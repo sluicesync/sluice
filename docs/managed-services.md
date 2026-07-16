@@ -535,6 +535,26 @@ Open question (unprobed): whether an *attached* binlog-dump connection holds the
 - **Default `sql_mode` includes `ANSI`** — double-quoted strings are *identifiers* on this server. Anything you run manually against the source with `"double quotes"` behaves differently than on a stock MySQL.
 - **`sql_require_primary_key=true`** by default — keyless tables cannot be created on a DO target, and restoring keyless-table dumps there fails until the setting is relaxed.
 
+## AWS RDS for Postgres
+
+**Status**: Live-validated 2026-07-16 (v0.99.261 validation run, RDS for PostgreSQL 16.14) as a **bulk-migration source** — byte-identical on md5 ground truth including NaN-in-`numeric[]`, ±Infinity, denormal floats, and 2-D arrays with NULL elements. Trigger-CDC (`postgres-trigger`) was validated end-to-end in the same run (that run also surfaced a provider-independent trigger-engine defect — array-column CDC payloads crash-looping the apply — fixed since, with the full array-family matrix pinned). Slot-based CDC was blocked in that run by a sluice-side false refusal — the replication-capability preflight only understood `rolsuper OR rolreplication`, while RDS grants slot creation via `rds_replication` role *membership* (the platform itself was proven slot-capable); the preflight has since been taught the membership model, so slot CDC is expected to work with the master user. Aurora Postgres uses the same role model.
+
+### Enabling logical replication
+
+Not postgresql.conf and not a console toggle: attach a **custom parameter group** with `rds.logical_replication = 1` (static → **reboot required**, ~2 min). The GUC `wal_level` itself is read-only on RDS. Two gotchas: (1) with `backup-retention-period 0` — the cheapest possible instance shape — the instance runs `wal_level=minimal`, not the `replica` most docs assume as the RDS baseline, so a cost-minimized instance is two steps from CDC-ready, not one; the parameter flip forces `logical` either way (the remedy is the parameter group + reboot, **not** "enable backups"); (2) after the flip RDS provisions `max_replication_slots=20` / `max_wal_senders=35` automatically.
+
+### Roles
+
+The master user is **not** a superuser and never has the REPLICATION attribute (`rolreplication=f`); it is a member of `rds_superuser` and `rds_replication`, which is what actually gates slot creation — sluice's replication preflight recognizes that membership. `ALTER ROLE ... REPLICATION` is not available on RDS; for a custom role, `GRANT rds_replication TO <role>;` is the equivalent. Nothing to grant on defaults — the master user has everything sluice needs, including `CREATE EVENT TRIGGER` (via `rds_superuser`) for `sluice trigger setup`.
+
+### TLS
+
+`rds.force_ssl=1` is the default on PG 15+ engines — plaintext connections are refused at pg_hba (`no pg_hba.conf entry ... no encryption`). `sslmode=require` works out of the box; `verify-full` needs the AWS RDS trust bundle (`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`) via `?sslrootcert=<path>`.
+
+### RDS Proxy
+
+Untested. Expected CDC-incompatible (transaction-mode pooler — the replication protocol cannot traverse it), same class as the Neon/Supabase pooler findings. Connect sluice to the **instance** endpoint (`*.<id>.<region>.rds.amazonaws.com`), not a proxy endpoint (`*.proxy-*.rds.amazonaws.com`).
+
 ## Other managed services
 
 The following haven't been formally verified but should work on the
@@ -543,9 +563,9 @@ of these and hit anything sluice-side, please open an issue.
 
 - **AWS RDS for MySQL / Aurora MySQL** — uses the vanilla `mysql`
   engine.
-- **AWS RDS for Postgres / Aurora Postgres** — uses the vanilla
-  `postgres` engine. Aurora's "logical replication" needs explicit
-  parameter-group settings (`rds.logical_replication=1`).
+- **Aurora Postgres** — uses the vanilla `postgres` engine. Shares
+  RDS for Postgres's role model and parameter-group settings
+  (`rds.logical_replication=1`); see the validated RDS section above.
 - **GCP CloudSQL for MySQL / Postgres** — uses the vanilla engines.
   CloudSQL's IAM-based connections require the cloud-sql-proxy
   alongside sluice.

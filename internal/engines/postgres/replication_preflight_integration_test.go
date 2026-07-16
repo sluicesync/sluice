@@ -147,6 +147,85 @@ func TestReplicationPreflight_LowPrivRoleCanProbe(t *testing.T) {
 	}
 }
 
+// applyRDSLikeFixture models AWS RDS / Aurora Postgres: a
+// `rds_replication` grant role exists, the master-like login role is
+// NOSUPERUSER NOREPLICATION but a MEMBER of it, and a second custom
+// login role exists WITHOUT the membership. Both attribute columns stay
+// false — on RDS slot capability is pure role membership (live-proven
+// on RDS PG 16, 2026-07-16; see replication_preflight.go).
+func applyRDSLikeFixture(t *testing.T, dsn string) (masterLikeDSN, customRoleDSN string) {
+	t.Helper()
+	const fixture = `
+		-- The provider grant role. NOLOGIN like the real one.
+		CREATE ROLE rds_replication NOLOGIN;
+
+		-- RDS-master-like: no superuser, no REPLICATION attribute, but
+		-- a member of rds_replication — must probe capable.
+		CREATE ROLE rds_master_like LOGIN PASSWORD 'app' NOSUPERUSER NOREPLICATION;
+		GRANT rds_replication TO rds_master_like;
+
+		-- Custom app role WITHOUT the membership — must probe incapable
+		-- even though the rds_replication role EXISTS (membership, not
+		-- mere role presence, is the capability).
+		CREATE ROLE rds_custom_like LOGIN PASSWORD 'app' NOSUPERUSER NOREPLICATION;
+	`
+	applyDDL(t, dsn, fixture)
+
+	rebind := func(user string) string {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("rebind DSN: parse: %v", err)
+		}
+		u.User = url.UserPassword(user, "app")
+		return u.String()
+	}
+	return rebind("rds_master_like"), rebind("rds_custom_like")
+}
+
+// TestReplicationPreflight_RDSLikeMembershipGrantsCapability is the F1
+// core pin (RDS validation 2026-07-16): a NOSUPERUSER NOREPLICATION
+// role that is a MEMBER of `rds_replication` probes capable, while a
+// sibling role WITHOUT the membership — on the SAME server, where the
+// grant role exists — still refuses. The pair pins both new predicate
+// branches: the CASE arm firing true on membership, and NOT degrading
+// into "the rds_replication role exists, so everyone passes".
+func TestReplicationPreflight_RDSLikeMembershipGrantsCapability(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	masterLikeDSN, customRoleDSN := applyRDSLikeFixture(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Member role: capable.
+	dbMaster, err := sql.Open("pgx", masterLikeDSN)
+	if err != nil {
+		t.Fatalf("open as rds_master_like: %v", err)
+	}
+	defer func() { _ = dbMaster.Close() }()
+	canReplicate, role, err := probeSourceReplicationCapability(ctx, dbMaster)
+	if err != nil {
+		t.Fatalf("probe (rds_master_like): %v", err)
+	}
+	if !canReplicate || role != "rds_master_like" {
+		t.Errorf("expected (true, rds_master_like) via rds_replication membership; got (%v, %q)", canReplicate, role)
+	}
+
+	// Non-member role on the same server: still refused.
+	dbCustom, err := sql.Open("pgx", customRoleDSN)
+	if err != nil {
+		t.Fatalf("open as rds_custom_like: %v", err)
+	}
+	defer func() { _ = dbCustom.Close() }()
+	canReplicate, role, err = probeSourceReplicationCapability(ctx, dbCustom)
+	if err != nil {
+		t.Fatalf("probe (rds_custom_like): %v", err)
+	}
+	if canReplicate || role != "rds_custom_like" {
+		t.Errorf("expected (false, rds_custom_like) — rds_replication EXISTS but this role is not a member; got (%v, %q)", canReplicate, role)
+	}
+}
+
 // TestReplicationPreflight_SchemaReader_AsProber confirms the
 // SchemaReader surface (the source-side handle the orchestrator probes)
 // routes to the same underlying probe and returns the same answers.

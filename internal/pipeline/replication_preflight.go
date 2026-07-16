@@ -68,10 +68,12 @@ var errReplicationRefused = errors.New("pipeline: replication-capability preflig
 // capability preflight.
 //
 // SourceReplicationCapability reports whether the connecting role can
-// create a logical replication slot — i.e. it is a superuser OR carries
-// the REPLICATION attribute (`pg_roles.rolsuper OR rolreplication`). The
-// role name is surfaced in the refusal message so the operator knows
-// which role to grant REPLICATION to (or which role to swap for).
+// create a logical replication slot — i.e. it is a superuser, carries
+// the REPLICATION attribute (`pg_roles.rolsuper OR rolreplication`), or
+// holds a managed-provider grant the engine recognizes (AWS RDS /
+// Aurora `rds_replication` membership). The role name is surfaced in
+// the refusal message so the operator knows which role to grant
+// REPLICATION to (or which role to swap for).
 //
 // Defined in the pipeline package rather than `ir` because it is
 // orchestrator-private (matches the shape of [rlsPreflightProber]).
@@ -96,8 +98,9 @@ type replicationCapabilityProber interface {
 //
 // Returns a wrapped [errReplicationRefused] when the role can't create a
 // slot. The message names the role, explains that slot-based CDC needs
-// the REPLICATION attribute, and lists the three operator-actionable
-// recovery paths (grant REPLICATION, use a replication-enabled role, or
+// the REPLICATION attribute (or a recognized provider grant), and lists
+// the four operator-actionable recovery paths (grant REPLICATION, use a
+// replication-enabled role, the RDS/Aurora `rds_replication` grant, or
 // switch to `--source-driver=postgres-trigger`).
 func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.Capabilities) error {
 	// Capability gate FIRST (correctness-critical). postgres-trigger's
@@ -124,7 +127,8 @@ func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.C
 		))
 	}
 	if canReplicate {
-		// Superuser or REPLICATION-enabled — slot creation will succeed.
+		// Superuser, REPLICATION-enabled, or provider-granted (RDS
+		// rds_replication membership) — slot creation will succeed.
 		return nil
 	}
 
@@ -139,17 +143,31 @@ func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.C
 // role), explain the mechanism (REPLICATION attribute / logical slot),
 // and list every operator-actionable recovery path so the operator can
 // pick the one that fits their hosting tier.
+//
+// The recovery text is provider-aware (RDS validation F1, 2026-07-16):
+// on AWS RDS / Aurora the pre-fix paths were all wrong or lossy —
+// `ALTER ROLE ... REPLICATION` requires real superuser (which RDS
+// withholds), no superuser/REPLICATION role exists there at all, and
+// the trigger-engine fallback forfeits slot CDC on a platform that
+// supports it. The probe now recognizes `rds_replication` membership,
+// so a refusal on RDS/Aurora means a CUSTOM role lacking the grant —
+// and the grant (not the attribute) is the fix there.
 func formatReplicationRefusal(role string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "the source connecting role %q is not a superuser and lacks the REPLICATION attribute. ", role)
+	fmt.Fprintf(&b, "the source connecting role %q is not a superuser, lacks the REPLICATION attribute, "+
+		"and is not a member of a recognized managed-provider replication role (AWS RDS/Aurora `rds_replication`). ", role)
 	b.WriteString("Slot-based Postgres CDC (`--source-driver=postgres`) creates a logical replication slot at cold start, " +
-		"which requires the connecting role to be a superuser or carry the REPLICATION attribute; without it, slot " +
-		"creation fails mid-cold-start with `ERROR: permission denied to create replication slot` (SQLSTATE 42501). ")
+		"which requires one of those grants; without it, slot creation fails mid-cold-start with " +
+		"`ERROR: permission denied to create replication slot` (SQLSTATE 42501). ")
 	b.WriteString("Recovery: (a) if you control the server, grant the attribute: `ALTER ROLE ")
 	b.WriteString(role)
 	b.WriteString(" REPLICATION;`; ")
 	b.WriteString("(b) re-run sluice with a superuser or replication-enabled role; ")
-	b.WriteString("(c) on managed Postgres that forbids the REPLICATION attribute (Heroku Postgres Essential, " +
+	b.WriteString("(c) on AWS RDS / Aurora Postgres (where the REPLICATION attribute is not grantable), connect as the " +
+		"master user — it is a member of `rds_replication` at creation — or grant a custom role the membership: `GRANT rds_replication TO ")
+	b.WriteString(role)
+	b.WriteString(";`; ")
+	b.WriteString("(d) on managed Postgres that forbids replication slots outright (Heroku Postgres Essential, " +
 		"Render Basic, Supabase free), use `--source-driver=postgres-trigger` — sluice's slot-less trigger-capture " +
 		"CDC engine, built for exactly this tier")
 	return b.String()

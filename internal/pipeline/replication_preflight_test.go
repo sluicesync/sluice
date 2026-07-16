@@ -115,12 +115,14 @@ func TestPreflightSourceReplication_IncapableRoleRefuses(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		`"heroku_like"`,    // connecting role named
-		"REPLICATION",      // mechanism named
-		"ALTER ROLE",       // grant-attribute recovery (a)
-		"superuser",        // alternative-role recovery (b)
-		"postgres-trigger", // slot-less recovery (c) — the key hint
-		"--source-driver",  // how to engage it
+		`"heroku_like"`,                        // connecting role named
+		"REPLICATION",                          // mechanism named
+		"ALTER ROLE",                           // grant-attribute recovery (a)
+		"superuser",                            // alternative-role recovery (b)
+		"rds_replication",                      // RDS/Aurora membership recovery (c) — the F1 provider-aware hint
+		"GRANT rds_replication TO heroku_like", // the concrete custom-role remedy, naming the role
+		"postgres-trigger",                     // slot-less recovery (d) — the key hint
+		"--source-driver",                      // how to engage it
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q\nfull: %s", want, msg)
@@ -158,5 +160,8 @@ func TestFormatReplicationRefusal_NamesRoleAndHints(t *testing.T) {
 	}
 	if !strings.Contains(msg, "logical replication slot") {
 		t.Errorf("expected the slot mechanism explained; got %q", msg)
+	}
+	if !strings.Contains(msg, "GRANT rds_replication TO essential_db_user") {
+		t.Errorf("expected the RDS/Aurora membership remedy naming the role; got %q", msg)
 	}
 }

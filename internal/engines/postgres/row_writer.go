@@ -6,8 +6,10 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -1143,6 +1145,24 @@ func prepareValue(v any, t ir.Type) (any, error) {
 // the scalar leaf type even for multi-dim, per the Bug 68 reader). PG
 // only ever emits rectangular arrays, so dimension lengths are taken
 // from the first element at each depth.
+//
+// # Leaf input shapes: SQL-decoded AND trigger-payload (RDS F3)
+//
+// Two source paths feed this function, with DIFFERENT leaf Go types.
+// The SQL read path (bulk copy, slot CDC) delivers the IR-canonical
+// leaves (float64 / int64 / string / time.Time — docs/value-types.md).
+// The pgtrigger change-payload path (ADR-0066 §4) delivers what
+// to_jsonb() + a UseNumber JSON decode produce: json.Number for finite
+// numerics, the STRINGS "Infinity"/"-Infinity"/"NaN" for non-finite
+// floats (JSON has no tokens for them), and ISO-8601 strings for
+// temporals. The pgtrigger decoder deliberately defers those to this
+// type-aware layer — parsing a numeric(p,s) element to float64 upstream
+// would silently truncate precision, and mapping an "Infinity" string
+// to a float upstream would corrupt a text[] holding the literal word.
+// Each leaf func below therefore accepts both shape sets for its OWN
+// family and refuses everything else loudly (before this, a float8[]
+// element in an UPDATE/DELETE payload crash-looped the trigger stream —
+// RDS validation F3, 2026-07-16).
 func convertArray(v []any, elem ir.Type) (any, error) {
 	switch e := elem.(type) {
 	case ir.Boolean:
@@ -1162,13 +1182,7 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 			return n, nil
 		})
 	case ir.Float:
-		return buildPGArray(v, func(x any) (float64, error) {
-			f, ok := x.(float64)
-			if !ok {
-				return 0, fmt.Errorf("expected float64, got %T", x)
-			}
-			return f, nil
-		})
+		return buildPGArray(v, floatArrayLeaf)
 	case ir.Char, ir.Varchar, ir.Text, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		return buildPGArray(v, func(x any) (pgtype.Text, error) {
 			s, ok := x.(string)
@@ -1178,47 +1192,37 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 			return pgtype.Text{String: s, Valid: true}, nil
 		})
 	case ir.Decimal:
-		return buildPGArray(v, func(x any) (pgtype.Numeric, error) {
-			s, ok := x.(string)
-			if !ok {
-				return pgtype.Numeric{}, fmt.Errorf("expected string, got %T", x)
-			}
-			var n pgtype.Numeric
-			if err := n.Scan(s); err != nil {
-				return pgtype.Numeric{}, fmt.Errorf("parse numeric %q: %w", s, err)
-			}
-			return n, nil
-		})
+		return buildPGArray(v, numericArrayLeaf)
 	case ir.Date:
 		return buildPGArray(v, func(x any) (pgtype.Date, error) {
-			t, ok := x.(time.Time)
-			if !ok {
-				return pgtype.Date{}, fmt.Errorf("expected time.Time, got %T", x)
+			t, err := temporalArrayLeaf(x, dateLeafLayout)
+			if err != nil {
+				return pgtype.Date{}, err
 			}
 			return pgtype.Date{Time: t, Valid: true}, nil
 		})
 	case ir.DateTime:
 		return buildPGArray(v, func(x any) (pgtype.Timestamp, error) {
-			t, ok := x.(time.Time)
-			if !ok {
-				return pgtype.Timestamp{}, fmt.Errorf("expected time.Time, got %T", x)
+			t, err := temporalArrayLeaf(x, timestampLeafLayout)
+			if err != nil {
+				return pgtype.Timestamp{}, err
 			}
 			return pgtype.Timestamp{Time: t, Valid: true}, nil
 		})
 	case ir.Timestamp:
 		if e.WithTimeZone {
 			return buildPGArray(v, func(x any) (pgtype.Timestamptz, error) {
-				t, ok := x.(time.Time)
-				if !ok {
-					return pgtype.Timestamptz{}, fmt.Errorf("expected time.Time, got %T", x)
+				t, err := temporalArrayLeaf(x, time.RFC3339Nano)
+				if err != nil {
+					return pgtype.Timestamptz{}, err
 				}
 				return pgtype.Timestamptz{Time: t, Valid: true}, nil
 			})
 		}
 		return buildPGArray(v, func(x any) (pgtype.Timestamp, error) {
-			t, ok := x.(time.Time)
-			if !ok {
-				return pgtype.Timestamp{}, fmt.Errorf("expected time.Time, got %T", x)
+			t, err := temporalArrayLeaf(x, timestampLeafLayout)
+			if err != nil {
+				return pgtype.Timestamp{}, err
 			}
 			return pgtype.Timestamp{Time: t, Valid: true}, nil
 		})
@@ -1241,6 +1245,98 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 		})
 	}
 	return nil, fmt.Errorf("postgres: array of element type %T not supported", elem)
+}
+
+// floatArrayLeaf converts one float4/float8 array element to float64.
+// Besides the IR-canonical float64, it accepts the pgtrigger
+// change-payload shapes (see the convertArray doc): json.Number
+// (ParseFloat is sign- and denormal-exact — note to_jsonb renders a
+// denormal as its full exact decimal expansion, hundreds of digits,
+// which rounds back to the same float64), int64 (a whole float — the
+// payload decoder's loss-free integer rule; exact both ways because
+// the value ORIGINATED as a float64), and exactly PG's to_jsonb
+// spellings of the three non-finite floats. Any other string is
+// refused loudly — float-parsing arbitrary strings here could mask an
+// upstream mis-decode as a plausible-looking value.
+func floatArrayLeaf(x any) (float64, error) {
+	switch f := x.(type) {
+	case float64:
+		return f, nil
+	case int64:
+		return float64(f), nil
+	case json.Number:
+		v, err := strconv.ParseFloat(f.String(), 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse float array element %q: %w", f.String(), err)
+		}
+		return v, nil
+	case string:
+		switch f {
+		case "Infinity":
+			return math.Inf(1), nil
+		case "-Infinity":
+			return math.Inf(-1), nil
+		case "NaN":
+			return math.NaN(), nil
+		}
+		return 0, fmt.Errorf("expected float64, got string %q (only the non-finite to_jsonb spellings Infinity/-Infinity/NaN are accepted)", f)
+	}
+	return 0, fmt.Errorf("expected float64, got %T", x)
+}
+
+// numericArrayLeaf converts one numeric/decimal array element to
+// pgtype.Numeric via its text parser (which handles NaN and, PG 14+,
+// ±Infinity). Besides the IR-canonical string, it accepts the pgtrigger
+// change-payload shapes: json.Number (its String() is the exact source
+// digits — lossless) and int64 (a whole numeric normalized by the
+// payload decoder's integer rule).
+func numericArrayLeaf(x any) (pgtype.Numeric, error) {
+	var s string
+	switch d := x.(type) {
+	case string:
+		s = d
+	case json.Number:
+		s = d.String()
+	case int64:
+		s = strconv.FormatInt(d, 10)
+	default:
+		return pgtype.Numeric{}, fmt.Errorf("expected string, got %T", x)
+	}
+	var n pgtype.Numeric
+	if err := n.Scan(s); err != nil {
+		return pgtype.Numeric{}, fmt.Errorf("parse numeric %q: %w", s, err)
+	}
+	return n, nil
+}
+
+// Temporal array-leaf layouts. to_jsonb renders timestamps in ISO 8601
+// with a 'T' separator: no zone suffix for timestamp/date (parse in the
+// layouts below; '.999999' makes the fraction optional), a full
+// ±hh:mm offset (or 'Z') for timestamptz (parse as RFC3339Nano).
+const (
+	dateLeafLayout      = "2006-01-02"
+	timestampLeafLayout = "2006-01-02T15:04:05.999999999"
+)
+
+// temporalArrayLeaf converts one date/timestamp/timestamptz array
+// element to time.Time. Besides the IR-canonical time.Time, it accepts
+// the pgtrigger change-payload shape: to_jsonb's ISO-8601 string,
+// parsed with the family's exact layout. A string that doesn't parse
+// (including PG's special 'infinity'/'-infinity' and BC dates, which
+// have no time.Time form) is refused loudly, naming the value — never
+// guessed at.
+func temporalArrayLeaf(x any, layout string) (time.Time, error) {
+	switch t := x.(type) {
+	case time.Time:
+		return t, nil
+	case string:
+		parsed, err := time.Parse(layout, t)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse temporal array element %q: %w", t, err)
+		}
+		return parsed, nil
+	}
+	return time.Time{}, fmt.Errorf("expected time.Time, got %T", x)
 }
 
 // timeOfDayMicros parses the IR canonical time-of-day string

@@ -39,7 +39,7 @@ How you change it depends on who runs the server — `wal_level` cannot be chang
 | Neon | Project setting **`enable_logical_replication`** (console: Settings → Logical replication, or the project-update API) | **Irreversible**; takes effect in seconds with no visible downtime (validated live 2026-07-15). |
 | Supabase | Nothing — `logical` is on by default | Note the direct-vs-pooler endpoint constraints in [managed-services](managed-services.md#supabase-postgres). |
 | PlanetScale Postgres | On by default on current provisioning; verify with `SHOW wal_level` | Older/custom-provisioned databases may differ. |
-| AWS RDS / Aurora | Parameter group: `rds.logical_replication = 1`, then reboot | The GUC itself is read-only on RDS; the rds.* parameter drives it. |
+| AWS RDS / Aurora | Parameter group: `rds.logical_replication = 1`, then reboot | The GUC itself is read-only on RDS; the rds.* parameter drives it. With `backup-retention-period 0` the baseline is `minimal` (not the usually-assumed `replica`) — the parameter flip forces `logical` either way; don't detour via "enable backups". |
 | GCP CloudSQL | Flag `cloudsql.logical_decoding = on`, then restart | |
 | Azure Database for PostgreSQL | Server parameter `wal_level = logical`, then restart | |
 

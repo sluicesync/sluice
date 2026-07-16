@@ -20,11 +20,12 @@ import (
 // streamer teardown; the closure is always non-nil so the caller can
 // `defer` it unconditionally.
 //
-// Non-fatal on every branch: failure to open the source, missing
-// SlotHealthReporter assertion (cross-engine pair where the source is
-// MySQL), or empty resolved slot name leaves the probe unattached and
-// the stream runs without F13 surfacing. Slot health is secondary
-// signal; the rest of the pipeline must work without it.
+// Non-fatal on every branch: a slot-LESS source CDC capability (the
+// gate below — trigger engines, MySQL binlog/VStream), failure to open
+// the source, missing SlotHealthReporter assertion, or empty resolved
+// slot name leaves the probe unattached and the stream runs without
+// F13 surfacing. Slot health is secondary signal; the rest of the
+// pipeline must work without it.
 //
 // The opened SchemaReader is dedicated to slot polling — it doesn't
 // share state with the CDC reader (which lives on a different
@@ -40,6 +41,20 @@ import (
 func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *slotHealthProbeAttachment {
 	noop := &slotHealthProbeAttachment{}
 	if s.Source == nil || s.SourceDSN == "" {
+		return noop
+	}
+	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
+		// Only a source whose CDC mechanism creates a logical
+		// replication slot has anything to probe. The gate must be the
+		// CAPABILITY, not the SlotHealthReporter type-assert below:
+		// postgres-trigger's SchemaReader delegates to the composed
+		// postgres.Engine, so it DOES satisfy the reporter interface —
+		// and pre-gate, every trigger-engine stream logged a misleading
+		// "slot-health probe attached ... slot=sluice_slot" INFO (and
+		// ran a probe goroutine against a slot that never exists) on
+		// exactly the engine operators reach BECAUSE slots are
+		// unavailable (RDS validation F4, 2026-07-16). Mirrors
+		// preflightSourceReplication's gate.
 		return noop
 	}
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)

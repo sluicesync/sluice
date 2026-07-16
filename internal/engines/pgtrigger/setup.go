@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"sluicesync.dev/sluice/internal/engines/postgres"
 )
 
@@ -101,9 +103,11 @@ type SetupOptions struct {
 	// AllowPolledFingerprint opts in to the polled schema-fingerprint
 	// fallback (§7) when the source denies event-trigger creation
 	// (Heroku Essential is the known case). When false (default),
-	// Setup refuses-loudly on tiers that grant neither superuser nor
-	// `pg_create_event_trigger`. Phase 1 only records the operator's
-	// intent — the polled-fingerprint loop itself is a follow-up.
+	// Setup refuses-loudly when the attempt-based probe shows the
+	// role cannot CREATE EVENT TRIGGER (stock PG: superuser-only;
+	// managed providers may grant it to their master role). Phase 1
+	// only records the operator's intent — the polled-fingerprint
+	// loop itself is a follow-up.
 	AllowPolledFingerprint bool
 
 	// CapturePayload selects how much of each changed row the capture
@@ -129,9 +133,11 @@ type Plan struct {
 	Refusals []TableRefusal
 
 	// EventTriggerSupported reports whether the connecting role can
-	// create event triggers (PG 14+ via the pg_create_event_trigger
-	// role, OR superuser on pre-14). False signals the §7 fallback
-	// path; the polled-fingerprint loop is enabled by
+	// create event triggers, established by an attempt-based probe
+	// (a rolled-back CREATE EVENT TRIGGER — stock PG gates this on
+	// superuser; managed providers like AWS RDS grant it to their
+	// master role). False signals the §7 fallback path; the
+	// polled-fingerprint loop is enabled by
 	// SetupOptions.AllowPolledFingerprint.
 	EventTriggerSupported bool
 
@@ -264,16 +270,20 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, fmt.Errorf("pgtrigger: setup: preflight: %w", err)
 	}
 
-	// Event-trigger permissions probe. Doesn't grant; only checks.
-	canEventTrigger, err := canCreateEventTrigger(ctx, db)
+	// Event-trigger permissions probe (attempt-based, rolled back —
+	// zero residue; see canCreateEventTrigger).
+	canEventTrigger, err := canCreateEventTrigger(ctx, db, opts.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: probe event-trigger permission: %w", err)
 	}
 	if !canEventTrigger && !opts.AllowPolledFingerprint {
-		// §14 last bullet — refuse with the flag suggestion.
+		// §14 last bullet — refuse with the flag suggestion. Stock PG
+		// gates CREATE EVENT TRIGGER on superuser (there is NO
+		// predefined role for it); managed providers grant it to their
+		// master role (AWS RDS via rds_superuser).
 		return nil, fmt.Errorf(
-			"pgtrigger: setup: connecting role lacks pg_create_event_trigger membership and is not a superuser; %s",
-			"the trigger engine requires event-trigger creation to detect source-side DDL — re-run with --allow-polled-fingerprint to opt in to the polled-fingerprint fallback (§7) or grant the role pg_create_event_trigger",
+			"pgtrigger: setup: connecting role cannot create event triggers (probe CREATE EVENT TRIGGER was refused); %s",
+			"the trigger engine uses an event trigger to detect source-side DDL — re-run as a superuser (or your managed provider's master role, e.g. the RDS master user), or re-run with --allow-polled-fingerprint to opt in to the polled-fingerprint fallback (§7)",
 		)
 	}
 
@@ -948,31 +958,56 @@ SELECT
 	return pkCols, isUnlogged, hasGenerated, hasUnrecognisedDomain, nil
 }
 
-// canCreateEventTrigger reports whether the connecting role is a
-// superuser OR has membership in pg_create_event_trigger (PG 14+).
-// Either grant is sufficient to run CREATE EVENT TRIGGER.
-func canCreateEventTrigger(ctx context.Context, db *sql.DB) (bool, error) {
-	const q = `
-SELECT
-    bool_or(rolsuper) AS is_super,
-    bool_or(
-        pg_has_role(current_user, 'pg_create_event_trigger', 'MEMBER')
-    ) AS has_role_member
-  FROM pg_roles
- WHERE rolname = current_user`
-	var isSuper, hasRoleMember sql.NullBool
-	if err := db.QueryRowContext(ctx, q).Scan(&isSuper, &hasRoleMember); err != nil {
-		// pg_create_event_trigger doesn't exist on PG < 14 — the
-		// pg_has_role call fails with "role does not exist". Fall
-		// back to checking just superuser.
-		var ok bool
-		const fb = `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`
-		if err2 := db.QueryRowContext(ctx, fb).Scan(&ok); err2 != nil {
-			return false, fmt.Errorf("probe event-trigger permission: %w", err2)
-		}
-		return ok, nil
+// canCreateEventTrigger reports whether the connecting role can run
+// CREATE EVENT TRIGGER, by ATTEMPTING one inside a transaction that is
+// always rolled back (event-trigger DDL is transactional, so the probe
+// is side-effect-free — nothing survives, not even on a crash, because
+// an un-committed transaction self-rolls-back).
+//
+// Attempt-based on purpose (RDS validation F2, 2026-07-16): the
+// previous probe checked membership in a `pg_create_event_trigger`
+// predefined role that DOES NOT EXIST in any stock PostgreSQL release
+// (the only `pg_create*` predefined role is `pg_create_subscription`),
+// so the capability read as superuser-only everywhere — and doubly
+// false on AWS RDS, where the master user CAN create event triggers via
+// `rds_superuser` (live-proven) despite `rolsuper=f`. Provider
+// permission models here are patched server-side and enumerable only by
+// drifting; the attempt is the one probe that can't lie. Contrast the
+// replication-capability preflight, which stays catalog-based because
+// slot creation is NOT transactional (see
+// postgres/replication_preflight.go for that tradeoff).
+//
+// The probe function is created in `schema` (rolled back with the rest);
+// a role that can't even create a function there can't run Setup's DDL
+// at all, so that failure propagates as a loud error rather than being
+// folded into "no event-trigger capability". Only SQLSTATE 42501
+// (insufficient_privilege) from CREATE EVENT TRIGGER itself maps to
+// (false, nil) — the §7 polled-fingerprint fallback signal.
+func canCreateEventTrigger(ctx context.Context, db *sql.DB, schema string) (bool, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("probe event-trigger capability: begin: %w", err)
 	}
-	return isSuper.Valid && isSuper.Bool || hasRoleMember.Valid && hasRoleMember.Bool, nil
+	// Always roll back — the probe must leave zero residue whether the
+	// CREATE succeeded or not.
+	defer func() { _ = tx.Rollback() }()
+
+	probeFn := quoteIdent(schema) + "." + quoteIdent("sluice_evtrig_probe")
+	createFn := "CREATE FUNCTION " + probeFn +
+		"() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN NULL; END'"
+	if _, err := tx.ExecContext(ctx, createFn); err != nil {
+		return false, fmt.Errorf("probe event-trigger capability: create probe function: %w", err)
+	}
+	createTrig := "CREATE EVENT TRIGGER " + quoteIdent("sluice_evtrig_probe") +
+		" ON ddl_command_end EXECUTE FUNCTION " + probeFn + "()"
+	if _, err := tx.ExecContext(ctx, createTrig); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			return false, nil
+		}
+		return false, fmt.Errorf("probe event-trigger capability: %w", err)
+	}
+	return true, nil
 }
 
 // readPGVersionNum reads the server's PG_VERSION_NUM. Used for the

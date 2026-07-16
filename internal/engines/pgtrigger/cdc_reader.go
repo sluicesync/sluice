@@ -466,23 +466,60 @@ func decodeJSONBRow(s string) (ir.Row, error) {
 		return nil, nil
 	}
 	// Convert json.Number leaves into typed values where the loss-
-	// free conversion is unambiguous. Integers stay int64; non-
-	// integer numerics stay json.Number so the applier's prepareValue
-	// path sees the exact source representation.
+	// free conversion is unambiguous — RECURSIVELY through arrays, so
+	// array ELEMENTS follow the same rule as scalars (RDS validation
+	// F3, 2026-07-16: array leaves were left raw, so int[] elements
+	// reached the applier as json.Number and crash-looped the stream).
+	// Integers become int64; non-integer numerics stay json.Number so
+	// the applier's prepareValue path sees the exact source
+	// representation and re-parses against the target column type (§4).
 	for k, v := range m {
-		if n, ok := v.(json.Number); ok {
-			if i, err := n.Int64(); err == nil && !strings.ContainsAny(n.String(), ".eE") {
-				m[k] = i
-				continue
-			}
-			// Leave as json.Number — preserves precision for
-			// numeric(p,s) round-trip. The applier consults the
-			// target column type's prepareValue and re-parses if
-			// needed (§4).
-			m[k] = n
-		}
+		m[k] = normalizePayloadValue(v)
 	}
 	return ir.Row(m), nil
+}
+
+// normalizePayloadValue applies decodeJSONBRow's loss-free-only leaf
+// rule to one decoded value, recursing into JSON arrays (which carry
+// array-column elements — including nested levels of a multi-dim
+// array). Three deliberate boundaries:
+//
+//   - Non-integer json.Number stays json.Number: parsing to float64
+//     here would silently truncate numeric(p,s) precision (the
+//     Bug-74-class loss ADR-0066 §4 exists to prevent). The applier
+//     re-parses type-aware (scalars via pgx's text binding; array
+//     elements via the postgres writer's convertArray leaf funcs).
+//   - The literal "-0" stays json.Number even though Int64 succeeds:
+//     int64(0) would silently drop a float sign bit. Defensive-only
+//     today — PG's to_jsonb stores numbers as numeric (no signed
+//     zero), so a live capture can never actually emit -0 (the
+//     engine.go "negative zero" wart) — but the decode rule must not
+//     be the layer that destroys a sign if the capture format ever
+//     becomes sign-faithful.
+//   - Objects (jsonb documents) are NOT descended: their leaves are
+//     re-marshaled verbatim on apply, and encoding/json emits a
+//     json.Number byte-identically, so rewriting them buys nothing. A
+//     jsonb column whose top-level value is a JSON array is
+//     indistinguishable from an array column here and IS normalized —
+//     harmless for the same reason (int64 and integral json.Number
+//     marshal identically).
+func normalizePayloadValue(v any) any {
+	switch x := v.(type) {
+	case json.Number:
+		if x.String() == "-0" {
+			return x
+		}
+		if i, err := x.Int64(); err == nil && !strings.ContainsAny(x.String(), ".eE") {
+			return i
+		}
+		return x
+	case []any:
+		for i, e := range x {
+			x[i] = normalizePayloadValue(e)
+		}
+		return x
+	}
+	return v
 }
 
 // decodeDDLTag pulls the command_tag from the §7 DDL-marker row's

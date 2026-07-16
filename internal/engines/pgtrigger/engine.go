@@ -53,6 +53,21 @@
 //
 // `--use-partitioning` remains deferred to a follow-up phase per the
 // task #62 plan.
+//
+// # Known capture-fidelity wart: float negative zero (CDC only)
+//
+// The §3 capture format is to_jsonb(), and PG stores jsonb numbers as
+// numeric — which has NO signed zero. A float4/float8 `-0` written
+// while the stream is live is therefore captured as `0` INSIDE the
+// source-side trigger, before sluice ever reads the payload; the
+// applied target value is `+0` (scalar and array element alike).
+// Ground-truthed on PG 16: `to_jsonb('-0'::float8)` → `0`, while the
+// SQL read path's `float8out` → `-0` — so cold-copy/bulk-migrate and
+// the slot-based `postgres` engine carry the sign faithfully; only the
+// trigger-captured CDC image loses it. Unfixable at the decode/apply
+// layers (the information is destroyed at capture); a fix would mean
+// changing the capture format itself (per-column float8out text).
+// Pinned by TestCDCApply_FloatNegativeZeroCaptureNormalization.
 package pgtrigger
 
 import (
