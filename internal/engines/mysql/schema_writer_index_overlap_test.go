@@ -418,6 +418,20 @@ type indexRecorder struct {
 	// emitted probes as existing — the committed-but-unacked shape the
 	// detect-then-skip idempotency (no-double-create) pin needs.
 	probeBuilt bool
+
+	// driftDefs scripts, per index NAME, the definition the MED-D0-8
+	// drift probe serves for an existing index. Absent names get the
+	// default single-column non-unique BTREE over `v` — matching the
+	// unit schemas' intended definitions, so no drift WARN fires in the
+	// pre-existing pins.
+	driftDefs map[string]fakeIndexDef
+}
+
+// fakeIndexDef is one scripted catalog definition for the drift probe.
+type fakeIndexDef struct {
+	unique    bool
+	columns   []string
+	indexType string // "" serves BTREE
 }
 
 // errSimulatedReparent classifies retriable via classifyApplierError's
@@ -490,6 +504,17 @@ func (r *indexRecorder) snapshot() []string {
 	return append([]string(nil), r.execs...)
 }
 
+// driftDefFor answers the drift probe's served definition for one index
+// name: scripted, or the default matching the unit schemas' intent.
+func (r *indexRecorder) driftDefFor(name string) fakeIndexDef {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if d, ok := r.driftDefs[name]; ok {
+		return d
+	}
+	return fakeIndexDef{columns: []string{"v"}}
+}
+
 // alterCountFor counts recorded ALTERs naming the quoted table.
 func (r *indexRecorder) alterCountFor(table string) int {
 	r.mu.Lock()
@@ -544,6 +569,35 @@ func (c indexFakeConn) ExecContext(_ context.Context, query string, _ []driver.N
 // (schema, table, name)), answered as a single bool row exactly as before.
 func (c indexFakeConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.rec.recordQuery(query, len(args))
+	// The MED-D0-8 definition-drift probe — recognisable by its
+	// seq_in_index ORDER BY; args = (schema, table, names…). One row per
+	// (existing index × scripted column), from driftDefs or the default.
+	if strings.Contains(query, "seq_in_index") {
+		var rows indexDefRows
+		for i := 2; i < len(args); i++ {
+			name, _ := args[i].Value.(string)
+			if !c.rec.indexProbeAnswer(name) {
+				continue
+			}
+			def := c.rec.driftDefFor(name)
+			outName := name
+			if c.rec.answerUppercase {
+				outName = strings.ToUpper(name)
+			}
+			nonUnique := int64(1)
+			if def.unique {
+				nonUnique = 0
+			}
+			indexType := def.indexType
+			if indexType == "" {
+				indexType = "BTREE"
+			}
+			for _, col := range def.columns {
+				rows.rows = append(rows.rows, [6]driver.Value{outName, nonUnique, col, nil, "A", indexType})
+			}
+		}
+		return &rows, nil
+	}
 	if nTables, nNames, ok := batchedProbeShape(query); ok {
 		if len(args) != 1+nTables+nNames {
 			return nil, fmt.Errorf("batched probe args = %d; want %d (schema + %d tables + %d names): %s",
@@ -596,6 +650,28 @@ func batchedProbeShape(query string) (nTables, nNames int, ok bool) {
 		return strings.Count(group, "?")
 	}
 	return count(segs[1]), count(segs[2]), true
+}
+
+// indexDefRows is a six-column driver result streaming
+// (index_name, non_unique, column_name, sub_part, collation, index_type)
+// rows — the MED-D0-8 definition probe's wire shape.
+type indexDefRows struct {
+	rows [][6]driver.Value
+	next int
+}
+
+func (*indexDefRows) Columns() []string {
+	return []string{"index_name", "non_unique", "column_name", "sub_part", "collation", "index_type"}
+}
+func (*indexDefRows) Close() error { return nil }
+
+func (r *indexDefRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.next][:])
+	r.next++
+	return nil
 }
 
 // pairRows is a two-column driver result streaming (table, name) rows —

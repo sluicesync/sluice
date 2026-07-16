@@ -193,7 +193,18 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	}
 	fmt.Fprintf(out, "%s: opened deploy request #%d (%s)\n", r.name, dr.Number, dr.HTMLURL)
 
-	if err := r.waitDeployable(ctx, dr.Number); err != nil {
+	if err := r.waitDeployable(ctx, branchName, dr.Number); err != nil {
+		// The review-timeout remedy is "approve the deploy request and
+		// re-run" — but deleting the dev branch closes its still-open DR,
+		// making the remedy self-defeating (audit L-D0-10). On exactly
+		// this path the branch is exempted from cleanup (auto
+		// --keep-branches semantics); the timeout message names the kept
+		// branch and how to delete it once the DR closes. Every other
+		// failure path still cleans up.
+		var pending *reviewPendingError
+		if errors.As(err, &pending) {
+			cleanup.remove(branchName)
+		}
 		return nil, err
 	}
 	// Pre-Deploy blast-radius + freshness gates (audit MED-D0-7). Both
@@ -492,9 +503,21 @@ var (
 	}
 )
 
+// reviewPendingError marks waitDeployable's deadline failure: the
+// deploy request is still OPEN (likely awaiting review approval), so
+// the caller must exempt the dev branch from cleanup — deleting the
+// branch closes the DR the operator was just told to approve (audit
+// L-D0-10). Wraps the coded drFailure so the exit surface is unchanged.
+type reviewPendingError struct{ err error }
+
+func (e *reviewPendingError) Error() string { return e.err.Error() }
+func (e *reviewPendingError) Unwrap() error { return e.err }
+
 // waitDeployable polls until the deploy request is deployable (the
-// diff computed and PlanetScale accepts a deploy call).
-func (r *legRunner) waitDeployable(ctx context.Context, number int) error {
+// diff computed and PlanetScale accepts a deploy call). branchName is
+// the leg's dev branch, named in the still-in-review timeout message
+// (the branch is kept on that path — see [reviewPendingError]).
+func (r *legRunner) waitDeployable(ctx context.Context, branchName string, number int) error {
 	deadline := time.Now().Add(r.deployTimeout)
 	for {
 		dr, err := r.api.GetDeployRequest(ctx, r.org, r.database, number)
@@ -521,10 +544,11 @@ func (r *legRunner) waitDeployable(ctx context.Context, number int) error {
 			))
 		}
 		if time.Now().After(deadline) {
-			return r.drFailure(dr, fmt.Sprintf(
-				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, %s",
+			return &reviewPendingError{err: r.drFailure(dr, fmt.Sprintf(
+				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, %s; the dev branch %q was KEPT (deleting it would close the still-open deploy request) — once the request closes, delete it with `pscale branch delete %s %s --org %s`",
 				number, r.deployTimeout, dr.DeploymentState, r.reviewTimeoutAdvice,
-			))
+				branchName, r.database, branchName, r.org,
+			))}
 		}
 		if err := r.sleepPoll(ctx); err != nil {
 			return err

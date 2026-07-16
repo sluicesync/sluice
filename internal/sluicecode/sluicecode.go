@@ -83,6 +83,7 @@ const (
 	CodeBackfillUnknownColumn     Code = "SLUICE-E-BACKFILL-UNKNOWN-COLUMN"
 	CodeBackfillIncomplete        Code = "SLUICE-E-BACKFILL-INCOMPLETE"
 	CodeBackfillCorruptCursor     Code = "SLUICE-E-BACKFILL-CORRUPT-CURSOR"
+	CodeBackfillConcurrentRun     Code = "SLUICE-E-BACKFILL-CONCURRENT-RUN"
 
 	CodeTargetTableShapeMismatch Code = "SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH"
 
@@ -163,6 +164,7 @@ var registry = map[Code]Info{
 	CodeBackfillUnknownColumn:     {ClassRefusal, "backfill refused: a --set column does not exist on the table"},
 	CodeBackfillIncomplete:        {ClassRuntime, "backfill verify found rows still matching the --where guard after the walk — online catch-up needed (rows written behind the cursor), or the guard does not self-describe doneness"},
 	CodeBackfillCorruptCursor:     {ClassRefusal, "backfill refused to resume: the persisted cursor was written by an older sluice whose JSON store mangled binary or large-integer PK values — resuming from it would silently skip or replay PK ranges; re-run with --restart"},
+	CodeBackfillConcurrentRun:     {ClassRefusal, "backfill refused to start: the spec's state row shows a heartbeat fresher than the freshness window while still in the walking phase — another run (typically an overlapping cron invocation) looks live, and two concurrent walks of one spec interleave cursor writes; wait for it to finish or for its heartbeat to go stale"},
 
 	CodeSourceForeignDump:   {ClassRefusal, "the --source file is a plain mysqldump/pg_dump SQL dump or a pg_dump custom-format (PGDMP) archive — formats sluice deliberately does not parse; the message carries the scratch-server-replay recipe"},
 	CodeSourceWrongDriver:   {ClassRefusal, "the --source is a recognisable format this source driver does not read (e.g. a mydumper directory handed to the csv driver) — the message names the right driver or preparation step"},

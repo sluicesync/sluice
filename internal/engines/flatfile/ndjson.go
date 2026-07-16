@@ -160,6 +160,18 @@ func ndjsonValue(raw json.RawMessage) (any, error) {
 		if err := json.Unmarshal(t, &s); err != nil {
 			return nil, fmt.Errorf("invalid JSON string: %w", err)
 		}
+		// The \u0000 escape decodes to a NUL the raw-byte scan can never
+		// see (audit L-D0-14) — and PostgreSQL text cannot hold NUL, so
+		// letting it through dies later as a generic COPY error with no
+		// line coordinates. Refuse HERE, matching the CSV raw-NUL posture:
+		// the wrapping callers name the file, line, and key. (A NUL escape
+		// inside a NESTED object/array stays as its 6-character escape
+		// text — TEXT-representable — so only the decoded-string case is
+		// unholdable.)
+		if strings.ContainsRune(s, 0x00) {
+			return nil, errors.New(`string decodes to a NUL (the \u0000 escape) — ` +
+				"the staged TEXT value cannot carry NUL to the target; remove the escape or re-encode the value")
+		}
 		return s, nil
 	case '{', '[':
 		return string(t), nil // nested document: raw JSON text, verbatim

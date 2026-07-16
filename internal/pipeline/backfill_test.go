@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -523,6 +524,77 @@ func TestBackfill_ResumeUsesStoredCursor(t *testing.T) {
 	if res.RowsUpdated != 20 {
 		t.Errorf("RowsUpdated = %d; want 20 (10 previous + 10 now)", res.RowsUpdated)
 	}
+}
+
+// TestBackfill_ConcurrentRunHeartbeatGuard pins the audit L-D0-9 guard:
+// a spec whose state row is still in the `backfill` phase with a FRESH
+// heartbeat refuses coded (SLUICE-E-BACKFILL-CONCURRENT-RUN) before any
+// UPDATE or state write — including under --restart, which must not
+// clear the row out from under the live walker — while a STALE
+// heartbeat (a crashed runner) resumes exactly as before, and a fresh
+// heartbeat on a COMPLETE row keeps the no-op path (no live walk to
+// collide with).
+func TestBackfill_ConcurrentRunHeartbeatGuard(t *testing.T) {
+	now := time.Now()
+	setup := func(phase ir.MigrationPhase, updatedAt time.Time) (*backfillFakeExecutor, *backfillFakeStore, *Backfiller) {
+		ex := &backfillFakeExecutor{rows: backfillFakeRows(5)}
+		store := newBackfillFakeStore()
+		eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+		b := newTestBackfiller(eng)
+		b.now = func() time.Time { return now }
+		id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+		store.headers[id] = ir.MigrationState{MigrationID: id, Phase: phase, UpdatedAt: updatedAt}
+		return ex, store, b
+	}
+
+	t.Run("fresh heartbeat refuses", func(t *testing.T) {
+		ex, store, b := setup(backfillPhaseRunning, now.Add(-time.Minute))
+		_, err := b.Run(context.Background())
+		wantBackfillCode(t, err, sluicecode.CodeBackfillConcurrentRun)
+		var coded *sluicecode.CodedError
+		if !errors.As(err, &coded) || !strings.Contains(coded.Hint, "wait") {
+			t.Errorf("hint %q should say to wait, not name a force flag", coded.Hint)
+		}
+		if ex.execCalls != 0 || store.writes != 0 {
+			t.Errorf("execCalls=%d store writes=%d; the refusal must touch nothing", ex.execCalls, store.writes)
+		}
+	})
+
+	t.Run("fresh heartbeat refuses --restart too, keeping the state row", func(t *testing.T) {
+		ex, store, b := setup(backfillPhaseRunning, now.Add(-time.Minute))
+		b.Restart = true
+		_, err := b.Run(context.Background())
+		wantBackfillCode(t, err, sluicecode.CodeBackfillConcurrentRun)
+		id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+		if _, ok := store.headers[id]; !ok {
+			t.Error("--restart cleared the live walker's state row despite the refusal")
+		}
+		if ex.execCalls != 0 {
+			t.Errorf("execCalls = %d; want 0", ex.execCalls)
+		}
+	})
+
+	t.Run("stale heartbeat proceeds", func(t *testing.T) {
+		ex, _, b := setup(backfillPhaseRunning, now.Add(-backfillHeartbeatFreshFor-time.Second))
+		res, err := b.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.RowsUpdated != 5 || ex.execCalls == 0 {
+			t.Errorf("RowsUpdated=%d execCalls=%d; a stale (crashed-runner) row must walk", res.RowsUpdated, ex.execCalls)
+		}
+	})
+
+	t.Run("fresh heartbeat on a complete row stays the no-op", func(t *testing.T) {
+		ex, _, b := setup(ir.MigrationPhaseComplete, now.Add(-time.Minute))
+		res, err := b.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if !res.AlreadyComplete || ex.execCalls != 0 {
+			t.Errorf("AlreadyComplete=%v execCalls=%d; want the documented no-op", res.AlreadyComplete, ex.execCalls)
+		}
+	})
 }
 
 // TestBackfill_RefusesSuspectLegacyCursor pins the CRITICAL-2/HIGH-1

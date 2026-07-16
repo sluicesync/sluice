@@ -190,6 +190,10 @@ func (w *SchemaWriter) routeIndexJobToFallback(ctx context.Context, job indexBui
 	if err != nil {
 		return fmt.Errorf("mysql: index fallback: probe indexes on %q: %w", job.tableName, err)
 	}
+	// Same name-only skip as the direct path, same advisory (audit
+	// MED-D0-8): a same-name index with a different definition is
+	// WARNed, not silently accepted as the fallback having nothing to do.
+	w.warnOnSkippedIndexDefinitionDrift(ctx, job, existing)
 	pending := make([]*ir.Index, 0, len(job.idxs))
 	for _, idx := range job.idxs {
 		if _, ok := existing[foldCatalogPair(job.tableName, idx.Name)]; !ok {

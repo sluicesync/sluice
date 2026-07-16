@@ -979,9 +979,10 @@ func (e *CharsetRefusalError) Error() string {
 }
 
 // checkCharsets refuses any string-family column whose EFFECTIVE charset
-// (explicit column charset, else the table default, else the assumed
-// utf8mb4) is not UTF-8-compatible. The returned error is always a
-// *CharsetRefusalError so callers can defer it (see the type doc).
+// (explicit column charset, else the table default, else the charset the
+// table COLLATION implies, else the assumed utf8mb4) is not
+// UTF-8-compatible. The returned error is always a *CharsetRefusalError
+// so callers can defer it (see the type doc).
 func (b *tableBuilder) checkCharsets() error {
 	for _, col := range b.table.Columns {
 		switch col.Type.(type) {
@@ -994,6 +995,16 @@ func (b *tableBuilder) checkCharsets() error {
 			effective = b.tableCharset
 		}
 		if effective == "" {
+			// A collation-only declaration (`COLLATE=latin1_swedish_ci`
+			// with no CHARSET) still pins the charset — MySQL derives it
+			// from the collation, and so must this gate (audit L-D0-1:
+			// tableCollation was parsed but never consulted, so a
+			// hand-edited latin1-collated schema passed as utf8mb4).
+			// mydumper-written schemas always carry CHARSET, so this
+			// branch only fires on hand-edited files.
+			effective = charsetOfCollation(b.tableCollation)
+		}
+		if effective == "" {
 			effective = "utf8mb4"
 		}
 		if !utf8CompatibleCharsets[effective] {
@@ -1003,4 +1014,13 @@ func (b *tableBuilder) checkCharsets() error {
 		}
 	}
 	return nil
+}
+
+// charsetOfCollation derives a collation's charset: MySQL collation names
+// are `<charset>_<comparison rules>` (latin1_swedish_ci → latin1,
+// utf8mb4_0900_ai_ci → utf8mb4), with the bare `binary` collation naming
+// its charset outright. Empty in, empty out.
+func charsetOfCollation(collation string) string {
+	cs, _, _ := strings.Cut(collation, "_")
+	return cs
 }

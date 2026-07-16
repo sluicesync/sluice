@@ -118,6 +118,7 @@ func TestNDJSONRefusals(t *testing.T) {
 		{"invalid JSON", `{"a":` + "\n", "invalid JSON"},
 		{"empty object before any column", `{}` + "\n" + `{"a":1}` + "\n", "empty object before any column"},
 		{"NUL byte", "{\"a\":\"x\x00y\"}\n", "NUL"},
+		{"NUL escape in a string", "{\"a\":\"x\\u0000y\"}\n", "decodes to a NUL"},
 		{"invalid UTF-8", "{\"a\":\"x\xffy\"}\n", "not valid UTF-8"},
 		// F3: key-name refusals — at the offending LINE, with named messages,
 		// instead of a late zero-length-identifier / duplicate-column error
@@ -139,6 +140,37 @@ func TestNDJSONRefusals(t *testing.T) {
 			}
 		})
 	}
+
+	// The \u0000 escape bypasses the raw-byte NUL scan (audit L-D0-14):
+	// the refusal must fire at the flatfile layer, naming file, LINE, and
+	// key — not surface later as a coordinate-free PG COPY error.
+	t.Run("NUL escape names the line and key", func(t *testing.T) {
+		e := ndjsonEngine(t)
+		path := writeSource(t, "nul.ndjson",
+			"{\"a\":\"clean\"}\n{\"a\":\"ok\",\"b\":\"x\\u0000y\"}\n")
+		_, err := e.OpenSchemaReader(context.Background(), path)
+		if err == nil {
+			t.Fatal("expected the NUL-escape refusal, got nil error")
+		}
+		for _, want := range []string{"line 2", `"b"`, "decodes to a NUL"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err.Error(), want)
+			}
+		}
+	})
+
+	// The refusal covers only the DECODED-string case: a NUL escape inside
+	// a nested object/array stays as its 6-character escape text — TEXT-
+	// representable on every target — and must keep staging verbatim.
+	t.Run("NUL escape inside a nested document stages verbatim", func(t *testing.T) {
+		e := ndjsonEngine(t)
+		path := writeSource(t, "nested-nul.ndjson", "{\"doc\":{\"k\":\"x\\u0000y\"}}\n")
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 1 {
+			t.Fatalf("staged %d rows; want 1", len(rows))
+		}
+		wantText(t, rows[0], "doc", "{\"k\":\"x\\u0000y\"}")
+	})
 
 	t.Run("single-array JSON document names the jq recipe", func(t *testing.T) {
 		e := ndjsonEngine(t)

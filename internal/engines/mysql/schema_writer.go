@@ -500,9 +500,12 @@ type dbExecer interface {
 // was one probe per index, a serial vtgate round trip apiece). The probe runs
 // at ATTEMPT time, so the reparent-retry's replay re-probes and skips any
 // index whose ALTER committed server-side but died unacknowledged — never a
-// double-create. sluice owns these tables, so a same-named index is the one
-// it built. When every index already exists the table is skipped entirely
-// (no ALTER emitted).
+// double-create. sluice owns these tables, so a same-named index is USUALLY
+// the one it built — but the skip is by name, so a pre-existing same-name
+// index with a DIFFERENT definition would be silently accepted as built;
+// [SchemaWriter.warnOnSkippedIndexDefinitionDrift] compares definitions and
+// WARNs on divergence (audit MED-D0-8). When every index already exists the
+// table is skipped entirely (no ALTER emitted).
 func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, job indexBuildJob) error {
 	wanted := make([]catalogPair, 0, len(job.idxs))
 	for _, idx := range job.idxs {
@@ -512,6 +515,7 @@ func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, j
 	if err != nil {
 		return fmt.Errorf("mysql: probe indexes on %q: %w", job.tableName, err)
 	}
+	w.warnOnSkippedIndexDefinitionDrift(ctx, job, existing)
 	pending := make([]*ir.Index, 0, len(job.idxs))
 	for _, idx := range job.idxs {
 		if _, ok := existing[foldCatalogPair(job.tableName, idx.Name)]; !ok {

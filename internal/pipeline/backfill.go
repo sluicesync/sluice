@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -117,7 +118,25 @@ type Backfiller struct {
 	// Progress is the ADR-0155 presentation sink. nil is the
 	// [progress.Nop] default.
 	Progress progress.Sink
+
+	// now is the wall clock the concurrent-run heartbeat guard compares
+	// the state row's UpdatedAt against; injectable so the freshness
+	// window is testable without real waits. nil (every production
+	// construction) means time.Now.
+	now func() time.Time
 }
+
+// backfillHeartbeatFreshFor is the concurrent-run guard's freshness
+// window (audit L-D0-9): a spec whose state row is still in the
+// `backfill` phase AND was touched more recently than this refuses to
+// start, because a live walk heartbeats the row on every committed
+// chunk. The window must outlive one chunk's worst plausible duration
+// (a bounded UPDATE of one batch — normally seconds) yet stay short
+// enough that a kill -9'd run doesn't block its cron slot for long;
+// it also absorbs modest client↔server clock skew (UpdatedAt is the
+// database's wall clock, the comparison is against ours — deep skew
+// degrades in the LOUD direction only, an over-refusal with a hint).
+const backfillHeartbeatFreshFor = 5 * time.Minute
 
 // BackfillResult is the structured outcome of a backfill run.
 type BackfillResult struct {
@@ -168,6 +187,14 @@ func (b *Backfiller) out() io.Writer {
 		return io.Discard
 	}
 	return b.Out
+}
+
+// nowFunc resolves the injectable clock (the legRunner pattern).
+func (b *Backfiller) nowFunc() func() time.Time {
+	if b.now != nil {
+		return b.now
+	}
+	return time.Now
 }
 
 // ParseBackfillSets parses the CLI's repeatable `--set 'col = expr'`
@@ -376,14 +403,37 @@ func (b *Backfiller) runWalk(ctx context.Context, ex ir.BackfillExecutor, table 
 		return fmt.Errorf("backfill: %w", err)
 	}
 	migID := BackfillMigrationID(b.Table, b.Sets, b.Where)
+	state, found, err := store.Read(ctx, migID)
+	if err != nil {
+		return fmt.Errorf("backfill: read state: %w", err)
+	}
+	// Concurrent-run heartbeat guard (audit 2026-07-15 L-D0-9): two
+	// simultaneous walks of one spec interleave cursor writes, turning
+	// the at-most-one-chunk replay bound into arbitrary skip/replay. A
+	// live walk heartbeats the state row on every committed chunk, so a
+	// FRESH heartbeat on a still-`backfill` header means another runner
+	// is (very likely) mid-walk — the realistic producer is overlapping
+	// cron invocations. Refuse before touching anything, including
+	// --restart's ClearMigration (which would otherwise yank the state
+	// row out from under the live walker). Deliberately heartbeat-only,
+	// no lease machinery: a single chunk outliving the freshness window
+	// slips through (documented residual), and a kill -9'd run keeps the
+	// spec refused for at most one window.
+	if found && state.Phase == backfillPhaseRunning {
+		if age := b.nowFunc()().Sub(state.UpdatedAt); age < backfillHeartbeatFreshFor {
+			return sluicecode.Wrap(
+				sluicecode.CodeBackfillConcurrentRun,
+				fmt.Sprintf("wait for the running backfill to finish (its heartbeat goes stale after %s without a committed chunk), or investigate why it is still walking — do NOT --restart around a live run", backfillHeartbeatFreshFor),
+				fmt.Errorf("backfill: spec %s looks live on another runner — its state heartbeat is %s old (fresher than %s); a second concurrent walk would interleave cursor writes and break the at-most-one-chunk replay bound",
+					migID, age.Round(time.Second), backfillHeartbeatFreshFor),
+			)
+		}
+	}
 	if b.Restart {
 		if err := store.ClearMigration(ctx, migID); err != nil {
 			return fmt.Errorf("backfill: --restart clear state: %w", err)
 		}
-	}
-	state, found, err := store.Read(ctx, migID)
-	if err != nil {
-		return fmt.Errorf("backfill: read state: %w", err)
+		state, found = ir.MigrationState{}, false
 	}
 
 	var cursor []any

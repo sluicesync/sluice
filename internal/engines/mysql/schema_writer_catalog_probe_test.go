@@ -113,8 +113,16 @@ func TestCreateIndexes_BatchedDetectThenSkip(t *testing.T) {
 		t.Fatalf("CreateIndexes: %v", err)
 	}
 
-	if qs := catalogQueries(rec); len(qs) != 1 {
-		t.Fatalf("CreateIndexes issued %d catalog queries for one table; want exactly 1", len(qs))
+	// TWO catalog reads since MED-D0-8: the batched existence probe plus
+	// the definition-drift advisory over the one skipped index. The
+	// advisory is O(1) per table-with-skips (never per index), so the
+	// V-1 no-N+1 property this pin protects still holds.
+	qs := catalogQueries(rec)
+	if len(qs) != 2 {
+		t.Fatalf("CreateIndexes issued %d catalog queries for one table; want 2 (existence probe + drift advisory)", len(qs))
+	}
+	if !strings.Contains(qs[1].query, "seq_in_index") {
+		t.Errorf("second catalog query is not the drift advisory: %s", qs[1].query)
 	}
 	execs := rec.snapshot()[1:] // drop the seeded statement
 	if len(execs) != 1 {

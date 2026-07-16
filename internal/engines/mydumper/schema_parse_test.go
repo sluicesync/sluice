@@ -261,6 +261,25 @@ func TestParseSchemaFile_CharsetGate(t *testing.T) {
 			"enum-under-latin1-refused",
 			"CREATE TABLE `t` (`e` enum('a','b')) DEFAULT CHARSET=latin1;", false,
 		},
+		// Collation-only declarations (audit L-D0-1): with no CHARSET the
+		// COLLATE prefix pins the charset — a hand-edited latin1-collated
+		// schema must refuse, not pass as the assumed utf8mb4.
+		{
+			"collation-only-latin1-refused",
+			"CREATE TABLE `t` (`s` varchar(10)) COLLATE=latin1_swedish_ci;", false,
+		},
+		{
+			"collation-only-utf8mb4-ok",
+			"CREATE TABLE `t` (`s` varchar(10)) COLLATE=utf8mb4_0900_ai_ci;", true,
+		},
+		{
+			"charset-beside-collation-unchanged",
+			"CREATE TABLE `t` (`s` varchar(10)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;", true,
+		},
+		{
+			"charset-refuses-beside-matching-collation",
+			"CREATE TABLE `t` (`s` varchar(10)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;", false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

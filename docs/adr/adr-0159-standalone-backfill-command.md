@@ -95,6 +95,16 @@ property the CDC apply idempotency relies on. A re-run of a completed spec is
 a reported no-op (exit 0, zero rows touched); `--restart` clears the stored
 state and walks again from the start.
 
+*Amended (audit 2026-07-15 L-D0-9):* the at-most-one-chunk replay bound
+assumes ONE walker per spec, so a run now refuses to start
+(`SLUICE-E-BACKFILL-CONCURRENT-RUN`) when the spec's state row is still in
+the walking phase with a heartbeat (the row's `updated_at`, bumped on every
+committed chunk) fresher than 5 minutes — the overlapping-cron shape.
+Heartbeat-only, no lease machinery: a single chunk outliving the window
+slips past the guard (documented residual), a kill -9'd run blocks its spec
+for at most one window, and the guard runs BEFORE `--restart`'s
+ClearMigration so a restart can't yank state out from under a live walker.
+
 **Cursor JSON-round-trip normalization.** `LastPK` persists as JSON, so each
 engine normalizes scanned PK values at the walk boundary: `[]byte` → string
 (base64-through-JSON would re-bind as garbage — a silently misplaced cursor,

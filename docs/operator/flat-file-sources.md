@@ -36,8 +36,8 @@ One JSON **object** per line (`.jsonl` works too); keys become columns in first-
 
 - **Numbers are carried as their raw source text** — never through a float64 — so integers > 2^53, snowflake IDs, and arbitrary-precision decimals land exact.
 - Strings are JSON-decoded (including `\u` escapes); `true`/`false` land as that text; nested objects/arrays land as their raw JSON text (and a name-hinted column of objects is promoted to `jsonb` — see inference below).
-- An **absent key and an explicit `null` both land as SQL NULL** (SQL has one nothing where JSON has two).
-- A duplicate key within one object, a non-object line, or trailing content after the object is refused loudly naming the line. A single JSON *array* document is not NDJSON — the refusal names the conversion (`jq -c '.[]' file.json > out.ndjson`).
+- An **absent key and an explicit `null` both land as SQL NULL** (SQL has one nothing where JSON has two), and a **scalar and its string spelling stage identically** (`"1"` vs `1`, `"true"` vs `true` — everything stages as TEXT, so a scalar's JSON *type* is not carried; its bytes are, exactly).
+- A duplicate key within one object, a non-object line, trailing content after the object, or a string decoding to a NUL via the `\u0000` escape (PostgreSQL text cannot hold NUL) is refused loudly naming the line. A single JSON *array* document is not NDJSON — the refusal names the conversion (`jq -c '.[]' file.json > out.ndjson`).
 
 ## Types: everything stages as TEXT; inference recovers the rest
 

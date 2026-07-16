@@ -59,10 +59,14 @@
 // float64 — so int64 > 2^53, arbitrary-precision decimals, and big
 // integers land byte-exact. Strings are JSON-decoded (\u escapes and all);
 // true/false carry as the text `true`/`false`; null is SQL NULL; a nested
-// object/array carries its raw JSON text verbatim. An ABSENT key and an
-// explicit null both land as SQL NULL (the one representational collapse,
-// documented in ADR-0163); a DUPLICATE key within one object is refused
-// loudly rather than last-wins.
+// object/array carries its raw JSON text verbatim. Two representational
+// collapses ride the TEXT staging posture (both documented in ADR-0163,
+// both value-exact): an ABSENT key and an explicit null land as the same
+// SQL NULL, and a scalar and its string spelling stage identically
+// (`"1"` and `1` both stage as the text `1`, `"true"` and `true` as
+// `true`) — the JSON TYPE of a scalar is not carried, its bytes are. A
+// DUPLICATE key within one object is refused loudly rather than
+// last-wins.
 //
 // # Capability shape
 //
