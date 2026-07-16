@@ -4,6 +4,25 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.257] - 2026-07-15
+
+Response to the 2026-07-15 repo audit's M0 safety-net plan: both OBSERVED CRITICAL silent-loss defects, the HIGH silent UTC shift, and the gate integrity fixes.
+
+### Fixed
+
+- **CRITICAL (mydumper): silent statement drop on torn or re-encoded dumps.** The chunk reader skipped any statement whose first token didn't lex to a SQL keyword, so a UTF-8 BOM at chunk start silently dropped the whole first INSERT and a severed INSERT fragment in a torn dump vanished with exit 0 — and `verify --depth count` rode the same path, confirming the loss instead of catching it. A leading BOM is now stripped losslessly with a WARN (matching the flat-file engines), and any other keyword-less non-comment fragment refuses loudly naming the file and the offending bytes, on both the migrate and verify count paths; schema files get the same treatment, and unterminated `/*!NNNNN` versioned comments now refuse instead of silently skipping.
+- **CRITICAL (resume cursors): lossless typed envelope for the resume-PK store.** Binary PK cursors (`BINARY`/`VARBINARY`/`BLOB`/`BYTEA`) were mangled by the JSON control-table round-trip (invalid-UTF-8 bytes replaced with U+FFFD; the migrate path additionally re-bound base64 text), and integer PK cursors above 2⁵³ drifted through float64 — a resumed `sluice backfill` or interrupted-`migrate` resume could silently skip (or replay past the documented one-chunk bound) arbitrary PK ranges. Cursor slices (`last_pk` and chunk bounds) now persist in a blobcodec-style tagged envelope (`{"_t":"i64|u64|bytes|f64|time"}`), decoded exact-integer-first; legacy plain cursors keep resuming exactly (including bare `BIGINT UNSIGNED` values above MaxInt64), while provably-mangled legacy cursors refuse loudly with the new coded `SLUICE-E-BACKFILL-CORRUPT-CURSOR` (re-run with `--restart`) on backfill and self-heal via the existing truncate-and-redo disposition on migrate. Resume fidelity is now integration-pinned per orderable PK family (large-int, binary, composite, temporal, multibyte string) on real MySQL and Postgres — the Bug-74 family discipline extended to cursor round-trips.
+- **`--infer-types` (auto-engaged for csv/tsv/ndjson sources) no longer silently UTC-shifts zoned timestamps carrying leading/trailing whitespace.** The temporal validator's zone classification ran over the raw staged value while the decoder trimmed before parsing, so a column of `…+05:00␠` values resolved as naive timestamp with every wall clock silently shifted. Classification now runs over the whitespace-TRIMmed value — trimming exactly the full Unicode White_Space set the decoder trims, with a test pinning the two character sets equal — so padded zoned values resolve `timestamptz` with instants intact; padded bare dates and naive datetimes now also promote (previously kept text).
+
+### CI / developer gate
+
+- **`scripts/pre-commit.ps1` no longer soft-skips the CI coverage guards when `sh` is missing from PATH** — it resolves Git for Windows' bundled `bin\sh.exe` and hard-fails with instructions if genuinely unavailable, closing the gap that let an uncovered integration package ship to a red main.
+- **psverify can no longer green while skipping.** The workflow now passes the full `PLANETSCALE_*` service-token/expand-contract/metrics env surface its suites read (it previously satisfied only 2 of 6 suites) and fails the job if ANY psverify test skips — a live-verification run that skipped anything did not verify what it claims.
+
+### Compatibility
+
+- **No breaking changes.** The cursor store change is one-way forward-compatible: new binaries read all legacy rows; an old binary reading new envelope rows fails loudly at bind (never silently wrong), same contract as every prior state-shape change. One new error code; the mydumper refusals convert silent losses into loud errors on inputs that were losing data.
+
 ## [0.99.256] - 2026-07-15
 
 ### Fixed
