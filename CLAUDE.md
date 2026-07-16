@@ -54,7 +54,7 @@ Six required checks gate merges (see `.github/workflows/ci.yml` — heavily comm
 - **Lint** — golangci-lint + the tags-vet matrix (`scripts/vet-tags.sh`: type-checks every `//go:build` combo incl. tagged test files) + the shard-coverage guard
 - **Build (ubuntu-latest)** — `go build ./...` smoke test
 
-Non-required but running: **govulncheck** (reachability-based vuln scan), scheduled fuzz (`fuzz-roundtrip.yml`, weekly fresh-seed deep run), the Vitess version matrix (weekly), prebaked-image builds. Branch protection requires the six named checks; linear history is enforced (no merge commits).
+Non-required but running: **govulncheck** (reachability-based vuln scan), scheduled fuzz (`fuzz-roundtrip.yml`, weekly fresh-seed deep run), the Vitess version matrix (weekly), prebaked-image builds, and **DuckDB parquet compat** (`duckdb-verify.yml`: a family×shape matrix export read back with real DuckDB — the independent-reader gate for the parquet boundary; path-triggered on parquet-touching changes + weekly). Branch protection requires the six named checks; linear history is enforced (no merge commits).
 
 ## Lint and format gotchas (these have bitten us)
 

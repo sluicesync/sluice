@@ -4,6 +4,27 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.259] - 2026-07-16
+
+The 2026-07-15 audit's performance batch and its two remaining leverage items: the mode-parity fallback threading and the independent-reader parquet gate.
+
+### Added
+
+- **`--stage-dir` (env `SLUICE_STAGE_DIR`)** relocates sluice's large scratch files — the flat-file staged copy, the D1 `--stage-local` replica, and the export-as-parquet per-table scratch — off the system temp dir (the tmpfs `/tmp` hazard, ADR-0145's class); a missing directory refuses loudly. The sqlite `.sql`-dump materialize path does not honor it yet (same class, filed in roadmap item 72 M3).
+- **The ADR-0148 deploy-request index-build fallback now arms on `restore` and the `sync start` cold-start, not just `migrate` (audit MED-A1)** — the same walled PlanetScale index build in those modes previously always ended at the `SLUICE-E-INDEX-*` hint even with credentials available. Same flag set and defaults as migrate; on restore/sync the existing `--planetscale-org` serves both the telemetry opt-in and the fallback (each arms on its own token pair; a fallback-only arming no longer trips the telemetry all-or-nothing refusal, and the org flag deliberately has no ambient env binding on those two commands). Unarmed runs are byte-identical. Fleet `sync run` and the broker remain unarmed — filed as explicit perf-parity gaps, not implied.
+- **A non-required `DuckDB parquet compat` CI workflow:** a deterministic family×shape matrix export (uint64 max, −0.0 signbit, NaN/±Inf, denormals, all three DECIMAL tiers, µs temporals, JSON, empty-vs-NULL, array element families, row-group placement, footer metadata incl. GeoParquet CRS) is generated through the real export codec and read back with real DuckDB, comparing values exactly — catching any future parquet-go upgrade that breaks external readability while sluice's own self-pins stay green (audit MED-T3). Plus raw-fixture response-shape pins for every PlanetScale API endpoint whose fields sluice reads, provenance-labeled captured/live-verified/derived (MED-T4).
+
+### Performance
+
+- **The mydumper reader's statement stream is now linear in statement size (audit MED-P1, measured).** Dumps taken with `--statement-size 64M` previously re-lexed the carried statement on every 1 MiB read block — measured 2.23s for one 64 MiB statement, ~17× slower per byte than small statements. Each byte is now lexed exactly once by a boundary-spanning incremental lexer (128ms for the same statement, 524 MB/s), with the token semantics pinned byte-identical against the original splitter as oracle across every token family × block-boundary offset.
+- **csv/tsv/ndjson migrates stage the source into temp SQLite once, not twice (MED-P2)** — the schema and row readers share one refcounted staged copy, halving staging writes and peak temp space (a 20 GB CSV no longer costs ~40 GB of temp).
+- **`backup export-as-parquet` bounds writer memory on BLOB-heavy tables (MED-P3)** by rolling row groups at a 128 MiB byte target inside oversized source chunks — row groups still never span chunks, and `parquet_index.json` records the actual count (ADR-0164 amendment).
+- **mydumper `.gz` dump chunks decompress via klauspost gzip** (~1.5× measured on realistic-entropy dump text).
+
+### Compatibility
+
+- **No breaking changes.** One new optional flag; the restore/sync fallback arming is opportunistic and WARN-at-most (never-worse pinned per mode); typical parquet exports are byte-identical in shape (the byte-roll engages only on oversized chunks); the statement-stream rewrite is oracle-pinned byte-identical.
+
 ## [0.99.258] - 2026-07-16
 
 The 2026-07-15 audit's M1 correctness batch (all eleven items), roadmap item 71(b), Bug 190, and the two findings from the first-ever psverify CI dispatch.

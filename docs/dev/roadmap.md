@@ -895,7 +895,7 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
-### 72. Repo-audit 2026-07-15 remediation (delta v0.99.231–256; grade B+) — *M0 SHIPPED v0.99.257; ALL of M1 + the reviewer fast-follow pins SHIPPED v0.99.258 (with ADR-0166/0167 and the psverify-dispatch findings); M2/M3 open*
+### 72. Repo-audit 2026-07-15 remediation (delta v0.99.231–256; grade B+) — *M0 SHIPPED v0.99.257; M1 + pins SHIPPED v0.99.258; M2 COMPLETE v0.99.259 (perf batch MED-P1/P2/P3+M3.3, fallback mode-threading MED-A1, DuckDB gate MED-T3+T4 pins, site port prepared local-only, docs refresh) — remaining: M3 tail + fleet/broker arming gap #12 + flat-file pool gap #13 + sqlite dump.go stage-dir*
 
 The fresh audit (45-agent fan-out; full doc in the operator's `workspace/repo-audit-2026-07-15.md`, gitignored) found two OBSERVED CRITICAL silent-loss defects in the new surfaces plus a HIGH UTC shift — all fixed in v0.99.257 (M0.1 mydumper keyword-less fragment refusal + BOM; M0.2 resume-cursor typed envelope + `SLUICE-E-BACKFILL-CORRUPT-CURSOR`; M0.3 infer-types TRIM classification; M0.5 pre-commit guard hard-fail; M0.4 psverify env + fail-on-skip). Root-cause theme: the Bug-74 family discipline was applied to values but not to cursor/statement-stream round-trips. Remaining, in audit priority order:
 
