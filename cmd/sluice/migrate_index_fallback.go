@@ -118,19 +118,28 @@ func (m *MigrateCmd) planetScaleIndexFallback() ir.IndexBuildFallback {
 // the ADR-0107/0115 telemetry opt-in (metrics token pair, all-or-nothing
 // loud refusal) and the ADR-0148 index-build fallback (service token
 // pair, opportunistic). When the org is evidently set FOR the fallback —
-// the fallback armed and NO metrics token piece was supplied — the org is
-// blanked for the telemetry builder so a fallback-only arming doesn't
-// trip the telemetry refusal; telemetry simply stays off, named by a
-// WARN. Every other combination is byte-identical to before: a complete
-// metrics pair runs telemetry alongside the fallback, and a PARTIAL
-// metrics pair (evident telemetry intent, typo'd) keeps the loud
-// all-or-nothing refusal.
-func telemetryParamsSharedOrg(ctx context.Context, p telemetryParams, fallbackArmed bool) telemetryParams {
-	if !fallbackArmed || p.org == "" || p.tokenID != "" || p.token != "" {
+// the COMPLETE service-token pair was supplied and NO metrics token piece
+// was — the org is blanked for the telemetry builder so a fallback-only
+// arming doesn't trip the telemetry refusal; telemetry simply stays off,
+// named by a WARN. Every other combination is byte-identical to before: a
+// complete metrics pair runs telemetry alongside the fallback, and a
+// PARTIAL metrics pair (evident telemetry intent, typo'd) keeps the loud
+// all-or-nothing refusal — as does an org with no token pair of either
+// kind (the typo-catch).
+//
+// Fallback intent is keyed on the SUPPLIED service-token pair, deliberately
+// NOT on whether composePlanetScaleIndexFallback armed: compose returns nil
+// on every non-planetscale target (where the fallback flags' documented
+// contract is "inert") and on an underivable database name, but the
+// operator's expressed intent is the same there — keying on the composed
+// fallback's nil-ness made those runs trip the telemetry refusal (Bug 192,
+// breaking the v0.99.259 inert-off-planetscale contract).
+func telemetryParamsSharedOrg(ctx context.Context, p telemetryParams, serviceTokenID, serviceToken string) telemetryParams {
+	if serviceTokenID == "" || serviceToken == "" || p.org == "" || p.tokenID != "" || p.token != "" {
 		return p
 	}
 	slog.WarnContext(ctx,
-		"--planetscale-org arms the deploy-request index-build fallback (service token resolved); target-health telemetry stays OFF — supply --planetscale-metrics-token-id/--planetscale-metrics-token to enable it too")
+		"--planetscale-org with a service-token pair selects the deploy-request index-build fallback (inert on non-planetscale targets); target-health telemetry stays OFF — supply --planetscale-metrics-token-id/--planetscale-metrics-token to enable it too")
 	p.org = ""
 	return p
 }

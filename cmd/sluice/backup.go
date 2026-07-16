@@ -1886,8 +1886,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// ADR-0148 / audit MED-A1: arm the automatic deploy-request index-build
 	// fallback when the target is planetscale and the control-plane
 	// credentials resolve; nil (unarmed) leaves the index phase
-	// byte-identical to before. Composed BEFORE the telemetry build so the
-	// shared --planetscale-org can be reconciled between the two consumers.
+	// byte-identical to before.
 	indexFallback := composePlanetScaleIndexFallback(indexFallbackParams{
 		targetDriver:  r.TargetDriver,
 		targetDSN:     r.Target,
@@ -1902,19 +1901,12 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// OPTIONAL PlanetScale telemetry (ADR-0107) — used here only to clamp the
 	// AUTO parallelism product by live headroom (ADR-0115). (nil, nil) when
 	// off; an org without a complete token pair is a loud refusal — except a
-	// fallback-only arming (org + service token, no metrics token piece),
-	// which telemetryParamsSharedOrg routes to telemetry-off-with-WARN
-	// instead. Closed at return so its background poller stops.
-	telemetryProvider, err := buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, telemetryParams{
-		org:       r.PlanetScaleOrg,
-		tokenID:   r.PlanetScaleMetricsTokenID,
-		token:     r.PlanetScaleMetricsToken,
-		metricsDB: r.PlanetScaleMetricsDB,
-		branch:    r.PlanetScaleMetricsBranch,
-		targetDSN: r.Target,
-		engine:    r.TargetDriver,
-		quiet:     pretty, // no telemetry-enabled INFO above the panel (ADR-0156 polish)
-	}, indexFallback != nil))
+	// fallback-intent arming (org + service-token pair, no metrics token
+	// piece), which telemetryParamsSharedOrg routes to
+	// telemetry-off-with-WARN instead — on ANY target engine (Bug 192).
+	// Closed at return so its background poller stops. quiet=pretty: no
+	// telemetry-enabled INFO above the panel (ADR-0156 polish).
+	telemetryProvider, err := r.buildTargetTelemetry(ctx, pretty)
 	if err != nil {
 		return err
 	}

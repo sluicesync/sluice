@@ -1425,10 +1425,12 @@ type telemetryParams struct {
 	quiet bool
 }
 
-// fallbackArmed reconciles the shared --planetscale-org between its two
-// consumers (see telemetryParamsSharedOrg): a fallback-only arming turns
-// telemetry off with a WARN instead of tripping the all-or-nothing refusal.
-func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet, fallbackArmed bool) (*pstelemetry.Provider, error) {
+// The shared --planetscale-org is reconciled between its two consumers by
+// telemetryParamsSharedOrg, keyed on the supplied SERVICE-token pair (the
+// operator's expressed fallback intent — Bug 192): a fallback-intent-only
+// org turns telemetry off with a WARN instead of tripping the
+// all-or-nothing refusal, on any target engine.
+func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet bool) (*pstelemetry.Provider, error) {
 	return buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, telemetryParams{
 		org:       s.PlanetScaleOrg,
 		tokenID:   s.PlanetScaleMetricsTokenID,
@@ -1438,7 +1440,23 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet, fallbackA
 		targetDSN: s.Target,
 		engine:    s.TargetDriver,
 		quiet:     quiet,
-	}, fallbackArmed))
+	}, s.PlanetScaleServiceTokenID, s.PlanetScaleServiceToken))
+}
+
+// buildTargetTelemetry is restore's twin of the sync-start builder above —
+// the same shared-org reconciliation, from RestoreCmd's flags. quiet is the
+// pretty-panel gate (ADR-0156 polish).
+func (r *RestoreCmd) buildTargetTelemetry(ctx context.Context, quiet bool) (*pstelemetry.Provider, error) {
+	return buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, telemetryParams{
+		org:       r.PlanetScaleOrg,
+		tokenID:   r.PlanetScaleMetricsTokenID,
+		token:     r.PlanetScaleMetricsToken,
+		metricsDB: r.PlanetScaleMetricsDB,
+		branch:    r.PlanetScaleMetricsBranch,
+		targetDSN: r.Target,
+		engine:    r.TargetDriver,
+		quiet:     quiet,
+	}, r.PlanetScaleServiceTokenID, r.PlanetScaleServiceToken))
 }
 
 // planetScaleIndexFallback composes the ADR-0148 deploy-request index-build
@@ -1899,7 +1917,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// composition root (the sole place allowed to import the PS provider);
 	// the streamer holds it as the engine-neutral ir.TargetTelemetry. Nil
 	// when the operator did not opt in ⇒ byte-identical default sync.
-	telemetryProvider, err := buildTargetTelemetry(kongContext(), s, prettyPanel, indexFallback != nil)
+	telemetryProvider, err := buildTargetTelemetry(kongContext(), s, prettyPanel)
 	if err != nil {
 		return err
 	}

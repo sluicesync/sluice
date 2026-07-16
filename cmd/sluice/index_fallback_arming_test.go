@@ -208,26 +208,29 @@ func TestSyncStartIndexFallbackFlags_ThroughKong(t *testing.T) {
 }
 
 // TestTelemetryParamsSharedOrg pins the one-flag-two-consumers
-// reconciliation: a fallback-only arming (org + service tokens, no
+// reconciliation, keyed on the SUPPLIED service-token pair (the operator's
+// expressed fallback intent — Bug 192), not on whether the fallback
+// composed: a fallback-intent arming (org + complete service pair, no
 // metrics token piece) blanks the org for the telemetry builder —
 // telemetry off, no refusal — while every telemetry-shaped input is
-// byte-identical to before (complete pair runs, PARTIAL pair keeps the
-// loud all-or-nothing refusal, unarmed keeps the refusal too).
+// byte-identical to before (complete metrics pair runs, PARTIAL metrics
+// pair keeps the loud all-or-nothing refusal, and org with no service
+// pair keeps the refusal too — the typo-catch).
 func TestTelemetryParamsSharedOrg(t *testing.T) {
 	ctx := context.Background()
 	base := telemetryParams{org: "acme", targetDSN: "dsn", engine: "planetscale"}
 
-	t.Run("fallback-only arming blanks the org (telemetry off, no refusal)", func(t *testing.T) {
-		got := telemetryParamsSharedOrg(ctx, base, true)
+	t.Run("fallback-intent arming blanks the org (telemetry off, no refusal)", func(t *testing.T) {
+		got := telemetryParamsSharedOrg(ctx, base, "svc-id", "svc-secret")
 		if got.org != "" {
 			t.Errorf("org = %q; want blanked", got.org)
 		}
 		if _, err := buildTargetTelemetryProvider(ctx, got); err != nil {
-			t.Errorf("telemetry builder refused a fallback-only arming: %v", err)
+			t.Errorf("telemetry builder refused a fallback-intent arming: %v", err)
 		}
 	})
-	t.Run("unarmed keeps the all-or-nothing refusal", func(t *testing.T) {
-		got := telemetryParamsSharedOrg(ctx, base, false)
+	t.Run("org alone keeps the all-or-nothing refusal (typo-catch)", func(t *testing.T) {
+		got := telemetryParamsSharedOrg(ctx, base, "", "")
 		if got.org != "acme" {
 			t.Fatalf("org = %q; want untouched", got.org)
 		}
@@ -235,10 +238,19 @@ func TestTelemetryParamsSharedOrg(t *testing.T) {
 			t.Error("org without any token pair must keep the loud telemetry refusal")
 		}
 	})
-	t.Run("partial metrics pair keeps the refusal even when armed", func(t *testing.T) {
+	t.Run("partial service pair is not fallback intent — refusal preserved", func(t *testing.T) {
+		got := telemetryParamsSharedOrg(ctx, base, "svc-id", "")
+		if got.org != "acme" {
+			t.Fatalf("org = %q; want untouched (half a service pair is a typo, not intent)", got.org)
+		}
+		if _, err := buildTargetTelemetryProvider(ctx, got); err == nil {
+			t.Error("a partial service pair must keep the all-or-nothing refusal")
+		}
+	})
+	t.Run("partial metrics pair keeps the refusal even with fallback intent", func(t *testing.T) {
 		p := base
 		p.tokenID = "mtok-id" // token missing — evident telemetry intent, typo'd
-		got := telemetryParamsSharedOrg(ctx, p, true)
+		got := telemetryParamsSharedOrg(ctx, p, "svc-id", "svc-secret")
 		if got.org != "acme" {
 			t.Fatalf("org = %q; want untouched (partial pair = telemetry intent)", got.org)
 		}
@@ -249,15 +261,98 @@ func TestTelemetryParamsSharedOrg(t *testing.T) {
 	t.Run("complete metrics pair is untouched", func(t *testing.T) {
 		p := base
 		p.tokenID, p.token = "mtok-id", "mtok-secret"
-		got := telemetryParamsSharedOrg(ctx, p, true)
+		got := telemetryParamsSharedOrg(ctx, p, "svc-id", "svc-secret")
 		if got.org != "acme" || got.tokenID != "mtok-id" || got.token != "mtok-secret" {
 			t.Errorf("params changed for a complete pair: %+v", got)
 		}
 	})
 	t.Run("empty org is untouched", func(t *testing.T) {
-		got := telemetryParamsSharedOrg(ctx, telemetryParams{}, true)
+		got := telemetryParamsSharedOrg(ctx, telemetryParams{}, "svc-id", "svc-secret")
 		if got.org != "" {
 			t.Errorf("org = %q; want empty", got.org)
+		}
+	})
+}
+
+// TestSharedOrgFallbackIntent_NonPlanetScaleTarget_ThroughKong is the Bug-192
+// pin: `--planetscale-org` + the service-token pair on a NON-planetscale
+// target must leave the fallback inert AND not trip the telemetry
+// all-or-nothing refusal — the v0.99.259 release contract ("fallback-only
+// arming no longer trips the telemetry refusal; inert off-planetscale").
+// Per the Bug-180 discipline the flag trio goes through the real kong
+// parser for BOTH commands, and the assertion drives the same wired
+// builders the commands call (RestoreCmd.buildTargetTelemetry /
+// buildTargetTelemetry), which is where the refusal would surface as an
+// error before any run work starts.
+func TestSharedOrgFallbackIntent_NonPlanetScaleTarget_ThroughKong(t *testing.T) {
+	ctx := context.Background()
+	armTrio := []string{
+		"--planetscale-org=bogus",
+		"--planetscale-service-token-id=x",
+		"--planetscale-service-token=y",
+	}
+
+	t.Run("restore", func(t *testing.T) {
+		cli := &CLI{}
+		parser, err := kong.New(cli, kong.Exit(func(int) {}))
+		if err != nil {
+			t.Fatalf("kong.New: %v", err)
+		}
+		args := append([]string{
+			"restore", "--from-dir=/backups/x",
+			"--target-driver=mysql", "--target=user:pw@tcp(h:3306)/db",
+		}, armTrio...)
+		if _, err := parser.Parse(args); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		r := &cli.Restore
+		if fb := composePlanetScaleIndexFallback(r.testIndexFallbackParams()); fb != nil {
+			t.Errorf("fallback = %#v; want nil (inert on a non-planetscale target)", fb)
+		}
+		p, err := r.buildTargetTelemetry(ctx, false)
+		if err != nil {
+			t.Errorf("restore telemetry build refused a fallback-intent arming on a non-planetscale target: %v", err)
+		}
+		if p != nil {
+			_ = p.Close()
+			t.Error("telemetry must stay OFF (WARN-and-blank), not run")
+		}
+		// org ALONE (no service pair) keeps the loud refusal — the typo-catch.
+		r.PlanetScaleServiceTokenID, r.PlanetScaleServiceToken = "", ""
+		if _, err := r.buildTargetTelemetry(ctx, false); err == nil {
+			t.Error("org alone must keep the loud telemetry refusal")
+		}
+	})
+
+	t.Run("sync start", func(t *testing.T) {
+		cli := &CLI{}
+		parser, err := kong.New(cli, kong.Exit(func(int) {}))
+		if err != nil {
+			t.Fatalf("kong.New: %v", err)
+		}
+		args := append([]string{
+			"sync", "start",
+			"--source-driver=mysql", "--source=src-dsn",
+			"--target-driver=mysql", "--target=user:pw@tcp(h:3306)/db",
+		}, armTrio...)
+		if _, err := parser.Parse(args); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		s := &cli.Sync.Start
+		if fb := s.planetScaleIndexFallback(); fb != nil {
+			t.Errorf("fallback = %#v; want nil (inert on a non-planetscale target)", fb)
+		}
+		p, err := buildTargetTelemetry(ctx, s, false)
+		if err != nil {
+			t.Errorf("sync-start telemetry build refused a fallback-intent arming on a non-planetscale target: %v", err)
+		}
+		if p != nil {
+			_ = p.Close()
+			t.Error("telemetry must stay OFF (WARN-and-blank), not run")
+		}
+		s.PlanetScaleServiceTokenID, s.PlanetScaleServiceToken = "", ""
+		if _, err := buildTargetTelemetry(ctx, s, false); err == nil {
+			t.Error("org alone must keep the loud telemetry refusal")
 		}
 	})
 }
