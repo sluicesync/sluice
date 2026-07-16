@@ -1326,7 +1326,7 @@ type SourceHostAdvisory struct {
 //     and long-lived snapshot transactions can exhaust the pool
 //     mid-copy.
 //   - The MySQL engine warns on DigitalOcean Managed MySQL hosts when
-//     cdc is true: the platform purges binlogs out-of-band ~10-15
+//     cdc is true: the platform purges binlogs out-of-band ~13-16
 //     minutes after creation regardless of what
 //     @@binlog_expire_logs_seconds reports, so the host pattern is
 //     the ONLY reliable preflight signal (the variable lies).

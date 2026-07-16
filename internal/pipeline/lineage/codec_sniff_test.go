@@ -22,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // putRealChunk writes a REAL chunk (via blobcodec.ChunkWriter, so the
@@ -247,6 +248,43 @@ func TestRebuildCatalog_EncryptedWithEnvelopeSniffs(t *testing.T) {
 	if got := cat.Segments[0].Codec; got != blobcodec.CodecGzip {
 		t.Errorf("encrypted rebuild codec = %q; want the decrypt-sniffed %q", got, blobcodec.CodecGzip)
 	}
+}
+
+// TestSniffChainCodec_KEKModeMismatchIsCoded: the up-front kek_mode gate
+// (an envelope of the wrong KIND against the chain's recorded mode) is
+// the codec probe's face of SLUICE-E-BACKUP-ENCRYPTION-MISMATCH — same
+// coded class as the restore/verify/writer preflights (audit-2026-07-15
+// M3), refused before any unwrap attempt.
+func TestSniffChainCodec_KEKModeMismatchIsCoded(t *testing.T) {
+	store := newMemStore()
+	encryptedSniffFixture(t, store, blobcodec.CodecGzip) // records KEKMode passphrase-argon2id
+
+	recs, err := ListAllManifestsViaWalk(context.Background(), store)
+	if err != nil {
+		t.Fatalf("ListAllManifestsViaWalk: %v", err)
+	}
+	_, _, err = SniffChainCodec(context.Background(), store, recs, kekModeStubEnvelope{mode: crypto.KEKModeAWSKMS})
+	if err == nil {
+		t.Fatal("SniffChainCodec with a mismatched-mode envelope: nil error; want a coded refusal")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeBackupEncryptionMismatch {
+		t.Errorf("want %s, got %v", sluicecode.CodeBackupEncryptionMismatch, err)
+	}
+}
+
+// kekModeStubEnvelope satisfies [crypto.EnvelopeEncryption] for the mode
+// gate above; Wrap/Unwrap are unreachable on that path and fail loudly
+// if accidentally hit.
+type kekModeStubEnvelope struct{ mode string }
+
+func (s kekModeStubEnvelope) Mode() string { return s.mode }
+func (s kekModeStubEnvelope) WrapCEK([]byte) ([]byte, error) {
+	return nil, errors.New("stub: WrapCEK not implemented")
+}
+
+func (s kekModeStubEnvelope) UnwrapCEK([]byte) ([]byte, error) {
+	return nil, errors.New("stub: UnwrapCEK not implemented")
 }
 
 // TestResolveLineage_SyntheticRoot_SniffsCodec_EveryFamily: the

@@ -747,6 +747,16 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 // never writer-legitimate — it is a store adversary blanking the id to slip the
 // recompute check (and, on an FV8 VStream segment, to un-bind the folded
 // CDCPositionCommitsAfterRows flag). Refuse it rather than skip.
+//
+// The skip is keyed on STRUCTURE as well as the recorded Kind (audit-2026-07-12
+// LOW): Kind is itself a manifest field, so an adversary blanking BackupID
+// could also relabel the segment `full` to take this skip. A manifest carrying
+// ChangeChunks IS a CDC segment whatever its label says, so it never skips. The
+// conservative residual: evading BOTH keys means relabeling to full AND
+// stripping the ChangeChunks — which degrades the tamper to the emptied-window
+// shape the chain walk refuses via the EndPosition-reached backstop
+// (Bug 183/184) and breaks the segment structure the lineage walk derives from
+// fulls. Full tamper-proofing remains signing (--require-signature).
 func verifyBackupIDs(links []lineage.SegmentRecord) error {
 	for i := range links {
 		m := links[i].Manifest
@@ -754,11 +764,11 @@ func verifyBackupIDs(links []lineage.SegmentRecord) error {
 			continue
 		}
 		if m.BackupID == "" {
-			if m.Kind == irbackup.BackupKindIncremental {
+			if m.Kind == irbackup.BackupKindIncremental || len(m.ChangeChunks) > 0 {
 				return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
 					"restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time",
-					fmt.Errorf("chain restore: incremental manifest %s carries an empty BackupID — a CDC segment always records one, so this is a corrupt or blanked-to-evade-verification manifest; refusing before any data lands",
-						links[i].Path))
+					fmt.Errorf("chain restore: manifest %s carries an empty BackupID on a CDC segment (kind %q, %d change chunk(s)) — a CDC segment always records one, so this is a corrupt or blanked-to-evade-verification manifest; refusing before any data lands",
+						links[i].Path, lineage.CanonicalKind(m.Kind), len(m.ChangeChunks)))
 			}
 			continue
 		}

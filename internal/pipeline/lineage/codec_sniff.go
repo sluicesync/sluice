@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // ErrCodecSniffEncrypted reports that a codec probe hit an encrypted
@@ -212,8 +213,10 @@ func SniffChainCodec(ctx context.Context, store irbackup.Store, recs []ManifestR
 		}
 	}
 	if env != nil && chainRoot != nil && chainRoot.ChainEncryption.KEKMode != "" && env.Mode() != chainRoot.ChainEncryption.KEKMode {
-		return "", false, fmt.Errorf("codec probe: envelope mode %q does not match the chain's recorded kek_mode %q",
-			env.Mode(), chainRoot.ChainEncryption.KEKMode)
+		return "", false, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("codec probe: envelope mode %q does not match the chain's recorded kek_mode %q",
+				env.Mode(), chainRoot.ChainEncryption.KEKMode))
 	}
 	s := &chainCodecSniffer{store: store, env: env, chainRoot: chainRoot}
 	var (

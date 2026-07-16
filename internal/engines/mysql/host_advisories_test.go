@@ -12,8 +12,9 @@ import (
 
 // TestSourceHostAdvisories_DigitalOceanRetention pins the item-70a
 // lying-retention advisory: a CDC-anchoring run against a
-// *.db.ondigitalocean.com host WARNs naming the ~10-15-minute
-// out-of-band purge window and the binlog_retention_period config-API
+// *.db.ondigitalocean.com host WARNs naming the ~13-16-minute
+// out-of-band purge window (the live probe's observed bound) and the
+// binlog_retention_period config-API
 // remedy — the host pattern is the ONLY reliable signal because
 // @@binlog_expire_logs_seconds lies (live-probed 2026-07-15).
 func TestSourceHostAdvisories_DigitalOceanRetention(t *testing.T) {
@@ -31,7 +32,7 @@ func TestSourceHostAdvisories_DigitalOceanRetention(t *testing.T) {
 		"binlog_expire_logs_seconds",
 		"binlog_retention_period",
 		"86400",
-		"10-15 minutes",
+		"13-16 minutes",
 	} {
 		if !strings.Contains(a.Message, want) {
 			t.Errorf("message should mention %q; got: %s", want, a.Message)

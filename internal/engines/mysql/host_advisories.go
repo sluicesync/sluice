@@ -39,7 +39,7 @@ const doMySQLHostSuffix = ".db.ondigitalocean.com"
 // SourceHostAdvisories implements [ir.SourceHostAdvisor]: on a
 // CDC-anchoring run (sync, backup) whose source host is a DigitalOcean
 // Managed MySQL endpoint, WARN that effective binlog retention may be
-// ~10-15 minutes regardless of what @@binlog_expire_logs_seconds
+// ~13-16 minutes regardless of what @@binlog_expire_logs_seconds
 // reports, naming the config-API knob. A plain migrate never returns
 // to the binlog, so cdc=false is a no-op; so are non-DO hosts and
 // unparseable DSNs.
@@ -54,7 +54,7 @@ func (e Engine) SourceHostAdvisories(dsn string, cdc bool) []ir.SourceHostAdviso
 	return []ir.SourceHostAdvisory{{
 		Message: fmt.Sprintf(
 			"source host %q is a DigitalOcean Managed MySQL endpoint: on defaults the platform purges "+
-				"binlogs out-of-band ~10-15 minutes after creation REGARDLESS of what "+
+				"binlogs out-of-band ~13-16 minutes after creation REGARDLESS of what "+
 				"@@binlog_expire_logs_seconds reports (the variable reads 3 days but does not govern the "+
 				"purger) — a CDC position older than that window is unrecoverable, and a cold copy longer "+
 				"than it can livelock auto-resnapshot. Before relying on this stream, set the retention "+

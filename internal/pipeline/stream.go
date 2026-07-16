@@ -1848,8 +1848,12 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Man
 	case parentEnc == nil && b.Encryption != nil:
 		return nil, errors.New("stream: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals")
 	case parentEnc != nil && b.Encryption == nil:
-		return nil, fmt.Errorf("stream: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
-			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
+		// Write-side face of the read-side preflights (audit M3): same
+		// coded class so an operator's retry loop keys on one code.
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("stream: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+				parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef))
 	}
 	if err := b.Encryption.RebindForChain(parentEnc.Argon2id); err != nil {
 		return nil, fmt.Errorf("stream: rebuild envelope for chain: %w", err)
@@ -1858,8 +1862,10 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Man
 		return nil, errors.New("stream: encryption envelope is nil")
 	}
 	if parentEnc.KEKMode != "" && b.Encryption.Envelope.Mode() != parentEnc.KEKMode {
-		return nil, fmt.Errorf("stream: envelope mode %q does not match chain's recorded kek_mode %q",
-			b.Encryption.Envelope.Mode(), parentEnc.KEKMode)
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("stream: envelope mode %q does not match chain's recorded kek_mode %q",
+				b.Encryption.Envelope.Mode(), parentEnc.KEKMode))
 	}
 	mode := parentEnc.Mode
 	if mode == "" {

@@ -159,4 +159,13 @@ var (
 	_ ir.GrowGateSetter            = (*RowWriter)(nil)
 	_ ir.ExactCountEstimateOptIn   = (*RowReader)(nil)
 	_ ir.TargetMetricsHistoryStore = (*ChangeApplier)(nil)
+
+	// audit-2026-07-15 carried MED-3: ChainResumePreflighter is the
+	// incremental-backup slot preflight (chain_preflight.go) — dispatched
+	// by runtime type-assertion in migcore.PreflightChainResume. A drift
+	// here silently SKIPS the preflight, re-opening its two refusals'
+	// hazards: the missing-slot misdiagnosis and, worse, the
+	// confirmed_flush_lsn-ahead silent-loss window (an incremental that
+	// SUCCEEDS while missing every write in (parent, confirmed_flush]).
+	_ irbackup.ChainResumePreflighter = Engine{}
 )

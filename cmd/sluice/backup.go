@@ -92,6 +92,21 @@ func readKeyMaterial(spec string) ([]byte, error) {
 	return raw, nil
 }
 
+// resolveWriteSigner is the ONLY write-side (`backup full` / `backup
+// incremental`) entry to --sign-key resolution: it refuses the
+// --sign + --sign-key combo BEFORE building anything, then delegates to
+// [EncryptionFlags.buildSignKeySigner]. The ordering is load-bearing
+// (audit TEST-F3 T-2): a `--sign-key kms://...` builds a cloud KMS
+// client, so an invalid flag combo must refuse before any KMS
+// credential resolution / network attempt — previously the exclusivity
+// check ran on the BUILT signer, after that attempt.
+func (e *EncryptionFlags) resolveWriteSigner() (*lineage.Signer, error) {
+	if e.Sign && e.SignKey != "" {
+		return nil, errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519 / kms://) are mutually exclusive — choose one signing scheme")
+	}
+	return e.buildSignKeySigner()
+}
+
 // buildSignKeySigner builds the write-side signer from --sign-key, or nil
 // when the flag is unset. A `kms://<provider>/<keyref>` value selects the
 // KMS scheme (ADR-0154 Phase 3 — the private key stays in the HSM); any
@@ -833,12 +848,9 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return err
 	}
-	signer, err := b.buildSignKeySigner()
+	signer, err := b.resolveWriteSigner()
 	if err != nil {
 		return err
-	}
-	if b.Sign && signer != nil {
-		return errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519) are mutually exclusive — choose one signing scheme")
 	}
 	bk := &backup.Backup{
 		Source:              source,
@@ -1032,12 +1044,9 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	signer, err := b.buildSignKeySigner()
+	signer, err := b.resolveWriteSigner()
 	if err != nil {
 		return err
-	}
-	if b.Sign && signer != nil {
-		return errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519) are mutually exclusive — choose one signing scheme")
 	}
 	incr := &pipeline.IncrementalBackup{
 		Source:        source,

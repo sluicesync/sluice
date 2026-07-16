@@ -171,11 +171,11 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 			}
 		}
 		// M0.1 0-patched-of-N tripwire (audit item 58) + the audit-2026-07-11
-		// M-2 widening. The exact re-read built a NON-EMPTY map (exactCount>0:
-		// the source has rows for this table), so a TOTAL miss is a silent
+		// M-2 widening + the audit-2026-07-12 MED-2 close. A run that patched
+		// NOTHING while the table demonstrably has (or had) rows is a silent
 		// FLOAT-fidelity loss the default posture must not swallow silently —
 		// the over-cap and unrepairable rounded-fallbacks both WARN, and the
-		// file's contract is "rounded but SIGNALLED", never silent. Two shapes:
+		// file's contract is "rounded but SIGNALLED", never silent. Three shapes:
 		//
 		//   (1) streamed>0 && patched==0 — a systemic PK-rendering divergence
 		//       (the SL-F2 class: the exact-scan PK and the COPY PK render
@@ -189,6 +189,16 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 		//       window so only the later exact scan sees rows (legit). Refusing
 		//       would false-positive the legit case, so this WARNs in BOTH
 		//       postures rather than refuses.
+		//   (3) exactCount==0 && streamed>0 — the mirror of (2), the
+		//       audit-2026-07-12 MED-2 shape: the COPY streamed rows but the
+		//       exact re-read found NONE, so every streamed row keeps its
+		//       VStream display rounding with patched==0. AMBIGUOUS like (2):
+		//       every row deleted between the COPY and the re-read (legit
+		//       temporal skip — v0.99.228's "a legitimately empty source table
+		//       never trips" contract) OR a systemic exact-scan cursor/predicate
+		//       defect (bad). Refusing would false-positive the mass-delete
+		//       case, so this too WARNs in BOTH postures rather than refuses —
+		//       the file's contract is "rounded but SIGNALLED", never silent.
 		switch {
 		case exactCount > 0 && streamed > 0 && patched == 0 && r.strict:
 			r.mu.Lock()
@@ -208,6 +218,11 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 				"backup: exact FLOAT re-read found rows but the COPY streamed none for this table — a table empty at the snapshot position and filled during the window (legit) or a whole-table copy dropout; verify this table's row count",
 				slog.String("table", table.Name),
 				slog.Int("exact_rows", exactCount))
+		case exactCount == 0 && streamed > 0:
+			slog.WarnContext(ctx,
+				"backup: exact FLOAT re-read found no rows though the COPY streamed some — every row deleted between the snapshot and the re-read (legit) or a systemic exact-scan defect; this table's single-precision FLOATs are archived VStream display-rounded, verify its row count",
+				slog.String("table", table.Name),
+				slog.Int64("streamed", streamed))
 		}
 	}()
 	return out, nil

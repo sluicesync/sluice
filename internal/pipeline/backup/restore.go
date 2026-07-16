@@ -1552,10 +1552,10 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				errors.New("verify: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to report a plaintext-claiming chain as verified under a key"))
 		}
 		if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
-			return 0, 0, false, false, fmt.Errorf(
-				"verify: envelope mode %q does not match chain's recorded kek_mode %q",
-				opts.Envelope.Mode(), rootEnc.KEKMode,
-			)
+			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+				"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+				fmt.Errorf("verify: envelope mode %q does not match chain's recorded kek_mode %q",
+					opts.Envelope.Mode(), rootEnc.KEKMode))
 		}
 		if len(rootEnc.WrappedCEK) > 0 {
 			// ADR-0152 chokepoint: bound unwrap for v5+ roots +

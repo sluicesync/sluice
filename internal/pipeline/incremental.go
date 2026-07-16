@@ -48,6 +48,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // DefaultIncrementalWindow is the default value of
@@ -1260,8 +1261,12 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	case parentEnc == nil && b.Encryption != nil:
 		return nil, errors.New("incremental: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals")
 	case parentEnc != nil && b.Encryption == nil:
-		return nil, fmt.Errorf("incremental: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
-			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
+		// Write-side face of the read-side preflights (audit M3): same
+		// coded class so an operator's retry loop keys on one code.
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("incremental: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+				parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef))
 	}
 	// Both non-nil: rebind the envelope to the chain's salt (Bug 43)
 	// before validating mode / unwrapping the chain CEK.
@@ -1272,8 +1277,10 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 		return nil, errors.New("incremental: encryption envelope is nil")
 	}
 	if parentEnc.KEKMode != "" && b.Encryption.Envelope.Mode() != parentEnc.KEKMode {
-		return nil, fmt.Errorf("incremental: envelope mode %q does not match chain's recorded kek_mode %q",
-			b.Encryption.Envelope.Mode(), parentEnc.KEKMode)
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("incremental: envelope mode %q does not match chain's recorded kek_mode %q",
+				b.Encryption.Envelope.Mode(), parentEnc.KEKMode))
 	}
 	mode := parentEnc.Mode
 	if mode == "" {

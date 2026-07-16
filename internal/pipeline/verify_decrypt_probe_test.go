@@ -15,6 +15,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestVerifyBackupWith_DecryptProbe_Bug117 pins the Bug 117 (v0.94.1)
@@ -212,6 +213,12 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "does not match chain's recorded kek_mode") {
 			t.Errorf("error = %q; want substring about mode mismatch", err.Error())
+		}
+		// audit-2026-07-15 M3: verify's decrypt-preflight face carries the
+		// same coded class as the restore/writer preflights.
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeBackupEncryptionMismatch {
+			t.Errorf("want %s, got %v", sluicecode.CodeBackupEncryptionMismatch, err)
 		}
 	})
 }

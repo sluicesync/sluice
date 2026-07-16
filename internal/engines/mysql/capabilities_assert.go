@@ -145,4 +145,16 @@ var (
 	_ ir.ConcurrentCopyPartitioner = (*concurrentBinlogRows)(nil)
 	_ ir.WorkStealingCopyReader    = (*concurrentBinlogRows)(nil)
 	_ ir.ConcurrentCopyPartitioner = (*vstreamSnapshotRows)(nil)
+
+	// audit-2026-07-15 M3.4 / carried MED-3: the last two unpinned
+	// runtime-dispatched surfaces this engine implements.
+	// ControlTableDDLProvider backs `sluice control-tables ddl` — a drift
+	// degrades it to the runtime "engine does not provide control-table
+	// DDL" refusal, breaking the documented PlanetScale safe-migrations
+	// bootstrap recipe (deploy-request path, ADR-0162).
+	// ParallelIdempotentCopyWriter is the ADR-0097 cold-start COPY write
+	// fan-out — a drift silently collapses the N-connection apply to the
+	// serial path (a large perf downgrade, no correctness signal at all).
+	_ ir.ControlTableDDLProvider      = Engine{}
+	_ ir.ParallelIdempotentCopyWriter = (*RowWriter)(nil)
 )

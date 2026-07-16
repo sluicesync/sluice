@@ -62,6 +62,25 @@ func TestVerifyBackupIDs_EmptyIDIncremental_Refused(t *testing.T) {
 			t.Fatalf("legacy empty-id full refused: %v", err)
 		}
 	})
+
+	t.Run("empty-id CDC segment RELABELED full still refused (structure key, audit-2026-07-12 LOW)", func(t *testing.T) {
+		// The Kind field is itself attacker-controllable: blanking the id
+		// AND relabeling the segment `full` (or blanking Kind, which
+		// canonicalises to full) took the legacy-full skip pre-fix. The
+		// refusal now also keys on the manifest CARRYING ChangeChunks — a
+		// CDC segment whatever its label says.
+		for _, kind := range []string{irbackup.BackupKindFull, ""} {
+			relabeled := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+			relabeled.Kind = kind
+			relabeled.BackupID = "" // blanked
+			relabeled.ChangeChunks = []*irbackup.ChunkInfo{{File: "changes/chunk-000001.jsonl.zst"}}
+			links := []lineage.SegmentRecord{
+				{ManifestRecord: lineage.ManifestRecord{Manifest: full, Path: "full.json"}},
+				{ManifestRecord: lineage.ManifestRecord{Manifest: relabeled, Path: "incr.json"}},
+			}
+			assertCoded(t, backup.VerifyBackupIDs(links), sluicecode.CodeBackupManifestInvalid)
+		}
+	})
 }
 
 // TestChainRestore_EmptiedWindowForgedAnchor_RefusedRegardlessOfEngine pins

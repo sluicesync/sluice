@@ -364,12 +364,55 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		}
 	})
 
-	t.Run("strict empty exact map never trips", func(t *testing.T) {
-		// An empty source table → empty exact map → nothing to patch → the
-		// exactCount>0 guard keeps --strict-float from a false refusal.
-		pr := newFloatExactPatchReader(disjointInner(), exactSourceEngine{}, "dsn", plan, 0, true)
-		if err := drain(t, pr); err != nil {
-			t.Fatalf("strict + empty exact map must NOT refuse (nothing to patch); got: %v", err)
+	t.Run("empty exact map + streamed rows WARNs, never refuses (audit-2026-07-12 MED-2)", func(t *testing.T) {
+		// The mirror of streamed==0: the COPY streamed rows but the exact
+		// re-read found NONE, so every streamed row keeps its display
+		// rounding with patched==0. Ambiguous (mass delete during the window
+		// is legit; a systemic exact-scan defect is not) → WARN loudly in
+		// BOTH postures, but never refuse. Pre-fix this shape was the one
+		// SILENT cell of the tripwire matrix.
+		for _, strict := range []bool{true, false} {
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+			pr := newFloatExactPatchReader(disjointInner(), exactSourceEngine{}, "dsn", plan, 0, strict)
+			gotErr := drain(t, pr)
+			slog.SetDefault(prev)
+
+			if gotErr != nil {
+				t.Fatalf("strict=%v: empty exact map must NOT refuse (legit mass-delete); got: %v", strict, gotErr)
+			}
+			if got := logBuf.String(); !strings.Contains(got, "exact FLOAT re-read found no rows") || !strings.Contains(got, table.Name) {
+				t.Errorf("strict=%v: empty exact map + streamed rows must WARN loudly naming the table; log = %q", strict, got)
+			}
+		}
+	})
+
+	t.Run("empty table both sides stays silent", func(t *testing.T) {
+		// exactCount==0 && streamed==0: a genuinely empty table has nothing
+		// to signal — no error, no WARN.
+		for _, strict := range []bool{true, false} {
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+			pr := newFloatExactPatchReader(&fakeInnerReader{rows: nil}, exactSourceEngine{}, "dsn", plan, 0, strict)
+			ch, err := pr.ReadRows(context.Background(), table)
+			if err != nil {
+				t.Fatalf("ReadRows: %v", err)
+			}
+			for range ch { //nolint:revive // drain
+			}
+			gotErr := pr.Err()
+			slog.SetDefault(prev)
+
+			if gotErr != nil {
+				t.Fatalf("strict=%v: empty table must NOT refuse: %v", strict, gotErr)
+			}
+			if got := logBuf.String(); strings.Contains(got, table.Name) {
+				t.Errorf("strict=%v: empty table must stay silent; log = %q", strict, got)
+			}
 		}
 	})
 }
