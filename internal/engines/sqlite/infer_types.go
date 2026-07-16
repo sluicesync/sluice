@@ -233,7 +233,30 @@ func validateInferredType(
 		if berr != nil {
 			return false, nil, 0, berr
 		}
-		return bad == 0, ir.JSON{Binary: true}, total, nil
+		if bad != 0 {
+			return false, ir.JSON{Binary: true}, total, nil
+		}
+		// REFUSE duplicate object keys (the 2026-07-15 audit's MED-D0-3).
+		// SQLite json_valid accepts `{"a":1,"a":2}`, but a jsonb target
+		// KEEPS ONLY THE LAST duplicate (verified on PG 16.14, at every
+		// nesting depth) — and SQLite's own json_extract reads the FIRST,
+		// so promotion would both drop members and flip which value wins.
+		// json_tree emits every member of the parsed document with keys
+		// DECODED (a unicode-escape spelling of a duplicate key compares
+		// equal to its plain twin, exactly as jsonb dedupes them); a
+		// per-parent duplicate key at any depth marks the value, and any
+		// such value keeps the whole column text. Runs only
+		// after the validity gate above: json_tree errors on malformed
+		// input. Core SQLite JSON1, identical on D1.
+		dups, derr := count(ctx, fmt.Sprintf(
+			"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL "+
+				"AND EXISTS (SELECT 1 FROM json_tree(%s) GROUP BY parent, key HAVING COUNT(*) > 1)",
+			qt, qc, qc,
+		))
+		if derr != nil {
+			return false, nil, 0, derr
+		}
+		return dups == 0, ir.JSON{Binary: true}, total, nil
 
 	case ir.UUID:
 		bad, berr := count(ctx, fmt.Sprintf(

@@ -40,6 +40,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/parquet-go/parquet-go"
@@ -88,7 +89,12 @@ type ParquetExport struct {
 
 	// ForceOverwrite discards a prior export at the destination. By
 	// default a destination already carrying parquet_index.json is
-	// refused.
+	// refused. Under force the REPLACEMENT is whole: after the new
+	// index is written, any `.parquet` at the destination the new
+	// index does not claim (a table dropped/excluded since the prior
+	// export, or a stray) is deleted, each named by an INFO line —
+	// otherwise the cookbook's `*.parquet` glob would read a stale
+	// table's old rows as current (audit MED-D0-5).
 	ForceOverwrite bool
 
 	// Envelope, VerifyKey, RequireSignature mirror [Restore]: the
@@ -259,6 +265,19 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 		return fmt.Errorf("export-as-parquet: write %s: %w", ParquetIndexFileName, err)
 	}
 
+	// 8. --force-overwrite means the prior export is REPLACED, not
+	//    shadowed: any .parquet the fresh index does not claim is a
+	//    stale orphan (a table dropped or excluded since the prior
+	//    export) — the cookbook's `*.parquet` glob would read its old
+	//    rows as current data, so it is deleted, each named loudly
+	//    (audit MED-D0-5). Runs AFTER the index write so a failed
+	//    export never half-deletes the prior one.
+	if e.ForceOverwrite {
+		if err := e.deleteStaleParquet(ctx, index); err != nil {
+			return err
+		}
+	}
+
 	var totalRows int64
 	for _, t := range index.Tables {
 		totalRows += t.Rows
@@ -402,8 +421,10 @@ func (e *ParquetExport) exportTable(
 	// sum vs the manifest's recorded RowCount, both directions.
 	switch {
 	case entry.RowCount > 0 && rows != entry.RowCount:
-		return nil, fmt.Errorf("export-as-parquet: layer-2 row-count mismatch on table %q: manifest says %d, decoded %d",
-			table.Name, entry.RowCount, rows)
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"export from an untampered copy, or sign the chain so a truncated/edited chunk set is caught at verify time",
+			fmt.Errorf("export-as-parquet: layer-2 row-count mismatch on table %q: manifest says %d, decoded %d",
+				table.Name, entry.RowCount, rows))
 	case entry.RowCount == 0 && rows != 0:
 		return nil, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"export from an untampered copy, or sign the chain so a zeroed row-count is caught at verify time",
@@ -534,7 +555,9 @@ func (e *ParquetExport) exportChunk(
 	// streamChunkRows (incl. the zeroed-RowCount tamper refusal).
 	switch {
 	case chunk.RowCount > 0 && rows != chunk.RowCount:
-		return rows, fmt.Errorf("layer-2 chunk row-count mismatch: manifest says %d, decoded %d", chunk.RowCount, rows)
+		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"export from an untampered copy, or sign the chain so a truncated/edited chunk is caught at verify time",
+			fmt.Errorf("layer-2 chunk row-count mismatch: manifest says %d, decoded %d", chunk.RowCount, rows))
 	case chunk.RowCount == 0 && rows > 0:
 		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"export from an untampered copy, or sign the chain so a zeroed chunk row-count is caught at verify time",
@@ -560,12 +583,16 @@ func (e *ParquetExport) preflightEncryption(manifest *irbackup.Manifest) error {
 	e.chainEncrypted = true
 	enc := manifest.ChainEncryption
 	if e.Envelope == nil {
-		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
-			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
+				enc.Algorithm, enc.KEKMode, enc.KEKRef))
 	}
 	if enc.KEKMode != "" && e.Envelope.Mode() != enc.KEKMode {
-		return fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
-			e.Envelope.Mode(), enc.KEKMode)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
+				e.Envelope.Mode(), enc.KEKMode))
 	}
 	mode := enc.Mode
 	if mode == "" {
@@ -613,6 +640,34 @@ func (e *ParquetExport) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 		return nil, errors.New("encrypted chunk encountered but chain CEK is unset (preflight skipped?)")
 	}
 	return e.chainCEK, nil
+}
+
+// deleteStaleParquet diffs the destination against the just-written
+// index and deletes every `.parquet` the index does not claim (see the
+// step-8 comment in Run). Scoped to `.parquet` files only — the index
+// itself and any non-parquet object are never touched.
+func (e *ParquetExport) deleteStaleParquet(ctx context.Context, index *parquetIndex) error {
+	paths, err := e.Output.List(ctx, "")
+	if err != nil {
+		return fmt.Errorf("export-as-parquet: list output for stale .parquet files: %w", err)
+	}
+	current := make(map[string]bool, len(index.Tables))
+	for _, t := range index.Tables {
+		current[t.File] = true
+	}
+	for _, p := range paths {
+		if !strings.HasSuffix(p, ".parquet") || current[p] {
+			continue
+		}
+		if err := e.Output.Delete(ctx, p); err != nil {
+			return fmt.Errorf("export-as-parquet: delete stale %s: %w", p, err)
+		}
+		slog.InfoContext(
+			ctx, "export-as-parquet: deleted a stale .parquet not claimed by this export's index (its table is not part of this export — a *.parquet glob would have read its old rows as current)",
+			slog.String("file", p),
+		)
+	}
+	return nil
 }
 
 // parquetFileName is the per-table output path: schema-qualified for

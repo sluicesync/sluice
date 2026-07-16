@@ -76,6 +76,7 @@ const (
 	CodeBackupIncomplete           Code = "SLUICE-E-BACKUP-INCOMPLETE"
 	CodeBackupManifestInvalid      Code = "SLUICE-E-BACKUP-MANIFEST-INVALID"
 	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
+	CodeBackupEncryptionMismatch   Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
 
 	CodeBackfillNoPrimaryKey      Code = "SLUICE-E-BACKFILL-NO-PRIMARY-KEY"
 	CodeBackfillUnsupportedEngine Code = "SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE"
@@ -150,9 +151,10 @@ var registry = map[Code]Info{
 	CodeBackupSignatureUnsupported: {ClassRefusal, "a signed backup manifest uses a newer signature scheme/canonicalization than this build supports; upgrade sluice (not a tamper signal)"},
 	CodeBackupChunkAuthFailed:      {ClassRefusal, "an encrypted backup chunk failed authenticated decryption (tampered / corrupt / spliced or reordered store) — the loud, coded twin of the signed-manifest tamper refusal for backups that are encrypted but not signed"},
 	CodeBackupChunkCorrupt:         {ClassRefusal, "a backup chunk's stored bytes do not match the SHA-256 recorded for it in the manifest — at-rest corruption / bit-rot, or a tamper that altered the stored bytes; caught by rehashing at restore, broker replay, and backup verify, before decryption, so it fires on plaintext and encrypted chunks alike (the integrity twin of -CHUNK-AUTH-FAILED, which is the GCM/AAD check)"},
-	CodeBackupIncomplete:           {ClassRefusal, "a restored/replayed incremental applied fewer changes than its manifest records (its change-chunk tail was truncated, or a table's chunk row-count was zeroed) — the signing-independent backstop against silent tail-truncation of an unsigned incremental"},
-	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest's recorded BackupID does not match its content — a BackupID-covered field (created_at / source_engine / kind / EndPosition) was edited without recomputing the id (corruption or lazy tamper)"},
+	CodeBackupIncomplete:           {ClassRefusal, "a restore/replay/export decoded or applied a DIFFERENT number of rows/changes than the manifest records (change-chunk tail truncated, a layer-2 row-count mismatch, or a zeroed RowCount) — the signing-independent backstop against silent truncation/edit of an unsigned backup"},
+	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},
 	CodeBackupChainConflict:        {ClassRefusal, "another writer advanced this backup chain's lineage mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — the conditional catalog write refused rather than interleave; no catalog change was written"},
+	CodeBackupEncryptionMismatch:   {ClassRefusal, "the supplied decryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
 
 	CodeBackfillNoPrimaryKey:      {ClassRefusal, "backfill refused: the table has no usable orderable primary key to drive the keyset-chunked walk"},
 	CodeBackfillUnsupportedEngine: {ClassRefusal, "backfill refused: the engine does not implement the in-place backfill surface"},

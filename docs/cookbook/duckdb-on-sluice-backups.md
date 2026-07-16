@@ -99,6 +99,11 @@ Worth knowing (full detail in
   instead.
 - Re-running into the same destination refuses unless you pass
   `--force-overwrite` (the export manifest is the sentinel).
+- `--force-overwrite` replaces the prior export **whole**: any `.parquet`
+  the fresh `parquet_index.json` doesn't claim (a table dropped or
+  excluded since the last export) is deleted and named in the log — so
+  the `*.parquet` globs below never read a dropped table's old rows as
+  current.
 - `--include-table` / `--exclude-table` scope the export.
 
 ## 3. Query with DuckDB

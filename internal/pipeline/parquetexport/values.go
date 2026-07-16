@@ -241,7 +241,7 @@ func encodeTimeOfDayMicros(v any) (any, error) {
 // fractions.
 func parseTimeOfDayMicros(s string) (int64, error) {
 	if strings.HasPrefix(s, "-") {
-		return 0, fmt.Errorf("time value %q is negative (a SQL duration, not a time-of-day); Parquet TIME cannot hold it — exclude the table or carry the column as text via a type override", s)
+		return 0, fmt.Errorf("time value %q is negative (a SQL duration, not a time-of-day); Parquet TIME cannot hold it — exclude the table (--exclude-table) or query its JSON-Lines chunks directly", s)
 	}
 	base, frac, _ := strings.Cut(s, ".")
 	parts := strings.Split(base, ":")
@@ -281,7 +281,7 @@ func parseTimeOfDayMicros(s string) (int64, error) {
 		micros += f
 	}
 	if micros >= microsPerDay {
-		return 0, fmt.Errorf("time value %q is not within a calendar day (MySQL TIME durations reach ±838h; PG allows 24:00:00); Parquet TIME cannot hold it — exclude the table or carry the column as text via a type override", s)
+		return 0, fmt.Errorf("time value %q is not within a calendar day (MySQL TIME durations reach ±838h; PG allows 24:00:00); Parquet TIME cannot hold it — exclude the table (--exclude-table) or query its JSON-Lines chunks directly", s)
 	}
 	return micros, nil
 }
@@ -382,7 +382,7 @@ func decimalUnscaled(v any, d ir.Decimal) (*big.Int, error) {
 	for _, part := range []string{intPart, fracPart} {
 		for _, r := range part {
 			if r < '0' || r > '9' {
-				return nil, fmt.Errorf("decimal value %q is not a plain decimal number (PG NUMERIC NaN/Infinity have no Parquet DECIMAL form) — exclude the table or carry the column as text via a type override", s)
+				return nil, fmt.Errorf("decimal value %q is not a plain decimal number (PG NUMERIC NaN/Infinity have no Parquet DECIMAL form) — exclude the table (--exclude-table) or query its JSON-Lines chunks directly", s)
 			}
 		}
 	}

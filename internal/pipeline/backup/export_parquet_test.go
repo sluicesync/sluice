@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -263,6 +264,83 @@ func TestParquetExport_OverwriteSentinel(t *testing.T) {
 	again.ForceOverwrite = true
 	if err := again.Run(context.Background()); err != nil {
 		t.Fatalf("forced overwrite: %v", err)
+	}
+}
+
+// TestParquetExport_ForceOverwriteDeletesStaleParquet pins the audit
+// MED-D0-5 fix: a --force-overwrite re-export REPLACES the prior
+// export, so any .parquet the fresh index does not claim (a table
+// dropped/excluded since the prior export, or a stray from an aborted
+// run) is deleted — each named by an INFO line — while the index, the
+// re-exported tables, and non-parquet bystanders survive. Without the
+// sweep, the cookbook's `*.parquet` glob reads the dropped table's old
+// rows as current data.
+func TestParquetExport_ForceOverwriteDeletesStaleParquet(t *testing.T) {
+	seed := seedPlaintextExportBackup(t)
+	outDir := runExport(t, &ParquetExport{Store: seed.store}) // exports users + empty
+
+	// A stray parquet no completed export wrote, and a non-parquet
+	// bystander that must survive the sweep.
+	if err := os.WriteFile(filepath.Join(outDir, "dropped.parquet"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "notes.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Re-export with "empty" excluded: the prior export's empty.parquet
+	// is now a stale orphan.
+	filter, err := migcore.NewTableFilter([]string{"users"}, nil)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	out, err := blobcodec.NewLocalStore(outDir)
+	if err != nil {
+		t.Fatalf("NewLocalStore(out): %v", err)
+	}
+	again := &ParquetExport{Store: seed.store, Output: out, Filter: filter, ForceOverwrite: true}
+	if err := again.Run(context.Background()); err != nil {
+		t.Fatalf("forced re-export: %v", err)
+	}
+
+	for _, gone := range []string{"empty.parquet", "dropped.parquet"} {
+		if _, err := os.Stat(filepath.Join(outDir, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s survived the force re-export (stat err = %v); want it deleted", gone, err)
+		}
+	}
+	for _, present := range []string{"users.parquet", ParquetIndexFileName, "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(outDir, present)); err != nil {
+			t.Errorf("%s missing after the force re-export: %v", present, err)
+		}
+	}
+	// Each deletion is INFO-named.
+	logs := logBuf.String()
+	for _, named := range []string{"empty.parquet", "dropped.parquet"} {
+		if !strings.Contains(logs, named) {
+			t.Errorf("deletion of %s not named in the INFO log:\n%s", named, logs)
+		}
+	}
+
+	// The sweep is FORCE-scoped: a fresh (index-less) destination that
+	// happens to hold a foreign .parquet is not swept by a plain export.
+	freshDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(freshDir, "foreign.parquet"), []byte("theirs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freshOut, err := blobcodec.NewLocalStore(freshDir)
+	if err != nil {
+		t.Fatalf("NewLocalStore(fresh): %v", err)
+	}
+	if err := (&ParquetExport{Store: seed.store, Output: freshOut}).Run(context.Background()); err != nil {
+		t.Fatalf("fresh export: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(freshDir, "foreign.parquet")); err != nil {
+		t.Errorf("foreign.parquet deleted by a NON-force export: %v (the sweep must be --force-overwrite-scoped)", err)
 	}
 }
 

@@ -635,12 +635,16 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 	r.chainEncrypted = true
 	enc := rootManifest.ChainEncryption
 	if r.Envelope == nil {
-		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
-			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
+				enc.Algorithm, enc.KEKMode, enc.KEKRef))
 	}
 	if enc.KEKMode != "" && r.Envelope.Mode() != enc.KEKMode {
-		return fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
-			r.Envelope.Mode(), enc.KEKMode)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
+				r.Envelope.Mode(), enc.KEKMode))
 	}
 	mode := enc.Mode
 	if mode == "" {
@@ -706,8 +710,10 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 			)
 			continue
 		}
-		return fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands",
-			links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got)
+		return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+			"restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time",
+			fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands",
+				links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got))
 	}
 	return nil
 }
@@ -785,12 +791,16 @@ func checkMixedModeChain(chain []lineage.SegmentRecord) error {
 			}
 		}
 		if segEnc && !incrHasChunkEnc && len(link.Manifest.ChangeChunks) > 0 {
-			return fmt.Errorf("mixed-mode lineage: segment full %s is encrypted but incremental %s has plaintext change chunks; encryption must be uniform within a segment",
-				segFullID, lineage.ManifestBackupID(link.Manifest))
+			return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+				"restore from an untampered copy of the chain, or sign it (--sign/--sign-key + --require-signature) so a mis-stitched/tampered lineage is caught at verify time",
+				fmt.Errorf("mixed-mode lineage: segment full %s is encrypted but incremental %s has plaintext change chunks; encryption must be uniform within a segment",
+					segFullID, lineage.ManifestBackupID(link.Manifest)))
 		}
 		if !segEnc && incrHasChunkEnc {
-			return fmt.Errorf("mixed-mode lineage: segment full %s is plaintext but incremental %s has encrypted change chunks; encryption must be uniform within a segment",
-				segFullID, lineage.ManifestBackupID(link.Manifest))
+			return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+				"restore from an untampered copy of the chain, or sign it (--sign/--sign-key + --require-signature) so a mis-stitched/tampered lineage is caught at verify time",
+				fmt.Errorf("mixed-mode lineage: segment full %s is plaintext but incremental %s has encrypted change chunks; encryption must be uniform within a segment",
+					segFullID, lineage.ManifestBackupID(link.Manifest)))
 		}
 	}
 	return nil

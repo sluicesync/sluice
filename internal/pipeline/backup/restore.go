@@ -848,8 +848,10 @@ func (r *Restore) restoreTable(
 	// boundary — that is what signing closes.)
 	switch got := rowsApplied.Load(); {
 	case entry.RowCount > 0 && got != entry.RowCount:
-		return fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
-			table.Name, entry.RowCount, got)
+		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a truncated/edited chunk set is caught at verify time",
+			fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
+				table.Name, entry.RowCount, got))
 	case entry.RowCount == 0 && got != 0:
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a zeroed row-count is caught at verify time",
@@ -1128,8 +1130,10 @@ func (r *Restore) streamChunkRows(
 	// regardless; refusing here names the tamper at the chunk that carries it.
 	switch {
 	case chunk.RowCount > 0 && rows != chunk.RowCount:
-		return rows, fmt.Errorf("layer-2 chunk row-count mismatch on %s: manifest says %d, decoded %d",
-			chunk.File, chunk.RowCount, rows)
+		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a truncated/edited chunk is caught at verify time",
+			fmt.Errorf("layer-2 chunk row-count mismatch on %s: manifest says %d, decoded %d",
+				chunk.File, chunk.RowCount, rows))
 	case chunk.RowCount == 0 && rows > 0:
 		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a zeroed chunk row-count is caught at verify time",
@@ -1280,12 +1284,16 @@ func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 	r.chainEncrypted = true
 	enc := manifest.ChainEncryption
 	if r.Envelope == nil {
-		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
-			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
+				enc.Algorithm, enc.KEKMode, enc.KEKRef))
 	}
 	if enc.KEKMode != "" && r.Envelope.Mode() != enc.KEKMode {
-		return fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
-			r.Envelope.Mode(), enc.KEKMode)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
+				r.Envelope.Mode(), enc.KEKMode))
 	}
 	mode := enc.Mode
 	if mode == "" {

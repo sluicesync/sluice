@@ -1490,12 +1490,16 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 	b.chainEncrypted = true
 	enc := root.ChainEncryption
 	if b.Envelope == nil {
-		return fmt.Errorf("chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
-			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"pass --encrypt with the chain's key material (the message names its kek_mode/kek_ref)",
+			fmt.Errorf("chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+				enc.Algorithm, enc.KEKMode, enc.KEKRef))
 	}
 	if enc.KEKMode != "" && b.Envelope.Mode() != enc.KEKMode {
-		return fmt.Errorf("envelope mode %q does not match chain's recorded kek_mode %q",
-			b.Envelope.Mode(), enc.KEKMode)
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
+			fmt.Errorf("envelope mode %q does not match chain's recorded kek_mode %q",
+				b.Envelope.Mode(), enc.KEKMode))
 	}
 	mode := enc.Mode
 	if mode == "" {

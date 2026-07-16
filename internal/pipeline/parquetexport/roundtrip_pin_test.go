@@ -368,6 +368,87 @@ func TestPin_BytesFamily(t *testing.T) {
 	}
 }
 
+// TestPin_GeoParquetCRS pins the geo block's per-column `crs` stamp
+// (audit MED-D0-4) across the SRID class matrix on ONE multi-geometry
+// table: a bundled geographic SRID (4326), the bundled PROJECTED SRID
+// (3857 — the case an omitted crs would silently misread as lon/lat
+// degrees), SRID 0 (the engines' "none declared" → explicit null,
+// silently — that IS the faithful translation), and an unbundled SRID
+// (32633 → explicit null + an operator-visible note naming it). The
+// crs key must be PRESENT for every column — omission means "OGC:CRS84
+// degrees" per the spec, which is the exact silent-loss shape.
+func TestPin_GeoParquetCRS(t *testing.T) {
+	table := &ir.Table{Name: "t", Columns: []*ir.Column{
+		{Name: "g4326", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}, Nullable: true},
+		{Name: "g3857", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 3857}, Nullable: true},
+		{Name: "g0", Type: ir.Geometry{Subtype: ir.GeometryPoint}, Nullable: true},
+		{Name: "g32633", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 32633}, Nullable: true},
+	}}
+	codec, err := NewTableCodec(table)
+	if err != nil {
+		t.Fatalf("NewTableCodec: %v", err)
+	}
+	var block struct {
+		Version       string `json:"version"`
+		PrimaryColumn string `json:"primary_column"`
+		Columns       map[string]struct {
+			Encoding string          `json:"encoding"`
+			CRS      json.RawMessage `json:"crs"`
+		} `json:"columns"`
+	}
+	raw := codec.Metadata[MetaGeo]
+	if err := json.Unmarshal([]byte(raw), &block); err != nil {
+		t.Fatalf("geo metadata does not parse: %v\n%s", err, raw)
+	}
+	if block.PrimaryColumn != "g4326" || len(block.Columns) != 4 {
+		t.Fatalf("geo block = %s", raw)
+	}
+
+	// crsID extracts id.authority/id.code from a column's crs, requiring
+	// the key to be PRESENT (json.RawMessage is nil only when absent).
+	type crsID struct {
+		ID struct {
+			Authority string `json:"authority"`
+			Code      int    `json:"code"`
+		} `json:"id"`
+		Type string `json:"type"`
+	}
+	col := func(name string) json.RawMessage {
+		c, ok := block.Columns[name]
+		if !ok {
+			t.Fatalf("column %q missing from geo block: %s", name, raw)
+		}
+		if c.Encoding != "WKB" {
+			t.Fatalf("column %q encoding = %q", name, c.Encoding)
+		}
+		if c.CRS == nil {
+			t.Fatalf("column %q has NO crs key — the spec defaults that to OGC:CRS84 degrees (the silent-loss shape): %s", name, raw)
+		}
+		return c.CRS
+	}
+
+	var g4326 crsID
+	if err := json.Unmarshal(col("g4326"), &g4326); err != nil || g4326.ID.Authority != "EPSG" || g4326.ID.Code != 4326 || g4326.Type != "GeographicCRS" {
+		t.Fatalf("g4326 crs = %s (err %v); want PROJJSON with id EPSG:4326", col("g4326"), err)
+	}
+	var g3857 crsID
+	if err := json.Unmarshal(col("g3857"), &g3857); err != nil || g3857.ID.Authority != "EPSG" || g3857.ID.Code != 3857 || g3857.Type != "ProjectedCRS" {
+		t.Fatalf("g3857 crs = %s (err %v); want PROJJSON with id EPSG:3857", col("g3857"), err)
+	}
+	if got := string(col("g0")); got != "null" {
+		t.Fatalf("g0 crs = %s; want explicit null (SRID 0 = undefined, NOT the CRS84 default)", got)
+	}
+	if got := string(col("g32633")); got != "null" {
+		t.Fatalf("g32633 crs = %s; want explicit null (unbundled SRID must not imply CRS84)", got)
+	}
+
+	// The unbundled SRID is loud: exactly one note, naming column + SRID.
+	// SRID 0 and the bundled SRIDs add none.
+	if len(codec.Notes) != 1 || !strings.Contains(codec.Notes[0], `"g32633"`) || !strings.Contains(codec.Notes[0], "32633") {
+		t.Fatalf("Notes = %v; want exactly one note naming g32633's SRID", codec.Notes)
+	}
+}
+
 func TestPin_JSONFamily(t *testing.T) {
 	for _, binary := range []bool{false, true} {
 		table := oneColTable(ir.JSON{Binary: binary})

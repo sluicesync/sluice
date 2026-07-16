@@ -174,7 +174,9 @@ func logInferPromoted(ctx context.Context, table, column string, from, to ir.Typ
 		slog.Int64("validated", validated))
 	if j, isJSON := to.(ir.JSON); isJSON && j.Binary {
 		slog.InfoContext(ctx, "infer-types: jsonb promotion normalizes the document "+
-			"(the JSON value is equal; stored bytes differ from the source text — whitespace/key-order)",
+			"(the JSON value is equal; stored bytes differ from the source text — whitespace/key-order; "+
+			"a column holding any duplicate-key document is never promoted, because jsonb would keep "+
+			"only the last duplicate — such a column stays text)",
 			slog.String("table", table),
 			slog.String("column", column))
 	}

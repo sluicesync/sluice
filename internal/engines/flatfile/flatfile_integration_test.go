@@ -55,12 +55,15 @@ const (
 // a trailing space / tab — the audit-HIGH-2 shape: a whitespace tail must
 // not hide the zone from classification, which pre-fix resolved the column
 // NAIVE and silently UTC-shifted every wall clock), meta_json (objects,
-// promotes to jsonb), user_uuid (promotes to uuid), customer_id (the cus_*
-// case: hinted but non-conforming — MUST stay text), big/dec (exact digit
-// text in a plain text column).
-const fixtureCSV = "id,name,created_at,synced_at,padded_at,meta_json,user_uuid,customer_id,big,dec\n" +
-	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,2026-07-15 08:09:10.123456+00,\"2026-07-15 08:09:10.123456+05:30 \",\"{\"\"a\"\":1}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
-	"2,héllo 🚀,\\N,2026-07-14 09:08:09+02,\"2026-07-14 09:08:09+02\t\",\\N,0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
+// promotes to jsonb), dup_json (json-hinted but one document carries a
+// DUPLICATE object key — jsonb would keep only the last duplicate, so the
+// column MUST stay text with the source bytes intact, audit MED-D0-3),
+// user_uuid (promotes to uuid), customer_id (the cus_* case: hinted but
+// non-conforming — MUST stay text), big/dec (exact digit text in a plain
+// text column).
+const fixtureCSV = "id,name,created_at,synced_at,padded_at,meta_json,dup_json,user_uuid,customer_id,big,dec\n" +
+	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,2026-07-15 08:09:10.123456+00,\"2026-07-15 08:09:10.123456+05:30 \",\"{\"\"a\"\":1}\",\"{\"\"a\"\":1,\"\"a\"\":2}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
+	"2,héllo 🚀,\\N,2026-07-14 09:08:09+02,\"2026-07-14 09:08:09+02\t\",\\N,\"{\"\"ok\"\":true}\",0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
 
 func writeFixtureIT(t *testing.T, name, content string) string {
 	t.Helper()
@@ -240,9 +243,9 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 	if got := typeOf("user_uuid"); got != "uuid" {
 		t.Errorf("user_uuid type = %q; want uuid", got)
 	}
-	for _, col := range []string{"customer_id", "big", "dec", "name"} {
+	for _, col := range []string{"customer_id", "big", "dec", "name", "dup_json"} {
 		if got := typeOf(col); got != "text" {
-			t.Errorf("%s type = %q; want text", col, got)
+			t.Errorf("%s type = %q; want text (dup_json: a duplicate-key document must block the jsonb promotion)", col, got)
 		}
 	}
 
@@ -266,6 +269,13 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 		"2026-07-14 07:08:09.000000", "row2 padded_at (trailing tab; +02 applied)")
 	wantCell(t, queryText(t, db, `SELECT meta_json::text FROM people WHERE id = '1'`),
 		`{"a": 1}`, "row1 meta_json (jsonb-normalized)")
+	// The dup-key document survives BYTE-EXACT: kept text, never routed
+	// through jsonb (which would silently collapse it to {"a": 2} — PG
+	// keeps the LAST duplicate, verified on PG 16.14).
+	wantCell(t, queryText(t, db, `SELECT dup_json FROM people WHERE id = '1'`),
+		`{"a":1,"a":2}`, "row1 dup_json (duplicate keys intact)")
+	wantCell(t, queryText(t, db, `SELECT dup_json FROM people WHERE id = '2'`),
+		`{"ok":true}`, "row2 dup_json")
 	wantCell(t, queryText(t, db, `SELECT user_uuid::text FROM people WHERE id = '1'`),
 		"6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f", "row1 user_uuid")
 	wantCell(t, queryText(t, db, `SELECT customer_id FROM people WHERE id = '1'`),

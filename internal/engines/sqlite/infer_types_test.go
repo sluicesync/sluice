@@ -54,6 +54,8 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			js_ok     TEXT,
 			js_num    TEXT,
 			js_free   TEXT,
+			js_dup    TEXT,
+			js_deep   TEXT,
 			uuid_lc   TEXT,
 			uuid_uc   TEXT,
 			uuid_bad  TEXT,
@@ -65,6 +67,7 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			'2024-01-15', 'not a date',
 			'2024-01-15T10:30:00+05:00', '2024-01-15 10:30:00.1234567', '2024-01-15T10:30:00.123456+05:00',
 			'{"a":1}', '123', 'free',
+			'{"a":1,"a":2}', '{"deep":{"arr":[{"x":1,"x":2}]}}',
 			'550e8400-e29b-41d4-a716-446655440000', '550E8400-E29B-41D4-A716-446655440000', 'cus_abc123',
 			NULL)`,
 		`INSERT INTO t VALUES (
@@ -73,11 +76,12 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			'2024-02-20', '2024-02-20',
 			'2024-02-20 08:00:00', '2024-02-20 08:00:00.7654321', '2024-02-20T08:00:00.654321Z',
 			'[1,2,3]', '456', '"hello"',
+			'{"clean":true}', '[1,2,3]',
 			'6ba7b810-9dad-11d1-80b4-00c04fd430c8', '6BA7B810-9DAD-11D1-80B4-00C04FD430C8', 'not-uuid',
 			NULL)`,
 		// Row 3 is all-NULL (except the PK) so every "ok" column has a NULL the
 		// validation must skip — conformance must hold despite it.
-		`INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
+		`INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
 	)
 
 	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
@@ -105,6 +109,8 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 		{"js_ok", ir.JSON{Binary: true}, true, ir.JSON{Binary: true}, 2},
 		{"js_num", ir.JSON{Binary: true}, false, nil, 2},  // '123' is a bare number
 		{"js_free", ir.JSON{Binary: true}, false, nil, 2}, // 'free' invalid / '"hello"' is a string
+		{"js_dup", ir.JSON{Binary: true}, false, nil, 2},  // duplicate object key → jsonb would keep only the last (audit MED-D0-3)
+		{"js_deep", ir.JSON{Binary: true}, false, nil, 2}, // duplicate key NESTED (object→array→object) — the recursive shape
 
 		{"uuid_lc", ir.UUID{}, true, ir.UUID{}, 2},
 		{"uuid_uc", ir.UUID{}, true, ir.UUID{}, 2}, // upper-case hex (case-insensitive GLOB)

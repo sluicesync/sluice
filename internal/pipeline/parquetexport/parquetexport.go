@@ -108,7 +108,7 @@ func NewTableCodec(table *ir.Table) (*TableCodec, error) {
 	group := parquet.Group{}
 	enumValues := map[string][]string{}
 	setValues := map[string][]string{}
-	var geoColumns []string
+	var geoColumns []geoColumnSpec
 	for _, col := range table.Columns {
 		if col == nil || col.IsGenerated() {
 			continue
@@ -125,7 +125,7 @@ func NewTableCodec(table *ir.Table) (*TableCodec, error) {
 		case ir.Set:
 			setValues[col.Name] = t.Values
 		case ir.Geometry:
-			geoColumns = append(geoColumns, col.Name)
+			geoColumns = append(geoColumns, geoColumnSpec{name: col.Name, srid: t.SRID})
 		}
 	}
 	if len(c.columns) == 0 {
@@ -138,7 +138,7 @@ func NewTableCodec(table *ir.Table) (*TableCodec, error) {
 		return nil, err
 	}
 	if len(geoColumns) > 0 {
-		geo, err := geoParquetMetadata(geoColumns)
+		geo, err := c.geoParquetMetadata(geoColumns)
 		if err != nil {
 			return nil, err
 		}
@@ -161,27 +161,53 @@ func (c *TableCodec) stampJSONMeta(key string, m map[string][]string) error {
 	return nil
 }
 
-// geoParquetMetadata renders the minimal GeoParquet "geo" block for
-// the table's WKB geometry columns. Metadata-only per the GeoParquet
+// geoColumnSpec carries one geometry column's name and declared SRID
+// into the geo-block rendering.
+type geoColumnSpec struct {
+	name string
+	srid int
+}
+
+// geoParquetMetadata renders the GeoParquet "geo" block for the
+// table's WKB geometry columns. Metadata-only per the GeoParquet
 // spec — no geometry library is involved; the value bytes are the IR's
 // raw WKB unchanged. geometry_types is left empty (unconstrained): the
 // IR subtype describes the DECLARED column type, but GeoParquet's field
 // promises the set of types present in the DATA, which an exit-only
 // streaming export does not scan ahead to prove.
-func geoParquetMetadata(columns []string) (string, error) {
+//
+// Each column stamps its `crs` from the IR's declared SRID (audit
+// MED-D0-4): the bundled canonical PROJJSON for the common SRIDs
+// (EPSG:4326, EPSG:3857 — see crs.go), an explicit null (spec meaning:
+// CRS undefined/unknown) otherwise. The key is NEVER omitted — an
+// omitted crs defaults to OGC:CRS84 lon/lat degrees per the spec, so
+// omission would present e.g. a geometry(Point,3857) column's projected
+// metres as degrees, silently. SRID 0 is the engines' own "no SRID
+// declared", so null IS its faithful translation (no note); any other
+// unbundled SRID additionally gets an operator-visible note (WARNed by
+// the exporter and recorded in parquet_index.json) naming the SRID.
+func (c *TableCodec) geoParquetMetadata(columns []geoColumnSpec) (string, error) {
 	type geoColumn struct {
-		Encoding      string   `json:"encoding"`
-		GeometryTypes []string `json:"geometry_types"`
+		Encoding      string          `json:"encoding"`
+		GeometryTypes []string        `json:"geometry_types"`
+		CRS           json.RawMessage `json:"crs"`
 	}
 	cols := make(map[string]geoColumn, len(columns))
-	for _, name := range columns {
-		cols[name] = geoColumn{Encoding: "WKB", GeometryTypes: []string{}}
+	for _, col := range columns {
+		crs, bundled := bundledCRS[col.srid]
+		if !bundled {
+			crs = json.RawMessage("null")
+			if col.srid != 0 {
+				c.note("column %q: geometry SRID %d has no bundled PROJJSON definition; the GeoParquet crs is stamped null (CRS undefined) — readers must NOT assume lon/lat degrees; assign EPSG:%d downstream (e.g. GeoPandas set_crs / DuckDB ST_Transform)", col.name, col.srid, col.srid)
+			}
+		}
+		cols[col.name] = geoColumn{Encoding: "WKB", GeometryTypes: []string{}, CRS: crs}
 	}
 	block := struct {
 		Version       string               `json:"version"`
 		PrimaryColumn string               `json:"primary_column"`
 		Columns       map[string]geoColumn `json:"columns"`
-	}{Version: "1.1.0", PrimaryColumn: columns[0], Columns: cols}
+	}{Version: "1.1.0", PrimaryColumn: columns[0].name, Columns: cols}
 	b, err := json.Marshal(block)
 	if err != nil {
 		return "", fmt.Errorf("parquetexport: marshal geo metadata: %w", err)
