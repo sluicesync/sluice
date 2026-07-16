@@ -187,16 +187,22 @@ func (o *Orchestrator) Run(ctx context.Context) (*Result, error) {
 	}
 	defer cleanup.run(ctx)
 
+	// expandDeployed records that THIS run's expand leg actually
+	// deployed a schema change (runDeployLeg succeeds only on a real
+	// deploy — an empty diff is the no_changes refusal). It drives the
+	// migrate leg's restart-over-stale-state decision below.
+	expandDeployed := false
 	if o.resumeFrom() == LegExpand {
 		dr, err := o.runDeployLeg(ctx, "expand", o.expandBranchName(), o.ExpandDDL, cleanup)
 		if err != nil {
 			return nil, err
 		}
 		result.ExpandDeployRequest = dr.Number
+		expandDeployed = true
 	}
 
 	if o.resumeFrom() != LegContract {
-		br, err := o.runMigrateLeg(ctx)
+		br, err := o.runMigrateLeg(ctx, expandDeployed)
 		if err != nil {
 			return nil, err
 		}
@@ -408,7 +414,24 @@ func (o *Orchestrator) ensureStateOnBranch(ctx context.Context, pw *api.BranchPa
 // in one shot: a dirty verify surfaces as the coded
 // SLUICE-E-BACKFILL-INCOMPLETE error, which is exactly the contract
 // gate — the caller never reaches the contract leg on it.
-func (o *Orchestrator) runMigrateLeg(ctx context.Context) (*pipeline.BackfillResult, error) {
+//
+// expandDeployed=true restarts the walk (clearing any persisted state
+// for this exact spec): when THIS run's expand leg deployed a real
+// schema change, a prior cycle's completed marker for the same
+// table+sets+where is provably stale — the column the earlier contract
+// dropped was just re-created empty, and honoring the marker would
+// no-op the walk and fail verify (live-caught 2026-07-15, first
+// psverify CI dispatch, on a reused database). The restart is safe by
+// the same contract that makes the command possible at all: the
+// REQUIRED self-describing --where guard scopes the re-walk to
+// unfinished rows. On --resume-from migrate/contract the expand leg
+// didn't run, so persisted state (mid-walk cursor, completed marker)
+// is honored exactly as before — the in-cycle at-most-one-chunk resume
+// contract is untouched, and standalone `sluice backfill` is
+// unaffected entirely (its Restart stays operator-driven via
+// --restart). Documented in ADR-0162 "Live-validation findings,
+// round 2".
+func (o *Orchestrator) runMigrateLeg(ctx context.Context, expandDeployed bool) (*pipeline.BackfillResult, error) {
 	b := &pipeline.Backfiller{
 		Engine:    o.Engine,
 		DSN:       o.DSN,
@@ -416,10 +439,15 @@ func (o *Orchestrator) runMigrateLeg(ctx context.Context) (*pipeline.BackfillRes
 		Sets:      o.Sets,
 		Where:     o.Where,
 		BatchSize: o.BatchSize,
+		Restart:   expandDeployed,
 		Verify:    true,
 		Out:       o.out(),
 	}
-	fmt.Fprintf(o.out(), "migrate: backfilling %q (%s)\n", o.Table, pipeline.BackfillMigrationID(o.Table, o.Sets, o.Where))
+	note := ""
+	if expandDeployed {
+		note = " (fresh walk: the expand leg deployed a schema change, so any prior completed state for this spec is stale)"
+	}
+	fmt.Fprintf(o.out(), "migrate: backfilling %q (%s)%s\n", o.Table, pipeline.BackfillMigrationID(o.Table, o.Sets, o.Where), note)
 	return b.Run(ctx)
 }
 

@@ -207,8 +207,8 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	if err := r.recheckProductionFreshness(ctx, dr.Number, prodBaseline, baselineAt); err != nil {
 		return nil, err
 	}
-	if _, err := r.api.Deploy(ctx, r.org, r.database, dr.Number); err != nil {
-		return nil, fmt.Errorf("%s: deploy request #%d: %w", r.errPrefix, dr.Number, err)
+	if err := r.deployWithValidatingRetry(ctx, dr); err != nil {
+		return nil, err
 	}
 	final, err := r.waitDeployed(ctx, dr.Number)
 	if err != nil {
@@ -558,6 +558,63 @@ func (r *legRunner) waitDeployed(ctx context.Context, number int) (*api.DeployRe
 			return nil, err
 		}
 	}
+}
+
+// The deploy call itself races PlanetScale's own safety validation:
+// even after the DR reports deployable, POST /deploy can come back
+// HTTP 422 "We're currently validating that these changes are safe to
+// deploy. Please try again in a few moments." (live-caught 2026-07-15,
+// first psverify CI dispatch — timing-dependent). That is a settling
+// state, not a failure; the retry budget below comfortably covers the
+// advertised "few moments" while any OTHER deploy error still fails
+// straight through.
+const (
+	deployValidatingRetryAttempts = 6
+	deployValidatingRetryInterval = 15 * time.Second
+)
+
+// deployWithValidatingRetry issues the deploy call, retrying only the
+// still-validating 422 (bounded; backoff rides the client's injectable
+// Sleep so tests spend no wall-clock). Exhausted retries surface the
+// coded DR failure with the last validating error attached; any other
+// deploy error keeps the pre-existing immediate failure shape.
+func (r *legRunner) deployWithValidatingRetry(ctx context.Context, dr *api.DeployRequest) error {
+	for attempt := 1; ; attempt++ {
+		_, err := r.api.Deploy(ctx, r.org, r.database, dr.Number)
+		if err == nil {
+			return nil
+		}
+		if !isDeployValidating422(err) {
+			return fmt.Errorf("%s: deploy request #%d: %w", r.errPrefix, dr.Number, err)
+		}
+		if attempt >= deployValidatingRetryAttempts {
+			return r.drFailure(dr, fmt.Sprintf(
+				"deploy request #%d was still validating after %d deploy attempts %s apart — PlanetScale had not finished checking the changes are safe to deploy; re-run once it settles (%v)",
+				dr.Number, attempt, deployValidatingRetryInterval, err,
+			))
+		}
+		if sleepErr := r.api.SleepFor(ctx, deployValidatingRetryInterval); sleepErr != nil {
+			return fmt.Errorf("%s: deploy request #%d: %w", r.errPrefix, dr.Number, err)
+		}
+	}
+}
+
+// isDeployValidating422 reports whether err is the deploy endpoint's
+// still-validating 422. The live capture's envelope code is the
+// GENERIC "invalid_params" — shared with real parameter errors — so
+// there is no structural discriminator beyond the status, and the
+// message fragment is the narrowest stable shape (a conservative
+// substring: PlanetScale rewording the sentence degrades to the old
+// immediate-failure behavior, never to a wrong retry). Deliberately
+// DISTINCT from [isDeleteRace422]: that one is status-only on the
+// branch-DELETE endpoint, where a spurious retry merely delays a
+// best-effort WARN — on the deploy endpoint a status-only match would
+// retry genuine parameter errors, so the message gate is load-bearing
+// here (pinned).
+func isDeployValidating422(err error) bool {
+	var se *api.StatusError
+	return errors.As(err, &se) && se.Status == http.StatusUnprocessableEntity &&
+		strings.Contains(se.Message, "currently validating")
 }
 
 // drFailure wraps a deploy-request failure/timeout in the coded

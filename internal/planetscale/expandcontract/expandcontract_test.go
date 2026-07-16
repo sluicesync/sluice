@@ -77,6 +77,14 @@ type fakePS struct {
 	drDiffs     []string
 	diffFetches int
 
+	// deploy422Script scripts POST /deploy-requests/{n}/deploy: each
+	// deploy call pops one message and fails HTTP 422 with the generic
+	// "invalid_params" envelope code (the live-captured shape) instead
+	// of deploying; empty (or exhausted) deploys normally. deployCalls
+	// counts every deploy POST (the retry-budget pins).
+	deploy422Script []string
+	deployCalls     int
+
 	// prodSchemaSuffix mutates the PRODUCTION branch's rendered schema
 	// mid-test (the post-wait freshness pins): non-empty is appended to
 	// main's raw DDL, so a baseline captured before the flip no longer
@@ -280,6 +288,17 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 		}
 		switch rest[1] {
 		case "deploy":
+			f.deployCalls++
+			if len(f.deploy422Script) > 0 {
+				msg := f.deploy422Script[0]
+				f.deploy422Script = f.deploy422Script[1:]
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"code":    "invalid_params",
+					"message": msg,
+				})
+				return
+			}
 			fdr.deployed = true
 			writeJSON(w, fdr.snapshot())
 		case "skip-revert":
