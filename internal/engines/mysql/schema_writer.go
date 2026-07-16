@@ -152,7 +152,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			return err
 		}
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("mysql: create table %q: %w", table.Name, wrapDDLError(err))
+			return fmt.Errorf("mysql: create table %q: %w", table.Name, wrapUserTableCreateError(err, table.Name))
 		}
 	}
 	return nil

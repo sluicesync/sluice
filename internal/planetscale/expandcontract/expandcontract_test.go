@@ -62,6 +62,12 @@ type fakePS struct {
 	// GET-backup state walk (default: immediately "success").
 	backups      int
 	backupStates []string
+
+	// deleteScript scripts the branch DELETE handler: each DELETE pops
+	// one HTTP status and fails with it instead of deleting; empty (or
+	// exhausted) deletes normally. Drives the cleanup 422-retry pins
+	// (roadmap item 71a).
+	deleteScript []int
 }
 
 type fakeDR struct {
@@ -173,6 +179,16 @@ func (f *fakePS) handleBranches(w http.ResponseWriter, r *http.Request, rest []s
 		out.SafeMigrations = f.safeMigrations && out.Name == "main"
 		writeJSON(w, out)
 	case len(rest) == 1 && r.Method == http.MethodDelete:
+		if len(f.deleteScript) > 0 {
+			status := f.deleteScript[0]
+			f.deleteScript = f.deleteScript[1:]
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"code":    "unprocessable",
+				"message": "branch cannot be deleted while a deployment is in progress",
+			})
+			return
+		}
 		if _, ok := f.branches[rest[0]]; !ok {
 			writeNotFound(w)
 			return

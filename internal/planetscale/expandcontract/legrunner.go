@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -491,6 +493,18 @@ func (c *branchCleanup) remove(name string) {
 	c.branches = kept
 }
 
+// The post-deploy delete races the deploy/skip-revert settling window:
+// for ~1 min after a deploy finalizes, the control plane refuses the
+// branch delete with HTTP 422 "cannot be deleted while a deployment is
+// in progress" (live-caught 2026-07-15 — EVERY deploy-ddl invocation
+// stranded its branch with a WARN; a manual delete minutes later
+// succeeded). The retry budget below comfortably covers that window;
+// any other delete error still WARNs immediately.
+const (
+	deleteRetryAttempts = 6
+	deleteRetryInterval = 20 * time.Second
+)
+
 func (c *branchCleanup) run(ctx context.Context) {
 	if len(c.branches) == 0 {
 		return
@@ -501,11 +515,38 @@ func (c *branchCleanup) run(ctx context.Context) {
 	}
 	deleteCtx := context.WithoutCancel(ctx)
 	for _, name := range c.branches {
-		if err := c.api.DeleteBranch(deleteCtx, c.org, c.database, name); err != nil && !api.IsNotFound(err) {
+		if err := c.deleteBranch(deleteCtx, name); err != nil && !api.IsNotFound(err) {
 			slog.WarnContext(deleteCtx, c.command+": could not delete dev branch; delete it manually",
 				"branch", name, "err", err.Error())
 			continue
 		}
 		fmt.Fprintf(c.out, "cleanup: deleted dev branch %q\n", name)
 	}
+}
+
+// deleteBranch deletes one dev branch, retrying only the
+// delete-races-deploy 422 (bounded; backoff rides the client's
+// injectable Sleep so tests spend no wall-clock). Retries exhausted
+// returns the last 422 — the caller's WARN names the branch.
+func (c *branchCleanup) deleteBranch(ctx context.Context, name string) error {
+	for attempt := 1; ; attempt++ {
+		err := c.api.DeleteBranch(ctx, c.org, c.database, name)
+		if err == nil || attempt >= deleteRetryAttempts || !isDeleteRace422(err) {
+			return err
+		}
+		if sleepErr := c.api.SleepFor(ctx, deleteRetryInterval); sleepErr != nil {
+			return err
+		}
+	}
+}
+
+// isDeleteRace422 reports whether err is the control-plane 422 the
+// branch delete gets while a just-finished deployment's settling
+// window still holds the branch. Matched by status alone: message
+// wording is PlanetScale's to change, and a persistent non-race 422
+// merely delays the same WARN by the retry budget (~100 s) in a
+// best-effort cleanup path.
+func isDeleteRace422(err error) bool {
+	var se *api.StatusError
+	return errors.As(err, &se) && se.Status == http.StatusUnprocessableEntity
 }

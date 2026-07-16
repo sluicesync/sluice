@@ -141,6 +141,14 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &se) && se.Status == http.StatusNotFound
 }
 
+// SleepFor waits d via the client's injectable Sleep (ctx-aware) —
+// exposed so callers layering their own retry loop over the client
+// (the branch-cleanup delete retry) share the test-injectable clock
+// instead of spending wall-clock in tests.
+func (c *Client) SleepFor(ctx context.Context, d time.Duration) error {
+	return c.sleep(ctx, d)
+}
+
 // Get issues an authenticated GET for path (e.g.
 // "/v1/organizations/{org}/metrics") and decodes the JSON response
 // into out.
