@@ -51,7 +51,9 @@ const columnShapeAbsent = "(absent)"
 // declared flag, and readers report the enforced state — comparing the
 // redundant flag would false-refuse a table the engine itself
 // normalized. A wrong-nullability PK is unrepresentable on the target
-// anyway.
+// anyway. Integer AutoIncrement is likewise excluded for every column
+// (see actualForCompare): it doesn't affect copy correctness and PG
+// doesn't round-trip it.
 func TableColumnShape(expected, actual *ir.Table) []ColumnShapeMismatch {
 	if expected == nil || actual == nil {
 		return nil
@@ -92,15 +94,30 @@ func TableColumnShape(expected, actual *ir.Table) []ColumnShapeMismatch {
 }
 
 // actualForCompare normalizes the actual column for the comparison:
-// for a PK-member column the nullability flag is overwritten with the
-// expected side's (i.e. excluded from the compare — see
-// TableColumnShape's doc comment). The copy keeps the inputs pristine.
+// excluded fields are overwritten with the expected side's value so
+// they can never produce a mismatch (see TableColumnShape's doc
+// comment). The copy keeps the inputs pristine. Excluded:
+//   - PK-member nullability (engines force NOT NULL; readers report
+//     the enforced state).
+//   - Integer AutoIncrement, for EVERY column: it never affects
+//     whether the bulk copy can land rows (inserts carry explicit
+//     values either way), and readers cannot always round-trip it —
+//     PG reads a table whose id was created as bigserial/identity
+//     back without the flag, which false-refused the Bug-81
+//     sibling-shard load (a second shard migrating into the first
+//     shard's tables) in CI. DDL for genuinely new tables still
+//     carries the flag; only the skip-vs-refuse decision ignores it.
 func actualForCompare(act, exp *ir.Column, pkCols map[string]struct{}) *ir.Column {
-	if _, isPK := pkCols[act.Name]; !isPK {
-		return act
-	}
 	normalized := *act
-	normalized.Nullable = exp.Nullable
+	if actInt, ok := normalized.Type.(ir.Integer); ok {
+		if expInt, ok2 := exp.Type.(ir.Integer); ok2 {
+			actInt.AutoIncrement = expInt.AutoIncrement
+			normalized.Type = actInt
+		}
+	}
+	if _, isPK := pkCols[act.Name]; isPK {
+		normalized.Nullable = exp.Nullable
+	}
 	return &normalized
 }
 

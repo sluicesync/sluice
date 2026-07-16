@@ -59,6 +59,40 @@ func TestTableColumnShape_EqualAcrossFamilies(t *testing.T) {
 	}
 }
 
+// TestTableColumnShape_AutoIncrementExcluded pins the Bug-81
+// sibling-shard regression: an existing target table whose integer
+// column lacks (or carries) AutoIncrement while the intended table
+// differs ONLY in that flag is shape-EQUAL — PG cannot round-trip the
+// flag (a bigserial/identity id reads back plain Int64), and the flag
+// never affects whether the copy can land rows. Both directions and
+// both PK/non-PK positions pinned, plus the guard that a REAL type
+// difference on the same column still refuses.
+func TestTableColumnShape_AutoIncrementExcluded(t *testing.T) {
+	expected := shapeTable("t", intPK("id"),
+		&ir.Column{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+		&ir.Column{Name: "n", Type: ir.Integer{Width: 32, AutoIncrement: true}, Nullable: true},
+	)
+	actual := shapeTable("t", intPK("id"),
+		&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+		&ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true},
+	)
+	if got := TableColumnShape(expected, actual); len(got) != 0 {
+		t.Errorf("AutoIncrement-only diff: got %+v; want empty (excluded from compare)", got)
+	}
+	// Reverse direction: target HAS the flag, intent doesn't.
+	if got := TableColumnShape(actual, expected); len(got) != 0 {
+		t.Errorf("AutoIncrement-only diff (reverse): got %+v; want empty", got)
+	}
+	// Guard: a genuine width difference on the same column still refuses.
+	narrower := shapeTable("t", intPK("id"),
+		&ir.Column{Name: "id", Type: ir.Integer{Width: 32}},
+		&ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true},
+	)
+	if got := TableColumnShape(expected, narrower); len(got) != 1 || got[0].Column != "id" {
+		t.Errorf("width diff under excluded flag: got %+v; want exactly the id mismatch", got)
+	}
+}
+
 // TestTableColumnShape_MismatchAxes pins every mismatch axis the gate
 // refuses on: a column missing on the target, an extra column on the
 // target, a type difference, and a nullability difference.
