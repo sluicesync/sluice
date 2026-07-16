@@ -37,6 +37,13 @@
 #                      override it per-run)
 #   - ddlfixture     → extended-suites.yml `ddlfixture` (dispatch-only)
 #   - kmsverify      → extended-suites.yml `kmsverify` (localstack KMS)
+#   - psverify       → psverify.yml (dispatch-only, real PlanetScale;
+#                      the 2026-07-16 audit scoped its run to
+#                      `-run '^TestPS'` over four package scopes, which
+#                      made it exactly this guard's class — an
+#                      off-pattern psverify test would compile under
+#                      the workflow's own vet, never be selected, emit
+#                      no `--- SKIP`, and green the fail-on-skip grep)
 #
 # The leg label's FIRST word must be the workflow filename: the
 # manifest-drift cross-check below greps that file for the regex.
@@ -49,6 +56,7 @@ vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
 kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
+psverify;^TestPS;internal/planetscale/... internal/engines/mysql internal/engines/postgres internal/pipeline;psverify.yml psverify
 '
 
 # Tags deliberately WITHOUT a manifest axis. Each entry needs a
@@ -57,8 +65,6 @@ kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
 # newtag` suite type-checked via vet-tags, passed shard coverage, and
 # ran in NO workflow with zero guard firing — the pre-Bug-125
 # "compiles but never runs" class one level up).
-#   - psverify      → real-PlanetScale verification; its cron is OFF
-#                     per operator decision (paid service), run manually.
 #   - jsonbench     → local/on-demand serializer benchmark harness; no
 #                     workflow, no `-run` filter to escape.
 #   - compressbench → same, compression-algorithm harness.
@@ -67,7 +73,7 @@ kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
 # the ci.yml pipeline shards' -run/-skip regexes are a complete
 # partition (the -skip shard catches every name the other two don't),
 # so no bare-integration test can escape by name.
-EXEMPT_TAGS='psverify jsonbench compressbench'
+EXEMPT_TAGS='jsonbench compressbench'
 
 set -eu
 cd "$(dirname "$0")/.."

@@ -121,10 +121,14 @@ func TestRetargetForEngine_PGtoMySQL_OtherExtensionPassthrough(t *testing.T) {
 	}
 }
 
-// TestRetargetForEngine_PGtoPlanetScale uses the same retarget rules
-// as PG→MySQL since PlanetScale's MySQL flavor has the same native-
-// type set.
-func TestRetargetForEngine_PGtoPlanetScale(t *testing.T) {
+// TestRetargetForEngine_PGtoMySQLFlavors pins the rule across the
+// WHOLE MySQL-dialect flavor set — planetscale AND vitess share the
+// one mysql engine implementation, so all three targets must engage
+// the same rule (the literal-name match this replaces silently missed
+// vitess: ADR-0166 follow-up (c), closed by the 2026-07-16 audit
+// HIGH-1 fix). The pgtrigger flavor of the SOURCE side rides the same
+// storage-family keying.
+func TestRetargetForEngine_PGtoMySQLFlavors(t *testing.T) {
 	src := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "t",
@@ -133,9 +137,62 @@ func TestRetargetForEngine_PGtoPlanetScale(t *testing.T) {
 			},
 		},
 	}}
-	got := RetargetForEngine(src, "postgres", "planetscale")
-	if got.Tables[0].Columns[0].Type != (ir.Char{Length: 36}) {
-		t.Errorf("uuid column not retargeted on planetscale flavor: %v", got.Tables[0].Columns[0].Type)
+	for _, source := range []string{"postgres", "postgres-trigger"} {
+		for _, target := range []string{"mysql", "planetscale", "vitess"} {
+			got := RetargetForEngine(src, source, target)
+			if got.Tables[0].Columns[0].Type != (ir.Char{Length: 36}) {
+				t.Errorf("%s→%s: uuid column not retargeted: %v", source, target, got.Tables[0].Columns[0].Type)
+			}
+		}
+	}
+}
+
+// TestHasStorageShapeMapping pins the ADR-0166 shape gate's engagement
+// matrix (audit 2026-07-16 HIGH-1): pairs sharing a storage family
+// compare by identity, pairs with a retarget rule compare through it,
+// and every other pair has NO mapping — the gate must fall back to
+// WARN-and-proceed there, never refuse on a comparison the translation
+// layer can't normalize.
+func TestHasStorageShapeMapping(t *testing.T) {
+	cases := []struct {
+		source, target string
+		want           bool
+	}{
+		// Same storage family: identity is faithful.
+		{"mysql", "mysql", true},
+		{"mysql", "planetscale", true},
+		{"vitess", "mysql", true},
+		{"mydumper", "planetscale", true},
+		{"postgres", "postgres", true},
+		{"postgres", "postgres-trigger", true},
+		{"sqlite", "d1", true},
+		{"sqlite-trigger", "sqlite", true},
+		{"csv", "csv", true},
+
+		// Retarget rule exists: PG storage → MySQL dialect.
+		{"postgres", "mysql", true},
+		{"postgres", "planetscale", true},
+		{"postgres", "vitess", true},
+		{"postgres-trigger", "mysql", true},
+
+		// No mapping: cross-storage pairs with no rule. The HIGH-1
+		// direction (mysql→postgres) leads this list.
+		{"mysql", "postgres", false},
+		{"planetscale", "postgres", false},
+		{"vitess", "postgres", false},
+		{"mydumper", "postgres", false},
+		{"sqlite", "postgres", false},
+		{"sqlite", "mysql", false},
+		{"postgres", "sqlite", false},
+		{"postgres", "d1", false},
+		{"mysql", "sqlite", false},
+		{"csv", "postgres", false},
+		{"csv", "mysql", false},
+	}
+	for _, c := range cases {
+		if got := HasStorageShapeMapping(c.source, c.target); got != c.want {
+			t.Errorf("HasStorageShapeMapping(%q, %q) = %v; want %v", c.source, c.target, got, c.want)
+		}
 	}
 }
 

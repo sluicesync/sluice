@@ -339,11 +339,14 @@ func (r *legRunner) nowFunc() func() time.Time {
 
 // assertDiffWithinExpected fetches the deploy request's computed diff
 // and refuses when it touches any object OUTSIDE the leg's intended
-// table set (audit MED-D0-7). The check is subset-only: production
+// table set (audit MED-D0-7). The check is subset-only — production
 // already carrying part of the intent (e.g. the expand leg's staged
-// control tables) legitimately shrinks the diff, and an EMPTY intended
-// set means the caller has nothing to assert (deploy-ddl's arbitrary
-// operator DDL) so the fetch is skipped entirely.
+// control tables) legitimately shrinks the diff — but never EMPTY: a
+// deployable DR with zero decoded diff entries is a response-shape
+// drift signal and refuses fail-closed (see the tripwire below). An
+// EMPTY intended set means the caller has nothing to assert
+// (deploy-ddl's arbitrary operator DDL) so the fetch is skipped
+// entirely.
 func (r *legRunner) assertDiffWithinExpected(ctx context.Context, number int) error {
 	if len(r.expectedDiffTables) == 0 {
 		return nil
@@ -351,6 +354,25 @@ func (r *legRunner) assertDiffWithinExpected(ctx context.Context, number int) er
 	diffs, err := r.api.GetDeployRequestDiff(ctx, r.org, r.database, number)
 	if err != nil {
 		return fmt.Errorf("%s: fetch deploy request #%d diff: %w", r.errPrefix, number, err)
+	}
+	// Fail-closed tripwire (audit 2026-07-16): a DEPLOYABLE deploy
+	// request structurally cannot have an empty diff — waitDeployable
+	// already refused `no_changes` — so zero decoded entries on a leg
+	// that intends changes means sluice's model of the diff response no
+	// longer matches the API (the DeployRequestDiff shape is DERIVED,
+	// not live-captured; see api.Client.GetDeployRequestDiff). Passing
+	// here would silently turn the whole blast-radius gate into a no-op
+	// on every leg while every fake-backed test stays green.
+	if len(diffs) == 0 {
+		dr, drErr := r.api.GetDeployRequest(ctx, r.org, r.database, number)
+		if drErr != nil {
+			// The refusal must not be masked by a failed URL lookup.
+			dr = &api.DeployRequest{Number: number, HTMLURL: "(unavailable)"}
+		}
+		return r.drFailure(dr, fmt.Sprintf(
+			"deploy request #%d is deployable but its computed diff decoded EMPTY while this %s leg intends to change %s — sluice's model of the diff response shape (derived, not live-captured) likely no longer matches the API; refusing before the deploy rather than deploying with the blast-radius gate blind",
+			number, r.name, strings.Join(r.expectedDiffTables, ", "),
+		))
 	}
 	expected := make(map[string]struct{}, len(r.expectedDiffTables))
 	for _, t := range r.expectedDiffTables {

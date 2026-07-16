@@ -120,6 +120,35 @@ func TestLegRunner_DiffStrangerObjectRefusesBeforeDeploy(t *testing.T) {
 	}
 }
 
+// TestLegRunner_EmptyDiffWithIntendedSetRefuses pins the fail-closed
+// tripwire (audit 2026-07-16): a deployable DR whose diff decodes
+// EMPTY on a leg with a non-empty intended set refuses coded before
+// the deploy — a deployable DR structurally cannot have an empty diff
+// (waitDeployable refuses no_changes), so an empty decode means the
+// DERIVED diff response shape drifted from the real API, and passing
+// would silently blind the whole blast-radius gate.
+func TestLegRunner_EmptyDiffWithIntendedSetRefuses(t *testing.T) {
+	ps := newFakePS(t)
+	ps.drDiffs = []string{} // non-nil: serve a deployable DR with ZERO diff entries
+	r, cleanup, _ := newGateLegRunner(t, ps)
+	r.expectedDiffTables = []string{"items"}
+
+	_, err := r.run(context.Background(), "sluice-gate-emptydiff", "ALTER TABLE items ADD COLUMN c BIGINT", cleanup)
+	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
+	for _, want := range []string{"decoded EMPTY", "derived, not live-captured", "items", "deploy-requests/1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q missing %q", err.Error(), want)
+		}
+	}
+	if anyDeployed(ps) {
+		t.Error("deploy was called despite the empty-diff refusal")
+	}
+	cleanup.run(context.Background())
+	if len(ps.deleted) != 1 || ps.deleted[0] != "sluice-gate-emptydiff" {
+		t.Errorf("cleanup deleted %v; want the dev branch", ps.deleted)
+	}
+}
+
 // TestLegRunner_EmptyExpectedSkipsDiffFetch pins the deploy-ddl
 // carve-out: an empty intended set (arbitrary operator DDL that sluice
 // deliberately does not parse) skips the diff fetch entirely and

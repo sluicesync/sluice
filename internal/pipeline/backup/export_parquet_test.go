@@ -344,6 +344,109 @@ func TestParquetExport_ForceOverwriteDeletesStaleParquet(t *testing.T) {
 	}
 }
 
+// TestParquetExport_ForceOverwriteFirstExportLeavesForeignParquet pins
+// the audit 2026-07-16 HIGH-2 repro: a FIRST-EVER forced export into a
+// directory holding foreign datasets (nested Hive-style .parquet files
+// plus a top-level stray) must delete NOTHING — no prior
+// parquet_index.json means no prior sluice export owned the directory
+// — and must WARN naming the unmanaged files a `*.parquet` glob would
+// still read.
+func TestParquetExport_ForceOverwriteFirstExportLeavesForeignParquet(t *testing.T) {
+	seed := seedPlaintextExportBackup(t)
+	outDir := t.TempDir()
+	nestedDir := filepath.Join(outDir, "other-tool", "dt=2026-07-16")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := []string{
+		filepath.Join(nestedDir, "part-0001.parquet"),
+		filepath.Join(outDir, "stray.parquet"),
+	}
+	for _, p := range foreign {
+		if err := os.WriteFile(p, []byte("theirs"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	out, err := blobcodec.NewLocalStore(outDir)
+	if err != nil {
+		t.Fatalf("NewLocalStore(out): %v", err)
+	}
+	if err := (&ParquetExport{Store: seed.store, Output: out, ForceOverwrite: true}).Run(context.Background()); err != nil {
+		t.Fatalf("first forced export: %v", err)
+	}
+
+	for _, p := range foreign {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s deleted by a first-ever forced export: %v (nothing sluice owns here — audit 2026-07-16 HIGH-2)", p, err)
+		}
+	}
+	logs := logBuf.String()
+	for _, named := range []string{"unmanaged", "other-tool/dt=2026-07-16/part-0001.parquet", "stray.parquet"} {
+		if !strings.Contains(logs, named) {
+			t.Errorf("unmanaged-stray WARN missing %q:\n%s", named, logs)
+		}
+	}
+	// The export itself still completed normally.
+	for _, present := range []string{"users.parquet", "empty.parquet", ParquetIndexFileName} {
+		if _, err := os.Stat(filepath.Join(outDir, present)); err != nil {
+			t.Errorf("%s missing after the forced export: %v", present, err)
+		}
+	}
+}
+
+// TestParquetExport_ForceOverwriteSweepIsTopLevelOnly pins the sweep's
+// path boundary on a destination a prior export DOES own: the genuine
+// top-level orphan is swept, while a nested foreign .parquet survives
+// (exports only ever write flat <schema>.<table>.parquet names, so a
+// nested file is by construction another tool's) and is WARN-named as
+// unmanaged.
+func TestParquetExport_ForceOverwriteSweepIsTopLevelOnly(t *testing.T) {
+	seed := seedPlaintextExportBackup(t)
+	outDir := runExport(t, &ParquetExport{Store: seed.store}) // prior export owns outDir
+
+	nestedDir := filepath.Join(outDir, "spark-output")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(nestedDir, "part-00000.snappy.parquet")
+	if err := os.WriteFile(nested, []byte("theirs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "orphan.parquet"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	out, err := blobcodec.NewLocalStore(outDir)
+	if err != nil {
+		t.Fatalf("NewLocalStore(out): %v", err)
+	}
+	if err := (&ParquetExport{Store: seed.store, Output: out, ForceOverwrite: true}).Run(context.Background()); err != nil {
+		t.Fatalf("forced re-export: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(outDir, "orphan.parquet")); !os.IsNotExist(err) {
+		t.Errorf("orphan.parquet survived (stat err = %v); a prior-export orphan must still be swept", err)
+	}
+	if _, err := os.Stat(nested); err != nil {
+		t.Errorf("nested foreign parquet deleted despite the top-level boundary: %v", err)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "unmanaged") || !strings.Contains(logs, "spark-output/part-00000.snappy.parquet") {
+		t.Errorf("unmanaged WARN missing the nested foreign file:\n%s", logs)
+	}
+}
+
 func TestParquetExport_BackupIDSelection(t *testing.T) {
 	ctx := context.Background()
 	seed := seedPlaintextExportBackup(t)

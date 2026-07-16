@@ -28,6 +28,12 @@ import (
 // mutate what they need.
 func newTestIndexFallback(t *testing.T, ps *fakePS) (*IndexFallback, *ddlRecorder) {
 	t.Helper()
+	if ps.drDiffs == nil {
+		// The blast-radius gate refuses an EMPTY diff on legs with an
+		// intended set (fail-closed tripwire); these tests route the
+		// "orders" table.
+		ps.drDiffs = []string{"orders"}
+	}
 	_, client := ps.serve()
 	rec := &ddlRecorder{}
 	return &IndexFallback{

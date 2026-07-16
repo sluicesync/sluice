@@ -230,6 +230,80 @@ func TestMigrate_ExistingTableGate_PG(t *testing.T) {
 	})
 }
 
+// TestMigrate_ExistingTableGate_MySQLToPG_ReRun pins the audit
+// 2026-07-16 HIGH-1 live repro end to end: a mysql→postgres migrate,
+// TRUNCATE on the target, then a SECOND migrate over sluice's own
+// completed output must succeed — the source table deliberately
+// carries the three families whose PG catalog read-back is lossy
+// against MySQL-native IR (TEXT → Text[long], VARBINARY → BYTEA/
+// Blob[long], INT UNSIGNED → BIGINT), which the pre-fix gate compared
+// raw and refused rc=3 with the data-destroying --reset-target-data
+// hint. With no storage-shape mapping for the pair, the gate now
+// WARN-proceeds and IF NOT EXISTS tolerates, exactly as before
+// ADR-0166.
+func TestMigrate_ExistingTableGate_MySQLToPG_ReRun(t *testing.T) {
+	mysqlSource, _, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, mysqlSource, `
+		CREATE TABLE gate_rerun (
+			id      BIGINT NOT NULL AUTO_INCREMENT,
+			body    TEXT          NULL,
+			payload VARBINARY(64) NULL,
+			qty     INT UNSIGNED  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO gate_rerun (body, payload, qty) VALUES
+			('hello', X'DEADBEEF', 7),
+			(NULL,    NULL,        4294967295);
+	`)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	first := &Migrator{Source: mysqlEng, Target: pgEng, SourceDSN: mysqlSource, TargetDSN: pgTarget, MigrationID: "gate-rerun-1"}
+	if err := first.Run(ctx); err != nil {
+		t.Fatalf("first mysql→pg migrate: %v", err)
+	}
+
+	// The audit's exact repro: empty the target and re-feed it.
+	applyPGDDL(t, pgTarget, `TRUNCATE gate_rerun;`)
+
+	second := &Migrator{Source: mysqlEng, Target: pgEng, SourceDSN: mysqlSource, TargetDSN: pgTarget, MigrationID: "gate-rerun-2"}
+	if err := second.Run(ctx); err != nil {
+		t.Fatalf("mysql→pg RE-RUN over sluice's own output refused: %v (audit 2026-07-16 HIGH-1 — the shape gate must not compare an unmappable pair)", err)
+	}
+
+	db := openSQLDB(t, "pgx", pgTarget)
+	assertRowCount(t, db, "gate_rerun", 2)
+	var body string
+	var qty int64
+	if err := db.QueryRow(`SELECT body, qty FROM gate_rerun WHERE id = 1`).Scan(&body, &qty); err != nil {
+		t.Fatalf("read back gate_rerun: %v", err)
+	}
+	if body != "hello" || qty != 7 {
+		t.Errorf("gate_rerun row 1 = (%q, %d); want hello / 7", body, qty)
+	}
+	if err := db.QueryRow(`SELECT qty FROM gate_rerun WHERE id = 2`).Scan(&qty); err != nil {
+		t.Fatalf("read back gate_rerun row 2: %v", err)
+	}
+	if qty != 4294967295 {
+		t.Errorf("unsigned-int max landed as %d; want 4294967295", qty)
+	}
+}
+
 // ---- shared assertion helpers ----
 
 func openSQLDB(t *testing.T, driver, dsn string) *sql.DB {

@@ -145,6 +145,170 @@ func TestMigrateShapeGate_VerdictMatrix(t *testing.T) {
 	}
 }
 
+// TestMigrateShapeGate_PairMatrix pins the gate's ENGAGEMENT per
+// engine pair — the audit-2026-07-16 HIGH-1 class fix, pinned by
+// family per the Bug-74 discipline. Three postures exist:
+//
+//   - mapped via retarget rule (postgres→{mysql,planetscale,vitess}):
+//     compare active — equal-after-retarget skips, different refuses;
+//   - same storage family, no rule (mysql→planetscale): identity
+//     compare active — equal skips, different refuses;
+//   - NO mapping (mysql→postgres — the observed false-refusal
+//     direction — plus sqlite→postgres): compare disengaged — the run
+//     proceeds WHATEVER the pre-existing shape, with a WARN naming the
+//     tolerated tables, never a refusal built on a comparison the
+//     translation layer can't normalize.
+//
+// The no-mapping "equal" fixture mirrors the live repro's lossy PG
+// read-back per family: MySQL TEXT reads back as Text[long], VARBINARY
+// as Blob[long], INT UNSIGNED as BIGINT — a re-run over sluice's own
+// completed output.
+func TestMigrateShapeGate_PairMatrix(t *testing.T) {
+	mysqlNative := gateTable(
+		"repro",
+		&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+		&ir.Column{Name: "body", Type: ir.Text{Size: ir.TextRegular}, Nullable: true},
+		&ir.Column{Name: "payload", Type: ir.Varbinary{Length: 64}, Nullable: true},
+		&ir.Column{Name: "qty", Type: ir.Integer{Width: 32, Unsigned: true}},
+	)
+	pgReadBack := gateTable(
+		"repro",
+		&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+		&ir.Column{Name: "body", Type: ir.Text{Size: ir.TextLong}, Nullable: true},
+		&ir.Column{Name: "payload", Type: ir.Blob{Size: ir.BlobLong}, Nullable: true},
+		&ir.Column{Name: "qty", Type: ir.Integer{Width: 64}},
+	)
+
+	t.Run("no mapping proceeds with WARN", func(t *testing.T) {
+		for _, pair := range []struct{ src, tgt string }{
+			{"mysql", "postgres"},
+			{"planetscale", "postgres"},
+			{"sqlite", "postgres"},
+		} {
+			t.Run(pair.src+"→"+pair.tgt, func(t *testing.T) {
+				intended := &ir.Schema{Tables: []*ir.Table{mysqlNative}}
+				for name, existing := range map[string]*ir.Table{
+					// The re-run shape (lossy read-back of sluice's own
+					// output) AND a genuinely-different table both proceed:
+					// with no mapping the gate cannot tell them apart, so
+					// it must never refuse either.
+					"re-run over own output": pgReadBack,
+					"genuinely different": gateTable("repro",
+						&ir.Column{Name: "only_col", Type: ir.Varchar{Length: 10}, Nullable: true}),
+				} {
+					t.Run(name, func(t *testing.T) {
+						logs := captureLogs(t)
+						m, _ := gateMigrator(pair.src, pair.tgt, &ir.Schema{Tables: []*ir.Table{existing}})
+						got, err := m.phasePlanExistingTables(context.Background(), intended)
+						if err != nil {
+							t.Fatalf("no-mapping pair must never refuse (audit 2026-07-16 HIGH-1): %v", err)
+						}
+						if got != intended {
+							t.Errorf("no-mapping pair must pass the schema through unchanged")
+						}
+						for _, want := range []string{"tolerated WITHOUT a shape compare", "repro"} {
+							if !strings.Contains(logs.String(), want) {
+								t.Errorf("tolerated-tables WARN missing %q:\n%s", want, logs.String())
+							}
+						}
+					})
+				}
+			})
+		}
+	})
+
+	t.Run("no mapping with no pre-existing table stays silent", func(t *testing.T) {
+		logs := captureLogs(t)
+		m, _ := gateMigrator("mysql", "postgres", &ir.Schema{})
+		got, err := m.phasePlanExistingTables(context.Background(), &ir.Schema{Tables: []*ir.Table{mysqlNative}})
+		if err != nil || len(got.Tables) != 1 {
+			t.Fatalf("fresh-target run altered: got=%+v err=%v", got, err)
+		}
+		if strings.Contains(logs.String(), "tolerated") {
+			t.Errorf("WARN fired with nothing tolerated:\n%s", logs.String())
+		}
+	})
+
+	t.Run("retarget-mapped pairs stay active", func(t *testing.T) {
+		intended := &ir.Schema{Tables: []*ir.Table{gateTable(
+			"items",
+			&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+			&ir.Column{Name: "guid", Type: ir.UUID{}, Nullable: true},
+		)}}
+		bootstrapped := gateTable(
+			"items",
+			&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+			&ir.Column{Name: "guid", Type: ir.Char{Length: 36}, Nullable: true},
+		)
+		for _, tgt := range []string{"mysql", "planetscale", "vitess"} {
+			t.Run("postgres→"+tgt, func(t *testing.T) {
+				m, _ := gateMigrator("postgres", tgt, &ir.Schema{Tables: []*ir.Table{bootstrapped}})
+				got, err := m.phasePlanExistingTables(context.Background(), intended)
+				if err != nil {
+					t.Fatalf("retarget-equal table refused: %v", err)
+				}
+				if len(got.Tables) != 0 {
+					t.Errorf("retarget-equal table not skipped")
+				}
+
+				differing := gateTable("items",
+					&ir.Column{Name: "only_col", Type: ir.Varchar{Length: 10}, Nullable: true})
+				m, _ = gateMigrator("postgres", tgt, &ir.Schema{Tables: []*ir.Table{differing}})
+				if _, err := m.phasePlanExistingTables(context.Background(), intended); err == nil {
+					t.Error("genuinely-different table must still refuse where a rule exists")
+				}
+			})
+		}
+	})
+
+	t.Run("same family cross-name identity stays active", func(t *testing.T) {
+		intended := &ir.Schema{Tables: []*ir.Table{gateTable("items", gateCols()...)}}
+		m, _ := gateMigrator("mysql", "planetscale", &ir.Schema{Tables: []*ir.Table{gateTable("items", gateCols()...)}})
+		got, err := m.phasePlanExistingTables(context.Background(), intended)
+		if err != nil {
+			t.Fatalf("same-family equal table refused: %v", err)
+		}
+		if len(got.Tables) != 0 {
+			t.Errorf("same-family equal table not skipped")
+		}
+
+		differing := gateTable("items",
+			&ir.Column{Name: "only_col", Type: ir.Varchar{Length: 10}, Nullable: true})
+		m, _ = gateMigrator("mysql", "planetscale", &ir.Schema{Tables: []*ir.Table{differing}})
+		if _, err := m.phasePlanExistingTables(context.Background(), intended); err == nil {
+			t.Error("same-family different table must still refuse")
+		}
+	})
+}
+
+// TestMigrateShapeGate_HintNeverLeadsWithReset pins the refusal hint's
+// remedy ordering (audit 2026-07-16 HIGH-1, second half): the
+// non-destructive remedies (--exclude-table, inspect) come FIRST;
+// --reset-target-data appears last WITH its blast radius spelled out —
+// an operator following the hint on a sibling-shard load must not be
+// steered into dropping the already-loaded shard's data.
+func TestMigrateShapeGate_HintNeverLeadsWithReset(t *testing.T) {
+	intended := &ir.Schema{Tables: []*ir.Table{gateTable("items", gateCols()...)}}
+	differing := gateTable("items",
+		&ir.Column{Name: "only_col", Type: ir.Varchar{Length: 10}, Nullable: true})
+	m, _ := gateMigrator("mysql", "mysql", &ir.Schema{Tables: []*ir.Table{differing}})
+	_, err := m.phasePlanExistingTables(context.Background(), intended)
+	coded, ok := sluicecode.FromError(err)
+	if !ok {
+		t.Fatalf("err = %v; want the coded refusal", err)
+	}
+	exclude := strings.Index(coded.Hint, "--exclude-table")
+	reset := strings.Index(coded.Hint, "--reset-target-data")
+	if exclude == -1 || reset == -1 || exclude > reset {
+		t.Errorf("hint must name --exclude-table before --reset-target-data; hint = %q", coded.Hint)
+	}
+	for _, want := range []string{"every in-scope target table", "not just the conflicting"} {
+		if !strings.Contains(coded.Hint, want) {
+			t.Errorf("hint %q missing the reset blast-radius warning %q", coded.Hint, want)
+		}
+	}
+}
+
 // TestMigrateShapeGate_CrossEngineRetargetEqual pins the retarget
 // branch and the PlanetScale bootstrap story at unit level: a PG
 // source's uuid column lands on a MySQL-family target as CHAR(36), so

@@ -232,15 +232,16 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 		return fmt.Errorf("export-as-parquet: %w", err)
 	}
 
-	// 5. Refuse to clobber a prior export.
-	if !e.ForceOverwrite {
-		exists, err := e.Output.Exists(ctx, ParquetIndexFileName)
-		if err != nil {
-			return fmt.Errorf("export-as-parquet: inspect output: %w", err)
-		}
-		if exists {
-			return fmt.Errorf("export-as-parquet: the output already contains %s from a prior export; pass --force-overwrite to replace it", ParquetIndexFileName)
-		}
+	// 5. Refuse to clobber a prior export. The sentinel probe runs even
+	//    under --force-overwrite: a pre-existing parquet_index.json is
+	//    what marks the destination as sluice-owned, and step 8's stale
+	//    sweep is gated on it (audit 2026-07-16 HIGH-2).
+	priorIndexExisted, err := e.Output.Exists(ctx, ParquetIndexFileName)
+	if err != nil {
+		return fmt.Errorf("export-as-parquet: inspect output: %w", err)
+	}
+	if priorIndexExisted && !e.ForceOverwrite {
+		return fmt.Errorf("export-as-parquet: the output already contains %s from a prior export; pass --force-overwrite to replace it", ParquetIndexFileName)
 	}
 
 	// 6. Table filter (schema + manifest sides, mirroring restore).
@@ -301,9 +302,13 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 	//    export) — the cookbook's `*.parquet` glob would read its old
 	//    rows as current data, so it is deleted, each named loudly
 	//    (audit MED-D0-5). Runs AFTER the index write so a failed
-	//    export never half-deletes the prior one.
+	//    export never half-deletes the prior one. The sweep only ever
+	//    touches files a prior sluice export could have written — see
+	//    sweepStaleParquet's ownership boundary (audit 2026-07-16
+	//    HIGH-2: the first cut listed recursively and ungated, deleting
+	//    foreign nested datasets on a first-ever forced export).
 	if e.ForceOverwrite {
-		if err := e.deleteStaleParquet(ctx, index); err != nil {
+		if err := e.sweepStaleParquet(ctx, index, priorIndexExisted); err != nil {
 			return err
 		}
 	}
@@ -736,11 +741,24 @@ func (e *ParquetExport) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	return e.chainCEK, nil
 }
 
-// deleteStaleParquet diffs the destination against the just-written
-// index and deletes every `.parquet` the index does not claim (see the
-// step-8 comment in Run). Scoped to `.parquet` files only — the index
-// itself and any non-parquet object are never touched.
-func (e *ParquetExport) deleteStaleParquet(ctx context.Context, index *parquetIndex) error {
+// sweepStaleParquet diffs the destination against the just-written
+// index and deletes every stale `.parquet` a PRIOR sluice export could
+// have written (see the step-8 comment in Run). The ownership boundary
+// (audit 2026-07-16 HIGH-2) is deliberate and two-sided:
+//
+//   - TOP-LEVEL names only. Exports write flat `<schema>.<table>.parquet`
+//     paths (see parquetFileName), and Store.List walks recursively
+//     with forward-slash-normalized paths — so a nested .parquet is by
+//     construction another tool's dataset, never sluice's.
+//   - Only when the destination's PRIOR parquet_index.json existed. A
+//     first-ever forced export into a shared directory owns nothing
+//     there yet, so it deletes nothing.
+//
+// Unclaimed .parquet files outside that boundary are WARN-named as
+// unmanaged — a `*.parquet` glob over the destination would still read
+// them as current data — but never touched. The index itself and any
+// non-parquet object are never touched either.
+func (e *ParquetExport) sweepStaleParquet(ctx context.Context, index *parquetIndex, priorIndexExisted bool) error {
 	paths, err := e.Output.List(ctx, "")
 	if err != nil {
 		return fmt.Errorf("export-as-parquet: list output for stale .parquet files: %w", err)
@@ -749,8 +767,13 @@ func (e *ParquetExport) deleteStaleParquet(ctx context.Context, index *parquetIn
 	for _, t := range index.Tables {
 		current[t.File] = true
 	}
+	var unmanaged []string
 	for _, p := range paths {
 		if !strings.HasSuffix(p, ".parquet") || current[p] {
+			continue
+		}
+		if strings.Contains(p, "/") || !priorIndexExisted {
+			unmanaged = append(unmanaged, p)
 			continue
 		}
 		if err := e.Output.Delete(ctx, p); err != nil {
@@ -759,6 +782,12 @@ func (e *ParquetExport) deleteStaleParquet(ctx context.Context, index *parquetIn
 		slog.InfoContext(
 			ctx, "export-as-parquet: deleted a stale .parquet not claimed by this export's index (its table is not part of this export — a *.parquet glob would have read its old rows as current)",
 			slog.String("file", p),
+		)
+	}
+	if len(unmanaged) > 0 {
+		slog.WarnContext(
+			ctx, "export-as-parquet: unmanaged .parquet file(s) in the output location were left untouched (not written by a sluice export — nested path, or no prior export owned this directory); a *.parquet glob over the destination would read them as current data",
+			slog.String("files", strings.Join(unmanaged, ", ")),
 		)
 	}
 	return nil

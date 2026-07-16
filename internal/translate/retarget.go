@@ -4,6 +4,8 @@
 package translate
 
 import (
+	"strings"
+
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -29,10 +31,14 @@ import (
 // runs; retarget's pattern match only fires on still-source-native
 // types).
 //
-// Identity for unknown engine pairs and same-engine pairs. v0.8.0
-// scope is the PG→MySQL direction (the v0.7.0 auto-emit defaults);
-// other directions retarget no types and the diff falls back to the
-// pre-retarget IR comparison.
+// Identity for unknown engine pairs and same-engine pairs. The rule
+// table today covers the PG-storage → MySQL-dialect direction (the
+// v0.7.0 auto-emit defaults); other directions retarget no types and
+// the diff falls back to the pre-retarget IR comparison. Consumers
+// that REFUSE on the comparison (rather than report, as the diff
+// does) must gate on [HasStorageShapeMapping] first — a raw compare
+// against a foreign catalog's read-back mistakes translation for
+// drift.
 func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
 	if s == nil {
 		return nil
@@ -63,12 +69,70 @@ func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Sche
 type retargetRule func(ir.Type) ir.Type
 
 // retargetRuleFor returns the rule for a (source, target) engine pair,
-// or nil when no rewriting applies.
+// or nil when no rewriting applies. Keyed on the storage families, not
+// literal engine names, so every PG-storage source (postgres,
+// postgres-trigger) and every MySQL-dialect target (mysql,
+// planetscale, vitess) shares the one rule — the literal-name match
+// this replaces silently missed the vitess flavor (ADR-0166
+// follow-up (c)).
 func retargetRuleFor(sourceEngine, targetEngine string) retargetRule {
-	if sourceEngine == "postgres" && (targetEngine == "mysql" || targetEngine == "planetscale") {
+	if storageShapeFamily(sourceEngine) == storageFamilyPostgres && IsMySQLFamily(targetEngine) {
 		return retargetPGtoMySQL
 	}
 	return nil
+}
+
+// Storage-shape family labels for [storageShapeFamily].
+const (
+	storageFamilyMySQL    = "mysql"
+	storageFamilyPostgres = "postgres"
+	storageFamilySQLite   = "sqlite"
+)
+
+// storageShapeFamily buckets engine names by the catalog surface their
+// schema readers share: two engines in one family read a
+// shape-identical table back to the SAME IR, so an identity comparison
+// between them is faithful. The MySQL flavors share one engine
+// implementation (and mydumper parses MySQL-dialect DDL into the same
+// shapes); the trigger-CDC variants delegate their SchemaReaders to
+// the composed base engine. Engines with no shared-storage sibling
+// bucket as their own lowercased name, so same-name pairs are always
+// one family.
+//
+// Maintenance: the MySQL half rides [IsMySQLFamily] (registry-parity
+// tested); the postgres/sqlite lists enumerate the composed variants.
+// A new flavor or trigger variant must be added here to keep the
+// ADR-0166 shape gate active for its pairs — a miss fails SAFE (the
+// pair falls back to the gate's WARN-and-proceed posture, never a
+// false refusal).
+func storageShapeFamily(engine string) string {
+	switch {
+	case IsMySQLFamily(engine):
+		return storageFamilyMySQL
+	case strings.EqualFold(engine, "postgres"), strings.EqualFold(engine, "postgres-trigger"):
+		return storageFamilyPostgres
+	case strings.EqualFold(engine, "sqlite"), strings.EqualFold(engine, "sqlite-trigger"),
+		strings.EqualFold(engine, "d1"), strings.EqualFold(engine, "d1-trigger"):
+		return storageFamilySQLite
+	}
+	return strings.ToLower(engine)
+}
+
+// HasStorageShapeMapping reports whether [RetargetForEngine] can render
+// source-native IR in the target's storage shapes for this engine
+// pair: either both engines share a storage-shape family (identity is
+// faithful) or a retarget rule exists. Consumers that COMPARE the
+// retargeted schema against a target catalog read-back — the ADR-0166
+// migrate pre-create shape gate — must check this first: with no
+// mapping, source-native IR lands against the target's lossy read-back
+// (MySQL INT UNSIGNED reads back from PG as BIGINT, TEXT tiers
+// collapse, VARBINARY becomes BYTEA) and translation is
+// indistinguishable from drift. That raw compare is the 2026-07-16
+// audit's HIGH-1: it false-refused every mysql→postgres re-run over
+// tables sluice itself had created.
+func HasStorageShapeMapping(sourceEngine, targetEngine string) bool {
+	return storageShapeFamily(sourceEngine) == storageShapeFamily(targetEngine) ||
+		retargetRuleFor(sourceEngine, targetEngine) != nil
 }
 
 // retargetPGtoMySQL mirrors the PG→MySQL emit rules from

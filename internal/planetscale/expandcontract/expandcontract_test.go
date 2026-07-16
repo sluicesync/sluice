@@ -70,10 +70,11 @@ type fakePS struct {
 	deleteScript []int
 
 	// drDiffs scripts GET /deploy-requests/{n}/diff: the diff-object
-	// names every DR serves. Empty (the default) serves an empty diff —
-	// a subset of every intended set, so pre-existing tests pass the
-	// MED-D0-7 assertion untouched. diffFetches counts the GETs (the
-	// deploy-ddl skip pin).
+	// names every DR serves. An empty diff on a leg with an intended
+	// table set now REFUSES (the audit-2026-07-16 fail-closed shape-
+	// drift tripwire), so the harness constructors default this to the
+	// leg's own table; tests script strangers/subsets explicitly.
+	// diffFetches counts the GETs (the deploy-ddl skip pin).
 	drDiffs     []string
 	diffFetches int
 
@@ -603,6 +604,13 @@ func (d *ddlRecorder) ensureState(_ context.Context, pw *api.BranchPassword, _ s
 // mutate what they need.
 func newTestOrchestrator(t *testing.T, ps *fakePS) (*Orchestrator, *ecFakeEngine, *ddlRecorder, *bytes.Buffer) {
 	t.Helper()
+	if ps.drDiffs == nil {
+		// Default the served diff to the orchestrator's table: the
+		// blast-radius gate refuses an EMPTY diff on legs with an
+		// intended set (fail-closed tripwire), and tests that scripted
+		// drDiffs before calling this constructor keep their script.
+		ps.drDiffs = []string{"items"}
+	}
 	_, client := ps.serve()
 	eng := &ecFakeEngine{schema: ecSchema(ecIntPK()), ex: &ecFakeExecutor{rows: ecRows(10)}, store: newECFakeStore()}
 	rec := &ddlRecorder{}

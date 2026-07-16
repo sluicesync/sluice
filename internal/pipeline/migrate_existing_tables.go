@@ -28,7 +28,12 @@ package pipeline
 //     the mid-copy retry wall;
 //   - compare uncomputable (reader open/read failed) → WARN and fall
 //     back to today's behavior (create everything, IF NOT EXISTS
-//     tolerates) — the gate must never invent a new failure mode.
+//     tolerates) — the gate must never invent a new failure mode;
+//   - no storage-shape mapping for the engine pair (e.g. mysql→
+//     postgres: translate.RetargetForEngine has no rule and the
+//     catalogs differ) → same WARN-and-proceed fallback, naming the
+//     tolerated tables — a compare the translation layer cannot
+//     normalize must never refuse (audit 2026-07-16 HIGH-1).
 //
 // The gate is skipped on --resume: the prior attempt already created
 // (or validated) the tables, and re-running the idempotent CREATE is
@@ -73,6 +78,35 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 		return schema, nil
 	}
 
+	// The compare is only meaningful when the translation layer can
+	// render the source's IR in the target's storage shapes (audit
+	// 2026-07-16 HIGH-1): for a cross-storage pair with no retarget
+	// rule, source-native IR against the target's lossy catalog
+	// read-back mistakes translation for drift — MySQL INT UNSIGNED
+	// reads back from PG as BIGINT, TEXT tiers collapse, VARBINARY
+	// becomes BYTEA — refusing tables this migration itself created on
+	// every re-run/bootstrap. Mapping absent → the gate's documented
+	// WARN-and-proceed fallback: pre-existing same-name tables are
+	// tolerated by CREATE TABLE IF NOT EXISTS exactly as before
+	// ADR-0166, and the WARN names them so the operator knows they went
+	// unvalidated.
+	if !translate.HasStorageShapeMapping(m.Source.Name(), m.Target.Name()) {
+		var tolerated []string
+		for _, t := range schema.Tables {
+			if _, exists := actual[t.Name]; exists {
+				tolerated = append(tolerated, t.Name)
+			}
+		}
+		if len(tolerated) > 0 {
+			slog.WarnContext(ctx,
+				"migration: pre-existing same-name target table(s) tolerated WITHOUT a shape compare — no storage-shape mapping exists for this engine pair, so a conflicting shape would still surface mid-copy; verify them against `sluice schema preview` (or --exclude-table them) if in doubt",
+				slog.String("source_engine", m.Source.Name()),
+				slog.String("target_engine", m.Target.Name()),
+				slog.String("tables", strings.Join(tolerated, ", ")))
+		}
+		return schema, nil
+	}
+
 	// Compare against the target engine's STORAGE shapes, mirroring the
 	// schema-diff command: cross-engine pairs rewrite source-native IR
 	// types to what the target writer would emit (PG uuid → CHAR(36),
@@ -104,9 +138,15 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 	}
 
 	if len(refusals) > 0 {
+		// The hint deliberately leads with the non-destructive remedies
+		// (audit 2026-07-16 HIGH-1's second half): --reset-target-data
+		// drops EVERY in-scope target table's data — on a sibling-shard
+		// consolidation that destroys the already-loaded shards — so it
+		// is named last, as a last resort, with its blast radius spelled
+		// out.
 		return nil, sluicecode.Wrap(
 			sluicecode.CodeTargetTableShapeMismatch,
-			"drop or rename the conflicting target table(s), exclude them with --exclude-table, or alter their shape to match `sluice schema preview`; --reset-target-data drops every in-scope target table first",
+			"inspect the conflicting target table(s) against `sluice schema preview`, then exclude them with --exclude-table or drop/rename/alter them to match; only if the ENTIRE target dataset is disposable, --reset-target-data drops every in-scope target table's data (not just the conflicting ones) before re-creating",
 			fmt.Errorf(
 				"pipeline: %d pre-existing target table(s) differ from the schema this migration would create — refusing before any data moves (proceeding would fail mid-copy or land rows in the wrong columns): %s",
 				len(refusals), strings.Join(refusals, "; "),

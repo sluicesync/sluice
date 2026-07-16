@@ -23,7 +23,8 @@ A new pre-create gate in the migrate orchestrator (`internal/pipeline/migrate_ex
    - absent → create exactly as before;
    - equal shape → **skip** the CREATE, with an INFO naming the table ("target table exists with matching column shape — skipping create");
    - differs → the new coded refusal **`SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH`** (ClassRefusal, exit 3), upfront, naming the table and the first three differing columns (expected vs actual, rendered by the same function the compare uses) with remedies (drop/rename, `--exclude-table`, fix the shape, `--reset-target-data`);
-   - compare uncomputable (target reader open/read failed) → WARN and fall back to today's create-everything behavior. The gate must never invent a new failure mode; `CREATE TABLE IF NOT EXISTS` remains the backstop.
+   - compare uncomputable (target reader open/read failed) → WARN and fall back to today's create-everything behavior. The gate must never invent a new failure mode; `CREATE TABLE IF NOT EXISTS` remains the backstop;
+   - **no storage-shape mapping for the engine pair** (post-audit-2026-07-16 amendment, see impl notes) → same WARN-and-proceed fallback, naming the tolerated tables. The compare only engages when `translate.HasStorageShapeMapping` holds — the pair shares a storage family (identity read-back is faithful) or a retarget rule exists. A raw compare of source-native IR against a foreign catalog's lossy read-back mistakes translation for drift and must never refuse.
 
 **Scope decisions (each deliberate):**
 
@@ -40,7 +41,16 @@ A new pre-create gate in the migrate orchestrator (`internal/pipeline/migrate_ex
 - A conflicting pre-existing table fails in seconds with a named-column diagnostic instead of ~30 retried minutes; nothing is created and zero rows are copied (pinned).
 - Cost on the happy path: one target `ReadSchema` per migrate (per database in multi-DB fan-out) — the same catalog sweep `schema diff` performs.
 - **Residual risk, stated honestly:** the equal-verdict relies on the write→catalog→read-back round trip landing on the same IR the (retargeted) intended schema carries. Same-engine round trips are exercised by the real-MySQL/PG integration pins across several type families; exotic cross-engine mappings that `RetargetForEngine` doesn't mirror (e.g. MySQL `BIGINT UNSIGNED` → PG `NUMERIC(20,0)`) can render a genuinely-matching pre-created table as a MISMATCH. That failure is a LOUD refusal with both renderings shown and `--exclude-table`/drop remedies — never silent — and matches the schema-diff command's existing noise profile for the same pairs. Extending `RetargetForEngine`'s rule table fixes both consumers at once.
-- Follow-ups flagged: (a) a live psverify leg driving deploy-ddl-bootstrap → fresh migrate on a real safe-migrations branch (the fake-level story pin exists); (b) evaluating the same gate for the sync cold-start path; (c) the `vitess` flavor name is missing from `retargetRuleFor`'s MySQL-family match (pre-existing gap now shared by diff and this gate).
+- Follow-ups flagged: (a) a live psverify leg driving deploy-ddl-bootstrap → fresh migrate on a real safe-migrations branch (the fake-level story pin exists); (b) evaluating the same gate for the sync cold-start path; (c) ~~the `vitess` flavor name is missing from `retargetRuleFor`'s MySQL-family match~~ (closed by the amendment below — `retargetRuleFor` now keys on the storage families).
+
+## Implementation notes (2026-07-16 amendment — audit HIGH-1)
+
+The first cut shipped the "residual risk" above as a functional regression: `retargetRuleFor` covered only `postgres→{mysql,planetscale}`, so for **every mysql→postgres run** the compare put MySQL-native IR against the PG catalog's lossy read-back — `INT UNSIGNED` vs `BIGINT`, `TEXT` tier collapse, `VARBINARY` vs `BYTEA` — and refused rc=3 on tables sluice itself had created (re-runs after TRUNCATE, deploy bootstraps, sibling-shard consolidation), with a hint that led operators toward the data-destroying `--reset-target-data`. The AutoIncrement carve-out (`a53a081c`) had patched one leaf of exactly this class. Live-reproduced by the 2026-07-16 confirming audit (HIGH-1). The class fix:
+
+- **The compare is gated on `translate.HasStorageShapeMapping`** (same storage family, or a retarget rule). Unmapped pairs get the WARN-and-proceed fallback naming the tolerated tables — restoring pre-ADR-0166 behavior for mysql→postgres/sqlite→anything rather than refusing on a comparison the translation layer can't normalize. A future `mysql→postgres` retarget rule (mirroring `postgres/ddl_emit.go`'s families) would re-arm the gate for that direction AND de-noise `schema diff` — deliberately deferred as a separate chunk with its own family-matrix pins.
+- **`retargetRuleFor` keys on storage families**, closing follow-up (c): `postgres`/`postgres-trigger` sources × all MySQL-dialect targets (`mysql`, `planetscale`, `vitess`) share the one rule.
+- **The refusal hint leads with the non-destructive remedies** (`--exclude-table`, inspect against `schema preview`); `--reset-target-data` is named last, as a last resort, with its drops-every-in-scope-table blast radius spelled out.
+- Pins: `TestHasStorageShapeMapping` (translate), `TestMigrateShapeGate_PairMatrix` + `TestMigrateShapeGate_HintNeverLeadsWithReset` (pipeline unit), and the end-to-end `TestMigrate_ExistingTableGate_MySQLToPG_ReRun` integration repro (migrate → TRUNCATE → migrate again on real MySQL+PG).
 
 ## Alternatives considered
 
