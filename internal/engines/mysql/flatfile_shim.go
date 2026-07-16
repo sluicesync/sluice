@@ -53,6 +53,15 @@ func ScanQuotedString(s string) (raw []byte, end int, ok bool) {
 	return scanMySQLQuotedString(s)
 }
 
+// ScanDoubleQuotedString is [ScanQuotedString] for a DOUBLE-quoted literal
+// (s[0] must be `"`) — the default string shape mydumper ≥1.0 emits. MySQL's
+// escape grammar is symmetric in the two quote chars (doubled `""` → one `"`,
+// a bare `'` rides through raw, backslash escapes are delimiter-independent),
+// so this is the same scanner with the delimiter swapped, not a fork.
+func ScanDoubleQuotedString(s string) (raw []byte, end int, ok bool) {
+	return scanQuotedStringDelim(s, '"')
+}
+
 // NormalizeExpressionText folds MySQL stored-form expression text (backtick
 // identifier quotes, charset introducers, C-style apostrophe escapes) toward
 // portable SQL — the exported face of [normalizeMySQLExpressionText]. Used

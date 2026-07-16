@@ -395,17 +395,45 @@ func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
 // Do not thread [backslashIsMySQLEscape] in here — that policy exists for the
 // EMIT direction only, where the server's parser is mode-sensitive.
 func scanMySQLQuotedString(s string) (raw []byte, end int, ok bool) {
-	if s == "" || s[0] != '\'' {
+	return scanQuotedStringDelim(s, '\'')
+}
+
+// scanQuotedStringDelim is scanMySQLQuotedString generalized over the quote
+// character: MySQL's string-literal grammar is symmetric in the two quote
+// chars — inside a "-quoted literal the doubling escape is `""` and a bare
+// `'` rides through raw (and vice versa), while the backslash escapes are
+// delimiter-independent — so the mydumper reader's double-quoted decode
+// (mydumper ≥1.0's default emit shape) shares this scanner byte-for-byte
+// via [ScanDoubleQuotedString] instead of transposing its input.
+//
+// The closing delimiter is located BEFORE any allocation: callers hand this
+// scanner whole statement TAILS (a mydumper --statement-size data chunk can
+// be one statement of tens of MiB), and the previous len(s)-capacity buffer
+// made the flat-file read O(rows × statement_size) — ~300 GB of large-object
+// zeroing for a 49 MiB, 12k-row statement (Bug 191). The pre-scan walks the
+// same escape grammar as the decode loop, so split and decode still agree
+// byte-for-byte on where the literal ends; it also reports whether any
+// escape occurred, so the common escape-free literal decodes as one
+// exact-size copy.
+func scanQuotedStringDelim(s string, delim byte) (raw []byte, end int, ok bool) {
+	if s == "" || s[0] != delim {
 		return nil, 0, false
 	}
-	out := make([]byte, 0, len(s))
-	for i := 1; i < len(s); {
-		c := s[i]
-		switch c {
+	closeIdx, hasEscape, ok := quotedLiteralClose(s, delim)
+	if !ok {
+		return nil, 0, false
+	}
+	if !hasEscape {
+		return []byte(s[1:closeIdx]), closeIdx + 1, true
+	}
+	// The decoded output is never longer than the raw literal body (every
+	// escape maps 2 bytes → 1, except \% / \_ which keep both), so the body
+	// length is an exact-or-over capacity — append never reallocates.
+	out := make([]byte, 0, closeIdx-1)
+	for i := 1; i < closeIdx; {
+		switch c := s[i]; c {
 		case '\\':
-			if i+1 >= len(s) {
-				return nil, 0, false // dangling backslash
-			}
+			// quotedLiteralClose guarantees a byte follows the backslash.
 			// MySQL's string-literal grammar KEEPS the backslash for \% and
 			// \_ (LIKE-pattern escapes: '\%' evaluates to the two bytes
 			// `\%`, not `%` — the manual's string-literal escape table).
@@ -419,19 +447,46 @@ func scanMySQLQuotedString(s string) (raw []byte, end int, ok bool) {
 				out = append(out, decodeMySQLStringEscape(next))
 			}
 			i += 2
-		case '\'':
-			if i+1 < len(s) && s[i+1] == '\'' {
-				out = append(out, '\'') // doubled '' → literal quote
-				i += 2
-				continue
-			}
-			return out, i + 1, true // closing delimiter at i
+		case delim:
+			// Doubled delimiter → one literal delim. A SINGLE delimiter
+			// cannot appear here: the pre-scan stopped at the first one,
+			// and this loop retraces the pre-scan's exact steps.
+			out = append(out, delim)
+			i += 2
 		default:
 			out = append(out, c)
 			i++
 		}
 	}
-	return nil, 0, false // no closing quote
+	return out, closeIdx + 1, true
+}
+
+// quotedLiteralClose pre-scans the quoted literal opened at s[0] and
+// reports the index of its closing delimiter plus whether any escape
+// (backslash or doubled delimiter) occurs in the body. ok=false for a
+// dangling backslash or a literal with no closing delimiter — the same
+// refusals the decode path makes.
+func quotedLiteralClose(s string, delim byte) (closeIdx int, hasEscape, ok bool) {
+	for i := 1; i < len(s); {
+		switch s[i] {
+		case '\\':
+			if i+1 >= len(s) {
+				return 0, false, false // dangling backslash
+			}
+			hasEscape = true
+			i += 2
+		case delim:
+			if i+1 < len(s) && s[i+1] == delim {
+				hasEscape = true // doubled delimiter → escape
+				i += 2
+				continue
+			}
+			return i, hasEscape, true
+		default:
+			i++
+		}
+	}
+	return 0, false, false // no closing quote
 }
 
 // decodeMySQLStringEscape maps the byte following a backslash to the byte MySQL

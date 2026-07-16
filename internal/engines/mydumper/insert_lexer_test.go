@@ -219,6 +219,21 @@ func TestScanValue_EscapeSequences(t *testing.T) {
 		{`'\q'`, []byte{'q'}},
 		// everything mixed, with raw high bytes riding through untouched
 		{"'a\\0b\\'c''d\\\\e\xf0\x9f\x8d\x8af'", append([]byte("a\x00b'c'd\\e"), append([]byte("\xf0\x9f\x8d\x8a"), 'f')...)},
+		// --- the DOUBLE-quoted twin (mydumper ≥1.0's default emit shape;
+		// decoded via the delimiter-aware scanner since Bug 191) ---
+		{`"\0"`, []byte{0x00}},
+		{`"\""`, []byte{'"'}},
+		{`"\'"`, []byte{'\''}},
+		{`"\n"`, []byte{0x0A}},
+		{`"\Z"`, []byte{0x1A}},
+		{`"\\"`, []byte{'\\'}},
+		{`"\%"`, []byte(`\%`)},
+		{`"\_"`, []byte(`\_`)},
+		{`""""`, []byte{'"'}}, // SQL-standard doubled quote, "-flavoured
+		{`"\q"`, []byte{'q'}},
+		{`""`, []byte{}},           // empty value
+		{`"it's"`, []byte("it's")}, // raw single quote rides through
+		{"\"a\\0b\\\"c\"\"d\\\\e\xf0\x9f\x8d\x8af\"", append([]byte("a\x00b\"c\"d\\e"), append([]byte("\xf0\x9f\x8d\x8a"), 'f')...)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.src, func(t *testing.T) {

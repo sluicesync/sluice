@@ -268,9 +268,11 @@ func scanBacktickIdent(s string) (name string, end int, ok bool) {
 
 // scanSQLString decodes the quoted string at s[0] (either quote char) with
 // MySQL escape semantics — backslash escapes plus doubled-quote doubling —
-// via the live engine's decoder for the single-quote form. Double-quoted
-// strings (rare in dumps; mydumper emits single quotes) reuse the same
-// decoder by transposing the delimiter.
+// via the live engine's delimiter-aware decoder. The double-quoted form is
+// mydumper ≥1.0's DEFAULT emit shape; it previously reused the single-quote
+// decoder by transposing the two quote chars across the whole input, which
+// copied the entire remaining statement tail per value — the worst offender
+// of the Bug-191 O(rows × statement_size) class.
 func scanSQLString(s string) (raw []byte, end int, ok bool) {
 	if s == "" {
 		return nil, 0, false
@@ -278,33 +280,7 @@ func scanSQLString(s string) (raw []byte, end int, ok bool) {
 	if s[0] == '\'' {
 		return mysql.ScanQuotedString(s)
 	}
-	// Transpose "..." to '...' for the shared decoder: swap the roles of
-	// the two quote chars byte-wise. Escapes (`\"`, `""`) transpose 1:1.
-	swapped := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '"':
-			swapped[i] = '\''
-		case '\'':
-			swapped[i] = '"'
-		default:
-			swapped[i] = s[i]
-		}
-	}
-	raw, end, ok = mysql.ScanQuotedString(string(swapped))
-	if !ok {
-		return nil, 0, false
-	}
-	// Un-transpose the decoded bytes (a literal ' or " inside the string).
-	for i, b := range raw {
-		switch b {
-		case '"':
-			raw[i] = '\''
-		case '\'':
-			raw[i] = '"'
-		}
-	}
-	return raw, end, ok
+	return mysql.ScanDoubleQuotedString(s)
 }
 
 // scanQuotedDigits scans the '…' body at s[0]=='\” allowing only the given

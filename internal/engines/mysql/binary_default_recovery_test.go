@@ -13,7 +13,9 @@ package mysql
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -93,6 +95,120 @@ func TestDecodeMySQLQuotedString_Malformed(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if _, ok := decodeMySQLQuotedString(c.in); ok {
 				t.Errorf("decodeMySQLQuotedString(%q) ok=true; want false", c.in)
+			}
+		})
+	}
+}
+
+// TestScanQuotedStringDelim_Matrix pins the delimiter-generalized scanner
+// (the Bug-191 rewrite) across BOTH delimiters × every escape shape — the
+// class, not one representative: the single-quote form is the
+// information_schema/pscale shape, the double-quote form is mydumper ≥1.0's
+// default emit shape, and the rewrite split decoding into an escape-free
+// fast path and an escape-aware path, so each shape is pinned under both
+// delimiters with the reported end index asserted too.
+func TestScanQuotedStringDelim_Matrix(t *testing.T) {
+	// Cases are written for delim '\'' with Q standing for the delimiter
+	// and D for the other quote char; the runner materializes both forms.
+	cases := []struct {
+		name    string
+		in      string // Q = delimiter, D = the other quote char
+		want    string // decoded bytes, same placeholders
+		wantEnd int    // -1 = len(in)
+	}{
+		// escape-free fast path
+		{"plain", "QabcQ", "abc", -1},
+		{"empty", "QQ", "", -1},
+		{"raw NUL/newline/high bytes", "Qa\x00\nb\xf0\x9f\x8d\x8a\xffQ", "a\x00\nb\xf0\x9f\x8d\x8a\xff", -1},
+		{"raw other quote char", "QaDbQ", "aDb", -1},
+		{"trailing text ignored", "QabcQ,(2,", "abc", 5},
+		// escape-aware path
+		{"backslash escapes", `Q\0\b\t\n\r\Z\\Q`, "\x00\x08\x09\x0A\x0D\x1A\\", -1},
+		{"escaped delimiter", `Qa\Qb\DcQ`, "aQbDc", -1},
+		{"doubled delimiter", "QaQQbQ", "aQb", -1},
+		{"only a doubled delimiter", "QQQQ", "Q", -1},
+		{"unknown escape drops backslash", `Q\qQ`, "q", -1},
+		{"LIKE escapes keep backslash", `Qa\%b\_cQ`, `a\%b\_c`, -1},
+		{"escape then trailing text", `Qa\QbQ)`, "aQb", 6},
+	}
+	for _, delim := range []byte{'\'', '"'} {
+		other := byte('"')
+		if delim == '"' {
+			other = '\''
+		}
+		expand := func(s string) string {
+			s = strings.ReplaceAll(s, "Q", string(delim))
+			return strings.ReplaceAll(s, "D", string(other))
+		}
+		scan := ScanQuotedString
+		if delim == '"' {
+			scan = ScanDoubleQuotedString
+		}
+		for _, c := range cases {
+			t.Run(fmt.Sprintf("delim_%c/%s", delim, c.name), func(t *testing.T) {
+				in, want := expand(c.in), expand(c.want)
+				wantEnd := c.wantEnd
+				if wantEnd == -1 {
+					wantEnd = len(in)
+				}
+				raw, end, ok := scan(in)
+				if !ok {
+					t.Fatalf("scan(%q) ok=false; want %q", in, want)
+				}
+				if string(raw) != want || end != wantEnd {
+					t.Errorf("scan(%q) = %q, end %d; want %q, end %d", in, raw, end, want, wantEnd)
+				}
+			})
+		}
+		// Malformed inputs refuse under both delimiters.
+		for _, c := range []struct{ name, in string }{
+			{"unterminated", "Qabc"},
+			{"dangling backslash", `Qab\`},
+			{"unterminated via escaped closer", `Qab\Q`},
+			{"wrong opener", "DabcD"},
+			{"empty input", ""},
+		} {
+			t.Run(fmt.Sprintf("delim_%c/malformed_%s", delim, c.name), func(t *testing.T) {
+				in := expand(c.in)
+				if _, _, ok := scan(in); ok {
+					t.Errorf("scan(%q) ok=true; want false", in)
+				}
+			})
+		}
+	}
+}
+
+// TestScanQuotedString_BufferSizedToValue is the Bug-191 regression pin at
+// the allocation level: decoding a small value from a HUGE remaining
+// statement tail must size the output to the VALUE, not the tail. Before
+// the fix the capacity below was len(s) (~1 MiB per value), which made the
+// mydumper flat-file read O(rows × statement_size).
+func TestScanQuotedString_BufferSizedToValue(t *testing.T) {
+	tail := "'value'," + strings.Repeat("x", 1<<20)
+	for name, scan := range map[string]func(string) ([]byte, int, bool){
+		"single": ScanQuotedString,
+		"double": func(s string) ([]byte, int, bool) {
+			return ScanDoubleQuotedString(strings.ReplaceAll(s, "'", `"`))
+		},
+	} {
+		t.Run(name+"/fast-path", func(t *testing.T) {
+			raw, _, ok := scan(tail)
+			if !ok || string(raw) != "value" {
+				t.Fatalf("scan = %q, ok=%v", raw, ok)
+			}
+			// The allocator rounds to a size class, so pin "value-sized,
+			// nowhere near tail-sized" rather than the exact length.
+			if cap(raw) > 64 {
+				t.Errorf("cap = %d; want ≤ 64 (buffer must be sized to the value, not the ~1 MiB tail)", cap(raw))
+			}
+		})
+		t.Run(name+"/escape-path", func(t *testing.T) {
+			raw, _, ok := scan(`'va\nlue',` + strings.Repeat("x", 1<<20))
+			if !ok || string(raw) != "va\nlue" {
+				t.Fatalf("scan = %q, ok=%v", raw, ok)
+			}
+			if cap(raw) > 64 {
+				t.Errorf("cap = %d; want ≤ 64 (buffer must be sized to the literal body, not the ~1 MiB tail)", cap(raw))
 			}
 		})
 	}
