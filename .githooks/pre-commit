@@ -41,6 +41,20 @@ fi
 
 echo "pre-commit: running gofumpt check, go vet, and tests..."
 
+# ---- NUL-byte guard on staged text files ----
+# AI-tooling parameter layers decode a literal backslash-u-0000 sequence
+# into a real NUL byte; this has reached committed docs 4x (2026-07-16).
+# A NUL in a text file flips grep/ripgrep into binary mode repo-wide.
+nul_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
+	[ -f "$f" ] && LC_ALL=C grep -qP '\x00' "$f" && echo "$f"
+done)
+if [ -n "$nul_hits" ]; then
+	red "pre-commit: staged text file(s) contain a literal NUL byte:"
+	echo "$nul_hits"
+	echo "Spell the escape in prose (backslash-u-0000) instead."
+	exit 1
+fi
+
 # ---- gofumpt ----
 if ! command -v gofumpt >/dev/null 2>&1; then
 	red "pre-commit: gofumpt not installed."

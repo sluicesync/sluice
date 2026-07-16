@@ -35,6 +35,20 @@ if ($markerFiles.Count -gt 0) {
     exit 1
 }
 
+# ---- NUL-byte guard on staged text files ----
+# AI-tooling parameter layers decode a literal backslash-u-0000 sequence
+# into a real NUL byte; this has reached committed docs 4x (2026-07-16).
+# A NUL in a text file flips grep/ripgrep into binary mode repo-wide.
+$nulFiles = git diff --cached --name-only --diff-filter=ACM |
+    Where-Object { $_ -match '\.(md|go|yml|yaml|sh|ps1|txt)$' } |
+    Where-Object { (Test-Path $_) -and ([System.IO.File]::ReadAllBytes($_) -contains 0) }
+if ($nulFiles.Count -gt 0) {
+    Red "pre-commit: staged text file(s) contain a literal NUL byte:"
+    $nulFiles | ForEach-Object { Write-Host $_ }
+    Write-Host "Spell the escape in prose (backslash-u-0000) instead."
+    exit 1
+}
+
 # ---- gofumpt ----
 $gofumpt = Get-Command gofumpt -ErrorAction SilentlyContinue
 if (-not $gofumpt) {
