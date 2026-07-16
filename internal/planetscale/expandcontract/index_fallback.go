@@ -122,6 +122,10 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 		alreadyDeployedAdvice: "close the DR, delete the dev branch, and re-run with --resume — the index phase detects already-built indexes and skips them",
 		reviewTimeoutAdvice:   "approve it and re-run with --resume",
 		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume once it completes — already-deployed indexes are detected and skipped",
+
+		// Pre-Deploy blast-radius assertion (audit MED-D0-7): the
+		// fallback's DR carries index DDL for exactly ONE table.
+		expectedDiffTables: []string{table},
 	}
 	// The leg machine applies ONE ddl before opening the deploy request;
 	// a multi-index table's remainder (each FULLTEXT/SPATIAL must be its

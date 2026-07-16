@@ -67,7 +67,35 @@ type legRunner struct {
 	alreadyDeployedAdvice string
 	reviewTimeoutAdvice   string
 	deployTimeoutAdvice   string
+
+	// expectedDiffTables is the leg's intended blast radius: the table
+	// names its DDL (+ staging hook) may alter/create. When non-empty,
+	// the runner fetches the deploy request's computed diff BEFORE
+	// calling Deploy and refuses on any object outside this set (audit
+	// MED-D0-7): a stranger object means the branch base was stale (the
+	// live-caught phantom revert the freshness gate exists for) or the
+	// branch was touched out-of-band. Empty skips the assertion — the
+	// one legitimate holder is deploy-ddl, whose DDL is an arbitrary
+	// operator statement sluice deliberately does not parse (no regex
+	// over DDL), so it has no intended set to assert against.
+	expectedDiffTables []string
+
+	// now is the wall clock, injectable so the post-wait freshness
+	// recheck's elapsed threshold is testable without real waits. nil
+	// (every production construction) means time.Now.
+	now func() time.Time
 }
+
+// legFreshnessRecheckAfter is the review/deploy-wait duration beyond
+// which the runner re-verifies production's schema hasn't moved before
+// calling Deploy (audit MED-D0-7, the TOCTOU half): the provisioning
+// freshness gate is point-in-time, and a deploy request can sit in an
+// org's review queue for up to --deploy-timeout (default 1h) while
+// production keeps shipping schema changes. Whether PlanetScale
+// re-diffs a DR at deploy time is derived-not-verified, so the runner
+// assumes it does not. Short waits skip the recheck — the window is
+// negligible and every skipped GET keeps the fast path fast.
+const legFreshnessRecheckAfter = 2 * time.Minute
 
 // branch-readiness polling gets its own (generous, fixed) deadline:
 // branch creation is near-instant next to a deploy, and reusing the
@@ -137,9 +165,11 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 		return nil, fmt.Errorf("%s: probe dev branch %q: %w", r.errPrefix, branchName, err)
 	}
 
-	if err := r.provisionFreshBranch(ctx, branchName, cleanup); err != nil {
+	prodBaseline, err := r.provisionFreshBranch(ctx, branchName, cleanup)
+	if err != nil {
 		return nil, err
 	}
+	baselineAt := r.nowFunc()()
 
 	pw, err := r.api.CreateBranchPassword(ctx, r.org, r.database, branchName, r.passwordName)
 	if err != nil {
@@ -164,6 +194,17 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	fmt.Fprintf(out, "%s: opened deploy request #%d (%s)\n", r.name, dr.Number, dr.HTMLURL)
 
 	if err := r.waitDeployable(ctx, dr.Number); err != nil {
+		return nil, err
+	}
+	// Pre-Deploy blast-radius + freshness gates (audit MED-D0-7). Both
+	// run between "PlanetScale computed the diff / review finished" and
+	// the deploy call — the last moment sluice can still refuse without
+	// anything having shipped; cleanup tears the dev branch down as on
+	// every other failure path.
+	if err := r.assertDiffWithinExpected(ctx, dr.Number); err != nil {
+		return nil, err
+	}
+	if err := r.recheckProductionFreshness(ctx, dr.Number, prodBaseline, baselineAt); err != nil {
 		return nil, err
 	}
 	if _, err := r.api.Deploy(ctx, r.org, r.database, dr.Number); err != nil {
@@ -191,7 +232,9 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 }
 
 // provisionFreshBranch creates the dev branch and guarantees its
-// schema base matches production before any DDL is applied.
+// schema base matches production before any DDL is applied. It
+// returns production's rendered schema at gate-pass time — the
+// baseline the post-wait freshness recheck compares against.
 //
 // A new branch's schema base can LAG production (live-caught
 // 2026-07-15, intermittent: a branch created 14 minutes after a
@@ -204,36 +247,36 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 // compare branch schema to production via the API → if stale, delete
 // the branch, take an on-demand backup of production, recreate,
 // recheck → still stale is a coded runtime refusal.
-func (r *legRunner) provisionFreshBranch(ctx context.Context, branchName string, cleanup *branchCleanup) error {
+func (r *legRunner) provisionFreshBranch(ctx context.Context, branchName string, cleanup *branchCleanup) (prodBaseline string, err error) {
 	out := r.out
 	if err := r.createBranchAndWait(ctx, branchName, cleanup); err != nil {
-		return err
+		return "", err
 	}
-	stale, err := r.branchBaseStale(ctx, branchName)
+	stale, prodBaseline, err := r.branchBaseStale(ctx, branchName)
 	if err != nil {
-		return fmt.Errorf("%s: compare dev-branch schema to %q: %w", r.errPrefix, r.branch, err)
+		return "", fmt.Errorf("%s: compare dev-branch schema to %q: %w", r.errPrefix, r.branch, err)
 	}
 	if !stale {
-		return nil
+		return prodBaseline, nil
 	}
 
 	fmt.Fprintf(out, "%s: dev branch %q came up with a schema older than %q's current one (a new PlanetScale branch's base can lag production); taking a fresh backup to rebase\n",
 		r.name, branchName, r.branch)
 	if err := r.api.DeleteBranch(ctx, r.org, r.database, branchName); err != nil {
-		return fmt.Errorf("%s: delete stale dev branch %q: %w", r.errPrefix, branchName, err)
+		return "", fmt.Errorf("%s: delete stale dev branch %q: %w", r.errPrefix, branchName, err)
 	}
 	cleanup.remove(branchName)
 	if err := r.backupProduction(ctx); err != nil {
-		return err
+		return "", err
 	}
 	if err := r.createBranchAndWait(ctx, branchName, cleanup); err != nil {
-		return err
+		return "", err
 	}
-	if stale, err = r.branchBaseStale(ctx, branchName); err != nil {
-		return fmt.Errorf("%s: recheck dev-branch schema against %q: %w", r.errPrefix, r.branch, err)
+	if stale, prodBaseline, err = r.branchBaseStale(ctx, branchName); err != nil {
+		return "", fmt.Errorf("%s: recheck dev-branch schema against %q: %w", r.errPrefix, r.branch, err)
 	}
 	if stale {
-		return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
+		return "", sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
 			"take a fresh backup of the production branch (pscale backup create), then re-run",
 			fmt.Errorf(
 				"%s: dev branch %q still differs from %q after a fresh backup — deploying from it would silently revert newer production schema; inspect `pscale branch schema %s %s --org %s` vs %q and retry once the schemas converge",
@@ -241,7 +284,7 @@ func (r *legRunner) provisionFreshBranch(ctx context.Context, branchName string,
 			))
 	}
 	fmt.Fprintf(out, "%s: rebased dev branch %q now matches %q\n", r.name, branchName, r.branch)
-	return nil
+	return prodBaseline, nil
 }
 
 // createBranchAndWait creates the dev branch, registers it for
@@ -259,17 +302,94 @@ func (r *legRunner) createBranchAndWait(ctx context.Context, branchName string, 
 }
 
 // branchBaseStale reports whether the dev branch's schema differs from
-// the production branch's — the from-a-stale-backup signal.
-func (r *legRunner) branchBaseStale(ctx context.Context, branchName string) (bool, error) {
+// the production branch's — the from-a-stale-backup signal — and
+// returns production's rendered schema so the caller can baseline the
+// post-wait freshness recheck without a second GET.
+func (r *legRunner) branchBaseStale(ctx context.Context, branchName string) (stale bool, prodRender string, err error) {
 	dev, err := r.api.GetBranchSchema(ctx, r.org, r.database, branchName)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	prod, err := r.api.GetBranchSchema(ctx, r.org, r.database, r.branch)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
-	return renderSchema(dev) != renderSchema(prod), nil
+	prodRender = renderSchema(prod)
+	return renderSchema(dev) != prodRender, prodRender, nil
+}
+
+// nowFunc resolves the injectable clock.
+func (r *legRunner) nowFunc() func() time.Time {
+	if r.now != nil {
+		return r.now
+	}
+	return time.Now
+}
+
+// assertDiffWithinExpected fetches the deploy request's computed diff
+// and refuses when it touches any object OUTSIDE the leg's intended
+// table set (audit MED-D0-7). The check is subset-only: production
+// already carrying part of the intent (e.g. the expand leg's staged
+// control tables) legitimately shrinks the diff, and an EMPTY intended
+// set means the caller has nothing to assert (deploy-ddl's arbitrary
+// operator DDL) so the fetch is skipped entirely.
+func (r *legRunner) assertDiffWithinExpected(ctx context.Context, number int) error {
+	if len(r.expectedDiffTables) == 0 {
+		return nil
+	}
+	diffs, err := r.api.GetDeployRequestDiff(ctx, r.org, r.database, number)
+	if err != nil {
+		return fmt.Errorf("%s: fetch deploy request #%d diff: %w", r.errPrefix, number, err)
+	}
+	expected := make(map[string]struct{}, len(r.expectedDiffTables))
+	for _, t := range r.expectedDiffTables {
+		expected[t] = struct{}{}
+	}
+	var strangers []string
+	for _, d := range diffs {
+		if _, ok := expected[d.Name]; !ok {
+			strangers = append(strangers, d.Name)
+		}
+	}
+	if len(strangers) == 0 {
+		return nil
+	}
+	dr, drErr := r.api.GetDeployRequest(ctx, r.org, r.database, number)
+	if drErr != nil {
+		// The refusal must not be masked by a failed URL lookup.
+		dr = &api.DeployRequest{Number: number, HTMLURL: "(unavailable)"}
+	}
+	return r.drFailure(dr, fmt.Sprintf(
+		"deploy request #%d would change object(s) this %s leg never intended (%s; intended only: %s) — the dev branch's base was stale or the branch was modified outside sluice, and deploying would ship those changes to %q; refusing before the deploy",
+		number, r.name, strings.Join(strangers, ", "), strings.Join(r.expectedDiffTables, ", "), r.branch,
+	))
+}
+
+// recheckProductionFreshness re-fetches production's schema after a
+// long deployable/review wait and refuses when it moved since the
+// provisioning baseline (audit MED-D0-7, the TOCTOU half): the DR's
+// diff was computed against the OLD production schema, and whether
+// PlanetScale re-diffs at deploy time is derived-not-verified — the
+// empirically-observed failure shape (ADR-0162 finding 3) is a deploy
+// that silently reverts the newer production change. Waits shorter
+// than legFreshnessRecheckAfter skip the extra GET.
+func (r *legRunner) recheckProductionFreshness(ctx context.Context, number int, prodBaseline string, baselineAt time.Time) error {
+	if r.nowFunc()().Sub(baselineAt) <= legFreshnessRecheckAfter {
+		return nil
+	}
+	prod, err := r.api.GetBranchSchema(ctx, r.org, r.database, r.branch)
+	if err != nil {
+		return fmt.Errorf("%s: recheck %q schema before deploying #%d: %w", r.errPrefix, r.branch, number, err)
+	}
+	if renderSchema(prod) == prodBaseline {
+		return nil
+	}
+	return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
+		"re-run the command — it re-provisions the dev branch from current production and recomputes the deploy request",
+		fmt.Errorf(
+			"%s: %q's schema changed while deploy request #%d waited to deploy — the request's diff was computed against the old schema, and deploying it could silently revert the newer change; refusing before the deploy",
+			r.errPrefix, r.branch, number,
+		))
 }
 
 // renderSchema canonicalizes a branch schema for comparison: raw DDL

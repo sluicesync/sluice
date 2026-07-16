@@ -411,6 +411,35 @@ func (c *Client) Deploy(ctx context.Context, org, db string, number int) (*Deplo
 	return &out, nil
 }
 
+// DeployRequestDiff is one object of a deploy request's computed diff
+// (GET /deploy-requests/{number}/diff — the endpoint the ADR-0148 live
+// prototype exercised on a real PS-10, 2026-07-02). Name is the table
+// the deployment would alter/create/drop; the response also carries
+// raw/html DDL legs sluice doesn't read. The {"data":[{"name",...}]}
+// envelope mirrors the live-verified branch-schema shape; the diff
+// object's exact field set is DERIVED from the pscale tooling, not yet
+// live-captured — the next psverify dispatch should verbatim-capture a
+// real response and tighten the client_test fixture.
+type DeployRequestDiff struct {
+	Name string `json:"name"`
+}
+
+// GetDeployRequestDiff fetches a deploy request's computed per-object
+// diff — the legRunner's pre-Deploy blast-radius assertion input
+// (audit MED-D0-7): a diff object outside the leg's intended table set
+// means the branch base was stale (the empirically-deployed phantom
+// revert) or the branch was touched out-of-band, and deploying it
+// would ship schema changes sluice never intended.
+func (c *Client) GetDeployRequestDiff(ctx context.Context, org, db string, number int) ([]DeployRequestDiff, error) {
+	var out struct {
+		Data []DeployRequestDiff `json:"data"`
+	}
+	if err := c.Get(ctx, deployRequestsPath(org, db)+"/"+strconv.Itoa(number)+"/diff", &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
 // SchemaTable is one table of a branch's rendered schema (the raw DDL
 // leg of GET /branches/{branch}/schema; live-verified shape
 // 2026-07-15: {"data":[{"name","html","raw","annotated"}]}).

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/migratestate"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/planetscale/api"
 )
@@ -347,8 +348,17 @@ func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl s
 		alreadyDeployedAdvice: "close the DR, delete the dev branch, and continue with --resume-from " + legAfter(kind),
 		reviewTimeoutAdvice:   "approve it and re-run with --resume-from " + string(o.resumeFrom()),
 		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume-from " + legAfter(kind) + " once it completes",
+
+		// Pre-Deploy blast-radius assertion (audit MED-D0-7): both legs
+		// intend to touch exactly --table; the expand leg additionally
+		// ships the staged migrate-state control tables inside its
+		// deploy request. Anything else in the DR diff is a stale base
+		// or an out-of-band branch edit — refused before the deploy.
+		expectedDiffTables: []string{o.Table},
 	}
 	if kind == "expand" {
+		r.expectedDiffTables = append(r.expectedDiffTables,
+			migratestate.HeaderTableName, migratestate.ProgressTableName)
 		// Expand leg only: stage the migrate-state control tables on
 		// the dev branch so the deploy request ships them to production
 		// — safe migrations blocks the backfill from creating them

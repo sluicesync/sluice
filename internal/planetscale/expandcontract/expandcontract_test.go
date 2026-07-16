@@ -68,6 +68,24 @@ type fakePS struct {
 	// exhausted) deletes normally. Drives the cleanup 422-retry pins
 	// (roadmap item 71a).
 	deleteScript []int
+
+	// drDiffs scripts GET /deploy-requests/{n}/diff: the diff-object
+	// names every DR serves. Empty (the default) serves an empty diff —
+	// a subset of every intended set, so pre-existing tests pass the
+	// MED-D0-7 assertion untouched. diffFetches counts the GETs (the
+	// deploy-ddl skip pin).
+	drDiffs     []string
+	diffFetches int
+
+	// prodSchemaSuffix mutates the PRODUCTION branch's rendered schema
+	// mid-test (the post-wait freshness pins): non-empty is appended to
+	// main's raw DDL, so a baseline captured before the flip no longer
+	// matches. Dev branches are unaffected.
+	prodSchemaSuffix string
+	// flipProdSchemaOnDRCreate sets prodSchemaSuffix when a deploy
+	// request is CREATED — i.e. after the provisioning freshness gate
+	// captured its baseline, before the deployable wait ends.
+	flipProdSchemaOnDRCreate string
 }
 
 type fakeDR struct {
@@ -156,6 +174,9 @@ func (f *fakePS) handleBranches(w http.ResponseWriter, r *http.Request, rest []s
 		if f.staleBranch[rest[0]] {
 			raw = "CREATE TABLE `items` (id bigint) -- stale backup base"
 		}
+		if rest[0] == "main" && f.prodSchemaSuffix != "" {
+			raw += f.prodSchemaSuffix
+		}
 		writeJSON(w, map[string]any{"data": []map[string]string{{"name": "items", "raw": raw}}})
 	case len(rest) == 2 && rest[1] == "backups" && r.Method == http.MethodPost:
 		f.backups++
@@ -226,7 +247,22 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 			states:    append([]string(nil), f.postStates...),
 		}
 		f.drs[n] = fdr
+		if f.flipProdSchemaOnDRCreate != "" {
+			f.prodSchemaSuffix = f.flipProdSchemaOnDRCreate
+		}
 		writeJSON(w, fdr.dr)
+	case len(rest) == 2 && rest[1] == "diff" && r.Method == http.MethodGet:
+		n, _ := strconv.Atoi(rest[0])
+		if _, ok := f.drs[n]; !ok {
+			writeNotFound(w)
+			return
+		}
+		f.diffFetches++
+		diffs := make([]map[string]string, 0, len(f.drDiffs))
+		for _, name := range f.drDiffs {
+			diffs = append(diffs, map[string]string{"name": name})
+		}
+		writeJSON(w, map[string]any{"data": diffs})
 	case len(rest) == 1 && r.Method == http.MethodGet:
 		n, _ := strconv.Atoi(rest[0])
 		fdr, ok := f.drs[n]

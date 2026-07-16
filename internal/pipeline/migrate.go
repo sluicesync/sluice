@@ -771,6 +771,27 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return err
 	}
 
+	// Pre-create gate for existing target tables (ADR-0166): partition
+	// the intended tables into create-vs-skip against the target's
+	// catalog, refusing upfront (coded) on a same-name table whose
+	// column shape differs — instead of the pre-gate behavior where
+	// CREATE TABLE IF NOT EXISTS silently tolerated it and the
+	// conflict surfaced mid-copy inside the ADR-0108 retry wall. Runs
+	// AFTER phaseGateColdStart so --reset-target-data's drops have
+	// happened, and never on --resume (the prior attempt's own tables
+	// re-create idempotently — the long-standing resume contract).
+	// Only the CREATE phase consumes the pruned set; every later phase
+	// keeps the full schema (skipped tables still get data, indexes,
+	// constraints — all detect-then-skip idempotent).
+	createSchema := schema
+	if !resuming {
+		createSchema, err = m.phasePlanExistingTables(ctx, schema)
+		if err != nil {
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply,
+				markFailed(ctx, rc, state, ir.MigrationPhaseTables, err))
+		}
+	}
+
 	// Resolve the copy parallelism from the target's measured
 	// connection budget at the single chokepoint: budget preflight
 	// (item 4) → ADR-0077 index-build reservation → ADR-0076 table ×
@@ -792,7 +813,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// LogSink line.
 	ctx, rowTotal := withRunRowTotal(ctx)
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, createSchema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
 		return err
 	}
 
@@ -1232,6 +1253,7 @@ func runBulkCopyPhases(
 	rc resumeContext,
 	state *ir.MigrationState,
 	schema *ir.Schema,
+	createSchema *ir.Schema,
 	rows ir.RowReader,
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
@@ -1290,12 +1312,18 @@ func runBulkCopyPhases(
 		parallel.copyBudget = budget
 	}
 
-	// Phase 1: tables.
+	// Phase 1: tables. createSchema is the ADR-0166 create subset —
+	// the full schema minus tables the pre-create gate proved already
+	// exist with a matching column shape (nil = no gate ran; create
+	// everything, the pre-ADR-0166 behavior every other caller keeps).
+	if createSchema == nil {
+		createSchema = schema
+	}
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
 		// Phase mark is non-fatal; continue with the data work.
 		_ = err
 	}
-	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+	if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
 		err = fmt.Errorf("pipeline: create tables: %w", err)
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
 	}

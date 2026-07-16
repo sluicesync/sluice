@@ -297,7 +297,9 @@ func (s *Streamer) runColdStartParallel(
 	rc := resumeContext{}
 	state := ir.MigrationState{}
 	return runBulkCopyPhases(
-		ctx, rc, &state, schema, stream.Rows, sw, rw,
+		ctx, rc, &state, schema,
+		nil, // createSchema: the ADR-0166 pre-create gate is migrate-only; the sync cold-start keeps the IF-NOT-EXISTS create for every table
+		stream.Rows, sw, rw,
 		false, // resuming
 		s.BulkBatchSize,
 		deps, tableParallelism,

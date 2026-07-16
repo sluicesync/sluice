@@ -56,6 +56,7 @@ func TestRunBulkCopyPhases_WiresGrowGateOntoTopLevelWriter(t *testing.T) {
 		resumeContext{}, // disabled: state ops no-op
 		&ir.MigrationState{},
 		&ir.Schema{}, // no tables → copy/index/constraint phases are no-ops
+		nil,          // createSchema: no ADR-0166 gate → create the full schema
 		noopRowReader{},
 		noopSchemaWriter{},
 		rw,
@@ -90,7 +91,7 @@ func TestRunBulkCopyPhases_NilGrowGateIsNoOp(t *testing.T) {
 
 	err := runBulkCopyPhases(
 		ctx, resumeContext{}, &ir.MigrationState{}, &ir.Schema{},
-		noopRowReader{}, noopSchemaWriter{}, rw, false, 1000, deps, 1, nil, ShardColumnSpec{}, false, false,
+		nil, noopRowReader{}, noopSchemaWriter{}, rw, false, 1000, deps, 1, nil, ShardColumnSpec{}, false, false,
 	)
 	if err != nil {
 		t.Fatalf("runBulkCopyPhases(nil gate): %v", err)

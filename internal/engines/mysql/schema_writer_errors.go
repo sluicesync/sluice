@@ -93,27 +93,26 @@ func wrapDDLError(err error) error {
 // sync-oriented hint — sent `migrate` operators chasing
 // `--schema-already-applied`, a flag migrate does not have
 // (live-caught 2026-07-15). So the message names both recovery paths
-// and scopes the sync-only flag to the command that owns it. Note the
-// deploy-request pre-create path does NOT yet unblock a re-run of
-// `migrate` itself (user-table CREATEs are not detect-first, and
-// PlanetScale refuses the statement even when the table exists) —
-// roadmap item 71b tracks the schema-compare-then-skip design; until
-// then migrate's complete path is the safe-migrations window.
+// and scopes the sync-only flag to the command that owns it. Since
+// ADR-0166 (roadmap item 71b) the deploy-request pre-create path
+// unblocks `migrate` too: its pre-create gate detects a pre-existing
+// table with a matching column shape and skips the refused CREATE, so
+// a deploy-ddl-bootstrapped schema feeds a fresh migrate directly.
 func wrapUserTableCreateError(err error, table string) error {
 	if !isDirectDDLDisabledErr(err) {
 		return wrapDDLError(err)
 	}
 	return sluicecode.Wrap(
 		sluicecode.CodePSDirectDDLBlocked,
-		"disable safe migrations on the branch for the migration window (re-enable after), or pre-create the schema via deploy requests: `sluice schema preview` prints the target DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement (a sync stream then skips schema-apply with `sluice sync start --schema-already-applied`; migrate cannot skip it yet)",
+		"disable safe migrations on the branch for the migration window (re-enable after), or pre-create the schema via deploy requests: `sluice schema preview` prints the target DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement (a re-run of `sluice migrate` then skips the pre-created tables; a sync stream skips schema-apply with `sluice sync start --schema-already-applied`)",
 		fmt.Errorf("%w: %w | "+
 			"sluice needs to CREATE user table %q, and this branch's safe-migrations setting "+
 			"refuses every direct DDL statement. Two ways through: "+
 			"(a) disable safe migrations on the branch for the migration window and re-enable it after; or "+
 			"(b) pre-create the schema through deploy requests — `sluice schema preview` prints the exact "+
-			"target DDL and `sluice deploy-ddl --ddl '<statement>'` deploys one statement — then copy the "+
-			"data with a flow that skips sluice's schema-apply phase "+
-			"(`sluice sync start --schema-already-applied`; `sluice migrate` cannot skip it yet)",
+			"target DDL and `sluice deploy-ddl --ddl '<statement>'` deploys one statement — then re-run: "+
+			"`sluice migrate` skips pre-created tables whose column shape matches, and a sync stream "+
+			"skips schema-apply with `sluice sync start --schema-already-applied`",
 			ErrSafeMigrationsBlocked, err, table),
 	)
 }

@@ -99,6 +99,14 @@ func TestWrapUserTableCreateError_1105CodedRefusal(t *testing.T) {
 			t.Errorf("refusal %q should contain %q", msg, want)
 		}
 	}
+	// ADR-0166 (item 71b): the deploy-request pre-create path now feeds
+	// a fresh migrate — the message and hint must say migrate SKIPS
+	// pre-created matching tables, not that it "cannot skip it yet".
+	for _, s := range []string{msg, coded.Hint} {
+		if !strings.Contains(s, "skips") || strings.Contains(s, "cannot skip") {
+			t.Errorf("text %q should say migrate skips pre-created tables (ADR-0166), never 'cannot skip'", s)
+		}
+	}
 	assertSyncFlagScoped(t, msg)
 	assertSyncFlagScoped(t, coded.Hint)
 }

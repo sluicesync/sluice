@@ -84,6 +84,8 @@ const (
 	CodeBackfillIncomplete        Code = "SLUICE-E-BACKFILL-INCOMPLETE"
 	CodeBackfillCorruptCursor     Code = "SLUICE-E-BACKFILL-CORRUPT-CURSOR"
 
+	CodeTargetTableShapeMismatch Code = "SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH"
+
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
@@ -167,9 +169,11 @@ var registry = map[Code]Info{
 	CodeCSVNullAmbiguous:    {ClassRefusal, "a csv/tsv source contains an unquoted empty field and no NULL representation was declared — RFC 4180 has no NULL, so sluice refuses to guess; declare the convention with --csv-null"},
 	CodeCSVHeaderUndeclared: {ClassRefusal, "a csv/tsv source was opened without declaring header presence — sluice never sniffs it; pass --csv-header or --csv-no-header"},
 
+	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
+
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state (or never became deployable/complete before the timeout) — the message carries the DR number, state, and URL"},
-	CodePSBranchStaleBase:        {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup — a new dev branch's schema can lag production (intermittent, timing undocumented), and deploying from a stale base would silently revert newer production schema"},
+	CodePSBranchStaleBase:        {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup (a new dev branch's schema can lag production — intermittent, timing undocumented), or production's schema changed while a deploy request sat in its review/deploy wait — either way, deploying would silently revert newer production schema"},
 	CodePSDirectDDLBlocked:       {ClassRefusal, "PlanetScale safe migrations refused a direct DDL statement sluice needs (Error 1105) — a user-table CREATE during schema apply, or sluice's own control tables. Ship the DDL through the governed channel (`sluice deploy-ddl`; `sluice control-tables ddl` / `sluice schema preview` print the statements) or disable safe migrations for the window — the message carries the per-case recipe"},
 
 	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},

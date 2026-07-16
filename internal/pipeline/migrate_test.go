@@ -521,6 +521,10 @@ type recordingEngine struct {
 	openSchemaWriterCalls int
 	openRowWriterCalls    int
 	phaseLog              []string
+	// createdTables records the table names each
+	// CreateTablesWithoutConstraints call received (ADR-0166: the
+	// pre-create gate prunes the CREATE set, and this is what pins it).
+	createdTables []string
 	// mu guards phaseLog appends from the recordingRowWriters this engine
 	// hands out: under the ADR-0076 cross-table pool, peer tables call
 	// WriteRows concurrently on sibling writers that share this slice.
@@ -540,7 +544,7 @@ func (e *recordingEngine) OpenSchemaReader(_ context.Context, _ string) (ir.Sche
 
 func (e *recordingEngine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, error) {
 	e.openSchemaWriterCalls++
-	return &recordingSchemaWriter{phaseLog: &e.phaseLog}, nil
+	return &recordingSchemaWriter{phaseLog: &e.phaseLog, createdTables: &e.createdTables}, nil
 }
 
 func (e *recordingEngine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
@@ -577,11 +581,17 @@ func (r *recordingSchemaReader) ReadSchema(context.Context) (*ir.Schema, error) 
 }
 
 type recordingSchemaWriter struct {
-	phaseLog *[]string
+	phaseLog      *[]string
+	createdTables *[]string
 }
 
-func (w *recordingSchemaWriter) CreateTablesWithoutConstraints(context.Context, *ir.Schema) error {
+func (w *recordingSchemaWriter) CreateTablesWithoutConstraints(_ context.Context, s *ir.Schema) error {
 	*w.phaseLog = append(*w.phaseLog, "CreateTablesWithoutConstraints")
+	if w.createdTables != nil && s != nil {
+		for _, t := range s.Tables {
+			*w.createdTables = append(*w.createdTables, t.Name)
+		}
+	}
 	return nil
 }
 

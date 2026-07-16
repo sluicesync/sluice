@@ -179,6 +179,12 @@ func (d *DDLDeployer) legRunner() *legRunner {
 		alreadyDeployedAdvice: "the --ddl is already applied on the production branch and there is nothing left to ship; close the DR",
 		reviewTimeoutAdvice:   "approve it and re-run",
 		deployTimeoutAdvice:   "watch it at the URL — once it completes the DDL is deployed and nothing further is needed",
+
+		// expectedDiffTables stays empty BY DESIGN: --ddl is an
+		// arbitrary operator statement sluice deliberately does not
+		// parse (no regex over DDL), so there is no intended table set
+		// to assert the DR diff against. The post-wait production
+		// freshness recheck still applies.
 	}
 }
 

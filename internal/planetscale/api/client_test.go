@@ -212,6 +212,9 @@ func TestClient_DeployRequestVerbs(t *testing.T) {
 	if _, err := c.Deploy(ctx, "o", "d", 7); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
+	if _, err := c.GetDeployRequestDiff(ctx, "o", "d", 7); err != nil {
+		t.Fatalf("GetDeployRequestDiff: %v", err)
+	}
 	if _, err := c.SkipRevert(ctx, "o", "d", 7); err != nil {
 		t.Fatalf("SkipRevert: %v", err)
 	}
@@ -223,6 +226,7 @@ func TestClient_DeployRequestVerbs(t *testing.T) {
 		{"POST", "/v1/organizations/o/databases/d/deploy-requests", `{"branch":"dev","into_branch":"main"}`},
 		{"GET", "/v1/organizations/o/databases/d/deploy-requests/7", ""},
 		{"POST", "/v1/organizations/o/databases/d/deploy-requests/7/deploy", ""},
+		{"GET", "/v1/organizations/o/databases/d/deploy-requests/7/diff", ""},
 		{"POST", "/v1/organizations/o/databases/d/deploy-requests/7/skip-revert", ""},
 		{"DELETE", "/v1/organizations/o/databases/d/branches/dev", ""},
 	}
@@ -286,6 +290,46 @@ func TestClient_GetDeployRequest_RealResponseShape(t *testing.T) {
 	}
 	if dr.DeploymentState != "ready" || dr.Number != 2 {
 		t.Fatalf("dr = %+v; want deployment_state ready, number 2", dr)
+	}
+}
+
+// TestClient_GetDeployRequestDiff_ResponseShape pins the diff verb's
+// decoding against the {"data":[{"name",...}]} envelope with the raw/
+// html sibling fields present — the same envelope family as the
+// live-verified branch-schema endpoint, and the endpoint itself
+// (/deploy-requests/{n}/diff) was live-exercised by the ADR-0148
+// prototype (real PS-10, 2026-07-02). CAVEAT, per the house
+// verbatim-capture convention: unlike the GetDeployRequest fixture
+// above, this diff body is DERIVED from the pscale tooling's shape,
+// not yet a sanitized capture of a real response — the next live
+// psverify dispatch should capture one and tighten this fixture (the
+// self-consistent-fixture blindness this convention exists for).
+func TestClient_GetDeployRequestDiff_ResponseShape(t *testing.T) {
+	const derivedDiffBody = `{
+	  "data": [
+	    {
+	      "name": "items",
+	      "raw": "ALTER TABLE items ADD COLUMN c bigint",
+	      "html": "<div>...</div>"
+	    },
+	    {
+	      "name": "sluice_migrate_state",
+	      "raw": "CREATE TABLE sluice_migrate_state (...)",
+	      "html": "<div>...</div>"
+	    }
+	  ]
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(derivedDiffBody))
+	}))
+	defer srv.Close()
+
+	diffs, err := newTestClient(srv, nil).GetDeployRequestDiff(context.Background(), "o", "d", 7)
+	if err != nil {
+		t.Fatalf("GetDeployRequestDiff: %v", err)
+	}
+	if len(diffs) != 2 || diffs[0].Name != "items" || diffs[1].Name != "sluice_migrate_state" {
+		t.Fatalf("diffs = %+v; want the two object names decoded in order", diffs)
 	}
 }
 
