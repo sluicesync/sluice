@@ -1743,11 +1743,24 @@ type RestoreCmd struct {
 	// is the scarce resource on small tiers and the connection-budget split
 	// only bounds prober-equipped engines (Postgres). Same opt-in /
 	// all-or-nothing semantics as 'sync start'; off (no clamp) when unset.
-	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) used to clamp the AUTO restore parallelism product by live headroom (ADR-0107/0115). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset." placeholder:"ORG"`
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug, consumed by BOTH optional PlanetScale integrations: target-health telemetry (CPU/mem/storage) clamping the AUTO restore parallelism product by live headroom (ADR-0107/0115; requires --planetscale-metrics-token-id + --planetscale-metrics-token, all-or-nothing) AND the automatic deploy-request index-build fallback on a planetscale target (ADR-0148; requires the service token, see --planetscale-service-token-id). Each integration arms on its own token pair. Control-plane only — distinct from the data-plane --target DSN. Off when unset." placeholder:"ORG"`
 	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted read_metrics_endpoints) for --planetscale-org telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
 	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for --planetscale-org telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
 	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
 	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+
+	// ADR-0148 / audit MED-A1: restore's Phase-4 CreateIndexes is the same
+	// walled deferred index build migrate's index phase runs, so the same
+	// deploy-request fallback arms here — a planetscale target +
+	// --planetscale-org + the service token (distinct from the metrics token
+	// above; the org flag is shared between the two consumers). Unarmed (any
+	// piece missing, or a non-planetscale target), the index phase behaves
+	// exactly as before, ending at the SLUICE-E-INDEX-* refusal + hints.
+	PlanetScaleDatabase       string        `name:"planetscale-database" help:"PlanetScale database name for the ADR-0148 index-build fallback. Defaults to the --target DSN's database name. Only consulted when --planetscale-org is set." placeholder:"DB"`
+	PlanetScaleBranch         string        `name:"planetscale-branch" help:"PlanetScale production branch the --target DSN points at, for the ADR-0148 index-build fallback (deploy requests merge into it). Only consulted when --planetscale-org is set." default:"main" placeholder:"BRANCH"`
+	PlanetScaleServiceTokenID string        `name:"planetscale-service-token-id" help:"PlanetScale service-token ID (branch + deploy-request scopes) for the ADR-0148 index-build fallback. Prefer the env var so it never lands in shell history." env:"PLANETSCALE_SERVICE_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
+	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request deadline for the ADR-0148 index-build fallback (a large table's index deploys via VReplication — real wall-clock, but async and unbounded by errno 3024). On timeout the deploy keeps running in PlanetScale and re-running the restore picks up: the index phase re-probes and rebuilds only what is still missing." default:"1h" placeholder:"DUR"`
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table row counts; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
@@ -1861,11 +1874,29 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
+	// ADR-0148 / audit MED-A1: arm the automatic deploy-request index-build
+	// fallback when the target is planetscale and the control-plane
+	// credentials resolve; nil (unarmed) leaves the index phase
+	// byte-identical to before. Composed BEFORE the telemetry build so the
+	// shared --planetscale-org can be reconciled between the two consumers.
+	indexFallback := composePlanetScaleIndexFallback(indexFallbackParams{
+		targetDriver:  r.TargetDriver,
+		targetDSN:     r.Target,
+		org:           r.PlanetScaleOrg,
+		database:      r.PlanetScaleDatabase,
+		branch:        r.PlanetScaleBranch,
+		tokenID:       r.PlanetScaleServiceTokenID,
+		token:         r.PlanetScaleServiceToken,
+		deployTimeout: r.PlanetScaleDeployTimeout,
+	})
+
 	// OPTIONAL PlanetScale telemetry (ADR-0107) — used here only to clamp the
 	// AUTO parallelism product by live headroom (ADR-0115). (nil, nil) when
-	// off; an org without a complete token pair is a loud refusal. Closed at
-	// return so its background poller stops.
-	telemetryProvider, err := buildTargetTelemetryProvider(ctx, telemetryParams{
+	// off; an org without a complete token pair is a loud refusal — except a
+	// fallback-only arming (org + service token, no metrics token piece),
+	// which telemetryParamsSharedOrg routes to telemetry-off-with-WARN
+	// instead. Closed at return so its background poller stops.
+	telemetryProvider, err := buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, telemetryParams{
 		org:       r.PlanetScaleOrg,
 		tokenID:   r.PlanetScaleMetricsTokenID,
 		token:     r.PlanetScaleMetricsToken,
@@ -1874,7 +1905,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		targetDSN: r.Target,
 		engine:    r.TargetDriver,
 		quiet:     pretty, // no telemetry-enabled INFO above the panel (ADR-0156 polish)
-	})
+	}, indexFallback != nil))
 	if err != nil {
 		return err
 	}
@@ -1904,6 +1935,8 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// restore's `TargetTelemetry != nil` guard stays exact (no typed-nil trap).
 		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
+		// ADR-0148 / audit MED-A1: nil unless armed (see above).
+		IndexBuildFallback: indexFallback,
 	}
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.

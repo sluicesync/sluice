@@ -501,6 +501,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	migcore.ApplyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
+	migcore.ApplyIndexBuildFallback(sw, s.IndexBuildFallback)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()

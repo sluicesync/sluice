@@ -1235,11 +1235,24 @@ type SyncStartCmd struct {
 	// sluice_target_* gauges). CONTROL-PLANE credential, distinct from the
 	// data-plane DSN. All-or-nothing: org without a complete token pair is a
 	// loud refusal. Unset ⇒ no provider wired ⇒ byte-identical default sync.
-	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug, consumed by BOTH optional PlanetScale integrations: target-health telemetry (CPU/mem/storage) for proactive apply back-off + in-tool observability (ADR-0107; requires --planetscale-metrics-token-id + --planetscale-metrics-token, all-or-nothing) AND the automatic deploy-request index-build fallback for the cold-start index phase on a planetscale target (ADR-0148; requires the service token, see --planetscale-service-token-id). Each integration arms on its own token pair. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
 	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planetscale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
 	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for --planetscale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
 	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
 	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+
+	// ADR-0148 / audit MED-A1: the sync cold-start's deferred index phase is
+	// the same walled CreateIndexes migrate's index phase runs, so the same
+	// deploy-request fallback arms here — a planetscale target +
+	// --planetscale-org + the service token (distinct from the metrics token
+	// above; the org flag is shared between the two consumers). Unarmed (any
+	// piece missing, or a non-planetscale target), the cold-start index phase
+	// behaves exactly as before. Warm-resume never builds indexes.
+	PlanetScaleDatabase       string        `name:"planetscale-database" help:"PlanetScale database name for the ADR-0148 index-build fallback. Defaults to the --target DSN's database name. Only consulted when --planetscale-org is set." placeholder:"DB"`
+	PlanetScaleBranch         string        `name:"planetscale-branch" help:"PlanetScale production branch the --target DSN points at, for the ADR-0148 index-build fallback (deploy requests merge into it). Only consulted when --planetscale-org is set." default:"main" placeholder:"BRANCH"`
+	PlanetScaleServiceTokenID string        `name:"planetscale-service-token-id" help:"PlanetScale service-token ID (branch + deploy-request scopes) for the ADR-0148 index-build fallback. Prefer the env var so it never lands in shell history." env:"PLANETSCALE_SERVICE_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
+	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request deadline for the ADR-0148 index-build fallback (a large table's index deploys via VReplication — real wall-clock, but async and unbounded by errno 3024). On timeout the deploy keeps running in PlanetScale and a re-run picks up: the cold-start index phase re-probes and rebuilds only what is still missing." default:"1h" placeholder:"DUR"`
 
 	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planetscale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
 
@@ -1412,8 +1425,11 @@ type telemetryParams struct {
 	quiet bool
 }
 
-func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet bool) (*pstelemetry.Provider, error) {
-	return buildTargetTelemetryProvider(ctx, telemetryParams{
+// fallbackArmed reconciles the shared --planetscale-org between its two
+// consumers (see telemetryParamsSharedOrg): a fallback-only arming turns
+// telemetry off with a WARN instead of tripping the all-or-nothing refusal.
+func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet, fallbackArmed bool) (*pstelemetry.Provider, error) {
+	return buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, telemetryParams{
 		org:       s.PlanetScaleOrg,
 		tokenID:   s.PlanetScaleMetricsTokenID,
 		token:     s.PlanetScaleMetricsToken,
@@ -1422,6 +1438,22 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet bool) (*ps
 		targetDSN: s.Target,
 		engine:    s.TargetDriver,
 		quiet:     quiet,
+	}, fallbackArmed))
+}
+
+// planetScaleIndexFallback composes the ADR-0148 deploy-request index-build
+// fallback for the sync cold-start's deferred index phase (audit MED-A1),
+// from the same flag set migrate carries. nil = unarmed, byte-identical.
+func (s *SyncStartCmd) planetScaleIndexFallback() ir.IndexBuildFallback {
+	return composePlanetScaleIndexFallback(indexFallbackParams{
+		targetDriver:  s.TargetDriver,
+		targetDSN:     s.Target,
+		org:           s.PlanetScaleOrg,
+		database:      s.PlanetScaleDatabase,
+		branch:        s.PlanetScaleBranch,
+		tokenID:       s.PlanetScaleServiceTokenID,
+		token:         s.PlanetScaleServiceToken,
+		deployTimeout: s.PlanetScaleDeployTimeout,
 	})
 }
 
@@ -1855,12 +1887,19 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// the panel's slog gate installs and would otherwise leak above the panel.
 	prettyPanel := wantPrettyProgress(g, env.jsonMode, s.DryRun, s.multiNamespaceFanout(allNS))
 
+	// ADR-0148 / audit MED-A1: arm the automatic deploy-request index-build
+	// fallback for the cold-start index phase when the target is planetscale
+	// and the control-plane credentials resolve; nil (unarmed) leaves the
+	// index phase byte-identical. Composed BEFORE the telemetry build so the
+	// shared --planetscale-org reconciles between the two consumers.
+	indexFallback := s.planetScaleIndexFallback()
+
 	// ADR-0107 Phase 2: construct the OPTIONAL PlanetScale target-health
 	// telemetry provider when the operator opts in. Wired ONLY here at the
 	// composition root (the sole place allowed to import the PS provider);
 	// the streamer holds it as the engine-neutral ir.TargetTelemetry. Nil
 	// when the operator did not opt in ⇒ byte-identical default sync.
-	telemetryProvider, err := buildTargetTelemetry(kongContext(), s, prettyPanel)
+	telemetryProvider, err := buildTargetTelemetry(kongContext(), s, prettyPanel, indexFallback != nil)
 	if err != nil {
 		return err
 	}
@@ -1906,6 +1945,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		MaxBufferBytes:                          s.MaxBufferBytes,
 		IndexBuildMem:                           indexBuildMem,
 		IndexBuildParallelism:                   s.IndexBuildParallelism,
+		IndexBuildFallback:                      indexFallback, // ADR-0148 / audit MED-A1: nil unless armed (see above)
 		MaxTargetConnections:                    s.MaxTargetConnections,
 		BulkParallelism:                         s.BulkParallelism,
 		TableParallelism:                        s.TableParallelism,

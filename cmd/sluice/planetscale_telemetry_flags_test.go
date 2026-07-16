@@ -60,7 +60,7 @@ func TestBuildTargetTelemetry_QuietSuppressesEnableLog(t *testing.T) {
 // TestBuildTargetTelemetry_OffWhenNoOrg pins the default-off contract: no
 // --planetscale-org ⇒ (nil, nil), the byte-identical pre-ADR-0107 path.
 func TestBuildTargetTelemetry_OffWhenNoOrg(t *testing.T) {
-	p, err := buildTargetTelemetry(context.Background(), &SyncStartCmd{}, false)
+	p, err := buildTargetTelemetry(context.Background(), &SyncStartCmd{}, false, false)
 	if err != nil {
 		t.Fatalf("no-org should be a no-op, got err: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestBuildTargetTelemetry_RefusesIncompleteCreds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := buildTargetTelemetry(context.Background(), &tc.cmd, false)
+			p, err := buildTargetTelemetry(context.Background(), &tc.cmd, false, false)
 			if err == nil {
 				t.Error("incomplete token should refuse loudly; got nil error")
 			}
@@ -109,7 +109,7 @@ func TestBuildTargetTelemetry_RefusesUndeterminableDB(t *testing.T) {
 		PlanetScaleMetricsToken:   "s",
 		Target:                    "postgres://host", // no path segment
 	}
-	p, err := buildTargetTelemetry(context.Background(), cmd, false)
+	p, err := buildTargetTelemetry(context.Background(), cmd, false, false)
 	if err == nil {
 		t.Error("undeterminable database should refuse loudly; got nil error")
 	}
@@ -131,7 +131,7 @@ func TestBuildTargetTelemetry_ConstructsWithCompleteOptIn(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := buildTargetTelemetry(ctx, cmd, false)
+	p, err := buildTargetTelemetry(ctx, cmd, false, false)
 	if err != nil {
 		t.Fatalf("complete opt-in should construct: %v", err)
 	}

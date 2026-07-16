@@ -69,21 +69,6 @@ func applyIndexBuildBudget(target any, connBudget int) {
 	}
 }
 
-// applyIndexBuildFallback threads the CLI-composed deploy-request
-// index-build fallback (ADR-0148) to a freshly-opened target
-// [ir.SchemaWriter] via the optional [ir.IndexBuildFallbackSetter]
-// surface, before any index phase runs. nil fallback and engines without
-// the setter (today: PG, SQLite) both skip cleanly — the orchestrator
-// never learns what the fallback does, keeping it engine-neutral.
-func applyIndexBuildFallback(target any, f ir.IndexBuildFallback) {
-	if f == nil {
-		return
-	}
-	if setter, ok := target.(ir.IndexBuildFallbackSetter); ok {
-		setter.SetIndexBuildFallback(f)
-	}
-}
-
 // applyEnabledPGExtensions threads the operator's
 // `--enable-pg-extension` allowlist (ADR-0032) through to a freshly-
 // opened engine reader / writer / applier via the optional

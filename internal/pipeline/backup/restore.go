@@ -120,6 +120,26 @@ type Restore struct {
 	// N > 1 honored) inside ChainRestore.
 	ApplyConcurrency int
 
+	// IndexBuildFallback is the optional out-of-band index-build channel
+	// (ADR-0148: the PlanetScale deploy-request fallback for the errno-3024
+	// statement-time wall / errno-1105 safe-migrations direct-DDL block),
+	// threaded onto the target SchemaWriter via the optional
+	// [ir.IndexBuildFallbackSetter] surface right after it opens — restore's
+	// Phase-4 CreateIndexes runs the same walled deferred build migrate's
+	// index phase does. The orchestrator stays engine-neutral: the value is
+	// composed by the CLI (which knows the target is PlanetScale and holds
+	// the control-plane credentials) and passed through opaquely; engines
+	// without the setter skip cleanly. On a chain restore it reaches the
+	// segment-0 full (the one that builds indexes; DataOnly segments skip
+	// the schema surface). Mirrors [pipeline.Migrator]'s field of the same
+	// name (audit 2026-07-15 MED-A1: the fallback originally reached only
+	// the migrate path).
+	//
+	// Zero-value-safe: nil (every programmatic / broker / test caller)
+	// leaves the direct index build byte-identical to before the fallback
+	// existed.
+	IndexBuildFallback ir.IndexBuildFallback
+
 	// TargetTelemetry, when non-nil, is an advisory control-plane health
 	// provider (ADR-0107) the restore consults at parallelism-resolve time
 	// to clamp the AUTO bulk×table fan-out by the target's LIVE CPU/memory
@@ -318,20 +338,21 @@ func (r *Restore) rootSegmentCodec(ctx context.Context) (blobcodec.Codec, error)
 // leave Progress nil (Nop), so phases aren't double-emitted.
 func (r *Restore) newChainRestore() *ChainRestore {
 	return &ChainRestore{
-		Target:           r.Target,
-		TargetDSN:        r.TargetDSN,
-		Store:            r.Store,
-		Filter:           r.Filter,
-		MaxBufferBytes:   r.MaxBufferBytes,
-		TableParallelism: r.TableParallelism,
-		ChunkParallelism: r.ChunkParallelism,
-		Summary:          r.Summary,
-		ApplyConcurrency: r.ApplyConcurrency,
-		Envelope:         r.Envelope,
-		VerifyKey:        r.VerifyKey,
-		RequireSignature: r.RequireSignature,
-		TargetSchema:     r.TargetSchema,
-		Progress:         r.Progress,
+		Target:             r.Target,
+		TargetDSN:          r.TargetDSN,
+		Store:              r.Store,
+		Filter:             r.Filter,
+		MaxBufferBytes:     r.MaxBufferBytes,
+		TableParallelism:   r.TableParallelism,
+		ChunkParallelism:   r.ChunkParallelism,
+		Summary:            r.Summary,
+		ApplyConcurrency:   r.ApplyConcurrency,
+		Envelope:           r.Envelope,
+		VerifyKey:          r.VerifyKey,
+		RequireSignature:   r.RequireSignature,
+		TargetSchema:       r.TargetSchema,
+		IndexBuildFallback: r.IndexBuildFallback,
+		Progress:           r.Progress,
 	}
 }
 
@@ -484,6 +505,10 @@ func (r *Restore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(sw, r.TargetSchema)
+	// ADR-0148: thread the deploy-request index-build fallback before any
+	// index phase runs (Phase 4 below is the same walled deferred
+	// CreateIndexes migrate's index phase runs). nil (unarmed) is a no-op.
+	migcore.ApplyIndexBuildFallback(sw, r.IndexBuildFallback)
 	defer migcore.CloseIf(sw)
 
 	// Construct the run's shared coordinated grow-gate (ADR-0110) BEFORE

@@ -702,7 +702,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	migcore.ApplyTargetSchema(sw, m.TargetSchema)
 	applyIndexBuildMem(sw, m.IndexBuildMem)
 	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
-	applyIndexBuildFallback(sw, m.IndexBuildFallback)
+	migcore.ApplyIndexBuildFallback(sw, m.IndexBuildFallback)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))

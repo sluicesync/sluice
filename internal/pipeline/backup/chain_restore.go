@@ -140,6 +140,13 @@ type ChainRestore struct {
 	// INSERT/UPDATE/DELETE land in the named schema.
 	TargetSchema string
 
+	// IndexBuildFallback is the optional ADR-0148 deploy-request
+	// index-build fallback, threaded to the segment-0 full's Restore (the
+	// segment that builds indexes; later DataOnly segments skip the schema
+	// surface). See [Restore.IndexBuildFallback]. nil (the zero value)
+	// leaves the direct index build byte-identical.
+	IndexBuildFallback ir.IndexBuildFallback
+
 	// chainCEK caches the chain-level CEK after the full's preflight.
 	// Reused for every change-chunk decrypt across the incremental
 	// walk so Argon2id (passphrase mode) runs once per chain restore.
@@ -593,19 +600,20 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *lineage.SegmentRecor
 		return err
 	}
 	rest := &Restore{
-		Target:            r.Target,
-		TargetDSN:         r.TargetDSN,
-		Store:             full.Segment.Store(r.Store),
-		Filter:            r.Filter,
-		MaxBufferBytes:    r.MaxBufferBytes,
-		TableParallelism:  r.TableParallelism,
-		ChunkParallelism:  r.ChunkParallelism,
-		Summary:           r.Summary,
-		SkipChainDispatch: true,
-		DataOnly:          dataOnly,
-		Envelope:          r.Envelope,
-		TargetSchema:      r.TargetSchema,
-		segCodec:          full.Segment.CodecOrDefault(),
+		Target:             r.Target,
+		TargetDSN:          r.TargetDSN,
+		Store:              full.Segment.Store(r.Store),
+		Filter:             r.Filter,
+		MaxBufferBytes:     r.MaxBufferBytes,
+		TableParallelism:   r.TableParallelism,
+		ChunkParallelism:   r.ChunkParallelism,
+		Summary:            r.Summary,
+		SkipChainDispatch:  true,
+		DataOnly:           dataOnly,
+		Envelope:           r.Envelope,
+		TargetSchema:       r.TargetSchema,
+		IndexBuildFallback: r.IndexBuildFallback,
+		segCodec:           full.Segment.CodecOrDefault(),
 	}
 	return rest.Run(ctx)
 }

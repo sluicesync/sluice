@@ -639,6 +639,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	migcore.ApplyTargetSchema(sw, targetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
+	migcore.ApplyIndexBuildFallback(sw, s.IndexBuildFallback)
 
 	rw, err := s.Target.OpenRowWriter(ctx, targetDSN)
 	if err != nil {

@@ -27,6 +27,13 @@ type restoreRecorderEngine struct {
 	// wiring into the restore path (the Track-C silent-under-copy fix).
 	growGateSets int
 
+	// indexFallback records the value threaded through the optional
+	// [ir.IndexBuildFallbackSetter] surface (ADR-0148 / audit MED-A1) —
+	// pins that restore arms the deploy-request fallback on the schema
+	// writer BEFORE the index phase, and never touches the setter unarmed.
+	indexFallback     ir.IndexBuildFallback
+	indexFallbackSets int
+
 	// --- ADR-0113 reparent-reconciliation simulation ---
 	// dropTable (when non-empty) names a table whose FIRST WriteRows drops
 	// its last row AND reports the table reparent-touched (via the wired
@@ -125,6 +132,18 @@ func (w *restoreRecordingSchemaWriter) SyncIdentitySequences(context.Context, *i
 func (w *restoreRecordingSchemaWriter) CreateViews(context.Context, *ir.Schema) error {
 	w.engine.recordPhase("CreateViews")
 	return nil
+}
+
+// SetIndexBuildFallback implements [ir.IndexBuildFallbackSetter] so the
+// recorder can pin the ADR-0148 threading (audit MED-A1): the restore
+// orchestrator must arm the writer before CreateIndexes runs, and must
+// not call the setter at all when unarmed (nil skips in the helper).
+func (w *restoreRecordingSchemaWriter) SetIndexBuildFallback(f ir.IndexBuildFallback) {
+	w.engine.mu.Lock()
+	w.engine.indexFallback = f
+	w.engine.indexFallbackSets++
+	w.engine.mu.Unlock()
+	w.engine.recordPhase("SetIndexBuildFallback")
 }
 
 type restoreRecordingRowWriter struct {

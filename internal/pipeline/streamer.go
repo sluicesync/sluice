@@ -588,6 +588,25 @@ type Streamer struct {
 	// See docs/dev/notes/index-build-phase-tuning.md.
 	IndexBuildParallelism int
 
+	// IndexBuildFallback is the optional out-of-band index-build channel
+	// (ADR-0148: the PlanetScale deploy-request fallback for the errno-3024
+	// statement-time wall / errno-1105 safe-migrations direct-DDL block),
+	// threaded onto the cold-start target SchemaWriter — single- and
+	// multi-database branches — via the optional
+	// [ir.IndexBuildFallbackSetter] surface right after it opens. Only the
+	// cold-start path builds indexes; warm-resume never opens a
+	// SchemaWriter. The orchestrator stays engine-neutral: the value is
+	// composed by the CLI (which knows the target is PlanetScale and holds
+	// the control-plane credentials) and passed through opaquely; engines
+	// without the setter skip cleanly. Mirrors [Migrator.IndexBuildFallback]
+	// (audit 2026-07-15 MED-A1: the fallback originally reached only the
+	// migrate path).
+	//
+	// Zero-value-safe: nil (every programmatic / fleet / broker / test
+	// caller) leaves the direct index build byte-identical to before the
+	// fallback existed.
+	IndexBuildFallback ir.IndexBuildFallback
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a
