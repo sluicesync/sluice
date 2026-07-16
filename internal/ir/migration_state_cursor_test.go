@@ -161,12 +161,15 @@ func TestCursorEnvelope_ChunkSlices(t *testing.T) {
 // keep their legacy shapes. Whether a legacy value is TRUSTED is the
 // resume sites' call, not the decoder's.
 func TestCursorEnvelope_LegacyBareValues(t *testing.T) {
-	legacy := `{"state":"in_progress","last_pk":[9007199254740995,1750000000000000123,"abc",3.5,true],"rows_copied":7}`
+	legacy := `{"state":"in_progress","last_pk":[9007199254740995,1750000000000000123,18446744073709551615,"abc",3.5,true],"rows_copied":7}`
 	var out TableProgress
 	if err := json.Unmarshal([]byte(legacy), &out); err != nil {
 		t.Fatalf("Unmarshal legacy: %v", err)
 	}
-	want := []any{int64(9007199254740995), int64(1750000000000000123), "abc", float64(3.5), true}
+	// 18446744073709551615 is MaxUint64: a legacy BIGINT UNSIGNED cursor
+	// beyond MaxInt64 must recover as uint64, losslessly, never as a
+	// drifted float64 the trust gate would then refuse.
+	want := []any{int64(9007199254740995), int64(1750000000000000123), uint64(18446744073709551615), "abc", float64(3.5), true}
 	if len(out.LastPK) != len(want) {
 		t.Fatalf("LastPK len = %d; want %d", len(out.LastPK), len(want))
 	}

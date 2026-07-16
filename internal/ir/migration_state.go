@@ -449,6 +449,12 @@ func decodeCursorValue(raw json.RawMessage) (any, error) {
 		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return n, nil
 		}
+		// Legacy BIGINT UNSIGNED cursors above MaxInt64 were persisted
+		// bare too — recover them losslessly instead of letting them
+		// fall to float64 and trip the float-over-integer suspect gate.
+		if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return u, nil
+		}
 		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return nil, fmt.Errorf("cursor number %q: %w", s, err)

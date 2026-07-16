@@ -18,15 +18,26 @@
 #                         is still maturing.
 #
 # Required repo secrets (Settings → Secrets and variables → Actions):
-#   - SLUICE_MYSQL_SOURCE
-#   - SLUICE_MYSQL_DESTINATION
-#   - SLUICE_POSTGRES_SOURCE
-#   - SLUICE_POSTGRES_DESTINATION
+#   - SLUICE_MYSQL_SOURCE / SLUICE_MYSQL_DESTINATION
+#   - SLUICE_POSTGRES_SOURCE / SLUICE_POSTGRES_DESTINATION
+#   - PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN
+#   - PLANETSCALE_EC_ORG / _EC_DATABASE / _EC_BRANCH / _EC_DSN / _EC_TABLE
+#   - PLANETSCALE_METRICS_SERVICE_TOKEN_ID / _METRICS_SERVICE_TOKEN /
+#     _METRICS_ORG / _METRICS_DATABASE / _METRICS_BRANCH
 #
-# Each secret holds the same DSN string the local PLANETSCALE_CREDENTIALS.env
-# file holds. The credential loader in the test files reads env vars first
-# (the CI path) and falls back to the .env file (the dev-loop path), so
-# one set of test code serves both.
+# The DSN secrets hold the same strings the local PLANETSCALE_CREDENTIALS.env
+# file holds; the token/EC/metrics secrets mirror the other local env files.
+# The credential loaders in the test files read env vars first (the CI path)
+# and fall back to the .env files (the dev-loop path), so one set of test
+# code serves both. The EC_*/METRICS_DATABASE secrets point at live (usually
+# throwaway) databases and are refreshed per dispatch.
+#
+# A missing secret does NOT green-skip: the fail-on-skip step below turns
+# any skipped psverify test into a job failure (audit 2026-07-15 MED-T1 —
+# this workflow sat at zero recorded runs while its env block satisfied
+# only 2 of 6 suites, so a dispatch would have greened while skipping the
+# rest). If this job is red with skips, wire the secrets; the loud red is
+# the point.
 
 name: PlanetScale Verify
 
@@ -75,16 +86,18 @@ jobs:
       # `psverify` tag before we burn time hitting external services.
       - run: go vet -tags=psverify ./internal/...
 
-      # The real run. Tests skip cleanly when env vars are missing,
-      # so a misconfigured secret produces "no tests to run" rather
-      # than a confusing connection error.
+      # The real run. Individual tests still t.Skip when their env vars
+      # are missing (so the suite is runnable piecemeal locally), but in
+      # CI the fail-on-skip step below converts ANY skip into a job
+      # failure — this workflow's entire reason to exist is running the
+      # live suites, so "green with skips" is the dishonest outcome.
       #
       # -count=1 disables the test cache (cached results would defeat
       # the point of verifying live infrastructure). -race catches
       # races in the reader/writer paths exercised against a real
       # backend, which the unit-test race coverage can't reach.
       #
-      # The credential loader reads env vars first; the .env-file
+      # The credential loaders read env vars first; the .env-file
       # fallback path doesn't fire in CI, so secrets land directly
       # via env: below.
       - name: Run PS verification suite
@@ -93,4 +106,30 @@ jobs:
           SLUICE_MYSQL_DESTINATION: ${{ secrets.SLUICE_MYSQL_DESTINATION }}
           SLUICE_POSTGRES_SOURCE: ${{ secrets.SLUICE_POSTGRES_SOURCE }}
           SLUICE_POSTGRES_DESTINATION: ${{ secrets.SLUICE_POSTGRES_DESTINATION }}
-        run: go test -tags=psverify -race -count=1 -timeout=15m -v ./internal/...
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+          PLANETSCALE_EC_ORG: ${{ secrets.PLANETSCALE_EC_ORG }}
+          PLANETSCALE_EC_DATABASE: ${{ secrets.PLANETSCALE_EC_DATABASE }}
+          PLANETSCALE_EC_BRANCH: ${{ secrets.PLANETSCALE_EC_BRANCH }}
+          PLANETSCALE_EC_DSN: ${{ secrets.PLANETSCALE_EC_DSN }}
+          PLANETSCALE_EC_TABLE: ${{ secrets.PLANETSCALE_EC_TABLE }}
+          PLANETSCALE_METRICS_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_METRICS_SERVICE_TOKEN_ID }}
+          PLANETSCALE_METRICS_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_METRICS_SERVICE_TOKEN }}
+          PLANETSCALE_METRICS_ORG: ${{ secrets.PLANETSCALE_METRICS_ORG }}
+          PLANETSCALE_METRICS_DATABASE: ${{ secrets.PLANETSCALE_METRICS_DATABASE }}
+          PLANETSCALE_METRICS_BRANCH: ${{ secrets.PLANETSCALE_METRICS_BRANCH }}
+        run: |
+          set -o pipefail
+          go test -tags=psverify -race -count=1 -timeout=15m -v ./internal/... | tee psverify-output.txt
+
+      # Fail on skip: a psverify run that skipped anything did not verify
+      # what it claims to verify. The grep matches go test's verbose
+      # "--- SKIP" markers; the skip reasons name the missing env vars,
+      # so the failure message is self-remediating.
+      - name: Fail if any psverify test was skipped
+        run: |
+          if grep -E '^\s*--- SKIP' psverify-output.txt; then
+            echo "::error::psverify tests were SKIPPED (missing env/secrets above) — a green run must run everything. Wire the missing secrets and re-dispatch."
+            exit 1
+          fi
+          echo "fail-on-skip: no skipped tests."
