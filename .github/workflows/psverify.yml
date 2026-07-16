@@ -70,7 +70,7 @@ jobs:
   psverify:
     name: PS-PG verification
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       # SHA-pinned (not the mutable tags): this workflow handles live
       # PlanetScale DSN secrets, so a re-pointed action tag would run
@@ -91,6 +91,22 @@ jobs:
       # CI the fail-on-skip step below converts ANY skip into a job
       # failure — this workflow's entire reason to exist is running the
       # live suites, so "green with skips" is the dishonest outcome.
+      #
+      # Scoping and serialization (both learned on the first dispatch,
+      # 2026-07-16):
+      #   * -run '^TestPS' + the explicit package list restricts the run
+      #     to the psverify suites. A bare ./internal/... sweep also runs
+      #     the whole unit suite, whose permanent placeholder skips
+      #     (e.g. pipeline's TestChainRestore_CrossEnginePostGISNowSupported)
+      #     false-positive the fail-on-skip gate — zero-skip would be
+      #     unattainable.
+      #   * The packages run SEQUENTIALLY (one go test invocation each,
+      #     not a single multi-package invocation): engines/postgres and
+      #     pipeline share the live PG source and its fixed `sluice_slot`
+      #     replication slot, so package-parallel runs race on it. PS-PG
+      #     also holds a just-closed reader's walsender "active" for tens
+      #     of seconds (>40s observed), which the tests' slot pre-cleans
+      #     wait out — but only if nobody else is competing for the slot.
       #
       # -count=1 disables the test cache (cached results would defeat
       # the point of verifying live infrastructure). -race catches
@@ -120,7 +136,14 @@ jobs:
           PLANETSCALE_METRICS_BRANCH: ${{ secrets.PLANETSCALE_METRICS_BRANCH }}
         run: |
           set -o pipefail
-          go test -tags=psverify -race -count=1 -timeout=15m -v ./internal/... | tee psverify-output.txt
+          : > psverify-output.txt
+          for pkg in \
+            ./internal/planetscale/... \
+            ./internal/engines/mysql \
+            ./internal/engines/postgres \
+            ./internal/pipeline; do
+            go test -tags=psverify -race -count=1 -timeout=20m -v -run '^TestPS' "$pkg" | tee -a psverify-output.txt
+          done
 
       # Fail on skip: a psverify run that skipped anything did not verify
       # what it claims to verify. The grep matches go test's verbose

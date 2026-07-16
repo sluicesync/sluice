@@ -368,6 +368,11 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 		t.Skipf("current_user lacks REPLICATION attribute; CDC will fail without it")
 	}
 
+	// Pre-clean any leftover `sluice_slot` (waiting out PS-PG's
+	// walsender-release lag) so the reader below starts from a fresh
+	// slot rather than reusing a stale one's confirmed_flush point.
+	waitPSSlotDropped(t, db, "sluice_slot", 90*time.Second)
+
 	const schemaName = "sluice_psverify_cdc"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
 		t.Fatalf("pre-clean: %v", err)
@@ -516,14 +521,10 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 		t.Skipf("PS-PG is PG <17 (%d); FAILOVER flag is unsupported", versionNum)
 	}
 
-	// Drop any leftover slot from a previous run so this test is
-	// idempotent. Errors here are informational only.
-	if _, err := db.ExecContext(
-		ctx,
-		"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
-	); err != nil {
-		t.Logf("pre-clean drop slot: %v", err)
-	}
+	// Drop any leftover slot — including the one the just-finished
+	// TestPSPG_CDCReaderBasic's reader may still hold while PS-PG
+	// releases its walsender — so this test is idempotent.
+	waitPSSlotDropped(t, db, "sluice_slot", 90*time.Second)
 
 	const schemaName = "sluice_psverify_failover"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
@@ -584,6 +585,50 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	}
 	if !failover {
 		t.Errorf("pg_replication_slots.failover = false on PS-PG; want true (slot will be lost on failover)")
+	}
+}
+
+// waitPSSlotDropped drops the named replication slot, first waiting
+// out PS-PG's walsender-release lag. On managed PS-PG the backend
+// walsender from a just-closed CDC reader can hold the slot "active"
+// for tens of seconds after the client connection is gone (the first
+// CI dispatch, 2026-07-16, measured >40s); a single-shot
+// pg_drop_replication_slot then fails with SQLSTATE 55006 and every
+// later test that needs the fixed `sluice_slot` name collides. Poll
+// until the slot is inactive (or absent), then drop it. Best-effort:
+// on timeout the next step surfaces the collision loudly.
+func waitPSSlotDropped(t *testing.T, db *sql.DB, slot string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var active bool
+		err := db.QueryRowContext(
+			ctx,
+			"SELECT active FROM pg_replication_slots WHERE slot_name = $1", slot,
+		).Scan(&active)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			cancel()
+			return // slot gone — nothing to drop
+		case err == nil && !active:
+			_, dropErr := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", slot)
+			cancel()
+			if dropErr == nil {
+				return
+			}
+			t.Logf("drop slot %s: %v (retrying)", slot, dropErr)
+		default:
+			cancel()
+			if err != nil {
+				t.Logf("slot %s active-check: %v (retrying)", slot, err)
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Logf("slot %s still held after %v; proceeding — the next step may collide", slot, timeout)
+			return
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 

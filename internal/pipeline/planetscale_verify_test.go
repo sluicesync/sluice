@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -450,19 +451,22 @@ func dropPSSchema(t *testing.T, _ context.Context, dsn, schema string) {
 }
 
 // dropPSSlotIfExists is a best-effort cleanup of a leftover
-// replication slot. pg_drop_replication_slot blocks if the slot is
-// still marked "active" (a previous failed run can leave it that
-// way for tens of seconds), and on managed services the Postgres-
-// level cancel packet doesn't always reach the backend in time.
-// We hard-cap the whole operation in a goroutine so cleanup never
-// hangs the test, even when context cancellation isn't honoured.
+// replication slot. pg_drop_replication_slot fails with SQLSTATE
+// 55006 while the slot is still marked "active" — and on managed
+// PS-PG the walsender from a just-closed reader (including one held
+// by the engines/postgres psverify package that ran before this one)
+// can keep the slot active for tens of seconds after the client
+// connection is gone (>40s observed on the first CI dispatch,
+// 2026-07-16). So this polls until the slot is inactive or absent,
+// then drops it, hard-capped in a goroutine so cleanup never hangs
+// the test even when context cancellation isn't honoured.
 //
 // Failure to drop the slot here isn't fatal — the next
 // CREATE_REPLICATION_SLOT will surface "slot already exists" with
 // a clear message that operators recognise.
 func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 	t.Helper()
-	const cap = 15 * time.Second
+	const slotWait = 90 * time.Second
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -472,33 +476,43 @@ func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 			return
 		}
 		defer func() { _ = db.Close() }()
-		ctx, cancel := context.WithTimeout(context.Background(), cap)
-		defer cancel()
-
-		var exists bool
-		err = db.QueryRowContext(
-			ctx,
-			"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-			slotName,
-		).Scan(&exists)
-		if err != nil {
-			t.Logf("slot pre-clean lookup: %v", err)
-			return
-		}
-		if !exists {
-			return
-		}
-		if _, err := db.ExecContext(
-			ctx,
-			"SELECT pg_drop_replication_slot($1)", slotName,
-		); err != nil {
-			t.Logf("drop slot %s: %v", slotName, err)
+		deadline := time.Now().Add(slotWait)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			var active bool
+			err := db.QueryRowContext(
+				ctx,
+				"SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+				slotName,
+			).Scan(&active)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				cancel()
+				return // slot gone — nothing to drop
+			case err == nil && !active:
+				_, dropErr := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", slotName)
+				cancel()
+				if dropErr == nil {
+					return
+				}
+				t.Logf("drop slot %s: %v (retrying)", slotName, dropErr)
+			default:
+				cancel()
+				if err != nil {
+					t.Logf("slot %s active-check: %v (retrying)", slotName, err)
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Logf("slot %s still held after %v; proceeding — the next step may collide", slotName, slotWait)
+				return
+			}
+			time.Sleep(2 * time.Second)
 		}
 	}()
 	select {
 	case <-done:
-	case <-time.After(cap + 2*time.Second):
-		t.Logf("drop slot %s: timed out after %v (PS-PG may not honour cancellation for replication-related calls); proceeding", slotName, cap)
+	case <-time.After(slotWait + 5*time.Second):
+		t.Logf("drop slot %s: timed out after %v (PS-PG may not honour cancellation for replication-related calls); proceeding", slotName, slotWait)
 	}
 }
 
