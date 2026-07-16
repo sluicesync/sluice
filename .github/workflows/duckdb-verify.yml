@@ -1,0 +1,93 @@
+# DuckDB external-reader compatibility gate for the Parquet export
+# (audit MED-T3).
+#
+# Every in-repo pin of `backup export-as-parquet` reads the files back
+# with the SAME parquet-go the writer uses, so a symmetric parquet-go
+# regression — an upgrade that changes what both sides agree on — would
+# keep every self-pin green while shipping files external readers can't
+# decode (the Bug-74 shape relocated to the file-format boundary, and
+# the "every new file format gets an independent reader in a test"
+# checklist item). This workflow is that independent reader: a
+# deterministic export covering the full value family × shape matrix
+# (uint64 max, -0.0 signbit, NaN/±Inf, denormals, all three DECIMAL
+# tiers + the string fallback, DATE/µs timestamps, JSON incl. the
+# present-"null" body, empty-vs-NULL, SET + every array element family,
+# multi-chunk row-group placement, footer kv metadata incl. GeoParquet)
+# is generated through the real TableCodec + writer configuration, read
+# back with a REAL DuckDB, and compared exactly against hand-derived
+# expected values (see internal/pipeline/parquetexport/duckdbverify).
+#
+# Non-required by design (like govulncheck): the boundary it guards
+# moves only when parquet-go or the export code moves, so it triggers
+# on those paths (a dependabot parquet-go bump touches go.mod and runs
+# it) plus a weekly schedule to catch drift on the DuckDB side.
+# duckdb/duckdb:latest is deliberately unpinned — the job exists to
+# detect incompatibility with what external readers ACTUALLY run, so
+# tracking DuckDB's current release is the point, and a red run here
+# never blocks a merge; it opens an investigation.
+#
+# Saturday 09:00 UTC: clear of the Saturday 07:00 fuzz run and the
+# Sunday prebake/Vitess-matrix slots.
+
+name: DuckDB parquet compat
+
+on:
+  pull_request:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "internal/pipeline/parquetexport/**"
+      - "internal/pipeline/backup/export_parquet*.go"
+      - ".github/workflows/duckdb-verify.yml"
+  push:
+    branches: [main]
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "internal/pipeline/parquetexport/**"
+      - "internal/pipeline/backup/export_parquet*.go"
+      - ".github/workflows/duckdb-verify.yml"
+  schedule:
+    - cron: "0 9 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  duckdb-verify:
+    name: DuckDB parquet compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      - name: Generate the family-matrix export + expected values
+        run: go run ./internal/pipeline/parquetexport/duckdbverify gen -out duckdb-out
+
+      # -bail makes a SQL error (e.g. a file DuckDB cannot open at all)
+      # fail this step directly instead of surfacing as truncated JSON.
+      # The spatial extension autoloads inside the container to decode
+      # the GeoParquet-annotated geometry column.
+      - name: Read the export back with real DuckDB
+        run: |
+          docker run -i --rm -v "$PWD/duckdb-out:/work" -w /work \
+            duckdb/duckdb:latest duckdb -bail -json \
+            < duckdb-out/script.sql > duckdb-out/actual.json
+
+      - name: Compare DuckDB's values against the expected matrix
+        run: go run ./internal/pipeline/parquetexport/duckdbverify check -dir duckdb-out -actual duckdb-out/actual.json
+
+      # On failure keep the export + both value sets for the
+      # investigation (the parquet files reproduce the read locally).
+      - name: Upload the export + comparison inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: duckdb-verify-${{ github.run_id }}
+          path: duckdb-out/
+          if-no-files-found: ignore
