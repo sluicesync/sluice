@@ -4,15 +4,21 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 
 ## Command taxonomy
 
-**Read-only — safe to run without approval.** These never modify either database: `sluice schema preview`, `sluice schema diff`, `sluice verify`, `sluice sync health`, `sluice sync status`, `sluice engines`, `sluice backup verify`, and **any command with `--dry-run`**.
+**Read-only — safe to run without approval.** These never modify either database: `sluice schema preview`, `sluice schema diff`, `sluice verify`, `sluice sync health`, `sluice sync status`, `sluice engines`, `sluice backup verify`, `sluice control-tables ddl` (prints CREATE statements; opens no connection), `sluice backfill --verify-only` (counts rows matching `--where`; no UPDATEs, no control-table writes), and **any command with `--dry-run`** (`expand-contract --dry-run` and `deploy-ddl --dry-run` additionally make zero control-plane calls).
 
-**State-changing — run only as part of an approved task.** These write to the target (and create bookkeeping objects — see `docs/database-objects` on the docs site): `sluice migrate`, `sluice sync start`, `sluice sync run`, `sluice backup *` (writes to the backup store), `sluice restore`, `sluice cutover`, `sluice schema add-table`, `sluice trigger setup/teardown/prune`.
+**State-changing — run only as part of an approved task.** These write to the target (and create bookkeeping objects — see `docs/database-objects` on the docs site): `sluice migrate`, `sluice sync start`, `sluice sync run`, `sluice backup *` (writes to the backup store; `backup export-as-parquet` is read-only against the chain but writes Parquet files to its destination), `sluice restore`, `sluice cutover`, `sluice schema add-table`, `sluice trigger setup/teardown/prune`.
+
+**Production-mutating schema-change commands — treat like state-changing, but the writes hit a PRODUCTION database in place**, not a migration target:
+
+- `sluice backfill` — issues real `UPDATE`s against the one database named by `--dsn` (keyset-chunked, resumable; `--dry-run` and `--verify-only` are the read-only forms)
+- `sluice deploy-ddl` — ships one DDL statement to a PlanetScale **production branch** via a deploy request
+- `sluice expand-contract` — deploy-requests an `ADD COLUMN`, runs the backfill, and (only with `--yes`) deploy-requests the `DROP COLUMN` contract step
 
 **Destructive flags — NEVER pass without explicit human approval for that specific invocation.** Approval to migrate is not approval to destroy:
 
 - `--reset-target-data` — drops/truncates target tables before copy
 - `--force-cold-start` — bypasses the populated-target safety preflight
-- `--yes` — suppresses the reset confirmation
+- `--yes` — suppresses the reset confirmation; **on `expand-contract` it confirms the contract leg — a `DROP COLUMN` deploy request against the production branch** (without it the run stops after verify and prints the resume command)
 - `backup prune` / `backup compact` without `--dry-run` — irreversibly drop backup history
 
 ## The standard workflow
@@ -31,6 +37,7 @@ Pass DSNs and secrets via environment variables, not flags — flags leak into p
 | `SLUICE_SOURCE` / `SLUICE_TARGET` | source / target DSN (equivalent to `--source` / `--target`) |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare D1 API token (env-only; there is no flag) |
 | `PLANETSCALE_METRICS_TOKEN_ID` / `PLANETSCALE_METRICS_TOKEN` | PlanetScale telemetry token |
+| `PLANETSCALE_SERVICE_TOKEN_ID` / `PLANETSCALE_SERVICE_TOKEN` | PlanetScale service token (branch + deploy-request scopes) for `expand-contract`, `deploy-ddl`, and `migrate`'s index-build fallback — the pscale CLI convention; the `--service-token*` flags exist but the env vars are the documented path |
 | `SLUICE_NOTIFY_WEBHOOK` / `SLUICE_NOTIFY_SLACK` | notification sink URLs (the URL path is the credential) |
 | `SLUICE_NOTIFY_SMTP_PASSWORD` | SMTP auth secret (env-only by policy) |
 | `--encryption-passphrase-env NAME` | names the env var holding the backup passphrase |

@@ -11,12 +11,15 @@
 
 </div>
 
-Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness. SQLite files and live Cloudflare D1 databases also migrate into Postgres or MySQL (with trigger-based continuous sync), and SQLite is a migrate target.
+Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness. SQLite files and live Cloudflare D1 databases also migrate into Postgres or MySQL (with trigger-based continuous sync), and SQLite is a migrate target. Flat files migrate too: CSV / TSV / NDJSON files and mydumper / `pscale database dump` directories are first-class migrate sources — no live source database needed.
 
 - 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, PlanetScale flavors included
 - 🗃️ **SQLite & Cloudflare D1** — import a SQLite file or a `wrangler d1 export` `.sql` dump (`--source-driver sqlite`), or read a live D1 over its HTTP query API (`--source-driver d1`) into Postgres / MySQL; big integers above 2⁵³ round-trip exactly (no JS 52-bit rounding, [ADR-0132](docs/adr/adr-0132-d1-query-api-reader.md)). SQLite is also a migrate **target** (`--target-driver sqlite`, decimals stored byte-exact as TEXT), and `sqlite-trigger` / `d1-trigger` add trigger-based continuous CDC ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md) / [ADR-0136](docs/adr/adr-0136-d1-trigger-cdc.md))
+- 📄 **Flat-file sources** — migrate straight from a CSV / TSV / NDJSON file (`--source-driver csv|tsv|ndjson`, staged with validated type inference, NULL conventions declared not sniffed — [ADR-0163](docs/adr/adr-0163-flatfile-csv-tsv-ndjson-sources.md)) or a mydumper / `pscale database dump` directory (`--source-driver mydumper`, [ADR-0161](docs/adr/adr-0161-mydumper-source-engine.md)) into any target
+- 🧬 **Online schema changes** — `sluice expand-contract` drives the full expand→migrate→contract pattern on PlanetScale via deploy requests ([ADR-0162](docs/adr/adr-0162-planetscale-expand-contract-orchestration.md)); `sluice backfill` is the resumable, keyset-chunked, online-safe in-place data migration for MySQL-family and Postgres ([ADR-0159](docs/adr/adr-0159-standalone-backfill-command.md)); `sluice deploy-ddl` ships one verbatim DDL statement through the governed deploy-request channel ([ADR-0165](docs/adr/adr-0165-deploy-ddl-and-control-table-bootstrap.md))
+- 📊 **Analytics export** — `sluice backup export-as-parquet` transcodes any engine's backup chain into one zstd Parquet file per table + an export manifest, ready for DuckDB / warehouse ingestion ([ADR-0164](docs/adr/adr-0164-backup-export-as-parquet.md))
 - 🔌 **Slot-less Postgres sources** — managed Postgres that blocks logical replication (e.g. Heroku Postgres) still streams via a trigger-based CDC engine (`--source-driver=postgres-trigger`) — no replication slot or `REPLICATION` role required
-- 🪶 **Schema evolution** — `ADD COLUMN` forwards automatically; every other shape refuses loudly with a structured drift diff naming the column that changed
+- 🪶 **Schema evolution** — unambiguous source DDL (`ADD`/`DROP COLUMN`, type/nullability `ALTER`s, index and `CHECK` changes) forwards automatically through the live CDC apply path (`--schema-changes=forward`, the default); ambiguous shapes (`RENAME`, volatile `DEFAULT`s) refuse loudly with a structured drift diff naming the column that changed
 - 🩺 **Operational telemetry** — pre-emptive PG slot-health warnings (70 % / 85 % retention + 30 min inactivity); source-side heartbeat writer keeps slots alive against quiet sources; `sync start --metrics-listen ADDR` serves Prometheus `/metrics` + a `/readyz` readiness probe (200 once the stream enters its apply phase) for k8s / load-balancer health checks
 - 🔁 **Cutover** — one-command sequence priming (`sluice cutover`) prevents PK collisions on the first post-cutover `INSERT`
 - 🛑 **Loud failure by default** — every silent-loss class we have caught has a structured refuse-loudly message with an operator-action recovery hint. Paste into Slack and the on-call DBA knows what to fix.
@@ -88,8 +91,13 @@ sluice is built around three product surfaces, each independently runnable:
 |---|---|
 | Move data **once** between MySQL and Postgres, then stop | `sluice migrate` |
 | Import a **SQLite file / `.sql` dump / live Cloudflare D1** into Postgres or MySQL | `sluice migrate --source-driver sqlite\|d1` |
+| Migrate a **CSV / TSV / NDJSON file** or a **mydumper / `pscale database dump` directory** — no live source database | `sluice migrate --source-driver csv\|tsv\|ndjson\|mydumper` |
 | Emit a **SQLite `.db`** from any source (e.g. for `wrangler d1 import`) | `sluice migrate --target-driver sqlite` |
-| Move data **once** with low downtime — snapshot + CDC catch-up + cutover | `sluice migrate` → `sluice sync start --resume` → `sluice cutover` |
+| **Export a backup chain as Parquet** for DuckDB / warehouse analytics | `sluice backup export-as-parquet` |
+| Run an **online schema change** (expand→migrate→contract) on PlanetScale | `sluice expand-contract` |
+| **Backfill / transform a column in place** — resumable, keyset-chunked, online-safe | `sluice backfill` |
+| Ship **one DDL statement** to a PlanetScale safe-migrations branch via a deploy request | `sluice deploy-ddl` (bootstrap: `sluice control-tables ddl`) |
+| Move data **once** with low downtime — snapshot + CDC catch-up + cutover | `sluice sync start` (cold-start snapshot → CDC) → `sluice cutover` |
 | **Replicate continuously** for analytics, geo-locality, or hot-standby | `sluice sync start` |
 | **Preview** the target DDL before running anything | `sluice schema preview` |
 | **Diff** a target against what sluice would produce | `sluice schema diff` |
@@ -108,7 +116,7 @@ These are the operator-pain features Reddit's `/r/PostgreSQL`, `/r/mysql`, and `
 | **F17 — Source-side heartbeat writer** | [v0.82.0](https://github.com/sluicesync/sluice/releases/tag/v0.82.0) | Optionally writes a tiny periodic row to a sluice-owned table on the source. The `INSERT` generates WAL / binlog so the consumer's position advances even against a quiet source, preventing silent slot eviction / binlog rotation past the consumer on low-traffic sources. Default-off; opt in with `--source-heartbeat-interval=30s`. Pairs with F13: F13 detects the symptom, F17 prevents the cause. ([ADR-0061](docs/adr/adr-0061-source-side-heartbeat-writer.md)) |
 | **F10 — Cutover sequence priming** | [v0.83.0](https://github.com/sluicesync/sluice/releases/tag/v0.83.0) | `sluice cutover` reads source PG sequences (`pg_sequences.last_value`) / MySQL `AUTO_INCREMENT` values and bumps the target by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-post-cutover-`INSERT` class. Idempotent; refuses loudly when target value is already above the safety margin (signal that traffic landed before cutover priming ran). Skips composite-PK / UUID / no-sequence tables gracefully. ([ADR-0062](docs/adr/adr-0062-cutover-sequence-priming.md)) |
 
-Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; multi-database fan-out; connection-resilience tuning; and the bulk-copy throughput arc (cross-table worker pool, index-build overlap on both engines, PG→PG raw `COPY` passthrough, fast `sync` cold-start). See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
+Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; multi-database fan-out; connection-resilience tuning; the bulk-copy throughput arc (cross-table worker pool, index-build overlap on both engines, PG→PG raw `COPY` passthrough, fast `sync` cold-start); and most recently the flat-file source engines, the Parquet analytics export, and the online schema-change command family (`backfill` / `expand-contract` / `deploy-ddl`). See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
 
 ### Engines and directions
 
@@ -118,6 +126,10 @@ Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond
 | **PostgreSQL** | ✓ | ✓ | ✓ | ✓ |
 | **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
 | **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ |
+| **CSV / TSV / NDJSON file** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| **mydumper / `pscale database dump` dir** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+
+The flat-file rows are migrate **sources** only (no CDC — a file doesn't change); SQLite / D1 have their own table below. There is also an analytics **exit** direction: `sluice backup export-as-parquet` transcodes any engine's backup chain — whatever the source engine was — into Parquet files for DuckDB / warehouse ingestion ([ADR-0164](docs/adr/adr-0164-backup-export-as-parquet.md), recipe in [`docs/cookbook/duckdb-on-sluice-backups.md`](docs/cookbook/duckdb-on-sluice-backups.md)).
 
 Cross-engine type translation handles the common surfaces (PG `UUID` / `INET` / `MACADDR` / `ARRAY` ↔ MySQL `CHAR(36)` / `VARCHAR` / `JSON`; MySQL `TINYINT(1)` ↔ PG `BOOLEAN`; MySQL `ENUM` / `SET` → PG enum / `TEXT[] + CHECK`; PostGIS `GEOMETRY` round-trips with SRID; many idioms in generated columns and `CHECK` constraints translate automatically — see [`docs/dev/translator-coverage.md`](docs/dev/translator-coverage.md)). When the default doesn't fit, `--type-override TABLE.COLUMN=TYPE` and `--expr-override TABLE.COLUMN=EXPR` cover one-off cases without writing a config file.
 
@@ -135,6 +147,16 @@ Cross-engine work flows through sluice's typed IR, where type translation, redac
 | `d1-trigger` | **CDC source** | The same trigger-CDC design over a live D1's HTTP query API ([ADR-0136](docs/adr/adr-0136-d1-trigger-cdc.md)). |
 
 SQLite / D1 are migrate **sources** into Postgres or MySQL, and SQLite is also a migrate **target**; D1 is not a target (use a `.db` SQLite target, then `wrangler d1 import`). Declared `DATE` / `DATETIME` / `BOOL` columns and the ambiguous value encoding are governed by `--sqlite-date-encoding` (`iso` default / `unixepoch` / `unixmillis` / `julian`), refusing loudly on a storage-class mismatch. Full operator walkthrough: [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md).
+
+### Flat files: CSV, TSV, NDJSON & mydumper dumps
+
+| Engine name | Role | Notes |
+|---|---|---|
+| `csv` / `tsv` | **source** (migrate only) | Schema-less flat files staged into a temp SQLite database with validated type inference auto-engaged ([ADR-0163](docs/adr/adr-0163-flatfile-csv-tsv-ndjson-sources.md)). Producer conventions are **declared, never sniffed**: `--csv-null` names the unquoted text meaning SQL NULL, `--csv-header` / `--csv-no-header` declare header presence — undeclared ambiguity refuses loudly. `--csv-delimiter` customises `csv`; `tsv` is the same engine with TAB fixed. |
+| `ndjson` | **source** (migrate only) | Newline-delimited JSON. Numbers are carried as raw source text end-to-end — never through a float64 — so integers above 2⁵³ and arbitrary-precision decimals land exact (the D1 lesson). Duplicate keys refuse loudly. |
+| `mydumper` | **source** (migrate only) | A mydumper or `pscale database dump` output **directory** — PlanetScale's exporter writes the same format, so this is the provider-export and air-gapped migration path ([ADR-0161](docs/adr/adr-0161-mydumper-source-engine.md)). Values decode through the live MySQL engine's own decoder, ground-truthed against real dumps per value family; the dump's recorded row counts are cross-checked after every table read. |
+
+All four are migrate sources into any target; `sluice verify --depth count` works against them (re-scan). Operator guide: [`docs/operator/flat-file-sources.md`](docs/operator/flat-file-sources.md).
 
 ---
 
@@ -169,7 +191,7 @@ The lesson all six share: **the integration test was green** at the surface that
 
 ## Architecture in one paragraph
 
-[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — nine registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
+[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the flat-file engines `internal/engines/{flatfile,mydumper}`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — thirteen registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
 
 The longer story lives in [`docs/architecture.md`](docs/architecture.md).
 
@@ -211,7 +233,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
 - **One-off snapshot, same engine, no CDC catch-up needed.** Just use `pg_dump` / `mysqldump`. sluice's value is the schema translation and the continuous-sync lifecycle; for trivial same-engine snapshots, the native tools are simpler.
 - **Logical decoding to applications.** sluice writes to a target database, not a Kafka topic or application stream. If you want raw decode events going to your own consumer, Debezium + Kafka is the right shape.
-- **Schema migration tooling.** sluice translates schemas between engines as part of a data migration, but it's not a versioned-migration tool like Atlas, Flyway, or Bytebase. Use those for application-driven schema evolution; use sluice when the goal is moving data between systems.
+- **Versioned schema-migration tooling.** sluice translates schemas between engines as part of a data migration, and it now ships the *online execution* half of a schema change — `sluice expand-contract`, `sluice backfill`, `sluice deploy-ddl` (see [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md)) — but it's not a versioned-migration tool like Atlas, Flyway, or Bytebase: no migration history, no multi-environment promotion, no down-migrations. Use those for application-driven schema versioning; use sluice's commands to execute a change safely against a live database.
 
 ---
 
@@ -272,7 +294,12 @@ Commands:
   sync from-backup run     Replay a backup chain into a target as a long-running broker.
   cutover                  Prime target sequences from source (post-snapshot, pre-traffic-switch).
   backup                   Take and verify encrypted logical backups (full + incremental chains).
+  backup export-as-parquet Transcode a backup into one Parquet file per table (analytics exit, ADR-0164).
   restore                  Restore a logical backup chain into a target database.
+  backfill                 Backfill/transform a column in place — keyset-chunked, resumable, online-safe (ADR-0159).
+  expand-contract          Drive the full expand→migrate→contract pattern on PlanetScale (ADR-0162).
+  deploy-ddl               Ship ONE verbatim DDL statement to a PlanetScale branch via a deploy request (ADR-0165).
+  control-tables ddl       Print sluice's control-table CREATE statements for safe-migrations bootstrap.
   trigger setup            Install trigger-CDC state (postgres-trigger / sqlite-trigger / d1-trigger).
   trigger teardown         Remove every trace of the trigger engine from the source database.
   trigger prune            Reap durably-applied rows from a trigger change-log (ADR-0137).
@@ -299,7 +326,7 @@ Run `sluice <command> --help` for per-command flags. DSNs can also be passed via
 A few terms recur in the codebase and docs:
 
 - **IR** — the **internal representation**, sluice's typed dialect-neutral schema + value model in `internal/ir`. Every cross-engine translation passes through it: source-engine readers populate the IR, target-engine writers consume it. The IR is the only shared contract between engines, which keeps source-specific knowledge out of writers and target-specific knowledge out of readers. See [`docs/architecture.md`](docs/architecture.md) for the longer story.
-- **Engine** — a registered database integration. Nine are registered today (run `sluice engines`): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
+- **Engine** — a registered database integration. Thirteen are registered today (run `sluice engines`): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
 - **Stream** — a continuous-sync flow with persisted position, identified by a `--stream-id`. Distinct from a one-shot `migrate` which doesn't persist resume state on the target.
 - **Shape** — the classification of a CDC-observed source DDL (`ShapeKindAddColumn`, `ShapeKindRenameColumn`, `ShapeKindUnrecognized`, …) that drives whether the streamer auto-forwards, coordinates live, or refuses loudly. See ADR-0054 / ADR-0058.
 - **Refuse loudly** — sluice's posture when the safe forward path is ambiguous or the operator-action recovery hint matters more than continuing. Always emits a structured message naming the offending object and the recovery path.
@@ -322,8 +349,10 @@ A few terms recur in the codebase and docs:
 - [`docs/throughput-tuning.md`](docs/throughput-tuning.md) — knobs that matter at scale
 - [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 26 strategies, determinism contracts, dictionary loader
 - [`docs/snapshot-cdc-handoff.md`](docs/snapshot-cdc-handoff.md) — operator reference for the cold-start → CDC handoff
-- [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
+- [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — the schema-change command family (`expand-contract`, `backfill`, `deploy-ddl`, `control-tables ddl`) plus coordinating DDL against a running stream
 - [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md) — importing SQLite files / `.sql` dumps / live Cloudflare D1 into Postgres or MySQL, the lossless big-integer path, and the SQLite/D1 trigger-CDC engines
+- [`docs/operator/flat-file-sources.md`](docs/operator/flat-file-sources.md) — migrating CSV / TSV / NDJSON files and mydumper / `pscale database dump` directories, the declared-not-sniffed CSV conventions, and type inference
+- [`docs/cookbook/duckdb-on-sluice-backups.md`](docs/cookbook/duckdb-on-sluice-backups.md) — querying `backup export-as-parquet` output with DuckDB (local + S3), footer metadata, GeoParquet
 - [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) — migrating many MySQL databases / Postgres schemas in one run (`--all-databases` / `--all-schemas`), fan-IN consolidation, and the documented edges
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
@@ -335,6 +364,10 @@ A few terms recur in the codebase and docs:
 
 Selected highlights from the **v0.94 → v0.99** arc:
 
+- **The online schema-change command family** (v0.99.244 → v0.99.258) — `sluice backfill` (resumable keyset-chunked in-place data migration with the `--verify` completion gate, [ADR-0159](docs/adr/adr-0159-standalone-backfill-command.md)), `sluice expand-contract` (the full expand→migrate→contract pattern on PlanetScale via deploy requests, live-validated, [ADR-0162](docs/adr/adr-0162-planetscale-expand-contract-orchestration.md)), `sluice deploy-ddl` + `sluice control-tables ddl` (the safe-migrations DDL channel and bootstrap, [ADR-0165](docs/adr/adr-0165-deploy-ddl-and-control-table-bootstrap.md)), the automatic deploy-request index-build fallback ([ADR-0148](docs/adr/adr-0148-planetscale-deploy-request-index-build.md)), and `migrate`'s pre-create shape gate so a deploy-request-bootstrapped schema feeds a fresh migrate end to end ([ADR-0166](docs/adr/adr-0166-migrate-precreate-shape-gate.md))
+- **Flat-file source engines** (v0.99.247 → v0.99.250) — `--source-driver mydumper` reads a mydumper / `pscale database dump` directory ([ADR-0161](docs/adr/adr-0161-mydumper-source-engine.md)); `--source-driver csv|tsv|ndjson` migrates schema-less flat files with validated type inference and declared-not-sniffed NULL/header conventions ([ADR-0163](docs/adr/adr-0163-flatfile-csv-tsv-ndjson-sources.md))
+- [v0.99.251](https://github.com/sluicesync/sluice/releases/tag/v0.99.251) — **`sluice backup export-as-parquet`**: the analytics exit surface — any engine's backup chain transcoded to zstd Parquet + an export manifest, faithful-or-loud type mapping, DuckDB cookbook ([ADR-0164](docs/adr/adr-0164-backup-export-as-parquet.md))
+- [v0.99.246](https://github.com/sluicesync/sluice/releases/tag/v0.99.246) — Slot-health alerts page the notification sinks (webhook/Slack/SMTP) + the backup-chain concurrent-writer guard (ADR-0160)
 - **SQLite & Cloudflare D1 engine family** (v0.99.141 → v0.99.148) — SQLite/D1 migrate source (file + `.sql` dump + lossless live-D1 query-API reader, [ADR-0128](docs/adr/adr-0128-sqlite-d1-migrate-source.md)/[0130](docs/adr/adr-0130-sqlite-sql-dump-ingest.md)/[0132](docs/adr/adr-0132-d1-query-api-reader.md)), generated/CHECK/expression-index carry ([ADR-0133](docs/adr/adr-0133-sqlite-schema-feature-detection.md)), within-table parallel chunking, SQLite as a migrate **target** (decimals byte-exact as TEXT, [ADR-0134](docs/adr/adr-0134-sqlite-target-engine.md)), and the `sqlite-trigger` / `d1-trigger` continuous-CDC engines ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md)/[0136](docs/adr/adr-0136-d1-trigger-cdc.md))
 - **MySQL CDC apply-over-WAN coalescing** ([ADR-0139](docs/adr/adr-0139-mysql-multirow-insert-apply.md)/[0140](docs/adr/adr-0140-mysql-coalesce-update-delete-apply.md)) — consecutive same-shape INSERTs fold into one multi-row `INSERT … ON DUPLICATE KEY UPDATE`, UPDATEs apply as the same keyed upsert, and DELETEs coalesce into one `DELETE … WHERE pk IN (…)`, turning N round trips into one and lifting cross-region / PlanetScale-MySQL apply off the per-RTT floor; a rate-limited INFO line reports the rows-per-statement coalescing ratio
 - [v0.99.30](https://github.com/sluicesync/sluice/releases/tag/v0.99.30) — Index-build overlap extended to MySQL targets (ADR-0080) + within-table chunking on the PG fast `sync` cold-start + the `SPATIAL`/`FULLTEXT` `Error 1089` fix
