@@ -63,8 +63,23 @@ const ParquetIndexFileName = "parquet_index.json"
 
 // exportRowBatchSize is how many encoded rows accumulate before one
 // parquet writer Write call. Bounded per-batch memory; row groups are
-// cut per source CHUNK (Flush), not per batch.
+// cut per source CHUNK (Flush) — or earlier at the byte target below —
+// never per batch.
 const exportRowBatchSize = 512
+
+// exportRowGroupTargetBytes bounds the parquet writer's buffered
+// row-group memory: the writer retains every page written since the
+// last Flush, and a Flush used to come only at the END of a source
+// chunk — whose size is bounded by ROW count alone, so a BLOB-heavy
+// ~1 MB/row table meant ~100 GB of retained pages and an OOM kill
+// hours in (audit 2026-07-15 MED-P3). When a chunk's accumulated
+// approximate encoded bytes pass this target, the row group is rolled
+// EARLY: an oversized chunk maps to several consecutive row groups
+// instead of one. Row groups still never span chunks — each chunk owns
+// a contiguous run of >= 1 groups (ADR-0164's cross-reference property,
+// amended from strict 1:1), and chunks under the target keep exactly
+// one group, so typical exports are byte-identical in shape.
+const exportRowGroupTargetBytes = 128 << 20
 
 // ParquetExport runs a single export. Construct the value, then call
 // Run.
@@ -108,6 +123,17 @@ type ParquetExport struct {
 	// SluiceVersion is stamped into parquet_index.json (informational).
 	SluiceVersion string
 
+	// StageDir is where the per-table scratch file is created
+	// (--stage-dir / SLUICE_STAGE_DIR). Empty — the zero value — keeps
+	// the os.TempDir default; the scratch holds a whole table's Parquet
+	// bytes, which overwhelms a tmpfs /tmp on large tables (the ADR-0145
+	// hazard class).
+	StageDir string
+
+	// rowGroupTargetBytes overrides exportRowGroupTargetBytes (tests
+	// pin the multi-group roll with a tiny target). 0 = the default.
+	rowGroupTargetBytes int64
+
 	// chainCEK / chainEncrypted mirror [Restore]'s chunk-decrypt
 	// state: the cached per-chain CEK and whether the selected
 	// manifest records chain encryption (a plaintext chunk is then a
@@ -135,11 +161,15 @@ type parquetIndexTable struct {
 	File   string `json:"file"`
 	Rows   int64  `json:"rows"`
 
-	// RowGroups is RECORDED (the source-chunk count — one Flush per
-	// chunk), not re-measured from the written file. The 1:1 alignment
-	// is the writer's contract, pinned by the integration test's
-	// len(f.RowGroups()) check; if parquet-go ever split or merged
-	// groups on its own, that pin fires, not this field.
+	// RowGroups is RECORDED (the count of Flush calls — one per source
+	// chunk, plus the early byte-target rolls inside oversized chunks;
+	// see exportRowGroupTargetBytes), not re-measured from the written
+	// file. Row groups never span chunks, so RowGroups >= len(
+	// SourceChunks), with equality for chunks under the byte target.
+	// The Flush-cuts-a-group behavior is the writer's contract, pinned
+	// by the integration tests' len(f.RowGroups()) checks; if parquet-go
+	// ever split or merged groups on its own, those pins fire, not this
+	// field.
 	RowGroups    int                   `json:"row_groups"`
 	SourceChunks []*irbackup.ChunkInfo `json:"source_chunks,omitempty"`
 	TypeNotes    []string              `json:"type_notes,omitempty"`
@@ -370,8 +400,13 @@ func (e *ParquetExport) exportTable(
 	}
 
 	fileName := parquetFileName(table.Schema, table.Name)
-	tmp, err := os.CreateTemp("", "sluice-parquet-*")
+	// StageDir (--stage-dir / SLUICE_STAGE_DIR) overrides where the
+	// table-sized scratch lives; "" is the os.TempDir default.
+	tmp, err := os.CreateTemp(e.StageDir, "sluice-parquet-*")
 	if err != nil {
+		if e.StageDir != "" {
+			return nil, fmt.Errorf("export-as-parquet: create scratch file under --stage-dir %q: %w", e.StageDir, err)
+		}
 		return nil, fmt.Errorf("export-as-parquet: create scratch file: %w", err)
 	}
 	tmpName := tmp.Name()
@@ -403,18 +438,19 @@ func (e *ParquetExport) exportTable(
 	w := parquet.NewGenericWriter[map[string]any](tmp, opts...)
 
 	var rows int64
+	var rowGroups int
 	for chunkIdx, chunk := range entry.Chunks {
-		chunkRows, err := e.exportChunk(ctx, segStore, codec, manifest, table, chunk, chunkColumns, tc, w)
+		// Row groups never span source chunks (ADR-0164): each chunk owns
+		// a contiguous run of >= 1 groups — exactly 1 under the byte
+		// target — so the operator-visible chunk concept survives into
+		// the Parquet file, indexed by the footer's source_chunks list.
+		// The flushes live inside exportChunk (the byte-target roll).
+		chunkRows, chunkGroups, err := e.exportChunk(ctx, segStore, codec, manifest, table, chunk, chunkColumns, tc, w)
 		if err != nil {
 			return nil, fmt.Errorf("export-as-parquet: table %q chunk %d (%s): %w", table.Name, chunkIdx, chunk.File, err)
 		}
 		rows += chunkRows
-		// Row groups align 1:1 with source chunks (ADR-0164): the
-		// operator-visible chunk concept survives into the Parquet
-		// file, and the footer's source_chunks list indexes them.
-		if err := w.Flush(); err != nil {
-			return nil, fmt.Errorf("export-as-parquet: table %q: flush row group %d: %w", table.Name, chunkIdx, err)
-		}
+		rowGroups += chunkGroups
 	}
 
 	// Layer-2 table-level check, mirroring restore: the ACTUAL decoded
@@ -446,14 +482,14 @@ func (e *ParquetExport) exportTable(
 		slog.String("table", table.Name),
 		slog.String("file", fileName),
 		slog.Int64("rows", rows),
-		slog.Int("row_groups", len(entry.Chunks)),
+		slog.Int("row_groups", rowGroups),
 	)
 	return &parquetIndexTable{
 		Schema:       table.Schema,
 		Name:         table.Name,
 		File:         fileName,
 		Rows:         rows,
-		RowGroups:    len(entry.Chunks),
+		RowGroups:    rowGroups,
 		SourceChunks: entry.Chunks,
 		TypeNotes:    tc.Notes,
 	}, nil
@@ -464,7 +500,12 @@ func (e *ParquetExport) exportTable(
 // SHA-256-verified fetch, CEK resolution (with the plaintext-splice
 // refusal), GCM AAD binding from the manifest's RECORDED version,
 // chunk-header column-set validation, and the per-chunk layer-2 row
-// count.
+// count. It owns the row-group flushes for its chunk: one at chunk end,
+// plus an early roll whenever the accumulated approximate encoded bytes
+// pass the byte target (see exportRowGroupTargetBytes) — the writer's
+// buffered-page memory stays bounded by the target instead of by the
+// chunk's size. Returns the decoded row count and the number of row
+// groups cut (>= 1).
 func (e *ParquetExport) exportChunk(
 	ctx context.Context,
 	segStore irbackup.Store,
@@ -475,19 +516,19 @@ func (e *ParquetExport) exportChunk(
 	chunkColumns map[string][]string,
 	tc *parquetexport.TableCodec,
 	w *parquet.GenericWriter[map[string]any],
-) (int64, error) {
+) (rows int64, groups int, err error) {
 	src, err := blobcodec.FetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
-		return 0, lineage.CodeChunkHashError(fmt.Errorf("open chunk: %w", err))
+		return 0, 0, lineage.CodeChunkHashError(fmt.Errorf("open chunk: %w", err))
 	}
 	cek, err := e.chunkCEK(chunk)
 	if err != nil {
 		_ = src.Close()
-		return 0, fmt.Errorf("resolve chunk cek: %w", err)
+		return 0, 0, fmt.Errorf("resolve chunk cek: %w", err)
 	}
 	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, codec, irbackup.ChunkAADFor(manifest, chunk, table.Schema, table.Name))
 	if err != nil {
-		return 0, lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
+		return 0, 0, lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
 	// Header ↔ schema cross-check (ADR-0152): a chunk written against a
 	// different schema version would silently mis-key rows.
@@ -495,15 +536,19 @@ func (e *ParquetExport) exportChunk(
 	expected, ok := chunkColumns[key]
 	if !ok {
 		_ = cr.Close()
-		return 0, fmt.Errorf("internal: no source column set for table %q", key)
+		return 0, 0, fmt.Errorf("internal: no source column set for table %q", key)
 	}
 	if missing, extra := diffColumnSets(expected, cr.Header().Columns); len(missing) > 0 || len(extra) > 0 {
 		_ = cr.Close()
-		return 0, fmt.Errorf("chunk does not match table %q's schema: header is missing columns %v and carries unexpected columns %v — the chunk was written against a different schema version than this manifest records; refusing before any row is exported",
+		return 0, 0, fmt.Errorf("chunk does not match table %q's schema: header is missing columns %v and carries unexpected columns %v — the chunk was written against a different schema version than this manifest records; refusing before any row is exported",
 			key, missing, extra)
 	}
 
-	var rows int64
+	target := e.rowGroupTargetBytes
+	if target <= 0 {
+		target = exportRowGroupTargetBytes
+	}
+	var groupBytes int64 // approx encoded bytes since the last flush
 	batch := make([]map[string]any, 0, exportRowBatchSize)
 	flushBatch := func() error {
 		if len(batch) == 0 {
@@ -518,7 +563,7 @@ func (e *ParquetExport) exportChunk(
 	for {
 		if err := ctx.Err(); err != nil {
 			_ = cr.Close()
-			return rows, err
+			return rows, groups, err
 		}
 		row, err := cr.ReadRow()
 		if errors.Is(err, io.EOF) {
@@ -526,44 +571,93 @@ func (e *ParquetExport) exportChunk(
 		}
 		if err != nil {
 			_ = cr.Close()
-			return rows, fmt.Errorf("read row: %w", err)
+			return rows, groups, fmt.Errorf("read row: %w", err)
 		}
 		encoded, err := tc.EncodeRow(row)
 		if err != nil {
 			_ = cr.Close()
-			return rows, sluicecode.Wrap(sluicecode.CodeExportUnrepresentable,
+			return rows, groups, sluicecode.Wrap(sluicecode.CodeExportUnrepresentable,
 				"the value cannot be represented faithfully in Parquet; exclude the table (--exclude-table) or query its JSON-Lines chunks directly (see the DuckDB cookbook recipe)",
 				fmt.Errorf("row %d: %w", rows, err))
 		}
 		batch = append(batch, encoded)
+		groupBytes += approxEncodedRowBytes(encoded)
 		rows++
 		if len(batch) == exportRowBatchSize {
 			if err := flushBatch(); err != nil {
 				_ = cr.Close()
-				return rows, err
+				return rows, groups, err
 			}
+		}
+		if groupBytes >= target {
+			// The byte-target roll: cut the row group early so the
+			// writer's retained pages stay bounded (audit MED-P3).
+			if err := flushBatch(); err != nil {
+				_ = cr.Close()
+				return rows, groups, err
+			}
+			if err := w.Flush(); err != nil {
+				_ = cr.Close()
+				return rows, groups, fmt.Errorf("flush row group: %w", err)
+			}
+			groups++
+			groupBytes = 0
 		}
 	}
 	if err := flushBatch(); err != nil {
 		_ = cr.Close()
-		return rows, err
+		return rows, groups, err
+	}
+	// Close the chunk's final row group — unless an early roll already
+	// ended exactly at the chunk's last row (an extra Flush there would
+	// depend on parquet-go's empty-flush behavior for the group count).
+	// A rolled-nothing chunk (groups == 0, even with zero rows) keeps
+	// today's unconditional one-flush-per-chunk shape.
+	if groupBytes > 0 || groups == 0 {
+		if err := w.Flush(); err != nil {
+			_ = cr.Close()
+			return rows, groups, fmt.Errorf("flush row group: %w", err)
+		}
+		groups++
 	}
 	if err := cr.Close(); err != nil {
-		return rows, lineage.CodeChunkHashError(err)
+		return rows, groups, lineage.CodeChunkHashError(err)
 	}
 	// Per-chunk layer-2 checks, byte-identical semantics to restore's
 	// streamChunkRows (incl. the zeroed-RowCount tamper refusal).
 	switch {
 	case chunk.RowCount > 0 && rows != chunk.RowCount:
-		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+		return rows, groups, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"export from an untampered copy, or sign the chain so a truncated/edited chunk is caught at verify time",
 			fmt.Errorf("layer-2 chunk row-count mismatch: manifest says %d, decoded %d", chunk.RowCount, rows))
 	case chunk.RowCount == 0 && rows > 0:
-		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+		return rows, groups, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"export from an untampered copy, or sign the chain so a zeroed chunk row-count is caught at verify time",
 			fmt.Errorf("layer-2 chunk row-count anomaly: manifest records 0 rows but the chunk decoded %d (zeroed chunk RowCount)", rows))
 	}
-	return rows, nil
+	return rows, groups, nil
+}
+
+// approxEncodedRowBytes estimates one encoded row's in-memory payload for
+// the byte-target roll: variable-width leaves count their byte length,
+// everything else a fixed 16 (a boxed scalar). An ESTIMATE is all the
+// roll needs — it bounds writer memory, it is not an accounting surface —
+// and it errs low only by per-value overhead, never by payload size (the
+// BLOB/string bytes that made MED-P3 unbounded are counted exactly).
+func approxEncodedRowBytes(row map[string]any) int64 {
+	var n int64
+	for k, v := range row {
+		n += int64(len(k)) + 16
+		switch x := v.(type) {
+		case *string:
+			n += int64(len(*x))
+		case string:
+			n += int64(len(x))
+		case []byte:
+			n += int64(len(x))
+		}
+	}
+	return n
 }
 
 // preflightEncryption mirrors [Restore.preflightEncryption] for the

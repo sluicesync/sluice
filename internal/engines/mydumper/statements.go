@@ -13,10 +13,11 @@ import (
 // This file is the MySQL-dialect statement layer shared by the schema and
 // data paths: a boundary splitter that finds top-level `;` without being
 // fooled by string/identifier/comment syntax, a bounded streaming reader
-// over it (the sqlite dump.go carry pattern — a statement, string, or
-// comment may span read-block boundaries and is resolved by re-scanning
-// the carried fragment with the next block), and the comment/versioned-
-// comment stripper the statement classifiers use.
+// over it (an incremental lexer whose state survives read-block
+// boundaries, so a statement, string, or comment spanning blocks splits
+// exactly as it would in one whole-file scan — each byte is examined
+// once), and the comment/versioned-comment stripper the statement
+// classifiers use.
 //
 // The sqlite engine's splitDumpChunk is deliberately NOT reused: SQLite
 // text has no backslash escapes, no backtick identifiers, and no `#`
@@ -123,13 +124,178 @@ var errStatementTooLarge = fmt.Errorf(
 	maxStatementBytes>>20,
 )
 
+// scanState is the incremental splitter's lexer state, carried across
+// appended blocks. States past scanTop either sit INSIDE a multi-byte
+// token (string/identifier/comment) or hold a PENDING one-byte lookahead
+// (a possible two-char delimiter or escape whose deciding byte has not
+// arrived yet — the stateful equivalent of splitMySQLChunk's leave-it-
+// in-the-carry-and-re-scan resolution). Because the machine consumes one
+// byte at a time, its trajectory — and therefore every statement
+// boundary — is independent of where the read blocks happen to fall.
+type scanState uint8
+
+const (
+	scanTop          scanState = iota
+	scanString                 // inside '…' or "…" (the quote byte is stmtScanner.quote)
+	scanStringEscape           // consumed a backslash inside a string; next byte is literal
+	scanStringQuote            // saw the quote byte; doubled-quote-escape lookahead pending
+	scanBacktick               // inside a `…` identifier
+	scanBacktickTick           // saw a backtick; doubled-backtick-escape lookahead pending
+	scanDash1                  // saw '-' at top level; second '-' lookahead pending
+	scanDash2                  // saw '--' at top level; the comment-deciding whitespace lookahead pending
+	scanSlash                  // saw '/' at top level; '*' lookahead pending
+	scanLineComment            // inside a `-- ` / `#` comment, consuming to newline
+	scanBlockComment           // inside /* … */ (versioned blocks included — opaque for splitting)
+	scanBlockStar              // saw '*' inside a block comment; '/' lookahead pending
+)
+
+// stmtScanner incrementally lexes MySQL text into top-level statements.
+// It holds the unemitted carry plus the lexer state at the carry's end,
+// so appending the next block resumes scanning where the last one left
+// off — each byte is examined exactly once. Its statement boundaries are
+// byte-identical to a whole-input [splitMySQLChunk] scan (pinned by the
+// differential test); the predecessor rebuilt and re-lexed carry+block
+// per 1 MiB block, which made statement SIZE quadratic in cost — a
+// 64 MiB --statement-size dump read ~15× slower per byte (audit
+// 2026-07-15 MED-P1).
+type stmtScanner struct {
+	buf   []byte // carry: bytes after the last emitted statement boundary
+	pos   int    // buf[:pos] is scanned — proven boundary-free given state
+	state scanState
+	quote byte // the active quote byte while in the scanString* states
+}
+
+// append adds the next read block and returns the complete statements it
+// finishes, in order. The remainder stays buffered as the carry.
+func (s *stmtScanner) append(block []byte) []string {
+	s.buf = append(s.buf, block...)
+	var stmts []string
+	buf := s.buf
+	start := 0 // carry-relative index where the current statement begins
+	i := s.pos
+	for i < len(buf) {
+		c := buf[i]
+		switch s.state {
+		case scanTop:
+			switch c {
+			case '\'', '"':
+				s.quote = c
+				s.state = scanString
+			case '`':
+				s.state = scanBacktick
+			case '#':
+				s.state = scanLineComment
+			case '-':
+				s.state = scanDash1
+			case '/':
+				s.state = scanSlash
+			case ';':
+				if stmt := strings.TrimSpace(string(buf[start:i])); stmt != "" {
+					stmts = append(stmts, stmt)
+				}
+				start = i + 1
+			}
+		case scanString:
+			switch c {
+			case '\\':
+				s.state = scanStringEscape
+			case s.quote:
+				s.state = scanStringQuote
+			}
+		case scanStringEscape:
+			s.state = scanString
+		case scanStringQuote:
+			if c != s.quote {
+				s.state = scanTop
+				continue // the string ended before c; re-dispatch it at top level
+			}
+			s.state = scanString // doubled quote is an escape, not a terminator
+		case scanBacktick:
+			if c == '`' {
+				s.state = scanBacktickTick
+			}
+		case scanBacktickTick:
+			if c != '`' {
+				s.state = scanTop
+				continue // the identifier ended before c; re-dispatch
+			}
+			s.state = scanBacktick // `` is an escaped backtick
+		case scanDash1:
+			if c != '-' {
+				s.state = scanTop
+				continue // lone '-' was arithmetic; re-dispatch c
+			}
+			s.state = scanDash2
+		case scanDash2:
+			// MySQL requires whitespace (or end of input) after `--` for a
+			// line comment; `a--b` is arithmetic. A further '-' shifts the
+			// pending pair right (`--- ` comments from the SECOND dash).
+			switch c {
+			case ' ', '\t', '\r':
+				s.state = scanLineComment
+			case '\n':
+				s.state = scanTop // an empty `--` comment; the newline ends it
+			case '-':
+				// stay in scanDash2
+			default:
+				s.state = scanTop
+				continue // both dashes were arithmetic; re-dispatch c
+			}
+		case scanSlash:
+			if c != '*' {
+				s.state = scanTop
+				continue // lone '/' was arithmetic; re-dispatch c
+			}
+			s.state = scanBlockComment
+		case scanLineComment:
+			if c == '\n' {
+				s.state = scanTop
+			}
+		case scanBlockComment:
+			if c == '*' {
+				s.state = scanBlockStar
+			}
+		case scanBlockStar:
+			switch c {
+			case '/':
+				s.state = scanTop
+			case '*':
+				// stay: this '*' may pair with the NEXT byte
+			default:
+				s.state = scanBlockComment
+			}
+		}
+		i++
+	}
+	// Compact the emitted prefix out of the carry; the resume offset now
+	// covers the whole (scanned) remainder.
+	if start > 0 {
+		n := copy(s.buf, s.buf[start:])
+		s.buf = s.buf[:n]
+	}
+	s.pos = len(s.buf)
+	return stmts
+}
+
+// carryLen reports the buffered partial-statement size (the
+// maxStatementBytes ceiling's input).
+func (s *stmtScanner) carryLen() int { return len(s.buf) }
+
+// finish returns the trimmed final fragment (a trailing statement with
+// no ';', or a dangling comment/string) and releases the buffer.
+func (s *stmtScanner) finish() string {
+	rest := strings.TrimSpace(string(s.buf))
+	s.buf = nil
+	return rest
+}
+
 // statementStream yields complete top-level statements from r, one at a
 // time, never holding more than one read block plus one partial statement
 // in memory. Next returns io.EOF after the final statement.
 type statementStream struct {
 	r       io.Reader
 	block   []byte
-	carry   string
+	scan    stmtScanner
 	pending []string
 	eof     bool
 }
@@ -154,18 +320,15 @@ func (s *statementStream) Next() (string, error) {
 			return stmt, nil
 		}
 		if s.eof {
-			if rest := strings.TrimSpace(s.carry); rest != "" {
-				s.carry = ""
+			if rest := s.scan.finish(); rest != "" {
 				return rest, nil
 			}
 			return "", io.EOF
 		}
 		nr, rerr := s.r.Read(s.block)
 		if nr > 0 {
-			stmts, rest := splitMySQLChunk(s.carry + string(s.block[:nr]))
-			s.carry = rest
-			s.pending = stmts
-			if len(s.carry) > maxStatementBytes {
+			s.pending = s.scan.append(s.block[:nr])
+			if s.scan.carryLen() > maxStatementBytes {
 				return "", errStatementTooLarge
 			}
 		}

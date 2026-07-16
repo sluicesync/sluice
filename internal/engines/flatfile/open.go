@@ -51,8 +51,15 @@ func (e Engine) stage(ctx context.Context, dsn string) (string, error) {
 			e.Name(), path, tableName)
 	}
 
-	tmp, err := os.CreateTemp("", "sluice-flatfile-*.db")
+	// opts.StageDir (--stage-dir / SLUICE_STAGE_DIR) overrides where the
+	// staged copy lives; "" is the os.TempDir default. The staged copy is
+	// roughly the source file's size — the override exists for hosts whose
+	// /tmp is a small tmpfs (the ADR-0145 hazard class).
+	tmp, err := os.CreateTemp(e.opts.StageDir, "sluice-flatfile-*.db")
 	if err != nil {
+		if e.opts.StageDir != "" {
+			return "", fmt.Errorf("%s: create staged db for %q under --stage-dir %q: %w", e.Name(), path, e.opts.StageDir, err)
+		}
 		return "", fmt.Errorf("%s: create temp db for %q: %w", e.Name(), path, err)
 	}
 	staged := tmp.Name()

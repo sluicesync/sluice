@@ -613,3 +613,129 @@ func TestParquetExport_ValidateInputs(t *testing.T) {
 		t.Fatal("empty store must refuse (no manifests)")
 	}
 }
+
+// seedWideRowExportBackup seeds one table whose chunk 0 carries several
+// ~1 KiB rows and chunk 1 a single small row — the byte-target roll's
+// fixture.
+func seedWideRowExportBackup(t *testing.T) exportSeed {
+	t.Helper()
+	ctx := context.Background()
+	store, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "wide",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "payload", Type: ir.Text{}, Nullable: true},
+		},
+	}}}
+	wide := schema.Tables[0]
+	chunkRows := [][]ir.Row{
+		{ // chunk 0: five ~1 KiB rows
+			{"id": int64(1), "payload": strings.Repeat("a", 1024)},
+			{"id": int64(2), "payload": strings.Repeat("b", 1024)},
+			{"id": int64(3), "payload": strings.Repeat("c", 1024)},
+			{"id": int64(4), "payload": strings.Repeat("d", 1024)},
+			{"id": int64(5), "payload": strings.Repeat("e", 1024)},
+		},
+		{ // chunk 1: one small row
+			{"id": int64(6), "payload": "tail"},
+		},
+	}
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.FormatVersionLegacy,
+		CreatedAt:     time.Date(2026, 7, 15, 11, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Kind:          irbackup.BackupKindFull,
+		Schema:        schema,
+		PartialState:  irbackup.BackupStateComplete,
+	}
+	chunks := make([]*irbackup.ChunkInfo, 0, len(chunkRows))
+	var total int64
+	for i, rows := range chunkRows {
+		path := "chunks/wide/wide-" + string(rune('0'+i)) + ".jsonl.gz"
+		info := writeExportChunk(t, store, path, wide.Columns, rows, nil, nil, blobcodec.CodecGzip)
+		chunks = append(chunks, info)
+		total += info.RowCount
+	}
+	m.Tables = []*irbackup.TableManifest{{Name: "wide", RowCount: total, Chunks: chunks}}
+	m.BackupID = irbackup.ComputeBackupID(m)
+	if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, m); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := lineage.UpdateLineageForManifestBestEffort(ctx, store, m, lineage.ManifestFileName, blobcodec.CodecGzip); err != nil {
+		t.Fatalf("update lineage: %v", err)
+	}
+	return exportSeed{store: store, manifest: m}
+}
+
+// TestParquetExport_ByteTargetRollsRowGroupsWithinChunk pins the MED-P3
+// fix: a chunk whose accumulated encoded bytes pass the byte target is
+// split into MULTIPLE consecutive row groups (bounding the writer's
+// retained-page memory by the target, not the chunk size), groups never
+// span chunks, rows stay value-exact across the roll boundaries, and the
+// index's recorded RowGroups matches the physical file.
+func TestParquetExport_ByteTargetRollsRowGroupsWithinChunk(t *testing.T) {
+	seed := seedWideRowExportBackup(t)
+	// ~1 KiB per row, target 2 KiB: chunk 0 (5 rows) rolls after rows 2
+	// and 4 -> groups of [2,2,1]; chunk 1 (1 small row) keeps one group.
+	outDir := runExport(t, &ParquetExport{Store: seed.store, SluiceVersion: "test", rowGroupTargetBytes: 2048})
+
+	rows, f := readParquetRows(t, filepath.Join(outDir, "wide.parquet"))
+	if len(rows) != 6 {
+		t.Fatalf("rows = %d; want 6", len(rows))
+	}
+	// Value-exact across the roll boundaries.
+	for i, wantPayload := range []string{
+		strings.Repeat("a", 1024), strings.Repeat("b", 1024), strings.Repeat("c", 1024),
+		strings.Repeat("d", 1024), strings.Repeat("e", 1024), "tail",
+	} {
+		if got := rows[i]["payload"]; got != wantPayload {
+			t.Fatalf("row %d payload = %.20q...; want %.20q...", i, got, wantPayload)
+		}
+		if got := rows[i]["id"]; got != int64(i+1) {
+			t.Fatalf("row %d id = %v; want %d", i, got, i+1)
+		}
+	}
+	// Physical row groups: [2,2,1] for chunk 0 then [1] for chunk 1 —
+	// the cumulative boundary after group 3 is exactly chunk 0's 5 rows,
+	// so no group spans the chunk seam.
+	groupRows := make([]int64, 0, len(f.RowGroups()))
+	for _, rg := range f.RowGroups() {
+		groupRows = append(groupRows, rg.NumRows())
+	}
+	if len(groupRows) != 4 || groupRows[0] != 2 || groupRows[1] != 2 || groupRows[2] != 1 || groupRows[3] != 1 {
+		t.Fatalf("row-group rows = %v; want [2 2 1 1] (byte-target rolls inside chunk 0, chunk seam preserved)", groupRows)
+	}
+
+	// The index RECORDS the actual group count.
+	var index parquetIndex
+	b, err := os.ReadFile(filepath.Join(outDir, ParquetIndexFileName))
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	if err := json.Unmarshal(b, &index); err != nil {
+		t.Fatalf("parse index: %v", err)
+	}
+	if len(index.Tables) != 1 || index.Tables[0].RowGroups != 4 {
+		t.Fatalf("index tables = %+v; want RowGroups 4", index.Tables)
+	}
+}
+
+// TestParquetExport_StageDirConsumed pins the --stage-dir plumbing at the
+// export layer: a missing stage dir is a loud refusal naming the flag —
+// never a silent fallback to the system temp dir.
+func TestParquetExport_StageDirConsumed(t *testing.T) {
+	seed := seedPlaintextExportBackup(t)
+	out, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStore(out): %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	err = (&ParquetExport{Store: seed.store, Output: out, StageDir: missing}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--stage-dir") || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("export with a missing --stage-dir = %v; want a loud refusal naming the flag and path", err)
+	}
+}

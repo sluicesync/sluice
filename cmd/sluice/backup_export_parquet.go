@@ -132,6 +132,7 @@ func (x *BackupExportAsParquetCmd) Run(g *Globals) error {
 		VerifyKey:        verifyKey,
 		RequireSignature: x.RequireSignature,
 		SluiceVersion:    version,
+		StageDir:         g.StageDir,
 	}
 	return export.Run(ctx)
 }

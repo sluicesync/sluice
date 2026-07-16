@@ -496,7 +496,7 @@ func TestStagedReaderOwnsTempFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
-	sr, err := sqlite.OpenStagedSchemaReader(context.Background(), staged, path)
+	sr, err := sqlite.OpenStagedSchemaReader(context.Background(), staged, path, nil)
 	if err != nil {
 		t.Fatalf("open staged: %v", err)
 	}

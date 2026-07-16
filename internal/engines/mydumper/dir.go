@@ -4,7 +4,6 @@
 package mydumper
 
 import (
-	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,11 @@ import (
 	"strconv"
 	"strings"
 
+	// klauspost's gzip is a drop-in stdlib replacement measured ~1.5×
+	// faster decompressing dump-shaped chunks (BenchmarkChunkGzipDecompress;
+	// audit 2026-07-15 M3.3), and the module already depends on
+	// klauspost/compress for zstd.
+	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 
 	"sluicesync.dev/sluice/internal/engines/internal/dumpsig"

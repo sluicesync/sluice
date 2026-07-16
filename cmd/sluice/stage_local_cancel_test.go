@@ -43,7 +43,7 @@ func TestStageD1Source_CanceledCtxCleansUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	path, cleanup, err := stageD1Source(ctx, "d1://acct-id/db-id")
+	path, cleanup, err := stageD1Source(ctx, "d1://acct-id/db-id", "")
 	if err == nil {
 		if cleanup != nil {
 			cleanup()

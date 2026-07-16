@@ -68,10 +68,12 @@ What you get at the destination:
 
 - `<schema>.<table>.parquet` per table (bare `<table>.parquet` for
   flat-namespace sources like MySQL/SQLite), zstd-compressed.
-- Row groups aligned 1:1 with the backup's chunk files; each file's
-  footer metadata carries the source-chunk list with SHA-256s
-  (cross-reference `sluice backup verify`), the backup id, and the
-  source engine.
+- Row groups that never span the backup's chunk files — each chunk maps
+  to one row group, or several consecutive ones when a single chunk's
+  bytes exceed the exporter's 128 MiB row-group target (BLOB-heavy
+  rows); each file's footer metadata carries the source-chunk list with
+  SHA-256s (cross-reference `sluice backup verify`), the backup id, and
+  the source engine.
 - `parquet_index.json` — the export manifest: per-table file, row
   count, row groups, source chunks, and any type-mapping notes.
 

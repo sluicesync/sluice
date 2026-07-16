@@ -10,11 +10,16 @@
 //
 // # Stage-into-SQLite (schema-less input ONLY)
 //
-// These formats carry no types, so each Open* materializes the file into a
-// temp SQLite database — every column declared TEXT, every value carried as
-// its exact source text — and reads it through the sqlite engine's staged
-// readers (the ADR-0130 materialize shape; the temp db is owned by the
-// reader and removed on Close). The `migrate` CLI AUTO-ENGAGES
+// These formats carry no types, so the file is materialized into a temp
+// SQLite database — every column declared TEXT, every value carried as
+// its exact source text — and read through the sqlite engine's staged
+// readers (the ADR-0130 materialize shape). The staged copy is created
+// ONCE per source and shared by the schema and row readers via a
+// refcounted stage-once handle; the last reader's Close removes it
+// (audit 2026-07-15 MED-P2 — staging twice doubled both the staging
+// writes and the peak temp footprint). `--stage-dir` (SLUICE_STAGE_DIR)
+// overrides where the staged copy lives; empty keeps the os.TempDir
+// default. The `migrate` CLI AUTO-ENGAGES
 // `--infer-types` (ADR-0144) for these drivers, so name-hinted columns
 // whose every value validates are promoted to richer target types
 // (timestamp/timestamptz, jsonb, uuid); everything else lands as TEXT —
@@ -64,9 +69,10 @@
 // A migrate SOURCE only — the d1/mydumper registry posture: CDC = CDCNone,
 // BulkLoad = BulkLoadNone, every write/CDC/snapshot Open* returns a wrapped
 // [ErrNotImplemented]. `sluice verify --depth count` works (the staged
-// sqlite reader implements ir.Verifier; each open re-stages the file — the
-// re-scan cost, same as the mydumper chunk re-scan). Sample depth is
-// refused (documented limitation).
+// sqlite reader implements ir.Verifier; once every reader of a staged copy
+// has closed, a later open re-stages the file — the re-scan cost, same as
+// the mydumper chunk re-scan). Sample depth is refused (documented
+// limitation).
 package flatfile
 
 import (
@@ -116,6 +122,14 @@ func (f format) name() string {
 type Engine struct {
 	format format
 	opts   Options
+
+	// share is the stage-once handle (audit 2026-07-15 MED-P2): the
+	// schema and row readers share ONE staged copy per source path
+	// instead of staging the file twice and holding both for the run.
+	// nil (the registry's zero value) stages per open — correct, just
+	// duplicated work; [Engine.WithFlatFileOptions] (the CLI path)
+	// always installs one.
+	share *stageShare
 }
 
 // Name returns the engine's CLI identifier (`--source-driver csv|tsv|ndjson`).
@@ -139,6 +153,14 @@ type Options struct {
 	// Delimiter is the raw --csv-delimiter flag text ("" = not passed;
 	// accepts a single ASCII character, or the spellings `\t` / `tab`).
 	Delimiter string
+
+	// StageDir is where the staged temp SQLite database is created
+	// (--stage-dir / SLUICE_STAGE_DIR). Empty — the zero value — keeps
+	// the os.TempDir default; a staged copy is roughly the source file's
+	// size, which overwhelms a tmpfs /tmp on large inputs (the ADR-0145
+	// hazard class). Applies to every flat-file format, so NDJSON does
+	// not refuse it.
+	StageDir string
 }
 
 // WithFlatFileOptions returns a copy of the engine carrying the operator's
@@ -157,6 +179,7 @@ func (e Engine) WithFlatFileOptions(o Options) (ir.Engine, error) {
 			return nil, errors.New("ndjson: --csv-delimiter does not apply")
 		}
 		e.opts = o
+		e.share = &stageShare{}
 		return e, nil
 	}
 	// Validate the delimiter spelling up front (loud, before any file I/O).
@@ -175,6 +198,7 @@ func (e Engine) WithFlatFileOptions(o Options) (ir.Engine, error) {
 		}
 	}
 	e.opts = o
+	e.share = &stageShare{}
 	return e, nil
 }
 
@@ -185,28 +209,30 @@ func (e Engine) WithFlatFileOptions(o Options) (ir.Engine, error) {
 func (Engine) Capabilities() ir.Capabilities { return capabilities }
 
 // OpenSchemaReader stages the flat file into a temp SQLite database and
-// returns the sqlite engine's staged SchemaReader over it (which owns the
-// temp file, removes it on Close, and carries the ir.InferredTypeValidator
-// surface --infer-types rides). The file is validated here — signature
-// refusals (foreign dumps, wrong-driver inputs) and the explicit-flag
-// refusals all fire before anything is staged.
+// returns the sqlite engine's staged SchemaReader over it (which carries
+// the ir.InferredTypeValidator surface --infer-types rides). The staged
+// copy is SHARED with the row reader through the stage-once handle —
+// removed when the last reader closes — so a migrate stages the file once,
+// not twice (audit 2026-07-15 MED-P2). The file is validated here —
+// signature refusals (foreign dumps, wrong-driver inputs) and the
+// explicit-flag refusals all fire before anything is staged.
 func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	staged, err := e.stage(ctx, dsn)
+	staged, release, err := e.acquireStaged(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return sqlite.OpenStagedSchemaReader(ctx, staged, dsn)
+	return sqlite.OpenStagedSchemaReader(ctx, staged, dsn, release)
 }
 
-// OpenRowReader stages the flat file (independently of OpenSchemaReader —
-// each reader owns its own staged copy, the ADR-0130 dump posture) and
-// returns the sqlite engine's staged RowReader over it.
+// OpenRowReader returns the sqlite engine's staged RowReader over the
+// shared staged copy (see [Engine.OpenSchemaReader] — one staged copy per
+// source, refcounted).
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	staged, err := e.stage(ctx, dsn)
+	staged, release, err := e.acquireStaged(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return sqlite.OpenStagedRowReader(ctx, staged, dsn)
+	return sqlite.OpenStagedRowReader(ctx, staged, dsn, release)
 }
 
 // OpenSchemaWriter is not implemented: a flat file is a source only.

@@ -137,6 +137,16 @@ type Globals struct {
 	// system RAM (that would change behavior for everyone); a future
 	// --max-memory=auto could do so.
 	MaxMemory string `name:"max-memory" help:"Soft ceiling on the Go heap (e.g. '2GiB', '512MiB'), applied via runtime/debug.SetMemoryLimit at startup to bound RSS. Unlike --max-buffer-bytes (which caps only raw buffered value bytes), this bounds the whole heap, so the GC defends a real RSS target. Off by default; the GOMEMLIMIT env var is honored natively when this is unset." placeholder:"SIZE"`
+
+	// StageDir overrides where sluice's large scratch files are created:
+	// the flat-file staged SQLite copy (csv/tsv/ndjson sources — roughly
+	// the source file's size), the D1 --stage-local replica, and the
+	// export-as-parquet per-table scratch file. Those all defaulted to
+	// os.TempDir, which on hosts whose /tmp is a small tmpfs fills RAM
+	// and ENOSPCs mid-run (the ADR-0145 hazard class). Empty — the zero
+	// value — keeps the os.TempDir default. Inert for commands that
+	// stage nothing.
+	StageDir string `name:"stage-dir" env:"SLUICE_STAGE_DIR" help:"Directory for sluice's large scratch files: the csv/tsv/ndjson staged SQLite copy (~source file size), the D1 --stage-local replica, and the export-as-parquet per-table scratch. Defaults to the system temp dir — override on hosts whose /tmp is a small tmpfs. The directory must already exist (a missing path is refused loudly). Env: SLUICE_STAGE_DIR." placeholder:"DIR"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from
@@ -319,9 +329,14 @@ type MigrateCmd struct {
 // temp-dir SQLite file (Strategy A) and returns the file path plus a cleanup
 // func that removes the temp dir. The migrate then runs against the local file,
 // sidestepping D1's HTTP query CPU/pattern limits. Used by `migrate --stage-local`.
-func stageD1Source(ctx context.Context, d1DSN string) (path string, cleanup func(), err error) {
-	dir, err := os.MkdirTemp("", "sluice-d1-stage-")
+// stageDir (--stage-dir / SLUICE_STAGE_DIR) overrides where the replica lives;
+// "" is the os.TempDir default.
+func stageD1Source(ctx context.Context, d1DSN, stageDir string) (path string, cleanup func(), err error) {
+	dir, err := os.MkdirTemp(stageDir, "sluice-d1-stage-")
 	if err != nil {
+		if stageDir != "" {
+			return "", nil, fmt.Errorf("--stage-local: create staging dir under --stage-dir %q: %w", stageDir, err)
+		}
 		return "", nil, fmt.Errorf("--stage-local: create temp dir: %w", err)
 	}
 	cleanup = func() { _ = os.RemoveAll(dir) }
@@ -628,7 +643,7 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
 				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
 		}
-		staged, stageCleanup, serr := stageD1Source(ctx, m.Source)
+		staged, stageCleanup, serr := stageD1Source(ctx, m.Source, g.StageDir)
 		if serr != nil {
 			return nil, nil, cleanup, serr
 		}
@@ -839,6 +854,7 @@ func applyEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
 			HeaderDeclared: g.CSVHeader || g.CSVNoHeader,
 			Header:         g.CSVHeader,
 			Delimiter:      g.CSVDelimiter,
+			StageDir:       g.StageDir,
 		}); err != nil {
 			return nil, err
 		}

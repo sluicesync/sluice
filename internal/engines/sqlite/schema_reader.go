@@ -42,17 +42,34 @@ type SchemaReader struct {
 	// (ADR-0130). Empty when the source was a real binary `.db` — then Close
 	// removes nothing.
 	tempPath string
+
+	// tempRelease, when set, is called on Close INSTEAD of removing
+	// tempPath: the staged file is shared and refcounted by its owner
+	// (the flatfile stage-once handle — audit 2026-07-15 MED-P2), and
+	// the owner's LAST release removes it.
+	tempRelease func() error
 }
 
 // Close releases the underlying connection pool and, for a materialized `.sql`
-// dump, removes the temp DB after the pool is closed (the file handle must be
-// released first, which matters on Windows). A `.db` source removes nothing.
+// dump, removes (or, when shared, releases) the temp DB after the pool is
+// closed (the file handle must be released first, which matters on Windows).
+// A `.db` source removes nothing.
 func (r *SchemaReader) Close() error {
 	if r.db == nil {
 		return nil
 	}
 	err := r.db.Close()
-	if r.tempPath != "" {
+	switch {
+	case r.tempRelease != nil:
+		// Clear the hook first so a repeated Close is a no-op, not a
+		// double release of the shared refcount.
+		release := r.tempRelease
+		r.tempRelease = nil
+		r.tempPath = ""
+		if rerr := release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	case r.tempPath != "":
 		// Clear the path first so a repeated Close is a no-op, not a remove of
 		// an already-gone file.
 		path := r.tempPath

@@ -40,6 +40,14 @@ type RowReader struct {
 	// idempotency is handled by removeOnce instead of clearing this field.
 	tempPath string
 
+	// tempRelease, when set, is called on Close INSTEAD of removing
+	// tempPath: the staged file is shared and refcounted by its owner
+	// (the flatfile stage-once handle — audit 2026-07-15 MED-P2), and
+	// the owner's LAST release removes it. Like tempPath it is set once
+	// at construction and never mutated (the removeOnce guard supplies
+	// the exactly-once semantics).
+	tempRelease func() error
+
 	// removeOnce guards the one-time removal of tempPath so a repeated Close is
 	// a no-op without mutating tempPath (which the ETA probe reads concurrently).
 	removeOnce sync.Once
@@ -64,11 +72,16 @@ func (r *RowReader) Close() error {
 	}
 	err := r.db.Close()
 	if r.tempPath != "" {
-		// Remove the temp DB exactly once (a repeated Close is a no-op) WITHOUT
-		// mutating tempPath — the concurrent ETA probe reads tempPath, so a
-		// Close-time write to it would be a data race (caught by the -race CI
-		// gate). os.Remove of an already-gone file would error, hence the Once.
+		// Remove (or, when shared, release) the temp DB exactly once (a
+		// repeated Close is a no-op) WITHOUT mutating tempPath — the
+		// concurrent ETA probe reads tempPath, so a Close-time write to it
+		// would be a data race (caught by the -race CI gate). os.Remove of
+		// an already-gone file would error, hence the Once.
 		r.removeOnce.Do(func() {
+			if r.tempRelease != nil {
+				r.removeErr = r.tempRelease()
+				return
+			}
 			if rmErr := os.Remove(r.tempPath); rmErr != nil {
 				r.removeErr = rmErr
 			}
