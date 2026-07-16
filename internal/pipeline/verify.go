@@ -128,8 +128,8 @@ func (v *Verifier) sink() progress.Sink {
 }
 
 // VerifyResult is the structured outcome of a verify run. The renderer
-// consumes this; CLI callers also inspect HasMismatch() to set exit
-// codes.
+// consumes this; CLI callers also inspect HasMismatch() and
+// HasUnverified() to set exit codes.
 type VerifyResult struct {
 	SourceEngine string              `json:"source_engine"`
 	TargetEngine string              `json:"target_engine"`
@@ -161,8 +161,12 @@ type VerifyTableResult struct {
 	// keep reports readable; the full count is in SampleMismatch.
 	SampleMismatchPKs []string `json:"sample_mismatch_pks,omitempty"`
 	// Reason is non-empty when this table couldn't be verified
-	// (e.g. table not on target side, engine doesn't support
-	// Verifier). The Source/Target counts are 0 when Reason is set.
+	// (e.g. table not on target side, a count/sample error, engine
+	// doesn't support sampling). A Reason-carrying table renders as
+	// SKIPPED in the report and counts toward
+	// [VerifySummary.TablesUnverified] — a failure class, not a pass
+	// (Bug 190). The Source/Target counts are 0 when the failure
+	// preceded counting.
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -171,7 +175,19 @@ type VerifySummary struct {
 	TablesChecked  int `json:"tables_checked"`
 	TablesClean    int `json:"tables_clean"`
 	TablesMismatch int `json:"tables_mismatch"`
-	TablesSkipped  int `json:"tables_skipped"`
+
+	// TablesUnverified counts tables that could NOT be verified at
+	// all: missing on the target, a source/target count error, or a
+	// sample-mode error (each table's Reason names which). These are
+	// a FAILURE class, not a benign skip (Bug 190): verify is the
+	// loss detector, and a detector that could not examine a table
+	// must not report overall success — the CLI maps a non-zero
+	// TablesUnverified to a non-zero exit. Deliberate exclusions
+	// (--include-table / --exclude-table, config filters) are applied
+	// before verification starts and never land here, so they stay
+	// exit-neutral.
+	TablesUnverified int `json:"tables_unverified"`
+
 	// TablesExtraOnTarget is the count of tables present on the
 	// target but absent from the source. Reported informationally
 	// (the names land in [VerifyResult.ExtraOnTarget]); not flagged
@@ -188,11 +204,21 @@ func (r *VerifyResult) HasMismatch() bool {
 	return r.Summary.TablesMismatch > 0
 }
 
+// HasUnverified reports whether any table could not be verified at
+// all (Bug 190). The CLI maps this to a non-zero exit — an incomplete
+// verification must never pass an rc-gated check. Deliberately
+// excluded tables never reach the result (filters are applied before
+// verification), and extra-on-target tables stay informational;
+// neither trips this.
+func (r *VerifyResult) HasUnverified() bool {
+	return r.Summary.TablesUnverified > 0
+}
+
 // Run executes the verify pass. Returns the result + a possibly-nil
 // error. On operational failure (couldn't open a connection, engine
 // doesn't implement Verifier, etc.) returns (nil, error). On
-// successful execution returns a non-nil result whose HasMismatch
-// distinguishes clean from drift.
+// successful execution returns a non-nil result whose HasMismatch /
+// HasUnverified distinguish clean from drift / incomplete.
 func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	if err := v.validate(); err != nil {
 		return nil, err
@@ -294,21 +320,21 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		if !present {
 			tr.Reason = "table not present on target"
 			result.Tables = append(result.Tables, tr)
-			result.Summary.TablesSkipped++
+			result.Summary.TablesUnverified++
 			continue
 		}
 		srcCount, err := srcVerifier.ExactRowCount(ctx, srcTable)
 		if err != nil {
 			tr.Reason = fmt.Sprintf("source count error: %v", err)
 			result.Tables = append(result.Tables, tr)
-			result.Summary.TablesSkipped++
+			result.Summary.TablesUnverified++
 			continue
 		}
 		tgtCount, err := tgtVerifier.ExactRowCount(ctx, tgtTable)
 		if err != nil {
 			tr.Reason = fmt.Sprintf("target count error: %v", err)
 			result.Tables = append(result.Tables, tr)
-			result.Summary.TablesSkipped++
+			result.Summary.TablesUnverified++
 			continue
 		}
 		tr.SourceRowCount = srcCount
@@ -318,7 +344,9 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		// Sample mode: also compare row content hashes for the
 		// requested sample size. Skip on count-mode runs and on tables
 		// where the engine's SampleVerifier surface isn't usable
-		// (no PK, etc.) — those land as SKIPPED with a clear reason.
+		// (no PK, etc.) — those land as SKIPPED with a clear reason
+		// and count toward TablesUnverified: the operator asked for
+		// sample depth and this table didn't get it (Bug 190).
 		if depth == VerifyDepthSample {
 			srcSV, srcOK := srcVerifier.(ir.SampleVerifier)
 			tgtSV, tgtOK := tgtVerifier.(ir.SampleVerifier)
@@ -326,7 +354,7 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 			case !srcOK || !tgtOK:
 				tr.Reason = "sample mode not supported on this engine (no ir.SampleVerifier implementation)"
 				result.Tables = append(result.Tables, tr)
-				result.Summary.TablesSkipped++
+				result.Summary.TablesUnverified++
 				continue
 			default:
 				algo := ir.HashMD5
@@ -336,7 +364,7 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 				if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, sampleRows, sampleSeed, algo, &tr); err != nil {
 					tr.Reason = fmt.Sprintf("sample-hash error: %v", err)
 					result.Tables = append(result.Tables, tr)
-					result.Summary.TablesSkipped++
+					result.Summary.TablesUnverified++
 					continue
 				}
 			}
@@ -364,7 +392,7 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		{Label: "Checked", Value: progress.HumanCount(int64(s.TablesChecked))},
 		{Label: "Clean", Value: progress.HumanCount(int64(s.TablesClean))},
 		{Label: "Mismatched", Value: progress.HumanCount(int64(s.TablesMismatch))},
-		{Label: "Skipped", Value: progress.HumanCount(int64(s.TablesSkipped))},
+		{Label: "Unverified", Value: progress.HumanCount(int64(s.TablesUnverified))},
 	}})
 	return result, nil
 }
@@ -403,8 +431,8 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 	sb.WriteString(string(r.Depth))
 	sb.WriteString(")\n")
 	fmt.Fprintf(&sb, "-- source: %s\n-- target: %s\n", r.SourceEngine, r.TargetEngine)
-	fmt.Fprintf(&sb, "-- result: %d table(s) checked, %d clean, %d mismatched, %d skipped\n",
-		r.Summary.TablesChecked, r.Summary.TablesClean, r.Summary.TablesMismatch, r.Summary.TablesSkipped)
+	fmt.Fprintf(&sb, "-- result: %d table(s) checked, %d clean, %d mismatched, %d could not be verified\n",
+		r.Summary.TablesChecked, r.Summary.TablesClean, r.Summary.TablesMismatch, r.Summary.TablesUnverified)
 	sb.WriteString("\n")
 
 	for _, t := range r.Tables {
@@ -436,6 +464,10 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 			fmt.Fprintf(&sb, "   %s\n", n)
 		}
 		sb.WriteString("-- run `sluice schema diff` if you need to reconcile structural drift.\n")
+	}
+	if r.Summary.TablesUnverified > 0 {
+		fmt.Fprintf(&sb, "\n-- %d table(s) could not be verified (SKIPPED above) — an unverified table is not a pass; non-zero exit code follows. Deliberately-unmigrated tables can be excluded with --exclude-table.\n",
+			r.Summary.TablesUnverified)
 	}
 	if r.Summary.TablesMismatch > 0 && r.Depth == VerifyDepthCount {
 		sb.WriteString("\n-- non-zero exit code follows; re-run with --depth=sample to compare row content for drift root-cause.\n")

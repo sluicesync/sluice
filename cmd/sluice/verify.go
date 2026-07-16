@@ -21,10 +21,15 @@ import (
 // follow per the proto-ADR (docs/dev/design/sluice-verify.md).
 //
 // Exit codes mirror `schema diff`:
-//   - 0 on clean (every table's source count == target count).
+//   - 0 on clean (every table verified, every count/sample matches).
 //   - 1 on mismatch (at least one table differs).
 //   - 2 on operational error (couldn't connect, engine unsupported,
-//     etc.).
+//     etc.) — including a run that completed but could not verify one
+//     or more tables (a per-table count/sample error, or a source
+//     table missing on the target): an unverified table is not a pass
+//     (Bug 190). Tables deliberately excluded via --exclude-table /
+//     --include-table or config filters are never verified and stay
+//     exit-neutral.
 type VerifyCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
@@ -132,8 +137,32 @@ func (v *VerifyCmd) Run(g *Globals) error {
 	if runErr != nil {
 		return operationalError{err: runErr}
 	}
-	if result != nil && result.HasMismatch() {
-		return driftError{summary: fmt.Sprintf("%d table(s) with row-count mismatch", result.Summary.TablesMismatch)}
+	return verifyExitError(result)
+}
+
+// verifyExitError maps a completed verify run to the command's exit
+// contract. Mismatches keep their long-documented exit 1; a run with
+// tables that could not be verified at all exits 2 (Bug 190) — verify
+// is the loss DETECTOR, and a detector that could not examine a table
+// must not report overall success, so the per-table error skips that
+// previously rode exit 0 now land in verify's documented "the check
+// could not (fully) run" class. When both classes are present the
+// mismatch exit wins (drift is confirmed either way) and the message
+// names the unverified count alongside it.
+func verifyExitError(result *pipeline.VerifyResult) error {
+	if result == nil {
+		return nil
+	}
+	s := result.Summary
+	switch {
+	case s.TablesMismatch > 0:
+		summary := fmt.Sprintf("%d table(s) with row-count mismatch", s.TablesMismatch)
+		if s.TablesUnverified > 0 {
+			summary += fmt.Sprintf("; %d table(s) could not be verified", s.TablesUnverified)
+		}
+		return driftError{summary: summary}
+	case s.TablesUnverified > 0:
+		return operationalError{err: fmt.Errorf("verify incomplete: %d table(s) could not be verified (see the SKIPPED rows in the report) — an unverified table is not a pass", s.TablesUnverified)}
 	}
 	return nil
 }

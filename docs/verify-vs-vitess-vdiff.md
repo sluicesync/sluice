@@ -126,7 +126,7 @@ divergence to a small chunk for forensic drill-in.
 | **Engine support** | Vitess-only (MySQL behind Vitess) | MySQL + Postgres + PlanetScale-MySQL + PlanetScale-PG |
 | **Workflow integration** | Built into `MoveTables` cutover | Standalone CLI; cron-friendly exit codes |
 | **Output** | Streamed report, often via `vtctldclient` | text / JSON; structured exit codes 0/1/2 |
-| **Tables without PK** | Heavy (full scan + filesort) | count: works fine • sample: SKIPPED with reason |
+| **Tables without PK** | Heavy (full scan + filesort) | count: works fine • sample: SKIPPED with reason (fails the run — an unverified table is not a pass; `--exclude-table` it to accept) |
 
 ## When to reach for which
 

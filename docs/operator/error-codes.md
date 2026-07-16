@@ -69,7 +69,7 @@ sluice historically exited 0 on success and 1 on everything else. The taxonomy b
 |---|---|
 | 0 | Success. For `verify`, `diff`, and `sync-health`: success and clean. |
 | 1 | Generic runtime failure. For `verify`/`diff`/`sync-health` this is those commands' long-standing per-command meaning: the check ran and found a mismatch / drift / stale stream. |
-| 2 | Config error: the `--config` file could not be loaded or parsed. (The read-side commands `verify`/`diff`/`sync-health`/`metrics-watch` have always used 2 more broadly for "the check could not run at all" — that per-command contract is unchanged.) |
+| 2 | Config error: the `--config` file could not be loaded or parsed. (The read-side commands `verify`/`diff`/`sync-health`/`metrics-watch` have always used 2 more broadly for "the check could not run at all" — that per-command contract is unchanged. For `verify` this includes a run that completed but could not verify one or more tables — a per-table count/sample error, or a source table missing on the target: an unverified table is not a pass, so those runs exit 2 rather than a misleading 0. Tables deliberately excluded via `--include-table`/`--exclude-table` or config filters stay exit-neutral.) |
 | 3 | Named refusal: sluice declined to proceed (or to silently alter a value) and named the remedy — the refusal-class codes in the table above. Retrying without acting on the hint will fail identically. |
 | 80 | Usage error: kong (the CLI parser) exits 80 on unknown flags/commands and missing required arguments before any sluice code runs. sluice adopts this rather than remapping it. |
 

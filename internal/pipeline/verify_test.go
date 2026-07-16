@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // verifyStubEngine is a minimal Engine for verify-orchestrator unit
@@ -133,6 +134,32 @@ func (r *verifyStubReaderNoVerifier) ReadSchema(_ context.Context) (*ir.Schema, 
 	return r.schema, nil
 }
 
+// verifyStubReaderNoSampler implements ir.Verifier but NOT
+// ir.SampleVerifier, for the "engine can count but cannot sample"
+// skip path at --depth=sample.
+type verifyStubReaderNoSampler struct {
+	schema *ir.Schema
+	counts map[string]int64
+}
+
+func (r *verifyStubReaderNoSampler) ReadSchema(_ context.Context) (*ir.Schema, error) {
+	return r.schema, nil
+}
+
+func (r *verifyStubReaderNoSampler) ExactRowCount(_ context.Context, table *ir.Table) (int64, error) {
+	return r.counts[table.Name], nil
+}
+
+// verifyStubEngineNoSampler wraps verifyStubReaderNoSampler in an
+// Engine; only the schema-reader surface is exercised by verify.
+type verifyStubEngineNoSampler struct {
+	verifyStubEngine
+}
+
+func (e *verifyStubEngineNoSampler) OpenSchemaReader(_ context.Context, _ string) (ir.SchemaReader, error) {
+	return &verifyStubReaderNoSampler{schema: e.schema, counts: e.counts}, nil
+}
+
 func verifySchema(tableNames ...string) *ir.Schema {
 	tables := make([]*ir.Table, len(tableNames))
 	for i, n := range tableNames {
@@ -160,6 +187,9 @@ func TestVerifier_Run_AllClean(t *testing.T) {
 	if r.HasMismatch() {
 		t.Errorf("expected no mismatch; got summary %+v", r.Summary)
 	}
+	if r.HasUnverified() {
+		t.Errorf("clean pass must not report unverified tables; got %+v", r.Summary)
+	}
 	if r.Summary.TablesChecked != 2 || r.Summary.TablesClean != 2 {
 		t.Errorf("expected 2 checked / 2 clean; got %+v", r.Summary)
 	}
@@ -183,6 +213,9 @@ func TestVerifier_Run_Mismatch(t *testing.T) {
 	if !r.HasMismatch() {
 		t.Errorf("expected mismatch; got %+v", r.Summary)
 	}
+	if r.HasUnverified() {
+		t.Errorf("a counted mismatch is verified, not unverified; got %+v", r.Summary)
+	}
 	if r.Tables[0].SourceRowCount != 100 || r.Tables[0].TargetRowCount != 95 {
 		t.Errorf("expected 100/95; got %+v", r.Tables[0])
 	}
@@ -192,6 +225,10 @@ func TestVerifier_Run_Mismatch(t *testing.T) {
 	}
 }
 
+// TestVerifier_Run_TableMissingOnTarget: a source table absent from
+// the target renders as SKIPPED (not a count mismatch) but counts as
+// UNVERIFIED — none of its rows were examined, so the run must not
+// pass (Bug 190).
 func TestVerifier_Run_TableMissingOnTarget(t *testing.T) {
 	src := &verifyStubEngine{name: "postgres", schema: verifySchema("users", "orphan_table"), counts: map[string]int64{"users": 10, "orphan_table": 5}}
 	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 10}}
@@ -203,11 +240,14 @@ func TestVerifier_Run_TableMissingOnTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if r.Summary.TablesSkipped != 1 {
-		t.Errorf("expected 1 skipped; got %+v", r.Summary)
+	if r.Summary.TablesUnverified != 1 {
+		t.Errorf("expected 1 unverified; got %+v", r.Summary)
+	}
+	if !r.HasUnverified() {
+		t.Errorf("missing-on-target must flag the run unverified; got %+v", r.Summary)
 	}
 	if r.HasMismatch() {
-		t.Errorf("missing-on-target should be SKIPPED, not mismatch")
+		t.Errorf("missing-on-target should be SKIPPED/unverified, not mismatch")
 	}
 }
 
@@ -245,22 +285,136 @@ func TestVerifier_Run_JSONOutput(t *testing.T) {
 	}
 }
 
-func TestVerifier_Run_PerTableCountErrorTreatedAsSkipped(t *testing.T) {
+// TestVerifier_Run_PerTableCountErrorFailsAsUnverified pins the Bug
+// 190 fix at the orchestrator: a table whose row count errors — on
+// EITHER side — keeps its informative SKIPPED row but counts as
+// UNVERIFIED, the summary names it, and the report announces the
+// non-zero exit. Before the fix, only count MISMATCHES drove a
+// non-zero exit, so an rc-gated verify passed while a table was never
+// verified (the v0.99.257 mydumper fragment refusal surfaced exactly
+// this way).
+func TestVerifier_Run_PerTableCountErrorFailsAsUnverified(t *testing.T) {
+	for _, side := range []string{"source", "target"} {
+		t.Run(side+" count error", func(t *testing.T) {
+			src := &verifyStubEngine{name: "postgres", schema: verifySchema("users", "orders"), counts: map[string]int64{"users": 5, "orders": 7}}
+			tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users", "orders"), counts: map[string]int64{"users": 5, "orders": 7}}
+			erring := src
+			if side == "target" {
+				erring = tgt
+			}
+			erring.countErr = map[string]error{"users": errors.New("simulated count failure")}
+
+			var buf bytes.Buffer
+			v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Out: &buf}
+			r, err := v.Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if r.Summary.TablesUnverified != 1 || r.Summary.TablesClean != 1 {
+				t.Errorf("expected 1 unverified / 1 clean; got %+v", r.Summary)
+			}
+			if !r.HasUnverified() {
+				t.Errorf("count error must flag the run unverified; got %+v", r.Summary)
+			}
+			if r.HasMismatch() {
+				t.Errorf("count error is unverified, not mismatch; got %+v", r.Summary)
+			}
+			out := buf.String()
+			for _, want := range []string{
+				"1 could not be verified",
+				"SKIPPED (" + side + " count error: simulated count failure)",
+				"an unverified table is not a pass; non-zero exit code follows",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("expected %q in text output; got:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+// TestVerifier_Run_SampleErrorFailsAsUnverified pins the same class
+// at sample depth: the swallow was shared by every depth's skip path,
+// so the fix must cover the sample-hash error skip too (fix the
+// class, not the instance).
+func TestVerifier_Run_SampleErrorFailsAsUnverified(t *testing.T) {
+	hashes := []ir.SampledRowHash{{PrimaryKey: "1", Hash: "h"}}
 	src := &verifyStubEngine{
 		name: "postgres", schema: verifySchema("users"),
-		counts:   map[string]int64{"users": 5},
-		countErr: map[string]error{"users": errors.New("simulated count failure")},
+		counts:    map[string]int64{"users": 1},
+		sampleErr: map[string]error{"users": errors.New("no usable primary key")},
 	}
-	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 5}}
+	tgt := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts:       map[string]int64{"users": 1},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": hashes},
+	}
 
 	var buf bytes.Buffer
-	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Out: &buf}
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
 	r, err := v.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if r.Summary.TablesSkipped != 1 {
-		t.Errorf("expected count error → 1 skipped; got %+v", r.Summary)
+	if !r.HasUnverified() || r.Summary.TablesUnverified != 1 {
+		t.Errorf("sample-hash error must flag the run unverified; got %+v", r.Summary)
+	}
+	if !strings.Contains(buf.String(), "SKIPPED (sample-hash error: source-side: no usable primary key)") {
+		t.Errorf("expected the sample-hash SKIPPED reason; got:\n%s", buf.String())
+	}
+}
+
+// TestVerifier_Run_SampleUnsupportedFailsAsUnverified pins the last
+// depth-specific skip path: an engine that can count but not sample
+// leaves every table SKIPPED at --depth=sample, and that too must
+// flag the run unverified — the operator asked for sample-depth
+// confidence and did not get it.
+func TestVerifier_Run_SampleUnsupportedFailsAsUnverified(t *testing.T) {
+	src := &verifyStubEngineNoSampler{verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}}
+	tgt := &verifyStubEngineNoSampler{verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.HasUnverified() || r.Summary.TablesUnverified != 1 {
+		t.Errorf("sample-unsupported must flag the run unverified; got %+v", r.Summary)
+	}
+	if !strings.Contains(buf.String(), "sample mode not supported") {
+		t.Errorf("expected the sample-unsupported SKIPPED reason; got:\n%s", buf.String())
+	}
+}
+
+// TestVerifier_Run_ExcludedTableStaysExitNeutral pins the deliberate-
+// exclusion distinction: a table removed by --exclude-table (or config
+// filters) is a chosen omission, never lands in the report, and must
+// NOT flag the run unverified — refused/errored ⇒ fail,
+// deliberately-excluded ⇒ pass.
+func TestVerifier_Run_ExcludedTableStaysExitNeutral(t *testing.T) {
+	src := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users", "legacy_junk"),
+		counts:   map[string]int64{"users": 5},
+		countErr: map[string]error{"legacy_junk": errors.New("would fail if verified")},
+	}
+	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 5}}
+
+	filter, err := migcore.NewTableFilter(nil, []string{"legacy_junk"})
+	if err != nil {
+		t.Fatalf("NewTableFilter: %v", err)
+	}
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Filter: filter, Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.HasUnverified() || r.HasMismatch() {
+		t.Errorf("excluded table must stay exit-neutral; got %+v", r.Summary)
+	}
+	if r.Summary.TablesChecked != 1 || r.Summary.TablesClean != 1 {
+		t.Errorf("expected 1 checked / 1 clean; got %+v", r.Summary)
 	}
 }
 
