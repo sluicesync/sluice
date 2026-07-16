@@ -87,6 +87,15 @@ For array/collection-element work specifically, the pin matrix is **each element
 
 **Why this exists (the cost):** v0.69.3's array fix used `pgtype.Array[*string]`; it was pinned green for `int[][]`/`text[][]` and passed independent review — but `numeric[][]` (identical sluice code path, *different pgx target-OID codec*) **silently flattened** to 1-D. That was Bug 74, a CRITICAL silent-loss regression, missed by both the per-representative pin and the reviewer, caught only by the post-release battle-test — costing an extra release and a public correction banner. **Reviewer corollary:** when reviewing a family-dispatched change, re-derive the family matrix yourself and verify the pin covers it; "the integration test is green" is insufficient if the test exercises one family of a family-dispatched path. This is the test-coverage counterpart to the three-phase protocol's "fix the class, not the instance."
 
+### New-surface pre-land checklist (the audit-2026-07-15 lesson)
+
+The Bug 74 discipline above was applied rigorously to *value* codecs and still missed two CRITICALs, because the new surfaces had serialization boundaries that weren't recognized as codecs. Before landing any new surface, walk this list:
+
+- **Anything that round-trips through a store is a codec.** Resume/cursor state, positions, manifests, progress rows — if it's persisted and read back, it gets the full family-matrix treatment (every value family × shape the surface can carry, round-trip byte/value-exact or refuse loudly). The resume-cursor CRITICAL shipped because `encoding/json` silently replaces invalid UTF-8 with U+FFFD and silently routes int64 > 2⁵³ through float64 — both invisible to tests that only pinned INT cursors.
+- **No skip-branch without proof.** A lexer/parser branch that skips content must prove the content is skippable; non-empty-but-unrecognized input refuses loudly. The mydumper CRITICAL was a `case "":` that assumed "keyword didn't lex" meant "comment" — a BOM or severed fragment silently vanished.
+- **Every new file format gets an independent reader in a test.** Writer-verifying-writer passes symmetric bugs; at least one pin must read the output with a reader that is not the writer's own library (DuckDB/pyarrow for parquet, the real target DB for dumps).
+- **Verification paths must not ride the reader under test.** `verify --depth count` shared the mydumper copy path, so it confirmed the loss instead of catching it. If verify and copy share a code path, that shared path is a single point of silent failure — note it and add one check that doesn't.
+
 ## Where to read more
 
 - `docs/architecture.md` — IR, engine pattern, orchestrator, planned roadmap

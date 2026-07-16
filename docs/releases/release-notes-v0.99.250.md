@@ -1,5 +1,7 @@
 # sluice v0.99.250
 
+> **Correction (2026-07-15):** the Compatibility line "refused loudly on any non-flat-file source, so they cannot silently mis-apply" was wrong at release: in v0.99.250 and v0.99.251 the four `--csv-*` flags were silently IGNORED on non-flat-file sources (Bug 189) — a `migrate --source-driver mysql --csv-null=NULL …` ran as if the flags weren't there, exit 0. The promised refusal shipped in v0.99.252. No data was affected (the flags never mis-applied; they simply didn't apply), but the contract stated here did not hold on this version.
+
 **New: CSV, TSV, and NDJSON files are now migrate sources — `--source-driver csv|tsv|ndjson` (ADR-0163, roadmap item 55 Phases 2+3).** With Phase 1's mydumper engine (v0.99.247), the flat-file arc's main line is complete: dump directories, spreadsheets, and log pipelines all migrate through the standard pipeline, and the formats sluice deliberately does not parse (plain mysqldump/pg_dump `.sql`, `pg_dump -Fc`) now refuse with a copy-pasteable scratch-server recipe instead of a confusing mid-parse error. Purely additive drop-in: three new source drivers, four new `--csv-*` flags inert everywhere else, four new refusal codes, no change to any existing invocation. One fix in this release does reach published versions: the SQLite/D1 ISO temporal validator/decoder alignment (loud wrong-refusal on live `sqlite`/`d1` `--infer-types` runs, v0.99.166–v0.99.249 — details in Fixed; nothing to re-verify, the class was always a loud abort).
 
 ## Added

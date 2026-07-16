@@ -1,5 +1,7 @@
 # sluice v0.99.228
 
+> **Correction (2026-07-15):** the headline's "closing the last unsigned silent-loss vector signing-independently" was inaccurate. `ComputeBackupID` is a keyless hash, so an adversary flipping the flag coherently recomputes the ID — the claim overstated what an ID-recompute can guarantee without a signature. The genuinely signing-independent closures shipped afterwards: v0.99.229 re-derives commit-after-rows semantics from the source engine's own registered capability, and v0.99.231 removed the anchor-trust acceptance branch for all engines. Unsigned chains on v0.99.228 alone did not have this vector closed; signed chains (`--require-signature`) were always safe.
+
 **Two backup-integrity hardenings from the security-audit carried tail: the manifest identity now covers the VStream position-semantics flag (closing the last unsigned silent-loss vector signing-independently), and `--strict-float` refuses a FLOAT re-read that silently patched nothing.**
 
 ## Fixed
