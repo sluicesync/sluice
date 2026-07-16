@@ -143,21 +143,21 @@ func (x *BackfillExecutor) scanPKRow(ctx context.Context, query string, args []a
 
 // normalizeBackfillCursorValue converts a raw driver-scanned PK value
 // into a form that (a) re-binds into the row-comparison predicates and
-// (b) survives the resume store's JSON round-trip. []byte would
-// JSON-encode as base64 and re-bind as garbage (a silently misplaced
-// cursor — the worst failure class), so it becomes its string form;
-// time.Time becomes Postgres's native literal form with the offset
-// preserved — a timestamptz PK re-binds via the offset, a plain
-// timestamp cast simply drops it, so both compare correctly.
+// (b) survives the resume store's JSON round-trip. []byte passes
+// through RAW: the store's cursor envelope (ir.TableProgress,
+// {"_t":"bytes"}) round-trips it byte-exact, and pgx binds []byte as
+// bytea — exactly what a bytea PK comparison needs. (The pre-envelope
+// string(t) conversion here fed invalid-UTF-8 PK bytes to
+// encoding/json, which replaced them with U+FFFD — a silently
+// misplaced cursor; audit 2026-07-15 CRITICAL-2.) time.Time becomes
+// Postgres's native literal form with the offset preserved — a
+// timestamptz PK re-binds via the offset, a plain timestamp cast
+// simply drops it, so both compare correctly.
 func normalizeBackfillCursorValue(v any) any {
-	switch t := v.(type) {
-	case []byte:
-		return string(t)
-	case time.Time:
+	if t, ok := v.(time.Time); ok {
 		return t.Format("2006-01-02 15:04:05.999999999-07:00")
-	default:
-		return v
 	}
+	return v
 }
 
 // ExecBackfillChunk implements [ir.BackfillExecutor]: one bounded

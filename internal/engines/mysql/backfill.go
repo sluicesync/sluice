@@ -143,21 +143,21 @@ func (x *BackfillExecutor) scanPKRow(ctx context.Context, query string, args []a
 
 // normalizeBackfillCursorValue converts a raw driver-scanned PK value
 // into a form that (a) re-binds into the row-comparison predicates and
-// (b) survives the resume store's JSON round-trip. []byte would
-// JSON-encode as base64 and re-bind as garbage (a silently misplaced
-// cursor — the worst failure class), so it becomes its string form;
-// time.Time would JSON-encode as RFC 3339, whose `T`/`Z` MySQL does
-// not reliably parse in comparisons, so it becomes MySQL's native
-// literal form up front.
+// (b) survives the resume store's JSON round-trip. []byte passes
+// through RAW: the store's cursor envelope (ir.TableProgress,
+// {"_t":"bytes"}) round-trips it byte-exact, and the driver binds
+// []byte and string identically in the predicates. (The pre-envelope
+// string(t) conversion here fed invalid-UTF-8 PK bytes to
+// encoding/json, which replaced them with U+FFFD — a silently
+// misplaced cursor on BINARY/VARBINARY/BLOB keys; audit 2026-07-15
+// CRITICAL-2.) time.Time would JSON-envelope fine, but MySQL does not
+// reliably parse RFC 3339's `T`/`Z` in comparisons, so it becomes
+// MySQL's native literal form up front.
 func normalizeBackfillCursorValue(v any) any {
-	switch t := v.(type) {
-	case []byte:
-		return string(t)
-	case time.Time:
+	if t, ok := v.(time.Time); ok {
 		return t.Format("2006-01-02 15:04:05.999999")
-	default:
-		return v
 	}
+	return v
 }
 
 // ExecBackfillChunk implements [ir.BackfillExecutor]: one bounded

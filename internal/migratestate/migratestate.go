@@ -537,8 +537,10 @@ func sortedTableNames(m map[string]ir.TableProgress) []string {
 // encodeProgressEntry serialises one table's progress entry. The
 // per-entry wire shape is owned by [ir.TableProgress.MarshalJSON]
 // (bare string for terminal states, object form for cursor-bearing
-// ones) — identical bytes to the values inside the legacy blob, so
-// the upgrade is a pure re-keying, not a re-encoding.
+// ones). Since the cursor-value envelope landed, a legacy blob's bare
+// numeric cursors re-encode as envelopes during the upgrade — a
+// value-exact re-encoding (the legacy decode parses integers
+// exact-int64-first), no longer byte-identical re-keying.
 func encodeProgressEntry(p ir.TableProgress) (string, error) {
 	b, err := json.Marshal(p)
 	if err != nil {

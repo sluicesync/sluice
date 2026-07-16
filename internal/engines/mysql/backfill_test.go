@@ -10,6 +10,7 @@
 package mysql
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -107,13 +108,18 @@ func TestBackfillBoundarySelect_MySQL(t *testing.T) {
 	}
 }
 
-// TestBackfillCursorNormalization_MySQL pins the JSON-round-trip
-// safety net: []byte would encode as base64 and re-bind as garbage (a
-// silently misplaced cursor), and time.Time's RFC 3339 form is not a
-// reliable MySQL comparison literal — both must be normalized at scan.
+// TestBackfillCursorNormalization_MySQL pins the cursor-scan contract:
+// []byte passes through RAW — the store's cursor envelope round-trips
+// it byte-exact, and stringifying it here is exactly what let
+// encoding/json replace invalid-UTF-8 PK bytes with U+FFFD (audit
+// 2026-07-15 CRITICAL-2). time.Time's RFC 3339 form is not a reliable
+// MySQL comparison literal, so it still normalizes to the native
+// literal form at scan.
 func TestBackfillCursorNormalization_MySQL(t *testing.T) {
-	if got := normalizeBackfillCursorValue([]byte("abc")); got != "abc" {
-		t.Errorf("[]byte → %v (%T); want string \"abc\"", got, got)
+	raw := []byte{0x9F, 0x80, 0x41, 0xFE, 0x10} // invalid UTF-8 — the observed mangled cursor
+	got := normalizeBackfillCursorValue(raw)
+	if b, ok := got.([]byte); !ok || !bytes.Equal(b, raw) {
+		t.Errorf("[]byte → %v (%T); want raw []byte passthrough", got, got)
 	}
 	ts := time.Date(2026, 7, 14, 10, 30, 0, 123456000, time.UTC)
 	if got := normalizeBackfillCursorValue(ts); got != "2026-07-14 10:30:00.123456" {

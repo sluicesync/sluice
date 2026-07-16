@@ -315,11 +315,11 @@ func TestWrite_LegacyRowUpgradesOnFirstWrite(t *testing.T) {
 		"BEGIN",
 		"DELETE_PROGRESS | m1",
 		`UPSERT_PROGRESS | m1,events,"no_pk_truncate_and_redo"`,
-		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[7],"rows_copied":7}`,
+		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[{"_t":"i64","v":7}],"rows_copied":7}`,
 		`UPSERT_PROGRESS | m1,users,"complete"`,
 		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
 		"COMMIT",
-		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[9],"rows_copied":9}`,
+		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[{"_t":"i64","v":9}],"rows_copied":9}`,
 		`UPSERT_PROGRESS | m1,users,"complete"`,
 	}
 	assertSeen(t, *seen, want)
@@ -512,7 +512,7 @@ func TestWrite_FullSnapshotIsSortedTx(t *testing.T) {
 		"BEGIN",
 		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>",
 		`UPSERT_PROGRESS | m1,a_users,"complete"`,
-		`UPSERT_PROGRESS | m1,b_orders,{"state":"in_progress","last_pk":[9],"rows_copied":9}`,
+		`UPSERT_PROGRESS | m1,b_orders,{"state":"in_progress","last_pk":[{"_t":"i64","v":9}],"rows_copied":9}`,
 		"COMMIT",
 	}
 	assertSeen(t, *seen, want)
@@ -529,7 +529,7 @@ func TestWriteTableProgress_SingleRowUpsert(t *testing.T) {
 		t.Fatalf("WriteTableProgress: %v", err)
 	}
 	want := []string{
-		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[5000],"rows_copied":5000}`,
+		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[{"_t":"i64","v":5000}],"rows_copied":5000}`,
 	}
 	assertSeen(t, *seen, want)
 }

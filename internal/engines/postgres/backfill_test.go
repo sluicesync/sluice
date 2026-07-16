@@ -9,6 +9,7 @@
 package postgres
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -108,13 +109,17 @@ func TestBackfillBoundarySelect_PG(t *testing.T) {
 	}
 }
 
-// TestBackfillCursorNormalization_PG pins the JSON-round-trip safety
-// net: []byte becomes its string form ([]byte would encode as base64
-// and re-bind as garbage — a silently misplaced cursor), time.Time
-// becomes the PG literal form with the offset preserved.
+// TestBackfillCursorNormalization_PG pins the cursor-scan contract:
+// []byte passes through RAW — the store's cursor envelope round-trips
+// it byte-exact and pgx binds it as bytea; stringifying it here is
+// exactly what let encoding/json replace invalid-UTF-8 PK bytes with
+// U+FFFD (audit 2026-07-15 CRITICAL-2). time.Time still becomes the
+// PG literal form with the offset preserved.
 func TestBackfillCursorNormalization_PG(t *testing.T) {
-	if got := normalizeBackfillCursorValue([]byte("abc")); got != "abc" {
-		t.Errorf("[]byte → %v (%T); want string \"abc\"", got, got)
+	raw := []byte{0x9F, 0x80, 0x41, 0xFE, 0x10} // invalid UTF-8 — the observed mangled cursor
+	got := normalizeBackfillCursorValue(raw)
+	if b, ok := got.([]byte); !ok || !bytes.Equal(b, raw) {
+		t.Errorf("[]byte → %v (%T); want raw []byte passthrough", got, got)
 	}
 	ts := time.Date(2026, 7, 14, 10, 30, 0, 123456000, time.UTC)
 	if got := normalizeBackfillCursorValue(ts); got != "2026-07-14 10:30:00.123456+00:00" {

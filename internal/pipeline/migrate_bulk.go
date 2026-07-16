@@ -74,6 +74,28 @@ func bulkCopyOneTable(
 	stateMu.Lock()
 	action := classifyTableForResume(*state, table.Name, resuming)
 	stateMu.Unlock()
+	// Legacy-cursor quarantine (audit 2026-07-15 CRITICAL-2 / HIGH-1):
+	// a resume cursor persisted by a pre-envelope release may be
+	// irrecoverably mangled — []byte cursors rode plain JSON (base64 /
+	// U+FFFD replacement) and >2^53 integers drifted through float64 —
+	// and a copy resumed from a lie silently skips or replays PK
+	// ranges. When the entry shows those fingerprints, degrade to
+	// truncate-and-redo: always correct, merely slower (the same
+	// disposition as a cursor-less v0.3.0 row).
+	if action == resumeActionResumeFromCursor || action == resumeActionResumeChunked {
+		stateMu.Lock()
+		entry := state.TableProgress[table.Name]
+		stateMu.Unlock()
+		if reason := suspectResumeEntry(table, entry); reason != "" {
+			slog.WarnContext(ctx, "migration: persisted resume cursor is not trustworthy; truncating and re-copying the table",
+				slog.String("table", table.Name),
+				slog.String("reason", reason))
+			stateMu.Lock()
+			state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressInProgress}
+			stateMu.Unlock()
+			action = resumeActionTruncate
+		}
+	}
 	switch action {
 	case resumeActionSkip:
 		slog.InfoContext(ctx, "migration: skipping completed table",
@@ -148,6 +170,26 @@ func bulkCopyOneTable(
 	// classified source-read drop on this table trips it (sibling lanes
 	// quiesce) and each (re)attempt Awaits an in-effect pause. nil-safe.
 	return copyTableWithSourceReadRetry(ctx, table.Name, strategy, rows, resuming, attempt, freshReader, truncate, parallel.growGate)
+}
+
+// suspectResumeEntry reports why a persisted resume entry's cursor
+// data is untrustworthy, or "" when it is clean. Covers the
+// single-chunk LastPK and every per-chunk bound/cursor slice; the
+// per-value fingerprints live in [migcore.SuspectLegacyMigrateCursor]
+// (chunk bounds are PK-tuple prefixes, so the same column alignment
+// applies).
+func suspectResumeEntry(table *ir.Table, entry ir.TableProgress) string {
+	if reason := migcore.SuspectLegacyMigrateCursor(table, entry.LastPK); reason != "" {
+		return reason
+	}
+	for _, ch := range entry.Chunks {
+		for _, cur := range [][]any{ch.LowerPK, ch.UpperPK, ch.LastPK} {
+			if reason := migcore.SuspectLegacyMigrateCursor(table, cur); reason != "" {
+				return fmt.Sprintf("chunk %d: %s", ch.ChunkIndex, reason)
+			}
+		}
+	}
+	return ""
 }
 
 // willKeysetChunk reports whether table will take the keyset/integer-PK

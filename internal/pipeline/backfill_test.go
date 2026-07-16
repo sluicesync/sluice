@@ -12,6 +12,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -519,6 +520,95 @@ func TestBackfill_ResumeUsesStoredCursor(t *testing.T) {
 		t.Errorf("first after = %v; want [10] (the persisted cursor)", ex.aftersSeen)
 	}
 	// Total carries the previously-recorded rows plus this run's.
+	if res.RowsUpdated != 20 {
+		t.Errorf("RowsUpdated = %d; want 20 (10 previous + 10 now)", res.RowsUpdated)
+	}
+}
+
+// TestBackfill_RefusesSuspectLegacyCursor pins the CRITICAL-2/HIGH-1
+// trust gate: a persisted cursor bearing a pre-envelope mangling
+// fingerprint (U+FFFD-replaced binary bytes, float64-drifted large
+// integer) must be the coded SLUICE-E-BACKFILL-CORRUPT-CURSOR refusal
+// with the --restart hint, before any UPDATE runs — and --restart must
+// clear it and walk clean.
+func TestBackfill_RefusesSuspectLegacyCursor(t *testing.T) {
+	cases := []struct {
+		name   string
+		cursor []any
+	}{
+		{"float64-drifted integer", []any{float64(1.75e18)}},
+		{"U+FFFD-mangled string", []any{"��A�\x10"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ex := &backfillFakeExecutor{rows: backfillFakeRows(20)}
+			store := newBackfillFakeStore()
+			eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+			b := newTestBackfiller(eng)
+			id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+			store.headers[id] = ir.MigrationState{MigrationID: id, Phase: backfillPhaseRunning}
+			store.progress[id] = map[string]ir.TableProgress{
+				"items": {State: ir.TableProgressInProgress, LastPK: tc.cursor, RowsCopied: 10},
+			}
+
+			_, err := b.Run(context.Background())
+			wantBackfillCode(t, err, sluicecode.CodeBackfillCorruptCursor)
+			var coded *sluicecode.CodedError
+			if !errors.As(err, &coded) || !strings.Contains(coded.Hint, "--restart") {
+				t.Errorf("hint %q missing --restart", coded.Hint)
+			}
+			if ex.execCalls != 0 {
+				t.Errorf("refusal ran %d chunk UPDATEs; must run none", ex.execCalls)
+			}
+
+			// --restart clears the poisoned state and walks clean.
+			b2 := newTestBackfiller(eng)
+			b2.Restart = true
+			res, err := b2.Run(context.Background())
+			if err != nil {
+				t.Fatalf("--restart run: %v", err)
+			}
+			if res.RowsUpdated != 20 {
+				t.Errorf("--restart RowsUpdated = %d; want 20", res.RowsUpdated)
+			}
+		})
+	}
+}
+
+// TestBackfill_LegacyPlainIntCursorStillResumes pins the compat
+// contract for live control tables: a pre-envelope plain-integer
+// cursor (decoded exact via the int64-first legacy parse) resumes
+// normally, no refusal.
+func TestBackfill_LegacyPlainIntCursorStillResumes(t *testing.T) {
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(20)}
+	for i := 0; i < 10; i++ {
+		v := ex.rows[i].old + 1
+		ex.rows[i].new = &v
+	}
+	store := newBackfillFakeStore()
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+	b := newTestBackfiller(eng)
+	b.BatchSize = 10
+	id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+	// Decode the legacy wire form for real: the store's own decoder is
+	// what must turn the bare 10 into an exact int64.
+	var legacy ir.TableProgress
+	if err := json.Unmarshal([]byte(`{"state":"in_progress","last_pk":[10],"rows_copied":10}`), &legacy); err != nil {
+		t.Fatalf("decode legacy entry: %v", err)
+	}
+	store.headers[id] = ir.MigrationState{MigrationID: id, Phase: backfillPhaseRunning}
+	store.progress[id] = map[string]ir.TableProgress{"items": legacy}
+
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Resumed {
+		t.Error("Resumed = false; want true")
+	}
+	if len(ex.aftersSeen) == 0 || len(ex.aftersSeen[0]) != 1 || ex.aftersSeen[0][0].(int64) != 10 {
+		t.Errorf("first after = %v; want [int64(10)] (the legacy cursor, exact)", ex.aftersSeen)
+	}
 	if res.RowsUpdated != 20 {
 		t.Errorf("RowsUpdated = %d; want 20 (10 previous + 10 now)", res.RowsUpdated)
 	}

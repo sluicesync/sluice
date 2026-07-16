@@ -95,8 +95,10 @@ func TestTableProgressMarshalInProgressObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	// Object form must contain the load-bearing fields.
-	want := `{"state":"in_progress","last_pk":[42,"abc"],"rows_copied":100}`
+	// Object form must contain the load-bearing fields; integer cursor
+	// values wear the i64 envelope so they never pass through float64
+	// (audit 2026-07-15 HIGH-1), clean strings stay bare.
+	want := `{"state":"in_progress","last_pk":[{"_t":"i64","v":42},"abc"],"rows_copied":100}`
 	if string(b) != want {
 		t.Errorf("Marshal: got %s; want %s", b, want)
 	}
@@ -111,14 +113,13 @@ func TestTableProgressMarshalInProgressObject(t *testing.T) {
 	if out.RowsCopied != in.RowsCopied {
 		t.Errorf("RowsCopied: got %d; want %d", out.RowsCopied, in.RowsCopied)
 	}
-	// JSON numbers come back as float64; compare element-wise via
-	// reflect after coercing the int64 source values to the float64
-	// shape the decoder produces.
+	// The envelope round-trips the cursor TYPE-exact: int64 in, int64
+	// out (a plain decode would have collapsed it to float64).
 	if got, want := len(out.LastPK), len(in.LastPK); got != want {
 		t.Fatalf("LastPK len: got %d; want %d", got, want)
 	}
-	if got := out.LastPK[0]; got != float64(42) {
-		t.Errorf("LastPK[0]: got %v (%T); want 42 (float64)", got, got)
+	if got := out.LastPK[0]; got != int64(42) {
+		t.Errorf("LastPK[0]: got %v (%T); want 42 (int64)", got, got)
 	}
 	if got := out.LastPK[1]; got != "abc" {
 		t.Errorf("LastPK[1]: got %v; want \"abc\"", got)

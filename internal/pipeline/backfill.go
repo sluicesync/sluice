@@ -401,6 +401,21 @@ func (b *Backfiller) runWalk(ctx context.Context, ex ir.BackfillExecutor, table 
 			return nil
 		}
 		if tp, ok := state.TableProgress[b.Table]; ok && len(tp.LastPK) > 0 {
+			// Legacy-cursor trust gate (audit 2026-07-15 CRITICAL-2 /
+			// HIGH-1): a cursor persisted by a pre-envelope release may
+			// be irrecoverably mangled (U+FFFD-replaced binary bytes,
+			// float64-drifted large integers), and a walk resumed from
+			// it silently skips PK ranges — rows the contract step then
+			// destroys. Refuse loudly; --restart re-walks from the
+			// start, and the self-describing --where guard makes that
+			// re-walk touch only unfinished rows.
+			if reason := migcore.SuspectLegacyCursor(table, tp.LastPK); reason != "" {
+				return sluicecode.Wrap(
+					sluicecode.CodeBackfillCorruptCursor,
+					"re-run with --restart to walk the table from the beginning; with a self-describing --where guard the re-walk only touches unfinished rows",
+					fmt.Errorf("backfill: persisted resume cursor for %q is not trustworthy: %s", b.Table, reason),
+				)
+			}
 			cursor = tp.LastPK
 			rowsUpdated = tp.RowsCopied
 			result.Resumed = true
