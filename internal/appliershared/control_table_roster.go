@@ -24,7 +24,7 @@ package appliershared
 // package's constant so the duplication cannot drift and a future
 // control table cannot be forgotten.
 
-import "strings"
+import "log/slog"
 
 // ControlTableNames returns the full roster of sluice-owned
 // control/bookkeeping table names, every one excluded from user-table
@@ -68,15 +68,37 @@ func ControlTableNames() []string {
 	}
 }
 
-// ControlTableSQLList renders the roster as `'a', 'b', …` for
-// embedding in a `table_name NOT IN (…)` clause. Inlining (rather
-// than binding) is safe here: every name is an internal compile-time
-// constant matching ^[a-z_]+$, never operator input.
-func ControlTableSQLList() string {
-	names := ControlTableNames()
-	quoted := make([]string, len(names))
-	for i, n := range names {
-		quoted[i] = "'" + n + "'"
+// controlTableSet is the roster as a membership set, built once.
+var controlTableSet = func() map[string]bool {
+	set := map[string]bool{}
+	for _, name := range ControlTableNames() {
+		set[name] = true
 	}
-	return strings.Join(quoted, ", ")
+	return set
+}()
+
+// IsControlTable reports whether name is on the control-table roster.
+// Every schema-reader door — live catalog readers (mysql, postgres,
+// sqlite, d1) and file/dump readers (mydumper, flatfile) — consults
+// this ONE predicate so the exclusion cannot diverge per door (the
+// audit-2026-07-15 MED-D0-6 class: the roster reached the live readers
+// but not the dump/flat-file doors). Exact match, matching how sluice
+// itself names the tables (always lowercase).
+func IsControlTable(name string) bool {
+	return controlTableSet[name]
+}
+
+// LogExcludedControlTables surfaces a roster exclusion the moment it
+// actually bites: one INFO naming the count (the loud-failure tenet —
+// a silently thinner table list looks like a sluice bug from the
+// outside), the names themselves at DEBUG. No-op when nothing was
+// excluded, so ordinary sources stay quiet.
+func LogExcludedControlTables(engine string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	slog.Info("excluded sluice control tables present on the source (sluice bookkeeping, never user data; "+
+		"they are not enumerated as user tables)",
+		slog.String("engine", engine), slog.Int("count", len(names)))
+	slog.Debug("excluded control tables", slog.String("engine", engine), slog.Any("tables", names))
 }

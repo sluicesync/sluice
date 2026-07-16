@@ -94,19 +94,81 @@ func TestControlTableRoster_SourceSync(t *testing.T) {
 	}
 }
 
-// TestControlTableSQLList pins the NOT IN body shape both engine
-// readers embed: single-quoted names, comma-separated, one per roster
-// entry, no operator-controllable input.
-func TestControlTableSQLList(t *testing.T) {
-	list := ControlTableSQLList()
-	names := ControlTableNames()
-	parts := strings.Split(list, ", ")
-	if len(parts) != len(names) {
-		t.Fatalf("SQL list has %d entries; roster has %d:\n%s", len(parts), len(names), list)
+// TestIsControlTable pins the membership predicate every schema-reader
+// door consults: true for every roster entry, false for near-misses.
+func TestIsControlTable(t *testing.T) {
+	for _, name := range ControlTableNames() {
+		if !IsControlTable(name) {
+			t.Errorf("IsControlTable(%q) = false; every roster entry must match", name)
+		}
 	}
-	for i, name := range names {
-		if want := "'" + name + "'"; parts[i] != want {
-			t.Errorf("entry %d = %s; want %s", i, parts[i], want)
+	for _, name := range []string{"", "users", "sluice_", "sluice_cdc_state_backup", "SLUICE_CDC_STATE"} {
+		if IsControlTable(name) {
+			t.Errorf("IsControlTable(%q) = true; want false", name)
+		}
+	}
+}
+
+// TestControlTableRoster_AllSchemaReaderDoors enforces that EVERY
+// schema-reader door applies the roster (audit-2026-07-15 MED-D0-6:
+// item 65b reached the live mysql/postgres readers but not the
+// mydumper/flatfile doors — the same-schema-different-door class).
+// Doors are DISCOVERED, not hand-listed: every engine package under
+// internal/engines with a non-test `ReadSchema(ctx context.Context)`
+// implementation must reference IsControlTable somewhere in its
+// non-test sources; the flatfile package (whose door is
+// deriveTableName — it stages into sqlite under a filename-derived
+// table name, so it has no ReadSchema of its own) is required
+// explicitly. A future engine that adds a ReadSchema without
+// consulting the roster fails here.
+func TestControlTableRoster_AllSchemaReaderDoors(t *testing.T) {
+	root := filepath.Join("..", "engines")
+	readSchemaPattern := regexp.MustCompile(`\)\s+ReadSchema\(ctx context\.Context\)`)
+
+	doorPkgs := map[string]bool{filepath.Join(root, "flatfile"): true}
+	usesRoster := map[string]bool{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if info.Name() == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		pkg := filepath.Dir(path)
+		if readSchemaPattern.Match(raw) {
+			doorPkgs[pkg] = true
+		}
+		if strings.Contains(string(raw), "IsControlTable") {
+			usesRoster[pkg] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	if len(doorPkgs) < 5 { // mysql, postgres, sqlite, mydumper, flatfile at minimum
+		t.Fatalf("discovered only %d schema-reader door packages (%v) — the ReadSchema scan pattern is broken",
+			len(doorPkgs), doorPkgs)
+	}
+	pkgs := make([]string, 0, len(doorPkgs))
+	for pkg := range doorPkgs {
+		pkgs = append(pkgs, pkg)
+	}
+	sort.Strings(pkgs)
+	for _, pkg := range pkgs {
+		if !usesRoster[pkg] {
+			t.Errorf("engine package %s enumerates tables (ReadSchema door) but never consults "+
+				"appliershared.IsControlTable — apply the control-table roster at that door", pkg)
 		}
 	}
 }

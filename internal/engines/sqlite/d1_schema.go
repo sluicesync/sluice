@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -79,34 +80,40 @@ func (r *D1SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 
 // tableNames lists user tables, excluding SQLite's internal sqlite_* tables,
 // Cloudflare D1's internal `_cf_*` tables (a user table merely containing "cf"
-// is NOT dropped, ADR-0130), AND — by EXACT name — the trigger engine's own
-// bookkeeping tables ([ChangeLogTable]/[ChangeLogMetaTable]/[ChangeLogColumnsTable],
-// ADR-0135/0136). The SAME query and exclusion as the file engine's
-// [SchemaReader.tableNames]: a cold-start (or a plain `sluice migrate` against a
-// `d1-trigger`-instrumented database) must NEVER copy the change-log/meta/columns
-// tables, and the trigger installer must never see them as replication candidates.
-// The exclusion is a no-op for a normal D1 without those tables. The three names
-// bind as string params, compared exactly against the TEXT `name` column.
+// is NOT dropped, ADR-0130), AND — by EXACT name — sluice's own control tables
+// ([appliershared.ControlTableNames]: the trigger trio of ADR-0135/0136 plus
+// CDC positions, migrate-state, …). The SAME query and exclusion as the file
+// engine's [SchemaReader.tableNames]: a cold-start (or a plain `sluice migrate`
+// against a `d1-trigger`-instrumented database or promoted ex-target) must
+// NEVER copy sluice bookkeeping, and the trigger installer must never see it
+// as a replication candidate. The roster filter runs Go-side and logs any
+// exclusion that actually bites, matching the other engine doors (roadmap
+// item 65b, audit-2026-07-15 MED-D0-6); it is a no-op for a normal D1.
 func (r *D1SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 	const q = `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table'
 		  AND name NOT LIKE 'sqlite_%'
 		  AND name NOT LIKE '\_cf\_%' ESCAPE '\'
-		  AND name NOT IN (?, ?, ?)
 		ORDER BY name`
-	rows, err := r.client.queryRows(ctx, q, ChangeLogTable, ChangeLogMetaTable, ChangeLogColumnsTable)
+	rows, err := r.client.queryRows(ctx, q)
 	if err != nil {
 		return nil, err
 	}
 	names := make([]string, 0, len(rows))
+	var excluded []string
 	for _, row := range rows {
 		name, err := rowString(row, "name")
 		if err != nil {
 			return nil, err
 		}
+		if appliershared.IsControlTable(name) {
+			excluded = append(excluded, name)
+			continue
+		}
 		names = append(names, name)
 	}
+	appliershared.LogExcludedControlTables("d1", excluded)
 	return names, nil
 }
 

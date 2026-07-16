@@ -287,8 +287,14 @@ var allowedSetNames = map[string]bool{
 }
 
 // checkSetStatement validates a SET statement found in a data chunk or
-// schema file, and reports whether it was a (UTC) TIME_ZONE header — the
-// signal [RowReader] uses to WARN on dumps that never declare one. `SET
+// schema file, and reports whether it carried a (UTC) TIME_ZONE
+// assignment — the signal [RowReader] uses to WARN on dumps that never
+// declare one. MySQL's SET is a COMMA-SEPARATED assignment list, so EVERY
+// assignment is inspected (respecting quoted commas — sql_mode values
+// contain them): a `SET SESSION sql_mode=…, SESSION time_zone='+05:30'`
+// must hit the same gate as the single-assignment spelling
+// (audit-2026-07-15 MED-D0-1 — the first cut checked only the first
+// assignment, and the second one shifted every instant silently). `SET
 // NAMES <charset>` outside the UTF-8-compatible allowlist and a TIME_ZONE
 // assignment other than '+00:00'/UTC are LOUD refusals (mis-decoded text /
 // shifted instants are the silent alternative); every other session
@@ -297,41 +303,112 @@ var allowedSetNames = map[string]bool{
 //
 // The TIME_ZONE match covers every spelling MySQL accepts — bare
 // `TIME_ZONE`, scope-qualified `SESSION/GLOBAL/LOCAL TIME_ZONE`, and the
-// system-variable forms `@@time_zone` / `@@session.time_zone` — so a
-// non-UTC header cannot slip past the gate under an alternate spelling.
+// system-variable forms `@@time_zone` / `@@session.time_zone` — in any
+// position of the assignment list, so a non-UTC header cannot slip past
+// the gate under an alternate spelling or behind another assignment.
 func checkSetStatement(stmt string) (sawTimeZone bool, err error) {
 	body := stripLeadingCommentsAndSpace(stmt)
 	fields := strings.Fields(body)
 	if len(fields) < 2 || !strings.EqualFold(fields[0], "SET") {
 		return false, nil
 	}
-	if strings.EqualFold(fields[1], "NAMES") {
-		if len(fields) < 3 {
-			return false, fmt.Errorf("malformed SET NAMES statement %q", body)
+	for _, assign := range splitTopLevelCommas(strings.TrimSpace(body[len(fields[0]):])) {
+		assign = strings.TrimSpace(assign)
+		if assign == "" {
+			continue
 		}
-		cs := strings.ToLower(strings.Trim(fields[2], "'\"`;"))
-		if !allowedSetNames[cs] {
-			return false, fmt.Errorf("dump declares SET NAMES %s — only UTF-8-compatible dump charsets "+
-				"(binary, utf8, utf8mb3, utf8mb4) are supported; re-dump with a UTF-8 connection "+
-				"charset rather than have sluice transcode silently", cs)
+		afields := strings.Fields(assign)
+		if strings.EqualFold(afields[0], "NAMES") {
+			if len(afields) < 2 {
+				return sawTimeZone, fmt.Errorf("malformed SET NAMES statement %q", body)
+			}
+			cs := strings.ToLower(strings.Trim(afields[1], "'\"`;"))
+			if !allowedSetNames[cs] {
+				return sawTimeZone, fmt.Errorf("dump declares SET NAMES %s — only UTF-8-compatible dump charsets "+
+					"(binary, utf8, utf8mb3, utf8mb4) are supported; re-dump with a UTF-8 connection "+
+					"charset rather than have sluice transcode silently", cs)
+			}
+			continue
 		}
-		return false, nil
+		// SET TIME_ZONE='+00:00' (mydumper emits it unconditionally;
+		// mysqldump under --tz-utc): only UTC is accepted — temporal
+		// literals in the dump are interpreted as UTC, so a non-UTC session
+		// offset would silently shift every instant.
+		key, val, ok := strings.Cut(assign, "=")
+		if !ok || !isTimeZoneVariable(key) {
+			continue
+		}
+		tz := strings.Trim(strings.TrimSpace(val), "'\" ;")
+		if tz != "+00:00" && !strings.EqualFold(tz, "UTC") {
+			return sawTimeZone, fmt.Errorf("dump declares SET TIME_ZONE=%q — only '+00:00'/UTC is supported "+
+				"(temporal values are interpreted as UTC; a non-UTC dump would shift instants silently)", tz)
+		}
+		sawTimeZone = true
 	}
-	// SET TIME_ZONE='+00:00' (mydumper emits it unconditionally; mysqldump
-	// under --tz-utc): only UTC is accepted — temporal literals in the dump
-	// are interpreted as UTC, so a non-UTC session offset would silently
-	// shift every instant.
-	rest := strings.TrimSpace(body[len(fields[0]):])
-	key, val, ok := strings.Cut(rest, "=")
-	if !ok || !isTimeZoneVariable(key) {
-		return false, nil
+	return sawTimeZone, nil
+}
+
+// splitTopLevelCommas splits a SET statement's assignment list on commas
+// that sit OUTSIDE string/identifier quoting and block comments — a
+// sql_mode value like 'NO_ZERO_DATE,ANSI' must stay one assignment, and
+// bytes inside quotes must never be mistaken for a further assignment.
+// The quote states mirror [splitMySQLChunk] (backslash + doubled-quote
+// escapes in strings, doubled-backtick in identifiers); line comments
+// cannot appear here because the statement splitter already consumed
+// statement boundaries and [stripLeadingCommentsAndSpace] the prefix.
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	start, n := 0, len(s)
+	for i := 0; i < n; i++ {
+		switch s[i] {
+		case '\'', '"':
+			q := s[i]
+			i++
+			for i < n {
+				switch s[i] {
+				case '\\':
+					i += 2
+					continue
+				case q:
+					if i+1 < n && s[i+1] == q {
+						i += 2
+						continue
+					}
+				default:
+					i++
+					continue
+				}
+				break
+			}
+		case '`':
+			i++
+			for i < n {
+				if s[i] == '`' {
+					if i+1 < n && s[i+1] == '`' {
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case '/':
+			if i+1 < n && s[i+1] == '*' {
+				i += 2
+				for i < n {
+					if s[i] == '*' && i+1 < n && s[i+1] == '/' {
+						break
+					}
+					i++
+				}
+				i++ // skip the '*'; the loop's i++ skips the '/'
+			}
+		case ',':
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
 	}
-	tz := strings.Trim(strings.TrimSpace(val), "'\" ;")
-	if tz != "+00:00" && !strings.EqualFold(tz, "UTC") {
-		return false, fmt.Errorf("dump declares SET TIME_ZONE=%q — only '+00:00'/UTC is supported "+
-			"(temporal values are interpreted as UTC; a non-UTC dump would shift instants silently)", tz)
-	}
-	return true, nil
+	return append(parts, s[start:])
 }
 
 // isTimeZoneVariable reports whether the left-hand side of a SET

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -504,5 +505,26 @@ func TestStagedReaderOwnsTempFile(t *testing.T) {
 	}
 	if _, err := os.Stat(staged); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("staged temp db %q still exists after Close (err=%v)", staged, err)
+	}
+}
+
+// TestStage_RefusesControlTableName pins the roster at the flat-file door
+// (audit-2026-07-15 MED-D0-6): a file named after a sluice control table
+// derives a sluice-reserved staged/target table name. The live readers
+// SKIP roster tables, but this source has exactly ONE table — skipping
+// would be a silent empty migration — so the door refuses loudly with the
+// remedy (rename the file). Iterates the shared roster so a future
+// control table is automatically covered.
+func TestStage_RefusesControlTableName(t *testing.T) {
+	for _, name := range appliershared.ControlTableNames() {
+		t.Run(name, func(t *testing.T) {
+			e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+			path := writeSource(t, name+".csv", "a\n1\n")
+			_, err := e.stage(context.Background(), path)
+			if err == nil || !strings.Contains(err.Error(), "control-table name") ||
+				!strings.Contains(err.Error(), "rename the file") {
+				t.Fatalf("stage(%s.csv) err = %v; want a control-table-name refusal naming the remedy", name, err)
+			}
+		})
 	}
 }

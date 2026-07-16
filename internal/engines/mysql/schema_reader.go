@@ -189,14 +189,16 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 // cutover flow). The full roster lives once in
 // [appliershared.ControlTableNames] (roadmap item 65b — this reader
 // previously excluded a 3-name subset and every later control table
-// missed it).
+// missed it). The filter runs Go-side (not a SQL NOT IN) so the
+// exclusion is also SURFACED: control tables actually present on the
+// source are logged, never silently thinned from the table list
+// (audit-2026-07-15 LOW-D0-6).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
-	q := `
+	const q = `
 		SELECT table_name, IFNULL(table_comment, '')
 		FROM   information_schema.tables
 		WHERE  table_schema = ?
 		  AND  table_type   = 'BASE TABLE'
-		  AND  table_name NOT IN (` + appliershared.ControlTableSQLList() + `)
 		ORDER  BY table_name`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)
@@ -206,10 +208,15 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 	defer rows.Close()
 
 	out := map[string]*ir.Table{}
+	var excluded []string
 	for rows.Next() {
 		var name, comment string
 		if err := rows.Scan(&name, &comment); err != nil {
 			return nil, err
+		}
+		if appliershared.IsControlTable(name) {
+			excluded = append(excluded, name)
+			continue
 		}
 		// Schema is empty in single-database mode (flat scope); in
 		// multi-database mode (ADR-0074) it carries the source database
@@ -217,6 +224,7 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		// target namespace.
 		out[name] = &ir.Table{Schema: r.namespaceName(), Name: name, Comment: comment}
 	}
+	appliershared.LogExcludedControlTables("mysql", excluded)
 	return out, rows.Err()
 }
 

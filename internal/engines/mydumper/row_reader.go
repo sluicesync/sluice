@@ -97,8 +97,9 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	go func() {
 		defer close(out)
 		sawTimeZone := false
+		var streamed int64
 		for _, chunk := range tf.chunks {
-			sawTZ, err := r.streamChunk(ctx, chunk, table, out)
+			sawTZ, n, err := r.streamChunk(ctx, chunk, table, out)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					r.setErr(err)
@@ -106,10 +107,14 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 				return
 			}
 			sawTimeZone = sawTimeZone || sawTZ
+			streamed += n
 		}
 		if !sawTimeZone && len(tf.chunks) > 0 {
 			warnIfTimestampsWithoutTZHeader(table)
 		}
+		// Post-stream tripwire: the table is fully read, so the dump's own
+		// recorded row count (when present) must agree (MED-D0-2).
+		r.dir.warnIfRowCountMismatch(table.Name, streamed)
 	}()
 	return out, nil
 }
@@ -171,9 +176,10 @@ func warnIfSingleFloatColumns(table *ir.Table) {
 }
 
 // streamChunk lexes one data-chunk file and emits its rows, reporting
-// whether the chunk declared a (UTC) time zone header.
-func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Table, out chan<- ir.Row) (sawTimeZone bool, err error) {
-	return processChunk(ctx, path, table.Name, func(sc *insertScan, columns []string) error {
+// whether the chunk declared a (UTC) time zone header and how many rows
+// it held (the row-count tripwire's input).
+func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Table, out chan<- ir.Row) (sawTimeZone bool, rows int64, err error) {
+	sawTimeZone, err = processChunk(ctx, path, table.Name, func(sc *insertScan, columns []string) error {
 		targets, err := resolveInsertColumns(table, columns)
 		if err != nil {
 			return fmt.Errorf("%s: %w", filepath.Base(path), err)
@@ -201,11 +207,13 @@ func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Tabl
 			}
 			select {
 			case out <- row:
+				rows++
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
 	})
+	return sawTimeZone, rows, err
 }
 
 // processChunk opens one data-chunk file (decompressing by suffix),
@@ -358,5 +366,10 @@ func (d *dumpDir) countTableRows(ctx context.Context, tableName string) (int64, 
 			return 0, err
 		}
 	}
+	// The verify door gets the same tripwire as the streaming door: a
+	// missing chunk shorts BOTH sides of a src-vs-target count compare
+	// (verify re-scans this same directory), so the dump's own recorded
+	// count is the only independent signal (MED-D0-2).
+	d.warnIfRowCountMismatch(tableName, total)
 	return total, nil
 }

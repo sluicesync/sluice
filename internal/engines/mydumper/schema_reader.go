@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -34,11 +35,23 @@ type SchemaReader struct {
 // own guard), which the pipeline consults after the table filter — so
 // --exclude-table can route around one legacy latin1 table instead of
 // the whole dump being unreadable (Bug 188).
+//
+// sluice's own control tables ([appliershared.ControlTableNames]) are
+// excluded, matching the live mysql reader's door: a dump of a
+// promoted ex-target carries sluice_cdc_state et al., and importing
+// them as user tables would let a later sync resume from a stale
+// imported position (audit-2026-07-15 MED-D0-6). Exclusions that
+// actually bite are logged, never silent.
 func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	s := &ir.Schema{}
+	var excluded []string
 	for _, name := range r.dir.tableOrder {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if appliershared.IsControlTable(name) {
+			excluded = append(excluded, name)
+			continue
 		}
 		tf := r.dir.tables[name]
 		table, err := r.parseTableSchema(tf)
@@ -52,6 +65,7 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		}
 		s.Tables = append(s.Tables, table)
 	}
+	appliershared.LogExcludedControlTables("mydumper", excluded)
 	return s, nil
 }
 

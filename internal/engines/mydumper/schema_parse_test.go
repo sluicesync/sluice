@@ -429,6 +429,27 @@ func TestCheckSetStatement(t *testing.T) {
 		{"SET SESSION TIME_ZONE='+00:00'", true, true},
 		{"SET @@session.time_zone = 'UTC'", true, true},
 		{"SET @@time_zone='+00:00'", true, true},
+		// Multi-assignment lists (audit-2026-07-15 MED-D0-1): MySQL's SET
+		// takes a comma-separated assignment list, and EVERY assignment must
+		// hit the gates — the first cut inspected only the first one, and
+		// `SET SESSION sql_mode='', SESSION time_zone='+05:30'` streamed a
+		// TIMESTAMP with a 5.5-hour silent shift (observed).
+		{"SET SESSION sql_mode='', SESSION time_zone='+05:30'", false, false},
+		{"SET SESSION sql_mode='', SESSION time_zone='+00:00'", true, true},
+		{"SET sql_mode='', NAMES latin1", false, false},
+		{"SET sql_mode='', NAMES utf8mb4", true, false},
+		{"SET NAMES utf8mb4, TIME_ZONE='+05:30'", false, false},
+		{"SET NAMES utf8mb4, TIME_ZONE='+00:00'", true, true},
+		// A UTC header FOLLOWED by more assignments must pass (the first
+		// cut's first-`=` Cut swallowed the tail into the value and refused).
+		{"SET TIME_ZONE='+00:00', FOREIGN_KEY_CHECKS=0", true, true},
+		// Quoted commas stay INSIDE values: a sql_mode list is one
+		// assignment, and a fake assignment inside a quoted value must not
+		// reach the gates.
+		{"SET sql_mode='NO_ZERO_DATE,STRICT_TRANS_TABLES', time_zone='+00:00'", true, true},
+		{"SET sql_mode='NO_ZERO_DATE,STRICT_TRANS_TABLES', time_zone='+05:30'", false, false},
+		{"SET sql_mode='a,time_zone=''+05:30''', FOREIGN_KEY_CHECKS=0", true, false},
+		{`SET sql_mode="x,NAMES latin1", UNIQUE_CHECKS=0`, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.stmt, func(t *testing.T) {

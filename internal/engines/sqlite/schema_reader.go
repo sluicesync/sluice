@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -119,35 +120,42 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 // would be exactly the silent-loss the tenets forbid). `--exclude-table`
 // remains available for anything else. Ordered by name for stable diffs/logs.
 //
-// The sqlite-trigger CDC engine's own bookkeeping tables ([ChangeLogTable] /
-// [ChangeLogMetaTable] / [ChangeLogColumnsTable], ADR-0135) are also excluded by
+// sluice's own control tables ([appliershared.ControlTableNames] — the
+// trigger-CDC trio, CDC positions, migrate-state, …) are also excluded by
 // EXACT name (not a LIKE wildcard, so a legitimate user table merely prefixed
-// `sluice_` is untouched): they are sluice-managed change-capture state, never
-// user data, so a cold-start (or a plain `sluice migrate` against a
-// trigger-instrumented file) must never copy them, and the trigger installer
-// must never see them as replication candidates.
+// `sluice_` is untouched): they are sluice-managed bookkeeping, never user
+// data, so a cold-start (or a plain `sluice migrate` against a promoted
+// ex-target or trigger-instrumented file) must never copy them, and the
+// trigger installer must never see them as replication candidates. This
+// reader previously excluded only the trigger trio; the full-roster filter
+// runs Go-side and logs any exclusion that actually bites, matching the
+// other engine doors (roadmap item 65b, audit-2026-07-15 MED-D0-6).
 func (r *SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 	const q = `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table'
 		  AND name NOT LIKE 'sqlite_%'
 		  AND name NOT LIKE '\_cf\_%' ESCAPE '\'
-		  AND name NOT IN (?, ?, ?)
 		ORDER BY name`
-	rows, err := r.db.QueryContext(ctx, q, ChangeLogTable, ChangeLogMetaTable, ChangeLogColumnsTable)
+	rows, err := r.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list tables in %q: %w", r.path, err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var names []string
+	var names, excluded []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, fmt.Errorf("sqlite: scan table name: %w", err)
 		}
+		if appliershared.IsControlTable(name) {
+			excluded = append(excluded, name)
+			continue
+		}
 		names = append(names, name)
 	}
+	appliershared.LogExcludedControlTables("sqlite", excluded)
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite: iterate tables: %w", err)
 	}

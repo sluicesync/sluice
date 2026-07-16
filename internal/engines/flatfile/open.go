@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/engines/internal/dumpsig"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -37,6 +38,19 @@ func (e Engine) stage(ctx context.Context, dsn string) (string, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	// The control-table roster at the flat-file door: a file named e.g.
+	// sluice_cdc_state.csv derives a sluice-reserved control-table name.
+	// The live readers SKIP roster tables from enumeration, but this
+	// source has exactly one table — skipping would be a silent empty
+	// migration — so the loud move is a refusal naming the remedy
+	// (audit-2026-07-15 MED-D0-6, roadmap item 65b).
+	tableName := deriveTableName(path)
+	if appliershared.IsControlTable(tableName) {
+		return "", fmt.Errorf("%s: %q derives table name %q — a sluice-reserved control-table name "+
+			"(sluice bookkeeping, never user data); rename the file to load its rows as a user table",
+			e.Name(), path, tableName)
+	}
+
 	tmp, err := os.CreateTemp("", "sluice-flatfile-*.db")
 	if err != nil {
 		return "", fmt.Errorf("%s: create temp db for %q: %w", e.Name(), path, err)
@@ -44,7 +58,7 @@ func (e Engine) stage(ctx context.Context, dsn string) (string, error) {
 	staged := tmp.Name()
 	_ = tmp.Close() // only the path is needed; modernc opens the file itself
 
-	st, err := newStager(ctx, staged, deriveTableName(path))
+	st, err := newStager(ctx, staged, tableName)
 	if err != nil {
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("%s: stage %q: %w", e.Name(), path, err)

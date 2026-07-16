@@ -6,8 +6,10 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +20,8 @@ import (
 // TestSchemaReader_ExcludesControlTableRoster pins roadmap item 65b on
 // the real engine: a database carrying EVERY sluice control table (the
 // promoted ex-target / cutover shape) plus one user table enumerates
-// only the user table. Iterates the shared roster rather than a
+// only the user table — and the exclusion is LOGGED, never silent
+// (audit-2026-07-15 LOW-D0-6). Iterates the shared roster rather than a
 // hand-copied list so a table added to [appliershared.ControlTableNames]
 // is automatically covered here.
 func TestSchemaReader_ExcludesControlTableRoster(t *testing.T) {
@@ -45,6 +48,11 @@ func TestSchemaReader_ExcludesControlTableRoster(t *testing.T) {
 		}
 	}()
 
+	var logs bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prevLogger)
+
 	schema, err := r.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -55,5 +63,10 @@ func TestSchemaReader_ExcludesControlTableRoster(t *testing.T) {
 			got = append(got, tbl.Name)
 		}
 		t.Fatalf("tables = %v; want exactly [roster_user_table] — a sluice control table leaked into user-table enumeration", got)
+	}
+	wantCount := fmt.Sprintf("count=%d", len(appliershared.ControlTableNames()))
+	if out := logs.String(); !strings.Contains(out, "excluded sluice control tables") ||
+		!strings.Contains(out, "engine=postgres") || !strings.Contains(out, wantCount) {
+		t.Fatalf("the roster exclusion must surface as an INFO naming the count (%s):\n%s", wantCount, out)
 	}
 }

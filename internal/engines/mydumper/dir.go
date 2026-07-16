@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
@@ -50,6 +51,16 @@ type tableFiles struct {
 	name       string
 	schemaFile string   // absolute path; always present
 	chunks     []string // absolute paths, sorted by chunk number; may be empty
+
+	// metadataRows is the dump's OWN recorded row count for this table,
+	// when it recorded one: the ini `rows =` entry in the dump-wide
+	// metadata file (mydumper ≥0.12; ground-truthed exact against
+	// v1.0.3) or, failing that, a bare-integer per-table `-metadata`
+	// companion (older mydumper; pscale-dump writes the companion but
+	// leaves it EMPTY, so absence is normal). Consumed by
+	// [dumpDir.warnIfRowCountMismatch] as a post-stream tripwire.
+	metadataRows    int64
+	hasMetadataRows bool
 }
 
 // compression suffixes mydumper appends to every output file when
@@ -153,6 +164,7 @@ func openDumpDir(path string) (*dumpDir, error) {
 		num   string
 	}
 	var chunks []numberedChunk
+	companionRows := map[string]int64{}
 
 	for _, e := range entries {
 		name := e.Name()
@@ -184,12 +196,20 @@ func openDumpDir(path string) (*dumpDir, error) {
 			continue
 		}
 
-		// Per-table checksum/row-count companions (`<db>.<table>-metadata`,
-		// `<db>.<table>-checksum`): informational only.
-		if db, tbl, ok := splitDumpName(base, "-metadata"); ok {
-			_, _ = db, tbl
+		// Per-table row-count companion (`<db>.<table>-metadata`): when it
+		// carries a bare integer (older mydumper), that count feeds the
+		// post-stream row-count tripwire. pscale-dump writes the file but
+		// leaves it EMPTY (ground-truthed, Bug 188 probe), and mydumper
+		// ≥0.12 records counts in the dump-wide metadata instead — so an
+		// unparseable companion is simply informational, never a refusal.
+		if _, tbl, ok := splitDumpName(base, "-metadata"); ok {
+			if n, ok := readCompanionRowCount(full); ok {
+				companionRows[tbl] = n
+			}
 			continue
 		}
+		// Per-table checksum companions (`<db>.<table>-checksum`):
+		// informational only (mydumper's own checksum algorithm).
 		if db, tbl, ok := splitDumpName(base, "-checksum"); ok {
 			_, _ = db, tbl
 			continue
@@ -256,14 +276,110 @@ func openDumpDir(path string) (*dumpDir, error) {
 	}
 	for _, t := range d.tables {
 		sortChunks(t.chunks)
+		warnIfChunkNumberGaps(t)
+		if n, ok := companionRows[t.name]; ok {
+			t.metadataRows, t.hasMetadataRows = n, true
+		}
 		d.tableOrder = append(d.tableOrder, t.name)
 	}
 	sort.Strings(d.tableOrder)
 
+	// parseMetadata runs after the companion attach so the dump-wide ini
+	// `rows =` counts (the modern, ground-truthed-exact shape) win when
+	// both are present.
 	if err := d.parseMetadata(); err != nil {
 		return nil, err
 	}
 	return d, nil
+}
+
+// warnIfChunkNumberGaps surfaces a non-contiguous chunk-number sequence,
+// once per table. This is deliberately a WARN, not the torn-dump refusal
+// the metadata.partial marker gets: real mydumper derives chunk numbers
+// from PK ranges, so a sparse primary key LEGITIMATELY skips numbers
+// (ground-truthed against v1.0.3: a table with PKs 1..500 and
+// 90000000..90000500 dumped as chunks 00001-00003 + 450001-450003, and
+// `-r` dumps start at 00001 while unsplit tables start at 00000) — but a
+// deleted or lost middle chunk produces exactly the same shape, and
+// before this WARN it streamed silently short (audit-2026-07-15
+// MED-D0-2). The row-count tripwire ([dumpDir.warnIfRowCountMismatch])
+// is the decisive cross-check when the dump recorded counts.
+func warnIfChunkNumberGaps(t *tableFiles) {
+	prev := int64(-1)
+	for _, chunk := range t.chunks {
+		base, _ := stripCompressionSuffix(filepath.Base(chunk))
+		_, _, numText, ok := splitChunkName(base)
+		if !ok {
+			return // unreachable post-validation; never guess about gaps
+		}
+		num, err := strconv.ParseInt(numText, 10, 64)
+		if err != nil {
+			return // a >19-digit chunk id; no continuity claim possible
+		}
+		if prev >= 0 && num != prev+1 {
+			slog.Warn(
+				"mydumper: table's data-chunk numbers are not contiguous — mydumper numbers chunks by PK "+
+					"range, so a sparse primary key legitimately skips numbers, but a DELETED OR LOST middle "+
+					"chunk looks identical and its rows would be silently missing; cross-check the row count "+
+					"(the dump-metadata row-count tripwire fires automatically when the dump recorded one, "+
+					"or compare against the live source)",
+				slog.String("table", t.name),
+				slog.Int64("gap_after_chunk", prev),
+				slog.Int64("next_chunk", num),
+				slog.Int("chunks", len(t.chunks)),
+			)
+			return
+		}
+		prev = num
+	}
+}
+
+// companionMaxBytes bounds a per-table `-metadata` companion read: the
+// file is a row count (or empty, pscale-dump); anything big is not one.
+const companionMaxBytes = 4096
+
+// readCompanionRowCount reads a per-table `-metadata` companion and
+// parses its bare-integer row count. Lenient by design — empty
+// (pscale-dump) or otherwise-shaped content is informational only, so
+// any read/parse miss reports no count rather than failing the open.
+func readCompanionRowCount(path string) (int64, bool) {
+	f, err := openDumpFile(path)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = f.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(f, companionMaxBytes))
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// warnIfRowCountMismatch is the post-stream row-count tripwire: after a
+// table's chunks are fully read (bulk copy or verify count), the rows
+// actually seen are compared against the dump's own recorded count when
+// one exists. A mismatch WARNs naming both counts — deliberately not a
+// refusal (owner decision: real-dump metadata fidelity across producers
+// is unverified, so the count is a tripwire, not an oracle); the named
+// counts let an operator escalate. Catches the missing-middle-chunk
+// class the chunk-gap WARN can only suspect (audit-2026-07-15 MED-D0-2).
+func (d *dumpDir) warnIfRowCountMismatch(tableName string, seen int64) {
+	tf := d.tables[tableName]
+	if tf == nil || !tf.hasMetadataRows || tf.metadataRows == seen {
+		return
+	}
+	slog.Warn(
+		"mydumper: the dump's own metadata records a different row count than its data chunks hold — "+
+			"the dump may be missing a chunk (or its metadata count is stale); verify against the live "+
+			"source before trusting this table",
+		slog.String("table", tableName),
+		slog.Int64("metadata_rows", tf.metadataRows),
+		slog.Int64("chunk_rows", seen),
+	)
 }
 
 // matchAuxiliarySuffix reports whether base names a schema-only auxiliary
@@ -404,9 +520,16 @@ const metadataMaxBytes = 1 << 20
 //   - ini (mydumper ≥0.12): a `[master]` / `[source]` section with
 //     `File = …` / `Position = …` / `Executed_Gtid_Set = …`
 //
-// Parsing is deliberately LENIENT — the position is informational (logged
-// at INFO; the ADR-0161 §8 handoff hook), so a metadata file with neither
-// shape parses to empty fields rather than failing the open.
+// The ini shape also records per-table `rows = N` counts under
+// [`db`.`table`] sections (ground-truthed exact against v1.0.3); those
+// feed the post-stream row-count tripwire
+// ([dumpDir.warnIfRowCountMismatch]), overriding any per-table
+// `-metadata` companion count.
+//
+// Parsing is deliberately LENIENT — the position and counts are
+// informational (position logged at INFO, the ADR-0161 §8 handoff hook;
+// counts a WARN-only tripwire), so a metadata file with neither shape
+// parses to empty fields rather than failing the open.
 func (d *dumpDir) parseMetadata() error {
 	path := filepath.Join(d.path, "metadata")
 	f, err := os.Open(path) //nolint:gosec // operator-supplied dump directory contents
@@ -419,6 +542,7 @@ func (d *dumpDir) parseMetadata() error {
 		return fmt.Errorf("mydumper: read metadata %q: %w", path, err)
 	}
 
+	var sectionTable *tableFiles // the [`db`.`table`] section we are inside, if any
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "#") {
@@ -426,6 +550,18 @@ func (d *dumpDir) parseMetadata() error {
 			// judges them non-authoritative (`# SOURCE_LOG_FILE = …` under
 			// --trx-tables). A commented position is deliberately NOT
 			// surfaced as one.
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			sectionTable = d.metadataSectionTable(line[1 : len(line)-1])
+			continue
+		}
+		if sectionTable != nil {
+			if key, val, found := strings.Cut(line, "="); found && strings.TrimSpace(key) == "rows" {
+				if n, err := strconv.ParseInt(metadataValue(val), 10, 64); err == nil && n >= 0 {
+					sectionTable.metadataRows, sectionTable.hasMetadataRows = n, true
+				}
+			}
 			continue
 		}
 		key, val, found := strings.Cut(line, ":")
@@ -461,6 +597,35 @@ func (d *dumpDir) parseMetadata() error {
 // shapes wrap values in.
 func metadataValue(v string) string {
 	return strings.Trim(strings.TrimSpace(v), `"'`)
+}
+
+// metadataSectionTable resolves an ini section name to the dump table it
+// describes, or nil for the bookkeeping sections ([config], [source],
+// [master], [myloader_session_variables], the db-only [`db`] section, a
+// table of some other database, …). mydumper writes table sections
+// backtick-quoted ([`db`.`table`], ground-truthed v1.0.3); an unquoted
+// db.table falls back to the FIRST-dot split, the same convention as
+// [splitDumpName].
+func (d *dumpDir) metadataSectionTable(section string) *tableFiles {
+	var db, tbl string
+	if strings.HasPrefix(section, "`") && strings.HasSuffix(section, "`") {
+		inner := section[1 : len(section)-1]
+		var found bool
+		db, tbl, found = strings.Cut(inner, "`.`")
+		if !found {
+			return nil // [`db`] — the database-checksum section
+		}
+	} else {
+		var found bool
+		db, tbl, found = strings.Cut(section, ".")
+		if !found {
+			return nil
+		}
+	}
+	if db != d.database {
+		return nil
+	}
+	return d.tables[tbl]
 }
 
 // logSourcePosition surfaces the dump's recorded binlog position / GTID at

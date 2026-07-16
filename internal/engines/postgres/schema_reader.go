@@ -614,18 +614,20 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 // (Migrator) and sync-start (Streamer) paths uniformly. The names are
 // all sluice-reserved, so the exclusion is harmless on a vanilla
 // `postgres` source (a user table named sluice_change_log would itself
-// be a name collision with sluice's own artifact).
+// be a name collision with sluice's own artifact). The filter runs
+// Go-side (not a SQL NOT IN) so the exclusion is also SURFACED:
+// control tables actually present on the source are logged, never
+// silently thinned from the table list (audit-2026-07-15 LOW-D0-6).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
 	extMembers, err := r.extensionMemberRelations(ctx)
 	if err != nil {
 		return nil, err
 	}
-	q := `
+	const q = `
 		SELECT table_name
 		FROM   information_schema.tables
 		WHERE  table_schema = $1
 		  AND  table_type   = 'BASE TABLE'
-		  AND  table_name NOT IN (` + appliershared.ControlTableSQLList() + `)
 		ORDER  BY table_name`
 
 	rows, err := r.catalogQuery(ctx, q, r.schema)
@@ -635,6 +637,7 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 	defer func() { _ = rows.Close() }()
 
 	out := map[string]*ir.Table{}
+	var excluded []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
@@ -644,6 +647,10 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		// they belong to the extension, not the user, and are recreated by
 		// CREATE EXTENSION on the target.
 		if _, isExt := extMembers[name]; isExt {
+			continue
+		}
+		if appliershared.IsControlTable(name) {
+			excluded = append(excluded, name)
 			continue
 		}
 		// catalog Bug 76: skip tables the operator's filter excludes so
@@ -657,6 +664,7 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		}
 		out[name] = &ir.Table{Schema: r.schema, Name: name}
 	}
+	appliershared.LogExcludedControlTables("postgres", excluded)
 	return out, rows.Err()
 }
 

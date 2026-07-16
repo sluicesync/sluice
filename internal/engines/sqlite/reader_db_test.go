@@ -12,6 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -401,5 +402,41 @@ func TestSchemaReader_DefaultClassification_RealDriver(t *testing.T) {
 		if col.Default != w {
 			t.Errorf("column %q Default = %#v; want %#v", name, col.Default, w)
 		}
+	}
+}
+
+// TestSchemaReader_ExcludesControlTableRoster pins the full control-table
+// roster at the sqlite file door (roadmap item 65b, audit-2026-07-15
+// MED-D0-6): a promoted ex-target (or trigger-instrumented) file carries
+// sluice bookkeeping tables, and enumeration must surface only user
+// tables — this reader previously excluded only the trigger trio.
+// Iterates the shared roster so a future control table is automatically
+// covered.
+func TestSchemaReader_ExcludesControlTableRoster(t *testing.T) {
+	stmts := make([]string, 0, 1+len(appliershared.ControlTableNames()))
+	stmts = append(stmts, `CREATE TABLE roster_user_table (id INTEGER PRIMARY KEY)`)
+	for _, name := range appliershared.ControlTableNames() {
+		stmts = append(stmts, `CREATE TABLE "`+name+`" (id INTEGER PRIMARY KEY)`)
+	}
+	path := seedDB(t, stmts...)
+
+	eng := Engine{}
+	ctx := context.Background()
+	sr, err := eng.OpenSchemaReader(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer func() { _ = sr.(*SchemaReader).Close() }()
+
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(schema.Tables) != 1 || schema.Tables[0].Name != "roster_user_table" {
+		got := make([]string, 0, len(schema.Tables))
+		for _, tbl := range schema.Tables {
+			got = append(got, tbl.Name)
+		}
+		t.Fatalf("tables = %v; want exactly [roster_user_table] — a control table leaked into enumeration", got)
 	}
 }
