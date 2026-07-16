@@ -1,6 +1,6 @@
 # psverify dispatch runbook
 
-The `psverify.yml` workflow runs the live-PlanetScale verification suites (12 tests across 6 packages) with `-race`, on demand via `workflow_dispatch`. It FAILS if any psverify test skips — a green run means everything actually ran. The durable token secrets are standing; the infra-pointing secrets are refreshed per dispatch from throwaway databases. First executed 2026-07-16 (three runs; every suite passed live at least once, zero skips).
+The `psverify.yml` workflow runs the live-PlanetScale verification suites (12 tests across 5 packages) with `-race`, on demand via `workflow_dispatch`. It FAILS if any psverify test skips — a green run means everything actually ran. The durable token secrets are standing; the infra-pointing secrets are refreshed per dispatch from throwaway databases. First executed 2026-07-16 (three runs; every suite passed live at least once, zero skips).
 
 ## Per-dispatch steps
 

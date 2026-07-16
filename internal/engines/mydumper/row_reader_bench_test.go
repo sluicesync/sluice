@@ -79,7 +79,7 @@ func BenchmarkReadRows_GiantSingleStatement(b *testing.B) {
 	}
 }
 
-func benchCorpusTable(b *testing.B, dir string) *ir.Table {
+func benchCorpusTable(b testing.TB, dir string) *ir.Table {
 	b.Helper()
 	sr, err := Engine{}.OpenSchemaReader(context.Background(), dir)
 	if err != nil {
@@ -95,7 +95,7 @@ func benchCorpusTable(b *testing.B, dir string) *ir.Table {
 	return schema.Tables[0]
 }
 
-func benchDrainRows(b *testing.B, dir string, table *ir.Table) {
+func benchDrainRows(b testing.TB, dir string, table *ir.Table) {
 	b.Helper()
 	rr, err := Engine{}.OpenRowReader(context.Background(), dir)
 	if err != nil {

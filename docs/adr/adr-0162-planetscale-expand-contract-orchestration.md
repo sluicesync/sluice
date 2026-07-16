@@ -1,6 +1,6 @@
 # ADR-0162: PlanetScale expand-contract orchestration (`sluice expand-contract`)
 
-- **Status:** Accepted (implemented; roadmap item 62 Phase 3)
+- **Status:** Accepted (shipped v0.99.248; roadmap item 62 Phase 3)
 - **Date:** 2026-07-14
 - **Related:** ADR-0159 (the standalone backfill this orchestrates — Phases 1–2), ADR-0148 (the deploy-request prototype whose ground truth this reuses: endpoints, DR lifecycle, the safe-migrations findings, the no-SDK posture), ADR-0107 (the telemetry client whose HTTP/auth shape the shared client generalizes), `docs/research/data-migration-backfill.md` §Phase 3.
 

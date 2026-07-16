@@ -1,6 +1,6 @@
 # ADR-0166: migrate's pre-create gate for existing target tables (schema-compare-then-skip)
 
-- **Status:** Accepted (implemented; roadmap item 71b)
+- **Status:** Accepted (shipped v0.99.258; roadmap item 71b)
 - **Date:** 2026-07-15
 - **Related:** ADR-0165 (the deploy-ddl bootstrap this completes for `migrate`), ADR-0162 (the renderSchema/compare posture cited by the roadmap entry — considered and not chosen, see Alternatives), ADR-0029 (the schema-diff machinery the compare rides), ADR-0108 (the transient-retry wall the pre-gate failure mode hid inside), ADR-0004 (the three-phase apply whose phase 1 this gates).
 

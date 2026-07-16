@@ -43,6 +43,17 @@ import (
 //   - a float where the PK column is integral: integer cursors are
 //     never floats on any shipping reader/executor, so a float there
 //     is the pre-envelope decode's lossy float64 — possibly drifted.
+//
+// Named residual (audit 2026-07-16, considered and accepted): a
+// pre-envelope binary that RESUMED a >2^53 integer-PK run drifted the
+// cursor through float64 and RE-PERSISTED it as bare integral digits
+// (json.Marshal(float64(9007199254740995)) emits "9007199254740996"),
+// which now decode as an exact int64 — the float fingerprint never
+// fires. Distrusting every legacy bare integer >2^53 would close it
+// but truncate-redo/refuse every large-PK legacy resume for a
+// population that requires a pre-envelope resume-of-resume on a >2^53
+// PK; `--restart` stays the operator remedy when that history is
+// suspected.
 func SuspectLegacyCursor(table *ir.Table, cursor []any) string {
 	return suspectCursor(table, cursor, false)
 }

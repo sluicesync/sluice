@@ -69,10 +69,21 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # parquet-go is excluded from auto-merge (audit 2026-07-16 M2.3):
+      # the Parquet file-format boundary is guarded by duckdb-verify.yml
+      # (an independent DuckDB read-back), but that job is deliberately
+      # NON-required — so a parquet-go bump whose writer+reader change
+      # symmetrically would keep every self-pin green, auto-merge on the
+      # six required checks, and only turn duckdb-verify red POST-merge,
+      # unwatched (the Bug-74 shape relocated to the file boundary).
+      # Holding these bumps for manual review makes the duckdb-verify
+      # result part of the merge decision without making the job
+      # required (it tracks an unpinned duckdb:latest by design).
       - name: Approve patch + minor updates
         if: |
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor'
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           steps.meta.outputs.update-type == 'version-update:semver-minor') &&
+          !contains(steps.meta.outputs.dependency-names, 'parquet-go')
         run: gh pr review --approve "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -80,9 +91,27 @@ jobs:
 
       - name: Enable auto-merge (squash) for patch + minor updates
         if: |
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor'
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           steps.meta.outputs.update-type == 'version-update:semver-minor') &&
+          !contains(steps.meta.outputs.dependency-names, 'parquet-go')
         run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on parquet-go updates (hold for duckdb-verify)
+        if: |
+          steps.meta.outputs.update-type != 'version-update:semver-major' &&
+          contains(steps.meta.outputs.dependency-names, 'parquet-go')
+        # Same env-indirection pattern as the major-update comment below.
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Auto-merge held: this bumps **parquet-go**, the writer AND \
+          in-repo reader of the Parquet export. Every self-pin is symmetric \
+          on it, so the required checks cannot see a format regression; the \
+          independent-reader gate is the non-required **DuckDB parquet \
+          compat** run on this PR. Check that it is green, then merge \
+          manually."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

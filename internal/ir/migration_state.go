@@ -452,6 +452,11 @@ func decodeCursorValue(raw json.RawMessage) (any, error) {
 		// Legacy BIGINT UNSIGNED cursors above MaxInt64 were persisted
 		// bare too — recover them losslessly instead of letting them
 		// fall to float64 and trip the float-over-integer suspect gate.
+		// This recovery window is only as good as the persisted digits:
+		// a pre-envelope binary that already drifted the value through
+		// float64 and re-persisted it wrote integral digits that decode
+		// "exactly" wrong here, indistinguishable from a faithful write
+		// (see migcore.SuspectLegacyCursor's named residual).
 		if u, err := strconv.ParseUint(s, 10, 64); err == nil {
 			return u, nil
 		}

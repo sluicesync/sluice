@@ -19,9 +19,12 @@ package backup
 // Shape decisions (ADR-0164):
 //
 //   - One Parquet file per table (`<schema>.<table>.parquet`), row
-//     groups aligned 1:1 with the source chunks, zstd-compressed;
-//     each file's footer metadata records the source chunk list with
-//     SHA-256s so operators can cross-reference `backup verify`.
+//     groups aligned to the source chunks — each chunk owns a
+//     contiguous run of >= 1 groups; chunks under the byte-roll target
+//     keep exactly one (see exportRowGroupTargetBytes for the amended
+//     1:1) — zstd-compressed; each file's footer metadata records the
+//     source chunk list with SHA-256s so operators can cross-reference
+//     `backup verify`.
 //   - The export represents ONE snapshot: a segment full's manifest
 //     (the latest by default; `--backup-id` selects an earlier
 //     segment's full — "chain to a point" at snapshot granularity).

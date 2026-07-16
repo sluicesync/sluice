@@ -1025,6 +1025,57 @@ func TestExpandContract_NoChangesDiffRefusedWithResumeGuidance(t *testing.T) {
 	}
 }
 
+// TestExpandContract_ContractNoChangesAdviceDoesNotLoop pins the
+// contract-leg advice de-loop (audit 2026-07-16): a contract DR seeing
+// no_changes means the contract DDL is already deployed and the pattern
+// is COMPLETE — the earlier advice spliced `--resume-from contract`,
+// sending the operator back into the exact leg that refuses again.
+func TestExpandContract_ContractNoChangesAdviceDoesNotLoop(t *testing.T) {
+	ps := newFakePS(t)
+	ps.preStates = []string{"no_changes"}
+	o, eng, _, _ := newTestOrchestrator(t, ps)
+	o.ResumeFrom = LegContract
+	for i := range eng.ex.rows {
+		eng.ex.rows[i].filled = true // verify gate passes; the contract leg runs
+	}
+
+	_, err := o.Run(context.Background())
+	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
+	msg := err.Error()
+	if !strings.Contains(msg, "pattern is complete") || !strings.Contains(msg, "--verify-only") {
+		t.Errorf("contract no_changes error = %q; want pattern-complete + verify-gate guidance", msg)
+	}
+	if strings.Contains(msg, "continue with --resume-from contract") {
+		t.Errorf("contract no_changes error advises re-running the contract leg (the circular advice):\n%s", msg)
+	}
+}
+
+// TestExpandContract_ContractLeftoverAdviceDoesNotLoop pins the same
+// de-loop on the refuse-on-leftover shape: a leftover CONTRACT branch
+// whose DDL already deployed has no next leg to resume.
+func TestExpandContract_ContractLeftoverAdviceDoesNotLoop(t *testing.T) {
+	ps := newFakePS(t)
+	o, eng, _, _ := newTestOrchestrator(t, ps)
+	o.ResumeFrom = LegContract
+	for i := range eng.ex.rows {
+		eng.ex.rows[i].filled = true
+	}
+	leftover := o.contractBranchName()
+	ps.branches[leftover] = &api.Branch{Name: leftover, Ready: true}
+
+	_, err := o.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("Run = %v; want the leftover-branch refusal", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "pattern is complete") {
+		t.Errorf("contract leftover error = %q; want the pattern-complete guidance", msg)
+	}
+	if strings.Contains(msg, "continue with --resume-from contract") {
+		t.Errorf("contract leftover error advises re-running the contract leg (the circular advice):\n%s", msg)
+	}
+}
+
 // ---- unknown intermediate state tolerance ----
 
 func TestExpandContract_UnknownIntermediateStateKeepsWaiting(t *testing.T) {

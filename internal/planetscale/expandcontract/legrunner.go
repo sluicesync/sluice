@@ -61,7 +61,7 @@ type legRunner struct {
 	//
 	//	leftoverAdvice        — "…if the DDL already deployed, %s; otherwise…"
 	//	alreadyDeployedAdvice — "…the DDL looks already deployed; %s"
-	//	reviewTimeoutAdvice   — "…requires deploy-request review, %s"
+	//	reviewTimeoutAdvice   — "…approve it AND deploy it from the PlanetScale UI …, then %s"
 	//	deployTimeoutAdvice   — "…keeps running in PlanetScale; %s"
 	leftoverAdvice        string
 	alreadyDeployedAdvice string
@@ -566,8 +566,14 @@ func (r *legRunner) waitDeployable(ctx context.Context, branchName string, numbe
 			))
 		}
 		if time.Now().After(deadline) {
+			// The manual escape must name BOTH steps: sluice never sets
+			// auto-apply on the deploy request, so approving it alone
+			// deploys nothing — the operator has to approve AND deploy
+			// from the PlanetScale UI (or `pscale deploy-request deploy`),
+			// then follow the per-command advice (audit 2026-07-16: the
+			// earlier "approve it and re-run" chain dead-ended).
 			return &reviewPendingError{err: r.drFailure(dr, fmt.Sprintf(
-				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, %s; the dev branch %q was KEPT (deleting it would close the still-open deploy request) — once the request closes, delete it with `pscale branch delete %s %s --org %s`",
+				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, approve it AND deploy it from the PlanetScale UI (approval alone deploys nothing; sluice never enables auto-apply), then %s; the dev branch %q was KEPT (deleting it would close the still-open deploy request) — once the request closes, delete it with `pscale branch delete %s %s --org %s`",
 				number, r.deployTimeout, dr.DeploymentState, r.reviewTimeoutAdvice,
 				branchName, r.database, branchName, r.org,
 			))}

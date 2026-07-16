@@ -47,12 +47,21 @@ type indexCatalogColumn struct {
 	desc    bool
 }
 
-// indexCatalogDef is a comparable index definition: uniqueness plus the
-// ordered key parts. INCLUDE columns, predicates, and access methods
-// beyond the FULLTEXT/SPATIAL normalization don't exist on MySQL, so
-// this is the complete definition surface the target catalog can hold.
+// indexCatalogDef is a comparable index definition: uniqueness, the
+// index type, plus the ordered key parts. INCLUDE columns and
+// predicates don't exist on MySQL, so this is the complete definition
+// surface the target catalog can hold.
 type indexCatalogDef struct {
-	unique  bool
+	unique bool
+	// kind is the normalized upper-case access method ("BTREE", "HASH",
+	// "FULLTEXT", "SPATIAL"); "" means the side doesn't report one (an
+	// intended index whose IR kind is unspecified emits no USING clause,
+	// so there is nothing to hold the catalog to). Compared only when
+	// BOTH sides report one (audit 2026-07-16): the FULLTEXT/SPATIAL
+	// column normalization below erases the per-column distinguishing
+	// signal, so without this field a same-name FULLTEXT vs SPATIAL
+	// over the same columns compared EQUAL.
+	kind    string
 	columns []indexCatalogColumn
 }
 
@@ -63,7 +72,7 @@ type indexCatalogDef struct {
 // drops them here too.
 func intendedIndexCatalogDef(idx *ir.Index) indexCatalogDef {
 	keyed := idx.Kind != ir.IndexKindFullText && idx.Kind != ir.IndexKindSpatial
-	def := indexCatalogDef{unique: idx.Unique && keyed}
+	def := indexCatalogDef{unique: idx.Unique && keyed, kind: intendedIndexKind(idx.Kind)}
 	for _, c := range idx.Columns {
 		col := indexCatalogColumn{
 			name: strings.ToLower(c.Column),
@@ -78,10 +87,33 @@ func intendedIndexCatalogDef(idx *ir.Index) indexCatalogDef {
 	return def
 }
 
+// intendedIndexKind maps the IR kinds [emitAddIndexClause] renders into
+// DDL onto the catalog's INDEX_TYPE vocabulary. Every other kind
+// (Unspecified included) emits no USING clause — the server picks — so
+// the intended side reports nothing and the type compare stays silent.
+func intendedIndexKind(k ir.IndexKind) string {
+	switch k {
+	case ir.IndexKindBTree:
+		return "BTREE"
+	case ir.IndexKindHash:
+		return "HASH"
+	case ir.IndexKindFullText:
+		return "FULLTEXT"
+	case ir.IndexKindSpatial:
+		return "SPATIAL"
+	default:
+		return ""
+	}
+}
+
 // indexCatalogDefsEqual reports whether the two definitions match part
-// for part.
+// for part. The index type participates only when both sides report
+// one (see [indexCatalogDef].kind).
 func indexCatalogDefsEqual(a, b indexCatalogDef) bool {
 	if a.unique != b.unique || len(a.columns) != len(b.columns) {
+		return false
+	}
+	if a.kind != "" && b.kind != "" && a.kind != b.kind {
 		return false
 	}
 	for i := range a.columns {
@@ -93,7 +125,10 @@ func indexCatalogDefsEqual(a, b indexCatalogDef) bool {
 }
 
 // formatIndexCatalogDef renders a definition for the drift WARN —
-// compact DDL-ish shape: `UNIQUE (a, b(10) DESC, (<expression>))`.
+// compact DDL-ish shape: `UNIQUE (a, b(10) DESC, (<expression>))`,
+// `FULLTEXT (txt)`, `(k) USING HASH`. BTREE (the InnoDB default) and an
+// unreported kind render nothing — every definition would carry it, so
+// it would be pure noise where it can't be the divergence.
 func formatIndexCatalogDef(d indexCatalogDef) string {
 	parts := make([]string, len(d.columns))
 	for i, c := range d.columns {
@@ -109,11 +144,18 @@ func formatIndexCatalogDef(d indexCatalogDef) string {
 		}
 		parts[i] = s
 	}
-	prefix := ""
-	if d.unique {
-		prefix = "UNIQUE "
+	prefix, suffix := "", ""
+	switch d.kind {
+	case "FULLTEXT", "SPATIAL":
+		prefix = d.kind + " "
+	case "", "BTREE":
+	default:
+		suffix = " USING " + d.kind
 	}
-	return prefix + "(" + strings.Join(parts, ", ") + ")"
+	if d.unique {
+		prefix += "UNIQUE "
+	}
+	return prefix + "(" + strings.Join(parts, ", ") + ")" + suffix
 }
 
 // probeIndexCatalogDefs reads the catalog definitions of the named
@@ -162,6 +204,7 @@ func probeIndexCatalogDefs(ctx context.Context, db *sql.DB, schema, table string
 		key := strings.ToLower(name)
 		def := out[key]
 		def.unique = nonUnique == 0 && !unkeyed
+		def.kind = strings.ToUpper(indexType)
 		def.columns = append(def.columns, col)
 		out[key] = def
 	}
@@ -207,8 +250,11 @@ func (w *SchemaWriter) warnOnSkippedIndexDefinitionDrift(ctx context.Context, jo
 			continue
 		}
 		msg := "mysql: an index with this name already exists with a DIFFERENT definition — the build skips it, leaving the existing index in place; drop/rename it first if the source definition is the one you want (audit MED-D0-8)"
-		if want.unique != got.unique {
+		switch {
+		case want.unique != got.unique:
 			msg = "mysql: an index with this name already exists with DIFFERENT UNIQUENESS — the build skips it, so the EXISTING definition decides which duplicate writes the target accepts or refuses, silently diverging from the source; drop/rename it first if the source definition is the one you want (audit MED-D0-8)"
+		case want.kind != "" && got.kind != "" && want.kind != got.kind:
+			msg = "mysql: an index with this name already exists with a DIFFERENT TYPE — the build skips it, so the EXISTING access method decides which queries the index can serve (a FULLTEXT/SPATIAL/HASH mismatch changes its semantics entirely), silently diverging from the source; drop/rename it first if the source definition is the one you want (audit MED-D0-8)"
 		}
 		slog.WarnContext(ctx, msg,
 			slog.String("table", job.tableName),

@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted (implemented, 2026-07-15).** Roadmap item 55 Phases 2 and 3 (`docs/research/flat-file-sources.md`). Phase 1 (the mydumper source engine) is ADR-0161.
+**Accepted (implemented 2026-07-15, shipped v0.99.250).** Roadmap item 55 Phases 2 and 3 (`docs/research/flat-file-sources.md`). Phase 1 (the mydumper source engine) is ADR-0161.
 
 ## Context
 

@@ -130,6 +130,55 @@ func TestIndexDrift_DifferentUniquenessWarnsNamingTheDuplicateHazard(t *testing.
 	}
 }
 
+// TestIndexDrift_DifferentTypeWarnsNamingTheAccessMethod pins the
+// audit-2026-07-16 type-blindness fix: a same-name index over the SAME
+// columns but a different access method (here intended BTREE vs an
+// existing FULLTEXT — whose SUB_PART/COLLATION normalization used to
+// erase every distinguishing signal) compared EQUAL before the kind
+// field existed. The compare fires only when BOTH sides report a type;
+// the intended side reports one exactly when the IR kind reaches
+// [emitAddIndexClause]'s DDL (BTREE/HASH/FULLTEXT/SPATIAL).
+func TestIndexDrift_DifferentTypeWarnsNamingTheAccessMethod(t *testing.T) {
+	w, _ := driftTestWriter(t, map[string]fakeIndexDef{
+		"t_v_idx": {columns: []string{"v"}, indexType: "FULLTEXT"},
+	})
+	schema := driftSchema(&ir.Index{Name: "t_v_idx", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "v"}}})
+
+	var runErr error
+	logged := captureWarnLog(t, func() { runErr = w.CreateIndexes(context.Background(), schema) })
+	if runErr != nil {
+		t.Fatalf("CreateIndexes: %v", runErr)
+	}
+	for _, want := range []string{
+		"DIFFERENT TYPE",
+		"access method",
+		`existing_definition="FULLTEXT (v)"`,
+		`intended_definition=(v)`, // BTREE (the default) renders nothing
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("type WARN missing %q:\n%s", want, logged)
+		}
+	}
+}
+
+// TestIndexDrift_UnspecifiedIntendedKindStaysQuietOnType pins the
+// both-sides-report-it carve-out: an intended index whose IR kind is
+// unspecified emits no USING clause — the server picks the access
+// method — so the catalog's BTREE must not be flagged against it.
+func TestIndexDrift_UnspecifiedIntendedKindStaysQuietOnType(t *testing.T) {
+	w, _ := driftTestWriter(t, nil) // default served def: non-unique BTREE (v)
+	schema := driftSchema(&ir.Index{Name: "t_v_idx", Columns: []ir.IndexColumn{{Column: "v"}}})
+
+	var runErr error
+	logged := captureWarnLog(t, func() { runErr = w.CreateIndexes(context.Background(), schema) })
+	if runErr != nil {
+		t.Fatalf("CreateIndexes: %v", runErr)
+	}
+	if strings.Contains(logged, "DIFFERENT") {
+		t.Errorf("type compare fired for an unspecified intended kind:\n%s", logged)
+	}
+}
+
 // TestIndexDrift_FallbackReprobeCarriesTheAdvisory pins the second
 // audit-named site: the ADR-0148 fallback's still-pending re-probe skips
 // by name too, and a same-name-diff-def index gets the same WARN there.
@@ -175,18 +224,23 @@ func TestIntendedIndexCatalogDef(t *testing.T) {
 			"UNIQUE (v)",
 		},
 		{
-			"fulltext drops unique and prefix",
+			"fulltext drops unique and prefix, renders its kind",
 			&ir.Index{Name: "i", Kind: ir.IndexKindFullText, Unique: true, Columns: []ir.IndexColumn{
 				{Column: "txt", Length: 32},
 			}},
-			"(txt)",
+			"FULLTEXT (txt)",
 		},
 		{
-			"spatial drops prefix",
+			"spatial drops prefix, renders its kind",
 			&ir.Index{Name: "i", Kind: ir.IndexKindSpatial, Columns: []ir.IndexColumn{
 				{Column: "pt", Length: 32},
 			}},
-			"(pt)",
+			"SPATIAL (pt)",
+		},
+		{
+			"hash renders its kind as the USING clause",
+			&ir.Index{Name: "i", Kind: ir.IndexKindHash, Columns: []ir.IndexColumn{{Column: "k"}}},
+			"(k) USING HASH",
 		},
 		{
 			"expression entry matches positionally",

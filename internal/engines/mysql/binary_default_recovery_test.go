@@ -130,6 +130,10 @@ func TestScanQuotedStringDelim_Matrix(t *testing.T) {
 		{"unknown escape drops backslash", `Q\qQ`, "q", -1},
 		{"LIKE escapes keep backslash", `Qa\%b\_cQ`, `a\%b\_c`, -1},
 		{"escape then trailing text", `Qa\QbQ)`, "aQb", 6},
+		// Escape-adjacency corners (audit 2026-07-16: previously sampled
+		// around, not on — FuzzScanQuotedStringDelim seeds these too).
+		{"escape adjacent to doubled delimiter", `Q\QQQQ`, "QQ", -1},
+		{"doubled delimiter then escaped delimiter", `QQQ\QQ`, "QQ", -1},
 	}
 	for _, delim := range []byte{'\'', '"'} {
 		other := byte('"')

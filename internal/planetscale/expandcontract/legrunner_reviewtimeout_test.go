@@ -35,7 +35,11 @@ func TestLegRunner_ReviewTimeoutKeepsBranchAndNamesIt(t *testing.T) {
 	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
 	for _, want := range []string{
 		"did not become deployable",
-		"approve it and re-run",                     // the injected reviewTimeoutAdvice
+		// The manual escape names BOTH steps — approval alone deploys
+		// nothing because sluice never sets auto-apply (audit 2026-07-16).
+		"approve it AND deploy it from the PlanetScale UI",
+		"approval alone deploys nothing",
+		"then approve it and re-run",                // the injected reviewTimeoutAdvice, spliced after the escape
 		`"sluice-gate-review" was KEPT`,             // the exemption, named
 		"pscale branch delete d sluice-gate-review", // the post-close recipe
 		"would close the still-open deploy request", // the why

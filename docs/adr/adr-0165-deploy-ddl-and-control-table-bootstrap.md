@@ -1,6 +1,6 @@
 # ADR-0165: `sluice deploy-ddl` + the control-table bootstrap (`sluice control-tables ddl`, coded Error-1105 refusal)
 
-- **Status:** Accepted (implemented; roadmap item 66)
+- **Status:** Accepted (shipped v0.99.254; roadmap item 66)
 - **Date:** 2026-07-15
 - **Related:** ADR-0162 (the expand-contract orchestration this extracts from — the leg machine, the stale-base freshness gate, the safe-migrations findings), ADR-0148 (the deploy-request ground truth), ADR-0082 (the migrate-state tables the bootstrap ships).
 

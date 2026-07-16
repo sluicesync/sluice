@@ -1,6 +1,6 @@
 # ADR-0167: legRunner pre-deploy gates — DR-diff blast-radius assertion + post-wait freshness recheck
 
-- **Status:** Accepted (implemented; audit 2026-07-15 task M1.9 / finding MED-D0-7)
+- **Status:** Accepted (shipped v0.99.258; audit 2026-07-15 task M1.9 / finding MED-D0-7)
 - **Date:** 2026-07-15
 - **Related:** ADR-0162 (the stale-base freshness gate this closes the TOCTOU window of; its finding 3 is the empirical basis), ADR-0165 (the shared `legRunner` all three consumers compose), ADR-0148 (the deploy-request ground truth; its live prototype exercised the diff endpoint).
 

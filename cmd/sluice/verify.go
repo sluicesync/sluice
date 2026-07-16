@@ -155,13 +155,13 @@ func verifyExitError(result *pipeline.VerifyResult) error {
 	}
 	s := result.Summary
 	switch {
-	case s.TablesMismatch > 0:
+	case result.HasMismatch():
 		summary := fmt.Sprintf("%d table(s) with row-count mismatch", s.TablesMismatch)
-		if s.TablesUnverified > 0 {
+		if result.HasUnverified() {
 			summary += fmt.Sprintf("; %d table(s) could not be verified", s.TablesUnverified)
 		}
 		return driftError{summary: summary}
-	case s.TablesUnverified > 0:
+	case result.HasUnverified():
 		return operationalError{err: fmt.Errorf("verify incomplete: %d table(s) could not be verified (see the SKIPPED rows in the report) — an unverified table is not a pass", s.TablesUnverified)}
 	}
 	return nil

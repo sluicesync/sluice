@@ -350,10 +350,10 @@ func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl s
 		errPrefix:     "expand-contract " + kind,
 		passwordName:  "sluice-expand-contract",
 
-		leftoverAdvice:        "continue with --resume-from " + legAfter(kind),
-		alreadyDeployedAdvice: "close the DR, delete the dev branch, and continue with --resume-from " + legAfter(kind),
-		reviewTimeoutAdvice:   "approve it and re-run with --resume-from " + string(o.resumeFrom()),
-		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume-from " + legAfter(kind) + " once it completes",
+		leftoverAdvice:        continueAdvice(kind),
+		alreadyDeployedAdvice: "close the DR, delete the dev branch, and " + continueAdvice(kind),
+		reviewTimeoutAdvice:   continueAdvice(kind),
+		deployTimeoutAdvice:   "watch it at the URL; once it completes, " + continueAdvice(kind),
 
 		// Pre-Deploy blast-radius assertion (audit MED-D0-7): both legs
 		// intend to touch exactly --table; the expand leg additionally
@@ -382,13 +382,23 @@ func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl s
 	return r.run(ctx, branchName, ddl, cleanup)
 }
 
-// legAfter names the --resume-from value that skips past a completed
-// leg, for the leftover-branch guidance.
-func legAfter(kind string) string {
+// continueAdvice is the "this leg's DDL is (or ends up) deployed —
+// what now" guidance the legRunner splices into its refusal/timeout
+// messages. After expand the pattern continues at the migrate leg.
+// After contract there IS no next leg: the earlier advice spliced
+// `--resume-from contract`, sending the operator back into the very
+// leg that would refuse again (`no_changes` / refuse-on-leftover — the
+// circular-advice loop audit 2026-07-16 flagged), so the honest advice
+// is that the pattern is complete, with the verify gate as the
+// reassurance check.
+func continueAdvice(kind string) string {
 	if kind == "expand" {
-		return string(LegMigrate)
+		return "continue with --resume-from " + string(LegMigrate)
 	}
-	return string(LegContract)
+	return "stop — the expand→migrate→contract pattern is complete; do not re-run " +
+		"(--resume-from contract would refuse on the already-deployed DDL). For reassurance " +
+		"the verify gate re-runs standalone: sluice backfill --verify-only with the same " +
+		"--table/--where (while the guard's columns still exist post-contract)"
 }
 
 // execDDLFunc resolves the injected ExecDDL fake or the real

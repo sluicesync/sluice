@@ -60,8 +60,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      # SHA-pinned (not the mutable tags) like release.yml/psverify.yml:
+      # this job holds no secrets, but it IS a merge signal for parquet-go
+      # bumps (dependabot-automerge holds them for this run), so a
+      # re-pointed action tag could quietly green-wash the one
+      # independent-reader gate the boundary has. duckdb/duckdb:latest
+      # below stays deliberately UNpinned — tracking what external
+      # readers actually run is the job's purpose.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -86,7 +93,7 @@ jobs:
       # investigation (the parquet files reproduce the read locally).
       - name: Upload the export + comparison inputs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: duckdb-verify-${{ github.run_id }}
           path: duckdb-out/

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -101,6 +102,57 @@ func TestStageOnce_ZeroValueEngineStagesPerOpen(t *testing.T) {
 		t.Fatalf("CountRows after the schema reader closed its own copy: %v", err)
 	}
 	closeIf(rr)
+}
+
+// TestStageShare_ConcurrentAcquireReleaseHammer hammers the refcounted
+// share from many goroutines (audit 2026-07-16: the prior pins were
+// sequential-only, so CI's -race job was vacuous over the refcount —
+// this test is what makes -race actually cover it). Correctness floor
+// pinned without ordering assumptions: every acquire hands back a live
+// staged copy however the other goroutines interleave their releases,
+// every release succeeds exactly once, and after the last release
+// nothing is left on disk.
+func TestStageShare_ConcurrentAcquireReleaseHammer(t *testing.T) {
+	ctx := context.Background()
+	stageDir := t.TempDir()
+	e := csvEngine(t, Options{HeaderDeclared: true, Header: true, StageDir: stageDir})
+	src := writeSource(t, "orders.csv", "a,b\n1,\"x\"\n2,\"y\"\n")
+
+	const goroutines, iterations = 8, 20
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				staged, release, err := e.acquireStaged(ctx, src)
+				if err != nil {
+					errs <- err
+					return
+				}
+				// The handed-out copy must be live for as long as the
+				// reference is held, however the other goroutines
+				// interleave their releases.
+				if _, err := os.Stat(staged); err != nil {
+					errs <- err
+					return
+				}
+				if err := release(); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("hammer goroutine: %v", err)
+	}
+	if got := stagedFilesIn(t, stageDir); len(got) != 0 {
+		t.Errorf("staged copies after the hammer drained = %d (%v); want 0", len(got), got)
+	}
 }
 
 // TestStageDir_MissingDirectoryRefusesLoudly pins the --stage-dir

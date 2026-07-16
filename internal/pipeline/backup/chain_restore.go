@@ -753,10 +753,14 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 // could also relabel the segment `full` to take this skip. A manifest carrying
 // ChangeChunks IS a CDC segment whatever its label says, so it never skips. The
 // conservative residual: evading BOTH keys means relabeling to full AND
-// stripping the ChangeChunks — which degrades the tamper to the emptied-window
-// shape the chain walk refuses via the EndPosition-reached backstop
-// (Bug 183/184) and breaks the segment structure the lineage walk derives from
-// fulls. Full tamper-proofing remains signing (--require-signature).
+// stripping the ChangeChunks — that segment then routes through the FULL apply
+// path, where the Bug-183/184 EndPosition-reached backstop does NOT run
+// (it lives on the incremental walk), so the real protection is different:
+// applying zero changes for the window makes the tamper EQUIVALENT to
+// dropping the chain tail at that segment, and unsigned tail truncation is
+// the class only signing closes (audit 2026-07-16 corrected the earlier
+// Bug-183/184 citation here). Full tamper-proofing remains signing
+// (--require-signature).
 func verifyBackupIDs(links []lineage.SegmentRecord) error {
 	for i := range links {
 		m := links[i].Manifest

@@ -177,7 +177,7 @@ func (d *DDLDeployer) legRunner() *legRunner {
 		// is simply done, so the guidance ends there.
 		leftoverAdvice:        "there is nothing left to run",
 		alreadyDeployedAdvice: "the --ddl is already applied on the production branch and there is nothing left to ship; close the DR",
-		reviewTimeoutAdvice:   "approve it and re-run",
+		reviewTimeoutAdvice:   "the --ddl is shipped and nothing further is needed",
 		deployTimeoutAdvice:   "watch it at the URL — once it completes the DDL is deployed and nothing further is needed",
 
 		// expectedDiffTables stays empty BY DESIGN: --ddl is an

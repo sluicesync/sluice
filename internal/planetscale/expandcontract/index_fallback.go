@@ -120,7 +120,7 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 		// so an already-deployed DR's indexes are detected and skipped.
 		leftoverAdvice:        "continue with --resume (the index phase re-probes the target and rebuilds only what is still missing)",
 		alreadyDeployedAdvice: "close the DR, delete the dev branch, and re-run with --resume — the index phase detects already-built indexes and skips them",
-		reviewTimeoutAdvice:   "approve it and re-run with --resume",
+		reviewTimeoutAdvice:   "re-run with --resume (already-built indexes are detected and skipped)",
 		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume once it completes — already-deployed indexes are detected and skipped",
 
 		// Pre-Deploy blast-radius assertion (audit MED-D0-7): the

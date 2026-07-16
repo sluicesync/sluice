@@ -1,6 +1,6 @@
 # ADR-0147: OLAP workload mode for large-table row counts on Vitess/PlanetScale
 
-- **Status:** Accepted — **implemented on `main` (`4d3648de`)**: `ExactRowCount` uses `olapCount` (dedicated-conn `SET workload='olap'; COUNT(*)`) as the primary on vtgate flavors (`usesVStream()`), with a WARN-logged fallback to the unchanged `chunkedCount`/`singleShotCount` path; vanilla MySQL unchanged. The fallback-removal follow-up remains open.
+- **Status:** Accepted — **shipped v0.99.172 (`4d3648de`)**: `ExactRowCount` uses `olapCount` (dedicated-conn `SET workload='olap'; COUNT(*)`) as the primary on vtgate flavors (`usesVStream()`), with a WARN-logged fallback to the unchanged `chunkedCount`/`singleShotCount` path; vanilla MySQL unchanged. The fallback-removal follow-up remains open.
 - **Date:** 2026-07-02
 - **Related:** ADR-0107 (PlanetScale target telemetry), the v0.99.15 "never set `workload=olap` session-wide" lesson (`internal/engines/mysql/row_reader.go` already uses OLAP on a dedicated connection for the no-PK full-scan read). Supersedes the working assumption that `verify`'s chunked-PK count exists to dodge a *row-read* cap.
 
