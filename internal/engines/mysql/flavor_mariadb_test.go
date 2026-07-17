@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"testing"
@@ -11,7 +12,59 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// TestMariaDBPreflightCDCScope pins the add-table CDC-scope guard
+// (ADR-0170) as a class: BOTH native families that break the CDC binlog
+// decode — ir.UUID (from native uuid) and ir.Inet (from native
+// inet6/inet4) — refuse with the coded error naming the column, a
+// plain-column table passes, and a NON-mariadb flavor is a no-op (those
+// IR types are text-backed VARCHARs there and decode correctly).
+func TestMariaDBPreflightCDCScope(t *testing.T) {
+	tbl := func(colName string, typ ir.Type) []*ir.Table {
+		return []*ir.Table{{
+			Name: "items",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 4}},
+				{Name: colName, Type: typ},
+			},
+		}}
+	}
+	cases := []struct {
+		name       string
+		flavor     Flavor
+		tables     []*ir.Table
+		wantRefuse bool
+	}{
+		{"mariadb native uuid refused", FlavorMariaDB, tbl("u", ir.UUID{}), true},
+		{"mariadb native inet refused", FlavorMariaDB, tbl("ip", ir.Inet{}), true},
+		{"mariadb plain columns pass", FlavorMariaDB, tbl("name", ir.Varchar{Length: 64}), false},
+		{"vanilla uuid is a no-op (text-backed varchar there)", FlavorVanilla, tbl("u", ir.UUID{}), false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			err := (Engine{Flavor: c.flavor}).PreflightCDCScope(context.Background(), c.tables)
+			if !c.wantRefuse {
+				if err != nil {
+					t.Fatalf("PreflightCDCScope = %v; want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("PreflightCDCScope = nil; want the coded native-type refusal")
+			}
+			ce, ok := sluicecode.FromError(err)
+			if !ok || ce.Code != sluicecode.CodeCDCMariaDBNativeTypeUnsupported {
+				t.Fatalf("code = %v; want %s", err, sluicecode.CodeCDCMariaDBNativeTypeUnsupported)
+			}
+			if !strings.Contains(err.Error(), "items.") {
+				t.Errorf("refusal should name the offending table.column; got %s", err)
+			}
+		})
+	}
+}
 
 // TestMariaDBCapabilities pins the load-bearing pieces of the mariadb
 // declaration (roadmap item 73): bulk source+target with the LOAD DATA

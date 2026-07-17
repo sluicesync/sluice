@@ -27,6 +27,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -277,6 +278,65 @@ func TestStreamer_MariaDBToPostgres(t *testing.T) {
 	case <-runErr2:
 	case <-time.After(15 * time.Second):
 		t.Fatal("phase J: streamer2.Run did not return after ctx cancel")
+	}
+}
+
+// TestStreamer_MariaDBToMySQL_NativeUUIDRefusedPreData is the direct proof
+// that the ADR-0170 native-uuid/inet refusal closes the MySQL-family-target
+// SILENT-corruption path: a MariaDB source with a native uuid column,
+// synced to a MYSQL target (whose CHAR(36) would silently accept a
+// mis-decoded binlog string), must refuse with the coded error PRE-DATA —
+// the refusal fires in the snapshot opener, before the bulk copy, so the
+// MySQL target gets ZERO rows (no chance for any value, right or wrong, to
+// land). This is the target that would corrupt silently without the
+// refusal (a PG target rejects the bad string loudly; a MySQL target does
+// not).
+func TestStreamer_MariaDBToMySQL_NativeUUIDRefusedPreData(t *testing.T) {
+	srcDSN, srcCleanup := startMariaDBBinlog(t)
+	defer srcCleanup()
+	_, mysqlTargetDSN, mysqlCleanup := startMySQLBinlog(t)
+	defer mysqlCleanup()
+
+	applyMariaDBSQL(t, srcDSN, `
+		CREATE TABLE items (
+			id INT NOT NULL,
+			u  UUID NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB;
+		INSERT INTO items (id, u) VALUES (1, '11111111-1111-1111-1111-111111111111');`)
+
+	mariaEng, ok := engines.Get("mariadb")
+	if !ok {
+		t.Fatal("mariadb engine not registered")
+	}
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	s := &Streamer{
+		Source:    mariaEng,
+		Target:    mysqlEng,
+		SourceDSN: srcDSN,
+		TargetDSN: mysqlTargetDSN,
+		StreamID:  "test-mariadb-mysql-native",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	err := s.Run(ctx)
+	if err == nil {
+		t.Fatal("mariadb → mysql sync with a native uuid column SUCCEEDED; want the coded native-type refusal — " +
+			"a MySQL-family target (CHAR(36)) would SILENTLY accept the mis-decoded binlog bytes")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeCDCMariaDBNativeTypeUnsupported {
+		t.Fatalf("Run err = %v; want coded %s", err, sluicecode.CodeCDCMariaDBNativeTypeUnsupported)
+	}
+	// Pre-data: the refusal fires in the snapshot opener, before the bulk
+	// copy — so the MySQL target got NO rows. pollRowCountMySQL tolerates
+	// an absent table (returns 0).
+	if n := pollRowCountMySQL(mysqlTargetDSN, "items"); n != 0 {
+		t.Errorf("mysql target items row count = %d; want 0 (the refusal must be pre-data — nothing copied)", n)
 	}
 }
 

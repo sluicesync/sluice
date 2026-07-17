@@ -1309,18 +1309,35 @@ type DSNValidator interface {
 // CDC=None" message.
 //
 // ExplainCDCUnsupported returns nil when the engine has no flavor-
-// specific story (the orchestrator falls back to its generic
-// refusal), so a multi-flavor engine implements the method once and
-// answers only for the flavors that need it. The mysql engine's
-// `mariadb` flavor is the current implementer: its CDC gap is a
-// concrete, roadmapped position-format issue (MariaDB domain GTIDs,
-// roadmap item 73 Phase 3) with concrete alternatives (bulk migrate +
-// cutover, backup/restore), and the generic message would hide both.
+// specific story (the orchestrator falls back to its generic refusal),
+// so a multi-flavor engine implements the method once and answers only
+// for the flavors that need it. No engine currently implements it — the
+// mysql `mariadb` flavor did in Phase 1, but MariaDB CDC shipped in
+// Phase 3 (ADR-0170); the surface remains for a future CDCNone flavor.
 //
 // The orchestrator consults it ONLY after Capabilities().CDC == CDCNone
 // — a non-nil return never overrides a real CDC declaration.
 type CDCUnsupportedExplainer interface {
 	ExplainCDCUnsupported() error
+}
+
+// CDCScopePreflighter is the optional source-engine surface consulted
+// before a set of tables enters an ACTIVE CDC stream's scope mid-stream
+// (the `schema add-table` flow). It returns a loud error when a table
+// carries a column the engine's CDC decode path cannot faithfully stream
+// — the mid-stream analogue of the per-engine preflight the CDC reader
+// runs at stream start (which the live stream already passed and does not
+// re-run when add-table extends its scope).
+//
+// The mysql engine's `mariadb` flavor is the current implementer: a
+// native uuid/inet column reads correctly under bulk `migrate` but its
+// binlog CDC value-decode is not yet implemented (ADR-0170), and a
+// MySQL-family target would SILENTLY accept the mis-decoded value — so
+// add-table refuses it with the same coded error the stream-start
+// preflight uses. Engines whose CDC path handles every column they read
+// need not implement it; nil error = every table is streamable.
+type CDCScopePreflighter interface {
+	PreflightCDCScope(ctx context.Context, tables []*Table) error
 }
 
 // SourceHostAdvisory is one operator advisory a [SourceHostAdvisor]

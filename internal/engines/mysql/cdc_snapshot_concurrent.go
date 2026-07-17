@@ -183,6 +183,12 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		_ = db.Close()
 		return nil, err
 	}
+	// ADR-0170: MariaDB native uuid/inet CDC refusal, before the FTWRL
+	// window and bulk copy (same rationale as the serial opener).
+	if err := scanMariaDBNativeUUIDInet(ctx, db, e.Flavor, cfg.DBName, nil); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Acquire the consistent N-snapshot (FTWRL → N pinned CONSISTENT SNAPSHOT
 	// conns → record ONE binlog position P → UNLOCK). Extracted so the

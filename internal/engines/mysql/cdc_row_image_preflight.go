@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -147,6 +148,110 @@ func preflightBinlogRowImage(ctx context.Context, q rowQuerier) error {
 		}
 	}
 	return nil
+}
+
+// preflightMariaDBNativeUUIDInet refuses CDC (coded, pre-data, on ALL
+// targets) when a MariaDB source has a native uuid / inet6 / inet4 column
+// in the CDC reader's scope. It runs at every CDC start
+// ([CDCReader.StreamChanges]); the snapshot openers call the shared
+// [scanMariaDBNativeUUIDInet] directly so a cold start refuses BEFORE the
+// bulk copy, and the mid-stream add-table analogue is
+// [Engine.PreflightCDCScope].
+//
+// Why a source-side stream-start refusal, not a decode-time error: the
+// binlog carries these native types as RAW storage bytes (16 for
+// uuid/inet6, 4 for inet4), which [decodeValue]'s ir.UUID/ir.Inet handler
+// — written for MySQL, where these live in VARCHAR columns whose binlog
+// bytes ARE the text — would stringify into a wrong value. A Postgres
+// target rejects that string loudly (22P02), but a MySQL-family target
+// (CHAR(36)/VARCHAR(45)) would SILENTLY ACCEPT it — a reachable silent
+// corruption on mariadb → mysql / mariadb / planetscale CDC. Refusing at
+// stream start is target-independent (the stream never opens, so no
+// target can see a wrong value), pre-data, and names the offending
+// schema.table.column. Flavor-aware binlog decode of these types is a
+// filed follow-up (roadmap item 73 P3 / ADR-0170).
+func (r *CDCReader) preflightMariaDBNativeUUIDInet(ctx context.Context) error {
+	return scanMariaDBNativeUUIDInet(ctx, r.db, r.flavor, r.schema, r.cdcDBInScope)
+}
+
+// scanMariaDBNativeUUIDInet is the shared implementation behind the CDC
+// reader's stream-start preflight and the snapshot openers' pre-bulk-copy
+// refusal. flavor gates it to MariaDB (non-MariaDB return nil immediately:
+// a MySQL / PlanetScale / Vitess source only maps a column to
+// ir.UUID/ir.Inet from a text-backed VARCHAR, which decodes correctly, so
+// the native-binary hazard is MariaDB-only). schema is the bound database
+// ("" for the ADR-0074 server-wide reader); inScope is the multi-database
+// predicate (nil ⇒ only `schema` is in scope, matching
+// [CDCReader.databaseInScope]).
+func scanMariaDBNativeUUIDInet(ctx context.Context, db *sql.DB, flavor Flavor, schema string, inScope func(string) bool) error {
+	if flavor != FlavorMariaDB {
+		return nil
+	}
+	pctx, cancel := context.WithTimeout(ctx, rowImagePreflightTimeout)
+	defer cancel()
+
+	// Scope-filter in Go via the inScope predicate so the SAME query serves
+	// the single-database reader and the ADR-0074 multi-database fan-out;
+	// the bound-schema fast-path narrows the scan when a database is bound.
+	query := `SELECT table_schema, table_name, column_name, LOWER(data_type)
+		FROM information_schema.columns
+		WHERE LOWER(data_type) IN ('uuid','inet4','inet6')`
+	var args []any
+	if schema != "" {
+		query += ` AND table_schema = ?`
+		args = append(args, schema)
+	}
+	rows, err := db.QueryContext(pctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("mariadb: cdc: preflight native uuid/inet columns: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	inScopeOf := func(sch string) bool {
+		if inScope != nil {
+			return inScope(sch)
+		}
+		return sch == schema
+	}
+	var offenders []string
+	for rows.Next() {
+		var sch, tbl, col, dt string
+		if err := rows.Scan(&sch, &tbl, &col, &dt); err != nil {
+			return fmt.Errorf("mariadb: cdc: preflight native uuid/inet columns: %w", err)
+		}
+		if !inScopeOf(sch) {
+			continue
+		}
+		offenders = append(offenders, fmt.Sprintf("%s.%s.%s (%s)", sch, tbl, col, dt))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mariadb: cdc: preflight native uuid/inet columns: %w", err)
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	sort.Strings(offenders)
+	return mariadbNativeUUIDInetRefusal(offenders)
+}
+
+// mariadbNativeUUIDInetRefusal builds the coded refusal shared by the
+// stream-start preflight and the add-table scope guard ([Engine.PreflightCDCScope]).
+func mariadbNativeUUIDInetRefusal(offenders []string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeCDCMariaDBNativeTypeUnsupported,
+		"use `sluice migrate` for these tables/columns (bulk uuid/inet copy is unaffected) and cut over, "+
+			"or exclude the native uuid/inet column from CDC scope",
+		fmt.Errorf(
+			"mariadb: cdc: the source has native uuid/inet6/inet4 column(s) in CDC scope that sluice cannot "+
+				"yet decode from the binlog — the binlog carries their raw storage bytes (16 for uuid/inet6, "+
+				"4 for inet4), NOT the text bulk copy reads, so streaming them would land a wrong value: a "+
+				"Postgres target rejects it loudly, but a MySQL-family target (CHAR(36)/VARCHAR(45)) would "+
+				"SILENTLY accept it. Refused at CDC start on ALL targets. Offending column(s): %s. Use bulk "+
+				"`sluice migrate` for these tables and cut over, or exclude the column from CDC scope. "+
+				"Native-uuid/inet CDC decode is roadmap item 73 P3 follow-up (ADR-0170)",
+			strings.Join(offenders, ", "),
+		),
+	)
 }
 
 // partialJSONUpdatesError builds the coded refusal for the

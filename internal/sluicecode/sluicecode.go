@@ -61,6 +61,11 @@ const (
 	CodeCDCMariaDBUnsupported    Code = "SLUICE-E-CDC-MARIADB-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// MariaDB native uuid/inet6/inet4 columns are unstreamable via CDC
+	// (the binlog carries raw storage bytes the decoder can't yet format);
+	// refused loudly at CDC start on ALL targets. See ADR-0170.
+	CodeCDCMariaDBNativeTypeUnsupported Code = "SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED"
+
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
@@ -143,8 +148,9 @@ var registry = map[Code]Info{
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
-	CodeCDCRowImagePartial:    {ClassRefusal, "the MySQL source streams partial binlog row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON), under which binlog CDC silently loses UPDATEs — refused at CDC start (or loudly mid-stream when a partial image slips past the global preflight)"},
-	CodeCDCMariaDBUnsupported: {ClassRefusal, "CDC (continuous sync / incremental backup) from a MariaDB source is not supported yet — MariaDB's domain-based GTID positions are roadmap item 73 Phase 3; use bulk migrate + cutover or backup/restore today"},
+	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL source streams partial binlog row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON), under which binlog CDC silently loses UPDATEs — refused at CDC start (or loudly mid-stream when a partial image slips past the global preflight)"},
+	CodeCDCMariaDBUnsupported:           {ClassRefusal, "CDC (continuous sync / incremental backup) from a MariaDB source is not supported yet — MariaDB's domain-based GTID positions are roadmap item 73 Phase 3; use bulk migrate + cutover or backup/restore today"},
+	CodeCDCMariaDBNativeTypeUnsupported: {ClassRefusal, "a MariaDB source has a native uuid / inet6 / inet4 column in CDC scope, which sluice cannot yet decode from the binlog (the binlog carries raw storage bytes, not the text bulk copy reads) — refused at CDC start on ALL targets rather than risk a silently-wrong value on a MySQL-family target; use bulk `sluice migrate` for those tables/columns (unaffected) or exclude the column. Native-uuid/inet CDC decode is roadmap item 73 P3 follow-up (ADR-0170)"},
 
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},

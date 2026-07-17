@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,58 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// TestMariaDB_CDCReader_NativeUUIDInet_LoudRefusal pins the ADR-0170
+// stream-start refusal that closes the MySQL-family-target SILENT-
+// corruption path: a MariaDB source with a native uuid / inet column in
+// CDC scope must refuse LOUDLY + coded at StreamChanges, PRE-DATA (the
+// binlog stream never opens, so no target — Postgres OR MySQL-family —
+// can see a mis-decoded value). Class pin: BOTH native families (uuid AND
+// inet6) are named as offenders. Both LTS lines.
+func TestMariaDB_CDCReader_NativeUUIDInet_LoudRefusal(t *testing.T) {
+	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+		image := image
+		t.Run(image, func(t *testing.T) {
+			dsn := newMariaDB(t, image, "mdb_cdc_native")
+			execSQLScript(t, dsn, `
+				CREATE TABLE plain (id INT PRIMARY KEY, name VARCHAR(32)) ENGINE=InnoDB;
+				CREATE TABLE hasnative (id INT PRIMARY KEY, u UUID, ip6 INET6) ENGINE=InnoDB;`)
+
+			eng := Engine{Flavor: FlavorMariaDB}
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			rdr, err := eng.OpenCDCReader(ctx, dsn)
+			if err != nil {
+				t.Fatalf("OpenCDCReader: %v", err)
+			}
+			defer func() {
+				if c, ok := rdr.(interface{ Close() error }); ok {
+					_ = c.Close()
+				}
+			}()
+
+			_, streamErr := rdr.StreamChanges(ctx, ir.Position{})
+			if streamErr == nil {
+				t.Fatal("StreamChanges succeeded on a MariaDB source with native uuid/inet columns in scope; " +
+					"want the coded refusal PRE-DATA — a MySQL-family target would otherwise silently accept the " +
+					"mis-decoded binlog bytes")
+			}
+			ce, ok := sluicecode.FromError(streamErr)
+			if !ok || ce.Code != sluicecode.CodeCDCMariaDBNativeTypeUnsupported {
+				t.Fatalf("stream error = %v; want coded %s", streamErr, sluicecode.CodeCDCMariaDBNativeTypeUnsupported)
+			}
+			// Class pin: both native families named (uuid AND inet6).
+			for _, want := range []string{"hasnative.u (uuid)", "hasnative.ip6 (inet6)"} {
+				if !strings.Contains(streamErr.Error(), want) {
+					t.Errorf("refusal must name offender %q; got: %s", want, streamErr)
+				}
+			}
+		})
+	}
+}
 
 // TestMariaDB_CDCReader_ResumeAfterKill pins exactly-once warm resume on
 // both LTS lines: stream a change, capture its domain-GTID position, close

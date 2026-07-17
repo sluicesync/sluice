@@ -438,6 +438,15 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, err
 	}
 
+	// MariaDB-only (ADR-0170): refuse loudly + coded if any in-scope table
+	// has a native uuid/inet column, whose binlog raw-bytes decode is not
+	// yet implemented — a MySQL-family target would otherwise SILENTLY
+	// accept the mis-decoded value. Target-independent, pre-data. No-op on
+	// every other flavor.
+	if err := r.preflightMariaDBNativeUUIDInet(ctx); err != nil {
+		return nil, err
+	}
+
 	startPos, err := r.resolveStartPosition(ctx, from)
 	if err != nil {
 		return nil, err

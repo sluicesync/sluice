@@ -353,7 +353,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 		)
 	}
 
-	if err := preflightAddTable(ctx, scoped, rw); err != nil {
+	if err := preflightAddTable(ctx, a.Source, scoped, rw); err != nil {
 		return err
 	}
 
@@ -1086,7 +1086,20 @@ func isolateTable(src *ir.Schema, tableName string) (*ir.Schema, error) {
 // check — same pattern as preflightColdStart. A table that doesn't
 // yet exist on the target counts as empty (the IsTableEmpty
 // contract).
-func preflightAddTable(ctx context.Context, scoped *ir.Schema, rw ir.RowWriter) error {
+func preflightAddTable(ctx context.Context, source ir.Engine, scoped *ir.Schema, rw ir.RowWriter) error {
+	// Source-side CDC-scope guard (ADR-0170): the live stream already
+	// passed its stream-start CDC preflight, but add-table extends that
+	// stream's scope without re-opening it — so a newly-added table with a
+	// column the source's CDC path cannot faithfully stream (MariaDB
+	// native uuid/inet) must be refused HERE, or it would be mis-decoded
+	// mid-stream (silently on a MySQL-family target). Optional surface;
+	// engines that decode every column they read do not implement it.
+	if pf, ok := source.(ir.CDCScopePreflighter); ok {
+		if err := pf.PreflightCDCScope(ctx, scoped.Tables); err != nil {
+			return err
+		}
+	}
+
 	checker, ok := rw.(ir.TableEmptyChecker)
 	if !ok {
 		slog.DebugContext(ctx, "add-table: target row writer does not implement TableEmptyChecker; skipping pre-flight")
