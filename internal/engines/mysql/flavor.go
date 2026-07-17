@@ -51,10 +51,14 @@ const (
 	// current_timestamp() with empty extra), the row-alias upsert
 	// (`AS new` was never implemented — MariaDB keeps the legacy
 	// VALUES() spelling), and the utf8mb4_0900_* ↔ utf8mb4_uca1400_*
-	// collation families. CDC is CDCNone for Phase 1: MariaDB replicates
-	// with domain-based GTIDs the MySQL binlog reader cannot parse; the
-	// refusal is loud and coded (SLUICE-E-CDC-MARIADB-UNSUPPORTED),
-	// Phase 3 threads the vendored go-mysql MariaDB-GTID support.
+	// collation families. CDC is CDCBinlog (Phase 3, ADR-0170): MariaDB
+	// replicates with domain-based GTIDs, which the binlog reader parses
+	// via the vendored go-mysql MariaDB-GTID support (SLUICE-E-CDC-MARIADB-
+	// UNSUPPORTED is retained in the catalog but no longer emitted). Native
+	// uuid/inet6/inet4 columns decode faithfully through CDC (ADR-0171 —
+	// canonical big-endian, trailing-zero-stripped), so the P3 native-type
+	// refusal (SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED) is likewise
+	// retained-but-unemitted.
 	FlavorMariaDB
 )
 

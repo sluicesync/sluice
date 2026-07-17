@@ -83,21 +83,30 @@ func TestMariaDB_CDCReader_NativeUUIDInet_Decode(t *testing.T) {
 
 			// INSERT the family × shape matrix. Row 1 uses UPPERCASE input to
 			// pin lowercase-canonical normalization; every value is accepted
-			// by MariaDB's uuid variant validator.
+			// by MariaDB's uuid variant validator. Rows 6-9 are the inet6
+			// shapes where mariadbInet6Text DELIBERATELY diverges from Go's
+			// net/netip (IPv4-compatible dotted ::1.2.3.4 / ::0.1.0.0, and the
+			// 7-word-run non-dotted ::100 / ::ffff): the live-server SELECT is
+			// the oracle for those, so this pins the renderer against MariaDB
+			// on exactly the shapes where it must differ from the stdlib.
 			applyMySQL(t, dsn, `
 				INSERT INTO nat (id, u, ip6, ip4) VALUES
 					(1, '01234567-89AB-CDEF-8123-456789ABCDEF', '2001:db8::1',     '192.168.1.10'),
 					(2, '00000000-0000-0000-0000-000000000000', '::',             '0.0.0.0'),
 					(3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '::ffff:1.2.3.4',  '255.255.255.255'),
 					(4, '01234567-89ab-cdef-8100-000000000000', '2001:db8::',      '10.0.0.0'),
-					(5, NULL, NULL, NULL);`)
+					(5, NULL, NULL, NULL),
+					(6, '10000000-0000-4000-8000-000000000006', '::1.2.3.4',       '1.2.3.4'),
+					(7, '20000000-0000-4000-8000-000000000007', '::0.1.0.0',       '5.6.7.8'),
+					(8, '30000000-0000-4000-8000-000000000008', '::100',           '9.10.11.12'),
+					(9, '40000000-0000-4000-8000-000000000009', '::ffff',          '13.14.15.16');`)
 
-			inserts := drainChanges(t, ctx, changes, 5, 30*time.Second)
-			if len(inserts) != 5 {
+			inserts := drainChanges(t, ctx, changes, 9, 30*time.Second)
+			if len(inserts) != 9 {
 				if streamErr := rdr.(*CDCReader).Err(); streamErr != nil {
-					t.Fatalf("got %d inserts; want 5 (stream error: %v)", len(inserts), streamErr)
+					t.Fatalf("got %d inserts; want 9 (stream error: %v)", len(inserts), streamErr)
 				}
-				t.Fatalf("got %d inserts; want 5", len(inserts))
+				t.Fatalf("got %d inserts; want 9", len(inserts))
 			}
 			for _, ch := range inserts {
 				ins, ok := ch.(ir.Insert)
@@ -107,6 +116,19 @@ func TestMariaDB_CDCReader_NativeUUIDInet_Decode(t *testing.T) {
 				id, _ := ins.Row["id"].(int64)
 				assertNativeRowMatchesDriver(t, dsn, int(id), ins.Row)
 			}
+
+			// Reviewer-corollary pin (Bug-74): for the netip-divergent inet6
+			// shapes, ALSO assert the live-server SELECT renders EXACTLY the
+			// canonical text this codec targets — so a wrong renderer can't
+			// hide behind "CDC == driver" when both are wrong. If MariaDB
+			// disagrees with any expectation here, that is a real finding
+			// (the codec, not the pin, must change).
+			assertDriverInet6Renders(t, dsn, map[int]string{
+				6: "::1.2.3.4", // best-run len 6 → dotted; DIVERGES from netip (::102:304)
+				7: "::0.1.0.0", // best-run len 6 → dotted; DIVERGES from netip (::1:0)
+				8: "::100",     // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.1.0)
+				9: "::ffff",    // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.255.255)
+			})
 
 			// UPDATE arm: mutate row 4 to fresh shapes — the before-image AND
 			// after-image both carry native columns, so both decode paths are
@@ -185,6 +207,31 @@ func assertNativeRowMatchesDriver(t *testing.T, dsn string, id int, row ir.Row) 
 		}
 		if gs != c.want.String {
 			t.Errorf("id=%d %s: CDC decode = %q; driver text = %q — cold-start and CDC DIVERGE", id, c.name, gs, c.want.String)
+		}
+	}
+}
+
+// assertDriverInet6Renders asserts that the LIVE MariaDB server's own SELECT
+// renders each row's ip6 as the exact canonical text this codec targets. It
+// is the independent oracle for the netip/BIND9-divergent inet6 shapes: if
+// the server disagrees, the codec's expectation (not the pin) is wrong.
+func assertDriverInet6Renders(t *testing.T, dsn string, want map[int]string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for id, wantText := range want {
+		var got string
+		if err := db.QueryRowContext(ctx, "SELECT ip6 FROM nat WHERE id = ?", id).Scan(&got); err != nil {
+			t.Fatalf("driver read ip6 id=%d: %v", id, err)
+		}
+		if got != wantText {
+			t.Errorf("live MariaDB SELECT ip6 (id=%d) = %q; codec targets %q — the codec's expectation is wrong, "+
+				"not the pin (adjust mariadbInet6Text, do NOT change the pin)", id, got, wantText)
 		}
 	}
 }
