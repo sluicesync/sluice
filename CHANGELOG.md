@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.275] - 2026-07-17
+
+The tail of the 2026-07-17 confirming audit: a Postgres control-read resilience touch-up plus the test/coverage and CI closures that finish the audit program. No change to any successful path.
+
+### Fixed
+
+- **Postgres control reads (`ReadPosition` / `ListStreams`) now classify a transient connection error the same way the apply path already does.** The concurrent apply lanes run in `QueryExecModeDescribeExec` (no client statement cache) and route every error through the transient classifier, so a momentary connection blip on the hot path is already retriable. The control reads — the startup resume-position read and the `sync status` list — ride the default cached-statement pool and returned their error raw, so a degraded pooled connection surfacing pgx's cached-statement cleanup timing out (`failed to deallocate cached statement(s): i/o timeout`) on a startup or status read propagated as a hard fault instead of a retriable transient. They now route through the same classifier, so that class carries the retriable signal and the supervisor backs off + reconnects on a fresh pooled connection rather than treating a momentary blip as a hard start-up fault. Data integrity was never at stake (the read is a control-table `SELECT`; the write/rollback path is untouched) and non-transient errors still pass through verbatim.
+
+### Changed
+
+- **Test & coverage hardening (2026-07-17 confirming-audit tail — no user-facing behavior change):** the item-74 NOBLOB partial-row-image belt (v0.99.273) was validated end-to-end against a real self-hosted `binlog_row_image=NOBLOB` Vitess cluster — it fires the loud `SLUICE-E-CDC-ROW-IMAGE-PARTIAL` refusal on both CDC dispatch paths (warm-resume and cold-start), naming the omitted column, and does not over-fire on full-image rows; a broker cold-start `--reset-target-data` restore under a signed backup chain is now pinned end-to-end (the signature verification + tamper-refusal were already correct — this closes a coverage hole, not a code gap); and three long-red extended-suites CI legs were diagnosed as non-product and fixed (a relocated upstream example-schema URL after `vitessio/vitess` moved `examples/local` → `examples/common`, a cold-image-pull timing flake in the Vitess rolling-upgrade chaos test, and stale reshard test scaffolding that asserted shard discovery before the stream opened after the connection-free-reader refactor).
+
+### Compatibility
+
+- **No behavior change.** The Postgres change only affects how a transient control-read connection error is retried; everything else is added test coverage and CI hardening.
+
 ## [0.99.274] - 2026-07-17
 
 Post-audit hardening + a broadened MariaDB LTS test matrix. Mostly internal quality and coverage; no change to any successful path.
