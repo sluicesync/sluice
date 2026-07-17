@@ -134,6 +134,12 @@ func OpenPgxDB(dsn, label string) (*sql.DB, error) {
 // openPgxDBAs is the role-aware variant behind [OpenPgxDB]. It stamps
 // the application_name for role and id (unless the operator already
 // set one) before handing the DSN to pgx.
+//
+// Every pool gets [afterConnectSessionPins] installed as the default
+// AfterConnect hook. stdlib's OptionAfterConnect is LAST-WINS (it
+// replaces, not chains), so a caller passing its own hook via opts must
+// compose the pins in via [composeAfterConnect] — the applier's
+// geometry-codec call sites are the pattern.
 func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionOpenDB) (*sql.DB, error) {
 	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
 	if err != nil {
@@ -141,7 +147,55 @@ func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionO
 	}
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
 	pinStandardConformingStrings(connConfig)
+	opts = append([]stdlib.OptionOpenDB{stdlib.OptionAfterConnect(afterConnectSessionPins)}, opts...)
 	return stdlib.OpenDB(*connConfig, opts...), nil
+}
+
+// afterConnectSessionPins pins extra_float_digits=3 on every physical
+// pgx connection the engine opens (Bug 194 belt-and-braces, F2). The
+// typed lanes normally decode float OIDs in BINARY format (extended
+// protocol), which extra_float_digits never touches — but a DSN
+// carrying default_query_exec_mode=exec or simple_protocol flips pgx to
+// TEXT results, where decodeFloat ParseFloats whatever the session
+// renders: under a server/database/role default < 1 (Supabase ships 0)
+// that is the silently-rounded legacy rendering. The pin makes the
+// typed-lane immunity claim unconditional and hardens any future
+// server-side ::text read on these pools.
+//
+// A statement (not a startup parameter) for two reasons: Supavisor
+// strips extra_float_digits from startup packets, and pgbouncer REFUSES
+// startup packets carrying parameters it does not track. It fires per
+// PHYSICAL client connection — under SESSION-mode pooling that maps 1:1
+// to a pinned server backend for the connection's lifetime, so the pin
+// holds; under TRANSACTION-mode pooling the backend can change per
+// statement, so this hook is NOT sufficient there — the per-site
+// transaction-scoped pins (raw-copy export, SampleRowHashes) remain the
+// pooler-proof layer.
+//
+// Deliberately unconditional (no DSN override, unlike
+// pinStandardConformingStrings): a sub-1 extra_float_digits inside
+// sluice's OWN sessions can only reintroduce the Bug-194 silent-loss
+// class; there is no legitimate operator intent to honor.
+func afterConnectSessionPins(ctx context.Context, conn *pgx.Conn) error {
+	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3"); err != nil {
+		return fmt.Errorf("postgres: pin extra_float_digits: %w", err)
+	}
+	return nil
+}
+
+// composeAfterConnect chains AfterConnect hooks left to right, so call
+// sites that need their own hook (the applier's geometry-codec
+// registration) can keep [afterConnectSessionPins] instead of silently
+// replacing it (stdlib's OptionAfterConnect is last-wins).
+func composeAfterConnect(hooks ...func(context.Context, *pgx.Conn) error) func(context.Context, *pgx.Conn) error {
+	return func(ctx context.Context, conn *pgx.Conn) error {
+		for _, h := range hooks {
+			if err := h(ctx, conn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // pinStandardConformingStrings forces standard_conforming_strings=on for the
@@ -201,6 +255,8 @@ func openPgxDBDescribeExec(dsn string, role connRole, appID string, opts ...stdl
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
 	connConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
 	pinStandardConformingStrings(connConfig)
+	// Same default AfterConnect pin + last-wins caveat as [openPgxDBAs].
+	opts = append([]stdlib.OptionOpenDB{stdlib.OptionAfterConnect(afterConnectSessionPins)}, opts...)
 	return stdlib.OpenDB(*connConfig, opts...), nil
 }
 

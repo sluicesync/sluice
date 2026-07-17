@@ -594,14 +594,19 @@ func charTypmod(typmod int32) int {
 }
 
 // numericTypmod decodes the (precision, scale) pair from a NUMERIC
-// typmod value. Postgres encodes (P, S) as ((P << 16) | S) + 4 with
-// -1 meaning "no precision specified" (max precision NUMERIC).
+// typmod value. Postgres encodes (P, S) as ((P << 16) | (S & 0x7FF)) + 4
+// with -1 meaning "no precision specified" (max precision NUMERIC).
+// Scale is an 11-bit SIGNED field (PG 15 allows negative scale,
+// numeric(5,-2), which rounds to the left of the decimal point); the
+// XOR/subtract pair below is PG's own NUMERIC_TYPMOD_SCALE sign
+// extension (numeric.c) — masking with 0xFFFF instead mis-read a
+// negative scale as a huge positive one.
 func numericTypmod(typmod int32) (precision, scale int) {
 	if typmod < 4 {
 		return 0, 0
 	}
 	t := typmod - 4
-	return int((t >> 16) & 0xFFFF), int(t & 0xFFFF)
+	return int((t >> 16) & 0xFFFF), int(((t & 0x7FF) ^ 1024) - 1024)
 }
 
 // temporalTypmod returns the fractional-second precision N from a

@@ -427,7 +427,7 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 	// on the lane path while passing on the serial path: a Bug-74-class
 	// codec-coverage trap. Same role + DSN as those pools.
 	laneDB, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
-		stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
+		stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: open concurrent lane pool: %w", err))
 	}

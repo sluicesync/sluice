@@ -87,7 +87,8 @@ func dnsResolveHint(err error) (errorHint, bool) {
 		hint: fmt.Sprintf(
 			"host %q is IPv6-only (it has an AAAA record but did not resolve from this network, which appears "+
 				"IPv4-only — e.g. a Supabase direct endpoint without the IPv4 add-on): for bulk migrate use the "+
-				"provider's pooler endpoint; for CDC the direct endpoint is required — a pooler cannot proxy "+
+				"provider's SESSION-mode pooler endpoint (Supabase port 5432, not the transaction-mode :6543); "+
+				"for CDC the direct endpoint is required — a pooler cannot proxy "+
 				"replication — so enable the provider's IPv4 add-on or run sluice from an IPv6-capable network",
 			dnsErr.Name,
 		),

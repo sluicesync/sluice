@@ -213,7 +213,7 @@ func (a *ChangeApplier) pipelinePool() (*sql.DB, error) {
 	// being TEXT-refused (see [afterConnectRegisterGeometry]); a no-op when
 	// PostGIS isn't installed on the target.
 	db, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
-		stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
+		stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: open pipelined pool: %w", err)
 	}

@@ -325,6 +325,18 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 
 	// ---- Decimal / float ----
 	case "numeric", "decimal":
+		// A declared typmod is the modifier ground truth and wins over
+		// information_schema, which fails it two ways: it reports NULL
+		// for every modifier of an ARRAY column (Bug 195's silent-loss
+		// half — `numeric(10,2)[]` landed as bare `numeric[]` because
+		// only the temporal family had the typmod fallback), and it
+		// mis-reports a NEGATIVE scale (PG 15+ `numeric(5,-2)`) as the
+		// raw 11-bit encoding (numeric_scale=2046, ground-truthed on
+		// PG 17) — [numericTypmod] sign-extends correctly.
+		if c.AttTypmod >= 4 {
+			p, s := numericTypmod(c.AttTypmod)
+			return ir.Decimal{Precision: p, Scale: s}, nil
+		}
 		// A bare `numeric` / `decimal` with no declared precision is
 		// arbitrary-precision: information_schema reports BOTH
 		// numeric_precision and numeric_scale as NULL. Collapsing that
@@ -333,20 +345,13 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 		// target (silent decimal-precision loss) — catalog Bug 69.
 		// Model the unconstrained case distinctly so the emitters can
 		// render the correct per-engine form.
-		//
-		// Array-element metas have no information_schema row at all
-		// (information_schema reports NULL for every modifier of an
-		// ARRAY column), so a nil (NumPrec, NumScale) falls back to the
-		// typmod the array column carries for its elements — Bug 195's
-		// silent-loss half: `numeric(10,2)[]` landed as bare `numeric[]`
-		// because only the temporal family had the typmod fallback.
 		if c.NumPrec == nil && c.NumScale == nil {
-			if c.AttTypmod >= 4 {
-				p, s := numericTypmod(c.AttTypmod)
-				return ir.Decimal{Precision: p, Scale: s}, nil
-			}
 			return ir.Decimal{Unconstrained: true}, nil
 		}
+		// typmod -1 with information_schema modifiers present: a
+		// DOMAIN-unwrapped column (the modifier lives on the domain
+		// type; the column's own atttypmod is -1) or a caller that
+		// resolves modifiers without pg_attribute.
 		return ir.Decimal{Precision: int(int64Ptr(c.NumPrec)), Scale: int(int64Ptr(c.NumScale))}, nil
 	case "real":
 		return ir.Float{Precision: ir.FloatSingle}, nil

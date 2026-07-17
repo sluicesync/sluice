@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -109,21 +110,18 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 		if perr != nil {
 			return perr
 		}
-		// Pin the wire encoding to UTF8 so the byte-pipe is self-consistent
-		// regardless of either DSN's client_encoding (see rawCopyForceUTF8).
-		if eerr := rawCopyForceUTF8(ctx, conn); eerr != nil {
-			return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, eerr)
-		}
-		// Pin float text rendering to shortest-exact on every non-binary
-		// format (see rawCopyPinFloatDigits — Bug 194); binary COPY carries
-		// raw IEEE-754 send bytes, which the GUC never touches.
-		if format != ir.RawCopyBinary {
-			if eerr := rawCopyPinFloatDigits(ctx, conn); eerr != nil {
-				return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, eerr)
+		// Run the COPY under the session pins (client_encoding — and, on
+		// non-binary formats, extra_float_digits; binary COPY carries raw
+		// IEEE-754 send bytes, which the GUC never touches). See
+		// rawCopyWithSessionPins for why the pins are transaction-scoped.
+		err := rawCopyWithSessionPins(ctx, conn, format != ir.RawCopyBinary, func() error {
+			if _, cerr := conn.CopyTo(ctx, w, sqlStmt); cerr != nil {
+				return fmt.Errorf("COPY TO STDOUT: %w", cerr)
 			}
-		}
-		if _, cerr := conn.CopyTo(ctx, w, sqlStmt); cerr != nil {
-			return fmt.Errorf("postgres: ExportRawCopy %q: COPY TO STDOUT: %w", table.Name, cerr)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, err)
 		}
 		return nil
 	}
@@ -163,15 +161,19 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		}
 		// Match the exporter's pinned UTF8 wire encoding so the byte stream
 		// the importer receives is decoded under the same encoding it was
-		// emitted (see rawCopyForceUTF8).
-		if eerr := rawCopyForceUTF8(ctx, conn); eerr != nil {
-			return fmt.Errorf("postgres: ImportRawCopy %q: %w", table.Name, eerr)
+		// emitted. No float pin here: extra_float_digits is OUTPUT-only,
+		// and float8in/float4in parse any digit count exactly.
+		err := rawCopyWithSessionPins(ctx, conn, false, func() error {
+			tag, cerr := conn.CopyFrom(ctx, r, sqlStmt)
+			if cerr != nil {
+				return fmt.Errorf("COPY FROM STDIN: %w", cerr)
+			}
+			copied = tag.RowsAffected()
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("postgres: ImportRawCopy %q: %w", table.Name, err)
 		}
-		tag, cerr := conn.CopyFrom(ctx, r, sqlStmt)
-		if cerr != nil {
-			return fmt.Errorf("postgres: ImportRawCopy %q: COPY FROM STDIN: %w", table.Name, cerr)
-		}
-		copied = tag.RowsAffected()
 		return nil
 	})
 	if rawErr != nil {
@@ -203,51 +205,96 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 	}
 }
 
-// rawCopyForceUTF8 pins the session's client_encoding to UTF8 on the raw
-// connection before a COPY. The raw lane byte-pipes the source's
-// COPY-TO-STDOUT stream straight into the target's COPY-FROM-STDIN: the
-// bytes are encoded under the SOURCE session's client_encoding and decoded
-// under the TARGET session's. If an operator sets client_encoding=LATIN1
-// in one DSN and not the other, that asymmetry would silently corrupt
-// non-ASCII text — the byte-pipe sees no Row, so the typed IR path's
-// per-value re-encode (which would normalize this) never runs. Forcing
-// both sessions to UTF8 makes the stream self-consistent by construction,
-// regardless of either DSN — matching what the IR/pgx COPY path already
-// gets from pgx's default UTF8 session. (ADR-0078 known-limitation note.)
-func rawCopyForceUTF8(ctx context.Context, conn *pgconn.PgConn) error {
-	if _, err := conn.Exec(ctx, "SET client_encoding TO 'UTF8'").ReadAll(); err != nil {
-		return fmt.Errorf("pin client_encoding=UTF8: %w", err)
+// rawCopyWithSessionPins runs fn (the COPY) with the raw lane's session
+// pins in effect, transaction-scoped:
+//
+//   - client_encoding=UTF8 (always). The raw lane byte-pipes the
+//     source's COPY-TO-STDOUT stream straight into the target's
+//     COPY-FROM-STDIN: the bytes are encoded under the SOURCE session's
+//     client_encoding and decoded under the TARGET session's. If an
+//     operator sets client_encoding=LATIN1 in one DSN and not the
+//     other, that asymmetry would silently corrupt non-ASCII text — the
+//     byte-pipe sees no Row, so the typed IR path's per-value re-encode
+//     (which would normalize this) never runs. Forcing both sessions to
+//     UTF8 makes the stream self-consistent by construction. (ADR-0078
+//     known-limitation note.)
+//   - extra_float_digits=3 (pinFloats — the EXPORT side of non-binary
+//     formats; Bug 194, CRITICAL silent loss). PG ≥ 12 renders
+//     float4/float8 shortest-exact ONLY when the session's
+//     extra_float_digits ≥ 1; a server/database/role default below that
+//     (Supabase ships 0 SERVER-WIDE) reverts float8out/float4out to the
+//     legacy %.15g/%.6g renderings, silently rounding any float needing
+//     more digits (π …2d18 → …2d11; only DBL_MAX failed loudly, 22003
+//     on COPY FROM). 3 forces round-trip-exact digits on every
+//     supported server version, pre-12 included. The import side needs
+//     no float pin (float8in/float4in parse any digit count exactly)
+//     and binary COPY needs none on either side (float4send/float8send
+//     bytes; the GUC is text-output-only). The typed IR lanes are
+//     immune by default (pgx extended protocol, binary float OIDs) and
+//     belt-and-braced by [afterConnectSessionPins].
+//
+// WHY transaction-scoped (the F1 review finding): the pins MUST be SET
+// statements (poolers strip GUCs from startup packets — Supavisor names
+// extra_float_digits in ignore_startup_parameters; pgbouncer refuses
+// unknown startup parameters outright), but a bare autocommit SET
+// followed by a COPY is NOT pooler-proof either — under
+// TRANSACTION-mode pooling (Supabase's recommended :6543 endpoint) the
+// two statements may land on DIFFERENT backends, leaving the COPY
+// silently unpinned (rc=0, Bug 194 alive). An explicit transaction is
+// what pins a server backend in transaction-mode pooling, and SET LOCAL
+// scopes the pins to exactly that transaction (nothing leaks back into
+// the pool).
+//
+// On a connection already inside a transaction — the snapshot-pinned
+// reader, whose COPY must run inside the exported-snapshot transaction
+// (a BEGIN there would warn and a COMMIT would DESTROY the snapshot) —
+// the SET LOCALs are issued against the ambient transaction instead:
+// same scope, no ownership. A snapshot export never crosses a
+// transaction-mode pooler (the replication protocol requires a direct
+// connection), so the ambient transaction is always a real single
+// backend.
+func rawCopyWithSessionPins(ctx context.Context, conn *pgconn.PgConn, pinFloats bool, fn func() error) error {
+	// 'I' = idle, outside any transaction (pgconn tracks the server's
+	// ReadyForQuery status byte). 'T'/'E' mean an ambient transaction
+	// owns the connection — join it rather than nesting.
+	ownTx := conn.TxStatus() == 'I'
+	pins := []string{"SET LOCAL client_encoding = 'UTF8'"}
+	if pinFloats {
+		pins = append(pins, "SET LOCAL extra_float_digits = 3")
+	}
+	if ownTx {
+		pins = append([]string{"BEGIN"}, pins...)
+	}
+	for _, stmt := range pins {
+		if _, err := conn.Exec(ctx, stmt).ReadAll(); err != nil {
+			if ownTx {
+				rawCopyRollback(conn)
+			}
+			return fmt.Errorf("session pin %q: %w", stmt, err)
+		}
+	}
+	if err := fn(); err != nil {
+		if ownTx {
+			rawCopyRollback(conn)
+		}
+		return err
+	}
+	if ownTx {
+		if _, err := conn.Exec(ctx, "COMMIT").ReadAll(); err != nil {
+			return fmt.Errorf("commit raw-copy transaction: %w", err)
+		}
 	}
 	return nil
 }
 
-// rawCopyPinFloatDigits pins extra_float_digits=3 on the raw-copy EXPORT
-// session before a text-format COPY TO (Bug 194 — CRITICAL silent loss).
-// PG ≥ 12 renders float4/float8 shortest-exact ONLY when the session's
-// extra_float_digits ≥ 1 (the modern compiled-in default); a
-// server/database/role default below that reverts float8out/float4out to
-// the legacy %.15g/%.6g renderings, which silently round any float
-// needing more digits — and Supabase ships extra_float_digits=0
-// SERVER-WIDE, so every text raw-copy off a default Supabase source
-// corrupted in transit (π …2d18 → …2d11, float4 2^24 → 2^24-16; only
-// DBL_MAX failed loudly, overflowing COPY FROM with 22003). 3 is the
-// maximum and forces round-trip-exact digits on every supported server
-// version, pre-12 included (where ≥1 alone is not enough).
-//
-// This MUST be a statement-level SET, never a DSN/startup parameter:
-// poolers strip extra_float_digits from startup packets (Supavisor's
-// ignore_startup_parameters includes it explicitly) but pass
-// statement-level SETs through — verified live against Supabase's
-// session pooler. The import side needs no pin (float8in/float4in parse
-// any digit count exactly), and the binary format needs none on either
-// side (float4send/float8send bytes; extra_float_digits is text-only).
-// The typed IR lanes are also immune: pgx's extended protocol decodes
-// float OIDs in binary format.
-func rawCopyPinFloatDigits(ctx context.Context, conn *pgconn.PgConn) error {
-	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3").ReadAll(); err != nil {
-		return fmt.Errorf("pin extra_float_digits=3: %w", err)
-	}
-	return nil
+// rawCopyRollback best-effort ROLLBACKs the pin transaction after a
+// failure so the connection returns to the pool idle rather than inside
+// an aborted transaction. Its own context: the failure path may hold a
+// canceled ctx, and an unrolled-back conn would poison the pool.
+func rawCopyRollback(conn *pgconn.PgConn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = conn.Exec(ctx, "ROLLBACK").ReadAll()
 }
 
 // pgConnFromDriver unwraps a database/sql driver connection to the

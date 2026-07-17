@@ -46,9 +46,13 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// floatEFDSeedDDL is the float corpus: every value needs MORE digits
-// than the legacy renderings carry, plus the loud-overflow boundary and
-// the denormal floor. NULL row included (the shape variant).
+// floatEFDSeedDDL is the float corpus: every finite value needs MORE
+// digits than the legacy renderings carry, plus the loud-overflow
+// boundary, the denormal floor, and the non-finite / signed-zero
+// specials (NaN / ±Infinity render as literal words and -0 keeps its
+// sign bit through text COPY — all extra_float_digits-independent, but
+// they pin that the session pins don't disturb the special-value
+// spellings). NULL row included (the shape variant).
 const floatEFDSeedDDL = `
 	CREATE TABLE floats (
 		id BIGINT PRIMARY KEY,
@@ -60,8 +64,15 @@ const floatEFDSeedDDL = `
 		(2, 1.7976931348623157e308, 3.4028235e38),            -- DBL_MAX (the 22003 loud cell pre-fix), FLT_MAX
 		(3, 5e-324, 1.4e-45),                                 -- denormal floors
 		(4, -2.2250738585072014e-308, -1.17549435e-38),       -- smallest normals, negative
-		(5, NULL, NULL);
+		(5, 'NaN'::float8, 'NaN'::float4),
+		(6, 'Infinity'::float8, '-Infinity'::float4),
+		(7, '-0'::float8, '-0'::float4),                      -- signed zero: send-bytes catch a dropped sign bit
+		(8, NULL, NULL);
 `
+
+// floatEFDCorpusRows is the seeded row count (send-bytes assertions
+// require every row to arrive).
+const floatEFDCorpusRows = 8
 
 // floatEFDSendBytes reads the per-row float send-bytes off one endpoint.
 // float8send/float4send are the wire ground truth — display-independent,
@@ -205,8 +216,8 @@ func TestRawCopy_FloatExactUnderSourceEFDDefaults(t *testing.T) {
 
 				srcBytes := floatEFDSendBytes(t, srcDSN)
 				dstBytes := floatEFDSendBytes(t, dstDSN)
-				if len(srcBytes) != 5 {
-					t.Fatalf("source rows = %d; want 5", len(srcBytes))
+				if len(srcBytes) != floatEFDCorpusRows {
+					t.Fatalf("source rows = %d; want %d", len(srcBytes), floatEFDCorpusRows)
 				}
 				for k := range srcBytes {
 					if k >= len(dstBytes) || srcBytes[k] != dstBytes[k] {

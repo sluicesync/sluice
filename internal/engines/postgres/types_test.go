@@ -264,6 +264,26 @@ func TestTranslateType(t *testing.T) {
 			},
 			ir.Array{Element: ir.Decimal{Unconstrained: true}},
 		},
+		{
+			// NEGATIVE scale (PG 15+). Typmod 329730 = ((5<<16) |
+			// ((-2) & 0x7ff)) + 4, ground-truthed on PG 17. The 11-bit
+			// sign extension must recover -2 — the 0xFFFF mask read it
+			// as 2046, which is also exactly what information_schema's
+			// numeric_scale mis-reports (so the typmod path is the only
+			// correct source).
+			"numeric(5,-2) scalar via typmod",
+			columnMeta{DataType: "numeric", UDTName: "numeric", AttTypmod: 329730, NumPrec: int64Val(5), NumScale: int64Val(2046)},
+			ir.Decimal{Precision: 5, Scale: -2},
+		},
+		{
+			"numeric(5,-2)[] element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_numeric",
+				AttTypmod:    329730,
+				ArrayElement: &columnMeta{DataType: "numeric", UDTName: "numeric", AttTypmod: 329730},
+			},
+			ir.Array{Element: ir.Decimal{Precision: 5, Scale: -2}},
+		},
 
 		// ---- Scalar unbounded character forms (the same Bug 195 class
 		// at the scalar layer: bare `varchar` / `bpchar` report

@@ -290,6 +290,10 @@ func TestOIDToType(t *testing.T) {
 		{"macaddr", pgtype.MacaddrOID, -1, ir.Macaddr{}},
 		// numeric(8,2) typmod = ((8<<16)|2) + 4 = 524294
 		{"numeric(8,2)", pgtype.NumericOID, 524294, ir.Decimal{Precision: 8, Scale: 2}},
+		// NEGATIVE scale (PG 15+): typmod = ((5<<16) | ((-2)&0x7ff)) + 4
+		// = 329730, ground-truthed on PG 17. numericTypmod's 11-bit sign
+		// extension must recover -2, not the raw 2046.
+		{"numeric(5,-2)", pgtype.NumericOID, 329730, ir.Decimal{Precision: 5, Scale: -2}},
 
 		// Bug 97 (v0.92.0) Stage 1 + Stage 2 verbatim-carry OID
 		// coverage. The schema reader's text-keyed allowlist drifted

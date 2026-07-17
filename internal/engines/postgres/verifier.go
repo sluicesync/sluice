@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -120,21 +121,25 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	// a false mismatch — and, worse, a source at efd=0 renders a true
 	// value identically to a target holding its rounded corruption — a
 	// false clean. Pin the query's session to 3 (shortest-exact on every
-	// version) via a dedicated conn so both sides hash canonical
-	// renderings. Statement-level SET, not a DSN param: poolers strip
-	// extra_float_digits from startup packets (Supavisor). The conn
-	// returns to the pool still pinned — deliberate and safe: the GUC
-	// only affects float text output, which sluice's typed paths never
-	// use (they decode binary), mirroring rawCopyForceUTF8's precedent.
-	conn, err := r.db.Conn(ctx)
+	// version) so both sides hash canonical renderings.
+	//
+	// The pin rides an explicit transaction as a SET LOCAL (the F1
+	// review finding): a statement-level SET is required (poolers strip
+	// the GUC from startup packets — Supavisor), but a bare autocommit
+	// SET followed by the query is not pooler-proof either — under
+	// TRANSACTION-mode pooling (Supabase's recommended :6543 endpoint)
+	// the two statements may land on DIFFERENT backends, silently
+	// unpinning the hash query. A transaction pins one backend; SET
+	// LOCAL scopes the pin to it, so nothing leaks back into the pool.
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: acquire conn: %w", r.schema, table.Name, err)
+		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: begin: %w", r.schema, table.Name, err)
 	}
-	defer func() { _ = conn.Close() }() // returns conn to pool
-	if _, err := conn.ExecContext(ctx, "SET extra_float_digits = 3"); err != nil {
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if _, err := tx.ExecContext(ctx, "SET LOCAL extra_float_digits = 3"); err != nil {
 		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: pin extra_float_digits: %w", r.schema, table.Name, err)
 	}
-	rows, err := conn.QueryContext(ctx, q)
+	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: %w", r.schema, table.Name, err)
 	}

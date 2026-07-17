@@ -481,7 +481,7 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	// column applies as BINARY EWKB rather than being TEXT-refused (see
 	// [afterConnectRegisterGeometry]); a no-op when PostGIS isn't installed.
 	// The pipelined pool registers it independently in [pipelinePool].
-	db, err := openDBAs(ctx, cfg, roleApplier, stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
+	db, err := openDBAs(ctx, cfg, roleApplier, stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
 	if err != nil {
 		return nil, err
 	}
