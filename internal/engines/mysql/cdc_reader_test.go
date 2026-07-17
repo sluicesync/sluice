@@ -204,6 +204,28 @@ func TestDecodeBinlogPosFromNowSentinel(t *testing.T) {
 	}
 }
 
+// TestDecodeBinlogPosAcceptsMariaDBEngine pins the Bug-142-shape fix for
+// MariaDB (ADR-0170): the reader always ENCODES Engine="mysql", but the
+// streamer's retag-for-source stamps a resumed position with the source
+// engine's Name() = "mariadb". decodeBinlogPos must accept it, else
+// warm-resume of a --source-driver=mariadb sync crash-loops on
+// `decode binlog position: engine = "mariadb"`.
+func TestDecodeBinlogPosAcceptsMariaDBEngine(t *testing.T) {
+	for _, name := range []string{engineNameMySQL, engineNameVStream, engineNameVitess, engineNameMariaDB} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			pos := ir.Position{Engine: name, Token: `{"mode":"file_pos","file":"mysqld-bin.000002","pos":1137}`}
+			got, ok, err := decodeBinlogPos(pos)
+			if err != nil || !ok {
+				t.Fatalf("decode with engine %q: ok=%v err=%v (must be accepted in the mysql family)", name, ok, err)
+			}
+			if got.File != "mysqld-bin.000002" || got.Pos != 1137 {
+				t.Errorf("decode with engine %q: got %+v; want file_pos mysqld-bin.000002:1137", name, got)
+			}
+		})
+	}
+}
+
 func TestDecodeBinlogPosErrors(t *testing.T) {
 	cases := []struct {
 		name string

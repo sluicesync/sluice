@@ -106,11 +106,24 @@ const engineNameMySQL = "mysql"
 // "planetscale".
 const engineNameVitess = "vitess"
 
+// engineNameMariaDB is the MariaDB flavor's engine name
+// (FlavorMariaDB.Name()). The mariadb source produces binlog-shape
+// positions through this package's CDC reader (ADR-0170), but the
+// streamer's [retagPositionForSource] stamps a resumed position with the
+// SOURCE engine's Name() = "mariadb". Without this in the decode-accept
+// family, warm-resume of a --source-driver=mariadb continuous sync
+// crash-loops on `decode binlog position: engine = "mariadb"` — the exact
+// Bug-142 shape the vitess entry above closed. Caught by the full-pipeline
+// cross-engine sync test (the reader always encodes "mysql", so only the
+// resume-retag path exercises this).
+const engineNameMariaDB = "mariadb"
+
 // isMySQLFamilyEngine returns true for the engine-name strings the
 // MySQL package's two CDC paths (binlog and VStream) accept on
 // decode. See [engineNameMySQL] for the rationale.
 func isMySQLFamilyEngine(name string) bool {
-	return name == engineNameMySQL || name == engineNameVStream || name == engineNameVitess
+	return name == engineNameMySQL || name == engineNameVStream ||
+		name == engineNameVitess || name == engineNameMariaDB
 }
 
 // encodeBinlogPos marshals p into an [ir.Position] suitable for
