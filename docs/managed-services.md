@@ -686,7 +686,7 @@ A cleanly stopped sluice stream leaves its (resumable) replication slot in place
 
 ### REQUIRED: set `binlog_row_image=FULL` before any sync
 
-Azure's platform default is `binlog_row_image=MINIMAL` — the only major managed-MySQL platform that defaults to it — and under MINIMAL sluice's binlog CDC currently **loses UPDATEs silently** (Bug 193; INSERT/DELETE are unaffected, counts stay equal, only content diverges — a row-image preflight refusal is being added, but do not rely on it yet). Before `sync start`:
+Azure's platform default is `binlog_row_image=MINIMAL` — the only major managed-MySQL platform that defaults to it. Under MINIMAL a binlog UPDATE carries only the changed columns, which would **lose UPDATEs silently** (Bug 193; INSERT/DELETE are unaffected, counts stay equal, only content diverges). Since v0.99.266 sluice's CDC preflight **refuses a non-FULL row image at stream start** with the coded `SLUICE-E-CDC-ROW-IMAGE-PARTIAL` (and re-checks on resume), so a fresh `sync start` under MINIMAL fails loudly, pre-data, rather than corrupting silently. Set the knob to FULL regardless — and if a stream already ran under MINIMAL before you set it, re-verify with full-table sampling (see below). Before `sync start`:
 
 ```
 az mysql flexible-server parameter set --resource-group <rg> --server-name <server> \
