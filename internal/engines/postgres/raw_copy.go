@@ -114,6 +114,14 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 		if eerr := rawCopyForceUTF8(ctx, conn); eerr != nil {
 			return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, eerr)
 		}
+		// Pin float text rendering to shortest-exact on every non-binary
+		// format (see rawCopyPinFloatDigits — Bug 194); binary COPY carries
+		// raw IEEE-754 send bytes, which the GUC never touches.
+		if format != ir.RawCopyBinary {
+			if eerr := rawCopyPinFloatDigits(ctx, conn); eerr != nil {
+				return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, eerr)
+			}
+		}
 		if _, cerr := conn.CopyTo(ctx, w, sqlStmt); cerr != nil {
 			return fmt.Errorf("postgres: ExportRawCopy %q: COPY TO STDOUT: %w", table.Name, cerr)
 		}
@@ -209,6 +217,35 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 func rawCopyForceUTF8(ctx context.Context, conn *pgconn.PgConn) error {
 	if _, err := conn.Exec(ctx, "SET client_encoding TO 'UTF8'").ReadAll(); err != nil {
 		return fmt.Errorf("pin client_encoding=UTF8: %w", err)
+	}
+	return nil
+}
+
+// rawCopyPinFloatDigits pins extra_float_digits=3 on the raw-copy EXPORT
+// session before a text-format COPY TO (Bug 194 — CRITICAL silent loss).
+// PG ≥ 12 renders float4/float8 shortest-exact ONLY when the session's
+// extra_float_digits ≥ 1 (the modern compiled-in default); a
+// server/database/role default below that reverts float8out/float4out to
+// the legacy %.15g/%.6g renderings, which silently round any float
+// needing more digits — and Supabase ships extra_float_digits=0
+// SERVER-WIDE, so every text raw-copy off a default Supabase source
+// corrupted in transit (π …2d18 → …2d11, float4 2^24 → 2^24-16; only
+// DBL_MAX failed loudly, overflowing COPY FROM with 22003). 3 is the
+// maximum and forces round-trip-exact digits on every supported server
+// version, pre-12 included (where ≥1 alone is not enough).
+//
+// This MUST be a statement-level SET, never a DSN/startup parameter:
+// poolers strip extra_float_digits from startup packets (Supavisor's
+// ignore_startup_parameters includes it explicitly) but pass
+// statement-level SETs through — verified live against Supabase's
+// session pooler. The import side needs no pin (float8in/float4in parse
+// any digit count exactly), and the binary format needs none on either
+// side (float4send/float8send bytes; extra_float_digits is text-only).
+// The typed IR lanes are also immune: pgx's extended protocol decodes
+// float OIDs in binary format.
+func rawCopyPinFloatDigits(ctx context.Context, conn *pgconn.PgConn) error {
+	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3").ReadAll(); err != nil {
+		return fmt.Errorf("pin extra_float_digits=3: %w", err)
 	}
 	return nil
 }

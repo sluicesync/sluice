@@ -35,6 +35,24 @@ func supabaseDirectDNSError(host, errText string, isNotFound bool) error {
 	})
 }
 
+// TestDNSProbeResolver_PreferGo pins the PRODUCTION probe's resolver
+// mode (Bug 196). Every other test in this file stubs the lookupIPv6
+// seam, which is exactly how the original probe shipped green while
+// unreachable live on its target audience (the Bug-180 lesson at the
+// resolver layer): the default resolver routes through getaddrinfow on
+// Windows, which suppresses AAAA answers on IPv4-only hosts
+// (WSANO_DATA), so the probe returned empty and the hint never fired.
+// PreferGo queries DNS directly and sees the record regardless of local
+// IPv6 connectivity — this pin fails if anyone reverts the probe to the
+// platform resolver. (The live Windows behaviour itself can't run in a
+// unit test; the ground truth is recorded on dnsProbeResolver's
+// comment.)
+func TestDNSProbeResolver_PreferGo(t *testing.T) {
+	if !dnsProbeResolver.PreferGo {
+		t.Fatal("dnsProbeResolver.PreferGo must be true: the platform resolver (getaddrinfow) suppresses AAAA answers on IPv4-only Windows hosts, making the IPv6-only hint unreachable for its target audience (Bug 196)")
+	}
+}
+
 // TestWrapWithHint_IPv6OnlyResolve pins the item-69f hint end to end
 // through the real WrapWithHint boundary: a no-data resolve failure
 // for a host that DOES carry an AAAA record gains the IPv6-only

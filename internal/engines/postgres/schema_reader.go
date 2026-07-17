@@ -1223,10 +1223,15 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 			DataType: elemDataType,
 			UDTName:  strings.TrimPrefix(udtName, "_"),
 			// The array column's typmod applies to its elements
-			// (`timestamptz(3)[]` carries atttypmod=3); thread it
-			// through so temporal elements resolve their precision
-			// (or precision-unspecified, typmod -1) exactly like
-			// the scalar path (TRIAGE #3).
+			// (`timestamptz(3)[]` carries atttypmod=3, `varchar(20)[]`
+			// carries 24, `numeric(10,2)[]` carries 655366); thread it
+			// through so EVERY parameterized element family resolves
+			// its modifier exactly like the scalar path — temporal
+			// precision (TRIAGE #3), char/varchar length and numeric
+			// precision/scale (Bug 195; information_schema reports
+			// NULL modifiers for ARRAY columns, so the typmod is the
+			// only source). typmod -1 is the bare form (unbounded
+			// varchar[] / unconstrained numeric[]).
 			AttTypmod: attTypmod,
 		}
 	}

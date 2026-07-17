@@ -37,11 +37,27 @@ import (
 // stall the error path it decorates.
 const dnsProbeTimeout = 3 * time.Second
 
+// dnsProbeResolver is the resolver behind the AAAA probe. PreferGo is
+// LOAD-BEARING (Bug 196): the default resolver on Windows routes
+// through getaddrinfow, and Windows suppresses AAAA answers on a host
+// with no IPv6 connectivity (WSANO_DATA, "no data of the requested
+// type") — so on the exact machine class this hint was built for
+// (IPv4-only Windows host × AAAA-only endpoint) the probe returned
+// empty and the hint never fired, while `nslookup -type=AAAA` returned
+// the record fine (live-probed 2026-07-16, Windows 11 IPv4-only host ×
+// Supabase direct endpoint: LookupIP("ip6") → ips=[] err=WSANO_DATA,
+// IsNotFound=false). Go's pure resolver queries DNS directly, so it
+// sees the AAAA record regardless of local IPv6 connectivity — which
+// is precisely the question this probe asks ("does the record exist?",
+// not "can this host use it?").
+var dnsProbeResolver = &net.Resolver{PreferGo: true}
+
 // lookupIPv6 is the AAAA probe, a seam so unit tests can pin the
-// classifier without real DNS. Production uses the default resolver
-// with the "ip6" network, which asks specifically for AAAA records.
+// classifier without real DNS. Production asks [dnsProbeResolver]
+// (DNS-direct, see its comment) specifically for AAAA records via the
+// "ip6" network.
 var lookupIPv6 = func(ctx context.Context, host string) ([]net.IP, error) {
-	return net.DefaultResolver.LookupIP(ctx, "ip6", host)
+	return dnsProbeResolver.LookupIP(ctx, "ip6", host)
 }
 
 // dnsResolveHint classifies err's resolve-failure shape. Returns the

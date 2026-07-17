@@ -499,8 +499,18 @@ func TestCaptureRowFunction_InsertSharedAcrossModes(t *testing.T) {
 		if !strings.Contains(ddl, "v_after  := to_jsonb(NEW);\n        v_before := NULL;") {
 			t.Errorf("mode %q: INSERT must write the full new-row image", m)
 		}
-		// Shared scaffold present in every mode.
-		for _, want := range []string{"SECURITY DEFINER", "SET search_path = pg_catalog, pg_temp", "INSERT INTO"} {
+		// Shared scaffold present in every mode. The extra_float_digits
+		// pin is Bug 194's trigger-capture face: to_jsonb converts
+		// floats through float8out/float4out, which honor the FIRING
+		// (application) session's extra_float_digits unless the
+		// function pins its own — without it a server default < 1
+		// (Supabase ships 0) silently rounds every captured float.
+		for _, want := range []string{
+			"SECURITY DEFINER",
+			"SET search_path = pg_catalog, pg_temp",
+			"SET extra_float_digits = 3",
+			"INSERT INTO",
+		} {
 			if !strings.Contains(ddl, want) {
 				t.Errorf("mode %q: missing shared scaffold %q", m, want)
 			}

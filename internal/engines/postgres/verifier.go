@@ -111,7 +111,30 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 		quoteIdent(r.schema), quoteIdent(table.Name),
 		pkExpr, seed, n,
 	)
-	rows, err := r.db.QueryContext(ctx, q)
+	// The row-content hash is computed server-side over ::text
+	// renderings, and float4/float8 text output depends on the SESSION's
+	// extra_float_digits — inherited from each endpoint's
+	// server/database/role default (Bug 194's verify face). Two
+	// endpoints with different defaults (Supabase ships 0 server-wide;
+	// stock PG ≥ 12 ships 1) render the SAME stored float differently —
+	// a false mismatch — and, worse, a source at efd=0 renders a true
+	// value identically to a target holding its rounded corruption — a
+	// false clean. Pin the query's session to 3 (shortest-exact on every
+	// version) via a dedicated conn so both sides hash canonical
+	// renderings. Statement-level SET, not a DSN param: poolers strip
+	// extra_float_digits from startup packets (Supavisor). The conn
+	// returns to the pool still pinned — deliberate and safe: the GUC
+	// only affects float text output, which sluice's typed paths never
+	// use (they decode binary), mirroring rawCopyForceUTF8's precedent.
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: acquire conn: %w", r.schema, table.Name, err)
+	}
+	defer func() { _ = conn.Close() }() // returns conn to pool
+	if _, err := conn.ExecContext(ctx, "SET extra_float_digits = 3"); err != nil {
+		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: pin extra_float_digits: %w", r.schema, table.Name, err)
+	}
+	rows, err := conn.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: %w", r.schema, table.Name, err)
 	}

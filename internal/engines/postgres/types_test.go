@@ -189,6 +189,104 @@ func TestTranslateType(t *testing.T) {
 			},
 			ir.Array{Element: ir.Text{Size: ir.TextLong}},
 		},
+
+		// ---- Parameterized array elements (Bug 195) ----
+		// information_schema reports NULL for EVERY modifier of an ARRAY
+		// column, so the element's length/precision comes only from the
+		// array column's atttypmod. Pre-fix, only the temporal family got
+		// the typmod fallback (above); varchar(n)[]/char(n)[] false-
+		// refused as VARCHAR(0)/CHAR(0) and numeric(p,s)[] silently
+		// dropped to bare numeric[]. Typmod values are ground-truthed on
+		// PG 17: varchar(20)[] → 24, char(5)[] → 9, numeric(10,2)[] →
+		// ((10<<16)|2)+4 = 655366; -1 is the bare form.
+		{
+			"varchar(20)[] element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_varchar",
+				AttTypmod:    24,
+				ArrayElement: &columnMeta{DataType: "character varying", UDTName: "varchar", AttTypmod: 24},
+			},
+			ir.Array{Element: ir.Varchar{Length: 20}},
+		},
+		{
+			// Bare varchar[] (typmod -1) is UNBOUNDED — it must land on
+			// the unbounded Text collapse (oidToType's convention), NOT
+			// VARCHAR(0)'s false refusal.
+			"varchar[] bare element → unbounded",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_varchar",
+				AttTypmod:    -1,
+				ArrayElement: &columnMeta{DataType: "character varying", UDTName: "varchar", AttTypmod: -1},
+			},
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+		},
+		{
+			"char(5)[] element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_bpchar",
+				AttTypmod:    9,
+				ArrayElement: &columnMeta{DataType: "character", UDTName: "bpchar", AttTypmod: 9},
+			},
+			ir.Array{Element: ir.Char{Length: 5}},
+		},
+		{
+			// Bare char[] element: bpchar with typmod -1 is unbounded in
+			// PG (accepts any length), so Char{1} would silently truncate
+			// and Char{0} false-refuses — unbounded Text is the faithful
+			// carry.
+			"char[] bare element → unbounded",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_bpchar",
+				AttTypmod:    -1,
+				ArrayElement: &columnMeta{DataType: "character", UDTName: "bpchar", AttTypmod: -1},
+			},
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+		},
+		{
+			// The silent-loss half of Bug 195: numeric(10,2)[] carried
+			// no (p,s) and landed as bare numeric[] on the target.
+			"numeric(10,2)[] element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_numeric",
+				AttTypmod:    655366,
+				ArrayElement: &columnMeta{DataType: "numeric", UDTName: "numeric", AttTypmod: 655366},
+			},
+			ir.Array{Element: ir.Decimal{Precision: 10, Scale: 2}},
+		},
+		{
+			// Bare numeric[] (typmod -1) stays unconstrained (Bug 69's
+			// shape) — the typmod fallback must not manufacture (0,0).
+			"numeric[] bare element stays unconstrained",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_numeric",
+				AttTypmod:    -1,
+				ArrayElement: &columnMeta{DataType: "numeric", UDTName: "numeric", AttTypmod: -1},
+			},
+			ir.Array{Element: ir.Decimal{Unconstrained: true}},
+		},
+
+		// ---- Scalar unbounded character forms (the same Bug 195 class
+		// at the scalar layer: bare `varchar` / `bpchar` report
+		// character_maximum_length NULL and atttypmod -1, and pre-fix
+		// false-refused as VARCHAR(0)/CHAR(0) even PG→PG) ----
+		{
+			"scalar bare varchar → unbounded",
+			columnMeta{DataType: "character varying", UDTName: "varchar", AttTypmod: -1},
+			ir.Text{Size: ir.TextLong},
+		},
+		{
+			"scalar bare bpchar → unbounded",
+			columnMeta{DataType: "character", UDTName: "bpchar", AttTypmod: -1},
+			ir.Text{Size: ir.TextLong},
+		},
+		{
+			// Scalar declared lengths keep information_schema as ground
+			// truth (regression guard: the typmod fallback must not
+			// shadow CharMaxLen).
+			"scalar varchar(20) with typmod",
+			columnMeta{DataType: "character varying", UDTName: "varchar", CharMaxLen: int64Val(20), AttTypmod: 24},
+			ir.Varchar{Length: 20},
+		},
 	}
 
 	for _, c := range cases {
@@ -202,6 +300,23 @@ func TestTranslateType(t *testing.T) {
 				t.Errorf("translateType(%+v)\n got = %#v\nwant = %#v", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestArrayElement_BitFamilyRefusedLoudly pins the Bug 195 class
+// BOUNDARY: bit(n)[] / varbit(n)[] are NOT a supported array element
+// family (builtinArrayElement carries no _bit/_varbit), so they refuse
+// loudly by name at schema read — they can never reach the typmod
+// decode with the char-family +4 layout, which would mis-read bit
+// typmods (bit stores the raw length, NO offset — ground-truthed:
+// bit(3)[] carries atttypmod=3). Widening bit arrays into a supported
+// family is a separate evidence exercise (value-codec + pin matrix),
+// not a typmod thread.
+func TestArrayElement_BitFamilyRefusedLoudly(t *testing.T) {
+	for _, udt := range []string{"_bit", "_varbit"} {
+		if got, ok := arrayElementDataType(udt); ok {
+			t.Errorf("arrayElementDataType(%q) = (%q, true); want unsupported (loud refusal upstream)", udt, got)
+		}
 	}
 }
 

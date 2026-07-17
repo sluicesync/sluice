@@ -574,11 +574,24 @@ func renderCaptureRowFunction(schema, changeLogTableRef string, payload CaptureP
 	// the function body programmatically. SECURITY DEFINER lets a
 	// non-table-owning role drive the engine as long as the
 	// function-owning role has INSERT on sluice_change_log.
+	// SET extra_float_digits = 3 (Bug 194's trigger-capture face): the
+	// capture format is to_jsonb(), and PG converts float4/float8 into a
+	// jsonb numeric THROUGH the type's text output function — which
+	// honors the FIRING session's extra_float_digits, i.e. the
+	// application's session, which sluice can never pin. A
+	// server/database/role default < 1 (Supabase ships 0 server-wide)
+	// silently rounds every captured float (ground-truthed on PG 17:
+	// to_jsonb(pi()) at efd=0 → 3.14159265358979). The per-function SET
+	// clause pins the GUC for exactly the trigger's execution — the same
+	// class fix as the raw-copy/walsender statement-level pins, at the
+	// only layer that survives arbitrary application sessions. Existing
+	// installs pick it up on the next setup re-run (CREATE OR REPLACE).
 	return `CREATE OR REPLACE FUNCTION ` + rowFunctionRef(schema) + `()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET extra_float_digits = 3
 AS $sluice$
 DECLARE
     v_pk_cols  TEXT[];

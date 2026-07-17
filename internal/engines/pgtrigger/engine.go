@@ -68,6 +68,13 @@
 // layers (the information is destroyed at capture); a fix would mean
 // changing the capture format itself (per-column float8out text).
 // Pinned by TestCDCApply_FloatNegativeZeroCaptureNormalization.
+//
+// Float MAGNITUDE, by contrast, IS capture-exact: the capture function
+// carries a per-function `SET extra_float_digits = 3` (Bug 194) so the
+// to_jsonb float→numeric conversion renders shortest-exact digits even
+// when the server/database/role default is < 1 (Supabase ships 0
+// server-wide) — without it, every captured float rounded to the legacy
+// %.15g/%.6g precision. See renderCaptureRowFunction.
 package pgtrigger
 
 import (

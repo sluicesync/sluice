@@ -1770,7 +1770,11 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 				DataType: elemDataType,
 				UDTName:  strings.TrimPrefix(udtName, "_"),
 				// Same as the schema reader: the array column's typmod
-				// applies to its elements (temporal precision / TRIAGE #3).
+				// applies to its elements — temporal precision (TRIAGE
+				// #3) AND char/varchar length + numeric precision/scale
+				// (Bug 195; the translator decodes each family's typmod
+				// layout when information_schema reports NULL, which it
+				// does for every ARRAY-column modifier).
 				AttTypmod: attTypmod,
 			}
 		}

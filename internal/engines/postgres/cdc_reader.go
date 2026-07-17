@@ -2477,6 +2477,23 @@ func openReplicationConn(ctx context.Context, dsn, appID string) (*pgconn.PgConn
 	if err != nil {
 		return nil, err
 	}
+	// Pin float text rendering to shortest-exact on the walsender session
+	// (Bug 194's CDC face). pgoutput delivers tuple data in TEXT format
+	// (sluice requests text — see decodeTuple), rendered by the
+	// walsender's own float4out/float8out, which honor that session's
+	// extra_float_digits — inherited from the server/database/role
+	// default, NOT from sluice. A default < 1 (Supabase ships 0
+	// server-wide) silently rounds every streamed float4/float8
+	// (ground-truthed: logical decoding emits π as 3.14159265358979 at
+	// efd=0, 3.141592653589793 at ≥1). A logical (replication=database)
+	// walsender accepts plain SQL SET via the simple query protocol
+	// (verified live), so the pin rides the same connection. Snapshot-
+	// slot callers (backup / cold-start) share this opener; the pin is
+	// inert there (no tuple text flows) but harmless.
+	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3").ReadAll(); err != nil {
+		_ = conn.Close(ctx)
+		return nil, fmt.Errorf("postgres: pin extra_float_digits on replication conn: %w", err)
+	}
 	return conn, nil
 }
 

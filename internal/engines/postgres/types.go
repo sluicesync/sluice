@@ -333,7 +333,18 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 		// target (silent decimal-precision loss) — catalog Bug 69.
 		// Model the unconstrained case distinctly so the emitters can
 		// render the correct per-engine form.
+		//
+		// Array-element metas have no information_schema row at all
+		// (information_schema reports NULL for every modifier of an
+		// ARRAY column), so a nil (NumPrec, NumScale) falls back to the
+		// typmod the array column carries for its elements — Bug 195's
+		// silent-loss half: `numeric(10,2)[]` landed as bare `numeric[]`
+		// because only the temporal family had the typmod fallback.
 		if c.NumPrec == nil && c.NumScale == nil {
+			if c.AttTypmod >= 4 {
+				p, s := numericTypmod(c.AttTypmod)
+				return ir.Decimal{Precision: p, Scale: s}, nil
+			}
 			return ir.Decimal{Unconstrained: true}, nil
 		}
 		return ir.Decimal{Precision: int(int64Ptr(c.NumPrec)), Scale: int(int64Ptr(c.NumScale))}, nil
@@ -344,9 +355,31 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 
 	// ---- Character ----
 	case "character":
-		return ir.Char{Length: int(int64Ptr(c.CharMaxLen)), Collation: c.Collation}, nil
+		if n, declared := charLengthOf(c); declared {
+			return ir.Char{Length: n, Collation: c.Collation}, nil
+		}
+		// Undeclared length (typmod -1): a bare `bpchar` scalar or a
+		// bare `char[]` element is UNBOUNDED in PG (it accepts any
+		// length — the "char(1) default" applies only to the SQL
+		// keyword `character` form, which the catalog records as an
+		// explicit typmod). Emitting Char{0} false-refused it at DDL
+		// emit ("CHAR(0)", Bug 195); Char{1} would silently truncate.
+		// Land on Text/long, the same collapse the CDC path's oidToType
+		// uses for unbounded varchar.
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
 	case "character varying":
-		return ir.Varchar{Length: int(int64Ptr(c.CharMaxLen)), Collation: c.Collation}, nil
+		if n, declared := charLengthOf(c); declared {
+			return ir.Varchar{Length: n, Collation: c.Collation}, nil
+		}
+		// Unbounded varchar — bare `varchar` scalar or `varchar[]`
+		// element (both report character_maximum_length NULL and typmod
+		// -1). The IR has no "varchar with no length", so land on
+		// Text/long, matching oidToType's unbounded-varchar collapse.
+		// Pre-Bug-195 this produced Varchar{0}, which false-refused at
+		// DDL emit as VARCHAR(0) — a MySQL marker-column idiom the PG
+		// catalog can never legitimately mean (PG refuses varchar(0) at
+		// CREATE TABLE, so a PG source cannot contain one).
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
 	case "text":
 		// Postgres text is unbounded; the IR's TextLong is the
 		// closest match that round-trips correctly to MySQL's LONGTEXT.
@@ -363,6 +396,14 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 	// symmetric with the PG writer's new ir.Bit emission so a
 	// sluice-written bit column reads back to the same IR type). `bit
 	// varying` with no length collapses to bit(1) — PG's default.
+	//
+	// Deliberately NOT routed through charLengthOf: bit typmods store
+	// the raw length with NO +4 offset (ground-truthed: bit(3) carries
+	// atttypmod=3), so the char-family decode would mis-read them. The
+	// fallback is also unreachable here — `bit(n)[]` / `varbit(n)[]`
+	// array elements refuse loudly upstream as an unsupported element
+	// family (builtinArrayElement has no _bit/_varbit), and scalar bit
+	// columns always carry character_maximum_length.
 	case "bit", "bit varying":
 		n := int(int64Ptr(c.CharMaxLen))
 		if n < 1 {
@@ -518,6 +559,29 @@ func int64Ptr(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// charLengthOf resolves the declared length for a character-family
+// column (varchar / bpchar). information_schema's
+// character_maximum_length is the scalar ground truth, but it is NULL
+// for every modifier of an ARRAY column — so array-element metas
+// (whose synthesized columnMeta carries only the array column's
+// atttypmod) fall back to the typmod, which PG applies to the elements
+// (`varchar(20)[]` carries atttypmod=24) stored as N+4 (VARHDRSZ).
+// declared=false is the bare form (typmod -1): unbounded varchar /
+// bpchar, NOT length zero — the caller maps it to an unbounded IR type
+// instead of the VARCHAR(0)/CHAR(0) false refusal (Bug 195). The
+// char-family counterpart of [temporalPrecisionOf]'s typmod fallback;
+// the numeric family's lives inline in translateScalarType via
+// [numericTypmod].
+func charLengthOf(c columnMeta) (length int, declared bool) {
+	if c.CharMaxLen != nil {
+		return int(*c.CharMaxLen), true
+	}
+	if c.AttTypmod >= 4 {
+		return int(c.AttTypmod - 4), true
+	}
+	return 0, false
 }
 
 // temporalPrecisionOf resolves the (precision, unspecified) pair for a
