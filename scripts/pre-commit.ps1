@@ -49,6 +49,20 @@ if ($nulFiles.Count -gt 0) {
     exit 1
 }
 
+# ---- merge-conflict-marker guard on staged text files ----
+# A stray conflict marker survived a manual resolution into a committed
+# doc once (2026-07-17): the error-code doc-sync test parses table rows
+# and skips other lines, so a leftover "<<<<<<< HEAD" rode a green gate.
+$conflictFiles = git diff --cached --name-only --diff-filter=ACM |
+    Where-Object { $_ -match '\.(md|go|yml|yaml|sh|ps1|txt)$' } |
+    Where-Object { (Test-Path $_) -and ((Get-Content -LiteralPath $_) -match '^(<{7}|>{7})( |$)') }
+if ($conflictFiles.Count -gt 0) {
+    Red "pre-commit: staged text file(s) contain a merge-conflict marker:"
+    $conflictFiles | ForEach-Object { Write-Host $_ }
+    Write-Host "Finish resolving the conflict before committing."
+    exit 1
+}
+
 # ---- gofumpt ----
 $gofumpt = Get-Command gofumpt -ErrorAction SilentlyContinue
 if (-not $gofumpt) {

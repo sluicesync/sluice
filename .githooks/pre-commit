@@ -55,6 +55,22 @@ if [ -n "$nul_hits" ]; then
 	exit 1
 fi
 
+# ---- merge-conflict-marker guard on staged text files ----
+# A stray conflict marker survived a manual resolution into a committed
+# doc once (2026-07-17): the error-code doc-sync test parses table rows
+# and skips other lines, so a leftover "<<<<<<< HEAD" rode a green gate.
+# Match a line-start marker followed by a space or EOL (the real conflict
+# shape), so prose/underlines like "=======" in a NOTICE don't false-fire.
+conflict_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
+	[ -f "$f" ] && grep -Eq '^(<{7}|>{7}) |^<{7}$|^>{7}$' "$f" && echo "$f"
+done)
+if [ -n "$conflict_hits" ]; then
+	red "pre-commit: staged text file(s) contain a merge-conflict marker:"
+	echo "$conflict_hits"
+	echo "Finish resolving the conflict before committing."
+	exit 1
+fi
+
 # ---- gofumpt ----
 if ! command -v gofumpt >/dev/null 2>&1; then
 	red "pre-commit: gofumpt not installed."
