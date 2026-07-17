@@ -1,0 +1,60 @@
+# NOBLOB override for the item-74 / ADR-0172 VStream partial-row-image belt
+# validation (cdc_vstream_cluster_noblob_integration_test.go).
+#
+# Layers onto docker-compose.yml. It replaces the two tablet commands so
+# mysqld inits with binlog_row_image=NOBLOB via EXTRA_MY_CNF, which is
+# written into the datadir and exported BEFORE mysqlctl init/start. Every
+# tablet query-pool connection then inherits NOBLOB from connect time — the
+# deterministic way to make unchanged BLOB/TEXT columns drop out of UPDATE
+# after-images (the partial row image the belt must refuse). A runtime
+# `SET GLOBAL binlog_row_image=NOBLOB` would MISS already-warm pool
+# connections, so it is deliberately NOT used here.
+#
+# The base compose's entrypoint (`sh -c`), image, named volume, hostname
+# and depends_on all carry through the merge; only `command` is replaced.
+# The tablet flags stay the modern v24 hyphenated form the base uses, so
+# this override is only layered on the default v24.0.1 image (the belt
+# suite does not drive the legacy-flag version matrix).
+services:
+  vttablet:
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        printf '[mysqld]\nbinlog_row_image=NOBLOB\n' > /vt/vtdataroot/noblob.cnf
+        export EXTRA_MY_CNF=/vt/vtdataroot/noblob.cnf
+        mysqlctl --tablet-uid 100 --mysql-port 17000 init || mysqlctl --tablet-uid 100 --mysql-port 17000 start
+        exec vttablet \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --tablet-path zone1-0000000100 \
+          --tablet-hostname vttablet \
+          --init-keyspace test \
+          --init-shard 0 \
+          --init-tablet-type replica \
+          --mysql-server-version '8.0.40-Vitess' \
+          --health-check-interval 5s \
+          --port 15100 --grpc-port 16100 \
+          --service-map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat-on-demand-duration=5s \
+          --config-file-not-found-handling=ignore
+  vttablet-replica:
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        printf '[mysqld]\nbinlog_row_image=NOBLOB\n' > /vt/vtdataroot/noblob.cnf
+        export EXTRA_MY_CNF=/vt/vtdataroot/noblob.cnf
+        mysqlctl --tablet-uid 101 --mysql-port 17000 init || mysqlctl --tablet-uid 101 --mysql-port 17000 start
+        exec vttablet \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --tablet-path zone1-0000000101 \
+          --tablet-hostname vttablet-replica \
+          --init-keyspace test \
+          --init-shard 0 \
+          --init-tablet-type replica \
+          --mysql-server-version '8.0.40-Vitess' \
+          --health-check-interval 5s \
+          --port 15100 --grpc-port 16100 \
+          --service-map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat-on-demand-duration=5s \
+          --config-file-not-found-handling=ignore

@@ -46,7 +46,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, chaos, reshard, vstream-pipeline, corpus, ddlfixture, kmsverify]
+        options: [all, chaos, reshard, noblob, vstream-pipeline, corpus, ddlfixture, kmsverify]
 
 permissions:
   contents: read
@@ -160,6 +160,52 @@ jobs:
         run: |
           go test -tags='integration vitessreshard' -race -count=1 -timeout=95m \
             -run '^TestVitessReshard_' -v ./internal/engines/mysql/...
+
+  # The NOBLOB partial-row-image belt suite (item-74 / ADR-0172): boots the
+  # full cluster with binlog_row_image=NOBLOB written into each tablet's
+  # mysqld (testdata/vitesscluster/docker-compose.noblob.yml), so an
+  # unchanged BLOB/TEXT column genuinely drops out of an UPDATE after-image
+  # on the wire — the silent-loss trap the belt refuses. It covers BOTH
+  # dispatch paths (warm-resume dispatchRow + cold-start dispatchCDCRow, the
+  # v0.99.273 fix path) and asserts up front that @@global.binlog_row_image =
+  # NOBLOB on both tablet mysqlds (the non-vacuity guard: a FULL-reverting
+  # provisioning regression fails LOUD instead of passing vacuously green).
+  #
+  # These tests carry the plain `vitesscluster` tag and match the
+  # `TestVitessCluster` prefix (the single-exclusion run-filter-coverage
+  # guard requires every non-chaos vitesscluster test to; a dedicated
+  # `noblob` sub-tag would need a second axis exclusion the guard doesn't
+  # support). They therefore ALSO ride the weekly vitess-version-matrix
+  # `cluster` leg on v23+/latest (skipping on legacy-flag v21/v22); this leg
+  # is the focused, dispatchable, default-v24 regression home matching the
+  # chaos/reshard shape. -race because the CDC pump is goroutine-bearing.
+  noblob:
+    name: Vitess NOBLOB belt suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'noblob' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Same GHCR-mirror pull as the chaos leg: the harness drives
+      # `docker compose` directly (not testcontainers), so the image must be
+      # in the local cache and VITESS_LITE_IMAGE must point the compose file
+      # + harness at the mirror (no docker.io rate-limit SPOF).
+      - name: Log in to ghcr.io + pull the pre-baked Vitess image
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-vitess:v24.0.1
+
+      - name: Run the NOBLOB belt suite
+        env:
+          VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
+        run: |
+          go test -tags='integration vitesscluster' -race -count=1 -timeout=40m \
+            -run '^TestVitessClusterNoBlob_' -v ./internal/engines/mysql/...
 
   # The PIPELINE-package vstream suite (Bug-132 chunked parity,
   # restart-mid-copy chaos, sharded-source + Bug-152 collision
