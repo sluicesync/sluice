@@ -7,7 +7,6 @@ import (
 	"context"
 	"testing"
 
-	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
@@ -16,22 +15,16 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// auditVStreamSrcEngine is a minimal registered engine whose Capabilities
-// declare CDCPositionCommitsAfterRows — a stand-in for a VStream flavour
-// (PlanetScale / Vitess) used to show that the emptied-window refusal is
-// engine-agnostic, without importing a real engine package (which would cycle:
-// engines import internal/pipeline).
-type auditVStreamSrcEngine struct{ stubEngineBase }
-
-func (auditVStreamSrcEngine) Name() string { return auditVStreamSrcName }
-
-func (auditVStreamSrcEngine) Capabilities() ir.Capabilities {
-	return ir.Capabilities{CDCPositionCommitsAfterRows: true}
-}
-
+// auditVStreamSrcName is a stand-in SourceEngine name for a VStream flavour
+// (PlanetScale / Vitess), used to show that the emptied-window refusal is
+// engine-agnostic. It is manifest DATA only — since the item-60 close
+// (e722fb81: restore no longer trusts a schema anchor at EndPosition, so it
+// never consults the engine registry for the recorded source engine) nothing
+// looks the name up, so no registry entry is registered for it. This test
+// file previously Register()ed a stub engine under this name from an init(),
+// mutating the process-global registry for every test in the package
+// (roadmap item 72 leftover); the registration was vestigial and is gone.
 const auditVStreamSrcName = "audit_vstream_src"
-
-func init() { engines.Register(auditVStreamSrcEngine{}) }
 
 // TestVerifyBackupIDs_EmptyIDIncremental_Refused pins audit-2026-07-11 H-1
 // facet (b): a CDC segment (incremental / streaming) has recorded a BackupID

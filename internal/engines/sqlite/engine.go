@@ -137,6 +137,14 @@ var ErrNotImplemented = errors.New("sqlite engine: not implemented (SQLite has n
 // non-CLI callers) reads temporal columns as ISO-8601 text exactly as before.
 type Engine struct {
 	dateEncoding dateEncoding
+
+	// stageDir is where a materialized `.sql`-dump temp database is created
+	// (--stage-dir / SLUICE_STAGE_DIR, set via [Engine.WithStageDir]). Empty —
+	// the zero value — keeps the os.TempDir default; the materialized copy is
+	// roughly the database's size, which overwhelms a tmpfs /tmp on large
+	// dumps (the ADR-0145 hazard class the flatfile/parquet stage paths
+	// already honor the flag for). Irrelevant to binary `.db` sources.
+	stageDir string
 }
 
 // Name returns the engine's short identifier as used in configuration
@@ -159,6 +167,17 @@ func (e Engine) WithDateEncoding(enc string) (ir.Engine, error) {
 	return e, nil
 }
 
+// WithStageDir returns a copy of the engine carrying the operator's
+// --stage-dir override for the `.sql`-dump materialize (ADR-0130). No
+// validation here — a missing directory refuses loudly at open, naming
+// the flag (the same posture as the flatfile staging path). Empty keeps
+// the os.TempDir default. Mirrors [Engine.WithDateEncoding]'s
+// configured-copy shape — the registry's engine value stays default-free.
+func (e Engine) WithStageDir(dir string) ir.Engine {
+	e.stageDir = dir
+	return e
+}
+
 // Capabilities returns the static capability declaration for the SQLite
 // migrate source. Declared honestly: no CDC, no extension types, a flat
 // table namespace, and no bulk-load target path (it is never a target).
@@ -167,12 +186,12 @@ func (Engine) Capabilities() ir.Capabilities { return capabilities }
 // OpenSchemaReader returns a [SchemaReader] bound to the SQLite file
 // identified by dsn (a filesystem path, `file:` URI, or `sqlite://`
 // URL). The caller is responsible for closing the returned reader.
-func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
+func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
 	// Schema reading infers the IR type from the declared type alone
 	// (ADR-0129), so the per-source date encoding is irrelevant here and the
 	// resolved value is discarded. tempPath is the materialized dump DB (empty
 	// for a real `.db`); the reader removes it on Close.
-	db, path, _, tempPath, err := openReadOnly(ctx, dsn)
+	db, path, _, tempPath, err := openReadOnly(ctx, dsn, e.stageDir)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +204,7 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 // param, or the engine --sqlite-date-encoding default folded at OpenRowReader — ADR-0129 / task 2.5) is resolved here and
 // carried on the reader for value decode.
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	db, path, enc, tempPath, err := openReadOnly(ctx, dsn)
+	db, path, enc, tempPath, err := openReadOnly(ctx, dsn, e.stageDir)
 	if err != nil {
 		return nil, err
 	}

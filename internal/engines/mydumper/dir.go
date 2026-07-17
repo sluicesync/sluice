@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	// klauspost's gzip is a drop-in stdlib replacement measured ~1.5×
 	// faster decompressing dump-shaped chunks (BenchmarkChunkGzipDecompress;
@@ -298,9 +299,26 @@ func openDumpDir(path string) (*dumpDir, error) {
 	// (companion + dump-wide metadata) — the count decides which of the
 	// three shapes a chunk-less table is.
 	for _, name := range d.tableOrder {
-		warnIfTableHasNoChunks(d.tables[name])
+		d.warnIfTableHasNoChunks(d.tables[name])
 	}
 	return d, nil
+}
+
+// warnedNoChunkTables dedups the zero-chunk loss-net WARNs per (dump dir,
+// table) per process. A single migrate re-opens the dump directory once per
+// reader open (schema reader, row reader, verifier, …, ~5× per run), and each
+// open re-runs the loss net — without the dedup the same WARN printed once
+// per open (v0.99.263 cycle observation). sync.Map is the warn-on-first-write
+// shape the postgres engine's warnNoFailoverSupport uses.
+var warnedNoChunkTables sync.Map
+
+// resetZeroChunkWarnsForTest clears the warned set. Used only from unit
+// tests in this package; not part of the engine's surface.
+func resetZeroChunkWarnsForTest() {
+	warnedNoChunkTables.Range(func(key, _ any) bool {
+		warnedNoChunkTables.Delete(key)
+		return true
+	})
 }
 
 // warnIfTableHasNoChunks is the zero-chunk loss net (audit 2026-07-16
@@ -326,12 +344,19 @@ func openDumpDir(path string) (*dumpDir, error) {
 //     indistinguishable from a genuinely empty table; WARN says exactly
 //     that and points at the live source. Documented in
 //     docs/operator/flat-file-sources.md.
-func warnIfTableHasNoChunks(t *tableFiles) {
+//
+// Both WARN shapes fire once per (dump dir, table) per process (the
+// [warnedNoChunkTables] dedup) — the finding doesn't change between the
+// several dump-opens of one run, so repeating it is pure noise.
+func (d *dumpDir) warnIfTableHasNoChunks(t *tableFiles) {
 	if len(t.chunks) > 0 {
 		return
 	}
 	if t.hasMetadataRows && t.metadataRows == 0 {
 		return // the dump's own count corroborates "empty"
+	}
+	if _, loaded := warnedNoChunkTables.LoadOrStore(d.path+"\x00"+t.name, struct{}{}); loaded {
+		return // already warned for this dump dir + table in this process
 	}
 	if t.hasMetadataRows {
 		slog.Warn(

@@ -47,8 +47,13 @@ func sniffSQLiteBinary(path string) (bool, error) {
 }
 
 // materializeDump loads the SQL text dump at dumpPath into a FRESH temp SQLite
-// database under os.TempDir() and returns the temp file's path. The caller owns
-// the temp file's lifecycle (the reader removes it on Close).
+// database and returns the temp file's path. The caller owns the temp file's
+// lifecycle (the reader removes it on Close). stageDir is where the temp
+// database is created (--stage-dir / SLUICE_STAGE_DIR — the materialized copy
+// is roughly the database's size, which overwhelms a tmpfs /tmp on large
+// dumps, the ADR-0145 hazard class); empty keeps the os.TempDir default, and
+// a missing directory refuses loudly naming the flag (mirroring the flatfile
+// staging path) — never a silent fallback to the system temp dir.
 //
 // The dump is STREAMED, never read whole into memory (a `sqlite3 .dump` of a
 // large database is bigger than the database itself, so reading it into RAM
@@ -58,15 +63,18 @@ func sniffSQLiteBinary(path string) (bool, error) {
 // COMMIT`-wrapped dump commits correctly). Any failure removes the temp file and
 // returns a loud error naming the dump — no data moves on a malformed dump (the
 // loud-failure posture, ADR-0130 §5).
-func materializeDump(ctx context.Context, dumpPath string) (tempPath string, err error) {
+func materializeDump(ctx context.Context, dumpPath, stageDir string) (tempPath string, err error) {
 	src, err := os.Open(dumpPath) //nolint:gosec // operator-supplied source path
 	if err != nil {
 		return "", fmt.Errorf("sqlite: read dump %q: %w", dumpPath, err)
 	}
 	defer func() { _ = src.Close() }()
 
-	f, err := os.CreateTemp("", "sluice-sqlite-*.db")
+	f, err := os.CreateTemp(stageDir, "sluice-sqlite-*.db")
 	if err != nil {
+		if stageDir != "" {
+			return "", fmt.Errorf("sqlite: create temp db for dump %q under --stage-dir %q: %w", dumpPath, stageDir, err)
+		}
 		return "", fmt.Errorf("sqlite: create temp db for dump %q: %w", dumpPath, err)
 	}
 	created := f.Name()

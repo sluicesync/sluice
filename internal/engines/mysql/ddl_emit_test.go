@@ -159,6 +159,46 @@ func TestEmitColumnType_IntervalRefuses(t *testing.T) {
 	}
 }
 
+// TestEmitColumnType_NegativeDecimalScaleRefuses pins the emit-time
+// backstop for PG 15+ negative numeric scale: MySQL DECIMAL scale is
+// 0..30, so DECIMAL(p,-s) has no spelling — pre-fix the emitter rendered
+// it verbatim and CREATE died with a raw Error 1064. The cross-engine
+// preflight (migcore.CheckCrossEngineSupportable) refuses earlier on the
+// migrate/restore paths; this backstop covers what bypasses it — notably
+// a DOMAIN whose base type carries the negative scale (emitColumnType
+// recurses into the base). Boundary scales 0 and 30 stay emittable.
+func TestEmitColumnType_NegativeDecimalScaleRefuses(t *testing.T) {
+	for name, typ := range map[string]ir.Type{
+		"scalar": ir.Decimal{Precision: 5, Scale: -2},
+		"domain base": ir.Domain{
+			Name:     "rounded_hundreds",
+			BaseType: ir.Decimal{Precision: 5, Scale: -2},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := emitColumnType(typ)
+			if err == nil {
+				t.Fatal("expected error on negative-scale DECIMAL; got nil")
+			}
+			for _, want := range []string{"NUMERIC(5,-2)", "negative scale", "decimal:precision=7,scale=0"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v; want mention of %q", err, want)
+				}
+			}
+		})
+	}
+	for name, typ := range map[string]ir.Type{
+		"scale 0":  ir.Decimal{Precision: 10, Scale: 0},
+		"scale 30": ir.Decimal{Precision: 65, Scale: 30},
+	} {
+		t.Run(name+" emits", func(t *testing.T) {
+			if _, err := emitColumnType(typ); err != nil {
+				t.Errorf("boundary %s refused: %v", name, err)
+			}
+		})
+	}
+}
+
 // TestEmitColumnType_HstoreCrossEngine emits MySQL JSON for an
 // ir.ExtensionType{Extension: "hstore"} column. The cross-engine
 // translator (ADR-0032 § "Cross-engine policy") is wired into the

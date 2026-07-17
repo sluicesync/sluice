@@ -102,6 +102,74 @@ func TestDumpIngest_SchemaSkipsCfTables(t *testing.T) {
 	}
 }
 
+// TestDumpIngest_StageDirHonored pins the --stage-dir thread for the
+// `.sql`-dump materialize (roadmap item 72 leftover): with
+// [Engine.WithStageDir] set, the materialized temp DB is created under the
+// named directory (and removed on Close, same lifecycle as the default), and
+// a MISSING stage dir refuses loudly naming the flag — never a silent
+// fallback to the system temp dir (the flatfile staging posture).
+func TestDumpIngest_StageDirHonored(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("staged copy lands under the stage dir", func(t *testing.T) {
+		stage := t.TempDir()
+		path := writeDump(t, "d1export.sql", d1LikeDump)
+		eng := Engine{}.WithStageDir(stage)
+		sr, err := eng.OpenSchemaReader(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenSchemaReader: %v", err)
+		}
+		scr := sr.(*SchemaReader)
+		if got := filepath.Dir(scr.tempPath); got != stage {
+			_ = scr.Close()
+			t.Fatalf("materialized temp DB dir = %q; want the stage dir %q", got, stage)
+		}
+		tempPath := scr.tempPath
+		if err := scr.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
+			t.Errorf("staged temp DB %q should be removed after Close; stat err = %v", tempPath, err)
+		}
+	})
+
+	t.Run("missing stage dir refuses naming --stage-dir", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+		path := writeDump(t, "d1export.sql", d1LikeDump)
+		eng := Engine{}.WithStageDir(missing)
+		_, err := eng.OpenSchemaReader(ctx, path)
+		if err == nil || !strings.Contains(err.Error(), "--stage-dir") {
+			t.Fatalf("open with a missing --stage-dir = %v; want a loud refusal naming the flag", err)
+		}
+	})
+
+	t.Run("binary .db source ignores the stage dir (nothing materializes)", func(t *testing.T) {
+		stage := t.TempDir()
+		dbPath := filepath.Join(t.TempDir(), "real.db")
+		seed, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("open seed db: %v", err)
+		}
+		if _, err := seed.ExecContext(ctx, "CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		_ = seed.Close()
+		eng := Engine{}.WithStageDir(stage)
+		sr, err := eng.OpenSchemaReader(ctx, dbPath)
+		if err != nil {
+			t.Fatalf("OpenSchemaReader: %v", err)
+		}
+		scr := sr.(*SchemaReader)
+		if scr.tempPath != "" {
+			_ = scr.Close()
+			t.Fatalf("binary .db source materialized %q; want no temp DB", scr.tempPath)
+		}
+		if err := scr.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
 // TestDumpIngest_RowsReadAndTempRemoved pins that rows decode correctly through
 // the existing path from a materialized dump (incl. the embedded-';' string and
 // a NULL), `_cf_KV` is not readable as a user table, and the row reader's temp

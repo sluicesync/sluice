@@ -463,4 +463,42 @@ func TestOpenDumpDir_ZeroChunkTableWarn(t *testing.T) {
 			t.Fatalf("zero-chunk WARN fired for a table WITH chunks:\n%s", logs.String())
 		}
 	})
+
+	t.Run("WARN dedups per dump dir + table across re-opens (v0.99.263 noise)", func(t *testing.T) {
+		// One migrate opens the dump directory once per internal reader open
+		// (~5×/run); the loss net's finding doesn't change between opens, so
+		// the WARN must fire once per (dir, table) per process — while a
+		// DIFFERENT dump dir with the same table name still warns.
+		dir := t.TempDir()
+		writeDumpFile(t, dir, "metadata", traditionalMetadata)
+		writeDumpFile(t, dir, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		logs := captureSlog(t)
+		for i := 0; i < 3; i++ {
+			if _, err := openDumpDir(dir); err != nil {
+				t.Fatalf("openDumpDir #%d: %v", i+1, err)
+			}
+		}
+		if got := strings.Count(logs.String(), marker); got != 1 {
+			t.Fatalf("zero-chunk WARN fired %d times across 3 opens; want exactly 1:\n%s", got, logs.String())
+		}
+
+		other := t.TempDir()
+		writeDumpFile(t, other, "metadata", traditionalMetadata)
+		writeDumpFile(t, other, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		if _, err := openDumpDir(other); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Count(logs.String(), marker); got != 2 {
+			t.Fatalf("a different dump dir with the same table must still WARN (got %d total):\n%s", got, logs.String())
+		}
+
+		// resetZeroChunkWarnsForTest re-arms the net (test hygiene hook).
+		resetZeroChunkWarnsForTest()
+		if _, err := openDumpDir(dir); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Count(logs.String(), marker); got != 3 {
+			t.Fatalf("after reset the WARN must fire again (got %d total):\n%s", got, logs.String())
+		}
+	})
 }

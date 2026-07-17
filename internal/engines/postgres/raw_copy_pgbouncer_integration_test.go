@@ -121,7 +121,12 @@ ignore_startup_parameters = extra_float_digits,options
 
 	pgbC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "edoburu/pgbouncer:latest",
+			// Pinned tag (v265 review nit): `latest` made the rig's pgbouncer
+			// version drift silently under the test — v1.25.2-p0 is the exact
+			// build the transaction-scoped pin shape was hand-validated
+			// against (see the file header). Bump deliberately, re-validating
+			// the unpinned-vs-pinned rendering by hand.
+			Image:        "edoburu/pgbouncer:v1.25.2-p0",
 			ExposedPorts: []string{"6432/tcp"},
 			Files: []testcontainers.ContainerFile{
 				{HostFilePath: iniPath, ContainerFilePath: "/etc/pgbouncer/pgbouncer.ini", FileMode: 0o644},

@@ -146,7 +146,7 @@ type Globals struct {
 	// and ENOSPCs mid-run (the ADR-0145 hazard class). Empty — the zero
 	// value — keeps the os.TempDir default. Inert for commands that
 	// stage nothing.
-	StageDir string `name:"stage-dir" env:"SLUICE_STAGE_DIR" help:"Directory for sluice's large scratch files: the csv/tsv/ndjson staged SQLite copy (~source file size), the D1 --stage-local replica, and the export-as-parquet per-table scratch. Defaults to the system temp dir — override on hosts whose /tmp is a small tmpfs. The directory must already exist (a missing path is refused loudly). Env: SLUICE_STAGE_DIR." placeholder:"DIR"`
+	StageDir string `name:"stage-dir" env:"SLUICE_STAGE_DIR" help:"Directory for sluice's large scratch files: the csv/tsv/ndjson staged SQLite copy (~source file size), the sqlite .sql-dump materialized database, the D1 --stage-local replica, and the export-as-parquet per-table scratch. Defaults to the system temp dir — override on hosts whose /tmp is a small tmpfs. The directory must already exist (a missing path is refused loudly). Env: SLUICE_STAGE_DIR." placeholder:"DIR"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from
@@ -838,6 +838,15 @@ func applyEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
 		if e, err = c.WithDateEncoding(g.SQLiteDateEncoding); err != nil {
 			return nil, err
 		}
+	}
+	// --stage-dir for the sqlite engine's `.sql`-dump materialize (ADR-0130):
+	// the staged temp database is ~the database's size, the same tmpfs-/tmp
+	// hazard the flatfile staging path already honors the flag for. The
+	// flatfile engines receive the same value through Options.StageDir below.
+	if c, ok := e.(interface {
+		WithStageDir(string) ir.Engine
+	}); ok {
+		e = c.WithStageDir(g.StageDir)
 	}
 	// The flat-file declarations (--csv-*, ADR-0163). The header mutual
 	// exclusion is checked unconditionally so it is caught even when the

@@ -190,14 +190,16 @@ func trimQuery(s string) string {
 // when a dump was materialized), the per-source date encoding resolved from the
 // DSN, and tempPath: the materialized temp DB the caller must os.Remove on
 // Close (empty when the source was a real binary `.db`, so a `.db` source
-// removes nothing). The caller owns the pool's lifecycle via Close.
+// removes nothing). stageDir is where a materialized dump lands (--stage-dir,
+// threaded from [Engine.WithStageDir]; empty = os.TempDir). The caller owns
+// the pool's lifecycle via Close.
 //
 // The source is sniffed by its SQLite magic header (ADR-0130): a binary `.db`
 // opens exactly as before; anything else is treated as a SQL text dump and
 // materialized in-process into a temp SQLite DB, which is then opened read-only
 // via the same path. On any error after materialize the temp file is removed
 // before returning, so a failed open never leaks one.
-func openReadOnly(ctx context.Context, dsn string) (db *sql.DB, path string, enc dateEncoding, tempPath string, err error) {
+func openReadOnly(ctx context.Context, dsn, stageDir string) (db *sql.DB, path string, enc dateEncoding, tempPath string, err error) {
 	driverDSN, path, enc, err := parseDSN(dsn)
 	if err != nil {
 		return nil, "", dateEncodingInherit, "", err
@@ -239,7 +241,7 @@ func openReadOnly(ctx context.Context, dsn string) (db *sql.DB, path string, enc
 		// A SQL text dump (e.g. `wrangler d1 export`): materialize it into a
 		// temp DB and read THAT, keeping `path` pointed at the original dump for
 		// error messages. The read-only pragmas still apply on the temp pool.
-		tempPath, err = materializeDump(ctx, path)
+		tempPath, err = materializeDump(ctx, path, stageDir)
 		if err != nil {
 			return nil, "", dateEncodingInherit, "", err // already names the dump
 		}

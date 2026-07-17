@@ -293,6 +293,20 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 		// PG-native-with-no-MySQL-form refusals above.
 		return "a PG INTERVAL type (no MySQL equivalent — a MySQL TIME can't hold the full duration range)"
 	}
+	// PG 15+ negative numeric scale — numeric(p, -s), values rounded to
+	// tens/hundreds — has no MySQL spelling (DECIMAL scale is 0..30).
+	// Pre-fix this emitted DECIMAL(p,-s) and died at CREATE with a raw
+	// Error 1064; the named refusal fires here instead, before any DDL.
+	// The values themselves are exact integers of at most p+|s| digits,
+	// so the wrapper's --type-override recovery has a LOSSLESS landing:
+	// decimal:precision=<p+|s|>,scale=0. Scalar columns only — a
+	// numeric(p,-s) ARRAY element lands as MySQL JSON with the exact
+	// value text carried, so it needs no refusal.
+	if v, ok := t.(ir.Decimal); ok && !v.Unconstrained && v.Scale < 0 {
+		return fmt.Sprintf("type NUMERIC(%d,%d) with a NEGATIVE scale (PG 15+) — MySQL DECIMAL scale must be 0..30; "+
+			"the lossless mapping is --type-override to decimal:precision=%d,scale=0 (the values are exact integers)",
+			v.Precision, v.Scale, v.Precision-v.Scale)
+	}
 	return ""
 }
 

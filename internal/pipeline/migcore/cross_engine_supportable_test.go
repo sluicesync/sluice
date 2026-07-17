@@ -818,3 +818,62 @@ func TestCheckCrossEngineSupportable_StandaloneSequenceRefuses(t *testing.T) {
 		t.Error("postgres-trigger → mysql with standalone sequence: want refusal; got nil")
 	}
 }
+
+// PG 15+ negative numeric scale (numeric(p,-s)) has no MySQL DECIMAL
+// spelling (scale range 0..30). Pre-fix the writer emitted DECIMAL(p,-s)
+// and the migration died at CREATE with a raw MySQL Error 1064; the
+// preflight now refuses with a named message carrying the lossless
+// --type-override landing (decimal:precision=<p+|s|>,scale=0 — the
+// values are exact integers). Shape coverage per the Bug-74 discipline:
+// scalar refused per MySQL flavor; the ARRAY-element shape is NOT
+// refused (a numeric(p,-s)[] lands as MySQL JSON with exact value text);
+// non-negative and unconstrained decimals stay clean; PG → PG carries.
+func TestCheckCrossEngineSupportable_NegativeDecimalScaleRefuses(t *testing.T) {
+	scalar := &ir.Schema{Tables: []*ir.Table{{
+		Name: "readings",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "rounded", Type: ir.Decimal{Precision: 5, Scale: -2}},
+		},
+	}}}
+	for _, target := range []string{"mysql", "planetscale", "vitess"} {
+		err := CheckCrossEngineSupportable(scalar, "postgres", target, "migrate")
+		if err == nil {
+			t.Fatalf("postgres → %s with numeric(5,-2): want refusal; got nil", target)
+		}
+		msg := err.Error()
+		for _, want := range []string{"NUMERIC(5,-2)", "NEGATIVE scale", "rounded", "decimal:precision=7,scale=0"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("postgres → %s: refusal %q missing %q", target, msg, want)
+			}
+		}
+	}
+
+	// Array element shape: numeric(p,-s)[] lands as MySQL JSON — the
+	// exact value text is carried, so no refusal fires.
+	arr := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "readings",
+		Columns: []*ir.Column{{Name: "series", Type: ir.Array{Element: ir.Decimal{Precision: 5, Scale: -2}}}},
+	}}}
+	if err := CheckCrossEngineSupportable(arr, "postgres", "mysql", "migrate"); err != nil {
+		t.Errorf("numeric(5,-2)[] → mysql err = %v; want nil (lands as JSON, value text exact)", err)
+	}
+
+	// Non-negative scales and the unconstrained shape stay clean.
+	clean := &ir.Schema{Tables: []*ir.Table{{
+		Name: "amounts",
+		Columns: []*ir.Column{
+			{Name: "zero_scale", Type: ir.Decimal{Precision: 10, Scale: 0}},
+			{Name: "max_scale", Type: ir.Decimal{Precision: 65, Scale: 30}},
+			{Name: "unbounded", Type: ir.Decimal{Unconstrained: true}},
+		},
+	}}}
+	if err := CheckCrossEngineSupportable(clean, "postgres", "mysql", "migrate"); err != nil {
+		t.Errorf("non-negative decimal scales → mysql err = %v; want nil", err)
+	}
+
+	// Same-engine PG → PG carries the negative scale verbatim.
+	if err := CheckCrossEngineSupportable(scalar, "postgres", "postgres", "migrate"); err != nil {
+		t.Errorf("postgres → postgres numeric(5,-2) err = %v; want nil (native carry)", err)
+	}
+}

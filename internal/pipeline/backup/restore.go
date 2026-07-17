@@ -466,12 +466,17 @@ func (r *Restore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 
-	// 1.6. ADR-0154 signature verification for the single-manifest path
-	// (a lone signed full, sequence 0). When SkipChainDispatch is set,
-	// [ChainRestore] already verified every segment's signatures at its
-	// walked position — re-verifying here would use the wrong sequence
-	// for a later segment's full, so skip.
+	// 1.55. BackupID recompute check (audit 2026-07-11 L-3), then
+	// 1.6. ADR-0154 signature verification — the single-manifest twins of
+	// chain restore's steps 2.7b and 2.8, in the same order. Both are
+	// skipped on ChainRestore re-entry (SkipChainDispatch): it already
+	// verified every link's BackupID and signatures at their walked
+	// positions — re-verifying the signature here would use the wrong
+	// sequence for a later segment's full.
 	if !r.SkipChainDispatch {
+		if err := r.verifySingleFullBackupID(manifest); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseConnect, err)
+		}
 		if err := verifyManifestSignaturePolicy(ctx, r.Store, lineage.ManifestFileName, manifest, 0, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 		}
@@ -651,6 +656,19 @@ func restoreSummaryResult(tables int, manifest *irbackup.Manifest) progress.Resu
 		{Label: "Tables", Value: progress.HumanCount(int64(tables))},
 		{Label: "Rows", Value: progress.HumanCount(rows)},
 	}}
+}
+
+// verifySingleFullBackupID runs the BackupID recompute check (audit
+// 2026-07-11 L-3) for the single-manifest path: the lone full's recorded
+// BackupID must match its recomputed content (created_at / source_engine /
+// kind / EndPosition + the FV8 flag) — a mismatch is bit-rot or a lazy
+// edit, refused before anything lands. Pre-fix only the chain walk ran
+// [verifyBackupIDs], so a single-full store's tampered covered field
+// restored with rc=0. A legacy full with an EMPTY recorded id still skips
+// (nothing recorded to verify — the verifyBackupIDs contract).
+func (r *Restore) verifySingleFullBackupID(manifest *irbackup.Manifest) error {
+	links := []lineage.SegmentRecord{{ManifestRecord: lineage.ManifestRecord{Manifest: manifest, Path: lineage.ManifestFileName}}}
+	return verifyBackupIDs(links)
 }
 
 // validate sanity-checks required fields.

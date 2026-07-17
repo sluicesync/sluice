@@ -80,6 +80,19 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 			// Bug 69; mirrors the bigint-unsigned precedent).
 			return "DECIMAL(65,30)", nil
 		}
+		if v.Scale < 0 {
+			// PG 15+ negative numeric scale (numeric(p,-s), values rounded
+			// to tens/hundreds) has no MySQL spelling — DECIMAL scale is
+			// 0..30, and emitting DECIMAL(p,-s) dies at CREATE with a raw
+			// Error 1064. The cross-engine preflight
+			// (migcore.CheckCrossEngineSupportable) normally refuses this
+			// earlier with recovery guidance; this is the loud emit-time
+			// backstop for paths that bypass it (hand-built IR, a DOMAIN
+			// whose base type carries the negative scale).
+			return "", fmt.Errorf("mysql: NUMERIC(%d,%d) has a negative scale (PG 15+) — MySQL DECIMAL scale must be 0..30; "+
+				"supply --type-override mapping the column to decimal:precision=%d,scale=0 (lossless — the values are exact integers)",
+				v.Precision, v.Scale, v.Precision-v.Scale)
+		}
 		return fmt.Sprintf("DECIMAL(%d,%d)", v.Precision, v.Scale), nil
 	case ir.Float:
 		if v.Precision == ir.FloatSingle {

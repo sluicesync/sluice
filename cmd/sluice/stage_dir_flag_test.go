@@ -78,6 +78,43 @@ func TestStageDirEnvVar(t *testing.T) {
 	assertStagesUnder(t, cli, src, stageDir)
 }
 
+// TestStageDirFlag_SQLiteDumpMaterialize pins --stage-dir through the CLI
+// for the sqlite engine's `.sql`-dump materialize (roadmap item 72
+// leftover): the same parse -> resolveEngines -> real-open discipline as
+// the flatfile pin above, observed via the sluice-sqlite-*.db temp file
+// landing under the named directory while the reader is open and being
+// removed on Close.
+func TestStageDirFlag_SQLiteDumpMaterialize(t *testing.T) {
+	stageDir := t.TempDir()
+	src := writeFixture(t, "dump.sql", "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\n")
+	cli := parseMigrate(
+		t,
+		"--source-driver=sqlite", "--source="+src,
+		"--target-driver=postgres", "--target=ignored",
+		"--stage-dir="+stageDir,
+	)
+	source, err := resolveSource(t, cli)
+	if err != nil {
+		t.Fatalf("resolveEngines: %v", err)
+	}
+	sr, err := source.OpenSchemaReader(context.Background(), src)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	staged, err := filepath.Glob(filepath.Join(stageDir, "sluice-sqlite-*.db"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(staged) != 1 {
+		migcore.CloseIf(sr)
+		t.Fatalf("materialized dumps under --stage-dir while open = %d (%v); want 1", len(staged), staged)
+	}
+	migcore.CloseIf(sr)
+	if _, err := os.Stat(staged[0]); !os.IsNotExist(err) {
+		t.Fatalf("materialized dump %q should be removed after Close; stat err = %v", staged[0], err)
+	}
+}
+
 // TestStageDirMissingRefusesLoudly pins the loud-failure posture through
 // the CLI layer: a --stage-dir that does not exist refuses at open,
 // naming the flag — never a silent fallback to the system temp dir.
