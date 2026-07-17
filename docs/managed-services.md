@@ -499,8 +499,9 @@ Supabase free-tier **direct** endpoints (`db.<ref>.supabase.co`) have **only an 
 
 ### CDC preflight facts
 
-- `max_replication_slots=5`, `max_wal_senders=5` — plenty for one stream, but a small budget if other consumers (Realtime, ETL) share the project.
-- **`max_slot_wal_keep_size=512MB`** — this is Supabase's analogue of the managed-MySQL retention warnings: a detached or badly lagging stream on a busy database has only 512 MB of WAL runway before Postgres invalidates the slot (`wal_status='lost'`, re-snapshot required). sluice's ADR-0059 slot-health probe pages at 70/85% of exactly this bound; keep detach windows short.
+- `max_replication_slots=10`, `max_wal_senders=10` on a fresh Micro project — plenty for one stream, but a shared budget if other consumers (Realtime, ETL) also use the project. (An earlier probe recorded 5/5; Supabase raised the platform default to 10, so treat the exact number as observed-in-band, not fixed.)
+- **`max_slot_wal_keep_size` scales with the COMPUTE tier, not PITR** — 512 MB on Micro, ~2048 MB on Small+. This is Supabase's analogue of the managed-MySQL retention warnings: a detached or badly lagging stream on a busy database has only that much WAL runway before Postgres invalidates the slot (`wal_status='lost'`, re-snapshot required). sluice's ADR-0059 slot-health probe pages at 70/85% of whatever the live bound is; keep detach windows short. Note the lever for a WIDER retention window is a compute-tier bump (~$15/mo Small), **not** the PITR add-on (~$100/mo) — PITR only reaches 2 GB transitively because it *requires* Small compute.
+- **PITR is CDC-benign** (unlike Cloud SQL's toggle, which destroys positions): enabling it leaves `wal_level`, `max_wal_senders`, `max_replication_slots`, and the logical-slot LSN untouched, adds no platform slot, and never rewinds the position a slot reads — WAL archiving is already `archive_mode=on` at baseline, so PITR only extends archived-WAL *retention duration*. A sluice CDC stream behaves identically with PITR on or off.
 - **Platform slots**: a fresh/idle project has none (the empty `supabase_realtime` *publication* exists, but no slot until Realtime is used). Projects actively using Realtime hold `supabase_realtime*` slots — those are platform-owned; don't drop them and don't count them as leaked consumers.
 
 ### Session vs transaction pooler modes
