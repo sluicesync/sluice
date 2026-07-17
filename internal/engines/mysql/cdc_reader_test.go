@@ -497,21 +497,23 @@ func TestParseTruncateTable(t *testing.T) {
 	}
 }
 
-// TestFilterDeleteBefore pins the Bug 88 fix at unit level: the CDC
-// reader narrows the Before-image of a DELETE rows-event to its PK
-// columns before emit, so the applier's [buildWhereClause] never
-// gets to emit `non_pk_col IS NULL` predicates that fail to match
-// real target rows whose non-PK columns hold non-null values.
+// TestFilterBeforeToPK pins the Bug 88 fix (and its Bug 193 extension
+// to the UPDATE arm) at unit level: the CDC reader narrows the
+// Before-image of a DELETE or UPDATE rows-event to its PK columns
+// before emit, so the applier's [buildWhereClause] never gets to emit
+// `non_pk_col IS NULL` predicates that fail to match real target rows
+// whose non-PK columns hold non-null values.
 //
 // The matrix integration test (cdc_delete_matrix_mysql_integration_test.go)
 // pins the end-to-end behaviour; this unit test pins the narrowing
 // helper itself so a regression that drops the filter or alters the
 // PK lookup shape fails cheaply, without spinning up a testcontainer.
 //
-// Same name and shape as the PG-side test pinning the equivalent
-// helper — the family-dispatched fix-locus matches between engines
-// per ADR-0057's Bug-74 family-pin discipline.
-func TestFilterDeleteBefore(t *testing.T) {
+// Same shape as the PG-side test pinning filterBeforeToKeyCols — the
+// family-dispatched fix-locus matches between engines per ADR-0057's
+// Bug-74 family-pin discipline. (Helper and test were named
+// filterDeleteBefore until Bug 193 put the narrowing on both arms.)
+func TestFilterBeforeToPK(t *testing.T) {
 	cases := []struct {
 		name string
 		tbl  *tableSchema
@@ -595,7 +597,7 @@ func TestFilterDeleteBefore(t *testing.T) {
 			},
 			// With no PK, there's no narrowing possible — return the
 			// full Before-image verbatim. Same fallback as PG's
-			// filterDeleteBefore on a PK-less REPLICA IDENTITY FULL
+			// filterBeforeToKeyCols on a PK-less REPLICA IDENTITY FULL
 			// relation.
 			in: ir.Row{
 				"event_id": int64(99),
@@ -607,9 +609,9 @@ func TestFilterDeleteBefore(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got := filterDeleteBefore(c.tbl, c.in)
+			got := filterBeforeToPK(c.tbl, c.in)
 			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("filterDeleteBefore(...) = %#v; want %#v", got, c.want)
+				t.Errorf("filterBeforeToPK(...) = %#v; want %#v", got, c.want)
 			}
 		})
 	}

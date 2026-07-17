@@ -312,6 +312,16 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		return nil, err
 	}
 
+	// Bug 193 preflight: a snapshot stream exists to hand off to CDC,
+	// so refuse a partial binlog_row_image source HERE — before the
+	// FTWRL/consistent-snapshot dance and the (potentially hours-long)
+	// bulk copy — rather than at the post-copy StreamChanges chokepoint.
+	// See cdc_row_image_preflight.go.
+	if err := preflightBinlogRowImage(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	// Pin a single connection. All snapshot-pinned reads will run on
 	// this conn; the snapshot transaction is bound to it.
 	conn, err := db.Conn(ctx)

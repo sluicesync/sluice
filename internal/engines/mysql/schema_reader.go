@@ -714,9 +714,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
 	}
 
-	// Bug 88: the CDC reader's DELETE emit path narrows the BEFORE-image
-	// to PK columns to avoid silent zero-match on MINIMAL / NOBLOB
-	// sources (see filterDeleteBefore in cdc_reader.go). Load the PK
+	// Bug 88 (DELETE) / Bug 193 (UPDATE): the CDC reader's emit paths
+	// narrow the BEFORE-image to PK columns to avoid silent zero-match
+	// (see filterBeforeToPK in cdc_reader.go). Load the PK
 	// column-name list now so the cached *tableSchema carries it.
 	// loadPrimaryKeyDB is a *sql.DB-flavoured sibling of the applier's
 	// loadPrimaryKey (which takes *sql.Tx).
@@ -736,7 +736,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 // loads metadata outside any data tx, so a *sql.DB is correct here.
 //
 // Returns an empty slice (not nil) for tables with no PK; the
-// caller's [filterDeleteBefore] falls back to the full Before-image
+// caller's [filterBeforeToPK] falls back to the full Before-image
 // in that case (same semantics as PG's REPLICA IDENTITY FULL on a
 // PK-less relation).
 func loadPrimaryKeyDB(ctx context.Context, db *sql.DB, schema, table string) ([]string, error) {

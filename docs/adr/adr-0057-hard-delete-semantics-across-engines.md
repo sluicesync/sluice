@@ -159,6 +159,35 @@ there too. Pinned by the existing
 `cdc_vstream_composite_pk_integration_test.go` matrix expanding
 when needed.
 
+##### Bug 193 posture change (2026-07-16): MINIMAL/NOBLOB now REFUSE at CDC start
+
+Bug 88 made DELETE correct under partial row images, and the matrix
+above pinned the `MINIMAL`/`NOBLOB` cells as *working streams*. Bug
+193 (found live on Azure Database for MySQL Flexible Server, whose
+platform default is `MINIMAL`) then proved the UPDATE arm is
+unfixable under a partial row image: the before-image narrowing that
+saved DELETE is not enough, because the UPDATE *after*-image is also
+partial — a PK-narrowed apply would NULL out every unchanged column,
+converting silent-skip into silent-corruption. Making MINIMAL updates
+apply correctly is replica-semantics work (present-columns-bitmap-
+aware SET clauses) sluice deliberately does not attempt.
+
+The production posture therefore changed: the CDC reader now reads
+`@@GLOBAL.binlog_row_image` at every CDC start (StreamChanges — cold
+handoff, warm resume, backup incremental — plus the snapshot openers,
+so a sync refuses *before* the bulk copy) and refuses `MINIMAL`/
+`NOBLOB` with the coded `SLUICE-E-CDC-ROW-IMAGE-PARTIAL`; a
+dispatch-time belt additionally stops the stream loudly if a partial
+INSERT/UPDATE image slips past the global preflight (session-level
+override, or a resume replaying a MINIMAL-era binlog segment). The
+matrix's `MINIMAL`/`NOBLOB` cells accordingly pin the refusal now,
+not delete propagation; the `filterBeforeToPK` narrowing (renamed
+from `filterDeleteBefore` when Bug 193 extended it to the UPDATE
+before-image, matching PG's `filterBeforeToKeyCols` from Bug 92)
+remains load-bearing as the reason partial-image DELETE *replay*
+stays safe and FULL-image WHEREs stay identity-keyed. See
+`internal/engines/mysql/cdc_row_image_preflight.go`.
+
 #### Postgres source (same-engine PG→PG)
 
 | `REPLICA IDENTITY` | plain DELETE | UPDATE-then-DELETE | TOAST'd row DELETE |

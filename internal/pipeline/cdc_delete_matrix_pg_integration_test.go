@@ -185,7 +185,7 @@ func runPostgresToPostgresDeleteCell(t *testing.T, identity, shape string, blobL
 		// OLD tuple only carries PK; under FULL it carries every
 		// column (with the TOAST pointer); under USING_INDEX it
 		// carries alt_key only. In every case sluice's
-		// filterDeleteBefore narrows to identity-key columns, so the
+		// filterBeforeToKeyCols narrows to identity-key columns, so the
 		// WHERE clause should be PK-only (DEFAULT/FULL) or alt_key
 		// (USING_INDEX) — never include the TOAST'd payload column.
 		applyDDL(t, sourceDSN, "DELETE FROM widgets WHERE id = 2;")

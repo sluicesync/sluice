@@ -56,6 +56,7 @@ const (
 	CodeIndexMissing             Code = "SLUICE-E-INDEX-MISSING"
 	CodeCDCReplicationPermission Code = "SLUICE-E-CDC-REPLICATION-PERMISSION"
 	CodeCDCPoolerEndpoint        Code = "SLUICE-E-CDC-POOLER-ENDPOINT"
+	CodeCDCRowImagePartial       Code = "SLUICE-E-CDC-ROW-IMAGE-PARTIAL"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
@@ -139,6 +140,7 @@ var registry = map[Code]Info{
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer), which cannot proxy replication-protocol commands; CDC needs the direct endpoint"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
+	CodeCDCRowImagePartial:         {ClassRefusal, "the MySQL source streams partial binlog row images (binlog_row_image != FULL), under which binlog CDC silently loses UPDATEs — refused at CDC start"},
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},

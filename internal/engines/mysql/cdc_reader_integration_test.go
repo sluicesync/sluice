@@ -148,11 +148,23 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 	if upd.Before == nil || upd.After == nil {
 		t.Fatalf("update missing Before/After: %+v", upd)
 	}
-	if before, _ := upd.Before["active"].(bool); !before {
-		t.Errorf("update.Before[active] = %#v; want true", upd.Before["active"])
+	// Bug 193: the UPDATE Before-image is narrowed to PK columns before
+	// emit (see filterBeforeToPK), the same Bug-88 treatment the DELETE
+	// arm below gets — the applier's WHERE needs only the row identity,
+	// and non-PK before values are the exact surface that silently
+	// zero-matches on a partial row image. Alice is row id=1 from the
+	// INSERT ordering above.
+	if id, _ := upd.Before["id"].(int64); id != 1 {
+		t.Errorf("update.Before[id] = %#v; want int64(1) (alice's row)", upd.Before["id"])
+	}
+	if _, present := upd.Before["active"]; present {
+		t.Errorf("update.Before unexpectedly carries non-PK active column (Bug 193 narrowing regressed?): %+v", upd.Before)
 	}
 	if after, _ := upd.After["active"].(bool); after {
 		t.Errorf("update.After[active] = %#v; want false", upd.After["active"])
+	}
+	if email, _ := upd.After["email"].(string); email != "alice@example.com" {
+		t.Errorf("update.After[email] = %#v; want the full after-image under FULL row image", upd.After["email"])
 	}
 
 	del, ok := got[3].(ir.Delete)
@@ -160,7 +172,7 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 		t.Fatalf("change[3] = %T; want ir.Delete", got[3])
 	}
 	// Bug 88: the CDC reader narrows the DELETE Before-image to PK
-	// columns before emit (see filterDeleteBefore in cdc_reader.go).
+	// columns before emit (see filterBeforeToPK in cdc_reader.go).
 	// Under the seed DDL above (PRIMARY KEY id), the Before should
 	// carry exactly {id} — non-PK columns (email, active) are
 	// excluded so the applier doesn't construct WHERE clauses with

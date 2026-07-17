@@ -176,6 +176,14 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return nil, err
 	}
 
+	// Bug 193 preflight: refuse a partial binlog_row_image source before
+	// the FTWRL window and the bulk copy (same rationale as the serial
+	// opener in cdc_snapshot.go). See cdc_row_image_preflight.go.
+	if err := preflightBinlogRowImage(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	// Acquire the consistent N-snapshot (FTWRL → N pinned CONSISTENT SNAPSHOT
 	// conns → record ONE binlog position P → UNLOCK). Extracted so the
 	// ADR-0111 re-snapshot recovery re-runs the EXACT same sequence on a fresh

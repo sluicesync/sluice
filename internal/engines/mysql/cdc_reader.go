@@ -267,11 +267,12 @@ type CDCReader struct {
 // PrimaryKey was added for Bug 88: under `binlog_row_image=MINIMAL`
 // (and `NOBLOB` when BLOB/TEXT non-PK columns exist), the binlog
 // DELETE rows-event carries `nil` for non-PK columns; the CDC
-// reader's DELETE emit path narrows the Before-image to PK columns
-// only via [filterDeleteBefore] so the applier's `buildWhereClause`
+// reader's DELETE and UPDATE emit paths narrow the Before-image to
+// PK columns only via [filterBeforeToPK] (DELETE since Bug 88,
+// UPDATE since Bug 193) so the applier's `buildWhereClause`
 // doesn't emit "non_pk_col IS NULL" predicates that fail to match
-// real target rows. Same shape as the PG-side helper of the same
-// name. Empty slice on a PK-less table — [filterDeleteBefore] falls
+// real target rows. Same shape as the PG-side filterBeforeToKeyCols.
+// Empty slice on a PK-less table — [filterBeforeToPK] falls
 // back to the full Before-image in that case (the only usable
 // identity on a PK-less table is "every column", same fallback as
 // PG's REPLICA IDENTITY FULL on a PK-less relation).
@@ -388,6 +389,18 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 				"node-replace position-loss detection degraded to binlog-filename-only",
 			slog.String("err", err.Error()),
 		)
+	}
+
+	// Bug 193 preflight: refuse partial binlog row images (MINIMAL /
+	// NOBLOB) before touching positions. Every CDC start — sync
+	// cold-start handoff, warm resume, backup incremental — flows
+	// through here, so this is the single chokepoint guaranteeing a
+	// stream never runs against a source whose UPDATE images sluice
+	// cannot apply faithfully. (The snapshot openers ALSO preflight, so
+	// a cold start refuses before the bulk copy rather than after it.)
+	// See cdc_row_image_preflight.go for the full mechanism.
+	if err := preflightBinlogRowImage(ctx, r.db); err != nil {
+		return nil, err
 	}
 
 	startPos, err := r.resolveStartPosition(ctx, from)
@@ -906,7 +919,15 @@ func (r *CDCReader) dispatchRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		for _, raw := range ev.Rows {
+		for i, raw := range ev.Rows {
+			// Bug 193 belt: a write image that omitted a non-generated
+			// column (a partial binlog_row_image slipping past the
+			// StreamChanges preflight) would land NULL where the source
+			// applied the column DEFAULT — refuse loudly instead. See
+			// cdc_row_image_preflight.go.
+			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
+				return err
+			}
 			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
@@ -931,6 +952,25 @@ func (r *CDCReader) dispatchRows(
 			return fmt.Errorf("mysql: cdc: update rows event has odd row count %d", len(ev.Rows))
 		}
 		for i := 0; i < len(ev.Rows); i += 2 {
+			// Bug 193 belt: refuse a partial UPDATE image loudly. A
+			// partial BEFORE-image would (un-narrowed) build `IS NULL`
+			// WHERE predicates that match nothing — the silent-UPDATE-
+			// loss class the StreamChanges preflight refuses upfront —
+			// and a partial AFTER-image cannot be applied at all: the
+			// SET clause writes every column it carries, so PK-narrowing
+			// the WHERE while the after-image omits unchanged columns
+			// would NULL those columns out (silent-skip traded for
+			// silent-corruption). If a partial image reaches this arm
+			// anyway (session-level binlog_row_image override, or a
+			// resume replaying a MINIMAL-era binlog segment), stop the
+			// stream naming binlog_row_image. See
+			// cdc_row_image_preflight.go.
+			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "update", "before"); err != nil {
+				return err
+			}
+			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
+				return err
+			}
 			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
@@ -939,6 +979,21 @@ func (r *CDCReader) dispatchRows(
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
+			// Bug 193 (the Bug 88 / PG Bug 92 symmetry): narrow the
+			// UPDATE Before-image to PK columns before emit, exactly as
+			// the DELETE arm below does. Under FULL the full before-
+			// image is correct but fragile — a genuinely NULL non-PK
+			// column builds an `IS NULL` predicate that is right, while
+			// a rich-typed column (JSON) needs placeholder casts to
+			// match — and only the PK is required to identify the row.
+			// The PG reader has narrowed its UPDATE before-image to
+			// identity-key columns since Bug 92 (filterBeforeToKeyCols);
+			// this closes the same class on the MySQL arm. The belt
+			// above guarantees the image is complete, so the PK values
+			// are always real (a PK-change UPDATE keeps working: the
+			// narrowed before carries the OLD key, the after carries the
+			// new one).
+			before = filterBeforeToPK(tbl, before)
 			if err := send(ctx, out, ir.Update{
 				Position:   pos,
 				Schema:     tbl.Schema,
@@ -966,9 +1021,16 @@ func (r *CDCReader) dispatchRows(
 			// `non_pk_col IS NULL` predicates that fail to match real
 			// target rows whose non-PK columns hold non-null values
 			// — Bug-8-equivalent silent data loss. Mirrors the
-			// PG-side helper of the same name. See
+			// PG-side filterBeforeToKeyCols. See
 			// docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
-			before = filterDeleteBefore(tbl, before)
+			//
+			// Deliberately NO refusePartialRowImage belt here (unlike
+			// the INSERT/UPDATE arms — Bug 193): a DELETE needs only
+			// the PK, which EVERY row image carries, so the narrowing
+			// makes partial images correct by construction. Keeping
+			// the belt off preserves the working replay of MINIMAL-era
+			// binlog segments for deletes.
+			before = filterBeforeToPK(tbl, before)
 			if err := send(ctx, out, ir.Delete{
 				Position:   pos,
 				Schema:     tbl.Schema,
@@ -1890,10 +1952,11 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boo
 	return row, nil
 }
 
-// filterDeleteBefore narrows a binlog DELETE event's Before-image down
-// to its primary-key columns. The narrowing is load-bearing for
-// silent-data-loss prevention (Bug 88), so the protocol detail driving
-// it is worth spelling out:
+// filterBeforeToPK narrows a binlog DELETE or UPDATE event's
+// Before-image down to its primary-key columns. The narrowing is
+// load-bearing for silent-data-loss prevention on both arms (DELETE:
+// Bug 88; UPDATE: Bug 193, mirroring PG's Bug 92), so the protocol
+// detail driving it is worth spelling out:
 //
 // Under `binlog_row_image=MINIMAL` the BEFORE-image of a DELETE
 // rows-event carries only the PK column(s); MySQL emits every non-PK
@@ -1910,24 +1973,28 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boo
 //
 // Filtering to PK columns produces a WHERE that uses only the
 // identity-key predicates, which is exactly what an idempotent
-// DELETE against the primary key needs. The same filter is correct
-// under FULL (every column is in the Before-image, but only the PK
-// columns are required to identify the row; the WHERE is still
-// right, just shorter).
+// DELETE — or the WHERE half of an UPDATE — against the primary key
+// needs. The same filter is correct under FULL (every column is in
+// the Before-image, but only the PK columns are required to identify
+// the row; the WHERE is still right, just shorter). The UPDATE arm
+// additionally guards the SET half with the Bug 193 partial-image
+// belt BEFORE narrowing (see refusePartialRowImage): PK-narrowing the
+// WHERE is only safe when the after-image is complete.
 //
 // PK-less tables: MySQL allows tables without a PRIMARY KEY (and
 // historically the source-readability check at ADR-0036 refuses to
 // stream such a table, but a defensive fallback here keeps the
 // helper total). With no PK there is no shorter identity than the
 // full row image, so we hand back `before` verbatim. Same shape as
-// PG's filterDeleteBefore on a PK-less REPLICA IDENTITY FULL
+// PG's filterBeforeToKeyCols on a PK-less REPLICA IDENTITY FULL
 // relation.
 //
-// Same name and shape as the PG-side helper at
-// `internal/engines/postgres/cdc_reader.go`; the family-dispatched
-// fix locus matches between engines (per ADR-0057's Bug-74
-// family-pin discipline).
-func filterDeleteBefore(tbl *tableSchema, before ir.Row) ir.Row {
+// Same shape as the PG-side filterBeforeToKeyCols at
+// `internal/engines/postgres/cdc_reader.go` (this helper was named
+// filterDeleteBefore until Bug 193 put it on the UPDATE arm too); the
+// family-dispatched fix locus matches between engines (per ADR-0057's
+// Bug-74 family-pin discipline).
+func filterBeforeToPK(tbl *tableSchema, before ir.Row) ir.Row {
 	if len(tbl.PrimaryKey) == 0 {
 		// PK-less table: no shorter identity exists. Hand back the
 		// full image — anything else would silently lose DELETEs on

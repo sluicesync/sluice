@@ -3,31 +3,39 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Task #44 — hard-delete CDC family-matrix pin (MySQL source axis).
+// Task #44 — hard-delete CDC family-matrix pin (MySQL source axis),
+// re-derived for Bug 193.
 //
 // Pins ADR-0057's hard-delete matrix per the Bug-74 family-pin
 // discipline. The family-dispatch under test is the MySQL binlog
-// rows-event BEFORE-image content, which varies by
-// --binlog-row-image setting:
+// rows-event image content, which varies by --binlog-row-image
+// setting:
 //
-//   - FULL    → BEFORE-image contains every column.
-//   - MINIMAL → BEFORE-image only carries the PK (and changed columns
-//               for UPDATE; for DELETE, only the PK).
-//   - NOBLOB  → BEFORE-image carries every column except BLOB/TEXT/JSON.
+//   - FULL    → images contain every column.
+//   - MINIMAL → BEFORE-image only carries the PK; the UPDATE
+//               AFTER-image only the changed columns.
+//   - NOBLOB  → images omit unchanged BLOB/TEXT/JSON columns.
 //
-// A regression in the "always-emit-DELETE" property could surface
-// per setting (e.g. MINIMAL might drop the row because the apply-side
-// WHERE clause is malformed when only PK is present; NOBLOB might
-// fail to construct WHERE if the apply path tried to use the absent
-// BLOB column in WHERE). The matrix exists precisely so the next
-// codec-dispatched regression in any cell fails LOUDLY. See
-// internal/engines/mysql/cdc_reader.go:708-724 (emit path), and
+// Bug 88 made DELETE correct under MINIMAL/NOBLOB (PK narrowing) and
+// this matrix originally pinned those cells as WORKING streams. Bug
+// 193 then proved UPDATE cannot be made correct under a partial row
+// image (the after-image is partial too — applying it would null out
+// unchanged columns), and the production posture changed: sluice now
+// REFUSES a MINIMAL/NOBLOB source at CDC start with
+// SLUICE-E-CDC-ROW-IMAGE-PARTIAL, before the bulk copy (Azure Database
+// for MySQL Flexible Server ships MINIMAL as its platform default, so
+// the refusal is the load-bearing cell for an entire provider). The
+// MINIMAL/NOBLOB cells therefore now pin the REFUSAL — loud, coded,
+// target untouched — and the FULL cells keep pinning exact
+// delete/update propagation. See
+// internal/engines/mysql/cdc_row_image_preflight.go and
 // docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
 //
 // F18 Reddit-research triage context: silently dropping hard deletes
 // was the most-cited operator pain in the dataset (Fivetran, Airbyte,
-// AWS DMS all named-and-shamed). sluice does NOT silently drop them;
-// this pin keeps that promise honest across configuration cells.
+// AWS DMS all named-and-shamed). sluice does NOT silently drop them —
+// on a partial-row-image source it refuses to stream at all rather
+// than propagate deletes while silently losing updates.
 
 package pipeline
 
@@ -35,11 +43,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -133,92 +141,241 @@ func waitForExactRowCountMySQL(dsn, table string, want int, timeout time.Duratio
 	return false
 }
 
-// TestStreamer_CDCDeleteMatrix_MySQLToMySQL pins the hard-delete
-// always-propagates property across {FULL, MINIMAL, NOBLOB} ×
-// {plain DELETE, UPDATE-then-DELETE, DELETE of a row with TOAST'd
-// BLOB column (NOBLOB-only — that's the interesting cell)}.
+// TestStreamer_CDCDeleteMatrix_MySQLToMySQL pins the row-image matrix
+// end to end:
 //
-// Bug 88 closure: the MINIMAL and NOBLOB-toast cells were previously
-// `t.Skip()`'d with a "sluice requires binlog_row_image=FULL"
-// finding from Task #44. The CDC reader now narrows the DELETE
-// Before-image to PK columns before emit (see
-// `internal/engines/mysql/cdc_reader.go` `filterDeleteBefore`),
-// mirroring the PG-side helper of the same name. All matrix cells
-// now run; a regression that drops the narrowing would fail one or
-// more of the previously-skipped cells loudly.
+//   - FULL × {plain DELETE, UPDATE-then-DELETE}: exact propagation
+//     (the pre-Bug-193 behaviour, unchanged).
+//   - MINIMAL / NOBLOB: the coded Bug 193 refusal at CDC start —
+//     Streamer.Run returns SLUICE-E-CDC-ROW-IMAGE-PARTIAL before the
+//     bulk copy, so the target is left untouched. (These cells pinned
+//     working delete propagation between Bug 88 and Bug 193; the
+//     posture change is deliberate — a stream that propagates deletes
+//     while silently losing updates is worse than no stream.)
+//
+// The FULL update shapes (single-column, multi-column, PK-change) are
+// pinned by TestStreamer_CDCRowImageUpdateShapes_MySQLToMySQL below.
 func TestStreamer_CDCDeleteMatrix_MySQLToMySQL(t *testing.T) {
-	const big = 100 * 1024 // 100KB MEDIUMTEXT — exercise NOBLOB's drop-blob behaviour.
-
 	cells := []struct {
 		rowImage string
 		shape    string
-		// includeBlob picks the schema variant: when true, the
-		// `payload` column is added and seeded with a 100KB string.
-		// shape=="toast-delete" requires includeBlob=true.
-		includeBlob bool
-		// skipReason, when non-empty, makes this cell a documented
-		// skip with the production behaviour spelled out. Currently
-		// empty for every cell after the Bug 88 fix landed; kept as
-		// a field so a future configuration cell that re-introduces
-		// a skip has a place to put the reason.
-		skipReason string
 	}{
 		{rowImage: "FULL", shape: "plain-delete"},
 		{rowImage: "FULL", shape: "update-then-delete"},
-		{rowImage: "MINIMAL", shape: "plain-delete"},
-		{rowImage: "MINIMAL", shape: "update-then-delete"},
-		{rowImage: "NOBLOB", shape: "plain-delete"},
-		{rowImage: "NOBLOB", shape: "update-then-delete"},
-		{rowImage: "NOBLOB", shape: "toast-delete", includeBlob: true},
+		{rowImage: "MINIMAL", shape: "refusal-at-cdc-start"},
+		{rowImage: "NOBLOB", shape: "refusal-at-cdc-start"},
 	}
 
 	for _, c := range cells {
 		c := c
 		name := fmt.Sprintf("rowimage=%s/shape=%s", c.rowImage, c.shape)
 		t.Run(name, func(t *testing.T) {
-			if c.skipReason != "" {
-				t.Skip(c.skipReason)
+			if c.shape == "refusal-at-cdc-start" {
+				runMySQLToMySQLRowImageRefusalCell(t, c.rowImage)
+				return
 			}
-			runMySQLToMySQLDeleteCell(t, c.rowImage, c.shape, c.includeBlob, big)
+			runMySQLToMySQLDeleteCell(t, c.rowImage, c.shape)
 		})
 	}
 }
 
-// runMySQLToMySQLDeleteCell is the per-cell driver. Extracted so the
-// matrix iteration stays readable.
-func runMySQLToMySQLDeleteCell(t *testing.T, rowImage, shape string, includeBlob bool, blobLen int) {
+// runMySQLToMySQLRowImageRefusalCell pins the Bug 193 posture for a
+// partial-row-image source: `sync` refuses loudly at CDC start with
+// the stable code, BEFORE any schema or data lands on the target.
+func runMySQLToMySQLRowImageRefusalCell(t *testing.T, rowImage string) {
 	t.Helper()
 	sourceDSN, targetDSN, cleanup := startMySQLBinlogWithRowImage(t, rowImage)
 	defer cleanup()
 
-	cols := "id BIGINT NOT NULL, name VARCHAR(64) NOT NULL, PRIMARY KEY (id)"
-	if includeBlob {
-		// MEDIUMTEXT (16MB max) rather than TEXT (64KB max) so the
-		// 100KB payload fits. MEDIUMTEXT still triggers the binlog
-		// MINIMAL/NOBLOB "drop BLOB columns from BEFORE-image"
-		// behaviour the same way TEXT would.
-		cols = "id BIGINT NOT NULL, name VARCHAR(64) NOT NULL, payload MEDIUMTEXT, PRIMARY KEY (id)"
+	applyMySQLDDL(t, sourceDSN, `
+		CREATE TABLE widgets (
+			id   BIGINT      NOT NULL,
+			name VARCHAR(64) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO widgets (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three');
+	`)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
 	}
-	seedDDL := fmt.Sprintf(
-		"CREATE TABLE widgets (%s) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
-		cols,
-	)
+	streamer := &Streamer{
+		Source:    mysqlEng,
+		Target:    mysqlEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "row-image-refusal-" + rowImage,
+	}
+
+	runCtx, runCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer runCancel()
+	err := streamer.Run(runCtx)
+	if err == nil {
+		t.Fatalf("Streamer.Run accepted a binlog_row_image=%s source; want the coded Bug 193 refusal", rowImage)
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeCDCRowImagePartial {
+		t.Fatalf("Streamer.Run error: want %s; got %T: %v", sluicecode.CodeCDCRowImagePartial, err, err)
+	}
+
+	// The refusal fires at the snapshot open — before the target
+	// writers exist — so the target database must be untouched.
+	if mysqlTableExists(t, targetDSN, "widgets") {
+		t.Errorf("target widgets table exists after the refusal; the refusal must precede any target mutation")
+	}
+}
+
+// mysqlTableExists reports whether the named table exists in the DSN's
+// default database, via information_schema (a missing table and a
+// zero-row table must be distinguishable for the refusal pin above).
+func mysqlTableExists(t *testing.T, dsn, table string) bool {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var n int
+	err = db.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+		table,
+	).Scan(&n)
+	if err != nil {
+		t.Fatalf("table-exists probe: %v", err)
+	}
+	return n > 0
+}
+
+// TestStreamer_CDCRowImageUpdateShapes_MySQLToMySQL pins the FULL-row-
+// image UPDATE column of the Bug 193 matrix end to end: single-column,
+// multi-column, and PK-change UPDATEs must all converge to exact
+// values on the target. This is the regression pin for the Bug 193
+// Before-image PK narrowing (internal/engines/mysql/cdc_reader.go
+// filterBeforeToPK on the UPDATE arm): a narrowing bug in any shape —
+// a WHERE that over- or under-matches, or a PK-change UPDATE losing
+// the old-key row — fails a value assertion loudly.
+func TestStreamer_CDCRowImageUpdateShapes_MySQLToMySQL(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startMySQLBinlogWithRowImage(t, "FULL")
+	defer cleanup()
+
+	applyMySQLDDL(t, sourceDSN, `
+		CREATE TABLE widgets (
+			id    BIGINT      NOT NULL,
+			name  VARCHAR(64) NOT NULL,
+			qty   INT         NOT NULL,
+			note  VARCHAR(64) NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO widgets (id, name, qty, note) VALUES
+			(1, 'one',   10, NULL),
+			(2, 'two',   20, 'keep'),
+			(3, 'three', 30, NULL);
+	`)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	streamer := &Streamer{
+		Source:    mysqlEng,
+		Target:    mysqlEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "row-image-update-shapes-FULL",
+	}
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	if !waitForExactRowCountMySQL(targetDSN, "widgets", 3, 90*time.Second) {
+		t.Fatalf("bulk copy never delivered the 3 seed rows (got %d)", pollRowCountMySQL(targetDSN, "widgets"))
+	}
+
+	// The three UPDATE shapes. Row 1: single-column. Row 2:
+	// multi-column (the exact shape the Azure probe watched silently
+	// no-op under MINIMAL — 11 of its 12 lost UPDATEs were
+	// multi-column). Row 3: PK-change (the narrowed Before must carry
+	// the OLD key so the old row migrates rather than duplicating).
+	applyMySQLDDL(t, sourceDSN, `
+		UPDATE widgets SET qty = 11 WHERE id = 1;
+		UPDATE widgets SET name = 'TWO', qty = 22, note = NULL WHERE id = 2;
+		UPDATE widgets SET id = 33 WHERE id = 3;
+	`)
+
+	wantRow := func(id int64, wantName string, wantQty int64, wantNote *string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		var lastErr error
+		for time.Now().Before(deadline) {
+			name, qty, note, err := readWidgetRowMySQL(targetDSN, id)
+			if err == nil && name == wantName && qty == wantQty &&
+				((note == nil) == (wantNote == nil)) && (note == nil || *note == *wantNote) {
+				return
+			}
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+		}
+		name, qty, note, err := readWidgetRowMySQL(targetDSN, id)
+		t.Fatalf("target row id=%d never converged: got (name=%q qty=%d note=%v, readErr=%v/%v); want (name=%q qty=%d note=%v)",
+			id, name, qty, note, err, lastErr, wantName, wantQty, wantNote)
+	}
+
+	wantRow(1, "one", 11, nil)
+	wantRow(2, "TWO", 22, nil)
+	wantRow(33, "three", 30, nil)
+
+	// The PK-change UPDATE must have MOVED row 3, not copied it.
+	if !waitForExactRowCountMySQL(targetDSN, "widgets", 3, 30*time.Second) {
+		t.Fatalf("row count after PK-change UPDATE = %d; want 3 (old-key row must be gone)",
+			pollRowCountMySQL(targetDSN, "widgets"))
+	}
+
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// readWidgetRowMySQL reads (name, qty, note) for the widgets row with
+// the given id on the target, for the update-shape convergence pins.
+func readWidgetRowMySQL(dsn string, id int64) (name string, qty int64, note *string, err error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = db.QueryRowContext(ctx, "SELECT name, qty, note FROM widgets WHERE id = ?", id).Scan(&name, &qty, &note)
+	return name, qty, note, err
+}
+
+// runMySQLToMySQLDeleteCell is the per-cell driver for the FULL delete
+// shapes. Extracted so the matrix iteration stays readable. (The
+// pre-Bug-193 blob/toast variant existed for the NOBLOB cells, which
+// now pin the refusal instead — a NOBLOB stream never runs.)
+func runMySQLToMySQLDeleteCell(t *testing.T, rowImage, shape string) {
+	t.Helper()
+	sourceDSN, targetDSN, cleanup := startMySQLBinlogWithRowImage(t, rowImage)
+	defer cleanup()
 
 	// Seed rows. The matrix only DELETEs id=2; ids 1 and 3 are
 	// witnesses that the WHERE clause didn't over-match.
-	seedInserts := "INSERT INTO widgets (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three');"
-	if includeBlob {
-		bigVal := strings.Repeat("x", blobLen)
-		// Seed id=2 with the big payload — that's the row we'll
-		// DELETE on the source; under NOBLOB the BEFORE-image won't
-		// carry payload at all.
-		seedInserts = fmt.Sprintf(
-			"INSERT INTO widgets (id, name, payload) VALUES "+
-				"(1, 'one', NULL), (2, 'two', '%s'), (3, 'three', NULL);",
-			bigVal,
-		)
-	}
-	applyMySQLDDL(t, sourceDSN, seedDDL+seedInserts)
+	applyMySQLDDL(t, sourceDSN, `
+		CREATE TABLE widgets (
+			id   BIGINT      NOT NULL,
+			name VARCHAR(64) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO widgets (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three');
+	`)
 
 	mysqlEng, ok := engines.Get("mysql")
 	if !ok {
@@ -259,15 +416,6 @@ func runMySQLToMySQLDeleteCell(t *testing.T, rowImage, shape string, includeBlob
 		applyMySQLDDL(t, sourceDSN, "DELETE FROM widgets WHERE id = 2;")
 		if !waitForExactRowCountMySQL(targetDSN, "widgets", 2, 30*time.Second) {
 			t.Fatalf("UPDATE-then-DELETE never settled at row count 2 (binlog_row_image=%s); target widget rows = %d",
-				rowImage, pollRowCountMySQL(targetDSN, "widgets"))
-		}
-
-	case "toast-delete":
-		// DELETE a row whose 100KB payload is absent from the NOBLOB
-		// BEFORE-image. The PK-only WHERE clause must still match.
-		applyMySQLDDL(t, sourceDSN, "DELETE FROM widgets WHERE id = 2;")
-		if !waitForExactRowCountMySQL(targetDSN, "widgets", 2, 30*time.Second) {
-			t.Fatalf("DELETE of TOAST'd row never propagated under binlog_row_image=%s; target widget rows = %d",
 				rowImage, pollRowCountMySQL(targetDSN, "widgets"))
 		}
 
