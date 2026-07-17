@@ -171,9 +171,7 @@ func TestVitessReshard_RelaxSkewConcurrentDrainAB(t *testing.T) {
 		t.Fatalf("Reshard SwitchTraffic: %v", rerr)
 	}
 	shards := vrShowShards(t, c.mysqlDSN)
-	if len(shards) != 2 {
-		t.Fatalf("post-reshard shards = %v; want 2 (-80, 80-) — cluster not 2-shard, A/B cannot run", shards)
-	}
+	assertReshardTargetShardsPresent(t, "SETUP", shards)
 	t.Logf("SETUP: resharded 1 -> 2; vtgate shards now %v", shards)
 
 	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
@@ -186,6 +184,41 @@ func TestVitessReshard_RelaxSkewConcurrentDrainAB(t *testing.T) {
 	runB := runRelaxSkewScenario(t, c, true, 200_000_000)
 
 	logRelaxABComparison(t, runA, runB)
+}
+
+// reshardTargetShards are the two serving shards a 1->2 reshard of the single
+// "-" source keyspace produces.
+var reshardTargetShards = []string{"-80", "80-"}
+
+// assertReshardTargetShardsPresent asserts both post-reshard serving shards
+// (-80, 80-) are in the discovered set, WITHOUT asserting an exact count.
+//
+// Why not `== 2`: after SwitchTraffic, sluice's shard auto-discovery is the
+// v0.99.195 union of SHOW VITESS_SHARDS and SHOW VITESS_TABLETS(SERVING). The
+// DRAINED pre-reshard source shard "-" is dropped from SHOW VITESS_SHARDS but
+// its tablets are STILL SERVING in the immediate post-SwitchTraffic window
+// (traffic switches at routing; the source tablets aren't torn down until the
+// workflow completes), so the tablet cross-check legitimately re-includes "-" —
+// the discovered set is [- -80 80-]. Discovery deliberately keeps it: it cannot
+// distinguish a drained source shard from a genuinely-serving shard that SHOW
+// VITESS_SHARDS wrongly omitted (the exact under-reporting bug v0.99.195 fixed),
+// and dropping the latter is a silent-partial-copy risk. The reshard-follow
+// oracles (TestVitessReshard_StreamerFollowsReshardEndToEnd + the sweep ORACLE
+// block) prove streaming this 3-shard set is exactly-once — no gap, no dup — in
+// this window. So the A/B precondition is "both new serving shards present", not
+// "exactly two shards"; the harmless drained "-" is tolerated.
+func assertReshardTargetShardsPresent(t *testing.T, label string, shards []string) {
+	t.Helper()
+	set := make(map[string]struct{}, len(shards))
+	for _, s := range shards {
+		set[s] = struct{}{}
+	}
+	for _, want := range reshardTargetShards {
+		if _, ok := set[want]; !ok {
+			t.Fatalf("%s: discovered shards %v missing post-reshard serving shard %q — "+
+				"A/B needs both new shards streamed", label, shards, want)
+		}
+	}
 }
 
 // runRelaxSkewScenario executes one half of the A/B and hard-asserts
@@ -252,11 +285,9 @@ func runRelaxSkewScenario(t *testing.T, c *vitessReshardCluster, relax bool, idB
 	// Shard auto-discovery is deferred to stream-open (product commit 8f82b30e
 	// moved it out of OpenCDCReader so reader construction stays
 	// connection-free), so cdcRdr.shards is empty until StreamChanges runs.
-	// Assert the discovered 2-shard layout and pin the MinimizeSkew request
-	// AFTER StreamChanges has populated r.shards.
-	if len(cdcRdr.shards) != 2 {
-		t.Fatalf("%s: reader discovered %d shards %v; want 2 — A/B needs a 2-shard stream", label, len(cdcRdr.shards), cdcRdr.shards)
-	}
+	// Assert the post-reshard serving shards are discovered and pin the
+	// MinimizeSkew request AFTER StreamChanges has populated r.shards.
+	assertReshardTargetShardsPresent(t, label, cdcRdr.shards)
 	// Pin that the request carries MinimizeSkew == !relax for this run.
 	if req, berr := cdcRdr.buildVStreamRequest(fromNowVStreamPos(cdcRdr.keyspace, cdcRdr.shards)); berr != nil {
 		t.Fatalf("%s: buildVStreamRequest: %v", label, berr)

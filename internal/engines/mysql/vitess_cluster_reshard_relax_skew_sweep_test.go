@@ -189,9 +189,7 @@ func TestVitessReshard_RelaxSkewMagnitudeSweep(t *testing.T) {
 	}
 	reshardSwitchTrafficRobust(t, c, "relaxsweep")
 	shards := vrShowShards(t, c.mysqlDSN)
-	if len(shards) != 2 {
-		t.Fatalf("post-reshard shards = %v; want 2 (-80, 80-) — cluster not 2-shard, sweep cannot run", shards)
-	}
+	assertReshardTargetShardsPresent(t, "SETUP", shards)
 	t.Logf("SETUP: resharded 1 -> 2; shards now %v; 80- replica routed through toxiproxy (latency swept per scenario)", shards)
 
 	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
@@ -338,11 +336,9 @@ func runRelaxSkewSweepRun(t *testing.T, c *vitessReshardCluster, p sweepRunParam
 	// Shard auto-discovery is deferred to stream-open (product commit 8f82b30e
 	// moved it out of OpenCDCReader so reader construction stays
 	// connection-free), so cdcRdr.shards is empty until StreamChanges runs.
-	// Assert the discovered 2-shard layout and pin the MinimizeSkew request
-	// AFTER StreamChanges has populated r.shards.
-	if len(cdcRdr.shards) != 2 {
-		t.Fatalf("%s: reader discovered %d shards %v; want 2", label, len(cdcRdr.shards), cdcRdr.shards)
-	}
+	// Assert the post-reshard serving shards are discovered and pin the
+	// MinimizeSkew request AFTER StreamChanges has populated r.shards.
+	assertReshardTargetShardsPresent(t, label, cdcRdr.shards)
 	if req, berr := cdcRdr.buildVStreamRequest(fromNowVStreamPos(cdcRdr.keyspace, cdcRdr.shards)); berr != nil {
 		t.Fatalf("%s: buildVStreamRequest: %v", label, berr)
 	} else if got := req.GetFlags().GetMinimizeSkew(); got != !p.relax {
