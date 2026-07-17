@@ -701,35 +701,14 @@ func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses(t *t
 	}
 }
 
-// TestIsMySQLFamilyEngine pins the MySQL-family target set, including
-// the self-hosted `vitess` flavor (M2.5): before vitess joined the
-// set, a PG → vitess chain restore silently SKIPPED every PG-native
-// refusal (EXCLUDE constraints, extension opclasses) — exactly the
-// new-engine-misses-a-name-branch bug class. These helpers stay
-// name-based on purpose (lineage-recorded identity strings; see the
-// helper doc comments), so this pin is the drift guard.
-func TestIsMySQLFamilyEngine(t *testing.T) {
-	cases := []struct {
-		name string
-		want bool
-	}{
-		{"mysql", true},
-		{"planetscale", true},
-		{"vitess", true},
-		{"postgres", false},
-		{"postgres-trigger", false},
-		{"", false},
-		{"future", false},
-	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			if got := IsMySQLFamilyEngine(c.name); got != c.want {
-				t.Errorf("IsMySQLFamilyEngine(%q) = %v; want %v", c.name, got, c.want)
-			}
-		})
-	}
-}
+// IsMySQLFamilyEngine's coverage is pinned by the REGISTRY-PARITY test
+// TestIsMySQLFamilyEngine_MatchesRegistryDDLDialect in the external
+// migcore_test package (cross_engine_supportable_registry_test.go) — it
+// asserts, for every registered engine, that IsMySQLFamilyEngine matches
+// whether the engine declares ir.DDLDialectMySQL. That is the class fix
+// for the mariadb miss: a future MySQL-dialect engine that isn't covered
+// fails CI instead of silently skipping every PG-native cross-engine
+// refusal. A few non-registered negatives are pinned there too.
 
 // TestCheckCrossEngineSupportable_PGToVitess_ExcludeRefuses pins the
 // M2.5 gap fix end-to-end: a PG-source EXCLUDE constraint restored to
@@ -750,6 +729,35 @@ func TestCheckCrossEngineSupportable_PGToVitess_ExcludeRefuses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no_overlap") {
 		t.Errorf("err = %v; want the offending constraint named", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGToMariaDB_ExcludeRefuses pins the F1
+// class fix (the mariadb-miss): a PG-source EXCLUDE constraint migrating
+// to the `mariadb` flavor must refuse loudly. Before mariadb joined the
+// MySQL-family target set, this returned nil and the mariadb writer
+// SILENTLY DROPPED the constraint (CreateConstraints only iterates
+// ForeignKeys; verify is count-based, blind to it) — the vitess-precedent
+// silent-loss class.
+func TestCheckCrossEngineSupportable_PGToMariaDB_ExcludeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "reservations",
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "no_overlap",
+			Definition: "EXCLUDE USING gist (room WITH =, during WITH &&)",
+		}},
+	}}}
+	err := CheckCrossEngineSupportable(s, "postgres", "mariadb", "test")
+	if err == nil {
+		t.Fatal("postgres → mariadb with EXCLUDE: expected loud refusal, got nil (silent constraint drop)")
+	}
+	if !strings.Contains(err.Error(), "no_overlap") {
+		t.Errorf("err = %v; want the offending constraint named", err)
+	}
+	// postgres-trigger source (delegates to the vanilla PG schema surface)
+	// trips the same refusal against a mariadb target.
+	if err := CheckCrossEngineSupportable(s, "postgres-trigger", "mariadb", "test"); err == nil {
+		t.Error("postgres-trigger → mariadb with EXCLUDE: want refusal; got nil")
 	}
 }
 
@@ -795,7 +803,7 @@ func TestCheckCrossEngineSupportable_StandaloneSequenceRefuses(t *testing.T) {
 		}},
 		Sequences: []*ir.Sequence{{Schema: "public", Name: "order_number_seq", Start: 1000, Increment: 5}},
 	}
-	for _, target := range []string{"mysql", "planetscale", "vitess"} {
+	for _, target := range []string{"mysql", "planetscale", "vitess", "mariadb"} {
 		err := CheckCrossEngineSupportable(s, "postgres", target, "migrate")
 		if err == nil {
 			t.Fatalf("postgres → %s with standalone sequence: want refusal; got nil", target)

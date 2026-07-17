@@ -197,6 +197,25 @@ func TestTranslateType(t *testing.T) {
 			want: ir.JSON{Binary: true},
 		},
 
+		// ----- MariaDB-native identity / network (item 73 Phase 2) -----
+		{
+			name: "mariadb native uuid",
+			in:   columnMeta{DataType: "uuid", ColumnType: "uuid"},
+			want: ir.UUID{},
+		},
+		{
+			name: "mariadb native inet6",
+			in:   columnMeta{DataType: "inet6", ColumnType: "inet6"},
+			want: ir.Inet{},
+		},
+		{
+			// INET4 collapses to ir.Inet{} — no IPv4-only IR variant; the
+			// address value round-trips as canonical text.
+			name: "mariadb native inet4 collapses to Inet",
+			in:   columnMeta{DataType: "inet4", ColumnType: "inet4"},
+			want: ir.Inet{},
+		},
+
 		// ----- Geometry -----
 		{
 			name: "point",

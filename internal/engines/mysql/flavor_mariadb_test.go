@@ -14,9 +14,9 @@ import (
 )
 
 // TestMariaDBCapabilities pins the load-bearing pieces of the mariadb
-// Phase-1 declaration (roadmap item 73): bulk source+target with the
-// LOAD DATA path, CDC honestly absent, textual JSON, and no geometry
-// (the SRID spelling + read-back is Phase 2).
+// declaration (roadmap item 73): bulk source+target with the LOAD DATA
+// path, CDC honestly absent, textual JSON, and — since Phase 2 — native
+// geometry (SRID via REF_SYSTEM_ID), UUID, and INET.
 func TestMariaDBCapabilities(t *testing.T) {
 	caps := FlavorMariaDB.capabilities()
 	if caps.BulkLoad != ir.BulkLoadLoadDataInfile {
@@ -28,8 +28,17 @@ func TestMariaDBCapabilities(t *testing.T) {
 	if caps.JSONSupport != ir.JSONText {
 		t.Errorf("mariadb JSONSupport = %v; want JSONText (MariaDB JSON is a LONGTEXT alias)", caps.JSONSupport)
 	}
-	if caps.SupportedTypes.Has(ir.ExtGeometry) {
-		t.Error("mariadb should not declare Geometry support (REF_SYSTEM_ID spelling + srs read-back is Phase 2)")
+	// Phase 2: geometry (SRID via REF_SYSTEM_ID), UUID, and INET are now
+	// declared. Geometry SRID read-back is proven live in the integration
+	// suite (a POINT with SRID 4326 must not read back as 0).
+	if !caps.SupportedTypes.Has(ir.ExtGeometry) {
+		t.Error("mariadb should declare Geometry support (Phase 2: SRID recovered from REF_SYSTEM_ID)")
+	}
+	if !caps.SupportedTypes.Has(ir.ExtUUID) {
+		t.Error("mariadb should declare UUID support (Phase 2: native uuid type)")
+	}
+	if !caps.SupportedTypes.Has(ir.ExtInet) {
+		t.Error("mariadb should declare Inet support (Phase 2: native inet6/inet4 types)")
 	}
 	if !caps.SupportedTypes.Has(ir.ExtEnum) || !caps.SupportedTypes.Has(ir.ExtSet) {
 		t.Error("mariadb should declare ENUM and SET support")
@@ -455,6 +464,32 @@ func TestMariaDBCatalogQueries(t *testing.T) {
 	}
 	if q := indexesQuery(FlavorMariaDB); strings.Contains(q, "IFNULL(expression") || !strings.Contains(q, "\n\t\t\t'',\n") {
 		t.Errorf("mariadb indexesQuery should select the constant '' in place of expression:\n%s", q)
+	}
+
+	// Bug 198: the check-constraints join is disambiguated by table_name
+	// ONLY on MariaDB (its constraint names are unique per-table, and its
+	// check_constraints carries table_name); MySQL 8's must NOT reference
+	// cc.table_name (no such column there — it would be a hard SQL error).
+	const wantChecks = `
+		SELECT
+			tc.table_name,
+			cc.constraint_name,
+			cc.check_clause
+		FROM   information_schema.check_constraints cc
+		JOIN   information_schema.table_constraints  tc
+		  ON   tc.constraint_schema = cc.constraint_schema
+		 AND   tc.constraint_name   = cc.constraint_name
+		WHERE  tc.table_schema    = ?
+		  AND  tc.constraint_type = 'CHECK'
+		ORDER  BY tc.table_name, cc.constraint_name`
+	if got := checkConstraintsQuery(FlavorVanilla); got != wantChecks {
+		t.Errorf("checkConstraintsQuery(vanilla) drifted / references cc.table_name (MySQL 8 has no such column):\n got: %s\nwant: %s", got, wantChecks)
+	}
+	if q := checkConstraintsQuery(FlavorMariaDB); !strings.Contains(q, "cc.table_name       = tc.table_name") {
+		t.Errorf("mariadb checkConstraintsQuery must disambiguate the join by table_name (Bug 198 fan-out):\n%s", q)
+	}
+	if q := checkConstraintsQuery(FlavorPlanetScale); strings.Contains(q, "cc.table_name") {
+		t.Errorf("non-mariadb checkConstraintsQuery must NOT reference cc.table_name:\n%s", q)
 	}
 }
 

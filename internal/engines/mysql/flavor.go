@@ -206,16 +206,31 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	//     MariaDB-GTID support).
 	//   - JSONSupport: JSONText, not JSONBinary. MariaDB JSON is a
 	//     LONGTEXT alias — information_schema reports data_type
-	//     'longtext' (plus an auto json_valid CHECK); there is no
-	//     binary JSON storage to declare. JSON-identity recovery via
-	//     the json_valid CHECK is item 73 Phase 2.
-	//   - ExtGeometry excluded. MariaDB spells the column SRID
-	//     attribute REF_SYSTEM_ID=n (MySQL 8's `SRID n` is a syntax
-	//     error there), and it has no information_schema srs_id column
-	//     to read one back from — carrying geometry through this flavor
-	//     today would silently drop declared SRIDs on read and emit
-	//     unparseable DDL on write. Refused loudly instead; the
-	//     REF_SYSTEM_ID spelling + SHOW CREATE read-back is Phase 2.
+	//     'longtext' (plus an auto json_valid CHECK). Phase 2 recovers
+	//     JSON identity: a longtext column whose ONLY CHECK is exactly
+	//     json_valid(<that column>) is remapped to ir.JSON{Binary:false}
+	//     (honest — MariaDB JSON is textual, matches JSONText and PG
+	//     `json`) and that MariaDB-internal auto-CHECK is stripped from
+	//     the IR so it is not re-emitted as an invalid json_valid() CHECK
+	//     on a PG target (see recoverMariaDBJSONColumns).
+	//   - ExtGeometry SUPPORTED (Phase 2). MariaDB has no
+	//     information_schema.columns.srs_id column, so the I_S read leaves
+	//     SRID=0; the mariadb READER recovers the true per-column SRID
+	//     from information_schema.GEOMETRY_COLUMNS.SRID
+	//     (populateMariaDBGeometrySRID) — MariaDB does NOT echo the SRID
+	//     in SHOW CREATE TABLE. On the WRITE side the mariadb emitter
+	//     spells the SRID as the REF_SYSTEM_ID=n TYPE attribute (before
+	//     NOT NULL); MySQL 8's `SRID n` form is a syntax error on MariaDB.
+	//     Phase 1 excluded geometry to avoid the silent-SRID-drop class;
+	//     that class is now closed on both read and write.
+	//   - ExtUUID / ExtInet SUPPORTED (Phase 2). MariaDB's native UUID,
+	//     INET6, and INET4 data types read to ir.UUID{} / ir.Inet{}
+	//     (see translateType). Cross-engine emit is the established
+	//     policy: PG target native (uuid/inet), MySQL-family target
+	//     auto-emits CHAR(36)/VARCHAR(45). A same-engine mariadb target
+	//     currently lands them as CHAR(36)/VARCHAR(45) too (values
+	//     round-trip losslessly; native-type emit on a mariadb target is
+	//     a future refinement).
 	//   - BulkLoadLoadDataInfile: verified live — the scoping probe's
 	//     restore-into-11.4 leg landed the full corpus byte-identically
 	//     through the LOAD DATA LOCAL path, and MariaDB ships with
@@ -237,9 +252,11 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		CDC:         ir.CDCNone, // Phase 3: MariaDB domain GTIDs
 		SchemaScope: ir.SchemaScopeFlat,
 		SupportedTypes: ir.NewTypeSet(
-			ir.ExtEnum, // column-level ENUM
-			ir.ExtSet,  // column-level SET
-			// ExtGeometry intentionally excluded — see comment above.
+			ir.ExtEnum,     // column-level ENUM
+			ir.ExtSet,      // column-level SET
+			ir.ExtGeometry, // built-in spatial types (Phase 2: SRID via REF_SYSTEM_ID)
+			ir.ExtUUID,     // native UUID (Phase 2)
+			ir.ExtInet,     // native INET6/INET4 (Phase 2)
 		),
 		SupportsCheckConstraint:  true, // MariaDB 10.2+ enforces CHECK
 		SupportsGeneratedColumns: true,

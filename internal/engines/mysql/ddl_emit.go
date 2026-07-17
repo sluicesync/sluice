@@ -46,6 +46,16 @@ type mysqlEmitter struct {
 	// column on the ALTER paths. nil (stdEmitter, unit constructions)
 	// disables remapping — byte-identical to the pre-item-73 emit.
 	collationRemap map[string]string
+
+	// flavor records the TARGET flavor so the emitter can render the
+	// handful of DDL fragments MariaDB spells differently from MySQL 8.
+	// Today that is the geometry column SRID attribute: MariaDB uses
+	// `REF_SYSTEM_ID=<n>` as a TYPE attribute (before NOT NULL), MySQL 8
+	// uses `SRID <n>` after NOT NULL — see emitColumnType / emitColumnDef
+	// (roadmap item 73 Phase 2). The zero value is FlavorVanilla, so
+	// stdEmitter and every unit construction emit the MySQL-8 form,
+	// byte-identical to the pre-item-73 behaviour.
+	flavor Flavor
 }
 
 // newMySQLEmitter resolves the DDL-emit policy from an engine's --mysql-sql-mode
@@ -60,6 +70,7 @@ func newMySQLEmitter(sqlMode *string) mysqlEmitter {
 func newMySQLEmitterForFlavor(sqlMode *string, flavor Flavor) mysqlEmitter {
 	m := newMySQLEmitter(sqlMode)
 	m.collationRemap = flavor.crossFlavorCollationRemap()
+	m.flavor = flavor
 	return m
 }
 
@@ -192,7 +203,19 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 		// per-column override if storage matters.
 		return "CHAR(36)", nil
 	case ir.Geometry:
-		return emitGeometryType(v.Subtype), nil
+		geomType := emitGeometryType(v.Subtype)
+		// MariaDB spells the geometry column SRID as a TYPE attribute —
+		// `REF_SYSTEM_ID=<n>`, which the grammar requires BEFORE NOT NULL
+		// (it is a syntax error after it), and rejects MySQL 8's
+		// `SRID <n>` form outright. Emit it here (adjacent to the type) so
+		// a PG→mariadb geometry column round-trips its SRID: the mariadb
+		// reader reads it back from information_schema.GEOMETRY_COLUMNS.
+		// SRID 0 = "no spatial reference declared" → omit, same as MySQL.
+		// Non-mariadb flavors emit the `SRID <n>` clause in emitColumnDef.
+		if m.flavor == FlavorMariaDB && v.SRID != 0 {
+			geomType += fmt.Sprintf(" REF_SYSTEM_ID=%d", v.SRID)
+		}
+		return geomType, nil
 
 	// ---- PG-native types without native MySQL equivalents ----
 	// Pre-v0.7.0 these returned an error pointing operators at
@@ -963,13 +986,16 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 		sb.WriteString(" NOT NULL")
 	}
 	// `SRID <n>` is a MySQL 8.0+ column attribute on spatial types
-	// (POINT/POLYGON/etc.). Emitted only when the IR carries a
-	// non-zero SRID — SRID 0 is MySQL's "no spatial reference
-	// declared" sentinel, identical to omitting the clause. Closes
-	// the writer half of Bug 26 (PG → MySQL): a PG `geometry(POINT,
-	// 4326)` column lands on MySQL as `POINT NOT NULL SRID 4326`
-	// and ST_SRID(loc) returns 4326 instead of 0.
-	if geom, ok := c.Type.(ir.Geometry); ok && geom.SRID != 0 {
+	// (POINT/POLYGON/etc.), emitted AFTER NOT NULL. Emitted only when
+	// the IR carries a non-zero SRID — SRID 0 is MySQL's "no spatial
+	// reference declared" sentinel, identical to omitting the clause.
+	// Closes the writer half of Bug 26 (PG → MySQL): a PG `geometry(
+	// POINT, 4326)` column lands on MySQL as `POINT NOT NULL SRID 4326`
+	// and ST_SRID(loc) returns 4326 instead of 0. The mariadb flavor is
+	// EXCLUDED here — it spells the SRID as the `REF_SYSTEM_ID=<n>` type
+	// attribute emitted in emitColumnType (before NOT NULL); MariaDB
+	// rejects the `SRID <n>` form (roadmap item 73 Phase 2).
+	if geom, ok := c.Type.(ir.Geometry); ok && geom.SRID != 0 && m.flavor != FlavorMariaDB {
 		fmt.Fprintf(&sb, " SRID %d", geom.SRID)
 	}
 	// DEFAULT and AUTO_INCREMENT are mutually exclusive with GENERATED

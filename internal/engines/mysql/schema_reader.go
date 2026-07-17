@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -121,6 +122,18 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		}
 		if err := r.populateCheckConstraints(ctx, tables); err != nil {
 			return nil, fmt.Errorf("mysql: read check constraints: %w", err)
+		}
+		// mariadb flavor (item 73 Phase 2): MariaDB JSON is a LONGTEXT
+		// alias with an auto json_valid CHECK — recover the JSON identity
+		// now that BOTH columns and checks are populated; and backfill
+		// geometry-column SRIDs from information_schema.GEOMETRY_COLUMNS
+		// (MariaDB's per-column SRID lives there, not in columns.srs_id
+		// nor SHOW CREATE).
+		if r.flavor == FlavorMariaDB {
+			recoverMariaDBJSONColumns(tables)
+			if err := r.populateMariaDBGeometrySRID(ctx, tables); err != nil {
+				return nil, fmt.Errorf("mysql: read geometry SRIDs: %w", err)
+			}
 		}
 	}
 
@@ -321,6 +334,46 @@ func indexesQuery(flavor Flavor) string {
 		ORDER  BY table_name, index_name, seq_in_index`
 }
 
+// checkConstraintsQuery returns populateCheckConstraints' query for the
+// reader's flavor. The join disambiguation is a MariaDB-specific
+// correctness fix (Bug 198): information_schema.check_constraints ↔
+// table_constraints join on (constraint_schema, constraint_name) alone.
+//
+//   - MySQL 8 constraint names are UNIQUE PER SCHEMA, so that 2-column
+//     key is already 1:1 — and MySQL 8's check_constraints has NO
+//     table_name column, so referencing cc.table_name there is a hard
+//     SQL error (Unknown column). The MySQL-8 query is therefore left
+//     byte-identical to the historical constant (unit-pinned).
+//   - MariaDB constraint names are unique only PER TABLE, so two tables
+//     in one database that share a check-constraint name FAN THE JOIN
+//     OUT — each table captures every same-named CHECK once per sharing
+//     table (a Cartesian blow-up). CREATE TABLE then emits duplicate
+//     CHECKs and the target refuses loudly (Error 1826 on MySQL/MariaDB,
+//     SQLSTATE 42710 on PG). MariaDB's `JSON`-as-`longtext CHECK
+//     (json_valid(<col>))` auto-CHECK is named after the COLUMN, so two
+//     tables with a same-named JSON column (meta/data/payload/…) trip it
+//     ubiquitously. MariaDB's check_constraints DOES carry table_name,
+//     so its variant adds `AND cc.table_name = tc.table_name` to the
+//     join, restoring the 1:1 (verified live: 11.4 + 10.11).
+func checkConstraintsQuery(flavor Flavor) string {
+	tableNameJoin := ""
+	if flavor == FlavorMariaDB {
+		tableNameJoin = "\n\t\t\t AND   cc.table_name       = tc.table_name"
+	}
+	return `
+		SELECT
+			tc.table_name,
+			cc.constraint_name,
+			cc.check_clause
+		FROM   information_schema.check_constraints cc
+		JOIN   information_schema.table_constraints  tc
+		  ON   tc.constraint_schema = cc.constraint_schema
+		 AND   tc.constraint_name   = cc.constraint_name` + tableNameJoin + `
+		WHERE  tc.table_schema    = ?
+		  AND  tc.constraint_type = 'CHECK'
+		ORDER  BY tc.table_name, cc.constraint_name`
+}
+
 // translateColumnDefault routes a scanned COLUMN_DEFAULT through the
 // flavor's convention translator: [translateMariaDBDefault] on the
 // mariadb flavor (quoted literals, the bare NULL keyword,
@@ -339,17 +392,25 @@ func (r *SchemaReader) translateColumnDefault(def sql.NullString, extra string, 
 // TABLE filter in readTables cannot see (the Bug-100/INHERITS
 // silent-loss class, roadmap item 73):
 //
-//   - SYSTEM VERSIONED — a normal data-bearing table that would
-//     silently vanish from migrate/backup/verify;
-//   - SEQUENCE — a schema object whose definition and current value
-//     would silently vanish (and whose NEXT VALUE defaults would
-//     break dependent tables on the target).
+//   - SYSTEM VERSIONED — a table that carries temporal history rows
+//     (the WITH SYSTEM VERSIONING period columns + historical
+//     row-versions). Carrying it as a plain current-state table would
+//     silently DROP that history, so it stays a loud refusal.
+//   - SEQUENCE — a schema object whose start/increment/min/max/cache/
+//     cycle definition and current value have NO representation on any
+//     MySQL-family target (MySQL has no sequence objects) and, even
+//     though the IR has a first-class Sequence surface, that surface is
+//     PG-only: the MySQL/MariaDB writer refuses a non-empty
+//     Schema.Sequences, so half-mapping a MariaDB sequence into it
+//     would only relocate the loud failure to emit time. Kept a loud
+//     read-time refusal instead (see ADR-0169).
 //
-// Phase 1 refuses loudly rather than partially supporting either
-// (Phase 2 migrates versioned tables as plain current-state tables
-// with a WARN and maps sequences to the IR sequence surface). The
-// refusal names every affected object so the operator can drop them
-// from scope deliberately instead of discovering the gap post-cutover.
+// The census names every affected object with its type and gives a
+// per-class remedy, so the operator can act deliberately rather than
+// discover the gap post-cutover. Phase 2 deliberately did NOT add
+// partial support for either class — silently dropping temporal history
+// or a sequence's topology is exactly the class this refusal exists to
+// prevent.
 func (r *SchemaReader) refuseInvisibleMariaDBTables(ctx context.Context) error {
 	if r.flavor != FlavorMariaDB {
 		return nil
@@ -367,27 +428,226 @@ func (r *SchemaReader) refuseInvisibleMariaDBTables(ctx context.Context) error {
 	}
 	defer rows.Close()
 
-	var found []string
+	var (
+		versioned []string
+		sequences []string
+	)
 	for rows.Next() {
 		var name, typ string
 		if err := rows.Scan(&name, &typ); err != nil {
 			return err
 		}
-		found = append(found, name+" ("+typ+")")
+		switch typ {
+		case "SEQUENCE":
+			sequences = append(sequences, name)
+		default: // SYSTEM VERSIONED
+			versioned = append(versioned, name)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(found) == 0 {
+	if len(versioned) == 0 && len(sequences) == 0 {
 		return nil
 	}
-	return fmt.Errorf(
-		"mariadb: the source database contains table types sluice's MariaDB support does not carry yet "+
-			"and would otherwise silently OMIT — %s. System-versioned tables and sequences are roadmap "+
-			"item 73 Phase 2; until then, convert the versioned tables (ALTER TABLE … DROP SYSTEM "+
-			"VERSIONING) or drop the objects from the source database before migrating",
-		strings.Join(found, ", "),
-	)
+
+	var b strings.Builder
+	b.WriteString("mariadb: the source database contains schema objects sluice's MariaDB support cannot carry " +
+		"and would otherwise silently OMIT (they are invisible to the table_type='BASE TABLE' filter):")
+	if len(versioned) > 0 {
+		fmt.Fprintf(&b, " SYSTEM VERSIONED tables [%s] carry temporal history that would be silently dropped if "+
+			"migrated as plain current-state tables — remedy: `ALTER TABLE <t> DROP SYSTEM VERSIONING` on the source "+
+			"(keeps current rows) or exclude them from scope;", strings.Join(versioned, ", "))
+	}
+	if len(sequences) > 0 {
+		fmt.Fprintf(&b, " SEQUENCE objects [%s] have no representation on a MySQL-family target and their "+
+			"start/increment/min/max/cache/cycle options + current value cannot be preserved — remedy: drop the "+
+			"sequence and the columns that reference it (letting the application supply values), or migrate the "+
+			"sequence-dependent portion to a PG target;", strings.Join(sequences, ", "))
+	}
+	return errors.New(strings.TrimRight(b.String(), ";"))
+}
+
+// recoverMariaDBJSONColumns restores the JSON identity MariaDB erases at
+// the catalog boundary (item 73 Phase 2). MariaDB's `JSON` type is a
+// LONGTEXT alias: information_schema reports data_type 'longtext' and
+// auto-generates a CHECK constraint `json_valid(<col>)`. Both facts are
+// what distinguishes a JSON column from a plain LONGTEXT, so the recovery
+// keys on the pair — a longtext column whose ONLY CHECK is EXACTLY
+// json_valid(<that column>):
+//
+//   - remaps the column type to ir.JSON{Binary: false} — honest, because
+//     MariaDB JSON is textual (matches the flavor's JSONText capability
+//     and PG `json`, not `jsonb`), and
+//   - STRIPS that auto-CHECK from the table's CheckConstraints. It is
+//     MariaDB-internal metadata: re-emitting it would land an invalid
+//     json_valid() CHECK on a PG target (PG has no such function) and a
+//     redundant one on a MySQL/MariaDB JSON column (which re-creates it
+//     implicitly).
+//
+// The match is deliberately precise — a single json_valid call
+// referencing exactly that column and nothing else (see
+// isMariaDBAutoJSONValidCheck) — so a user's genuine, more complex CHECK
+// that merely mentions json_valid is NOT mis-detected: the column stays
+// LONGTEXT and the CHECK is preserved. Because MariaDB's `JSON` and a
+// hand-written `LONGTEXT CHECK (json_valid(x))` are byte-identical in the
+// catalog, treating the latter as JSON too is the faithful reading, not a
+// guess.
+func recoverMariaDBJSONColumns(tables map[string]*ir.Table) {
+	for _, t := range tables {
+		byName := make(map[string]*ir.Column, len(t.Columns))
+		for _, c := range t.Columns {
+			byName[c.Name] = c
+		}
+		kept := t.CheckConstraints[:0]
+		for _, cc := range t.CheckConstraints {
+			col := jsonValidCheckTarget(cc, byName)
+			if col == nil {
+				kept = append(kept, cc)
+				continue
+			}
+			// Detected MariaDB JSON: remap the type and DROP the check
+			// (do not append to kept).
+			col.Type = ir.JSON{Binary: false}
+		}
+		// Zero the trailing slots the in-place filter left behind so no
+		// dropped *CheckConstraint stays reachable.
+		for i := len(kept); i < len(t.CheckConstraints); i++ {
+			t.CheckConstraints[i] = nil
+		}
+		if len(kept) == 0 {
+			t.CheckConstraints = nil
+		} else {
+			t.CheckConstraints = kept
+		}
+	}
+}
+
+// jsonValidCheckTarget returns the longtext column a CHECK constraint
+// auto-marks as MariaDB JSON — i.e. cc.Expr is exactly json_valid(<col>)
+// and that column exists and is ir.Text{Size: ir.TextLong}. Returns nil
+// when cc is not such an auto-CHECK (a genuine user CHECK, or one whose
+// target is not a longtext column).
+func jsonValidCheckTarget(cc *ir.CheckConstraint, byName map[string]*ir.Column) *ir.Column {
+	if cc == nil {
+		return nil
+	}
+	name, ok := isMariaDBAutoJSONValidCheck(cc.Expr)
+	if !ok {
+		return nil
+	}
+	col, ok := byName[name]
+	if !ok {
+		return nil
+	}
+	if txt, isText := col.Type.(ir.Text); !isText || txt.Size != ir.TextLong {
+		return nil
+	}
+	return col
+}
+
+// isMariaDBAutoJSONValidCheck reports whether expr is exactly a single
+// json_valid(<identifier>) call and returns the referenced column name.
+// The reader has already run normalizeMySQLExpressionText over the clause
+// (backtick-stripping), so expr is `json_valid(js)` for a column `js`.
+// The match is precise: the function name is case-insensitive, but the
+// call must wrap exactly one bare identifier and have no trailing
+// content — a complex CHECK such as `json_valid(js) AND length(js) > 2`
+// or `json_valid(a) OR json_valid(b)` does not end in `)` after the first
+// argument and is rejected, so a user's real CHECK is never mistaken for
+// MariaDB's auto-marker.
+func isMariaDBAutoJSONValidCheck(expr string) (col string, ok bool) {
+	s := strings.TrimSpace(expr)
+	const open = "json_valid("
+	if len(s) < len(open)+2 || !strings.EqualFold(s[:len(open)], open) || s[len(s)-1] != ')' {
+		return "", false
+	}
+	inner := strings.TrimSpace(s[len(open) : len(s)-1])
+	// Tolerate a residual backtick pair (defensive — normalize strips them).
+	inner = strings.Trim(inner, "`")
+	if inner == "" || !isBareIdentifier(inner) {
+		return "", false
+	}
+	return inner, true
+}
+
+// isBareIdentifier reports whether s is a single unquoted SQL identifier
+// (no parens, operators, whitespace, or a second argument) — the shape a
+// json_valid auto-CHECK's sole argument takes. A value that fails this is
+// a more complex expression and must not be treated as the auto-marker.
+func isBareIdentifier(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isIdentRune(rune(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// geometryColumnKey identifies a geometry column for the SRID backfill.
+type geometryColumnKey struct {
+	table  string
+	column string
+}
+
+// populateMariaDBGeometrySRID backfills ir.Geometry.SRID for the mariadb
+// flavor (item 73 Phase 2 item 4). Two facts make this a MariaDB-specific
+// pass: MariaDB has no information_schema.columns.srs_id column (MySQL
+// 8's source, which columnsQuery replaces with the constant 0), AND —
+// unlike MySQL 8 — MariaDB does NOT echo the column's REF_SYSTEM_ID
+// attribute in SHOW CREATE TABLE (verified live on 11.4/10.11). The
+// per-column SRID lives in the OGC-standard
+// information_schema.GEOMETRY_COLUMNS view instead (SRID keyed by
+// G_TABLE_SCHEMA / G_TABLE_NAME / G_GEOMETRY_COLUMN). One query covers
+// the whole schema; a geometry column absent from the view keeps SRID 0
+// ("no spatial reference declared").
+func (r *SchemaReader) populateMariaDBGeometrySRID(ctx context.Context, tables map[string]*ir.Table) error {
+	const q = `
+		SELECT g_table_name, g_geometry_column, srid
+		FROM   information_schema.geometry_columns
+		WHERE  g_table_schema = ?`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	srids := map[geometryColumnKey]int{}
+	for rows.Next() {
+		var table, column string
+		var srid int
+		if err := rows.Scan(&table, &column, &srid); err != nil {
+			return err
+		}
+		srids[geometryColumnKey{table: table, column: column}] = srid
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	applyMariaDBGeometrySRID(tables, srids)
+	return nil
+}
+
+// applyMariaDBGeometrySRID sets ir.Geometry.SRID on every geometry column
+// from the (table, column) → SRID map read from
+// information_schema.GEOMETRY_COLUMNS. Split out from the query so the
+// backfill is unit-testable without a live server. A geometry column with
+// no entry keeps its current SRID (0) — the honest "no spatial reference
+// declared" value.
+func applyMariaDBGeometrySRID(tables map[string]*ir.Table, srids map[geometryColumnKey]int) {
+	for name, t := range tables {
+		for _, col := range t.Columns {
+			geom, ok := col.Type.(ir.Geometry)
+			if !ok {
+				continue
+			}
+			if srid, ok := srids[geometryColumnKey{table: name, column: col.Name}]; ok {
+				geom.SRID = srid
+				col.Type = geom
+			}
+		}
+	}
 }
 
 // populateColumns fills in Column lists for each table.
@@ -699,20 +959,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 // the read boundary — same dialect-quoting normalization as the
 // generated-column path uses.
 func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[string]*ir.Table) error {
-	const q = `
-		SELECT
-			tc.table_name,
-			cc.constraint_name,
-			cc.check_clause
-		FROM   information_schema.check_constraints cc
-		JOIN   information_schema.table_constraints  tc
-		  ON   tc.constraint_schema = cc.constraint_schema
-		 AND   tc.constraint_name   = cc.constraint_name
-		WHERE  tc.table_schema    = ?
-		  AND  tc.constraint_type = 'CHECK'
-		ORDER  BY tc.table_name, cc.constraint_name`
-
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.db.QueryContext(ctx, checkConstraintsQuery(r.flavor), r.schema)
 	if err != nil {
 		return err
 	}

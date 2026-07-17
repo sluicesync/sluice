@@ -189,34 +189,70 @@ func translateType(c columnMeta) (ir.Type, error) {
 	case "json":
 		return ir.JSON{Binary: true}, nil
 
+	// ---- MariaDB-native identity / network types ----
+	//
+	// MariaDB grew native UUID (10.7+), INET6 (10.5+), and INET4
+	// (10.10+) types; information_schema reports their data_type as
+	// "uuid" / "inet6" / "inet4" (lowercased by columnsQuery). MySQL 8
+	// has none of these data_type strings — it never reaches these arms
+	// — so adding them to the shared switch is safe (roadmap item 73
+	// Phase 2; the mariadb flavor declares ExtUUID/ExtInet).
+	//
+	// Both INET6 and INET4 collapse to ir.Inet{}: the IR has no
+	// IPv4-only variant, and the address value round-trips losslessly as
+	// canonical text (PG `inet` natively, a MySQL-family target as
+	// VARCHAR(45) via the writer's auto-emit). MariaDB's own INET4 is a
+	// storage optimisation over INET6, not a distinct value space.
+	case "uuid":
+		return ir.UUID{}, nil
+	case "inet4", "inet6":
+		return ir.Inet{}, nil
+	}
+
 	// ---- Geometry (extension type) ----
 	//
-	// Each geometry case threads c.SrsID through to ir.Geometry.SRID
-	// so the cross-engine emit path lands `geometry(POINT, 4326)`
-	// on PG instead of dropping the SRID (Bug 26). Source columns
-	// without an explicit SRID get 0, which both engines treat as
-	// "no spatial reference system" — same semantics as the pre-fix
-	// state.
-
-	case "geometry":
-		return ir.Geometry{Subtype: ir.GeometryUnspecified, SRID: c.SrsID}, nil
-	case "point":
-		return ir.Geometry{Subtype: ir.GeometryPoint, SRID: c.SrsID}, nil
-	case "linestring":
-		return ir.Geometry{Subtype: ir.GeometryLineString, SRID: c.SrsID}, nil
-	case "polygon":
-		return ir.Geometry{Subtype: ir.GeometryPolygon, SRID: c.SrsID}, nil
-	case "multipoint":
-		return ir.Geometry{Subtype: ir.GeometryMultiPoint, SRID: c.SrsID}, nil
-	case "multilinestring":
-		return ir.Geometry{Subtype: ir.GeometryMultiLineString, SRID: c.SrsID}, nil
-	case "multipolygon":
-		return ir.Geometry{Subtype: ir.GeometryMultiPolygon, SRID: c.SrsID}, nil
-	case "geometrycollection", "geomcollection":
-		return ir.Geometry{Subtype: ir.GeometryCollection, SRID: c.SrsID}, nil
+	// The geometry family lives in its own dispatch so translateType
+	// stays under the cyclomatic-complexity gate. c.SrsID threads
+	// through to ir.Geometry.SRID so the cross-engine emit path lands
+	// `geometry(POINT, 4326)` on PG instead of dropping the SRID
+	// (Bug 26). On the mariadb flavor c.SrsID is 0 here (no I_S srs_id
+	// column); the true SRID is backfilled afterward from
+	// information_schema.GEOMETRY_COLUMNS (populateMariaDBGeometrySRID,
+	// item 73 Phase 2) — MariaDB does not expose it via srs_id or SHOW
+	// CREATE.
+	if geom, ok := geometryTypeFor(c.DataType, c.SrsID); ok {
+		return geom, nil
 	}
 
 	return nil, fmt.Errorf("mysql: unsupported data_type %q (column_type %q)", c.DataType, c.ColumnType)
+}
+
+// geometryTypeFor maps a MySQL/MariaDB spatial data_type to its
+// ir.Geometry, threading srid onto the value. ok is false for
+// non-geometry data types.
+func geometryTypeFor(dataType string, srid int) (ir.Geometry, bool) {
+	var sub ir.GeometrySubtype
+	switch dataType {
+	case "geometry":
+		sub = ir.GeometryUnspecified
+	case "point":
+		sub = ir.GeometryPoint
+	case "linestring":
+		sub = ir.GeometryLineString
+	case "polygon":
+		sub = ir.GeometryPolygon
+	case "multipoint":
+		sub = ir.GeometryMultiPoint
+	case "multilinestring":
+		sub = ir.GeometryMultiLineString
+	case "multipolygon":
+		sub = ir.GeometryMultiPolygon
+	case "geometrycollection", "geomcollection":
+		sub = ir.GeometryCollection
+	default:
+		return ir.Geometry{}, false
+	}
+	return ir.Geometry{Subtype: sub, SRID: srid}, true
 }
 
 // displayWidth extracts the display width N from a column_type of the

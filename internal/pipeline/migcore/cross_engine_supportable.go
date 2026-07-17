@@ -335,15 +335,24 @@ func isPGSourceEngine(engine string) bool {
 // for cross-engine supportability purposes — an engine with no
 // PG-native type surface, so every PG-only shape (PostGIS Geometry,
 // extension opclasses, EXCLUDE constraints) must refuse loudly before
-// any data moves. Covers all three registered MySQL flavors: `mysql`,
-// `planetscale`, and the self-hosted `vitess` flavor (which shares
-// PlanetScale's engine code and capabilities verbatim — ADR-0073(a)).
+// any data moves. Covers every registered MySQL-dialect engine: the
+// `mysql`/`planetscale`/`vitess`/`mariadb` flavors (plus the source-only
+// `mydumper` reader, inert as a target — it refuses long before this).
 //
-// A NAME check for the same reason as [isPGSourceEngine]: the engine
-// pair reaching [CheckCrossEngineSupportable] is recorded-name-driven
-// (backup lineage), so capabilities aren't resolvable here.
+// This DELEGATES to [translate.IsMySQLFamily] — the single source of
+// truth for the MySQL-dialect engine set (registry-parity-tested against
+// the engines that declare ir.DDLDialectMySQL). The prior hand-kept list
+// here EXCLUDED `mariadb`, so a PG→mariadb migrate computed
+// `pgToMySQL = isPGSource && false = false` and silently skipped every
+// PG-native refusal — the mariadb writer then dropped an EXCLUDE
+// constraint with no error (verify is count-based, blind to it). That is
+// the exact vitess-precedent silent-loss bug class; delegating to the
+// one parity-tested list makes a future MySQL-dialect engine that misses
+// this branch impossible. Still a pure NAME check (translate.IsMySQLFamily
+// is name-based too), so it stays resolvable from a backup manifest's
+// lineage strings without connecting to the engine.
 func IsMySQLFamilyEngine(engine string) bool {
-	return engine == "mysql" || engine == "planetscale" || engine == "vitess"
+	return translate.IsMySQLFamily(engine)
 }
 
 // isCrossEngineTranslatablePGExtension reports whether an
