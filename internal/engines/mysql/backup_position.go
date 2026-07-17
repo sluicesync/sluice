@@ -33,14 +33,14 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.
 	if r.db == nil {
 		return ir.Position{}, errors.New("mysql: CaptureBackupPosition: reader not opened")
 	}
-	useGTID, err := gtidModeOn(ctx, r.db)
+	useGTID, err := gtidModeOnFor(ctx, r.db, r.flavor)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: detect gtid mode: %w", err)
 	}
 	if useGTID {
-		set, err := executedGTIDSet(ctx, r.db)
+		set, err := coldStartGTIDSetFor(ctx, r.db, r.flavor)
 		if err != nil {
-			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: read @@gtid_executed: %w", err)
+			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
 		}
 		pos, err := encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
 		if err != nil {

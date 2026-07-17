@@ -392,35 +392,10 @@ func warnMariaDBUnderMySQLDriver(version string) {
 	)
 }
 
-// mariadbCDCUnsupportedError is the coded Phase-1 CDC refusal
-// (SLUICE-E-CDC-MARIADB-UNSUPPORTED). It fires from OpenCDCReader /
-// OpenServerCDCReader and — via [Engine.ExplainCDCUnsupported] — from
-// the pipeline's CDC-capability preflights (sync start, backup
-// stream/incremental, add-table), so the operator sees the real story
-// (MariaDB domain GTIDs, roadmap item 73 Phase 3) and the trigger-less
-// alternatives instead of a generic "declares CDC=None".
-func mariadbCDCUnsupportedError() error {
-	return sluicecode.Wrap(
-		sluicecode.CodeCDCMariaDBUnsupported,
-		"use `sluice migrate` + application cutover (or backup/restore) until MariaDB CDC ships (roadmap item 73 P3)",
-		fmt.Errorf(
-			"mariadb: CDC (continuous sync / incremental backup) is not supported yet: MariaDB replicates "+
-				"with domain-based GTID positions (e.g. 0-100-38) that sluice's MySQL binlog reader cannot "+
-				"parse or resume — MariaDB-native GTID support is roadmap item 73 Phase 3. "+
-				"Available today without CDC: bulk `sluice migrate` plus an application cutover, or "+
-				"`sluice backup` / `sluice restore` for point-in-time copies: %w",
-			ErrNotImplemented,
-		),
-	)
-}
-
-// ExplainCDCUnsupported implements [ir.CDCUnsupportedExplainer]: for
-// the mariadb flavor it supplies the coded refusal above; every other
-// flavor returns nil so the orchestrator's generic CDC=None message
-// (or the flavor's real CDC support) applies.
-func (e Engine) ExplainCDCUnsupported() error {
-	if e.Flavor == FlavorMariaDB {
-		return mariadbCDCUnsupportedError()
-	}
-	return nil
-}
+// NOTE: MariaDB CDC (domain-GTID binlog streaming) shipped in Phase 3
+// (ADR-0170); the flavor now declares [ir.CDCBinlog]. The Phase-1 coded
+// refusal (mariadbCDCUnsupportedError, [ir.CDCUnsupportedExplainer]) is
+// therefore removed — every mysql-family flavor now supports CDC, so no
+// flavor needs the "CDC unsupported" explainer hook. The
+// SLUICE-E-CDC-MARIADB-UNSUPPORTED code stays defined in the sluicecode
+// catalog (a stable public code registry) but is no longer emitted.

@@ -104,6 +104,20 @@ func ensureSharedMariaDB(t *testing.T, image string) (host, port string) {
 				"MARIADB_ROOT_PASSWORD": "rootpw",
 				"MARIADB_DATABASE":      "seed",
 			},
+			// Binlog ROW + FULL row-image so the shared container also
+			// backs the Phase-3 CDC tests (ADR-0170). MariaDB is always
+			// GTID-capable (no gtid-mode flag; the reader auto-detects via
+			// gtidModeOnFor → true and cold-starts from @@gtid_binlog_pos),
+			// so no gtid-mode/enforce-gtid flags are needed. The purged-
+			// position test that runs PURGE BINARY LOGS keeps its OWN
+			// container (newMariaDBDedicatedForCDC) so it can't truncate
+			// other CDC tests' binlog history mid-shard.
+			Cmd: []string{
+				"--server-id=1",
+				"--log-bin=mysqld-bin",
+				"--binlog-format=ROW",
+				"--binlog-row-image=FULL",
+			},
 			ExposedPorts: []string{"3306/tcp"},
 			WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
 				return fmt.Sprintf("root:rootpw@tcp(%s:%s)/seed", host, port.Port())
@@ -558,26 +572,81 @@ func TestMariaDB_BackupRestoreRoundTrip(t *testing.T) {
 	assertCorpusEqual(t, srcDSN, dstDSN)
 }
 
-// TestMariaDB_SyncStart_CodedRefusal pins the `sync start` shape: a
-// real Streamer against a live mariadb source refuses with
-// SLUICE-E-CDC-MARIADB-UNSUPPORTED before opening anything.
-func TestMariaDB_SyncStart_CodedRefusal(t *testing.T) {
-	srcDSN := newMariaDB(t, mariadb114Image, "mdb_sync_src")
-	execSQLScript(t, srcDSN, "CREATE TABLE t1 (id INT PRIMARY KEY);")
-	dstDSN, _ := newSharedDB(t, "mdb_sync_dst")
+// TestMariaDB_CDCReader_BasicChangeStream is the Phase-3 flip of the old
+// coded-refusal pin (ADR-0170): the mariadb flavor now streams binlog CDC.
+// On BOTH supported LTS lines: open the reader "from now" (domain-GTID
+// cold-start via @@gtid_binlog_pos), apply INSERT/UPDATE/DELETE, and
+// assert the exact ir.Change sequence converges with decoded values — the
+// spine test that proves the MariadbGTIDEvent transaction shape, the
+// MariaDBFlavor syncer + GTID-set parser, and the row decode path all
+// work end to end against a real MariaDB.
+func TestMariaDB_CDCReader_BasicChangeStream(t *testing.T) {
+	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+		image := image
+		t.Run(image, func(t *testing.T) {
+			dsn := newMariaDB(t, image, "mdb_cdc_basic")
+			execSQLScript(t, dsn, `
+				CREATE TABLE users (
+					id     BIGINT       NOT NULL AUTO_INCREMENT,
+					email  VARCHAR(255) NOT NULL,
+					active TINYINT(1)   NOT NULL DEFAULT 1,
+					PRIMARY KEY (id)
+				) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
 
-	src, _ := engines.Get("mariadb")
-	dst, _ := engines.Get("mysql")
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	s := &pipeline.Streamer{Source: src, SourceDSN: srcDSN, Target: dst, TargetDSN: dstDSN}
-	err := s.Run(ctx)
-	if err == nil {
-		t.Fatal("sync start from mariadb succeeded; want the coded CDC refusal")
-	}
-	ce, ok := sluicecode.FromError(err)
-	if !ok || ce.Code != sluicecode.CodeCDCMariaDBUnsupported {
-		t.Fatalf("sync start error = %v; want code %s", err, sluicecode.CodeCDCMariaDBUnsupported)
+			eng := Engine{Flavor: FlavorMariaDB}
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+
+			rdr, err := eng.OpenCDCReader(ctx, dsn)
+			if err != nil {
+				t.Fatalf("OpenCDCReader: %v", err)
+			}
+			defer func() {
+				if c, ok := rdr.(interface{ Close() error }); ok {
+					_ = c.Close()
+				}
+			}()
+
+			changes, err := rdr.StreamChanges(ctx, ir.Position{})
+			if err != nil {
+				t.Fatalf("StreamChanges: %v", err)
+			}
+			time.Sleep(300 * time.Millisecond) // let the syncer register at "now"
+
+			applyMySQL(t, dsn, `
+				INSERT INTO users (email, active) VALUES
+					('alice@example.com', 1),
+					('bob@example.com',   0);
+				UPDATE users SET active = 0 WHERE email = 'alice@example.com';
+				DELETE FROM users WHERE email = 'bob@example.com';`)
+
+			got := drainChanges(t, ctx, changes, 4, 30*time.Second)
+			if len(got) != 4 {
+				if cdcRdr, ok := rdr.(*CDCReader); ok {
+					if streamErr := cdcRdr.Err(); streamErr != nil {
+						t.Fatalf("got %d DML changes; want 4 (stream error: %v)", len(got), streamErr)
+					}
+				}
+				t.Fatalf("got %d DML changes; want 4", len(got))
+			}
+
+			ins0, ok := got[0].(ir.Insert)
+			if !ok || ins0.Table != "users" {
+				t.Fatalf("change[0] = %T; want ir.Insert users", got[0])
+			}
+			if email, _ := ins0.Row["email"].(string); email != "alice@example.com" {
+				t.Errorf("insert[0] email = %#v; want alice@example.com", ins0.Row["email"])
+			}
+			if active, _ := ins0.Row["active"].(bool); !active {
+				t.Errorf("insert[0] active = %#v; want true (TINYINT(1)→bool)", ins0.Row["active"])
+			}
+			if _, ok := got[2].(ir.Update); !ok {
+				t.Fatalf("change[2] = %T; want ir.Update", got[2])
+			}
+			if _, ok := got[3].(ir.Delete); !ok {
+				t.Fatalf("change[3] = %T; want ir.Delete", got[3])
+			}
+		})
 	}
 }
 

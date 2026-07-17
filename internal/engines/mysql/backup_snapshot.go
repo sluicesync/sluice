@@ -138,7 +138,7 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 	// Capture the position INSIDE the snapshot tx so it refers to the
 	// snapshot's logical clock (the same shape openBinlogSnapshotStream
 	// uses). Prefer GTID when gtid_mode is on; fall back to file/pos.
-	position, err := captureBackupPositionInTx(ctx, conn)
+	position, err := captureBackupPositionInTx(ctx, conn, e.Flavor)
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
@@ -309,7 +309,7 @@ func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.
 
 	// Capture the position on R[0] while FTWRL is still held — it refers
 	// to the frozen instant shared by all N readers.
-	position, err := captureBackupPositionInTx(ctx, conns[0])
+	position, err := captureBackupPositionInTx(ctx, conns[0], e.Flavor)
 	if err != nil {
 		return abort("could not capture snapshot position", err)
 	}
@@ -428,16 +428,20 @@ func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.SnapshotOpti
 // captureBackupPositionInTx queries the source-side cursor against the
 // pinned snapshot connection and encodes it the same way the standalone
 // CDC reader emits via [encodeBinlogPos]. The function is the conn-
-// scoped sibling of [SchemaReader.CaptureBackupPosition].
-func captureBackupPositionInTx(ctx context.Context, conn *sql.Conn) (ir.Position, error) {
-	useGTID, err := gtidModeOnConn(ctx, conn)
+// scoped sibling of [SchemaReader.CaptureBackupPosition]. flavor threads
+// the MariaDB branch (GTID always on; @@gtid_binlog_pos cold-start
+// position; ADR-0170) through the shared [gtidModeOnFor] /
+// [coldStartGTIDSetFor] helpers. The probes run INSIDE the snapshot tx on
+// the pinned *sql.Conn so the position refers to the snapshot's read-view.
+func captureBackupPositionInTx(ctx context.Context, conn *sql.Conn, flavor Flavor) (ir.Position, error) {
+	useGTID, err := gtidModeOnFor(ctx, conn, flavor)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("detect gtid mode: %w", err)
 	}
 	if useGTID {
-		set, err := executedGTIDSetConn(ctx, conn)
+		set, err := coldStartGTIDSetFor(ctx, conn, flavor)
 		if err != nil {
-			return ir.Position{}, fmt.Errorf("read @@gtid_executed: %w", err)
+			return ir.Position{}, err
 		}
 		return encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
 	}
@@ -446,30 +450,4 @@ func captureBackupPositionInTx(ctx context.Context, conn *sql.Conn) (ir.Position
 		return ir.Position{}, fmt.Errorf("master status: %w", err)
 	}
 	return encodeBinlogPos(binlogPos{Mode: positionModeFilePos, File: file, Pos: pos})
-}
-
-// gtidModeOnConn is the *sql.Conn variant of gtidModeOn (cdc_reader.go).
-// Used so the snapshot's gtid_mode probe runs INSIDE the snapshot tx —
-// reading the SHOW VARIABLES result outside the tx would lose the
-// snapshot read-view alignment.
-func gtidModeOnConn(ctx context.Context, conn *sql.Conn) (bool, error) {
-	var name, value string
-	err := conn.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'gtid_mode'").Scan(&name, &value)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return value == "ON" || value == "ON_PERMISSIVE", nil
-}
-
-// executedGTIDSetConn is the *sql.Conn variant of executedGTIDSet.
-func executedGTIDSetConn(ctx context.Context, conn *sql.Conn) (string, error) {
-	var set string
-	err := conn.QueryRowContext(ctx, "SELECT @@global.gtid_executed").Scan(&set)
-	if err != nil {
-		return "", err
-	}
-	return set, nil
 }

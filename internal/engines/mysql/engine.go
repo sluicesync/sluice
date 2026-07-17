@@ -261,27 +261,24 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 // The caller is responsible for calling Close on the returned
 // reader.
 func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	// The mariadb flavor's CDCNone has a concrete, roadmapped story
-	// (domain GTIDs, item 73 P3) — refuse with the coded error rather
-	// than the generic not-implemented shape.
-	if e.Flavor == FlavorMariaDB {
-		return nil, mariadbCDCUnsupportedError()
-	}
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
 	if e.Flavor.usesVStream() {
 		return openVStreamReader(ctx, dsn, e.Flavor, e.opts)
 	}
-	// FlavorVanilla and any future binlog-based flavor land here.
-	return openBinlogCDCReader(ctx, dsn, e.opts)
+	// FlavorVanilla, FlavorMariaDB, and any future binlog-based flavor
+	// land here; the reader flavor-branches its MariaDB-specific SQL
+	// (domain GTIDs, gtid_binlog_pos, SHOW BINLOG STATUS) off e.Flavor
+	// (ADR-0170).
+	return openBinlogCDCReader(ctx, dsn, e.Flavor, e.opts)
 }
 
-// openBinlogCDCReader is the FlavorVanilla path of OpenCDCReader.
-// Lifted out of OpenCDCReader so the flavor dispatch above stays
-// readable.
-func openBinlogCDCReader(ctx context.Context, dsn string, opts engineOptions) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, false, opts)
+// openBinlogCDCReader is the binlog (FlavorVanilla / FlavorMariaDB) path
+// of OpenCDCReader. Lifted out of OpenCDCReader so the flavor dispatch
+// above stays readable.
+func openBinlogCDCReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, flavor, false, opts)
 }
 
 // openBinlogServerCDCReader opens a binlog CDC reader against a *server*
@@ -291,8 +288,8 @@ func openBinlogCDCReader(ctx context.Context, dsn string, opts engineOptions) (i
 // separately via [CDCReader.SetCDCDatabaseScope]. The single-database
 // path keeps the strict [parseDSN] (database required); this sibling
 // relaxes only that precondition.
-func openBinlogServerCDCReader(ctx context.Context, dsn string, opts engineOptions) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, true, opts)
+func openBinlogServerCDCReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, flavor, true, opts)
 }
 
 // OpenServerCDCReader opens a server-wide binlog CDC reader against a
@@ -309,11 +306,6 @@ func openBinlogServerCDCReader(ctx context.Context, dsn string, opts engineOptio
 // server-wide CDC reader is not their model; they refuse loudly (multi-
 // keyspace CDC is the Phase 1c N-stream design).
 func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	// Same coded mariadb refusal as OpenCDCReader — the server-wide
-	// multi-database resume path is CDC too.
-	if e.Flavor == FlavorMariaDB {
-		return nil, mariadbCDCUnsupportedError()
-	}
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -324,15 +316,14 @@ func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCRead
 			e.Name(), ErrNotImplemented,
 		)
 	}
-	return openBinlogServerCDCReader(ctx, dsn, e.opts)
+	return openBinlogServerCDCReader(ctx, dsn, e.Flavor, e.opts)
 }
 
-func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool, opts engineOptions) (ir.CDCReader, error) {
-	// Package-level parse (not parseDSNForFlavor): every caller is the
-	// binlog path, reachable only from the vanilla flavor (the VStream
-	// flavors branch to openVStreamReader before this), and vanilla keeps
-	// the binary-protocol default under ADR-0153. A future binlog-based
-	// non-vanilla flavor should switch this to parseDSNForFlavor.
+func openBinlogCDCReaderShared(ctx context.Context, dsn string, flavor Flavor, serverScope bool, opts engineOptions) (ir.CDCReader, error) {
+	// Package-level parse (not parseDSNForFlavor): the binlog path is
+	// reachable from FlavorVanilla and FlavorMariaDB (the VStream flavors
+	// branch to openVStreamReader before this). Both keep the binary-
+	// protocol DSN default under ADR-0153, so parseDSN is correct for both.
 	parse := parseDSN
 	if serverScope {
 		parse = parseServerDSN
@@ -366,6 +357,7 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 	binlogTLS := binlogTLSFromConfig(cfg, host)
 	return &CDCReader{
 		db:             db,
+		flavor:         flavor,
 		schema:         cfg.DBName,
 		zeroDate:       zeroDate,
 		host:           host,

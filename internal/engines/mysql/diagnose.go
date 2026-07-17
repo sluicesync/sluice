@@ -164,22 +164,46 @@ func probeShowVariables(ctx context.Context, db *sql.DB, names []string) (map[st
 	return out, rows.Err()
 }
 
-// probeMasterStatus runs SHOW MASTER STATUS and returns the row as a
-// map. SHOW MASTER STATUS returns at most one row; empty result
-// (binlog disabled or PS read-only view) surfaces as nil, nil so the
-// caller can render an "unavailable" section rather than a failure.
+// probeMasterStatus returns the binlog-tip status row as a map. It tries
+// the family-spanning spelling list (masterStatusSpellings — MySQL
+// 8.0/8.4 + MariaDB 10.11/11.4/12; ADR-0170) and uses the first spelling
+// the server accepts; the statement returns at most one row, and an empty
+// result (binlog disabled or a PS read-only view) surfaces as nil, nil so
+// the caller can render an "unavailable" section rather than a failure. A
+// non-syntax error from the accepted spelling propagates.
 func probeMasterStatus(ctx context.Context, db *sql.DB) (map[string]any, error) {
-	rows, err := db.QueryContext(ctx, "SHOW MASTER STATUS")
+	var lastErr error
+	for _, q := range masterStatusSpellings {
+		out, ok, err := scanMasterStatusRow(ctx, db, q)
+		if err != nil {
+			lastErr = err
+			continue // wrong spelling for this server family: try the next
+		}
+		if !ok {
+			return nil, nil // accepted, but binlog disabled / read-only view
+		}
+		return out, nil
+	}
+	return nil, lastErr
+}
+
+// scanMasterStatusRow runs one binlog-tip spelling and returns its single
+// row as a column→value map. ok is false when the statement is accepted
+// but returns no row (binlog off). A syntax/unknown-statement error (wrong
+// spelling for the server family) surfaces as err so the caller falls
+// through to the next spelling.
+func scanMasterStatusRow(ctx context.Context, db *sql.DB, q string) (out map[string]any, ok bool, err error) {
+	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !rows.Next() {
-		return nil, rows.Err()
+		return nil, false, rows.Err()
 	}
 	scan := make([]any, len(cols))
 	vals := make([]sql.NullString, len(cols))
@@ -187,13 +211,13 @@ func probeMasterStatus(ctx context.Context, db *sql.DB) (map[string]any, error) 
 		scan[i] = &vals[i]
 	}
 	if err := rows.Scan(scan...); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	out := map[string]any{}
+	out = map[string]any{}
 	for i, c := range cols {
 		if vals[i].Valid {
 			out[c] = vals[i].String
 		}
 	}
-	return out, rows.Err()
+	return out, true, rows.Err()
 }

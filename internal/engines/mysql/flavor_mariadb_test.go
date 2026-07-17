@@ -5,12 +5,12 @@ package mysql
 
 import (
 	"database/sql"
-	"errors"
 	"strings"
 	"testing"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
+
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestMariaDBCapabilities pins the load-bearing pieces of the mariadb
@@ -22,8 +22,8 @@ func TestMariaDBCapabilities(t *testing.T) {
 	if caps.BulkLoad != ir.BulkLoadLoadDataInfile {
 		t.Errorf("mariadb BulkLoad = %v; want LoadDataInfile (verified live via the restore probe leg)", caps.BulkLoad)
 	}
-	if caps.CDC != ir.CDCNone {
-		t.Errorf("mariadb CDC = %v; want CDCNone (domain-GTID CDC is item 73 Phase 3)", caps.CDC)
+	if caps.CDC != ir.CDCBinlog {
+		t.Errorf("mariadb CDC = %v; want CDCBinlog (domain-GTID binlog CDC shipped in item 73 Phase 3, ADR-0170)", caps.CDC)
 	}
 	if caps.JSONSupport != ir.JSONText {
 		t.Errorf("mariadb JSONSupport = %v; want JSONText (MariaDB JSON is a LONGTEXT alias)", caps.JSONSupport)
@@ -50,7 +50,8 @@ func TestMariaDBCapabilities(t *testing.T) {
 		t.Error("FlavorMariaDB.usesVStream() = true; want false")
 	}
 	if caps.CDCPositionCommitsAfterRows {
-		t.Error("mariadb CDCPositionCommitsAfterRows = true; want false (no CDC at all in Phase 1)")
+		t.Error("mariadb CDCPositionCommitsAfterRows = true; want false (MariaDB binlog, like MySQL, " +
+			"stamps the GTID event BEFORE the transaction's rows — positions do not commit after rows)")
 	}
 }
 
@@ -493,46 +494,30 @@ func TestMariaDBCatalogQueries(t *testing.T) {
 	}
 }
 
-// TestMariaDBCDCRefusal pins the coded refusal shape on every CDC
-// surface reachable without a connection: the engine-level openers and
-// the [ir.CDCUnsupportedExplainer] hook the pipeline preflights consult.
-func TestMariaDBCDCRefusal(t *testing.T) {
-	assertCoded := func(t *testing.T, err error) {
-		t.Helper()
-		if err == nil {
-			t.Fatal("want the coded mariadb CDC refusal, got nil")
-		}
-		ce, ok := sluicecode.FromError(err)
-		if !ok {
-			t.Fatalf("error does not carry a sluicecode.CodedError: %v", err)
-		}
-		if ce.Code != sluicecode.CodeCDCMariaDBUnsupported {
-			t.Fatalf("code = %q; want %q", ce.Code, sluicecode.CodeCDCMariaDBUnsupported)
-		}
-		if !errors.Is(err, ErrNotImplemented) {
-			t.Error("refusal should wrap ErrNotImplemented so errors.Is callers keep working")
-		}
-		for _, want := range []string{"domain-based GTID", "item 73", "migrate"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("refusal message missing %q: %s", want, err)
-			}
-		}
+// TestMariaDBCDCEnabled pins Phase 3 (ADR-0170): the mariadb flavor now
+// declares binlog CDC, so the Phase-1 coded refusal
+// (CodeCDCMariaDBUnsupported via the [ir.CDCUnsupportedExplainer] hook) is
+// gone. The flavor takes the binlog reader path (goMySQLFlavor →
+// mysql.MariaDBFlavor), and — since every mysql-family flavor now supports
+// CDC — the Engine no longer implements the CDC-unsupported explainer at
+// all, so a pipeline preflight falls through to the real CDC support
+// rather than a flavor-specific refusal.
+func TestMariaDBCDCEnabled(t *testing.T) {
+	if got := FlavorMariaDB.capabilities().CDC; got != ir.CDCBinlog {
+		t.Fatalf("mariadb CDC = %v; want CDCBinlog (Phase 3, ADR-0170)", got)
 	}
-
-	e := Engine{Flavor: FlavorMariaDB}
-	assertCoded(t, e.ExplainCDCUnsupported())
-
-	_, err := e.OpenCDCReader(t.Context(), "u:p@tcp(localhost:1)/db")
-	assertCoded(t, err)
-	_, err = e.OpenServerCDCReader(t.Context(), "u:p@tcp(localhost:1)/db")
-	assertCoded(t, err)
-
-	// Non-mariadb flavors have no flavor-specific story.
-	if err := (Engine{Flavor: FlavorVanilla}).ExplainCDCUnsupported(); err != nil {
-		t.Errorf("vanilla ExplainCDCUnsupported = %v; want nil", err)
+	// The reader dispatches to the MariaDB go-mysql flavor (domain-GTID
+	// MariadbGTIDSet), not the MySQL one.
+	if got := (&CDCReader{flavor: FlavorMariaDB}).goMySQLFlavor(); got != mysql.MariaDBFlavor {
+		t.Errorf("mariadb goMySQLFlavor() = %q; want %q", got, mysql.MariaDBFlavor)
 	}
-	if err := (Engine{Flavor: FlavorPlanetScale}).ExplainCDCUnsupported(); err != nil {
-		t.Errorf("planetscale ExplainCDCUnsupported = %v; want nil", err)
+	if got := (&CDCReader{flavor: FlavorVanilla}).goMySQLFlavor(); got != mysql.MySQLFlavor {
+		t.Errorf("vanilla goMySQLFlavor() = %q; want %q", got, mysql.MySQLFlavor)
+	}
+	// The Phase-1 CDC-unsupported explainer hook was removed for all
+	// mysql-family flavors — none of them declares CDCNone anymore.
+	if _, ok := any(Engine{Flavor: FlavorMariaDB}).(ir.CDCUnsupportedExplainer); ok {
+		t.Error("Engine still implements ir.CDCUnsupportedExplainer; the hook should be gone now that every flavor supports CDC")
 	}
 }
 

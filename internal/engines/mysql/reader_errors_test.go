@@ -159,6 +159,18 @@ func TestClassifyReaderError_PurgedGTID(t *testing.T) {
 			true,
 		},
 		{
+			// MariaDB domain-GTID purge (ADR-0170): the wording shares no
+			// "purged required binary logs" substring with the MySQL/Vitess
+			// cases above, so isMariaDBPurgedGTIDError's distinct
+			// "could not find gtid state requested" matcher must catch it —
+			// else a purged MariaDB resume falls through terminal and never
+			// cold-starts. Ground-truthed verbatim against mariadb:11.4/10.11.
+			"mariadb 1236 gtid state not found",
+			errors.New("ERROR 1236 (HY000): Could not find GTID state requested by slave in any binlog files. " +
+				"Probably the slave state is too old and required binlog files have been purged."),
+			true,
+		},
+		{
 			// PlanetScale-flavored: the purged error arrives as a gRPC
 			// status carrying codes.Unknown (in the ADR-0038 retriable
 			// set). The purged check MUST win before isRetriableGRPCCode,

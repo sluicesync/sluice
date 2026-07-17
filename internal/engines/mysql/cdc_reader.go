@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -74,6 +75,18 @@ type CDCReader struct {
 	// detection. The binlog connection is separate — it speaks a
 	// different protocol and needs the REPLICATION SLAVE privilege.
 	db *sql.DB
+
+	// flavor is the MySQL-family flavor this reader streams from. The
+	// zero value (FlavorVanilla) keeps the MySQL-8 binlog path byte-
+	// identical; FlavorMariaDB flavor-branches the format-sensitive
+	// surfaces — the go-mysql syncer flavor + GTID-set parser
+	// (MariaDBFlavor / MariadbGTIDSet), the cold-start position source
+	// (@@gtid_binlog_pos vs @@gtid_executed), the gtid-mode probe
+	// (MariaDB has no gtid_mode variable), the per-event GTID
+	// accumulation (MariadbGTIDEvent, which also opens the transaction —
+	// MariaDB emits no BEGIN QueryEvent), and the purged-position resume
+	// refusal (MariaDB has no GTID_SUBSET / @@gtid_purged). See ADR-0170.
+	flavor Flavor
 
 	// posVerifyTimeout bounds the warm-resume position-verify queries
 	// (see [positionVerifyTimeout]). Zero — the production default for a
@@ -182,6 +195,18 @@ type CDCReader struct {
 	// parsing the DDL string and avoids the regex-over-DDL antipattern
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
+
+	// schemaCacheClears counts blanket schemaCache invalidations — one per
+	// in-scope DDL QueryEvent. It pins the MariaDB no-per-transaction-churn
+	// invariant (ADR-0170): unlike MySQL, MariaDB emits NO BEGIN / dummy
+	// QueryEvent for a plain-DML transaction (the domain-GTID event opens
+	// the transaction), so a stream of N plain-DML transactions must clear
+	// the cache ZERO times. A regression that started tripping the blanket
+	// clear() per transaction — a perf trap that also churns the ADR-0049
+	// deferred schema snapshot — would show up here. atomic so the pump
+	// goroutine's increment doesn't race a test/metric reader. Read by
+	// tests today; a natural future hook for a CDC diagnostics counter.
+	schemaCacheClears atomic.Int64
 
 	// pendingDDLAnchor is the ADR-0049 Chunk B1 deferred-snapshot
 	// anchor. clear(r.schemaCache) on a DDL QueryEvent is eager, but
@@ -381,14 +406,24 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// node-replace class). A failed lookup is non-fatal: serverUUID
 	// stays empty and the verify path falls back to the name-only
 	// check (pre-existing behaviour, no regression).
-	if uuid, err := sourceServerUUID(ctx, r.db); err == nil {
-		r.serverUUID = uuid
-	} else {
-		slog.WarnContext(
-			ctx, "mysql: cdc: could not read @@server_uuid; "+
-				"node-replace position-loss detection degraded to binlog-filename-only",
-			slog.String("err", err.Error()),
-		)
+	//
+	// Skipped on MariaDB: it has no @@server_uuid variable (the read
+	// errors 1193), and MariaDB always streams in domain-GTID mode where
+	// serverUUID is never consulted anyway — GTID UUIDs/domains are
+	// themselves instance-bound, so a replaced instance surfaces as a
+	// purged/unreachable GTID (error 1236 → ir.ErrPositionInvalid). So
+	// the probe would only emit a misleading "degraded" WARN on every
+	// MariaDB stream open. See ADR-0170.
+	if r.flavor != FlavorMariaDB {
+		if uuid, err := sourceServerUUID(ctx, r.db); err == nil {
+			r.serverUUID = uuid
+		} else {
+			slog.WarnContext(
+				ctx, "mysql: cdc: could not read @@server_uuid; "+
+					"node-replace position-loss detection degraded to binlog-filename-only",
+				slog.String("err", err.Error()),
+			)
+		}
 	}
 
 	// Bug 193 preflight: refuse partial binlog row images (MINIMAL /
@@ -416,7 +451,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID: r.serverID,
-		Flavor:   mysql.MySQLFlavor,
+		Flavor:   r.goMySQLFlavor(),
 		Host:     r.host,
 		Port:     r.port,
 		User:     r.user,
@@ -522,14 +557,14 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 	}
 
 	// Empty position: auto-detect mode and ask the source where it is.
-	useGTID, err := gtidModeOn(ctx, r.db)
+	useGTID, err := gtidModeOnFor(ctx, r.db, r.flavor)
 	if err != nil {
 		return binlogPos{}, fmt.Errorf("mysql: detect gtid mode: %w", err)
 	}
 	if useGTID {
-		set, err := executedGTIDSet(ctx, r.db)
+		set, err := coldStartGTIDSetFor(ctx, r.db, r.flavor)
 		if err != nil {
-			return binlogPos{}, fmt.Errorf("mysql: read @@gtid_executed: %w", err)
+			return binlogPos{}, err
 		}
 		return binlogPos{Mode: positionModeGTID, GTIDSet: set}, nil
 	}
@@ -546,7 +581,7 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, error) {
 	switch p.Mode {
 	case positionModeGTID:
-		set, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, p.GTIDSet)
+		set, err := mysql.ParseGTIDSet(r.goMySQLFlavor(), p.GTIDSet)
 		if err != nil {
 			return nil, fmt.Errorf("parse gtid set %q: %w", p.GTIDSet, err)
 		}
@@ -641,7 +676,8 @@ func isRowRelevantEvent(ev *replication.BinlogEvent) bool {
 		return false
 	}
 	switch ev.Event.(type) {
-	case *replication.RowsEvent, *replication.QueryEvent, *replication.GTIDEvent, *replication.XIDEvent:
+	case *replication.RowsEvent, *replication.QueryEvent, *replication.GTIDEvent,
+		*replication.MariadbGTIDEvent, *replication.XIDEvent:
 		return true
 	case *replication.TransactionPayloadEvent:
 		// A compressed transaction (binlog_transaction_compression=ON) wraps
@@ -676,6 +712,42 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			return fmt.Errorf("mysql: cdc: gtid update: %w", err)
 		}
 		return nil
+
+	case *replication.MariadbGTIDEvent:
+		// MariaDB opens each transaction with its domain-GTID event; there
+		// is NO separate BEGIN QueryEvent as on MySQL (ground-truthed: a
+		// plain-DML transaction is MARIADB_GTID → TABLE_MAP → ROWS → XID,
+		// ADR-0170). Two jobs the MySQL GTIDEvent + BEGIN QueryEvent pair
+		// does are folded here:
+		//
+		//  1. Accumulate the running domain-GTID set so every emitted
+		//     position advances. e.GTID.String() renders
+		//     domain-server-seq (ServerID is stamped from the event header
+		//     by go-mysql's parser); MariadbGTIDSet keeps one GTID per
+		//     domain via forward(). Without this the reader's gtidSet would
+		//     never move and every position would resume from the stale
+		//     cold-start point — a silent wrong-position gap.
+		//  2. Surface the transaction boundary. A transactional (non-
+		//     standalone) group is the MySQL "BEGIN" analogue: emit TxBegin
+		//     so the batched applier and the backup/stream window logic see
+		//     the same tx boundaries they do on MySQL (a window must not end
+		//     mid-transaction — stream.go straddle). A STANDALONE group
+		//     (DDL / no XID follows) gets no TxBegin, matching the MySQL DDL
+		//     path (GTID → QueryEvent, no BEGIN); its QueryEvent below drives
+		//     the schema-cache invalidation.
+		if r.posMode == positionModeGTID && r.gtidSet != nil {
+			if err := r.gtidSet.Update(e.GTID.String()); err != nil {
+				return fmt.Errorf("mysql: cdc: mariadb gtid update: %w", err)
+			}
+		}
+		if e.IsStandalone() {
+			return nil
+		}
+		pos, err := r.positionFor(ev.Header)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
 
 	case *replication.TableMapEvent:
 		// The TABLE_MAP_EVENT's own schema field is the authoritative
@@ -765,6 +837,8 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		stmtSchema := string(e.Schema)
 		if stmtSchema == "" || r.databaseInScope(stmtSchema) {
 			clear(r.schemaCache)
+			r.schemaCacheClears.Add(1) // ADR-0170 no-per-tx-churn pin
+
 			// ADR-0049 Chunk B1, locked decision #4c: capture THIS
 			// QUERY (DDL) event's own position now. The schemaCache
 			// clear is eager but the *tableSchema rebuilds lazily on
@@ -1342,6 +1416,29 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 		}
 		return verifyBinlogFilePresent(ctx, r.db, p.File)
 	case positionModeGTID:
+		if r.flavor == FlavorMariaDB {
+			// MariaDB has NO reliable SQL surface to pre-check GTID
+			// reachability: there is no GTID_SUBSET function and no
+			// @@gtid_purged, and @@gtid_binlog_state reports the NEWEST
+			// GTID per domain, NOT a purged floor (ground-truthed: it is
+			// UNCHANGED across a PURGE BINARY LOGS, so a resume position
+			// below the purged floor is indistinguishable from a live one
+			// via SQL). The authoritative check is the stream itself:
+			// StartSyncGTID on a purged position surfaces MariaDB error
+			// 1236 ("Could not find GTID state requested by slave ...
+			// required binlog files have been purged") LOUDLY on the
+			// pump's first GetEvent, which classifyReaderError wraps as
+			// ir.ErrPositionInvalid (isMariaDBPurgedGTIDError) → the
+			// streamer's ADR-0022/ADR-0093 cold-start fall-through. So the
+			// pre-check is a minimal parse-validation and defers to that
+			// reactive refusal — never a silent start-from-wrong-position.
+			// See ADR-0170.
+			if _, err := mysql.ParseGTIDSet(mysql.MariaDBFlavor, p.GTIDSet); err != nil {
+				return fmt.Errorf("mariadb: resume gtid set %q is unparseable: %w (%w)",
+					p.GTIDSet, ir.ErrPositionInvalid, err)
+			}
+			return nil
+		}
 		// GTID UUIDs are themselves instance-bound, so a fresh
 		// instance's gtid_purged/gtid_executed carry a different
 		// source UUID and verifyGTIDSetReachable already catches the
@@ -1583,12 +1680,38 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 		cloudSQLPositionLossHint(ctx, db), ir.ErrPositionInvalid)
 }
 
-// gtidModeOn queries the source's gtid_mode variable. ON, ON_PERMISSIVE,
-// and (rarely) ON_PERMISSIVE_NEW_REPLICA all count as "GTID is in
-// effect"; OFF and OFF_PERMISSIVE return false.
-func gtidModeOn(ctx context.Context, db *sql.DB) (bool, error) {
+// goMySQLFlavor maps sluice's [Flavor] to the go-mysql flavor constant
+// the binlog syncer and GTID-set parser dispatch on. FlavorMariaDB →
+// mysql.MariaDBFlavor (a MariadbGTIDSet: one domain-server-seq GTID per
+// domain); every other binlog flavor (vanilla) → mysql.MySQLFlavor. The
+// VStream flavors never reach the binlog reader. Ground truth + rationale
+// in ADR-0170.
+func (r *CDCReader) goMySQLFlavor() string {
+	if r.flavor == FlavorMariaDB {
+		return mysql.MariaDBFlavor
+	}
+	return mysql.MySQLFlavor
+}
+
+// gtidModeOnFor reports whether the source runs in GTID mode (so the
+// caller resolves a GTID-set position rather than file/pos).
+//
+// MariaDB has NO gtid_mode variable — it is always GTID-capable, and the
+// domain-GTID binlog stream is the failover-safe position on every
+// supported line (10.11 LTS floor, ground-truthed live: @@gtid_binlog_pos
+// is readable and go-mysql streams the MariadbGTIDSet). So the mariadb
+// flavor returns true unconditionally; the SHOW VARIABLES probe below is
+// MySQL-only (on MariaDB it returns no rows, which would wrongly fall the
+// reader into file/pos mode).
+//
+// On MySQL: ON, ON_PERMISSIVE (and rarely ON_PERMISSIVE_NEW_REPLICA) count
+// as "GTID in effect"; OFF / OFF_PERMISSIVE / no-such-variable return false.
+func gtidModeOnFor(ctx context.Context, q rowQuerier, flavor Flavor) (bool, error) {
+	if flavor == FlavorMariaDB {
+		return true, nil
+	}
 	var name, value string
-	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'gtid_mode'").Scan(&name, &value)
+	err := q.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'gtid_mode'").Scan(&name, &value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1598,22 +1721,53 @@ func gtidModeOn(ctx context.Context, db *sql.DB) (bool, error) {
 	return value == "ON" || value == "ON_PERMISSIVE", nil
 }
 
-// executedGTIDSet returns the source's current @@gtid_executed.
-func executedGTIDSet(ctx context.Context, db *sql.DB) (string, error) {
+// coldStartGTIDSetFor returns the GTID-set string a "from now" cold start
+// resumes after — the position of the last event already in the source's
+// binlog.
+//
+// MySQL: @@global.gtid_executed. MariaDB: @@gtid_binlog_pos — the GTID of
+// the last event group WRITTEN TO THE BINLOG. This is deliberately NOT
+// @@gtid_current_pos: on a source that is itself a replica,
+// gtid_current_pos folds in @@gtid_slave_pos (transactions applied but not
+// necessarily re-logged), which can sit AHEAD of the binlog and would ask
+// StartSyncGTID to resume at a position not yet in any binlog file. For a
+// CDC source we read the binlog, so the binlog position is the correct
+// resume anchor. On a pure primary the two are equal (ground-truthed:
+// both "0-1-N"). An empty result (a brand-new source with no committed
+// transactions) is a valid "from the beginning of history" set, the same
+// empty-set edge @@gtid_executed has on a fresh MySQL source. See ADR-0170.
+func coldStartGTIDSetFor(ctx context.Context, q rowQuerier, flavor Flavor) (string, error) {
+	query := "SELECT @@global.gtid_executed"
+	label := "@@gtid_executed"
+	if flavor == FlavorMariaDB {
+		query = "SELECT @@gtid_binlog_pos"
+		label = "@@gtid_binlog_pos"
+	}
 	var set string
-	err := db.QueryRowContext(ctx, "SELECT @@global.gtid_executed").Scan(&set)
-	if err != nil {
-		return "", err
+	if err := q.QueryRowContext(ctx, query).Scan(&set); err != nil {
+		return "", fmt.Errorf("mysql: read %s: %w", label, err)
 	}
 	return set, nil
 }
 
+// masterStatusSpellings is the ordered fallback list of "where is the
+// binlog tip?" statements across the MySQL and MariaDB families. Ordered
+// so no currently-supported server pays a wasted round-trip:
+//
+//	SHOW BINARY LOG STATUS  — MySQL 8.4+ (renamed from SHOW MASTER STATUS)
+//	SHOW MASTER STATUS      — MySQL 8.0, MariaDB 10.11 / 11.4 (all accept it)
+//	SHOW BINLOG STATUS      — MariaDB 12+, where SHOW MASTER STATUS is removed
+//
+// Ground-truthed live (ADR-0170): MariaDB 10.11 and 11.4 accept BOTH
+// SHOW MASTER STATUS and SHOW BINLOG STATUS but REJECT SHOW BINARY LOG
+// STATUS (error 1064); MySQL rejects SHOW BINLOG STATUS. So on every
+// current server the second entry hits, and the SHOW BINLOG STATUS entry
+// is purely forward-compat for MariaDB 12.
+var masterStatusSpellings = []string{"SHOW BINARY LOG STATUS", "SHOW MASTER STATUS", "SHOW BINLOG STATUS"}
+
 // masterStatus returns the source's current binlog file + position.
-// Uses SHOW BINARY LOG STATUS first (MySQL 8.4+), falling back to
-// SHOW MASTER STATUS for older versions where the new spelling
-// doesn't exist yet.
 func masterStatus(ctx context.Context, db *sql.DB) (file string, pos uint32, err error) {
-	for _, q := range []string{"SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"} {
+	for _, q := range masterStatusSpellings {
 		file, pos, err = scanMasterStatus(ctx, db, q)
 		if err == nil {
 			return file, pos, nil

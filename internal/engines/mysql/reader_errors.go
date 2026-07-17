@@ -88,6 +88,22 @@ func classifyReaderError(err error) error {
 	// branches: a purged error can arrive carrying codes.Unknown (in the
 	// ADR-0038 retriable set), and retrying the SAME purged position
 	// spins forever. The position is invalid, not transient.
+	// MariaDB domain-GTID purged-position resume (ADR-0170). MariaDB
+	// exposes no SQL surface to pre-flight GTID reachability
+	// (@@gtid_binlog_state is newest-per-domain, not a purged floor; there
+	// is no GTID_SUBSET / @@gtid_purged), so — unlike the MySQL binlog path
+	// which pre-checks proactively — the authoritative signal is the
+	// stream's reactive error 1236 on the pump's first GetEvent. Classify
+	// it as ir.ErrPositionInvalid so the streamer routes it to a cold-start
+	// re-snapshot (ADR-0022 parity), exactly as the VStream purged path
+	// does. Checked here (before the retriable classifier) so the invalid
+	// position is not mistaken for a transient and retried forever against
+	// the same purged GTID.
+	if isMariaDBPurgedGTIDError(err) {
+		return fmt.Errorf(
+			"source mariadb cannot resume: the persisted domain-GTID position is older than the source's retained binlogs (required binlog files have been purged); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
+		)
+	}
 	if isVStreamPurgedGTIDError(err) {
 		// Both the original error AND ir.ErrPositionInvalid are wrapped
 		// (%w, Go 1.20 multi-error): the streamer routes on
@@ -162,6 +178,29 @@ func isVStreamSchemaResolutionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return (strings.Contains(msg, "unknown table") && strings.Contains(msg, "in schema")) ||
 		strings.Contains(msg, "no schema found for table")
+}
+
+// isMariaDBPurgedGTIDError reports whether err is MariaDB's domain-GTID
+// "resume position is older than the retained binlogs" shape — server
+// error 1236 with the GTID-specific wording (ground-truthed live against
+// mariadb:11.4 and mariadb:10.11):
+//
+//	"Could not find GTID state requested by slave in any binlog files.
+//	 Probably the slave state is too old and required binlog files have
+//	 been purged."
+//
+// This is DISTINCT from MySQL's file/pos 1236 ("the master has purged
+// required binary logs", caught by isVStreamPurgedGTIDError's
+// "purged required binary logs" substring) — MariaDB's GTID wording
+// shares no such substring, so it needs its own matcher. The
+// discriminating phrase "could not find gtid state requested" is unique to
+// the MariaDB GTID-purge case and does not collide with the file/pos
+// wording. Kept as a named helper (not inlined) so
+// [TestClassifyReaderError_MariaDBPurgedGTID] pins the exact wording — a
+// server-side rewording then fails the pin rather than silently reverting
+// to a restart loop against an unreachable position.
+func isMariaDBPurgedGTIDError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "could not find gtid state requested")
 }
 
 // isVStreamPurgedGTIDError reports whether err is the source's

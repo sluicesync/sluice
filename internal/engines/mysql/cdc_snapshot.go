@@ -542,7 +542,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 // SetCDCDatabaseScope predicate is the sole event-scope authority.
 func (e Engine) openCDCReaderForSnapshot(ctx context.Context, dsn string, multiDatabase bool) (ir.CDCReader, error) {
 	if multiDatabase {
-		return openBinlogServerCDCReader(ctx, dsn, e.opts)
+		return openBinlogServerCDCReader(ctx, dsn, e.Flavor, e.opts)
 	}
 	return e.OpenCDCReader(ctx, dsn)
 }
@@ -556,13 +556,16 @@ type closer interface{ Close() error }
 // because it operates on *sql.DB; here we need to run on the pinned
 // *sql.Conn so the position is captured inside the snapshot tx.
 func snapshotMasterStatus(ctx context.Context, conn *sql.Conn) (file string, pos uint32, err error) {
-	for _, q := range []string{"SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"} {
+	// masterStatusSpellings covers the MySQL 8.0/8.4 and MariaDB
+	// 10.11/11.4/12 binlog-tip statements (ADR-0170); ordered so no
+	// current server pays a wasted round-trip.
+	for _, q := range masterStatusSpellings {
 		file, pos, err = scanMasterStatusOnConn(ctx, conn, q)
 		if err == nil {
 			return file, pos, nil
 		}
 	}
-	return "", 0, errors.New("mysql: snapshot: SHOW BINARY LOG STATUS / SHOW MASTER STATUS both failed (binlog disabled?)")
+	return "", 0, errors.New("mysql: snapshot: SHOW BINARY LOG STATUS / SHOW MASTER STATUS / SHOW BINLOG STATUS all failed (binlog disabled?)")
 }
 
 // scanMasterStatusOnConn mirrors scanMasterStatus from cdc_reader.go,

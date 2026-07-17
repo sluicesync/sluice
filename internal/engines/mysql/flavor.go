@@ -249,7 +249,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	// ---------------------------------------------------------------
 	FlavorMariaDB: {
 		BulkLoad:    ir.BulkLoadLoadDataInfile,
-		CDC:         ir.CDCNone, // Phase 3: MariaDB domain GTIDs
+		CDC:         ir.CDCBinlog, // Phase 3: MariaDB domain GTIDs (ADR-0170)
 		SchemaScope: ir.SchemaScopeFlat,
 		SupportedTypes: ir.NewTypeSet(
 			ir.ExtEnum,     // column-level ENUM
