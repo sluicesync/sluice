@@ -897,6 +897,10 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
+### 74. Vitess/VStream partial-row-image cell (filed from the Bug-193 review N4, 2026-07-17)
+
+The VStream reader (`cdc_vstream.go`, `decodeVStreamRow` ~:1588) passes row images through without a partial-image preflight or a `RowChange.DataColumns` bitmap check. A self-hosted Vitess deployment whose underlying mysqlds run `binlog_row_image=NOBLOB`/`MINIMAL` (Vitess 16+ supports it and then populates `DataColumns`) would hit the Bug-193 silent-loss class through the VStream door — unprobed and unguarded. PlanetScale manages FULL, so the managed flavor is safe; the cell needs a preflight/bitmap belt when the self-hosted vitess posture is next touched.
+
 ### 73. MariaDB flavor support (operator-requested 2026-07-16; SCOPED via live probe — full matrix + phased draft in the operator's sluice-testing `workspace/mariadb/scoping-probe.md`)
 
 **Why:** MariaDB is the largest MySQL-adjacent install base sluice doesn't serve. The 2026-07-16 scoping probe (mariadb:11.4 + 10.11, shipped v0.99.263 binary) found the gap smaller than feared: **no silent-loss path is reachable today** — every leg fails loudly, pre-data — and the vendored go-mysql v1.15.0 already carries complete MariaDB GTID support (`MariadbGTIDSet`, `StartSyncGTID`, probed working), so even CDC is plumbing rather than library work. `restore` INTO MariaDB 11.4 already works byte-identically (minus `POINT SRID` spelling).

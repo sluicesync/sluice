@@ -4,6 +4,19 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.266] - 2026-07-17
+
+The last of the provider-campaign CRITICALs: MySQL CDC silently lost every UPDATE on sources with partial binlog row images — Azure Database for MySQL's platform default.
+
+### Fixed
+
+- **CRITICAL (Bug 193): MySQL binlog CDC silently lost every UPDATE when the source ran `binlog_row_image=MINIMAL` (or `NOBLOB`)** — the partial before-image built zero-match WHERE predicates the resume-idempotency path absorbed, so the stream stayed green while row content diverged (live-proven on Azure Database for MySQL Flexible Server, whose platform default is MINIMAL; 12/12 UPDATEs no-oped with `verify` sampling past the divergence). sluice now reads `@@GLOBAL.binlog_row_image` at every CDC start — sync cold start (before the bulk copy), warm resume, and `backup incremental` — and refuses `MINIMAL`/`NOBLOB` with the new coded `SLUICE-E-CDC-ROW-IMAGE-PARTIAL`, naming the `SET GLOBAL binlog_row_image=FULL` remedy and the Azure `az mysql flexible-server parameter set` recipe. The refusal also covers `binlog_row_value_options=PARTIAL_JSON`, whose `PARTIAL_UPDATE_ROWS_EVENT`s were previously **silently dropped by the dispatcher even on FULL-row-image sources** — refused at CDC start (tolerant read; pre-8.0.3 servers unaffected) and loudly mid-stream as the backstop. **Affected scope: every sluice version with MySQL CDC, on any source with `binlog_row_image != FULL` — Azure by platform default, self-managed by choice** (DO, RDS, and Cloud SQL ship FULL).
+- **Defense-in-depth on the row-image dispatch path:** the UPDATE before-image is narrowed to primary-key columns like the DELETE arm has been since Bug 88 (and PG's since Bug 92); a dispatch-time belt keyed on the binlog's present-columns bitmap (which distinguishes present-but-NULL from absent) stops the stream loudly — never silently — if a partial INSERT/UPDATE image reaches the reader past the preflight (a session-level override, or a resume replaying a segment recorded before the global was flipped); and the DELETE arm belts its PK-less case — a UNIQUE-NOT-NULL-no-PK table's MINIMAL before-image is keyed on the unique index, which sluice's PRIMARY-only lookup cannot see, so a partial DELETE image there refuses rather than silently zero-matching (truly-keyless tables keep replaying — their full before-image is their identity; this also closes the NOBLOB-keyless-table-with-BLOBs cell).
+
+### Compatibility
+
+- **One deliberate behavior change (loud):** MINIMAL/NOBLOB sources that previously streamed inserts/deletes "successfully" now refuse at CDC start with the coded error and its remedy — the remedy is dynamically settable on every known managed platform. **Prospective-only note:** backup chains with change chunks recorded under MINIMAL by earlier sluice versions already carry nil-filled row images baked in at capture; replay bypasses the dispatch belt, so this fix protects streams and backups made from now on — re-take backups of a MINIMAL-era source after setting FULL.
+
 ## [0.99.265] - 2026-07-17
 
 Three defects found by the Supabase IPv4 validation — including a CRITICAL silent-loss class observed live through a real CDC stream.
