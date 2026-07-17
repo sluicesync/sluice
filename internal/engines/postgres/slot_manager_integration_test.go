@@ -144,6 +144,57 @@ func TestSlotManager_DropEmptyName(t *testing.T) {
 	}
 }
 
+// TestSlotManager_PlatformInternalSlot pins the platform-internal
+// wire-up end-to-end against a real server, using `pghoard_local`
+// (the Aiven-lineage/Vultr backup daemon's always-present slot) as
+// the representative: List labels it, a sibling stranger slot stays
+// un-annotated, Drop refuses it without --force, and --force still
+// removes it (operator override). The roster itself — both entries ×
+// stranger names — is unit-pinned in platform_slots_test.go.
+func TestSlotManager_PlatformInternalSlot(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+
+	// A physical slot, like the real pghoard_local; plus a stranger
+	// physical slot that must keep surfacing un-annotated.
+	applyPGSQL(t, dsn, `
+		SELECT pg_create_physical_replication_slot('pghoard_local');
+		SELECT pg_create_physical_replication_slot('stranger_physical');
+	`)
+
+	mgr := openSlotManagerForTest(t, dsn)
+	defer func() { _ = mgr.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	slots, err := mgr.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	byName := map[string]ir.SlotInfo{}
+	for _, s := range slots {
+		byName[s.Name] = s
+	}
+	if got := byName["pghoard_local"].PlatformNote; got == "" {
+		t.Error("pghoard_local: PlatformNote empty; want the Aiven-lineage annotation")
+	}
+	if got := byName["stranger_physical"].PlatformNote; got != "" {
+		t.Errorf("stranger_physical: PlatformNote = %q; want empty (a stranger slot must keep surfacing)", got)
+	}
+
+	err = mgr.Drop(ctx, "pghoard_local", false)
+	if err == nil || !strings.Contains(err.Error(), "platform-internal") {
+		t.Fatalf("Drop without --force = %v; want the platform-internal refusal", err)
+	}
+	if err := mgr.Drop(ctx, "pghoard_local", true); err != nil {
+		t.Fatalf("Drop with --force: %v", err)
+	}
+	if err := mgr.Drop(ctx, "stranger_physical", false); err != nil {
+		t.Fatalf("Drop stranger: %v", err)
+	}
+}
+
 // TestCDCReader_AutoDropOnFailedColdStart proves the cleanup path:
 // cold-start a CDC reader against a publication name that doesn't
 // exist (we override the publication after construction to skip the

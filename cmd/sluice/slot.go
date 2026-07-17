@@ -72,18 +72,36 @@ func (s *SlotListCmd) Run(g *Globals) error {
 		headers := []string{"NAME", "PLUGIN", "ACTIVE", "WAL_STATUS", "RESTART_LSN", "CONFIRMED_FLUSH_LSN"}
 		// activeCol=2 colours the ACTIVE column (yes=live consumer).
 		fmt.Fprintln(os.Stdout, progress.Table(fmt.Sprintf("Replication slots (%d)", len(slots)), headers, rows, 2))
+		printPlatformSlotNotes(slots)
 		return nil
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	defer func() { _ = tw.Flush() }()
 	fmt.Fprintln(tw, "NAME\tPLUGIN\tACTIVE\tWAL_STATUS\tRESTART_LSN\tCONFIRMED_FLUSH_LSN")
 	for _, slot := range slots {
 		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\t%s\n",
 			slot.Name, slot.Plugin, slot.Active, walStatusOrDash(slot.WALStatus),
 			lsnOrDash(slot.RestartLSN), lsnOrDash(slot.ConfirmedFlushLSN))
 	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	printPlatformSlotNotes(slots)
 	return nil
+}
+
+// printPlatformSlotNotes appends one line per platform-internal slot
+// after the `slot list` table (both render modes). A trailing line
+// rather than a table column so the column layout — which scripts
+// parse — stays byte-identical when no platform slot is present, and
+// so the "don't drop this" guidance reads as prose, not a cell.
+func printPlatformSlotNotes(slots []ir.SlotInfo) {
+	for _, slot := range slots {
+		if slot.PlatformNote != "" {
+			fmt.Fprintf(os.Stdout, "note: slot %q is platform-internal (%s) — leave it alone; it is not a leaked consumer and dropping it breaks the provider\n",
+				slot.Name, slot.PlatformNote)
+		}
+	}
 }
 
 // SlotDropCmd drops a named replication slot. Destructive; refuses

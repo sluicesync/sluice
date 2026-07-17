@@ -1262,9 +1262,9 @@ func (s *Streamer) Run(ctx context.Context) error {
 
 	// Managed-host advisories (items 69a/70a): WARN-level sibling of the
 	// refusal above. cdc=true — a sync anchors and consumes a CDC
-	// position, so both the pooler-endpoint WARN (slot creation cannot
-	// run through a pooler) and the DigitalOcean binlog-retention WARN
-	// apply here.
+	// position, so both the pooler-endpoint WARN (most poolers strip
+	// the replication parameter, failing slot creation) and the managed-
+	// MySQL binlog-retention WARNs (DigitalOcean, Vultr) apply here.
 	migcore.WarnSourceHostAdvisories(ctx, s.Source, s.SourceDSN, true)
 
 	// GitHub #18 Phase 2: static safety-rail. Warn (don't refuse)

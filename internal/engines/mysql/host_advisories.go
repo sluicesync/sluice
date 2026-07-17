@@ -37,20 +37,34 @@ import (
 const doMySQLHostSuffix = ".db.ondigitalocean.com"
 
 // SourceHostAdvisories implements [ir.SourceHostAdvisor]: on a
-// CDC-anchoring run (sync, backup) whose source host is a DigitalOcean
-// Managed MySQL endpoint, WARN that effective binlog retention may be
-// ~13-16 minutes regardless of what @@binlog_expire_logs_seconds
-// reports, naming the config-API knob. A plain migrate never returns
-// to the binlog, so cdc=false is a no-op; so are non-DO hosts and
-// unparseable DSNs.
+// CDC-anchoring run (sync, backup) whose source host is a managed
+// endpoint with a lying binlog-retention window, WARN up front. Two
+// host classes today, each with its own message shape:
+//
+//   - DigitalOcean Managed MySQL: ~13-16-minute out-of-band purge, the
+//     config-API knob is the remedy.
+//   - Vultr Managed MySQL (same Aiven-derived platform): ~10-16-minute
+//     purge with NO retention knob at all — the stronger, no-remedy
+//     message (see host_advisories_vultr.go).
+//
+// A plain migrate never returns to the binlog, so cdc=false is a
+// no-op; so are non-matching hosts and unparseable DSNs.
 func (e Engine) SourceHostAdvisories(dsn string, cdc bool) []ir.SourceHostAdvisory {
 	if !cdc {
 		return nil
 	}
-	host, ok := doManagedMySQLHost(dsn)
-	if !ok {
-		return nil
+	if host, ok := doManagedMySQLHost(dsn); ok {
+		return doMySQLAdvisories(host)
 	}
+	if host, ok := vultrManagedMySQLHost(dsn); ok {
+		return vultrMySQLAdvisories(host)
+	}
+	return nil
+}
+
+// doMySQLAdvisories is the DigitalOcean lying-retention WARN. Pure so
+// the message pins run without a DSN parse.
+func doMySQLAdvisories(host string) []ir.SourceHostAdvisory {
 	return []ir.SourceHostAdvisory{{
 		Message: fmt.Sprintf(
 			"source host %q is a DigitalOcean Managed MySQL endpoint: on defaults the platform purges "+

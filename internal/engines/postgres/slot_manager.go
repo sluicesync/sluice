@@ -69,6 +69,12 @@ func (m *SlotManager) List(ctx context.Context) ([]ir.SlotInfo, error) {
 		if err := rows.Scan(&s.Name, &s.Plugin, &s.Active, &s.WALStatus, &s.RestartLSN, &s.ConfirmedFlushLSN); err != nil {
 			return nil, fmt.Errorf("postgres: scan slot row: %w", err)
 		}
+		// Label known platform-internal slots (Neon wal_proposer_slot,
+		// Aiven-lineage pghoard_local) so the enumeration doesn't read
+		// them as leaked consumers. See platform_slots.go.
+		if note, ok := platformInternalSlotNote(s.Name); ok {
+			s.PlatformNote = note
+		}
 		out = append(out, s)
 	}
 	if err := rows.Err(); err != nil {
@@ -94,6 +100,18 @@ func (m *SlotManager) List(ctx context.Context) ([]ir.SlotInfo, error) {
 func (m *SlotManager) Drop(ctx context.Context, name string, force bool) error {
 	if name == "" {
 		return errors.New("postgres: drop slot: name is empty")
+	}
+
+	// Refuse known platform-internal slots without --force, before any
+	// DB round-trip: dropping one breaks the PROVIDER's machinery (its
+	// backup daemon, its consensus layer), not a sluice consumer — the
+	// exact opposite of the abandoned-slot cleanup this command exists
+	// for. See platform_slots.go.
+	if note, ok := platformInternalSlotNote(name); ok && !force {
+		return fmt.Errorf(
+			"postgres: drop slot %q: this slot is platform-internal (%s) — dropping it breaks the provider's own machinery, not a sluice consumer; pass --force only if the provider's support told you to remove it",
+			name, note,
+		)
 	}
 
 	info, err := slotInfo(ctx, m.db, name)

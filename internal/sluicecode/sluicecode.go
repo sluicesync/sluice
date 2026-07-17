@@ -137,7 +137,7 @@ var registry = map[Code]Info{
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
-	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer), which cannot proxy replication-protocol commands; CDC needs the direct endpoint"},
+	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeCDCRowImagePartial:         {ClassRefusal, "the MySQL source streams partial binlog row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON), under which binlog CDC silently loses UPDATEs — refused at CDC start (or loudly mid-stream when a partial image slips past the global preflight)"},

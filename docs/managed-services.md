@@ -465,7 +465,7 @@ stream restart). Exactly-once is preserved for keyed tables. Pass
 
 Neon gives every branch two hostnames: the **direct** endpoint (`ep-…<id>.<region>.aws.neon.tech`) and the **pooled** endpoint (same name with a `-pooler` suffix on the first label), which is pgbouncer in transaction mode.
 
-- **CDC requires the direct endpoint.** A pooler cannot proxy replication-protocol commands (it strips `replication=database`); `sync start` against the pooled host fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal.
+- **CDC requires the direct endpoint.** Neon's pooler strips the `replication=database` startup parameter — the behavior of most transaction/statement-mode poolers, though not a law of nature (some session-mode/modern-pgbouncer setups forward replication; Vultr's managed pools do) — so `sync start` against the pooled host fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal.
 - **Bulk migrate through the pooler works** — a full snapshot-pinned parallel migrate passed through it at the validation scale — but sluice's parallel copy pins server connections inside long-lived snapshot transactions, which risks pool exhaustion mid-copy at higher parallelism/scale with a confusing failure. sluice emits a preflight **WARN** when the source host matches the `-pooler` pattern; prefer the direct endpoint.
 
 ### Enabling logical replication (`wal_level`)
@@ -474,21 +474,34 @@ Neon defaults to `wal_level=replica`; sluice's CDC preflight refuses loudly. The
 
 ### Operational notes
 
-- **`wal_proposer_slot` is Neon-internal.** Every Neon endpoint carries an always-present *physical* replication slot named `wal_proposer_slot` (part of Neon's safekeeper architecture). sluice's slot-health monitoring correctly ignores it; any external slot-enumeration tooling (or future sluice tooling) must whitelist it rather than flagging it as a leaked consumer.
+- **`wal_proposer_slot` is Neon-internal.** Every Neon endpoint carries an always-present *physical* replication slot named `wal_proposer_slot` (part of Neon's safekeeper architecture). sluice knows it: the slot-health probe (scoped to sluice's own slot) never touches it, `sluice slot list` labels it platform-internal, and `sluice slot drop` refuses it without `--force`. Any external slot-enumeration tooling must whitelist it the same way rather than flagging it as a leaked consumer.
 - **TLS**: Neon DSNs work with `sslmode=require`; `verify-full` also works with the standard system roots.
 - **Region co-location matters.** The validation runs were cross-provider; co-locating the sluice process (or the target) with the Neon region measurably reduces snapshot wall-clock.
 - **Autosuspend / cold-start is unprobed.** The validation project stayed active throughout, so scale-to-zero resume latency under a sluice snapshot has not been characterized — if you run against an autosuspending endpoint and see slow first-connection behaviour, that's the place to look.
 
 ## Supabase (Postgres)
 
-**Status**: Live-validated 2026-07-15 as a bulk-migration **source** — bit-exact fidelity through **both** Supavisor pooler modes. CDC from Supabase was environment-blocked in the validation (IPv4-only network + IPv6-only direct endpoint — see below), not a sluice defect: `wal_level=logical` is on out of the box (contrast Neon).
+**Status**: Live-validated as a bulk-migration **source** (2026-07-15, bit-exact through **both** Supavisor pooler modes) and — 2026-07-16, over the IPv4 add-on from an IPv4-only host — as a slot-based **CDC source** end-to-end: cold snapshot → CDC handoff → live I/U/D convergence (2-D arrays with exact dims, NaN-in-`numeric[]`, NULL elements) → clean stop → warm resume → slot drop. `wal_level=logical` is on out of the box (contrast Neon); the `postgres` role carries the REPLICATION attribute directly (no RDS-style membership model), so there is nothing to grant.
 
 ### The IPv6-only direct endpoint (the thing that bites first)
 
 Supabase free-tier **direct** endpoints (`db.<ref>.supabase.co`) have **only an AAAA record** — IPv4 connectivity to the direct endpoint is a paid add-on. From an IPv4-only machine the connection fails in about a second with the platform resolver's cryptic no-data error. sluice detects this class: on a resolve failure it probes for an AAAA record and, when the host is IPv6-only, extends the error with the remedy (coded `SLUICE-E-CONNECT-IPV6-ONLY`).
 
-- **Bulk migrate**: use the pooler endpoint (`aws-…pooler.supabase.com` — it has an A record).
-- **CDC**: the direct endpoint is required (a pooler cannot proxy replication), so from an IPv4-only network you need the IPv4 add-on or an IPv6-capable network. `sync start` through Supavisor fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal explaining exactly this.
+- **Bulk migrate**: use the pooler endpoint (`aws-…pooler.supabase.com` — it has an A record; session mode, see below).
+- **CDC**: the direct endpoint is required (Supavisor strips the replication parameter), so from an IPv4-only network you need the IPv4 add-on or an IPv6-capable network. `sync start` through Supavisor fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal explaining exactly this.
+
+### The IPv4 add-on (validated end-to-end)
+
+- **Plan-gated**: the org must be on **Pro or higher** — a payment method alone is not enough (the API refuses with "Project addons cannot be edited on the free tier"), and the plan upgrade itself is dashboard-only.
+- **$4/month, prorated hourly** (≈ $0.006/h) — cheap enough to enable for a migration window and disable after.
+- Enable/disable via the management API (`PATCH /v1/projects/<ref>/billing/addons` with `addon_type=ipv4`; the DELETE takes the **variant** id `ipv4_default`, not the type). DNS flips in ~10 s each way.
+- **Enabling REPLACES the AAAA record with an A record** — the direct endpoint is single-family at any moment, so dual-stack clients get IPv4 while the add-on is on, and the endpoint reverts to IPv6-only ~10 s after disable. Don't disable it under a running stream from an IPv4-only host.
+
+### CDC preflight facts
+
+- `max_replication_slots=5`, `max_wal_senders=5` — plenty for one stream, but a small budget if other consumers (Realtime, ETL) share the project.
+- **`max_slot_wal_keep_size=512MB`** — this is Supabase's analogue of the managed-MySQL retention warnings: a detached or badly lagging stream on a busy database has only 512 MB of WAL runway before Postgres invalidates the slot (`wal_status='lost'`, re-snapshot required). sluice's ADR-0059 slot-health probe pages at 70/85% of exactly this bound; keep detach windows short.
+- **Platform slots**: a fresh/idle project has none (the empty `supabase_realtime` *publication* exists, but no slot until Realtime is used). Projects actively using Realtime hold `supabase_realtime*` slots — those are platform-owned; don't drop them and don't count them as leaked consumers.
 
 ### Session vs transaction pooler modes
 
@@ -499,9 +512,13 @@ Supavisor exposes two ports on the pooler hostname:
 
 sluice's pooler-host preflight WARN fires for both (the hostname matches the `pooler.supabase.com` pattern).
 
+### TLS
+
+**Plaintext is accepted on the direct endpoint** — Supabase does not force TLS there, so always put `sslmode=require` (or stronger) on the DSN yourself. `require` negotiates TLS 1.3. `verify-full` fails against system roots (private CA: `Supabase Root 2021 CA` with a per-project leaf) and works with the Supabase CA pinned via the DSN: `sslmode=verify-full&sslrootcert=<path>` (download the CA from the dashboard). Note `--source-tls-ca` is the MySQL-side flag — for Postgres the CA rides the DSN's `sslrootcert` parameter, and sluice's refusal says so.
+
 ### Float display is not float identity
 
-Supabase servers default `extra_float_digits=0`, so **text-level** float comparisons against a Supabase source lie (a value can print rounded while the stored bits are exact). sluice's copy was proven bit-exact via `float8send` ground truth; if you diff sluice's output with external tooling that compares text, pin `SET extra_float_digits = 1` (or better, compare `float8send`/`float4send` bytes).
+Supabase servers default `extra_float_digits=0`, which makes **text-rendered** floats lie (a value prints rounded while the stored bits are exact). As of v0.99.265 sluice pins shortest-exact float rendering on every session it opens — the raw-copy text lane, the CDC walsender session, the trigger capture function, and `verify --depth=sample` hashes — so the server default no longer affects sluice's own fidelity (earlier releases were affected; re-verify data moved by them, and re-run `sluice trigger setup` on trigger-CDC sources after upgrading). External tooling that diffs text against a Supabase source still needs its own `SET extra_float_digits = 1` (or better, compare `float8send`/`float4send` bytes).
 
 ### Platform schemas
 
@@ -509,19 +526,20 @@ Supabase ships its platform schemas (`auth`, `storage`, `realtime`, …) alongsi
 
 ## Managed MySQL: the binlog-retention story at a glance
 
-The next three sections (DigitalOcean, AWS RDS, Google Cloud SQL — each validated live) share one theme: on managed MySQL, the CDC window a detached or slow-starting stream can survive is a **platform property**, and on two of the three platforms the server variable that claims to describe it lies. The three-point comparison, measured 2026-07-15/16:
+The managed-MySQL sections below (DigitalOcean, AWS RDS, Google Cloud SQL, Azure Flexible Server, Vultr — each validated live) share one theme: on managed MySQL, the CDC window a detached or slow-starting stream can survive is a **platform property**, and on most of the platforms the server variable that claims to describe it lies. The five-point comparison, measured 2026-07-15/17:
 
-| | DigitalOcean | AWS RDS | Google Cloud SQL |
-|---|---|---|---|
-| Default effective window | ~13–16 min (out-of-band reaper) | ~5–11 min (post-backup-upload purge) | **1 day** (variable-governed) |
-| Does `@@binlog_expire_logs_seconds` tell the truth? | No (reads 3 d) | No (reads 30 d) | **Yes (reads 1 d)** |
-| Where's the real knob | DO config API (`binlog_retention_period`, 600–86400 s) | SQL: `mysql.rds_set_configuration('binlog retention hours', N)`, cap 168 h | gcloud database flag `binlog_expire_logs_seconds`, floor 86400 s, no practical cap |
-| Knob change restarts? | No | No | No (but the PITR *toggle* does, twice, and wipes positions) |
-| Detect signal | host suffix only | host suffix + SQL-visible setting | **no host suffix; `@@version` ends in `-google`** |
-| `FLUSH TABLES WITH READ LOCK` | allowed | platform-blocked | allowed |
-| Defaults CDC-safe? | No | No | **Yes** (for gaps < 24 h) |
+| | DigitalOcean | AWS RDS | Google Cloud SQL | Azure Flexible | Vultr |
+|---|---|---|---|---|---|
+| Default effective window | ~13–16 min (out-of-band reaper) | ~5–11 min (post-backup-upload purge) | **1 day** (variable-governed) | **unbounded observed** (no purge in 85 min; variable = 0) | ~10–16 min (out-of-band reaper — same Aiven lineage as DO) |
+| Does `@@binlog_expire_logs_seconds` tell the truth? | No (reads 3 d) | No (reads 30 d) | **Yes (reads 1 d)** | **Yes-and-then-some** (reads 0 = never; even a set value purges lazily) | No (reads 3 d — the identical DO value) |
+| Where's the real knob | DO config API (`binlog_retention_period`, 600–86400 s) | SQL: `mysql.rds_set_configuration('binlog retention hours', N)`, cap 168 h | gcloud database flag `binlog_expire_logs_seconds`, floor 86400 s, no practical cap | `az … parameter set binlog_expire_logs_seconds` (0–2³², no floor, live ~20 s) | **NO KNOB EXISTS — the window is unconfigurable** |
+| Knob change restarts? | No | No | No (but the PITR *toggle* does, twice, and wipes positions) | No | n/a (no knob) |
+| Detect signal | host suffix only | host suffix + SQL-visible setting | **no host suffix; `@@version` ends in `-google`** | host suffix + `@@version` ends in `-azure` | host suffix `*.vultrdb.com` only (`@@version_comment` is a bare `Source distribution`) |
+| `binlog_row_image` default | FULL | FULL | FULL | **MINIMAL — silent UPDATE loss (Bug 193) until set FULL** | FULL |
+| `FLUSH TABLES WITH READ LOCK` | allowed | platform-blocked | allowed | allowed | allowed |
+| Defaults CDC-safe? | No | No | **Yes** (for gaps < 24 h) | **No — retention yes, but the row image silently loses UPDATEs** | **No — and unfixable** |
 
-sluice's `sync`/backup preflight advises per platform: an unconditional WARN on DO host patterns (the truth is API-only there), a detect-then-read probe on RDS hosts (silent when correctly configured), and an in-band `@@version` fingerprint for Cloud SQL (silent at its safe defaults). Details in each section.
+sluice's `sync`/backup preflight advises per platform: unconditional WARNs on the DO and Vultr host patterns (the truth is API-only on DO and nonexistent on Vultr), a detect-then-read probe on RDS hosts (silent when correctly configured), and an in-band `@@version` fingerprint for Cloud SQL (silent at its safe defaults). Azure needs no retention advisory at all — its defaults hold binlogs — but carries the row-image trap instead (see its section). Details in each section.
 
 ## DigitalOcean Managed MySQL
 
@@ -540,9 +558,9 @@ PATCH /v2/databases/{id}/config
 {"config": {"binlog_retention_period": 86400}}
 ```
 
-Seconds, accepted range 600–86400; **86400 (24 h) is the right value for migrations**. It takes effect immediately, no restart, and pre-existing binlogs stop being purged. (Aiven-hosted MySQL likely shares the purger behaviour — same platform lineage — but has not been probed.)
+Seconds, accepted range 600–86400; **86400 (24 h) is the right value for migrations**. It takes effect immediately, no restart, and pre-existing binlogs stop being purged. (The purger is an Aiven-platform behaviour, now cross-confirmed: Vultr — the same Aiven-derived platform — exhibits the identical reaper class, minus DO's knob; expect it on any Aiven-lineage managed MySQL, including Aiven proper.)
 
-Open question (unprobed): whether an *attached* binlog-dump connection holds the purger back — i.e. whether a live caught-up stream is safe indefinitely at default retention or only between purge ticks. Until answered, treat the config-API knob as required for any DO CDC use.
+One earlier open question is now answered (via the Vultr probe of the same platform lineage, 2026-07-17): an *attached*, caught-up binlog-dump connection does **NOT** hold the purger back — files behind a live stream purge on schedule, and a caught-up stream survives only because it sits on the active file. Treat the config-API knob as required for any DO CDC use.
 
 ### Connection + schema gotchas
 
@@ -598,7 +616,7 @@ The master user is **not** a superuser and never has the REPLICATION attribute (
 
 ### RDS Proxy
 
-Untested. Expected CDC-incompatible (transaction-mode pooler — the replication protocol cannot traverse it), same class as the Neon/Supabase pooler findings. Connect sluice to the **instance** endpoint (`*.<id>.<region>.rds.amazonaws.com`), not a proxy endpoint (`*.proxy-*.rds.amazonaws.com`).
+Untested. Expected CDC-incompatible (a transaction-mode pooler, expected to strip the replication parameter — the Neon/Supavisor-class behaviour; some session-mode/modern-pgbouncer setups forward replication, but RDS Proxy is not known to be one). Connect sluice to the **instance** endpoint (`*.<id>.<region>.rds.amazonaws.com`), not a proxy endpoint (`*.proxy-*.rds.amazonaws.com`).
 
 ## Google Cloud SQL for MySQL
 
@@ -641,11 +659,109 @@ Baseline before the flip: `wal_level=replica` regardless of backup settings (no 
 
 ### Cloud SQL Auth Proxy
 
-Untested. It is an authenticating TCP tunnel, not a transaction pooler, so CDC may traverse it (unlike the pgbouncer class) — unvalidated; connect sluice to the instance IP directly. Cloud SQL's *Managed Connection Pooling* feature IS a pooler and belongs in the CDC-incompatible class (also untested).
+Untested. It is an authenticating TCP tunnel, not a transaction pooler, so CDC may traverse it (unlike the Supavisor class) — unvalidated; connect sluice to the instance IP directly. Cloud SQL's *Managed Connection Pooling* feature IS a pooler and is expected to strip replication like the Supavisor class (also untested).
 
 ### Decommissioning
 
 A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL and will eventually fill the instance disk.
+
+## Azure Database for MySQL (Flexible Server)
+
+**Status**: cold copy + CDC handoff + 35-min-detach warm resume validated live 2026-07-17 (throwaway Standard_B1ms, MySQL 8.0.45). Uses the vanilla `mysql` engine. **One required knob — see the row-image warning below.**
+
+### REQUIRED: set `binlog_row_image=FULL` before any sync
+
+Azure's platform default is `binlog_row_image=MINIMAL` — the only major managed-MySQL platform that defaults to it — and under MINIMAL sluice's binlog CDC currently **loses UPDATEs silently** (Bug 193; INSERT/DELETE are unaffected, counts stay equal, only content diverges — a row-image preflight refusal is being added, but do not rely on it yet). Before `sync start`:
+
+```
+az mysql flexible-server parameter set --resource-group <rg> --server-name <server> \
+  --name binlog_row_image --value FULL
+```
+
+Dynamic — applies in ~20 s with no restart. Verify with `SELECT @@binlog_row_image;`. If a stream already ran under MINIMAL, verify with full-table sampling (`--sample-rows-per-table` sized to the table), not the default sample depth — a 0.2% divergence sails under the default sampling design point (demonstrated live).
+
+### Retention: the safest defaults of any managed MySQL probed
+
+`binlog_expire_logs_seconds` defaults to **0 (no time-based expiry)** and — unlike DigitalOcean, Vultr, and RDS — no out-of-band reaper was observed: files survived 85+ minutes, multiple rotations, and an on-demand full backup without a single purge. Detached streams warm-resume after long gaps on pure defaults (a 35-minute detach — fatal on RDS/DO defaults — replayed its backlog exactly). The inverse concern applies: binlogs accrue against your storage until you set the knob (`--name binlog_expire_logs_seconds --value 604800`, live, no restart; note purge appears platform-scheduled and lazy — files can outlive the window by tens of minutes). Manual `PURGE BINARY LOGS` is denied (no SUPER/BINLOG_ADMIN).
+
+### Connection + privilege notes
+
+- **TLS is mandatory AND zero-setup**: plaintext is refused (`require_secure_transport=ON` — the only one of the probed managed-MySQL platforms that refuses it), and `?tls=true` just works — the server chain validates against public roots already in your system store. No CA download, no `--source-tls-ca`.
+- **FTWRL works** (RELOAD honored) — sluice's concurrent frozen-snapshot cold copy runs with no fallback WARNs.
+- Replication grants (`REPLICATION SLAVE`/`REPLICATION CLIENT`) present on the admin user out of the box; `binlog_format=ROW` is read-only at the platform (no MIXED trap); `gtid_mode=OFF` by default (file/pos CDC fine); `sql_require_primary_key=OFF`; stock-strict `sql_mode` (no DO-style ANSI surprise).
+- Host pattern `*.mysql.database.azure.com`; in-band fingerprint `@@version` ending `-azure`. One-time subscription step: `az provider register --namespace Microsoft.DBforMySQL` must have completed before instance creation works.
+
+## Azure Database for PostgreSQL (Flexible Server)
+
+**Status**: Live-validated 2026-07-17 (Flexible Server PG 16.14) as a migration + slot-based CDC **source** — byte-identical bulk migrate on md5 ground truth (NaN-in-`numeric[]`, ±Infinity, denormal floats, 2-D arrays with NULL elements) and exact CDC convergence with a clean snapshot→CDC handoff. The vanilla `postgres` engine is the right driver.
+
+### Enabling logical replication
+
+Three self-service steps, no ticket:
+
+1. `az postgres flexible-server parameter set --resource-group <rg> --server-name <server> --name wal_level --value logical` — Azure exposes the GUC directly (no provider-specific alias). It is static: the command returns with the change pending.
+2. `az postgres flexible-server restart --resource-group <rg> --name <server>` — the parameter does NOT take effect until this explicit restart (~1 min; contrast Cloud SQL, whose patch restarts for you). Verify with `SHOW wal_level;`.
+3. Grant the connecting role the REPLICATION attribute: `ALTER ROLE <role> WITH REPLICATION;` — this WORKS as the (non-superuser) admin user; Azure patches the grant for `azure_pg_admin` members. This is exactly recovery path (a) in sluice's replication-capability refusal, the same self-service model as Cloud SQL. (The platform `replication` role is grant-restricted and irrelevant; there is no RDS-style membership model.)
+
+Baseline before the flip: `wal_level=replica` regardless of backup settings (no RDS-style retention-0 ⇒ `minimal` trap), `max_replication_slots=10` / `max_wal_senders=10` (unchanged by the flip), zero platform slots.
+
+### TLS
+
+TLS is mandatory (plaintext refused at pg_hba) and the certificate chain is **public** (Microsoft/DigiCert roots): `sslmode=verify-full` works with no CA download and no `sslrootcert` — use it on every Azure DSN, it is both the strictest and the zero-config mode. (If a client stack with its own CA file fails verification, it's missing an OS trust store, not an Azure quirk.)
+
+### Pooler
+
+The built-in PgBouncer requires General Purpose or higher (port 6432 on the same hostname when enabled; it cannot be enabled at all on Burstable) and is expected to strip replication like the Supavisor class — untested; connect sluice to port 5432.
+
+### Provisioning friction
+
+`Microsoft.DBforPostgreSQL` provider registration is a one-time subscription step, and region availability differs per subscription even from the MySQL flexible service (a region that provisions MySQL can refuse PG with "The location is restricted" — plan a region fallback).
+
+### Decommissioning
+
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL and will eventually fill the instance disk.
+
+## Vultr Managed Databases for MySQL
+
+**Status**: cold copy + CDC handoff validated live 2026-07-17 (throwaway hobbyist single-node, MySQL 8.4.8). Uses the vanilla `mysql` engine. Vultr's DBaaS is the same Aiven-derived platform as DigitalOcean's, and it shares DO's headline hazard — without DO's fix:
+
+### The lying binlog window, with NO retention knob (read this before `sync start`)
+
+An out-of-band platform reaper purges **every binlog file ~10–16 minutes after creation** — while `@@binlog_expire_logs_seconds` reads **259200 (3 days)**. The variable lies exactly as it does on DigitalOcean (same platform lineage), but where DO's config API accepts `binlog_retention_period`, **Vultr exposes no retention control at all**: the advanced-options API rejects the option by name, the database-update API ignores it, and `SET GLOBAL`/`SET PERSIST`/`PURGE BINARY LOGS` are denied to `vultradmin`. There is nothing to configure — the ~10-minute floor is permanent. sluice emits a loud **WARN** at `sync`/backup start on the `*.vultrdb.com` host pattern (the only reliable signal — `@@version_comment` is a bare `Source distribution`).
+
+What that means in practice: a CDC position older than ~10 minutes is unrecoverable (`ErrPositionInvalid`, auto-resnapshot), an attached caught-up stream is safe **only while it stays caught up** (files behind a live stream purge on schedule; the active file alone is immune — live-demonstrated), and a cold copy or restart gap longer than ~10 minutes can livelock auto-resnapshot **with no remedy**. Treat Vultr MySQL as a migrate-and-cut-over source: keep the sync stream attached and caught up from snapshot to cutover, and keep any planned pause well under 10 minutes. For long-running or pausable replication, this platform's defaults cannot support it.
+
+### Connection + schema gotchas (the DO list, almost verbatim)
+
+- Host pattern `*.vultrdb.com`, nonstandard high port; **plaintext is accepted** (`require_secure_transport=OFF`) but the unencrypted-binlog WARN applies. `?tls=true` fails — per-cluster private CA (Aiven "Project CA"); it is embedded in the create/GET API response's `ca_certificate` field — save it and pass `--source-tls-ca` (no separate CA endpoint call needed, unlike DO).
+- **`vultradmin` has the replication grants** CDC needs, plus RELOAD — FTWRL works, so sluice runs the concurrent frozen-snapshot cold copy with no fallback WARNs.
+- **Default `sql_mode` includes `ANSI`** — double-quoted strings are *identifiers*. Manual SQL against the source behaves differently than stock MySQL.
+- **`sql_require_primary_key=ON`** — keyless tables cannot be created on a Vultr target.
+- `local_infile=OFF` (Vultr-as-target takes the batched-INSERT fallback); `max_binlog_size` lowered to 64 MB; MySQL **8.4 is the only offered version**.
+
+## Vultr Managed Databases for PostgreSQL
+
+**Status**: Live-validated 2026-07-16 (Vultr PG 17.10) as a migration + slot-based CDC **source** — byte-identical bulk migrate on md5 ground truth (NaN-in-`numeric[]`, ±Infinity, denormal floats, 2-D arrays with NULL elements) and exact CDC convergence with a clean snapshot→CDC handoff. The vanilla `postgres` engine is the right driver.
+
+### Enabling logical replication: nothing to do
+
+Vultr (an Aiven-lineage platform) ships CDC-ready: `wal_level=logical` out of the box and the master user (`vultradmin`) carries the REPLICATION attribute from first boot — `sync start` works with zero preparation, the only provider validated so far where that is true. `max_replication_slots`/`max_wal_senders` default 20/20 and are raisable to 64 via the database's advanced options. For custom roles, `ALTER ROLE <role> WITH REPLICATION` works as `vultradmin` (no superuser needed — the platform patches the grant, like Cloud SQL and Azure).
+
+### The `pghoard_local` slot is platform-internal
+
+Every Vultr PG instance carries an always-active *physical* replication slot named `pghoard_local` (Aiven's pghoard backup daemon). `sluice slot list` shows it labeled platform-internal, `sluice slot drop` refuses it without `--force`, and the slot-health probe (scoped to sluice's own slot) never flags it. Leave it alone — never drop it, and don't count it as a leaked consumer. (It is the Aiven-lineage sibling of Neon's `wal_proposer_slot`, and likely present on Aiven proper and DO Managed PG too — unprobed.)
+
+### TLS
+
+Plaintext is refused server-side; `sslmode=require` works out of the box, and `sslmode=verify-full` works with the project CA, which is delivered inline in the `database create`/`get` API response (`ca_certificate` field) — pass it via `?sslrootcert=<path>` on the DSN. System roots do not verify (private per-project CA).
+
+### Connection pooler: CDC actually traverses it
+
+Vultr's managed pgbouncer pools listen on the **primary hostname at port + 1** with `dbname=<poolname>` (the API does not expose this — it is the platform convention). Unlike the Neon/Supavisor/RDS-Proxy pooler class, **replication connections pass through** (modern pgbouncer ≥ 1.24 forwards them 1:1 to the server): both bulk migrate (parallel, snapshot-pinned, no statement-cache trip) and slot-based CDC — slot creation, streaming, warm resume, clean stop — were validated end-to-end through a transaction-mode pool. This is the live counter-example that makes the pooler-strip claim provider-dependent. Prefer the direct port anyway: a pool sized N permanently holds N of the plan's small connection budget (22 on the cheapest plan). Note sluice's pooler-host WARN does not fire here (the pool hostname equals the primary's; only the port differs), which on Vultr is harmless — but it also means "no WARN" is not evidence of "not a pooler" on this provider.
+
+### Decommissioning
+
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL against the instance disk. (`pghoard_local` stays; see above.)
 
 ## Other managed services
 
@@ -659,7 +775,11 @@ of these and hit anything sluice-side, please open an issue.
 - **Aurora Postgres** — uses the vanilla `postgres` engine. Shares
   RDS for Postgres's role model and parameter-group settings
   (`rds.logical_replication=1`); see the validated RDS section above.
-- **Azure Database for MySQL / Postgres** — uses the vanilla engines.
+- **Aiven (MySQL / Postgres)** — uses the vanilla engines. DO and
+  Vultr are Aiven-derived, so expect the same shapes: on MySQL the
+  out-of-band binlog reaper (Aiven exposes the `binlog_retention_period`
+  config knob DO surfaces), on Postgres the `pghoard_local` platform
+  slot and CDC-ready defaults. Unprobed.
 
 The rule of thumb: anything advertising standard pgwire (Postgres)
 or standard MySQL-protocol (MySQL) wire compatibility should work.

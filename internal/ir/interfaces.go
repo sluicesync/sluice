@@ -1322,14 +1322,15 @@ type SourceHostAdvisory struct {
 //
 //   - The Postgres engine warns when the host matches a known
 //     connection-pooler pattern (Neon `-pooler`, Supabase Supavisor,
-//     pgbouncer): CDC/logical replication needs the direct endpoint,
-//     and long-lived snapshot transactions can exhaust the pool
-//     mid-copy.
-//   - The MySQL engine warns on DigitalOcean Managed MySQL hosts when
-//     cdc is true: the platform purges binlogs out-of-band ~13-16
+//     pgbouncer): most poolers strip the replication startup
+//     parameter (so CDC typically needs the direct endpoint), and
+//     long-lived snapshot transactions can exhaust the pool mid-copy.
+//   - The MySQL engine warns on DigitalOcean and Vultr Managed MySQL
+//     hosts when cdc is true: both platforms purge binlogs out-of-band
 //     minutes after creation regardless of what
 //     @@binlog_expire_logs_seconds reports, so the host pattern is
-//     the ONLY reliable preflight signal (the variable lies).
+//     the ONLY reliable preflight signal (the variable lies; Vultr
+//     additionally exposes no retention knob at all).
 //
 // cdc reports whether the run will anchor or consume a CDC position
 // (sync, backup full/incremental/stream) — advisories about
@@ -2380,6 +2381,12 @@ type SourceFingerprintRecorder interface {
 // spot slots about to be invalidated. ConfirmedFlushLSN is the slot's
 // last-acknowledged consume position, useful for spotting stalled or
 // abandoned slots whose consumer hasn't advanced.
+// PlatformNote, when non-empty, marks the slot as PLATFORM-INTERNAL —
+// a slot the managed provider itself owns (Neon's wal_proposer_slot,
+// the Aiven-lineage pghoard_local) — and carries the short provider
+// description for display. Enumeration surfaces label such slots
+// instead of leaving them to read as leaked consumers, and Drop
+// refuses them without --force.
 type SlotInfo struct {
 	Name              string
 	Plugin            string
@@ -2387,6 +2394,7 @@ type SlotInfo struct {
 	WALStatus         string
 	RestartLSN        string
 	ConfirmedFlushLSN string
+	PlatformNote      string
 }
 
 // SlotManager is the engine-neutral surface for managing logical-

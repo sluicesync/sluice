@@ -21,9 +21,15 @@ import (
 // 50k-row validation scale — but it carries two real hazards the
 // operator can't see from a green run:
 //
-//   - CDC/logical replication CANNOT run through it: the pooler strips
-//     `replication=database`, so `sync start` fails at slot creation
-//     (the coded refusal in pooler_detect.go).
+//   - CDC/logical replication usually cannot run through it: most
+//     poolers in transaction/statement mode strip the
+//     `replication=database` startup parameter (Supavisor does), so
+//     `sync start` fails at slot creation (the coded refusal in
+//     pooler_detect.go). This is provider-dependent, not universal —
+//     some session-mode/modern-pgbouncer setups forward replication
+//     connections 1:1 (pgbouncer >= 1.24; Vultr's managed pools carry
+//     CDC end-to-end, live-verified 2026-07-16) — which is why this
+//     stays a WARN and the refusal fires only on the observed strip.
 //   - sluice's parallel bulk copy pins N server connections inside
 //     long-lived snapshot transactions; at higher parallelism/scale
 //     that risks exhausting the pool mid-copy with a confusing
@@ -95,8 +101,8 @@ func (e Engine) SourceHostAdvisories(dsn string, cdc bool) []ir.SourceHostAdviso
 		}
 		msg := fmt.Sprintf(
 			"source host %q matches a known connection-pooler pattern (%s): "+
-				"CDC/logical replication cannot run through a pooler (it strips replication=database, "+
-				"so `sync start` fails at slot creation), and parallel bulk copy pins connections in "+
+				"most poolers strip replication=database, so CDC/logical replication typically fails at "+
+				"slot creation, and parallel bulk copy pins connections in "+
 				"long-lived snapshot transactions that can exhaust the pool mid-copy at scale "+
 				"(transaction-mode poolers also disable parallel copy via the statement-cache fallback) — "+
 				"prefer the provider's direct database endpoint",
@@ -105,9 +111,10 @@ func (e Engine) SourceHostAdvisories(dsn string, cdc bool) []ir.SourceHostAdviso
 		if cdc {
 			msg = fmt.Sprintf(
 				"source host %q matches a known connection-pooler pattern (%s): "+
-					"this run needs CDC/logical replication, which cannot run through a pooler "+
-					"(it strips replication=database, so slot creation will fail) — "+
-					"use the provider's direct database endpoint",
+					"this run needs CDC/logical replication, and most poolers strip the "+
+					"replication=database startup parameter (Supavisor and transaction-mode pgbouncer do, "+
+					"so slot creation will fail there; some session-mode/modern-pgbouncer setups forward it) — "+
+					"prefer the provider's direct database endpoint",
 				host, p.label,
 			)
 		}
