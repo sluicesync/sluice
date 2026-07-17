@@ -4,6 +4,27 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.264] - 2026-07-16
+
+The Google Cloud SQL validation batch — both engines live-probed 2026-07-16 (the full GCP set: GCS CAS, Cloud KMS signing, Cloud SQL MySQL + Postgres).
+
+### Added
+
+- **Google Cloud SQL for MySQL is now detected in-band on `sync`/backup runs** — Cloud SQL has no hostname to pattern-match (connections are bare IPs or a localhost proxy), so for IP-shaped source hosts sluice fingerprints via `@@version`'s `-google` suffix and verifies the honest `binlog_expire_logs_seconds` (Cloud SQL enforces a 1-day floor and no out-of-band reaper — the first probed platform where the variable tells the truth, so correctly configured sources stay silent). A CDC position lost to the point-in-time-recovery toggle now explains the binlog-numbering reset (a disable/enable round-trip destroys binlogs AND restarts numbering at 000001, permanently invalidating positions on both sides) and names auto-resnapshot as the correct recovery. Probe failures degrade to silence — deliberately asymmetric with the RDS advisory, where the platform default is unsafe.
+- **docs/managed-services.md gains live-validated Google Cloud SQL for MySQL and PostgreSQL sections** plus a three-provider managed-MySQL binlog-retention comparison table (DigitalOcean ~13–16 min API-only truth / RDS ~5–11 min SQL-visible truth / Cloud SQL honest 1-day floor); the stale claim that Cloud SQL "requires the cloud-sql-proxy" is corrected — direct public-IP connections were validated end to end. **ADR-0160's backend matrix is now fully real-cloud-verified** — GCS and Azure Blob both probed the same day as S3's earlier run (GCS serializes contention into uniform 412s; Azure's loser shape is 409 `BlobAlreadyExists`, which gocloud explicitly maps to the same conflict class; sluice's guard took the true CAS path with the coded refusal on all three). **Roadmap item 59 is CLOSED** — both `kms://` signer legs validated live: GCP (in-HSM ECDSA-P256, CRC32C wire handshake) and Azure Key Vault (all four key families including P-521's odd-halves DER conversion and RSA-PSS; the lowkey-vault OAuth blocker that stalled the item since v0.99.228 proved to be an emulator artifact — real Key Vault worked first-try).
+
+### Changed
+
+- The Postgres replication-capability refusal names Google Cloud SQL as a platform where recovery path (a) — `ALTER ROLE … WITH REPLICATION` — works verbatim as the default `postgres` user (validated live; the first managed provider where the default remedy text is literally correct).
+
+### Fixed
+
+- **`backup verify` no longer counts manifest/lineage signature failures against the chunk denominator** ("2 of 1 chunk(s) failed verification" on a wrong-key verify) — signature failures get their own summary line; exit codes and the Bug-185 coding contract are unchanged.
+
+### Compatibility
+
+- **No breaking changes.** One behavior note: CDC-anchoring runs whose MySQL source DSN is an IP literal or localhost now pay one short-lived (15s-bounded) fingerprint probe connection at start; named hosts are unaffected.
+
 ## [0.99.263] - 2026-07-16
 
 The confirming audit's M1 correctness batch and quality tail, plus the findings from the first AWS validation set (S3, RDS MySQL, RDS Postgres — all live-probed 2026-07-16).
