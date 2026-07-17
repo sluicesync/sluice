@@ -323,9 +323,23 @@ func runRelaxSkewSweepRun(t *testing.T, c *vitessReshardCluster, p sweepRunParam
 	}
 	defer func() { _ = cdcRdr.Close() }()
 
+	// Pure reader-field check (independent of shard discovery) — stays before
+	// StreamChanges.
 	if cdcRdr.relaxSkew != p.relax {
 		t.Fatalf("%s: reader.relaxSkew = %v; want %v (DSN param did not take effect)", label, cdcRdr.relaxSkew, p.relax)
 	}
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("%s: StreamChanges: %v", label, err)
+	}
+	time.Sleep(3 * time.Second) // register at "current"
+
+	// Shard auto-discovery is deferred to stream-open (product commit 8f82b30e
+	// moved it out of OpenCDCReader so reader construction stays
+	// connection-free), so cdcRdr.shards is empty until StreamChanges runs.
+	// Assert the discovered 2-shard layout and pin the MinimizeSkew request
+	// AFTER StreamChanges has populated r.shards.
 	if len(cdcRdr.shards) != 2 {
 		t.Fatalf("%s: reader discovered %d shards %v; want 2", label, len(cdcRdr.shards), cdcRdr.shards)
 	}
@@ -334,12 +348,6 @@ func runRelaxSkewSweepRun(t *testing.T, c *vitessReshardCluster, p sweepRunParam
 	} else if got := req.GetFlags().GetMinimizeSkew(); got != !p.relax {
 		t.Fatalf("%s: request MinimizeSkew = %v; want %v", label, got, !p.relax)
 	}
-
-	changes, err := rdr.StreamChanges(ctx, ir.Position{})
-	if err != nil {
-		t.Fatalf("%s: StreamChanges: %v", label, err)
-	}
-	time.Sleep(3 * time.Second) // register at "current"
 
 	// ---- collector (mutex-guarded; read after it exits) ----
 	type tlEntry struct {
