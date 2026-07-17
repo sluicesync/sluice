@@ -51,7 +51,41 @@ import (
 const (
 	mariadb114Image  = "mariadb:11.4"
 	mariadb1011Image = "mariadb:10.11"
+	// The two additional LTS lines added to the value-fidelity + CDC-
+	// forward-compat matrix (roadmap item 73 matrix expansion). Both are
+	// stable docker.io tags. 12.3 is the first MariaDB 12.x line in the
+	// matrix and exercises the SHOW MASTER STATUS → SHOW BINLOG STATUS
+	// rename forward-compat (masterStatusSpellings; ADR-0170): live probe
+	// 2026-07-17 confirmed 11.8.8 and 12.3.2 both accept SHOW MASTER
+	// STATUS *and* SHOW BINLOG STATUS and reject SHOW BINARY LOG STATUS
+	// (1064) — the reader's fallback lands on SHOW MASTER STATUS on both.
+	mariadb118Image = "mariadb:11.8"
+	mariadb123Image = "mariadb:12.3"
+
+	// mariadb131PreviewImage is the MariaDB 13.1 PREVIEW line. It is not a
+	// docker.io stable tag (docker.io only carries a 13.0.x RC channel);
+	// the Foundation publishes the preview to its quay.io devel channel.
+	// It is a MOVING tag, so it is only ever booted by the mariadbpreview-
+	// tagged informational leg (never the required shard) — see the
+	// TestMariaDB_Preview_* file. Live probe 2026-07-17: 13.1.0-MariaDB,
+	// uuid canonical big-endian + inet6 renderings identical to 10.11/11.4
+	// (byte-layout residual risk closed), and it additionally now ACCEPTS
+	// SHOW BINARY LOG STATUS (the MySQL-8.4 spelling), so the reader's
+	// fallback lands on that first entry there — still zero code change.
+	mariadb131PreviewImage = "quay.io/mariadb-foundation/mariadb-devel:13.1"
 )
+
+// mariadbLTSImages is the full supported-LTS spread the value-fidelity and
+// CDC-forward-compat pins run across: a per-line storage-layout change (the
+// uuid/inet native byte order — ADR-0171's stated residual risk) or a
+// binlog-protocol change (SHOW BINLOG STATUS spelling, error-1236 wording)
+// on any LTS line must fail one of these live pins, never corrupt silently.
+// The 13.1 preview line is deliberately NOT here — it is a moving quay.io
+// tag exercised only by the non-required mariadbpreview leg, so the required
+// engines-mysql shard never depends on it.
+func mariadbLTSImages() []string {
+	return []string{mariadb1011Image, mariadb114Image, mariadb118Image, mariadb123Image}
+}
 
 // sharedMariaDBState mirrors sharedMySQLState's lazily-booted shared-
 // container model, one instance per MariaDB image. Tests reset a
@@ -69,6 +103,13 @@ type sharedMariaDBState struct {
 var sharedMariaDBs = map[string]*sharedMariaDBState{
 	mariadb114Image:  {},
 	mariadb1011Image: {},
+	mariadb118Image:  {},
+	mariadb123Image:  {},
+	// The 13.1 preview line: registered so the mariadbpreview leg can boot
+	// it via the same shared-container helper. Only that non-required leg
+	// ever requests it (the required shard's tests loop mariadbLTSImages,
+	// which excludes it), so it stays un-booted on every required run.
+	mariadb131PreviewImage: {},
 }
 
 // terminateSharedMariaDBs is called from TestMain after the run.

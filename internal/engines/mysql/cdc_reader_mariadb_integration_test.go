@@ -50,121 +50,139 @@ import (
 // trailing-zero rows are the discriminating cases: the binlog delivers them
 // trailing-zero-STRIPPED, so a naive decode would land a short/empty value.
 func TestMariaDB_CDCReader_NativeUUIDInet_Decode(t *testing.T) {
-	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+	// The full LTS spread (10.11 + 11.4 + 11.8 + 12.3): this is the pin
+	// that closes ADR-0171's stated residual risk — a future-LTS uuid/inet
+	// storage byte-order or inet6-rendering change would fail
+	// assertNativeRowMatchesDriver / assertDriverInet6Renders here rather
+	// than corrupt silently. The 13.1 preview line is covered by the
+	// non-required TestMariaDB_Preview_NativeUUIDInet_Decode leg.
+	for _, image := range mariadbLTSImages() {
 		image := image
 		t.Run(image, func(t *testing.T) {
-			dsn := newMariaDB(t, image, "mdb_cdc_native")
-			execSQLScript(t, dsn, `
-				CREATE TABLE nat (
-					id  INT PRIMARY KEY,
-					u   UUID,
-					ip6 INET6,
-					ip4 INET4
-				) ENGINE=InnoDB;`)
-
-			eng := Engine{Flavor: FlavorMariaDB}
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
-
-			rdr, err := eng.OpenCDCReader(ctx, dsn)
-			if err != nil {
-				t.Fatalf("OpenCDCReader: %v", err)
-			}
-			defer func() {
-				if c, ok := rdr.(interface{ Close() error }); ok {
-					_ = c.Close()
-				}
-			}()
-			changes, err := rdr.StreamChanges(ctx, ir.Position{})
-			if err != nil {
-				t.Fatalf("StreamChanges: %v", err)
-			}
-			time.Sleep(300 * time.Millisecond)
-
-			// INSERT the family × shape matrix. Row 1 uses UPPERCASE input to
-			// pin lowercase-canonical normalization; every value is accepted
-			// by MariaDB's uuid variant validator. Rows 6-9 are the inet6
-			// shapes where mariadbInet6Text DELIBERATELY diverges from Go's
-			// net/netip (IPv4-compatible dotted ::1.2.3.4 / ::0.1.0.0, and the
-			// 7-word-run non-dotted ::100 / ::ffff): the live-server SELECT is
-			// the oracle for those, so this pins the renderer against MariaDB
-			// on exactly the shapes where it must differ from the stdlib.
-			applyMySQL(t, dsn, `
-				INSERT INTO nat (id, u, ip6, ip4) VALUES
-					(1, '01234567-89AB-CDEF-8123-456789ABCDEF', '2001:db8::1',     '192.168.1.10'),
-					(2, '00000000-0000-0000-0000-000000000000', '::',             '0.0.0.0'),
-					(3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '::ffff:1.2.3.4',  '255.255.255.255'),
-					(4, '01234567-89ab-cdef-8100-000000000000', '2001:db8::',      '10.0.0.0'),
-					(5, NULL, NULL, NULL),
-					(6, '10000000-0000-4000-8000-000000000006', '::1.2.3.4',       '1.2.3.4'),
-					(7, '20000000-0000-4000-8000-000000000007', '::0.1.0.0',       '5.6.7.8'),
-					(8, '30000000-0000-4000-8000-000000000008', '::100',           '9.10.11.12'),
-					(9, '40000000-0000-4000-8000-000000000009', '::ffff',          '13.14.15.16');`)
-
-			inserts := drainChanges(t, ctx, changes, 9, 30*time.Second)
-			if len(inserts) != 9 {
-				if streamErr := rdr.(*CDCReader).Err(); streamErr != nil {
-					t.Fatalf("got %d inserts; want 9 (stream error: %v)", len(inserts), streamErr)
-				}
-				t.Fatalf("got %d inserts; want 9", len(inserts))
-			}
-			for _, ch := range inserts {
-				ins, ok := ch.(ir.Insert)
-				if !ok {
-					t.Fatalf("change = %T; want ir.Insert", ch)
-				}
-				id, _ := ins.Row["id"].(int64)
-				assertNativeRowMatchesDriver(t, dsn, int(id), ins.Row)
-			}
-
-			// Reviewer-corollary pin (Bug-74): for the netip-divergent inet6
-			// shapes, ALSO assert the live-server SELECT renders EXACTLY the
-			// canonical text this codec targets — so a wrong renderer can't
-			// hide behind "CDC == driver" when both are wrong. If MariaDB
-			// disagrees with any expectation here, that is a real finding
-			// (the codec, not the pin, must change).
-			assertDriverInet6Renders(t, dsn, map[int]string{
-				6: "::1.2.3.4", // best-run len 6 → dotted; DIVERGES from netip (::102:304)
-				7: "::0.1.0.0", // best-run len 6 → dotted; DIVERGES from netip (::1:0)
-				8: "::100",     // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.1.0)
-				9: "::ffff",    // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.255.255)
-			})
-
-			// UPDATE arm: mutate row 4 to fresh shapes — the before-image AND
-			// after-image both carry native columns, so both decode paths are
-			// exercised. The after-image must match the driver's post-update
-			// SELECT.
-			applyMySQL(t, dsn, `UPDATE nat SET u = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', ip6 = '::1', ip4 = '172.16.0.255' WHERE id = 4`)
-			upd := drainChanges(t, ctx, changes, 1, 30*time.Second)
-			if len(upd) != 1 {
-				t.Fatalf("got %d updates; want 1", len(upd))
-			}
-			u, ok := upd[0].(ir.Update)
-			if !ok {
-				t.Fatalf("change = %T; want ir.Update", upd[0])
-			}
-			assertNativeRowMatchesDriver(t, dsn, 4, u.After)
-
-			// DELETE arm: row 3's before-image carries the native columns.
-			applyMySQL(t, dsn, `DELETE FROM nat WHERE id = 3`)
-			del := drainChanges(t, ctx, changes, 1, 30*time.Second)
-			if len(del) != 1 {
-				t.Fatalf("got %d deletes; want 1", len(del))
-			}
-			d, ok := del[0].(ir.Delete)
-			if !ok {
-				t.Fatalf("change = %T; want ir.Delete", del[0])
-			}
-			// The DELETE before-image is PK-narrowed (Bug 88); assert whatever
-			// native columns it carries decode to a valid non-corrupt text.
-			for _, col := range []string{"u", "ip6", "ip4"} {
-				if v, present := d.Before[col]; present && v != nil {
-					if _, isStr := v.(string); !isStr {
-						t.Errorf("delete before-image %s = %#v; want a decoded string", col, v)
-					}
-				}
-			}
+			assertMariaDBNativeDecodeConverges(t, image)
 		})
+	}
+}
+
+// assertMariaDBNativeDecodeConverges is the per-image body of the native
+// uuid/inet CDC value-fidelity pin, factored out so the required LTS matrix
+// (TestMariaDB_CDCReader_NativeUUIDInet_Decode) and the non-required 13.1
+// preview leg (TestMariaDB_Preview_NativeUUIDInet_Decode) exercise the EXACT
+// same family × shape × DML matrix against the same live oracle — a
+// byte-layout change on any line, LTS or preview, trips one assertion here
+// rather than diverging silently.
+func assertMariaDBNativeDecodeConverges(t *testing.T, image string) {
+	t.Helper()
+	dsn := newMariaDB(t, image, "mdb_cdc_native")
+	execSQLScript(t, dsn, `
+		CREATE TABLE nat (
+			id  INT PRIMARY KEY,
+			u   UUID,
+			ip6 INET6,
+			ip4 INET4
+		) ENGINE=InnoDB;`)
+
+	eng := Engine{Flavor: FlavorMariaDB}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// INSERT the family × shape matrix. Row 1 uses UPPERCASE input to
+	// pin lowercase-canonical normalization; every value is accepted
+	// by MariaDB's uuid variant validator. Rows 6-9 are the inet6
+	// shapes where mariadbInet6Text DELIBERATELY diverges from Go's
+	// net/netip (IPv4-compatible dotted ::1.2.3.4 / ::0.1.0.0, and the
+	// 7-word-run non-dotted ::100 / ::ffff): the live-server SELECT is
+	// the oracle for those, so this pins the renderer against MariaDB
+	// on exactly the shapes where it must differ from the stdlib.
+	applyMySQL(t, dsn, `
+		INSERT INTO nat (id, u, ip6, ip4) VALUES
+			(1, '01234567-89AB-CDEF-8123-456789ABCDEF', '2001:db8::1',     '192.168.1.10'),
+			(2, '00000000-0000-0000-0000-000000000000', '::',             '0.0.0.0'),
+			(3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '::ffff:1.2.3.4',  '255.255.255.255'),
+			(4, '01234567-89ab-cdef-8100-000000000000', '2001:db8::',      '10.0.0.0'),
+			(5, NULL, NULL, NULL),
+			(6, '10000000-0000-4000-8000-000000000006', '::1.2.3.4',       '1.2.3.4'),
+			(7, '20000000-0000-4000-8000-000000000007', '::0.1.0.0',       '5.6.7.8'),
+			(8, '30000000-0000-4000-8000-000000000008', '::100',           '9.10.11.12'),
+			(9, '40000000-0000-4000-8000-000000000009', '::ffff',          '13.14.15.16');`)
+
+	inserts := drainChanges(t, ctx, changes, 9, 30*time.Second)
+	if len(inserts) != 9 {
+		if streamErr := rdr.(*CDCReader).Err(); streamErr != nil {
+			t.Fatalf("got %d inserts; want 9 (stream error: %v)", len(inserts), streamErr)
+		}
+		t.Fatalf("got %d inserts; want 9", len(inserts))
+	}
+	for _, ch := range inserts {
+		ins, ok := ch.(ir.Insert)
+		if !ok {
+			t.Fatalf("change = %T; want ir.Insert", ch)
+		}
+		id, _ := ins.Row["id"].(int64)
+		assertNativeRowMatchesDriver(t, dsn, int(id), ins.Row)
+	}
+
+	// Reviewer-corollary pin (Bug-74): for the netip-divergent inet6
+	// shapes, ALSO assert the live-server SELECT renders EXACTLY the
+	// canonical text this codec targets — so a wrong renderer can't
+	// hide behind "CDC == driver" when both are wrong. If MariaDB
+	// disagrees with any expectation here, that is a real finding
+	// (the codec, not the pin, must change).
+	assertDriverInet6Renders(t, dsn, map[int]string{
+		6: "::1.2.3.4", // best-run len 6 → dotted; DIVERGES from netip (::102:304)
+		7: "::0.1.0.0", // best-run len 6 → dotted; DIVERGES from netip (::1:0)
+		8: "::100",     // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.1.0)
+		9: "::ffff",    // 7-word run → NOT dotted; DIVERGES from BIND9 (which would render ::0.0.255.255)
+	})
+
+	// UPDATE arm: mutate row 4 to fresh shapes — the before-image AND
+	// after-image both carry native columns, so both decode paths are
+	// exercised. The after-image must match the driver's post-update
+	// SELECT.
+	applyMySQL(t, dsn, `UPDATE nat SET u = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', ip6 = '::1', ip4 = '172.16.0.255' WHERE id = 4`)
+	upd := drainChanges(t, ctx, changes, 1, 30*time.Second)
+	if len(upd) != 1 {
+		t.Fatalf("got %d updates; want 1", len(upd))
+	}
+	u, ok := upd[0].(ir.Update)
+	if !ok {
+		t.Fatalf("change = %T; want ir.Update", upd[0])
+	}
+	assertNativeRowMatchesDriver(t, dsn, 4, u.After)
+
+	// DELETE arm: row 3's before-image carries the native columns.
+	applyMySQL(t, dsn, `DELETE FROM nat WHERE id = 3`)
+	del := drainChanges(t, ctx, changes, 1, 30*time.Second)
+	if len(del) != 1 {
+		t.Fatalf("got %d deletes; want 1", len(del))
+	}
+	d, ok := del[0].(ir.Delete)
+	if !ok {
+		t.Fatalf("change = %T; want ir.Delete", del[0])
+	}
+	// The DELETE before-image is PK-narrowed (Bug 88); assert whatever
+	// native columns it carries decode to a valid non-corrupt text.
+	for _, col := range []string{"u", "ip6", "ip4"} {
+		if v, present := d.Before[col]; present && v != nil {
+			if _, isStr := v.(string); !isStr {
+				t.Errorf("delete before-image %s = %#v; want a decoded string", col, v)
+			}
+		}
 	}
 }
 
@@ -242,7 +260,11 @@ func assertDriverInet6Renders(t *testing.T, dsn string, want map[int]string) {
 // position and assert the while-down change arrives exactly once (and the
 // already-consumed change does NOT replay).
 func TestMariaDB_CDCReader_ResumeAfterKill(t *testing.T) {
-	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+	// Across the full LTS spread: each line proves a live cold-start →
+	// domain-GTID capture → warm-resume exactly-once cycle, so the 12.x
+	// SHOW-MASTER/BINLOG-STATUS forward-compat and the MariadbGTIDEvent
+	// pump are validated on every supported line, not just 10.11/11.4.
+	for _, image := range mariadbLTSImages() {
 		image := image
 		t.Run(image, func(t *testing.T) {
 			dsn := newMariaDB(t, image, "mdb_cdc_resume")
@@ -332,7 +354,7 @@ func TestMariaDB_CDCReader_ResumeAfterKill(t *testing.T) {
 // schema cache ZERO times; a real ALTER mid-stream DOES clear it exactly
 // once, and its new column is decoded on the next row.
 func TestMariaDB_CDCReader_SchemaCacheChurn(t *testing.T) {
-	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+	for _, image := range mariadbLTSImages() {
 		image := image
 		t.Run(image, func(t *testing.T) {
 			dsn := newMariaDB(t, image, "mdb_cdc_churn")
@@ -421,7 +443,15 @@ func TestMariaDB_CDCReader_SchemaCacheChurn(t *testing.T) {
 // start-from-wrong-position. Uses a DEDICATED container because PURGE
 // BINARY LOGS mutates global binlog state.
 func TestMariaDB_CDCReader_PurgedPosition_LoudRefusal(t *testing.T) {
-	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+	// Reachability subset, NOT the full LTS spread: this test boots a
+	// DEDICATED container per image (PURGE BINARY LOGS mutates global
+	// binlog state), so each added line costs a full cold boot. 12.3 is
+	// included so the error-1236 "could not find gtid state requested"
+	// classification (isMariaDBPurgedGTIDError — a silent-wrong-position
+	// guard, so worth the extra boot) is confirmed on a MariaDB 12.x line;
+	// 11.8 is omitted (11.4 covers the 11.x reachability shape) to bound
+	// CI minutes.
+	for _, image := range []string{mariadb1011Image, mariadb114Image, mariadb123Image} {
 		image := image
 		t.Run(image, func(t *testing.T) {
 			dsn, cleanup := newMariaDBDedicatedForCDC(t, image)

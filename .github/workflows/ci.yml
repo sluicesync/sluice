@@ -383,6 +383,25 @@ jobs:
             mariadb:11.4 \
             mariadb:10.11
 
+      # The additional MariaDB LTS lines (roadmap item 73 matrix expansion:
+      # 11.8 + 12.3) the native uuid/inet value-fidelity + CDC-forward-compat
+      # pins boot. Separate step, scoped to the engines-mysql shard (the only
+      # shard whose tests loop mariadbLTSImages over these — the
+      # pipeline-rest-streamer MariaDB pin uses stock 11.4), so the other
+      # shards don't pull images they never boot. Same GHCR-mirror + docker.io
+      # fallback as above. (The 10.11 + 11.4 floor lines are pre-pulled by the
+      # concurrent audit batch's addition to the call above; the 13.1 preview
+      # line is quay.io-only and handled by its own continue-on-error job.)
+      - name: Pre-pull MariaDB 11.8 / 12.3 via their GHCR mirrors (docker.io fallback)
+        if: matrix.shard.name == 'engines-mysql'
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-mirror-pull.sh \
+            mariadb:11.8 \
+            mariadb:12.3
+
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
       # would defeat the point). -race catches data-race bugs in the
@@ -575,6 +594,55 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci-mirror-pull.sh vitess/vttestserver:mysql80
       - run: go test -tags="integration vstream" -race -count=1 -timeout=30m -run 'TestVStream_' ./internal/engines/mysql/...
+
+  # ----- Integration (MariaDB preview) -----
+  # INFORMATIONAL, NON-REQUIRED canary (roadmap item 73 matrix expansion):
+  # re-runs the native uuid/inet CDC value-fidelity ground-truth
+  # (TestMariaDB_Preview_*, mariadbpreview build tag) against the NEXT,
+  # unreleased MariaDB line so a future-LTS storage-byte-order or binlog-
+  # protocol change is caught while it is still a preview — the exact ADR-0171
+  # residual-risk closer, extended one line ahead of GA.
+  #
+  # `continue-on-error: true` makes this leg NON-blocking: the preview image
+  # is a MOVING quay.io devel tag (quay.io/mariadb-foundation/mariadb-devel:13.1,
+  # which docker.io does not carry as a stable tag), so a quay outage or a
+  # preview-image regression must show as a red canary, never a wedged merge.
+  # It is deliberately NOT in branch protection's required-checks list.
+  #
+  # CI-minutes tradeoff: this adds ONE extra ubuntu-latest job per PR that
+  # boots a single MariaDB container (~30-60s) and runs one test under -race
+  # (~1-2 min total). Cheap relative to the silent-corruption class it guards;
+  # if the preview cadence makes it noisy it can be moved to extended-suites.yml
+  # (weekly + dispatch) without changing the test.
+  integration-mariadb-preview:
+    name: Integration (MariaDB preview)
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Non-blocking — see the job comment. A red run here files a signal, it
+    # never gates a merge.
+    continue-on-error: true
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+      # The preview image lives on quay.io (no GHCR mirror — it is a moving
+      # devel tag, and mirroring it would fight the moving-target semantics).
+      # Pull it directly with a small bounded retry so a transient quay blip
+      # doesn't red the leg on the first attempt; same shape as the localstack
+      # pull in extended-suites.yml. Keep the tag in sync with
+      # mariadb131PreviewImage in the engines-mysql package.
+      - name: Pre-pull the MariaDB preview image (bounded retry)
+        run: |
+          for i in 1 2 3; do
+            docker pull quay.io/mariadb-foundation/mariadb-devel:13.1 && break
+            echo "pull attempt $i failed; retrying in $((i * 10))s"
+            sleep $((i * 10))
+          done
+      - run: go test -tags="integration mariadbpreview" -race -count=1 -timeout=15m -run '^TestMariaDB_Preview_' ./internal/engines/mysql/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the

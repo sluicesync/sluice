@@ -345,6 +345,12 @@ func TestParseMariaDBVersion(t *testing.T) {
 	}{
 		{"11.4.12-MariaDB-ubu2404", 11, 4, true},
 		{"10.11.18-MariaDB-ubu2204-log", 10, 11, true},
+		// The matrix-expansion LTS lines + the 13.1 preview (roadmap item
+		// 73), version strings captured from the live 2026-07-17 probe —
+		// each is >= the 10.11 floor so checkServerFlavor never WARNs.
+		{"11.8.8-MariaDB-ubu2404-log", 11, 8, true},
+		{"12.3.2-MariaDB-ubu2404-log", 12, 3, true},
+		{"13.1.0-MariaDB-ubu2604-log", 13, 1, true},
 		{"5.5.5-10.6.7-MariaDB", 10, 6, true},
 		{"8.4.10", 0, 0, false},
 		{"8.0.46-0ubuntu0.22.04.1", 0, 0, false},

@@ -37,6 +37,12 @@
 #                      override it per-run)
 #   - ddlfixture     → extended-suites.yml `ddlfixture` (dispatch-only)
 #   - kmsverify      → extended-suites.yml `kmsverify` (localstack KMS)
+#   - mariadbpreview → ci.yml `integration-mariadb-preview` (INFORMATIONAL,
+#                      continue-on-error; the MariaDB 13.1 preview-line
+#                      native-uuid/inet canary — roadmap item 73 matrix
+#                      expansion. Non-required, but still guarded so a
+#                      TestMariaDB_Preview_* test can't escape the -run
+#                      filter and run nowhere)
 #   - psverify       → psverify.yml (dispatch-only, real PlanetScale;
 #                      the 2026-07-16 audit scoped its run to
 #                      `-run '^TestPS'` over four package scopes, which
@@ -56,6 +62,7 @@ vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
 kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
+mariadbpreview;^TestMariaDB_Preview_;internal/engines/mysql/...;ci.yml integration-mariadb-preview
 psverify;^TestPS;internal/planetscale/... internal/engines/mysql internal/engines/postgres internal/pipeline;psverify.yml psverify
 '
 

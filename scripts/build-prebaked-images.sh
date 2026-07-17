@@ -530,6 +530,15 @@ mirror_stock_refs() {
     echo "mariadb:11.4"
     echo "mariadb:10.11"
     echo "vitess/vttestserver:mysql80"
+    # Additional MariaDB LTS lines the item-73 value-fidelity + CDC pins
+    # boot in the engines-mysql required shard (roadmap item 73 matrix
+    # expansion). Mirrored so a docker.io blip cannot cold-pull-flake that
+    # required shard. (The 10.11 + 11.4 floor lines are mirrored alongside
+    # mysql:8.0 by the concurrent audit batch; the 13.1 PREVIEW line is NOT
+    # mirrored — it lives on quay.io, not docker.io, and its leg is
+    # non-required continue-on-error.)
+    echo "mariadb:11.8"
+    echo "mariadb:12.3"
 }
 
 # bake_mirrors MIRRORS each stock ref to GHCR. Pure retag, never a build —

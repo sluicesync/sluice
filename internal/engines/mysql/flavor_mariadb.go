@@ -290,7 +290,13 @@ func (f Flavor) crossFlavorCollationRemap() map[string]string {
 
 // mariadbVersionFloorMajor/Minor is the supported MariaDB floor:
 // 10.11 LTS. Below it the schema reader WARNs (older MariaDB may work
-// but is unpinned — the integration matrix runs 10.11 and 11.4).
+// but is unpinned). The catalog/defaults conventions in this file are
+// pinned on 10.11 + 11.4 (the live defaults-parity matrix); the CDC
+// value-fidelity + binlog-protocol pins run the wider LTS spread
+// 10.11 / 11.4 / 11.8 / 12.3 (roadmap item 73 matrix expansion — the
+// native uuid/inet byte layout re-ground-truthed identical across all
+// four, plus a non-required 13.1 preview canary), which is why 12.x's
+// SHOW MASTER STATUS → SHOW BINLOG STATUS rename is exercised live.
 const (
 	mariadbVersionFloorMajor = 10
 	mariadbVersionFloorMinor = 11
