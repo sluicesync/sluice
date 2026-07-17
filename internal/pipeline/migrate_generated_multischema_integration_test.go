@@ -26,6 +26,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -182,5 +183,32 @@ func assertQualifiedInvoiceTotals(t *testing.T, ctx context.Context, db *sql.DB,
 		if diff := got[i] - want[i]; diff < -eps || diff > eps {
 			t.Errorf("row %d: total = %v; want %v", i, got[i], want[i])
 		}
+	}
+}
+
+// applyPGDDLInSchema creates `schema` and applies the DDL into it by
+// prefixing a `SET search_path` so unqualified CREATE TABLEs land in the
+// target namespace (the DDL is not schema-qualified). One autocommit
+// batch, same connection, so the SET sticks. (Relocated here from the
+// retired real-world-corpus congruence oracle, which was its original
+// home; this multischema test is now its sole caller.)
+func applyPGDDLInSchema(t *testing.T, dsn, schema, ddl string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+schema); err != nil {
+		t.Fatalf("create schema %q: %v", schema, err)
+	}
+	// search_path = <schema>,public so the DDL's unqualified CREATE
+	// TABLEs land in <schema> while still resolving pg_catalog /
+	// public-resident helpers if any are referenced.
+	script := fmt.Sprintf("SET search_path TO %s, public;\n", schema) + ddl
+	if _, err := db.ExecContext(ctx, script); err != nil {
+		t.Fatalf("apply PG DDL into schema %q: %v", schema, err)
 	}
 }

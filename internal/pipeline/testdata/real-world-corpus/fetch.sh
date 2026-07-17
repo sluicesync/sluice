@@ -5,11 +5,43 @@
 #
 # The fetched *.sql + FETCHED.txt are gitignored; this script and
 # MANIFEST.md are the only tracked files in this dir. Re-run any time
-# to refresh; outputs are deterministic given upstream state.
+# to refresh; outputs are DETERMINISTIC because every source is fetched
+# by a PINNED upstream commit SHA (see the PINS block below), not a
+# moving ref (master/trunk/main/5.4-dev).
+#
+# WHY PINNED (the drift trap): the congruence oracle
+# (migrate_realworld_corpus_congruence_integration_test.go) compares
+# sluice's cross-engine emit against these fetched authored pairs and
+# tolerates a hand-maintained benign allowlist. Fetching from moving
+# refs meant every upstream schema edit silently invalidated the
+# allowlist and turned the corpus leg red on drift that has nothing to
+# do with sluice. Pinning freezes the corpus so the allowlist stays
+# valid until a DELIBERATE bump.
+#
+# TO BUMP (intentional, reviewed): run `./fetch.sh --resolve-latest` to
+# print each repo's current upstream HEAD SHA, update the one line in
+# the PINS block below, re-run `./fetch.sh`, then refresh the congruence
+# allowlist/characterizations against the new schemas in the SAME PR.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
+
+# ---------------------------------------------------------------------
+# PINS — the committed pin manifest (single source of truth). Each line
+# is one repo's frozen upstream commit SHA. Bumping any source is a
+# one-line change here (+ an allowlist refresh in the same PR). Resolve
+# fresh SHAs with `./fetch.sh --resolve-latest`.
+#
+#   repo@ref (at pin time)                        pinned commit
+CHINOOK_SHA=7f67772503d71ba90f19283c38e93923addb43fa   # lerocha/chinook-database@master
+MEDIAWIKI_SHA=c3c99d51534f59511e5497f4593b21e6ce45183b # wikimedia/mediawiki@master
+TESTDB_SHA=e324b56193ca506ab7cc1ab143a9153d8c4535d7    # datacharmer/test_db@master
+JOOMLA_SHA=32122f5d747dcf485e6c4e944a426f18b44e1fc9    # joomla/joomla-cms@5.4-dev
+WORDPRESS_SHA=ace9192af868524bdc49cf4fcb91f4c12c73ee5f # WordPress/wordpress-develop@trunk
+VITESS_SHA=704634c7eeb1bb92bcb6d25d04ccf89e8f258b2f    # vitessio/vitess@main
+GITLAB_SHA=19eed6d0c7c1d36797308ca3d0f4c1d34f4cafb1    # gitlab-org/gitlab@master (gitlab.com)
+# ---------------------------------------------------------------------
 
 # curl resolution: PATH first (Win10+ has curl.exe), then the bundled
 # Rancher Desktop curl (often not on PATH).
@@ -21,6 +53,35 @@ else
   echo "fetch.sh: no curl on PATH and no Rancher curl found" >&2
   exit 1
 fi
+
+# --resolve-latest: best-effort helper for the deliberate-bump workflow.
+# Prints each repo's CURRENT upstream HEAD SHA so an operator can copy
+# the new value into the PINS block above. Never fails (|| true on every
+# probe) — it is a convenience, not part of the deterministic fetch.
+if [ "${1:-}" = "--resolve-latest" ]; then
+  gh_head() { # owner/repo ref
+    "$CURL" -fsSL -m 30 "https://api.github.com/repos/$1/commits/$2" 2>/dev/null \
+      | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true
+  }
+  gl_head() { # project-path-encoded ref
+    "$CURL" -fsSL -m 30 \
+      "https://gitlab.com/api/v4/projects/$1/repository/commits?ref_name=$2&per_page=1" 2>/dev/null \
+      | grep -o '"id":"[0-9a-f]*"' | head -1 | sed 's/.*"id":"\([0-9a-f]*\)".*/\1/' || true
+  }
+  echo "current upstream HEADs (copy into the PINS block, then re-run fetch.sh):"
+  printf '  CHINOOK_SHA=%s\n'   "$(gh_head lerocha/chinook-database master)"
+  printf '  MEDIAWIKI_SHA=%s\n' "$(gh_head wikimedia/mediawiki master)"
+  printf '  TESTDB_SHA=%s\n'    "$(gh_head datacharmer/test_db master)"
+  printf '  JOOMLA_SHA=%s\n'    "$(gh_head joomla/joomla-cms 5.4-dev)"
+  printf '  WORDPRESS_SHA=%s\n' "$(gh_head WordPress/wordpress-develop trunk)"
+  printf '  VITESS_SHA=%s\n'    "$(gh_head vitessio/vitess main)"
+  printf '  GITLAB_SHA=%s\n'    "$(gl_head gitlab-org%2Fgitlab master)"
+  exit 0
+fi
+
+# Raw-file base URLs, pinned by SHA.
+GH_RAW=https://raw.githubusercontent.com
+GL_RAW=https://gitlab.com/gitlab-org/gitlab/-/raw
 
 get() { # url outfile
   echo "  fetch $2"
@@ -113,40 +174,38 @@ extract_wp_schema() { # infile outfile
   fi
 }
 
-# best-effort upstream-ref capture (never fails the fetch)
-gh_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/lerocha/chinook-database/commits/master" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-gl_sha=$("$CURL" -fsSL -m 30 \
-  "https://gitlab.com/api/v4/projects/gitlab-org%2Fgitlab/repository/commits?path=db/structure.sql&per_page=1" 2>/dev/null \
-  | grep -o '"id":"[0-9a-f]*"' | head -1 | sed 's/.*"id":"\([0-9a-f]*\)".*/\1/' || true)
+echo "real-world-corpus fetch (pinned):"
 
-echo "real-world-corpus fetch:"
-
-get "https://gitlab.com/gitlab-org/gitlab/-/raw/master/db/structure.sql" \
+get "$GL_RAW/$GITLAB_SHA/db/structure.sql" \
     "gitlab_structure.pg.sql"   # schema-only by design
 
-get "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_MySql.sql" \
+get "$GH_RAW/lerocha/chinook-database/$CHINOOK_SHA/ChinookDatabase/DataSources/Chinook_MySql.sql" \
     ".chinook_mysql.raw"
 strip_data ".chinook_mysql.raw" "chinook_mysql.ddl.sql"; rm -f ".chinook_mysql.raw"
 
-get "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_PostgreSql.sql" \
+get "$GH_RAW/lerocha/chinook-database/$CHINOOK_SHA/ChinookDatabase/DataSources/Chinook_PostgreSql.sql" \
     ".chinook_postgres.raw"
 strip_data ".chinook_postgres.raw" "chinook_postgres.ddl.sql"; rm -f ".chinook_postgres.raw"
 
 # --- iteration 2 ---
 # MediaWiki tables-generated.sql: both dialects generated from ONE
-# abstract schema (sql/tables.json) → a guaranteed-equivalent matched
-# cross-engine ORACLE. Schema-only by design.
-get "https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/mysql/tables-generated.sql" \
+# abstract schema (sql/tables.json). NOTE: "generated from one source"
+# does NOT make the two files column-for-column congruent — MediaWiki's
+# PG adapter renders the abstract `binary`/`blob` types as TEXT and the
+# MW-timestamp type as TIMESTAMPTZ, while the MySQL side uses
+# VARBINARY(n). sluice faithfully carries MySQL VARBINARY -> PG bytea,
+# so those columns DIVERGE from the authored PG side by upstream design,
+# not by a sluice defect (see the congruence test's classification).
+# Schema-only by design.
+get "$GH_RAW/wikimedia/mediawiki/$MEDIAWIKI_SHA/sql/mysql/tables-generated.sql" \
     "mediawiki_mysql.ddl.sql"
-get "https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/postgres/tables-generated.sql" \
+get "$GH_RAW/wikimedia/mediawiki/$MEDIAWIKI_SHA/sql/postgres/tables-generated.sql" \
     "mediawiki_postgres.ddl.sql"
 
 # datacharmer test_db employees (partitioned): real MySQL with
 # PARTITION BY (a feature Chinook lacks). Sources its data from .dump
 # files (stripped: the "source ...;" directives are dropped).
-get "https://raw.githubusercontent.com/datacharmer/test_db/master/employees_partitioned.sql" \
+get "$GH_RAW/datacharmer/test_db/$TESTDB_SHA/employees_partitioned.sql" \
     ".employees.raw"
 strip_data ".employees.raw" "employees_mysql_partitioned.ddl.sql"; rm -f ".employees.raw"
 
@@ -155,16 +214,16 @@ strip_data ".employees.raw" "employees_mysql_partitioned.ddl.sql"; rm -f ".emplo
 # cross-engine pair (independently authored per dialect, like Chinook;
 # not generated-from-one-source like MediaWiki). base.sql = core
 # schema (+ seed INSERTs, stripped). joomla-cms default branch 5.4-dev.
-get "https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/mysql/base.sql" \
+get "$GH_RAW/joomla/joomla-cms/$JOOMLA_SHA/installation/sql/mysql/base.sql" \
     ".joomla_mysql.raw"
 strip_data ".joomla_mysql.raw" "joomla_mysql.ddl.sql"; rm -f ".joomla_mysql.raw"
-get "https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/postgresql/base.sql" \
+get "$GH_RAW/joomla/joomla-cms/$JOOMLA_SHA/installation/sql/postgresql/base.sql" \
     ".joomla_postgres.raw"
 strip_data ".joomla_postgres.raw" "joomla_postgres.ddl.sql"; rm -f ".joomla_postgres.raw"
 
 # WordPress core schema is PHP (wp_get_db_schema()); extract the
 # CREATE TABLEs to plain MySQL DDL. Canonical operator-brought MySQL.
-get "https://raw.githubusercontent.com/WordPress/wordpress-develop/trunk/src/wp-admin/includes/schema.php" \
+get "$GH_RAW/WordPress/wordpress-develop/$WORDPRESS_SHA/src/wp-admin/includes/schema.php" \
     ".wordpress.raw"
 extract_wp_schema ".wordpress.raw" "wordpress_mysql.ddl.sql"; rm -f ".wordpress.raw"
 
@@ -179,7 +238,7 @@ extract_wp_schema ".wordpress.raw" "wordpress_mysql.ddl.sql"; rm -f ".wordpress.
 # strip is a no-op safety pass + drops any `USE`/`source` if present).
 # NOTE: upstream relocated this from examples/local → examples/common
 # (2026-07); the old path 404s. Keep on examples/common.
-get "https://raw.githubusercontent.com/vitessio/vitess/main/examples/common/create_commerce_schema.sql" \
+get "$GH_RAW/vitessio/vitess/$VITESS_SHA/examples/common/create_commerce_schema.sql" \
     ".vitess_commerce.raw"
 strip_data ".vitess_commerce.raw" "vitess_commerce_mysql.ddl.sql"; rm -f ".vitess_commerce.raw"
 
@@ -191,31 +250,16 @@ strip_data ".vitess_commerce.raw" "vitess_commerce_mysql.ddl.sql"; rm -f ".vites
 # the alternative (pgloader's cast ruleset is a translator-catalog
 # reference, not a corpus).
 
-mw_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/wikimedia/mediawiki/commits/master" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-emp_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/datacharmer/test_db/commits/master" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-jm_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/joomla/joomla-cms/commits/5.4-dev" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-wp_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/WordPress/wordpress-develop/commits/trunk" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-vt_sha=$("$CURL" -fsSL -m 30 \
-  "https://api.github.com/repos/vitessio/vitess/commits/main" 2>/dev/null \
-  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
-
 {
   echo "fetched_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "gitlab_structure.pg.sql           <- gitlab-org/gitlab@master  commit=${gl_sha:-unresolved}"
-  echo "chinook_*.ddl.sql                 <- lerocha/chinook-database@master  commit=${gh_sha:-unresolved}  (data stripped)"
-  echo "mediawiki_*.ddl.sql               <- wikimedia/mediawiki@master  commit=${mw_sha:-unresolved}  (schema-only upstream)"
-  echo "employees_mysql_partitioned.ddl.sql <- datacharmer/test_db@master  commit=${emp_sha:-unresolved}  (source-directives stripped)"
-  echo "joomla_*.ddl.sql                  <- joomla/joomla-cms@5.4-dev  commit=${jm_sha:-unresolved}  (seed data stripped)"
-  echo "wordpress_mysql.ddl.sql           <- WordPress/wordpress-develop@trunk  commit=${wp_sha:-unresolved}  (extracted from PHP wp_get_db_schema())"
-  echo "vitess_commerce_mysql.ddl.sql     <- vitessio/vitess@main  commit=${vt_sha:-unresolved}  (examples/common commerce keyspace; data-strip pass)"
+  echo "# All sources fetched by PINNED commit SHA (see the PINS block in fetch.sh)."
+  echo "gitlab_structure.pg.sql             <- gitlab-org/gitlab@$GITLAB_SHA  (schema-only by design)"
+  echo "chinook_*.ddl.sql                   <- lerocha/chinook-database@$CHINOOK_SHA  (data stripped)"
+  echo "mediawiki_*.ddl.sql                 <- wikimedia/mediawiki@$MEDIAWIKI_SHA  (schema-only upstream)"
+  echo "employees_mysql_partitioned.ddl.sql <- datacharmer/test_db@$TESTDB_SHA  (source-directives stripped)"
+  echo "joomla_*.ddl.sql                    <- joomla/joomla-cms@$JOOMLA_SHA  (seed data stripped)"
+  echo "wordpress_mysql.ddl.sql             <- WordPress/wordpress-develop@$WORDPRESS_SHA  (extracted from PHP wp_get_db_schema())"
+  echo "vitess_commerce_mysql.ddl.sql       <- vitessio/vitess@$VITESS_SHA  (examples/common commerce keyspace; data-strip pass)"
 } > FETCHED.txt
 
 echo "done. outputs:"

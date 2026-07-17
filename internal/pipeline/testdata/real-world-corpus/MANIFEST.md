@@ -24,9 +24,12 @@ fetch-on-demand via `fetch.sh`, not vendored). This `MANIFEST.md` and
 > and `fetch.sh`. If a corpus is ever to be *redistributed* (bundled
 > in a release / committed), that is a different analysis and only
 > the permissively-licensed corpora (MIT / Chinook-permissive) would
-> be eligible. Not legal advice; standard OSS hygiene. `fetch.sh` writes a
-`FETCHED.txt` (gitignored) recording the date + resolved upstream
-refs of the actual pull, for reproducibility.
+> be eligible. Not legal advice; standard OSS hygiene. `fetch.sh` fetches
+every source **by a pinned upstream commit SHA** (the `PINS` block in
+`fetch.sh` is the committed manifest; a bump is a one-line change +
+`./fetch.sh --resolve-latest` to get current HEADs) so the corpus is
+deterministic; it writes a `FETCHED.txt` (gitignored) recording the
+date + the pinned SHAs of the actual pull, for reproducibility.
 
 `fetch.sh` needs `curl` on PATH. On Windows + Rancher Desktop the
 bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\curl.exe`
@@ -37,7 +40,7 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
 
 | Corpus | Engine(s) | Source | License | Notes |
 |---|---|---|---|---|
-| **GitLab** `db/structure.sql` | PostgreSQL | `https://gitlab.com/gitlab-org/gitlab/-/raw/master/db/structure.sql` | MIT (`gitlab-org/gitlab` LICENSE) | ~2.8 MB, schema-only by design (no data). Biggest open real PG schema — partitioning, hundreds of tables. Stresses the PG reader at scale + the PG→MySQL loud-refusal surface. Pulled from `master` HEAD at fetch time (commit recorded in `FETCHED.txt`). |
+| **GitLab** `db/structure.sql` | PostgreSQL | `https://gitlab.com/gitlab-org/gitlab/-/raw/master/db/structure.sql` | MIT (`gitlab-org/gitlab` LICENSE) | ~2.8 MB, schema-only by design (no data). Biggest open real PG schema — partitioning, hundreds of tables. Stresses the PG reader at scale + the PG→MySQL loud-refusal surface (incl. the correct partition-aware loud-refusal on GitLab's declaratively-partitioned tables). Fetched by a pinned commit SHA (see the `PINS` block in `fetch.sh`). |
 | **Chinook** (MySQL) | MySQL | `https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_MySql.sql` | Chinook license (`lerocha/chinook-database` LICENSE.md — permissive) | Upstream mixes DDL + data INSERTs; `fetch.sh` strips data → `chinook_mysql.ddl.sql` (schema-only). |
 | **Chinook** (PostgreSQL) | PostgreSQL | `https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_PostgreSql.sql` | same as above | Same logical schema as the MySQL file → a **matched cross-engine oracle** (sakila/pagila-class, different shape: decimal/numeric-heavier). Data stripped → `chinook_postgres.ddl.sql`. |
 
@@ -46,7 +49,7 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
 | Corpus | Engine(s) | Source | License | Notes |
 |---|---|---|---|---|
 | **MediaWiki** `tables-generated.sql` (MySQL) | MySQL | `https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/mysql/tables-generated.sql` | **GPL-2.0-or-later** (`wikimedia/mediawiki` COPYING) — see LICENSE SAFETY note above; gitignored / not vendored | 64 tables, schema-only by design. |
-| **MediaWiki** `tables-generated.sql` (PostgreSQL) | PostgreSQL | `https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/postgres/tables-generated.sql` | same (GPL-2.0-or-later) | 64 tables. **Both dialects are generated from one abstract schema (`sql/tables.json`) → a *guaranteed-equivalent* matched cross-engine ORACLE** (stronger than independently-authored Chinook/sakila). |
+| **MediaWiki** `tables-generated.sql` (PostgreSQL) | PostgreSQL | `https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/postgres/tables-generated.sql` | same (GPL-2.0-or-later) | 64 tables. Both dialects are generated from one abstract schema (`sql/tables.json`), but this does **NOT** make them column-congruent — the PG adapter renders the abstract binary/blob type as `TEXT` and MW-timestamp as `TIMESTAMPTZ` while MySQL uses `VARBINARY(n)`. The upstream-pair congruence oracle over this member is **retired** (see "Cross-engine congruence: why DumpParity-only …"); DumpParity + the migrate/DryRun legs remain. |
 | **datacharmer test_db** `employees_partitioned.sql` | MySQL | `https://raw.githubusercontent.com/datacharmer/test_db/master/employees_partitioned.sql` | **CC-BY-SA-3.0** (`datacharmer/test_db`) — see LICENSE SAFETY note; gitignored / not vendored | 6 tables, real MySQL with `PARTITION BY` (a feature Chinook lacks). Sources data from `.dump` files; `fetch.sh` drops the `source …;` directives → schema-only `employees_mysql_partitioned.ddl.sql`. |
 
 ## Iteration 3 corpora
@@ -70,11 +73,47 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
 > `Flavor.String()=="planetscale"`, `internal/engines/mysql/flavor.go`)
 > instead of vanilla `mysql`, exercising the PlanetScale `Capabilities`
 > declaration (no `LOAD DATA INFILE`, no `PARTITION BY`, no spatial) in
-> the read+plan path; (2) a matched-pair **congruence oracle** (the
-> iteration-4 headline) that emits sluice's translation for real and
-> diffs it against the expert-authored other-engine side — see
-> `migrate_realworld_corpus_congruence_integration_test.go` and the
-> findings doc.
+> the read+plan path; (2) a matched-pair **congruence oracle** that
+> emitted sluice's translation for real and diffed it against the
+> expert-authored other-engine side — **now RETIRED**; see "Cross-engine
+> congruence: why DumpParity-only …" below and the file-top doc in
+> `migrate_realworld_corpus_congruence_integration_test.go`.
+
+## Cross-engine congruence: why DumpParity-only for Chinook / MediaWiki / Joomla
+
+The iteration-4 **upstream-pair congruence oracle** (emit sluice's
+cross-engine translation of one dialect and diff it against the
+authored other-dialect file in the same corpus member) has been
+**retired**. The three subject DBs — Chinook, MediaWiki, Joomla, the
+only members shipping BOTH dialects — are now exercised only by the
+migrate/DryRun corpus and the same-engine **DumpParity** corpus. Why:
+
+1. **The upstream pairs diverge by authoring convention, not by any
+   sluice error**, so there is no congruent oracle to assert against.
+   Chinook uses MySQL PascalCase identifiers (`InvoiceLine`) vs PG
+   snake_case (`invoice_line`); MediaWiki's PG adapter renders its
+   abstract binary/blob type as `TEXT` and its MW-timestamp as
+   `TIMESTAMPTZ` while the MySQL side uses `VARBINARY(n)` (so sluice's
+   faithful `VARBINARY → bytea` diverges from the authored PG `TEXT` on
+   ~150 columns — "generated from one abstract schema" does **not** mean
+   column-congruent); Joomla's PG author uses `idx_`-prefixed / renamed
+   indexes plus a PG-only `lower(email)` functional index the MySQL
+   author never wrote. sluice cannot and should not reconcile an
+   upstream inconsistency.
+
+2. **Golden-output comparison is licensing-blocked.** Capturing sluice's
+   own emit once and diffing against it would commit a sluice
+   translation *of a GPL-2.0+ schema* (Joomla/MediaWiki/WordPress) into
+   this Apache-2.0 repo — a GPL-derivative in an Apache tree — and it
+   contradicts the corpus design that `.gitignore`s every fetched schema
+   (only `MANIFEST.md` + `fetch.sh` are committed). Nothing derived from
+   the fetched schemas may be committed.
+
+3. **Cross-engine translation is already validated authoritatively
+   elsewhere:** `migrate_cross_integration_test.go` runs real MySQL↔PG
+   round-trips on testcontainers with owned, Apache-clean fixtures, and
+   same-engine fidelity on these very corpus schemas is the DumpParity
+   corpus. The retired oracle added only false drift-red.
 
 ### Evaluated, deliberately NOT fetched (do not "fix" — wrong shape)
 
