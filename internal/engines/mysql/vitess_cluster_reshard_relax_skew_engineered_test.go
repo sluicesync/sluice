@@ -281,8 +281,15 @@ func runEngineeredSkewScenario(t *testing.T, c *vitessReshardCluster, relax bool
 	}
 
 	// --- STEP 3: open the production reader (CDC-only, from "current") ---
+	// vstream_progress_timeout=300s (> the 240s throttled drainTimeout below):
+	// this A/B skew test deliberately throttles the CONSUMER for up to 240s to
+	// measure per-shard skew, which backpressures the source stream past the 45s
+	// default liveness window — without this the reader correctly reconnects
+	// mid-measurement and the test flags an unclean teardown. A real slow applier
+	// would likewise reconnect (harmless, from last position); the raised window
+	// is test-only and still catches a genuine >300s hang.
 	sourceDSN := fmt.Sprintf(
-		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true&vstream_progress_timeout=300s",
 		c.mysqlDSN, c.grpcAddr,
 	)
 	if !relax { // relaxed is the default (ADR-0120 flipped); opt out to preserve skew

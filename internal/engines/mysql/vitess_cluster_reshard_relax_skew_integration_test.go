@@ -247,8 +247,13 @@ func runRelaxSkewScenario(t *testing.T, c *vitessReshardCluster, relax bool, idB
 	// Source DSN: CDC from "current" with shard auto-discovery. Relaxed skew is
 	// now the DEFAULT (ADR-0120 flipped); the preserve-skew opt-out param is set
 	// only on the non-relaxed arm. The reader reads vstream_preserve_skew at open.
+	// vstream_progress_timeout=300s (> the throttled drainTimeout): this A/B skew
+	// test throttles the CONSUMER to measure per-shard skew, backpressuring the
+	// source past the 45s default liveness window — without this the reader
+	// correctly reconnects mid-measurement and the test flags an unclean teardown
+	// (test-only; a genuine >300s hang is still caught).
 	sourceDSN := fmt.Sprintf(
-		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true&vstream_progress_timeout=300s",
 		c.mysqlDSN, c.grpcAddr,
 	)
 	if !relax {
