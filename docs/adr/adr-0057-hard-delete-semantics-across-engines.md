@@ -185,7 +185,13 @@ not delete propagation; the `filterBeforeToPK` narrowing (renamed
 from `filterDeleteBefore` when Bug 193 extended it to the UPDATE
 before-image, matching PG's `filterBeforeToKeyCols` from Bug 92)
 remains load-bearing as the reason partial-image DELETE *replay*
-stays safe and FULL-image WHEREs stay identity-keyed. See
+stays safe and FULL-image WHEREs stay identity-keyed — with one
+refinement (Bug 193 review F1): the DELETE arm belts its **PK-less**
+case, because a UNIQUE-NOT-NULL-no-PK table's MINIMAL before-image
+is keyed on the PKE (the unique index), which the reader's
+PRIMARY-only PK lookup cannot see — the PK-less full-image fallback
+would zero-match silently. A truly-keyless table's MINIMAL
+before-image carries every column and keeps replaying. See
 `internal/engines/mysql/cdc_row_image_preflight.go`.
 
 #### Postgres source (same-engine PG→PG)

@@ -21,13 +21,21 @@
 //   - the belt → a writer session with a SESSION-level
 //     binlog_row_image=MINIMAL override slips past the GLOBAL preflight
 //     by design; its partial UPDATE image must stop the stream loudly
-//     (never a silent zero-row apply).
+//     (never a silent zero-row apply). The DELETE variant fires only on
+//     a UNIQUE-NOT-NULL-no-PK table (the PKE identity loadPrimaryKeyDB
+//     cannot see — review F1), while a truly-keyless table's MINIMAL
+//     DELETE keeps replaying (full before-image, nothing skipped — the
+//     no-false-refusal guard).
+//   - PARTIAL_JSON (review F2) → binlog_row_value_options=PARTIAL_JSON
+//     refuses at both preflight chokepoints, and a session-level
+//     override's PARTIAL_UPDATE_ROWS_EVENT stops the stream loudly at
+//     the dispatcher (the pre-Bug-193 code silently dropped it).
 //
 // This test boots its OWN container (not the shared TestMain mysqld):
-// it mutates the *global* binlog_row_image, which would leak MINIMAL
-// semantics into any other CDC test whose writer session opens inside
-// the flip window — the same isolation rationale as
-// startMySQLGTIDForCDC's PURGE BINARY LOGS.
+// it mutates the *global* binlog_row_image / binlog_row_value_options,
+// which would leak partial-image semantics into any other CDC test
+// whose writer session opens inside the flip window — the same
+// isolation rationale as startMySQLGTIDForCDC's PURGE BINARY LOGS.
 
 package mysql
 
@@ -260,6 +268,71 @@ func TestCDCReader_RowImagePreflight(t *testing.T) {
 		wantRowImageRefusal(t, err, "warm-resume StreamChanges")
 	})
 
+	// --- PARTIAL_JSON preflight (F2): binlog_row_value_options=
+	// PARTIAL_JSON makes the server write UPDATEs as
+	// PARTIAL_UPDATE_ROWS_EVENTs even under binlog_row_image=FULL —
+	// the same silent-UPDATE-loss class one variable over. Both CDC
+	// chokepoints must refuse.
+	t.Run("refuses_PARTIAL_JSON", func(t *testing.T) {
+		applyMySQL(t, dsn, "SET GLOBAL binlog_row_value_options = 'PARTIAL_JSON';")
+		defer applyMySQL(t, dsn, "SET GLOBAL binlog_row_value_options = '';")
+
+		_, err := openReader(t).StreamChanges(ctx, ir.Position{})
+		wantRowImageRefusal(t, err, "StreamChanges (PARTIAL_JSON)")
+
+		if snap, err := eng.OpenSnapshotStream(ctx, dsn); err == nil {
+			_ = snap.Close()
+			t.Fatal("OpenSnapshotStream: accepted a binlog_row_value_options=PARTIAL_JSON source; want the coded refusal before any copy")
+		} else {
+			wantRowImageRefusal(t, err, "OpenSnapshotStream (PARTIAL_JSON)")
+		}
+	})
+
+	// execOnSessionConn runs stmts in order on ONE pinned writer
+	// connection — the vehicle for session-scoped overrides
+	// (binlog_row_image / binlog_row_value_options), which slip past
+	// the GLOBAL preflight by design and are exactly what the
+	// dispatch-time belts exist for.
+	execOnSessionConn := func(t *testing.T, stmts ...string) {
+		t.Helper()
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("pin writer conn: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+		for _, stmt := range stmts {
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				t.Fatalf("writer session %q: %v", stmt, err)
+			}
+		}
+	}
+
+	// wantStreamStopsRefused drains changes until the channel closes
+	// and asserts the stream died with the coded refusal — never
+	// silently delivering (or dropping) the poisoned change.
+	wantStreamStopsRefused := func(t *testing.T, rdr *CDCReader, changes <-chan ir.Change, site string) {
+		t.Helper()
+		deadline := time.After(30 * time.Second)
+		for {
+			select {
+			case _, open := <-changes:
+				if !open {
+					wantRowImageRefusal(t, rdr.Err(), site)
+					return
+				}
+				// Non-terminal changes (e.g. schema snapshots) may
+				// precede the poisoned event; keep draining.
+			case <-deadline:
+				t.Fatalf("%s: stream did not stop within 30s", site)
+			}
+		}
+	}
+
 	// --- The belt: a SESSION-level binlog_row_image override on a
 	// writer slips past the GLOBAL preflight by design. Its partial
 	// UPDATE image must stop the stream loudly — the exact residue the
@@ -276,42 +349,124 @@ func TestCDCReader_RowImagePreflight(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 
-		// One writer CONNECTION with a session-scoped MINIMAL: its
-		// UPDATE's binlog image carries only the PK before-image and
-		// the changed-column after-image.
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Fatalf("open writer: %v", err)
-		}
-		defer func() { _ = db.Close() }()
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			t.Fatalf("pin writer conn: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
-		if _, err := conn.ExecContext(ctx, "SET SESSION binlog_row_image = 'MINIMAL'"); err != nil {
-			t.Fatalf("session row-image override: %v", err)
-		}
-		if _, err := conn.ExecContext(ctx, "UPDATE orders SET status = 'stealthy' WHERE id = 1"); err != nil {
-			t.Fatalf("partial-image update: %v", err)
-		}
+		// The MINIMAL session's UPDATE image carries only the PK
+		// before-image and the changed-column after-image.
+		execOnSessionConn(
+			t,
+			"SET SESSION binlog_row_image = 'MINIMAL'",
+			"UPDATE orders SET status = 'stealthy' WHERE id = 1",
+		)
+		wantStreamStopsRefused(t, rdr, changes, "dispatch belt (update)")
+	})
 
-		// The stream must terminate (channel closed) with the coded
-		// belt error — never deliver the partial update silently.
-		deadline := time.After(30 * time.Second)
-		for {
-			select {
-			case c, open := <-changes:
-				if !open {
-					wantRowImageRefusal(t, rdr.Err(), "dispatch belt")
-					return
-				}
-				if _, isUpd := c.(ir.Update); isUpd {
-					t.Fatalf("partial UPDATE image was emitted instead of refused: %+v", c)
-				}
-			case <-deadline:
-				t.Fatal("stream did not stop on the partial UPDATE image within 30s")
-			}
+	// --- F1: DELETE belt on a UNIQUE-NOT-NULL-no-PK table. Under
+	// MINIMAL, MySQL keys the before-image on the PKE (the first NOT
+	// NULL UNIQUE index) — which loadPrimaryKeyDB (index_name =
+	// 'PRIMARY' only) cannot see, so tbl.PrimaryKey is empty and the
+	// PK-less full-image fallback would keep nil-filled columns and
+	// zero-match silently. The belt must refuse instead.
+	t.Run("belt_refuses_partial_delete_on_uk_no_pk_table", func(t *testing.T) {
+		setGlobalRowImage(t, dsn, "FULL")
+		applyMySQL(t, dsn, `
+			CREATE TABLE uk_orders (
+				code   BIGINT      NOT NULL,
+				status VARCHAR(32) NOT NULL,
+				UNIQUE KEY uk_code (code)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO uk_orders (code, status) VALUES (10, 'new'), (20, 'new');
+		`)
+
+		rdr := openReader(t)
+		changes, err := rdr.StreamChanges(ctx, ir.Position{})
+		if err != nil {
+			t.Fatalf("StreamChanges under FULL: %v", err)
 		}
+		time.Sleep(200 * time.Millisecond)
+
+		execOnSessionConn(
+			t,
+			"SET SESSION binlog_row_image = 'MINIMAL'",
+			"DELETE FROM uk_orders WHERE code = 10",
+		)
+		wantStreamStopsRefused(t, rdr, changes, "dispatch belt (uk-no-pk delete)")
+	})
+
+	// --- F1 no-false-refusal guard: a TRULY keyless table's MINIMAL
+	// DELETE before-image carries EVERY column (no PK and no PKE means
+	// the whole row is the identity), skips nothing, and must keep
+	// replaying — the belt fires only where an identity cannot be
+	// reconstructed.
+	t.Run("keyless_minimal_delete_replay_still_works", func(t *testing.T) {
+		setGlobalRowImage(t, dsn, "FULL")
+		applyMySQL(t, dsn, `
+			CREATE TABLE keyless_log (
+				a BIGINT      NOT NULL,
+				b VARCHAR(32) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO keyless_log (a, b) VALUES (1, 'one'), (2, 'two');
+		`)
+
+		rdr := openReader(t)
+		changes, err := rdr.StreamChanges(ctx, ir.Position{})
+		if err != nil {
+			t.Fatalf("StreamChanges under FULL: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+
+		execOnSessionConn(
+			t,
+			"SET SESSION binlog_row_image = 'MINIMAL'",
+			"DELETE FROM keyless_log WHERE a = 1",
+		)
+		got := drainChanges(t, ctx, changes, 1, 30*time.Second)
+		if len(got) != 1 {
+			if streamErr := rdr.Err(); streamErr != nil {
+				t.Fatalf("keyless MINIMAL DELETE was refused instead of replayed (false refusal): %v", streamErr)
+			}
+			t.Fatalf("got %d changes; want 1", len(got))
+		}
+		del, ok := got[0].(ir.Delete)
+		if !ok {
+			t.Fatalf("change[0] = %T; want ir.Delete", got[0])
+		}
+		// Full before-image: with no shorter identity, every column
+		// carries its real value (that's what makes the replay safe).
+		if a, _ := del.Before["a"].(int64); a != 1 {
+			t.Errorf("delete.Before[a] = %#v; want int64(1)", del.Before["a"])
+		}
+		if b, _ := del.Before["b"].(string); b != "one" {
+			t.Errorf("delete.Before[b] = %#v; want \"one\"", del.Before["b"])
+		}
+	})
+
+	// --- F2 belt: a SESSION-level binlog_row_value_options=
+	// PARTIAL_JSON writer emits PARTIAL_UPDATE_ROWS_EVENTs past the
+	// (global, tolerant) preflight; the dispatcher's default arm must
+	// refuse them loudly — the pre-Bug-193 behaviour silently dropped
+	// the event, no-op'ing the UPDATE with a green stream.
+	t.Run("belt_stops_stream_on_partial_json_update", func(t *testing.T) {
+		setGlobalRowImage(t, dsn, "FULL")
+		applyMySQL(t, dsn, `
+			CREATE TABLE docs_j (
+				id BIGINT NOT NULL,
+				j  JSON   NULL,
+				PRIMARY KEY (id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO docs_j (id, j) VALUES (1, '{"a": 1, "b": "x"}');
+		`)
+
+		rdr := openReader(t)
+		changes, err := rdr.StreamChanges(ctx, ir.Position{})
+		if err != nil {
+			t.Fatalf("StreamChanges under FULL: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+
+		execOnSessionConn(
+			t,
+			"SET SESSION binlog_row_value_options = 'PARTIAL_JSON'",
+			`UPDATE docs_j SET j = JSON_SET(j, '$.a', 2) WHERE id = 1`,
+		)
+		wantStreamStopsRefused(t, rdr, changes, "dispatch belt (partial-json update)")
 	})
 }

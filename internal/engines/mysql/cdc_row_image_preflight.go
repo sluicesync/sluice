@@ -49,10 +49,25 @@ import (
 //     binlog_row_image override, or a resume replaying a binlog
 //     segment recorded before the global was flipped to FULL), the
 //     stream stops loudly instead of silently skipping/corrupting the
-//     row. The DELETE arm keeps working on partial images by
-//     construction (Bug 88's PK narrowing needs only the PK, which
-//     every row image carries), so it takes no belt — refusing there
-//     would regress the working partial-image DELETE replay.
+//     row. The DELETE arm belts ONLY its PK-less case: with a real PK
+//     the Bug 88 narrowing makes partial images correct by
+//     construction (every row image carries the PK), so refusing there
+//     would regress the working partial-image DELETE replay — but a
+//     UNIQUE-NOT-NULL-no-PK table's MINIMAL before-image carries the
+//     PKE (the unique index), which loadPrimaryKeyDB (index_name =
+//     'PRIMARY' only) cannot see, so the PK-less full-image fallback
+//     would keep nil-filled columns and zero-match silently. A
+//     truly-keyless table's MINIMAL before-image carries every column
+//     (no PKE to narrow to), so it skips nothing and never trips the
+//     belt.
+//
+// binlog_row_value_options=PARTIAL_JSON is the same class one variable
+// over: the server then writes UPDATEs as PARTIAL_UPDATE_ROWS_EVENTs
+// (JSON columns as diffs, not values), which sluice cannot apply
+// faithfully. The preflight reads that variable too (TOLERANTLY — it
+// does not exist before MySQL 8.0.3, and a read failure there must not
+// refuse), and the dispatcher's default arm refuses the event itself
+// as the belt ([partialJSONUpdatesError]).
 
 // rowImagePreflightTimeout bounds the @@GLOBAL.binlog_row_image read so
 // a half-dead pooled connection can't hang the stream startup (the
@@ -97,22 +112,64 @@ func preflightBinlogRowImage(ctx context.Context, q rowQuerier) error {
 	if err := q.QueryRowContext(pctx, "SELECT @@GLOBAL.binlog_row_image").Scan(&image); err != nil {
 		return fmt.Errorf("mysql: cdc: read @@GLOBAL.binlog_row_image: %w", err)
 	}
-	if strings.EqualFold(image, "FULL") {
-		return nil
+	if !strings.EqualFold(image, "FULL") {
+		return sluicecode.Wrap(
+			sluicecode.CodeCDCRowImagePartial,
+			rowImageRemedyHint,
+			fmt.Errorf(
+				"mysql: cdc: the source streams partial binlog row images (@@GLOBAL.binlog_row_image=%s): "+
+					"a partial UPDATE before-image omits non-key columns and its after-image omits unchanged "+
+					"columns, so sluice's CDC would silently lose every UPDATE — the stream stays green and row "+
+					"counts stay equal while row content diverges. Set the source to full row images before "+
+					"starting CDC: SET GLOBAL binlog_row_image=FULL (dynamic, no restart; applies to sessions "+
+					"opened after the change). On Azure Database for MySQL Flexible Server — whose platform "+
+					"default is MINIMAL — run: az mysql flexible-server parameter set --resource-group <rg> "+
+					"--server-name <server> --name binlog_row_image --value FULL (~20s, no restart). Then re-run",
+				image,
+			),
+		)
 	}
+
+	// The PARTIAL_JSON sibling: binlog_row_value_options=PARTIAL_JSON
+	// makes the server write UPDATEs as PARTIAL_UPDATE_ROWS_EVENTs
+	// (JSON columns as diffs) even under binlog_row_image=FULL, which
+	// sluice cannot apply faithfully — same silent-UPDATE-loss class,
+	// one variable over. TOLERANT read, unlike binlog_row_image's
+	// strict one: the variable does not exist before MySQL 8.0.3, and a
+	// pre-8.0.3 server cannot have the option on, so a read failure
+	// must pass, not refuse. (The dispatcher's default arm is the belt
+	// for anything that slips this — a session-level override, or a
+	// resume replaying a PARTIAL_JSON-era segment.)
+	var valueOptions string
+	if err := q.QueryRowContext(pctx, "SELECT @@GLOBAL.binlog_row_value_options").Scan(&valueOptions); err == nil {
+		if strings.Contains(strings.ToUpper(valueOptions), "PARTIAL_JSON") {
+			return partialJSONUpdatesError(fmt.Sprintf("@@GLOBAL.binlog_row_value_options=%s", valueOptions))
+		}
+	}
+	return nil
+}
+
+// partialJSONUpdatesError builds the coded refusal for the
+// binlog_row_value_options=PARTIAL_JSON shape, shared by the preflight
+// (evidence: the read variable value) and the dispatcher's default-arm
+// belt (evidence: a PARTIAL_UPDATE_ROWS_EVENT on the wire). Under that
+// option the server logs UPDATE after-images with JSON columns as
+// partial diffs (JSON_SET/JSON_REPLACE/JSON_REMOVE deltas) instead of
+// full values; sluice's applier writes whole values, so applying such
+// an event would silently corrupt or lose JSON content — refuse
+// loudly instead.
+func partialJSONUpdatesError(evidence string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCRowImagePartial,
-		rowImageRemedyHint,
+		"SET GLOBAL binlog_row_value_options='' on the source, then re-run",
 		fmt.Errorf(
-			"mysql: cdc: the source streams partial binlog row images (@@GLOBAL.binlog_row_image=%s): "+
-				"a partial UPDATE before-image omits non-key columns and its after-image omits unchanged "+
-				"columns, so sluice's CDC would silently lose every UPDATE — the stream stays green and row "+
-				"counts stay equal while row content diverges. Set the source to full row images before "+
-				"starting CDC: SET GLOBAL binlog_row_image=FULL (dynamic, no restart; applies to sessions "+
-				"opened after the change). On Azure Database for MySQL Flexible Server — whose platform "+
-				"default is MINIMAL — run: az mysql flexible-server parameter set --resource-group <rg> "+
-				"--server-name <server> --name binlog_row_image --value FULL (~20s, no restart). Then re-run",
-			image,
+			"mysql: cdc: the source writes partial-JSON UPDATE row images (%s): with "+
+				"binlog_row_value_options=PARTIAL_JSON the binlog carries JSON columns as diffs, not values, "+
+				"which sluice cannot apply faithfully — applying them would silently corrupt or lose JSON "+
+				"content. Set the source back to full JSON values before starting CDC: "+
+				"SET GLOBAL binlog_row_value_options='' (dynamic, no restart; applies to sessions opened "+
+				"after the change), then re-run",
+			evidence,
 		),
 	)
 }

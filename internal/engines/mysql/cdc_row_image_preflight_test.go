@@ -49,14 +49,26 @@ func (r *oneStringRow) Next(dest []driver.Value) error {
 	return nil
 }
 
+// QueryContext answers the two preflight reads per the DSN mode, which
+// is "image" or "image|value_options". Without the "|" part the
+// binlog_row_value_options read FAILS — modelling a pre-8.0.3 server
+// where the variable does not exist (the tolerant-read case).
 func (c rowImageConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	if query != "SELECT @@GLOBAL.binlog_row_image" {
+	image, valueOptions, hasValueOptions := strings.Cut(c.mode, "|")
+	switch query {
+	case "SELECT @@GLOBAL.binlog_row_image":
+		if image == "query_error" {
+			return nil, errors.New("Unknown system variable 'binlog_row_image'")
+		}
+		return &oneStringRow{val: image}, nil
+	case "SELECT @@GLOBAL.binlog_row_value_options":
+		if !hasValueOptions {
+			return nil, errors.New("Unknown system variable 'binlog_row_value_options'")
+		}
+		return &oneStringRow{val: valueOptions}, nil
+	default:
 		return nil, errors.New("unexpected query: " + query)
 	}
-	if c.mode == "query_error" {
-		return nil, errors.New("Unknown system variable 'binlog_row_image'")
-	}
-	return &oneStringRow{val: c.mode}, nil
 }
 
 var registerRowImageOnce sync.Once
@@ -80,7 +92,10 @@ func newRowImageDB(t *testing.T, mode string) *sql.DB {
 // the server reports the value as configured (full/FULL both occur).
 func TestPreflightBinlogRowImage(t *testing.T) {
 	t.Parallel()
-	pass := []string{"FULL", "full", "Full"}
+	// FULL passes with binlog_row_value_options empty ("FULL|"), with
+	// the variable unreadable (bare "FULL" — the pre-8.0.3 tolerant
+	// case), and case-insensitively.
+	pass := []string{"FULL", "full", "Full", "FULL|"}
 	for _, v := range pass {
 		if err := preflightBinlogRowImage(context.Background(), newRowImageDB(t, v)); err != nil {
 			t.Errorf("preflight(%q) = %v; want nil", v, err)
@@ -131,6 +146,59 @@ func TestPreflightBinlogRowImage_ReadFailureIsPlainError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "@@GLOBAL.binlog_row_image") {
 		t.Errorf("error should name the variable it failed to read; got: %v", err)
+	}
+}
+
+// TestPreflightBinlogRowValueOptions pins the PARTIAL_JSON sibling (F2):
+// binlog_row_value_options=PARTIAL_JSON refuses with the same coded
+// class naming the variable and the SET GLOBAL remedy — and, unlike the
+// binlog_row_image read, the read is TOLERANT: a failure (the variable
+// does not exist before MySQL 8.0.3, where the option cannot be on)
+// must pass, never refuse.
+func TestPreflightBinlogRowValueOptions(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"FULL|PARTIAL_JSON", "FULL|partial_json"} {
+		err := preflightBinlogRowImage(context.Background(), newRowImageDB(t, v))
+		if err == nil {
+			t.Errorf("preflight(%q) = nil; want the coded PARTIAL_JSON refusal", v)
+			continue
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCDCRowImagePartial {
+			t.Errorf("preflight(%q): want %s; got %T: %v", v, sluicecode.CodeCDCRowImagePartial, err, err)
+			continue
+		}
+		for _, phrase := range []string{
+			"binlog_row_value_options",
+			"SET GLOBAL binlog_row_value_options=''",
+		} {
+			if !strings.Contains(err.Error(), phrase) {
+				t.Errorf("preflight(%q) message missing %q; got: %v", v, phrase, err)
+			}
+		}
+	}
+	// Tolerant: unreadable variable (bare "FULL" mode) is pinned as a
+	// pass in TestPreflightBinlogRowImage; empty value passes too.
+	if err := preflightBinlogRowImage(context.Background(), newRowImageDB(t, "FULL|")); err != nil {
+		t.Errorf("preflight(FULL, value_options='') = %v; want nil", err)
+	}
+}
+
+// TestPartialJSONUpdatesError pins the shared refusal constructor used
+// by both the preflight and the dispatcher's default-arm belt (a
+// PARTIAL_UPDATE_ROWS_EVENT reaching the stream past the preflight —
+// session-level override or PARTIAL_JSON-era segment replay).
+func TestPartialJSONUpdatesError(t *testing.T) {
+	t.Parallel()
+	err := partialJSONUpdatesError("a PARTIAL_UPDATE_ROWS_EVENT for source_db.orders reached the stream")
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeCDCRowImagePartial {
+		t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCRowImagePartial, err, err)
+	}
+	for _, phrase := range []string{"source_db.orders", "PARTIAL_JSON", "SET GLOBAL binlog_row_value_options=''"} {
+		if !strings.Contains(err.Error(), phrase) {
+			t.Errorf("message missing %q; got: %v", phrase, err)
+		}
 	}
 }
 

@@ -1008,7 +1008,27 @@ func (r *CDCReader) dispatchRows(
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		for _, raw := range ev.Rows {
+		for i, raw := range ev.Rows {
+			// Bug 193 belt, PK-less tables ONLY. With a real PK the
+			// narrowing below makes partial images correct by
+			// construction (every row image carries the PK), so no
+			// belt — refusing would regress the working replay of
+			// MINIMAL-era binlog segments for deletes. But a
+			// UNIQUE-NOT-NULL-no-PK table is different: MySQL's
+			// MINIMAL before-image carries the PKE (the first NOT NULL
+			// UNIQUE index), which loadPrimaryKeyDB (index_name =
+			// 'PRIMARY' only) cannot see — tbl.PrimaryKey is empty, so
+			// the PK-less fallback would keep the nil-filled full
+			// image and buildWhereClause would zero-match silently.
+			// A truly-keyless table's MINIMAL before-image carries
+			// every column (no PKE exists to narrow to), skips
+			// nothing, and never trips this — the belt fires exactly
+			// where an identity cannot be reconstructed.
+			if len(tbl.PrimaryKey) == 0 {
+				if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "delete", "before"); err != nil {
+					return err
+				}
+			}
 			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
@@ -1023,13 +1043,6 @@ func (r *CDCReader) dispatchRows(
 			// — Bug-8-equivalent silent data loss. Mirrors the
 			// PG-side filterBeforeToKeyCols. See
 			// docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
-			//
-			// Deliberately NO refusePartialRowImage belt here (unlike
-			// the INSERT/UPDATE arms — Bug 193): a DELETE needs only
-			// the PK, which EVERY row image carries, so the narrowing
-			// makes partial images correct by construction. Keeping
-			// the belt off preserves the working replay of MINIMAL-era
-			// binlog segments for deletes.
 			before = filterBeforeToPK(tbl, before)
 			if err := send(ctx, out, ir.Delete{
 				Position:   pos,
@@ -1042,9 +1055,23 @@ func (r *CDCReader) dispatchRows(
 			}
 		}
 	default:
-		// Other rows-flavoured events (PARTIAL_UPDATE_ROWS_EVENT,
-		// MariaDB compressed variants) aren't in v1 scope. Surface as
-		// debug-only by virtue of falling through with no emission.
+		// Bug 193 (F2): a PARTIAL_UPDATE_ROWS_EVENT means the source
+		// runs binlog_row_value_options=PARTIAL_JSON — its UPDATEs
+		// carry JSON columns as diffs sluice cannot apply faithfully,
+		// and silently dropping the event here (the pre-Bug-193
+		// behaviour) is the same silent-UPDATE-loss class as MINIMAL,
+		// one variable over. The event type exists ONLY when the
+		// option is set, so this is a zero-false-refusal belt for
+		// anything past the tolerant preflight (a session-level
+		// override, or a resume replaying a PARTIAL_JSON-era segment).
+		if hdr.EventType == replication.PARTIAL_UPDATE_ROWS_EVENT {
+			return partialJSONUpdatesError(
+				fmt.Sprintf("a PARTIAL_UPDATE_ROWS_EVENT for %s.%s reached the stream", tbl.Schema, tbl.Name),
+			)
+		}
+		// Other rows-flavoured events (MariaDB compressed variants)
+		// aren't in v1 scope. Surface as debug-only by virtue of
+		// falling through with no emission.
 		return nil
 	}
 	return nil
