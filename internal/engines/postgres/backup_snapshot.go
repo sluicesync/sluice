@@ -83,6 +83,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		_ = db.Close()
 		return nil, err
 	}
+	// A hot standby / read replica cannot anchor a backup CDC chain
+	// (Bug 197): the publication ensure below writes, and standby slot
+	// creation blocks on the primary's next running-xacts record.
+	// Refuse with the coded primary steer before anything is created.
+	if err := checkNotStandby(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Resolve the anchor slot. Default shape: a fresh timestamped
 	// protocol-TEMPORARY anchor, auto-dropped when its replication
@@ -134,7 +142,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	if opts.PersistChainSlot {
 		if err := ensureAllTablesPublication(ctx, db, defaultPublication); err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err)
+			return nil, classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
 		}
 	}
 

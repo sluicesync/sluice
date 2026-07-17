@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // verifyStubEngine is a minimal Engine for verify-orchestrator unit
@@ -25,6 +26,7 @@ type verifyStubEngine struct {
 	counts         map[string]int64
 	countErr       map[string]error
 	noVerifier     bool // when true, the reader does NOT implement ir.Verifier
+	openErr        error
 	readSchemaFail error
 	// Sample-mode per-table data; nil for count-mode tests.
 	sampleHashes map[string][]ir.SampledRowHash
@@ -35,6 +37,9 @@ func (e *verifyStubEngine) Name() string                  { return e.name }
 func (e *verifyStubEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
 
 func (e *verifyStubEngine) OpenSchemaReader(_ context.Context, _ string) (ir.SchemaReader, error) {
+	if e.openErr != nil {
+		return nil, e.openErr
+	}
 	if e.noVerifier {
 		return &verifyStubReaderNoVerifier{schema: e.schema, fail: e.readSchemaFail}, nil
 	}
@@ -647,5 +652,43 @@ func TestVerifier_Run_SampleMode_CrossEngineRejected(t *testing.T) {
 	_, err := v.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "requires same source and target engine") {
 		t.Errorf("expected cross-engine rejection; got %v", err)
+	}
+}
+
+// TestVerifier_Run_ConnectErrorGetsHintRouting pins the Bug-196
+// residual close (Supabase replica probe 2026-07-17): verify's source
+// AND target opens route through migcore.WrapWithHint(PhaseConnect, …)
+// exactly like migrate's door, so connect-class failures gain the
+// coded hint (here the static connection-refused entry; the dynamic
+// AAAA-only classifier rides the same chokepoint — pinned end-to-end
+// in migcore's hints_dns tests). Pre-fix, verify printed the bare
+// driver/resolver error.
+func TestVerifier_Run_ConnectErrorGetsHintRouting(t *testing.T) {
+	refused := errors.New("postgres: connect: dial tcp 10.0.0.1:5432: connect: connection refused")
+	clean := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}
+
+	for name, v := range map[string]*Verifier{
+		"source open": {
+			Source: &verifyStubEngine{name: "postgres", openErr: refused}, Target: clean,
+			SourceDSN: "src", TargetDSN: "tgt", Out: &bytes.Buffer{},
+		},
+		"target open": {
+			Source: clean, Target: &verifyStubEngine{name: "postgres", openErr: refused},
+			SourceDSN: "src", TargetDSN: "tgt", Out: &bytes.Buffer{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := v.Run(context.Background())
+			if err == nil {
+				t.Fatal("Run succeeded; want the connect error")
+			}
+			if !strings.Contains(err.Error(), "\nhint: ") {
+				t.Errorf("connect error carries no hint line (the WrapWithHint routing is missing): %v", err)
+			}
+			ce, ok := sluicecode.FromError(err)
+			if !ok || ce.Code != sluicecode.CodeConnectRefused {
+				t.Errorf("err = %v; want coded %s", err, sluicecode.CodeConnectRefused)
+			}
+		})
 	}
 }

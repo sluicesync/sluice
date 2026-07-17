@@ -242,7 +242,13 @@ func (e Engine) EnsurePublication(ctx context.Context, dsn string, tables []stri
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	return ensurePublication(ctx, db, defaultPublication, cfg.schema, tables)
+	// The streamer cold-start's FIRST source write lands here (Bug 197):
+	// a hot standby / read replica source must get the coded
+	// primary-endpoint refusal, not a raw 25006 at CREATE PUBLICATION.
+	if err := checkNotStandby(ctx, db); err != nil {
+		return err
+	}
+	return classifyStandbyReadOnly(ensurePublication(ctx, db, defaultPublication, cfg.schema, tables))
 }
 
 // AddPublicationTables extends the sluice publication's table list
@@ -271,7 +277,10 @@ func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []s
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	return addTablesToPublication(ctx, db, defaultPublication, cfg.schema, tables)
+	// Same standby belt as EnsurePublication: an ALTER PUBLICATION on a
+	// source that entered recovery surfaces the coded steer, not a raw
+	// 25006 (Bug 197).
+	return classifyStandbyReadOnly(addTablesToPublication(ctx, db, defaultPublication, cfg.schema, tables))
 }
 
 // ExtractSnapshotLSN decodes a Postgres snapshot stream's

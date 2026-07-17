@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -170,7 +171,12 @@ func openSlotManager(driver, dsn string) (ir.SlotManager, error) {
 	}
 	mgr, err := opener.OpenSlotManager(context.Background(), dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open slot manager: %w", err)
+		// Connect-phase hint routing (Bug 196 residual): the slot
+		// commands are a diagnostic door operators reach when CDC is
+		// already misbehaving, so a resolve failure against an AAAA-only
+		// host (Supabase direct endpoints) must carry the coded
+		// IPv6-only remedy here too, not the resolver's bare error.
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("open slot manager: %w", err))
 	}
 	return mgr, nil
 }

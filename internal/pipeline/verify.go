@@ -251,15 +251,21 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	sink := v.sink()
 	sink.PhaseStarted(verifyPhaseSchema)
 
+	// Connect-phase hint routing (Bug 196 residual, Supabase replica
+	// probe 2026-07-17): verify's opens get the same [migcore.WrapWithHint]
+	// treatment as migrate's door, so a resolve failure against an
+	// AAAA-only host (Supabase direct endpoints) carries the coded
+	// IPv6-only remedy instead of the resolver's bare no-data error —
+	// and the static connect hints (refused/auth/db-missing) ride too.
 	sr, err := v.Source.OpenSchemaReader(ctx, v.SourceDSN)
 	if err != nil {
-		return nil, fmt.Errorf("verify: open source schema reader: %w", err)
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("verify: open source schema reader: %w", err))
 	}
 	defer migcore.CloseIf(sr)
 
 	tr, err := v.Target.OpenSchemaReader(ctx, v.TargetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("verify: open target schema reader: %w", err)
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("verify: open target schema reader: %w", err))
 	}
 	defer migcore.CloseIf(tr)
 

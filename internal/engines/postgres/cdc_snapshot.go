@@ -117,6 +117,14 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		_ = db.Close()
 		return nil, err
 	}
+	// A hot standby / read replica cannot host the snapshot+CDC handoff
+	// (Bug 197): publication management always writes, and standby slot
+	// creation blocks on the primary. Refuse with the primary steer
+	// before the publication ensure below touches the source.
+	if err := checkNotStandby(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Publication must exist BEFORE the replication slot is created.
 	// Logical replication slots pin a catalog snapshot at their
@@ -138,12 +146,12 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	if spanning {
 		if err := ensureAllTablesPublication(ctx, db, defaultPublication); err != nil {
 			_ = db.Close()
-			return nil, err
+			return nil, classifyStandbyReadOnly(err)
 		}
 	} else {
 		if err := ensurePublication(ctx, db, defaultPublication, cfg.schema, nil); err != nil {
 			_ = db.Close()
-			return nil, err
+			return nil, classifyStandbyReadOnly(err)
 		}
 	}
 

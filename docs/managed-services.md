@@ -516,6 +516,20 @@ sluice's pooler-host preflight WARN fires for both (the hostname matches the `po
 
 **Plaintext is accepted on the direct endpoint** — Supabase does not force TLS there, so always put `sslmode=require` (or stronger) on the DSN yourself. `require` negotiates TLS 1.3. `verify-full` fails against system roots (private CA: `Supabase Root 2021 CA` with a per-project leaf) and works with the Supabase CA pinned via the DSN: `sslmode=verify-full&sslrootcert=<path>` (download the CA from the dashboard). Note `--source-tls-ca` is the MySQL-side flag — for Postgres the CA rides the DSN's `sslrootcert` parameter, and sluice's refusal says so.
 
+### Read replicas: bulk-migrate source yes, CDC source no
+
+Live-probed 2026-07-17 (PG 17 replica, same region). A Supabase read replica works as a **bulk `sluice migrate` source** with the full consistency story: `pg_export_snapshot()` is legal on PG ≥ 16 standbys, so sluice's parallel snapshot-pinned copy engages **unreduced** on the replica — one shared snapshot across all table/chunk readers, byte-exact (`float8send`-proven), evaluated at the replica's replay position. Use it to offload the copy's read load from the production primary.
+
+**DSN shapes:**
+
+- **Direct endpoint**: `db.<ref>-rr-<region>-<suffix>.supabase.co:5432` — its own hostname, IPv6-only exactly like the primary. The IPv4 add-on covers replicas too (one PATCH gives both endpoints A records), but Supabase bills IPv4 **per database**, so it costs 2× while a replica exists.
+- **Pooler**: same host/port as the primary — routing is **by username**: `postgres.<ref>` reaches the primary, `postgres.<ref>-rr-<region>-<suffix>` reaches the replica (session mode `:5432` for sluice).
+- Password is identical to the primary (the role catalog replicates physically). Sanity check which end you're on with `SELECT pg_is_in_recovery()` — `t` means replica.
+
+**CDC: point `sync start` (and `backup` CDC chains) at the PRIMARY, never the replica.** CDC manages the sluice publication on the source and `CREATE`/`ALTER PUBLICATION` cannot run on a standby; sluice refuses up front with the coded `SLUICE-E-CDC-STANDBY-SOURCE` steer (pre-fix this surfaced as a raw SQLSTATE 25006 at publication ensure). PG 16+ standbys can technically host logical slots, but creation blocks on the primary's next running-xacts record and Supabase denies the `pg_log_standby_snapshot()` nudge — the primary is the supported CDC source.
+
+**Verifying against a replica: gate on replay lag.** `sluice verify` against a lagging replica compares the target with the replica's *past* — it can false-flag rows the copy correctly took from the primary moments earlier, or false-clean a stale target. Prefer verifying against the endpoint you copied from (self-consistent) and treat the primary as the authoritative sign-off target; if you must verify against a replica, first confirm `pg_stat_replication.replay_lag` on the primary is ≈ 0 (or receive LSN == replay LSN on the replica). Two operator traps: `now() - pg_last_xact_replay_timestamp()` on the replica reads minutes of "lag" on an **idle** primary (it timestamps the last replayed transaction — check `replay_lag` on the primary instead), and a **long** copy from a replica under primary write load can be cancelled by WAL-replay recovery conflicts once it outlives `max_standby_streaming_delay` — sluice fails loudly; re-run or copy from the primary.
+
 ### Float display is not float identity
 
 Supabase servers default `extra_float_digits=0`, which makes **text-rendered** floats lie (a value prints rounded while the stored bits are exact). As of v0.99.265 sluice pins shortest-exact float rendering on every session it opens — the raw-copy text lane, the CDC walsender session, the trigger capture function, and `verify --depth=sample` hashes — so the server default no longer affects sluice's own fidelity (earlier releases were affected; re-verify data moved by them, and re-run `sluice trigger setup` on trigger-CDC sources after upgrading). External tooling that diffs text against a Supabase source still needs its own `SET extra_float_digits = 1` (or better, compare `float8send`/`float4send` bytes).

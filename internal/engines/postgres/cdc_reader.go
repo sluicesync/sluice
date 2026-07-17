@@ -363,6 +363,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if err := checkWALLevel(ctx, r.db); err != nil {
 		return nil, err
 	}
+	// A hot standby / read replica cannot be a CDC source (Bug 197) —
+	// refuse with the coded primary-endpoint steer before any source
+	// write or replication command.
+	if err := checkNotStandby(ctx, r.db); err != nil {
+		return nil, err
+	}
 
 	// The streamer's coldStart calls Engine.EnsurePublication with
 	// the scoped table list before this point (Bug 13, ADR-0021),
@@ -374,7 +380,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// scoped-publication code path. That's the v0.4.0 shape and
 	// remains correct for those callers.
 	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil); err != nil {
-		return nil, err
+		return nil, classifyStandbyReadOnly(err)
 	}
 
 	conn, err := openReplicationConn(ctx, r.dsn, r.appID)

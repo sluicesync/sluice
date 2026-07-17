@@ -16,9 +16,14 @@
 // primary RowReader (the same conn-doubles-as-reader shape
 // OpenBackupSnapshot uses).
 //
-// pg_export_snapshot() cannot run during recovery, so a hot-standby
-// source returns a loud error here and the orchestrator falls back to
-// the documented independent-per-connection readers.
+// pg_export_snapshot() is legal on PG >= 16 standbys (the restriction
+// was lifted with logical-decoding-on-standby; live-proven on a
+// Supabase PG 17 read replica, 2026-07-17 probe — the shared-snapshot
+// pin fully engages there, same consistency story as a primary,
+// evaluated at the replica's replay position). Only a PG <= 15
+// hot-standby source still errors here, and the orchestrator falls
+// back to the documented independent-per-connection readers with a
+// loud WARN (migrate_snapshot.go).
 
 package postgres
 
