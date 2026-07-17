@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.273] - 2026-07-17
+
+A CRITICAL silent-loss fix surfaced by the 2026-07-17 confirming audit — the VStream partial-row-image belt was missing from one of its two dispatch paths.
+
+### Fixed
+
+- **CRITICAL: the item-74 NOBLOB partial-row-image belt was missing from the cold-start CDC dispatch path, so a self-hosted Vitess `binlog_row_image=NOBLOB` source could silently overwrite unchanged BLOB/TEXT columns with NULL on the default first sync.** The belt (v0.99.272, ADR-0172) refuses a partial VStream row image before decode — but it was wired only into `vstreamCDCReader.dispatchRow` (the warm-resume path), not its hand-mirrored twin `vstreamSnapshotStream.dispatchCDCRow`, which serves the cold-start snapshot→CDC catch-up. A cold-start sync (the common case) therefore reached the unguarded path: a NOBLOB UPDATE omits an unchanged BLOB/TEXT column as a −1-length NULL cell, the decoder read it as a genuine NULL, and the applied UPDATE silently wrote NULL over the real value (stream green, row counts equal). The belt now fires on both dispatch paths, pinned by a wiring test that drives `dispatchCDCRow` directly and asserts the coded `SLUICE-E-CDC-ROW-IMAGE-PARTIAL` refusal. Exposure is narrow (self-hosted Vitess with the `AllowNoBlobBinlogRowImage` experimental flag; PlanetScale pins `binlog_row_image=FULL` and never trips it), but a silent-loss on a default path is fixed regardless.
+
+### Compatibility
+
+- **A refusal, not a behavior change for correct configs.** The belt only ever fires on a genuinely-partial self-hosted-Vitess row image; a FULL stream (including all of PlanetScale) is unaffected on both dispatch paths.
+
 ## [0.99.272] - 2026-07-17
 
 A post-MariaDB-arc batch: native MariaDB `uuid`/`inet` now stream through CDC faithfully, a silent-loss belt for self-hosted Vitess partial row images, and two roadmap-leftover closures.
