@@ -970,7 +970,20 @@ func (a *ChangeApplier) CompactSchemaHistoryBelow(ctx context.Context, floor ir.
 func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.Position, bool, error) {
 	token, ok, err := readPosition(ctx, a.db, a.controlSchema, streamID)
 	if err != nil {
-		return ir.Position{}, false, err
+		// Classify the control-read error the SAME way the apply path
+		// does (classifyApplierError). The control read rides `a.db`
+		// (pgx's default cached-statement mode, unlike the DescribeExec
+		// apply lanes), so a degraded pooled connection can surface a
+		// transient "failed to deallocate cached statement(s): i/o
+		// timeout" / EOF on a startup or status read. That is the same
+		// pool-level transient the apply path already treats as retriable
+		// — classifying it here makes a transient position read carry the
+		// RetriableError signal so the supervisor backs off and reconnects
+		// (a fresh pooled connection) instead of treating a momentary blip
+		// as a hard fault. Data integrity is never at stake — the read is
+		// a control-table SELECT, and a non-transient error passes through
+		// unchanged.
+		return ir.Position{}, false, classifyApplierError(err)
 	}
 	if !ok {
 		return ir.Position{}, false, nil
@@ -983,7 +996,11 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 // of the table being absent — operators querying status against a
 // fresh target should see "no streams" rather than an error.
 func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, error) {
-	return listStreams(ctx, a.db, a.controlSchema, engineNamePostgres)
+	// Same control-read transient classification as ReadPosition (a
+	// status read rides the cached-statement `a.db`). classifyApplierError
+	// is nil-safe, so a successful list passes through unchanged.
+	streams, err := listStreams(ctx, a.db, a.controlSchema, engineNamePostgres)
+	return streams, classifyApplierError(err)
 }
 
 // RequestStop flips the stop flag on the named stream's row. The

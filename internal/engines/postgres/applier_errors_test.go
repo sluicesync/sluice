@@ -139,6 +139,12 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"connection refused", errors.New("dial tcp: connection refused")},
 		{"broken pipe", errors.New("write tcp: broken pipe")},
 		{"i/o timeout", errors.New("read tcp: i/o timeout")},
+		// The control-read (ReadPosition/ListStreams) transient shape: a
+		// degraded pooled connection surfaces pgx's cached-statement
+		// cleanup timing out. ReadPosition/ListStreams route through
+		// classifyApplierError so this rides the same retriable backoff as
+		// the apply path (rather than a hard startup/status fault).
+		{"cached-statement deallocate i/o timeout (control-read shape)", errors.New(`read position: failed to deallocate cached statement(s): timeout: read tcp 127.0.0.1:53482->127.0.0.1:32769: i/o timeout`)},
 		{"database starting up (server-side)", errors.New("the database system is starting up")},
 		{"database shutting down (server-side)", errors.New("the database system is shutting down")},
 	}
