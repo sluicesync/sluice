@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.269] - 2026-07-17
+
+A robustness fix for the backup-chain concurrent-writer guard's S3 conditional-PUT loser detection.
+
+### Fixed
+
+- **Chain concurrent-writer guard: the create-only conditional-PUT loser is now detected from the authoritative S3 API error code (`PreconditionFailed`), not gocloud's derived error class.** gocloud v0.46.0's s3blob error classifier carries a substring hack — `strings.Contains(err.Error(), "301")`, meant to catch an invalid-bucket 301 redirect — that matches the literal `301` anywhere in the error string, including the random hex RequestID/HostID that S3 stamps on every response. When that substring landed by chance (~2% of requests, whenever the RequestID happened to contain `301`), a genuine `412 PreconditionFailed` conditional-PUT loser was misclassified as `NoSuchBucket` → not-found, so the losing writer surfaced a confusing "not found" error instead of the coded `SLUICE-E-BACKUP-CHAIN-CONFLICT`. sluice now reads the smithy API error code directly — authoritative and immune to the flaky derived class — and falls back to gocloud's error class only for the fileblob/memblob drivers that carry no API error. Surfaced as a v0.99.268 tag-CI flake on the MinIO CAS integration test (RequestID `18C30130E2747EAB` contains `301`); the same misclassification was ~2% latent in production for a real chain-conflict loser.
+
+### Compatibility
+
+- **Purely additive robustness.** No behavior change for the ~98% of conditional-PUT losers gocloud already classified correctly — the fix only recovers the ~2% it misclassified. No CLI, config, or on-disk format change.
+
 ## [0.99.268] - 2026-07-17
 
 MariaDB as a first-class bulk source and target (roadmap item 73 Phase 1, ADR-0168) — operator-requested, scoped by a live probe.
