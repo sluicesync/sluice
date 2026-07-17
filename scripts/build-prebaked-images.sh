@@ -68,7 +68,7 @@
 #       # or via the build-prebaked-images.yml `vitess` matrix entry.
 #   ENGINES=mirrors ./scripts/build-prebaked-images.sh  # MIRROR the stock
 #       # docker.io images CI pre-pulls (postgres:16 + the pg-versions.txt
-#       # majors, mysql:8.0, vitess/vttestserver:mysql80) to
+#       # majors, mysql:8.0, mariadb:{11.4,10.11}, vitess/vttestserver:mysql80) to
 #       # ghcr.io/sluicesync/sluice-mirror-<name>:<tag> as pure retags
 #       # (task #36 — see the mirrors config block). Like vitess, opt-in
 #       # here / a dedicated matrix entry in the workflow.
@@ -130,7 +130,7 @@ VITESS_TARGET_REPO="${GHCR_NAMESPACE}/sluice-vitess"
 
 # mirrors (task #36): pure RETAGS of the STOCK docker.io images CI's
 # pre-pull steps depend on — postgres:{16,<pg-versions.txt majors>},
-# mysql:8.0, vitess/vttestserver:mysql80. Same rationale as the vitess
+# mysql:8.0, mariadb:{11.4,10.11}, vitess/vttestserver:mysql80. Same rationale as the vitess
 # mirror above, but for the images tests deliberately boot UNDER THEIR
 # STOCK NAMES (the pgtrigger cdc-reader, hstore/pg_trgm, PG17 FAILOVER,
 # translate fixtures, the vstream suite, the PG version matrix): three
@@ -524,6 +524,11 @@ mirror_stock_refs() {
     echo "postgres:16"
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$PG_VERSIONS_FILE"
     echo "mysql:8.0"
+    # MariaDB LTS lines the item-73 flavor suites boot (engines-mysql +
+    # pipeline-rest-streamer required shards); mirrored so a docker.io blip
+    # cannot cold-pull-flake those shards (audit 2026-07-17 D1).
+    echo "mariadb:11.4"
+    echo "mariadb:10.11"
     echo "vitess/vttestserver:mysql80"
 }
 

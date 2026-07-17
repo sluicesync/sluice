@@ -187,3 +187,53 @@ func TestMariaDBNativeKindOf(t *testing.T) {
 		}
 	}
 }
+
+// TestMariaDBNativeTypeRegistryCoupling is the A3 (audit 2026-07-17) pin:
+// [mariadbNativeDataTypes] is the SINGLE source of truth coupling the
+// schema-read ir.Type mapping (translateType) to the CDC binlog decoder
+// ([mariadbNativeKindOf] → [decodeMariaDBNative]). It fails if the two
+// ever drift — the exact silent-mis-decode-of-raw-binlog-bytes forward-
+// fragility A3 flags: a native binary-storage type mapped by translateType
+// without a decoder would stringify raw binlog bytes into a wrong value a
+// CHAR/VARCHAR target silently accepts (the Bug-74 class). For every
+// registry entry it asserts (1) translateType maps that data_type to the
+// registry's ir.Type, (2) mariadbNativeKindOf returns the registry kind,
+// (3) the kind is a real (non-None) native kind, and (4) decodeMariaDBNative
+// actually has a decoder for that kind (never the "no native decoder"
+// fall-through).
+func TestMariaDBNativeTypeRegistryCoupling(t *testing.T) {
+	if len(mariadbNativeDataTypes) == 0 {
+		t.Fatal("mariadbNativeDataTypes is empty — the coupling registry vanished")
+	}
+	for dt, nt := range mariadbNativeDataTypes {
+		// (3) every registered native type has a real decoder kind.
+		if nt.kind == mariadbNativeNone {
+			t.Errorf("registry[%q].kind = mariadbNativeNone — a registered native type MUST carry a decoder kind", dt)
+		}
+		// (2) mariadbNativeKindOf is driven by the registry.
+		if got := mariadbNativeKindOf(dt); got != nt.kind {
+			t.Errorf("mariadbNativeKindOf(%q) = %v; registry kind = %v — the schema-read discriminator drifted from the registry", dt, got, nt.kind)
+		}
+		// (1) translateType maps the data_type to the registry's ir.Type.
+		got, err := translateType(columnMeta{DataType: dt})
+		if err != nil {
+			t.Errorf("translateType(%q) errored (%v) — a registry native type must be schema-mappable", dt, err)
+			continue
+		}
+		if got.String() != nt.irType.String() {
+			t.Errorf("translateType(%q) = %s; registry irType = %s — schema mapping drifted from the registry", dt, got.String(), nt.irType.String())
+		}
+		// (4) decodeMariaDBNative has a real decoder for the kind — a
+		// single non-nil input byte proves it never hits the "no native
+		// decoder for kind" fall-through (over-width is refused elsewhere).
+		if _, err := decodeMariaDBNative([]byte{0x01}, nt.kind); err != nil {
+			t.Errorf("decodeMariaDBNative(kind for %q) errored on a 1-byte value (%v) — the decoder is missing for a registered kind", dt, err)
+		}
+	}
+
+	// A non-native data_type must NOT be in the registry (else it would
+	// route real text bytes through the raw-storage decoder).
+	if _, ok := mariadbNativeDataTypes["varchar"]; ok {
+		t.Error("mariadbNativeDataTypes contains \"varchar\" — only native fixed-width storage types belong")
+	}
+}

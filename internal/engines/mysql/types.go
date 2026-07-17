@@ -188,25 +188,29 @@ func translateType(c columnMeta) (ir.Type, error) {
 
 	case "json":
 		return ir.JSON{Binary: true}, nil
+	}
 
 	// ---- MariaDB-native identity / network types ----
 	//
-	// MariaDB grew native UUID (10.7+), INET6 (10.5+), and INET4
-	// (10.10+) types; information_schema reports their data_type as
-	// "uuid" / "inet6" / "inet4" (lowercased by columnsQuery). MySQL 8
-	// has none of these data_type strings — it never reaches these arms
-	// — so adding them to the shared switch is safe (roadmap item 73
-	// Phase 2; the mariadb flavor declares ExtUUID/ExtInet).
+	// MariaDB grew native UUID (10.7+), INET6 (10.5+), and INET4 (10.10+)
+	// types; information_schema reports their data_type as "uuid" / "inet6"
+	// / "inet4" (lowercased by columnsQuery). These resolve through the
+	// shared [mariadbNativeDataTypes] registry rather than hardcoded switch
+	// arms — that registry is the SINGLE source of truth coupling this
+	// schema-read mapping to the CDC binlog decoder ([mariadbNativeKindOf]),
+	// so a native binary-storage type can never be mapped here without also
+	// gaining a decoder (a mapping without a decoder would silently
+	// stringify raw binlog bytes on the CDC tail — the Bug-74 class).
 	//
-	// Both INET6 and INET4 collapse to ir.Inet{}: the IR has no
-	// IPv4-only variant, and the address value round-trips losslessly as
-	// canonical text (PG `inet` natively, a MySQL-family target as
-	// VARCHAR(45) via the writer's auto-emit). MariaDB's own INET4 is a
-	// storage optimisation over INET6, not a distinct value space.
-	case "uuid":
-		return ir.UUID{}, nil
-	case "inet4", "inet6":
-		return ir.Inet{}, nil
+	// Both INET6 and INET4 collapse to ir.Inet{} in the registry: the IR
+	// has no IPv4-only variant, and the address value round-trips
+	// losslessly as canonical text (PG `inet` natively, a MySQL-family
+	// target as VARCHAR(45) via the writer's auto-emit). MariaDB's own
+	// INET4 is a storage optimisation over INET6, not a distinct value
+	// space. MySQL 8 reports none of these data_type strings, so the lookup
+	// misses there and control falls through to the geometry check below.
+	if nt, ok := mariadbNativeDataTypes[c.DataType]; ok {
+		return nt.irType, nil
 	}
 
 	// ---- Geometry (extension type) ----

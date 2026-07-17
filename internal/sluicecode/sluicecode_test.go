@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -146,5 +147,62 @@ func TestRegistryDocSync(t *testing.T) {
 		if _, ok := Describe(c); !ok {
 			t.Errorf("%s documents %s, which is not a registered code", docPath, c)
 		}
+	}
+}
+
+// retainedButUnemittedMarker is the sentinel a registry summary carries
+// when a code's refusal has been LIFTED but the string is kept registered
+// (removing a published catalog code is breaking). It couples the registry
+// prose to the doc prose in TestRegistryDocSync_RetainedProse.
+const retainedButUnemittedMarker = "RETAINED-BUT-UNEMITTED"
+
+// TestRegistryDocSync_RetainedProse extends the token-only sync check
+// (TestRegistryDocSync) to compare row PROSE against the registry — the F7
+// (audit 2026-07-17) gate. TestRegistryDocSync passes forever on a row that
+// still describes an UNEMITTED code as an active refusal, because it only
+// checks the SLUICE-E-… token is present, never that the prose matches the
+// shipped status — exactly the drift error-codes.md rows 29-30 exhibited
+// (MariaDB CDC "not supported yet" long after CDC shipped). This test pins
+// the retained-but-unemitted class: any code whose registry summary carries
+// the [retainedButUnemittedMarker] must have a doc row that also flags it as
+// retained/no-longer-emitted, so stale ACTIVE-refusal prose fails CI.
+func TestRegistryDocSync_RetainedProse(t *testing.T) {
+	docPath := filepath.Join("..", "..", "docs", "operator", "error-codes.md")
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", docPath, err)
+	}
+	// Index each doc row by the first code token on its line (each code
+	// occupies exactly one table row).
+	codeRe := regexp.MustCompile(`SLUICE-E-[A-Z0-9-]+`)
+	rowFor := map[Code]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if m := codeRe.FindString(line); m != "" {
+			if _, seen := rowFor[Code(m)]; !seen {
+				rowFor[Code(m)] = line
+			}
+		}
+	}
+
+	sawRetained := false
+	for c, info := range registry {
+		if !strings.Contains(info.Summary, retainedButUnemittedMarker) {
+			continue
+		}
+		sawRetained = true
+		row, ok := rowFor[c]
+		if !ok {
+			t.Errorf("%s is %s in the registry but has no doc row", c, retainedButUnemittedMarker)
+			continue
+		}
+		up := strings.ToUpper(row)
+		if !strings.Contains(up, "RETAINED") && !strings.Contains(up, "NO LONGER EMITTED") {
+			t.Errorf("%s summary is %s but its error-codes.md row does not flag it retained/no-longer-emitted "+
+				"(prose lags the shipped status — the F7 stale-active-refusal class): %s",
+				c, retainedButUnemittedMarker, row)
+		}
+	}
+	if !sawRetained {
+		t.Logf("no %s codes in the registry (nothing to cross-check) — fine, the guard is a no-op", retainedButUnemittedMarker)
 	}
 }

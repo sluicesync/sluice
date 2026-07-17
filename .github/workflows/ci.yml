@@ -353,7 +353,12 @@ jobs:
       # The STOCK images: several tests deliberately use upstream
       # postgres:16 / mysql:8.0 (the pgtrigger cdc-reader, hstore/pg_trgm,
       # cutover, mysql-boot-retry, translate fixtures) rather than the
-      # pre-baked supersets, and the PG17 FAILOVER-flag tests
+      # pre-baked supersets; the MariaDB flavor suites (item 73/ADR-0168..
+      # 0172) boot the two LTS lines mariadb:11.4 + mariadb:10.11 in the
+      # engines-mysql shard (flavor_/cdc_reader_mariadb_*) and the
+      # pipeline-rest-streamer shard (TestStreamer_MariaDB*), mirrored here
+      # for the same reason so a docker.io blip cannot red-fail those
+      # required shards; and the PG17 FAILOVER-flag tests
       # (cdc_reader_integration_test.go) boot stock postgres:17 (its cold
       # docker.io pull mid-test flaked TestServerVersionNum_PG17 on three
       # tag runs, v0.99.29/31/32, before being pre-pulled). Task #36:
@@ -374,7 +379,9 @@ jobs:
           bash scripts/ci-mirror-pull.sh \
             postgres:16 \
             postgres:17 \
-            mysql:8.0
+            mysql:8.0 \
+            mariadb:11.4 \
+            mariadb:10.11
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results

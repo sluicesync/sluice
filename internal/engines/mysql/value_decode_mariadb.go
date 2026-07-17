@@ -6,6 +6,8 @@ package mysql
 import (
 	"fmt"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // MariaDB native uuid / inet6 / inet4 CDC binlog decode (ADR-0171).
@@ -61,20 +63,44 @@ const (
 	mariadbNativeInet6
 )
 
+// mariadbNativeType couples a MariaDB native fixed-width data_type to BOTH
+// the width-aware CDC binlog decoder kind AND the ir.Type the schema read
+// maps it to. It exists so the two switches that MUST stay in lockstep
+// cannot drift:
+//
+//   - [mariadbNativeKindOf] (this file) drives the CDC binlog decode — raw
+//     storage bytes -> canonical text via [decodeMariaDBNative].
+//   - translateType (types.go) drives the schema-read ir.Type mapping.
+//
+// A MariaDB native binary-storage type mapped by translateType WITHOUT a
+// decoder kind here would silently route its raw binlog bytes through
+// decodeString — a wrong-but-plausible value a CHAR(36)/VARCHAR(45) target
+// SILENTLY accepts (the Bug-74 silent-mis-decode class this file's header
+// already warns about). Making this map the single source of truth for
+// BOTH sides means adding a native type is one edit and can't half-land;
+// TestMariaDBNativeTypeRegistryCoupling pins the lockstep.
+type mariadbNativeType struct {
+	kind   mariadbNativeKind
+	irType ir.Type
+}
+
+// mariadbNativeDataTypes is the single source of truth for MariaDB's native
+// fixed-width identity/network data_types. Keyed by the lowercased
+// information_schema data_type string; MySQL 8 reports none of these, so a
+// lookup misses on every non-MariaDB flavor.
+var mariadbNativeDataTypes = map[string]mariadbNativeType{
+	"uuid":  {mariadbNativeUUID, ir.UUID{}},
+	"inet4": {mariadbNativeInet4, ir.Inet{}},
+	"inet6": {mariadbNativeInet6, ir.Inet{}},
+}
+
 // mariadbNativeKindOf maps an information_schema.columns data_type string
-// (already lowercased by loadTableSchema's query) to its native kind. Only
-// MariaDB reports these data_types, so on every other flavor this returns
-// [mariadbNativeNone] for every column.
+// (already lowercased by loadTableSchema's query) to its native kind via
+// the [mariadbNativeDataTypes] registry. Only MariaDB reports these
+// data_types, so on every other flavor the lookup misses and this returns
+// [mariadbNativeNone] (the map zero value's kind) for every column.
 func mariadbNativeKindOf(dataType string) mariadbNativeKind {
-	switch dataType {
-	case "uuid":
-		return mariadbNativeUUID
-	case "inet4":
-		return mariadbNativeInet4
-	case "inet6":
-		return mariadbNativeInet6
-	}
-	return mariadbNativeNone
+	return mariadbNativeDataTypes[dataType].kind
 }
 
 // decodeMariaDBNative decodes the RAW binlog storage bytes of a MariaDB

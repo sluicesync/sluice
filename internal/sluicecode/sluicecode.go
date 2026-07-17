@@ -58,8 +58,14 @@ const (
 	CodeCDCPoolerEndpoint        Code = "SLUICE-E-CDC-POOLER-ENDPOINT"
 	CodeCDCRowImagePartial       Code = "SLUICE-E-CDC-ROW-IMAGE-PARTIAL"
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
-	CodeCDCMariaDBUnsupported    Code = "SLUICE-E-CDC-MARIADB-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
+
+	// RETAINED-BUT-UNUSED (ADR-0170): the Phase-1/2 refusal for MariaDB CDC
+	// is lifted — MariaDB CDC via domain GTIDs shipped v0.99.271, so the
+	// flavor declares CDCBinlog and this code is no longer emitted. The
+	// string stays registered because removing a published catalog code is
+	// breaking. Mirrors CodeCDCMariaDBNativeTypeUnsupported below.
+	CodeCDCMariaDBUnsupported Code = "SLUICE-E-CDC-MARIADB-UNSUPPORTED"
 
 	// RETAINED-BUT-UNUSED (ADR-0171): the P3 refusal for MariaDB native
 	// uuid/inet6/inet4 CDC is lifted — the binlog decode now formats those
@@ -152,8 +158,8 @@ var registry = map[Code]Info{
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL/Vitess source streams partial row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON; on a self-hosted Vitess/VStream source the RowChange.DataColumns bitmap marks a NOBLOB-omitted column), under which CDC silently loses UPDATEs — refused at CDC start on the binlog path, and loudly mid-stream when a partial image reaches the reader (a slipped-past global preflight, or a VStream after-image whose bitmap flags an omitted column)"},
-	CodeCDCMariaDBUnsupported:           {ClassRefusal, "CDC (continuous sync / incremental backup) from a MariaDB source is not supported yet — MariaDB's domain-based GTID positions are roadmap item 73 Phase 3; use bulk migrate + cutover or backup/restore today"},
-	CodeCDCMariaDBNativeTypeUnsupported: {ClassRefusal, "a MariaDB source has a native uuid / inet6 / inet4 column in CDC scope, which sluice cannot yet decode from the binlog (the binlog carries raw storage bytes, not the text bulk copy reads) — refused at CDC start on ALL targets rather than risk a silently-wrong value on a MySQL-family target; use bulk `sluice migrate` for those tables/columns (unaffected) or exclude the column. Native-uuid/inet CDC decode is roadmap item 73 P3 follow-up (ADR-0170)"},
+	CodeCDCMariaDBUnsupported:           {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB CDC (domain-GTID positions) shipped v0.99.271 (ADR-0170); the flavor now declares CDCBinlog and this refusal is no longer emitted. Kept registered because removing a published catalog code is breaking"},
+	CodeCDCMariaDBNativeTypeUnsupported: {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB native uuid/inet6/inet4 CDC binlog decode shipped v0.99.272 (ADR-0171), lifting this refusal — the CDC tail now converges byte-for-byte with the bulk-copy text. Kept registered because removing a published code is breaking; no longer emitted"},
 
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},

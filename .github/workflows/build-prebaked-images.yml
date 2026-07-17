@@ -6,7 +6,7 @@
 # tags (scripts/vitess-versions.txt) to ghcr.io/sluicesync/sluice-vitess for
 # the gated multi-version cluster matrix (vitess-version-matrix.yml), plus
 # MIRROR the stock docker.io images CI pre-pulls (postgres:16 + the
-# scripts/pg-versions.txt majors, mysql:8.0, vitess/vttestserver:mysql80)
+# scripts/pg-versions.txt majors, mysql:8.0, mariadb:{11.4,10.11}, vitess/vttestserver:mysql80)
 # to ghcr.io/sluicesync/sluice-mirror-<name>:<tag> as pure retags (task
 # #36 — removes docker.io from CI's critical path; consumers pull via
 # scripts/ci-mirror-pull.sh with a docker.io fallback). The
