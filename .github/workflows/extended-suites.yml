@@ -96,6 +96,26 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-vitess:v24.0.1
 
+      # TestVitessChaos_RollingUpgrade_MidSync HARDCODES the literal
+      # docker.io tags vitess/lite:v24.0.0 (initial boot) and
+      # vitess/lite:v24.0.1 (mid-sync recreate) via
+      # chaosUpgrade{From,To}Image, overriding VITESS_LITE_IMAGE. Without
+      # this, both cold-pull from docker.io during the live per-service
+      # recreate — and the recreate competes with a 5m PingTablet budget,
+      # so a slow cold pull times the tablet-ping out (the ~2026-07-12
+      # intermittent red). Warm BOTH into the local cache up front, off the
+      # ping-budget path: v24.0.1 retags from its GHCR mirror; v24.0.0 has
+      # no mirror (kept out of vitess-versions.txt by the one-minor-per-
+      # major convention) so ci-mirror-pull falls back to a docker.io pull
+      # here in this dedicated step (full retry budget, not the ping timer).
+      - name: Warm the rolling-upgrade image cache (v24.0.0 + v24.0.1)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-mirror-pull.sh --mirror ghcr.io/sluicesync/sluice-vitess:v24.0.1 vitess/lite:v24.0.1
+          bash scripts/ci-mirror-pull.sh --mirror ghcr.io/sluicesync/sluice-vitess:v24.0.0 vitess/lite:v24.0.0
+
       - name: Run the chaos suite
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1

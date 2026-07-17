@@ -169,7 +169,7 @@ get "https://raw.githubusercontent.com/WordPress/wordpress-develop/trunk/src/wp-
 extract_wp_schema ".wordpress.raw" "wordpress_mysql.ddl.sql"; rm -f ".wordpress.raw"
 
 # --- iteration 4 ---
-# Vitess own example schema (vitessio/vitess examples/local). Apache-2.0
+# Vitess own example schema (vitessio/vitess examples/common). Apache-2.0
 # (vitessio/vitess LICENSE) — permissively licensed, but kept gitignored
 # / fetch-on-demand for consistency with the rest of the corpus. The
 # `commerce` keyspace schema is the canonical Vitess example: no FKs
@@ -177,7 +177,9 @@ extract_wp_schema ".wordpress.raw" "wordpress_mysql.ddl.sql"; rm -f ".wordpress.
 # — characterizes Vitess DDL idioms through sluice's MySQL reader. Run
 # through strip_data for discipline (it is schema-only upstream; the
 # strip is a no-op safety pass + drops any `USE`/`source` if present).
-get "https://raw.githubusercontent.com/vitessio/vitess/main/examples/local/create_commerce_schema.sql" \
+# NOTE: upstream relocated this from examples/local → examples/common
+# (2026-07); the old path 404s. Keep on examples/common.
+get "https://raw.githubusercontent.com/vitessio/vitess/main/examples/common/create_commerce_schema.sql" \
     ".vitess_commerce.raw"
 strip_data ".vitess_commerce.raw" "vitess_commerce_mysql.ddl.sql"; rm -f ".vitess_commerce.raw"
 
@@ -213,7 +215,7 @@ vt_sha=$("$CURL" -fsSL -m 30 \
   echo "employees_mysql_partitioned.ddl.sql <- datacharmer/test_db@master  commit=${emp_sha:-unresolved}  (source-directives stripped)"
   echo "joomla_*.ddl.sql                  <- joomla/joomla-cms@5.4-dev  commit=${jm_sha:-unresolved}  (seed data stripped)"
   echo "wordpress_mysql.ddl.sql           <- WordPress/wordpress-develop@trunk  commit=${wp_sha:-unresolved}  (extracted from PHP wp_get_db_schema())"
-  echo "vitess_commerce_mysql.ddl.sql     <- vitessio/vitess@main  commit=${vt_sha:-unresolved}  (examples/local commerce keyspace; data-strip pass)"
+  echo "vitess_commerce_mysql.ddl.sql     <- vitessio/vitess@main  commit=${vt_sha:-unresolved}  (examples/common commerce keyspace; data-strip pass)"
 } > FETCHED.txt
 
 echo "done. outputs:"

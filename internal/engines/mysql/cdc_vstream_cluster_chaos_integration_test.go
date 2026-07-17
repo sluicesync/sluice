@@ -530,7 +530,12 @@ func TestVitessChaos_RollingUpgrade_MidSync(t *testing.T) {
 	// The recreated replica's vttablet needs to finish booting before we can
 	// reparent onto it — `compose up` returns at container-start, not at
 	// tablet-serving, and a PRS issued too early fails "tablet is shutdown".
-	cc.waitForTabletPing(t, tabletAliasReplica, 3*time.Minute)
+	// 5m (was 3m): the recreate boots vitess/lite:v24.0.1; the extended-
+	// suites chaos job now pre-warms that tag into the local cache (see the
+	// "Warm the rolling-upgrade image cache" step), but the extra headroom
+	// covers a slow container-start under -race CPU pressure so a boot-timing
+	// blip doesn't surface as a ping timeout (the ~2026-07-12 intermittent).
+	cc.waitForTabletPing(t, tabletAliasReplica, 5*time.Minute)
 	_ = drainUntil(changes, drain, drain.count()+5, 60*time.Second)
 
 	// 3. promote the upgraded replica so the old primary can be upgraded
