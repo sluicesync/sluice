@@ -507,6 +507,22 @@ Supabase servers default `extra_float_digits=0`, so **text-level** float compari
 
 Supabase ships its platform schemas (`auth`, `storage`, `realtime`, …) alongside `public`. sluice's default `public` scoping ignores them correctly; nothing to exclude manually.
 
+## Managed MySQL: the binlog-retention story at a glance
+
+The next three sections (DigitalOcean, AWS RDS, Google Cloud SQL — each validated live) share one theme: on managed MySQL, the CDC window a detached or slow-starting stream can survive is a **platform property**, and on two of the three platforms the server variable that claims to describe it lies. The three-point comparison, measured 2026-07-15/16:
+
+| | DigitalOcean | AWS RDS | Google Cloud SQL |
+|---|---|---|---|
+| Default effective window | ~13–16 min (out-of-band reaper) | ~5–11 min (post-backup-upload purge) | **1 day** (variable-governed) |
+| Does `@@binlog_expire_logs_seconds` tell the truth? | No (reads 3 d) | No (reads 30 d) | **Yes (reads 1 d)** |
+| Where's the real knob | DO config API (`binlog_retention_period`, 600–86400 s) | SQL: `mysql.rds_set_configuration('binlog retention hours', N)`, cap 168 h | gcloud database flag `binlog_expire_logs_seconds`, floor 86400 s, no practical cap |
+| Knob change restarts? | No | No | No (but the PITR *toggle* does, twice, and wipes positions) |
+| Detect signal | host suffix only | host suffix + SQL-visible setting | **no host suffix; `@@version` ends in `-google`** |
+| `FLUSH TABLES WITH READ LOCK` | allowed | platform-blocked | allowed |
+| Defaults CDC-safe? | No | No | **Yes** (for gaps < 24 h) |
+
+sluice's `sync`/backup preflight advises per platform: an unconditional WARN on DO host patterns (the truth is API-only there), a detect-then-read probe on RDS hosts (silent when correctly configured), and an in-band `@@version` fingerprint for Cloud SQL (silent at its safe defaults). Details in each section.
+
 ## DigitalOcean Managed MySQL
 
 **Status**: cold copy + CDC handoff validated live 2026-07-15 (throwaway `db-s-1vcpu-1gb`, MySQL 8.4). Uses the vanilla `mysql` engine. One platform behaviour is dangerous enough to headline:
@@ -584,6 +600,53 @@ The master user is **not** a superuser and never has the REPLICATION attribute (
 
 Untested. Expected CDC-incompatible (transaction-mode pooler — the replication protocol cannot traverse it), same class as the Neon/Supabase pooler findings. Connect sluice to the **instance** endpoint (`*.<id>.<region>.rds.amazonaws.com`), not a proxy endpoint (`*.proxy-*.rds.amazonaws.com`).
 
+## Google Cloud SQL for MySQL
+
+**Status**: cold copy + CDC handoff + 35-min-detach warm resume validated live 2026-07-16 (throwaway db-f1-micro Enterprise, MySQL 8.0.45). Uses the vanilla `mysql` engine, connecting to the instance's public IP directly (no proxy required — see the connection notes below).
+
+### Retention: truthful and safe by default (1-day floor)
+
+Unlike DigitalOcean and RDS, Cloud SQL's `@@binlog_expire_logs_seconds` (default **86400 = 1 day**) is the real on-disk retention and no out-of-band reaper purges ahead of it — a stream detached for well under a day warm-resumes on pure defaults. The platform refuses to set it below 86400 (allowed: 0 = never, or 1–49,710 days), so the CDC window can't be misconfigured short. To stretch it past a day: `gcloud sql instances patch INSTANCE --database-flags=binlog_expire_logs_seconds=604800` — applied live, no restart; `--database-flags` replaces the whole flag set, so include existing flags. **`--retained-transaction-log-days` is NOT this knob**: it governs the PITR log copies in Cloud Storage (Enterprise caps it at 7 days), which the replication protocol can't read. Binlogs count against disk; watch storage if you raise the flag with auto-grow off.
+
+sluice fingerprints Cloud SQL in-band on `sync`/backup runs (there is no hostname to pattern-match — the reliable signal is `@@version` ending in `-google`, which also works through the auth proxy) and reads the retention variable, which is honest here; at the platform's safe defaults it stays silent.
+
+### The PITR toggle destroys positions (both directions)
+
+`--no-enable-bin-log` restarts the instance (~10 min operation), sets `log_bin=0` and deletes every binlog (a running stream dies loudly with `ERROR 1236: Binary log is not open`); re-enabling restarts it again and **resets numbering to `mysql-bin.000001`**, so positions persisted before the toggle are permanently invalid — expect sluice's loud WARN + auto-resnapshot (sluice's position-loss error names this Cloud SQL failure mode when the source fingerprints as Cloud SQL). Binary logging also requires automated backups: disabling backups with binlog on is refused (HTTP 400), and creating with `--enable-bin-log` implies backups.
+
+### Connection + privilege gotchas
+
+- **No hostname**: Cloud SQL is bare-IP (or the auth-proxy at localhost) — nothing for host-pattern advisories to match; the reliable fingerprint is `@@version` ending in `-google`.
+- **TLS**: defaults accept plaintext (`ALLOW_UNENCRYPTED_AND_ENCRYPTED`). `?tls=true` fails — per-instance private CA; fetch it with `gcloud sql instances describe INSTANCE --format='value(serverCaCert.cert)'` and pass `--source-tls-ca` (same recipe as DO; RDS's public-URL bundle has no analog here).
+- **`FLUSH TABLES WITH READ LOCK` works** — root has effective `RELOAD`/`FLUSH_TABLES`, so sluice's concurrent frozen-snapshot cold copy runs with no fallback WARNs (the RDS platform-block does not apply).
+- Replication grants present on root out of the box; `binlog_format=ROW` + `binlog_row_image=FULL` + `gtid_mode=ON` by default even on 8.0 (no parameter-group dance); `sql_require_primary_key=OFF`; stock-strict `sql_mode` (no DO-style ANSI surprise).
+- `SET GLOBAL` / `PURGE BINARY LOGS` are denied (no SUPER) — all retention/config changes go through gcloud/API database flags.
+
+## Google Cloud SQL for PostgreSQL
+
+**Status**: Live-validated 2026-07-16 (v0.99.263, Cloud SQL PG 16.14) as a migration + slot-based CDC **source** — byte-identical bulk migrate on md5 ground truth (NaN-in-`numeric[]`, ±Infinity, denormal floats, 2-D arrays with NULL elements) and exact CDC convergence with a clean snapshot→CDC handoff. The vanilla `postgres` engine is the right driver, connecting to the instance's public IP directly (authorized-network allowlist; no proxy required).
+
+### Enabling logical replication
+
+Two steps, both self-service, no ticket:
+
+1. Database flag **`cloudsql.logical_decoding = on`** — `gcloud sql instances patch <instance> --database-flags=cloudsql.logical_decoding=on`. The patch performs the required restart inline (~1 min end-to-end; validated live). Careful: `--database-flags` replaces the entire flag set — include any existing flags.
+2. Grant the connecting role the REPLICATION attribute: **`ALTER ROLE <role> WITH REPLICATION;`** — this WORKS on Cloud SQL as the (non-superuser) default `postgres` user: Cloud SQL patches the grant for `cloudsqlsuperuser` members. This is exactly recovery path (a) in sluice's replication-capability refusal, and the refusal names Cloud SQL for that reason. (Membership in `cloudsqlreplica`/`cloudsqllogical` does NOT confer slot creation — those are platform-internal; the attribute is the mechanism, unlike RDS's `rds_replication` membership model.)
+
+Baseline before the flip: `wal_level=replica` regardless of backup settings (no RDS-style retention-0 ⇒ `minimal` trap), `max_replication_slots=10` / `max_wal_senders=10` (unchanged by the flip).
+
+### TLS
+
+**The default accepts plaintext** (`sslMode=ALLOW_UNENCRYPTED_AND_ENCRYPTED`) — always put `sslmode=require` (or stronger) on Cloud SQL DSNs yourself; nothing server-side will refuse a plaintext connection unless the instance was created/patched to `ENCRYPTED_ONLY`. `verify-ca` works with the per-instance CA (`gcloud sql instances describe <instance> --format='value(serverCaCert.cert)'`) via `?sslrootcert=`. `verify-full` does NOT work on default instances (the cert names a `.sql.goog` DNS name the default CA mode doesn't publish; use `--server-ca-mode=GOOGLE_MANAGED_CAS_CA` at create time for a resolvable name — unvalidated).
+
+### Cloud SQL Auth Proxy
+
+Untested. It is an authenticating TCP tunnel, not a transaction pooler, so CDC may traverse it (unlike the pgbouncer class) — unvalidated; connect sluice to the instance IP directly. Cloud SQL's *Managed Connection Pooling* feature IS a pooler and belongs in the CDC-incompatible class (also untested).
+
+### Decommissioning
+
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL and will eventually fill the instance disk.
+
 ## Other managed services
 
 The following haven't been formally verified but should work on the
@@ -596,9 +659,6 @@ of these and hit anything sluice-side, please open an issue.
 - **Aurora Postgres** — uses the vanilla `postgres` engine. Shares
   RDS for Postgres's role model and parameter-group settings
   (`rds.logical_replication=1`); see the validated RDS section above.
-- **GCP CloudSQL for MySQL / Postgres** — uses the vanilla engines.
-  CloudSQL's IAM-based connections require the cloud-sql-proxy
-  alongside sluice.
 - **Azure Database for MySQL / Postgres** — uses the vanilla engines.
 
 The rule of thumb: anything advertising standard pgwire (Postgres)

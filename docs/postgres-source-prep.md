@@ -40,7 +40,7 @@ How you change it depends on who runs the server — `wal_level` cannot be chang
 | Supabase | Nothing — `logical` is on by default | Note the direct-vs-pooler endpoint constraints in [managed-services](managed-services.md#supabase-postgres). |
 | PlanetScale Postgres | On by default on current provisioning; verify with `SHOW wal_level` | Older/custom-provisioned databases may differ. |
 | AWS RDS / Aurora | Parameter group: `rds.logical_replication = 1`, then reboot | The GUC itself is read-only on RDS; the rds.* parameter drives it. With `backup-retention-period 0` the baseline is `minimal` (not the usually-assumed `replica`) — the parameter flip forces `logical` either way; don't detour via "enable backups". |
-| GCP CloudSQL | Flag `cloudsql.logical_decoding = on`, then restart | |
+| GCP CloudSQL | Flag `cloudsql.logical_decoding = on`, then restart | Validated live 2026-07-16: the restart is automatic inside `gcloud sql instances patch` (~1 min); `--database-flags` replaces the whole flag set, so include existing flags. Then grant the role: `ALTER ROLE <role> REPLICATION` — works as the default `postgres` user (Cloud SQL patches the check for `cloudsqlsuperuser` members). Baseline is `replica` regardless of backup settings (no RDS-style `minimal` trap). See [managed-services](managed-services.md#google-cloud-sql-for-postgresql). |
 | Azure Database for PostgreSQL | Server parameter `wal_level = logical`, then restart | |
 
 ### WAL volume cost of `wal_level = logical`

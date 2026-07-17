@@ -1452,11 +1452,14 @@ func VerifyBackup(ctx context.Context, store irbackup.Store) (total, failed int,
 //
 // It returns (total, failed, nil) on a completed scan even when chunks
 // failed — the count-inspecting contract every existing caller relies on.
+// failed aggregates BOTH failure kinds (chunk + manifest/lineage
+// signature) so a wrong-key or tampered signed chain still reads as
+// failed > 0; only the human-facing summary line separates them.
 // The CLI wants a coded exit-3 Refusal on failure instead (Bug 185), so it
 // calls [VerifyBackupCoded]; both share [verifyBackupScan].
 func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
-	total, failed, _, _, err = verifyBackupScan(ctx, store, opts)
-	return total, failed, err
+	tally, err := verifyBackupScan(ctx, store, opts)
+	return tally.total, tally.failed(), err
 }
 
 // VerifyBackupCoded is [VerifyBackupWith] plus a coded aggregate error when
@@ -1467,30 +1470,30 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 // The count-only [VerifyBackupWith] / [VerifyBackup] keep their (total,
 // failed, nil) contract for callers that inspect the failed count directly.
 func VerifyBackupCoded(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
-	total, failed, sawCorrupt, sawAuth, err := verifyBackupScan(ctx, store, opts)
+	tally, err := verifyBackupScan(ctx, store, opts)
 	if err != nil {
-		return total, failed, err
+		return tally.total, tally.failed(), err
 	}
-	if failed == 0 {
-		return total, failed, nil
+	if tally.failed() == 0 {
+		return tally.total, 0, nil
 	}
-	return total, failed, aggregateVerifyError(total, failed, sawCorrupt, sawAuth)
+	return tally.total, tally.failed(), aggregateVerifyError(tally)
 }
 
-// aggregateVerifyError wraps the "N of M chunks failed" summary in the
-// right coded Refusal (Bug 185). Prefer -CHUNK-CORRUPT when any SHA-256
+// aggregateVerifyError wraps the verify-failure summary in the right
+// coded Refusal (Bug 185). Prefer -CHUNK-CORRUPT when any SHA-256
 // mismatch was seen (at-rest corruption/bit-rot), else -CHUNK-AUTH-FAILED
 // when an auth/decrypt/splice failure was seen. When neither chunk-kind
-// fired — a manifest-signature-only failure — the aggregate stays uncoded
+// fired — a signature-only failure — the aggregate stays uncoded
 // (the signature refusal was already reported per-manifest), matching the
 // pre-Bug-185 shape for that path.
-func aggregateVerifyError(total, failed int, sawCorrupt, sawAuth bool) error {
-	msg := fmt.Errorf("verify: %d of %d chunk(s) failed verification", failed, total)
+func aggregateVerifyError(tally verifyScanTally) error {
+	msg := verifyFailureSummary(tally.total, tally.chunkFailed, tally.sigFailed)
 	switch {
-	case sawCorrupt:
+	case tally.sawCorrupt:
 		return sluicecode.Wrap(sluicecode.CodeBackupChunkCorrupt,
 			"restore from an untampered/healthy copy, or re-fetch the failing chunk object(s)", msg)
-	case sawAuth:
+	case tally.sawAuth:
 		return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
 			"restore from an untampered copy; sign the chain (--sign/--sign-key + --require-signature) to make tamper evident earlier", msg)
 	default:
@@ -1498,19 +1501,58 @@ func aggregateVerifyError(total, failed int, sawCorrupt, sawAuth bool) error {
 	}
 }
 
+// verifyFailureSummary renders the aggregate failure line with chunk
+// and signature failures counted SEPARATELY. Pre-split, signature
+// failures were folded into the chunk numerator against a chunk-count
+// denominator, so a wrong-key verify of a signed 1-chunk chain read
+// "2 of 1 chunk(s) failed verification" (manifest + lineage signature
+// failures counted as chunks) — loud and correct in direction, but a
+// signature failure is not a chunk (KMS real-cloud validation nit,
+// 2026-07-16).
+func verifyFailureSummary(total, chunkFailed, sigFailed int) error {
+	switch {
+	case chunkFailed > 0 && sigFailed > 0:
+		return fmt.Errorf("verify: %d of %d chunk(s) failed verification; %d signature failure(s)",
+			chunkFailed, total, sigFailed)
+	case sigFailed > 0:
+		return fmt.Errorf("verify: %d signature failure(s); all %d chunk(s) passed verification",
+			sigFailed, total)
+	default:
+		return fmt.Errorf("verify: %d of %d chunk(s) failed verification", chunkFailed, total)
+	}
+}
+
+// verifyScanTally carries [verifyBackupScan]'s counters. Chunk and
+// signature failures are SEPARATE — a manifest/lineage signature
+// failure is not a chunk, so folding it into the chunk numerator
+// produced summaries like "2 of 1 chunk(s) failed verification" on a
+// wrong-key verify of a signed 1-chunk chain (KMS real-cloud
+// validation nit, 2026-07-16). The saw* flags record which
+// chunk-failure kind(s) fired so the coded entrypoint can pick the
+// right Bug-185 Refusal code.
+type verifyScanTally struct {
+	total       int  // chunks referenced by the walked manifests
+	chunkFailed int  // per-chunk SHA / decrypt / splice failures (of total)
+	sigFailed   int  // manifest/lineage signature failures (not chunks)
+	sawCorrupt  bool // a SHA-256 mismatch fired
+	sawAuth     bool // a decrypt/GCM-auth failure or plaintext splice fired
+}
+
+// failed is the aggregate count the [VerifyBackupWith] contract exposes:
+// both failure kinds, so a wrong-key signed chain still reads failed > 0.
+func (t verifyScanTally) failed() int { return t.chunkFailed + t.sigFailed }
+
 // verifyBackupScan is the shared verify loop behind [VerifyBackupWith] and
-// [VerifyBackupCoded]. It reports total/failed chunk counts and which
-// failure kind(s) fired (sawCorrupt = SHA-256 mismatch; sawAuth =
-// decrypt/GCM-auth failure or plaintext splice) so the coded entrypoint can
-// pick the right Refusal code. An operational error (bad manifest, wrong
-// key) short-circuits with a non-nil err as before.
-func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, sawCorrupt, sawAuth bool, err error) {
+// [VerifyBackupCoded]. An operational error (bad manifest, wrong key)
+// short-circuits with a non-nil err as before.
+func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOptions) (verifyScanTally, error) {
+	var tally verifyScanTally
 	records, err := lineage.ListAllSegmentManifests(ctx, store)
 	if err != nil {
-		return 0, 0, false, false, fmt.Errorf("verify: %w", err)
+		return verifyScanTally{}, fmt.Errorf("verify: %w", err)
 	}
 	if len(records) == 0 {
-		return 0, 0, false, false, errors.New("verify: no manifests found in store")
+		return verifyScanTally{}, errors.New("verify: no manifests found in store")
 	}
 	// M0.4 / Bug 182: a tampered or bit-rotted manifest carrying a null
 	// structural element (a `"tables":[null]` or a `chunks:[null]`) would
@@ -1522,7 +1564,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// M0.4; this closes the second, unguarded verify traversal.)
 	for _, rec := range records {
 		if verr := validateManifestStructure(rec.Manifest); verr != nil {
-			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+			return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
 				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
 				fmt.Errorf("verify: manifest %q: %w", rec.Path, verr))
 		}
@@ -1547,12 +1589,12 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			// `backup verify --encrypt` returns a false GREEN on the exact
 			// downgrade restore refuses. An operator who passes --encrypt EXPECTS
 			// encryption, so this is the loud signal that catches it.
-			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+			return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
 				"remove --encrypt if this backup is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign chains (--sign + --require-signature) to make this tamper-evident",
 				errors.New("verify: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to report a plaintext-claiming chain as verified under a key"))
 		}
 		if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
-			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
 				"supply the key material matching the chain's recorded kek_mode (the passphrase for kek_mode=passphrase, the KMS reference for a KMS mode)",
 				fmt.Errorf("verify: envelope mode %q does not match chain's recorded kek_mode %q",
 					opts.Envelope.Mode(), rootEnc.KEKMode))
@@ -1561,7 +1603,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			// ADR-0152 chokepoint: bound unwrap for v5+ roots +
 			// the Azure key-version retarget (audit N-9).
 			if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
-				return 0, 0, false, false, fmt.Errorf(
+				return verifyScanTally{}, fmt.Errorf(
 					"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
 				)
 			}
@@ -1574,8 +1616,9 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// ADR-0154: report + verify the whole-manifest signatures. Reports
 	// signed/valid, signed/invalid, or unsigned per manifest; an invalid
 	// (or, under RequireSignature, an unverifiable) signature counts as a
-	// verify failure so `backup verify` exits non-zero.
-	failed += verifyBackupSignatures(ctx, store, records, opts)
+	// verify failure so `backup verify` exits non-zero — but in its OWN
+	// counter, not the chunk tally (see [verifyFailureSummary]).
+	tally.sigFailed = verifyBackupSignatures(ctx, store, records, opts)
 
 	// SEC-MIRROR follow-up: an encrypted chain must not carry a plaintext
 	// chunk. verifyChunk is SHA-only and ProbeChunkDecrypt no-ops on a nil
@@ -1585,8 +1628,8 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// lives on the chain root (records[0]); incrementals inherit it by reference.
 	chainEncrypted := len(records) > 0 && records[0].Manifest.ChainEncryption != nil
 	plaintextSplice := func(manifestPath, kind, file string) {
-		failed++
-		sawAuth = true // a plaintext splice is coded -CHUNK-AUTH-FAILED (Bug 185)
+		tally.chunkFailed++
+		tally.sawAuth = true // a plaintext splice is coded -CHUNK-AUTH-FAILED (Bug 185)
 		slog.ErrorContext(ctx, "verify: plaintext chunk in an encrypted chain (splice)",
 			slog.String("manifest", manifestPath), slog.String("kind", kind), slog.String("file", file),
 			slog.String("error", "chunk carries no encryption metadata on an encrypted chain — refusing (SLUICE-E-BACKUP-CHUNK-AUTH-FAILED at restore)"))
@@ -1601,14 +1644,14 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		// Row chunks (full backups).
 		for _, table := range manifest.Tables {
 			for _, chunk := range table.Chunks {
-				total++
+				tally.total++
 				if chainEncrypted && chunk.Encryption == nil {
 					plaintextSplice(rec.Path, "row chunk ("+table.Name+")", chunk.File)
 					continue
 				}
 				if err := verifyChunk(ctx, segStore, chunk); err != nil {
-					failed++
-					classifyChunkFailure(err, &sawCorrupt, &sawAuth)
+					tally.chunkFailed++
+					classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
 					slog.ErrorContext(
 						ctx, "verify: chunk failed",
 						slog.String("manifest", rec.Path),
@@ -1619,8 +1662,8 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 					continue
 				}
 				if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
-					failed++
-					sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
+					tally.chunkFailed++
+					tally.sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
 					slog.ErrorContext(
 						ctx, "verify: chunk decrypt probe failed",
 						slog.String("manifest", rec.Path),
@@ -1640,14 +1683,14 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		}
 		// Change chunks (incremental backups).
 		for _, chunk := range manifest.ChangeChunks {
-			total++
+			tally.total++
 			if chainEncrypted && chunk.Encryption == nil {
 				plaintextSplice(rec.Path, "change chunk", chunk.File)
 				continue
 			}
 			if err := verifyChunk(ctx, segStore, chunk); err != nil {
-				failed++
-				classifyChunkFailure(err, &sawCorrupt, &sawAuth)
+				tally.chunkFailed++
+				classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
 				slog.ErrorContext(
 					ctx, "verify: change chunk failed",
 					slog.String("manifest", rec.Path),
@@ -1657,8 +1700,8 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				continue
 			}
 			if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
-				failed++
-				sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
+				tally.chunkFailed++
+				tally.sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
 				slog.ErrorContext(
 					ctx, "verify: change chunk decrypt probe failed",
 					slog.String("manifest", rec.Path),
@@ -1674,7 +1717,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			)
 		}
 	}
-	return total, failed, sawCorrupt, sawAuth, nil
+	return tally, nil
 }
 
 // classifyChunkFailure inspects a per-chunk verify error's coded class and

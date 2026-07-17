@@ -42,6 +42,8 @@ Nullability itself is a property of the IR `Column` (`Column.Nullable`), not of 
 | `Timestamp` | `time.Time` | Always `UTC` regardless of the source's session timezone. Engine readers handle the conversion. |
 | `JSON` | `[]byte` | Raw JSON bytes. Whether the engine validated/normalised the bytes is recorded on `Column.Type` (`JSON{Binary: true}` for a parsed/normalised representation, `JSON{Binary: false}` for textual). |
 
+**Float NaN payload bits are outside the contract.** A Postgres `float8` NaN applied through slot-CDC lands as Go's canonical quiet NaN (`7ff8000000000001`) where the source held PG's (`7ff8000000000000`) — text-identical, invisible to every SQL comparison and to `verify`, detectable only via `float8send` bytes; cold copy and trigger-CDC preserve the source's bits (observed live on Cloud SQL PG 16, 2026-07-16, provider-independent). `-0.0` DOES round-trip exactly through slot-CDC apply (the trigger engine's `-0`→`+0` wart is documented in ADR-0066). If float-bit forensics ever become a stated guarantee, this is the line to revisit.
+
 ## Extension IR types
 
 | IR type | Go value type in `Row` | Notes |

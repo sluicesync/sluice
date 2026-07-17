@@ -1450,8 +1450,12 @@ func verifyBinlogFilePresent(ctx context.Context, db *sql.DB, file string) error
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("mysql: SHOW BINARY LOGS rows: %w", err)
 	}
-	return fmt.Errorf("mysql: binlog file %q is no longer available on the source (purged); cannot resume: %w",
-		file, ir.ErrPositionInvalid)
+	// [cloudSQLPositionLossHint] names the Cloud SQL PITR-toggle
+	// numbering reset when the source fingerprints as Cloud SQL ("" on
+	// every other source); the probe runs only on this already-failing
+	// branch.
+	return fmt.Errorf("mysql: binlog file %q is no longer available on the source (purged)%s; cannot resume: %w",
+		file, cloudSQLPositionLossHint(ctx, db), ir.ErrPositionInvalid)
 }
 
 // verifyGTIDSetReachable checks that the source's @@gtid_purged is
@@ -1483,8 +1487,11 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 	if subset == 1 {
 		return nil
 	}
-	return fmt.Errorf("mysql: source has purged GTIDs not present in resume set; cannot resume: %w",
-		ir.ErrPositionInvalid)
+	// Cloud SQL PITR-toggle hint, same as the file/pos path: with the
+	// binlogs destroyed, gtid_purged advances to gtid_executed and the
+	// pre-toggle resume set fails this check.
+	return fmt.Errorf("mysql: source has purged GTIDs not present in resume set%s; cannot resume: %w",
+		cloudSQLPositionLossHint(ctx, db), ir.ErrPositionInvalid)
 }
 
 // gtidModeOn queries the source's gtid_mode variable. ON, ON_PERMISSIVE,

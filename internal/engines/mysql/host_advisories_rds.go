@@ -59,22 +59,29 @@ const rdsRetentionRecommendedHours = 24
 const rdsRetentionProbeTimeout = 15 * time.Second
 
 // SourceProbedAdvisories implements [ir.SourceProbedAdvisor]: on a
-// CDC-anchoring run (sync, backup) whose source host is an AWS RDS /
-// Aurora MySQL endpoint, read the REAL retention setting from
-// mysql.rds_configuration and advise accordingly. A plain migrate
-// never returns to the binlog, so cdc=false is a no-op; so are
-// non-RDS hosts (no connection is even attempted) and unparseable
-// DSNs.
+// CDC-anchoring run (sync, backup), read the source's REAL retention
+// truth and advise accordingly. Two probe legs, each gated so a
+// non-matching host never pays a connection:
+//
+//   - AWS RDS / Aurora MySQL endpoints (host suffix): read the
+//     retention setting from mysql.rds_configuration.
+//   - Google Cloud SQL candidates (an IP-literal or localhost host —
+//     Cloud SQL has NO host pattern, see host_advisories_cloudsql.go):
+//     fingerprint via @@version and, only when it IS Cloud SQL, read
+//     @@binlog_expire_logs_seconds (honest on that platform).
+//
+// A plain migrate never returns to the binlog, so cdc=false is a
+// no-op; so are named non-RDS hosts (no connection is even attempted)
+// and unparseable DSNs.
 func (e Engine) SourceProbedAdvisories(ctx context.Context, dsn string, cdc bool) []ir.SourceHostAdvisory {
 	if !cdc {
 		return nil
 	}
-	host, ok := rdsMySQLHost(dsn)
-	if !ok {
-		return nil
+	if host, ok := rdsMySQLHost(dsn); ok {
+		hours, err := e.probeRDSBinlogRetentionHours(ctx, dsn)
+		return rdsRetentionAdvisories(host, hours, err)
 	}
-	hours, err := e.probeRDSBinlogRetentionHours(ctx, dsn)
-	return rdsRetentionAdvisories(host, hours, err)
+	return e.probeCloudSQLAdvisories(ctx, dsn)
 }
 
 // probeRDSBinlogRetentionHours opens a short-lived, timeout-bounded

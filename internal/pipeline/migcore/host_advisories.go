@@ -16,10 +16,11 @@ import (
 // point that opens a source calls — migrate, sync, and the backup CDC
 // paths — so a managed-host hazard the engine can read off the DSN
 // alone (a pooler endpoint, a DigitalOcean binlog-retention trap) or
-// off one host-gated probe query (the AWS RDS MySQL retention setting)
-// is surfaced up front. Engines without the surfaces are a silent
-// no-op; the run always proceeds (these are advisories, not refusals —
-// the refusal sibling is [ir.DSNValidator]).
+// off one gated probe query (the AWS RDS MySQL retention setting, the
+// Google Cloud SQL in-band fingerprint) is surfaced up front. Engines
+// without the surfaces are a silent no-op; the run always proceeds
+// (these are advisories, not refusals — the refusal sibling is
+// [ir.DSNValidator]).
 //
 // cdc reports whether the run anchors or consumes a CDC position (see
 // [ir.SourceHostAdvisor]).

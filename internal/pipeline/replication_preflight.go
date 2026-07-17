@@ -152,6 +152,14 @@ func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.C
 // supports it. The probe now recognizes `rds_replication` membership,
 // so a refusal on RDS/Aurora means a CUSTOM role lacking the grant —
 // and the grant (not the attribute) is the fix there.
+//
+// Path (a) names Google Cloud SQL explicitly (live-validated
+// 2026-07-16): Cloud SQL uses the standard grantable-attribute model
+// and server-side patches the grant so `cloudsqlsuperuser` members —
+// including the default (non-superuser) `postgres` user — can run
+// `ALTER ROLE ... REPLICATION` themselves. Naming it stops operators
+// from pattern-matching "managed == attribute not grantable" off the
+// RDS/Heroku examples.
 func formatReplicationRefusal(role string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "the source connecting role %q is not a superuser, lacks the REPLICATION attribute, "+
@@ -159,7 +167,9 @@ func formatReplicationRefusal(role string) string {
 	b.WriteString("Slot-based Postgres CDC (`--source-driver=postgres`) creates a logical replication slot at cold start, " +
 		"which requires one of those grants; without it, slot creation fails mid-cold-start with " +
 		"`ERROR: permission denied to create replication slot` (SQLSTATE 42501). ")
-	b.WriteString("Recovery: (a) if you control the server, grant the attribute: `ALTER ROLE ")
+	b.WriteString("Recovery: (a) if you control the server — this also works verbatim on Google Cloud SQL, " +
+		"where the default `postgres` user (any `cloudsqlsuperuser` member) may run it despite not being a " +
+		"superuser — grant the attribute: `ALTER ROLE ")
 	b.WriteString(role)
 	b.WriteString(" REPLICATION;`; ")
 	b.WriteString("(b) re-run sluice with a superuser or replication-enabled role; ")

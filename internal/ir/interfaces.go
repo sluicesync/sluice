@@ -1342,14 +1342,18 @@ type SourceHostAdvisor interface {
 
 // SourceProbedAdvisor is the connection-probing sibling of
 // [SourceHostAdvisor], for managed-host classes where the ground truth
-// is QUERYABLE in-session — detection beats pattern-guessing: the host
-// pattern only gates WHETHER to probe (so non-matching hosts cost
+// is QUERYABLE in-session — detection beats pattern-guessing: a host
+// gate only decides WHETHER to probe (so non-matching hosts cost
 // nothing), and the probe result decides WHAT to say, so a correctly
 // configured host stays silent instead of collecting a blind WARN on
 // every run. Contrast [SourceHostAdvisor]'s DigitalOcean advisory,
 // which MUST warn unconditionally because DO's retention truth is not
 // SQL-visible; AWS RDS MySQL exposes its real retention via
-// mysql.rds_configuration, so its advisory probes first.
+// mysql.rds_configuration, so its advisory probes first. The gate need
+// not be a host PATTERN: Google Cloud SQL has no DNS suffix at all
+// (bare IP, or the auth proxy at localhost), so the MySQL engine gates
+// that probe on the host SHAPE and fingerprints the platform in-band
+// (@@version).
 //
 // The orchestrator calls it from the same chokepoint as
 // SourceHostAdvisories, with the same cdc gate. A probe failure must

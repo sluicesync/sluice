@@ -118,6 +118,7 @@ func TestPreflightSourceReplication_IncapableRoleRefuses(t *testing.T) {
 		`"heroku_like"`,                        // connecting role named
 		"REPLICATION",                          // mechanism named
 		"ALTER ROLE",                           // grant-attribute recovery (a)
+		"Google Cloud SQL",                     // (a) works verbatim there (live-validated 2026-07-16)
 		"superuser",                            // alternative-role recovery (b)
 		"rds_replication",                      // RDS/Aurora membership recovery (c) — the F1 provider-aware hint
 		"GRANT rds_replication TO heroku_like", // the concrete custom-role remedy, naming the role
@@ -163,5 +164,8 @@ func TestFormatReplicationRefusal_NamesRoleAndHints(t *testing.T) {
 	}
 	if !strings.Contains(msg, "GRANT rds_replication TO essential_db_user") {
 		t.Errorf("expected the RDS/Aurora membership remedy naming the role; got %q", msg)
+	}
+	if !strings.Contains(msg, "cloudsqlsuperuser") {
+		t.Errorf("expected the Cloud SQL self-service note on recovery (a); got %q", msg)
 	}
 }

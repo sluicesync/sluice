@@ -187,11 +187,14 @@ func TestRDSRetentionAdvisories(t *testing.T) {
 }
 
 // TestSourceProbedAdvisories_Gates pins the two no-connection gates:
-// cdc=false (a plain migrate never returns to the binlog) and non-RDS
-// hosts must return nil WITHOUT probing — the host pattern is what
-// keeps the probe free for everyone else. Both DSNs would fail any
-// real dial, so a non-nil return or a hang here would itself signal a
-// gate regression.
+// cdc=false (a plain migrate never returns to the binlog) and named
+// non-RDS hosts must return nil WITHOUT probing — the RDS host pattern
+// and the Cloud SQL candidate shape (IP literal / localhost, pinned in
+// host_advisories_cloudsql_test.go) are what keep the probe free for
+// everyone else. Every DSN here is a NAMED host or unparseable, so no
+// real dial is attempted; a non-nil return or a hang here would itself
+// signal a gate regression. (A localhost/IP DSN is deliberately absent:
+// those ARE Cloud SQL probe candidates now and would dial.)
 func TestSourceProbedAdvisories_Gates(t *testing.T) {
 	var _ ir.SourceProbedAdvisor = Engine{}
 	ctx := context.Background()
@@ -205,7 +208,7 @@ func TestSourceProbedAdvisories_Gates(t *testing.T) {
 		name string
 		dsn  string
 	}{
-		{"local", "root:pw@tcp(localhost:3306)/app"},
+		{"named internal host", "root:pw@tcp(mysql.internal.example:3306)/app"},
 		{"digitalocean", "doadmin:pw@tcp(db-mysql-nyc3-1.b.db.ondigitalocean.com:25060)/defaultdb"},
 		{"suffix embedded mid-host does not match", "u:p@tcp(x.rds.amazonaws.com.evil.example:3306)/app"},
 		{"empty", ""},
