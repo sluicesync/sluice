@@ -193,17 +193,23 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	},
 
 	// ---------------------------------------------------------------
-	// FlavorMariaDB — MariaDB ≥ 10.11 LTS (roadmap item 73 Phase 1).
+	// FlavorMariaDB — MariaDB ≥ 10.11 LTS (roadmap item 73, Phases 1–3).
 	//
-	// Honest Phase-1 declaration: bulk migrate source+target plus
-	// backup/restore/verify. Deliberate differences from vanilla:
+	// Honest declaration across the shipped phases: bulk migrate
+	// source+target plus backup/restore/verify (Phase 1), type fidelity
+	// (Phase 2), and continuous CDC (Phase 3). Deliberate differences
+	// from vanilla:
 	//
-	//   - CDC: CDCNone. MariaDB replicates with domain-based GTIDs
-	//     (`0-100-38`) that the MySQL binlog reader's position codec
-	//     cannot parse; OpenCDCReader and the sync/backup-stream
-	//     preflights refuse loudly with SLUICE-E-CDC-MARIADB-UNSUPPORTED
-	//     (roadmap item 73 Phase 3 threads the vendored go-mysql
-	//     MariaDB-GTID support).
+	//   - CDC: CDCBinlog (Phase 3, ADR-0170). MariaDB replicates with
+	//     domain-based GTIDs (`0-100-38`); the binlog reader flavor-
+	//     branches the go-mysql GTID parser + the MariaDB position SQL
+	//     (`@@gtid_binlog_pos`, no `GTID_SUBSET`), and handles the
+	//     MariadbGTIDEvent that opens each transaction (MariaDB emits no
+	//     BEGIN QueryEvent). Native uuid/inet6/inet4 columns read
+	//     correctly under bulk migrate (Phase 2) but their binlog value-
+	//     decode is not yet implemented, so CDC over them refuses loudly,
+	//     pre-data, on all targets with SLUICE-E-CDC-MARIADB-NATIVE-TYPE-
+	//     UNSUPPORTED (flavor-aware binlog decode is a filed follow-up).
 	//   - JSONSupport: JSONText, not JSONBinary. MariaDB JSON is a
 	//     LONGTEXT alias — information_schema reports data_type
 	//     'longtext' (plus an auto json_valid CHECK). Phase 2 recovers
