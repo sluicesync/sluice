@@ -4,6 +4,19 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.268] - 2026-07-17
+
+MariaDB as a first-class bulk source and target (roadmap item 73 Phase 1, ADR-0168) — operator-requested, scoped by a live probe.
+
+### Added
+
+- **`mariadb` flavor: MariaDB is now a supported bulk migrate source and target** (plus backup/restore/verify), floor MariaDB 10.11 LTS, live-tested against 11.4 and 10.11. `restore` into MariaDB already worked; this closes the source and target gaps a MySQL-8-only reader/writer left: the schema reader's `information_schema` queries flavor-gate the MySQL-8-only `srs_id`/`statistics.expression` columns, the migrate-state store and change applier use MariaDB's `VALUES()` upsert spelling instead of the 8.0.20+ row-alias form, and — atomically with the query fix, because it would otherwise be a silent-corruption vector — a **defaults shim** normalizes MariaDB's distinct `COLUMN_DEFAULT` conventions (quoted literals, the literal string `'NULL'` for defaultless-nullable columns, `current_timestamp()` with empty `extra`) to a byte-identical IR read. The `0900` vs `uca1400` collation split between the LTS lines is remapped in the emitter with a WARN.
+- CDC from a MariaDB source is refused loudly with the new coded `SLUICE-E-CDC-MARIADB-UNSUPPORTED` — MariaDB's domain-based GTID positions are Phase 3 (the vendored library already carries the support; the flavor's capabilities are honest per phase). Geometry is deliberately excluded from the supported types for now (MariaDB has no `srs_id` catalog column to round-trip an SRID, and spells the attribute `REF_SYSTEM_ID` — carrying it would silently drop the SRID; deferred to Phase 2 with native uuid/inet and the sequence/system-versioned-table census). A source or target declared plain `mysql` that fingerprints as MariaDB (`@@version` contains `-MariaDB`) WARNs, recommending `--source-driver`/`--target-driver mariadb`.
+
+### Compatibility
+
+- **Purely additive.** One new flavor name and one new coded refusal; the MySQL-8 path is byte-identical (every flavor gate has the row-alias/MySQL-8 behavior as its zero value, and the full MySQL engine regression suite is unchanged). No change to any existing command or engine.
+
 ## [0.99.267] - 2026-07-17
 
 Provider-advisory hardening from the Vultr/Azure/Supabase probes, the confirming audit's small-leftovers tail, and the read-replica finding.
