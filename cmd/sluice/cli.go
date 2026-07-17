@@ -948,7 +948,42 @@ type SyncFromBackupCmd struct {
 
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
 
+	// ADR-0148 / audit MED-A1 gap #12: a --reset-target-data cold start runs a
+	// chain restore whose segment-0 full builds the deferred indexes — the same
+	// walled build migrate/restore route through the deploy-request fallback on
+	// a PlanetScale target. The broker has NO PlanetScale telemetry surface, so
+	// --planetscale-org here means ONLY the index-build fallback (no ADR-0107
+	// telemetry collision to reconcile). Mirrors restore's flag set; the org
+	// stays explicit-only (no PLANETSCALE_ORG env binding) so an ambient var in
+	// a pscale-shaped shell never silently arms a long-running broker, matching
+	// restore/sync-start's shape. Unarmed (any piece missing, or a
+	// non-planetscale target) the reset-leg's index phase is byte-identical.
+	PlanetScaleOrg            string        `name:"planetscale-org" help:"PlanetScale org slug for the ADR-0148 index-build fallback on a --reset-target-data cold start (requires the service token, see --planetscale-service-token-id). Control-plane only — distinct from the data-plane --target DSN. Off when unset." placeholder:"ORG"`
+	PlanetScaleDatabase       string        `name:"planetscale-database" help:"PlanetScale database name for the ADR-0148 index-build fallback. Defaults to the --target DSN's database name. Only consulted when --planetscale-org is set." placeholder:"DB"`
+	PlanetScaleBranch         string        `name:"planetscale-branch" help:"PlanetScale production branch the --target DSN points at, for the ADR-0148 index-build fallback (deploy requests merge into it). Only consulted when --planetscale-org is set." default:"main" placeholder:"BRANCH"`
+	PlanetScaleServiceTokenID string        `name:"planetscale-service-token-id" help:"PlanetScale service-token ID (branch + deploy-request scopes) for the ADR-0148 index-build fallback. Prefer the env var so it never lands in shell history." env:"PLANETSCALE_SERVICE_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
+	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request deadline for the ADR-0148 index-build fallback. On timeout the deploy keeps running in PlanetScale and re-running the broker cold start picks up: the index phase re-probes and rebuilds only what is still missing." default:"1h" placeholder:"DUR"`
+
 	EncryptionFlags
+}
+
+// planetScaleIndexFallback composes the ADR-0148 deploy-request index-build
+// fallback for the broker's --reset-target-data cold-start restore (audit
+// MED-A1 gap #12), from the same flag set restore carries. The broker has no
+// telemetry surface, so this calls the shared composer directly — no
+// telemetryParamsSharedOrg reconciliation. nil = unarmed, byte-identical.
+func (s *SyncFromBackupCmd) planetScaleIndexFallback() ir.IndexBuildFallback {
+	return composePlanetScaleIndexFallback(indexFallbackParams{
+		targetDriver:  s.TargetDriver,
+		targetDSN:     s.Target,
+		org:           s.PlanetScaleOrg,
+		database:      s.PlanetScaleDatabase,
+		branch:        s.PlanetScaleBranch,
+		tokenID:       s.PlanetScaleServiceTokenID,
+		token:         s.PlanetScaleServiceToken,
+		deployTimeout: s.PlanetScaleDeployTimeout,
+	})
 }
 
 // Run implements `sluice sync from-backup run`.
@@ -1027,6 +1062,10 @@ func (s *SyncFromBackupCmd) Run(g *Globals) error {
 		Envelope:         envelope,
 		VerifyKey:        verifyKey,
 		RequireSignature: s.RequireSignature,
+		// ADR-0148 / audit MED-A1 gap #12: nil unless armed (planetscale target
+		// + --planetscale-org + the service token); inert on the live-polling
+		// path, consulted only by the --reset-target-data cold-start restore.
+		IndexBuildFallback: s.planetScaleIndexFallback(),
 	}
 
 	// ADR-0156 phase 2: the TTY-aware live panel for the broker's

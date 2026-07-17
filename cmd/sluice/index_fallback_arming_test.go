@@ -207,6 +207,123 @@ func TestSyncStartIndexFallbackFlags_ThroughKong(t *testing.T) {
 	}
 }
 
+// armedSyncFromBackupCmd is a fully-armed broker baseline; tests knock
+// pieces out.
+func armedSyncFromBackupCmd() *SyncFromBackupCmd {
+	return &SyncFromBackupCmd{
+		TargetDriver:              "planetscale",
+		Target:                    "user:pw@tcp(host.psdb.cloud:3306)/shopdb?tls=true",
+		PlanetScaleOrg:            "acme",
+		PlanetScaleBranch:         "main",
+		PlanetScaleServiceTokenID: "tokid",
+		PlanetScaleServiceToken:   "toksecret",
+		PlanetScaleDeployTimeout:  time.Hour,
+	}
+}
+
+// TestSyncFromBackupIndexFallback_ArmingMatrix pins the broker-side arming
+// contract (audit MED-A1 gap #12) — the same opportunistic never-refuse
+// matrix migrate/restore pin, through the shared composer. The broker has no
+// telemetry surface, so planetscale-org here is fallback-only (no collision).
+func TestSyncFromBackupIndexFallback_ArmingMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*SyncFromBackupCmd)
+		wantArm bool
+		wantDB  string
+	}{
+		{"fully armed derives database from target DSN", func(*SyncFromBackupCmd) {}, true, "shopdb"},
+		{"explicit --planetscale-database wins over the DSN", func(s *SyncFromBackupCmd) { s.PlanetScaleDatabase = "other" }, true, "other"},
+		{"non-planetscale target stays unarmed", func(s *SyncFromBackupCmd) { s.TargetDriver = "mysql" }, false, ""},
+		{"no org stays unarmed", func(s *SyncFromBackupCmd) { s.PlanetScaleOrg = "" }, false, ""},
+		{"missing token secret stays unarmed", func(s *SyncFromBackupCmd) { s.PlanetScaleServiceToken = "" }, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := armedSyncFromBackupCmd()
+			tc.mutate(s)
+			got := s.planetScaleIndexFallback()
+			if !tc.wantArm {
+				if got != nil {
+					t.Fatalf("fallback armed = %#v; want nil", got)
+				}
+				return
+			}
+			fb, ok := got.(*expandcontract.IndexFallback)
+			if !ok {
+				t.Fatalf("fallback = %T; want *expandcontract.IndexFallback", got)
+			}
+			if fb.Org != "acme" || fb.Database != tc.wantDB || fb.Branch != "main" {
+				t.Errorf("fallback org/db/branch = %s/%s/%s; want acme/%s/main", fb.Org, fb.Database, fb.Branch, tc.wantDB)
+			}
+		})
+	}
+}
+
+// TestSyncFromBackupIndexFallbackFlags_ThroughKong pins the real-parser leg
+// for `sync from-backup run` (the Bug-180 lesson): the new flags and the
+// service-token env fallbacks populate the fields the arming reads, and the
+// end-to-end arm from the parsed command works.
+func TestSyncFromBackupIndexFallbackFlags_ThroughKong(t *testing.T) {
+	t.Setenv("PLANETSCALE_SERVICE_TOKEN_ID", "env-id")
+	t.Setenv("PLANETSCALE_SERVICE_TOKEN", "env-secret")
+
+	cli := &CLI{}
+	parser, err := kong.New(cli, kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatalf("kong.New: %v", err)
+	}
+	if _, err := parser.Parse([]string{
+		"sync", "from-backup", "run",
+		"--backup-dir=/backups/x",
+		"--target-driver=planetscale", "--target=user:pw@tcp(h:3306)/db",
+		"--stream-id=s1",
+		"--planetscale-org=acme",
+		"--planetscale-database=explicit-db",
+		"--planetscale-branch=prod",
+		"--planetscale-deploy-timeout=30m",
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s := &cli.Sync.FromBackup.Run
+	if s.PlanetScaleServiceTokenID != "env-id" || s.PlanetScaleServiceToken != "env-secret" {
+		t.Errorf("token = %q/%q; want the env fallbacks", s.PlanetScaleServiceTokenID, s.PlanetScaleServiceToken)
+	}
+	if s.PlanetScaleDatabase != "explicit-db" || s.PlanetScaleBranch != "prod" {
+		t.Errorf("database/branch = %q/%q; want explicit-db/prod", s.PlanetScaleDatabase, s.PlanetScaleBranch)
+	}
+	if s.PlanetScaleDeployTimeout != 30*time.Minute {
+		t.Errorf("PlanetScaleDeployTimeout = %v; want 30m", s.PlanetScaleDeployTimeout)
+	}
+	fb, ok := s.planetScaleIndexFallback().(*expandcontract.IndexFallback)
+	if !ok {
+		t.Fatalf("broker did not arm the fallback (got %T)", s.planetScaleIndexFallback())
+	}
+	if fb.Org != "acme" || fb.Database != "explicit-db" || fb.Branch != "prod" {
+		t.Errorf("fallback org/db/branch = %s/%s/%s; want acme/explicit-db/prod", fb.Org, fb.Database, fb.Branch)
+	}
+
+	// Zero-config default through the real parser: unarmed, byte-identical.
+	t.Setenv("PLANETSCALE_SERVICE_TOKEN_ID", "")
+	t.Setenv("PLANETSCALE_SERVICE_TOKEN", "")
+	cli2 := &CLI{}
+	parser2, err := kong.New(cli2, kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatalf("kong.New: %v", err)
+	}
+	if _, err := parser2.Parse([]string{
+		"sync", "from-backup", "run",
+		"--backup-dir=/backups/x",
+		"--target-driver=planetscale", "--target=user:pw@tcp(h:3306)/db",
+		"--stream-id=s1",
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if fb := cli2.Sync.FromBackup.Run.planetScaleIndexFallback(); fb != nil {
+		t.Errorf("fallback = %#v; want nil with no org/token configured", fb)
+	}
+}
+
 // TestTelemetryParamsSharedOrg pins the one-flag-two-consumers
 // reconciliation, keyed on the SUPPLIED service-token pair (the operator's
 // expressed fallback intent — Bug 192), not on whether the fallback

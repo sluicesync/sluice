@@ -23,6 +23,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -196,6 +197,27 @@ type SyncSpec struct {
 	PlanetScaleMetricsToken   string `koanf:"planetscale-metrics-token"`
 	PlanetScaleMetricsBranch  string `koanf:"planetscale-metrics-branch"`
 	PlanetScaleMetricsDB      string `koanf:"planetscale-metrics-db"`
+
+	// OPTIONAL per-sync ADR-0148 deploy-request index-build fallback (audit
+	// MED-A1 gap #12), mirroring `sync start`'s --planetscale-* fallback flags
+	// so a fleet-managed cold start onto a walled PlanetScale target auto-
+	// recovers a deferred index build the same way `migrate`/`restore` do.
+	// The `planetscale-org` key above is SHARED with the ADR-0126 telemetry
+	// opt-in — each consumer arms on its OWN token pair: telemetry on the
+	// metrics-token pair, this fallback on the service-token pair. A fallback-
+	// only arming (org + service pair, no metrics-token piece) turns telemetry
+	// off with a build-time WARN instead of tripping the telemetry all-or-
+	// nothing refusal (see [SyncSpec.isFallbackOnlyArming] +
+	// [telemetryParamsSharedOrg]). The service token is a SECRET: leave the two
+	// service-token keys empty in the committed YAML and supply
+	// PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN via the
+	// environment (env-first, the same contract the metrics token uses). Unset
+	// (no service pair) ⇒ fallback-off, byte-identical to a plain fleet sync.
+	PlanetScaleDatabase       string        `koanf:"planetscale-database"`
+	PlanetScaleBranch         string        `koanf:"planetscale-branch"`
+	PlanetScaleServiceTokenID string        `koanf:"planetscale-service-token-id"`
+	PlanetScaleServiceToken   string        `koanf:"planetscale-service-token"`
+	PlanetScaleDeployTimeout  time.Duration `koanf:"planetscale-deploy-timeout"`
 
 	SuppressTargetMetricsHistory bool `koanf:"suppress-target-metrics-history"`
 
@@ -466,6 +488,15 @@ func (s *SyncSpec) validateTelemetry(who string) error {
 	if s.PlanetScaleOrg == "" {
 		return nil // telemetry off — the zero value, unchanged.
 	}
+	// audit MED-A1 gap #12: a fallback-only arming (org + a complete service-
+	// token pair, no metrics-token piece) selects the ADR-0148 index-build
+	// fallback, not telemetry. Telemetry stays off (a build-time WARN in
+	// buildSupervisedFleet), so don't apply the all-or-nothing metrics refusal
+	// here. Every telemetry-shaped input (a metrics-token piece present, or org
+	// with no token pair at all) still hits the refusals below — the typo-catch.
+	if s.isFallbackOnlyArming() {
+		return nil
+	}
 	p := s.resolveTelemetryParams()
 	switch {
 	case p.tokenID == "" && p.token == "":
@@ -504,6 +535,57 @@ func (s *SyncSpec) resolveTelemetryParams() telemetryParams {
 		targetDSN: s.Target,
 		engine:    s.TargetDriver,
 	}
+}
+
+// resolveServiceToken gathers this sync's ADR-0148 index-fallback service-token
+// pair ENV-FIRST (audit MED-A1 gap #12): an empty planetscale-service-token-id
+// / -token in the spec falls back to the shared PLANETSCALE_SERVICE_TOKEN_ID /
+// PLANETSCALE_SERVICE_TOKEN env vars — the same env-first secret contract the
+// metrics token uses, and the same env vars the `sync start` / `restore` flags
+// read. The token is never logged.
+func (s *SyncSpec) resolveServiceToken() (id, token string) {
+	return firstNonEmpty(s.PlanetScaleServiceTokenID, os.Getenv("PLANETSCALE_SERVICE_TOKEN_ID")),
+		firstNonEmpty(s.PlanetScaleServiceToken, os.Getenv("PLANETSCALE_SERVICE_TOKEN"))
+}
+
+// resolveIndexFallback composes this sync's ADR-0148 deploy-request index-build
+// fallback (audit MED-A1 gap #12) through the shared CLI composer, with the
+// service-token pair resolved env-first. nil when the sync did not arm it (no
+// planetscale-org, no service pair, or a non-planetscale target) — the
+// byte-identical default. Set onto the built Streamer in [buildStreamerFromSpec].
+func (s *SyncSpec) resolveIndexFallback() ir.IndexBuildFallback {
+	tokenID, token := s.resolveServiceToken()
+	return composePlanetScaleIndexFallback(indexFallbackParams{
+		targetDriver:  s.TargetDriver,
+		targetDSN:     s.Target,
+		org:           s.PlanetScaleOrg,
+		database:      s.PlanetScaleDatabase,
+		branch:        s.PlanetScaleBranch,
+		tokenID:       tokenID,
+		token:         token,
+		deployTimeout: s.PlanetScaleDeployTimeout,
+	})
+}
+
+// isFallbackOnlyArming reports whether planetscale-org on this sync expresses
+// ADR-0148 index-fallback intent rather than ADR-0126 telemetry intent — the
+// fleet mirror of [telemetryParamsSharedOrg]'s keying (audit MED-A1 gap #12):
+// a COMPLETE service-token pair is resolvable AND NO metrics-token piece was
+// supplied. In that case telemetry stays off (a build-time WARN, not a
+// refusal), so [SyncSpec.validateTelemetry] must NOT trip the all-or-nothing
+// metrics refusal. Deliberately keyed on the supplied tokens, NOT on the target
+// engine or whether the fallback composed, so the contract matches the CLI
+// (inert off-planetscale, but the same expressed intent — the Bug-192 lesson).
+func (s *SyncSpec) isFallbackOnlyArming() bool {
+	if s.PlanetScaleOrg == "" {
+		return false
+	}
+	svcID, svc := s.resolveServiceToken()
+	if svcID == "" || svc == "" {
+		return false // no complete service pair → not fallback intent
+	}
+	tp := s.resolveTelemetryParams()
+	return tp.tokenID == "" && tp.token == "" // no metrics piece → fallback-only
 }
 
 // describe names a sync for an error message: its stream-id when set,
@@ -670,7 +752,15 @@ func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig, g *Global
 		// Returns (nil, nil) when the sync did not opt in (no planetscale-org)
 		// ⇒ TargetTelemetry stays the zero nil interface ⇒ byte-identical
 		// default sync. telemetryProviderOrNil avoids the typed-nil trap.
-		provider, err := buildTargetTelemetryProvider(ctx, spec.resolveTelemetryParams())
+		//
+		// audit MED-A1 gap #12: the org is SHARED with the index-fallback (armed
+		// on the Streamer above). telemetryParamsSharedOrg blanks the org for a
+		// fallback-only arming — org + a complete service-token pair, no metrics
+		// piece — so telemetry stays off with a WARN instead of tripping the
+		// all-or-nothing refusal (the same reconciliation `sync start`/`restore`
+		// do at their build sites). Every telemetry-shaped input is untouched.
+		svcID, svc := spec.resolveServiceToken()
+		provider, err := buildTargetTelemetryProvider(ctx, telemetryParamsSharedOrg(ctx, spec.resolveTelemetryParams(), svcID, svc))
 		if err != nil {
 			_ = closeProviders()
 			return nil, nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
@@ -843,6 +933,12 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		ExpressionMappings: exprMappings,
 		Filter:             filter,
 		TargetSchema:       spec.TargetSchema,
+
+		// ADR-0148 / audit MED-A1 gap #12: arm the deploy-request index-build
+		// fallback for this sync's cold-start deferred index phase. nil unless
+		// planetscale target + org + the service-token pair (env-first) — the
+		// byte-identical default for every non-armed sync.
+		IndexBuildFallback: spec.resolveIndexFallback(),
 
 		InjectShardColumn:    shardSpec,
 		AllowCrossShardMerge: spec.AllowCrossShardMerge,

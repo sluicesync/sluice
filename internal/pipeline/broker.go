@@ -222,6 +222,17 @@ type SyncFromBackup struct {
 	// (BRK-2)
 	RequireSignature bool
 
+	// IndexBuildFallback is the optional ADR-0148 deploy-request index-build
+	// fallback (audit MED-A1 gap #12), threaded onto the cold-start
+	// [backup.ChainRestore] the broker runs for --reset-target-data — its
+	// segment-0 full builds the deferred indexes on a PlanetScale target, the
+	// same walled build migrate/restore route through the fallback. nil (the
+	// zero value every non-CLI caller gets) leaves the reset-leg's index phase
+	// byte-identical to before. The CLI (`sync from-backup run`) arms it from
+	// the same --planetscale-* flag set restore carries; the broker has no
+	// telemetry surface, so there is no shared-org reconciliation to do here.
+	IndexBuildFallback ir.IndexBuildFallback
+
 	// chainCEK caches the unwrapped per-chain CEK across ticks so
 	// Argon2id (passphrase mode) runs once per broker process.
 	chainCEK []byte
@@ -707,6 +718,33 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // `(id, email, created_at)` shape) would silently keep the old
 // columns and the subsequent COPY would fail with "column does not
 // exist". Mirror `migrate --reset-target-data`'s drop-loop pattern.
+// newColdStartChainRestore builds the [backup.ChainRestore] the
+// --reset-target-data cold start delegates to (full + every incremental up
+// to the tail), mirroring [Restore.newChainRestore]: every broker field the
+// restore needs is carried here in one place so a new knob (e.g. the ADR-0148
+// index-build fallback) can't drift between the broker and the restore it
+// runs.
+func (b *SyncFromBackup) newColdStartChainRestore() *backup.ChainRestore {
+	return &backup.ChainRestore{
+		Target:           b.Target,
+		TargetDSN:        b.TargetDSN,
+		Store:            b.Store,
+		MaxBufferBytes:   b.MaxBufferBytes,
+		ApplyBatchSize:   b.ApplyBatchSize,
+		ApplyConcurrency: b.ApplyConcurrency,
+		Envelope:         b.Envelope,
+		// BRK-2: a --reset-target-data cold start must verify a signed
+		// chain's Ed25519 / KMS signature too, not just the HMAC-off-KEK
+		// envelope. Without threading these the cold-start restore silently
+		// ignored --verify-key / --require-signature.
+		VerifyKey:        b.VerifyKey,
+		RequireSignature: b.RequireSignature,
+		// audit MED-A1 gap #12: the segment-0 full's deferred index build on a
+		// PlanetScale target routes a walled failure through the deploy request.
+		IndexBuildFallback: b.IndexBuildFallback,
+	}
+}
+
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
 	chain, err := b.brokerChain(ctx)
 	if err != nil {
@@ -727,21 +765,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		}
 	}
 
-	rest := &backup.ChainRestore{
-		Target:           b.Target,
-		TargetDSN:        b.TargetDSN,
-		Store:            b.Store,
-		MaxBufferBytes:   b.MaxBufferBytes,
-		ApplyBatchSize:   b.ApplyBatchSize,
-		ApplyConcurrency: b.ApplyConcurrency,
-		Envelope:         b.Envelope,
-		// BRK-2: a --reset-target-data cold start must verify a signed
-		// chain's Ed25519 / KMS signature too, not just the HMAC-off-KEK
-		// envelope. Without threading these the cold-start restore silently
-		// ignored --verify-key / --require-signature.
-		VerifyKey:        b.VerifyKey,
-		RequireSignature: b.RequireSignature,
-	}
+	rest := b.newColdStartChainRestore()
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
