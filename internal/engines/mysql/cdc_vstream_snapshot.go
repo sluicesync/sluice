@@ -2371,6 +2371,18 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	for _, rc := range rev.GetRowChanges() {
+		// Item 74 belt (mirror of dispatchRow): refuse a partial after image
+		// (NOBLOB-omitted column or partial-JSON diff) before decode.
+		// decodeVStreamRow has no bitmap and would read an omitted column's
+		// NULL cell as a genuine NULL, silently corrupting the row on apply.
+		// This is the SAME belt dispatchRow (cdc_vstream.go) carries — the
+		// two dispatch methods are hand-mirrored, so this obligation mirrors
+		// too; the cold-start snapshot→CDC catch-up is the DEFAULT first sync,
+		// where a self-hosted-Vitess NOBLOB source would otherwise reach this
+		// unguarded. See cdc_vstream_partial_row_image.go.
+		if err := refuseVStreamPartialRowImage(rc, fields, rev.GetKeyspace(), tableName); err != nil {
+			return err
+		}
 		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn, s.zeroDate)
 		if err != nil {
 			return err

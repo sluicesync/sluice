@@ -306,3 +306,54 @@ func TestVStreamPartialRowImage_DispatchMatrix(t *testing.T) {
 		}
 	})
 }
+
+// TestVStreamPartialRowImage_ColdStartDispatch pins the belt on the SECOND
+// dispatch path — vstreamSnapshotStream.dispatchCDCRow, the cold-start
+// snapshot->CDC catch-up that serves the DEFAULT first sync. Audit
+// 2026-07-17 (A1, CRITICAL) found the item-74 belt was wired into
+// dispatchRow but MISSED on its hand-mirrored twin dispatchCDCRow, so a
+// self-hosted-Vitess NOBLOB source doing a cold start would silently write
+// NULL over an unchanged BLOB/TEXT column (stream green, counts equal). A
+// mirror method is a mirror obligation: a partial UPDATE here must refuse
+// loudly, before any decode/send, exactly as it does on dispatchRow.
+func TestVStreamPartialRowImage_ColdStartDispatch(t *testing.T) {
+	fields := []*query.Field{
+		{Name: "id", Type: query.Type_INT64},
+		{Name: "email", Type: query.Type_VARCHAR},
+		{Name: "bio", Type: query.Type_BLOB},
+	}
+	// currentVgtid empty -> positionFor() returns a zero position cleanly,
+	// so the belt (which runs after the position resolve) is reachable.
+	s := &vstreamSnapshotStream{
+		fields:   map[string][]*query.Field{fieldCacheKey("-", "users"): fields},
+		boolWarn: newBoolRangeWarner(),
+	}
+	partial := &binlogdata.VEvent{
+		Type: binlogdata.VEventType_ROW,
+		RowEvent: &binlogdata.RowEvent{
+			TableName: "users",
+			Keyspace:  "main",
+			Shard:     "-",
+			RowChanges: []*binlogdata.RowChange{{
+				Before:      makeRowOmitting([]*string{strptr("7"), strptr("a@x"), nil}),
+				After:       makeRowOmitting([]*string{strptr("7"), strptr("a@y"), nil}),
+				DataColumns: makeColBitmap([]bool{true, true, false}), // bio omitted (NOBLOB)
+			}},
+		},
+	}
+	out := make(chan ir.Change, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := s.dispatchCDCRow(ctx, partial, out)
+	if err == nil {
+		t.Fatal("cold-start partial UPDATE: want refusal; got nil (the silent NULL-overwrite audit A1 caught)")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeCDCRowImagePartial {
+		t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCRowImagePartial, err, err)
+	}
+	close(out)
+	if got := drainChannel(out); len(got) != 0 {
+		t.Fatalf("cold-start partial UPDATE emitted %d changes; want 0 (loud stop, no half-apply)", len(got))
+	}
+}
