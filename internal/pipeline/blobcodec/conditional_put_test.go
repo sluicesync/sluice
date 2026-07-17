@@ -127,6 +127,45 @@ func s3ConflictErr() error {
 		&smithy.GenericAPIError{Code: "ConditionalRequestConflict", Message: "A conflicting conditional operation is currently in progress against this resource."})
 }
 
+// s3PreconditionErr fabricates the wire shape an S3 conditional-PUT
+// loser surfaces when the key already exists: a smithy APIError with code
+// PreconditionFailed (HTTP 412), wrapped the way gocloud propagates
+// driver errors — and crucially with a RequestID containing the substring
+// "301" (the exact shape observed on the v0.99.268 tag CI, RequestID
+// 18C30130E2747EAB) that trips gocloud v0.46.0's s3blob ErrorCode
+// "301"-substring hack into misclassifying the 412 as NoSuchBucket →
+// gcerrors.NotFound.
+func s3PreconditionErr() error {
+	return fmt.Errorf("operation error S3: PutObject, https response error StatusCode: 412, RequestID: 18C30130E2747EAB: %w",
+		&smithy.GenericAPIError{Code: "PreconditionFailed", Message: "At least one of the pre-conditions you specified did not hold"})
+}
+
+// TestIsPreconditionFailed pins the create-only CAS-loser classification
+// against gocloud v0.46.0's s3blob "301"-substring misfire. The 412
+// PreconditionFailed must be recognised via the AUTHORITATIVE smithy API
+// error code, not gocloud's derived gcerrors code — which this shape
+// (RequestID containing "301") misclassifies as NotFound ~2% of the time,
+// silently turning the chain-guard conflict into a confusing "not found".
+// The gcerrors.FailedPrecondition fallback (fileblob/memblob, no smithy
+// error) is covered end-to-end by the driver contract tests above.
+func TestIsPreconditionFailed(t *testing.T) {
+	if !isPreconditionFailed(s3PreconditionErr()) {
+		t.Error("wrapped 412 PreconditionFailed (RequestID with \"301\") not recognised as the CAS loser")
+	}
+	// The 409 simultaneous-writer conflict is a DIFFERENT shape, handled
+	// by the retry path — not the 412→ErrPathExists mapping.
+	if isPreconditionFailed(s3ConflictErr()) {
+		t.Error("409 ConditionalRequestConflict misclassified as the 412 loser")
+	}
+	// Unrelated errors are not the loser.
+	if isPreconditionFailed(&smithy.GenericAPIError{Code: "NoSuchBucket"}) {
+		t.Error("NoSuchBucket misclassified as the 412 loser")
+	}
+	if isPreconditionFailed(errors.New("PreconditionFailed")) {
+		t.Error("plain-string match must not classify (smithy APIError or gcerrors only)")
+	}
+}
+
 // TestConditionalPutConflictRetry pins the audit 2026-07-16 S3-probe
 // follow-up: S3's 409 ConditionalRequestConflict routes to the
 // CONFLICT outcome (ErrPathExists → the chain guard's coded refusal),

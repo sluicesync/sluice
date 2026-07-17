@@ -263,8 +263,8 @@ func (s *BlobStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) e
 	})
 }
 
-// putIfAbsentOnce is one conditional-PUT attempt: 412/FailedPrecondition
-// (the portable loser shape) maps to ErrPathExists; everything else is
+// putIfAbsentOnce is one conditional-PUT attempt: the 412 conditional-PUT
+// loser shape (the portable one) maps to ErrPathExists; everything else is
 // returned raw for [conditionalPutWithConflictRetry] to classify.
 func (s *BlobStore) putIfAbsentOnce(ctx context.Context, path, key string, body []byte) error {
 	w, err := s.bucket.NewWriter(ctx, key, &blob.WriterOptions{IfNotExist: true})
@@ -273,18 +273,42 @@ func (s *BlobStore) putIfAbsentOnce(ctx context.Context, path, key string, body 
 	}
 	if _, err := w.Write(body); err != nil {
 		_ = w.Close()
-		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
+		if isPreconditionFailed(err) {
 			return fmt.Errorf("blob store: %q: %w", path, irbackup.ErrPathExists)
 		}
 		return fmt.Errorf("blob store: conditional write %q: %w", path, err)
 	}
 	if err := w.Close(); err != nil {
-		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
+		if isPreconditionFailed(err) {
 			return fmt.Errorf("blob store: %q: %w", path, irbackup.ErrPathExists)
 		}
 		return wrapBlobErr("close conditional writer", path, err)
 	}
 	return nil
+}
+
+// isPreconditionFailed reports whether err is the 412 conditional-PUT
+// loser (If-None-Match:* on a key that already exists — the portable
+// CAS-loser shape). It reads the smithy API error code DIRECTLY rather
+// than trusting gocloud's derived gcerrors classification, because
+// gocloud v0.46.0's s3blob ErrorCode carries a naive
+// `strings.Contains(err.Error(), "301")` hack (meant to catch an
+// invalid-bucket 301 redirect) that matches the substring "301" anywhere
+// in the error — INCLUDING the random hex RequestID/HostID S3 stamps on
+// every response. When that substring lands by chance (~2% of requests),
+// a genuine 412 PreconditionFailed is misclassified as NoSuchBucket →
+// gcerrors.NotFound, so a `gcerrors.Code(err) == FailedPrecondition`
+// check silently fails and the CAS-loser is reported as a confusing "not
+// found" instead of ErrPathExists. Observed on the v0.99.268 tag CI:
+// RequestID 18C30130E2747EAB contains "301". Detecting the authoritative
+// API error code sidesteps the flake entirely; the gcerrors path stays a
+// fallback for the fileblob/memblob drivers that have no smithy error.
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+		return true
+	}
+	return gcerrors.Code(err) == gcerrors.FailedPrecondition
 }
 
 // conditionalPutWithConflictRetry runs one attempt, retrying a single
