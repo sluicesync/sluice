@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.274] - 2026-07-17
+
+Post-audit hardening + a broadened MariaDB LTS test matrix. Mostly internal quality and coverage; no change to any successful path.
+
+### Added
+
+- **MariaDB test coverage now spans the full LTS spread — 10.11, 11.4, 11.8, and 12.3 — plus the 13.1 preview.** 11.8 and 12.3 run as required CI integration legs; the 13.1 preview (from `quay.io/mariadb-foundation/mariadb-devel`) is an informational, non-blocking leg. The native `uuid`/`inet` CDC byte layout was re-ground-truthed live on every one of these lines and is **byte-identical across all of them** — closing ADR-0171's residual-risk note that a future MariaDB line could silently change the storage byte order, with no codec change needed. The `SHOW MASTER STATUS` / `SHOW BINLOG STATUS` fallback was confirmed to cover the whole spread (12.3 still accepts `SHOW MASTER STATUS`; 13.1 accepts `SHOW BINARY LOG STATUS`) with zero code change.
+
+### Changed
+
+- **Post-audit hardening (2026-07-17 confirming audit, Medium/Low findings — no user-facing behavior change):** the MariaDB native-type schema mapping and CDC decoder are now coupled through a single source-of-truth registry, so a native binary-storage type can no longer be schema-mapped without also gaining a decoder (which would otherwise silently stringify raw binlog bytes); the MariaDB integration images are GHCR-mirrored to remove a docker.io cold-pull flake class; the MariaDB inet6 rendering is now pinned through the text protocol (the cold-start path) as well as the binary protocol — confirmed byte-identical, so no divergence existed; MariaDB is now represented in the perf-parity matrix; and the operator error-code catalog, ADR index, and roadmap are reconciled with the shipped MariaDB arc (the two retained MariaDB-CDC refusal codes are consistently marked retained-but-unemitted), with a doc-sync test that now fails CI on stale active-refusal prose.
+
+### Compatibility
+
+- **No behavior change.** Everything here is added test coverage, CI hardening, a behavior-preserving internal refactor, and documentation reconciliation.
+
 ## [0.99.273] - 2026-07-17
 
 A CRITICAL silent-loss fix surfaced by the 2026-07-17 confirming audit — the VStream partial-row-image belt was missing from one of its two dispatch paths.
