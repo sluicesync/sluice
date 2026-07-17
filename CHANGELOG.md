@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.265] - 2026-07-17
+
+Three defects found by the Supabase IPv4 validation — including a CRITICAL silent-loss class observed live through a real CDC stream.
+
+### ⚠ Action required for postgres-trigger CDC users
+
+**Re-run `sluice trigger setup` on every trigger-CDC source after upgrading.** The float-exactness fix below lives partly in the capture function's own definition (`SET extra_float_digits = 3`); installed triggers keep capturing rounded floats until setup re-runs `CREATE OR REPLACE`. Until then, float4/float8 changes captured on servers whose `extra_float_digits < 1` (Supabase's default is 0) remain rounded.
+
+### Fixed
+
+- **CRITICAL (Bug 194): PG float values rendered as text for transit are now shortest-exact regardless of the source's `extra_float_digits` server default** (Supabase ships 0 — observed live corrupting π through a real CDC stream). Four faces pinned: the PG→PG raw-copy text lane, the pgoutput CDC stream (the walsender session renders tuple text), the postgres-trigger capture function (per-function `SET` — the only layer that survives arbitrary application sessions), and `verify --depth=sample` row hashes (which previously could produce both false mismatches AND false cleans — blessing exactly the corruption it exists to catch). The raw-copy and verify pins are transaction-scoped (`SET LOCAL`) so they hold through transaction-mode poolers (Supabase :6543, pgbouncer — pinned against a real pgbouncer in transaction mode) as well as session-mode and direct connections, and every pgx pool sluice opens additionally pins the GUC per connection, making the typed lanes exact even under `default_query_exec_mode=exec`/`simple_protocol` DSNs. Previously a sub-1 default silently rounded float4/float8 in transit with exit 0; only DBL_MAX failed loudly — that case now copies exactly.
+- **Bug 195: the PG schema reader threads array-element type modifiers for every parameterized family** — `varchar(n)[]`/`char(n)[]` no longer false-refuse as VARCHAR(0)/CHAR(0), `numeric(p,s)[]` keeps precision/scale on the target, bare `varchar[]`/`varchar`/`bpchar` (scalar included) map to unbounded TEXT instead of refusing, and PG 15+ negative numeric scale (`numeric(5,-2)`, scalar and array element) now reads correctly — information_schema itself mis-reports it as scale 2046; sluice decodes the catalog typmod directly.
+- **Bug 196: the `SLUICE-E-CONNECT-IPV6-ONLY` hint now fires on IPv4-only Windows hosts** — the AAAA probe queries DNS directly (Go resolver) instead of `getaddrinfow`, which suppresses AAAA answers without local IPv6 connectivity — and its remediation names the SESSION-mode pooler endpoint specifically (the transaction-mode endpoint was exactly the unpinned path the old wording steered toward).
+
+### Compatibility
+
+- **No breaking changes.** The trigger-setup re-run above is the one operational step. Session pins are scoped (transaction-local or per-connection) and leak nothing; the import-side COPY is now transaction-wrapped (externally equivalent — COPY was already statement-atomic).
+
 ## [0.99.264] - 2026-07-16
 
 The Google Cloud SQL validation batch — both engines live-probed 2026-07-16 (the full GCP set: GCS CAS, Cloud KMS signing, Cloud SQL MySQL + Postgres).
