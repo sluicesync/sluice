@@ -17,8 +17,8 @@ drive it. This recipe is the integration.
   without touching production.
 - Your warehouse pipeline speaks Parquet (Snowflake `COPY INTO`,
   BigQuery load, Spark, pandas/Polars) and you want sluice's backups —
-  from **any** source engine: MySQL, PlanetScale, Vitess, Postgres,
-  SQLite, D1 — to feed it through one export path.
+  from **any** source engine: MySQL, MariaDB, PlanetScale, Vitess,
+  Postgres, SQLite, D1 — to feed it through one export path.
 - You want an ad-hoc "what did this table look like at last night's
   snapshot?" without a restore target.
 

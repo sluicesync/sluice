@@ -60,7 +60,7 @@ sluice backfill \
     --verify
 ```
 
-- **`--driver`** is one of `mysql`, `planetscale`, `vitess`, `postgres` (SQLite/D1 refuse with `SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE`). `--set` / `--where` are native SQL for that engine, emitted verbatim; `--set` splits at the *first* `=`, so CASE arms pass through.
+- **`--driver`** is one of `mysql`, `mariadb`, `planetscale`, `vitess`, `postgres` (SQLite/D1 refuse with `SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE`). `--set` / `--where` are native SQL for that engine, emitted verbatim; `--set` splits at the *first* `=`, so CASE arms pass through.
 - **Resume is automatic.** The cursor persists in the same database's `sluice_migrate_state` control tables, keyed by a hash of the spec (`--set` + `--where`); a killed run resumes where it stopped, replaying at most one chunk — which is why `--where` should be self-describing (`new_col IS NULL`), so the replay is a no-op. `--restart` discards the cursor and re-walks; `--batch-size` is excluded from the spec hash, so retuning it never orphans a cursor.
 - **`--verify`** runs a whole-table remaining-count on `--where` after the walk: 0 prints the safe-to-contract signal; >0 exits with `SLUICE-E-BACKFILL-INCOMPLETE` (rows written behind the walk's cursor during the run — re-run to catch up, then verify again). **`--verify-only`** is the standalone scriptable gate for deploy pipelines: no walk, no UPDATEs, no control-table writes, no PK requirement, `--set` optional.
 - **`--dry-run`** prints the exact engine-rendered chunk UPDATE plus a remaining-row estimate without writing anything.
