@@ -1060,6 +1060,12 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		}
 		applyGenerated(col, genExpr, meta.Extra)
 		out.Columns = append(out.Columns, col)
+		// Capture the MariaDB native fixed-width kind (uuid/inet4/inet6)
+		// parallel to Columns. The IR collapses inet4/inet6 to ir.Inet, so
+		// the CDC binlog decode (ADR-0171) recovers the exact width from
+		// here rather than from the trailing-zero-stripped byte length.
+		// mariadbNativeNone for every ordinary column / non-MariaDB source.
+		out.NativeKinds = append(out.NativeKinds, mariadbNativeKindOf(meta.DataType))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

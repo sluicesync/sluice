@@ -29,7 +29,6 @@ var (
 	_ ir.Engine                                = Engine{}
 	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
-	_ ir.CDCScopePreflighter                   = Engine{}
 	_ ir.DatabaseDSNDeriver                    = Engine{}
 	_ ir.DatabaseLister                        = Engine{}
 	_ ir.DefaultTableExcluder                  = Engine{}

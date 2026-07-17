@@ -27,7 +27,6 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -100,20 +99,11 @@ func startMariaDBBinlog(t *testing.T) (sourceDSN string, cleanup func()) {
 //	G. DELETE R2 → verify gone.
 //	H. Clean shutdown.
 //
-// KNOWN GAP (deliberately NOT in the corpus — reported for a follow-up
-// chunk, ADR-0170 § Consequences): MariaDB's NATIVE uuid / inet6 / inet4
-// columns do NOT survive the CDC path. Phase 2 (ADR-0169) added them for
-// schema + bulk copy, where the value arrives as driver-formatted TEXT;
-// the binlog carries the RAW storage bytes (16 for uuid/inet6, 4 for
-// inet4), and decodeValue's ir.UUID/ir.Inet handler assumes the MySQL
-// "stored in a VARCHAR → text" shape and stringifies the raw bytes. On a
-// PG target this fails LOUDLY (`invalid input syntax for type uuid`,
-// SQLSTATE 22P02) — no silent corruption — so it is safe to defer. The
-// proper fix is a flavor+type-aware binlog decode (format 16 bytes → uuid
-// text, ground-truthing MariaDB's uuid byte ORDER — the swapped-vs-straight
-// trap is a Bug-74-class silent-corruption risk if done without a live
-// pin) pinned across the uuid/inet4/inet6 family on both LTS lines. Bulk
-// migrate of these types is unaffected (Phase 2, proven).
+// The native uuid / inet6 / inet4 CDC path — the ADR-0170 KNOWN GAP — is
+// now CLOSED (ADR-0171). The dedicated
+// TestStreamer_MariaDBToPostgres_NativeUUIDInet below proves those columns
+// converge on the PG target through the live CDC stream; this corpus keeps
+// to the JSON/temporal P2 surface.
 func TestStreamer_MariaDBToPostgres(t *testing.T) {
 	sourceDSN, srcCleanup := startMariaDBBinlog(t)
 	defer srcCleanup()
@@ -281,38 +271,110 @@ func TestStreamer_MariaDBToPostgres(t *testing.T) {
 	}
 }
 
-// TestStreamer_MariaDBToMySQL_NativeUUIDRefusedPreData is the direct proof
-// that the ADR-0170 native-uuid/inet refusal closes the MySQL-family-target
-// SILENT-corruption path: a MariaDB source with a native uuid column,
-// synced to a MYSQL target (whose CHAR(36) would silently accept a
-// mis-decoded binlog string), must refuse with the coded error PRE-DATA —
-// the refusal fires in the snapshot opener, before the bulk copy, so the
-// MySQL target gets ZERO rows (no chance for any value, right or wrong, to
-// land). This is the target that would corrupt silently without the
-// refusal (a PG target rejects the bad string loudly; a MySQL target does
-// not).
-func TestStreamer_MariaDBToMySQL_NativeUUIDRefusedPreData(t *testing.T) {
+// TestStreamer_MariaDBToPostgres_NativeUUIDInet is the ADR-0171 cross-engine
+// value-fidelity spine: MariaDB native uuid + inet6 + inet4 columns must
+// converge to the CORRECT value on a PG target through the live CDC stream —
+// both the cold-start bulk copy AND the CDC INSERT/UPDATE arms. PG's native
+// uuid/inet types are the strict oracle: a wrong-order or mis-formatted value
+// is stored canonically-comparable, so an exact ::text match proves the
+// decode. Shapes: canonical uuid, all-zeros, ipv4-mapped inet6, plain inet4,
+// NULL — bulk (R1) + CDC insert (R2) + CDC update (R1).
+func TestStreamer_MariaDBToPostgres_NativeUUIDInet(t *testing.T) {
+	sourceDSN, srcCleanup := startMariaDBBinlog(t)
+	defer srcCleanup()
+	_, pgTargetDSN, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMariaDBSQL(t, sourceDSN, `
+		CREATE TABLE nat (
+			id  INT  NOT NULL,
+			u   UUID,
+			ip6 INET6,
+			ip4 INET4,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB;
+		INSERT INTO nat (id, u, ip6, ip4) VALUES
+			(1, '01234567-89ab-cdef-8123-456789abcdef', '2001:db8::1', '192.168.1.10');`)
+
+	mariaEng, _ := engines.Get("mariadb")
+	pgEng, _ := engines.Get("postgres")
+	streamer := &Streamer{
+		Source:    mariaEng,
+		Target:    pgEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: pgTargetDSN,
+		StreamID:  "test-cross-mariadb-pg-native",
+	}
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	// Bulk copy lands R1.
+	if !waitForRowCount(t, pgTargetDSN, "nat", 1, 90*time.Second) {
+		t.Fatalf("bulk copy never delivered R1 to PG")
+	}
+	assertNativeOnPG(t, pgTargetDSN, 1, "01234567-89ab-cdef-8123-456789abcdef", "2001:db8::1", "192.168.1.10", "bulk copy")
+
+	// CDC INSERT R2 — the all-zeros / ipv4-mapped discriminating shapes
+	// (binlog delivers them trailing-zero-stripped).
+	applyMariaDBSQL(t, sourceDSN, `
+		INSERT INTO nat (id, u, ip6, ip4) VALUES
+			(2, '00000000-0000-0000-0000-000000000000', '::ffff:1.2.3.4', '0.0.0.0'),
+			(3, NULL, NULL, NULL);`)
+	if !waitForRowCount(t, pgTargetDSN, "nat", 3, 30*time.Second) {
+		select {
+		case e := <-runErr:
+			t.Fatalf("CDC INSERT never delivered R2/R3; streamer.Run returned: %v", e)
+		default:
+			t.Fatalf("CDC INSERT never delivered R2/R3")
+		}
+	}
+	assertNativeOnPG(t, pgTargetDSN, 2, "00000000-0000-0000-0000-000000000000", "::ffff:1.2.3.4", "0.0.0.0", "CDC insert")
+	assertNativeNullOnPG(t, pgTargetDSN, 3, "CDC insert NULL")
+
+	// CDC UPDATE R1 — fresh shapes on both the uuid and the inet columns.
+	applyMariaDBSQL(t, sourceDSN,
+		"UPDATE nat SET u = 'ffffffff-ffff-ffff-ffff-ffffffffffff', ip6 = '::1', ip4 = '255.255.255.255' WHERE id = 1;")
+	if !waitForNativeUUIDByID(t, pgTargetDSN, 1, "ffffffff-ffff-ffff-ffff-ffffffffffff", 30*time.Second) {
+		t.Fatalf("CDC UPDATE never propagated the new uuid to PG")
+	}
+	assertNativeOnPG(t, pgTargetDSN, 1, "ffffffff-ffff-ffff-ffff-ffffffffffff", "::1", "255.255.255.255", "CDC update")
+
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// TestStreamer_MariaDBToMySQL_NativeUUIDInet_CDC proves the ADR-0171 decode
+// on the target that WOULD have corrupted silently: a MySQL-family target
+// (uuid → CHAR(36), inet → VARCHAR(45)) accepts any 36-char string, so a
+// wrong-order decode would land silently. With the faithful decode, the
+// MySQL target must hold the EXACT source text after both bulk copy and CDC.
+// This is the direct successor to the former pre-data refusal test — the
+// hazard is now closed by correctness, not by refusal.
+func TestStreamer_MariaDBToMySQL_NativeUUIDInet_CDC(t *testing.T) {
 	srcDSN, srcCleanup := startMariaDBBinlog(t)
 	defer srcCleanup()
 	_, mysqlTargetDSN, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
 
 	applyMariaDBSQL(t, srcDSN, `
-		CREATE TABLE items (
-			id INT NOT NULL,
-			u  UUID NOT NULL,
+		CREATE TABLE nat (
+			id  INT  NOT NULL,
+			u   UUID,
+			ip6 INET6,
+			ip4 INET4,
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB;
-		INSERT INTO items (id, u) VALUES (1, '11111111-1111-1111-1111-111111111111');`)
+		INSERT INTO nat (id, u, ip6, ip4) VALUES
+			(1, '01234567-89ab-cdef-8123-456789abcdef', '2001:db8::1', '192.168.1.10');`)
 
-	mariaEng, ok := engines.Get("mariadb")
-	if !ok {
-		t.Fatal("mariadb engine not registered")
-	}
-	mysqlEng, ok := engines.Get("mysql")
-	if !ok {
-		t.Fatal("mysql engine not registered")
-	}
+	mariaEng, _ := engines.Get("mariadb")
+	mysqlEng, _ := engines.Get("mysql")
 	s := &Streamer{
 		Source:    mariaEng,
 		Target:    mysqlEng,
@@ -320,23 +382,135 @@ func TestStreamer_MariaDBToMySQL_NativeUUIDRefusedPreData(t *testing.T) {
 		TargetDSN: mysqlTargetDSN,
 		StreamID:  "test-mariadb-mysql-native",
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(ctx) }()
 
-	err := s.Run(ctx)
-	if err == nil {
-		t.Fatal("mariadb → mysql sync with a native uuid column SUCCEEDED; want the coded native-type refusal — " +
-			"a MySQL-family target (CHAR(36)) would SILENTLY accept the mis-decoded binlog bytes")
+	// Bulk copy lands R1 on the MySQL target.
+	if !waitForRowCountMySQL(t, mysqlTargetDSN, "nat", 1, 90*time.Second) {
+		select {
+		case e := <-runErr:
+			t.Fatalf("bulk copy never delivered R1 to MySQL target; Run returned: %v", e)
+		default:
+			t.Fatalf("bulk copy never delivered R1 to MySQL target")
+		}
 	}
-	ce, ok := sluicecode.FromError(err)
-	if !ok || ce.Code != sluicecode.CodeCDCMariaDBNativeTypeUnsupported {
-		t.Fatalf("Run err = %v; want coded %s", err, sluicecode.CodeCDCMariaDBNativeTypeUnsupported)
+	assertNativeOnMySQL(t, mysqlTargetDSN, 1, "01234567-89ab-cdef-8123-456789abcdef", "2001:db8::1", "192.168.1.10", "bulk copy")
+
+	// CDC INSERT R2 — the discriminating all-zeros/ipv4-mapped shapes.
+	applyMariaDBSQL(t, srcDSN, `
+		INSERT INTO nat (id, u, ip6, ip4) VALUES
+			(2, '00000000-0000-0000-0000-000000000000', '::ffff:1.2.3.4', '0.0.0.0');`)
+	if !waitForRowCountMySQL(t, mysqlTargetDSN, "nat", 2, 30*time.Second) {
+		t.Fatalf("CDC INSERT never delivered R2 to MySQL target — the wrong-order silent-corruption target")
 	}
-	// Pre-data: the refusal fires in the snapshot opener, before the bulk
-	// copy — so the MySQL target got NO rows. pollRowCountMySQL tolerates
-	// an absent table (returns 0).
-	if n := pollRowCountMySQL(mysqlTargetDSN, "items"); n != 0 {
-		t.Errorf("mysql target items row count = %d; want 0 (the refusal must be pre-data — nothing copied)", n)
+	assertNativeOnMySQL(t, mysqlTargetDSN, 2, "00000000-0000-0000-0000-000000000000", "::ffff:1.2.3.4", "0.0.0.0", "CDC insert")
+
+	cancel()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// assertNativeOnPG reads nat(id) on the PG target and asserts each native
+// column's FULL ::text equals the expected canonical rendering. The inet
+// columns are asserted with PG's host-mask suffix (/128 for inet6, /32 for
+// inet4 — a MariaDB inet value is always a single host) so a mask/format
+// regression is visible, not hidden behind host(). Both the bulk-copy and
+// CDC arms flow through the same PG writer, so a divergence here is a real
+// decode/format bug, never PG-side rendering drift.
+func assertNativeOnPG(t *testing.T, dsn string, id int, wantUUID, wantIP6, wantIP4, phase string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("%s: open pg: %v", phase, err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var u, ip6, ip4 string
+	err = db.QueryRowContext(ctx,
+		`SELECT u::text, ip6::text, ip4::text FROM nat WHERE id = $1`, id).Scan(&u, &ip6, &ip4)
+	if err != nil {
+		t.Fatalf("%s: read nat(id=%d) on PG: %v", phase, id, err)
+	}
+	if u != wantUUID {
+		t.Errorf("%s: nat(%d).u = %q; want %q", phase, id, u, wantUUID)
+	}
+	if ip6 != wantIP6+"/128" {
+		t.Errorf("%s: nat(%d).ip6 = %q; want %q", phase, id, ip6, wantIP6+"/128")
+	}
+	if ip4 != wantIP4+"/32" {
+		t.Errorf("%s: nat(%d).ip4 = %q; want %q", phase, id, ip4, wantIP4+"/32")
+	}
+}
+
+func assertNativeNullOnPG(t *testing.T, dsn string, id int, phase string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("%s: open pg: %v", phase, err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var u, ip6, ip4 sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT u, ip6, ip4 FROM nat WHERE id = $1`, id).Scan(&u, &ip6, &ip4)
+	if err != nil {
+		t.Fatalf("%s: read nat(id=%d) on PG: %v", phase, id, err)
+	}
+	if u.Valid || ip6.Valid || ip4.Valid {
+		t.Errorf("%s: nat(%d) NULLs did not round-trip: u=%v ip6=%v ip4=%v", phase, id, u, ip6, ip4)
+	}
+}
+
+func waitForNativeUUIDByID(t *testing.T, dsn string, id int, want string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		db, err := sql.Open("pgx", dsn)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			var u string
+			qerr := db.QueryRowContext(ctx, "SELECT u::text FROM nat WHERE id = $1", id).Scan(&u)
+			cancel()
+			_ = db.Close()
+			if qerr == nil && u == want {
+				return true
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// assertNativeOnMySQL reads nat(id) on a MySQL-family target and asserts each
+// native column (landed as CHAR(36)/VARCHAR(45)) holds the exact source text.
+func assertNativeOnMySQL(t *testing.T, dsn string, id int, wantUUID, wantIP6, wantIP4, phase string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("%s: open mysql: %v", phase, err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var u, ip6, ip4 string
+	err = db.QueryRowContext(ctx, "SELECT u, ip6, ip4 FROM nat WHERE id = ?", id).Scan(&u, &ip6, &ip4)
+	if err != nil {
+		t.Fatalf("%s: read nat(id=%d) on mysql: %v", phase, id, err)
+	}
+	if u != wantUUID {
+		t.Errorf("%s: nat(%d).u = %q; want %q — a MySQL-family target would SILENTLY accept a wrong value", phase, id, u, wantUUID)
+	}
+	if ip6 != wantIP6 {
+		t.Errorf("%s: nat(%d).ip6 = %q; want %q", phase, id, ip6, wantIP6)
+	}
+	if ip4 != wantIP4 {
+		t.Errorf("%s: nat(%d).ip4 = %q; want %q", phase, id, ip4, wantIP4)
 	}
 }
 

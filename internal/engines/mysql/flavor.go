@@ -205,11 +205,12 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	//     branches the go-mysql GTID parser + the MariaDB position SQL
 	//     (`@@gtid_binlog_pos`, no `GTID_SUBSET`), and handles the
 	//     MariadbGTIDEvent that opens each transaction (MariaDB emits no
-	//     BEGIN QueryEvent). Native uuid/inet6/inet4 columns read
-	//     correctly under bulk migrate (Phase 2) but their binlog value-
-	//     decode is not yet implemented, so CDC over them refuses loudly,
-	//     pre-data, on all targets with SLUICE-E-CDC-MARIADB-NATIVE-TYPE-
-	//     UNSUPPORTED (flavor-aware binlog decode is a filed follow-up).
+	//     BEGIN QueryEvent). Native uuid/inet6/inet4 columns are decoded
+	//     from their raw binlog storage bytes (ADR-0171 — canonical
+	//     big-endian, trailing-zero-stripped; see decodeMariaDBNative), so
+	//     CDC over them now converges byte-for-byte with the bulk-copy
+	//     text; the P3 SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED refusal
+	//     is lifted (the code stays registered but is no longer emitted).
 	//   - JSONSupport: JSONText, not JSONBinary. MariaDB JSON is a
 	//     LONGTEXT alias — information_schema reports data_type
 	//     'longtext' (plus an auto json_valid CHECK). Phase 2 recovers

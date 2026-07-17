@@ -321,17 +321,6 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = db.Close()
 		return nil, err
 	}
-	// ADR-0170: refuse a MariaDB source with a native uuid/inet column
-	// HERE too — before the FTWRL/consistent-snapshot dance and the bulk
-	// copy — so a cold-start sync fails pre-data rather than after copying
-	// (the StreamChanges chokepoint is the backstop for warm resume /
-	// multi-db / backup incremental). Single-database cold start: nil
-	// predicate ⇒ only cfg.DBName is in scope.
-	if err := scanMariaDBNativeUUIDInet(ctx, db, e.Flavor, cfg.DBName, nil); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
 	// Pin a single connection. All snapshot-pinned reads will run on
 	// this conn; the snapshot transaction is bound to it.
 	conn, err := db.Conn(ctx)

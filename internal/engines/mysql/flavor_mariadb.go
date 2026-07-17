@@ -400,37 +400,12 @@ func warnMariaDBUnderMySQLDriver(version string) {
 // SLUICE-E-CDC-MARIADB-UNSUPPORTED code stays defined in the sluicecode
 // catalog (a stable public code registry) but is no longer emitted.
 
-// PreflightCDCScope implements [ir.CDCScopePreflighter]: the mid-stream
-// add-table guard paired with the CDC reader's stream-start
-// [CDCReader.preflightMariaDBNativeUUIDInet]. On the mariadb flavor it
-// refuses a table carrying a native uuid / inet column, whose binlog CDC
-// value-decode is not yet implemented (ADR-0170) — the raw storage bytes
-// would stringify into a wrong value that a MySQL-family target silently
-// accepts. The stream-start preflight runs inside the CDC reader, but
-// add-table extends a LIVE stream's scope without re-opening it, so this
-// closes that path with the same coded refusal.
-//
-// On a MariaDB source ir.UUID/ir.Inet arise ONLY from the native
-// uuid/inet6/inet4 types (ADR-0169; a text-backed VARCHAR reads as
-// ir.Varchar). A deliberate `--type-override` of a VARCHAR to uuid/inet
-// on a mariadb source would also be refused here — conservative but safe
-// (drop the override or bulk-migrate the table). Non-mariadb flavors, and
-// engines whose CDC decodes every column they read, return nil.
-func (e Engine) PreflightCDCScope(_ context.Context, tables []*ir.Table) error {
-	if e.Flavor != FlavorMariaDB {
-		return nil
-	}
-	var offenders []string
-	for _, t := range tables {
-		for _, c := range t.Columns {
-			switch c.Type.(type) {
-			case ir.UUID, ir.Inet:
-				offenders = append(offenders, fmt.Sprintf("%s.%s (%s)", t.Name, c.Name, c.Type.String()))
-			}
-		}
-	}
-	if len(offenders) == 0 {
-		return nil
-	}
-	return mariadbNativeUUIDInetRefusal(offenders)
-}
+// NOTE: MariaDB native uuid/inet6/inet4 CDC binlog decode shipped in the
+// item-73 P3 follow-up (ADR-0171); the binlog reader now decodes those raw
+// storage bytes faithfully ([decodeMariaDBNative]), so the Phase-3 add-table
+// refusal (the former Engine.PreflightCDCScope [ir.CDCScopePreflighter]
+// implementation) is removed — a native uuid/inet column can now join a live
+// CDC stream. The SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED code stays
+// defined in the sluicecode catalog (a stable public code registry) but is
+// no longer emitted. The [ir.CDCScopePreflighter] interface + the pipeline
+// add-table hook remain as a generic, engine-neutral extension point.

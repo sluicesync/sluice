@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"testing"
 	"time"
 
@@ -38,27 +37,33 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// TestMariaDB_CDCReader_NativeUUIDInet_LoudRefusal pins the ADR-0170
-// stream-start refusal that closes the MySQL-family-target SILENT-
-// corruption path: a MariaDB source with a native uuid / inet column in
-// CDC scope must refuse LOUDLY + coded at StreamChanges, PRE-DATA (the
-// binlog stream never opens, so no target — Postgres OR MySQL-family —
-// can see a mis-decoded value). Class pin: BOTH native families (uuid AND
-// inet6) are named as offenders. Both LTS lines.
-func TestMariaDB_CDCReader_NativeUUIDInet_LoudRefusal(t *testing.T) {
+// TestMariaDB_CDCReader_NativeUUIDInet_Decode is the ADR-0171 value-
+// fidelity pin: the binlog CDC decode of MariaDB native uuid / inet6 /
+// inet4 columns must converge BYTE-FOR-BYTE with the bulk-copy driver text
+// (the cold-start snapshot path) — proven by asserting each CDC-decoded
+// value equals a direct driver SELECT of the same cell. Bug-74 discipline:
+// every family (uuid, inet6, inet4) × every shape (canonical, all-zeros,
+// all-Fs, ipv4-mapped, trailing-zero, mixed-case, NULL) × every DML arm
+// (INSERT, UPDATE before+after, DELETE), on BOTH LTS lines. The all-zeros /
+// trailing-zero rows are the discriminating cases: the binlog delivers them
+// trailing-zero-STRIPPED, so a naive decode would land a short/empty value.
+func TestMariaDB_CDCReader_NativeUUIDInet_Decode(t *testing.T) {
 	for _, image := range []string{mariadb114Image, mariadb1011Image} {
 		image := image
 		t.Run(image, func(t *testing.T) {
 			dsn := newMariaDB(t, image, "mdb_cdc_native")
 			execSQLScript(t, dsn, `
-				CREATE TABLE plain (id INT PRIMARY KEY, name VARCHAR(32)) ENGINE=InnoDB;
-				CREATE TABLE hasnative (id INT PRIMARY KEY, u UUID, ip6 INET6) ENGINE=InnoDB;`)
+				CREATE TABLE nat (
+					id  INT PRIMARY KEY,
+					u   UUID,
+					ip6 INET6,
+					ip4 INET4
+				) ENGINE=InnoDB;`)
 
 			eng := Engine{Flavor: FlavorMariaDB}
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 
 			rdr, err := eng.OpenCDCReader(ctx, dsn)
@@ -70,24 +75,117 @@ func TestMariaDB_CDCReader_NativeUUIDInet_LoudRefusal(t *testing.T) {
 					_ = c.Close()
 				}
 			}()
+			changes, err := rdr.StreamChanges(ctx, ir.Position{})
+			if err != nil {
+				t.Fatalf("StreamChanges: %v", err)
+			}
+			time.Sleep(300 * time.Millisecond)
 
-			_, streamErr := rdr.StreamChanges(ctx, ir.Position{})
-			if streamErr == nil {
-				t.Fatal("StreamChanges succeeded on a MariaDB source with native uuid/inet columns in scope; " +
-					"want the coded refusal PRE-DATA — a MySQL-family target would otherwise silently accept the " +
-					"mis-decoded binlog bytes")
+			// INSERT the family × shape matrix. Row 1 uses UPPERCASE input to
+			// pin lowercase-canonical normalization; every value is accepted
+			// by MariaDB's uuid variant validator.
+			applyMySQL(t, dsn, `
+				INSERT INTO nat (id, u, ip6, ip4) VALUES
+					(1, '01234567-89AB-CDEF-8123-456789ABCDEF', '2001:db8::1',     '192.168.1.10'),
+					(2, '00000000-0000-0000-0000-000000000000', '::',             '0.0.0.0'),
+					(3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '::ffff:1.2.3.4',  '255.255.255.255'),
+					(4, '01234567-89ab-cdef-8100-000000000000', '2001:db8::',      '10.0.0.0'),
+					(5, NULL, NULL, NULL);`)
+
+			inserts := drainChanges(t, ctx, changes, 5, 30*time.Second)
+			if len(inserts) != 5 {
+				if streamErr := rdr.(*CDCReader).Err(); streamErr != nil {
+					t.Fatalf("got %d inserts; want 5 (stream error: %v)", len(inserts), streamErr)
+				}
+				t.Fatalf("got %d inserts; want 5", len(inserts))
 			}
-			ce, ok := sluicecode.FromError(streamErr)
-			if !ok || ce.Code != sluicecode.CodeCDCMariaDBNativeTypeUnsupported {
-				t.Fatalf("stream error = %v; want coded %s", streamErr, sluicecode.CodeCDCMariaDBNativeTypeUnsupported)
+			for _, ch := range inserts {
+				ins, ok := ch.(ir.Insert)
+				if !ok {
+					t.Fatalf("change = %T; want ir.Insert", ch)
+				}
+				id, _ := ins.Row["id"].(int64)
+				assertNativeRowMatchesDriver(t, dsn, int(id), ins.Row)
 			}
-			// Class pin: both native families named (uuid AND inet6).
-			for _, want := range []string{"hasnative.u (uuid)", "hasnative.ip6 (inet6)"} {
-				if !strings.Contains(streamErr.Error(), want) {
-					t.Errorf("refusal must name offender %q; got: %s", want, streamErr)
+
+			// UPDATE arm: mutate row 4 to fresh shapes — the before-image AND
+			// after-image both carry native columns, so both decode paths are
+			// exercised. The after-image must match the driver's post-update
+			// SELECT.
+			applyMySQL(t, dsn, `UPDATE nat SET u = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', ip6 = '::1', ip4 = '172.16.0.255' WHERE id = 4`)
+			upd := drainChanges(t, ctx, changes, 1, 30*time.Second)
+			if len(upd) != 1 {
+				t.Fatalf("got %d updates; want 1", len(upd))
+			}
+			u, ok := upd[0].(ir.Update)
+			if !ok {
+				t.Fatalf("change = %T; want ir.Update", upd[0])
+			}
+			assertNativeRowMatchesDriver(t, dsn, 4, u.After)
+
+			// DELETE arm: row 3's before-image carries the native columns.
+			applyMySQL(t, dsn, `DELETE FROM nat WHERE id = 3`)
+			del := drainChanges(t, ctx, changes, 1, 30*time.Second)
+			if len(del) != 1 {
+				t.Fatalf("got %d deletes; want 1", len(del))
+			}
+			d, ok := del[0].(ir.Delete)
+			if !ok {
+				t.Fatalf("change = %T; want ir.Delete", del[0])
+			}
+			// The DELETE before-image is PK-narrowed (Bug 88); assert whatever
+			// native columns it carries decode to a valid non-corrupt text.
+			for _, col := range []string{"u", "ip6", "ip4"} {
+				if v, present := d.Before[col]; present && v != nil {
+					if _, isStr := v.(string); !isStr {
+						t.Errorf("delete before-image %s = %#v; want a decoded string", col, v)
+					}
 				}
 			}
 		})
+	}
+}
+
+// assertNativeRowMatchesDriver asserts the CDC-decoded native uuid/inet
+// values for row id equal a direct driver SELECT of the same cells — the
+// cold-start (bulk-copy text) path — proving CDC and snapshot converge.
+// A NULL cell must decode to nil.
+func assertNativeRowMatchesDriver(t *testing.T, dsn string, id int, row ir.Row) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var u, ip6, ip4 sql.NullString
+	err = db.QueryRowContext(ctx, "SELECT u, ip6, ip4 FROM nat WHERE id = ?", id).Scan(&u, &ip6, &ip4)
+	if err != nil {
+		t.Fatalf("driver read id=%d: %v", id, err)
+	}
+	for _, c := range []struct {
+		name string
+		want sql.NullString
+	}{
+		{"u", u}, {"ip6", ip6}, {"ip4", ip4},
+	} {
+		got := row[c.name]
+		if !c.want.Valid {
+			if got != nil {
+				t.Errorf("id=%d %s: CDC=%#v; want nil (driver NULL)", id, c.name, got)
+			}
+			continue
+		}
+		gs, ok := got.(string)
+		if !ok {
+			t.Errorf("id=%d %s: CDC=%#v (%T); want string %q", id, c.name, got, got, c.want.String)
+			continue
+		}
+		if gs != c.want.String {
+			t.Errorf("id=%d %s: CDC decode = %q; driver text = %q — cold-start and CDC DIVERGE", id, c.name, gs, c.want.String)
+		}
 	}
 }
 

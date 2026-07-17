@@ -306,6 +306,16 @@ type tableSchema struct {
 	Name       string
 	Columns    []*ir.Column
 	PrimaryKey []string
+
+	// NativeKinds is parallel to Columns: NativeKinds[i] is the MariaDB
+	// native fixed-width kind of Columns[i] (uuid/inet4/inet6) or
+	// mariadbNativeNone. It is captured from information_schema.data_type
+	// in loadTableSchema because the IR collapses inet4/inet6 to ir.Inet
+	// and the CDC binlog decode needs the exact width (ADR-0171). Empty /
+	// all-none on non-MariaDB tables. The decode path
+	// ([decodeBinlogRow]) consults it only when the reader's flavor is
+	// MariaDB.
+	NativeKinds []mariadbNativeKind
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
@@ -435,15 +445,6 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// a cold start refuses before the bulk copy rather than after it.)
 	// See cdc_row_image_preflight.go for the full mechanism.
 	if err := preflightBinlogRowImage(ctx, r.db); err != nil {
-		return nil, err
-	}
-
-	// MariaDB-only (ADR-0170): refuse loudly + coded if any in-scope table
-	// has a native uuid/inet column, whose binlog raw-bytes decode is not
-	// yet implemented — a MySQL-family target would otherwise SILENTLY
-	// accept the mis-decoded value. Target-independent, pre-data. No-op on
-	// every other flavor.
-	if err := r.preflightMariaDBNativeUUIDInet(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1011,7 +1012,7 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
 				return err
 			}
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -1054,11 +1055,11 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
 				return err
 			}
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -1112,7 +1113,7 @@ func (r *CDCReader) dispatchRows(
 					return err
 				}
 			}
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -2113,13 +2114,28 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, error) {
+func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
 	row := make(ir.Row, len(cols))
 	for i, col := range cols {
 		if col.IsGenerated() {
+			continue
+		}
+		// MariaDB native uuid/inet columns arrive in the binlog as RAW
+		// storage bytes, NOT the text the bulk-copy driver path returns —
+		// decode them with the width-aware native decoder (ADR-0171) so the
+		// CDC tail converges byte-for-byte with the cold-start snapshot.
+		// natives is parallel to cols; the flavor gate is belt-and-braces
+		// (only MariaDB reports these data_types, so natives is all-none
+		// elsewhere). Non-native columns take the ordinary decodeValue path.
+		if flavor == FlavorMariaDB && i < len(natives) && natives[i] != mariadbNativeNone {
+			v, err := decodeMariaDBNative(raw[i], natives[i])
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", col.Name, err)
+			}
+			row[col.Name] = v
 			continue
 		}
 		v, err := decodeValue(raw[i], col.Type)

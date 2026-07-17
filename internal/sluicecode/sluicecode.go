@@ -61,9 +61,12 @@ const (
 	CodeCDCMariaDBUnsupported    Code = "SLUICE-E-CDC-MARIADB-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
-	// MariaDB native uuid/inet6/inet4 columns are unstreamable via CDC
-	// (the binlog carries raw storage bytes the decoder can't yet format);
-	// refused loudly at CDC start on ALL targets. See ADR-0170.
+	// RETAINED-BUT-UNUSED (ADR-0171): the P3 refusal for MariaDB native
+	// uuid/inet6/inet4 CDC is lifted — the binlog decode now formats those
+	// raw storage bytes faithfully ([mysql.decodeMariaDBNative]). The code
+	// stays registered because removing a published catalog code is
+	// breaking; it is no longer emitted. See ADR-0170 (refusal) / ADR-0171
+	// (decode + lift).
 	CodeCDCMariaDBNativeTypeUnsupported Code = "SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED"
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
