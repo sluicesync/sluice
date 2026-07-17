@@ -22,7 +22,7 @@ func TestBuildBatchUpsert_SinglePK(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert(table, 2, pk)
+	got := buildBatchUpsert(table, 2, pk, upsertRowAlias)
 	want := "INSERT INTO `users` (`id`, `email`, `name`) VALUES (?, ?, ?), (?, ?, ?) AS new ON DUPLICATE KEY UPDATE `email` = new.`email`, `name` = new.`name`"
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -42,7 +42,7 @@ func TestBuildBatchUpsert_CompositePK(t *testing.T) {
 		}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert(table, 1, pk)
+	got := buildBatchUpsert(table, 1, pk, upsertRowAlias)
 	want := "INSERT INTO `products` (`tenant`, `sku`, `name`) VALUES (?, ?, ?) AS new ON DUPLICATE KEY UPDATE `name` = new.`name`"
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -61,7 +61,7 @@ func TestBuildBatchUpsert_AllPKColumns(t *testing.T) {
 		}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert(table, 1, pk)
+	got := buildBatchUpsert(table, 1, pk, upsertRowAlias)
 	// No-op: re-assign first PK to itself so the statement is legal.
 	if !strings.Contains(got, "`tenant` = new.`tenant`") {
 		t.Errorf("got %q; want self-reassign of first PK column", got)
@@ -78,7 +78,7 @@ func TestBuildBatchUpsert_NoKeyColsFallsBackToPlainInsert(t *testing.T) {
 	}
 	// Empty keyCols → plain INSERT (defensive path; the idempotent
 	// writer refuses keyless tables before reaching here, Bug 125).
-	got := buildBatchUpsert(table, 1, nil)
+	got := buildBatchUpsert(table, 1, nil, upsertRowAlias)
 	if strings.Contains(got, "ON DUPLICATE KEY") {
 		t.Errorf("expected plain INSERT for empty keyCols; got %q", got)
 	}
@@ -105,7 +105,7 @@ func TestBuildBatchUpsert_NonNullUniqueKey(t *testing.T) {
 	if !ok {
 		t.Fatal("effectiveUpsertKeyColumns: ok=false; want a non-null unique key")
 	}
-	got := buildBatchUpsert(table, 1, keyCols)
+	got := buildBatchUpsert(table, 1, keyCols, upsertRowAlias)
 	if !strings.Contains(got, "ON DUPLICATE KEY UPDATE") {
 		t.Fatalf("expected upsert for non-null unique key; got %q", got)
 	}

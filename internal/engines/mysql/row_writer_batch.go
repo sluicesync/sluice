@@ -338,7 +338,7 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		if batch.empty() {
 			return nil
 		}
-		query := buildBatchUpsert(table, len(batch.rows), keyCols)
+		query := buildBatchUpsert(table, len(batch.rows), keyCols, w.upsert)
 		args, err := flattenArgs(batch.rows, table)
 		if err != nil {
 			return fmt.Errorf("mysql: idempotent insert into %q: %w", table.Name, err)
@@ -418,7 +418,11 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 // the idempotent writer refuses keyless tables before reaching here
 // (errKeylessIdempotent), so this fallback is defensive for direct
 // callers and unit tests.
-func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string) string {
+//
+// upsert selects the ON DUPLICATE KEY UPDATE spelling (roadmap item
+// 73: the MySQL 8.0.20+ row alias everywhere except mariadb, which
+// keeps the legacy VALUES() form).
+func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string, upsert upsertSpelling) string {
 	cols := nonGeneratedColumns(table.Columns)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
@@ -454,19 +458,19 @@ func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string) string {
 		}
 		nonKey = append(nonKey, c.Name)
 	}
-	sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
+	sb.WriteString(upsert.clauseOpen())
 	if len(nonKey) == 0 {
 		// Every column is a conflict-key column. Re-assign the first
 		// key column to itself so the statement parses; the conflict
 		// resolves to a no-op UPDATE which is the right semantic.
 		sb.WriteString(quoteIdent(keyCols[0]))
-		sb.WriteString(" = new.")
-		sb.WriteString(quoteIdent(keyCols[0]))
+		sb.WriteString(" = ")
+		sb.WriteString(upsert.newRowRef(quoteIdent(keyCols[0])))
 		return sb.String()
 	}
 	parts := make([]string, len(nonKey))
 	for i, c := range nonKey {
-		parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
+		parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 	return sb.String()

@@ -94,6 +94,16 @@ type RowWriter struct {
 	// (rows go through an io.Pipe to the driver) and is unaffected.
 	maxBufferBytes int64
 
+	// upsert is the ON DUPLICATE KEY UPDATE spelling the idempotent
+	// batched-insert path renders (roadmap item 73: VALUES() on the
+	// mariadb flavor, the MySQL 8.0.20+ row alias everywhere else).
+	// Set at [Engine.OpenRowWriter]; the zero value is the row alias,
+	// so direct constructions are byte-identical to today. Relevant on
+	// a mariadb target despite its LOAD DATA capability: the writer
+	// falls back to BatchedInsert per call when the server runs
+	// local_infile=OFF or the table carries a geometry column.
+	upsert upsertSpelling
+
 	// tierCPUBoundTarget marks a hosted-PlanetScale-flavor target;
 	// the first batched bulk flush per writer emits the ADR-0150
 	// tier-CPU-ceiling operator hint (see [noteTierCPUBoundTarget]).

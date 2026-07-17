@@ -17,6 +17,7 @@ func TestFlavorString(t *testing.T) {
 		{FlavorVanilla, "mysql"},
 		{FlavorPlanetScale, "planetscale"},
 		{FlavorVitess, "vitess"},
+		{FlavorMariaDB, "mariadb"},
 	}
 	for _, c := range cases {
 		if got := c.f.String(); got != c.want {
@@ -39,7 +40,7 @@ func TestEngineZeroValueIsVanilla(t *testing.T) {
 }
 
 func TestEachFlavorHasCapabilities(t *testing.T) {
-	flavors := []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess}
+	flavors := []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess, FlavorMariaDB}
 	for _, f := range flavors {
 		caps := f.capabilities()
 		// A flavor with no SchemaScope and BulkLoadNone is almost
@@ -123,7 +124,7 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 // flavor→capability wiring the completeness tests otherwise bypass with a
 // synthetic bool.
 func TestVStreamFlavorsCommitPositionsAfterRows(t *testing.T) {
-	for _, f := range []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess} {
+	for _, f := range []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess, FlavorMariaDB} {
 		caps := f.capabilities()
 		if caps.CDC == ir.CDCVStream && !caps.CDCPositionCommitsAfterRows {
 			t.Errorf("flavor %q: CDC==VStream but CDCPositionCommitsAfterRows=false — VStream stamps positions AFTER its rows, so restore must not trust a schema anchor at EndPosition (Bug 184); the default-false flag reopens the emptied-data silent-loss", f)

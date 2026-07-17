@@ -58,6 +58,7 @@ const (
 	CodeCDCPoolerEndpoint        Code = "SLUICE-E-CDC-POOLER-ENDPOINT"
 	CodeCDCRowImagePartial       Code = "SLUICE-E-CDC-ROW-IMAGE-PARTIAL"
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
+	CodeCDCMariaDBUnsupported    Code = "SLUICE-E-CDC-MARIADB-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
@@ -143,6 +144,8 @@ var registry = map[Code]Info{
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeCDCRowImagePartial:         {ClassRefusal, "the MySQL source streams partial binlog row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON), under which binlog CDC silently loses UPDATEs — refused at CDC start (or loudly mid-stream when a partial image slips past the global preflight)"},
+	CodeCDCMariaDBUnsupported:      {ClassRefusal, "CDC (continuous sync / incremental backup) from a MariaDB source is not supported yet — MariaDB's domain-based GTID positions are roadmap item 73 Phase 3; use bulk migrate + cutover or backup/restore today"},
+
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},

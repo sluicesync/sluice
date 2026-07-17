@@ -95,6 +95,12 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mysql: read tables: %w", err)
 	}
+	// mariadb flavor: refuse loudly on table classes the BASE TABLE
+	// filter above silently misses (SYSTEM VERSIONED, SEQUENCE) —
+	// item 73's census guard against the Bug-100 invisible-object class.
+	if err := r.refuseInvisibleMariaDBTables(ctx); err != nil {
+		return nil, fmt.Errorf("mysql: read tables: %w", err)
+	}
 	views, err := r.readViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: read views: %w", err)
@@ -239,15 +245,30 @@ func (r *SchemaReader) namespaceName() string {
 	return ""
 }
 
-// populateColumns fills in Column lists for each table.
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table) error {
-	// `srs_id` is geometry-only (NULL on non-geometry columns).
-	// IFNULL(..., 0) keeps the scan tidy — 0 is also the "no SRID
-	// declared" value for geometry columns, so the cast is
-	// semantically correct for both cases. MySQL added this column
-	// in 8.0; pre-8.0 servers would error here, but sluice's
-	// supported MySQL baseline is 8.0+.
-	const q = `
+// columnsQuery returns populateColumns' information_schema.columns
+// query for the reader's flavor. Two MySQL-8-only projections gate on
+// it (roadmap item 73):
+//
+//   - `srs_id` (MySQL 8.0's spatial-reference id; geometry-only, NULL
+//     on non-geometry columns — IFNULL(..., 0) keeps the scan tidy and
+//     0 is also the "no SRID declared" value, so the cast is
+//     semantically correct for both cases). MariaDB has never had the
+//     column (its SRID attribute lives only in SHOW CREATE as
+//     REF_SYSTEM_ID) — Error 1054, the wall that killed every
+//     mariadb-as-source surface. The mariadb variant selects the
+//     constant 0; the flavor excludes ExtGeometry so no SRID is
+//     silently dropped behind it.
+//   - nothing else differs: every other projection was probed clean on
+//     MariaDB 10.11/11.4.
+//
+// The MySQL shape is byte-identical to the historical constant (unit-
+// pinned) so the supported-baseline 8.0+ path cannot drift.
+func columnsQuery(flavor Flavor) string {
+	srsID := `IFNULL(srs_id, 0),`
+	if flavor == FlavorMariaDB {
+		srsID = `0,`
+	}
+	return `
 		SELECT
 			table_name,
 			column_name,
@@ -261,7 +282,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			datetime_precision,
 			IFNULL(character_set_name, ''),
 			IFNULL(collation_name, ''),
-			IFNULL(srs_id, 0),
+			` + srsID + `
 			column_type,
 			IFNULL(extra, ''),
 			IFNULL(column_comment, ''),
@@ -269,8 +290,109 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		FROM   information_schema.columns
 		WHERE  table_schema = ?
 		ORDER  BY table_name, ordinal_position`
+}
+
+// indexesQuery returns populateIndexes' information_schema.statistics
+// query for the reader's flavor. `expression` is MySQL 8.0.13's
+// functional-index column; MariaDB has no EXPRESSION column at all
+// (functional indexes are spelled via generated columns there, which
+// arrive through the ordinary generated-column path), so the mariadb
+// variant selects the empty-string constant — semantically faithful,
+// not a placeholder. The MySQL shape is byte-identical to the
+// historical constant (unit-pinned).
+func indexesQuery(flavor Flavor) string {
+	expr := `IFNULL(expression, ''),`
+	if flavor == FlavorMariaDB {
+		expr = `'',`
+	}
+	return `
+		SELECT
+			table_name,
+			index_name,
+			non_unique,
+			LOWER(IFNULL(index_type, '')),
+			column_name,
+			` + expr + `
+			seq_in_index,
+			IFNULL(sub_part, 0),
+			IFNULL(collation, '')
+		FROM   information_schema.statistics
+		WHERE  table_schema = ?
+		ORDER  BY table_name, index_name, seq_in_index`
+}
+
+// translateColumnDefault routes a scanned COLUMN_DEFAULT through the
+// flavor's convention translator: [translateMariaDBDefault] on the
+// mariadb flavor (quoted literals, the bare NULL keyword,
+// current_timestamp() with empty extra — the ATOMIC companion of the
+// catalog-query gate, see roadmap item 73), [translateDefault]
+// everywhere else (byte-identical to the historical behavior).
+func (r *SchemaReader) translateColumnDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultValue {
+	if r.flavor == FlavorMariaDB {
+		return translateMariaDBDefault(def, extra, typ)
+	}
+	return translateDefault(def, extra, typ)
+}
+
+// refuseInvisibleMariaDBTables is the mariadb-flavor census guard for
+// the table classes MariaDB reports under table_type values the BASE
+// TABLE filter in readTables cannot see (the Bug-100/INHERITS
+// silent-loss class, roadmap item 73):
+//
+//   - SYSTEM VERSIONED — a normal data-bearing table that would
+//     silently vanish from migrate/backup/verify;
+//   - SEQUENCE — a schema object whose definition and current value
+//     would silently vanish (and whose NEXT VALUE defaults would
+//     break dependent tables on the target).
+//
+// Phase 1 refuses loudly rather than partially supporting either
+// (Phase 2 migrates versioned tables as plain current-state tables
+// with a WARN and maps sequences to the IR sequence surface). The
+// refusal names every affected object so the operator can drop them
+// from scope deliberately instead of discovering the gap post-cutover.
+func (r *SchemaReader) refuseInvisibleMariaDBTables(ctx context.Context) error {
+	if r.flavor != FlavorMariaDB {
+		return nil
+	}
+	const q = `
+		SELECT table_name, table_type
+		FROM   information_schema.tables
+		WHERE  table_schema = ?
+		  AND  table_type IN ('SEQUENCE', 'SYSTEM VERSIONED')
+		ORDER  BY table_name`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var found []string
+	for rows.Next() {
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			return err
+		}
+		found = append(found, name+" ("+typ+")")
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"mariadb: the source database contains table types sluice's MariaDB support does not carry yet "+
+			"and would otherwise silently OMIT — %s. System-versioned tables and sequences are roadmap "+
+			"item 73 Phase 2; until then, convert the versioned tables (ALTER TABLE … DROP SYSTEM "+
+			"VERSIONING) or drop the objects from the source database before migrating",
+		strings.Join(found, ", "),
+	)
+}
+
+// populateColumns fills in Column lists for each table.
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table) error {
+	rows, err := r.db.QueryContext(ctx, columnsQuery(r.flavor), r.schema)
 	if err != nil {
 		return err
 	}
@@ -333,7 +455,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  translateDefault(defaultVal, meta.Extra, typ),
+			Default:  r.translateColumnDefault(defaultVal, meta.Extra, typ),
 			Comment:  comment,
 		}
 		applyGenerated(col, genExpr, meta.Extra)
@@ -362,22 +484,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 // sql.NullString so the NULL doesn't blow up the read, and route
 // NULL-column entries through the IR's expression-entry shape.
 func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*ir.Table) error {
-	const q = `
-		SELECT
-			table_name,
-			index_name,
-			non_unique,
-			LOWER(IFNULL(index_type, '')),
-			column_name,
-			IFNULL(expression, ''),
-			seq_in_index,
-			IFNULL(sub_part, 0),
-			IFNULL(collation, '')
-		FROM   information_schema.statistics
-		WHERE  table_schema = ?
-		ORDER  BY table_name, index_name, seq_in_index`
-
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.db.QueryContext(ctx, indexesQuery(r.flavor), r.schema)
 	if err != nil {
 		return err
 	}

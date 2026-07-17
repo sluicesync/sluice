@@ -21,7 +21,7 @@ func TestBuildMultiRowInsertSQL(t *testing.T) {
 			{"id": int64(8), "email": "b@x", "active": false},
 			{"id": int64(9), "email": "c@x", "active": true},
 		}
-		gotSQL, gotArgs, err := buildMultiRowInsertSQL("src", "users", rows, []string{"id"}, nil)
+		gotSQL, gotArgs, err := buildMultiRowInsertSQL("src", "users", rows, []string{"id"}, nil, upsertRowAlias)
 		if err != nil {
 			t.Fatalf("buildMultiRowInsertSQL: %v", err)
 		}
@@ -46,7 +46,7 @@ func TestBuildMultiRowInsertSQL(t *testing.T) {
 			{"id": int64(1), "name": "x"},
 			{"id": int64(2), "name": "y"},
 		}
-		gotSQL, gotArgs, err := buildMultiRowInsertSQL("src", "conns", rows, nil, nil)
+		gotSQL, gotArgs, err := buildMultiRowInsertSQL("src", "conns", rows, nil, nil, upsertRowAlias)
 		if err != nil {
 			t.Fatalf("buildMultiRowInsertSQL: %v", err)
 		}
@@ -62,7 +62,7 @@ func TestBuildMultiRowInsertSQL(t *testing.T) {
 	})
 
 	t.Run("empty rows is a loud error", func(t *testing.T) {
-		if _, _, err := buildMultiRowInsertSQL("src", "users", nil, []string{"id"}, nil); err == nil {
+		if _, _, err := buildMultiRowInsertSQL("src", "users", nil, []string{"id"}, nil, upsertRowAlias); err == nil {
 			t.Fatal("want error for zero rows, got nil")
 		}
 	})
@@ -88,8 +88,8 @@ func TestBuildMultiRowInsertSQL_SingleRowEquivalence(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			wantSQL, wantArgs, werr := buildInsertSQL("src", c.table, c.row, c.pk, nil)
-			gotSQL, gotArgs, gerr := buildMultiRowInsertSQL("src", c.table, []ir.Row{c.row}, c.pk, nil)
+			wantSQL, wantArgs, werr := buildInsertSQL("src", c.table, c.row, c.pk, nil, upsertRowAlias)
+			gotSQL, gotArgs, gerr := buildMultiRowInsertSQL("src", c.table, []ir.Row{c.row}, c.pk, nil, upsertRowAlias)
 			if werr != nil || gerr != nil {
 				t.Fatalf("build error: single=%v multi=%v", werr, gerr)
 			}

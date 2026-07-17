@@ -1300,6 +1300,29 @@ type DSNValidator interface {
 	ValidateDSN(dsn string) error
 }
 
+// CDCUnsupportedExplainer is the optional surface an [Engine] whose
+// [Capabilities.CDC] is [CDCNone] implements to supply the operator-
+// facing refusal for CDC-requiring modes (sync start, backup
+// stream/incremental, mid-stream add-table) — typically a coded error
+// naming WHY this engine flavor has no CDC yet and what the
+// alternatives are — instead of the orchestrator's generic "declares
+// CDC=None" message.
+//
+// ExplainCDCUnsupported returns nil when the engine has no flavor-
+// specific story (the orchestrator falls back to its generic
+// refusal), so a multi-flavor engine implements the method once and
+// answers only for the flavors that need it. The mysql engine's
+// `mariadb` flavor is the current implementer: its CDC gap is a
+// concrete, roadmapped position-format issue (MariaDB domain GTIDs,
+// roadmap item 73 Phase 3) with concrete alternatives (bulk migrate +
+// cutover, backup/restore), and the generic message would hide both.
+//
+// The orchestrator consults it ONLY after Capabilities().CDC == CDCNone
+// — a non-nil return never overrides a real CDC declaration.
+type CDCUnsupportedExplainer interface {
+	ExplainCDCUnsupported() error
+}
+
 // SourceHostAdvisory is one operator advisory a [SourceHostAdvisor]
 // derives from a source DSN's host pattern. Message is the full
 // WARN-level line (host + hazard + remedy, self-contained); Hint is

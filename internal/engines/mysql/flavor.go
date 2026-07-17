@@ -43,6 +43,19 @@ const (
 	// `--source-driver=vitess` works against a typical self-hosted vtgate
 	// without hand-set vstream_* params.
 	FlavorVitess
+	// FlavorMariaDB is MariaDB ≥ 10.11 LTS (roadmap item 73 Phase 1).
+	// Wire-compatible with the MySQL driver but divergent in exactly the
+	// places flavor_mariadb.go names: two MySQL-8-only information_schema
+	// columns (srs_id, statistics.expression), the COLUMN_DEFAULT
+	// reporting convention (quoted literals, the bare NULL keyword,
+	// current_timestamp() with empty extra), the row-alias upsert
+	// (`AS new` was never implemented — MariaDB keeps the legacy
+	// VALUES() spelling), and the utf8mb4_0900_* ↔ utf8mb4_uca1400_*
+	// collation families. CDC is CDCNone for Phase 1: MariaDB replicates
+	// with domain-based GTIDs the MySQL binlog reader cannot parse; the
+	// refusal is loud and coded (SLUICE-E-CDC-MARIADB-UNSUPPORTED),
+	// Phase 3 threads the vendored go-mysql MariaDB-GTID support.
+	FlavorMariaDB
 )
 
 // String returns the engine-registry name used to look this flavor
@@ -55,6 +68,8 @@ func (f Flavor) String() string {
 		return "planetscale"
 	case FlavorVitess:
 		return "vitess"
+	case FlavorMariaDB:
+		return "mariadb"
 	default:
 		return fmt.Sprintf("flavor(%d)", uint8(f))
 	}
@@ -175,5 +190,63 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		// flavor inherits it via the capabilities alias — same vtgate,
 		// same killer.
 		TransactionKiller: true,
+	},
+
+	// ---------------------------------------------------------------
+	// FlavorMariaDB — MariaDB ≥ 10.11 LTS (roadmap item 73 Phase 1).
+	//
+	// Honest Phase-1 declaration: bulk migrate source+target plus
+	// backup/restore/verify. Deliberate differences from vanilla:
+	//
+	//   - CDC: CDCNone. MariaDB replicates with domain-based GTIDs
+	//     (`0-100-38`) that the MySQL binlog reader's position codec
+	//     cannot parse; OpenCDCReader and the sync/backup-stream
+	//     preflights refuse loudly with SLUICE-E-CDC-MARIADB-UNSUPPORTED
+	//     (roadmap item 73 Phase 3 threads the vendored go-mysql
+	//     MariaDB-GTID support).
+	//   - JSONSupport: JSONText, not JSONBinary. MariaDB JSON is a
+	//     LONGTEXT alias — information_schema reports data_type
+	//     'longtext' (plus an auto json_valid CHECK); there is no
+	//     binary JSON storage to declare. JSON-identity recovery via
+	//     the json_valid CHECK is item 73 Phase 2.
+	//   - ExtGeometry excluded. MariaDB spells the column SRID
+	//     attribute REF_SYSTEM_ID=n (MySQL 8's `SRID n` is a syntax
+	//     error there), and it has no information_schema srs_id column
+	//     to read one back from — carrying geometry through this flavor
+	//     today would silently drop declared SRIDs on read and emit
+	//     unparseable DDL on write. Refused loudly instead; the
+	//     REF_SYSTEM_ID spelling + SHOW CREATE read-back is Phase 2.
+	//   - BulkLoadLoadDataInfile: verified live — the scoping probe's
+	//     restore-into-11.4 leg landed the full corpus byte-identically
+	//     through the LOAD DATA LOCAL path, and MariaDB ships with
+	//     local_infile=ON (both 11.4 and 10.11 defaults). The per-call
+	//     BatchedInsert fallback (local_infile=OFF servers) carries the
+	//     flavor's VALUES() upsert spelling.
+	//
+	// Version floor: MariaDB 10.11 LTS. The 11.4-only utf8mb4_0900_*
+	// alias set is NOT relied on — the emitter maps 0900 collations to
+	// their uca1400 equivalents, which exist on both supported LTS
+	// lines (see mariadbTargetCollation). Older MariaDB may work but is
+	// unpinned; the schema reader WARNs below the floor.
+	//
+	// Scoping probe (2026-07-16): sluice-testing
+	// workspace/mariadb/scoping-probe.md; roadmap item 73.
+	// ---------------------------------------------------------------
+	FlavorMariaDB: {
+		BulkLoad:    ir.BulkLoadLoadDataInfile,
+		CDC:         ir.CDCNone, // Phase 3: MariaDB domain GTIDs
+		SchemaScope: ir.SchemaScopeFlat,
+		SupportedTypes: ir.NewTypeSet(
+			ir.ExtEnum, // column-level ENUM
+			ir.ExtSet,  // column-level SET
+			// ExtGeometry intentionally excluded — see comment above.
+		),
+		SupportsCheckConstraint:  true, // MariaDB 10.2+ enforces CHECK
+		SupportsGeneratedColumns: true,
+		SupportsPartitioning:     true,
+		EnumSupport:              ir.EnumColumnLevel,
+		JSONSupport:              ir.JSONText, // LONGTEXT alias, see above
+		UnsignedIntegers:         true,
+		DDLDialect:               ir.DDLDialectMySQL,
 	},
 }

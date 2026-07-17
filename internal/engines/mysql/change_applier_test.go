@@ -105,7 +105,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
+			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil, upsertRowAlias)
 			if err != nil {
 				t.Fatalf("buildInsertSQL: %v", err)
 			}
@@ -221,7 +221,7 @@ func TestBuildInsertSQL_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
-	_, gotArgs, err := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes)
+	_, gotArgs, err := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes, upsertRowAlias)
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("INSERT excludes generated column from column list and ON DUPLICATE KEY UPDATE SET", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, gotArgs, err := buildInsertSQL("src", "products", row, []string{"id"}, colTypes)
+		gotSQL, gotArgs, err := buildInsertSQL("src", "products", row, []string{"id"}, colTypes, upsertRowAlias)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -423,7 +423,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("nil colTypes: every column passes through (pre-fix shape)", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "margin": "5.49"}
-		gotSQL, _, err := buildInsertSQL("src", "products", row, []string{"id"}, nil)
+		gotSQL, _, err := buildInsertSQL("src", "products", row, []string{"id"}, nil, upsertRowAlias)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}

@@ -59,10 +59,11 @@ type MigrationStateStore struct {
 
 // newMigrationStateStore builds the store plus its dialect SQL. The
 // statement set and the argument-order contract per statement are
-// documented on [migratestate.SQL]. Upserts use the row-alias form
-// (8.0.20+) — same form the data-write path uses for cross-applier
-// consistency.
-func newMigrationStateStore(db *sql.DB) *MigrationStateStore {
+// documented on [migratestate.SQL]. Upserts render in the flavor's
+// [upsertSpelling] — the row-alias form (8.0.20+) everywhere except
+// mariadb, which keeps the legacy VALUES() function (roadmap item 73)
+// — same form the data-write path uses for cross-applier consistency.
+func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateStore {
 	const hdr = "`" + migrateStateTableName + "`"
 	const prog = "`" + migrateProgressTableName + "`"
 	return &MigrationStateStore{
@@ -84,16 +85,15 @@ func newMigrationStateStore(db *sql.DB) *MigrationStateStore {
 				// refreshes via the column's ON UPDATE clause.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
 					"(migration_id, phase, table_progress, state_format, last_error) " +
-					"VALUES (?, ?, ?, ?, ?) AS new " +
-					"ON DUPLICATE KEY UPDATE " +
-					"phase = new.phase, " +
-					"table_progress = new.table_progress, " +
-					"state_format = new.state_format, " +
-					"last_error = new.last_error",
+					"VALUES (?, ?, ?, ?, ?)" + upsert.clauseOpen() +
+					"phase = " + upsert.newRowRef("phase") + ", " +
+					"table_progress = " + upsert.newRowRef("table_progress") + ", " +
+					"state_format = " + upsert.newRowRef("state_format") + ", " +
+					"last_error = " + upsert.newRowRef("last_error"),
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress) " +
-					"VALUES (?, ?, ?) AS new " +
-					"ON DUPLICATE KEY UPDATE progress = new.progress",
+					"VALUES (?, ?, ?)" + upsert.clauseOpen() +
+					"progress = " + upsert.newRowRef("progress"),
 				MarkUpgraded: "UPDATE " + hdr +
 					" SET table_progress = ?, state_format = ? WHERE migration_id = ?",
 				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = ?",

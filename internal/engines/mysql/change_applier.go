@@ -114,6 +114,15 @@ type ChangeApplier struct {
 	db     *sql.DB
 	schema string
 
+	// upsert is the ON DUPLICATE KEY UPDATE spelling every upsert this
+	// applier emits uses — row upserts (single- and multi-row), the
+	// ADR-0007 position write, and the schema-history write. Set from
+	// the engine flavor by [Engine.OpenChangeApplier] (VALUES() on
+	// mariadb, which never implemented MySQL 8.0.20's row alias). The
+	// zero value is the row-alias form, so direct-API / unit
+	// constructions stay byte-identical (roadmap item 73).
+	upsert upsertSpelling
+
 	// pipelineCfg is the parsed target DSN, retained so the ADR-0104
 	// concurrent key-hash apply path can open its dedicated pool lazily on
 	// the first concurrent batch (see change_applier_concurrent.go). nil for
@@ -886,7 +895,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, 0)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, 0, a.upsert)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1019,7 +1028,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
 		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
+		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c), a.upsert)
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()
@@ -1071,7 +1080,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes, a.upsert)
 		if err != nil {
 			return fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1170,7 +1179,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if v.IR == nil {
 			return errors.New("mysql: applier: schema snapshot has nil IR table")
 		}
-		if err := writeSchemaVersion(ctx, tx, a.controlKeyspace, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+		if err := writeSchemaVersion(ctx, tx, a.controlKeyspace, streamID, v.Schema, v.Table, v.Position, v.IR, a.upsert); err != nil {
 			return fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil
@@ -1338,8 +1347,9 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 	return pk, rows.Err()
 }
 
-// buildInsertSQL builds a single-row INSERT using the row-alias UPSERT form
-// (8.0.20+). It is the N == 1 case of [buildMultiRowInsertSQL] and delegates
+// buildInsertSQL builds a single-row INSERT in the caller's upsert spelling
+// (the 8.0.20+ row-alias form on every flavor except mariadb — roadmap item
+// 73). It is the N == 1 case of [buildMultiRowInsertSQL] and delegates
 // to it so the single-row and multi-row coalescing paths (ADR-0139) share one
 // source of truth for the column list, the value binding, and the
 // ON DUPLICATE KEY UPDATE clause — the output is byte-identical to the
@@ -1352,8 +1362,8 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // exists so a future error-producing value rule surfaces loudly on
 // this path without another signature change. Same on the
 // buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
-	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes)
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling) (sqlStmt string, args []any, err error) {
+	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes, upsert)
 }
 
 // buildUpdateSQL builds an UPDATE statement. SET uses every column

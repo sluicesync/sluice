@@ -1078,7 +1078,8 @@ func (b *BackupStream) validate() error {
 		return errors.New("stream: Store is nil")
 	}
 	if b.Source.Capabilities().CDC == ir.CDCNone {
-		return fmt.Errorf("stream: source engine %q does not declare CDC support", b.Source.Name())
+		return cdcUnsupportedError(b.Source,
+			fmt.Errorf("stream: source engine %q does not declare CDC support", b.Source.Name()))
 	}
 	return nil
 }

@@ -1878,7 +1878,8 @@ func (s *Streamer) validate() error {
 	case s.TargetDSN == "":
 		return errors.New("pipeline: Streamer.TargetDSN is empty")
 	case s.Source.Capabilities().CDC == ir.CDCNone:
-		return fmt.Errorf("pipeline: Streamer.Source engine %q declares CDC=None", s.Source.Name())
+		return cdcUnsupportedError(s.Source,
+			fmt.Errorf("pipeline: Streamer.Source engine %q declares CDC=None", s.Source.Name()))
 	}
 	if err := migcore.ValidateTargetSchema(s.Target, s.TargetSchema); err != nil {
 		return err

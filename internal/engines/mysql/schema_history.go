@@ -168,7 +168,7 @@ func ensureSchemaHistorySourceEngineColumn(ctx context.Context, db *sql.DB, cont
 // integration-tagged round-trip test, which the unused linter (run
 // without the integration tag) can't see — same documented pattern as
 // control_table.go's readStopRequested.
-func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, controlKeyspace, streamID, schema, table string, anchor ir.Position, t *ir.Table) error {
+func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, controlKeyspace, streamID, schema, table string, anchor ir.Position, t *ir.Table, upsert upsertSpelling) error {
 	if t == nil {
 		return errors.New("mysql: write schema version: table is nil")
 	}
@@ -185,17 +185,26 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, controlKe
 	// the empty case is defensive. COALESCE on the conflict path means
 	// a non-empty incoming value overwrites and an empty value
 	// preserves the existing row's tag.
-	ref := controlTableRef(controlKeyspace, schemaHistoryTableName)
-	q := "INSERT INTO " + ref + " " +
-		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
-		"VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, '')) " +
-		"AS new ON DUPLICATE KEY UPDATE " +
-		"ir_schema_json = new.ir_schema_json, " +
-		"source_engine = COALESCE(new.source_engine, " + ref + ".source_engine)"
+	q := schemaVersionUpsertSQL(controlKeyspace, upsert)
 	if _, err := exec.ExecContext(ctx, q, vk, streamID, schema, table, anchor.Token, string(payload), anchor.Engine); err != nil {
 		return fmt.Errorf("mysql: write schema version: %w", err)
 	}
 	return nil
+}
+
+// schemaVersionUpsertSQL builds writeSchemaVersion's UPSERT, keyspace-
+// qualified per controlKeyspace and rendered in the caller's
+// [upsertSpelling] (roadmap item 73). Extracted as a pure function so
+// both spellings are unit-pinnable byte-exactly, mirroring
+// [writePositionUpsertSQL].
+func schemaVersionUpsertSQL(controlKeyspace string, upsert upsertSpelling) string {
+	ref := controlTableRef(controlKeyspace, schemaHistoryTableName)
+	return "INSERT INTO " + ref + " " +
+		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
+		"VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''))" +
+		upsert.clauseOpen() +
+		"ir_schema_json = " + upsert.newRowRef("ir_schema_json") + ", " +
+		"source_engine = COALESCE(" + upsert.newRowRef("source_engine") + ", " + ref + ".source_engine)"
 }
 
 // loadRetainedSchemaVersions reads every retained

@@ -698,7 +698,8 @@ func (b *IncrementalBackup) validate() error {
 		return errors.New("incremental: Store is nil")
 	}
 	if b.Source.Capabilities().CDC == ir.CDCNone {
-		return fmt.Errorf("incremental: source engine %q does not declare CDC support", b.Source.Name())
+		return cdcUnsupportedError(b.Source,
+			fmt.Errorf("incremental: source engine %q does not declare CDC support", b.Source.Name()))
 	}
 	return nil
 }

@@ -179,7 +179,7 @@ func TestControlTableCreateSites_1105ClassifiedPerSite(t *testing.T) {
 			return ensureShardConsolidationLeaseTable(ctx, db, "")
 		}},
 		{"migrate state (header)", func(ctx context.Context, db *sql.DB) error {
-			return newMigrationStateStore(db).EnsureControlTable(ctx)
+			return newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx)
 		}},
 		{"keysets", func(ctx context.Context, db *sql.DB) error {
 			return (&mysqlKeysetStore{db: db}).EnsureKeysetTable(ctx)
@@ -228,7 +228,7 @@ func TestControlTableAlterSites_1105ClassifiedPerSite(t *testing.T) {
 			return ensureSchemaHistorySourceEngineColumn(ctx, db, "")
 		}, "ADD COLUMN source_engine"},
 		{"migrate state: state_format", func(ctx context.Context, db *sql.DB) error {
-			return newMigrationStateStore(db).ensureStateFormatColumn(ctx)
+			return newMigrationStateStore(db, upsertRowAlias).ensureStateFormatColumn(ctx)
 		}, "ADD COLUMN state_format"},
 	}
 	for _, tc := range cases {
@@ -267,7 +267,7 @@ func TestEnsurePathsIssueZeroDDLWhenCurrent(t *testing.T) {
 			return ensureShardConsolidationLeaseTable(ctx, db, "")
 		}},
 		{"migrate state", func(ctx context.Context, db *sql.DB) error {
-			return newMigrationStateStore(db).EnsureControlTable(ctx)
+			return newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx)
 		}},
 	}
 	for _, tc := range cases {
@@ -328,7 +328,7 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 	if err := ensureShardConsolidationLeaseTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureShardConsolidationLeaseTable: %v", err)
 	}
-	if err := newMigrationStateStore(db).EnsureControlTable(ctx); err != nil {
+	if err := newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx); err != nil {
 		t.Fatalf("migrate-state EnsureControlTable: %v", err)
 	}
 	executed := map[string]bool{}

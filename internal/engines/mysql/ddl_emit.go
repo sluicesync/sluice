@@ -35,12 +35,32 @@ type mysqlEmitter struct {
 	// (true unless the mode carries NO_BACKSLASH_ESCAPES). See
 	// [backslashIsMySQLEscape] for the two documented approximations.
 	backslashEscapes bool
+
+	// collationRemap maps MySQL-dialect collations the TARGET flavor's
+	// server family does not implement to their closest same-semantics
+	// equivalent (roadmap item 73): utf8mb4_0900_* → utf8mb4_uca1400_*
+	// on a mariadb target, the mirror on a MySQL-family target — see
+	// [Flavor.crossFlavorCollationRemap] for the tables and the
+	// closest-equivalent caveats. Every swap is surfaced: one WARN per
+	// table on the CREATE path (emitTableDefWithDomainChecks), one per
+	// column on the ALTER paths. nil (stdEmitter, unit constructions)
+	// disables remapping — byte-identical to the pre-item-73 emit.
+	collationRemap map[string]string
 }
 
 // newMySQLEmitter resolves the DDL-emit policy from an engine's --mysql-sql-mode
-// override (nil → the strict-by-default mode). Called once at [Engine.OpenSchemaWriter].
+// override (nil → the strict-by-default mode). Called once at [Engine.OpenSchemaWriter]
+// via [newMySQLEmitterForFlavor]; direct calls (tests) get no collation remap.
 func newMySQLEmitter(sqlMode *string) mysqlEmitter {
 	return mysqlEmitter{backslashEscapes: backslashIsMySQLEscape(sqlMode)}
+}
+
+// newMySQLEmitterForFlavor is newMySQLEmitter plus the flavor's
+// cross-family collation remap (roadmap item 73).
+func newMySQLEmitterForFlavor(sqlMode *string, flavor Flavor) mysqlEmitter {
+	m := newMySQLEmitter(sqlMode)
+	m.collationRemap = flavor.crossFlavorCollationRemap()
+	return m
 }
 
 // stdEmitter is the strict-mode default emitter (backslashEscapes = true, MySQL's
@@ -102,7 +122,7 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Character ----
 	case ir.Char:
-		return emitCharType("CHAR", v.Length, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
+		return emitCharType("CHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
 	case ir.Varchar:
 		// A bounded VARCHAR(N) wider than MySQL can represent
 		// (utf8mb4's ~16383-char creatable cap, and the 65535-byte
@@ -113,11 +133,11 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 		// `varchar(16383)` Error 1118 at create-tables (catalog
 		// Bug 72). Narrow VARCHARs (the common case) are unchanged.
 		if size, downmap := mysqlTextTierForWideVarchar(v.Length); downmap {
-			return emitTextType(size, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
+			return emitTextType(size, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
 		}
-		return emitCharType("VARCHAR", v.Length, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
+		return emitCharType("VARCHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
 	case ir.Text:
-		return emitTextType(v.Size, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
+		return emitTextType(v.Size, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
 
 	// ---- Binary ----
 	case ir.Binary:
@@ -438,6 +458,67 @@ func mysqlEmittableCollation(charset, collation string) string {
 		return ""
 	}
 	return collation
+}
+
+// emittableCollation is the emitter-policy composition of
+// [mysqlEmittableCollation] (the PG-collation drop) and the emitter's
+// cross-family collation remap (roadmap item 73). A nil remap
+// (stdEmitter) is byte-identical to mysqlEmittableCollation.
+func (m mysqlEmitter) emittableCollation(charset, collation string) string {
+	c := mysqlEmittableCollation(charset, collation)
+	if c == "" {
+		return c
+	}
+	if mapped, ok := m.collationRemap[c]; ok {
+		return mapped
+	}
+	return c
+}
+
+// remappedCollationColumns lists this table's columns whose collation
+// the emitter's cross-family remap will swap, as "col (from → to)"
+// entries for the per-table CREATE-path WARN. Nil remap → nil.
+func (m mysqlEmitter) remappedCollationColumns(table *ir.Table) []string {
+	if len(m.collationRemap) == 0 || table == nil {
+		return nil
+	}
+	var out []string
+	for _, col := range table.Columns {
+		charset, collation := translate.ColumnCollation(col.Type)
+		if collation == "" || translate.CollationDialect(charset, collation) != "mysql" {
+			continue
+		}
+		if mapped, ok := m.collationRemap[collation]; ok {
+			out = append(out, col.Name+" ("+collation+" → "+mapped+")")
+		}
+	}
+	return out
+}
+
+// warnRemappedCollation is the per-column WARN half of the cross-family
+// collation remap, for the low-volume ALTER paths (AlterAddColumn /
+// AlterColumnType) — the CREATE path aggregates one WARN per table in
+// emitTableDefWithDomainChecks. Mirrors [warnDroppedForeignCollation]'s
+// placement; a column whose collation is not remapped is a no-op.
+func (m mysqlEmitter) warnRemappedCollation(table *ir.Table, colName string, t ir.Type) {
+	if len(m.collationRemap) == 0 {
+		return
+	}
+	charset, collation := translate.ColumnCollation(t)
+	if collation == "" || translate.CollationDialect(charset, collation) != "mysql" {
+		return
+	}
+	mapped, ok := m.collationRemap[collation]
+	if !ok {
+		return
+	}
+	slog.Warn(
+		"mysql: column data is preserved; the source collation does not exist on this target's server family, so the closest equivalent is used (edge-case sort/comparison order may differ — UCA version and PAD semantics)",
+		slog.String("table", mysqlTableNameForLog(table)),
+		slog.String("column", colName),
+		slog.String("source_collation", collation),
+		slog.String("target_collation", mapped),
+	)
 }
 
 // warnDroppedForeignCollation is the per-column WARN half of the
@@ -1209,6 +1290,17 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 			"mysql: column data is preserved; some source collations have no MySQL equivalent, so those target columns use the table/database default collation (text sort/comparison order may differ)",
 			slog.String("table", table.Name),
 			slog.String("columns", strings.Join(dropped, ", ")),
+		)
+	}
+	// Cross-family collation remap (roadmap item 73): one WARN per
+	// table naming each 0900↔uca1400 swap the emitter applies below —
+	// the closest same-semantics equivalent on the target's server
+	// family, surfaced so the substitution is never silent.
+	if remapped := m.remappedCollationColumns(table); len(remapped) > 0 {
+		slog.Warn(
+			"mysql: column data is preserved; some source collations do not exist on this target's server family, so the closest equivalent is used (edge-case sort/comparison order may differ — UCA version and PAD semantics)",
+			slog.String("table", table.Name),
+			slog.String("columns", strings.Join(remapped, ", ")),
 		)
 	}
 	// Pre-compute the inline DOMAIN CHECK clauses so the column-list

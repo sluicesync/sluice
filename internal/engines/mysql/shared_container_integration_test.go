@@ -534,5 +534,9 @@ func TestMain(m *testing.M) {
 		cancel()
 	}
 
+	// Item 73: the lazily-booted shared MariaDB containers (11.4 /
+	// 10.11) follow the same single-boot-per-shard lifecycle.
+	terminateSharedMariaDBs()
+
 	os.Exit(code)
 }

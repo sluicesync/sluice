@@ -616,7 +616,8 @@ func (a *AddTable) validate() error {
 	case strings.TrimSpace(a.TableName) == "":
 		return errors.New("pipeline: add-table: TableName is empty")
 	case a.Source.Capabilities().CDC == ir.CDCNone:
-		return fmt.Errorf("pipeline: add-table: Source engine %q declares CDC=None; mid-stream add-table only applies to CDC sources", a.Source.Name())
+		return cdcUnsupportedError(a.Source,
+			fmt.Errorf("pipeline: add-table: Source engine %q declares CDC=None; mid-stream add-table only applies to CDC sources", a.Source.Name()))
 	}
 	// --target-schema is PG-only (ADR-0031, validated by migcore.ValidateTargetSchema
 	// against the target's SchemaScope capability). MySQL operators get a

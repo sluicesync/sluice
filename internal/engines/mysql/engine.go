@@ -88,6 +88,14 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 	if err != nil {
 		return nil, err
 	}
+	// Server-fingerprint guard (roadmap item 73): the mariadb flavor
+	// REFUSES a non-MariaDB server (its defaults shim would mis-read
+	// MySQL conventions), the vanilla flavor WARNs when the server is
+	// MariaDB (steering to --source-driver/--target-driver mariadb).
+	if err := e.checkServerFlavor(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &SchemaReader{db: db, schema: cfg.DBName, flavor: e.Flavor}, nil
 }
 
@@ -104,13 +112,22 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	if err != nil {
 		return nil, err
 	}
+	// Server-fingerprint guard (roadmap item 73): same directional
+	// guard as OpenSchemaReader — refuse a non-MariaDB server under the
+	// mariadb flavor, WARN toward the mariadb driver when a plain-mysql
+	// target fingerprints as MariaDB.
+	if err := e.checkServerFlavor(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Thread the flavor so the overlapped index-build path (ADR-0080) can
 	// decline the overlap on PlanetScale/Vitess targets and fall back to
 	// the post-copy whole-schema CreateIndexes. The emitter carries the
 	// resolved --mysql-sql-mode backslash policy (task 2.5) so every DDL
 	// string literal this writer emits is escaped for the SAME sql_mode its
-	// connections run under.
-	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor, emitter: newMySQLEmitter(e.opts.sqlMode)}
+	// connections run under, plus the flavor's cross-family collation
+	// remap (roadmap item 73: utf8mb4_0900_* ↔ utf8mb4_uca1400_*).
+	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor, emitter: newMySQLEmitterForFlavor(e.opts.sqlMode, e.Flavor)}
 	// Probe SELECT VERSION() once at open so the v0.97.0 inline-CHECK
 	// path knows whether the target is MySQL 8.0.16+. A probe failure
 	// is non-fatal: zero-value inlineCheckSupported (false) preserves
@@ -209,6 +226,12 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		// its WARN-vs-refuse decision off whether the operator opted into the
 		// relaxed "" mode, replacing the former sessionSQLMode global read.
 		sqlMode: e.opts.sqlMode,
+		// Roadmap item 73: the idempotent batched-insert path renders its
+		// ON DUPLICATE KEY UPDATE in the flavor's spelling. Reachable on a
+		// mariadb target even though the flavor declares LOAD DATA — the
+		// writer falls back to BatchedInsert per call on local_infile=OFF
+		// servers and geometry-bearing tables.
+		upsert: e.Flavor.upsertSpelling(),
 		// ADR-0150 companion hint: only the HOSTED PlanetScale flavor
 		// is tier-CPU-bound (self-hosted vitess runs on the operator's
 		// own hardware, so the PS-tier ceiling doesn't apply).
@@ -238,6 +261,12 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 // The caller is responsible for calling Close on the returned
 // reader.
 func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	// The mariadb flavor's CDCNone has a concrete, roadmapped story
+	// (domain GTIDs, item 73 P3) — refuse with the coded error rather
+	// than the generic not-implemented shape.
+	if e.Flavor == FlavorMariaDB {
+		return nil, mariadbCDCUnsupportedError()
+	}
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -280,6 +309,11 @@ func openBinlogServerCDCReader(ctx context.Context, dsn string, opts engineOptio
 // server-wide CDC reader is not their model; they refuse loudly (multi-
 // keyspace CDC is the Phase 1c N-stream design).
 func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	// Same coded mariadb refusal as OpenCDCReader — the server-wide
+	// multi-database resume path is CDC too.
+	if e.Flavor == FlavorMariaDB {
+		return nil, mariadbCDCUnsupportedError()
+	}
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -362,7 +396,7 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 	if err != nil {
 		return nil, err
 	}
-	return newMigrationStateStore(db), nil
+	return newMigrationStateStore(db, e.Flavor.upsertSpelling()), nil
 }
 
 // OpenChangeApplier returns a [ChangeApplier] bound to the database
@@ -414,11 +448,18 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 		pipelineCfg:     cfg,
 		sqlMode:         e.opts.sqlMode,
 		controlKeyspace: e.opts.controlKeyspace,
-		pkCache:         make(map[string][]string),
-		colTypeCache:    make(map[string]map[string]*ir.Column),
-		keylessCache:    make(map[string]bool),
-		warnedKeyless:   make(map[string]bool),
-		activeSchema:    make(map[string]activeSchemaVersion),
+		// Roadmap item 73: every upsert this applier emits — row
+		// upserts, the position write, schema-history — renders its
+		// ON DUPLICATE KEY UPDATE in the flavor's spelling (VALUES()
+		// on mariadb, the row alias everywhere else). The zero value
+		// is the row alias, so direct-API / unit constructions are
+		// byte-identical to today.
+		upsert:        e.Flavor.upsertSpelling(),
+		pkCache:       make(map[string][]string),
+		colTypeCache:  make(map[string]map[string]*ir.Column),
+		keylessCache:  make(map[string]bool),
+		warnedKeyless: make(map[string]bool),
+		activeSchema:  make(map[string]activeSchemaVersion),
 	}, nil
 }
 
@@ -765,4 +806,5 @@ func init() {
 	engines.Register(Engine{Flavor: FlavorVanilla})
 	engines.Register(Engine{Flavor: FlavorPlanetScale})
 	engines.Register(Engine{Flavor: FlavorVitess})
+	engines.Register(Engine{Flavor: FlavorMariaDB})
 }

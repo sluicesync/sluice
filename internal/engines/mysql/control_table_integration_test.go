@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", "", 0, upsertRowAlias); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -401,7 +401,7 @@ func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := writePositionTx(ctx, tx, "", streamID, token, "", "", "", delta); err != nil {
+		if err := writePositionTx(ctx, tx, "", streamID, token, "", "", "", delta, upsertRowAlias); err != nil {
 			t.Fatalf("writePositionTx: %v", err)
 		}
 		if err := tx.Commit(); err != nil {

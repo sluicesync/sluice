@@ -404,7 +404,7 @@ func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 	if b.run.empty() {
 		return nil
 	}
-	stmt, args, err := buildMultiRowInsertSQL(b.run.schema, b.run.table, b.run.rows, b.run.pk, b.run.colTypes)
+	stmt, args, err := buildMultiRowInsertSQL(b.run.schema, b.run.table, b.run.rows, b.run.pk, b.run.colTypes, b.a.upsert)
 	if err != nil {
 		return fmt.Errorf("mysql: applier: build multi-row insert for %s.%s: %w", b.run.schema, b.run.table, err)
 	}
@@ -452,7 +452,7 @@ func (b *mysqlBatchTx) writePosition(ctx context.Context, streamID, token string
 	}
 	posCtx, posCancel := b.a.execTimeoutCtx(ctx)
 	defer posCancel()
-	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.sourceFingerprint, b.a.targetSchema, rowsApplied)
+	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.sourceFingerprint, b.a.targetSchema, rowsApplied, b.a.upsert)
 }
 
 // commit flushes any remaining pending run (the CheckpointOnlyAtTxBoundary
@@ -498,7 +498,7 @@ func (b *mysqlBatchTx) Rollback() error {
 // colTypes maps column names to their full IR descriptors and is the input to
 // prepareValue; a missing entry (cold cache / unknown column) is tolerated and
 // the raw value bound, the same pre-Bug-6 shape buildInsertSQL preserves.
-func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling) (sqlStmt string, args []any, err error) {
 	if len(rows) == 0 {
 		return "", nil, errors.New("mysql: applier: buildMultiRowInsertSQL: no rows")
 	}
@@ -532,15 +532,19 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 	sb.WriteString(strings.Join(colSQL, ", "))
 	sb.WriteString(") VALUES ")
 	sb.WriteString(strings.Join(groups, ", "))
-	sb.WriteString(onDuplicateKeyUpdateClause(cols, pk))
+	sb.WriteString(onDuplicateKeyUpdateClause(cols, pk, upsert))
 	return sb.String(), args, nil
 }
 
-// onDuplicateKeyUpdateClause renders the row-alias upsert tail (8.0.20+) shared
-// by the single-row and multi-row INSERT builders. With a non-empty PK the
-// SET-list reassigns every non-PK column to the new row's value:
+// onDuplicateKeyUpdateClause renders the upsert tail shared by the single-row
+// and multi-row INSERT builders, in the caller's [upsertSpelling] — the
+// MySQL 8.0.20+ row-alias form on every flavor except mariadb, which never
+// implemented the alias and keeps the legacy VALUES() function (roadmap item
+// 73). With a non-empty PK the SET-list reassigns every non-PK column to the
+// new row's value:
 //
-//	AS new ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`
+//	AS new ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`      (row alias)
+//	ON DUPLICATE KEY UPDATE `a` = VALUES(`a`), `b` = VALUES(`b`)     (mariadb)
 //
 // PK columns are excluded from the SET list because updating them on conflict
 // is a no-op at best (they are equal by definition during the conflict) and
@@ -555,7 +559,7 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 // COPY's re-sent rows upsert instead of 1062-ing); a truly keyless table never
 // collides, so the clause is inert and behaviour is effectively plain INSERT.
 // See the ChangeApplier package doc for the full resume-idempotency contract.
-func onDuplicateKeyUpdateClause(cols, pk []string) string {
+func onDuplicateKeyUpdateClause(cols, pk []string, upsert upsertSpelling) string {
 	var sb strings.Builder
 	if len(pk) > 0 {
 		pkSet := make(map[string]struct{}, len(pk))
@@ -569,10 +573,10 @@ func onDuplicateKeyUpdateClause(cols, pk []string) string {
 			}
 		}
 		if len(nonPK) > 0 {
-			sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
+			sb.WriteString(upsert.clauseOpen())
 			parts := make([]string, len(nonPK))
 			for i, c := range nonPK {
-				parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
+				parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
 			}
 			sb.WriteString(strings.Join(parts, ", "))
 			return sb.String()
@@ -580,19 +584,19 @@ func onDuplicateKeyUpdateClause(cols, pk []string) string {
 		// Every column is a PK column — the row IS its own key. On conflict
 		// there's nothing to update; emit a no-op assignment so the conflict
 		// is absorbed silently.
-		sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
+		sb.WriteString(upsert.clauseOpen())
 		sb.WriteString(quoteIdent(pk[0]))
-		sb.WriteString(" = new.")
-		sb.WriteString(quoteIdent(pk[0]))
+		sb.WriteString(" = ")
+		sb.WriteString(upsert.newRowRef(quoteIdent(pk[0])))
 		return sb.String()
 	}
 	// No PRIMARY KEY: full-row SET-list so a collision on any unique index is
 	// absorbed idempotently rather than erroring with MySQL 1062 (the ADR-0072
 	// Gap-2 interlock; see the doc above).
-	sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
+	sb.WriteString(upsert.clauseOpen())
 	parts := make([]string, len(cols))
 	for i, c := range cols {
-		parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
+		parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 	return sb.String()

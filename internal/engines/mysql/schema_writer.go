@@ -858,6 +858,9 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		// otherwise drop it silently (emitColumnType omits foreign
 		// collations).
 		warnDroppedForeignCollation(table, col.Name, col.Type)
+		// Cross-family collation-remap WARN (item 73), same per-column
+		// rationale as the drop WARN above.
+		w.emitter.warnRemappedCollation(table, col.Name, col.Type)
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s",
 			quoteIdent(table.Name), def)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
@@ -1160,6 +1163,9 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	// Cross-engine collation-drop WARN, per column (mirrors
 	// AlterAddColumn — emitColumnType omits foreign collations).
 	warnDroppedForeignCollation(table, want.Name, want.Type)
+	// Cross-family collation-remap WARN (item 73), mirroring
+	// AlterAddColumn.
+	w.emitter.warnRemappedCollation(table, want.Name, want.Type)
 	stmt := fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s",
 		quoteIdent(table.Name), def)
 	if _, err := w.db.ExecContext(ctx, stmt); err != nil {

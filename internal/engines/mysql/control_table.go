@@ -838,7 +838,7 @@ func isMySQLMissingTableErr(err error) bool {
 // phase 2). 0 for a no-data position write (broker cold-start,
 // schema-delta-only incrementals, a Truncate/SchemaSnapshot serial
 // apply).
-func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) error {
+func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64, upsert upsertSpelling) error {
 	// Sidecar-keyspace feature: when controlKeyspace is set, this UPSERT
 	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
 	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
@@ -849,7 +849,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// idempotent apply makes a torn resume safe (a position that committed
 	// without its data, or vice versa, replays cleanly on restart). Empty
 	// controlKeyspace is unchanged single-keyspace, genuinely atomic behaviour.
-	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace), streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied); err != nil {
+	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert), streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}
 	return nil
@@ -857,26 +857,28 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 
 // writePositionUpsertSQL builds the ADR-0007 position-write UPSERT, keyspace-
 // qualified per controlKeyspace (empty = bare, byte-identical to the historical
-// statement). Extracted as a pure function so the byte-exactness of this
-// atomicity-critical statement is unit-pinnable for both the bare and the
-// sidecar-qualified shapes without a live target. The `ref.slot_name` COALESCE
-// sources use the SAME fully-qualified reference as the table, so a qualified
-// name yields a valid three-part `ks`.`table`.column reference and the bare
-// name yields the historical `table`.column form.
-func writePositionUpsertSQL(controlKeyspace string) string {
+// statement) and rendered in the caller's [upsertSpelling] (roadmap item 73:
+// VALUES() on mariadb targets, the row alias everywhere else). Extracted as a
+// pure function so the byte-exactness of this atomicity-critical statement is
+// unit-pinnable for the bare and sidecar-qualified shapes × both spellings
+// without a live target. The `ref.slot_name` COALESCE sources use the SAME
+// fully-qualified reference as the table, so a qualified name yields a valid
+// three-part `ks`.`table`.column reference and the bare name yields the
+// historical `table`.column form.
+func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling) string {
 	ref := controlTableRef(controlKeyspace, controlTableName)
 	return "INSERT INTO " + ref + " " +
 		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
-		"AS new ON DUPLICATE KEY UPDATE " +
-		"source_position = new.source_position, " +
-		"slot_name = COALESCE(new.slot_name, " + ref + ".slot_name), " +
-		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, " + ref + ".source_dsn_fingerprint), " +
-		"target_schema = COALESCE(new.target_schema, " + ref + ".target_schema), " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)" +
+		upsert.clauseOpen() +
+		"source_position = " + upsert.newRowRef("source_position") + ", " +
+		"slot_name = COALESCE(" + upsert.newRowRef("slot_name") + ", " + ref + ".slot_name), " +
+		"source_dsn_fingerprint = COALESCE(" + upsert.newRowRef("source_dsn_fingerprint") + ", " + ref + ".source_dsn_fingerprint), " +
+		"target_schema = COALESCE(" + upsert.newRowRef("target_schema") + ", " + ref + ".target_schema), " +
 		// rows_applied ACCUMULATES: add this write's delta to the existing
 		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
 		// means the column is never NULL post-migration).
-		"rows_applied = COALESCE(" + ref + ".rows_applied, 0) + new.rows_applied"
+		"rows_applied = COALESCE(" + ref + ".rows_applied, 0) + " + upsert.newRowRef("rows_applied")
 }
 
 // readStopRequested returns true when the named stream's row has a

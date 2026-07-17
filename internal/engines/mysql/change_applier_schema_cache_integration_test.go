@@ -81,10 +81,10 @@ func TestPrimeSchemaHistoryCache_Integration_SeedsFromStorage(t *testing.T) {
 		{Name: "order_id", Type: ir.Integer{Width: 64}},
 	}}
 
-	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorUsers, tblUsers); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorUsers, tblUsers, upsertRowAlias); err != nil {
 		t.Fatalf("seed users: %v", err)
 	}
-	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "orders", anchorOrders, tblOrders); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "orders", anchorOrders, tblOrders, upsertRowAlias); err != nil {
 		t.Fatalf("seed orders: %v", err)
 	}
 
@@ -227,7 +227,7 @@ func TestPrimeSchemaHistoryCache_Integration_BelowFloorIsLoud(t *testing.T) {
 	const u = "11111111-1111-1111-1111-111111111111"
 	anchor := ir.Position{Engine: engineNameMySQL, Token: `{"mode":"gtid","gtid_set":"` + u + `:1-10"}`}
 	tbl := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
-	if err := writeSchemaVersion(ctx, db, "", "stream-below", "", "users", anchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-below", "", "users", anchor, tbl, upsertRowAlias); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -305,7 +305,7 @@ func TestPrimeSchemaHistoryCache_CrossEngine_UsesSourceOrderer(t *testing.T) {
 		{Name: "id", Type: ir.Integer{Width: 64}},
 		{Name: "sku", Type: ir.Varchar{Length: 64}, Nullable: true},
 	}}
-	if err := writeSchemaVersion(ctx, db, "", "sluice_chain_restore", "src_app", "widgets", anchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "sluice_chain_restore", "src_app", "widgets", anchor, tbl, upsertRowAlias); err != nil {
 		t.Fatalf("seed cross-engine row: %v", err)
 	}
 
@@ -402,7 +402,7 @@ func TestPrimeSchemaHistoryCache_VStream_WarmResume(t *testing.T) {
 		{Name: "id", Type: ir.Integer{Width: 64}},
 		{Name: "name", Type: ir.Varchar{Length: 255}, Nullable: true},
 	}}
-	if err := writeSchemaVersion(ctx, db, "", "ps_resume", "main", "connections", anchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "ps_resume", "main", "connections", anchor, tbl, upsertRowAlias); err != nil {
 		t.Fatalf("seed vstream row: %v", err)
 	}
 
@@ -488,7 +488,7 @@ func TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud(t *testing.T) {
 	tbl := &ir.Table{Name: "widgets", Columns: []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}}
-	if err := writeSchemaVersion(ctx, db, "", "bogus-stream", "", "widgets", anchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "bogus-stream", "", "widgets", anchor, tbl, upsertRowAlias); err != nil {
 		t.Fatalf("seed row: %v", err)
 	}
 

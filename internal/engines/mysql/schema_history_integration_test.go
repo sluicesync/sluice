@@ -121,14 +121,14 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 		{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
 	}}
 
-	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorOld, tblOld); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorOld, tblOld, upsertRowAlias); err != nil {
 		t.Fatalf("writeSchemaVersion old: %v", err)
 	}
-	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew, upsertRowAlias); err != nil {
 		t.Fatalf("writeSchemaVersion new: %v", err)
 	}
 	// Idempotent re-write of the same anchor.
-	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew, upsertRowAlias); err != nil {
 		t.Fatalf("writeSchemaVersion new (idempotent): %v", err)
 	}
 
@@ -207,14 +207,14 @@ func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 	}
 	// Position write succeeds first (mirrors applyOne ordering: data
 	// + version on the tx, then writePositionTx).
-	if err := writePositionTx(ctx, tx, "", "atomic-stream", "tok-after-ddl", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "", "atomic-stream", "tok-after-ddl", "", "", "", 0, upsertRowAlias); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	// Version write on the SAME tx fails (no schema-history table).
 	anchor := ir.Position{Engine: engineNameMySQL, Token: "tok-after-ddl"}
 	verr := writeSchemaVersion(ctx, tx, "", "atomic-stream", "", "users", anchor,
-		&ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}})
+		&ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}, upsertRowAlias)
 	if verr == nil {
 		_ = tx.Rollback()
 		t.Fatal("expected version write to fail (schema-history table absent), got nil")
@@ -281,7 +281,7 @@ func TestSchemaHistory_LoadPreservesSourceEngine_CrossEngine(t *testing.T) {
 	tbl := &ir.Table{Name: "widgets", Columns: []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}}
-	if err := writeSchemaVersion(ctx, db, "", "sluice_chain_restore", "src_app", "widgets", crossEngineAnchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "sluice_chain_restore", "src_app", "widgets", crossEngineAnchor, tbl, upsertRowAlias); err != nil {
 		t.Fatalf("writeSchemaVersion cross-engine: %v", err)
 	}
 

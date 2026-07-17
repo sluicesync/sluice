@@ -26,5 +26,6 @@ func IsMySQLFamily(engine string) bool {
 	return strings.EqualFold(engine, "mysql") ||
 		strings.EqualFold(engine, "planetscale") ||
 		strings.EqualFold(engine, "vitess") ||
+		strings.EqualFold(engine, "mariadb") ||
 		strings.EqualFold(engine, "mydumper")
 }
