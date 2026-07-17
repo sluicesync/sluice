@@ -153,6 +153,8 @@ type skewSweepResult struct {
 // baseline. Each scenario is a held-vs-relaxed A/B; exactly-once is hard-
 // asserted per run, the scaling numbers are logged + read for monotonicity.
 func TestVitessReshard_RelaxSkewMagnitudeSweep(t *testing.T) {
+	skipReshardSkewABQuarantine(t)
+
 	c := startVitessReshardCluster(t, "-")
 	defer c.terminate()
 

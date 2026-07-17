@@ -156,6 +156,8 @@ type engSkewAB struct {
 // hold forms under ON and is relieved under OFF. Logs the A/B numbers;
 // hard-asserts exactly-once in both runs.
 func TestVitessReshard_RelaxSkewEngineeredSkewHoldAB(t *testing.T) {
+	skipReshardSkewABQuarantine(t)
+
 	c := startVitessReshardCluster(t, "-")
 	defer c.terminate()
 

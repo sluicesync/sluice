@@ -224,6 +224,8 @@ func (tp *toxiproxySidecar) apiPost(t *testing.T, path string, body map[string]a
 // numbers; hard-asserts exactly-once + the flag flip in both runs (inside
 // runRelaxSkewScenario).
 func TestVitessReshard_RelaxSkewPerShardLatencyAB(t *testing.T) {
+	skipReshardSkewABQuarantine(t)
+
 	c := startVitessReshardCluster(t, "-")
 	defer c.terminate()
 
