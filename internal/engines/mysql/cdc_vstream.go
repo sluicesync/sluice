@@ -1456,6 +1456,14 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 	commitTime := vstreamEventCommitTime(ev)
 
 	for _, rc := range rev.GetRowChanges() {
+		// Item 74 belt: refuse a partial after image (NOBLOB-omitted
+		// column or partial-JSON diff) before decode — decodeVStreamRow
+		// has no bitmap and would read an omitted column's NULL cell as a
+		// genuine NULL, silently corrupting the row on apply. See
+		// cdc_vstream_partial_row_image.go.
+		if err := refuseVStreamPartialRowImage(rc, fields, rev.GetKeyspace(), tableName); err != nil {
+			return err
+		}
 		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn, r.zeroDate)
 		if err != nil {
 			return err
