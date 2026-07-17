@@ -4,6 +4,30 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.267] - 2026-07-17
+
+Provider-advisory hardening from the Vultr/Azure/Supabase probes, the confirming audit's small-leftovers tail, and the read-replica finding.
+
+### Added
+
+- **Vultr Managed MySQL retention advisory.** `sync`/`backup` against a `*.vultrdb.com` source WARNs up front that the platform purges binlogs ~10–16 minutes after creation regardless of `@@binlog_expire_logs_seconds` (which reads 3 days) — and, unique among the managed-MySQL providers probed, that **no retention knob exists** (the config API, update surface, and SQL paths all reject it). CDC on Vultr MySQL is therefore migrate-and-cutover-shaped: keep pauses under ~10 minutes. (Vultr's DBaaS shares DigitalOcean's Aiven lineage — same reaper class, confirmed live.)
+- **Platform-internal replication-slot roster.** `sluice slot list` labels Neon's `wal_proposer_slot` and the Aiven-lineage `pghoard_local` (Vultr) as platform-internal, and `sluice slot drop` refuses them without `--force` — dropping one breaks the provider's own machinery, not a sluice consumer.
+- **PG standby/read-replica CDC sources now refuse up front with the coded `SLUICE-E-CDC-STANDBY-SOURCE`** — `sync start` and backup CDC chains pointed at a hot standby / read replica (a Supabase `-rr-` endpoint, or any streaming standby) previously died at publication ensure with a raw SQLSTATE 25006 error; the coded refusal names the standby, steers to the primary, and notes the replica remains a fine bulk-`migrate` source — the parallel snapshot-pinned copy works unreduced on PG 16+ standbys (live-validated). New live-validated `managed-services.md` sections for Azure Flexible Server (both engines), Vultr (both engines), and a Supabase read-replica recipe; the managed-MySQL retention comparison now spans five providers.
+
+### Changed
+
+- **The "a pooler cannot proxy replication" claim is corrected to provider-dependent.** Vultr's managed pgbouncer carried logical replication end to end (live-verified), so the pooler WARNs, the `SLUICE-E-CDC-POOLER-ENDPOINT` texts, and the docs no longer claim impossibility — most transaction/statement-mode poolers strip the replication parameter (Supavisor does), some session-mode/modern-pgbouncer setups forward it. The coded refusal still fires only on the observed strip signature (SQLSTATE 42601), never on a host pattern.
+- **PG 15+ negative numeric scale → MySQL now refuses upfront by name.** `numeric(p,-s)` previously died at CREATE TABLE with a raw Error 1064; migrate/restore/chain/broker now refuse at preflight naming the column and the lossless `--type-override … decimal:precision=<p+|s|>,scale=0` recovery (information_schema mis-reports the scale as 2046, so the reader decodes the catalog typmod directly). `verify`, `slot list`, and `slot drop` gained the connect-hint door — IPv6-only resolve failures now carry the `SLUICE-E-CONNECT-IPV6-ONLY` remedy on those commands too (Bug 196 residual).
+
+### Fixed
+
+- **Single-full restores now run the BackupID recompute check** (previously chain restores only) — a lone full whose BackupID-covered field was edited without recomputing the id refuses with `SLUICE-E-BACKUP-MANIFEST-INVALID` before any data lands.
+- **`--stage-dir` now also governs the sqlite `.sql`-dump materialize** — the temp database a `sqlite3 .dump`/`wrangler d1 export` source materializes lands under the named directory (missing dir refuses loudly), closing the tmpfs hazard for that path. The mydumper zero-chunk loss-net WARNs now fire once per table per run instead of once per internal dump-open.
+
+### Compatibility
+
+- **No breaking changes.** New advisories WARN; the negative-scale and standby refusals convert raw driver errors into coded, remedied ones. The stale "`pg_export_snapshot` cannot run during recovery" code comment is scoped to PG ≤ 15.
+
 ## [0.99.266] - 2026-07-17
 
 The last of the provider-campaign CRITICALs: MySQL CDC silently lost every UPDATE on sources with partial binlog row images — Azure Database for MySQL's platform default.
