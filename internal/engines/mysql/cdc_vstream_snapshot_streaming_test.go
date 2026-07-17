@@ -502,47 +502,90 @@ func TestVStreamSnapshot_StreamingMultiTableInterleaveRefuse(t *testing.T) {
 	}
 }
 
-// TestVStreamSnapshot_ActiveTableToggles asserts ReadRows marks its
-// table active synchronously (so the pump backpressures rather than
-// refuses on that table) and clears it once the channel closes. We
-// check "set" via a backpressure proxy rather than racing the drain
-// goroutine's clear: ReadRows sets activeTable before spawning its
-// goroutine, so it is observable immediately on return.
+// TestVStreamSnapshot_ActiveTableToggles asserts the sequential COPY
+// path's activeTable bookkeeping: ReadRows marks its table active
+// synchronously (so the pump backpressures rather than refuses on that
+// table) and the drain goroutine clears it once the table's COPY
+// completes and its channel closes.
+//
+// The two invariants are pinned SEPARATELY because they require opposite
+// pump states, and conflating them is what made this a -race flake (it
+// toggled three times across releases, always "activeTable = \"\" right
+// after ReadRows"). activeTable is SET synchronously by ReadRows (under
+// mu, before the goroutine spawns) but CLEARED asynchronously by the
+// drain goroutine's deferred cleanup. With a single tiny script (one row
+// + COPY_COMPLETED) that goroutine can run to completion — push the row
+// into the 64-deep buffered out-channel (rowChanBuffer), observe
+// copyComplete, return, and run the deferred clear — all BEFORE the test
+// acquires mu to read the set. Every access is mutex-guarded, so this is
+// not a data race the detector reports; it is a logical ordering flake
+// that -race's aggressive scheduler surfaces by widening that window.
+//
+// The fix synchronizes on the pump state each invariant actually needs —
+// no sleep, no retry:
+//
+//   - SET: a script that never sends COPY_COMPLETED, so after the row the
+//     drain goroutine parks in cond.Wait and CANNOT clear activeTable —
+//     the synchronous set is then race-free to observe. cancel() (via
+//     failCopy's broadcast) unwedges the parked goroutine at teardown.
+//   - CLEAR: the full script; the deferred clear runs under mu and is
+//     sequenced-before close(out) (defer LIFO), so the post-range read is
+//     ordered after the clear by the channel-close happens-before edge.
 func TestVStreamSnapshot_ActiveTableToggles(t *testing.T) {
-	resp := []*vtgate.VStreamResponse{
-		oneEvent(snapFieldEvent("-", &query.Field{Name: "id", Type: query.Type_INT64})),
-		oneEvent(snapRowEvent("-", "1")),
-		oneEvent(snapVgtidEvent("MySQL56/abc:1-1")),
-		oneEvent(globalCopyCompleted()),
-	}
-	s, _, cancel := newStreamingHarness(t, resp)
-	defer cancel()
-
-	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer ccancel()
 	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
-	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
-	if err != nil {
-		t.Fatalf("ReadRows: %v", err)
-	}
-	// activeTable is set synchronously in ReadRows, before the drain
-	// goroutine runs — observable immediately. (It may be cleared again
-	// by the time we drain; the clear is asserted after.)
-	s.mu.Lock()
-	setNow := s.activeTable
-	s.mu.Unlock()
-	if setNow != "t" {
-		t.Errorf("activeTable = %q right after ReadRows; want %q", setNow, "t")
-	}
 
-	for range ch {
-	}
+	t.Run("set synchronously on ReadRows", func(t *testing.T) {
+		resp := []*vtgate.VStreamResponse{
+			oneEvent(snapFieldEvent("-", &query.Field{Name: "id", Type: query.Type_INT64})),
+			oneEvent(snapRowEvent("-", "1")),
+			// Deliberately NO VGTID / COPY_COMPLETED: the pump enqueues the
+			// row then parks on the drained fake stream, and the drain
+			// goroutine parks in cond.Wait — so activeTable cannot be
+			// cleared and the synchronous set is deterministic to observe.
+		}
+		s, _, cancel := newStreamingHarness(t, resp)
+		defer cancel()
 
-	// After the channel closes, activeTable is cleared.
-	s.mu.Lock()
-	cleared := s.activeTable == ""
-	s.mu.Unlock()
-	if !cleared {
-		t.Errorf("activeTable = %q after drain; want cleared", s.activeTable)
-	}
+		ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		if _, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl); err != nil {
+			t.Fatalf("ReadRows: %v", err)
+		}
+		s.mu.Lock()
+		setNow := s.activeTable
+		s.mu.Unlock()
+		if setNow != "t" {
+			t.Errorf("activeTable = %q right after ReadRows; want %q", setNow, "t")
+		}
+	})
+
+	t.Run("cleared after channel closes", func(t *testing.T) {
+		resp := []*vtgate.VStreamResponse{
+			oneEvent(snapFieldEvent("-", &query.Field{Name: "id", Type: query.Type_INT64})),
+			oneEvent(snapRowEvent("-", "1")),
+			oneEvent(snapVgtidEvent("MySQL56/abc:1-1")),
+			oneEvent(globalCopyCompleted()),
+		}
+		s, _, cancel := newStreamingHarness(t, resp)
+		defer cancel()
+
+		ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+		if err != nil {
+			t.Fatalf("ReadRows: %v", err)
+		}
+		for range ch {
+		}
+
+		// close(out) is ordered after the deferred clear (defer LIFO), so
+		// this read — sequenced after the range loop drains that close — is
+		// race-free.
+		s.mu.Lock()
+		got := s.activeTable
+		s.mu.Unlock()
+		if got != "" {
+			t.Errorf("activeTable = %q after drain; want cleared", got)
+		}
+	})
 }
