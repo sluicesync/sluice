@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.277] - 2026-07-18
+
+Row-level filtering (ADR-0173, shipped in v0.99.276) follow-ons: a CLI flag-spelling fix and the operator guide. No change to any successful path.
+
+### Fixed
+
+- **`--allow-degraded-fks` now parses under the spelling every doc recommends.** kong auto-kebabs the `AllowDegradedFKs` field to `--allow-degraded-f-ks` (it splits the `FKs` capital run), but the `--help` prose, the `SLUICE-E-WHERE-FK-ORPHAN` error hint, and the v0.99.276 release notes all recommend `--allow-degraded-fks` — so the documented spelling was rejected (with a self-correcting kong "did you mean" suggestion). An explicit `name:"allow-degraded-fks"` tag (the same treatment as `--mysql-sql-mode` / `--zero-date` and the other capital-run fields) binds the spelling the docs use; pinned so a future dropped tag re-breaks loudly. Caught by the v0.99.276 post-release regression cycle.
+
+### Added
+
+- **Filtered / subset-migration operator guide** (`docs/operator/filtered-subset-migration.md`) — the ADR-0173 follow-on walkthrough for row-level `--where` filtering: the flag surface, the `migrate` push-down + `verify --where`, the FK-orphan caveat and `--allow-degraded-fks`, and the `sync` row-move semantics + restricted CDC grammar + before-image preflight. Wired into the README operator-guide list.
+
+### Compatibility
+
+- **No behavior change.** The flag fix makes the already-documented spelling work; the guide is documentation. Both `--where` spellings' behavior is unchanged from v0.99.276.
+
 ## [0.99.276] - 2026-07-18
 
 Row-level filtering — migrate or continuously sync **only the rows you want**, via a per-table `--where` predicate (ADR-0173). A new user-facing capability; fully additive (no `--where` = unchanged behavior).
