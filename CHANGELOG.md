@@ -4,6 +4,19 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.281] - 2026-07-18
+
+Final wave of the 2026-07-18 audit remediation (batch B) — a filtered-sync throughput fix and an internal collation-layering cleanup. No change to any path that doesn't use `--where`.
+
+### Fixed / Changed
+
+- **Filtered `sync --where` on PlanetScale MySQL / Vitess now filters server-side on *warm resume* too, not just cold-start.** Previously, after any restart or crash-resume, a filtered VStream sync streamed the **entire keyspace** and discarded ~99% of it client-side — correctness-safe but a large steady-state cost on every resume. The `--where` predicate is now pushed into the VStream filter rule on resume as well (`select * from <t> where (<predicate>)` per filtered table, with the unfiltered tables still streamed), so the resumed stream transfers only in-scope change traffic. The client-side row-move classification is unchanged (the server-side filter is an efficiency layer). Validated on a real Vitess cluster: on resume an out-of-scope row is dropped server-side, and the in-scope + move-out changes still arrive for the target INSERT/DELETE.
+- **Internal: the row-predicate evaluator no longer depends on a MySQL collation library.** Collation resolution moved behind an engine-supplied `CollationResolver` interface — MySQL provides the Vitess-backed comparator (with the PAD-space / charset / case-insensitive rules from v0.99.279-280), Postgres/SQLite provide a byte-exact-or-refuse resolver (with the determinism check from v0.99.280) — so the engine-neutral orchestrator no longer carries a compile-time edge to an engine-specific collation library (IR-first tenet). Behavior-preserving: the real-MySQL and real-Postgres collation family matrices pass unchanged.
+
+### Compatibility
+
+- **No behavior change.** The warm-resume change is a throughput improvement (fewer discarded events); filter semantics are identical. The collation-resolver refactor is internal and behavior-preserving.
+
 ## [0.99.280] - 2026-07-18
 
 Audit-tail hardening of `--where` filtering (2026-07-18 audit, batch A) — mostly correctness/quality on top of the v0.99.279 silent-loss fix. No change to any path that doesn't use `--where`.
