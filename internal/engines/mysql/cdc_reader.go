@@ -243,6 +243,17 @@ type CDCReader struct {
 	// the pump goroutine.
 	schemaForward bool
 
+	// fullBeforeImageTables is the ADR-0173 Phase 2 opt-out from the
+	// before-image PK-narrowing (Bug 88) for tables a continuous filtered
+	// sync (`--where`) filters: the client-side row-move evaluation needs
+	// every column of the OLD row, so for these tables the reader emits the
+	// FULL decoded before-image and the pipeline's where-intercept re-narrows
+	// to the PK before the applier builds its key-only WHERE. Keyed by
+	// lower-cased unqualified table name. Nil (the default) preserves the
+	// Bug-88 narrowing for every table. Set by [CDCReader.SetFullBeforeImageTables]
+	// before StreamChanges; read only on the pump goroutine.
+	fullBeforeImageTables map[string]bool
+
 	// forwardNullSig tracks, per qualified table, the last-emitted
 	// per-column nullability vector — the SEPARATE forward-delta signal
 	// for GAP #2. It is intentionally NOT folded into snapshotSig (which
@@ -349,6 +360,34 @@ func (r *CDCReader) SetCDCDatabaseScope(inScope func(database string) bool) {
 // goroutine. Implements pipeline.schemaForwardModeSetter.
 func (r *CDCReader) SetSchemaForward(enabled bool) {
 	r.schemaForward = enabled
+}
+
+// SetFullBeforeImageTables records the tables for which the reader must
+// emit UN-narrowed (full) before-images (ADR-0173 Phase 2 continuous
+// filtered sync). For these tables the Bug-88 PK narrowing is skipped so
+// the pipeline's client-side row-move evaluation can read every column of
+// the OLD row; the where-intercept re-narrows to the PK before apply.
+// Keyed by unqualified table name (case-insensitive). Nil/empty disables
+// the opt-out (every table keeps the narrowing). Must be called before
+// [StreamChanges]; read on the pump goroutine. Implements
+// pipeline.fullBeforeImageSetter.
+func (r *CDCReader) SetFullBeforeImageTables(tables map[string]bool) {
+	if len(tables) == 0 {
+		r.fullBeforeImageTables = nil
+		return
+	}
+	lc := make(map[string]bool, len(tables))
+	for t := range tables {
+		lc[strings.ToLower(t)] = true
+	}
+	r.fullBeforeImageTables = lc
+}
+
+// emitFullBefore reports whether table's before-image should be emitted
+// un-narrowed (ADR-0173 Phase 2). False (the default) keeps the Bug-88 PK
+// narrowing.
+func (r *CDCReader) emitFullBefore(table string) bool {
+	return r.fullBeforeImageTables[strings.ToLower(table)]
 }
 
 // databaseInScope reports whether events from the given source database
@@ -1077,7 +1116,13 @@ func (r *CDCReader) dispatchRows(
 			// are always real (a PK-change UPDATE keeps working: the
 			// narrowed before carries the OLD key, the after carries the
 			// new one).
-			before = filterBeforeToPK(tbl, before)
+			// ADR-0173 Phase 2: a filtered sync needs the FULL before-image
+			// (the where row-move eval reads every OLD column); the
+			// where-intercept re-narrows to PK before apply. Otherwise keep
+			// the Bug-88 PK narrowing.
+			if !r.emitFullBefore(tbl.Name) {
+				before = filterBeforeToPK(tbl, before)
+			}
 			if err := send(ctx, out, ir.Update{
 				Position:   pos,
 				Schema:     tbl.Schema,
@@ -1127,7 +1172,12 @@ func (r *CDCReader) dispatchRows(
 			// — Bug-8-equivalent silent data loss. Mirrors the
 			// PG-side filterBeforeToKeyCols. See
 			// docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
-			before = filterBeforeToPK(tbl, before)
+			// ADR-0173 Phase 2: emit the FULL before-image for a filtered
+			// table (the where intercept re-narrows to PK before apply);
+			// otherwise keep the Bug-88 PK narrowing.
+			if !r.emitFullBefore(tbl.Name) {
+				before = filterBeforeToPK(tbl, before)
+			}
 			if err := send(ctx, out, ir.Delete{
 				Position:   pos,
 				Schema:     tbl.Schema,

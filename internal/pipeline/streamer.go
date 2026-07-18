@@ -788,6 +788,18 @@ type Streamer struct {
 	// non-nil and non-empty.
 	Redactor *redact.Registry
 
+	// RowFilters is the operator's per-table `--where TABLE=<predicate>`
+	// row filter (ADR-0173 Phase 2, continuous *filtered* sync), keyed by
+	// SOURCE table name. The SAME map drives BOTH legs: the cold-start
+	// snapshot copy pushes the native-SQL predicate down into the source
+	// read (Phase 1 reuse, [migcore.ApplyRowFilters]), and the CDC leg
+	// evaluates it CLIENT-SIDE per change with the ADR-0173 row-move
+	// dispatch ([interceptWhereFilter]) — so the two legs cannot diverge on
+	// scope. [preflightRowFilters] compiles each predicate + verifies the
+	// source delivers full before-images at sync-start; nil/empty is the
+	// byte-identical unfiltered default.
+	RowFilters map[string]string
+
 	// PositionFromManifestStore is the [irbackup.Store] the chain
 	// terminal position is read from when the operator passes
 	// `--position-from-manifest=<chain-url>`. The Streamer uses the
@@ -1187,6 +1199,16 @@ type Streamer struct {
 	// dispatchErr classification path.
 	schemaSnapshotErr atomic.Pointer[error]
 
+	// whereFilter is the compiled ADR-0173 Phase 2 client-side row filter,
+	// built by [preflightRowFilters] from [RowFilters] at sync-start and
+	// consumed by the CDC-leg [interceptWhereFilter]. Nil when no --where is
+	// configured. whereFilterErr is the error sink that intercept writes to
+	// when a filtered UPDATE/DELETE arrives without a before-image (the
+	// mid-stream partial-image belt); surfaced via the standard dispatchErr
+	// classification path, mirroring schemaSnapshotErr.
+	whereFilter    *whereCDCFilter
+	whereFilterErr atomic.Pointer[error]
+
 	// coldStartSeedSnapshots is the ADR-0054 Bug 83 fix: synthetic
 	// SchemaSnapshots reflecting the pre-Shape-A-rewrite source IR
 	// per filtered table. Set by [coldStart] before
@@ -1273,6 +1295,15 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// validation-rig observations (PS-MySQL cross-region failed at
 	// batch=100, worked at 25-50).
 	warnIfApplyBatchSizeRisky(ctx, s)
+
+	// ADR-0173 Phase 2: continuous filtered sync. Compile each `--where`
+	// predicate against the source schema + verify the source delivers full
+	// before-images, ONCE here (before any attempt, cold-start or warm
+	// resume) — an unsupported predicate or a mis-configured source refuses
+	// up front, never after data moves. No-op when RowFilters is empty.
+	if err := s.preflightRowFilters(ctx); err != nil {
+		return err
+	}
 
 	attempts := s.ApplyRetryAttempts
 	if attempts < 1 {

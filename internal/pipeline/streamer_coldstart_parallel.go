@@ -225,12 +225,21 @@ func (s *Streamer) runColdStartParallel(
 	// coldStart's fast path, this becomes a live bug — re-gate here first.
 	snapshotName := stream.SnapshotName
 	maxBuffer := s.MaxBufferBytes
+	rowFilters := s.RowFilters
+	sourceName := s.Source.Name()
 	readerFactory := func(rctx context.Context) (ir.RowReader, error) {
 		readers, err := importer.ImportSnapshot(rctx, snapshotName, 1)
 		if err != nil {
 			return nil, err
 		}
 		migcore.ApplyMaxBufferBytes(readers[0], maxBuffer)
+		// ADR-0173 Phase 2: push the `--where` predicate into every
+		// snapshot-pinned parallel reader too (chunk-0 reads stream.Rows,
+		// which was already filtered in coldStartOpenSnapshot). No-op when
+		// unset; a reader that can't push down refuses loudly.
+		if err := migcore.ApplyRowFilters(readers[0], rowFilters, sourceName); err != nil {
+			return nil, err
+		}
 		return readers[0], nil
 	}
 

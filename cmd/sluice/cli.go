@@ -1193,6 +1193,8 @@ type SyncStartCmd struct {
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION" sep:"none"`
 
+	Where []string `help:"Continuous FILTERED sync (ADR-0173 Phase 2): stream only the rows of TABLE matching a native SOURCE-SQL boolean predicate (repeatable). Format: 'TABLE=<predicate>', e.g. 'users=country IN (''US'',''CA'')'. The SAME predicate scopes BOTH legs: the cold-start snapshot pushes it down into the source read (efficient), and the CDC leg evaluates it CLIENT-SIDE per change with row-move semantics — an UPDATE that moves a row into/out of scope becomes a target INSERT/DELETE. Because there is no source-side stream filter, the CDC leg accepts only a restricted, faithfully-evaluable grammar (column =/!=/</<=/>/>= literal, IN, IS [NOT] NULL, AND/OR/NOT, parentheses); anything it can't evaluate faithfully (functions, subqueries, ordering/collation-sensitive string comparisons) is refused at sync-start. Requires full row before-images (MySQL binlog_row_image=FULL, PG REPLICA IDENTITY FULL on the filtered tables). For a one-shot filtered copy with full source-SQL, use 'sluice migrate --where' instead." placeholder:"TABLE=<predicate>" sep:"none"`
+
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	SlotName string `help:"Replication-slot name suffix for engines that have a slot concept (Postgres). Default 'sluice_slot'. Sluice prepends 'sluice_' if the supplied name doesn't already start with it (so '--slot-name shard_a' creates 'sluice_shard_a'); the convention lets operators find every sluice slot with 'pg_replication_slots WHERE slot_name LIKE sluice\\_%'. Set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they collide on the default. Engines without slots (MySQL: binlog stream is the slot) silently ignore this flag." placeholder:"NAME"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
@@ -1883,6 +1885,14 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return err
 	}
+	// ADR-0173 Phase 2: parse the repeatable `--where TABLE=<predicate>`
+	// into the source-keyed map. Uses the SAME parser as migrate (Phase 1);
+	// the Streamer's preflight compiles + fidelity-checks each predicate for
+	// the client-side CDC leg at sync-start.
+	rowFilters, err := parseWhereFilters(s.Where)
+	if err != nil {
+		return err
+	}
 
 	// Validate mutually-exclusive flag combinations BEFORE the destructive
 	// confirmation prompt below — an invalid combination must fail loud up
@@ -2001,6 +2011,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		SlotName:           s.SlotName,
 		Mappings:           mappings,
 		ExpressionMappings: exprMappings,
+		RowFilters:         rowFilters,
 		DryRun:             s.DryRun,
 		Filter:             filter,
 		ViewFilter:         viewFilter,

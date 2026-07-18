@@ -113,6 +113,10 @@ func rawCopyConfigForStreamer(s *Streamer) rawCopyConfig {
 		mappings:     s.Mappings,
 		exprMappings: s.ExpressionMappings,
 		shard:        s.InjectShardColumn,
+		// ADR-0173 Phase 2: a `--where` filter on the sync cold-start makes
+		// the raw byte-pipe unsafe (it would bypass the predicate and copy
+		// every row), exactly as on migrate — gate it off.
+		rowFilters: s.RowFilters,
 	}
 	if s.Source != nil {
 		cfg.sourceEngine = s.Source.Name()

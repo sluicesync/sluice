@@ -1846,6 +1846,26 @@ type RowFilterSetter interface {
 	SetRowFilters(filters map[string]string)
 }
 
+// FilteredCDCPreflighter is the optional source-engine surface that a
+// continuous filtered sync (`sync --where`, ADR-0173 Phase 2) uses to
+// verify — at sync-start — that the source is configured to deliver full
+// row BEFORE-images for the filtered tables. Client-side row-move
+// evaluation (an UPDATE that moves a row into / out of the filter's scope
+// becomes a target INSERT / DELETE) requires the before-image, so a
+// filtered CDC stream effectively requires MySQL binlog_row_image=FULL /
+// PG REPLICA IDENTITY FULL. tables are the SOURCE table names carrying a
+// `--where` predicate.
+//
+// Implementations return a coded refusal
+// ([sluicecode.CodeWhereCDCBeforeImage]) naming the offending table + the
+// exact remedy when the requirement is not met, and nil when it is (or is
+// not applicable — a plain, empty-tables call is a no-op). MySQL and
+// Postgres implement it; a source engine that does NOT is refused loudly
+// by the pipeline (filtered continuous sync is v1-scoped to those two).
+type FilteredCDCPreflighter interface {
+	PreflightFilteredCDCBeforeImage(ctx context.Context, dsn string, tables []string) error
+}
+
 // IndexBuildTuner is the optional surface a [SchemaWriter] can implement
 // to accept the operator's `--index-build-mem` value (a per-build
 // maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator

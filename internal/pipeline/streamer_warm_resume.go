@@ -75,6 +75,12 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if setter, ok := cdc.(schemaForwardModeSetter); ok {
 		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
 	}
+	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
+	// tables (row-move eval needs every OLD column); refuses if unsupported.
+	if err := s.applyFullBeforeImageTables(cdc); err != nil {
+		migcore.CloseIf(cdc)
+		return nil, stop, err
+	}
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		migcore.CloseIf(cdc)

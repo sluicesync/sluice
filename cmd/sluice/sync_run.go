@@ -112,6 +112,12 @@ type SyncSpec struct {
 	TypeOverride []string `koanf:"type-override"`
 	ExprOverride []string `koanf:"expr-override"`
 
+	// Where is the per-sync ADR-0173 Phase 2 row filter (`sync start
+	// --where TABLE=<predicate>`): continuous filtered sync, one native-
+	// source-SQL predicate per table. Same parse + fidelity contract as the
+	// standalone flag; compiled at sync-start by the Streamer's preflight.
+	Where []string `koanf:"where"`
+
 	ApplyConcurrency int    `koanf:"apply-concurrency"`
 	ApplyBatchSize   string `koanf:"apply-batch-size"`
 	NoAutoTune       bool   `koanf:"no-auto-tune"`
@@ -876,6 +882,13 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 	if err != nil {
 		return nil, err
 	}
+	// ADR-0173 Phase 2: per-sync continuous filtered sync, parsed via the
+	// same parser as the standalone flag (the Streamer preflight compiles +
+	// fidelity-checks each predicate at sync-start).
+	rowFilters, err := parseWhereFilters(spec.Where)
+	if err != nil {
+		return nil, err
+	}
 
 	smtp := spec.smtpConfig()
 	if err := smtp.Validate(); err != nil {
@@ -931,6 +944,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		SlotName:           spec.SlotName,
 		Mappings:           mappings,
 		ExpressionMappings: exprMappings,
+		RowFilters:         rowFilters,
 		Filter:             filter,
 		TargetSchema:       spec.TargetSchema,
 

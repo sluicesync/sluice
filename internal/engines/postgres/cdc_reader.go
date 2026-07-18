@@ -104,6 +104,18 @@ type CDCReader struct {
 	// Events for other schemas are dropped during dispatch.
 	schema string
 
+	// fullBeforeImageTables is the ADR-0173 Phase 2 opt-out from the
+	// before-image identity-key narrowing ([filterBeforeToKeyCols]) for the
+	// tables a continuous filtered sync (`--where`) filters: the client-side
+	// row-move evaluation needs every column of the OLD row, so for these
+	// tables the reader emits the FULL decoded OldTuple and the pipeline's
+	// where-intercept re-narrows to the PK before the applier builds its
+	// key-only WHERE. Keyed by lower-cased unqualified table name. Nil (the
+	// default) preserves the narrowing for every table. Set by
+	// [CDCReader.SetFullBeforeImageTables] before StreamChanges; read only on
+	// the pump goroutine.
+	fullBeforeImageTables map[string]bool
+
 	// cdcSchemaInScope is the ADR-0075 Phase 2b multi-schema event-allow
 	// predicate, set by [SetCDCDatabaseScope]. A PG logical replication
 	// slot is DATABASE-WIDE — a single slot decodes the WAL for every
@@ -291,6 +303,34 @@ func (r *CDCReader) SetCDCDatabaseScope(inScope func(schema string) bool) {
 // Compile-time assertion that the PG CDC reader satisfies the multi-schema
 // fan-out event-scope surface (ADR-0075 Phase 2b).
 var _ ir.CDCDatabaseScoper = (*CDCReader)(nil)
+
+// SetFullBeforeImageTables records the tables for which the reader must
+// emit UN-narrowed (full) before-images (ADR-0173 Phase 2 continuous
+// filtered sync). For these tables the [filterBeforeToKeyCols] identity-key
+// narrowing is skipped so the pipeline's client-side row-move evaluation can
+// read every column of the OLD row; the where-intercept re-narrows to the PK
+// before apply. Keyed by unqualified table name (case-insensitive).
+// Nil/empty disables the opt-out (every table keeps the narrowing). Must be
+// called before [StreamChanges]; read on the pump goroutine. Implements
+// pipeline.fullBeforeImageSetter.
+func (r *CDCReader) SetFullBeforeImageTables(tables map[string]bool) {
+	if len(tables) == 0 {
+		r.fullBeforeImageTables = nil
+		return
+	}
+	lc := make(map[string]bool, len(tables))
+	for t := range tables {
+		lc[strings.ToLower(t)] = true
+	}
+	r.fullBeforeImageTables = lc
+}
+
+// emitFullBefore reports whether table's before-image should be emitted
+// un-narrowed (ADR-0173 Phase 2). False (the default) keeps the
+// identity-key narrowing.
+func (r *CDCReader) emitFullBefore(table string) bool {
+	return r.fullBeforeImageTables[strings.ToLower(table)]
+}
 
 // schemaInScope reports whether events from the given source schema
 // should be emitted. In multi-schema mode (cdcSchemaInScope non-nil) it
@@ -1224,8 +1264,13 @@ func (r *CDCReader) emitUpdate(
 		// key-only WHERE (WHERE id = $N). Under DEFAULT/USING INDEX
 		// IdentityKeyCols is the wire-flagged replica-identity set, so the
 		// pre-Bug-92 correct behaviour is preserved.
-		before, err = filterBeforeToKeyCols(rel, decoded)
-		if err != nil {
+		// ADR-0173 Phase 2: a filtered sync needs the FULL before-image (the
+		// where row-move eval reads every OLD column); the where-intercept
+		// re-narrows to the key columns before apply. Otherwise keep the
+		// Bug-92 identity-key narrowing.
+		if r.emitFullBefore(rel.Name) {
+			before = decoded
+		} else if before, err = filterBeforeToKeyCols(rel, decoded); err != nil {
 			return fmt.Errorf("postgres: cdc: %w", err)
 		}
 	} else {
@@ -1330,9 +1375,14 @@ func (r *CDCReader) emitDelete(
 	if err != nil {
 		return fmt.Errorf("postgres: cdc: decode delete for %s.%s: %w", rel.Schema, rel.Name, err)
 	}
-	before, err := filterBeforeToKeyCols(rel, decoded)
-	if err != nil {
-		return fmt.Errorf("postgres: cdc: %w", err)
+	// ADR-0173 Phase 2: emit the FULL before-image for a filtered table (the
+	// where intercept re-narrows to the key columns before apply); otherwise
+	// keep the Bug-8/92 identity-key narrowing.
+	before := decoded
+	if !r.emitFullBefore(rel.Name) {
+		if before, err = filterBeforeToKeyCols(rel, decoded); err != nil {
+			return fmt.Errorf("postgres: cdc: %w", err)
+		}
 	}
 	pos, err := r.positionAt(lsn)
 	if err != nil {

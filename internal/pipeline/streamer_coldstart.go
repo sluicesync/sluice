@@ -466,6 +466,18 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	// default the engine seeds at open.
 	migcore.ApplyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
 
+	// ADR-0173 Phase 2: push the `--where` predicate down into the
+	// cold-start snapshot READ, exactly as migrate does — the source
+	// evaluates the native-SQL predicate so only in-scope rows are copied
+	// (the snapshot leg reuses Phase 1). Refuses loudly if the snapshot
+	// reader can't push it down (rather than silently copy every row); the
+	// CDC leg's client-side evaluator (preflightRowFilters) agrees with this
+	// source-side evaluation by construction. No-op when RowFilters is empty.
+	if err := migcore.ApplyRowFilters(stream.Rows, s.RowFilters, s.Source.Name()); err != nil {
+		_ = stream.Close()
+		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, err)
+	}
+
 	// Wire the resumable COPY-cursor checkpoint sink (ADR-0072 Phase B).
 	// Engines whose snapshot reader carries a mid-COPY resume cursor (the
 	// VStream cold-start reader, whose position round-trips Vitess's
@@ -887,6 +899,14 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// that does not move the decode signature).
 	if setter, ok := stream.Changes.(schemaForwardModeSetter); ok {
 		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
+	}
+
+	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
+	// tables so the CDC-leg row-move eval can read every OLD column (refuses
+	// loudly if the reader can't). No-op when no --where is set.
+	if err := s.applyFullBeforeImageTables(stream.Changes); err != nil {
+		_ = stream.Close()
+		return nil, stop, err
 	}
 
 	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)

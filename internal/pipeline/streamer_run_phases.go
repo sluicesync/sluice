@@ -840,6 +840,15 @@ func (s *Streamer) startTelemetrySidecars(ctx context.Context, applier ir.Change
 // restart picks up a fresh seed in its next coldStart run.
 func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-chan ir.Change, liveFilter *liveAddedFilter, streamID string) <-chan ir.Change {
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
+	// ADR-0173 Phase 2: continuous *filtered* sync — the client-side
+	// row-move dispatch. When a `--where` predicate is set (s.whereFilter
+	// compiled by preflightRowFilters), evaluate it per row-bearing change
+	// over the before/after images and translate to the correct target op
+	// (drop / INSERT / UPDATE / DELETE — the move-IN/move-OUT cells). nil
+	// filter is a verbatim pass-through. Placed right after the table filter
+	// so an out-of-scope change never reaches the schema-forward / delay /
+	// sync-lag stages or the applier.
+	filtered = interceptWhereFilter(applyCtx, filtered, s.whereFilter, &s.whereFilterErr)
 	// ADR-0054 Phase 2d: when live coordination is engaged, intercept
 	// SchemaSnapshot events to route through the lease + per-shape
 	// applier + probe before forwarding to the downstream applier.
@@ -938,6 +947,16 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	if dispatchErr == nil {
 		if snapErrPtr := s.schemaSnapshotErr.Load(); snapErrPtr != nil && *snapErrPtr != nil {
 			dispatchErr = *snapErrPtr
+		}
+	}
+	// ADR-0173 Phase 2: the --where row-move intercept short-circuits the
+	// changes channel on a missing-before-image refusal (a mid-stream
+	// partial image). Surface its stored error the same way, so the coded
+	// CodeWhereCDCBeforeImage refusal reaches the operator instead of a
+	// silent clean close.
+	if dispatchErr == nil {
+		if whereErrPtr := s.whereFilterErr.Load(); whereErrPtr != nil && *whereErrPtr != nil {
+			dispatchErr = *whereErrPtr
 		}
 	}
 	// ADR-0157: the streamer surfaces a schema-forward refusal here (the

@@ -116,6 +116,18 @@ const (
 	CodeExportUnrepresentable Code = "SLUICE-E-EXPORT-UNREPRESENTABLE"
 
 	CodeWhereFilterFKOrphan Code = "SLUICE-E-WHERE-FK-ORPHAN"
+
+	// The two ADR-0173 Phase 2 (continuous filtered sync) refusals.
+	// CodeWhereCDCUnsupportedPredicate fires at sync-start when a
+	// `--where` predicate uses a construct the client-side CDC evaluator
+	// cannot faithfully evaluate (a function, subquery, collation-sensitive
+	// string op, or an unknown token) — refusing beats silently diverging
+	// from the source's own evaluation. CodeWhereCDCBeforeImage fires when a
+	// filtered CDC source is not configured to deliver full before-images
+	// (MySQL binlog_row_image!=FULL, PG REPLICA IDENTITY not FULL on a
+	// filtered table), which the row-move evaluation requires.
+	CodeWhereCDCUnsupportedPredicate Code = "SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE"
+	CodeWhereCDCBeforeImage          Code = "SLUICE-E-WHERE-CDC-BEFORE-IMAGE"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -205,6 +217,9 @@ var registry = map[Code]Info{
 	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},
 
 	CodeWhereFilterFKOrphan: {ClassRefusal, "a --where row filter on a parent table orphaned its children, so the deferred ADD CONSTRAINT FOREIGN KEY failed (SQLSTATE 23503) on the target — filter consistently so the referenced parent rows are copied, or pass --allow-degraded-fks to attach the FK as NOT VALID"},
+
+	CodeWhereCDCUnsupportedPredicate: {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the predicate uses a construct the client-side CDC evaluator cannot faithfully evaluate (a function/subquery, an ordering or collation-sensitive string comparison, an unknown column, or unrecognized syntax) — evaluating it client-side could diverge from the source's own evaluation and silently leak or drop rows"},
+	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a
