@@ -2,7 +2,13 @@
 
 ## Status
 
-**Proposed** (design-first; **not implemented**; filed 2026-07-17 from an operator feature request). Phase 1 (migrate-time filtering) is a modest, well-precedented chunk that fully covers the motivating use case; Phase 2 (continuous *filtered* sync) is a genuinely harder design deferred behind demand. This ADR pins the surface, the migrate mechanics, and — most importantly — the **defined semantics** the sync phase would need, so the hard part is settled on paper before any code.
+**Accepted (2026-07-17). Both phases implemented** — Phase 1 (migrate `--where`, commit `cde284b8`) and Phase 2 (continuous filtered sync, commit `b4f929da`). Phase 2 was built immediately after Phase 1 because a real operator use case surfaced (the demand-gate was met).
+
+**Implementation note — the row-move-OUT "killer" showed up in a subtler form than the design anticipated, and end-to-end testing caught it.** Both CDC readers narrow the before-image to the PK (Bug-88 and siblings), so the *filtered column was absent* by the time the CDC intercept evaluated the OLD row — a move-OUT (`before` matched, `after` doesn't) mis-classified as `(false,false)` → **drop**, silently leaking the now-out-of-scope row (exactly the failure the row-move table below exists to prevent). Fixed by a **zero-value-safe** reader opt-out (`ir.FullBeforeImageSetter` / `CDCReader.SetFullBeforeImageTables`): filtered tables emit the *full* before-image, unfiltered tables keep the existing PK-narrowing, and the intercept re-narrows to the PK before the applier builds its key-only WHERE.
+
+**Grammar is restricted slightly more than the prose below anticipated** (deliberate loud-failure fidelity, not a corner cut): the client-side CDC evaluator refuses string *ordering* (`< <= > >=`), string `=`/`IN` on **case/accent-insensitive collations**, and **tz-aware temporal** comparisons — in each case a byte-exact client-side compare would diverge from the source's own evaluation, so it refuses at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`) rather than risk a silent leak/drop. Equality / `IN` / `IS NULL` on numeric, bool, case-sensitive-string, and tz-naive temporal columns — the `country IN (…)` motivating case — works. Filtered CDC requires full before-images (`SLUICE-E-WHERE-CDC-BEFORE-IMAGE`: MySQL `binlog_row_image=FULL`, PG `REPLICA IDENTITY FULL` per filtered table).
+
+**Both phases touch concurrency-adjacent paths (parallel copy / CDC apply + the reader before-image emit) — they MUST pass CI's `-race` Integration job before any release tag.**
 
 ## Context
 
