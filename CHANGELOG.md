@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.278] - 2026-07-18
+
+Continuous **filtered sync** (`sync --where`, ADR-0173) now works across the full engine matrix — the MySQL-family gaps that live testing surfaced are closed (ADR-0174). Additive: no `--where` = unchanged behavior.
+
+### Added
+
+- **`sync --where` on MySQL-family sources — faithful case/accent-insensitive filters.** A string `--where` like `region = 'EU'` on a case- or accent-insensitive column (MySQL's default collation) is now evaluated **faithfully client-side** instead of refused: sluice reproduces the source's own `=` by reusing the source engine's collation comparator (Vitess `evalengine` over its `collations.Environment`), so `'EU'` matches `eu`/`Eu`/accent-folded values **byte-identically to what the source would match** — the client-side CDC classification and the source's own evaluation cannot diverge. A collation sluice cannot reproduce (an unknown/absent one, or a Postgres non-deterministic ICU collation) still refuses loudly rather than guess. New `--where-strict-collation` forces the pre-0174 strict behavior (refuse any non-byte-exact string comparison) for operators who want the byte-exact guarantee regardless; it defaults off (faithful mode is the common default).
+
+- **`sync --where` on PlanetScale MySQL / Vitess (VStream).** The predicate is pushed into the VStream filter rule (`select * from <t> where (<pred>)`) so Vitess evaluates it **server-side with the source's own collation** — filtering the cold-start COPY and the streaming tail natively — while the pipeline classifies row-moves client-side (move-in → INSERT, move-out → DELETE) from the before/after images. Because the VStream COPY sends its filter rules to vtgate eagerly, the predicate is threaded at stream-open (new `FilteredSnapshotOpener` / `FilteredSnapshotResumer` engine surfaces) rather than via a post-open setter that would leave the first table's COPY unfiltered. Validated end-to-end on a real Vitess cluster: the filtered COPY excludes out-of-scope rows server-side, and a row updated out of the filter's scope arrives with both images and becomes a target DELETE (never a silent leak). A universal floor guards it: any filtered UPDATE/DELETE whose before-image omits a predicate-referenced column refuses (`SLUICE-E-WHERE-CDC-BEFORE-IMAGE`, naming the column) — so a source that isn't delivering full row before-images (`binlog_row_image` != `FULL`) can never silently mis-classify a move-out. See ADR-0174.
+
+### Compatibility
+
+- **Additive — no behavior change without `--where`.** `migrate --where` is unchanged (already universal; source-evaluated). For `sync --where`: string filters on MySQL now evaluate faithfully under the column's collation (previously refused); PlanetScale MySQL / Vitess is now supported (previously refused, `migrate --where` only). sluice's collation set is pinned to MySQL 8.0.30 — an unrecognized collation refuses (safe), never a wrong comparison.
+
 ## [0.99.277] - 2026-07-18
 
 Row-level filtering (ADR-0173, shipped in v0.99.276) follow-ons: a CLI flag-spelling fix and the operator guide. No change to any successful path.
