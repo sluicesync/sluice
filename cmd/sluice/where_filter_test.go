@@ -3,7 +3,10 @@
 
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseWhereFilters(t *testing.T) {
 	t.Run("empty returns nil", func(t *testing.T) {
@@ -77,4 +80,19 @@ func TestParseWhereFilters(t *testing.T) {
 			t.Fatal("duplicate table key err = nil; want a loud refusal")
 		}
 	})
+}
+
+// TestAllowDegradedFKsFlagSpelling pins that the flag surfaced by the --where
+// FK-orphan path parses under the spelling the docs, --help, and the
+// SLUICE-E-WHERE-FK-ORPHAN hint all recommend. Without an explicit name: tag,
+// kong auto-kebabs the AllowDegradedFKs field to --allow-degraded-f-ks (it
+// splits the FKs capital run), so the documented --allow-degraded-fks would be
+// rejected. The v0.99.276 regression cycle caught that mismatch; this pins the
+// tag so a future dropped name: tag re-breaks loudly rather than silently.
+func TestAllowDegradedFKsFlagSpelling(t *testing.T) {
+	baseArgs := "migrate --source-driver=mysql --source=src --target-driver=postgres --target=tgt"
+	cli := parseInto(t, append(strings.Fields(baseArgs), "--allow-degraded-fks")...)
+	if !cli.Migrate.AllowDegradedFKs {
+		t.Fatal("--allow-degraded-fks did not bind AllowDegradedFKs=true")
+	}
 }
