@@ -161,6 +161,14 @@ type ColumnInfo struct {
 	// comparison is allowed instead of refused. Zero means "not faithfully
 	// reproducible" — the comparison is refused (unless CaseSensitive).
 	Collation collationID
+	// PadSpace is meaningful only for [FamilyString]: true when the column's
+	// collation uses PAD SPACE comparison (trailing spaces ignored in `=`,
+	// the MySQL legacy default). The evaluator right-trims ASCII spaces from
+	// both operands before comparing so `'EU'` matches a stored `'EU '` as the
+	// source's own `=` does — Vitess's comparator is NO-PAD regardless of the
+	// real attribute (audit F0-1/F0-2). False on NO-PAD collations (*_0900_*,
+	// binary) and on non-MySQL sources.
+	PadSpace bool
 }
 
 // faithfulString reports whether a string-column comparison can be evaluated
@@ -265,12 +273,44 @@ func isMySQLFamily(engineName string) bool {
 // comparator ([collationEqual]); an unresolvable/empty collation stays
 // unreproducible so its string comparisons refuse loudly at compile time.
 func stringColumnInfo(engineName, collation string, strict bool) ColumnInfo {
-	if collationCaseSensitive(engineName, collation) {
-		return ColumnInfo{Family: FamilyString, CaseSensitive: true}
+	// Postgres / SQLite: the deterministic DEFAULT collation (empty in the IR)
+	// is byte-exact, so a byte compare is faithful. A NAMED collation may be
+	// non-deterministic (a Postgres ICU `ks-level` collation), whose `=` is
+	// collation-aware — sluice cannot prove or reproduce that, so it refuses
+	// rather than silently byte-compare (audit F0-3). Determinism isn't carried
+	// in the IR yet; a follow-up can capture pg_collation.collisdeterministic to
+	// re-admit the deterministic named collations.
+	if !isMySQLFamily(engineName) {
+		if collation == "" {
+			return ColumnInfo{Family: FamilyString, CaseSensitive: true}
+		}
+		return ColumnInfo{Family: FamilyString} // named PG/SQLite collation -> refuse
 	}
+
+	// MySQL family. A faithful string comparison needs a KNOWN, UTF-8-charset
+	// collation: sluice delivers row values as UTF-8 bytes, so a non-UTF-8
+	// charset (latin1, …) would be mis-decoded by the comparator (audit F0-6),
+	// and an unknown/empty collation can't have its pad/fold reproduced — both
+	// refuse loudly rather than compare wrongly.
+	if collation == "" || !collationCharsetUTF8(collation) {
+		return ColumnInfo{Family: FamilyString}
+	}
+	// PAD SPACE (every legacy collation) vs NO PAD (*_0900_*, binary): the
+	// evaluator right-trims trailing spaces on a PAD SPACE column so it matches
+	// the source's own `=` (audit F0-1/F0-2). Carried on both the byte-exact
+	// and the ci/ai path.
+	padSpace := !collationNoPad(collation)
+	if collationCaseSensitive(engineName, collation) {
+		// Byte-exact (_bin / _cs): faithful with PAD handling. --where-strict-
+		// collation does NOT refuse here — byte-exact IS the strict guarantee;
+		// strict governs only the case/accent-insensitive fold path below.
+		return ColumnInfo{Family: FamilyString, CaseSensitive: true, PadSpace: padSpace}
+	}
+	// Case/accent-insensitive: faithful via Vitess's comparator IF the
+	// collation resolves and strict mode is off; else refuse.
 	if !strict {
 		if id, ok := resolveCollation(collation); ok {
-			return ColumnInfo{Family: FamilyString, Collation: id}
+			return ColumnInfo{Family: FamilyString, Collation: id, PadSpace: padSpace}
 		}
 	}
 	return ColumnInfo{Family: FamilyString}
@@ -420,6 +460,9 @@ type cmpNode struct {
 	// source's collation via [collationEqual] instead of a byte compare
 	// (ADR-0174 Piece 1). Zero means byte-exact.
 	collation collationID
+	// padSpace right-trims trailing ASCII spaces from a FamilyString compare
+	// so a PAD SPACE collation's `=` is reproduced (audit F0-1/F0-2).
+	padSpace bool
 }
 
 func (n cmpNode) eval(row ir.Row) truth {
@@ -427,7 +470,7 @@ func (n cmpNode) eval(row ir.Row) truth {
 	if !ok || v == nil {
 		return truthUnknown // NULL operand → UNKNOWN
 	}
-	return compareValue(n.fam, v, n.op, n.lit, n.collation)
+	return compareValue(n.fam, v, n.op, n.lit, n.collation, n.padSpace)
 }
 
 func (n cmpNode) columns(set map[string]bool) { set[n.column] = true }
@@ -440,6 +483,7 @@ type inNode struct {
 	lits      []literal
 	negated   bool
 	collation collationID
+	padSpace  bool
 }
 
 func (n inNode) eval(row ir.Row) truth {
@@ -449,7 +493,7 @@ func (n inNode) eval(row ir.Row) truth {
 	}
 	res := truthFalse
 	for _, l := range n.lits {
-		switch compareValue(n.fam, v, opEq, l, n.collation) {
+		switch compareValue(n.fam, v, opEq, l, n.collation, n.padSpace) {
 		case truthTrue:
 			res = truthTrue
 		case truthUnknown:
@@ -793,7 +837,7 @@ func (p *parser) parseComparison() (node, error) {
 	if err := checkComparable(col, info, op, lit); err != nil {
 		return nil, err
 	}
-	return cmpNode{column: strings.ToLower(col), op: op, fam: info.Family, lit: lit, collation: info.Collation}, nil
+	return cmpNode{column: strings.ToLower(col), op: op, fam: info.Family, lit: lit, collation: info.Collation, padSpace: info.PadSpace}, nil
 }
 
 func (p *parser) parseIn(col string, info ColumnInfo, negated bool) (node, error) {
@@ -826,7 +870,7 @@ func (p *parser) parseIn(col string, info ColumnInfo, negated bool) (node, error
 			if len(lits) == 0 {
 				return nil, fmt.Errorf("empty IN list on column %q", col)
 			}
-			return inNode{column: strings.ToLower(col), fam: info.Family, lits: lits, negated: negated, collation: info.Collation}, nil
+			return inNode{column: strings.ToLower(col), fam: info.Family, lits: lits, negated: negated, collation: info.Collation, padSpace: info.PadSpace}, nil
 		default:
 			return nil, fmt.Errorf("expected ',' or ')' in IN list on column %q, got %q", col, p.peek().text)
 		}
@@ -972,14 +1016,14 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 // column's family. Any value that does not match the contract for its
 // family (a bug upstream, or a NaN/Inf float) yields UNKNOWN rather than a
 // guessed answer.
-func compareValue(fam Family, value any, op cmpOp, lit literal, collation collationID) truth {
+func compareValue(fam Family, value any, op cmpOp, lit literal, collation collationID, padSpace bool) truth {
 	switch fam {
 	case FamilyNumeric:
 		return compareNumeric(value, op, lit)
 	case FamilyBool:
 		return compareBool(value, op, lit)
 	case FamilyString:
-		return compareString(value, op, lit, collation)
+		return compareString(value, op, lit, collation, padSpace)
 	case FamilyBinary:
 		return compareBinary(value, op, lit)
 	case FamilyTemporal:
@@ -1047,19 +1091,28 @@ func compareBool(value any, op cmpOp, lit literal) truth {
 	}
 }
 
-func compareString(value any, op cmpOp, lit literal, collation collationID) truth {
+func compareString(value any, op cmpOp, lit literal, collation collationID, padSpace bool) truth {
 	s, ok := value.(string)
 	if !ok {
 		return truthUnknown
+	}
+	rhs := lit.str
+	// audit F0-1/F0-2: a PAD SPACE collation ignores TRAILING spaces in `=`
+	// (Vitess's comparator does not), so reproduce it by right-trimming ASCII
+	// spaces from both operands before comparing — `'EU'` then matches a stored
+	// `'EU '` exactly as the source's own `=` does. NO-PAD collations skip this.
+	if padSpace {
+		s = strings.TrimRight(s, " ")
+		rhs = strings.TrimRight(rhs, " ")
 	}
 	// ADR-0174 Piece 1: under a resolved case/accent-insensitive collation,
 	// reproduce the source's `=` via Vitess's own comparator; otherwise the
 	// column's `=` is byte-exact (the compile gate proved one of these).
 	var equal bool
 	if collation != 0 {
-		equal = collationEqual(s, lit.str, collation)
+		equal = collationEqual(s, rhs, collation)
 	} else {
-		equal = s == lit.str
+		equal = s == rhs
 	}
 	switch op {
 	case opEq:
