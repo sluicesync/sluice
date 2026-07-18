@@ -1195,6 +1195,8 @@ type SyncStartCmd struct {
 
 	Where []string `help:"Continuous FILTERED sync (ADR-0173 Phase 2): stream only the rows of TABLE matching a native SOURCE-SQL boolean predicate (repeatable). Format: 'TABLE=<predicate>', e.g. 'users=country IN (''US'',''CA'')'. The SAME predicate scopes BOTH legs: the cold-start snapshot pushes it down into the source read (efficient), and the CDC leg evaluates it CLIENT-SIDE per change with row-move semantics — an UPDATE that moves a row into/out of scope becomes a target INSERT/DELETE. Because there is no source-side stream filter, the CDC leg accepts only a restricted, faithfully-evaluable grammar (column =/!=/</<=/>/>= literal, IN, IS [NOT] NULL, AND/OR/NOT, parentheses); anything it can't evaluate faithfully (functions, subqueries, ordering/collation-sensitive string comparisons) is refused at sync-start. Requires full row before-images (MySQL binlog_row_image=FULL, PG REPLICA IDENTITY FULL on the filtered tables). For a one-shot filtered copy with full source-SQL, use 'sluice migrate --where' instead." placeholder:"TABLE=<predicate>" sep:"none"`
 
+	WhereStrictCollation bool `name:"where-strict-collation" help:"Filtered sync (ADR-0174): force STRICT collation handling for a string --where. By default sluice reproduces a case/accent-insensitive column's '=' faithfully client-side via the source's own collation, so 'region = ''EU''' matches 'eu'/'Eu' exactly as the source would. Pass this to instead REFUSE any string --where on a non-byte-exact collation at sync-start (the pre-ADR-0174 strict behavior) — for operators who want the byte-exact guarantee regardless. No effect on numeric/byte-exact comparisons."`
+
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	SlotName string `help:"Replication-slot name suffix for engines that have a slot concept (Postgres). Default 'sluice_slot'. Sluice prepends 'sluice_' if the supplied name doesn't already start with it (so '--slot-name shard_a' creates 'sluice_shard_a'); the convention lets operators find every sluice slot with 'pg_replication_slots WHERE slot_name LIKE sluice\\_%'. Set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they collide on the default. Engines without slots (MySQL: binlog stream is the slot) silently ignore this flag." placeholder:"NAME"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
@@ -2003,20 +2005,21 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	streamer := &pipeline.Streamer{
-		Source:             source,
-		Target:             target,
-		SourceDSN:          s.Source,
-		TargetDSN:          s.Target,
-		StreamID:           s.StreamID,
-		SlotName:           s.SlotName,
-		Mappings:           mappings,
-		ExpressionMappings: exprMappings,
-		RowFilters:         rowFilters,
-		DryRun:             s.DryRun,
-		Filter:             filter,
-		ViewFilter:         viewFilter,
-		SkipViews:          s.SkipViews,
-		SkipForeignKeys:    s.SkipForeignKeys,
+		Source:               source,
+		Target:               target,
+		SourceDSN:            s.Source,
+		TargetDSN:            s.Target,
+		StreamID:             s.StreamID,
+		SlotName:             s.SlotName,
+		Mappings:             mappings,
+		ExpressionMappings:   exprMappings,
+		RowFilters:           rowFilters,
+		WhereStrictCollation: s.WhereStrictCollation,
+		DryRun:               s.DryRun,
+		Filter:               filter,
+		ViewFilter:           viewFilter,
+		SkipViews:            s.SkipViews,
+		SkipForeignKeys:      s.SkipForeignKeys,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine sync; a same-engine sync KEEPS them by default (the history
 		// is valid). --include-orm-tables / --skip-orm-tables override. (The

@@ -132,6 +132,21 @@ type ColumnInfo struct {
 	// column's collation makes the source's `=` byte-exact, so a client
 	// compare cannot diverge.
 	CaseSensitive bool
+	// Collation is meaningful only for [FamilyString] when !CaseSensitive:
+	// a non-zero, resolved collation ID (ADR-0174 Piece 1) means the
+	// column's case/accent-insensitive `=` can be reproduced FAITHFULLY
+	// client-side via [collationEqual] (Vitess's own comparator), so the
+	// comparison is allowed instead of refused. Zero means "not faithfully
+	// reproducible" — the comparison is refused (unless CaseSensitive).
+	Collation collationID
+}
+
+// faithfulString reports whether a string-column comparison can be evaluated
+// client-side without diverging from the source: either the source's `=` is
+// byte-exact (CaseSensitive) or its collation resolves to a faithful
+// comparator (Collation != 0). When false, a string equality is refused.
+func (ci ColumnInfo) faithfulString() bool {
+	return ci.CaseSensitive || ci.Collation != 0
 }
 
 // ColumnInfosFromIR builds the per-column fidelity map the evaluator
@@ -139,29 +154,33 @@ type ColumnInfo struct {
 // engineName drives the default-collation decision for a string column
 // that carries no explicit collation (MySQL-family defaults are
 // case-insensitive; Postgres/SQLite `=` is byte-exact).
-func ColumnInfosFromIR(engineName string, cols []*ir.Column) map[string]ColumnInfo {
+// strict, when true, disables ADR-0174 Piece 1's faithful case/accent-
+// insensitive comparison: a string column whose `=` is not byte-exact is
+// left unreproducible (refused), the pre-0174 strict behavior. Wired from
+// the operator's --where-strict-collation opt-out.
+func ColumnInfosFromIR(engineName string, cols []*ir.Column, strict bool) map[string]ColumnInfo {
 	out := make(map[string]ColumnInfo, len(cols))
 	for _, c := range cols {
 		if c == nil {
 			continue
 		}
-		out[strings.ToLower(c.Name)] = columnInfoFor(engineName, c)
+		out[strings.ToLower(c.Name)] = columnInfoFor(engineName, c, strict)
 	}
 	return out
 }
 
-func columnInfoFor(engineName string, c *ir.Column) ColumnInfo {
+func columnInfoFor(engineName string, c *ir.Column, strict bool) ColumnInfo {
 	switch t := c.Type.(type) {
 	case ir.Integer, ir.Decimal, ir.Float:
 		return ColumnInfo{Family: FamilyNumeric}
 	case ir.Boolean:
 		return ColumnInfo{Family: FamilyBool}
 	case ir.Char:
-		return ColumnInfo{Family: FamilyString, CaseSensitive: collationCaseSensitive(engineName, t.Collation)}
+		return stringColumnInfo(engineName, t.Collation, strict)
 	case ir.Varchar:
-		return ColumnInfo{Family: FamilyString, CaseSensitive: collationCaseSensitive(engineName, t.Collation)}
+		return stringColumnInfo(engineName, t.Collation, strict)
 	case ir.Text:
-		return ColumnInfo{Family: FamilyString, CaseSensitive: collationCaseSensitive(engineName, t.Collation)}
+		return stringColumnInfo(engineName, t.Collation, strict)
 	case ir.Enum, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// Canonical/identifier-shaped ASCII values: the source's `=` is
 		// exact, so a byte compare is faithful.
@@ -213,6 +232,26 @@ func isMySQLFamily(engineName string) bool {
 	default:
 		return false
 	}
+}
+
+// stringColumnInfo builds the ColumnInfo for a text-like column. If the
+// source's `=` is byte-exact (case+accent-sensitive collation), a byte
+// compare is faithful (CaseSensitive). Otherwise (a ci/ai collation, or an
+// unknown collation on a MySQL-family source) ADR-0174 Piece 1 attempts to
+// reproduce the collation faithfully: unless strict mode is set, a
+// RESOLVABLE collation is carried so the evaluator compares via Vitess's own
+// comparator ([collationEqual]); an unresolvable/empty collation stays
+// unreproducible so its string comparisons refuse loudly at compile time.
+func stringColumnInfo(engineName, collation string, strict bool) ColumnInfo {
+	if collationCaseSensitive(engineName, collation) {
+		return ColumnInfo{Family: FamilyString, CaseSensitive: true}
+	}
+	if !strict {
+		if id, ok := resolveCollation(collation); ok {
+			return ColumnInfo{Family: FamilyString, Collation: id}
+		}
+	}
+	return ColumnInfo{Family: FamilyString}
 }
 
 // Compile parses predicate into a client-side-evaluable [Predicate],
@@ -336,6 +375,10 @@ type cmpNode struct {
 	op     cmpOp
 	fam    Family
 	lit    literal
+	// collation, when non-zero, makes a FamilyString comparison use the
+	// source's collation via [collationEqual] instead of a byte compare
+	// (ADR-0174 Piece 1). Zero means byte-exact.
+	collation collationID
 }
 
 func (n cmpNode) eval(row ir.Row) truth {
@@ -343,16 +386,17 @@ func (n cmpNode) eval(row ir.Row) truth {
 	if !ok || v == nil {
 		return truthUnknown // NULL operand → UNKNOWN
 	}
-	return compareValue(n.fam, v, n.op, n.lit)
+	return compareValue(n.fam, v, n.op, n.lit, n.collation)
 }
 
 // inNode is `column [NOT] IN (lit, ...)`, desugared to OR-of-equalities
 // with SQL NULL semantics.
 type inNode struct {
-	column  string
-	fam     Family
-	lits    []literal
-	negated bool
+	column    string
+	fam       Family
+	lits      []literal
+	negated   bool
+	collation collationID
 }
 
 func (n inNode) eval(row ir.Row) truth {
@@ -362,7 +406,7 @@ func (n inNode) eval(row ir.Row) truth {
 	}
 	res := truthFalse
 	for _, l := range n.lits {
-		switch compareValue(n.fam, v, opEq, l) {
+		switch compareValue(n.fam, v, opEq, l, n.collation) {
 		case truthTrue:
 			res = truthTrue
 		case truthUnknown:
@@ -704,7 +748,7 @@ func (p *parser) parseComparison() (node, error) {
 	if err := checkComparable(col, info, op, lit); err != nil {
 		return nil, err
 	}
-	return cmpNode{column: strings.ToLower(col), op: op, fam: info.Family, lit: lit}, nil
+	return cmpNode{column: strings.ToLower(col), op: op, fam: info.Family, lit: lit, collation: info.Collation}, nil
 }
 
 func (p *parser) parseIn(col string, info ColumnInfo, negated bool) (node, error) {
@@ -737,7 +781,7 @@ func (p *parser) parseIn(col string, info ColumnInfo, negated bool) (node, error
 			if len(lits) == 0 {
 				return nil, fmt.Errorf("empty IN list on column %q", col)
 			}
-			return inNode{column: strings.ToLower(col), fam: info.Family, lits: lits, negated: negated}, nil
+			return inNode{column: strings.ToLower(col), fam: info.Family, lits: lits, negated: negated, collation: info.Collation}, nil
 		default:
 			return nil, fmt.Errorf("expected ',' or ')' in IN list on column %q, got %q", col, p.peek().text)
 		}
@@ -854,8 +898,8 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 		if lit.kind != litString {
 			return fmt.Errorf("string column %q compared to a non-string literal", col)
 		}
-		if !info.CaseSensitive {
-			return fmt.Errorf("string column %q has a case/accent-insensitive (or unknown) collation, so a client-side byte comparison could diverge from the source's own evaluation; normalize the value on the source and filter on that", col)
+		if !info.faithfulString() {
+			return fmt.Errorf("string column %q has a case/accent-insensitive or unknown collation whose `=` sluice cannot reproduce faithfully client-side (an unrecognized or absent collation, or --where-strict-collation is set), so a comparison could diverge from the source's own evaluation; use a recognized collation, normalize the value on the source and filter on that, or drop --where-strict-collation", col)
 		}
 		return nil
 	case FamilyBinary:
@@ -883,14 +927,14 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 // column's family. Any value that does not match the contract for its
 // family (a bug upstream, or a NaN/Inf float) yields UNKNOWN rather than a
 // guessed answer.
-func compareValue(fam Family, value any, op cmpOp, lit literal) truth {
+func compareValue(fam Family, value any, op cmpOp, lit literal, collation collationID) truth {
 	switch fam {
 	case FamilyNumeric:
 		return compareNumeric(value, op, lit)
 	case FamilyBool:
 		return compareBool(value, op, lit)
 	case FamilyString:
-		return compareString(value, op, lit)
+		return compareString(value, op, lit, collation)
 	case FamilyBinary:
 		return compareBinary(value, op, lit)
 	case FamilyTemporal:
@@ -958,12 +1002,20 @@ func compareBool(value any, op cmpOp, lit literal) truth {
 	}
 }
 
-func compareString(value any, op cmpOp, lit literal) truth {
+func compareString(value any, op cmpOp, lit literal, collation collationID) truth {
 	s, ok := value.(string)
 	if !ok {
 		return truthUnknown
 	}
-	equal := s == lit.str
+	// ADR-0174 Piece 1: under a resolved case/accent-insensitive collation,
+	// reproduce the source's `=` via Vitess's own comparator; otherwise the
+	// column's `=` is byte-exact (the compile gate proved one of these).
+	var equal bool
+	if collation != 0 {
+		equal = collationEqual(s, lit.str, collation)
+	} else {
+		equal = s == lit.str
+	}
 	switch op {
 	case opEq:
 		return boolToTruth(equal)

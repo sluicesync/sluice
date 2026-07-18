@@ -82,6 +82,27 @@ func TestParseWhereFilters(t *testing.T) {
 	})
 }
 
+// TestWhereStrictCollationFlag pins that --where-strict-collation parses onto
+// the sync-start field and defaults OFF (faithful mode) — the zero-value-safe
+// default (ADR-0174). Pinned through the real kong parser (the Bug-180
+// lesson) so a dropped tag or an inverted default is caught loudly.
+func TestWhereStrictCollationFlag(t *testing.T) {
+	base := "sync start --source-driver=mysql --source=src --target-driver=postgres --target=tgt"
+
+	t.Run("defaults off (faithful mode)", func(t *testing.T) {
+		cli := parseInto(t, strings.Fields(base)...)
+		if cli.Sync.Start.WhereStrictCollation {
+			t.Fatal("WhereStrictCollation defaulted true; the faithful default must be the zero value")
+		}
+	})
+	t.Run("flag sets it", func(t *testing.T) {
+		cli := parseInto(t, append(strings.Fields(base), "--where-strict-collation")...)
+		if !cli.Sync.Start.WhereStrictCollation {
+			t.Fatal("--where-strict-collation did not bind WhereStrictCollation=true")
+		}
+	})
+}
+
 // TestAllowDegradedFKsFlagSpelling pins that the flag surfaced by the --where
 // FK-orphan path parses under the spelling the docs, --help, and the
 // SLUICE-E-WHERE-FK-ORPHAN hint all recommend. Without an explicit name: tag,

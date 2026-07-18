@@ -53,7 +53,7 @@ type whereCDCFilter struct {
 // that cannot be faithfully evaluated client-side is refused loudly with a
 // [sluicecode.CodeWhereCDCUnsupportedPredicate] coded error; a `--where`
 // key that names no source table is refused too (it can never take effect).
-func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema *ir.Schema) (*whereCDCFilter, error) {
+func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema *ir.Schema, strictCollation bool) (*whereCDCFilter, error) {
 	if len(rowFilters) == 0 {
 		return nil, nil
 	}
@@ -79,7 +79,7 @@ func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema
 				),
 			)
 		}
-		infos := rowpredicate.ColumnInfosFromIR(engineName, tbl.Columns)
+		infos := rowpredicate.ColumnInfosFromIR(engineName, tbl.Columns, strictCollation)
 		p, err := rowpredicate.Compile(table, predicate, infos)
 		if err != nil {
 			return nil, err
@@ -399,7 +399,7 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema for --where preflight: %w", err))
 	}
-	filter, err := buildWhereCDCFilter(s.Source.Name(), s.RowFilters, schema)
+	filter, err := buildWhereCDCFilter(s.Source.Name(), s.RowFilters, schema, s.WhereStrictCollation)
 	if err != nil {
 		return err
 	}

@@ -800,6 +800,14 @@ type Streamer struct {
 	// byte-identical unfiltered default.
 	RowFilters map[string]string
 
+	// WhereStrictCollation opts OUT of ADR-0174 Piece 1's faithful
+	// case/accent-insensitive comparison (the --where-strict-collation flag):
+	// when true, a string `--where` on a non-byte-exact collation is refused
+	// at sync-start, the pre-0174 strict behavior. Zero value (false) is the
+	// common, faithful default — every construction path that never sets it
+	// gets the useful behavior, not the strict one (the v0.99.51 trap).
+	WhereStrictCollation bool
+
 	// PositionFromManifestStore is the [irbackup.Store] the chain
 	// terminal position is read from when the operator passes
 	// `--position-from-manifest=<chain-url>`. The Streamer uses the

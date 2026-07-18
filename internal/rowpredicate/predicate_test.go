@@ -265,7 +265,7 @@ func TestColumnInfosFromIR(t *testing.T) {
 	}
 
 	t.Run("mysql-family: empty collation is NOT case-sensitive", func(t *testing.T) {
-		m := ColumnInfosFromIR("mysql", cols)
+		m := ColumnInfosFromIR("mysql", cols, false)
 		wantFamily(t, m, "i", FamilyNumeric)
 		wantFamily(t, m, "d", FamilyNumeric)
 		wantFamily(t, m, "f", FamilyNumeric)
@@ -287,8 +287,38 @@ func TestColumnInfosFromIR(t *testing.T) {
 	})
 
 	t.Run("postgres: empty collation IS case-sensitive (deterministic =)", func(t *testing.T) {
-		m := ColumnInfosFromIR("postgres", cols)
+		m := ColumnInfosFromIR("postgres", cols, false)
 		wantStringCS(t, m, "vc_empty", true)
+	})
+
+	// ADR-0174 Piece 1: a recognized ci/ai collation resolves to a faithful
+	// comparator (non-strict), so its string comparison is ALLOWED, not
+	// refused — while an unknown/empty collation stays unreproducible.
+	t.Run("mysql-family: recognized ci collation is faithfully reproducible", func(t *testing.T) {
+		m := ColumnInfosFromIR("mysql", cols, false)
+		if !m["vc_ci"].faithfulString() || m["vc_ci"].Collation == 0 {
+			t.Errorf("vc_ci (utf8mb4_0900_ai_ci): want a resolved faithful collation, got Collation=%d faithful=%v", m["vc_ci"].Collation, m["vc_ci"].faithfulString())
+		}
+		if m["vc_empty"].faithfulString() {
+			t.Error("vc_empty (unknown collation): must NOT be faithful — an unknown collation can't be reproduced")
+		}
+		// A byte-exact column carries no collation (byte compare is faithful).
+		if m["vc_bin"].Collation != 0 {
+			t.Errorf("vc_bin: byte-exact column should carry no collation, got %d", m["vc_bin"].Collation)
+		}
+	})
+
+	// --where-strict-collation: even a recognized ci collation is left
+	// unreproducible, so its comparison refuses (the operator's strict opt-out).
+	t.Run("strict mode: recognized ci collation is NOT reproduced", func(t *testing.T) {
+		m := ColumnInfosFromIR("mysql", cols, true)
+		if m["vc_ci"].faithfulString() {
+			t.Error("vc_ci under strict mode: must NOT be faithful (strict forces refusal)")
+		}
+		// Byte-exact columns are still fine under strict.
+		if !m["vc_bin"].faithfulString() {
+			t.Error("vc_bin under strict mode: byte-exact should still be faithful")
+		}
 	})
 }
 
