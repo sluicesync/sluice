@@ -179,6 +179,17 @@ func TestMigrate_PG_CrossTablePool_ManyTables_ZeroLossAndFaster(t *testing.T) {
 	t.Logf("cross-table pool: serial(table=1)=%s parallel(table=6)=%s speedup=%.2fx",
 		serialElapsed, parElapsed, speedup)
 
+	// The zero-loss assertions above are the correctness guarantee. The
+	// wall-clock speedup below is a perf assertion, and it is only meaningful
+	// WITHOUT -race: the race detector serializes memory access and adds large
+	// per-access overhead, which erases a parallel path's speedup on a shared
+	// CI runner (observed parallel measuring 1.6x SLOWER under -race — a flake,
+	// not a regression). So skip the timing comparison under -race; it still
+	// runs on a plain `go test -tags=integration` (local + non-race CI).
+	if testRaceEnabled {
+		t.Logf("-race active: skipping the speedup assertion (timing is dominated by the detector; zero-loss above is the guarantee)")
+		return
+	}
 	if parElapsed >= serialElapsed {
 		t.Errorf("cross-table pool was not faster: serial=%s parallel=%s (speedup=%.2fx)",
 			serialElapsed, parElapsed, speedup)
