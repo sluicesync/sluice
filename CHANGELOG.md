@@ -22,7 +22,7 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.99.278] - 2026-07-18
 
-> ⚠️ **Known silent-loss issue — upgrade to v0.99.279.** A post-release audit found `sync --where` **string** filters mis-evaluate on **PAD SPACE collations** (legacy defaults: `utf8mb4_general_ci`, `utf8mb4_bin`, `latin1_swedish_ci`) — a trailing-whitespace-only difference (`'EU'` vs `'EU '`) can be silently dropped/leaked in continuous filtered sync. Not affected: `utf8mb4_0900_ai_ci` (NO PAD), Postgres defaults, `migrate --where` (source-evaluated), non-string filters. See `workspace/repo-audit-2026-07-18.md` F0-1; fixed in v0.99.279.
+> ⚠️ **Superseded by v0.99.279 — silent-loss fix; upgrade.** A post-release audit found `sync --where` **string** filters mis-evaluated on **PAD SPACE collations** (legacy defaults: `utf8mb4_general_ci`, `utf8mb4_bin`, `latin1_swedish_ci`) — a trailing-whitespace-only difference (`'EU'` vs `'EU '`) could be silently dropped/leaked in continuous filtered sync. Not affected: `utf8mb4_0900_ai_ci` (NO PAD), Postgres defaults, `migrate --where` (source-evaluated), non-string filters. Fixed in v0.99.279 (audit `workspace/repo-audit-2026-07-18.md` F0-1).
 
 Continuous **filtered sync** (`sync --where`, ADR-0173) now works across the full engine matrix — the MySQL-family gaps that live testing surfaced are closed (ADR-0174). Additive: no `--where` = unchanged behavior.
 
