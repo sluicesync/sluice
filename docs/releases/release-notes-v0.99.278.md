@@ -1,5 +1,7 @@
 # sluice v0.99.278
 
+> ⚠️ **Known silent-loss issue — upgrade to v0.99.279.** A post-release audit found that `sync --where` **string** filters mis-evaluate on **PAD SPACE collations** (the pre-8.0 / MariaDB / legacy defaults — `utf8mb4_general_ci`, `utf8mb4_bin`, `latin1_swedish_ci`, …): the client-side CDC comparator ignores the collation's trailing-space (PAD) semantics, so a value differing only by trailing whitespace (`'EU'` vs `'EU '`) can be silently dropped or leaked in continuous filtered sync. **Not affected:** the modern MySQL-8 default `utf8mb4_0900_ai_ci` (NO PAD) and Postgres default collations; **`migrate --where`** at all (it evaluates on the source under the real collation); non-string (numeric / `IN`-on-int) filters. **Action:** upgrade to v0.99.279 when available, or until then avoid `sync --where` string filters on a PAD SPACE column (use `migrate --where`, or filter on a NO-PAD `utf8mb4_0900_*` column). Details: audit `workspace/repo-audit-2026-07-18.md` F0-1.
+
 **Continuous filtered sync now works everywhere.** `sync --where` (row-level filtering, ADR-0173) previously refused on MySQL-family sources for two reasons that live testing surfaced; this release makes it *work* — faithfully — across the full engine matrix (ADR-0174). Fully additive: without `--where`, nothing changes.
 
 ## Added
