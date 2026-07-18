@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.279] - 2026-07-18
+
+**Silent-loss fix for `sync --where` string filters (supersedes v0.99.278).** A post-release audit found the ADR-0174 client-side collation comparator diverges from the source's own `=` on several axes, silently dropping or leaking rows in continuous filtered sync. If you use `sync --where` with a **string** filter, upgrade. `migrate --where` was never affected (it evaluates on the source). No change to any path that doesn't use `--where`.
+
+### Fixed
+
+- **PAD SPACE collations (the Critical) — trailing-whitespace rows no longer silently dropped/leaked.** The comparator (Vitess `evalengine.NullsafeCompare`) applied NO-PAD-SPACE semantics regardless of a collation's real `PAD_ATTRIBUTE`, so on any **PAD SPACE** collation (every legacy collation — `utf8mb4_general_ci`, `utf8mb4_bin`, `latin1_*`, …) a value differing only by trailing whitespace (`'EU'` vs `'EU '`) was classified out-of-scope by the CDC leg but in-scope by the source's own `WHERE` — a silent, exit-0 row drop/leak in `sync --where` on the *legacy default* collation, ground-truthed against real MySQL 8.0. The comparator now right-trims ASCII spaces on a PAD SPACE column (both the case/accent-insensitive and the byte-exact `_bin` paths) so it reproduces the source's PAD SPACE `=`; NO-PAD collations (`*_0900_*`, `binary`) are unchanged. Non-UTF-8 charset collations (`latin1`, …), which the comparator would mis-decode, and Postgres named (possibly non-deterministic ICU) collations, which it can't prove, now **refuse loudly** at sync-start rather than compare wrongly. **The root cause was a test gap** — the shipped tests verified Vitess's comparator against itself, never a real server; this release adds a real-MySQL collation family×shape matrix (every family × trailing-space / case / accent / expansion shape, ground-truthed against an actual server's `WHERE`) as the standing gate.
+
+- **`migrate` / `verify --where` table-key validation — a typo no longer silently copies the whole table.** The plain migrate/verify readers matched the `--where` key by exact table name, so a typo (`--where user=…` missing the `s`) or a case-fold mismatch silently disabled the filter and copied/counted the **whole** table — and `verify`, riding the same lookup, then reported a false PASS. `--where` keys are now validated against the source schema at migrate/verify start (case-insensitive, canonicalized), refusing an unmatched key loudly (`SLUICE-E-WHERE-UNKNOWN-TABLE`), matching the continuous-sync leg that already did.
+
+- **Float-equality filters refused.** `=` / `!=` / `IN` on a `FLOAT`/`DOUBLE` column is now refused at compile time (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`): the client compares the literal exactly while the source coerces it to a 64-bit double, so a high-precision literal could orphan a row. Ordering (`<`/`>`) on floats is unchanged.
+
+### Compatibility
+
+- **No behavior change without `--where`.** For `sync --where` string filters: PAD SPACE collations now evaluate correctly (previously silent-loss); non-UTF-8-charset and Postgres named collations now refuse loudly (previously silently wrong) — if you hit one, use `migrate --where` (source-evaluated, any collation), a NO-PAD `utf8mb4_0900_*` column, or normalize the value on the source. `migrate --where` / `verify --where` now refuse a `--where` key that names no source table (previously a silent whole-table copy).
+
 ## [0.99.278] - 2026-07-18
 
 > ⚠️ **Known silent-loss issue — upgrade to v0.99.279.** A post-release audit found `sync --where` **string** filters mis-evaluate on **PAD SPACE collations** (legacy defaults: `utf8mb4_general_ci`, `utf8mb4_bin`, `latin1_swedish_ci`) — a trailing-whitespace-only difference (`'EU'` vs `'EU '`) can be silently dropped/leaked in continuous filtered sync. Not affected: `utf8mb4_0900_ai_ci` (NO PAD), Postgres defaults, `migrate --where` (source-evaluated), non-string filters. See `workspace/repo-audit-2026-07-18.md` F0-1; fixed in v0.99.279.
