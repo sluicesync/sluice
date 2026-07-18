@@ -306,7 +306,7 @@ jobs:
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-skip '^(TestMigrate_|TestStreamer_)'"
           - name: engines-mysql
-            packages: "./internal/engines/mysql/..."
+            packages: "./internal/engines/mysql/... ./internal/rowpredicate/"
             goflags: ""
           - name: engines-postgres-and-rest
             packages: "./internal/engines/postgres/... ./internal/engines/pgtrigger/... ./internal/engines/mydumper/... ./internal/engines/flatfile/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/... ./internal/notify/..."

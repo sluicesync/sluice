@@ -148,6 +148,57 @@ func TestApplyRowFilters(t *testing.T) {
 	})
 }
 
+// TestValidateRowFilterKeys pins audit F0-4: a --where key naming no source
+// table is refused with the coded error; a correct key (in any casing) is
+// accepted and canonicalized to the schema's table casing so the readers'
+// exact-case lookups hit; a case-variant duplicate is refused.
+func TestValidateRowFilterKeys(t *testing.T) {
+	schema := &ir.Schema{Tables: []*ir.Table{
+		{Name: "Users"}, // schema casing preserved (e.g. a quoted PG relname)
+		{Name: "orders"},
+	}}
+
+	t.Run("empty is a no-op", func(t *testing.T) {
+		out, err := migcore.ValidateRowFilterKeys(schema, nil)
+		if err != nil || out != nil {
+			t.Fatalf("got (%v, %v); want (nil, nil)", out, err)
+		}
+	})
+
+	t.Run("unknown table refuses with coded error naming the key", func(t *testing.T) {
+		_, err := migcore.ValidateRowFilterKeys(schema, map[string]string{"user": "country = 'US'"})
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeWhereFilterUnknownTable {
+			t.Fatalf("want %s; got %v", sluicecode.CodeWhereFilterUnknownTable, err)
+		}
+		if !strings.Contains(err.Error(), "user") {
+			t.Errorf("refusal %q does not name the mistyped key", err.Error())
+		}
+	})
+
+	t.Run("correct key is canonicalized to schema casing", func(t *testing.T) {
+		// Operator passes a lower-cased key; the schema table is "Users".
+		out, err := migcore.ValidateRowFilterKeys(schema, map[string]string{"users": "country = 'US'"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, ok := out["Users"]; !ok || got != "country = 'US'" {
+			t.Errorf("canonicalized map = %v; want key \"Users\" -> predicate", out)
+		}
+		if _, staleKey := out["users"]; staleKey {
+			t.Errorf("stale lower-cased key survived canonicalization: %v", out)
+		}
+	})
+
+	t.Run("case-variant duplicate refuses", func(t *testing.T) {
+		_, err := migcore.ValidateRowFilterKeys(schema, map[string]string{"orders": "a = 1", "Orders": "b = 2"})
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeWhereFilterUnknownTable {
+			t.Fatalf("want %s; got %v", sluicecode.CodeWhereFilterUnknownTable, err)
+		}
+	})
+}
+
 func TestRawCopyGate_RowFilterForcesIRPath(t *testing.T) {
 	// Same-engine, no other transform, but a --where filter present: the
 	// raw byte-pipe would bypass the predicate, so the gate must refuse it.

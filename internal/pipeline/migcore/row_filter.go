@@ -5,9 +5,73 @@ package migcore
 
 import (
 	"fmt"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// ValidateRowFilterKeys checks every `--where TABLE=<predicate>` key names a
+// real table in the (already table-scoped) source schema and returns the
+// filter map RE-KEYED to the schema's canonical table casing, so the readers'
+// exact-case `rowFilters[table.Name]` lookups always hit (audit F0-4/M-Q1).
+//
+// The plain migrate/verify/cold-start readers look the predicate up by exact
+// table name; without this gate a typo (`--where user=...` missing the `s`) or
+// a case-fold mismatch (`--where Users=...` against a lower-cased PG relname)
+// finds no predicate, silently drops the WHERE, and copies/counts the WHOLE
+// table — a scope-escape that `verify`, riding the same lookup, would then
+// confirm as a false PASS. An unmatched key is refused loudly with a coded
+// [sluicecode.CodeWhereFilterUnknownTable] error, mirroring the CDC sibling
+// ([buildWhereCDCFilter]) and `--map`'s unknown-table rejection.
+//
+// Matching is case-insensitive. Two keys that fold to the same schema table
+// are refused (the same duplicate hazard [parseWhereFilters] guards at the
+// argv layer, but reachable here via case-variants that pass argv-level exact
+// dedup). A nil/empty map returns (nil, nil) unchanged — the common
+// unfiltered path never allocates.
+func ValidateRowFilterKeys(schema *ir.Schema, filters map[string]string) (map[string]string, error) {
+	if len(filters) == 0 {
+		return filters, nil
+	}
+	// Canonical (schema-cased) name keyed by its lower-cased form.
+	canon := make(map[string]string, len(schema.Tables))
+	for _, t := range schema.Tables {
+		if t != nil {
+			canon[strings.ToLower(t.Name)] = t.Name
+		}
+	}
+	out := make(map[string]string, len(filters))
+	for key, predicate := range filters {
+		name, ok := canon[strings.ToLower(strings.TrimSpace(key))]
+		if !ok {
+			return nil, sluicecode.Wrap(
+				sluicecode.CodeWhereFilterUnknownTable,
+				"correct the --where table name (matching is case-insensitive) or remove the entry; pass the same --where to migrate and verify",
+				fmt.Errorf(
+					"--where names table %q, which is not in the source schema "+
+						"(it may be misspelled or excluded by --include/--exclude-table); the readers match "+
+						"the filter by exact table name, so an unmatched key would silently disable the filter "+
+						"and copy/count the whole table",
+					key,
+				),
+			)
+		}
+		if _, dup := out[name]; dup {
+			return nil, sluicecode.Wrap(
+				sluicecode.CodeWhereFilterUnknownTable,
+				"give the table a single --where entry (combine conditions with AND)",
+				fmt.Errorf(
+					"--where names table %q more than once (case-insensitively); two predicates for one "+
+						"table would silently keep only one",
+					name,
+				),
+			)
+		}
+		out[name] = predicate
+	}
+	return out, nil
+}
 
 // ApplyRowFilters threads the operator's per-table `--where` predicates
 // (ADR-0173 Phase 1) onto a freshly-opened SOURCE reader — an

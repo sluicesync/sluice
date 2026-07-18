@@ -283,15 +283,6 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	if !ok {
 		return nil, fmt.Errorf("verify: source engine %q does not support data verification (no ir.Verifier implementation)", v.Source.Name())
 	}
-	// ADR-0173 Phase 1: thread the operator's --where predicates onto the
-	// SOURCE verifier only, so count/sample compares matching-source rows
-	// against the (already-filtered) target subset. Applying to the target
-	// verifier would be wrong — the target holds only the filtered rows and
-	// must be counted whole. A source engine that can't push it down is
-	// refused loudly here, before any counting.
-	if err := migcore.ApplyRowFilters(sr, v.RowFilters, v.Source.Name()); err != nil {
-		return nil, err
-	}
 	tgtVerifier, ok := tr.(ir.Verifier)
 	if !ok {
 		return nil, fmt.Errorf("verify: target engine %q does not support data verification (no ir.Verifier implementation)", v.Target.Name())
@@ -305,6 +296,24 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		return nil, errors.New("verify: source schema has no tables")
 	}
 	if err := migcore.ApplyTableFilter(ctx, srcSchema, v.Filter); err != nil {
+		return nil, err
+	}
+
+	// ADR-0173 Phase 1 + audit F0-4: validate the --where keys against the
+	// (table-scoped) source schema and canonicalize them to the schema's own
+	// table casing BEFORE threading them onto the SOURCE verifier. Without the
+	// gate a typo'd or mis-cased key silently disables the filter and verify
+	// counts the WHOLE source against the (correctly filtered) target — a false
+	// MISMATCH, or worse a false PASS confirming an over-copied migrate that
+	// rode the identical unvalidated lookup. Applying to the source verifier
+	// only is deliberate: the target holds just the filtered rows and must be
+	// counted whole. A source engine that can't push it down is refused loudly
+	// here, before any counting.
+	canonFilters, err := migcore.ValidateRowFilterKeys(srcSchema, v.RowFilters)
+	if err != nil {
+		return nil, err
+	}
+	if err := migcore.ApplyRowFilters(sr, canonFilters, v.Source.Name()); err != nil {
 		return nil, err
 	}
 

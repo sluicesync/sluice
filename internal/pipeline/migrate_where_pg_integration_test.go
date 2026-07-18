@@ -324,6 +324,77 @@ func TestMigrate_WhereFilter_KeyMatchesSourceUnderTargetRename(t *testing.T) {
 
 // runWhereMigrate runs a same-engine PG migrate, filling in the engine +
 // DSN fields the caller left on the Migrator.
+// TestMigrate_WhereFilter_UnknownTableKey_Refused pins audit F0-4 THROUGH the
+// real migrate/verify path: a --where key naming no source table (a typo)
+// refuses loudly with the coded error before any copy, instead of silently
+// dropping the WHERE and copying/counting the whole table — while a correctly
+// named key in a DIFFERENT casing is canonicalized and still filters.
+func TestMigrate_WhereFilter_UnknownTableKey_Refused(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgres(t)
+	defer cleanup()
+	applyPGDDL(t, sourceDSN, whereSeedPG)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	t.Run("migrate refuses a typo'd key before any copy", func(t *testing.T) {
+		tgt := freshPGTarget(t, sourceDSN, "where_typo_migrate")
+		m := &Migrator{
+			Source: pgEng, Target: pgEng,
+			SourceDSN: sourceDSN, TargetDSN: tgt,
+			RowFilters: map[string]string{"user": "region = 'US'"}, // typo: missing 's'
+		}
+		err := m.Run(ctx)
+		ce, coded := sluicecode.FromError(err)
+		if !coded || ce.Code != sluicecode.CodeWhereFilterUnknownTable {
+			t.Fatalf("want coded %s; got %v", sluicecode.CodeWhereFilterUnknownTable, err)
+		}
+		// The refusal must fire before the copy: no users table on the target.
+		if got := pgScalarInt(t, tgt, `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='users'`); got != 0 {
+			t.Errorf("users table exists on target (%d) despite the refusal — it must fire before any copy", got)
+		}
+	})
+
+	t.Run("case-insensitive key is canonicalized and still filters", func(t *testing.T) {
+		tgt := freshPGTarget(t, sourceDSN, "where_caseinsensitive_migrate")
+		m := &Migrator{
+			Source: pgEng, Target: pgEng,
+			SourceDSN: sourceDSN, TargetDSN: tgt,
+			// Upper-case key vs the lower-case relname; widgets has no FK so a
+			// partial filter can't orphan anything (isolates the casing axis).
+			RowFilters: map[string]string{"WIDGETS": "name = 'a'"},
+		}
+		if err := m.Run(ctx); err != nil {
+			t.Fatalf("upper-case key must canonicalize + filter, got: %v", err)
+		}
+		if got := pgScalarInt(t, tgt, `SELECT COUNT(*) FROM widgets`); got != 1 {
+			t.Errorf("target widgets = %d; want 1 (a case-variant key must still filter, not copy all 3)", got)
+		}
+	})
+
+	t.Run("verify refuses a typo'd key (cannot confirm an over-copy)", func(t *testing.T) {
+		tgt := freshPGTarget(t, sourceDSN, "where_typo_verify")
+		// A clean full copy so verify has something to count.
+		runWhereMigrate(t, pgEng, sourceDSN, tgt, &Migrator{})
+		v := &Verifier{
+			Source: pgEng, Target: pgEng,
+			SourceDSN: sourceDSN, TargetDSN: tgt,
+			Depth:      VerifyDepthCount,
+			RowFilters: map[string]string{"order": "region = 'US'"}, // typo: missing 's'
+			Out:        &strings.Builder{},
+		}
+		_, err := v.Run(ctx)
+		ce, coded := sluicecode.FromError(err)
+		if !coded || ce.Code != sluicecode.CodeWhereFilterUnknownTable {
+			t.Fatalf("want coded %s; got %v", sluicecode.CodeWhereFilterUnknownTable, err)
+		}
+	})
+}
+
 func runWhereMigrate(t *testing.T, eng ir.Engine, sourceDSN, targetDSN string, mig *Migrator) {
 	t.Helper()
 	mig.Source = eng

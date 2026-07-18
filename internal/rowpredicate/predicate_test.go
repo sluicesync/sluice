@@ -40,6 +40,39 @@ func mustRefuse(t *testing.T, predicate string, infos map[string]ColumnInfo) {
 	}
 }
 
+// TestFloatEqualityRefused pins audit F0-5: `=`/`!=`/`<>`/`IN`/`NOT IN` on a
+// FLOAT/DOUBLE column is refused at compile time (the client's exact big.Rat
+// compare vs the source's IEEE-754 coercion diverge on a high-precision
+// literal), while ordering (`<`/`<=`/`>`/`>=`) stays allowed. Built through
+// ColumnInfosFromIR from ir.Float so the FamilyFloat routing is exercised, not
+// a hand-set family.
+func TestFloatEqualityRefused(t *testing.T) {
+	floatCol := ColumnInfosFromIR("mysql", []*ir.Column{{Name: "x", Type: ir.Float{}}}, false)
+	for _, pred := range []string{
+		"x = 0.1",
+		"x != 0.1",
+		"x <> 0.1",
+		"x IN (0.1, 0.2)",
+		"x NOT IN (0.1, 0.2)",
+	} {
+		t.Run("refuse "+pred, func(t *testing.T) {
+			mustRefuse(t, pred, floatCol)
+		})
+	}
+	for _, pred := range []string{
+		"x > 0.1",
+		"x >= 0.1",
+		"x < 0.1",
+		"x <= 0.1",
+	} {
+		t.Run("allow "+pred, func(t *testing.T) {
+			p := mustCompile(t, pred, floatCol)
+			// Ordering still evaluates (big.Rat over the float64 value).
+			assertEval(t, p, ir.Row{"x": float64(0.05)}, pred == "x < 0.1" || pred == "x <= 0.1")
+		})
+	}
+}
+
 // TestColumns pins Predicate.Columns: the deduplicated, lower-cased set of
 // columns the predicate references across every node kind (cmp, IN, IS NULL,
 // AND/OR/NOT, parens). The filtered-sync before-image guard depends on it to
@@ -304,7 +337,7 @@ func TestColumnInfosFromIR(t *testing.T) {
 		m := ColumnInfosFromIR("mysql", cols, false)
 		wantFamily(t, m, "i", FamilyNumeric)
 		wantFamily(t, m, "d", FamilyNumeric)
-		wantFamily(t, m, "f", FamilyNumeric)
+		wantFamily(t, m, "f", FamilyFloat) // audit F0-5: Float is its own family (equality refused)
 		wantFamily(t, m, "b", FamilyBool)
 		wantStringCS(t, m, "vc_bin", true)
 		wantStringCS(t, m, "vc_ci", false)

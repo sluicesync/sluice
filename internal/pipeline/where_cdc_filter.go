@@ -482,6 +482,19 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema for --where preflight: %w", err))
 	}
+	// audit F0-4: canonicalize the --where keys to the schema's table casing
+	// (and refuse an unmatched key) BEFORE the cold-start snapshot's
+	// exact-case ApplyRowFilters lookup runs — the CDC leg keys by lower-case
+	// so it was already case-insensitive, but the snapshot reader looks up by
+	// exact table name and a mis-cased key would leave the initial snapshot
+	// UNFILTERED (a whole-table over-copy) while the CDC leg filtered. Pure
+	// pre-stream map reassignment; no concurrency. buildWhereCDCFilter's own
+	// unknown-table refusal stays as defense in depth.
+	canonFilters, err := migcore.ValidateRowFilterKeys(schema, s.RowFilters)
+	if err != nil {
+		return err
+	}
+	s.RowFilters = canonFilters
 	filter, err := buildWhereCDCFilter(s.Source.Name(), s.RowFilters, schema, s.WhereStrictCollation)
 	if err != nil {
 		return err

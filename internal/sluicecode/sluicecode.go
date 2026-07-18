@@ -117,6 +117,15 @@ const (
 
 	CodeWhereFilterFKOrphan Code = "SLUICE-E-WHERE-FK-ORPHAN"
 
+	// CodeWhereFilterUnknownTable fires at migrate/verify start when a
+	// `--where TABLE=<predicate>` key names no table in the (table-scoped)
+	// source schema — a typo, or a case-fold mismatch the readers' exact-case
+	// lookup would silently drop, disabling the filter and copying/counting
+	// the WHOLE table (scope-escape). Refusing beats a silent whole-table
+	// copy, mirroring the CDC sibling (which already refuses the same class)
+	// and `--map`'s unknown-table rejection.
+	CodeWhereFilterUnknownTable Code = "SLUICE-E-WHERE-UNKNOWN-TABLE"
+
 	// The two ADR-0173 Phase 2 (continuous filtered sync) refusals.
 	// CodeWhereCDCUnsupportedPredicate fires at sync-start when a
 	// `--where` predicate uses a construct the client-side CDC evaluator
@@ -216,7 +225,8 @@ var registry = map[Code]Info{
 
 	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},
 
-	CodeWhereFilterFKOrphan: {ClassRefusal, "a --where row filter on a parent table orphaned its children, so the deferred ADD CONSTRAINT FOREIGN KEY failed (SQLSTATE 23503) on the target — filter consistently so the referenced parent rows are copied, or pass --allow-degraded-fks to attach the FK as NOT VALID"},
+	CodeWhereFilterFKOrphan:     {ClassRefusal, "a --where row filter on a parent table orphaned its children, so the deferred ADD CONSTRAINT FOREIGN KEY failed (SQLSTATE 23503) on the target — filter consistently so the referenced parent rows are copied, or pass --allow-degraded-fks to attach the FK as NOT VALID"},
+	CodeWhereFilterUnknownTable: {ClassRefusal, "a migrate/verify --where TABLE=<predicate> key names no table in the (table-scoped) source schema — a typo or a case-fold mismatch would silently disable the filter and copy/count the whole table; correct the table name (matching is case-insensitive) or remove the --where entry"},
 
 	CodeWhereCDCUnsupportedPredicate: {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the predicate uses a construct the client-side CDC evaluator cannot faithfully evaluate (a function/subquery, an ordering or collation-sensitive string comparison, an unknown column, or unrecognized syntax) — evaluating it client-side could diverge from the source's own evaluation and silently leak or drop rows"},
 	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},

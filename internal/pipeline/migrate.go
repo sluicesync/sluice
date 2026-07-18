@@ -686,6 +686,18 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return err
 	}
 
+	// ADR-0173 Phase 1 + audit F0-4: validate the --where keys against the
+	// (table-scoped) source schema and canonicalize them to the schema's own
+	// table casing, so the readers' exact-case rowFilters[table.Name] lookups
+	// can never silently miss (which would drop the WHERE and copy the whole
+	// table). Runs before DryRun so a typo'd --where fails a plan too. A no-op
+	// on the common unfiltered path.
+	canonFilters, err := migcore.ValidateRowFilterKeys(schema, m.RowFilters)
+	if err != nil {
+		return err
+	}
+	m.RowFilters = canonFilters
+
 	if m.DryRun {
 		plan := m.buildDryRunPlan(ctx, schema)
 		if m.PlanSink != nil {

@@ -126,9 +126,19 @@ const (
 	// faithfully (Array, Set, Geometry, …) — a comparison against it is
 	// refused at compile time.
 	FamilyUnsupported Family = iota
-	// FamilyNumeric is Integer / Decimal / Float. Row values are int64,
-	// uint64, float64, or a decimal string; compared numerically.
+	// FamilyNumeric is Integer / Decimal (EXACT numerics). Row values are
+	// int64, uint64, or a decimal string; compared numerically via exact
+	// big.Rat, which reproduces the source's integer/decimal `=` faithfully.
 	FamilyNumeric
+	// FamilyFloat is Float / Double (IEEE-754). Row values are float64. It is
+	// split from FamilyNumeric because of an exact-vs-approximate divergence:
+	// the client compares the literal EXACTLY (big.Rat) while the source
+	// coerces the same literal to a 64-bit double, so a high-precision literal
+	// (e.g. `0.10000000000000001` against a stored `0.1`) is classified out of
+	// scope client-side but in scope by the source's `=`. Equality
+	// (`=`/`!=`/`IN`) is therefore REFUSED at compile time; ordering
+	// (`<`/`<=`/`>`/`>=`) is allowed (audit F0-5).
+	FamilyFloat
 	// FamilyBool is Boolean. Row value is a Go bool.
 	FamilyBool
 	// FamilyString is a text-like value compared byte-exact: Char /
@@ -201,8 +211,13 @@ func ColumnInfosFromIR(engineName string, cols []*ir.Column, strict bool) map[st
 
 func columnInfoFor(engineName string, c *ir.Column, strict bool) ColumnInfo {
 	switch t := c.Type.(type) {
-	case ir.Integer, ir.Decimal, ir.Float:
+	case ir.Integer, ir.Decimal:
 		return ColumnInfo{Family: FamilyNumeric}
+	case ir.Float:
+		// Split from FamilyNumeric so `=`/`!=`/`IN` refuse (exact big.Rat vs
+		// the source's IEEE-754 coercion diverge on high-precision literals);
+		// ordering stays allowed (audit F0-5).
+		return ColumnInfo{Family: FamilyFloat}
 	case ir.Boolean:
 		return ColumnInfo{Family: FamilyBool}
 	case ir.Char:
@@ -969,6 +984,22 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 			return fmt.Errorf("numeric column %q compared to a non-numeric literal", col)
 		}
 		return nil
+	case FamilyFloat:
+		if lit.kind != litNumber {
+			return fmt.Errorf("floating-point column %q compared to a non-numeric literal", col)
+		}
+		if !op.isOrdering() {
+			// opEq / opNe (and IN, which checks each member with opEq) on a
+			// float column cannot be reproduced faithfully client-side: the
+			// evaluator compares the literal EXACTLY (big.Rat) while the source
+			// coerces it to a 64-bit double, so a high-precision literal like
+			// 0.10000000000000001 diverges from a stored 0.1 (audit F0-5).
+			return fmt.Errorf("equality (=, !=, IN) on floating-point column %q cannot be evaluated faithfully client-side: "+
+				"the client compares the literal exactly while the source coerces it to an IEEE-754 double, so a high-precision "+
+				"literal can diverge (0.10000000000000001 vs a stored 0.1) — use an ordering comparison (<, <=, >, >=) or a range, "+
+				"or filter on a non-float column", col)
+		}
+		return nil
 	case FamilyBool:
 		if op.isOrdering() {
 			return fmt.Errorf("ordering comparison on boolean column %q is not supported (use = / !=)", col)
@@ -1018,7 +1049,9 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 // guessed answer.
 func compareValue(fam Family, value any, op cmpOp, lit literal, collation collationID, padSpace bool) truth {
 	switch fam {
-	case FamilyNumeric:
+	case FamilyNumeric, FamilyFloat:
+		// FamilyFloat only reaches here for ordering ops (equality is refused
+		// at compile time); big.Rat ordering of the float64 value is faithful.
 		return compareNumeric(value, op, lit)
 	case FamilyBool:
 		return compareBool(value, op, lit)
