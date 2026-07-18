@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.276] - 2026-07-18
+
+Row-level filtering — migrate or continuously sync **only the rows you want**, via a per-table `--where` predicate (ADR-0173). A new user-facing capability; fully additive (no `--where` = unchanged behavior).
+
+### Added
+
+- **`migrate --where TABLE=<predicate>` (and `verify --where`)** — copy only the rows of a table matching a native source-SQL boolean predicate (repeatable, source-keyed like `--redact`/`--type-override`). The predicate is pushed into the source read (`SELECT … WHERE <chunk_bounds> AND (<predicate>)`) and evaluated **on the source** — efficient, index-aware, no client-side row scanning — composing with the cross-table parallel copy and the keyset chunker. Use it for per-tenant / per-region carve-outs, GDPR-scoped extracts, or seeding a staging database with a realistic subset (e.g. `--where 'users=country IN (''US'',''CA'')'`). `verify --where` threads the same predicate so counts compare matching-source rows against the already-filtered target. Filtering a *parent* table orphans its children (the deferred FK add fails 23503) — sluice refuses loudly with `SLUICE-E-WHERE-FK-ORPHAN` naming the parent, or, with `--allow-degraded-fks`, degrades that constraint to `NOT VALID` (never a silent orphan). The raw-copy fast path is disabled when a filter is active (the byte-pipe would bypass the `WHERE`). The predicate is source-dialect and source-evaluated, so it is not cross-engine-portable.
+
+- **`sync --where TABLE=<predicate>` — continuous *filtered* replication.** The SAME predicate scopes BOTH legs: the cold-start snapshot pushes it down into the source read (as migrate does), and the CDC leg evaluates it client-side per change with full **row-move semantics** — an `UPDATE` that moves a row *into* scope becomes a target `INSERT`, one that moves it *out* of scope becomes a target `DELETE`, so a filtered stream never leaks an out-of-scope row nor misses a newly-in-scope one. Because there is no source-side stream filter, the CDC leg accepts a restricted, faithfully-evaluable grammar (a column compared to a literal with `= != <> < <= > >=`, `IN`, `IS [NOT] NULL`, combined with `AND`/`OR`/`NOT`); anything that could make a client-side evaluation *diverge* from the source's own — a function, a subquery, an ordering or case/accent-insensitive-collation string comparison, a timezone-aware temporal comparison — is refused loudly at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`) rather than risk a silent leak or drop. Filtered CDC requires full row before-images so the row-move can be decided on both the before and after image — MySQL `binlog_row_image=FULL`, Postgres `REPLICA IDENTITY FULL` on each filtered table — preflighted at sync-start with `SLUICE-E-WHERE-CDC-BEFORE-IMAGE` naming the table and remedy.
+
+### Compatibility
+
+- **Additive — no behavior change without `--where`.** `migrate --where` gives a one-shot filtered copy with full source-SQL; `sync --where` gives continuous filtered replication over the restricted client-side grammar. The predicate is native *source* SQL (source-dialect, not cross-engine-portable). Referential-aware auto-inclusion of FK-referenced parent rows (pg_dump `--table` / Jailer-style subsetting) is a deferred follow-on; today, filter consistently or use `--allow-degraded-fks`.
+
 ## [0.99.275] - 2026-07-17
 
 The tail of the 2026-07-17 confirming audit: a Postgres control-read resilience touch-up plus the test/coverage and CI closures that finish the audit program. No change to any successful path.
