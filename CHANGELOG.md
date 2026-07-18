@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.280] - 2026-07-18
+
+Audit-tail hardening of `--where` filtering (2026-07-18 audit, batch A) — mostly correctness/quality on top of the v0.99.279 silent-loss fix. No change to any path that doesn't use `--where`.
+
+### Added
+
+- **Deterministic Postgres named collations are re-admitted for `sync --where` string filters.** v0.99.279 conservatively refused *all* named PG collations (it couldn't tell deterministic from non-deterministic from the name alone). sluice now reads `pg_collation.collisdeterministic` and admits a **deterministic** named collation (`"C"`, `"POSIX"`, libc `en_US`, deterministic ICU) as byte-exact — while a **non-deterministic** ICU collation (`ks-level`) still refuses loudly (its collation-aware `=` can't be reproduced client-side). The default collation is unchanged. Ground-truthed by a new real-Postgres collation family matrix (asserted against PG's own `WHERE`).
+
+### Fixed / Changed
+
+- **`--where` filter throughput:** an `IN`-list on a case/accent-insensitive column now short-circuits on the first match instead of comparing every member per streamed CDC row.
+- **Loud guard for a filtered cold-start:** a source engine that supports table-scoped snapshots but not the filtered-snapshot open now refuses a filtered `sync --where` at start rather than silently opening an unfiltered stream (no current engine hits this — it fences a future flavor).
+- **Docs + hardening:** documented the move-OUT→`DELETE`-under-`--allow-degraded-fks` orphan hazard (intrinsic to filtering a parent in continuous sync); documented the client-side collation set's MySQL-8.0.30 version pin + the `--where-strict-collation` escape for exotic self-hosted Vitess; recorded the filtered-sync stream-reduction cell (and its engine gaps) in the perf-parity matrix; added compile-time asserts so the CDC readers' full-before-image capability can't silently drift; and added a tag-push CI gate that runs the VStream filtered move-OUT cluster test before a release tag publishes.
+
+### Compatibility
+
+- **No behavior change without `--where`.** For `sync --where`: deterministic named PG collations now work (were refused in v0.99.279); non-deterministic ones still refuse. Everything else is internal hardening, docs, and CI.
+
 ## [0.99.279] - 2026-07-18
 
 **Silent-loss fix for `sync --where` string filters (supersedes v0.99.278).** A post-release audit found the ADR-0174 client-side collation comparator diverges from the source's own `=` on several axes, silently dropping or leaking rows in continuous filtered sync. If you use `sync --where` with a **string** filter, upgrade. `migrate --where` was never affected (it evaluates on the source). No change to any path that doesn't use `--where`.
