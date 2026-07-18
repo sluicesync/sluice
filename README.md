@@ -317,6 +317,8 @@ Run `sluice <command> --help` for per-command flags. DSNs can also be passed via
 
 **Migrating many namespaces in one run.** A MySQL server's databases or a Postgres source's schemas can be moved together: `--all-databases` / `--all-schemas` fan every non-system namespace out to a same-named target namespace (auto-created), and `--include-database` / `--exclude-database` (or the PG-source synonyms `--include-schema` / `--exclude-schema`) scope the set. These work on both `migrate` and `sync start` (CDC included). See [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) and [ADR-0074](docs/adr/adr-0074-multi-database-mysql-migration-and-sync.md) / [ADR-0075](docs/adr/adr-0075-postgres-source-multi-schema-migration-and-sync.md).
 
+**Copying only some rows.** A per-table `--where TABLE=<predicate>` (native source SQL, source-keyed) filters at the **row** level — the granularity below `--include-table` and `--redact`. On `migrate` the predicate is pushed down into the source read (one-shot filtered extract, full source SQL); on `sync` the same predicate scopes both the cold-start snapshot and the CDC leg, which evaluates a restricted grammar client-side with full row-move semantics (a row updated out of scope becomes a target DELETE, not a leak). Filtering a *parent* table refuses loudly on the orphaned FK unless you reconcile or pass `--allow-degraded-fks`. See [`docs/operator/filtered-subset-migration.md`](docs/operator/filtered-subset-migration.md) and [ADR-0173](docs/adr/adr-0173-row-level-where-filter.md).
+
 `trigger setup` is no longer Postgres-only: `--source-driver` selects `postgres-trigger` (default), `sqlite-trigger` (a local SQLite file), or `d1-trigger` (a live Cloudflare D1).
 
 ---
@@ -348,6 +350,7 @@ A few terms recur in the codebase and docs:
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
 - [`docs/throughput-tuning.md`](docs/throughput-tuning.md) — knobs that matter at scale
 - [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 26 strategies, determinism contracts, dictionary loader
+- [`docs/operator/filtered-subset-migration.md`](docs/operator/filtered-subset-migration.md) — copying only the rows you want with a per-table `--where` predicate (`migrate` one-shot + `sync` continuous filtered replication), the FK-orphan caveat, and the CDC row-move semantics
 - [`docs/snapshot-cdc-handoff.md`](docs/snapshot-cdc-handoff.md) — operator reference for the cold-start → CDC handoff
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — the schema-change command family (`expand-contract`, `backfill`, `deploy-ddl`, `control-tables ddl`) plus coordinating DDL against a running stream
 - [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md) — importing SQLite files / `.sql` dumps / live Cloudflare D1 into Postgres or MySQL, the lossless big-integer path, and the SQLite/D1 trigger-CDC engines
