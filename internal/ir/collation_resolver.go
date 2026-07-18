@@ -31,10 +31,14 @@ type CollationResolver interface {
 	// --where-strict-collation opt-out: when set, an engine that would
 	// otherwise reproduce a case/accent-INSENSITIVE `=` via a folding
 	// comparator must instead refuse it (byte-exact and default remain
-	// allowed). A non-faithful result ([StringEquality.Faithful] == false)
-	// means the comparison must be REFUSED loudly at compile time rather than
-	// evaluated under a guessed collation.
-	ResolveStringEquality(collation string, determinism CollationDeterminism, strict bool) StringEquality
+	// allowed). fixedChar is true for a fixed-length CHAR/bpchar column, whose
+	// `=` can have PAD-SPACE semantics distinct from a variable-length
+	// text/varchar of the same collation (Postgres bpchar `=` ignores trailing
+	// spaces regardless of collation — audit 2026-07-19 A2); a resolver whose
+	// char `=` matches its varchar `=` ignores it. A non-faithful result
+	// ([StringEquality.Faithful] == false) means the comparison must be REFUSED
+	// loudly at compile time rather than evaluated under a guessed collation.
+	ResolveStringEquality(collation string, determinism CollationDeterminism, strict, fixedChar bool) StringEquality
 }
 
 // StringEquality is the resolved client-side string-comparison policy for one
@@ -80,14 +84,19 @@ type CollationResolverProvider interface {
 // so a byte compare reproduces it; a non-deterministic ICU collation
 // (collisdeterministic=false) or an unknown-determinism named collation (the
 // safe zero value) has a collation-aware `=` sluice cannot reproduce, so it
-// refuses (audit F0-3). It carries no PAD SPACE handling — Postgres `=` is
-// trailing-space significant.
+// refuses (audit F0-3). It carries no PAD SPACE handling: text/varchar `=` is
+// trailing-space significant, and this GENERIC byte-exact lens stays
+// pad-agnostic so a family whose fixed-length CHAR does NOT pad (e.g. SQLite)
+// is correct. An engine whose CHAR/bpchar DOES pad (Postgres) layers that on in
+// its own resolver (see engines/postgres) rather than here (audit 2026-07-19 A2).
 type ByteExactCollationResolver struct{}
 
 // ResolveStringEquality implements [CollationResolver] for the byte-exact
-// (Postgres/SQLite) family. strict is ignored: byte-exact IS the strict
-// guarantee, and there is no fold path to opt out of.
-func (ByteExactCollationResolver) ResolveStringEquality(collation string, determinism CollationDeterminism, _ bool) StringEquality {
+// (Postgres/SQLite) family. strict is ignored (byte-exact IS the strict
+// guarantee, and there is no fold path to opt out of); fixedChar is ignored
+// here (the generic byte-exact lens is pad-agnostic — a padding CHAR is an
+// engine-specific override layered by the engine's own resolver).
+func (ByteExactCollationResolver) ResolveStringEquality(collation string, determinism CollationDeterminism, _, _ bool) StringEquality {
 	if collation == "" || determinism == CollationDeterministic {
 		return StringEquality{Faithful: true} // byte-exact, no pad-space
 	}

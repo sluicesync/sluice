@@ -221,11 +221,13 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) Col
 	case ir.Boolean:
 		return ColumnInfo{Family: FamilyBool}
 	case ir.Char:
-		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict)
+		// fixedChar=true: a fixed-length CHAR/bpchar may pad (Postgres bpchar
+		// `=` is PAD SPACE regardless of collation — audit 2026-07-19 A2).
+		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict, true)
 	case ir.Varchar:
-		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict)
+		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict, false)
 	case ir.Text:
-		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict)
+		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict, false)
 	case ir.Enum, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// Canonical/identifier-shaped ASCII values: the source's `=` is
 		// exact, so a byte compare is faithful (no collation resolution).
@@ -260,8 +262,8 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) Col
 // collation-library dependency (audit 2026-07-18 M2.1). A non-faithful result
 // leaves the column unreproducible, so its string comparisons refuse loudly at
 // compile time.
-func stringColumnInfo(resolver ir.CollationResolver, collation string, determinism ir.CollationDeterminism, strict bool) ColumnInfo {
-	eq := resolver.ResolveStringEquality(collation, determinism, strict)
+func stringColumnInfo(resolver ir.CollationResolver, collation string, determinism ir.CollationDeterminism, strict, fixedChar bool) ColumnInfo {
+	eq := resolver.ResolveStringEquality(collation, determinism, strict, fixedChar)
 	if !eq.Faithful {
 		return ColumnInfo{Family: FamilyString} // refuse
 	}

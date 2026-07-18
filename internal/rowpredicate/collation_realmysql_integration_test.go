@@ -24,6 +24,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -156,17 +157,46 @@ func TestRealMySQL_CollationMatrix(t *testing.T) {
 
 	// The nasty stored values: trailing/leading/internal space, case variants,
 	// accent, expansion (ß/ss), and a distinct value.
+	//
+	// A1 (audit 2026-07-19): the last four stored values are the UCA
+	// canonical-equivalence + ignorable shapes that separate a GENUINE byte-exact
+	// collation (utf8mb4_bin) from a UCA one (utf8mb4_0900_as_cs). Under
+	// _0900_as_cs MySQL's `=` treats an NFC/NFD pair and a soft-hyphen-bearing
+	// value as EQUAL (canonical equivalence / UCA-ignorable weight); a
+	// client-side byte compare does NOT. The NFC/NFD café bytes are raw UTF-8 in
+	// this source (NFC c3a9 vs NFD 65cc81); the guard just below fails loudly if a
+	// tool ever normalizes the file and collapses them. Routing _as_cs to
+	// byte-exact (HEAD) diverges here; _bin (real memcmp) agrees; ci/ai go through
+	// the Vitess fold.
 	stored := []string{
 		"EU", "EU ", "EU  ", " EU", "E U",
 		"eu", "Eu", "US",
 		"café", "cafe",
 		"ß", "ss", "STRASSE", "strasse",
+		"café",      // NFC: 'caf' + U+00E9 (precomposed e-acute)
+		"café",     // NFD: 'cafe' + U+0301 (combining acute); UCA-equal to NFC
+		"ab", "a­b", // U+00AD soft hyphen (UCA-ignorable); UCA-equal to "ab"
 	}
 	literals := []string{
 		"EU", "EU ", "eu",
 		"café", "cafe",
 		"ss", "ß", "strasse",
 		"US", " EU",
+		"café", // matches BOTH NFC+NFD stored under _0900_as_cs (UCA); only NFC byte-exact
+		"ab",   // matches BOTH "ab"+"a­b" stored under _0900_as_cs; only "ab" byte-exact
+	}
+
+	// Robustness guard for the A1 shapes: these exact byte sequences MUST survive
+	// in the source, or the _as_cs divergence goes untested. Constructed from
+	// explicit bytes so a source normalization that collapsed NFC/NFD (or
+	// stripped the soft hyphen) is caught loudly rather than silently passing.
+	nfcCafe := string([]byte{'c', 'a', 'f', 0xc3, 0xa9})      // café NFC
+	nfdCafe := string([]byte{'c', 'a', 'f', 'e', 0xcc, 0x81}) // café NFD
+	softHyphen := "a" + string([]byte{0xc2, 0xad}) + "b"      // a<U+00AD>b
+	if nfcCafe == nfdCafe || !slices.Contains(stored, nfcCafe) ||
+		!slices.Contains(stored, nfdCafe) || !slices.Contains(stored, softHyphen) {
+		t.Fatalf("A1 shape values missing/collapsed by source normalization: nfc=%x nfd=%x soft=%x",
+			nfcCafe, nfdCafe, softHyphen)
 	}
 
 	for _, coll := range collations {

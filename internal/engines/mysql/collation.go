@@ -60,8 +60,11 @@ func (Engine) CollationResolver() ir.CollationResolver { return mysqlCollationRe
 // determinism is ignored (MySQL fidelity is driven by collation name + charset,
 // not the PG determinism signal); strict is the --where-strict-collation
 // opt-out that refuses the case/accent-insensitive FOLD path (byte-exact `_bin`
-// / `_cs` stays allowed — byte-exact IS the strict guarantee).
-func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.CollationDeterminism, strict bool) ir.StringEquality {
+// stays allowed — byte-exact IS the strict guarantee). fixedChar is ignored:
+// MySQL CHAR shares the collation's PAD_ATTRIBUTE with VARCHAR (already carried
+// by collationNoPad below), unlike Postgres bpchar's collation-independent PAD
+// SPACE — so a MySQL CHAR needs no char-specific override.
+func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.CollationDeterminism, strict, _ bool) ir.StringEquality {
 	// A faithful comparison needs a KNOWN, UTF-8-charset collation: sluice
 	// delivers row values as UTF-8 bytes, so a non-UTF-8 charset (latin1, …)
 	// would be mis-decoded by the comparator (audit F0-6), and an unknown/empty
@@ -74,13 +77,18 @@ func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.Colla
 	// the source's own `=` (audit F0-1/F0-2). Carried on both the byte-exact
 	// and the ci/ai path.
 	padSpace := !collationNoPad(collation)
-	if collationCaseSensitiveMySQL(collation) {
-		// Byte-exact (_bin / _cs): faithful with PAD handling; strict is
-		// irrelevant here.
+	if collationByteExactMySQL(collation) {
+		// Byte-exact (_bin / binary): a raw memcmp reproduces the source's `=`,
+		// with PAD handling; strict is irrelevant here (byte-exact IS the strict
+		// guarantee).
 		return ir.StringEquality{Faithful: true, PadSpace: padSpace}
 	}
-	// Case/accent-insensitive: faithful via Vitess's comparator IF the
-	// collation resolves and strict mode is off; else refuse.
+	// Collation-aware — the ci/ai folds AND the case+accent-SENSITIVE UCA
+	// collations (utf8mb4_0900_as_cs and the tailored `_as_cs`/`_cs` language
+	// variants): MySQL's `=` folds canonical equivalence (NFC/NFD) and ignores
+	// UCA-ignorable code points (e.g. a soft hyphen), none of which a byte
+	// compare reproduces (audit 2026-07-19 A1). Faithful via Vitess's comparator
+	// IF the collation resolves and strict mode is off; else refuse.
 	if !strict {
 		if id, ok := resolveCollation(collation); ok {
 			cid := id
@@ -94,14 +102,19 @@ func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.Colla
 	return ir.StringEquality{}
 }
 
-// collationCaseSensitiveMySQL reports whether a MySQL collation's `=` is
-// byte-exact (case+accent sensitive), so a client-side byte compare is
-// faithful. A `*_ci` (case-insensitive) or `*_ai` (accent-insensitive)
-// collation is not; every other (`_bin`, `_cs`, …) is. The caller has already
-// excluded the empty/unknown collation (refused before reaching here).
-func collationCaseSensitiveMySQL(collation string) bool {
+// collationByteExactMySQL reports whether a MySQL collation's `=` is a raw
+// byte/codepoint comparison (memcmp), so a client-side byte compare is faithful.
+// ONLY the `_bin` collations and the `binary` pseudo-collation are byte-exact.
+// Every other collation — including the case+accent-SENSITIVE UCA collations
+// (`utf8mb4_0900_as_cs` and the `_cs`/`_as_cs`/tailored language variants) — is
+// UCA-based: MySQL's `=` folds canonical equivalence (NFC/NFD) and ignores
+// UCA-ignorable code points, which a byte compare does NOT reproduce (audit
+// 2026-07-19 A1 — a `_0900_as_cs` column silently mis-classified an NFC/NFD or
+// soft-hyphen-bearing row-move). Those route through the Vitess comparator
+// instead. The caller has already excluded the empty/unknown collation.
+func collationByteExactMySQL(collation string) bool {
 	lc := strings.ToLower(strings.TrimSpace(collation))
-	return !strings.Contains(lc, "_ci") && !strings.Contains(lc, "_ai")
+	return lc == "binary" || strings.HasSuffix(lc, "_bin")
 }
 
 // collationNoPad reports whether a collation compares with NO-PAD semantics

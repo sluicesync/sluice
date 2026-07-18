@@ -27,6 +27,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,6 +206,80 @@ func TestRealPostgres_CollationMatrix(t *testing.T) {
 			}
 		})
 	}
+
+	// ---- A2 (audit 2026-07-19): char(n)/bpchar PAD-SPACE ----
+	// Postgres char(n)/bpchar `=` is PAD SPACE (trailing-space-INSENSITIVE),
+	// UNLIKE text/varchar. Logical decoding (pgoutput bpcharout) delivers the
+	// value space-PADDED to length n, and sluice's decoder does not trim, so the
+	// client sees "EU  " for a stored "EU". On HEAD the byte-exact resolver never
+	// sets PadSpace for ir.Char, so Eval("EU  ") != 'EU' diverges from PG's own
+	// `WHERE v = 'EU'` (which MATCHES) — a silent CDC move-misclassification on
+	// PG's DEFAULT char semantics (no legacy-collation opt-in needed). This cell
+	// is RED on HEAD and GREEN once ir.Char forces PadSpace (M1-2). The Eval input
+	// is explicitly space-padded to model the padded wire value; octet_length
+	// proves PG physically pads (the bug's precondition).
+	t.Run("bpchar-padspace", func(t *testing.T) {
+		const n = 4
+		infos := ColumnInfosFromIR(testPGResolver, []*ir.Column{
+			{Name: "v", Type: ir.Char{Length: n}},
+		}, false)
+
+		mustExecPG(t, ctx, db, "DROP TABLE IF EXISTS t_bpchar")
+		mustExecPG(t, ctx, db, fmt.Sprintf("CREATE TABLE t_bpchar (id INT PRIMARY KEY, v CHAR(%d))", n))
+		bstored := []string{"EU", "US", "eu"} // ASCII, ≤ n chars
+		for i, s := range bstored {
+			if _, err := db.ExecContext(ctx, "INSERT INTO t_bpchar (id, v) VALUES ($1, $2)", i, s); err != nil {
+				t.Fatalf("insert %q: %v", s, err)
+			}
+			// Prove PG physically pads to n bytes (the A2 precondition): without
+			// padding, the client would never see trailing spaces and there'd be
+			// no divergence to catch.
+			var olen int
+			if err := db.QueryRowContext(ctx, "SELECT octet_length(v) FROM t_bpchar WHERE id = $1", i).Scan(&olen); err != nil {
+				t.Fatalf("octet_length for %q: %v", s, err)
+			}
+			if olen != n {
+				t.Fatalf("expected CHAR(%d) to pad %q to octet_length=%d, got %d (bug precondition absent)", n, s, n, olen)
+			}
+		}
+
+		for _, lit := range []string{"EU", "US", "eu"} {
+			// Ground truth: the ids PG matches with its own bpchar `=`.
+			pgMatch := map[int]bool{}
+			rows, err := db.QueryContext(ctx, "SELECT id FROM t_bpchar WHERE v = $1", lit)
+			if err != nil {
+				t.Fatalf("SELECT WHERE v=%q: %v", lit, err)
+			}
+			for rows.Next() {
+				var id int
+				if err := rows.Scan(&id); err != nil {
+					_ = rows.Close()
+					t.Fatalf("scan: %v", err)
+				}
+				pgMatch[id] = true
+			}
+			closeErr := rows.Err()
+			_ = rows.Close()
+			if closeErr != nil {
+				t.Fatalf("rows err: %v", closeErr)
+			}
+
+			p, err := Compile("t", "v = '"+doubleQuotesPG(lit)+"'", infos)
+			if err != nil {
+				t.Fatalf("Compile(v=%q) on char(%d) refused unexpectedly: %v", lit, n, err)
+			}
+			for i, s := range bstored {
+				// The wire value sluice's decoder sees: space-padded to n.
+				wire := s + strings.Repeat(" ", n-len(s))
+				want := pgMatch[i]
+				got := p.Eval(ir.Row{"v": wire})
+				if got != want {
+					t.Errorf("DIVERGENCE char(%d) storedWire=%q literal=%q: sluice.Eval=%v, PG WHERE=%v",
+						n, wire, lit, got, want)
+				}
+			}
+		}
+	})
 
 	// ---- Non-deterministic ICU collation: Compile must REFUSE ----
 	t.Run("nondeterministic ICU refuses at compile (F0-3 fence)", func(t *testing.T) {

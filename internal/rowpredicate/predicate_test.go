@@ -341,7 +341,10 @@ func TestColumnInfosFromIR(t *testing.T) {
 		wantFamily(t, m, "b", FamilyBool)
 		wantString(t, m, "vc_bin", polByteExact)
 		wantString(t, m, "vc_ci", polFold)
-		wantString(t, m, "vc_cs", polByteExact)
+		// audit 2026-07-19 A1: utf8mb4_0900_as_cs is UCA (case+accent-sensitive
+		// but folds NFC/NFD + ignorables), NOT byte-exact — only _bin/binary is.
+		// It routes through the Vitess FOLD comparator.
+		wantString(t, m, "vc_cs", polFold)
 		wantString(t, m, "vc_empty", polRefuse) // MySQL empty/unknown collation: can't reproduce → refuse
 		wantString(t, m, "u", polByteExact)
 		wantString(t, m, "net", polByteExact)
@@ -384,6 +387,20 @@ func TestColumnInfosFromIR(t *testing.T) {
 		}
 		// Default (empty) collation stays byte-exact.
 		wantString(t, m, "c_default", polByteExact)
+
+		// A2 (audit 2026-07-19): bpchar/char(n) `=` is PAD SPACE while
+		// text/varchar are trailing-space-significant, even under the same
+		// deterministic collation. The CHAR column must carry PadSpace; the
+		// text/varchar ones must not (the wrong PadSpace=false silently
+		// mis-classified a CDC row-move on PG's default char semantics).
+		if !m["ch_det"].PadSpace {
+			t.Errorf("ch_det (char): PadSpace = false; want true (bpchar `=` is PAD SPACE)")
+		}
+		for _, name := range []string{"c_det", "vc_det", "c_default"} {
+			if m[name].PadSpace {
+				t.Errorf("%s (text/varchar): PadSpace = true; want false (trailing-space significant)", name)
+			}
+		}
 	})
 
 	// ADR-0174 Piece 1: a recognized ci/ai collation resolves to a faithful

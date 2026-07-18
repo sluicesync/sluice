@@ -85,36 +85,49 @@ func TestMySQLCollationResolver_Policies(t *testing.T) {
 	det := ir.CollationDeterminismUnknown
 
 	// Byte-exact, PAD SPACE (_bin): faithful, no comparator, pad-space on.
-	if eq := r.ResolveStringEquality("utf8mb4_bin", det, false); !eq.Faithful || eq.Compare != nil || !eq.PadSpace {
+	if eq := r.ResolveStringEquality("utf8mb4_bin", det, false, false); !eq.Faithful || eq.Compare != nil || !eq.PadSpace {
 		t.Errorf("utf8mb4_bin: got %+v; want faithful byte-exact PAD SPACE", eq)
 	}
-	// Byte-exact, NO PAD (_cs 0900): faithful, no comparator, pad-space off.
-	if eq := r.ResolveStringEquality("utf8mb4_0900_as_cs", det, false); !eq.Faithful || eq.Compare != nil || eq.PadSpace {
-		t.Errorf("utf8mb4_0900_as_cs: got %+v; want faithful byte-exact NO PAD", eq)
+	// UCA case+accent-sensitive (_as_cs 0900): NOT byte-exact — MySQL's `=`
+	// folds canonical equivalence (NFC/NFD) and UCA-ignorables, so it routes
+	// through the Vitess FOLD comparator (faithful, Compare != nil), NO PAD
+	// (audit 2026-07-19 A1). Only `_bin`/binary is byte-exact.
+	if eq := r.ResolveStringEquality("utf8mb4_0900_as_cs", det, false, false); !eq.Faithful || eq.Compare == nil || eq.PadSpace {
+		t.Errorf("utf8mb4_0900_as_cs: got %+v; want faithful FOLD NO PAD (audit A1)", eq)
 	}
 	// ci fold, PAD SPACE: faithful WITH comparator, pad-space on.
-	if eq := r.ResolveStringEquality("utf8mb4_general_ci", det, false); !eq.Faithful || eq.Compare == nil || !eq.PadSpace {
+	if eq := r.ResolveStringEquality("utf8mb4_general_ci", det, false, false); !eq.Faithful || eq.Compare == nil || !eq.PadSpace {
 		t.Errorf("utf8mb4_general_ci: got %+v; want faithful fold PAD SPACE", eq)
 	}
 	// ci fold, NO PAD (0900): faithful WITH comparator, pad-space off.
-	if eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, false); !eq.Faithful || eq.Compare == nil || eq.PadSpace {
+	if eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, false, false); !eq.Faithful || eq.Compare == nil || eq.PadSpace {
 		t.Errorf("utf8mb4_0900_ai_ci: got %+v; want faithful fold NO PAD", eq)
 	}
-	// Strict mode refuses the ci fold path but keeps byte-exact.
-	if eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, true); eq.Faithful {
+	// Strict mode refuses the fold path (ci/ai AND the UCA _as_cs) but keeps
+	// byte-exact.
+	if eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, true, false); eq.Faithful {
 		t.Errorf("utf8mb4_0900_ai_ci under strict: got %+v; want refuse", eq)
 	}
-	if eq := r.ResolveStringEquality("utf8mb4_bin", det, true); !eq.Faithful || eq.Compare != nil {
+	if eq := r.ResolveStringEquality("utf8mb4_0900_as_cs", det, true, false); eq.Faithful {
+		t.Errorf("utf8mb4_0900_as_cs under strict: got %+v; want refuse (UCA fold, not byte-exact)", eq)
+	}
+	if eq := r.ResolveStringEquality("utf8mb4_bin", det, true, false); !eq.Faithful || eq.Compare != nil {
 		t.Errorf("utf8mb4_bin under strict: got %+v; want still byte-exact", eq)
+	}
+	// fixedChar is IGNORED on MySQL: a CHAR shares its collation's PAD_ATTRIBUTE
+	// with VARCHAR (Postgres bpchar's collation-independent pad is a PG-only
+	// override, not applied here), so CHAR and VARCHAR give identical policy.
+	if eq := r.ResolveStringEquality("utf8mb4_bin", det, false, true); !eq.Faithful || eq.Compare != nil || !eq.PadSpace {
+		t.Errorf("utf8mb4_bin as CHAR (fixedChar): got %+v; want identical to VARCHAR (byte-exact PAD SPACE)", eq)
 	}
 	// Refusal fences: empty + non-UTF-8 charset.
 	for _, coll := range []string{"", "latin1_swedish_ci", "gbk_chinese_ci"} {
-		if eq := r.ResolveStringEquality(coll, det, false); eq.Faithful {
+		if eq := r.ResolveStringEquality(coll, det, false, false); eq.Faithful {
 			t.Errorf("%q: got faithful %+v; want refuse (empty/non-UTF-8 charset)", coll, eq)
 		}
 	}
 	// The comparator actually folds (spot check the ci path is wired).
-	eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, false)
+	eq := r.ResolveStringEquality("utf8mb4_0900_ai_ci", det, false, false)
 	if !eq.Compare("EU", "eu") || eq.Compare("EU", "US") {
 		t.Error("ci comparator did not fold case as expected")
 	}

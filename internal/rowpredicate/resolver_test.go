@@ -7,17 +7,19 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines/mysql"
-	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // Test resolvers for the collation-driven fidelity tests. These are the REAL
 // production resolvers the pipeline threads: MySQL's Vitess-backed resolver
 // (audit M2.1 — it lives in the engine now, not this package) and Postgres's
-// byte-exact-or-refuse determinism resolver. Importing the mysql engine in a
-// rowpredicate test is cycle-free (mysql imports ir, never rowpredicate).
+// determinism + bpchar-PAD-SPACE resolver (audit 2026-07-19 A2 — the real PG
+// resolver, NOT the generic ir.ByteExactCollationResolver, so the bpchar pad
+// behavior is exercised). Importing the engines in a rowpredicate test is
+// cycle-free (they import ir, never rowpredicate).
 var (
-	testMySQLResolver                      = mysql.Engine{}.CollationResolver()
-	testPGResolver    ir.CollationResolver = ir.ByteExactCollationResolver{}
+	testMySQLResolver = mysql.Engine{}.CollationResolver()
+	testPGResolver    = postgres.Engine{}.CollationResolver()
 )
 
 // stringPolicy is the resolved client-side string-comparison policy a
