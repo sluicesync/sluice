@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,8 +66,9 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	// binlog (empty-Gtid sentinel, no mid-COPY cursor). The shard layout
 	// is resolved inside openVStreamSnapshotStreamFrom — passing nil tells
 	// it to seed from-beginning against the resolved layout. The nil
-	// tables arg keeps the keyspace-wide COPY (every table).
-	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, nil)
+	// tables arg keeps the keyspace-wide COPY (every table). No --where
+	// filters on the default open (nil rowFilters).
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, nil, nil)
 }
 
 // vstreamCopyFilterRules builds the VStream COPY filter rules. With no
@@ -75,13 +77,38 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 // `select * from <t>` Filter) so vtgate's COPY scans only those tables —
 // a large unrelated table in the same keyspace is never streamed/buffered
 // (avoids the ADR-0071 multi-table interleaving buffer overflow).
-func vstreamCopyFilterRules(tables []string) []*binlogdata.Rule {
+//
+// filters (ADR-0174 Piece 2, `sync --where`) maps SOURCE table name to a
+// native-SQL predicate; a table with a non-empty entry gets a
+// `select * from <t> where (<pred>)` Filter so vtgate evaluates the
+// predicate SERVER-SIDE (with the source's own collation) across BOTH the
+// COPY phase and the streaming phase that reuses the same stream. The
+// predicate is the operator's `--where` string, already validated by the
+// restricted grammar; it is always parenthesized so a disjunctive
+// predicate can't escape the per-table scope. Matching is case-insensitive
+// (the operator's `--where TABLE` casing need not match the schema's). An
+// empty/nil filters map is byte-identical to the pre-0174 unfiltered rules
+// — the keyspace-wide catch-all cannot carry a per-table WHERE, so filters
+// are consulted only when the table allowlist is explicit (the shipping
+// filtered-sync path always enumerates the in-scope tables).
+func vstreamCopyFilterRules(tables []string, filters map[string]string) []*binlogdata.Rule {
 	if len(tables) == 0 {
 		return []*binlogdata.Rule{{Match: "/.*/"}}
 	}
+	var lc map[string]string
+	if len(filters) > 0 {
+		lc = make(map[string]string, len(filters))
+		for k, v := range filters {
+			lc[strings.ToLower(k)] = v
+		}
+	}
 	rules := make([]*binlogdata.Rule, 0, len(tables))
 	for _, t := range tables {
-		rules = append(rules, &binlogdata.Rule{Match: t, Filter: "select * from " + t})
+		filter := "select * from " + t
+		if pred := lc[strings.ToLower(t)]; pred != "" {
+			filter += " where (" + pred + ")"
+		}
+		rules = append(rules, &binlogdata.Rule{Match: t, Filter: filter})
 	}
 	return rules
 }
@@ -127,7 +154,18 @@ func vstreamCopyFilterRules(tables []string) []*binlogdata.Rule {
 // is never streamed/buffered (the ADR-0071 multi-table-interleaving
 // overflow). The scope is captured on the stream (copyTables) so an
 // in-place [reconnectCopy] re-applies it.
-func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid, tables []string) (*ir.SnapshotStream, error) {
+//
+// rowFilters (ADR-0174 Piece 2) maps SOURCE table name to a native-SQL
+// `--where` predicate; it is captured on the stream (rowFilters) and woven
+// into EVERY vtgate filter-rule build — the constructor's first-table open,
+// the auto-shard per-table reopens, the in-place reconnect, the reshard
+// reopen, and the auto-shard CDC handoff — so the server-side filter is
+// applied uniformly across the COPY and the streaming phase. It MUST be
+// supplied here (not via a post-open setter): the COPY filter rules are sent
+// to vtgate when the first stream opens below, so a filter arriving after the
+// open would leave the first table's COPY unfiltered (a silent leak). Empty/
+// nil rowFilters is byte-identical to the pre-0174 unfiltered path.
+func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid, tables []string, rowFilters map[string]string) (*ir.SnapshotStream, error) {
 	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
@@ -301,7 +339,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 			Vgtid: &binlogdata.VGtid{
 				ShardGtids: protoShardGtids,
 			},
-			Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables)},
+			Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables, rowFilters)},
 			Flags: &vtgate.VStreamFlags{
 				MinimizeSkew:      true,
 				StopOnReshard:     true,
@@ -333,6 +371,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		zeroDate:             zeroDate,
 		client:               client,
 		shards:               shards,
+		rowFilters:           rowFilters,
 		copyTables:           reconnectScope,
 		copyTablesSeq:        seq,
 		concurrentCopy:       concurrent,
@@ -571,6 +610,17 @@ type vstreamSnapshotStream struct {
 	// resume request's per-shard Gtid + TablePKs come from currentVgtid,
 	// but the shard list itself is the constructor's resolved layout.
 	shards []string
+
+	// rowFilters is the ADR-0174 Piece 2 continuous-filtered-sync
+	// (`sync --where`) per-table predicate map, keyed by SOURCE table name
+	// → native-SQL predicate. Captured at open (it must be known before the
+	// first stream's COPY filter rules are sent to vtgate) and woven into
+	// EVERY subsequent filter-rule build — the per-table auto-shard reopens,
+	// the in-place reconnect, the reshard reopen, and the auto-shard CDC
+	// handoff — via [vstreamCopyFilterRules], so the server-side WHERE is
+	// applied uniformly across the COPY and the streaming phase. Nil (the
+	// default) leaves every rule unfiltered. Read-only after construction.
+	rowFilters map[string]string
 
 	// copyTables is the COPY filter scope captured at open: empty means
 	// keyspace-wide (every table), non-empty restricts the COPY to those
@@ -1384,7 +1434,7 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table})},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table}, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -1505,7 +1555,7 @@ func (s *vstreamSnapshotStream) reconnectCopy(ctx context.Context, attempt int) 
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables)},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -1561,7 +1611,7 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables)},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -2107,13 +2157,26 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: build resume position: %w", err)
 	}
+	// Keyspace-wide by default: the CDC tail follows every table, not just
+	// the last one copied. ADR-0073 internal-table exclusion still strips
+	// _vt_* events in the CDC dispatch.
+	//
+	// ADR-0174 Piece 2: a FILTERED sync cannot use the `/.*/` catch-all for
+	// the tail — a per-table WHERE has nowhere to attach on it, so the
+	// out-of-scope rows would stream unfiltered and only the client-side
+	// intercept would hold them back. Instead scope the tail to exactly the
+	// in-scope tables (copyTablesSeq, the auto-shard iteration order) and
+	// re-apply each table's server-side WHERE, matching the COPY phase. Only
+	// in-scope tables are streamed, and each carries its filter; unfiltered
+	// syncs keep the keyspace-wide catch-all byte-for-byte.
+	rules := vstreamCopyFilterRules(nil, nil)
+	if len(s.rowFilters) > 0 {
+		rules = vstreamCopyFilterRules(s.copyTablesSeq, s.rowFilters)
+	}
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		// Keyspace-wide: the CDC tail follows every table, not just the
-		// last one copied. ADR-0073 internal-table exclusion still strips
-		// _vt_* events in the CDC dispatch.
-		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(nil)},
+		Filter:     &binlogdata.Filter{Rules: rules},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -2580,6 +2643,21 @@ func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
 	}
 }
 
+// SetRowFilters implements [ir.RowFilterSetter] for the VStream snapshot
+// COPY reader (ADR-0174 Piece 2, `sync --where`). It is DELIBERATELY a
+// no-op: the VStream COPY sends its per-table filter rules to vtgate when
+// the first stream opens (inside [Engine.OpenSnapshotStreamForTablesFiltered]),
+// so the predicate must already be installed on snap.rowFilters BEFORE this
+// reader is handed to the pipeline. A post-open write here would (a) come
+// too late to re-scope the first table's in-flight COPY (a silent leak) and
+// (b) data-race the COPY pump, which reads snap.rowFilters on its per-table
+// reopens. This method exists only so the reader satisfies the
+// [ir.RowFilterSetter] capability gate the pipeline runs after open; the
+// pipeline always routes a filtered VStream open through
+// [ir.FilteredSnapshotOpener], which is the actual push-down mechanism, and
+// then calls this with the SAME map it opened with — a genuine no-op.
+func (r *vstreamSnapshotRows) SetRowFilters(map[string]string) {}
+
 // SetCopyCheckpoint implements [ir.CopyCheckpointer] (ADR-0072 Phase B).
 // The pipeline wires the durable position sink here on the cold-start
 // path, BEFORE bulk-copy drains the stream, so the COPY pump persists
@@ -2870,6 +2948,27 @@ func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Posi
 	}
 	return c.snap.startPump(ctx)
 }
+
+// SetFullBeforeImageTables implements the pipeline's fullBeforeImageSetter
+// (ADR-0173 Phase 2 / ADR-0174 Piece 2) on the cold-start CDC half so the
+// continuous-filtered-sync before-image gate passes on the VStream path.
+//
+// It is a capability ASSERTION, not a narrowing opt-out: unlike the binlog
+// CDCReader (which narrows the before-image to PK columns per Bug-88), the
+// VStream decode path ([decodeVStreamRow]) never narrows — it passes
+// RowChange.Before through with every column Vitess delivered. So the
+// un-narrowed before-image the row-move evaluation needs is ALREADY what
+// this reader emits, and there is nothing to toggle. The pipeline's
+// where-intercept re-narrows to the PK before the applier builds its WHERE,
+// exactly as on the binlog/PG path. The genuine loud-failure floor — a
+// partial before-image that omits a filtered column (a self-hosted Vitess
+// on binlog_row_image != FULL) — is enforced two ways: Vitess itself aborts
+// a partial-image stream, the item-74 belt ([refuseVStreamPartialRowImage])
+// refuses a NOBLOB after-image, and the pipeline's route() refuses a
+// before-image missing any predicate-referenced column
+// ([whereCDCFilter.route]). Accepting tables here is enough to satisfy the
+// gate; the set itself needs no storage.
+func (c *vstreamSnapshotChanges) SetFullBeforeImageTables(map[string]bool) {}
 
 // Close is provided so the snapshot's CDC half implements the same
 // io.Closer-shaped optional interface the standalone CDC reader does

@@ -154,7 +154,7 @@ func newAutoShardResumeHarness(t *testing.T, tables []string, scripts [][]*vtgat
 	// The constructor opens table[0] from-beginning (the fresh shape); mirror
 	// that here so the pump's per-table reopens pop the subsequent scripts.
 	first, _ := client.VStream(ctx, &vtgate.VStreamRequest{
-		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{tables[0]})},
+		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{tables[0]}, nil)},
 	})
 
 	s := newTestSnapshotStream()

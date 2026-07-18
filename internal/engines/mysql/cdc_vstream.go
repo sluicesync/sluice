@@ -776,6 +776,23 @@ func (r *vstreamCDCReader) setErr(err error) {
 	}
 }
 
+// SetFullBeforeImageTables implements the pipeline's fullBeforeImageSetter
+// (ADR-0173 Phase 2 / ADR-0174 Piece 2) so a warm-resume continuous filtered
+// sync (`sync --where`) passes the before-image capability gate on the
+// standalone VStream CDC reader.
+//
+// It is a capability ASSERTION, not a narrowing opt-out. Unlike the binlog
+// CDCReader (which narrows the before-image to PK columns per Bug-88), the
+// VStream decode path ([decodeVStreamRow]) never narrows — RowChange.Before
+// flows through with every column Vitess delivered — so the un-narrowed
+// before-image the row-move evaluation needs is ALREADY emitted and there is
+// nothing to toggle. The genuine partial-before-image floor (a self-hosted
+// Vitess on binlog_row_image != FULL) stays enforced by Vitess's own
+// stream-abort, the item-74 belt ([refuseVStreamPartialRowImage]), and the
+// pipeline's route() refusal on a before-image missing a predicate-referenced
+// column. Accepting the set is enough; it needs no storage.
+func (r *vstreamCDCReader) SetFullBeforeImageTables(map[string]bool) {}
+
 // Close cancels the streaming goroutine (if any) and closes the
 // gRPC connection. Safe to call multiple times.
 func (r *vstreamCDCReader) Close() error {

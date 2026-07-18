@@ -294,7 +294,7 @@ func (cs *copyStream) openStreamForTable(ctx context.Context, table string, seed
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table})},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table}, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,

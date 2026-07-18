@@ -42,6 +42,13 @@ var (
 	_ ir.TargetConnectionBudgetProber          = Engine{}
 	_ irbackup.TableScopedBackupSnapshotOpener = Engine{}
 	_ ir.TableScopedSnapshotOpener             = Engine{}
+	// ADR-0174 Piece 2 — continuous filtered sync (`sync --where`) pushes
+	// the predicate into the VStream COPY at OPEN time (a post-open
+	// RowFilterSetter is too late for the eager COPY). A method-set drift
+	// here would silently drop the filtered-open dispatch and leave the
+	// cold-start COPY unfiltered — a silent leak of out-of-scope rows.
+	_ ir.FilteredSnapshotOpener  = Engine{}
+	_ ir.FilteredSnapshotResumer = Engine{}
 
 	// SchemaReader optional surfaces.
 	_ irbackup.PositionCapturer = (*SchemaReader)(nil)
@@ -126,6 +133,10 @@ var (
 	// silently skip the repair, shipping rounded floats (audit ARCH-F1).
 	_ ir.LossyFloatCopyReader = (*vstreamSnapshotRows)(nil)
 	_ ir.MaxBufferBytesSetter = (*vstreamSnapshotRows)(nil)
+	// ADR-0174 Piece 2 — the RowFilterSetter capability gate the pipeline
+	// runs on the cold-start snapshot Rows (the actual push-down happens at
+	// open via FilteredSnapshotOpener; this satisfies the gate).
+	_ ir.RowFilterSetter = (*vstreamSnapshotRows)(nil)
 
 	// Migration-state store.
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)

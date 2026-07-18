@@ -118,8 +118,9 @@ func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, table
 	}
 	// A nil start cursor produces a fresh from-beginning snapshot; the
 	// tables arg scopes the COPY filter exactly as the cold-start
-	// OpenSnapshotStreamForTables path does.
-	snap, err := e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
+	// OpenSnapshotStreamForTables path does. Backup takes no `--where`
+	// row filter, so rowFilters is nil.
+	snap, err := e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: backup snapshot (vstream): %w", err)
 	}

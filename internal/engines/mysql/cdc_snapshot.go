@@ -60,7 +60,7 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
 	if e.Flavor.usesVStream() {
-		return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
+		return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables, nil)
 	}
 	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
 	// so it never over-streams; the table scope is a no-op for correctness.
@@ -183,7 +183,71 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 		slog.InfoContext(ctx, "mysql/vstream: snapshot resume: scoping resumed COPY to included tables",
 			slog.Int("table_count", len(tables)))
 	}
-	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, tables)
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, tables, nil)
+}
+
+// OpenSnapshotStreamForTablesFiltered implements [ir.FilteredSnapshotOpener]
+// (ADR-0174 Piece 2): the table-scoped snapshot open with an operator
+// `--where` predicate pushed into the VStream COPY filter rules at open time
+// so the copy phase — and the streaming phase that reuses the same stream —
+// filter SERVER-SIDE with the source's own collation. Only the VStream
+// flavors need it (their COPY sends its filter rules to vtgate eagerly, so a
+// post-open [ir.RowFilterSetter] would come too late for the first table);
+// the vanilla/binlog flavor's snapshot RowReader filters lazily per read via
+// [ir.RowFilterSetter], so it neither implements nor needs this. rowFilters
+// maps SOURCE table name to the native-SQL predicate; an empty map is
+// identical to [Engine.OpenSnapshotStreamForTables].
+func (e Engine) OpenSnapshotStreamForTablesFiltered(ctx context.Context, dsn string, tables []string, rowFilters map[string]string) (*ir.SnapshotStream, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if !e.Flavor.usesVStream() {
+		// The vanilla/binlog flavor filters lazily via the RowReader's
+		// SetRowFilters, so a filtered open is just the unfiltered open — the
+		// pipeline's post-open ir.RowFilterSetter gate carries the predicate.
+		// (This method is only ever dispatched for VStream in practice; the
+		// fall-through keeps it safe if a caller reaches it for vanilla.)
+		return e.OpenSnapshotStreamForTables(ctx, dsn, tables)
+	}
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables, rowFilters)
+}
+
+// OpenSnapshotStreamFromPositionFiltered implements [ir.FilteredSnapshotResumer]
+// (ADR-0174 Piece 2): the interrupted-cold-start COPY resume
+// ([OpenSnapshotStreamFromPosition]) with the SAME `--where` predicate pushed
+// server-side. A resumed filtered COPY MUST carry the predicate the
+// interrupted run did — otherwise the resumed scan copies out-of-scope rows (a
+// silent leak) — so it is threaded at open exactly as the fresh filtered open
+// threads it. Only the VStream flavors implement a resumable COPY, so this
+// refuses a non-VStream flavor identically to [OpenSnapshotStreamFromPosition].
+func (e Engine) OpenSnapshotStreamFromPositionFiltered(ctx context.Context, dsn string, from ir.Position, tables []string, rowFilters map[string]string) (*ir.SnapshotStream, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if !e.Flavor.usesVStream() {
+		return nil, fmt.Errorf(
+			"%s: resumable cold-start COPY is only implemented for the VStream flavors (planetscale / vitess): %w",
+			e.Name(), ErrNotImplemented,
+		)
+	}
+	start, ok, err := decodeVStreamPos(from)
+	if err != nil {
+		return nil, fmt.Errorf("mysql/vstream: snapshot resume: decode position: %w", err)
+	}
+	if !ok {
+		return nil, errors.New("mysql/vstream: snapshot resume: empty position has no COPY cursor to resume from")
+	}
+	if !anyTablePKsPresent(start) {
+		return nil, errors.New(
+			"mysql/vstream: snapshot resume: position carries no TablePKs cursor; refusing to re-copy from row 0 " +
+				"(the cursor-less warm-resume belongs on the plain CDC path)",
+		)
+	}
+	if len(tables) > 0 {
+		slog.InfoContext(ctx, "mysql/vstream: snapshot resume: scoping resumed COPY to included tables (filtered)",
+			slog.Int("table_count", len(tables)))
+	}
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, tables, rowFilters)
 }
 
 // PositionCarriesCopyCursor reports whether a persisted position carries a

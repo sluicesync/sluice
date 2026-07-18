@@ -57,6 +57,65 @@ func (e *slotAwareEngine) OpenSnapshotStreamForTables(_ context.Context, _ strin
 	return nil, nil //nolint:nilnil // stub
 }
 
+// filteredOpenerEngine implements ir.FilteredSnapshotOpener +
+// TableScopedSnapshotOpener so the ADR-0174 Piece 2 dispatch can be pinned:
+// with a --where filter set the filtered open must win over the plain
+// table-scoped open, and the predicate map must reach it (the eager-COPY
+// source needs the filter at OPEN, not via a post-open setter).
+type filteredOpenerEngine struct {
+	stubEngine
+	filteredCalls   int
+	tableScopeCalls int
+	lastTables      []string
+	lastFilters     map[string]string
+}
+
+func (e *filteredOpenerEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	return nil, nil //nolint:nilnil // stub
+}
+
+func (e *filteredOpenerEngine) OpenSnapshotStreamForTables(_ context.Context, _ string, tables []string) (*ir.SnapshotStream, error) {
+	e.tableScopeCalls++
+	e.lastTables = tables
+	return nil, nil //nolint:nilnil // stub
+}
+
+func (e *filteredOpenerEngine) OpenSnapshotStreamForTablesFiltered(_ context.Context, _ string, tables []string, rowFilters map[string]string) (*ir.SnapshotStream, error) {
+	e.filteredCalls++
+	e.lastTables = tables
+	e.lastFilters = rowFilters
+	return nil, nil //nolint:nilnil // stub
+}
+
+// TestOpenSnapshotStreamScoped_FilteredDispatch pins ADR-0174 Piece 2: when a
+// --where filter is set and the source implements ir.FilteredSnapshotOpener,
+// openSnapshotStreamScoped routes to the filtered open (carrying the
+// predicate); with NO filter it falls back to the plain table-scoped open.
+func TestOpenSnapshotStreamScoped_FilteredDispatch(t *testing.T) {
+	t.Run("filter set -> filtered open wins and carries the predicate", func(t *testing.T) {
+		e := &filteredOpenerEngine{}
+		filters := map[string]string{"orders": "region = 'EU'"}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"orders"}, filters)
+		if e.filteredCalls != 1 {
+			t.Fatalf("filtered open call count = %d; want 1", e.filteredCalls)
+		}
+		if e.tableScopeCalls != 0 {
+			t.Errorf("plain table-scope open called %d times; want 0 (filtered must win)", e.tableScopeCalls)
+		}
+		if e.lastFilters["orders"] != "region = 'EU'" {
+			t.Errorf("predicate not forwarded to the filtered open: %v", e.lastFilters)
+		}
+	})
+
+	t.Run("no filter -> plain table-scoped open", func(t *testing.T) {
+		e := &filteredOpenerEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"orders"}, nil)
+		if e.tableScopeCalls != 1 || e.filteredCalls != 0 {
+			t.Errorf("unfiltered dispatch: tableScope=%d filtered=%d; want 1/0", e.tableScopeCalls, e.filteredCalls)
+		}
+	})
+}
+
 // TestResolveSlotName pins the sluice-prefix convention: every
 // sluice-created replication slot starts with `sluice_` so cleanup
 // queries can find them all. The empty case passes through unchanged
@@ -156,7 +215,7 @@ func (e *nonSlotAwareEngine) OpenSnapshotStream(context.Context, string) (*ir.Sn
 func TestOpenSnapshotStreamScoped(t *testing.T) {
 	t.Run("non-empty slotName routes to slot-aware method", func(t *testing.T) {
 		e := &slotAwareEngine{}
-		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", nil)
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", nil, nil)
 		if e.snapshotCallCount != 1 {
 			t.Errorf("OpenSnapshotStreamWithSlot call count = %d; want 1", e.snapshotCallCount)
 		}
@@ -172,7 +231,7 @@ func TestOpenSnapshotStreamScoped(t *testing.T) {
 		// slotAwareEngine implements both surfaces; with a slot AND tables
 		// the slot path must win (the more specific lifecycle requirement).
 		e := &slotAwareEngine{}
-		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", []string{"t1"})
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", []string{"t1"}, nil)
 		if e.snapshotCallCount != 1 {
 			t.Errorf("slot path call count = %d; want 1 (slot must win over table-scope)", e.snapshotCallCount)
 		}
@@ -183,7 +242,7 @@ func TestOpenSnapshotStreamScoped(t *testing.T) {
 
 	t.Run("non-empty tables routes to table-scoped method", func(t *testing.T) {
 		e := &slotAwareEngine{}
-		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"small_t", "other"})
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"small_t", "other"}, nil)
 		if e.tableScopeCallCount != 1 {
 			t.Errorf("OpenSnapshotStreamForTables call count = %d; want 1", e.tableScopeCallCount)
 		}
@@ -197,7 +256,7 @@ func TestOpenSnapshotStreamScoped(t *testing.T) {
 
 	t.Run("empty slot + empty tables uses default open", func(t *testing.T) {
 		e := &slotAwareEngine{}
-		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", nil)
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", nil, nil)
 		if e.defaultSnapshotCalls != 1 {
 			t.Errorf("default OpenSnapshotStream call count = %d; want 1", e.defaultSnapshotCalls)
 		}
@@ -210,7 +269,7 @@ func TestOpenSnapshotStreamScoped(t *testing.T) {
 		// nonSlotAwareEngine implements neither optional surface; a
 		// table-scope request must silently fall back to the default open.
 		e := &nonSlotAwareEngine{}
-		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"t1"})
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"t1"}, nil)
 		if e.defaultSnapshotCalls != 1 {
 			t.Errorf("expected fallback to OpenSnapshotStream; got %d calls", e.defaultSnapshotCalls)
 		}

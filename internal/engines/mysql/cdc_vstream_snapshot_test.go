@@ -784,7 +784,7 @@ func TestVStreamSnapshot_CheckpointWriteFailureNonFatal(t *testing.T) {
 // per table with a `select * from <t>` Filter, order preserved.
 func TestVStreamCopyFilterRules(t *testing.T) {
 	t.Run("nil scope is keyspace-wide catch-all", func(t *testing.T) {
-		got := vstreamCopyFilterRules(nil)
+		got := vstreamCopyFilterRules(nil, nil)
 		if len(got) != 1 {
 			t.Fatalf("nil scope: got %d rules; want exactly 1 catch-all", len(got))
 		}
@@ -797,14 +797,14 @@ func TestVStreamCopyFilterRules(t *testing.T) {
 	})
 
 	t.Run("empty scope is keyspace-wide catch-all", func(t *testing.T) {
-		got := vstreamCopyFilterRules([]string{})
+		got := vstreamCopyFilterRules([]string{}, nil)
 		if len(got) != 1 || got[0].GetMatch() != "/.*/" {
 			t.Fatalf("empty scope: got %+v; want a single /.*/ catch-all", got)
 		}
 	})
 
 	t.Run("two-table scope is one rule per table, order preserved", func(t *testing.T) {
-		got := vstreamCopyFilterRules([]string{"small_t", "orders"})
+		got := vstreamCopyFilterRules([]string{"small_t", "orders"}, nil)
 		want := []*binlogdata.Rule{
 			{Match: "small_t", Filter: "select * from small_t"},
 			{Match: "orders", Filter: "select * from orders"},
@@ -821,4 +821,84 @@ func TestVStreamCopyFilterRules(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestVStreamCopyFilterRules_WithWhere pins ADR-0174 Piece 2: a `--where`
+// predicate for a table becomes a parenthesized server-side WHERE on that
+// table's rule; an unfiltered table in the same scope stays a plain
+// `select *`. Matching is case-insensitive (the operator's --where casing
+// need not match the schema's).
+func TestVStreamCopyFilterRules_WithWhere(t *testing.T) {
+	t.Run("filtered table carries a parenthesized WHERE, unfiltered stays plain", func(t *testing.T) {
+		filters := map[string]string{"orders": "region = 'EU'"}
+		got := vstreamCopyFilterRules([]string{"small_t", "orders"}, filters)
+		want := map[string]string{
+			"small_t": "select * from small_t",
+			"orders":  "select * from orders where (region = 'EU')",
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d rules; want 2", len(got))
+		}
+		for _, r := range got {
+			if w := want[r.GetMatch()]; r.GetFilter() != w {
+				t.Errorf("table %q Filter = %q; want %q", r.GetMatch(), r.GetFilter(), w)
+			}
+		}
+	})
+
+	t.Run("filter key matches table case-insensitively", func(t *testing.T) {
+		filters := map[string]string{"Orders": "tenant_id IN (1,2,3)"}
+		got := vstreamCopyFilterRules([]string{"orders"}, filters)
+		if len(got) != 1 {
+			t.Fatalf("got %d rules; want 1", len(got))
+		}
+		if want := "select * from orders where (tenant_id IN (1,2,3))"; got[0].GetFilter() != want {
+			t.Errorf("Filter = %q; want %q (case-insensitive filter-key match)", got[0].GetFilter(), want)
+		}
+	})
+
+	t.Run("empty predicate string is treated as no filter", func(t *testing.T) {
+		got := vstreamCopyFilterRules([]string{"orders"}, map[string]string{"orders": ""})
+		if got[0].GetFilter() != "select * from orders" {
+			t.Errorf("empty predicate produced Filter %q; want unfiltered select *", got[0].GetFilter())
+		}
+	})
+
+	t.Run("filters never attach to the keyspace-wide catch-all", func(t *testing.T) {
+		// A nil/empty table scope cannot express a per-table WHERE, so it must
+		// stay the /.*/ catch-all regardless of any filters passed.
+		got := vstreamCopyFilterRules(nil, map[string]string{"orders": "region = 'EU'"})
+		if len(got) != 1 || got[0].GetMatch() != "/.*/" || got[0].GetFilter() != "" {
+			t.Fatalf("catch-all with filters = %+v; want a single unfiltered /.*/ rule", got)
+		}
+	})
+}
+
+// TestVStreamFilteredSyncSurfaces pins the ADR-0174 Piece 2 capability
+// surfaces the pipeline gates on: the snapshot Rows reader is an
+// ir.RowFilterSetter, the engine is a FilteredSnapshotOpener /
+// FilteredSnapshotResumer, and both VStream CDC readers accept the
+// full-before-image opt-out the filtered-sync gate requires.
+func TestVStreamFilteredSyncSurfaces(t *testing.T) {
+	var _ ir.RowFilterSetter = (*vstreamSnapshotRows)(nil)
+	var _ ir.FilteredSnapshotOpener = Engine{Flavor: FlavorPlanetScale}
+	var _ ir.FilteredSnapshotResumer = Engine{Flavor: FlavorPlanetScale}
+
+	// The pipeline's fullBeforeImageSetter is unexported; re-declare its shape
+	// so a method-set drift on either VStream CDC reader is a compile error.
+	type fullBeforeImageSetter interface {
+		SetFullBeforeImageTables(tables map[string]bool)
+	}
+	var _ fullBeforeImageSetter = (*vstreamCDCReader)(nil)
+	var _ fullBeforeImageSetter = (*vstreamSnapshotChanges)(nil)
+
+	// SetRowFilters is a documented no-op on the eager-COPY reader (the push
+	// happens at open); calling it must not panic and must leave the reader
+	// usable as the gate expects.
+	(&vstreamSnapshotRows{}).SetRowFilters(map[string]string{"t": "x = 1"})
+	// SetFullBeforeImageTables on both VStream CDC readers is a capability
+	// assertion (VStream never narrows) — accepting the set must not panic.
+	(&vstreamCDCReader{}).SetFullBeforeImageTables(map[string]bool{"t": true})
+	(&vstreamSnapshotChanges{}).SetFullBeforeImageTables(map[string]bool{"t": true})
+	t.Log("ADR-0174 Piece 2 filtered-sync capability surfaces present (RowFilterSetter / FilteredSnapshotOpener / FilteredSnapshotResumer / fullBeforeImageSetter)")
 }

@@ -3044,6 +3044,52 @@ type TableScopedSnapshotOpener interface {
 	OpenSnapshotStreamForTables(ctx context.Context, dsn string, tables []string) (*SnapshotStream, error)
 }
 
+// FilteredSnapshotOpener is the optional engine surface that pushes a
+// per-table `--where` predicate into the snapshot COPY at OPEN time
+// (ADR-0174 Piece 2, continuous filtered `sync --where` on VStream
+// sources). It is distinct from [RowFilterSetter] — which the pipeline
+// applies to an already-open RowReader that filters lazily per read —
+// because the VStream COPY sends its filter rules to vtgate when the
+// stream is constructed: a post-open SetRowFilters cannot retroactively
+// re-scope the in-flight COPY, so the predicate MUST be known before the
+// stream opens. Engines whose snapshot RowReader filters lazily (Postgres,
+// vanilla MySQL: `SELECT ... WHERE` per table) do NOT implement this — the
+// pipeline's post-open [RowFilterSetter] gate covers them; only an
+// eager-COPY source (VStream) needs the predicate at open.
+//
+// The pipeline prefers this surface whenever `--where` is set and the
+// source implements it; it still runs the [RowFilterSetter] gate afterward
+// (the loud-failure authority for a source that supports neither).
+type FilteredSnapshotOpener interface {
+	// OpenSnapshotStreamForTablesFiltered opens a table-scoped snapshot
+	// (as [TableScopedSnapshotOpener.OpenSnapshotStreamForTables]) whose
+	// COPY — and the streaming phase that follows it on the same stream —
+	// evaluates rowFilters server-side. rowFilters maps SOURCE table name
+	// to the operator's native-SQL predicate (already validated by the
+	// restricted `--where` grammar); a table with no entry copies unfiltered.
+	// The source engine evaluates the predicate with the SOURCE's own
+	// collation, so it agrees with the pipeline's client-side CDC evaluation
+	// by construction. An empty rowFilters is identical to the unfiltered
+	// table-scoped open.
+	OpenSnapshotStreamForTablesFiltered(ctx context.Context, dsn string, tables []string, rowFilters map[string]string) (*SnapshotStream, error)
+}
+
+// FilteredSnapshotResumer is the [FilteredSnapshotOpener] counterpart for
+// resuming an INTERRUPTED filtered cold-start COPY (the ADR-0174 Piece 2
+// intersection of [SnapshotStreamResumer] and the filter push-down). The
+// resumed COPY must carry the SAME server-side predicate the interrupted
+// run did — otherwise the resumed scan would copy out-of-scope rows, a
+// silent leak — so, like [FilteredSnapshotOpener], the predicate is threaded
+// at open time rather than via a post-open setter.
+type FilteredSnapshotResumer interface {
+	// OpenSnapshotStreamFromPositionFiltered resumes the bulk COPY from the
+	// cursor carried by from (as
+	// [SnapshotStreamResumer.OpenSnapshotStreamFromPosition]) with rowFilters
+	// pushed server-side, same keying/semantics as
+	// [FilteredSnapshotOpener.OpenSnapshotStreamForTablesFiltered].
+	OpenSnapshotStreamFromPositionFiltered(ctx context.Context, dsn string, from Position, tables []string, rowFilters map[string]string) (*SnapshotStream, error)
+}
+
 // DefaultTableExcluder is the optional engine surface for "tables
 // the operator almost never wants to migrate against this engine".
 // Implementing engines return a list of [path.Match]-style patterns

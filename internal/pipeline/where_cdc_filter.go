@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -45,6 +46,17 @@ type whereCDCFilter struct {
 	// Empty for a PK-less table (the before-image is then left full — the
 	// same PK-less fallback the readers use).
 	pkCols map[string]map[string]bool
+	// refCols is the lower-cased set of columns each table's predicate
+	// REFERENCES (from [rowpredicate.Predicate.Columns]). route() checks the
+	// decoded before-image carries every one before evaluating a filtered
+	// UPDATE/DELETE: a missing column reads as UNKNOWN in the evaluator and
+	// would silently mis-classify a move-OUT as a drop, leaking the now-out-
+	// of-scope row on the target. This is the belt-and-suspenders floor for a
+	// partial before-image (a self-hosted Vitess on binlog_row_image != FULL
+	// that slips past the reader's own guards) — the SLUICE-E-WHERE-CDC-
+	// BEFORE-IMAGE refusal at the exact point the columns that matter are
+	// known. Keyed by lower-cased source table name.
+	refCols map[string]map[string]bool
 }
 
 // buildWhereCDCFilter compiles each `--where TABLE=<predicate>` string into
@@ -65,6 +77,7 @@ func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema
 	}
 	preds := make(map[string]*rowpredicate.Predicate, len(rowFilters))
 	pkCols := make(map[string]map[string]bool, len(rowFilters))
+	refCols := make(map[string]map[string]bool, len(rowFilters))
 	for table, predicate := range rowFilters {
 		tbl, ok := byName[strings.ToLower(table)]
 		if !ok {
@@ -87,8 +100,13 @@ func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema
 		key := strings.ToLower(table)
 		preds[key] = p
 		pkCols[key] = primaryKeyColumnSet(tbl)
+		cols := make(map[string]bool)
+		for _, c := range p.Columns() {
+			cols[c] = true // already lower-cased by the compiler
+		}
+		refCols[key] = cols
 	}
-	return &whereCDCFilter{preds: preds, pkCols: pkCols}, nil
+	return &whereCDCFilter{preds: preds, pkCols: pkCols, refCols: refCols}, nil
 }
 
 // primaryKeyColumnSet returns the lower-cased primary-key column names of
@@ -122,6 +140,65 @@ func (f *whereCDCFilter) narrowBefore(table string, before ir.Row) ir.Row {
 		}
 	}
 	return out
+}
+
+// beforeImageMissingColumn reports whether the decoded before-image carries
+// every column the table's predicate references. It returns (missingColumn,
+// false) naming the first absent referenced column, or ("", true) when the
+// image is complete (or the table has no filter / references no columns).
+// Matching is case-insensitive: the row is keyed by the source's column-name
+// casing while the predicate's referenced columns are lower-cased.
+//
+// This is the load-bearing guard against a partial before-image on a filtered
+// table: the evaluator treats an ABSENT column the same as SQL NULL (UNKNOWN),
+// so a move-OUT (before matched, after didn't) on a before-image that omits
+// the filtered column would evaluate to "was never in scope" and silently drop
+// the DELETE — leaking the now-out-of-scope row on the target. Refusing here
+// keeps the loud-failure floor at the exact point the relevant columns are
+// known (the reader can't know which columns a predicate reads).
+func (f *whereCDCFilter) beforeImageMissingColumn(table string, before ir.Row) (string, bool) {
+	need := f.refCols[strings.ToLower(table)]
+	if len(need) == 0 || before == nil {
+		return "", true
+	}
+	present := make(map[string]bool, len(before))
+	for name := range before {
+		present[strings.ToLower(name)] = true
+	}
+	// Deterministic report order so the refusal message is stable.
+	missing := make([]string, 0)
+	for col := range need {
+		if !present[col] {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) == 0 {
+		return "", true
+	}
+	sort.Strings(missing)
+	return missing[0], false
+}
+
+// partialBeforeImage builds the coded refusal for a filtered UPDATE/DELETE
+// whose before-image is present but omits a column the predicate references —
+// the source is not delivering full row before-images for the filtered table
+// (a self-hosted Vitess / MySQL on binlog_row_image != FULL that slipped past
+// the reader's own guards). Evaluating the row-move on a partial before-image
+// would silently mis-classify it, so the stream stops loudly instead.
+func partialBeforeImage(op, schema, table, column string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeWhereCDCBeforeImage,
+		"ensure MySQL binlog_row_image=FULL / PG REPLICA IDENTITY FULL on the filtered table, then restart the sync",
+		fmt.Errorf(
+			"continuous filtered sync: a %s on filtered table %s arrived with a before-image that omits column %q, "+
+				"which the --where predicate references — so --where cannot decide whether the row moved out of the "+
+				"filter's scope. The source must deliver FULL row before-images for a filtered table (MySQL "+
+				"binlog_row_image=FULL, PG REPLICA IDENTITY FULL); a partial image reached the reader, and evaluating "+
+				"the row-move over the missing column would read it as NULL and could silently leak an out-of-scope "+
+				"row. The stream stops here rather than mis-classify the row",
+			op, qualifiedTableName(schema, table), column,
+		),
+	)
 }
 
 // fullBeforeImageSetter is the optional CDC-reader surface a filtered
@@ -276,6 +353,9 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		if e.Before == nil {
 			return nil, missingBeforeImage("DELETE", e.Schema, e.Table)
 		}
+		if miss, ok := f.beforeImageMissingColumn(e.Table, e.Before); !ok {
+			return nil, partialBeforeImage("DELETE", e.Schema, e.Table, miss)
+		}
 		if p.Eval(e.Before) {
 			// Re-narrow the (full) before-image to the key columns for the
 			// applier's WHERE.
@@ -290,6 +370,9 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		}
 		if e.Before == nil {
 			return nil, missingBeforeImage("UPDATE", e.Schema, e.Table)
+		}
+		if miss, ok := f.beforeImageMissingColumn(e.Table, e.Before); !ok {
+			return nil, partialBeforeImage("UPDATE", e.Schema, e.Table, miss)
 		}
 		before := p.Eval(e.Before)
 		after := p.Eval(e.After)

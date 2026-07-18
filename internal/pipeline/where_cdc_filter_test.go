@@ -148,6 +148,41 @@ func TestRowMoveMissingBeforeImage(t *testing.T) {
 	}
 }
 
+// TestRowMovePartialBeforeImage pins the ADR-0174 belt-and-suspenders floor:
+// a filtered UPDATE/DELETE whose before-image is PRESENT but OMITS a column
+// the predicate references (a self-hosted Vitess / MySQL on binlog_row_image
+// != FULL that slipped past the reader's guards) is a coded refusal — never a
+// silent move-OUT-as-drop leak. The evaluator would read the missing column as
+// NULL/UNKNOWN and mis-classify a now-out-of-scope row as "never in scope",
+// leaking it on the target.
+func TestRowMovePartialBeforeImage(t *testing.T) {
+	f := usersFilter(t) // predicate references `country`
+	// before-image carries only the PK (`id`), not the filtered `country`.
+	pkOnly := ir.Row{"id": int64(1)}
+	for _, c := range []ir.Change{
+		ir.Update{Table: "users", Before: pkOnly, After: inScope()},
+		ir.Delete{Table: "users", Before: pkOnly},
+	} {
+		_, err := f.route(c)
+		if err == nil {
+			t.Fatalf("route(%T with PK-only before-image): want a refusal, got nil", c)
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeWhereCDCBeforeImage {
+			t.Errorf("route(%T): code = %v; want %s", c, err, sluicecode.CodeWhereCDCBeforeImage)
+		}
+		if !strings.Contains(err.Error(), "country") {
+			t.Errorf("route(%T): refusal must name the missing column; got %v", c, err)
+		}
+	}
+
+	// A FULL before-image (carries `country`) is NOT refused — the guard only
+	// fires on a genuinely partial image, not on every filtered change.
+	if _, err := f.route(ir.Update{Table: "users", Before: inScope(), After: inScope()}); err != nil {
+		t.Fatalf("full before-image must not be refused: %v", err)
+	}
+}
+
 // TestInterceptWhereFilterChannel exercises the goroutine wrapper end to
 // end, asserting the move-IN and move-OUT translations reach the OUT
 // channel as the right op (the non-vacuous channel-level pin).

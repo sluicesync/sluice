@@ -436,9 +436,20 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 		// so the resumed COPY is scoped to --include-table exactly as a fresh
 		// cold-start is — Vitess's TablePKs cursor is per-table, so the scope
 		// composes with the cursor without any manual reconciliation.
-		stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom, snapshotTables)
+		//
+		// ADR-0174 Piece 2: a resumed FILTERED cold-start must re-push the same
+		// `--where` predicate server-side, or the resumed scan copies
+		// out-of-scope rows (a silent leak). The VStream engine implements the
+		// filtered resumer; when a filter is set and the engine supports it, use
+		// it. Otherwise the plain resume runs and the post-open ApplyRowFilters
+		// gate below is the loud-failure authority.
+		if fr, ok := s.Source.(ir.FilteredSnapshotResumer); ok && len(s.RowFilters) > 0 {
+			stream, err = fr.OpenSnapshotStreamFromPositionFiltered(ctx, s.SourceDSN, resumeFrom, snapshotTables, s.RowFilters)
+		} else {
+			stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom, snapshotTables)
+		}
 	} else {
-		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables)
+		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables, s.RowFilters)
 	}
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
@@ -954,6 +965,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 //   - slotName != "" → [ir.SnapshotStreamWithSlotOpener] when the engine
 //     implements it (Postgres), else a debug note + default open. The
 //     slot is created at open time, so the name must flow in here.
+//   - len(tables) > 0 → [ir.FilteredSnapshotOpener] when a `--where` filter
+//     is set and the engine implements it (VStream), pushing the predicate
+//     into the COPY filter rules at open (ADR-0174 Piece 2 — the eager-COPY
+//     source needs the predicate BEFORE the stream opens; a post-open
+//     [ir.RowFilterSetter] would leave the first table's COPY unfiltered).
 //   - len(tables) > 0 → [ir.TableScopedSnapshotOpener] when the engine
 //     implements it (PlanetScale VStream), scoping the COPY to the
 //     filtered tables so a large unrelated keyspace table is never
@@ -962,8 +978,12 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 //
 // Slot and table-scope never coexist on one engine (Postgres has the
 // slot; PlanetScale has the tables), but if both are somehow set the slot
-// wins — it's the more specific lifecycle requirement.
-func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotName string, tables []string) (*ir.SnapshotStream, error) {
+// wins — it's the more specific lifecycle requirement. The post-open
+// [migcore.ApplyRowFilters] gate in [coldStartOpenSnapshot] still runs for
+// every path — it is the loud-failure authority for a source that supports
+// neither push-down — and is a harmless no-op re-store on the VStream path
+// the filtered opener already handled.
+func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotName string, tables []string, rowFilters map[string]string) (*ir.SnapshotStream, error) {
 	if slotName != "" {
 		if opener, ok := source.(ir.SnapshotStreamWithSlotOpener); ok {
 			return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
@@ -975,6 +995,11 @@ func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotNa
 		return source.OpenSnapshotStream(ctx, dsn)
 	}
 	if len(tables) > 0 {
+		if len(rowFilters) > 0 {
+			if opener, ok := source.(ir.FilteredSnapshotOpener); ok {
+				return opener.OpenSnapshotStreamForTablesFiltered(ctx, dsn, tables, rowFilters)
+			}
+		}
 		if opener, ok := source.(ir.TableScopedSnapshotOpener); ok {
 			return opener.OpenSnapshotStreamForTables(ctx, dsn, tables)
 		}

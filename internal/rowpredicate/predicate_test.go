@@ -40,6 +40,42 @@ func mustRefuse(t *testing.T, predicate string, infos map[string]ColumnInfo) {
 	}
 }
 
+// TestColumns pins Predicate.Columns: the deduplicated, lower-cased set of
+// columns the predicate references across every node kind (cmp, IN, IS NULL,
+// AND/OR/NOT, parens). The filtered-sync before-image guard depends on it to
+// know which columns a partial before-image must carry.
+func TestColumns(t *testing.T) {
+	infos := map[string]ColumnInfo{
+		"region":    {Family: FamilyString, CaseSensitive: true},
+		"tenant_id": {Family: FamilyNumeric},
+		"deleted":   {Family: FamilyString, CaseSensitive: true},
+		"age":       {Family: FamilyNumeric},
+	}
+	p := mustCompile(t, "(region = 'EU' AND tenant_id IN (1,2)) OR NOT (deleted IS NULL) OR age > 3", infos)
+	got := p.Columns()
+	want := []string{"age", "deleted", "region", "tenant_id"} // sorted, deduped
+	if len(got) != len(want) {
+		t.Fatalf("Columns() = %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Columns() = %v; want %v", got, want)
+		}
+	}
+
+	// A repeated column is deduplicated.
+	p2 := mustCompile(t, "age > 3 AND age < 99", map[string]ColumnInfo{"age": {Family: FamilyNumeric}})
+	if cols := p2.Columns(); len(cols) != 1 || cols[0] != "age" {
+		t.Errorf("Columns() dedup = %v; want [age]", cols)
+	}
+
+	// A nil predicate references nothing.
+	var nilP *Predicate
+	if cols := nilP.Columns(); cols != nil {
+		t.Errorf("nil predicate Columns() = %v; want nil", cols)
+	}
+}
+
 // TestValueFamilies is the Bug-74 matrix for the evaluator: EVERY value
 // family it can compare (numeric int64/uint64/float64/decimal-string, bool,
 // string, temporal, binary), each exercised for a matching AND a

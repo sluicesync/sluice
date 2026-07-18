@@ -143,7 +143,7 @@ func newAutoShardHarness(t *testing.T, tables []string, scripts [][]*vtgate.VStr
 	// per-table reopen pops script[1], script[2], ... and the CDC handoff
 	// pops the last.
 	first, _ := client.VStream(ctx, &vtgate.VStreamRequest{
-		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{tables[0]})},
+		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{tables[0]}, nil)},
 	})
 
 	s := newTestSnapshotStream()

@@ -56,6 +56,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -91,6 +92,27 @@ func (p *Predicate) String() string {
 		return ""
 	}
 	return p.text
+}
+
+// Columns returns the sorted set of column names (lower-cased, the same
+// normalization [Compile] applies) the predicate references. A nil
+// predicate references nothing. Callers use it to verify a decoded row
+// carries every column the evaluation will read — a filtered CDC
+// before-image that omits a referenced column must be refused, not
+// evaluated (a missing column reads as UNKNOWN and would silently
+// mis-classify a row-move).
+func (p *Predicate) Columns() []string {
+	if p == nil || p.root == nil {
+		return nil
+	}
+	set := map[string]bool{}
+	p.root.columns(set)
+	out := make([]string, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Family is the value family a column belongs to, for fidelity gating.
@@ -316,6 +338,9 @@ func (t truth) not() truth {
 
 type node interface {
 	eval(row ir.Row) truth
+	// columns adds every column name this node (and its children)
+	// references to set. Names are already lower-cased at parse time.
+	columns(set map[string]bool)
 }
 
 type andNode struct{ kids []node }
@@ -333,6 +358,12 @@ func (n andNode) eval(row ir.Row) truth {
 	return res
 }
 
+func (n andNode) columns(set map[string]bool) {
+	for _, k := range n.kids {
+		k.columns(set)
+	}
+}
+
 type orNode struct{ kids []node }
 
 func (n orNode) eval(row ir.Row) truth {
@@ -348,9 +379,17 @@ func (n orNode) eval(row ir.Row) truth {
 	return res
 }
 
+func (n orNode) columns(set map[string]bool) {
+	for _, k := range n.kids {
+		k.columns(set)
+	}
+}
+
 type notNode struct{ kid node }
 
 func (n notNode) eval(row ir.Row) truth { return n.kid.eval(row).not() }
+
+func (n notNode) columns(set map[string]bool) { n.kid.columns(set) }
 
 // isNullNode is `column IS [NOT] NULL`. It is never UNKNOWN.
 type isNullNode struct {
@@ -368,6 +407,8 @@ func (n isNullNode) eval(row ir.Row) truth {
 	}
 	return truthFalse
 }
+
+func (n isNullNode) columns(set map[string]bool) { set[n.column] = true }
 
 // cmpNode is `column op literal`.
 type cmpNode struct {
@@ -388,6 +429,8 @@ func (n cmpNode) eval(row ir.Row) truth {
 	}
 	return compareValue(n.fam, v, n.op, n.lit, n.collation)
 }
+
+func (n cmpNode) columns(set map[string]bool) { set[n.column] = true }
 
 // inNode is `column [NOT] IN (lit, ...)`, desugared to OR-of-equalities
 // with SQL NULL semantics.
@@ -420,6 +463,8 @@ func (n inNode) eval(row ir.Row) truth {
 	}
 	return res
 }
+
+func (n inNode) columns(set map[string]bool) { set[n.column] = true }
 
 // -------------------- tokenizer --------------------
 
