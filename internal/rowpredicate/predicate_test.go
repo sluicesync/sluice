@@ -67,10 +67,22 @@ func TestFloatEqualityRefused(t *testing.T) {
 	} {
 		t.Run("allow "+pred, func(t *testing.T) {
 			p := mustCompile(t, pred, floatCol)
-			// Ordering still evaluates (big.Rat over the float64 value).
+			// Ordering still evaluates (as float64, matching IEEE-754 coercion).
 			assertEval(t, p, ir.Row{"x": float64(0.05)}, pred == "x < 0.1" || pred == "x <= 0.1")
 		})
 	}
+	// audit 2026-07-19 B1: ordering compares as float64 (IEEE-754), NOT exact
+	// big.Rat. A high-precision literal that rounds to the same double as the
+	// stored value must compare EQUAL, matching the source's coercion. With the
+	// old big.Rat path 0.10000000000000001 parsed exact-distinct from a stored
+	// 0.1, so `>=` returned false (a silent drop) and `<` returned true (leak).
+	t.Run("high-precision literal coerces to float64 (B1)", func(t *testing.T) {
+		const hp = "0.10000000000000001" // rounds to the same float64 as 0.1
+		ge := mustCompile(t, "x >= "+hp, floatCol)
+		assertEval(t, ge, ir.Row{"x": float64(0.1)}, true) // 0.1 >= 0.1 (coerced) → true
+		lt := mustCompile(t, "x < "+hp, floatCol)
+		assertEval(t, lt, ir.Row{"x": float64(0.1)}, false) // 0.1 < 0.1 (coerced) → false
+	})
 }
 
 // TestColumns pins Predicate.Columns: the deduplicated, lower-cased set of

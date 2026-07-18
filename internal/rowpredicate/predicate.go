@@ -55,6 +55,7 @@ package rowpredicate
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"strconv"
@@ -1000,10 +1001,16 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 // guessed answer.
 func compareValue(fam Family, value any, op cmpOp, lit literal, compare func(a, b string) bool, padSpace bool) truth {
 	switch fam {
-	case FamilyNumeric, FamilyFloat:
-		// FamilyFloat only reaches here for ordering ops (equality is refused
-		// at compile time); big.Rat ordering of the float64 value is faithful.
+	case FamilyNumeric:
 		return compareNumeric(value, op, lit)
+	case FamilyFloat:
+		// FamilyFloat only reaches here for ordering ops (equality is refused
+		// at compile time). Compare as float64 to match the source's IEEE-754
+		// coercion of the literal: a big.Rat compare treats a high-precision
+		// literal (0.10000000000000001) as distinct from a stored 0.1, but the
+		// source coerces both to the same double, so `d >= 0.10000000000000001`
+		// with a stored 0.1 diverges (audit 2026-07-19 B1).
+		return compareFloat(value, op, lit)
 	case FamilyBool:
 		return compareBool(value, op, lit)
 	case FamilyString:
@@ -1047,6 +1054,55 @@ func numericToRat(value any) (*big.Rat, bool) {
 		return r, true
 	default:
 		return nil, false
+	}
+}
+
+// compareFloat evaluates an ordering comparison on a FamilyFloat column as a
+// float64 comparison, reproducing the source's IEEE-754 coercion of the literal
+// (audit 2026-07-19 B1). Equality is refused at compile time, so only ordering
+// (<, <=, >, >=) reaches here. A NaN on either side is unordered → UNKNOWN.
+func compareFloat(value any, op cmpOp, lit literal) truth {
+	left, ok := toFloat64(value)
+	if !ok {
+		return truthUnknown
+	}
+	right, err := strconv.ParseFloat(strings.TrimSpace(lit.text), 64)
+	if err != nil {
+		return truthUnknown
+	}
+	if math.IsNaN(left) || math.IsNaN(right) {
+		return truthUnknown
+	}
+	switch {
+	case left < right:
+		return orderToTruth(-1, op)
+	case left > right:
+		return orderToTruth(1, op)
+	default:
+		return orderToTruth(0, op)
+	}
+}
+
+func toFloat64(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
 	}
 }
 
