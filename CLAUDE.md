@@ -96,6 +96,16 @@ The Bug 74 discipline above was applied rigorously to *value* codecs and still m
 - **Every new file format gets an independent reader in a test.** Writer-verifying-writer passes symmetric bugs; at least one pin must read the output with a reader that is not the writer's own library (DuckDB/pyarrow for parquet, the real target DB for dumps).
 - **Verification paths must not ride the reader under test.** `verify --depth count` shared the mydumper copy path, so it confirmed the loss instead of catching it. If verify and copy share a code path, that shared path is a single point of silent failure — note it and add one check that doesn't.
 
+## Pre-release QA triggers (delta-scoped review)
+
+The periodic full audit (`C:\code\REPO_AUDIT_PROMPT.md` — a blind multi-agent fan-out) is a heavy backstop; running it every release wastes tokens re-deriving unchanged code. Instead, QA layers in three cheapest-first tiers so most of the audit's silent-loss-catching value lands per-release at a fraction of the cost.
+
+**Tier 1 — ratchet each finding into a permanent gate (the highest-leverage move).** The best outcome of an audit is not "we found the bug," it's a *deterministic gate that never needs re-finding*: a family-matrix test, a doc-sync test, a shard-coverage guard, a capability assertion. The 07-18 PAD-SPACE Critical's durable fix was the **real-MySQL/PG collation matrices now in the per-PR shard** — permanent, zero-marginal-cost, and stronger than any review because it ground-truths against a real server every PR. So: **every audit exits by asking "what gate would have caught this class automatically?" and building it.** Prefer a gate over "review more often" — reviews are expensive and forgettable; gates are free and permanent. (Operationalized in the audit prompt's §4 "Gate proposals" required output.)
+
+**Tier 2 — delta-triggered specialist review (run per-release, only when the surface is touched).** `scripts/prerelease-triggers.sh [BASE_REF]` inspects `BASE_REF..HEAD` (default: latest tag) and prints which scoped, read-only specialist agents the changed surface warrants — `value-fidelity-reviewer` (value/collation/codec paths), `perf-parity-checker` (perf techniques), `docs-drift-detector` (flags/capabilities/ADRs/error-codes), plus `-race`-before-tag for concurrency paths and the new-surface codec checklist for persisted-state changes. Most releases (docs-only, non-surface bugfixes) trigger nothing; a risky delta triggers one or two cheap agents. This generalizes the pre-existing "run `perf-parity-checker` after perf chunks" agreement into one deterministic step. Run it before cutting a release tag; act on the hits.
+
+**Tier 3 — the full blind audit stays periodic, not per-release.** Its irreplaceable parts — independent blind re-derivation, the reconciler scorecard, promoting a light area to full depth — only pay off against *accumulated* delta with fresh eyes. Cadence: every ~10–15 releases, or event-triggered when a release introduces a genuinely **new surface** (new file format, new serialization boundary, new engine) — exactly when the "reader ≠ writer" independent pass earns its cost.
+
 ## Where to read more
 
 - `docs/architecture.md` — IR, engine pattern, orchestrator, planned roadmap
