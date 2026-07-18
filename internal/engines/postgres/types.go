@@ -43,6 +43,15 @@ type columnMeta struct {
 	// Charset empty for PG sources.
 	Collation string
 
+	// CollationIsDeterministic is pg_collation.collisdeterministic for the
+	// column's NAMED collation (audit 2026-07-18 F0-3). Meaningful only when
+	// Collation is non-empty; the reader COALESCEs it to true for the default
+	// (unnamed) collation, which is always deterministic. It is carried onto
+	// the IR character type's [ir.CollationDeterminism] so the client-side
+	// `--where` evaluator can admit a deterministic named collation as
+	// byte-exact and refuse a non-deterministic one.
+	CollationIsDeterministic bool
+
 	// IsAutoIncrement is true for SERIAL/BIGSERIAL/IDENTITY columns.
 	// The schema reader sets this based on either is_identity or a
 	// nextval() default; the translator just respects it.
@@ -304,6 +313,25 @@ func translateUserDefinedType(c columnMeta) (ir.Type, error) {
 	)
 }
 
+// collationDeterminism maps a column's named-collation determinism signal
+// (pg_collation.collisdeterministic, read into columnMeta) to the IR carrier
+// (audit 2026-07-18 F0-3). It is only meaningful for a NAMED collation: the
+// default (unnamed) collation is always deterministic and left at the safe
+// Unknown zero value, which the character-type structs carry harmlessly (the
+// client-side `--where` evaluator treats an empty collation as byte-exact
+// regardless). For a named collation the verdict is authoritative:
+// deterministic ⇒ byte-exact `=` (safe to reproduce client-side),
+// non-deterministic ⇒ collation-aware `=` (refused).
+func collationDeterminism(c columnMeta) ir.CollationDeterminism {
+	if c.Collation == "" {
+		return ir.CollationDeterminismUnknown
+	}
+	if c.CollationIsDeterministic {
+		return ir.CollationDeterministic
+	}
+	return ir.CollationNonDeterministic
+}
+
 // translateScalarType maps a Postgres scalar (non-array, non-USER-
 // DEFINED) column to an IR type via a data_type switch, with the
 // ADR-0051 core-verbatim allowlist as the last carry before the loud
@@ -361,7 +389,7 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 	// ---- Character ----
 	case "character":
 		if n, declared := charLengthOf(c); declared {
-			return ir.Char{Length: n, Collation: c.Collation}, nil
+			return ir.Char{Length: n, Collation: c.Collation, Determinism: collationDeterminism(c)}, nil
 		}
 		// Undeclared length (typmod -1): a bare `bpchar` scalar or a
 		// bare `char[]` element is UNBOUNDED in PG (it accepts any
@@ -371,10 +399,10 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 		// emit ("CHAR(0)", Bug 195); Char{1} would silently truncate.
 		// Land on Text/long, the same collapse the CDC path's oidToType
 		// uses for unbounded varchar.
-		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation, Determinism: collationDeterminism(c)}, nil
 	case "character varying":
 		if n, declared := charLengthOf(c); declared {
-			return ir.Varchar{Length: n, Collation: c.Collation}, nil
+			return ir.Varchar{Length: n, Collation: c.Collation, Determinism: collationDeterminism(c)}, nil
 		}
 		// Unbounded varchar — bare `varchar` scalar or `varchar[]`
 		// element (both report character_maximum_length NULL and typmod
@@ -384,11 +412,11 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 		// DDL emit as VARCHAR(0) — a MySQL marker-column idiom the PG
 		// catalog can never legitimately mean (PG refuses varchar(0) at
 		// CREATE TABLE, so a PG source cannot contain one).
-		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation, Determinism: collationDeterminism(c)}, nil
 	case "text":
 		// Postgres text is unbounded; the IR's TextLong is the
 		// closest match that round-trips correctly to MySQL's LONGTEXT.
-		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation, Determinism: collationDeterminism(c)}, nil
 
 	// ---- Binary ----
 	case "bytea":

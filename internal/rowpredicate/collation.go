@@ -36,9 +36,25 @@ import (
 //     collation (latin1, …) NullsafeCompare mis-decodes them. Such columns are
 //     REFUSED at compile time ([collationCharsetUTF8]), not silently compared.
 //
-// A collation that does not resolve, a non-UTF-8 charset, a Postgres named
-// (possibly non-deterministic) collation, or --where-strict-collation on the
-// ci/ai path still refuses loudly at compile time. The evaluator never guesses.
+// A collation that does not resolve, a non-UTF-8 charset, a Postgres
+// non-deterministic named collation, or --where-strict-collation on the ci/ai
+// path still refuses loudly at compile time. The evaluator never guesses.
+// (A Postgres DETERMINISTIC named collation — pg_collation.collisdeterministic
+// — has a byte-exact `=`, so it is classified byte-exact upstream in
+// [stringColumnInfo] and never reaches this Vitess comparator; only the
+// MySQL-family ci/ai fold path does.)
+//
+// TODO(audit-2026-07-18 M2.1 / M-A1): this file is the ONLY importer of
+// vitess.io/vitess outside internal/engines/mysql, so the engine-neutral
+// evaluator carries a hard compile edge to a MySQL collation library. The
+// clean containment is an engine-supplied collation-resolver interface (MySQL
+// provides the Vitess-backed comparator; Postgres/SQLite resolve byte-exact-
+// or-refuse through their own lens), threaded from the source engine into
+// Compile. That refactor is deferred: it is not needed for correctness here —
+// the Postgres path is already fully byte-exact-or-refuse WITHOUT touching this
+// comparator (the determinism gate above), and MySQL is this comparator's only
+// legitimate consumer — so the leak is an architectural wart, not a live
+// fidelity bug. Batch B can introduce the resolver seam.
 
 // collationNoPad reports whether a collation compares with NO-PAD semantics
 // (trailing spaces are SIGNIFICANT), as opposed to the legacy PAD SPACE default
@@ -75,14 +91,39 @@ var (
 	collationEnvInst *collations.Environment
 )
 
+// collationEnvVersion is the MySQL version whose collation set + weights the
+// client-side ci/ai comparator is pinned to. See [collationEnv].
+const collationEnvVersion = "8.0.30"
+
 // collationEnv returns the shared Vitess collation environment. The 8.0
 // collation set is a superset: it carries the utf8mb4_0900_* family (MySQL 8
 // default) plus the legacy utf8mb4_general_ci / utf8_general_ci / latin1_* /
 // *_bin collations, so an older server's column collation still resolves.
 // Vitess caches one Environment per version globally, so sharing is safe.
+//
+// F0-7 (audit 2026-07-18) — the version pin's assumption, stated honestly.
+// The comparator's case/accent WEIGHTS come from this pinned env, not from the
+// source tablet. For the standard MySQL/PlanetScale/Vitess deployments this is
+// faithful: the utf8mb4 collation weight tables are stable across the 8.0.x
+// line, and 8.0.30's set is a superset of the 5.7 / MariaDB legacy names. The
+// residual risk is an EXOTIC self-hosted-Vitess tablet running a MySQL/MariaDB
+// build whose weights for a given collation DIFFER from 8.0.30 — a
+// theoretically possible divergence for the ci/ai fold path. sluice cannot
+// cheaply learn a VStream tablet's underlying mysqld version at predicate-
+// compile time (there is no reachable per-tablet version signal on the source
+// engine surface the evaluator sees), so it does NOT silently trust a
+// mismatch it can't detect: the operator-facing contract (documented in
+// docs/operator/filtered-subset-migration.md) is that the client-side ci/ai
+// collation set is pinned to MySQL 8.0.30, and an operator on such an exotic
+// build who needs a byte-exact guarantee uses --where-strict-collation (which
+// refuses the fold path outright) or normalizes on the source. When a
+// reachable version signal is added to the source engine surface, this env can
+// be constructed per-source and a detected mismatch warned/refused; until then
+// the pin is explicit and the escape hatch is documented rather than a silent
+// best-effort.
 func collationEnv() *collations.Environment {
 	collationEnvOnce.Do(func() {
-		collationEnvInst = collations.NewEnvironment("8.0.30")
+		collationEnvInst = collations.NewEnvironment(collationEnvVersion)
 	})
 	return collationEnvInst
 }

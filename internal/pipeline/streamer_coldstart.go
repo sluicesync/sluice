@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -998,6 +999,31 @@ func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotNa
 		if len(rowFilters) > 0 {
 			if opener, ok := source.(ir.FilteredSnapshotOpener); ok {
 				return opener.OpenSnapshotStreamForTablesFiltered(ctx, dsn, tables, rowFilters)
+			}
+			// audit 2026-07-18 F0-9 (latent, made loud): row filters ARE set but
+			// this engine does NOT implement FilteredSnapshotOpener — the open-
+			// time push-down is the ONLY place a VStream-family snapshot applies
+			// the filter (its post-open RowFilterSetter is a no-op that merely
+			// satisfies the capability gate, cdc_vstream_snapshot.go:2971). Falling
+			// through to the plain TableScopedSnapshotOpener here would open the
+			// snapshot UNFILTERED and stream every row of the scoped tables with no
+			// loud floor — a silent leak of out-of-scope rows. Refuse instead. No
+			// engine hits this today (the VStream flavor implements
+			// FilteredSnapshotOpener); the guard exists so a FUTURE table-scoped
+			// flavor that gains scoping but not filtered-open cannot silently
+			// regress the filter. The open-time push-down is load-bearing.
+			if _, scoped := source.(ir.TableScopedSnapshotOpener); scoped {
+				return nil, sluicecode.Wrap(
+					sluicecode.CodeWhereCDCUnsupportedPredicate,
+					"use `sluice migrate --where` for a one-shot filtered copy, or run the filtered sync against an engine whose snapshot supports open-time filtering",
+					fmt.Errorf(
+						"continuous filtered sync: source engine %q scopes its cold-start snapshot by table but cannot push a --where "+
+							"row filter into the snapshot open, and its snapshot has no faithful post-open row filter — opening it would "+
+							"stream every row of the scoped tables unfiltered and silently leak out-of-scope rows. The stream stops here "+
+							"rather than copy the whole table",
+						source.Name(),
+					),
+				)
 			}
 		}
 		if opener, ok := source.(ir.TableScopedSnapshotOpener); ok {

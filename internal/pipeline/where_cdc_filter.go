@@ -209,9 +209,12 @@ func partialBeforeImage(op, schema, table, column string) error {
 // read every OLD column, and [whereCDCFilter.narrowBefore] re-narrows to
 // the key columns before the applier builds its WHERE. MySQL and Postgres
 // CDC readers implement it.
-type fullBeforeImageSetter interface {
-	SetFullBeforeImageTables(tables map[string]bool)
-}
+//
+// It is an ALIAS of [ir.FullBeforeImageSetter] so the concrete engine
+// readers can compile-assert conformance in their own packages
+// (capabilities_assert.go); see the ir declaration for why the surface is
+// pinned there (audit 2026-07-18 M-A2).
+type fullBeforeImageSetter = ir.FullBeforeImageSetter
 
 // applyFullBeforeImageTables wires the filtered-table set onto the CDC
 // reader so it emits full before-images for those tables. It is a no-op
@@ -396,6 +399,18 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		default:
 			// move-OUT (before && !after): DELETE by key so the now-out-of-
 			// scope row doesn't leak on the target. Narrow to the key columns.
+			//
+			// audit 2026-07-18 F0-8 (inherent subset-CDC hazard, NOT a bug):
+			// this DELETE has no source analog — the source still holds the row;
+			// only its filter scope changed. With ENFORCED target FKs a child of
+			// a moved-out parent surfaces loudly (23503 → SLUICE-E-WHERE-FK-
+			// ORPHAN). But under `--allow-degraded-fks` (FK left NOT VALID) the
+			// parent DELETE succeeds and the target diverges from the source: the
+			// source retains parent+child, the target now has neither. This is
+			// intrinsic to filtering a parent table in continuous sync; sluice
+			// documents it (docs/operator/filtered-subset-migration.md) rather
+			// than silently reshaping the move-OUT — the operator who opts into
+			// degraded FKs owns the referential-integrity reconciliation.
 			return []ir.Change{ir.Delete{
 				Position:   e.Position,
 				Schema:     e.Schema,

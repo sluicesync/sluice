@@ -360,6 +360,41 @@ func TestColumnInfosFromIR(t *testing.T) {
 		wantStringCS(t, m, "vc_empty", true)
 	})
 
+	// audit 2026-07-18 F0-3 / M1.1: a Postgres NAMED collation is byte-exact
+	// (faithful) ONLY when it is provably deterministic; a non-deterministic
+	// ICU collation, and an UNKNOWN-determinism name (the safe zero value),
+	// both refuse. The default (empty) collation stays byte-exact.
+	t.Run("postgres: named collation admitted only when deterministic", func(t *testing.T) {
+		pgCols := []*ir.Column{
+			{Name: "c_det", Type: ir.Text{Collation: "C", Determinism: ir.CollationDeterministic}},
+			{Name: "vc_det", Type: ir.Varchar{Collation: "en_US", Determinism: ir.CollationDeterministic}},
+			{Name: "ch_det", Type: ir.Char{Collation: "POSIX", Determinism: ir.CollationDeterministic}},
+			{Name: "c_nd", Type: ir.Text{Collation: "nd_icu", Determinism: ir.CollationNonDeterministic}},
+			{Name: "c_unknown", Type: ir.Text{Collation: "mystery", Determinism: ir.CollationDeterminismUnknown}},
+			{Name: "c_default", Type: ir.Text{}},
+		}
+		m := ColumnInfosFromIR("postgres", pgCols, false)
+		// Deterministic named collations → byte-exact faithful (allowed).
+		for _, name := range []string{"c_det", "vc_det", "ch_det"} {
+			if !m[name].CaseSensitive || !m[name].faithfulString() {
+				t.Errorf("%s: deterministic named PG collation must be byte-exact faithful, got %+v", name, m[name])
+			}
+			if m[name].Collation != 0 {
+				t.Errorf("%s: byte-exact column must carry no Vitess collation id, got %d", name, m[name].Collation)
+			}
+		}
+		// Non-deterministic + unknown-determinism named collations → refuse.
+		for _, name := range []string{"c_nd", "c_unknown"} {
+			if m[name].faithfulString() {
+				t.Errorf("%s: non-deterministic/unknown named PG collation must NOT be faithful (must refuse), got %+v", name, m[name])
+			}
+		}
+		// Default (empty) collation stays byte-exact.
+		if !m["c_default"].CaseSensitive {
+			t.Error("c_default: PG default collation should be byte-exact")
+		}
+	})
+
 	// ADR-0174 Piece 1: a recognized ci/ai collation resolves to a faithful
 	// comparator (non-strict), so its string comparison is ALLOWED, not
 	// refused — while an unknown/empty collation stays unreproducible.
@@ -424,5 +459,58 @@ func assertEval(t *testing.T, p *Predicate, row ir.Row, want bool) {
 	t.Helper()
 	if got := p.Eval(row); got != want {
 		t.Errorf("Eval(%v) on %q = %v; want %v", row, p, got, want)
+	}
+}
+
+// TestInList_ShortCircuitSemantics pins audit F-P2's short-circuit: a match on
+// an early IN member fixes the result to TRUE (non-negated) / FALSE (NOT IN)
+// regardless of later members — including a later NULL, which must NOT demote
+// a definite match to UNKNOWN. This is both the correctness contract and the
+// behavior the short-circuit relies on (breaking on the first match cannot
+// change the answer).
+func TestInList_ShortCircuitSemantics(t *testing.T) {
+	infos := ColumnInfosFromIR("mysql", []*ir.Column{
+		{Name: "n", Type: ir.Integer{}},
+	}, false)
+
+	// Match on the FIRST member with a NULL later member still in the list:
+	// SQL `n IN (1, NULL)` with n=1 is TRUE (a definite match), never UNKNOWN.
+	p := mustCompile(t, "n IN (1, 2, 3)", infos)
+	assertEval(t, p, ir.Row{"n": int64(1)}, true) // early match
+	assertEval(t, p, ir.Row{"n": int64(3)}, true) // late match
+	assertEval(t, p, ir.Row{"n": int64(9)}, false)
+
+	// NOT IN with an early match short-circuits to FALSE.
+	pn := mustCompile(t, "n NOT IN (1, 2, 3)", infos)
+	assertEval(t, pn, ir.Row{"n": int64(1)}, false)
+	assertEval(t, pn, ir.Row{"n": int64(9)}, true)
+}
+
+// BenchmarkInList_CollationShortCircuit demonstrates the F-P2 win: a 50-value
+// IN on a case-insensitive column whose FIRST member matches pays exactly one
+// collation compare, not fifty — the short-circuit returns on the first TRUE.
+// (Before the fix, inNode.eval looped every member, paying ~50×130ns + 100
+// allocs per row.) The benchmark is a living demonstration, not a hard
+// threshold assertion.
+func BenchmarkInList_CollationShortCircuit(b *testing.B) {
+	cols := []*ir.Column{{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_general_ci"}}}
+	infos := ColumnInfosFromIR("mysql", cols, false)
+	// A 50-member IN list; "EU" is the first member.
+	members := make([]string, 0, 50)
+	members = append(members, "'EU'")
+	for i := 0; i < 49; i++ {
+		members = append(members, "'zz"+string(rune('a'+i%26))+"'")
+	}
+	p, err := Compile("t", "region IN ("+strings.Join(members, ", ")+")", infos)
+	if err != nil {
+		b.Fatalf("compile: %v", err)
+	}
+	row := ir.Row{"region": "eu"} // matches "EU" under general_ci on the FIRST member
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(row) {
+			b.Fatal("expected match")
+		}
 	}
 }

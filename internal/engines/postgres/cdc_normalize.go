@@ -184,15 +184,18 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 	case ir.Varchar:
 		// pgoutput's RelationMessage carries no collation OID. The
 		// SchemaReader reads pg_attribute.attcollation and would
-		// populate Collation for any column with an explicit non-
-		// default collation; the CDC side leaves it empty.
+		// populate Collation (and its determinism) for any column with an
+		// explicit non-default collation; the CDC side leaves them empty.
 		v.Collation = ""
+		v.Determinism = ir.CollationDeterminismUnknown
 		return v
 	case ir.Char:
 		v.Collation = ""
+		v.Determinism = ir.CollationDeterminismUnknown
 		return v
 	case ir.Text:
 		v.Collation = ""
+		v.Determinism = ir.CollationDeterminismUnknown
 		return v
 	case ir.Decimal:
 		// The SchemaReader sets Unconstrained=true for bare `numeric`

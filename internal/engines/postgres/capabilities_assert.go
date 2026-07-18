@@ -147,6 +147,12 @@ var (
 
 	// Logical-replication CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)
+	// FullBeforeImageSetter backs `sync --where` (ADR-0173 Phase 2): the
+	// pipeline type-asserts the pgoutput reader onto it to request un-narrowed
+	// before-images for filtered tables. A rename / re-signature would compile
+	// green while flipping every filtered PG sync to a runtime
+	// "cannot emit full row before-images" refuse (audit 2026-07-18 M-A2).
+	_ ir.FullBeforeImageSetter = (*CDCReader)(nil)
 
 	// Slot manager, snapshot importer, migration-state store — the
 	// concrete types behind the Engine-level openers above.

@@ -208,11 +208,45 @@ func (Float) Tier() Tier { return TierCore }
 
 func (f Float) String() string { return fmt.Sprintf("Float[%s]", f.Precision) }
 
+// CollationDeterminism records whether a NAMED collation compares
+// byte-deterministically — Postgres's pg_collation.collisdeterministic.
+// It is meaningful only for a character type that carries a NON-EMPTY
+// [Char.Collation] / [Varchar.Collation] / [Text.Collation] name; the
+// database DEFAULT collation (empty name) is always deterministic and
+// leaves this field at its zero value.
+//
+// The zero value is [CollationDeterminismUnknown] on purpose (the
+// v0.99.51 zero-value-default discipline): a consumer that has not
+// established a named collation's determinism must treat it as NOT
+// safely byte-comparable — the client-side `--where` evaluator refuses
+// such a column rather than risk a silent divergence from the source's
+// collation-aware `=` (audit 2026-07-18 F0-3). Only a source that
+// positively reads `collisdeterministic=true` sets
+// [CollationDeterministic], which re-admits the deterministic named
+// collations (`"C"`, `"POSIX"`, libc `en_US`, deterministic ICU) as
+// byte-exact.
+type CollationDeterminism uint8
+
+const (
+	// CollationDeterminismUnknown is the safe zero value: determinism has
+	// not been established, so a named collation is treated as
+	// non-byte-comparable (refused by the client-side filter evaluator).
+	CollationDeterminismUnknown CollationDeterminism = iota
+	// CollationDeterministic means the named collation's `=` is byte
+	// equality (PG collisdeterministic=true) — a byte compare is faithful.
+	CollationDeterministic
+	// CollationNonDeterministic means the named collation's `=` is
+	// collation-aware and NOT byte equality (a PG ICU non-deterministic
+	// collation) — a byte compare would diverge from the source.
+	CollationNonDeterministic
+)
+
 // Char is a fixed-length character string.
 type Char struct {
-	Length    int
-	Charset   string
-	Collation string
+	Length      int
+	Charset     string
+	Collation   string
+	Determinism CollationDeterminism
 }
 
 func (Char) isType()    {}
@@ -222,9 +256,10 @@ func (c Char) String() string { return fmt.Sprintf("Char(%d)", c.Length) }
 
 // Varchar is a variable-length character string with an explicit max length.
 type Varchar struct {
-	Length    int
-	Charset   string
-	Collation string
+	Length      int
+	Charset     string
+	Collation   string
+	Determinism CollationDeterminism
 }
 
 func (Varchar) isType()    {}
@@ -235,9 +270,10 @@ func (v Varchar) String() string { return fmt.Sprintf("Varchar(%d)", v.Length) }
 // Text is a variable-length character string sized by category. Postgres
 // TEXT (unbounded) maps to TextLong.
 type Text struct {
-	Size      TextSize
-	Charset   string
-	Collation string
+	Size        TextSize
+	Charset     string
+	Collation   string
+	Determinism CollationDeterminism
 }
 
 func (Text) isType()    {}

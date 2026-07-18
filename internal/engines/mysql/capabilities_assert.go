@@ -114,6 +114,14 @@ var (
 
 	// Binlog CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)
+	// FullBeforeImageSetter backs `sync --where` (ADR-0173 Phase 2): the
+	// pipeline type-asserts the binlog reader onto it to request un-narrowed
+	// before-images for filtered tables. A rename / re-signature would compile
+	// green while flipping every filtered MySQL sync to a runtime
+	// "cannot emit full row before-images" refuse (audit 2026-07-18 M-A2). The
+	// VStream readers below carry it too (no-op there — VStream filters
+	// server-side — but pinned so the surface stays uniform across the flavor).
+	_ ir.FullBeforeImageSetter = (*CDCReader)(nil)
 
 	// VStream (PlanetScale / Vitess flavor) types. The snapshot-rows
 	// reader's resume surfaces are the ADR-0072 crash-resume path —
@@ -121,8 +129,10 @@ var (
 	// start-over.
 	_ ir.CDCReader               = (*vstreamCDCReader)(nil)
 	_ ir.ReshardReopener         = (*vstreamCDCReader)(nil)
+	_ ir.FullBeforeImageSetter   = (*vstreamCDCReader)(nil)
 	_ ir.CDCReader               = (*vstreamSnapshotChanges)(nil)
 	_ ir.ReshardReopener         = (*vstreamSnapshotChanges)(nil)
+	_ ir.FullBeforeImageSetter   = (*vstreamSnapshotChanges)(nil)
 	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
 	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)
 	_ ir.IdempotentCopyReader    = (*vstreamSnapshotRows)(nil)

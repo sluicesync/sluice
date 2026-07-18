@@ -43,6 +43,16 @@ on:
     # 08:00 UTC Sunday — 2h after build-prebaked-images.yml (06:00) so the
     # week's GHCR mirrors are fresh before this sweeps them.
     - cron: "0 8 * * 0"
+  # Tag pushes run ONLY the lean `filtered-tag-gate` job below (a single-version
+  # cluster boot of the ADR-0174 filtered move-OUT crux), NOT the full weekly
+  # version matrix. F-T2 (audit 2026-07-18): the `vitesscluster` filtered
+  # move-OUT test was weekly-only, so v0.99.278 shipped ~2 days before its gate
+  # could run and a Critical rode along. This puts the load-bearing "vtgate
+  # emits BOTH before/after images on a non-vindex move" wire behavior — which
+  # NO unit pin can prove — onto the release path so it executes before a tag
+  # publishes. The heavy full-version sweep stays schedule/dispatch-only.
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       run:
@@ -68,6 +78,9 @@ jobs:
   # image is the GHCR mirror and canary is true only for the :latest tag.
   setup:
     name: Resolve version matrix
+    # Schedule/dispatch only — a tag push runs the lean filtered-tag-gate job,
+    # never the full version sweep (see the `on:` push comment).
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
@@ -87,6 +100,8 @@ jobs:
 
   cluster:
     name: Cluster suite on Vitess ${{ matrix.version }}
+    # Schedule/dispatch only (see setup). Tag pushes use filtered-tag-gate.
+    if: github.event_name != 'push'
     needs: setup
     runs-on: ubuntu-latest
     # The :latest leg is a forward-compat canary — let it fail without failing
@@ -135,4 +150,51 @@ jobs:
         run: |
           go test -tags='integration vitesscluster' -race -count=1 -timeout=60m \
             -run "$RUN_FILTER" \
+            -v ./internal/engines/mysql/...
+
+  # ----- filtered-tag-gate (release path) -----
+  # F-T2 (audit 2026-07-18): the ADR-0174 filtered move-OUT correctness crux —
+  # vtgate emitting BOTH before/after images on a NON-vindex `--where` move so
+  # the pipeline's client-side row-move table can turn a move-OUT into a target
+  # DELETE — has NO unit pin (it is a real Vitess wire behavior). Its only
+  # end-to-end gate (TestVitessClusterFilteredSync, `vitesscluster`-tagged) was
+  # weekly-only, so v0.99.278 was tagged/published ~2 days before it could run
+  # and a Critical shipped. This job runs that ONE test on a tag push, on a
+  # SINGLE pinned Vitess version (the vendored-client major), so the crux gets
+  # CI execution BEFORE a tag publishes. It is NOT a branch-protection required
+  # check (tag pushes aren't PRs) — the release operator watches it alongside
+  # ci.yml/release.yml on the tag, per the CLAUDE.md publish gate. The heavy
+  # full-version sweep stays weekly. -race per the concurrency-chunk gate.
+  filtered-tag-gate:
+    name: Filtered move-OUT gate (tag)
+    if: github.event_name == 'push'
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: read
+    # One test, one cluster boot; mirrors the cluster job's -race budget shape
+    # for a single leg (inner 40m < outer 45m).
+    timeout-minutes: 45
+    env:
+      # Pin to the vendored-client major (vitess.io/vitess v0.24.x). The GHCR
+      # mirror tag mirrors scripts/vitess-versions.txt's v24 entry.
+      VITESS_TAG: v24.0.1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Log in to ghcr.io + pull the pre-baked Vitess image
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh "ghcr.io/sluicesync/sluice-vitess:${VITESS_TAG}"
+      # Same env-indirection as the cluster job: the image ref reaches the
+      # harness via VITESS_LITE_IMAGE, never interpolated into the run text.
+      - name: Boot cluster + run TestVitessClusterFilteredSync
+        env:
+          VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:${{ env.VITESS_TAG }}
+        run: |
+          go test -tags='integration vitesscluster' -race -count=1 -timeout=40m \
+            -run TestVitessClusterFilteredSync \
             -v ./internal/engines/mysql/...

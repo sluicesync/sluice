@@ -181,6 +181,12 @@ func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableN
 			c.datetime_precision,
 			c.is_identity,
 			COALESCE(coll.collname, ''),
+			-- Mirror populateColumns' collisdeterministic projection (audit
+			-- 2026-07-18 F0-3): the observed IR type is compared to the reader's
+			-- via reflect.DeepEqual, so the probe MUST carry the same collation-
+			-- determinism the schema reader sets, or a deterministic named-
+			-- collation column would spuriously read as inconsistent.
+			COALESCE(coll.collisdeterministic, true),
 			COALESCE(a.atttypmod, -1),
 			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
 		FROM   information_schema.columns c
@@ -202,6 +208,7 @@ func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableN
 		numScale, dtPrec    sql.NullInt64
 		isIdentity          string
 		collation           string
+		collIsDeterministic bool
 		attTypmod           int32
 		formatType          string
 	)
@@ -210,6 +217,7 @@ func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableN
 		&charMaxLen, &numPrec, &numScale, &dtPrec,
 		&isIdentity,
 		&collation,
+		&collIsDeterministic,
 		&attTypmod,
 		&formatType,
 	); {
@@ -220,16 +228,17 @@ func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableN
 	}
 
 	meta := columnMeta{
-		DataType:        dataType,
-		UDTName:         udtName,
-		CharMaxLen:      nullInt64ToPtr(charMaxLen),
-		NumPrec:         nullInt64ToPtr(numPrec),
-		NumScale:        nullInt64ToPtr(numScale),
-		DTPrec:          nullInt64ToPtr(dtPrec),
-		IsAutoIncrement: isAutoIncrement(isIdentity, sql.NullString{}),
-		Collation:       collation,
-		AttTypmod:       attTypmod,
-		FormatType:      formatType,
+		DataType:                 dataType,
+		UDTName:                  udtName,
+		CharMaxLen:               nullInt64ToPtr(charMaxLen),
+		NumPrec:                  nullInt64ToPtr(numPrec),
+		NumScale:                 nullInt64ToPtr(numScale),
+		DTPrec:                   nullInt64ToPtr(dtPrec),
+		IsAutoIncrement:          isAutoIncrement(isIdentity, sql.NullString{}),
+		Collation:                collation,
+		CollationIsDeterministic: collIsDeterministic,
+		AttTypmod:                attTypmod,
+		FormatType:               formatType,
 	}
 	t, err := translateType(meta)
 	if err != nil {

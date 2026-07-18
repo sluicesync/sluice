@@ -967,6 +967,14 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			COALESCE(c.is_generated, 'NEVER'),
 			COALESCE(c.generation_expression, ''),
 			COALESCE(coll.collname, ''),
+			-- audit 2026-07-18 F0-3 (M1.1): whether the column's NAMED
+			-- collation compares byte-deterministically. Only a deterministic
+			-- collation has byte-equality semantics, so only it is safe for the
+			-- client-side --where evaluator to reproduce with a byte compare;
+			-- a non-deterministic ICU collation is collation-aware and would
+			-- silently diverge. COALESCE true for the default (unnamed)
+			-- collation, which is always deterministic.
+			COALESCE(coll.collisdeterministic, true),
 			COALESCE(a.atttypmod, -1),
 			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), ''),
 			-- Bug 113 (v0.95.1): pg_type.typtype for the column's
@@ -1016,6 +1024,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&cr.isIdentity,
 			&cr.isGenerated, &cr.genExpr,
 			&cr.collation,
+			&cr.collIsDeterministic,
 			&cr.attTypmod,
 			&cr.formatType,
 			&cr.columnTypeKind,
@@ -1051,23 +1060,24 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 // columnFromRow call instead of a 19-value scan threaded through a helper
 // signature.
 type columnRow struct {
-	tableName, colName string
-	ordinal            int
-	columnDefault      sql.NullString
-	isNullable         string
-	dataType, udtName  string
-	charMaxLen         sql.NullInt64
-	numPrec            sql.NullInt64
-	numScale           sql.NullInt64
-	dtPrec             sql.NullInt64
-	isIdentity         string
-	isGenerated        string
-	genExpr            string
-	collation          string
-	attTypmod          int32
-	formatType         string
-	columnTypeKind     string
-	columnTypeName     string
+	tableName, colName  string
+	ordinal             int
+	columnDefault       sql.NullString
+	isNullable          string
+	dataType, udtName   string
+	charMaxLen          sql.NullInt64
+	numPrec             sql.NullInt64
+	numScale            sql.NullInt64
+	dtPrec              sql.NullInt64
+	isIdentity          string
+	isGenerated         string
+	genExpr             string
+	collation           string
+	collIsDeterministic bool
+	attTypmod           int32
+	formatType          string
+	columnTypeKind      string
+	columnTypeName      string
 }
 
 // columnLookups bundles the side tables populateColumns resolves once up
@@ -1109,16 +1119,17 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 	serialSeqs := lk.serialSeqs
 
 	meta := columnMeta{
-		DataType:        dataType,
-		UDTName:         udtName,
-		CharMaxLen:      nullInt64ToPtr(charMaxLen),
-		NumPrec:         nullInt64ToPtr(numPrec),
-		NumScale:        nullInt64ToPtr(numScale),
-		DTPrec:          nullInt64ToPtr(dtPrec),
-		IsAutoIncrement: r.classifyAutoIncrement(isIdentity, columnDefault, tableName, colName, serialSeqs),
-		Collation:       collation,
-		AttTypmod:       attTypmod,
-		FormatType:      formatType,
+		DataType:                 dataType,
+		UDTName:                  udtName,
+		CharMaxLen:               nullInt64ToPtr(charMaxLen),
+		NumPrec:                  nullInt64ToPtr(numPrec),
+		NumScale:                 nullInt64ToPtr(numScale),
+		DTPrec:                   nullInt64ToPtr(dtPrec),
+		IsAutoIncrement:          r.classifyAutoIncrement(isIdentity, columnDefault, tableName, colName, serialSeqs),
+		Collation:                collation,
+		CollationIsDeterministic: cr.collIsDeterministic,
+		AttTypmod:                attTypmod,
+		FormatType:               formatType,
 	}
 
 	// Bug 113 round-trip carry (v0.95.2). A column whose

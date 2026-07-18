@@ -1866,6 +1866,31 @@ type FilteredCDCPreflighter interface {
 	PreflightFilteredCDCBeforeImage(ctx context.Context, dsn string, tables []string) error
 }
 
+// FullBeforeImageSetter is the optional CDC-reader surface a filtered
+// continuous sync (`sync --where`, ADR-0173 Phase 2) uses to request
+// UN-narrowed before-images for the filtered tables. A CDC reader normally
+// narrows the before-image to identity-key columns (Bug-8/88/92); for the
+// named tables it must instead emit the FULL decoded old tuple so the
+// client-side row-move evaluation can read every OLD column the `--where`
+// predicate references, after which the pipeline re-narrows to the key
+// columns before the applier builds its WHERE.
+//
+// The MySQL binlog + Postgres pgoutput CDCReaders (and the VStream readers)
+// implement it; a reader that does NOT is refused loudly by the pipeline
+// (silently accepting a PK-narrowed before-image would mis-classify a
+// move-OUT and leak an out-of-scope row on the target).
+//
+// It lives in `ir` — not only in the pipeline — so the concrete engine
+// readers can pin their conformance at compile time
+// (`capabilities_assert.go`, audit 2026-07-18 M-A2): a rename or
+// re-signature of SetFullBeforeImageTables would otherwise keep `go build`
+// green while flipping every filtered sync on that engine to a runtime
+// refuse. The pipeline's own optional-interface assertion is an alias of
+// this type.
+type FullBeforeImageSetter interface {
+	SetFullBeforeImageTables(tables map[string]bool)
+}
+
 // IndexBuildTuner is the optional surface a [SchemaWriter] can implement
 // to accept the operator's `--index-build-mem` value (a per-build
 // maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator

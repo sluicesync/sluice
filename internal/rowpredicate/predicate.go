@@ -221,11 +221,11 @@ func columnInfoFor(engineName string, c *ir.Column, strict bool) ColumnInfo {
 	case ir.Boolean:
 		return ColumnInfo{Family: FamilyBool}
 	case ir.Char:
-		return stringColumnInfo(engineName, t.Collation, strict)
+		return stringColumnInfo(engineName, t.Collation, t.Determinism, strict)
 	case ir.Varchar:
-		return stringColumnInfo(engineName, t.Collation, strict)
+		return stringColumnInfo(engineName, t.Collation, t.Determinism, strict)
 	case ir.Text:
-		return stringColumnInfo(engineName, t.Collation, strict)
+		return stringColumnInfo(engineName, t.Collation, t.Determinism, strict)
 	case ir.Enum, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// Canonical/identifier-shaped ASCII values: the source's `=` is
 		// exact, so a byte compare is faithful.
@@ -287,19 +287,24 @@ func isMySQLFamily(engineName string) bool {
 // RESOLVABLE collation is carried so the evaluator compares via Vitess's own
 // comparator ([collationEqual]); an unresolvable/empty collation stays
 // unreproducible so its string comparisons refuse loudly at compile time.
-func stringColumnInfo(engineName, collation string, strict bool) ColumnInfo {
+func stringColumnInfo(engineName, collation string, determinism ir.CollationDeterminism, strict bool) ColumnInfo {
 	// Postgres / SQLite: the deterministic DEFAULT collation (empty in the IR)
-	// is byte-exact, so a byte compare is faithful. A NAMED collation may be
-	// non-deterministic (a Postgres ICU `ks-level` collation), whose `=` is
-	// collation-aware — sluice cannot prove or reproduce that, so it refuses
-	// rather than silently byte-compare (audit F0-3). Determinism isn't carried
-	// in the IR yet; a follow-up can capture pg_collation.collisdeterministic to
-	// re-admit the deterministic named collations.
+	// is byte-exact, so a byte compare is faithful. A NAMED collation is
+	// byte-exact ONLY when it is provably DETERMINISTIC: a deterministic
+	// collation's `=` (libc "C"/"POSIX"/"en_US", deterministic ICU — PG
+	// collisdeterministic=true) is byte equality, so a byte compare reproduces
+	// it exactly. A NON-deterministic ICU collation (`ks-level`, PG
+	// collisdeterministic=false) has a collation-aware `=` sluice cannot
+	// reproduce, and an UNKNOWN determinism (the safe zero value — e.g. a
+	// SQLite NOCASE/RTRIM collation, whose determinism the reader does not
+	// establish) is treated the same: both refuse rather than silently
+	// byte-compare (audit 2026-07-18 F0-3 / M1.1). The determinism signal is
+	// carried into the IR from pg_collation.collisdeterministic.
 	if !isMySQLFamily(engineName) {
-		if collation == "" {
+		if collation == "" || determinism == ir.CollationDeterministic {
 			return ColumnInfo{Family: FamilyString, CaseSensitive: true}
 		}
-		return ColumnInfo{Family: FamilyString} // named PG/SQLite collation -> refuse
+		return ColumnInfo{Family: FamilyString} // non-deterministic / unknown named collation -> refuse
 	}
 
 	// MySQL family. A faithful string comparison needs a KNOWN, UTF-8-charset
@@ -510,13 +515,25 @@ func (n inNode) eval(row ir.Row) truth {
 	for _, l := range n.lits {
 		switch compareValue(n.fam, v, opEq, l, n.collation, n.padSpace) {
 		case truthTrue:
-			res = truthTrue
+			// audit F-P2: an IN list desugars to OR-of-equalities, where TRUE
+			// dominates (an unmatched-but-NULL later member cannot demote a
+			// definite match to UNKNOWN). So the first TRUE fixes the result —
+			// break instead of paying compareValue (up to ~130ns + 2 allocs on
+			// the collation-fold path) for every remaining member. NOT IN
+			// (negated) is res.not(): res=TRUE → FALSE, equally final, so the
+			// same short-circuit is correct there too.
+			return n.maybeNegate(truthTrue)
 		case truthUnknown:
 			if res != truthTrue {
 				res = truthUnknown
 			}
 		}
 	}
+	return n.maybeNegate(res)
+}
+
+// maybeNegate applies NOT-IN's negation to a computed IN result.
+func (n inNode) maybeNegate(res truth) truth {
 	if n.negated {
 		return res.not()
 	}
