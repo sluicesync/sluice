@@ -126,6 +126,46 @@ func TestProgressTicker_PeriodicTickIncludesETA(t *testing.T) {
 	}
 }
 
+// TestProgressTicker_TotalRowsEstimatedFlag pins roadmap #22: total_rows is
+// always a statistics estimate, so once the live row count passes it the line
+// carries total_rows_estimated=true and eta_seconds reverts to -1 (unknown) —
+// so `rows > total_rows` reads as "past the estimate", not a bug.
+func TestProgressTicker_TotalRowsEstimatedFlag(t *testing.T) {
+	logs := captureSlog(t)
+
+	pt := newProgressTicker(context.Background(), 30*time.Millisecond, "events")
+	pt.setTotalRows(2) // tiny estimate; the live count sails past it
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				pt.inc()
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	pt.Stop(context.Background(), nil)
+
+	out := logs.String()
+	if !strings.Contains(out, "total_rows_estimated=true") {
+		t.Errorf("expected total_rows_estimated=true once total is populated; got: %q", out)
+	}
+	// Once rows >= the estimate, the ETA is unknown, never a bogus value.
+	if !strings.Contains(out, "eta_seconds=-1") {
+		t.Errorf("expected eta_seconds=-1 when rows passed the estimate; got: %q", out)
+	}
+}
+
 // TestProgressTicker_ChunkAttribute verifies the parallel-copy variant
 // emits a `chunk` attribute on every line and propagates it through
 // Stop. Operators tailing the log correlate per-chunk progress via

@@ -346,6 +346,15 @@ func (p *progressTicker) loop(ctx context.Context) {
 				slog.Float64("rate_mb_per_sec", mbps),
 				slog.Int64("eta_seconds", etaSecs),
 			}
+			// roadmap #22: total_rows is ALWAYS a statistics estimate (MySQL
+			// information_schema.TABLE_ROWS, PG pg_class.reltuples), so a live
+			// copy routinely passes it — `rows > total_rows` is expected, not a
+			// bug. Mark it estimated so the raw line (and any percent-deriving
+			// consumer) reads "past the estimate", not "past the real total".
+			// Only when total is populated (0 = "not yet available").
+			if total > 0 {
+				attrs = append(attrs, slog.Bool("total_rows_estimated", true))
+			}
 			if p.hasChunk {
 				attrs = append(attrs, slog.Int("chunk", p.chunk))
 			}

@@ -399,7 +399,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
-### 22. Progress ETA: label `total_rows` as an estimate (avoid "rows > total" confusion) — *cosmetic UX hardening; ETA safety already handled*
+### 22. Progress ETA: label `total_rows` as an estimate (avoid "rows > total" confusion) — *✅ SHIPPED. TTY panel: `internal/progress/model.go:265-276` renders `100%+` + `(N rows, est. exceeded)` when the live count passes the estimate. Raw slog line: `internal/pipeline/progress.go` now emits `total_rows_estimated=true` (when total>0) alongside `total_rows`, pinned by `TestProgressTicker_TotalRowsEstimatedFlag` (rows>total → flag set + `eta_seconds=-1`). ETA math was already safe (`progress.go` computes ETA only `if total > rows`).*
 
 **Why.** The bulk-copy progress ticker's `total_rows` is ALWAYS a statistics ESTIMATE — MySQL `information_schema.TABLE_ROWS`, PG `pg_class.reltuples` (`row_reader_range.go` `CountRows` on both engines; the native concurrent reader uses the same TABLE_ROWS estimate via the side metadata pool, item 21a follow-up). These can be off ±50%+ without a recent `ANALYZE` or under write churn, so a table can copy MORE rows than the estimate. The ETA math is already safe — `progress.go:218` only computes ETA `if total > rows`, so once rows reach/exceed the estimate `eta_seconds` reverts to `-1` (unknown), never negative — but the raw progress line can read `rows=1500000 total_rows=800000 eta_seconds=-1`, which looks odd (rows past the stated total). Pre-existing + universal (all cold-start/migrate paths), surfaced 2026-06-18 while reviewing the item-21a ETA forwarding.
 
