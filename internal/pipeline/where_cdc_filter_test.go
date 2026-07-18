@@ -26,7 +26,7 @@ func usersFilter(t *testing.T) *whereCDCFilter {
 		},
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 	}}}
-	f, err := buildWhereCDCFilter("postgres", map[string]string{"users": "country = 'US'"}, schema, false)
+	f, err := buildWhereCDCFilter(ir.ByteExactCollationResolver{}, map[string]string{"users": "country = 'US'"}, schema, false)
 	if err != nil {
 		t.Fatalf("buildWhereCDCFilter: %v", err)
 	}
@@ -238,18 +238,18 @@ func TestBuildWhereCDCFilterRefusals(t *testing.T) {
 	}}}
 
 	t.Run("unknown table -> coded refusal", func(t *testing.T) {
-		_, err := buildWhereCDCFilter("postgres", map[string]string{"nope": "country = 'US'"}, schema, false)
+		_, err := buildWhereCDCFilter(ir.ByteExactCollationResolver{}, map[string]string{"nope": "country = 'US'"}, schema, false)
 		assertCoded(t, err, sluicecode.CodeWhereCDCUnsupportedPredicate)
 		if !strings.Contains(err.Error(), "nope") {
 			t.Errorf("refusal %q does not name the table", err.Error())
 		}
 	})
 	t.Run("unsupported predicate -> coded refusal", func(t *testing.T) {
-		_, err := buildWhereCDCFilter("postgres", map[string]string{"users": "lower(country) = 'us'"}, schema, false)
+		_, err := buildWhereCDCFilter(ir.ByteExactCollationResolver{}, map[string]string{"users": "lower(country) = 'us'"}, schema, false)
 		assertCoded(t, err, sluicecode.CodeWhereCDCUnsupportedPredicate)
 	})
 	t.Run("empty filters -> nil filter", func(t *testing.T) {
-		f, err := buildWhereCDCFilter("postgres", nil, schema, false)
+		f, err := buildWhereCDCFilter(ir.ByteExactCollationResolver{}, nil, schema, false)
 		if err != nil || f != nil {
 			t.Errorf("empty filters: got (%v, %v); want (nil, nil)", f, err)
 		}

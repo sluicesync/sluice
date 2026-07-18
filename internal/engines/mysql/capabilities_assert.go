@@ -27,6 +27,7 @@ var (
 	// Engine-level optional openers / orderers (value type — the
 	// registry holds Engine values, see init()).
 	_ ir.Engine                                = Engine{}
+	_ ir.CollationResolverProvider             = Engine{}
 	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
 	_ ir.DatabaseDSNDeriver                    = Engine{}
@@ -127,15 +128,19 @@ var (
 	// reader's resume surfaces are the ADR-0072 crash-resume path —
 	// losing any of these silently turns a resumable COPY into a
 	// start-over.
-	_ ir.CDCReader               = (*vstreamCDCReader)(nil)
-	_ ir.ReshardReopener         = (*vstreamCDCReader)(nil)
-	_ ir.FullBeforeImageSetter   = (*vstreamCDCReader)(nil)
-	_ ir.CDCReader               = (*vstreamSnapshotChanges)(nil)
-	_ ir.ReshardReopener         = (*vstreamSnapshotChanges)(nil)
-	_ ir.FullBeforeImageSetter   = (*vstreamSnapshotChanges)(nil)
-	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
-	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)
-	_ ir.IdempotentCopyReader    = (*vstreamSnapshotRows)(nil)
+	_ ir.CDCReader             = (*vstreamCDCReader)(nil)
+	_ ir.ReshardReopener       = (*vstreamCDCReader)(nil)
+	_ ir.FullBeforeImageSetter = (*vstreamCDCReader)(nil)
+	// ADR-0174 Piece 2 / audit F-P1 — the warm-resume server-side filter push-
+	// down. A drift here silently reverts warm resume to the full-keyspace
+	// unfiltered stream (a perf regression) while go build stays green.
+	_ ir.ServerSideCDCFilterSetter = (*vstreamCDCReader)(nil)
+	_ ir.CDCReader                 = (*vstreamSnapshotChanges)(nil)
+	_ ir.ReshardReopener           = (*vstreamSnapshotChanges)(nil)
+	_ ir.FullBeforeImageSetter     = (*vstreamSnapshotChanges)(nil)
+	_ ir.CopyCheckpointer          = (*vstreamSnapshotRows)(nil)
+	_ ir.CopyDurableProgressSink   = (*vstreamSnapshotRows)(nil)
+	_ ir.IdempotentCopyReader      = (*vstreamSnapshotRows)(nil)
 	// LossyFloatCopyReader signals the VStream COPY phase rounds FLOATs
 	// (the 17-year MySQL display-rounding bug), which TRIGGERS the
 	// cold-start FLOAT repair. Dispatched by runtime type-assertion at

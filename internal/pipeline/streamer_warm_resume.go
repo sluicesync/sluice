@@ -81,6 +81,19 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 		migcore.CloseIf(cdc)
 		return nil, stop, err
 	}
+	// ADR-0174 Piece 2 / audit F-P1: push the --where predicates into the
+	// reader's SERVER-SIDE stream filter on warm resume so the resumed stream
+	// is reduced at the source (VStream) instead of pulling the whole keyspace
+	// and discarding ~99% client-side after every restart. PERFORMANCE only —
+	// the client-side row-move classification (interceptWhereFilter → route)
+	// still runs on every delivered change and preserves correctness; readers
+	// with no server-side stream filter (binlog / pgoutput) don't implement the
+	// setter and silently no-op (correct, just unfiltered at the source).
+	if len(s.RowFilters) > 0 {
+		if setter, ok := cdc.(ir.ServerSideCDCFilterSetter); ok {
+			setter.SetServerSideRowFilters(s.RowFilters)
+		}
+	}
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		migcore.CloseIf(cdc)

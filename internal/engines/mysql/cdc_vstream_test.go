@@ -1105,6 +1105,73 @@ func TestVStreamCopyProgressWindow_GenerousByDefault(t *testing.T) {
 	}
 }
 
+// TestVStreamCDCTailFilterRules pins the ADR-0174 Piece 2 / audit F-P1
+// warm-resume server-side filter rules: with no --where the CDC tail keeps the
+// pre-F-P1 keyspace-wide catch-all; with filters, each filtered table gets an
+// exact-Match `select * from <t> where (<pred>)` rule ORDERED BEFORE the
+// trailing `/.*/` catch-all (VStream matches first-wins, so the exact rules
+// must precede it) — non-filtered tables still stream via the catch-all.
+func TestVStreamCDCTailFilterRules(t *testing.T) {
+	t.Run("no filters ⇒ bare catch-all (byte-identical to pre-F-P1)", func(t *testing.T) {
+		for _, f := range []map[string]string{nil, {}} {
+			got := vstreamCDCTailFilterRules(f)
+			if len(got) != 1 || got[0].GetMatch() != "/.*/" || got[0].GetFilter() != "" {
+				t.Fatalf("vstreamCDCTailFilterRules(%v) = %+v; want single {Match:/.*/, Filter:\"\"}", f, got)
+			}
+		}
+	})
+
+	t.Run("filtered tables get server-side WHERE rules before the catch-all", func(t *testing.T) {
+		got := vstreamCDCTailFilterRules(map[string]string{
+			"orders":  "region = 'EU'",
+			"tenants": "id IN (1,2,3)",
+		})
+		// 2 filtered rules (sorted) + trailing catch-all.
+		if len(got) != 3 {
+			t.Fatalf("got %d rules; want 3 (2 filtered + catch-all): %+v", len(got), got)
+		}
+		if got[0].GetMatch() != "orders" || got[0].GetFilter() != "select * from orders where (region = 'EU')" {
+			t.Errorf("rule[0] = {%q,%q}; want orders WHERE region", got[0].GetMatch(), got[0].GetFilter())
+		}
+		if got[1].GetMatch() != "tenants" || got[1].GetFilter() != "select * from tenants where (id IN (1,2,3))" {
+			t.Errorf("rule[1] = {%q,%q}; want tenants WHERE id IN", got[1].GetMatch(), got[1].GetFilter())
+		}
+		// The catch-all MUST be LAST so the exact filtered-table rules win
+		// (first-match wins in VStream); a leading catch-all would swallow them.
+		last := got[len(got)-1]
+		if last.GetMatch() != "/.*/" || last.GetFilter() != "" {
+			t.Errorf("last rule = {%q,%q}; want the trailing {/.*/,\"\"} catch-all", last.GetMatch(), last.GetFilter())
+		}
+	})
+
+	t.Run("SetServerSideRowFilters threads through buildVStreamRequest", func(t *testing.T) {
+		r := &vstreamCDCReader{keyspace: "main", shards: []string{"0"}, tabletType: topodata.TabletType_REPLICA}
+		r.SetServerSideRowFilters(map[string]string{"orders": "region = 'EU'"})
+		req, err := r.buildVStreamRequest([]shardGtid{{Keyspace: "main", Shard: "0", Gtid: "current"}})
+		if err != nil {
+			t.Fatalf("buildVStreamRequest: %v", err)
+		}
+		rules := req.GetFilter().GetRules()
+		if len(rules) != 2 || rules[0].GetMatch() != "orders" ||
+			rules[0].GetFilter() != "select * from orders where (region = 'EU')" ||
+			rules[1].GetMatch() != "/.*/" {
+			t.Fatalf("buildVStreamRequest rules = %+v; want [orders-WHERE, /.*/]", rules)
+		}
+	})
+
+	t.Run("unset filters ⇒ buildVStreamRequest keeps the catch-all", func(t *testing.T) {
+		r := &vstreamCDCReader{keyspace: "main", shards: []string{"0"}, tabletType: topodata.TabletType_REPLICA}
+		req, err := r.buildVStreamRequest([]shardGtid{{Keyspace: "main", Shard: "0", Gtid: "current"}})
+		if err != nil {
+			t.Fatalf("buildVStreamRequest: %v", err)
+		}
+		rules := req.GetFilter().GetRules()
+		if len(rules) != 1 || rules[0].GetMatch() != "/.*/" {
+			t.Fatalf("unfiltered rules = %+v; want single /.*/ catch-all", rules)
+		}
+	})
+}
+
 // TestBuildVStreamRequest_TabletTypeSelection pins the cursor-dependent
 // tablet selection (ADR-0072 + ADR-0073 (b2)):
 //

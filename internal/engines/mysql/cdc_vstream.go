@@ -105,6 +105,22 @@ type vstreamCDCReader struct {
 	// querying the keyspace metadata in resolveStartPosition.
 	shards []string
 
+	// rowFilters maps SOURCE table name → the operator's native-SQL `--where`
+	// predicate for a continuous FILTERED sync (ADR-0174 Piece 2, audit
+	// 2026-07-18 F-P1). On a WARM RESUME the pipeline threads it here (via
+	// [ir.ServerSideCDCFilterSetter]) BEFORE StreamChanges, so
+	// [buildVStreamRequest] pushes the predicate into the VStream filter rules
+	// and vtgate reduces the resumed stream SERVER-SIDE — instead of the
+	// pre-F-P1 behavior of tailing the WHOLE keyspace and discarding ~99% of it
+	// client-side after every restart/crash-resume. It mirrors the cold-start
+	// snapshot's [vstreamCopyFilterRules] push-down. Efficiency only: the
+	// pipeline's client-side row-move classification still runs on every
+	// delivered change, so correctness never depends on this being set. Set
+	// once before the stream opens and only READ thereafter (StreamChanges +
+	// reshard Reopen), so no synchronization is needed. nil/empty ⇒ the
+	// pre-F-P1 keyspace-wide catch-all (byte-identical unfiltered stream).
+	rowFilters map[string]string
+
 	// tabletType is the vtgate tablet type the PURE-CDC-TAIL VStream
 	// request targets (the vstream_tablet_type DSN param; default
 	// REPLICA). A COPY-resume (TablePKs cursor present) overrides this
@@ -793,6 +809,19 @@ func (r *vstreamCDCReader) setErr(err error) {
 // column. Accepting the set is enough; it needs no storage.
 func (r *vstreamCDCReader) SetFullBeforeImageTables(map[string]bool) {}
 
+// SetServerSideRowFilters implements [ir.ServerSideCDCFilterSetter]: it records
+// the operator's `--where` predicates so a WARM RESUME pushes them into the
+// VStream filter rules server-side (ADR-0174 Piece 2, audit 2026-07-18 F-P1),
+// rather than tailing the whole keyspace and discarding ~99% client-side after
+// every restart. It is called by the pipeline BEFORE StreamChanges, so
+// [buildVStreamRequest] (invoked from StreamChanges and from the reshard
+// Reopen) sees the filters. Efficiency only — the pipeline's client-side
+// row-move classification still runs on every delivered change. An empty/nil
+// map is byte-identical to the pre-F-P1 unfiltered stream.
+func (r *vstreamCDCReader) SetServerSideRowFilters(filters map[string]string) {
+	r.rowFilters = filters
+}
+
 // Close cancels the streaming goroutine (if any) and closes the
 // gRPC connection. Safe to call multiple times.
 func (r *vstreamCDCReader) Close() error {
@@ -1048,6 +1077,43 @@ func tabletTypeSuffix(t topodata.TabletType) string {
 //     so resuming there keeps the COPY read consistent with the
 //     snapshot's GTID anchor. This mirrors the snapshot cold-start
 //     and reconnectCopy paths, which already target PRIMARY.
+//
+// vstreamCDCTailFilterRules builds the steady-state (CDC-tail / warm-resume)
+// VStream filter rules for a continuous filtered sync (ADR-0174 Piece 2, audit
+// 2026-07-18 F-P1). For each `--where` table it emits an exact-Match rule
+// carrying the server-side `select * from <t> where (<pred>)` predicate — the
+// same shape the cold-start snapshot uses ([vstreamCopyFilterRules]) — followed
+// by a `/.*/` keyspace-wide catch-all so EVERY OTHER table still streams
+// unfiltered. VStream matches rules in order (first match wins), so the exact
+// filtered-table rules MUST precede the catch-all; a non-filtered table falls
+// through to the catch-all exactly as it did before F-P1. With no filters it
+// returns the bare catch-all — byte-identical to the pre-F-P1 warm-resume
+// request. The predicate is always parenthesized so a disjunctive `--where`
+// can't escape its per-table scope; table names are used verbatim (already
+// canonicalized to the schema's casing by the pipeline's key validation).
+func vstreamCDCTailFilterRules(filters map[string]string) []*binlogdata.Rule {
+	if len(filters) == 0 {
+		return []*binlogdata.Rule{{Match: "/.*/"}}
+	}
+	// Deterministic rule order (stable request + stable test assertions).
+	tables := make([]string, 0, len(filters))
+	for t := range filters {
+		tables = append(tables, t)
+	}
+	sort.Strings(tables)
+	rules := make([]*binlogdata.Rule, 0, len(tables)+1)
+	for _, t := range tables {
+		filter := "select * from " + t
+		if pred := filters[t]; pred != "" {
+			filter += " where (" + pred + ")"
+		}
+		rules = append(rules, &binlogdata.Rule{Match: t, Filter: filter})
+	}
+	// Trailing catch-all keeps every non-filtered table streaming unfiltered.
+	rules = append(rules, &binlogdata.Rule{Match: "/.*/"})
+	return rules
+}
+
 func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStreamRequest, error) {
 	shardGtids, err := toProtoShardGtids(start)
 	if err != nil {
@@ -1067,12 +1133,11 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 	return &vtgate.VStreamRequest{
 		TabletType: tabletType,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: shardGtids},
-		Filter: &binlogdata.Filter{Rules: []*binlogdata.Rule{
-			// "/.*/" matches every table in the keyspace. Refining
-			// to specific tables is a future enhancement once the
-			// IR carries a per-stream table allowlist.
-			{Match: "/.*/"},
-		}},
+		// A filtered continuous sync (ADR-0174 Piece 2, audit F-P1) pushes the
+		// operator's `--where` predicates into the stream server-side on warm
+		// resume; with no filter this is the plain keyspace-wide catch-all
+		// (byte-identical to the pre-F-P1 request).
+		Filter: &binlogdata.Filter{Rules: vstreamCDCTailFilterRules(r.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
 			// MinimizeSkew holds the ahead shard back to keep the merged
 			// multi-shard stream commit-time ordered. ADR-0120 (default flipped

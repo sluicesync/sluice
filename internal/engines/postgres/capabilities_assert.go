@@ -27,6 +27,7 @@ var (
 	// Engine-level optional openers / probers (value type — the
 	// registry holds an Engine value, see init()).
 	_ ir.Engine                         = Engine{}
+	_ ir.CollationResolverProvider      = Engine{}
 	_ irbackup.SnapshotOpener           = Engine{}
 	_ ir.CDCReaderWithSlotOpener        = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer    = Engine{}

@@ -1891,6 +1891,35 @@ type FullBeforeImageSetter interface {
 	SetFullBeforeImageTables(tables map[string]bool)
 }
 
+// ServerSideCDCFilterSetter is the optional CDC-reader surface a WARM-RESUME
+// continuous filtered sync (`sync --where`, ADR-0174 Piece 2) uses to push the
+// operator's `--where` predicates into the reader's SERVER-SIDE stream filter,
+// so a resumed stream is reduced at the source instead of pulling the whole
+// keyspace and discarding ~99% of it client-side after every restart/crash-
+// resume (audit 2026-07-18 F-P1).
+//
+// It is a PERFORMANCE surface, not a correctness one: the pipeline's
+// client-side row-move classification (the ADR-0173 route()) still runs on
+// every delivered change regardless — the server-side filter only reduces what
+// is delivered. So a reader that does NOT implement this interface (the MySQL
+// binlog + Postgres pgoutput CDC readers, which have no server-side stream
+// filter) is a silent no-op: the resume is correct, merely unfiltered at the
+// source. Only the VStream (PlanetScale / Vitess) CDC reader implements it,
+// mirroring the cold-start snapshot's server-side push-down
+// ([FilteredSnapshotOpener]).
+//
+// filters maps SOURCE table name → the native-SQL `--where` predicate (the
+// same map [RowFilterSetter] carries on the migrate leg). The reader wraps each
+// in a `select * from <t> where (<pred>)` filter rule; tables with no entry
+// keep streaming unfiltered. Like [FullBeforeImageSetter] it lives in `ir` so
+// the concrete VStream reader can compile-assert conformance
+// (capabilities_assert.go) — a rename/re-signature would otherwise silently
+// drop the warm-resume server-side reduction (a perf regression) while
+// `go build` stays green.
+type ServerSideCDCFilterSetter interface {
+	SetServerSideRowFilters(filters map[string]string)
+}
+
 // IndexBuildTuner is the optional surface a [SchemaWriter] can implement
 // to accept the operator's `--index-build-mem` value (a per-build
 // maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator

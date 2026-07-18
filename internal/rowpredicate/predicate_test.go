@@ -47,7 +47,7 @@ func mustRefuse(t *testing.T, predicate string, infos map[string]ColumnInfo) {
 // ColumnInfosFromIR from ir.Float so the FamilyFloat routing is exercised, not
 // a hand-set family.
 func TestFloatEqualityRefused(t *testing.T) {
-	floatCol := ColumnInfosFromIR("mysql", []*ir.Column{{Name: "x", Type: ir.Float{}}}, false)
+	floatCol := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{{Name: "x", Type: ir.Float{}}}, false)
 	for _, pred := range []string{
 		"x = 0.1",
 		"x != 0.1",
@@ -79,9 +79,9 @@ func TestFloatEqualityRefused(t *testing.T) {
 // know which columns a partial before-image must carry.
 func TestColumns(t *testing.T) {
 	infos := map[string]ColumnInfo{
-		"region":    {Family: FamilyString, CaseSensitive: true},
+		"region":    {Family: FamilyString, Faithful: true},
 		"tenant_id": {Family: FamilyNumeric},
-		"deleted":   {Family: FamilyString, CaseSensitive: true},
+		"deleted":   {Family: FamilyString, Faithful: true},
 		"age":       {Family: FamilyNumeric},
 	}
 	p := mustCompile(t, "(region = 'EU' AND tenant_id IN (1,2)) OR NOT (deleted IS NULL) OR age > 3", infos)
@@ -152,13 +152,13 @@ func TestValueFamilies(t *testing.T) {
 		assertEval(t, p2, ir.Row{"active": true}, false)
 	})
 	t.Run("string equality (case-sensitive)", func(t *testing.T) {
-		p := mustCompile(t, "country = 'US'", map[string]ColumnInfo{"country": {Family: FamilyString, CaseSensitive: true}})
+		p := mustCompile(t, "country = 'US'", map[string]ColumnInfo{"country": {Family: FamilyString, Faithful: true}})
 		assertEval(t, p, ir.Row{"country": "US"}, true)
 		assertEval(t, p, ir.Row{"country": "CA"}, false)
 		assertEval(t, p, ir.Row{"country": "us"}, false) // byte-exact
 	})
 	t.Run("string not-equal", func(t *testing.T) {
-		p := mustCompile(t, "country != 'US'", map[string]ColumnInfo{"country": {Family: FamilyString, CaseSensitive: true}})
+		p := mustCompile(t, "country != 'US'", map[string]ColumnInfo{"country": {Family: FamilyString, Faithful: true}})
 		assertEval(t, p, ir.Row{"country": "CA"}, true)
 		assertEval(t, p, ir.Row{"country": "US"}, false)
 	})
@@ -220,7 +220,7 @@ func TestThreeValuedLogic(t *testing.T) {
 
 // TestInList pins IN / NOT IN with SQL NULL semantics.
 func TestInList(t *testing.T) {
-	str := map[string]ColumnInfo{"country": {Family: FamilyString, CaseSensitive: true}}
+	str := map[string]ColumnInfo{"country": {Family: FamilyString, Faithful: true}}
 	t.Run("IN matches / drops", func(t *testing.T) {
 		p := mustCompile(t, "country IN ('US','CA')", str)
 		assertEval(t, p, ir.Row{"country": "US"}, true)
@@ -268,8 +268,8 @@ func TestParenthesization(t *testing.T) {
 // compile time, NEVER silently mis-evaluated.
 func TestCompileRefusals(t *testing.T) {
 	infos := map[string]ColumnInfo{
-		"country": {Family: FamilyString, CaseSensitive: true},
-		"name_ci": {Family: FamilyString, CaseSensitive: false},
+		"country": {Family: FamilyString, Faithful: true},
+		"name_ci": {Family: FamilyString}, // ci/unresolved: not faithful -> refused
 		"age":     {Family: FamilyNumeric},
 		"created": {Family: FamilyTemporal},
 		"tags":    {Family: FamilyUnsupported}, // e.g. an array/set
@@ -333,19 +333,19 @@ func TestColumnInfosFromIR(t *testing.T) {
 		{Name: "arr", Type: ir.Array{Element: ir.Integer{}}},
 	}
 
-	t.Run("mysql-family: empty collation is NOT case-sensitive", func(t *testing.T) {
-		m := ColumnInfosFromIR("mysql", cols, false)
+	t.Run("mysql-family: string policies (byte-exact / fold / refuse)", func(t *testing.T) {
+		m := ColumnInfosFromIR(testMySQLResolver, cols, false)
 		wantFamily(t, m, "i", FamilyNumeric)
 		wantFamily(t, m, "d", FamilyNumeric)
 		wantFamily(t, m, "f", FamilyFloat) // audit F0-5: Float is its own family (equality refused)
 		wantFamily(t, m, "b", FamilyBool)
-		wantStringCS(t, m, "vc_bin", true)
-		wantStringCS(t, m, "vc_ci", false)
-		wantStringCS(t, m, "vc_cs", true)
-		wantStringCS(t, m, "vc_empty", false) // MySQL default collation is ci
-		wantStringCS(t, m, "u", true)
-		wantStringCS(t, m, "net", true)
-		wantStringCS(t, m, "tm", true)
+		wantString(t, m, "vc_bin", polByteExact)
+		wantString(t, m, "vc_ci", polFold)
+		wantString(t, m, "vc_cs", polByteExact)
+		wantString(t, m, "vc_empty", polRefuse) // MySQL empty/unknown collation: can't reproduce → refuse
+		wantString(t, m, "u", polByteExact)
+		wantString(t, m, "net", polByteExact)
+		wantString(t, m, "tm", polByteExact)
 		wantFamily(t, m, "blob", FamilyBinary)
 		wantFamily(t, m, "js", FamilyBinary)
 		wantFamily(t, m, "dt", FamilyTemporal)
@@ -355,9 +355,9 @@ func TestColumnInfosFromIR(t *testing.T) {
 		wantFamily(t, m, "arr", FamilyUnsupported)
 	})
 
-	t.Run("postgres: empty collation IS case-sensitive (deterministic =)", func(t *testing.T) {
-		m := ColumnInfosFromIR("postgres", cols, false)
-		wantStringCS(t, m, "vc_empty", true)
+	t.Run("postgres: empty collation is byte-exact (deterministic =)", func(t *testing.T) {
+		m := ColumnInfosFromIR(testPGResolver, cols, false)
+		wantString(t, m, "vc_empty", polByteExact)
 	})
 
 	// audit 2026-07-18 F0-3 / M1.1: a Postgres NAMED collation is byte-exact
@@ -373,56 +373,40 @@ func TestColumnInfosFromIR(t *testing.T) {
 			{Name: "c_unknown", Type: ir.Text{Collation: "mystery", Determinism: ir.CollationDeterminismUnknown}},
 			{Name: "c_default", Type: ir.Text{}},
 		}
-		m := ColumnInfosFromIR("postgres", pgCols, false)
-		// Deterministic named collations → byte-exact faithful (allowed).
+		m := ColumnInfosFromIR(testPGResolver, pgCols, false)
+		// Deterministic named collations → byte-exact faithful (allowed, no comparator).
 		for _, name := range []string{"c_det", "vc_det", "ch_det"} {
-			if !m[name].CaseSensitive || !m[name].faithfulString() {
-				t.Errorf("%s: deterministic named PG collation must be byte-exact faithful, got %+v", name, m[name])
-			}
-			if m[name].Collation != 0 {
-				t.Errorf("%s: byte-exact column must carry no Vitess collation id, got %d", name, m[name].Collation)
-			}
+			wantString(t, m, name, polByteExact)
 		}
 		// Non-deterministic + unknown-determinism named collations → refuse.
 		for _, name := range []string{"c_nd", "c_unknown"} {
-			if m[name].faithfulString() {
-				t.Errorf("%s: non-deterministic/unknown named PG collation must NOT be faithful (must refuse), got %+v", name, m[name])
-			}
+			wantString(t, m, name, polRefuse)
 		}
 		// Default (empty) collation stays byte-exact.
-		if !m["c_default"].CaseSensitive {
-			t.Error("c_default: PG default collation should be byte-exact")
-		}
+		wantString(t, m, "c_default", polByteExact)
 	})
 
 	// ADR-0174 Piece 1: a recognized ci/ai collation resolves to a faithful
 	// comparator (non-strict), so its string comparison is ALLOWED, not
 	// refused — while an unknown/empty collation stays unreproducible.
 	t.Run("mysql-family: recognized ci collation is faithfully reproducible", func(t *testing.T) {
-		m := ColumnInfosFromIR("mysql", cols, false)
-		if !m["vc_ci"].faithfulString() || m["vc_ci"].Collation == 0 {
-			t.Errorf("vc_ci (utf8mb4_0900_ai_ci): want a resolved faithful collation, got Collation=%d faithful=%v", m["vc_ci"].Collation, m["vc_ci"].faithfulString())
-		}
-		if m["vc_empty"].faithfulString() {
-			t.Error("vc_empty (unknown collation): must NOT be faithful — an unknown collation can't be reproduced")
-		}
-		// A byte-exact column carries no collation (byte compare is faithful).
-		if m["vc_bin"].Collation != 0 {
-			t.Errorf("vc_bin: byte-exact column should carry no collation, got %d", m["vc_bin"].Collation)
-		}
+		m := ColumnInfosFromIR(testMySQLResolver, cols, false)
+		// A ci collation resolves to a faithful FOLD comparator (not byte-exact).
+		wantString(t, m, "vc_ci", polFold)
+		// An unknown/empty collation on MySQL can't be reproduced → refuse.
+		wantString(t, m, "vc_empty", polRefuse)
+		// A byte-exact column carries no comparator (byte compare is faithful).
+		wantString(t, m, "vc_bin", polByteExact)
 	})
 
 	// --where-strict-collation: even a recognized ci collation is left
 	// unreproducible, so its comparison refuses (the operator's strict opt-out).
 	t.Run("strict mode: recognized ci collation is NOT reproduced", func(t *testing.T) {
-		m := ColumnInfosFromIR("mysql", cols, true)
-		if m["vc_ci"].faithfulString() {
-			t.Error("vc_ci under strict mode: must NOT be faithful (strict forces refusal)")
-		}
+		m := ColumnInfosFromIR(testMySQLResolver, cols, true)
+		// Strict forces the ci fold path to refuse.
+		wantString(t, m, "vc_ci", polRefuse)
 		// Byte-exact columns are still fine under strict.
-		if !m["vc_bin"].faithfulString() {
-			t.Error("vc_bin under strict mode: byte-exact should still be faithful")
-		}
+		wantString(t, m, "vc_bin", polByteExact)
 	})
 }
 
@@ -433,20 +417,11 @@ func wantFamily(t *testing.T, m map[string]ColumnInfo, col string, want Family) 
 	}
 }
 
-func wantStringCS(t *testing.T, m map[string]ColumnInfo, col string, want bool) {
-	t.Helper()
-	if m[col].Family != FamilyString {
-		t.Fatalf("%s: family = %d; want FamilyString", col, m[col].Family)
-	}
-	if got := m[col].CaseSensitive; got != want {
-		t.Errorf("%s: CaseSensitive = %v; want %v", col, got, want)
-	}
-}
-
 // TestCaseInsensitiveStringRefusalMessage pins that the ci-string refusal
 // names the collation hazard (so an operator understands why).
 func TestCaseInsensitiveStringRefusalMessage(t *testing.T) {
-	_, err := Compile("users", "name = 'bob'", map[string]ColumnInfo{"name": {Family: FamilyString, CaseSensitive: false}})
+	// A FamilyString column that the engine resolver left NOT faithful.
+	_, err := Compile("users", "name = 'bob'", map[string]ColumnInfo{"name": {Family: FamilyString}})
 	if err == nil {
 		t.Fatal("want refusal")
 	}
@@ -469,7 +444,7 @@ func assertEval(t *testing.T, p *Predicate, row ir.Row, want bool) {
 // behavior the short-circuit relies on (breaking on the first match cannot
 // change the answer).
 func TestInList_ShortCircuitSemantics(t *testing.T) {
-	infos := ColumnInfosFromIR("mysql", []*ir.Column{
+	infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{
 		{Name: "n", Type: ir.Integer{}},
 	}, false)
 
@@ -494,7 +469,7 @@ func TestInList_ShortCircuitSemantics(t *testing.T) {
 // threshold assertion.
 func BenchmarkInList_CollationShortCircuit(b *testing.B) {
 	cols := []*ir.Column{{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_general_ci"}}}
-	infos := ColumnInfosFromIR("mysql", cols, false)
+	infos := ColumnInfosFromIR(testMySQLResolver, cols, false)
 	// A 50-member IN list; "EU" is the first member.
 	members := make([]string, 0, 50)
 	members = append(members, "'EU'")

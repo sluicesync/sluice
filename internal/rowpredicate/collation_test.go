@@ -9,71 +9,18 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestResolveCollation pins that real MySQL collation names resolve and
-// garbage does not (the loud-refusal floor: an unresolvable collation must
-// NOT silently fall through to a byte compare).
-func TestResolveCollation(t *testing.T) {
-	for _, name := range []string{
-		"utf8mb4_0900_ai_ci", "utf8mb4_general_ci", "utf8mb4_bin",
-		"utf8_general_ci", "latin1_swedish_ci",
-	} {
-		if _, ok := resolveCollation(name); !ok {
-			t.Errorf("resolveCollation(%q) = not-ok; want a resolved collation", name)
-		}
-	}
-	for _, name := range []string{"", "not_a_collation", "utf8mb4_made_up"} {
-		if id, ok := resolveCollation(name); ok {
-			t.Errorf("resolveCollation(%q) = (%d, ok); want not-ok so the caller refuses", name, id)
-		}
-	}
-}
-
-// TestCollationEqual pins that collationEqual reproduces MySQL's own `=` —
-// case-insensitivity, accent-insensitivity, and the case-sensitive _bin
-// baseline — using Vitess's comparator. This is the fidelity the ADR-0174
-// design rests on: the client-side classification equals the source's.
-func TestCollationEqual(t *testing.T) {
-	mustID := func(name string) (id collationID) {
-		t.Helper()
-		got, ok := resolveCollation(name)
-		if !ok {
-			t.Fatalf("collation %q did not resolve", name)
-		}
-		return got
-	}
-	cases := []struct {
-		name      string
-		collation string
-		a, b      string
-		want      bool
-	}{
-		// utf8mb4_0900_ai_ci — case AND accent insensitive (MySQL 8 default).
-		{"0900 case-fold", "utf8mb4_0900_ai_ci", "EU", "eu", true},
-		{"0900 mixed case", "utf8mb4_0900_ai_ci", "Eu", "eU", true},
-		{"0900 accent-fold", "utf8mb4_0900_ai_ci", "cafe", "café", true},
-		{"0900 distinct", "utf8mb4_0900_ai_ci", "EU", "US", false},
-		// utf8mb4_general_ci — case insensitive.
-		{"general case-fold", "utf8mb4_general_ci", "EU", "eu", true},
-		{"general distinct", "utf8mb4_general_ci", "EU", "US", false},
-		// utf8mb4_bin — binary: case-SENSITIVE (the byte-exact baseline).
-		{"bin case-distinct", "utf8mb4_bin", "EU", "eu", false},
-		{"bin exact", "utf8mb4_bin", "EU", "EU", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := collationEqual(tc.a, tc.b, mustID(tc.collation)); got != tc.want {
-				t.Errorf("collationEqual(%q,%q,%s) = %v; want %v", tc.a, tc.b, tc.collation, got, tc.want)
-			}
-		})
-	}
-}
+// These tests drive the collation-driven compile + eval END TO END through the
+// engine's [ir.CollationResolver] (audit M2.1 — the Vitess comparator now lives
+// in internal/engines/mysql; the resolver-internal pins moved there too). The
+// oracle for the case/accent fold is the ground-truth real-MySQL family matrix
+// (collation_realmysql_integration_test.go), not these unit pins.
 
 // TestFaithfulCICompileEval is the end-to-end proof of ADR-0174 Piece 1: a
 // `region = 'EU'` predicate on a case-insensitive column matches rows whose
 // value differs only by case/accent — classified exactly as the source's
 // own `WHERE region = 'EU'` would — instead of being refused.
 func TestFaithfulCICompileEval(t *testing.T) {
-	infos := ColumnInfosFromIR("mysql", []*ir.Column{
+	infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{
 		{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_0900_ai_ci"}},
 	}, false)
 	p, err := Compile("t", "region = 'EU'", infos)
@@ -92,7 +39,7 @@ func TestFaithfulCICompileEval(t *testing.T) {
 	}
 
 	// Strict mode refuses the same predicate.
-	strictInfos := ColumnInfosFromIR("mysql", []*ir.Column{
+	strictInfos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{
 		{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_0900_ai_ci"}},
 	}, true)
 	if _, err := Compile("t", "region = 'EU'", strictInfos); err == nil {
@@ -106,7 +53,7 @@ func TestFaithfulCICompileEval(t *testing.T) {
 func TestPadSpaceFix_F01(t *testing.T) {
 	mk := func(coll string) *Predicate {
 		t.Helper()
-		infos := ColumnInfosFromIR("mysql", []*ir.Column{{Name: "region", Type: ir.Varchar{Collation: coll}}}, false)
+		infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{{Name: "region", Type: ir.Varchar{Collation: coll}}}, false)
 		p, err := Compile("t", "region = 'EU'", infos)
 		if err != nil {
 			t.Fatalf("Compile refused %s: %v", coll, err)
@@ -146,19 +93,19 @@ func TestPadSpaceFix_F01(t *testing.T) {
 // charset (F0-6) and a Postgres NAMED (possibly non-deterministic) collation
 // (F0-3) refuse rather than silently compare wrongly; the PG default works.
 func TestCollationRefusals_F03_F06(t *testing.T) {
-	refuse := func(engine, coll string) {
+	refuse := func(resolver ir.CollationResolver, coll string) {
 		t.Helper()
-		infos := ColumnInfosFromIR(engine, []*ir.Column{{Name: "c", Type: ir.Varchar{Collation: coll}}}, false)
+		infos := ColumnInfosFromIR(resolver, []*ir.Column{{Name: "c", Type: ir.Varchar{Collation: coll}}}, false)
 		if _, err := Compile("t", "c = 'x'", infos); err == nil {
-			t.Errorf("%s/%q: expected a loud refusal, got nil", engine, coll)
+			t.Errorf("resolver=%T coll=%q: expected a loud refusal, got nil", resolver, coll)
 		}
 	}
-	refuse("mysql", "latin1_swedish_ci") // F0-6 non-UTF-8 charset
-	refuse("mysql", "gbk_chinese_ci")    // F0-6 non-UTF-8 charset
-	refuse("mysql", "")                  // unknown collation on MySQL
-	refuse("postgres", "nd_icu")         // F0-3 PG named collation (can't prove deterministic)
+	refuse(testMySQLResolver, "latin1_swedish_ci") // F0-6 non-UTF-8 charset
+	refuse(testMySQLResolver, "gbk_chinese_ci")    // F0-6 non-UTF-8 charset
+	refuse(testMySQLResolver, "")                  // unknown collation on MySQL
+	refuse(testPGResolver, "nd_icu")               // F0-3 PG named collation (can't prove deterministic)
 	// PG default (empty) is deterministic -> byte-exact, allowed.
-	infos := ColumnInfosFromIR("postgres", []*ir.Column{{Name: "c", Type: ir.Varchar{}}}, false)
+	infos := ColumnInfosFromIR(testPGResolver, []*ir.Column{{Name: "c", Type: ir.Varchar{}}}, false)
 	if _, err := Compile("t", "c = 'x'", infos); err != nil {
 		t.Errorf("postgres default collation should compile: %v", err)
 	}

@@ -65,7 +65,7 @@ type whereCDCFilter struct {
 // that cannot be faithfully evaluated client-side is refused loudly with a
 // [sluicecode.CodeWhereCDCUnsupportedPredicate] coded error; a `--where`
 // key that names no source table is refused too (it can never take effect).
-func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema *ir.Schema, strictCollation bool) (*whereCDCFilter, error) {
+func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]string, schema *ir.Schema, strictCollation bool) (*whereCDCFilter, error) {
 	if len(rowFilters) == 0 {
 		return nil, nil
 	}
@@ -92,7 +92,7 @@ func buildWhereCDCFilter(engineName string, rowFilters map[string]string, schema
 				),
 			)
 		}
-		infos := rowpredicate.ColumnInfosFromIR(engineName, tbl.Columns, strictCollation)
+		infos := rowpredicate.ColumnInfosFromIR(resolver, tbl.Columns, strictCollation)
 		p, err := rowpredicate.Compile(table, predicate, infos)
 		if err != nil {
 			return nil, err
@@ -510,7 +510,26 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 		return err
 	}
 	s.RowFilters = canonFilters
-	filter, err := buildWhereCDCFilter(s.Source.Name(), s.RowFilters, schema, s.WhereStrictCollation)
+	// The client-side string comparator is resolved through the SOURCE engine's
+	// collation lens (audit 2026-07-18 M2.1): MySQL supplies a Vitess-backed
+	// resolver, Postgres a byte-exact-or-refuse one — so the engine-neutral
+	// evaluator carries no collation-library dependency. Filtered CDC sync is
+	// v1-scoped to engines that provide one (the FilteredCDCPreflighter gate
+	// above already restricts to MySQL + Postgres); refuse loudly rather than
+	// compare under a guessed collation if a source somehow reaches here without.
+	rp, ok := s.Source.(ir.CollationResolverProvider)
+	if !ok {
+		return sluicecode.Wrap(
+			sluicecode.CodeWhereCDCUnsupportedPredicate,
+			"use `sluice migrate --where` for a one-shot source-evaluated filter instead",
+			fmt.Errorf(
+				"continuous filtered sync (--where on `sync`): source engine %q does not supply a collation resolver, "+
+					"so a string predicate's `=` cannot be reproduced client-side faithfully; MySQL and Postgres are supported",
+				s.Source.Name(),
+			),
+		)
+	}
+	filter, err := buildWhereCDCFilter(rp.CollationResolver(), s.RowFilters, schema, s.WhereStrictCollation)
 	if err != nil {
 		return err
 	}

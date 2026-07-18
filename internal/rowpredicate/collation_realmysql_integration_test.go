@@ -171,7 +171,7 @@ func TestRealMySQL_CollationMatrix(t *testing.T) {
 
 	for _, coll := range collations {
 		t.Run(coll.name, func(t *testing.T) {
-			infos := ColumnInfosFromIR("mysql", []*ir.Column{{Name: "v", Type: ir.Varchar{Collation: coll.name}}}, false)
+			infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{{Name: "v", Type: ir.Varchar{Collation: coll.name}}}, false)
 
 			tbl := "t_" + coll.name // collation names are valid identifier chars
 			mustExecCM(t, ctx, db, "DROP TABLE IF EXISTS "+tbl)
@@ -231,7 +231,7 @@ func TestRealMySQL_CollationMatrix(t *testing.T) {
 	// F0-6 refusal fence: a non-UTF-8 charset collation must REFUSE at compile
 	// (sluice's UTF-8 row bytes would be mis-decoded under latin1), not compare.
 	t.Run("latin1_swedish_ci refuses at compile (F0-6 fence)", func(t *testing.T) {
-		infos := ColumnInfosFromIR("mysql", []*ir.Column{{Name: "v", Type: ir.Varchar{Collation: "latin1_swedish_ci"}}}, false)
+		infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{{Name: "v", Type: ir.Varchar{Collation: "latin1_swedish_ci"}}}, false)
 		_, err := Compile("t", "v = 'x'", infos)
 		ce, ok := sluicecode.FromError(err)
 		if !ok || ce.Code != sluicecode.CodeWhereCDCUnsupportedPredicate {

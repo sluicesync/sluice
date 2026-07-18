@@ -156,7 +156,7 @@ func TestRealPostgres_CollationMatrix(t *testing.T) {
 
 	for _, coll := range admitted {
 		t.Run(coll.name, func(t *testing.T) {
-			infos := ColumnInfosFromIR("postgres", []*ir.Column{{Name: "v", Type: coll.irType()}}, false)
+			infos := ColumnInfosFromIR(testPGResolver, []*ir.Column{{Name: "v", Type: coll.irType()}}, false)
 
 			tbl := "t_" + sanitizeIdent(coll.name)
 			mustExecPG(t, ctx, db, "DROP TABLE IF EXISTS "+tbl)
@@ -212,7 +212,7 @@ func TestRealPostgres_CollationMatrix(t *testing.T) {
 		if det != ir.CollationNonDeterministic {
 			t.Fatalf("expected %q to read as non-deterministic from the catalog, got %v", ndColl, det)
 		}
-		infos := ColumnInfosFromIR("postgres", []*ir.Column{
+		infos := ColumnInfosFromIR(testPGResolver, []*ir.Column{
 			{Name: "v", Type: ir.Text{Collation: ndColl, Determinism: det}},
 		}, false)
 		_, err := Compile("t", "v = 'x'", infos)
