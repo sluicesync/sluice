@@ -161,7 +161,7 @@ func TestOlapCount_SetThenSelectOnOneConn(t *testing.T) {
 	cfg := &countConfig{count: 123}
 	db := newCountDB(t, cfg)
 
-	n, err := olapCount(context.Background(), db, "widgets")
+	n, err := olapCount(context.Background(), db, "widgets", "")
 	if err != nil {
 		t.Fatalf("olapCount: unexpected error: %v", err)
 	}

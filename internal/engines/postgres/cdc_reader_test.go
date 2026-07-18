@@ -1160,14 +1160,14 @@ func TestBuildSelectQualifyBySchema(t *testing.T) {
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}
 	// Spanning mode feeds Table.Schema as the effective schema.
-	got := buildSelect(table.Schema, table)
+	got := buildSelect(table.Schema, table, "")
 	want := `SELECT "id" FROM "inventory"."widgets"`
 	if got != want {
 		t.Errorf("spanning buildSelect:\n got  %q\n want %q", got, want)
 	}
 	// Single-schema mode feeds the reader's bound schema, ignoring
 	// Table.Schema — byte-identical back-compat.
-	got = buildSelect("public", table)
+	got = buildSelect("public", table, "")
 	want = `SELECT "id" FROM "public"."widgets"`
 	if got != want {
 		t.Errorf("single-schema buildSelect:\n got  %q\n want %q", got, want)

@@ -104,6 +104,16 @@ type Verifier struct {
 	// value) keeps every source table.
 	Filter migcore.TableFilter
 
+	// RowFilters holds the operator's per-table `--where TABLE=<predicate>`
+	// row filters (ADR-0173 Phase 1), keyed by SOURCE table name. Threaded
+	// onto the SOURCE verifier ONLY (never the target), so `verify --depth
+	// count/sample` compares matching-source rows against the already-
+	// filtered target subset — otherwise a filtered migrate would
+	// false-report a count mismatch. Must match the predicates the migrate
+	// run used. nil/empty is the unfiltered default; a source engine that
+	// can't push it down is refused loudly (via [migcore.ApplyRowFilters]).
+	RowFilters map[string]string
+
 	// Format is "text" (default) or "json".
 	Format string
 
@@ -272,6 +282,15 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	srcVerifier, ok := sr.(ir.Verifier)
 	if !ok {
 		return nil, fmt.Errorf("verify: source engine %q does not support data verification (no ir.Verifier implementation)", v.Source.Name())
+	}
+	// ADR-0173 Phase 1: thread the operator's --where predicates onto the
+	// SOURCE verifier only, so count/sample compares matching-source rows
+	// against the (already-filtered) target subset. Applying to the target
+	// verifier would be wrong — the target holds only the filtered rows and
+	// must be counted whole. A source engine that can't push it down is
+	// refused loudly here, before any counting.
+	if err := migcore.ApplyRowFilters(sr, v.RowFilters, v.Source.Name()); err != nil {
+		return nil, err
 	}
 	tgtVerifier, ok := tr.(ir.Verifier)
 	if !ok {

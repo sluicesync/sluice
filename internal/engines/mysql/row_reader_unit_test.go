@@ -47,7 +47,7 @@ func TestBuildSelect(t *testing.T) {
 			{Name: "weird`name", Type: ir.Boolean{}},
 		},
 	}
-	got := buildSelect(table, false)
+	got := buildSelect(table, false, "")
 	want := "SELECT `id`, `email`, `weird``name` FROM `users`"
 	if got != want {
 		t.Errorf("buildSelect:\n got  %q\n want %q", got, want)
@@ -78,12 +78,12 @@ func TestBuildSelect_TemporalCAST(t *testing.T) {
 	wantList := "`id`, CAST(`d` AS CHAR) AS `d`, CAST(`dt` AS CHAR) AS `dt`, " +
 		"CAST(`ts` AS CHAR) AS `ts`, `dur`, `label`"
 
-	got := buildSelect(table, false)
+	got := buildSelect(table, false, "")
 	if want := "SELECT " + wantList + " FROM `events`"; got != want {
 		t.Errorf("buildSelect:\n got  %q\n want %q", got, want)
 	}
 
-	gotBatch := buildBatchedSelect(table, 1000, false, false)
+	gotBatch := buildBatchedSelect(table, 1000, false, false, "")
 	if want := "SELECT " + wantList + " FROM `events` ORDER BY `events`.`id` LIMIT 1000"; gotBatch != want {
 		t.Errorf("buildBatchedSelect:\n got  %q\n want %q", gotBatch, want)
 	}
@@ -102,7 +102,7 @@ func TestBuildSelect_QualifyBySchema(t *testing.T) {
 			{Name: "id", Type: ir.Integer{Width: 64}},
 		},
 	}
-	got := buildSelect(table, true)
+	got := buildSelect(table, true, "")
 	want := "SELECT `id` FROM `app_db`.`users`"
 	if got != want {
 		t.Errorf("buildSelect qualify:\n got  %q\n want %q", got, want)
@@ -110,7 +110,7 @@ func TestBuildSelect_QualifyBySchema(t *testing.T) {
 
 	// Empty Schema + qualifyBySchema true → unqualified (defensive).
 	table.Schema = ""
-	got = buildSelect(table, true)
+	got = buildSelect(table, true, "")
 	want = "SELECT `id` FROM `users`"
 	if got != want {
 		t.Errorf("buildSelect qualify empty-schema:\n got  %q\n want %q", got, want)

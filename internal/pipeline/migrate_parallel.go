@@ -89,6 +89,16 @@ type parallelBulkCopyDeps struct {
 	sourceDSN string
 	targetDSN string
 
+	// rowFilters holds the operator's per-table `--where` predicates
+	// (ADR-0173 Phase 1), keyed by SOURCE table name. [openChunkReader]
+	// applies them to every parallel chunk/table reader it mints (both the
+	// snapshot-factory and the independent-OpenRowReader branches) via
+	// [migcore.ApplyRowFilters], so every reader on the copy path pushes the
+	// same predicate down — never a mix of filtered and unfiltered readers.
+	// nil/empty for the unfiltered default and for every sync cold-start
+	// caller (sync does not thread --where — Phase 2).
+	rowFilters map[string]string
+
 	// parallelism is the configured --bulk-parallelism after
 	// migcore.ResolveBulkParallelism applied the "0 = min(8, NumCPU)" rule.
 	// Always >= 1.
@@ -750,10 +760,29 @@ func acquireChunkConn(
 // open-site — per-chunk and per-table (openTablePair delegates here too) —
 // consistent by construction.
 func openChunkReader(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReader, error) {
+	var (
+		rdr ir.RowReader
+		err error
+	)
 	if deps.chunkReaderFactory != nil {
-		return deps.chunkReaderFactory(ctx)
+		rdr, err = deps.chunkReaderFactory(ctx)
+	} else {
+		rdr, err = deps.source.OpenRowReader(ctx, deps.sourceDSN)
 	}
-	return deps.source.OpenRowReader(ctx, deps.sourceDSN)
+	if err != nil {
+		return nil, err
+	}
+	// ADR-0173 Phase 1: push the operator's --where predicates onto this
+	// reader too, so a parallel chunked/cross-table copy filters identically
+	// to the primary reader. A no-op when no filter is set (the common path
+	// and every sync caller). Any not-supported case was already refused
+	// loudly at the primary reader, so this cannot surprise mid-copy; the
+	// error is propagated defensively.
+	if ferr := migcore.ApplyRowFilters(rdr, deps.rowFilters, deps.source.Name()); ferr != nil {
+		migcore.CloseIf(rdr)
+		return nil, ferr
+	}
+	return rdr, nil
 }
 
 // openOneChunkConn opens a single source reader + target writer pair for

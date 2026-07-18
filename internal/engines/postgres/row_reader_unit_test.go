@@ -48,7 +48,7 @@ func TestBuildSelect(t *testing.T) {
 			{Name: `weird"name`, Type: ir.Boolean{}},
 		},
 	}
-	got := buildSelect("public", table)
+	got := buildSelect("public", table, "")
 	want := `SELECT "id", "email", "weird""name" FROM "public"."users"`
 	if got != want {
 		t.Errorf("buildSelect:\n got  %q\n want %q", got, want)
@@ -60,7 +60,7 @@ func TestBuildSelectNonDefaultSchema(t *testing.T) {
 		Name:    "users",
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}
-	got := buildSelect("app", table)
+	got := buildSelect("app", table, "")
 	want := `SELECT "id" FROM "app"."users"`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)

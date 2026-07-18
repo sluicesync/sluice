@@ -49,6 +49,7 @@ var (
 	_ ir.HealthReporter         = (*SchemaReader)(nil)
 	_ ir.HeartbeatWriter        = (*SchemaReader)(nil)
 	_ ir.MultiDatabaseScoper    = (*SchemaReader)(nil)
+	_ ir.RowFilterSetter        = (*SchemaReader)(nil)
 	_ ir.SampleVerifier         = (*SchemaReader)(nil)
 	_ ir.SequenceStateReader    = (*SchemaReader)(nil)
 	_ ir.Verifier               = (*SchemaReader)(nil)
@@ -69,6 +70,7 @@ var (
 	_ ir.KeysetSampler      = (*RowReader)(nil)
 	_ ir.RangeBoundsQuerier = (*RowReader)(nil)
 	_ ir.RowCounter         = (*RowReader)(nil)
+	_ ir.RowFilterSetter    = (*RowReader)(nil)
 
 	// RowWriter optional surfaces.
 	_ ir.BulkTableDropper            = (*RowWriter)(nil)

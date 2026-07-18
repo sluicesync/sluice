@@ -114,6 +114,8 @@ const (
 	CodeCSVNullAmbiguous      Code = "SLUICE-E-CSV-NULL-AMBIGUOUS"
 	CodeCSVHeaderUndeclared   Code = "SLUICE-E-CSV-HEADER-UNDECLARED"
 	CodeExportUnrepresentable Code = "SLUICE-E-EXPORT-UNREPRESENTABLE"
+
+	CodeWhereFilterFKOrphan Code = "SLUICE-E-WHERE-FK-ORPHAN"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -201,6 +203,8 @@ var registry = map[Code]Info{
 	CodePSDirectDDLBlocked:       {ClassRefusal, "PlanetScale safe migrations refused a direct DDL statement sluice needs (Error 1105) — a user-table CREATE during schema apply, or sluice's own control tables. Ship the DDL through the governed channel (`sluice deploy-ddl`; `sluice control-tables ddl` / `sluice schema preview` print the statements) or disable safe migrations for the window — the message carries the per-case recipe"},
 
 	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},
+
+	CodeWhereFilterFKOrphan: {ClassRefusal, "a --where row filter on a parent table orphaned its children, so the deferred ADD CONSTRAINT FOREIGN KEY failed (SQLSTATE 23503) on the target — filter consistently so the referenced parent rows are copied, or pass --allow-degraded-fks to attach the FK as NOT VALID"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

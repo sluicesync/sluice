@@ -83,7 +83,7 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildBatchedSelect(table, limit, len(after) > 0, len(upTo) > 0)
+	query := buildBatchedSelect(table, limit, len(after) > 0, len(upTo) > 0, r.rowFilters[table.Name])
 	// Bind in clause order: lower-bound placeholders first, then upper.
 	args := make([]any, 0, len(after)+len(upTo))
 	args = append(args, after...)
@@ -120,7 +120,14 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 // LIMIT is embedded as a literal because it's an orchestrator-
 // controlled int (no user input) and parameterising LIMIT in MySQL
 // has historical compatibility quirks across versions.
-func buildBatchedSelect(table *ir.Table, limit int, hasCursor, hasUpper bool) string {
+//
+// predicate is the operator's `--where` row filter for this table
+// (ADR-0173 Phase 1), or "" for none. When present it is added as one
+// more parenthesized conjunct in the WHERE — ALWAYS parenthesized so a
+// disjunctive predicate (`a OR b`) can't escape the keyset chunk bounds
+// it is ANDed with — before the ORDER BY / LIMIT, so a filtered chunked
+// read stays exactly-once.
+func buildBatchedSelect(table *ir.Table, limit int, hasCursor, hasUpper bool, predicate string) string {
 	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
@@ -163,6 +170,9 @@ func buildBatchedSelect(table *ir.Table, limit int, hasCursor, hasUpper bool) st
 	}
 	if hasUpper {
 		conds = append(conds, "("+pkTuple+") <= ("+placeholders+")")
+	}
+	if predicate != "" {
+		conds = append(conds, "("+predicate+")")
 	}
 	if len(conds) > 0 {
 		sb.WriteString(" WHERE ")

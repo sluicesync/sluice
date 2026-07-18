@@ -40,6 +40,8 @@ type VerifyCmd struct {
 	IncludeTable []string `help:"Only verify these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Verify every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	Where []string `help:"Row-level filter matching a filtered 'migrate' (repeatable; ADR-0173). Format: 'TABLE=<predicate>', native SOURCE-SQL, pushed into the SOURCE count/sample read as 'WHERE (<predicate>)'. Pass the SAME --where values you gave 'migrate' so verify counts matching-source rows against the (already-filtered) target subset — WITHOUT it, a filtered migrate false-reports a count mismatch. Table key matches the SOURCE name; split at the FIRST '='. Applied to the source side only." placeholder:"TABLE=PREDICATE" sep:"none"`
+
 	Depth string `help:"Verification depth. 'count' (default; row-count comparison) or 'sample' (count + per-table sampled-row content hashes; ~99% confidence on 5%+ corruption). 'full' planned per proto-ADR." default:"count" enum:"count,sample" placeholder:"DEPTH"`
 
 	SampleRowsPerTable int   `help:"Per-table sample size when --depth=sample. Default 100 gives ~99% confidence of detecting a 5%+ corruption rate; raise for stronger guarantees on tables with rare anomalies." default:"100" placeholder:"N"`
@@ -93,6 +95,10 @@ func (v *VerifyCmd) Run(g *Globals) error {
 	if err != nil {
 		return operationalError{err: err}
 	}
+	rowFilters, err := parseWhereFilters(v.Where)
+	if err != nil {
+		return operationalError{err: err}
+	}
 
 	writer, finalize, err := openVerifyOutput(v.Output)
 	if err != nil {
@@ -111,6 +117,7 @@ func (v *VerifyCmd) Run(g *Globals) error {
 		SampleSeed:         v.SampleSeed,
 		StrictHash:         v.StrictHash,
 		Filter:             filter,
+		RowFilters:         rowFilters,
 		Format:             v.Format,
 		Out:                writer,
 	}

@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // progressInterval is how often the bulk-copy progress ticker emits a
@@ -472,6 +474,23 @@ type Migrator struct {
 	// refused loudly in validate. Default off — byte-identical to before.
 	SkipForeignKeys bool
 
+	// RowFilters holds the operator's per-table `--where TABLE=<predicate>`
+	// row filters (ADR-0173 Phase 1), keyed by SOURCE table name (a
+	// --map-database/--map-schema rename still matches the original name,
+	// like --redact). Each predicate is native SOURCE-SQL pushed into the
+	// bulk-copy read as one more parenthesized WHERE conjunct — evaluated
+	// on the source, so only matching rows are copied. Threaded onto every
+	// migrate source reader (primary + parallel chunk/table) via
+	// [migcore.ApplyRowFilters], which refuses loudly if the source engine
+	// doesn't support it. nil/empty is the unfiltered default. Phase 1 is
+	// migrate-only; sync does NOT read this (a filtered snapshot with an
+	// unfiltered CDC leg would be inconsistent — that is Phase 2). It also
+	// disables the raw-copy passthrough lane (rawCopyGate) — the byte-pipe
+	// would bypass the predicate — and, on a --where run that orphans a
+	// child via a filtered parent, upgrades the constraints-phase 23503 to
+	// the coded SLUICE-E-WHERE-FK-ORPHAN refusal.
+	RowFilters map[string]string
+
 	// SkipORMTables, when true, drops recognized ORM/framework
 	// migration-bookkeeping tables (flyway_schema_history,
 	// _prisma_migrations, schema_migrations, …) from the source schema
@@ -763,6 +782,15 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		rr = openedRR
 	}
 
+	// ADR-0173 Phase 1: thread the operator's --where row filters onto the
+	// primary source reader (the parallel chunk/table readers are covered in
+	// openChunkReader). A non-empty filter against a source engine that can't
+	// push it down is refused LOUDLY here — before any copy — rather than
+	// silently copying every row.
+	if err := migcore.ApplyRowFilters(rr, m.RowFilters, m.Source.Name()); err != nil {
+		return err
+	}
+
 	// Resume / reset / populated-target gate: --resume rides
 	// TableProgress; --reset-target-data clears the target first;
 	// otherwise the Shape-A / Bug 9 preflights refuse a populated
@@ -814,7 +842,13 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	ctx, rowTotal := withRunRowTotal(ctx)
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, createSchema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
-		return err
+		// ADR-0173 Phase 1: a --where filter on a parent table orphans its
+		// children, so the deferred ADD CONSTRAINT FOREIGN KEY fails 23503.
+		// Upgrade that to the coded SLUICE-E-WHERE-FK-ORPHAN refusal naming
+		// the parent (no-op unless a filter is active and the error is a
+		// 23503; composes with --allow-degraded-fks, under which the writer
+		// degrades to NOT VALID and no 23503 escapes).
+		return m.rowFilterFKOrphanRefusal(sw, schema, err, err)
 	}
 
 	// Envelope bookkeeping: mirror the "migration complete" table set
@@ -932,6 +966,87 @@ func reportDegradedFKs(ctx context.Context, sw ir.SchemaWriter) {
 		slog.Int("count", len(fks)),
 		slog.String("action_required",
 			"run `ALTER TABLE ... VALIDATE CONSTRAINT <name>` for each after fixing the orphan rows on the child tables"))
+}
+
+// rowFilterFKOrphanRefusal upgrades a constraints-phase FK-orphan failure
+// (SQLSTATE 23503) to the coded [sluicecode.CodeWhereFilterFKOrphan]
+// refusal WHEN a `--where` row filter is active on this run: filtering a
+// PARENT table's rows orphans its children, so the deferred ADD CONSTRAINT
+// FOREIGN KEY fails on the target. Naming the child table, the FK, and the
+// referenced parent (flagging which side carries a filter) steers the
+// operator to filter consistently or opt into `--allow-degraded-fks`.
+//
+// Composition with `--allow-degraded-fks` is automatic and needs no flag
+// check here: with that opt-in the writer attaches the FK NOT VALID and no
+// 23503 escapes [SchemaWriter.CreateConstraints], so [ir.FKOrphanClassifier]
+// finds no violation and this passes through. raw carries the engine
+// SQLSTATE (it is the same value as presented in the migrate call site,
+// which already routed the error through [migcore.WrapWithHint]); presented
+// is what the caller returns unchanged in the non-orphan / no-filter case.
+// Writers without [ir.FKOrphanClassifier] (MySQL target) pass through too.
+func (m *Migrator) rowFilterFKOrphanRefusal(sw ir.SchemaWriter, schema *ir.Schema, raw, presented error) error {
+	if len(m.RowFilters) == 0 {
+		return presented
+	}
+	classifier, ok := sw.(ir.FKOrphanClassifier)
+	if !ok {
+		return presented
+	}
+	v, ok := classifier.AsFKOrphanViolation(raw)
+	if !ok {
+		return presented
+	}
+	parent := fkReferencedParent(schema, v.ChildTable, v.ConstraintName)
+	parentDesc := parent
+	if parentDesc == "" {
+		parentDesc = "the referenced parent table"
+	}
+	// Name which side(s) the operator actually filtered so the message is
+	// specific — usually the parent, but a child filter that out-scopes its
+	// parent orphans just as surely.
+	var filtered []string
+	if parent != "" {
+		if _, ok := m.RowFilters[parent]; ok {
+			filtered = append(filtered, parent)
+		}
+	}
+	if _, ok := m.RowFilters[v.ChildTable]; ok {
+		filtered = append(filtered, v.ChildTable)
+	}
+	filterDesc := "a --where filter"
+	if len(filtered) > 0 {
+		filterDesc = fmt.Sprintf("the --where filter on %s", strings.Join(filtered, ", "))
+	}
+	hint := fmt.Sprintf(
+		"filter consistently so %s's referenced rows are copied, or pass --allow-degraded-fks (PG target) to attach the FK as NOT VALID and validate after reconciling the orphans",
+		parentDesc,
+	)
+	msg := fmt.Errorf(
+		"pipeline: --where row filter orphaned foreign key %q on child table %q (referencing %s): %s left parent rows out of scope; %s: %w",
+		v.ConstraintName, v.ChildTable, parentDesc, filterDesc, hint, presented,
+	)
+	return &sluicecode.CodedError{Code: sluicecode.CodeWhereFilterFKOrphan, Hint: hint, Err: msg}
+}
+
+// fkReferencedParent returns the table a named foreign-key constraint on
+// childTable references, for the `--where` FK-orphan refusal. Returns ""
+// when the FK can't be located in the schema (defensive — the refusal
+// still fires, naming the child and constraint).
+func fkReferencedParent(schema *ir.Schema, childTable, constraintName string) string {
+	if schema == nil {
+		return ""
+	}
+	for _, t := range schema.Tables {
+		if t.Name != childTable {
+			continue
+		}
+		for _, fk := range t.ForeignKeys {
+			if fk.Name == constraintName {
+				return fk.ReferencedTable
+			}
+		}
+	}
+	return ""
 }
 
 type bulkCopyOpts struct {

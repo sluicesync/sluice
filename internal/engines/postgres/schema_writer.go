@@ -941,6 +941,26 @@ func isFKViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }
 
+// AsFKOrphanViolation implements [ir.FKOrphanClassifier]. It reports
+// whether err carries the SQLSTATE 23503 a validating ADD CONSTRAINT
+// FOREIGN KEY raises when orphan rows exist on the child table, and if so
+// returns the child table + constraint names PG reports on the
+// pgconn.PgError. The pipeline's `--where` row-filter path (ADR-0173
+// Phase 1) uses it to upgrade the otherwise-opaque 23503 into the coded
+// SLUICE-E-WHERE-FK-ORPHAN refusal that names the filtered parent. This
+// path is only reached when the operator did NOT pass --allow-degraded-fks
+// (with that flag the FK is attached NOT VALID and no 23503 escapes).
+func (w *SchemaWriter) AsFKOrphanViolation(err error) (ir.FKOrphanViolation, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		return ir.FKOrphanViolation{}, false
+	}
+	return ir.FKOrphanViolation{
+		ChildTable:     pgErr.TableName,
+		ConstraintName: pgErr.ConstraintName,
+	}, true
+}
+
 // appendNotValid takes the SQL produced by [emitAddForeignKey] (which
 // ends in a trailing `;`) and rewrites it to `... NOT VALID;`. Kept as
 // a tiny helper rather than threading a bool through emitAddForeignKey

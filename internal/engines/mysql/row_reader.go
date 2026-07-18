@@ -67,8 +67,24 @@ type RowReader struct {
 	// set it stay byte-identical to the pre-ADR-0127 global-only behavior.
 	zeroDate zeroDateMode
 
+	// rowFilters holds the operator's per-table `--where TABLE=<predicate>`
+	// row filters (ADR-0173 Phase 1), keyed by SOURCE table name. Set via
+	// [RowReader.SetRowFilters] ([ir.RowFilterSetter]); nil/absent means no
+	// filter for that table. buildSelect / buildBatchedSelect AND the
+	// matching predicate (always parenthesized) into the read query, so the
+	// filter is evaluated on the source and only matching rows are copied.
+	rowFilters map[string]string
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
+}
+
+// SetRowFilters implements [ir.RowFilterSetter]. The pipeline threads the
+// operator's `--where` predicates onto every migrate source reader
+// (ADR-0173 Phase 1); the map is keyed by SOURCE table name and consulted
+// per table in the SELECT builders. An empty/nil map is a no-op.
+func (r *RowReader) SetRowFilters(filters map[string]string) {
+	r.rowFilters = filters
 }
 
 // Close releases the underlying connection resources. Safe to call
@@ -109,7 +125,7 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildSelect(table, r.qualifyBySchema)
+	query := buildSelect(table, r.qualifyBySchema, r.rowFilters[table.Name])
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
@@ -262,7 +278,12 @@ func (r *RowReader) setErr(err error) {
 // pinned connection reads across N databases and may have no default
 // database. qualifyBySchema is false on every single-database path, so
 // the emitted SQL stays byte-identical there.
-func buildSelect(table *ir.Table, qualifyBySchema bool) string {
+//
+// predicate is the operator's `--where` row filter for this table
+// (ADR-0173 Phase 1), or "" for none. When present it is ANDed into the
+// full-scan SELECT as a parenthesized WHERE conjunct (the sole clause on
+// the full scan) — evaluated on the source so only matching rows are read.
+func buildSelect(table *ir.Table, qualifyBySchema bool, predicate string) string {
 	src := sourceReadableColumns(table.Columns)
 	cols := make([]string, len(src))
 	for i, c := range src {
@@ -272,11 +293,15 @@ func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 	if qualifyBySchema && table.Schema != "" {
 		tableRef = quoteIdent(table.Schema) + "." + tableRef
 	}
-	return fmt.Sprintf(
+	sel := fmt.Sprintf(
 		"SELECT %s FROM %s",
 		strings.Join(cols, ", "),
 		tableRef,
 	)
+	if predicate != "" {
+		sel += " WHERE (" + predicate + ")"
+	}
+	return sel
 }
 
 // selectColumnExpr returns the SELECT-list expression for source column

@@ -90,7 +90,7 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildBatchedSelect(r.schema, table, limit, len(after) > 0, len(upTo) > 0)
+	query := buildBatchedSelect(r.schema, table, limit, len(after) > 0, len(upTo) > 0, r.rowFilters[table.Name])
 	// Args are bound in clause order: lower-bound placeholders ($1..) then
 	// upper-bound placeholders, matching buildBatchedSelect's numbering.
 	args := make([]any, 0, len(after)+len(upTo))
@@ -130,7 +130,14 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 // doesn't accept a parameter in LIMIT for some plan-cache shapes,
 // and the value is orchestrator-controlled (not user input) so the
 // SQL-injection surface is non-existent.
-func buildBatchedSelect(schema string, table *ir.Table, limit int, hasCursor, hasUpper bool) string {
+//
+// predicate is the operator's `--where` row filter for this table
+// (ADR-0173 Phase 1), or "" for none. When present it is added as one
+// more parenthesized conjunct in the WHERE — ALWAYS parenthesized so a
+// disjunctive predicate (`a OR b`) can't escape the keyset chunk bounds
+// it is ANDed with — before the ORDER BY / LIMIT, so a filtered chunked
+// read stays exactly-once.
+func buildBatchedSelect(schema string, table *ir.Table, limit int, hasCursor, hasUpper bool, predicate string) string {
 	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
@@ -171,6 +178,9 @@ func buildBatchedSelect(schema string, table *ir.Table, limit int, hasCursor, ha
 	}
 	if hasUpper {
 		conds = append(conds, "("+pkTuple+") <= ("+nextPlaceholders()+")")
+	}
+	if predicate != "" {
+		conds = append(conds, "("+predicate+")")
 	}
 	if len(conds) > 0 {
 		sb.WriteString(" WHERE ")

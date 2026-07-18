@@ -21,7 +21,7 @@ func TestBuildBatchedSelect_SinglePK_FirstBatch(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, false, false)
+	got := buildBatchedSelect("public", table, 5000, false, false, "")
 	want := `SELECT "id", "email" FROM "public"."users" ORDER BY "id" LIMIT 5000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -40,7 +40,7 @@ func TestBuildBatchedSelect_SinglePK_WithCursor(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, true, false)
+	got := buildBatchedSelect("public", table, 5000, true, false, "")
 	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") > ($1) ORDER BY "id" LIMIT 5000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -61,7 +61,7 @@ func TestBuildBatchedSelect_SinglePK_BothBounds(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, true, true)
+	got := buildBatchedSelect("public", table, 5000, true, true, "")
 	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") > ($1) AND ("id") <= ($2) ORDER BY "id" LIMIT 5000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -80,7 +80,7 @@ func TestBuildBatchedSelect_SinglePK_UpperOnly(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, false, true)
+	got := buildBatchedSelect("public", table, 5000, false, true, "")
 	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") <= ($1) ORDER BY "id" LIMIT 5000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -103,7 +103,7 @@ func TestBuildBatchedSelect_CompositePK_BothBounds(t *testing.T) {
 			Columns: []ir.IndexColumn{{Column: "tenant"}, {Column: "sku"}},
 		},
 	}
-	got := buildBatchedSelect("public", table, 1000, true, true)
+	got := buildBatchedSelect("public", table, 1000, true, true, "")
 	want := `SELECT "tenant", "sku", "name" FROM "public"."products" WHERE ("tenant", "sku") > ($1, $2) AND ("tenant", "sku") <= ($3, $4) ORDER BY "tenant", "sku" LIMIT 1000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -129,7 +129,7 @@ func TestBuildBatchedSelect_CompositePK(t *testing.T) {
 			},
 		},
 	}
-	got := buildBatchedSelect("public", table, 1000, true, false)
+	got := buildBatchedSelect("public", table, 1000, true, false, "")
 	want := `SELECT "tenant", "sku", "name" FROM "public"."products" WHERE ("tenant", "sku") > ($1, $2) ORDER BY "tenant", "sku" LIMIT 1000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)

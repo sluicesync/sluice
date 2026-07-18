@@ -60,8 +60,12 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 	if r.db == nil {
 		return 0, errors.New("mysql: ExactRowCount: reader not opened")
 	}
+	// ADR-0173 Phase 1: a `--where` filter for this table is ANDed into
+	// every count path so verify compares matching-source rows against the
+	// filtered target subset. Empty when no filter is set for this table.
+	predicate := r.rowFilters[table.Name]
 	if r.flavor.usesVStream() {
-		n, err := olapCount(ctx, r.db, table.Name)
+		n, err := olapCount(ctx, r.db, table.Name, predicate)
 		if err == nil {
 			return n, nil
 		}
@@ -75,9 +79,21 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 	}
 	pkCol, ok := singleIntegerPKColumn(table)
 	if !ok {
-		return singleShotCount(ctx, r.db, table.Name)
+		return singleShotCount(ctx, r.db, table.Name, predicate)
 	}
-	return chunkedCount(ctx, r.db, table.Name, pkCol, defaultCountChunkSize)
+	return chunkedCount(ctx, r.db, table.Name, pkCol, defaultCountChunkSize, predicate)
+}
+
+// whereAnd returns the SQL fragment that AND-composes an operator `--where`
+// predicate (ADR-0173 Phase 1) onto a count query. ALWAYS parenthesized so
+// a disjunctive predicate can't escape any existing bounds. lead is " WHERE "
+// when the query has no WHERE yet, or " AND " when it already carries one.
+// Empty predicate returns "".
+func whereAnd(lead, predicate string) string {
+	if predicate == "" {
+		return ""
+	}
+	return lead + "(" + predicate + ")"
 }
 
 // SampleRowHashes implements [ir.SampleVerifier]. Same shape as the
@@ -124,9 +140,10 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 		hashExpr = "MD5(" + concatExpr + ")"
 	}
 	q := fmt.Sprintf(
-		"SELECT %s AS pk, %s AS hash FROM %s ORDER BY MD5(CONCAT(%s, '%d')) LIMIT %d",
+		"SELECT %s AS pk, %s AS hash FROM %s%s ORDER BY MD5(CONCAT(%s, '%d')) LIMIT %d",
 		pkSelect, hashExpr,
 		quoteIdent(table.Name),
+		whereAnd(" WHERE ", r.rowFilters[table.Name]),
 		pkSelect, seed, n,
 	)
 	rows, err := r.db.QueryContext(ctx, q)
@@ -168,7 +185,7 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 // count(*) is exact in any workload mode — OLAP changes the
 // timeout/streaming behavior, not the result — so there is no value-fidelity
 // risk here.
-func olapCount(ctx context.Context, db *sql.DB, tableName string) (int64, error) {
+func olapCount(ctx context.Context, db *sql.DB, tableName, predicate string) (int64, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("mysql: olap-count conn %s: %w", tableName, err)
@@ -177,7 +194,7 @@ func olapCount(ctx context.Context, db *sql.DB, tableName string) (int64, error)
 	if _, err := conn.ExecContext(ctx, "SET workload = 'olap'"); err != nil {
 		return 0, fmt.Errorf("mysql: olap-count set workload %s: %w", tableName, err)
 	}
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName))
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName)) + whereAnd(" WHERE ", predicate)
 	var count int64
 	if err := conn.QueryRowContext(ctx, q).Scan(&count); err != nil {
 		return 0, fmt.Errorf("mysql: olap-count %s: %w", tableName, err)
@@ -191,8 +208,8 @@ func olapCount(ctx context.Context, db *sql.DB, tableName string) (int64, error)
 // statement-*execution-time* limit, NOT a rows-returned cap (a count(*)
 // returns one row); the OLAP primary path in [SchemaReader.ExactRowCount]
 // exists specifically to stream past it (ADR-0147).
-func singleShotCount(ctx context.Context, db *sql.DB, tableName string) (int64, error) {
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName))
+func singleShotCount(ctx context.Context, db *sql.DB, tableName, predicate string) (int64, error) {
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName)) + whereAnd(" WHERE ", predicate)
 	var count int64
 	if err := db.QueryRowContext(ctx, q).Scan(&count); err != nil {
 		return 0, fmt.Errorf("mysql: count %s: %w", tableName, err)
@@ -205,8 +222,12 @@ func singleShotCount(ctx context.Context, db *sql.DB, tableName string) (int64, 
 // Cost: ⌈row_count / chunkSize⌉ + 1 queries (the +1 is for MIN/MAX).
 // For a 1M-row table at chunkSize=50000, that's 21 queries — fast on
 // any modern MySQL, well under PS's per-query budget.
-func chunkedCount(ctx context.Context, db *sql.DB, tableName, pkCol string, chunkSize int64) (int64, error) {
-	// Get PK bounds.
+func chunkedCount(ctx context.Context, db *sql.DB, tableName, pkCol string, chunkSize int64, predicate string) (int64, error) {
+	// Get PK bounds. The `--where` predicate (ADR-0173) is deliberately NOT
+	// applied to the MIN/MAX bounds — the filtered rows still fall inside
+	// [min,max], and each per-chunk COUNT below ANDs the predicate, so the
+	// total counts exactly the matching rows (a filtered-out chunk simply
+	// contributes zero).
 	boundsQ := fmt.Sprintf(`SELECT MIN(%s), MAX(%s) FROM %s`,
 		quoteIdent(pkCol), quoteIdent(pkCol), quoteIdent(tableName))
 	var minV, maxV sql.NullInt64
@@ -216,6 +237,7 @@ func chunkedCount(ctx context.Context, db *sql.DB, tableName, pkCol string, chun
 	if !minV.Valid || !maxV.Valid {
 		return 0, nil // empty table
 	}
+	andPred := whereAnd(" AND ", predicate)
 	// Walk PK ranges. Half-open interval [start, end); the final
 	// chunk uses <= maxV to include the maximum row.
 	var total int64
@@ -225,13 +247,13 @@ func chunkedCount(ctx context.Context, db *sql.DB, tableName, pkCol string, chun
 		var partQ string
 		if end > maxV.Int64 {
 			partQ = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s >= ? AND %s <= ?`,
-				quoteIdent(tableName), quoteIdent(pkCol), quoteIdent(pkCol))
+				quoteIdent(tableName), quoteIdent(pkCol), quoteIdent(pkCol)) + andPred
 			if err := db.QueryRowContext(ctx, partQ, start, maxV.Int64).Scan(&partial); err != nil {
 				return 0, fmt.Errorf("mysql: chunked-count partial [%d..%d] %s: %w", start, maxV.Int64, tableName, err)
 			}
 		} else {
 			partQ = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s >= ? AND %s < ?`,
-				quoteIdent(tableName), quoteIdent(pkCol), quoteIdent(pkCol))
+				quoteIdent(tableName), quoteIdent(pkCol), quoteIdent(pkCol)) + andPred
 			if err := db.QueryRowContext(ctx, partQ, start, end).Scan(&partial); err != nil {
 				return 0, fmt.Errorf("mysql: chunked-count partial [%d..%d) %s: %w", start, end, tableName, err)
 			}

@@ -240,6 +240,8 @@ type MigrateCmd struct {
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. The expression is emitted verbatim — sluice's cross-dialect translator (ADR-0016) does NOT run on overridden columns. Escape hatch for cases the translator's hand-coded rewrites don't recognise. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION" sep:"none"`
 
+	Where []string `help:"Row-level filter: copy only the rows of a table matching a predicate (repeatable; ADR-0173). Format: 'TABLE=<predicate>' where <predicate> is a native SOURCE-SQL boolean expression, pushed into the source read as 'WHERE (<predicate>)' (evaluated on the source — no client-side filtering). Split at the FIRST '=', so the predicate may contain '='. The table key matches the SOURCE name (a --map-database/--map-schema rename still matches the original, like --redact); exact names only in v1. Use for per-tenant/region carve-outs, GDPR-scoped extracts, or seeding a staging subset. Caveats: filtering a PARENT table orphans its children (the FK add fails 23503 — pass --allow-degraded-fks or filter consistently); the predicate is source-dialect and NOT cross-engine portable. Run 'verify' with the SAME --where so counts match. migrate-only (filtered continuous sync is Phase 2). Also thread it to 'verify'." placeholder:"TABLE=PREDICATE" sep:"none"`
+
 	InferTypes bool `help:"SQLite/D1 source only: promote conservatively-typed columns to richer Postgres types (boolean, timestamptz/timestamp, jsonb, uuid) — but ONLY after exhaustively validating that every non-NULL value conforms (a name-hint like is_*/created_at/*_json/*_id selects a candidate; the data validation is the gate). A column with a single non-conforming value (e.g. a '*_id' holding 'cus_abc123') is kept at its safe type and reported. Off by default (conservative-and-lossless mapping). Composes with --type-override (an explicit override always wins). Refused loudly against a non-SQLite/D1 source. See ADR-0144."`
 
 	StageLocal bool `help:"Cloudflare D1 source only: first replicate the live D1 database into a local SQLite file (byte-faithful — exact storage classes, integers > 2^53 included), then run the whole migrate against that file. Sidesteps D1's HTTP query limits (the per-query CPU ceiling and the LIKE/GLOB pattern-complexity limit that otherwise block --infer-types on real data), so validation and the bulk read run locally at full speed. Auto-engaged when --infer-types is set against a D1 source (D1 rejects the validation patterns on the direct path); set explicitly to stage without inference. The staged file is created in the system temp dir and removed when the migrate finishes."`
@@ -350,6 +352,26 @@ func stageD1Source(ctx context.Context, d1DSN, stageDir string) (path string, cl
 	return path, cleanup, nil
 }
 
+// resolveMigrateTransforms resolves the per-table transform configs the
+// migrate command threads onto the [pipeline.Migrator]: type overrides
+// (--type-override / YAML mappings), expression overrides (--expr-override),
+// and the --where row filters (ADR-0173). Grouping the three parse steps
+// keeps their order in one place and MigrateCmd.run under the funlen budget.
+func (m *MigrateCmd) resolveMigrateTransforms(cfg *config.Config) (
+	mappings []config.Mapping, exprMappings []config.ExpressionMapping, rowFilters map[string]string, err error,
+) {
+	if mappings, err = resolveMappings(m.TypeOverride, cfg); err != nil {
+		return nil, nil, nil, err
+	}
+	if exprMappings, err = resolveExpressionMappings(m.ExprOverride, cfg); err != nil {
+		return nil, nil, nil, err
+	}
+	if rowFilters, err = parseWhereFilters(m.Where); err != nil {
+		return nil, nil, nil, err
+	}
+	return mappings, exprMappings, rowFilters, nil
+}
+
 // Run implements `sluice migrate`: it wraps the body in the
 // `--format json` result-envelope lifecycle (a pass-through in text
 // mode) so exactly one JSON object reaches stdout on every exit path.
@@ -437,11 +459,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
-	mappings, err := resolveMappings(m.TypeOverride, cfg)
-	if err != nil {
-		return err
-	}
-	exprMappings, err := resolveExpressionMappings(m.ExprOverride, cfg)
+	mappings, exprMappings, rowFilters, err := m.resolveMigrateTransforms(cfg)
 	if err != nil {
 		return err
 	}
@@ -507,6 +525,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		AllowCrossShardMerge:  m.AllowCrossShardMerge,
 		AllowDegradedFKs:      m.AllowDegradedFKs,
 		SkipForeignKeys:       m.SkipForeignKeys,
+		RowFilters:            rowFilters,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine migration (the source's migration history is invalid on a
 		// different target engine); a same-engine migration KEEPS them by default

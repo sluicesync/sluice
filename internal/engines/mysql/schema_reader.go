@@ -54,6 +54,23 @@ type SchemaReader struct {
 	// multiDB is true; a nil predicate (the single-database default)
 	// disables the FK carve-out entirely.
 	dbInScope func(database string) bool
+
+	// rowFilters holds the operator's per-table `--where TABLE=<predicate>`
+	// row filters (ADR-0173 Phase 1), keyed by SOURCE table name. Set via
+	// [SchemaReader.SetRowFilters] ([ir.RowFilterSetter]) on the SOURCE
+	// verifier only, so `verify --depth count/sample` counts matching-
+	// source rows against the (already-filtered) target subset instead of
+	// false-reporting a mismatch. The migrate read path carries the same
+	// map on [RowReader]; this is the verify twin.
+	rowFilters map[string]string
+}
+
+// SetRowFilters implements [ir.RowFilterSetter]. The pipeline threads the
+// operator's `--where` predicates onto the SOURCE verifier so the count/
+// sample SQL AND-composes the matching per-table predicate (ADR-0173
+// Phase 1). An empty/nil map is a no-op. Keyed by SOURCE table name.
+func (r *SchemaReader) SetRowFilters(filters map[string]string) {
+	r.rowFilters = filters
 }
 
 // SetMultiDatabaseScope implements [ir.MultiDatabaseScoper]. It marks

@@ -1815,6 +1815,37 @@ type SchemaSetter interface {
 	SetSchema(name string)
 }
 
+// RowFilterSetter is the optional surface a [RowReader] or a verify-side
+// [SchemaReader] (an [ir.Verifier]) can implement to accept an operator-
+// supplied per-table row-level filter (`--where TABLE=<predicate>`,
+// ADR-0173 Phase 1). The predicate is native SOURCE-SQL, evaluated on
+// the source — sluice pushes it into the read query as one more
+// conjunct so only matching rows are copied/counted; there is no client-
+// side row filtering.
+//
+// The map is keyed by SOURCE table name (a `--map-database`/`--map-schema`
+// rename still matches on the original name, exactly like `--redact`).
+// The value is the raw predicate; the engine ALWAYS wraps it in
+// parentheses when composing it into the WHERE so a disjunctive predicate
+// (`a OR b`) can't escape the chunk/keyset bounds it is ANDed with.
+//
+// The pipeline threads it onto every source reader a `migrate` run opens
+// (the primary + each parallel chunk/table reader) via
+// [migcore.ApplyRowFilters], and onto the SOURCE verifier for `verify`.
+// Engines that don't implement it cause the pipeline to refuse `--where`
+// loudly rather than silently copy every row — the loud-failure tenet.
+//
+// MySQL and Postgres implement it (on both RowReader and SchemaReader);
+// SQLite/D1/flat-file sources do NOT (v1), so `--where` against them is
+// refused. Phase 1 is migrate-only; `sync` does NOT thread it (a filtered
+// snapshot with an unfiltered CDC leg would be inconsistent — Phase 2).
+type RowFilterSetter interface {
+	// SetRowFilters records the source-name-keyed predicate map. An empty
+	// or nil map disables filtering (the default). Implementations store
+	// it and consult filters[table.Name] at read/count time.
+	SetRowFilters(filters map[string]string)
+}
+
 // IndexBuildTuner is the optional surface a [SchemaWriter] can implement
 // to accept the operator's `--index-build-mem` value (a per-build
 // maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator

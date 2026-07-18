@@ -558,10 +558,13 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 	}
 
 	parallelDeps := &parallelBulkCopyDeps{
-		source:         m.Source,
-		target:         m.Target,
-		sourceDSN:      m.SourceDSN,
-		targetDSN:      m.TargetDSN,
+		source:    m.Source,
+		target:    m.Target,
+		sourceDSN: m.SourceDSN,
+		targetDSN: m.TargetDSN,
+		// ADR-0173 Phase 1: every parallel chunk/table reader pushes the
+		// operator's --where predicates down (openChunkReader applies them).
+		rowFilters:     m.RowFilters,
 		parallelism:    withinParallelism,
 		minRows:        migcore.ResolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
 		maxBufferBytes: m.MaxBufferBytes,

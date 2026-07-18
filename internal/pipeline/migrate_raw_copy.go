@@ -70,6 +70,13 @@ type rawCopyConfig struct {
 	mappings     []config.Mapping
 	exprMappings []config.ExpressionMapping
 	shard        ShardColumnSpec
+
+	// rowFilters is the --where per-table row filter (ADR-0173 Phase 1,
+	// G5). The raw byte-pipe COPYs the whole table verbatim, bypassing the
+	// per-table WHERE push-down — so any filter present forces the IR path,
+	// exactly like the value transforms above. Migrate-only today (the sync
+	// projection leaves it nil).
+	rowFilters map[string]string
 }
 
 // rawCopyConfigForMigrator projects a [Migrator]'s transform configuration
@@ -82,6 +89,7 @@ func rawCopyConfigForMigrator(m *Migrator) rawCopyConfig {
 		mappings:     m.Mappings,
 		exprMappings: m.ExpressionMappings,
 		shard:        m.InjectShardColumn,
+		rowFilters:   m.RowFilters,
 	}
 	if m.Source != nil {
 		cfg.sourceEngine = m.Source.Name()
@@ -160,6 +168,12 @@ func rawCopyGate(cfg rawCopyConfig) (ok bool, reason string) {
 	// point.
 	if cfg.shard.Engaged() {
 		return false, "shard-column injection (--inject-shard-column) configured"
+	}
+	// G5 — no row filter. The raw byte-pipe COPYs the whole table, so a
+	// per-table --where predicate (pushed into the IR read's WHERE) would be
+	// silently skipped — the raw lane would copy every row (ADR-0173).
+	if len(cfg.rowFilters) > 0 {
+		return false, "row filter (--where) configured"
 	}
 	return true, ""
 }

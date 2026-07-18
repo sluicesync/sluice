@@ -66,6 +66,40 @@ type DegradedFKAllower interface {
 	EnableDegradedFKs()
 }
 
+// FKOrphanViolation names the child side of a validating
+// `ADD CONSTRAINT FOREIGN KEY` that failed because orphan rows exist on
+// the child (SQLSTATE 23503 on PG). It carries only what the engine can
+// pull reliably from the error (the child table + the FK constraint
+// name); the pipeline resolves the referenced parent from the IR schema.
+type FKOrphanViolation struct {
+	// ChildTable is the referencing table the FK was being added to.
+	ChildTable string
+
+	// ConstraintName is the FK constraint's name as sluice emitted it.
+	ConstraintName string
+}
+
+// FKOrphanClassifier is the optional surface a [SchemaWriter] implements
+// so the pipeline can recognise a validating `ADD CONSTRAINT FOREIGN KEY`
+// failure caused by orphan child rows (SQLSTATE 23503 on PG) and name the
+// child table + constraint. The row-level filter path (`--where`,
+// ADR-0173 Phase 1) uses it to upgrade an otherwise-opaque 23503 into the
+// coded SLUICE-E-WHERE-FK-ORPHAN refusal: filtering a parent table's rows
+// orphans its children, so the deferred FK add fails — the operator is
+// steered to filter consistently or pass `--allow-degraded-fks`. It
+// composes with `--allow-degraded-fks`: when that flag is set the writer
+// degrades the FK to NOT VALID and this classifier is never consulted.
+//
+// PG implements it (the 23503 SQLSTATE + child/constraint names come off
+// pgconn.PgError). MySQL does NOT — its FK-orphan failure surfaces its own
+// errno and `--allow-degraded-fks` is PG-target-only anyway; the pipeline
+// simply passes the raw error through when the writer is not a classifier.
+type FKOrphanClassifier interface {
+	// AsFKOrphanViolation reports whether err is a validating-FK-add
+	// orphan violation and, if so, the child table + constraint name.
+	AsFKOrphanViolation(err error) (v FKOrphanViolation, ok bool)
+}
+
 // DegradedFKReporter exposes the list of FKs that were attached
 // degraded on the most-recent [SchemaWriter.CreateConstraints] call.
 // Returns nil/empty if the feature wasn't enabled, the writer doesn't

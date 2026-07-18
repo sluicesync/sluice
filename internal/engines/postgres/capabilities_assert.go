@@ -56,6 +56,7 @@ var (
 	_ ir.HeartbeatWriter                     = (*SchemaReader)(nil)
 	_ ir.MultiDatabaseScoper                 = (*SchemaReader)(nil)
 	_ irbackup.PositionFromManifestPreflight = (*SchemaReader)(nil)
+	_ ir.RowFilterSetter                     = (*SchemaReader)(nil)
 	_ ir.SampleVerifier                      = (*SchemaReader)(nil)
 	_ ir.SchemaSetter                        = (*SchemaReader)(nil)
 	_ ir.SequenceStateReader                 = (*SchemaReader)(nil)
@@ -76,6 +77,7 @@ var (
 	_ ir.DDLPreviewer            = (*SchemaWriter)(nil)
 	_ ir.DegradedFKAllower       = (*SchemaWriter)(nil)
 	_ ir.DegradedFKReporter      = (*SchemaWriter)(nil)
+	_ ir.FKOrphanClassifier      = (*SchemaWriter)(nil)
 	_ ir.ExtensionAware          = (*SchemaWriter)(nil)
 	_ ir.IncrementalIndexBuilder = (*SchemaWriter)(nil)
 	_ ir.IndexBuildBudgetSetter  = (*SchemaWriter)(nil)
@@ -96,6 +98,7 @@ var (
 	_ ir.RawCopyVersionProber = (*RowReader)(nil)
 	_ ir.RowCountEstimator    = (*RowReader)(nil)
 	_ ir.RowCounter           = (*RowReader)(nil)
+	_ ir.RowFilterSetter      = (*RowReader)(nil)
 	_ ir.SchemaSetter         = (*RowReader)(nil)
 
 	// RowWriter optional surfaces.
