@@ -55,7 +55,7 @@
 # manifest-drift cross-check below greps that file for the regex.
 MANIFEST='
 vstream;TestVStream_;internal/engines/mysql/...;ci.yml integration-vstream
-vstream;^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_);internal/pipeline;extended-suites.yml vstream-pipeline
+vstream;^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_|TestVindex);internal/pipeline;extended-suites.yml vstream-pipeline
 postgis;PostGIS_;internal/pipeline/... internal/engines/postgres/...;ci.yml integration-postgis
 chaos;^TestVitessChaos_;internal/engines/mysql/...;extended-suites.yml chaos
 vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml reshard

@@ -222,10 +222,13 @@ jobs:
   # because the F7c schema-forward pin drives the full Streamer apply
   # loop — it is streamer-shaped, not migrate-shaped, so it keeps the
   # pipeline package's TestStreamer_ naming convention rather than
-  # taking a misleading TestMigrate_VStream prefix. Any pipeline vstream
-  # test must match one of the three alternatives or it silently never
-  # runs (enforced by scripts/check-run-filter-coverage.sh in ci.yml's
-  # Lint job; keep that script's manifest in sync with this filter).
+  # taking a misleading TestMigrate_VStream prefix. The fourth alternative,
+  # ^TestVindex, is the audit-2026-07-19 M2-2 vindex-move-OUT ground-truth pin
+  # (a sharded-VStream premise check, neither migrate- nor streamer- nor
+  # spike-shaped). Any pipeline vstream test must match one of these
+  # alternatives or it silently never runs (enforced by
+  # scripts/check-run-filter-coverage.sh in ci.yml's Lint job; keep that
+  # script's manifest in sync with this filter).
   vstream-pipeline:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
@@ -260,7 +263,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           go test -tags='integration vstream' -race -count=1 -timeout=40m \
-            -run '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_)' -v ./internal/pipeline/
+            -run '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_|TestVindex)' -v ./internal/pipeline/
 
   # The real-world-schema corpus (roadmap item 52): migrate popular OSS
   # app schemas (GitLab / WordPress / Joomla / MediaWiki / Chinook /
