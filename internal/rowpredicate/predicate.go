@@ -116,6 +116,54 @@ func (p *Predicate) Columns() []string {
 	return out
 }
 
+// ValueComparedColumns returns the lower-cased columns this predicate references
+// in a VALUE comparison — a cmpNode (`col op literal`) or an IN membership —
+// EXCLUDING columns that appear ONLY in `col IS [NOT] NULL` (a presence test
+// whose result cannot depend on the stored value's exact bits).
+//
+// It is a strict subset of [Predicate.Columns]. The SL1 A0-fallback guard
+// (pipeline/where_cdc_filter.go) uses it so a single-precision FLOAT referenced
+// only in a display-round-INSENSITIVE `IS NULL` is not mistaken for a lossy
+// ordering term and wrongly refused (audit 2026-07-19c F-WR-1).
+func (p *Predicate) ValueComparedColumns() []string {
+	if p == nil || p.root == nil {
+		return nil
+	}
+	set := map[string]bool{}
+	valueComparedColumns(p.root, set)
+	out := make([]string, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// valueComparedColumns walks n, adding the column of every cmpNode / inNode
+// (value comparisons) and skipping isNullNode (presence-only). Node types are
+// value receivers stored as node values, so the switch matches on the concrete
+// value types.
+func valueComparedColumns(n node, set map[string]bool) {
+	switch t := n.(type) {
+	case andNode:
+		for _, k := range t.kids {
+			valueComparedColumns(k, set)
+		}
+	case orNode:
+		for _, k := range t.kids {
+			valueComparedColumns(k, set)
+		}
+	case notNode:
+		valueComparedColumns(t.kid, set)
+	case cmpNode:
+		set[t.column] = true
+	case inNode:
+		set[t.column] = true
+	case isNullNode:
+		// presence test — display-round-insensitive; intentionally NOT recorded.
+	}
+}
+
 // Family is the value family a column belongs to, for fidelity gating.
 type Family uint8
 

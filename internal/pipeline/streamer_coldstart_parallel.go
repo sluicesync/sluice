@@ -74,12 +74,25 @@ var errColdStartNoImporter = errors.New("pipeline: cold-start fast path: source 
 //     readers pinned to that snapshot.
 //
 // Pure and table-unit-testable: no I/O, no state mutation.
-func coldStartFastEligible(resumingCopy, schemaAlreadyApplied bool, snapshotName string, source ir.Engine) (ok bool, reason string) {
+func coldStartFastEligible(resumingCopy, schemaAlreadyApplied, clientCopyActive bool, snapshotName string, source ir.Engine) (ok bool, reason string) {
 	if resumingCopy {
 		return false, "resumable cold-start (durable watermark stays serial)"
 	}
 	if schemaAlreadyApplied {
 		return false, "--schema-already-applied (serial DDL-skipping path)"
+	}
+	// A0 client-copy fallback (audit 2026-07-19 #66 / 2026-07-19c F-ARCH-1): when
+	// a PAD-SPACE-collation --where forces a table to be streamed UNFILTERED
+	// server-side and filtered CLIENT-side, only the serial cold-start installs
+	// that PAD-faithful client filter (via ApplyClientCopyFilter). The parallel
+	// fast lane's readerFactory has no equivalent install point, so routing the
+	// A0 case here would stream the pad-space table with NO client-side narrowing
+	// — an out-of-scope over-copy leak (and, with the reduced server map, a
+	// NO-PAD drop). Stay serial whenever the fallback is engaged. Latent today
+	// (no engine is both CDCVStream and SnapshotImporterOpener), but this keeps
+	// the A0 invariant from silently breaking if one ever is.
+	if clientCopyActive {
+		return false, "A0 client-copy fallback engaged (serial cold-start installs the PAD-faithful client filter; the parallel fast lane cannot)"
 	}
 	if snapshotName == "" {
 		return false, "source snapshot is not shareable (per-session / single-stream)"
@@ -225,7 +238,13 @@ func (s *Streamer) runColdStartParallel(
 	// coldStart's fast path, this becomes a live bug — re-gate here first.
 	snapshotName := stream.SnapshotName
 	maxBuffer := s.MaxBufferBytes
-	rowFilters := s.RowFilters
+	// A-D1 invariant (audit 2026-07-19 / 2026-07-19c F-ARCH-1): every snapshot
+	// filter-PUSH site uses the reduced serverSideRowFilters (pad-space tables
+	// omitted for the A0 fallback), never the full RowFilters. Uniform with the
+	// serial coldStartOpenSnapshot + warm-resume sites. The fast lane is anyway
+	// gated OFF when the A0 fallback is active (coldStartFastEligible), so the two
+	// maps coincide here today; this keeps the invariant grep-clean regardless.
+	rowFilters := s.serverSideRowFilters
 	sourceName := s.Source.Name()
 	readerFactory := func(rctx context.Context) (ir.RowReader, error) {
 		readers, err := importer.ImportSnapshot(rctx, snapshotName, 1)

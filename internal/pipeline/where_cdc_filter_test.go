@@ -356,6 +356,19 @@ func TestClientCopyFloatSingleDetection(t *testing.T) {
 		}
 	})
 
+	t.Run("pad-forced + single-precision FLOAT IS NULL NOT recorded (display-round-insensitive)", func(t *testing.T) {
+		// F-WR-1: an IS NULL presence test on a FLOAT can't be affected by the
+		// carrier's display-rounding, so it must NOT be refused as a lossy
+		// ordering term. Recorded via ValueComparedColumns, which skips IS NULL.
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "region = 'EU' AND amount IS NULL"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.clientCopyFloatSingleColumns(); len(got) != 0 {
+			t.Fatalf("clientCopyFloatSingleColumns = %v; want empty (FLOAT IS NULL is display-round-insensitive — wrong-refusal otherwise)", got)
+		}
+	})
+
 	t.Run("pad-forced + DOUBLE ordering NOT recorded", func(t *testing.T) {
 		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "region = 'EU' AND price > 0.1"}, schema, false)
 		if err != nil {

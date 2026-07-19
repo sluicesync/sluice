@@ -70,20 +70,24 @@ type whereCDCFilter struct {
 	// need no fallback. Keyed by lower-cased source table name.
 	padSpaceCols map[string]string
 	// padSpaceFloatSingleCols records, for each PAD-SPACE-forced table (above)
-	// whose predicate ALSO references a single-precision FLOAT column in an
-	// ordering comparison, one such column (lower-cased). It is the SL1 hazard
-	// (audit 2026-07-19): a pad-forced table takes the client-side COPY fallback,
-	// and the cold-start COPY carries a single-precision FLOAT column's value
-	// DISPLAY-ROUNDED by mysqld's float->text formatter (the exact re-read repair
-	// runs AFTER copy, so the keep predicate sees the lossy pre-repair value). A
-	// FLOAT stored 0.1 promotes to 0.10000000149 so `v > 0.1` keeps the row at the
-	// source, but the rounded carrier renders "0.1" -> 0.1 > 0.1 = false -> the
-	// keep DROPS a source-in-scope row that is then never written and never
-	// repaired: silent loss. DOUBLE is full-precision in the carrier (only
-	// single-precision FLOAT rounds) and is NOT recorded. FLOAT equality is
-	// already refused at compile, so only ordering terms reach here. preflight
-	// REFUSES loudly on a VStream source when this is non-empty rather than
-	// mis-filter. Keyed by lower-cased source table name.
+	// whose predicate ALSO compares a single-precision FLOAT column BY VALUE, one
+	// such column (lower-cased). It is the SL1 hazard (audit 2026-07-19): a
+	// pad-forced table takes the client-side COPY fallback, and the cold-start
+	// COPY carries a single-precision FLOAT column's value DISPLAY-ROUNDED by
+	// mysqld's float->text formatter (the exact re-read repair runs AFTER copy, so
+	// the keep predicate sees the lossy pre-repair value). A FLOAT stored 0.1
+	// promotes to 0.10000000149 so `v > 0.1` keeps the row at the source, but the
+	// rounded carrier renders "0.1" -> 0.1 > 0.1 = false -> the keep DROPS a
+	// source-in-scope row that is then never written and never repaired: silent
+	// loss. DOUBLE is full-precision in the carrier (only single-precision FLOAT
+	// rounds) and is NOT recorded. Recorded only for a VALUE comparison
+	// ([rowpredicate.Predicate.ValueComparedColumns]): FLOAT equality is refused at
+	// compile, so a value comparison is an ordering term or an IN membership —
+	// both sensitive to the rounded bits; a `FLOAT IS [NOT] NULL` presence test is
+	// display-round-INSENSITIVE and is NOT recorded (else it would be a
+	// wrong-refusal, audit 2026-07-19c F-WR-1). preflight REFUSES loudly on a
+	// VStream source when this is non-empty rather than mis-filter. Keyed by
+	// lower-cased source table name.
 	padSpaceFloatSingleCols map[string]string
 }
 
@@ -151,15 +155,19 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 			}
 		}
 		// SL1: a table that will take the client-side COPY fallback (pad-forced
-		// above) AND references a single-precision FLOAT column would evaluate
-		// that column's ordering term on the DISPLAY-ROUNDED cold-start carrier
-		// value (see the padSpaceFloatSingleCols doc). Record the first such
-		// column so preflight can REFUSE on a VStream source. Only when the table
-		// is actually pad-forced — a non-pad table is server-filtered on the
-		// EXACT value, so its FLOAT ordering is faithful and safe.
+		// above) AND compares a single-precision FLOAT column by VALUE would
+		// evaluate that comparison on the DISPLAY-ROUNDED cold-start carrier value
+		// (see the padSpaceFloatSingleCols doc). Record the first such column so
+		// preflight can REFUSE on a VStream source. Two narrowings keep this from
+		// over-refusing: (1) only when the table is actually pad-forced — a non-pad
+		// table is server-filtered on the EXACT value, so its FLOAT comparison is
+		// faithful; (2) only a VALUE comparison (ValueComparedColumns, not the full
+		// Columns) — a `FLOAT IS [NOT] NULL` is a presence test whose result cannot
+		// depend on the rounded bits, so refusing it would be a wrong-refusal
+		// (audit 2026-07-19c F-WR-1).
 		if padSpaceCols[key] != "" {
-			singleFloats := singlePrecisionFloatColumns(tbl)
-			for _, c := range p.Columns() {
+			singleFloats := singlePrecisionFloatColumnSet(tbl)
+			for _, c := range p.ValueComparedColumns() {
 				if singleFloats[c] {
 					if padSpaceFloatSingleCols == nil {
 						padSpaceFloatSingleCols = make(map[string]string)
@@ -179,27 +187,30 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 	}, nil
 }
 
-// singlePrecisionFloatColumns returns the lower-cased names of tbl's
+// singlePrecisionFloatColumnSet returns the lower-cased names of tbl's
 // single-precision (32-bit) FLOAT columns — the ones mysqld's float->text COPY
-// carrier display-rounds (DOUBLE dumps at full precision). Used by the SL1 guard.
-func singlePrecisionFloatColumns(tbl *ir.Table) map[string]bool {
-	var out map[string]bool
-	for _, col := range tbl.Columns {
-		if f, ok := col.Type.(ir.Float); ok && f.Precision == ir.FloatSingle {
-			if out == nil {
-				out = make(map[string]bool)
-			}
-			out[strings.ToLower(col.Name)] = true
-		}
+// carrier display-rounds (DOUBLE transits exactly). It builds on
+// [migcore.SinglePrecisionFloatColumns] (the same source-of-truth the float-repair
+// planner keys off) so the SL1 guard and the repair stay in lock-step on what the
+// carrier rounds (audit 2026-07-19c J-ARCH-2).
+func singlePrecisionFloatColumnSet(tbl *ir.Table) map[string]bool {
+	cols := migcore.SinglePrecisionFloatColumns(tbl)
+	if len(cols) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(cols))
+	for _, col := range cols {
+		out[strings.ToLower(col.Name)] = true
 	}
 	return out
 }
 
 // clientCopyFloatSingleColumns returns the map of PAD-SPACE-forced table
-// (lower-cased) -> a single-precision FLOAT column its predicate references in
-// an ordering term (the SL1 hazard). Non-empty only when a client-copy-fallback
-// table would evaluate a single-precision FLOAT comparison on the lossy
-// cold-start COPY carrier. Nil-safe.
+// (lower-cased) -> a single-precision FLOAT column its predicate compares BY
+// VALUE (an ordering term or IN membership, not IS NULL — the SL1 hazard).
+// Non-empty only when a client-copy-fallback table would evaluate a
+// single-precision FLOAT value comparison on the lossy cold-start COPY carrier.
+// Nil-safe.
 func (f *whereCDCFilter) clientCopyFloatSingleColumns() map[string]string {
 	if f == nil {
 		return nil

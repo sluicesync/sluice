@@ -38,19 +38,28 @@ func TestColdStartFastEligible(t *testing.T) {
 	plainSrc := newRecordingEngine("mysql")              // no opener
 
 	tests := []struct {
-		name         string
-		resuming     bool
-		schemaApplie bool
-		snapshotName string
-		source       ir.Engine
-		wantOK       bool
-		wantSub      string
+		name             string
+		resuming         bool
+		schemaApplie     bool
+		clientCopyActive bool
+		snapshotName     string
+		source           ir.Engine
+		wantOK           bool
+		wantSub          string
 	}{
 		{
 			name:         "all preconditions hold -> fast",
 			snapshotName: "00000003-1-1",
 			source:       importerSrc,
 			wantOK:       true,
+		},
+		{
+			name:             "A0 client-copy fallback engaged -> serial",
+			snapshotName:     "00000003-1-1",
+			source:           importerSrc,
+			clientCopyActive: true,
+			wantOK:           false,
+			wantSub:          "client-copy fallback",
 		},
 		{
 			name:         "resuming -> serial",
@@ -86,7 +95,7 @@ func TestColdStartFastEligible(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, reason := coldStartFastEligible(tc.resuming, tc.schemaApplie, tc.snapshotName, tc.source)
+			ok, reason := coldStartFastEligible(tc.resuming, tc.schemaApplie, tc.clientCopyActive, tc.snapshotName, tc.source)
 			if ok != tc.wantOK {
 				t.Fatalf("coldStartFastEligible = %v (reason %q); want %v", ok, reason, tc.wantOK)
 			}

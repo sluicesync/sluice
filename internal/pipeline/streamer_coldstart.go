@@ -770,7 +770,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	// runBulkCopyWithOpts path runs, with a loud INFO naming the reason — the
 	// resumable durable-watermark + idempotent-COPY coupling lives ONLY on
 	// the serial path and is left untouched.
-	fast, fastReason := coldStartFastEligible(resumingCopy, s.SchemaAlreadyApplied, stream.SnapshotName, s.Source)
+	fast, fastReason := coldStartFastEligible(resumingCopy, s.SchemaAlreadyApplied, s.clientCopyFilter != nil, stream.SnapshotName, s.Source)
 	if coldStartDispatchObserver != nil {
 		coldStartDispatchObserver(fast)
 	}
