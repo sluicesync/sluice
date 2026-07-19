@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.283] - 2026-07-19
+
+**Filtered `sync --where` on a PAD-SPACE collation now WORKS on PlanetScale/Vitess — lifting the v0.99.282 refusal.** v0.99.282 refused a `--where` string filter on a legacy PAD-SPACE collation (e.g. `utf8mb4_general_ci`) against a VStream source, because the VStream server-side filter is NO-PAD and would silently drop trailing-space rows. That refusal is now replaced by an automatic client-side fallback, so the sync just works. Nothing that doesn't use `--where` on a PAD-SPACE collation against a VStream source changes.
+
+### Fixed / Changed
+
+- **PAD-SPACE-collation `--where` on PlanetScale/Vitess is filtered client-side instead of refused.** The VStream server-side filter evaluates the pushed `WHERE` NO-PAD regardless of the column's real `PAD_ATTRIBUTE`, so a legacy PAD-SPACE collation can't be reduced faithfully at the source. sluice now detects this and, for those tables, streams them **unfiltered** server-side and filters them **client-side** with the same PAD-faithful comparator the CDC leg uses — so the trailing-space `'EU '` a `region = 'EU'` filter should keep IS kept, on both the cold-start copy and the CDC stream, exactly as the source's own `=` does. Verified end-to-end on a real Vitess cluster (the trailing-space row survives the cold-start COPY; the out-of-scope row is dropped). The only trade is more wire traffic for that one table (it isn't reduced at the source); NO-PAD `utf8mb4_0900_*` collations are reduced server-side as usual.
+
+### Compatibility
+
+- **A filter v0.99.282 refused now runs; everything else is unchanged.** No behavior change for NO-PAD collations, non-string predicates, non-VStream flavors (vanilla MySQL, Postgres), or any sync without `--where`.
+
 ## [0.99.282] - 2026-07-19
 
 **Silent-loss fixes for `sync --where` string and float filters — from a fresh blind audit of the v0.99.279-281 remediation.** The 2026-07-18 remediation fixed one PAD-SPACE collation Critical but, an independent audit found, fixed one *representative* and missed three *siblings* of the same collation-fidelity family (a fix-the-representative miss). All four are confirmed against real MySQL 8.0.46 + Postgres 16.14. If you use `sync --where` with a string or float filter, upgrade. `migrate --where` (source-evaluated) was never affected; no change to any path that doesn't use `--where`.
