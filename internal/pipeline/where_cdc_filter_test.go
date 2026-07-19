@@ -325,6 +325,65 @@ func TestServerSidePadSpaceDetection(t *testing.T) {
 	})
 }
 
+// TestClientCopyFloatSingleDetection pins the SL1 hazard detection (audit
+// 2026-07-19): a table routed to the client-side COPY fallback (pad-forced)
+// whose predicate references a single-precision FLOAT column in an ordering term
+// is recorded, so preflight can refuse it on a VStream source — the cold-start
+// COPY carrier display-rounds single-precision FLOAT and the keep would compare
+// on the lossy value. DOUBLE (full-precision carrier) and non-pad (server-side,
+// exact-value) tables are NOT recorded.
+func TestClientCopyFloatSingleDetection(t *testing.T) {
+	r := mysql.Engine{}.CollationResolver()
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{}},
+			{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_general_ci"}}, // PAD SPACE
+			{Name: "zone", Type: ir.Varchar{Collation: "utf8mb4_0900_ai_ci"}},   // NO PAD
+			{Name: "amount", Type: ir.Float{Precision: ir.FloatSingle}},         // lossy carrier
+			{Name: "price", Type: ir.Float{Precision: ir.FloatDouble}},          // full precision
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+
+	t.Run("pad-forced + single-precision FLOAT ordering recorded", func(t *testing.T) {
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "region = 'EU' AND amount > 0.1"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.clientCopyFloatSingleColumns(); got["orders"] != "amount" {
+			t.Fatalf("clientCopyFloatSingleColumns = %v; want orders→amount (pad-forced + FLOAT ordering = SL1 hazard)", got)
+		}
+	})
+
+	t.Run("pad-forced + DOUBLE ordering NOT recorded", func(t *testing.T) {
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "region = 'EU' AND price > 0.1"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.clientCopyFloatSingleColumns(); len(got) != 0 {
+			t.Fatalf("clientCopyFloatSingleColumns = %v; want empty (DOUBLE carrier is full-precision)", got)
+		}
+	})
+
+	t.Run("non-pad + single-precision FLOAT NOT recorded (server-filtered, exact)", func(t *testing.T) {
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "zone = 'EU' AND amount > 0.1"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.clientCopyFloatSingleColumns(); len(got) != 0 {
+			t.Fatalf("clientCopyFloatSingleColumns = %v; want empty (NO-PAD table is server-filtered on the exact value)", got)
+		}
+	})
+
+	t.Run("nil filter is safe", func(t *testing.T) {
+		var f *whereCDCFilter
+		if got := f.clientCopyFloatSingleColumns(); got != nil {
+			t.Fatalf("nil.clientCopyFloatSingleColumns = %v; want nil", got)
+		}
+	})
+}
+
 // TestClientCopyFilter pins the A0 fallback's core (audit 2026-07-19 #66): the
 // cold-start COPY keep-predicate filters a PAD-SPACE table CLIENT-side with the
 // PAD-faithful comparator (keeping the trailing-space 'EU ' the NO-PAD VStream

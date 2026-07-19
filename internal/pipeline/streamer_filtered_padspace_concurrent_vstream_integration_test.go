@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -156,6 +157,69 @@ func TestStreamer_FilteredColdStart_PadSpace_ConcurrentCopy_VStream(t *testing.T
 	case <-time.After(20 * time.Second):
 		t.Fatal("Streamer.Run did not return after ctx cancel")
 	}
+}
+
+// TestStreamer_FilteredColdStart_FloatSingleRefused_VStream is the audit
+// 2026-07-19 SL1 gate: a filtered `sync --where` on a VStream source whose
+// predicate rides a single-precision FLOAT ordering term on a PAD-SPACE-forced
+// table must be REFUSED loudly at sync-start, not silently mis-filtered.
+//
+// The pad-space `region` column forces the whole table through the client-side
+// COPY fallback; its cold-start COPY carries a single-precision FLOAT
+// display-rounded by mysqld's float->text formatter (the exact re-read repair
+// runs AFTER copy, so the keep predicate would see the lossy value). A FLOAT
+// stored 0.1 is 0.10000000149 at the source so `amount > 0.1` KEEPS the row, but
+// the rounded "0.1" carrier compares 0.1 > 0.1 = false and would DROP it — a
+// source-in-scope row silently absent after cold-start. sluice refuses instead.
+func TestStreamer_FilteredColdStart_FloatSingleRefused_VStream(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, "commerce", 1)
+	defer cleanupSrc()
+	targetDSN, cleanupTgt := startMySQLTarget(t)
+	defer cleanupTgt()
+
+	applySQL(t, mysqlDSN, `CREATE TABLE orders_f (
+		id     BIGINT      NOT NULL AUTO_INCREMENT,
+		region VARCHAR(8)  CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+		amount FLOAT       NOT NULL,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	// A boundary FLOAT that would mis-classify under the rounded carrier.
+	applySQL(t, mysqlDSN, `INSERT INTO orders_f (id, region, amount) VALUES (1, 'EU', 0.1)`)
+	time.Sleep(3 * time.Second)
+
+	srcEng, ok := engines.Get("planetscale")
+	if !ok {
+		t.Fatal("source engine \"planetscale\" not registered")
+	}
+	tgtEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("target engine \"mysql\" not registered")
+	}
+	sourceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+	streamer := &Streamer{
+		Source:    srcEng,
+		Target:    tgtEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "t-sl1-float-refuse",
+		// PAD-SPACE region forces the client-copy fallback; amount is the
+		// single-precision FLOAT ordering term the fallback can't filter faithfully.
+		RowFilters: map[string]string{"orders_f": "region = 'EU' AND amount > 0.1"},
+	}
+
+	// The refusal fires at preflight (before any copy), so Run returns promptly;
+	// the timeout only guards a regression that fails to refuse and proceeds.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	err := streamer.Run(ctx)
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeWhereCDCUnsupportedPredicate {
+		t.Fatalf("Run() = %v; want coded %s (SL1 single-precision FLOAT refusal)", err, sluicecode.CodeWhereCDCUnsupportedPredicate)
+	}
+	t.Logf("SL1 refusal PASS: %v", err)
 }
 
 // targetIDSet returns the sorted id column of a target table (empty on error —

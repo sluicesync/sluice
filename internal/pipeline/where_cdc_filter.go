@@ -69,6 +69,22 @@ type whereCDCFilter struct {
 	// MySQL binlog, Postgres) push through the source's own PAD-faithful `=` and
 	// need no fallback. Keyed by lower-cased source table name.
 	padSpaceCols map[string]string
+	// padSpaceFloatSingleCols records, for each PAD-SPACE-forced table (above)
+	// whose predicate ALSO references a single-precision FLOAT column in an
+	// ordering comparison, one such column (lower-cased). It is the SL1 hazard
+	// (audit 2026-07-19): a pad-forced table takes the client-side COPY fallback,
+	// and the cold-start COPY carries a single-precision FLOAT column's value
+	// DISPLAY-ROUNDED by mysqld's float->text formatter (the exact re-read repair
+	// runs AFTER copy, so the keep predicate sees the lossy pre-repair value). A
+	// FLOAT stored 0.1 promotes to 0.10000000149 so `v > 0.1` keeps the row at the
+	// source, but the rounded carrier renders "0.1" -> 0.1 > 0.1 = false -> the
+	// keep DROPS a source-in-scope row that is then never written and never
+	// repaired: silent loss. DOUBLE is full-precision in the carrier (only
+	// single-precision FLOAT rounds) and is NOT recorded. FLOAT equality is
+	// already refused at compile, so only ordering terms reach here. preflight
+	// REFUSES loudly on a VStream source when this is non-empty rather than
+	// mis-filter. Keyed by lower-cased source table name.
+	padSpaceFloatSingleCols map[string]string
 }
 
 // buildWhereCDCFilter compiles each `--where TABLE=<predicate>` string into
@@ -90,7 +106,10 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 	preds := make(map[string]*rowpredicate.Predicate, len(rowFilters))
 	pkCols := make(map[string]map[string]bool, len(rowFilters))
 	refCols := make(map[string]map[string]bool, len(rowFilters))
-	var padSpaceCols map[string]string
+	var (
+		padSpaceCols            map[string]string
+		padSpaceFloatSingleCols map[string]string
+	)
 	for table, predicate := range rowFilters {
 		tbl, ok := byName[strings.ToLower(table)]
 		if !ok {
@@ -131,8 +150,61 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 				break
 			}
 		}
+		// SL1: a table that will take the client-side COPY fallback (pad-forced
+		// above) AND references a single-precision FLOAT column would evaluate
+		// that column's ordering term on the DISPLAY-ROUNDED cold-start carrier
+		// value (see the padSpaceFloatSingleCols doc). Record the first such
+		// column so preflight can REFUSE on a VStream source. Only when the table
+		// is actually pad-forced — a non-pad table is server-filtered on the
+		// EXACT value, so its FLOAT ordering is faithful and safe.
+		if padSpaceCols[key] != "" {
+			singleFloats := singlePrecisionFloatColumns(tbl)
+			for _, c := range p.Columns() {
+				if singleFloats[c] {
+					if padSpaceFloatSingleCols == nil {
+						padSpaceFloatSingleCols = make(map[string]string)
+					}
+					padSpaceFloatSingleCols[key] = c
+					break
+				}
+			}
+		}
 	}
-	return &whereCDCFilter{preds: preds, pkCols: pkCols, refCols: refCols, padSpaceCols: padSpaceCols}, nil
+	return &whereCDCFilter{
+		preds:                   preds,
+		pkCols:                  pkCols,
+		refCols:                 refCols,
+		padSpaceCols:            padSpaceCols,
+		padSpaceFloatSingleCols: padSpaceFloatSingleCols,
+	}, nil
+}
+
+// singlePrecisionFloatColumns returns the lower-cased names of tbl's
+// single-precision (32-bit) FLOAT columns — the ones mysqld's float->text COPY
+// carrier display-rounds (DOUBLE dumps at full precision). Used by the SL1 guard.
+func singlePrecisionFloatColumns(tbl *ir.Table) map[string]bool {
+	var out map[string]bool
+	for _, col := range tbl.Columns {
+		if f, ok := col.Type.(ir.Float); ok && f.Precision == ir.FloatSingle {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[strings.ToLower(col.Name)] = true
+		}
+	}
+	return out
+}
+
+// clientCopyFloatSingleColumns returns the map of PAD-SPACE-forced table
+// (lower-cased) -> a single-precision FLOAT column its predicate references in
+// an ordering term (the SL1 hazard). Non-empty only when a client-copy-fallback
+// table would evaluate a single-precision FLOAT comparison on the lossy
+// cold-start COPY carrier. Nil-safe.
+func (f *whereCDCFilter) clientCopyFloatSingleColumns() map[string]string {
+	if f == nil {
+		return nil
+	}
+	return f.padSpaceFloatSingleCols
 }
 
 // serverSidePadSpaceColumns returns the map of filtered table (lower-cased) →
@@ -611,6 +683,36 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 	// the source's OWN PAD-faithful `=` and never diverge — no reduction.
 	s.serverSideRowFilters = s.RowFilters
 	if s.Source.Capabilities().CDC == ir.CDCVStream {
+		// SL1 (audit 2026-07-19): a pad-forced table takes the client-side COPY
+		// fallback below, whose keep predicate runs on the cold-start COPY row —
+		// where a single-precision FLOAT column's value is DISPLAY-ROUNDED by
+		// mysqld's float->text carrier (the exact re-read repair runs AFTER copy,
+		// so keep sees the lossy value). An ordering term on such a column would
+		// then compare on the rounded value and could silently drop a
+		// source-in-scope boundary row (never written, so never repaired). Refuse
+		// loudly rather than mis-filter. DOUBLE is full-precision in the carrier
+		// and unaffected; a non-pad-forced table is server-filtered on the EXACT
+		// value and is not recorded here.
+		if fs := filter.clientCopyFloatSingleColumns(); len(fs) > 0 {
+			tables := make([]string, 0, len(fs))
+			for t := range fs {
+				tables = append(tables, t)
+			}
+			sort.Strings(tables)
+			t0 := tables[0]
+			return sluicecode.Wrap(
+				sluicecode.CodeWhereCDCUnsupportedPredicate,
+				"use a DOUBLE column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy",
+				fmt.Errorf(
+					"continuous filtered sync (--where on `sync`): table %q takes the client-side COPY fallback (it filters a "+
+						"PAD-SPACE-collation column on a PlanetScale/Vitess source), and its predicate also compares the "+
+						"single-precision FLOAT column %q — but the cold-start COPY carries FLOAT values display-rounded by "+
+						"mysqld's float->text formatter, so a boundary comparison (e.g. `> 0.1`) could silently drop a "+
+						"source-in-scope row. The stream refuses rather than mis-filter (DOUBLE is unaffected)",
+					t0, fs[t0],
+				),
+			)
+		}
 		if pad := filter.serverSidePadSpaceColumns(); len(pad) > 0 {
 			serverSide := make(map[string]string, len(s.RowFilters))
 			for t, p := range s.RowFilters {
