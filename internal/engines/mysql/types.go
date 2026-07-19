@@ -175,7 +175,10 @@ func translateType(c columnMeta) (ir.Type, error) {
 			return nil, err
 		}
 		warnIfLikelyTruncatedEnumLabel(c.ColumnType, "enum", values)
-		return ir.Enum{Values: values}, nil
+		// Collation carried so a filtered `sync --where` on an ENUM column
+		// reproduces the source's collation-aware `=` client-side (M1-5); a
+		// ci/ai collation matches `active` against a stored `Active`.
+		return ir.Enum{Values: values, Collation: c.Collation}, nil
 	case "set":
 		values, err := parseEnumOrSet(c.ColumnType, "set")
 		if err != nil {

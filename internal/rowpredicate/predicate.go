@@ -229,7 +229,16 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) Col
 		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict, false)
 	case ir.Text:
 		return stringColumnInfo(resolver, t.Collation, t.Determinism, strict, false)
-	case ir.Enum, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
+	case ir.Enum:
+		// A MySQL ENUM compares a value against a string literal under the
+		// column's collation (a ci/ai enum matches `active` ↔ `Active`), so
+		// route it through the resolver like varchar (audit 2026-07-19 M1-5) —
+		// a byte-exact client compare would mis-classify the row-move. A PG enum
+		// carries no collation (empty → the resolver's byte-exact path, matching
+		// its exact-label `=`); a MySQL enum under an unreproducible collation
+		// (or --where-strict-collation) refuses loudly, like any string column.
+		return stringColumnInfo(resolver, t.Collation, ir.CollationDeterminismUnknown, strict, false)
+	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// Canonical/identifier-shaped ASCII values: the source's `=` is
 		// exact, so a byte compare is faithful (no collation resolution).
 		return ColumnInfo{Family: FamilyString, Faithful: true}

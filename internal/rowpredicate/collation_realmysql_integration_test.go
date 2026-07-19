@@ -268,6 +268,52 @@ func TestRealMySQL_CollationMatrix(t *testing.T) {
 			t.Fatalf("latin1_swedish_ci: want coded refusal %s, got %v", sluicecode.CodeWhereCDCUnsupportedPredicate, err)
 		}
 	})
+
+	// M1-5 (audit 2026-07-19): a MySQL ENUM compares a value against a string
+	// literal under the column's collation. A ci/ai enum must match `active`
+	// against a stored `Active` exactly as the source does (a byte-exact client
+	// compare — the pre-M1-5 behavior — would mis-classify the row-move); a
+	// byte-exact `_bin` enum must NOT. Ground-truthed against the server's own
+	// `WHERE v='active'`.
+	t.Run("enum routes through the collation resolver (M1-5)", func(t *testing.T) {
+		for _, ec := range []struct {
+			coll string
+			want bool // does 'active' match a stored 'Active' under this collation?
+		}{
+			{"utf8mb4_0900_ai_ci", true}, // ci: matches
+			{"utf8mb4_bin", false},       // byte-exact: does not
+		} {
+			tbl := "t_enum_" + ec.coll
+			mustExecCM(t, ctx, db, "DROP TABLE IF EXISTS "+tbl)
+			mustExecCM(t, ctx, db, fmt.Sprintf(
+				"CREATE TABLE %s (id INT PRIMARY KEY, v ENUM('Active','Inactive') CHARACTER SET utf8mb4 COLLATE %s)",
+				tbl, ec.coll,
+			))
+			mustExecCM(t, ctx, db, fmt.Sprintf("INSERT INTO %s (id, v) VALUES (1, 'Active'), (2, 'Inactive')", tbl))
+
+			// Ground truth: does the server match 'active' against the stored 'Active'?
+			var n int
+			if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE v = 'active'", tbl)).Scan(&n); err != nil {
+				t.Fatalf("server count on enum %s: %v", ec.coll, err)
+			}
+			if (n == 1) != ec.want {
+				t.Fatalf("server WHERE v='active' on enum %s matched %d rows; expected match=%v", ec.coll, n, ec.want)
+			}
+
+			infos := ColumnInfosFromIR(testMySQLResolver, []*ir.Column{
+				{Name: "v", Type: ir.Enum{Values: []string{"Active", "Inactive"}, Collation: ec.coll}},
+			}, false)
+			p, err := Compile("t", "v = 'active'", infos)
+			if err != nil {
+				t.Fatalf("Compile(v='active') on enum %s refused unexpectedly: %v", ec.coll, err)
+			}
+			// The decoded ENUM value is the label string 'Active'.
+			if got := p.Eval(ir.Row{"v": "Active"}); got != ec.want {
+				t.Errorf("DIVERGENCE enum collation=%s: sluice.Eval('Active' vs 'active')=%v, MySQL WHERE match=%v",
+					ec.coll, got, ec.want)
+			}
+		}
+	})
 }
 
 func mustExecCM(t *testing.T, ctx context.Context, db *sql.DB, stmt string) {

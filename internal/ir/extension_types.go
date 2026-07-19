@@ -137,6 +137,19 @@ type Enum struct {
 	// `posts_status_enum` (which would break casts / shared-enum tables
 	// / app code referencing the type by name).
 	TypeName string
+
+	// Collation is the MySQL-family column collation whose `=` a filtered
+	// `sync --where status='active'` must reproduce client-side: a MySQL ENUM
+	// compares a value against a string literal under the column's collation,
+	// so a case/accent-insensitive one (`utf8mb4_0900_ai_ci`) matches `Active`
+	// against `active` — a byte-exact client compare would mis-classify the
+	// row-move (audit 2026-07-19 M1-5). Populated by the MySQL schema reader;
+	// empty for Postgres (a PG enum compares by exact label, not a collation)
+	// and after a wire round-trip (like TypeName, not carried on the wire — the
+	// `--where` predicate is compiled from a fresh schema read, so it always has
+	// the live collation). Consumed only by the row-predicate resolver; DDL
+	// emission is unaffected (the enum inherits its column/table charset).
+	Collation string
 }
 
 func (Enum) isType()    {}
