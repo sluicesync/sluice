@@ -174,13 +174,15 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # The -run prefix `TestVitessClusterFilteredSync` matches TWO tests — the
-    # cold-start move-OUT crux AND `...WarmResume` (each boots its own cluster),
-    # so the budget covers two cluster boots + two tests, not one (audit
-    # 2026-07-19 E: the prior 45m/40m was sized for one and would loud-timeout).
-    # Inner (55m) stays < outer (60m) so Go's diagnostic timeout-panic fires
-    # before the hard job kill.
-    timeout-minutes: 60
+    # The -run prefix `TestVitessClusterFilteredSync` matches THREE tests, each
+    # booting its OWN cluster: the cold-start move-OUT crux, `...WarmResume`, and
+    # `...PadSpaceFallback` (the A0 client-side COPY fallback, added v0.99.283).
+    # The budget covers three cluster boots + -race (audit 2026-07-19 T2: the
+    # prior 60m/55m was sized for two and the third would loud-timeout). Inner
+    # (80m) stays < outer (85m) so Go's diagnostic timeout-panic fires before the
+    # hard job kill. NOTE: if a fourth prefix-matching cluster test is added,
+    # re-bump this budget AND the vacuous-green assertion's test list below.
+    timeout-minutes: 85
     env:
       # Pin to the vendored-client major (vitess.io/vitess v0.24.x). The GHCR
       # mirror tag mirrors scripts/vitess-versions.txt's v24 entry.
@@ -197,10 +199,23 @@ jobs:
         run: bash scripts/ci-ghcr-pull.sh "ghcr.io/sluicesync/sluice-vitess:${VITESS_TAG}"
       # Same env-indirection as the cluster job: the image ref reaches the
       # harness via VITESS_LITE_IMAGE, never interpolated into the run text.
-      - name: Boot cluster + run TestVitessClusterFilteredSync (cold-start + warm-resume)
+      - name: Boot cluster + run TestVitessClusterFilteredSync (cold-start + warm-resume + PAD-SPACE A0)
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:${{ env.VITESS_TAG }}
         run: |
-          go test -tags='integration vitesscluster' -race -count=1 -timeout=55m \
+          set -o pipefail
+          go test -tags='integration vitesscluster' -race -count=1 -timeout=80m \
             -run TestVitessClusterFilteredSync \
-            -v ./internal/engines/mysql/...
+            -v ./internal/engines/mysql/... 2>&1 | tee gate.out
+          # F1 (audit 2026-07-19): `go test` exits 0 both when -run matches ZERO
+          # tests (a future rename/removal of the crux) and when a test t.Skip's
+          # (findDocker skips when docker is absent). This gate is the ONLY
+          # end-to-end proof of the Vitess move-OUT + A0 wire premise, so a
+          # vacuous green would let an operator ship on nothing. Assert each crux
+          # test actually ran AND passed.
+          for t in TestVitessClusterFilteredSync TestVitessClusterFilteredSyncWarmResume TestVitessClusterFilteredSyncPadSpaceFallback; do
+            grep -Eq "^--- PASS: ${t}( |\$)" gate.out || {
+              echo "::error::filtered-tag-gate: crux test ${t} did not run+PASS (vacuous gate — a rename, removal, or skip). See the run log."
+              exit 1
+            }
+          done

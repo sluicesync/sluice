@@ -13,9 +13,13 @@ The audit that produced v0.99.282 found that the VStream server-side filter eval
 
 Verified end-to-end on a real Vitess cluster: a filtered open drops the trailing-space row (confirming the server filter really is NO-PAD), and the fallback path keeps it while dropping the out-of-scope row. The only trade is **more wire traffic for that one table** (it isn't reduced at the source). NO-PAD `utf8mb4_0900_*` collations — the MySQL 8.0 default — are reduced server-side as usual and are unaffected.
 
+### A filtered `sync --where` on a MySQL `ENUM` column now compares under the column's collation
+
+A MySQL `ENUM` value compared to a string literal uses the column's collation, so a `--where status='active'` on a case-insensitive `ENUM('Active','Inactive')` now matches the stored `'Active'` exactly as the source's own `=` does. Previously the client-side classifier compared the enum byte-exact and silently mis-classified such a row-move. Postgres enums (which compare by exact label) are unchanged.
+
 ## Compatibility
 
-**A filter that v0.99.282 refused now runs; everything else is unchanged.** No behavior change for NO-PAD collations, non-string predicates, the non-VStream flavors (vanilla MySQL binlog, Postgres — which push the filter through the source's own PAD-faithful `=`), or any sync without `--where`.
+**A filter that v0.99.282 refused now runs; everything else is unchanged.** No behavior change for NO-PAD collations, non-string predicates, the non-VStream flavors (vanilla MySQL binlog, Postgres — which push the filter through the source's own PAD-faithful `=`), or any sync without `--where`. The ENUM change only affects a filtered `sync --where` on a case/accent-insensitive ENUM column.
 
 ## Who needs this
 

@@ -11,10 +11,11 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 ### Fixed / Changed
 
 - **PAD-SPACE-collation `--where` on PlanetScale/Vitess is filtered client-side instead of refused.** The VStream server-side filter evaluates the pushed `WHERE` NO-PAD regardless of the column's real `PAD_ATTRIBUTE`, so a legacy PAD-SPACE collation can't be reduced faithfully at the source. sluice now detects this and, for those tables, streams them **unfiltered** server-side and filters them **client-side** with the same PAD-faithful comparator the CDC leg uses — so the trailing-space `'EU '` a `region = 'EU'` filter should keep IS kept, on both the cold-start copy and the CDC stream, exactly as the source's own `=` does. Verified end-to-end on a real Vitess cluster (the trailing-space row survives the cold-start COPY; the out-of-scope row is dropped). The only trade is more wire traffic for that one table (it isn't reduced at the source); NO-PAD `utf8mb4_0900_*` collations are reduced server-side as usual.
+- **A filtered `sync --where` on a MySQL `ENUM` column now compares under the column's collation.** An `ENUM` value compared to a string literal uses the column's collation, so a `--where status='active'` on a case-insensitive `ENUM('Active','Inactive')` now matches `'Active'` exactly as the source's own `=` does — previously it compared byte-exact and silently mis-classified the row-move. Postgres enums (exact-label `=`) are unchanged.
 
 ### Compatibility
 
-- **A filter v0.99.282 refused now runs; everything else is unchanged.** No behavior change for NO-PAD collations, non-string predicates, non-VStream flavors (vanilla MySQL, Postgres), or any sync without `--where`.
+- **A filter v0.99.282 refused now runs; everything else is unchanged.** No behavior change for NO-PAD collations, non-string predicates, non-VStream flavors (vanilla MySQL, Postgres), or any sync without `--where`. The ENUM change only affects a filtered `sync --where` on a case/accent-insensitive ENUM column.
 
 ## [0.99.282] - 2026-07-19
 

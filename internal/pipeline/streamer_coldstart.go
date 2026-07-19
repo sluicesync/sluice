@@ -489,7 +489,16 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	// reader can't push it down (rather than silently copy every row); the
 	// CDC leg's client-side evaluator (preflightRowFilters) agrees with this
 	// source-side evaluation by construction. No-op when RowFilters is empty.
-	if err := migcore.ApplyRowFilters(stream.Rows, s.RowFilters, s.Source.Name()); err != nil {
+	//
+	// serverSideRowFilters, NOT RowFilters: it MUST be the same reduced map the
+	// stream was OPENED with (above), or a pad-space table A0 deliberately
+	// omitted from the server-side push could be silently re-added here. Today
+	// this is byte-identical to RowFilters on the VStream path (SetRowFilters is
+	// a no-op) and equal to RowFilters on every other path (no reduction) — but
+	// threading the same map keeps A0 correct if a future VStream reader ever
+	// makes SetRowFilters actually apply a server-side WHERE (audit 2026-07-19
+	// A-D1, the latent A0 re-introduction landmine).
+	if err := migcore.ApplyRowFilters(stream.Rows, s.serverSideRowFilters, s.Source.Name()); err != nil {
 		_ = stream.Close()
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, err)
 	}
