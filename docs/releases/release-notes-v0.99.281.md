@@ -1,5 +1,7 @@
 # sluice v0.99.281
 
+> ⚠️ **Correction (2026-07-19):** a fresh independent audit found additional silent-loss in `sync --where` string/float filters (`_as_cs`/`char(n)`/PAD-SPACE collations and float ordering) still present after this wave. **Fixed in v0.99.282.** If you use `sync --where`, upgrade to **≥ v0.99.282**.
+
 **Final wave of the 2026-07-18 audit remediation (batch B)** — a filtered-sync throughput fix and an internal collation-layering cleanup. Fully additive: nothing that doesn't use `--where` changes. This completes the audit; the remaining items are its explicit not-fix calls.
 
 ## Fixed / Changed

@@ -4,6 +4,21 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.282] - 2026-07-19
+
+**Silent-loss fixes for `sync --where` string and float filters — from a fresh blind audit of the v0.99.279-281 remediation.** The 2026-07-18 remediation fixed one PAD-SPACE collation Critical but, an independent audit found, fixed one *representative* and missed three *siblings* of the same collation-fidelity family (a fix-the-representative miss). All four are confirmed against real MySQL 8.0.46 + Postgres 16.14. If you use `sync --where` with a string or float filter, upgrade. `migrate --where` (source-evaluated) was never affected; no change to any path that doesn't use `--where`.
+
+### Fixed
+
+- **MySQL `utf8mb4_0900_as_cs` (and every `_as_cs`/`_cs` UCA collation) silently mis-classified a filtered row-move.** The comparator routed these case+accent-sensitive collations to a byte-exact compare, but MySQL's `=` under a UCA collation folds Unicode canonical equivalence (NFC/NFD) and ignores UCA-ignorable code points (e.g. a soft hyphen) — so a value differing only by normalization form or an ignorable character was classified out of scope client-side while the source kept it (a move-OUT read as a drop → silent `DELETE` of an in-scope row; the mirror leaks). Only `_bin`/`binary` is genuinely byte-exact; `_as_cs`/`_cs`/tailored-UCA now route through the same faithful Vitess comparator as the ci/ai collations.
+- **Postgres `char(n)`/bpchar filters silently mis-classified on trailing-space padding.** bpchar `=` is PAD SPACE (trailing-space-insensitive) regardless of collation — unlike `text`/`varchar` — and logical decoding delivers a char value space-padded to its width. The comparator compared the padded value byte-exact, so a stored `'EU'` (delivered as `'EU  '`) failed to match `region = 'EU'` which Postgres's own `=` matches — a silent drop/orphan on Postgres's DEFAULT char semantics, no legacy collation needed. char/bpchar now trims trailing spaces before the compare (text/varchar stay trailing-space-significant).
+- **Filtered `sync --where` on a PAD-SPACE collation is now refused on PlanetScale/Vitess instead of silently dropping rows.** Making the client comparator PAD-faithful (v0.99.279) without reconciling the VStream server-side filter left the two legs disagreeing: the pushed WHERE is evaluated NO-PAD by vttablet regardless of the column's real `PAD_ATTRIBUTE`, so a PAD-SPACE legacy collation (e.g. `utf8mb4_general_ci`) dropped trailing-space rows the client keeps. Until the client-side fallback lands, such a predicate is refused loudly at sync-start on VStream sources (use a NO-PAD `utf8mb4_0900_*` collation, filter on a different column, or `migrate --where`). NO-PAD collations, non-string predicates, and non-VStream flavors (vanilla MySQL, Postgres — which push through the source's own PAD-faithful `=`) are unaffected — server-side filtering stays in place everywhere it's faithful.
+- **Float/double ordering compared exactly instead of as IEEE-754.** A `sync --where` ordering comparison (`<`,`<=`,`>`,`>=`) on a FLOAT/DOUBLE column compared the literal exactly while the source coerces it to a 64-bit double, so a high-precision literal that rounds to the stored value (e.g. `d >= 0.10000000000000001` against a stored `0.1`) diverged — silently dropping or leaking the boundary row. Ordering now compares as float64, matching the source's coercion (equality on floats stays refused, as before).
+
+### Compatibility
+
+- **No behavior change without `--where`.** For `sync --where`: `_as_cs`/`_cs` MySQL and `char(n)` Postgres string filters are now faithful; float ordering matches the source; a PAD-SPACE-collation filter on a VStream/PlanetScale source now refuses loudly (was a silent drop) — the same filter on a NO-PAD collation or a non-VStream source works unchanged. All four are ground-truthed against real servers, and both real-server collation family matrices run in the per-PR CI gate.
+
 ## [0.99.281] - 2026-07-18
 
 Final wave of the 2026-07-18 audit remediation (batch B) — a filtered-sync throughput fix and an internal collation-layering cleanup. No change to any path that doesn't use `--where`.

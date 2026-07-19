@@ -1,5 +1,7 @@
 # sluice v0.99.279
 
+> ⚠️ **Correction (2026-07-19):** a fresh independent audit found this remediation fixed one representative of the collation-fidelity class and missed three siblings — additional silent-loss in `sync --where` string/float filters on `_as_cs`/`char(n)`/PAD-SPACE collations and float ordering. **Fixed in v0.99.282.** If you use `sync --where`, upgrade to **≥ v0.99.282**.
+
 **Silent-loss fix for `sync --where` string filters — supersedes v0.99.278.** A post-release audit found the ADR-0174 client-side collation comparator diverges from the source's own `=`, silently dropping or leaking rows in continuous filtered sync. If you use `sync --where` with a **string** filter, upgrade. `migrate --where` was never affected (it evaluates on the source), and nothing that doesn't use `--where` changes.
 
 ## Fixed
