@@ -132,3 +132,38 @@ func TestMySQLCollationResolver_Policies(t *testing.T) {
 		t.Error("ci comparator did not fold case as expected")
 	}
 }
+
+// TestCollationNoPad_MariaDBNopad pins audit 2026-07-19 SL-COLL-1: MariaDB's
+// `*_nopad_*` collations are NO PAD, but collationNoPad originally recognised
+// only MySQL's `_0900_`/binary, so a MariaDB utf8mb4_nopad_bin --where column
+// was byte-exact-yet-treated-PAD-SPACE and silently mis-classified trailing-
+// space row-moves (same class as A1/A2). Ground-truthed on MariaDB 11.4.
+func TestCollationNoPad_MariaDBNopad(t *testing.T) {
+	noPad := []string{
+		"utf8mb4_nopad_bin",            // MariaDB NO PAD byte-exact
+		"utf8mb4_general_nopad_ci",     // MariaDB NO PAD ci
+		"utf8mb4_unicode_nopad_ci",     // MariaDB NO PAD ci
+		"utf8mb4_unicode_520_nopad_ci", // MariaDB NO PAD ci
+		"utf8mb4_0900_ai_ci",           // MySQL UCA (already covered)
+		"binary",
+	}
+	for _, c := range noPad {
+		if !collationNoPad(c) {
+			t.Errorf("collationNoPad(%q) = false; want true (NO PAD)", c)
+		}
+	}
+	// PAD SPACE collations must stay PAD SPACE — the `nopad` token must not
+	// false-positive on a legacy _bin / ci collation.
+	for _, c := range []string{"utf8mb4_bin", "utf8mb4_general_ci", "latin1_swedish_ci"} {
+		if collationNoPad(c) {
+			t.Errorf("collationNoPad(%q) = true; want false (PAD SPACE)", c)
+		}
+	}
+	// The full resolver: a MariaDB utf8mb4_nopad_bin is byte-exact AND NO PAD, so
+	// it must NOT right-trim (PadSpace=false) — else a stored 'EU ' would wrongly
+	// match 'EU' (SL-COLL-1).
+	r := mysqlCollationResolver{}
+	if eq := r.ResolveStringEquality("utf8mb4_nopad_bin", ir.CollationDeterminismUnknown, false, false); !eq.Faithful || eq.Compare != nil || eq.PadSpace {
+		t.Errorf("utf8mb4_nopad_bin resolver: got %+v; want byte-exact NO PAD (Faithful, Compare=nil, PadSpace=false)", eq)
+	}
+}

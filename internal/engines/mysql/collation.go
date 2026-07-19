@@ -119,14 +119,23 @@ func collationByteExactMySQL(collation string) bool {
 
 // collationNoPad reports whether a collation compares with NO-PAD semantics
 // (trailing spaces are SIGNIFICANT), as opposed to the legacy PAD SPACE default
-// (trailing spaces ignored in `=`). MySQL's UCA-9.0.0 collations (`*_0900_*`)
-// and the `binary` collation are NO PAD; every other collation is PAD SPACE
-// (information_schema.COLLATIONS.PAD_ATTRIBUTE). A stable MySQL rule, ground-
-// truthed in the real-MySQL collation family matrix. When false, the caller
-// right-trims ASCII spaces before comparison to reproduce PAD SPACE `=`.
+// (trailing spaces ignored in `=`). The NO-PAD collations are:
+//   - MySQL's UCA-9.0.0 collations (`*_0900_*`) and the `binary` collation
+//     (information_schema.COLLATIONS.PAD_ATTRIBUTE on MySQL);
+//   - MariaDB's `*_nopad_*` collations (`utf8mb4_nopad_bin`,
+//     `utf8mb4_general_nopad_ci`, `utf8mb4_unicode[_520]_nopad_ci`) — MariaDB
+//     has NO PAD_ATTRIBUTE column, so the name is the only signal, and the
+//     `nopad` token is exactly its NO-PAD marker (ground-truthed on MariaDB
+//     11.4: `WHERE v='EU'` matches only `'EU'`, not `'EU '`).
+//
+// Every other collation is PAD SPACE. When false, the caller right-trims ASCII
+// spaces before comparison to reproduce PAD SPACE `=`. Missing the MariaDB
+// `nopad` family here silently mis-classified trailing-space row-moves on a
+// MariaDB `utf8mb4_nopad_bin` `--where` column (audit 2026-07-19 SL-COLL-1 —
+// same PAD-SPACE class as A1/A2). Ground-truthed in the real-server matrices.
 func collationNoPad(name string) bool {
 	lc := strings.ToLower(strings.TrimSpace(name))
-	return strings.Contains(lc, "_0900_") || lc == "binary"
+	return strings.Contains(lc, "_0900_") || strings.Contains(lc, "nopad") || lc == "binary"
 }
 
 // collationCharsetUTF8 reports whether the collation's charset is a UTF-8
