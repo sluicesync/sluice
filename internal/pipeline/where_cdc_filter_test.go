@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -277,4 +278,49 @@ func assertDropped(t *testing.T, f *whereCDCFilter, c ir.Change) {
 	if len(out) != 0 {
 		t.Fatalf("route(%T): got %d changes; want 0 (dropped)", c, len(out))
 	}
+}
+
+// TestServerSidePadSpaceDetection pins the A0 (audit 2026-07-19) detection that
+// the VStream refusal rides on: a predicate on a PAD-SPACE-collation string
+// column is recorded (the VStream server-side filter is NO-PAD and would
+// diverge), while a NO-PAD (_0900_) column is not. Uses the REAL MySQL resolver
+// so the collation → PAD_ATTRIBUTE mapping is the production one.
+func TestServerSidePadSpaceDetection(t *testing.T) {
+	r := mysql.Engine{}.CollationResolver()
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{}},
+			{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_general_ci"}}, // PAD SPACE
+			{Name: "zone", Type: ir.Varchar{Collation: "utf8mb4_0900_ai_ci"}},   // NO PAD
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+
+	t.Run("PAD-SPACE column recorded", func(t *testing.T) {
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "region = 'EU'"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.serverSidePadSpaceColumns(); got["orders"] != "region" {
+			t.Fatalf("serverSidePadSpaceColumns = %v; want orders→region (general_ci is PAD SPACE)", got)
+		}
+	})
+
+	t.Run("NO-PAD column not recorded", func(t *testing.T) {
+		f, err := buildWhereCDCFilter(r, map[string]string{"orders": "zone = 'EU'"}, schema, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if got := f.serverSidePadSpaceColumns(); len(got) != 0 {
+			t.Fatalf("serverSidePadSpaceColumns = %v; want empty (0900 is NO PAD)", got)
+		}
+	})
+
+	t.Run("nil filter is safe", func(t *testing.T) {
+		var f *whereCDCFilter
+		if got := f.serverSidePadSpaceColumns(); got != nil {
+			t.Fatalf("nil.serverSidePadSpaceColumns = %v; want nil", got)
+		}
+	})
 }

@@ -57,6 +57,16 @@ type whereCDCFilter struct {
 	// BEFORE-IMAGE refusal at the exact point the columns that matter are
 	// known. Keyed by lower-cased source table name.
 	refCols map[string]map[string]bool
+	// padSpaceCols records, for each filtered table whose predicate references a
+	// PAD-SPACE-collation string column, one such column (lower-cased). On a
+	// VStream flavor the server-side filter push-down evaluates the pushed WHERE
+	// with NO-PAD semantics regardless of the column's PAD_ATTRIBUTE, so such a
+	// predicate silently drops trailing-space rows the (PAD-faithful) client
+	// route keeps (audit 2026-07-19 A0). The pipeline refuses it loudly on
+	// VStream sources until the client-side COPY fallback lands; other flavors
+	// (vanilla MySQL binlog, Postgres) push through the source's own PAD-faithful
+	// `=` and are unaffected. Keyed by lower-cased source table name.
+	padSpaceCols map[string]string
 }
 
 // buildWhereCDCFilter compiles each `--where TABLE=<predicate>` string into
@@ -78,6 +88,7 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 	preds := make(map[string]*rowpredicate.Predicate, len(rowFilters))
 	pkCols := make(map[string]map[string]bool, len(rowFilters))
 	refCols := make(map[string]map[string]bool, len(rowFilters))
+	var padSpaceCols map[string]string
 	for table, predicate := range rowFilters {
 		tbl, ok := byName[strings.ToLower(table)]
 		if !ok {
@@ -105,8 +116,31 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 			cols[c] = true // already lower-cased by the compiler
 		}
 		refCols[key] = cols
+		// A0: record the first PAD-SPACE string column this predicate references,
+		// so a VStream source can refuse it (its server-side filter is NO-PAD).
+		// infos is keyed by lower-cased column name, matching p.Columns().
+		for _, c := range p.Columns() {
+			if ci := infos[c]; ci.Family == rowpredicate.FamilyString && ci.PadSpace {
+				if padSpaceCols == nil {
+					padSpaceCols = make(map[string]string)
+				}
+				padSpaceCols[key] = c
+				break
+			}
+		}
 	}
-	return &whereCDCFilter{preds: preds, pkCols: pkCols, refCols: refCols}, nil
+	return &whereCDCFilter{preds: preds, pkCols: pkCols, refCols: refCols, padSpaceCols: padSpaceCols}, nil
+}
+
+// serverSidePadSpaceColumns returns the map of filtered table (lower-cased) →
+// one PAD-SPACE-collation string column its predicate references. Non-empty
+// only when a predicate would diverge under a NO-PAD server-side filter
+// (audit 2026-07-19 A0). Nil-safe.
+func (f *whereCDCFilter) serverSidePadSpaceColumns() map[string]string {
+	if f == nil {
+		return nil
+	}
+	return f.padSpaceCols
 }
 
 // primaryKeyColumnSet returns the lower-cased primary-key column names of
@@ -533,6 +567,42 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// A0 (audit 2026-07-19): a VStream (PlanetScale/Vitess) source pushes the
+	// `--where` predicate into the VStream filter server-side, where vttablet
+	// evaluates it with NO-PAD semantics regardless of the column's real
+	// PAD_ATTRIBUTE. A PAD-SPACE-collation string column (e.g. the legacy
+	// utf8mb4_general_ci) filtered there would silently DROP trailing-space rows
+	// the now-PAD-faithful client route keeps — an internal snapshot/CDC
+	// divergence. Until the client-side COPY fallback lands (which lets such a
+	// table stream unfiltered and be filtered client-side), refuse it LOUDLY
+	// rather than mis-scope. Non-VStream flavors (vanilla MySQL binlog, Postgres)
+	// push the filter through the source's OWN PAD-faithful `=`, so they never
+	// diverge and are unaffected.
+	if s.Source.Capabilities().CDC == ir.CDCVStream {
+		if pad := filter.serverSidePadSpaceColumns(); len(pad) > 0 {
+			tables := make([]string, 0, len(pad))
+			for t := range pad {
+				tables = append(tables, t)
+			}
+			sort.Strings(tables)
+			t0 := tables[0]
+			return sluicecode.Wrap(
+				sluicecode.CodeWhereCDCUnsupportedPredicate,
+				"use a NO-PAD collation (utf8mb4_0900_*) on that column, filter on a different column, or run `sluice migrate --where` for a one-shot filtered copy",
+				fmt.Errorf(
+					"continuous filtered sync (--where on `sync`) on a PlanetScale/Vitess (VStream) source: the predicate for "+
+						"table %q filters on the PAD-SPACE-collation string column %q, but the VStream server-side filter "+
+						"evaluates it with NO-PAD semantics (trailing spaces significant), which would silently drop "+
+						"trailing-space rows the client keeps. Server-side filtering of PAD-SPACE-collation columns on VStream "+
+						"is not yet supported (a client-side fallback is planned); other columns/collations and other source "+
+						"flavors are unaffected",
+					t0, pad[t0],
+				),
+			)
+		}
+	}
+
 	s.whereFilter = filter
 	slog.InfoContext(
 		ctx, "continuous filtered sync: --where predicates compiled for the CDC leg (ADR-0173 Phase 2)",
