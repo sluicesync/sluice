@@ -222,6 +222,99 @@ func TestStreamer_FilteredColdStart_FloatSingleRefused_VStream(t *testing.T) {
 	t.Logf("SL1 refusal PASS: %v", err)
 }
 
+// TestStreamer_FilteredColdStart_DoubleAllowed_VStream binds the SL1 DOUBLE
+// EXEMPTION premise (audit 2026-07-19c J-TEST-1): the SL1 refusal exempts DOUBLE
+// because DOUBLE transits the VStream COPY carrier at FULL precision (only
+// single-precision FLOAT is display-rounded). If that premise were wrong — a
+// lossy DOUBLE carrier, or a mistaken refusal of DOUBLE — a filtered sync on a
+// DOUBLE ordering term over a pad-forced table would silently drop a boundary
+// row or refuse a safe one. This drives exactly that: a DOUBLE `> boundary`
+// filter on a PAD-SPACE-forced (client-copy fallback) table, and asserts (a) the
+// sync is NOT refused (DOUBLE is allowed) and (b) the boundary-precision in-scope
+// row SURVIVES the fallback COPY (DOUBLE carried exactly), while out-of-scope
+// rows are dropped.
+func TestStreamer_FilteredColdStart_DoubleAllowed_VStream(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, "commerce", 1)
+	defer cleanupSrc()
+	targetDSN, cleanupTgt := startMySQLTarget(t)
+	defer cleanupTgt()
+
+	applySQL(t, mysqlDSN, `CREATE TABLE orders_d (
+		id     BIGINT      NOT NULL AUTO_INCREMENT,
+		region VARCHAR(8)  CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+		dbl    DOUBLE      NOT NULL,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	// 8388608.5 is exactly representable as DOUBLE but NOT as single-precision
+	// FLOAT (which would round it to 8388608) — so a lossy carrier would drop
+	// id=1 under `dbl > 8388608.4`, and an exact DOUBLE carrier keeps it.
+	applySQL(t, mysqlDSN+"&multiStatements=true", `
+		INSERT INTO orders_d (id, region, dbl) VALUES
+			(1, 'EU', 8388608.5),
+			(2, 'US', 8388609.0),
+			(3, 'EU', 8388608.0)`)
+	time.Sleep(3 * time.Second)
+
+	srcEng, ok := engines.Get("planetscale")
+	if !ok {
+		t.Fatal("source engine \"planetscale\" not registered")
+	}
+	tgtEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("target engine \"mysql\" not registered")
+	}
+	sourceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+	streamer := &Streamer{
+		Source:    srcEng,
+		Target:    tgtEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "t-sl1-double-allowed",
+		// region PAD-SPACE forces the client-copy fallback; dbl (DOUBLE) is the
+		// ordering term the fallback evaluates client-side on the COPY carrier.
+		RowFilters: map[string]string{"orders_d": "region = 'EU' AND dbl > 8388608.4"},
+	}
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	tgtDB, err := sql.Open("mysql", targetDSN)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+
+	// Only id=1 is in scope (EU + 8388608.5 > 8388608.4). If DOUBLE were rounded
+	// to 8388608 by the carrier, id=1 would be dropped (8388608 !> 8388608.4) and
+	// this would time out; id=3 (8388608.0, EU) and id=2 (US) are out of scope.
+	if !waitForExactRowCountMySQL(targetDSN, "orders_d", 1, 120*time.Second) {
+		select {
+		case e := <-runErr:
+			t.Fatalf("orders_d: never reached the 1 in-scope row; Run returned: %v; ids=%v", e, targetIDSet(t, tgtDB, "orders_d"))
+		default:
+		}
+		t.Fatalf("orders_d: never reached the 1 in-scope row (DOUBLE carrier lossy, or DOUBLE wrongly refused?); ids=%v", targetIDSet(t, tgtDB, "orders_d"))
+	}
+	time.Sleep(2 * time.Second) // settle: a leaked out-of-scope row would arrive here
+	got := targetIDSet(t, tgtDB, "orders_d")
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("orders_d: kept id set = %v; want [1] (DOUBLE exact: 8388608.5 survives > 8388608.4; 8388608.0 and US dropped)", got)
+	}
+	t.Logf("orders_d: SL1 DOUBLE-exemption PASS — DOUBLE 8388608.5 carried exactly through the A0 fallback and kept, out-of-scope dropped (ids=%v)", got)
+
+	cancel()
+	select {
+	case <-runErr:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
 // targetIDSet returns the sorted id column of a target table (empty on error —
 // the caller asserts, so a transient read error surfaces as a set mismatch, not
 // a panic).

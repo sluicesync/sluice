@@ -25,8 +25,11 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 // TestCollationPadAttribute_MySQLLiveCatalogParity asserts collationNoPad agrees
@@ -102,6 +105,10 @@ func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 			}
 			defer func() { _ = db.Close() }()
 
+			// Non-vacuous guard (audit 2026-07-19c J-COLL-2): count how many cases
+			// of each class actually RAN, so an image where every collation is
+			// unavailable (all skipped) fails instead of passing on zero checks.
+			var ranNoPad, ranPad int
 			for _, tc := range cases {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				// A fresh table per collation; store 'EU ' WITH a trailing space,
@@ -112,9 +119,15 @@ func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 					"INSERT INTO pad_probe (v) VALUES ('EU ');"
 				if _, err := db.ExecContext(ctx, stmts); err != nil {
 					cancel()
-					// A collation absent on this MariaDB line is a skip, not a fail.
-					t.Logf("%s: collation %q unavailable (%v) — skipping", image, tc.collation, err)
-					continue
+					// Only a genuine "Unknown collation" (errno 1273) is a legit
+					// skip — any other CREATE error would silently mask a real
+					// failure as a skip, re-vacuuming the gate.
+					var me *gomysql.MySQLError
+					if errors.As(err, &me) && me.Number == 1273 {
+						t.Logf("%s: collation %q unavailable (errno 1273) — skipping", image, tc.collation)
+						continue
+					}
+					t.Fatalf("%s: unexpected error probing collation %q (not errno-1273 unavailable): %v", image, tc.collation, err)
 				}
 				var matched int
 				if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pad_probe WHERE v = 'EU'").Scan(&matched); err != nil {
@@ -132,6 +145,18 @@ func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 					t.Errorf("%s: collationNoPad(%q) = %v but real MariaDB `=` behaves NoPad=%v (stored 'EU ' %s '= EU') — SL-COLL-1 class regression",
 						image, tc.collation, got, serverNoPad, map[bool]string{true: "did NOT match", false: "matched"}[serverNoPad])
 				}
+				if tc.wantNoPad {
+					ranNoPad++
+				} else {
+					ranPad++
+				}
+			}
+			// The parity check must have exercised BOTH classes on this image,
+			// else it proved nothing (a NO-PAD-only or PAD-only run is vacuous for
+			// the classifier). utf8mb4_general_ci / utf8mb4_bin (PAD) and
+			// utf8mb4_nopad_bin (NO PAD) are standard on every supported LTS line.
+			if ranNoPad == 0 || ranPad == 0 {
+				t.Fatalf("%s: vacuous parity run — NO-PAD cases ran=%d, PAD-SPACE cases ran=%d; both must be >0", image, ranNoPad, ranPad)
 			}
 		})
 	}
