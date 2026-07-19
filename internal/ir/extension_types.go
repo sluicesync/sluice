@@ -149,6 +149,15 @@ type Enum struct {
 	// `--where` predicate is compiled from a fresh schema read, so it always has
 	// the live collation). Consumed only by the row-predicate resolver; DDL
 	// emission is unaffected (the enum inherits its column/table charset).
+	//
+	// The field DOES participate in structural equality (reflect.DeepEqual in
+	// diffRenameColumnIR, SchemaSignature.Equal), so a collation-ONLY ENUM change
+	// is surfaced as a schema delta rather than a no-op (audit 2026-07-19 E1/E3).
+	// That is intentional and monotonic-safe: a collation change alters `=`
+	// semantics (the whole reason this field exists), so surfacing it is correct,
+	// and a field-add can only ADD advisory deltas (a spurious rename→drop+add
+	// classification or an extra schema-history version), never HIDE a
+	// decode-affecting change. No data is mutated on either path.
 	Collation string
 }
 

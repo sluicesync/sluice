@@ -2624,7 +2624,11 @@ type vstreamSnapshotRows struct {
 	// can't reproduce their `--where` `=` (audit 2026-07-19 A0). ReadRows drops a
 	// row when keep(table, row) is false. Set once post-open, before any
 	// ReadRows, so the concurrent-copy readers only ever read it. nil = no
-	// client-side filtering (the common, fully-server-filtered case).
+	// client-side filtering — every filtered table reduced faithfully
+	// server-side (a NO-PAD utf8mb4_0900_* or non-string predicate). That is NOT
+	// rare-vs-common on real PlanetScale: its legacy default utf8mb4_general_ci
+	// is PAD SPACE, so a `--where` on any legacy-collation string column installs
+	// a non-nil keep (audit 2026-07-19 A-D3).
 	clientCopyFilter func(table string, row ir.Row) bool
 }
 
@@ -2911,8 +2915,10 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			for i, row := range batch {
 				// A0 fallback: drop rows the PAD-faithful client predicate
 				// excludes, for the tables we stream unfiltered server-side.
-				// keep is nil (a clean no-op) for every fully-server-filtered
-				// table — the common case.
+				// keep is nil (a clean no-op) only when every filtered table is
+				// reduced server-side (NO-PAD / non-string predicate) — engaged
+				// whenever a legacy-collation string column is filtered, which is
+				// the PlanetScale default (audit 2026-07-19 A-D3).
 				if keep != nil && !keep(tableName, row) {
 					batch[i] = nil
 					continue

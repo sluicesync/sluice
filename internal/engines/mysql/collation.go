@@ -112,6 +112,12 @@ func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.Colla
 // 2026-07-19 A1 — a `_0900_as_cs` column silently mis-classified an NFC/NFD or
 // soft-hyphen-bearing row-move). Those route through the Vitess comparator
 // instead. The caller has already excluded the empty/unknown collation.
+//
+// The `binary` disjunct is DEFENSIVE, not a live path: [ResolveStringEquality]
+// refuses any non-UTF-8-charset collation (which `binary` is) before it reaches
+// here, so a `binary` column never actually flows through this predicate today
+// (audit 2026-07-19 E2). It is kept so the function is correct in isolation for
+// any future caller that doesn't front it with the charset gate.
 func collationByteExactMySQL(collation string) bool {
 	lc := strings.ToLower(strings.TrimSpace(collation))
 	return lc == "binary" || strings.HasSuffix(lc, "_bin")

@@ -224,8 +224,10 @@ func (f *whereCDCFilter) serverSidePadSpaceColumns() map[string]string {
 // `=`), so this narrows them client-side with the SAME compiled predicate the
 // CDC route() uses. A table that is NOT PAD-SPACE (still server-filtered) is
 // kept unconditionally, so the filter only touches the unfiltered-server-side
-// tables. Returns nil when there are no PAD-SPACE tables (the common case — no
-// fallback needed). The row is fed to Eval exactly as route() feeds a CDC row,
+// tables. Returns nil when there are no PAD-SPACE tables (no fallback needed —
+// so for a NO-PAD/non-string predicate, but engaged whenever a legacy-collation
+// string column is filtered, the PlanetScale default; audit 2026-07-19 A-D3).
+// The row is fed to Eval exactly as route() feeds a CDC row,
 // so the casing/collation contract is identical.
 func (f *whereCDCFilter) clientCopyFilter() func(table string, row ir.Row) bool {
 	if f == nil || len(f.padSpaceCols) == 0 {

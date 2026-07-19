@@ -104,7 +104,9 @@ func ApplyRowFilters(reader any, filters map[string]string, engineName string) e
 // [ir.ClientCopyFilterSetter] surface. keep is the PAD-faithful predicate the
 // orchestrator uses for the tables it streams UNFILTERED server-side — a
 // PAD-SPACE-collation `--where` the VStream NO-PAD server filter cannot
-// reproduce. A nil keep is a no-op (no such table — the common case). When keep
+// reproduce. A nil keep is a no-op — every filter reduced server-side (frequent
+// for NO-PAD/non-string predicates, but a legacy-collation string `--where` on
+// PlanetScale installs a non-nil keep; audit 2026-07-19 A-D3). When keep
 // is non-nil but the reader does NOT implement the setter, it refuses LOUDLY
 // rather than silently over-copying those tables (they would stream unfiltered
 // with no client-side narrowing); engineName names the engine in the refusal.
