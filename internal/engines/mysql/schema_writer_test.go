@@ -130,7 +130,10 @@ func TestSchemaWriter_RoundTrip(t *testing.T) {
 	wantUsersCols := map[string]ir.Type{
 		"id":     ir.Integer{Width: 64, Unsigned: true, AutoIncrement: true},
 		"active": ir.Boolean{},
-		"role":   ir.Enum{Values: []string{"admin", "user", "guest"}},
+		// The reader carries the column's collation on the enum (M1-5, for
+		// filtered `sync --where`), the same DB default the email VARCHAR above
+		// expects on this 8.0 shard.
+		"role": ir.Enum{Values: []string{"admin", "user", "guest"}, Collation: "utf8mb4_0900_ai_ci"},
 	}
 	for name, wantType := range wantUsersCols {
 		col := findColumn(users, name)

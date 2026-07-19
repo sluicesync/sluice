@@ -120,7 +120,9 @@ func TestSchemaReader_BasicShape(t *testing.T) {
 		{"id", ir.Integer{Width: 64, Unsigned: true, AutoIncrement: true}},
 		{"email", ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
 		{"active", ir.Boolean{}},
-		{"role", ir.Enum{Values: []string{"admin", "user", "guest"}}},
+		// M1-5: the reader carries the enum's collation (the DB default here, the
+		// same the email VARCHAR above expects) for filtered `sync --where`.
+		{"role", ir.Enum{Values: []string{"admin", "user", "guest"}, Collation: "utf8mb4_0900_ai_ci"}},
 		{"created_at", ir.Timestamp{Precision: 6, WithTimeZone: true}},
 		{"profile", ir.JSON{Binary: true}},
 	}
