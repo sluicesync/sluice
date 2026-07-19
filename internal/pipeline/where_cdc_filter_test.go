@@ -324,3 +324,55 @@ func TestServerSidePadSpaceDetection(t *testing.T) {
 		}
 	})
 }
+
+// TestClientCopyFilter pins the A0 fallback's core (audit 2026-07-19 #66): the
+// cold-start COPY keep-predicate filters a PAD-SPACE table CLIENT-side with the
+// PAD-faithful comparator (keeping the trailing-space 'EU ' the NO-PAD VStream
+// server filter would drop), while a non-PAD-SPACE (server-filtered) table is
+// kept unconditionally (no double-filtering).
+func TestClientCopyFilter(t *testing.T) {
+	r := mysql.Engine{}.CollationResolver()
+	schema := &ir.Schema{Tables: []*ir.Table{
+		{
+			Name: "orders",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{}},
+				{Name: "region", Type: ir.Varchar{Collation: "utf8mb4_general_ci"}}, // PAD SPACE
+			},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+		{
+			Name: "widgets",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{}},
+				{Name: "zone", Type: ir.Varchar{Collation: "utf8mb4_0900_ai_ci"}}, // NO PAD
+			},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+	}}
+	f, err := buildWhereCDCFilter(r, map[string]string{
+		"orders":  "region = 'EU'",
+		"widgets": "zone = 'EU'",
+	}, schema, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	keep := f.clientCopyFilter()
+	if keep == nil {
+		t.Fatal("clientCopyFilter is nil; want non-nil (orders is PAD SPACE)")
+	}
+	// PAD-SPACE table 'orders': filtered client-side, PAD-faithfully.
+	if !keep("orders", ir.Row{"id": int64(1), "region": "EU"}) {
+		t.Error("keep(orders, region='EU') = false; want true (in scope)")
+	}
+	if !keep("orders", ir.Row{"id": int64(2), "region": "EU "}) {
+		t.Error("keep(orders, region='EU ') = false; want true (PAD-faithful — the row the NO-PAD server would drop)")
+	}
+	if keep("orders", ir.Row{"id": int64(3), "region": "US"}) {
+		t.Error("keep(orders, region='US') = true; want false (out of scope)")
+	}
+	// NON-PAD table 'widgets': server-filtered → the copy filter keeps everything.
+	if !keep("widgets", ir.Row{"id": int64(4), "zone": "US"}) {
+		t.Error("keep(widgets, zone='US') = false; want true (server-filtered, not re-filtered)")
+	}
+}

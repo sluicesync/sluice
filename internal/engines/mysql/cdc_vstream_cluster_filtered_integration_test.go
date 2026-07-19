@@ -55,6 +55,7 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -496,4 +497,134 @@ func findRegionUpdate(t *testing.T, got []ir.Change, id int64) ir.Update {
 	}
 	t.Fatalf("no ir.Update on regions for id=%d among %d changes (%s)", id, len(got), changeKinds(got))
 	return ir.Update{}
+}
+
+// padSpaceRegionsTable describes the general_ci `regions` for the COPY drain.
+func padSpaceRegionsTable() *ir.Table {
+	return &ir.Table{
+		Name: "regions",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "region", Type: ir.Varchar{Length: 8, Collation: "utf8mb4_general_ci"}},
+			{Name: "payload", Type: ir.Varchar{Length: 64}},
+		},
+	}
+}
+
+// drainRegionCopy reads the whole filtered COPY of `regions` into an id→region
+// map, failing on a decode error.
+func drainRegionCopy(t *testing.T, ctx context.Context, stream *ir.SnapshotStream) map[int64]string {
+	t.Helper()
+	rowsCh, err := stream.Rows.ReadRows(ctx, padSpaceRegionsTable())
+	if err != nil {
+		t.Fatalf("ReadRows(regions): %v", err)
+	}
+	copied := map[int64]string{}
+	for row := range rowsCh {
+		id, ok := asInt64Val(row["id"])
+		if !ok {
+			t.Fatalf("COPY row has non-integer id: %#v", row["id"])
+		}
+		copied[id] = asStringVal(row["region"])
+	}
+	if err := stream.Rows.Err(); err != nil {
+		t.Fatalf("snapshot COPY error after drain: %v", err)
+	}
+	return copied
+}
+
+// TestVitessClusterFilteredSyncPadSpaceFallback is the audit 2026-07-19 A0 gate.
+// It (1) REPRODUCES, on a real Vitess cluster, that the VStream server-side
+// filter evaluates the pushed WHERE NO-PAD — so a trailing-space row on a
+// PAD-SPACE collation is silently dropped (the divergence the 07-19 audit only
+// INFERRED from vendored vitess source), and (2) proves the client-side COPY
+// fallback (#66): with the table streamed UNFILTERED server-side, the
+// PAD-faithful client keep-predicate installed via ir.ClientCopyFilterSetter
+// keeps the trailing-space row and drops the out-of-scope one.
+func TestVitessClusterFilteredSyncPadSpaceFallback(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVitessCluster(t)
+	defer cleanup()
+
+	// region is a legacy PAD-SPACE collation: its `=` ignores trailing spaces.
+	applyClusterSQL(t, mysqlDSN, `
+		CREATE TABLE regions (
+			id      BIGINT       NOT NULL AUTO_INCREMENT,
+			region  VARCHAR(8)   CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+			payload VARCHAR(64)  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	time.Sleep(3 * time.Second)
+
+	// id=2 stores 'EU ' WITH a trailing space — in scope under the source's own
+	// PAD-SPACE `region='EU'`, but NO-PAD server-side.
+	applyClusterSQL(t, mysqlDSN+"&multiStatements=true", `
+		INSERT INTO regions (id, region, payload) VALUES
+			(1, 'EU',  'seed-eu-1'),
+			(2, 'EU ', 'seed-eu-trailing-2'),
+			(3, 'US',  'seed-us-3')`)
+	time.Sleep(2 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0&vstream_tablet_type=primary",
+		mysqlDSN, grpcEndpoint,
+	)
+	fo, ok := any(Engine{Flavor: FlavorPlanetScale}).(ir.FilteredSnapshotOpener)
+	if !ok {
+		t.Fatal("Engine{Flavor: FlavorPlanetScale} must implement ir.FilteredSnapshotOpener")
+	}
+
+	// (1) REPRO: a FILTERED open pushes `region='EU'` server-side; vttablet
+	// evaluates it NO-PAD, so the trailing-space id=2 is DROPPED.
+	t.Run("server-side filter is NO-PAD (drops the trailing-space row)", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		stream, err := fo.OpenSnapshotStreamForTablesFiltered(ctx, sluiceDSN, []string{"regions"}, map[string]string{"regions": "region = 'EU'"})
+		if err != nil {
+			t.Fatalf("filtered open: %v", err)
+		}
+		defer func() { _ = stream.Close() }()
+		copied := drainRegionCopy(t, ctx, stream)
+		if _, kept := copied[2]; kept {
+			t.Fatalf("server-side filter KEPT the trailing-space id=2 (%q): it is behaving PAD SPACE, not NO-PAD — the A0 divergence does not reproduce on this cluster, so the client fallback would be unnecessary. Investigate before relying on #66. copied=%v", copied[2], copied)
+		}
+		t.Logf("A0 repro confirmed: NO-PAD server-side filter dropped the trailing-space id=2; copied=%v", copied)
+	})
+
+	// (2) FALLBACK: stream UNFILTERED server-side + install the PAD-faithful
+	// client keep-predicate (the #66 path). id=2 ('EU ') must SURVIVE; id=3
+	// ('US') must be dropped client-side.
+	t.Run("client-side COPY fallback keeps the trailing-space row", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		stream, err := fo.OpenSnapshotStreamForTablesFiltered(ctx, sluiceDSN, []string{"regions"}, nil)
+		if err != nil {
+			t.Fatalf("unfiltered open: %v", err)
+		}
+		defer func() { _ = stream.Close() }()
+
+		setter, ok := stream.Rows.(ir.ClientCopyFilterSetter)
+		if !ok {
+			t.Fatal("VStream snapshot Rows must implement ir.ClientCopyFilterSetter (#66)")
+		}
+		// The PAD-faithful keep-predicate the pipeline builds for a PAD-SPACE
+		// table (here written directly; TestClientCopyFilter pins the builder).
+		setter.SetClientCopyFilter(func(table string, row ir.Row) bool {
+			if table != "regions" {
+				return true
+			}
+			return strings.TrimRight(asStringVal(row["region"]), " ") == "EU"
+		})
+
+		copied := drainRegionCopy(t, ctx, stream)
+		if copied[1] != "EU" {
+			t.Errorf("fallback dropped in-scope id=1 (EU); copied=%v", copied)
+		}
+		if _, kept := copied[2]; !kept {
+			t.Errorf("fallback DROPPED the trailing-space id=2 ('EU ') — the A0 fix FAILED; copied=%v", copied)
+		}
+		if _, leaked := copied[3]; leaked {
+			t.Errorf("fallback LEAKED out-of-scope id=3 (US); copied=%v", copied)
+		}
+		t.Logf("A0 fallback PASS: trailing-space id=2 survived, out-of-scope id=3 dropped; copied=%v", copied)
+	})
 }

@@ -1217,6 +1217,21 @@ type Streamer struct {
 	whereFilter    *whereCDCFilter
 	whereFilterErr atomic.Pointer[error]
 
+	// serverSideRowFilters is the subset of [RowFilters] pushed into a VStream
+	// source's SERVER-side stream filter (cold-start COPY + warm-resume). It
+	// equals RowFilters on every path EXCEPT a VStream source with a
+	// PAD-SPACE-collation --where column: those tables are OMITTED here (streamed
+	// unfiltered server-side) and filtered CLIENT-side instead, because the
+	// VStream server filter is NO-PAD and can't reproduce their `=` (audit
+	// 2026-07-19 A0). Set by [preflightRowFilters]; read by the cold-start open
+	// and the warm-resume SetServerSideRowFilters.
+	serverSideRowFilters map[string]string
+	// clientCopyFilter is the PAD-faithful cold-start COPY keep-predicate for the
+	// A0 fallback — non-nil ONLY on a VStream source with a PAD-SPACE-collation
+	// --where column, installed on the snapshot reader via
+	// [ir.ClientCopyFilterSetter]. nil on every other path.
+	clientCopyFilter func(table string, row ir.Row) bool
+
 	// coldStartSeedSnapshots is the ADR-0054 Bug 83 fix: synthetic
 	// SchemaSnapshots reflecting the pre-Shape-A-rewrite source IR
 	// per filtered table. Set by [coldStart] before

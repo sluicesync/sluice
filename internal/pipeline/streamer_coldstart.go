@@ -445,12 +445,16 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 		// it. Otherwise the plain resume runs and the post-open ApplyRowFilters
 		// gate below is the loud-failure authority.
 		if fr, ok := s.Source.(ir.FilteredSnapshotResumer); ok && len(s.RowFilters) > 0 {
-			stream, err = fr.OpenSnapshotStreamFromPositionFiltered(ctx, s.SourceDSN, resumeFrom, snapshotTables, s.RowFilters)
+			// serverSideRowFilters, not RowFilters: on VStream a PAD-SPACE table
+			// is OMITTED here (streamed unfiltered) and filtered client-side by
+			// the ApplyClientCopyFilter gate below (audit 2026-07-19 A0). Equal
+			// to RowFilters on every other path.
+			stream, err = fr.OpenSnapshotStreamFromPositionFiltered(ctx, s.SourceDSN, resumeFrom, snapshotTables, s.serverSideRowFilters)
 		} else {
 			stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom, snapshotTables)
 		}
 	} else {
-		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables, s.RowFilters)
+		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables, s.serverSideRowFilters)
 	}
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
@@ -486,6 +490,18 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	// CDC leg's client-side evaluator (preflightRowFilters) agrees with this
 	// source-side evaluation by construction. No-op when RowFilters is empty.
 	if err := migcore.ApplyRowFilters(stream.Rows, s.RowFilters, s.Source.Name()); err != nil {
+		_ = stream.Close()
+		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, err)
+	}
+
+	// A0 fallback (audit 2026-07-19): install the PAD-faithful client-side COPY
+	// filter for the PAD-SPACE-collation tables streamed UNFILTERED server-side
+	// on VStream (omitted from serverSideRowFilters above), so the cold-start
+	// copies only in-scope rows without relying on the NO-PAD server filter.
+	// s.clientCopyFilter is nil on every other path (a clean no-op); it refuses
+	// loudly if a filter is needed but the reader can't apply it, never
+	// over-copies.
+	if err := migcore.ApplyClientCopyFilter(stream.Rows, s.clientCopyFilter, s.Source.Name()); err != nil {
 		_ = stream.Close()
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, err)
 	}

@@ -98,3 +98,29 @@ func ApplyRowFilters(reader any, filters map[string]string, engineName string) e
 	setter.SetRowFilters(filters)
 	return nil
 }
+
+// ApplyClientCopyFilter installs a CLIENT-side cold-start COPY filter (audit
+// 2026-07-19 A0) on a freshly-opened snapshot reader via the optional
+// [ir.ClientCopyFilterSetter] surface. keep is the PAD-faithful predicate the
+// orchestrator uses for the tables it streams UNFILTERED server-side — a
+// PAD-SPACE-collation `--where` the VStream NO-PAD server filter cannot
+// reproduce. A nil keep is a no-op (no such table — the common case). When keep
+// is non-nil but the reader does NOT implement the setter, it refuses LOUDLY
+// rather than silently over-copying those tables (they would stream unfiltered
+// with no client-side narrowing); engineName names the engine in the refusal.
+// Only the VStream snapshot reader both needs this (its server filter is NO-PAD)
+// and implements it, so the refusal is a defensive belt, not a reachable
+// operator path.
+func ApplyClientCopyFilter(reader any, keep func(table string, row ir.Row) bool, engineName string) error {
+	if keep == nil {
+		return nil
+	}
+	setter, ok := reader.(ir.ClientCopyFilterSetter)
+	if !ok {
+		return fmt.Errorf("--where: source engine %q streams a PAD-SPACE-collation filtered table unfiltered "+
+			"server-side but its snapshot reader cannot apply the client-side copy filter, so the cold-start "+
+			"would over-copy out-of-scope rows (internal capability gap)", engineName)
+	}
+	setter.SetClientCopyFilter(keep)
+	return nil
+}

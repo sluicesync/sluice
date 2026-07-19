@@ -89,9 +89,14 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	// still runs on every delivered change and preserves correctness; readers
 	// with no server-side stream filter (binlog / pgoutput) don't implement the
 	// setter and silently no-op (correct, just unfiltered at the source).
+	//
+	// serverSideRowFilters, not RowFilters: on VStream a PAD-SPACE-collation
+	// --where table is OMITTED from the server-side push (its `=` can't be
+	// reproduced NO-PAD) and left to the client route() — the A0 fallback (audit
+	// 2026-07-19). Equal to RowFilters on every other path.
 	if len(s.RowFilters) > 0 {
 		if setter, ok := cdc.(ir.ServerSideCDCFilterSetter); ok {
-			setter.SetServerSideRowFilters(s.RowFilters)
+			setter.SetServerSideRowFilters(s.serverSideRowFilters)
 		}
 	}
 	changes, err = cdc.StreamChanges(ctx, persisted)

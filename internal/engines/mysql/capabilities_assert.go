@@ -152,6 +152,11 @@ var (
 	// runs on the cold-start snapshot Rows (the actual push-down happens at
 	// open via FilteredSnapshotOpener; this satisfies the gate).
 	_ ir.RowFilterSetter = (*vstreamSnapshotRows)(nil)
+	// A0 client-side COPY fallback (audit 2026-07-19): the snapshot reader
+	// filters the tables streamed unfiltered server-side (PAD-SPACE collations
+	// the NO-PAD VStream filter can't reproduce) with the PAD-faithful client
+	// predicate. Pinned so a rename can't silently drop the fallback.
+	_ ir.ClientCopyFilterSetter = (*vstreamSnapshotRows)(nil)
 
 	// Migration-state store.
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)

@@ -2618,6 +2618,14 @@ func (s *vstreamSnapshotStream) close() error {
 // always read every table — translation may filter some out).
 type vstreamSnapshotRows struct {
 	snap *vstreamSnapshotStream
+	// clientCopyFilter, when non-nil, is a PAD-faithful client-side keep
+	// predicate the orchestrator installs (ir.ClientCopyFilterSetter) for the
+	// tables it streams UNFILTERED server-side because the NO-PAD VStream filter
+	// can't reproduce their `--where` `=` (audit 2026-07-19 A0). ReadRows drops a
+	// row when keep(table, row) is false. Set once post-open, before any
+	// ReadRows, so the concurrent-copy readers only ever read it. nil = no
+	// client-side filtering (the common, fully-server-filtered case).
+	clientCopyFilter func(table string, row ir.Row) bool
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter] (ADR-0028 /
@@ -2657,6 +2665,19 @@ func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
 // [ir.FilteredSnapshotOpener], which is the actual push-down mechanism, and
 // then calls this with the SAME map it opened with — a genuine no-op.
 func (r *vstreamSnapshotRows) SetRowFilters(map[string]string) {}
+
+// SetClientCopyFilter implements [ir.ClientCopyFilterSetter]. Unlike
+// SetRowFilters (a no-op — the SERVER-side COPY rules are fixed at open), this
+// CLIENT-side filter runs in [vstreamSnapshotRows.ReadRows] as each row is
+// decoded, so it CAN be installed after open (before bulk-copy drains any
+// table). The orchestrator uses it for the tables it deliberately streams
+// UNFILTERED server-side — a PAD-SPACE-collation `--where` the NO-PAD VStream
+// filter can't reproduce (audit 2026-07-19 A0) — filtering them with the same
+// PAD-faithful predicate the CDC route() uses. Set once before the first
+// ReadRows; keep(table, row)==false drops the row.
+func (r *vstreamSnapshotRows) SetClientCopyFilter(keep func(table string, row ir.Row) bool) {
+	r.clientCopyFilter = keep
+}
 
 // SetCopyCheckpoint implements [ir.CopyCheckpointer] (ADR-0072 Phase B).
 // The pipeline wires the durable position sink here on the cold-start
@@ -2773,6 +2794,10 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 
 	s := r.snap
 	tableName := table.Name
+	// A0 fallback (audit 2026-07-19): the PAD-faithful client-side keep predicate
+	// for tables streamed UNFILTERED server-side, or nil. Captured once here so a
+	// concurrent-copy reader can't race the (write-once, pre-ReadRows) field.
+	keep := r.clientCopyFilter
 
 	// Mark this table active so the pump backpressures (rather than
 	// refuses) on its over-cap growth while we drain it.
@@ -2884,6 +2909,14 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			s.mu.Unlock()
 
 			for i, row := range batch {
+				// A0 fallback: drop rows the PAD-faithful client predicate
+				// excludes, for the tables we stream unfiltered server-side.
+				// keep is nil (a clean no-op) for every fully-server-filtered
+				// table — the common case.
+				if keep != nil && !keep(tableName, row) {
+					batch[i] = nil
+					continue
+				}
 				select {
 				case out <- row:
 					batch[i] = nil

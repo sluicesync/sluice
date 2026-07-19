@@ -1920,6 +1920,28 @@ type ServerSideCDCFilterSetter interface {
 	SetServerSideRowFilters(filters map[string]string)
 }
 
+// ClientCopyFilterSetter is the optional SNAPSHOT-reader surface the filtered-
+// sync orchestrator uses to apply a CLIENT-side row filter to the cold-start
+// COPY of specific tables — the ones whose `--where` predicate the reader's
+// SERVER-side filter cannot reproduce faithfully, so the orchestrator streams
+// them UNFILTERED server-side and filters them HERE instead (audit 2026-07-19
+// A0: a PAD-SPACE-collation column under the VStream NO-PAD server-side filter
+// would otherwise silently drop the trailing-space rows the PAD-faithful client
+// keeps — so it is refused today until this fallback lands).
+//
+// It is the cold-start COPY analogue of the CDC leg's route(): keep is the same
+// PAD-faithful client predicate, applied to each decoded COPY row as it leaves
+// the reader; keep(table, row)==false drops the row. The orchestrator returns
+// true for the tables it still filtered SERVER-side, so keep only ever narrows
+// the unfiltered-server-side tables. Only the VStream snapshot reader implements
+// it; other engines filter the snapshot faithfully at the source (native-SQL
+// push-down) and never need it — the orchestrator refuses loudly if it has a
+// client filter to install but the reader lacks this surface, rather than
+// silently over-copying.
+type ClientCopyFilterSetter interface {
+	SetClientCopyFilter(keep func(table string, row Row) bool)
+}
+
 // IndexBuildTuner is the optional surface a [SchemaWriter] can implement
 // to accept the operator's `--index-build-mem` value (a per-build
 // maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator
