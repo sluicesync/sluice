@@ -129,10 +129,13 @@ func collationByteExactMySQL(collation string) bool {
 //   - MySQL's UCA-9.0.0 collations (`*_0900_*`) and the `binary` collation
 //     (information_schema.COLLATIONS.PAD_ATTRIBUTE on MySQL);
 //   - MariaDB's `*_nopad_*` collations (`utf8mb4_nopad_bin`,
-//     `utf8mb4_general_nopad_ci`, `utf8mb4_unicode[_520]_nopad_ci`) — MariaDB
-//     has NO PAD_ATTRIBUTE column, so the name is the only signal, and the
-//     `nopad` token is exactly its NO-PAD marker (ground-truthed on MariaDB
-//     11.4: `WHERE v='EU'` matches only `'EU'`, not `'EU '`).
+//     `utf8mb4_general_nopad_ci`, `utf8mb4_unicode[_520]_nopad_ci`). MariaDB's
+//     information_schema.COLLATIONS.PAD_ATTRIBUTE is version-dependent — ABSENT
+//     through the 11.x LTS line (11.4, 11.8) and 12.0, then ADDED in 12.1 — so
+//     the catalog is not a version-robust signal; the `nopad` NAME token IS its
+//     version-independent NO-PAD marker across every release (ground-truthed
+//     behaviorally: `WHERE v='EU'` matches only `'EU'`, not `'EU '`, on
+//     `utf8mb4_nopad_bin` in all versions).
 //
 // Every other collation is PAD SPACE. When false, the caller right-trims ASCII
 // spaces before comparison to reproduce PAD SPACE `=`. Missing the MariaDB

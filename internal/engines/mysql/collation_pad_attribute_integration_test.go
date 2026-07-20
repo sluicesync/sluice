@@ -16,9 +16,11 @@
 // Two oracles because the two engines expose PAD-ness differently:
 //   - MySQL publishes information_schema.COLLATIONS.PAD_ATTRIBUTE, so we assert
 //     collationNoPad(name) == (PAD_ATTRIBUTE == "NO PAD") for EVERY collation.
-//   - MariaDB has NO PAD_ATTRIBUTE column, so we ground-truth BEHAVIORALLY: a
-//     stored 'EU ' (trailing space) matches `= 'EU'` under PAD SPACE and does
-//     not under NO PAD, and collationNoPad must agree with what the server does.
+//   - MariaDB's PAD_ATTRIBUTE column is version-dependent (absent through the
+//     11.x LTS line + 12.0, added in 12.1), so it is not a version-robust oracle;
+//     we ground-truth BEHAVIORALLY across the whole LTS spread instead: a stored
+//     'EU ' (trailing space) matches `= 'EU'` under PAD SPACE and does not under
+//     NO PAD, and collationNoPad must agree with what the server does.
 
 package mysql
 
@@ -83,9 +85,10 @@ func TestCollationPadAttribute_MySQLLiveCatalogParity(t *testing.T) {
 }
 
 // TestCollationPadAttribute_MariaDBLiveBehaviorParity ground-truths collationNoPad
-// against real MariaDB's actual `=` behavior across the supported LTS spread —
-// MariaDB has no PAD_ATTRIBUTE catalog column, so a stored trailing space is the
-// only oracle. This is the test that would have caught SL-COLL-1 before release.
+// against real MariaDB's actual `=` behavior across the supported LTS spread. Since
+// MariaDB's PAD_ATTRIBUTE column is version-dependent (absent through 11.x/12.0,
+// added in 12.1), a stored trailing space is the version-robust oracle that works
+// on every release. This is the test that would have caught SL-COLL-1 before release.
 func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 	cases := []struct {
 		collation string

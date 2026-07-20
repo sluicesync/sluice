@@ -10,7 +10,7 @@ A filtered `sync --where` whose predicate compares a **single-precision `FLOAT` 
 
 A `--where` predicate that references a single-precision `FLOAT` column only in a `IS [NOT] NULL` presence test is **no longer** wrongly caught by that refusal — an `IS NULL` result cannot depend on the rounded bits, so it is faithful and now runs (the guard restricts to value comparisons, not any reference to the column).
 
-A `--where` on a **MariaDB `*_nopad_*` (NO-PAD) collation** column is now classified correctly: `collationNoPad` recognizes the `nopad` naming (MariaDB has no `PAD_ATTRIBUTE` catalog column), so such a column is reduced faithfully rather than mis-treated as PAD SPACE.
+A `--where` on a **MariaDB `*_nopad_*` (NO-PAD) collation** column is now classified correctly: `collationNoPad` recognizes the `nopad` naming (MariaDB's `PAD_ATTRIBUTE` catalog column is version-dependent — absent through the 11.x LTS line + 12.0, added in 12.1 — so the name token is the version-robust signal), so such a column is reduced faithfully rather than mis-treated as PAD SPACE.
 
 ## [0.99.283] - 2026-07-19
 
