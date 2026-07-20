@@ -4,13 +4,19 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.284] - 2026-07-20
+
+**Collation and float fidelity fixes for `sync --where` on MariaDB and PlanetScale/Vitess.** Three small, self-contained correctness fixes to continuous filtered sync, from the audit follow-ups after v0.99.283. If you don't use `sync --where`, nothing changes; `migrate --where` (source-evaluated) is unaffected throughout.
+
 ### Fixed / Changed
 
-A filtered `sync --where` whose predicate compares a **single-precision `FLOAT` column by an ordering term** (e.g. `amount > 0.1`) on a PAD-SPACE-collation-forced table against a PlanetScale/Vitess (VStream) source is now **refused** at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`). Such a table takes the A0 client-copy fallback, whose keep predicate runs on the cold-start COPY row — and the COPY carrier display-rounds single-precision FLOAT (the exact re-read repair runs *after* copy), so a boundary comparison could silently drop a source-in-scope row. `DOUBLE` is full-precision in the carrier and is unaffected; use a `DOUBLE` column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy.
+- **A `--where` on a MariaDB `*_nopad_*` (NO-PAD) collation is now classified correctly.** `collationNoPad` recognizes the `nopad` naming, so a filter on a NO-PAD-collation column (e.g. `utf8mb4_nopad_bin`, whose `=` treats trailing spaces as significant) is reduced faithfully rather than mis-treated as PAD SPACE — previously it could silently mis-classify a trailing-space row-move. MariaDB's `information_schema.COLLATIONS.PAD_ATTRIBUTE` is version-dependent (absent through the 11.x LTS line + 12.0, added in 12.1), so the name token is the version-robust signal; validated against the real server on both catalog-bearing (12.1+) and catalog-less (11.x) versions.
+- **A single-precision `FLOAT` ordering `--where` on a PAD-SPACE-forced PlanetScale/Vitess table is now refused instead of risking a silent drop.** Such a table takes the client-side COPY fallback (introduced in v0.99.283 for PAD-SPACE collations), whose keep predicate runs on the cold-start COPY row — and the VStream COPY carrier display-rounds single-precision FLOAT (the exact re-read repair runs *after* copy), so a boundary comparison like `amount > 0.1` could silently drop a source-in-scope row. sluice now refuses it at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`); `DOUBLE` is full-precision in the carrier and unaffected. Use a `DOUBLE` column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy.
+- **A `FLOAT IS [NOT] NULL` `--where` is no longer wrongly refused.** The float guard above initially caught any reference to a single-precision FLOAT column, including a display-round-insensitive `IS NULL` presence test; it now restricts to value comparisons, so `IS [NOT] NULL` on a FLOAT column runs faithfully.
 
-A `--where` predicate that references a single-precision `FLOAT` column only in a `IS [NOT] NULL` presence test is **no longer** wrongly caught by that refusal — an `IS NULL` result cannot depend on the rounded bits, so it is faithful and now runs (the guard restricts to value comparisons, not any reference to the column).
+### Compatibility
 
-A `--where` on a **MariaDB `*_nopad_*` (NO-PAD) collation** column is now classified correctly: `collationNoPad` recognizes the `nopad` naming (MariaDB's `PAD_ATTRIBUTE` catalog column is version-dependent — absent through the 11.x LTS line + 12.0, added in 12.1 — so the name token is the version-robust signal), so such a column is reduced faithfully rather than mis-treated as PAD SPACE.
+- **All three only affect `sync --where`.** No behavior change for `migrate --where`, for a sync without `--where`, for DOUBLE columns, or for non-string / non-FLOAT predicates. The MariaDB fix only changes classification for a `--where` on a `*_nopad_*` collation column.
 
 ## [0.99.283] - 2026-07-19
 
