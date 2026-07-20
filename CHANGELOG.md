@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed / Changed
+
+A filtered `sync --where` whose predicate compares a **single-precision `FLOAT` column by an ordering term** (e.g. `amount > 0.1`) on a PAD-SPACE-collation-forced table against a PlanetScale/Vitess (VStream) source is now **refused** at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`). Such a table takes the A0 client-copy fallback, whose keep predicate runs on the cold-start COPY row — and the COPY carrier display-rounds single-precision FLOAT (the exact re-read repair runs *after* copy), so a boundary comparison could silently drop a source-in-scope row. `DOUBLE` is full-precision in the carrier and is unaffected; use a `DOUBLE` column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy.
+
+A `--where` predicate that references a single-precision `FLOAT` column only in a `IS [NOT] NULL` presence test is **no longer** wrongly caught by that refusal — an `IS NULL` result cannot depend on the rounded bits, so it is faithful and now runs (the guard restricts to value comparisons, not any reference to the column).
+
+A `--where` on a **MariaDB `*_nopad_*` (NO-PAD) collation** column is now classified correctly: `collationNoPad` recognizes the `nopad` naming (MariaDB has no `PAD_ATTRIBUTE` catalog column), so such a column is reduced faithfully rather than mis-treated as PAD SPACE.
+
 ## [0.99.283] - 2026-07-19
 
 **Filtered `sync --where` on a PAD-SPACE collation now WORKS on PlanetScale/Vitess — lifting the v0.99.282 refusal.** v0.99.282 refused a `--where` string filter on a legacy PAD-SPACE collation (e.g. `utf8mb4_general_ci`) against a VStream source, because the VStream server-side filter is NO-PAD and would silently drop trailing-space rows. That refusal is now replaced by an automatic client-side fallback, so the sync just works. Nothing that doesn't use `--where` on a PAD-SPACE collation against a VStream source changes.

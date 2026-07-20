@@ -8,7 +8,7 @@
 
 **Grammar is restricted slightly more than the prose below anticipated** (deliberate loud-failure fidelity, not a corner cut): the client-side CDC evaluator refuses string *ordering* (`< <= > >=`), string `=`/`IN` on **case/accent-insensitive collations**, and **tz-aware temporal** comparisons — in each case a byte-exact client-side compare would diverge from the source's own evaluation, so it refuses at sync-start (`SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE`) rather than risk a silent leak/drop. Equality / `IN` / `IS NULL` on numeric, bool, case-sensitive-string, and tz-naive temporal columns — the `country IN (…)` motivating case — works. Filtered CDC requires full before-images (`SLUICE-E-WHERE-CDC-BEFORE-IMAGE`: MySQL `binlog_row_image=FULL`, PG `REPLICA IDENTITY FULL` per filtered table).
 
-**Both phases touch concurrency-adjacent paths (parallel copy / CDC apply + the reader before-image emit) — they MUST pass CI's `-race` Integration job before any release tag.**
+**Both phases touch concurrency-adjacent paths (parallel copy / CDC apply + the reader before-image emit); they passed CI's `-race` Integration job before their release tags (v0.99.276+).**
 
 ## Context
 
