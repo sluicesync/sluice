@@ -4,6 +4,19 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.285] - 2026-07-20
+
+**Dependency and base-image maintenance — no functional change.** Routine updates to third-party Go dependencies and the runtime container's base image. sluice's own behavior is identical to v0.99.284; this release exists so the published binaries and the GHCR runtime image carry the current dependency set and the latest base-OS security patches.
+
+### Dependencies
+
+- Bumped `google.golang.org/grpc` to 1.82.0, the `aws-sdk-go-v2` group (`aws-sdk-go-v2` 1.42.1 + `config` / `credentials` / `service/kms` / `service/s3`), `github.com/klauspost/compress` to 1.19.0, `golang.org/x/crypto` to 0.54.0 and `golang.org/x/sync` to 0.22.0, and `github.com/mattn/go-isatty` to 0.0.22.
+- Refreshed the `distroless/static-debian12` base image digest, so the multi-arch GHCR runtime image (`ghcr.io/sluicesync/sluice`) picks up the latest base-OS patches.
+
+### Compatibility
+
+- **No behavior change.** All updates are patch/minor dependency bumps and a base-image digest refresh; every code path is identical to v0.99.284.
+
 ## [0.99.284] - 2026-07-20
 
 **Collation and float fidelity fixes for `sync --where` on MariaDB and PlanetScale/Vitess.** Three small, self-contained correctness fixes to continuous filtered sync, from the audit follow-ups after v0.99.283. If you don't use `sync --where`, nothing changes; `migrate --where` (source-evaluated) is unaffected throughout.
