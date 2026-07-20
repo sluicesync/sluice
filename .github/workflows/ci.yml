@@ -128,7 +128,7 @@ jobs:
       # `go-version-file` reads the version from go.mod so CI tracks the
       # declared toolchain automatically — bumping go.mod is the only
       # place a Go upgrade has to land.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
 
@@ -313,7 +313,7 @@ jobs:
             goflags: ""
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -504,7 +504,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -571,7 +571,7 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -625,7 +625,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -657,7 +657,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go mod download
@@ -748,7 +748,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -775,7 +775,7 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: "go.mod"
       - run: go build ./...
