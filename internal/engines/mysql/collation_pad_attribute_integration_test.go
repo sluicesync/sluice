@@ -13,14 +13,15 @@
 // REAL server so a future collation whose NO-PAD-ness escapes the name rule fails
 // CI instead of mis-padding a filtered `sync --where`.
 //
-// Two oracles because the two engines expose PAD-ness differently:
-//   - MySQL publishes information_schema.COLLATIONS.PAD_ATTRIBUTE, so we assert
-//     collationNoPad(name) == (PAD_ATTRIBUTE == "NO PAD") for EVERY collation.
-//   - MariaDB's PAD_ATTRIBUTE column is version-dependent (absent through the
-//     11.x LTS line + 12.0, added in 12.1), so it is not a version-robust oracle;
-//     we ground-truth BEHAVIORALLY across the whole LTS spread instead: a stored
-//     'EU ' (trailing space) matches `= 'EU'` under PAD SPACE and does not under
-//     NO PAD, and collationNoPad must agree with what the server does.
+// The oracle is chosen PER SERVER by whether it exposes PAD_ATTRIBUTE:
+//   - Where information_schema.COLLATIONS has PAD_ATTRIBUTE (MySQL 8 always;
+//     MariaDB from 12.1), assert collationNoPad(name) == (PAD_ATTRIBUTE == "NO PAD")
+//     for EVERY collation the catalog knows — the strong, exhaustive oracle.
+//   - Where it does not (MariaDB's 11.x LTS line + 12.0), ground-truth BEHAVIORALLY:
+//     a stored 'EU ' (trailing space) matches `= 'EU'` under PAD SPACE and does not
+//     under NO PAD, and collationNoPad must agree. This is the version-robust
+//     fallback — the classifier itself keys off the name in EVERY version, so it is
+//     validated whichever oracle a given release supports.
 
 package mysql
 
@@ -33,6 +34,57 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 )
+
+// assertCatalogPadParity asserts collationNoPad(name) == (PAD_ATTRIBUTE == "NO PAD")
+// for every collation in information_schema.COLLATIONS, with a vacuous-run guard.
+// Used wherever the server exposes the PAD_ATTRIBUTE column (MySQL 8; MariaDB 12.1+).
+// label names the server in failure messages.
+func assertCatalogPadParity(ctx context.Context, t *testing.T, db *sql.DB, label string, minCollations int) {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, "SELECT COLLATION_NAME, PAD_ATTRIBUTE FROM information_schema.COLLATIONS")
+	if err != nil {
+		t.Fatalf("%s: query information_schema.COLLATIONS: %v", label, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var checked, noPadSeen int
+	for rows.Next() {
+		var name, pad string
+		if err := rows.Scan(&name, &pad); err != nil {
+			t.Fatalf("%s: scan: %v", label, err)
+		}
+		checked++
+		wantNoPad := pad == "NO PAD"
+		if wantNoPad {
+			noPadSeen++
+		}
+		if got := collationNoPad(name); got != wantNoPad {
+			t.Errorf("%s: collationNoPad(%q) = %v; server PAD_ATTRIBUTE=%q wants %v (name heuristic diverged from the catalog — SL-COLL-1 class)", label, name, got, pad, wantNoPad)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: rows: %v", label, err)
+	}
+	// Vacuous-parity guard: a query that returned nothing, or a server with no
+	// NO-PAD collations, would pass every assertion by running none.
+	if checked < minCollations {
+		t.Fatalf("%s: only %d collations checked; expected >=%d (vacuous-parity guard)", label, checked, minCollations)
+	}
+	if noPadSeen == 0 {
+		t.Fatalf("%s: no NO-PAD collations seen in the catalog; the parity check was vacuous (expected a NO-PAD family)", label)
+	}
+	t.Logf("%s: catalog parity — %d collations checked against PAD_ATTRIBUTE (%d NO PAD), all agree", label, checked, noPadSeen)
+}
+
+// collationsHasPadAttribute reports whether information_schema.COLLATIONS exposes a
+// PAD_ATTRIBUTE column on this server (MySQL 8 always; MariaDB only from 12.1 —
+// absent through the 11.x LTS line + 12.0).
+func collationsHasPadAttribute(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='COLLATIONS' AND COLUMN_NAME='PAD_ATTRIBUTE'").Scan(&n)
+	return n > 0, err
+}
 
 // TestCollationPadAttribute_MySQLLiveCatalogParity asserts collationNoPad agrees
 // with real MySQL's information_schema.COLLATIONS.PAD_ATTRIBUTE for every
@@ -49,47 +101,19 @@ func TestCollationPadAttribute_MySQLLiveCatalogParity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, "SELECT COLLATION_NAME, PAD_ATTRIBUTE FROM information_schema.COLLATIONS")
-	if err != nil {
-		t.Fatalf("query information_schema.COLLATIONS: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var checked, noPadSeen int
-	for rows.Next() {
-		var name, pad string
-		if err := rows.Scan(&name, &pad); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		checked++
-		wantNoPad := pad == "NO PAD"
-		if wantNoPad {
-			noPadSeen++
-		}
-		if got := collationNoPad(name); got != wantNoPad {
-			t.Errorf("collationNoPad(%q) = %v; server PAD_ATTRIBUTE=%q wants %v (name heuristic diverged from the catalog — SL-COLL-1 class)", name, got, pad, wantNoPad)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-	// Vacuous-parity guard: a query that returned nothing, or a server with no
-	// NO-PAD collations, would pass every assertion by running none.
-	if checked < 100 {
-		t.Fatalf("only %d collations checked; expected >100 on real MySQL 8", checked)
-	}
-	if noPadSeen == 0 {
-		t.Fatalf("no NO-PAD collations seen in the catalog; the parity check was vacuous (expected the utf8mb4_0900_* family)")
-	}
-	t.Logf("collationNoPad parity: %d collations checked against PAD_ATTRIBUTE (%d NO PAD), all agree", checked, noPadSeen)
+	assertCatalogPadParity(ctx, t, db, "mysql", 100)
 }
 
-// TestCollationPadAttribute_MariaDBLiveBehaviorParity ground-truths collationNoPad
-// against real MariaDB's actual `=` behavior across the supported LTS spread. Since
-// MariaDB's PAD_ATTRIBUTE column is version-dependent (absent through 11.x/12.0,
-// added in 12.1), a stored trailing space is the version-robust oracle that works
-// on every release. This is the test that would have caught SL-COLL-1 before release.
-func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
+// TestCollationPadAttribute_MariaDBLiveParity ground-truths collationNoPad against
+// real MariaDB across the supported LTS spread, picking the oracle by version. On
+// MariaDB 12.1+ (where information_schema.COLLATIONS.PAD_ATTRIBUTE exists) it runs
+// the same EXHAUSTIVE catalog assertion as the MySQL half. On the 11.x LTS line +
+// 12.0 (no PAD_ATTRIBUTE column) it falls back to a behavioral probe: a stored
+// 'EU ' matches `= 'EU'` under PAD SPACE and not under NO PAD. Either way the
+// name-based classifier is validated against the real server — this is the test
+// that would have caught SL-COLL-1 before release.
+func TestCollationPadAttribute_MariaDBLiveParity(t *testing.T) {
+	// Behavioral-fallback probe set (used only where the catalog column is absent).
 	cases := []struct {
 		collation string
 		wantNoPad bool // what the server's `=` should do (verified below)
@@ -108,6 +132,26 @@ func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 			}
 			defer func() { _ = db.Close() }()
 
+			detectCtx, detectCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			hasCol, err := collationsHasPadAttribute(detectCtx, db)
+			detectCancel()
+			if err != nil {
+				t.Fatalf("%s: detect PAD_ATTRIBUTE column: %v", image, err)
+			}
+
+			// MariaDB 12.1+ exposes PAD_ATTRIBUTE — use the strong catalog oracle,
+			// the identical exhaustive assertion the MySQL half runs (every MariaDB
+			// collation's name-classification checked against its real pad attribute).
+			if hasCol {
+				t.Logf("%s: PAD_ATTRIBUTE present (12.1+) — full catalog parity", image)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				assertCatalogPadParity(ctx, t, db, image, 100)
+				return
+			}
+
+			// 11.x LTS line / 12.0: no PAD_ATTRIBUTE column — behavioral probe.
+			t.Logf("%s: no PAD_ATTRIBUTE column (<12.1) — behavioral probe", image)
 			// Non-vacuous guard (audit 2026-07-19c J-COLL-2): count how many cases
 			// of each class actually RAN, so an image where every collation is
 			// unavailable (all skipped) fails instead of passing on zero checks.
@@ -154,9 +198,9 @@ func TestCollationPadAttribute_MariaDBLiveBehaviorParity(t *testing.T) {
 					ranPad++
 				}
 			}
-			// The parity check must have exercised BOTH classes on this image,
-			// else it proved nothing (a NO-PAD-only or PAD-only run is vacuous for
-			// the classifier). utf8mb4_general_ci / utf8mb4_bin (PAD) and
+			// The behavioral parity check must have exercised BOTH classes on this
+			// image, else it proved nothing (a NO-PAD-only or PAD-only run is vacuous
+			// for the classifier). utf8mb4_general_ci / utf8mb4_bin (PAD) and
 			// utf8mb4_nopad_bin (NO PAD) are standard on every supported LTS line.
 			if ranNoPad == 0 || ranPad == 0 {
 				t.Fatalf("%s: vacuous parity run — NO-PAD cases ran=%d, PAD-SPACE cases ran=%d; both must be >0", image, ranNoPad, ranPad)
