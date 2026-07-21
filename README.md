@@ -357,6 +357,7 @@ A few terms recur in the codebase and docs:
 - [`docs/operator/flat-file-sources.md`](docs/operator/flat-file-sources.md) — migrating CSV / TSV / NDJSON files and mydumper / `pscale database dump` directories, the declared-not-sniffed CSV conventions, and type inference
 - [`docs/cookbook/duckdb-on-sluice-backups.md`](docs/cookbook/duckdb-on-sluice-backups.md) — querying `backup export-as-parquet` output with DuckDB (local + S3), footer metadata, GeoParquet
 - [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) — migrating many MySQL databases / Postgres schemas in one run (`--all-databases` / `--all-schemas`), fan-IN consolidation, and the documented edges
+- [`docs/operator/staged-wave-migration.md`](docs/operator/staged-wave-migration.md) — moving a database a few tables at a time: one growing stream (`schema add-table`) vs. independent per-wave streams, FK-driven wave ordering, per-wave cutover, and why write-back to the source isn't supported
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records; the full index lives in [`docs/adr/README.md`](docs/adr/README.md)
