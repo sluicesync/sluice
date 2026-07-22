@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.287] - 2026-07-22
+
+**Two independent correctness fixes, both found by looking outward rather than inward.** The first closes a silent divergence on Postgres sources: two concurrent syncs with different table scopes would quietly starve each other, with a healthy-looking `sync status` throughout — the shape you hit staging a migration in waves. The second unblocks SQLite/Cloudflare D1 imports that use the canonical boolean idiom (`INTEGER CHECK (col IN (0,1))`), which sluice was refusing outright. If you run more than one Postgres-source stream against one database, or import from SQLite/D1, upgrade.
+
 ### Fixed
 
 **SQLite / Cloudflare D1 sources: a `CHECK (col IN (0,1))` constraint no longer blocks the migration.** SQLite has no `BOOLEAN` type, so the canonical idiom is an `INTEGER` column constrained to 0/1 — and sluice refused it at create-tables with "carries a non-portable SQLite expression … with no provably-equivalent Postgres translation", stopping the migration before any data moved. The expression was in fact perfectly portable; the SQLite→canonical expression translator simply had no `IN` node, so the construct could not be parsed and fell through to the catch-all non-portable refusal. `x [NOT] IN (a, b, …)` now translates verbatim to both Postgres and MySQL, which share SQLite's syntax and its NULL three-valued logic. The genuinely non-portable shapes still refuse: `IN (SELECT …)` (a subquery is outside the provable subset), SQLite's `IN <table>` shorthand, and the SQLite-only empty list `IN ()` (a Postgres syntax error).
