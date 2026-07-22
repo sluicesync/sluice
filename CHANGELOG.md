@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.286] - 2026-07-22
+
+**A continuous `sync` now rides out routine transient source-side errors instead of exiting.** Found by a multi-day soak against real PlanetScale and Cloudflare D1: three ordinary network/upstream blips each terminated a healthy long-running stream. Nothing was ever at risk of data loss — every failure was loud and every restart resumed cleanly — but a sync that needs a manual restart after each blip isn't operationally usable. If you run continuous sync for days at a time, upgrade.
+
 ### Fixed / Changed
 
 **A continuous `sync` no longer exits on a routine transient source-side error — it reconnects and resumes in process.** Long-running syncs were terminating on ordinary network/upstream blips that should have been retried, because the error never reached the retry loop in a shape it recognized. sluice's pipeline retries a CDC reader failure only when the error is classified as retriable (`ir.RetriableError`), and three real shapes were falling through as terminal — each observed killing a multi-day soak against real infrastructure:
@@ -12,7 +16,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 - **Cloudflare D1 (`d1-trigger` / `sqlite-trigger`):** the D1 HTTP transport had no classification at all, so a `TLS handshake timeout` — or a Cloudflare-side `HTTP 500` — ended the stream. Transport failures and the transient status family (408, 429, 5xx) are now retried; a 4xx meaning the *request* is wrong (bad token, missing database, malformed statement) stays terminal so a real misconfiguration still fails loudly.
 - **Postgres trigger-CDC (`pgtrigger`):** the same structural gap — a bare poll error with no classification — now classifies transport-level transients. (SQLSTATE-level transients such as `57P01` / `57P03` / `08006` are not yet covered and remain a follow-up.)
 
-No data was ever at risk from these: each failure was loud, the CDC position is durable, and every restart warm-resumed cleanly. The retry budget is unchanged (`--apply-retry-attempts`, default 8), so a genuinely persistent outage still exhausts it and fails loudly rather than spinning forever.
+No data was ever at risk from these: each failure was loud, the CDC position is durable, and every restart warm-resumed cleanly. The retry budget is unchanged (`--apply-retry-attempts`, default 8), so a genuinely persistent outage still exhausts it and fails loudly rather than spinning forever. The D1 and pgtrigger classifiers are one shared, pinned implementation (`internal/engines/internal/triggercdc`) so the transient set can't drift apart between the trigger-CDC engines.
+
+### Documentation
+
+- New operator guide `docs/operator/staged-wave-migration.md` — moving a database a few tables at a time: the two mechanisms, which one to use on which source engine (they are not interchangeable — see the Postgres caveat), how foreign keys constrain wave ordering, and the one thing sluice deliberately does not do (no target→source write-back).
+- ADR-0175 (Postgres publication scope isolation — `--publication-name` + the clobber refusal), ADR-0176 (PG publication row-filter push-down), ADR-0177 (PG publication column lists — capability survey, no adoption), ADR-0178 (an analytical target class — `ir.ChangeSink` as the sibling of `ChangeApplier`).
 
 ## [0.99.285] - 2026-07-20
 
