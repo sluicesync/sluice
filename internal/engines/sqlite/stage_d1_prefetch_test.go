@@ -314,6 +314,11 @@ func TestStageD1Table_PrefetchCancelReapsFetcherLoud(t *testing.T) {
 		if res.err == nil {
 			t.Fatal("stageD1Table returned nil after cancellation — a silently truncated staged file")
 		}
+		// context.Canceled is now GUARANTEED in the chain: the insert
+		// site wraps ctx.Err() whenever the context is done, so a
+		// cancellation-race `sql: statement is closed` from the driver is
+		// carried as detail rather than replacing the canonical error.
+		// Before that fix this assertion flaked (v0.99.287 tag CI).
 		if !errors.Is(res.err, context.Canceled) {
 			t.Errorf("err = %v; want context.Canceled in the chain", res.err)
 		}

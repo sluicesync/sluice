@@ -6,6 +6,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -193,7 +194,28 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 func stageInsertPage(
 	ctx context.Context, db *sql.DB, t *ir.Table, plan pagePlan, rr *D1RowReader,
 	insertSQL string, stored []int, rows []d1Row, ordinal *int64,
-) error {
+) (retErr error) {
+	// Normalise a cancellation-race error to carry context.Canceled.
+	// A cancel mid-page can land on ANY of this loop's DB operations —
+	// the ExecContext insert, a batch Commit, the BeginTx/Prepare that
+	// starts the next batch — and database/sql surfaces the abort
+	// differently per site (`sql: statement is closed`, `context
+	// canceled`, a driver-specific message). Callers and the retry
+	// classifier need a STABLE identity, so at the single return
+	// boundary we wrap ctx.Err() whenever the context is done and the
+	// error doesn't already carry it. Doing it here rather than at each
+	// site means a new DB call added to the loop can't reintroduce the
+	// nondeterminism (the source of the v0.99.287 tag-CI flake).
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(retErr, ctxErr) {
+			retErr = fmt.Errorf("d1 stage: table %q cancelled: %w (driver detail: %w)",
+				t.Name, ctxErr, retErr)
+		}
+	}()
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("d1 stage: begin tx for %q: %w", t.Name, err)
