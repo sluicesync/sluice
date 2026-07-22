@@ -2,7 +2,7 @@
 
 Not every migration wants to be one event. On a large database it is often safer to move the biggest or most self-contained tables first, cut the application over for *just those*, let them bake in production for a while, and then bring the rest across in later waves. Each wave is small enough to reason about, and a problem in wave 3 doesn't implicate the tables that have been running fine since wave 1.
 
-sluice supports this today. This guide covers the two mechanisms, which one to use on which source engine (they are **not** interchangeable — see the Postgres caveat), how foreign keys constrain your wave ordering, and the one thing sluice deliberately does *not* do: replicate writes back from the target to the source.
+sluice supports this today. This guide covers the two mechanisms and when each fits, the per-stream names a Postgres source needs, how foreign keys constrain your wave ordering, and the one thing sluice deliberately does *not* do: replicate writes back from the target to the source.
 
 ---
 
@@ -13,10 +13,10 @@ sluice supports this today. This guide covers the two mechanisms, which one to u
 | Shape | a single `--stream-id` whose table scope expands | one `--stream-id` per wave, running side by side |
 | Add a wave with | `sluice schema add-table` | another `sluice sync start` |
 | Cut over | all tables together, at the end | **per wave**, independently |
-| Postgres source | **supported** | **unsafe today** — see [the publication caveat](#pg-publication-caveat) |
+| Postgres source | **supported** | **supported** — needs a per-stream `--publication-name` ([why](#pg-publication-caveat)) |
 | MySQL / PlanetScale / Vitess source | supported | supported |
 
-The distinction that matters: **can you cut waves over independently?** If the point of staging is to de-risk the *copy* — you want everything to land eventually, in one cutover, but you'd rather not snapshot 4 TB in one run — use one growing stream. If the point is to de-risk the *cutover* — you want wave 1 serving production traffic from the target while wave 2 is still being copied — you need independent streams, and today that means a MySQL-family source.
+The distinction that matters: **can you cut waves over independently?** If the point of staging is to de-risk the *copy* — you want everything to land eventually, in one cutover, but you'd rather not snapshot 4 TB in one run — use one growing stream. If the point is to de-risk the *cutover* — you want wave 1 serving production traffic from the target while wave 2 is still being copied — you need independent streams. Both source families support that; a Postgres source additionally needs a per-stream `--publication-name` (below).
 
 ---
 
@@ -54,7 +54,19 @@ One table per invocation. Repeat it per table, or script the loop.
 
 ## Mechanism B — several independent streams
 
-Each wave gets its own `--stream-id`, its own CDC position, and — on engines with a slot concept — its own `--slot-name`. The waves are fully independent: you cut wave 1 over and stop its stream while wave 2 is still snapshotting.
+Each wave gets its own `--stream-id`, its own CDC position, and — on Postgres — its own `--slot-name` **and** `--publication-name`. The waves are fully independent: you cut wave 1 over and stop its stream while wave 2 is still snapshotting.
+
+On a **Postgres** source, the full per-wave shape is:
+
+```bash
+sluice sync start \
+    --source-driver postgres --source "$SRC" \
+    --target-driver postgres --target "$DST_WAVE1" \
+    --include-table 'orders,order_items' \
+    --stream-id wave1 --slot-name wave1 --publication-name wave1
+```
+
+On a **MySQL-family** source only `--stream-id` is needed — there is no slot and no publication:
 
 ```bash
 # Wave 1 — cut over first, weeks before the rest.
@@ -76,27 +88,21 @@ sluice sync start \
 
 CDC state is keyed per stream (`sluice_cdc_state` is `PRIMARY KEY (stream_id)`), so the waves never contend for position. On a MySQL-family source each stream opens its own binlog / VStream reader, and there is no shared server-side object to collide over.
 
-**On Postgres, add `--slot-name` per stream.** Without it every stream lands on the default `sluice_slot` and they collide:
-
-```bash
-sluice sync start ... --stream-id wave1 --slot-name wave1   # → slot "sluice_wave1"
-```
-
-sluice prepends `sluice_` if your name doesn't already start with it, so every sluice slot is findable with `SELECT * FROM pg_replication_slots WHERE slot_name LIKE 'sluice\_%'`.
-
 <a id="pg-publication-caveat"></a>
 
-> ### ⚠️ Postgres sources: do not run concurrent streams with different table scopes
->
-> The replication **slot** is per-stream (`--slot-name`), but the **publication** is not. Every Postgres-source stream uses a single hardcoded publication, `sluice_pub`, and at **cold start** each stream scopes it to its own table list with `ALTER PUBLICATION sluice_pub SET TABLE …` — which replaces the entire table set atomically.
->
-> So if `wave1` is streaming `orders, order_items` and you cold-start `wave2` for `users, sessions` against the same source, the publication becomes `{users, sessions}`. Wave 1's slot is still healthy and still advancing, but its tables are no longer in the publication, so **it silently replicates nothing from that moment on.** There is no error; wave 1's target just quietly stops receiving changes. Warm resume does not re-assert scope, so a restart of wave 1 will not repair it — only a cold start will.
->
-> Until this is fixed, on a Postgres source use **Mechanism A** (one growing stream via `schema add-table`, which is additive and safe), or run waves **strictly sequentially** — fully stopping one wave's stream before cold-starting the next. Concurrent Postgres-source streams are only safe when they share an identical table scope (the fleet shape) or run against different source databases.
->
-> The fix is designed in [ADR-0175](../adr/adr-0175-postgres-publication-scope-isolation.md): a refusal when a rescope would de-scope another active stream, plus a `--publication-name` flag mirroring `--slot-name`. This section gets rewritten to the supported per-wave recipe once that lands.
->
-> MySQL, PlanetScale, and Vitess sources are unaffected — they have no publication.
+### Why Postgres needs both per-stream names
+
+`--slot-name` is the obvious one: without it every stream lands on the default `sluice_slot` and they collide immediately — a loud, hard-to-miss failure.
+
+`--publication-name` is the one that matters more, because forgetting it used to fail *silently*. The replication **slot** is per-stream, but the **publication** — the table filter `pgoutput` applies — is a separate object, and streams that share one fight over it. Each cold start scopes the publication to *its own* table list with `ALTER PUBLICATION … SET TABLE …`, which replaces the member set atomically. Two waves sharing the default `sluice_pub` would therefore de-scope each other: the first wave's slot would stay healthy and keep advancing while receiving **nothing** for its tables.
+
+sluice will not let that happen silently. A cold start that would **remove** tables from a publication another *active* sluice slot is reading refuses loudly with `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT`, naming the at-risk tables and the conflicting slot, and refuses **before** mutating anything — so a refused attempt leaves every running stream untouched. Pass `--publication-name` per stream (or drain the other stream first) and it proceeds.
+
+Widening or equal-scope rescopes remove nothing and never trigger the refusal, so the fleet shape (several streams, identical scope) and `schema add-table` (purely additive) are unaffected.
+
+Both flags share the `sluice_` prefix convention: `wave1` becomes `sluice_wave1`, so every sluice-owned source object is findable the same way — `pg_replication_slots WHERE slot_name LIKE 'sluice\_%'` and `pg_publication WHERE pubname LIKE 'sluice\_%'`.
+
+MySQL, PlanetScale, and Vitess sources have no publication and ignore the flag. See [ADR-0175](../adr/adr-0175-postgres-publication-scope-isolation.md).
 
 ---
 
@@ -183,7 +189,7 @@ If you need genuine fail-back today, the honest answer is to keep the source aut
 1. **Draw the FK graph.** It constrains ordering more than size does. Parents before children; note the cycles that will need `--skip-foreign-keys`.
 2. **Prefer self-contained clusters.** A wave whose tables reference only each other cuts over cleanly and can be verified in isolation.
 3. **Put the scariest table in wave 1, not last.** The point of staging is to learn early, on the table most likely to surprise you, while the blast radius is smallest and rollback is still just "keep using the source."
-4. **Confirm the source engine supports the mechanism you want.** Independent per-wave cutover needs Mechanism B, which needs a MySQL-family source today.
+4. **On a Postgres source, set `--slot-name` AND `--publication-name` per wave.** Independent per-wave cutover needs Mechanism B, and on Postgres both per-stream names are required for it to be correct — sluice refuses loudly if you forget, but it is cheaper to pass them up front.
 5. **Decide the write-fence per wave before you start**, not at the cutover window.
 6. **Budget the stream count.** Each concurrent wave is a full CDC reader (and on Postgres, a slot). A handful is fine; dozens is not a design, it's a load test.
 

@@ -73,7 +73,7 @@ func TestEnsurePublication_EmptyPublicationWarnsButDoesNotRefuse(t *testing.T) {
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 		defer slog.SetDefault(prev)
-		err := ensurePublication(ctx, db, name, "public", nil)
+		err := ensurePublication(ctx, db, name, "public", nil, "")
 		return buf.String(), err
 	}
 

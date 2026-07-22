@@ -50,3 +50,21 @@ func resolveSlotName(operatorSupplied string) string {
 	}
 	return sluiceSlotPrefix + operatorSupplied
 }
+
+// resolvePublicationName applies the SAME sluice-prefix convention to
+// an operator-supplied publication name (ADR-0175), so both of a
+// stream's per-instance names read alike and every sluice-managed
+// publication stays findable with
+// `pg_publication WHERE pubname LIKE 'sluice\_%'` — the mirror of the
+// slot convention's `pg_replication_slots` lookup.
+//
+//	""                → ""              (engine default: sluice_pub)
+//	"wave1"           → "sluice_wave1"
+//	"sluice_wave1"    → "sluice_wave1"  (idempotent)
+//
+// Deliberately shares sluiceSlotPrefix rather than minting a second
+// constant: the convention is one prefix for "objects sluice owns on
+// the source", not one per object type.
+func resolvePublicationName(operatorSupplied string) string {
+	return resolveSlotName(operatorSupplied)
+}

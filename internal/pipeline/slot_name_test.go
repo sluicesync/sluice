@@ -275,3 +275,24 @@ func TestOpenSnapshotStreamScoped(t *testing.T) {
 		}
 	})
 }
+
+// TestResolvePublicationName pins the ADR-0175 prefix convention: the
+// publication shares the slot's `sluice_` prefix policy so every
+// sluice-owned source object is findable by the same LIKE pattern, and
+// empty passes through as "use the engine default" (the non-breaking
+// upgrade property — see ADR-0175 on why a derived default was
+// rejected).
+func TestResolvePublicationName(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},                            // engine default (sluice_pub)
+		{"wave1", "sluice_wave1"},           // prefix applied
+		{"sluice_wave1", "sluice_wave1"},    // idempotent
+		{"sluice_pub", "sluice_pub"},        // the default, explicitly
+		{"sluicewave", "sluice_sluicewave"}, // prefix is `sluice_`, not `sluice`
+	}
+	for _, tc := range tests {
+		if got := resolvePublicationName(tc.in); got != tc.want {
+			t.Errorf("resolvePublicationName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

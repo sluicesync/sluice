@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Concurrent Postgres-source syncs with different table scopes no longer silently starve each other (ADR-0175).** The replication *slot* has always been per-stream and operator-overridable (`--slot-name`), but the *publication* — the table filter `pgoutput` applies, named per stream at `START_REPLICATION` — was a hardcoded `sluice_pub` with no flag, config key, or env var. Each cold start ran `ALTER PUBLICATION sluice_pub SET TABLE <its own tables>`, which replaces the member set atomically, so cold-starting a second stream with a disjoint `--include-table` scope against the same source de-scoped the first: its slot stayed healthy and kept advancing while `pgoutput` emitted nothing for its tables, and `sync status` / `sync health` both reported a current stream. Warm resume never re-asserts scope, so restarting the starved stream did not repair it. This was reachable by anyone staging a migration in waves; it was safe only in the one shipped multi-stream shape (a fleet of same-scope streams), where the rescope is a no-op rewrite. MySQL, PlanetScale, and Vitess sources were never affected — they have no publication.
+
+Two changes close it. First, the load-bearing one: a cold start that would **remove** tables from a publication another *active* sluice replication slot is reading now refuses with `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT`, naming the at-risk tables and the conflicting slot — and refuses *before* mutating anything, so a refused attempt leaves every running stream untouched. Second, `sync start` gains **`--publication-name`**, the sibling of `--slot-name` with the same `sluice_` prefix convention (`--publication-name wave1` manages `sluice_wave1`), which is how you legitimately run several differently-scoped streams off one Postgres source. The default is unchanged, so existing deployments keep `sluice_pub` and upgrade without any change in behaviour — a stream-id-derived default was deliberately rejected because the publication name is sent on every `START_REPLICATION`, including warm resume, and would have broken every running Postgres stream on upgrade.
+
+Only *narrowing* rescopes are guarded: widening or equal-scope rescopes remove nothing and never reach the check, so the fleet shape and the additive `schema add-table` path are unaffected. The regression is pinned end to end by a new integration gate that runs two concurrent Postgres-source streamers with disjoint scopes and asserts both targets receive their own changes — verified non-vacuous by running it against deliberately-disabled fix code, where it fails at exactly the starvation assertion.
+
+### Documentation
+
+- `docs/operator/staged-wave-migration.md` and the sluicesync.com staged-wave guide now document the supported per-wave recipe on Postgres (`--slot-name` **and** `--publication-name` per stream) in place of the interim "run waves sequentially" workaround.
+
 ## [0.99.286] - 2026-07-22
 
 **A continuous `sync` now rides out routine transient source-side errors instead of exiting.** Found by a multi-day soak against real PlanetScale and Cloudflare D1: three ordinary network/upstream blips each terminated a healthy long-running stream. Nothing was ever at risk of data loss — every failure was loud and every restart resumed cleanly — but a sync that needs a manual restart after each blip isn't operationally usable. If you run continuous sync for days at a time, upgrade.

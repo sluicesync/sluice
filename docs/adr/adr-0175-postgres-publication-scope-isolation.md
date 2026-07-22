@@ -2,7 +2,11 @@
 
 ## Status
 
-**Proposed (2026-07-21).** Filed from a staged-migration design question: whether sluice supports bringing tables across in waves, with several concurrently-running streams scoped to disjoint table sets. It does on a MySQL-family source; on a Postgres source the shared publication makes it a **silent-loss** shape. No code has landed; this ADR is the design gate.
+**Accepted — implemented 2026-07-22.** Filed from a staged-migration design question: whether sluice supports bringing tables across in waves, with several concurrently-running streams scoped to disjoint table sets. It does on a MySQL-family source; on a Postgres source the shared publication made it a **silent-loss** shape.
+
+**The bug was reproduced empirically before the fix landed, not only by code reading.** The Tier-1 gate (`internal/pipeline/publication_scope_conflict_pg_integration_test.go`) was written first and run against deliberately-disabled fix code: `TestPublicationScope_TwoStreams_IsolatedByPublicationName` failed at exactly the load-bearing assertion — *"wave A stopped receiving changes after wave B cold-started"* — and `..._ConflictRefusedWithoutIsolation` failed with *"the guard did not fire"*, while `..._WideningIsNotAConflict` **passed even pre-fix**, confirming the gate is targeted at the narrowing case rather than blanket. All three pass with the fix restored.
+
+Shipped surface: `--publication-name` on `sync start` (default unchanged), `ir.PublicationScoper` + `postgres.Engine.WithPublicationScope`, the narrowing guard in `ensurePublication`, and `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT`. Regression-checked against the other publication-touching paths: single-stream resume, cold-start (serial + parallel), multi-schema (`FOR ALL TABLES`), live `schema add-table`, and the backup chain-slot/incremental chain.
 
 **Concurrency note:** this touches the streamer cold-start path and source-side catalog DDL, but adds no goroutines or shared mutable state. The `-race`-before-tag rule applies to the integration pins (two concurrent streamers against one source), not to the guard logic itself.
 

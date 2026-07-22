@@ -60,6 +60,12 @@ const (
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// ADR-0175: a cold start would NARROW a Postgres publication that
+	// another ACTIVE sluice replication slot is streaming through,
+	// silently de-scoping that stream (its slot keeps advancing while
+	// pgoutput emits nothing for its tables).
+	CodeCDCPublicationScopeConflict Code = "SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT"
+
 	// RETAINED-BUT-UNUSED (ADR-0170): the Phase-1/2 refusal for MariaDB CDC
 	// is lifted — MariaDB CDC via domain GTIDs shipped v0.99.271, so the
 	// flavor declares CDCBinlog and this code is no longer emitted. The
@@ -179,6 +185,8 @@ var registry = map[Code]Info{
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
+
+	CodeCDCPublicationScopeConflict: {ClassRefusal, "cold start refused: rescoping the Postgres publication would REMOVE tables another active sluice replication slot is streaming through, silently de-scoping that stream (its slot would keep advancing while pgoutput emitted nothing for its tables) — give each concurrent stream its own --publication-name, or stop the other stream first"},
 
 	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL/Vitess source streams partial row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON; on a self-hosted Vitess/VStream source the RowChange.DataColumns bitmap marks a NOBLOB-omitted column), under which CDC silently loses UPDATEs — refused at CDC start on the binlog path, and loudly mid-stream when a partial image reaches the reader (a slipped-past global preflight, or a VStream after-image whose bitmap flags an omitted column)"},
 	CodeCDCMariaDBUnsupported:           {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB CDC (domain-GTID positions) shipped v0.99.271 (ADR-0170); the flavor now declares CDCBinlog and this refusal is no longer emitted. Kept registered because removing a published catalog code is breaking"},

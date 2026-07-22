@@ -3025,6 +3025,32 @@ type ConnectionLabeler interface {
 	WithConnectionLabel(id string) Engine
 }
 
+// PublicationScoper is the optional engine surface for engines whose
+// CDC stream reads through a NAMED, SHARED source-side filter object
+// that several concurrent streams could otherwise fight over — today
+// only Postgres, whose publication is exactly that (ADR-0175).
+//
+// Postgres splits two concerns sluice's naming used to conflate: the
+// replication SLOT is the per-consumer cursor and WAL-retention lease,
+// while the PUBLICATION is the table filter pgoutput applies, named
+// per stream at START_REPLICATION. Nothing binds one to the other. So
+// two streams sharing a publication but holding their own slots will
+// silently de-scope each other on a rescope — the first stream's slot
+// stays healthy and advancing while it receives nothing.
+//
+// WithPublicationScope returns a configured copy rather than mutating,
+// for the same reason [ConnectionLabeler] does: engines are registered
+// once and shared. ownSlot is the caller's OWN slot name, supplied so
+// the engine's conflict guard can exclude it when asking "is another
+// active slot reading this publication?".
+//
+// Engines with no shared source-side filter object (the MySQL family:
+// each stream opens its own binlog/VStream reader) simply omit the
+// method, and the orchestrator's type assertion no-ops.
+type PublicationScoper interface {
+	WithPublicationScope(publication, ownSlot string) Engine
+}
+
 // CDCReaderWithSlotOpener is the optional engine surface for engines
 // whose CDC implementation can be configured with a non-default
 // replication-slot name (today: Postgres). When the orchestrator has

@@ -140,7 +140,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	// in the 2026-06-10 backup benchmark). FOR ALL TABLES matches the
 	// CDC reader's own no-scope ensure and is superset-safe.
 	if opts.PersistChainSlot {
-		if err := ensureAllTablesPublication(ctx, db, defaultPublication); err != nil {
+		if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
 			_ = db.Close()
 			return nil, classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
 		}

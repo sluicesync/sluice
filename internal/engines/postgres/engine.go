@@ -48,6 +48,21 @@ type Engine struct {
 	// zero value) is normalised to "-" at the [withApplicationName]
 	// choke point.
 	appID string
+
+	// publication is the pgoutput publication this engine value
+	// manages and streams through. Empty (the zero value) means
+	// [defaultPublication] — so every pre-ADR-0175 construction site
+	// keeps the historical `sluice_pub` and upgrades are non-breaking.
+	// Set only via [Engine.WithPublicationScope]. See ADR-0175.
+	publication string
+
+	// ownSlot is the replication slot belonging to THIS stream, used
+	// solely to exclude ourselves from the ADR-0175 conflict guard's
+	// "is another active sluice slot reading this publication?" probe.
+	// Empty means "no slot of ours to exclude" — safe, because the
+	// guard only ever looks at ACTIVE slots and cold start ensures the
+	// publication before our own slot exists.
+	ownSlot string
 }
 
 // Name returns the engine's short identifier as used in configuration
@@ -57,6 +72,40 @@ func (Engine) Name() string { return "postgres" }
 // Compile-time check that the engine keeps satisfying the CLI's
 // connection-labeling type-assertion (labelEngine in cmd/sluice).
 var _ ir.ConnectionLabeler = Engine{}
+
+// Compile-time check for the ADR-0175 publication-scope surface.
+var _ ir.PublicationScoper = Engine{}
+
+// WithPublicationScope implements [ir.PublicationScoper]: it returns a
+// copy of the engine that manages and streams through the named
+// publication, and that knows which replication slot is its own.
+//
+// Two names, one call, because they are set together at exactly one
+// point (the streamer's per-attempt setup) and both feed the same
+// concern — keeping concurrent streams over one source from silently
+// de-scoping each other (ADR-0175).
+//
+// An empty publication keeps [defaultPublication], so callers that
+// don't care (every path before ADR-0175, and every stream that never
+// passes --publication-name) are unchanged. Returns a configured copy
+// rather than mutating: engines are registered once and shared, so the
+// registry's value must stay scope-free for the next caller.
+func (e Engine) WithPublicationScope(publication, ownSlot string) ir.Engine {
+	e.publication = publication
+	e.ownSlot = ownSlot
+	return e
+}
+
+// publicationName is the single read point for this engine value's
+// publication, collapsing the empty zero value to [defaultPublication].
+// Every call site that used to name defaultPublication directly goes
+// through here so an override can never be silently bypassed.
+func (e Engine) publicationName() string {
+	if e.publication == "" {
+		return defaultPublication
+	}
+	return e.publication
+}
 
 // WithConnectionLabel implements [ir.ConnectionLabeler]: it returns a
 // copy of the engine configured to stamp `sluice/<role>/<id>` as the
@@ -213,7 +262,7 @@ func (e Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string)
 		schema:       cfg.schema,
 		dsn:          cfg.dsn,
 		appID:        cfg.appID,
-		publication:  defaultPublication,
+		publication:  e.publicationName(),
 		slotName:     slotName,
 		protoVersion: 2,
 	}, nil
@@ -248,7 +297,7 @@ func (e Engine) EnsurePublication(ctx context.Context, dsn string, tables []stri
 	if err := checkNotStandby(ctx, db); err != nil {
 		return err
 	}
-	return classifyStandbyReadOnly(ensurePublication(ctx, db, defaultPublication, cfg.schema, tables))
+	return classifyStandbyReadOnly(ensurePublication(ctx, db, e.publicationName(), cfg.schema, tables, e.ownSlot))
 }
 
 // AddPublicationTables extends the sluice publication's table list
@@ -280,7 +329,7 @@ func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []s
 	// Same standby belt as EnsurePublication: an ALTER PUBLICATION on a
 	// source that entered recovery surfaces the coded steer, not a raw
 	// 25006 (Bug 197).
-	return classifyStandbyReadOnly(addTablesToPublication(ctx, db, defaultPublication, cfg.schema, tables))
+	return classifyStandbyReadOnly(addTablesToPublication(ctx, db, e.publicationName(), cfg.schema, tables))
 }
 
 // ExtractSnapshotLSN decodes a Postgres snapshot stream's

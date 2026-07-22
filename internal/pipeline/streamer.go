@@ -217,6 +217,21 @@ type Streamer struct {
 	// hard-coded `sluice_slot` default. v0.10.2.
 	SlotName string
 
+	// PublicationName, when non-empty, overrides the engine's default
+	// publication name on engines with a shared source-side filter
+	// object (Postgres: `sluice_pub`). Engines without one (the MySQL
+	// family — each stream opens its own binlog/VStream reader)
+	// silently ignore it.
+	//
+	// The sibling of SlotName, and needed for the same reason: the
+	// slot is per-consumer but the publication is NOT, so two
+	// concurrent streams over one PG source that share a publication
+	// will silently de-scope each other when the second cold-starts
+	// (its `ALTER PUBLICATION ... SET TABLE` replaces the member set
+	// atomically). Set this per stream — alongside SlotName — whenever
+	// several streams run against one Postgres source. ADR-0175.
+	PublicationName string
+
 	// DryRun, when true, prints what Run would do (cold-start vs
 	// warm-resume, source schema summary or persisted-position
 	// token) and returns without opening the snapshot stream,

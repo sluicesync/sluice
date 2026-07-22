@@ -144,12 +144,12 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// falling back to FOR ALL TABLES only on a fresh setup with no prior
 	// EnsurePublication call (test paths, direct API consumers).
 	if spanning {
-		if err := ensureAllTablesPublication(ctx, db, defaultPublication); err != nil {
+		if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
 			_ = db.Close()
 			return nil, classifyStandbyReadOnly(err)
 		}
 	} else {
-		if err := ensurePublication(ctx, db, defaultPublication, cfg.schema, nil); err != nil {
+		if err := ensurePublication(ctx, db, e.publicationName(), cfg.schema, nil, e.ownSlot); err != nil {
 			_ = db.Close()
 			return nil, classifyStandbyReadOnly(err)
 		}

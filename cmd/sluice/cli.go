@@ -1199,8 +1199,11 @@ type SyncStartCmd struct {
 
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	SlotName string `help:"Replication-slot name suffix for engines that have a slot concept (Postgres). Default 'sluice_slot'. Sluice prepends 'sluice_' if the supplied name doesn't already start with it (so '--slot-name shard_a' creates 'sluice_shard_a'); the convention lets operators find every sluice slot with 'pg_replication_slots WHERE slot_name LIKE sluice\\_%'. Set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they collide on the default. Engines without slots (MySQL: binlog stream is the slot) silently ignore this flag." placeholder:"NAME"`
-	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
-	Format   string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/aborted/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+
+	PublicationName string `help:"Publication name suffix for engines with a shared source-side filter object (Postgres). Default 'sluice_pub'. Same convention as --slot-name: sluice prepends 'sluice_' if absent, so '--publication-name wave1' manages 'sluice_wave1' and every sluice publication is findable with 'pg_publication WHERE pubname LIKE sluice\\_%'. REQUIRED (alongside --slot-name) to run multiple concurrent PG-source streams with DIFFERENT --include-table scopes: the slot is per-stream but the publication is NOT, so sharing one makes a second stream's cold start silently de-scope the first — sluice refuses that rescope loudly (SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT) rather than performing it. Engines without a publication (MySQL family) silently ignore this flag. See ADR-0175." placeholder:"NAME"`
+
+	DryRun bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
+	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/aborted/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
 
@@ -2011,6 +2014,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		TargetDSN:            s.Target,
 		StreamID:             s.StreamID,
 		SlotName:             s.SlotName,
+		PublicationName:      s.PublicationName,
 		Mappings:             mappings,
 		ExpressionMappings:   exprMappings,
 		RowFilters:           rowFilters,

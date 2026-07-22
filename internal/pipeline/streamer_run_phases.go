@@ -251,6 +251,38 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 		s.SlotName = resolved
 	}
 
+	// ADR-0175: same prefix convention for the publication, then push
+	// BOTH names into the source engine value. This is the one point
+	// where the stream's per-instance source-side object names are
+	// known, and it runs before any source connection opens — which
+	// matters, because the publication name is sent on every
+	// START_REPLICATION and the own-slot name is what keeps the
+	// narrowing guard from mistaking our own slot for a peer's.
+	//
+	// Applied unconditionally when the engine implements the surface
+	// (not only when PublicationName is set) so the guard always
+	// receives our slot name; an empty publication keeps the engine
+	// default, so behaviour for streams that never pass the flag is
+	// byte-identical to before.
+	if resolved := resolvePublicationName(s.PublicationName); resolved != s.PublicationName {
+		slog.InfoContext(
+			ctx, "applying sluice publication-name prefix convention",
+			slog.String("operator_supplied", s.PublicationName),
+			slog.String("resolved", resolved),
+		)
+		s.PublicationName = resolved
+	}
+	if scoper, ok := s.Source.(ir.PublicationScoper); ok {
+		s.Source = scoper.WithPublicationScope(s.PublicationName, s.SlotName)
+		if s.PublicationName != "" {
+			slog.InfoContext(
+				ctx, "using a per-stream publication",
+				slog.String("publication", s.PublicationName),
+				slog.String("slot", s.SlotName),
+			)
+		}
+	}
+
 	// Engine-default exclusions (Bug 22 / v0.8.1): merge in any
 	// patterns the source engine surfaces via [ir.DefaultTableExcluder]
 	// — today PlanetScale's `_vt_*` Vitess shadow tables, triggered

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events buffered before
@@ -419,7 +421,10 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// missing — i.e. a non-streamer caller never went through the
 	// scoped-publication code path. That's the v0.4.0 shape and
 	// remains correct for those callers.
-	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil); err != nil {
+	// nil tables takes the no-scope-supplied path, which never narrows
+	// and so never reaches the ADR-0175 guard; r.slotName is passed
+	// regardless so the exclusion is correct if that ever changes.
+	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil, r.slotName); err != nil {
 		return nil, classifyStandbyReadOnly(err)
 	}
 
@@ -2125,7 +2130,11 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 // references resolve in the session's search_path; quoting and
 // schema-qualifying both the relation and identifiers keeps the
 // behaviour robust against unusual search_path settings.
-func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string) error {
+// excludeSlot is the caller's OWN replication slot, excluded from the
+// ADR-0175 conflict probe. Empty is safe: the probe only considers
+// ACTIVE slots, and cold start ensures the publication before its own
+// slot exists.
+func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string, excludeSlot string) error {
 	var exists, allTables bool
 	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
 		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
@@ -2214,6 +2223,13 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		return nil
 	}
 	if allTables {
+		// ADR-0175: demoting FOR ALL TABLES to a scoped list removes
+		// every unlisted table from the stream. If another active
+		// sluice slot is reading through this publication, that is the
+		// silent-loss shape — refuse rather than rescope.
+		if err := guardPublicationNarrowing(ctx, db, name, nil, excludeSlot); err != nil {
+			return err
+		}
 		// Migrate: drop the FOR ALL TABLES publication and recreate
 		// scoped. ALTER cannot demote FOR ALL TABLES → FOR TABLE
 		// directly.
@@ -2228,12 +2244,183 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		}
 		return nil
 	}
+	// ADR-0175: `SET TABLE` replaces the member set atomically, so an
+	// incoming list that omits a current member REMOVES it. Guard that
+	// case; a widening or equal rescope removes nothing and proceeds.
+	if err := guardPublicationNarrowing(ctx, db, name, qualifiedTableKeys(schema, tables), excludeSlot); err != nil {
+		return err
+	}
 	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s SET TABLE %s`,
 		quoteIdent(name), formatPublicationTableList(schema, tables))
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
 		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
 	}
 	return nil
+}
+
+// qualifiedTableKeys renders the "schema.table" keys that match
+// [publicationMemberSet]'s shape, mirroring
+// [formatPublicationTableList]'s empty-schema handling.
+func qualifiedTableKeys(schema string, tables []string) map[string]struct{} {
+	keys := make(map[string]struct{}, len(tables))
+	for _, t := range tables {
+		keys[schema+"."+t] = struct{}{}
+	}
+	return keys
+}
+
+// removedFromPublication returns the sorted members that `incoming`
+// would drop from the publication — the ADR-0175 narrowing set. Empty
+// means the rescope widens or leaves scope unchanged, which is always
+// safe: it can only ADD tables to another stream's view, never take
+// them away.
+//
+// Pure set difference, split out from [guardPublicationNarrowing] so
+// the decision that gates a refusal is testable without a database.
+func removedFromPublication(members, incoming map[string]struct{}) []string {
+	var removed []string
+	for m := range members {
+		if _, keep := incoming[m]; !keep {
+			removed = append(removed, m)
+		}
+	}
+	sort.Strings(removed)
+	return removed
+}
+
+// publicationMemberSet returns the publication's current member tables
+// keyed "schema.table". Shared by the ADR-0175 narrowing guard and by
+// [addTablesToPublication]'s duplicate skip so both agree on the key
+// shape.
+func publicationMemberSet(ctx context.Context, db *sql.DB, name string) (map[string]struct{}, error) {
+	const memberQuery = `
+		SELECT n.nspname, c.relname
+		FROM   pg_publication p
+		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN   pg_class c            ON c.oid     = pr.prrelid
+		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
+		WHERE  p.pubname = $1`
+	rows, err := db.QueryContext(ctx, memberQuery, name)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list publication members: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	members := make(map[string]struct{})
+	for rows.Next() {
+		var nsp, rel string
+		if err := rows.Scan(&nsp, &rel); err != nil {
+			return nil, fmt.Errorf("postgres: scan publication member: %w", err)
+		}
+		members[nsp+"."+rel] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list publication members: %w", err)
+	}
+	return members, nil
+}
+
+// otherActiveSluiceSlots returns the ACTIVE sluice-convention
+// replication slots other than excludeSlot — the signal that some
+// other stream is currently reading through this source.
+//
+// Activity is the right proxy at this layer. The alternative,
+// sluice_cdc_state, lives on the TARGET, and concurrent waves may have
+// entirely different targets, so no single target's control table is
+// authoritative about who is reading the source. This is a proxy and
+// not a registry: a conflicting stream whose slot is momentarily
+// inactive is not detected (ADR-0175 "Residual risk").
+func otherActiveSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]string, error) {
+	const slotQuery = `
+		SELECT slot_name
+		FROM   pg_replication_slots
+		WHERE  slot_name LIKE 'sluice\_%'
+		  AND  active
+		  AND  slot_name <> $1
+		ORDER  BY slot_name`
+	rows, err := db.QueryContext(ctx, slotQuery, excludeSlot)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list active sluice replication slots: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var slots []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("postgres: scan replication slot: %w", err)
+		}
+		slots = append(slots, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list active sluice replication slots: %w", err)
+	}
+	return slots, nil
+}
+
+// guardPublicationNarrowing implements the ADR-0175 refusal. It runs
+// BEFORE any mutation, so a refused attempt leaves the publication —
+// and every stream reading through it — completely untouched.
+//
+// incoming is the "schema.table" key set the caller is about to scope
+// the publication to; a nil map means "everything is being removed"
+// (the FOR ALL TABLES demotion, where the current members aren't
+// enumerable from pg_publication_rel).
+//
+// No removal ⇒ no conflict, so widening and equal-scope rescopes never
+// reach the slot probe. That keeps the ADR-0122 fleet shape (identical
+// scopes) and `schema add-table` (additive) on their existing path at
+// zero added cost.
+func guardPublicationNarrowing(
+	ctx context.Context,
+	db *sql.DB,
+	name string,
+	incoming map[string]struct{},
+	excludeSlot string,
+) error {
+	var removed []string
+	if incoming == nil {
+		// FOR ALL TABLES → scoped. Every table not in the new list
+		// loses scope; we can't enumerate them (a FOR ALL TABLES
+		// publication has no pg_publication_rel rows), so treat the
+		// demotion itself as the removal.
+		removed = []string{"(every table — the publication is currently FOR ALL TABLES)"}
+	} else {
+		members, err := publicationMemberSet(ctx, db, name)
+		if err != nil {
+			return err
+		}
+		if removed = removedFromPublication(members, incoming); len(removed) == 0 {
+			return nil // widening or equal — nothing to protect
+		}
+	}
+
+	slots, err := otherActiveSluiceSlots(ctx, db, excludeSlot)
+	if err != nil {
+		return err
+	}
+	if len(slots) == 0 {
+		return nil // nobody else is reading; the rescope is the operator's own
+	}
+
+	return sluicecode.Wrap(
+		sluicecode.CodeCDCPublicationScopeConflict,
+		"pass --publication-name to give this stream its own publication, or stop the other stream first",
+		fmt.Errorf(
+			"postgres: refusing to rescope publication %q: it would REMOVE %s from the stream, "+
+				"but %d other active sluice replication slot(s) are reading through it (%s). "+
+				"A publication is pgoutput's table filter and nothing binds it to a slot, so this "+
+				"rescope would leave the other stream(s) advancing normally while receiving NOTHING "+
+				"for those tables — a silent divergence with a healthy-looking sync status. "+
+				"Recovery: give each concurrent stream over this source its own publication "+
+				"(--publication-name NAME, per stream), or drain the other stream first "+
+				"(sluice sync stop --wait --stream-id ID). See ADR-0175",
+			name,
+			strings.Join(removed, ", "),
+			len(slots),
+			strings.Join(slots, ", "),
+		),
+	)
 }
 
 // ensureAllTablesPublication guarantees the named publication exists as
@@ -2381,32 +2568,11 @@ func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string
 
 	// Look up the current member set so we can skip duplicates and
 	// emit a clean ALTER even if some of the supplied tables are
-	// already in the publication. pg_publication_rel + pg_class +
-	// pg_namespace gives us schema-qualified names that match
-	// formatPublicationTableList's quoting.
-	const memberQuery = `
-		SELECT n.nspname, c.relname
-		FROM   pg_publication p
-		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
-		JOIN   pg_class c            ON c.oid     = pr.prrelid
-		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
-		WHERE  p.pubname = $1`
-	rows, err := db.QueryContext(ctx, memberQuery, name)
+	// already in the publication. Shares [publicationMemberSet] with
+	// the ADR-0175 narrowing guard so both agree on the key shape.
+	existing, err := publicationMemberSet(ctx, db, name)
 	if err != nil {
-		return fmt.Errorf("postgres: list publication members: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	existing := make(map[string]struct{})
-	for rows.Next() {
-		var nsp, rel string
-		if err := rows.Scan(&nsp, &rel); err != nil {
-			return fmt.Errorf("postgres: scan publication member: %w", err)
-		}
-		existing[nsp+"."+rel] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("postgres: list publication members: %w", err)
+		return err
 	}
 
 	toAdd := make([]string, 0, len(tables))
