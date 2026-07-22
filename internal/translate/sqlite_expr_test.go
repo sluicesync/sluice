@@ -305,7 +305,14 @@ func TestSQLiteExpr_NonPortableBoth(t *testing.T) {
 		"x -> 'k'",
 		"x GLOB 'a*'",
 		"x LIKE 'a%'",
-		"x IN (1, 2)",
+		// NOTE: `x IN (1, 2)` used to live here. It is now SUPPORTED —
+		// the list form is portable to both targets verbatim, and
+		// refusing it blocked migration of the canonical SQLite boolean
+		// idiom `INTEGER CHECK (col IN (0,1))`. The non-portable IN
+		// shapes are still refused, below.
+		"x IN (SELECT id FROM t)", // subquery: outside the provable subset
+		"x IN ()",                 // empty list: SQLite-only, PG syntax error
+		"x IN other_table",        // SQLite's IN <table> shorthand
 		"x BETWEEN 1 AND 2",
 		// arity / shape violations
 		"trim(x, 'ab')",      // 2-arg trim is not portable
@@ -379,5 +386,92 @@ func TestSQLiteExprMySQLDefaultVerbatimSafe(t *testing.T) {
 		if got := SQLiteExprMySQLDefaultVerbatimSafe(in); got != want {
 			t.Errorf("SQLiteExprMySQLDefaultVerbatimSafe(%q) = %v; want %v", in, got, want)
 		}
+	}
+}
+
+// TestSQLiteExpr_InList pins the IN list form (both targets, verbatim).
+// Before this node existed the construct was unparseable, so the canonical
+// SQLite boolean idiom `CHECK (col IN (0,1))` was refused as non-portable
+// and BLOCKED the migration.
+func TestSQLiteExpr_InList(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"flag IN (0, 1)", "(flag IN (0, 1))"},
+		{"flag NOT IN (0, 1)", "(flag NOT IN (0, 1))"},
+		{"n IN (1)", "(n IN (1))"},
+		{"n IN (1, 2, 3)", "(n IN (1, 2, 3))"},
+		{"s IN ('a', 'b')", "(s IN ('a', 'b'))"},
+		// Composes with the rest of the grammar.
+		{"a IN (1, 2) AND b IN (3)", "((a IN (1, 2)) AND (b IN (3)))"},
+		{"NOT (a IN (1))", "(NOT (a IN (1)))"},
+	}
+	for _, tc := range cases {
+		got, ok := SQLiteExprToPG(tc.in)
+		if !ok || got != tc.want {
+			t.Errorf("SQLiteExprToPG(%q) = (%q, %v); want (%q, true)", tc.in, got, ok, tc.want)
+		}
+		// The list form is portable to MySQL verbatim too.
+		if _, ok := SQLiteExprToMySQL(tc.in); !ok {
+			t.Errorf("SQLiteExprToMySQL(%q) refused; the IN list form is portable to MySQL too", tc.in)
+		}
+	}
+}
+
+// TestSQLiteExprToPGBoolAware pins the boolean re-typing that has to
+// accompany an --infer-types INTEGER→BOOLEAN promotion: SQLite has no
+// BOOLEAN type, so its 0/1 idiom must become false/true or PG rejects the
+// body with `operator does not exist: boolean = integer`.
+func TestSQLiteExprToPGBoolAware(t *testing.T) {
+	bools := map[string]bool{"flag": true}
+
+	rewritten := []struct{ in, want string }{
+		{"flag IN (0, 1)", "(flag IN (false, true))"},
+		{"flag NOT IN (0, 1)", "(flag NOT IN (false, true))"},
+		{"flag = 1", "(flag = true)"},
+		{"flag = 0", "(flag = false)"},
+		{"flag <> 0", "(flag <> false)"},
+		{"flag != 0", "(flag <> false)"}, // != normalises to <>
+		{"1 = flag", "(true = flag)"},    // reversed operand order
+	}
+	for _, tc := range rewritten {
+		got, ok := SQLiteExprToPGBoolAware(tc.in, bools)
+		if !ok || got != tc.want {
+			t.Errorf("SQLiteExprToPGBoolAware(%q) = (%q, %v); want (%q, true)", tc.in, got, ok, tc.want)
+		}
+	}
+
+	// NOT rewritten — each of these would be a GUESS, so the literal is
+	// left alone and PG decides loudly.
+	untouched := []struct{ in, want string }{
+		// A non-bool column keeps integer literals.
+		{"other IN (0, 1)", "(other IN (0, 1))"},
+		{"other = 1", "(other = 1)"},
+		// Out-of-range literal against a bool column: never silently coerced.
+		{"flag = 2", "(flag = 2)"},
+		{"flag IN (0, 1, 2)", "(flag IN (false, true, 2))"},
+		// ORDERING comparisons are not boolean semantics.
+		{"flag > 0", "(flag > 0)"},
+		{"flag >= 1", "(flag >= 1)"},
+	}
+	for _, tc := range untouched {
+		got, ok := SQLiteExprToPGBoolAware(tc.in, bools)
+		if !ok || got != tc.want {
+			t.Errorf("SQLiteExprToPGBoolAware(%q) = (%q, %v); want (%q, true)", tc.in, got, ok, tc.want)
+		}
+	}
+
+	// An empty/nil bool set is byte-identical to the context-free call —
+	// the non-breaking property every pre-existing call site relies on.
+	for _, in := range []string{"flag IN (0, 1)", "flag = 1", "1 = flag"} {
+		plain, _ := SQLiteExprToPG(in)
+		nilCtx, _ := SQLiteExprToPGBoolAware(in, nil)
+		empty, _ := SQLiteExprToPGBoolAware(in, map[string]bool{})
+		if plain != nilCtx || plain != empty {
+			t.Errorf("%q: context-free=%q nil=%q empty=%q; all three must agree", in, plain, nilCtx, empty)
+		}
+	}
+
+	// MySQL never rewrites — its BOOLEAN is TINYINT and takes 0/1 natively.
+	if got, ok := SQLiteExprToMySQL("flag IN (0, 1)"); !ok || got != "(flag IN (0, 1))" {
+		t.Errorf("SQLiteExprToMySQL(flag IN (0,1)) = (%q, %v); MySQL must keep integer literals", got, ok)
 	}
 }

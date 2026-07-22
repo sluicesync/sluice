@@ -1897,7 +1897,14 @@ func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) str
 	// reject — never warn-DROP (dropping a CHECK silently removes an
 	// integrity guarantee).
 	if c.ExprDialect == sqliteSourceDialect {
-		if pg, ok := translate.SQLiteExprToPG(c.Expr); ok {
+		// Bool-aware: SQLite has no BOOLEAN type, so the canonical idiom
+		// is an INTEGER column constrained to 0/1. When --infer-types
+		// (ADR-0144) promotes such a column to PG BOOLEAN, `tbl` here is
+		// the POST-inference table, so exprContextForTable reports the
+		// promoted columns and the 0/1 literals in this CHECK re-type
+		// with them. Without that the body emits SQL PG rejects
+		// (`operator does not exist: boolean = integer`).
+		if pg, ok := translate.SQLiteExprToPGBoolAware(c.Expr, exprContextForTable(tbl).BoolColumns); ok {
 			return requotePGReservedIdents(pg)
 		}
 		return c.Expr

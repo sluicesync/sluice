@@ -36,6 +36,12 @@ package translate
 //   - operators: + - *  = <> != < <= > >=  AND OR NOT  IS [NOT] NULL,
 //     string concat || (PG keeps ||; MySQL becomes CONCAT(...)), and `/` on
 //     Postgres ONLY (see below)
+//   - `x [NOT] IN (a, b, …)` — the LIST form only. Portable to both targets
+//     verbatim (same syntax, same NULL three-valued logic). Admitted because
+//     refusing it BLOCKED migration of the canonical SQLite boolean idiom
+//     `INTEGER CHECK (col IN (0,1))` — SQLite has no BOOLEAN type, so that
+//     spelling is ubiquitous. `IN (SELECT …)`, the `IN <table>` shorthand,
+//     and the SQLite-only empty list `IN ()` (a PG syntax error) all refuse.
 //   - functions: abs, coalesce, ifnull(→coalesce), nullif,
 //     length (PG length / MySQL CHAR_LENGTH), trim/ltrim/rtrim (1-arg),
 //     substr/substring (literal start ≥ 1, literal len ≥ 0 — see resolveName),
@@ -112,6 +118,26 @@ import (
 // SQLiteExprToPG translates a SQLite expression body to its Postgres
 // canonical form. ok is false for anything outside the portability allowlist.
 func SQLiteExprToPG(expr string) (string, bool) { return translateSQLiteExpr(expr, sqPG) }
+
+// SQLiteExprToPGBoolAware is [SQLiteExprToPG] with the caller's set of
+// BOOLEAN-typed target columns, so integer 0/1 literals compared against
+// them emit as `false`/`true`.
+//
+// This exists because SQLite has no BOOLEAN type: the canonical idiom is
+// an INTEGER column constrained to 0/1, and when sluice promotes such a
+// column to PG `BOOLEAN` (`--infer-types`, ADR-0144) the surrounding
+// CHECK body has to be re-typed with it. Without that, a body that
+// parses cleanly emits SQL PG rejects (`operator does not exist:
+// boolean = integer`).
+//
+// boolColumns holds UNQUOTED column names; nil or empty is identical to
+// calling [SQLiteExprToPG]. Only `=`, `<>`/`!=` and `IN`/`NOT IN` members
+// are rewritten, and only for the literals 0 and 1 — an ordering
+// comparison or an out-of-range literal (`flag = 2`) is left alone so
+// PG rejects it loudly rather than sluice guessing.
+func SQLiteExprToPGBoolAware(expr string, boolColumns map[string]bool) (string, bool) {
+	return translateSQLiteExprCtx(expr, sqPG, sqEmitCtx{BoolColumns: boolColumns})
+}
 
 // SQLiteExprToMySQL translates a SQLite expression body to its MySQL
 // canonical form. ok is false for anything outside the portability allowlist
@@ -227,7 +253,63 @@ const (
 	sqMySQL
 )
 
+// sqEmitCtx carries the target-typing knowledge an emit pass needs that
+// the expression text alone cannot supply.
+//
+// Today that is exactly one thing: which identifiers name columns whose
+// TARGET type is boolean. SQLite has no BOOLEAN type, so the canonical
+// idiom is an INTEGER column constrained to 0/1 — and when sluice
+// promotes such a column to PG `BOOLEAN` (`--infer-types`, ADR-0144),
+// every `0`/`1` compared against it has to become `false`/`true` or PG
+// rejects the expression (`operator does not exist: boolean = integer`).
+// The expression body cannot reveal that on its own; only the (post-
+// inference) column types can, so the caller supplies them.
+//
+// The zero value is fully usable and means "no bool-typed columns" — every
+// pre-existing call site keeps byte-identical output.
+type sqEmitCtx struct {
+	// BoolColumns is the set of unquoted column names whose target type
+	// is boolean. Nil/empty disables every bool rewrite.
+	BoolColumns map[string]bool
+}
+
+// isBoolColumn reports whether n is a bare reference to a
+// boolean-typed target column.
+func (c sqEmitCtx) isBoolColumn(n sqNode) bool {
+	if len(c.BoolColumns) == 0 {
+		return false
+	}
+	v, ok := n.(verbatimNode)
+	if !ok {
+		return false
+	}
+	return c.BoolColumns[v.text]
+}
+
+// boolLiteralFor renders the boolean spelling of an integer literal
+// node when it is exactly 0 or 1. ok=false for anything else — a
+// `flag = 2` against a bool column is NOT silently rewritten; it emits
+// unchanged and PG rejects it loudly, which is the correct outcome for
+// an expression that was never valid against a two-valued column.
+func boolLiteralFor(n sqNode) (string, bool) {
+	v, ok := intLiteralValue(n)
+	if !ok {
+		return "", false
+	}
+	switch v {
+	case 0:
+		return "false", true
+	case 1:
+		return "true", true
+	}
+	return "", false
+}
+
 func translateSQLiteExpr(expr string, t sqTarget) (string, bool) {
+	return translateSQLiteExprCtx(expr, t, sqEmitCtx{})
+}
+
+func translateSQLiteExprCtx(expr string, t sqTarget, ctx sqEmitCtx) (string, bool) {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return "", false
@@ -244,7 +326,7 @@ func translateSQLiteExpr(expr string, t sqTarget) (string, bool) {
 		// outside the provable subset. Loud-fail (ok=false).
 		return "", false
 	}
-	return node.emit(t)
+	return node.emit(t, ctx)
 }
 
 // ---- AST ----
@@ -254,7 +336,7 @@ func translateSQLiteExpr(expr string, t sqTarget) (string, bool) {
 // construct has no faithful spelling on that specific target (e.g. `/` on
 // MySQL).
 type sqNode interface {
-	emit(t sqTarget) (string, bool)
+	emit(t sqTarget, ctx sqEmitCtx) (string, bool)
 }
 
 // verbatimNode carries text that is identical on both targets: a bare column
@@ -270,7 +352,7 @@ type sqNode interface {
 // older server rejects it LOUDLY at DDL time rather than diverging.
 type verbatimNode struct{ text string }
 
-func (n verbatimNode) emit(t sqTarget) (string, bool) {
+func (n verbatimNode) emit(t sqTarget, _ sqEmitCtx) (string, bool) {
 	if t == sqMySQL && isHex0xWord(n.text) {
 		return "", false
 	}
@@ -308,7 +390,7 @@ func isHex0xWord(s string) bool {
 // setting matters. Backslash literals therefore stay portable to PG.
 type stringNode struct{ text string }
 
-func (n stringNode) emit(t sqTarget) (string, bool) {
+func (n stringNode) emit(t sqTarget, _ sqEmitCtx) (string, bool) {
 	if t == sqMySQL && strings.Contains(n.text, `\`) {
 		return "", false
 	}
@@ -336,7 +418,7 @@ func (n stringNode) emit(t sqTarget) (string, bool) {
 // never silently.
 type identNode struct{ text string }
 
-func (n identNode) emit(t sqTarget) (string, bool) {
+func (n identNode) emit(t sqTarget, _ sqEmitCtx) (string, bool) {
 	if t == sqMySQL && strings.HasPrefix(n.text, `"`) {
 		return "", false
 	}
@@ -350,7 +432,7 @@ type binaryNode struct {
 	l, r sqNode
 }
 
-func (n binaryNode) emit(t sqTarget) (string, bool) {
+func (n binaryNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
 	switch n.op {
 	case "%":
 		// SQLite `%` first coerces BOTH operands to INTEGER; neither PG nor
@@ -365,15 +447,94 @@ func (n binaryNode) emit(t sqTarget) (string, bool) {
 			return "", false
 		}
 	}
-	ls, ok := n.l.emit(t)
+	// Bool-typed target column (PG only): `flag = 1` → `flag = true`,
+	// and the reversed `1 = flag`. Gated on the comparison operators
+	// where a boolean operand is meaningful — an ORDERING comparison
+	// (`flag > 0`) is NOT rewritten, because PG's boolean ordering is
+	// its own semantic and silently reinterpreting it would be a guess.
+	if t == sqPG && (n.op == "=" || n.op == "<>") {
+		if ctx.isBoolColumn(n.l) {
+			if lit, ok := boolLiteralFor(n.r); ok {
+				ls, ok := n.l.emit(t, ctx)
+				if !ok {
+					return "", false
+				}
+				return "(" + ls + " " + n.op + " " + lit + ")", true
+			}
+		}
+		if ctx.isBoolColumn(n.r) {
+			if lit, ok := boolLiteralFor(n.l); ok {
+				rs, ok := n.r.emit(t, ctx)
+				if !ok {
+					return "", false
+				}
+				return "(" + lit + " " + n.op + " " + rs + ")", true
+			}
+		}
+	}
+
+	ls, ok := n.l.emit(t, ctx)
 	if !ok {
 		return "", false
 	}
-	rs, ok := n.r.emit(t)
+	rs, ok := n.r.emit(t, ctx)
 	if !ok {
 		return "", false
 	}
 	return "(" + ls + " " + n.op + " " + rs + ")", true
+}
+
+// inNode is `<expr> [NOT] IN (<expr>, <expr>, …)`.
+//
+// The LIST form only. `IN (SELECT …)` and SQLite's `IN <table>` /
+// `IN <schema>.<table>` shorthands are deliberately NOT parsed — a
+// subquery is outside this translator's provable subset and the table
+// forms have no portable spelling; both fall through unparsed and
+// refuse, which is the pre-existing behaviour for everything here.
+//
+// The list form is portable to BOTH targets verbatim: PG and MySQL
+// share SQLite's `x IN (a, b, c)` syntax and semantics, including the
+// NULL three-valued-logic edges. Before this node existed the whole
+// construct was unparseable, so a completely portable
+// `CHECK (col IN (0,1))` — the canonical SQLite boolean idiom, since
+// SQLite has no BOOLEAN type — was refused as "non-portable" and
+// BLOCKED the migration outright.
+type inNode struct {
+	x       sqNode
+	list    []sqNode
+	negated bool
+}
+
+func (n inNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
+	xs, ok := n.x.emit(t, ctx)
+	if !ok {
+		return "", false
+	}
+	// Bool-typed target column (PG only): rewrite 0/1 members to
+	// false/true so `flag IN (0,1)` against a promoted BOOLEAN column
+	// emits `flag IN (false, true)` instead of a type error. MySQL needs
+	// no rewrite — its BOOLEAN is TINYINT and accepts 0/1 natively.
+	rewriteBools := t == sqPG && ctx.isBoolColumn(n.x)
+
+	parts := make([]string, 0, len(n.list))
+	for _, item := range n.list {
+		if rewriteBools {
+			if lit, ok := boolLiteralFor(item); ok {
+				parts = append(parts, lit)
+				continue
+			}
+		}
+		s, ok := item.emit(t, ctx)
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, s)
+	}
+	op := " IN ("
+	if n.negated {
+		op = " NOT IN ("
+	}
+	return "(" + xs + op + strings.Join(parts, ", ") + "))", true
 }
 
 // unaryNode is a prefix NOT / unary +/-.
@@ -382,8 +543,8 @@ type unaryNode struct {
 	x  sqNode
 }
 
-func (n unaryNode) emit(t sqTarget) (string, bool) {
-	xs, ok := n.x.emit(t)
+func (n unaryNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
+	xs, ok := n.x.emit(t, ctx)
 	if !ok {
 		return "", false
 	}
@@ -399,8 +560,8 @@ type isNullNode struct {
 	negated bool
 }
 
-func (n isNullNode) emit(t sqTarget) (string, bool) {
-	xs, ok := n.x.emit(t)
+func (n isNullNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
+	xs, ok := n.x.emit(t, ctx)
 	if !ok {
 		return "", false
 	}
@@ -416,10 +577,10 @@ func (n isNullNode) emit(t sqTarget) (string, bool) {
 // SQLite's any-NULL-arg → NULL semantics.
 type concatNode struct{ parts []sqNode }
 
-func (n concatNode) emit(t sqTarget) (string, bool) {
+func (n concatNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
 	parts := make([]string, len(n.parts))
 	for i, p := range n.parts {
-		s, ok := p.emit(t)
+		s, ok := p.emit(t, ctx)
 		if !ok {
 			return "", false
 		}
@@ -438,10 +599,10 @@ type funcNode struct {
 	args []sqNode
 }
 
-func (n funcNode) emit(t sqTarget) (string, bool) {
+func (n funcNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
 	args := make([]string, len(n.args))
 	for i, a := range n.args {
-		s, ok := a.emit(t)
+		s, ok := a.emit(t, ctx)
 		if !ok {
 			return "", false
 		}
@@ -461,8 +622,8 @@ type castNode struct {
 	affinity string
 }
 
-func (n castNode) emit(t sqTarget) (string, bool) {
-	xs, ok := n.x.emit(t)
+func (n castNode) emit(t sqTarget, ctx sqEmitCtx) (string, bool) {
+	xs, ok := n.x.emit(t, ctx)
 	if !ok {
 		return "", false
 	}
@@ -728,6 +889,22 @@ func (p *sqParser) parseComparison() (sqNode, bool) {
 			left = binaryNode{op: op, l: left, r: right}
 			continue
 		}
+		// `<expr> [NOT] IN (<list>)`. The infix NOT is handled here
+		// rather than by parseNot, which only sees a PREFIX NOT.
+		if p.peekWord("IN") || (p.peekWord("NOT") && p.peekWordAt(1, "IN")) {
+			negated := false
+			if p.peekWord("NOT") {
+				p.pos++
+				negated = true
+			}
+			p.pos++ // IN
+			list, ok := p.parseInList()
+			if !ok {
+				return nil, false
+			}
+			left = inNode{x: left, list: list, negated: negated}
+			continue
+		}
 		if p.peekWord("IS") {
 			p.pos++
 			negated := false
@@ -747,6 +924,57 @@ func (p *sqParser) parseComparison() (sqNode, bool) {
 		break
 	}
 	return left, true
+}
+
+// peekWordAt reports whether the token `off` positions ahead of the
+// cursor is the keyword w. Needed to distinguish the infix `NOT IN`
+// from a prefix `NOT` without consuming either.
+func (p *sqParser) peekWordAt(off int, w string) bool {
+	i := p.pos + off
+	if i >= len(p.toks) {
+		return false
+	}
+	t := p.toks[i]
+	return t.kind == sqWord && strings.EqualFold(t.text, w)
+}
+
+// parseInList parses the `( <expr> [, <expr>]* )` list after IN.
+//
+// Refuses an EMPTY list: SQLite accepts `x IN ()` (always false) but PG
+// rejects it as a syntax error, so there is no portable spelling and
+// emitting it would turn a parse into a target-side failure.
+//
+// A leading SELECT is not consumed — `IN (SELECT …)` refuses here
+// rather than being mis-parsed as a one-element list.
+func (p *sqParser) parseInList() ([]sqNode, bool) {
+	if !p.peekPunct("(") {
+		return nil, false
+	}
+	p.pos++
+	if p.peekWord("SELECT") {
+		return nil, false // subquery: outside the provable subset
+	}
+	if p.peekPunct(")") {
+		return nil, false // empty list: no portable PG spelling
+	}
+	var list []sqNode
+	for {
+		item, ok := p.parseExpr()
+		if !ok {
+			return nil, false
+		}
+		list = append(list, item)
+		if p.peekPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	if !p.peekPunct(")") {
+		return nil, false
+	}
+	p.pos++
+	return list, true
 }
 
 func (p *sqParser) peekCompareOp() (string, bool) {

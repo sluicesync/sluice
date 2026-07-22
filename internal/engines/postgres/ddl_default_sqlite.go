@@ -39,13 +39,65 @@ const sqliteSourceDialect = "sqlite"
 // missing entry is a safe loud-drop, a wrong entry is silent schema drift,
 // so the map stays small and provably-portable.
 func translateSQLiteDefaultExpr(expr string) (string, bool) {
-	switch normalizeSQLiteDefaultExpr(expr) {
+	norm := normalizeSQLiteDefaultExpr(expr)
+	switch norm {
 	case "datetime('now')", "current_timestamp":
 		return "CURRENT_TIMESTAMP", true
 	case "date('now')", "current_date":
 		return "CURRENT_DATE", true
 	case "time('now')", "current_time":
 		return "CURRENT_TIME", true
+	}
+	return translateSQLiteStrftimeDefault(norm)
+}
+
+// strftimeNowDefaults maps the normalised `strftime(<fmt>,'now')`
+// spellings that have a provably-equivalent Postgres form.
+//
+// Scope is deliberately narrow: only the whole-format patterns whose
+// meaning is a CURRENT INSTANT rendered at a known precision. sluice
+// does not attempt general strftime→to_char translation — a partial
+// format string (`'%Y'` alone, say) yields a TEXT year on SQLite but
+// would need an explicit cast dance on PG, and guessing there is how a
+// DEFAULT silently changes meaning.
+//
+// Precision matters and is preserved: every one of these formats
+// renders to SECOND precision, whereas PG's bare `now()` carries
+// microseconds — so the second-truncating spelling is the faithful
+// translation, not `now()`. Borrowed from planetscale/cli#1299, which
+// hit the same class translating D1 imports.
+var strftimeNowDefaults = map[string]string{
+	// ISO-8601 with a literal Z. SQLite's 'now' is UTC, so the Z is
+	// accurate; PG's now() is tz-aware and the target column is
+	// timestamptz, which carries the zone itself.
+	"strftime('%y-%m-%dt%h:%m:%sz','now')": "date_trunc('second', now())",
+	"strftime('%y-%m-%d %h:%m:%s','now')":  "date_trunc('second', now())",
+	// Date-only / time-only whole formats.
+	"strftime('%y-%m-%d','now')": "CURRENT_DATE",
+	"strftime('%h:%m:%s','now')": "CURRENT_TIME",
+}
+
+// translateSQLiteStrftimeDefault translates the supported
+// `strftime(...)` DEFAULT spellings. Input is already normalised by
+// [normalizeSQLiteDefaultExpr] (parens stripped, whitespace removed,
+// lowercased), which is why the keys above carry no spaces and the
+// format specifiers appear lowercased — the normaliser lowercases the
+// whole token, so `%Y` arrives as `%y`. That is safe here because these
+// are matched against a fixed table and never re-emitted.
+//
+// `%s` (seconds-since-epoch) is handled separately: it produces a
+// NUMBER, not a timestamp, so it only makes sense on a numeric column
+// and maps to extract(epoch …). Emitting it for a temporal column would
+// be a type error, so it is translated only in its own arm and the
+// caller's column type governs whether that arm is reachable.
+func translateSQLiteStrftimeDefault(norm string) (string, bool) {
+	if pg, ok := strftimeNowDefaults[norm]; ok {
+		return pg, true
+	}
+	if norm == "strftime('%s','now')" {
+		// Integer seconds since the epoch. floor() matches SQLite's
+		// integer-second semantics; the surrounding column is numeric.
+		return "floor(extract(epoch from now()))", true
 	}
 	return "", false
 }

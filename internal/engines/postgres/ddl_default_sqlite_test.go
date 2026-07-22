@@ -62,7 +62,14 @@ func TestTranslateSQLiteDefaultExpr(t *testing.T) {
 
 	nonMappable := []string{
 		"julianday('now')",
-		"strftime('%Y-%m-%d', 'now')",
+		// NOTE: several strftime('now') spellings moved to the SUPPORTED
+		// set — see TestTranslateSQLiteStrftimeDefault. These remain
+		// non-portable: a PARTIAL format has no provably-equivalent PG
+		// form (guessing is how a DEFAULT silently changes meaning), and
+		// a non-'now' base is not a current-instant expression at all.
+		"strftime('%Y', 'now')",
+		"strftime('%Y-%m-%d', mycol)",
+		"strftime('%Y-%m-%d', 'now', '+1 month')",
 		"unixepoch('now')",
 		"datetime('now', '+1 day')", // modifier — not the bare "now"
 		"date('now', 'localtime')",
@@ -144,7 +151,7 @@ func TestEmitColumnDef_SQLiteDefaultPortableAndDrop(t *testing.T) {
 		Name:     "installed_on",
 		Type:     ir.Text{},
 		Nullable: false,
-		Default:  ir.DefaultExpression{Expr: "strftime('%s','now')", Dialect: "sqlite"},
+		Default:  ir.DefaultExpression{Expr: "randomblob(16)", Dialect: "sqlite"},
 	}
 	def, err = emitColumnDef(table, nonPortable, emitOpts{})
 	if err != nil {

@@ -42,29 +42,6 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/sqlite"
 )
 
-// skipUntilSQLiteCheckINSupported gates both pins. They are WRITTEN AND
-// CONFIRMED FAILING against the current tree (2026-07-22) — that is the
-// point of them — but a red integration job on main helps nobody, so
-// they are skipped until the fix lands.
-//
-// Confirmed failure on the pre-fix tree, for BOTH tests, at create-tables:
-//
-//	refuse loudly: CHECK constraint "" carries a non-portable SQLite
-//	expression "is_in IN (0, 1)" with no provably-equivalent Postgres
-//	translation
-//
-// Note the cause is NOT type coercion: `internal/translate/sqlite_expr.go`
-// has no `IN` node at all, so a portable `col IN (0,1)` cannot be parsed
-// and hits the catch-all refusal — blocking the migration outright, before
-// --infer-types is ever relevant.
-//
-// REMOVING THIS SKIP IS PART OF THE FIX'S DEFINITION OF DONE. See the
-// "SQLite CHECK-constraint `IN` support" roadmap entry.
-const skipUntilSQLiteCheckINSupported = "gap not yet fixed: the SQLite expression translator has no IN node, " +
-	"so a portable `CHECK (col IN (0,1))` is refused and the migration is blocked. " +
-	"These pins are confirmed-failing by design; un-skip them as part of the fix. " +
-	"See docs/dev/roadmap.md — SQLite CHECK-constraint IN support."
-
 // seedCheckDefaultSource writes a SQLite file exercising the SQLite
 // boolean idiom in every operator shape PG would reject after a BOOLEAN
 // promotion, plus the strftime() DEFAULT spellings.
@@ -117,8 +94,6 @@ func seedCheckDefaultSource(t *testing.T) string {
 // run itself errors in the deferred constraint phase because PG rejects
 // `CHECK (is_in IN (0,1))` against a BOOLEAN column.
 func TestMigrate_InferTypes_BooleanCheckConstraint_SQLiteToPostgres(t *testing.T) {
-	t.Skip(skipUntilSQLiteCheckINSupported)
-
 	src := seedCheckDefaultSource(t)
 	_, pgTarget, pgCleanup := startPostgres(t)
 	defer pgCleanup()
@@ -212,8 +187,6 @@ func TestMigrate_InferTypes_BooleanCheckConstraint_SQLiteToPostgres(t *testing.T
 // expression. The `plain_at` arm is the control — already translated
 // today, and must not regress.
 func TestMigrate_InferTypes_StrftimeDefault_SQLiteToPostgres(t *testing.T) {
-	t.Skip(skipUntilSQLiteCheckINSupported)
-
 	src := seedCheckDefaultSource(t)
 	_, pgTarget, pgCleanup := startPostgres(t)
 	defer pgCleanup()
