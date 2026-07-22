@@ -264,6 +264,53 @@ func TestClassifyReaderError_GRPCStatusCodes(t *testing.T) {
 	}
 }
 
+// A long-lived VStream that drops mid-flight surfaces the TRANSPORT-level
+// abnormal close as codes.Internal — which is deliberately NOT in the retriable
+// code set (a genuine vtgate Internal fault must stay terminal). Ground truth
+// (2026-07-22): a multi-day soak against real PlanetScale died with
+// `code = Internal desc = server closed the stream without sending trailers`
+// after ~17h of healthy streaming; it fell through TERMINAL, so the ADR-0038
+// retry loop never saw a retriable shape and the sync exited instead of
+// reopening from its persisted position.
+//
+// This pins the discriminator: the grpc-go-generated transport wordings are
+// retriable, while a vtgate-authored Internal message stays terminal. A grpc-go
+// rewording fails this pin rather than silently reverting to a fatal exit on a
+// routine drop.
+func TestClassifyReaderError_GRPCAbnormalStreamClose(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      codes.Code
+		msg       string
+		retriable bool
+	}{
+		{"Internal + server-closed-without-trailers (observed)", codes.Internal, "server closed the stream without sending trailers", true},
+		{"Internal + unexpected EOF", codes.Internal, "unexpected EOF", true},
+		{"Internal + RST_STREAM", codes.Internal, "stream terminated by RST_STREAM with error code: INTERNAL_ERROR", true},
+		{"Internal + genuine vtgate fault stays TERMINAL", codes.Internal, "vttablet: rpc error: internal server error executing query", false},
+		{"non-Internal code is not matched by this helper", codes.InvalidArgument, "server closed the stream without sending trailers", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// Wrap as the VStream pump does (cdc_vstream.go:1226).
+			raw := status.Error(c.code, c.msg)
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", raw)
+
+			got := classifyReaderError(wrapped)
+			var re ir.RetriableError
+			gotRetriable := errors.As(got, &re)
+			if gotRetriable != c.retriable {
+				t.Errorf("classifyReaderError(grpc %s %q) retriable=%v, want %v", c.code, c.msg, gotRetriable, c.retriable)
+			}
+			// The underlying status must stay reachable for diagnostics.
+			if st, ok := status.FromError(got); !ok || st.Code() != c.code {
+				t.Errorf("classifyReaderError lost the underlying status (ok=%v code=%v)", ok, st.Code())
+			}
+		})
+	}
+}
+
 // A VStream teardown on an operator `sync stop` (or Ctrl-C / outer-ctx cancel)
 // surfaces from Recv as a gRPC Canceled / DeadlineExceeded status. The reader
 // classifier normalizes those to the standard context sentinels so the

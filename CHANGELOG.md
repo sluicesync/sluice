@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed / Changed
+
+**A continuous `sync` no longer exits on a routine transient source-side error — it reconnects and resumes in process.** Long-running syncs were terminating on ordinary network/upstream blips that should have been retried, because the error never reached the retry loop in a shape it recognized. sluice's pipeline retries a CDC reader failure only when the error is classified as retriable (`ir.RetriableError`), and three real shapes were falling through as terminal — each observed killing a multi-day soak against real infrastructure:
+
+- **PlanetScale/Vitess (VStream):** a long-lived stream drop surfaces as gRPC `code = Internal desc = server closed the stream without sending trailers`. `Internal` is deliberately *not* in the retriable code set (a genuine vtgate fault must stay loud), so the transport-level abnormal-close wordings are now discriminated and classified retriable while a real `Internal` fault still fails fast.
+- **Cloudflare D1 (`d1-trigger` / `sqlite-trigger`):** the D1 HTTP transport had no classification at all, so a `TLS handshake timeout` — or a Cloudflare-side `HTTP 500` — ended the stream. Transport failures and the transient status family (408, 429, 5xx) are now retried; a 4xx meaning the *request* is wrong (bad token, missing database, malformed statement) stays terminal so a real misconfiguration still fails loudly.
+- **Postgres trigger-CDC (`pgtrigger`):** the same structural gap — a bare poll error with no classification — now classifies transport-level transients. (SQLSTATE-level transients such as `57P01` / `57P03` / `08006` are not yet covered and remain a follow-up.)
+
+No data was ever at risk from these: each failure was loud, the CDC position is durable, and every restart warm-resumed cleanly. The retry budget is unchanged (`--apply-retry-attempts`, default 8), so a genuinely persistent outage still exhausts it and fails loudly rather than spinning forever.
+
 ## [0.99.285] - 2026-07-20
 
 **Dependency and base-image maintenance — no functional change.** Routine updates to third-party Go dependencies and the runtime container's base image. sluice's own behavior is identical to v0.99.284; this release exists so the published binaries and the GHCR runtime image carry the current dependency set and the latest base-OS security patches.

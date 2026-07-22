@@ -157,8 +157,56 @@ func classifyReaderError(err error) error {
 		if isRetriableGRPCCode(st.Code()) {
 			return &retriableMySQLError{err: err}
 		}
+		// Transport-level abnormal stream close arrives as codes.Internal, which
+		// is deliberately NOT in the retriable code set (a genuine vtgate
+		// Internal fault must stay terminal). See
+		// [isGRPCAbnormalStreamCloseError] for why the narrow wording match is
+		// the right discriminator here.
+		if isGRPCAbnormalStreamCloseError(st) {
+			return &retriableMySQLError{err: err}
+		}
 	}
 	return classifyApplierError(err)
+}
+
+// isGRPCAbnormalStreamCloseError reports whether a gRPC status is the
+// TRANSPORT-level abnormal-close shape — the HTTP/2 stream died mid-flight
+// without a clean trailer/EOF handshake. grpc-go surfaces these as
+// codes.Internal, NOT as one of the [isRetriableGRPCCode] transients.
+//
+// # Why this is a separate matcher and not `codes.Internal` in the code set
+//
+// codes.Internal is overloaded: it is BOTH "the transport broke" and "the
+// server hit a genuine internal fault". Adding Internal wholesale to
+// [isRetriableGRPCCode] would retry real vtgate faults forever, masking them —
+// exactly what that function's doc warns against. So the transport subset is
+// discriminated by its (grpc-go-generated, not vtgate-authored) wording.
+//
+// # Ground truth (2026-07-22)
+//
+// A multi-day soak against real PlanetScale died with:
+//
+//	rpc error: code = Internal desc = server closed the stream without sending trailers
+//
+// after ~17h of healthy streaming — a routine long-lived-VStream drop. It fell
+// through as TERMINAL, so the ADR-0038 pipeline retry loop never saw a
+// retriable shape and the sync EXITED instead of reopening from its persisted
+// position. Data was never at risk (the position is durable and the restart
+// warm-resumed cleanly), but a continuous sync that dies on every routine
+// stream drop is not operationally usable. Classifying it retriable lets the
+// existing retry loop reopen the pump in process.
+//
+// Kept as a named helper (not inlined) so [TestClassifyReaderError_GRPCAbnormalStreamClose]
+// pins the exact wording set — a grpc-go rewording then fails the pin rather
+// than silently reverting to a fatal exit on a routine drop.
+func isGRPCAbnormalStreamCloseError(st *status.Status) bool {
+	if st.Code() != codes.Internal {
+		return false
+	}
+	msg := strings.ToLower(st.Message())
+	return strings.Contains(msg, "server closed the stream without sending trailers") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "stream terminated by rst_stream")
 }
 
 // isVStreamSchemaResolutionError reports whether err is the source

@@ -227,7 +227,16 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		}
 		fetched, newLast, ddl, err := r.poll(ctx, lastSeen)
 		if err != nil {
-			r.setErr(fmt.Errorf("pgtrigger: poll: %w", err))
+			// Classify network/transport transients (connection reset, EOF,
+			// i/o timeout) so the ADR-0038 pipeline retry loop reopens the pump
+			// instead of terminating a long-running poll on a routine blip.
+			// Anything else stays TERMINAL. Scope note: this covers the
+			// TRANSPORT level only — PG SQLSTATE-level transients (57P01
+			// admin_shutdown, 57P03 cannot_connect_now, 08006
+			// connection_failure) are NOT yet classified here, since the
+			// postgres engine's SQLSTATE classifier is package-private; that is
+			// a tracked follow-up, not covered by this change.
+			r.setErr(triggercdc.ClassifyTransient(fmt.Errorf("pgtrigger: poll: %w", err)))
 			return
 		}
 		if ddl != "" {

@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -343,7 +344,15 @@ func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("d1: query database %q: %w", c.databaseID, err)
+		// A transport-level failure (TLS handshake timeout, connection reset,
+		// dial timeout) is transient by construction: classify it so a
+		// long-running d1-trigger CDC poll retries in process instead of
+		// terminating the stream (ground-truthed 2026-07-22 — see
+		// triggercdc.IsTransientTransportError). A non-transient shape is
+		// returned unchanged and stays terminal.
+		return nil, triggercdc.ClassifyTransient(
+			fmt.Errorf("d1: query database %q: %w", c.databaseID, err),
+		)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -352,12 +361,24 @@ func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) 
 	// memory (the same cap the PlanetScale telemetry client uses).
 	body, err := io.ReadAll(io.LimitReader(resp.Body, d1MaxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("d1: read response from database %q: %w", c.databaseID, err)
+		// A truncated/reset response body mid-read is the same transient class
+		// as a failed dial — classify it so the CDC poll retries.
+		return nil, triggercdc.ClassifyTransient(
+			fmt.Errorf("d1: read response from database %q: %w", c.databaseID, err),
+		)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("d1: query database %q failed: HTTP %d: %s",
+		statusErr := fmt.Errorf("d1: query database %q failed: HTTP %d: %s",
 			c.databaseID, resp.StatusCode, truncateForError(body))
+		// Cloudflare-side hiccups (429 rate-limit, 5xx) clear on retry — the
+		// observed CDC-killer was a plain `HTTP 500 internal error`. A 4xx that
+		// means the REQUEST is wrong (bad token, missing database, malformed
+		// statement) stays terminal so a real misconfiguration fails loudly.
+		if triggercdc.RetriableHTTPStatus(resp.StatusCode) {
+			return nil, triggercdc.AsTransient(statusErr)
+		}
+		return nil, statusErr
 	}
 
 	var env d1Envelope
