@@ -136,6 +136,9 @@ func validateControlKeyspace(name string) error {
 //   - stop_requested_at (v0.3.0)
 //   - live_added_tables (v0.27.0, ADR-0034 MySQL Phase 2 mid-stream
 //     live add-table)
+//   - publication_name (ADR-0176 prerequisite chunk) — slot_name's
+//     cross-engine sibling; records the publication a PG-source
+//     stream reads through so warm resume ratchets onto it.
 //   - slot_name, source_dsn_fingerprint, target_schema (v0.32.2,
 //     cross-engine parity with PG control table) — close OBS-1: a
 //     cross-engine PG → MySQL live add-table with `--slot-name <name>`
@@ -186,6 +189,14 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "slot_name", "VARCHAR(255) NULL"); err != nil {
 		return err
 	}
+	// publication_name (ADR-0176 prerequisite chunk): slot_name's exact
+	// sibling — a PG-source sync can target ANY engine and the control
+	// table lives on the TARGET, so the recorded publication must be
+	// storable here too or the warm-resume ratchet would only work for
+	// PG→PG streams. NULL == "engine default publication" (legacy).
+	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "publication_name", "VARCHAR(255) NULL"); err != nil {
+		return err
+	}
 	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "source_dsn_fingerprint", "VARCHAR(255) NULL"); err != nil {
 		return err
 	}
@@ -218,6 +229,7 @@ func controlTableDDL(controlKeyspace string) string {
 		ON UPDATE CURRENT_TIMESTAMP,
 	stop_requested_at      TIMESTAMP    NULL,
 	slot_name              VARCHAR(255) NULL,
+	publication_name       VARCHAR(255) NULL,
 	source_dsn_fingerprint VARCHAR(255) NULL,
 	target_schema          VARCHAR(255) NULL,
 	rows_applied           BIGINT       NOT NULL DEFAULT 0,
@@ -735,6 +747,7 @@ func readPosition(ctx context.Context, db *sql.DB, controlKeyspace, streamID str
 func listStreams(ctx context.Context, db *sql.DB, controlKeyspace, engineName string) ([]ir.StreamStatus, error) {
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
+		"COALESCE(publication_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
 		"COALESCE(target_schema, ''), " +
 		"COALESCE(rows_applied, 0) " +
@@ -799,7 +812,8 @@ func isMySQLMissingTableErr(err error) bool {
 }
 
 // writePositionTx upserts the (streamID, token, slotName,
-// sourceFingerprint, targetSchema) row inside an open transaction.
+// publicationName, sourceFingerprint, targetSchema) row inside an open
+// transaction.
 // Called from the applier's per-change tx after the data write —
 // atomicity guarantees that progress and data move together.
 //
@@ -813,7 +827,7 @@ func isMySQLMissingTableErr(err error) bool {
 // untouched: a position write is the streamer making forward
 // progress, which must not clear an in-flight stop request.
 //
-// slotName / sourceFingerprint / targetSchema follow the
+// slotName / publicationName / sourceFingerprint / targetSchema follow the
 // COALESCE-tolerant shape the PG counterpart uses (v0.24.0, v0.25.0,
 // v0.25.1 — bridged to MySQL in v0.32.2 to close OBS-1): a non-empty
 // value overwrites the row's existing column; an empty value
@@ -838,7 +852,7 @@ func isMySQLMissingTableErr(err error) bool {
 // phase 2). 0 for a no-data position write (broker cold-start,
 // schema-delta-only incrementals, a Truncate/SchemaSnapshot serial
 // apply).
-func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64, upsert upsertSpelling) error {
+func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, publicationName, sourceFingerprint, targetSchema string, rowsApplied int64, upsert upsertSpelling) error {
 	// Sidecar-keyspace feature: when controlKeyspace is set, this UPSERT
 	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
 	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
@@ -849,7 +863,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// idempotent apply makes a torn resume safe (a position that committed
 	// without its data, or vice versa, replays cleanly on restart). Empty
 	// controlKeyspace is unchanged single-keyspace, genuinely atomic behaviour.
-	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert), streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied); err != nil {
+	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert), streamID, token, slotName, publicationName, sourceFingerprint, targetSchema, rowsApplied); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}
 	return nil
@@ -868,11 +882,12 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling) string {
 	ref := controlTableRef(controlKeyspace, controlTableName)
 	return "INSERT INTO " + ref + " " +
-		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)" +
+		"(stream_id, source_position, slot_name, publication_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)" +
 		upsert.clauseOpen() +
 		"source_position = " + upsert.newRowRef("source_position") + ", " +
 		"slot_name = COALESCE(" + upsert.newRowRef("slot_name") + ", " + ref + ".slot_name), " +
+		"publication_name = COALESCE(" + upsert.newRowRef("publication_name") + ", " + ref + ".publication_name), " +
 		"source_dsn_fingerprint = COALESCE(" + upsert.newRowRef("source_dsn_fingerprint") + ", " + ref + ".source_dsn_fingerprint), " +
 		"target_schema = COALESCE(" + upsert.newRowRef("target_schema") + ", " + ref + ".target_schema), " +
 		// rows_applied ACCUMULATES: add this write's delta to the existing

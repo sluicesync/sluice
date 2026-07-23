@@ -452,6 +452,15 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		dropErr := dropReplicationSlot(ctx, conn, r.slotName)
 		closeReplConnGraceful(conn)
 		r.replConn = nil
+		// Cleanup parity (ADR-0176 prerequisite): the same teardown
+		// that drops the just-created slot drops the stream's own
+		// per-stream publication — never the shared default, tolerant
+		// of absence, same best-effort posture as the slot drop.
+		if pubErr := dropOwnPublicationIfPerStream(ctx, r.db, r.publication); pubErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"postgres: cdc: warning: failed to drop per-stream publication %q after setup error: %v\n",
+				r.publication, pubErr)
+		}
 		if dropErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"postgres: cdc: warning: failed to auto-drop freshly-created slot %q after setup error: %v\n",
@@ -2288,6 +2297,133 @@ func removedFromPublication(members, incoming map[string]struct{}) []string {
 	return removed
 }
 
+// attributeClearedSurvivors returns the sorted members that SURVIVE
+// the rescope (present in both the current definition and the
+// incoming set) but currently carry a per-table attribute — a row
+// filter (prqual) or column list (prattrs) — that the incoming bare
+// `SET TABLE` list would silently CLEAR. This is the ADR-0176
+// prerequisite widening of the ADR-0175 guard: two identical table
+// SETS with differing per-table attributes are a scope conflict one
+// level down (a stream reading through its row filter would silently
+// start receiving — or a peer would stop filtering — every row).
+// sluice's own lists are always attribute-free today, so "survivor
+// has any attribute" IS "the definitions differ"; each entry names
+// the attribute so the refusal is operator-actionable.
+//
+// Pure, like [removedFromPublication], so the decision that gates a
+// refusal is testable without a database.
+func attributeClearedSurvivors(defs map[string]publicationMemberAttrs, incoming map[string]struct{}) []string {
+	var cleared []string
+	for m, attrs := range defs {
+		if _, keep := incoming[m]; !keep || attrs.bare() {
+			continue
+		}
+		detail := m
+		switch {
+		case attrs.Qual != "" && attrs.HasColumnList:
+			detail += " (row filter WHERE (" + attrs.Qual + ") + a column list)"
+		case attrs.Qual != "":
+			detail += " (row filter WHERE (" + attrs.Qual + "))"
+		default:
+			detail += " (a column list)"
+		}
+		cleared = append(cleared, detail)
+	}
+	sort.Strings(cleared)
+	return cleared
+}
+
+// memberKeySet projects a definition map down to the bare member-key
+// set [removedFromPublication] and [addTablesToPublication] speak.
+func memberKeySet(defs map[string]publicationMemberAttrs) map[string]struct{} {
+	keys := make(map[string]struct{}, len(defs))
+	for m := range defs {
+		keys[m] = struct{}{}
+	}
+	return keys
+}
+
+// publicationMemberAttrs carries one member table's per-table
+// publication attributes (PG 15+): the row-filter WHERE clause
+// (pg_publication_rel.prqual, rendered via pg_get_expr) and whether a
+// column list (prattrs) is attached. The zero value — no qual, no
+// column list — is the only definition sluice itself ever emits
+// today, which is exactly why a NON-zero value on a surviving member
+// makes a bare SET TABLE a definition change: the rescope would
+// silently CLEAR the attribute. On PG < 15 the catalog has no
+// attribute columns and every member reports the zero value.
+type publicationMemberAttrs struct {
+	Qual          string
+	HasColumnList bool
+}
+
+// bare reports whether the member carries no per-table attributes —
+// the only shape sluice's own SET TABLE lists can express.
+func (a publicationMemberAttrs) bare() bool {
+	return a.Qual == "" && !a.HasColumnList
+}
+
+// publicationMemberDefs returns the publication's current member
+// DEFINITIONS keyed "schema.table": each member's per-table attributes
+// on PG 15+ (prqual / prattrs, gated on [serverVersionNum] — the same
+// precedent as pgVersionFailoverSupport), the attribute-free zero
+// value on older servers where the columns don't exist. The ADR-0175
+// guard compares against these so two identical table SETS with
+// differing attributes still register as a scope conflict (the
+// ADR-0176 prerequisite widening).
+func publicationMemberDefs(ctx context.Context, db *sql.DB, name string) (map[string]publicationMemberAttrs, error) {
+	version, err := serverVersionNum(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: publication member definitions: %w", err)
+	}
+	memberQuery := `
+		SELECT n.nspname, c.relname, '' AS qual, false AS has_column_list
+		FROM   pg_publication p
+		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN   pg_class c            ON c.oid     = pr.prrelid
+		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
+		WHERE  p.pubname = $1`
+	if version >= pgVersionPublicationAttrs {
+		memberQuery = `
+		SELECT n.nspname, c.relname,
+		       COALESCE(pg_get_expr(pr.prqual, pr.prrelid), ''),
+		       pr.prattrs IS NOT NULL
+		FROM   pg_publication p
+		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN   pg_class c            ON c.oid     = pr.prrelid
+		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
+		WHERE  p.pubname = $1`
+	}
+	rows, err := db.QueryContext(ctx, memberQuery, name)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list publication member definitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	defs := make(map[string]publicationMemberAttrs)
+	for rows.Next() {
+		var (
+			nsp, rel string
+			attrs    publicationMemberAttrs
+		)
+		if err := rows.Scan(&nsp, &rel, &attrs.Qual, &attrs.HasColumnList); err != nil {
+			return nil, fmt.Errorf("postgres: scan publication member definition: %w", err)
+		}
+		defs[nsp+"."+rel] = attrs
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list publication member definitions: %w", err)
+	}
+	return defs, nil
+}
+
+// pgVersionPublicationAttrs is the first server version whose
+// pg_publication_rel carries per-table attributes (prqual row filters
+// + prattrs column lists) — PG 15. Below it the catalog columns don't
+// exist and the guard's definition comparison degrades to the member
+// SET, which is complete there (no attributes can exist to differ).
+const pgVersionPublicationAttrs = 150000
+
 // publicationMemberSet returns the publication's current member tables
 // keyed "schema.table". Shared by the ADR-0175 narrowing guard and by
 // [addTablesToPublication]'s duplicate skip so both agree on the key
@@ -2388,10 +2524,16 @@ func otherSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]st
 // (the FOR ALL TABLES demotion, where the current members aren't
 // enumerable from pg_publication_rel).
 //
-// No removal ⇒ no conflict, so widening and equal-scope rescopes never
-// reach the slot probe. That keeps the ADR-0122 fleet shape (identical
-// scopes) and `schema add-table` (additive) on their existing path at
-// zero added cost.
+// "Narrowing" is defined over the whole publication DEFINITION, not
+// the table set (the ADR-0176 prerequisite widening): a rescope
+// conflicts when it removes a member OR when a surviving member
+// carries a per-table attribute (PG 15+ row filter / column list)
+// that the incoming bare list would silently clear. No removal and no
+// attribute clearing ⇒ no conflict, so widening and equal-scope
+// rescopes of attribute-free publications never reach the slot probe.
+// That keeps the ADR-0122 fleet shape (identical scopes) and
+// `schema add-table` (additive) on their existing path at near-zero
+// added cost (one server_version_num read).
 func guardPublicationNarrowing(
 	ctx context.Context,
 	db *sql.DB,
@@ -2399,7 +2541,7 @@ func guardPublicationNarrowing(
 	incoming map[string]struct{},
 	excludeSlot string,
 ) error {
-	var removed []string
+	var removed, attrCleared []string
 	if incoming == nil {
 		// FOR ALL TABLES → scoped. Every table not in the new list
 		// loses scope; we can't enumerate them (a FOR ALL TABLES
@@ -2407,12 +2549,14 @@ func guardPublicationNarrowing(
 		// demotion itself as the removal.
 		removed = []string{"(every table — the publication is currently FOR ALL TABLES)"}
 	} else {
-		members, err := publicationMemberSet(ctx, db, name)
+		defs, err := publicationMemberDefs(ctx, db, name)
 		if err != nil {
 			return err
 		}
-		if removed = removedFromPublication(members, incoming); len(removed) == 0 {
-			return nil // widening or equal — nothing to protect
+		removed = removedFromPublication(memberKeySet(defs), incoming)
+		attrCleared = attributeClearedSurvivors(defs, incoming)
+		if len(removed) == 0 && len(attrCleared) == 0 {
+			return nil // widening or equal, with no attributes at risk — nothing to protect
 		}
 	}
 
@@ -2424,23 +2568,33 @@ func guardPublicationNarrowing(
 		return nil // no other stream holds a claim; the rescope is the operator's own
 	}
 
+	// Compose what the rescope would change: removed members, cleared
+	// per-table attributes (the ADR-0176 prerequisite widening), or both.
+	var changes []string
+	if len(removed) > 0 {
+		changes = append(changes, "REMOVE "+strings.Join(removed, ", ")+" from the stream")
+	}
+	if len(attrCleared) > 0 {
+		changes = append(changes, "silently CLEAR per-table attributes on "+strings.Join(attrCleared, ", "))
+	}
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCPublicationScopeConflict,
 		"pass --publication-name to give this stream its own publication, stop the other stream first, or drop its slot if abandoned",
 		fmt.Errorf(
-			"postgres: refusing to rescope publication %q: it would REMOVE %s from the stream, "+
+			"postgres: refusing to rescope publication %q: it would %s, "+
 				"but %d other sluice replication slot(s) exist on this source (%s). "+
 				"A slot — active or not — is a stream that is reading through this publication or "+
-				"holds a resumable position expecting its scope; nothing binds a publication to a "+
+				"holds a resumable position expecting its scope (including any per-table row filter "+
+				"or column list); nothing binds a publication to a "+
 				"slot, so this rescope would leave those stream(s) advancing normally (or resuming "+
-				"later) while receiving NOTHING for those tables — a silent divergence with a "+
+				"later) while receiving the WRONG change set — a silent divergence with a "+
 				"healthy-looking sync status. "+
 				"Recovery: give each concurrent stream over this source its own publication "+
 				"(--publication-name NAME, per stream), drain the other stream first "+
 				"(sluice sync stop --wait --stream-id ID), or — for a truly abandoned stream — "+
 				"drop its slot. See ADR-0175",
 			name,
-			strings.Join(removed, ", "),
+			strings.Join(changes, " and "),
 			len(slots),
 			strings.Join(slots, ", "),
 		),
@@ -2697,6 +2851,41 @@ func closeReplConnGraceful(conn *pgconn.PgConn) {
 // just created when a later setup step fails.
 func dropReplicationSlot(ctx context.Context, conn *pgconn.PgConn, name string) error {
 	return pglogrepl.DropReplicationSlot(ctx, conn, name, pglogrepl.DropReplicationSlotOptions{})
+}
+
+// dropOwnPublicationIfPerStream drops the stream's own PER-STREAM
+// publication in the same teardown that drops its replication slot
+// (ADR-0176 prerequisite chunk, cleanup parity): a per-stream
+// publication shares the slot's lifecycle, so whatever path discards
+// the slot must discard the publication too or dead publications
+// accumulate on the source. Two deliberate limits:
+//
+//   - The shared default (`sluice_pub`) is NEVER dropped — every
+//     legacy deployment reads through it, and it may serve other
+//     streams. Empty (engine default) is likewise a no-op.
+//   - IF EXISTS tolerates absence: an abandoned cold start can refuse
+//     before its publication was ever created, or a retry can find a
+//     prior attempt's cleanup already removed it.
+//
+// The known edge this accepts (matching the slot-drop posture): an
+// operator who deliberately pointed TWO streams at one custom
+// publication via --publication-name loses it when either stream's
+// pre-anchor teardown fires — the peer then fails LOUDLY
+// ("publication does not exist") and its next cold start recreates
+// scope, never silently diverges. Per-stream names (the default this
+// chunk introduces for filtered streams) are 1:1 by construction and
+// don't hit this.
+//
+// Best-effort like the slot drop: the caller logs/surfaces a failure
+// without letting it mask the primary error.
+func dropOwnPublicationIfPerStream(ctx context.Context, db *sql.DB, name string) error {
+	if name == "" || name == defaultPublication {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS "+quoteIdent(name)); err != nil {
+		return fmt.Errorf("postgres: drop per-stream publication %q: %w", name, err)
+	}
+	return nil
 }
 
 // openReplicationConn opens a pgconn.PgConn in replication=database

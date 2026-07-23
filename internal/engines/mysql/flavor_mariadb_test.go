@@ -579,10 +579,11 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 	t.Run("writePositionUpsertSQL", func(t *testing.T) {
 		got := writePositionUpsertSQL("", upsertValuesFunc)
 		want := "INSERT INTO `sluice_cdc_state` " +
-			"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-			"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) ON DUPLICATE KEY UPDATE " +
+			"(stream_id, source_position, slot_name, publication_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+			"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) ON DUPLICATE KEY UPDATE " +
 			"source_position = VALUES(source_position), " +
 			"slot_name = COALESCE(VALUES(slot_name), `sluice_cdc_state`.slot_name), " +
+			"publication_name = COALESCE(VALUES(publication_name), `sluice_cdc_state`.publication_name), " +
 			"source_dsn_fingerprint = COALESCE(VALUES(source_dsn_fingerprint), `sluice_cdc_state`.source_dsn_fingerprint), " +
 			"target_schema = COALESCE(VALUES(target_schema), `sluice_cdc_state`.target_schema), " +
 			"rows_applied = COALESCE(`sluice_cdc_state`.rows_applied, 0) + VALUES(rows_applied)"

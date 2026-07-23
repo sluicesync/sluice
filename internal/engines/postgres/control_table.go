@@ -99,6 +99,18 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add slot_name: %w", err)
 	}
+	// Migration path for pre-ADR-0176-prerequisite deployments: the
+	// publication_name column is slot_name's exact sibling — it records
+	// the publication the stream reads through, so a warm resume can
+	// ratchet onto the SAME publication the stream cold-started with
+	// without the operator re-passing --publication-name. NULL on
+	// legacy rows (== "engine default `sluice_pub`", byte-identical to
+	// pre-column behaviour); the position-write path UPSERTs the
+	// streamer's effective publication name on every apply tx.
+	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS publication_name TEXT NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure control table: add publication_name: %w", err)
+	}
 	// Migration path for pre-v0.25.0 deployments: the
 	// source_dsn_fingerprint column powers stream-id collision
 	// detection (ADR-0031). NULL on legacy rows; the streamer's
@@ -375,16 +387,18 @@ func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (tok
 // listStreams returns every row in the per-target control table via
 // the shared skeleton (missing relation → "no streams", so
 // `sluice sync status` works against a target that hasn't been a CDC
-// destination yet; COALESCE on slot_name / source_dsn_fingerprint /
-// target_schema so legacy NULL rows surface as empty strings — the
-// fingerprint check (ADR-0031) treats empty as "unknown — allow" and
-// the target_schema check (Bug 46) as "operator did not pass
-// --target-schema"). The Position values set Engine to the
-// engine-specific identifier for symmetry with ReadPosition's
-// contract.
+// destination yet; COALESCE on slot_name / publication_name /
+// source_dsn_fingerprint / target_schema so legacy NULL rows surface
+// as empty strings — the fingerprint check (ADR-0031) treats empty as
+// "unknown — allow", the target_schema check (Bug 46) as "operator
+// did not pass --target-schema", and an empty publication_name as
+// "engine default publication" (ADR-0176 prerequisite)). The Position
+// values set Engine to the engine-specific identifier for symmetry
+// with ReadPosition's contract.
 func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
+		"COALESCE(publication_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
 		"COALESCE(target_schema, ''), " +
 		"COALESCE(rows_applied, 0) " +
@@ -415,6 +429,14 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // previously-recorded value (chain handoff via WritePosition doesn't
 // know the streamer's slot; the row's existing slot_name stays put).
 //
+// publicationName is slot_name's exact sibling (ADR-0176 prerequisite
+// chunk): the publication the stream reads through on a PG source,
+// recorded so warm resume ratchets onto the same publication without
+// the operator re-passing --publication-name. Same COALESCE-tolerant
+// shape: non-empty overwrites, empty preserves (legacy streams and
+// non-PG sources record nothing, and the row stays NULL == "engine
+// default publication").
+//
 // sourceFingerprint carries the streamer's source DSN fingerprint
 // (ADR-0031) on the same COALESCE-tolerant pattern: non-empty
 // overwrites; empty preserves the row's existing value. Powers
@@ -433,8 +455,8 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // makes durable; it is ADDED to the row's cumulative rows_applied in the
 // SAME upsert so the counter advances atomically with the position
 // (ADR-0156 phase 2). 0 for a no-data position write.
-func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) error {
-	q, args := buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied)
+func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, publicationName, sourceFingerprint, targetSchema string, rowsApplied int64) error {
+	q, args := buildWritePositionSQL(schema, streamID, token, slotName, publicationName, sourceFingerprint, targetSchema, rowsApplied)
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 		return fmt.Errorf("postgres: write position: %w", err)
 	}
@@ -448,26 +470,27 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 // preservation semantics single-sourced — the two callers cannot drift.
 //
 // COALESCE on the conflict path lets a non-empty slotName /
-// sourceFingerprint / targetSchema overwrite, while an empty value falls
-// back to whichever value the existing row already carries — so a
-// chain-handoff position-write that lacks streamer context doesn't clobber
-// the streamer's previously-recorded values.
-func buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) (stmt string, args []any) {
+// publicationName / sourceFingerprint / targetSchema overwrite, while an
+// empty value falls back to whichever value the existing row already
+// carries — so a chain-handoff position-write that lacks streamer context
+// doesn't clobber the streamer's previously-recorded values.
+func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, sourceFingerprint, targetSchema string, rowsApplied int64) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
-	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), $6) " +
+	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, publication_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
 		"updated_at = EXCLUDED.updated_at, " +
 		"slot_name = COALESCE(EXCLUDED.slot_name, " + tableRef + ".slot_name), " +
+		"publication_name = COALESCE(EXCLUDED.publication_name, " + tableRef + ".publication_name), " +
 		"source_dsn_fingerprint = COALESCE(EXCLUDED.source_dsn_fingerprint, " + tableRef + ".source_dsn_fingerprint), " +
 		"target_schema = COALESCE(EXCLUDED.target_schema, " + tableRef + ".target_schema), " +
 		// rows_applied ACCUMULATES: add this write's delta to the existing
 		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
 		// means the column is never NULL post-migration). EXCLUDED.rows_applied
-		// is the $6 delta, NOT a replacement value.
+		// is the $7 delta, NOT a replacement value.
 		"rows_applied = COALESCE(" + tableRef + ".rows_applied, 0) + EXCLUDED.rows_applied"
-	return q, []any{streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied}
+	return q, []any{streamID, token, slotName, publicationName, sourceFingerprint, targetSchema, rowsApplied}
 }
 
 // readStopRequested returns true when the named stream's row has a

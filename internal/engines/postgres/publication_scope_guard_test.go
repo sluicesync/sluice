@@ -94,6 +94,105 @@ func TestRemovedFromPublication(t *testing.T) {
 	}
 }
 
+// defSet builds a definition map with attribute-free members.
+func defSet(keys ...string) map[string]publicationMemberAttrs {
+	m := make(map[string]publicationMemberAttrs, len(keys))
+	for _, k := range keys {
+		m[k] = publicationMemberAttrs{}
+	}
+	return m
+}
+
+// TestAttributeClearedSurvivors pins the ADR-0176 prerequisite
+// widening of the guard: two identical table SETS with differing
+// per-table attributes (a row filter / column list on the current
+// definition that the incoming bare SET TABLE would clear) count as a
+// scope conflict — and, just as load-bearing, an attribute-free
+// equal/widening rescope must NOT fire (every shipped shape today).
+func TestAttributeClearedSurvivors(t *testing.T) {
+	tests := []struct {
+		name     string
+		defs     map[string]publicationMemberAttrs
+		incoming map[string]struct{}
+		want     []string
+	}{
+		{
+			name:     "same set, no attributes — no fire (every shipped shape)",
+			defs:     defSet("public.orders", "public.items"),
+			incoming: keySet("public.orders", "public.items"),
+			want:     nil,
+		},
+		{
+			name: "same set, surviving member carries a row filter — fire",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(country = 'US'::text)"},
+				"public.items":  {},
+			},
+			incoming: keySet("public.orders", "public.items"),
+			want:     []string{"public.orders (row filter WHERE ((country = 'US'::text)))"},
+		},
+		{
+			name: "same set, surviving member carries a column list — fire",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {HasColumnList: true},
+			},
+			incoming: keySet("public.orders"),
+			want:     []string{"public.orders (a column list)"},
+		},
+		{
+			name: "both attributes on one survivor — one entry naming both",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(id > 5)", HasColumnList: true},
+			},
+			incoming: keySet("public.orders"),
+			want:     []string{"public.orders (row filter WHERE ((id > 5)) + a column list)"},
+		},
+		{
+			name: "attribute on a REMOVED member is not double-reported here",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(id > 5)"},
+			},
+			incoming: keySet("public.users"),
+			want:     nil, // removedFromPublication reports public.orders; this arm only guards survivors
+		},
+		{
+			name: "widening past an attribute-bearing survivor still fires",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(id > 5)"},
+			},
+			incoming: keySet("public.orders", "public.users"),
+			want:     []string{"public.orders (row filter WHERE ((id > 5)))"},
+		},
+		{
+			name:     "results are sorted for a stable refusal message",
+			defs:     map[string]publicationMemberAttrs{"public.zeta": {HasColumnList: true}, "public.alpha": {HasColumnList: true}},
+			incoming: keySet("public.zeta", "public.alpha"),
+			want:     []string{"public.alpha (a column list)", "public.zeta (a column list)"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := attributeClearedSurvivors(tc.defs, tc.incoming)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("attributeClearedSurvivors() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMemberKeySet pins the projection the guard feeds to
+// removedFromPublication — a drift here would silently change which
+// arm of the definition comparison sees which members.
+func TestMemberKeySet(t *testing.T) {
+	defs := map[string]publicationMemberAttrs{
+		"public.orders": {Qual: "(id > 5)"},
+		"public.items":  {},
+	}
+	if got, want := memberKeySet(defs), keySet("public.orders", "public.items"); !reflect.DeepEqual(got, want) {
+		t.Errorf("memberKeySet() = %v, want %v", got, want)
+	}
+}
+
 // TestQualifiedTableKeys pins that the guard's incoming-key shape
 // matches publicationMemberSet's "schema.table" keying — if these ever
 // diverge the guard silently classifies EVERY rescope as narrowing

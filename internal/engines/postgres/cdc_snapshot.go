@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -344,22 +345,8 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 			firstErr = err
 		}
 		if dropSlot {
-			// Bug 177: an abandoned cold start (refusal / setup failure
-			// before the CDC anchor persisted) must not orphan the slot
-			// it just created — the leftover pins source WAL and breaks
-			// the refusal's own preferred recovery on "slot already
-			// exists". A failed drop is LOUD: named manual command, and
-			// the error surfaces to the caller.
-			if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", slotName); err != nil {
-				slog.WarnContext(
-					context.Background(), "postgres: snapshot abandon: dropping the just-created replication slot failed; drop it manually to release WAL",
-					slog.String("slot", slotName),
-					slog.String("manual_drop", fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)),
-					slog.String("error", err.Error()),
-				)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("postgres: snapshot abandon: drop replication slot %q: %w", slotName, err)
-				}
+			if err := abandonDropSourceObjects(db, slotName, e.publicationName()); err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
 		if err := db.Close(); err != nil && firstErr == nil {
@@ -374,6 +361,42 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// that gate.
 	stream.AbandonFn = func() error { return closeAll(true) }
 	return stream, nil
+}
+
+// abandonDropSourceObjects is the Abandon path's source-side cleanup:
+// drop the just-created replication slot (Bug 177 — an abandoned cold
+// start must not orphan a WAL-pinning slot, and the leftover breaks
+// the refusal's own preferred recovery on "slot already exists") and,
+// with it, the stream's own PER-STREAM publication (ADR-0176
+// prerequisite, cleanup parity — same lifecycle, same teardown; never
+// the shared `sluice_pub` default, which other streams may read
+// through, and tolerant of absence). Failures are LOUD: each names
+// the manual command, and the first error is returned to the caller.
+// Uses context.Background() because the abandon runs on already-
+// cancelled error paths.
+func abandonDropSourceObjects(db *sql.DB, slotName, publication string) error {
+	var firstErr error
+	if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", slotName); err != nil {
+		slog.WarnContext(
+			context.Background(), "postgres: snapshot abandon: dropping the just-created replication slot failed; drop it manually to release WAL",
+			slog.String("slot", slotName),
+			slog.String("manual_drop", fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)),
+			slog.String("error", err.Error()),
+		)
+		firstErr = fmt.Errorf("postgres: snapshot abandon: drop replication slot %q: %w", slotName, err)
+	}
+	if err := dropOwnPublicationIfPerStream(context.Background(), db, publication); err != nil {
+		slog.WarnContext(
+			context.Background(), "postgres: snapshot abandon: dropping the per-stream publication failed; drop it manually",
+			slog.String("publication", publication),
+			slog.String("manual_drop", fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", quoteIdent(publication))),
+			slog.String("error", err.Error()),
+		)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // closer is the local view of io.Closer for the CDC reader cleanup

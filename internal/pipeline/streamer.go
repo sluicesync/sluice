@@ -230,6 +230,16 @@ type Streamer struct {
 	// (its `ALTER PUBLICATION ... SET TABLE` replaces the member set
 	// atomically). Set this per stream — alongside SlotName — whenever
 	// several streams run against one Postgres source. ADR-0175.
+	//
+	// Empty does NOT always mean the shared engine default any more
+	// (ADR-0176 prerequisite chunk): [phaseResolvePublicationScope]
+	// ratchets an empty value onto the publication recorded in the
+	// stream's sluice_cdc_state row (warm-resume continuity), and a
+	// genuinely NEW stream with a `--where` row filter derives a
+	// per-stream default (`sluice_<stream-id>`). A stream with no
+	// record and no filter keeps the shared `sluice_pub` default —
+	// byte-identical to before. An explicit value here always wins
+	// (and updates the record, WARNing when they differ).
 	PublicationName string
 
 	// DryRun, when true, prints what Run would do (cold-start vs
@@ -1632,6 +1642,18 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// source-fingerprint check (2.7) — in that order; all skipped on
 	// dry-run.
 	if err := s.phasePrepareControlTable(ctx, applier, streamID); err != nil {
+		return err
+	}
+
+	// ---- 2.8. Resolve the stream's EFFECTIVE publication (ADR-0176
+	// prerequisite chunk) ----
+	// The recorded-name ratchet + the per-stream default for NEW
+	// filtered PG-source streams. Runs after the control table is
+	// prepared (the record lives there) and before any source
+	// connection opens (the publication name rides EnsurePublication
+	// and every START_REPLICATION). No-op for sources without a
+	// publication concept.
+	if err := s.phaseResolvePublicationScope(ctx, applier, streamID); err != nil {
 		return err
 	}
 

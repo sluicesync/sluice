@@ -194,6 +194,19 @@ type ChangeApplier struct {
 	// the row's existing slot_name is preserved on the conflict path.
 	slotName string
 
+	// publicationName is the publication the active stream reads
+	// through, set by [SetPublicationName] at Streamer startup —
+	// slotName's exact sibling (ADR-0176 prerequisite chunk). Threaded
+	// into every [writePositionTx] call so the per-target
+	// sluice_cdc_state row's publication_name column records which
+	// publication the stream cold-started with; warm resume reads it
+	// back (via ListStreams) to ratchet onto the same publication
+	// without the operator re-passing --publication-name. Empty when
+	// the streamer never set it (legacy streams on the engine-default
+	// `sluice_pub`, non-PG sources, broker chain-handoff); the row's
+	// existing value is preserved on the conflict path.
+	publicationName string
+
 	// sourceFingerprint is the truncated SHA-256 hex of the streamer's
 	// source DSN host+port+database tuple, set by
 	// [SetSourceDSNFingerprint] at Streamer startup. Threaded into
@@ -1083,7 +1096,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, 0)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, 0)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1110,6 +1123,22 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 // fill it in before calling.
 func (a *ChangeApplier) SetSlotName(slotName string) {
 	a.slotName = slotName
+}
+
+// SetPublicationName records the active stream's effective publication
+// name on the applier so subsequent position-writes (Apply +
+// WritePosition + the batched/pipelined/concurrent apply paths)
+// populate the sluice_cdc_state row's publication_name column —
+// slot_name's exact sibling (ADR-0176 prerequisite chunk). Warm resume
+// reads the recorded value back via [ListStreams] to ratchet onto the
+// same publication the stream cold-started with.
+//
+// Idempotent — the streamer may call this on every Run. Empty input is
+// allowed (no-op set) and means the engine-default publication
+// (`sluice_pub`) / a non-PG source; the COALESCE pattern in
+// writePositionTx preserves any previously-recorded value in that case.
+func (a *ChangeApplier) SetPublicationName(name string) {
+	a.publicationName = name
 }
 
 // SetSchema implements [ir.SchemaSetter]. Records the per-source
@@ -1303,7 +1332,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
 		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
+		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()

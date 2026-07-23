@@ -1738,6 +1738,19 @@ type StreamStatus struct {
 	// default `sluice_slot` is the caller's responsibility).
 	SlotName string
 
+	// PublicationName is the publication the stream reads through on
+	// engines with a shared source-side filter object (Postgres) —
+	// slot_name's exact sibling (ADR-0176 prerequisite chunk).
+	// Recorded by the applier on each position-write so a warm resume
+	// can ratchet onto the SAME publication the stream cold-started
+	// with, without the operator re-passing --publication-name. Empty
+	// means the engine default (`sluice_pub`) — the legacy shape for
+	// engines without publications (MySQL family), rows that pre-date
+	// the column, and streams that never used a per-stream
+	// publication; empty is deliberately the zero-value-safe "behave
+	// byte-identically to before" signal.
+	PublicationName string
+
 	// SourceDSNFingerprint is the truncated SHA-256 hex of the
 	// stream's source DSN host+port+database tuple, recorded by the
 	// streamer on `sync start` (ADR-0031). Used for stream-id

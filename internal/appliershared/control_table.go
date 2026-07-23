@@ -138,8 +138,8 @@ func ReadPosition(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, quer
 // destination yet.
 //
 // query is the engine-built SELECT over (stream_id, source_position,
-// updated_at, slot_name, source_dsn_fingerprint, target_schema,
-// rows_applied) with COALESCE(”) on the string columns and
+// updated_at, slot_name, publication_name, source_dsn_fingerprint,
+// target_schema, rows_applied) with COALESCE(”) on the string columns and
 // COALESCE(…, 0) on rows_applied, so legacy rows that pre-date those
 // columns surface as empty strings / 0 in the StreamStatus — callers
 // branch on empty-string rather than handling sql.NullString. The
@@ -175,11 +175,12 @@ func ListStreams(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, query
 			token        string
 			updated      time.Time
 			slotName     string
+			publication  string
 			fingerprint  string
 			targetSchema string
 			rowsApplied  int64
 		)
-		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint, &targetSchema, &rowsApplied); err != nil {
+		if err := rows.Scan(&streamID, &token, &updated, &slotName, &publication, &fingerprint, &targetSchema, &rowsApplied); err != nil {
 			return nil, fmt.Errorf("%s: scan streams: %w", cfg.EngineName, err)
 		}
 		out = append(out, ir.StreamStatus{
@@ -187,6 +188,7 @@ func ListStreams(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, query
 			Position:             ir.Position{Engine: positionEngine, Token: token},
 			UpdatedAt:            updated,
 			SlotName:             slotName,
+			PublicationName:      publication,
 			SourceDSNFingerprint: fingerprint,
 			TargetSchema:         targetSchema,
 			RowsApplied:          rowsApplied,

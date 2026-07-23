@@ -125,7 +125,7 @@ func TestEnsureControlTable_WidensPositionColumnsToLongText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "", "big-stream", bigToken, "", "", "", 0, upsertRowAlias); err != nil {
+	if err := writePositionTx(ctx, tx, "", "big-stream", bigToken, "", "", "", "", 0, upsertRowAlias); err != nil {
 		t.Fatalf("writePositionTx with >64KB token: %v", err)
 	}
 	if err := tx.Commit(); err != nil {

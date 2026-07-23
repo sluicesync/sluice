@@ -264,6 +264,13 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	// receives our slot name; an empty publication keeps the engine
 	// default, so behaviour for streams that never pass the flag is
 	// byte-identical to before.
+	//
+	// NOT the final word: [phaseResolvePublicationScope] (runOnce step
+	// 2.8, after the applier opens) may re-push with the RECORDED or
+	// DERIVED per-stream name once the control row is readable — the
+	// ADR-0176 prerequisite ratchet. This early push exists so every
+	// path that runs before that phase already carries the explicit
+	// flag + own-slot exclusion.
 	if resolved := resolvePublicationName(s.PublicationName); resolved != s.PublicationName {
 		slog.InfoContext(
 			ctx, "applying sluice publication-name prefix convention",
