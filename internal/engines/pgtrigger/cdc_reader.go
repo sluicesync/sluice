@@ -227,16 +227,18 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		}
 		fetched, newLast, ddl, err := r.poll(ctx, lastSeen)
 		if err != nil {
-			// Classify network/transport transients (connection reset, EOF,
-			// i/o timeout) so the ADR-0038 pipeline retry loop reopens the pump
-			// instead of terminating a long-running poll on a routine blip.
-			// Anything else stays TERMINAL. Scope note: this covers the
-			// TRANSPORT level only — PG SQLSTATE-level transients (57P01
-			// admin_shutdown, 57P03 cannot_connect_now, 08006
-			// connection_failure) are NOT yet classified here, since the
-			// postgres engine's SQLSTATE classifier is package-private; that is
-			// a tracked follow-up, not covered by this change.
-			r.setErr(triggercdc.ClassifyTransient(fmt.Errorf("pgtrigger: poll: %w", err)))
+			// Classify transients so the ADR-0038 pipeline retry loop reopens
+			// the pump instead of terminating a long-running poll on a routine
+			// blip. Two legs: PG SQLSTATE connection-availability transients
+			// (57P01/57P02/57P03 + class 08 — a server restart / standby
+			// promotion; the v0.99.286 tracked follow-up, closed via the
+			// exported postgres.IsReadTransientSQLState predicate +
+			// AsTransient, which exists for exactly this
+			// caller-holds-the-structured-signal case) and the shared
+			// network/transport shapes (connection reset, EOF, i/o timeout).
+			// Anything else stays TERMINAL — notably a missing change-log
+			// table (42P01), which is an operator/setup fault.
+			r.setErr(classifyPollError(err))
 			return
 		}
 		if ddl != "" {
@@ -269,6 +271,20 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			timer.Reset(r.pollInterval)
 		}
 	}
+}
+
+// classifyPollError wraps a change-log poll failure for the pipeline retry
+// loop: retriable when it carries a PG connection-availability SQLSTATE
+// (57P01/57P02/57P03, class 08 — the structured leg the caller judges via
+// the postgres predicate) or a shared transient transport shape; terminal
+// otherwise. Pulled out of pump so both legs are pinned without a live
+// poll loop.
+func classifyPollError(err error) error {
+	wrapped := fmt.Errorf("pgtrigger: poll: %w", err)
+	if postgres.IsReadTransientSQLState(err) {
+		return triggercdc.AsTransient(wrapped)
+	}
+	return triggercdc.ClassifyTransient(wrapped)
 }
 
 // pollQuery renders the one-poll fetch with the §2 safety-lag

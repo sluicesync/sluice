@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A Postgres server restart or standby promotion under a `postgres-trigger` source now reconnects instead of exiting the sync.** The v0.99.286 trigger-CDC hardening classified network/transport transients on the change-log poll but explicitly deferred the SQLSTATE level: a poll failing with `57P01` (admin_shutdown), `57P02`/`57P03` (crash shutdown / cannot connect now), or a class-08 connection exception — exactly what a managed-PG maintenance restart or failover produces — still surfaced unclassified and terminated the stream. Those shapes now ride the same bounded retry budget, via a narrow exported predicate on the postgres engine so the trigger engine and the applier can never drift on what "connection-availability transient" means. Deliberately narrower than the applier's set: a missing change-log table (`42P01`) and auth failures stay terminal — retrying those masks an operator error.
+
+Also hardened the slot-loss integration test against a walsender release race (the v0.99.288 tag-CI flake: the test's own `pg_drop_replication_slot` ran before Postgres marked the slot inactive, `SQLSTATE 55006`) — the drop now retries until the walsender lets go. Test-only; no product change.
+
 ## [0.99.288] - 2026-07-22
 
 **Operational resilience, found by running sluice's own multi-day soaks — plus a new proactive target-health advisory family.** A transient network blip while a sync retry re-establishes its connections no longer kills the stream (caught live on the 2026-07-22 scale-soak), a cancelled D1 `--stage-local` stage now reports a stable error identity (the v0.99.287 tag-CI flake), and two new opt-in `--notify-*` rules watch the Postgres TARGET for autovacuum falling behind and transaction-ID wraparound headroom. If you run continuous sync for days at a time, upgrade.

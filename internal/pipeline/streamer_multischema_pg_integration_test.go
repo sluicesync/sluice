@@ -30,9 +30,12 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/engines"
 
@@ -650,8 +653,24 @@ func dropSluiceSlots(t *testing.T, dsn string) int {
 	}
 	_ = rows.Close()
 	for _, n := range names {
-		if _, err := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", n); err != nil {
-			t.Fatalf("drop slot %q: %v", n, err)
+		// The walsender releases the slot ASYNCHRONOUSLY after its client
+		// disconnects: the streamer's Run returning does NOT mean
+		// pg_replication_slots.active has flipped yet, and a drop in that
+		// window fails with 55006 object_in_use ("slot is active for PID
+		// …") — the v0.99.288 tag-CI flake. Retry the drop until the
+		// walsender lets go; anything other than 55006 is a real failure.
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			_, err := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", n)
+			if err == nil {
+				break
+			}
+			var pgErr *pgconn.PgError
+			stillActive := errors.As(err, &pgErr) && pgErr.Code == "55006"
+			if !stillActive || time.Now().After(deadline) {
+				t.Fatalf("drop slot %q: %v", n, err)
+			}
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 	return len(names)
