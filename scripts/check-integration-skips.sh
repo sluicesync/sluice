@@ -24,7 +24,7 @@
 #   - TestLoadColumnTypes_Bug97VerbatimEligibleTypes: gated on the
 #     PG_PROBE_DSN env var (a live-probe characterization test), never
 #     set in shard CI.
-#   - TestChainRestore_CrossEngine_PostGISNowSupported: retired,
+#   - TestChainRestore_CrossEnginePostGISNowSupported: retired,
 #     documented unconditional skip (points at the postgis-tagged suite).
 #   - TestStreamer_SchemaForward_DropNotNull_PG: documented PG
 #     limitation (pgoutput omits the nullability flag), unconditional.
@@ -45,7 +45,7 @@
 ALLOWED_SKIPS='
 ^TestMigrate_Corpus_
 ^TestLoadColumnTypes_Bug97VerbatimEligibleTypes$
-^TestChainRestore_CrossEngine_PostGISNowSupported$
+^TestChainRestore_CrossEnginePostGISNowSupported$
 ^TestStreamer_SchemaForward_DropNotNull_PG$
 ^TestBackup_SignedManifest_DR_RoundTripAndTamper(/|$)
 ^TestConnectionSlotClassifier_RealPG53300$
