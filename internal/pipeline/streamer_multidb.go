@@ -100,7 +100,7 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 
 	all, err := lister.ListDatabases(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: list source databases: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: list source databases: %w", err))
 	}
 
 	// Resolve the selected SOURCE set (ADR-0142: map-only ⇒ the map keys ARE
@@ -548,7 +548,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
+		return connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	migcore.ApplyTableScope(sr, s.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
@@ -634,7 +634,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	sw, err := s.Target.OpenSchemaWriter(ctx, targetDSN)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer for %q: %w", database, err))
+		return connectHint(fmt.Errorf("pipeline: open target schema writer for %q: %w", database, err))
 	}
 	migcore.ApplyTargetSchema(sw, targetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -644,7 +644,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	rw, err := s.Target.OpenRowWriter(ctx, targetDSN)
 	if err != nil {
 		migcore.CloseIf(sw)
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
+		return connectHint(fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
 	}
 	migcore.ApplyTargetSchema(rw, targetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)

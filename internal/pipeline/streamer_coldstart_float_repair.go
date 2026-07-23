@@ -231,7 +231,7 @@ func (s *Streamer) repairColdStartFloats(ctx context.Context, plan []floatRepair
 
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: float repair: open target writer: %w", err))
+		return connectHint(fmt.Errorf("pipeline: float repair: open target writer: %w", err))
 	}
 	defer migcore.CloseIf(rw)
 	migcore.ApplyTargetSchema(rw, s.TargetSchema)

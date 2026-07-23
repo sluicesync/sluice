@@ -135,19 +135,19 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		// ADR-0054 Shape A Phase 2: engage live-coordination lease
 		// manager when the operator's flags + target engine allow.
 		if err := s.engageShardCoordination(ctx, s.Applier); err != nil {
-			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
+			return nil, false, connectHint(err)
 		}
 		// ADR-0058: engage single-stream ADD COLUMN forwarding when
 		// the operator opts in and Shape A is NOT engaged. No-op
 		// otherwise.
 		if err := s.engageAddColumnForward(ctx); err != nil {
-			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
+			return nil, false, connectHint(err)
 		}
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
 	if err != nil {
-		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
+		return nil, false, connectHint(fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
 	migcore.ApplyMaxBufferBytes(a, s.MaxBufferBytes)
 	migcore.ApplyTargetSchema(a, s.TargetSchema)
@@ -163,14 +163,14 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	// manager when the operator's flags + target engine allow.
 	if err := s.engageShardCoordination(ctx, a); err != nil {
 		migcore.CloseIf(a)
-		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
+		return nil, false, connectHint(err)
 	}
 	// ADR-0058: engage single-stream ADD COLUMN forwarding when
 	// the operator opts in and Shape A is NOT engaged. No-op
 	// otherwise.
 	if err := s.engageAddColumnForward(ctx); err != nil {
 		migcore.CloseIf(a)
-		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
+		return nil, false, connectHint(err)
 	}
 	return a, true, nil
 }

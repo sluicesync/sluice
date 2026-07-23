@@ -103,7 +103,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if pe, ok := s.Source.(publicationEnsurer); ok {
 		tables := migcore.TableNamesForPublication(schema)
 		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
-			return nil, stop, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
+			return nil, stop, connectHint(fmt.Errorf("pipeline: ensure publication scope: %w", err))
 		}
 	}
 
@@ -218,11 +218,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, []string, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sr)
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
@@ -233,7 +233,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		migcore.CloseIf(sr)
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		migcore.CloseIf(sr)
@@ -545,7 +545,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Abandon()
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -554,13 +554,13 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
+		return nil, nil, connectHint(fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(rw, s.TargetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)

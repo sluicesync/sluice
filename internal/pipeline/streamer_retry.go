@@ -154,11 +154,23 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// has to come AFTER the retriable check now.
 		re, retriable := classifyRetriable(err)
 		if !retriable {
-			// Includes bare context.Canceled / context.DeadlineExceeded
-			// (genuine ctx termination) and any non-retriable failure.
-			// Returning err preserves the pre-v0.52.2 behaviour for
-			// these shapes (callers branch on errors.Is themselves).
-			return err
+			// Connect-phase fall-through (the 2026-07-22 scale-soak
+			// incident): a retry attempt has to RE-ESTABLISH its
+			// connections, and a transient network failure there carries
+			// no engine [ir.RetriableError] — pre-fix it returned terminal
+			// right here, so a blip that outlived one attempt killed the
+			// stream even though the NEXT attempt's warm resume would have
+			// succeeded. A [connectPhaseError]-marked failure with a
+			// positively-matched transient shape falls through to the SAME
+			// budget + backoff below (re stays nil → no engine hint); every
+			// other shape returns terminal exactly as before.
+			if !isRetriableConnectFailure(err) {
+				// Includes bare context.Canceled / context.DeadlineExceeded
+				// (genuine ctx termination) and any non-retriable failure.
+				// Returning err preserves the pre-v0.52.2 behaviour for
+				// these shapes (callers branch on errors.Is themselves).
+				return err
+			}
 		}
 
 		// Clear ResetTargetData after the first iteration so a
@@ -244,7 +256,14 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 				consecutive, afterPos.Token, err)
 		}
 
-		backoff := computeRetryBackoff(consecutive, base, maxBackoff, re.RetryHint())
+		// re is nil on the connect-transient fall-through (no engine
+		// classifier, hence no hint) — the policy's exponential schedule
+		// alone owns that backoff.
+		var hint time.Duration
+		if re != nil {
+			hint = re.RetryHint()
+		}
+		backoff := computeRetryBackoff(consecutive, base, maxBackoff, hint)
 		slog.InfoContext(
 			ctx, "applier: transient error; retrying",
 			slog.String("stream_id", streamID),
