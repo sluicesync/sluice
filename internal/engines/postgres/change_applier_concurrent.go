@@ -246,7 +246,11 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			la.a.warnPipelineFallbackOnce(ctx, err)
 			return la.applyLaneBatchSerial(ctx, batch)
 		}
-		return 0, err
+		// Bug 200: a lane's pool acquire that dies dial-time (target
+		// restart's refused window) must reach the retry loop CLASSIFIED —
+		// this site returned it raw, bypassing the classifier entirely.
+		// classifyApplierError is idempotent on already-classified errors.
+		return 0, classifyApplierError(err)
 	}
 	if lanePipelinedTakenForTest != nil {
 		lanePipelinedTakenForTest()

@@ -97,6 +97,10 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 	}{
 		{"plain error", errors.New("some random failure")},
 		{"wrapped error", fmt.Errorf("wrapping: %w", errors.New("inner"))},
+		// Bug 200 negative pin: a typo'd endpoint's dial error stays
+		// terminal — the dial leg matches transient shapes, never dialing
+		// per se.
+		{"dial to a typo'd host (no such host) stays terminal", errors.New("dial tcp: lookup db.exmple.com: no such host")},
 		{"duplicate key (explicit non-retriable per ADR-0038)", &gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '1179' for key 'events.PRIMARY'"}},
 		{"foreign key violation", &gomysql.MySQLError{Number: 1452, Message: "Cannot add or update a child row"}},
 		{"syntax error", &gomysql.MySQLError{Number: 1064, Message: "You have an error in your SQL syntax"}},
@@ -163,6 +167,12 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"connection refused", errors.New("dial tcp: connection refused")},
 		{"broken pipe", errors.New("write tcp: broken pipe")},
 		{"i/o timeout", errors.New("read tcp: i/o timeout")},
+		// Bug 200: the Windows winsock dial wordings on the APPLY path —
+		// a target restart's refused window surfaced at begin-tx and exited
+		// with zero retries because only the POSIX wording was matched.
+		{"Windows refused dial at begin tx (Bug 200)", errors.New("mysql: applier: pkForRedact: begin tx: dial tcp 127.0.0.1:3311: connectex: No connection could be made because the target machine actively refused it")},
+		{"actively refused wording alone (Bug 200)", errors.New("dial: the target machine actively refused it")},
+		{"dial connection timed out (Bug 200)", errors.New("dial tcp 10.0.0.9:3306: connect: connection timed out")},
 	}
 	for _, c := range cases {
 		c := c

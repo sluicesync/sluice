@@ -332,7 +332,19 @@ func classifyApplierError(err error) error {
 		case strings.Contains(msg, "connection reset by peer"),
 			strings.Contains(msg, "connection refused"),
 			strings.Contains(msg, "broken pipe"),
-			strings.Contains(msg, "i/o timeout"):
+			strings.Contains(msg, "i/o timeout"),
+			// Windows winsock dial wordings (Bug 200, v0.99.289 regression
+			// cycle): a target restart's refused window surfaces on the
+			// APPLY path as `begin tx: dial tcp …: connectex: No connection
+			// could be made because the target machine actively refused
+			// it.` — the POSIX "connection refused" text above never
+			// matches it, so the first apply inside the window exited with
+			// zero retries. Dial-time by construction: no bytes reached
+			// the server. "no such host" stays deliberately unmatched
+			// (a typo'd endpoint is an operator error).
+			strings.Contains(msg, "connectex:"),
+			strings.Contains(msg, "actively refused"),
+			strings.Contains(msg, "connection timed out"):
 			return &retriableMySQLError{err: err}
 		}
 		lower := strings.ToLower(msg)

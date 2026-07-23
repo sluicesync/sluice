@@ -71,6 +71,11 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 	}{
 		{"plain error", errors.New("some random failure")},
 		{"wrapped error", fmt.Errorf("wrapping: %w", errors.New("inner"))},
+		// Bug 200 negative pins: ConnectError-shaped text WITHOUT a transient
+		// network shape stays terminal — the dial leg keys on shape, never on
+		// "failed to connect" alone.
+		{"dial to a typo'd host (no such host) stays terminal", errors.New("failed to connect: dial tcp: lookup db.exmple.com: no such host")},
+		{"auth failure inside a connect error stays terminal", errors.New(`failed to connect to ` + "`user=app database=app`" + `: failed SASL auth: FATAL: password authentication failed for user "app" (SQLSTATE 28P01)`)},
 		{"unique violation (explicit non-retriable per ADR-0038)", &pgconn.PgError{Code: "23505", Message: `duplicate key value violates unique constraint "users_pkey"`}},
 		{"foreign key violation", &pgconn.PgError{Code: "23503", Message: "insert or update on table violates foreign key constraint"}},
 		{"check violation", &pgconn.PgError{Code: "23514", Message: "new row violates check constraint"}},
@@ -143,6 +148,12 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		// closed" — SafeToRetry-by-construction (no bytes reached the
 		// server), previously unclassified → zero-retry terminal exit.
 		{"pgconn.ErrConnClosed sentinel (Bug 199b)", pgconn.ErrConnClosed},
+		// Bug 200: dial-time refusal at apply (pool acquire during a target
+		// restart's refused window) — the pgx v5 ConnectError text shape,
+		// Windows winsock wording and POSIX wording both.
+		{"lane pool acquire, Windows refused dial (Bug 200)", errors.New(`pipelined acquire conn: failed to connect to ` + "`user=app database=app`" + `: dial error: dial tcp 127.0.0.1:5443: connectex: No connection could be made because the target machine actively refused it`)},
+		{"pool acquire, POSIX refused dial (Bug 200)", errors.New("failed to connect: dial tcp 127.0.0.1:5432: connect: connection refused")},
+		{"dial connection timed out (Bug 200)", errors.New("failed to connect: dial tcp 10.0.0.9:5432: connect: connection timed out")},
 		{"wrapped pgconn.ErrConnClosed (checkpoint begin)", fmt.Errorf("postgres: applier: checkpoint begin: %w", pgconn.ErrConnClosed)},
 		{"pgconn SafeToRetry contract (connLockError stand-in)", fmt.Errorf("checkpoint begin: %w", safeToRetryErr{})},
 		{"io.EOF", io.EOF},

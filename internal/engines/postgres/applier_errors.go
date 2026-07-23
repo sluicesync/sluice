@@ -95,6 +95,29 @@ func classifyApplierError(err error) error {
 		return &retriablePGError{err: err}
 	}
 
+	// Dial-time network transients on the APPLY path (Bug 200, v0.99.289
+	// regression cycle): when a target restart severs the pool, the next
+	// apply's pool acquire dials fresh and dies inside pgx's ConnectError —
+	// no SQLSTATE, no SafeToRetry implementation, and (pgx v5 flattens the
+	// multi-host details into joined text) no reachable syscall errno — so
+	// the first apply inside the refused window exited with ZERO retries.
+	// Positive-match text shapes only, mirroring the MySQL classifier's
+	// long-standing apply-path leg plus the Windows winsock wordings; a
+	// dial failure is by construction pre-byte, so retrying is unambiguous.
+	// Deliberately NOT matched: "no such host" (typo'd endpoint = operator
+	// error) and auth failures ("password authentication failed" — arrives
+	// inside ConnectError too, which is why this leg keys on shape, never
+	// on ConnectError alone).
+	if msg := err.Error(); msg != "" {
+		switch {
+		case strings.Contains(msg, "connection refused"),
+			strings.Contains(msg, "connectex:"),
+			strings.Contains(msg, "actively refused"),
+			strings.Contains(msg, "connection timed out"):
+			return &retriablePGError{err: err}
+		}
+	}
+
 	// pgx surfaces server-side errors as *pgconn.PgError carrying a
 	// SQLSTATE in .Code. Match against the ADR-0038 retriable set.
 	var pgErr *pgconn.PgError
