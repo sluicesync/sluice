@@ -105,6 +105,106 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 	}
 }
 
+// TestClassifyApplierError_TerminalCodeShield pins the terminal-code
+// shield (audit 2026-07-23 D0-8, folded into the D0-3/G-3 fix family):
+// when the error chain carries a structured *pgconn.PgError, the server
+// RESPONDED — classification is decided by its SQLSTATE alone, and the
+// transport-text legs (both the dial-shape leg and the connection-shape
+// leg) must be UNREACHABLE. Pre-shield the dial-shape leg ran BEFORE the
+// PgError switch under a "dial-time, pre-byte by construction"
+// justification that is false for any PgError: a P0001 raise_exception
+// quoting stored text like "connection timed out" (a target-side audit
+// trigger is routine) classified RETRIABLE, and 23505 fell through the
+// switch's empty case into the second text leg like MySQL's 1062 —
+// retrying a deterministically-failing batch through the full ADR-0038
+// budget and delaying the loud terminal by many minutes.
+//
+// Structure mirrors the MySQL twin: the audit's OBSERVED cells first,
+// then the G-3 cross-product (structurally-terminal SQLSTATE × every
+// transient substring from both text legs) — all verbatim/non-retriable.
+// The one documented message-gated exception (XX000 + read-only wording)
+// is asserted to survive.
+func TestClassifyApplierError_TerminalCodeShield(t *testing.T) {
+	observed := []struct {
+		name string
+		err  error
+	}{
+		// The audit's OBSERVED cells (throwaway test, 2026-07-23),
+		// re-pinned permanently.
+		{
+			"P0001 raise_exception quoting 'connection timed out'",
+			&pgconn.PgError{Code: "P0001", Message: `audit trigger rejected row: reason "connection timed out"`},
+		},
+		{
+			"23505 with transient wording in the message",
+			&pgconn.PgError{Code: "23505", Message: `duplicate key value violates unique constraint "incidents_title_key": stored value 'connection refused'`},
+		},
+	}
+
+	terminalCodes := []struct {
+		code  string
+		label string
+	}{
+		{"23505", "unique violation"},
+		{"23503", "fk violation"},
+		{"23514", "check violation"},
+		{"42601", "syntax error"},
+		{"P0001", "raise_exception"},
+		{"22P02", "invalid text representation"},
+		{"XX000", "generic internal_error (non-read-only)"},
+	}
+	// Both text legs' substring sets, duplicated deliberately (a pin that
+	// reads the value it guards cannot detect the value changing). The
+	// XX000 read-only wordings are NOT here — that AND-gate is the
+	// documented exception, asserted below.
+	transientSubstrings := []string{
+		// dial-shape leg
+		"connection refused", "connectex:", "actively refused", "connection timed out",
+		// connection-shape leg
+		"connection reset by peer", "broken pipe", "i/o timeout", "unexpected EOF",
+		"use of closed network connection",
+		"the database system is starting up", "the database system is shutting down",
+	}
+
+	cases := observed
+	for _, code := range terminalCodes {
+		for _, sub := range transientSubstrings {
+			cases = append(cases, struct {
+				name string
+				err  error
+			}{
+				fmt.Sprintf("%s (%s) quoting %q", code.code, code.label, sub),
+				&pgconn.PgError{Code: code.code, Message: fmt.Sprintf("server error quoting stored text: '%s'", sub)},
+			})
+		}
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if errors.As(got, &re) {
+				t.Fatalf("structurally-terminal PgError classified RETRIABLE via text over-match (D0-8): %v", c.err)
+			}
+			//nolint:errorlint // identity not equivalence — terminal errors return verbatim
+			if got != c.err {
+				t.Errorf("terminal error not returned verbatim; got %T", got)
+			}
+		})
+	}
+
+	// The documented message-gated exception survives the shield: XX000 +
+	// the PlanetScale read-only wording stays retriable (structured code +
+	// message AND-gate — the safe shape).
+	roErr := &pgconn.PgError{Code: "XX000", Message: "pg_readonly: invalid statement because cluster is read-only"}
+	got := classifyApplierError(roErr)
+	var re ir.RetriableError
+	if !errors.As(got, &re) || !re.Retriable() {
+		t.Errorf("XX000 read-only AND-gate exception must stay retriable; got %T (%v)", got, got)
+	}
+}
+
 // safeToRetryErr stands in for pgconn's private connLockError: an error
 // whose SafeToRetry() contract says it occurred before any data reached the
 // server. Pins the classifier's structured SafeToRetry leg without reaching

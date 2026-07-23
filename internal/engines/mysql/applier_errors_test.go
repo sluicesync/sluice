@@ -134,6 +134,147 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 	}
 }
 
+// TestClassifyApplierError_TerminalCodeShield pins the terminal-code
+// shield (audit 2026-07-23 D0-3, HIGH silent-loss class): when the error
+// chain carries a structured *gomysql.MySQLError, classification is
+// decided by its CODE alone — the transport-text fallback legs must be
+// UNREACHABLE, because a server error's message routinely echoes row
+// data, key values, and (via the flush wrapper's `flush table %q` frame)
+// table names, any of which can carry transient wording. Pre-shield,
+// `case 1062:`'s empty body fell OUT of the switch into the text legs, so
+// a duplicate-key error whose echoed value or table name contained
+// "reparent" classified RETRIABLE — and the ADR-0108
+// tolerate-1062-on-retry wart then swallowed the retry's 1062 as "rows
+// already landed" even though BOTH atomic INSERTs rolled back: the whole
+// batch silently absent at exit 0.
+//
+// Structure: the audit's OBSERVED misclassification cells first (live
+// shapes), then the G-3 cross-product — every structurally-terminal code
+// × every transient substring from the text legs (reparent set,
+// connection set, disk-full set). All must return VERBATIM (identity),
+// exactly like TestClassifyApplierError_NonRetriableUnchanged.
+//
+// The documented structured-code+message AND-gate exceptions (1105 +
+// vttablet framing, 1290 + read-only wording, Error 3 / 1021 / 1114
+// disk-full) stay retriable — pinned in
+// TestClassifyApplierError_RetriableShapes; this test asserts the UNSAFE
+// shape only: bare text matching reachable with a structured code present.
+func TestClassifyApplierError_TerminalCodeShield(t *testing.T) {
+	observed := []struct {
+		name string
+		err  error
+	}{
+		// The audit's five OBSERVED cells (throwaway in-package test,
+		// 2026-07-23), re-pinned here permanently.
+		{
+			"1062 echoing a row value containing 'reparent'",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry 'planned-reparent-2026-07' for key 'jobs.name'"},
+		},
+		{
+			"1062 on a table named reparent_history (key echo)",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '42' for key 'reparent_history.PRIMARY'"},
+		},
+		{
+			"1062 echoing a row value containing 'connection refused'",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry 'connection refused by upstream' for key 'log_lines.msg'"},
+		},
+		{
+			"1062 echoing a row value containing 'disk full'",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry 'disk full on node 3' for key 'incidents.title'"},
+		},
+		{
+			"3819 CHECK violation echoing 'not serving'",
+			&gomysql.MySQLError{Number: 3819, Message: "Check constraint 'status_chk' is violated: value 'not serving'"},
+		},
+		// The flush wrapper injects the TABLE NAME around the driver error
+		// (row_writer.go `flush table %q`); the wrapped chain still carries
+		// the structured *MySQLError, so the shield must decide by code
+		// even though the wrapper text matches the reparent substring set.
+		{
+			"1062 wrapped by the flush frame naming table reparent_history",
+			fmt.Errorf("mysql: flush table %q: %w", "reparent_history",
+				&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '7' for key 'PRIMARY'"}),
+		},
+	}
+
+	// G-3 cross-product: structurally-terminal codes × every transient
+	// substring the text legs match. The substring lists are duplicated
+	// from production deliberately (a pin that reads the value it guards
+	// cannot detect the value changing).
+	terminalCodes := []struct {
+		number uint16
+		label  string
+	}{
+		{1062, "duplicate key"},
+		{3819, "check violation"},
+		{1452, "fk violation"},
+		{1064, "syntax error"},
+		{1048, "column cannot be null"},
+	}
+	transientSubstrings := []string{
+		// reparentRetriableSubstrings
+		"not serving", "reparent",
+		// connection-shape leg
+		"connection reset by peer", "connection refused", "broken pipe",
+		"i/o timeout", "connectex:", "actively refused", "connection timed out",
+		// isDiskFullSignal text set
+		"no space left on device", "errno: 28", "disk full",
+		"waiting for someone to free some space", "the table is full", "is full (errno",
+	}
+
+	cases := observed
+	for _, code := range terminalCodes {
+		for _, sub := range transientSubstrings {
+			cases = append(cases, struct {
+				name string
+				err  error
+			}{
+				fmt.Sprintf("%d (%s) echoing %q", code.number, code.label, sub),
+				&gomysql.MySQLError{Number: code.number, Message: fmt.Sprintf("server error echoing stored text: '%s'", sub)},
+			})
+		}
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if errors.As(got, &re) {
+				t.Fatalf("structurally-terminal MySQL error classified RETRIABLE via text over-match (D0-3): %v", c.err)
+			}
+			//nolint:errorlint // identity not equivalence — terminal errors return verbatim
+			if got != c.err {
+				t.Errorf("terminal error not returned verbatim; got %T", got)
+			}
+		})
+	}
+
+	// The AND-gate exceptions must SURVIVE the shield: a structured code
+	// whose documented message gate matches stays retriable (regression
+	// guard so the shield isn't over-tightened to code-only-no-exceptions).
+	exceptions := []struct {
+		name string
+		err  error
+	}{
+		{"1105 + vttablet framing (ADR-0038 pin-down 4)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unavailable desc = tablet not serving"}},
+		{"1290 + read-only wording (PS-320-v10)", &gomysql.MySQLError{Number: 1290, Message: "The MySQL server is running with the --read-only option so it cannot execute this statement"}},
+		{"Error 3 + ENOSPC wording (PS-320-v4)", &gomysql.MySQLError{Number: 3, Message: "Error writing file '/vt/tmp/ML' (OS errno 28 - No space left on device)"}},
+		{"1021 ER_DISK_FULL", &gomysql.MySQLError{Number: 1021, Message: "Disk full (/tmp); waiting for someone to free some space..."}},
+		{"1114 ER_RECORD_FILE_FULL", &gomysql.MySQLError{Number: 1114, Message: "The table '_tally' is full (errno: 28 - No space left on device)"}},
+	}
+	for _, c := range exceptions {
+		c := c
+		t.Run("exception/"+c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if !errors.As(got, &re) || !re.Retriable() {
+				t.Errorf("documented AND-gate exception must stay retriable; got %T (%v)", got, got)
+			}
+		})
+	}
+}
+
 // TestClassifyApplierError_RetriableShapes covers each documented
 // transient shape from the ADR-0038 classifier table. Each must
 // produce a value that (a) satisfies ir.RetriableError, (b) reports

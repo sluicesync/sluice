@@ -237,6 +237,23 @@ func classifyApplierError(err error) error {
 	//     transients; other gRPC codes (InvalidArgument, NotFound,
 	//     etc.) are terminal.
 	//   - 1062: duplicate key — explicitly NOT retriable.
+	//
+	// TERMINAL-CODE SHIELD (audit 2026-07-23 D0-3): when the chain carries
+	// a structured *MySQLError, the server RESPONDED and the code alone
+	// decides the classification — this block returns on EVERY structured
+	// error, so the transport-text legs below are unreachable for it. A
+	// server error's message routinely echoes row data, key values, and
+	// (via the flush wrapper's `flush table %q` frame) table names, so
+	// bare text matching over it can flip a terminal code retriable: the
+	// audit's observed cell was a 1062 on a table named reparent_history
+	// classifying RETRIABLE via the reparent fallback, whereupon the
+	// ADR-0108 tolerate-1062-on-retry wart swallowed the retry's 1062 as
+	// "rows already landed" — the whole batch silently absent at exit 0.
+	// The only message consultation allowed here is a structured-code +
+	// message AND-gate on a code whose semantics are message-dependent
+	// (1105 vttablet framing, 1290 read-only, Error 3 ENOSPC) — never a
+	// bare substring scan across all codes. Pinned by
+	// [TestClassifyApplierError_TerminalCodeShield]'s cross-product.
 	var mysqlErr *gomysql.MySQLError
 	if errors.As(err, &mysqlErr) {
 		switch mysqlErr.Number {
@@ -292,9 +309,34 @@ func classifyApplierError(err error) error {
 					txKilled: isVitessTxKillerMessage(mysqlErr.Message),
 				}
 			}
+		case 3:
+			// Error 3 "Error writing file" — the ENOSPC face the
+			// PS-320-v4 grow arc surfaced (vttablet wraps the OS errno-28
+			// write failure under this generic code). Message-gated
+			// AND-gate: only the disk-full wording is the grow transient;
+			// an unrelated Error 3 stays terminal via the shield below.
+			if isDiskFullSignal(err) {
+				return &retriableMySQLError{err: err}
+			}
+		case 1021, 1114:
+			// ER_DISK_FULL / ER_RECORD_FILE_FULL — target transiently out
+			// of disk during a storage auto-grow (PS-320-v4/-v6); the
+			// bounded retry rides the grow out. Code-only: these codes
+			// mean disk-full unconditionally.
+			return &retriableMySQLError{err: err}
+		case 1290:
+			// ER_OPTION_PREVENTS_STATEMENT is GENERIC ("running with the
+			// %s option") — only the read-only variant is the grow/
+			// reparent serving-transition transient (PS-320-v10).
+			// Message-gated AND-gate; an unrelated 1290 stays terminal.
+			if isReadOnlyTargetSignal(err) {
+				return &retriableMySQLError{err: err}
+			}
 		case 1062:
-			// Explicit non-retriable: don't wrap. Falls through to
-			// the bare return below.
+			// Explicit non-retriable per ADR-0038 — reaches the
+			// terminal-code shield's bare return below. (Pre-shield this
+			// empty case fell THROUGH to the text legs, which is exactly
+			// the D0-3 silent-batch-skip bug.)
 		case 1054, 1146:
 			// Schema drift (Bug F8): 1054 ER_BAD_FIELD_ERROR (unknown
 			// column) / 1146 ER_NO_SUCH_TABLE — the source has a
@@ -311,11 +353,19 @@ func classifyApplierError(err error) error {
 				"schema drift: the target is missing a column/table the source has — add it on the target to resume (sluice does not auto-apply DDL): %w", err,
 			)}
 		}
+		// Terminal-code shield: every structured code not explicitly
+		// classified above is terminal — return verbatim WITHOUT entering
+		// the text legs below (see the block comment above the errors.As).
+		return err
 	}
 
 	// Connection-string-level transients that don't surface as a
 	// MySQLError but do appear as raw error text from the driver
-	// or the connection pool. Pattern-match defensively.
+	// or the connection pool. Pattern-match defensively — reachable
+	// ONLY when no structured *MySQLError is present (the terminal-code
+	// shield above returned for every structured error), so the matched
+	// text is transport/driver framing, never a server message echoing
+	// row data or table names.
 	//
 	// "not serving" / "reparent" (ADR-0108): a target PRIMARY REPARENT
 	// (e.g. a PlanetScale non-Metal storage auto-grow at the ~39 GB
@@ -356,13 +406,13 @@ func classifyApplierError(err error) error {
 	}
 
 	// Target transiently OUT OF DISK — the ROOT face of a PlanetScale
-	// non-Metal storage auto-grow (ADR-0108/0109). While the volume is full
-	// and growing, a write surfaces "No space left on device" (OS errno 28),
-	// which MySQL/vttablet wraps inconsistently: as Error 3 "Error writing
-	// file" (code = Unknown), ER_DISK_FULL (1021), or the ENOSPC text — none
-	// of which the Error-1105 vttablet-code branch above catches (it gates on
-	// Number==1105). It is TRANSIENT: the auto-grow adds space and the retry
-	// succeeds (the v0.99.95 PS-320-v4 live finding — the copy rode ~8 min of
+	// non-Metal storage auto-grow (ADR-0108/0109). The STRUCTURED faces
+	// (Error 3 + ENOSPC wording, ER_DISK_FULL 1021, ER_RECORD_FILE_FULL
+	// 1114) are classified inside the *MySQLError switch above; this leg
+	// catches the ENOSPC text arriving WITHOUT a structured MySQLError
+	// (e.g. an OS-level write error surfaced as plain driver text). It is
+	// TRANSIENT: the auto-grow adds space and the retry succeeds (the
+	// v0.99.95 PS-320-v4 live finding — the copy rode ~8 min of
 	// query-killer retries, then died here on the unretried disk-full). A
 	// bounded retry rides the grow out; a genuinely-full, NON-growing target
 	// (e.g. an undersized fixed-storage Metal) exhausts the retry budget and
@@ -376,6 +426,9 @@ func classifyApplierError(err error) error {
 
 	// Target transiently READ-ONLY — another face of a PlanetScale storage
 	// auto-grow / reparent window (the v0.99.100 PS-320-v10 live finding).
+	// The structured face (Number 1290 + read-only wording) is classified
+	// inside the *MySQLError switch above; this leg catches the read-only
+	// wording arriving without a structured MySQLError.
 	// During the grow's serving transition the tablet briefly runs with
 	// `--read-only` before the new primary is promoted, and an in-flight
 	// write surfaces ER_OPTION_PREVENTS_STATEMENT (1290). It is TRANSIENT —

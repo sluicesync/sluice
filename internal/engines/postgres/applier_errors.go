@@ -95,31 +95,24 @@ func classifyApplierError(err error) error {
 		return &retriablePGError{err: err}
 	}
 
-	// Dial-time network transients on the APPLY path (Bug 200, v0.99.289
-	// regression cycle): when a target restart severs the pool, the next
-	// apply's pool acquire dials fresh and dies inside pgx's ConnectError —
-	// no SQLSTATE, no SafeToRetry implementation, and (pgx v5 flattens the
-	// multi-host details into joined text) no reachable syscall errno — so
-	// the first apply inside the refused window exited with ZERO retries.
-	// Positive-match text shapes only, mirroring the MySQL classifier's
-	// long-standing apply-path leg plus the Windows winsock wordings; a
-	// dial failure is by construction pre-byte, so retrying is unambiguous.
-	// Deliberately NOT matched: "no such host" (typo'd endpoint = operator
-	// error) and auth failures ("password authentication failed" — arrives
-	// inside ConnectError too, which is why this leg keys on shape, never
-	// on ConnectError alone).
-	if msg := err.Error(); msg != "" {
-		switch {
-		case strings.Contains(msg, "connection refused"),
-			strings.Contains(msg, "connectex:"),
-			strings.Contains(msg, "actively refused"),
-			strings.Contains(msg, "connection timed out"):
-			return &retriablePGError{err: err}
-		}
-	}
-
 	// pgx surfaces server-side errors as *pgconn.PgError carrying a
 	// SQLSTATE in .Code. Match against the ADR-0038 retriable set.
+	//
+	// TERMINAL-CODE SHIELD (audit 2026-07-23 D0-8, the D0-3 fix family):
+	// a *pgconn.PgError means the server RESPONDED — the SQLSTATE alone
+	// decides the classification, and this block returns on EVERY
+	// structured error so the transport-text legs below are unreachable
+	// for it. Pre-shield the dial-shape leg ran BEFORE this switch under a
+	// "dial-time, pre-byte by construction" justification that is false
+	// for any PgError: a P0001 raise_exception quoting stored text like
+	// "connection timed out" (a target-side audit trigger is routine)
+	// classified retriable, and 23505 fell through the switch's empty case
+	// into the second text leg like MySQL's 1062 — retrying a
+	// deterministically-failing batch through the full ADR-0038 budget.
+	// The only message consultation allowed here is the XX000 read-only
+	// AND-gate (XX000 is a generic catch-all, so its semantics are
+	// message-dependent) — never a bare substring scan across all codes.
+	// Pinned by [TestClassifyApplierError_TerminalCodeShield].
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -161,8 +154,9 @@ func classifyApplierError(err error) error {
 				"schema drift: the target is missing a column/table the source has — add it on the target to resume (sluice does not auto-apply DDL): %w", err,
 			)}
 		case "23505":
-			// Explicit non-retriable per ADR-0038 — fall through
-			// to the bare return.
+			// Explicit non-retriable per ADR-0038 — reaches the
+			// terminal-code shield's bare return below. (Pre-shield this
+			// empty case fell THROUGH to the text legs — the D0-8 bug.)
 		}
 		// PlanetScale Postgres serving-transition READ-ONLY window. During a
 		// non-Metal storage auto-grow the PG cluster is briefly promoted
@@ -189,10 +183,40 @@ func classifyApplierError(err error) error {
 		if strings.HasPrefix(pgErr.Code, "08") {
 			return &retriablePGError{err: err}
 		}
+		// Terminal-code shield: every SQLSTATE not explicitly classified
+		// above is terminal — return verbatim WITHOUT entering the text
+		// legs below (see the block comment above the errors.As).
+		return err
+	}
+
+	// Dial-time network transients on the APPLY path (Bug 200, v0.99.289
+	// regression cycle): when a target restart severs the pool, the next
+	// apply's pool acquire dials fresh and dies inside pgx's ConnectError —
+	// no SQLSTATE, no SafeToRetry implementation, and (pgx v5 flattens the
+	// multi-host details into joined text) no reachable syscall errno — so
+	// the first apply inside the refused window exited with ZERO retries.
+	// Positive-match text shapes only, mirroring the MySQL classifier's
+	// long-standing apply-path leg plus the Windows winsock wordings; with
+	// no *pgconn.PgError in the chain (the terminal-code shield above
+	// returned for every structured error) a matched shape here is by
+	// construction pre-byte, so retrying is unambiguous.
+	// Deliberately NOT matched: "no such host" (typo'd endpoint = operator
+	// error) and auth failures ("password authentication failed" — arrives
+	// inside ConnectError too, which is why this leg keys on shape, never
+	// on ConnectError alone).
+	if msg := err.Error(); msg != "" {
+		switch {
+		case strings.Contains(msg, "connection refused"),
+			strings.Contains(msg, "connectex:"),
+			strings.Contains(msg, "actively refused"),
+			strings.Contains(msg, "connection timed out"):
+			return &retriablePGError{err: err}
+		}
 	}
 
 	// Connection-string-level transients that bypass *pgconn.PgError
-	// (the driver couldn't reach the server to even get a SQLSTATE).
+	// (the driver couldn't reach the server to even get a SQLSTATE —
+	// only reachable when no structured PgError is in the chain).
 	if msg := err.Error(); msg != "" {
 		switch {
 		case strings.Contains(msg, "connection reset by peer"),

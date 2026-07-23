@@ -119,9 +119,19 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 	// re-snapshot has already fired this Run, so the recovery is bounded
 	// to one (a second consecutive ErrPositionInvalid is terminal).
 	resnapshotted := false
+	// D0-4 (audit 2026-07-23): whether any SUCCESSFUL position read this
+	// Run found the cdc-state anchor row. A FAILED read (target down —
+	// both engines return found=false on error) proves nothing about the
+	// anchor's existence, so it must never drive the RestartFromScratch
+	// discriminator below; this flag lets a read failure default to the
+	// warm resume the anchor's observed existence justifies.
+	anchorSeen := false
 
 	for {
-		beforePos, beforeFound, _ := posReader.ReadPosition(ctx, streamID)
+		beforePos, beforeFound, beforeReadErr := posReader.ReadPosition(ctx, streamID)
+		if beforeReadErr == nil && beforeFound {
+			anchorSeen = true
+		}
 
 		err := s.runOnceCall(ctx)
 		if err == nil {
@@ -179,8 +189,12 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// happens at most once per Run.
 		s.ResetTargetData = false
 
-		afterPos, afterFound, _ := posReader.ReadPosition(ctx, streamID)
-		progressed := beforeFound && afterFound && afterPos.Token != beforePos.Token
+		afterPos, afterFound, afterReadErr := posReader.ReadPosition(ctx, streamID)
+		if afterReadErr == nil && afterFound {
+			anchorSeen = true
+		}
+		progressed := beforeReadErr == nil && afterReadErr == nil &&
+			beforeFound && afterFound && afterPos.Token != beforePos.Token
 
 		// ADR-0109 §B — bounded auto-restart of the cold-start after a
 		// classified source-read drop DURING the cold-copy phase (the
@@ -211,12 +225,35 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// fault) never reaches here — classifyRetriable returned false above
 		// and the loop already returned it terminal, preserving the
 		// v0.99.92-clean terminal behaviour.
-		if afterFound {
+		//
+		// D0-4 (audit 2026-07-23): the discriminator may only read a
+		// SUCCESSFUL position read. A FAILED read (target down during the
+		// very outage that classified the apply error retriable) is "could
+		// not read the row", NOT "no anchor row" — latching
+		// RestartFromScratch on it converted a warm-resumable blip into a
+		// destructive forced re-snapshot once the connect-phase retry
+		// (v0.99.288) started surviving the outage window: dropped +
+		// recreated tables on native MySQL, and on idempotent sources a
+		// slot/snapshot recreated at NOW that never replays source DELETEs
+		// committed before it (silent divergence). On a failed read the
+		// latch keeps its prior value, except that an anchor OBSERVED by
+		// any successful read this Run proves warm resume is correct.
+		switch {
+		case afterReadErr != nil:
+			// Read FAILED: no evidence either way. Default to warm resume
+			// when the anchor was ever observed this Run; otherwise leave
+			// the latch untouched — the next attempt's successful read
+			// re-runs this discriminator with real evidence.
+			if anchorSeen {
+				s.RestartFromScratch = false
+			}
+		case afterFound:
 			// CDC phase: warm-resume from the durable position on the next
 			// attempt; do not force a re-copy.
 			s.RestartFromScratch = false
-		} else {
-			// Cold-copy phase: force a clean re-establishment of the copy.
+		default:
+			// Cold-copy phase (PROVEN by a successful read finding no
+			// cdc-state row): force a clean re-establishment of the copy.
 			s.RestartFromScratch = true
 		}
 		// Loose end 2b: a VStream Phase-2 "established then went idle"
