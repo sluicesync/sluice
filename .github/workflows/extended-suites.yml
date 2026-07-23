@@ -236,11 +236,39 @@ jobs:
     timeout-minutes: 45
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
+      # The -run alternation, defined ONCE so the budget guard below and
+      # the run step can never drift apart.
+      VSTREAM_PIPELINE_RUN: '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_|TestVindex)'
+      # The 40m -timeout / 45m job budget's documented basis (audit
+      # 2026-07-23 TEST-9): sized for exactly this many matching
+      # top-level tests. The guard below fails on ANY drift — fewer
+      # means a rename/removal silently emptied part of the filter
+      # (the vacuous-green shape); more means a new cluster-boot test
+      # joined the leg, so RE-DERIVE the budget (and this count) in the
+      # same PR instead of letting the 19c J-TEST-3 compounding
+      # continue.
+      VSTREAM_PIPELINE_EXPECTED_TESTS: "14"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6.5.0
         with:
           go-version-file: go.mod
+
+      # TEST-9 (audit 2026-07-23): `go test` exits 0 when -run matches
+      # nothing, so a rename could silently empty (part of) the
+      # alternation and this leg would green on a shrinking suite while
+      # its budget quietly covered fewer and fewer cluster boots — the
+      # filtered-tag-gate's F1 vacuous-green class. Pin the match count
+      # to the documented budget basis BEFORE spending any container
+      # time.
+      - name: Assert the -run filter matches the documented suite (vacuous-green + budget-basis guard)
+        run: |
+          matched=$(go test -tags='integration vstream' -list "$VSTREAM_PIPELINE_RUN" ./internal/pipeline/ | grep -c '^Test' || true)
+          if [ "$matched" -ne "$VSTREAM_PIPELINE_EXPECTED_TESTS" ]; then
+            echo "::error::vstream-pipeline: -run filter matches ${matched} tests, budget basis is ${VSTREAM_PIPELINE_EXPECTED_TESTS}. Fewer = a rename/removal silently emptied part of the filter; more = a new cluster-boot test joined the leg. Re-derive the 40m/45m budget AND update VSTREAM_PIPELINE_EXPECTED_TESTS in the same PR."
+            go test -tags='integration vstream' -list "$VSTREAM_PIPELINE_RUN" ./internal/pipeline/
+            exit 1
+          fi
 
       - name: Log in to ghcr.io + pre-pull images (bounded retry)
         env:
@@ -262,8 +290,19 @@ jobs:
 
       - name: Run the pipeline vstream tests
         run: |
+          set -o pipefail
           go test -tags='integration vstream' -race -count=1 -timeout=40m \
-            -run '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_|TestVindex)' -v ./internal/pipeline/
+            -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
+          # Second half of the TEST-9 guard, mirroring the filtered-tag-
+          # gate's per-test PASS assert: every matched test must have
+          # actually run AND passed at top level — a t.Skip (e.g. a
+          # provider-health skip after a mid-run Docker death) greens
+          # `go test` while executing nothing.
+          passed=$(grep -c '^--- PASS: Test' vstream-pipeline.out || true)
+          if [ "$passed" -ne "$VSTREAM_PIPELINE_EXPECTED_TESTS" ]; then
+            echo "::error::vstream-pipeline: ${passed} top-level tests PASSed, expected ${VSTREAM_PIPELINE_EXPECTED_TESTS} — a test was skipped or didn't run (vacuous green). See the run log."
+            exit 1
+          fi
 
   # The real-world-schema corpus (roadmap item 52): migrate popular OSS
   # app schemas (GitLab / WordPress / Joomla / MediaWiki / Chinook /

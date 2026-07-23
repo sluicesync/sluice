@@ -184,6 +184,42 @@ grant the apply role the privilege to set `session_replication_role`,
 or make the target FK constraints `DEFERRABLE`. MySQL's
 `foreign_key_checks` needs no special privilege.
 
+## MariaDB sources
+
+MariaDB is a first-class MySQL-family flavor (`--source-driver mariadb`,
+since v0.99.268), not "MySQL with a different banner": `sluice sync start`
+reads its binlog the same way it does vanilla MySQL's, through the same
+snapshot→CDC handoff and the same retry policy above. Three
+flavor-specific behaviors are worth knowing as an operator:
+
+- **Domain GTIDs.** MariaDB replicates with domain GTIDs
+  (`domain-server-sequence`, e.g. `0-1-38`), not MySQL's UUID-set GTIDs.
+  sluice's CDC position, warm resume, and cold-start anchor
+  (`@@gtid_binlog_pos`) all speak the MariaDB shape natively
+  ([ADR-0170](../adr/adr-0170-mariadb-flavor-phase3-cdc.md)); a restart
+  resumes exactly-once from the persisted domain-GTID position, and a
+  source that has purged the binlog past that position refuses loudly
+  (errno 1236) instead of silently restreaming from the wrong point.
+- **Native `uuid` / `inet6` / `inet4` columns** decode faithfully off the
+  binlog
+  ([ADR-0171](../adr/adr-0171-mariadb-native-uuid-inet-cdc-decode.md)).
+  The wire format is subtle — MariaDB strips trailing `0x00` bytes from
+  these fixed-width values, and its `inet6` text rendering differs from
+  most languages' — so the decode was ground-truthed byte-exact against
+  live 11.4 and 10.11 and pinned per type × shape. CDC values converge
+  byte-for-byte with what a bulk copy of the same rows produces, on both
+  same-engine and cross-engine (e.g. MariaDB → Postgres `uuid`/`inet`)
+  targets.
+- **Version-dependent collation catalog.** MariaDB's
+  `information_schema.COLLATIONS.PAD_ATTRIBUTE` column is absent through
+  the 11.x LTS line and 12.0 (added in 12.1), so sluice keys trailing-
+  space `=` semantics off the version-independent `_nopad_` collation
+  name token and the server's own behavior — relevant when a filtered
+  `--where` predicate compares string columns. Details in the
+  [field note](https://sluicesync.com/field-notes/mariadb-no-pad-attribute-column/)
+  and in
+  [migrating-legacy-mysql.md](migrating-legacy-mysql.md#mariadb-sources-and-targets).
+
 ## Trigger-based CDC sources: `sqlite-trigger` and `d1-trigger`
 
 Most CDC sources read a native change stream — Postgres logical

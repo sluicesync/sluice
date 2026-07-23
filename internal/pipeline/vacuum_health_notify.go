@@ -52,7 +52,8 @@ const (
 // per the loud-failure tenet an operator who opted in must learn the rule is
 // inert, but the alerter is advisory so it never fails the stream.
 //
-// One goroutine ticks at telemetryPollInterval; unlike the snapshot alerter
+// One goroutine ticks at [Streamer.vacuumHealthTick] (telemetryPollInterval
+// unless a test injects a faster cadence); unlike the snapshot alerter
 // each tick is a LIVE probe (two cheap catalog reads against the applier's
 // pool — pg_stat_user_tables and pg_database — well off the apply hot
 // path). It exits on ctx.Done; the caller does not track it.
@@ -80,7 +81,7 @@ func (s *Streamer) startVacuumHealthNotifier(ctx context.Context, streamID strin
 	}
 	deadTupleThreshold, xidAgeThreshold := s.NotifyDeadTupleRatio, s.NotifyXIDAge
 	go func() {
-		ticker := time.NewTicker(telemetryPollInterval)
+		ticker := time.NewTicker(s.vacuumHealthTick())
 		defer ticker.Stop()
 		for {
 			select {
@@ -91,6 +92,16 @@ func (s *Streamer) startVacuumHealthNotifier(ctx context.Context, streamID strin
 			}
 		}
 	}()
+}
+
+// vacuumHealthTick resolves the alerter's tick cadence: the injected
+// test override when set, the canonical telemetryPollInterval otherwise
+// (the zero value is the production default — the v0.99.51 lesson).
+func (s *Streamer) vacuumHealthTick() time.Duration {
+	if s.vacuumHealthTickInterval > 0 {
+		return s.vacuumHealthTickInterval
+	}
+	return telemetryPollInterval
 }
 
 // runVacuumHealthNotifyTick is one alerter tick: probe the target, evaluate

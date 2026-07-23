@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,64 @@ func TestStartVacuumHealthNotifier_NonReporterApplierIsInert(t *testing.T) {
 		NotifyWebhookURL:     "http://localhost:1", // sink configured so gating reaches the type-assert
 	}
 	s.startVacuumHealthNotifier(t.Context(), "s1", stubApplier{})
+}
+
+// countingVacuumApplier is a ChangeApplier that IS a
+// TargetVacuumHealthReporter, counting probe calls so the goroutine's
+// tick loop is observable. ok=false keeps every tick a no-fire (the
+// probe path runs; the sink never does), and any other applier method
+// call panics via the embedded nil interface (the stubEngine
+// discipline).
+type countingVacuumApplier struct {
+	ir.ChangeApplier
+	probes atomic.Int64
+}
+
+func (c *countingVacuumApplier) TargetVacuumHealth(context.Context) (ir.VacuumHealth, bool, error) {
+	c.probes.Add(1)
+	return ir.VacuumHealth{}, false, nil
+}
+
+func TestStartVacuumHealthNotifier_GoroutineLifecycle(t *testing.T) {
+	// The audit-2026-07-23 TEST-5 gate: the alerter goroutine — the
+	// delta's one new production goroutine — never executed in any test
+	// because its cadence was the 60s package constant. With the
+	// injected 1ms interval this drives the full lifecycle under -race:
+	// start, ≥2 observed ticks (a live loop, not a one-shot), ctx
+	// cancel, clean exit.
+	rep := &countingVacuumApplier{}
+	s := &Streamer{
+		NotifyXIDAge:             1,
+		NotifyWebhookURL:         "http://localhost:1",
+		vacuumHealthTickInterval: time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.startVacuumHealthNotifier(ctx, "s1", rep)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for rep.probes.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("alerter goroutine ticked %d times in 5s, want >= 2", rep.probes.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	// Clean exit: after cancel the probe count must settle. 20ms of
+	// silence is ~20 missed ticks at the 1ms cadence — only an exited
+	// loop stays that quiet.
+	settle := time.Now().Add(5 * time.Second)
+	for {
+		before := rep.probes.Load()
+		time.Sleep(20 * time.Millisecond)
+		if rep.probes.Load() == before {
+			return
+		}
+		if time.Now().After(settle) {
+			t.Fatal("alerter goroutine still ticking 5s after ctx cancel — the loop did not exit")
+		}
+	}
 }
 
 func TestStartVacuumHealthNotifier_NoThresholdNoSinkIsNoop(t *testing.T) {

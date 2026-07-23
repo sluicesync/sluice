@@ -193,6 +193,45 @@ both sides so the write succeeds). Recovery options:
 - Ignore the warning if your source legitimately uses `?` as a label
   and the runtime doesn't surface a false positive.
 
+## MariaDB sources and targets
+
+Everything above applies to MariaDB too — it is a first-class
+MySQL-family flavor (`--source-driver mariadb` / `--target-driver
+mariadb`, since v0.99.268), and it is *prime* legacy territory: MariaDB
+only turned `STRICT_TRANS_TABLES` on by default in 10.2.4 (2017), so a
+long-lived MariaDB schema carries the same zero-dates, truncated
+VARCHARs, and marker columns this doc covers. The same two layers apply
+unchanged: `--zero-date` on the read side, `--mysql-sql-mode` on the
+write side (when the target is MySQL-family).
+
+Three MariaDB-specific notes:
+
+- **Pick the right flavor.** `--source-driver mariadb` (not `mysql`)
+  makes sluice read MariaDB's own catalogs and binlog dialect — domain
+  GTIDs for CDC ([ADR-0170](../adr/adr-0170-mariadb-flavor-phase3-cdc.md)),
+  `json_valid`-based JSON detection, and the native types below. The
+  connect-time fingerprint guard enforces the pairing: `mariadb`
+  against a non-MariaDB server is refused loudly (its catalog variants
+  would mis-read MySQL 8), and the plain `mysql` driver against a
+  server that fingerprints as MariaDB gets a WARN steering you to
+  `--source-driver mariadb`.
+- **Native `uuid` / `inet6` / `inet4` types** are
+  carried as real typed values — a MariaDB `uuid` column lands as
+  Postgres `uuid`, `inet6`/`inet4` as Postgres `inet` — on both the bulk
+  copy and the CDC tail
+  ([ADR-0171](../adr/adr-0171-mariadb-native-uuid-inet-cdc-decode.md)),
+  not as opaque text.
+- **Trailing spaces and `=` (the PAD-attribute catalog gap).** Whether
+  `'EU'` equals a stored `'EU '` depends on the collation's PAD
+  attribute, and MariaDB's catalog column for it
+  (`information_schema.COLLATIONS.PAD_ATTRIBUTE`) is version-dependent:
+  absent through the entire 11.x LTS line and 12.0, added only in 12.1.
+  sluice therefore keys on MariaDB's version-independent `_nopad_`
+  collation-name token (plus the server's own behavior) instead of the
+  catalog — so `--where` filters and collation-sensitive comparisons
+  behave identically across MariaDB versions. Background:
+  [the field note](https://sluicesync.com/field-notes/mariadb-no-pad-attribute-column/).
+
 ## Migrating, then tightening
 
 A reasonable workflow for moving legacy data onto a new strict-mode

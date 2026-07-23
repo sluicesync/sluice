@@ -49,6 +49,7 @@ import (
 	"testing"
 	"time"
 
+	mobycontainer "github.com/moby/moby/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
 	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -79,11 +80,17 @@ import (
 // re-waits for the original readiness signal before returning, so a
 // chaos test can disrupt an in-flight source connection mid-copy and be
 // guaranteed the source is serving again by the time the closure
-// returns. The container's mapped ports are stable across a Docker
-// stop/start (the port bindings survive), so the previously-returned
-// mysqlDSN / grpcEndpoint stay valid after a restart — callers do not
-// need to re-read them. (testcontainers' Stop/Start preserve the
-// container; only Terminate removes it.)
+// returns. Contrary to what this comment used to claim, an EPHEMERAL
+// (empty-HostPort) mapped port is NOT reliably stable across a Docker
+// stop/start — the daemon may re-allocate it (observed under Rancher
+// Desktop by the chaos-lite work; see
+// streamer_chaoslite_restart_integration_test.go's file header). Both
+// exposed ports are therefore bound to explicitly-reserved FIXED host
+// ports at create time ([chaosFixedPortModifier]), which DO survive a
+// stop/start — so the previously-returned mysqlDSN / grpcEndpoint stay
+// valid after a restart and callers do not need to re-read them.
+// (testcontainers' Stop/Start preserve the container; only Terminate
+// removes it.)
 func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mysqlDSN, grpcEndpoint string, restartSource func(t *testing.T), cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
@@ -105,6 +112,13 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 		wait.ForListeningPort(mysqlPortBase),
 	).WithStartupTimeoutDefault(5 * time.Minute)
 
+	// Fixed host-port bindings for both exposed ports, so the DSN and
+	// gRPC endpoint returned below survive restartSource's stop/start
+	// (see the function comment; the ephemeral-binding re-allocation is
+	// real, not theoretical).
+	fixedMySQL, _ := chaosFixedPortModifier(t, mysqlPortBase)
+	fixedGRPC, _ := chaosFixedPortModifier(t, grpcPortBase)
+
 	req := testcontainers.ContainerRequest{
 		Image:        "vitess/vttestserver:mysql80",
 		ExposedPorts: []string{mysqlPortBase, grpcPortBase},
@@ -115,6 +129,10 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 			"MYSQL_BIND_HOST": "0.0.0.0",
 		},
 		WaitingFor: readiness,
+		HostConfigModifier: func(hc *mobycontainer.HostConfig) {
+			fixedMySQL(hc)
+			fixedGRPC(hc)
+		},
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,

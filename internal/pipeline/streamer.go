@@ -1343,6 +1343,13 @@ type Streamer struct {
 	// interceptor and no goroutine). The change-stream interceptor writes it
 	// (lock-free), the /metrics scrape and the alerter tick read it.
 	syncLag *syncLagTracker
+
+	// vacuumHealthTickInterval overrides the vacuum-health alerter's tick
+	// cadence, so the goroutine's start→tick→ctx-exit lifecycle is testable
+	// at millisecond scale under -race (audit 2026-07-23 TEST-5). Zero-value
+	// safe: every real construction leaves it 0 and gets the canonical
+	// telemetryPollInterval (see [Streamer.vacuumHealthTick]).
+	vacuumHealthTickInterval time.Duration
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
