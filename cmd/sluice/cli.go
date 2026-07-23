@@ -914,13 +914,14 @@ func applySourceEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
 // target on an ongoing basis — useful both as a low-downtime
 // migration path and as a reporting/locality replication tool.
 type SyncCmd struct {
-	Start      SyncStartCmd         `cmd:"" help:"Start a continuous-sync stream from source to target."`
-	Run        SyncRunCmd           `cmd:"" help:"Supervise many syncs from one process (a fleet config); each failure-isolated with bounded-backoff restart (ADR-0122)."`
-	Status     SyncStatusCmd        `cmd:"" help:"Show status of a running sync stream."`
-	Stop       SyncStopCmd          `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
-	Health     SyncHealthCmd        `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
-	Tui        SyncTuiCmd           `cmd:"" help:"Live terminal dashboard for a running fleet (polls a sync run --dashboard-listen endpoint)."`
-	FromBackup SyncFromBackupCmdGrp `cmd:"" name:"from-backup" help:"Replay a backup chain into a target as a long-running broker (Phase 4.5)."`
+	Start        SyncStartCmd         `cmd:"" help:"Start a continuous-sync stream from source to target."`
+	Run          SyncRunCmd           `cmd:"" help:"Supervise many syncs from one process (a fleet config); each failure-isolated with bounded-backoff restart (ADR-0122)."`
+	Status       SyncStatusCmd        `cmd:"" help:"Show status of a running sync stream."`
+	Stop         SyncStopCmd          `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
+	Decommission SyncDecommissionCmd  `cmd:"" help:"Retire a FINISHED (stopped) stream: drop its replication slot and per-stream publication on the source, clear its control row on the target. The slot otherwise pins WAL and blocks later differently-scoped cold starts."`
+	Health       SyncHealthCmd        `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
+	Tui          SyncTuiCmd           `cmd:"" help:"Live terminal dashboard for a running fleet (polls a sync run --dashboard-listen endpoint)."`
+	FromBackup   SyncFromBackupCmdGrp `cmd:"" name:"from-backup" help:"Replay a backup chain into a target as a long-running broker (Phase 4.5)."`
 }
 
 // SyncFromBackupCmdGrp groups `sluice sync from-backup` (run) and

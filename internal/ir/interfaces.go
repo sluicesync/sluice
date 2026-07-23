@@ -2635,6 +2635,49 @@ type SlotManagerOpener interface {
 	OpenSlotManager(ctx context.Context, dsn string) (SlotManager, error)
 }
 
+// PublicationDropOutcome reports what
+// [StreamPublicationDropper.DropStreamPublication] did (or, under
+// dryRun, would do) for a stream's recorded publication name. The
+// zero value is deliberately the never-drop outcome, so a
+// misconstructed result can't read as a removal.
+type PublicationDropOutcome int
+
+const (
+	// PublicationDropSkippedShared means the name is empty or names
+	// the engine's SHARED default publication, which other streams
+	// may read through — never dropped.
+	PublicationDropSkippedShared PublicationDropOutcome = iota
+
+	// PublicationDropAlreadyAbsent means no publication of that name
+	// exists on the source (a prior run — or an operator — already
+	// removed it). Success for idempotent re-runs.
+	PublicationDropAlreadyAbsent
+
+	// PublicationDropDropped means the publication was dropped (or
+	// would be, under dryRun).
+	PublicationDropDropped
+)
+
+// StreamPublicationDropper is the optional surface a [SlotManager]
+// can implement on engines whose CDC reads through a named
+// server-side table-filter object (the Postgres publication). Used by
+// `sluice sync decommission` to drop a finished stream's RECORDED
+// per-stream publication in the same pass that drops its replication
+// slot — the two share a lifecycle (see the engine's cleanup-parity
+// teardown paths).
+//
+// Engines without publications simply don't implement it; the caller
+// type-asserts and reports the skip.
+type StreamPublicationDropper interface {
+	// DropStreamPublication drops the named publication with the
+	// engine's per-stream guard semantics: an empty name and the
+	// engine's shared default are NEVER dropped
+	// (PublicationDropSkippedShared), absence is tolerated
+	// (PublicationDropAlreadyAbsent), and dryRun probes without
+	// mutating (PublicationDropDropped then means "would drop").
+	DropStreamPublication(ctx context.Context, name string, dryRun bool) (PublicationDropOutcome, error)
+}
+
 // MigrationPhase enumerates the phases a simple-mode migration can be
 // in. Stored as a TEXT column so the wire shape is portable across
 // engines and human-readable in ad-hoc psql/mysql sessions.

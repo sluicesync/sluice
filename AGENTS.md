@@ -20,6 +20,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 - `--force-cold-start` — bypasses the populated-target safety preflight
 - `--yes` — suppresses the reset confirmation; **on `expand-contract` it confirms the contract leg — a `DROP COLUMN` deploy request against the production branch** (without it the run stops after verify and prints the resume command)
 - `backup prune` / `backup compact` without `--dry-run` — irreversibly drop backup history
+- `sync decommission --yes` — drops a finished stream's replication slot + per-stream publication on the source and clears its control row on the target; the stream can never warm-resume after (preview with `--dry-run`, which needs no `--yes`)
 
 ## The standard workflow
 

@@ -289,6 +289,7 @@ Commands:
   sync run                 Supervise a fleet of syncs from one process (ADR-0122).
   sync status              Show status of a running sync stream.
   sync stop                Gracefully drain and stop a running stream.
+  sync decommission        Retire a finished stream: drop its slot + publication (source) and control row (target).
   sync health              Probe a stream's freshness; cron-friendly exit code.
   sync tui                 Live terminal dashboard for a running fleet (ADR-0125).
   sync from-backup run     Replay a backup chain into a target as a long-running broker.

@@ -142,3 +142,35 @@ func (m *SlotManager) Drop(ctx context.Context, name string, force bool) error {
 	}
 	return nil
 }
+
+// DropStreamPublication implements [ir.StreamPublicationDropper] for
+// `sluice sync decommission`: drop a finished stream's RECORDED
+// per-stream publication alongside its slot.
+//
+// The guard semantics are [dropOwnPublicationIfPerStream]'s, reused
+// verbatim for the drop itself: an empty name and the shared default
+// (`sluice_pub`) are NEVER dropped — every legacy deployment reads
+// through the default, and it may serve other streams. The existence
+// probe on top exists so the caller's report (and `--dry-run`) can
+// distinguish "dropped" from "already absent" — an idempotent re-run
+// after a partial failure should say what it found, not just succeed.
+func (m *SlotManager) DropStreamPublication(ctx context.Context, name string, dryRun bool) (ir.PublicationDropOutcome, error) {
+	if name == "" || name == defaultPublication {
+		return ir.PublicationDropSkippedShared, nil
+	}
+	var exists bool
+	const q = `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`
+	if err := m.db.QueryRowContext(ctx, q, name).Scan(&exists); err != nil {
+		return ir.PublicationDropSkippedShared, fmt.Errorf("postgres: check publication %q: %w", name, err)
+	}
+	if !exists {
+		return ir.PublicationDropAlreadyAbsent, nil
+	}
+	if dryRun {
+		return ir.PublicationDropDropped, nil
+	}
+	if err := dropOwnPublicationIfPerStream(ctx, m.db, name); err != nil {
+		return ir.PublicationDropSkippedShared, err
+	}
+	return ir.PublicationDropDropped, nil
+}

@@ -145,19 +145,24 @@ sluice verify \
     --target-driver postgres --target "$DST" \
     --include-table 'orders,order_items' --depth=sample
 
-# 5. Decommission the wave's source-side objects (Postgres sources).
-#    A finished wave's replication slot pins WAL on the source for the
-#    REST of the migration — weeks, on a multi-wave plan — and (since
-#    v0.99.289) blocks any later differently-scoped cold start, because
-#    an existing slot claims its scope even when inactive. Drop the slot,
-#    and the wave's publication if it had its own:
-psql "$SRC" -c "SELECT pg_drop_replication_slot('sluice_wave1');"
-psql "$SRC" -c "DROP PUBLICATION IF EXISTS sluice_wave1;"
+# 5. Decommission the finished wave. A finished wave's replication
+#    slot pins WAL on the source for the REST of the migration —
+#    weeks, on a multi-wave plan — and (since v0.99.289) blocks any
+#    later differently-scoped cold start, because an existing slot
+#    claims its scope even when inactive. This drops the wave's slot
+#    and its RECORDED per-stream publication on the source (never the
+#    shared sluice_pub) and clears its control row on the target:
+sluice sync decommission \
+    --source-driver mysql    --source "$SRC" \
+    --target-driver postgres --target "$DST" \
+    --stream-id wave1 --yes
 ```
 
 `cutover` takes `--include-table` too, so a wave's sequences are primed without touching tables that are still source-authoritative. Skipping it is the classic staged-migration failure: application writes to the target start allocating IDs that collide with rows CDC is about to deliver.
 
 Use `--wait` on `sync stop`. Without it the stop is asynchronous and late in-flight changes may not have landed.
+
+`sync decommission` is engine-aware. On a **Postgres source** it drops the wave's replication slot and the per-stream publication recorded on the wave's control row — the shared `sluice_pub` is never dropped, and a stream whose slot is still active refuses loudly with `SLUICE-E-DECOMMISSION-STREAM-ACTIVE` (run `sync stop --wait` first). On a **MySQL-family source** there are no source-side objects (the binlog is the stream), so it just clears the control row and says so. On a **trigger-CDC source** the change-log table and triggers are shared across streams and are deliberately left alone — `sluice trigger prune` bounds the log's growth and `sluice trigger teardown` removes the machinery once no streams remain. `--dry-run` previews without touching anything; a partially-failed run reports exactly what was and wasn't removed, keeps the control row, and an idempotent re-run completes the rest. If you prefer raw SQL on a Postgres source (or are on an older sluice), the manual equivalent is `psql "$SRC" -c "SELECT pg_drop_replication_slot('sluice_wave1');"` followed by `psql "$SRC" -c "DROP PUBLICATION IF EXISTS sluice_wave1;"` — plus deleting the stream's row from the target's `sluice_cdc_state`.
 
 Do not skip step 5 on a Postgres source: the WAL a forgotten slot retains has invalidated slots on small managed instances at a few hundred MB, and every later wave with a different scope will refuse until the leftover slot is gone.
 

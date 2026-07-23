@@ -160,6 +160,11 @@ var (
 	_ ir.SlotManager         = (*SlotManager)(nil)
 	_ ir.SnapshotImporter    = (*SnapshotImporter)(nil)
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)
+	// StreamPublicationDropper backs `sluice sync decommission`'s
+	// per-stream publication removal (audit 2026-07-23 DEVEX-3/Q3); a
+	// method-set drift would silently downgrade PG decommission to
+	// slot-only with a "does not expose publication management" skip.
+	_ ir.StreamPublicationDropper = (*SlotManager)(nil)
 
 	// audit-2026-07-11 M-3: finish the ARCH-F1 sweep — runtime-dispatched
 	// optional surfaces that were implemented but unpinned (a method-set drift

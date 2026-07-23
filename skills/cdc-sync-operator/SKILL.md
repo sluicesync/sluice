@@ -30,6 +30,8 @@ The user wants ongoing replication (not a one-shot migrate): a cold-start snapsh
 
 7. **Cut over.** Sequence: `sluice sync stop --target-driver <drv> --target "$SLUICE_TARGET" --stream-id <id> --wait` (drains in-flight changes and clears the stop signal; `--timeout` bounds the wait) → flip application traffic to the target → `sluice cutover --format json --source-driver <drv> --source … --target-driver <drv> --target …` (re-reads source sequence/AUTO_INCREMENT state and applies it with `--sequence-margin` headroom, default 1000). Cutover is idempotent (re-run reports "noop"); it **refuses loudly (exit non-zero)** if the target sequence is already ahead — that means a re-snapshot decision, not a retry.
 
+8. **Decommission a finished stream** (destructive — gated like `slot drop`). `sluice sync decommission --source-driver <drv> --source "$SLUICE_SOURCE" --target-driver <drv> --target "$SLUICE_TARGET" --stream-id <id> --yes` drops the stream's PG replication slot and its recorded per-stream publication on the source (never the shared `sluice_pub`) and clears its control row on the target — after this the stream can never warm-resume. A finished stream's slot otherwise pins WAL and (since v0.99.289) blocks later differently-scoped cold starts. Refuses with `SLUICE-E-DECOMMISSION-STREAM-ACTIVE` while the slot is active (run `sync stop --wait` first); `--dry-run` previews without `--yes`; MySQL-family sources have no source-side objects (control row only). Partial failures keep the control row; re-run to finish.
+
 ## What you return
 - **Lifecycle state:** cold-start done? handed to CDC? current `sync health` verdict (+ exit code).
 - **Freshness:** seconds-since-last-apply, byte-lag (PG), any breached threshold named.

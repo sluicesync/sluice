@@ -93,6 +93,14 @@ const (
 	// (decode + lift).
 	CodeCDCMariaDBNativeTypeUnsupported Code = "SLUICE-E-CDC-MARIADB-NATIVE-TYPE-UNSUPPORTED"
 
+	// audit 2026-07-23 DEVEX-3 / open question Q3: `sync decommission`
+	// refuses while the stream's replication slot is ACTIVE on the
+	// source — an attached walsender means the stream is live, and
+	// decommissioning a live stream yanks its slot (and publication)
+	// out from under it mid-stream. The remedy is a drain first
+	// (`sluice sync stop --wait`), then re-run.
+	CodeDecommissionStreamActive Code = "SLUICE-E-DECOMMISSION-STREAM-ACTIVE"
+
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
@@ -222,6 +230,8 @@ var registry = map[Code]Info{
 	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL/Vitess source streams partial row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON; on a self-hosted Vitess/VStream source the RowChange.DataColumns bitmap marks a NOBLOB-omitted column), under which CDC silently loses UPDATEs — refused at CDC start on the binlog path, and loudly mid-stream when a partial image reaches the reader (a slipped-past global preflight, or a VStream after-image whose bitmap flags an omitted column)"},
 	CodeCDCMariaDBUnsupported:           {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB CDC (domain-GTID positions) shipped v0.99.271 (ADR-0170); the flavor now declares CDCBinlog and this refusal is no longer emitted. Kept registered because removing a published catalog code is breaking"},
 	CodeCDCMariaDBNativeTypeUnsupported: {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB native uuid/inet6/inet4 CDC binlog decode shipped v0.99.272 (ADR-0171), lifting this refusal — the CDC tail now converges byte-for-byte with the bulk-copy text. Kept registered because removing a published code is breaking; no longer emitted"},
+
+	CodeDecommissionStreamActive: {ClassRefusal, "sync decommission refused: the stream's replication slot is active on the source (a CDC consumer is attached — the stream looks live); drain it with `sluice sync stop --wait` first, then re-run decommission"},
 
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
