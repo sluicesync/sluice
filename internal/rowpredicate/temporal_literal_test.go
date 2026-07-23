@@ -4,6 +4,7 @@
 package rowpredicate
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -66,8 +67,10 @@ func TestColumnInfosFromIR_TemporalSemantics(t *testing.T) {
 // re-ground-truthed by the temporal_realdb integration matrix. The three
 // engine modes and the ClientExact zero value are each pinned per literal
 // shape — the flavor-divergent .1234565 half-boundary is the discriminator
-// cell (PG half-even keeps .123456, MySQL half-up gives .123457, MariaDB
-// truncates to .123456).
+// cell (PG's double-mediated rint keeps .123456 there, MySQL half-up gives
+// .123457, MariaDB truncates to .123456), and the .0001255/.0001265 pair
+// pins that PG's rule is the DOUBLE-mediated one, not exact decimal
+// half-even (review F1).
 func TestTemporalLiteralNormalization(t *testing.T) {
 	date := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
 	ts := func(ns int) time.Time { return time.Date(2026, 1, 15, 8, 30, 0, ns, time.UTC) }
@@ -105,13 +108,25 @@ func TestTemporalLiteralNormalization(t *testing.T) {
 		{"pg date pure-date literal untouched", pgInfos, "d = '2026-01-15'", ir.Row{"d": date(2026, 1, 15)}, true},
 		{"pg date earlier day stays lt", pgInfos, "d < '2026-01-15 12:00:00'", ir.Row{"d": date(2026, 1, 14)}, true},
 
-		// ---- Postgres: fractional seconds round HALF-EVEN to µs ----
-		{"pg ts half-boundary rounds to even (.1234565 → .123456)", pgInfos, "ts = '2026-01-15 08:30:00.1234565'", ir.Row{"ts": ts(123456000)}, true},
-		{"pg ts half-boundary odd floor rounds up (.1234575 → .123458)", pgInfos, "ts = '2026-01-15 08:30:00.1234575'", ir.Row{"ts": ts(123457000)}, false},
+		// ---- Postgres: fractional seconds round DOUBLE-MEDIATED to µs ----
+		// PG's rule is rint(strtod(fraction)·10⁶) (datetime.c) — nominally
+		// round-half-even, but computed through a binary double, so the
+		// decimal-exact half rounds the way the DOUBLE of the fraction
+		// lands. The .0001255/.0001265 pair is the divergence pin: exact
+		// decimal half-even would give .000126/.000126, PG gives
+		// .000125/.000127 (OBSERVED live, 2026-07-23).
+		{"pg ts .1234565 half lands below (→ .123456)", pgInfos, "ts = '2026-01-15 08:30:00.1234565'", ir.Row{"ts": ts(123456000)}, true},
+		{"pg ts .1234575 half lands above (→ .123458)", pgInfos, "ts = '2026-01-15 08:30:00.1234575'", ir.Row{"ts": ts(123457000)}, false},
 		{"pg ts .1234575 matches .123458", pgInfos, "ts = '2026-01-15 08:30:00.1234575'", ir.Row{"ts": ts(123458000)}, true},
+		{"pg ts .0001255 double lands BELOW the half (→ .000125, not exact-half-even's .000126)", pgInfos, "ts = '2026-01-15 08:30:00.0001255'", ir.Row{"ts": ts(125000)}, true},
+		{"pg ts .0001255 does not match .000126", pgInfos, "ts = '2026-01-15 08:30:00.0001255'", ir.Row{"ts": ts(126000)}, false},
+		{"pg ts .0001265 double lands ABOVE the half (→ .000127, not exact-half-even's .000126)", pgInfos, "ts = '2026-01-15 08:30:00.0001265'", ir.Row{"ts": ts(127000)}, true},
+		{"pg ts .0001265 does not match .000126", pgInfos, "ts = '2026-01-15 08:30:00.0001265'", ir.Row{"ts": ts(126000)}, false},
 		{"pg ts 7-digit rounds up (.1234567 → .123457)", pgInfos, "ts = '2026-01-15 08:30:00.1234567'", ir.Row{"ts": ts(123457000)}, true},
 		{"pg ts 7-digit does not match the truncation", pgInfos, "ts = '2026-01-15 08:30:00.1234567'", ir.Row{"ts": ts(123456000)}, false},
 		{"pg ts rounding carries into seconds (.9999995 → +1s)", pgInfos, "ts = '2026-01-15 08:30:00.9999995'", ir.Row{"ts": time.Date(2026, 1, 15, 8, 30, 1, 0, time.UTC)}, true},
+		{"pg ts 8-digit fraction (.12345650 → .123456)", pgInfos, "ts = '2026-01-15 08:30:00.12345650'", ir.Row{"ts": ts(123456000)}, true},
+		{"pg ts 9-digit fraction (.123456501 → .123457)", pgInfos, "ts = '2026-01-15 08:30:00.123456501'", ir.Row{"ts": ts(123457000)}, true},
 		{"pg ts 6-digit literal untouched", pgInfos, "ts = '2026-01-15 08:30:00.123456'", ir.Row{"ts": ts(123456000)}, true},
 
 		// ---- MySQL: DATE PROMOTED to datetime (full instant compared) ----
@@ -132,10 +147,10 @@ func TestTemporalLiteralNormalization(t *testing.T) {
 		{"mariadb dt .9999995 does not match the next second", mdbInfos, "dt = '2026-01-15 08:30:00.9999995'", ir.Row{"dt": time.Date(2026, 1, 15, 8, 30, 1, 0, time.UTC)}, false},
 		{"mariadb date promotes like mysql", mdbInfos, "d = '2026-01-15 08:30:00'", ir.Row{"d": date(2026, 1, 15)}, false},
 
-		// ---- ClientExact zero value: NO normalization (pre-Q1 behavior;
-		// the push-down classifiers keep these out as the fail-closed belt) ----
-		{"clientexact date compares the full instant", exactInfos, "d = '2026-01-15 08:30:00'", ir.Row{"d": date(2026, 1, 15)}, false},
-		{"clientexact keeps sub-µs precision (no rounding)", exactInfos, "dt >= '2026-01-15 08:30:00.1234561'", ir.Row{"dt": ts(123456000)}, false},
+		// ---- ClientExact zero value: engine-granular literals still
+		// compile and compare at full (exact) precision ----
+		{"clientexact datetime time-bearing literal is exact", exactInfos, "dt = '2026-01-15 08:30:00.123456'", ir.Row{"dt": ts(123456000)}, true},
+		{"clientexact pure-date literal on a date column", exactInfos, "d = '2026-01-15'", ir.Row{"d": date(2026, 1, 15)}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +158,99 @@ func TestTemporalLiteralNormalization(t *testing.T) {
 			assertEval(t, p, tc.row, tc.want)
 		})
 	}
+}
+
+// TestTemporalLiteralClientExactRefusals pins review F4: under the
+// ClientExact zero value (no engine temporal-literal lens) a literal
+// FINER-grained than the column REFUSES at compile — the engines resolve
+// the mismatch three different ways, so a full-precision client compare is
+// a guess, and Compile's other unfaithful-comparison refusals set the
+// pattern. This makes "Compile output is always engine-granular or
+// engine-normalized" code, not a doc comment: no compiled predicate can
+// carry a granularity mismatch the evaluator would mis-compare.
+func TestTemporalLiteralClientExactRefusals(t *testing.T) {
+	exactInfos := map[string]ColumnInfo{
+		"d":  {Family: FamilyTemporal, TemporalDateOnly: true},
+		"dt": {Family: FamilyTemporal},
+	}
+	for _, pred := range []string{
+		"d = '2026-01-15 08:30:00'",               // time-bearing on DATE
+		"d < '2026-01-15 12:00'",                  // minute form on DATE
+		"d IN ('2026-01-15', '2026-01-16 08:30')", // one time-bearing member
+		"dt >= '2026-01-15 08:30:00.1234561'",     // sub-µs fraction
+		"dt IN ('2026-01-15 08:30:00.1234567')",   // sub-µs IN member
+	} {
+		t.Run(pred, func(t *testing.T) {
+			mustRefuse(t, pred, exactInfos)
+		})
+	}
+	// Engine-granular shapes stay compilable under ClientExact.
+	for _, pred := range []string{
+		"d = '2026-01-15'",
+		"dt = '2026-01-15 08:30:00.123456'",
+		"dt < '2026-01-15 12:00:00'", // time-bearing is fine on a NON-date temporal
+		"d IS NULL",
+	} {
+		t.Run("allow "+pred, func(t *testing.T) {
+			mustCompile(t, pred, exactInfos)
+		})
+	}
+}
+
+// TestCompareNumeric_NonFiniteTotalOrder pins the FamilyNumeric sibling of
+// the Q4 owner call (review F2): PG's NUMERIC type also stores NaN — and,
+// since PG 14, ±Infinity — ordered with the same total order as float (NaN
+// above everything, Infinity included). ir.Decimal values travel as STRINGS
+// per docs/value-types.md, so "NaN"/"Infinity"/"-Infinity" arrive at the
+// numeric comparator, where the exact big.Rat parse fails — pre-F2 that
+// meant UNKNOWN→drop, while ir.Decimal sits INSIDE the push-down envelope:
+// the server delivered a NaN row's changes and route() dropped them under
+// the benign-direction DEBUG log. Equality is ALLOWED on numeric (unlike
+// float), so =, !=, IN, and NOT IN are pinned alongside the orderings.
+// float64/float32 non-finite carriers get the same order (a value-contract
+// deviation would otherwise silently flip verdicts).
+func TestCompareNumeric_NonFiniteTotalOrder(t *testing.T) {
+	numCol := ColumnInfosFromIR(testPGResolver, []*ir.Column{{Name: "x", Type: ir.Decimal{Precision: 12, Scale: 4}}}, false)
+	cases := []struct {
+		pred string
+		val  any
+		want bool
+	}{
+		// NaN: above every finite literal.
+		{"x > 10.5", "NaN", true},
+		{"x >= 10.5", "NaN", true},
+		{"x < 10.5", "NaN", false},
+		{"x <= 10.5", "NaN", false},
+		{"x = 10.5", "NaN", false},
+		{"x != 10.5", "NaN", true},
+		{"x IN (10.5, 20)", "NaN", false},
+		{"x NOT IN (10.5, 20)", "NaN", true},
+		// +Infinity: above every finite literal.
+		{"x > 10.5", "Infinity", true},
+		{"x < 10.5", "Infinity", false},
+		{"x = 10.5", "Infinity", false},
+		{"x != 10.5", "Infinity", true},
+		// -Infinity: below every finite literal.
+		{"x < 10.5", "-Infinity", true},
+		{"x > 10.5", "-Infinity", false},
+		{"x != 10.5", "-Infinity", true},
+		// float64 carriers order identically.
+		{"x > 10.5", math.NaN(), true},
+		{"x > 10.5", math.Inf(1), true},
+		{"x < 10.5", math.Inf(-1), true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/%v", tc.pred, tc.val), func(t *testing.T) {
+			p := mustCompile(t, tc.pred, numCol)
+			assertEval(t, p, ir.Row{"x": tc.val}, tc.want)
+		})
+	}
+
+	// A finite-but-unparseable string stays UNKNOWN (contract violation →
+	// no guessed verdict), and a normal decimal string is untouched.
+	p := mustCompile(t, "x > 10.5", numCol)
+	assertEval(t, p, ir.Row{"x": "not-a-number"}, false)
+	assertEval(t, p, ir.Row{"x": "10.5001"}, true)
 }
 
 // TestCompareFloat_NaNTotalOrder pins the Q4 owner call (audit 2026-07-23

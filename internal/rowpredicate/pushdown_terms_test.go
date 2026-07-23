@@ -93,16 +93,6 @@ func TestPushdownTerms(t *testing.T) {
 			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
 		},
 		{
-			name:      "7 fractional digits is sub-microsecond (PG rounds to µs, the client keeps ns)",
-			predicate: "d >= '2026-01-15 08:30:00.1234567'",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}},
-		},
-		{
-			name:      "IN list flags fold across members (one time-bearing member flags the term)",
-			predicate: "d IN ('2026-01-15', '2026-01-16 08:30:00.1234567')",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}},
-		},
-		{
 			name:      "IN list of pure dates carries no granularity flag",
 			predicate: "d NOT IN ('2026-01-15', '2026-01-16')",
 			want:      []PushdownTerm{{Column: "d"}},
@@ -151,7 +141,7 @@ func TestPushdownTerms_NormalizedLiteralCarriesNoFlags(t *testing.T) {
 		"d = '2026-01-15 00:00:00'",                       // midnight is still rewritten (text-keyed)
 		"d IN ('2026-01-15', '2026-01-16 08:30:00')",      // per-member truncation
 		"ts >= '2026-01-15 08:30:00.1234567'",             // 7 digits → rounded to µs
-		"ts IN ('2026-01-15 08:30:00.1234565')",           // half-even boundary member
+		"ts IN ('2026-01-15 08:30:00.1234565')",           // half-boundary member
 		"NOT (d >= '2026-01-15 12:00:00') AND ts IS NULL", // composition
 	} {
 		t.Run(pred, func(t *testing.T) {
@@ -171,6 +161,31 @@ func TestPushdownTerms_NormalizedLiteralCarriesNoFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPushdownTerms_SubMicrosecondFlagOnHandBuiltAST pins the
+// TemporalLiteralSubMicrosecond flag on hand-built cmp/IN nodes. Compile can
+// no longer PRODUCE such a term (an engine lens normalizes the literal to
+// µs; the ClientExact zero value refuses it outright — review F4), so the
+// flag is purely the classifier's fail-closed belt for terms that reach a
+// push-down site without going through Compile's gates — and its
+// computation is pinned here on the AST directly, exactly the shape the
+// belt defends against.
+func TestPushdownTerms_SubMicrosecondFlagOnHandBuiltAST(t *testing.T) {
+	subMicroLit := literal{kind: litString, str: "2026-01-15 08:30:00.1234567"}
+	pureDateLit := literal{kind: litString, str: "2026-01-15"}
+
+	p := &Predicate{root: andNode{kids: []node{
+		cmpNode{column: "d", fam: FamilyTemporal, op: opGe, lit: subMicroLit},
+		inNode{column: "d", fam: FamilyTemporal, lits: []literal{pureDateLit, subMicroLit}},
+	}}}
+	want := []PushdownTerm{
+		{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true},
+		{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}, // one sub-µs member flags the IN term
+	}
+	if got := p.PushdownTerms(); !reflect.DeepEqual(got, want) {
+		t.Errorf("PushdownTerms() = %+v, want %+v", got, want)
 	}
 }
 

@@ -122,8 +122,10 @@ func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.Colla
 // catalogs carry, resolved per flavor here. PlanetScale/Vitess keep the
 // vanilla MySQL rule (mysqld backs the tablets); the VStream server-side
 // filter's OWN coercion of a finer-than-µs literal (vtgate evalengine) is a
-// separate, unverified surface — noted in the ADR-0174 residuals, not
-// resolved here.
+// separate, UNVERIFIED surface — recorded in ADR-0174's residuals, and the
+// pipeline routes engine-coerced temporal terms through the A0 client-side
+// fallback on VStream sources rather than push them (review F3;
+// where_cdc_filter.go temporalCoercionCols).
 func (r mysqlCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLiteralSemantics {
 	if r.flavor == FlavorMariaDB {
 		return ir.TemporalLiteralPromoteTruncate

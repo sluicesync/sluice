@@ -218,3 +218,160 @@ func TestWhereCDC_PGFloatNonFinite(t *testing.T) {
 		t.Fatalf("route NaN DELETE emitted %T; want ir.Delete (dropping it orphans the target row)", emitted[0])
 	}
 }
+
+// TestWhereCDC_PGNumericNonFinite is the FamilyNumeric sibling of the float
+// gate above (review F2): PG's NUMERIC stores NaN — and, since PG 14,
+// ±Infinity (unconstrained numeric only) — ordered NaN above everything.
+// ir.Decimal values travel as STRINGS, so the non-finite specials reach the
+// numeric comparator as "NaN"/"Infinity"/"-Infinity"; pre-F2 the exact
+// big.Rat parse failed → UNKNOWN → drop, while numeric sits INSIDE the
+// push-down envelope, so the server delivered the NaN row's changes and
+// route() destroyed them under the benign-direction DEBUG log. Unlike
+// float, numeric allows EQUALITY, so =/!=/IN ride alongside the orderings.
+// Real logical decoding ground-truths the string delivery contract.
+func TestWhereCDC_PGNumericNonFinite(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	const table = "orcn"
+	applyDDL(t, sourceDSN, `
+		CREATE TABLE orcn (id int PRIMARY KEY, v numeric, w int);
+		ALTER TABLE orcn REPLICA IDENTITY FULL;
+	`)
+
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("open schema reader: %v", err)
+	}
+	schema, err := sr.ReadSchema(context.Background())
+	migcore.CloseIf(sr)
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	resolver := pgEng.(ir.CollationResolverProvider).CollationResolver()
+
+	ctx := context.Background()
+	const pub, slot = "sluice_orcn", "sluice_orcn"
+	eng := pgEng.(ir.PublicationScoper).WithPublicationScope(pub, slot)
+	if err := eng.(publicationEnsurer).EnsurePublication(ctx, sourceDSN, []string{table}); err != nil {
+		t.Fatalf("ensure publication: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS "+pub) }()
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	rdr, err := eng.(ir.CDCReaderWithSlotOpener).OpenCDCReaderWithSlot(ctx, sourceDSN, slot)
+	if err != nil {
+		t.Fatalf("open CDC reader: %v", err)
+	}
+	rdr.(ir.FullBeforeImageSetter).SetFullBeforeImageTables(map[string]bool{table: true})
+	ch, err := rdr.StreamChanges(streamCtx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	defer func() {
+		cancelStream()
+		migcore.CloseIf(rdr)
+		dropSlotWithRetry(t, db, slot, 30*time.Second)
+	}()
+
+	for _, stmt := range []string{
+		`INSERT INTO orcn (id, v, w) VALUES (1, 'NaN'::numeric, 0)`,
+		`INSERT INTO orcn (id, v, w) VALUES (2, 'Infinity'::numeric, 0)`,
+		`INSERT INTO orcn (id, v, w) VALUES (3, '-Infinity'::numeric, 0)`,
+		`INSERT INTO orcn (id, v, w) VALUES (4, 10.5, 0)`,
+		`INSERT INTO orcn (id, v, w) VALUES (5, 0.01, 0)`,
+		`UPDATE orcn SET w = 1 WHERE id = 1`,
+		`DELETE FROM orcn WHERE id = 1`,
+		`INSERT INTO orcn (id, v, w) VALUES (9999, 99, 0)`, // sentinel
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("workload %q: %v", stmt, err)
+		}
+	}
+	raw := drainUntilSentinel(t, ch, table, 60*time.Second)
+
+	decoded := map[int64]ir.Row{}
+	var nanUpdate, nanDelete ir.Change
+	for _, c := range raw {
+		switch e := c.(type) {
+		case ir.Insert:
+			if id, ok := e.Row["id"].(int64); ok {
+				decoded[id] = e.Row
+			} else if id32, ok := e.Row["id"].(int32); ok {
+				decoded[int64(id32)] = e.Row
+			}
+		case ir.Update:
+			nanUpdate = e
+		case ir.Delete:
+			nanDelete = e
+		}
+	}
+
+	// Snapshot-leg vs CDC-leg agreement per (op × row); the ops include
+	// equality — allowed on numeric, refused on float.
+	rowLits := map[int64]string{1: "'NaN'::numeric", 2: "'Infinity'::numeric", 3: "'-Infinity'::numeric", 4: "10.5::numeric", 5: "0.01::numeric"}
+	for _, pred := range []string{"v > 10.5", "v >= 10.5", "v < 10.5", "v <= 10.5", "v = 10.5", "v != 10.5", "v NOT IN (10.5, 99)"} {
+		wf, err := buildWhereCDCFilter(resolver, map[string]string{table: pred}, schema, false)
+		if err != nil {
+			t.Fatalf("compile %q: %v", pred, err)
+		}
+		for id, lit := range rowLits {
+			var serverMatches int
+			if err := db.QueryRowContext(ctx,
+				fmt.Sprintf(`SELECT count(*) FROM (VALUES (%s)) AS r(v) WHERE %s`, lit, pred)).Scan(&serverMatches); err != nil {
+				t.Fatalf("server verdict for %q on %s: %v", pred, lit, err)
+			}
+			client := wf.predicateFor(table).Eval(decoded[id])
+			if (serverMatches > 0) != client {
+				t.Errorf("row %d (%s) under %q: server=%v client=%v — snapshot and CDC legs disagree on non-finite NUMERIC (review F2)",
+					id, lit, pred, serverMatches > 0, client)
+			}
+		}
+	}
+
+	// The consequence shapes under `v > 10.5` (NaN in scope server-side —
+	// and numeric is INSIDE the push-down envelope, so in production the
+	// server genuinely delivers these): UPDATE stays UPDATE, DELETE stays
+	// DELETE.
+	wf, err := buildWhereCDCFilter(resolver, map[string]string{table: "v > 10.5"}, schema, false)
+	if err != nil {
+		t.Fatalf("compile route filter: %v", err)
+	}
+	if nanUpdate == nil {
+		t.Fatal("workload UPDATE on the NaN row never arrived")
+	}
+	emitted, err := wf.route(nanUpdate)
+	if err != nil {
+		t.Fatalf("route NaN UPDATE: %v", err)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("route NaN UPDATE emitted %d changes; want 1 (the UPDATE)", len(emitted))
+	}
+	if _, ok := emitted[0].(ir.Update); !ok {
+		t.Fatalf("route NaN UPDATE emitted %T; want ir.Update (an in-scope row must stay in scope)", emitted[0])
+	}
+	if nanDelete == nil {
+		t.Fatal("workload DELETE on the NaN row never arrived")
+	}
+	emitted, err = wf.route(nanDelete)
+	if err != nil {
+		t.Fatalf("route NaN DELETE: %v", err)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("route NaN DELETE emitted %d changes; want 1 (the DELETE)", len(emitted))
+	}
+	if _, ok := emitted[0].(ir.Delete); !ok {
+		t.Fatalf("route NaN DELETE emitted %T; want ir.Delete (dropping it orphans the target row)", emitted[0])
+	}
+}

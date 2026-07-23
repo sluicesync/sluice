@@ -41,7 +41,8 @@ import (
 //     Temporal literals FINER than the column (a time-bearing literal on a
 //     DATE column; >6 fractional-second digits) are eligible too — Compile
 //     normalizes them to PG's own cast-to-column semantics (truncate to the
-//     date; round half-even to µs — audit 2026-07-23 D0-5 / Q1), so the
+//     date; round to µs by PG's double-mediated rint(strtod·10⁶) rule —
+//     audit 2026-07-23 D0-5 / Q1 + review F1), so the
 //     client evaluator and the pushed filter agree by construction, proven
 //     by the oracle's granularity cells. The term-level flags below remain
 //     the fail-closed BELT for a predicate compiled without the engine lens.
@@ -112,12 +113,16 @@ func pgPushdownEligibleTerms(tbl *ir.Table, terms []rowpredicate.PushdownTerm) (
 		// comparison semantics, so a predicate compiled through the PG
 		// engine's resolver can never carry these flags (a time-bearing
 		// literal on a DATE column is truncated to the date; >6 fractional
-		// digits round half-even to µs) — the normalized literal is exactly
+		// digits round to µs by PG's own double-mediated rule) — the
+		// normalized literal is exactly
 		// column-granular and client and server agree by construction (the
-		// oracle's granularity cells). A term STILL carrying a flag was
-		// compiled without the engine lens (a hand-built ColumnInfo map, a
-		// future non-normalizing caller); unnormalized, server and client
-		// provably disagree on the boundary, so it must not push.
+		// oracle's granularity cells). Compile can no longer produce a term
+		// with these flags at all — an engine lens normalizes the literal,
+		// and the ClientExact zero value REFUSES a finer-than-column
+		// literal outright (review F4) — so a term still carrying one
+		// reached this classifier without Compile's gates; unnormalized,
+		// server and client provably disagree on the boundary, so it must
+		// not push.
 		if term.TemporalLiteralTimeBearing {
 			if _, isDate := c.Type.(ir.Date); isDate {
 				return false, fmt.Sprintf("date column %q is compared to a time-bearing literal that Compile did not normalize to Postgres's cast-to-date semantics (the engine temporal-literal lens is missing), so the pushed filter and the client evaluator would disagree", c.Name)

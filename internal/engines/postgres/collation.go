@@ -43,8 +43,11 @@ func (pgCollationResolver) ResolveStringEquality(collation string, determinism i
 // Observed on PG 16.14 (2026-07-23): `d < '2026-01-15 12:00'` on a date
 // column plans — and is stored in a publication row filter — as
 // `(d < '2026-01-15'::date)`, the time-of-day silently truncated; a
-// fractional second beyond the µs timestamp resolution rounds HALF-EVEN
-// ('.1234565'::timestamp → .123456, '.1234575' → .123458), carrying into
+// fractional second beyond the µs timestamp resolution rounds by PG's
+// DOUBLE-MEDIATED rule, rint(strtod(fraction)·10⁶) — nominally half-even
+// but computed through a C double, so an exact-decimal half rounds the way
+// the binary double lands ('.1234565' → .123456, '.0001255' → .000125,
+// '.0001265' → .000127), carrying into
 // the seconds ('.9999995' → +1s); a typmod column (timestamp(0)) does NOT
 // truncate the literal — comparison runs at the type's µs resolution.
 // rowpredicate.Compile normalizes literals under this rule so the client

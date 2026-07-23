@@ -73,10 +73,28 @@ type whereCDCFilter struct {
 	// MySQL binlog, Postgres) push through the source's own PAD-faithful `=` and
 	// need no fallback. Keyed by lower-cased source table name.
 	padSpaceCols map[string]string
-	// padSpaceFloatSingleCols records, for each PAD-SPACE-forced table (above)
+	// temporalCoercionCols records, for each filtered table whose predicate
+	// ENGAGES the source engine's temporal-literal coercion — a literal
+	// Compile normalized (sub-µs fraction, or a date-truncated literal on a
+	// PG source), or a time-bearing literal on a DATE column (the
+	// MySQL-family promote comparison) — one such column (lower-cased). On
+	// a VStream flavor the server-side filter push-down is evaluated by
+	// vtgate's evalengine, whose coercion of a finer-than-µs fraction or a
+	// date-vs-datetime-literal comparison is an UNVERIFIED surface
+	// (ADR-0174 residuals; cluster ground-truth deferred to the
+	// vitess-cluster-validator) — so rather than push a possibly-divergent
+	// filter, such tables take the same A0 client-side fallback as
+	// padSpaceCols: streamed unfiltered server-side, filtered client-side
+	// with the engine-faithful predicate (review F3). Other flavors
+	// (vanilla MySQL binlog, Postgres) evaluate the pushed predicate with
+	// the source's OWN semantics — the exact semantics Compile normalized
+	// to — and need no fallback. Keyed by lower-cased source table name.
+	temporalCoercionCols map[string]string
+	// padSpaceFloatSingleCols records, for each client-copy-FORCED table
+	// (padSpaceCols or temporalCoercionCols, above)
 	// whose predicate ALSO compares a single-precision FLOAT column BY VALUE, one
 	// such column (lower-cased). It is the SL1 hazard (audit 2026-07-19): a
-	// pad-forced table takes the client-side COPY fallback, and the cold-start
+	// client-copy-forced table takes the client-side COPY fallback, and the cold-start
 	// COPY carries a single-precision FLOAT column's value DISPLAY-ROUNDED by
 	// mysqld's float->text formatter (the exact re-read repair runs AFTER copy, so
 	// the keep predicate sees the lossy pre-repair value). A FLOAT stored 0.1
@@ -157,6 +175,7 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 	refCols := make(map[string]map[string]bool, len(rowFilters))
 	var (
 		padSpaceCols            map[string]string
+		temporalCoercionCols    map[string]string
 		padSpaceFloatSingleCols map[string]string
 	)
 	for table, predicate := range rowFilters {
@@ -199,18 +218,29 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 				break
 			}
 		}
-		// SL1: a table that will take the client-side COPY fallback (pad-forced
-		// above) AND compares a single-precision FLOAT column by VALUE would
+		// F3: record the first column whose comparison engages the engine's
+		// temporal-literal coercion, so a VStream source routes the table
+		// through the A0 client-side fallback (see the temporalCoercionCols
+		// doc — the vtgate evalengine's coercion is unverified).
+		if col := temporalCoercionColumn(tbl, p); col != "" {
+			if temporalCoercionCols == nil {
+				temporalCoercionCols = make(map[string]string)
+			}
+			temporalCoercionCols[key] = col
+		}
+		// SL1: a table that will take the client-side COPY fallback
+		// (pad-forced or temporal-coercion-forced above) AND compares a
+		// single-precision FLOAT column by VALUE would
 		// evaluate that comparison on the DISPLAY-ROUNDED cold-start carrier value
 		// (see the padSpaceFloatSingleCols doc). Record the first such column so
 		// preflight can REFUSE on a VStream source. Two narrowings keep this from
-		// over-refusing: (1) only when the table is actually pad-forced — a non-pad
-		// table is server-filtered on the EXACT value, so its FLOAT comparison is
-		// faithful; (2) only a VALUE comparison (ValueComparedColumns, not the full
-		// Columns) — a `FLOAT IS [NOT] NULL` is a presence test whose result cannot
-		// depend on the rounded bits, so refusing it would be a wrong-refusal
-		// (audit 2026-07-19c F-WR-1).
-		if padSpaceCols[key] != "" {
+		// over-refusing: (1) only when the table actually takes the fallback — a
+		// server-filtered table is filtered on the EXACT value, so its FLOAT
+		// comparison is faithful; (2) only a VALUE comparison (ValueComparedColumns,
+		// not the full Columns) — a `FLOAT IS [NOT] NULL` is a presence test whose
+		// result cannot depend on the rounded bits, so refusing it would be a
+		// wrong-refusal (audit 2026-07-19c F-WR-1).
+		if padSpaceCols[key] != "" || temporalCoercionCols[key] != "" {
 			singleFloats := singlePrecisionFloatColumnSet(tbl)
 			for _, c := range p.ValueComparedColumns() {
 				if singleFloats[c] {
@@ -228,8 +258,41 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 		pkCols:                  pkCols,
 		refCols:                 refCols,
 		padSpaceCols:            padSpaceCols,
+		temporalCoercionCols:    temporalCoercionCols,
 		padSpaceFloatSingleCols: padSpaceFloatSingleCols,
 	}, nil
+}
+
+// temporalCoercionColumn returns one lower-cased column of tbl whose
+// comparison ENGAGES the source engine's temporal-literal coercion — a
+// literal Compile rewrote to the engine's granularity, or a time-bearing
+// literal against a DATE column (the promote-family full-instant compare) —
+// or "" when the predicate has no such term. These are exactly the terms
+// whose RAW text a VStream server-side push would hand to vtgate's
+// evalengine, whose own coercion is unverified (review F3; ADR-0174
+// residuals), so the caller records them for the A0 client-side fallback.
+func temporalCoercionColumn(tbl *ir.Table, p *rowpredicate.Predicate) string {
+	var types map[string]ir.Type
+	for _, term := range p.PushdownTerms() {
+		if term.TemporalLiteralNormalized {
+			return term.Column
+		}
+		if !term.TemporalLiteralTimeBearing {
+			continue
+		}
+		if types == nil {
+			types = make(map[string]ir.Type, len(tbl.Columns))
+			for _, c := range tbl.Columns {
+				if c != nil {
+					types[strings.ToLower(c.Name)] = c.Type
+				}
+			}
+		}
+		if _, isDate := types[term.Column].(ir.Date); isDate {
+			return term.Column
+		}
+	}
+	return ""
 }
 
 // singlePrecisionFloatColumnSet returns the lower-cased names of tbl's
@@ -274,24 +337,54 @@ func (f *whereCDCFilter) serverSidePadSpaceColumns() map[string]string {
 	return f.padSpaceCols
 }
 
-// clientCopyFilter returns the PAD-faithful cold-start COPY keep-predicate for
-// the A0 fallback (audit 2026-07-19): on a VStream source the PAD-SPACE tables
-// stream UNFILTERED server-side (the NO-PAD server filter can't reproduce their
-// `=`), so this narrows them client-side with the SAME compiled predicate the
-// CDC route() uses. A table that is NOT PAD-SPACE (still server-filtered) is
-// kept unconditionally, so the filter only touches the unfiltered-server-side
-// tables. Returns nil when there are no PAD-SPACE tables (no fallback needed —
-// so for a NO-PAD/non-string predicate, but engaged whenever a legacy-collation
-// string column is filtered, the PlanetScale default; audit 2026-07-19 A-D3).
-// The row is fed to Eval exactly as route() feeds a CDC row,
-// so the casing/collation contract is identical.
+// serverSideTemporalCoercionColumns returns the map of filtered table
+// (lower-cased) → one column whose comparison engages the source engine's
+// temporal-literal coercion (review F3 — see temporalCoercionCols). Nil-safe.
+func (f *whereCDCFilter) serverSideTemporalCoercionColumns() map[string]string {
+	if f == nil {
+		return nil
+	}
+	return f.temporalCoercionCols
+}
+
+// clientForcedTables returns the lower-cased set of filtered tables the
+// VStream A0 fallback must stream UNFILTERED server-side and filter
+// client-side: the PAD-SPACE tables (audit 2026-07-19 A0) plus the
+// temporal-coercion tables (review F3). Nil when no table is forced.
+// Nil-safe.
+func (f *whereCDCFilter) clientForcedTables() map[string]bool {
+	if f == nil || (len(f.padSpaceCols) == 0 && len(f.temporalCoercionCols) == 0) {
+		return nil
+	}
+	out := make(map[string]bool, len(f.padSpaceCols)+len(f.temporalCoercionCols))
+	for t := range f.padSpaceCols {
+		out[t] = true
+	}
+	for t := range f.temporalCoercionCols {
+		out[t] = true
+	}
+	return out
+}
+
+// clientCopyFilter returns the engine-faithful cold-start COPY keep-predicate
+// for the A0 fallback (audit 2026-07-19 + review F3): on a VStream source the
+// CLIENT-FORCED tables — PAD-SPACE columns (the NO-PAD server filter can't
+// reproduce their `=`) and temporal-coercion columns (the evalengine's
+// literal coercion is unverified) — stream UNFILTERED server-side, so this
+// narrows them client-side with the SAME compiled predicate the CDC route()
+// uses. A table that is NOT forced (still server-filtered) is kept
+// unconditionally, so the filter only touches the unfiltered-server-side
+// tables. Returns nil when no table is forced (no fallback needed). The row
+// is fed to Eval exactly as route() feeds a CDC row, so the casing/collation
+// contract is identical.
 func (f *whereCDCFilter) clientCopyFilter() func(table string, row ir.Row) bool {
-	if f == nil || len(f.padSpaceCols) == 0 {
+	forced := f.clientForcedTables()
+	if len(forced) == 0 {
 		return nil
 	}
 	return func(table string, row ir.Row) bool {
 		key := strings.ToLower(table)
-		if _, pad := f.padSpaceCols[key]; !pad {
+		if !forced[key] {
 			return true // server-filtered → keep
 		}
 		p := f.preds[key]
@@ -814,7 +907,8 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 				"use a DOUBLE column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy",
 				fmt.Errorf(
 					"continuous filtered sync (--where on `sync`): table %q takes the client-side COPY fallback (it filters a "+
-						"PAD-SPACE-collation column on a PlanetScale/Vitess source), and its predicate also compares the "+
+						"PAD-SPACE-collation or engine-coerced temporal-literal column on a PlanetScale/Vitess source), and its "+
+						"predicate also compares the "+
 						"single-precision FLOAT column %q — but the cold-start COPY carries FLOAT values display-rounded by "+
 						"mysqld's float->text formatter, so a boundary comparison (e.g. `> 0.1`) could silently drop a "+
 						"source-in-scope row. The stream refuses rather than mis-filter (DOUBLE is unaffected)",
@@ -822,10 +916,16 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 				),
 			)
 		}
-		if pad := filter.serverSidePadSpaceColumns(); len(pad) > 0 {
+		// The forced set unions the A0 PAD-SPACE tables (the NO-PAD server
+		// filter can't reproduce their `=`) with the F3 temporal-coercion
+		// tables (vtgate evalengine's coercion of a finer-than-column
+		// temporal literal is unverified — ADR-0174 residuals): both stream
+		// unfiltered server-side and filter client-side with the
+		// engine-faithful compiled predicate.
+		if forced := filter.clientForcedTables(); len(forced) > 0 {
 			serverSide := make(map[string]string, len(s.RowFilters))
 			for t, p := range s.RowFilters {
-				if _, isPad := pad[strings.ToLower(t)]; !isPad {
+				if !forced[strings.ToLower(t)] {
 					serverSide[t] = p
 				}
 			}
@@ -833,8 +933,9 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 			s.clientCopyFilter = filter.clientCopyFilter()
 			slog.InfoContext(
 				ctx,
-				"continuous filtered sync: PAD-SPACE-collation --where column(s) on VStream stream unfiltered server-side and are filtered client-side (audit 2026-07-19 A0 fallback)",
-				slog.Int("pad_space_tables", len(pad)),
+				"continuous filtered sync: --where column(s) the VStream server-side filter cannot evaluate faithfully stream unfiltered server-side and are filtered client-side (audit 2026-07-19 A0 fallback + review F3 temporal coercion)",
+				slog.Int("pad_space_tables", len(filter.serverSidePadSpaceColumns())),
+				slog.Int("temporal_coercion_tables", len(filter.serverSideTemporalCoercionColumns())),
 			)
 		}
 	}

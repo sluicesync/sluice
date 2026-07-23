@@ -143,9 +143,15 @@ func TestValueFamilies(t *testing.T) {
 		assertEval(t, p, ir.Row{"score": float64(20.0)}, true)
 		assertEval(t, p, ir.Row{"score": float64(19.99)}, false)
 	})
-	t.Run("float NaN never matches", func(t *testing.T) {
+	t.Run("numeric NaN sorts last (PG numeric total order)", func(t *testing.T) {
+		// Q4 sibling (review F2): PG's NUMERIC also stores NaN (and, PG 14+,
+		// ±Infinity), ordered NaN above everything — so a NaN in a
+		// FamilyNumeric column matches `> 0`, exactly as the snapshot leg's
+		// server-evaluated WHERE does. Pre-F2 this pinned the opposite
+		// (UNKNOWN→false), which silently dropped a NaN row's every CDC
+		// change while numeric sat INSIDE the push-down envelope.
 		p := mustCompile(t, "score > 0", map[string]ColumnInfo{"score": {Family: FamilyNumeric}})
-		assertEval(t, p, ir.Row{"score": math.NaN()}, false)
+		assertEval(t, p, ir.Row{"score": math.NaN()}, true)
 	})
 	t.Run("decimal string exact", func(t *testing.T) {
 		// Decimal values are strings (docs/value-types.md); comparison must

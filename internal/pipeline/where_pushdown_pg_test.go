@@ -123,10 +123,12 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 
 	// ---- Temporal literal granularity (audit 2026-07-23 D0-5 / Q1) ----
 	// The infos above carry NO engine temporal-literal lens (the ClientExact
-	// zero value), so Compile does not normalize — a finer-than-column
-	// literal keeps its full precision and the classifier's fail-closed
-	// BELT must keep the term out of the envelope (unnormalized, server and
-	// client provably disagree on the boundary).
+	// zero value) AND — unlike the real ColumnInfosFromIR — no
+	// TemporalDateOnly marker on d, so the time-bearing date predicates
+	// below slip past Compile's F4 refusal un-normalized: exactly the
+	// out-of-sync-with-the-schema shape the classifier's fail-closed BELT
+	// exists for. The belt must keep such terms out of the envelope
+	// (unnormalized, server and client provably disagree on the boundary).
 	if ok, _ := pgPushdownEligible(tbl, compile("d = '2026-01-15'")); !ok {
 		t.Error("date column with a pure-date literal must stay eligible")
 	}
@@ -144,8 +146,14 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 	if ok, _ := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.123456'")); !ok {
 		t.Error("timestamp column with a ≤6-fractional-digit literal must stay eligible")
 	}
-	if ok, reason := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.1234567'")); ok {
-		t.Error("un-normalized 7-fractional-digit literal must be ineligible (the belt)")
+	// A sub-µs literal cannot be COMPILED without an engine lens any more
+	// (review F4 refuses it under ClientExact), so the sub-µs belt arm is
+	// exercised on a hand-built term — the exact shape the belt defends
+	// against (a term that reached the classifier without Compile's gates).
+	if ok, reason := pgPushdownEligibleTerms(tbl, []rowpredicate.PushdownTerm{
+		{Column: "ts", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true},
+	}); ok {
+		t.Error("un-normalized sub-microsecond term must be ineligible (the belt)")
 	} else if !strings.Contains(reason, "ts") || !strings.Contains(reason, "fractional") {
 		t.Errorf("sub-microsecond reason must name the column and the rounding; got %q", reason)
 	}
@@ -165,7 +173,7 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 	// ---- The same shapes compiled THROUGH the engine lens are ADMITTED ----
 	// (audit 2026-07-23 D0-5 / Q1 — server semantics): Compile normalizes
 	// each literal to PG's cast-to-column coercion (truncate to the date;
-	// round half-even to µs), so the client evaluator and the pushed filter
+	// round to µs double-mediated), so the client evaluator and the pushed filter
 	// agree by construction — proven end to end by the oracle's granularity
 	// cells (TestPublicationScope_PushdownOracle date/timestamp families).
 	pgLens := map[string]rowpredicate.ColumnInfo{

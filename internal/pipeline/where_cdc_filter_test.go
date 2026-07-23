@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
@@ -358,6 +359,112 @@ func TestServerSidePadSpaceDetection(t *testing.T) {
 		var f *whereCDCFilter
 		if got := f.serverSidePadSpaceColumns(); got != nil {
 			t.Fatalf("nil.serverSidePadSpaceColumns = %v; want nil", got)
+		}
+	})
+}
+
+// TestServerSideTemporalCoercionDetection pins the F3 hazard detection
+// (2026-07-23 value-fidelity review): a predicate whose temporal term
+// engages the SOURCE engine's literal coercion — a sub-µs fraction Compile
+// normalized, or a time-bearing literal on a DATE column (the MySQL-family
+// promote comparison) — is recorded, so a VStream source routes the table
+// through the A0 client-side fallback instead of pushing the RAW text to
+// vtgate's evalengine, whose own coercion of those shapes is UNVERIFIED
+// (ADR-0174 residuals). Engine-granular literals are NOT recorded (the
+// pushed filter and the client agree wherever the backing mysqld evaluates).
+func TestServerSideTemporalCoercionDetection(t *testing.T) {
+	r := mysql.Engine{}.CollationResolver()
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{}},
+			{Name: "d", Type: ir.Date{}},
+			{Name: "dt", Type: ir.DateTime{Precision: 6}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+
+	cases := []struct {
+		name string
+		pred string
+		want string // recorded column, "" = not recorded
+	}{
+		{"sub-µs fraction (normalized) recorded", "dt = '2026-01-15 08:30:00.1234567'", "dt"},
+		{"time-bearing literal on DATE recorded", "d < '2026-01-15 08:30:00'", "d"},
+		{"time-bearing IN member on DATE recorded", "d IN ('2026-01-15', '2026-01-16 08:30')", "d"},
+		{"pure-date literal not recorded", "d = '2026-01-15'", ""},
+		{"µs-granular datetime literal not recorded", "dt = '2026-01-15 08:30:00.123456'", ""},
+		{"non-temporal predicate not recorded", "id > 3", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := buildWhereCDCFilter(r, map[string]string{"orders": tc.pred}, schema, false)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			got := f.serverSideTemporalCoercionColumns()["orders"]
+			if got != tc.want {
+				t.Fatalf("serverSideTemporalCoercionColumns[orders] = %q; want %q", got, tc.want)
+			}
+			// The forced-table union and the COPY keep-predicate must engage
+			// together: a recorded table gets a client-side filter, an
+			// unrecorded (and non-pad) one does not.
+			forced := f.clientForcedTables()
+			if (tc.want != "") != forced["orders"] {
+				t.Fatalf("clientForcedTables()[orders] = %v; want %v", forced["orders"], tc.want != "")
+			}
+			keep := f.clientCopyFilter()
+			if (tc.want != "") != (keep != nil) {
+				t.Fatalf("clientCopyFilter() nil-ness = %v; want engaged=%v", keep == nil, tc.want != "")
+			}
+		})
+	}
+
+	t.Run("temporal-forced table filters client-side, sibling stays server-kept", func(t *testing.T) {
+		twoTables := &ir.Schema{Tables: []*ir.Table{
+			schema.Tables[0],
+			{
+				Name: "widgets",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{}},
+					{Name: "n", Type: ir.Integer{}},
+				},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+			},
+		}}
+		f, err := buildWhereCDCFilter(r, map[string]string{
+			"orders":  "dt >= '2026-01-15 08:30:00.1234565'", // forced (MySQL rounds half-up → .123457)
+			"widgets": "n > 3",                               // server-filtered
+		}, twoTables, false)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		keep := f.clientCopyFilter()
+		if keep == nil {
+			t.Fatal("clientCopyFilter() = nil; want the fallback keep-predicate")
+		}
+		// The forced table evaluates the ENGINE-faithful (half-up) predicate:
+		// .123457 is kept, .123456 is dropped.
+		if !keep("orders", ir.Row{"dt": time.Date(2026, 1, 15, 8, 30, 0, 123457000, time.UTC)}) {
+			t.Error("keep(orders, .123457) = false; want true (>= the half-up-rounded literal)")
+		}
+		if keep("orders", ir.Row{"dt": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}) {
+			t.Error("keep(orders, .123456) = true; want false (below the half-up-rounded literal)")
+		}
+		// The server-filtered sibling is kept unconditionally (no
+		// double-filtering).
+		if !keep("widgets", ir.Row{"n": int64(0)}) {
+			t.Error("keep(widgets, out-of-scope row) = false; want true (server-filtered table is not re-filtered)")
+		}
+	})
+
+	t.Run("nil filter is safe", func(t *testing.T) {
+		var f *whereCDCFilter
+		if got := f.serverSideTemporalCoercionColumns(); got != nil {
+			t.Fatalf("nil.serverSideTemporalCoercionColumns = %v; want nil", got)
+		}
+		if got := f.clientForcedTables(); got != nil {
+			t.Fatalf("nil.clientForcedTables = %v; want nil", got)
 		}
 	})
 }

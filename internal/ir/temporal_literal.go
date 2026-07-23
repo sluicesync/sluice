@@ -19,10 +19,15 @@ package ir
 //   - Postgres 16.14: the unknown-typed literal is CAST TO THE COLUMN's type.
 //     On a DATE column the time-of-day is TRUNCATED (`d < '2026-01-15 12:00'`
 //     plans and publishes as `d < '2026-01-15'::date`); on a timestamp column
-//     fractional seconds round HALF-EVEN to µs ('.1234565' → .123456,
-//     '.1234575' → .123458) with carry ('.9999995' → +1s). Comparison
-//     precision is the TYPE's µs resolution — a typmod column
-//     (timestamp(0)) does NOT truncate the literal to its typmod.
+//     fractional seconds round to µs by PG's DOUBLE-MEDIATED rule —
+//     `rint(strtod(fraction) * 1e6)` (datetime.c), NOT exact decimal
+//     rounding: nominally half-even, but the fraction goes through a C
+//     double first, so an exact-decimal half rounds the way the binary
+//     double lands ('.1234565' → .123456 but '.0001255' → .000125 and
+//     '.0001265' → .000127, where exact half-even would give .000126 for
+//     all three) with carry ('.9999995' → +1s). Comparison precision is the
+//     TYPE's µs resolution — a typmod column (timestamp(0)) does NOT
+//     truncate the literal to its typmod.
 //   - MySQL 8.0.46: the DATE column is PROMOTED to datetime and compared as
 //     the full instant (`d = '2026-01-15 08:30'` is FALSE, `d < '2026-01-15
 //     12:00'` is TRUE); fractional seconds beyond 6 digits round HALF-UP
@@ -56,7 +61,8 @@ const (
 	TemporalLiteralClientExact TemporalLiteralSemantics = iota
 	// TemporalLiteralCastToColumn is the Postgres rule: the literal is cast
 	// to the COLUMN's type — truncated to the date on a DATE column, and
-	// fractional seconds rounded HALF-EVEN to the µs timestamp resolution.
+	// fractional seconds rounded to the µs timestamp resolution by PG's
+	// double-mediated rint(strtod·10⁶) rule (see the package comment).
 	TemporalLiteralCastToColumn
 	// TemporalLiteralPromoteRoundHalfUp is the MySQL rule: the DATE column
 	// is promoted to datetime (the full instant is compared), and literal

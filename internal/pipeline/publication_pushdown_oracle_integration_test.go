@@ -110,6 +110,25 @@ var oracleMatrix = []oracleFamily{
 		},
 	},
 	{
+		// Unconstrained NUMERIC with the non-finite specials (review F2
+		// belt): PG's NUMERIC stores NaN and (PG 14+) ±Infinity — NaN above
+		// everything, and ±Infinity only in an UNCONSTRAINED numeric column
+		// (numeric(p,s) refuses it with "numeric field overflow"; observed
+		// live) — and numeric is INSIDE the envelope, so the server
+		// evaluates the pushed filter on those rows and the client belt
+		// must agree. One ordering + one negated-equality cell put
+		// NaN/±Infinity through the pushed prqual, real decode, and the
+		// client belt. (The server-as-oracle gate for the evaluator class
+		// is TestWhereCDC_PGNumericNonFinite — a client-evaluator bug drops
+		// on BOTH of this oracle's legs identically, so these cells pin the
+		// pushed path's delivery, not the evaluator.)
+		name: "numeric_nonfinite", colType: "numeric",
+		cells: []oracleCell{
+			{name: "gt_nonfinite", pred: "v > 10.5", in0: "'NaN'::numeric", in1: "'Infinity'::numeric", out0: "'-Infinity'::numeric", out1: "0"},
+			{name: "ne_nonfinite", pred: "v != 10.5", in0: "'NaN'::numeric", in1: "'-Infinity'::numeric", out0: "10.5", out1: "10.5000"},
+		},
+	},
+	{
 		name: "bool", colType: "boolean",
 		cells: []oracleCell{
 			{name: "eq", pred: "v = TRUE", in0: "TRUE", in1: "TRUE", out0: "FALSE", out1: "FALSE"},
@@ -184,14 +203,19 @@ var oracleMatrix = []oracleFamily{
 			{name: "notin", pred: "v NOT IN ('2026-01-15 08:30:00', '2026-02-01 00:00:00')", in0: "'2026-01-15 08:30:01'", in1: "'2020-01-01 00:00:00'", out0: "'2026-01-15 08:30:00'", out1: "'2026-02-01 00:00:00'"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-16 00:00:00'"},
 			// SUB-MICROSECOND literals (audit 2026-07-23 D0-5, Q1
-			// re-admission): PG rounds >6 fractional digits HALF-EVEN to µs
-			// in both server-side legs, and Compile normalizes the client
-			// literal with the same rounding — equivalence cells, with the
-			// .1234565 half-boundary pinning the rounding MODE end to end
-			// (half-up would put in0/out0 on the wrong sides) and the
-			// .9999995 cell pinning the carry into seconds.
+			// re-admission): PG rounds >6 fractional digits to µs by its
+			// DOUBLE-MEDIATED rule (rint(strtod·10⁶) — review F1) in both
+			// server-side legs, and Compile normalizes the client literal
+			// with the same rule — equivalence cells. The .1234565 half
+			// pins the rounding mode end to end (half-up would put in0/out0
+			// on the wrong sides); the .0001255/.0001265 pair pins that the
+			// rule is DOUBLE-mediated (exact decimal half-even gives
+			// .000126 for BOTH — the review-F1 divergence, RED on the
+			// exact-decimal implementation); .9999995 pins the carry.
 			{name: "eq_7digit", pred: "v = '2026-01-15 08:30:00.1234567'", in0: "'2026-01-15 08:30:00.123457'", in1: "'2026-01-15 08:30:00.123457'", out0: "'2026-01-15 08:30:00.123456'", out1: "'2026-01-15 08:30:00.123458'"},
-			{name: "eq_halfeven", pred: "v = '2026-01-15 08:30:00.1234565'", in0: "'2026-01-15 08:30:00.123456'", in1: "'2026-01-15 08:30:00.123456'", out0: "'2026-01-15 08:30:00.123457'", out1: "'2026-01-15 08:30:00.123455'"},
+			{name: "eq_half_boundary", pred: "v = '2026-01-15 08:30:00.1234565'", in0: "'2026-01-15 08:30:00.123456'", in1: "'2026-01-15 08:30:00.123456'", out0: "'2026-01-15 08:30:00.123457'", out1: "'2026-01-15 08:30:00.123455'"},
+			{name: "eq_dblmediated_down", pred: "v = '2026-01-15 08:30:00.0001255'", in0: "'2026-01-15 08:30:00.000125'", in1: "'2026-01-15 08:30:00.000125'", out0: "'2026-01-15 08:30:00.000126'", out1: "'2026-01-15 08:30:00.000124'"},
+			{name: "eq_dblmediated_up", pred: "v = '2026-01-15 08:30:00.0001265'", in0: "'2026-01-15 08:30:00.000127'", in1: "'2026-01-15 08:30:00.000127'", out0: "'2026-01-15 08:30:00.000126'", out1: "'2026-01-15 08:30:00.000128'"},
 			{name: "eq_7digit_carry", pred: "v = '2026-01-15 08:30:00.9999995'", in0: "'2026-01-15 08:30:01'", in1: "'2026-01-15 08:30:01'", out0: "'2026-01-15 08:30:00.999999'", out1: "'2026-01-15 08:30:01.000001'"},
 		},
 	},
@@ -562,12 +586,13 @@ func TestPublicationScope_TemporalLiteralNormalization(t *testing.T) {
 	}
 
 	// Boundary rows: the DATE cell's midnight-vs-noon boundary, and the
-	// timestamp cell's µs twins of the 7-digit and half-even literals.
+	// timestamp cell's µs twins of the 7-digit, half-boundary, and
+	// double-mediated (review F1) literals.
 	applyDDL(t, sourceDSN, `
 		CREATE TABLE orcg_date (id int PRIMARY KEY, v date);
 		CREATE TABLE orcg_ts   (id int PRIMARY KEY, v timestamp);
 		INSERT INTO orcg_date (id, v) VALUES (1, '2026-01-15');
-		INSERT INTO orcg_ts   (id, v) VALUES (1, '2026-01-15 08:30:00.123457'), (2, '2026-01-15 08:30:00.123456');
+		INSERT INTO orcg_ts   (id, v) VALUES (1, '2026-01-15 08:30:00.123457'), (2, '2026-01-15 08:30:00.123456'), (3, '2026-01-15 08:30:00.000125');
 	`)
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -604,7 +629,13 @@ func TestPublicationScope_TemporalLiteralNormalization(t *testing.T) {
 		{"date NOT(ge) time-bearing (3VL negation)", "orcg_date", "NOT (v >= '2026-01-15 12:00:00')", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
 		{"timestamp eq 7-fractional-digit (rounded twin)", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 8, 30, 0, 123457000, time.UTC)}},
 		{"timestamp eq 7-fractional-digit (floor twin)", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", 2, ir.Row{"id": int64(2), "v": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}},
-		{"timestamp eq half-even boundary", "orcg_ts", "v = '2026-01-15 08:30:00.1234565'", 2, ir.Row{"id": int64(2), "v": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}},
+		{"timestamp eq half boundary (double-mediated rint)", "orcg_ts", "v = '2026-01-15 08:30:00.1234565'", 2, ir.Row{"id": int64(2), "v": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}},
+		// The review-F1 pair: PG's double lands BELOW the half for .0001255
+		// (→ .000125) and ABOVE for .0001265 (→ .000127) — exact decimal
+		// half-even gives .000126 for both, which is exactly how the F1
+		// CRITICAL slipped past every hand-picked boundary pin.
+		{"timestamp eq .0001255 (double lands below)", "orcg_ts", "v = '2026-01-15 08:30:00.0001255'", 3, ir.Row{"id": int64(3), "v": time.Date(2026, 1, 15, 8, 30, 0, 125000, time.UTC)}},
+		{"timestamp eq .0001265 (double lands above; row does NOT match)", "orcg_ts", "v = '2026-01-15 08:30:00.0001265'", 3, ir.Row{"id": int64(3), "v": time.Date(2026, 1, 15, 8, 30, 0, 125000, time.UTC)}},
 	}
 	for _, cell := range cells {
 		cell := cell

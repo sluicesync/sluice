@@ -39,24 +39,42 @@ type PushdownTerm struct {
 	// D0-5). Compile normalizes temporal literals to the source engine's
 	// own semantics (Q1), which rewrites exactly these literals — so a
 	// predicate compiled through a [ir.TemporalLiteralCastToColumn]
-	// resolver can never carry this flag on a DATE column. It remains the
-	// push-down classifier's fail-closed BELT: a DATE-column term still
-	// carrying it was compiled WITHOUT the engine lens and must classify
-	// out of the envelope.
+	// resolver can never carry this flag on a DATE column, and the
+	// ClientExact zero value refuses the shape at compile (review F4). It
+	// remains the push-down classifier's fail-closed BELT for a term that
+	// reached the classifier without Compile's gates — and, under the
+	// promote lenses (MySQL family), the LIVE signal a VStream push-down
+	// site combines with the column type for the F3 temporal-coercion
+	// fallback (a promote engine compares the full instant, so the literal
+	// is NOT rewritten and the flag stays).
 	TemporalLiteralTimeBearing bool
 
 	// TemporalLiteralSubMicrosecond marks a temporal-family comparison
 	// whose literal carries MORE than 6 fractional-second digits — finer
-	// than every supported engine's µs resolution (Postgres rounds
-	// half-even, MySQL rounds half-up, MariaDB truncates; ground truth in
+	// than every supported engine's µs resolution (Postgres rounds by its
+	// double-mediated rint rule, MySQL rounds half-up, MariaDB truncates;
+	// ground truth in
 	// [ir.TemporalLiteralSemantics]) while an un-normalized client compare
-	// keeps Go's nanosecond precision (audit 2026-07-23 D0-5). Compile's
-	// Q1 normalization rewrites such literals to the engine's µs value, so
-	// like TemporalLiteralTimeBearing this is the classifier's fail-closed
-	// belt for a compile that missed the engine lens. Implies
-	// TemporalLiteralTimeBearing (a fractional second requires a time
-	// component).
+	// keeps Go's nanosecond precision (audit 2026-07-23 D0-5). Compile can
+	// never emit this flag: an engine lens rewrites the literal to the
+	// engine's µs value, and the ClientExact zero value refuses it at
+	// compile (review F4) — so like TemporalLiteralTimeBearing it is the
+	// classifier's fail-closed belt for a term that bypassed Compile.
+	// Implies TemporalLiteralTimeBearing (a fractional second requires a
+	// time component).
 	TemporalLiteralSubMicrosecond bool
+
+	// TemporalLiteralNormalized marks a temporal-family comparison whose
+	// literal Compile REWROTE to the source engine's coercion (a truncated
+	// date under CastToColumn; a µs-rounded/truncated fraction under any
+	// lens). The CLIENT evaluator is engine-faithful for such a term — but
+	// the RAW predicate text still carries the finer-grained literal, so a
+	// server-side push-down site whose OWN evaluator is not the source
+	// engine (the VStream filter runs in vtgate's evalengine, whose
+	// sub-µs/date coercion is unverified — ADR-0174 residuals) must route
+	// the table through the A0-style client-side fallback instead of
+	// pushing (review F3).
+	TemporalLiteralNormalized bool
 
 	// Unrecognized names the concrete AST node type of a leaf the walker
 	// did not recognize (audit 2026-07-23 ARCH-1). Empty for every node the
@@ -102,6 +120,7 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 		}
 		if t.fam == FamilyTemporal && t.lit.kind == litString {
 			term.TemporalLiteralTimeBearing, term.TemporalLiteralSubMicrosecond = temporalLiteralGranularity(t.lit.str)
+			term.TemporalLiteralNormalized = t.lit.normalized
 		}
 		*terms = append(*terms, term)
 	case inNode:
@@ -114,6 +133,7 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 				tb, sm := temporalLiteralGranularity(l.str)
 				term.TemporalLiteralTimeBearing = term.TemporalLiteralTimeBearing || tb
 				term.TemporalLiteralSubMicrosecond = term.TemporalLiteralSubMicrosecond || sm
+				term.TemporalLiteralNormalized = term.TemporalLiteralNormalized || l.normalized
 			}
 		}
 		*terms = append(*terms, term)

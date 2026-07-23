@@ -990,6 +990,14 @@ type literal struct {
 	str  string
 	b    bool
 	text string
+	// normalized marks a temporal literal [normalizeTemporalLiteral]
+	// REWROTE to the source engine's coercion (a truncated date, a
+	// µs-rounded fraction). Surfaced as
+	// [PushdownTerm.TemporalLiteralNormalized] so a server-side push-down
+	// site can tell that the RAW predicate text carries finer granularity
+	// than the engine the client now mirrors — the VStream A0-fallback
+	// trigger (the vtgate evalengine's own coercion is unverified).
+	normalized bool
 }
 
 type cmpOp uint8
@@ -1089,6 +1097,24 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 		if _, ok := parseTemporalLiteral(lit.str); !ok {
 			return fmt.Errorf("temporal column %q compared to %q, which is not a recognized date/time literal", col, lit.str)
 		}
+		// Review F4: a literal FINER-grained than the column can only be
+		// compared faithfully by reproducing the source engine's coercion
+		// of it, and under the ClientExact zero value there IS no engine
+		// lens — the engines resolve it three different ways (see
+		// [ir.TemporalLiteralSemantics]), so a full-precision compare is a
+		// guess. Refuse, like every other unfaithful comparison; with an
+		// engine lens the literal is normalized instead (below). This makes
+		// "Compile output is always engine-granular or engine-normalized"
+		// an invariant of the code, not a comment.
+		if info.TemporalSemantics == ir.TemporalLiteralClientExact {
+			timeBearing, subMicro := temporalLiteralGranularity(lit.str)
+			if info.TemporalDateOnly && timeBearing {
+				return fmt.Errorf("date column %q is compared to the time-bearing literal %q, and no source-engine temporal-literal semantics are available to resolve the granularity mismatch faithfully (engines disagree: Postgres truncates the literal to the date, MySQL/MariaDB compare the full instant)", col, lit.str)
+			}
+			if subMicro {
+				return fmt.Errorf("temporal column %q is compared to %q, which has more than 6 fractional-second digits, and no source-engine temporal-literal semantics are available to resolve the sub-microsecond precision faithfully (engines disagree: Postgres and MySQL round differently, MariaDB truncates)", col, lit.str)
+			}
+		}
 		return nil
 	default:
 		return fmt.Errorf("column %q has a type the client-side --where evaluator cannot compare (arrays, sets, geometry, tz-aware timestamps, …)", col)
@@ -1124,12 +1150,62 @@ func compareValue(fam Family, value any, op cmpOp, lit literal, compare func(a, 
 	}
 }
 
+// compareNumeric evaluates an EXACT-numeric (integer/decimal) comparison via
+// big.Rat. A value with no rational form is first checked for the non-finite
+// specials PG's NUMERIC can store — NaN, and (PG 14+) ±Infinity, which
+// travel as strings per the ir.Decimal value contract — and ordered with
+// PG's numeric total order: NaN above EVERYTHING (Infinity included),
+// -Infinity below everything (audit 2026-07-23 review F2, the FamilyNumeric
+// sibling of compareFloat's Q4 fix; PG is the only supported source whose
+// exact-numeric type stores non-finite values, and ir.Decimal is INSIDE the
+// push-down envelope, so mapping these to UNKNOWN silently dropped a
+// server-delivered NaN row's changes under the benign-direction belt log).
+// The grammar cannot spell a non-finite literal, so the literal side is
+// always a finite big.Rat. Anything else unparseable stays UNKNOWN.
 func compareNumeric(value any, op cmpOp, lit literal) truth {
 	left, ok := numericToRat(value)
 	if !ok {
+		if cmp, nonFinite := numericNonFiniteOrder(value); nonFinite {
+			return orderToTruth(cmp, op)
+		}
 		return truthUnknown
 	}
 	return orderToTruth(left.Cmp(lit.num), op)
+}
+
+// numericNonFiniteOrder classifies a numeric value with no rational form
+// against any FINITE literal under PG's numeric total order: NaN and
+// +Infinity order above (+1), -Infinity below (-1). Strings are recognized
+// through strconv.ParseFloat (which accepts PG's "NaN"/"Infinity"/
+// "-Infinity" spellings and Go's own renderings); a string that ParseFloat
+// resolves to a FINITE value is NOT claimed here — the exact big.Rat path
+// already rejected it, so it stays UNKNOWN rather than acquiring a lossy
+// float verdict.
+func numericNonFiniteOrder(value any) (cmp int, nonFinite bool) {
+	var f float64
+	switch v := value.(type) {
+	case float64:
+		f = v
+	case float32:
+		f = float64(v)
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		f = parsed
+	default:
+		return 0, false
+	}
+	switch {
+	case math.IsNaN(f):
+		return 1, true // NaN sorts last, above Infinity
+	case math.IsInf(f, 1):
+		return 1, true
+	case math.IsInf(f, -1):
+		return -1, true
+	}
+	return 0, false
 }
 
 func numericToRat(value any) (*big.Rat, bool) {
@@ -1331,13 +1407,14 @@ func compareTemporal(value any, op cmpOp, lit literal) truth {
 //   - Postgres 16.14 (CastToColumn): the unknown-typed literal is cast to the
 //     COLUMN's type — a DATE column TRUNCATES the time-of-day
 //     (`d < '2026-01-15 12:00'` plans as `d < '2026-01-15'::date`); a
-//     timestamp column rounds fractional seconds HALF-EVEN to µs
-//     ('.1234565' → .123456, '.1234575' → .123458, '.9999995' carries +1s).
+//     timestamp column rounds fractional seconds to µs by PG's
+//     DOUBLE-MEDIATED rule (see [pgFractionMicros] — '.1234565' → .123456,
+//     '.0001255' → .000125, '.0001265' → .000127, '.9999995' carries +1s).
 //     A typmod column (timestamp(0)) does NOT truncate the literal.
 //   - MySQL 8.0.46 (PromoteRoundHalfUp): the DATE column is PROMOTED to
 //     datetime and the full instant compared (`d = '2026-01-15 08:30:00'` is
-//     FALSE); fractional seconds beyond 6 digits round HALF-UP (away from
-//     zero: '.1234565' → .123457) and carry.
+//     FALSE); fractional seconds beyond 6 digits round HALF-UP on the exact
+//     decimal digits (away from zero: '.1234565' → .123457) and carry.
 //   - MariaDB 11.8.8 (PromoteTruncate): promotes like MySQL, but fractional
 //     seconds beyond 6 digits are TRUNCATED ('.1234565' → .123456, no carry).
 //
@@ -1362,6 +1439,7 @@ func normalizeTemporalLiteral(info ColumnInfo, lit literal) literal {
 		// Postgres DATE: the literal is cast to date — time-of-day truncated.
 		if timeBearing {
 			lit.str = t.Format("2006-01-02")
+			lit.normalized = true
 		}
 		return lit
 	}
@@ -1370,32 +1448,67 @@ func normalizeTemporalLiteral(info ColumnInfo, lit literal) literal {
 	}
 	switch info.TemporalSemantics {
 	case ir.TemporalLiteralCastToColumn:
-		t = roundToMicros(t, true) // PG: half-even
+		// PG: replace the whole fraction with the server's double-mediated
+		// micros (may carry into the seconds via Add).
+		base := t.Add(-time.Duration(t.Nanosecond()))
+		t = base.Add(time.Duration(pgFractionMicros(temporalFractionDigits(lit.str))) * time.Microsecond)
 	case ir.TemporalLiteralPromoteRoundHalfUp:
-		t = roundToMicros(t, false) // MySQL: half-up (away from zero)
+		t = roundToMicrosHalfUp(t) // MySQL: half-up (away from zero), exact decimal
 	case ir.TemporalLiteralPromoteTruncate:
 		t = t.Truncate(time.Microsecond) // MariaDB: truncate, no carry
 	}
 	lit.str = t.Format("2006-01-02 15:04:05.999999")
+	lit.normalized = true
 	return lit
 }
 
-// roundToMicros rounds t's sub-microsecond nanoseconds to the microsecond,
-// half-even (Postgres's rint) or half-up (MySQL, away from zero), carrying
-// into the seconds when the fraction rounds to 10⁶ µs. Literal fractions are
-// at most 9 digits (Go's parser refuses more), so the parsed nanoseconds are
-// exact and no float is involved.
-func roundToMicros(t time.Time, halfEven bool) time.Time {
+// pgFractionMicros reproduces Postgres's fractional-second parse EXACTLY:
+// `fsec = rint(strtod(fraction) * 1000000)` (datetime.c, unchanged through
+// PG 16/17) — the fraction goes THROUGH A C DOUBLE before rounding.
+// strconv.ParseFloat is a correctly-rounded IEEE-754 parse (== strtod) and
+// math.RoundToEven is rint under the default rounding mode, so this is
+// byte-equivalent. The double mediation matters: the rule is NOMINALLY
+// half-even, but an exact-decimal half rounds the way the BINARY double of
+// the fraction lands (~0.1% of 7-digit fractions land on the other side of
+// .5 than exact decimal arithmetic — '.0001255' → 125 where exact half-even
+// gives 126, '.0001265' → 127; OBSERVED live on PG 16.14, 2026-07-23, and
+// re-ground-truthed by the randomized fraction sweep in
+// temporal_realdb_integration_test.go). An exact-decimal implementation
+// here was the audit-review F1 CRITICAL: it agreed on every hand-picked
+// boundary and silently diverged on the class.
+func pgFractionMicros(fracDigits string) int64 {
+	f, err := strconv.ParseFloat("0."+fracDigits, 64)
+	if err != nil {
+		return 0 // unreachable: the caller extracted digits-only text
+	}
+	return int64(math.RoundToEven(f * 1e6))
+}
+
+// temporalFractionDigits returns the fractional-second digit run of a
+// temporal literal ("" when it has none). The caller has already vetted the
+// literal through parseTemporalLiteral, so anything after the last '.' is
+// the digit run.
+func temporalFractionDigits(lit string) string {
+	if i := strings.LastIndexByte(strings.TrimSpace(lit), '.'); i >= 0 {
+		return strings.TrimSpace(lit)[i+1:]
+	}
+	return ""
+}
+
+// roundToMicrosHalfUp rounds t's sub-microsecond nanoseconds to the
+// microsecond, half-up (away from zero — MySQL's rule, applied to the exact
+// decimal digits), carrying into the seconds when the fraction rounds to
+// 10⁶ µs. Literal fractions are at most 9 digits (Go's parser refuses
+// more), so the parsed nanoseconds are exact and no float is involved —
+// unlike Postgres's double-mediated rule ([pgFractionMicros]).
+func roundToMicrosHalfUp(t time.Time) time.Time {
 	ns := t.Nanosecond()
 	rem := ns % 1000
 	if rem == 0 {
 		return t
 	}
 	micro := ns / 1000
-	switch {
-	case rem > 500:
-		micro++
-	case rem == 500 && (!halfEven || micro%2 == 1):
+	if rem >= 500 {
 		micro++
 	}
 	return t.Add(time.Duration(micro*1000 - ns))
