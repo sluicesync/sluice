@@ -41,6 +41,22 @@ retry loop.
 - The entire `08*` class (connection exception).
 - Connection lost / EOF / per-exec timeout.
 
+**Trigger-CDC transports (pgtrigger / sqlite-trigger / d1-trigger) —
+retriable (v0.99.286):** transient transport shapes on the change-log
+poll — connection reset/refused, timeouts, TLS handshake timeout, and
+(D1) HTTP 408/429/5xx. Wrong DSN, bad token, a missing change-log
+table, and decode faults stay terminal.
+
+**Connect-phase transients — retriable (v0.99.288):** each retry
+attempt first has to re-establish its connections (reopen the target
+applier and source readers), and a transient network failure there —
+a dead pool connection (`invalid connection`), reset/refused,
+timeouts, TLS handshake timeout — now rides the same bounded budget
+instead of exiting the stream. Positively-matched shapes only: DSN
+parse errors, bad credentials, unknown-host, and coded refusals stay
+terminal, and a target that can never be reached still exhausts the
+budget loudly.
+
 **Explicitly NOT retriable (both engines):** duplicate-key
 (`1062` / `23505`). A duplicate key during continuous sync is either
 an operator data issue (a non-PK uniqueness violation) or a sluice

@@ -11,7 +11,15 @@ and were extended in v0.46.0 / v0.48.0 / v0.52.x; the final
 pin-down-conformance pass (Vitess `code = Unknown` substring added to
 the MySQL classifier, the mandatory pin-down-4 literal-substring
 test, pin-down-3 startup range validation on the three dials, and the
-operator guide) completes the ADR as-written. Originating bug:
+operator guide) completes the ADR as-written. **Extended v0.99.288:**
+the retry loop's scope now also covers the CONNECT phase of each
+attempt — a transient network failure while re-establishing the
+target applier / source readers (`connectPhaseError` marker +
+positive-match transient shapes, `internal/pipeline/streamer_connect_retry.go`)
+rides the same budget instead of exiting; pre-fix, only errors raised
+inside a flowing attempt were classified (the 2026-07-22 scale-soak
+incident). v0.99.286 similarly closed the trigger-CDC transport
+classification gap (`internal/engines/internal/triggercdc`). Originating bug:
 GitHub #13.
 
 ## Operator-review sign-off (2026-05-18)

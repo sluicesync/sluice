@@ -415,7 +415,12 @@ sluice sync start \
   every transactional provider (SendGrid/Mailgun/SES/Postmark) and
   self-hosted relays. Rules: `--notify-storage-util` / `-cpu-util` /
   `-mem-util` (fractions 0–1), `--notify-lag-seconds`, and the
-  rate-of-change `--notify-storage-growth-per-min`. Advisory and
+  rate-of-change `--notify-storage-growth-per-min` (all PlanetScale-telemetry-gated),
+  plus three rules UNGATED from telemetry that need only a sink:
+  `--notify-sync-lag-seconds` (sluice's own seconds-behind-source, any engine)
+  and the Postgres-target vacuum pair `--notify-dead-tuple-ratio` /
+  `--notify-xid-age` (worst-table dead-tuple ratio and `age(datfrozenxid)`
+  wraparound headroom, probed from the target's own catalog). Advisory and
   failure-isolated — a dead sink is logged and swallowed; an unobserved
   metric never fires.
 - **Metrics history** — when telemetry is configured, sluice persists a
