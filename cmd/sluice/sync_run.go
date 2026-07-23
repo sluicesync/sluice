@@ -74,6 +74,14 @@ type SyncSpec struct {
 	SlotName     string `koanf:"slot-name"`
 	TargetSchema string `koanf:"target-schema"`
 
+	// PublicationName mirrors `sync start --publication-name` (ADR-0175):
+	// the per-stream Postgres publication, the refusal's PRIMARY documented
+	// escape for two differently-scoped PG-source legs — which the fleet is
+	// the surface most likely to run (audit 2026-07-23 DEVEX-1: the escape
+	// was unexpressible here). Same `sluice_` prefix convention; empty keeps
+	// the engine default.
+	PublicationName string `koanf:"publication-name"`
+
 	// ControlKeyspace is the per-sync --control-keyspace (the sidecar-keyspace
 	// feature), mirroring `sync start --control-keyspace` for the fleet: on a
 	// SHARDED MySQL/PlanetScale/Vitess TARGET the stream's vindex-less CDC
@@ -949,6 +957,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		TargetDSN:          spec.Target,
 		StreamID:           spec.StreamID,
 		SlotName:           spec.SlotName,
+		PublicationName:    spec.PublicationName,
 		Mappings:           mappings,
 		ExpressionMappings: exprMappings,
 		RowFilters:         rowFilters,

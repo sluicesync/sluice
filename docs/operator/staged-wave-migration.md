@@ -96,7 +96,7 @@ CDC state is keyed per stream (`sluice_cdc_state` is `PRIMARY KEY (stream_id)`),
 
 `--publication-name` is the one that matters more, because forgetting it used to fail *silently*. The replication **slot** is per-stream, but the **publication** — the table filter `pgoutput` applies — is a separate object, and streams that share one fight over it. Each cold start scopes the publication to *its own* table list with `ALTER PUBLICATION … SET TABLE …`, which replaces the member set atomically. Two waves sharing the default `sluice_pub` would therefore de-scope each other: the first wave's slot would stay healthy and keep advancing while receiving **nothing** for its tables.
 
-sluice will not let that happen silently. A cold start that would **remove** tables from a publication another *active* sluice slot is reading refuses loudly with `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT`, naming the at-risk tables and the conflicting slot, and refuses **before** mutating anything — so a refused attempt leaves every running stream untouched. Pass `--publication-name` per stream (or drain the other stream first) and it proceeds.
+sluice will not let that happen silently. A cold start that would **remove** tables from a publication refuses loudly with `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT` whenever another sluice slot **exists** on the source — active *or* inactive, because a stopped wave's slot still holds a resumable position that expects its scope (since v0.99.289; earlier releases checked only *active* slots, which left a stopped-mid-migration wave unprotected). The refusal names the at-risk tables, labels each conflicting slot active/inactive, and fires **before** mutating anything — a refused attempt leaves every stream untouched. Pass `--publication-name` per stream and it proceeds; note that merely stopping a wave is no longer enough to clear the conflict — a finished wave's slot must be **dropped** (see the decommission step below).
 
 Widening or equal-scope rescopes remove nothing and never trigger the refusal, so the fleet shape (several streams, identical scope) and `schema add-table` (purely additive) are unaffected.
 
@@ -144,11 +144,22 @@ sluice verify \
     --source-driver mysql    --source "$SRC" \
     --target-driver postgres --target "$DST" \
     --include-table 'orders,order_items' --depth=sample
+
+# 5. Decommission the wave's source-side objects (Postgres sources).
+#    A finished wave's replication slot pins WAL on the source for the
+#    REST of the migration — weeks, on a multi-wave plan — and (since
+#    v0.99.289) blocks any later differently-scoped cold start, because
+#    an existing slot claims its scope even when inactive. Drop the slot,
+#    and the wave's publication if it had its own:
+psql "$SRC" -c "SELECT pg_drop_replication_slot('sluice_wave1');"
+psql "$SRC" -c "DROP PUBLICATION IF EXISTS sluice_wave1;"
 ```
 
 `cutover` takes `--include-table` too, so a wave's sequences are primed without touching tables that are still source-authoritative. Skipping it is the classic staged-migration failure: application writes to the target start allocating IDs that collide with rows CDC is about to deliver.
 
 Use `--wait` on `sync stop`. Without it the stop is asynchronous and late in-flight changes may not have landed.
+
+Do not skip step 5 on a Postgres source: the WAL a forgotten slot retains has invalidated slots on small managed instances at a few hundred MB, and every later wave with a different scope will refuse until the leftover slot is gone.
 
 ---
 

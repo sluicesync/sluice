@@ -37,6 +37,7 @@ syncs:
     notify-storage-growth-per-min: 0.02
     notify-dead-tuple-ratio: 0.3
     notify-xid-age: 1000000000
+    publication-name: wave1
 `)
 	fleet, err := loadFleetConfig(path)
 	if err != nil {
@@ -60,6 +61,11 @@ syncs:
 	}
 	if s.NotifyDeadTupleRatio != 0.3 || s.NotifyXIDAge != 1_000_000_000 {
 		t.Errorf("vacuum thresholds mismatch: %+v", s)
+	}
+	// Audit 2026-07-23 DEVEX-1: the ADR-0175 refusal's primary escape must
+	// be expressible on the fleet surface.
+	if s.PublicationName != "wave1" {
+		t.Errorf("PublicationName = %q; want wave1", s.PublicationName)
 	}
 }
 
