@@ -411,6 +411,75 @@ func TestAddTable_LiveMode_FallsBackToDefaultSlotName(t *testing.T) {
 	}
 }
 
+// TestAddTable_UsesRecordedPublication pins the ADR-0176-prerequisite
+// inheritance: when the active stream's StreamStatus carries a
+// recorded publication_name, preflightStream scopes the source engine
+// to it (with the recorded slot as the guard's own-slot exclusion) so
+// the publication-extend lands on the publication the stream actually
+// reads through — not the shared default, which would leave the new
+// table silently outside the stream's scope after bulk-copy.
+func TestAddTable_UsesRecordedPublication(t *testing.T) {
+	src := &addTableSourceEnginePubScoped{addTableSourceEngineLive: newAddTableSourceEngineLive("source")}
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/1000"
+	src.snapshotLSN = "0/2000"
+
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", SlotName: "sluice_shard_a", PublicationName: "sluice_wave_x"},
+	}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run errored: %v", err)
+	}
+	if src.scopeCalls == 0 {
+		t.Fatal("WithPublicationScope was never called despite a recorded publication_name")
+	}
+	if src.scopedPublication != "sluice_wave_x" {
+		t.Errorf("scoped publication = %q; want the recorded %q", src.scopedPublication, "sluice_wave_x")
+	}
+	if src.scopedOwnSlot != "sluice_shard_a" {
+		t.Errorf("scoped own-slot = %q; want the recorded %q", src.scopedOwnSlot, "sluice_shard_a")
+	}
+}
+
+// TestAddTable_LegacyEmptyPublicationDoesNotScope pins the zero-value
+// floor: a legacy row (no recorded publication) must leave the source
+// engine untouched — the engine default, byte-identical to before the
+// ADR-0176 prerequisite chunk.
+func TestAddTable_LegacyEmptyPublicationDoesNotScope(t *testing.T) {
+	src := &addTableSourceEnginePubScoped{addTableSourceEngineLive: newAddTableSourceEngineLive("source")}
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/1000"
+	src.snapshotLSN = "0/2000"
+
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run errored: %v", err)
+	}
+	if src.scopeCalls != 0 {
+		t.Errorf("WithPublicationScope called %d times for a legacy (empty) record; want 0", src.scopeCalls)
+	}
+}
+
 // TestAddTable_LiveMode_RefusesEngineWithoutEitherSurface confirms
 // live mode refuses (with a clear engine-pair message) when neither
 // the source implements publicationAdder (PG path) NOR the target
@@ -693,6 +762,27 @@ func newAddTableSourceEngineWithPub(name string) *addTableSourceEngineWithPub {
 func (e *addTableSourceEngineWithPub) AddPublicationTables(_ context.Context, _ string, tables []string) error {
 	e.addedTables = append(e.addedTables, tables...)
 	return nil
+}
+
+// addTableSourceEnginePubScoped wraps the live stub with
+// ir.PublicationScoper so the ADR-0176-prerequisite recorded-
+// publication inheritance is pinnable. WithPublicationScope records
+// its arguments and returns the SAME stub, so the test keeps its
+// handle on the recorded fields after preflightStream reassigns
+// a.Source.
+type addTableSourceEnginePubScoped struct {
+	*addTableSourceEngineLive
+
+	scopedPublication string
+	scopedOwnSlot     string
+	scopeCalls        int
+}
+
+func (e *addTableSourceEnginePubScoped) WithPublicationScope(publication, ownSlot string) ir.Engine {
+	e.scopeCalls++
+	e.scopedPublication = publication
+	e.scopedOwnSlot = ownSlot
+	return e
 }
 
 // addTableSourceEngineLive is the live-mode (Phase 2) test stand-in.

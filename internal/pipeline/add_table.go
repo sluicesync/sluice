@@ -711,6 +711,30 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 		return addTablePreflight{}, fmt.Errorf("pipeline: add-table: no stream %q on target — verify --stream-id matches the active stream's id (run `sluice sync status` to list streams)", a.StreamID)
 	}
 
+	// ADR-0176 prerequisite: point the source engine at the stream's
+	// RECORDED publication so the publication-extend step lands on the
+	// publication the stream actually reads through — not the shared
+	// default. Without this, add-table against a stream on a
+	// per-stream publication (explicit --publication-name since
+	// ADR-0175, or the derived filtered-stream default) would extend
+	// `sluice_pub`: loudly when it doesn't exist, SILENTLY WRONG when
+	// another stream's `sluice_pub` does — the new table would
+	// bulk-copy once and then never receive CDC. An empty recorded
+	// name (legacy / MySQL-family) is a no-op: the engine keeps its
+	// default, byte-identical to before. Mirrors how the slot name is
+	// recovered from the same row (activeSlotName), which also serves
+	// as the guard's own-slot exclusion here.
+	if status.PublicationName != "" {
+		if scoper, ok := a.Source.(ir.PublicationScoper); ok {
+			a.Source = scoper.WithPublicationScope(status.PublicationName, activeSlotName(status))
+			slog.InfoContext(
+				ctx, "add-table: using the stream's recorded publication",
+				slog.String("stream_id", a.StreamID),
+				slog.String("publication", status.PublicationName),
+			)
+		}
+	}
+
 	// Bug 46: reconcile the operator-supplied --target-schema flag
 	// with the active stream's recorded target_schema. Refuses on
 	// mismatch; inherits the recorded value when the flag is empty.
