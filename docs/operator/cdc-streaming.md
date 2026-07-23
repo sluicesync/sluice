@@ -44,8 +44,12 @@ retry loop.
 **Trigger-CDC transports (pgtrigger / sqlite-trigger / d1-trigger) —
 retriable (v0.99.286):** transient transport shapes on the change-log
 poll — connection reset/refused, timeouts, TLS handshake timeout, and
-(D1) HTTP 408/429/5xx. Wrong DSN, bad token, a missing change-log
-table, and decode faults stay terminal.
+(D1) HTTP 408/429/5xx. Since v0.99.289 the `postgres-trigger` poll
+also retries PG's connection-availability SQLSTATEs — `57P01`/`57P02`/
+`57P03` (admin/crash shutdown, cannot connect now — a managed-PG
+maintenance restart or standby promotion) and the class-08 connection
+exceptions. Wrong DSN, bad token, a missing change-log table (`42P01`),
+and decode faults stay terminal.
 
 **Connect-phase transients — retriable (v0.99.288):** each retry
 attempt first has to re-establish its connections (reopen the target
