@@ -117,6 +117,12 @@ func TestIsTransientNetworkShape(t *testing.T) {
 		errors.New("dial tcp 5.6.7.8:3306: connect: connection refused"),
 		errors.New("write tcp 1.2.3.4:1->5.6.7.8:2: wsasend: An established connection was aborted"),
 		errors.New("read tcp 1.2.3.4:1->5.6.7.8:2: wsarecv: An existing connection was forcibly closed by the remote host"),
+		// Bug 199a (v0.99.288 regression cycle): the Windows dial-time
+		// refusal wording — the refused window is most of any target
+		// restart, and neither the POSIX text nor the ECONNREFUSED
+		// structural leg matches it (pgx v5 flattens multi-host errors).
+		errors.New("dial tcp 5.6.7.8:5432: connectex: No connection could be made because the target machine actively refused it"),
+		errors.New("mysql: ping: dial: the target machine actively refused it"),
 		fmt.Errorf("open: %w", io.ErrUnexpectedEOF),
 		fmt.Errorf("dial: %w", syscall.ECONNREFUSED),
 		fmt.Errorf("connect: %w", timeoutNetError{}),

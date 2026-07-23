@@ -85,6 +85,16 @@ func classifyApplierError(err error) error {
 		return &retriablePGError{err: err}
 	}
 
+	// pgx pool/lock-state faults that BY CONSTRUCTION occurred before any
+	// data reached the server — pgconn's own SafeToRetry contract (its
+	// connLockError, e.g. "conn closed" picked up from a severed pool conn
+	// at a checkpoint boundary — Bug 199b, v0.99.288 regression cycle) plus
+	// the exported ErrConnClosed sentinel. No bytes were sent, so retrying
+	// is unambiguous; the next attempt draws a fresh conn from the pool.
+	if pgconn.SafeToRetry(err) || errors.Is(err, pgconn.ErrConnClosed) {
+		return &retriablePGError{err: err}
+	}
+
 	// pgx surfaces server-side errors as *pgconn.PgError carrying a
 	// SQLSTATE in .Code. Match against the ADR-0038 retriable set.
 	var pgErr *pgconn.PgError

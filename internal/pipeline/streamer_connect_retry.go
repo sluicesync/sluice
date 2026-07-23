@@ -137,6 +137,16 @@ func isTransientNetworkShape(err error) bool {
 		"forcibly closed by the remote host", // Windows winsock wording
 		"wsarecv:",
 		"wsasend:",
+		// Windows dial-time refusal (Bug 199a): "connectex: No connection
+		// could be made because the target machine actively refused it."
+		// The POSIX "connection refused" wording above never matches it, and
+		// pgx v5's flattened multi-host connect error defeats the structural
+		// errors.Is(syscall.ECONNREFUSED) leg — caught by the v0.99.288
+		// regression cycle restarting a target container: the refused window
+		// is most of any restart, so without these the connect-phase retry
+		// was effectively inert on Windows for the canonical local transient.
+		"connectex:",
+		"actively refused",
 		"server closed idle connection",
 		"temporary failure in name resolution",
 	} {

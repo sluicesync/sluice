@@ -100,6 +100,15 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 	}
 }
 
+// safeToRetryErr stands in for pgconn's private connLockError: an error
+// whose SafeToRetry() contract says it occurred before any data reached the
+// server. Pins the classifier's structured SafeToRetry leg without reaching
+// into pgx internals.
+type safeToRetryErr struct{}
+
+func (safeToRetryErr) Error() string     { return "conn closed" }
+func (safeToRetryErr) SafeToRetry() bool { return true }
+
 // TestClassifyApplierError_RetriableShapes — each documented PG
 // transient SQLSTATE from the ADR-0038 classifier table.
 func TestClassifyApplierError_RetriableShapes(t *testing.T) {
@@ -129,6 +138,13 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"schema drift: undefined_column 42703 (Bug F8)", &pgconn.PgError{Code: "42703", Message: `column "soak_extra" of relation "soak_events" does not exist`}},
 		{"schema drift: undefined_table 42P01 (Bug F8)", &pgconn.PgError{Code: "42P01", Message: `relation "new_table" does not exist`}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
+		// Bug 199b (v0.99.288 regression cycle): a severed pool conn picked
+		// up at a checkpoint boundary surfaces pgconn's connLockError "conn
+		// closed" — SafeToRetry-by-construction (no bytes reached the
+		// server), previously unclassified → zero-retry terminal exit.
+		{"pgconn.ErrConnClosed sentinel (Bug 199b)", pgconn.ErrConnClosed},
+		{"wrapped pgconn.ErrConnClosed (checkpoint begin)", fmt.Errorf("postgres: applier: checkpoint begin: %w", pgconn.ErrConnClosed)},
+		{"pgconn SafeToRetry contract (connLockError stand-in)", fmt.Errorf("checkpoint begin: %w", safeToRetryErr{})},
 		{"io.EOF", io.EOF},
 		{"io.ErrUnexpectedEOF sentinel (reparent conn drop)", io.ErrUnexpectedEOF},
 		{"unexpected EOF string form (pgx mid-COPY conn sever)", errors.New(`copy chunk into "customers" (0 of 50000 rows copied before error): unexpected EOF`)},
