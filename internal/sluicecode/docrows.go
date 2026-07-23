@@ -109,7 +109,7 @@ var docRows = map[Code]docRow{
 	},
 	"SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT": {
 		Meaning: "A Postgres cold start would **narrow the publication** — an `ALTER PUBLICATION … SET TABLE` (or a `FOR ALL TABLES` drop-and-recreate) that REMOVES tables — while another sluice replication slot **exists** on that source (active or not; since v0.99.289 a slot's *existence* is the conflict signal, because an inactive slot is a stream stopped mid-migration that will resume expecting its scope). The publication is `pgoutput`'s table filter and nothing binds it to a slot, so the rescope would leave the other stream advancing (or resuming later) while it received **nothing** for its tables: a silent divergence with a green `sync status` / `sync health`. Reached most naturally by staged (\"wave\") migration — concurrent OR sequential streams over one PG source with different `--include-table` scopes. Widening or equal-scope rescopes never trigger it, so the ADR-0122 fleet shape and `schema add-table` are unaffected.",
-		Remedy:  "Give each stream its **own publication**: pass `--publication-name` (per-stream, same `sluice_` prefix convention as `--slot-name`) on every stream over that source. Or drain the other stream (`sluice sync stop --wait`) **and drop its slot** once it is finished for good (`SELECT pg_drop_replication_slot('sluice_…')` — the refusal labels each conflicting slot active/inactive); merely stopping it no longer clears the conflict, because a stopped stream's slot still claims its scope. See [staged-wave-migration](staged-wave-migration.md) and [ADR-0175](../adr/adr-0175-postgres-publication-scope-isolation.md).",
+		Remedy:  "Give each stream its **own publication**: pass `--publication-name` (per-stream, same `sluice_` prefix convention as `--slot-name`) on every stream over that source. Or drain the other stream (`sluice sync stop --wait`) **and decommission it** once it is finished for good (`sluice sync decommission --stream-id <id> --yes` drops its slot and per-stream publication and clears its control row; the raw-SQL equivalent is `SELECT pg_drop_replication_slot('sluice_…')` — the refusal labels each conflicting slot active/inactive); merely stopping it no longer clears the conflict, because a stopped stream's slot still claims its scope. See [staged-wave-migration](staged-wave-migration.md) and [ADR-0175](../adr/adr-0175-postgres-publication-scope-isolation.md).",
 	},
 	"SLUICE-E-CDC-REPLICATION-PERMISSION": {
 		Meaning: "The connecting role lacks the REPLICATION attribute.",
@@ -128,8 +128,12 @@ var docRows = map[Code]docRow{
 		Remedy:  "Sync: re-run with `--reset-target-data --yes`. Migrate: use `--resume`. Either mode: `--force-cold-start` to copy into the populated table anyway (collides on PRIMARY KEY in most cases).",
 	},
 	"SLUICE-E-CONFIRMATION-REQUIRED": {
-		Meaning: "A destructive command was run without `--yes`. sluice is non-interactive and never prompts, so it refuses loudly instead of blocking on a prompt (`slot drop` is the current caller).",
+		Meaning: "A destructive command was run without `--yes`. sluice is non-interactive and never prompts, so it refuses loudly instead of blocking on a prompt (`slot drop` and `sync decommission` are the current callers; `sync decommission --dry-run` is exempt — it touches nothing).",
 		Remedy:  "Re-run with `--yes` (or `-y`) to confirm the destructive operation.",
+	},
+	"SLUICE-E-DECOMMISSION-STREAM-ACTIVE": {
+		Meaning: "`sync decommission` refused because the stream's replication slot is **active** on the source — a CDC consumer (walsender client) is attached, so the stream is live (or another consumer has hold of its slot). Decommissioning a running stream would yank the slot and publication out from under it mid-stream; the refusal fires before anything is touched, so a refused attempt changes nothing on either side.",
+		Remedy:  "Drain the stream first: `sluice sync stop --stream-id <id> --wait`, then re-run `sluice sync decommission`. If the slot stays active with no sluice process running, another consumer holds it — investigate with `sluice slot list` before removing anything.",
 	},
 	"SLUICE-E-CONNECT-AUTH-FAILED": {
 		Meaning: "The database rejected the DSN credentials.",
