@@ -2340,8 +2340,14 @@ func publicationRowFiltersForVersion(ctx context.Context, version int, filters m
 	if version >= pgVersionPublicationAttrs {
 		return filters
 	}
-	slog.DebugContext(
-		ctx, "postgres: source predates publication row filters (PG 15); --where stays client-side-only for the CDC leg (ADR-0176 version gate)",
+	// INFO deliberately (audit 2026-07-23 DEVEX-4): the preflight has
+	// already told the operator at INFO that these predicates "will be
+	// pushed", so the version-gated drop must be equally visible or the
+	// operator believes WAL delivery is server-filtered when it is not
+	// (capacity/security expectations — data stays correct either way,
+	// the client evaluator filters).
+	slog.InfoContext(
+		ctx, "postgres: source predates publication row filters (PG 15) — these tables stream UNFILTERED server-side and the client-side evaluator filters them (ADR-0176 version gate; correctness preserved, out-of-scope change traffic is discarded client-side)",
 		slog.Int("server_version_num", version),
 		slog.Int("filtered_tables", len(filters)),
 	)
@@ -2810,7 +2816,10 @@ func publicationScopeConflictRefusal(name string, changes, slots []string) error
 				"Recovery: give each concurrent stream over this source its own publication "+
 				"(--publication-name NAME, per stream), drain the other stream first "+
 				"(sluice sync stop --wait --stream-id ID), or — for a truly abandoned stream — "+
-				"drop its slot. See ADR-0175",
+				"drop its slot. If THIS stream is rescoping its own already-isolated publication "+
+				"(e.g. a changed --where with --restart-from-scratch), a brand-new "+
+				"--publication-name for this stream always proceeds without touching any peer "+
+				"(audit 2026-07-23 ARCH-2). See ADR-0175",
 			name,
 			strings.Join(changes, " and "),
 			len(slots),
