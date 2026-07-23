@@ -210,5 +210,18 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 			setter.SetPublicationName(s.PublicationName)
 		}
 	}
+	// ADR-0176: thread the classifier-approved `--where` predicates into the
+	// source engine alongside the publication scope, so cold start's
+	// EnsurePublication emits them as per-table row filters (PG 15+; the
+	// engine gates the version). Applied HERE — after the effective
+	// publication is final and before any source connection opens — for the
+	// same reason the scope itself is. Warm resume never re-ensures the
+	// publication, so carrying the filters on the engine value never mutates
+	// anything on resume (the unchanged ADR-0175/0176 invariant).
+	if len(s.publicationRowFilters) > 0 {
+		if rf, ok := s.Source.(ir.PublicationRowFilterer); ok {
+			s.Source = rf.WithPublicationRowFilters(s.publicationRowFilters)
+		}
+	}
 	return nil
 }

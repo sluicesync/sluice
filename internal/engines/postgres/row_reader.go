@@ -316,10 +316,22 @@ func buildSelect(schema string, table *ir.Table, predicate string) string {
 		strings.Join(cols, ", "),
 		tableRef,
 	)
-	if predicate != "" {
-		sel += " WHERE (" + predicate + ")"
-	}
+	sel += rowFilterWhereSQL(predicate)
 	return sel
+}
+
+// rowFilterWhereSQL renders the operator's raw `--where` predicate as the
+// ` WHERE (<predicate>)` SQL suffix — the SINGLE rendering shared by the
+// snapshot SELECT ([buildSelect]), the verify COUNT/sample paths, and the
+// ADR-0176 publication row filter ([formatPublicationTableList]), so the
+// server-side evaluation sites cannot drift apart on how the predicate
+// text reaches the server. Always parenthesized so a disjunctive
+// predicate is fully scoped; empty predicate renders nothing.
+func rowFilterWhereSQL(predicate string) string {
+	if predicate == "" {
+		return ""
+	}
+	return " WHERE (" + predicate + ")"
 }
 
 // nonGeneratedColumns returns the columns of in that are NOT

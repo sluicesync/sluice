@@ -63,6 +63,32 @@ type Engine struct {
 	// guard only ever looks at ACTIVE slots and cold start ensures the
 	// publication before our own slot exists.
 	ownSlot string
+
+	// pubRowFilters carries the classifier-approved `--where` predicates
+	// to push into the publication as per-table row filters (ADR-0176),
+	// keyed by source table name with RAW predicate text values — see
+	// [ir.PublicationRowFilterer] for the full contract. Consumed only
+	// by [Engine.EnsurePublication] (cold start); nil (the zero value)
+	// emits today's bare table list. Set only via
+	// [Engine.WithPublicationRowFilters].
+	//
+	// Boxed behind a pointer DELIBERATELY (a named wart): a bare map
+	// field would make Engine — and every ir.Engine interface holding
+	// one — UNCOMPARABLE, turning any `==` between engine values into a
+	// runtime panic (existing pins compare engine copies with `==`, and
+	// nothing stops future callers from doing the same). The pointer
+	// keeps the value type comparable; the map itself is never mutated
+	// after WithPublicationRowFilters stores it.
+	pubRowFilters *map[string]string
+}
+
+// publicationRowFilters is the nil-safe read point for the boxed
+// ADR-0176 filter map.
+func (e Engine) publicationRowFilters() map[string]string {
+	if e.pubRowFilters == nil {
+		return nil
+	}
+	return *e.pubRowFilters
 }
 
 // Name returns the engine's short identifier as used in configuration
@@ -93,6 +119,26 @@ var _ ir.PublicationScoper = Engine{}
 func (e Engine) WithPublicationScope(publication, ownSlot string) ir.Engine {
 	e.publication = publication
 	e.ownSlot = ownSlot
+	return e
+}
+
+// Compile-time check for the ADR-0176 publication row-filter surface.
+var _ ir.PublicationRowFilterer = Engine{}
+
+// WithPublicationRowFilters implements [ir.PublicationRowFilterer]: it
+// returns a copy of the engine that will render the given per-table
+// `WHERE (<predicate>)` clauses when it next asserts the publication
+// scope (ADR-0176). The pipeline passes only classifier-approved
+// predicates; emission is additionally gated on PG 15+ inside
+// [ensurePublication], so on an older server the copy behaves exactly
+// like the receiver. Returns a configured copy rather than mutating,
+// like [Engine.WithPublicationScope].
+func (e Engine) WithPublicationRowFilters(filters map[string]string) ir.Engine {
+	if len(filters) == 0 {
+		e.pubRowFilters = nil
+		return e
+	}
+	e.pubRowFilters = &filters
 	return e
 }
 
@@ -297,7 +343,7 @@ func (e Engine) EnsurePublication(ctx context.Context, dsn string, tables []stri
 	if err := checkNotStandby(ctx, db); err != nil {
 		return err
 	}
-	return classifyStandbyReadOnly(ensurePublication(ctx, db, e.publicationName(), cfg.schema, tables, e.ownSlot))
+	return classifyStandbyReadOnly(ensurePublication(ctx, db, e.publicationName(), cfg.schema, tables, e.ownSlot, e.publicationRowFilters()))
 }
 
 // AddPublicationTables extends the sluice publication's table list

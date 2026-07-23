@@ -150,7 +150,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 			return nil, classifyStandbyReadOnly(err)
 		}
 	} else {
-		if err := ensurePublication(ctx, db, e.publicationName(), cfg.schema, nil, e.ownSlot); err != nil {
+		if err := ensurePublication(ctx, db, e.publicationName(), cfg.schema, nil, e.ownSlot, nil); err != nil {
 			_ = db.Close()
 			return nil, classifyStandbyReadOnly(err)
 		}

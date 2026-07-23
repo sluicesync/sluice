@@ -42,9 +42,7 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 	// always parenthesized so a disjunctive predicate is fully scoped.
 	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s`,
 		quoteIdent(r.schema), quoteIdent(table.Name))
-	if pred := r.rowFilters[table.Name]; pred != "" {
-		q += " WHERE (" + pred + ")"
-	}
+	q += rowFilterWhereSQL(r.rowFilters[table.Name])
 	var count int64
 	if err := r.db.QueryRowContext(ctx, q).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: ExactRowCount %s.%s: %w",
@@ -116,10 +114,7 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	// ADR-0173 Phase 1: AND the operator's `--where` filter into the
 	// FROM clause (before ORDER BY) so the sampled population is the
 	// matching-source subset; always parenthesized.
-	where := ""
-	if pred := r.rowFilters[table.Name]; pred != "" {
-		where = " WHERE (" + pred + ")"
-	}
+	where := rowFilterWhereSQL(r.rowFilters[table.Name])
 	q := fmt.Sprintf(
 		`SELECT %s AS pk, %s AS hash FROM %s.%s%s ORDER BY MD5(%s || '%d') LIMIT %d`,
 		pkExpr, hashExpr,

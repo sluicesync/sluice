@@ -89,6 +89,47 @@ type whereCDCFilter struct {
 	// VStream source when this is non-empty rather than mis-filter. Keyed by
 	// lower-cased source table name.
 	padSpaceFloatSingleCols map[string]string
+	// serverFiltered marks the tables whose predicate is ALSO pushed into a
+	// server-side filter (today: the ADR-0176 PG publication row filter),
+	// keyed by lower-cased source table name. Post-push-down the client
+	// evaluator should be a no-op for these tables — the server already
+	// excluded everything it would — so a client-side DROP on one of them is
+	// the observable, BENIGN divergence direction (server laxer than client)
+	// and route() logs it at DEBUG (ADR-0176 §2). The dangerous direction
+	// (server stricter) is unobservable client-side by construction, which is
+	// why the real-server oracle exists. Set by [preflightRowFilters] via
+	// [whereCDCFilter.markServerFiltered].
+	serverFiltered map[string]bool
+}
+
+// markServerFiltered records the tables whose predicate is pushed into a
+// server-side filter, enabling route()'s ADR-0176 §2 belt DEBUG logging.
+// Keys are canonicalized to lower case to match route()'s lookups.
+func (f *whereCDCFilter) markServerFiltered(tables []string) {
+	if f == nil || len(tables) == 0 {
+		return
+	}
+	f.serverFiltered = make(map[string]bool, len(tables))
+	for _, t := range tables {
+		f.serverFiltered[strings.ToLower(t)] = true
+	}
+}
+
+// debugServerDeliveredDrop emits the ADR-0176 §2 belt observation: the
+// client evaluator dropped a change the server-side publication row filter
+// delivered. Benign by direction (server laxer than client — merely
+// wasteful), routine below PG 15 (where the engine drops the push-down and
+// the client is the only filter), and DEBUG-level so steady state stays
+// quiet. No-op for tables that aren't server-filtered.
+func (f *whereCDCFilter) debugServerDeliveredDrop(op, schema, table string) {
+	if !f.serverFiltered[strings.ToLower(table)] {
+		return
+	}
+	slog.Debug(
+		"continuous filtered sync: client evaluator dropped a change on a table whose predicate is pushed down server-side (benign direction; on a PG 15+ source the publication filter should already have excluded it — ADR-0176 §2 belt)",
+		slog.String("op", op),
+		slog.String("table", qualifiedTableName(schema, table)),
+	)
 }
 
 // buildWhereCDCFilter compiles each `--where TABLE=<predicate>` string into
@@ -495,6 +536,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		if p == nil || p.Eval(e.Row) {
 			return []ir.Change{e}, nil
 		}
+		f.debugServerDeliveredDrop("INSERT", e.Schema, e.Table)
 		return nil, nil
 	case ir.Delete:
 		p := f.predicateFor(e.Table)
@@ -513,6 +555,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 			e.Before = f.narrowBefore(e.Table, e.Before)
 			return []ir.Change{e}, nil
 		}
+		f.debugServerDeliveredDrop("DELETE", e.Schema, e.Table)
 		return nil, nil
 	case ir.Update:
 		p := f.predicateFor(e.Table)
@@ -534,6 +577,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 			e.Before = f.narrowBefore(e.Table, e.Before)
 			return []ir.Change{e}, nil
 		case !before && !after:
+			f.debugServerDeliveredDrop("UPDATE", e.Schema, e.Table)
 			return nil, nil // never in scope
 		case !before && after:
 			// move-IN: the target never had this row → INSERT the after-image.
@@ -739,6 +783,52 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 				ctx,
 				"continuous filtered sync: PAD-SPACE-collation --where column(s) on VStream stream unfiltered server-side and are filtered client-side (audit 2026-07-19 A0 fallback)",
 				slog.Int("pad_space_tables", len(pad)),
+			)
+		}
+	}
+
+	// ADR-0176: Postgres publication row-filter push-down. On a source whose
+	// engine can carry per-table row filters on its publication (only the PG
+	// logical-replication engine implements [ir.PublicationRowFilterer]),
+	// classify each compiled predicate against the PROVEN equivalence
+	// envelope ([pgPushdownEligible]) and stage the eligible subset for the
+	// engine; [phaseResolvePublicationScope] threads it in alongside the
+	// publication scope, and cold start's EnsurePublication emits it (PG 15+
+	// only — the engine gates the version). An ineligible predicate takes
+	// the A0-style fallback: its table streams UNFILTERED server-side and the
+	// client-side evaluator — which stays ON for every table as the ADR-0176
+	// §2 belt — remains its filter, logged loudly at INFO like A0's
+	// client-copy fallback. Keys stay canonical (s.RowFilters was re-keyed to
+	// the schema's casing above), matching the EnsurePublication table list.
+	if _, ok := s.Source.(ir.PublicationRowFilterer); ok {
+		tableByName := make(map[string]*ir.Table, len(schema.Tables))
+		for _, t := range schema.Tables {
+			if t != nil {
+				tableByName[strings.ToLower(t.Name)] = t
+			}
+		}
+		eligible := make(map[string]string, len(s.RowFilters))
+		pushed := make([]string, 0, len(s.RowFilters))
+		for table, predicate := range s.RowFilters {
+			tbl := tableByName[strings.ToLower(table)]
+			ok, reason := pgPushdownEligible(tbl, filter.predicateFor(table))
+			if !ok {
+				slog.InfoContext(
+					ctx, "continuous filtered sync: publication row-filter push-down fallback engaged — the table streams unfiltered server-side and is filtered client-side (ADR-0176 A0-style fallback)",
+					slog.String("table", table),
+					slog.String("reason", reason),
+				)
+				continue
+			}
+			eligible[table] = predicate
+			pushed = append(pushed, table)
+		}
+		if len(eligible) > 0 {
+			s.publicationRowFilters = eligible
+			filter.markServerFiltered(pushed)
+			slog.InfoContext(
+				ctx, "continuous filtered sync: --where predicates will be pushed into the publication row filter on a PG 15+ source (ADR-0176); client-side evaluation stays on as the equivalence belt",
+				slog.Int("pushed_tables", len(eligible)),
 			)
 		}
 	}

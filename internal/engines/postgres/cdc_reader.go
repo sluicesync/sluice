@@ -424,7 +424,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// nil tables takes the no-scope-supplied path, which never narrows
 	// and so never reaches the ADR-0175 guard; r.slotName is passed
 	// regardless so the exclusion is correct if that ever changes.
-	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil, r.slotName); err != nil {
+	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil, r.slotName, nil); err != nil {
 		return nil, classifyStandbyReadOnly(err)
 	}
 
@@ -2143,12 +2143,32 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 // ADR-0175 conflict probe. Empty is safe: the probe only considers
 // ACTIVE slots, and cold start ensures the publication before its own
 // slot exists.
-func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string, excludeSlot string) error {
+//
+// filters is the ADR-0176 per-table row-filter map (source table name →
+// raw predicate text, the [ir.PublicationRowFilterer] contract). It is
+// consulted only when an explicit table list is supplied, and only on
+// PG 15+ — below that the catalog has no per-table attributes, so the
+// filters are dropped and the emitted DDL is byte-identical to today
+// (silently-safe: the client-side evaluator remains the filter).
+func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string, excludeSlot string, filters map[string]string) error {
 	var exists, allTables bool
 	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
 		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
 	if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists, &allTables); err != nil {
 		return fmt.Errorf("postgres: check publication: %w", err)
+	}
+
+	// Resolve the server version once when a row filter could be emitted;
+	// version drives both the DDL rendering here and the definition
+	// re-read inside the ADR-0176 no-op probe below.
+	version := 0
+	if len(tables) > 0 && len(filters) > 0 {
+		v, err := serverVersionNum(ctx, db)
+		if err != nil {
+			return err
+		}
+		version = v
+		filters = publicationRowFiltersForVersion(ctx, version, filters)
 	}
 
 	if !exists {
@@ -2157,7 +2177,7 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
 		} else {
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
-				quoteIdent(name), formatPublicationTableList(schema, tables))
+				quoteIdent(name), formatPublicationTableList(schema, tables, filters))
 		}
 		if _, err := db.ExecContext(ctx, createQuery); err != nil {
 			if !isDuplicatePublication(err) {
@@ -2236,7 +2256,7 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		// every unlisted table from the stream. If another active
 		// sluice slot is reading through this publication, that is the
 		// silent-loss shape — refuse rather than rescope.
-		if err := guardPublicationNarrowing(ctx, db, name, nil, excludeSlot); err != nil {
+		if _, err := guardPublicationNarrowing(ctx, db, name, nil, excludeSlot); err != nil {
 			return err
 		}
 		// Migrate: drop the FOR ALL TABLES publication and recreate
@@ -2247,33 +2267,165 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 			return fmt.Errorf("postgres: drop FOR-ALL-TABLES publication %q for migration: %w", name, err)
 		}
 		createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
-			quoteIdent(name), formatPublicationTableList(schema, tables))
+			quoteIdent(name), formatPublicationTableList(schema, tables, filters))
 		if _, err := db.ExecContext(ctx, createQuery); err != nil {
 			return fmt.Errorf("postgres: re-create publication %q with scoped tables: %w", name, err)
 		}
 		return nil
 	}
 	// ADR-0175: `SET TABLE` replaces the member set atomically, so an
-	// incoming list that omits a current member REMOVES it. Guard that
-	// case; a widening or equal rescope removes nothing and proceeds.
-	if err := guardPublicationNarrowing(ctx, db, name, qualifiedTableKeys(schema, tables), excludeSlot); err != nil {
+	// incoming list that omits a current member REMOVES it — and, one
+	// level down (ADR-0176), a list that clears/adds/changes a surviving
+	// member's row filter changes the DEFINITION. Guard both; a widening
+	// or equal rescope changes nothing and proceeds.
+	ambiguous, err := guardPublicationNarrowing(ctx, db, name, qualifiedTableQuals(schema, tables, filters), excludeSlot)
+	if err != nil {
 		return err
 	}
 	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s SET TABLE %s`,
-		quoteIdent(name), formatPublicationTableList(schema, tables))
+		quoteIdent(name), formatPublicationTableList(schema, tables, filters))
+	if len(ambiguous) > 0 {
+		// ADR-0176: a survivor carries a row filter and the incoming list
+		// carries one too. Raw predicate text cannot be compared to the
+		// catalog's pg_get_expr rendering (`country = 'US'` vs
+		// `(country = 'US'::text)`), so only PG itself can decide whether
+		// this rescope is the routine no-op re-assert (our own cold
+		// restart) or a genuine definition change (another stream's filter
+		// being replaced). Resolve it with the transactional probe.
+		return rescopeRowFilteredPublication(ctx, db, name, alterQuery, version, excludeSlot)
+	}
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
 		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
 	}
 	return nil
 }
 
-// qualifiedTableKeys renders the "schema.table" keys that match
-// [publicationMemberSet]'s shape, mirroring
-// [formatPublicationTableList]'s empty-schema handling.
-func qualifiedTableKeys(schema string, tables []string) map[string]struct{} {
-	keys := make(map[string]struct{}, len(tables))
+// publicationRowFiltersForVersion applies the ADR-0176 version gate:
+// per-table publication row filters exist from PG 15
+// ([pgVersionPublicationAttrs]); on an older server the filters are
+// DROPPED (nil) so the emitted DDL is byte-identical to the pre-ADR-0176
+// shape. Silently-safe by design — the client-side evaluator always runs
+// and remains the filter there — but logged at DEBUG so the degradation
+// is observable.
+func publicationRowFiltersForVersion(ctx context.Context, version int, filters map[string]string) map[string]string {
+	if version >= pgVersionPublicationAttrs {
+		return filters
+	}
+	slog.DebugContext(
+		ctx, "postgres: source predates publication row filters (PG 15); --where stays client-side-only for the CDC leg (ADR-0176 version gate)",
+		slog.Int("server_version_num", version),
+		slog.Int("filtered_tables", len(filters)),
+	)
+	return nil
+}
+
+// rescopeRowFilteredPublication resolves the ambiguous both-sides-carry-a-
+// row-filter rescope (ADR-0176): run the SET TABLE inside a transaction,
+// re-read the resulting definition, and let PG's own pg_get_expr
+// normalization decide whether anything actually changed.
+//
+//   - Definition unchanged → the rescope was a no-op re-assert (a filtered
+//     stream's own cold restart with the same predicate) → COMMIT.
+//   - Definition changed and no other sluice slot exists → the operator's
+//     own deliberate rescope (e.g. a changed --where on the only stream)
+//     → COMMIT.
+//   - Definition changed and another sluice slot exists → ROLLBACK and
+//     refuse with the ADR-0175 scope-conflict error: the change could be
+//     silently replacing a peer stream's filter. The rollback leaves the
+//     publication — and every stream reading through it — untouched, the
+//     same no-mutation-on-refusal guarantee the pre-mutation guard gives.
+func rescopeRowFilteredPublication(ctx context.Context, db *sql.DB, name, alterQuery string, version int, excludeSlot string) error {
+	before, err := publicationMemberDefsAt(ctx, db, name, version)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: begin publication rescope probe: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, alterQuery); err != nil {
+		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
+	}
+	after, err := publicationMemberDefsAt(ctx, tx, name, version)
+	if err != nil {
+		return err
+	}
+	changed := changedMemberDefs(before, after)
+	if len(changed) == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("postgres: commit publication rescope: %w", err)
+		}
+		committed = true
+		return nil
+	}
+	// A genuine definition change. Same decision as the pre-mutation
+	// guard: allowed when no other sluice slot holds a claim on this
+	// source, refused otherwise. The slot probe runs on db (its own
+	// connection) — pg_replication_slots is not transactional state.
+	slots, err := otherSluiceSlots(ctx, db, excludeSlot)
+	if err != nil {
+		return err
+	}
+	if len(slots) == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("postgres: commit publication rescope: %w", err)
+		}
+		committed = true
+		return nil
+	}
+	_ = tx.Rollback()
+	committed = true // rollback done; suppress the deferred one
+	return publicationScopeConflictRefusal(name, []string{"CHANGE the per-table row filter on " + strings.Join(changed, ", ")}, slots)
+}
+
+// changedMemberDefs returns the sorted members whose definition differs
+// between two catalog reads (both sides pg_get_expr-normalized, so text
+// equality is exact), each rendered "member (WHERE (old) → WHERE (new))"
+// for the refusal message. Pure, like [removedFromPublication].
+func changedMemberDefs(before, after map[string]publicationMemberAttrs) []string {
+	var changed []string
+	for m, b := range before {
+		a, ok := after[m]
+		if !ok || a == b {
+			continue
+		}
+		changed = append(changed, fmt.Sprintf("%s (WHERE (%s) → WHERE (%s))", m, b.Qual, a.Qual))
+	}
+	for m := range after {
+		if _, ok := before[m]; !ok {
+			changed = append(changed, m+" (added)")
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+// qualifiedTableQuals renders the incoming publication definition the
+// ADR-0175/0176 guard compares against the catalog: "schema.table" keys
+// matching [publicationMemberSet]'s shape (mirroring
+// [formatPublicationTableList]'s empty-schema handling), each mapped to
+// its raw ADR-0176 row-filter text — "" for a bare (filter-free) member,
+// which is every member when filters is nil.
+func qualifiedTableQuals(schema string, tables []string, filters map[string]string) map[string]string {
+	keys := make(map[string]string, len(tables))
 	for _, t := range tables {
-		keys[schema+"."+t] = struct{}{}
+		keys[schema+"."+t] = filters[t]
+	}
+	return keys
+}
+
+// incomingKeySet projects the incoming definition down to the bare
+// member-key set [removedFromPublication] speaks.
+func incomingKeySet(incoming map[string]string) map[string]struct{} {
+	keys := make(map[string]struct{}, len(incoming))
+	for m := range incoming {
+		keys[m] = struct{}{}
 	}
 	return keys
 }
@@ -2297,40 +2449,54 @@ func removedFromPublication(members, incoming map[string]struct{}) []string {
 	return removed
 }
 
-// attributeClearedSurvivors returns the sorted members that SURVIVE
-// the rescope (present in both the current definition and the
-// incoming set) but currently carry a per-table attribute — a row
-// filter (prqual) or column list (prattrs) — that the incoming bare
-// `SET TABLE` list would silently CLEAR. This is the ADR-0176
-// prerequisite widening of the ADR-0175 guard: two identical table
-// SETS with differing per-table attributes are a scope conflict one
-// level down (a stream reading through its row filter would silently
-// start receiving — or a peer would stop filtering — every row).
-// sluice's own lists are always attribute-free today, so "survivor
-// has any attribute" IS "the definitions differ"; each entry names
-// the attribute so the refusal is operator-actionable.
+// attributeChangedSurvivors classifies the members that SURVIVE the
+// rescope (present in both the current definition and the incoming set)
+// by what the rescope would do to their per-table attributes — the
+// ADR-0176 widening of the ADR-0175 guard (two identical table SETS with
+// differing per-table attributes are a scope conflict one level down: a
+// stream reading through its row filter would silently start receiving —
+// or a peer would stop filtering — every row).
+//
+// Two buckets:
+//
+//   - hard: the change is provable from the catalog alone — a current
+//     row filter the bare incoming member would CLEAR, a column list any
+//     incoming SET TABLE clears (sluice never emits one), or a row
+//     filter the incoming member would ADD where none exists. Each
+//     entry names the attribute so the refusal is operator-actionable.
+//   - ambiguous: BOTH sides carry a row filter. Equality is undecidable
+//     here — the incoming side is raw operator text, the catalog side is
+//     pg_get_expr-normalized — so the caller resolves it with the
+//     transactional no-op probe ([rescopeRowFilteredPublication]).
 //
 // Pure, like [removedFromPublication], so the decision that gates a
 // refusal is testable without a database.
-func attributeClearedSurvivors(defs map[string]publicationMemberAttrs, incoming map[string]struct{}) []string {
-	var cleared []string
+func attributeChangedSurvivors(defs map[string]publicationMemberAttrs, incoming map[string]string) (hard, ambiguous []string) {
 	for m, attrs := range defs {
-		if _, keep := incoming[m]; !keep || attrs.bare() {
-			continue
+		inQual, keep := incoming[m]
+		if !keep {
+			continue // removal — reported by removedFromPublication
 		}
-		detail := m
 		switch {
-		case attrs.Qual != "" && attrs.HasColumnList:
-			detail += " (row filter WHERE (" + attrs.Qual + ") + a column list)"
-		case attrs.Qual != "":
-			detail += " (row filter WHERE (" + attrs.Qual + "))"
-		default:
-			detail += " (a column list)"
+		case attrs.HasColumnList:
+			// sluice never emits column lists, so any rescope clears it —
+			// with or without an incoming row filter.
+			detail := m + " (a column list would be cleared"
+			if attrs.Qual != "" && inQual == "" {
+				detail += ", and row filter WHERE (" + attrs.Qual + ") too"
+			}
+			hard = append(hard, detail+")")
+		case attrs.Qual != "" && inQual == "":
+			hard = append(hard, m+" (row filter WHERE ("+attrs.Qual+") would be cleared)")
+		case attrs.Qual == "" && inQual != "":
+			hard = append(hard, m+" (a row filter WHERE ("+inQual+") would be added, narrowing the stream)")
+		case attrs.Qual != "" && inQual != "":
+			ambiguous = append(ambiguous, m)
 		}
-		cleared = append(cleared, detail)
 	}
-	sort.Strings(cleared)
-	return cleared
+	sort.Strings(hard)
+	sort.Strings(ambiguous)
+	return hard, ambiguous
 }
 
 // memberKeySet projects a definition map down to the bare member-key
@@ -2346,21 +2512,15 @@ func memberKeySet(defs map[string]publicationMemberAttrs) map[string]struct{} {
 // publicationMemberAttrs carries one member table's per-table
 // publication attributes (PG 15+): the row-filter WHERE clause
 // (pg_publication_rel.prqual, rendered via pg_get_expr) and whether a
-// column list (prattrs) is attached. The zero value — no qual, no
-// column list — is the only definition sluice itself ever emits
-// today, which is exactly why a NON-zero value on a surviving member
-// makes a bare SET TABLE a definition change: the rescope would
-// silently CLEAR the attribute. On PG < 15 the catalog has no
-// attribute columns and every member reports the zero value.
+// column list (prattrs) is attached. sluice's own definitions carry at
+// most a row filter (the ADR-0176 push-down); it never emits a column
+// list, so a column list on a surviving member always makes a rescope
+// a definition change ([attributeChangedSurvivors]). On PG < 15 the
+// catalog has no attribute columns and every member reports the zero
+// value.
 type publicationMemberAttrs struct {
 	Qual          string
 	HasColumnList bool
-}
-
-// bare reports whether the member carries no per-table attributes —
-// the only shape sluice's own SET TABLE lists can express.
-func (a publicationMemberAttrs) bare() bool {
-	return a.Qual == "" && !a.HasColumnList
 }
 
 // publicationMemberDefs returns the publication's current member
@@ -2376,6 +2536,14 @@ func publicationMemberDefs(ctx context.Context, db *sql.DB, name string) (map[st
 	if err != nil {
 		return nil, fmt.Errorf("postgres: publication member definitions: %w", err)
 	}
+	return publicationMemberDefsAt(ctx, db, name, version)
+}
+
+// publicationMemberDefsAt is [publicationMemberDefs] with the server
+// version already in hand, over any [querier] — split out so the
+// ADR-0176 rescope probe can re-read the definition INSIDE its
+// transaction (*sql.Tx) and compare against the pre-ALTER read.
+func publicationMemberDefsAt(ctx context.Context, q querier, name string, version int) (map[string]publicationMemberAttrs, error) {
 	memberQuery := `
 		SELECT n.nspname, c.relname, '' AS qual, false AS has_column_list
 		FROM   pg_publication p
@@ -2394,7 +2562,7 @@ func publicationMemberDefs(ctx context.Context, db *sql.DB, name string) (map[st
 		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
 		WHERE  p.pubname = $1`
 	}
-	rows, err := db.QueryContext(ctx, memberQuery, name)
+	rows, err := q.QueryContext(ctx, memberQuery, name)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list publication member definitions: %w", err)
 	}
@@ -2519,29 +2687,37 @@ func otherSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]st
 // BEFORE any mutation, so a refused attempt leaves the publication —
 // and every stream reading through it — completely untouched.
 //
-// incoming is the "schema.table" key set the caller is about to scope
-// the publication to; a nil map means "everything is being removed"
-// (the FOR ALL TABLES demotion, where the current members aren't
-// enumerable from pg_publication_rel).
+// incoming is the definition the caller is about to scope the
+// publication to — "schema.table" keys mapped to their ADR-0176 raw
+// row-filter text ("" = bare, [qualifiedTableQuals]); a nil map means
+// "everything is being removed" (the FOR ALL TABLES demotion, where
+// the current members aren't enumerable from pg_publication_rel).
 //
 // "Narrowing" is defined over the whole publication DEFINITION, not
-// the table set (the ADR-0176 prerequisite widening): a rescope
-// conflicts when it removes a member OR when a surviving member
-// carries a per-table attribute (PG 15+ row filter / column list)
-// that the incoming bare list would silently clear. No removal and no
-// attribute clearing ⇒ no conflict, so widening and equal-scope
-// rescopes of attribute-free publications never reach the slot probe.
-// That keeps the ADR-0122 fleet shape (identical scopes) and
+// the table set (the ADR-0176 widening): a rescope conflicts when it
+// removes a member OR when a surviving member's per-table attributes
+// (PG 15+ row filter / column list) would change. No removal and no
+// attribute change ⇒ no conflict, so widening and equal-scope rescopes
+// of attribute-free publications never reach the slot probe. That
+// keeps the ADR-0122 fleet shape (identical scopes) and
 // `schema add-table` (additive) on their existing path at near-zero
 // added cost (one server_version_num read).
+//
+// The returned ambiguous list names surviving members where BOTH the
+// current definition and the incoming one carry a row filter — a
+// change only PG's own normalization can rule in or out, which the
+// caller resolves via [rescopeRowFilteredPublication]. It is non-empty
+// only when nothing else conflicts (a provable conflict refuses here;
+// a rescope this stream is entitled to — no other slots — proceeds
+// unprobed).
 func guardPublicationNarrowing(
 	ctx context.Context,
 	db *sql.DB,
 	name string,
-	incoming map[string]struct{},
+	incoming map[string]string,
 	excludeSlot string,
-) error {
-	var removed, attrCleared []string
+) (ambiguous []string, err error) {
+	var removed, attrChanged []string
 	if incoming == nil {
 		// FOR ALL TABLES → scoped. Every table not in the new list
 		// loses scope; we can't enumerate them (a FOR ALL TABLES
@@ -2551,32 +2727,45 @@ func guardPublicationNarrowing(
 	} else {
 		defs, err := publicationMemberDefs(ctx, db, name)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		removed = removedFromPublication(memberKeySet(defs), incoming)
-		attrCleared = attributeClearedSurvivors(defs, incoming)
-		if len(removed) == 0 && len(attrCleared) == 0 {
-			return nil // widening or equal, with no attributes at risk — nothing to protect
+		removed = removedFromPublication(memberKeySet(defs), incomingKeySet(incoming))
+		attrChanged, ambiguous = attributeChangedSurvivors(defs, incoming)
+		if len(removed) == 0 && len(attrChanged) == 0 {
+			// Widening or equal, with no provable attribute change — the
+			// only open question (if any) is the ambiguous filter-vs-filter
+			// comparison, which the caller's probe settles.
+			return ambiguous, nil
 		}
 	}
 
 	slots, err := otherSluiceSlots(ctx, db, excludeSlot)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(slots) == 0 {
-		return nil // no other stream holds a claim; the rescope is the operator's own
+		// No other stream holds a claim; the rescope is the operator's
+		// own. That entitlement covers the ambiguous members too — no
+		// probe needed.
+		return nil, nil
 	}
 
-	// Compose what the rescope would change: removed members, cleared
-	// per-table attributes (the ADR-0176 prerequisite widening), or both.
+	// Compose what the rescope would change: removed members, changed
+	// per-table attributes (the ADR-0176 widening), or both.
 	var changes []string
 	if len(removed) > 0 {
 		changes = append(changes, "REMOVE "+strings.Join(removed, ", ")+" from the stream")
 	}
-	if len(attrCleared) > 0 {
-		changes = append(changes, "silently CLEAR per-table attributes on "+strings.Join(attrCleared, ", "))
+	if len(attrChanged) > 0 {
+		changes = append(changes, "silently CHANGE per-table attributes: "+strings.Join(attrChanged, ", "))
 	}
+	return nil, publicationScopeConflictRefusal(name, changes, slots)
+}
+
+// publicationScopeConflictRefusal builds the ADR-0175/0176 coded
+// refusal, shared by the pre-mutation guard and the transactional
+// rescope probe so both refusal paths speak with one voice.
+func publicationScopeConflictRefusal(name string, changes, slots []string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCPublicationScopeConflict,
 		"pass --publication-name to give this stream its own publication, stop the other stream first, or drop its slot if abandoned",
@@ -2770,8 +2959,13 @@ func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string
 		return nil
 	}
 
+	// nil filters: the mid-stream add-table flow adds tables BARE. A
+	// `--where` for a live-added table is not pushed down until the
+	// stream's next cold start re-asserts the publication — the
+	// client-side evaluator (always on) keeps it correct in the interim
+	// (ADR-0176 §2).
 	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s ADD TABLE %s`,
-		quoteIdent(name), formatPublicationTableList(schema, toAdd))
+		quoteIdent(name), formatPublicationTableList(schema, toAdd, nil))
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
 		return fmt.Errorf("postgres: alter publication %q add tables: %w", name, err)
 	}
@@ -2780,15 +2974,22 @@ func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string
 
 // formatPublicationTableList renders a comma-separated list of
 // schema-qualified, double-quoted table identifiers for use after
-// `FOR TABLE` / `SET TABLE`.
-func formatPublicationTableList(schema string, tables []string) string {
+// `FOR TABLE` / `SET TABLE`. filters is the ADR-0176 row-filter map
+// (bare source table name → raw predicate text): a table with an entry
+// renders `schema."table" WHERE (<predicate>)` via the same
+// single-sourced renderer the snapshot SELECT uses
+// ([rowFilterWhereSQL]), so the publication filter and the snapshot
+// push-down can never drift on predicate text. nil/absent renders the
+// bare identifier — byte-identical to the pre-ADR-0176 shape.
+func formatPublicationTableList(schema string, tables []string, filters map[string]string) string {
 	parts := make([]string, len(tables))
 	for i, t := range tables {
 		if schema == "" {
 			parts[i] = quoteIdent(t)
-			continue
+		} else {
+			parts[i] = quoteIdent(schema) + "." + quoteIdent(t)
 		}
-		parts[i] = quoteIdent(schema) + "." + quoteIdent(t)
+		parts[i] += rowFilterWhereSQL(filters[t])
 	}
 	return strings.Join(parts, ", ")
 }

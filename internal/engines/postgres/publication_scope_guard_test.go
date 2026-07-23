@@ -10,6 +10,7 @@
 package postgres
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -103,78 +104,119 @@ func defSet(keys ...string) map[string]publicationMemberAttrs {
 	return m
 }
 
-// TestAttributeClearedSurvivors pins the ADR-0176 prerequisite
-// widening of the guard: two identical table SETS with differing
-// per-table attributes (a row filter / column list on the current
-// definition that the incoming bare SET TABLE would clear) count as a
-// scope conflict — and, just as load-bearing, an attribute-free
-// equal/widening rescope must NOT fire (every shipped shape today).
-func TestAttributeClearedSurvivors(t *testing.T) {
+// bareQuals builds a filter-free incoming definition (every member
+// bare) — the shape every pre-ADR-0176 caller sends.
+func bareQuals(keys ...string) map[string]string {
+	m := make(map[string]string, len(keys))
+	for _, k := range keys {
+		m[k] = ""
+	}
+	return m
+}
+
+// TestAttributeChangedSurvivors pins the ADR-0176 widening of the
+// guard over the full attribute-transition matrix: a row filter /
+// column list the incoming definition would CLEAR or ADD is a hard
+// (provable) conflict; filter-vs-filter is AMBIGUOUS (raw text vs
+// pg_get_expr rendering — only the transactional probe can decide);
+// and, just as load-bearing, an attribute-free equal/widening rescope
+// must NOT fire (every pre-ADR-0176 shipped shape).
+func TestAttributeChangedSurvivors(t *testing.T) {
 	tests := []struct {
-		name     string
-		defs     map[string]publicationMemberAttrs
-		incoming map[string]struct{}
-		want     []string
+		name          string
+		defs          map[string]publicationMemberAttrs
+		incoming      map[string]string
+		wantHard      []string
+		wantAmbiguous []string
 	}{
 		{
 			name:     "same set, no attributes — no fire (every shipped shape)",
 			defs:     defSet("public.orders", "public.items"),
-			incoming: keySet("public.orders", "public.items"),
-			want:     nil,
+			incoming: bareQuals("public.orders", "public.items"),
 		},
 		{
-			name: "same set, surviving member carries a row filter — fire",
+			name: "bare incoming clears a surviving row filter — hard",
 			defs: map[string]publicationMemberAttrs{
 				"public.orders": {Qual: "(country = 'US'::text)"},
 				"public.items":  {},
 			},
-			incoming: keySet("public.orders", "public.items"),
-			want:     []string{"public.orders (row filter WHERE ((country = 'US'::text)))"},
+			incoming: bareQuals("public.orders", "public.items"),
+			wantHard: []string{"public.orders (row filter WHERE ((country = 'US'::text)) would be cleared)"},
 		},
 		{
-			name: "same set, surviving member carries a column list — fire",
+			name: "incoming filter added where none exists — hard (narrows peers)",
+			defs: defSet("public.orders"),
+			incoming: map[string]string{
+				"public.orders": "id < 100",
+			},
+			wantHard: []string{"public.orders (a row filter WHERE (id < 100) would be added, narrowing the stream)"},
+		},
+		{
+			name: "filter on both sides — ambiguous (only PG can compare)",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(id < 100)"},
+			},
+			incoming: map[string]string{
+				"public.orders": "id < 100",
+			},
+			wantAmbiguous: []string{"public.orders"},
+		},
+		{
+			name: "column list is always a hard clear, filter or not",
 			defs: map[string]publicationMemberAttrs{
 				"public.orders": {HasColumnList: true},
 			},
-			incoming: keySet("public.orders"),
-			want:     []string{"public.orders (a column list)"},
+			incoming: bareQuals("public.orders"),
+			wantHard: []string{"public.orders (a column list would be cleared)"},
 		},
 		{
-			name: "both attributes on one survivor — one entry naming both",
+			name: "column list + row filter, bare incoming — one entry naming both",
 			defs: map[string]publicationMemberAttrs{
 				"public.orders": {Qual: "(id > 5)", HasColumnList: true},
 			},
-			incoming: keySet("public.orders"),
-			want:     []string{"public.orders (row filter WHERE ((id > 5)) + a column list)"},
+			incoming: bareQuals("public.orders"),
+			wantHard: []string{"public.orders (a column list would be cleared, and row filter WHERE ((id > 5)) too)"},
+		},
+		{
+			name: "column list + row filter, incoming filter — hard on the list, not ambiguous",
+			defs: map[string]publicationMemberAttrs{
+				"public.orders": {Qual: "(id > 5)", HasColumnList: true},
+			},
+			incoming: map[string]string{"public.orders": "id > 5"},
+			wantHard: []string{"public.orders (a column list would be cleared)"},
 		},
 		{
 			name: "attribute on a REMOVED member is not double-reported here",
 			defs: map[string]publicationMemberAttrs{
 				"public.orders": {Qual: "(id > 5)"},
 			},
-			incoming: keySet("public.users"),
-			want:     nil, // removedFromPublication reports public.orders; this arm only guards survivors
+			incoming: bareQuals("public.users"),
+			// removedFromPublication reports public.orders; this arm only
+			// guards survivors.
 		},
 		{
 			name: "widening past an attribute-bearing survivor still fires",
 			defs: map[string]publicationMemberAttrs{
 				"public.orders": {Qual: "(id > 5)"},
 			},
-			incoming: keySet("public.orders", "public.users"),
-			want:     []string{"public.orders (row filter WHERE ((id > 5)))"},
+			incoming: bareQuals("public.orders", "public.users"),
+			wantHard: []string{"public.orders (row filter WHERE ((id > 5)) would be cleared)"},
 		},
 		{
 			name:     "results are sorted for a stable refusal message",
 			defs:     map[string]publicationMemberAttrs{"public.zeta": {HasColumnList: true}, "public.alpha": {HasColumnList: true}},
-			incoming: keySet("public.zeta", "public.alpha"),
-			want:     []string{"public.alpha (a column list)", "public.zeta (a column list)"},
+			incoming: bareQuals("public.zeta", "public.alpha"),
+			wantHard: []string{"public.alpha (a column list would be cleared)", "public.zeta (a column list would be cleared)"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := attributeClearedSurvivors(tc.defs, tc.incoming)
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("attributeClearedSurvivors() = %v, want %v", got, tc.want)
+			hard, ambiguous := attributeChangedSurvivors(tc.defs, tc.incoming)
+			if !reflect.DeepEqual(hard, tc.wantHard) {
+				t.Errorf("attributeChangedSurvivors() hard = %v, want %v", hard, tc.wantHard)
+			}
+			if !reflect.DeepEqual(ambiguous, tc.wantAmbiguous) {
+				t.Errorf("attributeChangedSurvivors() ambiguous = %v, want %v", ambiguous, tc.wantAmbiguous)
 			}
 		})
 	}
@@ -193,15 +235,20 @@ func TestMemberKeySet(t *testing.T) {
 	}
 }
 
-// TestQualifiedTableKeys pins that the guard's incoming-key shape
+// TestQualifiedTableQuals pins that the guard's incoming-key shape
 // matches publicationMemberSet's "schema.table" keying — if these ever
 // diverge the guard silently classifies EVERY rescope as narrowing
-// (over-fire) or none of them (under-fire, silent loss).
-func TestQualifiedTableKeys(t *testing.T) {
-	got := qualifiedTableKeys("public", []string{"orders", "items"})
-	want := keySet("public.orders", "public.items")
+// (over-fire) or none of them (under-fire, silent loss) — and that the
+// ADR-0176 filter map (keyed by BARE table name) lands on the right
+// qualified member.
+func TestQualifiedTableQuals(t *testing.T) {
+	got := qualifiedTableQuals("public", []string{"orders", "items"}, map[string]string{"orders": "id < 100"})
+	want := map[string]string{
+		"public.orders": "id < 100",
+		"public.items":  "",
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("qualifiedTableKeys() = %v, want %v", got, want)
+		t.Errorf("qualifiedTableQuals() = %v, want %v", got, want)
 	}
 
 	// Round-trip against the member-set key shape: a member emitted as
@@ -210,6 +257,11 @@ func TestQualifiedTableKeys(t *testing.T) {
 	member := "public" + "." + "orders"
 	if _, ok := got[member]; !ok {
 		t.Errorf("key shape mismatch: member %q not found in %v", member, got)
+	}
+
+	// nil filters — every pre-ADR-0176 caller — leaves every member bare.
+	if got := qualifiedTableQuals("public", []string{"orders"}, nil); got["public.orders"] != "" {
+		t.Errorf("nil filters must render every member bare; got %v", got)
 	}
 }
 
@@ -264,5 +316,112 @@ func TestEngine_ImplementsPublicationScoper(t *testing.T) {
 	var e any = Engine{}
 	if _, ok := e.(ir.PublicationScoper); !ok {
 		t.Fatal("postgres.Engine no longer implements ir.PublicationScoper")
+	}
+	// ADR-0176: same contract for the row-filter sibling — losing it
+	// silently reverts every filtered PG sync to client-side-only
+	// (correct but the push-down feature is gone without a trace).
+	if _, ok := e.(ir.PublicationRowFilterer); !ok {
+		t.Fatal("postgres.Engine no longer implements ir.PublicationRowFilterer")
+	}
+}
+
+// TestEngine_WithPublicationRowFilters pins the configured-copy
+// semantics (registry value stays filter-free) and that the filters
+// ride into EnsurePublication's field.
+func TestEngine_WithPublicationRowFilters(t *testing.T) {
+	base := Engine{}
+	filters := map[string]string{"orders": "id < 100"}
+	scoped, ok := base.WithPublicationRowFilters(filters).(Engine)
+	if !ok {
+		t.Fatal("WithPublicationRowFilters did not return a postgres.Engine")
+	}
+	if got := scoped.publicationRowFilters()["orders"]; got != "id < 100" {
+		t.Errorf("scoped publicationRowFilters()[orders] = %q, want %q", got, "id < 100")
+	}
+	if base.publicationRowFilters() != nil {
+		t.Error("WithPublicationRowFilters mutated the receiver; the registry's shared value must stay filter-free")
+	}
+	// The boxed-pointer wart exists to keep Engine COMPARABLE (interface
+	// `==` on ir.Engine values must never panic) — pin that property.
+	if scoped == base {
+		t.Error("scoped and base compare equal despite differing filters")
+	}
+	// Empty filters clear the box, restoring the zero value exactly.
+	if cleared := scoped.WithPublicationRowFilters(nil).(Engine); cleared != base {
+		t.Error("WithPublicationRowFilters(nil) must restore the filter-free zero value")
+	}
+}
+
+// TestFormatPublicationTableList_RowFilters pins the ADR-0176 DDL
+// rendering: a filtered table gets `WHERE (<raw predicate>)` via the
+// SAME renderer the snapshot SELECT uses ([rowFilterWhereSQL]), an
+// unfiltered sibling stays bare, and nil filters is byte-identical to
+// the pre-ADR-0176 output.
+func TestFormatPublicationTableList_RowFilters(t *testing.T) {
+	tables := []string{"orders", "items"}
+	filters := map[string]string{"orders": "country = 'US'"}
+
+	got := formatPublicationTableList("public", tables, filters)
+	want := `"public"."orders" WHERE (country = 'US'), "public"."items"`
+	if got != want {
+		t.Errorf("filtered list:\n got  %s\n want %s", got, want)
+	}
+
+	// Single-source pin: the publication's WHERE suffix and the snapshot
+	// SELECT's must be the identical rendering of the identical text.
+	if snapshot := rowFilterWhereSQL("country = 'US'"); snapshot != ` WHERE (country = 'US')` {
+		t.Errorf("rowFilterWhereSQL drifted: %q", snapshot)
+	}
+
+	if got := formatPublicationTableList("public", tables, nil); got != `"public"."orders", "public"."items"` {
+		t.Errorf("nil filters must render the pre-ADR-0176 bare list; got %s", got)
+	}
+
+	// Empty-schema callers render unqualified identifiers, filters intact.
+	if got := formatPublicationTableList("", []string{"orders"}, filters); got != `"orders" WHERE (country = 'US')` {
+		t.Errorf("empty-schema filtered list = %s", got)
+	}
+}
+
+// TestPublicationRowFiltersForVersion pins the ADR-0176 version gate:
+// below PG 15 ([pgVersionPublicationAttrs]) the filters are DROPPED so
+// the emitted DDL is byte-identical to today (client-side-only,
+// silently-safe); at/above 15 they pass through untouched.
+func TestPublicationRowFiltersForVersion(t *testing.T) {
+	ctx := context.Background()
+	filters := map[string]string{"orders": "id < 100"}
+	if got := publicationRowFiltersForVersion(ctx, 140011, filters); got != nil {
+		t.Errorf("PG 14 must drop the filters (client-side-only); got %v", got)
+	}
+	if got := publicationRowFiltersForVersion(ctx, pgVersionPublicationAttrs, filters); !reflect.DeepEqual(got, filters) {
+		t.Errorf("PG 15.0 must pass the filters through; got %v", got)
+	}
+	if got := publicationRowFiltersForVersion(ctx, 160009, filters); !reflect.DeepEqual(got, filters) {
+		t.Errorf("PG 16 must pass the filters through; got %v", got)
+	}
+}
+
+// TestChangedMemberDefs pins the probe's pure diff: pg_get_expr-
+// normalized definitions compare by text equality, and every changed
+// member is named for the refusal message.
+func TestChangedMemberDefs(t *testing.T) {
+	before := map[string]publicationMemberAttrs{
+		"public.orders": {Qual: "(id < 100)"},
+		"public.items":  {Qual: "(sku <> ''::text)"},
+	}
+	same := map[string]publicationMemberAttrs{
+		"public.orders": {Qual: "(id < 100)"},
+		"public.items":  {Qual: "(sku <> ''::text)"},
+	}
+	if got := changedMemberDefs(before, same); got != nil {
+		t.Errorf("identical definitions must diff empty; got %v", got)
+	}
+	after := map[string]publicationMemberAttrs{
+		"public.orders": {Qual: "(id < 50)"},
+		"public.items":  {Qual: "(sku <> ''::text)"},
+	}
+	want := []string{"public.orders (WHERE ((id < 100)) → WHERE ((id < 50)))"}
+	if got := changedMemberDefs(before, after); !reflect.DeepEqual(got, want) {
+		t.Errorf("changedMemberDefs() = %v, want %v", got, want)
 	}
 }

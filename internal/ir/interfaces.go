@@ -3064,6 +3064,41 @@ type PublicationScoper interface {
 	WithPublicationScope(publication, ownSlot string) Engine
 }
 
+// PublicationRowFilterer is the optional engine surface — the
+// [PublicationScoper] sibling — for engines that can push a `--where`
+// predicate into the publication as a per-table row filter, so
+// out-of-scope changes are never decoded or sent (ADR-0176; today only
+// Postgres 15+, whose `ALTER PUBLICATION ... SET TABLE t WHERE (pred)`
+// is the source-side analogue of the VStream filter push-down).
+//
+// The contract, load-bearing on both sides of the seam:
+//
+//   - filters is keyed by SOURCE table name (the schema's canonical
+//     casing, the same keys the snapshot leg's [RowFilterSetter] map
+//     uses) and each value is the operator's RAW predicate text — the
+//     SAME single-sourced text the snapshot SELECT pushes down, so the
+//     three server-side evaluation sites (snapshot SELECT, publication
+//     filter, verify COUNT) cannot drift apart.
+//   - The orchestrator passes ONLY predicates its conservative
+//     eligibility classifier proved equivalent per family
+//     (pgPushdownEligible); everything else stays client-side-only.
+//   - The engine gates emission on its own server version (below PG 15
+//     the filter is silently dropped and behavior is byte-identical to
+//     client-side-only, which stays correct because the client-side
+//     evaluator always runs as the belt — ADR-0176 §2).
+//   - The filter is emitted only where the publication scope is
+//     asserted (cold start's EnsurePublication). Warm resume never
+//     re-emits or mutates the publication — the unchanged ADR-0175/0176
+//     invariant.
+//
+// WithPublicationRowFilters returns a configured copy rather than
+// mutating, for the same registry-sharing reason [PublicationScoper]
+// does. Engines without publication row filters simply omit the
+// method, and the orchestrator's type assertion no-ops.
+type PublicationRowFilterer interface {
+	WithPublicationRowFilters(filters map[string]string) Engine
+}
+
 // CDCReaderWithSlotOpener is the optional engine surface for engines
 // whose CDC implementation can be configured with a non-default
 // replication-slot name (today: Postgres). When the orchestrator has

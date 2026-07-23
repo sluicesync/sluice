@@ -1265,6 +1265,18 @@ type Streamer struct {
 	// 2026-07-19 A0). Set by [preflightRowFilters]; read by the cold-start open
 	// and the warm-resume SetServerSideRowFilters.
 	serverSideRowFilters map[string]string
+	// publicationRowFilters is the subset of [RowFilters] the ADR-0176
+	// classifier ([pgPushdownEligible]) proved safe to push into a Postgres
+	// source's publication as per-table row filters. Set by
+	// [preflightRowFilters] (nil for non-PG sources and for every predicate
+	// outside the proven envelope — those tables stream unfiltered
+	// server-side and are filtered client-side, the A0-style fallback);
+	// threaded into the source engine by [phaseResolvePublicationScope] via
+	// [ir.PublicationRowFilterer] so cold start's EnsurePublication emits
+	// them. Warm resume never re-ensures, so it never mutates the
+	// publication. The client-side evaluator stays ON regardless — the
+	// ADR-0176 §2 equivalence belt.
+	publicationRowFilters map[string]string
 	// clientCopyFilter is the PAD-faithful cold-start COPY keep-predicate for the
 	// A0 fallback — non-nil ONLY on a VStream source with a PAD-SPACE-collation
 	// --where column, installed on the snapshot reader via
