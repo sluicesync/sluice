@@ -1214,3 +1214,29 @@ func TestWithReplicationParam(t *testing.T) {
 		})
 	}
 }
+
+// TestBackfillUnchangedToast pins the audit 2026-07-23 D0-1 fix's exactness
+// contract: columns present in the (RI-FULL) before-image but absent from
+// the after-image — pgoutput's unchanged-TOAST 'u' omissions — are copied
+// into After verbatim; columns After already carries (including explicit
+// NULLs) are never overwritten, and Before is never mutated.
+func TestBackfillUnchangedToast(t *testing.T) {
+	big := strings.Repeat("x", 4096)
+	before := ir.Row{"id": int64(1), "body": big, "note": "old", "n": nil}
+	after := ir.Row{"id": int64(1), "note": "new", "n": nil} // body omitted ('u')
+
+	backfillUnchangedToast(before, after)
+
+	if after["body"] != big {
+		t.Errorf("omitted TOAST column not backfilled from Before: got %v", after["body"])
+	}
+	if after["note"] != "new" {
+		t.Errorf("After's own value was overwritten: got %v, want new", after["note"])
+	}
+	if v, ok := after["n"]; !ok || v != nil {
+		t.Errorf("After's explicit NULL must survive (present-and-nil, not backfilled): %v ok=%v", v, ok)
+	}
+	if before["note"] != "old" || len(before) != 4 {
+		t.Errorf("Before was mutated by the backfill: %v", before)
+	}
+}

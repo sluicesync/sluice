@@ -184,6 +184,43 @@ func TestRowMovePartialBeforeImage(t *testing.T) {
 	}
 }
 
+// TestRowMovePartialAfterImage pins the audit 2026-07-23 D0-1 belt: a
+// filtered UPDATE whose AFTER-image omits a column the predicate references
+// (pgoutput's unchanged-TOAST omission, had it slipped past the PG reader's
+// backfill) is a coded SLUICE-E-WHERE-CDC-AFTER-IMAGE refusal — never a
+// silent move-OUT. Pre-fix, route() evaluated the incomplete After as
+// UNKNOWN→false and emitted a spurious DELETE for an in-scope row.
+func TestRowMovePartialAfterImage(t *testing.T) {
+	f := usersFilter(t) // predicate references `country`
+	// Before is FULL and in-scope; After omits the filtered column — the
+	// exact unchanged-TOAST decode shape.
+	partialAfter := ir.Row{"id": int64(1)}
+	got, err := f.route(ir.Update{Table: "users", Before: inScope(), After: partialAfter})
+	if err == nil {
+		if len(got) == 1 {
+			if _, isDelete := got[0].(ir.Delete); isDelete {
+				t.Fatal("D0-1 regression: partial after-image routed as move-OUT → spurious DELETE for an in-scope row")
+			}
+		}
+		t.Fatal("route(UPDATE with partial after-image): want a coded refusal, got nil error")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeWhereCDCAfterImage {
+		t.Errorf("code = %v; want %s", err, sluicecode.CodeWhereCDCAfterImage)
+	}
+	if !strings.Contains(err.Error(), "country") {
+		t.Errorf("refusal must name the missing column; got %v", err)
+	}
+
+	// An After that carries every referenced column but omits an
+	// UNREFERENCED one is NOT refused: the evaluator never reads it, and
+	// absent-key still means "preserve the target's value" for the applier.
+	okAfter := ir.Row{"id": int64(1), "country": "US"} // no `name`-style extras needed
+	if _, err := f.route(ir.Update{Table: "users", Before: inScope(), After: okAfter}); err != nil {
+		t.Fatalf("complete-for-the-predicate after-image must not be refused: %v", err)
+	}
+}
+
 // TestInterceptWhereFilterChannel exercises the goroutine wrapper end to
 // end, asserting the move-IN and move-OUT translations reach the OUT
 // channel as the right op (the non-vacuous channel-level pin).

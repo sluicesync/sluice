@@ -183,7 +183,11 @@ var oracleMatrix = []oracleFamily{
 // oracleWorkload renders the fixed row-move script for one cell. Rows 1–4
 // walk every truth-table transition (stay-in / move-in / move-out /
 // stay-out, plus in- and out-scope INSERTs and DELETEs); row 5 is the
-// NULL arc (NULL insert, NULL→in move, in→NULL move); 9999 is the
+// NULL arc (NULL insert, NULL→in move, in→NULL move); the w-only UPDATE
+// is the NO-TOUCH arc (audit 2026-07-23 G-1): an UPDATE that does NOT set
+// the filtered column, so the stream must classify the row-move from an
+// unchanged `v` — pre-G-1 every cell SET v itself, leaving the
+// unchanged-column delivery path structurally unexercised; 9999 is the
 // end-of-workload sentinel (in-scope by construction).
 func oracleWorkload(table string, c oracleCell) []string {
 	q := func(format string, args ...any) string { return fmt.Sprintf(format, args...) }
@@ -193,15 +197,16 @@ func oracleWorkload(table string, c oracleCell) []string {
 		q(`INSERT INTO %s (id, v) VALUES (3, %s)`, table, c.in0),
 		q(`INSERT INTO %s (id, v) VALUES (4, %s)`, table, c.out0),
 		q(`INSERT INTO %s (id, v) VALUES (5, NULL)`, table),
-		q(`UPDATE %s SET v = %s WHERE id = 1`, table, c.in1),        // stay-in
-		q(`UPDATE %s SET v = %s WHERE id = 2`, table, c.in0),        // move-IN
-		q(`UPDATE %s SET v = %s WHERE id = 3`, table, c.out0),       // move-OUT
-		q(`UPDATE %s SET v = %s WHERE id = 4`, table, c.out1),       // stay-out
-		q(`UPDATE %s SET v = %s WHERE id = 5`, table, c.in0),        // NULL→in
-		q(`UPDATE %s SET v = NULL WHERE id = 5`, table),             // in→NULL
-		q(`DELETE FROM %s WHERE id = 1`, table),                     // delete in-scope
-		q(`DELETE FROM %s WHERE id = 4`, table),                     // delete out-of-scope
-		q(`INSERT INTO %s (id, v) VALUES (9999, %s)`, table, c.in0), // sentinel
+		q(`UPDATE %s SET w = COALESCE(w, 0) + 1 WHERE id = 1`, table), // no-touch (v unchanged, stay-in)
+		q(`UPDATE %s SET v = %s WHERE id = 1`, table, c.in1),          // stay-in
+		q(`UPDATE %s SET v = %s WHERE id = 2`, table, c.in0),          // move-IN
+		q(`UPDATE %s SET v = %s WHERE id = 3`, table, c.out0),         // move-OUT
+		q(`UPDATE %s SET v = %s WHERE id = 4`, table, c.out1),         // stay-out
+		q(`UPDATE %s SET v = %s WHERE id = 5`, table, c.in0),          // NULL→in
+		q(`UPDATE %s SET v = NULL WHERE id = 5`, table),               // in→NULL
+		q(`DELETE FROM %s WHERE id = 1`, table),                       // delete in-scope
+		q(`DELETE FROM %s WHERE id = 4`, table),                       // delete out-of-scope
+		q(`INSERT INTO %s (id, v) VALUES (9999, %s)`, table, c.in0),   // sentinel
 	}
 }
 
@@ -320,10 +325,12 @@ func TestPublicationScope_PushdownOracle(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	// One table per value family, created up front; REPLICA IDENTITY FULL is
-	// the filtered-sync precondition (SLUICE-E-WHERE-CDC-BEFORE-IMAGE).
+	// the filtered-sync precondition (SLUICE-E-WHERE-CDC-BEFORE-IMAGE). The
+	// `w` sibling column exists solely for the no-touch workload arc (G-1):
+	// an UPDATE that never sets the filtered column.
 	for _, fam := range oracleMatrix {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`CREATE TABLE orc_%s (id int PRIMARY KEY, v %s);
+			`CREATE TABLE orc_%s (id int PRIMARY KEY, v %s, w int);
 			 ALTER TABLE orc_%s REPLICA IDENTITY FULL;`, fam.name, fam.colType, fam.name,
 		))
 	}

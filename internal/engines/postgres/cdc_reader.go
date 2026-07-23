@@ -1284,6 +1284,19 @@ func (r *CDCReader) emitUpdate(
 		// Bug-92 identity-key narrowing.
 		if r.emitFullBefore(rel.Name) {
 			before = decoded
+			// Audit 2026-07-23 D0-1: backfill After's unchanged-TOAST-omitted
+			// columns from the RI-FULL Before. pgoutput sends an out-of-line
+			// TOASTed column as 'u' in the NEW tuple whenever the UPDATE
+			// didn't change it — even under REPLICA IDENTITY FULL — and
+			// decodeTuple omits it from After. For a FILTERED table the
+			// row-move evaluation reads an absent predicate column as
+			// UNKNOWN→false, so an in-scope sibling-column UPDATE would be
+			// mis-classified as a move-OUT and emit a spurious DELETE on the
+			// target (silent loss). The backfill is EXACT: 'u' means
+			// unchanged, so PG guarantees old == new, and the FULL old tuple
+			// carries the real value. Unfiltered tables keep the omission
+			// (absent key == "preserve the target's existing value").
+			backfillUnchangedToast(before, after)
 		} else if before, err = filterBeforeToKeyCols(rel, decoded); err != nil {
 			return fmt.Errorf("postgres: cdc: %w", err)
 		}
@@ -1305,6 +1318,22 @@ func (r *CDCReader) emitUpdate(
 		After:      after,
 		CommitTime: commitTime,
 	})
+}
+
+// backfillUnchangedToast copies every column present in the (complete,
+// REPLICA IDENTITY FULL) before-image but absent from the after-image —
+// exactly the unchanged-TOAST columns decodeTuple omitted from the new
+// tuple ('u' datum) — into after. Exact by PG's contract: 'u' is emitted
+// only when the column is UNCHANGED, so old == new. Called only on the
+// emitFullBefore (filtered-table) path, where an incomplete After would
+// otherwise mis-classify the row-move (audit 2026-07-23 D0-1); the applier
+// SETs the backfilled value to itself, which is value-neutral.
+func backfillUnchangedToast(before, after ir.Row) {
+	for name, v := range before {
+		if _, ok := after[name]; !ok {
+			after[name] = v
+		}
+	}
 }
 
 // synthesizeKeyOnlyBefore builds a key-only Before image from the

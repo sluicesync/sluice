@@ -134,7 +134,7 @@ const (
 	// and `--map`'s unknown-table rejection.
 	CodeWhereFilterUnknownTable Code = "SLUICE-E-WHERE-UNKNOWN-TABLE"
 
-	// The two ADR-0173 Phase 2 (continuous filtered sync) refusals.
+	// The ADR-0173 Phase 2 (continuous filtered sync) refusals.
 	// CodeWhereCDCUnsupportedPredicate fires at sync-start when a
 	// `--where` predicate uses a construct the client-side CDC evaluator
 	// cannot faithfully evaluate (a function, subquery, collation-sensitive
@@ -143,8 +143,15 @@ const (
 	// filtered CDC source is not configured to deliver full before-images
 	// (MySQL binlog_row_image!=FULL, PG REPLICA IDENTITY not FULL on a
 	// filtered table), which the row-move evaluation requires.
+	// CodeWhereCDCAfterImage is the mid-stream AFTER-image sibling (audit
+	// 2026-07-23 D0-1): a filtered UPDATE whose after-image omits a
+	// predicate column would be mis-classified as a move-OUT and emit a
+	// spurious DELETE for an in-scope row; the PG reader backfills the one
+	// known producer (pgoutput's unchanged-TOAST omission), and this belt
+	// stops the stream loudly for any shape that slips past it.
 	CodeWhereCDCUnsupportedPredicate Code = "SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE"
 	CodeWhereCDCBeforeImage          Code = "SLUICE-E-WHERE-CDC-BEFORE-IMAGE"
+	CodeWhereCDCAfterImage           Code = "SLUICE-E-WHERE-CDC-AFTER-IMAGE"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -240,6 +247,7 @@ var registry = map[Code]Info{
 
 	CodeWhereCDCUnsupportedPredicate: {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the predicate uses a construct the client-side CDC evaluator cannot faithfully evaluate (a function/subquery, an ordering or collation-sensitive string comparison, an unknown column, or unrecognized syntax) — evaluating it client-side could diverge from the source's own evaluation and silently leak or drop rows"},
 	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},
+	CodeWhereCDCAfterImage:           {ClassRefusal, "continuous filtered sync (--where on `sync`) stopped mid-stream: an UPDATE on a filtered table arrived with an AFTER-image missing a column the predicate references, so the row-move evaluation cannot decide whether the row left the filter's scope — evaluating over the missing column would read NULL and could emit a spurious DELETE for a row still in scope at the source (the audit 2026-07-23 D0-1 unchanged-TOAST class; the PG reader backfills that producer, so this belt firing means an unexpected partial after-image reached the filter)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

@@ -48,14 +48,18 @@ type whereCDCFilter struct {
 	pkCols map[string]map[string]bool
 	// refCols is the lower-cased set of columns each table's predicate
 	// REFERENCES (from [rowpredicate.Predicate.Columns]). route() checks the
-	// decoded before-image carries every one before evaluating a filtered
-	// UPDATE/DELETE: a missing column reads as UNKNOWN in the evaluator and
-	// would silently mis-classify a move-OUT as a drop, leaking the now-out-
-	// of-scope row on the target. This is the belt-and-suspenders floor for a
-	// partial before-image (a self-hosted Vitess on binlog_row_image != FULL
-	// that slips past the reader's own guards) — the SLUICE-E-WHERE-CDC-
-	// BEFORE-IMAGE refusal at the exact point the columns that matter are
-	// known. Keyed by lower-cased source table name.
+	// decoded before-image (UPDATE/DELETE) AND after-image (UPDATE) carry
+	// every one before evaluating a filtered change: a missing column reads
+	// as UNKNOWN in the evaluator and silently mis-classifies the row-move —
+	// a partial BEFORE turns a move-OUT into a drop (leaking the row on the
+	// target), a partial AFTER turns an in-scope UPDATE into a move-OUT (a
+	// spurious DELETE — audit 2026-07-23 D0-1). This is the belt-and-
+	// suspenders floor for a partial image that slips past the reader's own
+	// guards (a self-hosted Vitess on binlog_row_image != FULL; an
+	// unchanged-TOAST After the PG reader failed to backfill) — the
+	// SLUICE-E-WHERE-CDC-BEFORE-IMAGE / -AFTER-IMAGE refusals at the exact
+	// point the columns that matter are known. Keyed by lower-cased source
+	// table name.
 	refCols map[string]map[string]bool
 	// padSpaceCols records, for each filtered table whose predicate references a
 	// PAD-SPACE-collation string column, one such column (lower-cased). On a
@@ -331,27 +335,31 @@ func (f *whereCDCFilter) narrowBefore(table string, before ir.Row) ir.Row {
 	return out
 }
 
-// beforeImageMissingColumn reports whether the decoded before-image carries
-// every column the table's predicate references. It returns (missingColumn,
-// false) naming the first absent referenced column, or ("", true) when the
-// image is complete (or the table has no filter / references no columns).
-// Matching is case-insensitive: the row is keyed by the source's column-name
-// casing while the predicate's referenced columns are lower-cased.
+// imageMissingColumn reports whether a decoded row image (before OR after)
+// carries every column the table's predicate references. It returns
+// (missingColumn, false) naming the first absent referenced column, or
+// ("", true) when the image is complete (or the table has no filter /
+// references no columns). Matching is case-insensitive: the row is keyed by
+// the source's column-name casing while the predicate's referenced columns
+// are lower-cased.
 //
-// This is the load-bearing guard against a partial before-image on a filtered
-// table: the evaluator treats an ABSENT column the same as SQL NULL (UNKNOWN),
-// so a move-OUT (before matched, after didn't) on a before-image that omits
-// the filtered column would evaluate to "was never in scope" and silently drop
-// the DELETE — leaking the now-out-of-scope row on the target. Refusing here
-// keeps the loud-failure floor at the exact point the relevant columns are
-// known (the reader can't know which columns a predicate reads).
-func (f *whereCDCFilter) beforeImageMissingColumn(table string, before ir.Row) (string, bool) {
+// This is the load-bearing guard against a partial row image on a filtered
+// table: the evaluator treats an ABSENT column the same as SQL NULL
+// (UNKNOWN), so a move evaluated over an incomplete image mis-classifies
+// silently — a partial BEFORE turns a move-OUT into "was never in scope"
+// (leaking the row on the target), and a partial AFTER turns an in-scope
+// UPDATE into a move-OUT (emitting a spurious DELETE — the audit 2026-07-23
+// D0-1 unchanged-TOAST class, normally prevented by the PG reader's
+// backfill and checked here as the belt). Refusing keeps the loud-failure
+// floor at the exact point the relevant columns are known (the reader
+// can't know which columns a predicate reads).
+func (f *whereCDCFilter) imageMissingColumn(table string, img ir.Row) (string, bool) {
 	need := f.refCols[strings.ToLower(table)]
-	if len(need) == 0 || before == nil {
+	if len(need) == 0 || img == nil {
 		return "", true
 	}
-	present := make(map[string]bool, len(before))
-	for name := range before {
+	present := make(map[string]bool, len(img))
+	for name := range img {
 		present[strings.ToLower(name)] = true
 	}
 	// Deterministic report order so the refusal message is stable.
@@ -386,6 +394,29 @@ func partialBeforeImage(op, schema, table, column string) error {
 				"the row-move over the missing column would read it as NULL and could silently leak an out-of-scope "+
 				"row. The stream stops here rather than mis-classify the row",
 			op, qualifiedTableName(schema, table), column,
+		),
+	)
+}
+
+// partialAfterImage builds the coded refusal for a filtered UPDATE whose
+// AFTER-image omits a column the predicate references — the After-side
+// sibling of [partialBeforeImage] (audit 2026-07-23 D0-1). The known
+// producer of an incomplete After is pgoutput's unchanged-TOAST omission,
+// which the PG reader backfills from the RI-FULL Before before the change
+// reaches this filter; anything that still arrives incomplete would be
+// mis-classified as a move-OUT and DELETE an in-scope row on the target,
+// so the stream stops loudly instead.
+func partialAfterImage(schema, table, column string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeWhereCDCAfterImage,
+		"ensure MySQL binlog_row_image=FULL / PG REPLICA IDENTITY FULL on the filtered table, then restart the sync; if the source is a Postgres 15+ logical stream this shape should be impossible (the reader backfills unchanged-TOAST columns) — report it as a bug",
+		fmt.Errorf(
+			"continuous filtered sync: an UPDATE on filtered table %s arrived with an AFTER-image that omits column %q, "+
+				"which the --where predicate references — so --where cannot decide whether the row moved out of the "+
+				"filter's scope. Evaluating the row-move over the missing column would read it as NULL and could emit a "+
+				"spurious DELETE for a row still in scope at the source. The stream stops here rather than mis-classify "+
+				"the row",
+			qualifiedTableName(schema, table), column,
 		),
 	)
 }
@@ -546,7 +577,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		if e.Before == nil {
 			return nil, missingBeforeImage("DELETE", e.Schema, e.Table)
 		}
-		if miss, ok := f.beforeImageMissingColumn(e.Table, e.Before); !ok {
+		if miss, ok := f.imageMissingColumn(e.Table, e.Before); !ok {
 			return nil, partialBeforeImage("DELETE", e.Schema, e.Table, miss)
 		}
 		if p.Eval(e.Before) {
@@ -565,8 +596,18 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		if e.Before == nil {
 			return nil, missingBeforeImage("UPDATE", e.Schema, e.Table)
 		}
-		if miss, ok := f.beforeImageMissingColumn(e.Table, e.Before); !ok {
+		if miss, ok := f.imageMissingColumn(e.Table, e.Before); !ok {
 			return nil, partialBeforeImage("UPDATE", e.Schema, e.Table, miss)
+		}
+		// After-side completeness belt (audit 2026-07-23 D0-1): an AFTER
+		// image missing a predicate column would evaluate UNKNOWN→false and
+		// turn an in-scope UPDATE into a move-OUT — a spurious DELETE on the
+		// target. The PG reader backfills unchanged-TOAST omissions from the
+		// RI-FULL Before, so this refusal fires only for a shape that
+		// slipped past every reader-side guarantee; refusing beats deleting
+		// a row the source still holds.
+		if miss, ok := f.imageMissingColumn(e.Table, e.After); !ok {
+			return nil, partialAfterImage(e.Schema, e.Table, miss)
 		}
 		before := p.Eval(e.Before)
 		after := p.Eval(e.After)
