@@ -447,6 +447,7 @@ var (
 	_ ir.WorkStealingCopyReader        = (*concurrentBinlogRows)(nil)
 	_ ir.ChunkedWorkStealingCopyReader = (*concurrentBinlogRows)(nil)
 	_ ir.RowCounter                    = (*concurrentBinlogRows)(nil)
+	_ ir.RowFilterSetter               = (*concurrentBinlogRows)(nil)
 )
 
 type concurrentBinlogRows struct {
@@ -494,6 +495,14 @@ type concurrentBinlogRows struct {
 	// readers the ADR-0111 recovery builds in swapConnections, so a re-snapshot
 	// never silently reverts the cold-copy to the global default.
 	zeroDate zeroDateMode
+
+	// rowFilters is the operator's per-table `--where TABLE=<predicate>` map
+	// (ADR-0173/0174), stamped onto every inner RowReader by [SetRowFilters]
+	// AND re-stamped onto the fresh readers an ADR-0111 re-snapshot recovery
+	// builds in swapConnections — so a mid-copy recovery never silently
+	// resumes a filtered table unfiltered (the zeroDate discipline, Bug 201).
+	// Guarded by connMu alongside the reader set it is stamped onto.
+	rowFilters map[string]string
 
 	// --- ADR-0111 resumable cold-copy state (see cdc_snapshot_concurrent_resume.go) ---
 
@@ -617,6 +626,32 @@ func (r *concurrentBinlogRows) ReadRows(ctx context.Context, table *ir.Table) (<
 	// producing ONE continuous channel; the CDC anchor stays at the original P.
 	// Whole-table read: no PK-range bounds, cursor keyed on the table name.
 	return r.readResumable(ctx, table, nil, nil, table.Name, idx)
+}
+
+// SetRowFilters implements [ir.RowFilterSetter] (Bug 201): the pipeline's
+// post-open gate (migcore.ApplyRowFilters) threads the operator's `--where`
+// predicates onto the cold-start snapshot reader, and before this method
+// existed a multi-table filtered sync on a native MySQL source refused at
+// cold start (the concurrent reader is the DEFAULT for 2+ tables since the
+// perf-parity gap-3 chunk, and the gate rightly refuses a reader that would
+// ignore filters). The map is stamped onto every inner pinned-snapshot
+// RowReader, whose SELECT builders AND the matching predicate into both the
+// keyless full scan (buildSelect) and the keyed/chunked paged reads
+// (buildBatchedSelect) — so every concurrent table leg filters on the
+// source, byte-identical to the serial reader's semantics. The map is also
+// retained on the struct so an ADR-0111 re-snapshot recovery re-stamps it
+// onto the fresh readers (swapConnections). The boundary-hint metaReader
+// stays deliberately unfiltered: RangeBounds / SampleKeysetBoundaries only
+// partition the PK space, and the chunks tile correctly (some merely empty)
+// whatever the filter matches. Called once, post-open, before the copy
+// goroutines start; connMu keeps it coherent with a concurrent swap.
+func (r *concurrentBinlogRows) SetRowFilters(filters map[string]string) {
+	r.connMu.Lock()
+	defer r.connMu.Unlock()
+	r.rowFilters = filters
+	for _, rr := range r.readers {
+		rr.SetRowFilters(filters)
+	}
 }
 
 // ConcurrentCopyGroups returns the disjoint table partition the cold-start

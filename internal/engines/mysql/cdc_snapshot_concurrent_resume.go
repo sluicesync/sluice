@@ -644,7 +644,9 @@ func (r *concurrentBinlogRows) swapConnections(conns []*sql.Conn, db *sql.DB) {
 	defer r.connMu.Unlock()
 	readers := make([]*RowReader, len(conns))
 	for i, c := range conns {
-		readers[i] = &RowReader{q: c, schema: r.dbName, qualifyBySchema: false, closer: nil, zeroDate: r.zeroDate}
+		// rowFilters re-stamped alongside zeroDate (Bug 201): a recovery that
+		// dropped the filters would silently resume filtered tables unfiltered.
+		readers[i] = &RowReader{q: c, schema: r.dbName, qualifyBySchema: false, closer: nil, zeroDate: r.zeroDate, rowFilters: r.rowFilters}
 	}
 	byTable := make(map[string]*RowReader)
 	for i, g := range r.groups {

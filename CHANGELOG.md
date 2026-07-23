@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Multi-table filtered sync on a native MySQL source no longer refuses at cold start (Bug 201 — pre-existing since the concurrent cold-copy became the multi-table default, ≈v0.99.276+; loud, zero-loss).** The ADR-0101 native concurrent cold-copy reader — the default whenever a native-MySQL stream covers 2+ tables — never implemented `ir.RowFilterSetter`, so `sync start --where` refused at cold start with the misleading `source engine "mysql" does not support row-level filtering` (the serial `--copy-table-parallelism=1` path worked, which was the verified workaround). The concurrent reader now implements the setter, stamping the per-table predicate map onto every pinned-snapshot inner reader so each concurrent table leg ANDs its predicate into both the keyless full scan and the keyed/chunked paged reads — byte-identical semantics to the serial reader — and an ADR-0111 mid-copy re-snapshot recovery re-stamps the map onto its fresh readers so a recovery can never silently resume a filtered table unfiltered. The pipeline's refusal gate survives untouched for readers that genuinely lack the setter (SQLite/D1/flat-file sources). Pinned by unit tests on the stamp/re-stamp shape and the surviving refusal guard, plus a real-MySQL integration test (RED pre-fix on the exact refusal) running a 3-table cold start at parallelism 2 with two distinct predicates and an unfiltered bystander, asserting out-of-predicate rows absent per table, the concurrent path actually engaged, and the CDC leg still filtering after the handoff.
+
 ## [0.99.291] - 2026-07-23
 
 The closing waves of the 2026-07-23 blind-audit remediation (`workspace/repo-audit-2026-07-23.md`, milestones M1–M3) plus the value-fidelity review of the temporal work: two HIGH silent-loss fixes in the filtered-sync client evaluator (temporal-literal granularity, non-finite NaN/±Infinity ordering), the new `sluice sync decommission` command, seven audit finding classes ratcheted into permanent deterministic gates, and a grpc security bump.
