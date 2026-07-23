@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"sluicesync.dev/sluice/internal/nettransient"
 )
 
 // # Applier error classification for ADR-0038's retry policy
@@ -189,50 +191,40 @@ func classifyApplierError(err error) error {
 		return err
 	}
 
-	// Dial-time network transients on the APPLY path (Bug 200, v0.99.289
-	// regression cycle): when a target restart severs the pool, the next
-	// apply's pool acquire dials fresh and dies inside pgx's ConnectError —
-	// no SQLSTATE, no SafeToRetry implementation, and (pgx v5 flattens the
-	// multi-host details into joined text) no reachable syscall errno — so
-	// the first apply inside the refused window exited with ZERO retries.
-	// Positive-match text shapes only, mirroring the MySQL classifier's
-	// long-standing apply-path leg plus the Windows winsock wordings; with
-	// no *pgconn.PgError in the chain (the terminal-code shield above
-	// returned for every structured error) a matched shape here is by
-	// construction pre-byte, so retrying is unambiguous.
-	// Deliberately NOT matched: "no such host" (typo'd endpoint = operator
-	// error) and auth failures ("password authentication failed" — arrives
-	// inside ConnectError too, which is why this leg keys on shape, never
-	// on ConnectError alone).
-	if msg := err.Error(); msg != "" {
-		switch {
-		case strings.Contains(msg, "connection refused"),
-			strings.Contains(msg, "connectex:"),
-			strings.Contains(msg, "actively refused"),
-			strings.Contains(msg, "connection timed out"):
-			return &retriablePGError{err: err}
-		}
+	// Transport-level transients that bypass *pgconn.PgError — the driver
+	// couldn't reach the server to even get a SQLSTATE, so this is only
+	// reachable when no structured PgError is in the chain (the
+	// terminal-code shield above returned for every structured error) and
+	// a matched shape is by construction pre-byte, making the retry
+	// unambiguous. Covers the Bug 200 dial-time window (a target restart
+	// severs the pool; the next apply's pool acquire dies inside pgx's
+	// ConnectError with no SQLSTATE, no SafeToRetry, and — pgx v5 flattens
+	// the multi-host details into joined text — no reachable syscall
+	// errno) and the mid-stream severance shapes ("unexpected EOF" from a
+	// PlanetScale reparent dropping an in-flight COPY: live finding, item
+	// 38 re-validation 2026-06-23).
+	//
+	// The shape vocabulary lives in the shared
+	// [nettransient.IsTransientShape] matcher (audit 2026-07-23
+	// QUAL-1/G-9). Deliberately NOT matched there: "no such host" (typo'd
+	// endpoint = operator error) and auth failures ("password
+	// authentication failed" — arrives inside ConnectError too, which is
+	// why this leg keys on shape, never on ConnectError alone).
+	// [TestClassifyApplierError_NetTransientCorpusParity] fails if this
+	// site ever drifts from the corpus.
+	if nettransient.IsTransientShape(err) {
+		return &retriablePGError{err: err}
 	}
 
-	// Connection-string-level transients that bypass *pgconn.PgError
-	// (the driver couldn't reach the server to even get a SQLSTATE —
-	// only reachable when no structured PgError is in the chain).
+	// SITE-SPECIFIC extension — PG server-lifecycle wordings arriving
+	// WITHOUT a structured PgError (the canonical forms are SQLSTATE
+	// 57P03/57P01, classified in the switch above): a restarting server's
+	// brief startup/shutdown window is the same bounded-retry class as
+	// the connection shapes, but the wording is Postgres's, not a network
+	// shape — stays local, not in the shared corpus.
 	if msg := err.Error(); msg != "" {
 		switch {
-		case strings.Contains(msg, "connection reset by peer"),
-			strings.Contains(msg, "connection refused"),
-			strings.Contains(msg, "broken pipe"),
-			strings.Contains(msg, "i/o timeout"),
-			// "unexpected EOF" — the server severed the connection mid-stream
-			// (e.g. a PlanetScale reparent dropping the in-flight cold-copy
-			// COPY connection: live finding, item 38 re-validation 2026-06-23).
-			// pgx surfaces this as a plain string error (not always wrapping the
-			// io.ErrUnexpectedEOF sentinel caught above), so match the message
-			// too. A transient connection severance; the cold-copy chunk retry /
-			// CDC reconnect rides it, bounded + loud on genuine exhaustion.
-			strings.Contains(msg, "unexpected EOF"),
-			strings.Contains(msg, "use of closed network connection"),
-			strings.Contains(msg, "the database system is starting up"),
+		case strings.Contains(msg, "the database system is starting up"),
 			strings.Contains(msg, "the database system is shutting down"):
 			return &retriablePGError{err: err}
 		}

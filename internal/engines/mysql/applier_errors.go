@@ -13,6 +13,8 @@ import (
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
+
+	"sluicesync.dev/sluice/internal/nettransient"
 )
 
 // # Applier error classification for ADR-0038's retry policy
@@ -359,44 +361,36 @@ func classifyApplierError(err error) error {
 		return err
 	}
 
-	// Connection-string-level transients that don't surface as a
-	// MySQLError but do appear as raw error text from the driver
-	// or the connection pool. Pattern-match defensively — reachable
-	// ONLY when no structured *MySQLError is present (the terminal-code
-	// shield above returned for every structured error), so the matched
-	// text is transport/driver framing, never a server message echoing
-	// row data or table names.
+	// Transport-level transients that don't surface as a MySQLError but
+	// do appear as raw error text from the driver or the connection
+	// pool — reachable ONLY when no structured *MySQLError is present
+	// (the terminal-code shield above returned for every structured
+	// error), so the matched text is transport/driver framing, never a
+	// server message echoing row data or table names.
 	//
-	// "not serving" / "reparent" (ADR-0108): a target PRIMARY REPARENT
-	// (e.g. a PlanetScale non-Metal storage auto-grow at the ~39 GB
-	// boundary) makes the in-flight tablet briefly "not serving". The
-	// vttablet-framed shape (Error 1105 `code = Unavailable`) is already
-	// caught above, but a PlanetScale/vtgate reparent can ALSO surface
-	// without that framing — belt-and-suspenders so the cold-copy
-	// reparent-retry (ADR-0108) AND the CDC apply path (ADR-0038) both
-	// ride it out. Case-insensitive: vtgate/vttablet wording varies in
-	// case across versions. These phrases do not appear in healthy or
-	// terminal-semantic errors.
+	// The generic network-shape vocabulary (POSIX + the Bug 199a/200
+	// Windows winsock/`connectex:` dial wordings; "no such host" stays
+	// deliberately terminal) lives in the shared
+	// [nettransient.IsTransientShape] matcher (audit 2026-07-23
+	// QUAL-1/G-9); [TestClassifyApplierError_NetTransientCorpusParity]
+	// fails if this site ever drifts from the corpus.
+	if nettransient.IsTransientShape(err) {
+		return &retriableMySQLError{err: err}
+	}
+
+	// SITE-SPECIFIC extension — "not serving" / "reparent" (ADR-0108):
+	// a target PRIMARY REPARENT (e.g. a PlanetScale non-Metal storage
+	// auto-grow at the ~39 GB boundary) makes the in-flight tablet
+	// briefly "not serving". The vttablet-framed shape (Error 1105
+	// `code = Unavailable`) is already caught above, but a
+	// PlanetScale/vtgate reparent can ALSO surface without that
+	// framing — belt-and-suspenders so the cold-copy reparent-retry
+	// (ADR-0108) AND the CDC apply path (ADR-0038) both ride it out.
+	// Case-insensitive: vtgate/vttablet wording varies in case across
+	// versions. These phrases do not appear in healthy or
+	// terminal-semantic errors. Server-state wording, not a network
+	// shape — stays local, not in the shared corpus.
 	if msg := err.Error(); msg != "" {
-		switch {
-		case strings.Contains(msg, "connection reset by peer"),
-			strings.Contains(msg, "connection refused"),
-			strings.Contains(msg, "broken pipe"),
-			strings.Contains(msg, "i/o timeout"),
-			// Windows winsock dial wordings (Bug 200, v0.99.289 regression
-			// cycle): a target restart's refused window surfaces on the
-			// APPLY path as `begin tx: dial tcp …: connectex: No connection
-			// could be made because the target machine actively refused
-			// it.` — the POSIX "connection refused" text above never
-			// matches it, so the first apply inside the window exited with
-			// zero retries. Dial-time by construction: no bytes reached
-			// the server. "no such host" stays deliberately unmatched
-			// (a typo'd endpoint is an operator error).
-			strings.Contains(msg, "connectex:"),
-			strings.Contains(msg, "actively refused"),
-			strings.Contains(msg, "connection timed out"):
-			return &retriableMySQLError{err: err}
-		}
 		lower := strings.ToLower(msg)
 		for _, sub := range reparentRetriableSubstrings {
 			if strings.Contains(lower, sub) {

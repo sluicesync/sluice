@@ -4,14 +4,10 @@
 package triggercdc
 
 import (
-	"errors"
-	"io"
-	"net"
-	"strings"
-	"syscall"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/nettransient"
 )
 
 // # Transient-error classification for the trigger-CDC engines
@@ -94,59 +90,25 @@ func AsTransient(err error) error {
 // that is transient by construction — the connection or TLS handshake failed,
 // timed out, or was reset mid-flight.
 //
-// Structured checks come first (they survive wording changes); the text fallback
-// covers shapes that carry no structured form through the stdlib HTTP stack —
-// notably `net/http: TLS handshake timeout`, which arrives as a plain string on
-// a *url.Error whose Timeout() is not always set.
-//
-// Deliberately EXCLUDED as terminal-by-design:
-//   - "no such host" — a wrong/typo'd endpoint is an operator error; failing
-//     fast beats burning the retry budget on it. (Explicitly-temporary DNS
-//     wording IS included below.)
-//   - auth/permission, malformed-request, and decode failures — retrying masks
-//     a real misconfiguration.
+// The shape vocabulary lives in [nettransient.IsTransientShape] — the ONE
+// shared matcher (audit 2026-07-23 QUAL-1/G-9). This site used to carry its
+// own copy, and it drifted one release after Bug 199: the Windows dial
+// wordings (`connectex:` / "actively refused" / "connection timed out")
+// reached the pipeline's connect-phase retry and both applier classifiers but
+// never this list, so a pgtrigger-source sync on Windows exited terminally on
+// a routine managed-PG restart. Delegating closes the class: the corpus is
+// pinned once in the shared package (structured checks first, text fallback
+// for shapes like `net/http: TLS handshake timeout` that carry no structured
+// form through the stdlib HTTP stack; "no such host" / auth / malformed-
+// request / decode faults stay terminal-by-design), and
+// [TestIsTransientTransportError_CorpusParity] fails if this site ever drifts
+// from it again.
 //
 // Kept as a named exported helper so [TestIsTransientTransportError] pins the
-// exact shape set — widening the retry surface then fails the pin rather than
-// slipping in silently.
+// observed trigger-CDC shapes end-to-end — widening or narrowing the retry
+// surface then fails a pin rather than slipping in silently.
 func IsTransientTransportError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Structured: stream ended mid-flight.
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	// Structured: socket-level resets / refusals / broken pipes.
-	if errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ETIMEDOUT) {
-		return true
-	}
-	// Structured: any net.Error that reports itself as a timeout (covers
-	// *url.Error, *net.OpError, and dial/response-header deadlines).
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	// Text fallback for shapes with no reliable structured form.
-	msg := strings.ToLower(err.Error())
-	for _, s := range []string{
-		"tls handshake timeout",
-		"connection reset by peer",
-		"broken pipe",
-		"i/o timeout",
-		"unexpected eof",
-		"connection refused",
-		"server closed idle connection",
-		"temporary failure in name resolution",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
+	return nettransient.IsTransientShape(err)
 }
 
 // RetriableHTTPStatus reports whether an HTTP status code from a trigger-CDC

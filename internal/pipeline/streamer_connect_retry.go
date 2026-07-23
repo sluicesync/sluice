@@ -5,11 +5,8 @@ package pipeline
 
 import (
 	"errors"
-	"io"
-	"net"
-	"strings"
-	"syscall"
 
+	"sluicesync.dev/sluice/internal/nettransient"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -87,72 +84,18 @@ func isRetriableConnectFailure(err error) bool {
 // isTransientNetworkShape reports whether err is a network/transport shape
 // that is transient by construction. Positive-match only — the DEFAULT is
 // "not transient", the opposite posture from [isTransientOpenError] (whose
-// job is merely picking a log level and defaults transient). Mirrors
-// triggercdc.IsTransientTransportError (which pipeline cannot import —
-// internal to the engines tree) with the pool-facing additions ground-
-// truthed in the scale-soak incident:
+// job is merely picking a log level and defaults transient).
 //
-//   - "invalid connection" — go-sql-driver's post-mortem for a pool conn
-//     the peer dropped; it swallows the underlying cause, so no structured
-//     form survives (the incident's exact shape, via openDB's ping).
-//   - the Windows winsock wordings ("wsarecv:"/"wsasend:", "forcibly
-//     closed by the remote host") — syscall.Errno equivalents exist but
-//     driver wrapping routinely reduces them to text.
-//
-// Deliberately EXCLUDED (terminal-by-design): "no such host" (a typo'd
-// endpoint is an operator error; explicitly-temporary DNS wording IS
-// included), auth/permission ("Access denied"), DSN parse errors, and any
-// coded sluice refusal — none of these match a listed shape.
+// The shape vocabulary lives in [nettransient.IsTransientShape] — the ONE
+// shared matcher (audit 2026-07-23 QUAL-1/G-9). This site used to carry its
+// own copy ("mirrors triggercdc.IsTransientTransportError, which pipeline
+// cannot import") plus the pool-facing additions ground-truthed in the
+// scale-soak incident ("invalid connection", the Windows winsock wordings,
+// the Bug 199a `connectex:` dial refusal); those and the exclusions
+// ("no such host", auth, DSN parse, coded refusals — all terminal-by-design)
+// are now documented and pinned in the shared package, and
+// [TestIsTransientNetworkShape_CorpusParity] fails if this site ever drifts
+// from the corpus again.
 func isTransientNetworkShape(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Structured: stream/connection ended mid-flight.
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	// Structured: socket-level resets / refusals / broken pipes.
-	if errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ETIMEDOUT) {
-		return true
-	}
-	// Structured: any net.Error reporting itself as a timeout.
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	// Text fallback for shapes with no reliable structured form.
-	msg := strings.ToLower(err.Error())
-	for _, s := range []string{
-		"invalid connection", // go-sql-driver dead pool conn (the incident shape)
-		"tls handshake timeout",
-		"connection reset by peer",
-		"connection refused",
-		"connection timed out",
-		"broken pipe",
-		"i/o timeout",
-		"unexpected eof",
-		"forcibly closed by the remote host", // Windows winsock wording
-		"wsarecv:",
-		"wsasend:",
-		// Windows dial-time refusal (Bug 199a): "connectex: No connection
-		// could be made because the target machine actively refused it."
-		// The POSIX "connection refused" wording above never matches it, and
-		// pgx v5's flattened multi-host connect error defeats the structural
-		// errors.Is(syscall.ECONNREFUSED) leg — caught by the v0.99.288
-		// regression cycle restarting a target container: the refused window
-		// is most of any restart, so without these the connect-phase retry
-		// was effectively inert on Windows for the canonical local transient.
-		"connectex:",
-		"actively refused",
-		"server closed idle connection",
-		"temporary failure in name resolution",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
+	return nettransient.IsTransientShape(err)
 }
