@@ -68,6 +68,16 @@ const (
 	// while pgoutput emits nothing for its tables).
 	CodeCDCPublicationScopeConflict Code = "SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT"
 
+	// audit 2026-07-23 D0-9: an operator-supplied --publication-name
+	// outside [a-z0-9_] / over 63 bytes is refused at resolve time —
+	// sluice's quoted CREATE PUBLICATION preserves case while
+	// START_REPLICATION's publication_names is downcased server-side (and
+	// CREATE silently truncates past NAMEDATALEN-1), so an unsafe name
+	// creates one publication and streams from another: green through the
+	// whole bulk copy, then 42704 at the first change, or a silently idle
+	// stream. The mirror of PG's own slot-name charset enforcement.
+	CodeCDCPublicationNameInvalid Code = "SLUICE-E-CDC-PUBLICATION-NAME-INVALID"
+
 	// RETAINED-BUT-UNUSED (ADR-0170): the Phase-1/2 refusal for MariaDB CDC
 	// is lifted — MariaDB CDC via domain GTIDs shipped v0.99.271, so the
 	// flavor declares CDCBinlog and this code is no longer emitted. The
@@ -207,6 +217,7 @@ var registry = map[Code]Info{
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeCDCPublicationScopeConflict: {ClassRefusal, "cold start refused: rescoping the Postgres publication would REMOVE tables another sluice replication slot (active or inactive) holds a claim on, silently de-scoping that stream — give each stream its own --publication-name, drain the other stream first, or drop its slot if the stream is truly abandoned"},
+	CodeCDCPublicationNameInvalid:   {ClassRefusal, "sync start refused: the --publication-name is not a safe Postgres replication identifier ([a-z0-9_], max 63 bytes) — CREATE PUBLICATION preserves a quoted mixed-case/over-length spelling while START_REPLICATION downcases (and CREATE truncates) it, so the stream would create one publication and stream from another: green through the whole bulk copy, then 42704 at the first change (or silently idle); use lowercase [a-z0-9_]"},
 
 	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL/Vitess source streams partial row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON; on a self-hosted Vitess/VStream source the RowChange.DataColumns bitmap marks a NOBLOB-omitted column), under which CDC silently loses UPDATEs — refused at CDC start on the binlog path, and loudly mid-stream when a partial image reaches the reader (a slipped-past global preflight, or a VStream after-image whose bitmap flags an omitted column)"},
 	CodeCDCMariaDBUnsupported:           {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB CDC (domain-GTID positions) shipped v0.99.271 (ADR-0170); the flavor now declares CDCBinlog and this refusal is no longer emitted. Kept registered because removing a published catalog code is breaking"},
@@ -259,7 +270,7 @@ var registry = map[Code]Info{
 	CodeWhereCDCUnsupportedPredicate: {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the predicate uses a construct the client-side CDC evaluator cannot faithfully evaluate (a function/subquery, an ordering or collation-sensitive string comparison, an unknown column, or unrecognized syntax) — evaluating it client-side could diverge from the source's own evaluation and silently leak or drop rows"},
 	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},
 	CodeWhereCDCAfterImage:           {ClassRefusal, "continuous filtered sync (--where on `sync`) stopped mid-stream: an UPDATE on a filtered table arrived with an AFTER-image missing a column the predicate references, so the row-move evaluation cannot decide whether the row left the filter's scope — evaluating over the missing column would read NULL and could emit a spurious DELETE for a row still in scope at the source (the audit 2026-07-23 D0-1 unchanged-TOAST class; the PG reader backfills that producer, so this belt firing means an unexpected partial after-image reached the filter)"},
-	CodeWherePushdownDrift:           {ClassRefusal, "warm resume refused: the current --where flags don't match the row-filter subset this stream PUSHED into its Postgres publication at cold start — the publication filter is durable source-side state a warm resume never re-ensures, so resuming would leave the SERVER silently filtering on the stale predicate (under-delivery the client cannot observe); re-run with the --where the stream was established with, or --restart-from-scratch to re-snapshot under the new predicate, or --reset-target-data for a destructive reset"},
+	CodeWherePushdownDrift:           {ClassRefusal, "warm resume refused: the current --where flags don't match the row-filter subset this stream PUSHED into its Postgres publication at cold start — the publication filter is durable source-side state a warm resume never re-ensures, so resuming would leave the SERVER silently filtering on the stale predicate (under-delivery the client cannot observe); re-run with the --where the stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (on a PG source the restart first refuses on the stream's existing replication slot — drop it as that refusal instructs, then re-run), or --reset-target-data for a destructive reset"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

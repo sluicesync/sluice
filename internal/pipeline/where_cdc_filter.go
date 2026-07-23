@@ -714,9 +714,13 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 			),
 		)
 	}
-	if err := pf.PreflightFilteredCDCBeforeImage(ctx, s.SourceDSN, s.filteredTableNames()); err != nil {
-		return err
-	}
+	// The before-image probe itself runs AFTER ValidateRowFilterKeys below
+	// (audit 2026-07-23 D0-10): the engines look tables up by EXACT name
+	// (PG: pg_class.relname; unfound == not-full), so probing the raw
+	// `--where` keys turned a mere case-mismatch into a spurious
+	// SLUICE-E-WHERE-CDC-BEFORE-IMAGE naming a REPLICA IDENTITY remedy that
+	// cannot fix it. Canonicalizing first routes a bad key to the correct
+	// unknown-table refusal and hands the probe schema-cased names.
 
 	// Read the source schema so each predicate can be compiled against its
 	// table's real column types + collations.
@@ -743,6 +747,13 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 		return err
 	}
 	s.RowFilters = canonFilters
+	// The client-side row-move eval requires full before-images on every
+	// filtered table — probed on the CANONICAL (schema-cased) names, post-
+	// ValidateRowFilterKeys (audit 2026-07-23 D0-10; see the ordering note
+	// above the schema read).
+	if err := pf.PreflightFilteredCDCBeforeImage(ctx, s.SourceDSN, s.filteredTableNames()); err != nil {
+		return err
+	}
 	// The client-side string comparator is resolved through the SOURCE engine's
 	// collation lens (audit 2026-07-18 M2.1): MySQL supplies a Vitess-backed
 	// resolver, Postgres a byte-exact-or-refuse one — so the engine-neutral

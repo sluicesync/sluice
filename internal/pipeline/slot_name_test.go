@@ -5,9 +5,11 @@ package pipeline
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // slotAwareEngine is a stub that implements both ir.Engine and the
@@ -294,5 +296,81 @@ func TestResolvePublicationName(t *testing.T) {
 		if got := resolvePublicationName(tc.in); got != tc.want {
 			t.Errorf("resolvePublicationName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestValidatePublicationName pins the audit 2026-07-23 D0-9 resolve-time
+// charset refusal: CREATE PUBLICATION quotes (preserving case) while
+// START_REPLICATION's publication_names is downcased server-side (and
+// CREATE silently truncates past 63 bytes), so a name outside lowercase
+// [a-z0-9_] / over 63 bytes creates one publication and streams from
+// another — green through the whole bulk copy, 42704 (or silent idle) at
+// the first change. Refused with SLUICE-E-CDC-PUBLICATION-NAME-INVALID,
+// mirroring PG's own slot-name charset enforcement; the derived
+// per-stream default is safe by construction (TestDerivePerStreamPublicationName
+// pins its [a-z0-9_] + 63-byte envelope).
+func TestValidatePublicationName(t *testing.T) {
+	valid := []string{
+		"", // engine default — always safe
+		"sluice_pub",
+		"sluice_wave_1",
+		strings.Repeat("a", pgMaxIdentifierBytes), // exactly 63 bytes passes
+	}
+	for _, name := range valid {
+		if err := validatePublicationName(name); err != nil {
+			t.Errorf("validatePublicationName(%q) = %v; want nil", name, err)
+		}
+	}
+
+	invalid := []string{
+		"sluice_MyPub",    // mixed case — the OBSERVED D0-9 downcase divergence
+		"sluice_my pub",   // space
+		"sluice_my,pub",   // comma (a publication_names list separator!)
+		"sluice_pub;drop", // punctuation
+		"sluice_püb",      // non-ASCII
+		strings.Repeat("a", pgMaxIdentifierBytes+1), // 64 bytes — CREATE truncates, START matches verbatim
+	}
+	for _, name := range invalid {
+		err := validatePublicationName(name)
+		if err == nil {
+			t.Errorf("validatePublicationName(%q) = nil; want the D0-9 refusal", name)
+			continue
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCDCPublicationNameInvalid {
+			t.Errorf("validatePublicationName(%q) = %v; want coded %s", name, err, sluicecode.CodeCDCPublicationNameInvalid)
+		}
+	}
+}
+
+// cdcCapableStub is stubEngine with a CDC capability, so it passes the
+// Streamer's validate() gate (stubEngine's zero Capabilities declare
+// CDC=None, which refuses before the publication-name check runs).
+type cdcCapableStub struct{ stubEngine }
+
+func (cdcCapableStub) Capabilities() ir.Capabilities {
+	return ir.Capabilities{CDC: ir.CDCLogicalReplication}
+}
+
+// TestPhaseResolveStreamIdentity_RefusesUnsafePublicationName pins the
+// refusal THROUGH the resolve phase (the Bug-180 lesson: a fix gated on
+// a flag value must be pinned through the layer that carries the flag):
+// the operator's raw value is prefix-resolved first, so a bare mixed-case
+// name refuses on its resolved form before any source connection opens.
+func TestPhaseResolveStreamIdentity_RefusesUnsafePublicationName(t *testing.T) {
+	s := &Streamer{
+		Source:          cdcCapableStub{},
+		Target:          cdcCapableStub{},
+		SourceDSN:       "src",
+		TargetDSN:       "dst",
+		PublicationName: "MyPub", // resolves to sluice_MyPub — still unsafe
+	}
+	_, err := s.phaseResolveStreamIdentity(context.Background())
+	if err == nil {
+		t.Fatal("phaseResolveStreamIdentity accepted a mixed-case publication name")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeCDCPublicationNameInvalid {
+		t.Fatalf("err = %v; want coded %s", err, sluicecode.CodeCDCPublicationNameInvalid)
 	}
 }

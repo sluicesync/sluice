@@ -797,3 +797,65 @@ func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
 		t.Errorf("SetRowFilterHash did not reach the row: got %q (found=%v), want cbf29ce484222325", got.RowFilterHash, ok)
 	}
 }
+
+// TestListStreams_LegacyControlTableDegrades is the audit 2026-07-23
+// QUAL-2 / G-10 class ratchet: an upgraded binary's READ-ONLY paths
+// (`sync status`/`health`, the live panel, `--dry-run`,
+// `--schema-already-applied`) can query a control table a PREVIOUS
+// release created — before anything ran EnsureControlTable's ALTERs —
+// and ListStreams must DEGRADE (legacy fallback, empty extras), never
+// error with SQLSTATE 42703. The table here is the ORIGINAL minimal
+// column set, so this pin auto-covers every future column addition:
+// any new column in the SELECT is by construction missing from it.
+// MySQL has carried this fallback since v0.32.2; this is the PG mirror
+// (the seam has now been hit by three column additions — slot_name,
+// rows_applied, publication_name).
+func TestListStreams_LegacyControlTableDegrades(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	// The original (pre-column-additions) shape, as a previous release's
+	// EnsureControlTable would have created it. Deliberately NOT running
+	// EnsureControlTable here — the read-only paths don't either.
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id       VARCHAR(255) NOT NULL,
+			source_position TEXT         NOT NULL,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position)
+		VALUES ('legacy-stream', 'legacy-token');
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applier, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	streams, err := applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams against the previous release's control table = %v; want graceful degradation (QUAL-2 regression: 42703 took down the observability path)", err)
+	}
+	if len(streams) != 1 {
+		t.Fatalf("ListStreams returned %d rows; want the 1 legacy row", len(streams))
+	}
+	got := streams[0]
+	if got.StreamID != "legacy-stream" || got.Position.Token != "legacy-token" {
+		t.Errorf("legacy row = %+v; want stream_id/source_position round-tripped", got)
+	}
+	if got.SlotName != "" || got.PublicationName != "" || got.RowFilterHash != "" ||
+		got.SourceDSNFingerprint != "" || got.TargetSchema != "" || got.RowsApplied != 0 {
+		t.Errorf("legacy fallback must report empty/zero extras (the \"unknown — allow\" contract); got %+v", got)
+	}
+	if got.UpdatedAt.IsZero() {
+		t.Error("legacy fallback dropped updated_at")
+	}
+}

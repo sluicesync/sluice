@@ -147,9 +147,10 @@ func derivePerStreamPublicationName(streamID string) string {
 // --publication-name (already prefix-resolved; empty = not passed),
 // the name recorded on the stream's control row (empty = none
 // recorded — the legacy shape), whether a control row exists at all
-// (rowExists=false means a genuinely NEW stream), and whether the
-// stream opts into per-table publication attributes (today: at least
-// one `--where` row filter on a publication-scoped source).
+// (rowExists=false means a genuinely NEW stream), whether this run is
+// a `--reset-target-data` destructive restart, and whether the stream
+// opts into per-table publication attributes (today: at least one
+// `--where` row filter on a publication-scoped source).
 //
 // Precedence, highest first:
 //
@@ -161,10 +162,24 @@ func derivePerStreamPublicationName(streamID string) string {
 //     genuinely new stream (no control row) that carries a row filter.
 //  4. "" — the engine default (`sluice_pub`), byte-identical to today.
 //
+// resetTargetData folds into rowExists (audit 2026-07-23 ARCH-3): a
+// `--reset-target-data` run IS a from-scratch stream, but its
+// ClearStream runs later — inside coldStart, after this phase already
+// read the row — so the raw rowExists is stale-true. Treating it as
+// false lets a filtered reset derive its per-stream publication instead
+// of landing row filters on the shared `sluice_pub` default. A recorded
+// name still wins above the derivation: the reset re-uses the stream's
+// own already-isolated publication rather than orphaning it (the
+// derivation is deterministic from the stream id, so the empty-recorded
+// legacy case lands on the same per-stream name either way).
+//
 // Zero-value-safe: every input empty/false yields "", so legacy
 // streams, non-PG sources, and every programmatic construction that
 // never touches publications keep today's behaviour exactly.
-func resolveEffectivePublication(explicit, recorded string, rowExists, filtered bool, streamID string) (effective string, explicitOverridesRecorded bool) {
+func resolveEffectivePublication(explicit, recorded string, rowExists, resetTargetData, filtered bool, streamID string) (effective string, explicitOverridesRecorded bool) {
+	if resetTargetData {
+		rowExists = false
+	}
 	if explicit != "" {
 		return explicit, recorded != "" && recorded != explicit
 	}
@@ -249,7 +264,7 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: read recorded publication name: %w", err))
 	}
 	recorded := st.PublicationName
-	effective, overrode := resolveEffectivePublication(s.PublicationName, recorded, rowExists, len(s.RowFilters) > 0, streamID)
+	effective, overrode := resolveEffectivePublication(s.PublicationName, recorded, rowExists, s.ResetTargetData, len(s.RowFilters) > 0, streamID)
 	if overrode {
 		slog.WarnContext(
 			ctx, "explicit --publication-name overrides the publication recorded for this stream; the record updates to the explicit name. The stream will read through the EXPLICIT publication — make sure that is intended, or drop the flag to resume through the recorded one",
@@ -297,7 +312,7 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 			sort.Strings(pushed)
 			return sluicecode.Wrap(
 				sluicecode.CodeWherePushdownDrift,
-				"re-run with the --where this stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (required for a widened filter anyway), or --reset-target-data for a destructive reset",
+				"re-run with the --where this stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (required for a widened filter anyway; on a PG source the restart first refuses on the stream's existing replication slot — drop it as that refusal instructs, then re-run), or --reset-target-data for a destructive reset",
 				fmt.Errorf(
 					"pipeline: warm resume refused: the current --where flags don't match the row-filter subset stream %q "+
 						"pushed into its publication at cold start (recorded row_filter_hash %s, current %s; currently-pushed "+

@@ -2421,8 +2421,15 @@ func rescopeRowFilteredPublication(ctx context.Context, db *sql.DB, name, alterQ
 
 // changedMemberDefs returns the sorted members whose definition differs
 // between two catalog reads (both sides pg_get_expr-normalized, so text
-// equality is exact), each rendered "member (WHERE (old) → WHERE (new))"
-// for the refusal message. Pure, like [removedFromPublication].
+// equality is exact), each named for the refusal message. Pure, like
+// [removedFromPublication].
+//
+// The BEFORE side's predicate text is REDACTED (audit 2026-07-23 SEC-1):
+// it is catalog state that may quote a PEER stream's row filter, and a
+// predicate routinely carries data values (customer identifiers, date
+// cutoffs) that must not be echoed into another operator's terminal. The
+// AFTER side is the caller's OWN incoming definition as PG normalized
+// it, so it stays visible — the operator already typed it.
 func changedMemberDefs(before, after map[string]publicationMemberAttrs) []string {
 	var changed []string
 	for m, b := range before {
@@ -2430,7 +2437,7 @@ func changedMemberDefs(before, after map[string]publicationMemberAttrs) []string
 		if !ok || a == b {
 			continue
 		}
-		changed = append(changed, fmt.Sprintf("%s (WHERE (%s) → WHERE (%s))", m, b.Qual, a.Qual))
+		changed = append(changed, fmt.Sprintf("%s (row filter changed: WHERE (<current filter hidden — it may belong to another stream>) → WHERE (%s))", m, a.Qual))
 	}
 	for m := range after {
 		if _, ok := before[m]; !ok {
@@ -2504,6 +2511,12 @@ func removedFromPublication(members, incoming map[string]struct{}) []string {
 //     pg_get_expr-normalized — so the caller resolves it with the
 //     transactional no-op probe ([rescopeRowFilteredPublication]).
 //
+// Catalog-side predicate text (attrs.Qual) is never echoed (audit
+// 2026-07-23 SEC-1): it may be a PEER stream's row filter carrying data
+// values, and the refusal can land in another operator's terminal — the
+// entry names the member and that it "carries a row filter" instead. The
+// INCOMING qual is the caller's own `--where` text and stays visible.
+//
 // Pure, like [removedFromPublication], so the decision that gates a
 // refusal is testable without a database.
 func attributeChangedSurvivors(defs map[string]publicationMemberAttrs, incoming map[string]string) (hard, ambiguous []string) {
@@ -2518,11 +2531,11 @@ func attributeChangedSurvivors(defs map[string]publicationMemberAttrs, incoming 
 			// with or without an incoming row filter.
 			detail := m + " (a column list would be cleared"
 			if attrs.Qual != "" && inQual == "" {
-				detail += ", and row filter WHERE (" + attrs.Qual + ") too"
+				detail += ", and the row filter it carries too"
 			}
 			hard = append(hard, detail+")")
 		case attrs.Qual != "" && inQual == "":
-			hard = append(hard, m+" (row filter WHERE ("+attrs.Qual+") would be cleared)")
+			hard = append(hard, m+" (carries a row filter this rescope would clear)")
 		case attrs.Qual == "" && inQual != "":
 			hard = append(hard, m+" (a row filter WHERE ("+inQual+") would be added, narrowing the stream)")
 		case attrs.Qual != "" && inQual != "":
@@ -2824,6 +2837,125 @@ func publicationScopeConflictRefusal(name string, changes, slots []string) error
 			strings.Join(changes, " and "),
 			len(slots),
 			strings.Join(slots, ", "),
+		),
+	)
+}
+
+// verifyPublicationUnchanged is the audit 2026-07-23 D0-7 post-slot
+// re-verification: it proves the publication still matches the
+// definition THIS stream ensured, using PG's own normalization as the
+// judge, and mutates nothing.
+//
+// Why it exists: cold start ensures the publication BEFORE its own
+// replication slot does — so two streams cold-starting simultaneously
+// under one publication name each pass the ADR-0175 scope guard (the
+// peer has no slot yet to conflict with) and can swap definitions in
+// the ensure→slot-creation window. Once a slot exists, any later
+// rescope by a peer is refused by the guard; this call closes exactly
+// the pre-slot window by re-reading the catalog AFTER the slot is
+// created and comparing against what this stream would ensure.
+//
+// Mechanics mirror [rescopeRowFilteredPublication]'s transactional
+// probe (raw `--where` text cannot be text-compared to the catalog's
+// pg_get_expr rendering, so only PG can decide equality): read the
+// current member definitions, re-issue this stream's own SET TABLE
+// inside a transaction, re-read, and ALWAYS roll back. An empty diff
+// means the catalog still holds this stream's definition; a non-empty
+// diff means a concurrent cold start redefined it — the loud
+// SCOPE-CONFLICT refusal, before any data moves.
+func verifyPublicationUnchanged(ctx context.Context, db *sql.DB, name, schema string, tables []string, filters map[string]string) error {
+	version, err := serverVersionNum(ctx, db)
+	if err != nil {
+		return fmt.Errorf("postgres: post-slot publication re-verification: %w", err)
+	}
+	if version < pgVersionPublicationAttrs {
+		// Same gate as [publicationRowFiltersForVersion], without re-logging
+		// — the ensure already announced the drop at INFO.
+		filters = nil
+	}
+	current, err := publicationMemberDefsAt(ctx, db, name, version)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: begin post-slot publication re-verification probe: %w", err)
+	}
+	// The probe NEVER commits: verification must not mutate. On the
+	// happy path the rolled-back ALTER is byte-equivalent to the catalog
+	// state anyway; on the conflict path the rollback preserves the
+	// no-mutation-on-refusal guarantee the guard family gives.
+	defer func() { _ = tx.Rollback() }()
+	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s SET TABLE %s`,
+		quoteIdent(name), formatPublicationTableList(schema, tables, filters))
+	if _, err := tx.ExecContext(ctx, alterQuery); err != nil {
+		// e.g. the publication was recreated FOR ALL TABLES (SET TABLE
+		// refuses there), or dropped outright — either way it no longer
+		// matches what this stream ensured moments ago. Loud.
+		return fmt.Errorf(
+			"postgres: post-slot publication re-verification: probe rescope of %q failed — the publication was redefined between this stream's ensure and its slot creation: %w",
+			name, err,
+		)
+	}
+	ensured, err := publicationMemberDefsAt(ctx, tx, name, version)
+	if err != nil {
+		return err
+	}
+	if diff := verifyMemberDiff(current, ensured); len(diff) > 0 {
+		return publicationPostSlotConflictRefusal(name, diff)
+	}
+	return nil
+}
+
+// verifyMemberDiff returns the sorted differences between the CATALOG
+// definition (current) and the definition THIS stream ensured (ensured,
+// read back through PG's own normalization so text equality is exact),
+// rendered from the verifying stream's perspective. Empty means the
+// catalog still holds this stream's definition.
+//
+// Catalog-side predicate text is never echoed (audit 2026-07-23 SEC-1
+// — in the D0-7 shape the current filter is by construction ANOTHER
+// stream's): entries name the member and the kind of divergence only.
+//
+// Pure, like [removedFromPublication], so the decision that gates a
+// refusal is testable without a database.
+func verifyMemberDiff(current, ensured map[string]publicationMemberAttrs) []string {
+	var diff []string
+	for m, cur := range current {
+		ens, ok := ensured[m]
+		switch {
+		case !ok:
+			diff = append(diff, m+" (present in the publication but not in this stream's definition)")
+		case cur != ens:
+			diff = append(diff, m+" (its row filter or column list differs from what this stream ensured)")
+		}
+	}
+	for m := range ensured {
+		if _, ok := current[m]; !ok {
+			diff = append(diff, m+" (removed from the publication)")
+		}
+	}
+	sort.Strings(diff)
+	return diff
+}
+
+// publicationPostSlotConflictRefusal is the D0-7 flavor of the
+// ADR-0175/0176 coded refusal: the concurrent-first-boot window closed
+// after the fact, before any data moved.
+func publicationPostSlotConflictRefusal(name string, diff []string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeCDCPublicationScopeConflict,
+		"give each concurrently-starting stream over this source its own --publication-name, then restart this stream",
+		fmt.Errorf(
+			"postgres: cold start refused after slot creation: publication %q no longer matches the definition this "+
+				"stream ensured at the start of this cold start (%s). A concurrently cold-starting stream sharing this "+
+				"publication name redefined it inside the ensure→slot-creation window — before either stream's slot "+
+				"existed, so the scope-conflict guard had no slot to refuse against (audit 2026-07-23 D0-7). Streaming "+
+				"on would deliver the WRONG change set through the peer's definition; no data has moved. Recovery: give "+
+				"each concurrent stream over this source its own publication (--publication-name NAME, per stream) and "+
+				"restart. See ADR-0175",
+			name,
+			strings.Join(diff, "; "),
 		),
 	)
 }

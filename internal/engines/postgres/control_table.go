@@ -8,7 +8,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
@@ -410,6 +413,16 @@ func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (tok
 // recorded; drift unknown — allow" (audit 2026-07-23 D0-2)). The Position
 // values set Engine to the engine-specific identifier for symmetry
 // with ReadPosition's contract.
+//
+// The fallback hook retries with the legacy column set when Postgres
+// reports an undefined column (SQLSTATE 42703) — the MySQL parity the
+// audit 2026-07-23 QUAL-2 finding demanded: an upgraded binary's
+// READ-ONLY paths (`sync status`/`health`, the live panel, `--dry-run`,
+// `--schema-already-applied`) can query a pre-upgrade control table
+// before anything ran EnsureControlTable's ALTERs, and this seam has
+// now been hit by three column additions (slot_name, rows_applied,
+// publication_name). Degrading with empty extras beats erroring the
+// observability path.
 func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
@@ -419,7 +432,69 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 		"COALESCE(target_schema, ''), " +
 		"COALESCE(rows_applied, 0) " +
 		"FROM " + controlTableRef(schema)
-	return appliershared.ListStreams(ctx, db, controlCfg, q, engineName)
+	cfg := *controlCfg
+	cfg.ListStreamsFallback = func(ctx context.Context, queryErr error) ([]ir.StreamStatus, bool, error) {
+		if !isUndefinedColumnErr(queryErr) {
+			return nil, false, nil
+		}
+		out, err := listStreamsLegacy(ctx, db, schema, engineName)
+		return out, true, err
+	}
+	return appliershared.ListStreams(ctx, db, &cfg, q, engineName)
+}
+
+// listStreamsLegacy is the original (pre-column-additions) SELECT
+// shape, used as a fallback when the full query trips an undefined-
+// column error against a control table a previous release created. The
+// returned StreamStatus values have empty SlotName / PublicationName /
+// RowFilterHash / SourceDSNFingerprint / TargetSchema and zero
+// RowsApplied — the columns are simply not present yet on this control
+// table, and every consumer already treats empty as "unknown — allow".
+// Mirrors mysql's listStreamsLegacy exactly (QUAL-2 parity).
+func listStreamsLegacy(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
+	q := "SELECT stream_id, source_position, updated_at FROM " + controlTableRef(schema)
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		if isUndefinedRelationErr(err) {
+			return []ir.StreamStatus{}, nil
+		}
+		return nil, fmt.Errorf("postgres: list streams (legacy): %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []ir.StreamStatus{}
+	for rows.Next() {
+		var (
+			streamID string
+			token    string
+			updated  time.Time
+		)
+		if err := rows.Scan(&streamID, &token, &updated); err != nil {
+			return nil, fmt.Errorf("postgres: scan streams (legacy): %w", err)
+		}
+		out = append(out, ir.StreamStatus{
+			StreamID:  streamID,
+			Position:  ir.Position{Engine: engineName, Token: token},
+			UpdatedAt: updated,
+		})
+	}
+	return out, rows.Err()
+}
+
+// isUndefinedColumnErr returns true when err is Postgres's "column X
+// does not exist" / SQLSTATE 42703 — the surface an upgraded binary's
+// widened SELECT hits against a control table created by a previous
+// release. Structural first (the driver's own PgError code), with a
+// string fallback for wrapped shapes that lost the type.
+func isUndefinedColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42703"
+	}
+	return strings.Contains(err.Error(), "42703")
 }
 
 // writePositionTx upserts the (streamID, token, slotName) row inside

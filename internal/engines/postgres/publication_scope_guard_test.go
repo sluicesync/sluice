@@ -12,6 +12,7 @@ package postgres
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -120,7 +121,10 @@ func bareQuals(keys ...string) map[string]string {
 // (provable) conflict; filter-vs-filter is AMBIGUOUS (raw text vs
 // pg_get_expr rendering — only the transactional probe can decide);
 // and, just as load-bearing, an attribute-free equal/widening rescope
-// must NOT fire (every pre-ADR-0176 shipped shape).
+// must NOT fire (every pre-ADR-0176 shipped shape). Catalog-side
+// (potentially PEER) predicate text must never appear in the rendered
+// entries — see TestScopeConflictRendering_RedactsPeerPredicates — while
+// the caller's own incoming qual stays visible.
 func TestAttributeChangedSurvivors(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -141,7 +145,7 @@ func TestAttributeChangedSurvivors(t *testing.T) {
 				"public.items":  {},
 			},
 			incoming: bareQuals("public.orders", "public.items"),
-			wantHard: []string{"public.orders (row filter WHERE ((country = 'US'::text)) would be cleared)"},
+			wantHard: []string{"public.orders (carries a row filter this rescope would clear)"},
 		},
 		{
 			name: "incoming filter added where none exists — hard (narrows peers)",
@@ -175,7 +179,7 @@ func TestAttributeChangedSurvivors(t *testing.T) {
 				"public.orders": {Qual: "(id > 5)", HasColumnList: true},
 			},
 			incoming: bareQuals("public.orders"),
-			wantHard: []string{"public.orders (a column list would be cleared, and row filter WHERE ((id > 5)) too)"},
+			wantHard: []string{"public.orders (a column list would be cleared, and the row filter it carries too)"},
 		},
 		{
 			name: "column list + row filter, incoming filter — hard on the list, not ambiguous",
@@ -200,7 +204,7 @@ func TestAttributeChangedSurvivors(t *testing.T) {
 				"public.orders": {Qual: "(id > 5)"},
 			},
 			incoming: bareQuals("public.orders", "public.users"),
-			wantHard: []string{"public.orders (row filter WHERE ((id > 5)) would be cleared)"},
+			wantHard: []string{"public.orders (carries a row filter this rescope would clear)"},
 		},
 		{
 			name:     "results are sorted for a stable refusal message",
@@ -403,7 +407,10 @@ func TestPublicationRowFiltersForVersion(t *testing.T) {
 
 // TestChangedMemberDefs pins the probe's pure diff: pg_get_expr-
 // normalized definitions compare by text equality, and every changed
-// member is named for the refusal message.
+// member is named for the refusal message — with the BEFORE side's
+// predicate text redacted (it is catalog state that may quote a PEER
+// stream's filter; audit 2026-07-23 SEC-1) while the caller's own
+// incoming (after) qual stays visible.
 func TestChangedMemberDefs(t *testing.T) {
 	before := map[string]publicationMemberAttrs{
 		"public.orders": {Qual: "(id < 100)"},
@@ -420,8 +427,113 @@ func TestChangedMemberDefs(t *testing.T) {
 		"public.orders": {Qual: "(id < 50)"},
 		"public.items":  {Qual: "(sku <> ''::text)"},
 	}
-	want := []string{"public.orders (WHERE ((id < 100)) → WHERE ((id < 50)))"}
+	want := []string{"public.orders (row filter changed: WHERE (<current filter hidden — it may belong to another stream>) → WHERE ((id < 50)))"}
 	if got := changedMemberDefs(before, after); !reflect.DeepEqual(got, want) {
 		t.Errorf("changedMemberDefs() = %v, want %v", got, want)
 	}
+}
+
+// TestScopeConflictRendering_RedactsPeerPredicates is the audit
+// 2026-07-23 SEC-1 pin: a scope-conflict refusal can land in the
+// terminal of an operator who does NOT own the peer stream, and a row
+// filter routinely carries data values (customer identifiers, date
+// cutoffs) — so no rendered entry may echo catalog-side predicate text.
+// The operator's OWN incoming predicate remains visible (they typed it).
+func TestScopeConflictRendering_RedactsPeerPredicates(t *testing.T) {
+	const peerSecret = "customer_id = 'acme-8842'"
+
+	t.Run("attributeChangedSurvivors never echoes the catalog qual", func(t *testing.T) {
+		defs := map[string]publicationMemberAttrs{
+			"public.orders": {Qual: "(" + peerSecret + ")"},
+			"public.audits": {Qual: "(" + peerSecret + ")", HasColumnList: true},
+		}
+		hard, _ := attributeChangedSurvivors(defs, bareQuals("public.orders", "public.audits"))
+		for _, entry := range hard {
+			if strings.Contains(entry, "acme-8842") {
+				t.Errorf("peer predicate text leaked into the refusal entry: %s", entry)
+			}
+		}
+		if len(hard) != 2 {
+			t.Fatalf("expected both members reported; got %v", hard)
+		}
+		// The operator's own incoming qual stays visible.
+		hard, _ = attributeChangedSurvivors(defSet("public.orders"), map[string]string{"public.orders": "id < 100"})
+		if len(hard) != 1 || !strings.Contains(hard[0], "id < 100") {
+			t.Errorf("the caller's own incoming qual must stay visible; got %v", hard)
+		}
+	})
+
+	t.Run("changedMemberDefs redacts the before side only", func(t *testing.T) {
+		before := map[string]publicationMemberAttrs{"public.orders": {Qual: "(" + peerSecret + ")"}}
+		after := map[string]publicationMemberAttrs{"public.orders": {Qual: "(id < 50)"}}
+		changed := changedMemberDefs(before, after)
+		if len(changed) != 1 {
+			t.Fatalf("changedMemberDefs = %v; want one entry", changed)
+		}
+		if strings.Contains(changed[0], "acme-8842") {
+			t.Errorf("peer predicate text leaked: %s", changed[0])
+		}
+		if !strings.Contains(changed[0], "(id < 50)") {
+			t.Errorf("the caller's own (after) qual must stay visible: %s", changed[0])
+		}
+	})
+
+	t.Run("verifyMemberDiff never echoes any qual", func(t *testing.T) {
+		current := map[string]publicationMemberAttrs{"public.orders": {Qual: "(" + peerSecret + ")"}}
+		ensured := map[string]publicationMemberAttrs{"public.orders": {Qual: "(id < 100)"}}
+		for _, entry := range verifyMemberDiff(current, ensured) {
+			if strings.Contains(entry, "acme-8842") || strings.Contains(entry, "id < 100") {
+				t.Errorf("verifyMemberDiff echoed predicate text: %s", entry)
+			}
+		}
+	})
+}
+
+// TestVerifyMemberDiff pins the D0-7 post-slot comparison's pure diff
+// over its full transition matrix: equal definitions (including
+// attribute-free PG<15 member sets) diff empty; a changed filter, a
+// peer-added member, and a peer-removed member each render a named,
+// sorted, predicate-free entry.
+func TestVerifyMemberDiff(t *testing.T) {
+	ours := map[string]publicationMemberAttrs{
+		"public.orders": {Qual: "(id < 100)"},
+		"public.items":  {},
+	}
+	t.Run("unchanged — empty diff (the happy cold start)", func(t *testing.T) {
+		same := map[string]publicationMemberAttrs{
+			"public.orders": {Qual: "(id < 100)"},
+			"public.items":  {},
+		}
+		if got := verifyMemberDiff(same, ours); got != nil {
+			t.Errorf("verifyMemberDiff(equal) = %v; want empty", got)
+		}
+	})
+	t.Run("peer swapped the filter — reported without the text", func(t *testing.T) {
+		current := map[string]publicationMemberAttrs{
+			"public.orders": {Qual: "(region = 'EU')"},
+			"public.items":  {},
+		}
+		want := []string{"public.orders (its row filter or column list differs from what this stream ensured)"}
+		if got := verifyMemberDiff(current, ours); !reflect.DeepEqual(got, want) {
+			t.Errorf("verifyMemberDiff = %v, want %v", got, want)
+		}
+	})
+	t.Run("peer replaced the member set — both directions reported, sorted", func(t *testing.T) {
+		current := map[string]publicationMemberAttrs{
+			"public.orders": {Qual: "(id < 100)"},
+			"public.users":  {},
+		}
+		want := []string{
+			"public.items (removed from the publication)",
+			"public.users (present in the publication but not in this stream's definition)",
+		}
+		if got := verifyMemberDiff(current, ours); !reflect.DeepEqual(got, want) {
+			t.Errorf("verifyMemberDiff = %v, want %v", got, want)
+		}
+	})
+	t.Run("PG<15 attribute-free sets compare by membership alone", func(t *testing.T) {
+		if got := verifyMemberDiff(defSet("public.a", "public.b"), defSet("public.a", "public.b")); got != nil {
+			t.Errorf("attribute-free equal sets must diff empty; got %v", got)
+		}
+	})
 }

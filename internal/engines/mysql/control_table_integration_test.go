@@ -829,3 +829,56 @@ func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
 		t.Errorf("empty write clobbered the record: got %q, want preserved %q", got.RowFilterHash, values["rt-hash"])
 	}
 }
+
+// TestListStreams_LegacyControlTableDegrades is the MySQL leg of the
+// audit 2026-07-23 QUAL-2 / G-10 class ratchet (the fallback shipped in
+// v0.32.2 but was never pinned): ListStreams against a control table a
+// PREVIOUS release created — the ORIGINAL minimal column set, so every
+// future column addition is auto-covered — must degrade to the legacy
+// SELECT with empty extras, never surface error 1054. The PG mirror
+// lives in internal/engines/postgres.
+func TestListStreams_LegacyControlTableDegrades(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// The original (pre-column-additions) shape. Deliberately NOT running
+	// EnsureControlTable — the read-only paths don't either.
+	applyMySQLApplier(t, dsn, "CREATE TABLE `sluice_cdc_state` ("+
+		"  stream_id       VARCHAR(255) NOT NULL,"+
+		"  source_position TEXT         NOT NULL,"+
+		"  updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"+
+		"  PRIMARY KEY (stream_id)"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"+
+		"INSERT INTO `sluice_cdc_state` (stream_id, source_position) VALUES ('legacy-stream', 'legacy-token');")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applier, err := Engine{Flavor: FlavorVanilla}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	streams, err := applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams against the previous release's control table = %v; want the legacy fallback", err)
+	}
+	if len(streams) != 1 {
+		t.Fatalf("ListStreams returned %d rows; want the 1 legacy row", len(streams))
+	}
+	row := streams[0]
+	if row.StreamID != "legacy-stream" || row.Position.Token != "legacy-token" {
+		t.Errorf("legacy row = %+v; want stream_id/source_position round-tripped", row)
+	}
+	if row.SlotName != "" || row.PublicationName != "" || row.RowFilterHash != "" ||
+		row.SourceDSNFingerprint != "" || row.TargetSchema != "" || row.RowsApplied != 0 {
+		t.Errorf("legacy fallback must report empty/zero extras; got %+v", row)
+	}
+	if row.UpdatedAt.IsZero() {
+		t.Error("legacy fallback dropped updated_at")
+	}
+}

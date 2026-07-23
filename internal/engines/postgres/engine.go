@@ -346,6 +346,32 @@ func (e Engine) EnsurePublication(ctx context.Context, dsn string, tables []stri
 	return classifyStandbyReadOnly(ensurePublication(ctx, db, e.publicationName(), cfg.schema, tables, e.ownSlot, e.publicationRowFilters()))
 }
 
+// VerifyPublicationScope re-verifies, AFTER the stream's replication
+// slot exists, that the publication still matches the definition this
+// engine value ensured at cold start — the audit 2026-07-23 D0-7
+// closure of the concurrent-first-boot window (two streams cold-
+// starting simultaneously under one publication name can swap
+// definitions while neither has a slot for the ADR-0175 guard to see).
+// Mutates nothing (the comparison probe always rolls back); a mismatch
+// is the loud SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT refusal, raised
+// before any data moves.
+//
+// Discovered by the [pipeline.Streamer] via structural interface
+// (publicationPostSlotVerifier), mirroring EnsurePublication's
+// discovery; tables is the same list the ensure received.
+func (e Engine) VerifyPublicationScope(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := e.parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return verifyPublicationUnchanged(ctx, db, e.publicationName(), cfg.schema, tables, e.publicationRowFilters())
+}
+
 // AddPublicationTables extends the sluice publication's table list
 // to include every name in tables, leaving the existing scope
 // untouched. Used by the mid-stream add-table flow where a `SET

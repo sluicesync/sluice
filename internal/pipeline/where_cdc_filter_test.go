@@ -485,3 +485,94 @@ func TestClientCopyFilter(t *testing.T) {
 		t.Error("keep(widgets, zone='US') = false; want true (server-filtered, not re-filtered)")
 	}
 }
+
+// preflightRecordingSource is a fake filtered-sync source for
+// preflightRowFilters unit pins: a recordingEngine (serving the schema)
+// plus the FilteredCDCPreflighter and CollationResolverProvider
+// surfaces. The preflighter records the exact table names it is handed
+// and mimics the ENGINES' exact-name lookup semantics (PG resolves the
+// name against pg_class.relname; an unfound name reads as
+// not-REPLICA-IDENTITY-FULL) via the fail map.
+type preflightRecordingSource struct {
+	*recordingEngine
+	preflighted [][]string
+	fail        map[string]error
+}
+
+func (s *preflightRecordingSource) PreflightFilteredCDCBeforeImage(_ context.Context, _ string, tables []string) error {
+	s.preflighted = append(s.preflighted, tables)
+	for _, tb := range tables {
+		if err := s.fail[tb]; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (*preflightRecordingSource) CollationResolver() ir.CollationResolver {
+	return ir.ByteExactCollationResolver{}
+}
+
+// TestPreflightRowFilters_BeforeImageProbeRunsOnCanonicalNames is the
+// audit 2026-07-23 D0-10 pin (the carried 07-19 finding): the
+// before-image probe must run AFTER ValidateRowFilterKeys, on the
+// schema-cased table names. Pre-fix it probed the RAW `--where` keys —
+// the engines look tables up by exact name, so a mere case-mismatch
+// produced a spurious SLUICE-E-WHERE-CDC-BEFORE-IMAGE naming a REPLICA
+// IDENTITY remedy that cannot fix a casing typo (loud-but-misleading).
+func TestPreflightRowFilters_BeforeImageProbeRunsOnCanonicalNames(t *testing.T) {
+	newSource := func() *preflightRecordingSource {
+		eng := newRecordingEngine("fake-pg")
+		eng.schema = &ir.Schema{Tables: []*ir.Table{{
+			Name: "Orders", // schema-cased: mixed case, as PG can hold it
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{}},
+			},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		}}}
+		return &preflightRecordingSource{
+			recordingEngine: eng,
+			// Exact-name semantics: the raw upper-cased key does not resolve,
+			// so a probe on it would refuse — exactly the pre-fix shape.
+			fail: map[string]error{
+				"ORDERS": missingBeforeImage("UPDATE", "", "ORDERS"),
+			},
+		}
+	}
+
+	t.Run("case-mismatched key canonicalizes, then probes — no spurious refusal", func(t *testing.T) {
+		src := newSource()
+		s := &Streamer{Source: src, SourceDSN: "dsn", RowFilters: map[string]string{"ORDERS": "id < 5"}}
+		if err := s.preflightRowFilters(context.Background()); err != nil {
+			t.Fatalf("preflightRowFilters = %v; want nil (RED pre-fix: the raw-key probe refused with the before-image code)", err)
+		}
+		if len(src.preflighted) != 1 || len(src.preflighted[0]) != 1 || src.preflighted[0][0] != "Orders" {
+			t.Errorf("before-image probe received %v; want the canonical [Orders]", src.preflighted)
+		}
+	})
+
+	t.Run("unknown key gets the unknown-table refusal, never the before-image one", func(t *testing.T) {
+		src := newSource()
+		src.fail["ghost"] = missingBeforeImage("UPDATE", "", "ghost")
+		s := &Streamer{Source: src, SourceDSN: "dsn", RowFilters: map[string]string{"ghost": "id < 5"}}
+		err := s.preflightRowFilters(context.Background())
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeWhereFilterUnknownTable {
+			t.Fatalf("err = %v; want coded %s (the correct refusal for a bad key)", err, sluicecode.CodeWhereFilterUnknownTable)
+		}
+		if len(src.preflighted) != 0 {
+			t.Errorf("the before-image probe must not run on an unvalidated key set; got %v", src.preflighted)
+		}
+	})
+
+	t.Run("a genuine before-image misconfiguration still refuses loudly", func(t *testing.T) {
+		src := newSource()
+		src.fail["Orders"] = missingBeforeImage("UPDATE", "", "Orders")
+		s := &Streamer{Source: src, SourceDSN: "dsn", RowFilters: map[string]string{"orders": "id < 5"}}
+		err := s.preflightRowFilters(context.Background())
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeWhereCDCBeforeImage {
+			t.Fatalf("err = %v; want coded %s (the probe's own refusal must still propagate)", err, sluicecode.CodeWhereCDCBeforeImage)
+		}
+	})
+}

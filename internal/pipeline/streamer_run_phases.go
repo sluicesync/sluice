@@ -279,6 +279,18 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 		)
 		s.PublicationName = resolved
 	}
+	// audit 2026-07-23 D0-9: refuse an unsafe --publication-name at
+	// resolve time — a mixed-case or over-length name runs green through
+	// the whole bulk copy and only fails (or silently idles) at the
+	// first change, because START_REPLICATION downcases publication_names
+	// while the quoted CREATE preserved the spelling. Validated on the
+	// RESOLVED name (the prefix is already [a-z0-9_], so validity of the
+	// resolved name is validity of the operator's input). The ratchet's
+	// derived per-stream default is safe by construction; a recorded
+	// name originates from a flag this check already vetted.
+	if err := validatePublicationName(s.PublicationName); err != nil {
+		return "", err
+	}
 	if scoper, ok := s.Source.(ir.PublicationScoper); ok {
 		s.Source = scoper.WithPublicationScope(s.PublicationName, s.SlotName)
 		if s.PublicationName != "" {

@@ -36,6 +36,20 @@ type publicationEnsurer interface {
 	EnsurePublication(ctx context.Context, dsn string, tables []string) error
 }
 
+// publicationPostSlotVerifier is [publicationEnsurer]'s post-slot
+// sibling (audit 2026-07-23 D0-7): cold start ensures the publication
+// BEFORE its own replication slot exists, so two simultaneously
+// cold-starting streams sharing a publication name can swap definitions
+// past the ADR-0175 existence guard — neither has a slot yet for the
+// guard to refuse against. After the slot is created, [coldStart] calls
+// this with the SAME table list the ensure received; the engine
+// re-reads the publication and refuses loudly (the SCOPE-CONFLICT
+// refusal) when it no longer matches what this stream ensured — before
+// any data moves. Read-only on the source; Postgres implements it.
+type publicationPostSlotVerifier interface {
+	VerifyPublicationScope(ctx context.Context, dsn string, tables []string) error
+}
+
 // lsnTrackerProvider is the optional applier-side surface for
 // engines that produce applied-LSN feedback (Bug 15, ADR-0020). The
 // applier owns the tracker; the streamer fetches it via this

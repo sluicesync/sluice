@@ -100,9 +100,13 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// crashing the applier with "table public.X has no columns".
 	// Run BEFORE OpenSnapshotStream so the snapshot's slot pins a
 	// catalog snapshot that already has the scoped publication.
+	// publicationTables is captured for the post-slot re-verification
+	// below (audit 2026-07-23 D0-7): the verify must compare the catalog
+	// against exactly the definition this ensure asserted.
+	var publicationTables []string
 	if pe, ok := s.Source.(publicationEnsurer); ok {
-		tables := migcore.TableNamesForPublication(schema)
-		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
+		publicationTables = migcore.TableNamesForPublication(schema)
+		if err := pe.EnsurePublication(ctx, s.SourceDSN, publicationTables); err != nil {
 			return nil, stop, connectHint(fmt.Errorf("pipeline: ensure publication scope: %w", err))
 		}
 	}
@@ -147,6 +151,25 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	stream, err := s.coldStartOpenSnapshot(ctx, applier, streamID, resumeFrom, resumingCopy, snapshotTables)
 	if err != nil {
 		return nil, stop, err
+	}
+
+	// ---- Post-slot publication re-verification (audit 2026-07-23
+	// D0-7). The EnsurePublication above ran BEFORE this stream's slot
+	// existed, so a simultaneously cold-starting peer sharing the
+	// publication name could have redefined it past the ADR-0175 guard
+	// (neither stream had a slot yet). Now that the snapshot open has
+	// created our slot, re-verify the publication still matches what WE
+	// ensured; a mismatch refuses loudly before any row moves, and the
+	// abandon drops the just-created slot + per-stream publication (no
+	// anchor position has been persisted, so Abandon is in-contract).
+	// Skipped on an interrupted-COPY resume: the slot already existed
+	// before the ensure there, so the pre-slot window never opened —
+	// and Abandon would wrongly drop a slot carrying prior progress.
+	if pv, ok := s.Source.(publicationPostSlotVerifier); ok && !resumingCopy && len(publicationTables) > 0 {
+		if err := pv.VerifyPublicationScope(ctx, s.SourceDSN, publicationTables); err != nil {
+			_ = stream.Abandon()
+			return nil, stop, fmt.Errorf("pipeline: post-slot publication re-verification: %w", err)
+		}
 	}
 
 	// VStream-COPY FLOAT display-rounding (roadmap open-bug 2026-07-09):
