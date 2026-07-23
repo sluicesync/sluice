@@ -24,8 +24,14 @@
 #   - TestLoadColumnTypes_Bug97VerbatimEligibleTypes: gated on the
 #     PG_PROBE_DSN env var (a live-probe characterization test), never
 #     set in shard CI.
-#   - TestChainRestore_CrossEnginePostGISNowSupported: retired,
-#     documented unconditional skip (points at the postgis-tagged suite).
+#   - TestChainRestore_CrossEnginePostGISNowSupported AND
+#     TestChainRestore_CrossEngine_PostGISNowSupported: TWO distinct
+#     retired v0.28.0 tombstones with near-identical names — the first
+#     is the untagged unit placeholder (chain_restore_test.go), the
+#     second the integration-tagged one (chain_restore_cross_
+#     integration_test.go). A -tags=integration shard runs BOTH, so
+#     both documented unconditional skips appear in shard output
+#     (each points at the postgis-tagged suite for the live coverage).
 #   - TestStreamer_SchemaForward_DropNotNull_PG: documented PG
 #     limitation (pgoutput omits the nullability flag), unconditional.
 #   - TestBackup_SignedManifest_DR_RoundTripAndTamper: two data-dependent
@@ -46,6 +52,7 @@ ALLOWED_SKIPS='
 ^TestMigrate_Corpus_
 ^TestLoadColumnTypes_Bug97VerbatimEligibleTypes$
 ^TestChainRestore_CrossEnginePostGISNowSupported$
+^TestChainRestore_CrossEngine_PostGISNowSupported$
 ^TestStreamer_SchemaForward_DropNotNull_PG$
 ^TestBackup_SignedManifest_DR_RoundTripAndTamper(/|$)
 ^TestConnectionSlotClassifier_RealPG53300$
