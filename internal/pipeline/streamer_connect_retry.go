@@ -71,14 +71,36 @@ func connectHint(err error) error {
 }
 
 // isRetriableConnectFailure reports whether err is a connect-phase-marked
-// failure with a positively-transient network shape — the only combination
-// [runWithRetry] retries without an [ir.RetriableError] wrapper. Both legs
-// are required: an unmarked error may come from a phase whose retry
-// semantics the engines own, and a marked-but-unmatched error (refusal,
-// credential, parse) must stay terminal.
+// failure with a positively-transient shape — the only combination
+// [runWithRetry] retries without an [ir.RetriableError] wrapper. The marker
+// is required in every case: an unmarked error may come from a phase whose
+// retry semantics the engines own. Two transient legs (both positive-match,
+// terminal by default):
+//
+//   - network/transport shapes ([isTransientNetworkShape] — no server
+//     response at all), and
+//   - the PG connection-availability SQLSTATEs
+//     ([nettransient.IsConnectionAvailabilitySQLState] — Bug 203): a
+//     re-establish attempt that reaches a RESTARTING server inside its
+//     `57P03 the database system is starting up` window (~1–2s locally,
+//     10–60s on managed-PG restarts — the real-world restart shape) gets a
+//     structured PgError, which no network shape matches, and pre-fix
+//     exited terminal here while the applier classifier and the trigger-CDC
+//     poll classifier both classified the same SQLSTATE retriable. The
+//     structured leg reads ONLY the code — auth (28000/28P01), invalid
+//     catalog (3D000), and every other SQLSTATE stay terminal. A restarting
+//     MySQL has no structured connect-phase sibling (its listener is simply
+//     down until recovery completes, so the whole window is dial-refused
+//     shapes the network leg already covers — ground-truthed; see the
+//     predicate's doc).
+//
+// A marked-but-unmatched error (refusal, credential, parse) stays terminal.
 func isRetriableConnectFailure(err error) bool {
 	var cp *connectPhaseError
-	return errors.As(err, &cp) && isTransientNetworkShape(err)
+	if !errors.As(err, &cp) {
+		return false
+	}
+	return isTransientNetworkShape(err) || nettransient.IsConnectionAvailabilitySQLState(err)
 }
 
 // isTransientNetworkShape reports whether err is a network/transport shape

@@ -4,10 +4,7 @@
 package postgres
 
 import (
-	"errors"
-	"strings"
-
-	"github.com/jackc/pgx/v5/pgconn"
+	"sluicesync.dev/sluice/internal/nettransient"
 )
 
 // IsReadTransientSQLState reports whether err carries a PG SQLSTATE from the
@@ -34,17 +31,15 @@ import (
 // all no 42703/42P01 — a missing change-log table is an operator/setup
 // fault that must stay TERMINAL on the trigger engines, while the applier
 // maps those to schema-drift semantics.
+//
+// Since Bug 203 the SQLSTATE set itself is SINGLE-HOMED in
+// [nettransient.IsConnectionAvailabilitySQLState] (which matches
+// *pgconn.PgError structurally via its SQLState() method) so the pipeline's
+// engine-neutral connect-phase retry consults the same vocabulary; this
+// function is the engine-side name for it, kept for the trigger-CDC
+// consumers and pinned equivalent by the delegation-parity test — a site
+// that stops delegating (or a one-sided widening) fails there, not as
+// silent drift.
 func IsReadTransientSQLState(err error) bool {
-	if err == nil {
-		return false
-	}
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	switch pgErr.Code {
-	case "57P01", "57P02", "57P03":
-		return true
-	}
-	return strings.HasPrefix(pgErr.Code, "08")
+	return nettransient.IsConnectionAvailabilitySQLState(err)
 }

@@ -39,8 +39,12 @@
 // code shield (audit 2026-07-23 D0-3/D0-8) — a structured driver error
 // (*gomysql.MySQLError / *pgconn.PgError) means the server RESPONDED,
 // its message routinely echoes row data and table names, and the code
-// alone decides the classification. This package must never be
+// alone decides the classification. [IsTransientShape] must never be
 // consulted for an error chain carrying a structured server response.
+// The separate [IsConnectionAvailabilitySQLState] predicate (Bug 203) is
+// the structured companion for exactly those chains: it reads ONLY the
+// SQLSTATE code — never message text — so the shield's data-echo hazard
+// does not apply to it.
 package nettransient
 
 import (
@@ -163,4 +167,61 @@ func IsTransientShape(err error) bool {
 		}
 	}
 	return false
+}
+
+// sqlStater is the structural surface a SQLSTATE-carrying driver error
+// exposes — pgx's *pgconn.PgError implements it (SQLState() returns .Code).
+// Matched structurally (errors.As onto the interface) so this package needs
+// no driver import and the pipeline consumer stays engine-neutral; the
+// go-sql-driver *MySQLError carries its SQLState as a field, not a method,
+// so MySQL errors never match here (see the asymmetry note below).
+type sqlStater interface {
+	SQLState() string
+}
+
+// IsConnectionAvailabilitySQLState reports whether err carries a SQLSTATE
+// from the Postgres CONNECTION-AVAILABILITY transient set — the structured
+// shapes a connect/ping/read hits when the server is restarting, promoting,
+// or dropping the connection server-side:
+//
+//   - 57P01 admin_shutdown / 57P02 crash_shutdown / 57P03
+//     cannot_connect_now (the "database system is starting up" window a
+//     managed-PG restart holds open for 10–60s) — the server comes back.
+//   - class 08 connection_exception (08000/08003/08006/08007/08P01).
+//
+// This is the SINGLE HOME of that SQLSTATE set (Bug 203 — the QUAL-1
+// vocabulary discipline): postgres.IsReadTransientSQLState delegates here,
+// and the pipeline's connect-phase retry consults it directly for the
+// structured leg its network-shape matcher deliberately lacks (a
+// re-establish attempt landing in a restarting server's 57P03 window gets a
+// structured PgError, no network shape matches, and pre-fix it exited
+// terminal while the applier and trigger-CDC poll classifiers both retried
+// the same shape). Everything else stays terminal by omission — notably
+// auth (28000/28P01), invalid catalog (3D000), and undefined objects
+// (42P01/42703), which are operator faults retrying would mask.
+//
+// MySQL asymmetry (ground-truthed 2026-07-23, docker restart of mysql:8.0
+// with a 50ms connect probe): a restarting MySQL never presented a
+// structured handshake errno — the listener simply is not up until InnoDB
+// recovery completes, so the observed restart window surfaced entirely as
+// transport shapes (every sample was the driver's "invalid connection";
+// direct dials additionally yield the refused/i-o-timeout wordings), all of
+// which [IsTransientShape] already classifies. There is no MySQL leg to add
+// here; 1053 ER_SERVER_SHUTDOWN is a mid-session shape on established
+// connections, not a connect-phase one, and adding it without connect-phase
+// evidence would widen the retry surface on speculation.
+func IsConnectionAvailabilitySQLState(err error) bool {
+	if err == nil {
+		return false
+	}
+	var st sqlStater
+	if !errors.As(err, &st) {
+		return false
+	}
+	switch code := st.SQLState(); code {
+	case "57P01", "57P02", "57P03":
+		return true
+	default:
+		return strings.HasPrefix(code, "08")
+	}
 }
