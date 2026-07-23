@@ -114,6 +114,10 @@ var oracleMatrix = []oracleFamily{
 		cells: []oracleCell{
 			{name: "eq", pred: "v = TRUE", in0: "TRUE", in1: "TRUE", out0: "FALSE", out1: "FALSE"},
 			{name: "ne", pred: "v != FALSE", in0: "TRUE", in1: "TRUE", out0: "FALSE", out1: "FALSE"},
+			// IN / NOT IN on bool: the grammar compiles it and the classifier
+			// admits it, so it needs cells (audit 2026-07-23 TEST-4).
+			{name: "in", pred: "v IN (TRUE)", in0: "TRUE", in1: "TRUE", out0: "FALSE", out1: "FALSE"},
+			{name: "notin", pred: "v NOT IN (TRUE)", in0: "FALSE", in1: "FALSE", out0: "TRUE", out1: "TRUE"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "TRUE", out1: "FALSE"},
 			{name: "isnotnull", pred: "v IS NOT NULL", in0: "TRUE", in1: "FALSE", out0: "NULL", out1: "NULL"},
 		},
@@ -148,8 +152,15 @@ var oracleMatrix = []oracleFamily{
 		name: "date", colType: "date",
 		cells: []oracleCell{
 			{name: "eq", pred: "v = '2026-01-15'", in0: "'2026-01-15'", in1: "'2026-01-15'", out0: "'2026-01-14'", out1: "'2026-01-16'"},
+			// !=, NOT IN, and the 3VL negation — the shapes where a
+			// server-stricter divergence would surface (audit 2026-07-23
+			// TEST-4). Pure-date literals only: time-bearing literals are
+			// OUTSIDE the envelope (D0-5 — see the granularity fallback gate).
+			{name: "ne", pred: "v != '2026-01-15'", in0: "'2026-01-16'", in1: "'1999-12-31'", out0: "'2026-01-15'", out1: "'2026-01-15'"},
 			{name: "ge", pred: "v >= '2026-01-15'", in0: "'2026-01-15'", in1: "'2027-03-01'", out0: "'2026-01-14'", out1: "'1999-12-31'"},
 			{name: "in", pred: "v IN ('2026-01-15', '2026-02-01')", in0: "'2026-01-15'", in1: "'2026-02-01'", out0: "'2026-01-16'", out1: "'2026-02-02'"},
+			{name: "notin", pred: "v NOT IN ('2026-01-15', '2026-02-01')", in0: "'2026-01-16'", in1: "'2026-02-02'", out0: "'2026-01-15'", out1: "'2026-02-01'"},
+			{name: "not_or_3vl", pred: "NOT (v = '2026-01-15' OR v > '2026-06-01')", in0: "'2026-01-16'", in1: "'2026-06-01'", out0: "'2026-01-15'", out1: "'2026-06-02'"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "'2026-01-15'", out1: "'2026-01-16'"},
 		},
 	},
@@ -159,6 +170,11 @@ var oracleMatrix = []oracleFamily{
 			{name: "eq", pred: "v = '2026-01-15 08:30:00'", in0: "'2026-01-15 08:30:00'", in1: "'2026-01-15 08:30:00'", out0: "'2026-01-15 08:30:01'", out1: "'2026-01-15 08:29:59.999999'"},
 			{name: "lt", pred: "v < '2026-01-15 08:30:00'", in0: "'2026-01-15 08:29:59.999999'", in1: "'1999-01-01 00:00:00'", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-15 08:30:00.000001'"},
 			{name: "ne", pred: "v != '2026-01-15 08:30:00'", in0: "'2026-01-15 08:30:00.000001'", in1: "'2020-05-05 05:05:05'", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-15 08:30:00'"},
+			// IN / NOT IN with µs-boundary members (≤6 fractional digits —
+			// the envelope's edge; 7+ digits are OUTSIDE it, D0-5). Audit
+			// 2026-07-23 TEST-4.
+			{name: "in", pred: "v IN ('2026-01-15 08:30:00', '2026-02-01 00:00:00.000001')", in0: "'2026-01-15 08:30:00'", in1: "'2026-02-01 00:00:00.000001'", out0: "'2026-01-15 08:30:01'", out1: "'2026-02-01 00:00:00'"},
+			{name: "notin", pred: "v NOT IN ('2026-01-15 08:30:00', '2026-02-01 00:00:00')", in0: "'2026-01-15 08:30:01'", in1: "'2020-01-01 00:00:00'", out0: "'2026-01-15 08:30:00'", out1: "'2026-02-01 00:00:00'"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-16 00:00:00'"},
 		},
 	},
@@ -488,5 +504,104 @@ func runOracleCell(
 	joined := strings.Join(gotClient, "\n")
 	if !strings.Contains(joined, "INSERT") || !strings.Contains(joined, "DELETE") {
 		t.Errorf("client leg is missing INSERT/DELETE shapes — the workload did not exercise the truth table:\n%s", joined)
+	}
+}
+
+// TestPublicationScope_PushdownGranularityFallback is the D0-5 gate (audit
+// 2026-07-23): temporal literal-granularity mismatches — a time-bearing
+// literal against a DATE column, a >6-fractional-digit literal against a
+// microsecond timestamp — make the SERVER truncate/round the literal while
+// the client evaluator compares at full precision, so the two provably
+// disagree and the cell can never be an equivalence cell. For each shape it
+// asserts BOTH halves:
+//
+//   - the divergence is REAL on live PG (server verdict via SELECT under
+//     the raw predicate vs the shipped client evaluator on the decoded
+//     value-contract row) — the ground truth that mandates the exclusion,
+//     stable regardless of sluice's code; and
+//   - the classifier keeps the predicate OUT of the push-down envelope
+//     (the fix pin — RED on pre-fix HEAD, where these classified eligible
+//     and the pushed prqual silently evaluated the truncated literal).
+func TestPublicationScope_PushdownGranularityFallback(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	// Boundary rows: the DATE cell's midnight-vs-noon boundary, and the
+	// timestamp cell's µs-rounded twin of a 7-digit literal.
+	applyDDL(t, sourceDSN, `
+		CREATE TABLE orcg_date (id int PRIMARY KEY, v date);
+		CREATE TABLE orcg_ts   (id int PRIMARY KEY, v timestamp);
+		INSERT INTO orcg_date (id, v) VALUES (1, '2026-01-15');
+		INSERT INTO orcg_ts   (id, v) VALUES (1, '2026-01-15 08:30:00.123457');
+	`)
+
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("open schema reader: %v", err)
+	}
+	schema, err := sr.ReadSchema(context.Background())
+	migcore.CloseIf(sr)
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	resolver := pgEng.(ir.CollationResolverProvider).CollationResolver()
+
+	// clientRow values follow docs/value-types.md: FamilyTemporal decodes to
+	// a UTC time.Time (a date at midnight; a timestamp at µs precision —
+	// exactly what PG stores for the 7-digit literal's rounded twin).
+	cells := []struct {
+		name      string
+		table     string
+		pred      string
+		clientRow ir.Row
+	}{
+		{"date lt time-bearing", "orcg_date", "v < '2026-01-15 12:00:00'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"date ne time-bearing", "orcg_date", "v != '2026-01-15 12:00:00'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"date NOT(ge) time-bearing (3VL negation)", "orcg_date", "NOT (v >= '2026-01-15 12:00:00')", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"timestamp eq 7-fractional-digit", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 8, 30, 0, 123457000, time.UTC)}},
+	}
+	for _, cell := range cells {
+		cell := cell
+		t.Run(cell.name, func(t *testing.T) {
+			// Ground truth: server and client verdicts DISAGREE on the
+			// boundary row — the divergence the exclusion exists for.
+			var serverMatches int
+			if err := db.QueryRowContext(context.Background(),
+				fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, cell.table, cell.pred)).Scan(&serverMatches); err != nil {
+				t.Fatalf("server verdict for %q: %v", cell.pred, err)
+			}
+			wf, err := buildWhereCDCFilter(resolver, map[string]string{cell.table: cell.pred}, schema, false)
+			if err != nil {
+				t.Fatalf("compile %q: %v", cell.pred, err)
+			}
+			clientMatches := wf.predicateFor(cell.table).Eval(cell.clientRow)
+			if (serverMatches > 0) == clientMatches {
+				t.Fatalf("server (%d) and client (%v) AGREE for %q — this cell no longer proves the divergence; re-derive the granularity envelope before touching the classifier", serverMatches, clientMatches, cell.pred)
+			}
+
+			// The fix pin: the classifier must keep this predicate OUT.
+			var tbl *ir.Table
+			for _, tb := range schema.Tables {
+				if tb != nil && strings.EqualFold(tb.Name, cell.table) {
+					tbl = tb
+				}
+			}
+			if ok, reason := pgPushdownEligible(tbl, wf.predicateFor(cell.table)); ok {
+				t.Fatalf("classifier admitted %q despite the proven server/client divergence (server=%d client=%v) — the D0-5 granularity exclusion regressed", cell.pred, serverMatches, clientMatches)
+			} else if reason == "" {
+				t.Error("granularity exclusion must carry a fallback-log reason")
+			}
+		})
 	}
 }

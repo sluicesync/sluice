@@ -18,6 +18,7 @@ func TestPushdownTerms(t *testing.T) {
 		"name":    {Family: FamilyString, Faithful: true},
 		"active":  {Family: FamilyBool},
 		"deleted": {Family: FamilyBool},
+		"d":       {Family: FamilyTemporal},
 	}
 
 	tests := []struct {
@@ -59,6 +60,56 @@ func TestPushdownTerms(t *testing.T) {
 			predicate: `"Active" = FALSE AND ID < 3`,
 			want: []PushdownTerm{
 				{Column: "active"},
+				{Column: "id"},
+			},
+		},
+
+		// ---- Temporal literal-granularity flags (audit 2026-07-23 D0-5) ----
+		{
+			name:      "pure-date temporal literal carries no granularity flag",
+			predicate: "d = '2026-01-15'",
+			want:      []PushdownTerm{{Column: "d"}},
+		},
+		{
+			name:      "time-bearing literal (space form, no seconds) is flagged",
+			predicate: "d < '2026-01-15 08:30'",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+		},
+		{
+			name:      "time-bearing literal (T form) is flagged",
+			predicate: "d != '2026-01-15T08:30:00'",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+		},
+		{
+			name:      "midnight is still time-bearing (the flag keys on the TEXT, conservatively)",
+			predicate: "d = '2026-01-15 00:00:00'",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+		},
+		{
+			name:      "exactly 6 fractional digits is time-bearing but NOT sub-microsecond",
+			predicate: "d >= '2026-01-15 08:30:00.123456'",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+		},
+		{
+			name:      "7 fractional digits is sub-microsecond (PG rounds to µs, the client keeps ns)",
+			predicate: "d >= '2026-01-15 08:30:00.1234567'",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}},
+		},
+		{
+			name:      "IN list flags fold across members (one time-bearing member flags the term)",
+			predicate: "d IN ('2026-01-15', '2026-01-16 08:30:00.1234567')",
+			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}},
+		},
+		{
+			name:      "IN list of pure dates carries no granularity flag",
+			predicate: "d NOT IN ('2026-01-15', '2026-01-16')",
+			want:      []PushdownTerm{{Column: "d"}},
+		},
+		{
+			name:      "granularity flags survive NOT/AND composition",
+			predicate: "NOT (d >= '2026-01-15 12:00:00') AND id < 3",
+			want: []PushdownTerm{
+				{Column: "d", TemporalLiteralTimeBearing: true},
 				{Column: "id"},
 			},
 		},

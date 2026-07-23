@@ -84,12 +84,16 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 			{Name: "id", Type: ir.Integer{Width: 64}},
 			{Name: "flag", Type: ir.Boolean{}},
 			{Name: "tag", Type: ir.UUID{}},
+			{Name: "d", Type: ir.Date{}},
+			{Name: "ts", Type: ir.DateTime{}},
 		},
 	}
 	infos := map[string]rowpredicate.ColumnInfo{
 		"id":   {Family: rowpredicate.FamilyNumeric},
 		"flag": {Family: rowpredicate.FamilyBool},
 		"tag":  {Family: rowpredicate.FamilyString, Faithful: true},
+		"d":    {Family: rowpredicate.FamilyTemporal},
+		"ts":   {Family: rowpredicate.FamilyTemporal},
 	}
 	compile := func(pred string) *rowpredicate.Predicate {
 		p, err := rowpredicate.Compile("orders", pred, infos)
@@ -109,6 +113,37 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 	}
 	if ok, _ := pgPushdownEligible(tbl, compile("id < 100 AND tag = 'x'")); ok {
 		t.Error("one ineligible term (uuid) must poison the whole predicate — the classifier fails closed")
+	}
+
+	// ---- Temporal literal granularity (audit 2026-07-23 D0-5) ----
+	// A DATE column with a time-bearing literal, and any temporal column
+	// with a >6-fractional-digit literal, classify OUT: PG truncates/rounds
+	// the literal while the client compares at full precision, so pushing
+	// the predicate would make server and client provably disagree.
+	if ok, _ := pgPushdownEligible(tbl, compile("d = '2026-01-15'")); !ok {
+		t.Error("date column with a pure-date literal must stay eligible")
+	}
+	if ok, reason := pgPushdownEligible(tbl, compile("d < '2026-01-15 12:00:00'")); ok {
+		t.Error("date column with a time-bearing literal must be ineligible (PG truncates to the date)")
+	} else if !strings.Contains(reason, "d") || !strings.Contains(reason, "time-bearing") {
+		t.Errorf("granularity reason must name the column and the truncation; got %q", reason)
+	}
+	if ok, _ := pgPushdownEligible(tbl, compile("NOT (d >= '2026-01-15 12:00:00')")); ok {
+		t.Error("date granularity exclusion must survive NOT composition (the 3VL negation shape)")
+	}
+	if ok, _ := pgPushdownEligible(tbl, compile("d IN ('2026-01-15', '2026-01-16 08:30')")); ok {
+		t.Error("one time-bearing IN member must poison the date term")
+	}
+	if ok, _ := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.123456'")); !ok {
+		t.Error("timestamp column with a ≤6-fractional-digit literal must stay eligible")
+	}
+	if ok, reason := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.1234567'")); ok {
+		t.Error("timestamp column with a 7-fractional-digit literal must be ineligible (PG rounds to µs, the client keeps ns)")
+	} else if !strings.Contains(reason, "ts") || !strings.Contains(reason, "fractional") {
+		t.Errorf("sub-microsecond reason must name the column and the rounding; got %q", reason)
+	}
+	if ok, _ := pgPushdownEligible(tbl, compile("ts < '2026-01-15 12:00:00'")); !ok {
+		t.Error("timestamp column with a time-bearing (µs-representable) literal must stay eligible — only DATE truncates it")
 	}
 	if ok, _ := pgPushdownEligible(tbl, compile("tag IS NULL")); ok {
 		t.Error("IS NULL on an outside-envelope column type is still outside the envelope")

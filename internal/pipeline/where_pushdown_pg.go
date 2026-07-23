@@ -46,11 +46,19 @@ import (
 //     probably equivalent, but "probably" is what the oracle exists to
 //     replace; a family joins the envelope only with its oracle cells.
 //
-// One term-level exclusion rides on the predicate rather than the column:
-// a BOOLEAN compared to a 0/1 numeric literal (`flag = 1`) is legal in the
-// client grammar but not valid Postgres SQL (`boolean = integer` has no
-// operator), so pushing it would fail the publication DDL loudly at sync
-// start — classified out instead, it streams client-side like today.
+// Three term-level exclusions ride on the predicate rather than the column:
+//
+//   - a BOOLEAN compared to a 0/1 numeric literal (`flag = 1`) is legal in
+//     the client grammar but not valid Postgres SQL (`boolean = integer`
+//     has no operator), so pushing it would fail the publication DDL
+//     loudly at sync start — classified out instead, it streams
+//     client-side like today;
+//   - a DATE column compared to a TIME-BEARING literal — PG truncates the
+//     literal to the date inside the publication filter while the client
+//     compares the full instant (audit 2026-07-23 D0-5);
+//   - a temporal column compared to a literal with MORE than 6 fractional-
+//     second digits — PG rounds to its microsecond resolution while the
+//     client keeps nanoseconds (D0-5's sibling arm).
 func pgPushdownEligible(tbl *ir.Table, p *rowpredicate.Predicate) (eligible bool, reason string) {
 	if tbl == nil || p == nil {
 		return false, "no compiled predicate"
@@ -70,6 +78,22 @@ func pgPushdownEligible(tbl *ir.Table, p *rowpredicate.Predicate) (eligible bool
 		}
 		if term.BoolNumericLiteral {
 			return false, fmt.Sprintf("boolean column %q is compared to a 0/1 numeric literal, which is not valid Postgres SQL in a publication row filter (use TRUE/FALSE)", c.Name)
+		}
+		// Temporal literal-granularity exclusions (audit 2026-07-23 D0-5):
+		// Postgres resolves a finer-than-column literal by TRUNCATING (a
+		// time-bearing literal against a DATE column) or ROUNDING (>6
+		// fractional-second digits against a microsecond timestamp) while
+		// the client evaluator compares the literal at full precision — so
+		// the two provably disagree on the boundary and the term falls back
+		// to client-side-only evaluation. Safe under both D0-5 adjudications
+		// (the Compile-layer normalization question is deferred — audit Q1).
+		if term.TemporalLiteralTimeBearing {
+			if _, isDate := c.Type.(ir.Date); isDate {
+				return false, fmt.Sprintf("date column %q is compared to a time-bearing literal, which Postgres truncates to the date in a publication row filter while the client compares the full instant", c.Name)
+			}
+		}
+		if term.TemporalLiteralSubMicrosecond {
+			return false, fmt.Sprintf("column %q is compared to a literal with more than 6 fractional-second digits, which Postgres rounds to microseconds while the client compares at nanosecond precision", c.Name)
 		}
 		if ok, reason := pgPushdownEligibleColumn(c); !ok {
 			return false, reason
