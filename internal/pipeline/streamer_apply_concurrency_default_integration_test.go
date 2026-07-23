@@ -87,12 +87,19 @@ func TestStreamer_ApplyConcurrencyDefault_EngagesAndConvergesWithSerial(t *testi
 		logs := captureSlog(t)
 
 		streamer := &Streamer{
-			Source:           pgEng,
-			Target:           pgEng,
-			SourceDSN:        sourceDSN,
-			TargetDSN:        targetDSN,
-			StreamID:         streamID,
-			SlotName:         "slot_" + streamID,
+			Source:    pgEng,
+			Target:    pgEng,
+			SourceDSN: sourceDSN,
+			TargetDSN: targetDSN,
+			StreamID:  streamID,
+			SlotName:  "slot_" + streamID,
+			// Per-leg publication (the ADR-0175 remediation): the two legs
+			// run SEQUENTIALLY with disjoint table scopes, and leg 1's slot
+			// remains (inactive) after its ctx cancel — under the guard's
+			// existence semantics (2026-07-23) leg 2's narrowing SET TABLE
+			// on a SHARED publication is a refusal, by design. Isolating
+			// per leg models what the refusal tells a real operator to do.
+			PublicationName:  "pub_" + streamID,
 			Filter:           migcore.TableFilter{Include: []string{table}},
 			ApplyConcurrency: applyConcurrency,
 			// AutoTune + ApplyBatchSize>1 so the per-lane controllers (and the
