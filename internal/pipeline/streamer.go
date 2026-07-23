@@ -1203,6 +1203,15 @@ type Streamer struct {
 	// --apply-batch-size cap.
 	aimdResumeSize atomic.Int64
 
+	// applyProgressPollInterval overrides the committed-progress sentinel's
+	// poll cadence ([runWithRetry]'s mid-attempt position reads — Bug 202).
+	// Zero (every production construction) means the
+	// [defaultApplyProgressPollInterval] production default; unit tests set a
+	// few-millisecond value so a short simulated healthy stretch is reliably
+	// observed. Unexported: the cadence is an implementation detail of the
+	// retry budget's progress ledger, not an operator surface.
+	applyProgressPollInterval time.Duration
+
 	// leaseMgr is the ADR-0054 Shape A Phase 2 live-coordination
 	// lease manager. Constructed by [engageShardCoordination] when
 	// [CoordinateLiveDDL] is true, [InjectShardColumn] is engaged,
