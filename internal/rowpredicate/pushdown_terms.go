@@ -4,6 +4,7 @@
 package rowpredicate
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -33,21 +34,39 @@ type PushdownTerm struct {
 	// literal carries a time-of-day component (anything beyond a bare
 	// `YYYY-MM-DD`). Postgres coerces such a literal to a DATE column by
 	// TRUNCATING the time of day (`d < '2024-01-01 12:00'` is stored as
-	// `d < '2024-01-01'::date`), while the client evaluator compares the
-	// full instant — a provable client/server disagreement (audit
-	// 2026-07-23 D0-5) — so a push-down site must classify a DATE-column
-	// term with a time-bearing literal out of the envelope.
+	// `d < '2024-01-01'::date`), so an UN-normalized client compare of the
+	// full instant provably disagrees with the server (audit 2026-07-23
+	// D0-5). Compile normalizes temporal literals to the source engine's
+	// own semantics (Q1), which rewrites exactly these literals — so a
+	// predicate compiled through a [ir.TemporalLiteralCastToColumn]
+	// resolver can never carry this flag on a DATE column. It remains the
+	// push-down classifier's fail-closed BELT: a DATE-column term still
+	// carrying it was compiled WITHOUT the engine lens and must classify
+	// out of the envelope.
 	TemporalLiteralTimeBearing bool
 
 	// TemporalLiteralSubMicrosecond marks a temporal-family comparison
-	// whose literal carries MORE than 6 fractional-second digits. Postgres
-	// ROUNDS such a literal to its microsecond timestamp resolution while
-	// the client evaluator keeps Go's nanosecond precision, so the two
-	// provably disagree on the boundary (audit 2026-07-23 D0-5); a
-	// push-down site must classify a term carrying one out of the
-	// envelope. Implies TemporalLiteralTimeBearing (a fractional second
-	// requires a time component).
+	// whose literal carries MORE than 6 fractional-second digits — finer
+	// than every supported engine's µs resolution (Postgres rounds
+	// half-even, MySQL rounds half-up, MariaDB truncates; ground truth in
+	// [ir.TemporalLiteralSemantics]) while an un-normalized client compare
+	// keeps Go's nanosecond precision (audit 2026-07-23 D0-5). Compile's
+	// Q1 normalization rewrites such literals to the engine's µs value, so
+	// like TemporalLiteralTimeBearing this is the classifier's fail-closed
+	// belt for a compile that missed the engine lens. Implies
+	// TemporalLiteralTimeBearing (a fractional second requires a time
+	// component).
 	TemporalLiteralSubMicrosecond bool
+
+	// Unrecognized names the concrete AST node type of a leaf the walker
+	// did not recognize (audit 2026-07-23 ARCH-1). Empty for every node the
+	// grammar can produce today. A future grammar node (BETWEEN, LIKE, a
+	// function call) that misses a case in [collectPushdownTerms] surfaces
+	// here instead of silently contributing ZERO terms — which would let an
+	// unproven construct push down — and every push-down classifier must
+	// treat a non-empty Unrecognized as ineligible: the walker fails CLOSED
+	// (the CLAUDE.md "no skip-branch without proof" class).
+	Unrecognized string
 }
 
 // PushdownTerms returns the predicate's leaf comparisons for push-down
@@ -100,11 +119,19 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 		*terms = append(*terms, term)
 	case isNullNode:
 		*terms = append(*terms, PushdownTerm{Column: t.column})
+	default:
+		// ARCH-1 (audit 2026-07-23): a node type this walk does not know
+		// contributes an Unrecognized term rather than NOTHING — silence
+		// here would let a future grammar construct push down unproven.
+		// See PushdownTerm.Unrecognized.
+		*terms = append(*terms, PushdownTerm{Unrecognized: fmt.Sprintf("%T", n)})
 	}
 }
 
 // temporalLiteralGranularity classifies a temporal literal's TEXT
-// granularity for push-down eligibility (audit 2026-07-23 D0-5). A literal
+// granularity — consumed by both Compile's engine-semantics normalization
+// (which rewrites exactly the finer-than-engine texts) and the push-down
+// term flags above (audit 2026-07-23 D0-5). A literal
 // that parses as a bare date (`YYYY-MM-DD`) carries neither flag; anything
 // else the temporal grammar accepted is time-bearing, and a fractional-
 // second part longer than 6 digits is additionally sub-microsecond. The

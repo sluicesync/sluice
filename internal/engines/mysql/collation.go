@@ -48,13 +48,20 @@ import (
 
 // mysqlCollationResolver is MySQL's [ir.CollationResolver]: it maps a MySQL
 // collation name to the client-side string-comparison policy that reproduces
-// the source's `=` faithfully, or refuses when it cannot.
-type mysqlCollationResolver struct{}
+// the source's `=` faithfully, or refuses when it cannot. It carries the
+// engine's flavor for the TEMPORAL axis only — the string lens is
+// flavor-independent, but MariaDB truncates a finer-than-µs temporal literal
+// where MySQL rounds it (see ResolveTemporalLiteralSemantics).
+type mysqlCollationResolver struct {
+	flavor Flavor
+}
 
 // CollationResolver implements [ir.CollationResolverProvider]: MySQL (and its
-// PlanetScale/Vitess/MariaDB flavors) share one collation lens, so the resolver
-// is flavor-independent.
-func (Engine) CollationResolver() ir.CollationResolver { return mysqlCollationResolver{} }
+// PlanetScale/Vitess/MariaDB flavors) share one collation lens; the flavor is
+// threaded for the temporal-literal axis, where MariaDB diverges.
+func (e Engine) CollationResolver() ir.CollationResolver {
+	return mysqlCollationResolver{flavor: e.Flavor}
+}
 
 // ResolveStringEquality implements [ir.CollationResolver] for the MySQL family.
 // determinism is ignored (MySQL fidelity is driven by collation name + charset,
@@ -100,6 +107,28 @@ func (mysqlCollationResolver) ResolveStringEquality(collation string, _ ir.Colla
 		}
 	}
 	return ir.StringEquality{}
+}
+
+// ResolveTemporalLiteralSemantics implements [ir.TemporalLiteralResolver] for
+// the MySQL family: a DATE column compared against a time-bearing literal is
+// PROMOTED to datetime and compared as the full instant (observed on MySQL
+// 8.0.46 AND MariaDB 11.8.8, 2026-07-23: `d = '2026-01-15 08:30:00'` is
+// FALSE, `d < '2026-01-15 12:00:00'` is TRUE — the opposite of Postgres,
+// which truncates the literal to the date). Fractional seconds beyond the
+// 6-digit fsp ceiling diverge BY FLAVOR: MySQL 8.0.46 rounds HALF-UP
+// ('.1234565' → .123457, '.9999995' carries +1s) while MariaDB 11.8.8
+// TRUNCATES ('.1234565' → .123456, '.9999995' → .999999, no carry) — the
+// same server-behavior split the SHOW BINLOG STATUS / PAD_ATTRIBUTE
+// catalogs carry, resolved per flavor here. PlanetScale/Vitess keep the
+// vanilla MySQL rule (mysqld backs the tablets); the VStream server-side
+// filter's OWN coercion of a finer-than-µs literal (vtgate evalengine) is a
+// separate, unverified surface — noted in the ADR-0174 residuals, not
+// resolved here.
+func (r mysqlCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLiteralSemantics {
+	if r.flavor == FlavorMariaDB {
+		return ir.TemporalLiteralPromoteTruncate
+	}
+	return ir.TemporalLiteralPromoteRoundHalfUp
 }
 
 // collationByteExactMySQL reports whether a MySQL collation's `=` is a raw

@@ -154,14 +154,23 @@ var oracleMatrix = []oracleFamily{
 			{name: "eq", pred: "v = '2026-01-15'", in0: "'2026-01-15'", in1: "'2026-01-15'", out0: "'2026-01-14'", out1: "'2026-01-16'"},
 			// !=, NOT IN, and the 3VL negation — the shapes where a
 			// server-stricter divergence would surface (audit 2026-07-23
-			// TEST-4). Pure-date literals only: time-bearing literals are
-			// OUTSIDE the envelope (D0-5 — see the granularity fallback gate).
+			// TEST-4).
 			{name: "ne", pred: "v != '2026-01-15'", in0: "'2026-01-16'", in1: "'1999-12-31'", out0: "'2026-01-15'", out1: "'2026-01-15'"},
 			{name: "ge", pred: "v >= '2026-01-15'", in0: "'2026-01-15'", in1: "'2027-03-01'", out0: "'2026-01-14'", out1: "'1999-12-31'"},
 			{name: "in", pred: "v IN ('2026-01-15', '2026-02-01')", in0: "'2026-01-15'", in1: "'2026-02-01'", out0: "'2026-01-16'", out1: "'2026-02-02'"},
 			{name: "notin", pred: "v NOT IN ('2026-01-15', '2026-02-01')", in0: "'2026-01-16'", in1: "'2026-02-02'", out0: "'2026-01-15'", out1: "'2026-02-01'"},
 			{name: "not_or_3vl", pred: "NOT (v = '2026-01-15' OR v > '2026-06-01')", in0: "'2026-01-16'", in1: "'2026-06-01'", out0: "'2026-01-15'", out1: "'2026-06-02'"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "'2026-01-15'", out1: "'2026-01-16'"},
+			// TIME-BEARING literals on a DATE column (audit 2026-07-23 D0-5,
+			// Q1 re-admission): PG casts the literal to date — time-of-day
+			// TRUNCATED — inside both the pushed prqual and the snapshot
+			// SELECT, and Compile normalizes the client literal identically,
+			// so these are equivalence cells now. The in/out values are the
+			// TRUNCATED semantics ('v < ... 12:00:00' ≡ 'v < 2026-01-15').
+			{name: "eq_time_bearing", pred: "v = '2026-01-15 08:30:00'", in0: "'2026-01-15'", in1: "'2026-01-15'", out0: "'2026-01-14'", out1: "'2026-01-16'"},
+			{name: "lt_time_bearing", pred: "v < '2026-01-15 12:00:00'", in0: "'2026-01-14'", in1: "'1999-12-31'", out0: "'2026-01-15'", out1: "'2026-01-16'"},
+			{name: "ne_time_bearing", pred: "v != '2026-01-15 12:00:00'", in0: "'2026-01-16'", in1: "'1999-12-31'", out0: "'2026-01-15'", out1: "'2026-01-15'"},
+			{name: "in_time_bearing", pred: "v IN ('2026-01-15 08:30', '2026-02-01')", in0: "'2026-01-15'", in1: "'2026-02-01'", out0: "'2026-01-16'", out1: "'2026-02-02'"},
 		},
 	},
 	{
@@ -170,12 +179,20 @@ var oracleMatrix = []oracleFamily{
 			{name: "eq", pred: "v = '2026-01-15 08:30:00'", in0: "'2026-01-15 08:30:00'", in1: "'2026-01-15 08:30:00'", out0: "'2026-01-15 08:30:01'", out1: "'2026-01-15 08:29:59.999999'"},
 			{name: "lt", pred: "v < '2026-01-15 08:30:00'", in0: "'2026-01-15 08:29:59.999999'", in1: "'1999-01-01 00:00:00'", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-15 08:30:00.000001'"},
 			{name: "ne", pred: "v != '2026-01-15 08:30:00'", in0: "'2026-01-15 08:30:00.000001'", in1: "'2020-05-05 05:05:05'", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-15 08:30:00'"},
-			// IN / NOT IN with µs-boundary members (≤6 fractional digits —
-			// the envelope's edge; 7+ digits are OUTSIDE it, D0-5). Audit
-			// 2026-07-23 TEST-4.
+			// IN / NOT IN with µs-boundary members. Audit 2026-07-23 TEST-4.
 			{name: "in", pred: "v IN ('2026-01-15 08:30:00', '2026-02-01 00:00:00.000001')", in0: "'2026-01-15 08:30:00'", in1: "'2026-02-01 00:00:00.000001'", out0: "'2026-01-15 08:30:01'", out1: "'2026-02-01 00:00:00'"},
 			{name: "notin", pred: "v NOT IN ('2026-01-15 08:30:00', '2026-02-01 00:00:00')", in0: "'2026-01-15 08:30:01'", in1: "'2020-01-01 00:00:00'", out0: "'2026-01-15 08:30:00'", out1: "'2026-02-01 00:00:00'"},
 			{name: "isnull", pred: "v IS NULL", in0: "NULL", in1: "NULL", out0: "'2026-01-15 08:30:00'", out1: "'2026-01-16 00:00:00'"},
+			// SUB-MICROSECOND literals (audit 2026-07-23 D0-5, Q1
+			// re-admission): PG rounds >6 fractional digits HALF-EVEN to µs
+			// in both server-side legs, and Compile normalizes the client
+			// literal with the same rounding — equivalence cells, with the
+			// .1234565 half-boundary pinning the rounding MODE end to end
+			// (half-up would put in0/out0 on the wrong sides) and the
+			// .9999995 cell pinning the carry into seconds.
+			{name: "eq_7digit", pred: "v = '2026-01-15 08:30:00.1234567'", in0: "'2026-01-15 08:30:00.123457'", in1: "'2026-01-15 08:30:00.123457'", out0: "'2026-01-15 08:30:00.123456'", out1: "'2026-01-15 08:30:00.123458'"},
+			{name: "eq_halfeven", pred: "v = '2026-01-15 08:30:00.1234565'", in0: "'2026-01-15 08:30:00.123456'", in1: "'2026-01-15 08:30:00.123456'", out0: "'2026-01-15 08:30:00.123457'", out1: "'2026-01-15 08:30:00.123455'"},
+			{name: "eq_7digit_carry", pred: "v = '2026-01-15 08:30:00.9999995'", in0: "'2026-01-15 08:30:01'", in1: "'2026-01-15 08:30:01'", out0: "'2026-01-15 08:30:00.999999'", out1: "'2026-01-15 08:30:01.000001'"},
 		},
 	},
 }
@@ -514,22 +531,28 @@ func runOracleCell(
 	}
 }
 
-// TestPublicationScope_PushdownGranularityFallback is the D0-5 gate (audit
-// 2026-07-23): temporal literal-granularity mismatches — a time-bearing
-// literal against a DATE column, a >6-fractional-digit literal against a
-// microsecond timestamp — make the SERVER truncate/round the literal while
-// the client evaluator compares at full precision, so the two provably
-// disagree and the cell can never be an equivalence cell. For each shape it
-// asserts BOTH halves:
+// TestPublicationScope_TemporalLiteralNormalization is the D0-5 / Q1 gate
+// (audit 2026-07-23, owner call: filtered replicas follow the SOURCE
+// ENGINE's comparison semantics): for the temporal literal-granularity
+// boundary shapes — a time-bearing literal against a DATE column, a
+// >6-fractional-digit literal against a microsecond timestamp — the server
+// truncates/rounds the literal, and Compile now normalizes the client
+// literal to the SAME coercion. For each shape it asserts BOTH halves:
 //
-//   - the divergence is REAL on live PG (server verdict via SELECT under
-//     the raw predicate vs the shipped client evaluator on the decoded
-//     value-contract row) — the ground truth that mandates the exclusion,
-//     stable regardless of sluice's code; and
-//   - the classifier keeps the predicate OUT of the push-down envelope
-//     (the fix pin — RED on pre-fix HEAD, where these classified eligible
-//     and the pushed prqual silently evaluated the truncated literal).
-func TestPublicationScope_PushdownGranularityFallback(t *testing.T) {
+//   - server and client verdicts AGREE on the boundary row, live (server
+//     verdict via SELECT under the raw predicate vs the shipped client
+//     evaluator on the decoded value-contract row). RED on the pre-Q1
+//     evaluator, whose full-precision compare provably diverged here —
+//     the predecessor of this test pinned that divergence live; and
+//   - the classifier ADMITS the normalized predicate into the push-down
+//     envelope (the M0-3 exclusions moved back inside it; the term flags
+//     remain only as the belt for a compile without the engine lens,
+//     pinned at the unit level).
+//
+// The full two-leg stream equivalence for these shapes rides the oracle's
+// granularity cells (date eq/lt/ne/in_time_bearing; timestamp eq_7digit,
+// eq_halfeven — the rounding-MODE pin — and eq_7digit_carry).
+func TestPublicationScope_TemporalLiteralNormalization(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -539,12 +562,12 @@ func TestPublicationScope_PushdownGranularityFallback(t *testing.T) {
 	}
 
 	// Boundary rows: the DATE cell's midnight-vs-noon boundary, and the
-	// timestamp cell's µs-rounded twin of a 7-digit literal.
+	// timestamp cell's µs twins of the 7-digit and half-even literals.
 	applyDDL(t, sourceDSN, `
 		CREATE TABLE orcg_date (id int PRIMARY KEY, v date);
 		CREATE TABLE orcg_ts   (id int PRIMARY KEY, v timestamp);
 		INSERT INTO orcg_date (id, v) VALUES (1, '2026-01-15');
-		INSERT INTO orcg_ts   (id, v) VALUES (1, '2026-01-15 08:30:00.123457');
+		INSERT INTO orcg_ts   (id, v) VALUES (1, '2026-01-15 08:30:00.123457'), (2, '2026-01-15 08:30:00.123456');
 	`)
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -565,27 +588,32 @@ func TestPublicationScope_PushdownGranularityFallback(t *testing.T) {
 	resolver := pgEng.(ir.CollationResolverProvider).CollationResolver()
 
 	// clientRow values follow docs/value-types.md: FamilyTemporal decodes to
-	// a UTC time.Time (a date at midnight; a timestamp at µs precision —
-	// exactly what PG stores for the 7-digit literal's rounded twin).
+	// a UTC time.Time (a date at midnight; a timestamp at µs precision).
+	// rowID selects which stored row the server verdict runs against, so the
+	// client row always mirrors the server row exactly.
 	cells := []struct {
 		name      string
 		table     string
 		pred      string
+		rowID     int
 		clientRow ir.Row
 	}{
-		{"date lt time-bearing", "orcg_date", "v < '2026-01-15 12:00:00'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
-		{"date ne time-bearing", "orcg_date", "v != '2026-01-15 12:00:00'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
-		{"date NOT(ge) time-bearing (3VL negation)", "orcg_date", "NOT (v >= '2026-01-15 12:00:00')", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
-		{"timestamp eq 7-fractional-digit", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 8, 30, 0, 123457000, time.UTC)}},
+		{"date lt time-bearing", "orcg_date", "v < '2026-01-15 12:00:00'", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"date ne time-bearing", "orcg_date", "v != '2026-01-15 12:00:00'", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"date eq time-bearing", "orcg_date", "v = '2026-01-15 08:30:00'", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"date NOT(ge) time-bearing (3VL negation)", "orcg_date", "NOT (v >= '2026-01-15 12:00:00')", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)}},
+		{"timestamp eq 7-fractional-digit (rounded twin)", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", 1, ir.Row{"id": int64(1), "v": time.Date(2026, 1, 15, 8, 30, 0, 123457000, time.UTC)}},
+		{"timestamp eq 7-fractional-digit (floor twin)", "orcg_ts", "v = '2026-01-15 08:30:00.1234567'", 2, ir.Row{"id": int64(2), "v": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}},
+		{"timestamp eq half-even boundary", "orcg_ts", "v = '2026-01-15 08:30:00.1234565'", 2, ir.Row{"id": int64(2), "v": time.Date(2026, 1, 15, 8, 30, 0, 123456000, time.UTC)}},
 	}
 	for _, cell := range cells {
 		cell := cell
 		t.Run(cell.name, func(t *testing.T) {
-			// Ground truth: server and client verdicts DISAGREE on the
-			// boundary row — the divergence the exclusion exists for.
+			// Ground truth: server and client verdicts AGREE on the boundary
+			// row — the Q1 contract, RED on the pre-normalization evaluator.
 			var serverMatches int
 			if err := db.QueryRowContext(context.Background(),
-				fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, cell.table, cell.pred)).Scan(&serverMatches); err != nil {
+				fmt.Sprintf(`SELECT count(*) FROM %s WHERE id = %d AND (%s)`, cell.table, cell.rowID, cell.pred)).Scan(&serverMatches); err != nil {
 				t.Fatalf("server verdict for %q: %v", cell.pred, err)
 			}
 			wf, err := buildWhereCDCFilter(resolver, map[string]string{cell.table: cell.pred}, schema, false)
@@ -593,21 +621,21 @@ func TestPublicationScope_PushdownGranularityFallback(t *testing.T) {
 				t.Fatalf("compile %q: %v", cell.pred, err)
 			}
 			clientMatches := wf.predicateFor(cell.table).Eval(cell.clientRow)
-			if (serverMatches > 0) == clientMatches {
-				t.Fatalf("server (%d) and client (%v) AGREE for %q — this cell no longer proves the divergence; re-derive the granularity envelope before touching the classifier", serverMatches, clientMatches, cell.pred)
+			if (serverMatches > 0) != clientMatches {
+				t.Fatalf("server (%d) and client (%v) DISAGREE for %q on row %d — Compile's engine-semantics normalization does not reproduce PG's literal coercion (audit 2026-07-23 D0-5 / Q1)", serverMatches, clientMatches, cell.pred, cell.rowID)
 			}
 
-			// The fix pin: the classifier must keep this predicate OUT.
+			// Q1 re-admission: the normalized predicate is INSIDE the
+			// push-down envelope (the two-leg stream equivalence rides the
+			// oracle's granularity cells).
 			var tbl *ir.Table
 			for _, tb := range schema.Tables {
 				if tb != nil && strings.EqualFold(tb.Name, cell.table) {
 					tbl = tb
 				}
 			}
-			if ok, reason := pgPushdownEligible(tbl, wf.predicateFor(cell.table)); ok {
-				t.Fatalf("classifier admitted %q despite the proven server/client divergence (server=%d client=%v) — the D0-5 granularity exclusion regressed", cell.pred, serverMatches, clientMatches)
-			} else if reason == "" {
-				t.Error("granularity exclusion must carry a fallback-log reason")
+			if ok, reason := pgPushdownEligible(tbl, wf.predicateFor(cell.table)); !ok {
+				t.Fatalf("classifier refused the normalized predicate %q (%s) — the Q1 re-admission regressed", cell.pred, reason)
 			}
 		})
 	}

@@ -6,6 +6,8 @@ package rowpredicate
 import (
 	"reflect"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestPushdownTerms pins the flattened leaf-comparison surface the
@@ -129,5 +131,74 @@ func TestPushdownTerms(t *testing.T) {
 	var nilPred *Predicate
 	if got := nilPred.PushdownTerms(); got != nil {
 		t.Errorf("nil predicate PushdownTerms() = %v, want nil", got)
+	}
+}
+
+// TestPushdownTerms_NormalizedLiteralCarriesNoFlags pins the Q1 interlock
+// (audit 2026-07-23 D0-5): a temporal literal compiled through an engine
+// temporal-literal lens is NORMALIZED to the engine's granularity, so the
+// term flags — computed from the (rewritten) literal text — no longer fire
+// and the push-down classifier admits the term. The flags stay reachable
+// only for a ClientExact compile (the classifier's fail-closed belt), which
+// the granularity cases in TestPushdownTerms pin.
+func TestPushdownTerms_NormalizedLiteralCarriesNoFlags(t *testing.T) {
+	pgLens := map[string]ColumnInfo{
+		"d":  {Family: FamilyTemporal, TemporalSemantics: ir.TemporalLiteralCastToColumn, TemporalDateOnly: true},
+		"ts": {Family: FamilyTemporal, TemporalSemantics: ir.TemporalLiteralCastToColumn},
+	}
+	for _, pred := range []string{
+		"d < '2026-01-15 08:30'",                          // time-bearing → truncated to the date
+		"d = '2026-01-15 00:00:00'",                       // midnight is still rewritten (text-keyed)
+		"d IN ('2026-01-15', '2026-01-16 08:30:00')",      // per-member truncation
+		"ts >= '2026-01-15 08:30:00.1234567'",             // 7 digits → rounded to µs
+		"ts IN ('2026-01-15 08:30:00.1234565')",           // half-even boundary member
+		"NOT (d >= '2026-01-15 12:00:00') AND ts IS NULL", // composition
+	} {
+		t.Run(pred, func(t *testing.T) {
+			p, err := Compile("t", pred, pgLens)
+			if err != nil {
+				t.Fatalf("Compile(%q): %v", pred, err)
+			}
+			for _, term := range p.PushdownTerms() {
+				if term.Column == "d" && term.TemporalLiteralTimeBearing {
+					t.Errorf("term %+v still time-bearing after CastToColumn normalization", term)
+				}
+				if term.TemporalLiteralSubMicrosecond {
+					t.Errorf("term %+v still sub-microsecond after normalization", term)
+				}
+				if term.Unrecognized != "" {
+					t.Errorf("term %+v unexpectedly unrecognized", term)
+				}
+			}
+		})
+	}
+}
+
+// fakeGrammarNode is a synthetic AST node the term walker does not know —
+// the ARCH-1 pin's stand-in for a future grammar construct (BETWEEN, LIKE, a
+// function call) whose collectPushdownTerms case was forgotten.
+type fakeGrammarNode struct{}
+
+func (fakeGrammarNode) eval(ir.Row) truth       { return truthUnknown }
+func (fakeGrammarNode) columns(map[string]bool) {}
+
+// TestPushdownTerms_UnrecognizedNodeFailsClosed pins the ARCH-1 default arm
+// (audit 2026-07-23): an AST node type collectPushdownTerms does not
+// recognize emits an Unrecognized term naming the type — never ZERO terms,
+// which would let an unproven construct slip into a push-down envelope. The
+// classifier-side rejection is pinned by the pipeline's
+// TestPGPushdownEligibleTerms_FailClosed.
+func TestPushdownTerms_UnrecognizedNodeFailsClosed(t *testing.T) {
+	p := &Predicate{root: andNode{kids: []node{
+		cmpNode{column: "id", fam: FamilyNumeric, lit: literal{kind: litNumber}},
+		fakeGrammarNode{},
+	}}}
+	got := p.PushdownTerms()
+	want := []PushdownTerm{
+		{Column: "id"},
+		{Unrecognized: "rowpredicate.fakeGrammarNode"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PushdownTerms() = %+v, want %+v", got, want)
 	}
 }

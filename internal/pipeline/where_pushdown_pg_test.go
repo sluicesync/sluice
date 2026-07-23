@@ -41,6 +41,12 @@ func TestPGPushdownEligible_EnvelopePin(t *testing.T) {
 		{"timestamp WITH tz (fail closed; Compile refuses anyway)", ir.Timestamp{WithTimeZone: true}, false},
 		{"text POSIX collation (byte-identical to C but not oracle-proven)", ir.Text{Collation: "POSIX"}, false},
 		{"text named deterministic collation", ir.Text{Collation: "en_US.utf8"}, false},
+		// ARCH-9 belt (audit 2026-07-23): a catalog-marked NON-deterministic
+		// collation classifies out regardless of name — Compile's resolver
+		// refusal already prevents such a predicate, but the envelope must
+		// not rest single-layered on that gate.
+		{"text non-deterministic determinism, no name (belt)", ir.Text{Determinism: ir.CollationNonDeterministic}, false},
+		{"varchar non-deterministic named collation (belt)", ir.Varchar{Length: 32, Collation: "case_insensitive", Determinism: ir.CollationNonDeterministic}, false},
 		{"char/bpchar (PAD SPACE equality)", ir.Char{Length: 4}, false},
 		{"enum", ir.Enum{Values: []string{"a", "b"}}, false},
 		{"uuid", ir.UUID{}, false},
@@ -115,30 +121,31 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 		t.Error("one ineligible term (uuid) must poison the whole predicate — the classifier fails closed")
 	}
 
-	// ---- Temporal literal granularity (audit 2026-07-23 D0-5) ----
-	// A DATE column with a time-bearing literal, and any temporal column
-	// with a >6-fractional-digit literal, classify OUT: PG truncates/rounds
-	// the literal while the client compares at full precision, so pushing
-	// the predicate would make server and client provably disagree.
+	// ---- Temporal literal granularity (audit 2026-07-23 D0-5 / Q1) ----
+	// The infos above carry NO engine temporal-literal lens (the ClientExact
+	// zero value), so Compile does not normalize — a finer-than-column
+	// literal keeps its full precision and the classifier's fail-closed
+	// BELT must keep the term out of the envelope (unnormalized, server and
+	// client provably disagree on the boundary).
 	if ok, _ := pgPushdownEligible(tbl, compile("d = '2026-01-15'")); !ok {
 		t.Error("date column with a pure-date literal must stay eligible")
 	}
 	if ok, reason := pgPushdownEligible(tbl, compile("d < '2026-01-15 12:00:00'")); ok {
-		t.Error("date column with a time-bearing literal must be ineligible (PG truncates to the date)")
+		t.Error("un-normalized time-bearing literal on a date column must be ineligible (the belt)")
 	} else if !strings.Contains(reason, "d") || !strings.Contains(reason, "time-bearing") {
 		t.Errorf("granularity reason must name the column and the truncation; got %q", reason)
 	}
 	if ok, _ := pgPushdownEligible(tbl, compile("NOT (d >= '2026-01-15 12:00:00')")); ok {
-		t.Error("date granularity exclusion must survive NOT composition (the 3VL negation shape)")
+		t.Error("date granularity belt must survive NOT composition (the 3VL negation shape)")
 	}
 	if ok, _ := pgPushdownEligible(tbl, compile("d IN ('2026-01-15', '2026-01-16 08:30')")); ok {
-		t.Error("one time-bearing IN member must poison the date term")
+		t.Error("one un-normalized time-bearing IN member must poison the date term")
 	}
 	if ok, _ := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.123456'")); !ok {
 		t.Error("timestamp column with a ≤6-fractional-digit literal must stay eligible")
 	}
 	if ok, reason := pgPushdownEligible(tbl, compile("ts = '2026-01-15 08:30:00.1234567'")); ok {
-		t.Error("timestamp column with a 7-fractional-digit literal must be ineligible (PG rounds to µs, the client keeps ns)")
+		t.Error("un-normalized 7-fractional-digit literal must be ineligible (the belt)")
 	} else if !strings.Contains(reason, "ts") || !strings.Contains(reason, "fractional") {
 		t.Errorf("sub-microsecond reason must name the column and the rounding; got %q", reason)
 	}
@@ -153,5 +160,56 @@ func TestPGPushdownEligible_Predicate(t *testing.T) {
 	}
 	if ok, _ := pgPushdownEligible(nil, compile("id = 1")); ok {
 		t.Error("nil table must classify ineligible (fail closed)")
+	}
+
+	// ---- The same shapes compiled THROUGH the engine lens are ADMITTED ----
+	// (audit 2026-07-23 D0-5 / Q1 — server semantics): Compile normalizes
+	// each literal to PG's cast-to-column coercion (truncate to the date;
+	// round half-even to µs), so the client evaluator and the pushed filter
+	// agree by construction — proven end to end by the oracle's granularity
+	// cells (TestPublicationScope_PushdownOracle date/timestamp families).
+	pgLens := map[string]rowpredicate.ColumnInfo{
+		"id": {Family: rowpredicate.FamilyNumeric},
+		"d":  {Family: rowpredicate.FamilyTemporal, TemporalSemantics: ir.TemporalLiteralCastToColumn, TemporalDateOnly: true},
+		"ts": {Family: rowpredicate.FamilyTemporal, TemporalSemantics: ir.TemporalLiteralCastToColumn},
+	}
+	compileLens := func(pred string) *rowpredicate.Predicate {
+		p, err := rowpredicate.Compile("orders", pred, pgLens)
+		if err != nil {
+			t.Fatalf("Compile(%q) with the PG lens: %v", pred, err)
+		}
+		return p
+	}
+	for _, pred := range []string{
+		"d < '2026-01-15 12:00:00'",
+		"NOT (d >= '2026-01-15 12:00:00')",
+		"d IN ('2026-01-15', '2026-01-16 08:30')",
+		"ts = '2026-01-15 08:30:00.1234567'",
+		"ts >= '2026-01-15 08:30:00.1234565'",
+	} {
+		if ok, reason := pgPushdownEligible(tbl, compileLens(pred)); !ok {
+			t.Errorf("normalized temporal predicate %q must be eligible (Q1 re-admission); refused: %s", pred, reason)
+		}
+	}
+}
+
+// TestPGPushdownEligibleTerms_FailClosed pins the classifier arm of ARCH-1
+// (audit 2026-07-23): a term the walker marked Unrecognized — the stand-in
+// for a future grammar node whose collectPushdownTerms case was forgotten —
+// classifies the predicate OUT with a reason naming the construct. The
+// walker-side emission is pinned by rowpredicate's
+// TestPushdownTerms_UnrecognizedNodeFailsClosed; the AST is private there,
+// which is why this arm takes the flattened terms directly.
+func TestPGPushdownEligibleTerms_FailClosed(t *testing.T) {
+	tbl := &ir.Table{Name: "orders", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	ok, reason := pgPushdownEligibleTerms(tbl, []rowpredicate.PushdownTerm{
+		{Column: "id"},
+		{Unrecognized: "rowpredicate.betweenNode"},
+	})
+	if ok {
+		t.Fatal("an Unrecognized term must classify the predicate out of the envelope")
+	}
+	if !strings.Contains(reason, "rowpredicate.betweenNode") {
+		t.Errorf("reason must name the unrecognized construct; got %q", reason)
 	}
 }

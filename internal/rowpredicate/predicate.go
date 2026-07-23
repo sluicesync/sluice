@@ -45,6 +45,14 @@
 //   - A timezone-aware temporal comparison (the row value is a UTC instant
 //     but the source would interpret the literal in its session timezone).
 //
+// One gate NORMALIZES instead of refusing: a temporal literal finer-grained
+// than the column (a time-of-day on a DATE column; >6 fractional-second
+// digits) is rewritten at compile time to the SOURCE engine's own coercion
+// of it ([ir.TemporalLiteralSemantics], supplied by the engine's resolver),
+// so the client evaluator classifies exactly as the engine's snapshot
+// SELECT / pushed stream filter does — the "filtered replicas follow the
+// source engine's comparison semantics" contract (audit 2026-07-23 D0-5).
+//
 // Evaluation uses SQL three-valued logic (TRUE / FALSE / UNKNOWN). A row
 // is "in scope" only when the predicate evaluates to definitely TRUE;
 // UNKNOWN (a NULL-involving comparison) is treated as NOT matching, which
@@ -227,6 +235,24 @@ type ColumnInfo struct {
 	// source's own `=` does (audit F0-1/F0-2). False on NO-PAD collations and
 	// on byte-exact (Postgres) sources. Threaded from [ir.StringEquality.PadSpace].
 	PadSpace bool
+
+	// TemporalSemantics is meaningful only for [FamilyTemporal]: the SOURCE
+	// engine's coercion rule for a temporal literal FINER-grained than the
+	// column (a time-bearing literal on a DATE column; more fractional-second
+	// digits than the engine's µs resolution), resolved from the engine's
+	// [ir.TemporalLiteralResolver] by [ColumnInfosFromIR]. Compile normalizes
+	// each temporal literal under this rule so the client evaluator reproduces
+	// the source's own comparison — the "filtered replicas follow the source
+	// engine's comparison semantics" contract (audit 2026-07-23 D0-5 / Q1).
+	// The zero value ([ir.TemporalLiteralClientExact]) applies no
+	// normalization: the pre-Q1 full-precision compare, which the push-down
+	// classifier keeps out of any server-side envelope as its fail-closed belt.
+	TemporalSemantics ir.TemporalLiteralSemantics
+	// TemporalDateOnly is meaningful only for [FamilyTemporal]: true for a
+	// DATE column, whose literal [ir.TemporalLiteralCastToColumn] (Postgres)
+	// truncates to the date, while the promote engines (MySQL family) compare
+	// the full instant against the date-at-midnight value.
+	TemporalDateOnly bool
 }
 
 // faithfulString reports whether a string-column comparison can be evaluated
@@ -248,17 +274,27 @@ func (ci ColumnInfo) faithfulString() bool {
 // left unreproducible (refused), the pre-0174 strict behavior. Wired from
 // the operator's --where-strict-collation opt-out, forwarded to the resolver.
 func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict bool) map[string]ColumnInfo {
+	// The temporal-literal lens is the resolver's optional companion surface
+	// (audit 2026-07-23 D0-5 / Q1): the SOURCE engine names how it coerces a
+	// finer-than-column temporal literal, and Compile normalizes literals to
+	// match. A resolver without the surface leaves the zero value
+	// (ClientExact — no normalization), which the push-down classifiers keep
+	// out of their envelopes as the fail-closed belt.
+	var temporal ir.TemporalLiteralSemantics
+	if tr, ok := resolver.(ir.TemporalLiteralResolver); ok {
+		temporal = tr.ResolveTemporalLiteralSemantics()
+	}
 	out := make(map[string]ColumnInfo, len(cols))
 	for _, c := range cols {
 		if c == nil {
 			continue
 		}
-		out[strings.ToLower(c.Name)] = columnInfoFor(resolver, c, strict)
+		out[strings.ToLower(c.Name)] = columnInfoFor(resolver, c, strict, temporal)
 	}
 	return out
 }
 
-func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) ColumnInfo {
+func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool, temporal ir.TemporalLiteralSemantics) ColumnInfo {
 	switch t := c.Type.(type) {
 	case ir.Integer, ir.Decimal:
 		return ColumnInfo{Family: FamilyNumeric}
@@ -297,8 +333,10 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) Col
 		return ColumnInfo{Family: FamilyString, Faithful: true}
 	case ir.Binary, ir.Varbinary, ir.Blob, ir.JSON:
 		return ColumnInfo{Family: FamilyBinary}
-	case ir.Date, ir.DateTime:
-		return ColumnInfo{Family: FamilyTemporal}
+	case ir.Date:
+		return ColumnInfo{Family: FamilyTemporal, TemporalSemantics: temporal, TemporalDateOnly: true}
+	case ir.DateTime:
+		return ColumnInfo{Family: FamilyTemporal, TemporalSemantics: temporal}
 	case ir.Timestamp:
 		if t.WithTimeZone {
 			// A tz-aware instant: the source interprets a bare literal in
@@ -306,7 +344,7 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool) Col
 			// faithfully. Leave it unsupported so a comparison refuses.
 			return ColumnInfo{Family: FamilyUnsupported}
 		}
-		return ColumnInfo{Family: FamilyTemporal}
+		return ColumnInfo{Family: FamilyTemporal, TemporalSemantics: temporal}
 	default:
 		return ColumnInfo{Family: FamilyUnsupported}
 	}
@@ -861,6 +899,10 @@ func (p *parser) parseComparison() (node, error) {
 	if err := checkComparable(col, info, op, lit); err != nil {
 		return nil, err
 	}
+	// Q1 (audit 2026-07-23 D0-5): a temporal literal finer-grained than the
+	// column is rewritten to the SOURCE engine's own coercion of it, so the
+	// client evaluator agrees with the engine-evaluated legs by construction.
+	lit = normalizeTemporalLiteral(info, lit)
 	return cmpNode{column: strings.ToLower(col), op: op, fam: info.Family, lit: lit, compare: info.Compare, padSpace: info.PadSpace}, nil
 }
 
@@ -881,7 +923,8 @@ func (p *parser) parseIn(col string, info ColumnInfo, negated bool) (node, error
 		if err := checkComparable(col, info, opEq, lit); err != nil {
 			return nil, err
 		}
-		lits = append(lits, lit)
+		// Q1 normalization, per IN member (see parseComparison).
+		lits = append(lits, normalizeTemporalLiteral(info, lit))
 		if !p.hasMore() {
 			return nil, fmt.Errorf("unterminated IN list on column %q", col)
 		}
@@ -1117,7 +1160,20 @@ func numericToRat(value any) (*big.Rat, bool) {
 // compareFloat evaluates an ordering comparison on a FamilyFloat column as a
 // float64 comparison, reproducing the source's IEEE-754 coercion of the literal
 // (audit 2026-07-19 B1). Equality is refused at compile time, so only ordering
-// (<, <=, >, >=) reaches here. A NaN on either side is unordered → UNKNOWN.
+// (<, <=, >, >=) reaches here.
+//
+// NaN is ordered with Postgres's float TOTAL order — NaN greater than every
+// non-NaN value, NaN equal to NaN (observed PG 16.14, 2026-07-23:
+// `'NaN'::float8 > 0.1` → true) — audit 2026-07-23 D0-6 / owner call Q4.
+// Mapping NaN to UNKNOWN made the two legs of one sync disagree on the same
+// row: the snapshot SELECT (server-evaluated WHERE) included a NaN row, then
+// the client CDC evaluator dropped its every UPDATE (stale target row) and
+// swallowed its DELETE (orphan forever), at exit 0. Postgres is the only
+// supported source that can deliver a float NaN (MySQL/MariaDB cannot store
+// one; SQLite stores NaN as NULL), so the engine-neutral comparator applies
+// the total order universally — no other engine can ever present the case.
+// The literal side can only be NaN through a direct call (the grammar cannot
+// spell it); it is handled anyway so the order is total, not conditional.
 func compareFloat(value any, op cmpOp, lit literal) truth {
 	left, ok := toFloat64(value)
 	if !ok {
@@ -1127,10 +1183,13 @@ func compareFloat(value any, op cmpOp, lit literal) truth {
 	if err != nil {
 		return truthUnknown
 	}
-	if math.IsNaN(left) || math.IsNaN(right) {
-		return truthUnknown
-	}
 	switch {
+	case math.IsNaN(left) && math.IsNaN(right):
+		return orderToTruth(0, op)
+	case math.IsNaN(left):
+		return orderToTruth(1, op) // NaN sorts last: greater than any non-NaN
+	case math.IsNaN(right):
+		return orderToTruth(-1, op)
 	case left < right:
 		return orderToTruth(-1, op)
 	case left > right:
@@ -1258,6 +1317,88 @@ func compareTemporal(value any, op cmpOp, lit literal) truth {
 		order = 0
 	}
 	return orderToTruth(order, op)
+}
+
+// normalizeTemporalLiteral rewrites a FamilyTemporal literal to the value the
+// SOURCE engine actually compares, per the engine's declared
+// [ir.TemporalLiteralSemantics] (audit 2026-07-23 D0-5, owner call Q1:
+// filtered replicas follow the source engine's comparison semantics — the
+// snapshot SELECT and any server-side stream filter evaluate the RAW literal
+// under these rules, so the client evaluator must reproduce them or the two
+// legs of one sync classify the same row differently). Ground truth, observed
+// 2026-07-23 on real servers:
+//
+//   - Postgres 16.14 (CastToColumn): the unknown-typed literal is cast to the
+//     COLUMN's type — a DATE column TRUNCATES the time-of-day
+//     (`d < '2026-01-15 12:00'` plans as `d < '2026-01-15'::date`); a
+//     timestamp column rounds fractional seconds HALF-EVEN to µs
+//     ('.1234565' → .123456, '.1234575' → .123458, '.9999995' carries +1s).
+//     A typmod column (timestamp(0)) does NOT truncate the literal.
+//   - MySQL 8.0.46 (PromoteRoundHalfUp): the DATE column is PROMOTED to
+//     datetime and the full instant compared (`d = '2026-01-15 08:30:00'` is
+//     FALSE); fractional seconds beyond 6 digits round HALF-UP (away from
+//     zero: '.1234565' → .123457) and carry.
+//   - MariaDB 11.8.8 (PromoteTruncate): promotes like MySQL, but fractional
+//     seconds beyond 6 digits are TRUNCATED ('.1234565' → .123456, no carry).
+//
+// The rewrite keys on the literal's TEXT granularity (the same
+// [temporalLiteralGranularity] facts the push-down classifier reads):
+// literals already at engine granularity pass through byte-identical, so
+// diagnostics keep the operator's spelling wherever it is already faithful.
+// ClientExact (the zero value — no engine lens) never rewrites. Pinned
+// against all three real servers by the temporal ground-truth matrix
+// (temporal_realdb_integration_test.go).
+func normalizeTemporalLiteral(info ColumnInfo, lit literal) literal {
+	if info.Family != FamilyTemporal || lit.kind != litString ||
+		info.TemporalSemantics == ir.TemporalLiteralClientExact {
+		return lit
+	}
+	t, ok := parseTemporalLiteral(lit.str)
+	if !ok {
+		return lit // unreachable: checkComparable already refused unparseable literals
+	}
+	timeBearing, subMicro := temporalLiteralGranularity(lit.str)
+	if info.TemporalSemantics == ir.TemporalLiteralCastToColumn && info.TemporalDateOnly {
+		// Postgres DATE: the literal is cast to date — time-of-day truncated.
+		if timeBearing {
+			lit.str = t.Format("2006-01-02")
+		}
+		return lit
+	}
+	if !subMicro {
+		return lit // already at (or coarser than) the µs engine resolution
+	}
+	switch info.TemporalSemantics {
+	case ir.TemporalLiteralCastToColumn:
+		t = roundToMicros(t, true) // PG: half-even
+	case ir.TemporalLiteralPromoteRoundHalfUp:
+		t = roundToMicros(t, false) // MySQL: half-up (away from zero)
+	case ir.TemporalLiteralPromoteTruncate:
+		t = t.Truncate(time.Microsecond) // MariaDB: truncate, no carry
+	}
+	lit.str = t.Format("2006-01-02 15:04:05.999999")
+	return lit
+}
+
+// roundToMicros rounds t's sub-microsecond nanoseconds to the microsecond,
+// half-even (Postgres's rint) or half-up (MySQL, away from zero), carrying
+// into the seconds when the fraction rounds to 10⁶ µs. Literal fractions are
+// at most 9 digits (Go's parser refuses more), so the parsed nanoseconds are
+// exact and no float is involved.
+func roundToMicros(t time.Time, halfEven bool) time.Time {
+	ns := t.Nanosecond()
+	rem := ns % 1000
+	if rem == 0 {
+		return t
+	}
+	micro := ns / 1000
+	switch {
+	case rem > 500:
+		micro++
+	case rem == 500 && (!halfEven || micro%2 == 1):
+		micro++
+	}
+	return t.Add(time.Duration(micro*1000 - ns))
 }
 
 // temporalLayouts are the date/time literal forms the evaluator accepts,

@@ -46,6 +46,34 @@ func TestTranslateType_UnrecognizedUDT_HonestRefusal(t *testing.T) {
 	}
 }
 
+// TestTranslateType_NaiveTimestampPushdownCoupling is the ARCH-9
+// change-detector (audit 2026-07-23): the ADR-0176 push-down classifier
+// (internal/pipeline/where_pushdown_pg.go, pgPushdownEligibleColumn) admits
+// bare ir.Timestamp{} on the stated ground that a PG catalog read ALWAYS
+// produces ir.DateTime for `timestamp without time zone` — so the oracle's
+// timestamp cells exercise the type PG sources actually deliver, and the
+// ir.Timestamp arm is cross-engine-shaped only. That unreachability claim
+// lives in a comment; this test makes it falsifiable. If the mapping ever
+// changes (naive timestamps start reading as ir.Timestamp), this fails and
+// the envelope + oracle must be re-derived together, per the envelope↔oracle
+// coupling rule.
+func TestTranslateType_NaiveTimestampPushdownCoupling(t *testing.T) {
+	naive, err := translateType(columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(6), AttTypmod: -1})
+	if err != nil {
+		t.Fatalf("translateType(timestamp without time zone): %v", err)
+	}
+	if _, ok := naive.(ir.DateTime); !ok {
+		t.Fatalf("timestamp without time zone = %T; want ir.DateTime — the push-down envelope's ir.Timestamp-unreachability premise (where_pushdown_pg.go) is broken; re-derive the envelope and the oracle together", naive)
+	}
+	zoned, err := translateType(columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(6), AttTypmod: -1})
+	if err != nil {
+		t.Fatalf("translateType(timestamp with time zone): %v", err)
+	}
+	if ts, ok := zoned.(ir.Timestamp); !ok || !ts.WithTimeZone {
+		t.Fatalf("timestamp with time zone = %#v; want ir.Timestamp{WithTimeZone: true} (Compile refuses it; the envelope fails closed on it)", zoned)
+	}
+}
+
 func TestTranslateType(t *testing.T) {
 	cases := []struct {
 		name string

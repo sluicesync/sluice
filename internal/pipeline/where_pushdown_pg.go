@@ -38,9 +38,18 @@ import (
 //
 //   - integer, numeric/decimal, boolean, date, timestamp WITHOUT time zone:
 //     eligible. (tz-aware timestamps never compile — rowpredicate refuses.)
+//     Temporal literals FINER than the column (a time-bearing literal on a
+//     DATE column; >6 fractional-second digits) are eligible too — Compile
+//     normalizes them to PG's own cast-to-column semantics (truncate to the
+//     date; round half-even to µs — audit 2026-07-23 D0-5 / Q1), so the
+//     client evaluator and the pushed filter agree by construction, proven
+//     by the oracle's granularity cells. The term-level flags below remain
+//     the fail-closed BELT for a predicate compiled without the engine lens.
 //   - text/varchar under the default collation ("") or COLLATE "C":
 //     eligible. Any other named collation — POSIX included, byte-identical
-//     or not — is OUTSIDE the proven envelope and falls back.
+//     or not — is OUTSIDE the proven envelope and falls back. A column
+//     whose collation is known NON-deterministic falls back regardless of
+//     name (belt: Compile already refuses it — audit 2026-07-23 ARCH-9).
 //   - everything else (char/bpchar PAD SPACE, enum, uuid/inet/cidr/macaddr,
 //     time-of-day, float, binary/blob/JSON, …): fallback. Some of these are
 //     probably equivalent, but "probably" is what the oracle exists to
@@ -53,23 +62,42 @@ import (
 //     has no operator), so pushing it would fail the publication DDL
 //     loudly at sync start — classified out instead, it streams
 //     client-side like today;
-//   - a DATE column compared to a TIME-BEARING literal — PG truncates the
-//     literal to the date inside the publication filter while the client
-//     compares the full instant (audit 2026-07-23 D0-5);
-//   - a temporal column compared to a literal with MORE than 6 fractional-
-//     second digits — PG rounds to its microsecond resolution while the
-//     client keeps nanoseconds (D0-5's sibling arm).
+//   - the temporal literal-granularity BELT (audit 2026-07-23 D0-5): a
+//     DATE-column term still carrying a time-bearing literal, or any
+//     temporal term still carrying >6 fractional-second digits, was
+//     compiled WITHOUT the PG engine's temporal-literal lens (Compile's Q1
+//     normalization rewrites exactly those texts), so the client evaluator
+//     would compare at full precision while the server truncates/rounds —
+//     the term falls back to client-side-only evaluation rather than push
+//     an unproven divergence;
+//   - an Unrecognized term — an AST node the term walker does not know
+//     (audit 2026-07-23 ARCH-1) — classifies out: a future grammar
+//     construct must join the envelope with oracle cells, never by
+//     contributing zero terms.
 func pgPushdownEligible(tbl *ir.Table, p *rowpredicate.Predicate) (eligible bool, reason string) {
 	if tbl == nil || p == nil {
 		return false, "no compiled predicate"
 	}
+	return pgPushdownEligibleTerms(tbl, p.PushdownTerms())
+}
+
+// pgPushdownEligibleTerms is the term-level arm of the classifier, split
+// from pgPushdownEligible so the fail-closed handling of synthetic term
+// shapes (Unrecognized — the AST is private to rowpredicate) can be pinned
+// directly (TestPGPushdownEligibleTerms_FailClosed).
+func pgPushdownEligibleTerms(tbl *ir.Table, terms []rowpredicate.PushdownTerm) (eligible bool, reason string) {
 	cols := make(map[string]*ir.Column, len(tbl.Columns))
 	for _, c := range tbl.Columns {
 		if c != nil {
 			cols[strings.ToLower(c.Name)] = c
 		}
 	}
-	for _, term := range p.PushdownTerms() {
+	for _, term := range terms {
+		if term.Unrecognized != "" {
+			// ARCH-1: the walker flagged a node it does not know — fail
+			// closed rather than push a predicate whose terms are unproven.
+			return false, fmt.Sprintf("predicate contains a construct (%s) the push-down term walker does not recognize", term.Unrecognized)
+		}
 		c, ok := cols[term.Column]
 		if !ok {
 			// Unreachable — Compile already refused unknown columns — but a
@@ -79,21 +107,24 @@ func pgPushdownEligible(tbl *ir.Table, p *rowpredicate.Predicate) (eligible bool
 		if term.BoolNumericLiteral {
 			return false, fmt.Sprintf("boolean column %q is compared to a 0/1 numeric literal, which is not valid Postgres SQL in a publication row filter (use TRUE/FALSE)", c.Name)
 		}
-		// Temporal literal-granularity exclusions (audit 2026-07-23 D0-5):
-		// Postgres resolves a finer-than-column literal by TRUNCATING (a
-		// time-bearing literal against a DATE column) or ROUNDING (>6
-		// fractional-second digits against a microsecond timestamp) while
-		// the client evaluator compares the literal at full precision — so
-		// the two provably disagree on the boundary and the term falls back
-		// to client-side-only evaluation. Safe under both D0-5 adjudications
-		// (the Compile-layer normalization question is deferred — audit Q1).
+		// Temporal literal-granularity BELT (audit 2026-07-23 D0-5 / Q1):
+		// Compile normalizes temporal literals to the source engine's own
+		// comparison semantics, so a predicate compiled through the PG
+		// engine's resolver can never carry these flags (a time-bearing
+		// literal on a DATE column is truncated to the date; >6 fractional
+		// digits round half-even to µs) — the normalized literal is exactly
+		// column-granular and client and server agree by construction (the
+		// oracle's granularity cells). A term STILL carrying a flag was
+		// compiled without the engine lens (a hand-built ColumnInfo map, a
+		// future non-normalizing caller); unnormalized, server and client
+		// provably disagree on the boundary, so it must not push.
 		if term.TemporalLiteralTimeBearing {
 			if _, isDate := c.Type.(ir.Date); isDate {
-				return false, fmt.Sprintf("date column %q is compared to a time-bearing literal, which Postgres truncates to the date in a publication row filter while the client compares the full instant", c.Name)
+				return false, fmt.Sprintf("date column %q is compared to a time-bearing literal that Compile did not normalize to Postgres's cast-to-date semantics (the engine temporal-literal lens is missing), so the pushed filter and the client evaluator would disagree", c.Name)
 			}
 		}
 		if term.TemporalLiteralSubMicrosecond {
-			return false, fmt.Sprintf("column %q is compared to a literal with more than 6 fractional-second digits, which Postgres rounds to microseconds while the client compares at nanosecond precision", c.Name)
+			return false, fmt.Sprintf("column %q is compared to a literal with more than 6 fractional-second digits that Compile did not normalize to Postgres's round-to-microseconds semantics (the engine temporal-literal lens is missing), so the pushed filter and the client evaluator would disagree", c.Name)
 		}
 		if ok, reason := pgPushdownEligibleColumn(c); !ok {
 			return false, reason
@@ -111,8 +142,11 @@ func pgPushdownEligibleColumn(c *ir.Column) (eligible bool, reason string) {
 	case ir.Integer, ir.Decimal, ir.Boolean, ir.Date, ir.DateTime:
 		// ir.DateTime is the naive-timestamp family's PG spelling: the PG
 		// catalog reads `timestamp [without time zone]` as ir.DateTime
-		// (types.go), so it — not ir.Timestamp{} — is the type the oracle's
-		// timestamp cells actually exercise on a PG source.
+		// (types.go — pinned by the postgres package's
+		// TestTranslateType_NaiveTimestampPushdownCoupling change-detector,
+		// audit 2026-07-23 ARCH-9), so it — not ir.Timestamp{} — is the
+		// type the oracle's timestamp cells actually exercise on a PG
+		// source.
 		return true, ""
 	case ir.Timestamp:
 		if t.WithTimeZone {
@@ -124,9 +158,9 @@ func pgPushdownEligibleColumn(c *ir.Column) (eligible bool, reason string) {
 		// above — but the family's semantics are identical).
 		return true, ""
 	case ir.Varchar:
-		return pgPushdownEligibleTextCollation(c.Name, t.Collation)
+		return pgPushdownEligibleTextCollation(c.Name, t.Collation, t.Determinism)
 	case ir.Text:
-		return pgPushdownEligibleTextCollation(c.Name, t.Collation)
+		return pgPushdownEligibleTextCollation(c.Name, t.Collation, t.Determinism)
 	default:
 		return false, fmt.Sprintf("column %q has type %T, which is outside the proven publication push-down envelope", c.Name, c.Type)
 	}
@@ -134,8 +168,15 @@ func pgPushdownEligibleColumn(c *ir.Column) (eligible bool, reason string) {
 
 // pgPushdownEligibleTextCollation admits text/varchar only under the two
 // collations the oracle ground-truths: the default ("" — the column
-// inherits the database collation) and the explicit byte-order "C".
-func pgPushdownEligibleTextCollation(name, collation string) (eligible bool, reason string) {
+// inherits the database collation) and the explicit byte-order "C". A
+// collation the catalog marked NON-deterministic is refused regardless of
+// name (audit 2026-07-23 ARCH-9): Compile's resolver refusal already keeps
+// such a predicate from existing at all, but the envelope must not rest
+// single-layered on that gate.
+func pgPushdownEligibleTextCollation(name, collation string, determinism ir.CollationDeterminism) (eligible bool, reason string) {
+	if determinism == ir.CollationNonDeterministic {
+		return false, fmt.Sprintf("text column %q carries a non-deterministic collation, whose `=` only the server can evaluate (outside the publication push-down envelope)", name)
+	}
 	if collation == "" || collation == "C" {
 		return true, ""
 	}
