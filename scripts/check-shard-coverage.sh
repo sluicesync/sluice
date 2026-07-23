@@ -125,6 +125,59 @@ if ! self_test; then
 fi
 
 status=0
+
+# ---- COVERED_PACKAGES ↔ ci.yml cross-grep (audit 2026-07-23 TEST-3 /
+# G-13). COVERED_PACKAGES is a hand-copied mirror of the integration
+# matrix's `packages:` lines, and until this check the guard validated
+# only the MIRROR — a shard rebalance that dropped a package from
+# ci.yml passed the guard while the package's integration tests (e.g.
+# the rowpredicate collation matrices, the 07-18 Critical's designated
+# permanent gate) silently stopped running. This is the same tripwire
+# check-run-filter-coverage.sh carries for its MANIFEST, ported here:
+# parse the REAL ci.yml integration-job matrix and require set equality
+# with COVERED_PACKAGES, both directions.
+#
+# Extraction scope: lines between the `  integration:` job key and the
+# next top-level job key, keeping only quoted `packages: "..."` values
+# (the job-level `packages: read` permission line has no quote). Tokens
+# are normalized from go-test argument form (`./x/` or `./x/...`) to
+# COVERED_PACKAGES form (`x` / `x/...`), preserving the recursion shape
+# (N-17b) — the `/...` suffix is semantic and must match exactly.
+ci_workflow=".github/workflows/ci.yml"
+ci_packages=$(awk '
+	/^  integration:/ { injob = 1; next }
+	injob && /^  [A-Za-z0-9_-]+:/ { injob = 0 }
+	injob && /packages: "/ {
+		sub(/^[^"]*"/, ""); sub(/".*$/, "")
+		n = split($0, toks, /[[:space:]]+/)
+		for (i = 1; i <= n; i++) if (toks[i] != "") print toks[i]
+	}
+' "$ci_workflow" | sed -e 's|^\./||' -e 's|/$||' | sort -u)
+
+# Vacuous-success guard: the matrix has 5 shards over >= 10 distinct
+# packages; an extraction that finds almost nothing means the awk scope
+# broke (job renamed, indentation changed), not that the list shrank.
+if [ "$(printf '%s\n' "$ci_packages" | grep -c .)" -lt 5 ]; then
+	echo "::error::check-shard-coverage: extracted fewer than 5 package entries from $ci_workflow's integration matrix — the extraction no longer matches the workflow's shape; fix the awk scope in scripts/check-shard-coverage.sh before trusting this guard."
+	exit 1
+fi
+
+for p in $COVERED_PACKAGES; do
+	if ! printf '%s\n' "$ci_packages" | grep -qxF "$p"; then
+		echo "::error::COVERED_PACKAGES entry $p does not appear in $ci_workflow's integration matrix packages lines (recursion shape included) — the mirror drifted from the workflow it guards; update them TOGETHER"
+		status=1
+	fi
+done
+for e in $ci_packages; do
+	found=0
+	for p in $COVERED_PACKAGES; do
+		[ "$p" = "$e" ] && found=1
+	done
+	if [ "$found" -eq 0 ]; then
+		echo "::error::$ci_workflow integration matrix lists package $e, which is missing from COVERED_PACKAGES in scripts/check-shard-coverage.sh — the mirror drifted from the workflow it guards; update them TOGETHER"
+		status=1
+	fi
+done
 # Every directory containing a file whose build expression includes the
 # `integration` tag (compound combos like `integration && vstream` are
 # covered packages-wise here; whether their extra tag has a RUN entry

@@ -2,11 +2,15 @@
 
 ## Status
 
-**Proposed (2026-06-27).** Roadmap item 49 follow-up (#5 of the SQLite queue). Phase 1
-scope: continuous logical CDC from a **local SQLite file** to Postgres/MySQL via
+**Accepted — shipped v0.99.148** (the `sqlite-trigger` engine, `internal/engines/sqlite-trigger`;
+the index row carried the shipped status while this header still said Proposed — caught by the
+G-17 status-parity gate, audit 2026-07-23 DOC-3). Roadmap item 49 follow-up (#5 of the SQLite
+queue). Phase 1 scope: continuous logical CDC from a **local SQLite file** to Postgres/MySQL via
 triggers + a change-log table + a polling reader, mirroring the `pgtrigger` engine
-(ADR-0066). D1-over-HTTP, schema-change forwarding, and capture-payload trimming are
-explicit deferred follow-ups.
+(ADR-0066). D1-over-HTTP landed as the `d1-trigger` engine (ADR-0136); schema-change
+forwarding and capture-payload trimming remain explicit deferred follow-ups.
+
+Prior status: Proposed (2026-06-27).
 
 ## Context
 

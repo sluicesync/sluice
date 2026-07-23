@@ -1355,14 +1355,20 @@ type SyncStartCmd struct {
 	// line. Same advisory + failure-isolated semantics as the webhook/Slack
 	// sinks; delivers EVERY threshold alert (the ADR-0107 rules + the item-45
 	// sync-lag rule).
-	NotifySMTPHost     string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. One sink covers every transactional provider (SendGrid/Mailgun/SES/Postmark are all SMTP) and self-hosted relays. Advisory — a dead relay is logged-and-swallowed, never affects the sync." placeholder:"HOST"`
-	NotifySMTPPort     int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
-	NotifySMTPFrom     string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
-	NotifySMTPTo       []string `help:"Recipient address for alert emails (repeatable for multiple recipients; required when --notify-smtp-host is set)." placeholder:"ADDR"`
-	NotifySMTPTLS      string   `help:"SMTP transport security: starttls (default, upgrade on port 587), implicit (TLS from connect, port 465), or none (cleartext — trusted local relay only)." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
-	NotifySMTPAuth     string   `help:"SMTP authentication mechanism: none (default), plain, or login. plain/login require --notify-smtp-username and the SLUICE_NOTIFY_SMTP_PASSWORD env var." default:"none" enum:"none,plain,login" placeholder:"MECH"`
-	NotifySMTPUsername string   `help:"SMTP auth username (e.g. 'apikey' for SendGrid). Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
-	NotifySMTPPassword string   `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never pass it on the command line; masked in all logging." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
+	NotifySMTPHost string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. One sink covers every transactional provider (SendGrid/Mailgun/SES/Postmark are all SMTP) and self-hosted relays. Advisory — a dead relay is logged-and-swallowed, never affects the sync." placeholder:"HOST"`
+	NotifySMTPPort int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
+	NotifySMTPFrom string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTo   []string `help:"Recipient address for alert emails (repeatable for multiple recipients; required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	// name tag: kong's kebab-caser cannot split the trailing TLS acronym
+	// (NotifySMTPTLS → "notify-smtptls"), so without it the REAL flag
+	// disagreed with every doc, error message, and the fleet koanf key,
+	// which all say --notify-smtp-tls — caught by TestSyncSpecFlagParity
+	// (audit 2026-07-23 DEVEX-1 / G-14). The derived spelling stays as a
+	// hidden-in-help alias so any existing invocation keeps working.
+	NotifySMTPTLS      string `name:"notify-smtp-tls" aliases:"notify-smtptls" help:"SMTP transport security: starttls (default, upgrade on port 587), implicit (TLS from connect, port 465), or none (cleartext — trusted local relay only)." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
+	NotifySMTPAuth     string `help:"SMTP authentication mechanism: none (default), plain, or login. plain/login require --notify-smtp-username and the SLUICE_NOTIFY_SMTP_PASSWORD env var." default:"none" enum:"none,plain,login" placeholder:"MECH"`
+	NotifySMTPUsername string `help:"SMTP auth username (e.g. 'apikey' for SendGrid). Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
+	NotifySMTPPassword string `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never pass it on the command line; masked in all logging." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
 
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 

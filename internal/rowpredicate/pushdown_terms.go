@@ -23,6 +23,14 @@ type PushdownTerm struct {
 	// Column is the lower-cased referenced column name (the same
 	// normalization [Compile] applies).
 	Column string
+	// Op is the leaf's canonical operator spelling, one of
+	// [GrammarLeafOps] ("<>" folds to "!="). Consumers use it to prove
+	// per-operator coverage against the grammar's inventory — the
+	// push-down oracle's op-completeness gate (audit 2026-07-23 TEST-2 /
+	// G-12) compiles every oracle cell and asserts the union of emitted
+	// Ops covers GrammarLeafOps, so a new grammar operator cannot ship
+	// without oracle cells. Empty only on an Unrecognized term.
+	Op string
 	// BoolNumericLiteral marks a BOOLEAN column compared against a numeric
 	// 0/1 literal. The client grammar accepts it (the MySQL idiom `flag = 1`)
 	// but it is not valid Postgres SQL — `boolean = integer` has no operator —
@@ -87,6 +95,40 @@ type PushdownTerm struct {
 	Unrecognized string
 }
 
+// GrammarLeafOps is the canonical inventory of leaf operators the
+// rowpredicate grammar compiles — one spelling per operator ("<>" folds
+// to "!=", per [cmpOp.spelling]). KEEP IN LOCKSTEP with [parseOp] and
+// the leaf node types (cmpNode / inNode / isNullNode): this is the
+// enumeration source coverage gates assert against (the push-down
+// oracle's op-completeness pin, audit 2026-07-23 TEST-2 / G-12), so a
+// new operator added to the grammar without a matching entry here — or
+// an entry without a compiling operator — fails
+// TestGrammarLeafOps_EveryOpCompilesAndEmits before it can ship
+// untested. AND/OR/NOT are compositions, not leaves; coverage gates pin
+// them separately.
+func GrammarLeafOps() []string {
+	return []string{"=", "!=", "<", "<=", ">", ">=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+}
+
+// spelling renders a cmpOp as its canonical [GrammarLeafOps] token.
+func (o cmpOp) spelling() string {
+	switch o {
+	case opEq:
+		return "="
+	case opNe:
+		return "!="
+	case opLt:
+		return "<"
+	case opLe:
+		return "<="
+	case opGt:
+		return ">"
+	case opGe:
+		return ">="
+	}
+	return fmt.Sprintf("cmpOp(%d)", o)
+}
+
 // PushdownTerms returns the predicate's leaf comparisons for push-down
 // eligibility classification. A nil predicate has no terms.
 func (p *Predicate) PushdownTerms() []PushdownTerm {
@@ -116,6 +158,7 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 	case cmpNode:
 		term := PushdownTerm{
 			Column:             t.column,
+			Op:                 t.op.spelling(),
 			BoolNumericLiteral: t.fam == FamilyBool && t.lit.kind == litNumber,
 		}
 		if t.fam == FamilyTemporal && t.lit.kind == litString {
@@ -124,7 +167,11 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 		}
 		*terms = append(*terms, term)
 	case inNode:
-		term := PushdownTerm{Column: t.column}
+		op := "IN"
+		if t.negated {
+			op = "NOT IN"
+		}
+		term := PushdownTerm{Column: t.column, Op: op}
 		for _, l := range t.lits {
 			if t.fam == FamilyBool && l.kind == litNumber {
 				term.BoolNumericLiteral = true
@@ -138,7 +185,11 @@ func collectPushdownTerms(n node, terms *[]PushdownTerm) {
 		}
 		*terms = append(*terms, term)
 	case isNullNode:
-		*terms = append(*terms, PushdownTerm{Column: t.column})
+		op := "IS NULL"
+		if t.negated {
+			op = "IS NOT NULL"
+		}
+		*terms = append(*terms, PushdownTerm{Column: t.column, Op: op})
 	default:
 		// ARCH-1 (audit 2026-07-23): a node type this walk does not know
 		// contributes an Unrecognized term rather than NOTHING — silence

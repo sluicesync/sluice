@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -64,9 +65,14 @@ func TestPGPushdownEligible_EnvelopePin(t *testing.T) {
 		{"array", ir.Array{Element: ir.Integer{Width: 32}}, false},
 		{"geometry", ir.Geometry{}, false},
 		{"extension type", ir.ExtensionType{Name: "citext"}, false},
+		{"bit (fail-closed default arm)", ir.Bit{Length: 8}, false},
+		{"interval (fail-closed default arm)", ir.Interval{}, false},
+		{"verbatim type (fail-closed default arm)", ir.VerbatimType{Definition: "int4range"}, false},
 	}
 
+	pinned := map[reflect.Type]bool{}
 	for _, tc := range cases {
+		pinned[reflect.TypeOf(tc.typ)] = true
 		t.Run(tc.name, func(t *testing.T) {
 			got, reason := pgPushdownEligibleColumn(&ir.Column{Name: "v", Type: tc.typ})
 			if got != tc.want {
@@ -76,6 +82,18 @@ func TestPGPushdownEligible_EnvelopePin(t *testing.T) {
 				t.Errorf("ineligible %T must carry a fallback-log reason", tc.typ)
 			}
 		})
+	}
+
+	// Exhaustiveness over the ir type universe (audit 2026-07-23 TEST-2 /
+	// G-12): a NEW ir type added without an explicit eligible/ineligible
+	// case here fails, instead of silently riding the fail-closed default
+	// arm with no one re-deriving whether it belongs in the envelope.
+	// ir.AllTypes() is itself source-pinned against the isType()
+	// implementors, so this cannot rot when the type universe grows.
+	for _, typ := range ir.AllTypes() {
+		if !pinned[reflect.TypeOf(typ)] {
+			t.Errorf("ir type %T has no envelope-pin case — classify it eligible/ineligible here, and if eligible add its real-PG oracle family (TestPushdownOracleMatrix_EnvelopeCoupling enforces that half)", typ)
+		}
 	}
 }
 

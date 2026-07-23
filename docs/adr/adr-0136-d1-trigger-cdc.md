@@ -2,7 +2,12 @@
 
 ## Status
 
-**Proposed (2026-06-28).** Roadmap item 49 follow-up — Phase 2 of the trigger-CDC work
+**Accepted — shipped v0.99.149** (the `d1-trigger` engine, `internal/engines/d1-trigger`,
+commit `97adc7b1`; both this header and the index row said Proposed long after the engine
+shipped — the doc-vs-code half of the DOC-3 class, fixed alongside the G-17 gate,
+audit 2026-07-23). Prior status: Proposed (2026-06-28).
+
+Roadmap item 49 follow-up — Phase 2 of the trigger-CDC work
 (ADR-0135 Phase 1 was local-SQLite-file only). Adds continuous logical CDC from a **live
 Cloudflare D1** database to Postgres/MySQL by running the same trigger + change-log +
 polling design over D1's HTTP query API instead of a local `*sql.DB`.

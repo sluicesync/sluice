@@ -51,14 +51,17 @@ type MetricsWatchCmd struct {
 
 	// Email / SMTP sink (roadmap item 48) — identical to the sync-path flags.
 	// Opt-in (inert unless --notify-smtp-host); password via env only.
-	NotifySMTPHost     string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. Advisory + failure-isolated." placeholder:"HOST"`
-	NotifySMTPPort     int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
-	NotifySMTPFrom     string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
-	NotifySMTPTo       []string `help:"Recipient address for alert emails (repeatable; required when --notify-smtp-host is set)." placeholder:"ADDR"`
-	NotifySMTPTLS      string   `help:"SMTP transport security: starttls (default), implicit, or none." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
-	NotifySMTPAuth     string   `help:"SMTP authentication mechanism: none (default), plain, or login." default:"none" enum:"none,plain,login" placeholder:"MECH"`
-	NotifySMTPUsername string   `help:"SMTP auth username. Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
-	NotifySMTPPassword string   `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never on the command line." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
+	NotifySMTPHost string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. Advisory + failure-isolated." placeholder:"HOST"`
+	NotifySMTPPort int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
+	NotifySMTPFrom string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTo   []string `help:"Recipient address for alert emails (repeatable; required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	// name tag: see SyncStartCmd.NotifySMTPTLS — kong derives
+	// "notify-smtptls" from the trailing acronym; the documented spelling
+	// is --notify-smtp-tls (TestSyncSpecFlagParity's catch).
+	NotifySMTPTLS      string `name:"notify-smtp-tls" aliases:"notify-smtptls" help:"SMTP transport security: starttls (default), implicit, or none." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
+	NotifySMTPAuth     string `help:"SMTP authentication mechanism: none (default), plain, or login." default:"none" enum:"none,plain,login" placeholder:"MECH"`
+	NotifySMTPUsername string `help:"SMTP auth username. Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
+	NotifySMTPPassword string `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never on the command line." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
 
 	NotifyStorageUtil         float64 `help:"Alert when storage utilisation (used/capacity, 0-1) is at or above this fraction. 0 (default) disables. Edge-triggered + cooldown'd. Requires a --notify-webhook/--notify-slack sink to deliver." placeholder:"FRAC"`
 	NotifyCPUUtil             float64 `help:"Alert when CPU utilisation (0-1) is at or above this fraction. 0 disables." placeholder:"FRAC"`

@@ -150,6 +150,124 @@ func TestRegistryDocSync(t *testing.T) {
 	}
 }
 
+// splitDocCells splits a markdown table row on unescaped pipes (the doc
+// escapes in-cell pipes as `\|`; the escape is KEPT in the cell text,
+// matching how docRows stores it).
+func splitDocCells(line string) []string {
+	var cells []string
+	var cur strings.Builder
+	escaped := false
+	for _, r := range line {
+		switch {
+		case escaped:
+			cur.WriteRune('\\')
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '|':
+			cells = append(cells, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	return append(cells, cur.String())
+}
+
+// normalizeDocCell collapses runs of whitespace so incidental reflow in
+// either home never fails the equality gate — only content changes do.
+func normalizeDocCell(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// TestRegistryDocSync_ContentEquality is the G-15 gate (audit 2026-07-23
+// DEVEX-2): the token-presence check above passes forever on a row whose
+// PROSE lags a semantics change — error-codes row 29 kept prescribing the
+// scope guard's pre-v0.99.289 "drain the other stream" remedy one release
+// after the existence-semantics ratchet made it insufficient. This test
+// pins the doc table's Meaning/Remedy cells byte-for-byte (whitespace-
+// normalized) against the in-package docRows mirror, and the Class cell
+// against the registry Class — so editing the doc, the mirror, or a
+// code's class alone fails CI until the two homes agree again.
+func TestRegistryDocSync_ContentEquality(t *testing.T) {
+	docPath := filepath.Join("..", "..", "docs", "operator", "error-codes.md")
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", docPath, err)
+	}
+
+	type docCells struct{ class, meaning, remedy string }
+	fromDoc := map[Code]docCells{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "| `SLUICE-E-") {
+			continue
+		}
+		cells := splitDocCells(line)
+		if len(cells) < 5 {
+			t.Errorf("table row has %d cells, want >= 5: %s", len(cells), line)
+			continue
+		}
+		code := Code(strings.Trim(strings.TrimSpace(cells[1]), "`"))
+		if _, dup := fromDoc[code]; dup {
+			t.Errorf("%s has two table rows in %s", code, docPath)
+		}
+		fromDoc[code] = docCells{
+			class:   strings.TrimSpace(cells[2]),
+			meaning: strings.TrimSpace(cells[3]),
+			remedy:  strings.TrimSpace(cells[4]),
+		}
+	}
+	// Vacuity guard: the table has ~58 rows; near-empty parse = broken parse.
+	if len(fromDoc) < 40 {
+		t.Fatalf("parsed only %d code rows from %s — the table shape changed; fix the parser", len(fromDoc), docPath)
+	}
+
+	classWord := func(c Class) string {
+		if c == ClassRefusal {
+			return "refusal"
+		}
+		return "runtime"
+	}
+
+	for _, c := range All() {
+		info, _ := Describe(c)
+		doc, inDoc := fromDoc[c]
+		mirror, inMirror := docRows[c]
+		if !inDoc {
+			t.Errorf("registered code %s has no table row in %s", c, docPath)
+			continue
+		}
+		if !inMirror {
+			t.Errorf("registered code %s has no docRows mirror entry (internal/sluicecode/docrows.go) — add the row's Meaning/Remedy there", c)
+			continue
+		}
+		if doc.class != classWord(info.Class) {
+			t.Errorf("%s: doc Class cell says %q but the registry class is %q — reconcile", c, doc.class, classWord(info.Class))
+		}
+		if got, want := normalizeDocCell(doc.meaning), normalizeDocCell(mirror.Meaning); got != want {
+			t.Errorf("%s: doc Meaning cell diverged from the docRows mirror — update BOTH homes together (audit 2026-07-23 G-15)\n  doc:    %s\n  mirror: %s", c, got, want)
+		}
+		if got, want := normalizeDocCell(doc.remedy), normalizeDocCell(mirror.Remedy); got != want {
+			t.Errorf("%s: doc Remedy cell diverged from the docRows mirror — update BOTH homes together (audit 2026-07-23 G-15)\n  doc:    %s\n  mirror: %s", c, got, want)
+		}
+	}
+
+	// Parity in the remaining directions: no orphan doc rows (already
+	// covered token-wise above, but keep this loop self-contained) and no
+	// orphan mirror entries.
+	for c := range fromDoc {
+		if _, ok := Describe(c); !ok {
+			t.Errorf("%s has a table row but is not a registered code", c)
+		}
+	}
+	for c := range docRows {
+		if _, ok := Describe(c); !ok {
+			t.Errorf("docRows mirrors %s, which is not a registered code — drop the stale entry", c)
+		}
+	}
+}
+
 // retainedButUnemittedMarker is the sentinel a registry summary carries
 // when a code's refusal has been LIFTED but the string is kept registered
 // (removing a published catalog code is breaking). It couples the registry

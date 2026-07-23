@@ -32,37 +32,37 @@ func TestPushdownTerms(t *testing.T) {
 			name:      "compound walk order, IS NULL and IN included",
 			predicate: "NOT (id = 5 OR name IN ('a', 'b')) AND id IS NULL",
 			want: []PushdownTerm{
-				{Column: "id"},
-				{Column: "name"},
-				{Column: "id"},
+				{Column: "id", Op: "="},
+				{Column: "name", Op: "IN"},
+				{Column: "id", Op: "IS NULL"},
 			},
 		},
 		{
 			name:      "bool vs TRUE literal is NOT flagged",
 			predicate: "active = TRUE",
-			want:      []PushdownTerm{{Column: "active"}},
+			want:      []PushdownTerm{{Column: "active", Op: "="}},
 		},
 		{
 			name:      "bool vs 0/1 numeric literal IS flagged (invalid PG SQL)",
 			predicate: "active = 1",
-			want:      []PushdownTerm{{Column: "active", BoolNumericLiteral: true}},
+			want:      []PushdownTerm{{Column: "active", Op: "=", BoolNumericLiteral: true}},
 		},
 		{
 			name:      "bool IN with a numeric member IS flagged",
 			predicate: "active IN (1)",
-			want:      []PushdownTerm{{Column: "active", BoolNumericLiteral: true}},
+			want:      []PushdownTerm{{Column: "active", Op: "IN", BoolNumericLiteral: true}},
 		},
 		{
 			name:      "bool IN with only keyword literals is NOT flagged",
 			predicate: "active IN (TRUE, FALSE)",
-			want:      []PushdownTerm{{Column: "active"}},
+			want:      []PushdownTerm{{Column: "active", Op: "IN"}},
 		},
 		{
 			name:      "column casing is normalized like Compile's",
 			predicate: `"Active" = FALSE AND ID < 3`,
 			want: []PushdownTerm{
-				{Column: "active"},
-				{Column: "id"},
+				{Column: "active", Op: "="},
+				{Column: "id", Op: "<"},
 			},
 		},
 
@@ -70,39 +70,39 @@ func TestPushdownTerms(t *testing.T) {
 		{
 			name:      "pure-date temporal literal carries no granularity flag",
 			predicate: "d = '2026-01-15'",
-			want:      []PushdownTerm{{Column: "d"}},
+			want:      []PushdownTerm{{Column: "d", Op: "="}},
 		},
 		{
 			name:      "time-bearing literal (space form, no seconds) is flagged",
 			predicate: "d < '2026-01-15 08:30'",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+			want:      []PushdownTerm{{Column: "d", Op: "<", TemporalLiteralTimeBearing: true}},
 		},
 		{
 			name:      "time-bearing literal (T form) is flagged",
 			predicate: "d != '2026-01-15T08:30:00'",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+			want:      []PushdownTerm{{Column: "d", Op: "!=", TemporalLiteralTimeBearing: true}},
 		},
 		{
 			name:      "midnight is still time-bearing (the flag keys on the TEXT, conservatively)",
 			predicate: "d = '2026-01-15 00:00:00'",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+			want:      []PushdownTerm{{Column: "d", Op: "=", TemporalLiteralTimeBearing: true}},
 		},
 		{
 			name:      "exactly 6 fractional digits is time-bearing but NOT sub-microsecond",
 			predicate: "d >= '2026-01-15 08:30:00.123456'",
-			want:      []PushdownTerm{{Column: "d", TemporalLiteralTimeBearing: true}},
+			want:      []PushdownTerm{{Column: "d", Op: ">=", TemporalLiteralTimeBearing: true}},
 		},
 		{
 			name:      "IN list of pure dates carries no granularity flag",
 			predicate: "d NOT IN ('2026-01-15', '2026-01-16')",
-			want:      []PushdownTerm{{Column: "d"}},
+			want:      []PushdownTerm{{Column: "d", Op: "NOT IN"}},
 		},
 		{
 			name:      "granularity flags survive NOT/AND composition",
 			predicate: "NOT (d >= '2026-01-15 12:00:00') AND id < 3",
 			want: []PushdownTerm{
-				{Column: "d", TemporalLiteralTimeBearing: true},
-				{Column: "id"},
+				{Column: "d", Op: ">=", TemporalLiteralTimeBearing: true},
+				{Column: "id", Op: "<"},
 			},
 		},
 	}
@@ -181,8 +181,8 @@ func TestPushdownTerms_SubMicrosecondFlagOnHandBuiltAST(t *testing.T) {
 		inNode{column: "d", fam: FamilyTemporal, lits: []literal{pureDateLit, subMicroLit}},
 	}}}
 	want := []PushdownTerm{
-		{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true},
-		{Column: "d", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}, // one sub-µs member flags the IN term
+		{Column: "d", Op: ">=", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true},
+		{Column: "d", Op: "IN", TemporalLiteralTimeBearing: true, TemporalLiteralSubMicrosecond: true}, // one sub-µs member flags the IN term
 	}
 	if got := p.PushdownTerms(); !reflect.DeepEqual(got, want) {
 		t.Errorf("PushdownTerms() = %+v, want %+v", got, want)
@@ -210,10 +210,65 @@ func TestPushdownTerms_UnrecognizedNodeFailsClosed(t *testing.T) {
 	}}}
 	got := p.PushdownTerms()
 	want := []PushdownTerm{
-		{Column: "id"},
+		{Column: "id", Op: "="},
 		{Unrecognized: "rowpredicate.fakeGrammarNode"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("PushdownTerms() = %+v, want %+v", got, want)
+	}
+}
+
+// TestGrammarLeafOps_EveryOpCompilesAndEmits keeps [GrammarLeafOps]
+// honest against the grammar (audit 2026-07-23 TEST-2 / G-12): every
+// inventory entry must be reachable through Compile and come back as a
+// PushdownTerm.Op spelled exactly like the inventory, and Compile must
+// not emit an Op outside the inventory. With this pin, the inventory is
+// safe to use as the enumeration source for op-coverage gates (the
+// push-down oracle's op-completeness assert) — a grammar operator added
+// without an inventory entry surfaces here as an out-of-inventory Op.
+func TestGrammarLeafOps_EveryOpCompilesAndEmits(t *testing.T) {
+	infos := map[string]ColumnInfo{"id": {Family: FamilyNumeric}}
+	// One predicate per inventory op, canonical spelling.
+	preds := map[string]string{
+		"=":           "id = 1",
+		"!=":          "id != 1",
+		"<":           "id < 1",
+		"<=":          "id <= 1",
+		">":           "id > 1",
+		">=":          "id >= 1",
+		"IN":          "id IN (1, 2)",
+		"NOT IN":      "id NOT IN (1, 2)",
+		"IS NULL":     "id IS NULL",
+		"IS NOT NULL": "id IS NOT NULL",
+	}
+	inventory := map[string]bool{}
+	for _, op := range GrammarLeafOps() {
+		inventory[op] = true
+		pred, ok := preds[op]
+		if !ok {
+			t.Errorf("GrammarLeafOps() lists %q but this pin has no predicate for it — extend the preds map (and the oracle matrix)", op)
+			continue
+		}
+		p, err := Compile("t", pred, infos)
+		if err != nil {
+			t.Errorf("inventory op %q does not compile (%q): %v — drop the stale inventory entry", op, pred, err)
+			continue
+		}
+		terms := p.PushdownTerms()
+		if len(terms) != 1 || terms[0].Op != op {
+			t.Errorf("Compile(%q) emitted terms %+v; want exactly one term with Op %q", pred, terms, op)
+		}
+	}
+	// The alternate `<>` spelling must FOLD into the canonical inventory,
+	// not extend it.
+	p, err := Compile("t", "id <> 1", infos)
+	if err != nil {
+		t.Fatalf("Compile(id <> 1): %v", err)
+	}
+	if got := p.PushdownTerms()[0].Op; got != "!=" {
+		t.Errorf("`<>` compiled to Op %q; want the canonical \"!=\"", got)
+	}
+	if len(preds) != len(inventory) {
+		t.Errorf("pin has %d predicates for %d inventory ops — keep them 1:1", len(preds), len(inventory))
 	}
 }
