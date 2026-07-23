@@ -389,6 +389,16 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 	// Skip on dry-run — that's a write, and dry-run is read-only.
 	// ReadPosition below tolerates a missing control table by
 	// returning ok=false (same as "no row").
+	//
+	// This phase (and 2.5/2.7/2.8 below) runs on EVERY retry
+	// re-establish, so its DB-touching failures are wrapped with
+	// connectHint — like the applier-open sites — rather than the bare
+	// PhaseSchemaApply hint: a transient network blip here must ride
+	// runWithRetry's connect-transient fall-through instead of being
+	// terminal at exactly the step class Bugs 199/200 fixed one phase
+	// earlier (audit 2026-07-23 ARCH-4). Refusal/permission shapes stay
+	// terminal — the marker retries only positively-matched transient
+	// network shapes.
 	if !s.DryRun && !s.SchemaAlreadyApplied {
 		if err := applier.EnsureControlTable(ctx); err != nil {
 			if s.multiDatabaseMode() {
@@ -399,12 +409,12 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 				// target DSN with no database has nowhere to put the
 				// control table — name one and the per-source databases
 				// still route correctly.
-				return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
+				return connectHint(fmt.Errorf(
 					"pipeline: ensure control table (multi-database mode): the target DSN must name a database "+
 						"to host sluice_cdc_state (user data still routes to per-source-database namespaces): %w", err,
 				))
 			}
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
+			return connectHint(fmt.Errorf("pipeline: ensure control table: %w", err))
 		}
 	}
 
@@ -416,7 +426,9 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 	// same read-only reason as EnsureControlTable above.
 	if !s.DryRun {
 		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: clear stop signal: %w", err))
+			// connectHint, not PhaseSchemaApply: see the phase-2 comment
+			// (ARCH-4 — this runs on every retry re-establish).
+			return connectHint(fmt.Errorf("pipeline: clear stop signal: %w", err))
 		}
 	}
 
@@ -472,7 +484,11 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 		if fingerprint != "" {
 			existing, err := applier.ListStreams(ctx)
 			if err != nil {
-				return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: list streams for fingerprint check: %w", err))
+				// connectHint, not PhaseSchemaApply: see the phase-2 comment
+				// (ARCH-4). The collision REFUSAL below keeps its
+				// PhaseSchemaApply wrap — it is an operator-facing verdict,
+				// not a read that a blip can fail.
+				return connectHint(fmt.Errorf("pipeline: list streams for fingerprint check: %w", err))
 			}
 			if err := checkStreamIDCollision(streamID, fingerprint, existing); err != nil {
 				return migcore.WrapWithHint(migcore.PhaseSchemaApply, err)

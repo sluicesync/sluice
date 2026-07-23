@@ -36,7 +36,6 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -261,7 +260,12 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 	}
 	st, rowExists, err := readRecordedPublicationState(ctx, applier, streamID)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: read recorded publication name: %w", err))
+		// connectHint, not PhaseSchemaApply: phase 2.8 runs on every retry
+		// re-establish, so a transient network blip in this control-table
+		// read must ride runWithRetry's connect-transient fall-through like
+		// the applier-open sites (audit 2026-07-23 ARCH-4). The drift
+		// REFUSAL below keeps its coded terminal shape.
+		return connectHint(fmt.Errorf("pipeline: read recorded publication name: %w", err))
 	}
 	recorded := st.PublicationName
 	effective, overrode := resolveEffectivePublication(s.PublicationName, recorded, rowExists, s.ResetTargetData, len(s.RowFilters) > 0, streamID)
