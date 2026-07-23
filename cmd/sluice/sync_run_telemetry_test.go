@@ -35,6 +35,8 @@ syncs:
     notify-mem-util: 0.8
     notify-lag-seconds: 30
     notify-storage-growth-per-min: 0.02
+    notify-dead-tuple-ratio: 0.3
+    notify-xid-age: 1000000000
 `)
 	fleet, err := loadFleetConfig(path)
 	if err != nil {
@@ -55,6 +57,9 @@ syncs:
 	}
 	if s.NotifyLagSeconds != 30 || s.NotifyStorageGrowthPerMin != 0.02 {
 		t.Errorf("lag/growth thresholds mismatch: %+v", s)
+	}
+	if s.NotifyDeadTupleRatio != 0.3 || s.NotifyXIDAge != 1_000_000_000 {
+		t.Errorf("vacuum thresholds mismatch: %+v", s)
 	}
 }
 

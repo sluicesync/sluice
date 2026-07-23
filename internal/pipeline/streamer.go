@@ -504,6 +504,20 @@ type Streamer struct {
 	// failure-isolated, never on the value path.
 	NotifySyncLagSeconds float64
 
+	// NotifyDeadTupleRatio / NotifyXIDAge are the thresholds for the
+	// TARGET-side autovacuum advisory rules (the item-36 vacuum rule
+	// family, roadmap 2026-07-22): fire when the worst user table's
+	// dead-tuple ratio (dead/(dead+live), 0-1) or the database's
+	// age(datfrozenxid) is at or above the value. Like NotifySyncLagSeconds
+	// they are UNGATED from PlanetScale telemetry — the signal is probed
+	// from the target's own catalog via [ir.TargetVacuumHealthReporter]
+	// (Postgres targets only; a non-implementing target WARNs once and
+	// leaves the rules inert). 0 (the default) ⇒ INERT — the zero value is
+	// the safe off default for every construction. Observability only —
+	// failure-isolated, never on the value path.
+	NotifyDeadTupleRatio float64
+	NotifyXIDAge         float64
+
 	// NotifySMTP is the optional email/SMTP sink (roadmap item 48), wired
 	// into the SAME alerter path as the webhook/Slack sinks so every
 	// threshold alert — the ADR-0107 rules AND the item-45 sync-lag rule —

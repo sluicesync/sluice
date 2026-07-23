@@ -167,6 +167,13 @@ type SyncSpec struct {
 	NotifySyncLagSeconds float64       `koanf:"notify-sync-lag-seconds"`
 	NotifyCooldown       time.Duration `koanf:"notify-cooldown"`
 
+	// Target-side autovacuum advisory rules (the item-36 vacuum rule
+	// family). Like notify-sync-lag-seconds these are UNGATED from
+	// PlanetScale telemetry — probed from the Postgres target's own
+	// catalog; inert at 0 or on a non-Postgres target (WARN once).
+	NotifyDeadTupleRatio float64 `koanf:"notify-dead-tuple-ratio"`
+	NotifyXIDAge         float64 `koanf:"notify-xid-age"`
+
 	// NotifySchemaDrift toggles the ADR-0157 schema-drift alert per sync.
 	// Default ON, but a plain bool in a YAML spec gets the Go zero value
 	// (false) when omitted — the v0.99.51 trap — so it is a *bool: nil
@@ -980,6 +987,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		NotifySlackWebhookURL: spec.NotifySlack,
 		NotifySyncLagSeconds:  spec.NotifySyncLagSeconds,
 		NotifyCooldown:        spec.NotifyCooldown,
+		NotifyDeadTupleRatio:  spec.NotifyDeadTupleRatio,
+		NotifyXIDAge:          spec.NotifyXIDAge,
 		NotifySMTP:            smtp,
 		// ADR-0157: default-ON schema-drift alert; nil (omitted) ⇒ enabled.
 		SuppressSchemaDriftNotify: schemaDriftSuppressFromSpec(spec.NotifySchemaDrift),

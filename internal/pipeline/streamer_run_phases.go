@@ -861,6 +861,14 @@ func (s *Streamer) startTelemetrySidecars(ctx context.Context, applier ir.Change
 	// ⇒ no goroutine. Observability only — a dead sink is logged-and-swallowed,
 	// never able to stall or crash the stream.
 	s.startTargetMetricsNotifier(ctx, streamID, applier, s.TargetTelemetry, s.buildMetricsNotifier())
+
+	// Item-36 vacuum rule family (roadmap 2026-07-22): target-side
+	// autovacuum/dead-tuple + XID-wraparound advisories, probed from the
+	// target's own catalog — no telemetry provider needed. No threshold /
+	// no sink / non-Postgres target ⇒ no goroutine (the latter WARNs once).
+	// Started here so it covers cold-copy — the heaviest-write window,
+	// where dead tuples accumulate fastest — as well as CDC apply.
+	s.startVacuumHealthNotifier(ctx, streamID, applier)
 }
 
 // phaseWireInterceptChain wraps the raw change channel with the
