@@ -2322,38 +2322,59 @@ func publicationMemberSet(ctx context.Context, db *sql.DB, name string) (map[str
 
 // otherActiveSluiceSlots returns the ACTIVE sluice-convention
 // replication slots other than excludeSlot — the signal that some
-// other stream is currently reading through this source.
+// other stream holds a claim on this source.
 //
-// Activity is the right proxy at this layer. The alternative,
-// sluice_cdc_state, lives on the TARGET, and concurrent waves may have
-// entirely different targets, so no single target's control table is
-// authoritative about who is reading the source. This is a proxy and
-// not a registry: a conflicting stream whose slot is momentarily
-// inactive is not detected (ADR-0175 "Residual risk").
-func otherActiveSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]string, error) {
+// EXISTENCE, not activity, is the conflict signal (the ADR-0175
+// residual closure, 2026-07-23). A replication slot is the durable,
+// source-side object a stream owns for exactly as long as it intends
+// to resume — a slot that is merely INACTIVE (stream stopped
+// mid-migration, crashed, or between retry attempts) still names a
+// stream that will warm-resume expecting its scope, and "momentarily
+// inactive" was precisely the window the original activity predicate
+// left open. A stream with NO slot must cold-start, and cold start
+// re-asserts scope under this same guard. The cost is a conservative
+// refusal against a genuinely abandoned slot — but an abandoned slot
+// pins WAL and deserves the operator's attention anyway, and the
+// refusal message names both escapes.
+//
+// Still a source-side signal by design: sluice_cdc_state lives on the
+// TARGET, and concurrent waves may have entirely different targets, so
+// no single target's control table is authoritative about who is
+// reading the source.
+//
+// Each returned entry is rendered "name (active)" / "name (inactive)"
+// so the refusal tells the operator which conflicting streams are
+// running right now vs holding a resumable position.
+func otherSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]string, error) {
 	const slotQuery = `
-		SELECT slot_name
+		SELECT slot_name, active
 		FROM   pg_replication_slots
 		WHERE  slot_name LIKE 'sluice\_%'
-		  AND  active
 		  AND  slot_name <> $1
 		ORDER  BY slot_name`
 	rows, err := db.QueryContext(ctx, slotQuery, excludeSlot)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: list active sluice replication slots: %w", err)
+		return nil, fmt.Errorf("postgres: list sluice replication slots: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var slots []string
 	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
+		var (
+			s      string
+			active bool
+		)
+		if err := rows.Scan(&s, &active); err != nil {
 			return nil, fmt.Errorf("postgres: scan replication slot: %w", err)
 		}
-		slots = append(slots, s)
+		if active {
+			slots = append(slots, s+" (active)")
+		} else {
+			slots = append(slots, s+" (inactive — holds a resumable position; drop it with SELECT pg_drop_replication_slot('"+s+"') if the stream is truly abandoned)")
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("postgres: list active sluice replication slots: %w", err)
+		return nil, fmt.Errorf("postgres: list sluice replication slots: %w", err)
 	}
 	return slots, nil
 }
@@ -2395,26 +2416,29 @@ func guardPublicationNarrowing(
 		}
 	}
 
-	slots, err := otherActiveSluiceSlots(ctx, db, excludeSlot)
+	slots, err := otherSluiceSlots(ctx, db, excludeSlot)
 	if err != nil {
 		return err
 	}
 	if len(slots) == 0 {
-		return nil // nobody else is reading; the rescope is the operator's own
+		return nil // no other stream holds a claim; the rescope is the operator's own
 	}
 
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCPublicationScopeConflict,
-		"pass --publication-name to give this stream its own publication, or stop the other stream first",
+		"pass --publication-name to give this stream its own publication, stop the other stream first, or drop its slot if abandoned",
 		fmt.Errorf(
 			"postgres: refusing to rescope publication %q: it would REMOVE %s from the stream, "+
-				"but %d other active sluice replication slot(s) are reading through it (%s). "+
-				"A publication is pgoutput's table filter and nothing binds it to a slot, so this "+
-				"rescope would leave the other stream(s) advancing normally while receiving NOTHING "+
-				"for those tables — a silent divergence with a healthy-looking sync status. "+
+				"but %d other sluice replication slot(s) exist on this source (%s). "+
+				"A slot — active or not — is a stream that is reading through this publication or "+
+				"holds a resumable position expecting its scope; nothing binds a publication to a "+
+				"slot, so this rescope would leave those stream(s) advancing normally (or resuming "+
+				"later) while receiving NOTHING for those tables — a silent divergence with a "+
+				"healthy-looking sync status. "+
 				"Recovery: give each concurrent stream over this source its own publication "+
-				"(--publication-name NAME, per stream), or drain the other stream first "+
-				"(sluice sync stop --wait --stream-id ID). See ADR-0175",
+				"(--publication-name NAME, per stream), drain the other stream first "+
+				"(sluice sync stop --wait --stream-id ID), or — for a truly abandoned stream — "+
+				"drop its slot. See ADR-0175",
 			name,
 			strings.Join(removed, ", "),
 			len(slots),

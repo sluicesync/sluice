@@ -63,9 +63,11 @@ func createPGDatabase(t *testing.T, dsn, name string) string {
 }
 
 // waitForActiveSluiceSlot polls until the named replication slot
-// exists AND is active. The ADR-0175 guard keys on slot ACTIVITY, so a
-// conflict test that races ahead of the slot becoming active would
-// assert against an absent signal and pass vacuously.
+// exists AND is active. The guard's conflict signal is slot EXISTENCE
+// (the ADR-0175 residual closure), which arrives strictly before
+// activity — but the conflict test waits for ACTIVE anyway so it also
+// proves the running wave is genuinely delivering when the refusal
+// protects it, not merely registered.
 func waitForActiveSluiceSlot(t *testing.T, dsn, slotName string, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -274,6 +276,74 @@ func TestPublicationScope_ConflictRefusedWithoutIsolation(t *testing.T) {
 	case err := <-errA:
 		t.Fatalf("wave A exited early: %v", err)
 	default:
+	}
+}
+
+// TestPublicationScope_InactiveSlotStillConflicts pins the ADR-0175
+// residual closure (2026-07-23): the guard's conflict signal is slot
+// EXISTENCE, not activity. A stream that is stopped mid-migration
+// holds an INACTIVE slot and a resumable position that expects its
+// scope — the original activity predicate was blind to exactly this
+// window, so a narrowing rescope timed inside it silently starved the
+// stopped stream on resume. With existence semantics the rescope must
+// refuse, and the refusal must tell the operator the conflicting slot
+// is inactive (so a genuinely abandoned slot can be dropped).
+func TestPublicationScope_InactiveSlotStillConflicts(t *testing.T) {
+	sourceDSN, target, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	applyDDL(t, sourceDSN, pubScopeSeedDDL)
+
+	// The state a stopped-mid-migration wave leaves behind: the shared
+	// publication scoped to ITS tables, and its slot present but
+	// inactive (no consumer attached).
+	applyDDL(t, sourceDSN, "CREATE PUBLICATION sluice_pub FOR TABLE orders, order_items;")
+	applyDDL(t, sourceDSN, "SELECT pg_create_logical_replication_slot('sluice_ghost_wave', 'pgoutput');")
+	if active := pgQueryOne[bool](t, sourceDSN,
+		`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, "sluice_ghost_wave"); active {
+		t.Fatal("setup: the ghost slot is unexpectedly active; the pin needs an INACTIVE conflicting slot")
+	}
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	stream := &Streamer{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: target,
+		StreamID:  "wave-b",
+		SlotName:  "wave_b",
+		Filter:    migcore.TableFilter{Include: []string{"users", "sessions"}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	runErr := stream.Run(ctx)
+	if runErr == nil {
+		t.Fatal("cold start rescoped a publication another (inactive) sluice slot holds a claim on — " +
+			"the existence-semantics guard did not fire")
+	}
+	coded, ok := sluicecode.FromError(runErr)
+	if !ok || coded.Code != sluicecode.CodeCDCPublicationScopeConflict {
+		t.Fatalf("failed, but not with the expected coded refusal.\n got: %v", runErr)
+	}
+	msg := runErr.Error()
+	for _, want := range []string{"orders", "inactive", "sluice_ghost_wave", "--publication-name"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal message missing %q; got:\n%s", want, msg)
+		}
+	}
+
+	// Refuse-before-mutate: the stopped wave's scope must be intact.
+	members := pgQueryOne[int](t, sourceDSN,
+		`SELECT COUNT(*) FROM pg_publication_rel pr
+		   JOIN pg_class c ON c.oid = pr.prrelid
+		   JOIN pg_publication p ON p.oid = pr.prpubid
+		  WHERE p.pubname = $1 AND c.relname IN ('orders','order_items')`, "sluice_pub")
+	if members != 2 {
+		t.Fatalf("publication membership changed under a refused rescope: orders/order_items members = %d, want 2", members)
 	}
 }
 
