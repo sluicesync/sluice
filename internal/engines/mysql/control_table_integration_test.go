@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", "", "", 0, upsertRowAlias); err != nil {
+	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", "", "", "", 0, upsertRowAlias); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -401,7 +401,7 @@ func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := writePositionTx(ctx, tx, "", streamID, token, "", "", "", "", delta, upsertRowAlias); err != nil {
+		if err := writePositionTx(ctx, tx, "", streamID, token, "", "", "", "", "", delta, upsertRowAlias); err != nil {
 			t.Fatalf("writePositionTx: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -722,5 +722,110 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 	got, _ := findStream("rt-utf8")
 	if got.PublicationName != values["rt-utf8"] {
 		t.Errorf("empty write clobbered the record: got %q, want preserved %q", got.PublicationName, values["rt-utf8"])
+	}
+}
+
+// TestControlTable_RowFilterHashRoundTrip is the MySQL-target sibling of
+// the Postgres row_filter_hash pin (audit 2026-07-23 D0-2): a PG-source
+// filtered sync can target ANY engine and the control table lives on the
+// TARGET, so the recorded pushed-filter hash must round-trip BYTE-EXACT
+// through the MySQL store too — with the same legacy-migration and
+// COALESCE-preservation semantics as publication_name.
+func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// Pre-D0-2 shape: every column EXCEPT row_filter_hash, so the
+	// detect-then-ALTER migration arm is the one exercised.
+	applyMySQLApplier(t, dsn, "CREATE TABLE `sluice_cdc_state` ("+
+		"  stream_id              VARCHAR(255) NOT NULL,"+
+		"  source_position        LONGTEXT     NOT NULL,"+
+		"  updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"+
+		"  stop_requested_at      TIMESTAMP    NULL,"+
+		"  slot_name              VARCHAR(255) NULL,"+
+		"  publication_name       VARCHAR(255) NULL,"+
+		"  source_dsn_fingerprint VARCHAR(255) NULL,"+
+		"  target_schema          VARCHAR(255) NULL,"+
+		"  rows_applied           BIGINT       NOT NULL DEFAULT 0,"+
+		"  PRIMARY KEY (stream_id)"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"+
+		"INSERT INTO `sluice_cdc_state` (stream_id, source_position, publication_name) VALUES ('legacy-stream', 'legacy-token', 'sluice_pub');")
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	findStream := func(id string) (ir.StreamStatus, bool) {
+		t.Helper()
+		streams, err := applier.ListStreams(ctx)
+		if err != nil {
+			t.Fatalf("ListStreams: %v", err)
+		}
+		for _, s := range streams {
+			if s.StreamID == id {
+				return s, true
+			}
+		}
+		return ir.StreamStatus{}, false
+	}
+
+	// Legacy row: column freshly added, value NULL → surfaces as "" (the
+	// drift comparison's "not recorded — allow" signal), and the row's
+	// other columns survive the migration.
+	legacy, ok := findStream("legacy-stream")
+	if !ok {
+		t.Fatal("legacy-stream row vanished across the migration")
+	}
+	if legacy.RowFilterHash != "" {
+		t.Errorf("legacy RowFilterHash = %q; want empty (not recorded)", legacy.RowFilterHash)
+	}
+	if legacy.PublicationName != "sluice_pub" {
+		t.Errorf("legacy PublicationName = %q; want preserved sluice_pub", legacy.PublicationName)
+	}
+
+	// SetRowFilterHash threads through WritePosition and round-trips
+	// byte-exact — both the real-subset shape and the empty-subset
+	// sentinel (which must be storable and distinct from NULL/"").
+	myApplier := applier.(*ChangeApplier)
+	values := map[string]string{
+		"rt-hash":     "00d1a2b3c4d5e6f7",
+		"rt-sentinel": "cbf29ce484222325",
+	}
+	for streamID, hash := range values {
+		myApplier.SetRowFilterHash(hash)
+		if err := myApplier.WritePosition(ctx, streamID, ir.Position{Engine: engineNameMySQL, Token: "tok"}); err != nil {
+			t.Fatalf("WritePosition(%s): %v", streamID, err)
+		}
+		got, ok := findStream(streamID)
+		if !ok {
+			t.Fatalf("stream %s not listed after write", streamID)
+		}
+		if got.RowFilterHash != hash {
+			t.Errorf("RowFilterHash round-trip for %s: got %q, want byte-exact %q", streamID, got.RowFilterHash, hash)
+		}
+	}
+
+	// Empty follow-up write preserves the record (COALESCE) — the
+	// chain-handoff / MySQL-source shape where no hash is set.
+	myApplier.SetRowFilterHash("")
+	if err := myApplier.WritePosition(ctx, "rt-hash", ir.Position{Engine: engineNameMySQL, Token: "tok2"}); err != nil {
+		t.Fatalf("WritePosition (preserve): %v", err)
+	}
+	got, _ := findStream("rt-hash")
+	if got.RowFilterHash != values["rt-hash"] {
+		t.Errorf("empty write clobbered the record: got %q, want preserved %q", got.RowFilterHash, values["rt-hash"])
 	}
 }

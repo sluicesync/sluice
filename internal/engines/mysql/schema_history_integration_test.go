@@ -207,7 +207,7 @@ func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 	}
 	// Position write succeeds first (mirrors applyOne ordering: data
 	// + version on the tx, then writePositionTx).
-	if err := writePositionTx(ctx, tx, "", "atomic-stream", "tok-after-ddl", "", "", "", "", 0, upsertRowAlias); err != nil {
+	if err := writePositionTx(ctx, tx, "", "atomic-stream", "tok-after-ddl", "", "", "", "", "", 0, upsertRowAlias); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("writePositionTx: %v", err)
 	}

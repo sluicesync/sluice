@@ -154,3 +154,72 @@ func TestDerivePerStreamPublicationName(t *testing.T) {
 		}
 	})
 }
+
+// TestRowFilterPushdownHash pins the row_filter_hash stored-codec value
+// (audit 2026-07-23 D0-2): canonical (order-independent, table-case-
+// insensitive), 16 lower-hex bytes, sensitive to every field of every
+// pair, and the empty-subset SENTINEL is non-empty — the empty string
+// stays reserved for "not recorded" so the COALESCE position-write shape
+// can distinguish "nothing pushed" from "legacy row".
+func TestRowFilterPushdownHash(t *testing.T) {
+	a := rowFilterPushdownHash(map[string]string{"orders": "id < 100", "users": "country = 'US'"})
+	b := rowFilterPushdownHash(map[string]string{"users": "country = 'US'", "orders": "id < 100"})
+	if a != b {
+		t.Errorf("hash is insertion-order dependent: %s vs %s", a, b)
+	}
+	if len(a) != 16 {
+		t.Errorf("hash %q is not 16 hex bytes", a)
+	}
+	if got := rowFilterPushdownHash(map[string]string{"Orders": "id < 100", "Users": "country = 'US'"}); got != a {
+		t.Errorf("table-name casing changed the hash: %s vs %s (keys must canonicalize)", got, a)
+	}
+	if got := rowFilterPushdownHash(map[string]string{"orders": "id < 200", "users": "country = 'US'"}); got == a {
+		t.Error("a changed predicate did not change the hash")
+	}
+	if got := rowFilterPushdownHash(map[string]string{"orders": "id < 100"}); got == a {
+		t.Error("a removed table did not change the hash")
+	}
+	// The empty-subset sentinel: fnv64a's offset basis, pinned byte-exact —
+	// it is persisted state (a stored codec), so it must never drift.
+	if got := rowFilterPushdownHash(nil); got != "cbf29ce484222325" {
+		t.Errorf("empty-subset sentinel = %q; want cbf29ce484222325 (fnv64a offset basis)", got)
+	}
+	if got := rowFilterPushdownHash(map[string]string{}); got != "cbf29ce484222325" {
+		t.Errorf("empty-map sentinel = %q; want cbf29ce484222325", got)
+	}
+	if rowFilterPushdownHash(nil) == a {
+		t.Error("empty subset collides with a non-empty subset")
+	}
+}
+
+// TestRowFilterHashDrift pins the D0-2 warm-resume drift decision matrix,
+// including the escapes that must never be blocked by the refusal itself.
+func TestRowFilterHashDrift(t *testing.T) {
+	const (
+		recorded = "00000000aaaaaaaa"
+		other    = "00000000bbbbbbbb"
+	)
+	cases := []struct {
+		name                      string
+		rowExists, restart, reset bool
+		recorded, current         string
+		want                      bool
+	}{
+		{"no control row — new stream, nothing to drift", false, false, false, "", other, false},
+		{"legacy row (hash never recorded) — unknown, allow", true, false, false, "", other, false},
+		{"same hash — byte-identical resume proceeds", true, false, false, recorded, recorded, false},
+		{"changed subset — refuse", true, false, false, recorded, other, true},
+		{"removed --where (current = empty-subset sentinel) — refuse", true, false, false, recorded, rowFilterPushdownHash(nil), true},
+		{"added --where onto a recorded empty subset — refuse", true, false, false, rowFilterPushdownHash(nil), other, true},
+		{"--restart-from-scratch escape is never blocked", true, true, false, recorded, other, false},
+		{"--reset-target-data escape is never blocked", true, false, true, recorded, other, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rowFilterHashDrift(tc.rowExists, tc.restart, tc.reset, tc.recorded, tc.current); got != tc.want {
+				t.Errorf("rowFilterHashDrift(rowExists=%v restart=%v reset=%v recorded=%q current=%q) = %v, want %v",
+					tc.rowExists, tc.restart, tc.reset, tc.recorded, tc.current, got, tc.want)
+			}
+		})
+	}
+}

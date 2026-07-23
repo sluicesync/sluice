@@ -1751,6 +1751,22 @@ type StreamStatus struct {
 	// byte-identically to before" signal.
 	PublicationName string
 
+	// RowFilterHash is the canonical fnv64a hash (16 hex bytes) of the
+	// `--where` row-filter subset PUSHED into the source-side publication
+	// row filter (ADR-0176), recorded by the applier on each
+	// position-write — publication_name's exact sibling (audit 2026-07-23
+	// D0-2). The pushed predicate is DURABLE source-side catalog state
+	// that a warm resume never re-ensures, so `sync start` compares this
+	// record against the current run's pushed subset and refuses loudly
+	// on drift: a changed or removed `--where` would otherwise leave the
+	// SERVER filtering on the stale predicate — silent under-delivery
+	// that is unobservable client-side by construction. Set (to the
+	// empty-subset sentinel hash when nothing is pushed) for every stream
+	// whose source can carry publication row filters; empty means "not
+	// recorded" — legacy rows, non-publication sources, and pre-upgrade
+	// binaries — which the comparison treats as "unknown — allow".
+	RowFilterHash string
+
 	// SourceDSNFingerprint is the truncated SHA-256 hex of the
 	// stream's source DSN host+port+database tuple, recorded by the
 	// streamer on `sync start` (ADR-0031). Used for stream-id

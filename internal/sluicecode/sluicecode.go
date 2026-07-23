@@ -152,6 +152,17 @@ const (
 	CodeWhereCDCUnsupportedPredicate Code = "SLUICE-E-WHERE-CDC-UNSUPPORTED-PREDICATE"
 	CodeWhereCDCBeforeImage          Code = "SLUICE-E-WHERE-CDC-BEFORE-IMAGE"
 	CodeWhereCDCAfterImage           Code = "SLUICE-E-WHERE-CDC-AFTER-IMAGE"
+
+	// CodeWherePushdownDrift fires at sync-start when a warm resume's
+	// current `--where` flags don't match the row-filter subset the stream
+	// PUSHED into its Postgres publication at cold start (recorded as
+	// row_filter_hash in sluice_cdc_state — audit 2026-07-23 D0-2). The
+	// pushed filter is durable source-side catalog state a warm resume
+	// never re-ensures, so silently resuming would leave the SERVER
+	// filtering on the stale predicate — under-delivery the client cannot
+	// observe. Refusing names the escapes (re-pass the original --where,
+	// --restart-from-scratch, --reset-target-data).
+	CodeWherePushdownDrift Code = "SLUICE-E-WHERE-PUSHDOWN-DRIFT"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -248,6 +259,7 @@ var registry = map[Code]Info{
 	CodeWhereCDCUnsupportedPredicate: {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the predicate uses a construct the client-side CDC evaluator cannot faithfully evaluate (a function/subquery, an ordering or collation-sensitive string comparison, an unknown column, or unrecognized syntax) — evaluating it client-side could diverge from the source's own evaluation and silently leak or drop rows"},
 	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},
 	CodeWhereCDCAfterImage:           {ClassRefusal, "continuous filtered sync (--where on `sync`) stopped mid-stream: an UPDATE on a filtered table arrived with an AFTER-image missing a column the predicate references, so the row-move evaluation cannot decide whether the row left the filter's scope — evaluating over the missing column would read NULL and could emit a spurious DELETE for a row still in scope at the source (the audit 2026-07-23 D0-1 unchanged-TOAST class; the PG reader backfills that producer, so this belt firing means an unexpected partial after-image reached the filter)"},
+	CodeWherePushdownDrift:           {ClassRefusal, "warm resume refused: the current --where flags don't match the row-filter subset this stream PUSHED into its Postgres publication at cold start — the publication filter is durable source-side state a warm resume never re-ensures, so resuming would leave the SERVER silently filtering on the stale predicate (under-delivery the client cannot observe); re-run with the --where the stream was established with, or --restart-from-scratch to re-snapshot under the new predicate, or --reset-target-data for a destructive reset"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

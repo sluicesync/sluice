@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", "", "", "", 0); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -390,7 +390,7 @@ func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := writePositionTx(ctx, tx, "public", streamID, token, "", "", "", "", delta); err != nil {
+		if err := writePositionTx(ctx, tx, "public", streamID, token, "", "", "", "", "", delta); err != nil {
 			t.Fatalf("writePositionTx: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -455,7 +455,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "", "fp-a", "customer_svc", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "", "", "fp-a", "customer_svc", 0); err != nil {
 		t.Fatalf("first writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -480,7 +480,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin 2: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", "", "", "", 0); err != nil {
 		t.Fatalf("second writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -613,7 +613,7 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin %s: %v", streamID, err)
 		}
-		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", pub, "", "", 0); err != nil {
+		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", pub, "", "", "", 0); err != nil {
 			t.Fatalf("writePositionTx(%s): %v", streamID, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -633,7 +633,7 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin preserve: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "rt-utf8", "tok-2", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "rt-utf8", "tok-2", "", "", "", "", "", 0); err != nil {
 		t.Fatalf("writePositionTx(preserve): %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -654,5 +654,146 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 	got, ok = findStream("rt-setter")
 	if !ok || got.PublicationName != "sluice_via_setter" {
 		t.Errorf("SetPublicationName did not reach the row: got %q (found=%v), want sluice_via_setter", got.PublicationName, ok)
+	}
+}
+
+// TestControlTable_RowFilterHashRoundTrip pins the D0-2 (audit 2026-07-23)
+// stored codec: the row_filter_hash column — publication_name's exact
+// sibling — on real Postgres.
+//
+//   - Legacy migration: a pre-D0-2 control table (no row_filter_hash
+//     column) picks it up on EnsureControlTable; the legacy row's value
+//     surfaces as "" through ListStreams (== "not recorded; drift
+//     unknown — allow") and its other columns survive.
+//   - Round-trip is BYTE-EXACT per the new-surface codec checklist: both
+//     the real-subset shape and the empty-subset sentinel
+//     ("cbf29ce484222325") come back identical — a silently-normalizing
+//     store would break the warm-resume drift comparison invisibly.
+//   - COALESCE preservation: an empty follow-up write (chain handoff /
+//     pre-streamer WritePosition) must NOT clobber the record.
+//   - SetRowFilterHash threads through the WritePosition path.
+func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	// Pre-D0-2 shape: every column EXCEPT row_filter_hash.
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id              VARCHAR(255) NOT NULL,
+			source_position        TEXT         NOT NULL,
+			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			stop_requested_at      TIMESTAMP    NULL,
+			slot_name              TEXT         NULL,
+			publication_name       TEXT         NULL,
+			source_dsn_fingerprint TEXT         NULL,
+			target_schema          TEXT         NULL,
+			rows_applied           BIGINT       NOT NULL DEFAULT 0,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position, publication_name)
+		VALUES ('legacy-stream', 'legacy-token', 'sluice_pub');
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	findStream := func(id string) (ir.StreamStatus, bool) {
+		t.Helper()
+		streams, err := applier.ListStreams(ctx)
+		if err != nil {
+			t.Fatalf("ListStreams: %v", err)
+		}
+		for _, s := range streams {
+			if s.StreamID == id {
+				return s, true
+			}
+		}
+		return ir.StreamStatus{}, false
+	}
+
+	// Legacy row: column freshly added, value NULL → surfaces as "".
+	legacy, ok := findStream("legacy-stream")
+	if !ok {
+		t.Fatal("legacy-stream row vanished across the migration")
+	}
+	if legacy.RowFilterHash != "" {
+		t.Errorf("legacy RowFilterHash = %q; want empty (not recorded)", legacy.RowFilterHash)
+	}
+	if legacy.PublicationName != "sluice_pub" {
+		t.Errorf("legacy PublicationName = %q; want preserved sluice_pub", legacy.PublicationName)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// The codec matrix: byte-exact round-trip for both the real-subset
+	// shape and the empty-subset sentinel (distinct from NULL/"").
+	values := map[string]string{
+		"rt-hash":     "00d1a2b3c4d5e6f7",
+		"rt-sentinel": "cbf29ce484222325",
+	}
+	for streamID, hash := range values {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin %s: %v", streamID, err)
+		}
+		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", "", hash, "", "", 0); err != nil {
+			t.Fatalf("writePositionTx(%s): %v", streamID, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit %s: %v", streamID, err)
+		}
+		got, ok := findStream(streamID)
+		if !ok {
+			t.Fatalf("stream %s not listed after write", streamID)
+		}
+		if got.RowFilterHash != hash {
+			t.Errorf("RowFilterHash round-trip for %s: got %q, want byte-exact %q", streamID, got.RowFilterHash, hash)
+		}
+	}
+
+	// Empty follow-up write preserves the record (COALESCE).
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin preserve: %v", err)
+	}
+	if err := writePositionTx(ctx, tx, "public", "rt-hash", "tok-2", "", "", "", "", "", 0); err != nil {
+		t.Fatalf("writePositionTx(preserve): %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit preserve: %v", err)
+	}
+	got, _ := findStream("rt-hash")
+	if got.RowFilterHash != values["rt-hash"] {
+		t.Errorf("empty write clobbered the record: got %q, want preserved %q", got.RowFilterHash, values["rt-hash"])
+	}
+
+	// SetRowFilterHash threads through the WritePosition path — the same
+	// route the streamer's cold-start anchor write takes.
+	pgApplier := applier.(*ChangeApplier)
+	pgApplier.SetRowFilterHash("cbf29ce484222325")
+	if err := pgApplier.WritePosition(ctx, "rt-setter", ir.Position{Token: "tok-s"}); err != nil {
+		t.Fatalf("WritePosition: %v", err)
+	}
+	got, ok = findStream("rt-setter")
+	if !ok || got.RowFilterHash != "cbf29ce484222325" {
+		t.Errorf("SetRowFilterHash did not reach the row: got %q (found=%v), want cbf29ce484222325", got.RowFilterHash, ok)
 	}
 }

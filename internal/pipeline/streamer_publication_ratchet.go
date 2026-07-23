@@ -32,9 +32,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // publicationNameSetter is the optional applier-side surface for
@@ -45,6 +48,48 @@ import (
 // target any engine); test stubs that don't are skipped cleanly.
 type publicationNameSetter interface {
 	SetPublicationName(name string)
+}
+
+// rowFilterHashSetter is [publicationNameSetter]'s exact sibling (audit
+// 2026-07-23 D0-2): the optional applier-side surface for recording the
+// canonical hash of the `--where` subset the stream pushes into its
+// publication row filter, persisted beside publication_name on every
+// position-write. Both shipping appliers implement it; test stubs that
+// don't are skipped cleanly.
+type rowFilterHashSetter interface {
+	SetRowFilterHash(hash string)
+}
+
+// rowFilterPushdownHash canonically hashes the classifier-approved pushed
+// row-filter subset (table → raw predicate text): fnv64a over the
+// lower-cased table name and the raw predicate of each entry, sorted by
+// table, each field NUL-terminated so pair boundaries can't be forged by
+// concatenation. Rendered as 16 lower-hex bytes — the row_filter_hash
+// stored-codec value.
+//
+// The empty subset hashes to the fnv64a offset basis
+// ("cbf29ce484222325") — a deliberate NON-empty sentinel: for a
+// publication-scoped source "nothing pushed" is a positive fact that must
+// OVERWRITE a previously-recorded hash on the next cold start (the
+// --restart-from-scratch escape after removing --where), while the empty
+// STRING stays reserved for "not recorded" (legacy rows, non-publication
+// sources) which the COALESCE position-write shape preserves rather than
+// clobbers.
+func rowFilterPushdownHash(filters map[string]string) string {
+	type pair struct{ table, pred string }
+	pairs := make([]pair, 0, len(filters))
+	for t, p := range filters {
+		pairs = append(pairs, pair{strings.ToLower(t), p})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].table < pairs[j].table })
+	h := fnv.New64a()
+	for _, p := range pairs {
+		_, _ = h.Write([]byte(p.table))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(p.pred))
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // pgMaxIdentifierBytes is Postgres's NAMEDATALEN-1 identifier limit.
@@ -132,23 +177,48 @@ func resolveEffectivePublication(explicit, recorded string, rowExists, filtered 
 	return "", false
 }
 
-// readRecordedPublicationName loads the stream's control row (if any)
-// and returns its recorded publication name. rowExists=false is the
-// genuinely-new-stream signal the per-stream-default derivation keys
-// on; a row with an empty PublicationName is the legacy shape and
-// stays on the shared engine default. Tolerant of a missing control
-// table by construction — ListStreams returns "no streams" then.
-func readRecordedPublicationName(ctx context.Context, applier ir.ChangeApplier, streamID string) (recorded string, rowExists bool, err error) {
+// rowFilterHashDrift is the D0-2 warm-resume drift decision (audit
+// 2026-07-23), pure so the whole matrix is unit-pinnable:
+//
+//   - only an EXISTING control row can drift (a genuinely new stream has
+//     nothing recorded — cold start pushes and records the current subset);
+//   - --restart-from-scratch / --reset-target-data skip the comparison:
+//     both force a cold start that re-ensures the publication with the
+//     CURRENT filters and re-records the hash — they are two of the
+//     refusal's own named escapes and must never be blocked by it;
+//   - an empty recorded hash is "not recorded" (legacy rows, pre-drift
+//     binaries, non-publication paths): unknown — allow, the same
+//     tolerance the ADR-0031 fingerprint check uses;
+//   - otherwise any mismatch refuses — INCLUDING current-empty-subset vs
+//     recorded-non-empty (a REMOVED --where, D0-2's worst variant,
+//     previously zero-signal): the empty subset hashes to the non-empty
+//     sentinel, never to "".
+func rowFilterHashDrift(rowExists, restartFromScratch, resetTargetData bool, recorded, current string) bool {
+	if !rowExists || restartFromScratch || resetTargetData || recorded == "" {
+		return false
+	}
+	return recorded != current
+}
+
+// readRecordedPublicationState loads the stream's control row (if any)
+// and returns it whole — the recorded publication name the ratchet keys
+// on, plus the recorded row_filter_hash the D0-2 drift comparison reads.
+// rowExists=false is the genuinely-new-stream signal the
+// per-stream-default derivation keys on; a row with an empty
+// PublicationName is the legacy shape and stays on the shared engine
+// default. Tolerant of a missing control table by construction —
+// ListStreams returns "no streams" then.
+func readRecordedPublicationState(ctx context.Context, applier ir.ChangeApplier, streamID string) (st ir.StreamStatus, rowExists bool, err error) {
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		return "", false, err
+		return ir.StreamStatus{}, false, err
 	}
-	for _, st := range streams {
-		if st.StreamID == streamID {
-			return st.PublicationName, true, nil
+	for _, s := range streams {
+		if s.StreamID == streamID {
+			return s, true, nil
 		}
 	}
-	return "", false, nil
+	return ir.StreamStatus{}, false, nil
 }
 
 // phaseResolvePublicationScope is runOnce's ---- 2.8 ---- step: the
@@ -174,10 +244,11 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 	if !ok {
 		return nil
 	}
-	recorded, rowExists, err := readRecordedPublicationName(ctx, applier, streamID)
+	st, rowExists, err := readRecordedPublicationState(ctx, applier, streamID)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: read recorded publication name: %w", err))
 	}
+	recorded := st.PublicationName
 	effective, overrode := resolveEffectivePublication(s.PublicationName, recorded, rowExists, len(s.RowFilters) > 0, streamID)
 	if overrode {
 		slog.WarnContext(
@@ -208,6 +279,39 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 	if !s.DryRun {
 		if setter, ok := applier.(publicationNameSetter); ok {
 			setter.SetPublicationName(s.PublicationName)
+		}
+	}
+	// ADR-0176 + audit 2026-07-23 D0-2: the pushed row-filter subset is
+	// DURABLE source-side catalog state (warm resume never re-ensures the
+	// publication), so a source that can carry publication row filters gets
+	// the reconciliation contract here — compare the recorded hash against
+	// the current run's pushed subset, refuse loudly on drift, and record
+	// the current hash beside publication_name on every position-write.
+	if _, ok := s.Source.(ir.PublicationRowFilterer); ok {
+		currentHash := rowFilterPushdownHash(s.publicationRowFilters)
+		if rowFilterHashDrift(rowExists, s.RestartFromScratch, s.ResetTargetData, st.RowFilterHash, currentHash) {
+			pushed := make([]string, 0, len(s.publicationRowFilters))
+			for table := range s.publicationRowFilters {
+				pushed = append(pushed, table)
+			}
+			sort.Strings(pushed)
+			return sluicecode.Wrap(
+				sluicecode.CodeWherePushdownDrift,
+				"re-run with the --where this stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (required for a widened filter anyway), or --reset-target-data for a destructive reset",
+				fmt.Errorf(
+					"pipeline: warm resume refused: the current --where flags don't match the row-filter subset stream %q "+
+						"pushed into its publication at cold start (recorded row_filter_hash %s, current %s; currently-pushed "+
+						"tables: [%s]). The publication row filter is durable source-side state a warm resume never re-ensures, "+
+						"so resuming would leave the SERVER silently filtering on the stale predicate — rows the new flags admit "+
+						"would never be delivered, unobservably (audit 2026-07-23 D0-2)",
+					streamID, st.RowFilterHash, currentHash, strings.Join(pushed, ", "),
+				),
+			)
+		}
+		if !s.DryRun {
+			if setter, ok := applier.(rowFilterHashSetter); ok {
+				setter.SetRowFilterHash(currentHash)
+			}
 		}
 	}
 	// ADR-0176: thread the classifier-approved `--where` predicates into the

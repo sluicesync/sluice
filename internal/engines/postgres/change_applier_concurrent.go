@@ -372,7 +372,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 		return classifyApplierError(err)
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, rowsApplied)
+	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
 	posCancel()
 	if werr != nil {
 		_ = tx.Rollback()

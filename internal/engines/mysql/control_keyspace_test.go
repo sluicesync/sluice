@@ -177,12 +177,13 @@ func TestSelectControlKeyspace(t *testing.T) {
 // column in both the INSERT list and the ON DUPLICATE KEY UPDATE set.
 func TestWritePositionUpsertSQL(t *testing.T) {
 	const wantBare = "INSERT INTO `sluice_cdc_state` " +
-		"(stream_id, source_position, slot_name, publication_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
+		"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
 		"slot_name = COALESCE(new.slot_name, `sluice_cdc_state`.slot_name), " +
 		"publication_name = COALESCE(new.publication_name, `sluice_cdc_state`.publication_name), " +
+		"row_filter_hash = COALESCE(new.row_filter_hash, `sluice_cdc_state`.row_filter_hash), " +
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `sluice_cdc_state`.source_dsn_fingerprint), " +
 		"target_schema = COALESCE(new.target_schema, `sluice_cdc_state`.target_schema), " +
 		"rows_applied = COALESCE(`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"
@@ -191,12 +192,13 @@ func TestWritePositionUpsertSQL(t *testing.T) {
 	}
 
 	const wantQualified = "INSERT INTO `ctl`.`sluice_cdc_state` " +
-		"(stream_id, source_position, slot_name, publication_name, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
+		"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
 		"slot_name = COALESCE(new.slot_name, `ctl`.`sluice_cdc_state`.slot_name), " +
 		"publication_name = COALESCE(new.publication_name, `ctl`.`sluice_cdc_state`.publication_name), " +
+		"row_filter_hash = COALESCE(new.row_filter_hash, `ctl`.`sluice_cdc_state`.row_filter_hash), " +
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `ctl`.`sluice_cdc_state`.source_dsn_fingerprint), " +
 		"target_schema = COALESCE(new.target_schema, `ctl`.`sluice_cdc_state`.target_schema), " +
 		"rows_applied = COALESCE(`ctl`.`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"

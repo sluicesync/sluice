@@ -270,7 +270,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint begin: %w", err))
 	}
-	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
 	}

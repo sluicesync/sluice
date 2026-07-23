@@ -172,7 +172,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, rowsApplied)
+			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
 			if b, ok := tx.(*pgxBatchTx); ok {

@@ -216,14 +216,14 @@ func TestReadStopRequested_Shapes(t *testing.T) {
 }
 
 func streamCols() []string {
-	return []string{"stream_id", "source_position", "updated_at", "slot_name", "publication_name", "source_dsn_fingerprint", "target_schema", "rows_applied"}
+	return []string{"stream_id", "source_position", "updated_at", "slot_name", "publication_name", "row_filter_hash", "source_dsn_fingerprint", "target_schema", "rows_applied"}
 }
 
 func TestListStreams_ScanAndEngineStamp(t *testing.T) {
 	updated := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	db, cfg, _ := ctFixture(t, []ctStep{{rows: &ctRows{
 		cols: streamCols(),
-		data: [][]driver.Value{{"s1", "tok-1", updated, "slot-a", "sluice_pub_a", "fp-a", "schema-a", int64(4242)}},
+		data: [][]driver.Value{{"s1", "tok-1", updated, "slot-a", "sluice_pub_a", "00d1a2b3c4d5e6f7", "fp-a", "schema-a", int64(4242)}},
 	}}})
 	out, err := ListStreams(context.Background(), db, cfg, "Q", "engine-x")
 	if err != nil {
@@ -235,6 +235,7 @@ func TestListStreams_ScanAndEngineStamp(t *testing.T) {
 		UpdatedAt:            updated,
 		SlotName:             "slot-a",
 		PublicationName:      "sluice_pub_a",
+		RowFilterHash:        "00d1a2b3c4d5e6f7",
 		SourceDSNFingerprint: "fp-a",
 		TargetSchema:         "schema-a",
 		RowsApplied:          4242,

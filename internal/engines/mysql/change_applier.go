@@ -222,6 +222,17 @@ type ChangeApplier struct {
 	// engine-default `sluice_pub`.
 	publicationName string
 
+	// rowFilterHash is the canonical hash of the `--where` subset the
+	// active stream pushed into its SOURCE-side publication row filter,
+	// set by [SetRowFilterHash] at Streamer startup — publicationName's
+	// exact sibling (audit 2026-07-23 D0-2). Same cross-engine parity
+	// rationale: a PG-source sync can target MySQL, and the warm-resume
+	// drift refusal reads the recorded hash back from the TARGET's
+	// sluice_cdc_state row via ListStreams, so the column must round-trip
+	// here too. Empty on same-engine MySQL → MySQL streams (no
+	// publication concept) and for legacy streams.
+	rowFilterHash string
+
 	// sourceFingerprint is the truncated SHA-256 hex of the streamer's
 	// source DSN host+port+database tuple, set by
 	// [SetSourceDSNFingerprint] at Streamer startup. Same
@@ -458,6 +469,22 @@ func (a *ChangeApplier) SetSlotName(slotName string) {
 // writePositionTx. Idempotent; the streamer may call this on every Run.
 func (a *ChangeApplier) SetPublicationName(name string) {
 	a.publicationName = name
+}
+
+// SetRowFilterHash records the canonical hash of the `--where` subset the
+// active stream pushed into its publication row filter, so subsequent
+// position-writes populate the sluice_cdc_state row's row_filter_hash
+// column — publication_name's exact sibling (audit 2026-07-23 D0-2).
+// Symmetric with the PG ChangeApplier's counterpart: a cross-engine
+// PG → MySQL stream records the pushed subset on the TARGET's control
+// table so the warm-resume drift refusal protects it too.
+//
+// MySQL sources have no publication concept, so on a MySQL-source stream
+// the structural call lands with an empty string; empty input is a no-op
+// via writePositionTx's COALESCE-tolerant shape. Idempotent; the streamer
+// may call this on every Run.
+func (a *ChangeApplier) SetRowFilterHash(hash string) {
+	a.rowFilterHash = hash
 }
 
 // SetSourceDSNFingerprint implements [ir.SourceFingerprintRecorder].
@@ -923,7 +950,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, 0, a.upsert)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0, a.upsert)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1056,7 +1083,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
 		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c), a.upsert)
+		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c), a.upsert)
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()

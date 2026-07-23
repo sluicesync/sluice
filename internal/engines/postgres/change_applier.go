@@ -207,6 +207,19 @@ type ChangeApplier struct {
 	// existing value is preserved on the conflict path.
 	publicationName string
 
+	// rowFilterHash is the canonical hash of the `--where` subset the
+	// active stream pushed into its publication row filter, set by
+	// [SetRowFilterHash] at Streamer startup — publicationName's exact
+	// sibling (audit 2026-07-23 D0-2). Threaded into every
+	// [writePositionTx] call so the per-target sluice_cdc_state row's
+	// row_filter_hash column records what the SERVER is filtering on;
+	// `sync start` reads it back (via ListStreams) and refuses a warm
+	// resume whose current flags drift from it. Empty when the streamer
+	// never set it (non-publication sources, legacy binaries, broker
+	// chain-handoff); the row's existing value is preserved on the
+	// conflict path.
+	rowFilterHash string
+
 	// sourceFingerprint is the truncated SHA-256 hex of the streamer's
 	// source DSN host+port+database tuple, set by
 	// [SetSourceDSNFingerprint] at Streamer startup. Threaded into
@@ -1096,7 +1109,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, 0)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1139,6 +1152,22 @@ func (a *ChangeApplier) SetSlotName(slotName string) {
 // writePositionTx preserves any previously-recorded value in that case.
 func (a *ChangeApplier) SetPublicationName(name string) {
 	a.publicationName = name
+}
+
+// SetRowFilterHash records the canonical hash of the `--where` subset the
+// active stream pushes into its publication row filter, so subsequent
+// position-writes populate the sluice_cdc_state row's row_filter_hash
+// column — publication_name's exact sibling (audit 2026-07-23 D0-2).
+// `sync start` reads the recorded value back via [ListStreams] and refuses
+// a warm resume whose current flags drift from the durable server-side
+// filter.
+//
+// Idempotent — the streamer may call this on every Run. Empty input is
+// allowed (no-op set) and means "not recorded" (a non-publication source /
+// a caller predating the drift check); the COALESCE pattern in
+// writePositionTx preserves any previously-recorded value in that case.
+func (a *ChangeApplier) SetRowFilterHash(hash string) {
+	a.rowFilterHash = hash
 }
 
 // SetSchema implements [ir.SchemaSetter]. Records the per-source
@@ -1332,7 +1361,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
 		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
+		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()

@@ -138,17 +138,19 @@ func ReadPosition(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, quer
 // destination yet.
 //
 // query is the engine-built SELECT over (stream_id, source_position,
-// updated_at, slot_name, publication_name, source_dsn_fingerprint,
-// target_schema, rows_applied) with COALESCE(”) on the string columns and
-// COALESCE(…, 0) on rows_applied, so legacy rows that pre-date those
-// columns surface as empty strings / 0 in the StreamStatus — callers
-// branch on empty-string rather than handling sql.NullString. The
-// fingerprint check (ADR-0031) treats empty as "unknown — allow," so
-// legacy rows don't trip false-positive stream-id collisions; the
-// target_schema check (Bug 46) treats empty as "operator did not pass
-// --target-schema; use the DSN default schema"; rows_applied 0 on a
-// legacy row is the honest cumulative starting point (pre-upgrade
-// applies were never tracked).
+// updated_at, slot_name, publication_name, row_filter_hash,
+// source_dsn_fingerprint, target_schema, rows_applied) with COALESCE(”) on
+// the string columns and COALESCE(…, 0) on rows_applied, so legacy rows
+// that pre-date those columns surface as empty strings / 0 in the
+// StreamStatus — callers branch on empty-string rather than handling
+// sql.NullString. The fingerprint check (ADR-0031) treats empty as
+// "unknown — allow," so legacy rows don't trip false-positive stream-id
+// collisions; the target_schema check (Bug 46) treats empty as "operator
+// did not pass --target-schema; use the DSN default schema"; an empty
+// row_filter_hash is "no pushed row-filter subset recorded" (audit
+// 2026-07-23 D0-2 — the drift comparison treats it as unknown-allow);
+// rows_applied 0 on a legacy row is the honest cumulative starting point
+// (pre-upgrade applies were never tracked).
 //
 // positionEngine is stamped onto each returned Position for symmetry
 // with ReadPosition's contract — the token alone is opaque without
@@ -171,16 +173,17 @@ func ListStreams(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, query
 	out := []ir.StreamStatus{}
 	for rows.Next() {
 		var (
-			streamID     string
-			token        string
-			updated      time.Time
-			slotName     string
-			publication  string
-			fingerprint  string
-			targetSchema string
-			rowsApplied  int64
+			streamID      string
+			token         string
+			updated       time.Time
+			slotName      string
+			publication   string
+			rowFilterHash string
+			fingerprint   string
+			targetSchema  string
+			rowsApplied   int64
 		)
-		if err := rows.Scan(&streamID, &token, &updated, &slotName, &publication, &fingerprint, &targetSchema, &rowsApplied); err != nil {
+		if err := rows.Scan(&streamID, &token, &updated, &slotName, &publication, &rowFilterHash, &fingerprint, &targetSchema, &rowsApplied); err != nil {
 			return nil, fmt.Errorf("%s: scan streams: %w", cfg.EngineName, err)
 		}
 		out = append(out, ir.StreamStatus{
@@ -189,6 +192,7 @@ func ListStreams(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, query
 			UpdatedAt:            updated,
 			SlotName:             slotName,
 			PublicationName:      publication,
+			RowFilterHash:        rowFilterHash,
 			SourceDSNFingerprint: fingerprint,
 			TargetSchema:         targetSchema,
 			RowsApplied:          rowsApplied,

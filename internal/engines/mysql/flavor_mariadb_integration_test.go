@@ -1160,7 +1160,7 @@ func TestMariaDB_UpsertSpelling_ExecutesLive(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := writePositionTx(ctx, tx, "", "mdb-stream", tok, "", "", "", "", int64(i), upsertValuesFunc); err != nil {
+		if err := writePositionTx(ctx, tx, "", "mdb-stream", tok, "", "", "", "", "", int64(i), upsertValuesFunc); err != nil {
 			t.Fatalf("writePositionTx (%s): %v", tok, err)
 		}
 		if err := tx.Commit(); err != nil {
