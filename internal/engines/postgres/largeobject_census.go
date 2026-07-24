@@ -15,12 +15,13 @@ import (
 //
 // Used by the pipeline's advisory `warnLargeObjects` preflight (roadmap
 // item 68c): large-object CONTENTS live in pg_largeobject, outside any
-// user table, so sluice copies the referencing oid values as plain
-// integers and the blobs themselves are stranded on the source — a
-// skip that was previously silent. The census powers a WARN, never a
-// refusal: an oid column is also a perfectly ordinary integer-ish
-// column (row OIDs, catalog references), so only the operator knows
-// whether the referenced blobs matter.
+// user table, and sluice does not copy them — a skip that was
+// previously silent. The census powers a WARN, never a refusal of its
+// own: only the operator knows whether the referenced blobs matter.
+// Note the suspect columns themselves are unsupported column types the
+// schema read refuses loudly, which is why the pipeline runs this
+// census BEFORE ReadSchema (Bug 205) — the WARN is that refusal's
+// large-object context.
 //
 // loCount is the number of large objects on the source
 // (pg_largeobject_metadata rows — one per lo, world-readable unlike

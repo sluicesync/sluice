@@ -11,26 +11,29 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Roadmap item 68c (ps-discovery comparison, 2026-07-15). Postgres
 // large-object CONTENTS live in pg_largeobject, outside every user
-// table; sluice copies the referencing `oid`/`lo` column values as
-// plain integers and the blobs themselves are STRANDED on the source —
-// a skip that was previously silent.
+// table; sluice does not copy them, and the blobs are STRANDED on the
+// source — a skip that was previously silent.
 //
-// Deliberately a WARN, never a refusal: an oid column is also a
-// perfectly ordinary integer-ish column, the referencing values copy
-// faithfully, and only the operator knows whether the referenced blobs
-// matter. Two volumes:
+// Deliberately a WARN, never a refusal by itself: the census can't
+// prove the blobs matter, only the operator knows. Two volumes:
 //
 //   - large objects exist AND an in-scope column is typed oid/lo →
-//     the full WARN naming the suspect table.column pairs and stating
-//     the blobs are not copied (docs/type-mapping.md carries the
-//     recovery recipes);
+//     the full WARN naming the suspect table.column pairs. An oid/lo
+//     column is ALSO an unsupported column type the schema read
+//     refuses loudly (Bug 205) — which is exactly why this census runs
+//     BEFORE ReadSchema: the WARN gives the refusal its large-object
+//     context (why the column exists, what the blobs mean, the
+//     docs/type-mapping.md recovery recipes) instead of arriving as
+//     dead code after the run has already refused;
 //   - large objects exist but NO in-scope column could reference them
-//     → one quieter WARN (the census can't prove anything points at
-//     them, but the operator should know the los won't travel).
+//     → one quieter WARN (nothing appears to point at them, but the
+//     operator should know the los won't travel), and the run
+//     proceeds.
 //
 // A probe failure skips SILENTLY (DEBUG only): this is an advisory
 // census on catalogs a managed platform could restrict, and it must
@@ -47,11 +50,16 @@ type largeObjectPreflightProber interface {
 }
 
 // warnLargeObjects runs the large-object census against the source
-// schema reader and WARNs — the run always proceeds — when the source
-// holds large objects. schema is the FILTERED schema (post
-// --include/--exclude), which scopes the suspect-column report:
-// suspects on excluded tables don't name themselves (the quieter WARN
-// still fires — the los exist regardless of scope).
+// schema reader and WARNs when the source holds large objects. It runs
+// BEFORE the schema read (Bug 205): the census probes the catalogs
+// directly, so it needs no parsed schema, and an in-scope oid/lo
+// column — the very suspect shape it names — refuses at ReadSchema as
+// an unsupported column type, so a post-read census could never reach
+// its named-suspect branch. Suspect scoping therefore rides the
+// operator's [migcore.TableFilter] (the same in-scope notion as
+// [warnForeignTables]): suspects on excluded tables don't name
+// themselves (the quieter WARN still fires — the los exist regardless
+// of scope).
 //
 // Silent no-op when:
 //
@@ -60,7 +68,7 @@ type largeObjectPreflightProber interface {
 //   - The handle doesn't implement the prober surface.
 //   - The probe fails (advisory census — DEBUG log, never an error).
 //   - The source has no large objects.
-func warnLargeObjects(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) {
+func warnLargeObjects(ctx context.Context, handle any, sourceCaps ir.Capabilities, filter migcore.TableFilter) {
 	if !sourceCaps.PostgresBackend {
 		return
 	}
@@ -80,16 +88,10 @@ func warnLargeObjects(ctx context.Context, handle any, sourceCaps ir.Capabilitie
 		return
 	}
 
-	// Scope the suspect columns to the filtered table set.
-	inScope := make(map[string]bool, len(schema.Tables))
-	for _, t := range schema.Tables {
-		if t != nil {
-			inScope[t.Name] = true
-		}
-	}
+	// Scope the suspect columns to the operator's table filter.
 	var named []string
 	for table, cols := range suspects {
-		if !inScope[table] {
+		if !filter.Allows(table) {
 			continue
 		}
 		for _, col := range cols {
@@ -109,10 +111,11 @@ func warnLargeObjects(ctx context.Context, handle any, sourceCaps ir.Capabilitie
 	}
 	slog.WarnContext(ctx, fmt.Sprintf(
 		"the source database holds %d large object(s) (pg_largeobject) and %d in-scope column(s) are typed "+
-			"oid/lo — likely large-object references: %s. sluice copies the referencing oid values as plain "+
-			"integers but NOT the large objects themselves: on the target those ids point at nothing. If the "+
-			"blobs matter, export them separately (lo_export / pg_dump --blobs) or convert the columns to bytea "+
-			"on the source first — see docs/type-mapping.md, \"Postgres large objects\"",
+			"oid/lo — likely large-object references: %s. sluice does not copy large objects, and oid/lo are "+
+			"themselves unsupported column types, so the schema read will refuse these columns next. To proceed "+
+			"without them, pass --exclude-table for each table; to carry the blobs, convert the columns to inline "+
+			"bytea on the source first (ALTER ... TYPE bytea USING lo_get(...)) or export them separately "+
+			"(lo_export / pg_dump --blobs) — see docs/type-mapping.md, \"Postgres large objects\"",
 		loCount, len(named), strings.Join(named, ", "),
 	))
 }

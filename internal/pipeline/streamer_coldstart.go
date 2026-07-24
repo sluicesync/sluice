@@ -262,6 +262,12 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
 	migcore.ApplyTableScope(sr, s.Filter)
+	// Large-object census (roadmap item 68c) — advisory WARN only; runs
+	// BEFORE ReadSchema so the named-suspect branch is reachable: an
+	// in-scope oid/lo column refuses at the schema read as an unsupported
+	// column type (Bug 205; see the migrate call site). Probe failure
+	// skips silently.
+	warnLargeObjects(ctx, sr, s.Source.Capabilities(), s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		migcore.CloseIf(sr)
@@ -374,10 +380,6 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
-	// Large-object census (roadmap item 68c) — advisory WARN only:
-	// pg_largeobject blobs are not copied; the referencing oid/lo
-	// columns copy as plain integers. Probe failure skips silently.
-	warnLargeObjects(ctx, sr, s.Source.Capabilities(), schema)
 	migcore.CloseIf(sr)
 
 	return schema, snapshotTables, nil

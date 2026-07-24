@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // stubLOProber is a fake [largeObjectPreflightProber] with a canned
@@ -30,12 +31,16 @@ func (s *stubLOProber) LargeObjectCensus(_ context.Context) (loCount int64, susp
 	return s.loCount, s.suspects, nil
 }
 
-func loSchema(tables ...string) *ir.Schema {
-	s := &ir.Schema{}
-	for _, name := range tables {
-		s.Tables = append(s.Tables, &ir.Table{Name: name})
+// loExclude builds the deny-list filter the WARN scoping rides (Bug 205:
+// the census runs before ReadSchema, so scoping is filter-based, not
+// parsed-schema-based — the same in-scope notion as warnForeignTables).
+func loExclude(t *testing.T, tables ...string) migcore.TableFilter {
+	t.Helper()
+	f, err := migcore.NewTableFilter(nil, tables)
+	if err != nil {
+		t.Fatalf("NewTableFilter: %v", err)
 	}
-	return s
+	return f
 }
 
 // TestWarnLargeObjects_GateExcludesNonPG: pg_largeobject is a
@@ -43,7 +48,7 @@ func loSchema(tables ...string) *ir.Schema {
 func TestWarnLargeObjects_GateExcludesNonPG(t *testing.T) {
 	for _, caps := range []ir.Capabilities{capsMySQL, {}} {
 		prober := &stubLOProber{loCount: 5}
-		warnLargeObjects(context.Background(), prober, caps, loSchema("docs"))
+		warnLargeObjects(context.Background(), prober, caps, migcore.TableFilter{})
 		if prober.callCount != 0 {
 			t.Errorf("caps %+v: expected the gate to short-circuit; got %d prober calls", caps, prober.callCount)
 		}
@@ -54,7 +59,7 @@ func TestWarnLargeObjects_GateExcludesNonPG(t *testing.T) {
 // census surface skips silently.
 func TestWarnLargeObjects_NonProberHandleSkips(t *testing.T) {
 	logs := captureLogs(t)
-	warnLargeObjects(context.Background(), stubWriterNoChecker{}, capsSlotPG, loSchema("docs"))
+	warnLargeObjects(context.Background(), stubWriterNoChecker{}, capsSlotPG, migcore.TableFilter{})
 	if strings.Contains(logs.String(), "large object") {
 		t.Errorf("non-prober handle must stay silent:\n%s", logs.String())
 	}
@@ -66,7 +71,7 @@ func TestWarnLargeObjects_NonProberHandleSkips(t *testing.T) {
 func TestWarnLargeObjects_NoLargeObjectsStaysSilent(t *testing.T) {
 	logs := captureLogs(t)
 	prober := &stubLOProber{loCount: 0, suspects: map[string][]string{"docs": {"blob_ref"}}}
-	warnLargeObjects(context.Background(), prober, capsSlotPG, loSchema("docs"))
+	warnLargeObjects(context.Background(), prober, capsSlotPG, migcore.TableFilter{})
 	if strings.Contains(logs.String(), "WARN") || strings.Contains(logs.String(), "large object") {
 		t.Errorf("no-lo source must stay silent:\n%s", logs.String())
 	}
@@ -74,7 +79,10 @@ func TestWarnLargeObjects_NoLargeObjectsStaysSilent(t *testing.T) {
 
 // TestWarnLargeObjects_InScopeSuspectsNamed is the core advisory: los
 // exist AND in-scope oid/lo columns exist → the full WARN naming every
-// suspect table.column, the not-copied consequence, and the doc pointer.
+// suspect table.column, the coming unsupported-type refusal (Bug 205:
+// an in-scope oid/lo column refuses at the schema read, so the WARN is
+// the refusal's context, not a copies-as-integers claim), and the
+// recovery pointers.
 func TestWarnLargeObjects_InScopeSuspectsNamed(t *testing.T) {
 	logs := captureLogs(t)
 	prober := &stubLOProber{
@@ -84,13 +92,14 @@ func TestWarnLargeObjects_InScopeSuspectsNamed(t *testing.T) {
 			"excluded": {"other_ref"}, // out of scope — must NOT be named
 		},
 	}
-	warnLargeObjects(context.Background(), prober, capsSlotPG, loSchema("docs", "users"))
+	warnLargeObjects(context.Background(), prober, capsSlotPG, loExclude(t, "excluded"))
 	out := logs.String()
 	for _, want := range []string{
 		"3 large object(s)",
 		"docs.blob_ref", "docs.thumb_ref", // in-scope suspects named
-		"NOT the large objects themselves", // the consequence
-		"docs/type-mapping.md",             // the recovery pointer
+		"schema read will refuse", // the coming refusal, contextualized
+		"--exclude-table",         // proceed-without-them recovery
+		"docs/type-mapping.md",    // the carry-recipes pointer
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("WARN missing %q:\n%s", want, out)
@@ -109,7 +118,7 @@ func TestWarnLargeObjects_NoInScopeSuspectsQuieterWarn(t *testing.T) {
 		loCount:  7,
 		suspects: map[string][]string{"excluded": {"other_ref"}},
 	}
-	warnLargeObjects(context.Background(), prober, capsSlotPG, loSchema("users"))
+	warnLargeObjects(context.Background(), prober, capsSlotPG, loExclude(t, "excluded"))
 	out := logs.String()
 	for _, want := range []string{"7 large object(s)", "no in-scope column is typed oid/lo"} {
 		if !strings.Contains(out, want) {
@@ -128,7 +137,7 @@ func TestWarnLargeObjects_NoInScopeSuspectsQuieterWarn(t *testing.T) {
 func TestWarnLargeObjects_ProbeFailureSkipsSilently(t *testing.T) {
 	logs := captureLogs(t)
 	prober := &stubLOProber{err: errors.New("permission denied for pg_largeobject_metadata")}
-	warnLargeObjects(context.Background(), prober, capsSlotPG, loSchema("docs"))
+	warnLargeObjects(context.Background(), prober, capsSlotPG, migcore.TableFilter{})
 	out := logs.String()
 	if strings.Contains(out, "level=WARN") {
 		t.Errorf("probe failure must not WARN (advisory census):\n%s", out)

@@ -81,6 +81,17 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// mode (scope is nil) and on engines without [ir.MultiDatabaseScoper].
 	applyMultiDatabaseScope(sr, scope)
 
+	// Large-object census (roadmap item 68c) — advisory WARN only. Runs
+	// BEFORE ReadSchema (Bug 205): an in-scope oid/lo column — the very
+	// suspect shape the census names — is an unsupported column type that
+	// ReadSchema refuses loudly, so a post-read census could never reach
+	// its named-suspect branch. Probing the catalogs directly (scoped by
+	// the operator's filter, not the parsed schema) puts the large-object
+	// context in front of the operator first; the refusal then fires
+	// unchanged. A probe failure skips silently (nothing refuses on this
+	// census).
+	warnLargeObjects(ctx, sr, m.Source.Capabilities(), m.Filter)
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return sr, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
@@ -183,12 +194,6 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	if err := warnForeignTables(ctx, sr, m.Source.Capabilities(), m.Filter); err != nil {
 		return sr, nil, err
 	}
-
-	// Large-object census (roadmap item 68c) — advisory WARN only:
-	// pg_largeobject blobs live outside every user table and are not
-	// copied; the referencing oid/lo columns copy as plain integers.
-	// A probe failure skips silently (nothing refuses on this census).
-	warnLargeObjects(ctx, sr, m.Source.Capabilities(), schema)
 
 	return sr, schema, nil
 }
