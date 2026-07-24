@@ -71,14 +71,18 @@ type DecommissionReport struct {
 // client connection died (the same reap race
 // startReplicationWithSlotActiveRetry documents on the START_
 // REPLICATION side), and pg_drop_replication_slot refuses with
-// SQLSTATE 55006 through that window. Same attempts/backoff shape as
-// that idiom; a slot still active past the budget is a genuinely live
-// consumer and surfaces as the coded refusal. Vars, not consts, so
-// unit tests can compress the backoff.
+// SQLSTATE 55006 through that window. The wall-clock budget derives from
+// the single engine-neutral [ir.SlotActiveReapBudget] home so this path
+// and the CDC-reader's START_REPLICATION retry can't drift — a
+// decommission on managed PG (PlanetScale-Postgres PG18's walsender can
+// hold the slot >90s past disconnect) needs the same generous bound. A
+// slot still active past the budget is a genuinely live consumer and
+// surfaces as the coded refusal. Vars, not consts, so unit tests can
+// compress the budget/backoff.
 var (
-	decommissionDropAttempts    = 8
-	decommissionDropBaseBackoff = 500 * time.Millisecond
-	decommissionDropMaxBackoff  = 8 * time.Second
+	decommissionSlotReleaseBudget = ir.SlotActiveReapBudget
+	decommissionDropBaseBackoff   = 500 * time.Millisecond
+	decommissionDropMaxBackoff    = 8 * time.Second
 )
 
 // DecommissionStream retires the named stream's durable footprint:
@@ -258,32 +262,41 @@ func findSlot(ctx context.Context, slots ir.SlotManager, name string) (*ir.SlotI
 	return nil, nil
 }
 
-// dropSlotWithActiveRetry drops the slot, retrying with bounded
-// backoff while the failure has the active-slot shape (the
-// lingering-walsender reap window; see the budget vars above). The
-// final attempt's error propagates unchanged.
+// dropSlotWithActiveRetry drops the slot, retrying with exponential
+// backoff (capped) while the failure has the active-slot shape (the
+// lingering-walsender reap window; see the budget vars above), until the
+// wall-clock [decommissionSlotReleaseBudget] is exhausted or ctx is
+// cancelled. A drop still failing with the active shape past the budget
+// is a genuinely live consumer; its error propagates unchanged.
 func dropSlotWithActiveRetry(ctx context.Context, slots ir.SlotManager, name string) error {
-	var err error
-	for attempt := 1; ; attempt++ {
-		err = slots.Drop(ctx, name, false)
-		if err == nil || !isSlotActiveShapeErr(err) || attempt >= decommissionDropAttempts {
+	start := time.Now()
+	backoff := decommissionDropBaseBackoff
+	for {
+		err := slots.Drop(ctx, name, false)
+		if err == nil || !isSlotActiveShapeErr(err) {
 			return err
 		}
-		backoff := decommissionDropBaseBackoff << (attempt - 1)
-		if backoff > decommissionDropMaxBackoff {
-			backoff = decommissionDropMaxBackoff
+		elapsed := time.Since(start)
+		if elapsed >= decommissionSlotReleaseBudget {
+			return err
 		}
-		slog.InfoContext(
+		slog.WarnContext(
 			ctx, "decommission: slot is still held (prior owner likely not yet reaped); waiting to retry the drop",
 			slog.String("slot", name),
-			slog.Int("attempt", attempt),
-			slog.Int("max_attempts", decommissionDropAttempts),
+			slog.Duration("elapsed", elapsed),
+			slog.Duration("budget", decommissionSlotReleaseBudget),
 			slog.Duration("backoff", backoff),
 		)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(backoff):
+		}
+		if backoff < decommissionDropMaxBackoff {
+			backoff *= 2
+			if backoff > decommissionDropMaxBackoff {
+				backoff = decommissionDropMaxBackoff
+			}
 		}
 	}
 }

@@ -338,7 +338,7 @@ func TestPSPG_SchemaReaderRoundTrip(t *testing.T) {
 func TestPSPG_CDCReaderBasic(t *testing.T) {
 	sourceDSN, _ := dsnPair(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout)
 	defer cancel()
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -371,7 +371,7 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	// Pre-clean any leftover `sluice_slot` (waiting out PS-PG's
 	// walsender-release lag) so the reader below starts from a fresh
 	// slot rather than reusing a stale one's confirmed_flush point.
-	waitPSSlotDropped(t, db, "sluice_slot", 90*time.Second)
+	waitPSSlotDropped(t, db, "sluice_slot", psverifySlotReleaseTimeout)
 
 	const schemaName = "sluice_psverify_cdc"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
@@ -480,7 +480,7 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	sourceDSN, _ := dsnPair(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout)
 	defer cancel()
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -524,7 +524,7 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	// Drop any leftover slot — including the one the just-finished
 	// TestPSPG_CDCReaderBasic's reader may still hold while PS-PG
 	// releases its walsender — so this test is idempotent.
-	waitPSSlotDropped(t, db, "sluice_slot", 90*time.Second)
+	waitPSSlotDropped(t, db, "sluice_slot", psverifySlotReleaseTimeout)
 
 	const schemaName = "sluice_psverify_failover"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
@@ -588,15 +588,29 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	}
 }
 
+// psverifySlotReleaseTimeout is the test-side ceiling for any wait a
+// just-disconnected walsender's slot-active reap can gate on managed
+// PS-PG (the pre-clean slot poll and the outer ctx around a cold-start
+// StreamChanges, which may retry START_REPLICATION through the reap
+// window). It sits a margin ABOVE the product's own retry budget —
+// deriving from the same [ir.SlotActiveReapBudget] const so the two
+// can't drift — so the test never times out before the product's
+// bounded retry completes. PS-PG upgraded to PG18 and was observed
+// holding a slot active >90s past disconnect (run 30074757309,
+// 2026-07-16-era config), exceeding the old fixed 90s test bounds; the
+// product now waits it out, so the test must give it room to.
+const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + time.Minute
+
 // waitPSSlotDropped drops the named replication slot, first waiting
 // out PS-PG's walsender-release lag. On managed PS-PG the backend
 // walsender from a just-closed CDC reader can hold the slot "active"
-// for tens of seconds after the client connection is gone (the first
-// CI dispatch, 2026-07-16, measured >40s); a single-shot
-// pg_drop_replication_slot then fails with SQLSTATE 55006 and every
-// later test that needs the fixed `sluice_slot` name collides. Poll
-// until the slot is inactive (or absent), then drop it. Best-effort:
-// on timeout the next step surfaces the collision loudly.
+// well past the client connection's death — tens of seconds on the
+// 2026-07-16 CI dispatch (>40s), then >90s once PS-PG moved to PG18. A
+// single-shot pg_drop_replication_slot fails with SQLSTATE 55006
+// through that window and every later test that needs the fixed
+// `sluice_slot` name collides. Poll until the slot is inactive (or
+// absent), then drop it. Best-effort: on timeout the next step surfaces
+// the collision loudly.
 func waitPSSlotDropped(t *testing.T, db *sql.DB, slot string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

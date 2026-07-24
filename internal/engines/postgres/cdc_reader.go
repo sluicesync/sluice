@@ -499,66 +499,102 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	return out, nil
 }
 
+// Slot-active retry backoff schedule and wall-clock budget for
+// START_REPLICATION. The budget derives from the single engine-neutral
+// [ir.SlotActiveReapBudget] home (shared with the decommission slot-drop
+// path so the two can't drift); base/max are vars, not consts, only so
+// the unit pins can compress the schedule without sleeping out the real
+// budget.
+var (
+	slotActiveRetryBudget      = ir.SlotActiveReapBudget
+	slotActiveRetryBaseBackoff = 500 * time.Millisecond
+	slotActiveRetryMaxBackoff  = 8 * time.Second
+)
+
 // startReplicationWithSlotActiveRetry runs START_REPLICATION, retrying
 // with bounded backoff when the slot reports "active for PID N"
 // (SQLSTATE 55006). That error has two distinct causes that need
 // opposite handling:
 //
 //   - A PRIOR OWNER NOT YET REAPED: a just-crashed/stopped streamer's
-//     walsender lingers for a moment after its client connection dies
-//     (kernel socket teardown, in-process teardown ordering, or — under
-//     a contended CI scheduler — whole seconds). A warm resume or
-//     crash-recovery restart racing that window is transient and
-//     self-heals; failing it loudly forces an operator retry for a
-//     condition that resolves itself. This race is real and recurring:
-//     the bug15 stop/restart test papered over it with a 5s sleep, and
-//     the ADR-0046 post-bulkcopy crash-recovery leg hit it on CI the
-//     moment faster checkpoints (ADR-0082) narrowed the gap between
-//     recovery start and PG's reap.
+//     walsender lingers after its client connection dies (kernel socket
+//     teardown, in-process teardown ordering, or — on managed PG behind
+//     a pgwire proxy — far longer: PlanetScale-Postgres on PG18 was
+//     observed holding the slot active >90s past disconnect, bounded by
+//     wal_sender_timeout + proxy teardown). A warm resume or crash-
+//     recovery restart racing that window is transient and self-heals;
+//     failing it loudly forces an operator retry for a condition that
+//     resolves itself. This race is real and recurring: the bug15
+//     stop/restart test papered over it with a 5s sleep, and the
+//     ADR-0046 post-bulkcopy crash-recovery leg hit it on CI the moment
+//     faster checkpoints (ADR-0082) narrowed the gap between recovery
+//     start and PG's reap.
 //
 //   - A GENUINELY CONCURRENT SECOND WRITER: the error is the load-
 //     bearing guard against two live streamers sharing a slot, and it
 //     must keep failing loudly.
 //
-// A bounded retry separates them: a dead owner's walsender is reaped
-// well within the budget (worst case wal_sender_timeout, default 60s,
-// but socket-death detection is near-immediate in practice); a live
-// owner keeps holding the slot past it, and the final attempt's error
-// — the original loud refusal — propagates unchanged. Each wait is
-// logged at INFO so a recovering stream is visibly waiting, not hung.
-// A failed START_REPLICATION leaves the replication conn in
-// ReadyForQuery, so retries reuse the same conn.
+// A wall-clock BUDGET (not a fixed attempt count) separates them: a dead
+// owner's walsender is reaped well within [slotActiveRetryBudget]; a live
+// owner keeps holding the slot past it, and the final attempt's error —
+// the original loud refusal — propagates unchanged. Widening the budget
+// only makes the loud failure slower on the misconfiguration case, never
+// masking it. Each wait is logged at WARN (carrying elapsed + budget) so
+// a recovering stream is visibly waiting, not hung. A failed
+// START_REPLICATION leaves the replication conn in ReadyForQuery, so
+// retries reuse the same conn.
 func (r *CDCReader) startReplicationWithSlotActiveRetry(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, pluginArgs []string) error {
-	const (
-		attempts    = 8
-		baseBackoff = 500 * time.Millisecond
-		maxBackoff  = 8 * time.Second
-	)
-	var err error
-	for attempt := 1; ; attempt++ {
-		err = pglogrepl.StartReplication(ctx, conn, r.slotName, startLSN, pglogrepl.StartReplicationOptions{
+	return retryWhileSlotActive(ctx, r.slotName, func() error {
+		return pglogrepl.StartReplication(ctx, conn, r.slotName, startLSN, pglogrepl.StartReplicationOptions{
 			PluginArgs: pluginArgs,
 		})
+	})
+}
+
+// retryWhileSlotActive runs attempt, retrying with exponential backoff
+// (capped) while it fails with SQLSTATE 55006 ("replication slot is
+// active"), until the wall-clock [slotActiveRetryBudget] is exhausted or
+// ctx is cancelled. It is the reusable core of the START_REPLICATION
+// reap-window wait, factored out so the unit pins can script `attempt`
+// without a real walsender.
+//
+// A non-55006 error (or success) returns immediately — no retry. Once
+// the budget is exhausted the ORIGINAL 55006 error is returned unchanged
+// (the loud second-writer refusal). ctx cancellation returns ctx.Err()
+// promptly regardless of the backoff in flight.
+func retryWhileSlotActive(ctx context.Context, slotName string, attempt func() error) error {
+	start := time.Now()
+	backoff := slotActiveRetryBaseBackoff
+	for {
+		err := attempt()
 		var pgErr *pgconn.PgError
-		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55006" || attempt >= attempts {
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55006" {
 			return err
 		}
-		backoff := baseBackoff << (attempt - 1)
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		elapsed := time.Since(start)
+		if elapsed >= slotActiveRetryBudget {
+			// Held past the budget: a genuinely concurrent second writer
+			// (or a hung walsender). Return the loud 55006 unchanged.
+			return err
 		}
-		slog.InfoContext(
+		slog.WarnContext(
 			ctx, "postgres: cdc: slot is active (prior owner likely not yet reaped); waiting to retry START_REPLICATION",
-			slog.String("slot", r.slotName),
+			slog.String("slot", slotName),
 			slog.String("detail", pgErr.Message),
-			slog.Int("attempt", attempt),
-			slog.Int("max_attempts", attempts),
+			slog.Duration("elapsed", elapsed),
+			slog.Duration("budget", slotActiveRetryBudget),
 			slog.Duration("backoff", backoff),
 		)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(backoff):
+		}
+		if backoff < slotActiveRetryMaxBackoff {
+			backoff *= 2
+			if backoff > slotActiveRetryMaxBackoff {
+				backoff = slotActiveRetryMaxBackoff
+			}
 		}
 	}
 }
@@ -2178,12 +2214,13 @@ func slotInfo(ctx context.Context, db *sql.DB, name string) (*slotState, error) 
 // with an already-cancelled ctx skips the graceful Terminate ('X')
 // message and hard-closes the socket. The server-side walsender then
 // keeps the slot marked active until it next touches the dead socket
-// or `wal_sender_timeout` (default 60 s) reaps it — LONGER than the
-// v0.99.34 slot-active retry budget (~40 s of backoff), so a
-// stop-then-restart hit "slot is active for PID N" through the entire
-// retry window and failed. With Terminate sent, the walsender exits
-// immediately and the slot releases in milliseconds. The 5 s bound
-// keeps a wedged socket from blocking teardown.
+// or `wal_sender_timeout` (default 60 s) reaps it. The slot-active
+// retry budget ([ir.SlotActiveReapBudget]) now covers that window, so a
+// stop-then-restart would eventually succeed either way — but Terminate
+// makes the walsender exit immediately and the slot release in
+// milliseconds, so the restart never has to burn minutes of backoff on
+// a reap sluice could have triggered. The 5 s bound keeps a wedged
+// socket from blocking teardown.
 func closeReplConnGraceful(conn *pgconn.PgConn) {
 	if conn == nil {
 		return

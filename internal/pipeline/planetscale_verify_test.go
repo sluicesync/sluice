@@ -32,10 +32,23 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
+
+// psverifySlotReleaseTimeout is the test-side ceiling for any wait a
+// just-disconnected walsender's slot-active reap can gate on managed
+// PS-PG — the cold-start slot pre-clean and the CDC-delivery poll of a
+// streamer whose START_REPLICATION may be retrying through the reap
+// window. It sits a margin ABOVE the product's own retry budget,
+// deriving from the same [ir.SlotActiveReapBudget] const so the test and
+// the product can't drift. PS-PG on PG18 was observed holding a slot
+// active >90s past disconnect (run 30074757309), exceeding the old fixed
+// 60s/90s test bounds; the product now waits it out, so the test must
+// give it room to.
+const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + time.Minute
 
 // dsnsAllPS returns the four PS DSNs in the credentials file:
 // PS-MySQL source/destination and PS-PG source/destination. Skips
@@ -203,7 +216,11 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 		t.Skipf("source wal_level = %q; CDC needs 'logical'", walLevel)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Above the CDC-delivery wait (psverifySlotReleaseTimeout) so the
+	// streamer's own bounded START_REPLICATION retry through the PS-PG
+	// PG18 walsender-reap window can complete before this parent ctx —
+	// which cancels the streamer — fires.
+	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout+2*time.Minute)
 	defer cancel()
 
 	// A previous failed run may have left a `sluice_slot` replication
@@ -271,7 +288,11 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 	// as a 60s "never delivered" timeout — useless for diagnosis.
 	waitOrSurfaceErr := func(want int, label string) {
 		t.Helper()
-		deadline := time.NewTimer(60 * time.Second)
+		// psverifySlotReleaseTimeout, not a fixed 60s: on PS-PG PG18 the
+		// CDC leg (phase E) can't deliver until the streamer's cold-start
+		// START_REPLICATION clears the >90s walsender-reap window via its
+		// own bounded retry — so the delivery poll must outlast it.
+		deadline := time.NewTimer(psverifySlotReleaseTimeout)
 		defer deadline.Stop()
 		for {
 			select {
@@ -455,18 +476,19 @@ func dropPSSchema(t *testing.T, _ context.Context, dsn, schema string) {
 // 55006 while the slot is still marked "active" — and on managed
 // PS-PG the walsender from a just-closed reader (including one held
 // by the engines/postgres psverify package that ran before this one)
-// can keep the slot active for tens of seconds after the client
-// connection is gone (>40s observed on the first CI dispatch,
-// 2026-07-16). So this polls until the slot is inactive or absent,
-// then drops it, hard-capped in a goroutine so cleanup never hangs
-// the test even when context cancellation isn't honoured.
+// can keep the slot active well past the client connection's death:
+// tens of seconds on the first CI dispatch (>40s, 2026-07-16), then
+// >90s once PS-PG moved to PG18. So this polls until the slot is
+// inactive or absent, then drops it, hard-capped in a goroutine so
+// cleanup never hangs the test even when context cancellation isn't
+// honoured.
 //
 // Failure to drop the slot here isn't fatal — the next
 // CREATE_REPLICATION_SLOT will surface "slot already exists" with
 // a clear message that operators recognise.
 func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 	t.Helper()
-	const slotWait = 90 * time.Second
+	const slotWait = psverifySlotReleaseTimeout
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

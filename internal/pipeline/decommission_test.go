@@ -22,16 +22,17 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// fastDecommissionRetry compresses the slot-drop retry backoff so the
-// retry-path pins run in milliseconds.
+// fastDecommissionRetry compresses the slot-drop retry budget and
+// backoff so the retry-path pins run in milliseconds instead of sleeping
+// out the real 5-minute wall-clock budget.
 func fastDecommissionRetry(t *testing.T) {
 	t.Helper()
-	attempts, base, maxB := decommissionDropAttempts, decommissionDropBaseBackoff, decommissionDropMaxBackoff
-	decommissionDropAttempts = 3
+	budget, base, maxB := decommissionSlotReleaseBudget, decommissionDropBaseBackoff, decommissionDropMaxBackoff
+	decommissionSlotReleaseBudget = 30 * time.Millisecond
 	decommissionDropBaseBackoff = time.Millisecond
 	decommissionDropMaxBackoff = 4 * time.Millisecond
 	t.Cleanup(func() {
-		decommissionDropAttempts = attempts
+		decommissionSlotReleaseBudget = budget
 		decommissionDropBaseBackoff = base
 		decommissionDropMaxBackoff = maxB
 	})
@@ -65,13 +66,14 @@ func (a *decomApplier) ClearStream(_ context.Context, streamID string) error {
 // decomSlotMgr is an ir.SlotManager + ir.StreamPublicationDropper
 // with scripted results, recording into the shared order log.
 type decomSlotMgr struct {
-	slots    []ir.SlotInfo
-	listErr  error
-	dropErrs []error // consumed per Drop call; nil past the end
-	dropN    int
-	pubOut   ir.PublicationDropOutcome
-	pubErr   error
-	order    *[]string
+	slots      []ir.SlotInfo
+	listErr    error
+	dropErrs   []error // consumed per Drop call; nil past the end
+	stickyDrop error   // when set, EVERY Drop returns it (models a slot held active forever, exhausting the wall-clock budget)
+	dropN      int
+	pubOut     ir.PublicationDropOutcome
+	pubErr     error
+	order      *[]string
 }
 
 func (m *decomSlotMgr) List(context.Context) ([]ir.SlotInfo, error) {
@@ -81,6 +83,10 @@ func (m *decomSlotMgr) List(context.Context) ([]ir.SlotInfo, error) {
 func (m *decomSlotMgr) Drop(_ context.Context, name string, force bool) error {
 	if force {
 		return errors.New("decommission must never force-drop")
+	}
+	if m.stickyDrop != nil {
+		m.dropN++
+		return m.stickyDrop
 	}
 	var err error
 	if m.dropN < len(m.dropErrs) {
@@ -260,9 +266,9 @@ func TestDecommission_SlotHeldPastBudgetRefusesCoded(t *testing.T) {
 	}
 	active := errors.New(`postgres: drop slot "sluice_wave_a": slot is active (a CDC consumer is currently connected); pass --force to drop anyway`)
 	slots := &decomSlotMgr{
-		slots:    []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
-		dropErrs: []error{active, active, active},
-		order:    &order,
+		slots:      []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
+		stickyDrop: active, // held active through the whole wall-clock budget
+		order:      &order,
 	}
 
 	rep, err := DecommissionStream(context.Background(), applier, slots, "wave-a", false)

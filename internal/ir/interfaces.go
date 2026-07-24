@@ -2565,6 +2565,29 @@ type SourceFingerprintRecorder interface {
 	SetSourceDSNFingerprint(fingerprint string)
 }
 
+// SlotActiveReapBudget is the shared wall-clock budget for waiting out
+// a "replication slot is active" (Postgres SQLSTATE 55006) failure whose
+// cause is a JUST-DISCONNECTED consumer's walsender that the server has
+// not yet reaped ("disconnect is not release"). It bounds every 55006
+// retry loop sluice runs — START_REPLICATION on CDC-reader (re)start and
+// the `sync decommission` / slot-drop path — from a single home so the
+// two cannot drift.
+//
+// The value is a wall-clock BUDGET, not an attempt count: on vanilla PG
+// the reap is near-immediate (kernel socket teardown), but on managed PG
+// behind a pgwire proxy the walsender can stay active far longer —
+// PlanetScale-Postgres on PG18 was observed holding the slot active >90s
+// after disconnect, bounded by wal_sender_timeout + proxy teardown and
+// potentially longer under load. Five minutes is ~3× that observed floor
+// with margin for wal_sender_timeout variance / load.
+//
+// Widening the budget only makes the LOUD failure slower on the genuine
+// second-writer misconfiguration (two live consumers sharing one slot);
+// it never masks it — a slot still held past the budget surfaces the
+// original 55006 refusal unchanged. Every retry loop stays
+// ctx-cancellable so a real shutdown exits promptly regardless.
+const SlotActiveReapBudget = 5 * time.Minute
+
 // SlotInfo describes one row of an engine's logical-replication slot
 // inventory. The shape is engine-neutral but the underlying concept is
 // Postgres-specific today (logical replication slots). Future engines
