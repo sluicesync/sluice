@@ -486,6 +486,14 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if err := preflightBinlogRowImage(ctx, r.db); err != nil {
 		return nil, err
 	}
+	// Roadmap 68e preflight: refuse a STATEMENT/MIXED-format source —
+	// its DML arrives as SQL text the dispatcher cannot apply, a
+	// silently-EMPTY stream (Phase-A ground truth 2026-07-23). Runs at
+	// the same chokepoint, and thus the same start surfaces, as the
+	// row-image gate above. See cdc_binlog_format_preflight.go.
+	if err := preflightBinlogFormat(ctx, r.db); err != nil {
+		return nil, err
+	}
 
 	startPos, err := r.resolveStartPosition(ctx, from)
 	if err != nil {

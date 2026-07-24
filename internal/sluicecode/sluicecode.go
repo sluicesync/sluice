@@ -60,6 +60,17 @@ const (
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// Roadmap item 68e: binlog CDC (vanilla MySQL / MariaDB flavors)
+	// refuses at every CDC start when @@GLOBAL.binlog_format is not ROW.
+	// Ground truth (Phase A, 2026-07-23, real mysql:8.0 STATEMENT): the
+	// cold copy lands, then every live DML is SILENTLY LOST — QueryEvents
+	// hit the dispatcher's generic-DDL arm, nothing applies, the position
+	// never advances, the stream stays green. MIXED is the same class
+	// (deterministic writes statement-logged; MariaDB's DEFAULT).
+	// VStream flavors never take this path (vtgate owns the row-event
+	// contract); bulk-only runs are not gated.
+	CodeCDCBinlogFormatNotRow Code = "SLUICE-E-CDC-BINLOG-FORMAT-NOT-ROW"
+
 	// Roadmap item 68d: a slot-creating PG CDC cold start refuses
 	// UPFRONT when the source's max_replication_slots are all in use
 	// (or max_wal_senders all attached) — the census names the existing
@@ -233,6 +244,8 @@ var registry = map[Code]Info{
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
+
+	CodeCDCBinlogFormatNotRow: {ClassRefusal, "binlog CDC refused at start: @@GLOBAL.binlog_format is STATEMENT or MIXED, under which DML arrives as SQL text sluice cannot replay — the stream would run green while silently applying nothing; SET GLOBAL binlog_format=ROW (or the provider console) and re-run"},
 
 	CodeCDCPublicationScopeConflict: {ClassRefusal, "cold start refused: rescoping the Postgres publication would REMOVE tables another sluice replication slot (active or inactive) holds a claim on, silently de-scoping that stream — give each stream its own --publication-name, drain the other stream first, or drop its slot if the stream is truly abandoned"},
 	CodeCDCReplicationHeadroom:      {ClassRefusal, "cold start refused: the source has no replication headroom for this stream's new slot/WAL sender (max_replication_slots or max_wal_senders exhausted) — free a leftover slot (`sluice slot list`, `sync decommission`, `slot drop`) or raise the ceiling; warm resume reuses its existing slot and never trips this"},

@@ -385,6 +385,13 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = db.Close()
 		return nil, err
 	}
+	// Roadmap 68e: refuse a STATEMENT/MIXED-format source here too, so a
+	// cold start refuses BEFORE the bulk copy rather than streaming a
+	// silently-empty CDC tail after it. See cdc_binlog_format_preflight.go.
+	if err := preflightBinlogFormat(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Pin a single connection. All snapshot-pinned reads will run on
 	// this conn; the snapshot transaction is bound to it.
 	conn, err := db.Conn(ctx)
