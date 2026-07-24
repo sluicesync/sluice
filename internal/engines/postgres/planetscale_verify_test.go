@@ -338,7 +338,7 @@ func TestPSPG_SchemaReaderRoundTrip(t *testing.T) {
 func TestPSPG_CDCReaderBasic(t *testing.T) {
 	sourceDSN, _ := dsnPair(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout+2*time.Minute)
 	defer cancel()
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -480,7 +480,7 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	sourceDSN, _ := dsnPair(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout+2*time.Minute)
 	defer cancel()
 
 	db, err := sql.Open("pgx", sourceDSN)
@@ -598,8 +598,11 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 // bounded retry completes. PS-PG upgraded to PG18 and was observed
 // holding a slot active >90s past disconnect (run 30074757309,
 // 2026-07-16-era config), exceeding the old fixed 90s test bounds; the
-// product now waits it out, so the test must give it room to.
-const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + time.Minute
+// product now waits it out, so the test must give it room to. The
+// margin is deliberately generous (a long-but-rarely-hit test timeout
+// only ever fires on a genuine hang, and a "ready" PS-PG can still be
+// replication-warming) — 5 minutes over the product budget.
+const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + 5*time.Minute
 
 // waitPSSlotDropped drops the named replication slot, first waiting
 // out PS-PG's walsender-release lag. On managed PS-PG the backend

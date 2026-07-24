@@ -47,8 +47,11 @@ import (
 // the product can't drift. PS-PG on PG18 was observed holding a slot
 // active >90s past disconnect (run 30074757309), exceeding the old fixed
 // 60s/90s test bounds; the product now waits it out, so the test must
-// give it room to.
-const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + time.Minute
+// give it room to. The margin is deliberately generous (a
+// long-but-rarely-hit test timeout only ever fires on a genuine hang,
+// and a "ready" PS-PG can still be replication-warming) — 5 minutes
+// over the product budget.
+const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + 5*time.Minute
 
 // dsnsAllPS returns the four PS DSNs in the credentials file:
 // PS-MySQL source/destination and PS-PG source/destination. Skips
