@@ -315,6 +315,9 @@ Every series `/metrics` can emit, by family. Conditional families follow the hon
 | `sluice_target_storage_util` | gauge | `stream_id` | Target storage volume utilisation, fraction in [0,1]. | Alert well before 1.0 — managed platforms resize with a serving pause. |
 | `sluice_target_storage_available_bytes` | gauge | `stream_id` | Storage bytes still available before a resize. | Pair with the util fraction for absolute headroom. |
 | `sluice_target_storage_capacity_bytes` | gauge | `stream_id` | Storage volume capacity in bytes. | Reference for the two above. |
+| `sluice_target_storage_util_worst` | gauge | `stream_id` | Storage utilisation of the **fullest pod** of the target branch, fraction in [0,1]. | **Alert on this one, not `sluice_target_storage_util`.** The three metrics above describe the *primary* pod; this describes whichever pod fills first, and on managed Postgres the replicas are routinely fuller than the primary. The primary's figures remain what sluice's own write-rate adaptivity acts on. |
+| `sluice_target_storage_available_worst_bytes` | gauge | `stream_id` | Storage bytes still available on the fullest pod. | Absolute headroom for the pod that hits its ceiling first. |
+| `sluice_target_storage_capacity_worst_bytes` | gauge | `stream_id` | Volume capacity in bytes of the fullest pod. | Reference for the two above; may differ from the primary's capacity on a heterogeneous branch. |
 | `sluice_target_replica_lag_seconds` | gauge | `stream_id` | Target-internal replica lag reported by the control plane. | Secondary signal; not sluice's apply lag. |
 | `sluice_target_active_connections` | gauge | `stream_id` | Target active connection count. | Alert as it approaches the max below. |
 | `sluice_target_max_connections` | gauge | `stream_id` | Target connection budget. | Reference for the above. |

@@ -133,7 +133,18 @@ func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, stor
 			read:      read,
 		})
 	}
+	// The storage ALERT reads the FULLEST pod, not the primary. An alert
+	// exists to fire before a volume fills, and the fullest pod is not
+	// reliably the primary (live PS-PG: both replicas fuller than the
+	// primary), so a primary-only alert is blind to the pod that hits the
+	// ceiling first. Falls back to the primary when the worst-pod reduction
+	// is unavailable — an engine/exposition that yields only the primary
+	// series still alerts exactly as it did before, never goes silent.
+	// (Adaptivity stays on the primary; see ir.TargetHealthSnapshot.)
 	add(notifyStorageUtil, storageUtil, notify.LevelCritical, "target storage approaching capacity", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+		if snap.StorageWorstKnown {
+			return snap.StorageUtilWorst, true
+		}
 		return snap.StorageUtil, snap.StorageKnown
 	})
 	add(notifyCPUUtil, cpuUtil, notify.LevelWarning, "target CPU saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {

@@ -86,6 +86,21 @@ type TargetHealthSnapshot struct {
 	StorageCapacityBytes  int64
 	StorageKnown          bool
 
+	// StorageUtilWorst / StorageAvailableWorstBytes / StorageCapacityWorstBytes
+	// describe the FULLEST pod of the branch — the one that reaches its
+	// ceiling first — as a signal SEPARATE from the primary's above, with its
+	// own StorageWorstKnown guard. The two are deliberately not merged: the
+	// primary's volume is what sluice's own writes consume (so it is what the
+	// AIMD damp and headroom refusal act on), while the fullest pod is what a
+	// storage ALERT should watch, and on real managed branches the replicas
+	// are routinely fuller than the primary. Consumers must pick one on
+	// purpose; folding them would silently change the meaning of the
+	// already-persisted StorageUtil history.
+	StorageUtilWorst           float64
+	StorageAvailableWorstBytes int64
+	StorageCapacityWorstBytes  int64
+	StorageWorstKnown          bool
+
 	// ReplicaLagSeconds and ActiveConnections are the SECONDARY signals
 	// (operator priority is CPU/mem/storage first). *Known guards each.
 	ReplicaLagSeconds float64

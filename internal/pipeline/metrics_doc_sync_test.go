@@ -55,7 +55,7 @@ func TestMetricsDocSync_RunningAsAService(t *testing.T) {
 	// the whole emit surface. Adding a metric to metrics.go moves this
 	// number — update it together with the doc table, which direction (1)
 	// below forces anyway.
-	const wantSeries = 27
+	const wantSeries = 30
 	if len(scraped) != wantSeries {
 		t.Fatalf("fully-attached scrape emitted %d distinct sluice_* series, want %d — if a metric was added/removed, update docs/operator/running-as-a-service.md's reference table and this count together. scraped: %v", len(scraped), wantSeries, sortedKeys(scraped))
 	}
@@ -121,11 +121,21 @@ func (docSyncTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) 
 		StorageAvailableBytes: 1 << 30,
 		StorageCapacityBytes:  1 << 31,
 		StorageKnown:          true,
-		ReplicaLagSeconds:     1.5,
-		LagKnown:              true,
-		ActiveConnections:     3,
-		MaxConnections:        100,
-		ConnKnown:             true,
+		// The worst-pod family must be ENABLED here or the doc-sync gate
+		// cannot see it: the exporter emits it only under StorageWorstKnown,
+		// so a fixture that leaves the flag false lets a new metric ship both
+		// undocumented and unpinned — the drift class this test exists to
+		// catch. Deliberately fuller than the primary above, mirroring the
+		// live PS-PG shape that motivated the signal.
+		StorageUtilWorst:           0.75,
+		StorageAvailableWorstBytes: 1 << 29,
+		StorageCapacityWorstBytes:  1 << 31,
+		StorageWorstKnown:          true,
+		ReplicaLagSeconds:          1.5,
+		LagKnown:                   true,
+		ActiveConnections:          3,
+		MaxConnections:             100,
+		ConnKnown:                  true,
 	}, true
 }
 

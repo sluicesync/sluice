@@ -617,6 +617,20 @@ func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHeal
 		fmt.Fprintln(w, "# TYPE sluice_target_storage_capacity_bytes gauge")
 		fmt.Fprintf(w, `sluice_target_storage_capacity_bytes{stream_id=%q} %d`+"\n", streamID, snap.StorageCapacityBytes)
 	}
+	if snap.StorageWorstKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_util_worst Storage utilisation of the FULLEST pod of the target branch as a fraction in [0,1] — the pod that reaches its ceiling first, which is not reliably the primary. Separate series from sluice_target_storage_util (the primary's), never a replacement for it.")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_util_worst gauge")
+		fmt.Fprintf(w, `sluice_target_storage_util_worst{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.StorageUtilWorst))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_available_worst_bytes Storage bytes still available on the FULLEST pod of the target branch.")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_available_worst_bytes gauge")
+		fmt.Fprintf(w, `sluice_target_storage_available_worst_bytes{stream_id=%q} %d`+"\n", streamID, snap.StorageAvailableWorstBytes)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_capacity_worst_bytes Volume capacity in bytes of the FULLEST pod of the target branch.")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_capacity_worst_bytes gauge")
+		fmt.Fprintf(w, `sluice_target_storage_capacity_worst_bytes{stream_id=%q} %d`+"\n", streamID, snap.StorageCapacityWorstBytes)
+	}
 	if snap.LagKnown {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "# HELP sluice_target_replica_lag_seconds Target replica lag in seconds from the control-plane telemetry provider (ADR-0107).")

@@ -4,6 +4,9 @@
 package telemetry
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -96,9 +99,21 @@ const (
 	labelComponent  = "planetscale_component"
 	labelTabletType = "planetscale_tablet_type"
 	labelContainer  = "planetscale_container"
+	// labelRole is the Postgres surface's primary/replica discriminator.
+	// PG emits its PER-POD metrics (the volume pair) under
+	// `planetscale_component="hzinstance"` with NO `planetscale_tablet_type`
+	// and NO `planetscale_container` — the container label exists only on the
+	// PER-CONTAINER metrics (cpu/mem, fanned across postgres / pgbouncer /
+	// walg-daemon). So neither the vttablet cascade nor the primaryContainer
+	// escape hatch could identify the primary pod, and a 3-pod PG branch fell
+	// all the way through to the refuse-to-guess arm: StorageKnown stayed
+	// false and `--notify-storage-util` could never fire on a Postgres target
+	// (live-confirmed 2026-07-24 on two real PS-PG branches).
+	labelRole = "planetscale_role"
 
 	componentVTTablet = "vttablet"
 	tabletTypePrimary = "primary"
+	rolePrimary       = "primary"
 )
 
 // distill collapses a poll's parsed exposition samples into the
@@ -138,6 +153,22 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 		snap.StorageCapacityBytes = int64(capac)
 		snap.StorageUtil = clampFraction(1.0 - avail/capac)
 		snap.StorageKnown = true
+	}
+
+	// The FULLEST pod's volume, across every pod of the branch — a SEPARATE
+	// signal from the primary's, never folded into it. A storage alert exists
+	// to fire before a volume fills, and the fullest pod is not reliably the
+	// primary: on a live PS-PG branch the two replicas were consistently
+	// fuller than the primary (637.2 MB vs 603.7 MB used), so a primary-only
+	// alert is blind to the pod that reaches the ceiling first. Adaptivity
+	// (the AIMD damp / headroom refusal) deliberately stays on the PRIMARY —
+	// those throttle sluice's own writes, and the primary is the volume those
+	// writes land on.
+	if wAvail, wCapac, ok := selectWorstVolume(samples, names.volAvailableByte, names.volCapacityByte); ok {
+		snap.StorageAvailableWorstBytes = int64(wAvail)
+		snap.StorageCapacityWorstBytes = int64(wCapac)
+		snap.StorageUtilWorst = clampFraction(1.0 - wAvail/wCapac)
+		snap.StorageWorstKnown = true
 	}
 
 	if v, ok := selectPrimaryValue(samples, names.replicaLagSec, names.primaryContainer); ok {
@@ -200,7 +231,13 @@ func selectPrimaryValue(samples []promSample, name, primaryContainer string) (fl
 			// (1) exact write-target match — take it immediately.
 			return s.value, true
 		}
-		if isPrimary {
+		// (2a) Postgres per-pod primary: `planetscale_role="primary"`. Held
+		// to the same tier as a tablet_type primary (NOT taken immediately)
+		// so the Vitess exact match at (1) always wins if both are somehow
+		// present — the two label vocabularies never co-occur on a real
+		// exposition, but tier order is the thing that makes that safe
+		// rather than incidental.
+		if isPrimary || s.label(labelRole) == rolePrimary {
 			primaryOnly = append(primaryOnly, s)
 		}
 	}
@@ -218,6 +255,81 @@ func selectPrimaryValue(samples []promSample, name, primaryContainer string) (fl
 		// refuse to guess.
 		return 0, false
 	}
+}
+
+// selectWorstVolume returns the (available, capacity) pair of the FULLEST
+// pod across every pod exposing the volume metrics — the pod that will hit
+// its ceiling first, which is the signal a storage alert wants.
+//
+// The pairing is the load-bearing part: min(available) and max(capacity)
+// taken INDEPENDENTLY across series would mix two different pods and
+// manufacture a utilisation neither pod has (a small pod's available over a
+// big pod's capacity). So the two metrics are joined per pod on their FULL
+// label set — available and capacity for one pod carry identical labels,
+// which makes the serialized label set an exact pod key without this
+// function needing to know any engine's pod-identity label. Utilisation is
+// then compared as a ratio, not as raw free bytes, so heterogeneous volume
+// sizes rank correctly.
+//
+// Returns ok=false when either metric is absent, when no pod exposes both,
+// or when every candidate has a non-positive capacity — the same
+// honest-unobserved contract as [selectPrimaryValue], never a guess.
+func selectWorstVolume(samples []promSample, availName, capacName string) (avail, capac float64, ok bool) {
+	if availName == "" || capacName == "" {
+		return 0, 0, false
+	}
+	type pod struct {
+		avail, capac float64
+		haveA, haveC bool
+	}
+	pods := map[string]*pod{}
+	get := func(s promSample) *pod {
+		k := labelKey(s.labels)
+		p := pods[k]
+		if p == nil {
+			p = &pod{}
+			pods[k] = p
+		}
+		return p
+	}
+	for _, s := range samples {
+		switch s.name {
+		case availName:
+			p := get(s)
+			p.avail, p.haveA = s.value, true
+		case capacName:
+			p := get(s)
+			p.capac, p.haveC = s.value, true
+		}
+	}
+	worst := -1.0
+	for _, p := range pods {
+		if !p.haveA || !p.haveC || p.capac <= 0 {
+			continue
+		}
+		used := 1.0 - p.avail/p.capac
+		if used > worst {
+			worst, avail, capac, ok = used, p.avail, p.capac, true
+		}
+	}
+	return avail, capac, ok
+}
+
+// labelKey serializes a label set into a deterministic, collision-free pod
+// key. Sorted so map iteration order can't produce two keys for one pod, and
+// length-prefixed so a label value containing the separator cannot forge a
+// different pod's key.
+func labelKey(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%d:%s=%d:%s|", len(k), k, len(labels[k]), labels[k])
+	}
+	return b.String()
 }
 
 // clampFraction bounds a derived utilisation into [0,1]; a provider quirk
