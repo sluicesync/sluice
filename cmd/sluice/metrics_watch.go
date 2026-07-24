@@ -11,7 +11,9 @@ import (
 
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
+	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/telemetrysink"
 )
 
 // MetricsWatchCmd implements `sluice metrics-watch` — the standalone
@@ -31,6 +33,16 @@ import (
 // touching. Threshold + sink semantics are identical to `sync start`'s
 // --notify-* flags by construction (the rule set and evaluator are shared).
 //
+// **Two modes** (roadmap item 75b). With --planetscale-metrics-db it watches
+// exactly that one database — the original, unchanged behaviour. WITHOUT it,
+// the watch goes ORG-WIDE: the org's metrics service-discovery document
+// enumerates every database+branch, the poll fans out across them with
+// bounded concurrency, and --include-database/--exclude-database scope the
+// set. Org-wide mode leads with the exporter (--metrics-listen, one series
+// per database+branch) and the persistent sink (--sink-file/--sink-http)
+// rather than the live line, which collapses to one summary row because a
+// per-database line is unreadable across dozens of databases.
+//
 // **Exit codes.** 0 on a clean shutdown (SIGINT/SIGTERM) or after --once; 2 on
 // an operational error (incomplete telemetry opt-in, unknown engine).
 type MetricsWatchCmd struct {
@@ -43,8 +55,24 @@ type MetricsWatchCmd struct {
 	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug (REQUIRED). The watch reads this org's metrics endpoint. Control-plane only — no data-plane DSN is used." required:"" placeholder:"ORG"`
 	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted read_metrics_endpoints). Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
 	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
-	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Branch to filter telemetry series to (defaults to 'main')." placeholder:"BRANCH"`
-	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Database name to watch (REQUIRED — there is no --target DSN to derive it from)." required:"" placeholder:"DATABASE"`
+	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Branch to filter telemetry series to. Single-database mode defaults to 'main'; in org-wide mode an unset value means EVERY branch, and a set value restricts the fan-out to branches with that name." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Database name to watch. OMIT it to watch the WHOLE ORG: every database+branch the org's metrics service discovery returns, fanned out on the same cadence." placeholder:"DATABASE"`
+
+	// Org-wide fan-out scoping (roadmap item 75b). Ignored in
+	// single-database mode. Include and exclude may be combined (exclude
+	// wins) — deliberately unlike --include-table/--exclude-table; see
+	// telemetry.fleetFilter for why.
+	IncludeDatabase  []string `help:"Org-wide mode: only watch databases matching this glob (comma-separated, repeatable). Matched against 'database' and 'database/branch'. Combines with --exclude-database, which wins on a conflict." sep:"," placeholder:"GLOB"`
+	ExcludeDatabase  []string `help:"Org-wide mode: skip databases matching this glob (comma-separated, repeatable). Same matching as --include-database; exclude wins when both match." sep:"," placeholder:"GLOB"`
+	FleetConcurrency int      `help:"Org-wide mode: how many per-branch metric scrapes run concurrently each poll (default 4, max 16). Bounds the load the fan-out puts on the PlanetScale metrics API." placeholder:"N"`
+
+	// Persistent sample sink (roadmap item 75c). Records EVERY polled
+	// sample, unlike the --notify-* sinks which fire only on a threshold
+	// breach. Opt-in, advisory, failure-isolated.
+	SinkFile         string `help:"Append every polled sample to this rotating JSONL file (one record per line). Opt-in durable storage for a portal/warehouse — no Prometheus required. ADVISORY: a write failure is logged-and-swallowed, never stalling the poll." placeholder:"PATH"`
+	SinkFileMaxBytes int64  `help:"Rotate --sink-file at this size. 0 (default) = 64MiB; negative disables rotation (you own the file's growth)." placeholder:"BYTES"`
+	SinkFileMaxFiles int    `help:"How many rotated --sink-file generations to keep (PATH.1 … PATH.N). 0 (default) = 5." placeholder:"N"`
+	SinkHTTP         string `help:"POST every polled sample batch as JSON to this endpoint. Same record schema as --sink-file. A credential (set via the env var); advisory + failure-isolated." env:"SLUICE_METRICS_SINK_HTTP" placeholder:"URL"`
 
 	NotifyWebhook string `help:"Generic webhook URL to POST threshold alerts to as JSON. Opt-in; only fires when at least one --notify-* threshold is set. ADVISORY — a dead sink is logged-and-swallowed. A credential (set via the env var)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
 	NotifySlack   string `help:"Slack incoming-webhook URL to POST threshold alerts to. Same gating + advisory + failure-isolated semantics as --notify-webhook. A credential (set via the env var)." env:"SLUICE_NOTIFY_SLACK" placeholder:"URL"`
@@ -93,6 +121,35 @@ func (m *MetricsWatchCmd) smtpConfig() notify.SMTPConfig {
 	}
 }
 
+// buildSampleSink assembles the roadmap-75c persistent-sample sink from the
+// --sink-* flags: a rotating JSONL file, a generic HTTP push, or both. It
+// returns a TRUE nil interface when no sink is configured (NOT a typed-nil
+// MultiSink), so the pipeline's `Sink != nil` guard stays exact. A bad file
+// path is a LOUD startup refusal — the opt-in must never silently record
+// nothing — while every RUNTIME write failure is logged-and-swallowed.
+func (m *MetricsWatchCmd) buildSampleSink() (telemetrysink.Sink, error) {
+	var sinks []telemetrysink.Sink
+	if m.SinkFile != "" {
+		fs, err := telemetrysink.NewFileSink(telemetrysink.FileConfig{
+			Path:     m.SinkFile,
+			MaxBytes: m.SinkFileMaxBytes,
+			MaxFiles: m.SinkFileMaxFiles,
+		})
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, fs)
+	}
+	if m.SinkHTTP != "" {
+		sinks = append(sinks, &telemetrysink.HTTPSink{URL: m.SinkHTTP})
+	}
+	multi := telemetrysink.NewMultiSink(sinks...)
+	if multi == nil {
+		return nil, nil //nolint:nilnil // (nil, nil) == "no sink configured", a valid no-op result distinct from an error
+	}
+	return multi, nil
+}
+
 // Run implements `sluice metrics-watch`.
 func (m *MetricsWatchCmd) Run(g *Globals) error {
 	if _, err := resolveEngine(m.Engine); err != nil {
@@ -110,23 +167,63 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 	// panel's slog gate installs and would otherwise leak above the panel.
 	// Renders only for an interactive, text-log, non-once invocation.
 	pretty := wantPrettyProgress(g, false, false, false) && !m.Once
-	provider, err := buildTargetTelemetryProvider(ctx, telemetryParams{
-		org:       m.PlanetScaleOrg,
-		tokenID:   m.PlanetScaleMetricsTokenID,
-		token:     m.PlanetScaleMetricsToken,
-		metricsDB: m.PlanetScaleMetricsDB,
-		branch:    m.PlanetScaleMetricsBranch,
-		targetDSN: "", // standalone: no data-plane DSN; metrics-db is supplied directly
-		engine:    m.Engine,
-		quiet:     pretty,
-	})
+
+	// Mode split (roadmap item 75b): --planetscale-metrics-db names ONE
+	// database (the original behaviour, byte-identical); omitting it watches
+	// the whole org.
+	orgWide := m.PlanetScaleMetricsDB == ""
+
+	var (
+		provider *pstelemetry.Provider
+		fleet    *pstelemetry.Fleet
+		err      error
+	)
+	if orgWide {
+		fleet, err = buildFleetTelemetryProvider(ctx, fleetTelemetryParams{
+			org:         m.PlanetScaleOrg,
+			tokenID:     m.PlanetScaleMetricsTokenID,
+			token:       m.PlanetScaleMetricsToken,
+			branch:      m.PlanetScaleMetricsBranch,
+			include:     m.IncludeDatabase,
+			exclude:     m.ExcludeDatabase,
+			engine:      m.Engine,
+			concurrency: m.FleetConcurrency,
+			quiet:       pretty,
+		})
+	} else {
+		provider, err = buildTargetTelemetryProvider(ctx, telemetryParams{
+			org:       m.PlanetScaleOrg,
+			tokenID:   m.PlanetScaleMetricsTokenID,
+			token:     m.PlanetScaleMetricsToken,
+			metricsDB: m.PlanetScaleMetricsDB,
+			branch:    m.PlanetScaleMetricsBranch,
+			targetDSN: "", // standalone: no data-plane DSN; metrics-db is supplied directly
+			engine:    m.Engine,
+			quiet:     pretty,
+		})
+	}
 	if err != nil {
 		return operationalError{err: err}
 	}
 	if provider != nil {
 		defer func() { _ = provider.Close() }()
 	}
+	if fleet != nil {
+		defer func() { _ = fleet.Close() }()
+	}
 
+	sampleSink, err := m.buildSampleSink()
+	if err != nil {
+		return operationalError{err: err}
+	}
+	if sampleSink != nil {
+		defer func() { _ = sampleSink.Close() }()
+	}
+
+	label := "metrics-watch:" + m.PlanetScaleMetricsDB
+	if orgWide {
+		label = "metrics-watch:" + m.PlanetScaleOrg
+	}
 	cfg := pipeline.MetricsWatchConfig{
 		StorageUtil:         m.NotifyStorageUtil,
 		CPUUtil:             m.NotifyCPUUtil,
@@ -138,13 +235,17 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 		SlackWebhookURL:     m.NotifySlack,
 		SMTP:                m.smtpConfig(),
 		Interval:            m.Interval,
-		Label:               "metrics-watch:" + m.PlanetScaleMetricsDB,
+		Label:               label,
+		Database:            m.PlanetScaleMetricsDB,
+		Branch:              branchOrMainLabel(m.PlanetScaleMetricsBranch),
 		Once:                m.Once,
 		Print:               !m.Quiet,
 		Out:                 os.Stdout,
 		MetricsListen:       m.MetricsListen,
 		BuildVersion:        version,
 		BuildCommit:         commit,
+		Fleet:               fleetProviderOrNil(fleet),
+		Sink:                sampleSink,
 	}
 	// The panel gate (`pretty`) was computed above, before the telemetry build,
 	// so its enable-INFO could be suppressed on the panel path. --once is a
@@ -152,9 +253,13 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 	// invocation keeps today's byte-identical sample-line stream.
 	provNil := telemetryProviderOrNil(provider)
 	if pretty {
+		watching := m.PlanetScaleMetricsDB
+		if orgWide {
+			watching = "all databases"
+		}
 		header := progress.LiveHeader{
 			Mode:   "metrics-watch",
-			Detail: "watching " + m.PlanetScaleMetricsDB + "  ·  " + m.PlanetScaleOrg,
+			Detail: "watching " + watching + "  ·  " + m.PlanetScaleOrg,
 		}
 		err := runReadoutLivePanel(ctx, header, func(sink *progress.LiveTTYSink) func(context.Context) error {
 			cfg.Readout = sink.Readout

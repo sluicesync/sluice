@@ -324,7 +324,7 @@ Commands:
   matview refresh          Refresh PostgreSQL materialized views (PG-only).
   slot list / slot drop    Manage Postgres replication slots.
   diagnose                 Bundle source/target capability + role state for operator handoff.
-  metrics-watch            Watch a PlanetScale DB's control-plane metrics + fire alerts (ADR-0107).
+  metrics-watch            Watch a PlanetScale DB — or a whole org — for control-plane metrics.
 ```
 
 Run `sluice <command> --help` for per-command flags. DSNs can also be passed via `SLUICE_SOURCE` / `SLUICE_TARGET` env vars.

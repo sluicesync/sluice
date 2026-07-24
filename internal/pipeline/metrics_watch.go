@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/telemetrysink"
 )
 
 // Standalone target-metrics WATCH loop — the engine behind the
@@ -76,6 +77,13 @@ type MetricsWatchConfig struct {
 	// notification StreamID field). Empty ⇒ "metrics-watch".
 	Label string
 
+	// Database / Branch name the watched target in persisted sink records
+	// (single-database mode only — org-wide mode takes them from each
+	// discovered target). They are labels, not selectors: the provider was
+	// already scoped to this target when it was constructed.
+	Database string
+	Branch   string
+
 	// Once polls a single sample (after the warm-up), prints/evaluates it, and
 	// returns — the one-shot mode for scripts and `--once`.
 	Once bool
@@ -112,6 +120,21 @@ type MetricsWatchConfig struct {
 	// breaches surface in the panel even when no external --notify-* sink is
 	// configured — the panel is a delivery target of its own.
 	Event func(level, text string)
+
+	// Fleet, when non-nil, switches the watch to ORG-WIDE mode (roadmap item
+	// 75b): every database+branch the provider discovers is polled on the
+	// same cadence, alerted on independently, exported with database/branch
+	// labels, and persisted. It is MUTUALLY EXCLUSIVE with the single-target
+	// provider argument to [RunMetricsWatch] — a nil Fleet is the default and
+	// leaves the single-database path byte-for-byte unchanged.
+	Fleet ir.FleetTelemetry
+
+	// Sink, when non-nil, durably records EVERY polled sample (roadmap item
+	// 75c) — not just threshold breaches, which is what the --notify-* sinks
+	// carry. ADVISORY and failure-isolated exactly like those sinks: a write
+	// error is logged and swallowed, never stalling or failing a poll. nil
+	// (the default) ⇒ no persistence, no behaviour change.
+	Sink telemetrysink.Sink
 }
 
 // RunMetricsWatch runs the standalone watch loop against provider until ctx is
@@ -122,6 +145,11 @@ type MetricsWatchConfig struct {
 // rules ⇒ watch-only; no sinks ⇒ rules are not evaluated; an unobserved or
 // stale sample ⇒ "no fresh sample", never a spurious alert).
 func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg MetricsWatchConfig) error {
+	if cfg.Fleet != nil {
+		// Org-wide mode (roadmap item 75b) — a distinct loop so the
+		// single-database path below stays byte-for-byte what it was.
+		return runFleetMetricsWatch(ctx, cfg.Fleet, cfg)
+	}
 	if provider == nil {
 		return errors.New("metrics-watch: nil telemetry provider (supply --planetscale-org and the metrics token)")
 	}
@@ -162,16 +190,26 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 	warmUpForSample(ctx, provider)
 
 	tick := func() {
+		// One cached read per tick, shared by the readout/print line and the
+		// persistent sink. Sample is a non-blocking read of the provider's
+		// cache (never a live round-trip), so reading it unconditionally —
+		// including under --quiet with no sink — costs nothing and has no
+		// observable side effect.
+		now := time.Now()
+		snap, ok := provider.Sample(ctx)
 		switch {
 		case cfg.Readout != nil:
 			// ADR-0156 pretty path: push the sample as a label/value readout
 			// the live panel renders in place (the panel owns stdout, so no
 			// per-sample line is printed).
-			snap, ok := provider.Sample(ctx)
-			cfg.Readout(metricsWatchReadoutFields(time.Now(), snap, ok))
+			cfg.Readout(metricsWatchReadoutFields(now, snap, ok))
 		case cfg.Print:
-			snap, ok := provider.Sample(ctx)
-			fmt.Fprintln(out, formatWatchLine(time.Now(), snap, ok))
+			fmt.Fprintln(out, formatWatchLine(now, snap, ok))
+		}
+		if cfg.Sink != nil {
+			writeSampleRecords(ctx, logger, cfg.Sink, []telemetrysink.Record{
+				sampleRecord(now, label, cfg.Database, cfg.Branch, snap, ok),
+			})
 		}
 		if alerting {
 			// Reuse the exact sync-path alerter tick (it re-reads the cached

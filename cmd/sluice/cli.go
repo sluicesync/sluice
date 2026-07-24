@@ -177,7 +177,7 @@ type CLI struct {
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`
 	Trigger  TriggerCmd  `cmd:"" help:"Install / remove the postgres-trigger engine's source-side state (ADR-0066)."`
 
-	MetricsWatch MetricsWatchCmd `cmd:"" help:"Watch a PlanetScale database's control-plane metrics (CPU/mem/storage/lag) and fire threshold alerts — standalone, no sync attached (ADR-0107)."`
+	MetricsWatch MetricsWatchCmd `cmd:"" help:"Watch a PlanetScale database — or the WHOLE ORG — for control-plane metrics (CPU/mem/storage/lag): threshold alerts, a Prometheus exporter, and an optional durable sample sink. Standalone, no sync attached (ADR-0107, ADR-0180)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
@@ -1618,6 +1618,80 @@ func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pste
 		)
 	}
 	return provider, nil
+}
+
+// fleetTelemetryParams is the input to [buildFleetTelemetryProvider] — the
+// ORG-WIDE (roadmap item 75b) sibling of [telemetryParams]. It carries no
+// database/DSN: the whole point of the fleet mode is that the org's
+// service-discovery document enumerates the databases and branches itself.
+type fleetTelemetryParams struct {
+	org     string
+	tokenID string
+	token   string
+	branch  string // "" ⇒ every branch (NOT "main" — see FleetConfig.Branch)
+	include []string
+	exclude []string
+	engine  string // fallback metric-name table for an unmarked exposition
+
+	concurrency int
+	quiet       bool
+}
+
+// buildFleetTelemetryProvider constructs the org-wide PlanetScale telemetry
+// provider. Opt-in is all-or-nothing exactly as in
+// [buildTargetTelemetryProvider]: an org without a complete token pair is a
+// loud refusal, never a half-running watch.
+func buildFleetTelemetryProvider(ctx context.Context, p fleetTelemetryParams) (*pstelemetry.Fleet, error) {
+	if p.org == "" {
+		return nil, errors.New("org-wide telemetry requires --planetscale-org")
+	}
+	if p.tokenID == "" || p.token == "" {
+		return nil, errors.New(
+			"--planetscale-org is set but the metrics service token is incomplete: supply BOTH --planetscale-metrics-token-id and --planetscale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
+		)
+	}
+	fleet, err := pstelemetry.NewFleet(ctx, pstelemetry.FleetConfig{
+		Org:         p.org,
+		TokenID:     p.tokenID,
+		Token:       p.token,
+		Branch:      p.branch,
+		Include:     p.include,
+		Exclude:     p.exclude,
+		Engine:      p.engine,
+		Concurrency: p.concurrency,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("--planetscale-org fleet telemetry: %w", err)
+	}
+	if !p.quiet {
+		slog.InfoContext(
+			ctx,
+			"PlanetScale ORG-WIDE telemetry enabled (roadmap item 75b) — every database+branch the org exposes; advisory only",
+			slog.String("org", p.org),
+			slog.String("branch", fleetBranchLabel(p.branch)),
+		)
+	}
+	return fleet, nil
+}
+
+// fleetBranchLabel is the log-label form of the fleet branch filter: the
+// configured value, or "(all)" when unset — deliberately NOT "main", because
+// an unset fleet branch means every branch.
+func fleetBranchLabel(branch string) string {
+	if branch == "" {
+		return "(all)"
+	}
+	return branch
+}
+
+// fleetProviderOrNil converts a possibly-nil *Fleet into the engine-neutral
+// ir.FleetTelemetry WITHOUT the typed-nil interface trap (see
+// [telemetryProviderOrNil]).
+func fleetProviderOrNil(f *pstelemetry.Fleet) ir.FleetTelemetry {
+	if f == nil {
+		return nil
+	}
+	return f
 }
 
 // telemetryProviderOrNil converts a possibly-nil *Provider into the

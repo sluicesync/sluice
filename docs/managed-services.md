@@ -452,6 +452,73 @@ supports `--once` (single sample, for scripts) and `--interval`
 PlanetScale-metrics Prometheus exporter — needing only the metrics
 token, no DB credential.
 
+#### Org-wide mode (whole-fleet telemetry)
+
+**Omit `--planetscale-metrics-db`** and the watch covers the entire
+org: one call to the org's metrics service discovery enumerates every
+database + branch, and the poll fans out across them on the same 60s
+cadence with bounded concurrency.
+
+```bash
+sluice metrics-watch \
+  --engine planetscale --planetscale-org acme \
+  --include-database 'prod-*' --exclude-database 'prod-scratch' \
+  --metrics-listen :9090 --sink-file /var/lib/sluice/metrics.jsonl --quiet
+```
+
+`--include-database` / `--exclude-database` are repeatable globs matched
+against both `database` and `database/branch` (unlike `--include-table`,
+the two may be combined — exclude wins). `--fleet-concurrency` bounds
+in-flight scrapes per poll (default 4, max 16). `--planetscale-metrics-branch`
+means *every* branch when unset in this mode (single-database mode still
+defaults it to `main`); set it to restrict the fan-out to one branch name.
+
+Org-wide mode leads with the **exporter** and the **sink** rather than the
+live line — across dozens of databases a per-database line is unreadable, so
+the live output collapses to one summary row (`targets=`, `observed=`, and
+the worst reading per metric with the database that produced it). The
+`/metrics` endpoint exports the same `sluice_target_*` gauge family labelled
+`{database,branch}` — one Grafana dashboard covers the whole org — plus
+`sluice_fleet_targets` and `sluice_fleet_targets_observed`.
+
+Databases of *both* engines can sit in one org: each target's metric
+vocabulary is resolved from its own exposition, so a Vitess/MySQL database
+and a Postgres database in the same fan-out are each read correctly.
+`--engine` remains the fallback for a target whose exposition names
+neither.
+
+#### Keeping the samples (`--sink-file` / `--sink-http`)
+
+The `--notify-*` sinks deliver **threshold breaches**. To keep **every**
+polled sample — for your own portal, without standing up Prometheus —
+opt into a persistent sink:
+
+| Flag | What it does |
+| --- | --- |
+| `--sink-file PATH` | Append each sample as one JSON object per line (JSONL), rotating by size |
+| `--sink-file-max-bytes N` | Rotate at N bytes (default 64 MiB; negative disables rotation) |
+| `--sink-file-max-files N` | Keep N rotated generations, `PATH.1` (newest) … `PATH.N` (default 5) |
+| `--sink-http URL` | POST each tick's samples as `{"records":[…]}` (env `SLUICE_METRICS_SINK_HTTP`) |
+
+Both sinks are **advisory and failure-isolated**, exactly like the
+`--notify-*` sinks: a full disk or a dead endpoint is logged and swallowed,
+never stalling or failing a poll. A bad `--sink-file` path is refused at
+startup rather than silently recording nothing.
+
+One record per target per tick:
+
+```json
+{"at":"2026-07-24T20:31:19.018Z","sampled_at":"2026-07-24T20:31:18.766Z","watch":"metrics-watch:acme","database":"app","branch":"main","fresh":true,"cpu_util":0.175,"mem_util":0.331,"storage_util":0.029,"storage_available_bytes":12237946880,"storage_capacity_bytes":12606734336,"replica_lag_seconds":null,"active_connections":5,"max_connections":250}
+```
+
+**A metric the provider did not observe is `null`, never `0`** — the same
+honesty contract the live line's `n/a` carries, so a dashboard never plots
+"unobserved" as "idle". A tick where the provider had no sample at all
+records `"fresh":false` with every metric null, so a gap is visible rather
+than a missing row. Byte figures are emitted as exact integers, so decode
+them into a 64-bit integer type (or `json.Decoder.UseNumber` / `jq`) rather
+than a default float.
+
 ### Fast-by-default concurrent CDC apply
 
 `--apply-concurrency` controls the key-hash CDC apply lane count and is

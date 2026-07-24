@@ -89,6 +89,59 @@ func metricNamesFor(engine string) metricNames {
 	}
 }
 
+// Marker metrics that identify which engine surface an exposition came from.
+// Ground-truthed 2026-07-24 against the live `sluicesync` org (6 branches, 4
+// Vitess/MySQL + 2 Postgres): the two storage families are DISJOINT — a
+// Vitess branch carries `planetscale_vttablet_volume_*` and never
+// `planetscale_volume_*`; a Postgres branch carries `planetscale_volume_*`
+// and never the vttablet spelling. That disjointness is what makes
+// [metricNamesForExposition] safe.
+const (
+	markerVitessVolume   = "planetscale_vttablet_volume_capacity_bytes"
+	markerPostgresVolume = "planetscale_volume_capacity_bytes"
+)
+
+// metricNamesForExposition picks the per-engine metric-name table for ONE
+// scraped exposition by MARKER-METRIC presence, falling back to the declared
+// (--engine) table when neither marker is present.
+//
+// It exists for the org-wide fleet watch (roadmap item 75b): the per-org
+// service-discovery document carries `planetscale_database_name` /
+// `planetscale_branch_name` / `planetscale_organization_name` and NOTHING
+// that names the engine (probed live 2026-07-24), yet a real org mixes
+// Vitess/MySQL and Postgres databases — the `sluicesync` org itself does. A
+// single declared --engine would therefore read the wrong name table for half
+// the fleet.
+//
+// Why this is safe rather than a guess: the two tables' names are disjoint
+// (see the marker constants), so picking WRONG can only fail to find a series
+// — the corresponding *Known flag stays false, the honest "unobserved"
+// degrade — it can never attribute one engine's number to the other's signal.
+// The scan is ORDER-INDEPENDENT and an AMBIGUOUS exposition (both markers, or
+// neither) falls back to the declared table rather than letting whichever
+// series happened to be listed first decide. The single-database path does
+// NOT use this at all: it keeps the declared table byte-for-byte, so nothing
+// about existing behaviour moves.
+func metricNamesForExposition(samples []promSample, declared metricNames) metricNames {
+	var vitess, postgres bool
+	for _, s := range samples {
+		switch s.name {
+		case markerVitessVolume:
+			vitess = true
+		case markerPostgresVolume:
+			postgres = true
+		}
+	}
+	switch {
+	case vitess && !postgres:
+		return mysqlMetricNames
+	case postgres && !vitess:
+		return postgresMetricNames
+	default:
+		return declared
+	}
+}
+
 // Label keys + the write-target selection values. The write-target health
 // is the PRIMARY vttablet (the pod that takes apply writes); we select on
 // these labels and fall back gracefully when a label is absent.
