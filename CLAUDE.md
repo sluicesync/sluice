@@ -129,7 +129,13 @@ Don't enumerate feature state here — snapshots rot (an earlier version of this
 
 ## Release process
 
-Releases are cut from `main` and published via GoReleaser behind a draft-review gate. The flow for a typical release:
+Releases are cut from `main` and published via GoReleaser behind a draft-review gate.
+
+**Versioning cadence (conventional semver, from v0.100.0 onward).** Patch bumps (`v0.100.1`, `.2`, …) for fixes and small changes; minor bumps (`v0.101.0`, `v0.102.0`, …) for meaningful feature batches or milestones. The `v0.99.x` run all the way to `v0.99.292` was a deliberate **one-time exception** — the minor was held at 99 to reserve `v0.100.0` for a "feels complete" confidence milestone (shipped 2026-07-24) — NOT the ongoing pattern. Prefer the minor/patch distinction so a version communicates change magnitude.
+
+**WinGet submission is manual and selective** — milestones + genuinely notable versions, not every release (microsoft/winget-pkgs reviews each by hand, slowly; historically ~3 of the 292 v0.99.x versions went to WinGet). Use the machine-local `winget-release` skill (`/winget-release`) to produce the fork-branch + upstream PR in one pass. It is deliberately not automated: the CI `TAP_GITHUB_TOKEN` is fine-grained and can't PR against microsoft/winget-pkgs, and per-release auto-PRs would be noise for their manual review. Promotable to an every-X-releases or automatic cadence later (a classic `public_repo`-scope PAT can open the upstream PR).
+
+The flow for a typical release:
 
 1. **Stage + commit** the fix(es) on `main` (run the pre-commit hook locally first; never bypass with `--no-verify`).
 2. **Tag** with `git tag -a vX.Y.Z -m "..."` from the commit you intend to ship. Force-moving a tag is acceptable **only while the corresponding GitHub release is still in draft state** (CI failed, fix landing, etc.) — never after publish.
