@@ -581,6 +581,25 @@ type Index struct {
 	// unnamed) — engines without the distinction ignore it and emit a
 	// plain unique index. Meaningful only when Unique is true.
 	ConstraintBacked bool
+	// ConstraintDeferrable / ConstraintNullsNotDistinct /
+	// ConstraintWithoutOverlaps carry the source UNIQUE constraint's
+	// attribute flags (pg_constraint condeferrable / connullsnotdistinct
+	// [PG 15+] / conperiod [PG 18+]). Meaningful only when
+	// ConstraintBacked is true; only the PG reader sets them. These are
+	// metadata-only for now: NO emitter reads them — every target still
+	// lands a plain UNIQUE, which is strictly WEAKER (NULLS NOT DISTINCT
+	// dropped ⇒ the target admits duplicate NULLs the source rejected;
+	// DEFERRABLE dropped ⇒ immediate per-statement enforcement;
+	// WITHOUT OVERLAPS dropped ⇒ no temporal non-overlap). The PG schema
+	// reader WARNs loudly per affected constraint at read time so the
+	// weakening is never silent; faithful same-engine carry is the filed
+	// follow-up (roadmap "UNIQUE-constraint attribute fidelity"). Carried
+	// on the IR (and therefore the backup/schema-history wire, where the
+	// bools ride the default struct JSON) so that follow-up can emit them
+	// without a wire change.
+	ConstraintDeferrable       bool
+	ConstraintNullsNotDistinct bool
+	ConstraintWithoutOverlaps  bool
 	// Kind is the storage structure (btree, hash, gin, etc.).
 	Kind IndexKind
 	// Method is the verbatim engine-specific access-method name when

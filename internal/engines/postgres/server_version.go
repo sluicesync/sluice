@@ -23,6 +23,21 @@ import (
 // for future point releases.
 const pgVersionFailoverSupport = 170000
 
+// pgVersionUniqueNullsNotDistinct is the first server version whose
+// pg_index carries `indnullsnotdistinct` (UNIQUE NULLS NOT DISTINCT —
+// stored on the index side, not pg_constraint) — PG 15.
+// pgVersionUniqueWithoutOverlaps is the first whose pg_constraint
+// carries `conperiod` (temporal UNIQUE ... WITHOUT OVERLAPS) — PG 18.
+// Below each, the catalog column does not exist and referencing it
+// would 42703 the whole index read, so the schema reader substitutes a
+// constant-false select expression there (the same version-gated
+// catalog-read precedent as [pgVersionPublicationAttrs] /
+// [pgVersionFailoverSupport]).
+const (
+	pgVersionUniqueNullsNotDistinct = 150000
+	pgVersionUniqueWithoutOverlaps  = 180000
+)
+
 // serverVersionNum returns the Postgres server's numeric version
 // (server_version_num), e.g. 170002 for PG 17.2 or 160006 for PG
 // 16.6. Used by the slot-creation path to decide whether to opt in

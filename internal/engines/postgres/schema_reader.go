@@ -1344,7 +1344,19 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 // which requires `vector_l2_ops` / `vector_cosine_ops` /
 // `vector_ip_ops`) round-trip cleanly under ADR-0032 / Bug 47.
 func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*ir.Table) error {
-	const q = `
+	// UNIQUE-constraint attribute reads are version-gated (the
+	// [serverVersionNum] precedent from publicationMemberDefs):
+	// `connullsnotdistinct` exists on PG 15+ and `conperiod` on PG 18+
+	// only — referencing either on an older server would 42703 the
+	// whole index read, so the query substitutes constant `false` for
+	// the missing column (below the version no constraint can carry the
+	// attribute, so false is exact, not a degradation).
+	version, err := serverVersionNum(ctx, r.db)
+	if err != nil {
+		return fmt.Errorf("postgres: index read: %w", err)
+	}
+	nullsNotDistinctExpr, periodExpr := uniqueConstraintAttrExprs(version)
+	q := `
 		SELECT
 			cl.relname AS table_name,
 			i.relname  AS index_name,
@@ -1391,12 +1403,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- CONSTRAINT), so the writer must re-emit it as a
 			-- constraint, not demote it to a bare index. contype 'u'
 			-- only: 'p' (PK) rides Table.PrimaryKey and 'x' (EXCLUDE)
-			-- rides Table.ExcludeConstraints.
-			EXISTS (
-				SELECT 1 FROM pg_constraint con
-				WHERE  con.conindid = ix.indexrelid
-				  AND  con.contype  = 'u'
-			) AS constraint_backed,
+			-- rides Table.ExcludeConstraints. Read via the ucon LEFT
+			-- JOIN below (a unique constraint OWNS its index, so the
+			-- join is at most 1:1 and cannot multiply rows).
+			ucon.oid IS NOT NULL AS constraint_backed,
+			-- v0.100 readiness C3: the owning UNIQUE constraint's
+			-- attribute flags. sluice lands every target as a plain
+			-- UNIQUE (strictly weaker), so the reader carries these on
+			-- the IR and WARNs per affected constraint — the
+			-- ix.indnullsnotdistinct / ucon.conperiod selects are
+			-- version-gated expressions (PG 15+ / PG 18+; constant
+			-- false below — see uniqueConstraintAttrExprs).
+			COALESCE(ucon.condeferrable, false) AS con_deferrable,
+			` + nullsNotDistinctExpr + ` AS con_nulls_not_distinct,
+			` + periodExpr + ` AS con_period,
 			-- ADR-0047: is the access method owned by an extension
 			-- (pg_depend deptype 'e')? An extension-owned AM that is
 			-- NOT one of the ADR-0032 catalogued ones is carried
@@ -1431,6 +1451,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		LEFT JOIN LATERAL unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
 		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
+		LEFT JOIN pg_constraint ucon ON ucon.conindid = ix.indexrelid AND ucon.contype = 'u'
 		WHERE  n.nspname = $1
 		  AND  cl.relkind = 'r'
 		ORDER  BY cl.relname, i.relname, u.ord`
@@ -1452,6 +1473,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			&row.colName, &row.ord, &row.opclass, &row.opclassDefault, &row.exprText,
 			&row.nKeyAtts, &row.indOption, &row.predicate,
 			&row.constraintBacked,
+			&row.conDeferrable, &row.conNullsNotDistinct, &row.conPeriod,
 			&row.amExtOwned, &row.opclassExtOwned,
 		); err != nil {
 			return err
@@ -1479,6 +1501,10 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			if row.isPrimary {
 				primary[row.tableName] = row.indexName
 			}
+			// C3: the WARN rides shell creation, so it fires exactly
+			// once per constraint per schema read regardless of how
+			// many column rows the index unnests into.
+			warnWeakenedUniqueConstraint(ctx, row.tableName, idx)
 		}
 		// Bug 19b: ordinals beyond indnkeyatts are non-key INCLUDE payload
 		// columns, not part of the index key. They carry a real column
@@ -1505,18 +1531,97 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 // ordering / opclass / predicate metadata. isExpr is derived after the
 // scan (an expression key has an empty column name).
 type indexRow struct {
-	tableName, indexName, method, colName string
-	isUnique, isPrimary                   bool
-	ord                                   int
-	opclass                               string
-	opclassDefault                        bool
-	exprText                              string
-	nKeyAtts                              int
-	indOption                             int
-	predicate                             string
-	constraintBacked                      bool
-	amExtOwned, opclassExtOwned           bool
-	isExpr                                bool
+	tableName, indexName, method, colName         string
+	isUnique, isPrimary                           bool
+	ord                                           int
+	opclass                                       string
+	opclassDefault                                bool
+	exprText                                      string
+	nKeyAtts                                      int
+	indOption                                     int
+	predicate                                     string
+	constraintBacked                              bool
+	conDeferrable, conNullsNotDistinct, conPeriod bool
+	amExtOwned, opclassExtOwned                   bool
+	isExpr                                        bool
+}
+
+// uniqueConstraintAttrExprs returns the SQL select expressions for the
+// two version-gated UNIQUE-attribute catalog columns (v0.100 readiness
+// C3): NULLS NOT DISTINCT is stored on the INDEX side as
+// `pg_index.indnullsnotdistinct` (PG 15+ — NOT on pg_constraint; the
+// roadmap entry's `connullsnotdistinct` column never existed, which a
+// real PG 16 read caught as a 42703), and WITHOUT OVERLAPS on the
+// constraint side as `pg_constraint.conperiod` (PG 18+, via the ucon
+// join). Below each version the column is absent from the catalog —
+// referencing it would fail the whole index read with SQLSTATE 42703 —
+// and no constraint can carry the attribute there, so constant `false`
+// is the exact (not degraded) substitute. Pure so the per-version
+// matrix is unit-testable without a server.
+func uniqueConstraintAttrExprs(version int) (nullsNotDistinctExpr, periodExpr string) {
+	nullsNotDistinctExpr = "false"
+	if version >= pgVersionUniqueNullsNotDistinct {
+		nullsNotDistinctExpr = "ix.indnullsnotdistinct"
+	}
+	periodExpr = "false"
+	if version >= pgVersionUniqueWithoutOverlaps {
+		periodExpr = "COALESCE(ucon.conperiod, false)"
+	}
+	return nullsNotDistinctExpr, periodExpr
+}
+
+// weakenedUniqueAttrs names the attribute flags idx carries that every
+// sluice target currently drops (the constraint lands as a plain
+// UNIQUE), each with the operator-facing consequence of the drop.
+// Empty for a plain constraint-backed UNIQUE and for non-constraint
+// indexes. Split from the WARN emitter so the naming matrix is
+// unit-testable as data.
+func weakenedUniqueAttrs(idx *ir.Index) []string {
+	if !idx.ConstraintBacked {
+		return nil
+	}
+	var attrs []string
+	if idx.ConstraintNullsNotDistinct {
+		attrs = append(attrs, "NULLS NOT DISTINCT (a plain UNIQUE treats NULLs as distinct, so the target admits duplicate NULLs the source rejected)")
+	}
+	if idx.ConstraintDeferrable {
+		attrs = append(attrs, "DEFERRABLE (the target enforces uniqueness immediately at each statement; transactions relying on deferred checking will fail)")
+	}
+	if idx.ConstraintWithoutOverlaps {
+		attrs = append(attrs, "WITHOUT OVERLAPS (a plain UNIQUE compares on equality only, so the target no longer rejects overlapping ranges/periods)")
+	}
+	return attrs
+}
+
+// warnWeakenedUniqueConstraint emits the C3 fidelity WARN for a UNIQUE
+// constraint carrying DEFERRABLE / NULLS NOT DISTINCT / WITHOUT
+// OVERLAPS: sluice lands every target — including same-engine PG — as
+// a plain UNIQUE, which is strictly WEAKER, and until this WARN the
+// weakening was silent. Emitted at READ time (index-shell creation, so
+// exactly once per constraint per schema read) because the reader is
+// the single chokepoint every consumer path flows through — migrate,
+// sync cold start, backup, preview/diff — and the weaker landing is
+// target-independent today. WARN, never a refusal: the constraint
+// itself still carries and enforces plain uniqueness. Faithful
+// same-engine carry is the filed follow-up (roadmap "UNIQUE-constraint
+// attribute fidelity"); the dump-parity oracle pins the NULLS NOT
+// DISTINCT divergence as a cited allowlist entry until it ships.
+func warnWeakenedUniqueConstraint(ctx context.Context, tableName string, idx *ir.Index) {
+	attrs := weakenedUniqueAttrs(idx)
+	if len(attrs) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx,
+		"postgres: UNIQUE constraint carries attribute(s) the target will NOT enforce — it lands as a plain "+
+			"UNIQUE constraint on every sluice target, which is strictly weaker; review before cutover",
+		slog.String("table", tableName),
+		slog.String("constraint", idx.Name),
+		slog.String("dropped_attributes", strings.Join(attrs, "; ")),
+		slog.String("hint", "if the attribute is load-bearing, recreate the constraint with it on the target "+
+			"after migration (ALTER TABLE ... DROP CONSTRAINT / ADD CONSTRAINT ... with the attribute) and "+
+			"verify no rows already violate it"),
+	)
 }
 
 // newIndexFromRow builds the [ir.Index] shell the first time a given
@@ -1533,14 +1638,23 @@ func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
 	predicate := row.predicate
 
 	kind := indexKindFrom(method)
+	// TRIAGE #4: a UNIQUE-constraint-owned index re-emits as
+	// ALTER TABLE ... ADD CONSTRAINT, not CREATE UNIQUE INDEX. Never
+	// true for PK indexes (contype 'p'). The C3 attribute flags share
+	// the gate: they are attributes OF that owning constraint.
+	owned := constraintBacked && isUnique && !isPrimary
 	idx := &ir.Index{
-		Name:   indexName,
-		Unique: isUnique,
-		Kind:   kind,
-		// TRIAGE #4: a UNIQUE-constraint-owned index re-emits
-		// as ALTER TABLE ... ADD CONSTRAINT, not CREATE UNIQUE
-		// INDEX. Never true for PK indexes (contype 'p').
-		ConstraintBacked: constraintBacked && isUnique && !isPrimary,
+		Name:             indexName,
+		Unique:           isUnique,
+		Kind:             kind,
+		ConstraintBacked: owned,
+		// v0.100 readiness C3: metadata-only carry of the owning UNIQUE
+		// constraint's attributes — no emitter reads these yet; the
+		// read-time WARN (warnWeakenedUniqueConstraint) names the
+		// plain-UNIQUE weakening every target currently lands.
+		ConstraintDeferrable:       owned && row.conDeferrable,
+		ConstraintNullsNotDistinct: owned && row.conNullsNotDistinct,
+		ConstraintWithoutOverlaps:  owned && row.conPeriod,
 	}
 	// ADR-0032: preserve extension-introduced access-method
 	// names (ivfflat, hnsw) verbatim so the same-engine writer

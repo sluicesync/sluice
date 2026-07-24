@@ -37,6 +37,19 @@ var DumpParityAllowlist = []dumpParityAllowlistEntry{
 		Reason:   "integer defaults re-emit as quoted casts (DEFAULT '0'::bigint vs source DEFAULT 0) — evaluates identically on every insert, catalog-text different; operator-approved cosmetic divergence (2026-07-03)",
 		Citation: "docs/type-mapping.md \"Typed-literal default rendering\"",
 	},
+	// The v0.100-readiness C3 UNIQUE-attribute cell: the source
+	// constraint is UNIQUE NULLS NOT DISTINCT; sluice lands it as a
+	// plain UNIQUE (strictly weaker — admits duplicate NULLs), the PG
+	// schema reader WARNs loudly per affected constraint at read time,
+	// and the attribute is carried on ir.Index for the faithful-carry
+	// follow-up. This entry is the oracle-side pin of that documented
+	// weakening: if the follow-up ships, the mismatch disappears and
+	// this entry goes stale-loud (allowlist hits are logged every run).
+	{
+		Pattern:  "ALTER TABLE public.customers ADD CONSTRAINT customers_extref_nnd",
+		Reason:   "UNIQUE NULLS NOT DISTINCT lands as plain UNIQUE — the C3 read-time WARN names the weakening; faithful same-engine carry is the filed follow-up",
+		Citation: "docs/dev/roadmap.md \"UNIQUE-constraint attribute fidelity\"",
+	},
 	// The serial → identity modernization trio (docs/type-mapping.md
 	// "Sequences and serial columns"): pg_dump restores a classic
 	// serial column as CREATE SEQUENCE + OWNED BY + SET DEFAULT

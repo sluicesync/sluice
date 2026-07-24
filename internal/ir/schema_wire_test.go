@@ -120,7 +120,17 @@ func TestMarshalTable_IndexConstraintBackedRoundTrip(t *testing.T) {
 		Name:    "accounts",
 		Columns: []*Column{{Name: "email", Type: Text{Size: TextLong}}},
 		Indexes: []*Index{
-			{Name: "accounts_email_unique", Unique: true, ConstraintBacked: true, Columns: []IndexColumn{{Column: "email"}}},
+			// The C3 attribute flags ride the same default-struct-JSON
+			// wire as ConstraintBacked; set all three so the final
+			// DeepEqual pins their round-trip too (a restore that loses
+			// them would silently drop the follow-up faithful carry's
+			// input — and the read-time WARN's evidence — through the
+			// backup door).
+			{
+				Name: "accounts_email_unique", Unique: true, ConstraintBacked: true,
+				ConstraintDeferrable: true, ConstraintNullsNotDistinct: true, ConstraintWithoutOverlaps: true,
+				Columns: []IndexColumn{{Column: "email"}},
+			},
 			{Name: "accounts_email_uidx", Unique: true, Columns: []IndexColumn{{Column: "email"}}},
 		},
 	}
