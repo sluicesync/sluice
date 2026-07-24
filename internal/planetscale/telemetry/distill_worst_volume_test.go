@@ -188,3 +188,91 @@ func TestSelectWorstVolume_MySQLShapeAlsoReduces(t *testing.T) {
 			snap.StorageKnown, snap.StorageAvailableBytes)
 	}
 }
+
+// TestDistill_ReplicaLag_WorstAcrossReplicas_BothEngines pins the lag repair.
+// Neither engine emits a PRIMARY lag series — PG tags every series
+// role="replica", Vitess tags every one tablet_type="replica" — so the old
+// primary-selection cascade found no primary, fell past the single-series
+// tier on any branch with >=2 replicas, and refused. LagKnown was therefore
+// silently false on multi-replica branches of BOTH engines.
+func TestDistill_ReplicaLag_WorstAcrossReplicas_BothEngines(t *testing.T) {
+	cases := []struct {
+		name   string
+		names  metricNames
+		metric string
+		labels []map[string]string
+	}{
+		{
+			name:   "postgres (role=replica)",
+			names:  postgresMetricNames,
+			metric: "planetscale_postgres_replica_lag_seconds",
+			labels: []map[string]string{
+				{"planetscale_pod": "a", "planetscale_role": "replica"},
+				{"planetscale_pod": "b", "planetscale_role": "replica"},
+			},
+		},
+		{
+			name:   "vitess (tablet_type=replica)",
+			names:  mysqlMetricNames,
+			metric: "planetscale_mysql_replica_lag_seconds",
+			labels: []map[string]string{
+				{"planetscale_pod": "a", "planetscale_tablet_type": "replica"},
+				{"planetscale_pod": "b", "planetscale_tablet_type": "replica"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			samples := []promSample{
+				{name: tc.metric, labels: tc.labels[0], value: 3},
+				{name: tc.metric, labels: tc.labels[1], value: 41.5}, // the furthest behind
+			}
+			snap := distill(samples, tc.names, time.Now())
+			if !snap.LagKnown {
+				t.Fatal("LagKnown = false; want true — two replica series must reduce, not refuse")
+			}
+			if snap.ReplicaLagSeconds != 41.5 {
+				t.Errorf("ReplicaLagSeconds = %v; want 41.5 (the WORST replica, not the first or an average)",
+					snap.ReplicaLagSeconds)
+			}
+		})
+	}
+}
+
+// TestSelectWorstOf_SingleSeriesIsUnchanged pins that the max reduction
+// degenerates to the old value on a single-replica branch, so this is a
+// strict repair rather than a behaviour change where lag already resolved.
+func TestSelectWorstOf_SingleSeriesIsUnchanged(t *testing.T) {
+	samples := []promSample{{name: "m", labels: map[string]string{"p": "only"}, value: 7.25}}
+	got, ok := selectWorstOf(samples, "m")
+	if !ok || got != 7.25 {
+		t.Errorf("selectWorstOf = (%v, %v); want (7.25, true)", got, ok)
+	}
+	if _, ok := selectWorstOf(samples, ""); ok {
+		t.Error("unset metric name returned ok=true; want false (honest unobserved)")
+	}
+	if _, ok := selectWorstOf(samples, "absent"); ok {
+		t.Error("absent metric returned ok=true; want false")
+	}
+}
+
+// TestDistill_PGConnections_ResolveOnTheRealShapes pins the two PG connection
+// series at the shapes the live endpoint emits: active connections as a
+// single unlabelled series (single-series tier), and max_connections fanned
+// per pod with planetscale_role (the role tier added for storage).
+func TestDistill_PGConnections_ResolveOnTheRealShapes(t *testing.T) {
+	samples := []promSample{
+		{name: "planetscale_edge_postgres_active_connections", labels: map[string]string{}, value: 4},
+		{name: "planetscale_postgres_settings_max_connections", labels: map[string]string{"planetscale_pod": "a", "planetscale_role": "replica"}, value: 25},
+		{name: "planetscale_postgres_settings_max_connections", labels: map[string]string{"planetscale_pod": "b", "planetscale_role": "replica"}, value: 25},
+		{name: "planetscale_postgres_settings_max_connections", labels: map[string]string{"planetscale_pod": "c", "planetscale_role": "primary"}, value: 25},
+	}
+	snap := distill(samples, postgresMetricNames, time.Now())
+	if !snap.ConnKnown {
+		t.Fatal("ConnKnown = false; want true — both PG connection shapes are resolvable")
+	}
+	if snap.ActiveConnections != 4 || snap.MaxConnections != 25 {
+		t.Errorf("connections = %d/%d; want 4/25 (max_connections from the PRIMARY pod)",
+			snap.ActiveConnections, snap.MaxConnections)
+	}
+}

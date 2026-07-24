@@ -67,13 +67,23 @@ var postgresMetricNames = metricNames{
 	memUtilPct:       "planetscale_pods_mem_util_percentages",
 	volAvailableByte: "planetscale_volume_available_bytes",
 	volCapacityByte:  "planetscale_volume_capacity_bytes",
-	// replicaLagSec intentionally UNSET: the live PG endpoint exposes no
-	// `planetscale_postgres_replica_lag_seconds` (probed 2026-06-23 — it has
-	// `planetscale_postgres_wal_archiver_lag_bytes` / `wal_size_bytes`, a
-	// different signal). A single-node PG has no replica lag anyway; leaving it
-	// unset keeps LagKnown=false (honest unobserved) rather than naming a
-	// non-existent series.
-	// activeConns / maxConns intentionally unset — see doc comment above.
+	// All three CONFIRMED live 2026-07-24. Each was previously left unset on
+	// the strength of a 2026-06-23 probe that is no longer accurate — the
+	// endpoint has since grown them:
+	//
+	//   - replicaLagSec: `planetscale_postgres_replica_lag_seconds` DOES now
+	//     exist ("Replica lag in fine-grained seconds from Postgres"), one
+	//     gauge per replica pod. The old comment asserted it did not.
+	//   - activeConns: `planetscale_edge_postgres_active_connections`, a
+	//     single unlabelled series (so the single-series tier resolves it).
+	//   - maxConns: `planetscale_postgres_settings_max_connections`, one
+	//     series per pod carrying planetscale_role — resolvable since the
+	//     role tier was added. This is NOT the per-state
+	//     `planetscale_postgres_connection_state` breakdown the old comment
+	//     worried about mis-summing; it is a flat setting value.
+	replicaLagSec:    "planetscale_postgres_replica_lag_seconds",
+	activeConns:      "planetscale_edge_postgres_active_connections",
+	maxConns:         "planetscale_postgres_settings_max_connections",
 	primaryContainer: "postgres",
 }
 
@@ -171,7 +181,19 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 		snap.StorageWorstKnown = true
 	}
 
-	if v, ok := selectPrimaryValue(samples, names.replicaLagSec, names.primaryContainer); ok {
+	// Replica lag is the WORST (max) lag across replicas, not a
+	// primary-selected value — on BOTH engines. Lag is inherently a replica
+	// property: neither surface emits a primary series for it (PG tags every
+	// lag series planetscale_role="replica"; Vitess tags every one
+	// planetscale_tablet_type="replica"), so [selectPrimaryValue] found no
+	// primary, fell past the single-series tier on any branch with ≥2
+	// replicas, and refused — leaving LagKnown false. That silently disabled
+	// --notify-lag-seconds on multi-replica branches of BOTH engines
+	// (live-confirmed 2026-07-24). Max is also the semantically right
+	// reduction: a lag alert cares about the furthest-behind replica, and on a
+	// single-replica branch max degenerates to that one value, so this is a
+	// strict repair with no behaviour change where lag already resolved.
+	if v, ok := selectWorstOf(samples, names.replicaLagSec); ok {
 		snap.ReplicaLagSeconds = v
 		snap.LagKnown = true
 	}
@@ -255,6 +277,32 @@ func selectPrimaryValue(samples []promSample, name, primaryContainer string) (fl
 		// refuse to guess.
 		return 0, false
 	}
+}
+
+// selectWorstOf returns the MAXIMUM value across every series of the named
+// metric — the "worst pod wins" reduction, for signals where higher is worse
+// and no series is privileged (replica lag being the motivating case: every
+// series is a replica, so there is no primary to select).
+//
+// Unlike [selectPrimaryValue] this never refuses on ambiguity, because
+// ambiguity is not a problem here: with no privileged series, the max IS the
+// answer regardless of how many pods report. It returns ok=false only when
+// the metric is absent entirely (including the engine-table-unset case where
+// name is ""), preserving the honest-unobserved contract.
+func selectWorstOf(samples []promSample, name string) (float64, bool) {
+	if name == "" {
+		return 0, false
+	}
+	worst, found := 0.0, false
+	for _, s := range samples {
+		if s.name != name {
+			continue
+		}
+		if !found || s.value > worst {
+			worst, found = s.value, true
+		}
+	}
+	return worst, found
 }
 
 // selectWorstVolume returns the (available, capacity) pair of the FULLEST

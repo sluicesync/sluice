@@ -107,15 +107,18 @@ func TestDistill_PostgresEngine_UsesPGNames(t *testing.T) {
 	if snap.StorageAvailableBytes != 40000000000 || snap.StorageCapacityBytes != 160000000000 {
 		t.Errorf("raw storage = %d/%d, want 40e9/160e9", snap.StorageAvailableBytes, snap.StorageCapacityBytes)
 	}
-	// Lag: PG lag name is now UNSET (the live endpoint has no
-	// planetscale_postgres_replica_lag_seconds — probed 2026-06-23), so the
-	// mysql decoy (99) must NOT be read and LagKnown stays false (honest).
-	if snap.LagKnown {
-		t.Errorf("LagKnown true (=%v); want false (PG lag intentionally unmapped)", snap.ReplicaLagSeconds)
+	// Lag: `planetscale_postgres_replica_lag_seconds` DOES exist on the live
+	// endpoint (confirmed 2026-07-24) and is now mapped, so the PG series (2)
+	// is read and the mysql decoy (99) must NOT be — proving the PG table
+	// still picks the right name now that both are wired.
+	if !snap.LagKnown || snap.ReplicaLagSeconds != 2 {
+		t.Errorf("lag = %v known=%v; want 2 true (the PG series, not the mysql decoy 99)",
+			snap.ReplicaLagSeconds, snap.LagKnown)
 	}
-	// Connections: PG table leaves these unset → honest unobserved.
+	// Connections: this fixture carries neither PG connection series, so they
+	// stay honestly unobserved even though the names are now mapped.
 	if snap.ConnKnown {
-		t.Error("ConnKnown true; want false (PG conn metrics intentionally unmapped)")
+		t.Error("ConnKnown true; want false (no connection series in this fixture)")
 	}
 }
 
