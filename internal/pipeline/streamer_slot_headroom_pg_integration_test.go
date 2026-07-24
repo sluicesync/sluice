@@ -205,6 +205,16 @@ func TestStreamer_WarmResume_PG_FullSlots_NeverProbesRefuses(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("cold-start Run did not return after ctx cancel")
 	}
+	// Run returning is NOT slot release: Postgres reaps the walsender
+	// asynchronously (near-instant usually, whole seconds under a
+	// contended CI scheduler — the disconnect-is-not-release class), and
+	// the resume's bounded 55006 retry can lose that race on a loaded
+	// runner (first firing: run 30068794246). The operator-visible
+	// contract this test pins is the resume on a FULL server, not the
+	// release race, so wait for the slot to go inactive first.
+	if !waitForSluiceSlotInactive(t, src, "sluice_slot", 90*time.Second) {
+		t.Fatal("cold-start stream's walsender never released sluice_slot")
+	}
 
 	// Fill the server to its ceiling: the stream's slot + the occupier.
 	occupySlot(t, src, "wave_2_leftover")
