@@ -198,19 +198,28 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 // warning list). So instead of the pre-Vector-B silent skip, emit a loud
 // one-time-per-table WARN naming the coercions + the data-preserving
 // remedy. Not a refusal: the operator chose relaxed mode deliberately.
-// readShowWarnings reads SHOW WARNINGS on conn (must be read before any
+// diagnosticQuerier is the session surface [readShowWarnings] probes: a
+// pinned *sql.Conn (the bulk-write paths) or an open *sql.Tx (the CDC
+// apply path, task C2). Either way the probe MUST run on the SAME
+// session as the just-executed statement — the diagnostics area is
+// session-scoped and per-statement.
+type diagnosticQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// readShowWarnings reads SHOW WARNINGS on q (must be read before any
 // other statement on the session, which would clear the diagnostic list),
 // returning up to 8 formatted detail lines and the total warning count.
-func readShowWarnings(ctx context.Context, conn *sql.Conn, table string) (details []string, count int, err error) {
-	rows, err := conn.QueryContext(ctx, "SHOW WARNINGS")
+func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (details []string, count int, err error) {
+	rows, err := q.QueryContext(ctx, "SHOW WARNINGS")
 	if err != nil {
-		return nil, 0, fmt.Errorf("mysql: bulk write into %q: SHOW WARNINGS failed: %w", table, err)
+		return nil, 0, fmt.Errorf("mysql: write into %q: SHOW WARNINGS failed: %w", table, err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var level, code, msg string
 		if err := rows.Scan(&level, &code, &msg); err != nil {
-			return nil, 0, fmt.Errorf("mysql: bulk write into %q: scan warning: %w", table, err)
+			return nil, 0, fmt.Errorf("mysql: write into %q: scan warning: %w", table, err)
 		}
 		count++
 		// Cap at a few warnings — gigantic loads can emit thousands and
@@ -220,7 +229,7 @@ func readShowWarnings(ctx context.Context, conn *sql.Conn, table string) (detail
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("mysql: bulk write into %q: iterate warnings: %w", table, err)
+		return nil, 0, fmt.Errorf("mysql: write into %q: iterate warnings: %w", table, err)
 	}
 	return details, count, nil
 }

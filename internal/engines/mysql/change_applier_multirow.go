@@ -411,6 +411,14 @@ func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 	if _, err := b.a.txExec(ctx, b.tx, stmt, args...); err != nil {
 		return fmt.Errorf("mysql: applier: multi-row insert into %s.%s: %w", b.run.schema, b.run.table, err)
 	}
+	// Vector B (task C2): under --mysql-sql-mode='' the server silently
+	// clamps out-of-range values in the upsert above and only flags the
+	// session warning list — probe it BEFORE any later statement clears
+	// the diagnostics area. No-op round-trip-free under strict mode (the
+	// default), where the upsert itself errors loudly.
+	if err := b.a.reportApplyClampWarnings(ctx, b.tx, b.run.schema, b.run.table); err != nil {
+		return err
+	}
 	if multiRowFlushHookForTest != nil {
 		multiRowFlushHookForTest(len(b.run.rows))
 	}

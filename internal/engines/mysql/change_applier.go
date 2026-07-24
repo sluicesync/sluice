@@ -418,6 +418,23 @@ type ChangeApplier struct {
 	// on the apply hot path. Zero means "never logged" (the first flush
 	// logs, matching appliercontrol.NoteByteCapDominant's first-call shape).
 	lastCoalesceLogNanos atomic.Int64
+
+	// warnedClamp tracks tables already WARNed about a relaxed-sql_mode
+	// silent coercion on the apply path (Vector B, task C2), so
+	// [reportApplyClampWarnings] emits at most one WARN per table — and,
+	// load-bearingly, skips the SHOW WARNINGS probe entirely for tables
+	// already warned. Keyed by qualified "schema.table"; values are
+	// struct{}. A sync.Map (not the cacheMu maps) because the ADR-0104
+	// concurrent lanes hit it from W goroutines on the flush hot path.
+	// Mirrors RowWriter.warnedClamp on the bulk side.
+	warnedClamp sync.Map
+
+	// clampProbes counts the value-writing statements considered for the
+	// relaxed-mode Vector B probe, driving the [warningsCheckDue] sampling
+	// schedule (shared with the batched bulk path — see row_writer.go for
+	// the schedule's derivation and what the sampling deliberately
+	// weakens). Atomic for the same W-goroutine reason as warnedClamp.
+	clampProbes atomic.Int64
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier
@@ -1142,7 +1159,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
 			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
-		return nil
+		return a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
 
 	case ir.Update:
 		schema := a.routedSchema(v.Schema)
@@ -1164,8 +1181,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("mysql: applier: update %s.%s: %w", schema, v.Table, err)
 		}
+		// logZeroRowsAffected reads the driver-cached rows-affected count
+		// (no SQL round-trip), so the diagnostics area is still the
+		// UPDATE's when the Vector B probe below reads it.
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
-		return nil
+		return a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
 
 	case ir.Delete:
 		schema := a.routedSchema(v.Schema)
@@ -1240,6 +1260,79 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		return nil
 	}
 	return fmt.Errorf("mysql: applier: unknown change type %T", c)
+}
+
+// reportApplyClampWarnings closes the Vector B silent-clamp gap on the
+// CDC APPLY path (v0.100 readiness task C2): under the operator's
+// --mysql-sql-mode=” relaxed opt-in, a steady-state CDC INSERT/UPDATE
+// writing an out-of-range / over-long value is silently clamped or
+// truncated by the server (300 → 127 on TINYINT) and only flagged on
+// the session's warning list — the same class [RowWriter.reportBulkWriteWarnings]
+// closed for the three bulk-copy paths in v0.99.28. This is its
+// apply-path twin, shaped for the apply hot path:
+//
+//   - Strict sql_mode (the default) short-circuits BEFORE any round
+//     trip: a strict session errors the DML itself (loud already, and
+//     the LOAD DATA warning-downgrade quirk does not exist on plain
+//     INSERT/UPDATE), so the default path pays zero added latency.
+//   - Relaxed mode probes SHOW WARNINGS on the SAME tx/session
+//     IMMEDIATELY after a value-writing statement — the diagnostics
+//     area is per-statement, so any later statement (the position
+//     write) would clear it. That per-statement timing is why the
+//     probe lives at the dispatch/flush call sites rather than once
+//     per batch commit.
+//   - Cost is bounded twice over: tables already WARNed skip the probe
+//     entirely (steady-state cost after the first WARN is zero), and
+//     un-warned tables probe on the batched bulk path's sampling
+//     schedule ([warningsCheckDue] — first N statements exhaustive,
+//     then 1-in-M, final-flush unconditionality not applicable here;
+//     same documented advisory trade as row_writer.go).
+//
+// WARN-only, never a refusal: the operator chose relaxed mode
+// deliberately, and strict mode already refuses at the exec. Called
+// after the serial single-row INSERT/UPDATE execs and the ADR-0139
+// coalesced multi-row upsert flush; DELETE (serial or coalesced) and
+// TRUNCATE write no operator values, so they carry no clamp to report.
+// Lane-safe: warnedClamp is a sync.Map and clampProbes is atomic — the
+// ADR-0104 concurrent lanes call this from W goroutines.
+func (a *ChangeApplier) reportApplyClampWarnings(ctx context.Context, tx *sql.Tx, schema, table string) error {
+	if resolveSessionSQLMode(a.sqlMode) != "" {
+		return nil
+	}
+	qn := qualifiedName(schema, table)
+	if _, warned := a.warnedClamp.Load(qn); warned {
+		return nil
+	}
+	if !warningsCheckDue(int(a.clampProbes.Add(1))) {
+		return nil
+	}
+	details, count, err := readShowWarnings(ctx, tx, table)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	if _, seen := a.warnedClamp.LoadOrStore(qn, struct{}{}); seen {
+		return nil
+	}
+	more := ""
+	if count > 8 {
+		more = fmt.Sprintf(" (… and %d more)", count-8)
+	}
+	slog.WarnContext(
+		ctx,
+		"mysql: target SILENTLY coerced CDC value(s) under --mysql-sql-mode='' — an out-of-range/over-long "+
+			"value in a replicated change was clamped or truncated on apply, not refused (Vector B, CDC apply "+
+			"path). The sync continues with the coerced values per your relaxed sql_mode opt-in.",
+		slog.String("table", qn),
+		slog.Int("warnings", count),
+		slog.String("examples", strings.Join(details, "; ")+more),
+		slog.String("hint", "to PRESERVE such values, widen the target column to a type that FITS them "+
+			"(then re-sync the table); to REFUSE instead of coerce, drop --mysql-sql-mode='' so strict mode "+
+			"rejects the value loudly and the stream stops at the offending change"),
+	)
+	return nil
 }
 
 // logZeroRowsAffected emits a debug-level log line when a target Exec
