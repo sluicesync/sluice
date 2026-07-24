@@ -339,8 +339,11 @@ func (e *AzureKMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 // unwrapping. When no version is known (a pre-FormatVersion-5
 // manifest + an unversioned operator URL + no preflight resolution),
 // the unwrap falls to the vault's LATEST version — correct until the
-// key auto-rotates, after which restores of older chains fail with an
-// auth error; a WARN names that hazard up front.
+// key auto-rotates, after which restores of older chains fail with a
+// BadParameter (or auth) error; a WARN names that hazard up front.
+// (Real AKV returns BadParameter for a wrong-version RSA-OAEP unwrap —
+// ground-truthed against a live vault 2026-07-24, incl. the N-9
+// rotate-then-restore-old-chain recovery.)
 func (e *AzureKMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
 	if len(wrapped) == 0 {
 		return nil, errors.New("crypto: azure kms unwrap wrapped bytes are empty")
@@ -420,7 +423,7 @@ func (e *AzureKMSEnvelope) RebindChainKEKRef(recordedRef string) {
 // WARN when an unwrap is about to target the vault's latest key
 // version because no wrap-time version is known (audit N-9's failure
 // mode: enable key auto-rotation and restores of older chains fail
-// with a misleading auth error).
+// with a misleading BadParameter/auth error).
 func (e *AzureKMSEnvelope) warnIfUnversionedUnwrap() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -428,7 +431,7 @@ func (e *AzureKMSEnvelope) warnIfUnversionedUnwrap() {
 		return
 	}
 	e.warnedUnversioned = true
-	slog.Warn("crypto: azure kms: unwrapping against the key's LATEST version — this chain's manifest records no wrap-time key version (written before sluice recorded versioned Azure kek_refs) and the supplied --azure-key-vault-id names none. If the key has auto-rotated since the backup, the unwrap will fail with an auth error; pass the wrap-time version explicitly (https://VAULT.vault.azure.net/keys/KEY/VERSION) to recover",
+	slog.Warn("crypto: azure kms: unwrapping against the key's LATEST version — this chain's manifest records no wrap-time key version (written before sluice recorded versioned Azure kek_refs) and the supplied --azure-key-vault-id names none. If the key has auto-rotated since the backup, the unwrap will fail with a BadParameter or auth error; pass the wrap-time version explicitly (https://VAULT.vault.azure.net/keys/KEY/VERSION) to recover",
 		slog.String("key_id", e.keyID))
 }
 

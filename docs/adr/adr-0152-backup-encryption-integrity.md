@@ -51,6 +51,7 @@ The chain CEK's wrap is bound to the identity of the manifest that records it (`
 - Old manifests (unversioned KEKRef): current latest-version behavior, plus a once-per-envelope WARN naming the rotation hazard and the recovery (pass the wrap-time version explicitly).
 - The lying "Azure recovers the wrap-time version from the wrapped blob's metadata" comment is corrected to state the real semantics.
 - Behavior note: `backup compact`'s encryption-binding compatibility tuple includes KEKRef, so Azure segments wrapped under different key versions now refuse to merge (loud, correct: their unwrap targets genuinely differ).
+- **Live-validated against a real Azure Key Vault (2026-07-24, v0.100.0 milestone):** a chain wrapped under version N restores clean with an *unversioned* operator URL after the key is rotated to N+1 (the KEKRef rebind targets the recorded version N); the negative control — forcing the N+1 version explicitly — fails loudly as designed. The only correction: real AKV returns `BadParameter`, not the "auth error" the WARN wording predicted (wording since updated); functional behavior is identical (loud failure).
 
 ### 5. Restore-side chunk-header validation (makes comment 3 true)
 
