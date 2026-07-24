@@ -115,25 +115,40 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 
 	streamID := s.resolveStreamID()
 	var consecutive int
-	// Bug 202 — the in-memory progress ledger. The `progressed` reset below
-	// requires BOTH boundary position reads to succeed, and the read that
-	// matters most fails in exactly the outage class the ride-out arc exists
-	// for: when the TARGET (which is also the position store) is down at the
-	// next failure, the after-read fails, `progressed` stays false, and the
-	// counter CARRIED OVER a previous ridden-out outage's attempts — a stream
-	// that survived one outage and then applied hours of CDC exited "apply
-	// retry budget exhausted" on the SECOND outage's first or second failure.
-	// The ledger applies the D0-4 discipline (a FAILED read is never evidence
-	// in either direction) to the budget: lastFailureToken records the
-	// persisted token best-known as of the previous counted failure, and any
-	// SUCCESSFUL anchor-bearing read in the current iteration — the boundary
-	// reads or the mid-attempt sentinel's ([observeApplyProgress]) — showing a
-	// DIFFERENT token proves the applier durably committed batches since that
-	// failure (position writes ride the batch tx, ADR-0007), so the failure
-	// starts a fresh budget. With no successful read there is no evidence and
-	// the counter keeps accumulating, so a never-reachable target still
-	// exhausts the budget in exactly `attempts`, and a stuck batch's frozen
-	// token never credits — the loud-failure floor is untouched.
+	// Bug 202 / Bug 204 — the in-memory progress ledger. The counter's
+	// original reset required BOTH boundary position reads to succeed, and
+	// the read that matters most fails in exactly the outage class the
+	// ride-out arc exists for: when the TARGET (which is also the position
+	// store) is down at the next failure, the after-read fails and the
+	// counter CARRIED OVER a previous ridden-out outage's attempts — a
+	// stream that survived one outage and then applied hours of CDC exited
+	// "apply retry budget exhausted" on the SECOND outage's first or second
+	// failure (Bug 202). The ledger applies the D0-4 discipline (a FAILED
+	// read is never evidence in either direction) to the budget: a fresh
+	// budget is credited on either of two strictly evidence-based proofs
+	// that the applier durably committed batches since the last counted
+	// failure (position writes ride the batch tx, ADR-0007):
+	//
+	//   - within-iteration advancement (Bug 204): two SUCCESSFUL
+	//     anchor-bearing observations inside the current iteration — the
+	//     boundary reads plus the mid-attempt sentinel's earliest/latest
+	//     ([observeApplyProgress]) — showing DIFFERENT tokens prove commits
+	//     during this very attempt, with no baseline needed at all;
+	//   - cross-outage advancement (Bug 202): a successful observation
+	//     showing a token DIFFERENT from lastFailureToken — the freshest
+	//     successfully-observed token as of the previous counted failure OR
+	//     EARLIER: it is SEEDED from the Run's first successful
+	//     anchor-bearing observation wherever that occurs (Bug 204: the
+	//     young-Run gap — a first outage within one sentinel poll of Run
+	//     start used to leave the baseline forever invalid, so the second
+	//     outage's evidence had nothing to compare against), then advanced
+	//     at every counted failure.
+	//
+	// With no successful read there is no evidence and the counter keeps
+	// accumulating, so the loud-failure floors are untouched: a
+	// never-reachable target (no observation ever) still exhausts the
+	// budget in exactly `attempts`, and a stuck batch's frozen token never
+	// differs from the seeded baseline, so it never credits.
 	var lastFailureToken string
 	var lastFailureTokenValid bool
 	// ADR-0093: track whether a reactive invalid-position cold-start
@@ -152,6 +167,16 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		beforePos, beforeFound, beforeReadErr := posReader.ReadPosition(ctx, streamID)
 		if beforeReadErr == nil && beforeFound {
 			anchorSeen = true
+			// Bug 204: seed the ledger baseline from the Run's first
+			// successful anchor-bearing observation, wherever it occurs —
+			// including iterations that never reach the counted-failure
+			// bookkeeping below (the reactive-resnapshot `continue`). Seed
+			// only: this read runs AFTER the previous counted failure, so
+			// advancing an already-valid baseline from it would erase
+			// exactly the cross-outage evidence the ledger exists to credit.
+			if !lastFailureTokenValid {
+				lastFailureToken, lastFailureTokenValid = beforePos.Token, true
+			}
 		}
 
 		// Run the attempt with the committed-progress sentinel alongside it
@@ -226,26 +251,39 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		if afterReadErr == nil && afterFound {
 			anchorSeen = true
 		}
-		progressed := beforeReadErr == nil && afterReadErr == nil &&
-			beforeFound && afterFound && afterPos.Token != beforePos.Token
-
-		// Bug 202: fold this iteration's successful anchor-bearing reads into
-		// one freshest observation (position tokens only ever advance, so the
-		// latest read subsumes the earlier ones), then compare it against the
-		// ledger baseline from the previous counted failure. This credits the
-		// deferred evidence `progressed` structurally cannot see — progress
-		// whose proving read happened BEFORE the outage that failed this
-		// iteration's after-read — while a failed read contributes nothing.
+		// Fold this iteration's successful anchor-bearing reads into the
+		// EARLIEST and FRESHEST observations. The reads are strictly ordered
+		// (before-read → sentinel earliest/latest → after-read) and position
+		// tokens only ever advance, so any two differing successful
+		// observations differ between these two ends; a failed read
+		// contributes nothing (D0-4).
+		firstToken, firstValid := "", false
 		obsToken, obsValid := "", false
 		if beforeReadErr == nil && beforeFound {
+			firstToken, firstValid = beforePos.Token, true
 			obsToken, obsValid = beforePos.Token, true
 		}
 		if midObs.valid {
-			obsToken, obsValid = midObs.token, true
+			if !firstValid {
+				firstToken, firstValid = midObs.firstToken, true
+			}
+			obsToken, obsValid = midObs.lastToken, true
 		}
 		if afterReadErr == nil && afterFound {
+			if !firstValid {
+				firstToken, firstValid = afterPos.Token, true
+			}
 			obsToken, obsValid = afterPos.Token, true
 		}
+		// Bug 204: divergence WITHIN the iteration is proof on its own — the
+		// young-Run cell where the fatal iteration holds the Run's first
+		// successful reads (baseline still unseeded) must credit too.
+		// Subsumes the original `progressed` reset (both boundary reads OK
+		// and differing).
+		advancedWithinAttempt := firstValid && firstToken != obsToken
+		// Bug 202: the cross-outage comparison — credits the deferred
+		// evidence whose proving read happened BEFORE the outage that failed
+		// this iteration's after-read.
 		committedSinceLastFailure := obsValid && lastFailureTokenValid && obsToken != lastFailureToken
 
 		// ADR-0109 §B — bounded auto-restart of the cold-start after a
@@ -318,8 +356,8 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// (the ~6-min idle-PlanetScale give-up over the public vstream
 		// endpoint, where no idle heartbeats reach us): each idle reconnect
 		// warm-resumes fine but processes zero events, so the position never
-		// advances and the progressed-reset never fires. So leave the budget
-		// UNTOUCHED for this shape.
+		// advances and no progress evidence ever credits. So leave the
+		// budget UNTOUCHED for this shape.
 		//
 		// INVARIANT (loud-failure tenet): ONLY the established-then-idle
 		// Phase-2 timeout is exempt. A Phase-1 liveness timeout
@@ -334,12 +372,12 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		case isIdleProgressTimeout(err):
 			// Non-incrementing: leave consecutive as-is (do NOT reset — a
 			// real failure between idles must keep its accumulated count).
-		case progressed || committedSinceLastFailure:
-			// Direct evidence (both boundary reads OK, token advanced across
-			// the attempt) or the Bug 202 ledger's deferred evidence (a
-			// successful read this iteration shows the token advanced since
-			// the previous counted failure). Either proves durable commits
-			// happened since the last failure — fresh budget.
+		case advancedWithinAttempt || committedSinceLastFailure:
+			// Two successful observations this iteration with different
+			// tokens (Bug 204), or one successful observation newer than the
+			// ledger baseline from the previous counted failure (Bug 202).
+			// Either proves durable commits happened since the last failure
+			// — fresh budget.
 			consecutive = 1
 		default:
 			consecutive++
@@ -405,18 +443,23 @@ func (s *Streamer) applyProgressPollIntervalOrDefault() time.Duration {
 }
 
 // applyProgressObservation is the committed-progress sentinel's result: the
-// latest persisted position token a SUCCESSFUL anchor-bearing read observed
-// during the attempt. The zero value means "no successful observation" —
-// which the ledger treats as no evidence, never as regression (D0-4).
+// EARLIEST and LATEST persisted position tokens SUCCESSFUL anchor-bearing
+// reads observed during the attempt. Both ends are kept because two
+// differing observations within one attempt are evidence on their own
+// (Bug 204) — an attempt-spanning advance must stay visible even when both
+// boundary reads failed. The zero value means "no successful observation"
+// — which the ledger treats as no evidence, never as regression (D0-4).
 type applyProgressObservation struct {
-	token string
-	valid bool
+	firstToken string
+	lastToken  string
+	valid      bool
 }
 
 // observeApplyProgress is the Bug 202 committed-progress sentinel: while an
 // attempt is flowing it polls the persisted position on the side-channel
-// applier at a bounded cadence, recording the latest SUCCESSFUL found-row
-// observation, and delivers it on out exactly once when ctx is cancelled.
+// applier at a bounded cadence, recording the earliest and latest
+// SUCCESSFUL found-row observations, and delivers them on out exactly once
+// when ctx is cancelled.
 // The caller joins it (cancel + receive) before touching posReader again, so
 // the applier is never used from two goroutines at once. Failed reads and
 // found=false reads (cold-copy phase — no anchor row yet) record nothing;
@@ -434,7 +477,10 @@ func observeApplyProgress(ctx context.Context, posReader ir.ChangeApplier, strea
 		case <-t.C:
 		}
 		if pos, found, err := posReader.ReadPosition(ctx, streamID); err == nil && found {
-			obs = applyProgressObservation{token: pos.Token, valid: true}
+			if !obs.valid {
+				obs.firstToken = pos.Token
+			}
+			obs.lastToken, obs.valid = pos.Token, true
 		}
 	}
 }
