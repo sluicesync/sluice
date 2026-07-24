@@ -44,10 +44,13 @@ import (
 // streamer whose START_REPLICATION may be retrying through the reap
 // window. It sits a margin ABOVE the product's own retry budget,
 // deriving from the same [ir.SlotActiveReapBudget] const so the test and
-// the product can't drift. PS-PG on PG18 was observed holding a slot
-// active >90s past disconnect (run 30074757309), exceeding the old fixed
-// 60s/90s test bounds; the product now waits it out, so the test must
-// give it room to. The margin is deliberately generous (a
+// the product can't drift. A slot-active hold >90s past disconnect was
+// observed on PS-PG once (run 30074757309), exceeding the old fixed
+// 60s/90s test bounds; the later controlled measurement (roadmap item
+// 76) could not reproduce it and put the real ceiling at
+// wal_sender_timeout, 60s — so the generous bound here is insurance
+// against an unexplained hold, not a measured floor. The margin is
+// deliberately generous (a
 // long-but-rarely-hit test timeout only ever fires on a genuine hang,
 // and a "ready" PS-PG can still be replication-warming) — 5 minutes
 // over the product budget.

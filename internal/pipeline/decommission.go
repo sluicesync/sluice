@@ -74,8 +74,9 @@ type DecommissionReport struct {
 // SQLSTATE 55006 through that window. The wall-clock budget derives from
 // the single engine-neutral [ir.SlotActiveReapBudget] home so this path
 // and the CDC-reader's START_REPLICATION retry can't drift — a
-// decommission on managed PG (PlanetScale-Postgres PG18's walsender can
-// hold the slot >90s past disconnect) needs the same generous bound. A
+// decommission racing a consumer that vanished silently (no Terminate,
+// no FIN) waits out wal_sender_timeout, 60s on the managed tiers
+// measured, so it needs the same generous bound. A
 // slot still active past the budget is a genuinely live consumer and
 // surfaces as the coded refusal. Vars, not consts, so unit tests can
 // compress the budget/backoff.

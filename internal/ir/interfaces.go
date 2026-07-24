@@ -2573,13 +2573,31 @@ type SourceFingerprintRecorder interface {
 // the `sync decommission` / slot-drop path — from a single home so the
 // two cannot drift.
 //
-// The value is a wall-clock BUDGET, not an attempt count: on vanilla PG
-// the reap is near-immediate (kernel socket teardown), but on managed PG
-// behind a pgwire proxy the walsender can stay active far longer —
-// PlanetScale-Postgres on PG18 was observed holding the slot active >90s
-// after disconnect, bounded by wal_sender_timeout + proxy teardown and
-// potentially longer under load. Five minutes is ~3× that observed floor
-// with margin for wal_sender_timeout variance / load.
+// The value is a wall-clock BUDGET, not an attempt count, and what
+// governs it is DISCONNECT OBSERVABILITY, not the PG major version. A
+// controlled PS-PG measurement (PG 17.10 vs PG 18.4, both PS_10, a raw
+// harness whose clean close is byte-identical to sluice's
+// closeReplConnGraceful — see workspace/pg17-pg18-walsender-reap-2026-07-24.md
+// and roadmap item 76) found the two versions INDISTINGUISHABLE, with
+// reap latency set purely by how the client went away: a clean graceful
+// close (sluice's real path) reaps sub-2s; an abrupt socket / TCP-FIN
+// close reaps sub-second; only a TRULY SILENT vanish — no Terminate, no
+// FIN, i.e. a network partition or host death — waits the full
+// wal_sender_timeout (60s on both tiers). Five minutes is generous
+// headroom over that 60s worst case, sized for wal_sender_timeout
+// variance across managed tiers and for load.
+//
+// This CORRECTS the causal story this const shipped with in v0.100.0
+// ("PS-PG on PG18 holds the slot active 10+ minutes"), which the
+// measurement above disproved. The budget itself is unchanged and still
+// right — the raise from the old ~31.5s was justified by the 60s
+// silent-vanish case alone — but it is not PG18-specific, and a routine
+// stop→restart essentially cannot hit a loud 55006 at default settings.
+// The >90s hold once observed in CI (run 30074757309) and the >12min one
+// seen in v0.100.0's psverify run are UNREPRODUCED and inconsistent with
+// the 60s ceiling, so neither is the walsender-reap path; the psverify
+// case is most likely the shared-slot test-concurrency artifact that
+// per-test unique slot + publication names already resolved.
 //
 // Widening the budget only makes the LOUD failure slower on the genuine
 // second-writer misconfiguration (two live consumers sharing one slot);
