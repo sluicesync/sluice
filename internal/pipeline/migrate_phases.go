@@ -184,6 +184,12 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 		return sr, nil, err
 	}
 
+	// Large-object census (roadmap item 68c) — advisory WARN only:
+	// pg_largeobject blobs live outside every user table and are not
+	// copied; the referencing oid/lo columns copy as plain integers.
+	// A probe failure skips silently (nothing refuses on this census).
+	warnLargeObjects(ctx, sr, m.Source.Capabilities(), schema)
+
 	return sr, schema, nil
 }
 

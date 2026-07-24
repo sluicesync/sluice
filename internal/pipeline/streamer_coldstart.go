@@ -374,6 +374,10 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
+	// Large-object census (roadmap item 68c) — advisory WARN only:
+	// pg_largeobject blobs are not copied; the referencing oid/lo
+	// columns copy as plain integers. Probe failure skips silently.
+	warnLargeObjects(ctx, sr, s.Source.Capabilities(), schema)
 	migcore.CloseIf(sr)
 
 	return schema, snapshotTables, nil
