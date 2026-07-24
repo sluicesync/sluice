@@ -2593,6 +2593,32 @@ type SlotInfo struct {
 	PlatformNote      string
 }
 
+// ReplicationHeadroom is one census of a source's replication-resource
+// ceilings versus current use, read by the roadmap-68d cold-start
+// preflight before a slot-creating CDC stream adds one more consumer.
+// The concept is Postgres-shaped today (max_replication_slots /
+// max_wal_senders), but the struct is engine-neutral like [SlotInfo]:
+// any engine whose CDC consumes a bounded server-side resource can
+// surface the same shape.
+//
+// SlotsInUse counts EVERY existing slot (logical and physical, any
+// owner) because the server's ceiling does; Slots carries the same
+// rows (Name + Active populated) so a refusal can show what occupies
+// the ceiling. ActiveWALSenders counts attached sender processes —
+// the resource the stream's own replication connection will consume
+// the moment it connects, independent of slot creation.
+type ReplicationHeadroom struct {
+	MaxReplicationSlots int
+	SlotsInUse          int
+	MaxWALSenders       int
+	ActiveWALSenders    int
+
+	// Slots lists the existing slots occupying the ceiling, sorted by
+	// name. Only Name and Active are populated (the census is a count,
+	// not a health probe — [SlotHealth] owns the deep read).
+	Slots []SlotInfo
+}
+
 // SlotManager is the engine-neutral surface for managing logical-
 // replication slots from the operator-facing CLI (`sluice slot list`,
 // `sluice slot drop`). Engines without a notion of replication slots

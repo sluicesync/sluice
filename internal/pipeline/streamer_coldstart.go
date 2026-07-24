@@ -77,7 +77,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// the still-open reader. A nil schema with nil error is the
 	// empty-source case — nothing to stream (the (nil, nil) contract
 	// runOnce checks for).
-	schema, snapshotTables, err := s.coldStartReadSourceSchema(ctx)
+	schema, snapshotTables, err := s.coldStartReadSourceSchema(ctx, resumingCopy)
 	if err != nil {
 		return nil, stop, err
 	}
@@ -232,13 +232,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 
 // coldStartReadSourceSchema opens the source SchemaReader, reads and
 // filters the schema, and runs every source-side preflight (RLS,
-// replication capability, XID wraparound, partitioned tables) against
-// the still-open reader before closing it. Returns the filtered
-// schema plus the surviving table names for snapshot/publication
-// scoping. A (nil, nil, nil) return is the empty-source case: the
-// source has no tables and there is nothing to stream (already
-// logged here).
-func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, []string, error) {
+// replication capability + headroom, XID wraparound, partitioned
+// tables) against the still-open reader before closing it. Returns the
+// filtered schema plus the surviving table names for snapshot/
+// publication scoping. A (nil, nil, nil) return is the empty-source
+// case: the source has no tables and there is nothing to stream
+// (already logged here).
+//
+// resumingCopy marks the interrupted-cold-start COPY resume: the
+// stream's slot already exists from the interrupted run, so the
+// slot-headroom preflight is skipped there (a resume consumes no new
+// slot — refusing it on a full server would strand a healthy resume).
+func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy bool) (*ir.Schema, []string, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
 		return nil, nil, connectHint(fmt.Errorf("pipeline: open source schema reader: %w", err))
@@ -319,6 +324,21 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	if err := preflightSourceReplication(ctx, sr, s.Source.Capabilities()); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
+	}
+	// Replication-headroom preflight (roadmap item 68d). Refuses a
+	// FRESH slot-creating cold start when the source's
+	// max_replication_slots are all in use (or max_wal_senders all
+	// attached) — naming the existing slots — instead of failing
+	// mid-cold-start with the raw 53400. Skipped on the interrupted-
+	// COPY resume: that path reuses the slot the interrupted run
+	// created, consuming no new one (warm resume never reaches this
+	// function at all). A failed probe WARNs and continues inside the
+	// preflight (advisory degrade — see replication_headroom_preflight.go).
+	if !resumingCopy {
+		if err := preflightReplicationHeadroom(ctx, sr, s.Source.Capabilities()); err != nil {
+			migcore.CloseIf(sr)
+			return nil, nil, err
+		}
 	}
 	// XID-wraparound preflight (pgcopydb PR #17 adoption). Refuses
 	// upfront when the source PG database is near the 32-bit wraparound

@@ -60,6 +60,16 @@ const (
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// Roadmap item 68d: a slot-creating PG CDC cold start refuses
+	// UPFRONT when the source's max_replication_slots are all in use
+	// (or max_wal_senders all attached) — the census names the existing
+	// slots so the operator can free leftovers instead of decoding the
+	// raw mid-cold-start 53400. Cold-start only; warm resume reuses its
+	// existing slot and never probes. A failed probe WARNs and
+	// continues (advisory degrade) — the refusal requires a successful
+	// census that proves the ceiling.
+	CodeCDCReplicationHeadroom Code = "SLUICE-E-CDC-REPLICATION-HEADROOM"
+
 	// ADR-0175: a cold start would NARROW a Postgres publication while
 	// another sluice replication slot EXISTS on the source (active or
 	// not — existence semantics since v0.99.289: an inactive slot is a
@@ -225,6 +235,7 @@ var registry = map[Code]Info{
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeCDCPublicationScopeConflict: {ClassRefusal, "cold start refused: rescoping the Postgres publication would REMOVE tables another sluice replication slot (active or inactive) holds a claim on, silently de-scoping that stream — give each stream its own --publication-name, drain the other stream first, or drop its slot if the stream is truly abandoned"},
+	CodeCDCReplicationHeadroom:      {ClassRefusal, "cold start refused: the source has no replication headroom for this stream's new slot/WAL sender (max_replication_slots or max_wal_senders exhausted) — free a leftover slot (`sluice slot list`, `sync decommission`, `slot drop`) or raise the ceiling; warm resume reuses its existing slot and never trips this"},
 	CodeCDCPublicationNameInvalid:   {ClassRefusal, "sync start refused: the --publication-name is not a safe Postgres replication identifier ([a-z0-9_], max 63 bytes) — CREATE PUBLICATION preserves a quoted mixed-case/over-length spelling while START_REPLICATION downcases (and CREATE truncates) it, so the stream would create one publication and stream from another: green through the whole bulk copy, then 42704 at the first change (or silently idle); use lowercase [a-z0-9_]"},
 
 	CodeCDCRowImagePartial:              {ClassRefusal, "the MySQL/Vitess source streams partial row images (binlog_row_image != FULL, or binlog_row_value_options=PARTIAL_JSON; on a self-hosted Vitess/VStream source the RowChange.DataColumns bitmap marks a NOBLOB-omitted column), under which CDC silently loses UPDATEs — refused at CDC start on the binlog path, and loudly mid-stream when a partial image reaches the reader (a slipped-past global preflight, or a VStream after-image whose bitmap flags an omitted column)"},
