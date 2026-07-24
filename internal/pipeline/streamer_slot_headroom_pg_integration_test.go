@@ -206,13 +206,18 @@ func TestStreamer_WarmResume_PG_FullSlots_NeverProbesRefuses(t *testing.T) {
 		t.Fatal("cold-start Run did not return after ctx cancel")
 	}
 	// Run returning is NOT slot release: Postgres reaps the walsender
-	// asynchronously (near-instant usually, whole seconds under a
-	// contended CI scheduler — the disconnect-is-not-release class), and
-	// the resume's bounded 55006 retry can lose that race on a loaded
-	// runner (first firing: run 30068794246). The operator-visible
-	// contract this test pins is the resume on a FULL server, not the
-	// release race, so wait for the slot to go inactive first.
-	if !waitForSluiceSlotInactive(t, src, "sluice_slot", 90*time.Second) {
+	// asynchronously (near-instant on a clean close, but bounded by
+	// wal_sender_timeout — ~60s — when the cancel's teardown isn't
+	// observed promptly; the disconnect-is-not-release class), and the
+	// resume's bounded 55006 retry can lose that race on a loaded runner.
+	// The operator-visible contract this test pins is the resume on a
+	// FULL server, not the release race, so wait for the slot to go
+	// inactive first. Budget is 180s — 3x the ~60s wal_sender_timeout
+	// ceiling — because the 90s first cut still flaked under the -race
+	// CI scheduler (run 30068794246, then the v0.100.0 tag run
+	// 30111105907, both cleared on rerun; the 2026-07-24 PS-PG reap
+	// measurement confirms 60s is the worst non-clean-close reap).
+	if !waitForSluiceSlotInactive(t, src, "sluice_slot", 180*time.Second) {
 		t.Fatal("cold-start stream's walsender never released sluice_slot")
 	}
 
