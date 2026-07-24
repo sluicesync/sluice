@@ -368,10 +368,22 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 		t.Skipf("current_user lacks REPLICATION attribute; CDC will fail without it")
 	}
 
-	// Pre-clean any leftover `sluice_slot` (waiting out PS-PG's
+	// Per-test slot + publication names so this test never collides with
+	// another PS-PG CDC test's leftover walsender on the shared default
+	// `sluice_slot`/`sluice_pub`. On PS-PG PG18 a just-closed reader's
+	// walsender holds its slot active 10+ minutes; sharing one name across
+	// sequential sub-tests serialized them behind that reap. Unique names
+	// make each test self-contained (and keep the ADR-0175 publication-scope
+	// guard from ever seeing a cross-test narrowing).
+	const (
+		slotName = "sluice_psv_basic"
+		pubName  = "sluice_psv_basic_pub"
+	)
+
+	// Pre-clean any leftover slot for THIS test (waiting out PS-PG's
 	// walsender-release lag) so the reader below starts from a fresh
 	// slot rather than reusing a stale one's confirmed_flush point.
-	waitPSSlotDropped(t, db, "sluice_slot", psverifySlotReleaseTimeout)
+	waitPSSlotDropped(t, db, slotName, psverifySlotReleaseTimeout)
 
 	const schemaName = "sluice_psverify_cdc"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
@@ -403,29 +415,35 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	// Ensure a clean, scoped publication that includes this test's table.
 	// The reader's no-scope path reuses an existing publication as-is; on
 	// managed PS-PG (non-superuser) it cannot create a FOR ALL TABLES
-	// publication, and a stale empty `sluice_pub` left by a prior run
+	// publication, and a stale empty publication left by a prior run
 	// makes pgoutput emit nothing — the 0-changes failure this guards
-	// against. The table owner can scope its own table in.
-	if _, err := db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS sluice_pub"); err != nil {
+	// against. The table owner can scope its own table in. The
+	// per-test publication name below is the one the reader streams
+	// through (via WithPublicationScope).
+	if _, err := db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS "+pubName); err != nil {
 		t.Fatalf("drop stale publication: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "CREATE PUBLICATION sluice_pub FOR TABLE sluice_psverify_cdc.users"); err != nil {
+	if _, err := db.ExecContext(ctx, "CREATE PUBLICATION "+pubName+" FOR TABLE sluice_psverify_cdc.users"); err != nil {
 		t.Fatalf("create scoped publication: %v", err)
 	}
 	defer func() {
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer dropCancel()
-		if _, err := db.ExecContext(dropCtx, "DROP PUBLICATION IF EXISTS sluice_pub"); err != nil {
+		if _, err := db.ExecContext(dropCtx, "DROP PUBLICATION IF EXISTS "+pubName); err != nil {
 			t.Logf("post-clean publication: %v", err)
 		}
 	}()
 
 	psDSN := withSchemaParam(sourceDSN, schemaName)
 
-	eng := Engine{}
-	rdr, err := eng.OpenCDCReader(ctx, psDSN)
+	// Bind the reader to this test's own slot + publication so it can't
+	// collide with any other PS-PG CDC test. WithPublicationScope sets the
+	// publication the reader streams through; OpenCDCReaderWithSlot names
+	// the slot. Both are per-test-unique.
+	eng := Engine{}.WithPublicationScope(pubName, slotName).(Engine)
+	rdr, err := eng.OpenCDCReaderWithSlot(ctx, psDSN, slotName)
 	if err != nil {
-		t.Fatalf("OpenCDCReader: %v", err)
+		t.Fatalf("OpenCDCReaderWithSlot: %v", err)
 	}
 	defer psverifyCloseIf(rdr)
 
@@ -521,10 +539,18 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 		t.Skipf("PS-PG is PG <17 (%d); FAILOVER flag is unsupported", versionNum)
 	}
 
-	// Drop any leftover slot — including the one the just-finished
-	// TestPSPG_CDCReaderBasic's reader may still hold while PS-PG
-	// releases its walsender — so this test is idempotent.
-	waitPSSlotDropped(t, db, "sluice_slot", psverifySlotReleaseTimeout)
+	// Per-test slot + publication names so this test is self-contained and
+	// never waits out another PS-PG CDC test's leftover walsender on a
+	// shared default name (PS-PG PG18 holds a just-closed slot active 10+
+	// minutes). With unique names the pre-clean below is effectively
+	// instant.
+	const (
+		slotName = "sluice_psv_failover"
+		pubName  = "sluice_psv_failover_pub"
+	)
+
+	// Drop any leftover slot for THIS test so it's idempotent across runs.
+	waitPSSlotDropped(t, db, slotName, psverifySlotReleaseTimeout)
 
 	const schemaName = "sluice_psverify_failover"
 	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
@@ -540,9 +566,15 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 		// safe to call when the slot doesn't exist.
 		if _, err := db.ExecContext(
 			dropCtx,
-			"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
+			"SELECT pg_drop_replication_slot($1) FROM pg_replication_slots WHERE slot_name = $1",
+			slotName,
 		); err != nil {
 			t.Logf("post-clean drop slot: %v", err)
+		}
+		// Drop the reader-created publication too (this test's reader
+		// ensures it FOR ALL TABLES when missing) so reruns stay clean.
+		if _, err := db.ExecContext(dropCtx, "DROP PUBLICATION IF EXISTS "+pubName); err != nil {
+			t.Logf("post-clean publication: %v", err)
 		}
 		if _, err := db.ExecContext(dropCtx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
 			t.Logf("post-clean schema: %v", err)
@@ -561,10 +593,12 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 
 	psDSN := withSchemaParam(sourceDSN, schemaName)
 
-	eng := Engine{}
-	rdr, err := eng.OpenCDCReader(ctx, psDSN)
+	// Bind the reader to this test's own slot + publication so it can't
+	// collide with any other PS-PG CDC test's leftover walsender.
+	eng := Engine{}.WithPublicationScope(pubName, slotName).(Engine)
+	rdr, err := eng.OpenCDCReaderWithSlot(ctx, psDSN, slotName)
 	if err != nil {
-		t.Fatalf("OpenCDCReader: %v", err)
+		t.Fatalf("OpenCDCReaderWithSlot: %v", err)
 	}
 	defer psverifyCloseIf(rdr)
 
@@ -573,12 +607,13 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	}
 
 	// The slot should now exist with failover=true. Use a separate
-	// connection (not the replication conn) to query the view.
+	// connection (not the replication conn) to query the view — and query
+	// the slot THIS test created, not the shared default.
 	var failover bool
 	err = db.QueryRowContext(
 		ctx,
 		"SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
-		"sluice_slot",
+		slotName,
 	).Scan(&failover)
 	if err != nil {
 		t.Fatalf("query failover: %v", err)
@@ -610,10 +645,11 @@ const psverifySlotReleaseTimeout = ir.SlotActiveReapBudget + 5*time.Minute
 // well past the client connection's death — tens of seconds on the
 // 2026-07-16 CI dispatch (>40s), then >90s once PS-PG moved to PG18. A
 // single-shot pg_drop_replication_slot fails with SQLSTATE 55006
-// through that window and every later test that needs the fixed
-// `sluice_slot` name collides. Poll until the slot is inactive (or
-// absent), then drop it. Best-effort: on timeout the next step surfaces
-// the collision loudly.
+// through that window. Each PS-PG CDC test now uses its OWN slot name,
+// so a leftover only collides with the SAME test's next run (not other
+// tests); this poll waits it out for that idempotent-rerun case. Poll
+// until the slot is inactive (or absent), then drop it. Best-effort: on
+// timeout the next step surfaces the collision loudly.
 func waitPSSlotDropped(t *testing.T, db *sql.DB, slot string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

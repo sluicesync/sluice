@@ -226,17 +226,27 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), psverifySlotReleaseTimeout+2*time.Minute)
 	defer cancel()
 
-	// A previous failed run may have left a `sluice_slot` replication
-	// slot behind on the source. Drop it BEFORE the schema cleanup
-	// because PG can refuse to drop a schema whose tables are
-	// referenced by an active publication tied to the slot, and the
-	// slot itself can hold the publication's catalog snapshot. Slot
-	// teardown is deferred too so reruns are reliable even if this
-	// test fails mid-flight.
+	// Per-test slot + publication names so this streamer never collides
+	// with the postgres-package PS-PG CDC tests' leftover walsenders on the
+	// shared default `sluice_slot`/`sluice_pub` (PS-PG PG18 holds a
+	// just-closed slot active 10+ minutes). Unique publication names also
+	// keep this cold-start's `ALTER PUBLICATION ... SET TABLE` from being
+	// seen as a cross-test narrowing by the ADR-0175 scope guard.
+	const (
+		slotName = "sluice_psv_stream"
+		pubName  = "sluice_psv_stream_pub"
+	)
+
+	// A previous failed run may have left this test's replication slot
+	// behind on the source. Drop it BEFORE the schema cleanup because PG
+	// can refuse to drop a schema whose tables are referenced by an active
+	// publication tied to the slot, and the slot itself can hold the
+	// publication's catalog snapshot. Slot teardown is deferred too so
+	// reruns are reliable even if this test fails mid-flight.
 	step(t, "pre-clean: drop leftover slot", func() {
-		dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+		dropPSSlotIfExists(t, pgSrc, slotName)
 	})
-	defer dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+	defer dropPSSlotIfExists(t, pgSrc, slotName)
 
 	const schemaName = "sluice_psverify_stream"
 	step(t, "pre-clean: drop and recreate test schemas", func() {
@@ -272,11 +282,13 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 	streamer := &Streamer{
-		Source:    pgEng,
-		Target:    pgEng,
-		SourceDSN: withPSSchema(pgSrc, schemaName),
-		TargetDSN: withPSSchema(pgDest, schemaName),
-		StreamID:  "psverify-pg-stream",
+		Source:          pgEng,
+		Target:          pgEng,
+		SourceDSN:       withPSSchema(pgSrc, schemaName),
+		TargetDSN:       withPSSchema(pgDest, schemaName),
+		StreamID:        "psverify-pg-stream",
+		SlotName:        slotName,
+		PublicationName: pubName,
 	}
 
 	t.Logf("phase B: starting Streamer.Run")
@@ -477,11 +489,11 @@ func dropPSSchema(t *testing.T, _ context.Context, dsn, schema string) {
 // dropPSSlotIfExists is a best-effort cleanup of a leftover
 // replication slot. pg_drop_replication_slot fails with SQLSTATE
 // 55006 while the slot is still marked "active" — and on managed
-// PS-PG the walsender from a just-closed reader (including one held
-// by the engines/postgres psverify package that ran before this one)
-// can keep the slot active well past the client connection's death:
-// tens of seconds on the first CI dispatch (>40s, 2026-07-16), then
-// >90s once PS-PG moved to PG18. So this polls until the slot is
+// PS-PG the walsender from a just-closed reader can keep the slot
+// active well past the client connection's death: tens of seconds on
+// the first CI dispatch (>40s, 2026-07-16), then >90s once PS-PG moved
+// to PG18. This test uses its OWN slot name, so a leftover only
+// collides with the SAME test's next run; this polls until the slot is
 // inactive or absent, then drops it, hard-capped in a goroutine so
 // cleanup never hangs the test even when context cancellation isn't
 // honoured.
