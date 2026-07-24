@@ -333,3 +333,32 @@ Every series `/metrics` can emit, by family. Conditional families follow the hon
 
 The emitters live in `internal/pipeline/metrics.go`; the design doc with
 full rationale is `docs/dev/design/sync-health-monitoring.md`.
+
+## When something goes wrong: `sluice diagnose`
+
+The first support step for a misbehaving service — before log spelunking,
+and always before filing an issue or paging whoever operates the source —
+is a diagnose bundle:
+
+```
+sluice diagnose --stream-id myapp-prod \
+  --target-driver postgres --target "$SLUICE_TARGET_DSN" \
+  --output bundle.zip
+```
+
+It assembles a ZIP of the stream's control-table state, engine health
+probes, capabilities, and (optionally) target-health telemetry — the
+state another person needs to reason about your stream without access to
+your databases. `--privacy` tiers what's included: `basic` is state-table
+dumps only (no version, no DSN, no logs), the default `standard` adds
+redacted CLI args + version + health probes, `verbose` adds per-table
+row counts and the last 200 log lines. See
+[ADR-0056](../adr/adr-0056-sluice-diagnose-operator-bundle.md) for the
+exact inclusion/exclusion contract.
+
+For unattended services, the long-running subcommands (`sync start`,
+`migrate`, `sync from-backup run`) take `--diagnose-on-crash-dir DIR` —
+when the process exits with an error, a bundle is written there
+automatically, so the state at failure is captured even when nobody was
+watching. Off by default (an unattended bundle on disk is a privacy
+decision); `--diagnose-on-crash-privacy` defaults to `basic`.

@@ -244,6 +244,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
 | Symptom | First-look |
 |---|---|
+| Anything you can't explain — or want to hand to another human | `sluice diagnose --stream-id X --output bundle.zip` — a privacy-tiered ZIP of the stream's state tables, engine health probes, and capabilities, safe to attach to an issue (ADR-0056). Long-running commands can also auto-write one on error via `--diagnose-on-crash-dir` (off by default). |
 | `sluice migrate` failed mid-phase | Re-run with `--resume` (per-table-progress checkpointing, ADR-0018). State row in `sluice_migrate_state` survives the crash. |
 | `sluice sync start` won't resume — slot lost / WAL gone | Per [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md). Recovery: `sluice slot drop --source ...`, then `sync start --reset-target-data` to redo from scratch. |
 | `sluice verify` reports row-count mismatch | The target has drifted from source. Investigate via `--format json` for delta-per-table, then run `sluice schema diff` to confirm structural drift didn't also happen. Re-run `migrate` (with `--reset-target-data` if necessary) or fix source-side data. |
@@ -258,10 +259,19 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
 **Pre-1.0** (`v0.99.x` series at time of writing, 200+ tagged releases across the v0.x line). The v0.84 → v0.99 arc kept widening the capability surface — encrypted logical backups + restore + a continuous-backup broker, PII redaction, the slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, multi-source aggregation, multi-database fan-out, connection-resilience tuning, and the bulk-copy throughput arc (cross-table pool + index overlap + raw PG→PG passthrough) — each landing with the same class-pin test discipline rather than a happy-path-only ship. **No known production users today.**
 
+### Maturity, concretely
+
+"No production users" and "production-usable" are both true, and here is how they reconcile. What *is* battle-tested — in the strict sense of being exercised against real systems, automatically, on every change:
+
+- Cross-engine migrate + sync + backup run against real MySQL, Postgres, and Vitess containers with the race detector on **every PR** (six required checks); every silent-loss class ever caught is pinned by a per-family × per-shape matrix ground-truthed on real servers, per the Bug 74 lesson.
+- sluice's own PG→PG and MySQL→MySQL output is diffed against `pg_dump` / `mysqldump` on every PR — every knowingly-uncarried feature is an allowlist entry citing the doc that declares it.
+- Three full blind multi-agent audits of the codebase ran in July 2026 alone, each remediated to closure and each closing with a permanent CI gate for the class it found.
+- The PlanetScale filtered-sync path was validated end-to-end against **real PlanetScale at 5M rows**, and a multi-week soak fleet runs continuous syncs against live managed databases between releases; tag publishes additionally require a real-Vitess-cluster gate.
+
+What has *not* happened yet: a stranger running sluice against a production workload nobody wrote a test for first. That is the honest gap behind the framing above — and the reason the tool refuses loudly rather than guessing when it is uncertain. The full support matrix and known-limitations list live in [`docs/production-readiness.md`](docs/production-readiness.md).
+
 This is a deliberate posture, not an accident:
 
-- Same-engine and cross-engine integration tests run against real MySQL + Postgres containers on every PR.
-- Every silent-loss class caught has a permanent class-pin test (not a representative-pin), per the Bug 74 lesson.
 - Every recognized failure mode has a structured refuse-loudly message with an operator-action recovery hint.
 - Versioning follows [SemVer](https://semver.org/). v0.x minor releases may include opt-in behavior changes; the API and CLI surface are still settling. v1.0.0 will mark the API-frozen line, but no timeline is committed.
 
