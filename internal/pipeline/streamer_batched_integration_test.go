@@ -150,10 +150,16 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 		t.Fatalf("source commit: %v", err)
 	}
 
-	// Wait for the dest to reach totalRows.
+	// Wait for the dest to reach totalRows. The poll uses the tolerant
+	// counter (0 on any error), NOT countRows: the slot the test just
+	// waited on is created BEFORE the cold start creates target tables
+	// (and the item-25 shape gate's target-catalog read sits between
+	// them), so early polls can race the startup window and see 42P01 —
+	// which is "not yet", not a failure. The deadline fatal below and
+	// the loud final assertions keep the failure floor.
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		got := countRows(t, targetDSN, "bulk_users")
+		got := pollRowCountPGQuoted(targetDSN, "bulk_users")
 		if got >= totalRows {
 			break
 		}
