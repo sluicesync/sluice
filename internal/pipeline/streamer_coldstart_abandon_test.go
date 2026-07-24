@@ -42,7 +42,7 @@ func TestColdStartGatePreflight_RefusalAbandonsStream(t *testing.T) {
 	rw := &stubEmptyChecker{empty: map[string]bool{"users": false}} // populated → refuse
 	s := &Streamer{Source: stubEngine{}, Target: stubEngine{}}
 
-	err := s.coldStartGatePreflight(
+	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, stream, nil, "stream-1",
 		false /* resumingCopy */, false, /* forceFresh */
 	)
@@ -69,9 +69,13 @@ func TestColdStartGatePreflight_PassLeavesStreamOpen(t *testing.T) {
 
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
 	rw := &stubEmptyChecker{empty: map[string]bool{"users": true}}
-	s := &Streamer{Source: stubEngine{}, Target: stubEngine{}}
+	// Target is a recordingEngine (empty catalog), not a stubEngine: the
+	// pass path now legitimately reaches Target.OpenSchemaReader — the
+	// default branch runs the ADR-0166 shape gate (item 25 residual)
+	// after the Bug-9 check, and an empty target catalog passes it.
+	s := &Streamer{Source: stubEngine{}, Target: newRecordingEngine("stub")}
 
-	if err := s.coldStartGatePreflight(
+	if _, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, stream, nil, "stream-1", false, false,
 	); err != nil {
 		t.Fatalf("preflight: %v", err)

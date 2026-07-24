@@ -193,15 +193,19 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 
 	// Gate the cold start: --reset-target-data recovery,
 	// --schema-already-applied skip, interrupted-COPY resume skip, or
-	// the default populated-target preflight (Bug 9 / ADR-0048 DP-2).
-	if err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy, forceFresh); err != nil {
+	// the default populated-target preflight (Bug 9 / ADR-0048 DP-2)
+	// followed by the ADR-0166 pre-create shape gate (roadmap item 25
+	// residual) — whose returned create subset excludes pre-existing
+	// tables with a matching column shape (nil = create everything).
+	createSchema, err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy, forceFresh)
+	if err != nil {
 		return nil, stop, err
 	}
 
 	// Bulk-copy: the ADR-0079 FAST parallel path when eligible, the
 	// serial path otherwise. Releases the writers and the snapshot
 	// transaction (Bug 21) on success.
-	if err := s.coldStartRunCopy(ctx, schema, stream, sw, rw, streamID, resumingCopy); err != nil {
+	if err := s.coldStartRunCopy(ctx, schema, createSchema, stream, sw, rw, streamID, resumingCopy); err != nil {
 		return nil, stop, err
 	}
 
@@ -672,7 +676,8 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // --schema-already-applied operator-promise skip (GitHub #17), the
 // interrupted-COPY resume skip (v0.99.8 — the partial copy is the
 // expected state), or the default path's populated-target preflights
-// (ADR-0048 Shape-A three-point check / Bug 9 cold-start refusal).
+// (ADR-0048 Shape-A three-point check / Bug 9 cold-start refusal)
+// followed by the ADR-0166 pre-create shape gate.
 // On any error the writers are closed and the snapshot stream is
 // ABANDONED here (pre-anchor rule, Bug 177 — see
 // [Streamer.coldStartOpenTargetWriters]): a refusal fires before any
@@ -680,14 +685,26 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // unconditionally safe, and leaving it would pin source WAL AND break
 // the refusal hint's own preferred `--reset-target-data` recovery on
 // "slot already exists".
-func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy, forceFresh bool) error {
+//
+// createSchema is the ADR-0166 create subset for the copy phase (the
+// full schema minus pre-existing tables whose column shape matches —
+// see [existingTablesGate]); nil means "create everything", returned
+// by every branch where the gate deliberately does not run:
+// --reset-target-data and the forceFresh non-idempotent restart drop
+// the in-scope tables before the copy (nothing pre-existing survives
+// to compare), --schema-already-applied skips ALL target DDL on the
+// operator's promise, and the interrupted-COPY resume re-creates
+// idempotently per the long-standing resume contract (mirroring
+// migrate's --resume carve-out). Warm resume never creates tables and
+// never reaches this function.
+func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy, forceFresh bool) (*ir.Schema, error) {
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
-			return err
+			return nil, err
 		}
 	case s.SchemaAlreadyApplied:
 		// GitHub issue #17: operator promises every source table
@@ -743,7 +760,7 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
-			return err
+			return nil, err
 		}
 	default:
 		// ADR-0048 Shape A populated-target preflight (DP-2). When
@@ -759,13 +776,13 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
-			return err
+			return nil, err
 		}
 		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
-			return err
+			return nil, err
 		}
 		// Cold-start pre-flight: refuse if any target table already
 		// contains data. See preflight.go for the rationale (Bug 9).
@@ -789,11 +806,42 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 				migcore.CloseIf(rw)
 				migcore.CloseIf(sw)
 				_ = stream.Abandon()
-				return err
+				return nil, err
 			}
 		}
+		// ADR-0166 pre-create shape gate on the SYNC leg (roadmap item
+		// 25 residual). Runs AFTER the Bug-9 populated-target check (a
+		// populated target's refusal + remedies take precedence) and
+		// BEFORE any target DDL: an empty-but-drifted pre-existing table
+		// used to pass Bug 9 and cold-copy into the drifted schema — the
+		// silent-coercion class ADR-0166 closed for migrate (relaxed
+		// sql_mode narrows values without an error). Same shared compare,
+		// same coded SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH, same verdicts:
+		// matching shape → INFO skip (the create subset shrinks; the
+		// IF-NOT-EXISTS copy still covers the table), uncomputable → WARN
+		// and create everything as before. This branch is the ONLY one
+		// that creates tables against an unvalidated pre-existing target
+		// — the reset/restart branches drop the in-scope tables first,
+		// --schema-already-applied skips DDL, and the COPY resume keeps
+		// the resume contract — so the gate lives here alone.
+		g := &existingTablesGate{
+			Source:              s.Source,
+			Target:              s.Target,
+			TargetDSN:           s.TargetDSN,
+			TargetSchema:        s.TargetSchema,
+			EnabledPGExtensions: s.EnabledPGExtensions,
+			Mode:                "sync cold-start",
+		}
+		createSchema, err := g.plan(ctx, schema)
+		if err != nil {
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
+			_ = stream.Abandon()
+			return nil, err
+		}
+		return createSchema, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // coldStartRunCopy runs the bulk-copy phase: the ADR-0079 FAST
@@ -803,7 +851,11 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 // On success the target writers are closed and the snapshot
 // transaction is released (Bug 21); on error everything (writers +
 // stream) is closed here before returning.
-func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream, sw ir.SchemaWriter, rw ir.RowWriter, streamID string, resumingCopy bool) error {
+//
+// createSchema is the ADR-0166 create subset from the shape gate
+// (nil = create everything); only the CREATE TABLE phase consumes it —
+// the copy/index/constraint phases keep the full schema.
+func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *ir.Schema, stream *ir.SnapshotStream, sw ir.SchemaWriter, rw ir.RowWriter, streamID string, resumingCopy bool) error {
 	// ADR-0079: take the FAST parallel cold-start (migrate's cross-table
 	// pool + index-build overlap + same-engine raw passthrough) when the
 	// source surfaced a SHAREABLE exported snapshot AND implements the
@@ -819,7 +871,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	}
 	var copyErr error
 	if fast {
-		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema, streamID)
+		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema, createSchema, streamID)
 	} else {
 		// The ADR-0079 fast shareable-snapshot path was not taken — but that
 		// does NOT mean the copy is serial. When the source surfaced a
@@ -859,6 +911,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 
 		bulkOpts := bulkCopyOpts{
 			SkipSchemaApply:      s.SchemaAlreadyApplied,
+			CreateSchema:         createSchema,
 			Redactor:             s.Redactor,
 			Shard:                s.InjectShardColumn,
 			CopyFanoutDegree:     s.CopyFanoutDegree,

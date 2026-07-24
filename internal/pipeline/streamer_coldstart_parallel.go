@@ -196,7 +196,7 @@ func (s *Streamer) runColdStartParallel(
 	stream *ir.SnapshotStream,
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
-	schema *ir.Schema,
+	schema, createSchema *ir.Schema,
 	streamID string,
 ) error {
 	opener, ok := s.Source.(ir.SnapshotImporterOpener)
@@ -326,7 +326,7 @@ func (s *Streamer) runColdStartParallel(
 	state := ir.MigrationState{}
 	return runBulkCopyPhases(
 		ctx, rc, &state, schema,
-		nil, // createSchema: the ADR-0166 pre-create gate is migrate-only; the sync cold-start keeps the IF-NOT-EXISTS create for every table
+		createSchema, // the ADR-0166 create subset from the sync cold-start's shape gate (roadmap item 25 residual); nil = create everything
 		stream.Rows, sw, rw,
 		false, // resuming
 		s.BulkBatchSize,

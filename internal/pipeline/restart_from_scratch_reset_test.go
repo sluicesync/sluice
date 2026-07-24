@@ -173,7 +173,7 @@ func TestColdStartGate_RestartFromScratch_NonIdempotent_DropsTarget(t *testing.T
 		RestartFromScratch: true,
 	}
 
-	err := s.coldStartGatePreflight(
+	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(nonIdempotentReader{}),
 		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
@@ -190,11 +190,14 @@ func TestColdStartGate_RestartFromScratch_Idempotent_DoesNotDrop(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
 	rw := &emptyCheckingDropper{}
 	s := &Streamer{
-		Source:             &copyResumeEngine{name: "planetscale"},
+		Source: &copyResumeEngine{name: "planetscale"},
+		// Target feeds the default branch's ADR-0166 shape gate (item 25
+		// residual); an empty recorded catalog makes the gate a no-op.
+		Target:             newRecordingEngine("planetscale"),
 		RestartFromScratch: true,
 	}
 
-	err := s.coldStartGatePreflight(
+	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(idempotentReader{}),
 		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
@@ -218,7 +221,7 @@ func TestColdStartGate_RestartFromScratch_SurfaceFalse_DropsTarget(t *testing.T)
 		RestartFromScratch: true,
 	}
 
-	err := s.coldStartGatePreflight(
+	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, gateStream(idempotentReaderFalse{}),
 		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
@@ -285,13 +288,15 @@ func (w *populatedChecker) IsTableEmpty(context.Context, *ir.Table) (bool, error
 func TestColdStartGate_ForceFresh_DiscriminatesPopulatedTarget(t *testing.T) {
 	captureSlog(t)
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
-	s := &Streamer{Source: &copyResumeEngine{name: "planetscale"}}
+	// Target feeds the default branch's ADR-0166 shape gate (item 25
+	// residual); an empty recorded catalog makes the gate a no-op.
+	s := &Streamer{Source: &copyResumeEngine{name: "planetscale"}, Target: newRecordingEngine("planetscale")}
 
 	// forceFresh=true on a POPULATED idempotent target: proceed, no refusal,
 	// no drop (the UPSERT cold-copy absorbs the overlap). This is the fix —
 	// the auto-resnapshot / restart-from-scratch re-copy path.
 	rwFresh := &populatedChecker{}
-	if err := s.coldStartGatePreflight(
+	if _, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rwFresh, gateStream(idempotentReader{}),
 		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	); err != nil {
@@ -304,7 +309,7 @@ func TestColdStartGate_ForceFresh_DiscriminatesPopulatedTarget(t *testing.T) {
 	// forceFresh=false on the SAME populated target: still refuses (Bug 9
 	// cold-start guard preserved — we did not weaken it).
 	rwGenuine := &populatedChecker{}
-	err := s.coldStartGatePreflight(
+	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rwGenuine, gateStream(idempotentReader{}),
 		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, false, /*forceFresh*/
 	)

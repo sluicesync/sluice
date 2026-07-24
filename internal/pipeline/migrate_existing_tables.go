@@ -39,6 +39,15 @@ package pipeline
 // (or validated) the tables, and re-running the idempotent CREATE is
 // the long-standing resume contract — re-comparing would only add a
 // round-trip-fidelity failure mode to a path that has none.
+//
+// The SAME gate guards the sync cold-start leg (roadmap item 25
+// residual, 2026-07-23): the Streamer's cold start also calls
+// CreateTablesWithoutConstraints (IF NOT EXISTS), so an empty-but-
+// drifted table on a SYNC target passed the Bug-9 populated-target
+// check and cold-copied into the drifted schema — the exact silent-
+// coercion class ADR-0166 closed for migrate. The comparison core
+// lives on [existingTablesGate] so both orchestrators share one
+// implementation; the Migrator methods below are thin delegates.
 
 import (
 	"context"
@@ -58,12 +67,42 @@ import (
 // count so a wildly different table doesn't produce a page of error.
 const shapeMismatchColumnsShown = 3
 
-// phasePlanExistingTables partitions the schema's tables into
-// create-vs-skip against the target's existing catalog and returns the
-// schema subset the CREATE phase should apply. It refuses (coded) on
-// any pre-existing same-name table whose column shape differs, and
-// returns the input schema unchanged — with a WARN — when the target
-// catalog cannot be read (never a new failure mode).
+// existingTablesGate carries the inputs the pre-create shape gate
+// needs, decoupled from the Migrator so the sync cold start runs the
+// SAME comparison (roadmap item 25 residual). Mode is the one word of
+// caller identity in the operator-facing prose — "migration" keeps the
+// migrate output byte-identical; the Streamer passes "sync cold-start".
+type existingTablesGate struct {
+	Source ir.Engine
+	Target ir.Engine
+
+	TargetDSN           string
+	TargetSchema        string
+	EnabledPGExtensions []string
+
+	Mode string
+}
+
+// phasePlanExistingTables is the Migrator's thin delegate onto the
+// shared gate.
+func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schema) (*ir.Schema, error) {
+	g := &existingTablesGate{
+		Source:              m.Source,
+		Target:              m.Target,
+		TargetDSN:           m.TargetDSN,
+		TargetSchema:        m.TargetSchema,
+		EnabledPGExtensions: m.EnabledPGExtensions,
+		Mode:                "migration",
+	}
+	return g.plan(ctx, schema)
+}
+
+// plan partitions the schema's tables into create-vs-skip against the
+// target's existing catalog and returns the schema subset the CREATE
+// phase should apply. It refuses (coded) on any pre-existing same-name
+// table whose column shape differs, and returns the input schema
+// unchanged — with a WARN — when the target catalog cannot be read
+// (never a new failure mode).
 //
 // The returned schema is a shallow clone when any table is skipped;
 // schema-level objects (sequences, views) are carried through
@@ -72,8 +111,8 @@ const shapeMismatchColumnsShown = 3
 // schema: a pre-created table still receives its data, and the
 // index/constraint phases are detect-then-skip idempotent, so a
 // bootstrapped table that already carries them converges cleanly.
-func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schema) (*ir.Schema, error) {
-	actual, ok := m.readTargetTablesForShapeGate(ctx)
+func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.Schema, error) {
+	actual, ok := g.readTargetTablesForShapeGate(ctx)
 	if !ok || len(actual) == 0 {
 		return schema, nil
 	}
@@ -90,7 +129,7 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 	// tolerated by CREATE TABLE IF NOT EXISTS exactly as before
 	// ADR-0166, and the WARN names them so the operator knows they went
 	// unvalidated.
-	if !translate.HasStorageShapeMapping(m.Source.Name(), m.Target.Name()) {
+	if !translate.HasStorageShapeMapping(g.Source.Name(), g.Target.Name()) {
 		var tolerated []string
 		for _, t := range schema.Tables {
 			if _, exists := actual[t.Name]; exists {
@@ -99,9 +138,9 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 		}
 		if len(tolerated) > 0 {
 			slog.WarnContext(ctx,
-				"migration: pre-existing same-name target table(s) tolerated WITHOUT a shape compare — no storage-shape mapping exists for this engine pair, so a conflicting shape would still surface mid-copy; verify them against `sluice schema preview` (or --exclude-table them) if in doubt",
-				slog.String("source_engine", m.Source.Name()),
-				slog.String("target_engine", m.Target.Name()),
+				g.Mode+": pre-existing same-name target table(s) tolerated WITHOUT a shape compare — no storage-shape mapping exists for this engine pair, so a conflicting shape would still surface mid-copy; verify them against `sluice schema preview` (or --exclude-table them) if in doubt",
+				slog.String("source_engine", g.Source.Name()),
+				slog.String("target_engine", g.Target.Name()),
 				slog.String("tables", strings.Join(tolerated, ", ")))
 		}
 		return schema, nil
@@ -113,7 +152,7 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 	// …) so the IR comparison sees the shape the catalog will read
 	// back. Same-engine pairs are identity. RetargetForEngine clones;
 	// the writer keeps the untouched schema.
-	expected := translate.RetargetForEngine(schema, m.Source.Name(), m.Target.Name())
+	expected := translate.RetargetForEngine(schema, g.Source.Name(), g.Target.Name())
 	expTables := make(map[string]*ir.Table, len(expected.Tables))
 	for _, t := range expected.Tables {
 		expTables[t.Name] = t
@@ -125,7 +164,7 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 	// table under a utf8mb4 intent) died mid-copy pre-fix. Cross-engine
 	// pairs keep charset out — translation noise, not drift.
 	shapeOpts := irdiff.ShapeCompareOptions{
-		CompareCharset: translate.IsMySQLFamily(m.Source.Name()) && translate.IsMySQLFamily(m.Target.Name()),
+		CompareCharset: translate.IsMySQLFamily(g.Source.Name()) && translate.IsMySQLFamily(g.Target.Name()),
 	}
 
 	skip := make(map[string]struct{})
@@ -142,13 +181,13 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 				// doesn't stop the copy, but a duplicate-carrying source
 				// will fail loudly on it mid-copy — say so up front.
 				slog.WarnContext(ctx,
-					"migration: pre-existing target table carries a PRIMARY KEY the source schema does not declare — tolerated (the copy proceeds), but source rows that collide on it will fail loudly mid-copy; drop the key or --exclude-table if that is not what you want",
+					g.Mode+": pre-existing target table carries a PRIMARY KEY the source schema does not declare — tolerated (the copy proceeds), but source rows that collide on it will fail loudly mid-copy; drop the key or --exclude-table if that is not what you want",
 					slog.String("table", t.Name),
 					slog.String("primary_key", pk))
 			}
 			skip[t.Name] = struct{}{}
 			slog.InfoContext(ctx,
-				"migration: target table exists with matching column shape — skipping create",
+				g.Mode+": target table exists with matching column shape — skipping create",
 				slog.String("table", t.Name))
 			continue
 		}
@@ -166,8 +205,8 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 			sluicecode.CodeTargetTableShapeMismatch,
 			"inspect the conflicting target table(s) against `sluice schema preview`, then exclude them with --exclude-table or drop/rename/alter them to match; only if the ENTIRE target dataset is disposable, --reset-target-data drops every in-scope target table's data (not just the conflicting ones) before re-creating",
 			fmt.Errorf(
-				"pipeline: %d pre-existing target table(s) differ from the schema this migration would create — refusing before any data moves (proceeding would fail mid-copy or land rows in the wrong columns): %s",
-				len(refusals), strings.Join(refusals, "; "),
+				"pipeline: %d pre-existing target table(s) differ from the schema this %s would create — refusing before any data moves (proceeding would fail mid-copy or land rows in the wrong columns): %s",
+				len(refusals), g.Mode, strings.Join(refusals, "; "),
 			),
 		)
 	}
@@ -188,20 +227,20 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 // the target engine's own SchemaReader (the schema-diff surface),
 // indexed by table name. ok=false means the compare is uncomputable —
 // already WARNed — and the caller must fall back to today's behavior.
-func (m *Migrator) readTargetTablesForShapeGate(ctx context.Context) (map[string]*ir.Table, bool) {
+func (g *existingTablesGate) readTargetTablesForShapeGate(ctx context.Context) (map[string]*ir.Table, bool) {
 	warnFallback := func(step string, err error) {
 		slog.WarnContext(ctx,
-			"migration: cannot read the target's existing tables — skipping the pre-create shape compare (pre-existing same-name tables are tolerated as before)",
+			g.Mode+": cannot read the target's existing tables — skipping the pre-create shape compare (pre-existing same-name tables are tolerated as before)",
 			slog.String("step", step), slog.String("err", err.Error()))
 	}
-	tr, err := m.Target.OpenSchemaReader(ctx, m.TargetDSN)
+	tr, err := g.Target.OpenSchemaReader(ctx, g.TargetDSN)
 	if err != nil {
 		warnFallback("open target schema reader", err)
 		return nil, false
 	}
 	defer migcore.CloseIf(tr)
-	migcore.ApplyTargetSchema(tr, m.TargetSchema)
-	if err := applyEnabledPGExtensions(ctx, tr, m.EnabledPGExtensions); err != nil {
+	migcore.ApplyTargetSchema(tr, g.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, tr, g.EnabledPGExtensions); err != nil {
 		warnFallback("enable PG extensions on target reader", err)
 		return nil, false
 	}

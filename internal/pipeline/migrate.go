@@ -1073,6 +1073,17 @@ type bulkCopyOpts struct {
 	// validate.
 	SkipSchemaApply bool
 
+	// CreateSchema, when non-nil, is the ADR-0166 create subset the
+	// CREATE TABLE phase applies INSTEAD of the full schema — the
+	// full schema minus pre-existing target tables the pre-create
+	// shape gate proved already match (roadmap item 25 residual: the
+	// sync cold-start's shape gate). Every other phase (bulk copy,
+	// indexes, constraints) keeps consuming the full schema, exactly
+	// like runBulkCopyPhases' createSchema parameter. nil = no gate
+	// ran; create everything (byte-identical pre-gate behavior for
+	// every other caller).
+	CreateSchema *ir.Schema
+
 	// Redactor is the operator-configured PII redaction policy
 	// (Phase 1, roadmap item 15a). nil/empty Registry is the
 	// no-redactions hot path; see [migcore.RedactRow] and [redactRows] for
@@ -1120,7 +1131,16 @@ func runBulkCopyWithOpts(
 	opts bulkCopyOpts,
 ) error {
 	if !opts.SkipSchemaApply {
-		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		// The CREATE phase consumes the ADR-0166 create subset when the
+		// pre-create shape gate ran (sync cold-start); nil keeps the full
+		// schema. Copy/index/constraint phases below stay on the full
+		// schema either way — a skipped (pre-existing, shape-matched)
+		// table still receives its data.
+		createSchema := schema
+		if opts.CreateSchema != nil {
+			createSchema = opts.CreateSchema
+		}
+		if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 		}
 	}
