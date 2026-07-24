@@ -13,7 +13,7 @@
 
 Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness. SQLite files and live Cloudflare D1 databases also migrate into Postgres or MySQL (with trigger-based continuous sync), and SQLite is a migrate target. Flat files migrate too: CSV / TSV / NDJSON files and mydumper / `pscale database dump` directories are first-class migrate sources — no live source database needed.
 
-- 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, PlanetScale flavors included
+- 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, MariaDB and the PlanetScale flavors included
 - 🗃️ **SQLite & Cloudflare D1** — import a SQLite file or a `wrangler d1 export` `.sql` dump (`--source-driver sqlite`), or read a live D1 over its HTTP query API (`--source-driver d1`) into Postgres / MySQL; big integers above 2⁵³ round-trip exactly (no JS 52-bit rounding, [ADR-0132](docs/adr/adr-0132-d1-query-api-reader.md)). SQLite is also a migrate **target** (`--target-driver sqlite`, decimals stored byte-exact as TEXT), and `sqlite-trigger` / `d1-trigger` add trigger-based continuous CDC ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md) / [ADR-0136](docs/adr/adr-0136-d1-trigger-cdc.md))
 - 📄 **Flat-file sources** — migrate straight from a CSV / TSV / NDJSON file (`--source-driver csv|tsv|ndjson`, staged with validated type inference, NULL conventions declared not sniffed — [ADR-0163](docs/adr/adr-0163-flatfile-csv-tsv-ndjson-sources.md)) or a mydumper / `pscale database dump` directory (`--source-driver mydumper`, [ADR-0161](docs/adr/adr-0161-mydumper-source-engine.md)) into any target
 - 🧬 **Online schema changes** — `sluice expand-contract` drives the full expand→migrate→contract pattern on PlanetScale via deploy requests ([ADR-0162](docs/adr/adr-0162-planetscale-expand-contract-orchestration.md)); `sluice backfill` is the resumable, keyset-chunked, online-safe in-place data migration for MySQL-family and Postgres ([ADR-0159](docs/adr/adr-0159-standalone-backfill-command.md)); `sluice deploy-ddl` ships one verbatim DDL statement through the governed deploy-request channel ([ADR-0165](docs/adr/adr-0165-deploy-ddl-and-control-table-bootstrap.md))
@@ -120,14 +120,17 @@ Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond
 
 ### Engines and directions
 
-| Source ↘ Target → | MySQL | PostgreSQL | PlanetScale MySQL | PlanetScale PG |
-|---|---|---|---|---|
-| **MySQL** | ✓ | ✓ | ✓ | ✓ |
-| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ |
-| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
-| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ |
-| **CSV / TSV / NDJSON file** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
-| **mydumper / `pscale database dump` dir** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| Source ↘ Target → | MySQL | MariaDB | PostgreSQL | PlanetScale MySQL | PlanetScale PG |
+|---|---|---|---|---|---|
+| **MySQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **MariaDB** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
+| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **CSV / TSV / NDJSON file** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| **mydumper / `pscale database dump` dir** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+
+The long-form version of this matrix — CDC modes and source requirements per engine, the known-limitations list, and a pre-production checklist — lives in [`docs/production-readiness.md`](docs/production-readiness.md).
 
 The flat-file rows are migrate **sources** only (no CDC — a file doesn't change); SQLite / D1 have their own table below. There is also an analytics **exit** direction: `sluice backup export-as-parquet` transcodes any engine's backup chain — whatever the source engine was — into Parquet files for DuckDB / warehouse ingestion ([ADR-0164](docs/adr/adr-0164-backup-export-as-parquet.md), recipe in [`docs/cookbook/duckdb-on-sluice-backups.md`](docs/cookbook/duckdb-on-sluice-backups.md)).
 
@@ -191,7 +194,7 @@ The lesson all six share: **the integration test was green** at the surface that
 
 ## Architecture in one paragraph
 
-[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the flat-file engines `internal/engines/{flatfile,mydumper}`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — thirteen registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
+[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the flat-file engines `internal/engines/{flatfile,mydumper}`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — fourteen registered engines today (`sluice engines` lists them): `mysql`, `mariadb`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, MariaDB, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
 
 The longer story lives in [`docs/architecture.md`](docs/architecture.md).
 
@@ -329,7 +332,7 @@ Run `sluice <command> --help` for per-command flags. DSNs can also be passed via
 A few terms recur in the codebase and docs:
 
 - **IR** — the **internal representation**, sluice's typed dialect-neutral schema + value model in `internal/ir`. Every cross-engine translation passes through it: source-engine readers populate the IR, target-engine writers consume it. The IR is the only shared contract between engines, which keeps source-specific knowledge out of writers and target-specific knowledge out of readers. See [`docs/architecture.md`](docs/architecture.md) for the longer story.
-- **Engine** — a registered database integration. Thirteen are registered today (run `sluice engines`): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
+- **Engine** — a registered database integration. Fourteen are registered today (run `sluice engines`): `mysql`, `mariadb`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
 - **Stream** — a continuous-sync flow with persisted position, identified by a `--stream-id`. Distinct from a one-shot `migrate` which doesn't persist resume state on the target.
 - **Shape** — the classification of a CDC-observed source DDL (`ShapeKindAddColumn`, `ShapeKindRenameColumn`, `ShapeKindUnrecognized`, …) that drives whether the streamer auto-forwards, coordinates live, or refuses loudly. See ADR-0054 / ADR-0058.
 - **Refuse loudly** — sluice's posture when the safe forward path is ambiguous or the operator-action recovery hint matters more than continuing. Always emits a structured message naming the offending object and the recovery path.
@@ -338,6 +341,7 @@ A few terms recur in the codebase and docs:
 
 ## Documentation
 
+- [`docs/production-readiness.md`](docs/production-readiness.md) — the support matrix, CDC modes per source, **known limitations**, and the pre-production checklist — start here when evaluating sluice for a real workload
 - [`docs/architecture.md`](docs/architecture.md) — IR, engine pattern, orchestrator, what sluice is and isn't
 - [`docs/comparison.md`](docs/comparison.md) — sluice vs. Debezium / AWS DMS / Fivetran / pgcopydb / HVR / Striim / Qlik (deep dive)
 - [`docs/comparison-bucardo.md`](docs/comparison-bucardo.md) — sluice vs. Bucardo (the canonical open-source PG → PG comparison; honest measured numbers, where each tool wins)
