@@ -262,15 +262,29 @@ func IsGracefulGoAway(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "goaway") {
+	return IsGracefulGoAwayText(err.Error())
+}
+
+// IsGracefulGoAwayText is [IsGracefulGoAway] over a bare message string, for
+// the call sites that hold a message rather than an error — notably the MySQL
+// applier's Error 1105 branch, where Vitess wraps an upstream vttablet gRPC
+// status INSIDE a *gomysql.MySQLError's Message. That branch is one of the
+// few places the terminal-code shield permits consulting message text: 1105's
+// semantics are message-dependent by construction, so it is a structured-code
+// AND message gate, never a bare scan.
+//
+// Both entry points share this one implementation so the conjunction cannot
+// drift between them.
+func IsGracefulGoAwayText(msg string) bool {
+	m := strings.ToLower(msg)
+	if !strings.Contains(m, "goaway") {
 		return false
 	}
 	// NO_ERROR (0x0) is the only code that makes a GOAWAY a graceful drain.
 	// Accept both the symbolic spelling stacks emit and the numeric form, but
 	// require one of them — a GOAWAY whose code we cannot read stays terminal
 	// rather than being assumed benign.
-	return strings.Contains(msg, "errcode=no_error") ||
-		strings.Contains(msg, "errcode = no_error") ||
-		strings.Contains(msg, "error code = no_error")
+	return strings.Contains(m, "errcode=no_error") ||
+		strings.Contains(m, "errcode = no_error") ||
+		strings.Contains(m, "error code = no_error")
 }

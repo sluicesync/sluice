@@ -768,3 +768,69 @@ func TestClassifyApplierError_BulkCopyReadDrop(t *testing.T) {
 		t.Errorf("a non-connection iteration error must stay TERMINAL; got retriable for %q", terminal)
 	}
 }
+
+// TestClassifyApplierError_GracefulGoAwayIn1105 pins the APPLY-path sibling of
+// roadmap item 79. Vitess wraps the vtgate->vttablet gRPC status inside a
+// MySQL Error 1105 message, so the same graceful drain that killed the VStream
+// reader reaches the applier as an InvalidArgument-carrying 1105.
+// InvalidArgument is deliberately absent from vitessRetriableSubstrings — a
+// genuinely malformed statement must stay terminal — so before this the drain
+// failed the batch instead of retrying it.
+//
+// Pin-the-class both ways, including the shield interaction: the retriable
+// verdict must come from the structured 1105 code AND its message, never from
+// a bare text scan over some other code.
+func TestClassifyApplierError_GracefulGoAwayIn1105(t *testing.T) {
+	const goawayDesc = `target: ks.-.primary: vttablet: rpc error: ` +
+		`code = InvalidArgument desc = protocol error: incomplete envelope: ` +
+		`http2: server sent GOAWAY and closed the connection; ` +
+		`LastStreamID=1, ErrCode=NO_ERROR, debug="graceful_stop"`
+
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{
+			"1105 wrapping a graceful GOAWAY is retriable",
+			&gomysql.MySQLError{Number: 1105, Message: goawayDesc},
+			true,
+		},
+		{
+			"1105 wrapping a PROTOCOL_ERROR GOAWAY stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: `target: ks.-.primary: vttablet: rpc error: ` +
+				`code = InvalidArgument desc = http2: server sent GOAWAY; ErrCode=PROTOCOL_ERROR`},
+			false,
+		},
+		{
+			// The GOAWAY leg lives behind the "vttablet" gate, exactly like
+			// every other 1105 shape: a 1105 that is not vttablet-framed must
+			// not be swept in.
+			"1105 without vttablet framing stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: `http2: server sent GOAWAY; ErrCode=NO_ERROR`},
+			false,
+		},
+		{
+			// TERMINAL-CODE SHIELD: a duplicate-key error whose message
+			// happens to echo GOAWAY text (a row value, a table name) must
+			// STAY terminal. 1062's semantics are code-only; the message is
+			// never consulted. This is the audit D0-3 hazard — a terminal
+			// code flipped retriable by text — and the reason the GOAWAY
+			// check went inside the 1105 branch rather than beside the
+			// transport-text legs.
+			"1062 whose message echoes GOAWAY/NO_ERROR stays terminal",
+			&gomysql.MySQLError{Number: 1062, Message: `Duplicate entry 'GOAWAY ErrCode=NO_ERROR' for key 'notes.PRIMARY'`},
+			false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if gotRetriable := errors.As(got, &re); gotRetriable != c.retriable {
+				t.Errorf("retriable=%v, want %v (got %v)", gotRetriable, c.retriable, got)
+			}
+		})
+	}
+}

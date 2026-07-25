@@ -541,7 +541,21 @@ func classifyVitessMessage(msg string) bool {
 			return true
 		}
 	}
-	return false
+	// GRACEFUL HTTP/2 DRAIN wrapped in the 1105 envelope (roadmap item 79,
+	// sibling sweep). Vitess wraps the vtgate→vttablet gRPC status inside this
+	// message, so the same server-side drain that killed the VStream READER
+	// arrives here as `vttablet: rpc error: code = InvalidArgument desc = …
+	// GOAWAY … ErrCode=NO_ERROR` on the APPLY path. InvalidArgument is not in
+	// [vitessRetriableSubstrings] — correctly, since a genuinely malformed
+	// statement must stay terminal — so without this the drain failed the
+	// batch instead of retrying it.
+	//
+	// Deliberately NOT a [vitessRetriableSubstrings] entry: that list is a
+	// bare substring scan, and the bare word "goaway" must never be retriable
+	// (a GOAWAY carrying PROTOCOL_ERROR or ENHANCE_YOUR_CALM means the peer is
+	// rejecting how we speak to it). The conjunction lives in nettransient, so
+	// the reader and the applier cannot drift apart on what "graceful" means.
+	return nettransient.IsGracefulGoAwayText(msg)
 }
 
 // vitessTxKillerSubstrings are the markers that distinguish a Vitess
