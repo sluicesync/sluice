@@ -225,3 +225,52 @@ func IsConnectionAvailabilitySQLState(err error) bool {
 		return strings.HasPrefix(code, "08")
 	}
 }
+
+// IsGracefulGoAway reports whether err is an HTTP/2 GOAWAY announcing a
+// GRACEFUL connection drain — the server saying "this connection is going
+// away, reconnect", which is retriable by construction.
+//
+// Why this is a separate predicate rather than a [TextShapes] entry: the
+// corpus is a plain substring match, and the bare word "goaway" MUST NOT be
+// retriable. A GOAWAY is only benign when it carries a benign error code. The
+// same frame with PROTOCOL_ERROR, ENHANCE_YOUR_CALM, or INADEQUATE_SECURITY
+// means the peer is rejecting how we are speaking to it, and retrying that
+// identically is the mask-a-real-fault case the package's positive-match-only
+// posture exists to prevent. So the decision needs the CONJUNCTION — a GOAWAY
+// *and* a no-error code — which a substring corpus cannot express.
+//
+// The decision is carried by `ErrCode=NO_ERROR`, the standards-defined field
+// (RFC 9113 §7, code 0x0). Implementations also attach a free-text debug
+// field — vtgate sends `debug="graceful_stop"` — which is corroborating only
+// and deliberately NOT load-bearing: it is a peer-chosen string that can
+// change without notice, while the error code cannot.
+//
+// Why it is here and not in the MySQL reader (Bug-203 precedent): the drain is
+// a property of the HTTP/2 transport, not of VStream. Any gRPC or HTTP/2
+// consumer sluice grows can meet it, so the vocabulary lives once and the
+// call sites delegate.
+//
+// Observed live 2026-07-24 (roadmap item 79): a PlanetScale VStream CDC
+// stream exited on `rpc error: code = InvalidArgument desc = protocol error:
+// incomplete envelope: http2: server sent GOAWAY and closed the connection;
+// LastStreamID=1, ErrCode=NO_ERROR, debug="graceful_stop"`. The gRPC code
+// describes the envelope-parse failure, not the operator's request, so the
+// reader's terminal-on-InvalidArgument rule — correct for a genuine
+// InvalidArgument — took down an unattended sync on routine edge-pod
+// rotation.
+func IsGracefulGoAway(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "goaway") {
+		return false
+	}
+	// NO_ERROR (0x0) is the only code that makes a GOAWAY a graceful drain.
+	// Accept both the symbolic spelling stacks emit and the numeric form, but
+	// require one of them — a GOAWAY whose code we cannot read stays terminal
+	// rather than being assumed benign.
+	return strings.Contains(msg, "errcode=no_error") ||
+		strings.Contains(msg, "errcode = no_error") ||
+		strings.Contains(msg, "error code = no_error")
+}

@@ -349,3 +349,87 @@ func TestClassifyReaderError_CancellationNormalized(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyReaderError_GracefulGoAway pins roadmap item 79: a server-side
+// HTTP/2 GOAWAY carrying ErrCode=NO_ERROR is a GRACEFUL DRAIN — "reconnect" —
+// and must be retriable, even though grpc-go delivers it as
+// codes.InvalidArgument, which this classifier otherwise (correctly) treats as
+// terminal.
+//
+// The observed failure (soak231, 2026-07-24, v0.100.0): a routine PlanetScale
+// edge-pod rotation exited the stream, and an unattended sync stayed down.
+// Zero-loss — the position was intact — but continuous replication that stops
+// on routine platform maintenance is not continuous.
+//
+// Pin-the-class, both directions: the graceful code retries; every
+// error-carrying GOAWAY stays terminal, INCLUDING one whose debug text says
+// "graceful_stop" (the debug field is peer-chosen and must not be
+// load-bearing — only the standards-defined ErrCode decides).
+func TestClassifyReaderError_GracefulGoAway(t *testing.T) {
+	// The verbatim production text, copied from the soak log.
+	const productionDesc = `protocol error: incomplete envelope: ` +
+		`http2: server sent GOAWAY and closed the connection; ` +
+		`LastStreamID=1, ErrCode=NO_ERROR, debug="graceful_stop"`
+
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{
+			"verbatim production shape, as a gRPC InvalidArgument status",
+			status.Error(codes.InvalidArgument, productionDesc),
+			true,
+		},
+		{
+			"same shape as a bare (non-status) error",
+			errors.New(productionDesc),
+			true,
+		},
+		{
+			"PROTOCOL_ERROR GOAWAY stays terminal",
+			status.Error(codes.InvalidArgument,
+				`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=PROTOCOL_ERROR`),
+			false,
+		},
+		{
+			"ENHANCE_YOUR_CALM GOAWAY stays terminal (we are being throttled off)",
+			status.Error(codes.InvalidArgument,
+				`http2: server sent GOAWAY; ErrCode=ENHANCE_YOUR_CALM, debug="too_many_pings"`),
+			false,
+		},
+		{
+			"debug=graceful_stop WITHOUT a no-error code stays terminal",
+			status.Error(codes.InvalidArgument,
+				`http2: server sent GOAWAY; ErrCode=PROTOCOL_ERROR, debug="graceful_stop"`),
+			false,
+		},
+		{
+			"a genuine InvalidArgument (no GOAWAY) still stays terminal",
+			status.Error(codes.InvalidArgument, "vstream: malformed vgtid"),
+			false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", c.err)
+			got := classifyReaderError(wrapped)
+
+			var re ir.RetriableError
+			if gotRetriable := errors.As(got, &re); gotRetriable != c.retriable {
+				t.Errorf("retriable=%v, want %v (err: %v)", gotRetriable, c.retriable, got)
+			}
+			if !errors.Is(got, c.err) {
+				t.Error("classifyReaderError lost the underlying error from the chain")
+			}
+			// A graceful drain must NOT be mistaken for an invalid position:
+			// the stream reconnects from the SAME position, it does not
+			// re-snapshot. (Routing it to ErrPositionInvalid would turn a
+			// free reconnect into a full cold-start re-copy.)
+			if errors.Is(got, ir.ErrPositionInvalid) {
+				t.Error("classified as ErrPositionInvalid; a graceful drain must resume from the same position, never force a re-snapshot")
+			}
+		})
+	}
+}

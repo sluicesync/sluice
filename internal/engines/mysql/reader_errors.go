@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/nettransient"
 )
 
 // # Source-reader error classification (GitHub issue #19)
@@ -131,6 +132,27 @@ func classifyReaderError(err error) error {
 	if isVStreamSchemaResolutionError(err) {
 		return &retriableMySQLError{err: fmt.Errorf(
 			"source vstream could not resolve a table's schema for the replay position (likely a DDL cutover, or the Vitess schema historian / track_schema_versions is off) — retrying from the last position; if it persists, resume from current (cold-start) to skip the unresolvable window: %w", err,
+		)}
+	}
+	// GRACEFUL HTTP/2 DRAIN (roadmap item 79, observed live 2026-07-24). The
+	// server sent a GOAWAY carrying ErrCode=NO_ERROR — "this connection is
+	// going away, reconnect" — which on PlanetScale accompanies routine
+	// edge-pod rotation. grpc-go surfaces it as codes.InvalidArgument
+	// ("protocol error: incomplete envelope: http2: server sent GOAWAY …"),
+	// because the code describes the ENVELOPE-PARSE failure, not the
+	// operator's request. The switch below deliberately keeps
+	// InvalidArgument terminal (a genuinely malformed request must not be
+	// retried), so without this arm a graceful drain killed the stream and an
+	// unattended sync stayed down until a human restarted it.
+	//
+	// Checked BEFORE the status block so it catches the shape whether or not
+	// it arrives wrapped in a gRPC status, and AFTER the purged-position arms
+	// above so an invalid position is never mistaken for a retriable blip.
+	// The conjunction (GOAWAY *and* NO_ERROR) lives in nettransient — a
+	// GOAWAY carrying a real error code stays terminal there and here.
+	if nettransient.IsGracefulGoAway(err) {
+		return &retriableMySQLError{err: fmt.Errorf(
+			"source vstream connection was gracefully drained by the server (HTTP/2 GOAWAY, ErrCode=NO_ERROR — routine on managed platforms that rotate edge pods); reconnecting from the last position: %w", err,
 		)}
 	}
 	// status.FromError reports ok=true only when err is — or wraps

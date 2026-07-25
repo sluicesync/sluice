@@ -924,7 +924,7 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
-### 79. A graceful server-side GOAWAY kills a VStream CDC stream instead of reconnecting (observed live 2026-07-24) — *confirmed defect, loud + zero-loss; small fix*
+### 79. A graceful server-side GOAWAY kills a VStream CDC stream instead of reconnecting (observed live 2026-07-24) — *✅ FIXED 2026-07-25:  (conjunction: GOAWAY + ErrCode=NO_ERROR) consulted by the VStream reader classifier before its terminal-on-InvalidArgument arm; RED-before-GREEN pinned on the verbatim production string, with every error-carrying GOAWAY pinned terminal*
 
 **What happened.** The `soak231` soak (PS-MySQL → PS-Postgres, running v0.100.0) exited on:
 
