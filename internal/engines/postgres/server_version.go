@@ -38,6 +38,15 @@ const (
 	pgVersionUniqueWithoutOverlaps  = 180000
 )
 
+// pgVersionConstraintParentID is the first server version whose
+// pg_constraint carries `conparentid` — PG 11, which is also the first
+// version that can create the internal per-partition FK clones the column
+// identifies. sluice's floor is PG 10 (pgoutput CDC), and the foreign-key
+// read runs against EVERY source — the Bug 100 partition refusal covers
+// partitioned tables, not partition-free ones — so an unconditional
+// reference would 42703 the whole FK read on a PG 10 server.
+const pgVersionConstraintParentID = 110000
+
 // serverVersionNum returns the Postgres server's numeric version
 // (server_version_num), e.g. 170002 for PG 17.2 or 160006 for PG
 // 16.6. Used by the slot-creation path to decide whether to opt in

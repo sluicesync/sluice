@@ -1558,6 +1558,25 @@ type indexRow struct {
 // and no constraint can carry the attribute there, so constant `false`
 // is the exact (not degraded) substitute. Pure so the per-version
 // matrix is unit-testable without a server.
+// fkParentOnlyExpr returns the WHERE-clause predicate that excludes
+// Postgres's internal per-partition FOREIGN KEY clones, version-gated on
+// [pgVersionConstraintParentID].
+//
+// On PG 11+ that is `con.conparentid = 0` — only a top-level constraint has
+// no parent, and pg_dump filters identically. Below PG 11 the column does not
+// exist (referencing it would 42703 the whole FK read), and no such server can
+// produce partition FK clones, so constant `true` is the exact substitute
+// rather than a degradation.
+//
+// Pure, so the per-version matrix is unit-testable without a server — the same
+// shape as [uniqueConstraintAttrExprs].
+func fkParentOnlyExpr(version int) string {
+	if version >= pgVersionConstraintParentID {
+		return "con.conparentid = 0"
+	}
+	return "true"
+}
+
 func uniqueConstraintAttrExprs(version int) (nullsNotDistinctExpr, periodExpr string) {
 	nullsNotDistinctExpr = "false"
 	if version >= pgVersionUniqueNullsNotDistinct {
@@ -1845,7 +1864,11 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 	// the selected set. In single-schema mode the value equals r.schema
 	// for every in-namespace FK, so the emitted IR is byte-identical to
 	// the pre-ADR-0075 shape.
-	const q = `
+	version, err := serverVersionNum(ctx, r.db)
+	if err != nil {
+		return fmt.Errorf("postgres: foreign-key read: %w", err)
+	}
+	q := `
 		SELECT
 			con.conname,
 			cl.relname  AS table_name,
@@ -1866,6 +1889,35 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		LEFT JOIN pg_attribute ref_col ON ref_col.attrelid = con.confrelid AND ref_col.attnum = u.f_attnum
 		WHERE  n.nspname = $1
 		  AND  con.contype = 'f'
+		  -- Exclude Postgres's INTERNAL per-partition FK clones. When a
+		  -- foreign key is declared on a partitioned table, PG materialises a
+		  -- child copy on every partition with conparentid pointing at the
+		  -- top-level constraint; only the parent (conparentid = 0) is a real,
+		  -- separately-creatable constraint. pg_dump filters the same way.
+		  --
+		  -- UNREACHABLE TODAY and deliberately kept anyway: preflightPartitionedTables
+		  -- (Bug 100) refuses declaratively-partitioned PG sources before this
+		  -- query runs, so no clone can reach it. This is pre-registered
+		  -- insurance for when partition support ships — the failure it
+		  -- prevents is nasty and shape-specific enough that rediscovering it
+		  -- would cost a debugging session: a clone's definition renders as
+		  -- REFERENCES <specific_partition>, producing a single-partition FK no
+		  -- row can satisfy (target unwritable, initial insert AND CDC apply
+		  -- both fail), while clones on a partitioned REFERENCING table cascade
+		  -- automatically when the parent FK is added, so recreating them
+		  -- explicitly errors "constraint already exists". Both were observed
+		  -- in a peer Postgres migration tool (roadmap item 78a).
+		  --
+		  -- VERSION-GATED (the serverVersionNum precedent used by
+		  -- populateIndexes for connullsnotdistinct/conperiod): conparentid
+		  -- exists on PG 11+ only, and this query runs against EVERY PG
+		  -- source — the Bug 100 refusal covers partitioned tables, not
+		  -- partition-free ones — so referencing it unconditionally would
+		  -- 42703 the whole FK read on a PG 10 source. Below PG 11 the
+		  -- predicate is substituted with a constant TRUE, which is exact
+		  -- rather than a degradation: no server that lacks the column can
+		  -- have partition FK clones to exclude.
+		  AND  ` + fkParentOnlyExpr(version) + `
 		ORDER  BY cl.relname, con.conname, u.ord`
 
 	rows, err := r.catalogQuery(ctx, q, r.schema)
