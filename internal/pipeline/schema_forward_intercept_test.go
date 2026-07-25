@@ -4,8 +4,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -866,5 +868,83 @@ func TestForwardAddColumn_Backfill_NoPK_Refuses(t *testing.T) {
 	}
 	if !strings.Contains((*ePtr).Error(), "primary key") {
 		t.Errorf("error %q does not mention primary key", (*ePtr).Error())
+	}
+}
+
+// TestRefuseComputedDefaults_WarnsWhenProjectionDroppedTheDefault pins roadmap
+// item 78(b)'s loud-not-silent WARN.
+//
+// The defect: a source ADD COLUMN carrying a DEFAULT lands on the target
+// WITHOUT it whenever the CDC projection cannot report defaults (the vtgate
+// FieldEvent never carries one; pgoutput's RelationMessage does not either).
+// Pre-existing target rows then hold NULL where source rows hold the default,
+// and no row event ever reconciles them — adding a column with a default
+// writes no per-row changes. Invisible to a row-count check.
+//
+// Pin the class in BOTH directions: the WARN must fire when something is
+// genuinely lost, and must STAY QUIET otherwise, or it becomes noise on every
+// forwarded ADD COLUMN and stops being read.
+func TestRefuseComputedDefaults_WarnsWhenProjectionDroppedTheDefault(t *testing.T) {
+	cases := []struct {
+		name     string
+		inBand   ir.DefaultValue // what the CDC projection carried (nil = dropped)
+		probed   ir.DefaultValue // what the source actually has
+		wantWarn bool
+		wantWhy  string
+	}{
+		{
+			name:     "projection dropped it AND the source has one -> WARN",
+			inBand:   nil,
+			probed:   ir.DefaultLiteral{Value: "5"},
+			wantWarn: true,
+			wantWhy:  "the default is genuinely lost on the target's pre-existing rows",
+		},
+		{
+			name:     "projection dropped it and the source has NO default -> quiet",
+			inBand:   nil,
+			probed:   ir.DefaultNone{},
+			wantWarn: false,
+			wantWhy:  "nothing is lost; warning here would fire on most ADD COLUMNs and become noise",
+		},
+		{
+			name:     "projection CARRIED the default -> quiet",
+			inBand:   ir.DefaultLiteral{Value: "5"},
+			probed:   ir.DefaultLiteral{Value: "5"},
+			wantWarn: false,
+			wantWhy:  "the binlog flavor carries column_default, so the emitted DDL includes it",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			defer slog.SetDefault(prev)
+
+			deps := schemaForwardDeps{
+				defaultProber: func(_ context.Context, _, _, _ string) (ir.DefaultValue, error) {
+					return c.probed, nil
+				},
+			}
+			col := &ir.Column{Name: "region", Type: ir.Integer{Width: 32}, Default: c.inBand}
+			snap := ir.SchemaSnapshot{Schema: "app", Table: "orders"}
+
+			if err := refuseComputedDefaults(context.Background(), deps, "orders", snap, []*ir.Column{col}); err != nil {
+				t.Fatalf("refuseComputedDefaults returned an error for a SAFE default: %v", err)
+			}
+
+			got := strings.Contains(buf.String(), "cannot be carried through this source's change stream")
+			if got != c.wantWarn {
+				t.Errorf("warned=%v, want %v — %s\nlog: %s", got, c.wantWarn, c.wantWhy, buf.String())
+			}
+			if c.wantWarn {
+				for _, want := range []string{"orders", "region", "--backfill-added-column"} {
+					if !strings.Contains(buf.String(), want) {
+						t.Errorf("WARN omits %q — an operator cannot act on it without the table, column, and remedy\nlog: %s", want, buf.String())
+					}
+				}
+			}
+		})
 	}
 }

@@ -847,8 +847,51 @@ func refuseComputedDefaults(
 				forwardRecoveryHint(tableName),
 			)
 		}
+		// LOUD-NOT-SILENT (roadmap item 78b). The in-band CDC IR carried no
+		// DEFAULT but the source does have one: the emitted ADD COLUMN will
+		// therefore omit it, so the target's PRE-EXISTING rows land NULL while
+		// the source's hold the default — and no row event will ever reconcile
+		// them, because adding a column with a default writes no per-row
+		// changes on either engine. Rows changed AFTER the ALTER are fine (CDC
+		// carries explicit values), so the divergence is confined to rows that
+		// existed at the moment of the ALTER, is invisible to a row-count
+		// check, and surfaces only under a value-comparing verify. That
+		// combination — real, bounded, and silent — is what this WARN exists
+		// to break.
+		//
+		// Gated on `c.Default == nil && def != DefaultNone`: the in-band value
+		// being absent is what says the projection dropped it, and the probe
+		// finding a real default is what says something is actually lost. A
+		// column with genuinely no default reaches neither condition and stays
+		// quiet.
+		if c.Default == nil && !isDefaultNone(def) {
+			slog.WarnContext(
+				ctx,
+				"forward-add-column: the source's column DEFAULT cannot be carried through this source's change stream — "+
+					"the target column is being added WITHOUT it, so rows that already exist on the target will hold NULL "+
+					"where the source holds the default value. Rows changed after this point are unaffected. "+
+					"Remedy: apply the default on the target and backfill the existing rows "+
+					"(ALTER TABLE ... ALTER COLUMN ... SET DEFAULT, then UPDATE ... WHERE <col> IS NULL), "+
+					"or re-run the forward with --backfill-added-column so sluice populates them from source values",
+				"table", tableName,
+				"column", c.Name,
+				"source_default", defaultExpressionText(def),
+			)
+		}
 	}
 	return nil
+}
+
+// isDefaultNone reports whether d is the explicit "this column has no
+// DEFAULT" value. A nil DefaultValue is NOT the same thing — nil means
+// "unknown / the projection did not carry one", which is precisely the
+// case the item-78b WARN distinguishes.
+func isDefaultNone(d ir.DefaultValue) bool {
+	if d == nil {
+		return false
+	}
+	_, none := d.(ir.DefaultNone)
+	return none
 }
 
 // defaultExpressionText returns the human-readable expression text for
