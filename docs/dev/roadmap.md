@@ -924,6 +924,27 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
+### 79. A graceful server-side GOAWAY kills a VStream CDC stream instead of reconnecting (observed live 2026-07-24) — *confirmed defect, loud + zero-loss; small fix*
+
+**What happened.** The `soak231` soak (PS-MySQL → PS-Postgres, running v0.100.0) exited on:
+
+```
+sluice: error: pipeline: source cdc reader: mysql/vstream: recv: rpc error:
+code = InvalidArgument desc = protocol error: incomplete envelope:
+http2: server sent GOAWAY and closed the connection;
+LastStreamID=1, ErrCode=NO_ERROR, debug="graceful_stop"
+```
+
+**Why this is a defect, not a legitimate refusal.** `GOAWAY` with **`ErrCode=NO_ERROR`** and **`debug="graceful_stop"`** is HTTP/2's *polite drain*: the server is telling the client "this connection is going away, reconnect" — the textbook retriable condition. It is almost certainly the same PlanetScale edge-pod rotation documented in item 75(a) (connector series churning within hours), i.e. routine platform maintenance, not an error at all. But the transport failure surfaces wrapped in gRPC **`InvalidArgument`**, and `classifyReaderError` (`internal/engines/mysql/reader_errors.go`) deliberately treats `InvalidArgument` as TERMINAL on the stated reasoning that "the operator's request is wrong, and retrying would mask it". That reasoning is right for a genuine `InvalidArgument` and wrong here: the code describes the *envelope-parse* failure, not the operator's request.
+
+**Confirmed absent:** `grep -ri "goaway"` over the whole tree returns nothing — no GOAWAY handling exists anywhere, and `internal/nettransient`'s matcher set does not cover it either. So every VStream consumer is exposed, and the exposure scales with how often the platform rotates edge pods.
+
+**Severity.** LOUD and ZERO-LOSS — the stream exits with a clear error and the persisted position is intact, so a warm resume loses nothing. But an unattended continuous sync **stays down** until someone restarts it, which is precisely the failure mode continuous replication exists to avoid. Two of this session's soak outages trace to it.
+
+**Fix shape.** Classify the graceful-GOAWAY signature as transient and let the existing reactive-resume path reconnect. Match on the *conjunction* — a GOAWAY carrying `ErrCode=NO_ERROR` (and/or `debug="graceful_stop"`) — never on the bare word `GOAWAY`, because a GOAWAY with a real error code (`PROTOCOL_ERROR`, `ENHANCE_YOUR_CALM`) is a different animal and must stay terminal. Home it in `internal/nettransient` beside the existing shapes rather than in the MySQL reader, since the same drain can hit any gRPC/HTTP2 consumer (the ADR-0111/Bug-203 precedent of one shared matcher with per-engine delegation). Pin RED-before-GREEN with the verbatim error string above, plus a negative control proving a non-NO_ERROR GOAWAY still exits terminal.
+
+**Gotcha.** `debug="graceful_stop"` is a *vtgate*-chosen debug string, not a protocol constant — do not make it load-bearing on its own. `ErrCode=NO_ERROR` is the standards-defined part and should carry the decision; treat the debug text as corroborating evidence only.
+
 ### 78. Peer-tool review follow-ups — one pre-registered landmine, one unverified sibling, one gate (filed 2026-07-24) — *not started; three small independent items*
 
 Three residuals from reviewing a peer Postgres-migration tool's recent fixes and a third-party Vitess CDC connector's known-issue list against sluice. Most of both lists was already closed in sluice or structurally inapplicable (sluice binds parameters rather than building SQL literal text, so the float-precision-in-WHERE class cannot arise; the shard-list `FailedPrecondition` and the retry-forever-on-a-dead-cursor pathologies are already fixed and pinned; sequence priming at cutover is already more thorough). These three are what survived.
