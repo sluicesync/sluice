@@ -924,7 +924,40 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
-### 80. The filtered move-IN/move-OUT crux family has been RED on Vitess 21 & 22 for a week, in a NON-REQUIRED workflow (found 2026-07-26) — *unresolved; investigate before it is assumed benign*
+### 81. A mid-stream `CREATE TABLE` killed a keyspace-wide VStream with "row event without preceding FIELD event" (observed 2026-07-26) — *confirmed crash, loud + zero-loss; reproduce deliberately before fixing*
+
+**What happened.** While verifying item 80, a new table was created on `soak-mysql231` — a PlanetScale (Vitess 22) source with a **live, keyspace-wide** sluice sync attached (`soak231`, no `--include-table`). The running stream first logged, correctly and harmlessly:
+
+```
+WARN postgres: applier: skipping CDC event for unknown target table op=insert schema=public table=item80_regions
+```
+
+and then **died**:
+
+```
+sluice: error: pipeline: source cdc reader:
+mysql/vstream: row event for "-/soak-mysql231.soak_events" without preceding FIELD event
+```
+
+Note the table named in the fatal error is **`soak_events` — the pre-existing table the soak has been replicating for days**, not the newly created one. So the DDL did not merely introduce an unknown table; it disturbed FIELD-event sequencing for an **established** table in the same keyspace.
+
+**Why this is worth fixing rather than filing as operator error.** "Someone creates a table while a continuous sync is running" is an ordinary thing to happen in production, not a contrived test condition. A keyspace-wide stream is also the DEFAULT shape — `--include-table` is opt-in — so most streams are exposed. The failure is **loud and zero-loss** (the position is intact and a warm resume recovers, as it did here), which puts it in the same family as item 79: a transient, recoverable protocol condition classified as terminal, taking down an unattended stream that a reconnect would have healed.
+
+**Severity + exposure.** Loud, zero-loss, recoverable by restart. Exposure is broad (default stream shape, ordinary DDL) but the trigger is a schema event rather than a data event, so a stream on a static schema never meets it. The soak that hit this had been up cleanly for a day.
+
+**Do NOT fix from this description alone.** The observation was a by-product of an unrelated experiment, so several variables were uncontrolled: a SECOND sluice stream (the item-80 test stream) was reading the same keyspace concurrently, and the DDL was `CREATE TABLE` + `INSERT` in quick succession. Any of those could be load-bearing. This is a three-phase-protocol candidate: reproduce deliberately on a disposable Vitess source (single stream, CREATE TABLE alone, then CREATE+INSERT, then with a concurrent second consumer) and establish which variable actually produces the missing FIELD event before writing a classifier change.
+
+**Likely shape of the fix, once ground truth exists.** If a row event for a table whose FIELD event has not yet been seen is a *transient* sequencing artifact around a DDL boundary — the VStream will re-send a FIELD event — then the reader should treat it as retriable (the item-79 pattern: reconnect from the last position rather than exiting) or resynchronize the table's field cache, rather than failing the stream. If instead it indicates genuine decode ambiguity, the current loud refusal is right and the fix belongs in documentation plus a clearer error naming the DDL as the probable cause. The distinction matters: retrying a genuine decode ambiguity would risk misdecoding rows, which is exactly the silent-loss class the loud refusal exists to prevent.
+
+**Related.** Item 79 (graceful GOAWAY classified terminal) is the same *class* — a recoverable source-side condition ending an unattended stream — and its fix landed in `internal/nettransient` with a per-call-site delegation, which is the shape a fix here would likely reuse.
+
+### 80. The filtered move-IN/move-OUT crux family was RED on Vitess 21 & 22 — ✅ RESOLVED 2026-07-26: TEST-ONLY; the product is VERIFIED correct on Vitess 22 against a real PlanetScale database
+
+**✅ PRODUCT VERIFIED CORRECT ON VITESS 22 (2026-07-26) — the convergence check the suite never had.** The reasoning above said the data outcome was *likely* fine but unverified, because these tests assert event SHAPES and nothing checked that the target actually converges. That gap is now closed by measurement, not inference. A scoped filtered sync (`--include-table` + `--where region='EU'`) was run from **`soak-mysql231`, a live PlanetScale database on Vitess 22**, into a throwaway local-rig Postgres target. Cold start landed exactly the in-scope rows {1,3}. Then a move-IN (id=2 US→EU), a move-OUT (id=1 EU→US), an out-of-scope INSERT (id=4 US) and an in-scope INSERT (id=5 EU) were applied together. **Source EU set {2,3,5}; target {2,3,5} — exact convergence.** The move-IN appeared, the move-OUT was removed, the out-of-scope row never arrived. sluice's filtered sync is correct on Vitess 22; the CI failures were the tests encoding v23+'s wire shape as the contract.
+
+**Fixed in the tests, not the product.** `assertMoveIn` / `assertMoveOut` now accept EITHER shape — an `ir.Update` carrying both images (v23+) or the pre-classified `ir.Insert` / `ir.Delete` (v21/v22) — while the stronger both-images assertions stay gated behind `expectedScopeTransitionShape()` to the majors that can satisfy them, so the F-P1 before-image guarantee remains pinned where it applies. The warm-resume collector also terminated only on an `ir.Update`, so on ≤22 it drained past a correctly-delivered move-OUT and timed out; it now terminates on the DELETE form too. The pre-classified move-IN is still checked for an IN-SCOPE after-image, so a genuine out-of-scope leak would still fail the test.
+
+**⚠️ Cost of the verification, recorded honestly.** Creating the test table in `soak-mysql231` disturbed the live soak. That stream is keyspace-wide (no `--include-table`), so it saw the new table's events (`skipping CDC event for unknown target table`) and then **died** on `mysql/vstream: row event for "-/soak-mysql231.soak_events" without preceding FIELD event` — a mid-stream `CREATE TABLE` breaking FIELD-event sequencing for an EXISTING table. The soak was relaunched and warm-resumed from its persisted position; all test artifacts were removed. The blast radius was mis-predicted (the stream's scope was assumed to be its cold-start table set; it is not), which is the process lesson. That crash shape is filed as **item 81** — it is a plausible real-world event and it was reached by accident rather than by design.
 
 **What.** `TestVitessClusterFilteredSync` and `TestVitessClusterFilteredSyncWarmResume` fail on **Vitess v21.0.6 and v22.0.4** and pass on **v23.0.4, v24.0.1, and latest**. The weekly `vitess-version-matrix.yml` schedule run is where this surfaces.
 

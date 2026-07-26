@@ -195,49 +195,67 @@ func TestVitessClusterFilteredSync(t *testing.T) {
 	// (B) out-of-scope INSERT (id=11 US) must NEVER appear as its own INSERT —
 	// vtgate's server-side filter drops it. The only id=11 event is the move-IN
 	// UPDATE below.
-	for _, ch := range got {
-		if ins, ok := ch.(ir.Insert); ok && ins.Table == "regions" {
-			if id, _ := asInt64Val(ins.Row["id"]); id == 11 {
-				t.Errorf("out-of-scope INSERT id=11 (US) leaked into the filtered stream: %#v", ins.Row)
+	// On v23+ the ONLY id=11 event is the move-IN UPDATE, so any Insert is a
+	// leak. On v21/v22 vtgate pre-classifies the move-IN AS an Insert of the
+	// in-scope after-image (roadmap item 80), which is correct, not a leak —
+	// so the leak check there is that no OUT-OF-SCOPE row body arrives, which
+	// [assertMoveIn] enforces on the after-image it inspects.
+	if expectedScopeTransitionShape() == transitionAsUpdate {
+		for _, ch := range got {
+			if ins, ok := ch.(ir.Insert); ok && ins.Table == "regions" {
+				if id, _ := asInt64Val(ins.Row["id"]); id == 11 {
+					t.Errorf("out-of-scope INSERT id=11 (US) leaked into the filtered stream: %#v", ins.Row)
+				}
 			}
 		}
 	}
 
-	// (C) move-IN (id=11 US->EU): the LOAD-BEARING anchor — must arrive as an
-	// ir.Update carrying BOTH images (before out-of-scope US, after in-scope
-	// EU). The pipeline's unit-pinned route() turns this into a target INSERT
-	// of the after-image; if the before-image were absent the classification
-	// could not run.
-	moveIn := findRegionUpdate(t, got, 11)
-	if before := asStringVal(moveIn.Before["region"]); before != "US" {
-		t.Errorf("move-IN id=11 before.region = %q; want US (VStream must deliver the OLD out-of-scope image)", before)
-	}
-	if after := asStringVal(moveIn.After["region"]); after != "EU" {
-		t.Errorf("move-IN id=11 after.region = %q; want EU", after)
+	// (C) move-IN (id=11 US->EU): the LOAD-BEARING anchor. The row must be
+	// observed crossing INTO scope. On v23+ that is an ir.Update carrying BOTH
+	// images, and the extra before/after assertions below pin the F-P1
+	// before-image guarantee the pipeline's route() depends on. On v21/v22 the
+	// same transition arrives pre-classified as an Insert of the after-image;
+	// both converge the target identically (item 80, verified against a real
+	// PlanetScale Vitess-22 database).
+	if moveIn, bothImages := assertMoveIn(t, got, 11); bothImages {
+		if before := asStringVal(moveIn.Before["region"]); before != "US" {
+			t.Errorf("move-IN id=11 before.region = %q; want US (VStream must deliver the OLD out-of-scope image)", before)
+		}
+		if after := asStringVal(moveIn.After["region"]); after != "EU" {
+			t.Errorf("move-IN id=11 after.region = %q; want EU", after)
+		}
 	}
 
 	// (D) move-OUT (id=10 EU->US): the cell a naive per-event filter would DROP
 	// (leaking the now-out-of-scope row). VStream must deliver the full UPDATE
 	// with BOTH images (before in-scope EU, after out-of-scope US); the
 	// pipeline's route() turns before=in/after=out into a target DELETE by key.
-	moveOut := findRegionUpdate(t, got, 10)
-	if before := asStringVal(moveOut.Before["region"]); before != "EU" {
-		t.Errorf("move-OUT id=10 before.region = %q; want EU (the in-scope OLD image the DELETE-by-key needs)", before)
-	}
-	if after := asStringVal(moveOut.After["region"]); after != "US" {
-		t.Errorf("move-OUT id=10 after.region = %q; want US", after)
-	}
-	// The before-image must carry the filtered column (region) so route() can
-	// classify the move-OUT — the exact partial-before-image hazard the
-	// pipeline's SLUICE-E-WHERE-CDC-BEFORE-IMAGE guard refuses when it is absent.
-	if _, ok := moveOut.Before["region"]; !ok {
-		t.Errorf("move-OUT id=10 before-image omits the filtered column `region` — a partial before-image would mis-classify the move-OUT as a drop (leak)")
+	if moveOut, bothImages := assertMoveOut(t, got, 10); bothImages {
+		if before := asStringVal(moveOut.Before["region"]); before != "EU" {
+			t.Errorf("move-OUT id=10 before.region = %q; want EU (the in-scope OLD image the DELETE-by-key needs)", before)
+		}
+		if after := asStringVal(moveOut.After["region"]); after != "US" {
+			t.Errorf("move-OUT id=10 after.region = %q; want US", after)
+		}
+		// The before-image must carry the filtered column (region) so route() can
+		// classify the move-OUT — the exact partial-before-image hazard the
+		// pipeline's SLUICE-E-WHERE-CDC-BEFORE-IMAGE guard refuses when it is absent.
+		// Only meaningful where a before-image exists at all: on v21/v22 vtgate has
+		// already made the classification server-side and emits a bare DELETE, so
+		// there is no before-image to be partial.
+		if _, ok := moveOut.Before["region"]; !ok {
+			t.Errorf("move-OUT id=10 before-image omits the filtered column `region` — a partial before-image would mis-classify the move-OUT as a drop (leak)")
+		}
 	}
 
 	if err := stream.Changes.(interface{ Err() error }).Err(); err != nil {
 		t.Fatalf("filtered CDC stream errored: %v", err)
 	}
-	t.Log("filtered CDC PASS: in-scope INSERT flowed; out-of-scope INSERT dropped server-side; move-IN and move-OUT each delivered as a full UPDATE with BOTH images (→ pipeline INSERT / DELETE)")
+	t.Logf("filtered CDC PASS (%s): in-scope INSERT flowed; out-of-scope INSERT dropped server-side; move-IN and move-OUT both observed with correct scoping",
+		map[scopeTransitionShape]string{
+			transitionAsUpdate:      "v23+ shape: full UPDATE with BOTH images → pipeline INSERT / DELETE",
+			transitionPreClassified: "v21/v22 shape: vtgate pre-classified into INSERT / DELETE server-side",
+		}[expectedScopeTransitionShape()])
 }
 
 // TestVitessClusterFilteredSyncWarmResume is the ADR-0174 Piece 2 / audit F-P1
@@ -382,15 +400,16 @@ func TestVitessClusterFilteredSyncWarmResume(t *testing.T) {
 	// images (before in-scope EU, after out-of-scope US) — the raw material
 	// route() turns into a target DELETE-by-key. The before-image must carry
 	// the filtered column so route() can classify the move-OUT.
-	moveOut := findRegionUpdate(t, got, 20)
-	if before := asStringVal(moveOut.Before["region"]); before != "EU" {
-		t.Errorf("move-OUT id=20 before.region = %q; want EU (the in-scope OLD image the DELETE-by-key needs)", before)
-	}
-	if after := asStringVal(moveOut.After["region"]); after != "US" {
-		t.Errorf("move-OUT id=20 after.region = %q; want US", after)
-	}
-	if _, ok := moveOut.Before["region"]; !ok {
-		t.Errorf("move-OUT id=20 before-image omits the filtered column `region` — route() could not classify the move-OUT (leak)")
+	if moveOut, bothImages := assertMoveOut(t, got, 20); bothImages {
+		if before := asStringVal(moveOut.Before["region"]); before != "EU" {
+			t.Errorf("move-OUT id=20 before.region = %q; want EU (the in-scope OLD image the DELETE-by-key needs)", before)
+		}
+		if after := asStringVal(moveOut.After["region"]); after != "US" {
+			t.Errorf("move-OUT id=20 after.region = %q; want US", after)
+		}
+		if _, ok := moveOut.Before["region"]; !ok {
+			t.Errorf("move-OUT id=20 before-image omits the filtered column `region` — route() could not classify the move-OUT (leak)")
+		}
 	}
 
 	if err := r2.(interface{ Err() error }).Err(); err != nil {
@@ -418,8 +437,19 @@ func collectResumedRegionChanges(t *testing.T, ctx context.Context, changes <-ch
 				t.Fatalf("resumed stream closed before the move-OUT update id=%d (%s)", untilUpdateID, changeKinds(got))
 			}
 			switch e := ch.(type) {
-			case ir.Insert, ir.Delete:
+			case ir.Insert:
 				got = append(got, ch)
+			case ir.Delete:
+				got = append(got, ch)
+				// v21/v22 (roadmap item 80): vtgate pre-classifies the move-OUT
+				// SERVER-side, so the terminating event is a bare DELETE, not an
+				// UPDATE. Draining only on ir.Update made this collector wait out
+				// its full timeout on those majors while the transition had
+				// already been delivered correctly — the failure that made the
+				// crux look broken when the product was not.
+				if did, _ := asInt64Val(e.Before["id"]); did == untilUpdateID {
+					return got
+				}
 			case ir.Update:
 				got = append(got, ch)
 				bid, _ := asInt64Val(e.Before["id"])
@@ -627,4 +657,85 @@ func TestVitessClusterFilteredSyncPadSpaceFallback(t *testing.T) {
 		}
 		t.Logf("A0 fallback PASS: trailing-space id=2 survived, out-of-scope id=3 dropped; copied=%v", copied)
 	})
+}
+
+// scopeTransitionShape names how a given Vitess major delivers a row crossing
+// the --where filter boundary. The two shapes are semantically equivalent and
+// BOTH satisfy sluice's guarantee; only the wire form differs.
+type scopeTransitionShape int
+
+const (
+	// transitionAsUpdate — Vitess >=23: the client receives an ir.Update
+	// carrying BOTH images, and sluice's route() classifies the transition.
+	transitionAsUpdate scopeTransitionShape = iota
+	// transitionPreClassified — Vitess <=22: vtgate resolves the scope change
+	// SERVER-side, so a move-IN arrives as a bare ir.Insert of the after-image
+	// and a move-OUT as a bare ir.Delete. sluice applies them verbatim and the
+	// target converges identically (verified 2026-07-26 against a real
+	// PlanetScale Vitess-22 database: source EU set {2,3,5}, target {2,3,5}).
+	transitionPreClassified
+)
+
+// expectedScopeTransitionShape reports how the Vitess major under test
+// delivers filter-boundary transitions.
+//
+// Why this exists (roadmap item 80): the crux tests originally asserted the
+// v23+ SHAPE — "a move-IN must be an ir.Update with both images" — and so went
+// red on v21/v22 for a week while the PRODUCT was correct on both. The
+// guarantee sluice actually makes is about CONVERGENCE (the row is present
+// after a move-IN, absent after a move-OUT), not about which event kind
+// carried it. These tests read ir.Change events directly with no target
+// attached, so they assert the closest available proxy: the transition is
+// OBSERVED, with the correct scoping, in whichever form this major emits.
+// The stronger both-images assertion is kept, gated to the majors that can
+// satisfy it, so the F-P1 before-image guarantee stays pinned where it applies.
+func expectedScopeTransitionShape() scopeTransitionShape {
+	if major, ok := vitessClusterMajor(); ok && major <= 22 {
+		return transitionPreClassified
+	}
+	return transitionAsUpdate
+}
+
+// assertMoveIn asserts that id crossed INTO the filter scope, accepting either
+// wire shape. Returns the ir.Update when this major delivers one (so a caller
+// can make the stricter both-images assertions), or ok=false when the
+// transition arrived pre-classified as an Insert.
+func assertMoveIn(t *testing.T, got []ir.Change, id int64) (ir.Update, bool) {
+	t.Helper()
+	if expectedScopeTransitionShape() == transitionAsUpdate {
+		return findRegionUpdate(t, got, id), true
+	}
+	for _, ch := range got {
+		if ins, ok := ch.(ir.Insert); ok && ins.Table == "regions" {
+			if iid, _ := asInt64Val(ins.Row["id"]); iid == id {
+				// The pre-classified move-IN must carry the IN-SCOPE after
+				// image — an out-of-scope value here would be a real leak.
+				if r := asStringVal(ins.Row["region"]); r != "EU" {
+					t.Errorf("pre-classified move-IN id=%d carries region=%q; want the in-scope after-image EU", id, r)
+				}
+				return ir.Update{}, false
+			}
+		}
+	}
+	t.Fatalf("move-IN id=%d never observed in any form among %d changes (%s)", id, len(got), changeKinds(got))
+	return ir.Update{}, false
+}
+
+// assertMoveOut is the move-OUT twin of [assertMoveIn]: on v23+ the transition
+// is an ir.Update whose BEFORE image is in-scope; on v21/v22 it is a bare
+// ir.Delete. Either proves the row left the filtered set.
+func assertMoveOut(t *testing.T, got []ir.Change, id int64) (ir.Update, bool) {
+	t.Helper()
+	if expectedScopeTransitionShape() == transitionAsUpdate {
+		return findRegionUpdate(t, got, id), true
+	}
+	for _, ch := range got {
+		if del, ok := ch.(ir.Delete); ok && del.Table == "regions" {
+			if did, _ := asInt64Val(del.Before["id"]); did == id {
+				return ir.Update{}, false
+			}
+		}
+	}
+	t.Fatalf("move-OUT id=%d never observed in any form among %d changes (%s)", id, len(got), changeKinds(got))
+	return ir.Update{}, false
 }
