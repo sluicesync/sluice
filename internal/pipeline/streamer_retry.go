@@ -415,10 +415,32 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 			// transient cutover window to a full re-copy would be a large,
 			// silent cost for a condition that clears itself in seconds.
 			if isUnreplayableWindowError(err) {
-				return fmt.Errorf(
+				invalid := fmt.Errorf(
 					"pipeline: the source's replay window at position %q is unreplayable — %d consecutive attempts failed to resolve a table's schema there, which on a Vitess source means the window references a table that no longer exists (a DROP while this stream was stopped, or a DDL the schema historian cannot reconstruct). The persisted position cannot advance past it: %w (%w)",
 					afterPos.Token, consecutive, ir.ErrPositionInvalid, err,
 				)
+				// Route it through the SAME ADR-0093 decision the head of this
+				// loop uses for a reactive purged position — do NOT merely
+				// return it. The resnapshot handling lives at the loop head, so
+				// returning here wraps the error with ErrPositionInvalid and
+				// then exits PAST the handler that acts on it: the operator
+				// reads an accurate diagnosis and still gets no recovery. The
+				// first cut of this fix did exactly that, and it was caught by
+				// running it against a live poisoned stream rather than by
+				// re-reading the code — the classification fired perfectly and
+				// the stream still died.
+				//
+				// The shared decision honours --no-auto-resnapshot and the
+				// one-shot-per-Run bound identically, so an unreplayable window
+				// costs at most a single re-copy and a second one stays
+				// terminal.
+				retry, rerr := s.reactiveResnapshotDecision(ctx, invalid, resnapshotted)
+				if !retry {
+					return rerr
+				}
+				resnapshotted = true
+				consecutive = 0
+				continue
 			}
 			return fmt.Errorf("pipeline: apply retry budget exhausted after %d consecutive failures at position %q: %w",
 				consecutive, afterPos.Token, err)
