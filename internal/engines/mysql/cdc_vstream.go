@@ -1245,7 +1245,17 @@ func (r *vstreamCDCReader) pump(
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := r.dispatch(ctx, ev, out); err != nil {
-				r.setErr(err)
+				// Classify DISPATCH errors, not just Recv errors (Bug 207).
+				// Recv failures were routed through classifyReaderError while
+				// everything raised while INTERPRETING an event was stored raw
+				// — so every retriable carve-out the classifier owns
+				// (post-DDL FIELD-cache miss, schema-resolution windows, the
+				// purged-position mapping) was unreachable from here. The
+				// post-DDL miss shipped with a matcher and a green unit test
+				// that called classifyReaderError directly, and was inert in
+				// production because the error never reached it: the test
+				// pinned the function, not the path.
+				r.setErr(classifyReaderError(err))
 				return
 			}
 		}
@@ -1401,8 +1411,59 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 		// reports.
 	}
 
-	clear(r.fields)
+	r.invalidateFieldsForDDL(stmt)
 	return nil
+}
+
+// invalidateFieldsForDDL drops the cached FIELD metadata a DDL could have
+// invalidated — the TARGET table's entries when the statement names one,
+// everything otherwise (Bug 207).
+//
+// The old behaviour was an unconditional blanket clear across every
+// (shard, table). It is safe in the sense that it never decodes against a
+// stale column list, but it WEDGES a keyspace-wide stream: vtgate only
+// re-announces the table whose shape actually changed, so a DDL on ANY table
+// leaves every OTHER table without a cached shape, and the next row event for
+// a long-established table hits the loud floor. Worse, it does not survive a
+// reconnect — the resume replays the same DDL AFTER the fresh FIELD
+// announcements and wipes them again, so the stream dies at the same position
+// forever (reproduced 6/6 against a real vtgate; only a full re-snapshot
+// recovered).
+//
+// Scoping it fixes that, and a parse miss is benign rather than dangerous: if
+// this fails to identify an ALTERed table and leaves a stale entry, vtgate
+// still emits a FIELD event for that table before any row of the new shape —
+// that re-announcement is how a client learns a new shape at all — so the
+// entry is overwritten before it can be misused. The blanket fallback below
+// keeps the conservative behaviour for statements we cannot attribute.
+//
+// [ddlTargetTable] is reused deliberately: it is the same already-shipped,
+// already-tested extractor the Vitess-internal-DDL carve-out uses, and that
+// carve-out exists for precisely this wedge — its comment names the "row event
+// without preceding FIELD event" failure verbatim. This generalises the same
+// idea from internal tables to every attributable DDL.
+func (r *vstreamCDCReader) invalidateFieldsForDDL(stmt string) {
+	target, ok := ddlTargetTable(stmt)
+	if !ok {
+		clear(r.fields)
+		return
+	}
+	// Keys are `shard/keyspace.table` (see fieldCacheKey), so the bare table
+	// name is the segment after the LAST separator of each kind. Compared
+	// case-insensitively and across EVERY shard: a sharded keyspace holds one
+	// entry per (shard, table), and an ALTER changes the shape on all of them.
+	for key := range r.fields {
+		name := key
+		if _, after, found := strings.Cut(name, "/"); found {
+			name = after
+		}
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			name = name[i+1:]
+		}
+		if strings.EqualFold(name, target) {
+			delete(r.fields, key)
+		}
+	}
 }
 
 // maybeSnapshotSchema is the ADR-0049 Chunk B2 boundary path. On

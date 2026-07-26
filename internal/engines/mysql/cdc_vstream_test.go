@@ -2042,3 +2042,66 @@ func TestShardScopedTarget(t *testing.T) {
 		})
 	}
 }
+
+// TestInvalidateFieldsForDDL_ScopesToTheTargetTable pins the Bug 207 fix.
+//
+// The old blanket clear wiped every (shard, table) entry on any DDL, which
+// wedges a keyspace-wide stream: vtgate only re-announces the table whose shape
+// changed, so a DDL on ANY table left every OTHER table without a cached shape
+// and the next row on a long-established table hit the loud floor — and the
+// reconnect could not fix it, because the resume replays the same DDL after the
+// fresh FIELD announcements and wipes them again.
+//
+// Both directions matter. Scoping too little re-introduces the wedge; scoping
+// too much (dropping the blanket fallback for statements we cannot attribute)
+// would leave a genuinely-altered table decoding against a stale column list.
+func TestInvalidateFieldsForDDL_ScopesToTheTargetTable(t *testing.T) {
+	newReader := func() *vstreamCDCReader {
+		return &vstreamCDCReader{fields: map[string][]*query.Field{
+			"0/vtk.t1":   {},
+			"0/vtk.t2":   {},
+			"-80/vtk.t1": {},
+		}}
+	}
+
+	t.Run("CREATE TABLE on t3 keeps every established table's shape", func(t *testing.T) {
+		r := newReader()
+		r.invalidateFieldsForDDL("CREATE TABLE t3 (id BIGINT PRIMARY KEY)")
+		if len(r.fields) != 3 {
+			t.Errorf("cache size = %d; want 3 — a CREATE cannot change an existing table's shape, and dropping them is the wedge", len(r.fields))
+		}
+	})
+
+	t.Run("ALTER TABLE t1 drops t1 on EVERY shard, keeps t2", func(t *testing.T) {
+		r := newReader()
+		r.invalidateFieldsForDDL("ALTER TABLE t1 ADD COLUMN c INT")
+		if _, ok := r.fields["0/vtk.t1"]; ok {
+			t.Error("0/vtk.t1 survived an ALTER on t1 — a stale column list is the silent-corruption case")
+		}
+		if _, ok := r.fields["-80/vtk.t1"]; ok {
+			t.Error("-80/vtk.t1 survived — invalidation must cover every shard's entry for the table")
+		}
+		if _, ok := r.fields["0/vtk.t2"]; !ok {
+			t.Error("0/vtk.t2 was dropped by a DDL that did not touch it — that is the wedge this fix removes")
+		}
+	})
+
+	t.Run("unattributable DDL falls back to the conservative blanket clear", func(t *testing.T) {
+		r := newReader()
+		// Not a CREATE/ALTER/DROP/RENAME TABLE form, so ddlTargetTable refuses
+		// and the safe fallback must fire rather than silently keeping stale
+		// entries.
+		r.invalidateFieldsForDDL("CREATE INDEX idx_x ON t1 (c)")
+		if len(r.fields) != 0 {
+			t.Errorf("cache size = %d; want 0 — an unattributable DDL must clear everything, not be assumed harmless", len(r.fields))
+		}
+	})
+
+	t.Run("empty statement clears everything", func(t *testing.T) {
+		r := newReader()
+		r.invalidateFieldsForDDL("")
+		if len(r.fields) != 0 {
+			t.Errorf("cache size = %d; want 0", len(r.fields))
+		}
+	})
+}

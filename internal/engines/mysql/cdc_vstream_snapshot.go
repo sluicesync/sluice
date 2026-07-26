@@ -2256,7 +2256,11 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := s.dispatchCDCEvent(ctx, ev, out); err != nil {
-				s.setErr(err)
+				// Classify DISPATCH errors here too — the snapshot reader's
+				// twin of the standalone reader's site (Bug 207). Both stored
+				// the raw error, so a retriable dispatch condition exited the
+				// stream with zero retry attempts on either path.
+				s.setErr(classifyReaderError(err))
 				return
 			}
 		}
