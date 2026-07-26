@@ -134,6 +134,29 @@ func classifyReaderError(err error) error {
 			"source vstream could not resolve a table's schema for the replay position (likely a DDL cutover, or the Vitess schema historian / track_schema_versions is off) — retrying from the last position; if it persists, resume from current (cold-start) to skip the unresolvable window: %w", err,
 		)}
 	}
+	// FIELD-cache miss after a DDL boundary (roadmap item 81, observed live
+	// 2026-07-26). dispatchDDL invalidates the field cache with a BLANKET
+	// clear across every (shard, table) — correct and deliberately
+	// conservative, because decoding rows against a stale column list after
+	// an ALTER is silent corruption. But vtgate only re-emits a FIELD event
+	// for the table whose shape actually changed, so the next ROW event on an
+	// UNRELATED table in the same keyspace finds an empty cache and trips the
+	// loud floor in dispatchRow. That is how a `CREATE TABLE` on one table
+	// killed a stream whose fatal error named a DIFFERENT, long-established
+	// table.
+	//
+	// Retriable, not terminal, and NOT a weakening of the floor: nothing here
+	// decodes a row with guessed or stale metadata. A reconnect re-opens the
+	// stream from the last position, where the VStream protocol emits a FIELD
+	// event ahead of the first ROW event for every table in the filter — so
+	// the reader re-learns the CURRENT shape and resumes correctly. If the
+	// FIELD genuinely never arrives, the retry budget still exhausts loudly
+	// rather than looping forever.
+	if isVStreamMissingFieldEventError(err) {
+		return &retriableMySQLError{err: fmt.Errorf(
+			"source vstream sent a row event before the table's FIELD event — the field cache was invalidated by a DDL on the keyspace and this table's shape has not been re-announced yet; reconnecting from the last position to re-learn it: %w", err,
+		)}
+	}
 	// GRACEFUL HTTP/2 DRAIN (roadmap item 79, observed live 2026-07-24). The
 	// server sent a GOAWAY carrying ErrCode=NO_ERROR — "this connection is
 	// going away, reconnect" — which on PlanetScale accompanies routine
@@ -248,6 +271,23 @@ func isVStreamSchemaResolutionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return (strings.Contains(msg, "unknown table") && strings.Contains(msg, "in schema")) ||
 		strings.Contains(msg, "no schema found for table")
+}
+
+// isVStreamMissingFieldEventError reports whether err is the
+// "row event … without preceding FIELD event" shape raised by
+// [vstreamCDCReader.dispatchRow] (and its concurrent-COPY twin) when the
+// field cache has no entry for a ROW event's (shard, table).
+//
+// Matched on BOTH fragments together, never on either alone: "field event"
+// appears in unrelated diagnostics, and "row event" is generic. Kept as a
+// named helper — not inlined — so the wording set is pinned by
+// [TestClassifyReaderError_MissingFieldEvent]; a message change then fails
+// the pin rather than silently reverting this to TERMINAL and re-introducing
+// the item-81 stream kill.
+func isVStreamMissingFieldEventError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "row event for") &&
+		strings.Contains(msg, "without preceding field event")
 }
 
 // isMariaDBPurgedGTIDError reports whether err is MariaDB's domain-GTID

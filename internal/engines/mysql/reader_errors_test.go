@@ -433,3 +433,74 @@ func TestClassifyReaderError_GracefulGoAway(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyReaderError_MissingFieldEvent pins roadmap item 81: a ROW event
+// arriving before its table's FIELD event must be RETRIABLE, not terminal.
+//
+// The mechanism (verified by code-reading against a live production kill):
+// dispatchDDL invalidates the field cache with a BLANKET clear across every
+// (shard, table), but vtgate only re-emits a FIELD event for the table whose
+// shape actually changed. So a DDL on one table leaves every OTHER table in
+// the keyspace with an empty cache entry, and the next ROW event on a
+// long-established table trips the loud floor — which is why the observed
+// fatal named a different table than the DDL touched.
+//
+// Retrying is safe precisely because nothing decodes with guessed metadata: a
+// reconnect re-opens at the last position, where VStream emits a FIELD event
+// ahead of the first ROW event per table, so the reader re-learns the CURRENT
+// shape. The near-miss cases below keep that carve-out from widening into
+// "any row-event complaint is transient".
+func TestClassifyReaderError_MissingFieldEvent(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{
+			// The verbatim production shape that killed the soak231 stream.
+			"verbatim: dispatchRow floor",
+			errors.New(`mysql/vstream: row event for "-/soak-mysql231.soak_events" without preceding FIELD event`),
+			true,
+		},
+		{
+			// The concurrent-COPY twin raises the same class from a different
+			// call site; it must classify identically.
+			"concurrent COPY twin",
+			errors.New(`mysql/vstream: snapshot: concurrent COPY: row event for "orders" without preceding FIELD event`),
+			true,
+		},
+		{
+			// Near-miss: "field event" alone must NOT make an unrelated error
+			// retriable.
+			"unrelated mention of a field event stays terminal",
+			errors.New("mysql/vstream: malformed field event payload: bad wire type"),
+			false,
+		},
+		{
+			// Near-miss: a generic row-event complaint is not this shape.
+			"generic row-event error stays terminal",
+			errors.New("mysql/vstream: row event decode failed: unsupported column type"),
+			false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", c.err)
+			got := classifyReaderError(wrapped)
+			var re ir.RetriableError
+			if gotRetriable := errors.As(got, &re); gotRetriable != c.retriable {
+				t.Errorf("retriable=%v, want %v (got %v)", gotRetriable, c.retriable, got)
+			}
+			if !errors.Is(got, c.err) {
+				t.Error("classifyReaderError lost the underlying error from the chain")
+			}
+			// A DDL-boundary cache miss must resume from the SAME position —
+			// routing it to ErrPositionInvalid would turn a free reconnect
+			// into a full cold-start re-copy.
+			if errors.Is(got, ir.ErrPositionInvalid) {
+				t.Error("classified as ErrPositionInvalid; a FIELD-cache miss must resume from the same position, never force a re-snapshot")
+			}
+		})
+	}
+}
