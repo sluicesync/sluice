@@ -4,6 +4,32 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.102.1] - 2026-07-26
+
+Two ways a continuous sync could stop and stay stopped are now self-healing — and one of them is a correction: the schema-change fix announced in v0.101.0 did not work. Drop-in upgrade, no breaking changes, no flag changes.
+
+### Corrected
+
+**v0.101.0 claimed a schema change on the keyspace no longer kills the stream. It did not — the fix was inert, and the stream also wedged.** Testing against a real vtgate after that release showed a `CREATE TABLE` on any table still killed a keyspace-wide sync with `row event for … without preceding FIELD event` — naming a different, long-established table — and **with zero retry attempts**; three consecutive warm resumes then died at the same position while the source advanced. Two independent defects were in the way, and both are fixed here.
+
+*Reachability:* `classifyReaderError` was applied only to `grpcStream.Recv()` failures, while anything raised while INTERPRETING an event was stored raw via `setErr`. The post-DDL FIELD-cache miss is raised on the dispatch path, so the retriable arm shipped in v0.101.0 could never engage. It went out with a passing unit test that called `classifyReaderError` directly — the test pinned the FUNCTION, not the PATH. Every other carve-out that classifier owns (schema-resolution windows, the purged-position mapping) was equally unreachable from dispatch; both call sites — the standalone reader and its snapshot twin — now classify.
+
+*Recovery:* reachability alone was not sufficient, and the reproduction proved it — retries fired and the stream still died at the same position forever, because a warm resume replays the same DDL AFTER the fresh FIELD announcements and the blanket cache clear wipes them again. `dispatchDDL` now invalidates only the DDL's target table (every shard's entry for it), falling back to the blanket clear for statements it cannot attribute. Scoping is safe because vtgate emits a FIELD event for an altered table before any row of the new shape — that announcement is how a client learns a new shape at all — so a stale entry is overwritten before it can be misused, and a parse miss degrades to the previous behaviour rather than to a wrong decode. The extractor reused is the same already-shipped one behind the Vitess-internal-DDL carve-out, which exists for precisely this wedge and names it verbatim in its comment.
+
+Verified against a deterministic repro on a real vtgate: before, the post-DDL row on a long-established table never applied (src 5 / dst 4) and three warm resumes died at the same position; after, the row applies (5/5) and all three resumes return live with zero retries.
+
+### Fixed
+
+**A dropped table no longer strands a stream permanently.** A table dropped while a sync is stopped can leave the persisted position inside a window whose events reference a relation that no longer exists; Vitess cannot build a replication plan for it, so every resume failed identically and exhausted its retry budget. The stream was unrecoverable without manual intervention, and the terminal message named neither the cause nor the remedy even though the retry lines had been printing both.
+
+Retrying first is unchanged and still correct — the same classifier wording also covers a transient DDL-cutover window where the Vitess schema historian is catching up, and the two are indistinguishable at first failure. What changed is the terminal disposition: budget exhaustion is the point at which the window is demonstrably unreplayable, which is semantically a purged position, so it now carries `ir.ErrPositionInvalid` and is routed through the same ADR-0093 decision a reactive purged position takes — an automatic cold-start re-snapshot, or a loud refusal with the recovery commands under `--no-auto-resnapshot`. The one-shot-per-Run bound is honoured, so an unreplayable window costs at most a single re-copy.
+
+The first cut of this fix wrapped the error with the sentinel and *returned* it, which exits past the resnapshot handler at the head of the retry loop: an accurate diagnosis and still no recovery. That was caught by running against a live poisoned stream rather than by re-reading the code. Validated end to end on the soak that produced the bug — after three failed manual relaunches it emitted the auto-resnapshot WARN, re-copied 262,740 rows, and entered CDC mode with no operator action.
+
+### Compatibility
+
+No breaking changes, no flag changes, drop-in upgrade. Both fixes only convert previously-fatal conditions into recoveries, so a stream that never met them behaves identically. The scoped FIELD invalidation is strictly narrower than the previous blanket clear and falls back to it for unattributable statements. The unreplayable-window recovery honours `--no-auto-resnapshot` exactly as the existing expired-position path does.
+
 ## [0.102.0] - 2026-07-26
 
 `sluice metrics-watch` grows from a per-database alerter into an org-wide fleet collector: point it at an organization and it watches every database and branch, with a persistent sample sink so keeping the history no longer means standing up Prometheus. Drop-in upgrade, no breaking changes; single-database mode is byte-for-byte unchanged.
