@@ -393,6 +393,33 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		}
 
 		if consecutive >= attempts {
+			// Roadmap item 82. A VStream "cannot resolve the table's schema for
+			// the replay position" is retried above because it is genuinely
+			// AMBIGUOUS at first failure: the same wording covers a transient
+			// DDL-cutover window (the Vitess schema historian catches up and
+			// the next attempt succeeds) AND a permanently unreplayable one
+			// (the window references a relation that has since been DROPPED —
+			// no retry can ever build that plan). Exhausting the budget is what
+			// disambiguates them: N consecutive failures on the same position
+			// means the window is not coming back.
+			//
+			// At that point the condition is semantically a purged position, so
+			// it gets the purged position's disposition — ir.ErrPositionInvalid,
+			// which the streamer routes to the ADR-0093 cold-start re-snapshot,
+			// or refuses loudly with the recovery commands under
+			// --no-auto-resnapshot. That reuses a shipped, documented recovery
+			// instead of exiting on a generic budget message whose text drops
+			// the very remedy the retry lines had been printing all along.
+			//
+			// Deliberately gated on EXHAUSTION, never on first sight: routing a
+			// transient cutover window to a full re-copy would be a large,
+			// silent cost for a condition that clears itself in seconds.
+			if isUnreplayableWindowError(err) {
+				return fmt.Errorf(
+					"pipeline: the source's replay window at position %q is unreplayable — %d consecutive attempts failed to resolve a table's schema there, which on a Vitess source means the window references a table that no longer exists (a DROP while this stream was stopped, or a DDL the schema historian cannot reconstruct). The persisted position cannot advance past it: %w (%w)",
+					afterPos.Token, consecutive, ir.ErrPositionInvalid, err,
+				)
+			}
 			return fmt.Errorf("pipeline: apply retry budget exhausted after %d consecutive failures at position %q: %w",
 				consecutive, afterPos.Token, err)
 		}
@@ -537,4 +564,27 @@ func computeRetryBackoff(attempt int, base, maxBackoff, hint time.Duration) time
 		b = maxBackoff
 	}
 	return b
+}
+
+// isUnreplayableWindowError reports whether err is the VStream
+// "could not resolve a table's schema for the replay position" shape — the
+// condition the MySQL engine's reader classifier already recognises and
+// retries (isVStreamSchemaResolutionError), surfaced here so the RETRY-BUDGET
+// EXHAUSTION path can give it a better terminal disposition than a generic
+// "budget exhausted" (roadmap item 82).
+//
+// Matched on the engine classifier's own operator-facing wording rather than
+// the raw Vitess text beneath it. That is deliberate: the underlying strings
+// ("failed to build table replication plan for table X", "failed to parse
+// transaction payload's internal event") are vtgate-authored and have already
+// varied across Vitess majors, whereas the wrapper is sluice's and changes
+// only when we change it. Pinned by TestIsUnreplayableWindowError so a reword
+// of that wrapper fails the test rather than silently reverting this to the
+// generic exit.
+func isUnreplayableWindowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "could not resolve a table's schema for the replay position")
 }

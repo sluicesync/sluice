@@ -322,3 +322,64 @@ func TestComputeRetryBackoff_TinyBase(t *testing.T) {
 		t.Errorf("attempt 2 = %v; want 20ms", got)
 	}
 }
+
+// TestIsUnreplayableWindowError pins roadmap item 82's terminal disposition.
+//
+// The condition is AMBIGUOUS at first failure — the same VStream wording covers
+// a transient DDL-cutover window (the schema historian catches up) and a
+// permanently unreplayable one (the window references a DROPPED table). Retrying
+// is therefore correct, and only budget EXHAUSTION disambiguates them. At that
+// point the window is semantically a purged position, so it must carry
+// ir.ErrPositionInvalid and get the ADR-0093 cold-start recovery rather than a
+// generic "budget exhausted" whose text drops the remedy the retry lines printed.
+//
+// The matcher deliberately keys on sluice's own operator-facing wrapper, not the
+// vtgate text beneath it (which has varied across Vitess majors). This pin is
+// what makes a reword of that wrapper fail loudly instead of silently reverting
+// the disposition.
+func TestIsUnreplayableWindowError(t *testing.T) {
+	// The verbatim wrapper the MySQL reader classifier emits.
+	const wrapper = "source vstream could not resolve a table's schema for the replay position " +
+		"(likely a DDL cutover, or the Vitess schema historian / track_schema_versions is off) — " +
+		"retrying from the last position; if it persists, resume from current (cold-start) to skip the unresolvable window"
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			"verbatim classifier wrapper, as wrapped by the pipeline",
+			fmt.Errorf("pipeline: source cdc reader: %s: %w", wrapper,
+				errors.New(`rpc error: code = Unknown desc = failed to build table replication plan for table dropped_t`)),
+			true,
+		},
+		{
+			"bare wrapper",
+			errors.New(wrapper),
+			true,
+		},
+		{
+			// The raw vtgate text ALONE must not match: it is peer-authored and
+			// has varied by Vitess major, so keying on it would be brittle in
+			// the direction that silently loses the disposition.
+			"raw vtgate text without the wrapper stays unmatched",
+			errors.New("failed to build table replication plan for table dropped_t"),
+			false,
+		},
+		{
+			"an unrelated exhausted-budget cause stays unmatched",
+			errors.New("pipeline: source cdc reader: dial tcp: i/o timeout"),
+			false,
+		},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := isUnreplayableWindowError(c.err); got != c.want {
+				t.Errorf("isUnreplayableWindowError = %v; want %v", got, c.want)
+			}
+		})
+	}
+}
