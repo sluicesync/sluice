@@ -7,16 +7,34 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
 
 // captureHandler records slog records at WARN+ for assertion.
-type captureHandler struct{ records *[]slog.Record }
+//
+// MUST be goroutine-safe. It is installed with [slog.SetDefault]
+// (swapDefaultLogger), which makes it PROCESS-GLOBAL for as long as it is
+// current — so every goroutine in the package that logs anything routes
+// through this one handler, not just the test that installed it. That
+// includes background goroutines outliving the test that spawned them: the
+// `-race` job caught `runAutoPruneTick`'s ticker (streamer_auto_prune.go)
+// logging concurrently with a test's own WARN and racing the unsynchronised
+// append. The race was in the test harness, not the product, but it fails the
+// build all the same and it is inherently timing-dependent — CGO is off on the
+// usual dev machine, so `-race` only runs in CI and a fix cannot be verified
+// locally.
+type captureHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	*h.records = append(*h.records, r)
 	return nil
 }
@@ -229,11 +247,12 @@ func TestWarnFloatDisplayRounding(t *testing.T) {
 	warnFloatDisplayRounding(context.Background(), plan, false)
 	restore()
 
-	if len(recs) != 3 {
-		t.Fatalf("want 3 WARNs (a.fl + b.x + b.y), got %d", len(recs))
+	got := readCaptured(&recs)
+	if len(got) != 3 {
+		t.Fatalf("want 3 WARNs (a.fl + b.x + b.y), got %d", len(got))
 	}
 	byCol := map[string]slog.Record{}
-	for _, r := range recs {
+	for _, r := range got {
 		if r.Level != slog.LevelWarn {
 			t.Errorf("record level = %v; want WARN", r.Level)
 		}
@@ -257,16 +276,38 @@ func TestWarnFloatDisplayRounding(t *testing.T) {
 	restore2 := swapDefaultLogger(&recs2)
 	warnFloatDisplayRounding(context.Background(), plan[:1], true)
 	restore2()
-	if len(recs2) != 1 {
-		t.Fatalf("want 1 WARN, got %d", len(recs2))
+	got2 := readCaptured(&recs2)
+	if len(got2) != 1 {
+		t.Fatalf("want 1 WARN, got %d", len(got2))
 	}
-	if !strings.Contains(recs2[0].Message, "DISABLED") {
-		t.Errorf("disabled-repair message should name the disabled repair: %q", recs2[0].Message)
+	if !strings.Contains(got2[0].Message, "DISABLED") {
+		t.Errorf("disabled-repair message should name the disabled repair: %q", got2[0].Message)
 	}
 }
 
+// swapDefaultLogger installs the capture handler as the process-wide default
+// and returns the restore func. Callers that read *sink afterwards must do so
+// through [readCaptured], not directly: a background goroutine can still be
+// logging into it at the moment of the read, and the whole point of the mutex
+// is defeated by an unguarded read on the assertion side.
 func swapDefaultLogger(sink *[]slog.Record) func() {
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: sink}))
+	slog.SetDefault(slog.New(captureHandler{mu: &captureMu, records: sink}))
 	return func() { slog.SetDefault(prev) }
+}
+
+// captureMu guards every capture sink. One shared mutex rather than one per
+// handler is correct here and simpler: only one capture handler is installed at
+// a time (slog.SetDefault is global), so there is no contention to spread, and
+// a single lock cannot be forgotten by a future second construction site.
+var captureMu sync.Mutex
+
+// readCaptured returns a snapshot of the captured records under the same lock
+// the handler writes with. Tests assert against the snapshot.
+func readCaptured(sink *[]slog.Record) []slog.Record {
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	out := make([]slog.Record, len(*sink))
+	copy(out, *sink)
+	return out
 }
