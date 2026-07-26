@@ -924,7 +924,28 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
-### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *confirmed; severity + ownership not yet established*
+### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *confirmed Vitess-side; sluice already classifies + prints the remedy, but the TERMINAL disposition is wrong*
+
+**⚠️ CORRECTION 2026-07-26 (the first filing above overstated the gap).** Reading the full log rather than the fatal line alone shows sluice **already recognises this shape and already prints the remedy**. The condition is caught by `isVStreamSchemaResolutionError` and classified RETRIABLE, and every retry logs:
+
+```
+source vstream could not resolve a table's schema for the replay position (likely a DDL
+cutover, or the Vitess schema historian / track_schema_versions is off) — retrying from
+the last position; if it persists, resume from current (cold-start) to skip the
+unresolvable window
+```
+
+So "tells an operator neither the cause nor the way out" — as first filed — is **wrong**: the INFO lines state both, including the exact recovery. What actually happens is narrower:
+
+1. The shape is classified retriable, which is CORRECT — the same wording covers a genuinely transient DDL-cutover window where the Vitess schema historian is catching up and the next attempt succeeds.
+2. It retries the configured 8 attempts with backoff, each logging the remedy.
+3. On exhaustion it exits with a **generic** `apply retry budget exhausted after N consecutive failures at position …`, which carries the underlying Vitess text but NOT the remedy the retry lines were printing. The operator's last message before exit is the least useful one.
+
+**Revised finding, and the fix that follows.** The retry-then-exit behaviour is right for the transient case and wrong only for the permanent one, and the two are indistinguishable at first failure — which is exactly why retrying first is correct. What is missing is the *terminal* disposition: once this specific shape has exhausted its budget, the window is demonstrably unreplayable, which is semantically identical to a purged GTID. sluice already has machinery for that: classify as [ir.ErrPositionInvalid] and the streamer routes to the ADR-0093 cold-start re-snapshot (or, under `--no-auto-resnapshot`, refuses loudly with the recovery commands instead of re-copying). That would have auto-recovered the affected soak with no operator intervention, and it reuses a documented, already-shipped recovery path rather than inventing one.
+
+The cheaper half — carry the remedy text into the terminal error so the last line an operator reads names the two exits — is worth doing regardless and is nearly free.
+
+**What this does NOT change:** the underlying replay really is impossible (the Vitess-side plan cannot be built for a window referencing a dropped relation), the exposure is still ordinary (`DROP TABLE` on a keyspace-wide sync, the default shape), and the stream is still permanently down until someone acts. Only the characterisation of sluice's handling was overstated.
 
 **What happened.** A table was created on a PlanetScale (Vitess 22) keyspace with a live keyspace-wide sync attached, written to, and then dropped. Every subsequent warm resume of that stream fails identically and exhausts its retry budget:
 
