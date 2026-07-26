@@ -38,10 +38,10 @@ If you want a "platform check" gate before merging a particular PR (e.g. a PR th
 ### Other
 
 - **Require conversation resolution before merging:** on
-- **Require linear history:** on (recommended) — disallows merge commits, forcing rebase-and-merge or squash-and-merge. Keeps `git log --oneline` readable.
+- **Require linear history:** on (recommended) — nominally disallows merge commits, forcing rebase-and-merge or squash-and-merge. Keeps `git log --oneline` readable. **In practice this rule is BYPASSABLE on push** and has been bypassed every time it came up: a `git merge` pushed to `main` reports `Bypassed rule violations … This branch must not contain merge commits` and lands anyway. History carries 4 merge commits as of 2026-07-26. Treat it as a preference to rebase, not a guarantee that `main` is linear.
 - **Require signed commits:** off (worth turning on later if you adopt signed commits across the project)
 - **Include administrators:** on — applies the same rules to repo admins, which prevents accidental direct pushes to `main`.
-- **Allow force pushes:** off
+- **Allow force pushes:** off — and unlike the linear-history rule, this one is **absolute**: a force-push to `main` is refused outright (`Cannot force-push to this branch … protected branch hook declined`), with no bypass. The consequence worth knowing before you need it: **a merge commit that lands on `main` cannot be rewritten away.** The rule that would have stopped it is soft; the rule that would let you undo it is hard. Accept it, or relax the protection in the UI deliberately — do not burn time on a repair the server will not accept.
 - **Allow deletions:** off
 
 ## Recommended rules for tags
