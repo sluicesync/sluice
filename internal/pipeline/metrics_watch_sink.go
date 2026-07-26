@@ -55,6 +55,15 @@ func sampleRecord(now time.Time, label, database, branch string, snap ir.TargetH
 		rec.StorageAvailableBytes = ptrOf(snap.StorageAvailableBytes)
 		rec.StorageCapacityBytes = ptrOf(snap.StorageCapacityBytes)
 	}
+	// Guarded by its OWN flag, not StorageKnown: the primary's figures and the
+	// worst pod's are independently observable (the primary can resolve while
+	// the per-pod reduction cannot, and vice versa), so gating both on one flag
+	// would silently drop a signal that was actually read.
+	if snap.StorageWorstKnown {
+		rec.StorageUtilWorst = ptrOf(snap.StorageUtilWorst)
+		rec.StorageAvailableWorstBytes = ptrOf(snap.StorageAvailableWorstBytes)
+		rec.StorageCapacityWorstBytes = ptrOf(snap.StorageCapacityWorstBytes)
+	}
 	if snap.LagKnown {
 		rec.ReplicaLagSeconds = ptrOf(snap.ReplicaLagSeconds)
 	}

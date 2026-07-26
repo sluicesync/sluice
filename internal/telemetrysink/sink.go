@@ -86,9 +86,17 @@ type Record struct {
 	StorageUtil           *float64 `json:"storage_util"`
 	StorageAvailableBytes *int64   `json:"storage_available_bytes"`
 	StorageCapacityBytes  *int64   `json:"storage_capacity_bytes"`
-	ReplicaLagSeconds     *float64 `json:"replica_lag_seconds"`
-	ActiveConnections     *int64   `json:"active_connections"`
-	MaxConnections        *int64   `json:"max_connections"`
+	// Worst-POD storage: the fullest pod of the branch, a SEPARATE signal
+	// from the primary's above (on managed Postgres the replicas run fuller,
+	// so an alert reading only the primary misses the pod that fills first).
+	// Nullable like every other metric, so an unobserved reading is an
+	// explicit null rather than a zero that reads as "empty volume".
+	StorageUtilWorst           *float64 `json:"storage_util_worst"`
+	StorageAvailableWorstBytes *int64   `json:"storage_available_worst_bytes"`
+	StorageCapacityWorstBytes  *int64   `json:"storage_capacity_worst_bytes"`
+	ReplicaLagSeconds          *float64 `json:"replica_lag_seconds"`
+	ActiveConnections          *int64   `json:"active_connections"`
+	MaxConnections             *int64   `json:"max_connections"`
 }
 
 // Sink is one persistent-sample destination. Write persists a batch (one
@@ -183,6 +191,7 @@ func EncodeRecord(r Record) ([]byte, error) {
 		{"cpu_util", r.CPUUtil},
 		{"mem_util", r.MemUtil},
 		{"storage_util", r.StorageUtil},
+		{"storage_util_worst", r.StorageUtilWorst},
 		{"replica_lag_seconds", r.ReplicaLagSeconds},
 	} {
 		if f.value == nil {

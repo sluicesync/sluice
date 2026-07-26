@@ -412,3 +412,52 @@ func (r *recordingSink) Write(_ context.Context, recs []Record) error {
 	r.writes = append(r.writes, recs)
 	return nil
 }
+
+// TestRecord_CarriesWorstPodStorage pins that the persisted sink record carries
+// the worst-POD storage family, and that it is guarded by its OWN flag.
+//
+// Why this pin exists: the fleet exporter and this record were both written
+// before the worst-pod signal landed in the single-database exporter, so
+// merging left them silently missing it — a metric present in one mode and
+// absent in another, which is the "fixed the representative, missed the
+// sibling" shape. The reflection ratchet over this struct could not catch it:
+// it proves every RECORD field is validated, not that the record covers every
+// snapshot field.
+func TestRecord_CarriesWorstPodStorage(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	i := func(v int64) *int64 { return &v }
+	rec := Record{
+		At: time.Unix(1, 0).UTC(), Watch: "w", Database: "db", Branch: "main", Fresh: true,
+		StorageUtil: f(0.5), StorageAvailableBytes: i(1 << 30), StorageCapacityBytes: i(1 << 31),
+		StorageUtilWorst: f(0.75), StorageAvailableWorstBytes: i(1 << 29), StorageCapacityWorstBytes: i(1 << 31),
+	}
+	b, err := EncodeRecord(rec)
+	if err != nil {
+		t.Fatalf("EncodeRecord: %v", err)
+	}
+	for _, want := range []string{
+		`"storage_util_worst":0.75`,
+		`"storage_available_worst_bytes":536870912`,
+		`"storage_capacity_worst_bytes":2147483648`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("encoded record omits %s\ngot: %s", want, b)
+		}
+	}
+
+	// Independently observable: the primary can resolve while the per-pod
+	// reduction cannot. A record carrying only the primary must still encode
+	// the worst-pod keys as explicit nulls, never as zeros that would read as
+	// "the volume is empty".
+	onlyPrimary := Record{
+		At: time.Unix(1, 0).UTC(), Watch: "w", Database: "db", Branch: "main", Fresh: true,
+		StorageUtil: f(0.5),
+	}
+	b2, err := EncodeRecord(onlyPrimary)
+	if err != nil {
+		t.Fatalf("EncodeRecord(onlyPrimary): %v", err)
+	}
+	if !strings.Contains(string(b2), `"storage_util_worst":null`) {
+		t.Errorf("unobserved worst-pod storage must encode as explicit null, not be omitted or zeroed\ngot: %s", b2)
+	}
+}

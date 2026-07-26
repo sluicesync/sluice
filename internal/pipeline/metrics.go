@@ -761,6 +761,34 @@ func fleetGaugeFamilies() []fleetGaugeFamily {
 				return strconv.FormatInt(s.StorageCapacityBytes, 10), s.StorageKnown
 			},
 		},
+		// The worst-POD storage family (distinct from fleetWorst, which is the
+		// worst DATABASE across the fleet — same word, different axis). Fleet
+		// mode must export these for the same reason single-database mode
+		// does: on managed Postgres the replicas run fuller than the primary,
+		// so a storage alert reading only the primary is blind to the pod that
+		// fills first. Omitting them here would ship a fleet exporter silently
+		// missing a signal its single-database sibling has.
+		{
+			name: "sluice_target_storage_util_worst",
+			help: "Storage utilisation of the FULLEST pod of the target branch as a fraction in [0,1] — the pod that reaches its ceiling first, which is not reliably the primary. Separate series from sluice_target_storage_util (the primary's), never a replacement for it.",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.StorageUtilWorst), s.StorageWorstKnown
+			},
+		},
+		{
+			name: "sluice_target_storage_available_worst_bytes",
+			help: "Storage bytes still available on the FULLEST pod of the target branch.",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.FormatInt(s.StorageAvailableWorstBytes, 10), s.StorageWorstKnown
+			},
+		},
+		{
+			name: "sluice_target_storage_capacity_worst_bytes",
+			help: "Volume capacity in bytes of the FULLEST pod of the target branch.",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.FormatInt(s.StorageCapacityWorstBytes, 10), s.StorageWorstKnown
+			},
+		},
 		{
 			name: "sluice_target_replica_lag_seconds",
 			help: "Target replica lag in seconds from the control-plane telemetry provider (ADR-0107).",

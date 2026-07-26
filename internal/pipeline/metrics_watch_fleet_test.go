@@ -339,6 +339,14 @@ func TestMetricsDocSync_FleetExporter(t *testing.T) {
 		CPUUtil:   0.5, CPUKnown: true,
 		MemUtil: 0.5, MemKnown: true,
 		StorageUtil: 0.5, StorageAvailableBytes: 1 << 30, StorageCapacityBytes: 1 << 31, StorageKnown: true,
+		// The worst-POD family must be ENABLED here or this gate cannot see
+		// it: the exporter emits a family only when some target reports it
+		// known, so a fixture leaving the flag false lets new series ship both
+		// undocumented and unpinned — the exact drift this test exists to
+		// catch, and the same fixture blind spot the single-database doc-sync
+		// gate had. Deliberately fuller than the primary above, mirroring the
+		// live PS-PG shape that motivated the signal.
+		StorageUtilWorst: 0.75, StorageAvailableWorstBytes: 1 << 29, StorageCapacityWorstBytes: 1 << 31, StorageWorstKnown: true,
 		ReplicaLagSeconds: 1.5, LagKnown: true,
 		ActiveConnections: 3, MaxConnections: 100, ConnKnown: true,
 	}
@@ -355,7 +363,7 @@ func TestMetricsDocSync_FleetExporter(t *testing.T) {
 	}
 	// Vacuity guard: 8 target gauges + 2 fleet gauges. Adding a fleet metric
 	// moves this number, which forces the doc update below.
-	const wantSeries = 10
+	const wantSeries = 13
 	if len(names) != wantSeries {
 		t.Fatalf("fleet exporter emitted %d distinct series, want %d — if a metric was added/removed, update docs/operator/running-as-a-service.md and this count together: %v", len(names), wantSeries, names)
 	}
