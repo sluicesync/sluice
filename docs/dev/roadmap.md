@@ -924,6 +924,29 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
+### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *confirmed; severity + ownership not yet established*
+
+**What happened.** A table was created on a PlanetScale (Vitess 22) keyspace with a live keyspace-wide sync attached, written to, and then dropped. Every subsequent warm resume of that stream fails identically and exhausts its retry budget:
+
+```
+sluice: error: pipeline: apply retry budget exhausted after 8 consecutive failures
+  at position "[{\"keyspace\":\"soak-mysql231\",\"shard\":\"-\",\"gtid\":\"MySQL56/…\"}]"
+    failed to build table replication plan for table item80_regions
+    failed to parse transaction payload's internal event
+```
+
+Reproduced three times across separate relaunches, hours apart: the stream starts, logs `warm resume from persisted position`, engages the apply lanes, then fails the same way and exits. **It is not a transient and it does not age out** — the persisted position points into a GTID window whose events reference a relation that no longer exists, so the plan can never be built for that window.
+
+**Distinct from item 81, and worse.** Item 81 (a `CREATE TABLE` blanket-clearing the FIELD cache) is recoverable: a reconnect re-learns the shapes and the stream continues, which is why the fix there was to make the miss retriable. This one is **not recoverable by reconnect at all** — retrying is exactly what fails, eight times, before the budget gives up. The only exits are resume-from-current (skipping the window, and whatever real changes it contained) or a full cold start.
+
+**Ownership is NOT established and must not be assumed.** The wording (`failed to build table replication plan`, `failed to parse transaction payload's internal event`) reads like Vitess/vstreamer text rather than sluice's own, which would make this a vtgate limitation that sluice merely surfaces. If so, the sluice-side work is classification and remedy rather than a fix: today it presents as a generic exhausted retry budget, which tells an operator nothing about the cause or the way out. A coded refusal naming the dropped table and the two recovery paths would be a large improvement even if the underlying replay is genuinely impossible.
+
+**Severity, stated carefully.** Loud and zero-loss in the sense that nothing is silently mis-applied and the position is intact — but the stream is **permanently down** until an operator intervenes, and the intervention is either data-skipping or a full re-copy. `DROP TABLE` on a keyspace with a live sync is an ordinary operation, and keyspace-wide is the default stream shape (`--include-table` is opt-in), so exposure is not exotic. This is a worse operational outcome than either item 79 or item 81, both of which self-heal once classified correctly.
+
+**How it was found (and the caveat that comes with it).** As collateral from the item-80 verification: a test table was created on a live soak's source, used, and dropped. So the trigger is confirmed, but the surrounding conditions were not controlled — a second stream was reading the same keyspace at the time, and the DDL sequence was CREATE → INSERT → DROP in close succession. Before designing a fix, reproduce deliberately on a disposable Vitess source: single stream, plain CREATE → INSERT → DROP, and establish whether the poison requires the writes, the drop, or both.
+
+**Interim operator guidance worth documenting regardless of the fix:** if a table is dropped on a source with a live sync and the stream then refuses to resume, the position is unrecoverable for that window — resume from current if the gap is acceptable, otherwise cold start. Do not simply keep restarting; the retry budget will exhaust every time.
+
 ### 81. A mid-stream `CREATE TABLE` killed a keyspace-wide VStream with "row event without preceding FIELD event" (observed 2026-07-26) — *✅ ROOT-CAUSED + FIXED 2026-07-26: blanket FIELD-cache clear vs per-table FIELD re-emit; the miss is now retriable*
 
 **✅ ROOT-CAUSED AND FIXED 2026-07-26 — the mechanism explains the one detail that looked wrong.** No cluster boot was needed: the production error itself is the proof. `dispatchDDL` (`internal/engines/mysql/cdc_vstream.go`) invalidates the FIELD cache with a **blanket `clear(r.fields)`** across every `(shard, table)` pair — deliberately conservative, and correct as a safety measure, because decoding rows against a stale column list after an `ALTER` is silent corruption. But **vtgate only re-emits a FIELD event for the table whose shape actually changed.** An unrelated table in the same keyspace has no reason to be re-announced, so its next ROW event finds an empty cache entry and trips the loud floor in `dispatchRow`.
