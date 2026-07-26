@@ -251,7 +251,30 @@ func runMetricsNotifyTick(
 	now func() time.Time,
 ) {
 	snap, ok := provider.Sample(ctx)
-	if !ok || !snap.Fresh(now(), telemetryFreshnessWindow) {
+	if !ok {
+		return
+	}
+	deliverMetricsNotifyTick(ctx, logger, snap, notifier, streamID, rules, state, cooldown, now)
+}
+
+// deliverMetricsNotifyTick is the second half of [runMetricsNotifyTick],
+// split out so a caller that ALREADY holds a snapshot (the org-wide fleet
+// watch, which reads every target in one call) evaluates and delivers
+// through exactly the same freshness check, evaluator, and failure-isolated
+// fan-out. Semantics are identical to the single-provider path by
+// construction.
+func deliverMetricsNotifyTick(
+	ctx context.Context,
+	logger *slog.Logger,
+	snap ir.TargetHealthSnapshot,
+	notifier notify.Notifier,
+	streamID string,
+	rules []metricsNotifyRule,
+	state *metricsNotifyState,
+	cooldown time.Duration,
+	now func() time.Time,
+) {
+	if !snap.Fresh(now(), telemetryFreshnessWindow) {
 		// No usable / stale signal — don't evaluate (a stale poll must not
 		// fire a spurious alert or re-arm a latched one).
 		return

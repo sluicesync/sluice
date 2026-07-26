@@ -37,6 +37,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -646,6 +647,141 @@ func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHeal
 		fmt.Fprintln(w, "# HELP sluice_target_max_connections Target maximum connection budget from the control-plane telemetry provider (ADR-0107).")
 		fmt.Fprintln(w, "# TYPE sluice_target_max_connections gauge")
 		fmt.Fprintf(w, `sluice_target_max_connections{stream_id=%q} %d`+"\n", streamID, snap.MaxConnections)
+	}
+}
+
+// emitFleetTelemetryMetrics renders the ORG-WIDE (roadmap item 75b) view of
+// the sluice_target_* family: the same gauges [emitTargetTelemetryMetrics]
+// exports for one database, but one series per watched database+branch,
+// labelled `database` + `branch` so a single Grafana dashboard covers the
+// whole org.
+//
+// It is a separate emitter rather than a loop over the single-target one for
+// a load-bearing reason: Prometheus exposition allows exactly ONE `# HELP`/
+// `# TYPE` block per metric NAME, so the fan-out has to group by metric and
+// emit the header once, then every target's series. Calling the per-target
+// emitter N times would produce N duplicate HELP lines — text a strict
+// scraper rejects outright.
+//
+// The honesty contract is unchanged and now applies per target: a target
+// with no fresh sample, or a metric that target's provider did not observe,
+// contributes NO series rather than a misleading 0. Two fleet-level gauges
+// make that absence legible instead of ambiguous — sluice_fleet_targets
+// (discovered) and sluice_fleet_targets_observed (with a fresh sample).
+func emitFleetTelemetryMetrics(w io.Writer, samples []ir.FleetHealthSample) {
+	observed := 0
+	for _, s := range samples {
+		if s.OK {
+			observed++
+		}
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_fleet_targets Number of database+branch targets discovered by the org-wide metrics watch.")
+	fmt.Fprintln(w, "# TYPE sluice_fleet_targets gauge")
+	fmt.Fprintf(w, "sluice_fleet_targets %d\n", len(samples))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_fleet_targets_observed Number of discovered targets with a FRESH control-plane sample this scrape.")
+	fmt.Fprintln(w, "# TYPE sluice_fleet_targets_observed gauge")
+	fmt.Fprintf(w, "sluice_fleet_targets_observed %d\n", observed)
+
+	for _, fam := range fleetGaugeFamilies() {
+		lines := make([]string, 0, len(samples))
+		for _, s := range samples {
+			if !s.OK {
+				continue
+			}
+			if value, known := fam.read(s.Snapshot); known {
+				lines = append(lines, fmt.Sprintf(
+					"%s{database=%q,branch=%q} %s\n", fam.name, s.Target.Database, s.Target.Branch, value,
+				))
+			}
+		}
+		if len(lines) == 0 {
+			// No target observed this metric — omit the family entirely
+			// rather than emit a header with no series.
+			continue
+		}
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "# HELP %s %s\n", fam.name, fam.help)
+		fmt.Fprintf(w, "# TYPE %s gauge\n", fam.name)
+		for _, l := range lines {
+			fmt.Fprint(w, l)
+		}
+	}
+}
+
+// fleetGaugeFamily is one exported gauge in the org-wide fan-out: its name,
+// help text, and a reader returning the already-formatted value plus the
+// snapshot's *Known flag for that metric.
+type fleetGaugeFamily struct {
+	name string
+	help string
+	read func(ir.TargetHealthSnapshot) (string, bool)
+}
+
+// fleetGaugeFamilies is the exported family list, in a fixed order so the
+// exposition is byte-stable across scrapes. The names + help strings mirror
+// [emitTargetTelemetryMetrics] exactly so a dashboard written against the
+// single-database exporter works unchanged against the fleet one (only the
+// label set differs).
+func fleetGaugeFamilies() []fleetGaugeFamily {
+	return []fleetGaugeFamily{
+		{
+			name: "sluice_target_cpu_util",
+			help: "Target CPU utilisation as a fraction in [0,1] from the control-plane telemetry provider (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.CPUUtil), s.CPUKnown
+			},
+		},
+		{
+			name: "sluice_target_mem_util",
+			help: "Target memory utilisation as a fraction in [0,1] from the control-plane telemetry provider (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.MemUtil), s.MemKnown
+			},
+		},
+		{
+			name: "sluice_target_storage_util",
+			help: "Target storage volume utilisation as a fraction in [0,1] (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.StorageUtil), s.StorageKnown
+			},
+		},
+		{
+			name: "sluice_target_storage_available_bytes",
+			help: "Target storage bytes still available before a resize (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.FormatInt(s.StorageAvailableBytes, 10), s.StorageKnown
+			},
+		},
+		{
+			name: "sluice_target_storage_capacity_bytes",
+			help: "Target storage volume capacity in bytes (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.FormatInt(s.StorageCapacityBytes, 10), s.StorageKnown
+			},
+		},
+		{
+			name: "sluice_target_replica_lag_seconds",
+			help: "Target replica lag in seconds from the control-plane telemetry provider (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.ReplicaLagSeconds), s.LagKnown
+			},
+		},
+		{
+			name: "sluice_target_active_connections",
+			help: "Target active connection count from the control-plane telemetry provider (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.Itoa(s.ActiveConnections), s.ConnKnown
+			},
+		},
+		{
+			name: "sluice_target_max_connections",
+			help: "Target maximum connection budget from the control-plane telemetry provider (ADR-0107).",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return strconv.Itoa(s.MaxConnections), s.ConnKnown
+			},
+		},
 	}
 }
 

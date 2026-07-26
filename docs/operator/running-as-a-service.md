@@ -334,6 +334,21 @@ Every series `/metrics` can emit, by family. Conditional families follow the hon
 | `sluice_go_gc_completed_total` | counter | — | Completed GC cycles. | Diagnostic. |
 | `sluice_go_gc_pause_seconds_total` | counter | — | Cumulative stop-the-world GC pause time. | Rate spikes correlate with apply-latency spikes; usually memory pressure. |
 
+**`metrics-watch --metrics-listen` (org-wide mode)** — the standalone
+PlanetScale-metrics exporter serves the same `sluice_target_*` family above,
+but when it is watching a whole org (see
+[managed-services.md](../managed-services.md#org-wide-mode-whole-fleet-telemetry))
+each series is labelled `database` + `branch` instead of `stream_id`, so one
+dashboard covers every database. That mode adds two fleet-level gauges,
+listed here rather than in the table above because they come from the
+watch's exporter, not a sync's `/metrics`:
+
+- `sluice_fleet_targets` (gauge, no labels) — database+branch targets the
+  org discovery found. Alert when it drops below your expected fleet size.
+- `sluice_fleet_targets_observed` (gauge, no labels) — of those, how many
+  had a FRESH control-plane sample this scrape. A sustained gap between the
+  two means some branches are not answering; the watch logs which.
+
 The emitters live in `internal/pipeline/metrics.go`; the design doc with
 full rationale is `docs/dev/design/sync-health-monitoring.md`.
 

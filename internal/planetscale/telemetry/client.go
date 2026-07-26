@@ -45,17 +45,48 @@ type client struct {
 	org        string
 }
 
+// newClient assembles the two-leg metrics client: the authenticated
+// service-discovery leg (the shared control-plane client, ADR-0162) and the
+// unauthenticated SIGNED scrape leg (its own *http.Client). Shared by the
+// single-database [Provider] and the org-wide [Fleet] so both construct the
+// legs identically.
+func newClient(org, tokenID, token, baseURL string, httpClient *http.Client) *client {
+	return &client{
+		api: api.New(api.Config{
+			TokenID:    tokenID,
+			Token:      token,
+			BaseURL:    baseURL,
+			HTTPClient: httpClient,
+		}),
+		httpClient: httpClient,
+		org:        org,
+	}
+}
+
 // discover fetches the per-org metrics SD document and returns the element
 // for the target branch (matched by database name, branch=main unless a
 // non-empty branch is requested). It returns a clear error — never the raw
 // token, never the request URL (the shared client strips both) — on
 // auth/HTTP/JSON failure or when no element matches.
 func (c *client) discover(ctx context.Context, database, branch string) (sdTarget, error) {
-	var targets []sdTarget
-	if err := c.api.Get(ctx, "/v1/organizations/"+url.PathEscape(c.org)+"/metrics", &targets); err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: service discovery: %w", err)
+	targets, err := c.discoverAll(ctx)
+	if err != nil {
+		return sdTarget{}, err
 	}
 	return selectBranch(targets, database, branch)
+}
+
+// discoverAll fetches the per-org metrics SD document and returns EVERY
+// element — one per database+branch the token can see. It is the discovery
+// source for the org-wide fleet watch (roadmap item 75b): a single
+// control-plane call enumerates the whole org, already carrying each
+// target's signed scrape URL, so the fan-out needs no per-database API call.
+func (c *client) discoverAll(ctx context.Context) ([]sdTarget, error) {
+	var targets []sdTarget
+	if err := c.api.Get(ctx, "/v1/organizations/"+url.PathEscape(c.org)+"/metrics", &targets); err != nil {
+		return nil, fmt.Errorf("telemetry: service discovery: %w", err)
+	}
+	return targets, nil
 }
 
 // selectBranch picks the SD element for the sync's target database and

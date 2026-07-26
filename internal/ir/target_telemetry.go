@@ -121,3 +121,47 @@ func (s TargetHealthSnapshot) Fresh(now time.Time, window time.Duration) bool {
 	}
 	return now.Sub(s.SampledAt) <= window
 }
+
+// FleetTarget identifies ONE watched database+branch inside a fleet
+// (org-wide) telemetry provider. It is the map/label key for everything
+// fleet-shaped: the per-target alerter latch state, the exported gauge
+// labels, and the persisted sample record.
+type FleetTarget struct {
+	Database string
+	Branch   string
+}
+
+// String renders the target as `database/branch` — the stable form used in
+// log lines, notification stream IDs, and the fleet filter patterns.
+func (t FleetTarget) String() string { return t.Database + "/" + t.Branch }
+
+// FleetHealthSample pairs a [FleetTarget] with its most recent snapshot. OK
+// carries exactly the meaning of [TargetTelemetry.Sample]'s second return —
+// false means "no usable signal for THIS target right now" (never polled, or
+// the cached snapshot aged out) — so a fleet consumer applies the same
+// honesty contract per target that a single-target consumer applies once.
+// A sample with OK=false is still reported (rather than dropped) so a
+// consumer can distinguish "discovered but unobserved" from "not discovered".
+type FleetHealthSample struct {
+	Target   FleetTarget
+	Snapshot TargetHealthSnapshot
+	OK       bool
+}
+
+// FleetTelemetry is the ORG-WIDE sibling of [TargetTelemetry]: instead of one
+// database's snapshot it exposes every discovered database+branch in one
+// call, so an observability consumer can fan a single poll cadence across a
+// whole fleet. Same posture as TargetTelemetry in every other respect —
+// ADVISORY only, cached (never a live round-trip), and degrading to "no
+// signal" per target rather than erroring.
+//
+// The core defines only this interface; the PlanetScale implementation lives
+// in `internal/planetscale/telemetry` and is constructed at the cmd/sluice
+// composition root, so nothing engine-neutral learns that PlanetScale exists.
+type FleetTelemetry interface {
+	// SampleFleet returns one entry per currently-discovered target, in a
+	// STABLE order (sorted by database then branch) so exported series and
+	// printed lines don't shuffle between ticks. It MUST NOT block on a live
+	// network round-trip. ctx is honoured only for cancellation.
+	SampleFleet(ctx context.Context) []FleetHealthSample
+}
