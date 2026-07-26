@@ -924,6 +924,23 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
+### 80. The filtered move-IN/move-OUT crux family has been RED on Vitess 21 & 22 for a week, in a NON-REQUIRED workflow (found 2026-07-26) — *unresolved; investigate before it is assumed benign*
+
+**What.** `TestVitessClusterFilteredSync` and `TestVitessClusterFilteredSyncWarmResume` fail on **Vitess v21.0.6 and v22.0.4** and pass on **v23.0.4, v24.0.1, and latest**. The weekly `vitess-version-matrix.yml` schedule run is where this surfaces.
+
+**Timeline — it is a regression, not a permanent gap.** Scheduled runs: 2026-06-21 ✅, 06-28 ✅, 07-05 ✅, **07-12 ✅**, **07-19 ❌**, 07-26 ❌. So it broke in the **07-12 → 07-19** window, whose delta is the v0.99.279–283 collation / filtered-sync arc (PAD-SPACE `--where` evaluation A1/A2, the float-ordering B1 fix, the A0 client-side COPY fallback, and the F-P1 VStream **warm-resume server-side filter push-down**). F-P1 is the most suspicious single change, because the warm-resume test is one of the two failing and the push-down is exactly the thing whose server-side support could differ by Vitess major.
+
+**Observed shapes (v21.0.6, 2026-07-26).** Not a boot or infra failure — the cluster comes up and the *cold* filtered COPY passes:
+- `filtered COPY PASS: only in-scope EU rows {1,3} landed; out-of-scope US row 2 excluded` — the copy leg is fine.
+- then `out-of-scope INSERT id=11 (US) leaked into the filtered stream: ir.Row{"id":11, "payload":"moved-in-11", "region":"EU"}` and `no ir.Update on regions for id=11 among 3 changes (ir.Insert,ir.Insert,ir.Delete)` — the CDC leg delivers a **different event shape** than the crux expects for a move-IN.
+- Warm-resume fails differently: `timed out after 1m30s waiting for the move-OUT update id=20`, preceded by the alive-but-idle WARN (`heartbeats flowing … NO change events for 30s`). A connected, healthy-looking stream delivering nothing.
+
+**Why this matters more than a red weekly badge.** This is the *filtered move-OUT* family — the one the publish checklist singles out as a tag-time gate precisely because it is the silent-loss-sensitive path, and the one whose warm-resume variant looks green while delivering no events. Whether the underlying behavior is a **product** defect on older Vitess or a **test-expectation** mismatch against those versions' event shapes is **not yet determined, and must not be assumed** — the two failure shapes (wrong event kind vs no events at all) are different enough that one explanation probably does not cover both. This is a three-phase-protocol candidate, not a code-reading one.
+
+**Why nobody noticed for a week.** `vitess-version-matrix.yml` is **not** one of the six required checks; its only blocking incarnation is the `filtered-tag-gate` job, which runs on tag pushes **pinned to `VITESS_TAG: v24.0.1`** — a version that passes. So the tag-time gate is structurally blind to a regression that only affects 21/22, and the weekly run that does see it blocks nothing. **Gate proposal:** either promote the older-version cells to something that blocks (at minimum, a loud failure notification on the weekly), or state explicitly in `docs/production-readiness.md` which Vitess majors are supported so a red cell on an unsupported version is a documented non-event rather than an ambiguous one. Today it is ambiguous, which is the worst of both.
+
+**Not release-blocking by the documented gates** — the six required checks are green on `3f510cfa`, and the tag gate's pinned v24.0.1 passes — but that is a statement about the gates, not about the behavior.
+
 ### 79. A graceful server-side GOAWAY kills a VStream CDC stream instead of reconnecting (observed live 2026-07-24) — *✅ FIXED 2026-07-25: `nettransient.IsGracefulGoAway` (conjunction: GOAWAY + `ErrCode=NO_ERROR`) consulted by the VStream reader classifier before its terminal-on-InvalidArgument arm; RED-before-GREEN pinned on the verbatim production string, with every error-carrying GOAWAY pinned terminal*
 
 **What happened.** The `soak231` soak (PS-MySQL → PS-Postgres, running v0.100.0) exited on:
