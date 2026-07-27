@@ -454,13 +454,17 @@ token, no DB credential.
 
 #### Org-wide mode (whole-fleet telemetry)
 
-**Omit `--planetscale-metrics-db`** and the watch covers the entire
-org: one call to the org's metrics service discovery enumerates every
-database + branch, and the poll fans out across them on the same 60s
-cadence with bounded concurrency.
+**Pass `--fleet`** (in place of `--planetscale-metrics-db`) and the watch
+covers the entire org: one call to the org's metrics service discovery
+enumerates every database + branch, and the poll fans out across them on the
+same 60s cadence with bounded concurrency. Exactly one of the two flags is
+required — org-wide is deliberately NOT what you get by leaving the database
+name out, because a wrapper script whose `$DB` is unset would then fan out
+across the whole org silently.
 
 ```bash
 sluice metrics-watch \
+  --fleet \
   --engine planetscale --planetscale-org acme \
   --include-database 'prod-*' --exclude-database 'prod-scratch' \
   --metrics-listen :9090 --sink-file /var/lib/sluice/metrics.jsonl --quiet

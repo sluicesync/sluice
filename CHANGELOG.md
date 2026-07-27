@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+**`metrics-watch` org-wide mode now requires an explicit `--fleet` flag.** It used to be inferred from an omitted `--planetscale-metrics-db`, which meant a wrapper script whose `$DB` variable happened to be unset silently fanned out across every database in the org — flipping the persisted record's identity from `metrics-watch:<db>` to `metrics-watch:<org>` and inverting `--planetscale-metrics-branch`, where unset then means every branch. Exactly one of `--fleet` or `--planetscale-metrics-db` is now required, and passing neither refuses with a message naming both. If you invoke org-wide mode by omission, add `--fleet`.
+
+### Fixed
+
+**A generated-column `--where` refusal named the wrong reason for MySQL.** v0.103.0's refusal message, release notes and docs said "MySQL's binlog omits generated columns". The binlog row image carries them; sluice's decoder drops them deliberately, so the target's own `GENERATED` clause recomputes the value rather than freezing the source's. The refusal itself is unchanged and correct — the decoded row has no such key either way — but an operator reading the old wording could have gone looking for a MySQL setting or version that would change it, and none exists. Only Postgres genuinely omits them on the wire, and only before PG 18.
+
 ## [0.103.0] - 2026-07-27
 
 A correctness release, and the largest single batch of silent-loss fixes sluice has shipped. Everything here came out of a blind multi-agent audit of the last 88 commits — findings that survived an adversarial refutation pass, each closed with a permanent gate rather than a one-off fix. Drop-in upgrade, no breaking changes; three new loud refusals replace three silent wrong answers.

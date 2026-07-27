@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -33,12 +34,15 @@ import (
 // touching. Threshold + sink semantics are identical to `sync start`'s
 // --notify-* flags by construction (the rule set and evaluator are shared).
 //
-// **Two modes** (roadmap item 75b). With --planetscale-metrics-db it watches
-// exactly that one database — the original, unchanged behaviour. WITHOUT it,
-// the watch goes ORG-WIDE: the org's metrics service-discovery document
-// enumerates every database+branch, the poll fans out across them with
-// bounded concurrency, and --include-database/--exclude-database scope the
-// set. Org-wide mode leads with the exporter (--metrics-listen, one series
+// **Two modes** (roadmap item 75b), selected EXPLICITLY. With
+// --planetscale-metrics-db it watches exactly that one database — the
+// original, unchanged behaviour. With --fleet it goes ORG-WIDE: the org's
+// metrics service-discovery document enumerates every database+branch, the
+// poll fans out across them with bounded concurrency, and
+// --include-database/--exclude-database scope the set. Exactly one of the two
+// is required; neither is the default, because org-wide inferred from an empty
+// --planetscale-metrics-db meant a wrapper script with an unset variable fanned
+// out across the whole org silently (audit 2026-07-26 ARCH-3). Org-wide mode leads with the exporter (--metrics-listen, one series
 // per database+branch) and the persistent sink (--sink-file/--sink-http)
 // rather than the live line, which collapses to one summary row because a
 // per-database line is unreadable across dozens of databases.
@@ -56,7 +60,8 @@ type MetricsWatchCmd struct {
 	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted read_metrics_endpoints). Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
 	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
 	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Branch to filter telemetry series to. Single-database mode defaults to 'main'; in org-wide mode an unset value means EVERY branch, and a set value restricts the fan-out to branches with that name." placeholder:"BRANCH"`
-	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Database name to watch. OMIT it to watch the WHOLE ORG: every database+branch the org's metrics service discovery returns, fanned out on the same cadence." placeholder:"DATABASE"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Database name to watch. Mutually exclusive with --fleet; exactly one of the two is required." placeholder:"DATABASE"`
+	Fleet                     bool   `name:"fleet" help:"Watch the WHOLE ORG: every database+branch the org's metrics service discovery returns, fanned out on the same cadence. Mutually exclusive with --planetscale-metrics-db."`
 
 	// Org-wide fan-out scoping (roadmap item 75b). Ignored in
 	// single-database mode. Include and exclude may be combined (exclude
@@ -169,9 +174,29 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 	pretty := wantPrettyProgress(g, false, false, false) && !m.Once
 
 	// Mode split (roadmap item 75b): --planetscale-metrics-db names ONE
-	// database (the original behaviour, byte-identical); omitting it watches
-	// the whole org.
-	orgWide := m.PlanetScaleMetricsDB == ""
+	// database; --fleet watches the whole org. The mode is now selected by an
+	// EXPLICIT flag rather than by the ABSENCE of one (audit 2026-07-26
+	// ARCH-3).
+	//
+	// It used to be inferred from an empty --planetscale-metrics-db, which had
+	// dropped its `required:""` tag to make org-wide reachable. That turned a
+	// wrapper script whose $DB happens to be unset from a loud kong refusal
+	// into a silent org-wide fan-out — one that also flips the persisted
+	// record's identity from metrics-watch:<db> to metrics-watch:<org> and
+	// inverts --planetscale-metrics-branch (unset now meaning EVERY branch).
+	// This is the CLI-layer form of the zero-value-safe-config rule: a mode
+	// whose "on" state is the zero value will eventually be entered by
+	// accident.
+	switch {
+	case m.Fleet && m.PlanetScaleMetricsDB != "":
+		return errors.New("metrics-watch: --fleet and --planetscale-metrics-db are mutually exclusive: " +
+			"--fleet watches every database in the org, --planetscale-metrics-db watches exactly one. Pass one or the other")
+	case !m.Fleet && m.PlanetScaleMetricsDB == "":
+		return errors.New("metrics-watch: pass --planetscale-metrics-db <database> to watch one database, " +
+			"or --fleet to watch every database in the org. Neither was given — and org-wide is NOT the default, " +
+			"because a wrapper script with an unset variable would otherwise fan out across the whole org silently")
+	}
+	orgWide := m.Fleet
 
 	var (
 		provider *pstelemetry.Provider
