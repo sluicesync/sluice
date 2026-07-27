@@ -1788,3 +1788,13 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 **Why it is filed rather than fixed.** The resume-position safety argument is the whole difficulty, and ADR-0109 §2 spells out why: a retry may only resume from a position that is provably dup-free AND loss-free. For the chunked reader that means reasoning about the keyset cursor and the chunk's upper bound together, and for `ExportRawCopy` it means a partially-written COPY stream on the target side. Neither is a wrapper around the existing helper.
 
 **Correction it produced.** v0.103.0's release notes claimed an engine asymmetry here ("aborted a Postgres cold copy while MySQL resumed"). That is true of the full-scan path and false of the chunked one, where neither engine resumes. The published notes and CHANGELOG were amended in v0.103.1.
+
+### 87. A Postgres target now carries `DEFERRABLE` on a primary key and a foreign key, but still drops it on a UNIQUE constraint (raised 2026-07-27 by the v0.103.1 regression cycle) — *open, contract decision*
+
+**What.** v0.103.0 and v0.103.1 made a PG target carry `DEFERRABLE` / `DEFERRABLE INITIALLY DEFERRED` on foreign keys and primary keys. A `DEFERRABLE UNIQUE` constraint still lands plain, with the read-time C3 WARN naming the weakening. So three adjacent constraint kinds now behave differently on the same target: two carry, one warns.
+
+**Why it is not filed as a defect.** Both directions are loud. A carried attribute is visible in the target catalog; a dropped one is named by `warnWeakenedUniqueConstraint` with its operator-facing consequence. Nothing is silent, so this is a coherence question rather than a data-fidelity one — which is why the regression cycle recorded it as an observation rather than a bug.
+
+**Why it needs a decision rather than a patch.** The UNIQUE-attribute drop is the shipped C3 contract, deliberately: `weakenedUniqueAttrs` covers `NULLS NOT DISTINCT`, `DEFERRABLE` and `WITHOUT OVERLAPS` as one family, and the dump-parity allowlist carries a matching entry citing the documented weakening. Carrying only the `DEFERRABLE` third of that family would split it, and the WARN is emitted at READ time, where the target engine is not known — so a PG target that carried the attribute would still be warned that it had been dropped. Closing this properly means either making the warning target-aware or carrying all three attributes on PG, and either is a contract change with a doc, an allowlist entry, and a parity cell attached.
+
+**The MySQL-target half is already closed** (Bug 210, fixed in this batch): a deferrable primary key against a MySQL-family target now WARNs like its FK and UNIQUE siblings, rather than vanishing in silence.

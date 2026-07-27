@@ -1389,6 +1389,28 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	}
 
 	if hasPK {
+		// Carry-or-WARN for a DEFERRABLE primary key (Bug 210). InnoDB has no
+		// deferred-constraint concept, so the attribute cannot be carried —
+		// but it must not vanish in silence either, and it was: a DEFERRABLE
+		// UNIQUE and a DEFERRABLE FOREIGN KEY in the SAME schema and the same
+		// migrate run both warned, while the primary key said nothing. The
+		// consequence is the one the deferrable attribute exists for: a bulk
+		// key shift (UPDATE t SET id = id + 1) commits on the source and fails
+		// on the target with a duplicate-key error partway through.
+		//
+		// Only reachable now that the reader's constraint join can see a PK at
+		// all — before v0.103.1 the flag was always false here, which is why
+		// this check would have been dead code had it been written earlier.
+		if table.PrimaryKey.ConstraintDeferrable {
+			slog.Warn("primary-key attribute cannot be represented on a MySQL-family target and is being DROPPED",
+				"table", table.Name,
+				"constraint", table.PrimaryKey.Name,
+				"deferrable", true,
+				"initially_deferred", table.PrimaryKey.ConstraintInitiallyDeferred,
+				"consequence", "InnoDB checks the key immediately, so a transaction the source allows to violate "+
+					"it mid-way and satisfy by COMMIT — the classic bulk key shift UPDATE t SET id = id + 1 — "+
+					"aborts on the target with a duplicate-key error; verify any such workload before cutover")
+		}
 		sb.WriteString("  PRIMARY KEY ")
 		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
 		if hasInlineIdx || hasUserChecks || hasDomainChecks {
