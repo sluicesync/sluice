@@ -1789,6 +1789,16 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 **Correction it produced.** v0.103.0's release notes claimed an engine asymmetry here ("aborted a Postgres cold copy while MySQL resumed"). That is true of the full-scan path and false of the chunked one, where neither engine resumes. The published notes and CHANGELOG were amended in v0.103.1.
 
+### 88. Make the encrypted-chunk AAD injective — ADR-0181 (raised 2026-07-26 as audit SEC-2) — *designed, not implemented*
+
+**What.** The AES-GCM additional-authenticated-data binding an encrypted row chunk to its manifest and parent table is built by raw `"\nkey=" + value` concatenation, so it is not injective: a value carrying `\nschema=` forges a structural boundary and two distinct parents render to identical AAD. OBSERVED — a chunk sealed under one parent opens cleanly under another, and the attacker-rows-IN direction was reproduced end to end. The correct encoding already exists in the adjacent file: `signature.go`'s length-prefixed tokens, whose doc names this exact forgery as what length-prefixing closes.
+
+**Design is settled; see [ADR-0181](../adr/adr-0181-injective-chunk-aad.md).** `FormatVersionInjectiveChunkAAD = 9`, length-prefixed tokens matching the signature path, and `ChunkAAD` grows a third version state (`<5` nil / `5–8` raw concat unchanged / `>=9` injective) under ADR-0154's dual-version rule, so every existing chain keeps opening with no re-seal migration.
+
+**Why it is not urgent.** The exfiltration direction is impossible — a sluice-generated chunk path carries no delimiter, so victim rows can never be reassigned to an attacker-owned table. The reachable primitive is attacker-rows-IN only, gated behind adversary source DDL plus store write plus an UNSIGNED chain, and `--sign` closes the class (ADR-0152 documents and accepts that residual). It is worth doing because the AAD is on-disk contract and the deferral cost grows with every chain written.
+
+**The gate is a property test, not a golden.** Distinct field tuples carrying delimiter bytes in every position must render to distinct AAD — that is the assertion the current encoding fails, and the assertion a golden would not have caught, since a golden proves one input maps to one output and says nothing about collisions. Plus a downgrade-oracle pin mirroring ADR-0154's: a v9 manifest relabelled to v8 must fail to open.
+
 ### 87. A Postgres target now carries `DEFERRABLE` on a primary key and a foreign key, but still drops it on a UNIQUE constraint (raised 2026-07-27 by the v0.103.1 regression cycle) — *open, contract decision*
 
 **What.** v0.103.0 and v0.103.1 made a PG target carry `DEFERRABLE` / `DEFERRABLE INITIALLY DEFERRED` on foreign keys and primary keys. A `DEFERRABLE UNIQUE` constraint still lands plain, with the read-time C3 WARN naming the weakening. So three adjacent constraint kinds now behave differently on the same target: two carry, one warns.
