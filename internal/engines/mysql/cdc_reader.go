@@ -196,6 +196,12 @@ type CDCReader struct {
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
 
+	// schemaLoader is the seam tableFor loads through. nil — the value every
+	// production construction gets — means the real loadTableSchema; tests
+	// override it to inject a transient source failure on the dispatch path.
+	// See the comment in tableFor for why this indirection is worth its cost.
+	schemaLoader func(ctx context.Context, db *sql.DB, schema, table string) (*tableSchema, error)
+
 	// schemaCacheClears counts blanket schemaCache invalidations — one per
 	// in-scope DDL QueryEvent. It pins the MariaDB no-per-transaction-churn
 	// invariant (ADR-0170): unlike MySQL, MariaDB emits NO BEGIN / dummy
@@ -1240,7 +1246,18 @@ func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, erro
 		return cached, nil
 	}
 	schema, table := splitQualified(qn)
-	tbl, err := loadTableSchema(ctx, r.db, schema, table)
+	// Indirected through a field ONLY so a test can inject the transient
+	// failure the dispatch-path classification above exists to survive. The
+	// real loader runs a live information_schema query, and making THAT fail
+	// transiently at the exact TABLE_MAP boundary against a real server is not
+	// reliably reproducible — while the classification being absent is a
+	// stream-killing bug that shipped twice. Zero-value-safe: nil means the
+	// real loader, so every production construction is unchanged.
+	load := r.schemaLoader
+	if load == nil {
+		load = loadTableSchema
+	}
+	tbl, err := load(ctx, r.db, schema, table)
 	if err != nil {
 		return nil, err
 	}
