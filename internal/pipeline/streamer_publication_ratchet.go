@@ -208,10 +208,34 @@ func resolveEffectivePublication(explicit, recorded string, rowExists, resetTarg
 //     previously zero-signal): the empty subset hashes to the non-empty
 //     sentinel, never to "".
 func rowFilterHashDrift(rowExists, restartFromScratch, resetTargetData bool, recorded, current string) bool {
+	return rowFilterHashDriftAny(rowExists, restartFromScratch, resetTargetData, recorded, []string{current})
+}
+
+// rowFilterHashDriftAny is the drift test against SEVERAL acceptable
+// spellings of "unchanged". The extra spellings exist for one reason: when the
+// hash's coverage widens (it went from the PG-pushed subset to the full
+// --where set — audit 2026-07-26 SL-4), a stream whose flags never changed
+// still carries the older spelling, and refusing it would be a false alarm
+// caused purely by upgrading. Accepting the legacy spelling costs nothing:
+// genuine drift matches NEITHER.
+func rowFilterHashDriftAny(rowExists, restartFromScratch, resetTargetData bool, recorded string, acceptable []string) bool {
 	if !rowExists || restartFromScratch || resetTargetData || recorded == "" {
 		return false
 	}
-	return recorded != current
+	for _, a := range acceptable {
+		if recorded == a {
+			return false
+		}
+	}
+	return true
+}
+
+// rowFilterFullHash hashes the COMPLETE --where set, engine-independently.
+// Shares rowFilterPushdownHash's construction so the two agree whenever the
+// pushed subset IS the full set — which is what makes the legacy-tolerant
+// comparison above a no-op for the common PG case.
+func rowFilterFullHash(filters map[string]string) string {
+	return rowFilterPushdownHash(filters)
 }
 
 // readRecordedPublicationState loads the stream's control row (if any)
@@ -306,24 +330,52 @@ func (s *Streamer) phaseResolvePublicationScope(ctx context.Context, applier ir.
 	// the reconciliation contract here — compare the recorded hash against
 	// the current run's pushed subset, refuse loudly on drift, and record
 	// the current hash beside publication_name on every position-write.
-	if _, ok := s.Source.(ir.PublicationRowFilterer); ok {
-		currentHash := rowFilterPushdownHash(s.publicationRowFilters)
-		if rowFilterHashDrift(rowExists, s.RestartFromScratch, s.ResetTargetData, st.RowFilterHash, currentHash) {
-			pushed := make([]string, 0, len(s.publicationRowFilters))
-			for table := range s.publicationRowFilters {
-				pushed = append(pushed, table)
+	//
+	// The hash covers the FULL --where set on EVERY source engine, not just
+	// the PG-pushed subset (audit 2026-07-26 SL-4). The original contract was
+	// written for the pushed subset because that is DURABLE source-side state,
+	// but the drift hazard is not exclusive to it: a warm resume under a
+	// changed client-side predicate re-snapshots nothing, so the target still
+	// holds whatever the ORIGINAL predicate copied, while the CDC leg starts
+	// classifying under the new one. Narrowing leaves out-of-scope rows on the
+	// target forever; widening never backfills the rows the first cold start
+	// skipped. Both are silent. Confining the check to the one engine that can
+	// push filters left MySQL, Vitess, and PG-below-15 unguarded against the
+	// same class.
+	{
+		currentHash := rowFilterFullHash(s.RowFilters)
+		// A stream established before the hash widened recorded only the
+		// pushed subset. Accept that spelling too, so upgrading does not
+		// manufacture a drift refusal on a stream whose flags never changed;
+		// the next position-write rewrites it to the full-set hash.
+		acceptable := []string{currentHash}
+		if _, ok := s.Source.(ir.PublicationRowFilterer); ok {
+			acceptable = append(acceptable, rowFilterPushdownHash(s.publicationRowFilters))
+		}
+		if rowFilterHashDriftAny(rowExists, s.RestartFromScratch, s.ResetTargetData, st.RowFilterHash, acceptable) {
+			filtered := make([]string, 0, len(s.RowFilters))
+			for table := range s.RowFilters {
+				filtered = append(filtered, table)
 			}
-			sort.Strings(pushed)
+			sort.Strings(filtered)
+			_, pushes := s.Source.(ir.PublicationRowFilterer)
+			serverNote := ""
+			if pushes {
+				serverNote = " On this source the predicate is ALSO pushed into the publication as durable catalog " +
+					"state a warm resume never re-ensures, so the server would keep filtering on the stale predicate " +
+					"and the rows the new flags admit would never be delivered at all."
+			}
 			return sluicecode.Wrap(
 				sluicecode.CodeWherePushdownDrift,
 				"re-run with the --where this stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (required for a widened filter anyway; on a PG source the restart first refuses on the stream's existing replication slot — drop it as that refusal instructs, then re-run), or --reset-target-data for a destructive reset",
 				fmt.Errorf(
-					"pipeline: warm resume refused: the current --where flags don't match the row-filter subset stream %q "+
-						"pushed into its publication at cold start (recorded row_filter_hash %s, current %s; currently-pushed "+
-						"tables: [%s]). The publication row filter is durable source-side state a warm resume never re-ensures, "+
-						"so resuming would leave the SERVER silently filtering on the stale predicate — rows the new flags admit "+
-						"would never be delivered, unobservably (audit 2026-07-23 D0-2)",
-					streamID, st.RowFilterHash, currentHash, strings.Join(pushed, ", "),
+					"pipeline: warm resume refused: the current --where flags don't match the ones stream %q was "+
+						"established with (recorded row_filter_hash %s, current %s; currently-filtered tables: [%s]). "+
+						"A warm resume does not re-snapshot, so the target still holds exactly what the ORIGINAL "+
+						"predicate copied while the CDC leg would begin classifying under the new one — a narrowed "+
+						"filter strands out-of-scope rows on the target forever, a widened one never backfills what "+
+						"the first cold start skipped.%s",
+					streamID, st.RowFilterHash, currentHash, strings.Join(filtered, ", "), serverNote,
 				),
 			)
 		}

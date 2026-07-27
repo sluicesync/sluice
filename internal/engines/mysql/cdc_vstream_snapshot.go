@@ -2528,8 +2528,42 @@ func (s *vstreamSnapshotStream) dispatchCDCDDL(ctx context.Context, ev *binlogda
 		}
 	}
 
-	clear(s.fields)
+	// Scope the invalidation to the DDL's target table, mirroring the fix on
+	// vstreamCDCReader.dispatchDDL (audit 2026-07-26 SL-12). The blanket clear
+	// was the wedge that fix removed: any DDL anywhere in the keyspace — even
+	// a CREATE TABLE, which cannot change an existing table's shape — wiped
+	// every other table's cached FIELDs, so the next ROW event on a
+	// long-established table tripped the loud floor. These two dispatch
+	// methods are hand-mirrored, and the earlier sweep carried over the
+	// CLASSIFICATION half of the fix but not the RECOVERY half.
+	s.invalidateFieldsForDDL(stmt)
 	return nil
+}
+
+// invalidateFieldsForDDL drops only the cached FIELD entries for the table a
+// DDL targets, falling back to the blanket clear for a statement it cannot
+// attribute. The twin of [vstreamCDCReader.invalidateFieldsForDDL]; keys are
+// `shard/keyspace.table`, so the bare name is the segment after the last
+// separator of each kind, compared case-insensitively across every shard (an
+// ALTER changes the shape on all of them).
+func (s *vstreamSnapshotStream) invalidateFieldsForDDL(stmt string) {
+	target, ok := ddlTargetTable(stmt)
+	if !ok {
+		clear(s.fields)
+		return
+	}
+	for key := range s.fields {
+		name := key
+		if _, after, found := strings.Cut(name, "/"); found {
+			name = after
+		}
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			name = name[i+1:]
+		}
+		if strings.EqualFold(name, target) {
+			delete(s.fields, key)
+		}
+	}
 }
 
 // positionFor encodes the current VGTID into an [ir.Position]. The

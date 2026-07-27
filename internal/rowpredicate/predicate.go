@@ -249,6 +249,19 @@ type ColumnInfo struct {
 	// classifier keeps out of any server-side envelope as its fail-closed belt.
 	TemporalSemantics ir.TemporalLiteralSemantics
 
+	// Identifier marks the identifier / time-of-day families whose literal
+	// must already be in the engine's canonical spelling to compare
+	// faithfully client-side (audit 2026-07-26 SL-3). identifierNone for
+	// every other column; see identifier_literal.go for why this refuses
+	// rather than normalizes.
+	Identifier identifierKind
+
+	// TimeFractionAmbiguous marks a TIME column with fractional-second
+	// precision, whose value renders differently on the snapshot and binlog
+	// legs — so no single literal is correct on both, and any value
+	// comparison against it is refused.
+	TimeFractionAmbiguous bool
+
 	// Generated is true for a GENERATED / computed column. Such a column is
 	// REFUSED at compile time on the CDC leg, because neither engine's change
 	// stream carries it: MySQL's binlog decoder skips generated columns
@@ -341,15 +354,29 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool, tem
 		// its exact-label `=`); a MySQL enum under an unreproducible collation
 		// (or --where-strict-collation) refuses loudly, like any string column.
 		return stringColumnInfo(resolver, t.Collation, ir.CollationDeterminismUnknown, strict, false)
-	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
-		// Canonical/identifier-shaped ASCII values: the source's `=` is
-		// exact, so a byte compare is faithful (no collation resolution).
-		return ColumnInfo{Family: FamilyString, Faithful: true}
+	case ir.UUID:
+		// Identifier-shaped ASCII. The byte compare is faithful ONLY when the
+		// literal is already canonical: the source coerces the literal to the
+		// column type before comparing, so it accepts spellings the decoded
+		// (canonical) value will not match. checkIdentifierLiteral refuses
+		// those loudly (audit 2026-07-26 SL-3).
+		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierUUID}
+	case ir.Inet, ir.Cidr:
+		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierNetwork}
+	case ir.Macaddr:
+		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierMAC}
 	case ir.Time:
 		// Stored as a fixed-width string ("08:30:00[.ffffff]"); equality is
 		// byte-exact. Ordering is refused (over-24h / fractional edge
-		// cases), so no chronological parse is attempted.
-		return ColumnInfo{Family: FamilyString, Faithful: true}
+		// cases), so no chronological parse is attempted. A FRACTIONAL time
+		// is refused outright — its rendering differs between the snapshot and
+		// binlog legs, so no literal is correct on both (SL-3).
+		return ColumnInfo{
+			Family:                FamilyString,
+			Faithful:              true,
+			Identifier:            identifierTime,
+			TimeFractionAmbiguous: t.PrecisionUnspecified || t.Precision > 0,
+		}
 	case ir.Binary, ir.Varbinary, ir.Blob, ir.JSON:
 		return ColumnInfo{Family: FamilyBinary}
 	case ir.Date:
@@ -1120,7 +1147,11 @@ func checkComparable(col string, info ColumnInfo, op cmpOp, lit literal) error {
 		if !info.faithfulString() {
 			return fmt.Errorf("string column %q has a case/accent-insensitive or unknown collation whose `=` sluice cannot reproduce faithfully client-side (an unrecognized or absent collation, or --where-strict-collation is set), so a comparison could diverge from the source's own evaluation; use a recognized collation, normalize the value on the source and filter on that, or drop --where-strict-collation", col)
 		}
-		return nil
+		// The identifier / time families reach here as faithful strings, but
+		// only a CANONICAL literal actually compares faithfully — the source
+		// coerces the literal to the column type, the change stream does not
+		// (audit 2026-07-26 SL-3).
+		return checkIdentifierLiteral(col, info, lit)
 	case FamilyBinary:
 		if op.isOrdering() {
 			return fmt.Errorf("ordering comparison on binary/JSON column %q is not supported; use =, !=, or IS [NOT] NULL", col)
