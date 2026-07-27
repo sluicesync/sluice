@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -205,6 +206,29 @@ func (s *FileSink) open() error {
 	if err != nil {
 		_ = f.Close()
 		return fmt.Errorf("telemetrysink: stat %s: %w", s.cfg.Path, err)
+	}
+	// O_CREATE's perm argument applies ONLY at creation, so a path that
+	// already exists keeps whatever mode it has — a config-management tool, an
+	// earlier version, or a runbook `touch` that pre-created it at 0644 would
+	// leave the whole fleet's telemetry (database and branch names, capacity
+	// and utilisation) accumulating world-readable, and rotation preserves the
+	// mode through the rename. The package doc promises owner-only without
+	// qualification, so the honest options were to narrow the promise or to
+	// keep it; keeping it is cheap here (audit 2026-07-26 SEC-4).
+	//
+	// Widening is never attempted — a mode STRICTER than 0600 is the
+	// operator's business, and this only removes group/other bits.
+	if perm := info.Mode().Perm(); perm&^filePerm != 0 {
+		if cerr := f.Chmod(perm & filePerm); cerr != nil {
+			// Not fatal: an advisory sink must never stall a poll, and a
+			// filesystem that cannot chmod (some mounts, some platforms) is
+			// not a reason to stop recording. Say so rather than pretend.
+			slog.Warn("telemetrysink: could not tighten sink-file permissions to owner-only",
+				"path", s.cfg.Path,
+				"mode", perm.String(),
+				"error", cerr,
+				"consequence", "the file keeps its wider mode and telemetry accumulates readable by others")
+		}
 	}
 	s.f = f
 	s.size = info.Size()

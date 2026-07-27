@@ -135,15 +135,22 @@ func classifyReaderError(err error) error {
 		)}
 	}
 	// FIELD-cache miss after a DDL boundary (roadmap item 81, observed live
-	// 2026-07-26). dispatchDDL invalidates the field cache with a BLANKET
-	// clear across every (shard, table) — correct and deliberately
-	// conservative, because decoding rows against a stale column list after
-	// an ALTER is silent corruption. But vtgate only re-emits a FIELD event
-	// for the table whose shape actually changed, so the next ROW event on an
-	// UNRELATED table in the same keyspace finds an empty cache and trips the
-	// loud floor in dispatchRow. That is how a `CREATE TABLE` on one table
-	// killed a stream whose fatal error named a DIFFERENT, long-established
-	// table.
+	// 2026-07-26). dispatchDDL invalidates the field cache; vtgate only
+	// re-emits a FIELD event for the table whose shape actually changed, so a
+	// ROW event on a table whose entry was dropped without a re-announcement
+	// finds an empty cache and trips the loud floor in dispatchRow. That is
+	// how a `CREATE TABLE` on one table killed a stream whose fatal error
+	// named a DIFFERENT, long-established table.
+	//
+	// The invalidation is no longer a BLANKET clear — this comment said it was
+	// for one release after it stopped being true (audit 2026-07-26 QUAL-4;
+	// `cd369576` wrote the claim, `9fe4dd23` changed the mechanism).
+	// invalidateFieldsForDDL now drops only the DDL's target table across
+	// every shard, falling back to the blanket clear only when it cannot
+	// attribute the statement. The carve-out below is still needed: the
+	// fallback path still exists, a warm resume replays the DDL, and an
+	// attributable ALTER legitimately drops the altered table's entry — so a
+	// miss remains reachable and must stay retriable rather than terminal.
 	//
 	// Retriable, not terminal, and NOT a weakening of the floor: nothing here
 	// decodes a row with guessed or stale metadata. A reconnect re-opens the

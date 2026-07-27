@@ -88,10 +88,24 @@ func (h *HTTPSink) Close() error { return nil }
 // WARN-logs err.Error(), so every error below passes through
 // [safeerr.SafeParseError] to strip the wrapper.
 func (h *HTTPSink) post(ctx context.Context, payload httpPayload) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
+	// Encoder with SetEscapeHTML(false), not json.Marshal (audit 2026-07-26
+	// SL-16). EncodeRecord deliberately disables HTML escaping so a record's
+	// bytes are the same on both sinks; marshalling the assembled payload with
+	// the default escaping RE-escapes `<`, `>` and `&` inside the already-
+	// encoded RawMessage, so a branch named `a<b>&c` shipped as `a<b>`
+	// over HTTP and as `a<b>&c` in the file. Semantically identical, and the
+	// package doc promises the bytes are identical — so this is the doc being
+	// made true rather than a data fix.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
 		return fmt.Errorf("telemetrysink: marshal push batch: %w", err)
 	}
+	// Encode appends a newline that Marshal does not; the body is a single
+	// JSON document either way, but trim it so the bytes on the wire are
+	// exactly what they were before this change apart from the escaping.
+	body := bytes.TrimRight(buf.Bytes(), "\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("telemetrysink: build push request: %w", safeerr.SafeParseError(err))

@@ -1776,3 +1776,15 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 **What would close this.** A second occurrence with a core dump or `GOTRACEBACK=crash` output naming a frame. Until then the useful thing is the record: if this test segfaults again, it is the second data point, not the first, and this entry is where to start.
 
 **Adjacent, and cheap:** `scripts/race-integration.ps1` fails to parse under Windows PowerShell 5.1 — its em-dashes are UTF-8 and 5.1 reads the file as ANSI. Invoke it with `pwsh`, or re-encode the file. Its default `-Image golang:1.26` is also older than `go.mod`'s `go >= 1.26.5` requirement, so the default invocation aborts with a GOTOOLCHAIN error; pass `-Image golang:1.26.5`.
+
+### 86. Chunked and raw-copy cold-copy reads have no reconnect-and-resume, on either engine (raised 2026-07-27 by the v0.103.0 regression cycle) — *open*
+
+**What.** ADR-0109 gives the per-table FULL-SCAN cold-copy read a bounded reconnect-and-resume: a classified transient mid-table opens a fresh reader and continues from a dup-free position. The CHUNKED path (`migcore/copy_helpers.go` → `ReadRowsBatchBounded`) and the raw-copy path (`ExportRawCopy`) have no equivalent. Both engines' readers now classify the underlying error correctly — MySQL and Postgres each route their batched read through their own `stream()` helper, whose `rows.Err()` exit is classified — so the gap is not classification. It is that the chunked caller does not consult it.
+
+**Observed.** Terminating the source backend mid-chunk aborts the copy on a Postgres source and, identically, on a MySQL source. `--resume` recovers cleanly (400000 = 400000 in the cycle's run), so this is a lost-progress and operator-intervention cost rather than a data-fidelity one. It is pre-existing: v0.102.0 behaves byte-identically.
+
+**Why it is worth doing.** The chunked path is the one a LARGE table takes — the case where losing the copy costs the most and where a mid-copy transient is most likely, because the read window is longest. The full-scan path, which does have the retry, is the one used for small tables that would have finished anyway.
+
+**Why it is filed rather than fixed.** The resume-position safety argument is the whole difficulty, and ADR-0109 §2 spells out why: a retry may only resume from a position that is provably dup-free AND loss-free. For the chunked reader that means reasoning about the keyset cursor and the chunk's upper bound together, and for `ExportRawCopy` it means a partially-written COPY stream on the target side. Neither is a wrapper around the existing helper.
+
+**Correction it produced.** v0.103.0's release notes claimed an engine asymmetry here ("aborted a Postgres cold copy while MySQL resumed"). That is true of the full-scan path and false of the chunked one, where neither engine resumes. The published notes and CHANGELOG were amended in v0.103.1.
