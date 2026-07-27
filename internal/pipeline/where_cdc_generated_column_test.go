@@ -6,11 +6,13 @@
 // The defect: a `--where` predicate referencing a GENERATED column compiled
 // cleanly and the cold-start copy was CORRECT (the predicate is pushed into
 // the source SELECT, which can read a generated column perfectly well), and
-// then the CDC leg silently dropped every matching INSERT forever. Neither
-// engine's change stream carries a generated column — MySQL's binlog decoder
-// skips them (engines/mysql/cdc_reader.go, `if col.IsGenerated() { continue }`)
-// and pgoutput's RelationMessage omits them before PG 18 — so the decoded row
-// had no such key, the comparison scored UNKNOWN, and the INSERT arm treated
+// then the CDC leg silently dropped every matching INSERT forever. A change
+// stream does not deliver a generated column to the filter: MySQL's binlog row
+// image DOES carry it, but sluice's decoder drops it on purpose so the target's
+// own GENERATED clause recomputes the value rather than freezing the source's
+// (engines/mysql/cdc_reader.go, `if col.IsGenerated() { continue }`), and
+// pgoutput omits it from RelationMessage before PG 18 — so either way the
+// decoded row had no such key, the comparison scored UNKNOWN, and the INSERT arm treated
 // that as "not in scope" and returned nil. Exit 0, green status, no warning.
 //
 // What made it survive review: the INSERT arm was the ONE row-bearing arm of

@@ -145,6 +145,19 @@ var (
 	_ ir.SourceFingerprintRecorder      = (*ChangeApplier)(nil)
 	_ ir.StreamCleaner                  = (*ChangeApplier)(nil)
 	_ ir.StreamIDSetter                 = (*ChangeApplier)(nil)
+	// audit 2026-07-26 ARCH-1: implemented and runtime-dispatched
+	// (vacuum_health_notify.go) but never pinned, so a receiver or signature
+	// change would leave every build and test GREEN while the alerter silently
+	// stopped starting — the operator's --notify-dead-tuple* thresholds
+	// permanently inert with no signal.
+	_ ir.TargetVacuumHealthReporter = (*ChangeApplier)(nil)
+
+	// Collation-resolver optional surface. audit 2026-07-26 QUAL-1: the
+	// temporal-literal lens is runtime-dispatched from rowpredicate, and a
+	// method drift would leave the build green while BOTH engines silently
+	// reverted to ClientExact — re-opening the exact granularity defect the
+	// previous release fixed.
+	_ ir.TemporalLiteralResolver = pgCollationResolver{}
 
 	// Logical-replication CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)

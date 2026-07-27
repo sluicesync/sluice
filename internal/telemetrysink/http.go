@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"time"
 
-	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/safeerr"
 )
 
 // defaultHTTPTimeout bounds one push. A sample push is advisory; it must
@@ -86,7 +86,7 @@ func (h *HTTPSink) Close() error { return nil }
 // credential, and both url.Parse (inside NewRequest) and client.Do wrap
 // failures in *url.Error whose Error() embeds the full URL. The caller
 // WARN-logs err.Error(), so every error below passes through
-// [diagnose.SafeParseError] to strip the wrapper.
+// [safeerr.SafeParseError] to strip the wrapper.
 func (h *HTTPSink) post(ctx context.Context, payload httpPayload) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -94,12 +94,12 @@ func (h *HTTPSink) post(ctx context.Context, payload httpPayload) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("telemetrysink: build push request: %w", diagnose.SafeParseError(err))
+		return fmt.Errorf("telemetrysink: build push request: %w", safeerr.SafeParseError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := h.client().Do(req)
 	if err != nil {
-		return fmt.Errorf("telemetrysink: push failed: %w", diagnose.SafeParseError(err))
+		return fmt.Errorf("telemetrysink: push failed: %w", safeerr.SafeParseError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

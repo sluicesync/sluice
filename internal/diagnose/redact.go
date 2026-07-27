@@ -24,9 +24,9 @@
 package diagnose
 
 import (
-	"errors"
-	"net/url"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/safeerr"
 )
 
 // SafeParseError sanitizes an error produced by [net/url.Parse] so it
@@ -52,13 +52,11 @@ import (
 // `.URL` field that carries the DSN. A non-`*url.Error` (and nil) is
 // returned unchanged: this only sanitizes the parse-ERROR path, never
 // alters valid-DSN handling.
-func SafeParseError(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) {
-		return uerr.Err
-	}
-	return err
-}
+// It delegates to [safeerr.SafeParseError], which is the leaf home of this
+// helper: dependency-light packages need it without dragging in this package
+// closure (audit 2026-07-26 ARCH-2). This wrapper stays so existing callers and
+// the diagnose API are unchanged.
+func SafeParseError(err error) error { return safeerr.SafeParseError(err) }
 
 // RedactDSN returns a credential-safe locator for the given DSN —
 // host[:port][/db] only, with userinfo + query string stripped.

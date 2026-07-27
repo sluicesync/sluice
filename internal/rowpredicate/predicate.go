@@ -263,9 +263,11 @@ type ColumnInfo struct {
 	TimeFractionAmbiguous bool
 
 	// Generated is true for a GENERATED / computed column. Such a column is
-	// REFUSED at compile time on the CDC leg, because neither engine's change
-	// stream carries it: MySQL's binlog decoder skips generated columns
-	// outright, and pgoutput's RelationMessage omits them before PG 18. The
+	// REFUSED at compile time on the CDC leg, because a change stream does not
+	// deliver it to the filter: MySQL's binlog row image DOES carry it, but
+	// sluice's decoder drops it on purpose so the target's own GENERATED
+	// clause recomputes the value rather than freezing the source's, and
+	// pgoutput omits it from RelationMessage before PG 18. The
 	// evaluator would therefore see no value for the column, score the
 	// comparison UNKNOWN, and — on the INSERT arm — silently DROP every row
 	// (audit 2026-07-26 SL-1, a released-code Critical).
@@ -441,9 +443,11 @@ func Compile(table, predicate string, infos map[string]ColumnInfo) (*Predicate, 
 	for _, col := range compiled.Columns() {
 		if infos[col].Generated {
 			return nil, refuse(table, predicate, fmt.Sprintf(
-				"column %q is a GENERATED column, which no supported change stream carries: "+
-					"MySQL's binlog omits generated columns and Postgres's pgoutput excludes them from "+
-					"RelationMessage before PG 18. The initial copy would be correct (the filter is pushed "+
+				"column %q is a GENERATED column, and a change stream does not deliver one to the filter. "+
+					"On MySQL the binlog row image DOES carry it, but sluice drops it from the decoded row on "+
+					"purpose so the target's own GENERATED clause recomputes the value instead of freezing the "+
+					"source's; on Postgres pgoutput omits it from RelationMessage before PG 18. Either way the "+
+					"predicate has no value to compare. The initial copy would be correct (the filter is pushed "+
 					"into the source SELECT, which CAN read the column) and the continuous leg would then "+
 					"silently drop every matching row. Rewrite the predicate against the columns the "+
 					"generation expression is built from",

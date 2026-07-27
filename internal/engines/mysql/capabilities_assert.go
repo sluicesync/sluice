@@ -26,7 +26,11 @@ import (
 var (
 	// Engine-level optional openers / orderers (value type — the
 	// registry holds Engine values, see init()).
-	_ ir.Engine                                = Engine{}
+	_ ir.Engine = Engine{}
+	// audit 2026-07-26 QUAL-1: the temporal-literal lens is runtime-dispatched
+	// from rowpredicate; without this pin a method drift reverts this engine to
+	// ClientExact silently, re-opening the granularity defect it was built for.
+	_ ir.TemporalLiteralResolver               = mysqlCollationResolver{}
 	_ ir.CollationResolverProvider             = Engine{}
 	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
