@@ -5,6 +5,7 @@ package backup
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,18 @@ import (
 // residual, and --require-signature is the operator's opt-in to refuse an
 // unsigned chain outright.
 
+// ADR-0181 (audit SEC-2): the v1 derivations below are raw
+// `"\nkey=" + value` concatenation, which is NOT injective — a
+// source-derived value carrying `\nschema=` forges a structural
+// boundary, so two DISTINCT parents can render to IDENTICAL bytes and a
+// chunk sealed under one opens cleanly under the other. From
+// [FormatVersionInjectiveChunkAAD] the same fields are rendered as the
+// `<len>:<bytes>\n` tokens the signature path already uses ([tok]),
+// which is injective by construction: a decoder reads exactly len bytes,
+// so no embedded delimiter can be misread as structure. The v1 encoding
+// is FROZEN — every v5–v8 chunk on every store depends on it byte-for-
+// byte — so v9 is a parallel derivation, never an edit of the old one.
+
 // chunkAADPrefix / cekBindingPrefix version the binding derivations
 // independently of the manifest FormatVersion. Part of the on-disk
 // contract for FormatVersion-5+ chunks; changing either strands every
@@ -68,6 +81,16 @@ import (
 const (
 	chunkAADPrefix   = "sluice-chunk-aad/v1\n"
 	cekBindingPrefix = "sluice-cek-binding/v1\n"
+
+	// chunkAADPrefixV2 / cekBindingPrefixV2 tag the ADR-0181 injective
+	// derivations ([FormatVersionInjectiveChunkAAD]+). They are TOKENS,
+	// not raw prefixes: the whole v2 stream is length-prefixed, so the tag
+	// goes through [tok] like every other field and carries no trailing
+	// newline of its own. Bumping the tag alongside the encoding gives the
+	// two derivations disjoint byte spaces even before the length prefixes
+	// do — a v1 and a v2 binding can never collide.
+	chunkAADPrefixV2   = "sluice-chunk-aad/v2"
+	cekBindingPrefixV2 = "sluice-cek-binding/v2"
 )
 
 // timeRFC3339Nano aliases the stdlib layout so the derivation above
@@ -75,14 +98,45 @@ const (
 // [ComputeBackupID]'s use of the same layout).
 const timeRFC3339Nano = time.RFC3339Nano
 
+// injectiveAAD reports whether m's RECORDED FormatVersion selects the
+// ADR-0181 length-prefixed binding encoding. Every binding derivation in
+// this file routes its encoding choice through this one predicate, so
+// the write side and the read side can never disagree about which
+// encoding a manifest's chunks were sealed under.
+func injectiveAAD(m *Manifest) bool {
+	return m != nil && m.FormatVersion >= FormatVersionInjectiveChunkAAD
+}
+
 // bindingIdentity renders the manifest-identity lines shared by
-// [ChunkAAD] and [CEKBinding]. Field order is part of the on-disk
-// contract; do not reorder. Mirrors [ComputeBackupID]'s rendering of
-// the same fields so the two identities can never disagree in format.
+// [ChunkAAD] and [CEKBinding] in the LEGACY (FormatVersion 5–8) raw-
+// concatenation encoding. Field order is part of the on-disk contract;
+// do not reorder. Mirrors [ComputeBackupID]'s rendering of the same
+// fields so the two identities can never disagree in format. FROZEN —
+// see the ADR-0181 note above.
 func bindingIdentity(m *Manifest) string {
 	return "created_at=" + m.CreatedAt.UTC().Format(timeRFC3339Nano) +
 		"\nsource_engine=" + m.SourceEngine +
 		"\nkind=" + canonicalKind(m.Kind)
+}
+
+// bindingIdentityTokens is [bindingIdentity] in the injective (v9+)
+// encoding: the same three fields in the same order, each rendered as a
+// length-prefixed name/value token pair.
+func bindingIdentityTokens(b *strings.Builder, m *Manifest) {
+	field(b, "created_at", m.CreatedAt.UTC().Format(timeRFC3339Nano))
+	field(b, "source_engine", m.SourceEngine)
+	field(b, "kind", canonicalKind(m.Kind))
+}
+
+// aadTokens renders fn's tokens into a fresh string. The token stream is
+// self-delimiting, so a binding built by CONCATENATING token groups (base
+// + parent table, base + ordinal) stays injective — which is what lets
+// the suffix helpers below keep appending onto [ChunkAAD]'s result the
+// way they always have.
+func aadTokens(fn func(*strings.Builder)) string {
+	var b strings.Builder
+	fn(&b)
+	return b.String()
 }
 
 // ChunkAAD returns the BASE AES-GCM additional-authenticated-data a chunk
@@ -115,9 +169,20 @@ func bindingIdentity(m *Manifest) string {
 // file is the chunk's manifest-recorded path ([ChunkInfo.File]) —
 // segment-relative, exactly as stored, which is what keeps the binding
 // stable when compaction relocates a whole segment directory.
+//
+// ADR-0181: at [FormatVersionInjectiveChunkAAD]+ the same fields are
+// rendered as length-prefixed tokens; below it the historical raw
+// concatenation is reproduced byte-for-byte.
 func ChunkAAD(m *Manifest, file string) []byte {
 	if m == nil || m.FormatVersion < FormatVersionEncryptedChunkBinding {
 		return nil
+	}
+	if injectiveAAD(m) {
+		return []byte(aadTokens(func(b *strings.Builder) {
+			tok(b, chunkAADPrefixV2)
+			bindingIdentityTokens(b, m)
+			field(b, "file", file)
+		}))
 	}
 	return []byte(chunkAADPrefix + bindingIdentity(m) + "\nfile=" + file)
 }
@@ -129,10 +194,21 @@ func ChunkAAD(m *Manifest, file string) []byte {
 // ORIGINAL table's AAD). Empty for pre-v7 manifests, so their row-chunk
 // AAD stays byte-identical to what shipped — the on-disk contract that
 // keeps every v5/v6 chain decryptable. Uses the same `\nkey=value` framing
-// as [bindingIdentity] and [ChangeChunkAAD]'s `\nindex=`.
+// as [bindingIdentity] and [ChangeChunkAAD]'s `\nindex=`, or — at
+// [FormatVersionInjectiveChunkAAD]+ — the length-prefixed token pairs
+// that make the whole binding injective (ADR-0181). This suffix is
+// exactly where the raw-concatenation forgery was OBSERVED: with
+// `\nschema=` embeddable in a source-derived table name, two distinct
+// parents rendered to identical bytes.
 func rowChunkTableBinding(m *Manifest, schema, table string) string {
 	if m == nil || m.FormatVersion < FormatVersionChunkTableBinding {
 		return ""
+	}
+	if injectiveAAD(m) {
+		return aadTokens(func(b *strings.Builder) {
+			field(b, "schema", schema)
+			field(b, "table", table)
+		})
 	}
 	return "\nschema=" + schema + "\ntable=" + table
 }
@@ -205,6 +281,11 @@ func ChangeChunkAAD(m *Manifest, file string, index int) []byte {
 	if base == nil {
 		return nil
 	}
+	if injectiveAAD(m) {
+		return append(base, aadTokens(func(b *strings.Builder) {
+			field(b, "index", strconv.Itoa(index))
+		})...)
+	}
 	return append(base, []byte("\nindex="+strconv.Itoa(index))...)
 }
 
@@ -221,10 +302,19 @@ func ChangeChunkAADFor(m *Manifest, c *ChunkInfo, index int) []byte {
 // chain-CEK wrap is bound to ([crypto.BoundEnvelope]), or "" for older
 // manifests whose CEKs were wrapped unbound. Same single-gate contract
 // as [ChunkAAD]: the manifest that RECORDS the wrap (the segment full
-// for per-chain mode) decides the shape on both wrap and unwrap.
+// for per-chain mode) decides the shape on both wrap and unwrap — which
+// is also what keeps the ADR-0181 encoding switch safe here, since a
+// chain extended by a v9 binary still unwraps its v7 root's CEK under
+// the v7 rendering.
 func CEKBinding(m *Manifest) string {
 	if m == nil || m.FormatVersion < FormatVersionEncryptedChunkBinding {
 		return ""
+	}
+	if injectiveAAD(m) {
+		return aadTokens(func(b *strings.Builder) {
+			tok(b, cekBindingPrefixV2)
+			bindingIdentityTokens(b, m)
+		})
 	}
 	return cekBindingPrefix + bindingIdentity(m)
 }

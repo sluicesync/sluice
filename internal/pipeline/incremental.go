@@ -376,9 +376,12 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// manifest is stamped accordingly — even when it extends an OLDER
 	// (pre-v5) chain, whose root keeps its own version and unbound
 	// shape (each link's chunks are gated by its OWN recorded version).
+	// ADR-0181: freshly written means freshly SEALED, so the stamp is the
+	// injective-AAD tier — there are no kept chunks here to strand, which
+	// is what separates this from the full-backup resume ladder.
 	// Must precede captureWindow so [irbackup.ChunkAAD] gates on.
 	if b.Encryption != nil {
-		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionInjectiveChunkAAD)
 	}
 	// ADR-0154: extend a signed chain as signed (stamps v6 + preflights
 	// the signer before the window opens). See [resolveSigning].

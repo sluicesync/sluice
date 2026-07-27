@@ -139,7 +139,7 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the ADR-0152 encrypted-chunk-binding version, the
+// ceiling is the ADR-0181 injective-chunk-AAD version, the
 // standalone-sequences version, the ADR-0086 in-progress sidecar
 // version and the Bug 116 security-metadata version keep their
 // historical slots, and the legacy value is frozen. If a future change
@@ -147,9 +147,16 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionCDCPositionBinding {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionCDCPositionBinding=%d (item 57 fold ceiling)",
-			BackupFormatVersion, FormatVersionCDCPositionBinding)
+	if BackupFormatVersion != FormatVersionInjectiveChunkAAD {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionInjectiveChunkAAD=%d (ADR-0181 ceiling)",
+			BackupFormatVersion, FormatVersionInjectiveChunkAAD)
+	}
+	// The ladder is strictly ascending — the AAD gates are `>=` comparisons,
+	// so a reordered constant would silently reroute a whole tier's chunks
+	// to the wrong encoding.
+	if FormatVersionInjectiveChunkAAD <= FormatVersionCDCPositionBinding {
+		t.Errorf("FormatVersionInjectiveChunkAAD (%d) must be strictly greater than FormatVersionCDCPositionBinding (%d)",
+			FormatVersionInjectiveChunkAAD, FormatVersionCDCPositionBinding)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)

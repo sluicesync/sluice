@@ -231,6 +231,17 @@ func WrapChainCEK(env crypto.EnvelopeEncryption, cek []byte, owner *irbackup.Man
 	return env.WrapCEK(cek)
 }
 
+// CEKUnwrapHint is the operator-facing parenthetical every chain-CEK
+// unwrap failure carries. Naming ONLY the passphrase/key would send an
+// operator holding the correct key down the wrong path: the wrap is
+// BOUND to the owner manifest ([irbackup.CEKBinding] — its identity
+// since ADR-0152, and from [irbackup.FormatVersionInjectiveChunkAAD] its
+// recorded format version too), so an edited manifest fails here with a
+// perfectly good key. That binding is load-bearing, not incidental: it
+// is what refuses a format-version relabel on an UNSIGNED encrypted
+// chain, ahead of the ADR-0154 signature backstop.
+const CEKUnwrapHint = "wrong passphrase / KMS key, or an edited manifest — the CEK wrap is bound to the manifest's identity and recorded format version"
+
 // UnwrapChainCEK is the read-side mirror of [WrapChainCEK] and the
 // single chokepoint every chain-CEK unwrap routes through (restore /
 // chain-restore / broker / verify preflights, backup-full resume,

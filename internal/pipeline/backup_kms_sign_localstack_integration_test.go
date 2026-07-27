@@ -136,8 +136,8 @@ func TestBackup_KMSSign_EncryptedChain_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadManifest: %v", err)
 	}
-	if full.FormatVersion != irbackup.FormatVersionChunkTableBinding {
-		t.Fatalf("signed full manifest FormatVersion = %d, want %d (SEC-F1 row-chunk table binding)", full.FormatVersion, irbackup.FormatVersionChunkTableBinding)
+	if full.FormatVersion != irbackup.FormatVersionInjectiveChunkAAD {
+		t.Fatalf("signed full manifest FormatVersion = %d, want %d (SEC-F1 table binding, SEC-2 injective encoding)", full.FormatVersion, irbackup.FormatVersionInjectiveChunkAAD)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{Engine: "postgres", Token: fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN)}

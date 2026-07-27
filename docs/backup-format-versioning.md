@@ -74,6 +74,21 @@ Every backup chain root manifest carries a `FormatVersion` field:
   capability (audit-2026-07-11 H-1), and `--require-signature` closes the whole
   unsigned manifest-edit class. An older binary refuses a v8 manifest loudly at
   preflight rather than recompute-mismatching its `BackupID`.
+- **`FormatVersion=9`** — an **encrypted** manifest whose chunk bindings use
+  the **injective** length-prefixed encoding (`--encrypt`, v0.104.0+,
+  ADR-0181). Through v8 the AES-GCM AAD was built by raw `"\nkey=" + value`
+  concatenation, which two distinct field tuples can collide on: a
+  source-derived table name carrying `\nschema=` forges a structural boundary,
+  so a chunk sealed under one parent opens cleanly under another. v9 renders
+  the same fields as the `<len>:<bytes>\n` tokens the manifest signature
+  already used — injective by construction, because a decoder reads exactly
+  *len* bytes and no embedded delimiter can be read as structure. Stamped on
+  **any fresh encrypted backup or CDC segment, signed or not**; a *plaintext*
+  backup keeps its schema-derived version, and a resumed pre-v9 chain keeps its
+  prior version so its already-sealed chunks still decrypt. Existing chains are
+  **not** re-sealed and need no migration — each one keeps opening under the
+  version it records. An older binary refuses a v9 manifest loudly at preflight
+  rather than recomputing the old AAD against chunks sealed with the new one.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version
@@ -263,9 +278,10 @@ The contract is pinned by three integration tests:
   - Nil-element tolerance in the table slice
   - Agreement between the internal `chooseFormatVersion` and the
     exported `FormatVersionFor`
-  - The constant invariant `BackupFormatVersion ==
-    FormatVersionSecurityMetadata` (defense-in-depth for the
-    "constants drift on a future bump" failure mode)
+  - The constant invariant that `BackupFormatVersion` equals the
+    highest declared tier — `FormatVersionInjectiveChunkAAD` today
+    (defense-in-depth for the "constants drift on a future bump"
+    failure mode)
 - **`TestBackupFormatVersion_Bumped`** — pins the constant invariant
   explicitly.
 - **`TestBackup_FormatVersion_Bug116`** at the pipeline-orchestrator

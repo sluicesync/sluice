@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,8 +89,8 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadManifest: %v", err)
 	}
-	if full.FormatVersion != irbackup.FormatVersionChunkTableBinding {
-		t.Fatalf("full FormatVersion = %d; want %d (signed encrypted → row-chunk table binding, SEC-F1)", full.FormatVersion, irbackup.FormatVersionChunkTableBinding)
+	if full.FormatVersion != irbackup.FormatVersionInjectiveChunkAAD {
+		t.Fatalf("full FormatVersion = %d; want %d (signed encrypted → table-bound row chunks with the SEC-2 injective AAD)", full.FormatVersion, irbackup.FormatVersionInjectiveChunkAAD)
 	}
 	if signed, _ := lineage.ChainIsSigned(context.Background(), store); !signed {
 		t.Fatal("chain not detected as signed (lineage.json.sig missing)")
@@ -152,7 +153,7 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 	}
 	// downgradeFormatVersion rewrites a manifest's format_version in place
 	// (keeping its signature), simulating the signed->unsigned downgrade
-	// attack (v7 signed-encrypted -> v5 unsigned-encrypted).
+	// attack (v9 signed-encrypted -> v5 unsigned-encrypted).
 	downgradeFormatVersion := func(path string, orig []byte) {
 		var m irbackup.Manifest
 		if err := json.Unmarshal(orig, &m); err != nil {
@@ -172,6 +173,9 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 		// structural Kind/parent checks AHEAD of the signature backstop —
 		// defense in depth, still a loud refusal, just a different code).
 		wantCode sluicecode.Code
+		// wantMsg, when set, is a substring the refusal must name — the
+		// non-vacuity guard for the cases that are deliberately uncoded.
+		wantMsg string
 	}{
 		{
 			name: "corrupt full manifest signature",
@@ -194,16 +198,26 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 		},
 		{
 			// CRITICAL: a signed->v5 FormatVersion downgrade (with the .sig
-			// files left intact) must NOT let the verifier skip checks —
-			// format_version is inside the signed bytes, so verification is
-			// forced by the signature's PRESENCE and then fails the MAC.
+			// files left intact) must NOT let the verifier skip checks.
+			//
+			// Which layer refuses it moved with ADR-0181, and moved EARLIER.
+			// format_version is inside the signed bytes, so the signature
+			// backstop still covers it — but from FormatVersion 9 the chain
+			// CEK's wrap is bound to the manifest's recorded version too, so
+			// the edit is refused at the CEK unwrap before the signature is
+			// ever consulted. That is the stronger layer of the two: it does
+			// not depend on the chain being signed at all, so an UNSIGNED
+			// encrypted v9 chain gets the same refusal. Asserted on the
+			// message rather than a code because the unwrap failure is not a
+			// coded class.
 			name: "format-version downgrade (signed->v5) with sigs intact",
 			apply: func() {
 				downgradeFormatVersion(lineage.ManifestFileName, fullManifestBytes)
 				downgradeFormatVersion(incrPath, incrManifestBytes)
 			},
 			undo:     func() {},
-			wantCode: sluicecode.CodeBackupSignatureInvalid,
+			wantCode: "", // refused ahead of the signature backstop
+			wantMsg:  lineage.CEKUnwrapHint,
 		},
 		{
 			name: "truncated change-list tail",
@@ -263,6 +277,9 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 				if ce, ok := sluicecode.FromError(err); !ok || ce.Code != tc.wantCode {
 					t.Fatalf("got %v (code ok=%v), want %s", err, ok, tc.wantCode)
 				}
+			}
+			if tc.wantMsg != "" && !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("got %v; want a refusal naming %q", err, tc.wantMsg)
 			}
 			// Target must be empty — the refusal is a preflight, before any
 			// data lands.

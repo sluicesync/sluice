@@ -188,7 +188,7 @@ func (s *chainCodecSniffer) probeCEK(chunk *irbackup.ChunkInfo) ([]byte, error) 
 	}
 	cek, err := UnwrapChainCEK(s.env, s.chainRoot.ChainEncryption.WrappedCEK, s.chainRoot)
 	if err != nil {
-		return nil, fmt.Errorf("codec probe: unwrap chain cek (wrong passphrase / KMS key?): %w", err)
+		return nil, fmt.Errorf("codec probe: unwrap chain cek (%s): %w", CEKUnwrapHint, err)
 	}
 	s.chainCEK = cek
 	return cek, nil
