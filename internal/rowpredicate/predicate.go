@@ -248,6 +248,20 @@ type ColumnInfo struct {
 	// normalization: the pre-Q1 full-precision compare, which the push-down
 	// classifier keeps out of any server-side envelope as its fail-closed belt.
 	TemporalSemantics ir.TemporalLiteralSemantics
+
+	// Generated is true for a GENERATED / computed column. Such a column is
+	// REFUSED at compile time on the CDC leg, because neither engine's change
+	// stream carries it: MySQL's binlog decoder skips generated columns
+	// outright, and pgoutput's RelationMessage omits them before PG 18. The
+	// evaluator would therefore see no value for the column, score the
+	// comparison UNKNOWN, and — on the INSERT arm — silently DROP every row
+	// (audit 2026-07-26 SL-1, a released-code Critical).
+	//
+	// The cold-start snapshot's agreement is what makes this so dangerous: the
+	// predicate is pushed into the source SELECT, where the generated column
+	// is perfectly readable, so the initial copy is CORRECT and only the CDC
+	// leg silently under-delivers.
+	Generated bool
 	// TemporalDateOnly is meaningful only for [FamilyTemporal]: true for a
 	// DATE column, whose literal [ir.TemporalLiteralCastToColumn] (Postgres)
 	// truncates to the date, while the promote engines (MySQL family) compare
@@ -289,7 +303,12 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 		if c == nil {
 			continue
 		}
-		out[strings.ToLower(c.Name)] = columnInfoFor(resolver, c, strict, temporal)
+		info := columnInfoFor(resolver, c, strict, temporal)
+		// Set OUTSIDE columnInfoFor's type switch: whether a column is
+		// generated is orthogonal to its family, and threading it through
+		// every arm is exactly how one arm comes to forget it.
+		info.Generated = c.IsGenerated()
+		out[strings.ToLower(c.Name)] = info
 	}
 	return out
 }
@@ -385,7 +404,27 @@ func Compile(table, predicate string, infos map[string]ColumnInfo) (*Predicate, 
 	if !p.atEnd() {
 		return nil, refuse(table, predicate, fmt.Sprintf("unexpected %q after a complete expression", p.peek().text))
 	}
-	return &Predicate{root: root, text: predicate}, nil
+	compiled := &Predicate{root: root, text: predicate}
+	// A GENERATED column is refused here rather than tolerated, because the
+	// CDC leg cannot evaluate it and the failure mode is SILENT: the row
+	// arrives without the column, the comparison scores UNKNOWN, and the
+	// INSERT arm drops it. Refusing at compile time means the operator hears
+	// about it before any data moves, instead of after a cold start that
+	// looked perfect (audit 2026-07-26 SL-1).
+	for _, col := range compiled.Columns() {
+		if infos[col].Generated {
+			return nil, refuse(table, predicate, fmt.Sprintf(
+				"column %q is a GENERATED column, which no supported change stream carries: "+
+					"MySQL's binlog omits generated columns and Postgres's pgoutput excludes them from "+
+					"RelationMessage before PG 18. The initial copy would be correct (the filter is pushed "+
+					"into the source SELECT, which CAN read the column) and the continuous leg would then "+
+					"silently drop every matching row. Rewrite the predicate against the columns the "+
+					"generation expression is built from",
+				col,
+			))
+		}
+	}
+	return compiled, nil
 }
 
 func refuse(table, predicate, reason string) error {

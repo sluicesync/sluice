@@ -193,6 +193,19 @@ func isSecretFlag(name string) bool {
 	switch name {
 	case "--planetscale-metrics-token",
 		"--planetscale-metrics-token-id",
+		// The fleet/service-token family (audit 2026-07-26 SEC-1). These were
+		// missed when metrics-watch grew org-wide discovery: the bundle's whole
+		// documented purpose is to be attached to a GitHub issue, and a
+		// PlanetScale service token was landing in it verbatim, two lines below
+		// a correctly-redacted DSN. The gate in cmd/sluice keeps this list
+		// honest as new credential-shaped flags appear.
+		"--planetscale-service-token",
+		"--planetscale-service-token-id",
+		"--service-token",
+		"--service-token-id",
+		// A signed scrape/sink URL carries its credential in the query string,
+		// so it is secret even though it looks like an endpoint.
+		"--sink-http",
 		"--notify-webhook",
 		"--notify-slack",
 		"--notify-smtp-password",
@@ -201,3 +214,9 @@ func isSecretFlag(name string) bool {
 	}
 	return false
 }
+
+// IsSecretFlag reports whether a CLI flag's VALUE must never appear in a
+// diagnose bundle. Exported so the cmd/sluice kong-model gate can assert that
+// every credential-shaped flag in the real CLI model is covered here — the
+// allowlist is only as good as the thing that notices when it falls behind.
+func IsSecretFlag(name string) bool { return isSecretFlag(name) }

@@ -898,7 +898,20 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 		}
 
 		if errMsg, ok := raw.(*pgproto3.ErrorResponse); ok {
-			r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: server error: %s", errMsg.Message)))
+			// Carry the SQLSTATE, not just the message text (audit 2026-07-26
+			// SL-13). classifyReaderError reaches the code via
+			// errors.As(*pgconn.PgError), so formatting the ErrorResponse with
+			// %s discarded exactly the field the classifier decides on: every
+			// server-responded error — including the transient 57P0x/40001
+			// shapes ADR-0038 lists as retriable — arrived as an opaque string
+			// and was therefore treated as terminal.
+			r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: server error: %w", &pgconn.PgError{
+				Severity: errMsg.Severity,
+				Code:     errMsg.Code,
+				Message:  errMsg.Message,
+				Detail:   errMsg.Detail,
+				Hint:     errMsg.Hint,
+			})))
 			return
 		}
 		copyData, ok := raw.(*pgproto3.CopyData)
@@ -923,11 +936,22 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
 			if err != nil {
-				r.setErr(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err))
+				r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err)))
 				return
 			}
+			// Classify DISPATCH errors, not just Receive errors — the Postgres
+			// sibling of the MySQL Bug 207 sites (audit 2026-07-26 SL-2).
+			// dispatchWAL is not merely decoding buffered bytes: it runs LIVE
+			// catalog queries on the reader's own *sql.DB
+			// (resolveColumnStableIDs → pg_attribute on every RelationMessage,
+			// resolveIdentityKeyCols → pg_index, ensureExtensionTypeOIDs,
+			// ensureEnumTypeOIDs). pgoutput re-sends Relation on first touch
+			// after every reconnect — precisely when a pooler is least healthy
+			// — so a routine connection fault there surfaced here and, parked
+			// raw, was TERMINAL on exactly the shape nettransient exists to
+			// ride out.
 			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
-				r.setErr(err)
+				r.setErr(classifyReaderError(err))
 				return
 			}
 		}

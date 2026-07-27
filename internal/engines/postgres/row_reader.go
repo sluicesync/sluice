@@ -280,7 +280,17 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 	}
 
 	if err := rows.Err(); err != nil {
-		r.setErr(fmt.Errorf("postgres: rows iteration: %w", err))
+		// ADR-0109's cold-copy source-READ reconnect-and-resume is
+		// engine-NEUTRAL: it rides on errors.As(&ir.RetriableError) over
+		// whatever the reader parks here. MySQL's twin has classified this
+		// site since ADR-0109; Postgres never did, so a mid-table source drop
+		// on a PG cold copy — the very shape ADR-0109 was written for, a
+		// stalled target backpressuring until the source closes the idle read
+		// connection — aborted the whole copy instead of reconnecting and
+		// resuming. A retry technique that landed in one engine and silently
+		// missed its sibling (audit 2026-07-26; found by the shared setErr
+		// gate the moment it could see this package).
+		r.setErr(classifyApplierError(fmt.Errorf("postgres: rows iteration: %w", err)))
 	}
 }
 

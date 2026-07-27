@@ -499,17 +499,24 @@ func partialBeforeImage(op, schema, table, column string) error {
 // reaches this filter; anything that still arrives incomplete would be
 // mis-classified as a move-OUT and DELETE an in-scope row on the target,
 // so the stream stops loudly instead.
-func partialAfterImage(schema, table, column string) error {
+func partialAfterImage(op, schema, table, column string) error {
+	// The consequence differs by arm, and saying the wrong one sends the
+	// operator hunting the wrong bug: an incomplete UPDATE after-image emits a
+	// spurious DELETE, while an incomplete INSERT after-image silently drops
+	// the row.
+	consequence := "could emit a spurious DELETE for a row still in scope at the source"
+	if op == "INSERT" {
+		consequence = "would silently DROP a row that is in scope at the source — no error, exit 0, and green sync status"
+	}
 	return sluicecode.Wrap(
 		sluicecode.CodeWhereCDCAfterImage,
-		"ensure MySQL binlog_row_image=FULL / PG REPLICA IDENTITY FULL on the filtered table, then restart the sync; if the source is a Postgres 15+ logical stream this shape should be impossible (the reader backfills unchanged-TOAST columns) — report it as a bug",
+		"ensure MySQL binlog_row_image=FULL / PG REPLICA IDENTITY FULL on the filtered table, then restart the sync; if the predicate references a GENERATED column it is refused at startup instead (no change stream carries one); if the source is a Postgres 15+ logical stream this shape should be impossible (the reader backfills unchanged-TOAST columns) — report it as a bug",
 		fmt.Errorf(
-			"continuous filtered sync: an UPDATE on filtered table %s arrived with an AFTER-image that omits column %q, "+
-				"which the --where predicate references — so --where cannot decide whether the row moved out of the "+
-				"filter's scope. Evaluating the row-move over the missing column would read it as NULL and could emit a "+
-				"spurious DELETE for a row still in scope at the source. The stream stops here rather than mis-classify "+
-				"the row",
-			qualifiedTableName(schema, table), column,
+			"continuous filtered sync: an %s on filtered table %s arrived with an AFTER-image that omits column %q, "+
+				"which the --where predicate references — so --where cannot evaluate the row against the filter. "+
+				"Evaluating over the missing column would read it as NULL and %s. The stream stops here rather than "+
+				"mis-classify the row",
+			op, qualifiedTableName(schema, table), column, consequence,
 		),
 	)
 }
@@ -657,7 +664,21 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 	switch e := c.(type) {
 	case ir.Insert:
 		p := f.predicateFor(e.Table)
-		if p == nil || p.Eval(e.Row) {
+		if p == nil {
+			return []ir.Change{e}, nil
+		}
+		// The completeness check is per-IMAGE, not per-arm: ANY row image
+		// missing a predicate column evaluates UNKNOWN→false, and on this arm
+		// that silently DROPS the insert. This arm was the one of four
+		// without the check, which is how the generated-column Critical
+		// (audit 2026-07-26 SL-1) went silent in released code. Generated
+		// columns are now refused at compile time, so what reaches here is
+		// any OTHER producer of an incomplete after-image — and a loud
+		// refusal beats losing rows at exit 0.
+		if miss, ok := f.imageMissingColumn(e.Table, e.Row); !ok {
+			return nil, partialAfterImage("INSERT", e.Schema, e.Table, miss)
+		}
+		if p.Eval(e.Row) {
 			return []ir.Change{e}, nil
 		}
 		f.debugServerDeliveredDrop("INSERT", e.Schema, e.Table)
@@ -700,7 +721,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		// slipped past every reader-side guarantee; refusing beats deleting
 		// a row the source still holds.
 		if miss, ok := f.imageMissingColumn(e.Table, e.After); !ok {
-			return nil, partialAfterImage(e.Schema, e.Table, miss)
+			return nil, partialAfterImage("UPDATE", e.Schema, e.Table, miss)
 		}
 		before := p.Eval(e.Before)
 		after := p.Eval(e.After)
