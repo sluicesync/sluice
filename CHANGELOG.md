@@ -4,6 +4,30 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.103.2] - 2026-07-27
+
+One warning that was missing, and the gates that stop three recurring mistakes from recurring. Drop-in upgrade, no flag changes, no behaviour changes to any data path.
+
+### Fixed
+
+**A `DEFERRABLE PRIMARY KEY` is no longer dropped silently against a MySQL-family target.** InnoDB has no deferred-constraint concept, so the attribute genuinely cannot be carried — but it vanished without a word, while a `DEFERRABLE UNIQUE` and a `DEFERRABLE FOREIGN KEY` in the same schema and the same migrate run both warned. The consequence is the one the attribute exists for: a bulk key shift like `UPDATE t SET id = id + 1` commits on the source and fails partway through on the target with a duplicate-key error. It now warns, naming the table, the constraint and that consequence. A Postgres target carries the attribute properly, so this affects MySQL-family targets only.
+
+### Internal
+
+**Three gates, each built for a mistake that had already happened more than once.**
+
+The first holds the operator documentation's filtered-sync engine list to the code. Three consecutive releases described *which engines* a filtered-sync behaviour applied to, and got it wrong each time; the worst of them told SQLite and trigger-CDC operators their targets had been diverging silently, for a mode those engines refuse at preflight and could never have entered. A filtered continuous sync requires the source's change stream to deliver full row before-images, which is declared by a compile-time capability pin — so the gate derives the engine set from those pins and fails if the doc disagrees. The documentation also gained the sentence a reader actually needed and never had: which sources can run a filtered continuous sync, why the others cannot, and that `migrate --where` is unaffected.
+
+The second requires every optional capability discovered at runtime to have a compile-time pin. That discovery idiom fails silently by construction — if an implementing method's receiver or signature drifts, the check simply stops matching, and the build, the vet pass and every test stay green while the feature quietly stops existing. Two capabilities had already fallen through, one of which would have left every dead-tuple alert threshold permanently inert with no signal at all.
+
+The third holds the telemetry sink's two outputs to the byte-identity its documentation promises. That promise was false for `<`, `>` and `&` — and a pin for exactly this existed and could not see it, because its fixture used a character set the encoder never re-escapes. The replacement drives the same nine-shape corpus through both sinks, organised around what could make the two paths differ rather than around what looks like a realistic value.
+
+**Smaller repairs in the same pass.** The telemetry sink now narrows an over-permissive existing file to owner-only rather than promising that in documentation and only enforcing it at creation; the local race-detector gate script, which is the pre-tag gate for concurrency work, no longer fails to parse under Windows PowerShell and no longer defaults to a toolchain older than the module requires; and a load-bearing comment that justified an error carve-out with a mechanism replaced a release earlier now states the reason that is currently true.
+
+### Compatibility
+
+No breaking changes and no flag changes. The only behaviour difference is one additional warning during schema creation against a MySQL-family target, in a case that previously produced silence.
+
 ## [0.103.1] - 2026-07-27
 
 Two of v0.103.0's fixes were shipped inert — present in the code, unreachable from the path that would have used them. Both were found by the post-release regression cycle running the released binary against real databases, and both are corrected here. Drop-in upgrade; one CLI change affects `metrics-watch` org-wide mode only.
