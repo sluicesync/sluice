@@ -71,12 +71,14 @@ func TestSetErrSitesClassify(t *testing.T) {
 		"cdc_snapshot_concurrent_resume.go:ctx.Err()":                     "the caller's own cancellation, never a source fault",
 		"row_reader.go:ctx.Err()":                                         "the caller's own cancellation, never a source fault",
 		`row_reader.go:fmt.Errorf("mysql: column %q: %w", col.Name, err)`: "a value decode / zero-date-policy fault is a data-fidelity error: no retry can change the bytes, and classifying it risks routing corruption to a retry loop",
-		// NOT settled — see roadmap item 83. A rows.Scan failure mid-copy can be
-		// an ordinary connection drop, which nettransient would ride out, so this
-		// may be a genuine Bug-207 sibling on the BULK path. Allowlisted to keep
-		// the gate green while the question is investigated properly rather than
-		// answered in haste; the roadmap entry is the commitment to come back.
-		`row_reader.go:fmt.Errorf("mysql: scan: %w", err)`: "OPEN QUESTION (roadmap item 83): may be transient; deliberately not changed without establishing whether the bulk path already retries it upstream",
+		// SETTLED (roadmap item 83) by killing a real connection mid-stream in
+		// TestRowReader_MidStreamConnectionDrop_IsClassifiedRetriable: the drop
+		// surfaces at the SIBLING rows.Err() exit, which IS classified. This exit
+		// is not on the transient path — database/sql records a driver failure in
+		// lasterr and Next() returns false, so the loop exits without ever
+		// re-entering Scan — and its destinations are *any, which convertAssign
+		// cannot fail on. Classifying here would be unreachable code.
+		`row_reader.go:fmt.Errorf("mysql: scan: %w", err)`: "settled by the mid-stream-drop probe (item 83): a real connection drop surfaces at the classified rows.Err() exit, never here; this exit is not on the transient path",
 	}
 
 	fset := token.NewFileSet()
