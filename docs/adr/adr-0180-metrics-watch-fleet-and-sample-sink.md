@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted — implemented 2026-07-24 (unreleased at time of writing).** Roadmap item 75 parts **(b)** and **(c)**. Part **(a)** — the egress metric — is deliberately NOT built here: a live measurement (`workspace/ps-egress-metric-semantics-2026-07-24.md`) falsified its filed plan, and the family choice is unresolved pending a question to PlanetScale. Adding no egress field at all is the honest outcome; the surfaces below are shaped so one can be added later as further nullable record fields + one more gauge family, without reshaping anything.
+**Accepted — implemented 2026-07-24, shipped in v0.102.0.** Roadmap item 75 parts **(b)** and **(c)**. Part **(a)** — the egress metric — is deliberately NOT built here: a live measurement (`workspace/ps-egress-metric-semantics-2026-07-24.md`) falsified its filed plan, and the family choice is unresolved pending a question to PlanetScale. Adding no egress field at all is the honest outcome; the surfaces below are shaped so one can be added later as further nullable record fields + one more gauge family, without reshaping anything.
 
 Shipped surface: `metrics-watch` with `--planetscale-metrics-db` OMITTED now watches the whole org; `--include-database` / `--exclude-database` / `--fleet-concurrency` scope and pace the fan-out; `--sink-file` / `--sink-file-max-bytes` / `--sink-file-max-files` / `--sink-http` durably record every polled sample. New packages/types: `ir.FleetTelemetry` + `ir.FleetTarget` + `ir.FleetHealthSample` (the engine-neutral seam), `planetscale/telemetry.Fleet` (the provider), `internal/telemetrysink` (the sink layer).
 
