@@ -597,9 +597,14 @@ type Index struct {
 	// on the IR (and therefore the backup/schema-history wire, where the
 	// bools ride the default struct JSON) so that follow-up can emit them
 	// without a wire change.
-	ConstraintDeferrable       bool
-	ConstraintNullsNotDistinct bool
-	ConstraintWithoutOverlaps  bool
+	ConstraintDeferrable bool
+	// ConstraintInitiallyDeferred distinguishes DEFERRABLE INITIALLY DEFERRED
+	// from DEFERRABLE INITIALLY IMMEDIATE. Without it the two collapse, and
+	// they differ in behaviour: only INITIALLY DEFERRED lets a transaction
+	// violate the constraint mid-way and satisfy it by COMMIT.
+	ConstraintInitiallyDeferred bool
+	ConstraintNullsNotDistinct  bool
+	ConstraintWithoutOverlaps   bool
 	// Kind is the storage structure (btree, hash, gin, etc.).
 	Kind IndexKind
 	// Method is the verbatim engine-specific access-method name when

@@ -1415,6 +1415,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- version-gated expressions (PG 15+ / PG 18+; constant
 			-- false below — see uniqueConstraintAttrExprs).
 			COALESCE(ucon.condeferrable, false) AS con_deferrable,
+			COALESCE(ucon.condeferred, false) AS con_initially_deferred,
 			` + nullsNotDistinctExpr + ` AS con_nulls_not_distinct,
 			` + periodExpr + ` AS con_period,
 			-- ADR-0047: is the access method owned by an extension
@@ -1473,7 +1474,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			&row.colName, &row.ord, &row.opclass, &row.opclassDefault, &row.exprText,
 			&row.nKeyAtts, &row.indOption, &row.predicate,
 			&row.constraintBacked,
-			&row.conDeferrable, &row.conNullsNotDistinct, &row.conPeriod,
+			&row.conDeferrable, &row.conInitiallyDeferred, &row.conNullsNotDistinct, &row.conPeriod,
 			&row.amExtOwned, &row.opclassExtOwned,
 		); err != nil {
 			return err
@@ -1531,19 +1532,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 // ordering / opclass / predicate metadata. isExpr is derived after the
 // scan (an expression key has an empty column name).
 type indexRow struct {
-	tableName, indexName, method, colName         string
-	isUnique, isPrimary                           bool
-	ord                                           int
-	opclass                                       string
-	opclassDefault                                bool
-	exprText                                      string
-	nKeyAtts                                      int
-	indOption                                     int
-	predicate                                     string
-	constraintBacked                              bool
-	conDeferrable, conNullsNotDistinct, conPeriod bool
-	amExtOwned, opclassExtOwned                   bool
-	isExpr                                        bool
+	tableName, indexName, method, colName string
+	isUnique, isPrimary                   bool
+	ord                                   int
+	opclass                               string
+	opclassDefault                        bool
+	exprText                              string
+	nKeyAtts                              int
+	indOption                             int
+	predicate                             string
+	constraintBacked                      bool
+	conDeferrable, conInitiallyDeferred   bool
+	conNullsNotDistinct, conPeriod        bool
+	amExtOwned, opclassExtOwned           bool
+	isExpr                                bool
 }
 
 // uniqueConstraintAttrExprs returns the SQL select expressions for the
@@ -1682,9 +1684,10 @@ func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
 		// constraint's attributes — no emitter reads these yet; the
 		// read-time WARN (warnWeakenedUniqueConstraint) names the
 		// plain-UNIQUE weakening every target currently lands.
-		ConstraintDeferrable:       attrOwned && row.conDeferrable,
-		ConstraintNullsNotDistinct: attrOwned && row.conNullsNotDistinct,
-		ConstraintWithoutOverlaps:  attrOwned && row.conPeriod,
+		ConstraintDeferrable:        attrOwned && row.conDeferrable,
+		ConstraintInitiallyDeferred: attrOwned && row.conInitiallyDeferred,
+		ConstraintNullsNotDistinct:  attrOwned && row.conNullsNotDistinct,
+		ConstraintWithoutOverlaps:   attrOwned && row.conPeriod,
 	}
 	// ADR-0032: preserve extension-introduced access-method
 	// names (ivfflat, hnsw) verbatim so the same-engine writer

@@ -1337,7 +1337,19 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	}
 
 	if table.PrimaryKey != nil {
-		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns, opts))
+		pk := "PRIMARY KEY " + emitIndexColumnList(table.PrimaryKey.Columns, opts)
+		// A DEFERRABLE primary key is a real behavioural difference, not a
+		// cosmetic one: the classic bulk key shift UPDATE t SET id = id + 1
+		// commits against it and aborts against an immediate PK (audit
+		// 2026-07-26 SL-8). The flag is only ever set when the source said so,
+		// so unfiltered output is unchanged.
+		if table.PrimaryKey.ConstraintDeferrable {
+			pk += " DEFERRABLE"
+			if table.PrimaryKey.ConstraintInitiallyDeferred {
+				pk += " INITIALLY DEFERRED"
+			}
+		}
+		parts = append(parts, pk)
 	}
 
 	// Bug 125 cross-engine symmetry: for a PK-less table, promote a

@@ -1754,3 +1754,13 @@ The only forward-looking piece is the `--smart-compaction` default flip — gate
 ### Foundational ADRs (0001–0029)
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
+
+### 84. PRIMARY KEY constraint-name fidelity (raised 2026-07-27 by the extended dump-parity seed) — *open*
+
+**What.** sluice emits `PRIMARY KEY (cols)` inline in `CREATE TABLE`, so Postgres auto-names the constraint `<table>_pkey`. A source that named its primary key explicitly (`CONSTRAINT orders_pk PRIMARY KEY (id)`) loses that name on the target.
+
+**Why it matters.** Enforcement is identical — same columns, same uniqueness — so this is not a data-fidelity issue. It breaks *references* to the name: `INSERT … ON CONFLICT ON CONSTRAINT orders_pk` fails on the migrated target, as does any DDL or tooling that names the constraint. An application that uses the named-constraint form of upsert would break at cutover with a confusing "constraint does not exist".
+
+**Why it is not a one-liner.** The obvious fix — emit `CONSTRAINT <PrimaryKey.Name> PRIMARY KEY (…)` — is wrong cross-engine. A MySQL source's PK index is literally named `PRIMARY`, so it would emit `CONSTRAINT PRIMARY PRIMARY KEY (…)`: a reserved word, and a name no operator asked for. The rule has to be source-engine aware (carry an explicit name only when the source engine names PKs meaningfully, and never when the name is the engine's own placeholder), which is a design decision rather than an emitter tweak.
+
+**How it was found.** The audit-2026-07-26 SL-9 seed extension added a table with an explicitly-named PK to exercise the DEFERRABLE axis, and the dump-parity oracle immediately reported the name divergence — a gap that had been invisible because every prior seed table let Postgres name its own PK. Two allowlist entries in `dumpparity_allowlist.go` keep it visible in the ledger (allowlist hits are logged every run) and will go stale-loud when this ships.

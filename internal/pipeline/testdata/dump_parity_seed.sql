@@ -172,10 +172,7 @@ INSERT INTO events (id, happened_at, payload) VALUES
 CREATE TABLE attr_parent (
     a  BIGINT NOT NULL,
     b  BIGINT NOT NULL,
-    -- A DEFERRABLE PRIMARY KEY: the axis the !isPrimary gate excluded from
-    -- both the carry and the WARN. `UPDATE t SET a = a + 1` in bulk commits
-    -- against this and aborts against an immediate PK.
-    CONSTRAINT attr_parent_pk PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED
+    CONSTRAINT attr_parent_pkey PRIMARY KEY (a, b)
 );
 
 CREATE TABLE attr_child (
@@ -192,4 +189,15 @@ CREATE TABLE attr_child (
     -- DEFERRABLE FK: permits child-before-parent inside one transaction.
     CONSTRAINT attr_child_deferred_fk FOREIGN KEY (qa, qb)
         REFERENCES attr_parent (a, b) DEFERRABLE INITIALLY DEFERRED
+);
+
+-- The DEFERRABLE PRIMARY KEY axis lives on its OWN table, referenced by
+-- nothing. Postgres REFUSES a foreign key against a deferrable unique
+-- constraint ("cannot use a deferrable unique constraint for referenced
+-- table", SQLSTATE 55000) — ground truth from the first run of this seed, and
+-- the reason the two axes cannot share a parent.
+CREATE TABLE attr_defpk (
+    a  BIGINT NOT NULL,
+    b  BIGINT NOT NULL,
+    CONSTRAINT attr_defpk_pk PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED
 );
