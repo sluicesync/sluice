@@ -342,7 +342,14 @@ func (f *Fleet) scrapeOne(ctx context.Context, st scopedTarget) (fleetEntry, boo
 		f.warnScrape(ctx, st.target, err)
 		return fleetEntry{}, false
 	}
-	samples := parsePromText(strings.NewReader(text))
+	samples, err := parsePromTextChecked(strings.NewReader(text))
+	if err != nil {
+		// Same disposition as an HTTP failure: the caller carries the previous
+		// entry forward rather than recording an all-unknown one as observed
+		// (audit SL-14).
+		f.warnScrape(ctx, st.target, err)
+		return fleetEntry{}, false
+	}
 	names := metricNamesForExposition(samples, f.declared)
 	return fleetEntry{snap: distill(samples, names, f.now()), haveOK: true}, true
 }

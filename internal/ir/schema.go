@@ -736,4 +736,52 @@ type ForeignKey struct {
 	// OnDelete and OnUpdate are the referential actions.
 	OnDelete FKAction
 	OnUpdate FKAction
+
+	// Match is the NULL-handling rule for a COMPOSITE key. The zero value is
+	// MATCH SIMPLE, which every engine defaults to — so a reader that does not
+	// populate this stays byte-identical.
+	//
+	// It is carried because the difference is a CONSTRAINT-STRENGTH one, not a
+	// cosmetic one: under MATCH FULL the source REJECTS a partially-NULL key
+	// like (1, NULL); under MATCH SIMPLE it accepts it. Dropping the attribute
+	// silently lands a weaker constraint on the target, which then admits rows
+	// the source forbids, forever (audit 2026-07-26 SL-7).
+	Match FKMatch
+
+	// Deferrable / InitiallyDeferred carry the constraint's timing. Both zero
+	// = NOT DEFERRABLE, every engine's default.
+	//
+	// Also a strength difference, in the opposite direction: on a source with
+	// DEFERRABLE INITIALLY DEFERRED, `BEGIN; INSERT child; INSERT parent;
+	// COMMIT;` succeeds. Against the immediate constraint sluice used to land,
+	// that transaction ABORTS — so the migration silently breaks a workload
+	// that worked before cutover.
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
+// FKMatch is a foreign key's composite-NULL matching rule.
+type FKMatch uint8
+
+// Recognised FKMatch values. The zero value is MATCH SIMPLE (the SQL default:
+// if ANY referencing column is NULL, the constraint is satisfied).
+const (
+	FKMatchSimple FKMatch = iota
+	// FKMatchFull requires either ALL referencing columns NULL or NONE.
+	FKMatchFull
+	// FKMatchPartial is in the SQL standard and implemented by no engine
+	// sluice supports; carried so a reader can report it rather than
+	// silently flatten it to SIMPLE.
+	FKMatchPartial
+)
+
+func (m FKMatch) String() string {
+	switch m {
+	case FKMatchFull:
+		return "FULL"
+	case FKMatchPartial:
+		return "PARTIAL"
+	default:
+		return "SIMPLE"
+	}
 }

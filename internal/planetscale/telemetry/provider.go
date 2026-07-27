@@ -235,7 +235,15 @@ func (p *Provider) pollOnce(ctx context.Context) {
 		p.warnPoll(ctx, err)
 		return
 	}
-	snap := distill(parsePromText(strings.NewReader(text)), p.names, p.now())
+	samples, err := parsePromTextChecked(strings.NewReader(text))
+	if err != nil {
+		// Do NOT overwrite the cached snapshot: a body that is not an
+		// exposition is a failed poll, and a failed poll must leave the last
+		// good reading in place exactly as an HTTP error does (audit SL-14).
+		p.warnPoll(ctx, err)
+		return
+	}
+	snap := distill(samples, p.names, p.now())
 	p.mu.Lock()
 	p.cached = snap
 	p.haveOK = true

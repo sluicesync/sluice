@@ -118,8 +118,11 @@ func classifyApplierError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "40001", "40P01",
-			"57P01", "57P02", "57P03":
+		case "40001", "40P01":
+			// Serialization failure / deadlock — a TRANSACTION outcome, not a
+			// connection-availability shape, so it stays local. The
+			// connection-availability codes (57P0x, class 08) are delegated to
+			// nettransient below.
 			return &retriablePGError{err: err}
 		case "53100", "53000", "53200":
 			// Class 53 — insufficient_resources (roadmap item 38). On a
@@ -179,10 +182,16 @@ func classifyApplierError(err error) error {
 				return &retriablePGError{err: err}
 			}
 		}
-		// Class 08: connection_exception. Includes 08000, 08003,
-		// 08006, 08007, 08P01. All are network / connection-state
-		// transients.
-		if strings.HasPrefix(pgErr.Code, "08") {
+		// Connection-availability SQLSTATEs (57P0x admin shutdown/crash, plus
+		// class 08 connection_exception) delegate to the shared predicate,
+		// which declares itself the SINGLE HOME of that set (audit 2026-07-26
+		// QUAL-2). They were duplicated inline here, so a new managed-PG shape
+		// added to the shared predicate reached the pgtrigger poll classifier
+		// and the connect-phase retry but NOT this one — the classifier that
+		// decides whether hours of streamed changes ride out an outage. Same
+		// drift mechanism as Bug 199, one abstraction level up. Delegation is
+		// shield-safe because the predicate matches on CODE only, never text.
+		if nettransient.IsConnectionAvailabilitySQLState(err) {
 			return &retriablePGError{err: err}
 		}
 		// Terminal-code shield: every SQLSTATE not explicitly classified

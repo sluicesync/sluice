@@ -19,6 +19,8 @@ import (
 	"log/slog"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -157,6 +159,27 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 			_ = closeIfErrIgnored(s.addColumnForwardWriter)
 			s.addColumnForwardWriter = nil
 			return s.refuseSourceMissingBatchedReader()
+		}
+		// Carry --where into the backfill read (audit 2026-07-26 SL-11).
+		// The backfill intercept is wired DOWNSTREAM of the row-filter
+		// intercept, so its synthetic Updates never pass through route() — it
+		// paginated the ENTIRE table and emitted one Update per source row,
+		// out-of-scope ones included. They matched zero target rows and were
+		// swallowed at DEBUG, so nothing leaked, but the filter's whole point
+		// on a subset sync — bounded source read volume — was silently
+		// defeated.
+		//
+		// Filtering at the READER rather than reordering the intercepts is
+		// deliberate: the synthetic Update carries a PK-only Before, so
+		// routing it through route() would trip the image-completeness belt on
+		// every backfill row. Pushing the predicate into the source SELECT
+		// also means the out-of-scope rows are never read at all, which is the
+		// property the operator asked for.
+		if err := migcore.ApplyRowFilters(rr, s.RowFilters, s.Source.Name()); err != nil {
+			_ = closeIfErrIgnored(rr)
+			_ = closeIfErrIgnored(s.addColumnForwardWriter)
+			s.addColumnForwardWriter = nil
+			return fmt.Errorf("pipeline: engage add-column-forward backfill: %w", err)
 		}
 		s.addColumnForwardReader = rr
 	}

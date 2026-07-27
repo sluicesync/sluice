@@ -57,3 +57,48 @@ func TestClassifyApplierError_NetTransientCorpusParity(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyApplierError_NetTransientSQLStateParity is the CODE-shape twin
+// of the corpus-parity test above (audit 2026-07-26 QUAL-2).
+//
+// The existing parity test iterates nettransient.TextShapes only, so it could
+// not see the real drift risk: the connection-availability SQLSTATE set was
+// duplicated inline in this file while nettransient's own doc claimed to be
+// its SINGLE HOME. A new managed-PG shape added to the shared predicate would
+// reach the pgtrigger poll classifier and the connect-phase retry, but not the
+// CDC apply classifier — the one that decides whether hours of streamed
+// changes ride out an outage. Iterating the shared set is what makes the
+// delegation checkable rather than merely intended.
+func TestClassifyApplierError_NetTransientSQLStateParity(t *testing.T) {
+	// Every SQLSTATE the shared predicate calls connection-availability must
+	// be retriable here too.
+	codes := []string{
+		"57P01", "57P02", "57P03", // admin shutdown / crash shutdown / cannot connect now
+		"08000", "08003", "08006", "08007", "08P01", // class 08 connection_exception
+	}
+	for _, code := range codes {
+		t.Run(code, func(t *testing.T) {
+			pgErr := &pgconn.PgError{Code: code, Message: "server said so"}
+			if !nettransient.IsConnectionAvailabilitySQLState(pgErr) {
+				t.Fatalf("the shared predicate does not consider %s a connection-availability code; this test's "+
+					"list has drifted from nettransient", code)
+			}
+			got := classifyApplierError(fmt.Errorf("postgres: applier: %w", pgErr))
+			var re ir.RetriableError
+			if !errors.As(got, &re) || !re.Retriable() {
+				t.Errorf("SQLSTATE %s is retriable per the shared predicate but TERMINAL here — the apply "+
+					"classifier has drifted from internal/nettransient, so an outage shape that the poll "+
+					"classifier rides out would kill a stream mid-apply (audit QUAL-2)", code)
+			}
+		})
+	}
+
+	// The shield still holds: a terminal SQLSTATE stays terminal even though
+	// the delegation now runs in the same function.
+	terminal := &pgconn.PgError{Code: "23505", Message: "duplicate key"}
+	got := classifyApplierError(fmt.Errorf("postgres: applier: %w", terminal))
+	var re ir.RetriableError
+	if errors.As(got, &re) && re.Retriable() {
+		t.Error("a terminal SQLSTATE became retriable after the delegation — the code shield regressed")
+	}
+}

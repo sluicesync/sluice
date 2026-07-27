@@ -1654,6 +1654,28 @@ func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (strin
 			fk.Name, len(fk.Columns), len(fk.ReferencedColumns))
 	}
 
+	// Carry-or-WARN (audit 2026-07-26 SL-7): InnoDB can represent NEITHER of
+	// these. It PARSES `MATCH FULL` and then ignores it, and it has no
+	// deferred-constraint concept at all. Both are constraint-STRENGTH
+	// attributes, so landing the plain constraint changes what the target
+	// accepts: MATCH FULL rejects a partially-NULL composite key that the
+	// emitted MATCH SIMPLE admits, and a DEFERRABLE source constraint permits
+	// a child-before-parent transaction that the immediate target one aborts.
+	// Nothing here can fix that — a MySQL target simply cannot hold the
+	// constraint — so the obligation is to say so loudly rather than let the
+	// difference ship unmentioned.
+	if fk.Match != ir.FKMatchSimple || fk.Deferrable {
+		slog.Warn("foreign key attribute cannot be represented on a MySQL-family target and is being DROPPED",
+			"table", childTable,
+			"constraint", fk.Name,
+			"match", fk.Match.String(),
+			"deferrable", fk.Deferrable,
+			"initially_deferred", fk.InitiallyDeferred,
+			"consequence", "the target constraint is weaker (MATCH FULL rejects a partially-NULL composite key "+
+				"that MATCH SIMPLE accepts) or stricter (a DEFERRABLE source permits a child-before-parent "+
+				"transaction that an immediate constraint aborts) — verify the affected workload before cutover")
+	}
+
 	var sb strings.Builder
 	sb.WriteString("ALTER TABLE ")
 	sb.WriteString(quoteIdent(childTable))

@@ -1731,6 +1731,21 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 	sb.WriteByte(' ')
 	sb.WriteString(emitColumnList(fk.ReferencedColumns))
 
+	// MATCH FULL is a constraint-STRENGTH attribute: under it the source
+	// rejects a partially-NULL composite key that MATCH SIMPLE accepts, so
+	// omitting it lands a weaker constraint and the target admits rows the
+	// source forbids (audit 2026-07-26 SL-7). MATCH SIMPLE is the default and
+	// stays unwritten so unfiltered output is byte-identical. PARTIAL is
+	// carried in the IR but unimplemented by Postgres itself; emitting it
+	// would fail loudly at the server, which is the correct outcome for a
+	// constraint nothing can honour.
+	switch fk.Match {
+	case ir.FKMatchFull:
+		sb.WriteString(" MATCH FULL")
+	case ir.FKMatchPartial:
+		sb.WriteString(" MATCH PARTIAL")
+	}
+
 	if fk.OnDelete != ir.FKActionNoAction {
 		sb.WriteString(" ON DELETE ")
 		sb.WriteString(fk.OnDelete.String())
@@ -1738,6 +1753,17 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 	if fk.OnUpdate != ir.FKActionNoAction {
 		sb.WriteString(" ON UPDATE ")
 		sb.WriteString(fk.OnUpdate.String())
+	}
+	// Timing, the other strength axis (SL-7). With DEFERRABLE INITIALLY
+	// DEFERRED on the source, `BEGIN; INSERT child; INSERT parent; COMMIT;`
+	// succeeds; against the immediate constraint sluice used to land, that
+	// same transaction ABORTS — a workload that worked before cutover breaks
+	// after it. NOT DEFERRABLE is the default and stays unwritten.
+	if fk.Deferrable {
+		sb.WriteString(" DEFERRABLE")
+		if fk.InitiallyDeferred {
+			sb.WriteString(" INITIALLY DEFERRED")
+		}
 	}
 	sb.WriteByte(';')
 	return sb.String(), nil

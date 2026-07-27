@@ -20,6 +20,7 @@ package telemetry
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -47,7 +48,30 @@ func (s promSample) label(k string) string { return s.labels[k] }
 // emitted series as an independent sample — sufficient for the gauge subset
 // ADR-0107 consumes.
 func parsePromText(r io.Reader) []promSample {
+	out, _ := parsePromTextChecked(r)
+	return out
+}
+
+// parsePromTextChecked is parsePromText plus the answer to "was this actually
+// an exposition?" (audit 2026-07-26 SL-14).
+//
+// The skip-on-unparseable rule above is right for a malformed LINE and wrong
+// for a body that is not an exposition at all. An intermediary returning HTML
+// or a JSON error with HTTP 200, or PlanetScale adopting the OpenMetrics
+// quoted-metric-name form, parses to zero samples with no error — and the
+// caller then treats an all-unknown snapshot as a SUCCESSFUL poll and
+// overwrites its good cached one. That is strictly worse than an HTTP error,
+// which correctly leaves the last snapshot in place: `n/a` everywhere,
+// --notify-* silently stops firing, and the sink persists fresh=true rows with
+// every metric null.
+//
+// This is the "no skip-branch without proof" rule from the project's own
+// new-surface checklist: a branch that skips content must prove the content is
+// skippable. Non-empty input that yields NOTHING is not skippable — it is a
+// wrong-format signal, and the caller must be able to see it.
+func parsePromTextChecked(r io.Reader) (samples []promSample, err error) {
 	var out []promSample
+	nonEmptyLines := 0
 	sc := bufio.NewScanner(r)
 	// Metric values are short; the buffer only needs to hold one (long,
 	// many-labelled) line. 1 MiB is generous headroom over PlanetScale's
@@ -58,13 +82,25 @@ func parsePromText(r io.Reader) []promSample {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		nonEmptyLines++
 		s, ok := parsePromLine(line)
 		if !ok {
 			continue
 		}
 		out = append(out, s)
 	}
-	return out
+	// A body with content but not one parseable series is not an exposition.
+	// Say so, rather than returning an empty-but-successful parse.
+	if len(out) == 0 && nonEmptyLines > 0 {
+		return nil, fmt.Errorf(
+			"scrape body is not a Prometheus exposition: %d non-comment line(s), none parseable as a metric "+
+				"series (an HTML or JSON error page served with HTTP 200, or an exposition format this parser "+
+				"does not understand). Treating it as a successful poll would overwrite the last good snapshot "+
+				"with an all-unknown one and silence every threshold",
+			nonEmptyLines,
+		)
+	}
+	return out, nil
 }
 
 // parsePromLine parses a single non-comment exposition line. Returns
@@ -107,14 +143,29 @@ func splitNameAndLabels(line string) (name, rest string, labels map[string]strin
 		return "", "", nil
 	}
 	end += brace
-	labels = parsePromLabels(line[brace+1 : end])
+	labels, ok := parsePromLabels(line[brace+1 : end])
+	if !ok {
+		// A line whose label block we could not fully parse is discarded
+		// rather than used with a partial label set (audit SL-14).
+		return "", "", nil
+	}
 	return name, line[end+1:], labels
 }
 
 // parsePromLabels parses the inside of a `{...}` label block:
 // `k1="v1",k2="v2"`. Values are double-quoted with `\"` and `\\` escapes
-// per the exposition spec. Malformed pairs are skipped.
-func parsePromLabels(s string) map[string]string {
+// per the exposition spec.
+//
+// ok=false when any pair is malformed, and the caller then discards the whole
+// LINE. The doc used to promise "malformed pairs are skipped" while the code
+// abandoned the entire block at the first bad pair — so every VALID label
+// after it was silently dropped (audit 2026-07-26 SL-14). Neither behaviour is
+// safe to keep quiet about: labels are how a series is SELECTED
+// (planetscale_role, planetscale_container), so a partially-parsed block can
+// make a replica series look unlabelled and be picked as the primary. There is
+// no way to resynchronise mid-block without knowing where the bad pair ended,
+// so the honest disposition is to reject the line.
+func parsePromLabels(s string) (map[string]string, bool) {
 	labels := make(map[string]string)
 	i := 0
 	for i < len(s) {
@@ -128,17 +179,25 @@ func parsePromLabels(s string) map[string]string {
 		// Read key up to '='.
 		eq := strings.IndexByte(s[i:], '=')
 		if eq < 0 {
-			break
+			return nil, false
 		}
 		key := strings.TrimSpace(s[i : i+eq])
+		// Validate the NAME, not just the structure. Without this, a
+		// malformed pair is absorbed into the next key — `{bad,role="primary"}`
+		// scans as the single label `bad,role`, so the block "parses" while
+		// role is silently gone. Since labels select the series, that is the
+		// wrong-pod hazard, not a cosmetic one.
+		if !isPromLabelName(key) {
+			return nil, false
+		}
 		i += eq + 1
 		if i >= len(s) || s[i] != '"' {
-			break
+			return nil, false
 		}
 		i++ // consume opening quote
 		val, next, ok := readQuotedValue(s, i)
 		if !ok {
-			break
+			return nil, false
 		}
 		i = next
 		if key != "" {
@@ -146,9 +205,9 @@ func parsePromLabels(s string) map[string]string {
 		}
 	}
 	if len(labels) == 0 {
-		return nil
+		return nil, true
 	}
-	return labels
+	return labels, true
 }
 
 // readQuotedValue reads a double-quoted, backslash-escaped value starting
@@ -191,4 +250,23 @@ func parsePromFloat(s string) (float64, error) {
 		return 0, strconv.ErrSyntax
 	}
 	return strconv.ParseFloat(s, 64)
+}
+
+// isPromLabelName reports whether s is a valid Prometheus label name
+// ([a-zA-Z_][a-zA-Z0-9_]*). Used to reject a "key" that has silently absorbed
+// a malformed neighbouring pair.
+func isPromLabelName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }

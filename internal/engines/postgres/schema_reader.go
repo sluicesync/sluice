@@ -1662,6 +1662,17 @@ func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
 	// true for PK indexes (contype 'p'). The C3 attribute flags share
 	// the gate: they are attributes OF that owning constraint.
 	owned := constraintBacked && isUnique && !isPrimary
+	// The ATTRIBUTE carry is a WIDER gate than the re-emit shape (audit
+	// 2026-07-26 SL-8). Excluding PK indexes from `owned` is correct for
+	// ConstraintBacked — a PK re-emits as ADD PRIMARY KEY, not ADD CONSTRAINT
+	// UNIQUE — but sharing that gate with the attribute flags silently forced
+	// all three false for PKs, so `CONSTRAINT pk PRIMARY KEY (id) DEFERRABLE
+	// INITIALLY DEFERRED` was neither carried NOR warned about. The classic
+	// bulk key shift `UPDATE t SET id = id + 1` commits on such a source and
+	// aborts on the migrated target. An undocumented silent exclusion inside
+	// the function whose whole purpose is "never silently weaken" is exactly
+	// the shape that rots, so the two gates are now separate and named.
+	attrOwned := constraintBacked && isUnique
 	idx := &ir.Index{
 		Name:             indexName,
 		Unique:           isUnique,
@@ -1671,9 +1682,9 @@ func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
 		// constraint's attributes — no emitter reads these yet; the
 		// read-time WARN (warnWeakenedUniqueConstraint) names the
 		// plain-UNIQUE weakening every target currently lands.
-		ConstraintDeferrable:       owned && row.conDeferrable,
-		ConstraintNullsNotDistinct: owned && row.conNullsNotDistinct,
-		ConstraintWithoutOverlaps:  owned && row.conPeriod,
+		ConstraintDeferrable:       attrOwned && row.conDeferrable,
+		ConstraintNullsNotDistinct: attrOwned && row.conNullsNotDistinct,
+		ConstraintWithoutOverlaps:  attrOwned && row.conPeriod,
 	}
 	// ADR-0032: preserve extension-introduced access-method
 	// names (ivfflat, hnsw) verbatim so the same-engine writer
@@ -1876,6 +1887,9 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 			pn.nspname  AS referenced_schema,
 			con.confupdtype,
 			con.confdeltype,
+			con.confmatchtype,
+			con.condeferrable,
+			con.condeferred,
 			fk_col.attname,
 			ref_col.attname,
 			u.ord
@@ -1931,13 +1945,15 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 	for rows.Next() {
 		var (
 			name, tableName, refTable, refSchema string
-			updType, delType                     string
+			updType, delType, matchType          string
+			deferrable, deferred                 bool
 			fkCol, refCol                        sql.NullString
 			ord                                  int
 		)
 		if err := rows.Scan(
 			&name, &tableName, &refTable, &refSchema,
-			&updType, &delType,
+			&updType, &delType, &matchType,
+			&deferrable, &deferred,
 			&fkCol, &refCol, &ord,
 		); err != nil {
 			return err
@@ -1973,6 +1989,12 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 				ReferencedTable:  refTable,
 				OnUpdate:         fkActionFromCode(updType),
 				OnDelete:         fkActionFromCode(delType),
+				// Constraint-STRENGTH attributes, carried so the target gets
+				// the same constraint rather than a silently weaker or
+				// stricter one (audit 2026-07-26 SL-7).
+				Match:             fkMatchFromCode(matchType),
+				Deferrable:        deferrable,
+				InitiallyDeferred: deferred,
 			}
 			collected[k] = fk
 		}
@@ -2613,4 +2635,23 @@ func sortedKeys[V any](m map[string]V) []string {
 		}
 	}
 	return out
+}
+
+// fkMatchFromCode maps pg_constraint.confmatchtype to [ir.FKMatch].
+//
+//	f = MATCH FULL
+//	p = MATCH PARTIAL (in the standard; unimplemented by Postgres)
+//	s = MATCH SIMPLE (the default)
+//
+// An unrecognised code maps to SIMPLE, matching the column default, and any
+// future code would surface through the dump-parity oracle rather than here.
+func fkMatchFromCode(code string) ir.FKMatch {
+	switch code {
+	case "f":
+		return ir.FKMatchFull
+	case "p":
+		return ir.FKMatchPartial
+	default:
+		return ir.FKMatchSimple
+	}
 }
