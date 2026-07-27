@@ -121,7 +121,20 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, err)
+			// Classify, so the cold-copy source-read retry can see this
+			// (roadmap item 86). ADR-0109's retry IS wired around this path —
+			// the raw-copy block lives inside the attempt the wrapper invokes
+			// — but the wrapper decides via errors.As(&ir.RetriableError), and
+			// this site returned a bare error. A terminated backend mid-export
+			// (57P01) therefore aborted the whole table copy, on a path whose
+			// resume strategy (truncate the target, restart the table from a
+			// fresh reader) was already correct and already available.
+			//
+			// The Bug-207 class at a RETURN site rather than a setErr one,
+			// which is why internal/errclassgate could not see it: that gate
+			// walks parked errors, and most returned errors are legitimately
+			// unclassified.
+			return classifyApplierError(fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, err))
 		}
 		return nil
 	}
