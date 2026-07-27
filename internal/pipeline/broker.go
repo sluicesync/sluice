@@ -1537,7 +1537,7 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 		// the Azure key-version retarget (audit N-9).
 		cek, err := lineage.UnwrapChainCEK(b.Envelope, enc.WrappedCEK, root)
 		if err != nil {
-			return fmt.Errorf("unwrap chain cek (wrong passphrase?): %w", err)
+			return fmt.Errorf("unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, err)
 		}
 		b.chainCEK = cek
 		return nil

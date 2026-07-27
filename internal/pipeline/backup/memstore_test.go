@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // memStore is a minimal in-memory BackupStore for catalog/lineage/
@@ -15,7 +16,12 @@ import (
 // coverage; the tested behaviour is store-agnostic. (Mirror of the
 // lineage-package test copy — a test-only helper, duplicated across
 // the two packages so neither imports the other's test tree.)
+//
+// Guarded by a mutex: the restore/backup pools reach it from worker
+// goroutines, and an unsynchronised map is a `-race` failure waiting on
+// the first test that drives a real Run against it.
 type memStore struct {
+	mu   sync.RWMutex
 	data map[string][]byte
 }
 
@@ -28,11 +34,15 @@ func (s *memStore) Put(_ context.Context, path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.data[path] = b
 	return nil
 }
 
 func (s *memStore) Get(_ context.Context, path string) (io.ReadCloser, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	b, ok := s.data[path]
 	if !ok {
 		return nil, &storeNotFoundErr{path: path}
@@ -41,6 +51,8 @@ func (s *memStore) Get(_ context.Context, path string) (io.ReadCloser, error) {
 }
 
 func (s *memStore) List(_ context.Context, prefix string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]string, 0)
 	for k := range s.data {
 		if strings.HasPrefix(k, prefix) {
@@ -52,11 +64,15 @@ func (s *memStore) List(_ context.Context, prefix string) ([]string, error) {
 }
 
 func (s *memStore) Delete(_ context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.data, path)
 	return nil
 }
 
 func (s *memStore) Exists(_ context.Context, path string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	_, ok := s.data[path]
 	return ok, nil
 }

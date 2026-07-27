@@ -706,7 +706,7 @@ func (e *ParquetExport) preflightEncryption(manifest *irbackup.Manifest) error {
 		}
 		cek, err := lineage.UnwrapChainCEK(e.Envelope, enc.WrappedCEK, manifest)
 		if err != nil {
-			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
+			return fmt.Errorf("unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, err)
 		}
 		e.chainCEK = cek
 		return nil

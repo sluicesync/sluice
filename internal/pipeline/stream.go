@@ -1249,10 +1249,12 @@ func (b *BackupStream) runRollover(
 	// ADR-0152: encrypted rollovers write freshly-bound chunks, so the
 	// manifest is stamped the chunk-binding version — regardless of the
 	// (possibly older) chain root's own stamp; each link's chunks are
-	// gated by its OWN recorded version. Must precede captureWindow so
+	// gated by its OWN recorded version. ADR-0181: a fresh rollover seals
+	// nothing it has to stay compatible with, so the stamp is the
+	// injective-AAD tier. Must precede captureWindow so
 	// [irbackup.ChunkAAD] gates on.
 	if b.Encryption != nil {
-		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionInjectiveChunkAAD)
 	}
 
 	deadline := clockNow().Add(window)

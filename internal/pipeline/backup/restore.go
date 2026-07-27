@@ -1351,7 +1351,7 @@ func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 		// retarget (audit N-9).
 		cek, err := lineage.UnwrapChainCEK(r.Envelope, enc.WrappedCEK, manifest)
 		if err != nil {
-			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
+			return fmt.Errorf("unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, err)
 		}
 		r.chainCEK = cek
 		return nil
@@ -1622,7 +1622,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			// the Azure key-version retarget (audit N-9).
 			if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
 				return verifyScanTally{}, fmt.Errorf(
-					"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
+					"verify: unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, uerr,
 				)
 			}
 		} else {

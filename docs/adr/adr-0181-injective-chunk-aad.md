@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed — not implemented.** Raised as SEC-2 by the blind audit of 2026-07-26 and deliberately kept out of the v0.103.x fix batches: it changes an on-disk contract, and a format change rushed into a correctness release is how format changes go wrong. This ADR is the design so the implementation can be one focused piece of work rather than a decision made under release pressure.
+**Accepted — implemented 2026-07-27** (roadmap item 88). Raised as SEC-2 by the blind audit of 2026-07-26 and deliberately kept out of the v0.103.x fix batches: it changes an on-disk contract, and a format change rushed into a correctness release is how format changes go wrong. This ADR was written as the design so the implementation could be one focused piece of work rather than a decision made under release pressure. See "Implementation notes" at the end for the two places the design was underspecified and what was done instead.
 
 ## Context
 
@@ -58,3 +58,15 @@ Re-sealing every chunk in an existing chain would require the CEK and a full rew
 **Reuse `CanonicalManifestBytes` directly.** Tempting, but it renders the *whole manifest* for signing; the AAD binds a specific chunk to a specific parent and must stay small and stable. Sharing the token-encoding primitive is right; sharing the field list is not.
 
 **Do nothing, and rely on `--sign`.** Defensible today — `--sign` genuinely closes the class — but it makes a security property depend on an opt-in flag, and the deferral cost compounds with every chain written.
+
+## Implementation notes
+
+Four things the design above left implicit, resolved during implementation.
+
+**The decision table describes the READER; it does not say who stamps 9.** Reading the recorded version correctly changes nothing if nothing ever records 9. Three write sites stamp it: the fresh encrypted full (previously v7), and the encrypted incremental and stream-rollover segment manifests (previously v5 — both build a fresh manifest per window and seal every chunk in that window, so there is nothing older to stay compatible with). The full-backup resume ladder grew a fourth tier, `resumingPreInjectiveAAD`: a run resumed from a v7/v8 chain keeps v7, because its already-written chunks carry the raw-concatenation binding. That is the same Bug-179 inherit-the-chain's-shape rule the v5 and v7 tiers already followed, one step up.
+
+**The CEK binding changes encoding too, and that makes the downgrade oracle fire a layer earlier than expected.** `CEKBinding` shares `bindingIdentity`, so it moves to length-prefixed tokens at v9 as well (tagged `sluice-cek-binding/v2`). A relabelled manifest therefore fails at the chain-CEK *unwrap*, before any chunk is read — a louder refusal than the GCM tag mismatch the ADR anticipated, but a different error surface, and worth knowing when reading a support report. It also means any fixture that rewinds a manifest's stamp to simulate an older binary must re-wrap the CEK at that version; a rewind alone fails for the encoding reason rather than the tier reason, which would make a tier test green for the wrong cause.
+
+**Stamping 9 enrols encrypted manifests in the item-57 `BackupID` fold.** `ComputeBackupID` gates the `cdc_position_commits_after_rows` field on `FormatVersion >= FormatVersionCDCPositionBinding`, which is a `>=`, so a v9 encrypted full now folds that field (as `false`) where a v7 one did not. This is self-consistent — every writer stamps the version before computing the id, and every recompute keys on the manifest's own recorded version — so no chain, mixed or otherwise, is affected. But it does mean a fresh encrypted backup's `BackupID` differs from the one v0.103.x computed for byte-identical inputs. Noted because "nothing else changes" would have been wrong.
+
+**The class is wider than the (schema, table) parent.** Row chunks and change chunks share one chain CEK, and under raw concatenation a change chunk's recorded path can also collide with a *row* chunk of a table named `…\nindex=0` — a cross-KIND relabel that evades the change-chunk ordinal binding entirely. Same defect, same fix; the property test renders every binding kind into a single collision map rather than one map per kind, so cross-kind forgeries are covered rather than assumed away. The corresponding non-finding: the ordinal itself is not forgeable, because it is rendered from an `int`.

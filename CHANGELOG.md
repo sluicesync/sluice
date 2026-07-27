@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**An encrypted backup can no longer have someone else's rows decrypt into one of your tables.** Every encrypted chunk is sealed against a description of where it belongs — which backup, which file, which table — and that description was assembled by gluing the fields together with `\n` and `=` separators. A table name is source-controlled, so a name containing those same separators could produce a description that reads two different ways, and a chunk sealed under one parent would open cleanly under another. Reaching it took source DDL rights plus write access to the backup store plus an unsigned chain, and it could only ever push rows *in*, never pull victim rows out — but the fix is cheap and the exposure grew with every chain written, so it is closed rather than documented.
+
+Backups written from this version stamp `FormatVersion=9` and seal their chunks with a length-prefixed encoding that cannot be read two ways, the same one the manifest signature has used since it learned this lesson. **Nothing needs migrating.** Every chain already on your store keeps opening exactly as before, because sluice derives the encoding from the version each manifest records rather than from what the running binary would prefer — and a resumed backup deliberately stays on its chain's original encoding so its already-written chunks keep decrypting. The one operational consequence is the usual one for a format bump: a sluice older than this cannot read a v9 chain, and refuses it clearly at preflight instead of failing with a bare decryption error.
+
 ## [0.103.2] - 2026-07-27
 
 One warning that was missing, and the gates that stop three recurring mistakes from recurring. Drop-in upgrade, no flag changes, no behaviour changes to any data path.

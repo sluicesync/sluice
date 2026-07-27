@@ -166,7 +166,26 @@ import (
 // their feature-minimum version and their legacy id. An older binary refuses a
 // v8 manifest loudly at the preflight rather than recompute-mismatching its
 // BackupID (which it would, computing the id without the folded field).
-const BackupFormatVersion = 8
+//
+// v0.104.0+ introduces FormatVersion=9 for ENCRYPTED manifests whose chunk
+// bindings are rendered with the INJECTIVE length-prefixed token encoding
+// (ADR-0181, audit SEC-2). Through v8 the AAD was raw `"\nkey=" + value`
+// concatenation, which is not injective: a source-derived value carrying
+// `\nschema=` forges a structural boundary, so two DISTINCT (schema, table)
+// parents can render to IDENTICAL AAD and a chunk sealed under one opens
+// cleanly under the other. v9 renders the same fields as the `<len>:<bytes>\n`
+// tokens [CanonicalManifestBytes] already uses — provably injective, since a
+// decoder reads exactly len bytes and no embedded delimiter can be misread as
+// structure. Readers derive the shape from the RECORDED version ([ChunkAAD] is
+// the single gate for both sides), so v5–v8 chains keep opening byte-for-byte
+// as they always did and no re-seal migration exists. Proportional as always:
+// only an ENCRYPTED manifest is stamped 9, and a resumed pre-v9 encrypted run
+// keeps its prior version so its already-written raw-concat-bound chunks still
+// decrypt (the Bug-179 inherit-the-chain's-shape rule). An older binary refuses
+// a v9 manifest loudly at the preflight rather than recomputing the old AAD
+// against chunks sealed under the new one (which would surface as a bare
+// auth-tag failure).
+const BackupFormatVersion = 9
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -254,6 +273,29 @@ const (
 	// them — a VStream CDC segment is stamped 8 whether plaintext, encrypted, or
 	// signed, because the fold is a plaintext-manifest-field binding.
 	FormatVersionCDCPositionBinding = 8
+
+	// FormatVersionInjectiveChunkAAD is the version stamped on an ENCRYPTED
+	// manifest whose chunk bindings ([ChunkAAD], [ChangeChunkAAD],
+	// [CEKBinding]) are rendered with the INJECTIVE length-prefixed token
+	// encoding (ADR-0181, audit SEC-2). It is the read-side gate for that
+	// encoding: a chunk under a manifest at this version or above was sealed
+	// with `<len>:<bytes>\n` tokens; below it the AAD is the historical raw
+	// `"\nkey=" + value` concatenation and readers MUST reproduce it verbatim
+	// or the ciphertext fails to decrypt. The two encodings are never mixed —
+	// the RECORDED version picks one, never both, never a guess.
+	//
+	// Why it exists: raw concatenation is not injective, so a value carrying
+	// `\nschema=` forges a structural boundary and two distinct parents render
+	// to the same AAD (observed: a chunk sealed under one parent opened cleanly
+	// under another). Length-prefixing is injective by construction, which is
+	// why the signature path ([CanonicalManifestBytes]) already uses it.
+	//
+	// Stamped on any FRESH encrypted backup or CDC segment, signed or not (GCM
+	// enforces the AAD regardless of any signature); a resumed pre-v9 encrypted
+	// run keeps its prior version so its already-written chunks still decrypt
+	// (the Bug-179 inherit-the-chain's-shape rule). A PLAINTEXT backup keeps
+	// its schema-derived version — a plaintext chunk has no ciphertext to bind.
+	FormatVersionInjectiveChunkAAD = 9
 )
 
 // StampCDCPositionBinding raises m.FormatVersion to
