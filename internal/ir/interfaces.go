@@ -1895,6 +1895,35 @@ type FilteredCDCPreflighter interface {
 	PreflightFilteredCDCBeforeImage(ctx context.Context, dsn string, tables []string) error
 }
 
+// UpsertKeyPreflighter is the optional TARGET-engine surface (implemented
+// on a [ChangeApplier]) the streamer consults once the target schema
+// exists and before the first change is applied: it verifies that every
+// in-scope target table has a key the engine's idempotent
+// insert-or-update can actually key on.
+//
+// It exists because a target constraint can be perfectly faithful to the
+// source and still be unusable by the apply path. Postgres refuses a
+// DEFERRABLE unique constraint as an `ON CONFLICT` arbiter, so a table
+// whose only key is deferrable kills the stream on its FIRST change —
+// terminally, with no retry, taking every other table in the stream with
+// it, and wedging every warm resume on the same change (Bug 211). The
+// attribute is still carried faithfully; this surface is how the engine
+// says "carried, but I cannot upsert into it" at a moment the operator
+// can act on.
+//
+// inScope reports whether a target table name participates in this
+// stream, so a table the stream never touches is never refused over. A
+// nil inScope means "every table in the applier's schema".
+//
+// Implementations return a coded refusal
+// ([sluicecode.CodeTargetDeferrableKey]) naming every offending table,
+// its constraint, and the remedy — and nil when there is nothing to
+// report. Engines without the surface skip silently; their appliers
+// still refuse loudly on first sight of such a table.
+type UpsertKeyPreflighter interface {
+	PreflightUpsertKeys(ctx context.Context, inScope func(table string) bool) error
+}
+
 // FullBeforeImageSetter is the optional CDC-reader surface a filtered
 // continuous sync (`sync --where`, ADR-0173 Phase 2) uses to request
 // UN-narrowed before-images for the filtered tables. A CDC reader normally

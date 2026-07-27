@@ -653,8 +653,8 @@ func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) (
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: pkForRedact: %w", err)
 	}
-	a.storePK(qn, pk)
-	return pk, nil
+	a.storePK(qn, pk.Cols)
+	return pk.Cols, nil
 }
 
 // forceSynchronousCommitOn emits `SET LOCAL synchronous_commit = on`
@@ -2016,11 +2016,17 @@ func (a *ChangeApplier) routedSchema(changeSchema string) string {
 // pg_index. Returns an empty slice (not nil) for tables with no PK.
 // Uses pg_index directly rather than information_schema.table_
 // constraints so we get the column order from indkey natively.
-func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
+//
+// The returned [primaryKeyInfo] additionally carries the backing index's
+// name and pg_index.indimmediate, which only conflict-key selection
+// consults — a deferrable key identifies a row perfectly well, so the
+// UPDATE/DELETE and redactor callers read Cols and nothing else.
+func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) (primaryKeyInfo, error) {
 	const q = `
-		SELECT a.attname
+		SELECT a.attname, ic.relname, ix.indimmediate
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
+		JOIN   pg_class      ic ON ic.oid = ix.indexrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
 		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
@@ -2031,19 +2037,30 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 
 	rows, err := tx.QueryContext(ctx, q, schema, table)
 	if err != nil {
-		return nil, err
+		return primaryKeyInfo{}, err
 	}
 	defer rows.Close()
 
-	pk := make([]string, 0, 4)
+	info := primaryKeyInfo{Cols: make([]string, 0, 4), Immediate: true}
 	for rows.Next() {
 		var col string
-		if err := rows.Scan(&col); err != nil {
-			return nil, err
+		if err := rows.Scan(&col, &info.Name, &info.Immediate); err != nil {
+			return primaryKeyInfo{}, err
 		}
-		pk = append(pk, col)
+		info.Cols = append(info.Cols, col)
 	}
-	return pk, rows.Err()
+	return info, rows.Err()
+}
+
+// primaryKeyInfo is what [loadPrimaryKey] reads out of pg_index: the key
+// columns in indkey order, the backing index's name (the constraint name
+// a remedy would ALTER), and whether the constraint is immediate.
+// A table with no PRIMARY KEY yields an empty Cols; the other fields are
+// meaningless then.
+type primaryKeyInfo struct {
+	Cols      []string
+	Name      string
+	Immediate bool
 }
 
 // loadConflictKey returns the column list the Insert path keys its
@@ -2062,16 +2079,46 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // indexprs set) are excluded — they can't be a stable ON CONFLICT
 // arbiter without a matching index_predicate clause sluice doesn't
 // emit.
+//
+// DEFERRABLE indexes (pg_index.indimmediate false) are excluded for a
+// harder reason: Postgres REFUSES a non-immediate index as an
+// ON CONFLICT arbiter outright — `ON CONFLICT does not support
+// deferrable unique constraints/exclusion constraints as arbiters`,
+// SQLSTATE 55000, raised by infer_arbiter_indexes() before the
+// statement runs. Naming the constraint (`ON CONFLICT ON CONSTRAINT`)
+// is refused the same way, so there is no spelling that works. Note
+// indimmediate is cleared for EITHER initial mode — `DEFERRABLE
+// INITIALLY IMMEDIATE` is just as unusable as `INITIALLY DEFERRED`
+// (ground-truthed on PG 16.14), so the deferrability of the
+// constraint, not its initial mode, is what matters here.
+//
+// When the exclusion leaves NOTHING to key on, this refuses loudly
+// ([errDeferrableUpsertKey]) rather than degrading to the keyless
+// plain-INSERT branch: the table DOES have a unique key, so a replayed
+// change would collide on it and fail anyway — silently downgrading
+// idempotency would only move the failure somewhere less legible. That
+// refusal is the class Bug 211 belongs to: v0.103.1 made a Postgres
+// target CARRY a source's DEFERRABLE primary key (correctly), and
+// carrying it is what made this apply path illegal.
 func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
 	pk, err := loadPrimaryKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, err
 	}
-	if len(pk) > 0 {
-		return pk, nil
+	if len(pk.Cols) > 0 && pk.Immediate {
+		return pk.Cols, nil
+	}
+	// A deferrable PK is not usable as an arbiter, but a table can carry
+	// an ordinary UNIQUE index alongside it — fall through to the same
+	// selection a PK-less table takes, and refuse only if that finds
+	// nothing either. blocked accumulates the arbiters we had to reject
+	// for deferrability so the refusal can name them.
+	var blocked []string
+	if len(pk.Cols) > 0 {
+		blocked = append(blocked, pk.Name)
 	}
 
-	// No PK — find the deterministic non-null UNIQUE index. The query
+	// No usable PK — find the deterministic non-null UNIQUE index. The query
 	// returns one row per (index, column) in indkey order WITH each
 	// column's nullability; we group in Go, reject any index with a
 	// nullable member, then apply the same tie-break the IR-side picker
@@ -2081,8 +2128,14 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 	// single-column key (a) — then `ON CONFLICT (a)` wouldn't match the
 	// real index and would error. We must see the full column set per
 	// index to judge it.
+	// indimmediate is SELECTed, not filtered in the WHERE clause, for the
+	// same reason attnotnull is: we have to SEE the candidates we reject.
+	// A `AND ix.indimmediate` predicate would make a deferrable-only table
+	// indistinguishable from a truly keyless one, and the two want
+	// opposite answers — plain INSERT for the keyless table, a loud
+	// refusal for the one whose key we simply cannot arbitrate on.
 	const q = `
-		SELECT cl.relname AS index_name, a.attname, a.attnotnull, u.ord
+		SELECT cl.relname AS index_name, a.attname, a.attnotnull, ix.indimmediate, u.ord
 		FROM   pg_index ix
 		JOIN   pg_class      tcl ON tcl.oid = ix.indrelid
 		JOIN   pg_class      cl  ON cl.oid  = ix.indexrelid
@@ -2104,18 +2157,19 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 	defer rows.Close()
 
 	// Group columns per index, preserving indkey order, tracking whether
-	// every member column is NOT NULL.
+	// every member column is NOT NULL and whether the index is immediate.
 	type idxCols struct {
 		cols       []string
 		allNotNull bool
+		immediate  bool
 	}
 	byIndex := map[string]*idxCols{}
 	var order []string
 	for rows.Next() {
 		var name, col string
-		var notNull bool
+		var notNull, immediate bool
 		var ord int
-		if err := rows.Scan(&name, &col, &notNull, &ord); err != nil {
+		if err := rows.Scan(&name, &col, &notNull, &immediate, &ord); err != nil {
 			return nil, err
 		}
 		ic, ok := byIndex[name]
@@ -2125,6 +2179,7 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 			order = append(order, name)
 		}
 		ic.cols = append(ic.cols, col)
+		ic.immediate = immediate
 		if !notNull {
 			ic.allNotNull = false
 		}
@@ -2135,6 +2190,8 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 
 	// Tie-break (matches pickNonNullUniqueIndex): every column NOT NULL,
 	// then fewest columns, then lexicographically smallest index name.
+	// A deferrable index is not a candidate at all; it is recorded so the
+	// refusal below can name it.
 	sort.Strings(order)
 	var bestCols []string
 	for _, name := range order {
@@ -2142,11 +2199,18 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 		if !ic.allNotNull {
 			continue
 		}
+		if !ic.immediate {
+			blocked = append(blocked, name)
+			continue
+		}
 		if bestCols == nil || len(ic.cols) < len(bestCols) {
 			bestCols = ic.cols
 		}
 	}
 	if bestCols == nil {
+		if len(blocked) > 0 {
+			return nil, errDeferrableUpsertKey(schema, table, blocked)
+		}
 		return []string{}, nil
 	}
 	return bestCols, nil

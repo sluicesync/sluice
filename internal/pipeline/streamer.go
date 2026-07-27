@@ -1841,6 +1841,18 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		return err
 	}
 
+	// ---- 4c. Upsert-key preflight (Bug 211) ----
+	// The last check before changes start flowing: every in-scope target
+	// table must have a key the target engine's idempotent
+	// insert-or-update can key on. It sits AFTER the stream opens
+	// because a cold start creates the very tables it asks about — see
+	// the phase doc — and BEFORE the apply loop, so a target shape sluice
+	// cannot upsert into is refused at start rather than killing the
+	// stream on its first change (and every warm resume after it).
+	if err := s.phasePreflightUpsertKeys(ctx, applier); err != nil {
+		return err
+	}
+
 	// Streaming phase entered — flip /readyz to 200. Orchestrators
 	// (k8s, Heroku, systemd) gating traffic on readiness now see the
 	// stream as in-service. Bound on the apply-loop entry, not the

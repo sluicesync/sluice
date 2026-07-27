@@ -145,6 +145,7 @@ var (
 	_ ir.SourceFingerprintRecorder      = (*ChangeApplier)(nil)
 	_ ir.StreamCleaner                  = (*ChangeApplier)(nil)
 	_ ir.StreamIDSetter                 = (*ChangeApplier)(nil)
+	_ ir.UpsertKeyPreflighter           = (*ChangeApplier)(nil)
 	// audit 2026-07-26 ARCH-1: implemented and runtime-dispatched
 	// (vacuum_health_notify.go) but never pinned, so a receiver or signature
 	// change would leave every build and test GREEN while the alerter silently
