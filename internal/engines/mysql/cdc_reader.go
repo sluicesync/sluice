@@ -691,7 +691,18 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 			r.suppressNoEventsWatchdog()
 		}
 		if err := r.dispatch(ctx, ev, out); err != nil {
-			r.setErr(err)
+			// Classify DISPATCH errors, not just GetEvent errors — the binlog
+			// sibling of the VStream Bug 207 site. This path is not merely
+			// decoding buffered bytes: dispatchRows calls tableFor, which runs
+			// a LIVE information_schema query against the source
+			// (loadTableSchema) on a TABLE_MAP boundary. So a routine
+			// connection blip during that schema re-read surfaces here as an
+			// ordinary transport error, and storing it raw made it terminal —
+			// killing the stream on exactly the shape nettransient exists to
+			// ride out. Found by auditing every setErr site after Bug 207
+			// rather than by a failure, which is why the audit is now a gate
+			// (TestSetErrSitesClassify).
+			r.setErr(classifyReaderError(err))
 			return
 		}
 	}

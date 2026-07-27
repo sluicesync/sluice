@@ -924,6 +924,24 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **How.** Extraction: `runDeployLeg` + `provisionFreshBranch` + the poller are shipped and generic; the command is CLI wiring + the DDL-printer + tests. Reuses `SLUICE-E-PS-{SAFE-MIGRATIONS-DISABLED,DEPLOY-REQUEST-FAILED,BRANCH-STALE-BASE}` unchanged.
 
+### 83. Is a `rows.Scan` failure on the bulk-copy path a Bug-207 sibling? (raised 2026-07-26 by the new setErr gate) — *open question, deliberately not answered in haste*
+
+**Where it came from.** The `TestSetErrSitesClassify` gate (added with the Bug 207 fix) flags every `setErr` site that parks an unclassified error. Judged individually, all but one were legitimate — already classified by a dedicated predicate, terminal by construction, or a caller-side `ctx.Err()`. The exception:
+
+```go
+// internal/engines/mysql/row_reader.go
+if err := rows.Scan(scanPtrs...); err != nil {
+    r.setErr(fmt.Errorf("mysql: scan: %w", err))
+```
+
+**Why it might be the same bug.** A `rows.Scan` failure mid-copy is not necessarily a data fault. An ordinary connection drop while streaming a large result surfaces exactly here, and that is precisely the shape `internal/nettransient` exists to ride out — but the error is parked unclassified, so the streamer treats it as terminal. If the bulk path has no upstream retry covering it, a routine blip mid-copy kills a migration that should have resumed.
+
+**Why it might NOT be.** The bulk-copy path has its own retry machinery that the CDC path does not — the ADR-0109 source-read retry and the ADR-0117 chunk-read retry — and one of them may already wrap this call at a higher level, making classification here redundant or even harmful (double-retrying, or converting a terminal decode fault into a spin). The sibling line immediately below it (`mysql: column %q`) is definitely terminal-by-construction, since no retry can change bytes that failed to decode, so the two adjacent sites genuinely differ.
+
+**What must happen before touching it.** Establish where, if anywhere, a mid-stream `rows.Scan` failure is retried today: read the chunk-read retry's wrapping boundary, then ground-truth it by killing a source connection partway through a large bulk copy and observing whether the copy resumes or exits. Only then decide between classifying it, leaving it, or moving the retry boundary. It is allowlisted in the gate with this item number so the question stays visible rather than silently accepted.
+
+**Why it is filed rather than fixed.** It was found at the end of a long session, immediately after two fixes that *looked* right by reading and were wrong in practice. Classifying it on reasoning alone would repeat exactly that mistake on a path that carries bulk data.
+
 ### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *confirmed Vitess-side; sluice already classifies + prints the remedy, but the TERMINAL disposition is wrong*
 
 **⚠️ CORRECTION 2026-07-26 (the first filing above overstated the gap).** Reading the full log rather than the fatal line alone shows sluice **already recognises this shape and already prints the remedy**. The condition is caught by `isVStreamSchemaResolutionError` and classified RETRIABLE, and every retry logs:

@@ -7,7 +7,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,3 +146,53 @@ func (docSyncTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) 
 type docSyncLagSource struct{}
 
 func (docSyncLagSource) SyncLagSeconds(time.Time) (float64, bool) { return 2.5, true }
+
+// TestDocSyncFixturesEnableEveryKnownFlag is the Tier-1 gate for the
+// fixture-blindness class.
+//
+// Both /metrics exporters gate each metric family on a *Known flag from
+// [ir.TargetHealthSnapshot]. A doc-sync fixture that leaves one false makes the
+// exporter emit nothing for that family — so the gate sees nothing, compares
+// nothing, and passes while a brand-new metric ships undocumented AND unpinned.
+// That is not hypothetical: it happened twice in one day, in the
+// single-database exporter and then again in the fleet exporter, for the same
+// three worst-pod series.
+//
+// Reflecting over the struct rather than listing flags by hand is the point: a
+// future signal added to the snapshot arrives here automatically, and the
+// person adding it is told to enable it rather than discovering months later
+// that their metric was never covered.
+func TestDocSyncFixturesEnableEveryKnownFlag(t *testing.T) {
+	snap, ok := docSyncTelemetry{}.Sample(context.Background())
+	if !ok {
+		t.Fatal("docSyncTelemetry.Sample returned ok=false; the doc-sync fixture must produce a usable snapshot")
+	}
+
+	v := reflect.ValueOf(snap)
+	typ := v.Type()
+	var unset []string
+	seen := 0
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		if f.Type.Kind() != reflect.Bool || !strings.HasSuffix(f.Name, "Known") {
+			continue
+		}
+		seen++
+		if !v.Field(i).Bool() {
+			unset = append(unset, f.Name)
+		}
+	}
+
+	// Anti-vacuity: a rename away from the *Known convention would silently
+	// empty this gate.
+	if seen < 4 {
+		t.Fatalf("found only %d *Known flags on ir.TargetHealthSnapshot; the naming convention this gate keys on has probably changed — re-point it", seen)
+	}
+	if len(unset) > 0 {
+		t.Errorf("doc-sync fixture leaves %d *Known flag(s) false: %s\n\n"+
+			"Every exporter family is gated on one of these, so a false flag makes the family unemittable "+
+			"and this gate structurally blind to it — a new metric would ship undocumented and unpinned. "+
+			"Set them all true in docSyncTelemetry and give the fields a representative value.",
+			len(unset), strings.Join(unset, ", "))
+	}
+}

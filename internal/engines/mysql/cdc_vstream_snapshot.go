@@ -1325,13 +1325,11 @@ func (s *vstreamSnapshotStream) copyPumpAutoShard(ctx context.Context, cancel co
 func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel context.CancelFunc, table string) ([]shardGtid, error) {
 	live := startVStreamLiveness(ctx, s.livenessWindow, s.copyProgressWindow, s.idleWarnWindow,
 		func() {
-			err := vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards)
-			s.setErr(err)
+			s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			cancel()
 		},
 		func() {
-			err := vstreamProgressTimeoutError(s.copyProgressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards)
-			s.setErr(err)
+			s.setErr(vstreamProgressTimeoutError(s.copyProgressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			cancel()
 		},
 		func() {
