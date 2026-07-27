@@ -242,6 +242,45 @@ for p in $COVERED_PACKAGES; do
 	fi
 done
 
+
+# ---------------------------------------------------------------------------
+# Filtered-shard completeness (audit 2026-07-26 TEST-1).
+#
+# The pipeline shards partition the test-name space by regex:
+#   -run ^TestMigrate_ | -run ^TestStreamer_ | -skip ^(TestMigrate_|TestStreamer_)
+#
+# That partition is complete only for a package listed in ALL of them. A
+# package listed under the -skip shard ALONE has a hole exactly the size of the
+# skipped names: such a test runs in no job, and NOTHING notices — "go test
+# -skip" emits no RUN line and no --- SKIP marker and exits 0, so even the
+# fail-on-skip belt is blind to it. internal/pipeline/backup sat in that hole,
+# under a comment asserting the opposite.
+#
+# Rule: every package appearing in a -skip shard must also appear in every -run
+# shard.
+skip_pkgs=$(grep -B1 'goflags: "-skip' "$ci_workflow" | grep -oE '\./internal/[a-zA-Z0-9_/.-]+' | sort -u)
+run_pkglists=$(grep -B1 'goflags: "-run' "$ci_workflow" | grep 'packages:')
+
+if [ -n "$skip_pkgs" ] && [ -n "$run_pkglists" ]; then
+	while IFS= read -r pkg; do
+		[ -z "$pkg" ] && continue
+		while IFS= read -r line; do
+			[ -z "$line" ] && continue
+			case "$line" in
+			*"$pkg"*) ;;
+			*)
+				echo "::error::$pkg is listed in a -skip shard of $ci_workflow but is missing from a -run shard of the same partition: ${line# *}"
+				echo "::error::A test there whose name the -skip regex matches would run in NO job. 'go test -skip' prints no RUN line and no SKIP marker and exits 0, so neither the fail-on-skip belt nor the coverage check above can see it. Add $pkg to every -run shard's packages list."
+				status=1
+				;;
+			esac
+		done <<-INNER
+			$run_pkglists
+		INNER
+	done <<-OUTER
+		$skip_pkgs
+	OUTER
+fi
 if [ "$status" -eq 0 ]; then
 	echo "check-shard-coverage: every integration-tagged package is covered by a CI shard (recursion semantics mirroring ci.yml), and no shard entry is stale."
 fi

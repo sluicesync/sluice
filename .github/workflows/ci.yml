@@ -280,11 +280,18 @@ jobs:
       fail-fast: false
       matrix:
         shard:
+          # internal/pipeline/backup appears in ALL THREE pipeline shards, not
+          # only the -skip one. The three regexes partition the test-name space
+          # (-run TestMigrate_ | -run TestStreamer_ | -skip both), and that
+          # partition is complete only FOR A PACKAGE LISTED IN ALL THREE.
+          # Listing backup under -skip alone meant a TestMigrate_- or
+          # TestStreamer_-named integration test there would have run in NO
+          # job, with both self-guards green (audit 2026-07-26 TEST-1).
           - name: pipeline-migrate
-            packages: "./internal/pipeline/"
+            packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-run ^TestMigrate_"
           - name: pipeline-rest-streamer
-            packages: "./internal/pipeline/"
+            packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-run ^TestStreamer_"
           # The `-skip` regex uses parentheses for alternation — those
           # are shell-special characters when the goflags string gets
@@ -295,13 +302,9 @@ jobs:
           # parse step with `syntax error near unexpected token '('`.
           # internal/pipeline/backup carries the backup/restore/chain
           # orchestration carved out of the flat pipeline root (audit
-          # 3.7b-2). Its tests are unit-only today, but the package is
-          # listed here so any future integration-tagged backup/restore
-          # test actually RUNS — the shard-coverage guard's prefix match
-          # (internal/pipeline covers the subtree) would otherwise pass
-          # green while this non-recursive `./internal/pipeline/` shard
-          # silently skipped it (the exact false-confidence class the
-          # guard exists to prevent).
+          # 3.7b-2). Its tests are unit-only today; it is listed across ALL
+          # THREE pipeline shards (see the note above) so a future
+          # integration-tagged test there runs whatever its name.
           - name: pipeline-rest-other
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-skip '^(TestMigrate_|TestStreamer_)'"
