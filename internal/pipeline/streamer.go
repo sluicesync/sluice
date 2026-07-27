@@ -1699,6 +1699,16 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		return err
 	}
 
+	// The `--where` drift contract runs for EVERY source engine, so it lives
+	// outside the publication phase above — that one returns early for any
+	// source that is not an ir.PublicationScoper, which is every engine except
+	// Postgres, and having the check inside it made the engine-neutral
+	// widening inert (Bug 209). Ordered AFTER it so the PG legacy-hash
+	// acceptance can see the resolved publicationRowFilters.
+	if err := s.phaseCheckRowFilterDrift(ctx, applier, streamID); err != nil {
+		return err
+	}
+
 	// ---- 3. Look up the persisted position ----
 	// Source priority: --position-from-manifest chain terminal >
 	// applier.ReadPosition (warm resume) > cold start. The phase doc

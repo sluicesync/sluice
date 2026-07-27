@@ -199,5 +199,15 @@ CREATE TABLE attr_child (
 CREATE TABLE attr_defpk (
     a  BIGINT NOT NULL,
     b  BIGINT NOT NULL,
-    CONSTRAINT attr_defpk_pk PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED
+    CONSTRAINT attr_defpk_pkey PRIMARY KEY (a, b) DEFERRABLE INITIALLY DEFERRED
+);
+
+-- The PK constraint-NAME axis, on its OWN table carrying NO attributes
+-- (roadmap item 84). Kept separate from attr_defpk deliberately: the
+-- dump-parity allowlist matches a statement PREFIX, so an entry excusing a
+-- NAME difference on an attribute-bearing table would also excuse an
+-- attribute difference on the same line — which is exactly how Bug 208 hid.
+CREATE TABLE attr_namedpk (
+    a  BIGINT NOT NULL,
+    CONSTRAINT attr_namedpk_pk PRIMARY KEY (a)
 );

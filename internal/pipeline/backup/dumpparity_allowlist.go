@@ -61,13 +61,30 @@ var DumpParityAllowlist = []dumpParityAllowlistEntry{
 	// source-engine-aware rule, not a one-liner. These entries keep the gap
 	// VISIBLE in the ledger (allowlist hits are logged every run) instead of
 	// letting the seed go quiet about it, and go stale-loud when item 84 ships.
+	// NOTE on scope, learned the hard way (Bug 208): these entries match a
+	// statement PREFIX, so an entry keyed on the constraint name swallows
+	// everything that follows it on the line — including the DEFERRABLE
+	// INITIALLY DEFERRED clause. The first cut of this pair masked a real
+	// attribute defect: the oracle emitted the PK with its attributes and
+	// sluice emitted it without them, and the ledger stayed green because the
+	// allowlist had already excused the whole line on NAME grounds.
+	//
+	// So the attribute-bearing table (attr_defpk) is NOT allowlisted at all
+	// any more — its PK is named to PG's own default so no name divergence
+	// arises and the attribute axis is compared for real. The name gap keeps a
+	// dedicated table of its own, carrying NO attributes, so excusing its line
+	// cannot hide anything else.
+	//
+	// General rule for this file: an allowlist entry must be narrower than the
+	// property it excuses. If the entry's prefix can absorb an unrelated
+	// difference, it will eventually absorb a defect.
 	{
-		Pattern:  "ALTER TABLE public.attr_defpk ADD CONSTRAINT attr_defpk_pkey",
-		Reason:   "an explicitly-named source PRIMARY KEY is re-emitted inline, so PG auto-names it <table>_pkey",
+		Pattern:  "ALTER TABLE public.attr_namedpk ADD CONSTRAINT attr_namedpk_pkey",
+		Reason:   "an explicitly-named source PRIMARY KEY is re-emitted inline, so PG auto-names it <table>_pkey; this table carries NO constraint attributes, so the excused line cannot hide an attribute divergence",
 		Citation: "docs/dev/roadmap.md item 84 (PK constraint-name fidelity)",
 	},
 	{
-		Pattern:  "ALTER TABLE public.attr_defpk ADD CONSTRAINT attr_defpk_pk",
+		Pattern:  "ALTER TABLE public.attr_namedpk ADD CONSTRAINT attr_namedpk_pk",
 		Reason:   "oracle side of the same cell: pg_dump emits the source constraint name sluice did not preserve",
 		Citation: "docs/dev/roadmap.md item 84 (PK constraint-name fidelity)",
 	},

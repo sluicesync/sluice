@@ -1452,7 +1452,18 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		LEFT JOIN LATERAL unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
 		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
-		LEFT JOIN pg_constraint ucon ON ucon.conindid = ix.indexrelid AND ucon.contype = 'u'
+		-- contype IN ('u','p'): the attribute columns below must see a PRIMARY
+		-- KEY as well as a UNIQUE constraint. Restricting the join to 'u' made
+		-- condeferrable unreadable for a PK, so a DEFERRABLE PRIMARY KEY was
+		-- neither carried nor warned about — and the gate split and emitter
+		-- change that were supposed to fix that were both UNREACHABLE, because
+		-- the data they branch on never arrived (Bug 208).
+		--
+		-- constraint_backed widens with it, which is intended and safe: the
+		-- re-emit shape is gated separately on !isPrimary (a PK re-emits as
+		-- ADD PRIMARY KEY, not ADD CONSTRAINT UNIQUE), while the ATTRIBUTE
+		-- carry deliberately covers both.
+		LEFT JOIN pg_constraint ucon ON ucon.conindid = ix.indexrelid AND ucon.contype IN ('u', 'p')
 		WHERE  n.nspname = $1
 		  AND  cl.relkind = 'r'
 		ORDER  BY cl.relname, i.relname, u.ord`
