@@ -1,12 +1,12 @@
 # Runs the integration test suite WITH the race detector inside a Linux
-# container — the pre-tag gate for concurrency-touching chunks.
+# container -- the pre-tag gate for concurrency-touching chunks.
 #
 # Why this exists: the dev box is Windows + CGO_ENABLED=0 and CANNOT run
 # `-race` (the detector is a CGO/TSan runtime); integration tests also
 # need Docker. So "integration + -race" otherwise exists only on CI's
 # Linux runner. For chunks touching concurrency (goroutines, channels,
 # shared state, rotation/FSM, crash-recovery, failpoints) this gate must
-# pass BEFORE a tag is cut — see CLAUDE.md "Concurrency chunks: the
+# pass BEFORE a tag is cut -- see CLAUDE.md "Concurrency chunks: the
 # -race integration gate runs BEFORE the tag".
 #
 # Mechanism: a golang Linux container with gcc + CGO_ENABLED=1, the host
@@ -23,15 +23,15 @@
 # a git hook.
 #
 # Rancher Desktop caveats (this repo's dev environment):
-#   - Requires the dockerd (moby) backend, NOT containerd — DooD needs a
+#   - Requires the dockerd (moby) backend, NOT containerd -- DooD needs a
 #     Docker socket at /var/run/docker.sock. Switch in Rancher Desktop:
 #     Preferences > Container Engine > dockerd(moby).
 #   - testcontainers-go inside the container reaches sibling containers
 #     via host.docker.internal (set as TESTCONTAINERS_HOST_OVERRIDE
-#     below); RYUK is disabled (it vanishes under Rancher's daemon — the
+#     below); RYUK is disabled (it vanishes under Rancher's daemon -- the
 #     same reason the bare-metal integration runs need it disabled).
 #   - If DooD proves flaky on your local Rancher setup, DO NOT fight it:
-#     fall through to the zero-infra alternative (CLAUDE.md option 2) —
+#     fall through to the zero-infra alternative (CLAUDE.md option 2) --
 #     push the work to `main` and wait for the CI Integration job green
 #     BEFORE cutting the tag. One CI cycle either way; no retag churn.
 
@@ -40,7 +40,7 @@ param(
     [string]$Run = '',
     [string]$Timeout = '30m',
     [int]$Count = 1,
-    [string]$Image = 'golang:1.26'
+    [string]$Image = 'golang:1.26.5'  # must satisfy go.mod's go >= directive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,7 +49,7 @@ function Red($msg)   { Write-Host $msg -ForegroundColor Red }
 function Green($msg) { Write-Host $msg -ForegroundColor Green }
 function Info($msg)  { Write-Host $msg -ForegroundColor Cyan }
 
-# Locate docker.exe — on Rancher Desktop it is often absent from PATH.
+# Locate docker.exe -- on Rancher Desktop it is often absent from PATH.
 $docker = 'docker'
 if (-not (Get-Command $docker -ErrorAction SilentlyContinue)) {
     $rancher = 'C:\Program Files\Rancher Desktop\resources\resources\win32\bin\docker.exe'
@@ -59,7 +59,7 @@ if (-not (Get-Command $docker -ErrorAction SilentlyContinue)) {
 
 # Confirm a Docker socket exists (DooD needs the moby backend, not containerd).
 & $docker info *> $null
-if ($LASTEXITCODE -ne 0) { Red 'docker info failed — start Rancher Desktop (dockerd/moby backend).'; exit 1 }
+if ($LASTEXITCODE -ne 0) { Red 'docker info failed -- start Rancher Desktop (dockerd/moby backend).'; exit 1 }
 
 $repo = (Resolve-Path "$PSScriptRoot\..").Path
 Info "repo:    $repo"
@@ -94,9 +94,9 @@ go test -tags=integration -race -count=$Count -timeout=$Timeout $runExpr ./inter
 $code = $LASTEXITCODE
 Write-Host ''
 if ($code -eq 0) {
-    Green 'race-integration: OK (concurrency -race gate passed — safe to tag)'
+    Green 'race-integration: OK (concurrency -race gate passed -- safe to tag)'
 } else {
-    Red "race-integration: FAILED (exit $code) — do NOT cut/force-move the tag."
+    Red "race-integration: FAILED (exit $code) -- do NOT cut/force-move the tag."
     Red 'Read the failure as CI ground truth (three-phase Phase A); if DooD itself is flaky, use CLAUDE.md option 2 (push-first, wait for CI Integration green, then tag).'
 }
 exit $code
