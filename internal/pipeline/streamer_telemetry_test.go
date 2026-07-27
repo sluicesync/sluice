@@ -47,7 +47,8 @@ func TestEmitTargetTelemetryMetrics_AllKnown(t *testing.T) {
 		LagKnown:              true,
 		ActiveConnections:     12,
 		MaxConnections:        100,
-		ConnKnown:             true,
+		ActiveConnKnown:       true,
+		MaxConnKnown:          true,
 	}
 	var buf bytes.Buffer
 	emitTargetTelemetryMetrics(&buf, "s1", snap)

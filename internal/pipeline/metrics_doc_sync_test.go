@@ -137,7 +137,8 @@ func (docSyncTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) 
 		LagKnown:                   true,
 		ActiveConnections:          3,
 		MaxConnections:             100,
-		ConnKnown:                  true,
+		ActiveConnKnown:            true,
+		MaxConnKnown:               true,
 	}, true
 }
 

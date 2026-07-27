@@ -61,7 +61,8 @@ func TestTargetMetricsHistory_RoundTripPruneNULLs(t *testing.T) {
 		MemUtil: 0.70, MemKnown: true,
 		StorageUtil: 0.55, StorageAvailableBytes: 5 << 30, StorageCapacityBytes: 10 << 30, StorageKnown: true,
 		ReplicaLagSeconds: 1.5, LagKnown: true,
-		ActiveConnections: 12, MaxConnections: 100, ConnKnown: true,
+		ActiveConnections: 12, MaxConnections: 100, ActiveConnKnown: true,
+		MaxConnKnown: true,
 	}
 	// partial: only CPU observed — mem/storage/lag/conns UNOBSERVED → NULL.
 	partial := ir.TargetMetricsSample{
@@ -111,7 +112,7 @@ func TestTargetMetricsHistory_RoundTripPruneNULLs(t *testing.T) {
 	if !r0.LagKnown || r0.ReplicaLagSeconds != 1.5 {
 		t.Errorf("Lag: %+v", r0)
 	}
-	if !r0.ConnKnown || r0.ActiveConnections != 12 || r0.MaxConnections != 100 {
+	if (!r0.ActiveConnKnown || !r0.MaxConnKnown) || r0.ActiveConnections != 12 || r0.MaxConnections != 100 {
 		t.Errorf("Conn: %+v", r0)
 	}
 	if r0.Database != "appdb" || r0.Branch != "main" {
@@ -133,7 +134,7 @@ func TestTargetMetricsHistory_RoundTripPruneNULLs(t *testing.T) {
 	if r1.LagKnown {
 		t.Errorf("partial LagKnown should be false (NULL); got %+v", r1)
 	}
-	if r1.ConnKnown {
+	if r1.ActiveConnKnown || r1.MaxConnKnown {
 		t.Errorf("partial ConnKnown should be false (NULL); got %+v", r1)
 	}
 

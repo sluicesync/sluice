@@ -36,7 +36,8 @@ func TestMetricsWatchReadoutFields_Honesty(t *testing.T) {
 		StorageCapacityBytes:  10_000_000_000,
 		StorageKnown:          true,
 		ReplicaLagSeconds:     1.5, LagKnown: true,
-		ActiveConnections: 12, MaxConnections: 100, ConnKnown: true,
+		ActiveConnections: 12, MaxConnections: 100, ActiveConnKnown: true,
+		MaxConnKnown: true,
 	}
 	got := metricsWatchReadoutFields(now, snap, true)
 	want := map[string]string{

@@ -58,5 +58,6 @@ func ApplyMetricNullables(
 
 	r.ActiveConnections = int(activeConns.Int32)
 	r.MaxConnections = int(maxConns.Int32)
-	r.ConnKnown = activeConns.Valid && maxConns.Valid
+	r.ActiveConnKnown = activeConns.Valid
+	r.MaxConnKnown = maxConns.Valid
 }

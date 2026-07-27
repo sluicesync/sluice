@@ -4,6 +4,7 @@
 package telemetrysink
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -126,12 +127,51 @@ func (s *FileSink) Write(ctx context.Context, recs []Record) error {
 			return errors.Join(append(errs, err)...)
 		}
 	}
+	before := s.size
 	n, err := s.f.Write(buf)
 	s.size += int64(n)
 	if err != nil {
+		// A SHORT write (classically ENOSPC) stops mid-record, leaving the
+		// file ending in a partial line with no newline. Left alone, the next
+		// successful write appends at that offset and GLUES a fully-valid
+		// record onto the fragment: one unparseable line that swallows a
+		// record this sink already reported as written (audit 2026-07-26
+		// SL-5, observed on a full tmpfs).
+		//
+		// So roll the file back to the last COMPLETE record boundary inside
+		// what was actually written. Whole records that made it survive; only
+		// the torn one is discarded — and it is discarded LOUDLY, since the
+		// write error is still returned. Truncating also releases the bytes
+		// the failed write consumed, which is exactly what a full disk needs.
+		if keep, ok := lastRecordBoundary(buf, n, before); ok {
+			if terr := s.f.Truncate(keep); terr == nil {
+				s.size = keep
+			} else {
+				err = errors.Join(err, fmt.Errorf("could not truncate the torn record away: %w", terr))
+			}
+		}
 		return errors.Join(append(errs, fmt.Errorf("telemetrysink: write %s: %w", s.cfg.Path, err))...)
 	}
 	return errors.Join(errs...)
+}
+
+// lastRecordBoundary reports the file size to truncate back to after a short
+// write of n bytes that began at file offset before. Records are
+// newline-terminated, so the boundary is just past the last newline inside the
+// written prefix; if no record completed, the whole prefix goes.
+func lastRecordBoundary(buf []byte, n int, before int64) (int64, bool) {
+	if n <= 0 {
+		// Nothing landed — there is still a boundary to restore only if the
+		// offset moved, which it did not.
+		return before, before >= 0
+	}
+	if n > len(buf) {
+		n = len(buf)
+	}
+	if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
+		return before + int64(i) + 1, true
+	}
+	return before, true
 }
 
 // Close closes the current file. Safe to call more than once.
@@ -155,7 +195,9 @@ func (s *FileSink) open() error {
 			return fmt.Errorf("telemetrysink: create directory for %s: %w", s.cfg.Path, err)
 		}
 	}
-	f, err := os.OpenFile(s.cfg.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, filePerm) //nolint:gosec // path is operator-supplied by construction (--sink-file)
+	// O_RDWR rather than O_WRONLY so the torn-tail check below can read the
+	// file's last byte.
+	f, err := os.OpenFile(s.cfg.Path, os.O_RDWR|os.O_APPEND|os.O_CREATE, filePerm) //nolint:gosec // path is operator-supplied by construction (--sink-file)
 	if err != nil {
 		return fmt.Errorf("telemetrysink: open %s: %w", s.cfg.Path, err)
 	}
@@ -166,6 +208,28 @@ func (s *FileSink) open() error {
 	}
 	s.f = f
 	s.size = info.Size()
+	// Heal a tail torn by something this process cannot roll back — a kill
+	// -9, a power loss, a container OOM mid-write. Truncate-on-short-write
+	// handles the errors we SEE; this handles the ones we never got to
+	// observe, and without it a restart re-opens at the torn offset and the
+	// first new record is glued onto the fragment (audit 2026-07-26 SL-5).
+	//
+	// Terminating the fragment rather than truncating it is deliberate: the
+	// bytes are the operator's, they may be diagnostically useful, and a
+	// reader already has to tolerate one unparseable line for the tear
+	// itself. Destroying data to tidy up would be the worse trade.
+	if s.size > 0 {
+		var last [1]byte
+		if _, rerr := f.ReadAt(last[:], s.size-1); rerr == nil && last[0] != '\n' {
+			n, werr := f.Write([]byte{'\n'})
+			s.size += int64(n)
+			if werr != nil {
+				_ = f.Close()
+				s.f = nil
+				return fmt.Errorf("telemetrysink: terminate torn record in %s: %w", s.cfg.Path, werr)
+			}
+		}
+	}
 	return nil
 }
 

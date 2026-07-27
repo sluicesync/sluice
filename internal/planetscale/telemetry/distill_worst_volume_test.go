@@ -268,7 +268,7 @@ func TestDistill_PGConnections_ResolveOnTheRealShapes(t *testing.T) {
 		{name: "planetscale_postgres_settings_max_connections", labels: map[string]string{"planetscale_pod": "c", "planetscale_role": "primary"}, value: 25},
 	}
 	snap := distill(samples, postgresMetricNames, time.Now())
-	if !snap.ConnKnown {
+	if !snap.ActiveConnKnown || !snap.MaxConnKnown {
 		t.Fatal("ConnKnown = false; want true — both PG connection shapes are resolvable")
 	}
 	if snap.ActiveConnections != 4 || snap.MaxConnections != 25 {

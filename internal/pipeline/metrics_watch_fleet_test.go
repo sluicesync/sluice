@@ -348,7 +348,8 @@ func TestMetricsDocSync_FleetExporter(t *testing.T) {
 		// live PS-PG shape that motivated the signal.
 		StorageUtilWorst: 0.75, StorageAvailableWorstBytes: 1 << 29, StorageCapacityWorstBytes: 1 << 31, StorageWorstKnown: true,
 		ReplicaLagSeconds: 1.5, LagKnown: true,
-		ActiveConnections: 3, MaxConnections: 100, ConnKnown: true,
+		ActiveConnections: 3, MaxConnections: 100, ActiveConnKnown: true,
+		MaxConnKnown: true,
 	}
 	var buf bytes.Buffer
 	emitFleetTelemetryMetrics(&buf, []ir.FleetHealthSample{
@@ -427,7 +428,8 @@ func TestRunMetricsWatch_SingleModePersistsTheSample(t *testing.T) {
 	prov := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{
 		SampledAt: time.Now(),
 		CPUUtil:   0.25, CPUKnown: true,
-		ActiveConnections: 12, MaxConnections: 100, ConnKnown: true,
+		ActiveConnections: 12, MaxConnections: 100, ActiveConnKnown: true,
+		MaxConnKnown: true,
 	}}
 	err := RunMetricsWatch(t.Context(), prov, MetricsWatchConfig{
 		Label: "metrics-watch:app", Database: "app", Branch: "main",

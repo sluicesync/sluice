@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -293,10 +294,10 @@ func formatWatchLine(now time.Time, snap ir.TargetHealthSnapshot, ok bool) strin
 	if snap.LagKnown {
 		lag = fmt.Sprintf("%.1fs", snap.ReplicaLagSeconds)
 	}
-	conns := "n/a"
-	if snap.ConnKnown {
-		conns = fmt.Sprintf("%d/%d", snap.ActiveConnections, snap.MaxConnections)
-	}
+	// Each half is rendered only if observed — "37/?" rather than a
+	// fabricated "37/0", which reads as a target with no connection budget
+	// (audit 2026-07-26 SL-6).
+	conns := formatConnPair(snap)
 	return fmt.Sprintf(
 		"%s  cpu=%s mem=%s storage=%s%s lag=%s conns=%s  sampled=%s fresh=%t",
 		stamp,
@@ -336,10 +337,10 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 	if snap.LagKnown {
 		lag = fmt.Sprintf("%.1fs", snap.ReplicaLagSeconds)
 	}
-	conns := "n/a"
-	if snap.ConnKnown {
-		conns = fmt.Sprintf("%d/%d", snap.ActiveConnections, snap.MaxConnections)
-	}
+	// Each half is rendered only if observed — "37/?" rather than a
+	// fabricated "37/0", which reads as a target with no connection budget
+	// (audit 2026-07-26 SL-6).
+	conns := formatConnPair(snap)
 	return []progress.Field{
 		{Label: "cpu", Value: frac(snap.CPUKnown, snap.CPUUtil)},
 		{Label: "mem", Value: frac(snap.MemKnown, snap.MemUtil)},
@@ -433,4 +434,24 @@ func logWatchStart(ctx context.Context, logger *slog.Logger, label string, inter
 		slog.Duration("interval", interval),
 		slog.String("mode", mode),
 	)
+}
+
+// formatConnPair renders the active/max connection pair for operator-facing
+// output, showing "?" for a half that was not observed.
+//
+// The two counts come from independent metric series and either can resolve
+// while the other does not. A single shared *Known flag used to render the
+// missing half as 0 — "37/0" reads as a target with no connection budget at
+// all, which is a claim the telemetry never made (audit 2026-07-26 SL-6).
+func formatConnPair(snap ir.TargetHealthSnapshot) string {
+	if !snap.ActiveConnKnown && !snap.MaxConnKnown {
+		return "n/a"
+	}
+	half := func(v int, known bool) string {
+		if !known {
+			return "?"
+		}
+		return strconv.Itoa(v)
+	}
+	return half(snap.ActiveConnections, snap.ActiveConnKnown) + "/" + half(snap.MaxConnections, snap.MaxConnKnown)
 }

@@ -97,8 +97,8 @@ func (a *ChangeApplier) RecordTargetMetricsSample(ctx context.Context, s ir.Targ
 		ir.MetricNullInt64(s.StorageAvailableBytes, s.StorageKnown),
 		ir.MetricNullInt64(s.StorageCapacityBytes, s.StorageKnown),
 		ir.MetricNullFloat64(s.ReplicaLagSeconds, s.LagKnown),
-		ir.MetricNullInt32(s.ActiveConnections, s.ConnKnown),
-		ir.MetricNullInt32(s.MaxConnections, s.ConnKnown),
+		ir.MetricNullInt32(s.ActiveConnections, s.ActiveConnKnown),
+		ir.MetricNullInt32(s.MaxConnections, s.MaxConnKnown),
 	)
 	if err != nil {
 		return fmt.Errorf("mysql: record target-metrics sample: %w", err)

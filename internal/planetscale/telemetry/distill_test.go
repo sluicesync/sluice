@@ -62,7 +62,7 @@ func TestDistill_FullExposition_AllFamilies(t *testing.T) {
 
 	// Connections (secondary): active from edge (128), max from primary
 	// vttablet (1000).
-	if !snap.ConnKnown {
+	if !snap.ActiveConnKnown || !snap.MaxConnKnown {
 		t.Fatal("ConnKnown false; want true")
 	}
 	if snap.ActiveConnections != 128 || snap.MaxConnections != 1000 {
@@ -117,7 +117,7 @@ func TestDistill_PostgresEngine_UsesPGNames(t *testing.T) {
 	}
 	// Connections: this fixture carries neither PG connection series, so they
 	// stay honestly unobserved even though the names are now mapped.
-	if snap.ConnKnown {
+	if snap.ActiveConnKnown || snap.MaxConnKnown {
 		t.Error("ConnKnown true; want false (no connection series in this fixture)")
 	}
 }
@@ -166,7 +166,7 @@ func TestDistill_MissingMetric_KnownFalse(t *testing.T) {
 	if snap.LagKnown {
 		t.Error("LagKnown true; want false (lag absent)")
 	}
-	if snap.ConnKnown {
+	if snap.ActiveConnKnown || snap.MaxConnKnown {
 		t.Error("ConnKnown true; want false (conn metrics absent)")
 	}
 }

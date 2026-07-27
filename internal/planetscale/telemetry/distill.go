@@ -253,12 +253,16 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 
 	active, activeOK := selectPrimaryValue(samples, names.activeConns, names.primaryContainer)
 	maxc, maxOK := selectPrimaryValue(samples, names.maxConns, names.primaryContainer)
-	if activeOK || maxOK {
-		// Connections are a secondary signal; report whichever halves we
-		// observed (a missing half stays 0). ConnKnown gates the whole pair.
+	// Each half gates its OWN value: the two counts come from independent
+	// series families and either can resolve while the other does not, so a
+	// shared flag published a fabricated 0 as observed (audit SL-6).
+	if activeOK {
 		snap.ActiveConnections = int(active)
+		snap.ActiveConnKnown = true
+	}
+	if maxOK {
 		snap.MaxConnections = int(maxc)
-		snap.ConnKnown = true
+		snap.MaxConnKnown = true
 	}
 
 	return snap

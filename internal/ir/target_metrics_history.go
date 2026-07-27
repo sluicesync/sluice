@@ -108,8 +108,16 @@ type TargetMetricsSample struct {
 	ReplicaLagSeconds float64
 	LagKnown          bool
 	ActiveConnections int
-	MaxConnections    int
-	ConnKnown         bool
+	// ActiveConnKnown and MaxConnKnown gate their OWN value. They were one
+	// shared ConnKnown until audit 2026-07-26 SL-6: the two counts come from
+	// independent metric series and either can be absent while the other
+	// resolves, so a single flag published a fabricated 0 for the missing half
+	// as though it had been observed — rendering "37/0" and persisting a zero
+	// denominator as non-NULL. One flag per value is the same discipline the
+	// storage triple already followed.
+	ActiveConnKnown bool
+	MaxConnections  int
+	MaxConnKnown    bool
 }
 
 // TargetMetricsHistoryRow is the rendered shape one persisted history row
@@ -136,6 +144,14 @@ type TargetMetricsHistoryRow struct {
 	ReplicaLagSeconds float64
 	LagKnown          bool
 	ActiveConnections int
-	MaxConnections    int
-	ConnKnown         bool
+	// ActiveConnKnown and MaxConnKnown gate their OWN value. They were one
+	// shared ConnKnown until audit 2026-07-26 SL-6: the two counts come from
+	// independent metric series and either can be absent while the other
+	// resolves, so a single flag published a fabricated 0 for the missing half
+	// as though it had been observed — rendering "37/0" and persisting a zero
+	// denominator as non-NULL. One flag per value is the same discipline the
+	// storage triple already followed.
+	ActiveConnKnown bool
+	MaxConnections  int
+	MaxConnKnown    bool
 }

@@ -100,8 +100,8 @@ func TestPSVerify_TelemetryProvider(t *testing.T) {
 			t.Logf("live snapshot: cpu=%.3f(known=%v) mem=%.3f(known=%v) storage=%.3f(known=%v avail=%d cap=%d) lag=%.1fs(known=%v) conns=%d/%d(known=%v)",
 				s.CPUUtil, s.CPUKnown, s.MemUtil, s.MemKnown,
 				s.StorageUtil, s.StorageKnown, s.StorageAvailableBytes, s.StorageCapacityBytes,
-				s.ReplicaLagSeconds, s.LagKnown, s.ActiveConnections, s.MaxConnections, s.ConnKnown)
-			if !s.CPUKnown && !s.MemKnown && !s.StorageKnown && !s.LagKnown && !s.ConnKnown {
+				s.ReplicaLagSeconds, s.LagKnown, s.ActiveConnections, s.MaxConnections, (s.ActiveConnKnown || s.MaxConnKnown))
+			if !s.CPUKnown && !s.MemKnown && !s.StorageKnown && !s.LagKnown && (!s.ActiveConnKnown || !s.MaxConnKnown) {
 				t.Fatal("live snapshot ok but no metric family observed — check the metric-name table against the live exposition")
 			}
 			return

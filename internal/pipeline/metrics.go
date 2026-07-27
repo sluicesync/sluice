@@ -638,7 +638,10 @@ func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHeal
 		fmt.Fprintln(w, "# TYPE sluice_target_replica_lag_seconds gauge")
 		fmt.Fprintf(w, `sluice_target_replica_lag_seconds{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.ReplicaLagSeconds))
 	}
-	if snap.ConnKnown {
+	// Each half is emitted independently: a series ABSENT from the scrape is
+	// how Prometheus says "not observed", while a 0 is a claim about the
+	// target (audit 2026-07-26 SL-6).
+	if snap.ActiveConnKnown {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "# HELP sluice_target_active_connections Target active connection count from the control-plane telemetry provider (ADR-0107).")
 		fmt.Fprintln(w, "# TYPE sluice_target_active_connections gauge")
@@ -800,14 +803,14 @@ func fleetGaugeFamilies() []fleetGaugeFamily {
 			name: "sluice_target_active_connections",
 			help: "Target active connection count from the control-plane telemetry provider (ADR-0107).",
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
-				return strconv.Itoa(s.ActiveConnections), s.ConnKnown
+				return strconv.Itoa(s.ActiveConnections), s.ActiveConnKnown
 			},
 		},
 		{
 			name: "sluice_target_max_connections",
 			help: "Target maximum connection budget from the control-plane telemetry provider (ADR-0107).",
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
-				return strconv.Itoa(s.MaxConnections), s.ConnKnown
+				return strconv.Itoa(s.MaxConnections), s.MaxConnKnown
 			},
 		},
 	}

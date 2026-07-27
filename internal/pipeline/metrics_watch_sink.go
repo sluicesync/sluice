@@ -67,8 +67,12 @@ func sampleRecord(now time.Time, label, database, branch string, snap ir.TargetH
 	if snap.LagKnown {
 		rec.ReplicaLagSeconds = ptrOf(snap.ReplicaLagSeconds)
 	}
-	if snap.ConnKnown {
+	// Independently gated: the Record doc promises an unobserved metric
+	// serializes as an explicit JSON null, never a misleading 0 (audit SL-6).
+	if snap.ActiveConnKnown {
 		rec.ActiveConnections = ptrOf(int64(snap.ActiveConnections))
+	}
+	if snap.MaxConnKnown {
 		rec.MaxConnections = ptrOf(int64(snap.MaxConnections))
 	}
 	return rec

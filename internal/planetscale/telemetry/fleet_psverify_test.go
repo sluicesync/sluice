@@ -68,7 +68,7 @@ func TestPSVerify_FleetTelemetry(t *testing.T) {
 				s.Target, s.OK,
 				snap.CPUUtil, snap.CPUKnown, snap.MemUtil, snap.MemKnown,
 				snap.StorageUtil, snap.StorageKnown, snap.StorageAvailableBytes, snap.StorageCapacityBytes,
-				snap.ReplicaLagSeconds, snap.LagKnown, snap.ActiveConnections, snap.MaxConnections, snap.ConnKnown)
+				snap.ReplicaLagSeconds, snap.LagKnown, snap.ActiveConnections, snap.MaxConnections, (snap.ActiveConnKnown || snap.MaxConnKnown))
 		}
 		t.Logf("fleet: %d targets discovered, %d observed", len(samples), observed)
 
@@ -82,7 +82,7 @@ func TestPSVerify_FleetTelemetry(t *testing.T) {
 				continue
 			}
 			snap := s.Snapshot
-			if !snap.CPUKnown && !snap.MemKnown && !snap.StorageKnown && !snap.LagKnown && !snap.ConnKnown {
+			if !snap.CPUKnown && !snap.MemKnown && !snap.StorageKnown && !snap.LagKnown && (!snap.ActiveConnKnown || !snap.MaxConnKnown) {
 				t.Errorf("%s: observed but NO metric family read — metricNamesForExposition likely picked the wrong table for this target", s.Target)
 			}
 		}

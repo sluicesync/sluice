@@ -415,8 +415,12 @@ func renderTargetMetricsRows(rows []ir.TargetMetricsHistoryRow) []map[string]any
 		if r.LagKnown {
 			m["replica_lag_seconds"] = r.ReplicaLagSeconds
 		}
-		if r.ConnKnown {
+		// Each half is emitted only if observed: an unobserved metric must be
+		// absent (rendering as null), never a misleading 0 (audit SL-6).
+		if r.ActiveConnKnown {
 			m["active_connections"] = r.ActiveConnections
+		}
+		if r.MaxConnKnown {
 			m["max_connections"] = r.MaxConnections
 		}
 		out = append(out, m)
@@ -535,8 +539,10 @@ func probeAndWriteTargetHealth(ctx context.Context, b *bundleWriter, name string
 	if snap.LagKnown {
 		out["replica_lag_seconds"] = snap.ReplicaLagSeconds
 	}
-	if snap.ConnKnown {
+	if snap.ActiveConnKnown {
 		out["active_connections"] = snap.ActiveConnections
+	}
+	if snap.MaxConnKnown {
 		out["max_connections"] = snap.MaxConnections
 	}
 	b.writeJSON(name, out)

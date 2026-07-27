@@ -143,7 +143,8 @@ func recordTargetMetricsTick(
 		LagKnown:              snap.LagKnown,
 		ActiveConnections:     snap.ActiveConnections,
 		MaxConnections:        snap.MaxConnections,
-		ConnKnown:             snap.ConnKnown,
+		ActiveConnKnown:       snap.ActiveConnKnown,
+		MaxConnKnown:          snap.MaxConnKnown,
 	}
 	if err := store.RecordTargetMetricsSample(ctx, sample); err != nil {
 		logger.WarnContext(
