@@ -799,6 +799,41 @@ func (s *Streamer) phasePrimeSchemaHistoryCache(ctx context.Context, applier ir.
 	return nil
 }
 
+// phasePreflightUpsertKeys refuses, before the apply loop starts
+// (---- 4c ----), if any in-scope target table lacks a key the target
+// engine's idempotent insert-or-update can key on.
+//
+// It runs HERE — after [Streamer.phaseOpenChangeStream], not at
+// sync-start with the other preflights — because the answer only exists
+// once the target schema does: a cold start CREATEs the tables it is
+// asking about, so asking earlier would find an empty schema and pass
+// vacuously. A warm resume inherits them and is checked on every
+// attempt. Either way this is still before the first change is applied.
+//
+// The concrete class is Bug 211: a Postgres target carrying a source's
+// `PRIMARY KEY … DEFERRABLE` cannot be an `ON CONFLICT` arbiter, so the
+// stream died on the first change to such a table with no retry, every
+// warm resume died on the same change, and the rest of the stream —
+// plain-PK tables included — stalled behind it. The refusal names the
+// table and the remedy at a moment the operator can act on.
+//
+// Optional-surface probe: an applier without [ir.UpsertKeyPreflighter]
+// (every non-Postgres engine today, and every test stub) skips silently;
+// its apply path is unchanged.
+func (s *Streamer) phasePreflightUpsertKeys(ctx context.Context, applier ir.ChangeApplier) error {
+	pf, ok := applier.(ir.UpsertKeyPreflighter)
+	if !ok {
+		return nil
+	}
+	// The stream's table scope, so a deferrable-key table this stream
+	// never touches is never refused over.
+	inScope := func(table string) bool { return s.Filter.Allows(table) }
+	// Returned verbatim: the engine's refusal already carries its
+	// sluicecode + remedy hint, and WrapWithHint would re-classify it
+	// against the substring registry and could overwrite both.
+	return pf.PreflightUpsertKeys(ctx, inScope)
+}
+
 // phaseStartApplySidecars wires the apply loop's sidecar goroutines:
 // the stop-signal poll (Bug 15 CLI fix, ADR-0025), the ADR-0034
 // live-added-tables seed + poll, and the GitHub #23 Phase A

@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Continuous Postgres→Postgres sync of a table whose primary key is `DEFERRABLE` works again — and where it cannot, it now refuses at the start instead of dying mid-stream.** This one is ours, and it came from the previous release's own fix. v0.103.1 made a Postgres target CARRY a source's `PRIMARY KEY … DEFERRABLE`, which was right — landing an immediate key instead is a STRICTER constraint than the source's, and it aborts the bulk key shift (`UPDATE t SET id = id + 1`) that commits happily on the source. What that correct fix did was make sluice's own change-apply path illegal: applying a change idempotently means `INSERT … ON CONFLICT (<key>) DO UPDATE`, and Postgres refuses a deferrable constraint as an `ON CONFLICT` arbiter. From v0.103.1 the stream died on the FIRST change to such a table — `ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters`, terminally, with zero retries — every warm resume died on the same change, and every other table in the same stream, plain primary keys included, stalled behind it. Nothing was lost or corrupted; the sync simply stopped and could not be restarted. v0.103.0 was unaffected because it dropped the attribute on the way to the target.
+
+The attribute keeps being carried — reverting that would trade this availability defect for the silent fidelity one it fixed. What changed is that sluice no longer tries to arbitrate on a key Postgres will not accept: it keys the upsert on an immediate `NOT NULL UNIQUE` index when the table has one, so a deferrable primary key alongside an ordinary unique key now streams normally. When there is no such alternative, `sync start` refuses before applying anything, with `SLUICE-E-TARGET-DEFERRABLE-KEY` naming the table, the constraint, why Postgres cannot use it, and the remedy (recreate the target constraint as immediate, pre-create the target table with an immediate key, add an immediate unique index, or take the table out of scope). The check runs once the target schema exists and before the first change — the same refusal an hour into a stream is worth much less than the same refusal at start.
+
+Worth knowing if you are reading catalogs: `DEFERRABLE INITIALLY IMMEDIATE` is refused too. Postgres clears `pg_index.indimmediate` for any deferrable constraint regardless of its initial mode, so the two behave identically here — the obvious "only skip `INITIALLY DEFERRED`" reading is wrong, and the test matrix pins both.
+
+The same shape existed on the idempotent bulk-copy writer — the path behind `restore --data-only`, chain replay, and `schema add-table`'s copy — where a deferrable target key produced the identical raw Postgres error with no code and no remedy. It now produces the same coded refusal. That check reads the target catalog rather than the source schema, so pre-creating the target with an immediate primary key (the documented workaround for this whole class) is never refused over the source's shape.
+
 ## [0.103.2] - 2026-07-27
 
 One warning that was missing, and the gates that stop three recurring mistakes from recurring. Drop-in upgrade, no flag changes, no behaviour changes to any data path.

@@ -111,6 +111,19 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 	if !ok {
 		return errKeylessIdempotent(table)
 	}
+	// Bug 211: the chosen key must be backed by an IMMEDIATE unique index
+	// on the target — PG rejects a deferrable one as an ON CONFLICT
+	// arbiter (SQLSTATE 55000), which a Postgres source's carried
+	// `PRIMARY KEY … DEFERRABLE` produces. Probed against the live
+	// catalog rather than the IR so a target pre-created with an
+	// immediate key is never refused over its source's shape.
+	blocked, err := blockingDeferrableIndex(ctx, w.db, w.schema, table.Name, keyCols)
+	if err != nil {
+		return err
+	}
+	if blocked != "" {
+		return errDeferrableUpsertKey(w.schema, table.Name, []string{blocked})
+	}
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
@@ -277,6 +290,14 @@ func primaryKeyColumns(table *ir.Table) []string {
 // column, so such a key wouldn't reliably collide on re-emission — the
 // same silent-duplicate hazard as no key at all (identical to the
 // MySQL-side reasoning).
+//
+// Deferrability is deliberately NOT judged here (Bug 211). PG refuses a
+// deferrable index as an ON CONFLICT arbiter, but whether the TARGET's
+// key is deferrable is a property of the target catalog, not of the
+// source IR this function reads: a target pre-created with an immediate
+// primary key is perfectly usable even though the source's is
+// DEFERRABLE. [writeViaBatchIdempotent] therefore checks the real
+// catalog ([blockingDeferrableIndex]) once the key is chosen.
 func effectiveUpsertKeyColumns(table *ir.Table) ([]string, bool) {
 	if table == nil {
 		return nil, false

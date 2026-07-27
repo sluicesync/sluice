@@ -151,6 +151,19 @@ const (
 
 	CodeTargetTableShapeMismatch Code = "SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH"
 
+	// CodeTargetDeferrableKey fires when a target table's only usable
+	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
+	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
+	// and every idempotent write sluice makes — the CDC applier's
+	// `INSERT … ON CONFLICT (key) DO UPDATE`, the idempotent bulk-copy
+	// writer's batch upsert — needs one. Refused at sync-start preflight
+	// (and, defence-in-depth, on first sight of the table) rather than
+	// mid-stream: v0.103.1 made a Postgres target CARRY a source's
+	// `PRIMARY KEY … DEFERRABLE`, which is correct, and that made the
+	// apply path illegal — the stream died on the first change to such a
+	// table with no retry and no recovery (Bug 211).
+	CodeTargetDeferrableKey Code = "SLUICE-E-TARGET-DEFERRABLE-KEY"
+
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
@@ -288,6 +301,8 @@ var registry = map[Code]Info{
 	CodeSourceWrongDriver:   {ClassRefusal, "the --source is a recognisable format this source driver does not read (e.g. a mydumper directory handed to the csv driver) — the message names the right driver or preparation step"},
 	CodeCSVNullAmbiguous:    {ClassRefusal, "a csv/tsv source contains an unquoted empty field and no NULL representation was declared — RFC 4180 has no NULL, so sluice refuses to guess; declare the convention with --csv-null"},
 	CodeCSVHeaderUndeclared: {ClassRefusal, "a csv/tsv source was opened without declaring header presence — sluice never sniffs it; pass --csv-header or --csv-no-header"},
+
+	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 
