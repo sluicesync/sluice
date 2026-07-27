@@ -20,7 +20,7 @@ require (
 	github.com/charmbracelet/x/exp/teatest v0.0.0-20260712004152-b16d026a9d2e
 	github.com/docker/go-units v0.5.0
 	github.com/go-json-experiment/json v0.0.0-20260505212615-e40f80bf6836
-	github.com/go-mysql-org/go-mysql v1.15.0
+	github.com/go-mysql-org/go-mysql v1.16.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/goccy/go-json v0.10.6
