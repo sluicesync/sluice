@@ -1846,6 +1846,20 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 99. `assertDataWindowEndPositionInvariant` is close to vacuous on the Postgres path — *open, medium*
+
+**Found while root-causing item 92, and deliberately not acted on there.** That invariant is a load-bearing part of the Bug-184 completeness net: on an engine whose CDC positions do not commit after their rows, a data-bearing window's `EndPosition` must never coincide with a schema-history anchor, because the restore side uses exactly that to tell a genuine DDL-only window from an emptied-data one.
+
+On the PG path it can essentially never fire. Postgres stamps schema anchors at LSN `0/0` — `maybeSnapshotSchema` takes the relation message's `xld.WALStart`, which pgoutput reports as zero — so `SchemaHistoryAnchors(EndPosition)` is false for any real `EndPosition`. The assertion runs, costs nothing, and cannot catch the class it exists for on the engine most likely to hit it.
+
+Worth confirming against MySQL/VStream before deciding the fix: if the anchor LSN is genuinely unavailable at that point, the invariant may need a different discriminator entirely rather than a repaired comparison. Note this is the same *shape* as the class in item 97 — a guard whose local logic is right and which never reaches the state it guards.
+
+### 98. `BackupStream`'s rollover shares item 92's replay defect on its first rollover after a resume — *open, medium*
+
+`BackupStream.captureWindow`'s `changeChunkBuffer.processChange` carries the same `maxChanges > 0 && … && !*inTransaction` cutoff that item 92 fixed in `IncrementalBackup`, and the same exposure: a resumed stream's **first** rollover re-receives the parent's boundary transaction, so a tight `--max-changes` can be satisfied by the replay alone and close a rollover that captured nothing new. Subsequent rollovers ride one open stream and cannot replay, which is why the exposure is first-rollover-only.
+
+It already carries a related concept — ADR-0067's `skipThrough` floor using `PrecedesOrEqual` — but only for the rotation-boundary case, not for this one. The fix is item 92's `advanced` latch applied to the same cutoff; the reason it was not done in the same pass is that it is a different orchestrator with its own resume semantics and deserves its own pin rather than an assumed-identical patch.
+
 ### 97. `backup verify` reports a rotation-born encrypted chain healthy that `restore` cannot decrypt (Bug 215, v0.104.2 cycle) — *open, HIGH / DR-availability*
 
 **What.** An ENCRYPTED chain that `backup stream` rotated and one `backup incremental` then resumed (the ADR-0087 / Bug-139 rotation-born resume path) restores everything up to the last rollover and then exits 3 at `chunk failed authenticated decryption` on that incremental's own chunk. Pre-existing: identical on v0.104.1 and v0.104.0. Plaintext is unaffected.
