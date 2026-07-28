@@ -581,6 +581,46 @@ type Index struct {
 	// unnamed) — engines without the distinction ignore it and emit a
 	// plain unique index. Meaningful only when Unique is true.
 	ConstraintBacked bool
+
+	// ConstraintNamed reports that Name is the identifier of a real
+	// table-level constraint in the source catalog — the name
+	// `ON CONFLICT ON CONSTRAINT x` and `ALTER TABLE ... DROP CONSTRAINT x`
+	// reference — rather than an engine placeholder. It is the signal a
+	// writer needs in order to decide whether re-emitting the name
+	// PRESERVES operator intent or INVENTS it (roadmap item 84).
+	//
+	// Only the PG reader sets it, for every pg_constraint-owned index
+	// (contype 'p' and 'u'): in Postgres a PRIMARY KEY / UNIQUE
+	// constraint and its backing index are one catalog object under one
+	// name. MySQL leaves it false — a MySQL PK index is literally named
+	// `PRIMARY`, a fixed sentinel every table shares, so there is no name
+	// to preserve and carrying it would emit `CONSTRAINT "PRIMARY"
+	// PRIMARY KEY (...)`, a name no operator chose. SQLite leaves it
+	// false because its primary key has no name at all.
+	//
+	// Distinct from ConstraintBacked, which is narrower on purpose:
+	// ConstraintBacked drives the UNIQUE *re-emit shape* (ADD CONSTRAINT
+	// rather than CREATE UNIQUE INDEX) and is therefore deliberately
+	// false for primary keys, which re-emit as PRIMARY KEY. This flag is
+	// about the NAME, and covers both constraint kinds.
+	//
+	// Read today by the PG writer on a table's PrimaryKey: true emits
+	// `CONSTRAINT <Name> PRIMARY KEY (...)` so the target keeps the
+	// source constraint name; false keeps the bare `PRIMARY KEY (...)`
+	// and lets PG auto-name it `<table>_pkey`. MySQL-family targets
+	// ignore it — MySQL parses `CONSTRAINT x PRIMARY KEY` and then
+	// discards x, so there is nothing to carry, and a per-table WARN was
+	// deliberately NOT added: it would fire on every table of every
+	// PG → MySQL migration for a name Postgres itself generated in the
+	// common case.
+	//
+	// Rides the backup / schema-history wire on Index's default struct
+	// JSON, like the Constraint* attribute flags below. A manifest
+	// written by an older binary decodes it false, which is exactly that
+	// binary's own behaviour (an unnamed inline PK) — additive wire, no
+	// format bump.
+	ConstraintNamed bool
+
 	// ConstraintDeferrable / ConstraintNullsNotDistinct /
 	// ConstraintWithoutOverlaps carry the source UNIQUE constraint's
 	// attribute flags (pg_constraint condeferrable / connullsnotdistinct

@@ -1338,6 +1338,42 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 
 	if table.PrimaryKey != nil {
 		pk := "PRIMARY KEY " + emitIndexColumnList(table.PrimaryKey.Columns, opts)
+		// Roadmap item 84: carry the source's own constraint NAME when the
+		// source engine names primary keys as first-class constraints
+		// ([ir.Index.ConstraintNamed] — Postgres today). Emitted inline and
+		// unnamed, PG auto-names the target's key `<table>_pkey`, and every
+		// `INSERT ... ON CONFLICT ON CONSTRAINT orders_pk` in the
+		// application fails at cutover with "constraint does not exist".
+		//
+		// Gated on the IR flag, never on the name TEXT: a MySQL PK index is
+		// literally named `PRIMARY`, so a text-level rule would emit
+		// `CONSTRAINT "PRIMARY" PRIMARY KEY (...)` — an invented name no
+		// operator chose, and (ground truth from mutating this line and
+		// running the MySQL → PG cell) a hard migration failure the moment
+		// the source has a SECOND table, since a PG constraint's backing
+		// index takes the name in the per-SCHEMA relation namespace:
+		// `ERROR: relation "PRIMARY" already exists (SQLSTATE 42P07)`.
+		//
+		// A PG source whose PK was auto-named `<table>_pkey` needs no
+		// special case: re-emitting it produces exactly the name the target
+		// would have chosen anyway. Deliberately NO heuristic tries to
+		// guess whether a name was "chosen" — that is unknowable from the
+		// catalog and would be fragile.
+		if table.PrimaryKey.ConstraintNamed && table.PrimaryKey.Name != "" {
+			// Verbatim, like [emitAddUniqueConstraint]: the name is a PG
+			// catalog identifier already scoped to this table, so the
+			// cross-engine pgIndexName table-prefixing would mangle it —
+			// and mangling it breaks the very ON CONFLICT ON CONSTRAINT this
+			// carry exists to preserve. The length still gets the roadmap
+			// item 43 refusal: unreachable from a PG source (whose catalog
+			// cannot hold an over-length name), it guards a hand-built or
+			// future-engine IR against PG silently truncating the name into
+			// a different constraint.
+			if err := validatePGIndexName(table.PrimaryKey.Name, table.PrimaryKey.Name, table.Name); err != nil {
+				return "", err
+			}
+			pk = "CONSTRAINT " + quoteIdent(table.PrimaryKey.Name) + " " + pk
+		}
 		// A DEFERRABLE primary key is a real behavioural difference, not a
 		// cosmetic one: the classic bulk key shift UPDATE t SET id = id + 1
 		// commits against it and aborts against an immediate PK (audit
