@@ -619,7 +619,21 @@ type Index struct {
 	// written by an older binary decodes it false, which is exactly that
 	// binary's own behaviour (an unnamed inline PK) — additive wire, no
 	// format bump.
-	ConstraintNamed bool
+	//
+	// The `omitempty` is LOAD-BEARING, not cosmetic. Index's default
+	// struct JSON is the exact input to
+	// [sluicesync.dev/sluice/internal/ir/backup.ComputeSchemaHash],
+	// which fingerprints every backup manifest's schema; a chain
+	// restore recomputes that fingerprint and REFUSES on a mismatch.
+	// A bare `bool` here emits `"ConstraintNamed":false` on every index
+	// of every table, which changes the fingerprint of every schema
+	// ever written and makes every pre-existing chain look corrupted.
+	// With `omitempty` the false case marshals byte-identically to what
+	// v0.100.0–v0.104.2 wrote, and only a PG-source named constraint —
+	// a shape no older binary ever produced — adds the key. Any new
+	// field on Index / Table / Schema needs the same treatment; see
+	// TestComputeSchemaHash_FrozenGolden in internal/ir/backup.
+	ConstraintNamed bool `json:"ConstraintNamed,omitempty"`
 
 	// ConstraintDeferrable / ConstraintNullsNotDistinct /
 	// ConstraintWithoutOverlaps carry the source UNIQUE constraint's
