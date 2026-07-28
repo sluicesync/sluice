@@ -155,11 +155,17 @@ type BackupStream struct {
 	// rollover.
 	RolloverWindow time.Duration
 
-	// RolloverMaxChanges bounds the total number of [ir.Change] events
-	// a single rollover captures. Zero disables the cap (window /
-	// bytes only). The cap is approximate — a TxBegin/Commit pair
+	// RolloverMaxChanges bounds the total number of [ir.Change] EVENTS
+	// a single rollover captures — transaction framing included, so a
+	// single-row source transaction is three events. Zero falls back to
+	// [DefaultRolloverMaxChanges].
+	//
+	// The cap is approximate in two directions. A TxBegin/Commit pair
 	// straddling the boundary is allowed to complete so the chain
-	// doesn't end mid-transaction.
+	// doesn't end mid-transaction; and the rollover will not close on
+	// the cap until it has advanced past its start position, because a
+	// resumed CDC stream opens by replaying the transaction the parent
+	// ends on (roadmap item 98 — see [windowAdvancedPast]).
 	RolloverMaxChanges int
 
 	// RolloverMaxBytes bounds the buffered chunk bytes a single
@@ -167,7 +173,10 @@ type BackupStream struct {
 	// [DefaultRolloverMaxBytes]. Mirrors the existing
 	// `--max-buffer-bytes` shape; the bound is checked at chunk-flush
 	// boundaries, so actual buffered bytes may transiently exceed the
-	// ceiling by up to one chunk's worth.
+	// ceiling by up to one chunk's worth. It carries the same
+	// advancement condition as RolloverMaxChanges, for the same reason:
+	// the replayed boundary transaction's bytes are the parent's, not
+	// this rollover's (roadmap item 98).
 	RolloverMaxBytes int64
 
 	// ChunkChanges is the per-chunk change-event count. Zero falls
@@ -767,7 +776,13 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	//    = P_N, and the lineage becomes born-contiguous and compactable. The
 	//    (P_N, S] overlap re-applies idempotently on restore (ADR-0010 / the
 	//    snapshot->CDC handoff dedup). No skipThrough is needed: a fresh
-	//    StreamChanges(P_N) resumes strictly-after P_N like any normal resume.
+	//    StreamChanges(P_N) delivers nothing BELOW P_N, so there is no prior-
+	//    segment tail to filter. (It does re-deliver the transaction that
+	//    COMMITTED at P_N — logical decoding skips only transactions
+	//    committing strictly before the requested position — which is why the
+	//    rollover caps carry the item-98 advancement condition; that replay is
+	//    kept, not filtered, since the (P_N, S] window is exactly what this
+	//    heal exists to recover.)
 	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
 		slog.InfoContext(
 			ctx, "stream: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
@@ -1321,6 +1336,7 @@ func (b *BackupStream) runRollover(
 		return out, captureErr
 	}
 
+	warnReplayOnlyRollover(ctx, manifest, captured)
 	manifest.EndPosition = captured.EndPos
 	if (manifest.EndPosition.Engine == "" && manifest.EndPosition.Token == "") && captured.TotalChanges == 0 {
 		// Empty rollover written-anyway path: the chain advances no
@@ -1376,6 +1392,32 @@ func (b *BackupStream) runRollover(
 	manifest.PartialState = irbackup.BackupStateComplete
 	out.Manifest = manifest
 	return out, captureErr
+}
+
+// warnReplayOnlyRollover names the shape roadmap item 98 was filed over,
+// and is the streaming twin of the incremental path's
+// [warnReplayOnlyWindow]: a rollover that captured events but never moved
+// past the position it resumed from holds only the boundary transaction
+// the source replayed on reconnect (see [windowAdvancedPast]). The
+// manifest is chain-linked and honestly stamped, but it carries nothing
+// the parent did not — and `changes=N` on the commit line reads as "N of
+// your writes are in here".
+//
+// Neither count/byte cap can produce this shape any more. A rollover
+// whose wall-clock window expires before the source commits anything new
+// still can, and that is legitimate — hence a WARN, not a refusal. It
+// fires at most once per resume, because the replay is a single
+// transaction and the caps only close on a transaction boundary.
+func warnReplayOnlyRollover(ctx context.Context, manifest *irbackup.Manifest, captured captureOutcome) {
+	if captured.Advanced || len(manifest.ChangeChunks) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx, "stream: rollover captured no NEW changes — every event in it is the source's replay of the transaction the parent already ends on; the manifest is valid but adds no coverage (widen --rollover-window, or raise --rollover-max-changes / --rollover-max-bytes, to capture the writes that followed)",
+		slog.String("start_position", manifest.StartPosition.Token),
+		slog.String("end_position", captured.EndPos.Token),
+		slog.Int64("replayed_changes", captured.TotalChanges),
+	)
 }
 
 // refreshSchemaAndAttachDelta re-reads the source schema, diffs it
@@ -1439,9 +1481,18 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 // error rather than a long positional argument list (gocritic's 5-result
 // ceiling).
 type captureOutcome struct {
-	EndPos        ir.Position
-	TotalChanges  int64
-	TotalBytes    int64
+	EndPos       ir.Position
+	TotalChanges int64
+	TotalBytes   int64
+	// Advanced latches once an event strictly after the window's
+	// StartPosition has been captured — i.e. once this rollover holds
+	// something the parent does not (roadmap item 98; see
+	// [windowAdvancedPast]). Sticky rather than re-derived from EndPos,
+	// because a position-bearing event can carry a LOWER position than
+	// the one before it (a Postgres SchemaSnapshot is anchored at the
+	// relation message's WAL start, which pgoutput reports as 0/0) and
+	// that must not un-advance a rollover that has already moved.
+	Advanced      bool
 	SourceClosed  bool
 	StopRequested bool
 }
@@ -1457,6 +1508,30 @@ type captureOutcome struct {
 // Window-end straddle behaviour: an open transaction (TxBegin observed
 // without TxCommit) extends the window by up to one transaction so the
 // chain doesn't end mid-tx — same as Phase 3.1.
+//
+// Advancement condition on the two count/byte caps (roadmap item 98,
+// item 92's twin in this orchestrator): neither cap may close a rollover
+// that has not yet captured an event strictly after its StartPosition.
+// A resumed pump opens by RE-DELIVERING the transaction the parent ends
+// on (see [windowAdvancedPast]), so a tight cap was satisfiable by that
+// replay alone — the rollover closed at its own start position, having
+// captured nothing new, and still committed a chain-linked manifest
+// reporting a non-zero change count. The DEADLINE is deliberately NOT
+// conditioned: a wall-clock window that expires over a quiet source must
+// still close (that is the stream's whole cadence), so the worst the
+// condition can cost is a rollover that runs to RolloverWindow.
+//
+// The replayed events are deliberately KEPT rather than filtered. They
+// are duplicates of parent content in the ordinary case (chain restore
+// replays them idempotently), but this orchestrator has TWO documented
+// exits that can end a window mid-transaction — the eager stop-signal
+// exit below, and the ctx-cancel drain, which skips its flush while
+// inTransaction — so the parent's tail can be severed and the replay is
+// then the only thing carrying it. Dropping it would convert a benign
+// duplicate into silent loss. (This is a different question from the
+// ADR-0067 `skipThrough` floor, which DOES drop: that one runs at an
+// in-process ROTATION boundary where the pump never restarted and the
+// dropped events are provably already committed in the prior segment.)
 //
 // Two stop-signal paths (Bug 37 fix; v0.19.1):
 //
@@ -1727,6 +1802,10 @@ func (cb *changeChunkBuffer) open() error {
 // EndPosition) are dropped (terminate=false), and the floor is cleared on
 // the first event strictly after P_N — KEEPING the (P_N, S] overlap so
 // the lineage is born-contiguous and compactable.
+//
+// The count/byte caps additionally require [captureOutcome.Advanced]
+// (roadmap item 98) — see [BackupStream.captureWindow] for why, and for
+// why the deadline is deliberately exempt.
 func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change, out *captureOutcome, inTransaction *bool, deadlinePassed bool, chunkSize, maxChanges int, maxBytes int64) (terminate bool, err error) {
 	if cb.b.skipThrough != nil {
 		cp := change.Pos()
@@ -1763,6 +1842,9 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 	pos := change.Pos()
 	if pos.Engine != "" || pos.Token != "" {
 		out.EndPos = pos
+		if !out.Advanced {
+			out.Advanced = windowAdvancedPast(cb.b.Source, cb.manifest.StartPosition, pos)
+		}
 	}
 	// Roll the chunk on per-chunk-row cap.
 	if cb.writer.ChangeCount() >= int64(chunkSize) {
@@ -1770,8 +1852,12 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 			return true, err
 		}
 	}
-	// Approximate max-changes cap: close at next tx boundary.
-	if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !*inTransaction {
+	// Approximate max-changes cap: close at next tx boundary, once the
+	// rollover has something of its own to close on. `out.Advanced` is
+	// roadmap item 98 (item 92's twin in this orchestrator) — without it
+	// the boundary transaction a resumed pump replays could satisfy the
+	// cap by itself and close the rollover at its own start position.
+	if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !*inTransaction && out.Advanced {
 		if err := cb.flushTo(ctx, out); err != nil {
 			return true, err
 		}
@@ -1780,8 +1866,11 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 	// Approximate max-bytes cap: close at next tx boundary once the
 	// running total + the in-flight chunk's buffered bytes crosses the
 	// ceiling. Checked at chunk-flush boundaries so transient over-shoot
-	// is bounded by one chunk's compressed size.
-	if maxBytes > 0 && !*inTransaction {
+	// is bounded by one chunk's compressed size. Carries the same
+	// advancement condition, for the same reason: the replayed
+	// transaction's bytes belong to the parent, so on its own they must
+	// not close this rollover.
+	if maxBytes > 0 && !*inTransaction && out.Advanced {
 		inflightBytes := int64(0)
 		if cb.buf != nil {
 			inflightBytes = int64(cb.buf.Len())
