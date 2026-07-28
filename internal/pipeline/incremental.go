@@ -932,12 +932,20 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 // regress below start.) Those replayed events belong to the parent
 // segment; they are not this window's content.
 //
-// Ordering comes from the engine's [ir.PositionMonotonicChecker] (PG and
-// MySQL both implement it) rather than a byte compare, so representation
-// drift — a parent anchor stamped before the reader started emitting
-// systemid/timeline, say — still compares by LSN. Without a comparator,
-// or on a pair the comparator cannot order, the fallback is position
-// inequality.
+// Ordering comes from the engine's [ir.PositionMonotonicChecker] when it
+// has one — which today is POSTGRES ONLY (`grep 'func .*PrecedesOrEqual'`
+// returns one non-test hit, and `capabilities_assert.go` carries the only
+// pin). An earlier version of this comment claimed MySQL implemented it
+// too; it does not, and it takes the fallback below. Corrected rather than
+// deleted because the wrong version was copied into two roadmap entries
+// before anyone checked.
+//
+// The comparator matters where it exists because it beats a byte compare:
+// representation drift — a parent anchor stamped before the reader started
+// emitting systemid/timeline, say — still compares by LSN. Without a
+// comparator, or on a pair the comparator cannot order, the fallback is
+// position inequality, which is why the guard is engine-neutral in effect
+// even though the comparator is not.
 //
 // Neither wrong answer loses data. A false "advanced" degrades to the
 // pre-fix behaviour (the bound may close on a re-delivery); a false "not
