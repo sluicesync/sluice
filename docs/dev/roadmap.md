@@ -1884,6 +1884,8 @@ Commit `89b89862` added `ConstraintDeferrable` / `ConstraintNullsNotDistinct` / 
 | E2 | v0.100.0 – v0.102.2 | `+Deferrable +NullsNotDistinct +WithoutOverlaps` | `a75f53e0…4e164` |
 | E3 | v0.103.0 – v0.104.2 | `+InitiallyDeferred` | `4bda0022…10f827` |
 
+**⚠ The error messages quoted below are the PRE-FIX wording**, kept because they are what a v0.104.2-or-earlier binary still prints and what an operator hitting this today will actually see. The shipped refusal no longer says "corrupted" first — see the DECISION block above.
+
 **Ground truth — reproduced on real released binaries, not inferred.** Built from tag worktrees and driven through the existing cross-version harness (`internal/pipeline/backup_crossversion_integration_test.go`, `integration && crossversion`) with the old tag pinned instead of derived, against a real Postgres container:
 
 - **v0.99.292 writes a chain → v0.104.2 restores → FAIL.** `code=SLUICE-E-BACKUP-MANIFEST-INVALID`, `hint="restore from an untampered copy, or sign the chain …"`, `err="chain restore: manifest manifest.json (backup 35c7d6c5986ae21a) schema hash mismatch: recorded 4c20b032f583a76660afdf88f0d5ec3c754433a5ece89d94b00fccc0ba108bef, recomputed 4bda0022832a1fb44e63ea8745038c3dc86439cf0d694274b556d5d18810f827 — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands"`.
