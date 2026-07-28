@@ -42,6 +42,7 @@ package migcore
 //     leave it out.
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -257,6 +258,26 @@ func matchErrorHint(phase string, err error) (errorHint, bool) {
 func WrapWithHint(phase string, err error) error {
 	if err == nil {
 		return nil
+	}
+	// Item 91 / Bug 213: a specific refusal beats a generic phase guess.
+	// The registry matches on message SUBSTRINGS, so a precisely-coded
+	// error travelling up through a phase wrapper will also match that
+	// phase's catch-all entry — and re-coding it there replaces both the
+	// code operators are told to match on AND, because ExitCode() is
+	// derived from the code's class, the process exit status. A deferrable
+	// upsert-key refusal reached `schema add-table` as
+	// SLUICE-E-BULKCOPY-TABLE-FAILED / exit 1 where every other caller
+	// reported SLUICE-E-TARGET-DEFERRABLE-KEY / exit 3.
+	//
+	// The generic hint is not merely redundant in that case, it is wrong:
+	// the bulk-copy catch-all tells the operator earlier tables are missing
+	// their secondary indexes, when a refusal by definition copied nothing.
+	// So an already-coded error is returned untouched — its own code and
+	// its own remedy are strictly better than anything a substring match
+	// can infer.
+	var coded *sluicecode.CodedError
+	if errors.As(err, &coded) {
+		return err
 	}
 	// Dynamic classifiers first: they match on error STRUCTURE (a
 	// [net.DNSError] in the chain) rather than message substrings, so a
