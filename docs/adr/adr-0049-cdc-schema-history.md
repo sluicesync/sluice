@@ -1,11 +1,17 @@
 # ADR-0049 — sluice-native position-anchored CDC schema history
 
-**Status:** **Accepted (2026-05-18) — design signed off across all
-decision points (DP-1/2/3) after a design dialogue; implementation
-pending. Not demand-gated (standalone resume-after-DDL value) →
-implement-ready modulo owner prioritization; see "Status / next".**
-(Header reconciled 2026-05-18: the dialogue is complete; the prior
-"Proposed; sign-off pending" wording was superseded.) Design pass
+**Status:** **Accepted — SHIPPED. Chunks A–D + partial E in v0.70.0;
+Chunk E's cross-engine gaps closed in v0.70.1/v0.70.2 (Bug 78) and its
+deferred end-to-end pin in v0.71.0.** The `sluice_cdc_schema_history`
+control table is in `internal/appliershared/control_table_roster.go`
+and the locked decision #4a same-tx invariant is cited in
+`internal/appliershared/batch_loop.go`. (Header reconciled 2026-05-18:
+the design dialogue completed and the prior "Proposed; sign-off
+pending" wording was superseded — but the header then sat at
+"implementation pending" for ~35 releases after the implementation
+landed, and §"Status / next" below still called it implement-ready.
+The G-17 status-parity gate could not catch either: this ADR's index
+row declared no status at all.) Design pass
 *before* code; produced from the Track-1 PlanetScale/Vitess readiness
 investigation (design evidence:
 [`docs/dev/notes/prep-planetscale-vitess-readiness.md`](../dev/notes/prep-planetscale-vitess-readiness.md)
@@ -189,21 +195,25 @@ removal of the loud guarantee.
 
 ## Status / next
 
-**Proposed; design dialogue COMPLETE (2026-05-18, owner-endorsed).**
-**All decision points resolved: DP-1, DP-2, DP-3.** No design
-questions remain; the Phase-1c evidence DP-1 needed was always in
-hand (verified 2026-05-17) — never a research gap, only an
-un-recorded resolution, now recorded. **Not demand-gated** (unlike
-ADR-0050) — this has standalone resume-after-DDL value — so it is
-**implement-ready, modulo owner prioritization** (design-first
-sign-off now given across all DPs). Independent of #37 (pinned); can
-proceed on its own branch. **Cross-ADR (owner, 2026-05-18):**
+**SHIPPED (v0.70.0 → v0.71.0).** This section is retained as the
+design-dialogue record; it is no longer a forward-looking plan.
+
+**Prior status — design dialogue COMPLETE (2026-05-18,
+owner-endorsed).** **All decision points resolved: DP-1, DP-2,
+DP-3.** No design questions remained; the Phase-1c evidence DP-1
+needed was always in hand (verified 2026-05-17) — never a research
+gap, only an un-recorded resolution, now recorded. **Not
+demand-gated** (unlike ADR-0050) — this has standalone
+resume-after-DDL value — so it was **implement-ready, modulo owner
+prioritization** (design-first sign-off given across all DPs).
+Independent of #37 (pinned). **Cross-ADR (owner, 2026-05-18):**
 ADR-0049 and ADR-0050 stay *separate, not merged*, but
 hard-sequenced — ADR-0050 DP-3's correctness is contingent on this
 ADR's per-engine DDL-boundary detection, so **ADR-0049 must be
-*implemented* before any ADR-0050 implementation** (the design +
-Phase-1c halves of that prerequisite are now satisfied; the
-remaining half is this ADR's implementation). **Reframe (Phase-1c):**
+*implemented* before any ADR-0050 implementation**. That gate is now
+CLEARED by this ADR shipping; ADR-0050 remains unimplemented on its
+own two remaining conditions (empirical cost-validation and real
+operator demand). **Reframe (Phase-1c):**
 the CDC schema-evolution path is *already faithful at the loud
 floor* — no active silent bug — so this ADR is a value/efficiency upgrade
 (resume-after-DDL without a whole-stream re-snapshot), priority/
@@ -217,7 +227,8 @@ the ADR-0050 A–D sequencing gate. **Owner checkpoint CLEARED
 (2026-05-19): all 5 go/no-go decisions ratified as recommended — see
 §"Implementation checkpoint sign-off" below.** Design is complete, no
 design questions remain, and the implementation-level decisions are
-now locked. **Chunk A is implement-ready.**
+locked. Chunks A–E have since been built and shipped (see the Status
+header).
 
 ## Implementation checkpoint sign-off (2026-05-19)
 

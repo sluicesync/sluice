@@ -113,6 +113,49 @@ have zero row events between TxBegin/TxCommit; the applier already
 treats an empty source-tx as a no-op (ADR-0027 documented this for
 the streamer; smart-compact's collapsed chunks ride the same path).
 
+#### Implementation note — "F3 preserved by construction" did NOT hold (roadmap item 101, fixed v0.104.3)
+
+The paragraph above is right that TxBegin/TxCommit pass through
+verbatim and in source-order, and wrong about what followed from it.
+`finalize` drained the per-PK accumulators with a bare `flushAll`
+**after** the closing `TxCommit` had already been emitted, so the
+rewritten stream's last position-bearing event was a *collapsed row
+event* — and a collapsed event deliberately carries its chain's
+**FIRST** position (`rowAccumulator.flush`), not its last. Any
+incremental that touched one row in more than one transaction
+therefore ended BELOW its own recorded `EndPosition`, which
+`chain_restore.go`'s F1 tail-truncation backstop reads as a truncated
+change-list and refuses: `SLUICE-E-BACKUP-INCOMPLETE`. Loud, never
+silent — but it is a compacted backup that will not restore, on the
+most ordinary shape smart compaction exists for. It was proven
+pre-existing against the base tree, not inferred.
+
+**The shipped output shape is not the one this section describes.**
+`finalize` now calls `smartCompactor.flushCollapsedInsideClosingTx`,
+which holds the closing `TxCommit` back, flushes the accumulators, and
+re-appends it — so collapsed rows land **inside** the incremental's
+last transaction (a tighter envelope than before, not a looser one)
+and the closing position is once again the stream's last event.
+Positions and collapse semantics are deliberately untouched: raising a
+collapsed event's position to its chain's LAST would also not
+guarantee reaching the end, because accumulator insertion order is not
+position order. A stream with no transactional envelope (an engine
+whose CDC reader emits no TxBegin/TxCommit) has no closing commit to
+hold back and keeps the previous shape.
+
+**The lesson worth carrying, not just the fix.** Two comments in this
+same code contradicted each other and the code followed the wrong one;
+the invariant was documented, believed, and unenforced. F3 is now held
+by a gate rather than by prose —
+`internal/pipeline/backup/chain_compact_smart_closing_position_test.go`
+states the property the restore path actually needs (last
+position-bearing event == the closing position) across {one row in two
+transactions, two rows whose insertion order is not position order,
+INSERT-then-UPDATE where the policy keeps the INSERT's position, a
+chain that collapses to nothing}, plus a no-envelope non-vacuity half,
+and is mutation-verified against the bare `flushAll`. Read
+"by construction" in any ADR as a claim needing a test, not as one.
+
 ### 4. Per-row identity — the PK lookup
 
 "Same row" = same `(schema, table, PK-tuple)`. The PK is looked up

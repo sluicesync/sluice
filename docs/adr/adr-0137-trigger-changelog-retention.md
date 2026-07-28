@@ -2,10 +2,15 @@
 
 ## Status
 
-**Proposed (2026-06-28).** Roadmap item 49 follow-up — addresses Bug 165 (and the
-shared growth vector behind pgtrigger Bug 159). Phase A: an operator-run `sluice trigger
-prune` command that safely reaps consumed change-log rows. Phase B (automatic in-stream
-pruning) is deferred.
+**Accepted — both phases shipped: Phase A v0.99.151, Phase B v0.99.174.**
+Proposed 2026-06-28. Phase A is `sluice trigger prune`; Phase B is
+`--auto-prune-change-log`. Roadmap item 49 follow-up —
+addresses Bug 165 (and the shared growth vector behind pgtrigger Bug 159). Phase A: an
+operator-run `sluice trigger prune` command that safely reaps consumed change-log rows.
+Phase B: the opt-in in-stream sidecar (§Decision 2, which had already been rewritten to
+"IMPLEMENTED" while this header still called it deferred — a self-contradiction the G-17
+gate could not see, because it only compares the header against the index row and the
+index row repeated the same stale "Phase B (deferred)").
 
 ## Context
 
@@ -88,8 +93,8 @@ durable watermark, never the source reader's read cursor.
   `id > durable_watermark` — never needs a pruned row.
 - One command across all three trigger engines; the retention story Bug 159 and Bug 165
   both pointed at is now shared.
-- Until Phase B lands, bounding growth on a continuous sync is an explicit operator action
-  (documented), not automatic.
+- Bounding growth on a continuous sync is automatic once `--auto-prune-change-log` is set
+  (Phase B); with the flag off — the default — it stays an explicit operator action.
 
 ## Alternatives considered
 

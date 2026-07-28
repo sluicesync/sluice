@@ -2,7 +2,13 @@
 
 ## Status
 
-**Proposed (2026-05-26).** Design-pass before code. Establishes the engine
+**Accepted — shipped v0.85.0** (the `postgres-trigger` engine,
+`internal/engines/pgtrigger`), proposed 2026-05-26. The header stayed
+at Proposed while the engine shipped and then accreted a whole
+"Implementation notes (drift from this spec)" section below — the
+doc-vs-code half of the DOC-3 class the G-17 status-parity gate exists
+for; the gate could not see it because the index row declared no
+status at all. Design-pass before code. Establishes the engine
 contract and the operator surface so the implementation chunk can be sized
 without re-litigating the shape. Depends on no other unmerged ADR; composes
 with the existing `postgres` engine via the embedding pattern this ADR
