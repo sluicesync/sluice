@@ -75,9 +75,15 @@ func TestCompactChain_TwoSegmentGroup_Merges(t *testing.T) {
 			t.Errorf("merged segment incremental %q is missing under its dir", ip)
 		}
 	}
-	// Source dirs are swept (post-commit cleanup).
-	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); ex {
-		t.Error("source-0 root manifest survives compact; should have been swept")
+	// Source dirs are swept (post-commit cleanup) — EXCEPT the chain-root
+	// manifest, which is the chain's identity and is kept unconditionally
+	// (Bug 214; see sweepRootSegmentArtifacts). Its DATA at the root still
+	// goes.
+	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); !ex {
+		t.Error("chain-root manifest was swept; Bug 214: it is the chain's identity (the ADR-0152 CEK binding + the passphrase Argon2id salt), not a spare copy of segment 0's full")
+	}
+	if paths, _ := store.List(context.Background(), "chunks/"); len(paths) != 0 {
+		t.Errorf("source-0 root chunks survive compact: %v", paths)
 	}
 	if paths, _ := store.List(context.Background(), "seg-1/"); len(paths) != 0 {
 		t.Errorf("source-1 dir survives compact: %v", paths)
