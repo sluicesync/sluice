@@ -100,12 +100,43 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 		}
 	})
 
-	t.Run("parent carries ChainEncryption → no store read, no error", func(t *testing.T) {
-		// The store is broken, but the parent already answers the
-		// question — the fast path must not touch the store.
-		store := &failingExistsStore{memStore: newMemStore(), err: errors.New("must not be reached")}
+	t.Run("parent carries ChainEncryption but the ROOT wins (Bug 215)", func(t *testing.T) {
+		// The pre-Bug-215 shape returned the parent's own header
+		// without consulting the store — a "fast path" that, on a
+		// rotated chain, handed the writer the OPEN SEGMENT full's
+		// CEK. The restore path decrypts every incremental with the
+		// CHAIN ROOT's, so those chunks were sealed under a key it
+		// never tries. The lineage root is authoritative, always.
+		store := newMemStore()
+		rootEnc := &irbackup.ChainEncryption{
+			Algorithm: "AES-256-GCM", KEKMode: "passphrase-argon2id", WrappedCEK: []byte("root-wrap"),
+		}
+		if err := WriteManifest(ctx, store, &irbackup.Manifest{Kind: "full", ChainEncryption: rootEnc}); err != nil {
+			t.Fatalf("WriteManifest: %v", err)
+		}
+		segEnc := &irbackup.ChainEncryption{
+			Algorithm: "AES-256-GCM", KEKMode: "passphrase-argon2id", WrappedCEK: []byte("segment-wrap"),
+		}
+		owner, enc, err := ChainRootEncryption(ctx, store, &irbackup.Manifest{Kind: "full", ChainEncryption: segEnc})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if enc == segEnc {
+			t.Fatal("returned the PARENT segment's ChainEncryption; Bug 215 is back (the writer would seal chunks under the segment CEK)")
+		}
+		if string(enc.WrappedCEK) != "root-wrap" {
+			t.Errorf("WrappedCEK = %q; want the chain root's", enc.WrappedCEK)
+		}
+		if owner == nil || owner.ChainEncryption != enc {
+			t.Error("owner manifest is not the one carrying the returned header (the CEK binding would be wrong)")
+		}
+	})
+
+	t.Run("no root manifest → the parent's own header is the fallback", func(t *testing.T) {
+		// Hand-assembled fixtures and the Bug-214 deleted-root shape:
+		// there is nothing at the lineage root to be authoritative.
 		want := &irbackup.ChainEncryption{Algorithm: "AES-256-GCM", KEKMode: "passphrase-argon2id"}
-		_, enc, err := ChainRootEncryption(ctx, store, &irbackup.Manifest{ChainEncryption: want})
+		_, enc, err := ChainRootEncryption(ctx, newMemStore(), &irbackup.Manifest{ChainEncryption: want})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

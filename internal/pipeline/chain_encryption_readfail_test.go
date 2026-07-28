@@ -60,11 +60,11 @@ func TestAlignEncryption_RootManifestReadFailureAborts(t *testing.T) {
 
 	align := map[string]func(enc *lineage.BackupEncryption, store irbackup.Store) ([]byte, error){
 		"incremental": func(enc *lineage.BackupEncryption, store irbackup.Store) ([]byte, error) {
-			b := &IncrementalBackup{segStore: store, Encryption: enc}
+			b := &IncrementalBackup{Store: store, Encryption: enc}
 			return b.alignEncryption(ctx, incParent)
 		},
 		"stream": func(enc *lineage.BackupEncryption, store irbackup.Store) ([]byte, error) {
-			b := &BackupStream{segStore: store, Encryption: enc}
+			b := &BackupStream{Store: store, Encryption: enc}
 			return b.alignEncryption(ctx, incParent)
 		},
 	}

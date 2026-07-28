@@ -120,7 +120,7 @@ func TestChainEncryptModeInheritAndRefuse_Bug179(t *testing.T) {
 			{
 				name: "IncrementalBackup",
 				align: func(store irbackup.Store, env crypto.EnvelopeEncryption, incMode string, parent *irbackup.Manifest) ([]byte, error) {
-					inc = &IncrementalBackup{segStore: store, Encryption: &lineage.BackupEncryption{Envelope: env, Mode: incMode}}
+					inc = &IncrementalBackup{Store: store, Encryption: &lineage.BackupEncryption{Envelope: env, Mode: incMode}}
 					return inc.alignEncryption(context.Background(), parent)
 				},
 				encMode: func() string { return inc.Encryption.Mode },
@@ -129,7 +129,7 @@ func TestChainEncryptModeInheritAndRefuse_Bug179(t *testing.T) {
 			{
 				name: "BackupStream",
 				align: func(store irbackup.Store, env crypto.EnvelopeEncryption, incMode string, parent *irbackup.Manifest) ([]byte, error) {
-					bs = &BackupStream{segStore: store, Encryption: &lineage.BackupEncryption{Envelope: env, Mode: incMode}}
+					bs = &BackupStream{Store: store, Encryption: &lineage.BackupEncryption{Envelope: env, Mode: incMode}}
 					return bs.alignEncryption(context.Background(), parent)
 				},
 				encMode: func() string { return bs.Encryption.Mode },

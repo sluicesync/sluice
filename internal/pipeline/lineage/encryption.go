@@ -174,37 +174,60 @@ func (e *BackupEncryption) RebindForChain(parentParams *irbackup.Argon2idParams)
 
 // ChainRootEncryption returns the chain-root's [irbackup.ChainEncryption]
 // — plus the manifest CARRYING it — when an extending writer
-// (incremental / stream) needs to align its envelope. parent's
-// ChainEncryption is returned directly when set (the common case:
-// parent is a full carrying the chain header). When parent is itself
-// an incremental (no ChainEncryption), the chain root manifest is read
-// from store and its ChainEncryption is returned.
+// (incremental / stream) needs to align its envelope. rootStore is the
+// LINEAGE ROOT store, never a segment view: the manifest at the lineage
+// root is the chain's CEK owner, and it is exactly the manifest the read
+// path resolves ([backup.ChainRestore] unwraps `links[0].Manifest`'s
+// wrap and decrypts EVERY incremental's change chunks with the resulting
+// key). parent is consulted only as a fallback for a store with no root
+// manifest at all.
 //
 // The carrying manifest is what [UnwrapChainCEK] needs: its RECORDED
 // FormatVersion decides whether the chain CEK's wrap is identity-bound
 // (ADR-0152), and its identity is the binding.
 //
+// Bug 215 — why the parent is NOT the fast path any more. Every
+// rotation-born segment full runs the ordinary `backup full`
+// orchestrator against an EMPTY provisional dir, so it mints its OWN
+// chain CEK (`Backup.setupChainEncryption`'s prior == nil arm). A
+// rotated chain therefore carries one CEK PER SEGMENT, and the read
+// path deliberately uses two different ones: a segment full's ROW
+// chunks are read with that segment's own CEK (`ChainRestore.applyFull`
+// scopes a [backup.Restore] to the segment store), while an
+// incremental's CHANGE chunks are read with the CHAIN ROOT's. A
+// long-running `backup stream` matches that by accident — it resolves
+// its CEK once at startup and carries it across rotations — but a
+// one-shot `backup incremental`, and a RESTARTED `backup stream`,
+// resolved through the open SEGMENT and picked up the segment's key.
+// Their chunks were sealed under a key the restore path never tries:
+// exit 3 at `chunk failed authenticated decryption`, on a chain
+// `backup verify` had just called healthy. Resolving the owner at the
+// lineage root is what makes the writer agree with the reader.
+//
 // A (nil, nil, nil) return means the chain is GENUINELY plaintext: the
 // root manifest exists and carries no ChainEncryption, or no root
-// manifest exists at all ([ReadManifestIfPresent]'s not-found shape).
-// A store read/parse failure is an error, never nil — callers branch
-// nil = "parent chain is plaintext", so swallowing a transient read
-// error here (the pre-audit-N-6 behaviour) either wrongly refused an
-// operator's --encrypt with "parent chain is plaintext…" (steering them
-// to drop the flag) or, with no --encrypt, silently extended an
-// ENCRYPTED chain with plaintext chunks at exit 0.
-func ChainRootEncryption(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest) (*irbackup.Manifest, *irbackup.ChainEncryption, error) {
-	if parent != nil && parent.ChainEncryption != nil {
-		return parent, parent.ChainEncryption, nil
-	}
-	root, err := ReadManifestIfPresent(ctx, store)
+// manifest exists and the parent carries none either. A store read/parse
+// failure is an error, never nil — callers branch nil = "parent chain is
+// plaintext", so swallowing a transient read error here (the pre-audit-N-6
+// behaviour) either wrongly refused an operator's --encrypt with "parent
+// chain is plaintext…" (steering them to drop the flag) or, with no
+// --encrypt, silently extended an ENCRYPTED chain with plaintext chunks
+// at exit 0.
+func ChainRootEncryption(ctx context.Context, rootStore irbackup.Store, parent *irbackup.Manifest) (*irbackup.Manifest, *irbackup.ChainEncryption, error) {
+	root, err := ReadManifestIfPresent(ctx, rootStore)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read chain root manifest: %w", err)
 	}
-	if root == nil {
-		return nil, nil, nil
+	if root != nil {
+		return root, root.ChainEncryption, nil
 	}
-	return root, root.ChainEncryption, nil
+	// No root manifest on this store: hand-assembled fixtures and the
+	// Bug-214 deleted-root shape. The parent's own header is the best
+	// remaining answer, and it is what the pre-Bug-215 code always used.
+	if parent != nil && parent.ChainEncryption != nil {
+		return parent, parent.ChainEncryption, nil
+	}
+	return nil, nil, nil
 }
 
 // WrapChainCEK wraps cek for the chain whose header manifest `owner`
