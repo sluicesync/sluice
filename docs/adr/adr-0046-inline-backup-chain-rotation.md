@@ -155,6 +155,27 @@ leading incrementals within the oldest kept segment; advance
 model, not beside it. Both are list/segment-local ops; no
 tombstone/parent-link surgery.
 
+> **Implementation note (2026-07-28): the second half of that prune
+> definition does not hold, and is now refused.** Dropping leading
+> WHOLE segments is restore-safe and is what prune does. Dropping
+> leading incrementals *within* the oldest kept segment is not: the
+> re-stitch that would have preserved the parent link was removed in
+> this very reframe and nothing replaced it, so the surviving
+> incrementals record a parent the prune deletes, and the events
+> between the floor segment's full and the first survivor are gone.
+> Restore refuses the result — on the severed parent link, and again on
+> the forward position gap. Prune therefore detects that plan shape at
+> its pre-commit leg and refuses it with
+> `SLUICE-E-BACKUP-CHAIN-UNREADABLE` (exit 3) having deleted nothing,
+> naming the `--keep-incrementals` counts that DO land on a segment
+> boundary. Retention is segment-granular in practice, and on a
+> never-rotated (single-segment) chain no positive `--keep-incrementals`
+> can express it, so every such prune refuses; `--keep-duration` past
+> every incremental is the shape that works there. See roadmap item 100
+> — the retention *contract* (refuse vs. retain-more-than-asked vs.
+> re-anchor the floor full) is still open; the refusal is the shipped
+> interim.
+
 ### §14d Compact (v0.77.0, Task #15)
 
 **Implemented.** Compact is the operator-explicit counterpart to

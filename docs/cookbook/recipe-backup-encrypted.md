@@ -24,8 +24,9 @@ recipe still works.
    incremental backups as changes land on the source. Rolls over into
    new segments on configurable cadence.
 3. **`sluice backup verify`** — periodic verification that the chain
-   on disk matches its manifests (and, with `--encrypt`, that the
-   operator's envelope can still unwrap every chunk).
+   on disk matches its manifests, and — with `--encrypt` + the chain's
+   key material — that every encrypted chunk still opens under the same
+   key and binding `restore` would use.
 4. **`sluice restore`** — when you actually need to recover, restore
    the chain to a fresh target.
 
@@ -144,6 +145,16 @@ rather than report success over a chain it made unreadable — pass
 `--encrypt` with the chain's key material so that check can prove the
 key still unwraps, not just that the identity survived.
 
+Retention is **segment-granular**: `N` has to land on a segment
+boundary. Trimming leading incrementals *inside* a segment would leave
+its full anchored before a gap, so prune refuses that shape at the
+pre-commit leg — `SLUICE-E-BACKUP-CHAIN-UNREADABLE`, exit 3, nothing
+deleted — and names the keep-counts that do land on a boundary for your
+chain. A chain that has never rotated is a single segment with no
+boundary to land on, so every `--keep-incrementals` prune of one
+refuses; use `--keep-duration` with a cutoff older than every
+incremental there instead.
+
 ## Step 3: verify periodically
 
 ```sh
@@ -152,13 +163,38 @@ sluice backup verify \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase'
 ```
 
-Without the `--encrypt` flag, this is SHA-only — chunk hashes are
-compared against the manifest's recorded hashes. With `--encrypt`,
-sluice **also** probes each chunk's WrappedCEK against the operator's
-envelope — catching the case where the operator rotated their
-passphrase but didn't notice the chain stopped being restorable. The
-loud failure is `unwrap chunk cek (passphrase rotated mid-chain?):
-crypto: aes-gcm open: cipher: message authentication failed`.
+Verify has **two depths**, and the difference is what a green result
+promises.
+
+Without the `--encrypt` flag it is sha256-only — chunk bytes are hashed
+and compared against the manifest's recorded hashes. That proves the
+bytes have not rotted. It does **not** prove the chain is readable:
+bytes that hash correctly can still be sealed under a key or a binding
+the restore path will not reproduce.
+
+With `--encrypt` + the chain's key material, sluice **also** performs
+the real AES-GCM authenticated open of every encrypted chunk — the same
+CEK and the same AAD binding `restore` uses, in the default per-chain
+mode as well as per-chunk. This is the depth to run before you trust a
+DR archive. A chunk `restore` cannot read (tampered, spliced, or sealed
+under the wrong key) fails here as
+`SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`, exit 3.
+
+Both depths walk the chain's lineage first, the way `restore` does, so
+a chain a `prune` or `compact` left un-walkable is refused either way —
+verify never reports a chain healthy that `restore` will not start on.
+
+**Read the `decrypted=` count, not just the exit status.** The summary
+line reports `chunks=N decrypted=M`; `M` is how many chunks were
+actually opened, and `decrypted=0` on an encrypted chain means you only
+got the sha256 depth (no key material reached the command). A wrong key
+fails earlier, at the key unwrap rather than at a chunk: `unwrap chain
+cek` in the default per-chain mode, and `unwrap chunk cek (passphrase
+rotated mid-chain?)` in `--encrypt-mode=per-chunk`, where each chunk
+carries its own wrapped CEK and a mid-chain rotation shows up on the
+first chunk written under the new passphrase. That second string is the
+**wrong-key case only** — a tampered or spliced chunk is not a key
+problem and surfaces as `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`.
 
 Run this on whatever cadence your DR policy requires — daily is
 common.

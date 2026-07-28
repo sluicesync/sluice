@@ -131,9 +131,9 @@ These are deliberate non-goals for the current contract; they may be revisited a
 - **Typed JSON.** `[]byte` preserves the source's exact encoding; promoting to a parsed `map[string]any` would lose that and is rarely what a migration tool wants.
 - **A typed `Row` rather than `map[string]any`.** Possible eventually; the value contract above is the prerequisite either way.
 
-## MySQL binlog-event volume — sizing `--rollover-max-changes`
+## CDC-event volume — sizing `--rollover-max-changes`
 
-The CDC reader and `backup stream` both count *binlog events*, not user-visible row changes. On MySQL the two counts are not the same, and operators sizing rollover bounds against expected INSERT counts can under-size the bound by a factor of 3-4×.
+The CDC reader and `backup stream` both count *change events*, not user-visible row changes. On **every** engine the two counts differ — transaction framing is an event — and operators sizing rollover bounds against expected INSERT counts can under-size the bound by a factor of 3-4×. The MySQL shape is documented first because its inflation is the larger of the two; the Postgres subsection below records that PG is not exempt.
 
 ### Per-INSERT shape
 
@@ -149,15 +149,21 @@ A multi-row `INSERT ... VALUES (r1), (r2), ..., (rN)` collapses the row events i
 
 Many MySQL client sessions emit an **empty `BEGIN` / `COMMIT`** pair into the binlog ahead of the first DML in a connection — typically from the driver issuing a session-setup statement (`SET autocommit`, `SET time_zone`, etc.) inside an implicit transaction that gets logged but contains no row changes. The pair is a constant overhead per session, not per row. Operators should budget +2 events for the first DML of any new connection.
 
-### Operator rule of thumb
+### Operator rule of thumb (MySQL)
 
 When setting `--rollover-max-changes=N` on `sluice backup stream` against a MySQL source: **budget at least 4× your expected INSERT count**. The 4× covers the per-row 3-event shape plus headroom for the spurious empty pair and any other session-bookkeeping events (heartbeats, format-description, rotate). For workloads with predictable transaction shapes (e.g. bulk multi-row inserts) the bound can be tighter — the 2 + N shape means a 1000-row multi-row INSERT consumes ~1002 events, not 3000 — but the safe default for naive INSERT-counting is 4×.
 
-This rule of thumb only applies to MySQL. PostgreSQL's `pgoutput` logical replication delivers **one event per row change** with no in-band BEGIN/COMMIT inflation in the consumer's view (transaction boundaries arrive as separate `Begin` / `Commit` messages but sluice's CDC reader doesn't surface them as countable changes), so PG operators sizing `--rollover-max-changes` can use INSERT-count directly without a multiplier.
+### Postgres counts transaction framing too
+
+**Postgres is not exempt from the framing arithmetic.** pgoutput's `Begin` and `Commit` messages are surfaced by sluice's PG CDC reader as `ir.TxBegin` / `ir.TxCommit` changes (`internal/engines/postgres/cdc_reader.go`), and both backup paths count every change they write to a chunk — framing included, with no per-kind filter (`internal/pipeline/incremental.go`, `internal/pipeline/stream.go`). So a one-row autocommit transaction consumes **3** against `--max-changes` / `--rollover-max-changes` on Postgres exactly as it does on MySQL, and an N-row transaction consumes 2 + N. **Budget at least 3× a naive INSERT count on PG.**
+
+What differs between the engines is the *headroom*, not the shape. MySQL's 4× buys slack for binlog-specific extras — the spurious empty `BEGIN`/`COMMIT` pair per session, plus rotate / format-description bookkeeping. The PG reader emits only `TxBegin`, `TxCommit`, `Insert`, `Update`, `Delete`, `Truncate` (and one `SchemaSnapshot` at stream start), so there is no equivalent per-session inflation to budget for — but the 3-per-transaction floor is identical.
+
+*(An earlier version of this section carved Postgres out entirely, on the claim that its transaction boundaries "arrive as separate `Begin`/`Commit` messages but sluice's CDC reader doesn't surface them as countable changes", and told PG operators to size `--rollover-max-changes` off INSERT-count with no multiplier. Both halves were wrong against the code: the reader does surface them, and the window does count them. Corrected 2026-07-28.)*
 
 ### Why this matters
 
-Under-sized `--rollover-max-changes` causes incremental backup windows to close earlier than the operator expects, which leaves rows the operator believed would land in the *current* incremental in the *next* one. For a chain restore that's harmless (the chain replays in order), but for an operator scripting "drive 5 INSERTs then expect them in this incremental" the off-by-time-window can be confusing. The 4× rule eliminates the surprise.
+Under-sized `--rollover-max-changes` causes incremental backup windows to close earlier than the operator expects, which leaves rows the operator believed would land in the *current* incremental in the *next* one. For a chain restore that's harmless (the chain replays in order), but for an operator scripting "drive 5 INSERTs then expect them in this incremental" the off-by-time-window can be confusing. The multipliers above (4× on MySQL, 3× on Postgres) eliminate the surprise. Neither cap can close a rollover before the window has advanced past its own start position, either — a resumed pump opens by replaying the transaction its parent ended on, and those replayed events are the parent's, not this window's (roadmap item 98).
 
 ## Cross-references
 

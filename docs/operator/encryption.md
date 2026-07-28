@@ -102,13 +102,15 @@ sluice backup verify --from=s3://my-bucket/backups/2026-05-09/
 
 That mode proves the bytes have not rotted. It cannot prove the chain is READABLE — bytes that hash correctly can still be sealed under a key or a binding the restore path will not reproduce.
 
-**With `--encrypt` + the chain's key material** it additionally performs the real AES-GCM authenticated open of every encrypted chunk, using the same key and the same binding the restore path would use, and walks the lineage the way `restore` does before it starts. This is the mode to run before you trust a DR archive:
+**With `--encrypt` + the chain's key material** it additionally performs the real AES-GCM authenticated open of every encrypted chunk, using the same key and the same binding the restore path would use. This is the mode to run before you trust a DR archive:
 
 ```bash
 sluice backup verify --from=s3://my-bucket/backups/2026-05-09/ \
   --encrypt --encryption-passphrase-env=SLUICE_BACKUP_PASSPHRASE
 # backup verify: all chunks OK  chunks=42 decrypted=42
 ```
+
+Both depths walk the chain's lineage before they check a single chunk, the way `restore` does — a mis-stitched chain (one a `prune` or `compact` left un-walkable) is refused at either depth, because a chain restore will not start on is not healthy no matter how its bytes hash.
 
 Read the `decrypted=` count, not just the exit status: it is how many chunks were actually opened. `decrypted=0` on an encrypted chain means you got the sha256-only depth. (Through v0.104.2 this line was a bare `decrypt_probe=true` that meant only "a key was supplied" — on the default per-chain mode no chunk was ever opened, and a chain whose tail could not be decrypted verified green. See roadmap item 97 / Bug 215.)
 
