@@ -974,7 +974,12 @@ func openBackupStore(
 //   - The window closes on either --window (wall-clock) or
 //     --max-changes (event count); first to fire wins. The window is
 //     extended to the next TxCommit so the chain doesn't end
-//     mid-transaction.
+//     mid-transaction. --max-changes counts change EVENTS, transaction
+//     framing included (a one-row transaction is three), and cannot
+//     close a window that has not yet passed the parent's end position:
+//     a resumed CDC stream opens by replaying the transaction the parent
+//     ends on, and a tight bound was otherwise satisfiable by that
+//     replay alone (roadmap item 92).
 //   - When the source's WAL / binlog has been pruned past the parent's
 //     terminal position, the run refuses loudly with "take a fresh
 //     full backup" guidance.
@@ -1001,7 +1006,7 @@ type BackupIncrementalCmd struct {
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the same slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
 
 	Window     time.Duration `help:"Wall-clock duration the incremental streams CDC events for before closing the window. The window is extended to the next TxCommit so the chain doesn't end mid-transaction." default:"5m" placeholder:"DUR"`
-	MaxChanges int           `help:"Stop streaming after this many CDC events (approximate; the window closes at the next TxCommit). Zero means time-bound only." default:"0" placeholder:"N"`
+	MaxChanges int           `help:"Stop streaming after this many CDC EVENTS — transaction framing included, so a one-row transaction counts three (approximate; the window closes at the next TxCommit, and never before it has passed the parent's end position). Zero means time-bound only." default:"0" placeholder:"N"`
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
 
