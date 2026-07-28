@@ -1,0 +1,696 @@
+//go:build integration && crossversion
+
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+// The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212).
+//
+// Every other test in this repo runs ONE sluice binary against its own
+// output. That is exactly why the defect this file exists for reached a
+// release: it is invisible to a single binary by construction.
+//
+// The contract. A manifest records the format version its own chunks were
+// sealed under, and every reader recomputes at the version the artifact
+// records (ADR-0154 / ADR-0181's dual-version rule). That rule is what
+// makes "newer sluice always reads older" true forever, and it is
+// deliberately PER-LINK. The consequence is not per-link: a restore walks
+// the WHOLE chain, so a binary that refuses ANY one manifest restores
+// NOTHING from that chain — including the segments it wrote itself, under
+// a version it understands perfectly well.
+//
+// So when a v0.104.0 binary (BackupFormatVersion 9) takes `backup
+// incremental` against a chain rooted by a v0.103.2 binary (at most 8),
+// the new segment is stamped 9 and the v0.103.2 binary loses the entire
+// chain. That is the KNOWN, ACCEPTED behaviour — the alternative, sealing
+// fresh chunks under the encoding a format bump exists to retire, is
+// worse. This gate's job is to make it VISIBLE and to fail loudly if its
+// SHAPE ever changes, not to assert it is fixed.
+//
+// The suite runs two real binaries against one real backup store:
+//
+//	cell 1  forward read      OLD writes chain → NEW restores        PASS
+//	cell 2  backward refusal  NEW writes chain → OLD restores      REFUSE
+//	cell 3  the Bug-212 cell  OLD writes, NEW extends →
+//	                            (a) NEW restores                      PASS
+//	                            (b) OLD restores                     FAIL
+//	cell 4  control           OLD writes, OLD extends, OLD restores  PASS
+//
+// Cell 4 is not padding: it is what proves cell 3b's failure is caused by
+// the version raise and by nothing else in the harness.
+//
+// Encryption is not optional here. FormatVersion 9 is an ENCRYPTED-manifest
+// tier — a plaintext chain keeps its schema-derived version (1/2/4) and
+// would reproduce nothing.
+//
+// Binaries come from scripts/crossversion-build.sh via the environment.
+// Absent them this test FAILS rather than skipping: a skip is the vacuous
+// green this whole file exists to prevent, and the `crossversion` build tag
+// means nothing else compiles it by accident.
+
+package pipeline
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// xvPassphraseEnv / xvPassphraseValue: the passphrase reaches both binaries
+// through the environment (`--encryption-passphrase-env`), never on the
+// command line, so a failing run's logged argv carries no secret.
+//
+// The variable name deliberately carries NO `SLUICE_` prefix and NO
+// "passphrase" substring. Both were learned the hard way while building
+// this: koanf reads every `SLUICE_*` variable as config and WARNs about
+// the ones it doesn't recognise, which put the literal string "passphrase"
+// into the output of a refusal that had nothing to do with the passphrase
+// — and tripped this suite's own you-must-not-blame-the-passphrase
+// assertion. A test-fixture name that can appear in the artifact under
+// test is a name that can lie about it.
+const (
+	xvPassphraseEnv   = "CROSSVER_BACKUP_KEY"
+	xvPassphraseValue = "crossversion-gate-key-not-a-real-secret"
+)
+
+// xvCmdTimeout bounds any single binary invocation. Generous: a `backup
+// incremental` sits on its CDC window, and the window budget below is well
+// inside this.
+const xvCmdTimeout = 5 * time.Minute
+
+// xvIncrementalWindow is how long each incremental streams. Every delta
+// this suite writes is COMMITTED before the window opens, so decoding it
+// takes milliseconds and the rest is the window running out — 12s is slack
+// for a loaded runner, not a wait for anything. Six segments, so this is
+// roughly 75s of the suite's total.
+const xvIncrementalWindow = "12s"
+
+// xvFormatVersionRefusal is the operator-facing substring the older binary
+// MUST print when it meets a manifest from the future. Pinned as a literal
+// (not imported) on purpose — this is a cross-VERSION contract, and the
+// wording that matters is the one the OLD binary already shipped with, so
+// importing the new build's constant would assert the wrong side.
+const xvFormatVersionRefusal = "newer than this build supports"
+
+// xvMisleadingRefusalTerms are words the version refusal must NOT contain.
+// A v0.103.x binary once told an operator holding the CORRECT passphrase
+// that the passphrase was wrong; an operator handed the wrong reason does
+// the wrong thing next (rotates keys, re-derives, escalates a security
+// incident) instead of the one right thing (upgrade the binary). A refusal
+// that names the wrong cause is a defect even though the refusal itself is
+// correct, so it is asserted, not merely hoped for.
+var xvMisleadingRefusalTerms = []string{
+	"passphrase",
+	"message authentication failed",
+	"wrong key",
+	"decrypt",
+}
+
+// ---------------------------------------------------------------------
+// binaries + the non-vacuity contract
+// ---------------------------------------------------------------------
+
+type xvBinaries struct {
+	oldBin, newBin       string
+	oldTag               string
+	oldFormat, newFormat int
+}
+
+// xvLoadBinaries reads the contract scripts/crossversion-build.sh emits.
+// Every failure path here is a t.Fatalf, never a t.Skip.
+func xvLoadBinaries(t *testing.T) xvBinaries {
+	t.Helper()
+	get := func(k string) string {
+		v := os.Getenv(k)
+		if v == "" {
+			t.Fatalf("%s is unset — this suite needs BOTH binaries. Run `bash scripts/crossversion-build.sh` "+
+				"and export the KEY=VALUE lines it prints, then re-run with -tags='integration crossversion'. "+
+				"(Deliberately a FAILURE and not a skip: a skipped cross-version gate is the vacuous green it exists to prevent.)", k)
+		}
+		return v
+	}
+	getInt := func(k string) int {
+		n, err := strconv.Atoi(get(k))
+		if err != nil {
+			t.Fatalf("%s=%q is not an integer: %v", k, os.Getenv(k), err)
+		}
+		return n
+	}
+	b := xvBinaries{
+		oldBin:    get("CROSSVER_OLD_BIN"),
+		newBin:    get("CROSSVER_NEW_BIN"),
+		oldTag:    get("CROSSVER_OLD_TAG"),
+		oldFormat: getInt("CROSSVER_OLD_FORMAT"),
+		newFormat: getInt("CROSSVER_NEW_FORMAT"),
+	}
+	// The FIRST non-vacuity guard: a gate whose two binaries understand the
+	// same manifest versions asserts nothing at all, and would report a
+	// confident green while covering none of the four cells' intent. The
+	// build script refuses to produce such a pair; re-assert it here so a
+	// hand-set environment cannot route around it.
+	if b.oldFormat >= b.newFormat {
+		t.Fatalf("OLD %s stamps BackupFormatVersion=%d and NEW stamps %d — the gate needs old < new, "+
+			"otherwise every cell below is vacuous. Re-run scripts/crossversion-build.sh.",
+			b.oldTag, b.oldFormat, b.newFormat)
+	}
+	for _, p := range []string{b.oldBin, b.newBin} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("binary %q: %v", p, err)
+		}
+	}
+	t.Logf("cross-version gate: OLD=%s (%s, BackupFormatVersion=%d)  NEW=%s (BackupFormatVersion=%d)",
+		b.oldBin, b.oldTag, b.oldFormat, b.newBin, b.newFormat)
+	return b
+}
+
+// ---------------------------------------------------------------------
+// the cell ledger (the second non-vacuity guard)
+// ---------------------------------------------------------------------
+
+// xvLedger records which cells actually reached their assertions. The
+// workflow leg has its own PASS-count guard, but that one watches from
+// outside and can only see what `go test` chose to print; this one lives
+// where the truth is. A cell that never ran — filtered out, panicked past,
+// quietly returned early — fails the parent test by name.
+type xvLedger struct {
+	expected []string
+	done     map[string]bool
+}
+
+func newXVLedger(t *testing.T, cells ...string) *xvLedger {
+	t.Helper()
+	l := &xvLedger{expected: cells, done: make(map[string]bool, len(cells))}
+	t.Cleanup(func() {
+		var missing []string
+		for _, c := range l.expected {
+			if !l.done[c] {
+				missing = append(missing, c)
+			}
+		}
+		if len(missing) > 0 {
+			t.Errorf("cross-version gate did not run every cell — missing: %s. "+
+				"All four cells must report; a partial run is a vacuous green, not a pass.",
+				strings.Join(missing, ", "))
+		}
+	})
+	return l
+}
+
+func (l *xvLedger) report(t *testing.T, cell string) {
+	t.Helper()
+	if !l.done[cell] {
+		l.done[cell] = true
+		t.Logf("cross-version gate: cell %s reported", cell)
+	}
+}
+
+// ---------------------------------------------------------------------
+// invocation helpers
+// ---------------------------------------------------------------------
+
+// xvExec runs one sluice invocation and returns its combined output. The
+// combined stream is what an operator sees, which is what the refusal
+// assertions are about.
+//
+// The child's environment is the caller's with every `SLUICE_*` variable
+// REMOVED. That prefix is sluice's own koanf config namespace, so a stray
+// SLUICE_SOURCE / SLUICE_TARGET in the shell that launched `go test` would
+// silently retarget a cell — and any other SLUICE_* variable produces a
+// config-typo WARN that pollutes the very output the refusal assertions
+// read. The cells pass everything they mean on the command line.
+func xvExec(t *testing.T, bin string, args ...string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), xvCmdTimeout)
+	defer cancel()
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "SLUICE_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, xvPassphraseEnv+"="+xvPassphraseValue)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func xvMustExec(t *testing.T, what, bin string, args ...string) string {
+	t.Helper()
+	out, err := xvExec(t, bin, args...)
+	if err != nil {
+		t.Fatalf("%s: %v\n--- %s %s ---\n%s", what, err, filepath.Base(bin), strings.Join(args, " "), out)
+	}
+	return out
+}
+
+// xvEncryptFlags is the passphrase-encryption flag set every write and read
+// side shares. Defined once so no cell can accidentally take a plaintext
+// path (which would keep the schema-derived version and reproduce nothing).
+func xvEncryptFlags() []string {
+	return []string{"--encrypt", "--encryption-passphrase-env", xvPassphraseEnv}
+}
+
+func xvBackupFull(t *testing.T, bin, srcDSN, dir, slot string) {
+	t.Helper()
+	args := append([]string{
+		"backup", "full",
+		"--source-driver", "postgres", "--source", srcDSN,
+		"--output-dir", dir,
+		"--chain-slot", "--slot-name", slot,
+	}, xvEncryptFlags()...)
+	xvMustExec(t, "backup full", bin, args...)
+}
+
+// xvBackupIncremental extends the chain in dir with one TIME-BOUND CDC
+// window.
+//
+// `--max-changes` is deliberately NOT used, and the reason is worth
+// keeping. The count it bounds is CDC EVENTS, not row changes — a window
+// budgeted at "the 2 rows I just wrote" closes on transaction framing
+// before the rows are decoded, and the segment lands with
+// start_position == end_position: a real, chain-linked, correctly-stamped
+// manifest carrying none of the delta. Ground-truthed while building this
+// gate; every restore assertion below silently lost its extension delta
+// until the bound came out. A count bound here would make the harness, not
+// the product, decide whether the cells mean anything.
+//
+// xvIncrementalWindow is the whole cost of a segment (the run sits out its
+// window), so it is the suite's dominant wall-clock term.
+func xvBackupIncremental(t *testing.T, bin, srcDSN, dir, slot string) {
+	t.Helper()
+	args := append([]string{
+		"backup", "incremental",
+		"--source-driver", "postgres", "--source", srcDSN,
+		"--output-dir", dir,
+		"--slot-name", slot,
+		"--window", xvIncrementalWindow,
+		"--max-changes", "0",
+	}, xvEncryptFlags()...)
+	xvMustExec(t, "backup incremental", bin, args...)
+}
+
+func xvRestore(t *testing.T, bin, dir, targetDSN string) (string, error) {
+	t.Helper()
+	args := append([]string{
+		"restore",
+		"--from-dir", dir,
+		"--target-driver", "postgres", "--target", targetDSN,
+	}, xvEncryptFlags()...)
+	return xvExec(t, bin, args...)
+}
+
+// ---------------------------------------------------------------------
+// store + database inspection
+// ---------------------------------------------------------------------
+
+// xvManifestVersion reads the format_version off a manifest JSON file.
+// Decoded through an anonymous struct rather than irbackup.Manifest on
+// purpose: this is a WIRE assertion about bytes on disk written by a
+// binary that is not this build, so it must not ride the current build's
+// type to interpret them.
+func xvManifestVersion(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read manifest %s: %v", path, err)
+	}
+	var m struct {
+		FormatVersion int `json:"format_version"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode manifest %s: %v", path, err)
+	}
+	return m.FormatVersion
+}
+
+// xvChainVersions returns the root full's format version and the
+// incremental segments' versions in path order.
+func xvChainVersions(t *testing.T, dir string) (root int, segments []int) {
+	t.Helper()
+	root = xvManifestVersion(t, filepath.Join(dir, "manifest.json"))
+	paths, err := filepath.Glob(filepath.Join(dir, "manifests", "incr-*.json"))
+	if err != nil {
+		t.Fatalf("glob incremental manifests: %v", err)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		segments = append(segments, xvManifestVersion(t, p))
+	}
+	if len(segments) == 0 {
+		t.Fatalf("chain at %s has no incremental segments — the cell wrote a bare full, "+
+			"so it is not exercising the chain contract at all", dir)
+	}
+	return root, segments
+}
+
+// xvUser is one row of the shared chainSeedDDL `users` table.
+type xvUser struct {
+	ID     int64
+	Email  string
+	Active bool
+}
+
+func xvUsers(t *testing.T, dsn string) []xvUser {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dsn, err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SELECT id, email, active FROM users ORDER BY id")
+	if err != nil {
+		t.Fatalf("select users: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []xvUser
+	for rows.Next() {
+		var u xvUser
+		if err := rows.Scan(&u.ID, &u.Email, &u.Active); err != nil {
+			t.Fatalf("scan users: %v", err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate users: %v", err)
+	}
+	return out
+}
+
+// xvAssertUsers pins the restored CONTENT, not just the exit code. A
+// restore that succeeds while landing the wrong rows is the silent-loss
+// shape; an exit-code assertion would sail straight past it.
+func xvAssertUsers(t *testing.T, dsn, what string, want []xvUser) {
+	t.Helper()
+	got := xvUsers(t, dsn)
+	if len(got) != len(want) {
+		t.Fatalf("%s: restored %d rows, want %d\n got: %+v\nwant: %+v", what, len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: row %d = %+v, want %+v\n got: %+v\nwant: %+v", what, i, got[i], want[i], got, want)
+		}
+	}
+}
+
+// xvPublicRelationCount counts the relations a restore would have created
+// in the target's public schema. A refused restore must leave this at zero:
+// the format-version gate sits at the manifest preflight, ahead of anything
+// that touches the target, and "refused loudly" is only half the contract
+// if the target is left half-built.
+func xvPublicRelationCount(t *testing.T, dsn string) int64 {
+	t.Helper()
+	return pgQueryOne[int64](t, dsn,
+		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','S')`)
+}
+
+// xvAssertVersionRefusal pins the whole refusal contract: it failed, it
+// said why in the operator's words, it did NOT blame the passphrase, and
+// the target is untouched.
+func xvAssertVersionRefusal(t *testing.T, what, out string, err error, targetDSN string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: the older binary RESTORED a chain stamped above its BackupFormatVersion — "+
+			"the forward-compat refusal is gone, which means older binaries now read manifests they "+
+			"cannot correctly interpret.\n--- output ---\n%s", what, out)
+	}
+	if !strings.Contains(out, xvFormatVersionRefusal) {
+		t.Fatalf("%s: refused (%v) but never said %q — the operator cannot tell a version gap from corruption.\n--- output ---\n%s",
+			what, err, xvFormatVersionRefusal, out)
+	}
+	lower := strings.ToLower(out)
+	for _, term := range xvMisleadingRefusalTerms {
+		if strings.Contains(lower, term) {
+			t.Fatalf("%s: the refusal blames %q. The passphrase is CORRECT here; this is a format-version gap. "+
+				"An operator handed the wrong cause rotates keys instead of upgrading the binary.\n--- output ---\n%s",
+				what, term, out)
+		}
+	}
+	if n := xvPublicRelationCount(t, targetDSN); n != 0 {
+		t.Fatalf("%s: refused, but the target already carries %d relation(s) in public — the version gate must "+
+			"sit at the manifest preflight, ahead of anything that touches the target", what, n)
+	}
+}
+
+// ---------------------------------------------------------------------
+// fixture
+// ---------------------------------------------------------------------
+
+// The post-full deltas. Each is a single multi-statement Exec, so it lands
+// as ONE transaction and is fully committed before the incremental that
+// captures it opens its window.
+const (
+	// xvDelta1: insert, update, delete — all three DML shapes, so a
+	// change-replay that mishandles one is caught by the row assertion.
+	xvDelta1 = `
+		INSERT INTO users (id, email, active) VALUES (4, 'dave@example.com', true);
+		UPDATE users SET active = false WHERE id = 1;
+		DELETE FROM users WHERE id = 3;
+	`
+
+	// xvDelta2: the EXTENSION window's delta. Distinct rows from xvDelta1
+	// (a new id, and an update to a row xvDelta1 left alone) so "the
+	// extension's changes landed" is decidable from the restored rows
+	// alone — a replay of xvDelta1 in xvDelta2's place is idempotent and
+	// would otherwise be indistinguishable from success.
+	xvDelta2 = `
+		INSERT INTO users (id, email, active) VALUES (5, 'erin@example.com', true);
+		UPDATE users SET active = false WHERE id = 2;
+	`
+)
+
+// xvAfterDelta1 / xvAfterDelta2 are the exact row sets a correct restore
+// lands, seeded rows folded through each delta.
+var (
+	xvAfterDelta1 = []xvUser{
+		{1, "alice@example.com", false},
+		{2, "bob@example.com", true},
+		{4, "dave@example.com", true},
+	}
+	xvAfterDelta2 = []xvUser{
+		{1, "alice@example.com", false},
+		{2, "bob@example.com", false},
+		{4, "dave@example.com", true},
+		{5, "erin@example.com", true},
+	}
+)
+
+// xvCreateDB creates a database in the running container and returns its
+// DSN. Every cell gets its own source (so it can own a replication slot)
+// and its own target(s) (so an "untouched" assertion means what it says).
+func xvCreateDB(t *testing.T, adminDSN, name string) string {
+	t.Helper()
+	db, err := sql.Open("pgx", adminDSN)
+	if err != nil {
+		t.Fatalf("open admin: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
+	}
+	dsn, err := buildPGDSN(adminDSN, name)
+	if err != nil {
+		t.Fatalf("build DSN for %s: %v", name, err)
+	}
+	return dsn
+}
+
+// xvSeededSource creates a source database, applies the shared seed, and
+// returns its DSN.
+func xvSeededSource(t *testing.T, adminDSN, name string) string {
+	t.Helper()
+	dsn := xvCreateDB(t, adminDSN, name)
+	applyDDL(t, dsn, chainSeedDDL)
+	return dsn
+}
+
+// ---------------------------------------------------------------------
+// the gate
+// ---------------------------------------------------------------------
+
+func TestBackup_CrossVersionChainCompat(t *testing.T) {
+	bins := xvLoadBinaries(t)
+
+	// One container, one database per role. Slots are cluster-wide, so each
+	// cell's slot name is distinct; publications are per-database, so the
+	// default name is fine.
+	adminDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	ledger := newXVLedger(t, "1-forward-read", "2-backward-refusal", "3a-new-reads-extended", "3b-old-loses-extended", "4-control")
+
+	t.Run("cell1_forward_read_OLD_writes_NEW_restores", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv1_src")
+		tgt := xvCreateDB(t, adminDSN, "xv1_tgt")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.oldBin, src, dir, "xv_slot_1")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.oldBin, src, dir, "xv_slot_1")
+
+		root, segs := xvChainVersions(t, dir)
+		if root > bins.oldFormat {
+			t.Fatalf("OLD %s wrote a root manifest stamped %d, above its own BackupFormatVersion %d — impossible; the harness is not running the binary it thinks it is",
+				bins.oldTag, root, bins.oldFormat)
+		}
+		t.Logf("cell 1: OLD chain stamped root=%d segments=%v", root, segs)
+
+		out, err := xvRestore(t, bins.newBin, dir, tgt)
+		if err != nil {
+			t.Fatalf("NEW binary failed to restore an OLD chain — the always-reads-older half of the "+
+				"forward-compat contract is broken: %v\n--- output ---\n%s", err, out)
+		}
+		xvAssertUsers(t, tgt, "cell 1 (NEW restores OLD chain)", xvAfterDelta1)
+		ledger.report(t, "1-forward-read")
+	})
+
+	t.Run("cell2_backward_refusal_NEW_writes_OLD_refuses", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv2_src")
+		tgt := xvCreateDB(t, adminDSN, "xv2_tgt")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.newBin, src, dir, "xv_slot_2")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.newBin, src, dir, "xv_slot_2")
+
+		root, segs := xvChainVersions(t, dir)
+		if root <= bins.oldFormat {
+			t.Fatalf("NEW wrote a root manifest stamped %d, which OLD (%d) can read — this cell cannot "+
+				"assert a refusal it will never see. An encrypted full must stamp the current tier; "+
+				"check that --encrypt actually engaged.", root, bins.oldFormat)
+		}
+		t.Logf("cell 2: NEW chain stamped root=%d segments=%v", root, segs)
+
+		out, err := xvRestore(t, bins.oldBin, dir, tgt)
+		xvAssertVersionRefusal(t, "cell 2 (OLD restores NEW chain)", out, err, tgt)
+		ledger.report(t, "2-backward-refusal")
+	})
+
+	// Cell 3 — the reason this gate exists.
+	//
+	// OLD roots the chain and takes the first incremental; NEW then extends
+	// it with an ordinary `backup incremental`, which is the single most
+	// ordinary thing an operator does to a chain. The extension is stamped
+	// at NEW's tier (an encrypted incremental's chunks are freshly SEALED,
+	// so they carry the current AAD encoding — see incremental.go's stamp),
+	// which raises the chain's readability floor for EVERY link.
+	//
+	// 3b is a KNOWN, ACCEPTED consequence (roadmap item 90 / Bug 212), NOT
+	// a bug this gate is waiting to see fixed. Sealing the extension under
+	// the retired encoding to keep OLD happy would defeat the bump. What was
+	// missing was visibility, and this is it: if 3b ever starts PASSING, or
+	// starts failing in a different SHAPE (a mid-restore failure instead of
+	// a preflight refusal, a half-built target, a refusal blaming the
+	// passphrase), this cell goes red and someone looks.
+	t.Run("cell3_bug212_OLD_chain_extended_by_NEW", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv3_src")
+		tgtNew := xvCreateDB(t, adminDSN, "xv3_tgt_new")
+		tgtOld := xvCreateDB(t, adminDSN, "xv3_tgt_old")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.oldBin, src, dir, "xv_slot_3")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.oldBin, src, dir, "xv_slot_3")
+
+		// The extension, by the NEW binary.
+		applyDDL(t, src, xvDelta2)
+		xvBackupIncremental(t, bins.newBin, src, dir, "xv_slot_3")
+
+		// The THIRD and sharpest non-vacuity guard, and the mechanism stated
+		// as an assertion: one chain, an OLD-written root and a NEW-written
+		// extension, and the extension must record a strictly higher version.
+		// If it does not, cells 3a/3b below are asserting nothing.
+		root, segs := xvChainVersions(t, dir)
+		if len(segs) < 2 {
+			t.Fatalf("cell 3: chain carries %d incremental segment(s), want 2 (OLD's, then NEW's extension)", len(segs))
+		}
+		ext := segs[len(segs)-1]
+		if ext <= root {
+			t.Fatalf("cell 3: the NEW binary's extension is stamped %d and the OLD root is stamped %d — "+
+				"the extension did not raise the chain's floor, so this cell is vacuous. Either the two "+
+				"binaries agree on the format version (check CROSSVER_OLD_TAG=%s) or --encrypt did not engage.",
+				ext, root, bins.oldTag)
+		}
+		if ext <= bins.oldFormat {
+			t.Fatalf("cell 3: the extension is stamped %d, which OLD (%d) can still read — cell 3b would "+
+				"assert a refusal that cannot happen", ext, bins.oldFormat)
+		}
+		t.Logf("cell 3: chain floor raised — root=%d segments=%v (OLD reads up to %d)", root, segs, bins.oldFormat)
+
+		t.Run("a_NEW_restores_the_extended_chain", func(t *testing.T) {
+			out, err := xvRestore(t, bins.newBin, dir, tgtNew)
+			if err != nil {
+				t.Fatalf("NEW binary failed to restore the chain it extended: %v\n--- output ---\n%s", err, out)
+			}
+			xvAssertUsers(t, tgtNew, "cell 3a (NEW restores the extended chain)", xvAfterDelta2)
+			ledger.report(t, "3a-new-reads-extended")
+		})
+
+		t.Run("b_OLD_loses_the_whole_chain", func(t *testing.T) {
+			out, err := xvRestore(t, bins.oldBin, dir, tgtOld)
+			// KNOWN + ACCEPTED (item 90 / Bug 212): OLD wrote the root and the
+			// first segment itself, understands both perfectly, and still
+			// restores NOTHING — because the walk refuses at the newer
+			// extension. Cell 4 is the control that proves the version raise,
+			// and not the harness, is what does this.
+			xvAssertVersionRefusal(t, "cell 3b (OLD restores the chain NEW extended)", out, err, tgtOld)
+			ledger.report(t, "3b-old-loses-extended")
+		})
+	})
+
+	// Cell 4 — the control. Byte-for-byte the same shape as cell 3, with the
+	// extension taken by OLD instead of NEW. It must PASS. Without it, cell
+	// 3b's failure is only evidence that SOMETHING in a two-incremental
+	// chain restore breaks; with it, the version raise is the only variable
+	// left standing.
+	t.Run("cell4_control_OLD_writes_extends_restores", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv4_src")
+		tgt := xvCreateDB(t, adminDSN, "xv4_tgt")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.oldBin, src, dir, "xv_slot_4")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.oldBin, src, dir, "xv_slot_4")
+		applyDDL(t, src, xvDelta2)
+		xvBackupIncremental(t, bins.oldBin, src, dir, "xv_slot_4")
+
+		root, segs := xvChainVersions(t, dir)
+		if len(segs) < 2 {
+			t.Fatalf("cell 4: chain carries %d incremental segment(s), want 2", len(segs))
+		}
+		for _, v := range append([]int{root}, segs...) {
+			if v > bins.oldFormat {
+				t.Fatalf("cell 4: OLD %s stamped %d, above its own BackupFormatVersion %d — impossible; "+
+					"the control is not running the OLD binary", bins.oldTag, v, bins.oldFormat)
+			}
+		}
+		t.Logf("cell 4: OLD-only chain stamped root=%d segments=%v", root, segs)
+
+		out, err := xvRestore(t, bins.oldBin, dir, tgt)
+		if err != nil {
+			t.Fatalf("CONTROL FAILED: OLD could not restore a chain it wrote entirely by itself. "+
+				"Cell 3b's failure can no longer be attributed to the format-version raise — fix the "+
+				"harness before reading anything into cell 3.\n%v\n--- output ---\n%s", err, out)
+		}
+		xvAssertUsers(t, tgt, "cell 4 (OLD writes, extends, restores)", xvAfterDelta2)
+		ledger.report(t, "4-control")
+	})
+
+	// Belt for the ledger's braces: a summary line naming what ran, so a
+	// human reading the CI log sees the four cells rather than inferring
+	// them from subtest names.
+	t.Logf("cross-version gate: %d/%d cells reported", len(ledger.done), len(ledger.expected))
+}

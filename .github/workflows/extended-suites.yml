@@ -25,6 +25,21 @@
 # compiles in the per-PR pipeline-migrate shard, but SKIPs there because
 # the dumps are gitignored — this leg fetches them and is where they run.
 #
+# The `crossversion` leg (roadmap item 90 / Bug 212) is the only place in
+# CI where TWO sluice binaries meet ONE backup store. Every other suite in
+# this repo runs one binary against its own output, which is precisely why
+# a v0.104.0 binary extending a v0.103.2 chain — raising the chain's format
+# version and thereby making the WHOLE chain unrestorable by v0.103.2,
+# including the segments v0.103.2 wrote itself — shipped silently and was
+# found by a post-release regression cycle instead. On the WEEKLY schedule,
+# not dispatch-only (contrast `ddlfixture`): it is a regression signal
+# rather than a fixture sweep, it is cheap (~15m; two `go build`s and one
+# PG container), and the defect class is introduced by ORDINARY commits —
+# a format-version bump is a small, innocuous-looking diff, so the gate has
+# to be standing when one lands rather than waiting to be remembered.
+# ALSO dispatch it by hand before tagging any release that bumps
+# BackupFormatVersion; weekly is the backstop, not the release gate.
+#
 # The `kmsverify` leg (audit N-17c) runs the AWS-KMS backup/restore
 # suite against a real localstack KMS container. It sat here as a
 # documented deliberate skip while every test body was t.Skip()
@@ -46,7 +61,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, chaos, reshard, noblob, vstream-pipeline, corpus, ddlfixture, kmsverify]
+        options: [all, chaos, reshard, noblob, vstream-pipeline, corpus, ddlfixture, kmsverify, crossversion]
 
 permissions:
   contents: read
@@ -408,6 +423,83 @@ jobs:
         run: |
           go test -tags='integration kmsverify' -race -count=1 -timeout=25m \
             -run '^TestBackup_KMS' -v ./internal/pipeline/
+
+  # The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212).
+  # Builds the previous release from source in a throwaway tag worktree,
+  # builds the working tree, and runs both against ONE encrypted backup
+  # chain on real Postgres: forward read, backward refusal, the Bug-212
+  # extend-an-older-chain cell, and an OLD-only control that proves the
+  # Bug-212 cell's failure comes from the version raise and not the harness.
+  # See internal/pipeline/backup_crossversion_integration_test.go for the
+  # full contract and scripts/crossversion-build.sh for how the pair is
+  # derived (never hardcoded — the script refuses rather than build two
+  # copies of the same version, which would green against itself).
+  #
+  # No -race: the suite's own Go code is a serial driver around two child
+  # processes, so -race would cover nothing here and only inflate the
+  # budget — same reasoning as the ddlfixture leg below.
+  #
+  # Any crossversion-tagged test MUST carry the TestBackup_CrossVersion
+  # prefix or the -run filter below silently skips it (enforced by
+  # scripts/check-run-filter-coverage.sh in ci.yml's Lint job; keep that
+  # script's manifest in sync with this filter).
+  crossversion:
+    name: Cross-version backup compat
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'crossversion' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      # fetch-depth: 0 is load-bearing, not hygiene: the build script picks
+      # the old binary's tag by walking `git tag --sort=-v:refname` and
+      # reading BackupFormatVersion out of each tag's tree. A shallow,
+      # tagless checkout would leave it with nothing to pick — it refuses
+      # loudly there rather than degrading, but the fix is here.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # `go test` exits 0 when -run matches nothing, so pin the match count
+      # BEFORE spending two builds and a container on it. Cheap, and it
+      # compiles the tagged file without needing the binaries (the env
+      # contract is read inside the test body, not at list time).
+      - name: Assert the -run filter matches the suite (vacuous-green guard)
+        run: |
+          matched=$(go test -tags='integration crossversion' -list '^TestBackup_CrossVersion' ./internal/pipeline/ | grep -c '^Test' || true)
+          if [ "$matched" -ne 1 ]; then
+            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 1. A rename emptied the filter (0) or a new cross-version test joined the leg (>1) — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
+            exit 1
+          fi
+
+      - name: Log in to ghcr.io + pre-pull the PG image (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-postgres:16-prebaked
+
+      # Emits CROSSVER_* into $GITHUB_ENV for the run step below.
+      - name: Build the previous-release and working-tree binaries
+        run: bash scripts/crossversion-build.sh
+
+      - name: Run the cross-version backup-compatibility gate
+        run: |
+          set -o pipefail
+          go test -tags='integration crossversion' -count=1 -timeout=20m \
+            -run '^TestBackup_CrossVersion' -v ./internal/pipeline/ 2>&1 | tee crossversion.out
+          # Second half of the guard, mirroring the vstream-pipeline leg: a
+          # t.Skip greens `go test` while executing nothing. (The four cells
+          # have their OWN ledger inside the test — a cell that never runs
+          # fails the parent by name — so this outer check is specifically
+          # for the case where the whole suite silently didn't.)
+          passed=$(grep -c '^--- PASS: TestBackup_CrossVersion' crossversion.out || true)
+          if [ "$passed" -ne 1 ]; then
+            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 1 — the suite was skipped or didn't run (vacuous green). See the run log."
+            exit 1
+          fi
 
   # The DDL-fixture harness (internal/translate/ddl_fixture_test.go):
   # sweep the Dolt sqllogictest createtable1 corpus (~4,575 CREATE

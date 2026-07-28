@@ -1794,7 +1794,7 @@ So this is the Bug-207 class again — an unclassified error at a site whose cla
 
 **Gate note.** `internal/errclassgate` cannot see this site: it walks `setErr` parking sites, and `ExportRawCopy` returns its errors instead. Extending the gate to returned errors is not obviously right — most returned errors are legitimately unclassified — so the durable protection here is the end-to-end pin, not a widened AST walk.
 
-### 88. Make the encrypted-chunk AAD injective — ADR-0181 (raised 2026-07-26 as audit SEC-2) — *✅ SHIPPED 2026-07-27 (unreleased at time of writing)*
+### 88. Make the encrypted-chunk AAD injective — ADR-0181 (raised 2026-07-26 as audit SEC-2) — *✅ SHIPPED v0.104.0*
 
 **What.** The AES-GCM additional-authenticated-data binding an encrypted row chunk to its manifest and parent table is built by raw `"\nkey=" + value` concatenation, so it is not injective: a value carrying `\nschema=` forges a structural boundary and two distinct parents render to identical AAD. OBSERVED — a chunk sealed under one parent opens cleanly under another, and the attacker-rows-IN direction was reproduced end to end. The correct encoding already exists in the adjacent file: `signature.go`'s length-prefixed tokens, whose doc names this exact forgery as what length-prefixing closes.
 
@@ -1816,7 +1816,7 @@ So this is the Bug-207 class again — an unclassified error at a site whose cla
 
 **The MySQL-target half is already closed** (Bug 210, fixed in this batch): a deferrable primary key against a MySQL-family target now WARNs like its FK and UNIQUE siblings, rather than vanishing in silence.
 
-### 90. Extending an older encrypted chain with a v9 binary silently makes the whole chain unreadable by older binaries (Bug 212, v0.104.0 regression cycle) — *warning SHIPPED 2026-07-27; strict mode + catalog-recorded version + CI gate still open*
+### 90. Extending an older encrypted chain with a v9 binary silently makes the whole chain unreadable by older binaries (Bug 212, v0.104.0 regression cycle) — *warning + cross-version CI gate SHIPPED v0.104.1; strict mode + catalog-recorded version still open*
 
 **What.** One `backup incremental` run by a FormatVersion-9 binary against a chain whose root is v7 stamps the new segment 9 and exits 0 with no warning at `-l info`. An older sluice can then restore **nothing** from that directory — not the new segment, and not the untouched v7 full it wrote itself — because `lineage.json` pins the segment and a chain is only as readable as its newest link. The new binary restores it row-exact, so nothing is lost; what is lost is the older binary's ability to read anything there.
 
@@ -1832,11 +1832,13 @@ So this is the Bug-207 class again — an unclassified error at a site whose cla
 
 **The class is older than ADR-0181.** `StampCDCPositionBinding` raises a VStream CDC segment to v8 with the same unconditional shape, so any VStream chain rooted before v0.99.228 has had a silently-raised floor since. The warning is deliberately generic (parent version vs. final stamped version) rather than v9-specific, so it covers that instance without a second code path — pinned as its own case in `TestWarnChainFormatVersionRaise_FiresOnlyOnARaise`.
 
-**Still open.** (a) The opt-in strict refusal above. (b) `lineage.json` records no per-segment format version — `Segment` carries `Codec` and `VerbatimExtensionColumns` as precedent for additive catalog fields, and recording the version would make a chain's floor computable without opening every manifest, which is the prerequisite for surfacing it in `backup verify` (no CLI surface reports a format version today — `grep FormatVersion cmd/` returns nothing). (c) The cross-version differential gate.
+**Still open.** (a) The opt-in strict refusal above. (b) `lineage.json` records no per-segment format version — `Segment` carries `Codec` and `VerbatimExtensionColumns` as precedent for additive catalog fields, and recording the version would make a chain's floor computable without opening every manifest, which is the prerequisite for surfacing it in `backup verify` (no CLI surface reports a format version today — `grep FormatVersion cmd/` returns nothing).
 
-**Gate.** The cycle's differential (`workspace/v104/focus1d_upgrade.sh`) is the shape: two binaries, one store, assert what each can read after an extension. It belongs in extended-suites rather than only in the testing repo. This class is invisible to every test sluice has, all of which run one binary against its own output — which is precisely why it reached a release.
+**Gate — SHIPPED v0.104.1.** `internal/pipeline/backup_crossversion_integration_test.go` (`//go:build integration && crossversion`), plus the `crossversion` leg in `extended-suites.yml` and `scripts/crossversion-build.sh`. It is the only place in CI where TWO sluice binaries meet ONE backup store; every other suite runs one binary against its own output, which is exactly why this class shipped. The old binary is *derived*, never hardcoded — the script walks `git tag --sort=-v:refname` and stops at the first tag whose `BackupFormatVersion` is below the working tree's, refusing outright rather than building two copies of one version (a gate that greens against itself is the failure mode). Four cells: forward read, backward refusal, the Bug-212 extend-an-older-chain cell, and an OLD-only control proving the Bug-212 cell fails from the version raise and not the harness. Cell 3 was verified to produce the real mixed chain (`root=7 segments=[5 9]`). The backward-refusal cell also asserts the refusal does NOT blame the passphrase, key or decryption — a v0.103.x binary once told an operator holding the correct passphrase that it was wrong, and an operator handed the wrong cause rotates keys instead of upgrading. Weekly + dispatch, and the leg comment says to dispatch it by hand before tagging any release that bumps `BackupFormatVersion`.
 
-### 91. `schema add-table` reports the deferrable-key refusal under the wrong code and exit status (Bug 213, v0.104.0 regression cycle) — *✅ SHIPPED 2026-07-27 (unreleased at time of writing)*
+**One caveat on that gate.** It has been run locally end to end (all four cells, real Postgres, 78s) but has never executed on Linux CI; the first scheduled or dispatched run is its real proof.
+
+### 91. `schema add-table` reports the deferrable-key refusal under the wrong code and exit status (Bug 213, v0.104.0 regression cycle) — *✅ SHIPPED v0.104.1*
 
 The deferrable-key preflight refusal reaches `schema add-table` with its full prose and remedy, but arrived wrapped as `SLUICE-E-BULKCOPY-TABLE-FAILED` with exit 1, where `sync start` and chain restore report the documented `SLUICE-E-TARGET-DEFERRABLE-KEY` with exit 3. An operator matching on the documented code — which is what the error-codes table tells them to do — would not have matched this one. The refusal was correct and the guidance intact; only the machine-readable half was wrong.
 
@@ -1844,7 +1846,19 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
-### 89. `refuseSignedChain` reports a cancelled context as a probe failure (observed 2026-07-27 on the v0.104.0 tag) — *✅ SHIPPED 2026-07-27 (unreleased at time of writing)*
+### 92. A tightly-bounded `--max-changes` incremental can write a chain segment that captured nothing (observed 2026-07-27) — *open, NOT root-caused*
+
+**Observed.** Building the item-90 cross-version gate, an incremental run with `--max-changes 2` immediately after a prior one wrote a real, chain-linked, correctly-stamped, correctly-parented manifest with `start_position == end_position` and **none of the committed delta in it** — while logging `changes=6`. The identical run with `--max-changes 0` and a time bound picked the delta up. Surfaced as two restore cells returning 3 rows instead of 4; the harness works around it by dropping the bound, documented in the test.
+
+**Not silent loss, on current evidence.** The replication slot did not advance past the missed delta, so a later time-bounded window caught it — a soundness-preserving miss rather than data destruction. That is what keeps this off the critical path. What it costs an operator is subtler: someone building a chain with tight `--max-changes` bounds can accumulate empty segments while believing each captured their writes, and the summary line reports a non-zero change count while doing it.
+
+**One hypothesis already falsified — do not re-derive it.** The obvious story is that `--max-changes` counts every `ir.Change` including `TxBegin`/`TxCommit` framing, so a low bound truncates mid-transaction before any commit lands. **Reading `captureWindow` disproves this:** the cutoff is `totalChanges >= maxChanges && !inTransaction`, which already refuses to close inside a transaction, and the doc comment on `MaxChanges` states that contract explicitly. The framing events *are* counted toward the bound (so `--max-changes 100` is nearer 33 single-row transactions than 100 rows, which is worth documenting on its own), but that alone does not produce an EMPTY window. `changes=6` against a delta this small is itself unexplained and is the thread to pull.
+
+**Second unexplained signal.** `assertDataWindowEndPositionInvariant` exists precisely for the "emptied-data window" class on engines whose positions do not commit after their rows — and it did not fire here. Either the window was not classified as data-bearing, or the invariant does not cover this shape. Whichever it is, it is worth knowing, because that assertion is a load-bearing part of the Bug-184 completeness net.
+
+**How to approach it.** Three-phase protocol, Phase A first: this is exactly the "multiple plausible hypotheses, first guess already wrong" shape the protocol exists for. Instrument `captureWindow` to log each `ir.Change` kind, `totalChanges`, `inTransaction`, `lastPos`, and the flush/return branch taken, then reproduce with `--max-changes 2` against a committed two-transaction delta. Do not write a fix off the counting story above — it has already been checked and does not explain the observation.
+
+### 89. `refuseSignedChain` reports a cancelled context as a probe failure (observed 2026-07-27 on the v0.104.0 tag) — *✅ SHIPPED v0.104.1*
 
 **What.** `BackupStream.refuseSignedChain` (`internal/pipeline/stream.go`) wraps every error from `lineage.ChainIsSigned` as `"backup stream: probe signed chain: %w"`. That includes `context.Canceled`. When a caller cancels during a rollover, the probe is interrupted and `stream.Run` returns an error naming the probe, instead of exiting cleanly — `TestBackupStream_ContextCancel_DuringRollover_CleanExit` asserts the clean exit and caught it.
 
