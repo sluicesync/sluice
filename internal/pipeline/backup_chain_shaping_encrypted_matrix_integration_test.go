@@ -222,27 +222,23 @@ func (f *shapingFixture) restored(t *testing.T) bug214Sums { return bug214Read(t
 // shapingOp is one chain-shaping operation under test. apply runs it
 // against the seeded rotated chain and returns a one-line description
 // for the damage-map log.
+//
+// An operation carrying a CONFIRMED OPEN DEFECT asserts that defect
+// inside its own apply — see `prune` (roadmap item 100) — rather than
+// through a harness-level "known broken" flag. That is deliberate: the
+// two defects this matrix has caught surfaced at different LAYERS (one
+// at restore, one as a coded refusal from the operation itself), and a
+// single "the restore error must contain X" knob can only express one of
+// them, which is exactly how the first version of this cell came to
+// assert a surface the operation no longer has. What must NOT happen is
+// deleting or skipping a cell to get green — a known-and-filed failing
+// cell is worth far more than a matrix trimmed to what works — so a
+// defect-carrying apply still has to fail when the defect changes shape
+// or disappears, and every cell still runs the full round trip and the
+// verify/restore agreement gate below.
 type shapingOp struct {
 	name  string
 	apply func(t *testing.T, f *shapingFixture) string
-
-	// knownBroken, when non-empty, is a substring the RESTORE failure of
-	// this cell must contain, and its presence declares the cell a
-	// CONFIRMED OPEN DEFECT rather than a passing round trip.
-	//
-	// This is an assertion, not a skip, and the difference matters. The
-	// cell still runs end to end; it still requires `verify` and
-	// `restore` to AGREE (both must refuse — a known-broken operation
-	// does not get to keep a green verify); and it FAILS if the restore
-	// starts succeeding, so the expectation cannot rot into a blessing
-	// of the bug. Deleting or skipping the cell to get green is the one
-	// thing that must not happen — a known-and-filed failing cell is
-	// worth far more than a matrix trimmed to what works.
-	knownBroken string
-
-	// knownBrokenRef names where the defect is filed, so the damage-map
-	// log line points somewhere.
-	knownBrokenRef string
 }
 
 // shapingOps is the operation axis. Every one of these RESHAPES a chain
@@ -329,33 +325,104 @@ func shapingOps() []shapingOp {
 			},
 		},
 		{
-			// A CONFIRMED OPEN DEFECT, found by this matrix and NOT
-			// fixed in this pass — see the file's damage-map note.
-			// `backup prune` with a keep-count that trims inside the
-			// floor segment deletes the manifest the first SURVIVING
-			// incremental parents on, and the surviving links no longer
-			// form one chain. It is mode-INDEPENDENT (the plaintext
-			// control fails identically), which is what distinguishes it
-			// from the encrypted-read-path class this file was built for,
-			// and it is why it is reported rather than patched: the safe
-			// repair is a retention-semantics decision (prune must keep
-			// more than asked, or refuse), and re-stitching the parent
-			// pointer — the tempting one-liner — would convert restore's
-			// loud refusal into a SILENT coverage gap.
-			name:           "prune",
-			knownBroken:    "does not chain off preceding link",
-			knownBrokenRef: "roadmap item 95 / found by this matrix 2026-07-28",
+			// A CONFIRMED OPEN DEFECT — roadmap item 100, found by this
+			// matrix — pinned at the surface the operation actually has.
+			//
+			// The defect: `backup prune` with a keep-count that trims
+			// inside the FLOOR segment drops the incrementals the first
+			// surviving one parents on, so the survivors no longer form
+			// one chain (and the events in the gap are simply gone). It
+			// is mode-INDEPENDENT — the plaintext control refuses
+			// identically — which is what distinguishes it from the
+			// encrypted-read-path class this file was built for. It is
+			// reported rather than patched because the safe repair is a
+			// retention-semantics decision (prune must keep more than
+			// asked, or refuse by shape), and re-stitching the parent
+			// pointer — the tempting one-liner — would convert a loud
+			// refusal into a SILENT coverage gap.
+			//
+			// What that costs an operator TODAY is a refusal, not a
+			// broken archive: item 95's readability gate re-walks the
+			// prospective chain at the PRE-COMMIT leg, sees the severed
+			// parent link, and refuses under
+			// SLUICE-E-BACKUP-CHAIN-UNREADABLE / exit 3 with the catalog
+			// unwritten and every file still on disk. So this cell
+			// asserts three things, and each is load-bearing:
+			//
+			//  1. the refusal is CODED — a retention script branching on
+			//     SLUICE-E-* (which docs/operator/error-codes.md tells
+			//     operators to do) can see it, and it exits 3 rather than
+			//     the generic 1 a bare fmt.Errorf produced;
+			//  2. it still names item 100's SHAPE (the severed parent
+			//     link) at the pre-commit stage — so the cell fails if the
+			//     defect changes shape, e.g. when item 100's purpose-built
+			//     within-segment-trim refusal replaces the generic "does
+			//     not walk" prose, forcing the expectation to be revisited
+			//     rather than quietly outliving the bug;
+			//  3. the refusal is INERT — the catalog, the chain-root
+			//     manifest, and (via the round trip the harness runs after
+			//     this returns) the chain's actual restorability are
+			//     exactly as they were. That is the half a message-only
+			//     assertion cannot make, and it is the promise the
+			//     refusal's own prose makes to the operator.
+			name: "prune",
 			apply: func(t *testing.T, f *shapingFixture) string {
+				const keep = 1
 				before := f.segments(t)
-				res, err := backup.PruneChain(context.Background(), f.store, backup.PruneOpts{KeepIncrementals: 1})
+
+				// Non-vacuity, established BEFORE the refusal: --dry-run
+				// returns ahead of the readability gate by design, so it
+				// enumerates what a real run would drop without tripping
+				// it. A refusal over a prune that would have deleted
+				// nothing proves nothing.
+				plan, err := backup.PruneChain(context.Background(), f.store, backup.PruneOpts{
+					KeepIncrementals: keep, DryRun: true,
+				})
 				if err != nil {
-					t.Fatalf("PruneChain: %v", err)
+					t.Fatalf("PruneChain --dry-run: %v", err)
 				}
-				if res.SegmentsDropped < 1 {
-					t.Fatalf("prune dropped no whole segment (%d segments before); this cell would be vacuous "+
-						"— the root-manifest deletion only fires on a whole-segment drop", before)
+				if plan.SegmentsDropped < 1 || len(plan.Pruned) == 0 {
+					t.Fatalf("prune --keep-incrementals=%d planned nothing to drop on a %d-segment chain "+
+						"(segments=%d manifests=%d); this cell would be vacuous",
+						keep, before, plan.SegmentsDropped, len(plan.Pruned))
 				}
-				return fmt.Sprintf("pruned %d whole segment(s) of %d", res.SegmentsDropped, before)
+
+				res, err := backup.PruneChain(context.Background(), f.store, backup.PruneOpts{KeepIncrementals: keep})
+				if err == nil {
+					t.Fatalf("KNOWN-BROKEN cell [prune]: `backup prune --keep-incrementals=%d` now SUCCEEDS "+
+						"(dropped %d of %d segments) — roadmap item 100's within-segment trim appears FIXED. "+
+						"Do not delete this assertion: re-read item 100 and promote the cell to a normal round "+
+						"trip, so the pruned chain's restorability is what gets pinned.",
+						keep, res.SegmentsDropped, before)
+				}
+				coded, ok := sluicecode.FromError(err)
+				if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
+					t.Fatalf("prune's refusal is not %s, so a retention script cannot branch on it "+
+						"(item 96's contract): %v", sluicecode.CodeBackupChainUnreadable, err)
+				}
+				if coded.ExitCode() != sluicecode.ExitRefusal {
+					t.Errorf("refusal ExitCode() = %d; want %d — a re-run will not help, so it must not read as retryable",
+						coded.ExitCode(), sluicecode.ExitRefusal)
+				}
+				// The SHAPE of the filed defect, at the leg that makes the
+				// refusal inert. Change either and this cell must be
+				// revisited — that is its whole job.
+				for _, want := range []string{"pre-commit readability check", "does not chain off preceding link"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("KNOWN-BROKEN cell [prune] refused DIFFERENTLY from the filed defect "+
+							"(roadmap item 100).\n  want substring: %q\n  got: %v", want, err)
+					}
+				}
+				// Inertness, structurally: pre-commit means nothing was
+				// written and nothing deleted.
+				if after := f.segments(t); after != before {
+					t.Errorf("the pre-commit refusal rewrote the catalog: %d segments, want %d (unchanged)", after, before)
+				}
+				if ex, _ := f.store.Exists(context.Background(), lineage.ManifestFileName); !ex {
+					t.Error("the pre-commit refusal deleted the chain-root manifest — the Bug-214/item-95 file it exists to protect")
+				}
+				return fmt.Sprintf("prune of %d segment(s) REFUSED (item 100) as %s/exit %d at the pre-commit leg; chain untouched at %d segments",
+					plan.SegmentsDropped, coded.Code, coded.ExitCode(), before)
 			},
 		},
 	}
@@ -378,9 +445,8 @@ func shapingModes() []struct{ name, mode string } {
 // apply the operation, then VERIFY it, RESTORE it, and compare rows to
 // the source.
 //
-// Damage map as of 2026-07-28 — 15 of 18 cells restore row-exact; the
-// three `prune` cells are a CONFIRMED OPEN DEFECT, asserted as such
-// (see the `prune` entry in [shapingOps]) rather than skipped:
+// Damage map as of 2026-07-28 — all 18 cells round-trip row-exact; the
+// three `prune` cells reach that state through a REFUSAL, not a prune:
 //
 //	rotate                     ×3   green
 //	rotate-then-resume         ×3   green  (per-chain was Bug 215 — RED
@@ -389,17 +455,27 @@ func shapingModes() []struct{ name, mode string } {
 //	rotate-then-stream-resume  ×3   green  (same defect, ordinary restart)
 //	compact                    ×3   green  (Bug 214's cell)
 //	compact-after-rotate       ×3   green
-//	prune                      ×3   RED    mis-stitched lineage after a
-//	                                        keep-count that trims inside the
-//	                                        floor segment — mode-INDEPENDENT
-//	                                        (plaintext fails identically), so
-//	                                        NOT the encrypted-read-path class
+//	prune                      ×3   REFUSED + intact — a keep-count that
+//	                                        trims inside the floor segment
+//	                                        would mis-stitch the lineage
+//	                                        (roadmap item 100, still open),
+//	                                        so item 95's readability gate
+//	                                        refuses it at the pre-commit leg
+//	                                        under SLUICE-E-BACKUP-CHAIN-
+//	                                        UNREADABLE and the chain then
+//	                                        restores exactly as before. The
+//	                                        cell pins the code, the defect's
+//	                                        shape, and the inertness — see
+//	                                        the `prune` entry in [shapingOps]
 //
-// The mode axis is what makes that last row readable at a glance: an
+// The mode axis is what makes each row readable at a glance: an
 // encrypted-read-path defect shows as RED-encrypted / green-plaintext
-// (Bug 215's signature), while prune's uniform red says the breakage is
-// upstream of encryption entirely. A matrix without the plaintext
-// control cannot tell those apart, which is how three of these shipped.
+// (Bug 215's signature), while a uniform result across all three modes
+// says the behaviour is upstream of encryption entirely — which is what
+// prune's row reports, since the mis-stitch it refuses is structural and
+// the plaintext control refuses identically. A matrix without the
+// plaintext control cannot tell those apart, which is how three of these
+// shipped.
 func TestChainShaping_EncryptedRoundTripMatrix(t *testing.T) {
 	const passphrase = "chain-shaping-matrix-passphrase"
 	for _, op := range shapingOps() {
@@ -429,9 +505,10 @@ func TestChainShaping_EncryptedRoundTripMatrix(t *testing.T) {
 				// GATE 2 — verify and restore must agree. This fires
 				// BEFORE the round-trip assertion so the message names
 				// the trap rather than the symptom, and it applies to
-				// KNOWN-BROKEN cells too: an operation that produces an
-				// unrestorable chain does not get to keep a green
-				// verify just because the breakage is filed.
+				// every cell without exception — including one whose
+				// operation carries a filed defect: an operation that
+				// produces an unrestorable chain does not get to keep a
+				// green verify just because the breakage is filed.
 				if verifyErr == nil && !rowsMatch {
 					t.Errorf("VERIFY/RESTORE DISAGREEMENT — `backup verify` returned rc=0 (chunks=%d decrypted=%d) on a chain restore cannot read.\n"+
 						"  cell:     %s / %s (%s)\n"+
@@ -439,27 +516,6 @@ func TestChainShaping_EncryptedRoundTripMatrix(t *testing.T) {
 						"  rows:     got %+v want %+v\n"+
 						"A green verify over an unrestorable chain is worse than no verify: it is the signal operators are told to trust before they need the backup.",
 						verifyRep.Chunks, verifyRep.Authenticated, op.name, m.name, what, restoreErr, got, oracle)
-				}
-
-				// A cell carrying a filed defect asserts the damage
-				// instead of the round trip — and fails if the damage
-				// changes shape or disappears, so the expectation gets
-				// revisited rather than quietly outliving the bug.
-				if op.knownBroken != "" {
-					switch {
-					case restoreErr == nil:
-						t.Fatalf("KNOWN-BROKEN cell [%s / %s] now RESTORES — the defect (%s) appears fixed. "+
-							"Delete the knownBroken expectation and promote this cell to a normal round trip.",
-							op.name, m.name, op.knownBrokenRef)
-					case !strings.Contains(restoreErr.Error(), op.knownBroken):
-						t.Fatalf("KNOWN-BROKEN cell [%s / %s] failed DIFFERENTLY from the filed defect (%s).\n"+
-							"  want substring: %q\n  got: %v",
-							op.name, m.name, op.knownBrokenRef, op.knownBroken, restoreErr)
-					default:
-						t.Logf("DAMAGE (filed, %s) [%s / %s]: %s — restore refuses: %v",
-							op.knownBrokenRef, op.name, m.name, what, restoreErr)
-					}
-					return
 				}
 
 				// GATE 1 — the round trip itself.
