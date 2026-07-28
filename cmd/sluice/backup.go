@@ -1131,8 +1131,8 @@ type BackupStreamCmd struct {
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
 
 	RolloverWindow     time.Duration `help:"Wall-clock cadence each rollover commits at. Window extends to next TxCommit so the chain doesn't end mid-tx." default:"5m" placeholder:"DUR"`
-	RolloverMaxChanges int           `help:"Commit a rollover after this many CDC events queue up (approximate; closes at next TxCommit)." default:"100000" placeholder:"N"`
-	RolloverMaxBytes   int64         `help:"Commit a rollover when buffered chunk bytes cross this ceiling. Default 67108864 (64 MiB)." default:"67108864" placeholder:"BYTES"`
+	RolloverMaxChanges int           `help:"Commit a rollover after this many CDC EVENTS queue up — transaction framing included, so a one-row transaction counts three (approximate; the rollover closes at the next TxCommit, and never before the window has advanced past its own start position, because a resumed pump opens by replaying the transaction its parent ended on)." default:"100000" placeholder:"N"`
+	RolloverMaxBytes   int64         `help:"Commit a rollover when buffered chunk bytes cross this ceiling — transaction framing events are written to the chunk too, so they count toward it. The bound is checked at chunk-flush boundaries, so the buffer may transiently exceed it by up to one chunk, and like --rollover-max-changes it cannot close the rollover before the window has advanced past its own start position (a resumed pump replays the transaction its parent ended on). Default 67108864 (64 MiB)." default:"67108864" placeholder:"BYTES"`
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
 
@@ -1328,12 +1328,25 @@ func (b *BackupStreamStopCmd) Run(_ *Globals) error {
 // archived backups — confirms the bits are still good without needing
 // a target database to restore into.
 //
-// When the chain is encrypted and the operator supplies `--encrypt`
-// + a passphrase / KMS reference, verify additionally performs a
-// decrypt probe on every per-chunk WrappedCEK — the Bug 117 closure.
-// A passphrase rotation mid-chain (per-chunk mode) surfaces here as
-// a "wrong passphrase for chunk X" verify failure instead of a
-// partial-fail at restore-time.
+// Verify has TWO depths and the difference is what a green result
+// promises. Key-less it is sha256-only: the bytes have not rotted, but
+// bytes that hash correctly can still be sealed under a key or a
+// binding the restore path will not reproduce. When the chain is
+// encrypted and the operator supplies `--encrypt` + a passphrase / KMS
+// reference, verify additionally performs the REAL AES-GCM
+// authenticated open of every encrypted chunk — the same CEK and the
+// same AAD binding `restore` uses, in per-chain mode too. A chunk
+// restore cannot read fails HERE, as
+// `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`, rather than during a recovery.
+// (BOTH depths walk the lineage first, the way restore does, so a
+// mis-stitched chain is refused at either.)
+//
+// The reported `decrypted=N` is the honest coverage signal and is why
+// it sits next to `chunks=N`: the pre-Bug-215 probe unwrapped each
+// chunk's own `WrappedCEK` — a field only per-chunk mode populates — so
+// on a default per-chain chain it decrypted no ciphertext at all while
+// still logging `decrypt_probe=true`. Read the count, not just the exit
+// status (roadmap item 97 / Bug 215).
 type BackupVerifyCmd struct {
 	FromDir string `help:"Directory containing the backup to verify (the same directory --output-dir wrote to). Mutually exclusive with --from." placeholder:"DIR"`
 	From    string `help:"URL of the backup to verify (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
@@ -1408,8 +1421,9 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 			// Bug 117 closure (v0.94.1): when --encrypt is on, load the
 			// chain-root manifest so the read envelope re-derives the same
 			// Argon2id KEK the writer used, then thread the envelope into
-			// VerifyBackupWith. SHA-only verify silently accepted per-chunk
-			// passphrase rotation; the decrypt probe refuses it.
+			// the scan. Key-less verify is sha256-only and cannot see a chain
+			// it could not decrypt; with the envelope every encrypted chunk
+			// gets the authenticated open restore performs (Bug 215).
 			rootManifest, err := lineage.ReadRootManifest(runCtx, store)
 			if err != nil {
 				return fmt.Errorf("verify: read root manifest: %w", err)
@@ -1419,13 +1433,13 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 				return err
 			}
 			if envelope == nil && rootManifest != nil && rootManifest.ChainEncryption != nil {
-				// Encrypted chain + no envelope = SHA-only verify (legacy
-				// behavior). Bug 117's silent passphrase-rotation acceptance
-				// is invisible without a decrypt probe — warn the operator
-				// loudly so they know to re-run with `--encrypt` + their
-				// passphrase for full coverage.
+				// Encrypted chain + no envelope = the sha256-only depth. That
+				// depth cannot tell a readable chain from one whose chunks no
+				// longer open (Bug 215, and Bug 117's silent passphrase
+				// rotation before it), so say so loudly rather than let a
+				// green run be read as a restorability claim.
 				slog.WarnContext(
-					runCtx, "backup verify: chain is encrypted but no envelope supplied — running SHA-only verify; passphrase rotation (Bug 117) is undetectable in this mode. Re-run with --encrypt + the chain's passphrase / KMS reference to enable the per-chunk decrypt probe.",
+					runCtx, "backup verify: chain is encrypted but no key material supplied — running the sha256-only depth; this proves the bytes have not rotted, NOT that restore can read them (decrypted=0). Re-run with --encrypt + the chain's passphrase / KMS reference to authenticate-open every chunk under the same key and binding restore uses.",
 					slog.String("kek_mode", rootManifest.ChainEncryption.KEKMode),
 					slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
 				)
@@ -1533,14 +1547,18 @@ type BackupPruneCmd struct {
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
 
-	KeepIncrementals int           `help:"Retain the N most-recent incrementals. Mutually exclusive with --keep-duration." placeholder:"N"`
+	KeepIncrementals int           `help:"Retain the N most-recent incrementals. Retention is SEGMENT-granular: N must land on a segment boundary, because trimming leading incrementals INSIDE the floor segment severs the chain — prune refuses that shape at the pre-commit leg (SLUICE-E-BACKUP-CHAIN-UNREADABLE, exit 3, nothing deleted) and the refusal lists the counts that DO land on a boundary on your chain. A never-rotated (single-segment) chain has no boundary for the flag to land on, so every --keep-incrementals prune of one refuses; use --keep-duration with a cutoff older than every incremental instead. Mutually exclusive with --keep-duration." placeholder:"N"`
 	KeepDuration     time.Duration `help:"Retain incrementals younger than this duration. Mutually exclusive with --keep-incrementals. Examples: 168h (7d), 720h (30d)." placeholder:"DUR"`
 
 	DryRun bool `help:"Report what would be pruned without deleting or rewriting the catalog."`
 
-	// Pruning a SIGNED (ADR-0154) chain renumbers link positions and must
-	// re-sign the survivors; pass --encrypt + the chain's key to enable
-	// that (a signed chain refuses to prune without it).
+	// Two jobs. Pruning a SIGNED (ADR-0154) chain renumbers link positions
+	// and must re-sign the survivors, so a signed chain refuses to prune
+	// without the key. And on ANY encrypted chain the key upgrades prune's
+	// readability gate from "the chain identity survived" to "the chain's
+	// CEK still unwraps" (Bug 214 / roadmap item 95) — the check that stops
+	// a retention run reporting success over a chain it just made
+	// unreadable. Without it the gate says so and degrades.
 	EncryptionFlags
 }
 

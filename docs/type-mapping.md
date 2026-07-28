@@ -362,6 +362,16 @@ PostgreSQL distinguishes a table-level `CONSTRAINT x UNIQUE (cols)` (a `pg_const
 
 **Engine asymmetry (deliberate):** MySQL has no such distinction — a MySQL `UNIQUE KEY` *is* an index under the hood, so MySQL-sourced unique indexes never carry `ConstraintBacked`, and a PG-sourced unique CONSTRAINT lands on a MySQL (or SQLite) target as a unique index — the only shape those engines have. Round-tripping PG → MySQL → PG therefore lands the constraint as a plain unique index; only same-engine PG (and PG backups) preserve constraint identity.
 
+### Constraint NAMES — keeping `ON CONFLICT ON CONSTRAINT` alive (roadmap item 84)
+
+A second, wider distinction rides alongside `ConstraintBacked`: whether an index's `Name` is a real, operator-referenceable constraint identifier or an engine placeholder. `ir.Index.ConstraintNamed` carries it. Only the PG reader sets it, for every `pg_constraint`-owned index — `contype 'p'` and `'u'` alike — because in Postgres a PRIMARY KEY / UNIQUE constraint and its backing index are one catalog object under one name, and that name is what `INSERT ... ON CONFLICT ON CONSTRAINT x` and `ALTER TABLE ... DROP CONSTRAINT x` reference.
+
+- **PG target:** a table's primary key emits as `CONSTRAINT <name> PRIMARY KEY (…)` when the flag is set, so the source's own constraint name survives PG → PG (and PG-backup restore) instead of PG auto-naming the target's key `<table>_pkey`. When it isn't set the bare `PRIMARY KEY (…)` is emitted and PG auto-names it, exactly as before.
+- **MySQL / SQLite sources leave it false, and that is the point.** A MySQL PK index is literally named `PRIMARY` — a fixed sentinel every table shares, not a name an operator chose — and SQLite's primary key has no name at all. Dispatching on the flag rather than on the name TEXT is what keeps `CONSTRAINT "PRIMARY" PRIMARY KEY (…)` from being emitted onto a PG target, where the backing index would claim `PRIMARY` in the per-schema relation namespace and the source's *second* table would fail with `relation "PRIMARY" already exists` (SQLSTATE 42P07).
+- **MySQL-family targets ignore it deliberately, with no per-table WARN.** MySQL parses `CONSTRAINT x PRIMARY KEY` and then discards `x`, so there is nothing to carry; a WARN would fire on every table of every PG → MySQL migration, usually for a name Postgres generated itself.
+- **Distinct from `ConstraintBacked` on purpose.** `ConstraintBacked` drives the UNIQUE *re-emit shape* and is deliberately false for primary keys (which re-emit as `PRIMARY KEY`, not `ADD CONSTRAINT`); `ConstraintNamed` is about the NAME and covers both constraint kinds. Folding the wider carry into the narrower gate is how a previous attribute carry went silent.
+- **Wire:** additive on `Index`'s default struct JSON, like the `Constraint*` attribute flags. A manifest written by an older binary decodes it `false`, which is precisely that binary's own behaviour (an unnamed inline PK) — no backup-format bump.
+
 ### MySQL ENUM and SET → Postgres
 
 **ENUM default:** Postgres `enum` type. Faster, more space-efficient, but rigid (adding a value requires `ALTER TYPE`).
