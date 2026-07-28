@@ -1917,7 +1917,7 @@ Commit `89b89862` added `ConstraintDeferrable` / `ConstraintNullsNotDistinct` / 
 
 **Why no existing test could have caught it.** Every other test in this repo runs ONE binary against its own output, and one binary always agrees with itself about what `Index` marshals to. Only the two-binary cross-version harness (built for the unrelated Bug 212 / item 90) can observe this class at all — and it derives its old tag as *"the newest tag whose `BackupFormatVersion` is strictly lower"*, which is v0.103.2 for the current tree: an E3→E3 pair, in-epoch, green. The tag-derivation rule that makes the item-90 gate non-vacuous is exactly what made it blind here. Worth folding into the fix: the crossversion gate should ALSO pin a pair that straddles a known hash epoch.
 
-### 101. `backup compact --smart-compaction` left a chain restore REFUSES, on the most ordinary shape it exists for — *✅ FIXED 2026-07-28, unreleased — found while fixing item 98, pre-existing and NOT caused by it*
+### 101. `backup compact --smart-compaction` left a chain restore REFUSES, on the most ordinary shape it exists for — *✅ SHIPPED v0.104.3 — found while fixing item 98, pre-existing and NOT caused by it*
 
 **What.** Smart compaction rewrites each merged incremental's change chunks: it buffers row events into per-PK accumulators and flushes them at end-of-incremental. `finalize` called `flushAll` *after* the stream's closing `TxCommit`, so the rewritten stream's last position-bearing event was a collapsed row event — and a collapsed event deliberately carries its chain's **FIRST** position (`rowAccumulator.flush`: `Position: prev.Position`, with its own comment saying so). Any incremental that touched **one row in more than one transaction** therefore ended BELOW its own recorded `EndPosition`, and `chain_restore.go`'s F1 tail-truncation backstop reads exactly that as a truncated change-list and refuses the chain with `SLUICE-E-BACKUP-INCOMPLETE`. Loud, not silent — but it is a **compacted backup that will not restore**, which is the DR-availability class of items 94/95/97.
 
@@ -1933,7 +1933,7 @@ Commit `89b89862` added `ConstraintDeferrable` / `ConstraintNullsNotDistinct` / 
 
 **Scope note.** This landed as a SEPARATE commit on the item-98 branch because item 98's fix cannot be green without it. It is an independent defect in an independent orchestrator and can be reviewed — or split — on its own.
 
-### 100. `backup prune`'s within-segment incremental trim produces a chain that cannot be restored — *✅ FIXED 2026-07-28, unreleased — contract decided: SEGMENT-GRANULAR retention*
+### 100. `backup prune`'s within-segment incremental trim produces a chain that cannot be restored — *✅ SHIPPED v0.104.3 — contract decided: SEGMENT-GRANULAR retention*
 
 **Found while implementing item 95's readability gate; ground-truthed, not inferred.** Prune has two retention shapes. Dropping leading WHOLE segments is restore-safe (the next segment's full is a self-contained base) and is what item 95 fixed. The other shape — dropping leading incrementals INSIDE the floor segment — leaves that segment's full anchored at S with its first surviving incremental starting at S′ > S. The events in (S, S′] are simply gone, so restoring gives you a snapshot at S with changes from S′ forward and a hole in between. The restore path refuses it, correctly and twice: first on the severed parent link (`build lineage: … does not chain off preceding link … — branching/mis-stitched lineage`), then — with a real position comparator — on the forward gap `ValidateFirstIncrementalBoundary` exists to catch.
 
@@ -1981,7 +1981,7 @@ On the PG path it can essentially never fire. Postgres stamps schema anchors at 
 
 Worth confirming against MySQL/VStream before deciding the fix: if the anchor LSN is genuinely unavailable at that point, the invariant may need a different discriminator entirely rather than a repaired comparison. Note this is the same *shape* as the class in item 97 — a guard whose local logic is right and which never reaches the state it guards.
 
-### 98. `BackupStream`'s rollover shares item 92's replay defect on its first rollover after a resume — *✅ FIXED 2026-07-28, unreleased — and the exposure is WIDER than filed, in two ways*
+### 98. `BackupStream`'s rollover shares item 92's replay defect on its first rollover after a resume — *✅ SHIPPED v0.104.3 — and the exposure is WIDER than filed, in two ways*
 
 `BackupStream.captureWindow`'s `changeChunkBuffer.processChange` carries the same `maxChanges > 0 && … && !*inTransaction` cutoff that item 92 fixed in `IncrementalBackup`, and the same exposure: a resumed stream's **first** rollover re-receives the parent's boundary transaction, so a tight `--max-changes` can be satisfied by the replay alone and close a rollover that captured nothing new. Subsequent rollovers ride one open stream and cannot replay, which is why the exposure is first-rollover-only.
 
@@ -2003,7 +2003,7 @@ It already carries a related concept — ADR-0067's `skipThrough` floor using `P
 
 **Deferred, now DONE (2026-07-28, the v0.104.3 docs pass):** the `--rollover-max-changes` CLI help in `cmd/sluice/backup.go` got the one-line clarification item 92 gave `--max-changes` (it counts change EVENTS including transaction framing, and cannot close a rollover before the window has advanced past its own start position). `--rollover-max-bytes` got the advancement half too — `stream.go`'s `RolloverMaxBytes` doc says it carries the same condition for the same reason, and the flag help did not. `docs/value-types.md`'s sizing section was corrected in the same pass: it carved Postgres out of the framing arithmetic entirely, on a claim the PG CDC reader disproves.
 
-### 97. `backup verify` reports a rotation-born encrypted chain healthy that `restore` cannot decrypt (Bug 215, v0.104.2 cycle) — *✅ FIXED 2026-07-28, unreleased — and BOTH halves were worse than filed*
+### 97. `backup verify` reports a rotation-born encrypted chain healthy that `restore` cannot decrypt (Bug 215, v0.104.2 cycle) — *✅ SHIPPED v0.104.3 — and BOTH halves were worse than filed*
 
 **Root cause, from the operator's actual failing chain.** Every rotation-born segment full runs the ordinary `backup full` orchestrator against an EMPTY provisional dir, so `setupChainEncryption` takes its `prior == nil` arm and mints a FRESH chain CEK per segment. Unwrapping every manifest's CEK and trying each against every chunk showed the chain root and all four segments holding four different keys, and the failing chunk decrypting only under the last segment's. **The AAD was byte-correct in every case** — v9 injective, right file, right ordinal. The binding was never the defect; the key was. `alignEncryption` resolved the CEK owner through `b.segStore`, so anything extending the chain after a rotation sealed under the segment's key while the read path used the root's.
 
@@ -2025,7 +2025,7 @@ It already carries a related concept — ADR-0067's `skipThrough` floor using `P
 
 **The gate this class needs, and it is bigger than any one fix.** Every chain-shaping operation needs an encrypted round-trip cell — write encrypted, apply the operation, **restore and compare rows** — in the same matrix, not per-bug as each is found. The v0.104.2 compaction fix added exactly one such cell; the right move is to generalise it into a table of {compact, prune, rotate, rotate-then-resume, compact-after-rotate} × {per-chain, per-chunk, plaintext control} rather than wait for the fourth instance. A second gate worth having alongside it: **`verify` and `restore` must agree** — a fixture where verify passes and restore fails should itself be a test failure, since that disagreement is what turned this from a bug into a trap.
 
-### 96. The compaction readability refusal has no `SLUICE-E-*` code — *✅ IMPLEMENTED (`SLUICE-E-BACKUP-CHAIN-UNREADABLE`); ships in the next release*
+### 96. The compaction readability refusal has no `SLUICE-E-*` code — *✅ IMPLEMENTED (`SLUICE-E-BACKUP-CHAIN-UNREADABLE`); SHIPPED v0.104.3*
 
 `verifyChainReadable`'s refusal (item 94) is a bare `fmt.Errorf`, so `internal/pipeline/backup/chain_readable_gate.go` contains no `sluicecode` reference at all. The prose and the `cp` recovery are good, but a script or agent branching on `SLUICE-E-*` — which is exactly what `docs/operator/error-codes.md` instructs operators to do — cannot detect it, and it exits 1 rather than the refusal status 3.
 
@@ -2035,7 +2035,7 @@ Add the code alongside `CodeTargetDeferrableKey`'s declaration, class `ClassRefu
 
 **Shipped shape.** `SLUICE-E-BACKUP-CHAIN-UNREADABLE`, `ClassRefusal` (exit 3), wrapped INSIDE `verifyChainReadable` rather than at its call sites — the guard's body moved to an unexported `checkChainReadable` and `verifyChainReadable` became the coding wrapper, so a future caller cannot acquire the guard without acquiring its refusal class. One code serves both operations, with the existing `op` naming which refused (`backup compact` / `backup prune`) and `stage` naming which leg (`pre-swap`/`pre-commit` = nothing deleted; `post-sweep` = already deleted, recovery named). The row still needs porting to the sluicesync.com mirror, whose build hard-fails on a count mismatch.
 
-### 95. `backup prune` has Bug 214's defect too, on a path that runs far more often — *✅ IMPLEMENTED (keep the root manifest + the shared readability gate); ships in the next release*
+### 95. `backup prune` has Bug 214's defect too, on a path that runs far more often — *✅ IMPLEMENTED (keep the root manifest + the shared readability gate); SHIPPED v0.104.3*
 
 **Found while fixing item 94, in the same read path, and deliberately left unfixed there because it needs a decision rather than a patch.** `pruneWholeSegments` (`internal/pipeline/backup/chain_prune.go`) deletes `seg.FullManifestPath` through `seg.Store(store)`. For the ROOT segment that store is the lineage root and that path is `manifest.json` — so prune destroys the chain's identity header exactly the way compaction did, and a passphrase-encrypted chain then fails to restore at `unwrap chain cek` while the operator holds the correct passphrase.
 
@@ -2055,7 +2055,7 @@ Add the code alongside `CodeTargetDeferrableKey`'s declaration, class `ClassRefu
 
 **(b) FILED AS ITEM 100, now FIXED (segment-granular retention) — prune's within-segment incremental trim produced a chain that could not be restored, and always had.** Prune's other retention shape drops LEADING incrementals inside the floor segment, leaving that segment's full anchored at S with its first survivor starting at S′ > S. The events in (S, S′] are gone, so the restore path refuses it — first on the severed parent link (`does not chain off preceding link … — branching/mis-stitched lineage`), then on the forward position gap. **Ground-truthed on a real rotated PG chain, in PLAINTEXT, on the pre-fix binary: prune exited 0 and the subsequent `ChainRestore` failed.** This is unrelated to encryption and is not caused by the gate — the gate SURFACES it, refusing pre-commit with nothing deleted, which is strictly better than destroying first and finding out at restore time. But it means `--keep-incrementals` on a NON-rotated (single-segment) chain now always refuses, because every such prune is a within-segment trim. The package doc's claim that "the segment full + the remaining incrementals still form a contiguous chain" is false; that claim is about positions and the trim breaks both the position boundary and the parent link. Deciding the shape — segment-granular retention only, re-anchoring the floor full, or an explicit "this narrows the window and drops the base" refusal with a remedy — is a contract call, filed rather than papered over.
 
-### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *✅ FIXED 2026-07-28, unreleased*
+### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *✅ SHIPPED v0.104.3*
 
 **What.** `backup compact` against an encrypted chain reports success — `groups_merged=1 segments_removed=3`, exit 0 — and the chain is then unrestorable. `verify` and `restore` both refuse at `unwrap chain cek`, zero rows, minutes after that same chain restored 230/230 md5-exact. Pre-existing, NOT a v0.104.1 regression: v0.104.0 and v0.103.2 do the same thing.
 
@@ -2071,7 +2071,7 @@ Add the code alongside `CodeTargetDeferrableKey`'s declaration, class `ClassRefu
 
 **Fix shape.** Stop deleting the root manifest — it is small, and on an encrypted chain it is load-bearing forever. Then add the gate the class actually needs: **compaction must prove the chain still restores before it deletes anything.** A compact that reports success on a chain it has made unreadable is the same shape as the format-floor bug (an operation whose local reasoning is right and whose whole-chain consequence is unimplemented), and the durable answer is the same — a post-compaction readability check, not a more careful sweep. Pin the round trip: encrypted compact → restore, per-chain AND per-chunk, with the plaintext control.
 
-### 93. A PG source table whose only key is a DEFERRABLE PK has no usable replica identity, and adding it to a publication breaks the SOURCE APPLICATION's own writes — silently, from sluice's side (reproduced on v0.103.0/1/2) — *✅ IMPLEMENTED (`SLUICE-E-SOURCE-REPLICA-IDENTITY`); ships in the next release*
+### 93. A PG source table whose only key is a DEFERRABLE PK has no usable replica identity, and adding it to a publication breaks the SOURCE APPLICATION's own writes — silently, from sluice's side (reproduced on v0.103.0/1/2) — *✅ IMPLEMENTED (`SLUICE-E-SOURCE-REPLICA-IDENTITY`); SHIPPED v0.104.2*
 
 **What.** Postgres will not use a deferrable primary key's index as a replica identity (`pg_index.indimmediate = false`), so a table whose only key is a deferrable PK has **no usable replica identity**. `sluice sync start` adds it to `sluice_pub` with `pubupdate=t pubdelete=t`, and from that moment Postgres refuses the **source application's own** `UPDATE` and `DELETE` on that table:
 
@@ -2100,7 +2100,7 @@ ERROR: cannot delete from table "dpk" because it does not have a replica identit
 
 **Knock-on.** `deferrable_key_pg_integration_test.go`'s fixture now sets `ALTER TABLE dpk REPLICA IDENTITY FULL` — the source-side gate runs first and would otherwise refuse before the Bug-211 target-side gate under test could be reached. `relreplident` is not part of the IR and is not carried to the target, so the target's key stays deferrable and that pin still tests exactly what it did.
 
-### 92. A tightly-bounded `--max-changes` incremental can write a chain segment that captured nothing (observed 2026-07-27) — *✅ root-caused + FIXED, pending release*
+### 92. A tightly-bounded `--max-changes` incremental can write a chain segment that captured nothing (observed 2026-07-27) — *✅ SHIPPED v0.104.3*
 
 **Observed.** Building the item-90 cross-version gate, an incremental run with `--max-changes 2` immediately after a prior one wrote a real, chain-linked, correctly-stamped, correctly-parented manifest with `start_position == end_position` and **none of the committed delta in it** — while logging `changes=6`. The identical run with `--max-changes 0` and a time bound picked the delta up. Surfaced as two restore cells returning 3 rows instead of 4; the harness works around it by dropping the bound, documented in the test.
 
