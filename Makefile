@@ -75,7 +75,8 @@ fmt-check: ## Verify formatting without writing changes (exits non-zero if any f
 		exit 1; \
 	fi
 
-coverage-guards: ## Run CI Lint's test-coverage guards (shard + -run-filter)
+coverage-guards: ## Run CI Lint's tree/test guards (tree-hygiene + shard + -run-filter)
+	sh scripts/check-tree-hygiene.sh
 	sh scripts/check-shard-coverage.sh
 	sh scripts/check-run-filter-coverage.sh
 

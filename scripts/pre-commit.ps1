@@ -104,8 +104,8 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# ---- CI coverage guards ----
-# These two run in CI's Lint job; without them here, adding
+# ---- CI Lint guards (tree hygiene + coverage) ----
+# These three run in CI's Lint job; without them here, adding
 # integration-tagged tests in an uncovered package (or a tagged test
 # whose name escapes its job's -run filter) passes the full local gate
 # and only fails in CI — exactly how the flatfile COVERED_PACKAGES miss
@@ -137,10 +137,20 @@ if ($sh) {
     }
 }
 if (-not $shExe) {
-    Red "sh not found (neither on PATH nor under Git for Windows' bin\) - cannot run the CI coverage guards."
-    Write-Host "check-shard-coverage.sh and check-run-filter-coverage.sh are required CI Lint gates;"
-    Write-Host "skipping them locally is how a shard-coverage miss ships to a red main."
+    Red "sh not found (neither on PATH nor under Git for Windows' bin\) - cannot run the CI Lint guards."
+    Write-Host "check-tree-hygiene.sh, check-shard-coverage.sh and check-run-filter-coverage.sh are"
+    Write-Host "required CI Lint gates; skipping them locally is how a shard-coverage miss ships to a red main."
     Write-Host "Install Git for Windows (bundles sh.exe) or put sh on PATH, then re-run."
+    exit 1
+}
+# Tracked scratch/editor detritus (*.tmp, *.bak, *.orig, *.rej, *~,
+# *.swp, .DS_Store, Thumbs.db). Every other gate in this script
+# validates the CODE's health; this one validates the TREE's shape,
+# which is why a .driftblock.tmp fragment swept in by a broad `git add`
+# stayed tracked for a day and was found by a human, not a check.
+& $shExe scripts/check-tree-hygiene.sh
+if ($LASTEXITCODE -ne 0) {
+    Red "check-tree-hygiene failed (a scratch/editor artefact is tracked in git)."
     exit 1
 }
 & $shExe scripts/check-shard-coverage.sh
