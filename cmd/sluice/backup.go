@@ -1475,7 +1475,13 @@ func boolYesNoCLI(b bool) string {
 //   - Operator chooses retention via --keep-incrementals N (keep the
 //     N most-recent) OR --keep-duration DUR (keep anything younger
 //     than DUR). Mutually exclusive; exactly one required.
-//   - The full backup at the chain root is always preserved.
+//   - The full backup at the chain root is preserved on a SINGLE-segment
+//     chain. On a rotated multi-segment chain, prune can drop segment 0
+//     whole — including its manifest, which for a passphrase-encrypted
+//     chain is where the restore side reads the Argon2id salt, so
+//     dropping it makes the chain fail at `unwrap chain cek` holding a
+//     correct passphrase (roadmap item 95, OPEN). This line previously
+//     claimed the root full is ALWAYS preserved; it is not.
 //   - The first surviving incremental gets re-stitched to point at
 //     the full directly (advances the chain's "earliest restorable
 //     position" forward — the dropped incrementals' event windows
