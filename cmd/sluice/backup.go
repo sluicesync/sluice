@@ -1435,7 +1435,7 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 			// when chunks fail — SLUICE-E-BACKUP-CHUNK-CORRUPT (SHA-256
 			// mismatch) / -CHUNK-AUTH-FAILED (decrypt/splice) — so operators
 			// can script `backup verify` against the code, matching restore.
-			total, _, err := backup.VerifyBackupCoded(runCtx, store, backup.VerifyOptions{
+			rep, err := backup.VerifyBackupCodedReport(runCtx, store, backup.VerifyOptions{
 				Envelope:         envelope,
 				VerifyKey:        verifyKey,
 				RequireSignature: v.RequireSignature,
@@ -1443,16 +1443,24 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 			if err != nil {
 				return err
 			}
+			// Bug 215: `decrypted` is the honest signal, and it is
+			// reported alongside the chunk total precisely because
+			// `decrypt_probe=true` used to mean nothing more than "a key
+			// was supplied". Every encrypted chunk is now GCM-opened
+			// under the key + binding the restore path would use, so a
+			// non-zero `decrypted` is the claim that verify and restore
+			// agree.
 			slog.InfoContext(
 				runCtx, "backup verify: all chunks OK",
-				slog.Int("chunks", total),
+				slog.Int("chunks", rep.Chunks),
+				slog.Int("decrypted", rep.Authenticated),
 				slog.Bool("decrypt_probe", envelope != nil),
 			)
 			sink.PhaseCompleted(backup.VerifyPhaseCheck)
 			sink.Summary(progress.Result{Fields: []progress.Field{
-				{Label: "Chunks", Value: progress.HumanCount(int64(total))},
+				{Label: "Chunks", Value: progress.HumanCount(int64(rep.Chunks))},
 				{Label: "Mismatched", Value: "0"},
-				{Label: "Decrypt probe", Value: boolYesNoCLI(envelope != nil)},
+				{Label: "Decrypted", Value: progress.HumanCount(int64(rep.Authenticated))},
 			}})
 			return nil
 		})

@@ -89,16 +89,28 @@ The Phase 6.1 default is the NIST-recommended Argon2id starting point:
 
 These are recorded in the manifest's `ChainEncryption.Argon2id` field, so restore-side derivation matches the backup's. Future revisions may rotate the defaults forward; older chains stay decryptable because the manifest records the actual params used.
 
-## Backup verification without the passphrase
+## Backup verification, with and without the passphrase
 
-`sluice backup verify` runs sha256-only integrity checks against ciphertext bytes. **No passphrase is needed.** Run it from a cron probe to confirm archived backups stay intact without distributing the encryption key to the verification host.
+`sluice backup verify` has two depths, and the difference matters for what a green result actually promises.
+
+**Without key material** it runs sha256-only integrity checks against ciphertext bytes. **No passphrase is needed.** Run it from a cron probe to confirm archived backups stay intact without distributing the encryption key to the verification host.
 
 ```bash
 sluice backup verify --from=s3://my-bucket/backups/2026-05-09/
-# Verifies every chunk's SHA-256 against the manifest.
+# Verifies every chunk's SHA-256 against the manifest. Reports decrypted=0.
 ```
 
-A future enhancement (`--decrypt-verify`) will offer a deeper "decrypt + re-hash plaintext" check; v0.22.0 ships sha256-only.
+That mode proves the bytes have not rotted. It cannot prove the chain is READABLE — bytes that hash correctly can still be sealed under a key or a binding the restore path will not reproduce.
+
+**With `--encrypt` + the chain's key material** it additionally performs the real AES-GCM authenticated open of every encrypted chunk, using the same key and the same binding the restore path would use, and walks the lineage the way `restore` does before it starts. This is the mode to run before you trust a DR archive:
+
+```bash
+sluice backup verify --from=s3://my-bucket/backups/2026-05-09/ \
+  --encrypt --encryption-passphrase-env=SLUICE_BACKUP_PASSPHRASE
+# backup verify: all chunks OK  chunks=42 decrypted=42
+```
+
+Read the `decrypted=` count, not just the exit status: it is how many chunks were actually opened. `decrypted=0` on an encrypted chain means you got the sha256-only depth. (Through v0.104.2 this line was a bare `decrypt_probe=true` that meant only "a key was supplied" — on the default per-chain mode no chunk was ever opened, and a chain whose tail could not be decrypted verified green. See roadmap item 97 / Bug 215.)
 
 ## Recovery posture
 

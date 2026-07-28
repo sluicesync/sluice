@@ -37,11 +37,11 @@ func TestAlignEncryption_MismatchIsCoded(t *testing.T) {
 
 	align := map[string]func(enc *lineage.BackupEncryption) ([]byte, error){
 		"incremental": func(enc *lineage.BackupEncryption) ([]byte, error) {
-			b := &IncrementalBackup{segStore: newMemStore(), Encryption: enc}
+			b := &IncrementalBackup{Store: newMemStore(), Encryption: enc}
 			return b.alignEncryption(ctx, encryptedParent)
 		},
 		"stream": func(enc *lineage.BackupEncryption) ([]byte, error) {
-			b := &BackupStream{segStore: newMemStore(), Encryption: enc}
+			b := &BackupStream{Store: newMemStore(), Encryption: enc}
 			return b.alignEncryption(ctx, encryptedParent)
 		},
 	}
@@ -51,11 +51,11 @@ func TestAlignEncryption_MismatchIsCoded(t *testing.T) {
 	plaintextParent := &irbackup.Manifest{Kind: "full"}
 	alignAgainst := map[string]func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error){
 		"incremental": func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error) {
-			b := &IncrementalBackup{segStore: newMemStore(), Encryption: enc}
+			b := &IncrementalBackup{Store: newMemStore(), Encryption: enc}
 			return b.alignEncryption(ctx, parent)
 		},
 		"stream": func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error) {
-			b := &BackupStream{segStore: newMemStore(), Encryption: enc}
+			b := &BackupStream{Store: newMemStore(), Encryption: enc}
 			return b.alignEncryption(ctx, parent)
 		},
 	}

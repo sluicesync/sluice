@@ -1415,10 +1415,20 @@ type VerifyOptions struct {
 	// chunk-naming error so the operator can identify the rotation
 	// point before attempting restore.
 	//
-	// Per-chain mode is also probed (unwrap the chain-level CEK
-	// once up-front) so a fully-wrong passphrase fails fast with a
-	// single clear error rather than 0 verify failures + a
-	// restore-time surprise.
+	// Bug 215 widened this from a WRAP probe to an authenticated OPEN
+	// of every encrypted chunk. Unwrapping a chunk's own WrappedCEK
+	// only ever proved the key material was right, and only in
+	// per-chunk mode — per-chain chunks carry no wrap of their own, so
+	// the historical probe was a no-op on the DEFAULT mode and the
+	// whole run decrypted exactly one thing: the chain-root CEK. Now
+	// each chunk's ciphertext is GCM-opened under the key AND the
+	// binding [ChainRestore] would use, so a chunk sealed under the
+	// wrong CEK (Bug 215) or the wrong AAD (a splice, a relabelled
+	// parent table) fails verify instead of surviving to a recovery.
+	//
+	// The chain-level unwrap still runs first, so a fully-wrong
+	// passphrase fails fast with a single clear error rather than one
+	// failure per chunk.
 	//
 	// Must match the chain root's recorded KEKMode when set; a
 	// mismatch returns an irrecoverable error from VerifyBackup.
@@ -1488,14 +1498,43 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 // The count-only [VerifyBackupWith] / [VerifyBackup] keep their (total,
 // failed, nil) contract for callers that inspect the failed count directly.
 func VerifyBackupCoded(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
+	rep, err := VerifyBackupCodedReport(ctx, store, opts)
+	return rep.Chunks, rep.Failed, err
+}
+
+// VerifyReport is the per-run tally `sluice backup verify` renders.
+type VerifyReport struct {
+	// Chunks is every chunk referenced by every walked manifest.
+	Chunks int
+
+	// Failed aggregates chunk failures + manifest/lineage signature
+	// failures, matching [VerifyBackupWith]'s second return.
+	Failed int
+
+	// Authenticated is how many chunks had their CIPHERTEXT actually
+	// AES-GCM-opened under the key + binding the restore path would
+	// use. Reported separately from Chunks because the difference is
+	// exactly what Bug 215 hid: pre-fix this was 0 on every per-chain
+	// chain while the CLI still logged `decrypt_probe=true`, so
+	// "verified" meant "the bytes hash correctly and the passphrase
+	// opens the root wrap" — not "restore can read this".
+	Authenticated int
+}
+
+// VerifyBackupCodedReport is [VerifyBackupCoded] with the full tally,
+// so the CLI can report how much of the chain was actually decrypted
+// rather than just that a key was supplied.
+func VerifyBackupCodedReport(ctx context.Context, store irbackup.Store, opts VerifyOptions) (VerifyReport, error) {
 	tally, err := verifyBackupScan(ctx, store, opts)
-	if err != nil {
-		return tally.total, tally.failed(), err
+	rep := VerifyReport{Chunks: tally.total, Failed: tally.failed(), Authenticated: tally.authenticated}
+	switch {
+	case err != nil:
+		return rep, err
+	case tally.failed() == 0:
+		return rep, nil
+	default:
+		return rep, aggregateVerifyError(tally)
 	}
-	if tally.failed() == 0 {
-		return tally.total, 0, nil
-	}
-	return tally.total, tally.failed(), aggregateVerifyError(tally)
 }
 
 // aggregateVerifyError wraps the verify-failure summary in the right
@@ -1549,11 +1588,12 @@ func verifyFailureSummary(total, chunkFailed, sigFailed int) error {
 // chunk-failure kind(s) fired so the coded entrypoint can pick the
 // right Bug-185 Refusal code.
 type verifyScanTally struct {
-	total       int  // chunks referenced by the walked manifests
-	chunkFailed int  // per-chunk SHA / decrypt / splice failures (of total)
-	sigFailed   int  // manifest/lineage signature failures (not chunks)
-	sawCorrupt  bool // a SHA-256 mismatch fired
-	sawAuth     bool // a decrypt/GCM-auth failure or plaintext splice fired
+	total         int  // chunks referenced by the walked manifests
+	chunkFailed   int  // per-chunk SHA / decrypt / splice failures (of total)
+	sigFailed     int  // manifest/lineage signature failures (not chunks)
+	authenticated int  // chunks whose ciphertext was actually GCM-opened
+	sawCorrupt    bool // a SHA-256 mismatch fired
+	sawAuth       bool // a decrypt/GCM-auth failure or plaintext splice fired
 }
 
 // failed is the aggregate count the [VerifyBackupWith] contract exposes:
@@ -1587,13 +1627,32 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				fmt.Errorf("verify: manifest %q: %w", rec.Path, verr))
 		}
 	}
+	// The chain must be WALKABLE, not just hash-clean. `restore` builds
+	// the lineage first and refuses a mis-stitched one before anything
+	// else; verify predicting restore has to make the same call in the
+	// same order, or it reports a chain healthy that restore will not
+	// start on. Found by the chain-shaping matrix: `backup prune` with a
+	// keep-count that trims INSIDE the floor segment leaves the first
+	// surviving incremental parented on a manifest it just deleted, and
+	// pre-fix `backup verify` returned rc=0 `all chunks OK` on it — every
+	// chunk really was intact, and the chain really was unrestorable.
+	//
+	// The comparator is nil deliberately: it gates only the POSITION
+	// comparisons, which need a target engine verify does not have.
+	// Nil therefore makes this check a strict subset of the one restore
+	// runs, so verify can never refuse a chain restore would accept.
+	if _, cerr := lineage.BuildLineageChain(ctx, store, nil); cerr != nil {
+		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+			"this chain cannot be restored as it stands — restore from an intact copy; if a prune/compact produced it, the surviving links no longer form one chain",
+			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
+	}
+
 	// Bug 117 closure: when an envelope is supplied AND the chain
 	// root records ChainEncryption, validate the chain-level
 	// envelope eagerly so the operator gets a single clear "wrong
-	// passphrase / wrong KMS key" error up front. For per-chain
-	// mode this is also the only decrypt probe per verify run; for
-	// per-chunk mode it confirms the operator's envelope is
-	// well-formed before per-chunk probes run in the chunk loop.
+	// passphrase / wrong KMS key" error up front, before the
+	// per-chunk authenticated opens in the loop below.
+	prober := &chunkAuthProber{env: opts.Envelope}
 	if opts.Envelope != nil {
 		rootEnc := records[0].Manifest.ChainEncryption
 		if rootEnc == nil {
@@ -1620,11 +1679,13 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		if len(rootEnc.WrappedCEK) > 0 {
 			// ADR-0152 chokepoint: bound unwrap for v5+ roots +
 			// the Azure key-version retarget (audit N-9).
-			if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
+			cek, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest)
+			if uerr != nil {
 				return verifyScanTally{}, fmt.Errorf(
 					"verify: unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, uerr,
 				)
 			}
+			prober.rootCEK = cek
 		} else {
 			// Per-chunk mode: retarget the envelope's key version
 			// before the per-chunk probes in the loop below.
@@ -1639,11 +1700,12 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	tally.sigFailed = verifyBackupSignatures(ctx, store, records, opts)
 
 	// SEC-MIRROR follow-up: an encrypted chain must not carry a plaintext
-	// chunk. verifyChunk is SHA-only and ProbeChunkDecrypt no-ops on a nil
-	// Encryption, so a plaintext-spliced chunk (the exact tamper restore/broker
-	// now refuse) would otherwise pass `backup verify` GREEN and only fail at
-	// restore. Flag it here so verify catches what restore catches. ChainEncryption
-	// lives on the chain root (records[0]); incrementals inherit it by reference.
+	// chunk. The chunk scan below is SHA + authenticated-open, and both
+	// no-op on a chunk with nil Encryption, so a plaintext-spliced chunk
+	// (the exact tamper restore/broker now refuse) would otherwise pass
+	// `backup verify` GREEN and only fail at restore. Flag it here so
+	// verify catches what restore catches. ChainEncryption lives on the
+	// chain root (records[0]); incrementals inherit it by reference.
 	chainEncrypted := len(records) > 0 && records[0].Manifest.ChainEncryption != nil
 	plaintextSplice := func(manifestPath, kind, file string) {
 		tally.chunkFailed++
@@ -1652,90 +1714,173 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			slog.String("manifest", manifestPath), slog.String("kind", kind), slog.String("file", file),
 			slog.String("error", "chunk carries no encryption metadata on an encrypted chain — refusing (SLUICE-E-BACKUP-CHUNK-AUTH-FAILED at restore)"))
 	}
+	scan := func(rec lineage.SegmentRecord, kind, table, file string, cek, aad []byte, chunk *irbackup.ChunkInfo) {
+		tally.total++
+		if chainEncrypted && chunk.Encryption == nil {
+			plaintextSplice(rec.Path, kind, file)
+			return
+		}
+		segStore := rec.Segment.Store(store)
+		opened, err := verifyChunkAuthenticated(ctx, segStore, chunk, cek, aad)
+		if err != nil {
+			tally.chunkFailed++
+			classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
+			slog.ErrorContext(
+				ctx, "verify: chunk failed",
+				slog.String("manifest", rec.Path),
+				slog.String("kind", kind),
+				slog.String("table", table),
+				slog.String("file", file),
+				slog.String("error", err.Error()),
+			)
+			return
+		}
+		if opened {
+			tally.authenticated++
+		}
+		slog.DebugContext(
+			ctx, "verify: chunk OK",
+			slog.String("manifest", rec.Path),
+			slog.String("kind", kind),
+			slog.String("table", table),
+			slog.String("file", file),
+		)
+	}
 
 	for _, rec := range records {
 		manifest := rec.Manifest
-		// Chunk files are addressed relative to the segment's store
-		// (Dir-prefixed). verify only rehashes bytes — codec is
-		// irrelevant for a byte-level SHA check.
-		segStore := rec.Segment.Store(store)
 		// Row chunks (full backups).
 		for _, table := range manifest.Tables {
 			for _, chunk := range table.Chunks {
-				tally.total++
-				if chainEncrypted && chunk.Encryption == nil {
-					plaintextSplice(rec.Path, "row chunk ("+table.Name+")", chunk.File)
-					continue
-				}
-				if err := verifyChunk(ctx, segStore, chunk); err != nil {
+				cek, aad, err := prober.rowChunk(manifest, chunk, table.Schema, table.Name)
+				if err != nil {
+					tally.total++
 					tally.chunkFailed++
-					classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
-					slog.ErrorContext(
-						ctx, "verify: chunk failed",
-						slog.String("manifest", rec.Path),
-						slog.String("table", table.Name),
-						slog.String("file", chunk.File),
-						slog.String("error", err.Error()),
-					)
+					tally.sawAuth = true
+					slog.ErrorContext(ctx, "verify: cannot resolve the chunk key the restore path would use",
+						slog.String("manifest", rec.Path), slog.String("table", table.Name),
+						slog.String("file", chunk.File), slog.String("error", err.Error()))
 					continue
 				}
-				if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
-					tally.chunkFailed++
-					tally.sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
-					slog.ErrorContext(
-						ctx, "verify: chunk decrypt probe failed",
-						slog.String("manifest", rec.Path),
-						slog.String("table", table.Name),
-						slog.String("file", chunk.File),
-						slog.String("error", perr.Error()),
-					)
-					continue
-				}
-				slog.DebugContext(
-					ctx, "verify: chunk OK",
-					slog.String("manifest", rec.Path),
-					slog.String("table", table.Name),
-					slog.String("file", chunk.File),
-				)
+				scan(rec, "row chunk", table.Name, chunk.File, cek, aad, chunk)
 			}
 		}
 		// Change chunks (incremental backups).
-		for _, chunk := range manifest.ChangeChunks {
-			tally.total++
-			if chainEncrypted && chunk.Encryption == nil {
-				plaintextSplice(rec.Path, "change chunk", chunk.File)
-				continue
-			}
-			if err := verifyChunk(ctx, segStore, chunk); err != nil {
+		for i, chunk := range manifest.ChangeChunks {
+			cek, aad, err := prober.changeChunk(manifest, chunk, i)
+			if err != nil {
+				tally.total++
 				tally.chunkFailed++
-				classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
-				slog.ErrorContext(
-					ctx, "verify: change chunk failed",
-					slog.String("manifest", rec.Path),
-					slog.String("file", chunk.File),
-					slog.String("error", err.Error()),
-				)
+				tally.sawAuth = true
+				slog.ErrorContext(ctx, "verify: cannot resolve the chunk key the restore path would use",
+					slog.String("manifest", rec.Path), slog.String("file", chunk.File),
+					slog.String("error", err.Error()))
 				continue
 			}
-			if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
-				tally.chunkFailed++
-				tally.sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
-				slog.ErrorContext(
-					ctx, "verify: change chunk decrypt probe failed",
-					slog.String("manifest", rec.Path),
-					slog.String("file", chunk.File),
-					slog.String("error", perr.Error()),
-				)
-				continue
-			}
-			slog.DebugContext(
-				ctx, "verify: change chunk OK",
-				slog.String("manifest", rec.Path),
-				slog.String("file", chunk.File),
-			)
+			scan(rec, "change chunk", "", chunk.File, cek, aad, chunk)
 		}
 	}
 	return tally, nil
+}
+
+// chunkAuthProber resolves, per chunk, the exact (CEK, AAD) pair the
+// RESTORE path would use — so `backup verify` performs the same
+// authenticated open restore performs, and the two can no longer
+// disagree about whether a chain is readable.
+//
+// Bug 215 is why this type exists. Pre-fix, verify's "decrypt probe"
+// was [lineage.ProbeChunkDecrypt], which unwraps a chunk's OWN
+// WrappedCEK — a field only PER-CHUNK mode populates. On the default
+// PER-CHAIN chain it returned nil immediately for every chunk, so the
+// only decryption a whole `backup verify --encrypt` run performed was
+// the single chain-root CEK unwrap above. `decrypt_probe=true` meant
+// "an envelope was supplied", not "a chunk was opened": verify reported
+// `all chunks OK chunks=10 decrypt_probe=true` on a chain whose tail
+// `restore` could not decrypt at all. Even in per-chunk mode the probe
+// only proved the WRAP opened, never that the ciphertext authenticated
+// under it — so no mode caught a wrong CEK or a wrong AAD.
+//
+// The two key sources are NOT symmetric, and that asymmetry is the
+// contract, not an accident (see [lineage.ChainRootEncryption]):
+//
+//   - ROW chunks are read by [ChainRestore.applyFull], which scopes a
+//     [Restore] to the SEGMENT store — so the key is the SEGMENT full's
+//     own chain header. Every rotation-born segment full mints its own.
+//   - CHANGE chunks are read by [ChainRestore.streamOneChangeChunk]
+//     using the single chain-root CEK, whatever segment they live in.
+type chunkAuthProber struct {
+	env crypto.EnvelopeEncryption
+
+	// rootCEK is the chain-root's per-chain CEK: the key
+	// [ChainRestore] decrypts EVERY incremental's change chunks with.
+	// nil for plaintext chains and for per-chunk mode.
+	rootCEK []byte
+
+	// segCEK memoizes the per-chain CEK of each segment full already
+	// unwrapped, keyed by the manifest pointer whose header carries it.
+	segCEK map[*irbackup.Manifest][]byte
+}
+
+// rowChunk returns the (CEK, AAD) [Restore] would open chunk with.
+func (p *chunkAuthProber) rowChunk(owner *irbackup.Manifest, chunk *irbackup.ChunkInfo, schema, table string) (cek, aad []byte, err error) {
+	cek, err = p.ownerCEK(owner, chunk)
+	if err != nil || cek == nil {
+		return nil, nil, err
+	}
+	return cek, irbackup.ChunkAADFor(owner, chunk, schema, table), nil
+}
+
+// changeChunk returns the (CEK, AAD) [ChainRestore] would open chunk
+// with. index is the chunk's ordinal in owner.ChangeChunks — part of
+// the binding, because change-REPLAY order is semantic.
+func (p *chunkAuthProber) changeChunk(owner *irbackup.Manifest, chunk *irbackup.ChunkInfo, index int) (cek, aad []byte, err error) {
+	if p.env == nil || chunk == nil || chunk.Encryption == nil {
+		return nil, nil, nil
+	}
+	if len(chunk.Encryption.WrappedCEK) > 0 {
+		cek, err = p.env.UnwrapCEK(chunk.Encryption.WrappedCEK)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unwrap chunk cek (passphrase rotated mid-chain?): %w", err)
+		}
+	} else {
+		if p.rootCEK == nil {
+			return nil, nil, errors.New("encrypted change chunk but the chain root records no per-chain CEK")
+		}
+		cek = p.rootCEK
+	}
+	return cek, irbackup.ChangeChunkAADFor(owner, chunk, index), nil
+}
+
+// ownerCEK resolves the key for a chunk whose owning manifest carries
+// the chain header it was sealed under (a full's row chunks). Per-chunk
+// wraps win; otherwise the owner manifest's own per-chain CEK is
+// unwrapped once and memoized.
+func (p *chunkAuthProber) ownerCEK(owner *irbackup.Manifest, chunk *irbackup.ChunkInfo) ([]byte, error) {
+	if p.env == nil || chunk == nil || chunk.Encryption == nil {
+		return nil, nil
+	}
+	if len(chunk.Encryption.WrappedCEK) > 0 {
+		cek, err := p.env.UnwrapCEK(chunk.Encryption.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("unwrap chunk cek (passphrase rotated mid-chain?): %w", err)
+		}
+		return cek, nil
+	}
+	if cek, ok := p.segCEK[owner]; ok {
+		return cek, nil
+	}
+	if owner == nil || owner.ChainEncryption == nil || len(owner.ChainEncryption.WrappedCEK) == 0 {
+		return nil, errors.New("encrypted row chunk but its manifest records no per-chain CEK")
+	}
+	cek, err := lineage.UnwrapChainCEK(p.env, owner.ChainEncryption.WrappedCEK, owner)
+	if err != nil {
+		return nil, fmt.Errorf("unwrap segment chain cek (%s): %w", lineage.CEKUnwrapHint, err)
+	}
+	if p.segCEK == nil {
+		p.segCEK = make(map[*irbackup.Manifest][]byte)
+	}
+	p.segCEK[owner] = cek
+	return cek, nil
 }
 
 // classifyChunkFailure inspects a per-chunk verify error's coded class and
@@ -1786,16 +1931,52 @@ func validateManifestStructure(m *irbackup.Manifest) error {
 	return nil
 }
 
-// verifyChunk fetches a chunk and recomputes its SHA-256, returning
-// nil on match or a wrapped [ErrChunkHashMismatch] on mismatch. It routes
-// through [fetchChunkVerified] so a transient short read is retried rather
-// than reported as a false mismatch (the same robustness the restore
-// chunk-read path gained); a genuine at-rest corruption persists across
-// the retries and still surfaces loudly.
-func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
+// verifyChunkAuthenticated fetches a chunk and recomputes its SHA-256
+// (returning a wrapped [ErrChunkHashMismatch] on mismatch), then — when
+// cek is non-nil — performs the REAL authenticated decryption the
+// restore path performs: the ciphertext is AES-GCM-opened under
+// (cek, aad), so a chunk sealed with a key or a binding the restore path
+// will not reproduce fails HERE instead of during a recovery (Bug 215).
+//
+// The fetch routes through [blobcodec.FetchChunkVerified] so a transient
+// short read is retried rather than reported as a false mismatch (the
+// same robustness the restore chunk-read path gained); a genuine at-rest
+// corruption persists across the retries and still surfaces loudly.
+//
+// It rides the same [crypto.DecryptChunkWithAAD] primitive
+// [blobcodec.NewChunkReader] does, deliberately: the defect this closes
+// is verify and restore DISAGREEING, so sharing the decrypt primitive is
+// what makes agreement structural rather than reviewed. (The independent-
+// reader rule in CLAUDE.md is about catching writer bugs with a
+// second implementation; it does not apply to a check whose whole
+// purpose is to be byte-identical to the consumer it predicts.) The
+// codec layer above it is NOT re-run — GCM authenticates the entire
+// ciphertext, so the open is the complete answer to "can restore read
+// this", and skipping decompression keeps the added cost to one AES pass
+// over bytes verify already had in memory for the SHA.
+// It returns opened=true only when a real AES-GCM open happened, so the
+// reported "decrypted" count cannot drift away from the work actually
+// done — a caller-inferred count would keep claiming coverage after a
+// refactor removed the open, which is the precise failure mode
+// `decrypt_probe=true` had.
+func verifyChunkAuthenticated(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo, cek, aad []byte) (opened bool, err error) {
 	rc, err := blobcodec.FetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
 	if err != nil {
-		return lineage.CodeChunkHashError(err)
+		return false, lineage.CodeChunkHashError(err)
 	}
-	return lineage.CodeChunkHashError(rc.Close())
+	if cek == nil {
+		return false, lineage.CodeChunkHashError(rc.Close())
+	}
+	body, rerr := io.ReadAll(rc)
+	cerr := rc.Close()
+	if rerr != nil {
+		return false, lineage.CodeChunkHashError(rerr)
+	}
+	if cerr != nil {
+		return false, lineage.CodeChunkHashError(cerr)
+	}
+	if _, derr := crypto.DecryptChunkWithAAD(body, cek, aad); derr != nil {
+		return false, lineage.CodeChunkAuthError(fmt.Errorf("authenticated decryption of chunk %q failed — the restore path cannot read it: %w", chunk.File, derr))
+	}
+	return true, nil
 }

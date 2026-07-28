@@ -177,9 +177,24 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	if got.RestorableFromSegment != 0 {
 		t.Errorf("RestorableFromSegment = %d; want 0 (re-based to seg-1)", got.RestorableFromSegment)
 	}
-	// seg0 full + its chunks are gone; seg-1 full survives.
-	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); ex {
-		t.Error("seg0 root full not deleted after whole-segment prune")
+	// seg0's DATA chunks are gone, but its manifest survives BECAUSE IT
+	// IS THE LINEAGE ROOT — roadmap item 95 / Bug 214's defect on the
+	// prune path. That file is the chain's identity header: ADR-0152
+	// binds the chain CEK's wrap to it, and a passphrase chain's
+	// Argon2id salt exists nowhere else, so deleting it made every
+	// REMAINING segment unrestorable (`unwrap chain cek`, with the
+	// correct passphrase in hand) behind a green exit 0. This assertion
+	// was inverted before the fix; that is exactly how the defect
+	// survived — the deletion was pinned as intended behaviour.
+	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); !ex {
+		t.Error("prune deleted the LINEAGE-ROOT manifest — an encrypted chain would now fail restore at `unwrap chain cek` (item 95)")
+	}
+	// Only the identity header is spared: seg0's incrementals — real
+	// retention weight, and nothing's identity — are genuinely gone.
+	for _, p := range []string{"manifests/incr-01.json", "manifests/incr-02.json"} {
+		if ex, _ := store.Exists(context.Background(), p); ex {
+			t.Errorf("seg0 incremental %s survived a whole-segment prune; the root-manifest carve-out must be exactly one file", p)
+		}
 	}
 	if ex, _ := store.Exists(context.Background(), "seg-1/manifest.json"); !ex {
 		t.Error("seg-1 full must survive (it is the new restore base)")

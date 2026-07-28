@@ -310,14 +310,34 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	return res, nil
 }
 
+// isLineageRootManifest reports whether seg's full manifest IS the
+// lineage root's `manifest.json` — the chain's identity header, not a
+// segment artifact (see [pruneWholeSegments]'s Bug-214 note).
+func isLineageRootManifest(seg *lineage.Segment) bool {
+	return seg.Dir == "" && seg.FullManifestPath == lineage.ManifestFileName
+}
+
 // pruneWholeSegments physically deletes every segment in
-// [cat.RestorableFromSegment, floorSeg): each segment's full manifest +
-// its data chunks and every incremental + its change chunks. Records the
-// dropped paths and chunk-delete count on res (and bumps
-// res.SegmentsDropped per segment). DryRun records the paths without
-// deleting. A segment full is a self-contained snapshot, so dropping
-// whole segments strictly older than the floor is unconditionally
-// restore-safe.
+// [cat.RestorableFromSegment, floorSeg): each segment's data chunks and
+// every incremental + its change chunks, plus the segment's full
+// manifest — EXCEPT at the lineage root. Records the dropped paths and
+// chunk-delete count on res (and bumps res.SegmentsDropped per
+// segment). DryRun records the paths without deleting. A segment full is
+// a self-contained snapshot, so dropping whole segments strictly older
+// than the floor is unconditionally restore-safe.
+//
+// The lineage-root `manifest.json` is DELIBERATELY KEPT (roadmap item 95
+// — Bug 214's defect on the prune path, and prune runs on a retention
+// SCHEDULE where compaction is occasional maintenance). It is not
+// segment 0's spare copy, it is the CHAIN'S IDENTITY, resolved by
+// absolute path at the lineage root and never through the catalog:
+// ADR-0152 binds the chain CEK's wrap to it, and for a passphrase chain
+// the Argon2id salt the restore side re-derives the KEK from is recorded
+// ONLY there. Delete it and `sluice restore` fails at `unwrap chain cek`
+// while the operator holds the correct passphrase — a green `prune`
+// exit 0 that silently revoked readability for every remaining segment.
+// Its DATA chunks are still swept; what survives is a few KiB of header
+// whose only job is to keep the chain openable.
 func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, floorSeg int, dryRun bool, res *PruneResult) {
 	for si := cat.RestorableFromSegment; si < floorSeg; si++ {
 		seg := &cat.Segments[si]
@@ -335,7 +355,7 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 				}
 			}
 		}
-		if !dryRun {
+		if !dryRun && !isLineageRootManifest(seg) {
 			_ = ss.Delete(ctx, seg.FullManifestPath)
 		}
 		// Incrementals + their change chunks.

@@ -1890,8 +1890,16 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // salt the CLI started the run with. Without this rebind, the unwrap
 // of the parent's WrappedCEK fails with `aes-gcm open: cipher:
 // message authentication failed`.
+//
+// Bug 215: resolved at the LINEAGE ROOT, never b.segStore. A stream that
+// STARTS on an already-rotated chain (an ordinary restart) resolved
+// through the open segment and picked up that segment full's own CEK —
+// every rollover it then wrote was sealed under a key the restore path
+// never tries. A stream that CREATED the rotations never saw it: it
+// resolves once at startup, when the open segment IS the root, and
+// carries that CEK across rotations.
 func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.Store, parent)
 	if err != nil {
 		// Audit N-6: a failed root-manifest read must NOT be conflated
 		// with "parent chain is plaintext" — that branch decides whether

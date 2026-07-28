@@ -136,7 +136,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 
 		readEnv := rebindForChain(t, store, "rotation-pass")
 		inc := &IncrementalBackup{
-			segStore:   store,
+			Store:      store,
 			Encryption: &lineage.BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChunk},
 		}
 		cek, err := inc.alignEncryption(context.Background(), parent)
@@ -159,7 +159,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		// passphrase mismatch crossing the rotation boundary.
 		wrong := rebindForChain(t, store, "ROTATED-pass")
 		inc := &IncrementalBackup{
-			segStore:   store,
+			Store:      store,
 			Encryption: &lineage.BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChunk},
 		}
 		_, err := inc.alignEncryption(context.Background(), parent)
@@ -178,7 +178,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 
 		readEnv := rebindForChain(t, store, "secret-pass")
 		inc := &IncrementalBackup{
-			segStore:   store,
+			Store:      store,
 			Encryption: &lineage.BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChain},
 		}
 		cek, err := inc.alignEncryption(context.Background(), parent)
@@ -197,7 +197,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 
 		wrong := rebindForChain(t, store, "WRONG-pass")
 		inc := &IncrementalBackup{
-			segStore:   store,
+			Store:      store,
 			Encryption: &lineage.BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChain},
 		}
 		_, err := inc.alignEncryption(context.Background(), parent)

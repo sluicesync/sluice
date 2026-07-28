@@ -1259,7 +1259,12 @@ func joinComma(parts []string) string {
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
 func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	// Bug 215: the LINEAGE ROOT store, never b.segStore. On a rotated
+	// chain the open segment's full carries its own chain header with its
+	// own CEK; sealing this incremental's change chunks under it produces
+	// a chunk the restore path — which decrypts every incremental with the
+	// chain ROOT's CEK — cannot open. See [lineage.ChainRootEncryption].
+	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.Store, parent)
 	if err != nil {
 		// Audit N-6: a failed root-manifest read must NOT be conflated
 		// with "parent chain is plaintext" — that branch decides whether
