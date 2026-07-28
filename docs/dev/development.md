@@ -30,14 +30,16 @@ make fmt              # apply gofumpt to every .go file
 make fmt-check        # verify formatting without writing changes; CI-shaped
 make vet              # go vet ./...
 make vet-tags         # type-check every build-tag combination (incl. tagged test files)
-make coverage-guards  # CI Lint's test-coverage guards (shard + -run-filter)
+make coverage-guards  # CI Lint's tree/test guards (tree-hygiene + shard + -run-filter)
 make lint             # go vet + golangci-lint run
 make test             # unit tests, race detector, no DB
 make test-it          # unit + integration; needs Docker for testcontainers
 make pre-commit       # the full gate: fmt-check + vet + vet-tags + coverage-guards + lint + test
 ```
 
-`make pre-commit` is the single command that mirrors what the CI Lint and Test jobs check — formatting, vet (including the build-tag matrix), the test-coverage guards, golangci-lint, and the fast unit tests. Run it before pushing and you'll catch the easy stuff that's been bouncing off CI.
+`make pre-commit` is the single command that mirrors what the CI Lint and Test jobs check — formatting, vet (including the build-tag matrix), the tree/test guards, golangci-lint, and the fast unit tests. Run it before pushing and you'll catch the easy stuff that's been bouncing off CI.
+
+One of those guards is not about the code at all: `scripts/check-tree-hygiene.sh` fails when a scratch/editor artefact (`*.tmp`, `*.bak`, `*.orig`, `*.rej`, `*~`, `*.swp`, `.DS_Store`, `Thumbs.db`) is **tracked** in git. Untracked scratch files in your checkout are normal and it ignores them entirely — the defect is tracking one, which every other gate passes by construction. A `.driftblock.tmp` fragment held aside during a multi-line edit was swept in by a broad `git add` and stayed tracked for a day before a human noticed the filename in a directory listing. The remedy it prints is `git rm --cached <path>` plus a `.gitignore` check.
 
 ## Git pre-commit hook
 

@@ -34,6 +34,16 @@ vendor/
 *.swo
 *~
 .DS_Store
+Thumbs.db
+
+# Merge/patch detritus. These are the shape most likely to carry a
+# half-applied hunk of real source into the tree, and they were the
+# four patterns scripts/check-tree-hygiene.sh guarded that .gitignore
+# did NOT cover — leaving the guard as the only line of defence for
+# them, which inverts the cheap/expensive order.
+*.bak
+*.orig
+*.rej
 
 # Claude Code local state
 .claude/
@@ -92,4 +102,7 @@ tmp/
 # Scratch files from multi-line edits. A .driftblock.tmp fragment was
 # swept into the tree by a broad `git add` and tracked for a day before
 # anyone noticed; tmp/ covered the directory but not stray *.tmp files.
+# This list is the cheap half of the defence — scripts/check-tree-hygiene.sh
+# (both pre-commit hooks + CI's Lint job) is the half that fires when one
+# of these is TRACKED anyway, via `git add -f` or a .gitignore regression.
 *.tmp

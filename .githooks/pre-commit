@@ -32,6 +32,22 @@ if [ -n "$markers_files" ]; then
 	exit 1
 fi
 
+# ---- tree-hygiene guard (applies to ALL files, not just Go) ----
+# Fails when a scratch/editor artefact (*.tmp, *.bak, *.orig, *.rej,
+# *~, *.swp, .DS_Store, Thumbs.db) is TRACKED — the index, so a
+# freshly-`git add`ed one is caught before the commit that would track
+# it. A .driftblock.tmp fragment reached main by a broad `git add` and
+# sat tracked for a day; every gate below validates the CODE's health
+# and none validates the TREE's shape.
+#
+# Deliberately ABOVE the "no Go files staged" early return: the
+# incident file was Go source with a .tmp name, so it matched neither
+# the \.go$ filter nor anything after it.
+if ! sh scripts/check-tree-hygiene.sh; then
+	red "pre-commit: check-tree-hygiene failed (a scratch/editor artefact is tracked in git)."
+	exit 1
+fi
+
 # Only run Go checks if Go files are staged. Lets non-code commits
 # (docs, CI config, etc.) skip the slow steps.
 if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.go$'; then

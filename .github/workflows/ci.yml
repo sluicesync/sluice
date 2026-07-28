@@ -691,6 +691,19 @@ jobs:
       - name: vet build-tag combinations
         run: bash scripts/vet-tags.sh
 
+      # Every other gate in this workflow validates the CODE's health;
+      # this one validates the TREE's shape. A `.driftblock.tmp`
+      # fragment held aside during a multi-line edit was swept in by a
+      # broad `git add` and stayed TRACKED for a day — found by a human
+      # noticing the filename, not by any check, because a tracked
+      # scratch artefact passes gofumpt/vet/lint/tests by construction.
+      # It runs here as well as in both pre-commit hooks deliberately:
+      # a guard enforced only locally is one `--no-verify` from
+      # useless, and this is the class where the bypass is most
+      # tempting (you are mid-edit, in a hurry, with a broad `git add`).
+      - name: check tree hygiene
+        run: bash scripts/check-tree-hygiene.sh
+
       # The integration shard matrix above is a hand-maintained
       # package list; this guard fails CI when a package containing
       # integration-tagged tests is missing from it (the mechanism
