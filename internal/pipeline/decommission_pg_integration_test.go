@@ -15,6 +15,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,22 +31,39 @@ import (
 // waitForSluiceSlotInactive polls until the named slot exists but has
 // no attached consumer — the state a just-stopped wave leaves behind
 // once PG reaps its walsender.
-func waitForSluiceSlotInactive(t *testing.T, dsn, slotName string, timeout time.Duration) bool {
+//
+// The second return value is the LAST OBSERVED state, and callers must
+// put it in their failure message. The two ways to miss the deadline are
+// opposite bugs — "the slot is still held" (a walsender that was never
+// reaped) versus "the slot is gone" (something dropped it, so no amount
+// of waiting can ever succeed) — and a message that says only "never
+// released" sends the reader after the first when it is the second.
+// That misreading cost two rounds of raising the timeout on
+// TestStreamer_WarmResume_PG_FullSlots_NeverProbesRefuses before the
+// dropped-slot cause was found (see
+// streamer_coldstart_stop_handoff_pg_integration_test.go).
+func waitForSluiceSlotInactive(t *testing.T, dsn, slotName string, timeout time.Duration) (bool, string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	last := "slot was never polled"
 	for time.Now().Before(deadline) {
 		exists := pgQueryOne[bool](t, dsn,
 			`SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, slotName)
-		if exists {
+		if !exists {
+			last = fmt.Sprintf("slot %q DOES NOT EXIST — it was dropped, so waiting longer can never succeed", slotName)
+		} else {
 			active := pgQueryOne[bool](t, dsn,
 				`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, slotName)
 			if !active {
-				return true
+				return true, ""
 			}
+			pid := pgQueryOne[int64](t, dsn,
+				`SELECT COALESCE(active_pid, 0) FROM pg_replication_slots WHERE slot_name = $1`, slotName)
+			last = fmt.Sprintf("slot %q is still ACTIVE, held by pid %d", slotName, pid)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return false
+	return false, last
 }
 
 // decommissionSourceState is the (slot exists, per-stream publication
@@ -159,8 +177,8 @@ func TestDecommission_PG_FullLifecycle(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("streamer did not return after ctx cancel")
 	}
-	if !waitForSluiceSlotInactive(t, sourceDSN, "sluice_wave_a", 60*time.Second) {
-		t.Fatal("the wave's slot never went inactive after the stop")
+	if ok, why := waitForSluiceSlotInactive(t, sourceDSN, "sluice_wave_a", 60*time.Second); !ok {
+		t.Fatalf("the wave's slot never went inactive after the stop: %s", why)
 	}
 
 	// ---- Phase 3: dry run — full report, zero mutation ----

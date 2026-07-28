@@ -950,6 +950,38 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 	return nil
 }
 
+// coldStartAnchorWriteTimeout bounds the cold-start CDC anchor write
+// (GitHub issue #15) when it runs on an uncancellable context.
+//
+// Why uncancellable at all. The anchor write is the ONLY durable record
+// that a just-completed bulk copy has a valid CDC resume point. Running
+// it on the caller's ctx made the write fail with context.Canceled
+// whenever an operator stopped the stream in the window between "bulk
+// copy committed on the target" and "CDC started" — and the error path
+// for that write is [ir.SnapshotStream.Abandon], which DROPS the
+// freshly-created Postgres replication slot and the per-stream
+// publication. So a Ctrl-C landing in that window threw away the anchor
+// for a copy that had already succeeded: the target keeps the rows but
+// has no cdc-state row, so warm resume can't recover (no position) and
+// cold start refuses (populated target). The only escape is
+// `--reset-target-data` — a full re-copy. That is precisely the wedge
+// this write exists to prevent, skipped for the one reason that must
+// never skip it. Ground-truthed 2026-07-27 with a tight-poll cancel
+// against real Postgres: 4 of 6 runs returned "persist cold-start CDC
+// anchor position: … context canceled" and left the source with NO
+// replication slot at all.
+//
+// The window is not merely microseconds: it is as long as the anchor
+// write itself takes, which on a loaded or distant target is seconds.
+//
+// Same posture as the snapshot teardown's context.Background() COMMIT
+// (see the Postgres snapshot ReleaseRowsFn) and the stop-drain flush in
+// stream.go: the reason we are stopping must not be the reason the
+// durability record is missing. The timeout keeps a wedged target from
+// blocking shutdown indefinitely; it matches [stopDrainTimeout], the
+// budget the stop path already grants an in-flight durable write.
+const coldStartAnchorWriteTimeout = stopDrainTimeout
+
 // coldStartBeginCDC persists the snapshot's anchor position on the
 // target (GitHub issue #15 — BEFORE the first CDC batch lands), then
 // starts CDC from that position. The returned stop closure closes the
@@ -994,8 +1026,15 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// applier.commitBatch — same row shape, monotonic position, same
 	// (streamID, source_fingerprint, target_schema) tuple, so the
 	// applier's writePositionTx absorbs the duplicate without conflict.
+	//
+	// The write runs on an UNCANCELLABLE ctx — see
+	// [coldStartAnchorWriteTimeout] for why that is the whole point of
+	// this write and not a detail.
 	if pw, ok := applier.(ir.PositionWriter); ok {
-		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
+		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
+		err := pw.WritePosition(anchorCtx, streamID, stream.Position)
+		anchorCancel()
+		if err != nil {
 			_ = stream.Abandon()
 			return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
 		}

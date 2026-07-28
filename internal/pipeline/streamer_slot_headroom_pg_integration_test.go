@@ -213,12 +213,22 @@ func TestStreamer_WarmResume_PG_FullSlots_NeverProbesRefuses(t *testing.T) {
 	// The operator-visible contract this test pins is the resume on a
 	// FULL server, not the release race, so wait for the slot to go
 	// inactive first. Budget is 180s — 3x the ~60s wal_sender_timeout
-	// ceiling — because the 90s first cut still flaked under the -race
-	// CI scheduler (run 30068794246, then the v0.100.0 tag run
-	// 30111105907, both cleared on rerun; the 2026-07-24 PS-PG reap
-	// measurement confirms 60s is the worst non-clean-close reap).
-	if !waitForSluiceSlotInactive(t, src, "sluice_slot", 180*time.Second) {
-		t.Fatal("cold-start stream's walsender never released sluice_slot")
+	// ceiling.
+	//
+	// Historical note, because this budget's own history is misleading:
+	// the wait was raised 90s→180s on a suspected slow reap (run
+	// 30068794246, the v0.100.0 tag run 30111105907) and then failed
+	// again at 181s anyway (the v0.104.1 tag run 30325554041). The cause
+	// was never a slow walsender. It was the cancel above landing in the
+	// cold-start handoff window, where a failed anchor write ABANDONED
+	// the stream and DROPPED the slot — which makes "wait for the slot to
+	// go inactive" unsatisfiable at ANY budget. Fixed at the source (see
+	// [coldStartAnchorWriteTimeout]) and pinned by
+	// TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes. The
+	// budget stays generous because it costs nothing when the wait
+	// succeeds in milliseconds, which is what a clean close does.
+	if ok, why := waitForSluiceSlotInactive(t, src, "sluice_slot", 180*time.Second); !ok {
+		t.Fatalf("cold-start stream's slot never became reusable: %s", why)
 	}
 
 	// Fill the server to its ceiling: the stream's slot + the occupier.
