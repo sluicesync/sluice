@@ -32,11 +32,19 @@ type fakeCDCEngine struct {
 	cdcStartErr       error // returned from StreamChanges when non-nil
 	cdcExpectedFromOK bool  // when true, refuse a "from now" empty position
 	cdcSeenFrom       ir.Position
+
+	// cdcPositionCommitsAfterRows models a VStream-shaped source, whose CDC
+	// segments stamp [irbackup.FormatVersionCDCPositionBinding]. Off by
+	// default so every existing test keeps its schema-derived version.
+	cdcPositionCommitsAfterRows bool
 }
 
 func (e *fakeCDCEngine) Name() string { return e.name }
 func (e *fakeCDCEngine) Capabilities() ir.Capabilities {
-	return ir.Capabilities{CDC: ir.CDCLogicalReplication}
+	return ir.Capabilities{
+		CDC:                         ir.CDCLogicalReplication,
+		CDCPositionCommitsAfterRows: e.cdcPositionCommitsAfterRows,
+	}
 }
 
 func (e *fakeCDCEngine) OpenSchemaReader(_ context.Context, _ string) (ir.SchemaReader, error) {
