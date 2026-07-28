@@ -10,12 +10,15 @@ package backup
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 func schemaHashLink(t *testing.T, mutate func(m *irbackup.Manifest)) lineage.SegmentRecord {
@@ -74,6 +77,72 @@ func TestVerifySchemaHashes(t *testing.T) {
 		}
 	})
 
+	// The refusal's WORDING is load-bearing, not cosmetic (roadmap item
+	// 102). A fingerprint mismatch has TWO causes and this check cannot
+	// tell them apart: a manifest written by a release whose IR schema
+	// field set differs is INTACT and merely unreadable here. Three such
+	// epochs already shipped, so telling that operator their manifest is
+	// "corrupted or partially-rewritten" — during a recovery — is a false
+	// accusation that sends them hunting a storage fault that is not
+	// there. Prose is what the operator acts on, so prose is what is
+	// pinned.
+	t.Run("the refusal names BOTH causes and accuses neither", func(t *testing.T) {
+		link := schemaHashLink(t, func(m *irbackup.Manifest) {
+			m.SluiceVersion = "0.99.292"
+			m.Schema.Tables[0].Columns[0].Name = "mangled"
+		})
+		err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link})
+		if err == nil {
+			t.Fatal("mismatched hash passed; the check must still REFUSE — only its wording changed")
+		}
+		msg := err.Error()
+		// The writing release is DATA (the manifest's own sluice_version),
+		// never a hardcoded epoch table in the error string.
+		for _, want := range []string{
+			"written by sluice 0.99.292",
+			"the chain is intact",
+			"genuinely corrupt or tampered",
+		} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal should contain %q; got:\n%s", want, msg)
+			}
+		}
+		if strings.Contains(msg, "corrupted or partially-rewritten") {
+			t.Errorf("refusal still accuses the operator of corruption as the ONLY cause; got:\n%s", msg)
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok {
+			t.Fatalf("refusal lost its %s code: %v", sluicecode.CodeBackupManifestInvalid, err)
+		}
+		if ce.Code != sluicecode.CodeBackupManifestInvalid {
+			t.Errorf("code = %s, want %s", ce.Code, sluicecode.CodeBackupManifestInvalid)
+		}
+		// The remedy must be actionable for BOTH causes, and must not
+		// invent a flag: there is no skip-the-check flag to name.
+		for _, want := range []string{
+			"re-take the backup with this binary",
+			"docs/operator/error-codes.md",
+		} {
+			if !strings.Contains(ce.Hint, want) {
+				t.Errorf("hint should contain %q; got: %s", want, ce.Hint)
+			}
+		}
+	})
+
+	t.Run("a manifest with no recorded writer version says so", func(t *testing.T) {
+		link := schemaHashLink(t, func(m *irbackup.Manifest) {
+			m.SluiceVersion = ""
+			m.Schema.Tables[0].Columns[0].Name = "mangled"
+		})
+		err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link})
+		if err == nil {
+			t.Fatal("mismatched hash passed")
+		}
+		if !strings.Contains(err.Error(), "does not record the release that wrote it") {
+			t.Errorf("refusal should say the writing release is unknown; got:\n%s", err)
+		}
+	})
+
 	t.Run("pre-v5 manifest with standalone sequences → WARN carve-out, not refusal", func(t *testing.T) {
 		// The named wart: pre-ADR-0152 writers re-stamped the recorded
 		// Schema with end-of-window sequence state without re-hashing
@@ -85,6 +154,48 @@ func TestVerifySchemaHashes(t *testing.T) {
 		})
 		if err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err != nil {
 			t.Errorf("pre-v5 sequences carve-out refused a legitimate old chain: %v", err)
+		}
+	})
+
+	t.Run("skew-annotated signature failure", func(t *testing.T) {
+		// The signature path's twin of the same false accusation.
+		// CanonicalManifestBytes folds the RECORDED schema_hash verbatim,
+		// but deltaTableFingerprint RECOMPUTES the fingerprint of each
+		// SchemaDelta's before/after table — so a signed manifest carrying
+		// a delta fails its MAC across a fingerprint boundary, and a MAC
+		// failure carries no structure to read. Restore and the broker run
+		// verifySchemaHashes first and preempt it; `backup verify` and
+		// `export-as-parquet` do not, so the note rides the error there.
+		skewed := schemaHashLink(t, func(m *irbackup.Manifest) {
+			m.Schema.Tables[0].Columns[0].Name = "mangled"
+		}).Manifest
+
+		annotated := annotateSchemaFingerprintSkew(
+			fmt.Errorf("manifest %q: mac mismatch: %w", "manifest.json", lineage.ErrSignatureInvalid), skewed,
+		)
+		if !errors.Is(annotated, lineage.ErrSignatureInvalid) {
+			t.Fatal("the annotation broke the error chain — CodeForSignatureError would no longer classify it")
+		}
+		if !strings.Contains(annotated.Error(), "different IR schema field set") {
+			t.Errorf("annotated signature failure should raise the release-skew possibility; got:\n%s", annotated)
+		}
+
+		// Clean manifest: the fingerprint reproduces, so there is no
+		// evidence of skew and the error must be left exactly as-is —
+		// absence of the note is not evidence of tampering either way, but
+		// inventing it would be.
+		clean := schemaHashLink(t, nil).Manifest
+		sigErr := fmt.Errorf("manifest %q: mac mismatch: %w", "manifest.json", lineage.ErrSignatureInvalid)
+		if got := annotateSchemaFingerprintSkew(sigErr, clean); got.Error() != sigErr.Error() {
+			t.Errorf("annotated a manifest whose fingerprint reproduces: %v", got)
+		}
+
+		// A non-signature failure is never annotated. Compared by message
+		// rather than by identity: the assertion is that nothing was
+		// appended, and errors.Is would be satisfied by a wrapper.
+		other := errors.New("store read failed")
+		if got := annotateSchemaFingerprintSkew(other, skewed); got.Error() != other.Error() {
+			t.Errorf("annotated a non-signature error: %v", got)
 		}
 	})
 

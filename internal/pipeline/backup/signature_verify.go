@@ -109,6 +109,40 @@ func (m verifyMaterial) signerForScheme(scheme string) (s *lineage.Signer, ok bo
 	}
 }
 
+// annotateSchemaFingerprintSkew adds the release-skew possibility to a
+// SIGNATURE-INVALID error whose real cause may be that the manifest was
+// written by a release with a different IR schema field set.
+//
+// Why this is needed at all. [irbackup.CanonicalManifestBytes] folds the
+// manifest's RECORDED schema_hash verbatim (no recompute), so the signed
+// bytes are release-stable — except for `deltaTableFingerprint`, which
+// RECOMPUTES [irbackup.ComputeSchemaHash] over each SchemaDelta's
+// before/after table at verify time. A signed manifest carrying a
+// SchemaDelta therefore fails its MAC across a fingerprint epoch, and a
+// MAC failure has no structure to read: it says "tampered" and means
+// nothing of the kind. On the chain-RESTORE and BROKER paths
+// [verifySchemaHashes] runs first and preempts this with the honest
+// two-cause refusal; `backup verify` and `export-as-parquet` have no such
+// preflight, which is where this note earns its keep.
+//
+// The signal is DATA, not a guess: the manifest's own recorded
+// schema_hash failing to reproduce under this binary is exactly the
+// release-skew fingerprint. Absence of the note is NOT evidence of
+// tampering, and the wording says so. Same discipline as the
+// unsupported-scheme branches above — never report a compatibility gap
+// as a compromise.
+func annotateSchemaFingerprintSkew(err error, m *irbackup.Manifest) error {
+	if err == nil || m == nil || m.SchemaHash == "" || !errors.Is(err, lineage.ErrSignatureInvalid) {
+		return err
+	}
+	got, hErr := irbackup.ComputeSchemaHash(m.Schema)
+	if hErr != nil || got == m.SchemaHash {
+		return err
+	}
+	return fmt.Errorf("%w (this manifest's recorded schema fingerprint also fails to reproduce under this binary — recorded %s, recomputed %s — which is what a manifest written by a release with a different IR schema field set looks like; a signed manifest carrying a schema delta cannot verify across that boundary, and the chain may be intact. See docs/operator/error-codes.md, SLUICE-E-BACKUP-MANIFEST-INVALID)",
+		err, m.SchemaHash, got)
+}
+
 // hmacVerifier derives the Phase 1 HMAC-off-KEK verifier from env. ok is
 // false when env is nil or cannot key an HMAC off its KEK (KMS — Phase 3).
 func hmacVerifier(env crypto.EnvelopeEncryption) (s *lineage.Signer, ok bool, err error) {
@@ -196,7 +230,7 @@ func verifyManifestSignaturePolicy(
 		return unverifiableSignedManifest(ctx, manifestPath, requireStrict)
 	}
 	if err := lineage.VerifyManifest(ctx, segStore, manifestPath, manifest, seq, signer); err != nil {
-		return lineage.CodeForSignatureError(err)
+		return lineage.CodeForSignatureError(annotateSchemaFingerprintSkew(err, manifest))
 	}
 	slog.InfoContext(ctx, "restore: manifest signature verified (ADR-0154)",
 		slog.String("manifest", manifestPath),
@@ -238,7 +272,7 @@ func verifyChainSignatures(
 		link := &links[i]
 		segStore := link.Segment.Store(rootStore)
 		if err := lineage.VerifyManifest(ctx, segStore, link.Path, link.Manifest, i, signer); err != nil {
-			return lineage.CodeForSignatureError(err)
+			return lineage.CodeForSignatureError(annotateSchemaFingerprintSkew(err, link.Manifest))
 		}
 	}
 	// Lineage catalog enumeration — closes dropped-newest-link (the
@@ -301,8 +335,12 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 		segStore := rec.Segment.Store(store)
 		if err := lineage.VerifyManifest(ctx, segStore, rec.Path, rec.Manifest, i, signer); err != nil {
 			failed++
+			// `backup verify` has no schema-hash preflight to preempt this
+			// (unlike restore/broker), so the release-skew possibility is
+			// annotated onto the report itself.
 			slog.ErrorContext(ctx, "backup verify: signature INVALID",
-				slog.String("manifest", rec.Path), slog.Int("sequence", i), slog.String("error", err.Error()))
+				slog.String("manifest", rec.Path), slog.Int("sequence", i),
+				slog.String("error", annotateSchemaFingerprintSkew(err, rec.Manifest).Error()))
 			continue
 		}
 		slog.InfoContext(ctx, "backup verify: signature valid",

@@ -26,7 +26,7 @@
 // worse. This gate's job is to make it VISIBLE and to fail loudly if its
 // SHAPE ever changes, not to assert it is fixed.
 //
-// The suite runs two real binaries against one real backup store:
+// The suite runs three real binaries against one real backup store:
 //
 //	cell 1  forward read      OLD writes chain → NEW restores        PASS
 //	cell 2  backward refusal  NEW writes chain → OLD restores      REFUSE
@@ -34,9 +34,26 @@
 //	                            (a) NEW restores                      PASS
 //	                            (b) OLD restores                     FAIL
 //	cell 4  control           OLD writes, OLD extends, OLD restores  PASS
+//	cell 5  epoch partition   EPOCH writes chain → NEW restores    REFUSE
 //
 // Cell 4 is not padding: it is what proves cell 3b's failure is caused by
 // the version raise and by nothing else in the harness.
+//
+// CELL 5 IS A SECOND AXIS, and it exists because cells 1–4 structurally
+// cannot see it (roadmap item 102). OLD is derived as "the newest tag
+// whose BackupFormatVersion is strictly lower than the working tree's" —
+// the rule that makes this gate non-vacuous, and the rule that made it
+// blind to the SCHEMA-FINGERPRINT partition: sluice's manifest schema
+// fingerprint moved twice (v0.100.0, v0.103.0) from untagged field
+// additions to ir.Index, and BOTH boundaries sit INSIDE format version 8,
+// so the "strictly lower" walk steps right over them. Cell 5 pins a pair
+// that straddles one, and asserts the CURRENT, ACCEPTED behaviour: the
+// chain is refused, with the honest two-cause schema-fingerprint refusal
+// rather than the accusation of tampering it used to carry.
+//
+// So cell 5 documents the partition as known-and-accepted. If someone
+// later builds the compatibility shim item 102 describes, this cell goes
+// red — which is the correct trigger to come back and update it.
 //
 // Encryption is not optional here. FormatVersion 9 is an ENCRYPTED-manifest
 // tier — a plaintext chain keeps its schema-derived version (1/2/4) and
@@ -61,6 +78,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // xvPassphraseEnv / xvPassphraseValue: the passphrase reaches both binaries
@@ -99,6 +118,26 @@ const xvIncrementalWindow = "12s"
 // importing the new build's constant would assert the wrong side.
 const xvFormatVersionRefusal = "newer than this build supports"
 
+// The cell-5 refusal contract, pinned as literals for the same reason as
+// xvFormatVersionRefusal: this is a cross-VERSION assertion about what an
+// operator reads, so it must not ride a constant the build under test can
+// move.
+//
+// xvSchemaFingerprintRefusal is the refusal itself. The two "must say"
+// fragments are the halves that make it honest: the mismatch has TWO
+// causes and this check cannot tell them apart, so it must name the
+// release-skew one (the chain is intact, only unreadable here) alongside
+// corruption. xvTamperAccusation is the wording it USED to carry —
+// asserted absent, because telling an operator holding a byte-perfect
+// chain that their manifest is corrupt, during a recovery, sends them
+// hunting a storage fault that does not exist.
+const (
+	xvSchemaFingerprintRefusal = "schema hash mismatch"
+	xvSchemaFingerprintIntact  = "the chain is intact"
+	xvSchemaFingerprintCorrupt = "genuinely corrupt or tampered"
+	xvTamperAccusation         = "corrupted or partially-rewritten"
+)
+
 // xvMisleadingRefusalTerms are words the version refusal must NOT contain.
 // A v0.103.x binary once told an operator holding the CORRECT passphrase
 // that the passphrase was wrong; an operator handed the wrong reason does
@@ -121,7 +160,22 @@ type xvBinaries struct {
 	oldBin, newBin       string
 	oldTag               string
 	oldFormat, newFormat int
+
+	// The cell-5 axis: a binary from a DIFFERENT schema-fingerprint epoch
+	// (see the file header). Its BackupFormatVersion is unconstrained
+	// relative to oldFormat — the two axes are independent.
+	epochBin    string
+	epochTag    string
+	epochFormat int
 }
+
+// xvEpochVersion is the version string the epoch binary stamps into every
+// manifest it writes — the tag without its leading "v", exactly as
+// goreleaser's `-X main.version={{.Version}}` renders a real release (and
+// as scripts/crossversion-build.sh reproduces for the tag builds). The
+// fingerprint refusal ECHOES this back to the operator, so cell 5 can
+// assert the refusal names the release that actually wrote the chain.
+func (b xvBinaries) xvEpochVersion() string { return strings.TrimPrefix(b.epochTag, "v") }
 
 // xvLoadBinaries reads the contract scripts/crossversion-build.sh emits.
 // Every failure path here is a t.Fatalf, never a t.Skip.
@@ -144,11 +198,14 @@ func xvLoadBinaries(t *testing.T) xvBinaries {
 		return n
 	}
 	b := xvBinaries{
-		oldBin:    get("CROSSVER_OLD_BIN"),
-		newBin:    get("CROSSVER_NEW_BIN"),
-		oldTag:    get("CROSSVER_OLD_TAG"),
-		oldFormat: getInt("CROSSVER_OLD_FORMAT"),
-		newFormat: getInt("CROSSVER_NEW_FORMAT"),
+		oldBin:      get("CROSSVER_OLD_BIN"),
+		newBin:      get("CROSSVER_NEW_BIN"),
+		oldTag:      get("CROSSVER_OLD_TAG"),
+		oldFormat:   getInt("CROSSVER_OLD_FORMAT"),
+		newFormat:   getInt("CROSSVER_NEW_FORMAT"),
+		epochBin:    get("CROSSVER_EPOCH_BIN"),
+		epochTag:    get("CROSSVER_EPOCH_TAG"),
+		epochFormat: getInt("CROSSVER_EPOCH_FORMAT"),
 	}
 	// The FIRST non-vacuity guard: a gate whose two binaries understand the
 	// same manifest versions asserts nothing at all, and would report a
@@ -160,13 +217,23 @@ func xvLoadBinaries(t *testing.T) xvBinaries {
 			"otherwise every cell below is vacuous. Re-run scripts/crossversion-build.sh.",
 			b.oldTag, b.oldFormat, b.newFormat)
 	}
-	for _, p := range []string{b.oldBin, b.newBin} {
+	// Cell 5's format-version precondition. The epoch cell asserts a
+	// SCHEMA-FINGERPRINT refusal; if the epoch binary wrote manifests NEW
+	// cannot read at all, the version gate preempts and the cell would
+	// assert the wrong contract entirely. (This is the harness half; the
+	// cell re-checks the chain it actually got.)
+	if b.epochFormat > b.newFormat {
+		t.Fatalf("EPOCH %s stamps BackupFormatVersion=%d, above NEW's %d — NEW would refuse it on the VERSION gate "+
+			"before reaching the fingerprint check, so cell 5 would assert the wrong refusal. Pick an older epoch tag "+
+			"in scripts/crossversion-build.sh.", b.epochTag, b.epochFormat, b.newFormat)
+	}
+	for _, p := range []string{b.oldBin, b.newBin, b.epochBin} {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("binary %q: %v", p, err)
 		}
 	}
-	t.Logf("cross-version gate: OLD=%s (%s, BackupFormatVersion=%d)  NEW=%s (BackupFormatVersion=%d)",
-		b.oldBin, b.oldTag, b.oldFormat, b.newBin, b.newFormat)
+	t.Logf("cross-version gate: OLD=%s (%s, BackupFormatVersion=%d)  NEW=%s (BackupFormatVersion=%d)  EPOCH=%s (%s, BackupFormatVersion=%d)",
+		b.oldBin, b.oldTag, b.oldFormat, b.newBin, b.newFormat, b.epochBin, b.epochTag, b.epochFormat)
 	return b
 }
 
@@ -196,8 +263,8 @@ func newXVLedger(t *testing.T, cells ...string) *xvLedger {
 		}
 		if len(missing) > 0 {
 			t.Errorf("cross-version gate did not run every cell — missing: %s. "+
-				"All four cells must report; a partial run is a vacuous green, not a pass.",
-				strings.Join(missing, ", "))
+				"All %d cells must report; a partial run is a vacuous green, not a pass.",
+				strings.Join(missing, ", "), len(l.expected))
 		}
 	})
 	return l
@@ -332,6 +399,49 @@ func xvManifestVersion(t *testing.T, path string) int {
 	return m.FormatVersion
 }
 
+// xvSchemaFingerprint decodes a manifest written by ANOTHER binary and
+// returns both the fingerprint that binary recorded and the fingerprint
+// THIS build computes for the very same carried schema. Equal means the
+// two binaries share a schema-fingerprint epoch; unequal means they do
+// not, and that is the entire precondition cell 5 rests on.
+//
+// This is the ONE place in the suite that deliberately reads a foreign
+// binary's bytes through the CURRENT build's types, and the deliberation
+// matters. Everywhere else that would be a bug (an assertion about bytes
+// on disk must not ride the type interpreting them — see
+// xvManifestVersion). Here the question IS "what does this build make of
+// those bytes", so the current build's decoder is the instrument, not a
+// contaminant.
+//
+// It measures the right thing, which an obvious alternative does not: a
+// second full taken by the NEW binary and its recorded hash compared
+// would conflate a fingerprint-epoch boundary with ordinary SCHEMA-READER
+// drift (a newer reader populating a field the older one left empty
+// changes the fingerprint of a fresh read while old manifests still
+// reproduce perfectly). Ground-truthed while building this cell: v0.103.2
+// and the working tree disagree about a fresh read of one database and
+// still restore each other's chains. The recompute-what-was-recorded form
+// is the predicate the refusal actually keys on.
+func xvSchemaFingerprint(t *testing.T, path string) (recorded, recomputed string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read manifest %s: %v", path, err)
+	}
+	var m irbackup.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode manifest %s: %v", path, err)
+	}
+	if m.SchemaHash == "" {
+		t.Fatalf("manifest %s records no schema_hash — the fingerprint check skips such links, so cell 5 would be vacuous", path)
+	}
+	got, err := irbackup.ComputeSchemaHash(m.Schema)
+	if err != nil {
+		t.Fatalf("recompute schema hash for %s: %v", path, err)
+	}
+	return m.SchemaHash, got
+}
+
 // xvChainVersions returns the root full's format version and the
 // incremental segments' versions in path order.
 func xvChainVersions(t *testing.T, dir string) (root int, segments []int) {
@@ -443,6 +553,54 @@ func xvAssertVersionRefusal(t *testing.T, what, out string, err error, targetDSN
 	}
 }
 
+// xvAssertSchemaFingerprintRefusal pins cell 5's whole contract: the
+// restore failed, it failed on the FINGERPRINT (not the format version —
+// a version refusal here would mean the cell asserted a different
+// mechanism), the message names both causes and the writing release, it
+// does NOT accuse the operator of tampering, it does not blame the
+// passphrase, and the target is untouched.
+func xvAssertSchemaFingerprintRefusal(t *testing.T, what, out string, err error, targetDSN, writerVersion string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: the chain RESTORED across a schema-fingerprint epoch. That is not a failure of this cell — it "+
+			"means the partition roadmap item 102 documents has been closed (a compatibility shim, or a re-derivation "+
+			"of the fingerprint at the writing release). Update this cell to assert the NEW contract.\n--- output ---\n%s",
+			what, out)
+	}
+	if strings.Contains(out, xvFormatVersionRefusal) {
+		t.Fatalf("%s: refused on the FORMAT VERSION, not the schema fingerprint — this cell asserts the fingerprint "+
+			"partition and the version gate preempted it. Pick an epoch tag whose BackupFormatVersion this build "+
+			"reads.\n--- output ---\n%s", what, out)
+	}
+	for _, want := range []string{xvSchemaFingerprintRefusal, xvSchemaFingerprintIntact, xvSchemaFingerprintCorrupt} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("%s: refused (%v) but never said %q — the refusal must name BOTH causes, because it cannot tell "+
+				"them apart.\n--- output ---\n%s", what, err, want, out)
+		}
+	}
+	if !strings.Contains(out, "written by sluice "+writerVersion) {
+		t.Fatalf("%s: the refusal does not name the release that WROTE the chain (%s). That version is the only datum "+
+			"an operator can act on — it is what tells them the chain is probably intact and which binary reads "+
+			"it.\n--- output ---\n%s", what, writerVersion, out)
+	}
+	if strings.Contains(out, xvTamperAccusation) {
+		t.Fatalf("%s: the refusal still says %q about a chain this harness wrote and never touched. An operator told "+
+			"their backup is corrupt, mid-recovery, goes looking for a storage fault that is not there.\n--- output ---\n%s",
+			what, xvTamperAccusation, out)
+	}
+	lower := strings.ToLower(out)
+	for _, term := range xvMisleadingRefusalTerms {
+		if strings.Contains(lower, term) {
+			t.Fatalf("%s: the refusal blames %q. The passphrase is CORRECT here; this is a fingerprint-epoch "+
+				"gap.\n--- output ---\n%s", what, term, out)
+		}
+	}
+	if n := xvPublicRelationCount(t, targetDSN); n != 0 {
+		t.Fatalf("%s: refused, but the target already carries %d relation(s) in public — the fingerprint check must sit "+
+			"at the manifest preflight, ahead of anything that touches the target", what, n)
+	}
+}
+
 // ---------------------------------------------------------------------
 // fixture
 // ---------------------------------------------------------------------
@@ -530,7 +688,7 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 	adminDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
-	ledger := newXVLedger(t, "1-forward-read", "2-backward-refusal", "3a-new-reads-extended", "3b-old-loses-extended", "4-control")
+	ledger := newXVLedger(t, "1-forward-read", "2-backward-refusal", "3a-new-reads-extended", "3b-old-loses-extended", "4-control", "5-epoch-partition")
 
 	t.Run("cell1_forward_read_OLD_writes_NEW_restores", func(t *testing.T) {
 		src := xvSeededSource(t, adminDSN, "xv1_src")
@@ -687,6 +845,65 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 		}
 		xvAssertUsers(t, tgt, "cell 4 (OLD writes, extends, restores)", xvAfterDelta2)
 		ledger.report(t, "4-control")
+	})
+
+	// Cell 5 — the epoch axis (roadmap item 102).
+	//
+	// A chain written by a binary from a DIFFERENT schema-fingerprint
+	// epoch, restored by the working tree. The known, accepted outcome is
+	// a REFUSAL: the manifest's recorded schema fingerprint does not
+	// reproduce under this binary's IR field set, and there is no
+	// re-derivation path, so the chain — byte-for-byte intact — is
+	// unreadable here. Cell 5 asserts that refusal and, just as
+	// importantly, its WORDING: it must name the release-skew cause and
+	// the writing release, and must not tell the operator their store is
+	// corrupt.
+	//
+	// A BARE FULL crosses epochs fine (the single-manifest restore path
+	// never walks a chain and never runs the check), which is why this
+	// cell takes an incremental — the shape that actually partitions.
+	t.Run("cell5_epoch_partition_EPOCH_writes_NEW_refuses", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv5_src")
+		tgt := xvCreateDB(t, adminDSN, "xv5_tgt")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.epochBin, src, dir, "xv_slot_5")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.epochBin, src, dir, "xv_slot_5")
+
+		// THE NON-VACUITY GUARD, and the reason this cell can be trusted
+		// without trusting a tag NAME. The two binaries are in different
+		// fingerprint epochs exactly when this build fails to reproduce the
+		// fingerprint the epoch binary recorded with its own schema. Equal
+		// means one epoch: the refusal below could not fire for the reason
+		// this cell claims, so it is a FAILURE, not a pass. Same class of
+		// guard as cell 3's "the extension must raise the floor".
+		recorded, recomputed := xvSchemaFingerprint(t, filepath.Join(dir, "manifest.json"))
+		if recorded == recomputed {
+			t.Fatalf("cell 5: this build reproduces EPOCH %s's recorded fingerprint (%s) — the two are in the SAME "+
+				"schema-fingerprint epoch, so this cell asserts nothing and a green here would be vacuous. Either the "+
+				"epoch tag in scripts/crossversion-build.sh needs repointing at a tag on the far side of a boundary, "+
+				"or the epochs have been unified (in which case this cell needs rewriting, not repointing).",
+				bins.epochTag, recorded)
+		}
+		t.Logf("cell 5: epochs confirmed distinct — EPOCH %s recorded %s, this build recomputes %s",
+			bins.epochTag, recorded, recomputed)
+
+		// The chain must be a CHAIN (a bare full legitimately crosses), and
+		// every link must be readable by NEW's format-version gate so the
+		// refusal below is the fingerprint's and not the version's.
+		root, segs := xvChainVersions(t, dir)
+		for _, v := range append([]int{root}, segs...) {
+			if v > bins.newFormat {
+				t.Fatalf("cell 5: EPOCH %s stamped a manifest at %d, above NEW's BackupFormatVersion %d — the version "+
+					"gate would preempt the fingerprint check", bins.epochTag, v, bins.newFormat)
+			}
+		}
+		t.Logf("cell 5: EPOCH chain stamped root=%d segments=%v (NEW reads up to %d)", root, segs, bins.newFormat)
+
+		out, err := xvRestore(t, bins.newBin, dir, tgt)
+		xvAssertSchemaFingerprintRefusal(t, "cell 5 (NEW restores an EPOCH-crossing chain)", out, err, tgt, bins.xvEpochVersion())
+		ledger.report(t, "5-epoch-partition")
 	})
 
 	// Belt for the ledger's braces: a summary line naming what ran, so a
