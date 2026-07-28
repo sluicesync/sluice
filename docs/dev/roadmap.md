@@ -1846,7 +1846,19 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
-### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *open, HIGH / DR-availability*
+### 95. `backup prune` has Bug 214's defect too, on a path that runs far more often — *open, HIGH / DR-availability*
+
+**Found while fixing item 94, in the same read path, and deliberately left unfixed there because it needs a decision rather than a patch.** `pruneWholeSegments` (`internal/pipeline/backup/chain_prune.go`) deletes `seg.FullManifestPath` through `seg.Store(store)`. For the ROOT segment that store is the lineage root and that path is `manifest.json` — so prune destroys the chain's identity header exactly the way compaction did, and a passphrase-encrypted chain then fails to restore at `unwrap chain cek` while the operator holds the correct passphrase.
+
+**This is worse than item 94 in reach.** Compaction is occasional maintenance; prune is ordinary retention and runs on a schedule. It fires whenever prune drops segment 0.
+
+**Not a code-reading guess.** `TestPruneLineage_MultiSegmentDropsLeadingWholeSegment` **asserts the deletion as intended behaviour**, so the current shape is deliberate and tested — which is precisely why this needs a decision. Item 94's mutation testing independently proved the consequence: a passphrase chain with no root manifest fails the restore at `unwrap chain cek`.
+
+**Recoverable, and for a reassuring reason.** Every rotation-born segment full carries the same chain salt (`stream_rotation.go` runs `backup.Backup` with the aligned envelope), so copying any surviving segment's header to the chain root restores readability.
+
+**The decision this needs.** Compaction was easy: the deleted data provably still exists in the merged segment, so keeping the root header costs nothing. Prune is genuinely different — should a chain whose root segment has been legitimately retired keep a dangling identity header forever? Probably yes (it is small, and it is the chain's identity rather than segment 0's data), but that is a contract call, not a bug fix. Whatever is decided, `verifyChainReadable` already takes an `op string` so prune can reuse it verbatim; the implementation is the guard plus two call sites.
+
+### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *✅ FIXED 2026-07-28, unreleased*
 
 **What.** `backup compact` against an encrypted chain reports success — `groups_merged=1 segments_removed=3`, exit 0 — and the chain is then unrestorable. `verify` and `restore` both refuse at `unwrap chain cek`, zero rows, minutes after that same chain restored 230/230 md5-exact. Pre-existing, NOT a v0.104.1 regression: v0.104.0 and v0.103.2 do the same thing.
 
@@ -1856,7 +1868,9 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 
 **Recovery for anyone hit by it:** `cp <chain>/seg-merged-*/manifest.json <chain>/manifest.json` restores the chain byte-exactly — compaction copies the oldest full's manifest into the merged segment dir before deleting the root, so the identity still exists on disk. Verified in both per-chain and per-chunk modes.
 
-**Modes differ in symptom, not severity.** Per-chain fails at `unwrap chain cek`; `--encrypt-mode=per-chunk` fails later as `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` on 6/6 chunks. `--dry-run` is inert and the plaintext control is unaffected — both good, and both part of why this stayed hidden.
+**The precise mechanism is narrower than "ADR-0152 binds the CEK to the root manifest", and the narrower version is what the gate keys on.** The killer is `cmd/sluice/backup.go`'s `buildReadEnvelope`: for `kek_mode=passphrase-argon2id` it reads the **Argon2id salt off the chain-root manifest, and silently falls back to a fresh-salt default when that file is absent**. The restore then builds a wrong-KEK envelope and fails while holding a perfectly good passphrase. That silent fallback is why the symptom is `unwrap chain cek` — i.e. "wrong passphrase" — rather than an honest missing-file error, and it is why the same deletion is harmless on a KMS chain, where no key material comes from the root.
+
+**Modes differ in symptom, not severity.** Per-chain fails at `unwrap chain cek`; `--encrypt-mode=per-chunk` fails on the first chunk at `resolve chunk cek: unwrap chunk cek: crypto: chain CEK unwrap failed`. (An earlier version of this entry said per-chunk surfaced as `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` on 6/6 chunks — same root cause, wrong code; corrected before it reached release notes.) `--dry-run` is inert and the plaintext control is unaffected — both good, and both part of why this stayed hidden.
 
 **Fix shape.** Stop deleting the root manifest — it is small, and on an encrypted chain it is load-bearing forever. Then add the gate the class actually needs: **compaction must prove the chain still restores before it deletes anything.** A compact that reports success on a chain it has made unreadable is the same shape as the format-floor bug (an operation whose local reasoning is right and whose whole-chain consequence is unimplemented), and the durable answer is the same — a post-compaction readability check, not a more careful sweep. Pin the round trip: encrypted compact → restore, per-chain AND per-chunk, with the plaintext control.
 
