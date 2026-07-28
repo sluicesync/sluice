@@ -1755,7 +1755,7 @@ The only forward-looking piece is the `--smart-compaction` default flip — gate
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
 
-### 84. PRIMARY KEY constraint-name fidelity (raised 2026-07-27 by the extended dump-parity seed) — *✅ SHIPPED*
+### 84. PRIMARY KEY constraint-name fidelity (raised 2026-07-27 by the extended dump-parity seed) — *✅ SHIPPED v0.104.3*
 
 **What.** sluice emits `PRIMARY KEY (cols)` inline in `CREATE TABLE`, so Postgres auto-names the constraint `<table>_pkey`. A source that named its primary key explicitly (`CONSTRAINT orders_pk PRIMARY KEY (id)`) loses that name on the target.
 
@@ -1786,7 +1786,7 @@ Both `attr_namedpk` allowlist entries are gone and that table is now a live pari
 
 **Adjacent, and cheap — ✅ BOTH FIXED 2026-07-27, this note was stale.** `scripts/race-integration.ps1` used to fail to parse under Windows PowerShell 5.1 (UTF-8 em-dashes read as ANSI) and defaulted to `-Image golang:1.26`, older than `go.mod`'s `go >= 1.26.5`, so the default invocation aborted with a GOTOOLCHAIN error. The file is now ASCII and the default is `golang:1.26.5`. Verified 2026-07-28 before this correction — the entry had outlived its truth window, which is the same doc-lag class CLAUDE.md warns about; noted here rather than silently deleted so the fix is discoverable from the entry that reported it.
 
-### 86. The raw-copy cold-copy path produces an UNCLASSIFIED error, so ADR-0109's retry declines it (raised 2026-07-27; diagnosis corrected 2026-07-27) — *open*
+### 86. The raw-copy cold-copy path produces an UNCLASSIFIED error, so ADR-0109's retry declines it (raised 2026-07-27; diagnosis corrected 2026-07-27) — *✅ headline SHIPPED v0.104.0 (`bb6feebf`); one residual open, see below*
 
 **Corrected diagnosis.** This entry originally said the chunked and raw-copy callers "have no reconnect-and-resume" and that "the gap is not classification — it is that the chunked caller does not consult it". Both halves were wrong, and they were written from a regression-cycle observation without reading the retry wiring. Ground truth:
 
@@ -2055,7 +2055,7 @@ Add the code alongside `CodeTargetDeferrableKey`'s declaration, class `ClassRefu
 
 **(b) FILED AS ITEM 100, now FIXED (segment-granular retention) — prune's within-segment incremental trim produced a chain that could not be restored, and always had.** Prune's other retention shape drops LEADING incrementals inside the floor segment, leaving that segment's full anchored at S with its first survivor starting at S′ > S. The events in (S, S′] are gone, so the restore path refuses it — first on the severed parent link (`does not chain off preceding link … — branching/mis-stitched lineage`), then on the forward position gap. **Ground-truthed on a real rotated PG chain, in PLAINTEXT, on the pre-fix binary: prune exited 0 and the subsequent `ChainRestore` failed.** This is unrelated to encryption and is not caused by the gate — the gate SURFACES it, refusing pre-commit with nothing deleted, which is strictly better than destroying first and finding out at restore time. But it means `--keep-incrementals` on a NON-rotated (single-segment) chain now always refuses, because every such prune is a within-segment trim. The package doc's claim that "the segment full + the remaining incrementals still form a contiguous chain" is false; that claim is about positions and the trim breaks both the position boundary and the parent link. Deciding the shape — segment-granular retention only, re-anchoring the floor full, or an explicit "this narrows the window and drops the base" refusal with a remedy — is a contract call, filed rather than papered over.
 
-### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *✅ SHIPPED v0.104.3*
+### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *✅ SHIPPED v0.104.2*
 
 **What.** `backup compact` against an encrypted chain reports success — `groups_merged=1 segments_removed=3`, exit 0 — and the chain is then unrestorable. `verify` and `restore` both refuse at `unwrap chain cek`, zero rows, minutes after that same chain restored 230/230 md5-exact. Pre-existing, NOT a v0.104.1 regression: v0.104.0 and v0.103.2 do the same thing.
 
