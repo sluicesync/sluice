@@ -1,0 +1,193 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package backup
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+
+	"sluicesync.dev/sluice/internal/crypto"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
+)
+
+// # The chain-maintenance readability gate (Bug 214)
+//
+// `backup compact` is the operation that DELETES chain artifacts, and its
+// delete pass reasons LOCALLY: "the catalog no longer references these
+// files, so they are orphans." That reasoning is locally correct and
+// whole-chain incomplete — it never asks the only question an operator
+// cares about, which is whether the chain left behind still RESTORES.
+//
+// Bug 214 is what the gap costs. The orphan sweep deleted the chain-root
+// `manifest.json` because the merged segment owns a byte-identical copy;
+// true of the BYTES, false of the IDENTITY. The chain CEK's wrap is bound
+// to the root manifest (ADR-0152) and, for a passphrase chain, the read
+// side re-derives its KEK from the Argon2id salt recorded ONLY there
+// ([lineage.ReadRootManifest] → the CLI's buildReadEnvelope). Compaction
+// deleted it, logged `groups_merged=1 segments_removed=3`, and exited 0;
+// `verify` and `restore` then both refused at `unwrap chain cek` with zero
+// rows, on a chain that had restored 230/230 md5-exact minutes earlier —
+// including segments compaction never touched.
+//
+// The durable answer to that shape is not a more careful sweep. It is
+// making the operation PROVE the chain still reads, twice:
+//
+//   - BEFORE the catalog swap, against the prospective post-compact
+//     catalog. A refusal here has destroyed nothing: no catalog was
+//     written, no file deleted, every source segment is intact.
+//   - AFTER the delete pass, against what is actually on disk. A refusal
+//     here cannot undo the deletes, but it converts Bug 214's exit-0-with-
+//     an-unreadable-chain into a loud, named failure — which is the whole
+//     difference between an operator who knows their DR archive is broken
+//     and one who finds out at restore time.
+//
+// The gate is deliberately CHEAP: it re-walks the lineage and re-resolves
+// the chain's identity + key material. It does not decrypt chunks or
+// replay changes — a full `verify` inline would make every compact run
+// pay a whole-chain read, and the class this exists to catch (an identity
+// artifact swept out from under the read path) is entirely visible at the
+// header level. `sluice backup verify` remains the deep check.
+
+// verifyChainReadable re-reads the chain described by cat the way a
+// RESTORE would and refuses when it cannot. op names the operation for
+// the operator ("backup compact"); stage names WHICH of the two calls
+// fired, because the recovery differs sharply between them.
+//
+// env is the operator's read envelope when key material was supplied
+// (`--encrypt`), nil otherwise. With an envelope the gate performs the
+// real chain-CEK unwrap — the exact operation Bug 214 broke. Without one
+// it verifies the chain's identity + recorded key-derivation material and
+// says so; an encrypted chain can be compacted with no key (only a SIGNED
+// chain requires one), and refusing that would be a new refusal for a
+// workflow that has always worked.
+func verifyChainReadable(
+	ctx context.Context,
+	store irbackup.Store,
+	cat *lineage.Catalog,
+	env crypto.EnvelopeEncryption,
+	op, stage string,
+) error {
+	// 1. The structural walk: every segment's full + incrementals read,
+	//    every boundary validates. nil comparator — positions are
+	//    engine-native and maintenance has no live source engine to order
+	//    them with; the structural same-engine guarantee is what the
+	//    cross-engine restore path relies on too.
+	links, err := lineage.BuildLineageChainFromCatalog(ctx, store, cat, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %s readability check: the chain does not walk: %w", op, stage, err)
+	}
+	if len(links) == 0 {
+		// Never let the gate pass vacuously: an empty walk means there is
+		// nothing to have proven readable.
+		return fmt.Errorf("%s: %s %w", op, stage, errNoChainToVerify)
+	}
+
+	// 2. The chain's identity. Restore reads it from the lineage ROOT by
+	//    absolute path — never through the catalog — which is precisely
+	//    why a catalog-driven "is it still referenced?" sweep could not
+	//    see that it was load-bearing.
+	root, err := lineage.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("%s: %s readability check: read chain-root manifest: %w", op, stage, err)
+	}
+
+	enc := links[0].Manifest.ChainEncryption
+	if enc == nil {
+		if root == nil {
+			// A plaintext chain restores fine without the root manifest
+			// (nothing derives a key from it), and a chain compacted by a
+			// pre-fix binary legitimately has none. WARN, never refuse —
+			// a refusal here would reject chains that restore.
+			slog.WarnContext(
+				ctx, op+": the chain-root manifest is absent (a chain compacted by sluice <= v0.104.1, which deleted it). The chain is plaintext so it still restores; an ENCRYPTED chain in this state does not — see `sluice backup compact`'s Bug-214 note",
+				slog.String("stage", stage),
+			)
+		}
+		return nil
+	}
+	return verifyEncryptedChainIdentity(ctx, links[0].Manifest, root, enc, env, op, stage)
+}
+
+// verifyEncryptedChainIdentity is [verifyChainReadable]'s encrypted leg:
+// the chain-root manifest must still carry the key material the read side
+// rebuilds its envelope from, and — when the operator supplied a key —
+// the chain CEK must actually unwrap.
+func verifyEncryptedChainIdentity(
+	ctx context.Context,
+	first, root *irbackup.Manifest,
+	enc *irbackup.ChainEncryption,
+	env crypto.EnvelopeEncryption,
+	op, stage string,
+) error {
+	// Passphrase chains derive their KEK from the Argon2id salt recorded
+	// on the chain-root manifest and NOWHERE else, so losing that file
+	// revokes readability for the whole chain. KMS chains do not (the KEK
+	// lives in the KMS; the KEKRef travels on every segment full), so a
+	// missing root manifest costs them nothing and must not be refused.
+	if enc.KEKMode == "" || enc.KEKMode == crypto.KEKModePassphrase {
+		switch {
+		case root == nil:
+			return fmt.Errorf("%s: %s readability check: this chain is encrypted with a passphrase-derived key, and its chain-root %q — the file the restore side reads the Argon2id salt from to re-derive that key — is missing. Restoring it would fail at `unwrap chain cek` with a perfectly good passphrase. Recovery: a merged segment holds a byte-identical copy, so `cp <chain>/%s<id>/%s <chain>/%s` restores the chain's identity",
+				op, stage, lineage.ManifestFileName,
+				mergedSegmentDirPrefix, lineage.ManifestFileName, lineage.ManifestFileName)
+		case root.ChainEncryption == nil:
+			return fmt.Errorf("%s: %s readability check: the chain-root %q records no chain-encryption metadata while the chain's first segment is encrypted (kek_mode=%q) — the restore side would build a plaintext read path for an encrypted chain",
+				op, stage, lineage.ManifestFileName, enc.KEKMode)
+		case root.ChainEncryption.Argon2id == nil:
+			return fmt.Errorf("%s: %s readability check: the chain-root %q records no Argon2id parameters, so the restore side cannot re-derive this chain's passphrase KEK",
+				op, stage, lineage.ManifestFileName)
+		case enc.Argon2id != nil && !bytes.Equal(root.ChainEncryption.Argon2id.Salt, enc.Argon2id.Salt):
+			return fmt.Errorf("%s: %s readability check: the chain-root %q records a DIFFERENT Argon2id salt than the chain's first restorable segment — a read envelope built from the root would not unwrap the segment's CEK",
+				op, stage, lineage.ManifestFileName)
+		}
+	}
+
+	// The behavioural half: with key material in hand, do the unwrap the
+	// restore preflight does, against the same owner manifest it uses
+	// (the first restorable segment's full — the CEK wrap's ADR-0152
+	// identity binding). Per-chunk mode carries no chain-level CEK; its
+	// per-chunk wraps are probed by `backup verify`.
+	mode := enc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if env == nil {
+		slog.WarnContext(
+			ctx, op+": no key material was supplied (--encrypt), so the post-maintenance readability check verified the chain's identity + recorded key-derivation material but could NOT prove its key unwraps. Pass --encrypt with the chain's key to get the full check",
+			slog.String("stage", stage),
+			slog.String("kek_mode", enc.KEKMode),
+		)
+		return nil
+	}
+	if mode != crypto.EncryptModePerChain || len(enc.WrappedCEK) == 0 {
+		return nil
+	}
+	if _, err := lineage.UnwrapChainCEK(env, enc.WrappedCEK, first); err != nil {
+		return fmt.Errorf("%s: %s readability check: the chain's key does not unwrap (%s): %w",
+			op, stage, lineage.CEKUnwrapHint, err)
+	}
+	return nil
+}
+
+// errPreSweepReadability decorates a pre-delete gate failure with the one
+// fact that changes what the operator does next: nothing has been deleted.
+func errPreSweepReadability(op string, err error) error {
+	return fmt.Errorf("%w — refusing to delete the superseded segments; NO files were removed and every pre-maintenance segment is intact, so the chain is exactly as restorable as it was before this %s run", err, op)
+}
+
+// errPostSweepReadability decorates a post-delete gate failure. This is
+// the Bug-214 shape itself: the operation succeeded structurally and left
+// a chain that does not read. It cannot un-delete, so its whole job is to
+// make sure the run does NOT report success.
+func errPostSweepReadability(op string, err error) error {
+	return fmt.Errorf("%w — the superseded segments have already been deleted, so this %s CANNOT be undone by re-running it; restore from another copy of this chain, or apply the recovery the message above names before taking further backups against it", err, op)
+}
+
+// errNoChainToVerify guards the gate against a vacuous pass: a walk that
+// produced no links proved nothing.
+var errNoChainToVerify = errors.New("readability check: the chain walks to zero links — nothing was proven readable")

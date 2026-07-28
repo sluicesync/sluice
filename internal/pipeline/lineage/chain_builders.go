@@ -156,6 +156,22 @@ func BuildLineageChain(ctx context.Context, store irbackup.Store, cmp ir.Positio
 	if err != nil {
 		return nil, err
 	}
+	return BuildLineageChainFromCatalog(ctx, store, cat, cmp)
+}
+
+// BuildLineageChainFromCatalog is [BuildLineageChain] against a SUPPLIED
+// catalog instead of the one on disk. Same walk, same single
+// [ValidateBoundary] invariant — the only difference is where the
+// structural record comes from.
+//
+// It exists for the chain-maintenance readability gate (Bug 214): compact
+// builds its post-compact catalog IN MEMORY and must prove the chain that
+// catalog describes actually reads BEFORE it commits the swap, so a
+// maintenance run that would leave an unreadable chain refuses while every
+// pre-compaction byte is still on disk. Reading through the on-disk
+// lineage.json cannot answer that question — the swap is what would put it
+// there.
+func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat *Catalog, cmp ir.PositionMonotonicChecker) ([]SegmentRecord, error) {
 	if cat.RestorableFromSegment < 0 || cat.RestorableFromSegment >= len(cat.Segments) {
 		return nil, fmt.Errorf("lineage restorable_from_segment=%d out of range [0,%d) — corrupt lineage",
 			cat.RestorableFromSegment, len(cat.Segments))

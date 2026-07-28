@@ -1651,12 +1651,26 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 	if err != nil {
 		return err
 	}
+	// Read envelope for the Bug-214 readability gate: compact never
+	// decrypts anything, but with the operator's key in hand the gate can
+	// prove the compacted chain's CEK still unwraps rather than only that
+	// its identity survived. nil when --encrypt was not supplied (the
+	// gate says so and degrades to the identity check).
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("backup compact: read root manifest: %w", err)
+	}
+	envelope, err := c.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return err
+	}
 	res, err := backup.CompactChain(ctx, store, backup.CompactOpts{
 		MergeWindow:     c.MergeWindow,
 		DryRun:          c.DryRun,
 		SmartCompaction: c.SmartCompaction,
 		PKStrategy:      backup.PKStrategy(c.CompactionPKStrategy),
 		Signer:          signer,
+		Envelope:        envelope,
 	})
 	if err != nil {
 		return err

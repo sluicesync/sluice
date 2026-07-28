@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -149,6 +150,16 @@ type CompactOpts struct {
 	// survivor set is re-signed. When the chain is signed and Signer is
 	// nil, compact REFUSES rather than emit an unsigned merged successor.
 	Signer *lineage.Signer
+
+	// Envelope, when non-nil, is the operator's READ envelope for an
+	// encrypted chain. Compaction never encrypts or decrypts anything —
+	// this is consumed only by the Bug-214 readability gate
+	// ([verifyChainReadable]), which uses it to prove the compacted
+	// chain's CEK still unwraps before and after the destructive sweep.
+	// nil (no `--encrypt`) degrades the gate to its identity-only check
+	// with a WARN; an encrypted chain has always been compactable
+	// without key material and stays so.
+	Envelope crypto.EnvelopeEncryption
 }
 
 // CompactResult summarises a [CompactChain] run.
@@ -560,15 +571,8 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		sort.Strings(res.TablesWithoutPK)
 	}
 
-	// Catalog swap (the linearization commit). Build the post-compact
-	// lineage by walking cat.Segments and either passing each segment
-	// through OR (when it's the OLDEST source of a planned merge
-	// group) emitting the merged segment + skipping the rest.
-	cat.Segments = buildPostCompactSegments(cat, planned, now())
-	cat.RestorableFromSegment = 0
-	cat.UpdatedAt = now().UTC()
-	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
-		return nil, fmt.Errorf("backup compact: rewrite lineage catalog: %w", err)
+	if err := commitCompactedChain(ctx, store, cat, planned, opts, now()); err != nil {
+		return nil, err
 	}
 
 	// ADR-0154: re-sign the merged survivor set at its new positions +
@@ -578,36 +582,8 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		return nil, fmt.Errorf("backup compact: re-sign merged chain: %w", err)
 	}
 
-	// Post-commit delete pass: the merged segment is now authoritative;
-	// every source's leftover files are orphans. Failures here are
-	// non-fatal by design (the catalog swap above already committed,
-	// so the chain is correct either way) — but a failed sweep leaks
-	// backup-store disk forever, so it must leave a breadcrumb for the
-	// operator rather than vanish.
-	for i := range planned {
-		pg := &planned[i]
-		if pg.plan.MergedSegmentID == "" {
-			continue
-		}
-		for _, s := range pg.span {
-			seg := &eligible[s.idx]
-			target := seg.Dir
-			var sweepErr error
-			if seg.Dir == "" {
-				target = "(root segment artifacts)"
-				sweepErr = sweepRootSegmentArtifacts(ctx, store, seg)
-			} else {
-				sweepErr = sweepSegmentSubdir(ctx, store, seg.Dir)
-			}
-			if sweepErr != nil {
-				slog.WarnContext(
-					ctx, "backup compact: orphan sweep failed — superseded segment files remain in the backup store",
-					slog.String("segment_dir", target),
-					slog.String("merged_into", pg.plan.MergedSegmentID),
-					slog.String("error", sweepErr.Error()),
-				)
-			}
-		}
+	if err := sweepSupersededSegments(ctx, store, cat, eligible, planned, opts); err != nil {
+		return nil, err
 	}
 
 	logArgs := []any{
@@ -629,6 +605,101 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	}
 	slog.InfoContext(ctx, "backup compact: lineage compacted", logArgs...)
 	return res, nil
+}
+
+// commitCompactedChain performs compaction's linearization commit: build
+// the post-compact segment list (walking cat.Segments and either passing
+// each segment through OR, when it's the OLDEST source of a planned merge
+// group, emitting the merged segment and skipping the rest), PROVE the
+// chain that list describes actually reads, then swap the catalog in one
+// Put. Mutates cat in place on success.
+//
+// The proof is the Bug-214 gate's first leg, and its placement is the
+// point: BEFORE the swap, so a refusal leaves the pre-compaction chain
+// byte-for-byte authoritative — the staged merged dirs are then orphan
+// garbage the next run cleans, and nothing an operator can restore from
+// has changed.
+func commitCompactedChain(
+	ctx context.Context,
+	store irbackup.Store,
+	cat *lineage.Catalog,
+	planned []plannedGroup,
+	opts CompactOpts,
+	now time.Time,
+) error {
+	postSegments := buildPostCompactSegments(cat, planned, now)
+
+	prospective := *cat
+	prospective.Segments = postSegments
+	prospective.RestorableFromSegment = 0
+	if err := verifyChainReadable(ctx, store, &prospective, opts.Envelope, "backup compact", "pre-swap"); err != nil {
+		return errPreSweepReadability("backup compact", err)
+	}
+
+	cat.Segments = postSegments
+	cat.RestorableFromSegment = 0
+	cat.UpdatedAt = now.UTC()
+	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
+		return fmt.Errorf("backup compact: rewrite lineage catalog: %w", err)
+	}
+	return nil
+}
+
+// sweepSupersededSegments is compaction's post-commit delete pass: the
+// merged segments are now authoritative, so every source's leftover files
+// are orphans. Per-segment sweep failures are non-fatal by design (the
+// catalog swap already committed, so the chain is correct either way) —
+// but a failed sweep leaks backup-store disk forever, so it must leave a
+// breadcrumb for the operator rather than vanish.
+//
+// The Bug-214 gate's SECOND leg runs after the deletes and is the one
+// that would have caught Bug 214 as it shipped. It cannot un-delete, so
+// its entire job is to stop the run reporting success on a chain it has
+// just made unreadable — the difference between an operator who knows
+// their DR archive is broken and one who finds out at restore time.
+func sweepSupersededSegments(
+	ctx context.Context,
+	store irbackup.Store,
+	cat *lineage.Catalog,
+	eligible []lineage.Segment,
+	planned []plannedGroup,
+	opts CompactOpts,
+) error {
+	for i := range planned {
+		pg := &planned[i]
+		if pg.plan.MergedSegmentID == "" {
+			continue
+		}
+		for _, s := range pg.span {
+			sweepOneSupersededSegment(ctx, store, &eligible[s.idx], pg.plan.MergedSegmentID)
+		}
+	}
+	if err := verifyChainReadable(ctx, store, cat, opts.Envelope, "backup compact", "post-sweep"); err != nil {
+		return errPostSweepReadability("backup compact", err)
+	}
+	return nil
+}
+
+// sweepOneSupersededSegment deletes one merged-away source segment's
+// files, WARNing (never failing) on a partial sweep.
+func sweepOneSupersededSegment(ctx context.Context, store irbackup.Store, seg *lineage.Segment, mergedInto string) {
+	target := seg.Dir
+	var sweepErr error
+	if seg.Dir == "" {
+		target = "(root segment artifacts)"
+		sweepErr = sweepRootSegmentArtifacts(ctx, store, seg)
+	} else {
+		sweepErr = sweepSegmentSubdir(ctx, store, seg.Dir)
+	}
+	if sweepErr == nil {
+		return
+	}
+	slog.WarnContext(
+		ctx, "backup compact: orphan sweep failed — superseded segment files remain in the backup store",
+		slog.String("segment_dir", target),
+		slog.String("merged_into", mergedInto),
+		slog.String("error", sweepErr.Error()),
+	)
 }
 
 // segmentByteTotal sums every chunk's byte length across the segment's
@@ -1019,10 +1090,41 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 	return nil
 }
 
-// sweepRootSegmentArtifacts deletes the conventional-layout files at
-// the lineage root that belong to a merged source. After compact the
-// merged segment lives under its own sub-dir, so the root manifest +
-// root incrementals + root chunks are orphans.
+// sweepRootSegmentArtifacts deletes the conventional-layout DATA files
+// at the lineage root that belong to a merged source: its incrementals
+// and its chunks. After compact the merged segment owns a copy of every
+// one of them at a catalogued path, and nothing resolves the root copies
+// any more — the catalog is the only thing that names them, and it no
+// longer does.
+//
+// The chain-root `manifest.json` is DELIBERATELY NOT swept (Bug 214).
+// It is not a redundant copy of segment 0's full — it is the CHAIN'S
+// IDENTITY, and the read path resolves it by absolute path at the
+// lineage root, never through the catalog:
+//
+//   - ADR-0152 binds the chain CEK's wrap to the root manifest's
+//     identity, and
+//   - for a passphrase chain the Argon2id salt the restore side
+//     re-derives the KEK from is recorded ONLY there
+//     ([lineage.ReadRootManifest] → the CLI's buildReadEnvelope).
+//
+// Deleting it therefore revokes readability for EVERY segment, including
+// ones compaction never touched — which is what shipped: `compact` exited
+// 0 while `verify` and `restore` both refused at `unwrap chain cek` with
+// zero rows. The disk saved was one small JSON file; that is not a trade
+// worth making, and "this file is only needed sometimes" is exactly the
+// reasoning that produced the bug. So it is kept UNCONDITIONALLY — not
+// "when the chain is encrypted" — because a keep-it-when rule is one
+// future encryption mode, one future reader, or one future `if` away from
+// the same outage, and nobody would notice until a restore.
+//
+// What survives is an identity HEADER, not a restorable segment: its
+// table/chunk references point at the root chunks this sweep does remove.
+// That is safe by construction — the post-compact catalog never names it,
+// and the one reader that could reach it without the catalog
+// ([lineage.ResolveLineage]'s legacy single-segment synthesis, used only
+// when lineage.json is ABSENT) refuses loudly the moment it sees a
+// `seg-*` directory, which a compacted chain always has.
 //
 // Best-effort within the sweep: every delete is ATTEMPTED, and each
 // failure is collected (naming its path) into the joined return so
@@ -1033,9 +1135,6 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 // partial sweep stays clean.
 func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *lineage.Segment) error {
 	var errs []error
-	if err := store.Delete(ctx, lineage.ManifestFileName); err != nil {
-		errs = append(errs, fmt.Errorf("delete %q: %w", lineage.ManifestFileName, err))
-	}
 	for _, ip := range seg.Incrementals {
 		if err := store.Delete(ctx, ip); err != nil {
 			errs = append(errs, fmt.Errorf("delete %q: %w", ip, err))
