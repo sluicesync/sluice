@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Stopping `sluice backup stream` while it is still starting up now exits cleanly instead of reporting a failure.** Every startup step reads the backup destination, so a SIGTERM (or Ctrl-C, or `q` on the live panel) that arrived during startup surfaced as an error naming whichever step it interrupted — `backup stream: probe signed chain: context canceled` was the shape a CI run caught, but the concurrent-writer preflight, the parent resolution and the initial state write could all produce their own wording. The process exited 1, which a supervisor or an orchestrator reasonably reads as a crash. sluice now distinguishes your own cancellation from a startup fault: the former exits 0 with a log line saying so, nothing having been in flight to lose, and a genuine startup failure — including one that happens to race the shutdown — still fails loudly and exits non-zero as before.
+
+**Refusing to extend a signed backup chain no longer leaks the replication connection it had already opened.** `backup stream` cannot yet sign its rollover manifests, so it refuses a signed chain up front; that refusal returned before arming the teardown for the source replication slot it had opened a moment earlier. The connection is now closed on that path.
+
 ## [0.104.0] - 2026-07-27
 
 A backup-format change that closes a chunk-relocation forgery, and a fix for an availability defect the previous release's own fix created. Minor rather than patch because encrypted backups written from this version record a new format version and a different backup identifier; older chains keep opening exactly as before.

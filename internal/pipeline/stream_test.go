@@ -6,7 +6,9 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // TestBackupStream_Validate covers the same validation surface as
@@ -335,6 +338,16 @@ func TestBackupStream_PositionInvalid_LoudFailure(t *testing.T) {
 // The fake CDC reader's emit-then-close shape doesn't naturally model
 // a blocking source. Use a blocking-fakeCDCEngine subclass that emits
 // on a delay so the rollover loop is mid-window when ctx fires.
+//
+// The cancel is gated on the rollover loop actually starting, not on a
+// wall-clock sleep. The sleep-only version raced Run's setup: on a slow
+// host the cancel landed in a setup store read instead of in the window,
+// and Run reported that step as a failure (roadmap item 89 — it failed
+// roughly one run in a hundred, and only on the tag-only Windows job).
+// Readout is the first thing each loop iteration touches, so it is the
+// exact "the window is open" edge; the sleep after it is what keeps this
+// a mid-window cancel rather than a boundary one, and it cannot race —
+// the window is an hour long and the source never emits.
 func TestBackupStream_ContextCancel_DuringRollover_CleanExit(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
@@ -363,7 +376,11 @@ func TestBackupStream_ContextCancel_DuringRollover_CleanExit(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	windowOpen := make(chan struct{})
+	var once sync.Once
+	stream.Readout = func([]progress.Field) { once.Do(func() { close(windowOpen) }) }
 	go func() {
+		<-windowOpen
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
@@ -372,6 +389,211 @@ func TestBackupStream_ContextCancel_DuringRollover_CleanExit(t *testing.T) {
 	if err != nil {
 		t.Errorf("stream.Run on ctx cancel = %v; want nil (clean exit)", err)
 	}
+}
+
+// TestBackupStream_ContextCancel_DuringSetup_CleanExit is the deterministic
+// half of the test above: it forces the cancellation to land INSIDE a setup
+// store read rather than racing one.
+//
+// The wrapper cancels the run context at the moment a named setup read
+// stats its object, so the store's ctx.Err() entry guard returns
+// context.Canceled from within that step. Both cases are pinned rather than
+// the reported one alone: the signed-chain probe is what the v0.104.0 tag's
+// Windows job happened to name, but the whole setup phase reads the store
+// through the same guard, so a classifier keyed on the probe's wording
+// would leave every sibling step still reporting a cancel as a failure.
+func TestBackupStream_ContextCancel_DuringSetup_CleanExit(t *testing.T) {
+	cases := []struct {
+		name string
+		// cancelAtExistsPath is the object whose Exists call cancels the
+		// run context, choosing which setup step gets interrupted.
+		cancelAtExistsPath string
+	}{
+		// refuseSignedChain — the reported instance.
+		{"signed-chain probe", lineage.LineageSigFileName},
+		// preflightStreamState → readStreamState, the FIRST store read
+		// newRolloverLoop makes. Different call site, different wrapping
+		// prose ("stream: read existing stream_state: …"), same classifier.
+		{"concurrent-writer preflight", DefaultStreamStateFilename},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			local, _ := blobcodec.NewLocalStore(dir)
+
+			parent := &irbackup.Manifest{
+				FormatVersion: irbackup.BackupFormatVersion,
+				CreatedAt:     time.Now().UTC(),
+				SourceEngine:  "postgres",
+				Schema:        &ir.Schema{},
+				Kind:          irbackup.BackupKindFull,
+				EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
+			}
+			parent.BackupID = irbackup.ComputeBackupID(parent)
+			writeParentFullManifest(t, local, parent)
+			// The preflight only reads stream_state.json when it exists, so
+			// seed one; a cold store would skip that read entirely.
+			seedStreamState(t, local, DefaultStreamStateFilename)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store := &cancelOnExistsStore{Store: local, path: c.cancelAtExistsPath, cancel: cancel}
+
+			stream := &BackupStream{
+				Source:             &blockingCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}},
+				SourceDSN:          "src",
+				Store:              store,
+				ParentRef:          parent.BackupID,
+				RolloverWindow:     time.Hour,
+				RolloverMaxChanges: 1_000_000,
+				RolloverMaxBytes:   1 << 30,
+				Force:              true, // the seeded state file is another "writer"
+				pidHostFn:          func() (int, string) { return 1, "h" },
+			}
+
+			if err := stream.Run(ctx); err != nil {
+				t.Errorf("stream.Run cancelled during setup = %v; want nil (clean exit)", err)
+			}
+			if !store.fired {
+				t.Fatalf("the %s never read %q; the test proved nothing", c.name, c.cancelAtExistsPath)
+			}
+		})
+	}
+}
+
+// cancelOnExistsStore cancels the run context the first time a setup step
+// stats the named object, then lets the underlying store's ctx.Err() entry
+// guard fail that same call. That puts the cancellation inside the step
+// deterministically. Single-goroutine by construction — Run's setup phase
+// is sequential and the fake CDC reader never touches the store.
+type cancelOnExistsStore struct {
+	irbackup.Store
+
+	path   string
+	cancel func()
+	fired  bool
+}
+
+func (s *cancelOnExistsStore) Exists(ctx context.Context, path string) (bool, error) {
+	if path == s.path && !s.fired {
+		s.fired = true
+		s.cancel()
+	}
+	return s.Store.Exists(ctx, path)
+}
+
+// seedStreamState writes a liveness file so the concurrent-writer preflight
+// reaches its Get (it short-circuits on a store with no state file).
+func seedStreamState(t *testing.T, store irbackup.Store, path string) {
+	t.Helper()
+	st := &streamState{PID: 999, Host: "other-host", StartedAt: time.Now().UTC(), LastRolloverAt: time.Now().UTC()}
+	if err := writeStreamState(context.Background(), store, path, st); err != nil {
+		t.Fatalf("seed stream_state: %v", err)
+	}
+}
+
+// TestBackupStream_SetupError_StaysLoud is the other half of the pin above:
+// the clean-exit arm must not swallow a real setup failure. Both of
+// cleanExitOnCallerCancel's guards get their own case, because a classifier
+// that turns a genuine failure into exit 0 is strictly worse than the wrong
+// error message it was added to fix.
+func TestBackupStream_SetupError_StaysLoud(t *testing.T) {
+	cases := []struct {
+		name string
+		// probeErr is what the signed-chain probe's store read returns.
+		probeErr error
+		// cancelFirst cancels the run context before Run starts, so the
+		// ctx.Err() guard is satisfied and only the errors.Is arm can hold
+		// the error loud.
+		cancelFirst bool
+		want        string
+	}{
+		{
+			name:     "unrelated failure, live context",
+			probeErr: errors.New("store: 403 forbidden"),
+			want:     "403 forbidden",
+		},
+		{
+			name:        "unrelated failure racing a cancel",
+			probeErr:    errors.New("store: 403 forbidden"),
+			cancelFirst: true,
+			want:        "403 forbidden",
+		},
+		{
+			// The store reports a cancellation from a context that is not
+			// ours (its own per-call deadline, a pooled connection's). Our
+			// context is live, so this is a store fault and stays loud.
+			name:     "foreign context.Canceled, live context",
+			probeErr: fmt.Errorf("store: internal read: %w", context.Canceled),
+			want:     "probe signed chain",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			local, _ := blobcodec.NewLocalStore(dir)
+
+			parent := &irbackup.Manifest{
+				FormatVersion: irbackup.BackupFormatVersion,
+				CreatedAt:     time.Now().UTC(),
+				SourceEngine:  "postgres",
+				Schema:        &ir.Schema{},
+				Kind:          irbackup.BackupKindFull,
+				EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/300"}`},
+			}
+			parent.BackupID = irbackup.ComputeBackupID(parent)
+			writeParentFullManifest(t, local, parent)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store := &failingSigProbeStore{Store: local, err: c.probeErr}
+			if c.cancelFirst {
+				// Cancel only once setup is past its own store reads, so the
+				// probe is still reached: Readout fires at the top of the
+				// rollover loop, which this test never gets to — so cancel
+				// from the probe wrapper itself instead.
+				store.alsoCancel = cancel
+			}
+
+			stream := &BackupStream{
+				Source:             &blockingCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}},
+				SourceDSN:          "src",
+				Store:              store,
+				ParentRef:          parent.BackupID,
+				RolloverWindow:     time.Hour,
+				RolloverMaxChanges: 1_000_000,
+				RolloverMaxBytes:   1 << 30,
+				pidHostFn:          func() (int, string) { return 1, "h" },
+			}
+
+			err := stream.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("stream.Run = %v; want an error containing %q (a real setup failure must stay loud)", err, c.want)
+			}
+		})
+	}
+}
+
+// failingSigProbeStore fails the signed-chain probe with a caller-supplied
+// error, optionally cancelling the run context first so the errors.Is arm
+// of cleanExitOnCallerCancel is the only thing keeping the error loud.
+type failingSigProbeStore struct {
+	irbackup.Store
+
+	err        error
+	alsoCancel func()
+}
+
+func (s *failingSigProbeStore) Exists(ctx context.Context, path string) (bool, error) {
+	if path == lineage.LineageSigFileName {
+		if s.alsoCancel != nil {
+			s.alsoCancel()
+		}
+		return false, s.err
+	}
+	return s.Store.Exists(ctx, path)
 }
 
 // blockingCDCEngine is a fake source whose CDC reader emits no changes

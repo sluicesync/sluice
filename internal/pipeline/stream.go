@@ -343,16 +343,21 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 	init, err := b.newRolloverLoop(ctx)
 	if err != nil {
-		return err
+		return cleanExitOnCallerCancel(ctx, err)
 	}
-	// ADR-0154 Phase 1: `backup stream` does not yet sign its rollover
-	// manifests — refuse to extend a signed chain. See [refuseSignedChain].
-	if err := b.refuseSignedChain(ctx); err != nil {
-		return err
-	}
+	// The pump is returned OPEN and the stop channel already registered, so
+	// arm both teardowns BEFORE the signed-chain probe: its refusal (and its
+	// cancel arm below) exits Run, and leaving the defers below it leaked a
+	// live replication connection + a registered stop channel on that path.
 	cdc := init.cdc
 	defer func() { migcore.CloseIf(cdc) }()
 	defer init.deregisterStopCh()
+
+	// ADR-0154 Phase 1: `backup stream` does not yet sign its rollover
+	// manifests — refuse to extend a signed chain. See [refuseSignedChain].
+	if err := b.refuseSignedChain(ctx); err != nil {
+		return cleanExitOnCallerCancel(ctx, err)
+	}
 
 	changesCh := init.changesCh
 	chainCEK := init.chainCEK
@@ -573,6 +578,48 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// cleanExitOnCallerCancel is [BackupStream.Run]'s setup-phase exit
+// classifier: it maps the operator's own cancellation onto the same clean
+// exit the rollover loop takes, and returns every other error untouched.
+//
+// Every setup step reads the store — the concurrent-writer preflight, the
+// rotation recovery, the segment + parent resolution, the chain-resume
+// preflight, the initial state write, the signed-chain probe — and every
+// [irbackup.Store] implementation returns ctx.Err() from its entry guard.
+// So a SIGTERM (or a live-panel q) landing anywhere in setup surfaced as a
+// failure naming whichever step it happened to interrupt; "backup stream:
+// probe signed chain: context canceled" is the shape a tag's Windows job
+// caught (roadmap item 89), but the probe is one of eight equally reachable
+// wordings. That is the caller's own cancellation, never a setup fault —
+// the same distinction the engine setErr allowlists draw for their
+// ctx.Err() sites.
+//
+// Both guards are load-bearing, because the failure mode of getting this
+// wrong is a swallowed real error. `ctx.Err() != nil` keeps an error that
+// merely CARRIES context.Canceled while our own context is still live (a
+// store's internal per-call context, say) loud; the errors.Is arm keeps an
+// unrelated failure that happens to race the cancel — a permission denial,
+// a corrupt manifest, the signed-chain refusal itself — loud too.
+//
+// The disposition is nil rather than ctx.Err(), matching the loop's
+// ctx-cancel arm above: nothing is in flight during setup, so there is
+// nothing to drain and nothing lost. It also has to be nil for the CLI to
+// read it as a clean stop — the non-pretty `backup stream` path returns
+// Run's error straight to kong, where a bare context.Canceled exits 1.
+func cleanExitOnCallerCancel(ctx context.Context, err error) error {
+	if ctx.Err() == nil {
+		return err
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	slog.InfoContext(
+		ctx, "stream: cancelled during setup; exiting cleanly (no rollover was in flight)",
+		slog.String("interrupted_at", err.Error()),
+	)
+	return nil
 }
 
 // rolloverInit is the fully-initialised state newRolloverLoop hands to
