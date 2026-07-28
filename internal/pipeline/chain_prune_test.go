@@ -15,46 +15,89 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// TestPruneLineage_KeepIncrementalsDropsOldest: 1 full + 5
-// incrementals in a one-segment lineage, keep 2, the 3 oldest get
-// pruned; the lineage's open segment retains 2.
-func TestPruneLineage_KeepIncrementalsDropsOldest(t *testing.T) {
+// TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted
+// pins a defect the item-95 readability gate SURFACED (it did not create
+// it), and it is why this test replaces the old
+// `TestPruneLineage_KeepIncrementalsDropsOldest`, which asserted the
+// trim succeeded.
+//
+// Prune's other retention shape — dropping LEADING incrementals inside
+// the floor segment — leaves that segment's full anchored at S with its
+// first surviving incremental starting at some S' > S. The events in
+// (S, S'] are simply gone, so the chain no longer restores: the restore
+// path's own `lineage.BuildLineageChain` refuses it, first on the
+// severed parent link and then (with a real comparator) on the forward
+// position gap. Ground-truthed on a REAL rotated Postgres chain, in
+// PLAINTEXT, on the pre-fix binary: prune exited 0 and the subsequent
+// `ChainRestore` failed with `build lineage: … does not chain off
+// preceding link … — branching/mis-stitched lineage`.
+//
+// The gate converts that from "prune destroys, and you find out at
+// restore time" into "prune refuses, nothing was deleted". Refusing is
+// the correct half of the loud-failure tenet; making the SHAPE work
+// again (segment-granular retention, or re-anchoring the floor full) is
+// a contract decision filed for the roadmap, not something this gate
+// should paper over.
+func TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 5)
 
-	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
-	if err != nil {
-		t.Fatalf("PruneChain: %v", err)
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
+	if err == nil {
+		t.Fatal("prune reported success over a chain whose restore path refuses to walk")
 	}
-	if len(res.Pruned) != 3 {
-		t.Errorf("Pruned count = %d; want 3", len(res.Pruned))
+	coded, ok := sluicecode.FromError(err)
+	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
+		t.Fatalf("refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, err)
 	}
-	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
-	if err != nil || !ok {
-		t.Fatalf("post-prune lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
+	if !strings.Contains(err.Error(), "NO files were removed") {
+		t.Errorf("err = %q; want the pre-sweep decoration promising nothing was destroyed", err)
 	}
-	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 2 {
-		t.Errorf("post-prune segment = %+v; want 1 segment with 2 incrementals", cat.Segments)
+	// The promise has to be true: catalog and manifests untouched.
+	cat, okCat, err := lineage.LoadLineageCatalog(context.Background(), store)
+	if err != nil || !okCat {
+		t.Fatalf("post-refusal lineage.LoadLineageCatalog: ok=%v err=%v", okCat, err)
+	}
+	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 5 {
+		t.Errorf("refused prune mutated the catalog: %+v", cat.Segments)
+	}
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("refused prune left the chain unwalkable: %v", err)
 	}
 }
 
 // TestPruneLineage_KeepDuration drops incrementals older than the
-// threshold.
+// threshold. The threshold retires the WHOLE segment's incrementals
+// (leaving its full as the restore base) rather than trimming leading
+// ones — the segment-granular shape that stays restorable; see
+// [TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted]
+// for why the partial-trim variant this used to assert cannot.
 func TestPruneLineage_KeepDuration(t *testing.T) {
 	store := newMemStore()
 	base := seedLineageChain(t, store, 5)
-	now := func() time.Time { return base.Add(5*time.Hour + time.Minute) }
+	now := func() time.Time { return base.Add(100 * time.Hour) }
 
 	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepDuration: 2 * time.Hour, Now: now})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
-	// Incrementals at base+1h..base+5h; now=base+5h1m; keep < 2h old →
-	// keep base+4h and base+5h (2 newest), drop the 3 oldest.
-	if len(res.Pruned) != 3 {
-		t.Errorf("Pruned = %d; want 3 (older-than-2h)", len(res.Pruned))
+	// Incrementals at base+1h..base+5h; now=base+100h; nothing is younger
+	// than 2h, so all 5 go and the segment full remains the restore base.
+	if len(res.Pruned) != 5 {
+		t.Errorf("Pruned = %d; want 5 (older-than-2h)", len(res.Pruned))
+	}
+	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
+	if err != nil || !ok {
+		t.Fatalf("post-prune lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
+	}
+	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 0 {
+		t.Errorf("post-prune segment = %+v; want 1 segment with 0 incrementals", cat.Segments)
+	}
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-prune chain does not walk: %v", err)
 	}
 }
 
@@ -177,9 +220,28 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	if got.RestorableFromSegment != 0 {
 		t.Errorf("RestorableFromSegment = %d; want 0 (re-based to seg-1)", got.RestorableFromSegment)
 	}
-	// seg0 full + its chunks are gone; seg-1 full survives.
-	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); ex {
-		t.Error("seg0 root full not deleted after whole-segment prune")
+	// seg0's DATA is gone, but the chain-root manifest SURVIVES.
+	//
+	// This assertion is INVERTED from what it pinned before (roadmap item
+	// 95). It encoded a plaintext-era assumption: that the root segment's
+	// full is just segment 0's manifest, redundant once segment 0 is
+	// retired. Encryption changed what "redundant" means. That file is the
+	// CHAIN'S identity — ADR-0152 binds the chain CEK's wrap to it, and a
+	// passphrase chain's Argon2id salt is recorded ONLY there — so deleting
+	// it revoked readability for every REMAINING segment while the operator
+	// held a correct passphrase. Prune fires on a retention schedule, so its
+	// reach was larger than Bug 214's compaction twin. What survives is a
+	// small dangling identity header for a legitimately retired root
+	// segment; that is the right trade, and it is unconditional rather than
+	// encryption-gated because "we only need this file sometimes" is exactly
+	// the reasoning that produced Bug 214.
+	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); !ex {
+		t.Error("item 95: prune deleted the chain-root manifest — the chain's identity, not segment 0's data")
+	}
+	// …and the retirement is real: seg0's incrementals ARE gone, so keeping
+	// the header did not quietly turn prune into a no-op.
+	if ex, _ := store.Exists(context.Background(), "manifests/incr-01.json"); ex {
+		t.Error("seg0 incrementals survived a whole-segment prune")
 	}
 	if ex, _ := store.Exists(context.Background(), "seg-1/manifest.json"); !ex {
 		t.Error("seg-1 full must survive (it is the new restore base)")

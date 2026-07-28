@@ -267,8 +267,9 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		)
 	}
 
-	// 2.5. Encryption pre-flight at the lineage root.
-	if err := r.preflightEncryption(root.Manifest); err != nil {
+	// 2.5. Encryption pre-flight at the chain's IDENTITY (not merely at
+	//      the first restorable link — see [ChainRestore.chainIdentityManifest]).
+	if err := r.preflightEncryption(r.chainIdentityManifest(ctx, root.Manifest)); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
@@ -616,6 +617,49 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *lineage.SegmentRecor
 		segCodec:           full.Segment.CodecOrDefault(),
 	}
 	return rest.Run(ctx)
+}
+
+// chainIdentityManifest returns the manifest the chain-level encryption
+// preflight must read: the chain-ROOT `manifest.json`, resolved by
+// absolute path, whenever it records chain encryption — falling back to
+// first (the oldest restorable link's full) otherwise.
+//
+// The distinction is invisible until retention retires segment 0. A
+// rotated chain's CHANGE chunks are ALL sealed under the stream's
+// original chain CEK — the one wrapped on the chain-root manifest —
+// while each rotation-born segment full mints its OWN CEK for its row
+// chunks, which is fine because a segment full is restored through its
+// own nested [Restore] against its own segment root. So `links[0]` is
+// the chain's identity only while segment 0 is still in the catalog;
+// after a whole-segment prune it is a later segment full whose CEK never
+// sealed a change chunk, and every surviving incremental then dies at
+// `chunk failed authenticated decryption` — a chain that verifies as
+// structurally intact and cannot be restored.
+//
+// Reading the identity by absolute path is the same move the
+// chain-maintenance readability gate makes, and it is the other half of
+// why the chain-root manifest is KEPT when its segment is pruned away
+// (roadmap items 94/95): the file is the chain's identity — its CEK wrap
+// and its Argon2id salt — not a spare copy of segment 0's manifest.
+//
+// The fallback is load-bearing too: a chain compacted by a pre-fix binary
+// has NO root manifest, and a plaintext chain's root records no chain
+// encryption. Both must keep restoring exactly as before, so the
+// substitution happens only when the root manifest actually carries the
+// chain-encryption metadata this preflight consumes.
+func (r *ChainRestore) chainIdentityManifest(ctx context.Context, first *irbackup.Manifest) *irbackup.Manifest {
+	root, err := lineage.ReadRootManifest(ctx, r.Store)
+	if err != nil {
+		slog.WarnContext(
+			ctx, "chain restore: cannot read the chain-root manifest; falling back to the oldest restorable segment's full for the encryption preflight",
+			slog.String("error", err.Error()),
+		)
+		return first
+	}
+	if root == nil || root.ChainEncryption == nil {
+		return first
+	}
+	return root
 }
 
 // preflightEncryption validates the chain root's encryption metadata
