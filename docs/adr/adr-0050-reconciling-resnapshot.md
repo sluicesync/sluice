@@ -1,10 +1,13 @@
 # ADR-0050 — Reconciling / incremental re-snapshot for CDC position-loss recovery
 
-**Status:** **Accepted (2026-05-18) — design dialogue complete: all
+**Status:** **Accepted (design, 2026-05-18) — NOT IMPLEMENTED.** All
 5 DPs + the structural question signed off & owner-endorsed.
-Implementation gated on 3 NON-design conditions (empirical
-cost-validation incl. the DP-2 Vitess A/B · ADR-0049 implementation ·
-real operator demand); still demand-gated — see "Status / next".**
+Implementation was gated on 3 NON-design conditions; one has since
+CLEARED — **ADR-0049 shipped in v0.70.0–v0.71.0**, so the
+hard-sequencing prerequisite no longer blocks. The other two still
+hold: empirical cost-validation (incl. the DP-2 Vitess A/B) and real
+operator demand. Nothing in `internal/` or `cmd/` references ADR-0050
+(verified 2026-07-28); it remains demand-gated — see "Status / next".
 (Header reconciled 2026-05-18: the dialogue is complete; the prior
 "Proposed; sign-off pending" wording was superseded.) Design pass
 *before* code; from the Track-1 PlanetScale/Vitess readiness
@@ -364,26 +367,24 @@ recovery.
 
 ## Status / next
 
-**Proposed; design dialogue COMPLETE (2026-05-18, owner-endorsed).**
-**All decision points resolved: DP-1–DP-5 + the structural
-question.** No design questions remain open. Implementation is gated
-**only** on three non-design gates — do **not** implement until all
-three clear:
+**Accepted (design) — NOT IMPLEMENTED; design dialogue COMPLETE
+(2026-05-18, owner-endorsed).** **All decision points resolved:
+DP-1–DP-5 + the structural question.** No design questions remain
+open. Implementation is gated **only** on three non-design gates — do
+**not** implement until all three clear:
 1. **Empirical cost-validation** — real testing data must show
    reconciling-resnapshot beats full re-copy on representative
    tables; the Vitess native-vs-`sluice_watermark` A/B (DP-2) is a
-   deliberate part of that evidence.
+   deliberate part of that evidence. **STILL OPEN.**
 2. **Hard-sequencing (DP-3)** — **ADR-0049 must be *implemented*
    before any ADR-0050 implementation**; ADR-0050 DP-3's correctness
-   is contingent on ADR-0049's per-engine DDL-boundary signal. Update
-   (2026-05-18): ADR-0049's **design dialogue is now complete (all its
-   DPs resolved) and its Phase-1c evidence is in hand** — so the
-   design+evidence halves of this prerequisite are satisfied; the
-   **sole remaining gate-2 condition is ADR-0049's implementation**
-   (it is implement-ready, not demand-gated). ADR-0049/0050 stay
-   **separate, not merged**.
+   is contingent on ADR-0049's per-engine DDL-boundary signal.
+   **CLEARED (2026-07-28): ADR-0049 shipped in v0.70.0 (Chunks A–D +
+   partial E) and completed through v0.71.0**, so all three halves of
+   this prerequisite — design, Phase-1c evidence, implementation —
+   are satisfied. ADR-0049/0050 stay **separate, not merged**.
 3. **Real operator demand** — still demand-gated on an actual
-   position-loss case; not scheduled.
+   position-loss case; not scheduled. **STILL OPEN.**
 Independent of #37 (pinned). Phase-1c's empirical characterisation of
 the *current* re-snapshot granularity feeds DP-3 and the
 Consequences. When promoted: v1 = in-sluice checksum (b), flat

@@ -2,7 +2,16 @@
 
 ## Status
 
-**Proposed (2026-06-14).** Extends ADR-0058 (online ADD COLUMN
+**Accepted — shipped v0.99.45 (F7a) → v0.99.46 (F7b) → v0.99.48 (F7c).**
+Proposed 2026-06-14. `--schema-changes=forward|refuse` is the live flag
+in `cmd/sluice/cli.go` (default `forward`), and
+`--forward-schema-add-column` is deprecated in its favour. This header
+said Proposed for ~40 releases after the flag shipped: the index row
+declared "Accepted" *unbolded*, and the G-17 status-parity gate read
+only bold tokens, so the DOC-3 lag it exists to catch sailed straight
+through it. The gate now reads unbolded declarations on both sides.
+
+Extends ADR-0058 (online ADD COLUMN
 forwarding) from an opt-in, ADD-COLUMN-only intercept to a
 **default-on, all-unambiguous-shapes** forwarding path on the
 single-stream (non-Shape-A) CDC apply loop, controlled by a new
