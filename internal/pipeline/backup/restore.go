@@ -1647,6 +1647,13 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
 	}
 
+	// The chain's IDENTITY manifest, which is not necessarily
+	// records[0] — see [verifyChainIdentityManifest]. Everything below
+	// that reasons about "the chain's encryption" reads it from here, the
+	// same way [ChainRestore] does, so verify and restore cannot disagree
+	// about which manifest owns the chain CEK.
+	identity := verifyChainIdentityManifest(ctx, store, records[0].Manifest)
+
 	// Bug 117 closure: when an envelope is supplied AND the chain
 	// root records ChainEncryption, validate the chain-level
 	// envelope eagerly so the operator gets a single clear "wrong
@@ -1654,7 +1661,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// per-chunk authenticated opens in the loop below.
 	prober := &chunkAuthProber{env: opts.Envelope}
 	if opts.Envelope != nil {
-		rootEnc := records[0].Manifest.ChainEncryption
+		rootEnc := identity.ChainEncryption
 		if rootEnc == nil {
 			// SEC-MIRROR parity with the apply paths (restore / chain_restore /
 			// broker preflightEncryption): a key supplied against a chain that
@@ -1679,7 +1686,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		if len(rootEnc.WrappedCEK) > 0 {
 			// ADR-0152 chokepoint: bound unwrap for v5+ roots +
 			// the Azure key-version retarget (audit N-9).
-			cek, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest)
+			cek, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, identity)
 			if uerr != nil {
 				return verifyScanTally{}, fmt.Errorf(
 					"verify: unwrap chain cek (%s): %w", lineage.CEKUnwrapHint, uerr,
@@ -1689,7 +1696,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		} else {
 			// Per-chunk mode: retarget the envelope's key version
 			// before the per-chunk probes in the loop below.
-			lineage.RebindEnvelopeKEK(opts.Envelope, records[0].Manifest)
+			lineage.RebindEnvelopeKEK(opts.Envelope, identity)
 		}
 	}
 	// ADR-0154: report + verify the whole-manifest signatures. Reports
@@ -1705,8 +1712,8 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// (the exact tamper restore/broker now refuse) would otherwise pass
 	// `backup verify` GREEN and only fail at restore. Flag it here so
 	// verify catches what restore catches. ChainEncryption lives on the
-	// chain root (records[0]); incrementals inherit it by reference.
-	chainEncrypted := len(records) > 0 && records[0].Manifest.ChainEncryption != nil
+	// chain's identity manifest; incrementals inherit it by reference.
+	chainEncrypted := identity.ChainEncryption != nil
 	plaintextSplice := func(manifestPath, kind, file string) {
 		tally.chunkFailed++
 		tally.sawAuth = true // a plaintext splice is coded -CHUNK-AUTH-FAILED (Bug 185)
@@ -1781,6 +1788,48 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		}
 	}
 	return tally, nil
+}
+
+// verifyChainIdentityManifest returns the manifest verify must read the
+// chain's encryption identity from: the chain-ROOT `manifest.json`,
+// resolved by absolute path, whenever it records chain encryption —
+// falling back to first (the oldest listed manifest) otherwise.
+//
+// It is the verify-side twin of [ChainRestore.chainIdentityManifest],
+// and it exists for the same reason: a rotated chain's CHANGE chunks are
+// ALL sealed under the stream's original chain CEK, the one wrapped on
+// the chain-root manifest, while each rotation-born segment full mints
+// its OWN CEK for its row chunks. `records[0]` is the chain's identity
+// only while segment 0 is still catalogued; after a whole-segment prune
+// it is a later segment full whose CEK never sealed a change chunk.
+//
+// Reading it from `records[0]` was a pre-existing verify defect that the
+// chain-shaping matrix could not reach while roadmap item 100 made every
+// prune of that fixture REFUSE: with segment-granular retention the
+// prune succeeds, and verify then reported `2 of 4 chunks failed
+// authenticated decryption` on a chain that restored row-exact. That is
+// the Bug-215 verify/restore disagreement inverted — the safe direction,
+// but still a red verify on a healthy chain, which is exactly the signal
+// operators are told to trust before they need the backup.
+//
+// The fallback is load-bearing, identically to the restore side: a chain
+// compacted by a pre-fix binary has NO root manifest, and a plaintext
+// chain's root records no chain encryption. Both must keep verifying
+// exactly as before, so the substitution happens only when the root
+// manifest actually carries the chain-encryption metadata this consumes.
+func verifyChainIdentityManifest(ctx context.Context, store irbackup.Store, first *irbackup.Manifest) *irbackup.Manifest {
+	root, err := lineage.ReadRootManifest(ctx, store)
+	if err != nil {
+		slog.WarnContext(
+			ctx, "verify: cannot read the chain-root manifest; falling back to the oldest listed manifest for the chain's encryption identity",
+			slog.String("error", err.Error()),
+		)
+		return first
+	}
+	if root == nil || root.ChainEncryption == nil {
+		return first
+	}
+	return root
 }
 
 // chunkAuthProber resolves, per chunk, the exact (CEK, AAD) pair the

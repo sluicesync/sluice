@@ -1504,21 +1504,21 @@ func boolYesNoCLI(b bool) string {
 //     unreadable). Both refuse under `SLUICE-E-BACKUP-CHAIN-UNREADABLE`,
 //     exit 3. Pass `--encrypt` + key material to upgrade the check from
 //     "the identity survived" to "the chain's key still unwraps".
-//   - Retention is SEGMENT-granular in practice. Trimming LEADING
-//     incrementals inside the floor segment severs the chain — the
-//     survivors' parent link points at a manifest the prune deletes,
+//   - Retention is SEGMENT-granular, and the flags are rounded UP to the
+//     nearest segment boundary to make it so (roadmap item 100). Trimming
+//     LEADING incrementals inside the floor segment severs the chain —
+//     the survivors' parent link points at a manifest the prune deletes,
 //     and the events between the segment full's anchor and the first
-//     survivor are simply gone — so prune refuses that shape at the
-//     pre-commit leg with nothing deleted, naming the keep-counts that
-//     DO land on a segment boundary (roadmap item 100). Note the
-//     consequence for a NON-rotated chain: no positive
-//     `--keep-incrementals` retires a segment's incrementals entirely,
-//     so every such prune of a single-segment chain is that shape and
-//     refuses; use `--keep-duration` past all of them instead. (An
-//     earlier version of this doc described a "re-stitch the first
-//     survivor onto the full" behaviour — that re-stitch was removed in
-//     the segment-list reframe and nothing replaced it, which is the
-//     defect item 100 tracks.)
+//     survivor are simply gone — so prune retires only WHOLE leading
+//     segments, keeping MORE than asked rather than less, and logs both
+//     numbers when they differ. Note the consequence for a NON-rotated
+//     chain: it has no segment boundary at all, so `--keep-incrementals`
+//     cannot express retention there and prune refuses (nothing deleted)
+//     rather than report success over a run that dropped nothing; use
+//     `--keep-duration` past all of them instead. (An earlier version of
+//     this doc described a "re-stitch the first survivor onto the full"
+//     behaviour — that re-stitch was removed in the segment-list reframe
+//     and nothing replaced it, which is the defect item 100 tracked.)
 //   - --dry-run reports what WOULD be pruned without deleting
 //     anything or rewriting the catalog.
 //
@@ -1533,8 +1533,8 @@ type BackupPruneCmd struct {
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
 
-	KeepIncrementals int           `help:"Retain the N most-recent incrementals. Mutually exclusive with --keep-duration." placeholder:"N"`
-	KeepDuration     time.Duration `help:"Retain incrementals younger than this duration. Mutually exclusive with --keep-incrementals. Examples: 168h (7d), 720h (30d)." placeholder:"DUR"`
+	KeepIncrementals int           `help:"Retain at least the N most-recent incrementals. Rounded UP to a segment boundary — prune retires only whole segments, so it keeps more than asked, never fewer. Mutually exclusive with --keep-duration." placeholder:"N"`
+	KeepDuration     time.Duration `help:"Retain incrementals younger than this duration, rounded UP to a segment boundary. Mutually exclusive with --keep-incrementals. Examples: 168h (7d), 720h (30d)." placeholder:"DUR"`
 
 	DryRun bool `help:"Report what would be pruned without deleting or rewriting the catalog."`
 
@@ -1605,6 +1605,11 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 		slog.Int("manifests_kept", len(res.Kept)),
 		slog.Int("chunks_deleted", res.ChunksDeleted),
 		slog.String("earliest_restorable_backup_id", res.EarliestRestorableBackupID),
+		// Both numbers, always — an operator comparing "what I asked for"
+		// against "what I got" should not have to notice whether a
+		// separate rounding line was emitted (roadmap item 100).
+		slog.Int("incrementals_requested", res.RequestedIncrementals),
+		slog.Int("incrementals_retained", res.IncrementalsRetained),
 	)
 	for _, p := range res.Pruned {
 		slog.InfoContext(

@@ -3,25 +3,27 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Roadmap item 100 — the refusal an ordinary retention cron actually
-// hits, driven through the real prune path on a real Postgres chain.
+// Roadmap item 100 — the one retention request segment-granular
+// rounding cannot rescue, driven through the real prune path on a real
+// Postgres chain.
 //
-// The sibling matrix file exercises this shape on a ROTATED chain, where
-// it is one cell of a bigger table. This file pins the case that made
-// item 100 a release blocker rather than a filed defect: a NON-rotated,
-// single-segment chain, where EVERY `--keep-incrementals` prune is a
-// within-segment trim, because no positive keep-count can retire a
-// segment's incrementals entirely. That is the most ordinary retention
-// invocation there is, and before this refusal it failed every time
-// under prose ("the chain does not walk") that told the operator neither
-// whether their backups were broken, nor whether sluice was, nor what to
-// run instead.
+// The sibling matrix file exercises a ROTATED chain, where rounding a
+// keep-count UP to the nearest segment boundary turns the request into a
+// whole-segment prune that restores row-exact. This file pins the
+// opposite shape: a NON-rotated, single-segment chain has NO segment
+// boundary, so rounding up retains the entire chain and the run would
+// delete nothing. Reporting that as a successful prune is the silent
+// no-op the contract exists to avoid — "my disk did not shrink" with an
+// exit 0 — so it stays a refusal.
 //
-// So the assertions here are about the REMEDY as much as the refusal:
-// the message must name the shape, promise inertness, and name retention
-// that works — and the test then proves both promises against the real
-// chain, by restoring it row-exact after the refusal and by running the
-// remedy it named.
+// That is the most ordinary retention invocation there is, and before
+// this refusal it failed under prose ("the chain does not walk") that
+// told the operator neither whether their backups were broken, nor
+// whether sluice was, nor what to run instead. So the assertions here
+// are about the REMEDY as much as the refusal: the message must name the
+// shape, promise inertness, and name retention that works — and the test
+// then proves both promises against the real chain, by restoring it
+// row-exact after the refusal and by running the remedy it named.
 
 package pipeline
 
@@ -134,23 +136,34 @@ func TestItem100_SingleSegmentKeepIncrementals_RefusesActionably(t *testing.T) {
 		t.Fatalf("source oracle has %d rows; the fixture produced nothing", oracle.n)
 	}
 
-	// Non-vacuity 2: --dry-run returns ahead of the readability gate by
-	// design, so it enumerates what a real run would drop without
-	// tripping it. A refusal over a prune that would have deleted nothing
-	// proves nothing.
-	plan, err := backup.PruneChain(ctx, f.store, backup.PruneOpts{KeepIncrementals: 1, DryRun: true})
-	if err != nil {
-		t.Fatalf("PruneChain --dry-run: %v", err)
-	}
-	if len(plan.Pruned) == 0 {
-		t.Fatal("--keep-incrementals=1 planned nothing to drop; this pin would be vacuous")
+	// Non-vacuity 2: the request really does ask for a prune. With >= 3
+	// incrementals in the only segment, --keep-incrementals=1 asks to
+	// retire at least two of them — a refusal over a request that would
+	// have dropped nothing anyway proves nothing.
+	//
+	// This assertion is INVERTED from the version that shipped with item
+	// 100's refusal, which established non-vacuity by asserting --dry-run
+	// SUCCEEDED and enumerated 2 manifests. That was only defensible
+	// while the refusal came from the readability gate, which --dry-run
+	// returned ahead of by design; segment-granular retention computes
+	// the refusal from the plan, and --dry-run computes the same plan. A
+	// dry run that promises a prune the real run refuses is worse than no
+	// dry run, so the two must now agree — which is what is asserted
+	// instead, below.
+	plan, dryErr := backup.PruneChain(ctx, f.store, backup.PruneOpts{KeepIncrementals: 1, DryRun: true})
+	if dryErr == nil {
+		t.Fatalf("--dry-run planned %d manifests the real run refuses; a dry run must not lie about what happens next", len(plan.Pruned))
 	}
 
 	_, err = backup.PruneChain(ctx, f.store, backup.PruneOpts{KeepIncrementals: 1})
 	if err == nil {
-		t.Fatal("`backup prune --keep-incrementals=1` on a single-segment chain SUCCEEDED — roadmap item 100's " +
-			"within-segment trim appears fixed. Do not delete this test: re-read item 100, then promote it to a " +
+		t.Fatal("`backup prune --keep-incrementals=1` on a single-segment chain SUCCEEDED — a chain with no segment " +
+			"boundary has nothing to round up to, so this run deleted nothing and reported a prune. Do not delete " +
+			"this test: re-read roadmap item 100, and if the retention contract changed again, promote it to a " +
 			"round trip that pins the pruned chain's restorability.")
+	}
+	if dryErr.Error() != err.Error() {
+		t.Errorf("--dry-run and the real run refused DIFFERENTLY:\n  dry:  %v\n  real: %v", dryErr, err)
 	}
 	coded, codedOK := sluicecode.FromError(err)
 	if !codedOK || coded.Code != sluicecode.CodeBackupChainUnreadable {

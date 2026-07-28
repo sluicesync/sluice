@@ -224,18 +224,20 @@ func (f *shapingFixture) restored(t *testing.T) bug214Sums { return bug214Read(t
 // for the damage-map log.
 //
 // An operation carrying a CONFIRMED OPEN DEFECT asserts that defect
-// inside its own apply — see `prune` (roadmap item 100) — rather than
-// through a harness-level "known broken" flag. That is deliberate: the
-// two defects this matrix has caught surfaced at different LAYERS (one
-// at restore, one as a coded refusal from the operation itself), and a
-// single "the restore error must contain X" knob can only express one of
-// them, which is exactly how the first version of this cell came to
-// assert a surface the operation no longer has. What must NOT happen is
-// deleting or skipping a cell to get green — a known-and-filed failing
-// cell is worth far more than a matrix trimmed to what works — so a
-// defect-carrying apply still has to fail when the defect changes shape
-// or disappears, and every cell still runs the full round trip and the
-// verify/restore agreement gate below.
+// inside its own apply — as `prune` did while roadmap item 100 was open
+// — rather than through a harness-level "known broken" flag. That is
+// deliberate: the two defects this matrix has caught surfaced at
+// different LAYERS (one at restore, one as a coded refusal from the
+// operation itself), and a single "the restore error must contain X"
+// knob can only express one of them, which is exactly how the first
+// version of the prune cell came to assert a surface the operation no
+// longer had. What must NOT happen is deleting or skipping a cell to get
+// green — a known-and-filed failing cell is worth far more than a matrix
+// trimmed to what works — so a defect-carrying apply still has to fail
+// when the defect changes shape or disappears (prune's did exactly that,
+// and its assertion said so and named the promotion), and every cell
+// still runs the full round trip and the verify/restore agreement gate
+// below.
 type shapingOp struct {
 	name  string
 	apply func(t *testing.T, f *shapingFixture) string
@@ -325,61 +327,75 @@ func shapingOps() []shapingOp {
 			},
 		},
 		{
-			// A CONFIRMED OPEN DEFECT — roadmap item 100, found by this
-			// matrix — pinned at the surface the operation actually has.
+			// Roadmap item 100's cell — and the record of a decision this
+			// matrix forced.
 			//
-			// The defect: `backup prune` with a keep-count that trims
-			// inside the FLOOR segment drops the incrementals the first
-			// surviving one parents on, so the survivors no longer form
-			// one chain (and the events in the gap are simply gone). It
-			// is mode-INDEPENDENT — the plaintext control refuses
-			// identically — which is what distinguishes it from the
-			// encrypted-read-path class this file was built for. It is
-			// reported rather than patched because the safe repair is a
-			// retention-semantics decision (prune must keep more than
-			// asked, or refuse by shape), and re-stitching the parent
-			// pointer — the tempting one-liner — would convert a loud
-			// refusal into a SILENT coverage gap.
+			// It was a KNOWN-BROKEN cell: `backup prune` with a keep-count
+			// landing INSIDE the floor segment dropped the incrementals the
+			// first survivor parents on, so the survivors no longer formed
+			// one chain (and the events in the gap were simply gone). Item
+			// 95's readability gate caught that pre-commit and refused, so
+			// what the cell pinned was a coded, inert REFUSAL — correct, but
+			// it left the headline retention flag unable to succeed on the
+			// most ordinary chain shapes. The repair had to be a retention-
+			// CONTRACT decision, because re-stitching the parent pointer —
+			// the tempting one-liner — would have converted a loud refusal
+			// into a SILENT coverage gap.
 			//
-			// What that costs an operator TODAY is a refusal, not a
-			// broken archive: item 95's readability gate re-walks the
-			// prospective chain at the PRE-COMMIT leg, sees the severed
-			// parent link, and refuses under
-			// SLUICE-E-BACKUP-CHAIN-UNREADABLE / exit 3 with the catalog
-			// unwritten and every file still on disk. So this cell
-			// asserts three things, and each is load-bearing:
+			// The decision: retention is SEGMENT-granular. A keep-count is
+			// rounded UP to the nearest segment boundary, so prune retires
+			// only whole leading segments — keeping MORE than asked, never
+			// fewer. So this cell is now a normal round trip, exactly as the
+			// old assertion's own failure message instructed whoever fixed
+			// it, and what it pins is what an operator actually gets:
 			//
-			//  1. the refusal is CODED — a retention script branching on
-			//     SLUICE-E-* (which docs/operator/error-codes.md tells
-			//     operators to do) can see it, and it exits 3 rather than
-			//     the generic 1 a bare fmt.Errorf produced;
-			//  2. it names item 100's SHAPE — and, since the item-100
-			//     prose landed, it names it in the operator's terms
-			//     rather than the gate's: "a within-segment incremental
-			//     trim severs the chain" plus the retention that IS safe
-			//     on this chain, not the generic "the chain does not
-			//     walk". These expectations were the previous prose's
-			//     ("does not chain off preceding link") and were REVISED
-			//     when the message changed, which is exactly what this
-			//     cell exists to force — a shape change must not quietly
-			//     outlive the assertion that describes it;
-			//  3. the refusal is INERT — the catalog, the chain-root
-			//     manifest, and (via the round trip the harness runs after
-			//     this returns) the chain's actual restorability are
-			//     exactly as they were. That is the half a message-only
-			//     assertion cannot make, and it is the promise the
-			//     refusal's own prose makes to the operator.
+			//  1. the ROUNDING happened and was reported — requested vs
+			//     retained, both numbers, because silent over-retention is
+			//     how "my disk did not shrink" starts;
+			//  2. it is a real prune — whole segments gone, not a no-op
+			//     dressed up as success;
+			//  3. NO segment was trimmed in place — every surviving segment
+			//     still holds every incremental it held before, which is the
+			//     structural property that makes the result restorable;
+			//  4. …and the harness then RESTORES the pruned chain and
+			//     compares rows to the source oracle, in all three
+			//     encryption modes. That is the assertion the refusal era
+			//     could never make.
 			name: "prune",
 			apply: func(t *testing.T, f *shapingFixture) string {
 				const keep = 1
-				before := f.segments(t)
+				ctx := context.Background()
+				pre, ok, err := lineage.LoadLineageCatalog(ctx, f.store)
+				if err != nil || !ok {
+					t.Fatalf("LoadLineageCatalog: ok=%v err=%v", ok, err)
+				}
+				before := len(pre.Segments)
+				// Non-vacuity: keep=1 must NOT already land on a segment
+				// boundary, or this cell exercises no rounding at all. The
+				// segment that decides it is the NEWEST one holding any
+				// incrementals — the open segment is routinely a
+				// rotation-born full with none yet, which contributes no
+				// boundary of its own.
+				floor := -1
+				for si := before - 1; si >= 0; si-- {
+					if len(pre.Segments[si].Incrementals) > 0 {
+						floor = si
+						break
+					}
+				}
+				if floor < 0 {
+					t.Fatalf("the seeded %d-segment chain holds no incrementals at all; this cell would be vacuous", before)
+				}
+				if n := len(pre.Segments[floor].Incrementals); n < 2 {
+					t.Fatalf("the newest incremental-bearing segment (index %d of %d) holds %d incremental(s), so "+
+						"--keep-incrementals=%d already lands on a segment boundary and this cell would not exercise "+
+						"item 100's rounding; retune the fixture's rollover/rotation thresholds", floor, before, n, keep)
+				}
 
-				// Non-vacuity, established BEFORE the refusal: --dry-run
-				// returns ahead of the readability gate by design, so it
-				// enumerates what a real run would drop without tripping
-				// it. A refusal over a prune that would have deleted
-				// nothing proves nothing.
-				plan, err := backup.PruneChain(context.Background(), f.store, backup.PruneOpts{
+				// --dry-run must report the ROUNDED plan, not the requested
+				// one: a dry run that lies about the real run is worse than
+				// no dry run.
+				plan, err := backup.PruneChain(ctx, f.store, backup.PruneOpts{
 					KeepIncrementals: keep, DryRun: true,
 				})
 				if err != nil {
@@ -391,54 +407,58 @@ func shapingOps() []shapingOp {
 						keep, before, plan.SegmentsDropped, len(plan.Pruned))
 				}
 
-				res, err := backup.PruneChain(context.Background(), f.store, backup.PruneOpts{KeepIncrementals: keep})
-				if err == nil {
-					t.Fatalf("KNOWN-BROKEN cell [prune]: `backup prune --keep-incrementals=%d` now SUCCEEDS "+
-						"(dropped %d of %d segments) — roadmap item 100's within-segment trim appears FIXED. "+
-						"Do not delete this assertion: re-read item 100 and promote the cell to a normal round "+
-						"trip, so the pruned chain's restorability is what gets pinned.",
-						keep, res.SegmentsDropped, before)
+				res, err := backup.PruneChain(ctx, f.store, backup.PruneOpts{KeepIncrementals: keep})
+				if err != nil {
+					t.Fatalf("`backup prune --keep-incrementals=%d` on a %d-segment chain REFUSED. Segment-granular "+
+						"retention (roadmap item 100) is supposed to round this up to a whole-segment prune; a refusal "+
+						"here means either the rounding regressed or the readability gate is refusing a chain that "+
+						"reads: %v", keep, before, err)
 				}
-				coded, ok := sluicecode.FromError(err)
-				if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
-					t.Fatalf("prune's refusal is not %s, so a retention script cannot branch on it "+
-						"(item 96's contract): %v", sluicecode.CodeBackupChainUnreadable, err)
+				if res.SegmentsDropped != plan.SegmentsDropped || len(res.Pruned) != len(plan.Pruned) {
+					t.Errorf("the real run diverged from --dry-run: dropped %d segments / %d manifests, the plan said %d / %d",
+						res.SegmentsDropped, len(res.Pruned), plan.SegmentsDropped, len(plan.Pruned))
 				}
-				if coded.ExitCode() != sluicecode.ExitRefusal {
-					t.Errorf("refusal ExitCode() = %d; want %d — a re-run will not help, so it must not read as retryable",
-						coded.ExitCode(), sluicecode.ExitRefusal)
+				// 1. Rounded UP, and said so.
+				if res.RequestedIncrementals != keep {
+					t.Errorf("RequestedIncrementals = %d; want the %d that was asked for", res.RequestedIncrementals, keep)
 				}
-				// The SHAPE of the filed defect, at the leg that makes the
-				// refusal inert, AND the remedy — item 100's release
-				// blocker was that the first two were right and the third
-				// was missing. Change any of them and this cell must be
-				// revisited; that is its whole job.
-				for _, want := range []string{
-					"within-segment incremental trim severs the chain",
-					"still records parent",
-					"pre-commit leg",
-					"NOTHING WAS DELETED",
-					"segment boundary",
-					"--keep-duration",
-				} {
-					if !strings.Contains(err.Error(), want) {
-						t.Fatalf("KNOWN-BROKEN cell [prune] refused DIFFERENTLY from the filed defect "+
-							"(roadmap item 100).\n  want substring: %q\n  got: %v", want, err)
+				if res.IncrementalsRetained <= res.RequestedIncrementals {
+					t.Errorf("retained %d incrementals for a requested %d — this cell is supposed to exercise the "+
+						"round-UP, and an equal count means it did not",
+						res.IncrementalsRetained, res.RequestedIncrementals)
+				}
+				// 2. A real prune.
+				if res.SegmentsDropped < 1 {
+					t.Fatalf("SegmentsDropped = %d; rounding up must not turn prune into a silent no-op", res.SegmentsDropped)
+				}
+				// 3. Nothing trimmed IN PLACE: every surviving segment kept
+				//    every incremental it had. This is the structural
+				//    property the restore below depends on.
+				post, ok, err := lineage.LoadLineageCatalog(ctx, f.store)
+				if err != nil || !ok {
+					t.Fatalf("post-prune LoadLineageCatalog: ok=%v err=%v", ok, err)
+				}
+				if len(post.Segments) >= before {
+					t.Fatalf("post-prune segments = %d; want fewer than the %d before", len(post.Segments), before)
+				}
+				held := make(map[string]int, len(pre.Segments))
+				for _, seg := range pre.Segments {
+					held[seg.SegmentID] = len(seg.Incrementals)
+				}
+				for _, seg := range post.Segments {
+					if n, seen := held[seg.SegmentID]; !seen || len(seg.Incrementals) != n {
+						t.Errorf("surviving segment %s (%s) holds %d incrementals, held %d before — a within-segment "+
+							"trim is exactly what segment-granular retention exists to prevent",
+							seg.SegmentID, seg.Dir, len(seg.Incrementals), n)
 					}
 				}
-				if coded.Hint == "" {
-					t.Error("the refusal carries no standalone hint — the machine-readable half of item 100's remedy")
+				// The Bug-214/item-95 file, still there after a whole-segment
+				// prune that retired the root segment.
+				if ex, _ := f.store.Exists(ctx, lineage.ManifestFileName); !ex {
+					t.Error("prune deleted the chain-root manifest — the chain's identity, not segment 0's data")
 				}
-				// Inertness, structurally: pre-commit means nothing was
-				// written and nothing deleted.
-				if after := f.segments(t); after != before {
-					t.Errorf("the pre-commit refusal rewrote the catalog: %d segments, want %d (unchanged)", after, before)
-				}
-				if ex, _ := f.store.Exists(context.Background(), lineage.ManifestFileName); !ex {
-					t.Error("the pre-commit refusal deleted the chain-root manifest — the Bug-214/item-95 file it exists to protect")
-				}
-				return fmt.Sprintf("prune of %d segment(s) REFUSED (item 100) as %s/exit %d at the pre-commit leg; chain untouched at %d segments",
-					plan.SegmentsDropped, coded.Code, coded.ExitCode(), before)
+				return fmt.Sprintf("pruned --keep-incrementals=%d → retained %d (rounded up to a segment boundary); %d → %d segments, %d manifests dropped",
+					keep, res.IncrementalsRetained, before, len(post.Segments), len(res.Pruned))
 			},
 		},
 	}
@@ -461,8 +481,7 @@ func shapingModes() []struct{ name, mode string } {
 // apply the operation, then VERIFY it, RESTORE it, and compare rows to
 // the source.
 //
-// Damage map as of 2026-07-28 — all 18 cells round-trip row-exact; the
-// three `prune` cells reach that state through a REFUSAL, not a prune:
+// Damage map as of 2026-07-28 — all 18 cells round-trip row-exact:
 //
 //	rotate                     ×3   green
 //	rotate-then-resume         ×3   green  (per-chain was Bug 215 — RED
@@ -471,28 +490,26 @@ func shapingModes() []struct{ name, mode string } {
 //	rotate-then-stream-resume  ×3   green  (same defect, ordinary restart)
 //	compact                    ×3   green  (Bug 214's cell)
 //	compact-after-rotate       ×3   green
-//	prune                      ×3   REFUSED + intact — a keep-count that
-//	                                        trims inside the floor segment
-//	                                        would mis-stitch the lineage
-//	                                        (roadmap item 100, still open as
-//	                                        a retention-CONTRACT question),
-//	                                        so item 95's readability gate
-//	                                        refuses it at the pre-commit leg
-//	                                        under SLUICE-E-BACKUP-CHAIN-
-//	                                        UNREADABLE and the chain then
-//	                                        restores exactly as before. The
-//	                                        cell pins the code, the defect's
-//	                                        shape, the REMEDY the refusal
-//	                                        now computes, and the inertness
-//	                                        — see the `prune` entry in
-//	                                        [shapingOps]
+//	prune                      ×3   green  (was REFUSED + intact while
+//	                                        roadmap item 100's retention
+//	                                        CONTRACT was open — a keep-count
+//	                                        landing inside the floor segment
+//	                                        mis-stitched the lineage, so the
+//	                                        readability gate refused it
+//	                                        pre-commit. Retention is now
+//	                                        SEGMENT-granular: the keep-count
+//	                                        rounds UP to a segment boundary
+//	                                        and the whole-segment prune that
+//	                                        results restores row-exact — see
+//	                                        the `prune` entry in
+//	                                        [shapingOps])
 //
 // The mode axis is what makes each row readable at a glance: an
 // encrypted-read-path defect shows as RED-encrypted / green-plaintext
 // (Bug 215's signature), while a uniform result across all three modes
 // says the behaviour is upstream of encryption entirely — which is what
-// prune's row reports, since the mis-stitch it refuses is structural and
-// the plaintext control refuses identically. A matrix without the
+// prune's row said while it refused, since the mis-stitch was structural
+// and the plaintext control refused identically. A matrix without the
 // plaintext control cannot tell those apart, which is how three of these
 // shipped.
 func TestChainShaping_EncryptedRoundTripMatrix(t *testing.T) {

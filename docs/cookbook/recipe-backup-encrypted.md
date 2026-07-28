@@ -128,7 +128,12 @@ control segment cadence:
   into a single incremental.
 
 `sluice backup prune --keep-incrementals N` retires older WHOLE
-segments while preserving the chain root's restorability. On an
+segments while preserving the chain root's restorability. Retention is
+segment-granular: `N` is rounded UP to the nearest segment boundary, so
+prune keeps at least the `N` you asked for and often a few more, and it
+logs both numbers when they differ. A never-rotated chain has no segment
+boundary for `--keep-incrementals` to land on — use `--keep-duration`
+there. On an
 encrypted chain "the chain root" means the root `manifest.json`
 specifically: it carries the Argon2id salt the restore side re-derives
 your KEK from and the CEK every change chunk is sealed under, so prune

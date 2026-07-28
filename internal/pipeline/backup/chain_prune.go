@@ -30,27 +30,50 @@ import (
 //     a segment full is a self-contained snapshot at its anchor S, so
 //     the oldest KEPT segment's full is always a complete restore
 //     base — dropping older whole segments is unconditionally
-//     restore-safe.
-//   - Drop leading incrementals WITHIN the oldest kept segment: this
-//     SEVERS the chain and is refused (roadmap item 100). The claim
-//     that used to stand here — "the segment full + the remaining
-//     incrementals still form a contiguous chain (the boundary
-//     invariant prune always preserved)" — was false in both of its
-//     senses: the trim breaks the parent-link chain (the first
-//     survivor still records a parent this prune deletes) AND the
-//     position boundary (the full stays anchored at S while the first
-//     survivor starts at S′ > S, so the events in (S, S′] are gone).
-//     The re-stitch that once preserved the parent link was removed in
-//     the segment-list reframe and nothing replaced it. The readability
-//     gate below catches the shape pre-commit, and
-//     [pruneTrim.withinSegmentTrimRefusal] renders it as a refusal that
-//     names the segment-granular retention that IS safe.
+//     restore-safe. This is the ONLY shape prune ever commits.
+//   - NEVER drop leading incrementals WITHIN the oldest kept segment:
+//     that SEVERS the chain. The claim that used to stand here — "the
+//     segment full + the remaining incrementals still form a
+//     contiguous chain (the boundary invariant prune always
+//     preserved)" — was false in both of its senses: the trim breaks
+//     the parent-link chain (the first survivor still records a parent
+//     this prune deletes) AND the position boundary (the full stays
+//     anchored at S while the first survivor starts at S′ > S, so the
+//     events in (S, S′] are gone). The re-stitch that once preserved
+//     the parent link was removed in the segment-list reframe and
+//     nothing replaced it.
 //   - Advance `lineage.json`'s `restorable_from_segment` floor;
 //     restore refuses to start before it.
 //
 // The open (last, uncapped) segment is never fully dropped while it's
 // the only segment, and its incrementals are pruned only down to its
 // full (the full is always kept — it's the restore base).
+//
+// # Retention is SEGMENT-granular (roadmap item 100's contract call)
+//
+// `--keep-incrementals=N` and `--keep-duration` are rounded UP to the
+// nearest segment boundary ([segmentAlignedKeep]) before anything is
+// planned, so prune can only ever retire whole leading segments. The
+// operator's number becomes approximate in the SAFE direction — never
+// fewer incrementals than asked, sometimes more — and the run says so at
+// INFO with both numbers, because silent over-retention is how "my disk
+// did not shrink" starts.
+//
+// Two alternatives were weighed and rejected. Re-anchoring the floor
+// segment's full would make retention exact, but it turns a maintenance
+// command into one that reads the SOURCE — surprising and expensive for
+// something an operator runs from cron. Refusing every in-place trim
+// (the item-95 interim behaviour) is honest, but it leaves the headline
+// retention flag unable to succeed on the most common chain shape: a
+// single-segment chain, where NO `--keep-incrementals` value can retire
+// the segment's base.
+//
+// Rounding up can leave NOTHING to drop, when the chain has no boundary
+// at or above the requested retention — always the case on a
+// never-rotated chain, which has no boundary at all. That one case
+// refuses, under [pruneTrim.withinSegmentTrimRefusal]: retaining the
+// whole chain and reporting a successful prune is the silent no-op the
+// INFO line above exists to prevent.
 //
 // What prune physically deletes: every dropped incremental's change
 // chunks + manifest, and every dropped whole segment's full manifest +
@@ -126,6 +149,17 @@ type PruneResult struct {
 	// After prune, restore-to-position-X requires X >= this entry's
 	// StartPosition.
 	EarliestRestorableBackupID string
+
+	// RequestedIncrementals is how many incrementals the operator's flag
+	// asked to retain (derived from the cutoff for --keep-duration);
+	// IncrementalsRetained is how many segment-granular retention
+	// actually kept. They differ when the requested boundary fell inside
+	// a segment and was rounded UP — see the package doc. Reported so a
+	// caller can surface the over-retention rather than leave an operator
+	// wondering why the number moved; DryRun reports the ROUNDED plan,
+	// exactly as the real run would.
+	RequestedIncrementals int
+	IncrementalsRetained  int
 }
 
 // lineageIncr is one incremental in lineage-flattened order, tagged
@@ -220,6 +254,15 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		}
 	}
 
+	// Segment-granular retention (roadmap item 100): round the requested
+	// retention UP to the nearest segment boundary, so the plan below can
+	// only ever retire whole leading segments. Rounding the other way
+	// would trim leading incrementals INSIDE the floor segment, which
+	// severs it from its restore base.
+	requestedDrop, requestedKeep := dropN, len(flat)-dropN
+	keepN := segmentAlignedKeep(flat, requestedKeep)
+	dropN = len(flat) - keepN
+
 	dropped := flat[:dropN]
 	kept := flat[dropN:]
 
@@ -236,8 +279,39 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		floorSeg = len(cat.Segments) - 1
 	}
 
+	// Rounding up can round the whole run away: no segment boundary sits
+	// at or above the requested retention, so the plan retains everything
+	// and the floor has not moved. (A chain whose leading segments hold
+	// no incrementals at all is the exception that makes the floor check
+	// load-bearing — dropping those is still a real prune.) Reporting
+	// success over a run that deleted nothing is the silent no-op this
+	// contract exists to avoid, so it keeps item 100's refusal — and it
+	// fires for --dry-run too, because a dry run that promises a prune
+	// the real run refuses is worse than no dry run.
+	if dropN == 0 && floorSeg == cat.RestorableFromSegment {
+		survivor := flat[requestedDrop]
+		seg := &cat.Segments[survivor.segIdx]
+		trim := pruneTrim{
+			floor: seg, floorStore: seg.Store(store),
+			flat: flat, keepFromInSeg: survivor.inSegIdx,
+			keepCount: opts.KeepIncrementals, keepDuration: opts.KeepDuration,
+		}
+		return nil, trim.withinSegmentTrimRefusal(ctx, survivor)
+	}
+	if keepN > requestedKeep {
+		slog.InfoContext(
+			ctx, "prune: retained MORE than requested — the retention boundary was rounded up to a segment boundary",
+			slog.String("requested_retention", requestedRetention(opts.KeepIncrementals, opts.KeepDuration)),
+			slog.Int("requested_incrementals_retained", requestedKeep),
+			slog.Int("incrementals_retained", keepN),
+			slog.String("reason", "prune drops only WHOLE leading segments: trimming leading incrementals inside a segment would sever it from its restore base (roadmap item 100), so retention rounds UP to the nearest segment boundary"),
+		)
+	}
+
 	res := &PruneResult{
-		Pruned: make([]string, 0, len(dropped)),
+		Pruned:                make([]string, 0, len(dropped)),
+		RequestedIncrementals: requestedKeep,
+		IncrementalsRetained:  keepN,
 	}
 
 	// Deletion boundaries. The physical deletes themselves run AFTER the
@@ -250,6 +324,21 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	} else if len(kept) == 0 {
 		// Everything dropped — keep the floor segment's full only.
 		keepFromInSeg = len(floor.Incrementals)
+	}
+	// The invariant the whole contract rests on, asserted rather than
+	// assumed: the committed plan must never trim inside the floor
+	// segment while leaving later incrementals there. The two shapes that
+	// remain are exactly the restore-safe ones — keepFromInSeg == 0 (the
+	// floor segment is untouched and its full is a self-contained base)
+	// and an empty survivor set (the floor keeps only its full, so there
+	// is no first-incremental boundary left to violate). Unreachable
+	// after [segmentAlignedKeep]; it is here because the failure it
+	// guards is an unrestorable DR archive discovered at restore time.
+	if keepFromInSeg > 0 && len(kept) > 0 {
+		return nil, fmt.Errorf(
+			"prune: internal invariant violated: the plan would trim %d of the floor segment's %d incrementals in place, which severs the chain (roadmap item 100); refusing before anything is written",
+			keepFromInSeg, len(floor.Incrementals),
+		)
 	}
 	// Snapshot the pre-prune catalog shape for the post-commit delete
 	// pass: cat.Segments is reassigned below, but the helpers enumerate
@@ -272,24 +361,17 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 			res.Kept = append(res.Kept, segQualify(seg.Dir, ip))
 		}
 	}
-	// ADR-0067: if prune trimmed the floor segment's leading incrementals,
-	// its earliest incremental coverage moved forward; resync the floor
-	// segment's IncrementalCoverageStart so the restore-time within-segment
-	// integrity check (validateFirstIncrementalBoundary) stays valid. An
-	// untrimmed floor segment keeps its recorded value.
-	if len(newSegs) > 0 {
-		switch {
-		case len(kept) > 0 && kept[0].segIdx == floorSeg && keepFromInSeg > 0:
-			// Floor segment's leading incrementals were trimmed; the new
-			// first incremental is kept[0] — its StartPosition is the new
-			// earliest coverage.
-			newSegs[0].IncrementalCoverageStart = kept[0].manifest.StartPosition
-		case len(kept) == 0:
-			// Everything dropped: the floor segment retains only its full,
-			// so there is no incremental coverage — clear the field (it
-			// resolves to StartPosition, the full anchor).
-			newSegs[0].IncrementalCoverageStart = ir.Position{}
-		}
+	// ADR-0067: the floor segment's earliest incremental coverage is what
+	// the restore-time within-segment integrity check
+	// (validateFirstIncrementalBoundary) validates against. Segment-
+	// granular retention leaves a kept floor segment's incrementals
+	// untouched, so its recorded value stays correct; the one case that
+	// moves is retiring them all, which leaves no coverage at all.
+	if len(newSegs) > 0 && len(kept) == 0 {
+		// The floor segment retains only its full, so there is no
+		// incremental coverage — clear the field (it resolves to
+		// StartPosition, the full anchor).
+		newSegs[0].IncrementalCoverageStart = ir.Position{}
 	}
 
 	cat.Segments = newSegs
@@ -316,27 +398,15 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	// is the point: prune's deletes all run after the commit, so a refusal
 	// here has written no catalog and removed no file — the chain is
 	// exactly as restorable as it was when the run started.
+	//
+	// Roadmap item 100's within-segment trim no longer reaches here — the
+	// retention rounding above makes it unplannable, and it carries its
+	// own refusal at that point. What remains is the gate's original
+	// catch: a missing chain-root manifest, an identity/key mismatch, a
+	// structural break the prune did not cause. Those keep the generic
+	// decoration, whose recovery is a `cp` of a surviving header rather
+	// than a retention change.
 	if err := verifyChainReadable(ctx, store, cat, opts.Envelope, prunerOp, "pre-commit"); err != nil {
-		// Roadmap item 100's shape earns its OWN refusal, because the
-		// generic one ("the chain does not walk") is unactionable for it
-		// and it is the single most ordinary way to trip this gate: every
-		// --keep-incrementals prune of a never-rotated chain is a
-		// within-segment trim. Two conditions, both required — the PLAN is
-		// a within-segment trim, and the sever it implies is proven
-		// structurally rather than read out of the walk's prose. Every
-		// other unreadable-chain condition the gate legitimately catches
-		// (a missing chain-root manifest, an identity/key mismatch) keeps
-		// the generic decoration, whose recovery is a different one.
-		if errors.Is(err, errChainDoesNotWalk) {
-			trim := pruneTrim{
-				floor: floor, floorStore: floorStore,
-				flat: flat, kept: kept, keepFromInSeg: keepFromInSeg,
-				keepCount: opts.KeepIncrementals, keepDuration: opts.KeepDuration,
-			}
-			if refusal := trim.withinSegmentTrimRefusal(ctx); refusal != nil {
-				return nil, refusal
-			}
-		}
 		return nil, errPreSweepReadability(prunerOp, err)
 	}
 	// Catalog commit FIRST (the ADR-0160 CAS linearization point, and the
@@ -376,64 +446,42 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	return res, nil
 }
 
-// pruneTrim is the retention decision this run computed, in the terms
-// the within-segment-trim refusal needs: which segment is the floor,
-// what it held, what survives it, and which flag expressed the request.
-// It exists so [PruneChain] can hand the refusal ONE value instead of
-// six positional arguments.
+// pruneTrim is the retention the operator REQUESTED, in the terms the
+// refusal needs: which segment the request lands in, what it holds, and
+// which flag expressed it. It describes the plan segment-granular
+// rounding declined to commit, never the one that runs. It exists so
+// [PruneChain] can hand the refusal ONE value instead of five positional
+// arguments.
 type pruneTrim struct {
 	floor         *lineage.Segment
 	floorStore    irbackup.Store
 	flat          []lineageIncr
-	kept          []lineageIncr
 	keepFromInSeg int
 
 	keepCount    int           // --keep-incrementals; 0 when unused
 	keepDuration time.Duration // --keep-duration; 0 when unused
 }
 
-// isWithinSegmentTrim reports whether this plan drops LEADING
-// incrementals inside the floor segment while LEAVING later ones — the
-// one retention shape that severs the chain (roadmap item 100).
+// withinSegmentTrimRefusal is roadmap item 100's purpose-built refusal:
+// the requested retention would trim LEADING incrementals inside the
+// floor segment, and rounding it up to a segment boundary reaches no
+// boundary at all — so honouring it segment-granularly would retain the
+// whole chain and delete nothing.
 //
-// The two SAFE shapes fall out as the complement, which is what makes
-// this the whole discriminator: keepFromInSeg == 0 is a
-// whole-segments-only prune (the floor segment is untouched, and its
-// full is a self-contained restore base), and an empty survivor set
-// retires the floor segment's incrementals ENTIRELY, leaving only its
-// full — no first-incremental boundary left to violate.
-func (p pruneTrim) isWithinSegmentTrim() bool {
-	return p.keepFromInSeg > 0 && len(p.kept) > 0
-}
-
-// withinSegmentTrimRefusal returns roadmap item 100's purpose-built
-// refusal, or nil when this plan is not that shape or the sever cannot
-// be PROVEN — in which case the caller keeps the readability gate's own
-// generic refusal, whose recovery is a different one.
-//
-// Proving the sever structurally, rather than matching the walk's prose,
-// is what keeps the refusal specific. After the trim the floor segment's
-// FULL is the only link that can precede the first surviving
-// incremental, so a survivor recording any other parent is severed —
-// exactly the condition [lineage.BuildLineageChainFromCatalog] refuses
-// on, re-derived from the plan rather than parsed back out of its error.
-func (p pruneTrim) withinSegmentTrimRefusal(ctx context.Context) error {
-	if !p.isWithinSegmentTrim() {
-		return nil
-	}
-	survivor := p.kept[0]
+// It is unconditional by design. The earlier version returned nil when
+// it could not PROVE the sever from the survivor's parent link, because
+// it decorated a readability-gate failure that already had prose of its
+// own; this one fires ahead of any gate, on retention arithmetic that is
+// fully known, and there is no second refusal behind it to fall through
+// to. Silently succeeding over a run that deletes nothing is the outcome
+// the whole contract exists to avoid.
+func (p pruneTrim) withinSegmentTrimRefusal(ctx context.Context, survivor lineageIncr) error {
+	fullID := "(unreadable)"
 	if fm, err := lineage.ReadManifestAt(ctx, p.floorStore, p.floor.FullManifestPath); err == nil {
-		fullID := lineage.ManifestBackupID(fm)
-		if survivor.manifest.ParentBackupID != "" && survivor.manifest.ParentBackupID != fullID {
-			return sluicecode.Wrap(sluicecode.CodeBackupChainUnreadable, withinSegmentTrimHint,
-				errors.New(p.withinSegmentTrimProse(survivor, fullID)))
-		}
+		fullID = lineage.ManifestBackupID(fm)
 	}
-	// Either the survivor already parents on the floor segment's full (so
-	// the trim is not what broke the walk) or that full is unreadable for
-	// some OTHER reason — which the gate's own refusal describes better
-	// than a guess would. Both keep the generic refusal.
-	return nil
+	return sluicecode.Wrap(sluicecode.CodeBackupChainUnreadable, withinSegmentTrimHint,
+		errors.New(p.withinSegmentTrimProse(survivor, fullID)))
 }
 
 // withinSegmentTrimHint is the standalone machine-readable remedy that
@@ -441,7 +489,7 @@ func (p pruneTrim) withinSegmentTrimRefusal(ctx context.Context) error {
 // THIRD refusal in this arc whose human half was right and whose
 // actionable half was missing (items 91 and 96 were the others), so the
 // remedy is not optional decoration here — it is the finding.
-const withinSegmentTrimHint = "prune at SEGMENT granularity: pass a --keep-incrementals count that lands on a segment boundary (the refusal lists this chain's), or a --keep-duration cutoff older than every incremental in the chain. A never-rotated chain has no boundary, so --keep-incrementals cannot express it there. Nothing was deleted."
+const withinSegmentTrimHint = "retention is SEGMENT-granular: prune rounds a keep-count UP to the nearest segment boundary, and this chain has none at or above what you asked for, so rounding up would retain everything. Use one of the boundary keep-counts the refusal lists, or a --keep-duration cutoff older than every incremental in the chain. A never-rotated chain has no boundary at all, so --keep-incrementals cannot express retention there. Nothing was deleted."
 
 // withinSegmentTrimProse renders the refusal an operator reads. It has
 // three jobs and each is load-bearing: name the SHAPE (a within-segment
@@ -451,28 +499,29 @@ const withinSegmentTrimHint = "prune at SEGMENT granularity: pass a --keep-incre
 func (p pruneTrim) withinSegmentTrimProse(survivor lineageIncr, fullID string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s: refusing %s: it would trim %d of the floor segment's %d incrementals IN PLACE, and a within-segment incremental trim severs the chain. ",
-		prunerOp, p.requestedRetention(), p.keepFromInSeg, len(p.floor.Incrementals))
+		prunerOp, requestedRetention(p.keepCount, p.keepDuration), p.keepFromInSeg, len(p.floor.Incrementals))
 	fmt.Fprintf(&b, "A segment's full is a restore base only together with the incrementals that continue from it: trimming the leading ones leaves the floor segment's full (%s, at %q) anchored where it is while the first survivor %q still records parent %q — a link this very prune would delete — so the events between them are gone. The restore path refuses the result, on the severed parent link and again on the forward position gap. ",
 		fullID, segQualify(p.floor.Dir, p.floor.FullManifestPath), segQualify(p.floor.Dir, survivor.path), survivor.manifest.ParentBackupID)
+	b.WriteString("So retention is SEGMENT-granular: prune rounds a keep-count UP to the nearest segment boundary and retires only WHOLE leading segments — keeping more than asked, never less. This chain has no segment boundary at or above the retention you asked for, so rounding up would retain the entire chain and delete nothing, and reporting that as a prune is how a bounded archive quietly stops being bounded. ")
 	b.WriteString("NOTHING WAS DELETED: this is the pre-commit leg, so no catalog was written and no file removed — the chain is exactly as restorable as it was before this run. ")
-	b.WriteString("Until roadmap item 100 settles the retention contract, prune is safe only at SEGMENT granularity. ")
 	if boundaries := segmentBoundaryKeepCounts(p.flat); len(boundaries) > 0 {
 		fmt.Fprintf(&b, "On this chain the --keep-incrementals counts that land on a segment boundary are %s. ", joinKeepCounts(boundaries))
 	} else {
 		b.WriteString("No --keep-incrementals value lands on a segment boundary on this chain, and on a never-rotated (SINGLE-segment) chain none ever can — the flag cannot express segment granularity there, which is why every --keep-incrementals prune of one refuses. ")
 	}
-	fmt.Fprintf(&b, "--keep-duration obeys the same rule (its cutoff must fall on a boundary too), and a cutoff older than all %d incrementals in the chain always does: it retires them and leaves the newest segment's full as a self-contained restore base. Otherwise leave the chain as it is — nothing about it is broken.", len(p.flat))
+	fmt.Fprintf(&b, "--keep-duration obeys the same rule (its cutoff is rounded up to a boundary too), and a cutoff older than all %d incrementals in the chain always lands on one: it retires them and leaves the newest segment's full as a self-contained restore base. Otherwise leave the chain as it is — nothing about it is broken.", len(p.flat))
 	return b.String()
 }
 
 // requestedRetention renders the retention the operator ASKED for, in
-// the flag they used: a remedy only means something when the refusal
-// names their own invocation back to them.
-func (p pruneTrim) requestedRetention() string {
-	if p.keepCount > 0 {
-		return fmt.Sprintf("--keep-incrementals=%d", p.keepCount)
+// the flag they used. Both the refusal and the rounded-up INFO line
+// quote it back: a remedy — or an "I kept more than you asked" — only
+// means something when it names their own invocation.
+func requestedRetention(keepCount int, keepDuration time.Duration) string {
+	if keepCount > 0 {
+		return fmt.Sprintf("--keep-incrementals=%d", keepCount)
 	}
-	return fmt.Sprintf("--keep-duration=%s", p.keepDuration)
+	return fmt.Sprintf("--keep-duration=%s", keepDuration)
 }
 
 // segmentBoundaryKeepCounts returns the --keep-incrementals values that
@@ -494,6 +543,35 @@ func segmentBoundaryKeepCounts(flat []lineageIncr) []int {
 		}
 	}
 	return out
+}
+
+// segmentAlignedKeep rounds a requested retention UP to the nearest
+// segment boundary — the whole of roadmap item 100's contract, in one
+// function. It is deliberately built on [segmentBoundaryKeepCounts]
+// (which the refusal already quotes to the operator) rather than
+// re-deriving the boundary test, so the counts prune ACCEPTS and the
+// counts it NAMES can never drift apart.
+//
+// Two counts are boundary-aligned without appearing in that list, and
+// both are handled here:
+//
+//   - keep == 0 — retire every incremental. The floor segment is left
+//     holding only its full, so there is no first-incremental boundary
+//     to violate. This is `--keep-duration` past everything.
+//   - keep == len(flat) — retain the whole chain. It is the answer when
+//     NO boundary sits at or above the request, which is always the case
+//     on a never-rotated chain; the caller refuses that rather than
+//     reporting a prune that deleted nothing.
+func segmentAlignedKeep(flat []lineageIncr, keep int) int {
+	if keep <= 0 {
+		return 0
+	}
+	for _, b := range segmentBoundaryKeepCounts(flat) {
+		if b >= keep {
+			return b
+		}
+	}
+	return len(flat)
 }
 
 // joinKeepCounts renders a keep-count list for the refusal prose.
@@ -626,6 +704,11 @@ func r0(cat *lineage.Catalog, store irbackup.Store, ctx context.Context, why str
 		for _, ip := range seg.Incrementals {
 			res.Kept = append(res.Kept, segQualify(seg.Dir, ip))
 		}
+		// The request was already satisfied by what is there, so the two
+		// retention counts agree at the whole chain — no rounding happened
+		// and none was needed.
+		res.RequestedIncrementals += len(seg.Incrementals)
+		res.IncrementalsRetained += len(seg.Incrementals)
 		if res.EarliestRestorableBackupID == "" && len(seg.Incrementals) > 0 {
 			if m, err := lineage.ReadManifestAt(ctx, seg.Store(store), seg.Incrementals[0]); err == nil {
 				res.EarliestRestorableBackupID = lineage.ManifestBackupID(m)

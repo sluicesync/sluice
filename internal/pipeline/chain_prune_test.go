@@ -36,21 +36,16 @@ import (
 // `ChainRestore` failed with `build lineage: … does not chain off
 // preceding link … — branching/mis-stitched lineage`.
 //
-// The gate converts that from "prune destroys, and you find out at
-// restore time" into "prune refuses, nothing was deleted". Refusing is
-// the correct half of the loud-failure tenet; making the SHAPE work
-// again (segment-granular retention, or re-anchoring the floor full) is
-// a contract decision filed for the roadmap, not something this gate
-// should paper over.
-//
-// What this test now ALSO pins is the refusal's actionable half (item
-// 100's release-blocking part, and the third instance of the class items
-// 91 and 96 are): the generic "the chain does not walk" prose told an
-// operator nothing — not whether their backups were broken, not whether
-// sluice was, not what to run instead — on the single most ordinary
-// retention invocation there is. So the shape gets a purpose-built
-// refusal, and this test holds it to naming the shape, the inertness,
-// and the retention that IS safe on THIS chain.
+// Item 100's settled contract is segment-granular retention: prune
+// rounds a keep-count UP to the nearest segment boundary and retires
+// only whole segments (see
+// [TestPruneLineage_KeepCountRoundsUpToTheSegmentBoundary]). This is the
+// one shape rounding cannot rescue — a SINGLE-segment chain has no
+// boundary, so rounding up retains everything and the run would delete
+// nothing. Reporting that as a successful prune is the silent no-op the
+// contract exists to avoid, so it stays a refusal, and this test holds
+// that refusal to naming the shape, the inertness, and the retention
+// that IS available on THIS chain.
 func TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 5)
@@ -124,6 +119,14 @@ func TestPruneLineage_KeepDuration(t *testing.T) {
 	if len(res.Pruned) != 5 {
 		t.Errorf("Pruned = %d; want 5 (older-than-2h)", len(res.Pruned))
 	}
+	// The must-NOT-change direction: retiring a segment's incrementals
+	// ENTIRELY is boundary-aligned already (the floor keeps only its full,
+	// so there is no first-incremental boundary to violate), so item
+	// 100's rounding leaves it alone.
+	if res.RequestedIncrementals != 0 || res.IncrementalsRetained != 0 {
+		t.Errorf("requested/retained = %d/%d; want 0/0 — a cutoff past every incremental needs no rounding",
+			res.RequestedIncrementals, res.IncrementalsRetained)
+	}
 	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
 		t.Fatalf("post-prune lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
@@ -133,6 +136,32 @@ func TestPruneLineage_KeepDuration(t *testing.T) {
 	}
 	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
 		t.Errorf("post-prune chain does not walk: %v", err)
+	}
+}
+
+// TestPruneLineage_KeepDurationOlderThanEveryIncrementalIsANoOp is the
+// other must-NOT-change direction for item 100: a retention window that
+// reaches back past every incremental retires none of them, and that
+// stays the documented no-op rather than becoming a refusal. Rounding
+// never enters it — there is no drop to round.
+func TestPruneLineage_KeepDurationOlderThanEveryIncrementalIsANoOp(t *testing.T) {
+	store := newMemStore()
+	base := seedLineageChain(t, store, 5)
+	now := func() time.Time { return base.Add(6 * time.Hour) }
+
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepDuration: 1000 * time.Hour, Now: now})
+	if err != nil {
+		t.Fatalf("PruneChain: %v", err)
+	}
+	if len(res.Pruned) != 0 || res.SegmentsDropped != 0 {
+		t.Errorf("Pruned=%d SegmentsDropped=%d; want 0,0", len(res.Pruned), res.SegmentsDropped)
+	}
+	if res.RequestedIncrementals != 5 || res.IncrementalsRetained != 5 {
+		t.Errorf("requested/retained = %d/%d; want 5/5", res.RequestedIncrementals, res.IncrementalsRetained)
+	}
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(cat.Segments[0].Incrementals) != 5 {
+		t.Errorf("incrementals = %d; want 5 (unchanged)", len(cat.Segments[0].Incrementals))
 	}
 }
 
@@ -154,16 +183,78 @@ func TestPruneLineage_KeepAllNoOp(t *testing.T) {
 }
 
 // TestPruneLineage_DryRunNoSideEffects reports the would-prune set
-// without mutating the lineage or deleting chunks.
+// without mutating the lineage or deleting chunks — and reports the
+// ROUNDED plan, not the requested one. A dry run that describes a prune
+// the real run would not perform is worse than no dry run, so the plan
+// is compared against the real run's own result rather than against a
+// hand-computed expectation.
 func TestPruneLineage_DryRunNoSideEffects(t *testing.T) {
 	store := newMemStore()
-	seedLineageChain(t, store, 4)
+	seedTwoSegmentLineage(t, store)
+
+	// keep=1 asks for one incremental inside seg-1; segment granularity
+	// rounds it up to 2 (seg-1's pair), so the plan is seg0 WHOLE.
 	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1, DryRun: true})
 	if err != nil {
 		t.Fatalf("PruneChain dry-run: %v", err)
 	}
-	if len(res.Pruned) != 3 || res.ChunksDeleted != 0 {
-		t.Errorf("dry-run Pruned=%d ChunksDeleted=%d; want 3,0", len(res.Pruned), res.ChunksDeleted)
+	if res.ChunksDeleted != 0 {
+		t.Errorf("dry-run ChunksDeleted = %d; want 0", res.ChunksDeleted)
+	}
+	if res.RequestedIncrementals != 1 || res.IncrementalsRetained != 2 {
+		t.Errorf("dry-run requested/retained = %d/%d; want 1/2 — the dry run must report the ROUNDED retention",
+			res.RequestedIncrementals, res.IncrementalsRetained)
+	}
+	if res.SegmentsDropped != 1 {
+		t.Errorf("dry-run SegmentsDropped = %d; want 1 (whole seg0)", res.SegmentsDropped)
+	}
+	for _, p := range res.Pruned {
+		if strings.HasPrefix(p, "seg-1/") {
+			t.Errorf("dry-run planned to drop %q inside the surviving floor segment; rounding up must leave it whole", p)
+		}
+	}
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 2 || len(cat.Segments[0].Incrementals) != 2 {
+		t.Errorf("post-dry-run catalog = %+v; want the seeded 2 segments untouched", cat.Segments)
+	}
+
+	// …and the real run does exactly what the dry run said.
+	live, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	if err != nil {
+		t.Fatalf("PruneChain (real): %v", err)
+	}
+	if len(live.Pruned) != len(res.Pruned) || live.SegmentsDropped != res.SegmentsDropped {
+		t.Errorf("the real run diverged from the dry run: dropped %d manifests / %d segments, dry run said %d / %d",
+			len(live.Pruned), live.SegmentsDropped, len(res.Pruned), res.SegmentsDropped)
+	}
+}
+
+// TestPruneLineage_DryRunRefusesWhatTheRealRunRefuses is the other half
+// of "a dry run must not lie": on the shape rounding cannot rescue, the
+// plan-only path refuses identically instead of enumerating a prune the
+// real run would decline.
+//
+// This assertion is INVERTED from what it pinned before item 100's
+// contract landed. `--dry-run` used to return ahead of the readability
+// gate, so it reported "would drop 3" on a chain whose real prune then
+// refused — which was tolerable only while the refusal came from a gate
+// the dry run deliberately skipped. The refusal is now a property of the
+// retention arithmetic, which --dry-run computes too.
+func TestPruneLineage_DryRunRefusesWhatTheRealRunRefuses(t *testing.T) {
+	store := newMemStore()
+	seedLineageChain(t, store, 4)
+
+	dry, dryErr := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1, DryRun: true})
+	if dryErr == nil {
+		t.Fatalf("--dry-run reported a plan (%d manifests) the real run refuses", len(dry.Pruned))
+	}
+	coded, ok := sluicecode.FromError(dryErr)
+	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
+		t.Fatalf("dry-run refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, dryErr)
+	}
+	_, realErr := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	if realErr == nil || realErr.Error() != dryErr.Error() {
+		t.Errorf("dry run and real run disagree:\n  dry:  %v\n  real: %v", dryErr, realErr)
 	}
 	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments[0].Incrementals) != 4 {
@@ -216,6 +307,13 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	}
 	if res.SegmentsDropped != 1 {
 		t.Errorf("SegmentsDropped = %d; want 1 (whole seg0)", res.SegmentsDropped)
+	}
+	// The must-NOT-change direction for item 100: a keep-count that
+	// ALREADY lands on a segment boundary is not rounded, and behaves
+	// exactly as it did before segment-granular retention landed.
+	if res.RequestedIncrementals != 2 || res.IncrementalsRetained != 2 {
+		t.Errorf("requested/retained = %d/%d; want 2/2 — a boundary keep-count must not be rounded",
+			res.RequestedIncrementals, res.IncrementalsRetained)
 	}
 	got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(got.Segments) != 1 || got.Segments[0].Dir != "seg-1" {
@@ -296,45 +394,177 @@ func seedTwoSegmentLineage(t *testing.T, store irbackup.Store) {
 	}
 }
 
-// TestPruneLineage_WithinSegmentTrimNamesTheBoundaryKeepCounts is the
-// ROTATED half of item 100's refusal: on a chain that HAS segment
-// boundaries, the refusal must not just say "prune at segment
-// granularity" — it must compute and name the `--keep-incrementals`
-// values that do, so the operator's next invocation is a copy-paste
-// rather than a derivation from the lineage catalog.
+// TestPruneLineage_KeepCountRoundsUpToTheSegmentBoundary is item 100's
+// contract, on the shape it was decided for.
 //
-// The fixture holds 4 incrementals split 2/2 across two segments, so
-// exactly one count (2 — keep seg1's pair, retire seg0 whole) lands on a
-// boundary. `--keep-incrementals=1` asks for one inside seg1, which is
-// the sever.
-func TestPruneLineage_WithinSegmentTrimNamesTheBoundaryKeepCounts(t *testing.T) {
+// This test's first half is INVERTED from what it pinned as
+// `TestPruneLineage_WithinSegmentTrimNamesTheBoundaryKeepCounts`, which
+// asserted that `--keep-incrementals=1` on this fixture REFUSED and
+// named the boundary counts. Refusing was the interim behaviour while
+// the retention contract was open; the contract is now "round the
+// retention UP to a segment boundary", so this keep-count succeeds and
+// retains 2. The refusal's boundary-naming half did not disappear with
+// it — see
+// [TestPruneLineage_NoBoundaryAtOrAboveTheRequestRefusesAndNamesTheCounts],
+// which pins that prose on the same fixture at the keep-count rounding
+// still cannot rescue.
+//
+// The fixture holds 4 incrementals split 2/2 across two segments, so the
+// only boundary is at keep=2 (retire seg0 whole).
+func TestPruneLineage_KeepCountRoundsUpToTheSegmentBoundary(t *testing.T) {
 	store := newMemStore()
 	seedTwoSegmentLineage(t, store)
 
-	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	if err != nil {
+		t.Fatalf("PruneChain: %v", err)
+	}
+	// Retained MORE than asked, in the safe direction, and said so.
+	if res.RequestedIncrementals != 1 || res.IncrementalsRetained != 2 {
+		t.Errorf("requested/retained = %d/%d; want 1/2 — retention rounds UP to the segment boundary",
+			res.RequestedIncrementals, res.IncrementalsRetained)
+	}
+	// …and it is a real prune, not an over-retention that dropped nothing.
+	if res.SegmentsDropped != 1 {
+		t.Fatalf("SegmentsDropped = %d; want 1 (whole seg0) — rounding up must not turn prune into a no-op", res.SegmentsDropped)
+	}
+	got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(got.Segments) != 1 || got.Segments[0].Dir != "seg-1" {
+		t.Fatalf("post-prune segments = %+v; want only seg-1", got.Segments)
+	}
+	// The load-bearing half: the surviving floor segment was not trimmed
+	// in place. Whole segments dropped, nothing severed.
+	if n := len(got.Segments[0].Incrementals); n != 2 {
+		t.Errorf("floor segment kept %d of its 2 incrementals; segment-granular retention must leave it whole", n)
+	}
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Fatalf("the rounded-up prune left a chain that does not walk: %v", err)
+	}
+	// Idempotence in the must-NOT-change direction: asking for the count
+	// the rounding produced behaves identically (there is nothing left to
+	// drop, so it is the documented no-op).
+	again, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
+	if err != nil {
+		t.Fatalf("re-running at the rounded keep-count refuses: %v", err)
+	}
+	if len(again.Pruned) != 0 {
+		t.Errorf("re-run Pruned = %d; want 0", len(again.Pruned))
+	}
+}
+
+// TestPruneLineage_NoBoundaryAtOrAboveTheRequestRefusesAndNamesTheCounts
+// is the ROTATED half of item 100's refusal, and the reason the refusal
+// survived the contract decision at all: rounding UP can only reach a
+// boundary that EXISTS at or above the request. Ask to keep 3 of this
+// fixture's 4 incrementals and the only boundary (2) is below it, so
+// honouring the request segment-granularly means retaining all 4 and
+// deleting nothing.
+//
+// The refusal must not just say "prune at segment granularity" — it must
+// compute and name the `--keep-incrementals` values that work on THIS
+// chain, so the operator's next invocation is a copy-paste rather than a
+// derivation from the lineage catalog.
+func TestPruneLineage_NoBoundaryAtOrAboveTheRequestRefusesAndNamesTheCounts(t *testing.T) {
+	store := newMemStore()
+	seedTwoSegmentLineage(t, store)
+
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 3})
 	if err == nil {
-		t.Fatal("a keep-count that trims inside the floor segment must refuse")
+		t.Fatal("a keep-count above every segment boundary retains everything; reporting that as a prune is the silent no-op")
 	}
 	coded, ok := sluicecode.FromError(err)
 	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
 		t.Fatalf("refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, err)
 	}
 	for _, want := range []string{
+		"refusing --keep-incrementals=3",
 		"within-segment incremental trim severs the chain",
 		"the --keep-incrementals counts that land on a segment boundary are 2",
+		"NOTHING WAS DELETED",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal is missing %q:\n  %v", want, err)
 		}
 	}
-	// The named remedy has to actually WORK — a computed remedy nobody
-	// ran is the same unactionable refusal with more words.
+	// Inert, and the named remedy actually WORKS — a computed remedy
+	// nobody ran is the same unactionable refusal with more words.
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 2 {
+		t.Fatalf("the refusal mutated the catalog: %+v", cat.Segments)
+	}
 	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
 	if err != nil {
 		t.Fatalf("the boundary keep-count the refusal named still refuses: %v", err)
 	}
 	if res.SegmentsDropped != 1 {
 		t.Errorf("SegmentsDropped = %d; want 1 (the remedy must actually prune, not no-op)", res.SegmentsDropped)
+	}
+}
+
+// TestPruneLineage_LeadingIncrementalLessSegmentStillDrops pins the
+// reason item 100's refusal asks TWO questions ("did rounding leave
+// nothing to drop?" AND "has the restore floor not moved?") rather than
+// just the first.
+//
+// A rotated chain whose leading segment holds no incrementals of its own
+// contributes no segment boundary, so a keep-count rounds up to "retain
+// every incremental" — and yet there is still a whole segment to retire.
+// Refusing here would deny an operator a prune that is available and
+// perfectly safe, on the strength of an incremental count.
+func TestPruneLineage_LeadingIncrementalLessSegmentStillDrops(t *testing.T) {
+	store := newMemStore()
+	seedLeadingIncrementalLessSegmentLineage(t, store)
+
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	if err != nil {
+		t.Fatalf("PruneChain refused a chain with a droppable leading segment: %v", err)
+	}
+	if res.SegmentsDropped != 1 {
+		t.Fatalf("SegmentsDropped = %d; want 1 (the incremental-less seg0)", res.SegmentsDropped)
+	}
+	if res.RequestedIncrementals != 1 || res.IncrementalsRetained != 2 {
+		t.Errorf("requested/retained = %d/%d; want 1/2 (rounded up to the whole surviving segment)",
+			res.RequestedIncrementals, res.IncrementalsRetained)
+	}
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 1 || cat.Segments[0].Dir != "seg-1" || len(cat.Segments[0].Incrementals) != 2 {
+		t.Fatalf("post-prune segments = %+v; want only seg-1 with both incrementals", cat.Segments)
+	}
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-prune chain does not walk: %v", err)
+	}
+}
+
+// seedLeadingIncrementalLessSegmentLineage writes a 2-segment lineage
+// whose ROOT segment received no incrementals before rotating (the
+// Bug-139 stamp-less shape) and whose second segment holds two.
+func seedLeadingIncrementalLessSegmentLineage(t *testing.T, store irbackup.Store) {
+	t.Helper()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+
+	f0 := seedFull(t, store, "", "0/000", "0/100", now)
+	f1 := seedFull(t, store, "seg-1", "0/100", "0/200", now.Add(time.Hour))
+	i11 := seedIncr(t, store, "seg-1", "incr11", f1.BackupID, "0/200", "0/300", now.Add(2*time.Hour))
+	i12 := seedIncr(t, store, "seg-1", "incr12", i11.BackupID, "0/300", "0/400", now.Add(3*time.Hour))
+
+	capt := now.Add(time.Hour)
+	cat := &lineage.Catalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []lineage.Segment{
+			{
+				SegmentID: f0.BackupID, Dir: "", FullManifestPath: lineage.ManifestFileName,
+				StartPosition: f0.EndPosition, EndPosition: f0.EndPosition,
+				CappedAt: &capt, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
+			},
+			{
+				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: lineage.ManifestFileName,
+				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
+				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: blobcodec.CodecGzip,
+			},
+		},
+	}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
 	}
 }
 

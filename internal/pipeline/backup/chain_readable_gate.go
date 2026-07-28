@@ -233,8 +233,10 @@ var errNoChainToVerify = errors.New("readability check: the chain walks to zero 
 // errChainDoesNotWalk marks the gate's STRUCTURAL leg — the lineage walk
 // itself refused — as distinct from its identity/key legs, which fail
 // with the chain perfectly walkable and want an entirely different
-// remedy. Callers that can EXPLAIN a structural refusal in their own
-// terms match on this (see chain_prune.go's within-segment-trim
-// refusal, roadmap item 100); the prose is unchanged from when this was
-// an inline literal, so the sentinel costs the operator nothing.
+// remedy. It exists for callers that can EXPLAIN a structural refusal in
+// their own terms; prune matched on it while its within-segment trim
+// could still reach the gate, and stopped when segment-granular
+// retention made that shape unplannable (roadmap item 100). The prose is
+// unchanged from when this was an inline literal, so the sentinel costs
+// the operator nothing whether or not anyone is matching on it.
 var errChainDoesNotWalk = errors.New("the chain does not walk")
