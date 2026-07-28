@@ -1366,6 +1366,12 @@ func (b *BackupStream) runRollover(
 	// Stamp the CDC-position fold version FIRST (item 57) so ComputeBackupID
 	// folds CDCPositionCommitsAfterRows into the id for a VStream segment.
 	irbackup.StampCDCPositionBinding(manifest)
+	// Item 90 / Bug 212: the streaming twin of the incremental warning. This
+	// path stamps the injective-AAD version unconditionally too (see the
+	// comment on the stamp above), so a long-lived `backup stream` extending
+	// a chain rooted by an older binary raises the floor on its first
+	// rollover — silently, before this.
+	lineage.WarnChainFormatVersionRaise(ctx, lineage.ManifestBackupID(parent), parent.FormatVersion, manifest.FormatVersion)
 	manifest.BackupID = irbackup.ComputeBackupID(manifest)
 	manifest.PartialState = irbackup.BackupStateComplete
 	out.Manifest = manifest

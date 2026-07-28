@@ -353,6 +353,38 @@ func chooseFormatVersion(s *ir.Schema) int {
 // stamps the correct version without duplicating the detection logic.
 func FormatVersionFor(s *ir.Schema) int { return chooseFormatVersion(s) }
 
+// minimumReaderVersion maps a manifest FormatVersion to the earliest
+// sluice release that can read it. Kept in lock-step with the version
+// constants above and with docs/backup-format-versioning.md; the
+// entries are release tags, not the development versions that
+// introduced the code.
+var minimumReaderVersion = map[int]string{
+	FormatVersionLegacy:                "v0.16.0",
+	FormatVersionSecurityMetadata:      "v0.94.1",
+	FormatVersionProgressSidecar:       "v0.99.39",
+	FormatVersionStandaloneSequences:   "v0.99.175",
+	FormatVersionEncryptedChunkBinding: "v0.99.202",
+	FormatVersionSignedManifest:        "v0.99.208",
+	FormatVersionChunkTableBinding:     "v0.99.214",
+	FormatVersionCDCPositionBinding:    "v0.99.228",
+	FormatVersionInjectiveChunkAAD:     "v0.104.0",
+}
+
+// MinimumReaderVersion names the earliest sluice release that can read a
+// manifest recorded at format version fv. Returns "" for a version this
+// build has no entry for — callers must treat that as "unknown" and omit
+// the advice rather than guess.
+//
+// This is a WRITE-side helper. It cannot improve the cross-version restore
+// refusal in [lineage.ReadManifest], however tempting that looks: that
+// refusal fires precisely when `m.FormatVersion > BackupFormatVersion`, so
+// the binary raising it has never heard of the version it is refusing and
+// its table necessarily has no entry. The advice would always degrade to
+// the bare "upgrade sluice" it already prints. The version that CAN answer
+// the question is the one doing the writing, which is why this exists for
+// [Manifest]-stamping callers naming a chain's new readability floor.
+func MinimumReaderVersion(fv int) string { return minimumReaderVersion[fv] }
+
 // Manifest kind constants. String literals are part of the on-disk
 // format; renaming requires a [BackupFormatVersion] bump.
 const (

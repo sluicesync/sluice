@@ -456,6 +456,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// the id for a VStream segment; a no-op (legacy id, feature-min version) for
 	// a non-VStream one.
 	irbackup.StampCDCPositionBinding(manifest)
+	// Item 90 / Bug 212: every stamp this segment will carry is now decided,
+	// so this is the first honest moment to tell the operator whether the
+	// chain's readability floor just moved. Compared against the link being
+	// extended, not the chain root — once a raise has happened the parent is
+	// the already-raised segment, so a chain does not warn on every
+	// subsequent incremental.
+	lineage.WarnChainFormatVersionRaise(ctx, lineage.ManifestBackupID(parent), parent.FormatVersion, manifest.FormatVersion)
 	manifest.BackupID = irbackup.ComputeBackupID(manifest)
 	manifest.PartialState = irbackup.BackupStateComplete
 

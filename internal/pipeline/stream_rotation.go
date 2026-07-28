@@ -317,6 +317,17 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		b.discardProvisional(ctx, provisionalDir)
 		return zero, abortStayOpen("read new segment full manifest", err)
 	}
+	// Item 90 / Bug 212, the third stamping site. A rotation-born segment
+	// full runs the ordinary `backup full` orchestrator against an EMPTY
+	// provisional dir, so its resume ladder sees no prior manifest and
+	// stamps the current version — the chain it is joining is never
+	// consulted. Warn on the raise, reading the prior segment's own full to
+	// get a version the catalog does not record. Best-effort by
+	// construction: a chain-readability warning must never be the thing
+	// that aborts a rotation.
+	if priorFull, perr := lineage.ReadManifestAt(ctx, prior.Store(b.Store), prior.FullManifestPath); perr == nil {
+		lineage.WarnChainFormatVersionRaise(ctx, lineage.ManifestBackupID(priorFull), priorFull.FormatVersion, newFull.FormatVersion)
+	}
 	s := newFull.EndPosition
 
 	if err := crashAt("post-bulkcopy"); err != nil {

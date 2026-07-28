@@ -89,6 +89,10 @@ Every backup chain root manifest carries a `FormatVersion` field:
   **not** re-sealed and need no migration — each one keeps opening under the
   version it records. An older binary refuses a v9 manifest loudly at preflight
   rather than recomputing the old AAD against chunks sealed with the new one.
+  But **extending** an existing chain with a v9 binary raises the whole chain's
+  floor to v9 — see [A chain's floor is its newest
+  link](#a-chains-floor-is-its-newest-link) below, which is the part of this
+  contract that is easiest to get wrong.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version
@@ -195,6 +199,94 @@ relations** on the destination. The refuse-before-touch property is
 load-bearing: there is no code path on the older binary where the
 chain is partially applied with the security metadata dropped. The
 silent-loss class is **structurally impossible**.
+
+## A chain's floor is its newest link
+
+Everything above describes a **single manifest**. A chain is a root full
+plus its segments and incrementals, and a restore walks all of them — so
+a binary that refuses any one manifest restores **nothing** from that
+chain, including the manifests it wrote itself under a version it
+understands perfectly well.
+
+That makes the operative number for a chain not its root's version but
+the **maximum over all its links**. Call it the chain's floor: the
+earliest sluice release that can restore the chain as a whole.
+
+The floor moves when a newer binary extends an older chain:
+
+```
+chain root written by v0.103.2        → format version 7
+  + `backup incremental` by v0.104.0  → format version 9   ← floor is now 9
+```
+
+One `backup incremental` is enough. The new segment is correctly stamped
+9 — its chunks really were sealed under the v9 encoding, and stamping it
+anything else would seal fresh data under an encoding the bump exists to
+retire. But from that moment v0.103.2 cannot restore *any* part of that
+chain, including the root it wrote itself.
+
+**This is not a bug in the stamping, and there is no in-product escape
+today.** The per-link stamp is what makes the forward direction work
+forever. What was missing is that nothing told the operator the floor had
+moved: through v0.104.0 the raise was silent, with exit code 0. Sluice
+now emits a WARN at the moment of the raise, naming the new floor and the
+release needed to reach it:
+
+```
+WARN backup: this segment raises the chain's format version, so sluice
+     releases older than v0.104.0 can no longer restore ANY part of this
+     chain — including the segments they wrote themselves. If a binary
+     that must be able to restore is still on an older release, upgrade
+     it before taking further backups here
+     chain=backup-2f9c… previous_format_version=7 new_format_version=9
+     minimum_sluice_version=v0.104.0
+```
+
+Three paths raise a floor, and all three warn: `backup incremental`, a
+`backup stream` rollover, and the segment full a stream rotation creates.
+Chain **compaction** does not — it rewrites manifests in place and each
+one keeps its own recorded version.
+
+### What this means for a staged fleet upgrade
+
+If every binary that might ever restore is on the same version, none of
+this affects you; upgrade and carry on.
+
+If you upgrade in stages — a new version on the backup host first, older
+versions still on DR or restore-test hosts — then **finish the upgrade
+before taking an incremental with the new binary.** The reverse direction
+is safe by construction: an older binary refuses to extend a newer chain
+and writes nothing, so a mixed fleet degrades safely on that side. It is
+the new-binary-extends-old-chain direction that silently locks the old
+ones out.
+
+If it has already happened, the chain is not damaged — the new binary
+restores it row-exact. The remedy is to upgrade the binaries that need to
+read it, or to start a fresh chain with a full backup on the older binary
+if upgrading is not possible.
+
+### Why a warning and not a refusal
+
+A refusal would break the routine incremental cadence for every operator
+on upgrade day, including the majority who have no older binary anywhere
+— turning a compatibility caveat into an outage, to protect against a
+condition sluice cannot detect (it has no way to know what other binaries
+exist). The operator holds the information; the warning is what gets it
+to them. Roadmap item 90 tracks whether an opt-in strict mode is worth
+adding for operators who want the hard failure.
+
+### Why this was found late
+
+Every test sluice had ran **one binary against its own output**, where
+this class is invisible by construction. It took a post-release
+regression cycle running two binaries against one store to surface it,
+and the v0.104.0 release notes had already claimed existing chains were
+"unaffected in both directions" — true only of a chain nobody extends,
+and taking an incremental is the most ordinary thing an operator does to
+a chain. Catalogued as **Bug 212**. The warning above is the operator-
+facing half; the durable gate is a cross-version differential — two
+binaries, one store — since that is the only shape of test that can see
+this class at all.
 
 ## What operators see
 
