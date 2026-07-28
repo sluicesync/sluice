@@ -1816,6 +1816,24 @@ So this is the Bug-207 class again — an unclassified error at a site whose cla
 
 **The MySQL-target half is already closed** (Bug 210, fixed in this batch): a deferrable primary key against a MySQL-family target now WARNs like its FK and UNIQUE siblings, rather than vanishing in silence.
 
+### 90. Extending an older encrypted chain with a v9 binary silently makes the whole chain unreadable by older binaries (Bug 212, v0.104.0 regression cycle) — *open*
+
+**What.** One `backup incremental` run by a FormatVersion-9 binary against a chain whose root is v7 stamps the new segment 9 and exits 0 with no warning at `-l info`. An older sluice can then restore **nothing** from that directory — not the new segment, and not the untouched v7 full it wrote itself — because `lineage.json` pins the segment and a chain is only as readable as its newest link. The new binary restores it row-exact, so nothing is lost; what is lost is the older binary's ability to read anything there.
+
+**Observed, with a sensitive differential.** Extending the same chain with the older binary instead leaves both binaries able to restore it. The reverse direction is safe by construction: an older binary refuses to extend a v9-headed chain and writes nothing, so a mixed fleet degrades in the safe direction on that side.
+
+**Why the per-link design is right and still insufficient.** Stamping each manifest at the version its own chunks were sealed under is exactly the dual-version rule ADR-0181 and ADR-0154 rest on, and it is what makes the *restore* direction work at all. The gap is not the stamping — it is that nothing tells the operator the readability of the CHAIN just changed. A per-link decision has a whole-chain consequence, and only the per-link half is implemented.
+
+**What this cost.** v0.104.0's published Compatibility section said existing chains were unaffected in both directions. That is true only for a chain nobody extends, and "take an incremental" is the most ordinary thing an operator does to an existing chain. The notes are corrected; this entry is the fix.
+
+**Options, in rough order of appeal.** A loud WARN at the moment of the version bump, naming the consequence and which binaries can no longer read the chain, is the cheapest honest thing and would have made this self-reporting rather than a cycle finding. A refusal gated behind a `--allow-format-upgrade`-style opt-in is stronger and matches how this project treats other irreversible-ish steps. Keeping the extension at the chain's existing version is a third option and probably wrong — it would seal new chunks under the encoding ADR-0181 exists to retire.
+
+**Gate when this ships.** The cross-version differential the cycle built (`workspace/v104/focus1d_upgrade.sh`) is the shape: two binaries, one store, assert what each can read after an extension. That belongs in the extended-suites matrix rather than living only in the testing repo — this class is invisible to any single-binary test, which is exactly why it reached a release.
+
+### 91. `schema add-table` reports the deferrable-key refusal under the wrong code and exit status (Bug 213, v0.104.0 regression cycle) — *open, small*
+
+The deferrable-key preflight refusal reaches `schema add-table` with its full prose and remedy, but arrives wrapped as `SLUICE-E-BULKCOPY-TABLE-FAILED` with exit 1, where `sync start` and chain restore report the documented `SLUICE-E-TARGET-DEFERRABLE-KEY` with exit 3. An operator matching on the documented code — which is what the error-codes table tells them to do — will not match this one. The refusal is correct and the guidance is intact; only the machine-readable half is wrong.
+
 ### 89. `refuseSignedChain` reports a cancelled context as a probe failure (observed 2026-07-27 on the v0.104.0 tag) — *✅ SHIPPED 2026-07-27 (unreleased at time of writing)*
 
 **What.** `BackupStream.refuseSignedChain` (`internal/pipeline/stream.go`) wraps every error from `lineage.ChainIsSigned` as `"backup stream: probe signed chain: %w"`. That includes `context.Canceled`. When a caller cancels during a rollover, the probe is interrupted and `stream.Run` returns an error naming the probe, instead of exiting cleanly — `TestBackupStream_ContextCancel_DuringRollover_CleanExit` asserts the clean exit and caught it.
