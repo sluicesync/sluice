@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
@@ -41,6 +42,15 @@ import (
 // again (segment-granular retention, or re-anchoring the floor full) is
 // a contract decision filed for the roadmap, not something this gate
 // should paper over.
+//
+// What this test now ALSO pins is the refusal's actionable half (item
+// 100's release-blocking part, and the third instance of the class items
+// 91 and 96 are): the generic "the chain does not walk" prose told an
+// operator nothing — not whether their backups were broken, not whether
+// sluice was, not what to run instead — on the single most ordinary
+// retention invocation there is. So the shape gets a purpose-built
+// refusal, and this test holds it to naming the shape, the inertness,
+// and the retention that IS safe on THIS chain.
 func TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 5)
@@ -53,8 +63,33 @@ func TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted(t *testi
 	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
 		t.Fatalf("refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, err)
 	}
-	if !strings.Contains(err.Error(), "NO files were removed") {
-		t.Errorf("err = %q; want the pre-sweep decoration promising nothing was destroyed", err)
+	if coded.ExitCode() != sluicecode.ExitRefusal {
+		t.Errorf("ExitCode() = %d; want %d — a re-run will not help", coded.ExitCode(), sluicecode.ExitRefusal)
+	}
+	if coded.Hint == "" {
+		t.Error("the refusal carries no standalone hint — the machine-readable remedy is the half item 100 was filed for")
+	}
+	// The three jobs of the purpose-built prose. Each substring is a
+	// promise to the operator, not a formatting detail: what happened,
+	// that nothing was destroyed, and what to do instead.
+	for _, want := range []string{
+		// The SHAPE, in the operator's own invocation.
+		"refusing --keep-incrementals=2",
+		"within-segment incremental trim severs the chain",
+		"still records parent",
+		// The inertness promise.
+		"NOTHING WAS DELETED",
+		"exactly as restorable as it was before this run",
+		// The remedy — and, on a never-rotated chain, the fact that the
+		// flag they used cannot express it (item 100's reach, derived
+		// from the lineage rather than asserted in prose).
+		"No --keep-incrementals value lands on a segment boundary",
+		"never-rotated (SINGLE-segment) chain none ever can",
+		"--keep-duration",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal is missing %q — it is the unactionable generic prose again:\n  %v", want, err)
+		}
 	}
 	// The promise has to be true: catalog and manifests untouched.
 	cat, okCat, err := lineage.LoadLineageCatalog(context.Background(), store)
@@ -173,38 +208,7 @@ func TestPruneLineage_RefusesWhenCatalogAbsent(t *testing.T) {
 // full is a self-contained snapshot).
 func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	store := newMemStore()
-	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
-
-	// Contiguous chain: each link's StartPosition == the preceding
-	// link's EndPosition, and seg1.full.Start == seg0.lastIncr.End
-	// (the inter-segment boundary the rotation FSM guarantees).
-	f0 := seedFull(t, store, "", "0/000", "0/100", now)
-	i01 := seedIncr(t, store, "", "incr01", f0.BackupID, "0/100", "0/200", now.Add(time.Hour))
-	i02 := seedIncr(t, store, "", "incr02", i01.BackupID, "0/200", "0/300", now.Add(2*time.Hour))
-	f1 := seedFull(t, store, "seg-1", "0/300", "0/400", now.Add(3*time.Hour))
-	i11 := seedIncr(t, store, "seg-1", "incr11", f1.BackupID, "0/400", "0/500", now.Add(4*time.Hour))
-	i12 := seedIncr(t, store, "seg-1", "incr12", i11.BackupID, "0/500", "0/600", now.Add(5*time.Hour))
-
-	capt := now.Add(3 * time.Hour)
-	cat := &lineage.Catalog{
-		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []lineage.Segment{
-			{
-				SegmentID: f0.BackupID, Dir: "", FullManifestPath: lineage.ManifestFileName,
-				Incrementals:  []string{"manifests/incr-01.json", "manifests/incr-02.json"},
-				StartPosition: f0.EndPosition, EndPosition: i02.EndPosition,
-				CappedAt: &capt, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
-			},
-			{
-				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: lineage.ManifestFileName,
-				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
-				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: blobcodec.CodecGzip,
-			},
-		},
-	}
-	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
-		t.Fatal(err)
-	}
+	seedTwoSegmentLineage(t, store)
 
 	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
 	if err != nil {
@@ -251,7 +255,140 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
 		t.Errorf("restore-after-prune lineage.BuildLineageChain: %v; want valid", err)
 	}
-	_ = i02
+}
+
+// seedTwoSegmentLineage writes the canonical rotated fixture: seg0
+// (capped, full + 2 incrementals) and seg1 (open, full + 2). Contiguous
+// throughout — each link's StartPosition == the preceding link's
+// EndPosition, and seg1.full.Start == seg0.lastIncr.End, the
+// inter-segment boundary the rotation FSM guarantees — so any refusal a
+// prune of it produces is about the PRUNE, never about the seed.
+func seedTwoSegmentLineage(t *testing.T, store irbackup.Store) {
+	t.Helper()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+
+	f0 := seedFull(t, store, "", "0/000", "0/100", now)
+	i01 := seedIncr(t, store, "", "incr01", f0.BackupID, "0/100", "0/200", now.Add(time.Hour))
+	i02 := seedIncr(t, store, "", "incr02", i01.BackupID, "0/200", "0/300", now.Add(2*time.Hour))
+	f1 := seedFull(t, store, "seg-1", "0/300", "0/400", now.Add(3*time.Hour))
+	i11 := seedIncr(t, store, "seg-1", "incr11", f1.BackupID, "0/400", "0/500", now.Add(4*time.Hour))
+	i12 := seedIncr(t, store, "seg-1", "incr12", i11.BackupID, "0/500", "0/600", now.Add(5*time.Hour))
+
+	capt := now.Add(3 * time.Hour)
+	cat := &lineage.Catalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []lineage.Segment{
+			{
+				SegmentID: f0.BackupID, Dir: "", FullManifestPath: lineage.ManifestFileName,
+				Incrementals:  []string{"manifests/incr-01.json", "manifests/incr-02.json"},
+				StartPosition: f0.EndPosition, EndPosition: i02.EndPosition,
+				CappedAt: &capt, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
+			},
+			{
+				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: lineage.ManifestFileName,
+				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
+				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: blobcodec.CodecGzip,
+			},
+		},
+	}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPruneLineage_WithinSegmentTrimNamesTheBoundaryKeepCounts is the
+// ROTATED half of item 100's refusal: on a chain that HAS segment
+// boundaries, the refusal must not just say "prune at segment
+// granularity" — it must compute and name the `--keep-incrementals`
+// values that do, so the operator's next invocation is a copy-paste
+// rather than a derivation from the lineage catalog.
+//
+// The fixture holds 4 incrementals split 2/2 across two segments, so
+// exactly one count (2 — keep seg1's pair, retire seg0 whole) lands on a
+// boundary. `--keep-incrementals=1` asks for one inside seg1, which is
+// the sever.
+func TestPruneLineage_WithinSegmentTrimNamesTheBoundaryKeepCounts(t *testing.T) {
+	store := newMemStore()
+	seedTwoSegmentLineage(t, store)
+
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
+	if err == nil {
+		t.Fatal("a keep-count that trims inside the floor segment must refuse")
+	}
+	coded, ok := sluicecode.FromError(err)
+	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
+		t.Fatalf("refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, err)
+	}
+	for _, want := range []string{
+		"within-segment incremental trim severs the chain",
+		"the --keep-incrementals counts that land on a segment boundary are 2",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal is missing %q:\n  %v", want, err)
+		}
+	}
+	// The named remedy has to actually WORK — a computed remedy nobody
+	// ran is the same unactionable refusal with more words.
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
+	if err != nil {
+		t.Fatalf("the boundary keep-count the refusal named still refuses: %v", err)
+	}
+	if res.SegmentsDropped != 1 {
+		t.Errorf("SegmentsDropped = %d; want 1 (the remedy must actually prune, not no-op)", res.SegmentsDropped)
+	}
+}
+
+// TestPruneLineage_UnreadableChainKeepsTheGenericRefusal is the
+// SPECIFICITY pin for item 100's message: the readability gate catches
+// more than the within-segment trim, and those conditions need their own
+// prose (an identity/key failure's recovery is `cp`-ing a surviving
+// header back, which has nothing to do with retention granularity). A
+// blanket "if prune fails, blame the trim" would have been the wrong
+// fix, so this asserts the generic decoration is still what a
+// non-trim refusal carries.
+//
+// The shape: a whole-segment prune (keep exactly seg1's pair — no
+// in-place trim at all) of a chain whose surviving segment claims
+// passphrase encryption while the chain-ROOT manifest records none, i.e.
+// the state a pre-fix binary left an encrypted chain in.
+func TestPruneLineage_UnreadableChainKeepsTheGenericRefusal(t *testing.T) {
+	store := newMemStore()
+	seedTwoSegmentLineage(t, store)
+
+	// Stamp encryption on the surviving segment's full only. The walk
+	// still succeeds — this fails at the gate's IDENTITY leg, which is
+	// the whole point of the pin.
+	segStore := lineage.NewPrefixedStore(store, "seg-1")
+	f1, err := lineage.ReadManifestAt(context.Background(), segStore, lineage.ManifestFileName)
+	if err != nil {
+		t.Fatalf("read seg-1 full: %v", err)
+	}
+	f1.ChainEncryption = &irbackup.ChainEncryption{
+		Algorithm: "AES-256-GCM", Mode: crypto.EncryptModePerChain,
+		KEKMode:  crypto.KEKModePassphrase,
+		Argon2id: &irbackup.Argon2idParams{Salt: []byte("0123456789abcdef")},
+	}
+	if err := lineage.WriteManifestAt(context.Background(), segStore, lineage.ManifestFileName, f1); err != nil {
+		t.Fatalf("rewrite seg-1 full: %v", err)
+	}
+
+	_, err = backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
+	if err == nil {
+		t.Fatal("prune reported success over a chain whose identity header records no encryption")
+	}
+	coded, ok := sluicecode.FromError(err)
+	if !ok || coded.Code != sluicecode.CodeBackupChainUnreadable {
+		t.Fatalf("refusal is not %s: %v", sluicecode.CodeBackupChainUnreadable, err)
+	}
+	if !strings.Contains(err.Error(), "records no chain-encryption metadata") {
+		t.Errorf("the identity refusal lost its own prose:\n  %v", err)
+	}
+	if !strings.Contains(err.Error(), "NO files were removed") {
+		t.Errorf("err = %q; want the generic pre-sweep decoration", err)
+	}
+	if strings.Contains(err.Error(), "within-segment incremental trim") {
+		t.Errorf("a NON-trim readability failure was reported as item 100's trim — the detection is not specific:\n  %v", err)
+	}
 }
 
 // --- seed helpers ---
