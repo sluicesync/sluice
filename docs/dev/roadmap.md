@@ -1846,6 +1846,27 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 93. A PG source table whose only key is a DEFERRABLE PK has no usable replica identity, and adding it to a publication breaks the SOURCE APPLICATION's own writes — silently, from sluice's side (reproduced on v0.103.0/1/2) — *open, HIGH*
+
+**What.** Postgres will not use a deferrable primary key's index as a replica identity (`pg_index.indimmediate = false`), so a table whose only key is a deferrable PK has **no usable replica identity**. `sluice sync start` adds it to `sluice_pub` with `pubupdate=t pubdelete=t`, and from that moment Postgres refuses the **source application's own** `UPDATE` and `DELETE` on that table:
+
+```
+ERROR: cannot update table "dpk" because it does not have a replica identity and publishes updates
+ERROR: cannot delete from table "dpk" because it does not have a replica identity and publishes deletes
+```
+
+`INSERT` keeps working, which is what makes it insidious — the table looks healthy until the first update.
+
+**Why this ranks above an ordinary preflight gap.** The breakage lands in the operator's *own application*, not in sluice's output, and it is sluice's publication that triggers Postgres's check. So the symptom appears somewhere the operator has no reason to connect to sluice, while sluice logs **nothing** — zero lines mentioning replica identity at cold start on any of three binaries tested. A plain-PK table in the same run is unaffected, so it also looks table-specific rather than tool-caused. Both recoveries are verified: dropping the publication, or `ALTER TABLE … REPLICA IDENTITY FULL`.
+
+**Same catalog bit as Bug 211, opposite side of the pipeline.** `indimmediate=false` is exactly what makes a deferrable key illegal as an `ON CONFLICT` arbiter on the TARGET (Bug 211, fixed v0.104.0). This is the SOURCE-side consequence of the same bit, and it is pre-existing rather than a regression — reproduced identically on v0.103.0, v0.103.1 and v0.103.2. It was recorded in Bug 211's companion section and never promoted to a roadmap item; the v0.104.1 learnings sweep caught that it was still unfiled.
+
+**Verified still open at HEAD (v0.104.1).** The only `relreplident` read anywhere in `internal/` is the `--where` full-before-image preflight (`internal/engines/postgres/where_cdc_preflight.go`); there is no general replica-identity-usability check. sluice's only other handling is REACTIVE — `cdc_reader.go` errors when an UPDATE arrives with no identity — and that never fires here, because the operator's write fails first, upstream of sluice ever seeing a change.
+
+**Fix shape.** One preflight at PG-source cold start: every in-scope table's replica-identity index must be unique **and** `indimmediate`. That single catalog read covers three cases at once — this one, Bug 211's target side, and the keyless case (which today produces only an INFO about copy strategy). Refuse loudly, naming the table, the reason, and both remedies (make the constraint immediate, or `REPLICA IDENTITY FULL`). Prefer refusing at start over letting sluice put the source into a state where the operator's writes fail.
+
+**Evidence.** `sluice-testing` BUG-CATALOG, Bug 211 companion section; repro script `workspace/v1032/focus1c_replicaidentity.sh`.
+
 ### 92. A tightly-bounded `--max-changes` incremental can write a chain segment that captured nothing (observed 2026-07-27) — *open, NOT root-caused*
 
 **Observed.** Building the item-90 cross-version gate, an incremental run with `--max-changes 2` immediately after a prior one wrote a real, chain-linked, correctly-stamped, correctly-parented manifest with `start_position == end_position` and **none of the committed delta in it** — while logging `changes=6`. The identical run with `--max-changes 0` and a time bound picked the delta up. Surfaced as two restore cells returning 3 rows instead of 4; the harness works around it by dropping the bound, documented in the test.
