@@ -50,44 +50,23 @@ var DumpParityAllowlist = []dumpParityAllowlistEntry{
 		Reason:   "UNIQUE NULLS NOT DISTINCT lands as plain UNIQUE — the C3 read-time WARN names the weakening; faithful same-engine carry is the filed follow-up",
 		Citation: "docs/dev/roadmap.md \"UNIQUE-constraint attribute fidelity\"",
 	},
-	// The PK-constraint-NAME cell (audit 2026-07-26 follow-up, roadmap item
-	// 84). sluice emits PRIMARY KEY inline in CREATE TABLE, so Postgres
-	// auto-names the constraint <table>_pkey and an explicitly-named source PK
-	// loses its name. Harmless for enforcement — the key is identical — but it
-	// breaks ON CONFLICT ON CONSTRAINT <name> and any DDL that names the
-	// constraint. NOT fixed inline with the attribute work because the obvious
-	// fix (emit CONSTRAINT <PrimaryKey.Name>) would emit CONSTRAINT PRIMARY for
-	// a MySQL source, whose PK index is literally named PRIMARY — it needs a
-	// source-engine-aware rule, not a one-liner. These entries keep the gap
-	// VISIBLE in the ledger (allowlist hits are logged every run) instead of
-	// letting the seed go quiet about it, and go stale-loud when item 84 ships.
-	// NOTE on scope, learned the hard way (Bug 208): these entries match a
-	// statement PREFIX, so an entry keyed on the constraint name swallows
-	// everything that follows it on the line — including the DEFERRABLE
-	// INITIALLY DEFERRED clause. The first cut of this pair masked a real
-	// attribute defect: the oracle emitted the PK with its attributes and
-	// sluice emitted it without them, and the ledger stayed green because the
-	// allowlist had already excused the whole line on NAME grounds.
+	// The PK-constraint-NAME cell (roadmap item 84) is CLOSED: the PG writer
+	// now re-emits `CONSTRAINT <name> PRIMARY KEY (...)` when the source
+	// engine names primary keys as first-class constraints
+	// (ir.Index.ConstraintNamed), so attr_namedpk's `attr_namedpk_pk`
+	// survives to the target and the two entries that excused the divergence
+	// are gone. attr_namedpk stays in the seed as the oracle-side pin of the
+	// carry, and attr_defpk stays separate — its PK is named to PG's own
+	// default so the attribute axis is compared without a name difference in
+	// the way.
 	//
-	// So the attribute-bearing table (attr_defpk) is NOT allowlisted at all
-	// any more — its PK is named to PG's own default so no name divergence
-	// arises and the attribute axis is compared for real. The name gap keeps a
-	// dedicated table of its own, carrying NO attributes, so excusing its line
-	// cannot hide anything else.
+	// The scope rule those entries taught (Bug 208) outlives them and is the
+	// general rule for this file: an allowlist entry matches a statement
+	// PREFIX, so an entry keyed on a constraint name swallows everything that
+	// follows on the line — including a DEFERRABLE INITIALLY DEFERRED clause.
+	// An entry must be NARROWER than the property it excuses; if its prefix
+	// can absorb an unrelated difference, it will eventually absorb a defect.
 	//
-	// General rule for this file: an allowlist entry must be narrower than the
-	// property it excuses. If the entry's prefix can absorb an unrelated
-	// difference, it will eventually absorb a defect.
-	{
-		Pattern:  "ALTER TABLE public.attr_namedpk ADD CONSTRAINT attr_namedpk_pkey",
-		Reason:   "an explicitly-named source PRIMARY KEY is re-emitted inline, so PG auto-names it <table>_pkey; this table carries NO constraint attributes, so the excused line cannot hide an attribute divergence",
-		Citation: "docs/dev/roadmap.md item 84 (PK constraint-name fidelity)",
-	},
-	{
-		Pattern:  "ALTER TABLE public.attr_namedpk ADD CONSTRAINT attr_namedpk_pk",
-		Reason:   "oracle side of the same cell: pg_dump emits the source constraint name sluice did not preserve",
-		Citation: "docs/dev/roadmap.md item 84 (PK constraint-name fidelity)",
-	},
 	// The serial → identity modernization trio (docs/type-mapping.md
 	// "Sequences and serial columns"): pg_dump restores a classic
 	// serial column as CREATE SEQUENCE + OWNED BY + SET DEFAULT

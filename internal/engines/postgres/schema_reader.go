@@ -1691,6 +1691,17 @@ func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
 		Unique:           isUnique,
 		Kind:             kind,
 		ConstraintBacked: owned,
+		// Roadmap item 84: the NAME carry is a THIRD gate, wider than
+		// either of the two above — `indexName` is a real, operator-
+		// referenceable pg_constraint identifier whenever a constraint owns
+		// the index, PK included. That is what lets the writer re-emit
+		// `CONSTRAINT <name> PRIMARY KEY (...)` instead of letting PG
+		// auto-name the target's key `<table>_pkey` and breaking every
+		// `ON CONFLICT ON CONSTRAINT <name>` the application issues. Kept
+		// separate from `owned` for the reason the comment above records:
+		// folding a wider carry into a narrower re-emit gate is how the
+		// DEFERRABLE PK went silent.
+		ConstraintNamed: constraintBacked,
 		// v0.100 readiness C3: metadata-only carry of the owning UNIQUE
 		// constraint's attributes — no emitter reads these yet; the
 		// read-time WARN (warnWeakenedUniqueConstraint) names the

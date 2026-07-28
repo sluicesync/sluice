@@ -161,6 +161,67 @@ func TestMarshalTable_IndexConstraintBackedRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMarshalTable_PrimaryKeyConstraintNamedRoundTrip pins roadmap item
+// 84's flag across the backup / schema-history wire, on the field that
+// actually carries it: Table.PrimaryKey, which no other pin in this file
+// exercises. A restore that lost ConstraintNamed would re-emit the PK
+// inline and unnamed, so the restored target's key would be
+// `<table>_pkey` and every `ON CONFLICT ON CONSTRAINT orders_pk` in the
+// application would fail — the exact divergence item 84 closes, reopened
+// through the backup door.
+//
+// The paired MySQL-shaped PK is the non-vacuity half: a wire that
+// defaulted the flag ON would carry the `PRIMARY` sentinel into a
+// `CONSTRAINT "PRIMARY"` on the restored target.
+func TestMarshalTable_PrimaryKeyConstraintNamedRoundTrip(t *testing.T) {
+	pgSourced := &Table{
+		Name:       "orders",
+		Columns:    []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		PrimaryKey: &Index{Name: "orders_pk", Unique: true, ConstraintNamed: true, Columns: []IndexColumn{{Column: "id"}}},
+	}
+	mysqlSourced := &Table{
+		Name:       "orders",
+		Columns:    []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		PrimaryKey: &Index{Name: "PRIMARY", Unique: true, Columns: []IndexColumn{{Column: "id"}}},
+	}
+	for _, c := range []struct {
+		name string
+		in   *Table
+	}{{"PG-sourced named PK", pgSourced}, {"MySQL-sourced PRIMARY sentinel", mysqlSourced}} {
+		t.Run(c.name, func(t *testing.T) {
+			b, err := MarshalTable(c.in)
+			if err != nil {
+				t.Fatalf("MarshalTable: %v", err)
+			}
+			out, err := UnmarshalTable(b)
+			if err != nil {
+				t.Fatalf("UnmarshalTable: %v", err)
+			}
+			if !reflect.DeepEqual(c.in.PrimaryKey, out.PrimaryKey) {
+				t.Errorf("PrimaryKey did not round-trip:\n in: %#v\nout: %#v\njson=%s", c.in.PrimaryKey, out.PrimaryKey, b)
+			}
+		})
+	}
+}
+
+// TestUnmarshalTable_OldWireLeavesConstraintNamedFalse pins the
+// cross-version contract: a manifest written before item 84 has no
+// constraint_named key at all, and must decode to false — the unnamed
+// inline PK that binary itself emitted. Additive wire, no format bump.
+func TestUnmarshalTable_OldWireLeavesConstraintNamedFalse(t *testing.T) {
+	const oldWire = `{"Name":"orders","PrimaryKey":{"Name":"orders_pk","Unique":true,"Columns":[{"Column":"id"}]}}`
+	out, err := UnmarshalTable([]byte(oldWire))
+	if err != nil {
+		t.Fatalf("UnmarshalTable: %v", err)
+	}
+	if out.PrimaryKey.ConstraintNamed {
+		t.Error("an older manifest decoded ConstraintNamed true — a restore would invent a constraint name the writing binary never carried")
+	}
+	if out.PrimaryKey.Name != "orders_pk" {
+		t.Errorf("PrimaryKey.Name = %q; want orders_pk", out.PrimaryKey.Name)
+	}
+}
+
 // TestUnmarshalType_OldTemporalWireDecodesExplicit pins the TRIAGE #3
 // cross-version contract: a manifest written by an OLDER binary
 // carries the materialized Precision=6 for a bare temporal column and

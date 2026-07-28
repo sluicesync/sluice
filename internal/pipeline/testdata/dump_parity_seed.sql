@@ -203,10 +203,13 @@ CREATE TABLE attr_defpk (
 );
 
 -- The PK constraint-NAME axis, on its OWN table carrying NO attributes
--- (roadmap item 84). Kept separate from attr_defpk deliberately: the
--- dump-parity allowlist matches a statement PREFIX, so an entry excusing a
--- NAME difference on an attribute-bearing table would also excuse an
--- attribute difference on the same line — which is exactly how Bug 208 hid.
+-- (roadmap item 84, now SHIPPED — the two allowlist entries that excused the
+-- divergence are gone, so this table is a live parity cell: the target must
+-- carry `attr_namedpk_pk`, not PG's auto-generated `attr_namedpk_pkey`).
+-- Kept separate from attr_defpk deliberately: the dump-parity allowlist
+-- matches a statement PREFIX, so an entry excusing a NAME difference on an
+-- attribute-bearing table would also excuse an attribute difference on the
+-- same line — which is exactly how Bug 208 hid.
 CREATE TABLE attr_namedpk (
     a  BIGINT NOT NULL,
     CONSTRAINT attr_namedpk_pk PRIMARY KEY (a)
