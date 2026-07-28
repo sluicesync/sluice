@@ -145,15 +145,23 @@ rather than report success over a chain it made unreadable — pass
 `--encrypt` with the chain's key material so that check can prove the
 key still unwraps, not just that the identity survived.
 
-Retention is **segment-granular**: `N` has to land on a segment
-boundary. Trimming leading incrementals *inside* a segment would leave
-its full anchored before a gap, so prune refuses that shape at the
-pre-commit leg — `SLUICE-E-BACKUP-CHAIN-UNREADABLE`, exit 3, nothing
-deleted — and names the keep-counts that do land on a boundary for your
-chain. A chain that has never rotated is a single segment with no
-boundary to land on, so every `--keep-incrementals` prune of one
-refuses; use `--keep-duration` with a cutoff older than every
-incremental there instead.
+Retention is **segment-granular**, and prune rounds your request **up**
+to the nearest segment boundary. Trimming leading incrementals *inside* a
+segment would leave its full anchored before a gap, so prune retires only
+whole segments — which means it keeps **more** than you asked for, never
+fewer. Ask to keep 7 on a chain whose boundaries fall at 5 and 12 and it
+keeps 12, and says so at INFO with both numbers. Size your retention
+expecting that, and read the line rather than assuming the request was
+honoured exactly.
+
+A chain that has never rotated is a single segment with no boundary below
+its root, so there is nothing prune can retire and it refuses with
+`SLUICE-E-BACKUP-CHAIN-UNREADABLE`, exit 3, nothing deleted. That is not
+a bug to work around: the segment's full is the only base those
+incrementals replay onto. Rotate the chain (a `backup stream` rollover
+starts a new segment with a fresh full) if you want retention to have
+something to drop, or use `--keep-duration` with a cutoff older than
+every incremental to retire the lot.
 
 ## Step 3: verify periodically
 
