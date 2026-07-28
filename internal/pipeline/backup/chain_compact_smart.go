@@ -594,6 +594,47 @@ func (s *smartCompactor) flushAll() {
 	s.order = nil
 }
 
+// flushCollapsedInsideClosingTx drains the accumulators into the output
+// stream, placing the collapsed row events INSIDE the incremental's last
+// transaction rather than after its closing TxCommit.
+//
+// Roadmap item 101, and the reason [finalize]'s own doc comment already
+// said finalize "does NOT emit accumulator events at the very end if a
+// TxCommit has already been emitted" — the code did exactly that. A bare
+// [flushAll] appends at the very end, so the rewritten stream's last
+// position-bearing event became a collapsed row event, and a collapsed
+// event deliberately carries its chain's FIRST position (see
+// [rowAccumulator.flush]). Any incremental that touched one row in more
+// than one transaction therefore ENDED BELOW its own recorded
+// EndPosition — which chain_restore.go's F1 tail-truncation backstop
+// reads as a truncated change-list and refuses (SLUICE-E-BACKUP-INCOMPLETE).
+// A `backup compact --smart-compaction` could thus leave a chain that no
+// longer restores, on the most ordinary shape smart compaction exists for.
+//
+// Holding the closing TxCommit back costs nothing else: the collapsed
+// rows land inside the last transaction (a tighter envelope than before,
+// not a looser one), and the closing position is once again the stream's
+// last event.
+//
+// A stream with no transactional envelope — an engine whose CDC reader
+// emits no TxBegin/TxCommit — has no closing commit to hold back and
+// keeps the previous shape.
+func (s *smartCompactor) flushCollapsedInsideClosingTx() {
+	last := len(s.out) - 1
+	if last < 0 {
+		s.flushAll()
+		return
+	}
+	if _, ok := s.out[last].(ir.TxCommit); !ok {
+		s.flushAll()
+		return
+	}
+	closing := s.out[last]
+	s.out = s.out[:last]
+	s.flushAll()
+	s.out = append(s.out, closing)
+}
+
 // finalize flushes any remaining accumulators and returns the
 // transformed event stream + the per-incremental tally.
 //
@@ -618,12 +659,15 @@ func (s *smartCompactor) finalize() ([]ir.Change, *smartCompactResult) {
 	//       row events WITHIN a tx is semantically equivalent to
 	//       the source's order for the apply path (each row event
 	//       is its own DML in the applied tx).
-	//   (b) The collapsed-out events that landed BETWEEN multiple
-	//       TxCommits in the source stream are folded into the
-	//       LAST event's position by the policy table (which uses
-	//       the LATEST event's position for the net event). The
-	//       net event's position is therefore at or after every
-	//       collapsed event's position — F3 preserved.
+	//   (b) F3 (the rewritten stream must not END below the
+	//       incremental's closing position) is preserved by holding
+	//       the closing TxCommit back until after the flush — see
+	//       [smartCompactor.flushCollapsedInsideClosingTx]. It is NOT
+	//       preserved by the policy table: a collapsed event
+	//       deliberately carries its chain's FIRST position (see
+	//       [rowAccumulator.flush]), not its last. An earlier version
+	//       of this comment claimed the opposite and the mismatch was
+	//       load-bearing — roadmap item 101.
 	//
 	// The trade-off: a per-tx flush would preserve transactional
 	// boundaries exactly. We chose per-incremental flush for
@@ -638,7 +682,7 @@ func (s *smartCompactor) finalize() ([]ir.Change, *smartCompactResult) {
 	// events as a flat list at finalize time. The applier sees them
 	// as a sequence of DMLs against the target; the final row state
 	// matches the source's final row state.
-	s.flushAll()
+	s.flushCollapsedInsideClosingTx()
 
 	res := newSmartCompactResult()
 	res.eventsBefore = s.eventsBefore
