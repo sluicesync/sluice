@@ -165,6 +165,17 @@ type CDCReader struct {
 	// available.
 	streamerCancel context.CancelFunc
 
+	// pumpDone is closed by the pump goroutine as the LAST thing it
+	// does, so receiving from it establishes a happens-before edge
+	// against every field the pump touched. [Close] cancels the pump
+	// and then waits on it before tearing down anything the pump
+	// owns — see Close's doc for why that wait is load-bearing rather
+	// than merely tidy. Created by [StreamChanges] and handed to the
+	// pump as an argument (never read from the struct by the pump, so
+	// Close can clear the field without racing it). nil before the
+	// first StreamChanges and after a completed Close.
+	pumpDone chan struct{}
+
 	// appliedLSN is the slot-ack-after-apply tracker (Bug 15,
 	// ADR-0020). Non-nil values come from the streamer wiring;
 	// when nil, the keepalive routine reports the streamed LSN
@@ -346,19 +357,54 @@ func (r *CDCReader) schemaInScope(schema string) bool {
 	return schema == r.schema
 }
 
-// Close releases the schema-DB pool and stops the pump goroutine.
-// Safe to call multiple times.
+// Close stops the pump goroutine, JOINS it, and only then releases the
+// catalog-DB pool. Safe to call multiple times.
+//
+// The join is the load-bearing part, not a nicety. The pump does not
+// merely decode buffered bytes: every RelationMessage runs live catalog
+// queries on r.db ([ensureExtensionTypeOIDs], [ensureEnumTypeOIDs],
+// [resolveIdentityKeyCols], [resolveColumnStableIDs]). An earlier Close
+// cancelled the pump and returned immediately, leaving `r.db = nil` to
+// land underneath a pump that was still inside one of those — an
+// unsynchronised write to a field the pump reads, and worse than a
+// detector warning: a pump that had passed its `r.db == nil` guard and
+// then reached `r.db.QueryContext` dereferenced a nil *sql.DB and
+// PANICKED on a goroutine no one recovers, taking the process with it.
+// A CDC reader whose Close races its own pump is a production defect —
+// `sluice sync`'s per-attempt teardown ([pipeline.Streamer] runOnce's
+// deferred stop) and `backup stream`'s transient-retry reopen both close
+// a reader whose pump is live, and both already document the reader as
+// joining its streaming goroutine deterministically. This makes that
+// true.
+//
+// The wait is bounded and cannot deadlock: cancelling the pump's ctx
+// unblocks it wherever it can park — the ReceiveMessage deadline, the
+// catalog queries (all ctx-scoped), and the change-channel [send],
+// which selects on ctx.Done. So Close needs no cooperation from a
+// consumer that has already stopped draining the channel, which is
+// exactly the shape every caller's deferred teardown has. The pump's
+// own exit path closes replConn under a 5s cap
+// ([closeReplConnGraceful]), which is the wait's ceiling.
+//
+// That boundedness is a property of [CDCReader.pump]'s receive-error
+// branch, which has to check ctx BEFORE treating a timeout as the
+// keepalive trigger — see the comment there. Joining a pump that could
+// not observe its own cancellation would hang here rather than leak
+// quietly, so the two changes are one fix.
 func (r *CDCReader) Close() error {
 	if r.streamerCancel != nil {
 		r.streamerCancel()
 		r.streamerCancel = nil
 	}
-	// replConn is closed by the pump goroutine on its way out (it
-	// owns the connection); we just wait for the cancellation to
-	// propagate. In practice Close is called from a different
-	// goroutine and the pump exit is asynchronous, so we rely on
-	// the OS to clean up the socket if the pump hasn't returned by
-	// the time the test process exits.
+	// replConn is closed by the pump goroutine on its way out (it owns
+	// the connection), so joining the pump is also what makes the
+	// replication connection — and therefore the slot's active flag —
+	// released by the time Close returns rather than whenever the
+	// scheduler gets round to it.
+	if r.pumpDone != nil {
+		<-r.pumpDone
+		r.pumpDone = nil
+	}
 	if r.db != nil {
 		err := r.db.Close()
 		r.db = nil
@@ -494,8 +540,13 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
 	out := make(chan ir.Change, cdcChannelBuffer)
+	// done is what [Close] joins on. It is passed as an argument rather
+	// than read off r.pumpDone by the pump, so Close can clear the field
+	// without racing the very goroutine it is waiting for.
+	done := make(chan struct{})
+	r.pumpDone = done
 	streamStarted = true // suppress the deferred slot-drop
-	go r.pump(loopCtx, conn, startLSN, out)
+	go r.pump(loopCtx, conn, startLSN, out, done)
 	return out, nil
 }
 
@@ -824,7 +875,14 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 // callers), the pump falls back to streamedLSN so the slot still
 // gets keepalive activity. Production paths always wire a tracker
 // via the [pipeline.Streamer].
-func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, out chan<- ir.Change) {
+//
+// done is closed when the pump has fully unwound — declared first so it
+// runs LAST, after the replication connection is closed and after the
+// change channel is closed. [Close] joins on it before touching any
+// field the pump reads, which is what keeps the catalog-pool teardown
+// off the pump's back (see Close).
+func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, out chan<- ir.Change, done chan<- struct{}) {
+	defer close(done)
 	defer close(out)
 	defer closeReplConnGraceful(conn)
 
@@ -886,6 +944,23 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 		raw, err := conn.ReceiveMessage(recvCtx)
 		cancel()
 		if err != nil {
+			// Cancellation MUST be tested before the keepalive
+			// `continue`, because pgconn dresses a done context as a
+			// timeout: ReceiveMessage's already-done fast path returns
+			// newContextAlreadyDoneError, which is an *errTimeout, and
+			// pgconn.Timeout reports true for it (pgx v5.10.0
+			// pgconn.go:606 / errors.go:24,227). recvCtx derives from
+			// ctx, so once ctx is cancelled EVERY subsequent receive
+			// takes that fast path — and `continue` spun this loop
+			// forever, never closing replConn or `out`. That left a hot
+			// goroutine per torn-down stream (invisible while Close
+			// didn't join the pump; a hang once it did), and it is why
+			// only the exit-while-parked-in-the-read case ever unwound:
+			// there normalizeTimeoutError unwraps to a bare
+			// context.Canceled instead.
+			if ctx.Err() != nil {
+				return
+			}
 			if pgconn.Timeout(err) {
 				// Deadline-driven timeout — the keepalive trigger.
 				continue
