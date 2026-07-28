@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
@@ -49,7 +50,14 @@ func TestPruneChain_ConcurrentWriterConflictLeavesChainUntouched(t *testing.T) {
 	seedLineageChain(t, store, 5)
 	store.armConflict = true
 
-	res, err := backup.PruneChain(ctx, store, backup.PruneOpts{KeepIncrementals: 2})
+	// Retire the whole segment's incrementals (keep-duration past all of
+	// them) rather than trimming leading ones: a partial trim severs the
+	// floor segment from its restore base and the item-95 readability gate
+	// now refuses it BEFORE the catalog CAS, which would mask the ADR-0160
+	// refusal this test exists to pin. See
+	// TestPruneLineage_WithinSegmentTrimIsRefusedBeforeAnythingIsDeleted.
+	opts := backup.PruneOpts{KeepDuration: time.Hour}
+	res, err := backup.PruneChain(ctx, store, opts)
 	if err == nil {
 		t.Fatalf("PruneChain = %+v, nil; want the concurrent-writer refusal", res)
 	}
@@ -75,11 +83,11 @@ func TestPruneChain_ConcurrentWriterConflictLeavesChainUntouched(t *testing.T) {
 		}
 	}
 
-	res, err = backup.PruneChain(ctx, store, backup.PruneOpts{KeepIncrementals: 2})
+	res, err = backup.PruneChain(ctx, store, opts)
 	if err != nil {
 		t.Fatalf("PruneChain re-run after refusal: %v; want success (the promised remediation)", err)
 	}
-	if len(res.Pruned) != 3 {
-		t.Errorf("re-run Pruned = %d; want 3", len(res.Pruned))
+	if len(res.Pruned) != 5 {
+		t.Errorf("re-run Pruned = %d; want 5", len(res.Pruned))
 	}
 }

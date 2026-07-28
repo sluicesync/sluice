@@ -1477,11 +1477,20 @@ func boolYesNoCLI(b bool) string {
 //     than DUR). Mutually exclusive; exactly one required.
 //   - The full backup at the chain root is preserved on a SINGLE-segment
 //     chain. On a rotated multi-segment chain, prune can drop segment 0
-//     whole — including its manifest, which for a passphrase-encrypted
-//     chain is where the restore side reads the Argon2id salt, so
-//     dropping it makes the chain fail at `unwrap chain cek` holding a
-//     correct passphrase (roadmap item 95, OPEN). This line previously
-//     claimed the root full is ALWAYS preserved; it is not.
+//     whole — its incrementals, its data chunks, and the segment itself —
+//     but NOT the chain-root `manifest.json`, which is the CHAIN'S
+//     identity rather than segment 0's data: it carries the Argon2id salt
+//     a passphrase chain's restore side re-derives its KEK from, so
+//     deleting it made the chain fail at `unwrap chain cek` holding a
+//     correct passphrase (roadmap item 95, the Bug-214 defect on prune's
+//     path — fixed; a retired root segment leaves a small dangling
+//     identity header behind, deliberately).
+//   - Prune PROVES the chain still reads, twice — before the catalog
+//     commit (a refusal there has deleted nothing) and after the delete
+//     pass (so a run can never report success over a chain it just made
+//     unreadable). Both refuse under `SLUICE-E-BACKUP-CHAIN-UNREADABLE`,
+//     exit 3. Pass `--encrypt` + key material to upgrade the check from
+//     "the identity survived" to "the chain's key still unwraps".
 //   - The first surviving incremental gets re-stitched to point at
 //     the full directly (advances the chain's "earliest restorable
 //     position" forward — the dropped incrementals' event windows
@@ -1540,11 +1549,25 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 	if err != nil {
 		return err
 	}
+	// Read envelope for the chain-readability gate (Bug 214 / item 95):
+	// prune never decrypts anything, but with the operator's key in hand
+	// the gate can prove the pruned chain's CEK still unwraps rather than
+	// only that its identity survived. nil when --encrypt was not supplied
+	// (the gate says so and degrades to the identity check).
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("backup prune: read root manifest: %w", err)
+	}
+	envelope, err := p.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return err
+	}
 	res, err := backup.PruneChain(ctx, store, backup.PruneOpts{
 		KeepIncrementals: p.KeepIncrementals,
 		KeepDuration:     p.KeepDuration,
 		DryRun:           p.DryRun,
 		Signer:           signer,
+		Envelope:         envelope,
 	})
 	if err != nil {
 		return err

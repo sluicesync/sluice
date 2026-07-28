@@ -13,15 +13,18 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// # The chain-maintenance readability gate (Bug 214)
+// # The chain-maintenance readability gate (Bug 214, roadmap item 95)
 //
-// `backup compact` is the operation that DELETES chain artifacts, and its
-// delete pass reasons LOCALLY: "the catalog no longer references these
-// files, so they are orphans." That reasoning is locally correct and
-// whole-chain incomplete — it never asks the only question an operator
-// cares about, which is whether the chain left behind still RESTORES.
+// `backup compact` and `backup prune` are the operations that DELETE
+// chain artifacts, and both delete passes reason LOCALLY: "the catalog no
+// longer references these files, so they are orphans." That reasoning is
+// locally correct and whole-chain incomplete — it never asks the only
+// question an operator cares about, which is whether the chain left
+// behind still RESTORES. Hence one guard, shared verbatim by both, with
+// `op` naming which of them is asking.
 //
 // Bug 214 is what the gap costs. The orphan sweep deleted the chain-root
 // `manifest.json` because the merged segment owns a byte-identical copy;
@@ -54,9 +57,36 @@ import (
 // header level. `sluice backup verify` remains the deep check.
 
 // verifyChainReadable re-reads the chain described by cat the way a
-// RESTORE would and refuses when it cannot. op names the operation for
-// the operator ("backup compact"); stage names WHICH of the two calls
-// fired, because the recovery differs sharply between them.
+// RESTORE would and refuses — under one stable, machine-matchable code —
+// when it cannot. See [checkChainReadable] for the check itself.
+//
+// The code lives HERE rather than at the two call sites so a future
+// caller cannot acquire the guard without acquiring its refusal class:
+// the whole point of the refusal is that a script or agent branching on
+// `SLUICE-E-*` (which is what docs/operator/error-codes.md tells
+// operators to do) can see it, and that it exits 3 — "a re-run will not
+// help" — rather than the generic 1 a bare fmt.Errorf produced.
+func verifyChainReadable(
+	ctx context.Context,
+	store irbackup.Store,
+	cat *lineage.Catalog,
+	env crypto.EnvelopeEncryption,
+	op, stage string,
+) error {
+	return sluicecode.Wrap(sluicecode.CodeBackupChainUnreadable, chainUnreadableHint,
+		checkChainReadable(ctx, store, cat, env, op, stage))
+}
+
+// chainUnreadableHint is the standalone remedy [sluicecode.CodedError]
+// carries alongside the prose. Deliberately stage-agnostic — the prose
+// names which stage fired, and only the prose can, since the recovery
+// differs sharply between them.
+const chainUnreadableHint = "re-read the refusal's stage: a pre-swap/pre-sweep refusal deleted nothing, a post-sweep one names the chain-root manifest recovery; pass --encrypt with the chain's key material for the full check"
+
+// checkChainReadable performs the readability check. op names the
+// operation for the operator ("backup compact"); stage names WHICH of
+// the two calls fired, because the recovery differs sharply between
+// them.
 //
 // env is the operator's read envelope when key material was supplied
 // (`--encrypt`), nil otherwise. With an envelope the gate performs the
@@ -65,7 +95,7 @@ import (
 // says so; an encrypted chain can be compacted with no key (only a SIGNED
 // chain requires one), and refusing that would be a new refusal for a
 // workflow that has always worked.
-func verifyChainReadable(
+func checkChainReadable(
 	ctx context.Context,
 	store irbackup.Store,
 	cat *lineage.Catalog,
@@ -132,9 +162,17 @@ func verifyEncryptedChainIdentity(
 	if enc.KEKMode == "" || enc.KEKMode == crypto.KEKModePassphrase {
 		switch {
 		case root == nil:
-			return fmt.Errorf("%s: %s readability check: this chain is encrypted with a passphrase-derived key, and its chain-root %q — the file the restore side reads the Argon2id salt from to re-derive that key — is missing. Restoring it would fail at `unwrap chain cek` with a perfectly good passphrase. Recovery: a merged segment holds a byte-identical copy, so `cp <chain>/%s<id>/%s <chain>/%s` restores the chain's identity",
+			// The recovery names both surviving-copy shapes because ONE
+			// guard now serves two operations: compaction leaves a merged
+			// segment holding a byte-identical copy, and prune leaves none —
+			// but every rotation-born segment full carries the SAME chain
+			// salt (stream_rotation.go runs backup.Backup with the aligned
+			// envelope), so any surviving segment's header restores the
+			// chain's identity either way.
+			return fmt.Errorf("%s: %s readability check: this chain is encrypted with a passphrase-derived key, and its chain-root %q — the file the restore side reads the Argon2id salt from to re-derive that key — is missing. Restoring it would fail at `unwrap chain cek` with a perfectly good passphrase. Recovery: every surviving segment full carries the same chain salt, so copying any one of them back restores the chain's identity — `cp <chain>/%s<id>/%s <chain>/%s` after a compact, `cp <chain>/%s<id>/%s <chain>/%s` for a rotation-born segment",
 				op, stage, lineage.ManifestFileName,
-				mergedSegmentDirPrefix, lineage.ManifestFileName, lineage.ManifestFileName)
+				mergedSegmentDirPrefix, lineage.ManifestFileName, lineage.ManifestFileName,
+				lineage.RotationSegmentDirPrefix, lineage.ManifestFileName, lineage.ManifestFileName)
 		case root.ChainEncryption == nil:
 			return fmt.Errorf("%s: %s readability check: the chain-root %q records no chain-encryption metadata while the chain's first segment is encrypted (kek_mode=%q) — the restore side would build a plaintext read path for an encrypted chain",
 				op, stage, lineage.ManifestFileName, enc.KEKMode)

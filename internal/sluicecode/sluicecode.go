@@ -142,6 +142,19 @@ const (
 	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
 	CodeBackupEncryptionMismatch   Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
 
+	// CodeBackupChainUnreadable is the chain-maintenance readability
+	// gate's refusal: `backup compact` / `backup prune` re-read the chain
+	// the way a restore would — before the destructive sweep, and again
+	// after it — and could not. It is emitted by ONE guard shared by both
+	// operations (the `op` names which refused), because both are
+	// chain-SHAPING operations whose local "these files are orphans"
+	// reasoning is whole-chain incomplete: Bug 214 was compaction deleting
+	// the chain-root manifest, and prune deleted the same file whenever
+	// retention dropped segment 0. Refusal class so the exit status says
+	// "a re-run will not help" — the pre-sweep leg has destroyed nothing,
+	// and the post-sweep leg names a recovery.
+	CodeBackupChainUnreadable Code = "SLUICE-E-BACKUP-CHAIN-UNREADABLE"
+
 	CodeBackfillNoPrimaryKey      Code = "SLUICE-E-BACKFILL-NO-PRIMARY-KEY"
 	CodeBackfillUnsupportedEngine Code = "SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE"
 	CodeBackfillUnknownColumn     Code = "SLUICE-E-BACKFILL-UNKNOWN-COLUMN"
@@ -303,6 +316,7 @@ var registry = map[Code]Info{
 	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},
 	CodeBackupChainConflict:        {ClassRefusal, "another writer advanced this backup chain's lineage mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — the conditional catalog write refused rather than interleave; no catalog change was written"},
 	CodeBackupEncryptionMismatch:   {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
+	CodeBackupChainUnreadable:      {ClassRefusal, "backup compact / backup prune re-read the chain the way a restore would and could not: the chain does not walk, or its identity/key material (the chain-root manifest.json a passphrase chain's Argon2id salt is recorded on) is missing or inconsistent — refused BEFORE the destructive sweep with nothing deleted, or reported AFTER it so the run never exits 0 over a chain it just made unreadable"},
 
 	CodeBackfillNoPrimaryKey:      {ClassRefusal, "backfill refused: the table has no usable orderable primary key to drive the keyset-chunked walk"},
 	CodeBackfillUnsupportedEngine: {ClassRefusal, "backfill refused: the engine does not implement the in-place backfill surface"},

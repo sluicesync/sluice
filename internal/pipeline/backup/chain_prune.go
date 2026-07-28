@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
@@ -44,7 +45,15 @@ import (
 // chunks + manifest, and every dropped whole segment's full manifest +
 // data chunks + sub-dir contents. lineage.json is rewritten in one
 // atomic Put. What it preserves: the oldest kept segment's full +
-// every kept incremental + every later segment.
+// every kept incremental + every later segment — and, when the dropped
+// segment is the lineage ROOT, its `manifest.json`
+// ([keepsChainIdentity], roadmap item 95).
+
+// prunerOp is the operator-facing verb the readability gate and its
+// pre/post-sweep decorators name in their refusals — the CLI command,
+// not the package-internal "prune:" error prefix, because the operator
+// reading the refusal is holding a `sluice backup prune` invocation.
+const prunerOp = "backup prune"
 
 // PruneOpts configures [PruneChain]. Exactly one of KeepIncrementals
 // or KeepDuration is required; specifying both is an error.
@@ -73,6 +82,16 @@ type PruneOpts struct {
 	// is signed and Signer is nil, prune REFUSES rather than leave a
 	// signed chain with stale-position signatures / an unsigned lineage.
 	Signer *lineage.Signer
+
+	// Envelope, when non-nil, is the operator's READ envelope for an
+	// encrypted chain. Prune never encrypts or decrypts anything — this is
+	// consumed only by the readability gate ([verifyChainReadable], shared
+	// verbatim with compact), which uses it to prove the pruned chain's CEK
+	// still unwraps before and after the destructive sweep. nil (no
+	// `--encrypt`) degrades the gate to its identity-only check with a
+	// WARN; an encrypted chain has always been prunable without key
+	// material and stays so.
+	Envelope crypto.EnvelopeEncryption
 }
 
 // PruneResult summarises a [PruneChain] run.
@@ -281,6 +300,14 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
 		return res, nil
 	}
+	// The readability gate's FIRST leg (Bug 214 / item 95), against the
+	// prospective post-prune catalog and BEFORE the commit. Its placement
+	// is the point: prune's deletes all run after the commit, so a refusal
+	// here has written no catalog and removed no file — the chain is
+	// exactly as restorable as it was when the run started.
+	if err := verifyChainReadable(ctx, store, cat, opts.Envelope, prunerOp, "pre-commit"); err != nil {
+		return nil, errPreSweepReadability(prunerOp, err)
+	}
 	// Catalog commit FIRST (the ADR-0160 CAS linearization point, and the
 	// same commit-then-sweep order compaction uses): the loud concurrent-
 	// writer refusal — or a crash — before this write leaves the chain
@@ -301,6 +328,14 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	// helpers (a leaked orphan is disk, not correctness).
 	pruneWholeSegments(ctx, store, &origCat, floorSeg, false, res)
 	pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, false, res)
+	// The gate's SECOND leg, against what is actually on disk. It cannot
+	// un-delete; its entire job is to stop a retention run reporting
+	// success over a chain it has just made unreadable — the difference
+	// between an operator who knows their DR archive is broken and one who
+	// finds out at restore time.
+	if err := verifyChainReadable(ctx, store, cat, opts.Envelope, prunerOp, "post-sweep"); err != nil {
+		return nil, errPostSweepReadability(prunerOp, err)
+	}
 	slog.InfoContext(
 		ctx, "prune: lineage pruned",
 		slog.Int("segments_dropped", res.SegmentsDropped),
@@ -335,7 +370,7 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 				}
 			}
 		}
-		if !dryRun {
+		if !dryRun && !keepsChainIdentity(seg) {
 			_ = ss.Delete(ctx, seg.FullManifestPath)
 		}
 		// Incrementals + their change chunks.
@@ -356,6 +391,45 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 		}
 		res.SegmentsDropped++
 	}
+}
+
+// keepsChainIdentity reports whether seg's full manifest IS the
+// chain-root `manifest.json` — the one file a whole-segment prune must
+// never delete (roadmap item 95, the Bug-214 defect on prune's path).
+//
+// For the lineage ROOT segment (Dir == "") the segment store IS the
+// lineage root, so its FullManifestPath resolves to the chain-root
+// manifest. That file is not a redundant copy of segment 0's full: it is
+// the CHAIN'S IDENTITY. ADR-0152 binds the chain CEK's wrap to it, and
+// for a passphrase chain the Argon2id salt the restore side re-derives
+// its KEK from is recorded ONLY there (the CLI's buildReadEnvelope,
+// which SILENTLY falls back to a fresh salt when the file is absent —
+// which is why the symptom is `unwrap chain cek`, i.e. "wrong
+// passphrase", rather than an honest missing-file error). Deleting it
+// revokes readability for EVERY remaining segment, including ones prune
+// never touched, while the operator holds a perfectly good passphrase.
+//
+// Prune's reach is larger than compaction's, which is what settles the
+// contract question: compaction is occasional maintenance, prune is
+// scheduled retention, and it fires whenever retention drops segment 0.
+// So the chain keeps a dangling identity HEADER for a root segment that
+// has been legitimately retired. That is the right trade — the file is
+// small, it is the chain's identity rather than segment 0's data, and
+// "we only need it sometimes" is precisely the reasoning that produced
+// Bug 214. Unconditional, not "when the chain is encrypted": a
+// keep-it-when rule is one future encryption mode or one future reader
+// away from the same outage, and nobody notices until a restore.
+//
+// What survives is safe by construction, for the same reason the
+// compaction side is: the post-prune catalog never names it, and the one
+// reader that could reach it without the catalog
+// ([lineage.ResolveLineage]'s legacy single-segment synthesis, used only
+// when lineage.json is ABSENT) refuses loudly the moment it sees a
+// `seg-*` directory — and a prune that drops a whole segment is by
+// definition operating on a multi-segment (rotated) chain, which always
+// has one.
+func keepsChainIdentity(seg *lineage.Segment) bool {
+	return seg.Dir == "" && seg.FullManifestPath == lineage.ManifestFileName
 }
 
 // pruneFloorLeadingIncrementals physically deletes the first

@@ -127,9 +127,17 @@ control segment cadence:
 - `--rollover-window 5m` — group changes within a 5-minute window
   into a single incremental.
 
-`sluice backup prune --keep-incrementals N` removes older incremental
-segments while preserving the chain root's restorability — see the
-per-feature docs.
+`sluice backup prune --keep-incrementals N` retires older WHOLE
+segments while preserving the chain root's restorability. On an
+encrypted chain "the chain root" means the root `manifest.json`
+specifically: it carries the Argon2id salt the restore side re-derives
+your KEK from and the CEK every change chunk is sealed under, so prune
+keeps that one file even when it retires the segment it belonged to.
+Prune proves the chain still reads both before and after its delete
+pass and refuses under `SLUICE-E-BACKUP-CHAIN-UNREADABLE` (exit 3)
+rather than report success over a chain it made unreadable — pass
+`--encrypt` with the chain's key material so that check can prove the
+key still unwraps, not just that the identity survived.
 
 ## Step 3: verify periodically
 
