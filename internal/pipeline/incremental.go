@@ -107,11 +107,18 @@ type IncrementalBackup struct {
 	// First of Window or MaxChanges to fire closes the window.
 	Window time.Duration
 
-	// MaxChanges bounds the total number of [ir.Change] events the
-	// orchestrator captures. Zero disables the cap (Window-only). The
-	// cap is approximate — a TxBegin/Commit pair that straddles the
-	// boundary is allowed to complete so the chain doesn't end
-	// mid-transaction.
+	// MaxChanges bounds the total number of [ir.Change] EVENTS the
+	// orchestrator captures — transaction framing included. A
+	// single-row source transaction is three events (TxBegin, the row,
+	// TxCommit), so MaxChanges=100 is nearer 33 such transactions than
+	// 100 rows. Zero disables the cap (Window-only).
+	//
+	// The cap is approximate in two directions. A TxBegin/Commit pair
+	// that straddles the boundary is allowed to complete so the chain
+	// doesn't end mid-transaction; and the window will not close on the
+	// bound until it has advanced past its start position, because a
+	// resumed CDC stream opens by replaying the transaction the parent
+	// segment ends on (roadmap item 92 — see [windowAdvancedPast]).
 	MaxChanges int
 
 	// ChunkChanges is the per-chunk change-event count. Zero falls
@@ -393,12 +400,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	sink.PhaseCompleted(incrPhaseConnect)
 	sink.PhaseStarted(incrPhaseStream)
 	deadline := clockNow().Add(windowDur)
-	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
+	endPos, totalChanges, advanced, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, startPos, clockNow, chainCEK)
 	if captureErr != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
 	sink.PhaseCompleted(incrPhaseStream)
 	sink.PhaseStarted(incrPhaseFinalize)
+	warnReplayOnlyWindow(ctx, manifest, advanced, startPos, endPos, totalChanges)
 	manifest.EndPosition = endPos
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, err)
@@ -510,6 +518,28 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	sink.PhaseCompleted(incrPhaseFinalize)
 	sink.Summary(incrementalSummaryResult(manifest, totalChanges, signing))
 	return nil
+}
+
+// warnReplayOnlyWindow names the shape roadmap item 92 was filed over: a
+// window that captured events but never moved past the position it
+// resumed from holds only the boundary transaction the source replayed
+// on reconnect (see [windowAdvancedPast]). The segment is chain-linked
+// and honestly stamped, but it carries nothing the parent did not — and
+// `changes=N` on its own reads as "N of your writes are in here".
+//
+// The MaxChanges bound can no longer produce this shape. A wall-clock
+// window that expires before the source commits anything new still can,
+// and that is legitimate — hence a WARN, not a refusal.
+func warnReplayOnlyWindow(ctx context.Context, manifest *irbackup.Manifest, advanced bool, startPos, endPos ir.Position, totalChanges int64) {
+	if advanced || len(manifest.ChangeChunks) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx, "incremental: window captured no NEW changes — every event in it is the source's replay of the transaction the parent segment already ends on; the segment is valid but adds no coverage (widen --window, or drop --max-changes, to capture the writes that followed)",
+		slog.String("start_position", startPos.Token),
+		slog.String("end_position", endPos.Token),
+		slog.Int64("replayed_changes", totalChanges),
+	)
 }
 
 // incrementalSummaryResult builds the ADR-0155 TTY summary panel for a
@@ -885,16 +915,81 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 	return b.Source.OpenCDCReader(ctx, b.SourceDSN)
 }
 
+// windowAdvancedPast reports whether pos lies STRICTLY AFTER start in
+// the source engine's native change-stream order — i.e. whether an event
+// observed at pos is genuinely new relative to the position the window
+// resumed from.
+//
+// It exists because a resumed CDC stream RE-DELIVERS the boundary
+// transaction. PostgreSQL's logical decoding begins at
+// max(requested_lsn, confirmed_flush_lsn) and skips only transactions
+// whose commit record is STRICTLY BEFORE that point, so restarting at a
+// parent segment's EndPosition — which is exactly a commit LSN — replays
+// that entire transaction. (Ground-truthed on PG 16, roadmap item 92: a
+// slot whose confirmed_flush_lsn trailed the request by two committed
+// transactions still replayed only the boundary one, so the REQUESTED
+// LSN, not the flush point, is the floor and delivered positions never
+// regress below start.) Those replayed events belong to the parent
+// segment; they are not this window's content.
+//
+// Ordering comes from the engine's [ir.PositionMonotonicChecker] (PG and
+// MySQL both implement it) rather than a byte compare, so representation
+// drift — a parent anchor stamped before the reader started emitting
+// systemid/timeline, say — still compares by LSN. Without a comparator,
+// or on a pair the comparator cannot order, the fallback is position
+// inequality.
+//
+// Neither wrong answer loses data. A false "advanced" degrades to the
+// pre-fix behaviour (the bound may close on a re-delivery); a false "not
+// advanced" only withholds the MaxChanges close, so the window runs to
+// its wall-clock deadline instead — which is exactly what
+// `--max-changes 0` does.
+func windowAdvancedPast(src ir.Engine, start, pos ir.Position) bool {
+	if start.Engine == "" && start.Token == "" {
+		// "From now" start (a v0.16.x parent carrying no EndPosition):
+		// there is no boundary transaction to re-deliver.
+		return true
+	}
+	if pos.Engine == "" && pos.Token == "" {
+		return false
+	}
+	if chk, ok := src.(ir.PositionMonotonicChecker); ok {
+		if atOrBefore, err := chk.PrecedesOrEqual(pos, start); err == nil {
+			return !atOrBefore
+		}
+	}
+	return pos != start
+}
+
 // captureWindow drains changes from changesCh for the configured
 // window, writing them into change chunks staged on manifest.
 // Returns the position of the last applied change (the window's
-// EndPosition), the total change count, and any fatal error.
+// EndPosition), the total change count, whether the window advanced
+// past startPos, and any fatal error.
 //
 // Window closure: deadline reached (clockNow >= deadline) OR
-// totalChanges >= maxChanges (when maxChanges > 0). The orchestrator
-// is permissive about straddle: a TxBegin already received but the
-// matching TxCommit not yet observed extends the window by up to one
-// transaction so the chain doesn't end mid-tx.
+// totalChanges >= maxChanges (when maxChanges > 0) once the window has
+// advanced past startPos. The orchestrator is permissive about straddle:
+// a TxBegin already received but the matching TxCommit not yet observed
+// extends the window by up to one transaction so the chain doesn't end
+// mid-tx.
+//
+// The advancement condition on the maxChanges bound is roadmap item 92.
+// maxChanges counts CHANGE EVENTS, transaction framing included, and a
+// resumed stream opens with a replay of the boundary transaction (see
+// [windowAdvancedPast]). A tight bound was therefore satisfiable by the
+// replay alone: the window closed at its own start position, having
+// captured nothing new, and still wrote a chain-linked segment reporting
+// a non-zero change count. Requiring forward progress makes the bound
+// mean "close once this window has captured maxChanges events AND has
+// something of its own to close on".
+//
+// The replayed events are deliberately KEPT rather than filtered. They
+// are duplicates of parent content in the ordinary case (chain restore
+// replays them idempotently), but when the parent's own window ended
+// mid-transaction — the channel-close and ctx-cancel exits can do that —
+// the replay is the only thing that carries the severed tail, so
+// dropping it would convert a benign duplicate into silent loss.
 //
 // cdc is passed in so an early channel-close (the CDC reader's pump
 // terminating with an error) surfaces the underlying error via
@@ -908,15 +1003,21 @@ func (b *IncrementalBackup) captureWindow(
 	chunkSize int,
 	deadline time.Time,
 	maxChanges int,
+	startPos ir.Position,
 	clockNow func() time.Time,
 	chainCEK []byte,
-) (ir.Position, int64, error) {
+) (endPos ir.Position, totalChanges int64, advanced bool, err error) {
+	// endPos, totalChanges and advanced are the named results. advanced
+	// latches once a position strictly after startPos has been observed —
+	// sticky rather than re-derived from endPos at the cutoff, because a
+	// position-bearing event can carry a LOWER position than the one
+	// before it (a Postgres SchemaSnapshot is anchored at the relation
+	// message's WAL start, which pgoutput reports as 0/0), and that must
+	// not un-advance a window that has already moved.
 	var (
 		writer        *blobcodec.ChangeChunkWriter
 		buf           *bytes.Buffer
 		chunkIdx      int
-		totalChanges  int64
-		lastPos       ir.Position
 		inTransaction bool
 		curWrappedCEK []byte
 	)
@@ -1051,7 +1152,7 @@ func (b *IncrementalBackup) captureWindow(
 	for {
 		select {
 		case <-ctx.Done():
-			return lastPos, totalChanges, ctx.Err()
+			return endPos, totalChanges, advanced, ctx.Err()
 		case <-timer.C:
 			deadlinePassed = true
 			// Check immediately whether we can close cleanly. If we're
@@ -1059,9 +1160,9 @@ func (b *IncrementalBackup) captureWindow(
 			// next TxCommit.
 			if !inTransaction {
 				if err := flush(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
-				return lastPos, totalChanges, nil
+				return endPos, totalChanges, advanced, nil
 			}
 		case change, ok := <-changesCh:
 			if !ok {
@@ -1071,13 +1172,13 @@ func (b *IncrementalBackup) captureWindow(
 				// we got.
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
 					if e := errReader.Err(); e != nil {
-						return lastPos, totalChanges, fmt.Errorf("cdc reader: %w", e)
+						return endPos, totalChanges, advanced, fmt.Errorf("cdc reader: %w", e)
 					}
 				}
 				if err := flush(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
-				return lastPos, totalChanges, nil
+				return endPos, totalChanges, advanced, nil
 			}
 			// Track transaction boundary so we can extend the window
 			// to the next TxCommit when the deadline straddles a tx.
@@ -1089,39 +1190,46 @@ func (b *IncrementalBackup) captureWindow(
 			}
 			if writer == nil {
 				if err := openWriter(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
 			}
 			if err := writer.WriteChange(change); err != nil {
-				return lastPos, totalChanges, err
+				return endPos, totalChanges, advanced, err
 			}
 			totalChanges++
-			// Position-bearing changes update lastPos.
+			// Position-bearing changes update endPos.
 			pos := change.Pos()
 			if pos.Engine != "" || pos.Token != "" {
-				lastPos = pos
+				endPos = pos
+				if !advanced {
+					advanced = windowAdvancedPast(b.Source, startPos, pos)
+				}
 			}
 			// Roll the chunk when it hits the row cap.
 			if writer.ChangeCount() >= int64(chunkSize) {
 				if err := flush(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
 			}
 			// MaxChanges (approximate): close on a tx boundary at-or-after
-			// the cap.
-			if maxChanges > 0 && totalChanges >= int64(maxChanges) && !inTransaction {
+			// the cap, once the window has something of its own to close
+			// on. `advanced` is roadmap item 92 — without it the boundary
+			// transaction the resumed stream replays could satisfy the
+			// bound by itself and close the window at its own start
+			// position. See [windowAdvancedPast].
+			if maxChanges > 0 && totalChanges >= int64(maxChanges) && !inTransaction && advanced {
 				if err := flush(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
-				return lastPos, totalChanges, nil
+				return endPos, totalChanges, advanced, nil
 			}
 			// Deadline-already-passed and we just observed a TxCommit:
 			// close now.
 			if deadlinePassed && !inTransaction {
 				if err := flush(); err != nil {
-					return lastPos, totalChanges, err
+					return endPos, totalChanges, advanced, err
 				}
-				return lastPos, totalChanges, nil
+				return endPos, totalChanges, advanced, nil
 			}
 		}
 	}
