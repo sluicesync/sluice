@@ -268,6 +268,162 @@ func TestRegistryDocSync_ContentEquality(t *testing.T) {
 	}
 }
 
+// remedyOpenerVerbs is the closed VOCABULARY of imperative verbs this
+// registry's remedies open with when the fix is genuinely prose ("Add a
+// primary key", "Upgrade sluice") rather than an artifact worth quoting.
+// It is a vocabulary, not a taxonomy: extending it because an honest new
+// remedy opens with a verb it lacks is the intended maintenance —
+// suppressing the gate that consults it is not.
+var remedyOpenerVerbs = map[string]bool{
+	"add": true, "alter": true, "apply": true, "bootstrap": true, "check": true,
+	"choose": true, "correct": true, "declare": true, "delete": true, "disable": true,
+	"drop": true, "enable": true, "exclude": true, "filter": true, "fix": true,
+	"free": true, "give": true, "grant": true, "inspect": true, "install": true,
+	"normalize": true, "pass": true, "point": true, "raise": true, "rebuild": true,
+	"recreate": true, "re-create": true, "re-run": true, "remove": true, "rename": true,
+	"rerun": true, "restore": true, "rewrite": true, "run": true, "set": true,
+	"supply": true, "take": true, "update": true, "upgrade": true, "use": true,
+	"verify": true, "wait": true, "widen": true, "write": true,
+}
+
+// remedyOpener returns a remedy's first word, lowercased and stripped of
+// the markdown a doc cell carries (backticks, emphasis, punctuation), so
+// the opener test reads the WORD rather than its formatting.
+func remedyOpener(remedy string) string {
+	fields := strings.Fields(remedy)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.Trim(fields[0], "`*_\"'(,.:;"))
+}
+
+// remedyIsActionable is what "actionable" means MECHANICALLY here, and
+// the bar is deliberately a floor rather than a judgement:
+//
+//   - non-empty and at least one sentence long — a bare "None." or a
+//     "TBD" placeholder is not a remedy; and
+//   - it names a concrete next step, approximated as EITHER a backticked
+//     artifact (a flag, a command, a SQL statement, a setting — which is
+//     how 46 of the 50 refusal rows say what to do) OR an imperative
+//     opener from [remedyOpenerVerbs] (which is how the other four say
+//     it, e.g. "Add a primary key to the table").
+//
+// What it cannot check is whether the advice is CORRECT — that stays a
+// human review. What it makes impossible is the class items 91, 96 and
+// 100 hit three times: shipping a refusal whose human-readable half is
+// right and whose actionable half is absent.
+//
+// The opener test rather than an anywhere-match is the deliberate part:
+// explanatory prose ("The chain cannot be restored; this is a known
+// limitation") mentions actions constantly but rarely OPENS with an
+// imperative, so matching the opener keeps the gate from going vacuous.
+func remedyIsActionable(remedy string) bool {
+	trimmed := strings.TrimSpace(remedy)
+	if len(trimmed) < 30 {
+		return false
+	}
+	if strings.Count(trimmed, "`") >= 2 {
+		return true
+	}
+	return remedyOpenerVerbs[remedyOpener(trimmed)]
+}
+
+// TestRefusalCodesCarryAnActionableRemedy is the item-100 RATCHET, and it
+// exists because that item is the THIRD instance of one class: an
+// operator-facing refusal whose human-readable half is right and whose
+// ACTIONABLE half is missing. Item 91 (Bug 213) reported the wrong code
+// and exit status, item 96 had no code at all, and item 100 had both and
+// no remedy — a correct, coded, exit-3 refusal on the most ordinary
+// `backup prune` invocation there is, under prose that told the operator
+// neither whether their backups were broken nor what to run instead.
+//
+// A refusal is sluice's loud-failure tenet made machine-readable, and the
+// tenet is only half-kept if the loud failure has no way out. So: every
+// ClassRefusal code must mirror a remedy in [docRows] (which
+// TestRegistryDocSync_ContentEquality holds equal to the operator table,
+// so this gates BOTH homes at once) and that remedy must be actionable by
+// [remedyIsActionable]'s definition.
+//
+// Runtime-class codes are deliberately out of scope: they name a failure
+// the operator did not ask sluice to prevent, and several are honestly
+// "the database said no" — the refusal contract is what promises a way
+// forward.
+//
+// One exemption, and it is mechanical rather than a suppression: a code
+// whose registry summary carries [retainedButUnemittedMarker] is a
+// LIFTED refusal kept registered only because removing a published code
+// is breaking. It cannot fire, so it has no remedy to give, and the
+// marker is already the registry's own machine-readable statement of
+// that.
+func TestRefusalCodesCarryAnActionableRemedy(t *testing.T) {
+	checked := 0
+	for _, c := range All() {
+		info, _ := Describe(c)
+		if info.Class != ClassRefusal {
+			continue
+		}
+		if strings.Contains(info.Summary, retainedButUnemittedMarker) {
+			t.Logf("%s: skipped — %s (a lifted refusal has no remedy to give)", c, retainedButUnemittedMarker)
+			continue
+		}
+		checked++
+		row, ok := docRows[c]
+		if !ok {
+			t.Errorf("refusal code %s has no docRows entry — a refusal with no remedy is half a loud failure", c)
+			continue
+		}
+		if !remedyIsActionable(row.Remedy) {
+			t.Errorf("refusal code %s has no ACTIONABLE remedy (roadmap items 91/96/100 are this class three times over).\n"+
+				"  A refusal must name a next step: a backticked flag/command/statement, or an imperative opener from remedyOpenerVerbs.\n"+
+				"  got: %q", c, row.Remedy)
+		}
+	}
+	// Vacuity guard: the registry carries ~50 refusal codes, so a
+	// near-empty sweep means the class filter (or All()) broke, not that
+	// the codebase got tidy.
+	if checked < 40 {
+		t.Fatalf("checked only %d refusal codes; the sweep is not reaching the registry", checked)
+	}
+}
+
+// TestRemedyActionablePredicateHasTeeth pins [remedyIsActionable] against
+// synthetic cases rather than against the corpus, because a predicate
+// validated only by "every existing row passes" is indistinguishable from
+// one that returns true. The negatives are the shapes the three filed
+// items actually produced or would have.
+func TestRemedyActionablePredicateHasTeeth(t *testing.T) {
+	cases := []struct {
+		name   string
+		remedy string
+		want   bool
+	}{
+		{"empty", "", false},
+		{"placeholder", "TBD", false},
+		{"bare none", "None.", false},
+		{
+			"explanation with no next step",
+			"The chain cannot be restored in this state; this is a known limitation of the retention model and is tracked on the roadmap.",
+			false,
+		},
+		{
+			"names the shape but not the way out (the item-100 shape)",
+			"A within-segment incremental trim severs the chain, so the readability gate refuses the prune before anything is deleted.",
+			false,
+		},
+		{"backticked flag", "Re-run the migration with `--resume` once the target has room.", true},
+		{"backticked command", "Free a leftover slot with `sluice slot drop <name>`, then re-run the sync.", true},
+		{"imperative opener, no markdown", "Add a primary key to the table (or fix the non-orderable key), then re-run.", true},
+		{"imperative opener with emphasis", "**Upgrade** sluice to a build that supports the backup's signature scheme, then retry.", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remedyIsActionable(tc.remedy); got != tc.want {
+				t.Errorf("remedyIsActionable(%q) = %v; want %v", tc.remedy, got, tc.want)
+			}
+		})
+	}
+}
+
 // retainedButUnemittedMarker is the sentinel a registry summary carries
 // when a code's refusal has been LIFTED but the string is kept registered
 // (removing a published catalog code is breaking). It couples the registry

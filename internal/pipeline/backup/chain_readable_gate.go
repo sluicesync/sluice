@@ -109,7 +109,7 @@ func checkChainReadable(
 	//    cross-engine restore path relies on too.
 	links, err := lineage.BuildLineageChainFromCatalog(ctx, store, cat, nil)
 	if err != nil {
-		return fmt.Errorf("%s: %s readability check: the chain does not walk: %w", op, stage, err)
+		return fmt.Errorf("%s: %s readability check: %w: %w", op, stage, errChainDoesNotWalk, err)
 	}
 	if len(links) == 0 {
 		// Never let the gate pass vacuously: an empty walk means there is
@@ -229,3 +229,12 @@ func errPostSweepReadability(op string, err error) error {
 // errNoChainToVerify guards the gate against a vacuous pass: a walk that
 // produced no links proved nothing.
 var errNoChainToVerify = errors.New("readability check: the chain walks to zero links — nothing was proven readable")
+
+// errChainDoesNotWalk marks the gate's STRUCTURAL leg — the lineage walk
+// itself refused — as distinct from its identity/key legs, which fail
+// with the chain perfectly walkable and want an entirely different
+// remedy. Callers that can EXPLAIN a structural refusal in their own
+// terms match on this (see chain_prune.go's within-segment-trim
+// refusal, roadmap item 100); the prose is unchanged from when this was
+// an inline literal, so the sentinel costs the operator nothing.
+var errChainDoesNotWalk = errors.New("the chain does not walk")

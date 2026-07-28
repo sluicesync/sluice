@@ -353,12 +353,16 @@ func shapingOps() []shapingOp {
 			//     SLUICE-E-* (which docs/operator/error-codes.md tells
 			//     operators to do) can see it, and it exits 3 rather than
 			//     the generic 1 a bare fmt.Errorf produced;
-			//  2. it still names item 100's SHAPE (the severed parent
-			//     link) at the pre-commit stage — so the cell fails if the
-			//     defect changes shape, e.g. when item 100's purpose-built
-			//     within-segment-trim refusal replaces the generic "does
-			//     not walk" prose, forcing the expectation to be revisited
-			//     rather than quietly outliving the bug;
+			//  2. it names item 100's SHAPE — and, since the item-100
+			//     prose landed, it names it in the operator's terms
+			//     rather than the gate's: "a within-segment incremental
+			//     trim severs the chain" plus the retention that IS safe
+			//     on this chain, not the generic "the chain does not
+			//     walk". These expectations were the previous prose's
+			//     ("does not chain off preceding link") and were REVISED
+			//     when the message changed, which is exactly what this
+			//     cell exists to force — a shape change must not quietly
+			//     outlive the assertion that describes it;
 			//  3. the refusal is INERT — the catalog, the chain-root
 			//     manifest, and (via the round trip the harness runs after
 			//     this returns) the chain's actual restorability are
@@ -405,13 +409,25 @@ func shapingOps() []shapingOp {
 						coded.ExitCode(), sluicecode.ExitRefusal)
 				}
 				// The SHAPE of the filed defect, at the leg that makes the
-				// refusal inert. Change either and this cell must be
-				// revisited — that is its whole job.
-				for _, want := range []string{"pre-commit readability check", "does not chain off preceding link"} {
+				// refusal inert, AND the remedy — item 100's release
+				// blocker was that the first two were right and the third
+				// was missing. Change any of them and this cell must be
+				// revisited; that is its whole job.
+				for _, want := range []string{
+					"within-segment incremental trim severs the chain",
+					"still records parent",
+					"pre-commit leg",
+					"NOTHING WAS DELETED",
+					"segment boundary",
+					"--keep-duration",
+				} {
 					if !strings.Contains(err.Error(), want) {
 						t.Fatalf("KNOWN-BROKEN cell [prune] refused DIFFERENTLY from the filed defect "+
 							"(roadmap item 100).\n  want substring: %q\n  got: %v", want, err)
 					}
+				}
+				if coded.Hint == "" {
+					t.Error("the refusal carries no standalone hint — the machine-readable half of item 100's remedy")
 				}
 				// Inertness, structurally: pre-commit means nothing was
 				// written and nothing deleted.
@@ -458,15 +474,18 @@ func shapingModes() []struct{ name, mode string } {
 //	prune                      ×3   REFUSED + intact — a keep-count that
 //	                                        trims inside the floor segment
 //	                                        would mis-stitch the lineage
-//	                                        (roadmap item 100, still open),
+//	                                        (roadmap item 100, still open as
+//	                                        a retention-CONTRACT question),
 //	                                        so item 95's readability gate
 //	                                        refuses it at the pre-commit leg
 //	                                        under SLUICE-E-BACKUP-CHAIN-
 //	                                        UNREADABLE and the chain then
 //	                                        restores exactly as before. The
 //	                                        cell pins the code, the defect's
-//	                                        shape, and the inertness — see
-//	                                        the `prune` entry in [shapingOps]
+//	                                        shape, the REMEDY the refusal
+//	                                        now computes, and the inertness
+//	                                        — see the `prune` entry in
+//	                                        [shapingOps]
 //
 // The mode axis is what makes each row readable at a glance: an
 // encrypted-read-path defect shows as RED-encrypted / green-plaintext

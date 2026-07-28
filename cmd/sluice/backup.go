@@ -1504,11 +1504,21 @@ func boolYesNoCLI(b bool) string {
 //     unreadable). Both refuse under `SLUICE-E-BACKUP-CHAIN-UNREADABLE`,
 //     exit 3. Pass `--encrypt` + key material to upgrade the check from
 //     "the identity survived" to "the chain's key still unwraps".
-//   - The first surviving incremental gets re-stitched to point at
-//     the full directly (advances the chain's "earliest restorable
-//     position" forward — the dropped incrementals' event windows
-//     are LOST from the chain's restore range; operator opts into
-//     this).
+//   - Retention is SEGMENT-granular in practice. Trimming LEADING
+//     incrementals inside the floor segment severs the chain — the
+//     survivors' parent link points at a manifest the prune deletes,
+//     and the events between the segment full's anchor and the first
+//     survivor are simply gone — so prune refuses that shape at the
+//     pre-commit leg with nothing deleted, naming the keep-counts that
+//     DO land on a segment boundary (roadmap item 100). Note the
+//     consequence for a NON-rotated chain: no positive
+//     `--keep-incrementals` retires a segment's incrementals entirely,
+//     so every such prune of a single-segment chain is that shape and
+//     refuses; use `--keep-duration` past all of them instead. (An
+//     earlier version of this doc described a "re-stitch the first
+//     survivor onto the full" behaviour — that re-stitch was removed in
+//     the segment-list reframe and nothing replaced it, which is the
+//     defect item 100 tracks.)
 //   - --dry-run reports what WOULD be pruned without deleting
 //     anything or rewriting the catalog.
 //
