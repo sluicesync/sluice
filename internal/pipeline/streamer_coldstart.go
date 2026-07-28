@@ -374,6 +374,17 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
+	// Source-side replica-identity preflight (roadmap item 93). Runs
+	// AFTER the partition/inheritance preflights (so only ordinary
+	// tables remain in scope) and — load-bearing — BEFORE coldStart's
+	// EnsurePublication: scoping the publication is what makes Postgres
+	// start refusing the SOURCE APPLICATION's own UPDATE/DELETE on a
+	// table with no usable replica identity, so the answer has to be
+	// known while the source is still untouched.
+	if err := preflightSourceReplicaIdentity(ctx, sr, s.Source.Capabilities(), migcore.TableNamesForPublication(schema)); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
 	// Foreign-table census (roadmap item 68a) — WARN-and-proceed on
 	// FDW foreign tables the schema read silently filtered out.
 	if err := warnForeignTables(ctx, sr, s.Source.Capabilities(), s.Filter); err != nil {

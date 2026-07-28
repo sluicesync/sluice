@@ -47,8 +47,19 @@ import (
 // deferrableKeySeedDDL is the regression cycle's own fixture: one table
 // whose PK is DEFERRABLE, one ordinary table riding the same stream so
 // the blast radius is visible.
+//
+// The `REPLICA IDENTITY FULL` on dpk is load-bearing for THIS test, not
+// part of the original repro. Roadmap item 93 added a SOURCE-side gate
+// for the same catalog bit — a deferrable PK is not a usable replica
+// identity either — and it runs at the very start of cold start, so
+// without this ALTER the run would refuse there and never reach the
+// target-side gate under test. FULL gives the source a publishable
+// identity while leaving the TARGET's carried key deferrable (
+// relreplident is not part of the IR and is not copied), which is
+// exactly the Bug 211 shape in isolation.
 const deferrableKeySeedDDL = `
 CREATE TABLE dpk   (id int, v text, CONSTRAINT dpk_pk PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED);
+ALTER TABLE dpk REPLICA IDENTITY FULL;
 CREATE TABLE plain (id int PRIMARY KEY, v text);
 INSERT INTO dpk   (id, v) VALUES (1, 'a'), (2, 'b');
 INSERT INTO plain (id, v) VALUES (1, 'a'), (2, 'b');

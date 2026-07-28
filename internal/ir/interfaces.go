@@ -1895,6 +1895,40 @@ type FilteredCDCPreflighter interface {
 	PreflightFilteredCDCBeforeImage(ctx context.Context, dsn string, tables []string) error
 }
 
+// ReplicaIdentityPreflighter is the optional SOURCE-engine surface
+// (implemented on a [SchemaReader]) that a publication-scoped CDC path
+// consults BEFORE it puts a table into the publication — at cold start
+// and again at `schema add-table`: every table it is about to add must
+// have a replica identity that can identify a row for the UPDATE/DELETE
+// publishing the publication enables.
+//
+// It exists because the act of scoping the publication is what breaks the
+// source. Postgres will not use a DEFERRABLE key's index as a replica
+// identity, so a table whose only key is a deferrable PRIMARY KEY has
+// none — and once it publishes updates, Postgres refuses the SOURCE
+// APPLICATION's own UPDATE and DELETE on it ("cannot update table …
+// because it does not have a replica identity and publishes updates").
+// INSERT keeps working, so the table looks healthy until the first
+// update, and the failure lands where nobody would connect it to sluice
+// (roadmap item 93). The same read covers the keyless table and an
+// explicit REPLICA IDENTITY NOTHING; REPLICA IDENTITY FULL is always
+// fine.
+//
+// tables is what the caller is about to hand the publication: cold
+// start's post-filter source table list, or the single table
+// `schema add-table` is about to ALTER into scope. A table the sync
+// never touches is therefore never refused over; an empty list is a
+// no-op.
+//
+// Implementations return a coded refusal
+// ([sluicecode.CodeSourceReplicaIdentity]) naming every offending table,
+// the reason, and the remedies — and nil when there is nothing to
+// report. Engines without the surface skip silently: only a
+// publication-scoped source can reach this failure at all.
+type ReplicaIdentityPreflighter interface {
+	PreflightReplicaIdentity(ctx context.Context, tables []string) error
+}
+
 // UpsertKeyPreflighter is the optional TARGET-engine surface (implemented
 // on a [ChangeApplier]) the streamer consults once the target schema
 // exists and before the first change is applied: it verifies that every

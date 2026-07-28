@@ -57,15 +57,21 @@ var (
 	_ ir.HeartbeatWriter                     = (*SchemaReader)(nil)
 	_ ir.MultiDatabaseScoper                 = (*SchemaReader)(nil)
 	_ irbackup.PositionFromManifestPreflight = (*SchemaReader)(nil)
-	_ ir.RowFilterSetter                     = (*SchemaReader)(nil)
-	_ ir.SampleVerifier                      = (*SchemaReader)(nil)
-	_ ir.SchemaSetter                        = (*SchemaReader)(nil)
-	_ ir.SequenceStateReader                 = (*SchemaReader)(nil)
-	_ ir.SlotHealthReporter                  = (*SchemaReader)(nil)
-	_ ir.SlotSpillReporter                   = (*SchemaReader)(nil)
-	_ ir.TableScoper                         = (*SchemaReader)(nil)
-	_ ir.VerbatimExtensionAware              = (*SchemaReader)(nil)
-	_ ir.Verifier                            = (*SchemaReader)(nil)
+	// The item-93 source-side preflight is dispatched by runtime
+	// type-assert from the cold-start phase; unpinned, a receiver or
+	// signature drift would leave every build green while the whole check
+	// silently stopped running and PG-source syncs went back to breaking
+	// the operator's own writes.
+	_ ir.ReplicaIdentityPreflighter = (*SchemaReader)(nil)
+	_ ir.RowFilterSetter            = (*SchemaReader)(nil)
+	_ ir.SampleVerifier             = (*SchemaReader)(nil)
+	_ ir.SchemaSetter               = (*SchemaReader)(nil)
+	_ ir.SequenceStateReader        = (*SchemaReader)(nil)
+	_ ir.SlotHealthReporter         = (*SchemaReader)(nil)
+	_ ir.SlotSpillReporter          = (*SchemaReader)(nil)
+	_ ir.TableScoper                = (*SchemaReader)(nil)
+	_ ir.VerbatimExtensionAware     = (*SchemaReader)(nil)
+	_ ir.Verifier                   = (*SchemaReader)(nil)
 	// The pipeline's preflight probers are pipeline-side interfaces
 	// (partitionPreflightProber & co.) discovered by runtime assertion;
 	// their method SHAPES are pinned by the pipeline unit tests, and the

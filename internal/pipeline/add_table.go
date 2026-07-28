@@ -293,10 +293,22 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open source schema reader: %w", err))
 	}
 	fullSchema, err := sr.ReadSchema(ctx)
-	migcore.CloseIf(sr)
 	if err != nil {
+		migcore.CloseIf(sr)
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read source schema: %w", err))
 	}
+	// Source-side replica-identity preflight (roadmap item 93). This is
+	// the OTHER door into the publication: extendPublicationScope below
+	// runs `ALTER PUBLICATION … ADD TABLE`, after which Postgres refuses
+	// the source application's own UPDATE/DELETE on a table with no
+	// usable replica identity. Same refusal, same remedies, run against
+	// the still-open reader and ahead of the ALTER so a refusal leaves
+	// the publication untouched.
+	if err := preflightSourceReplicaIdentity(ctx, sr, a.Source.Capabilities(), []string{a.TableName}); err != nil {
+		migcore.CloseIf(sr)
+		return err
+	}
+	migcore.CloseIf(sr)
 
 	scoped, err := isolateTable(fullSchema, a.TableName)
 	if err != nil {

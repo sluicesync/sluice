@@ -9,6 +9,7 @@ Before running a sluice CDC stream against a Postgres source, the cluster needs 
 - `max_wal_senders ≥ 2 × replicas`, and ≥ `max_replication_slots` — required (cluster restart to change)
 - `max_slot_wal_keep_size > 4GB` — strongly recommended (live)
 - The connecting role must have the `REPLICATION` attribute
+- Every in-scope table needs a usable replica identity — an *immediate* primary key, `REPLICA IDENTITY USING INDEX`, or `REPLICA IDENTITY FULL` (live; see the section below — a `DEFERRABLE` primary key does **not** count)
 - The sluice slot name (default `sluice_slot`) must be listed in the cluster's "Logical slot name" / Patroni `slots:` / PG 17 `sync_replication_slots` configuration *before* failover or switchover events — see the failover section below
 - For PG 17+ HA: `sync_replication_slots = on` and `hot_standby_feedback = on`
 
@@ -116,6 +117,37 @@ ALTER ROLE sluice_user WITH REPLICATION;
 ```
 
 Without it, sluice fails on the first replication-protocol command rather than mid-stream.
+
+## Every in-scope table needs a usable replica identity
+
+sluice scopes its publication with `pubupdate`/`pubdelete`, and Postgres will not let *your own application* `UPDATE` or `DELETE` a published table that cannot identify its old row:
+
+```
+ERROR: cannot update table "orders" because it does not have a replica identity and publishes updates
+```
+
+`INSERT` keeps working, so a table in this state looks healthy right up until the first update. sluice therefore checks every in-scope table at cold start — **before** it creates or rescopes the publication — and refuses with `SLUICE-E-SOURCE-REPLICA-IDENTITY` rather than leave your source in that state. Three shapes fail the check:
+
+- **The table's only key is `DEFERRABLE`.** Postgres skips non-immediate indexes when it resolves a replica identity, so `PRIMARY KEY (id) DEFERRABLE` gives the table none. A separate immediate `UNIQUE` index does **not** rescue it — `REPLICA IDENTITY DEFAULT` resolves to the primary key and nothing else.
+- **The table has no primary key.** A `UNIQUE` index alone is not a replica identity until you nominate it.
+- **`REPLICA IDENTITY NOTHING`** is set explicitly.
+
+Three fixes, narrowest first:
+
+```sql
+-- (a) nominate an existing immediate NOT NULL UNIQUE index (cheapest WAL)
+ALTER TABLE orders REPLICA IDENTITY USING INDEX orders_pubid_key;
+
+-- (b) publish the whole old row — always works, including for keyless tables,
+--     at the cost of WAL volume on every UPDATE/DELETE
+ALTER TABLE orders REPLICA IDENTITY FULL;
+
+-- (c) make the key immediate (NOT DEFERRABLE is the default)
+ALTER TABLE orders DROP CONSTRAINT orders_pkey;
+ALTER TABLE orders ADD  CONSTRAINT orders_pkey PRIMARY KEY (id);
+```
+
+Or take the table out of the sync entirely with `--exclude-table` — an excluded table never joins the publication, so its writes are unaffected. The refusal names each offending table, why it failed, and (where one exists) the index you could nominate.
 
 ## Slot lifetime under failover
 

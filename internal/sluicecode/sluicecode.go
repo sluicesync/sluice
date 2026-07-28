@@ -164,6 +164,20 @@ const (
 	// table with no retry and no recovery (Bug 211).
 	CodeTargetDeferrableKey Code = "SLUICE-E-TARGET-DEFERRABLE-KEY"
 
+	// CodeSourceReplicaIdentity is CodeTargetDeferrableKey's source-side
+	// sibling — the same `pg_index.indimmediate` bit, the opposite end of
+	// the pipeline. Postgres will not use a DEFERRABLE key's index as a
+	// replica identity, so a PG source table whose only key is a
+	// deferrable PRIMARY KEY has none; the moment sluice adds it to a
+	// publication with `pubupdate=t pubdelete=t`, Postgres refuses the
+	// SOURCE APPLICATION's own UPDATE/DELETE on it. INSERT keeps working,
+	// so it looks healthy until the first update, and the failure surfaces
+	// in the operator's application rather than in sluice (roadmap item
+	// 93). Refused at PG-source cold start BEFORE the publication is
+	// scoped — the keyless table and an explicit `REPLICA IDENTITY
+	// NOTHING` fall out of the same catalog read.
+	CodeSourceReplicaIdentity Code = "SLUICE-E-SOURCE-REPLICA-IDENTITY"
+
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
@@ -301,6 +315,8 @@ var registry = map[Code]Info{
 	CodeSourceWrongDriver:   {ClassRefusal, "the --source is a recognisable format this source driver does not read (e.g. a mydumper directory handed to the csv driver) — the message names the right driver or preparation step"},
 	CodeCSVNullAmbiguous:    {ClassRefusal, "a csv/tsv source contains an unquoted empty field and no NULL representation was declared — RFC 4180 has no NULL, so sluice refuses to guess; declare the convention with --csv-null"},
 	CodeCSVHeaderUndeclared: {ClassRefusal, "a csv/tsv source was opened without declaring header presence — sluice never sniffs it; pass --csv-header or --csv-no-header"},
+
+	CodeSourceReplicaIdentity: {ClassRefusal, "PG-source cold start refused before the publication was scoped: an in-scope source table has no usable replica identity (its only key is DEFERRABLE, it has no key at all, or REPLICA IDENTITY is NOTHING) — publishing its UPDATEs/DELETEs would make Postgres reject the SOURCE APPLICATION's own writes to it; make the key immediate, set REPLICA IDENTITY FULL / USING INDEX, or exclude the table"},
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
