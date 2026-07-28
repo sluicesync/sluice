@@ -1846,6 +1846,14 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 96. The compaction readability refusal has no `SLUICE-E-*` code — *open, small*
+
+`verifyChainReadable`'s refusal (item 94) is a bare `fmt.Errorf`, so `internal/pipeline/backup/chain_readable_gate.go` contains no `sluicecode` reference at all. The prose and the `cp` recovery are good, but a script or agent branching on `SLUICE-E-*` — which is exactly what `docs/operator/error-codes.md` instructs operators to do — cannot detect it, and it exits 1 rather than the refusal status 3.
+
+Worth doing precisely because it is the thin version of the defect v0.104.2 spent three fixes on: an operator-facing refusal whose human-readable half is right and whose machine-readable half is missing, which is item 91 (Bug 213) restated. It also lands the same release-note claim twice — v0.104.2 tells operators a chain can be refused up front, without giving them a code to match on.
+
+Add the code alongside `CodeTargetDeferrableKey`'s declaration, class `ClassRefusal` so `ExitCode()` yields 3, mirror it into `docrows.go` and `docs/operator/error-codes.md` (both gated by `sluicecode_test.go`, so the in-repo table cannot drift), and port the row to the site. Reuse `verifyChainReadable`'s existing `op string` parameter so the same code serves prune when item 95 is decided.
+
 ### 95. `backup prune` has Bug 214's defect too, on a path that runs far more often — *open, HIGH / DR-availability*
 
 **Found while fixing item 94, in the same read path, and deliberately left unfixed there because it needs a decision rather than a patch.** `pruneWholeSegments` (`internal/pipeline/backup/chain_prune.go`) deletes `seg.FullManifestPath` through `seg.Store(store)`. For the ROOT segment that store is the lineage root and that path is `manifest.json` — so prune destroys the chain's identity header exactly the way compaction did, and a passphrase-encrypted chain then fails to restore at `unwrap chain cek` while the operator holds the correct passphrase.
