@@ -1846,6 +1846,20 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 94. `backup compact` on an ENCRYPTED chain exits 0 and leaves the chain UNRESTORABLE (Bug 214, v0.104.1 regression cycle) — *open, HIGH / DR-availability*
+
+**What.** `backup compact` against an encrypted chain reports success — `groups_merged=1 segments_removed=3`, exit 0 — and the chain is then unrestorable. `verify` and `restore` both refuse at `unwrap chain cek`, zero rows, minutes after that same chain restored 230/230 md5-exact. Pre-existing, NOT a v0.104.1 regression: v0.104.0 and v0.103.2 do the same thing.
+
+**Root cause, confirmed by reading.** `sweepRootSegmentArtifacts` (`internal/pipeline/backup/chain_compact.go`) deletes the chain-root `manifest.json`, on the stated reasoning that after compaction "the root manifest + root incrementals + root chunks are orphans". That reasoning holds for a PLAINTEXT chain, where the file is genuinely redundant once the merged segment owns its own copy. It is false for an encrypted one: ADR-0152 binds the chain CEK wrap to the ROOT MANIFEST'S IDENTITY, and `chain_restore.go` unwraps via `lineage.UnwrapChainCEK(envelope, enc.WrappedCEK, rootManifest)`. The root manifest is the chain's identity, not a spare copy of segment 0's — deleting it revokes readability for **every** segment, including ones compaction never touched.
+
+**The tell that it was never round-tripped.** Compaction's history in the bug catalog (Bugs 95, 139) is entirely about refusals to merge, and both were closed against plaintext chains. Encrypted compaction has apparently never had a compact→restore cell.
+
+**Recovery for anyone hit by it:** `cp <chain>/seg-merged-*/manifest.json <chain>/manifest.json` restores the chain byte-exactly — compaction copies the oldest full's manifest into the merged segment dir before deleting the root, so the identity still exists on disk. Verified in both per-chain and per-chunk modes.
+
+**Modes differ in symptom, not severity.** Per-chain fails at `unwrap chain cek`; `--encrypt-mode=per-chunk` fails later as `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` on 6/6 chunks. `--dry-run` is inert and the plaintext control is unaffected — both good, and both part of why this stayed hidden.
+
+**Fix shape.** Stop deleting the root manifest — it is small, and on an encrypted chain it is load-bearing forever. Then add the gate the class actually needs: **compaction must prove the chain still restores before it deletes anything.** A compact that reports success on a chain it has made unreadable is the same shape as the format-floor bug (an operation whose local reasoning is right and whose whole-chain consequence is unimplemented), and the durable answer is the same — a post-compaction readability check, not a more careful sweep. Pin the round trip: encrypted compact → restore, per-chain AND per-chunk, with the plaintext control.
+
 ### 93. A PG source table whose only key is a DEFERRABLE PK has no usable replica identity, and adding it to a publication breaks the SOURCE APPLICATION's own writes — silently, from sluice's side (reproduced on v0.103.0/1/2) — *open, HIGH*
 
 **What.** Postgres will not use a deferrable primary key's index as a replica identity (`pg_index.indimmediate = false`), so a table whose only key is a deferrable PK has **no usable replica identity**. `sluice sync start` adds it to `sluice_pub` with `pubupdate=t pubdelete=t`, and from that moment Postgres refuses the **source application's own** `UPDATE` and `DELETE` on that table:

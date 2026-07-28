@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Stopping a Postgres cold start at the wrong moment no longer throws away the copy you just paid for.** Between "the bulk copy has committed on the target" and "CDC has started", sluice writes the CDC anchor — the record that lets the stream resume from where the copy ended. That write rode the caller's cancellable context, so a Ctrl-C or a SIGTERM arriving in that window failed it with `context canceled`, and the error path dropped the freshly-created replication slot and publication. The result was a target holding every row but no resume position: warm resume had nothing to resume from and a fresh cold start refused on a populated target, leaving `--reset-target-data` and a full re-copy as the only way forward. The window is as long as the anchor write takes, which on a loaded or distant target is seconds rather than microseconds. The anchor write now completes even when the run is being cancelled, on the same uncancellable-with-timeout footing sluice already gives the snapshot teardown's commit and the stop-drain flush — the reason you are stopping must not be the reason the durability record is missing. A genuine anchor-write failure still abandons the stream, since without an anchor the slot really would be orphaned WAL.
+
+This was found by root-causing a test that had been dismissed as flaky and "fixed" twice by raising its timeout. The test was not waiting on a slow walsender — a clean shutdown releases the slot in about two milliseconds — it was waiting for a slot that had already been deleted, which is why it always consumed its entire budget and why no timeout would ever have been long enough. It now passes in 1.5 seconds instead of 181.
+
 ## [0.104.1] - 2026-07-27
 
 ### Fixed
