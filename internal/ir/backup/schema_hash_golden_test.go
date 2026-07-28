@@ -26,14 +26,16 @@ import (
 // the schema it was written with, and a chain restore RECOMPUTES it and
 // REFUSES the whole chain on a mismatch (`verifySchemaHashes` in
 // internal/pipeline/backup/chain_restore.go). The refusal is
-// SLUICE-E-BACKUP-MANIFEST-INVALID, whose text says "corrupted or
-// partially-rewritten manifest" and whose remedy is "restore from an
-// untampered copy" — so a field addition here does not degrade a restore,
-// it tells an operator holding a perfectly good backup that their backup
-// store is corrupt. The same recompute rides the broker's live-apply path
+// SLUICE-E-BACKUP-MANIFEST-INVALID — so a field addition here does not
+// degrade a restore, it makes every chain an operator already holds
+// unrestorable by this binary. (The refusal's WORDING was fixed for
+// roadmap item 102: it now names release skew alongside corruption
+// instead of telling that operator their store is corrupt. That makes the
+// failure honest; it does not make it survivable — the chain is still
+// refused.) The same recompute rides the broker's live-apply path
 // (internal/pipeline/broker.go), so it is not DR-only, and
 // `deltaTableFingerprint` (signature.go) folds it into the signing bytes,
-// so signed chains fail signature verification too.
+// so signed chains carrying a schema delta fail signature verification too.
 //
 // The whole class is therefore invisible to every other test in this repo
 // by construction: they all run ONE binary against its own output, and one
@@ -187,9 +189,8 @@ ir.ExcludeConstraint / ir.Policy / ir.View / ir.Sequence. Those structs have
 no json tags, so an untagged field marshals on EVERY object of that type and
 moves the fingerprint of schemas that did not change. A chain restore
 recomputes this hash and REFUSES the whole chain on a mismatch
-(SLUICE-E-BACKUP-MANIFEST-INVALID, "corrupted or partially-rewritten
-manifest") — so shipping this makes every backup an operator already holds
-unrestorable, and tells them their backup store is corrupt.
+(SLUICE-E-BACKUP-MANIFEST-INVALID) — so shipping this makes every chain
+backup an operator already holds unrestorable by the release that ships it.
 
 FIX IT ONE OF TWO WAYS:
 

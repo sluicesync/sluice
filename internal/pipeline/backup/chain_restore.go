@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
@@ -722,13 +723,52 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 	return nil
 }
 
+// schemaFingerprintCauses renders the HONEST cause list for a
+// schema-fingerprint mismatch. The check cannot distinguish its two
+// causes, so it must not pick one:
+//
+//   - the manifest was written by a sluice release whose IR schema field
+//     set differs from this binary's. [irbackup.ComputeSchemaHash] is a
+//     SHA-256 over the marshalled IR structs, so an untagged field
+//     addition re-fingerprints schemas that never changed — the chain is
+//     INTACT and merely unreadable by THIS binary; or
+//   - the manifest is genuinely corrupt or tampered.
+//
+// Naming only the second is a false accusation delivered during a
+// recovery: it sends an operator holding a byte-perfect chain hunting a
+// fault in their storage that is not there. Three fingerprint epochs
+// already shipped from exactly the first cause (roadmap item 102), so
+// that branch is named FIRST and the epoch boundaries live in
+// docs/operator/error-codes.md rather than in this string.
+//
+// The writing release is DATA — [irbackup.Manifest.SluiceVersion],
+// stamped by whichever binary wrote the manifest — never a hardcoded
+// release table inlined here, which would rot on the next addition.
+func schemaFingerprintCauses(m *irbackup.Manifest) string {
+	written := "this manifest does not record the release that wrote it"
+	if v := strings.TrimSpace(m.SluiceVersion); v != "" {
+		written = "this manifest was written by sluice " + v
+	}
+	return written + ", and a schema fingerprint is only comparable between releases that share an IR schema field set — so EITHER the writing release's field set differs from this binary's, in which case the chain is intact and unreadable only HERE, OR the manifest is genuinely corrupt or tampered"
+}
+
+// schemaFingerprintRemedy is the remedy half of the same refusal. Both
+// causes get an action, and neither invents a flag: there is no
+// skip-the-check flag, and re-deriving the fingerprint at the writing
+// release's field set is not built (roadmap item 102 — deliberately
+// demand-gated).
+const schemaFingerprintRemedy = "restore this chain with a sluice release that shares the schema fingerprint of the release that wrote it (the manifest records that version), or re-take the backup with this binary; if the writing release IS this binary the mismatch is corruption — restore from an untampered copy, and sign chains (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time. Background: docs/operator/error-codes.md, SLUICE-E-BACKUP-MANIFEST-INVALID"
+
 // verifySchemaHashes recomputes every link's schema fingerprint and
 // compares it against the manifest-recorded [irbackup.Manifest.SchemaHash]
 // BEFORE anything lands on the target — the check the SchemaHash field
 // doc promised and, pre-ADR-0152, nothing performed (audit N-8 item 4).
 // This is CORRUPTION detection (bit-rot, truncated rewrite, mangled
 // schema JSON), not tamper-proofing: the hash lives in the same
-// unsigned manifest as the schema.
+// unsigned manifest as the schema. It ALSO fires — indistinguishably —
+// on a manifest written by a release whose IR schema field set differs
+// from this binary's, which is why the refusal names both causes (see
+// [schemaFingerprintCauses]).
 //
 // Links without a recorded hash (fulls written before ADR-0152,
 // pre-Phase-3 manifests) are skipped. One named carve-out: a pre-v5
@@ -763,9 +803,9 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 			continue
 		}
 		return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
-			"restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time",
-			fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands",
-				links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got))
+			schemaFingerprintRemedy,
+			fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not fingerprint to the value written with it: %s; refusing before any data lands",
+				links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got, schemaFingerprintCauses(m)))
 	}
 	return nil
 }
