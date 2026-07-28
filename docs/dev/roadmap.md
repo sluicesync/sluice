@@ -1869,6 +1869,8 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 
 **Check for the cancellation-spin sibling while there.** The PG pump tested `pgconn.Timeout(err)` before `errors.Is(err, context.Canceled)`, so a cancelled pump never unwound. Whatever go-mysql returns on a cancelled read deserves the same question: does the error-classification order let a cancelled pump loop forever?
 
+**Adjacent, small, PG-side, pre-existing — worth folding in whenever this file is next opened.** If cancellation lands exactly when a keepalive is due, `SendStandbyStatusUpdate` errors and `setErr` records that on what is otherwise a clean shutdown, so a healthy stop can surface a spurious error. Rare, and it fails in the noisy rather than the silent direction, which is why it is a note and not its own item — but it is the same "the reason we are stopping must not become the failure we report" shape the cold-start anchor fix (item 89) closed on the backup path, so it belongs with that family rather than being rediscovered as a mystery.
+
 
 ### 102. **CRITICAL, ALREADY SHIPPED** — adding a field to `ir.Index` partitions every backup chain by release, and v0.100.0 already did it: a pre-v0.100.0 chain cannot be restored by any v0.100.0+ binary, and it reports as *"your backup is corrupt"* — *open, CRITICAL / DR-availability. Fix shape needs its own scoping; deliberately NOT fixed in the chunk that found it.*
 
