@@ -88,3 +88,8 @@ internal/pipeline/testdata/real-world-corpus/*
 # nothing under here is tracked.
 workspace/
 tmp/
+
+# Scratch files from multi-line edits. A .driftblock.tmp fragment was
+# swept into the tree by a broad `git add` and tracked for a day before
+# anyone noticed; tmp/ covered the directory but not stray *.tmp files.
+*.tmp
