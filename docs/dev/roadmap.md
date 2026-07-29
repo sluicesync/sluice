@@ -1884,7 +1884,7 @@ Three gates, in order of how much they would actually have caught:
 **Not fixed, and deliberately.** A chain v0.104.3 wrote from a primary-keyed Postgres source stays unreadable by everything including v0.104.4 — its manifest records a fingerprint computed *with* the field, and nothing re-derives it. That is item 102's demand-gated shim, unchanged by this. `docs/operator/error-codes.md` now documents E4 as the one-release detour it is, including which v0.104.3 chains are affected (PG source with a PK) and which are ordinary E3 chains (MySQL sources, PG without a PK).
 
 
-### 103. The MySQL CDC reader has the PG close-vs-pump race, unfixed — *open, HIGH*
+### 103. The MySQL CDC reader has the PG close-vs-pump race, unfixed — *FIXED, ships in v0.104.4*
 
 **Found while fixing the Postgres one (roadmap item covering the v0.104.3 CI data race), and deliberately NOT bundled with it.** `internal/engines/mysql/cdc_reader.go` (~415-430) nils `r.db` in `Close` with no join against its pump goroutine, and that pump reads `r.db` via `tableFor` (~1260) on the TABLE_MAP path. Same shape as the Postgres defect: `Close` tears down state the pump still owns.
 
@@ -1897,6 +1897,18 @@ Three gates, in order of how much they would actually have caught:
 **Check for the cancellation-spin sibling while there.** The PG pump tested `pgconn.Timeout(err)` before `errors.Is(err, context.Canceled)`, so a cancelled pump never unwound. Whatever go-mysql returns on a cancelled read deserves the same question: does the error-classification order let a cancelled pump loop forever?
 
 **Adjacent, small, PG-side, pre-existing — worth folding in whenever this file is next opened.** If cancellation lands exactly when a keepalive is due, `SendStandbyStatusUpdate` errors and `setErr` records that on what is otherwise a clean shutdown, so a healthy stop can surface a spurious error. Rare, and it fails in the noisy rather than the silent direction, which is why it is a note and not its own item — but it is the same "the reason we are stopping must not become the failure we report" shape the cold-start anchor fix (item 89) closed on the backup path, so it belongs with that family rather than being rediscovered as a mystery.
+
+**SHIPPED (v0.104.4), and it is ONE half rather than the PG fix's two.** `StreamChanges` now hands the pump a `done` channel as an argument (never read off the struct, so `Close` can clear the field without racing the goroutine it waits for), closed as the pump's last act; `Close` cancels, joins, and only then closes the syncer and releases the pool. Joining before the syncer teardown, not after: the pump exits on ctx alone, so the join needs nothing from the syncer.
+
+**The cancellation-spin sibling was checked, not assumed, and it is absent.** go-mysql v1.15.0's `BinlogStreamer.GetEvent` (`replication/binlogstreamer.go:29-36`) selects on `ctx.Done()` and returns `ctx.Err()` bare — no timeout dressing, so nothing for the pump's classification order to swallow, and no second half to write. That is a claim about a dependency rather than about sluice, which is why the integration pin exists at all: regress it and the test hangs at `Close` rather than failing an assertion.
+
+**The adjacent note above, applied to this engine.** A cancelled dispatch used to be recorded through `setErr`: `tableFor` runs a live information_schema query and the channel send parks on `ctx.Done`, so an ordinary `Close` reached the dispatch-error branch with the teardown's own context error and `Err()` reported a deliberate stop as the stream's terminating failure. Both error branches now test `ctx.Err()` first.
+
+**Pins, mutation-verified in both directions — and the integration one had to be rewritten to earn that.** Unit (`TestCDCReaderCloseJoinsPumpBeforeReleasingSchemaPool`): deleting the `<-r.pumpDone` wait fails it deterministically, and its stand-in pump re-reads `r.db` on the way out so `-race` trips too. Integration (`TestCDCReader_CloseJoinsLivePump`, real mysqld): parks the pump inside `tableFor`'s schema lookup through the existing `schemaLoader` seam, then asserts `Close` BLOCKS there and that the pool is still pingable from inside the parked lookup.
+
+**The first draft of that integration test PASSED with the join deleted**, which is worth recording as its own data point. It did the obvious thing — close a live reader, assert the change channel is already closed — and a cancelled pump simply unwinds faster than `Close` returns, so the assertion held either way. Same family as item 104's self-referential golden: a gate whose green survives the defect it is named for. The parking is what converts it into a real gate; the ordering it asserts is now impossible to satisfy by luck.
+
+**Still true of this reader, and deliberately not changed here:** `r.schemaCache` and the tableMap are pump-owned and untouched by `Close`, so the join is what makes them safe rather than a lock. If a future caller ever reads reader state from outside the pump, that is a new question, not one this fix answers.
 
 
 ### 102. **CRITICAL, ALREADY SHIPPED** — adding a field to `ir.Index` partitions every backup chain by release, and v0.100.0 already did it: a pre-v0.100.0 chain cannot be restored by any v0.100.0+ binary, and it reports as *"your backup is corrupt"* — *open, CRITICAL / DR-availability. Fix shape needs its own scoping; deliberately NOT fixed in the chunk that found it.*

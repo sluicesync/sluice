@@ -182,6 +182,17 @@ type CDCReader struct {
 	// even when the caller's context isn't readily available.
 	streamerCancel context.CancelFunc
 
+	// pumpDone is closed by the pump goroutine as the LAST thing it
+	// does, so receiving from it establishes a happens-before edge
+	// against every field the pump touched. [Close] cancels the pump
+	// and then waits on it before releasing anything the pump owns —
+	// see Close's doc for why the wait is load-bearing. Created by
+	// [StreamChanges] and handed to the pump as an ARGUMENT (never
+	// read off the struct by the pump, so Close can clear the field
+	// without racing the goroutine it is waiting for). nil before the
+	// first StreamChanges and after a completed Close.
+	pumpDone chan struct{}
+
 	// tableMap is the transient binlog table_id → qualified-name map.
 	// Repopulated on every TABLE_MAP_EVENT; entries are not durable
 	// across server restarts and are not cached on disk. Empty string
@@ -410,12 +421,50 @@ func (r *CDCReader) databaseInScope(database string) bool {
 	return database == r.schema
 }
 
-// Close releases the schema-DB pool and stops the binlog syncer if one
-// is open. Safe to call multiple times.
+// Close stops the pump goroutine, JOINS it, and only then closes the
+// binlog syncer and releases the schema-DB pool. Safe to call multiple
+// times.
+//
+// The join is load-bearing, not tidiness. The pump does not merely
+// decode buffered bytes: on every TABLE_MAP boundary for an uncached
+// table, [CDCReader.tableFor] runs a live information_schema query on
+// r.db — and unlike its Postgres sibling it does not even carry a nil
+// guard, so a Close that returned while the pump was inside that
+// lookup left `r.db = nil` landing under a live reader: an
+// unsynchronised write to a field the pump reads, and, once the nil
+// wins the race, a method call on a nil *sql.DB that PANICS on a
+// goroutine nothing recovers, taking the process with it. Two ordinary
+// call sites close a reader whose pump is running — `sluice sync`'s
+// per-attempt teardown (the Streamer's deferred stop → CloseIf) and
+// `backup stream`'s transient-retry reopen — and both already document
+// the reader as joining its streaming goroutine deterministically. This
+// is the Postgres fix's sibling, applied to the class rather than
+// waiting for the detector to name this instance too (roadmap item
+// 103).
+//
+// The wait is bounded and cannot deadlock. Cancelling the pump's ctx
+// unblocks it wherever it can park: go-mysql's
+// [replication.BinlogStreamer.GetEvent] selects on ctx.Done and returns
+// ctx.Err() (v1.15.0 binlogstreamer.go:29-36 — read before relying on
+// it, because the Postgres pump's equivalent dressed an already-done
+// context as a TIMEOUT and spun forever), the information_schema
+// lookups are ctx-scoped, and the change-channel send selects on
+// ctx.Done. So Close needs no cooperation from a consumer that has
+// already stopped draining — which is the shape every caller's deferred
+// teardown has.
+//
+// Ordering: join BEFORE closing the syncer, not after. The pump exits
+// on ctx alone, so the join needs nothing from the syncer, and tearing
+// the syncer down under a live pump would only trade one race for
+// another.
 func (r *CDCReader) Close() error {
 	if r.streamerCancel != nil {
 		r.streamerCancel()
 		r.streamerCancel = nil
+	}
+	if r.pumpDone != nil {
+		<-r.pumpDone
+		r.pumpDone = nil
 	}
 	if r.syncer != nil {
 		r.syncer.Close()
@@ -443,9 +492,11 @@ func (r *CDCReader) Err() error {
 // position; pass a previously-emitted Position to resume.
 //
 // The channel is closed when ctx is cancelled, when the syncer
-// terminates, or when a fatal error occurs (visible via [Err]). The
-// caller should drain the channel or cancel ctx to avoid leaking the
-// streaming goroutine.
+// terminates, or when a fatal error occurs (visible via [Err]). A
+// caller that is done early should call [Close], which cancels the pump
+// and JOINS it — so when Close returns, the change channel is already
+// closed and no goroutine is left reading the pool Close just released.
+// Cancelling ctx alone stops the pump too, but asynchronously.
 func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan ir.Change, error) {
 	r.mu.Lock()
 	r.err = nil
@@ -594,7 +645,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
 	out := make(chan ir.Change, cdcChannelBuffer)
-	go r.pump(loopCtx, streamer, out)
+	// done is what [Close] joins on. Passed as an argument rather than
+	// read off r.pumpDone by the pump, so Close can clear the field
+	// without racing the very goroutine it is waiting for.
+	done := make(chan struct{})
+	r.pumpDone = done
+	go r.pump(loopCtx, streamer, out, done)
 	return out, nil
 }
 
@@ -670,7 +726,11 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 // connecting role have REPLICATION SLAVE?"). Heartbeat events
 // (from the source's HeartbeatPeriod ack) and rotate events do NOT
 // count — only row-level events satisfy the watchdog.
-func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- ir.Change) {
+// done is closed when the pump has fully unwound — declared FIRST so it
+// runs LAST, after the change channel is closed. [Close] joins on it
+// before releasing the schema-DB pool the dispatch path queries.
+func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- ir.Change, done chan<- struct{}) {
+	defer close(done)
 	defer close(out)
 
 	pumpCtx, cancel := context.WithCancel(ctx)
@@ -681,8 +741,12 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 		ev, err := streamer.GetEvent(ctx)
 		if err != nil {
 			// Context cancellation is the orderly-shutdown path; not an
-			// error worth recording.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// error worth recording. The ctx.Err() arm catches the same
+			// thing arriving WRAPPED — go-mysql returns ctx.Err() bare
+			// here (v1.15.0), but a syncer teardown racing the cancel can
+			// surface as ErrSyncClosed instead, and a clean stop must not
+			// be reported as the stream's failure.
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
 			r.setErr(classifyReaderError(fmt.Errorf("mysql: cdc: get event: %w", err)))
@@ -697,6 +761,17 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 			r.suppressNoEventsWatchdog()
 		}
 		if err := r.dispatch(ctx, ev, out); err != nil {
+			// A cancelled dispatch is the teardown, not a fault. tableFor
+			// runs a live information_schema query and the channel send
+			// parks on ctx.Done, so an ordinary Close reaches this branch
+			// with a context error dressed up as whatever the driver said
+			// — and recording it would let a deliberate stop surface
+			// through Err() as the stream's terminating failure. The
+			// reason we are stopping must not become the failure we
+			// report (the shape item 89 closed on the backup path).
+			if ctx.Err() != nil {
+				return
+			}
 			// Classify DISPATCH errors, not just GetEvent errors — the binlog
 			// sibling of the VStream Bug 207 site. This path is not merely
 			// decoding buffered bytes: dispatchRows calls tableFor, which runs
