@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
@@ -42,6 +43,61 @@ import (
 // to assert restore equality against the source oracle.
 type bug139Sums struct {
 	n, sumID, sumBalance int64
+}
+
+// waitForChainToCover blocks until the lineage's newest committed
+// position has reached `want` — a WAL LSN the caller captured INSIDE its
+// final write's transaction, so it is a target the stream is guaranteed
+// to pass once it decodes that transaction, and one that lies past every
+// earlier write.
+//
+// Do NOT pass `pg_current_wal_lsn()` sampled after the writes: it also
+// counts slot/snapshot bookkeeping records the stream will never commit
+// past on an idle source, so the wait cannot succeed. Tried, and it hung
+// 48 bytes short of an unreachable target.
+//
+// It exists because "sleep and hope the rollover fired" is the shape that
+// turns a healthy stream into a red publish gate under CI load. The
+// comparison is done BY POSTGRES (`::pg_lsn >=`) rather than by parsing
+// `X/Y` hex in Go: the source is right there and it owns the type.
+//
+// The caller must have stopped writing before calling this — otherwise
+// the target keeps moving and the wait is unbounded by construction.
+func waitForChainToCover(t *testing.T, store irbackup.Store, sourceDSN, want string, timeout time.Duration) {
+	t.Helper()
+	if want == "" {
+		t.Fatal("waitForChainToCover called with an empty target LSN — the writer did not record one, so this wait would be vacuous")
+	}
+
+	deadline := time.Now().Add(timeout)
+	var last string
+	for {
+		cat, _, err := lineage.LoadLineageCatalog(context.Background(), store)
+		if err == nil && cat != nil {
+			last = ""
+			for i := range cat.Segments {
+				if tok := cat.Segments[i].EndPosition.Token; tok != "" {
+					last = tok
+				}
+			}
+			// The recorded token is the PG reader's position DOCUMENT —
+			// `{"slot":…,"lsn":"0/25D1720","systemid":…,"timeline":…}` —
+			// not a bare LSN, so pull the field out before comparing.
+			// Postgres does both the extraction and the ordering: `->>`
+			// then `::pg_lsn`. If the token shape ever changes, this
+			// errors loudly here rather than silently comparing strings.
+			if last != "" && pgQueryOne[bool](t, sourceDSN,
+				"SELECT (($1::json)->>'lsn')::pg_lsn >= $2::pg_lsn", last, want) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream did not commit an incremental covering %s within %s (newest committed position: %q) — "+
+				"either the rollover stopped firing or the source kept being written to after wg.Wait()",
+				want, timeout, last)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func bug139Read(t *testing.T, dsn string) bug139Sums {
@@ -272,11 +328,29 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 	// stamp-less open segment from P_N (the resume heal) and commit its
 	// first incremental at P_N — stamping IncrementalCoverageStart.
 	eng, _ := engines.Get("postgres")
-	var wg sync.WaitGroup
+	var (
+		wg          sync.WaitGroup
+		lastWriteAt string // WAL position INSIDE the final write's transaction
+	)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 16; i++ {
+			if i == 15 {
+				// The last write reports its own WAL position, read in the
+				// SAME transaction so the value sits BEFORE that
+				// transaction's commit record. That makes it a target the
+				// stream is guaranteed to pass once it decodes this
+				// transaction — unlike `pg_current_wal_lsn()` sampled
+				// afterwards, which also counts slot/snapshot bookkeeping
+				// the stream will never commit past on an idle source (a
+				// 48-byte gap, and an unreachable wait, when tried).
+				lastWriteAt = pgQueryOne[string](t, sourceDSN, fmt.Sprintf(
+					`WITH u AS (UPDATE accounts SET balance = balance + 1 WHERE id = %d RETURNING 1)
+					 SELECT pg_current_wal_lsn()::text FROM u LIMIT 1`, (i%4)+1,
+				))
+				continue
+			}
 			applyDDL(t, sourceDSN, fmt.Sprintf(
 				`UPDATE accounts SET balance = balance + 1 WHERE id = %d;`, (i%4)+1,
 			))
@@ -298,7 +372,20 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 	streamErr := make(chan error, 1)
 	go func() { streamErr <- stream.Run(ctx) }()
 	wg.Wait()
-	time.Sleep(2 * time.Second)
+	// Wait until the stream has actually COMMITTED the last write into an
+	// incremental, rather than assuming a fixed drain window did it.
+	//
+	// This was `time.Sleep(2 * time.Second)`, and it failed the v0.104.6
+	// TAG run — the only run of the day it failed, on a commit that had
+	// passed the same shard an hour earlier. The oracle below is read from
+	// the SOURCE, so a final UPDATE that the stream had not yet rolled into
+	// an incremental when cancel() landed is missing from the chain and
+	// present in the oracle: `sumBalance:2032 want 2033`, one update short.
+	// Not a product defect — a cancelled stream owes you nothing past its
+	// last committed window, and the slot has not advanced — but a fixed
+	// sleep guarding a 700ms rollover under CI load is an assumption, and
+	// this one cost a publish-gate scare.
+	waitForChainToCover(t, store, sourceDSN, lastWriteAt, 60*time.Second)
 	cancel()
 	select {
 	case err := <-streamErr:
