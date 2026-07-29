@@ -5,12 +5,14 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // captureHandler records slog records at WARN+ for assertion.
@@ -206,6 +208,61 @@ func TestPlanFloatRepair_FamilyAndShapeMatrix(t *testing.T) {
 // schema (the ApplyMappings FLOAT→DOUBLE type-override race the plan is
 // captured BEFORE): the trimmed read table must still see FloatSingle so
 // selectColumnExpr keeps the `(col * 1E0)` projection.
+// floatRepairOpenFailEngine fails OpenRowReader with a connect-shaped error,
+// so the float-repair path's source-open error path can be driven directly.
+type floatRepairOpenFailEngine struct {
+	stubEngine
+	err error
+}
+
+func (e *floatRepairOpenFailEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	return nil, e.err
+}
+
+// TestRepairColdStartFloats_SourceOpenIsConnectAttributed pins the sibling of
+// the errno-3024 index-wall wiring bug found in the same sweep: this source
+// OpenRowReader failure used to be handed to migcore.PhaseSnapshot, which has
+// ZERO registry entries — so a wrong/unreachable source DSN here produced no
+// hint and no SLUICE-E- code, while the symmetric TARGET open twelve lines
+// below produced both. The registry was right; the phase argument was not.
+//
+// Both connect shapes are pinned rather than one representative, because the
+// registry dispatches on the message substring.
+func TestRepairColdStartFloats_SourceOpenIsConnectAttributed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want sluicecode.Code
+	}{
+		{"connection refused", errors.New("dial tcp 10.0.0.1:5432: connect: connection refused"), sluicecode.CodeConnectRefused},
+		{"auth failed", errors.New(`pq: password authentication failed for user "sluice"`), sluicecode.CodeConnectAuthFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Streamer{
+				Source:    &floatRepairOpenFailEngine{err: tc.err},
+				SourceDSN: "postgres://x/y",
+			}
+			plan := []floatRepairTable{{name: "t", pkColumns: []string{"id"}, floatColumns: []string{"f"}, repairable: true}}
+			targetSchema := &ir.Schema{Tables: []*ir.Table{{Name: "t"}}}
+
+			err := s.repairColdStartFloats(context.Background(), plan, targetSchema)
+			if err == nil {
+				t.Fatal("expected the failing source open to fail float repair")
+			}
+			var coded *sluicecode.CodedError
+			if !errors.As(err, &coded) {
+				t.Fatalf("source-open failure carries no code, so the operator gets a bare dial error:\n%v", err)
+			}
+			if coded.Code != tc.want {
+				t.Errorf("code = %s; want %s", coded.Code, tc.want)
+			}
+			if coded.Hint == "" {
+				t.Error("no remedy hint attached to a connect failure")
+			}
+		})
+	}
+}
+
 func TestTrimmedFloatReadTable_TypeCaptureIsIndependent(t *testing.T) {
 	src := &ir.Table{
 		Name:       "t",

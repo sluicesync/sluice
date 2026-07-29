@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // fakeIndexBuilderSW is a minimal SchemaWriter that ALSO implements
@@ -265,4 +267,157 @@ func TestOverlapPhase_CopyErrorCancelsIndexPool(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when a copy reader fails; got nil")
 	}
+}
+
+// walledIndexBuilderSW is fakeIndexBuilderSW with a caller-supplied error, so
+// the attribution pin below can hand the overlapped phase the REAL walled
+// shape (`mysql: create indexes on … maximum statement execution time
+// exceeded`) rather than a synthetic "fake index build failed" string the
+// hint registry would never match.
+type walledIndexBuilderSW struct {
+	*fakeIndexBuilderSW
+	wall error
+}
+
+func (s *walledIndexBuilderSW) BuildTableIndexesFromChannel(ctx context.Context, _ *ir.Schema, completedTables <-chan *ir.Table) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case _, ok := <-completedTables:
+		if !ok {
+			return nil
+		}
+		return s.wall
+	}
+}
+
+// TestOverlapPhase_AttributesTheFailingAxis pins WHICH phase the overlapped
+// errgroup blames, in both directions.
+//
+// The index axis used to be attributed to bulk-copy ("the conservative
+// guess"), which silently discarded the errno-3024 hint and its
+// SLUICE-E-INDEX-STATEMENT-TIME-LIMIT code: those live under PhaseIndexes,
+// and PhaseBulkCopy's entries match none of the walled text. cmd/sluice's
+// TestMigrateIndexWall_HintAndCodeReachTheOperator is the end-to-end gate;
+// this is the unit-level pin that the attribution ALSO doesn't over-correct —
+// a copy failure that merely cancels the index axis must still report as
+// bulk-copy.
+func TestOverlapPhase_AttributesTheFailingAxis(t *testing.T) {
+	t.Run("index axis → indexes phase, hint and code attached", func(t *testing.T) {
+		schema := overlapTestSchema(3)
+		gauge := &concurrencyGauge{}
+		eng := &poolFakeEngine{rowsPerTable: 2, gauge: gauge}
+		sw := &walledIndexBuilderSW{
+			fakeIndexBuilderSW: &fakeIndexBuilderSW{},
+			wall: fmt.Errorf(`mysql: create indexes on %q: %w`, "events",
+				errors.New("Error 3024 (HY000): Query execution was interrupted, "+
+					"maximum statement execution time exceeded")),
+		}
+		state := &ir.MigrationState{TableProgress: map[string]ir.TableProgress{}}
+		var stateMu sync.Mutex
+
+		err := runOverlappedCopyAndIndexPhase(
+			context.Background(), resumeContext{enabled: false}, state, &stateMu, schema,
+			&poolFakeReader{rowsPerTable: 2}, sw, newPoolFakeWriter(gauge, 0), sw,
+			false, 0, &parallelBulkCopyDeps{source: eng, target: eng, parallelism: 1},
+			4, nil, ShardColumnSpec{},
+		)
+		if err == nil {
+			t.Fatal("expected the walled index build to fail the phase")
+		}
+		if !strings.Contains(err.Error(), "pipeline: create indexes:") {
+			t.Errorf("error lacks the index-phase prefix every other index path carries:\n%v", err)
+		}
+		var coded *sluicecode.CodedError
+		if !errors.As(err, &coded) {
+			t.Fatalf("walled index build carries no code, so the operator gets a bare MySQL timeout:\n%v", err)
+		}
+		if coded.Code != sluicecode.CodeIndexStatementTimeLimit {
+			t.Errorf("code = %s; want %s", coded.Code, sluicecode.CodeIndexStatementTimeLimit)
+		}
+		if !strings.Contains(coded.Hint, "--resume finishes just the indexes with NO re-copy") {
+			t.Errorf("hint does not name the no-re-copy remedy: %q", coded.Hint)
+		}
+	})
+
+	// The attribution change also moves the PERSISTED phase to indexes, and
+	// the comment at the call site claims resume is unaffected because every
+	// resume decision reads per-table TableProgress while state.Phase is only
+	// ever compared against MigrationPhaseComplete. That claim is a
+	// hypothesis until something fails when it breaks — this is that
+	// something.
+	t.Run("persisted state names indexes and keeps per-table progress", func(t *testing.T) {
+		schema := overlapTestSchema(3)
+		gauge := &concurrencyGauge{}
+		eng := &poolFakeEngine{rowsPerTable: 2, gauge: gauge}
+		sw := &walledIndexBuilderSW{
+			fakeIndexBuilderSW: &fakeIndexBuilderSW{},
+			wall:               errors.New("mysql: create indexes: maximum statement execution time exceeded"),
+		}
+		store := newFakeStateStore()
+		rc := resumeContext{store: store, migrationID: "m-overlap", enabled: true}
+		state := &ir.MigrationState{MigrationID: "m-overlap", TableProgress: map[string]ir.TableProgress{}}
+		var stateMu sync.Mutex
+
+		if err := runOverlappedCopyAndIndexPhase(
+			context.Background(), rc, state, &stateMu, schema,
+			&poolFakeReader{rowsPerTable: 2}, sw, newPoolFakeWriter(gauge, 0), sw,
+			false, 0, &parallelBulkCopyDeps{source: eng, target: eng, parallelism: 1},
+			4, nil, ShardColumnSpec{},
+		); err == nil {
+			t.Fatal("expected the walled index build to fail the phase")
+		}
+
+		persisted, found, err := store.Read(context.Background(), "m-overlap")
+		if err != nil || !found {
+			t.Fatalf("state row not persisted: found=%v err=%v", found, err)
+		}
+		if persisted.Phase != ir.MigrationPhaseIndexes {
+			t.Errorf("persisted phase = %q; want %q — the failed phase should name what failed",
+				persisted.Phase, ir.MigrationPhaseIndexes)
+		}
+		if persisted.Phase == ir.MigrationPhaseComplete {
+			t.Error("persisted phase is complete; a --resume would exit clean over an unbuilt index")
+		}
+		// The load-bearing half: whichever tables DID copy stay recorded
+		// complete, so a --resume skips their copy rather than re-copying
+		// 122 GB. If a future change made resume read state.Phase instead,
+		// this is the assertion that stops being enough — and
+		// TestResume_* covers that read side.
+		if len(persisted.TableProgress) == 0 {
+			t.Fatal("no per-table progress survived the failure; a --resume would re-copy everything")
+		}
+		for name, tp := range persisted.TableProgress {
+			if tp.State == ir.TableProgressComplete {
+				return // at least one copied table is still resumable
+			}
+			_ = name
+		}
+		t.Errorf("no table recorded complete despite copies succeeding: %+v", persisted.TableProgress)
+	})
+
+	t.Run("copy axis → bulk-copy phase, unchanged", func(t *testing.T) {
+		schema := overlapTestSchema(6)
+		sw := &fakeIndexBuilderSW{}
+		state := &ir.MigrationState{TableProgress: map[string]ir.TableProgress{}}
+		var stateMu sync.Mutex
+		eng := &errAfterNEngine{failAt: 1, rowsEach: 2}
+
+		err := runOverlappedCopyAndIndexPhase(
+			context.Background(), resumeContext{enabled: false}, state, &stateMu, schema,
+			&maybeErrReader{rowsEach: 2, fail: true}, sw, newPoolFakeWriter(&concurrencyGauge{}, 0), sw,
+			false, 0, &parallelBulkCopyDeps{source: eng, target: eng, parallelism: 1},
+			4, nil, ShardColumnSpec{},
+		)
+		if err == nil {
+			t.Fatal("expected the failing copy reader to fail the phase")
+		}
+		if strings.Contains(err.Error(), "pipeline: create indexes:") {
+			t.Errorf("a COPY failure was mis-attributed to the index phase:\n%v", err)
+		}
+		var coded *sluicecode.CodedError
+		if errors.As(err, &coded) && coded.Code == sluicecode.CodeIndexStatementTimeLimit {
+			t.Errorf("a copy failure picked up the index-wall code: %s", coded.Code)
+		}
+	})
 }

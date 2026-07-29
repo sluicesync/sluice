@@ -31,6 +31,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -40,6 +42,36 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
+
+// indexAxisError tags an error as having come from the INDEX-BUILD axis of
+// the overlapped phase rather than the copy axis, so
+// [runOverlappedCopyAndIndexPhase] can attribute the failure to the phase
+// that actually produced it instead of guessing.
+//
+// The guess used to be "bulk-copy, conservatively", and it cost operators
+// the single most valuable sentence sluice can say at that moment. A
+// PlanetScale index build walled at errno 3024 after a 122 GB copy had
+// ALREADY completed surfaced as a bare
+// `mysql: create indexes on "events": Error 3024 … maximum statement
+// execution time exceeded` — no `pipeline:` prefix, no `hint:` line, no
+// SLUICE-E- code — because the errno-3024 hint is registered under
+// [migcore.PhaseIndexes] and this call site handed the error to
+// [migcore.PhaseBulkCopy], whose entries ("does not exist" / "doesn't
+// exist" / "pipeline: copy table") the walled text matches none of. The
+// registry was right the whole time; the wiring was not. The remedy the
+// operator never saw is that the data is already copied and `--resume`
+// finishes just the indexes with NO re-copy — so the natural reaction to a
+// bare timeout, starting over, re-copies 122 GB for nothing.
+//
+// The tag is applied inside the index goroutine and read after
+// [errgroup.Group.Wait], which returns the FIRST error handed to it: a copy
+// failure that merely CANCELS the index axis therefore still reports as
+// bulk-copy (the index axis's ctx.Err() arrives second and loses), which is
+// the correct attribution.
+type indexAxisError struct{ err error }
+
+func (e indexAxisError) Error() string { return e.err.Error() }
+func (e indexAxisError) Unwrap() error { return e.err }
 
 // onTableCopiedObserver is a TEST-ONLY observability seam (ADR-0077): when
 // non-nil it fires with each table's name at the moment its copy completes,
@@ -146,15 +178,31 @@ func runOverlappedCopyAndIndexPhase(
 	// completedTables closes and every queued build finishes, or the first
 	// build error (which cancels the copy pool via gctx).
 	g.Go(func() error {
-		return indexBuilder.BuildTableIndexesFromChannel(gctx, schema, completedTables)
+		if err := indexBuilder.BuildTableIndexesFromChannel(gctx, schema, completedTables); err != nil {
+			return indexAxisError{err: err}
+		}
+		return nil
 	})
 
 	if err := g.Wait(); err != nil {
-		// Attribute the failure to whichever phase is in flight. Both axes
-		// share the bulk-copy/index window; the bulk-copy phase mark is the
-		// in-flight one (index builds piggyback on it), so wrap as indexes
-		// only if the error came from the build side is hard to tell here —
-		// use the bulk-copy hint, the conservative attribution, and persist.
+		// Attribute the failure to the axis that produced it, not to
+		// whichever phase mark happens to be in flight. See indexAxisError
+		// for what the old "bulk-copy, conservatively" guess cost.
+		var axis indexAxisError
+		if errors.As(err, &axis) {
+			// Same prefix the sequential index phase uses, so the registry's
+			// PhaseIndexes entries and the operator's grep both see the shape
+			// they see on every other index-phase path.
+			//
+			// The persisted phase moves to indexes with it. Resume is
+			// unaffected: every resume decision reads per-table
+			// state.TableProgress, and state.Phase is only ever compared
+			// against MigrationPhaseComplete (see loadOrInitState) — so this
+			// names what failed without changing what a --resume re-copies.
+			wrapped := fmt.Errorf("pipeline: create indexes: %w", axis.err)
+			return migcore.WrapWithHint(migcore.PhaseIndexes,
+				markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseIndexes, wrapped))
+		}
 		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
 	}
 	return nil
