@@ -11,10 +11,14 @@ package pipeline
 //     reads any existing state file and refuses to start if a recent
 //     `last_rollover_at` ({"<", "now - 2 × rollover-window"}) is
 //     paired with a (pid, host) that doesn't match the current
-//     process. Operator overrides via [BackupStream.Force].
+//     process — unless the file records a handoff, see below.
+//     Operator overrides via [BackupStream.Force].
 //   - Cross-machine stop signaling. `sluice backup stream stop` writes
 //     `stop_requested_at` to the file; the running stream polls
 //     between rollovers and exits cleanly when the field is set.
+//   - Handoff. On a clean exit the stream stamps `stopped_at`, so the
+//     next stream against the destination takes over immediately
+//     instead of waiting out the staleness window ([priorHandedOff]).
 //
 // The state file is informational-only; the chain itself is the source
 // of truth for restore + verify. Losing the state file (operator
@@ -64,6 +68,16 @@ type streamState struct {
 	// the stream to exit cleanly. `sluice backup stream stop` writes
 	// this; the running stream polls between rollovers and exits.
 	StopRequestedAt *time.Time `json:"stop_requested_at,omitempty"`
+
+	// StoppedAt, when non-nil, records that the owner named by
+	// (PID, Host) finished its last rollover and RETURNED — the
+	// positive "this destination is free" signal. Written by
+	// [BackupStream.recordCleanExit] on every clean [BackupStream.Run]
+	// return (stop-requested, ctx-cancel drain, source exhaustion,
+	// rollover budget reached). Without it a completed handoff is
+	// indistinguishable from a crashed owner and the next stream has
+	// to wait out the staleness window — see [priorHandedOff].
+	StoppedAt *time.Time `json:"stopped_at,omitempty"`
 }
 
 // readStreamState loads the state file at path from store. Returns
@@ -179,6 +193,9 @@ func readStreamStopRequested(ctx context.Context, store irbackup.Store, path str
 //   - State file exists, (pid, host) matches → previous run on this
 //     host crashed without cleanup; we own this destination, take
 //     over.
+//   - State file exists, (pid, host) differs, but the file records a
+//     HANDOFF ([priorHandedOff]) → the prior owner is gone by its own
+//     account; take over immediately at INFO, no staleness wait.
 //   - State file exists, (pid, host) differs, last_rollover_at is
 //     stale (`< now - 2*window`) → previous run on a different host
 //     is no longer ticking; we take over with a WARN.
@@ -209,10 +226,6 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 		if !stale {
 			conflict = "fresh prior state from another writer"
 		}
-		// Use slog from the package's existing import surface; since
-		// this function lives in stream_state.go and slog isn't
-		// imported here, switch to fmt.Errorf for the WARN content
-		// and let the caller log. Simpler: emit via a local helper.
 		warnConcurrentWriterOverride(ctx, prior, conflict)
 		return nil
 	}
@@ -222,6 +235,14 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 		// as legitimate restart; the state file gets re-written.
 		return nil
 	}
+	if handoff, evidence := priorHandedOff(prior); handoff {
+		// The prior owner recorded that it is gone. Not a competitor —
+		// take over now, and at INFO: a supervisor/k8s restart loop is
+		// the DOCUMENTED shape here (ADR-0087), so it must not be
+		// dressed up as an anomaly.
+		logConcurrentWriterHandoff(ctx, prior, evidence)
+		return nil
+	}
 	if stale {
 		// Different writer, but its rollover cadence has stalled past
 		// the freshness window. The previous stream crashed without
@@ -229,17 +250,105 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 		warnConcurrentWriterTakeover(ctx, prior)
 		return nil
 	}
-	// Different writer, fresh state — refuse loudly.
+	// Different writer, fresh state — refuse loudly. The remedy must
+	// name an action the operator has NOT already taken: when a stop is
+	// already recorded (and the owner has rolled over since, so this is
+	// a still-draining stream rather than a handoff), telling them to
+	// run `backup stream stop` again is a no-op instruction against a
+	// signal that is already in the file we just read.
+	remedy := "to take over, stop it via `sluice backup stream stop` or pass --force"
+	if prior.StopRequestedAt != nil {
+		remedy = fmt.Sprintf(
+			"a stop was already requested at %s and the stream has committed a rollover since, so it is still draining; wait for it to exit (it exits on its next rollover-tick) or pass --force",
+			prior.StopRequestedAt.UTC().Format(time.RFC3339),
+		)
+	}
 	return fmt.Errorf(
-		"stream: a stream is already running against this destination (pid=%d host=%q last_rollover_at=%s); to take over, stop it via `sluice backup stream stop` or pass --force",
-		prior.PID, prior.Host, prior.LastRolloverAt.UTC().Format(time.RFC3339),
+		"stream: a stream is already running against this destination (pid=%d host=%q last_rollover_at=%s); %s",
+		prior.PID, prior.Host, prior.LastRolloverAt.UTC().Format(time.RFC3339), remedy,
 	)
 }
 
-// warnConcurrentWriterOverride and warnConcurrentWriterTakeover live as
-// thin wrappers around slog in stream.go; declared here as forward
-// declarations to keep stream_state.go's import set lean (no slog
-// import in this file). Implementation lives in stream_logging.go.
+// priorHandedOff reports whether prior records a HANDOFF — the owner
+// declaring itself gone — rather than a live competitor, and returns
+// the evidence for the log line. Two shapes qualify:
+//
+//   - StoppedAt set. The owner's [BackupStream.recordCleanExit] ran, so
+//     it committed its last rollover and returned. Unambiguous.
+//   - StopRequestedAt strictly after LastRolloverAt. The operator ran
+//     `sluice backup stream stop` and the owner has not written a
+//     heartbeat since. Covers the crashed-mid-drain owner and state
+//     files written by a sluice that predates StoppedAt.
+//
+// **The residual, named: the drain window.** The second shape also
+// holds for the seconds between `stop` being written and the owner
+// actually exiting — `backup stream stop` writes the signal and
+// returns without waiting. Taking over there overlaps two writers.
+// It is accepted deliberately, and it is narrow: the operator has
+// explicitly declared this owner unwanted, the owner eager-exits on
+// its next stop-poll tick, and the alternative — the pre-fix
+// behaviour — is a hard rc=1 on the documented supervisor-restart
+// path with a remedy that cannot help. The unambiguous StoppedAt
+// shape is what a current-version clean stop actually produces; the
+// second shape is the compatibility/crash fallback.
+//
+// The crashed-mid-rollover owner needs no special handling here: a
+// takeover runs [recoverRotationState] and re-resolves the open
+// segment during setup regardless of WHICH branch admitted it, so this
+// function only changes WHEN we take over, never WHAT we do next.
+func priorHandedOff(prior *streamState) (handoff bool, evidence string) {
+	if prior.StoppedAt != nil {
+		return true, "prior stream recorded a clean exit"
+	}
+	if prior.StopRequestedAt != nil && prior.StopRequestedAt.After(prior.LastRolloverAt) {
+		return true, "prior stream was asked to stop and wrote no rollover after the request"
+	}
+	return false, ""
+}
+
+// recordCleanExit stamps `stopped_at` on the state file so the NEXT
+// `backup stream` against this destination can tell a completed
+// handoff from a crashed owner (see [priorHandedOff]). Called from
+// [BackupStream.Run]'s deferred clean-exit hook; best-effort, because
+// the chain — not this file — is the source of truth, and a failure to
+// stamp only costs the next stream a staleness wait.
+//
+// Two details are load-bearing:
+//
+//   - The write runs on a cancel-immune, [stopDrainTimeout]-bounded
+//     context: the common clean exit is a SIGTERM drain, so the
+//     caller's ctx is already cancelled by the time we get here.
+//   - It refuses to write when the file no longer names (pid, host).
+//     A --force takeover (or a handoff takeover racing our drain)
+//     means someone else owns this destination now, and stamping our
+//     exit over THEIR liveness record would hand the destination away
+//     while they are actively writing it.
+func (b *BackupStream) recordCleanExit(ctx context.Context, path string, pid int, host string, now func() time.Time) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
+	defer cancel()
+	prior, err := readStreamState(writeCtx, b.Store, path)
+	if err != nil {
+		warnCleanExitNotRecorded(writeCtx, path, err.Error())
+		return
+	}
+	if prior == nil {
+		warnCleanExitNotRecorded(writeCtx, path, "state file is gone")
+		return
+	}
+	if prior.PID != pid || prior.Host != host {
+		warnCleanExitNotRecorded(writeCtx, path, "destination was taken over by another writer while we drained")
+		return
+	}
+	t := now().UTC()
+	prior.StoppedAt = &t
+	if err := writeStreamState(writeCtx, b.Store, path, prior); err != nil {
+		warnCleanExitNotRecorded(writeCtx, path, err.Error())
+	}
+}
+
+// warnConcurrentWriterOverride / warnConcurrentWriterTakeover /
+// logConcurrentWriterHandoff / warnCleanExitNotRecorded are thin slog
+// wrappers implemented in stream_logging.go.
 
 // RequestStreamStop sets `stop_requested_at` on the state file at
 // store's [DefaultStreamStateFilename] path so the running stream

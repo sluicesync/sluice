@@ -344,7 +344,7 @@ type BackupStream struct {
 // defer and drives the rollover loop, delegating each committed / empty
 // rollover to commitRollover / handleEmptyRollover and keeping the
 // transient-retry and in-process rotation-FSM logic inline.
-func (b *BackupStream) Run(ctx context.Context) error {
+func (b *BackupStream) Run(ctx context.Context) (err error) {
 	// Managed-host advisories (items 69a/70a). cdc=true — the stream
 	// lives on the source's change log; a lying retention window (the
 	// DigitalOcean binlog purger) is exactly what kills it.
@@ -354,6 +354,19 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	if err != nil {
 		return cleanExitOnCallerCancel(ctx, err)
 	}
+	// Record the handoff on EVERY clean return — stop-requested,
+	// ctx-cancel drain, source exhaustion, rollover budget — so a
+	// supervisor restart doesn't have to wait out the staleness window
+	// (see [priorHandedOff]). Registered FIRST of Run's defers so it
+	// runs LAST: the stamp is the final word on this destination,
+	// written after the pump is closed and the stop channel
+	// deregistered. An error return leaves the file untouched — a
+	// stream that died loudly did not hand anything off.
+	defer func() {
+		if err == nil {
+			b.recordCleanExit(ctx, init.statePath, init.state.PID, init.state.Host, init.now)
+		}
+	}()
 	// The pump is returned OPEN and the stop channel already registered, so
 	// arm both teardowns BEFORE the signed-chain probe: its refusal (and its
 	// cancel arm below) exits Run, and leaving the defers below it leaked a

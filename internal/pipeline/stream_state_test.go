@@ -22,12 +22,14 @@ func TestStreamState_RoundTrip(t *testing.T) {
 
 	then := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	stop := then.Add(5 * time.Minute)
+	stopped := then.Add(6 * time.Minute)
 	want := &streamState{
 		PID:             1234,
 		Host:            "alpha.example.com",
 		StartedAt:       then,
 		LastRolloverAt:  then.Add(time.Minute),
 		StopRequestedAt: &stop,
+		StoppedAt:       &stopped,
 	}
 	if err := writeStreamState(context.Background(), store, "manifests/stream_state.json", want); err != nil {
 		t.Fatalf("writeStreamState: %v", err)
@@ -50,6 +52,9 @@ func TestStreamState_RoundTrip(t *testing.T) {
 	}
 	if got.StopRequestedAt == nil || !got.StopRequestedAt.Equal(stop) {
 		t.Errorf("stop_requested_at = %v; want %v", got.StopRequestedAt, stop)
+	}
+	if got.StoppedAt == nil || !got.StoppedAt.Equal(stopped) {
+		t.Errorf("stopped_at = %v; want %v", got.StoppedAt, stopped)
 	}
 }
 
@@ -121,6 +126,186 @@ func TestPreflightStreamState_FreshConflict_Refuses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--force") {
 		t.Errorf("err = %v; want '--force' override hint", err)
+	}
+}
+
+// handoffPreflightNow is the pinned clock the handoff-takeover tests
+// share. The rollover window they pass is a minute, so the freshness
+// threshold sits two minutes back and every state file below is
+// unambiguously FRESH — the point of the group is that a handoff is
+// honoured despite freshness, not because of staleness.
+var handoffPreflightNow = time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+
+// TestPreflightStreamState_StopHandoff_TakesOverImmediately pins the
+// clean-handoff takeover: a fresh state file whose stop_requested_at is
+// LATER than its last_rollover_at is the exact residue `sluice backup
+// stream stop` leaves behind when the running stream commits its final
+// rollover and exits (the eager-exit path returns before the next
+// heartbeat, so no rollover is recorded after the request). Pre-fix the
+// restart was refused for a full staleness window and told the operator
+// to run the stop command they had just run.
+func TestPreflightStreamState_StopHandoff_TakesOverImmediately(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	stop := now.Add(-9 * time.Second)
+	handed := &streamState{
+		PID: 2328, Host: "other.example.com",
+		StartedAt:       now.Add(-30 * time.Second),
+		LastRolloverAt:  now.Add(-10 * time.Second), // fresh
+		StopRequestedAt: &stop,                      // …but a stop landed after it
+	}
+	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", handed)
+	b := &BackupStream{Store: store}
+	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
+	if err != nil {
+		t.Errorf("preflight after a recorded stop err = %v; want immediate takeover", err)
+	}
+}
+
+// TestPreflightStreamState_StoppedAtHandoff_TakesOverImmediately covers
+// the OTHER clean-exit shape, which the stop_requested_at rule alone
+// does NOT catch: when the stream observes the stop via the heartbeat
+// merge (writeStreamStateMergeHeartbeat), it advances last_rollover_at
+// PAST stop_requested_at and only then exits. Only the positive
+// stopped_at stamp distinguishes that from a stream still draining.
+func TestPreflightStreamState_StoppedAtHandoff_TakesOverImmediately(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	stop := now.Add(-12 * time.Second)
+	stopped := now.Add(-8 * time.Second)
+	handed := &streamState{
+		PID: 2328, Host: "other.example.com",
+		StartedAt:       now.Add(-30 * time.Second),
+		LastRolloverAt:  now.Add(-10 * time.Second), // heartbeat AFTER the stop
+		StopRequestedAt: &stop,
+		StoppedAt:       &stopped,
+	}
+	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", handed)
+	b := &BackupStream{Store: store}
+	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
+	if err != nil {
+		t.Errorf("preflight after a recorded clean exit err = %v; want immediate takeover", err)
+	}
+}
+
+// TestPreflightStreamState_NoHandoffRecord_StillWaitsOutStaleness is the
+// other direction of the gate: the SAME fresh state file, minus any
+// handoff evidence, must still be refused. Without this the handoff
+// branch would be indistinguishable from deleting the guard.
+func TestPreflightStreamState_NoHandoffRecord_StillWaitsOutStaleness(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	running := &streamState{
+		PID: 2328, Host: "other.example.com",
+		StartedAt:      now.Add(-30 * time.Second),
+		LastRolloverAt: now.Add(-10 * time.Second), // fresh, no stop, no exit
+	}
+	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", running)
+	b := &BackupStream{Store: store}
+	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
+	if err == nil {
+		t.Fatal("err = nil; want refusal — no handoff was recorded")
+	}
+	if !strings.Contains(err.Error(), "stream is already running") {
+		t.Errorf("err = %v; want the concurrent-writer refusal", err)
+	}
+	// And the same file, aged past the staleness window, DOES take over
+	// — proving the refusal above is the freshness guard doing its job,
+	// not an unconditional failure.
+	if err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now.Add(3*time.Minute)); err != nil {
+		t.Errorf("preflight past the staleness window err = %v; want takeover", err)
+	}
+}
+
+// TestPreflightStreamState_StopRequestedButRolledOverSince_RefusesWithAHonestRemedy
+// pins the refusal TEXT for the still-draining stream: a stop is on
+// file but the owner has committed a rollover since, so it is alive and
+// this is a genuine conflict. The remedy must not tell the operator to
+// run `backup stream stop` — they already did, and against an
+// already-signalled stream that command is a no-op.
+func TestPreflightStreamState_StopRequestedButRolledOverSince_RefusesWithAHonestRemedy(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	stop := now.Add(-20 * time.Second)
+	draining := &streamState{
+		PID: 2328, Host: "other.example.com",
+		StartedAt:       now.Add(-30 * time.Second),
+		LastRolloverAt:  now.Add(-10 * time.Second), // heartbeat AFTER the stop
+		StopRequestedAt: &stop,
+	}
+	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", draining)
+	b := &BackupStream{Store: store}
+	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
+	if err == nil {
+		t.Fatal("err = nil; want refusal — the prior stream is still draining")
+	}
+	if strings.Contains(err.Error(), "stop it via") {
+		t.Errorf("err = %v; must not advise `backup stream stop` — it is already recorded in the state file", err)
+	}
+	if !strings.Contains(err.Error(), "already requested") {
+		t.Errorf("err = %v; want the message to name the stop already on file", err)
+	}
+	if !strings.Contains(err.Error(), "--force") {
+		t.Errorf("err = %v; want the --force override to stay reachable", err)
+	}
+}
+
+// TestBackupStream_RecordCleanExit_StampsStoppedAt verifies the stamp
+// lands on the file the exiting stream owns.
+func TestBackupStream_RecordCleanExit_StampsStoppedAt(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	mine := &streamState{
+		PID: 42, Host: "mine.example.com",
+		StartedAt:      now.Add(-time.Minute),
+		LastRolloverAt: now.Add(-time.Second),
+	}
+	_ = writeStreamState(context.Background(), store, DefaultStreamStateFilename, mine)
+
+	b := &BackupStream{Store: store}
+	b.recordCleanExit(context.Background(), DefaultStreamStateFilename, 42, "mine.example.com", func() time.Time { return now })
+
+	got, err := readStreamState(context.Background(), store, DefaultStreamStateFilename)
+	if err != nil {
+		t.Fatalf("readStreamState: %v", err)
+	}
+	if got.StoppedAt == nil || !got.StoppedAt.Equal(now) {
+		t.Fatalf("stopped_at = %v; want %v", got.StoppedAt, now)
+	}
+	if got.LastRolloverAt.IsZero() || got.PID != 42 {
+		t.Errorf("stamp clobbered the liveness fields: %+v", got)
+	}
+}
+
+// TestBackupStream_RecordCleanExit_RefusesToClobberANewOwner pins the
+// ownership guard. If a --force (or handoff) takeover happened while we
+// were draining, the state file names the NEW owner — stamping our exit
+// there would declare their live destination free.
+func TestBackupStream_RecordCleanExit_RefusesToClobberANewOwner(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	now := handoffPreflightNow
+	newOwner := &streamState{
+		PID: 77, Host: "new.example.com",
+		StartedAt:      now,
+		LastRolloverAt: now,
+	}
+	_ = writeStreamState(context.Background(), store, DefaultStreamStateFilename, newOwner)
+
+	b := &BackupStream{Store: store}
+	b.recordCleanExit(context.Background(), DefaultStreamStateFilename, 42, "mine.example.com", func() time.Time { return now })
+
+	got, _ := readStreamState(context.Background(), store, DefaultStreamStateFilename)
+	if got.StoppedAt != nil {
+		t.Errorf("stopped_at = %v; want nil — the file belongs to another writer now", *got.StoppedAt)
+	}
+	if got.PID != 77 {
+		t.Errorf("pid = %d; want 77 (the new owner's record must survive)", got.PID)
 	}
 }
 
