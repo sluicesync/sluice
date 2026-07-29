@@ -75,10 +75,26 @@ func mutateHexDigit(h string) string {
 	return "a" + h[1:]
 }
 
+// idTamper names which manifest (if any) gets a recorded BackupID that
+// does not match its content — the Bug 218 shape. Kept as an explicit
+// knob rather than a bool pair so a cell reads as what it tampers.
+type idTamper int
+
+const (
+	tamperNothing idTamper = iota
+	tamperFullID
+	tamperIncrementalID
+)
+
 // writeFingerprintChain writes a full plus (optionally) one incremental,
 // with each manifest's recorded SchemaHash supplied by the caller so a
-// test can record an honest hash or a mutated one. Returns the store.
-func writeFingerprintChain(t *testing.T, fullHash, incrHash string, withIncremental bool) irbackup.Store {
+// test can record an honest hash or a mutated one, and an optional
+// BackupID tamper. Returns the store.
+func writeFingerprintChain(t *testing.T, fullHash, incrHash string, withIncremental bool, tamper ...idTamper) irbackup.Store {
+	what := tamperNothing
+	if len(tamper) > 0 {
+		what = tamper[0]
+	}
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -98,6 +114,12 @@ func writeFingerprintChain(t *testing.T, fullHash, incrHash string, withIncremen
 		Tables:        []*irbackup.TableManifest{{Name: "orders", RowCount: 0}},
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
+	if what == tamperFullID {
+		// The lazy-edit shape: a covered field changed (or the id
+		// mistyped) without recomputing. Restore refuses it on every
+		// shape including this one.
+		full.BackupID = mutateHexDigit(full.BackupID)
+	}
 	if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
@@ -118,6 +140,9 @@ func writeFingerprintChain(t *testing.T, fullHash, incrHash string, withIncremen
 		SchemaHash:     incrHash,
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
+	if what == tamperIncrementalID {
+		incr.BackupID = mutateHexDigit(incr.BackupID)
+	}
 	path := lineage.IncrementalManifestPrefix + "incr-0001.json"
 	if err := lineage.WriteManifestAt(ctx, store, path, incr); err != nil {
 		t.Fatalf("write incremental: %v", err)
@@ -157,6 +182,50 @@ func TestVerifyBackup_SchemaFingerprintMismatch_RefusedLikeRestore(t *testing.T)
 			}
 		})
 	}
+}
+
+// TestVerifyBackup_BackupIDMismatch_RefusedLikeRestore is Bug 218: the
+// SECOND preflight verify was missing, and the reason it was still
+// missing after Bug 217 is the interesting part.
+//
+// v0.104.5 shared the PREDICATE that decides which lineage shapes get
+// checked, and left the LIST of checks duplicated between verify and
+// restore. So the class stayed open one preflight over: a manifest whose
+// recorded BackupID no longer matched its content was refused by restore
+// with rc=3 and zero rows, and verified `all chunks OK` rc=0.
+//
+// Note the shape coverage, which is the opposite of the fingerprint
+// half's: the BackupID check runs on a BARE FULL too, because restore
+// runs it there (`verifySingleFullBackupID`). Verify is now neither
+// stricter nor laxer than restore on either shape — which is only
+// checkable because both come from one list.
+func TestVerifyBackup_BackupIDMismatch_RefusedLikeRestore(t *testing.T) {
+	ctx := context.Background()
+	honest := mustSchemaHash(t)
+
+	assertRefused := func(t *testing.T, store irbackup.Store, what string) {
+		t.Helper()
+		_, err := VerifyBackupCodedReport(ctx, store, VerifyOptions{})
+		if err == nil {
+			t.Fatalf("%s: verify returned clean over a manifest whose recorded BackupID does not match its content — restore refuses this with rc=3 and 0 rows (Bug 218)", what)
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeBackupManifestInvalid {
+			t.Fatalf("%s: want %s, got %v", what, sluicecode.CodeBackupManifestInvalid, err)
+		}
+	}
+
+	t.Run("chain: an incremental's recorded id", func(t *testing.T) {
+		assertRefused(t, writeFingerprintChain(t, honest, honest, true, tamperIncrementalID), "chain link")
+	})
+
+	// The shape the fingerprint half deliberately exempts. Restore checks
+	// the id here, so verify must too — a bare full is exempt from the
+	// FINGERPRINT check, not from every check, and conflating the two
+	// would have left this hole open in the name of the earlier fix.
+	t.Run("bare full: the lone manifest's recorded id", func(t *testing.T) {
+		assertRefused(t, writeFingerprintChain(t, honest, "", false, tamperFullID), "bare full")
+	})
 }
 
 // TestVerifyBackup_BareFullFingerprintMismatch_StaysGreen is the

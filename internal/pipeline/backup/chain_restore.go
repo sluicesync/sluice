@@ -279,18 +279,14 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
-	// 2.7. Schema-fingerprint corruption check across every link
-	// (ADR-0152 — the check [irbackup.Manifest.SchemaHash] documents),
-	// before anything lands on the target.
-	if err := verifySchemaHashes(ctx, links); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, err)
-	}
-
-	// 2.7b. BackupID recompute check (audit item 57): the schema-hash twin
-	// for the four ComputeBackupID-covered fields (created_at/source_engine/
-	// kind/EndPosition). Catches bit-rot / a truncated rewrite / a lazy edit
-	// of one of those that forgot to recompute the id, before anything lands.
-	if err := verifyBackupIDs(links); err != nil {
+	// 2.7 + 2.7b. The manifest-integrity preflights, before anything lands
+	// on the target: the schema-fingerprint check across every link
+	// (ADR-0152 — what [irbackup.Manifest.SchemaHash] documents) and the
+	// BackupID recompute (audit item 57), in that order. Both live in
+	// [restoreManifestIntegrityPreflights] so `backup verify` runs the
+	// same LIST rather than a copy of it — see that function's comment for
+	// why the list, not just the checks, is the thing worth sharing.
+	if err := restoreManifestIntegrityPreflights(ctx, links, true); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
@@ -758,6 +754,41 @@ func schemaFingerprintCauses(m *irbackup.Manifest) string {
 // release's field set is not built (roadmap item 102 — deliberately
 // demand-gated).
 const schemaFingerprintRemedy = "restore this chain with a sluice release that shares the schema fingerprint of the release that wrote it (the manifest records that version), or re-take the backup with this binary; if the writing release IS this binary the mismatch is corruption — restore from an untampered copy, and sign chains (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time. Background: docs/operator/error-codes.md, SLUICE-E-BACKUP-MANIFEST-INVALID"
+
+// restoreManifestIntegrityPreflights runs, in restore's own order, the
+// manifest-integrity checks the RESTORE path runs for a lineage of this
+// shape. It is the single definition of that LIST, and the list is the
+// point (Bug 218).
+//
+// v0.104.5 gave `backup verify` the schema-fingerprint check restore ran
+// and shared the PREDICATE that decides which shapes get it — but left
+// the list of preflights duplicated between the two commands, so the
+// class stayed open while one instance closed: `verifyBackupIDs` was
+// still restore-only, and verify kept returning rc=0 over a chain whose
+// recorded BackupID no longer matched its content while restore refused
+// it with rc=3 and zero rows. That is the same defect one preflight over,
+// which is what a shared list prevents and a shared predicate does not.
+// A future preflight added here reaches both commands or neither.
+//
+// needsWalk mirrors restore's own dispatch (see [verifyLineageNeedsWalk]):
+// the schema fingerprint is a CHAIN-path check — the single-manifest path
+// never walks links and never fingerprints them, which is why a bare full
+// legitimately crosses a fingerprint epoch. The BackupID check runs on
+// BOTH shapes, because restore runs it on both (`verifySingleFullBackupID`
+// is this function at needsWalk=false over the lone full).
+//
+// Encryption preflight is deliberately NOT here. It needs key material
+// verify may not have been given, and verify has its own key-vs-chain
+// handling with a different contract; folding it in would make verify
+// refuse chains restore accepts whenever a key is absent.
+func restoreManifestIntegrityPreflights(ctx context.Context, links []lineage.SegmentRecord, needsWalk bool) error {
+	if needsWalk {
+		if err := verifySchemaHashes(ctx, links); err != nil {
+			return err
+		}
+	}
+	return verifyBackupIDs(links)
+}
 
 // verifySchemaHashes recomputes every link's schema fingerprint and
 // compares it against the manifest-recorded [irbackup.Manifest.SchemaHash]

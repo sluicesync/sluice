@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.104.6] - 2026-07-29
+
+### Fixed
+
+**`backup verify` was still green over chains `restore` refuses — one preflight further along.** v0.104.5 gave verify the schema-fingerprint check restore runs, and shared the rule deciding which backup shapes get it. It did not share the *list* of checks, so a second one stayed restore-only: the recomputed `BackupID`, which catches a manifest whose `created_at` / `source_engine` / `kind` / end-position was edited without recomputing its id. Such a manifest verified `all chunks OK` with exit 0 while restore refused it with exit 3 and zero rows — the same disagreement the previous release existed to close, one check over. **This reaches a bare full as well as a chain**, which is the mirror image of the fingerprint check's scope: a bare full is exempt from the *fingerprint* check because restore does not run that one there, but restore does check its id. Both checks now come from a single function shared by restore's two paths and verify, so a preflight added in future reaches both commands or neither. Pre-existing back to v0.103.2, found by the v0.104.5 regression cycle testing the previous release's own claim that the fingerprint was "the only restore preflight it skipped" — a claim about a list, checked by enumerating the list. That sentence has been corrected in place on the v0.104.5 release notes.
+
 ## [0.104.5] - 2026-07-29
 
 ### Fixed

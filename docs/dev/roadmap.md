@@ -1857,7 +1857,20 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
-### 106. `backup verify` was green over chains `restore` refuses — the fingerprint preflight it never made (Bug 217) — *FIXED, ships in v0.104.5*
+### 107. The preflight LIST was duplicated, so closing one instance left the class open — `verifyBackupIDs` was still restore-only (Bug 218) — *FIXED, ships in v0.104.6*
+
+**What.** Item 106 gave `backup verify` the schema-fingerprint check and shared the *predicate* deciding which lineage shapes get it. It left the *list* of preflights duplicated between the two commands — so a manifest whose recorded `BackupID` no longer matched its content still verified `all chunks OK` rc=0 while restore refused it with rc=3 and zero rows. Pre-existing back to v0.103.2 on all seven staged binaries; found by the v0.104.5 regression cycle, which did the thing a claim about a list invites: it enumerated the list.
+
+**How it was found is the point.** v0.104.5's notes said the fingerprint was *"the only restore preflight it skipped"*. That sentence is a claim about a set, and the cycle checked it against the code rather than against the fix's shape: chain restore runs `preflightEncryption` + `verifySchemaHashes` + `verifyBackupIDs`, and the single-manifest path runs `verifySingleFullBackupID`. Verify had gained the second and not the third. The published claim has been corrected in place on the v0.104.5 notes and the live release body.
+
+**Shape coverage runs the OPPOSITE way to item 106's**, which is why conflating them would have been a mistake: the BackupID check reaches a **bare full** as well as chain links, because restore checks it there (`verifySingleFullBackupID`). A bare full is exempt from the *fingerprint* check, not from every check.
+
+**Fix — the class, not the instance.** `restoreManifestIntegrityPreflights(ctx, links, needsWalk)` is now the single definition of the list: fingerprint on the chain path, BackupID on both shapes. Three call sites use it — chain restore's step 2.7, `Restore.verifySingleFullBackupID` (needsWalk=false over the lone full), and `verifyBackupScan`. A preflight added there now reaches both commands or neither. Encryption preflight is deliberately excluded: it needs key material verify may not have, and folding it in would make verify refuse chains restore accepts whenever a key is absent.
+
+**Pins, mutation-verified.** A tampered recorded id on a chain incremental and on a bare full each refuse under the restore code; stubbing `verifyBackupIDs` fails both deterministically. The existing bare-full-fingerprint-stays-green pin still passes, which is what proves the two shape rules did not get merged.
+
+
+### 106. `backup verify` was green over chains `restore` refuses — the fingerprint preflight it never made (Bug 217) — *FIXED, ships in v0.104.5 — but see item 107: the fix shared the predicate and not the LIST, leaving a second preflight behind*
 
 **What.** `sluice backup verify` returned rc=0 `all chunks OK` over a chain `restore` refuses with rc=3 and zero rows. Found by the v0.104.4 regression cycle, which asked the question v0.104.3's own headline had turned into a house rule: does verify AGREE with restore? Pre-existing back to **v0.103.2** — every released binary has it.
 

@@ -494,7 +494,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// positions — re-verifying the signature here would use the wrong
 	// sequence for a later segment's full.
 	if !r.SkipChainDispatch {
-		if err := r.verifySingleFullBackupID(manifest); err != nil {
+		if err := r.verifySingleFullBackupID(ctx, manifest); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseConnect, err)
 		}
 		if err := verifyManifestSignaturePolicy(ctx, r.Store, lineage.ManifestFileName, manifest, 0, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
@@ -686,9 +686,14 @@ func restoreSummaryResult(tables int, manifest *irbackup.Manifest) progress.Resu
 // [verifyBackupIDs], so a single-full store's tampered covered field
 // restored with rc=0. A legacy full with an EMPTY recorded id still skips
 // (nothing recorded to verify — the verifyBackupIDs contract).
-func (r *Restore) verifySingleFullBackupID(manifest *irbackup.Manifest) error {
+func (r *Restore) verifySingleFullBackupID(ctx context.Context, manifest *irbackup.Manifest) error {
 	links := []lineage.SegmentRecord{{ManifestRecord: lineage.ManifestRecord{Manifest: manifest, Path: lineage.ManifestFileName}}}
-	return verifyBackupIDs(links)
+	// needsWalk=false: this IS the single-manifest shape, so the shared
+	// list runs its BackupID half and skips the chain-only fingerprint
+	// check. Routed through [restoreManifestIntegrityPreflights] rather
+	// than calling verifyBackupIDs directly so a preflight added to that
+	// list reaches this path too (Bug 218 — the list is what drifted).
+	return restoreManifestIntegrityPreflights(ctx, links, false)
 }
 
 // validate sanity-checks required fields.
@@ -1668,8 +1673,10 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
 	}
 
-	// The SECOND restore preflight verify has to make, and the last one it
-	// was missing (Bug 217, found by the v0.104.4 regression cycle).
+	// The manifest-integrity preflights restore runs, run here from the
+	// SAME LIST (Bug 217, then Bug 218 — found by the v0.104.4 and
+	// v0.104.5 regression cycles asking, twice, whether verify agreed
+	// with restore).
 	//
 	// A chain restore recomputes every link's schema fingerprint and
 	// refuses the whole chain on a mismatch. Verify did not, so it
@@ -1680,22 +1687,31 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// it. That is the exact defect class v0.104.3 existed to close, one
 	// preflight over, and it was pre-existing back to v0.103.2.
 	//
+	// The BackupID recompute is the second half, and it is here because
+	// the FIRST fix shared only the predicate (Bug 218). v0.104.5 gave
+	// verify the fingerprint check and the shape-dispatch that decides
+	// which lineages get it, then left the LIST of preflights duplicated
+	// between the two commands — so verify still returned rc=0 over a
+	// manifest whose recorded BackupID no longer matched its content
+	// while restore refused it, on chain links AND on a bare full. Both
+	// checks now come from [restoreManifestIntegrityPreflights], so the
+	// next preflight added there reaches both commands or neither.
+	//
 	// Scoped to what restore ACTUALLY does, for the same reason the
 	// lineage walk above passes a nil comparator: verify must never
-	// refuse a chain restore would accept. Restore runs this check on the
-	// chain path only — a one-segment-no-incrementals lineage takes the
+	// refuse a chain restore would accept. The fingerprint half is a
+	// chain-path check — a one-segment-no-incrementals lineage takes the
 	// single-manifest path, which never walks links and never
 	// fingerprints them, so a BARE FULL legitimately crosses an epoch
 	// boundary and must keep verifying green here (roadmap item 102's
-	// blast-radius note, and a cell the cross-version suite pins).
+	// blast-radius note, and a cell the cross-version suite pins). The
+	// BackupID half runs on both shapes because restore does.
 	needsWalk, lerr := verifyLineageNeedsWalk(ctx, store)
 	if lerr != nil {
 		return verifyScanTally{}, fmt.Errorf("verify: resolve lineage: %w", lerr)
 	}
-	if needsWalk {
-		if serr := verifySchemaHashes(ctx, chain); serr != nil {
-			return verifyScanTally{}, serr
-		}
+	if perr := restoreManifestIntegrityPreflights(ctx, chain, needsWalk); perr != nil {
+		return verifyScanTally{}, perr
 	}
 
 	// The chain's IDENTITY manifest, which is not necessarily
