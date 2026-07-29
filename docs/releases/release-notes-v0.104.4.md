@@ -14,6 +14,7 @@ The more useful half of this release is why nothing caught it. v0.104.3 shipped 
 
 - **Chains written by this release restore on v0.103.0 – v0.104.2**, which was true before v0.104.3 and is true again. The epoch table in `docs/operator/error-codes.md` now lists v0.104.3 as the one-release detour it is, including which of its chains are affected.
 - **The epoch boundaries at v0.100.0 and v0.103.0 are unchanged and still unrepaired.** A chain from an older epoch is still refused, still loudly, still before any data lands. The compatibility shim that would recompute a fingerprint at the writing release's field set remains deliberately unbuilt.
+- **The exclusion is not free, and the cost is worth naming rather than implying away.** The fingerprint no longer detects an edit to that one flag, and signing does not backstop it: a chain signature binds the fingerprint *string*, not the schema bytes. The entire effect of such an edit on a restore is whether a primary key is re-emitted as `CONSTRAINT <name> PRIMARY KEY` or as a bare `PRIMARY KEY` — no data, no row count, no position — and a `SchemaHistory` entry still folds its table JSON verbatim, so that surface is unchanged. One bit of tamper-detection on a name, traded against partitioning every chain in the field by release.
 - **No format-version bump**, no flag changes, no behaviour change to any command's interface.
 
 ### Who needs this
