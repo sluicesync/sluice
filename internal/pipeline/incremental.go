@@ -216,16 +216,10 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// exactly where a lying binlog-retention window bites.
 	migcore.WarnSourceHostAdvisories(ctx, b.Source, b.SourceDSN, true)
 
-	// 0. Resolve the open segment: every incremental lands in the
-	//    lineage's open segment, under its Dir, with its recorded
-	//    codec (ADR-0046). For a never-rotated backup that's the root
-	//    (Dir == "") — byte-identical to the pre-ADR single chain.
-	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
-	if err != nil {
-		return fmt.Errorf("incremental: resolve open segment: %w", err)
+	// 0. Resolve the open segment (and heal a crash-orphaned catalog).
+	if err := b.openSegment(ctx); err != nil {
+		return err
 	}
-	b.segStore = segStore
-	b.segCodec = segCodec
 
 	// 1. Resolve the parent manifest. The parent's EndPosition (or, on
 	//    a parent-is-full first incremental, the parent's recorded
@@ -475,23 +469,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	manifest.PartialState = irbackup.BackupStateComplete
 
 	manifestPath := buildIncrementalManifestPath(manifest)
-	if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
-		return fmt.Errorf("incremental: write manifest: %w", err)
-	}
-	// The window is durable — let the slot release WAL up to its end.
-	// (Effective on the reader's next keepalive; for a one-shot
-	// incremental the release usually lands via the NEXT run's start
-	// ack instead, which is equivalent. The long-lived `backup stream`
-	// path relies on this to bound WAL retention per rollover.)
-	releaseChainAckTo(ctx, cdc, manifest.EndPosition)
-	// ADR-0046: append this incremental to the open segment in
-	// lineage.json (best-effort for the non-rotation path; the
-	// manifest file is authoritative for the one-segment shape). An
-	// ADR-0160 concurrent-writer conflict is the one loud outcome: a
-	// second writer on this chain fails the run (the manifest above is
-	// durable; only the catalog append was refused).
-	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec); err != nil {
-		return fmt.Errorf("incremental: lineage catalog: %w", err)
+	if err := b.commitWindow(ctx, cdc, manifest, manifestPath); err != nil {
+		return err
 	}
 
 	// ADR-0154: sign this incremental's manifest + re-sign the lineage
@@ -517,6 +496,77 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	)
 	sink.PhaseCompleted(incrPhaseFinalize)
 	sink.Summary(incrementalSummaryResult(manifest, totalChanges, signing))
+	return nil
+}
+
+// openSegment resolves the lineage's open segment onto b (every
+// incremental lands there, under its Dir, with its recorded codec —
+// ADR-0046; for a never-rotated backup that is the root, Dir == "", and
+// byte-identical to the pre-ADR single chain), then heals an
+// open-segment catalog a crash/cancel left out of sync with disk.
+//
+// The reconcile is the same one `backup stream`'s resume runs, for the
+// same reason, and it must run BEFORE resolveParent. It is mirrored here
+// because the chain-tip guard compares the resolved parent against the
+// CATALOG's tip: on a chain whose last incremental is durable on disk but
+// missing from lineage.json (its best-effort append never landed),
+// resolveParent walks to the on-disk tail while the catalog still points
+// at the previous link, and the guard would refuse a chain that is merely
+// un-catalogued. Pre-guard that shape silently produced a mis-stitched,
+// un-restorable lineage instead; healing first is what keeps the refusal
+// meaning what it says — a second writer. Best-effort + idempotent: a
+// no-op when the catalog already matches disk, and it refuses to guess on
+// a branch, so it never masks a real fork.
+func (b *IncrementalBackup) openSegment(ctx context.Context) error {
+	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
+	if err != nil {
+		return fmt.Errorf("incremental: resolve open segment: %w", err)
+	}
+	b.segStore = segStore
+	b.segCodec = segCodec
+	if rerr := lineage.ReconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
+		slog.WarnContext(
+			ctx, "incremental: open-segment catalog reconcile failed; continuing "+
+				"(a crash-orphaned incremental may keep restore refusing this segment until repaired)",
+			slog.String("err", rerr.Error()),
+		)
+	}
+	return nil
+}
+
+// commitWindow makes a closed window durable: the chain-tip guard, the
+// manifest write, the chain-ack release, and the lineage append. The
+// ORDER is load-bearing and is the reason this is one function rather
+// than four statements in Run.
+func (b *IncrementalBackup) commitWindow(ctx context.Context, cdc ir.CDCReader, manifest *irbackup.Manifest, manifestPath string) error {
+	// Chain-tip guard (see lineage/chain_tip.go). The parent was resolved
+	// BEFORE the window opened; an overlapping `backup incremental` cron
+	// can have committed in between, and appending beside it would FORK
+	// the lineage into a permanently unrestorable chain while this run
+	// still exited 0. Checked HERE, ahead of the manifest write, so the
+	// loser of the race leaves no manifest behind; UpdateLineageForManifest
+	// re-checks it as the durable gate.
+	if err := lineage.AssertExtendsChainTip(ctx, b.Store, manifest.ParentBackupID); err != nil {
+		return err
+	}
+	if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
+		return fmt.Errorf("incremental: write manifest: %w", err)
+	}
+	// The window is durable — let the slot release WAL up to its end.
+	// (Effective on the reader's next keepalive; for a one-shot
+	// incremental the release usually lands via the NEXT run's start
+	// ack instead, which is equivalent. The long-lived `backup stream`
+	// path relies on this to bound WAL retention per rollover.)
+	releaseChainAckTo(ctx, cdc, manifest.EndPosition)
+	// ADR-0046: append this incremental to the open segment in
+	// lineage.json (best-effort for the non-rotation path; the
+	// manifest file is authoritative for the one-segment shape). A
+	// concurrent-writer conflict is the one loud outcome: a second writer
+	// on this chain fails the run (the manifest above is durable; only
+	// the catalog append was refused).
+	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec); err != nil {
+		return fmt.Errorf("incremental: lineage catalog: %w", err)
+	}
 	return nil
 }
 

@@ -1669,7 +1669,10 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	chain, cerr := lineage.BuildLineageChain(ctx, store, nil)
 	if cerr != nil {
 		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
-			"this chain cannot be restored as it stands — restore from an intact copy; if a prune/compact produced it, the surviving links no longer form one chain",
+			"this chain cannot be restored as it stands — read the underlying error, which names the shape and the repair. "+
+				"A branching lineage is most often a FORK from two concurrent chain writers (overlapping `backup incremental` "+
+				"crons); that repair is lossless. A prune/compact whose survivors no longer form one chain, and a crash between "+
+				"an incremental's manifest write and its lineage.json append, produce the same shape",
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
 	}
 

@@ -236,7 +236,24 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 			}
 			seenInc[id] = ip
 			if im.ParentBackupID != "" && im.ParentBackupID != parentID {
-				return nil, fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — branching/mis-stitched lineage",
+				// Cause + recovery, in that order. The pre-2026-07-29 wording
+				// advised "if a prune/compact produced it, the surviving links
+				// no longer form one chain" — and the shape that actually
+				// produces this in the field is neither: two overlapping
+				// `backup incremental` crons each committing off the same
+				// parent. Sending an operator to audit a maintenance run that
+				// never happened is the v0.104.3 false-accusation class again,
+				// so the concurrent-writer fork is named FIRST and the
+				// (genuinely lossless) repair is named at all.
+				return nil, fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — "+
+					"branching/mis-stitched lineage. Most likely a FORK: two chain writers (overlapping `backup "+
+					"incremental` cron entries, or a `backup incremental` racing a `backup stream`) each committed "+
+					"an incremental off the same parent — pre-v0.104.7 both such runs exited 0. A crash between an "+
+					"incremental's manifest write and its lineage.json append, or a `backup prune`/`backup compact` "+
+					"whose survivors no longer form one chain, produce the same shape. "+
+					"REPAIR (lossless for the fork case — the siblings captured the same window): remove the "+
+					"ORPHANED sibling's entry from lineage.json, keeping whichever sibling the LATER incrementals "+
+					"chain off, re-upload it, and re-run `backup verify` before relying on the chain",
 					si, ip, im.ParentBackupID, parentID)
 			}
 			if ii == 0 {
