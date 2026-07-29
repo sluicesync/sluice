@@ -1857,7 +1857,7 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
-### 104. v0.104.3 added a FOURTH fingerprint epoch — the `omitempty` fix does not hold for the value a real Postgres source produces (Bug 216) — *open, HIGH / DR-availability*
+### 104. v0.104.3 added a FOURTH fingerprint epoch — the `omitempty` fix does not hold for the value a real Postgres source produces (Bug 216) — *FIXED, ships in v0.104.4*
 
 **What.** A backup chain written by v0.104.3 from a Postgres source whose tables have primary keys cannot be restored by v0.104.2 or any earlier release: schema-fingerprint mismatch, rc=3, zero rows. Confirmed against v0.104.2, v0.104.1, v0.104.0 and v0.103.2. This is item 102's class, one release later, in the release that shipped the fix for it.
 
@@ -1870,6 +1870,18 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 **Gate that would actually have caught it.** The cross-version CI cell (`internal/pipeline/backup_crossversion_integration_test.go`) already builds two real binaries against one store. Extend it to write a **named-PK Postgres** chain with the new binary and assert the PREVIOUS release restores it. That is a behavioural check across the boundary rather than a hash compared against itself, and it is the shape that found this — a regression cycle asking the boring question "does the new release's output still read on the old one?"
 
 **Severity note.** It fails in the safe direction — loud refusal in preflight, never a silent partial restore — and with no production users there is no stranded chain in the field. It is HIGH because the published release notes asserted the opposite, and that assertion has been corrected in place rather than rewritten.
+
+**SHIPPED (v0.104.4).** Fix shape (a), scoped down to the one field: `canonicalSchemaForHash` now drops `ir.Index.ConstraintNamed` before marshalling (`fingerprintIndex` in `internal/ir/backup/chain.go`), for a table's `PrimaryKey` and its secondary indexes alike, copying rather than mutating so the schema the manifest records still carries the name a restore re-emits. Scoping it to the field rather than rewriting the whole hash as an explicit projection is what makes it a *repair*: with the field gone the marshalled bytes are E3's exactly, so v0.104.4 chains restore on v0.103.0 – v0.104.2 and the epoch count goes back to three. A general projection would have been a fifth epoch for zero user benefit — the item-102 reasoning, unchanged.
+
+Verified against a **real v0.104.2 build**, not against this one: a worktree at that tag, hashing the golden fixture with the `ConstraintNamed` line dropped (the field does not exist there), prints `07231daa…916868` — the constant now frozen in `schema_hash_golden_test.go`. That provenance is written into the constant's comment, because a golden verified against its own binary is what let this ship.
+
+Three gates, in order of how much they would actually have caught:
+
+1. **Cell 6 of the cross-version suite** — the working tree writes a primary-keyed Postgres chain, the newest release at the SAME `BackupFormatVersion` restores it, and it must PASS. This is the boring question the regression cycle asked, made permanent. Its peer binary is derived (`scripts/crossversion-build.sh`, newest same-format tag minus an orphan-epoch exclusion list that today holds exactly `v0.104.3`), so it advances on its own; equality of format is what keeps a refusal here attributable to the fingerprint rather than the version gate. Its non-vacuity guard asserts the chain it just wrote really carries a constraint-named index — the exact thing the pre-release verification of the `omitempty` fix failed to check.
+2. **`TestComputeSchemaHash_ExcludesIndexConstraintNamed`** — flipping the field on a PK or a secondary index must not move the hash by a bit, plus a pin that hashing does not mutate the caller's schema.
+3. **The frozen golden, made honest** — the constant is now a number an older binary demonstrably produced, and the block comment carries a third answer (exclude the field) alongside `omitempty` and a deliberate format bump, with the warning that `omitempty` is only worth what the zero value's frequency in real sources makes it.
+
+**Not fixed, and deliberately.** A chain v0.104.3 wrote from a primary-keyed Postgres source stays unreadable by everything including v0.104.4 — its manifest records a fingerprint computed *with* the field, and nothing re-derives it. That is item 102's demand-gated shim, unchanged by this. `docs/operator/error-codes.md` now documents E4 as the one-release detour it is, including which v0.104.3 chains are affected (PG source with a PK) and which are ordinary E3 chains (MySQL sources, PG without a PK).
 
 
 ### 103. The MySQL CDC reader has the PG close-vs-pump race, unfixed — *open, HIGH*

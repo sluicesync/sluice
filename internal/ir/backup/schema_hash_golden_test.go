@@ -42,21 +42,38 @@ import (
 // binary always agrees with itself about what Index marshals to.
 //
 // HOW TO RESPOND WHEN THIS TEST FAILS. You almost certainly just added a
-// field to one of the structs above. Two legitimate answers, in order:
+// field to one of the structs above. Three legitimate answers, in order:
 //
 //  1. Tag the new field `json:"<Name>,omitempty"` so its ZERO VALUE
 //     marshals away. Every schema an older binary wrote has the zero
 //     value, so the bytes — and the hash — stay exactly as before, and
 //     only the new shape (which no older binary ever produced) adds a key.
-//     This is the right answer for an additive, opt-in field, and it is
-//     what [ir.Index.ConstraintNamed] does. Re-run this test; it should go
-//     green WITHOUT touching the constant below.
+//     Re-run this test; it should go green WITHOUT touching the constant
+//     below.
+//
+//     BUT CHECK WHO SETS IT, because `omitempty` is only as good as how
+//     often the zero value is what a real source produces. That is what
+//     failed in v0.104.3: [ir.Index.ConstraintNamed] got the tag, and the
+//     Postgres reader sets it TRUE on every constraint-owned index of
+//     every primary-keyed table, so on a real PG chain the key was always
+//     present and the fingerprint moved anyway (Bug 216). If a common
+//     source shape carries the NON-zero value, this answer does not
+//     apply — go to (3).
 //
 //  2. If the field genuinely cannot be omitempty (a non-zero default, a
 //     field whose absence means something different from its zero value),
 //     then invalidating the fingerprint is a DELIBERATE format change:
 //     bump [BackupFormatVersion], write the migration/compat story, and
 //     only then update the constant below.
+//
+//  3. EXCLUDE the field from the fingerprint, in `fingerprintIndex`
+//     (chain.go) or its sibling for whatever struct grew. This is the
+//     right answer when the field is a RE-EMISSION hint rather than part
+//     of what the schema IS, and it is the only answer that can move the
+//     hash BACK: v0.104.4 excludes ConstraintNamed and thereby returns to
+//     the exact bytes v0.103.0 – v0.104.2 hashed. Excluding costs the
+//     tamper-detection of that one field and nothing else; weigh that
+//     against partitioning every chain in the field.
 //
 // DO NOT simply paste the new hash in to make the test green. Changing
 // this constant without doing (2) invalidates EVERY BACKUP CHAIN IN THE
@@ -67,11 +84,36 @@ import (
 // Also DO NOT retrofit `omitempty` onto fields that ALREADY shipped
 // without it: that is the same break in the other direction, invalidating
 // the chains written by the releases that carried them.
-const goldenSchemaHash = "75a03532fd32bac87454e9ad6a53d45f5c9d3d7b14432270811bfaba45458e48"
+//
+// PROVENANCE OF THE CONSTANT, which is the part this gate got wrong the
+// first time. A frozen golden whose fixture carries post-bump fields at
+// their NON-zero values is self-referential by construction: it proves
+// this binary agrees with itself, which was never in doubt, and it is
+// exactly why the v0.104.3 constant was measured green over a schema no
+// older binary could have written. The value below was instead computed
+// by a REAL v0.104.2 build — `git worktree add <dir> v0.104.2`, the
+// fixture below pasted in with the `ConstraintNamed` line dropped (that
+// field does not exist there), `ComputeSchemaHash` printed — and it
+// matches. So this constant is the E3 epoch's own number, not this
+// build's opinion of it. Re-verify that way if it ever legitimately
+// changes, and keep the behavioural gate that actually found Bug 216:
+// cell 6 of internal/pipeline/backup_crossversion_integration_test.go,
+// which writes a chain with THIS binary and restores it with the
+// PREVIOUS release.
+const goldenSchemaHash = "07231daa5cdd1330a32d83668cc229d8302c518af0416579d7294b68da916868"
 
 // goldenSchema is the frozen input to [goldenSchemaHash]. It is FROZEN:
 // changing it changes the hash and defeats the gate. It exists only to be
 // hashed — it is deliberately NOT shared with any other test.
+//
+// Its primary key deliberately carries ConstraintNamed TRUE even though
+// the fingerprint now excludes that field: the golden then also witnesses
+// the exclusion, so deleting it from `fingerprintIndex` fails HERE as well
+// as in TestComputeSchemaHash_ExcludesIndexConstraintNamed. That is safe
+// only BECAUSE the field is excluded — a post-bump field that still rides
+// the hash must be held at its ZERO value here, or the constant stops
+// being a number an older binary could have produced (see the provenance
+// note above).
 //
 // It carries at least one instance of every IR schema object that rides
 // the fingerprint, because a field added to a struct with no instance here
@@ -209,12 +251,82 @@ Bytes actually hashed:
 %s`, goldenSchemaHash, got, canonical)
 }
 
-// TestIndexConstraintNamed_OmitsZeroValue pins the mechanism the golden
-// depends on, at the one field that needed it (roadmap item 84): a false
-// ConstraintNamed must not appear in Index's JSON at all — that is what
-// keeps a v0.100.0-through-v0.104.2 schema hashing to the same value under
-// this binary — while a true one must still ride the wire, or the field is
-// omitempty'd into uselessness.
+// TestComputeSchemaHash_ExcludesIndexConstraintNamed is the direct pin on
+// the Bug 216 fix, and it is the assertion the frozen golden cannot make
+// on its own: flipping [ir.Index.ConstraintNamed] — on a table's PRIMARY
+// KEY or on a secondary index — must not move the fingerprint by so much
+// as a bit.
+//
+// This is what the `omitempty` was supposed to deliver and did not. The
+// tag only hides the FALSE case, and the Postgres reader sets the field
+// true for every constraint-owned index of every primary-keyed table, so
+// "the zero value keeps the bytes stable" was true of a shape real
+// Postgres sources essentially never produce. A chain written by v0.104.3
+// from any PG source with a primary key is unrestorable by v0.104.2 and
+// earlier for exactly this reason.
+func TestComputeSchemaHash_ExcludesIndexConstraintNamed(t *testing.T) {
+	schemaWith := func(pkNamed, idxNamed bool) *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{{
+			Schema:  "public",
+			Name:    "orders",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			PrimaryKey: &ir.Index{
+				Name: "orders_pkey", Unique: true, ConstraintNamed: pkNamed,
+				Columns: []ir.IndexColumn{{Column: "id"}},
+			},
+			Indexes: []*ir.Index{{
+				Name: "orders_id_key", Unique: true, ConstraintBacked: true, ConstraintNamed: idxNamed,
+				Columns: []ir.IndexColumn{{Column: "id"}},
+			}},
+		}}}
+	}
+
+	base, err := ComputeSchemaHash(schemaWith(false, false))
+	if err != nil {
+		t.Fatalf("ComputeSchemaHash (both false): %v", err)
+	}
+	for _, tc := range []struct {
+		what      string
+		pk, idx   bool
+		reachedBy string
+	}{
+		{"primary key named", true, false, "every PG table with a primary key — PG auto-names them"},
+		{"secondary unique named", false, true, "every PG UNIQUE constraint"},
+		{"both named", true, true, "the ordinary PG table"},
+	} {
+		got, err := ComputeSchemaHash(schemaWith(tc.pk, tc.idx))
+		if err != nil {
+			t.Fatalf("ComputeSchemaHash (%s): %v", tc.what, err)
+		}
+		if got != base {
+			t.Errorf("Index.ConstraintNamed moved the schema fingerprint (%s — reached by %s):\n  without %s\n  with    %s\n\n"+
+				"Every backup chain written by this binary from such a source becomes unrestorable by every release "+
+				"that hashes it differently, reported to the operator as a corrupt manifest. The field must be dropped "+
+				"in fingerprintIndex (chain.go) — see roadmap item 104 / Bug 216.", tc.what, tc.reachedBy, base, got)
+		}
+	}
+
+	// And the exclusion must not have been implemented by MUTATING the
+	// caller's schema — the manifest records the schema verbatim, so a
+	// fingerprint helper that clears the field in place would silently
+	// strip the constraint name a restore re-emits.
+	s := schemaWith(true, true)
+	if _, err := ComputeSchemaHash(s); err != nil {
+		t.Fatalf("ComputeSchemaHash: %v", err)
+	}
+	if !s.Tables[0].PrimaryKey.ConstraintNamed || !s.Tables[0].Indexes[0].ConstraintNamed {
+		t.Error("hashing the schema CLEARED ConstraintNamed on the caller's own indexes — the restore that re-emits " +
+			"this schema would lose the source constraint name")
+	}
+}
+
+// TestIndexConstraintNamed_OmitsZeroValue pins the WIRE half (roadmap item
+// 84): a false ConstraintNamed must not appear in Index's JSON at all, so
+// a manifest this binary writes for an unnamed index stays byte-identical
+// to what older binaries wrote and decodes on them unchanged — while a
+// true one must still ride the wire, or the field is omitempty'd into
+// uselessness. The FINGERPRINT no longer depends on this; that is
+// TestComputeSchemaHash_ExcludesIndexConstraintNamed's job now.
 func TestIndexConstraintNamed_OmitsZeroValue(t *testing.T) {
 	idx := &ir.Index{Name: "t_pkey", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}
 

@@ -35,6 +35,7 @@
 //	                            (b) OLD restores                     FAIL
 //	cell 4  control           OLD writes, OLD extends, OLD restores  PASS
 //	cell 5  epoch partition   EPOCH writes chain → NEW restores    REFUSE
+//	cell 6  fingerprint fwd   NEW writes chain → PEER restores       PASS
 //
 // Cell 4 is not padding: it is what proves cell 3b's failure is caused by
 // the version raise and by nothing else in the harness.
@@ -54,6 +55,20 @@
 // So cell 5 documents the partition as known-and-accepted. If someone
 // later builds the compatibility shim item 102 describes, this cell goes
 // red — which is the correct trigger to come back and update it.
+//
+// CELL 6 IS THE THIRD AXIS, and it exists because cells 1–5 all read
+// chains written by an OLDER binary, or assert a refusal. None of them
+// asks the question that caught the FOURTH epoch (roadmap item 104 / Bug
+// 216): does a chain THIS build writes still restore on the previous
+// release? v0.104.3 added an `omitempty` field to ir.Index believing the
+// zero value would keep the fingerprint still — but the Postgres reader
+// sets it on every primary-keyed table, so every real PG chain moved, and
+// no gate saw it. The frozen golden could not: its fixture carried the
+// new field at its new value, so it only ever proved the current binary
+// agrees with itself. What found it was a regression cycle asking the
+// boring question, and cell 6 is that question made permanent. Its peer
+// binary is derived at the SAME BackupFormatVersion precisely so that a
+// refusal here can only be the fingerprint's.
 //
 // Encryption is not optional here. FormatVersion 9 is an ENCRYPTED-manifest
 // tier — a plaintext chain keeps its schema-derived version (1/2/4) and
@@ -167,6 +182,13 @@ type xvBinaries struct {
 	epochBin    string
 	epochTag    string
 	epochFormat int
+
+	// The cell-6 axis: the newest release at the SAME format version as
+	// this build (roadmap item 104 / Bug 216). Equal-format is what makes
+	// the cell about the schema fingerprint rather than the version gate.
+	peerBin    string
+	peerTag    string
+	peerFormat int
 }
 
 // xvEpochVersion is the version string the epoch binary stamps into every
@@ -206,6 +228,9 @@ func xvLoadBinaries(t *testing.T) xvBinaries {
 		epochBin:    get("CROSSVER_EPOCH_BIN"),
 		epochTag:    get("CROSSVER_EPOCH_TAG"),
 		epochFormat: getInt("CROSSVER_EPOCH_FORMAT"),
+		peerBin:     get("CROSSVER_PEER_BIN"),
+		peerTag:     get("CROSSVER_PEER_TAG"),
+		peerFormat:  getInt("CROSSVER_PEER_FORMAT"),
 	}
 	// The FIRST non-vacuity guard: a gate whose two binaries understand the
 	// same manifest versions asserts nothing at all, and would report a
@@ -227,13 +252,25 @@ func xvLoadBinaries(t *testing.T) xvBinaries {
 			"before reaching the fingerprint check, so cell 5 would assert the wrong refusal. Pick an older epoch tag "+
 			"in scripts/crossversion-build.sh.", b.epochTag, b.epochFormat, b.newFormat)
 	}
-	for _, p := range []string{b.oldBin, b.newBin, b.epochBin} {
+	// Cell 6's precondition, and the reason the peer is derived on EQUALITY.
+	// A peer at a lower format refuses a NEW-written chain on the version
+	// gate, which cell 2 already covers — cell 6 would then report green
+	// about a refusal instead of red about a fingerprint it cannot
+	// reproduce, which is the exact failure mode the whole file is built to
+	// avoid.
+	if b.peerFormat != b.newFormat {
+		t.Fatalf("PEER %s stamps BackupFormatVersion=%d and NEW stamps %d — cell 6 needs them EQUAL so the only thing "+
+			"that can refuse the restore is the schema fingerprint. Re-run scripts/crossversion-build.sh, or repoint "+
+			"CROSSVER_PEER_TAG at a same-format release.", b.peerTag, b.peerFormat, b.newFormat)
+	}
+	for _, p := range []string{b.oldBin, b.newBin, b.epochBin, b.peerBin} {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("binary %q: %v", p, err)
 		}
 	}
-	t.Logf("cross-version gate: OLD=%s (%s, BackupFormatVersion=%d)  NEW=%s (BackupFormatVersion=%d)  EPOCH=%s (%s, BackupFormatVersion=%d)",
-		b.oldBin, b.oldTag, b.oldFormat, b.newBin, b.newFormat, b.epochBin, b.epochTag, b.epochFormat)
+	t.Logf("cross-version gate: OLD=%s (%s, BackupFormatVersion=%d)  NEW=%s (BackupFormatVersion=%d)  EPOCH=%s (%s, BackupFormatVersion=%d)  PEER=%s (%s, BackupFormatVersion=%d)",
+		b.oldBin, b.oldTag, b.oldFormat, b.newBin, b.newFormat, b.epochBin, b.epochTag, b.epochFormat,
+		b.peerBin, b.peerTag, b.peerFormat)
 	return b
 }
 
@@ -440,6 +477,44 @@ func xvSchemaFingerprint(t *testing.T, path string) (recorded, recomputed string
 		t.Fatalf("recompute schema hash for %s: %v", path, err)
 	}
 	return m.SchemaHash, got
+}
+
+// xvChainCarriesNamedConstraint reports whether the chain's root manifest
+// records at least one index whose name came from a real source constraint
+// — [ir.Index.ConstraintNamed], the field whose fingerprint treatment is
+// cell 6's whole subject.
+//
+// Decoding through the CURRENT build's type is correct here, unlike in
+// xvManifestVersion: the manifest under inspection was written by THIS
+// build, so there is no foreign shape to misread. The question is simply
+// whether the writer produced the shape the cell needs.
+func xvChainCarriesNamedConstraint(t *testing.T, dir string) bool {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var m irbackup.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if m.Schema == nil {
+		t.Fatalf("manifest carries no schema — cell 6 has nothing to inspect")
+	}
+	for _, tbl := range m.Schema.Tables {
+		if tbl == nil {
+			continue
+		}
+		if tbl.PrimaryKey != nil && tbl.PrimaryKey.ConstraintNamed {
+			return true
+		}
+		for _, idx := range tbl.Indexes {
+			if idx != nil && idx.ConstraintNamed {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // xvChainVersions returns the root full's format version and the
@@ -688,7 +763,7 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 	adminDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
-	ledger := newXVLedger(t, "1-forward-read", "2-backward-refusal", "3a-new-reads-extended", "3b-old-loses-extended", "4-control", "5-epoch-partition")
+	ledger := newXVLedger(t, "1-forward-read", "2-backward-refusal", "3a-new-reads-extended", "3b-old-loses-extended", "4-control", "5-epoch-partition", "6-fingerprint-forward-compat")
 
 	t.Run("cell1_forward_read_OLD_writes_NEW_restores", func(t *testing.T) {
 		src := xvSeededSource(t, adminDSN, "xv1_src")
@@ -904,6 +979,72 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 		out, err := xvRestore(t, bins.newBin, dir, tgt)
 		xvAssertSchemaFingerprintRefusal(t, "cell 5 (NEW restores an EPOCH-crossing chain)", out, err, tgt, bins.xvEpochVersion())
 		ledger.report(t, "5-epoch-partition")
+	})
+
+	// Cell 6 — the fingerprint-forward axis (roadmap item 104 / Bug 216).
+	//
+	// THIS build writes a chain from a primary-keyed Postgres source; the
+	// newest release at the same format version restores it. That must
+	// PASS, and unlike every cell above it, it is a cell whose failure is a
+	// BUG rather than a documented consequence: the two binaries agree
+	// about the manifest format, so the only thing left that can refuse is
+	// a schema fingerprint this build moved.
+	//
+	// The source is the shared seed, unmodified, because the shape that
+	// partitions is not exotic — `id BIGINT PRIMARY KEY` is enough. Postgres
+	// auto-names that constraint, the reader records the name as
+	// constraint-owned, and that is the field v0.104.3 folded into the
+	// fingerprint. An operator did not have to do anything unusual to be
+	// stranded.
+	t.Run("cell6_fingerprint_forward_NEW_writes_PEER_restores", func(t *testing.T) {
+		src := xvSeededSource(t, adminDSN, "xv6_src")
+		tgt := xvCreateDB(t, adminDSN, "xv6_tgt")
+		dir := t.TempDir()
+
+		xvBackupFull(t, bins.newBin, src, dir, "xv_slot_6")
+		applyDDL(t, src, xvDelta1)
+		xvBackupIncremental(t, bins.newBin, src, dir, "xv_slot_6")
+
+		// THE NON-VACUITY GUARD, and it is the whole lesson of Bug 216 in
+		// one assertion. The pre-release verification of the omitempty fix
+		// hashed a schema in which the field was ABSENT, measured
+		// byte-identical, and shipped a partition. So: prove the chain this
+		// cell just wrote actually CARRIES the constraint-named shape before
+		// reading anything into the restore below. If a future reader change
+		// stops setting it, this cell would keep passing while covering
+		// nothing — that is the failure this guard exists to convert into a
+		// red run.
+		if !xvChainCarriesNamedConstraint(t, dir) {
+			t.Fatalf("cell 6: NEW wrote a chain whose schema records no constraint-owned index name — the shape that " +
+				"partitioned the fingerprint in v0.104.3 is absent, so a green here would prove nothing. The seed's " +
+				"`id BIGINT PRIMARY KEY` should make the PG reader set ir.Index.ConstraintNamed; check the reader " +
+				"before relaxing this guard.")
+		}
+
+		// And the chain must be a chain the PEER can reach the fingerprint
+		// check on at all — cell 2's refusal shape must not be what we end
+		// up measuring.
+		root, segs := xvChainVersions(t, dir)
+		for _, v := range append([]int{root}, segs...) {
+			if v > bins.peerFormat {
+				t.Fatalf("cell 6: NEW stamped a manifest at %d, above PEER %s's BackupFormatVersion %d — PEER would "+
+					"refuse on the VERSION gate and this cell would be measuring cell 2. The peer derivation is "+
+					"supposed to make that impossible; see scripts/crossversion-build.sh.", v, bins.peerTag, bins.peerFormat)
+			}
+		}
+		t.Logf("cell 6: NEW chain stamped root=%d segments=%v (PEER %s reads up to %d)", root, segs, bins.peerTag, bins.peerFormat)
+
+		out, err := xvRestore(t, bins.peerBin, dir, tgt)
+		if err != nil {
+			t.Fatalf("cell 6: PEER %s could not restore a chain THIS build wrote from an ordinary primary-keyed "+
+				"Postgres source. That is a fingerprint partition shipping — every chain written by this build "+
+				"becomes unrestorable by the release an operator is most likely to still be running, and it surfaces "+
+				"to them as a refused (not degraded) restore. See roadmap item 104 / Bug 216, and the three answers "+
+				"in the block comment on goldenSchemaHash (internal/ir/backup/schema_hash_golden_test.go).\n"+
+				"%v\n--- output ---\n%s", bins.peerTag, err, out)
+		}
+		xvAssertUsers(t, tgt, "cell 6 (PEER restores a NEW-written chain)", xvAfterDelta1)
+		ledger.report(t, "6-fingerprint-forward-compat")
 	})
 
 	// Belt for the ledger's braces: a summary line naming what ran, so a

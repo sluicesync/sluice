@@ -91,11 +91,14 @@ The fingerprint is computed over sluice's internal schema representation, so it 
 |---|---|
 | E1 | up to and including v0.99.292 |
 | E2 | v0.100.0 – v0.102.2 |
-| E3 | v0.103.0 onward |
+| E3 | v0.103.0 – v0.104.2, and v0.104.4 onward |
+| E4 | v0.104.3 only, and only for some chains — see below |
+
+**v0.104.3 is the odd one out, and it is worth reading if you took a backup with it.** That release added a field describing whether an index's name came from a real source constraint, and the Postgres reader sets it for every primary key. So a chain v0.104.3 wrote **from a Postgres source whose tables have primary keys** fingerprints differently from every other release, in both directions: v0.104.2 and earlier refuse it, and so does v0.104.4 and later. Chains it wrote from a **MySQL** source, or from a Postgres source with **no** primary key, are ordinary E3 chains and restore anywhere in E3. If you hold a v0.104.3 Postgres chain, restore it with v0.104.3, or re-take the backup with the current release. v0.104.4 removed the field from the fingerprint, which put the fingerprint back on E3's exact bytes — so this is a one-release detour, not a new line.
 
 **If a restore refuses with a schema-hash mismatch**, read the writing release the refusal prints (`sluice_version` in the manifest) and compare its epoch with your binary's. Different epochs means the chain is almost certainly intact and the fix is operational: restore it with a release from its own epoch, or re-take the backup with the current binary. Same epoch means the fingerprint really did move under a manifest that should have reproduced it — treat that as corruption. There is no flag that skips the check, and sluice does not re-derive a fingerprint at the writing release's field set (tracked as roadmap item 102; it is deliberately unbuilt).
 
-**The list above cannot silently grow.** A frozen-golden unit test (`TestComputeSchemaHash_FrozenGolden`) fails CI on any change to the fingerprint, so a new epoch can only be created deliberately — and a cross-version integration cell pins an E1↔E3 pair to the refusal shape documented here.
+**How this list is kept honest.** A frozen-golden unit test (`TestComputeSchemaHash_FrozenGolden`) fails CI on any change to the fingerprint, so a new epoch can only be created deliberately. That gate alone did **not** catch E4 — its fixture carried the new field at its new value, so it compared the release against itself — which is why two behavioural cross-version integration cells now sit behind it: one pins an E1↔E3 pair to the refusal shape documented here, and one writes a primary-keyed Postgres chain with the current build and requires the **previous release** to restore it.
 
 ## Exit codes
 

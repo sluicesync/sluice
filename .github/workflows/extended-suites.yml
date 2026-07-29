@@ -424,12 +424,18 @@ jobs:
           go test -tags='integration kmsverify' -race -count=1 -timeout=25m \
             -run '^TestBackup_KMS' -v ./internal/pipeline/
 
-  # The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212).
-  # Builds the previous release from source in a throwaway tag worktree,
-  # builds the working tree, and runs both against ONE encrypted backup
-  # chain on real Postgres: forward read, backward refusal, the Bug-212
-  # extend-an-older-chain cell, and an OLD-only control that proves the
-  # Bug-212 cell's failure comes from the version raise and not the harness.
+  # The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212,
+  # and item 104 / Bug 216). Builds three released binaries from source in
+  # throwaway tag worktrees, builds the working tree, and runs them against
+  # encrypted backup chains on real Postgres: forward read, backward
+  # refusal, the Bug-212 extend-an-older-chain cell, an OLD-only control
+  # that proves the Bug-212 cell's failure comes from the version raise and
+  # not the harness, the epoch-partition cell, and — the one whose failure
+  # is a BUG rather than a documented consequence — cell 6, where the
+  # working tree writes a primary-keyed Postgres chain and the previous
+  # SAME-format release must restore it. Cell 6 is the gate for the class
+  # that shipped in v0.104.3 past a frozen-golden unit test, because that
+  # golden compared the release against itself.
   # See internal/pipeline/backup_crossversion_integration_test.go for the
   # full contract and scripts/crossversion-build.sh for how the pair is
   # derived (never hardcoded — the script refuses rather than build two
@@ -447,7 +453,9 @@ jobs:
     name: Cross-version backup compat
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'crossversion' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 40, not 30: the peer axis (cell 6) added a fourth tag build and a
+    # sixth cell, each with its own full + incremental + restore.
+    timeout-minutes: 40
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
     steps:
@@ -488,7 +496,7 @@ jobs:
       - name: Run the cross-version backup-compatibility gate
         run: |
           set -o pipefail
-          go test -tags='integration crossversion' -count=1 -timeout=20m \
+          go test -tags='integration crossversion' -count=1 -timeout=25m \
             -run '^TestBackup_CrossVersion' -v ./internal/pipeline/ 2>&1 | tee crossversion.out
           # Second half of the guard, mirroring the vstream-pipeline leg: a
           # t.Skip greens `go test` while executing nothing. (The four cells

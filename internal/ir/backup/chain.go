@@ -43,6 +43,12 @@ import (
 // normalization a reader-fresh schema and the SAME schema re-read
 // from a manifest would fingerprint differently. The hash is thereby
 // stable across manifest JSON round-trips.
+//
+// Finally, the canonical view DROPS the fields listed under
+// [fingerprintIndex] — read that comment before adding to the set. It
+// is the mechanism that keeps a re-emission hint (does this index's
+// name come from a real constraint?) from partitioning every backup
+// chain by release.
 func ComputeSchemaHash(s *ir.Schema) (string, error) {
 	if s == nil {
 		h := sha256.Sum256([]byte("schema:nil"))
@@ -70,7 +76,8 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 		}
 		ct := *t
 		ct.Columns = canonicalColumnsForHash(t.Columns)
-		ct.Indexes = sortedByName(t.Indexes, func(x *ir.Index) string { return x.Name })
+		ct.PrimaryKey = fingerprintIndex(t.PrimaryKey)
+		ct.Indexes = sortedByName(fingerprintIndexes(t.Indexes), func(x *ir.Index) string { return x.Name })
 		ct.ForeignKeys = sortedByName(t.ForeignKeys, func(x *ir.ForeignKey) string { return x.Name })
 		ct.CheckConstraints = sortedByName(t.CheckConstraints, func(x *ir.CheckConstraint) string { return x.Name })
 		ct.ExcludeConstraints = sortedByName(t.ExcludeConstraints, func(x *ir.ExcludeConstraint) string { return x.Name })
@@ -127,6 +134,76 @@ func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 		cc := *c
 		cc.Default = ir.DefaultNone{}
 		out[i] = &cc
+	}
+	return out
+}
+
+// FINGERPRINT-EXCLUDED FIELDS (roadmap item 104 / Bug 216).
+//
+// Some fields on [ir.Index] describe how a name should be RE-EMITTED,
+// not what the schema IS, and those are deliberately kept out of the
+// fingerprint. Today the set is exactly one field —
+// [ir.Index.ConstraintNamed] — and the reason is compatibility, not
+// taste.
+//
+// The fingerprint is a SHA-256 over the schema's default struct JSON,
+// so a field added to Index moves the fingerprint of every schema that
+// has an index, and a chain restore REFUSES a chain whose recorded
+// fingerprint does not reproduce. `omitempty` was supposed to contain
+// that: a false field marshals away, older schemas all carry false, so
+// the bytes stay put. It does not hold for THIS field, because the
+// Postgres reader sets it TRUE for every constraint-owned index and
+// Postgres auto-names every primary key — so on any real Postgres
+// source the field is present, the fingerprint moves, and v0.104.3
+// minted a fourth epoch that the omitempty was written to prevent.
+// Relying on a zero value only works when the source rarely produces
+// the interesting case; here it always does.
+//
+// Excluding the field entirely restores the fingerprint of a v0.103.0
+// – v0.104.2 schema BYTE-IDENTICALLY (the field is the only addition
+// to any hashed struct across that span), which is why this is an
+// exclusion rather than a fifth epoch. Chains written BY v0.104.3 from
+// a Postgres source with a primary key remain their own orphan epoch —
+// their manifests record a fingerprint computed WITH the field, and
+// nothing here re-derives it.
+//
+// WHAT THE EXCLUSION COSTS, stated exactly rather than waved at. The
+// check verifies a manifest against its OWN recorded schema, so what
+// is lost is detection of an edit to `ConstraintNamed` alone — and
+// signing does NOT backstop it, because [canonicalManifestBytes] folds
+// the fingerprint STRING (`schema_hash`) and the same
+// [deltaTableFingerprint] for schema deltas, not the schema bytes. The
+// one place still covering it verbatim is a SchemaHistory entry, whose
+// TableJSON is folded raw. So a coherent tamper could flip the flag on
+// a manifest's recorded schema undetected; its entire effect on a
+// restore is whether a primary key is re-emitted as
+// `CONSTRAINT <name> PRIMARY KEY` or a bare `PRIMARY KEY` — a DDL
+// naming difference, no data, no row count, no position. That is the
+// trade: one bit of tamper-detection on a name, against partitioning
+// every chain in the field by release.
+//
+// Before adding a field here, read the block on `goldenSchemaHash`
+// (schema_hash_golden_test.go): exclusion is the third answer to a
+// moved fingerprint, and the only one that can move it BACK.
+func fingerprintIndex(in *ir.Index) *ir.Index {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.ConstraintNamed = false
+	return &out
+}
+
+// fingerprintIndexes maps [fingerprintIndex] over a slice, copying it
+// rather than mutating the caller's indexes (the input schema is the
+// one the manifest records verbatim; only the FINGERPRINT is canonical).
+func fingerprintIndexes(in []*ir.Index) []*ir.Index {
+	if in == nil {
+		return nil
+	}
+	out := make([]*ir.Index, len(in))
+	for i, idx := range in {
+		out[i] = fingerprintIndex(idx)
 	}
 	return out
 }

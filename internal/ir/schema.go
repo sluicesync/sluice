@@ -620,19 +620,33 @@ type Index struct {
 	// binary's own behaviour (an unnamed inline PK) — additive wire, no
 	// format bump.
 	//
-	// The `omitempty` is LOAD-BEARING, not cosmetic. Index's default
-	// struct JSON is the exact input to
+	// EXCLUDED FROM THE BACKUP SCHEMA FINGERPRINT, and the history is
+	// worth two minutes because it cost a release. Index's default
+	// struct JSON feeds
 	// [sluicesync.dev/sluice/internal/ir/backup.ComputeSchemaHash],
 	// which fingerprints every backup manifest's schema; a chain
-	// restore recomputes that fingerprint and REFUSES on a mismatch.
-	// A bare `bool` here emits `"ConstraintNamed":false` on every index
-	// of every table, which changes the fingerprint of every schema
-	// ever written and makes every pre-existing chain look corrupted.
-	// With `omitempty` the false case marshals byte-identically to what
-	// v0.100.0–v0.104.2 wrote, and only a PG-source named constraint —
-	// a shape no older binary ever produced — adds the key. Any new
-	// field on Index / Table / Schema needs the same treatment; see
-	// TestComputeSchemaHash_FrozenGolden in internal/ir/backup.
+	// restore recomputes that fingerprint and REFUSES the whole chain
+	// on a mismatch. So a new field on Index partitions every chain in
+	// the field by release. The first fix was the `omitempty` below —
+	// a false field marshals away, every older schema carries false,
+	// the bytes hold. It did not hold: the PG reader sets this TRUE on
+	// every constraint-owned index and PG auto-names every primary key,
+	// so on a real Postgres chain the key is always present and
+	// v0.104.3 minted an epoch anyway (Bug 216). The fingerprint now
+	// DROPS the field outright (see fingerprintIndex in
+	// internal/ir/backup/chain.go), which puts a v0.104.4+ schema back
+	// on the v0.103.0–v0.104.2 bytes exactly.
+	//
+	// The `omitempty` stays, and still earns its keep on the WIRE: an
+	// unnamed index writes no key at all, so a manifest written here
+	// stays byte-compatible with what older binaries produced and
+	// decodes on them unchanged.
+	//
+	// A new field on Index / Table / Schema does NOT get to rely on
+	// either mechanism by default — see
+	// TestComputeSchemaHash_FrozenGolden in internal/ir/backup, which
+	// fails on any addition that moves the hash, and read its block
+	// comment for the three legitimate answers.
 	ConstraintNamed bool `json:"ConstraintNamed,omitempty"`
 
 	// ConstraintDeferrable / ConstraintNullsNotDistinct /

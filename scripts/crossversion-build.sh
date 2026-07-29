@@ -52,6 +52,18 @@
 #   CROSSVER_WORKTREE                      — the throwaway tag worktree
 #   CROSSVER_EPOCH_BIN / _TAG / _FORMAT    — the epoch-crossing binary
 #   CROSSVER_EPOCH_WORKTREE                — its throwaway tag worktree
+#   CROSSVER_PEER_BIN / _TAG / _FORMAT     — the SAME-format peer binary
+#   CROSSVER_PEER_WORKTREE                 — its throwaway tag worktree
+#
+# THE THIRD AXIS: THE SAME-FORMAT PEER (roadmap item 104 / Bug 216). Cells
+# 1-5 all read OLD-written chains with a NEWER binary, or assert a refusal.
+# None of them asks the question that actually caught the fourth epoch:
+# does the chain THIS build writes still restore on the PREVIOUS release?
+# That direction is where a schema-fingerprint addition bites, it is what
+# a v0.104.3 operator hit, and it needs a binary that shares this build's
+# BackupFormatVersion — otherwise the version gate refuses first and the
+# fingerprint is never reached. Hence a FOURTH binary, derived as the
+# newest tag at the same format version, minus the known orphan epochs.
 #
 # Environment overrides (all default OUTSIDE the repo, so nothing here
 # needs a .gitignore entry and no sweep over the working tree ever walks a
@@ -61,6 +73,10 @@
 #   CROSSVER_WORKTREE   where the tag worktree is created
 #                        (default: ${RUNNER_TEMP:-/tmp}/sluice-crossversion)
 #   CROSSVER_EPOCH_TAG  overrides the hardcoded epoch-boundary tag below
+#   CROSSVER_PEER_TAG   overrides the derived same-format peer tag
+#   CROSSVER_PEER_EXCLUDE
+#                       space-separated tags the peer derivation skips —
+#                       the orphan-epoch list (see below)
 
 set -eu
 cd "$(dirname "$0")/.."
@@ -157,6 +173,61 @@ fi
 git worktree prune
 git worktree add --detach "$epoch_worktree" "$epoch_tag" >/dev/null
 
+# ---------------------------------------------------------------------
+# The SAME-FORMAT PEER tag (roadmap item 104 / Bug 216).
+#
+# Derived, like OLD: the newest tag whose BackupFormatVersion EQUALS the
+# working tree's. Equality is the point — the peer cell asserts that a
+# chain THIS build writes still restores on the previous release, and a
+# peer at a lower format would refuse on the version gate before the
+# schema fingerprint is ever recomputed, turning the cell into a
+# restatement of cell 2.
+#
+# THE EXCLUSION LIST IS THE ORPHAN EPOCHS. A release whose fingerprint
+# nobody else reproduces cannot serve as the peer: it would fail the cell
+# for a reason the cell is not about. v0.104.3 is the one such release —
+# it hashed ir.Index.ConstraintNamed into the fingerprint (the omitempty
+# that did not hold, Bug 216), so chains it wrote from a primary-keyed
+# Postgres source are readable only by itself, and chains written by
+# v0.104.4+ are unreadable by it. Add a tag here ONLY when it is a known
+# orphan; every other same-format release must stay eligible, because the
+# whole value of this cell is that the peer advances automatically.
+peer_exclude=${CROSSVER_PEER_EXCLUDE:-v0.104.3}
+peer_tag=${CROSSVER_PEER_TAG:-}
+if [ -z "$peer_tag" ]; then
+	for t in $(git tag --list 'v*' --sort=-v:refname); do
+		skip=
+		for x in $peer_exclude; do
+			[ "$t" = "$x" ] && skip=1 && break
+		done
+		[ -n "$skip" ] && continue
+		v=$(git show "$t:$manifest_file" 2>/dev/null | read_format_version || true)
+		[ -n "$v" ] || continue
+		if [ "$v" -eq "$new_version" ]; then
+			peer_tag=$t
+			break
+		fi
+	done
+fi
+
+if [ -z "$peer_tag" ]; then
+	echo "::error::crossversion-build: no released tag stamps BackupFormatVersion=$new_version (excluding the orphan epochs: $peer_exclude), so the same-format peer cell has nothing to run against. This is what a FRESH FORMAT BUMP looks like: until a release ships at this format, no older binary can read this build's chains at all and the fingerprint direction is untestable from outside. Ship the bump, then this derivation re-arms itself on the next run. To run the suite deliberately without the peer cell in the meantime, set CROSSVER_PEER_TAG to a same-format tag by hand — there is no skip flag, on purpose."
+	exit 1
+fi
+
+peer_version=$(git show "$peer_tag:$manifest_file" | read_format_version)
+if [ "$peer_version" != "$new_version" ]; then
+	echo "::error::crossversion-build: peer tag $peer_tag stamps BackupFormatVersion=$peer_version, not the working tree's $new_version — the peer cell would assert a version refusal instead of the fingerprint compatibility it exists for."
+	exit 1
+fi
+
+peer_worktree=${CROSSVER_PEER_WORKTREE:-${RUNNER_TEMP:-/tmp}/sluice-crossversion-peer}
+if [ -e "$peer_worktree" ]; then
+	git worktree remove --force "$peer_worktree" >/dev/null 2>&1 || rm -rf "$peer_worktree"
+fi
+git worktree prune
+git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
+
 exe=
 case "$(go env GOOS)" in
 windows) exe=".exe" ;;
@@ -167,6 +238,7 @@ out_dir=$(cd "$out_dir" && pwd)
 old_bin="$out_dir/sluice-old$exe"
 new_bin="$out_dir/sluice-new$exe"
 epoch_bin="$out_dir/sluice-epoch$exe"
+peer_bin="$out_dir/sluice-peer$exe"
 
 # The tag builds stamp their version the way a real release does
 # (.goreleaser.yaml: `-X main.version={{.Version}}`, which is the tag
@@ -178,6 +250,8 @@ echo "crossversion-build: building OLD $old_tag (BackupFormatVersion=$old_versio
 (cd "$worktree" && go build -ldflags "-X main.version=${old_tag#v}" -o "$old_bin" ./cmd/sluice)
 echo "crossversion-build: building EPOCH $epoch_tag (BackupFormatVersion=$epoch_version) from $epoch_worktree"
 (cd "$epoch_worktree" && go build -ldflags "-X main.version=${epoch_tag#v}" -o "$epoch_bin" ./cmd/sluice)
+echo "crossversion-build: building PEER $peer_tag (BackupFormatVersion=$peer_version) from $peer_worktree"
+(cd "$peer_worktree" && go build -ldflags "-X main.version=${peer_tag#v}" -o "$peer_bin" ./cmd/sluice)
 echo "crossversion-build: building NEW working tree (BackupFormatVersion=$new_version)"
 go build -o "$new_bin" ./cmd/sluice
 
@@ -198,3 +272,7 @@ emit CROSSVER_EPOCH_BIN "$epoch_bin"
 emit CROSSVER_EPOCH_TAG "$epoch_tag"
 emit CROSSVER_EPOCH_FORMAT "$epoch_version"
 emit CROSSVER_EPOCH_WORKTREE "$epoch_worktree"
+emit CROSSVER_PEER_BIN "$peer_bin"
+emit CROSSVER_PEER_TAG "$peer_tag"
+emit CROSSVER_PEER_FORMAT "$peer_version"
+emit CROSSVER_PEER_WORKTREE "$peer_worktree"
