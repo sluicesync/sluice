@@ -18,7 +18,10 @@ package pipeline
 //     between rollovers and exits cleanly when the field is set.
 //   - Handoff. On a clean exit the stream stamps `stopped_at`, so the
 //     next stream against the destination takes over immediately
-//     instead of waiting out the staleness window ([priorHandedOff]).
+//     instead of waiting out the staleness window. Only a recorded
+//     EXIT does that — a recorded stop REQUEST never shortens the
+//     wait, because the requesting operator does not wait for the
+//     process either. See [priorHandedOff].
 //
 // The state file is informational-only; the chain itself is the source
 // of truth for restore + verify. Losing the state file (operator
@@ -67,6 +70,12 @@ type streamState struct {
 	// StopRequestedAt, when non-nil, signals the operator has asked
 	// the stream to exit cleanly. `sluice backup stream stop` writes
 	// this; the running stream polls between rollovers and exits.
+	//
+	// It records a REQUEST, not an outcome: the stop command returns
+	// without waiting for the process, so a set StopRequestedAt is
+	// compatible with an owner that is still draining. It therefore
+	// never admits a takeover — only [StoppedAt] does. See
+	// [priorHandedOff] for why no waiting period repairs that.
 	StopRequestedAt *time.Time `json:"stop_requested_at,omitempty"`
 
 	// StoppedAt, when non-nil, records that the owner named by
@@ -235,12 +244,12 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 		// as legitimate restart; the state file gets re-written.
 		return nil
 	}
-	if handoff, evidence := priorHandedOff(prior); handoff {
-		// The prior owner recorded that it is gone. Not a competitor —
+	if exitedAt, handoff := priorHandedOff(prior); handoff {
+		// The prior owner recorded that it is GONE. Not a competitor —
 		// take over now, and at INFO: a supervisor/k8s restart loop is
 		// the DOCUMENTED shape here (ADR-0087), so it must not be
 		// dressed up as an anomaly.
-		logConcurrentWriterHandoff(ctx, prior, evidence)
+		logConcurrentWriterHandoff(ctx, prior, exitedAt)
 		return nil
 	}
 	if stale {
@@ -252,15 +261,16 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 	}
 	// Different writer, fresh state — refuse loudly. The remedy must
 	// name an action the operator has NOT already taken: when a stop is
-	// already recorded (and the owner has rolled over since, so this is
-	// a still-draining stream rather than a handoff), telling them to
-	// run `backup stream stop` again is a no-op instruction against a
-	// signal that is already in the file we just read.
+	// already recorded, telling them to run `backup stream stop` again
+	// is a no-op instruction against a signal that is already in the
+	// file we just read. What they need instead is the WAIT and what
+	// ends it.
 	remedy := "to take over, stop it via `sluice backup stream stop` or pass --force"
 	if prior.StopRequestedAt != nil {
 		remedy = fmt.Sprintf(
-			"a stop was already requested at %s and the stream has committed a rollover since, so it is still draining; wait for it to exit (it exits on its next rollover-tick) or pass --force",
+			"a stop was already requested at %s, so the prior stream may still be draining and this destination is not free yet; it is taken over automatically as soon as that stream records its exit, or after %s without a rollover — or pass --force to take over now",
 			prior.StopRequestedAt.UTC().Format(time.RFC3339),
+			streamStateFreshness*window,
 		)
 	}
 	return fmt.Errorf(
@@ -270,40 +280,73 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 }
 
 // priorHandedOff reports whether prior records a HANDOFF — the owner
-// declaring itself gone — rather than a live competitor, and returns
-// the evidence for the log line. Two shapes qualify:
+// declaring that it is GONE — rather than a possibly-live competitor.
 //
-//   - StoppedAt set. The owner's [BackupStream.recordCleanExit] ran, so
-//     it committed its last rollover and returned. Unambiguous.
-//   - StopRequestedAt strictly after LastRolloverAt. The operator ran
-//     `sluice backup stream stop` and the owner has not written a
-//     heartbeat since. Covers the crashed-mid-drain owner and state
-//     files written by a sluice that predates StoppedAt.
+// **The invariant: only a recorded EXIT shortens the wait; a recorded
+// stop REQUEST never does.** Exactly one field qualifies, StoppedAt,
+// which [BackupStream.recordCleanExit] writes after [BackupStream.Run]
+// has returned. It means the process is gone. `stop_requested_at`
+// means only that someone asked it to go, which is not the same claim
+// — and the gap between the two is a live writer.
 //
-// **The residual, named: the drain window.** The second shape also
-// holds for the seconds between `stop` being written and the owner
-// actually exiting — `backup stream stop` writes the signal and
-// returns without waiting. Taking over there overlaps two writers.
-// It is accepted deliberately, and it is narrow: the operator has
-// explicitly declared this owner unwanted, the owner eager-exits on
-// its next stop-poll tick, and the alternative — the pre-fix
-// behaviour — is a hard rc=1 on the documented supervisor-restart
-// path with a remedy that cannot help. The unambiguous StoppedAt
-// shape is what a current-version clean stop actually produces; the
-// second shape is the compatibility/crash fallback.
+// # Why a stop request is deliberately NOT a second signal
+//
+// The tempting rule is "stop_requested_at newer than last_rollover_at
+// ⇒ the owner exited without a further heartbeat, take over." It is
+// wrong, and it cannot be repaired by waiting out some drain bound D
+// first. Note that the rule's own precondition gives
+// `last_rollover_at < stop_requested_at`, hence for any D:
+//
+//	now - last_rollover_at  >  now - stop_requested_at  >  D
+//
+// So if D is at least the staleness threshold (streamStateFreshness ×
+// window), `stale` is already true and the ordinary staleness branch
+// above has ALREADY admitted the takeover — the rule is dead code. And
+// if D is anything shorter, the rule's ONLY marginal effect is to
+// admit takeovers while `last_rollover_at` is still FRESH — precisely
+// the state in which a draining or wedged owner cannot be ruled out.
+// There is no D that buys safe availability: the rule is either
+// vacuous or it is exactly the unsafe case.
+//
+// # Why that matters more than the wait it costs (finding F1)
+//
+// Two concurrent extending writers on one chain fork the lineage into
+// a PERMANENTLY UNRESTORABLE state, and **both writers exit rc=0
+// reporting success** (reproduced on real S3 and on local disk). The
+// catalog commits both siblings as though sequential; `verify` and
+// `restore` then refuse with `SLUICE-E-BACKUP-MANIFEST-INVALID …
+// branching/mis-stitched lineage`, and the dead chain keeps accepting
+// further incrementals — so the damage stays silent until someone
+// attempts a recovery. `sluice backup stream stop` writes its signal
+// and returns WITHOUT waiting for the process to exit, so a
+// stop-then-immediately-restart supervisor is a direct path into that
+// class. Waiting is cheap; an overlapping writer is not. Do not
+// "simplify" the delay away without meeting this argument.
+//
+// Removing the rule costs nothing against the pre-handoff behaviour:
+// a legacy state file (written before StoppedAt existed) and an owner
+// that crashed after a stop was requested both fall through to the
+// same staleness wait they already had. The real operator scenario —
+// clean stop, immediate restart, current binary — is covered by
+// StoppedAt with no wait at all.
 //
 // The crashed-mid-rollover owner needs no special handling here: a
 // takeover runs [recoverRotationState] and re-resolves the open
 // segment during setup regardless of WHICH branch admitted it, so this
 // function only changes WHEN we take over, never WHAT we do next.
-func priorHandedOff(prior *streamState) (handoff bool, evidence string) {
-	if prior.StoppedAt != nil {
-		return true, "prior stream recorded a clean exit"
+//
+// Returning the exit timestamp alongside the verdict is deliberate: it
+// makes "admitted a handoff" and "can name when the owner went away"
+// the same statement, so a future clause cannot admit a takeover it
+// has no exit time for. (An earlier cut returned a bare bool and let
+// the caller dereference prior.StoppedAt on the strength of a comment;
+// a mutation that added a second clause turned that comment into a nil
+// dereference.)
+func priorHandedOff(prior *streamState) (exitedAt time.Time, handoff bool) {
+	if prior.StoppedAt == nil {
+		return time.Time{}, false
 	}
-	if prior.StopRequestedAt != nil && prior.StopRequestedAt.After(prior.LastRolloverAt) {
-		return true, "prior stream was asked to stop and wrote no rollover after the request"
-	}
-	return false, ""
+	return *prior.StoppedAt, true
 }
 
 // recordCleanExit stamps `stopped_at` on the state file so the NEXT

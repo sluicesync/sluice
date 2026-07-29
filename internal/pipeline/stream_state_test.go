@@ -136,30 +136,135 @@ func TestPreflightStreamState_FreshConflict_Refuses(t *testing.T) {
 // honoured despite freshness, not because of staleness.
 var handoffPreflightNow = time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 
-// TestPreflightStreamState_StopHandoff_TakesOverImmediately pins the
-// clean-handoff takeover: a fresh state file whose stop_requested_at is
-// LATER than its last_rollover_at is the exact residue `sluice backup
-// stream stop` leaves behind when the running stream commits its final
-// rollover and exits (the eager-exit path returns before the next
-// heartbeat, so no rollover is recorded after the request). Pre-fix the
-// restart was refused for a full staleness window and told the operator
-// to run the stop command they had just run.
-func TestPreflightStreamState_StopHandoff_TakesOverImmediately(t *testing.T) {
+// TestPreflightStreamState_StopRequestedWithinDrainWindow_Refuses is
+// the CORRECTED contract, and the reason it is worth a pin of its own.
+//
+// A fresh state file whose stop_requested_at is LATER than its
+// last_rollover_at is genuinely ambiguous: it is what `sluice backup
+// stream stop` leaves behind BOTH when the owner has already exited
+// AND while the owner is still draining, because the stop command
+// writes its signal and returns without waiting for the process. Two
+// concurrent extending writers fork the chain permanently while both
+// exit rc=0 (finding F1), so the ambiguous shape must be REFUSED —
+// only a recorded exit (stopped_at) admits a takeover.
+//
+// The seconds here put the request well inside any plausible drain
+// budget; the tail of the test proves the refusal is the freshness
+// guard, not a permanent wedge.
+func TestPreflightStreamState_StopRequestedWithinDrainWindow_Refuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
 	now := handoffPreflightNow
-	stop := now.Add(-9 * time.Second)
-	handed := &streamState{
+	stop := now.Add(-2 * time.Second) // a stop issued 2s ago — mid-drain
+	ambiguous := &streamState{
 		PID: 2328, Host: "other.example.com",
 		StartedAt:       now.Add(-30 * time.Second),
-		LastRolloverAt:  now.Add(-10 * time.Second), // fresh
-		StopRequestedAt: &stop,                      // …but a stop landed after it
+		LastRolloverAt:  now.Add(-3 * time.Second), // fresh
+		StopRequestedAt: &stop,                     // …and no recorded exit
 	}
-	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", handed)
+	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", ambiguous)
 	b := &BackupStream{Store: store}
 	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
-	if err != nil {
-		t.Errorf("preflight after a recorded stop err = %v; want immediate takeover", err)
+	if err == nil {
+		t.Fatal("err = nil; want refusal — the prior stream may still be draining (F1 chain-fork class)")
+	}
+	if !strings.Contains(err.Error(), "stream is already running") {
+		t.Errorf("err = %v; want the concurrent-writer refusal", err)
+	}
+	// The same file, once its last_rollover_at goes stale, IS taken
+	// over — the refusal above is the freshness guard doing its job,
+	// not an unrecoverable state.
+	if err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now.Add(3*time.Minute)); err != nil {
+		t.Errorf("preflight past the staleness window err = %v; want takeover", err)
+	}
+}
+
+// TestPreflightStreamState_StopRequestNeverShortensTheWait pins the
+// INVARIANT directly, which the per-shape tests only imply: a recorded
+// stop request must not change the admission decision at ANY age. Two
+// state files identical but for the stop request are compared at the
+// same instants, on both sides of the staleness threshold.
+//
+// This is the pin that fails if someone reintroduces the tempting
+// "stop_requested_at is older than some drain bound D ⇒ take over"
+// rule, in EITHER of its forms. The `aged stop, still fresh` row is
+// what makes it bite: the stop request there is 5 minutes old — far
+// past stopDrainTimeout and any plausible D — while last_rollover_at
+// is still inside the 10-minute freshness threshold. That band is
+// exactly where a drain-bounded rule would admit, and it is the band
+// the arithmetic in [priorHandedOff] identifies as unsafe. A D large
+// enough to skip the band is already subsumed by staleness.
+func TestPreflightStreamState_StopRequestNeverShortensTheWait(t *testing.T) {
+	now := handoffPreflightNow
+	// A 5-minute window puts the staleness threshold at 10 minutes, so
+	// a stop request can be aged well past any drain budget while
+	// last_rollover_at is still fresh.
+	const window = 5 * time.Minute
+
+	seed := func(t *testing.T, lastRollover time.Time, stop *time.Time) *BackupStream {
+		t.Helper()
+		store, _ := blobcodec.NewLocalStore(t.TempDir())
+		s := &streamState{
+			PID: 2328, Host: "other.example.com",
+			StartedAt:      now.Add(-time.Hour),
+			LastRolloverAt: lastRollover,
+		}
+		if stop != nil {
+			st := *stop
+			s.StopRequestedAt = &st
+		}
+		if err := writeStreamState(context.Background(), store, DefaultStreamStateFilename, s); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return &BackupStream{Store: store}
+	}
+
+	cases := []struct {
+		label        string
+		lastRollover time.Time
+		stop         time.Time
+		at           time.Time
+		wantRefuse   bool
+	}{
+		{
+			// Mid-drain: the shape a stop-then-restart supervisor sees.
+			label:        "fresh stop, still fresh",
+			lastRollover: now.Add(-30 * time.Second),
+			stop:         now.Add(-20 * time.Second),
+			at:           now,
+			wantRefuse:   true,
+		},
+		{
+			// The drain-bound killer: 5-minute-old stop request, and the
+			// owner is STILL inside the freshness window.
+			label:        "aged stop, still fresh",
+			lastRollover: now.Add(-6 * time.Minute),
+			stop:         now.Add(-5 * time.Minute),
+			at:           now,
+			wantRefuse:   true,
+		},
+		{
+			// Once the owner's own liveness goes stale, the ordinary
+			// guard admits — with or without the stop on file.
+			label:        "once stale",
+			lastRollover: now.Add(-6 * time.Minute),
+			stop:         now.Add(-5 * time.Minute),
+			at:           now.Add(11 * time.Minute),
+			wantRefuse:   false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.label, func(t *testing.T) {
+			withStop := seed(t, c.lastRollover, &c.stop).preflightStreamState(context.Background(), DefaultStreamStateFilename, window, 1, "us.example.com", c.at)
+			without := seed(t, c.lastRollover, nil).preflightStreamState(context.Background(), DefaultStreamStateFilename, window, 1, "us.example.com", c.at)
+			if (withStop != nil) != c.wantRefuse {
+				t.Errorf("with stop_requested_at: err = %v; want refuse=%v", withStop, c.wantRefuse)
+			}
+			if (withStop != nil) != (without != nil) {
+				t.Errorf("stop_requested_at changed the admission decision: with=%v without=%v", withStop, without)
+			}
+		})
 	}
 }
 
@@ -220,37 +325,52 @@ func TestPreflightStreamState_NoHandoffRecord_StillWaitsOutStaleness(t *testing.
 	}
 }
 
-// TestPreflightStreamState_StopRequestedButRolledOverSince_RefusesWithAHonestRemedy
-// pins the refusal TEXT for the still-draining stream: a stop is on
-// file but the owner has committed a rollover since, so it is alive and
-// this is a genuine conflict. The remedy must not tell the operator to
-// run `backup stream stop` — they already did, and against an
-// already-signalled stream that command is a no-op.
-func TestPreflightStreamState_StopRequestedButRolledOverSince_RefusesWithAHonestRemedy(t *testing.T) {
-	dir := t.TempDir()
-	store, _ := blobcodec.NewLocalStore(dir)
+// TestPreflightStreamState_StopAlreadyRequested_RefusalNamesTheWait
+// pins the refusal TEXT for BOTH shapes that reach it with a stop on
+// file — the owner heartbeated after the request (definitely alive) and
+// the owner did not (ambiguous, refused per the F1 argument). The
+// remedy must not tell the operator to run `backup stream stop`: they
+// already did, and against an already-signalled stream that command is
+// a no-op. It must name the wait and what ends it instead.
+func TestPreflightStreamState_StopAlreadyRequested_RefusalNamesTheWait(t *testing.T) {
 	now := handoffPreflightNow
 	stop := now.Add(-20 * time.Second)
-	draining := &streamState{
-		PID: 2328, Host: "other.example.com",
-		StartedAt:       now.Add(-30 * time.Second),
-		LastRolloverAt:  now.Add(-10 * time.Second), // heartbeat AFTER the stop
-		StopRequestedAt: &stop,
+	cases := map[string]time.Time{
+		"owner heartbeated after the stop (definitely alive)": now.Add(-10 * time.Second),
+		"owner wrote no rollover after the stop (ambiguous)":  now.Add(-30 * time.Second),
 	}
-	_ = writeStreamState(context.Background(), store, "manifests/stream_state.json", draining)
-	b := &BackupStream{Store: store}
-	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "us.example.com", now)
-	if err == nil {
-		t.Fatal("err = nil; want refusal — the prior stream is still draining")
-	}
-	if strings.Contains(err.Error(), "stop it via") {
-		t.Errorf("err = %v; must not advise `backup stream stop` — it is already recorded in the state file", err)
-	}
-	if !strings.Contains(err.Error(), "already requested") {
-		t.Errorf("err = %v; want the message to name the stop already on file", err)
-	}
-	if !strings.Contains(err.Error(), "--force") {
-		t.Errorf("err = %v; want the --force override to stay reachable", err)
+	for name, lastRollover := range cases {
+		t.Run(name, func(t *testing.T) {
+			store, _ := blobcodec.NewLocalStore(t.TempDir())
+			st := stop
+			prior := &streamState{
+				PID: 2328, Host: "other.example.com",
+				StartedAt:       now.Add(-time.Minute),
+				LastRolloverAt:  lastRollover,
+				StopRequestedAt: &st,
+			}
+			_ = writeStreamState(context.Background(), store, DefaultStreamStateFilename, prior)
+			b := &BackupStream{Store: store}
+			err := b.preflightStreamState(context.Background(), DefaultStreamStateFilename, time.Minute, 1, "us.example.com", now)
+			if err == nil {
+				t.Fatal("err = nil; want refusal")
+			}
+			if strings.Contains(err.Error(), "stop it via") {
+				t.Errorf("err = %v; must not advise `backup stream stop` — it is already recorded in the state file", err)
+			}
+			if !strings.Contains(err.Error(), "already requested") {
+				t.Errorf("err = %v; want the message to name the stop already on file", err)
+			}
+			if !strings.Contains(err.Error(), "may still be draining") {
+				t.Errorf("err = %v; want the message to name why the destination is not free yet", err)
+			}
+			if !strings.Contains(err.Error(), "records its exit") || !strings.Contains(err.Error(), "2m0s") {
+				t.Errorf("err = %v; want the message to name BOTH ends of the wait (recorded exit / staleness)", err)
+			}
+			if !strings.Contains(err.Error(), "--force") {
+				t.Errorf("err = %v; want the --force override to stay reachable", err)
+			}
+		})
 	}
 }
 
