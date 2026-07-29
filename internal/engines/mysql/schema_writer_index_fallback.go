@@ -122,7 +122,16 @@ func (w *SchemaWriter) buildTableIndexesWithDeployFallback(
 	direct func(ctx context.Context, job indexBuildJob) error,
 ) error {
 	if w.indexBuildFallback == nil {
-		return direct(ctx, job)
+		err := direct(ctx, job)
+		// One WARN, and only on the walled path: the automatic recovery for
+		// exactly this wall exists but was never injected, and saying nothing
+		// leaves the operator to discover it from the docs. Scoped to
+		// isIndexBuildWalled so a successful build (the overwhelmingly common
+		// case) and an ordinary DDL fault stay quiet.
+		if err != nil && isIndexBuildWalled(err) {
+			warnIndexFallbackNotArmed(ctx, job.tableName, err)
+		}
+		return err
 	}
 
 	if w.indexFallbackTableClearlyHuge(ctx, job.tableName) {
@@ -172,6 +181,28 @@ func (w *SchemaWriter) buildTableIndexesWithDeployFallback(
 		return fmt.Errorf("mysql: deploy-request index fallback for %q failed (engaged because the direct build failed: %w): %w",
 			job.tableName, err, ferr)
 	}
+}
+
+// warnIndexFallbackNotArmed is the nil-fallback sibling of the
+// "fallback unavailable" WARN: the ADR-0148 deploy-request recovery for
+// exactly this wall was never injected, because no PlanetScale control-plane
+// credentials were supplied. The direct build has already failed by the time
+// this fires, so naming the arming inputs costs the operator nothing and
+// saves them discovering the feature from the docs after the fact.
+//
+// Deliberately NOT symmetric with the unavailable WARN in one respect: it is
+// scoped to the walled shapes only, so a run whose index builds all succeed
+// (every non-PlanetScale target, every table under the wall) emits nothing.
+// One WARN per walled table — which is one per run in practice, since a
+// walled build aborts the index phase through the orchestrator's errgroup.
+func warnIndexFallbackNotArmed(ctx context.Context, table string, cause error) {
+	slog.WarnContext(ctx,
+		"mysql: direct index build hit PlanetScale's wall and no deploy-request index fallback is armed; "+
+			"sluice can build the index via a dev branch + deploy request instead (ADR-0148), which VReplication runs async and unbounded by errno 3024 — "+
+			"arm it with --planetscale-org plus a service token in PLANETSCALE_SERVICE_TOKEN_ID/PLANETSCALE_SERVICE_TOKEN, "+
+			"and note it requires safe migrations ON for the target branch (sluice never toggles that itself)",
+		slog.String("table", table),
+		slog.String("direct_error", cause.Error()))
 }
 
 // routeIndexJobToFallback re-derives the table's STILL-PENDING secondary

@@ -217,9 +217,17 @@ func (s *Streamer) repairColdStartFloats(ctx context.Context, plan []floatRepair
 		tgtByName[t.Name] = t
 	}
 
+	// PhaseConnect, not PhaseSnapshot: this is a DSN connection open, and the
+	// connect-phase entries (connection refused / password authentication
+	// failed / database does not exist) are the ones that can fire on it.
+	// PhaseSnapshot has no registry entries at all, so the previous wrapping
+	// was a guaranteed identity function — a wrong DSN here produced no hint
+	// and no SLUICE-E- code, while the symmetric target open twelve lines
+	// below produced both. Same class as the errno-3024 index-wall wiring bug:
+	// the registry was fine, the phase argument was not.
 	rr, err := s.Source.OpenRowReader(ctx, s.SourceDSN)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: float repair: open source reader: %w", err))
+		return connectHint(fmt.Errorf("pipeline: float repair: open source reader: %w", err))
 	}
 	defer migcore.CloseIf(rr)
 	br, ok := rr.(ir.BatchedRowReader)

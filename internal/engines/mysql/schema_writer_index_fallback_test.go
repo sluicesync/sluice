@@ -512,3 +512,90 @@ func TestVStreamSerialOverlap_WalledRoutesToDeployFallback(t *testing.T) {
 		t.Errorf("IndexesBuilt callbacks = %v; want [orders] (build-then-mark after fallback recovery)", marked)
 	}
 }
+
+// ---- the unarmed-fallback advisory ----
+
+// TestCreateIndexes_NilFallbackWarnsTheWallIsRecoverable pins the quieter
+// half of the index-wall operator-experience gap: with NO fallback injected
+// (no PlanetScale credentials supplied) sluice took the doomed direct path
+// and said NOTHING about the ADR-0148 recovery existing — even though that
+// recovery is the automatic fix for exactly this wall. The *unavailable*
+// case already WARNed; the *nil* case did not.
+//
+// Both walled shapes are pinned, not one representative: the decision tree
+// gates on isIndexBuildWalled, which classifies errno 3024 and errno 1105
+// through separate branches.
+func TestCreateIndexes_NilFallbackWarnsTheWallIsRecoverable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wall error
+	}{
+		{"errno 3024 statement-time wall", err3024()},
+		{"errno 1105 direct-DDL block", err1105DirectDDL()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &fbRecorder{failContains: map[string]error{"`idx_val`": tc.wall}}
+			w := newFallbackWriter(t, rec, nil)
+
+			var err error
+			log := captureWarnLog(t, func() {
+				err = w.CreateIndexes(context.Background(), fbSchemaOneTable(fbBTreeIdx("idx_val", "val")))
+			})
+			if err == nil {
+				t.Fatal("CreateIndexes succeeded; the fake ALTER was supposed to be walled")
+			}
+			if !strings.Contains(log, "no deploy-request index fallback is armed") {
+				t.Fatalf("no WARN named the unarmed fallback; log was:\n%s", log)
+			}
+			// A WARN the operator cannot act on is noise, so the arming
+			// inputs are part of the contract.
+			for _, want := range []string{
+				"--planetscale-org",
+				"PLANETSCALE_SERVICE_TOKEN_ID",
+				"PLANETSCALE_SERVICE_TOKEN",
+				"safe migrations",
+			} {
+				if !strings.Contains(log, want) {
+					t.Errorf("WARN does not name %q:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateIndexes_NilFallbackStaysQuietOffTheWalledPath is the other half:
+// the WARN is scoped to the walled shapes, so a run whose index builds
+// succeed — every non-PlanetScale target, every table under the wall —
+// emits nothing, and a real DDL fault is not dressed up as a PlanetScale
+// problem.
+func TestCreateIndexes_NilFallbackStaysQuietOffTheWalledPath(t *testing.T) {
+	t.Run("successful build", func(t *testing.T) {
+		w := newFallbackWriter(t, &fbRecorder{}, nil)
+		var err error
+		log := captureWarnLog(t, func() {
+			err = w.CreateIndexes(context.Background(), fbSchemaOneTable(fbBTreeIdx("idx_val", "val")))
+		})
+		if err != nil {
+			t.Fatalf("CreateIndexes: %v", err)
+		}
+		if strings.Contains(log, "deploy-request index fallback") {
+			t.Errorf("a successful index build advertised the fallback:\n%s", log)
+		}
+	})
+
+	t.Run("non-walled DDL fault", func(t *testing.T) {
+		dup := &gomysql.MySQLError{Number: 1061, Message: "Duplicate key name 'idx_val'"}
+		rec := &fbRecorder{failContains: map[string]error{"`idx_val`": dup}}
+		w := newFallbackWriter(t, rec, nil)
+		var err error
+		log := captureWarnLog(t, func() {
+			err = w.CreateIndexes(context.Background(), fbSchemaOneTable(fbBTreeIdx("idx_val", "val")))
+		})
+		if err == nil {
+			t.Fatal("expected the duplicate-key fault to fail loudly")
+		}
+		if strings.Contains(log, "deploy-request index fallback") {
+			t.Errorf("an ordinary DDL fault was blamed on the missing fallback:\n%s", log)
+		}
+	})
+}
