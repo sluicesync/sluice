@@ -61,6 +61,10 @@ Continuous sync (`sluice sync start`) needs a change stream from the source. Whi
 | `sqlite-trigger` / `d1-trigger` | Trigger-based change log | Write access to the file / D1 database. | Exactly-once resume via a change-log watermark. |
 | `sqlite`, `d1`, `csv`, `tsv`, `ndjson`, `mydumper` | none | — | Migrate-only sources. |
 
+<!-- cdc-modes: csv=none, d1=none, d1-trigger=triggers, mariadb=binlog, mydumper=none, mysql=binlog, ndjson=none, planetscale=vstream, postgres=logical-replication, postgres-trigger=triggers, sqlite=none, sqlite-trigger=triggers, tsv=none, vitess=vstream -->
+
+The marker above is not decoration: `TestCDCModeTableMatchesTheRegistry` derives this pairing from the engine registry's own capability declarations and fails the build if the table drifts. It exists because "which engines does this CDC change affect" is a sentence this project has gotten wrong four releases running — most recently a fix to the **binlog** reader described as reaching PlanetScale and Vitess, which stream through VStream and were never on that path. If you are writing release notes about a CDC-path change, take the engine list from this table rather than from the shape of the fix.
+
 CDC **apply** targets are MySQL-family and Postgres (concurrent key-hash apply on both). SQLite is a migrate-only target. The operator guide for running CDC day-to-day is [operator/cdc-streaming](operator/cdc-streaming.md).
 
 ## Known limitations

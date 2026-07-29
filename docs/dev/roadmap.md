@@ -1872,13 +1872,19 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 **Behaviour change worth calling out in the notes:** an operator running `backup verify` on a schedule against chains written by an older release will see it start refusing what it used to pass. That refusal is the truth restore was already telling them.
 
 
-### 105. The CDC-mode-per-source engine list is prose, and prose is where the engine-set claims go wrong — *open, LOW / gate-ratchet*
+### 105. The CDC-mode-per-source engine list is prose, and prose is where the engine-set claims go wrong — *DONE — the gate is live on `main`. It is a test, so it protects every subsequent release rather than shipping in one.*
 
 **Why now.** Writing v0.104.4's release notes, the first draft said the MySQL close-vs-pump fix reached "MySQL, MariaDB, PlanetScale or Vitess". It does not: `Flavor.usesVStream()` (`internal/engines/mysql/flavor.go:89`) routes PlanetScale and Vitess to a different reader entirely, so the fix reaches `mysql` and `mariadb` and nothing else. Caught by reading the dispatch before publishing — which is the CLAUDE.md rule working, and also the reason the rule exists: this is the fourth release in a row where an engine-set sentence was the part that was wrong while the fix underneath it was right.
 
 **What to build.** The `internal/docsync` pattern that already exists for filtered sync (`TestFilteredSyncEngineListMatchesTheCode`: capability pin → engine set → doc marker). Here the derivable fact is the CDC mode per source — binlog for `mysql`/`mariadb`, VStream for `planetscale`/`vitess`, logical replication for `postgres`, trigger for the pgtrigger/D1 variants — and the doc to hold to it is `docs/production-readiness.md`'s CDC-modes table, which is correct today and unguarded. ~80 lines, and it converts a recurring prose error into a build failure.
 
 **Scope note.** Release notes and CHANGELOG entries stay prose and stay unguarded — they are archival and each names a moment. The gate belongs on the living doc; the discipline for the notes is to derive the sentence from the gated table rather than from the shape of the fix.
+
+**BUILT (`internal/docsync/cdc_mode_engines_test.go`).** `TestCDCModeTableMatchesTheRegistry` iterates the real engine registry — the same blank-import set `cmd/sluice/main.go` links — reads each engine's `Capabilities().CDC`, and holds `docs/production-readiness.md`'s `<!-- cdc-modes: … -->` marker to the derived pairing. Today that is 14 engines: `mysql`/`mariadb` binlog, `planetscale`/`vitess` vstream, `postgres` logical-replication, the three trigger engines, and six with none.
+
+Three properties worth keeping if it is ever edited. It checks the **mechanism**, not just presence — the sibling gate next door already asks "is this engine named in the CDC guide", and presence was never the thing going wrong. It includes the `none` engines, because "which sources have no CDC at all" is the same class of claim. And it carries a **non-vacuity floor** (a minimum registry size, three named engines whose mechanisms differ, and at least one non-`none`), so a dropped blank import fails the gate instead of quietly agreeing with the doc about a smaller world — the failure mode that made three of this session's gates pass against the defects they were named for.
+
+Mutation-verified: flipping `planetscale=vstream` to `binlog` in the marker — the exact error in v0.104.4's first-draft notes — fails with `WRONG mechanism for planetscale: doc says binlog, registry says vstream`.
 
 
 ### 104. v0.104.3 added a FOURTH fingerprint epoch — the `omitempty` fix does not hold for the value a real Postgres source produces (Bug 216) — *FIXED, ships in v0.104.4*
