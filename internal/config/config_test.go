@@ -309,6 +309,84 @@ func TestEnvVars_UnknownVarWarnsLoudly(t *testing.T) {
 	}
 }
 
+// TestEnvVars_ClaimedVarDoesNotWarn pins the flag-claim exemption: an
+// env var an operator explicitly pointed a flag at
+// (--encryption-passphrase-env SLUICE_PASS — the shape the flag's own
+// help text RECOMMENDS) must not be reported as a typo, while a
+// genuinely unrecognised SLUICE_ variable in the same process still is.
+// Without this, sluice warned about its own documented production
+// pattern on every backup command.
+func TestEnvVars_ClaimedVarDoesNotWarn(t *testing.T) {
+	t.Setenv("SLUICE_PASS", "hunter2")
+	t.Setenv("SLUICE_TYPO_KEY", "1")
+
+	SetClaimedEnvVars([]string{"SLUICE_PASS"})
+	t.Cleanup(func() { SetClaimedEnvVars(nil) })
+
+	logs := captureLoadWarnings(t, "")
+	if strings.Contains(logs, "SLUICE_PASS") {
+		t.Errorf("WARN log %q flagged the flag-claimed passphrase var", logs)
+	}
+	if !strings.Contains(logs, "SLUICE_TYPO_KEY") {
+		t.Errorf("WARN log %q lost the genuine typo — the claim must not blanket-suppress", logs)
+	}
+}
+
+// TestEnvVars_ConfigDeclaredKeysetEnvVarDoesNotWarn covers the same
+// defect reached from the config file instead of a flag: a
+// `keyset_source: env:VARNAME` names a variable exactly the way
+// `--keyset-source env:VARNAME` does.
+func TestEnvVars_ConfigDeclaredKeysetEnvVarDoesNotWarn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sluice.yaml")
+	if err := os.WriteFile(path, []byte("keyset_source: env:SLUICE_KEYSET\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SLUICE_KEYSET", "keys:\n  - name: k1\n")
+	t.Setenv("SLUICE_TYPO_KEY", "1")
+
+	logs := captureLoadWarnings(t, path)
+	if strings.Contains(logs, "var=SLUICE_KEYSET") {
+		t.Errorf("WARN log %q flagged the config-declared keyset holder", logs)
+	}
+	if !strings.Contains(logs, "SLUICE_TYPO_KEY") {
+		t.Errorf("WARN log %q lost the genuine typo", logs)
+	}
+}
+
+// captureLoadWarnings runs Load against path with slog captured and
+// returns everything it logged.
+func captureLoadWarnings(t *testing.T, path string) string {
+	t.Helper()
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return logBuf.String()
+}
+
+// TestEnvVarNameFromSpec pins the one definition of "this spec names an
+// environment variable" the claim registration and the scan share.
+func TestEnvVarNameFromSpec(t *testing.T) {
+	cases := map[string]string{
+		"env:SLUICE_KEYSET":            "SLUICE_KEYSET",
+		"env:":                         "",
+		"file:/etc/sluice/keyset.yaml": "",
+		"db:postgres://u:p@h/db":       "",
+		"/etc/sluice/sign.pem":         "",
+		"kms://aws/alias/sluice":       "",
+		"":                             "",
+	}
+	for spec, want := range cases {
+		if got := EnvVarNameFromSpec(spec); got != want {
+			t.Errorf("EnvVarNameFromSpec(%q) = %q; want %q", spec, got, want)
+		}
+	}
+}
+
 // TestEnvKeyIndex_Resolve pins the resolver's mapping table shape:
 // flat, nested, map-valued, and YAML-only block keys.
 func TestEnvKeyIndex_Resolve(t *testing.T) {
