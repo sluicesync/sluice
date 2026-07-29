@@ -1857,6 +1857,21 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 106. `backup verify` was green over chains `restore` refuses — the fingerprint preflight it never made (Bug 217) — *FIXED, ships in v0.104.5*
+
+**What.** `sluice backup verify` returned rc=0 `all chunks OK` over a chain `restore` refuses with rc=3 and zero rows. Found by the v0.104.4 regression cycle, which asked the question v0.104.3's own headline had turned into a house rule: does verify AGREE with restore? Pre-existing back to **v0.103.2** — every released binary has it.
+
+**Why it is worse than a release-skew nit.** The cycle scoped it before filing, and the scoping is the interesting part: verify DOES catch a corrupted chunk, a deleted chunk, a severed lineage link, and (with `--verify-key`) signature failures. The manifest schema fingerprint was the **only** restore preflight it skipped — and changing **one hex digit** of a chain's own `schema_hash` was invisible to verify on all six staged binaries while all six refused to restore it. So this is not "verify cannot see across an epoch boundary", it is "verify cannot see a class of manifest damage restore refuses on". Signing was the only mitigation, and it works, but it is opt-in and the check it backstops is not.
+
+**Fix.** `verifyBackupScan` now runs `verifySchemaHashes` over the built lineage chain — the same function, on the same links, that `chain_restore.go` runs — and reports the same `SLUICE-E-BACKUP-MANIFEST-INVALID` with the same two-cause wording, so a script branching on the code gets one answer from both commands.
+
+**Scoped to what restore ACTUALLY does, which is the load-bearing half.** Restore runs this check on the CHAIN path only; a one-segment-no-incrementals lineage takes the single-manifest path, which never walks links and never fingerprints them. That is why a **bare full crosses an epoch fine** (item 102's blast-radius note), and a verify that refused it would report a chain broken that restores row-exact — the same defect inverted. The predicate is now shared: `Restore.lineageNeedsWalk` delegates to `verifyLineageNeedsWalk`, one function with two callers, so verify and restore cannot drift into disagreeing about which shape gets checked. Same reasoning as the nil comparator on the lineage walk above it: **verify must never refuse a chain restore would accept.**
+
+**Pins, mutation-verified.** `verify_schema_fingerprint_test.go`: a one-hex-digit edit to the root full's fingerprint and to an incremental's each refuse under the restore code, an intact chain verifies clean, and — the honest one — a **bare full** with a mismatched fingerprint still verifies green. Disabling the check fails the two refusal cases deterministically. Real-binary half: cell 5 of the cross-version suite now asserts verify refuses the same epoch-crossing chain restore just refused, and names the schema fingerprint when it does.
+
+**Behaviour change worth calling out in the notes:** an operator running `backup verify` on a schedule against chains written by an older release will see it start refusing what it used to pass. That refusal is the truth restore was already telling them.
+
+
 ### 105. The CDC-mode-per-source engine list is prose, and prose is where the engine-set claims go wrong — *open, LOW / gate-ratchet*
 
 **Why now.** Writing v0.104.4's release notes, the first draft said the MySQL close-vs-pump fix reached "MySQL, MariaDB, PlanetScale or Vitess". It does not: `Flavor.usesVStream()` (`internal/engines/mysql/flavor.go:89`) routes PlanetScale and Vitess to a different reader entirely, so the fix reaches `mysql` and `mariadb` and nothing else. Caught by reading the dispatch before publishing — which is the CLAUDE.md rule working, and also the reason the rule exists: this is the fourth release in a row where an engine-set sentence was the part that was wrong while the fix underneath it was right.

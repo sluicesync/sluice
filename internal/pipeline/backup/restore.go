@@ -299,14 +299,34 @@ func (r *Restore) reparentMark() func(string) {
 // (== a pre-ADR single full) returns false so the single-manifest path
 // handles it with byte-identical behaviour.
 func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
-	cat, err := lineage.ResolveLineage(ctx, r.Store)
+	return verifyLineageNeedsWalk(ctx, r.Store)
+}
+
+// verifyLineageNeedsWalk is the store-only form of [Restore.lineageNeedsWalk],
+// shared so `backup verify` can ask the question restore asks —
+// "would this restore walk the chain?" — and run exactly the preflights
+// restore would (Bug 217). Two callers, one predicate, on purpose: a
+// verify that answered this question its own way could drift into
+// refusing a chain restore accepts, which is the failure mode the whole
+// verify-agrees-with-restore contract exists to prevent.
+//
+// An empty catalog reports false rather than indexing into nothing. That
+// shape does not reach here through either caller today (verify refuses
+// on zero manifests earlier, restore resolves a catalog it just built),
+// but a predicate that panics on it would be a poor thing to share.
+func verifyLineageNeedsWalk(ctx context.Context, store irbackup.Store) (bool, error) {
+	cat, err := lineage.ResolveLineage(ctx, store)
 	if err != nil {
 		return false, err
 	}
-	if len(cat.Segments) > 1 {
+	switch {
+	case len(cat.Segments) == 0:
+		return false, nil
+	case len(cat.Segments) > 1:
 		return true, nil
+	default:
+		return len(cat.Segments[0].Incrementals) > 0, nil
 	}
-	return len(cat.Segments[0].Incrementals) > 0, nil
 }
 
 // rootSegmentCodec returns the codec recorded for segment 0 (the root
@@ -1641,10 +1661,41 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// comparisons, which need a target engine verify does not have.
 	// Nil therefore makes this check a strict subset of the one restore
 	// runs, so verify can never refuse a chain restore would accept.
-	if _, cerr := lineage.BuildLineageChain(ctx, store, nil); cerr != nil {
+	chain, cerr := lineage.BuildLineageChain(ctx, store, nil)
+	if cerr != nil {
 		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
 			"this chain cannot be restored as it stands — restore from an intact copy; if a prune/compact produced it, the surviving links no longer form one chain",
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
+	}
+
+	// The SECOND restore preflight verify has to make, and the last one it
+	// was missing (Bug 217, found by the v0.104.4 regression cycle).
+	//
+	// A chain restore recomputes every link's schema fingerprint and
+	// refuses the whole chain on a mismatch. Verify did not, so it
+	// returned rc=0 `all chunks OK` over chains restore refuses with
+	// rc=0 rows — and not only across a release boundary: changing ONE
+	// hex digit of a manifest's own `schema_hash` was invisible to verify
+	// on every released binary while every one of them refused to restore
+	// it. That is the exact defect class v0.104.3 existed to close, one
+	// preflight over, and it was pre-existing back to v0.103.2.
+	//
+	// Scoped to what restore ACTUALLY does, for the same reason the
+	// lineage walk above passes a nil comparator: verify must never
+	// refuse a chain restore would accept. Restore runs this check on the
+	// chain path only — a one-segment-no-incrementals lineage takes the
+	// single-manifest path, which never walks links and never
+	// fingerprints them, so a BARE FULL legitimately crosses an epoch
+	// boundary and must keep verifying green here (roadmap item 102's
+	// blast-radius note, and a cell the cross-version suite pins).
+	needsWalk, lerr := verifyLineageNeedsWalk(ctx, store)
+	if lerr != nil {
+		return verifyScanTally{}, fmt.Errorf("verify: resolve lineage: %w", lerr)
+	}
+	if needsWalk {
+		if serr := verifySchemaHashes(ctx, chain); serr != nil {
+			return verifyScanTally{}, serr
+		}
 	}
 
 	// The chain's IDENTITY manifest, which is not necessarily

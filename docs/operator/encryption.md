@@ -110,7 +110,9 @@ sluice backup verify --from=s3://my-bucket/backups/2026-05-09/ \
 # backup verify: all chunks OK  chunks=42 decrypted=42
 ```
 
-Both depths walk the chain's lineage before they check a single chunk, the way `restore` does — a mis-stitched chain (one a `prune` or `compact` left un-walkable) is refused at either depth, because a chain restore will not start on is not healthy no matter how its bytes hash.
+Both depths run `restore`'s manifest preflights before they check a single chunk, and refuse whatever restore would refuse — because a chain restore will not start on is not healthy no matter how its bytes hash. That is two checks. The chain's **lineage** must walk (a `prune` or `compact` that left the links un-stitched is refused at either depth), and every link's recorded **schema fingerprint** must reproduce (`SLUICE-E-BACKUP-MANIFEST-INVALID`, with the same two-cause wording restore gives — a manifest written by a release with a different internal schema field set, or genuine corruption). The fingerprint half landed in v0.104.5: before it, a chain written by another release, or one whose recorded fingerprint had been edited, verified `all chunks OK` and then failed to restore with zero rows.
+
+One deliberate asymmetry, and it is not an oversight: a **bare full** — one segment, no incrementals — is not fingerprint-checked, because the single-manifest restore path does not check it either. Such a backup restores across a fingerprint-epoch boundary, so refusing it at verify would report a healthy backup broken. **Verify never refuses what restore accepts**, in either direction.
 
 Read the `decrypted=` count, not just the exit status: it is how many chunks were actually opened. `decrypted=0` on an encrypted chain means you got the sha256-only depth. (Through v0.104.2 this line was a bare `decrypt_probe=true` that meant only "a key was supplied" — on the default per-chain mode no chunk was ever opened, and a chain whose tail could not be decrypted verified green. See roadmap item 97 / Bug 215.)
 

@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**`backup verify` returned a clean result on chains `restore` refuses.** Every restore preflight verify was missing is now one it makes: it already re-checksums and authenticates every chunk, and already refuses a chain whose links no longer stitch together — but it never recomputed each manifest's recorded schema fingerprint, which is a check `restore` runs on every link and refuses the whole chain on. So a chain written by a release with a different internal schema field set verified `all chunks OK`, rc=0, and then failed to restore with rc=3 and zero rows. **It was not only a release-skew story:** changing a single hex digit of a manifest's own `schema_hash` was invisible to verify on every released binary, while every one of them refused to restore that chain. That is the trust signal operators are told to run on a schedule precisely so they never learn about a bad backup during a recovery, and it was answering a narrower question than the one being asked. Verify now runs the fingerprint check on exactly the shapes restore runs it on — the chain path — and reports the same `SLUICE-E-BACKUP-MANIFEST-INVALID` refusal with the same two-cause wording, so a script branching on the code sees one answer from both commands. **A bare full still verifies green**, deliberately: the single-manifest restore path never walks links and never fingerprints them, so a bare full legitimately crosses an epoch boundary, and a verify that refused it would report a chain broken that restores row-exact. Pre-existing back to v0.103.2; found by the v0.104.4 regression cycle asking whether verify agreed with restore. **If you run `backup verify` on a schedule against chains written by an older release, expect it to start refusing what it used to pass** — that refusal is the truth restore was already telling you.
+
 ## [0.104.4] - 2026-07-28
 
 ### Fixed

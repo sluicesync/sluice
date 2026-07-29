@@ -402,6 +402,18 @@ func xvBackupIncremental(t *testing.T, bin, srcDSN, dir, slot string) {
 	xvMustExec(t, "backup incremental", bin, args...)
 }
 
+// xvVerify runs `backup verify` over the same directory a cell restores,
+// so a cell can assert the two AGREE. Bug 217: verify skipped the
+// schema-fingerprint preflight restore runs, so it returned rc=0 over
+// epoch-crossing chains restore refuses — the trust signal an operator
+// runs on a schedule saying healthy about a chain that cannot be
+// recovered. No target: verify reads the store and nothing else.
+func xvVerify(t *testing.T, bin, dir string) (string, error) {
+	t.Helper()
+	args := append([]string{"backup", "verify", "--from-dir", dir}, xvEncryptFlags()...)
+	return xvExec(t, bin, args...)
+}
+
 func xvRestore(t *testing.T, bin, dir, targetDSN string) (string, error) {
 	t.Helper()
 	args := append([]string{
@@ -978,6 +990,25 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 
 		out, err := xvRestore(t, bins.newBin, dir, tgt)
 		xvAssertSchemaFingerprintRefusal(t, "cell 5 (NEW restores an EPOCH-crossing chain)", out, err, tgt, bins.xvEpochVersion())
+
+		// AND verify must say the same thing (Bug 217). This is the one
+		// place in the suite where a chain restore refuses is already
+		// built, so it is the cheapest place to hold verify to it: for
+		// as long as verify skipped the fingerprint preflight, it
+		// returned rc=0 `all chunks OK` right here — every chunk really
+		// was intact, and the chain really was unrestorable, which is
+		// precisely the disagreement v0.104.3's headline existed to
+		// close one preflight over.
+		vout, verr := xvVerify(t, bins.newBin, dir)
+		if verr == nil {
+			t.Fatalf("cell 5: `backup verify` returned CLEAN over the same epoch-crossing chain restore just refused. "+
+				"An operator who runs verify on a schedule would be told this chain is healthy and discover otherwise "+
+				"during a recovery — see Bug 217.\n--- verify output ---\n%s", vout)
+		}
+		if !strings.Contains(vout, "schema") {
+			t.Errorf("cell 5: verify refused, but its output does not name the schema fingerprint, so an operator cannot "+
+				"tell this refusal from chunk corruption:\n%s", vout)
+		}
 		ledger.report(t, "5-epoch-partition")
 	})
 
