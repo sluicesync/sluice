@@ -11,6 +11,7 @@ package pipeline
 import (
 	"context"
 	"log/slog"
+	"time"
 )
 
 func warnConcurrentWriterOverride(ctx context.Context, prior *streamState, conflict string) {
@@ -34,13 +35,15 @@ func warnConcurrentWriterTakeover(ctx context.Context, prior *streamState) {
 
 // logConcurrentWriterHandoff is INFO, not WARN, on purpose: a recorded
 // handoff is the supervisor-restart happy path, not an anomaly the
-// operator should go look at.
-func logConcurrentWriterHandoff(ctx context.Context, prior *streamState, evidence string) {
+// operator should go look at. exitedAt comes from [priorHandedOff]
+// rather than being re-derived here — it is the evidence that admitted
+// the takeover.
+func logConcurrentWriterHandoff(ctx context.Context, prior *streamState, exitedAt time.Time) {
 	slog.InfoContext(
-		ctx, "stream: prior stream handed off this destination; taking over",
+		ctx, "stream: prior stream recorded a clean exit; taking over destination",
 		slog.Int("prior_pid", prior.PID),
 		slog.String("prior_host", prior.Host),
-		slog.String("evidence", evidence),
+		slog.Time("prior_stopped_at", exitedAt),
 	)
 }
 
