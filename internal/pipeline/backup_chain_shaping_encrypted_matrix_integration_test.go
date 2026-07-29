@@ -158,6 +158,57 @@ func (f *shapingFixture) runIncremental(t *testing.T) *irbackup.Manifest {
 	return nil
 }
 
+// runIncrementalFromStaleParent is the LOSER of the overlapping-cron
+// race, replayed deterministically. A second `backup incremental` whose
+// window opened before the first one committed holds a parent that is no
+// longer the chain's tip — on Postgres it gets there by blocking on the
+// replication slot, waiting out the winner, then re-reading the same
+// changes from the slot restart position. Pinning `ParentRef` to the
+// pre-winner tip reproduces exactly that state at commit time without a
+// slot stand-off, so the cell is deterministic instead of timing-shaped.
+//
+// It must REFUSE, loudly and coded, and it must leave the chain
+// byte-untouched: pre-v0.104.7 it exited 0 and committed a sibling, and
+// the chain was unrestorable from that moment on.
+func (f *shapingFixture) runIncrementalFromStaleParent(t *testing.T, staleParentID string) error {
+	t.Helper()
+	eng, _ := engines.Get("postgres")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return (&IncrementalBackup{
+		Source:        eng,
+		SourceDSN:     f.sourceDSN,
+		Store:         f.store,
+		ParentRef:     staleParentID,
+		Window:        8 * time.Second,
+		MaxChanges:    200,
+		ChunkChanges:  50,
+		SluiceVersion: "test",
+		Encryption:    f.writerEncryption(t),
+	}).Run(ctx)
+}
+
+// openSegmentTip returns the BackupID of the open segment's current
+// chain tip — the link a well-behaved incremental must extend.
+func (f *shapingFixture) openSegmentTip(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, f.store)
+	if err != nil || !ok {
+		t.Fatalf("LoadLineageCatalog: ok=%v err=%v", ok, err)
+	}
+	seg := cat.Segments[len(cat.Segments)-1]
+	path := seg.FullManifestPath
+	if n := len(seg.Incrementals); n > 0 {
+		path = seg.Incrementals[n-1]
+	}
+	m, err := lineage.ReadManifestAt(ctx, seg.Store(f.store), path)
+	if err != nil {
+		t.Fatalf("read chain tip %q: %v", path, err)
+	}
+	return lineage.ManifestBackupID(m)
+}
+
 // runStreamResume restarts `backup stream` against the ALREADY-ROTATED
 // chain — the ordinary supervisor restart. The Bug-215 shape reaches it
 // too, and far more often than the one-shot incremental does: a stream
@@ -327,6 +378,107 @@ func shapingOps() []shapingOp {
 			},
 		},
 		{
+			// The overlapping-cron FORK cell (2026-07-28 field defect,
+			// reproduced on real AWS S3 and on a local directory).
+			//
+			// Two `backup incremental` runs against one chain both exited
+			// rc=0 with the SAME `parent_backup_id`, and the lineage
+			// committed both as if sequential. `verify` and `restore` then
+			// refused the chain permanently — while it kept ACCEPTING
+			// incrementals, so an operator with overlapping crons banks
+			// weeks of green backups on a chain that died at the fork.
+			//
+			// ADR-0160's generation CAS did not catch it and could not: it
+			// serialises catalog WRITES, and both writes were serialised
+			// correctly (the `lineage.gen/` markers advanced 1→2→3 with no
+			// clobber). The missing precondition is on the LINK — an
+			// incremental may only be appended while its parent is still
+			// the tip.
+			//
+			// This cell belongs in THIS matrix rather than beside its unit
+			// pins for the reason the file's header gives: what makes a
+			// chain-shaping defect expensive is not the operation's return
+			// value, it is whether the chain still RESTORES afterwards, in
+			// every encryption mode. A refusal that left the chain damaged
+			// would be a different bug wearing this one's fix.
+			name: "concurrent-incremental-fork",
+			apply: func(t *testing.T, f *shapingFixture) string {
+				ctx := context.Background()
+				staleTip := f.openSegmentTip(t)
+
+				// The winner: an ordinary incremental. It advances the tip.
+				f.insert(t, 3)
+				won := f.runIncremental(t)
+				if len(won.ChangeChunks) == 0 {
+					t.Fatal("the winning incremental captured no change chunks; this cell would be vacuous")
+				}
+				if newTip := f.openSegmentTip(t); newTip == staleTip {
+					t.Fatalf("the chain tip did not move (%s); the loser below would not be stale and this cell "+
+						"would be vacuous", staleTip)
+				}
+
+				before, ok, err := lineage.LoadLineageCatalog(ctx, f.store)
+				if err != nil || !ok {
+					t.Fatalf("LoadLineageCatalog: ok=%v err=%v", ok, err)
+				}
+				beforeManifests := len(f.manifestPaths(t))
+
+				// The loser: same parent, committing after the winner.
+				f.insert(t, 2)
+				lossErr := f.runIncrementalFromStaleParent(t, staleTip)
+				if lossErr == nil {
+					t.Fatal("the second `backup incremental` off the SAME parent exited 0 — it committed a SIBLING " +
+						"and forked the lineage. Both runs report success; `backup verify` and `restore` refuse the " +
+						"chain from here on, and it keeps accepting further incrementals off whichever sibling won " +
+						"the tail.")
+				}
+				ce, coded := sluicecode.FromError(lossErr)
+				if !coded || ce.Code != sluicecode.CodeBackupChainConflict {
+					t.Fatalf("the loser failed with %v; want a coded %s refusal naming the concurrent writer",
+						lossErr, sluicecode.CodeBackupChainConflict)
+				}
+
+				// It must have written NOTHING durable: no manifest, no
+				// catalog entry. A refusal that still left a sibling
+				// manifest behind would leave the next reconcile with a
+				// branch it refuses to guess at.
+				after, ok, err := lineage.LoadLineageCatalog(ctx, f.store)
+				if err != nil || !ok {
+					t.Fatalf("post-refusal LoadLineageCatalog: ok=%v err=%v", ok, err)
+				}
+				if len(after.Segments) != len(before.Segments) {
+					t.Fatalf("the refused run changed the segment count: %d → %d",
+						len(before.Segments), len(after.Segments))
+				}
+				for si := range after.Segments {
+					if got, want := after.Segments[si].Incrementals, before.Segments[si].Incrementals; len(got) != len(want) {
+						t.Fatalf("the refused run appended to segment %d: %v → %v", si, want, got)
+					}
+				}
+				if got := len(f.manifestPaths(t)); got != beforeManifests {
+					t.Fatalf("chain manifests = %d after a refused run; want the %d that were there before",
+						got, beforeManifests)
+				}
+
+				// The REMEDIATION the refusal prints — "re-run to extend
+				// from <tip>" — has to actually work. A guard that turned an
+				// overlapping cron into a permanently un-extendable chain
+				// would be its own outage, and the loser's window (the two
+				// rows above) has to end up in the chain via this re-run or
+				// the round trip below is short by two rows.
+				retried := f.runIncremental(t)
+				if len(retried.ChangeChunks) == 0 {
+					t.Fatal("the post-refusal re-run captured no change chunks; the remediation is not pinned")
+				}
+				if got, want := len(f.manifestPaths(t)), beforeManifests+1; got != want {
+					t.Fatalf("chain manifests = %d after the refusal + re-run; want %d (exactly one new link — "+
+						"the refused sibling must never appear)", got, want)
+				}
+				return fmt.Sprintf("winner committed off %s; the stale-parent loser refused with %s and wrote nothing; the re-run extended the real tip",
+					staleTip, ce.Code)
+			},
+		},
+		{
 			// Roadmap item 100's cell — and the record of a decision this
 			// matrix forced.
 			//
@@ -481,7 +633,7 @@ func shapingModes() []struct{ name, mode string } {
 // apply the operation, then VERIFY it, RESTORE it, and compare rows to
 // the source.
 //
-// Damage map as of 2026-07-28 — all 18 cells round-trip row-exact:
+// Damage map as of 2026-07-29 — all 21 cells round-trip row-exact:
 //
 //	rotate                     ×3   green
 //	rotate-then-resume         ×3   green  (per-chain was Bug 215 — RED
@@ -490,6 +642,10 @@ func shapingModes() []struct{ name, mode string } {
 //	rotate-then-stream-resume  ×3   green  (same defect, ordinary restart)
 //	compact                    ×3   green  (Bug 214's cell)
 //	compact-after-rotate       ×3   green
+//	concurrent-incremental-fork ×3  green  (the 2026-07-28 overlapping-cron
+//	                                        FORK — RED pre-fix in all three
+//	                                        modes with BOTH runs exiting 0,
+//	                                        mutation-verified)
 //	prune                      ×3   green  (was REFUSED + intact while
 //	                                        roadmap item 100's retention
 //	                                        CONTRACT was open — a keep-count

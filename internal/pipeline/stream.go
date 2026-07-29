@@ -987,6 +987,21 @@ func (b *BackupStream) drainCommitInFlightRollover(ctx context.Context, roll rol
 	}
 	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 	defer commitCancel()
+	// Chain-tip guard (see lineage/chain_tip.go). The drain path is
+	// best-effort about CATALOG hiccups — the next resume's reconcile
+	// re-catalogs an orphaned manifest — but a fork is precisely the shape
+	// reconcile refuses to guess at, so writing the sibling here would
+	// strand it forever. Skip the commit instead: the window's changes are
+	// re-read from the source on the next resume, whereas a forked lineage
+	// is not recoverable without hand-editing lineage.json.
+	if err := lineage.AssertExtendsChainTip(commitCtx, b.Store, roll.Manifest.ParentBackupID); err != nil {
+		slog.WarnContext(
+			ctx, "stream: drain-commit SKIPPED — another writer extended this chain during the in-flight rollover; "+
+				"committing it would fork the lineage. The window's changes re-stream on the next resume",
+			append([]any{slog.String("err", err.Error())}, sluicecode.Attrs(err)...)...,
+		)
+		return
+	}
 	manifestPath := buildIncrementalManifestPath(roll.Manifest)
 	if err := lineage.WriteManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
 		slog.WarnContext(
@@ -1019,6 +1034,12 @@ func (b *BackupStream) drainCommitInFlightRollover(ctx context.Context, roll rol
 // or advanced=true with the next parent + start position on the normal
 // path. The rollover hook fires (best-effort) after a durable commit.
 func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome, state *streamState, statePath string, now func() time.Time, elapsed time.Duration, cdc ir.CDCReader, rolloverSeq int) (rolloverCommit, error) {
+	// Chain-tip guard (see lineage/chain_tip.go): refuse BEFORE writing a
+	// manifest that would fork the lineage beside a link some other writer
+	// committed during this rollover's window.
+	if err := lineage.AssertExtendsChainTip(ctx, b.Store, roll.Manifest.ParentBackupID); err != nil {
+		return rolloverCommit{}, err
+	}
 	manifestPath := buildIncrementalManifestPath(roll.Manifest)
 	if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
 		return rolloverCommit{}, fmt.Errorf("stream: write rollover manifest: %w", err)

@@ -497,12 +497,14 @@ func ListAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]Segme
 // from the supplied value so the open segment's Codec is pinned on
 // first write and never changes mid-segment.
 //
-// ONE error class is never swallowed: the ADR-0160 concurrent-writer
-// conflict (coded [sluicecode.CodeBackupChainConflict]) is returned to
-// the caller. A conflict is not a transient store hiccup — it is
-// evidence a SECOND writer is interleaving this chain (a duplicate
-// cron, a racing compact/prune), and the next write would not heal
-// that; the operator must be told loudly.
+// ONE error class is never swallowed: the concurrent-writer refusals
+// (coded [sluicecode.CodeBackupChainConflict]) are returned to the
+// caller — both the ADR-0160 generation conflict and the chain-tip fork
+// refusal (chain_tip.go). Neither is a transient store hiccup; each is
+// evidence a SECOND writer is interleaving this chain (a duplicate cron,
+// a racing compact/prune), and the next write would not heal it — a
+// swallowed fork refusal would be the silent sibling commit this guard
+// exists to prevent.
 func UpdateLineageForManifestBestEffort(
 	ctx context.Context,
 	store irbackup.Store,
@@ -598,7 +600,9 @@ func UpdateLineageForManifest(
 		if len(seg.Incrementals) == 0 && manifest.StartPosition != seg.StartPosition {
 			seg.IncrementalCoverageStart = manifest.StartPosition
 		}
-		// Dedup on path (per-chunk checkpoint re-writes the same path).
+		// Dedup on path (per-chunk checkpoint re-writes the same path,
+		// and the signed path re-calls this to make the append durable
+		// before it signs the enumeration).
 		found := false
 		for _, ip := range seg.Incrementals {
 			if ip == manifestPath {
@@ -607,6 +611,26 @@ func UpdateLineageForManifest(
 			}
 		}
 		if !found {
+			// The durable half of the chain-tip guard (see chain_tip.go):
+			// this link may only be appended while its parent is still the
+			// segment's tip. Checked against the catalog THIS call loaded
+			// under the ADR-0160 observation, so a second writer that
+			// committed during our CDC window is caught here even though its
+			// generation claim did not collide with ours. An already-recorded
+			// path skips it — re-appending is a no-op and the tip is then
+			// this very manifest.
+			//
+			// Only when a catalog was LOADED (`ok`). The seed branch above
+			// invents a root segment with no incrementals, so its "tip" is
+			// the full — which would refuse a legacy/lineage.json-lost chain
+			// whose on-disk tail is an incremental. There is no recorded tip
+			// there, so the guard has no opinion; `backup verify
+			// --rebuild-catalog` is what re-derives one.
+			if ok {
+				if err := assertExtendsSegmentTip(ctx, store, seg, manifest.ParentBackupID, manifestPath); err != nil {
+					return err
+				}
+			}
 			seg.Incrementals = append(seg.Incrementals, manifestPath)
 		}
 		seg.EndPosition = manifest.EndPosition
