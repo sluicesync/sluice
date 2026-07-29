@@ -217,12 +217,12 @@ func TestClassifyApplierError_TerminalCodeShield(t *testing.T) {
 		// 1105 is INCLUDED deliberately, even though it is the one code with
 		// message-dependent semantics: its AND-gates are the vttablet framing
 		// and the FULL canonical vtgate cluster-event sentences
-		// ([vitessClusterEventSubstrings]), never the loose tokens below. A
+		// ([vtgateTransientSubstrings]), never the loose tokens below. A
 		// bare "reparent" / "not serving" in an echoed statement or row value
 		// must still be terminal — this row is what fails if someone widens
 		// the 1105 arm to scan reparentRetriableSubstrings, which would arm
 		// the cold-copy tolerate-1062-on-retry wart off a false transient.
-		{1105, "vtgate generic (narrowness of the cluster-event AND-gate)"},
+		{1105, "vtgate generic (narrowness of the vtgate-sentence AND-gate)"},
 	}
 	transientSubstrings := []string{
 		// reparentRetriableSubstrings
@@ -800,11 +800,91 @@ func TestClassifyApplierError_UnframedVtgateReparent(t *testing.T) {
 			&gomysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"},
 			true,
 		},
+		// --- run 2, clean PS-160: rode 18 transients, then died on THIS ---
+		// Raised at tabletgateway.go:400 as Code_UNAVAILABLE, NOT
+		// Code_CLUSTER_EVENT — which is exactly why it is absent from
+		// buffer.ClusterEvents and why a set derived only from that list
+		// missed it. Verbatim from the field capture.
+		{
+			"un-framed vtgate inconsistent-state (the SECOND field abort, ~7.1M rows in)",
+			&gomysql.MySQLError{Number: 1105, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "target: scaletest-my3.-.primary: " +
+				"inconsistent state detected, primary is serving but initially found no available tablet"},
+			true,
+		},
+		{
+			// Upstream's own tabletgateway_flaky_test.go:349 pins this
+			// sentence and the one above TOGETHER — "depending on whether the
+			// health check ticks before or after the buffering code, we might
+			// get different errors". Two faces of ONE race; matching one
+			// without the other would be arbitrary.
+			"un-framed vtgate no-healthy-tablet (the other face of the same race)",
+			&gomysql.MySQLError{Number: 1105, Message: `target: ks.-80.primary: ` +
+				`no healthy tablet available for 'keyspace:"ks" shard:"-80" tablet_type:PRIMARY'`},
+			true,
+		},
 		// --- the sibling vtgate cluster event, same class, same code path ---
 		{
 			"un-framed vtgate resharding cutover (ClusterEventReshardingInProgress)",
 			&gomysql.MySQLError{Number: 1105, Message: "target: scaletest-mysql.-.primary: current keyspace is being resharded"},
 			true,
+		},
+		{
+			"un-framed vtgate no-connection-for-tablet (VT14003)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: no connection for tablet alias:{cell:\"zone1\" uid:101}"},
+			true,
+		},
+		{
+			// The buffer sentinels arrive inside the WaitForFailoverEnd wrap
+			// (vterrors.Wrapf → `msg + ": " + cause`), so the sentinel text is
+			// present in the final message. Shape reproduced here.
+			"vtgate buffer full during a failover (buffer.go:48, via the WaitForFailoverEnd wrap)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: failed to automatically buffer and retry " +
+				"failed request during failover. original err (type=*vterrors.fundamental): <nil>: primary buffer is full"},
+			true,
+		},
+		{
+			"vtgate buffer eviction during a failover (buffer.go:49)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: failed to automatically buffer and retry " +
+				"failed request during failover. original err (type=*vterrors.fundamental): <nil>: buffer full: request evicted for newer request"},
+			true,
+		},
+		{
+			"vtgate destination shard missing after resharding (buffer.go:47)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: destination shard is missing after a resharding operation"},
+			true,
+		},
+		// --- REJECTED vtgate raises: availability-adjacent but must NOT retry ---
+		{
+			// buffer.go:50. Cancel-flavored — a CLIENT-side shutdown must stay
+			// terminal, the same reason a bare `code = Canceled` is absent
+			// from vitessRetriableSubstrings (v0.99.94). Note the surrounding
+			// failover wrap does NOT rescue it: the wrap is deliberately not
+			// in the match set precisely so this exclusion holds.
+			"vtgate 'context was canceled before failover finished' stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: failed to automatically buffer and retry " +
+				"failed request during failover. original err (type=*vterrors.fundamental): <nil>: context was canceled before failover finished"},
+			false,
+		},
+		{
+			// tabletgateway.go:349 — vtgate configuration, never self-heals.
+			"vtgate disallowed tablet type (FAILED_PRECONDITION) stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.replica: requested tablet type REPLICA is not part of " +
+				"the allowed tablet types for this vtgate: [PRIMARY]"},
+			false,
+		},
+		{
+			// tabletgateway.go:414 VT14002 — availability, but three generic
+			// English words a migrated log row can carry, so it fails the
+			// echo-safety rule this set is built on.
+			"vtgate bare 'no available connection' (VT14002) stays terminal — echo-unsafe",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: no available connection"},
+			false,
+		},
+		{
+			// buffer.go:74 ClusterEventMoveTables — routing-rule denial.
+			"vtgate MoveTables 'disallowed due to rule' stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: disallowed due to rule: enforce denied tables"},
+			false,
 		},
 		// --- both consumers of the classifier see the wrapped form ---
 		{
@@ -828,6 +908,12 @@ func TestClassifyApplierError_UnframedVtgateReparent(t *testing.T) {
 		{
 			"1062 whose ECHOED ROW VALUE is the verbatim reparent sentence stays terminal",
 			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '" + unframedReparent + "' for key 'incidents.title'"},
+			false,
+		},
+		{
+			"1062 whose ECHOED ROW VALUE is the verbatim inconsistent-state sentence stays terminal",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry 'inconsistent state detected, primary is serving " +
+				"but initially found no available tablet' for key 'incidents.title'"},
 			false,
 		},
 		{
@@ -881,38 +967,52 @@ func TestClassifyApplierError_UnframedVtgateReparent(t *testing.T) {
 	}
 }
 
-// TestVitessClusterEventSubstrings_PinDown is the change-detector for the
-// vtgate CLUSTER-EVENT match set, in the same discipline as
+// TestVtgateTransientSubstrings_PinDown is the change-detector for the
+// vtgate availability match set, in the same discipline as
 // TestReparentRetriableSubstrings_PinDown. The literals are duplicated from
 // production (a pin that reads the value it guards cannot detect the value
 // changing) and MUST be lower-case (the matcher lower-cases first).
 //
-// Ground truth for the wording: vitess.io/vitess@v0.24.2
-// `go/vt/vtgate/buffer/buffer.go:72-73`. If a Vitess upgrade rewords a
-// sentence, this fails LOUDLY rather than silently non-retrying a production
-// reparent — which is exactly the failure mode this whole test file exists
-// to prevent.
-func TestVitessClusterEventSubstrings_PinDown(t *testing.T) {
+// Ground truth for the wording (vitess.io/vitess@v0.24.2), BOTH sources —
+// deriving from the first alone is what shipped an incomplete set on
+// 2026-07-28 and cost a second 122 GB run:
+//
+//   - `go/vt/vtgate/buffer/buffer.go:72-73` — the buffer.ClusterEvents
+//     constants (Code_CLUSTER_EVENT).
+//   - `go/vt/vtgate/tabletgateway.go:400,406,422` + `buffer.go:47-49` — the
+//     Code_UNAVAILABLE raises in the SAME withRetry function, which upstream
+//     does NOT list in buffer.ClusterEvents.
+//
+// If a Vitess upgrade rewords a sentence, this fails LOUDLY rather than
+// silently non-retrying a production failover — exactly the failure mode
+// this whole test file exists to prevent.
+func TestVtgateTransientSubstrings_PinDown(t *testing.T) {
 	want := []string{
 		"primary is not serving",
 		"reparent operation in progress",
 		"current keyspace is being resharded",
+		"inconsistent state detected, primary is serving",
+		"no healthy tablet available for",
+		"no connection for tablet",
+		"primary buffer is full",
+		"buffer full: request evicted for newer request",
+		"destination shard is missing after a resharding operation",
 	}
-	if len(vitessClusterEventSubstrings) != len(want) {
-		t.Fatalf("vitessClusterEventSubstrings = %q; pinned set is exactly %q. "+
+	if len(vtgateTransientSubstrings) != len(want) {
+		t.Fatalf("vtgateTransientSubstrings = %q; pinned set is exactly %q. "+
 			"If vtgate's wording changed, update BOTH the production slice and this pin.",
-			vitessClusterEventSubstrings, want)
+			vtgateTransientSubstrings, want)
 	}
-	got := make(map[string]bool, len(vitessClusterEventSubstrings))
-	for _, s := range vitessClusterEventSubstrings {
+	got := make(map[string]bool, len(vtgateTransientSubstrings))
+	for _, s := range vtgateTransientSubstrings {
 		if s != strings.ToLower(s) {
-			t.Errorf("vitessClusterEventSubstrings entry %q is not lower-case; the matcher lower-cases the error text, so a mixed-case literal can never match", s)
+			t.Errorf("vtgateTransientSubstrings entry %q is not lower-case; the matcher lower-cases the error text, so a mixed-case literal can never match", s)
 		}
 		got[s] = true
 	}
 	for _, w := range want {
 		if !got[w] {
-			t.Errorf("vitessClusterEventSubstrings is missing %q (got %q); a vtgate cluster event with this phrasing would silently NON-retry", w, vitessClusterEventSubstrings)
+			t.Errorf("vtgateTransientSubstrings is missing %q (got %q); a vtgate availability error with this phrasing would silently NON-retry", w, vtgateTransientSubstrings)
 		}
 	}
 
@@ -922,6 +1022,8 @@ func TestVitessClusterEventSubstrings_PinDown(t *testing.T) {
 	for _, canonical := range []string{
 		"primary is not serving, there may be a reparent operation in progress",
 		"current keyspace is being resharded",
+		"inconsistent state detected, primary is serving but initially found no available tablet",
+		`no healthy tablet available for 'keyspace:"ks" shard:"-80" tablet_type:PRIMARY'`,
 	} {
 		msg := "target: ks.-.primary: " + canonical
 		out := classifyApplierError(&gomysql.MySQLError{Number: 1105, Message: msg})

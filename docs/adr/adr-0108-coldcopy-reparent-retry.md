@@ -227,9 +227,9 @@ fix was correct — it closed a 1062 silent-batch-skip — and it silently
 orphaned this belt: a comment asserting coverage with no test that fails
 when the coverage stops existing.
 
-**Fix.** The canonical vtgate CLUSTER-EVENT sentences are now an
+**Fix.** The canonical vtgate availability sentences are now an
 explicit structured-code + message AND-gate **inside** `case 1105:`
-(`vitessClusterEventSubstrings` / `isVitessClusterEventMessage`),
+(`vtgateTransientSubstrings` / `isVtgateTransientMessage`),
 alongside the existing vttablet gate. The shield is untouched: 1062 and
 every other structurally-terminal code still return verbatim.
 
@@ -244,10 +244,10 @@ still applies below the shield, where no server response exists.
 cross-product so widening that gate fails a test.
 
 **Gate.** `TestClassifyApplierError_UnframedVtgateReparent` pins the
-verbatim wire string plus the other two errors from the same window, the
+verbatim wire strings plus the other errors from the same windows, the
 terminal codes that must not move, and the echo negatives;
-`TestVitessClusterEventSubstrings_PinDown` pins the literals against
-vtgate's constants. Mutation-checked both directions (neuter the gate →
+`TestVtgateTransientSubstrings_PinDown` pins the literals against
+vtgate's raise sites. Mutation-checked both directions (neuter the gate →
 FAIL; widen it to the loose set → the shield's 1105 rows FAIL).
 
 **Same defect, both paths.** Cold copy and the CDC apply path share one
@@ -255,12 +255,72 @@ classifier, so ADR-0038's apply retry had the identical hole; both
 wrapper frames are pinned in the gate. The `ir.TransientClassifier`
 DDL-phase verdict (ADR-0114) rides the same fix.
 
-**Sibling swept in.** `ClusterEventReshardingInProgress` ("current
-keyspace is being resharded") is the same vtgate cluster-event class on
-the same code path and was equally terminal; it is included.
-`ClusterEventMoveTables` ("disallowed due to rule") is deliberately NOT
-matched — too generic a phrase to match safely, and a routing-rule
-denial does not self-heal the way a failover window does.
+### The three-sentence set was incomplete, and the field found it in HOURS
+
+The first cut of this fix derived its match set from
+`buffer.ClusterEvents` — vtgate's own exported list of cluster-event
+sentences. That is a principled source, it is upstream's own
+enumeration, and **it was wrong for our purpose.** A rebuild of the
+branch was deployed to the scale rig and re-run against a clean PS-160.
+It rode **18 transients** that would previously have aborted, and then
+died at ~7.1M rows on a *fourth* sentence:
+
+```
+Error 1105 (HY000): target: scaletest-my3.-.primary: inconsistent state detected, primary is serving but initially found no available tablet
+```
+
+raised at `tabletgateway.go:400` — **a few lines below the reparent
+raise, in the same function** — as `Code_UNAVAILABLE`, **not**
+`Code_CLUSTER_EVENT`. That is exactly why it is absent from
+`buffer.ClusterEvents`: upstream's constant list is scoped to the
+*buffering* feature, not to "errors a client should retry."
+
+**The generalizable lesson: enumerating from an upstream constant list
+has a blind spot wherever upstream raises the same class outside its own
+list.** The list is authoritative for what upstream put IN it and says
+nothing about what it left out. The correct derivation is the *raise
+sites* — walk the function, read every `vterrors.Errorf`/`New` on the
+path, and classify each one — with the constant list as one input rather
+than the boundary. The set is now derived that way, from BOTH
+`buffer.ClusterEvents` AND the `Code_UNAVAILABLE` raises in
+`tabletgateway.go`'s `withRetry`, with file:line for each source recorded
+on `vtgateTransientSubstrings` so the next reader re-derives instead of
+trusting.
+
+Corroboration that these are one class, not two: upstream's own
+`tabletgateway_flaky_test.go:349` accepts **either** the inconsistent-state
+sentence **or** `no healthy tablet available for '…'`, commenting
+"depending on whether the health check ticks before or after the buffering
+code, we might get different errors." Two faces of one race — so matching
+one and not the other would have been arbitrary, and the second field
+abort was in some sense scheduled the moment the first fix shipped.
+
+**Sentences matched** (see the slice comment for the per-site citation):
+the three `buffer.ClusterEvents` cluster events, plus
+inconsistent-state (`:400`), no-healthy-tablet (`:406`),
+no-connection-for-tablet (`VT14003`, `:422`), and the buffer's
+`Code_UNAVAILABLE` sentinels — primary-buffer-full, entry-evicted,
+destination-shard-missing (`buffer.go:47-49`), which reach the client
+through the `WaitForFailoverEnd` wrap at `:373`.
+
+**Sentences REJECTED, deliberately** — the boundary was considered, not
+guessed. `Code_INTERNAL` non-transactional-replica-query (`:337`) and
+`Code_FAILED_PRECONDITION` disallowed-tablet-type (`:349`) are semantic /
+configuration faults that never self-heal. `VT14002` "no available
+connection" (`:414`) *is* availability-class but is three generic English
+words a migrated log row can legitimately contain, so it fails the
+echo-safety rule this set is built on — and it is raised only when
+`err == nil`, so a real availability failure in the same pass preserves
+the error we *do* match. `contextCanceledError` "context was canceled
+before failover finished" (`buffer.go:50`) is cancel-flavored and stays
+terminal for the same reason a bare `code = Canceled` is excluded
+(v0.99.94) — a client-side shutdown must not retry. The
+`WaitForFailoverEnd` wrap sentence itself is **not** matched even though
+it denotes a real failover, because it wraps all four buffer sentinels
+*including* the canceled one; matching it would silently defeat that
+exclusion. `ClusterEventMoveTables` ("disallowed due to rule") stays
+rejected: too generic, and a routing-rule denial does not self-heal the
+way a failover window does. Each rejection has a negative test row.
 
 ## See also
 
