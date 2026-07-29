@@ -98,21 +98,30 @@ func wrapDDLError(err error) error {
 // unblocks `migrate` too: its pre-create gate detects a pre-existing
 // table with a matching column shape and skips the refused CREATE, so
 // a deploy-ddl-bootstrapped schema feeds a fresh migrate directly.
+//
+// The word "fresh" there is load-bearing, which is why the text says
+// it: the ADR-0166 gate is deliberately NOT run on `--resume`, so a
+// resumed migrate skips its create-tables phase on a different
+// criterion — every in-scope table recorded complete
+// ([pipeline.createTablesRedundantOnResume]). Both are named, because a
+// remedy that describes a path the binary cannot take is how this site
+// mis-hinted operators once already.
 func wrapUserTableCreateError(err error, table string) error {
 	if !isDirectDDLDisabledErr(err) {
 		return wrapDDLError(err)
 	}
 	return sluicecode.Wrap(
 		sluicecode.CodePSDirectDDLBlocked,
-		"disable safe migrations on the branch for the migration window (re-enable after), or pre-create the schema via deploy requests: `sluice schema preview` prints the target DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement (a re-run of `sluice migrate` then skips the pre-created tables; a sync stream skips schema-apply with `sluice sync start --schema-already-applied`)",
+		"disable safe migrations on the branch for the migration window (re-enable after), or pre-create the schema via deploy requests: `sluice schema preview` prints the target DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement (a fresh re-run of `sluice migrate` then skips the pre-created tables; a `--resume` re-run instead skips the create-tables phase outright once every in-scope table is recorded complete; a sync stream skips schema-apply with `sluice sync start --schema-already-applied`)",
 		fmt.Errorf("%w: %w | "+
 			"sluice needs to CREATE user table %q, and this branch's safe-migrations setting "+
 			"refuses every direct DDL statement. Two ways through: "+
 			"(a) disable safe migrations on the branch for the migration window and re-enable it after; or "+
 			"(b) pre-create the schema through deploy requests — `sluice schema preview` prints the exact "+
 			"target DDL and `sluice deploy-ddl --ddl '<statement>'` deploys one statement — then re-run: "+
-			"`sluice migrate` skips pre-created tables whose column shape matches, and a sync stream "+
-			"skips schema-apply with `sluice sync start --schema-already-applied`",
+			"a fresh `sluice migrate` skips pre-created tables whose column shape matches (a `--resume` "+
+			"re-run instead skips the create-tables phase outright once every in-scope table is recorded "+
+			"complete), and a sync stream skips schema-apply with `sluice sync start --schema-already-applied`",
 			ErrSafeMigrationsBlocked, err, table),
 	)
 }
