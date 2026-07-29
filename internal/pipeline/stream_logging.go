@@ -31,3 +31,27 @@ func warnConcurrentWriterTakeover(ctx context.Context, prior *streamState) {
 		slog.Time("prior_last_rollover_at", prior.LastRolloverAt),
 	)
 }
+
+// logConcurrentWriterHandoff is INFO, not WARN, on purpose: a recorded
+// handoff is the supervisor-restart happy path, not an anomaly the
+// operator should go look at.
+func logConcurrentWriterHandoff(ctx context.Context, prior *streamState, evidence string) {
+	slog.InfoContext(
+		ctx, "stream: prior stream handed off this destination; taking over",
+		slog.Int("prior_pid", prior.PID),
+		slog.String("prior_host", prior.Host),
+		slog.String("evidence", evidence),
+	)
+}
+
+// warnCleanExitNotRecorded reports a `stopped_at` stamp that did not
+// land. Best-effort by design (the chain, not this file, is the source
+// of truth) — the only cost is that the next stream against this
+// destination waits out the staleness window.
+func warnCleanExitNotRecorded(ctx context.Context, path, reason string) {
+	slog.WarnContext(
+		ctx, "stream: could not record clean exit in stream_state; next start may have to wait out the staleness window",
+		slog.String("path", path),
+		slog.String("reason", reason),
+	)
+}

@@ -236,6 +236,60 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	}
 }
 
+// TestBackupStream_CleanExit_AllowsImmediateRestart is the end-to-end
+// shape behind the handoff fix: a stream that exits cleanly must leave
+// the destination restartable RIGHT AWAY, not after a staleness window.
+// This is the supervisor / k8s restart loop (ADR-0087's rotation-born
+// resume) — pre-fix the second Run below failed with "a stream is
+// already running against this destination" and named a remedy the
+// restarting operator had no way to use.
+func TestBackupStream_CleanExit_AllowsImmediateRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
+		CreatedAt:     time.Now().UTC(),
+		SourceEngine:  "postgres",
+		Schema:        &ir.Schema{},
+		Kind:          irbackup.BackupKindFull,
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
+	}
+	parent.BackupID = irbackup.ComputeBackupID(parent)
+	writeParentFullManifest(t, store, parent)
+
+	newStream := func(pid int) *BackupStream {
+		return &BackupStream{
+			Source:             &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}, cdcExpectedFromOK: true},
+			SourceDSN:          "src",
+			Store:              store,
+			ParentRef:          parent.BackupID,
+			RolloverWindow:     time.Minute,
+			RolloverMaxChanges: 10,
+			RolloverMaxBytes:   1 << 30,
+			pidHostFn:          func() (int, string) { return pid, "supervised.example.com" },
+		}
+	}
+
+	if err := newStream(2328).Run(context.Background()); err != nil {
+		t.Fatalf("first stream.Run: %v", err)
+	}
+	state, err := readStreamState(context.Background(), store, DefaultStreamStateFilename)
+	if err != nil {
+		t.Fatalf("readStreamState: %v", err)
+	}
+	if state == nil || state.StoppedAt == nil {
+		t.Fatalf("stopped_at not stamped after a clean exit: %+v", state)
+	}
+
+	// Same host, new pid — exactly what a supervisor restart looks
+	// like. last_rollover_at is seconds old, so only the handoff record
+	// can admit this.
+	if err := newStream(9001).Run(context.Background()); err != nil {
+		t.Fatalf("restart after a clean exit: %v", err)
+	}
+}
+
 // TestBackupStream_IncludeEmptyRollover_WritesManifest verifies the
 // opt-in: --rollover-include-empty commits a manifest even with zero
 // changes.
