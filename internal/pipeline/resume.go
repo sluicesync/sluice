@@ -455,6 +455,66 @@ func classifyTableForResume(state ir.MigrationState, tableName string, resuming 
 	return resumeActionFresh
 }
 
+// createTablesRedundantOnResume reports whether a resume attempt can
+// skip the create-tables phase outright: every table the phase would
+// CREATE is already recorded `complete` in the SAME persisted state the
+// bulk-copy phase classifies from ([classifyTableForResume]). One
+// predicate, one source of truth — a table the copy would skip is
+// exactly a table whose DDL is redundant.
+//
+// This is not only an optimization; it is what makes a documented
+// PlanetScale recovery path exist at all. On a safe-migrations branch
+// every direct DDL statement is refused (errno 1105 "direct DDL is
+// disabled"), so re-issuing the idempotent `CREATE TABLE` for a table
+// that already holds 20M rows killed the run in its FIRST phase —
+// before the index phase, where the ADR-0148 deploy-request fallback
+// lives. Both index-phase hints (errno 3024, and the safe-migrations
+// 1105) tell the operator to re-run with `--resume` (plus a service
+// token) to finish just the indexes with no re-copy; measured at
+// 122 GB against real PlanetScale, that advice dead-ended here after
+// one second with zero rows copied and nothing achieved. The two fit
+// together precisely: those hints fire from the index phase, which
+// only runs once EVERY table's copy has completed, so the state they
+// leave behind is exactly the all-complete shape this predicate
+// matches.
+//
+// Deliberately narrow — the boundary is the load-bearing part:
+//
+//   - Not resuming → false. A fresh run always creates; its
+//     equivalent is the ADR-0166 pre-create gate, which VALIDATES the
+//     target's column shape rather than trusting a recorded row.
+//   - A table absent from the recorded state (added to the source, or
+//     to --include-table, since the last attempt) → false: it
+//     genuinely needs its DDL.
+//   - A table recorded in-progress / no-PK-truncate-and-redo → false:
+//     the phase runs exactly as before, for the whole create set.
+//   - An empty create set → false: with no table to reason about there
+//     is no evidence the prior attempt created anything, and a
+//     table-less schema can still carry schema-level objects the phase
+//     emits (PG standalone sequences, the target schema itself).
+//
+// One consequence is deliberate and worth naming: when a table is
+// recorded complete but has since been DROPPED on the target, the
+// skipped CREATE means the later index/identity/constraint phases fail
+// loudly on the missing relation — where before the fix the phase
+// silently re-created it EMPTY, the copy skipped it ("skipping
+// completed table"), and the run reported success. Loud is the
+// direction we want.
+func createTablesRedundantOnResume(createSchema *ir.Schema, state ir.MigrationState, resuming bool) bool {
+	if !resuming || createSchema == nil || len(createSchema.Tables) == 0 {
+		return false
+	}
+	for _, t := range createSchema.Tables {
+		if t == nil {
+			return false
+		}
+		if classifyTableForResume(state, t.Name, resuming) != resumeActionSkip {
+			return false
+		}
+	}
+	return true
+}
+
 // truncateForResume invokes the optional [ir.TableTruncator] surface
 // on the row writer. Falls back to an error when the writer doesn't
 // implement it — a target without TRUNCATE support is unusable for

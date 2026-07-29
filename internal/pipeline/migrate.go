@@ -1382,7 +1382,11 @@ func runBulkCopyForAddTable(
 //
 // Resume semantics per phase:
 //
-//   - tables:       re-run unconditionally (idempotent CREATE TABLE).
+//   - tables:       re-run (idempotent CREATE TABLE) unless the
+//     recorded state marks EVERY table in the create set complete, in
+//     which case the phase is skipped outright — see
+//     [createTablesRedundantOnResume] for why that is load-bearing and
+//     not merely an optimization.
 //   - bulk_copy:    per-table classification (skip / truncate-redo /
 //     resume-from-cursor / fresh) keyed off state.TableProgress.
 //     Per-batch checkpointing on the cursor path; see ADR-0018.
@@ -1470,7 +1474,24 @@ func runBulkCopyPhases(
 		// Phase mark is non-fatal; continue with the data work.
 		_ = err
 	}
-	if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
+	// A resume whose recorded state marks EVERY table in the create set
+	// complete has nothing to create — the prior attempt necessarily ran
+	// this phase to completion — so issuing the DDL is pointless work.
+	// It is also, on a PlanetScale safe-migrations branch, fatal work:
+	// direct DDL is refused (1105) even for a table that already exists,
+	// which killed `--resume` here before it could reach the index phase
+	// and the ADR-0148 deploy-request fallback the errno-3024 /
+	// safe-migrations hints send operators to. The boundary lives in
+	// [createTablesRedundantOnResume] — reading the same recorded state
+	// the bulk phase classifies from, so a present-but-incomplete or
+	// absent table still gets its DDL. State reads need no lock here:
+	// stateMu's concurrent writers are spawned by phase 2, below.
+	// Nothing else in the phase moves — markPhase and the progress
+	// PhaseCompleted still run, so phase accounting is unchanged.
+	if createTablesRedundantOnResume(createSchema, *state, resuming) {
+		slog.InfoContext(ctx, "migration: every in-scope table is already recorded complete — skipping the create-tables phase",
+			slog.Int("tables", len(createSchema.Tables)))
+	} else if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
 		err = fmt.Errorf("pipeline: create tables: %w", err)
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
 	}
