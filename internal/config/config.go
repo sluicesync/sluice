@@ -361,7 +361,17 @@ func Load(path string) (*Config, error) {
 	if err := k.Load(envProvider, nil); err != nil {
 		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: load env: %w", err)}
 	}
+	// A `keyset_source: env:VARNAME` names an environment variable the
+	// same way `--keyset-source env:VARNAME` does, so the operator's own
+	// configured secret holder must not be reported as a typo either.
+	// The flag-level claims arrive from the CLI via
+	// [SetClaimedEnvVars]; see env_claims.go for why the warning — not
+	// the overlay — is what the claim gates.
+	configClaimed := EnvVarNameFromSpec(k.String("keyset_source"))
 	for _, name := range unknown {
+		if name == configClaimed || isClaimedEnvVar(name) {
+			continue
+		}
 		slog.Warn(
 			"config: ignoring SLUICE_ environment variable that matches no config key (typo?)",
 			slog.String("var", name),

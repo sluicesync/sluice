@@ -77,6 +77,12 @@ func main() {
 		},
 	)
 	configureLogging(cli.LogLevel, cli.LogFormat)
+	// Flags can point at a secret by environment-variable NAME
+	// (--encryption-passphrase-env VAR, --sign-key env:VAR, …). Register
+	// those names so internal/config's SLUICE_ prefix scan doesn't warn
+	// that sluice's own recommended pattern is a typo. One chokepoint,
+	// after parse and before any subcommand's config.Load.
+	registerClaimedEnvVars(cli)
 	applyMaxMemory(cli.MaxMemory)
 	startPprofIfRequested(cli.PprofListen)
 	// The operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
