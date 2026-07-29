@@ -50,6 +50,10 @@ func TestSchemaWriter_IsTransientError(t *testing.T) {
 	w := &SchemaWriter{}
 	transient := []error{
 		&gomysql.MySQLError{Number: 1105, Message: "target: ks.0.primary: vttablet: rpc error: code = Unavailable desc = primary is not serving"},
+		// The UN-framed vtgate cluster event (no `vttablet` tag) — the
+		// 2026-07-28 PS-160 shape. The DDL phase rides the same reparent the
+		// copy phase does; see TestClassifyApplierError_UnframedVtgateReparent.
+		&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: primary is not serving, there may be a reparent operation in progress"},
 		&gomysql.MySQLError{Number: 1021, Message: "No space left on device"},
 		&gomysql.MySQLError{Number: 1290, Message: "The MySQL server is running with the --read-only option so it cannot execute this statement"},
 	}
@@ -210,6 +214,15 @@ func TestClassifyApplierError_TerminalCodeShield(t *testing.T) {
 		{1452, "fk violation"},
 		{1064, "syntax error"},
 		{1048, "column cannot be null"},
+		// 1105 is INCLUDED deliberately, even though it is the one code with
+		// message-dependent semantics: its AND-gates are the vttablet framing
+		// and the FULL canonical vtgate cluster-event sentences
+		// ([vitessClusterEventSubstrings]), never the loose tokens below. A
+		// bare "reparent" / "not serving" in an echoed statement or row value
+		// must still be terminal — this row is what fails if someone widens
+		// the 1105 arm to scan reparentRetriableSubstrings, which would arm
+		// the cold-copy tolerate-1062-on-retry wart off a false transient.
+		{1105, "vtgate generic (narrowness of the cluster-event AND-gate)"},
 	}
 	transientSubstrings := []string{
 		// reparentRetriableSubstrings
@@ -731,6 +744,196 @@ func TestReparentRetriableSubstrings_PinDown(t *testing.T) {
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("ADR-0108: reparentRetriableSubstrings is missing %q (got %q); a reparent with this phrasing would silently NON-retry", w, reparentRetriableSubstrings)
+		}
+	}
+}
+
+// TestClassifyApplierError_UnframedVtgateReparent is the gate for the
+// 2026-07-28 live PlanetScale PS-160 finding (122 GB copy, 153M-row table):
+// vtgate answers a query for a mid-reparent primary with
+//
+//	Error 1105 (HY000): target: scaletest-mysql.-.primary: primary is not
+//	serving, there may be a reparent operation in progress
+//
+// The sentence is vtgate's OWN (vitess.io/vitess `go/vt/vtgate/buffer`
+// ClusterEventReparentInProgress, raised at tabletgateway.go), so it carries
+// no `vttablet` tag — [classifyVitessMessage] requires that tag by design and
+// cannot match. Pre-fix the error fell straight to the terminal-code shield
+// and ABORTED the copy after 38s with neither ADR-0108 bound reached (30m
+// wall-clock, 100000 attempts), while the vttablet-framed sibling error in
+// the SAME reparent window was ridden out. The ADR-0108 "belt-and-suspenders"
+// text legs that claimed to cover this were unreachable for every structured
+// *MySQLError from the moment the shield landed — a written invariant nobody
+// checked.
+//
+// Table-driven over the three shapes the real reparent window produced, plus
+// the terminal codes that must NOT move, plus the OVER-match negatives that
+// keep the shield load-bearing: an echoed statement or identifier carrying
+// the loose "reparent" / "not serving" tokens under a structured code must
+// stay terminal (a false-positive transient arms the cold-copy
+// tolerate-1062-on-retry wart — the D0-3 silent-batch-skip chain).
+func TestClassifyApplierError_UnframedVtgateReparent(t *testing.T) {
+	// The verbatim wire string from the live run, kept as one constant so
+	// the pin cannot drift from what was observed.
+	const unframedReparent = "target: scaletest-mysql.-.primary: primary is not serving, " +
+		"there may be a reparent operation in progress"
+
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		// --- the three errors the live PS-160 reparent window produced ---
+		{
+			"un-framed vtgate reparent (THE defect: aborted the 122 GB copy)",
+			&gomysql.MySQLError{Number: 1105, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: unframedReparent},
+			true,
+		},
+		{
+			"vttablet-framed QueryList.TerminateAll in the same window (was already retried)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: scaletest-mysql.-.primary: vttablet: rpc error: " +
+				"code = Canceled desc = QueryList.TerminateAll(), elapsed time: 1m2.1s, killing connection ID 204"},
+			true,
+		},
+		{
+			"1205 lock-wait-timeout in the same window (was already retried, code-only)",
+			&gomysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"},
+			true,
+		},
+		// --- the sibling vtgate cluster event, same class, same code path ---
+		{
+			"un-framed vtgate resharding cutover (ClusterEventReshardingInProgress)",
+			&gomysql.MySQLError{Number: 1105, Message: "target: scaletest-mysql.-.primary: current keyspace is being resharded"},
+			true,
+		},
+		// --- both consumers of the classifier see the wrapped form ---
+		{
+			"cold-copy flush frame (ADR-0108) around the un-framed reparent",
+			fmt.Errorf("mysql: insert into %q (%d rows): %w", "events", 1000,
+				&gomysql.MySQLError{Number: 1105, Message: unframedReparent}),
+			true,
+		},
+		{
+			"CDC apply frame (ADR-0038) around the un-framed reparent",
+			fmt.Errorf("mysql: applier: begin tx: %w",
+				&gomysql.MySQLError{Number: 1105, Message: unframedReparent}),
+			true,
+		},
+		// --- the terminal codes must not move (shield still load-bearing) ---
+		{
+			"1062 duplicate key stays terminal",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '1179' for key 'events.PRIMARY'"},
+			false,
+		},
+		{
+			"1062 whose ECHOED ROW VALUE is the verbatim reparent sentence stays terminal",
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '" + unframedReparent + "' for key 'incidents.title'"},
+			false,
+		},
+		{
+			"1064 syntax error stays terminal",
+			&gomysql.MySQLError{Number: 1064, Message: "You have an error in your SQL syntax"},
+			false,
+		},
+		{
+			"1452 FK violation stays terminal",
+			&gomysql.MySQLError{Number: 1452, Message: "Cannot add or update a child row"},
+			false,
+		},
+		// --- narrowness: the loose tokens must NOT flip a structured 1105 ---
+		{
+			"1105 whose Sql echo names a table containing 'reparent' stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: vttablet: rpc error: " +
+				"code = InvalidArgument desc = column x not found (CallerID: abc): " +
+				`Sql: "insert into reparent_history(a) values (1)"`},
+			false,
+		},
+		{
+			"1105 echoing a stored row value 'not serving' stays terminal",
+			&gomysql.MySQLError{Number: 1105, Message: "internal error handling value 'not serving'"},
+			false,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			gotRetriable := errors.As(got, &re) && re.Retriable()
+			if gotRetriable != c.retriable {
+				t.Fatalf("retriable=%v, want %v (classified %T: %v)", gotRetriable, c.retriable, got, got)
+			}
+			if !errors.Is(got, c.err) {
+				t.Errorf("Unwrap chain broken: errors.Is(classified, original) = false")
+			}
+		})
+	}
+
+	// A reparent is a FAILOVER, not an oversized transaction: the same batch
+	// re-applied against the new primary succeeds, so it must retry AT SIZE.
+	// Flagging it TransactionKilled would force a needless AIMD shrink
+	// (ADR-0052) on every reparent.
+	got := classifyApplierError(&gomysql.MySQLError{Number: 1105, Message: unframedReparent})
+	var tk ir.TransactionKilledError
+	if errors.As(got, &tk) && tk.TransactionKilled() {
+		t.Error("un-framed reparent reported TransactionKilled(); a failover must retry at size, not force an AIMD shrink")
+	}
+}
+
+// TestVitessClusterEventSubstrings_PinDown is the change-detector for the
+// vtgate CLUSTER-EVENT match set, in the same discipline as
+// TestReparentRetriableSubstrings_PinDown. The literals are duplicated from
+// production (a pin that reads the value it guards cannot detect the value
+// changing) and MUST be lower-case (the matcher lower-cases first).
+//
+// Ground truth for the wording: vitess.io/vitess@v0.24.2
+// `go/vt/vtgate/buffer/buffer.go:72-73`. If a Vitess upgrade rewords a
+// sentence, this fails LOUDLY rather than silently non-retrying a production
+// reparent — which is exactly the failure mode this whole test file exists
+// to prevent.
+func TestVitessClusterEventSubstrings_PinDown(t *testing.T) {
+	want := []string{
+		"primary is not serving",
+		"reparent operation in progress",
+		"current keyspace is being resharded",
+	}
+	if len(vitessClusterEventSubstrings) != len(want) {
+		t.Fatalf("vitessClusterEventSubstrings = %q; pinned set is exactly %q. "+
+			"If vtgate's wording changed, update BOTH the production slice and this pin.",
+			vitessClusterEventSubstrings, want)
+	}
+	got := make(map[string]bool, len(vitessClusterEventSubstrings))
+	for _, s := range vitessClusterEventSubstrings {
+		if s != strings.ToLower(s) {
+			t.Errorf("vitessClusterEventSubstrings entry %q is not lower-case; the matcher lower-cases the error text, so a mixed-case literal can never match", s)
+		}
+		got[s] = true
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("vitessClusterEventSubstrings is missing %q (got %q); a vtgate cluster event with this phrasing would silently NON-retry", w, vitessClusterEventSubstrings)
+		}
+	}
+
+	// End-to-end through the real classifier, under the code vtgate actually
+	// uses — catches the regression where the slice is right but nothing
+	// consults it (the shape the original defect had).
+	for _, canonical := range []string{
+		"primary is not serving, there may be a reparent operation in progress",
+		"current keyspace is being resharded",
+	} {
+		msg := "target: ks.-.primary: " + canonical
+		out := classifyApplierError(&gomysql.MySQLError{Number: 1105, Message: msg})
+		var re ir.RetriableError
+		if !errors.As(out, &re) || !re.Retriable() {
+			t.Errorf("Error 1105 carrying the canonical vtgate sentence %q must classify retriable; got %T", canonical, out)
+		}
+		// Case-insensitivity: vtgate/vttablet wording varies in case across
+		// versions, and the matcher promises to absorb that.
+		out = classifyApplierError(&gomysql.MySQLError{Number: 1105, Message: strings.ToUpper(msg)})
+		if !errors.As(out, &re) || !re.Retriable() {
+			t.Errorf("upper-cased %q must still classify retriable (the matcher lower-cases)", canonical)
 		}
 	}
 }

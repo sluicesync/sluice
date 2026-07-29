@@ -118,6 +118,12 @@ PlanetScale/vtgate reparent can surface **without** that framing; this
 fallback catches it. It also benefits the CDC apply path (ADR-0038) for
 free.
 
+> **This paragraph described an unreachable belt from 2026-07-23 to
+> 2026-07-28.** See the implementation note at the end of this ADR — the
+> terminal-code shield returns before the text fallback for every
+> structured `*MySQLError`, so the un-framed reparent it names was
+> classified TERMINAL. Fixed inside the `case 1105:` arm.
+
 ### Plain-path 1062-on-retry tolerance (the wart)
 
 A plain cold-copy batch is a SINGLE atomic multi-row `INSERT`. On a
@@ -189,6 +195,72 @@ fan-out (`WriteRowsParallel` / `WriteRowsIdempotentParallel`) — a
 `-race` integration gate is required before any tag (the per-worker
 retry, fresh-conn re-acquire, and shared `workerCtx` cancel are the
 concurrency-sensitive surface).
+
+## Implementation note (2026-07-28): the belt was unreachable — the canonical vtgate reparent error classified TERMINAL
+
+Found in the wild against real PlanetScale (PS-160, a 122 GB copy of a
+153M-row table). In one reparent window vtgate returned three errors: the
+vttablet-framed `QueryList.TerminateAll()` (retried, 1105 + vttablet), a
+`1205 Lock wait timeout` (retried, code-only), and
+
+```
+Error 1105 (HY000): target: scaletest-mysql.-.primary: primary is not serving, there may be a reparent operation in progress
+```
+
+which **aborted the migration after 38 seconds** with
+`SLUICE-E-BULKCOPY-TABLE-FAILED` — neither the 30m wall-clock bound nor
+the 100000-attempt backstop reached (confirmed by the absence of the
+budget-exhaustion wording).
+
+**Why.** That sentence is emitted by **vtgate itself**
+(`vitess.io/vitess` `go/vt/vtgate/buffer` `ClusterEventReparentInProgress`,
+raised in `tabletgateway.go` as `vterrors.Errorf(Code_CLUSTER_EVENT, …)`
+when a PRIMARY target has no serving tablet), so it carries **no
+`vttablet` tag** — and `classifyVitessMessage` requires that tag by
+design ("a bare HY000 without it is a non-Vitess generic error and stays
+terminal"). The `case 1105:` arm therefore fell out of the switch into
+the **terminal-code shield** (audit 2026-07-23 D0-3), which returns
+verbatim *above* the text-fallback legs. The
+"belt-and-suspenders" fallback this ADR describes has been unreachable
+for every structured `*MySQLError` since that shield landed. The shield
+fix was correct — it closed a 1062 silent-batch-skip — and it silently
+orphaned this belt: a comment asserting coverage with no test that fails
+when the coverage stops existing.
+
+**Fix.** The canonical vtgate CLUSTER-EVENT sentences are now an
+explicit structured-code + message AND-gate **inside** `case 1105:`
+(`vitessClusterEventSubstrings` / `isVitessClusterEventMessage`),
+alongside the existing vttablet gate. The shield is untouched: 1062 and
+every other structurally-terminal code still return verbatim.
+
+**Deliberately NARROW, not the loose fallback set.** The in-switch gate
+matches the *full* vtgate sentences, never the loose `"reparent"` /
+`"not serving"` tokens, because a 1105 message can echo the offending
+statement (`… : Sql: "insert into reparent_history …"`) — and a
+false-positive transient **arms the tolerate-1062-on-retry wart** on the
+next attempt, which is the D0-3 silent-batch-skip chain. The loose set
+still applies below the shield, where no server response exists.
+`TestClassifyApplierError_TerminalCodeShield` now includes 1105 in its
+cross-product so widening that gate fails a test.
+
+**Gate.** `TestClassifyApplierError_UnframedVtgateReparent` pins the
+verbatim wire string plus the other two errors from the same window, the
+terminal codes that must not move, and the echo negatives;
+`TestVitessClusterEventSubstrings_PinDown` pins the literals against
+vtgate's constants. Mutation-checked both directions (neuter the gate →
+FAIL; widen it to the loose set → the shield's 1105 rows FAIL).
+
+**Same defect, both paths.** Cold copy and the CDC apply path share one
+classifier, so ADR-0038's apply retry had the identical hole; both
+wrapper frames are pinned in the gate. The `ir.TransientClassifier`
+DDL-phase verdict (ADR-0114) rides the same fix.
+
+**Sibling swept in.** `ClusterEventReshardingInProgress` ("current
+keyspace is being resharded") is the same vtgate cluster-event class on
+the same code path and was equally terminal; it is included.
+`ClusterEventMoveTables` ("disallowed due to rule") is deliberately NOT
+matched — too generic a phrase to match safely, and a routing-rule
+denial does not self-heal the way a failover window does.
 
 ## See also
 
