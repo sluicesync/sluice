@@ -1857,6 +1857,23 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
+### 108. `--resume` refuses a dev branch whose deploy request is still healthily building, instead of adopting it — the operators the unbounded wait was written for are the ones it cannot rescue (observed live 2026-07-30) — *OPEN*
+
+**Why.** The ADR-0148 index fallback opens a PlanetScale deploy request on a dev branch and waits. Before the unbounded-wait change, that wait was capped at 1h while a real 106 GB / 4-index build takes ~3h25m throttled — so the common outcome was: sluice exits, the branch and its deploy request survive, and the build keeps going. On the next `--resume`, sluice hits `dev branch "sluice-index-<id>" already exists — a previous run left it behind` and refuses.
+
+**Verified live**, not reasoned: against `scaletest-my3` with deploy request #1 at **78%, `deployment_state=in_progress`, `eta_seconds≈3099`**, a `--resume` with `--planetscale-deploy-timeout 0` refused. It behaved *safely* — still exactly 1 deploy request and 1 branch afterwards, nothing deleted, DR untouched — but it did not wait. The remedies it names are "inspect it yourself" or "delete the branch and re-run", and deleting would discard ~3h of completed index build.
+
+**Why it matters despite the wait fix.** Going forward, an unbounded wait means a run no longer abandons a deploy mid-flight, so this state stops being *created*. It does nothing for anyone already holding a branch stranded by the old 1h default — which is precisely the population the change was written for. The fix prevents the disease without curing existing cases.
+
+**What.** On encountering an existing sluice-owned dev branch, look up its open deploy request and **adopt it**: if the state is in-flight, hand off to the same poller the fresh path uses (progress narration, terminal-failure fast-fail, keep-the-branch rule all already exist). Only refuse when there is no deploy request, or when it is in a terminal-failure state — and in the latter case name the branch delete, which is then genuinely correct. The poller is already built and mutation-covered; this is a lookup plus a dispatch, not new machinery.
+
+**Gotchas.**
+- **Adopt only what sluice owns.** Match the `sluice-index-` prefix convention; never adopt an operator's own dev branch.
+- **Verify the DDL matches** before adopting. A branch left by a run whose index set has since changed (a schema edit between attempts) must not be treated as satisfying the current set — compare the deployed DDL against what this run would emit, and refuse loudly on divergence rather than silently building the wrong indexes.
+- The refusal currently carries **no `SLUICE-E-*` code**, so a DR automation cannot branch on it — the same machine-contract class as Bug 219. Code it as part of this work.
+- Its remedy still suggests deleting a branch whose deployment may be live. That is the narrower survivor of the F8 advice bug: on the in-flight path the delete is not merely refused by the API, it would destroy work in progress.
+- `--resume`'s index phase already "re-probes the target and rebuilds only what is still missing", so the post-adoption path needs no special-casing once the deploy completes.
+
 ### 107. The preflight LIST was duplicated, so closing one instance left the class open — `verifyBackupIDs` was still restore-only (Bug 218) — *FIXED, ships in v0.104.6*
 
 **What.** Item 106 gave `backup verify` the schema-fingerprint check and shared the *predicate* deciding which lineage shapes get it. It left the *list* of preflights duplicated between the two commands — so a manifest whose recorded `BackupID` no longer matched its content still verified `all chunks OK` rc=0 while restore refused it with rc=3 and zero rows. Pre-existing back to v0.103.2 on all seven staged binaries; found by the v0.104.5 regression cycle, which did the thing a claim about a list invites: it enumerated the list.
