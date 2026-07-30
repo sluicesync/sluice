@@ -2217,6 +2217,33 @@ type IndexBuildFallbackSetter interface {
 	SetIndexBuildFallback(f IndexBuildFallback)
 }
 
+// ForeignKeyConsistencyDeclarer is the OPTIONAL setter the migrate
+// orchestrator uses to tell a target [SchemaWriter] that the rows the
+// bulk-copy phase loaded are ALREADY consistent with the foreign keys the
+// constraints phase is about to create — so re-validating them target-side is
+// provably redundant (roadmap item 109).
+//
+// It is set true ONLY on the safe-by-construction path: an UNFILTERED migrate
+// (no `--where` row filters) from a source that enforced those FKs, whose
+// per-table reparent reconciliation re-derives every touched table to exactly
+// match that source before the constraints phase (ADR-0141). A `--where` run
+// can legitimately orphan children (filtering a parent), so it must NOT set
+// this — the target-side validation is the loud net that catches those; and
+// sync cold-start / a pre-populated target never set it either.
+//
+// A MySQL/Vitess target uses the declaration to add a foreign key that would
+// otherwise blow PlanetScale's statement-time wall (errno 3024 — InnoDB
+// validates every child row as it adds the constraint) as a metadata-only
+// `ALTER` under session `foreign_key_checks=0`. The declaration only ever
+// substitutes for a validation that could not have completed (the constraint
+// was walling), so it removes no functioning safety net. The zero value
+// (false) keeps full target-side validation — the safe default every
+// non-migrate path and every filtered run gets. PG has no statement-time wall
+// (it adds FKs `NOT VALID` then validates), so it need not implement this.
+type ForeignKeyConsistencyDeclarer interface {
+	SetCopiedRowsForeignKeyConsistent(consistent bool)
+}
+
 // TableAnalyzer is the OPTIONAL surface a [SchemaWriter] implements so
 // the migrate orchestrator's opt-in `--analyze-after` phase can refresh
 // the target's planner statistics per migrated table once constraints

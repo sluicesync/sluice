@@ -194,6 +194,26 @@ var hintRegistry = []errorHint{
 		code:     sluicecode.CodeIndexDirectDDLDisabled,
 	},
 
+	// Constraints: the SAME PlanetScale statement-time wall (errno 3024), one
+	// phase later, on a large post-copy `ALTER … ADD FOREIGN KEY`. InnoDB
+	// validates every child row against the parent as it adds the FK, so on a
+	// big table the ADD is HEAVIER than an index build and cannot finish under
+	// the ~900 s wall (roadmap item 109; field-captured 2026-07-30 on a
+	// 153M-row events table, FK died at elapsed 15m0.0006s). A DISTINCT code
+	// and remedy from the index wall above: there is no deploy-request
+	// fallback for FKs yet (roadmap C), and the index remedies do not apply —
+	// --resume re-runs the identical validating ADD and re-hits the SAME
+	// deterministic wall (the field --resume loop that never converged), and
+	// --upfront-indexes is about indexes, not FKs. The converging remedy is
+	// --skip-foreign-keys, which completes the migration and keeps each FK's
+	// referencing columns indexed so the constraints can be added out-of-band.
+	{
+		phase:    PhaseConstraints,
+		contains: "maximum statement execution time",
+		hint:     "the foreign-key build hit PlanetScale's statement-time limit (errno 3024); ADD FOREIGN KEY validates every child row against the parent, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall — and --resume re-runs the identical validating ADD and re-hits the same wall, so it never converges. An UNFILTERED migrate adds such a constraint metadata-only automatically (the copied rows are FK-consistent by construction), so you are seeing this because a --where row filter is active (which can legitimately orphan children, so validation is kept) or this is not a migrate. Re-run with --skip-foreign-keys to complete WITHOUT the foreign keys (each FK's referencing columns stay indexed, so you can add the constraints out-of-band afterward), fix the --where filter so it does not orphan children, or grow the PlanetScale cluster so the child-row validation finishes under the limit",
+		code:     sluicecode.CodeConstraintStatementTimeLimit,
+	},
+
 	// CDC: replication-role attribute missing. Postgres surfaces
 	// "permission denied for replication" when the connecting
 	// role doesn't have the REPLICATION attribute. docs/postgres-
