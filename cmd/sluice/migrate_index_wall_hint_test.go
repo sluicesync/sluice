@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/alecthomas/kong"
@@ -200,7 +201,7 @@ func init() {
 // error to migcore.PhaseBulkCopy again) and BOTH assertions fail — that is
 // the mutation check this gate is built to survive.
 func TestMigrateIndexWall_HintAndCodeReachTheOperator(t *testing.T) {
-	records := captureSlog(t)
+	snapshot := captureSlog(t)
 
 	cli := &CLI{}
 	parser, err := kong.New(cli, kong.Vars{"version": "test"}, kong.Exit(func(int) {}))
@@ -245,7 +246,7 @@ func TestMigrateIndexWall_HintAndCodeReachTheOperator(t *testing.T) {
 	}
 
 	logCodedError(runErr)
-	attrs := findRecordAttrs(t, *records, "command failed")
+	attrs := findRecordAttrs(t, snapshot(), "command failed")
 	if attrs["code"] != string(sluicecode.CodeIndexStatementTimeLimit) {
 		t.Errorf("exit-boundary code attr = %q; want %q", attrs["code"], sluicecode.CodeIndexStatementTimeLimit)
 	}
@@ -254,15 +255,25 @@ func TestMigrateIndexWall_HintAndCodeReachTheOperator(t *testing.T) {
 	}
 }
 
-// captureSlog swaps the default logger for a recorder for the duration of
-// the test and returns the (growing) record slice.
-func captureSlog(t *testing.T) *[]slog.Record {
+// captureSlog swaps the default logger for a recorder for the duration of the
+// test and returns a snapshot function. These tests drive a REAL Migrator whose
+// parallel copy goroutines log concurrently, so the returned closure takes a
+// LOCKED copy of the records — reading the slice directly would race the
+// concurrent appends the `-race` job flags. Call it after the run to assert.
+func captureSlog(t *testing.T) func() []slog.Record {
 	t.Helper()
-	var records []slog.Record
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: &records}))
+	slog.SetDefault(slog.New(captureHandler{mu: &mu, records: &records}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &records
+	return func() []slog.Record {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]slog.Record(nil), records...)
+	}
 }
 
 // findRecordAttrs returns the attrs of the LAST record with the given

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -359,9 +360,12 @@ func TestSlotDropListErrorDoesNotMaskNotFound(t *testing.T) {
 // was exhausted. So the exit code and the stdout line stay EXACTLY as
 // before (scripts parse them) and the information rides a WARN record.
 func TestSlotDropIfExistsWarnsAboutTheSibling(t *testing.T) {
-	var records []slog.Record
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: &records}))
+	slog.SetDefault(slog.New(captureHandler{mu: &mu, records: &records}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	mgr := &fakeSlotManager{slots: slotRows("sluice_shard_a")}
@@ -401,9 +405,12 @@ func TestSlotDropIfExistsWarnsAboutTheSibling(t *testing.T) {
 // with no sibling, --if-exists is the plain idempotent no-op it always
 // was — no WARN noise on a source that simply has nothing to clean up.
 func TestSlotDropIfExistsStaysQuietWhenNothingRhymes(t *testing.T) {
-	var records []slog.Record
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: &records}))
+	slog.SetDefault(slog.New(captureHandler{mu: &mu, records: &records}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	mgr := &fakeSlotManager{slots: slotRows("sluice_other")}
