@@ -408,7 +408,10 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
-	return nil
+	// Roadmap item 109: prove any metadata-only-added FK clean (same as the
+	// per-database path). No-op unless the cross-database FK pass added one
+	// metadata-only.
+	return m.verifyUnvalidatedForeignKeys(ctx, sw, schema)
 }
 
 // stripForeignKeys clears every table's ForeignKeys so the per-database

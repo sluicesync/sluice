@@ -71,6 +71,17 @@ const (
 	// has no deploy-request fallback wired yet (roadmap C).
 	CodeConstraintStatementTimeLimit Code = "SLUICE-E-CONSTRAINT-STATEMENT-TIME-LIMIT"
 
+	// Roadmap item 109 (loud-failure recovery): the item-109 metadata-only FK
+	// statement-wall recovery adds a wall-blocked foreign key under
+	// foreign_key_checks=0, then PROVES the child rows satisfy it with a
+	// bounded chunked orphan scan (each query PK-range-bounded so it cannot
+	// itself hit the wall). When that scan finds a child row whose foreign-key
+	// value has no matching parent, the run is REFUSED (the FK is dropped
+	// first, so the target never keeps a trusted-wrong constraint) — the loud
+	// signal the `--allow-degraded-fks` baseline demands, recovered without
+	// re-incurring the wall a validating ADD would have hit.
+	CodeFKSourceOrphan Code = "SLUICE-E-FK-SOURCE-ORPHAN"
+
 	// Roadmap item 68e: binlog CDC (vanilla MySQL / MariaDB flavors)
 	// refuses at every CDC start when @@GLOBAL.binlog_format is not ROW.
 	// Ground truth (Phase A, 2026-07-23, real mysql:8.0 STATEMENT): the
@@ -312,6 +323,8 @@ var registry = map[Code]Info{
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeConstraintStatementTimeLimit: {ClassRuntime, "foreign-key ADD hit PlanetScale's statement-time limit (errno 3024) — ADD FOREIGN KEY validates every child row, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall; --resume re-hits the identical deterministic wall, so the converging remedy is --skip-foreign-keys (completes the migration, keeps each FK's backing index)"},
+
+	CodeFKSourceOrphan: {ClassRefusal, "the item-109 metadata-only FK wall recovery added a foreign key under foreign_key_checks=0, then a bounded chunked orphan scan found a child row whose foreign-key value has no matching parent — the source was not FK-consistent after all; the FK is dropped and the run refused (loud-failure per the --allow-degraded-fks baseline). Clean the orphaned child rows on the source, or re-run with --skip-foreign-keys to complete without the constraint"},
 
 	CodeCDCBinlogFormatNotRow: {ClassRefusal, "binlog CDC refused at start: @@GLOBAL.binlog_format is STATEMENT or MIXED, under which DML arrives as SQL text sluice cannot replay — the stream would run green while silently applying nothing; SET GLOBAL binlog_format=ROW (or the provider console) and re-run"},
 
