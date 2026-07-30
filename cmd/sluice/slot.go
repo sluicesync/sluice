@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -28,8 +30,8 @@ import (
 // run, accumulated WAL). Keeping it under `sluice slot` makes it
 // discoverable on its own.
 type SlotCmd struct {
-	List SlotListCmd `cmd:"" help:"List logical-replication slots on the source database."`
-	Drop SlotDropCmd `cmd:"" help:"Drop a named replication slot on the source database."`
+	List SlotListCmd `cmd:"" help:"List logical-replication slots on the source database. The NAME column is the literal slot name 'sluice slot drop' takes."`
+	Drop SlotDropCmd `cmd:"" help:"Drop a replication slot on the source database by its literal name (as 'sluice slot list' prints it)."`
 }
 
 // SlotListCmd shows every replication slot visible on the source.
@@ -112,7 +114,14 @@ type SlotDropCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
 
-	Name     string `arg:"" help:"Slot name to drop." placeholder:"NAME"`
+	// Name is the LITERAL slot name — deliberately not run through
+	// pipeline.ResolveSlotName. `--slot-name` on sync/backup is a
+	// SUFFIX (sluice prepends `sluice_`), but auto-prefixing here would
+	// (a) make a literal unprefixed slot untargetable and (b) silently
+	// retarget a destructive command at a different object than the one
+	// the operator named. Instead the not-found path says "you probably
+	// meant sluice_<name>" — see slotNameSuggestions.
+	Name     string `arg:"" help:"The LITERAL, fully-qualified slot name to drop, exactly as the NAME column of 'sluice slot list' prints it. This is NOT the '--slot-name' suffix that sync/backup take: sluice prepends 'sluice_' to those, so '--slot-name shard_a' creates the slot 'sluice_shard_a' and that full name is what belongs here. Drop never auto-prefixes (a destructive command must act on the object you named); when the literal name is absent but its 'sluice_'-prefixed sibling exists, the error says so and gives the exact command." placeholder:"NAME"`
 	IfExists bool   `help:"Treat a missing slot as success rather than an error."`
 	Force    bool   `help:"Drop the slot even if it is active (a CDC consumer is currently connected). Use with care."`
 	Yes      bool   `help:"Confirm this destructive operation. Required: without it, drop refuses loudly rather than prompting." short:"y"`
@@ -142,16 +151,136 @@ func (s *SlotDropCmd) Run(_ *Globals) error {
 	}
 	defer func() { _ = mgr.Close() }()
 
-	ctx := kongContext()
-	if err := mgr.Drop(ctx, s.Name, s.Force); err != nil {
-		if s.IfExists && isSlotNotFoundErr(err) {
-			fmt.Fprintf(os.Stdout, "slot %q does not exist; nothing to do\n", s.Name)
-			return nil
-		}
+	return s.drop(kongContext(), mgr, os.Stdout)
+}
+
+// drop runs the drop against an already-open slot manager. Split out of
+// Run so the not-found did-you-mean path is unit-testable against a
+// fake [ir.SlotManager] with no database.
+func (s *SlotDropCmd) drop(ctx context.Context, mgr ir.SlotManager, out io.Writer) error {
+	err := mgr.Drop(ctx, s.Name, s.Force)
+	if err == nil {
+		fmt.Fprintf(out, "dropped slot %q\n", s.Name)
+		return nil
+	}
+	if !isSlotNotFoundErr(err) {
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "dropped slot %q\n", s.Name)
-	return nil
+
+	// Not found. Before reporting it, work out whether the operator hit
+	// sluice's own naming convention: `--slot-name shard_a` creates
+	// `sluice_shard_a`, so `slot drop shard_a` is the natural — and
+	// wrong — next command. Purely diagnostic: it runs on an
+	// already-failing path and degrades to empty strings when the source
+	// can't be listed, so a List failure never masks the not-found it
+	// was trying to explain.
+	sibling, nearby := s.slotNameSuggestions(ctx, mgr)
+
+	if s.IfExists {
+		// --if-exists means "a missing slot is not an ERROR" — it does
+		// not mean "say nothing about it". Suppressing the failure is not
+		// the same as suppressing the information, and the sibling case
+		// is exactly where exiting 0 on "nothing to do" would otherwise
+		// be a silent no-op over an object the operator meant to drop
+		// (the cleanup-that-never-cleaned-up shape that exhausted
+		// max_replication_slots in a regression cycle). So: still exit 0,
+		// but WARN. The warning goes to the log (stderr / structured
+		// under --log-format json), never stdout, so the stdout contract
+		// scripts parse stays byte-identical on this path.
+		fmt.Fprintf(out, "slot %q does not exist; nothing to do\n", s.Name)
+		if sibling != "" {
+			slog.WarnContext(
+				ctx,
+				"slot drop --if-exists: the named slot is absent but its sluice-convention sibling exists",
+				slog.String("slot", s.Name),
+				slog.String("hint", sibling),
+			)
+		}
+		return nil
+	}
+
+	// Uncoded, exit 1, and still wrapping the engine's not-found error —
+	// the guidance is appended to the prose, it does not reclassify the
+	// failure.
+	switch {
+	case sibling != "":
+		return fmt.Errorf("%w — %s", err, sibling)
+	case nearby != "":
+		return fmt.Errorf("%w — %s", err, nearby)
+	default:
+		return err
+	}
+}
+
+// maxSuggestedSlots caps how many existing sluice-owned slot names the
+// not-found guidance enumerates. A source can legitimately carry dozens
+// (one per stream, per shard); a diagnostic line is not a slot listing,
+// and `sluice slot list` is one command away.
+const maxSuggestedSlots = 5
+
+// slotNameSuggestions inspects the source's actual slots and returns at
+// most one of two guidance strings for the not-found path:
+//
+//   - sibling: the strong signal — the literal name the operator gave
+//     does NOT exist but its `sluice_`-prefixed form DOES, i.e. they
+//     passed the `--slot-name` suffix rather than the full name. Names
+//     the convention and gives the exact command.
+//   - nearby: the weak signal — neither form exists, but the source does
+//     carry sluice-owned slots worth naming (a typo, or the wrong
+//     source).
+//
+// Both are empty when List fails or has nothing useful to say; the
+// caller then reports today's bare not-found error unchanged.
+func (s *SlotDropCmd) slotNameSuggestions(ctx context.Context, mgr ir.SlotManager) (sibling, nearby string) {
+	slots, err := mgr.List(ctx)
+	if err != nil {
+		return "", ""
+	}
+
+	exists := make(map[string]bool, len(slots))
+	owned := make([]string, 0, len(slots))
+	for _, slot := range slots {
+		exists[slot.Name] = true
+		if strings.HasPrefix(slot.Name, pipeline.SluiceSlotPrefix) {
+			owned = append(owned, slot.Name)
+		}
+	}
+
+	resolved := pipeline.ResolveSlotName(s.Name)
+	if resolved != s.Name && exists[resolved] && !exists[s.Name] {
+		return fmt.Sprintf(
+			"but the slot %q does exist: sluice treats a sync/backup --slot-name as a SUFFIX and prepends %q to it, "+
+				"so `--slot-name %s` created the slot %q. `slot drop` takes the literal name and never prefixes it, "+
+				"so if that is the slot you mean, run: sluice slot drop %s --source-driver %s --source <the same DSN> %s",
+			resolved, pipeline.SluiceSlotPrefix, s.Name, resolved,
+			resolved, s.SourceDriver, s.dropFlagsForSuggestion(),
+		), ""
+	}
+
+	if len(owned) == 0 {
+		return "", ""
+	}
+	shown := owned
+	suffix := ""
+	if len(shown) > maxSuggestedSlots {
+		shown = shown[:maxSuggestedSlots]
+		suffix = fmt.Sprintf(" (and %d more)", len(owned)-maxSuggestedSlots)
+	}
+	return "", fmt.Sprintf(
+		"sluice-owned slots that DO exist on this source: %s%s. `slot drop` takes the literal slot name — the NAME "+
+			"column of `sluice slot list` — and sluice prepends %q to every slot it creates from a --slot-name suffix",
+		strings.Join(shown, ", "), suffix, pipeline.SluiceSlotPrefix,
+	)
+}
+
+// dropFlagsForSuggestion echoes the operator's own destructive-intent
+// flags back into the suggested command so the copy-paste doesn't lose
+// the --force they already decided they needed.
+func (s *SlotDropCmd) dropFlagsForSuggestion() string {
+	if s.Force {
+		return "--yes --force"
+	}
+	return "--yes"
 }
 
 // openSlotManager resolves the engine and opens its slot manager,
