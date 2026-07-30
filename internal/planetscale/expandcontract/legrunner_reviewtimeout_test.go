@@ -32,9 +32,11 @@ func TestLegRunner_ReviewTimeoutKeepsBranchAndNamesIt(t *testing.T) {
 	r.deployTimeout = 50 * time.Millisecond
 
 	_, err := r.run(context.Background(), "sluice-gate-review", "ALTER TABLE items ADD COLUMN c BIGINT", cleanup)
-	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
+	// Not a FAILURE: the request is healthy, sluice stopped waiting.
+	wantCode(t, err, sluicecode.CodePSDeployRequestIncomplete)
 	for _, want := range []string{
 		"did not become deployable",
+		"nothing failed",
 		// The manual escape names BOTH steps — approval alone deploys
 		// nothing because sluice never sets auto-apply (audit 2026-07-16).
 		"approve it AND deploy it from the PlanetScale UI",
@@ -72,7 +74,7 @@ func TestExpandContract_ReviewTimeoutKeepsBranch(t *testing.T) {
 	o.DeployTimeout = 50 * time.Millisecond
 
 	_, err := o.Run(context.Background())
-	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
+	wantCode(t, err, sluicecode.CodePSDeployRequestIncomplete)
 	if !strings.Contains(err.Error(), "was KEPT") {
 		t.Errorf("error %q should say the branch was kept", err.Error())
 	}

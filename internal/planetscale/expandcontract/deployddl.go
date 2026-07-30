@@ -172,6 +172,7 @@ func (d *DDLDeployer) legRunner() *legRunner {
 		name:          "deploy-ddl",
 		errPrefix:     "deploy-ddl",
 		passwordName:  "sluice-deploy-ddl",
+		timeoutFlag:   "--deploy-timeout",
 
 		// deploy-ddl has no resume legs: a deployed DDL means the run
 		// is simply done, so the guidance ends there.

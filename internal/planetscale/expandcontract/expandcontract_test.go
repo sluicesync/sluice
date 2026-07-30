@@ -95,6 +95,45 @@ type fakePS struct {
 	// request is CREATED — i.e. after the provisioning freshness gate
 	// captured its baseline, before the deployable wait ends.
 	flipProdSchemaOnDRCreate string
+
+	// ---- the progress/health half of the deployment object ----
+	//
+	// Live-captured field set (2026-07-30, a real mid-build PS-160 deploy
+	// request); the poller's narration and its human-gate detection read
+	// nothing else.
+
+	// opPercents is the progress_percentage script: one entry consumed
+	// per post-deploy GET, the last repeating. Empty means the
+	// deployment reports NO operation rows at all (a queued deployment),
+	// which must stay narratable rather than panicking on a nil slice.
+	opPercents []int
+	// opETASeconds / opThrottledAt fill the remaining operation fields.
+	opETASeconds  int64
+	opThrottledAt *time.Time
+	// opsInSummariesOnly moves the operation rows out of
+	// deploy_operations and into deploy_operation_summaries — the OTHER
+	// location the real response carries them in, so the fallback read
+	// is exercised rather than assumed.
+	opsInSummariesOnly bool
+
+	// autoCutover mirrors deployment.auto_cutover; true is what
+	// PlanetScale returns for sluice's own deploy requests
+	// (live-verified), so newFakePS defaults it on and a test opts into
+	// the gated-deployment shape.
+	autoCutover bool
+	// approved mirrors the DR's approved flag.
+	approved bool
+	// queuePaused / queuePauseReason mirror the deploy-queue pause.
+	queuePaused      bool
+	queuePauseReason string
+
+	// deleteAttempts counts every branch DELETE that REACHED the fake,
+	// scripted failures included — the pin that sluice does not even ASK
+	// for the delete while a deployment is in flight (a `deleted`-only
+	// assertion would pass on a refused-but-attempted delete, which is
+	// exactly the field bug: PlanetScale answering 422 to a request
+	// sluice should never have sent).
+	deleteAttempts int
 }
 
 type fakeDR struct {
@@ -118,6 +157,10 @@ func newFakePS(t *testing.T) *fakePS {
 		nextDR:         1,
 		postStates:     []string{"queued", "in_progress", "complete_pending_revert"},
 		staleBranch:    map[string]bool{},
+		// PlanetScale returns auto_cutover=true for sluice's own deploy
+		// requests (live-verified 2026-07-30) — the default must be the
+		// real one, or every test would exercise the gated-deployment path.
+		autoCutover: true,
 	}
 }
 
@@ -209,6 +252,7 @@ func (f *fakePS) handleBranches(w http.ResponseWriter, r *http.Request, rest []s
 		out.SafeMigrations = f.safeMigrations && out.Name == "main"
 		writeJSON(w, out)
 	case len(rest) == 1 && r.Method == http.MethodDelete:
+		f.deleteAttempts++
 		if len(f.deleteScript) > 0 {
 			status := f.deleteScript[0]
 			f.deleteScript = f.deleteScript[1:]
@@ -279,7 +323,7 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 			writeNotFound(w)
 			return
 		}
-		writeJSON(w, fdr.snapshot())
+		writeJSON(w, f.snapshot(fdr))
 	case len(rest) == 2 && r.Method == http.MethodPost:
 		n, _ := strconv.Atoi(rest[0])
 		fdr, ok := f.drs[n]
@@ -301,7 +345,7 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 				return
 			}
 			fdr.deployed = true
-			writeJSON(w, fdr.snapshot())
+			writeJSON(w, f.snapshot(fdr))
 		case "skip-revert":
 			fdr.skipRevert = true
 			fdr.dr.DeploymentState = "complete"
@@ -319,8 +363,12 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 // mirroring the real GET-by-number response shape (which has no
 // top-level "deployable" — the live-caught 2026-07-15 field-location
 // bug); these tests must exercise the shape the real API serves.
-func (fd *fakeDR) snapshot() *api.DeployRequest {
+func (f *fakePS) snapshot(fd *fakeDR) *api.DeployRequest {
 	out := *fd.dr
+	out.Approved = f.approved
+	out.Deployment.AutoCutover = f.autoCutover
+	out.Deployment.QueuePaused = f.queuePaused
+	out.Deployment.QueuePauseReason = f.queuePauseReason
 	if !fd.deployed {
 		if len(fd.preStates) > 0 {
 			out.DeploymentState = fd.preStates[0]
@@ -341,7 +389,35 @@ func (fd *fakeDR) snapshot() *api.DeployRequest {
 		fd.states = fd.states[1:]
 	}
 	fd.dr.DeploymentState = out.DeploymentState
+	out.Deployment.State = out.DeploymentState
+	f.attachOperations(&out)
 	return &out
+}
+
+// attachOperations fills the deployment's progress rows from the
+// opPercents/opETASeconds/opThrottledAt script, in whichever of the two
+// live locations opsInSummariesOnly selects. An empty script leaves BOTH
+// lists nil — the queued-deployment shape.
+func (f *fakePS) attachOperations(out *api.DeployRequest) {
+	if len(f.opPercents) == 0 {
+		return
+	}
+	op := api.DeployOperation{
+		State:              "in_progress",
+		TableName:          "items",
+		OperationName:      "ALTER",
+		ProgressPercentage: f.opPercents[0],
+		ETASeconds:         f.opETASeconds,
+		ThrottledAt:        f.opThrottledAt,
+	}
+	if len(f.opPercents) > 1 {
+		f.opPercents = f.opPercents[1:]
+	}
+	if f.opsInSummariesOnly {
+		out.Deployment.DeployOperationSummaries = []api.DeployOperation{op}
+		return
+	}
+	out.Deployment.DeployOperations = []api.DeployOperation{op}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -1000,16 +1076,25 @@ func TestExpandContract_DeployErrorStateIsCodedWithURL(t *testing.T) {
 	}
 }
 
-func TestExpandContract_DeployTimeoutIsCoded(t *testing.T) {
+// TestExpandContract_DeployTimeoutIsIncompleteNotFailed: see the
+// deploy-ddl sibling — the shared legRunner reframes the non-terminal
+// exit for every consumer, and leaves the in-flight deployment's dev
+// branch alone.
+func TestExpandContract_DeployTimeoutIsIncompleteNotFailed(t *testing.T) {
 	ps := newFakePS(t)
 	ps.postStates = []string{"in_progress"} // never terminal
 	o, _, _, _ := newTestOrchestrator(t, ps)
 	o.DeployTimeout = 50 * time.Millisecond
 
 	_, err := o.Run(context.Background())
-	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
-	if !strings.Contains(err.Error(), "still deploying") {
-		t.Errorf("timeout error = %q; want the still-deploying guidance", err)
+	wantCode(t, err, sluicecode.CodePSDeployRequestIncomplete)
+	for _, want := range []string{"still deploying", "nothing failed", "LEFT ALONE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("timeout error %q missing %q", err.Error(), want)
+		}
+	}
+	if len(ps.deleted) != 0 {
+		t.Errorf("deleted = %v; the branch of an in-flight deployment must be left alone", ps.deleted)
 	}
 }
 

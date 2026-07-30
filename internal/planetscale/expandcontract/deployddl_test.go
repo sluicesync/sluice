@@ -197,16 +197,26 @@ func TestDeployDDL_NoChangesDiffRefused(t *testing.T) {
 	}
 }
 
-func TestDeployDDL_DeployTimeoutIsCoded(t *testing.T) {
+// TestDeployDDL_DeployTimeoutIsIncompleteNotFailed pins the reframed
+// non-terminal exit: a healthy deploy that outran the bound is
+// SLUICE-E-PS-DEPLOY-REQUEST-INCOMPLETE, not …-FAILED, it names the flag
+// to zero out, and it LEAVES THE DEV BRANCH ALONE (the running
+// deployment depends on it; PlanetScale refuses the delete anyway).
+func TestDeployDDL_DeployTimeoutIsIncompleteNotFailed(t *testing.T) {
 	ps := newFakePS(t)
 	ps.postStates = []string{"in_progress"} // never terminal
 	d, _, _ := newTestDeployer(t, ps)
 	d.DeployTimeout = 50 * time.Millisecond
 
 	_, err := d.Run(context.Background())
-	wantCode(t, err, sluicecode.CodePSDeployRequestFailed)
-	if !strings.Contains(err.Error(), "still deploying") {
-		t.Errorf("timeout error = %q; want the still-deploying guidance", err)
+	wantCode(t, err, sluicecode.CodePSDeployRequestIncomplete)
+	for _, want := range []string{"still deploying", "nothing failed", "--deploy-timeout", "LEFT ALONE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("timeout error %q missing %q", err.Error(), want)
+		}
+	}
+	if len(ps.deleted) != 0 {
+		t.Errorf("deleted = %v; the branch of an in-flight deployment must be left alone", ps.deleted)
 	}
 }
 
