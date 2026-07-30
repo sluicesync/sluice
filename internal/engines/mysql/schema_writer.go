@@ -103,6 +103,15 @@ type SchemaWriter struct {
 	// See schema_writer_constraint_fk_wall.go.
 	copiedRowsFKConsistent bool
 
+	// unvalidatedFKs records every foreign key CreateConstraints added
+	// metadata-only under foreign_key_checks=0 (the item-109 wall recovery),
+	// so the orchestrator can PROVE each one clean with a bounded chunked
+	// orphan scan after the phase (recovering the loud-failure signal the
+	// skipped validation would have produced). Exposed via
+	// [ir.UnvalidatedForeignKeyReporter]. Empty on every non-armed / vanilla /
+	// filtered path. See schema_writer_constraint_fk_wall.go.
+	unvalidatedFKs []ir.UnvalidatedForeignKey
+
 	// rlsWarnOnce gates the cross-engine PG → MySQL RLS-drop WARN
 	// (ADR-0063 — task #52 sub-deliverable 3). A PG source carrying
 	// any RLS-enabled table or attached policy logs a single WARN
@@ -618,7 +627,7 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			if err != nil {
 				return err
 			}
-			if err := w.addForeignKeyWithWallRecovery(ctx, fkWallRecovery, table.Name, fk, stmt); err != nil {
+			if err := w.addForeignKeyWithWallRecovery(ctx, fkWallRecovery, table, fk, stmt); err != nil {
 				return err
 			}
 		}

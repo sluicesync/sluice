@@ -2244,6 +2244,50 @@ type ForeignKeyConsistencyDeclarer interface {
 	SetCopiedRowsForeignKeyConsistent(consistent bool)
 }
 
+// UnvalidatedForeignKey names one foreign key a target added WITHOUT
+// validating its child rows — the item-109 metadata-only statement-wall
+// recovery adds a wall-blocked `ADD FOREIGN KEY` under foreign_key_checks=0,
+// which skips InnoDB's O(rows) validation. The orchestrator collects these
+// after the constraints phase and PROVES each one clean with a bounded chunked
+// orphan scan (recovering the loud-failure signal without re-incurring the
+// wall).
+type UnvalidatedForeignKey struct {
+	Table string      // child (referencing) table
+	FK    *ForeignKey // the constraint that was added unvalidated
+}
+
+// UnvalidatedForeignKeyReporter is the OPTIONAL [SchemaWriter] surface that
+// reports which foreign keys it added without child-row validation, so the
+// orchestrator can verify them out-of-band. An empty slice (and a writer
+// without the surface) means "everything was validated at add time" — the
+// common case and the safe default.
+type UnvalidatedForeignKeyReporter interface {
+	UnvalidatedForeignKeys() []UnvalidatedForeignKey
+}
+
+// ForeignKeyOrphanScanner is the OPTIONAL [SchemaWriter] surface that scans a
+// bounded PK range of a child table for a row that VIOLATES a foreign key — a
+// row whose (non-NULL) referencing key has no matching parent — returning the
+// first violating child primary key. It backs the item-109 post-add orphan
+// verification: each call is clipped to one chunk's PK range so it cannot
+// itself hit the statement-time wall the metadata-only add was dodging.
+//
+// lowerPK / upperPK follow the [migcore.ChunkBoundary] half-open convention
+// ((lowerPK, upperPK]); a nil bound means unbounded on that side. found=false
+// with a nil error means the range is clean.
+type ForeignKeyOrphanScanner interface {
+	ScanForeignKeyOrphan(ctx context.Context, child *Table, fk *ForeignKey, lowerPK, upperPK []any) (violatingKey []any, found bool, err error)
+}
+
+// ForeignKeyDropper is the OPTIONAL [SchemaWriter] surface used to remove a
+// foreign key by name — the item-109 orphan scan drops the unvalidated
+// constraint it just added when it finds a violation, so the target never
+// keeps a trusted-wrong FK (it ends in the same "FK absent, run refused" state
+// a validating ADD would have left).
+type ForeignKeyDropper interface {
+	DropForeignKey(ctx context.Context, childTable, fkName string) error
+}
+
 // TableAnalyzer is the OPTIONAL surface a [SchemaWriter] implements so
 // the migrate orchestrator's opt-in `--analyze-after` phase can refresh
 // the target's planner statistics per migrated table once constraints

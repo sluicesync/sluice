@@ -869,6 +869,19 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return m.rowFilterFKOrphanRefusal(sw, schema, err, err)
 	}
 
+	// Roadmap item 109: any FK the constraints phase added metadata-only (the
+	// statement-wall recovery under foreign_key_checks=0) skipped InnoDB's
+	// child-row validation. PROVE those child rows actually satisfy the FK with
+	// a bounded chunked orphan scan — recovering the loud-failure signal without
+	// re-incurring the wall. No-op unless a metadata-only add happened (an armed
+	// VStream migrate whose FK walled); a violation drops the FK and refuses
+	// (SLUICE-E-FK-SOURCE-ORPHAN). The constraints phase re-runs idempotently on
+	// --resume, so a refusal re-derives deterministically rather than a resume
+	// silently completing with the FK absent.
+	if err := m.verifyUnvalidatedForeignKeys(ctx, sw, schema); err != nil {
+		return err
+	}
+
 	// Envelope bookkeeping: mirror the "migration complete" table set
 	// into the optional Summary (nil-safe no-op otherwise). The per-table
 	// row count stays out of the JSON envelope by design; the aggregate
@@ -984,6 +997,32 @@ func reportDegradedFKs(ctx context.Context, sw ir.SchemaWriter) {
 		slog.Int("count", len(fks)),
 		slog.String("action_required",
 			"run `ALTER TABLE ... VALIDATE CONSTRAINT <name>` for each after fixing the orphan rows on the child tables"))
+}
+
+// verifyUnvalidatedForeignKeys runs the roadmap-item-109 post-constraints
+// orphan scan: for every FK the target added metadata-only under
+// foreign_key_checks=0 (the statement-wall recovery), it proves the child rows
+// clean with a bounded chunked scan, dropping the FK and refusing on a
+// violation. A no-op unless the writer reports metadata-only-added FKs (every
+// non-armed / vanilla / filtered / by-construction-clean path), so it opens no
+// target reader in the common case. The chunk boundaries are computed on a
+// TARGET-side reader (the samplers the parallel copy uses); the scan itself
+// runs on the writer.
+func (m *Migrator) verifyUnvalidatedForeignKeys(ctx context.Context, sw ir.SchemaWriter, schema *ir.Schema) error {
+	r, ok := sw.(ir.UnvalidatedForeignKeyReporter)
+	if !ok || len(r.UnvalidatedForeignKeys()) == 0 {
+		return nil
+	}
+	tr, err := m.Target.OpenRowReader(ctx, m.TargetDSN)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConstraints,
+			fmt.Errorf("pipeline: open target reader to verify metadata-only foreign keys: %w", err))
+	}
+	defer migcore.CloseIf(tr)
+	migcore.ApplyTargetSchema(tr, m.TargetSchema)
+	// The returned error is already coded (SLUICE-E-FK-SOURCE-ORPHAN) or a loud
+	// wrapped scan failure — return it unchanged.
+	return migcore.ValidateUnvalidatedForeignKeys(ctx, sw, schema, tr)
 }
 
 // rowFilterFKOrphanRefusal upgrades a constraints-phase FK-orphan failure
