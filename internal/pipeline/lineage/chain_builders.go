@@ -11,7 +11,53 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// ChainNotRestorableHint is the standalone remedy the structural-lineage
+// refusal carries alongside its prose — the ONE definition both `restore`
+// and `backup verify` report, so a script branching on the coded hint gets
+// the same answer from either command.
+const ChainNotRestorableHint = "this chain cannot be restored as it stands — read the underlying error, which names the shape and the repair. " +
+	"A branching lineage is most often a FORK from two concurrent chain writers (overlapping `backup incremental` " +
+	"crons); that repair is lossless. A prune/compact whose survivors no longer form one chain, and a crash between " +
+	"an incremental's manifest write and its lineage.json append, produce the same shape"
+
+// invalidLineage codes a STRUCTURAL refusal from the lineage walk — the
+// chain does not hold together — with [sluicecode.CodeBackupManifestInvalid],
+// which is the refusal class the docs table already publishes for it and the
+// code `backup verify` already reports over the same directory.
+//
+// Bug 219 is what its absence cost. The walk's refusals predate the exit-3
+// refusal taxonomy (they shipped v0.67.0; the taxonomy arrived v0.99.175 and
+// seeded five call sites, none of them here), so restore reported a FORKED
+// lineage — the shape two overlapping `backup incremental` crons produce —
+// as an uncoded exit 1 while `backup verify` reported exit 3 with the code
+// on the identical directory, and while restore itself reported exit 3 with
+// that same code for the sibling shapes (schema-hash mismatch, BackupID
+// recompute). One code, two machine contracts on one command, keyed on which
+// shape raised it: loud to a human, invisible to the DR script that followed
+// docs/operator/error-codes.md and branched on `SLUICE-E-*`.
+//
+// Every structural refusal in [BuildLineageChainFromCatalog] goes through
+// this except two, both deliberate and both pinned by
+// TestRestoreRefusalMachineContract_MatchesVerify:
+//
+//   - The two link READS. A store GET can fail transiently (an S3 5xx, a
+//     timeout) and exit 3 promises "a re-run will not help", so this shape
+//     keeps its uncoded connect-phase failure.
+//   - [blobcodec.ValidateRecordedCodec]. `backup verify` reaches that same
+//     check through [ListAllSegmentManifests] — its own pre-walk listing,
+//     which runs BEFORE the walk and returns it uncoded — so coding it here
+//     alone would leave restore at 3 and verify at 1 and simply INVERT the
+//     asymmetry Bug 219 is. Coding it belongs with that listing, for every
+//     command that reads through it, and that is a wider decision than this.
+//
+// Prose is untouched at every site: [sluicecode.Wrap] delegates Error(), so
+// the human-facing message an operator reads is byte-identical.
+func invalidLineage(err error) error {
+	return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid, ChainNotRestorableHint, err)
+}
 
 // ValidateBoundary is THE single boundary-monotonicity invariant used
 // at every lineage adjacency — intra-segment (exact) and
@@ -173,27 +219,33 @@ func BuildLineageChain(ctx context.Context, store irbackup.Store, cmp ir.Positio
 // there.
 func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat *Catalog, cmp ir.PositionMonotonicChecker) ([]SegmentRecord, error) {
 	if cat.RestorableFromSegment < 0 || cat.RestorableFromSegment >= len(cat.Segments) {
-		return nil, fmt.Errorf("lineage restorable_from_segment=%d out of range [0,%d) — corrupt lineage",
-			cat.RestorableFromSegment, len(cat.Segments))
+		return nil, invalidLineage(fmt.Errorf("lineage restorable_from_segment=%d out of range [0,%d) — corrupt lineage",
+			cat.RestorableFromSegment, len(cat.Segments)))
 	}
 
 	var out []SegmentRecord
 	var prevLink *SegmentRecord // last link of the previously-walked segment
 	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
 		seg := &cat.Segments[si]
+		// Uncoded on purpose — one of [invalidLineage]'s two carve-outs:
+		// verify reaches this same check uncoded through its own pre-walk
+		// [ListAllSegmentManifests], so coding it here alone would invert
+		// Bug 219's asymmetry instead of closing it.
 		if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 			return nil, err
 		}
 		ss := seg.Store(store)
 
-		// Segment full.
+		// Segment full. The READ failure is the other carve-out: a store GET
+		// can fail transiently and exit 3 says "a re-run will not help".
+		// Everything below it is structural.
 		fm, err := ReadManifestAt(ctx, ss, seg.FullManifestPath)
 		if err != nil {
 			return nil, fmt.Errorf("segment %d (%s) full %q: %w", si, seg.SegmentID, seg.FullManifestPath, err)
 		}
 		if k := CanonicalKind(fm.Kind); k != irbackup.BackupKindFull {
-			return nil, fmt.Errorf("segment %d (%s) full manifest %q has kind %q; expected full",
-				si, seg.SegmentID, seg.FullManifestPath, fm.Kind)
+			return nil, invalidLineage(fmt.Errorf("segment %d (%s) full manifest %q has kind %q; expected full",
+				si, seg.SegmentID, seg.FullManifestPath, fm.Kind))
 		}
 		fullRec := SegmentRecord{
 			ManifestRecord: ManifestRecord{Path: seg.FullManifestPath, Manifest: fm},
@@ -209,7 +261,7 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 			if err := ValidateBoundary(cmp, prevLink.Manifest.EndPosition, seg.IncrementalCoverageStartOrStart(), false,
 				fmt.Sprintf("segment %d last link %s", si-1, ManifestBackupID(prevLink.Manifest)),
 				fmt.Sprintf("segment %d (%s) incremental coverage start", si, seg.SegmentID)); err != nil {
-				return nil, err
+				return nil, invalidLineage(err)
 			}
 		}
 		out = append(out, fullRec)
@@ -226,13 +278,13 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 				return nil, fmt.Errorf("segment %d (%s) incremental %q: %w", si, seg.SegmentID, ip, err)
 			}
 			if k := CanonicalKind(im.Kind); k != irbackup.BackupKindIncremental {
-				return nil, fmt.Errorf("segment %d incremental %q has kind %q; expected incremental",
-					si, ip, im.Kind)
+				return nil, invalidLineage(fmt.Errorf("segment %d incremental %q has kind %q; expected incremental",
+					si, ip, im.Kind))
 			}
 			id := ManifestBackupID(im)
 			if prevPath, dup := seenInc[id]; dup {
-				return nil, fmt.Errorf("segment %d duplicate incremental BackupID %q (paths %q and %q)",
-					si, id, prevPath, ip)
+				return nil, invalidLineage(fmt.Errorf("segment %d duplicate incremental BackupID %q (paths %q and %q)",
+					si, id, prevPath, ip))
 			}
 			seenInc[id] = ip
 			if im.ParentBackupID != "" && im.ParentBackupID != parentID {
@@ -245,7 +297,7 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 				// never happened is the v0.104.3 false-accusation class again,
 				// so the concurrent-writer fork is named FIRST and the
 				// (genuinely lossless) repair is named at all.
-				return nil, fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — "+
+				return nil, invalidLineage(fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — "+
 					"branching/mis-stitched lineage. Most likely a FORK: two chain writers (overlapping `backup "+
 					"incremental` cron entries, or a `backup incremental` racing a `backup stream`) each committed "+
 					"an incremental off the same parent — pre-v0.104.7 both such runs exited 0. A crash between an "+
@@ -254,7 +306,7 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 					"REPAIR (lossless for the fork case — the siblings captured the same window): remove the "+
 					"ORPHANED sibling's entry from lineage.json, keeping whichever sibling the LATER incrementals "+
 					"chain off, re-upload it, and re-run `backup verify` before relying on the chain",
-					si, ip, im.ParentBackupID, parentID)
+					si, ip, im.ParentBackupID, parentID))
 			}
 			if ii == 0 {
 				// Full -> first-incremental boundary. ADR-0067: a
@@ -268,12 +320,12 @@ func BuildLineageChainFromCatalog(ctx context.Context, store irbackup.Store, cat
 				// start == full.End and this is the historical exact match.
 				if err := ValidateFirstIncrementalBoundary(cmp, fm.EndPosition, seg.IncrementalCoverageStart, im.StartPosition,
 					fmt.Sprintf("segment %d (%s)", si, seg.SegmentID)); err != nil {
-					return nil, err
+					return nil, invalidLineage(err)
 				}
 			} else if err := ValidateBoundary(cmp, prevLink.Manifest.EndPosition, im.StartPosition, true,
 				fmt.Sprintf("segment %d link %d", si, ii),
 				fmt.Sprintf("segment %d incremental %s", si, id)); err != nil {
-				return nil, err
+				return nil, invalidLineage(err)
 			}
 			out = append(out, SegmentRecord{
 				ManifestRecord: ManifestRecord{Path: ip, Manifest: im},

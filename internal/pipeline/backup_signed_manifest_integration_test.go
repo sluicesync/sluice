@@ -256,11 +256,16 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 		{
 			// A whole-backup rollback (swap the newest link's manifest for
 			// an OLDER, differently-shaped one) is refused loudly — here the
-			// structural Kind check fires ahead of the signature backstop.
+			// structural Kind check fires ahead of the signature backstop,
+			// so the code is the lineage walk's -MANIFEST-INVALID rather
+			// than -SIGNATURE-INVALID. It was UNCODED (exit 1) until Bug
+			// 219; asserting the code here is the real-Postgres half of that
+			// gate — the walk's refusals are now machine-readable on the
+			// restore path, not just under `backup verify`.
 			name:     "whole-manifest swap (older backup rollback)",
 			apply:    func() { storePut(t, store, incrPath, fullManifestBytes) },
 			undo:     func() {},
-			wantCode: "", // any loud refusal
+			wantCode: sluicecode.CodeBackupManifestInvalid,
 		},
 	}
 	for _, tc := range tamperCases {

@@ -1666,13 +1666,18 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// comparisons, which need a target engine verify does not have.
 	// Nil therefore makes this check a strict subset of the one restore
 	// runs, so verify can never refuse a chain restore would accept.
+	//
+	// The remedy hint is [lineage.ChainNotRestorableHint] — the same string
+	// the walk's own structural refusals now carry (Bug 219), so restore and
+	// verify report one (code, hint) pair for one shape instead of two
+	// spellings of it. This wrap stays because it also covers the shapes the
+	// walk leaves uncoded (a lineage-resolve or manifest-read failure) and
+	// adds verify's own prose; on an already-coded structural refusal it is
+	// the outermost of two identical codes, which is a no-op for the operator.
 	chain, cerr := lineage.BuildLineageChain(ctx, store, nil)
 	if cerr != nil {
 		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
-			"this chain cannot be restored as it stands — read the underlying error, which names the shape and the repair. "+
-				"A branching lineage is most often a FORK from two concurrent chain writers (overlapping `backup incremental` "+
-				"crons); that repair is lossless. A prune/compact whose survivors no longer form one chain, and a crash between "+
-				"an incremental's manifest write and its lineage.json append, produce the same shape",
+			lineage.ChainNotRestorableHint,
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
 	}
 

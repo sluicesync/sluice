@@ -200,6 +200,16 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    restore (positions are engine-native); cross-engine restore
 	//    passes nil and relies on the rotation FSM's write-time
 	//    S>=P_N hard-fail + the structural same-engine guarantee.
+	//
+	//    A STRUCTURAL refusal from the walk (a forked/mis-stitched lineage,
+	//    a boundary regression, a duplicate link) arrives already coded
+	//    [sluicecode.CodeBackupManifestInvalid], which WrapWithHint passes
+	//    through untouched (its item-91 "a specific refusal beats a generic
+	//    phase guess" short-circuit) — so it reaches the operator with the
+	//    code and exit 3 that `backup verify` gives for the same directory,
+	//    and that this command already gave for the sibling shapes of that
+	//    code (Bug 219). A manifest-READ failure stays uncoded and keeps the
+	//    connect-phase hint: it may be transient, and 3 promises otherwise.
 	cmp := lineage.SameEngineComparator(ctx, r.Store, r.Target)
 	links, err := lineage.BuildLineageChain(ctx, r.Store, cmp)
 	if err != nil {
