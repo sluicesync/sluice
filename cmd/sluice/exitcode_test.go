@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/alecthomas/kong"
@@ -89,12 +90,25 @@ func TestExitCodeTaxonomy(t *testing.T) {
 	}
 }
 
-// captureHandler records slog records for assertion.
-type captureHandler struct{ records *[]slog.Record }
+// captureHandler records slog records for assertion. The append is guarded by
+// a SHARED mutex (a pointer, so the value copies slog makes via WithAttrs/
+// WithGroup all serialize on the same lock): a test that drives a REAL Migrator
+// logs from N concurrent copy goroutines through this one handler, and an
+// unsynchronized `append` there is a data race the `-race` job catches (it did,
+// on TestMigrateConstraintWall). Reads must lock the same mutex when the writers
+// could still be running — see captureSlog's snapshot(); the single-goroutine
+// exit-boundary tests read directly, which is race-free because their logging is
+// synchronous on the reading goroutine.
+type captureHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
 	*h.records = append(*h.records, r)
+	h.mu.Unlock()
 	return nil
 }
 func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
@@ -105,9 +119,12 @@ func (h captureHandler) WithGroup(string) slog.Handler      { return h }
 // attributes (the machine-branching surface under --log-format json);
 // an uncoded error emits nothing (kong's stderr line covers it).
 func TestLogCodedError(t *testing.T) {
-	var records []slog.Record
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: &records}))
+	slog.SetDefault(slog.New(captureHandler{mu: &mu, records: &records}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	logCodedError(fmt.Errorf("outer: %w", sluicecode.Wrap(

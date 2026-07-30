@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,9 +130,12 @@ func TestRestoreForkedChain_ExitsRefusalWithCode(t *testing.T) {
 
 	// The code must actually be EMITTED at the exit boundary, not merely
 	// present in the error chain.
-	var records []slog.Record
+	var (
+		mu      sync.Mutex
+		records []slog.Record
+	)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(captureHandler{records: &records}))
+	slog.SetDefault(slog.New(captureHandler{mu: &mu, records: &records}))
 	logCodedError(err)
 	slog.SetDefault(prev)
 	if len(records) != 1 {

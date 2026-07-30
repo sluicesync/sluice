@@ -167,7 +167,7 @@ func init() {
 // (hand the error to migcore.PhaseBulkCopy or PhaseIndexes instead) and BOTH
 // assertions fail — that is the mutation check this gate is built to survive.
 func TestMigrateConstraintWall_HintAndCodeReachTheOperator(t *testing.T) {
-	records := captureSlog(t)
+	snapshot := captureSlog(t)
 
 	cli := &CLI{}
 	parser, err := kong.New(cli, kong.Vars{"version": "test"}, kong.Exit(func(int) {}))
@@ -219,7 +219,7 @@ func TestMigrateConstraintWall_HintAndCodeReachTheOperator(t *testing.T) {
 	}
 
 	logCodedError(runErr)
-	attrs := findRecordAttrs(t, *records, "command failed")
+	attrs := findRecordAttrs(t, snapshot(), "command failed")
 	if attrs["code"] != string(sluicecode.CodeConstraintStatementTimeLimit) {
 		t.Errorf("exit-boundary code attr = %q; want %q", attrs["code"], sluicecode.CodeConstraintStatementTimeLimit)
 	}
