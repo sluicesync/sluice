@@ -20,6 +20,14 @@ import (
 // names like `--slot-name shard_a` become `sluice_shard_a`.
 const sluiceSlotPrefix = "sluice_"
 
+// SluiceSlotPrefix is the exported form of [sluiceSlotPrefix], for CLI
+// surfaces that must RECOGNISE the convention rather than apply it —
+// today `sluice slot drop`'s not-found did-you-mean, which names the
+// prefix in its guidance and enumerates the sluice-owned slots that do
+// exist on the source. Exported next to [ResolveSlotName] so the prefix
+// string itself stays defined in exactly one place.
+const SluiceSlotPrefix = sluiceSlotPrefix
+
 // ResolveSlotName is the exported counterpart of [resolveSlotName].
 // CLI commands outside the pipeline package (today: `sluice backup
 // full --slot-name`) call through to apply the sluice-prefix
