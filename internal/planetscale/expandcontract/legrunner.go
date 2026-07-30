@@ -68,6 +68,14 @@ type legRunner struct {
 	reviewTimeoutAdvice   string
 	deployTimeoutAdvice   string
 
+	// timeoutFlag names the CLI flag that set deployTimeout, so the
+	// non-terminal exit can tell the operator exactly which knob to set
+	// to 0 for an unbounded wait. The commands disagree on the name
+	// (`--deploy-timeout` for expand-contract/deploy-ddl,
+	// `--planetscale-deploy-timeout` for the index-build fallback), and a
+	// message that names the wrong one is worse than one that names none.
+	timeoutFlag string
+
 	// expectedDiffTables is the leg's intended blast radius: the table
 	// names its DDL (+ staging hook) may alter/create. When non-empty,
 	// the runner fetches the deploy request's computed diff BEFORE
@@ -193,19 +201,12 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	}
 	fmt.Fprintf(out, "%s: opened deploy request #%d (%s)\n", r.name, dr.Number, dr.HTMLURL)
 
-	if err := r.waitDeployable(ctx, branchName, dr.Number); err != nil {
-		// The review-timeout remedy is "approve the deploy request and
-		// re-run" — but deleting the dev branch closes its still-open DR,
-		// making the remedy self-defeating (audit L-D0-10). On exactly
-		// this path the branch is exempted from cleanup (auto
-		// --keep-branches semantics); the timeout message names the kept
-		// branch and how to delete it once the DR closes. Every other
-		// failure path still cleans up.
-		var pending *reviewPendingError
-		if errors.As(err, &pending) {
-			cleanup.remove(branchName)
-		}
-		return nil, err
+	// One reporter spans both waits, so a state transition across the
+	// deploy call reads as one continuous narration.
+	progress := newDeployProgressReporter(r, dr.Number)
+
+	if err := r.waitDeployable(ctx, branchName, dr.Number, progress); err != nil {
+		return nil, r.keepBranchOnRequest(err, branchName, cleanup)
 	}
 	// Pre-Deploy blast-radius + freshness gates (audit MED-D0-7). Both
 	// run between "PlanetScale computed the diff / review finished" and
@@ -221,9 +222,9 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	if err := r.deployWithValidatingRetry(ctx, dr); err != nil {
 		return nil, err
 	}
-	final, err := r.waitDeployed(ctx, dr.Number)
+	final, err := r.waitDeployed(ctx, branchName, dr.Number, progress)
 	if err != nil {
-		return nil, err
+		return nil, r.keepBranchOnRequest(err, branchName, cleanup)
 	}
 
 	// Finalize the revert window: PlanetScale holds a
@@ -451,7 +452,10 @@ func (r *legRunner) backupProduction(ctx context.Context) error {
 		return fmt.Errorf("%s: create rebase backup of %q: %w", r.errPrefix, r.branch, err)
 	}
 	fmt.Fprintf(r.out, "%s: backup of %q started (rebase base for the dev branch; duration scales with database size)\n", r.name, r.branch)
-	deadline := time.Now().Add(r.deployTimeout)
+	// The rebase backup rides the leg's deploy bound, unbounded included:
+	// its duration scales with database size for the same reason the
+	// deploy does, so a bound that is wrong for one is wrong for both.
+	deadline, bounded := pollDeadline(time.Now(), r.deployTimeout)
 	for {
 		cur, err := r.api.GetBackup(ctx, r.org, r.database, r.branch, bk.ID)
 		if err != nil {
@@ -468,7 +472,7 @@ func (r *legRunner) backupProduction(ctx context.Context) error {
 					r.errPrefix, r.branch, cur.State,
 				))
 		}
-		if time.Now().After(deadline) {
+		if bounded && time.Now().After(deadline) {
 			return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
 				"take a fresh backup of the production branch (pscale backup create), then re-run",
 				fmt.Errorf(
@@ -503,44 +507,69 @@ func (r *legRunner) waitBranchReady(ctx context.Context, branchName string) erro
 	}
 }
 
-// Deploy-request lifecycle classification (ADR-0148 finding #3 ground
-// truth: open/pending → ready (deployable=true) → queued →
-// complete_pending_revert). The poller is deliberately TOLERANT of
-// state names it doesn't know: terminal-success and terminal-failure
-// are matched by name, everything else keeps waiting until the
-// deadline — a new intermediate PlanetScale state must not fail a
-// healthy deploy, and the timeout bounds the unknown-terminal risk.
-var (
-	drSuccessStates = map[string]bool{
-		"complete":                true,
-		"complete_pending_revert": true,
-	}
-	drFailureStates = map[string]bool{
-		"error":                 true,
-		"complete_error":        true,
-		"cancelled":             true,
-		"complete_cancel":       true,
-		"complete_revert":       true,
-		"complete_revert_error": true,
-	}
-)
+// keepBranchError marks a leg failure on which the dev branch MUST NOT
+// be deleted, exempting it from [branchCleanup]. Two paths raise it,
+// for the same underlying reason — something in PlanetScale still needs
+// that branch:
+//
+//   - the deployable-wait timeout (audit L-D0-10): the remedy is
+//     "approve the deploy request", and deleting the branch closes the
+//     still-open DR the operator was just told to approve.
+//   - the deploy-wait bound with the deployment still IN FLIGHT: the
+//     running deployment depends on the branch, PlanetScale refuses the
+//     delete while it runs (HTTP 422 "cannot be deleted while a
+//     deployment is in progress" — field-observed), and the recovery
+//     sluice itself prescribes requires that deployment to finish. Asking
+//     for the delete at all was wrong; the 422 was PlanetScale correctly
+//     refusing it.
+//
+// It wraps the coded error so the exit surface is unchanged.
+type keepBranchError struct{ err error }
 
-// reviewPendingError marks waitDeployable's deadline failure: the
-// deploy request is still OPEN (likely awaiting review approval), so
-// the caller must exempt the dev branch from cleanup — deleting the
-// branch closes the DR the operator was just told to approve (audit
-// L-D0-10). Wraps the coded drFailure so the exit surface is unchanged.
-type reviewPendingError struct{ err error }
+func (e *keepBranchError) Error() string { return e.err.Error() }
+func (e *keepBranchError) Unwrap() error { return e.err }
 
-func (e *reviewPendingError) Error() string { return e.err.Error() }
-func (e *reviewPendingError) Unwrap() error { return e.err }
+// pollDeadline resolves a polling deadline: a zero or negative duration
+// means UNBOUNDED — poll to a terminal state, however long it takes.
+// bounded=false is the index-build fallback's default, because a large
+// table's VReplication index build genuinely runs for hours and a
+// wall-clock bound made the non-terminal exit the DEFAULT outcome
+// (field-measured on a real PS-160: a 106 GB / 153 M-row `ADD KEY ×4`
+// was ~29 % done when the old 1 h bound gave up, projecting ~3 h 25 m).
+func pollDeadline(now time.Time, d time.Duration) (deadline time.Time, bounded bool) {
+	if d <= 0 {
+		return time.Time{}, false
+	}
+	return now.Add(d), true
+}
+
+// legHumanWaitCap bounds the waits that depend on a PERSON, even when the
+// deploy wait itself is unbounded. The asymmetry is deliberate: the
+// deploy wait may be unbounded because a VReplication build is machine
+// work with visible, reportable progress, whereas the deployable wait can
+// hang on an approver who never comes. "sluice looks hung forever" must
+// never be the outcome of a human gate.
+const legHumanWaitCap = time.Hour
+
+// reviewTimeout bounds waitDeployable — the "PlanetScale computed the
+// diff / a human approved it" wait. It tracks the leg's deploy timeout
+// when that is bounded (byte-identical behaviour for expand-contract and
+// deploy-ddl) and falls back to [legHumanWaitCap] when the deploy wait is
+// unbounded.
+func (r *legRunner) reviewTimeout() time.Duration {
+	if r.deployTimeout <= 0 {
+		return legHumanWaitCap
+	}
+	return r.deployTimeout
+}
 
 // waitDeployable polls until the deploy request is deployable (the
 // diff computed and PlanetScale accepts a deploy call). branchName is
 // the leg's dev branch, named in the still-in-review timeout message
-// (the branch is kept on that path — see [reviewPendingError]).
-func (r *legRunner) waitDeployable(ctx context.Context, branchName string, number int) error {
-	deadline := time.Now().Add(r.deployTimeout)
+// (the branch is kept on that path — see [keepBranchError]).
+func (r *legRunner) waitDeployable(ctx context.Context, branchName string, number int, progress *deployProgressReporter) error {
+	timeout := r.reviewTimeout()
+	deadline, bounded := pollDeadline(r.nowFunc()(), timeout)
 	for {
 		dr, err := r.api.GetDeployRequest(ctx, r.org, r.database, number)
 		if err != nil {
@@ -559,22 +588,23 @@ func (r *legRunner) waitDeployable(ctx context.Context, branchName string, numbe
 				"deploy request #%d has no schema changes — the DDL looks already deployed; %s",
 				number, r.alreadyDeployedAdvice,
 			))
-		case drFailureStates[dr.DeploymentState] || dr.State == "closed":
+		case classifyDeployState(dr.DeploymentState) == drFailure || dr.State == "closed":
 			return r.drFailure(dr, fmt.Sprintf(
 				"deploy request #%d cannot be deployed (state %q, deployment_state %q)",
 				number, dr.State, dr.DeploymentState,
 			))
 		}
-		if time.Now().After(deadline) {
-			// The manual escape must name BOTH steps: sluice never sets
-			// auto-apply on the deploy request, so approving it alone
-			// deploys nothing — the operator has to approve AND deploy
-			// from the PlanetScale UI (or `pscale deploy-request deploy`),
-			// then follow the per-command advice (audit 2026-07-16: the
-			// earlier "approve it and re-run" chain dead-ended).
-			return &reviewPendingError{err: r.drFailure(dr, fmt.Sprintf(
-				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, approve it AND deploy it from the PlanetScale UI (approval alone deploys nothing; sluice never enables auto-apply), then %s; the dev branch %q was KEPT (deleting it would close the still-open deploy request) — once the request closes, delete it with `pscale branch delete %s %s --org %s`",
-				number, r.deployTimeout, dr.DeploymentState, r.reviewTimeoutAdvice,
+		progress.noteApprovalGate(ctx, dr)
+		if bounded && r.nowFunc()().After(deadline) {
+			// Not a FAILURE — the request is healthy, sluice just stopped
+			// waiting for the human/diff half. The manual escape names
+			// BOTH steps: sluice never sets auto-apply on the deploy
+			// request, so approving it alone deploys nothing (audit
+			// 2026-07-16: the earlier "approve it and re-run" chain
+			// dead-ended).
+			return &keepBranchError{err: r.drIncomplete(dr, fmt.Sprintf(
+				"deploy request #%d did not become deployable within %s (deployment_state %q) — nothing failed; if your organization requires deploy-request review, approve it AND deploy it from the PlanetScale UI (approval alone deploys nothing; sluice never enables auto-apply), then %s; the dev branch %q was KEPT and must be LEFT ALONE for now (deleting it would close the still-open deploy request) — once the request closes, delete it with `pscale branch delete %s %s --org %s`",
+				number, timeout, dr.DeploymentState, r.reviewTimeoutAdvice,
 				branchName, r.database, branchName, r.org,
 			))}
 		}
@@ -584,32 +614,86 @@ func (r *legRunner) waitDeployable(ctx context.Context, branchName string, numbe
 	}
 }
 
-// waitDeployed polls a deploying request to a terminal state.
-func (r *legRunner) waitDeployed(ctx context.Context, number int) (*api.DeployRequest, error) {
-	deadline := time.Now().Add(r.deployTimeout)
+// waitDeployed polls a deploying request to a TERMINAL state — by
+// default without any wall-clock bound at all (see [pollDeadline]), so
+// the multi-hour VReplication build the index-build fallback exists for
+// runs to completion instead of exiting non-terminally at ~29 % done.
+// Terminal FAILURE states are matched by name and fail fast, so an
+// unbounded wait never sits on an already-dead deploy; the progress
+// reporter narrates the rest so a long build is visibly alive.
+func (r *legRunner) waitDeployed(ctx context.Context, branchName string, number int, progress *deployProgressReporter) (*api.DeployRequest, error) {
+	deadline, bounded := pollDeadline(r.nowFunc()(), r.deployTimeout)
 	for {
 		dr, err := r.api.GetDeployRequest(ctx, r.org, r.database, number)
 		if err != nil {
 			return nil, fmt.Errorf("%s: poll deploy request #%d: %w", r.errPrefix, number, err)
 		}
-		switch {
-		case drSuccessStates[dr.DeploymentState]:
+		progress.observe(dr)
+		progress.noteQueuePaused(ctx, dr)
+		switch classifyDeployState(dr.DeploymentState) {
+		case drSuccess:
 			return dr, nil
-		case drFailureStates[dr.DeploymentState]:
+		case drFailure:
 			return nil, r.drFailure(dr, fmt.Sprintf(
 				"deploy request #%d failed (deployment_state %q)", number, dr.DeploymentState,
 			))
+		case drHumanGate:
+			// The ONLY documented human gate here is pending_cutover
+			// ("ready to apply the schema and waiting on the user to
+			// confirm"). A deployment that reports auto_cutover will cut
+			// over by itself, so passing through that state briefly is
+			// healthy and must NOT stop the wait — sluice's own deploy
+			// requests come back auto_cutover=true (live-verified
+			// 2026-07-30), which is why the downgrade lives here rather
+			// than in the state table.
+			if dr.Deployment.AutoCutover {
+				break
+			}
+			return nil, &keepBranchError{err: r.drIncomplete(dr, fmt.Sprintf(
+				"deploy request #%d is waiting for a PERSON to confirm the cutover (deployment_state %q, auto_cutover=false) — nothing failed: the schema build finished, but PlanetScale will not apply it until someone confirms in the UI, and sluice never confirms a cutover on your behalf. Confirm it at the URL, then %s. The dev branch %q was KEPT and must be LEFT ALONE until the deployment finishes",
+				number, dr.DeploymentState, r.deployTimeoutAdvice, branchName,
+			))}
+		case drInFlight:
 		}
-		if time.Now().After(deadline) {
-			return nil, r.drFailure(dr, fmt.Sprintf(
-				"deploy request #%d still deploying after %s (deployment_state %q) — the deploy keeps running in PlanetScale; %s",
-				number, r.deployTimeout, dr.DeploymentState, r.deployTimeoutAdvice,
-			))
+		if bounded && r.nowFunc()().After(deadline) {
+			// A bound was hit while the deploy is healthy and progressing.
+			// Nothing FAILED — sluice stopped waiting — so this is the
+			// non-failure code, and the dev branch is left alone: the
+			// in-flight deployment depends on it, PlanetScale refuses the
+			// delete while it runs, and the recovery named below needs
+			// that deployment to complete.
+			return nil, &keepBranchError{err: r.drIncomplete(dr, fmt.Sprintf(
+				"deploy request #%d is still deploying after %s (deployment_state %q%s) — nothing failed: the deploy keeps running in PlanetScale. sluice stopped waiting because %s was set to %s; pass 0 to wait for the deployment to finish however long it takes. %s. The dev branch %q was KEPT and must be LEFT ALONE — the running deployment depends on it (PlanetScale refuses the delete while a deployment is in progress) and the deployment has to finish for this recovery to work; delete the branch yourself afterwards with `pscale branch delete %s %s --org %s`",
+				number, r.deployTimeout, dr.DeploymentState, progressSuffix(dr),
+				r.timeoutFlag, r.deployTimeout, r.deployTimeoutAdvice,
+				branchName, r.database, branchName, r.org,
+			))}
 		}
 		if err := r.sleepPoll(ctx); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// progressSuffix renders the deployment's progress into the non-terminal
+// exit message, so the operator reads how far the build actually got
+// rather than inferring it from the state name alone.
+func progressSuffix(dr *api.DeployRequest) string {
+	prog := dr.Progress()
+	var parts []string
+	if prog.PercentKnown {
+		parts = append(parts, fmt.Sprintf("%d%% complete", prog.Percent))
+	}
+	if prog.ETAKnown {
+		parts = append(parts, "PlanetScale ETA ~"+prog.ETA.Round(time.Second).String())
+	}
+	if !prog.ThrottledAt.IsZero() {
+		parts = append(parts, "throttled at least once (last stamp "+prog.ThrottledAt.UTC().Format(time.RFC3339)+")")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(parts, ", ")
 }
 
 // The deploy call itself races PlanetScale's own safety validation:
@@ -669,14 +753,43 @@ func isDeployValidating422(err error) bool {
 		strings.Contains(se.Message, "currently validating")
 }
 
-// drFailure wraps a deploy-request failure/timeout in the coded
-// runtime error, always carrying the DR state and URL.
+// drFailure wraps a deploy-request FAILURE in the coded runtime error,
+// always carrying the DR state and URL. Reserved for "something is
+// wrong": a terminal failure state, a closed request, an empty diff, a
+// blast-radius stranger. A wait sluice gave up on is [drIncomplete].
 func (r *legRunner) drFailure(dr *api.DeployRequest, msg string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodePSDeployRequestFailed,
 		"inspect the deploy request in PlanetScale: "+dr.HTMLURL,
 		fmt.Errorf("%s: %s: %s", r.errPrefix, msg, dr.HTMLURL),
 	)
+}
+
+// drIncomplete is drFailure's NON-failure sibling: the deploy request
+// never reached a terminal state, but nothing about it failed — sluice
+// stopped waiting (a bound was hit), or the request is parked on a human
+// gate. Calling that FAILED overstated it badly on the field run this
+// exists for: a perfectly healthy deploy 29 % of the way through a
+// 3 h 25 m index build exited `SLUICE-E-PS-DEPLOY-REQUEST-FAILED`, which
+// reads as "your index build broke" rather than "come back later".
+func (r *legRunner) drIncomplete(dr *api.DeployRequest, msg string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodePSDeployRequestIncomplete,
+		"nothing failed — watch the deploy request finish in PlanetScale ("+dr.HTMLURL+"), leave its dev branch alone until it does, then continue",
+		fmt.Errorf("%s: %s: %s", r.errPrefix, msg, dr.HTMLURL),
+	)
+}
+
+// keepBranchOnRequest exempts the dev branch from cleanup when err is a
+// [keepBranchError] — the paths where PlanetScale still needs the branch
+// (a still-open deploy request awaiting approval, an in-flight deployment
+// that depends on it). Every other failure path still cleans up.
+func (r *legRunner) keepBranchOnRequest(err error, branchName string, cleanup *branchCleanup) error {
+	var keep *keepBranchError
+	if errors.As(err, &keep) {
+		cleanup.remove(branchName)
+	}
+	return err
 }
 
 func (r *legRunner) sleepPoll(ctx context.Context) error {

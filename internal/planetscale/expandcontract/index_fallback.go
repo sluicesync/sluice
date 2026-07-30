@@ -60,9 +60,26 @@ type IndexFallback struct {
 	Database string
 	Branch   string
 
-	// PollInterval / DeployTimeout shape the deploy-request polling.
-	// Zero values default to 10s / 1h.
-	PollInterval  time.Duration
+	// PollInterval shapes the deploy-request polling cadence; zero
+	// defaults to 10s.
+	PollInterval time.Duration
+
+	// DeployTimeout bounds the wait for the deploy to reach a terminal
+	// state. ZERO — the Go zero value, and the CLI default — means
+	// UNBOUNDED: poll until PlanetScale says the deployment is done,
+	// however long that takes.
+	//
+	// Unbounded is the default deliberately, and the zero value is the
+	// safe one (the v0.99.51 zero-value-default trap: every non-CLI
+	// construction gets zero, so zero has to mean the common intent).
+	// A large table's index build IS hours of VReplication — measured on
+	// a real PS-160, a 106 GB / 153 M-row `ADD KEY ×4` was ~29 % done
+	// when the previous 1 h default gave up, projecting ~3 h 25 m — so a
+	// wall-clock bound made the non-terminal exit the DEFAULT outcome at
+	// the scale this fallback exists for. Terminal FAILURE states are
+	// still matched by name and fail fast, so unbounded never means
+	// "wait out a dead deploy"; the deployable/approval wait keeps its
+	// own 1 h cap, because waiting forever on a human is a hang.
 	DeployTimeout time.Duration
 
 	// ExecDDL overrides the branch-DDL executor (tests). nil = real.
@@ -108,12 +125,13 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 		database:      f.Database,
 		branch:        f.branch(),
 		pollInterval:  f.pollInterval(),
-		deployTimeout: f.deployTimeout(),
+		deployTimeout: f.DeployTimeout, // zero = unbounded, on purpose (see the field doc)
 		out:           out,
 		execDDL:       exec,
 		name:          "index-fallback",
 		errPrefix:     "index-fallback",
 		passwordName:  "sluice-index-fallback",
+		timeoutFlag:   "--planetscale-deploy-timeout",
 
 		// migrate's recovery is always --resume: the index phase
 		// re-probes the target and rebuilds only what is still missing,
@@ -194,13 +212,6 @@ func (f *IndexFallback) pollInterval() time.Duration {
 		return 10 * time.Second
 	}
 	return f.PollInterval
-}
-
-func (f *IndexFallback) deployTimeout() time.Duration {
-	if f.DeployTimeout <= 0 {
-		return time.Hour
-	}
-	return f.DeployTimeout
 }
 
 func (f *IndexFallback) execDDLFunc() func(ctx context.Context, pw *api.BranchPassword, database, ddl string) error {

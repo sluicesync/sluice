@@ -49,6 +49,7 @@ func newGateLegRunner(t *testing.T, ps *fakePS) (*legRunner, *branchCleanup, *by
 		name:         "gate-test",
 		errPrefix:    "gate-test",
 		passwordName: "gate-test",
+		timeoutFlag:  "--deploy-timeout",
 
 		leftoverAdvice:        "continue",
 		alreadyDeployedAdvice: "close the DR",

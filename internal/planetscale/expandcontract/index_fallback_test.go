@@ -195,6 +195,66 @@ func TestIndexFallback_StaleBranchRebasedViaBackup(t *testing.T) {
 	}
 }
 
+// TestIndexFallback_ZeroDeployTimeoutWaitsForTheBuild pins the
+// zero-value-safe default (the v0.99.51 trap read the right way round):
+// the CLI default AND every programmatic construction leave DeployTimeout
+// at zero, and zero must mean "wait for the index build", because a large
+// table's build is genuinely hours. Field-measured: at the previous 1 h
+// default a 106 GB / 153 M-row build was ~29 % done, so the bounded exit
+// was the DEFAULT outcome at the scale this fallback exists for.
+func TestIndexFallback_ZeroDeployTimeoutWaitsForTheBuild(t *testing.T) {
+	ps := newFakePS(t)
+	ps.postStates = []string{
+		"queued", "submitting", "in_progress", "in_progress",
+		"in_progress_cutover", "complete_pending_revert",
+	}
+	f, _ := newTestIndexFallback(t, ps)
+	f.DeployTimeout = 0 // the default
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := f.BuildIndexDDL(ctx, "orders", indexFallbackDDLs, err3024Stub()); err != nil {
+		t.Fatalf("BuildIndexDDL = %v; want nil (a zero deploy timeout waits for the build)", err)
+	}
+}
+
+// TestIndexFallback_BoundedTimeoutIsIncompleteNotFailed pins the reframed
+// exit as migrate's operator sees it: the non-failure code, the
+// `--planetscale-deploy-timeout` flag name (NOT expand-contract's
+// `--deploy-timeout`), the --resume recovery, and the dev branch left
+// completely untouched.
+func TestIndexFallback_BoundedTimeoutIsIncompleteNotFailed(t *testing.T) {
+	ps := newFakePS(t)
+	ps.postStates = []string{"in_progress"} // never terminal
+	ps.opPercents = []int{29}
+	f, _ := newTestIndexFallback(t, ps)
+	f.DeployTimeout = 50 * time.Millisecond
+
+	err := f.BuildIndexDDL(context.Background(), "orders", indexFallbackDDLs, err3024Stub())
+	wantCode(t, err, sluicecode.CodePSDeployRequestIncomplete)
+	if errors.Is(err, ir.ErrIndexBuildFallbackUnavailable) {
+		t.Errorf("a still-running deploy is not fallback unavailability: %v", err)
+	}
+	for _, want := range []string{
+		"still deploying",
+		"nothing failed",
+		"29% complete",
+		"--planetscale-deploy-timeout was set to 50ms",
+		"re-run with --resume",
+		"LEFT ALONE",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("incomplete error %q missing %q", err.Error(), want)
+		}
+	}
+	if ps.deleteAttempts != 0 {
+		t.Errorf("branch DELETE attempted %d time(s); the running index build depends on the dev branch — deleting it is exactly the advice this change removes", ps.deleteAttempts)
+	}
+	if want := indexFallbackBranchName("orders", indexFallbackDDLs); !ps.branchExists(want) {
+		t.Errorf("dev branch %q is gone; the in-flight deployment needed it", want)
+	}
+}
+
 // err3024Stub is the cause the engine would hand over — the tests only
 // assert it is threaded, not interpreted.
 func err3024Stub() error {

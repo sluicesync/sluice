@@ -306,17 +306,80 @@ type BranchPassword struct {
 // run timed out at --deploy-timeout). Both locations are read so a
 // response shape that does carry it top-level keeps working.
 type DeployRequest struct {
-	Number          int    `json:"number"`
-	Branch          string `json:"branch"`
-	IntoBranch      string `json:"into_branch"`
-	State           string `json:"state"`
-	DeploymentState string `json:"deployment_state"`
-	Deployable      bool   `json:"deployable"`
-	Deployment      struct {
-		State      string `json:"state"`
-		Deployable bool   `json:"deployable"`
-	} `json:"deployment"`
-	HTMLURL string `json:"html_url"`
+	Number          int        `json:"number"`
+	Branch          string     `json:"branch"`
+	IntoBranch      string     `json:"into_branch"`
+	State           string     `json:"state"`
+	DeploymentState string     `json:"deployment_state"`
+	Deployable      bool       `json:"deployable"`
+	Approved        bool       `json:"approved"`
+	Deployment      Deployment `json:"deployment"`
+	HTMLURL         string     `json:"html_url"`
+}
+
+// Deployment is the nested deployment object — the progress/health half
+// of the deploy-request response, live-captured 2026-07-30 mid-build on
+// a real PS-160 (a 106 GB / 153 M-row `ALTER … ADD KEY ×4`). Everything
+// beyond State/Deployable exists so a multi-HOUR VReplication index
+// build can be NARRATED instead of looking hung; the poller reads no
+// other progress source.
+type Deployment struct {
+	State      string `json:"state"`
+	Deployable bool   `json:"deployable"`
+
+	// AutoCutover false is a HUMAN gate: the deployment parks in
+	// `pending_cutover` waiting for a person to confirm the cutover.
+	// sluice's own deploy requests come back auto_cutover=true
+	// (live-verified 2026-07-30), but a database configured for gated
+	// deployments changes that — and an unbounded wait on a human gate
+	// is exactly the "looks hung" shape the poller must refuse instead
+	// of sitting in.
+	AutoCutover bool `json:"auto_cutover"`
+
+	// TableLocked / CutoverExpiring / QueuePaused are the
+	// operator-visible conditions under which a healthy-looking
+	// deployment stops advancing. QueuePauseReason is PlanetScale's
+	// human-readable explanation when it has one (JSON null decodes to
+	// "").
+	TableLocked      bool   `json:"table_locked"`
+	CutoverExpiring  bool   `json:"cutover_expiring"`
+	QueuePaused      bool   `json:"queue_paused"`
+	QueuePauseReason string `json:"queue_pause_reason"`
+
+	// DeployOperations is the per-table/per-shard operation list;
+	// DeployOperationSummaries is PlanetScale's aggregated view of the
+	// same set. BOTH carry progress — the live capture held identical
+	// values in each — so [DeployRequest.Progress] reads the operations
+	// and falls back to the summaries rather than going blind if
+	// PlanetScale ever populates only one.
+	DeployOperations         []DeployOperation `json:"deploy_operations"`
+	DeployOperationSummaries []DeployOperation `json:"deploy_operation_summaries"`
+}
+
+// DeployOperation is one deploy operation's progress row. The field set
+// is live-captured (2026-07-30); the real response carries considerably
+// more (syntax-highlighted DDL, foreign-key bookkeeping, per-shard
+// sub-operations) that sluice does not read.
+type DeployOperation struct {
+	State              string `json:"state"`
+	TableName          string `json:"table_name"`
+	OperationName      string `json:"operation_name"`
+	ProgressPercentage int    `json:"progress_percentage"`
+	ETASeconds         int64  `json:"eta_seconds"`
+
+	// ThrottledAt is documented as "when the deploy operation was LAST
+	// throttled" — and measurement says it is NOT a live throttle gauge.
+	// On the 2026-07-30 capture PlanetScale stamped it ONCE at 00:21:59
+	// (two seconds BEFORE the deployment's own started_at) and it had
+	// not moved 2 h 25 m later — on the very run whose PlanetScale UI
+	// read "This deployment is being throttled due to replication lag
+	// on your database" the whole time. So a non-nil value means
+	// throttling was involved at some point; it does NOT mean
+	// "throttled right now", and sluice's narration must not claim
+	// otherwise. The honest live signal for a throttled build is the
+	// ETA failing to converge (measured: 4435 s → 4299 s of ETA burned
+	// over 353 s of wall clock).
+	ThrottledAt *time.Time `json:"throttled_at"`
 }
 
 // CanDeploy reports whether PlanetScale will accept a deploy call for
@@ -325,6 +388,55 @@ type DeployRequest struct {
 // endpoint; tolerated top-level for other shapes).
 func (dr *DeployRequest) CanDeploy() bool {
 	return dr.Deployable || dr.Deployment.Deployable
+}
+
+// DeployProgress is the narratable summary of a deployment's operation
+// rows — what a poller logs so an operator watching only sluice's output
+// can tell a healthy-but-slow build from a stuck one.
+type DeployProgress struct {
+	// Percent is the LOWEST progress_percentage across the operation
+	// rows (a deployment is only as done as its slowest leg);
+	// PercentKnown is false when no row reported one.
+	Percent      int
+	PercentKnown bool
+
+	// ETA is the LONGEST eta_seconds across the rows.
+	ETA      time.Duration
+	ETAKnown bool
+
+	// ThrottledAt is the most recent throttle stamp across the rows,
+	// zero when none carried one. See [DeployOperation.ThrottledAt] —
+	// presence is historical, not live.
+	ThrottledAt time.Time
+
+	// Operations is how many rows the summary read, so a caller can
+	// tell "no progress reported" from "no operations yet" (a queued
+	// deployment has none).
+	Operations int
+}
+
+// Progress summarizes the deployment's operation rows.
+func (dr *DeployRequest) Progress() DeployProgress {
+	ops := dr.Deployment.DeployOperations
+	if len(ops) == 0 {
+		ops = dr.Deployment.DeployOperationSummaries
+	}
+	p := DeployProgress{Operations: len(ops)}
+	for i := range ops {
+		op := &ops[i]
+		if !p.PercentKnown || op.ProgressPercentage < p.Percent {
+			p.Percent = op.ProgressPercentage
+			p.PercentKnown = true
+		}
+		if eta := time.Duration(op.ETASeconds) * time.Second; eta > p.ETA {
+			p.ETA = eta
+			p.ETAKnown = true
+		}
+		if op.ThrottledAt != nil && op.ThrottledAt.After(p.ThrottledAt) {
+			p.ThrottledAt = *op.ThrottledAt
+		}
+	}
+	return p
 }
 
 // branchesPath builds the escaped org/database branch collection path.

@@ -349,6 +349,7 @@ func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl s
 		name:          kind,
 		errPrefix:     "expand-contract " + kind,
 		passwordName:  "sluice-expand-contract",
+		timeoutFlag:   "--deploy-timeout",
 
 		leftoverAdvice:        continueAdvice(kind),
 		alreadyDeployedAdvice: "close the DR, delete the dev branch, and " + continueAdvice(kind),
