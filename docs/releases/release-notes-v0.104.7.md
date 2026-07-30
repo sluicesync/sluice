@@ -28,7 +28,9 @@ Drop-in. No backup format version change, no new fingerprint epoch, no flag remo
 
 ### Who needs this
 
-**Anyone migrating a large dataset into PlanetScale.** The reparent fix is load-bearing at scale and gets more so the bigger the load — a fresh database growing from zero reparents repeatedly, and each one used to be fatal. Measured across three runs of the same 122 GB load: the unfixed binary aborted at 8.4M rows, an intermediate fix at 7.1M, and the shipped version rode 392 transients and carried the copy to completion.
+**Anyone migrating a large dataset into PlanetScale.** The reparent fix is load-bearing at scale and gets more so the bigger the load — a fresh database growing from zero reparents repeatedly, and each one used to be fatal. On the shipped version, one attempt of a 122 GB load **rode 392 target transients, 381 of which were the un-framed `not serving` shape this release fixes**, and carried the bulk copy of all three tables to completion (`customers` 2,000,000 and `orders` 20,000,000, exact against source). The unfixed binary aborted that same load with 8,443,235 rows landed.
+
+> **⚠ CORRECTION (2026-07-29, shortly after publication).** The first published version of this paragraph gave a three-point progression — "the unfixed binary aborted at 8.4M rows, an intermediate fix at 7.1M, and the shipped version rode 392 transients". The 392/381 counts and the 8,443,235 figure are exact and stand. **The "7.1M" figure did not:** it was read from InnoDB's `table_rows`, which is an estimate and not a row count, and the three points were not all measured on the same database, so presenting them as one progression overstated the precision. The direction is well-evidenced; that middle number was not, and it has been removed rather than restated.
 
 **Anyone taking scheduled incremental backups.** If two runs can ever overlap on one chain — a cron that occasionally runs long, a manual incremental beside a scheduled one — you could already have a forked chain that reports healthy and will refuse at recovery. Run `backup verify` against your chains after upgrading; this release's verify walks the lineage and will tell you.
 
