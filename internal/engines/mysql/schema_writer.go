@@ -89,6 +89,20 @@ type SchemaWriter struct {
 	// ([buildEachAsCopiedSerial]); see schema_writer_index_fallback.go.
 	indexBuildFallback ir.IndexBuildFallback
 
+	// copiedRowsFKConsistent records the migrate orchestrator's declaration
+	// (via [ir.ForeignKeyConsistencyDeclarer]) that the bulk-copied child rows
+	// are already consistent with the foreign keys about to be created — an
+	// UNFILTERED migrate from an FK-enforcing source, reconciled to that source
+	// before the constraints phase (ADR-0141). It ARMS the roadmap-item-109 FK
+	// statement-wall recovery: on a VStream target (the only flavor with the
+	// errno-3024 wall) a large `ALTER … ADD FOREIGN KEY` that cannot finish
+	// under the wall is re-issued metadata-only under session
+	// foreign_key_checks=0. The zero value (false — every non-migrate path, and
+	// every `--where`-filtered run, gets it) keeps full target-side FK
+	// validation, so the loud net that catches orphaned children stays intact.
+	// See schema_writer_constraint_fk_wall.go.
+	copiedRowsFKConsistent bool
+
 	// rlsWarnOnce gates the cross-engine PG → MySQL RLS-drop WARN
 	// (ADR-0063 — task #52 sub-deliverable 3). A PG source carrying
 	// any RLS-enabled table or attached policy logs a single WARN
@@ -585,6 +599,12 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 	if err != nil {
 		return fmt.Errorf("mysql: CreateConstraints: probe existing foreign keys: %w", err)
 	}
+	// Roadmap item 109: on a VStream target whose copied rows are FK-consistent
+	// by construction, a large ADD FOREIGN KEY that would blow the errno-3024
+	// statement wall is added metadata-only instead. Inert (false) on vanilla
+	// MySQL and on every filtered/non-migrate path, so the loop below is
+	// byte-identical to before there. See schema_writer_constraint_fk_wall.go.
+	fkWallRecovery := w.fkWallRecoveryArmed()
 	for _, table := range tables {
 		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
 		sort.Slice(fks, func(i, j int) bool {
@@ -598,8 +618,8 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			if err != nil {
 				return err
 			}
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("mysql: add foreign key %q on %q: %w", fk.Name, table.Name, wrapDDLError(err))
+			if err := w.addForeignKeyWithWallRecovery(ctx, fkWallRecovery, table.Name, fk, stmt); err != nil {
+				return err
 			}
 		}
 	}

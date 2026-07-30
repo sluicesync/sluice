@@ -734,6 +734,12 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	applyIndexBuildMem(sw, m.IndexBuildMem)
 	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
 	migcore.ApplyIndexBuildFallback(sw, m.IndexBuildFallback)
+	// Roadmap item 109: on an UNFILTERED migrate the child rows are copied from
+	// a source that enforced these FKs (and reconciled to it before the
+	// constraints phase, ADR-0141), so a MySQL/Vitess target may add a
+	// wall-blocked FK metadata-only. A `--where` run can orphan children by
+	// filtering a parent, so it stays validated (false). No-op on PG/SQLite.
+	migcore.ArmForeignKeyConsistency(sw, len(m.RowFilters) == 0)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))

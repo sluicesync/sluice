@@ -84,6 +84,18 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "safe-migrations is enabled",
 		},
 		{
+			// Roadmap item 109: the errno-3024 wall one phase over. The remedy
+			// MUST diverge from the index wall's --resume (a constraints 3024 is
+			// deterministic — --resume re-hits it), so assert the FK-specific
+			// --skip-foreign-keys steer, not the index text.
+			name:  "constraints: PlanetScale errno-3024 FK wall points at --skip-foreign-keys (NOT --resume)",
+			phase: PhaseConstraints,
+			err: errors.New(
+				`pipeline: create constraints: mysql: add foreign key "events_customer_fk" on "events": Error 3024 (HY000): target: db.-.primary: vttablet: Query execution was interrupted, maximum statement execution time exceeded, elapsed time: 15m0.0006s`,
+			),
+			want: "--skip-foreign-keys",
+		},
+		{
 			name:  "cdc: permission denied for replication",
 			phase: PhaseCDC,
 			err:   errors.New(`pq: permission denied for replication`),

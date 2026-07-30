@@ -391,8 +391,20 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	}
 	defer migcore.CloseIf(sw)
 	migcore.ApplyTargetSchema(sw, m.TargetSchema)
+	// Roadmap item 109: same arming as the per-database migrate path — this
+	// cross-database deferred FK pass is still an unfiltered migrate's FK phase.
+	migcore.ArmForeignKeyConsistency(sw, len(m.RowFilters) == 0)
 
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	// Wrap in the ADR-0114 DDL-phase reparent retry so this deferred
+	// cross-database FK pass rides a PlanetScale storage-grow / reparent the
+	// same as the single-database path (migrate.go) — without it, item 109's
+	// sibling gap: one FK path stayed outside the retry envelope. (A terminal
+	// errno-3024 statement-wall is NOT retried here — it is classified
+	// terminal — but it still routes through WrapWithHint below and surfaces
+	// the coded SLUICE-E-CONSTRAINT-STATEMENT-TIME-LIMIT remedy.)
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)

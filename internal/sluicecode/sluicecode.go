@@ -60,6 +60,17 @@ const (
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// Roadmap item 109: the errno-3024 statement-time wall reaches the
+	// CONSTRAINTS phase, not just the index phase. A large post-copy
+	// `ALTER … ADD FOREIGN KEY` on a PlanetScale/Vitess target runs InnoDB's
+	// child-row validation synchronously and blows the ~900 s wall
+	// (field-captured 2026-07-30 at 153M rows). A DISTINCT code from the index
+	// wall because the remedy differs: --skip-foreign-keys completes the
+	// migration (backing indexes preserved), where the index wall's remedy is
+	// --resume / --upfront-indexes / the deploy-request fallback. The FK ADD
+	// has no deploy-request fallback wired yet (roadmap C).
+	CodeConstraintStatementTimeLimit Code = "SLUICE-E-CONSTRAINT-STATEMENT-TIME-LIMIT"
+
 	// Roadmap item 68e: binlog CDC (vanilla MySQL / MariaDB flavors)
 	// refuses at every CDC start when @@GLOBAL.binlog_format is not ROW.
 	// Ground truth (Phase A, 2026-07-23, real mysql:8.0 STATEMENT): the
@@ -299,6 +310,8 @@ var registry = map[Code]Info{
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
+
+	CodeConstraintStatementTimeLimit: {ClassRuntime, "foreign-key ADD hit PlanetScale's statement-time limit (errno 3024) — ADD FOREIGN KEY validates every child row, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall; --resume re-hits the identical deterministic wall, so the converging remedy is --skip-foreign-keys (completes the migration, keeps each FK's backing index)"},
 
 	CodeCDCBinlogFormatNotRow: {ClassRefusal, "binlog CDC refused at start: @@GLOBAL.binlog_format is STATEMENT or MIXED, under which DML arrives as SQL text sluice cannot replay — the stream would run green while silently applying nothing; SET GLOBAL binlog_format=ROW (or the provider console) and re-run"},
 
