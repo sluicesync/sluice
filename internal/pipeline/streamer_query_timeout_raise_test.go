@@ -128,3 +128,45 @@ func TestPhasePrepareQueryTimeoutRaise_UnarmedNonRecorderIsNoOp(t *testing.T) {
 		t.Fatalf("phasePrepareQueryTimeoutRaise (unarmed) must be a no-op; got %v", err)
 	}
 }
+
+// TestPhasePrepareQueryTimeoutRaise_MultiDatabaseArmedRefuses: the multi-DB
+// cold-start copies WITHOUT the raise, so arming the flag on a multi-database
+// sync must refuse LOUDLY (naming the flag) rather than silently skip the raise
+// — even when the target applier CAN record it (a PlanetScale target). The
+// refusal fires before any copy, on every multi-DB entry.
+func TestPhasePrepareQueryTimeoutRaise_MultiDatabaseArmedRefuses(t *testing.T) {
+	applier := newFakeApplierRaiseRecorder() // recorder present (PlanetScale-shaped target)
+	s := &Streamer{
+		RaiseQueryTimeout:      true,
+		QueryTimeoutController: &fakeController{mu: &sync.Mutex{}, order: new([]string)},
+		AllDatabases:           true, // engages multiDatabaseMode()
+	}
+	if !s.multiDatabaseMode() {
+		t.Fatal("test setup: AllDatabases must engage multiDatabaseMode()")
+	}
+	err := s.phasePrepareQueryTimeoutRaise(context.Background(), applier, "stream-1")
+	if err == nil || !strings.Contains(err.Error(), "planetscale-raise-query-timeout") {
+		t.Fatalf("err = %v; want a loud refusal naming the flag on a multi-database sync", err)
+	}
+	if !strings.Contains(err.Error(), "multi-database") {
+		t.Errorf("refusal %q should explain the multi-database incompatibility", err)
+	}
+}
+
+// TestPhasePrepareQueryTimeoutRaise_SingleDatabaseArmedNotRefused: the sibling
+// negative — the multi-DB refusal must NOT fire on a single-database armed sync
+// (multiDatabaseMode() false), which proceeds to the normal no-op auto-revert.
+func TestPhasePrepareQueryTimeoutRaise_SingleDatabaseArmedNotRefused(t *testing.T) {
+	applier := newFakeApplierRaiseRecorder()
+	s := &Streamer{
+		RaiseQueryTimeout:      true,
+		QueryTimeoutController: &fakeController{mu: &sync.Mutex{}, order: new([]string)},
+		// No database-scope flags set → multiDatabaseMode() is false.
+	}
+	if s.multiDatabaseMode() {
+		t.Fatal("test setup: a bare Streamer must NOT be in multi-database mode")
+	}
+	if err := s.phasePrepareQueryTimeoutRaise(context.Background(), applier, "stream-1"); err != nil {
+		t.Fatalf("single-database armed sync must not be refused; got %v", err)
+	}
+}

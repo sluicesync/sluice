@@ -526,6 +526,23 @@ func queryTimeoutRaiseRecorder(applier ir.ChangeApplier) ir.QueryTimeoutRaiseRec
 // The actual raise (and its post-copy revert) is scoped to the cold-start copy
 // in [Streamer.coldStart] — a warm resume that skips the copy never raises.
 func (s *Streamer) phasePrepareQueryTimeoutRaise(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	// Multi-database sync is NOT wired for the raise: the multi-DB cold-start
+	// ([Streamer.coldStartMultiDatabase]) fans out across databases and copies
+	// via runBulkCopyWithOpts WITHOUT calling maybeRaiseQueryTimeout. Rather than
+	// silently ignore an explicitly-set flag (the loud-failure tenet), refuse
+	// loudly HERE — this phase runs in runOnce on EVERY attempt (single/multi
+	// cold-start, warm-resume-multi, reactive-resnapshot) before any copy path is
+	// dispatched, so no multi-DB copy can slip past it. The raise's ROI is narrow
+	// (two rolling restarts around one large copy); full multi-DB wiring isn't
+	// worth it, so the refusal is the deliberate contract, not a stopgap.
+	if s.RaiseQueryTimeout && s.multiDatabaseMode() {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, errors.New(
+			"pipeline: --planetscale-raise-query-timeout is not supported on a multi-database sync — "+
+				"the query-timeout raise is keyspace-scoped and the multi-database cold-start fans out across "+
+				"multiple databases, so it cannot protect that copy; run per-database syncs (one --include-database "+
+				"each) with the flag, or omit the flag",
+		))
+	}
 	recorder := queryTimeoutRaiseRecorder(applier)
 	if s.RaiseQueryTimeout && recorder == nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, errors.New(
