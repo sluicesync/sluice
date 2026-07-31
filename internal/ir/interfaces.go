@@ -2217,6 +2217,62 @@ type IndexBuildFallbackSetter interface {
 	SetIndexBuildFallback(f IndexBuildFallback)
 }
 
+// QueryTimeoutController is the OPTIONAL control-plane object the CLI
+// injects to raise a PlanetScale keyspace's queryserver-config-query-timeout
+// to its 3600s maximum for the duration of a migration and revert it
+// afterwards (ADR-0182). The engine-neutral pipeline calls these two methods
+// and owns the crash-safe bookkeeping (recording the raise in migrate-state,
+// the size gate, the defer-style revert); the control-plane HOW — resolving
+// the keyspace, staging + submitting + polling the rolling-restart rollout,
+// reading previous_options — lives behind this interface so neither the
+// pipeline nor the mysql engine imports the PlanetScale API. nil (every
+// non-CLI construction, and any run whose credentials don't resolve) disables
+// the feature entirely.
+type QueryTimeoutController interface {
+	// Raise resolves the target keyspace (refusing loudly on a
+	// multi-keyspace database or a config change already in progress), reads
+	// the CURRENT query timeout, and hands it to record BEFORE staging any
+	// change — so a crash mid-rollout leaves a persisted previous value the
+	// next run reverts. Only if record returns nil does it stage + submit +
+	// poll the raise to the maximum, blocking until the rolling tablet
+	// restart completes. When the keyspace is already at the maximum it logs
+	// and returns without recording (no restart, nothing to revert).
+	Raise(ctx context.Context, record func(previous string) error) error
+
+	// Revert stages + submits + polls a config-change restoring the
+	// keyspace's query timeout to previous (an empty previous ⇒ the
+	// documented default, 900), blocking until the rolling restart
+	// completes. Drives both the post-migration revert and the
+	// crash-recovery auto-revert; a no-op (logged) when the keyspace already
+	// holds previous.
+	Revert(ctx context.Context, previous string) error
+}
+
+// QueryTimeoutRaiseRecorder is the OPTIONAL [MigrationStateStore] surface
+// that persists the crash-recovery record for the ADR-0182 query-timeout
+// raise: "we raised the keyspace timeout; the value to restore is <previous>".
+// Only the MySQL store implements it (the raise only ever targets a
+// PlanetScale/Vitess keyspace); the pipeline type-asserts it and refuses
+// loudly rather than raise a timeout it could never auto-revert. The record
+// rides a dedicated column on the same sluice_migrate_state header row keyed
+// by migration_id, written through its OWN statements (never the generic
+// header upsert), so ordinary phase transitions cannot clobber it.
+type QueryTimeoutRaiseRecorder interface {
+	// ReadQueryTimeoutRaise returns the recorded raise for migrationID, or
+	// ok=false when none is recorded (the common fresh-run case). previous
+	// is the value Revert restores.
+	ReadQueryTimeoutRaise(ctx context.Context, migrationID string) (previous string, ok bool, err error)
+
+	// RecordQueryTimeoutRaise persists the raise for migrationID BEFORE it
+	// takes effect. Requires the header row to already exist (the pipeline's
+	// loadOrInitState guarantees it).
+	RecordQueryTimeoutRaise(ctx context.Context, migrationID, previous string) error
+
+	// ClearQueryTimeoutRaise removes the record after a successful revert.
+	// Idempotent.
+	ClearQueryTimeoutRaise(ctx context.Context, migrationID string) error
+}
+
 // ForeignKeyConsistencyDeclarer is the OPTIONAL setter the migrate
 // orchestrator uses to tell a target [SchemaWriter] that the rows the
 // bulk-copy phase loaded are ALREADY consistent with the foreign keys the

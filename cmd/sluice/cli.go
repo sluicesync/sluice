@@ -304,6 +304,9 @@ type MigrateCmd struct {
 	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
 	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request wait for the ADR-0148 index-build fallback. DEFAULT 0 = wait indefinitely for the deploy to finish, which is what a large table needs (its index builds via VReplication — async, unbounded by errno 3024, and genuinely hours on a ~100 GB table; progress, ETA and throttling are logged as it runs). Terminal failure states still fail fast. Set a duration to stop waiting after it — nothing fails, the deploy keeps running in PlanetScale and --resume picks up: the index phase re-probes and rebuilds only what is still missing." default:"0" placeholder:"DUR"`
 
+	// ADR-0182 (roadmap item 110): OPT-IN raise of the keyspace statement wall.
+	PlanetScaleRaiseQueryTimeout bool `name:"planetscale-raise-query-timeout" help:"OPT-IN (PlanetScale target only): raise the keyspace's queryserver-config-query-timeout to its 3600s maximum for the duration of the migration, then revert it to the value it had. This is a KEYSPACE-WIDE config change whose rollout is a ROLLING TABLET RESTART (~2–6m each way, and again on revert) that affects anyone else on the keyspace. Requires --planetscale-org plus the service token (PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN); refused loudly if set on a non-planetscale target or without them. Skipped with an INFO line on a small migration (no table large enough to approach the wall). Crash-safe: the raise is recorded in sluice_migrate_state and a --resume or bare re-run reverts a dangling raise before anything else. Composes with --upfront-indexes and the deploy-request fallback; it gives headroom on fast-enough tiers, not a guarantee (a large index build on network-attached storage can exceed even 3600s). Off by default (a no-op on non-planetscale targets). See ADR-0182."`
+
 	AnalyzeAfter bool `help:"Refresh the target's planner statistics after the migration completes: one per-table ANALYZE (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) once constraints and views are in place. A freshly bulk-loaded table has stale statistics, so the first post-cutover queries plan badly until autovacuum or a background ANALYZE catches up — this closes that window at cutover time (pgcopydb runs a per-table VACUUM ANALYZE by default for the same reason). Advisory: a per-table failure WARNs and never fails the migration. Default off."`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
@@ -546,6 +549,15 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	// credentials resolve; nil (unarmed) leaves the index phase
 	// byte-identical to before. See migrate_index_fallback.go.
 	mig.IndexBuildFallback = m.planetScaleIndexFallback()
+	// ADR-0182 (item 110): compose the opt-in query-timeout raise controller
+	// (also available for the crash-recovery auto-revert). A flag set without
+	// a planetscale target / credentials is a loud refusal.
+	queryTimeoutController, err := m.planetScaleQueryTimeoutController()
+	if err != nil {
+		return err
+	}
+	mig.RaiseQueryTimeout = m.PlanetScaleRaiseQueryTimeout
+	mig.QueryTimeoutController = queryTimeoutController
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
 		keysetSource = cfg.KeysetSource
