@@ -150,6 +150,9 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	if err := s.ensureStateFormatColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensurePSQueryTimeoutRaiseColumn(ctx); err != nil {
+		return err
+	}
 	progExists, err := s.controlTableExists(ctx, migrateProgressTableName)
 	if err != nil {
 		return err
@@ -179,6 +182,7 @@ func migrateStateHeaderDDL() string {
 	updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 		ON UPDATE CURRENT_TIMESTAMP,
 	last_error      TEXT         NULL,
+	ps_query_timeout_raise TEXT  NULL,
 	PRIMARY KEY (migration_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }

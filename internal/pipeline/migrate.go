@@ -548,6 +548,25 @@ type Migrator struct {
 	// existed.
 	IndexBuildFallback ir.IndexBuildFallback
 
+	// RaiseQueryTimeout arms the opt-in ADR-0182 raise of the PlanetScale
+	// keyspace's queryserver-config-query-timeout to its 3600s maximum for
+	// the duration of the migration (CLI: --planetscale-raise-query-timeout).
+	// It only fires when QueryTimeoutController is also set (a planetscale
+	// target with resolvable control-plane credentials) and the migration is
+	// large enough to plausibly hit the wall (the size gate). Zero value
+	// (false) leaves the run byte-identical to before ADR-0182.
+	RaiseQueryTimeout bool
+
+	// QueryTimeoutController is the optional control-plane object that raises
+	// and reverts the PlanetScale keyspace query timeout (ADR-0182),
+	// composed by the CLI (which knows the target is PlanetScale and holds
+	// the credentials) and passed through opaquely so the orchestrator stays
+	// engine-neutral. It is consulted for the armed RAISE and, independently
+	// of RaiseQueryTimeout, for the crash-recovery auto-revert of a raise a
+	// prior run left dangling. nil (every programmatic / broker / test
+	// caller, and any run whose credentials don't resolve) disables both.
+	QueryTimeoutController ir.QueryTimeoutController
+
 	// Progress is the optional TTY-aware presentation sink (ADR-0155).
 	// When nil (the zero value — every test, library embedder, broker /
 	// fleet path, and the sync cold-start), the orchestrator falls back
@@ -724,6 +743,16 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 	resuming := m.Resume && rc.enabled
 
+	// ADR-0182: before anything touches the target, revert a PlanetScale
+	// query-timeout raise a prior crashed run left dangling in migrate-state.
+	// Runs before the reset path (phaseGateColdStart) clears the state row,
+	// so a --reset-target-data re-run still restores the keyspace first. A
+	// no-op on every non-planetscale target and every run with no dangling
+	// raise recorded.
+	if err := m.autoRevertDanglingQueryTimeoutRaise(ctx, rc); err != nil {
+		return err
+	}
+
 	// ---- 2. Open target writers ----
 	sw, err := m.Target.OpenSchemaWriter(ctx, m.TargetDSN)
 	if err != nil {
@@ -858,6 +887,19 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// the presentation layer only — no bearing on correctness or the
 	// LogSink line.
 	ctx, rowTotal := withRunRowTotal(ctx)
+
+	// ADR-0182: raise the PlanetScale keyspace query timeout (and wait out its
+	// rolling restart) BEFORE the copy phase — the restart must not hit an
+	// in-flight copy. The returned revert runs on every exit path (deferred
+	// immediately so an abort still restores the keyspace); nil when unarmed,
+	// size-gated out, or a non-planetscale target.
+	revertQueryTimeout, err := m.maybeRaiseQueryTimeout(ctx, rc, schema, rr)
+	if err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
+	if revertQueryTimeout != nil {
+		defer revertQueryTimeout()
+	}
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, createSchema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
 		// ADR-0173 Phase 1: a --where filter on a parent table orphans its
