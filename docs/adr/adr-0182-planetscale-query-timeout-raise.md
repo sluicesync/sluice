@@ -1,6 +1,6 @@
 # ADR-0182: Opt-in raise of PlanetScale's keyspace query-timeout for a migration
 
-- **Status:** Accepted — **IMPLEMENTED (2026-07-31, roadmap item 110)**; main-session review + land pending (not yet released). Opt-in, tightly gated, off by default.
+- **Status:** Accepted — **SHIPPED v0.106.0 (2026-07-31, roadmap item 110)**. Opt-in, tightly gated, off by default. `migrate`-only at ship; sync-side parity is roadmap item 111.
 - **Date:** 2026-07-31
 - **Related:** roadmap item 110; ADR-0148 (the deploy-request index-build fallback whose `internal/planetscale/api` client, credential plumbing, and CLI-composer posture this reuses); ADR-0162 (the shared no-SDK control-plane client); roadmap item 109 / `SLUICE-E-CONSTRAINT-STATEMENT-TIME-LIMIT` (the constraints-phase half of the same errno-3024 wall); `--upfront-indexes` (the pre-copy alternative this composes with); ADR-0082 (`sluice_migrate_state`, the crash-safe store this records the raise in).
 
