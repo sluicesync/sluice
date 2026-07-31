@@ -931,6 +931,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 			CreateSchema:         createSchema,
 			Redactor:             s.Redactor,
 			Shard:                s.InjectShardColumn,
+			UpfrontIndexes:       s.UpfrontIndexes,
 			CopyFanoutDegree:     s.CopyFanoutDegree,
 			NoIntraTableStealing: s.NoIntraTableStealing,
 		}

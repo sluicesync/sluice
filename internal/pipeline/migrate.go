@@ -1183,6 +1183,14 @@ type bulkCopyOpts struct {
 	// is the no-op default — single-source streams pay nothing.
 	Shard ShardColumnSpec
 
+	// UpfrontIndexes, when true, builds every secondary index BEFORE the
+	// bulk copy (maintained during load) instead of the default deferred
+	// post-copy build — the sync cold-start mirror of Migrator.UpfrontIndexes
+	// (item 111 phase 2). Zero value (false) is byte-identical to the prior
+	// deferred behavior for every caller. Ignored when SkipSchemaApply is set
+	// (the target catalog, indexes included, is the operator's responsibility).
+	UpfrontIndexes bool
+
 	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for
 	// the idempotent VStream/CDC snapshot cold-start copy (ADR-0097).
 	// Resolved through [resolveCopyFanoutDegree]: the Go zero value (0)
@@ -1229,6 +1237,23 @@ func runBulkCopyWithOpts(
 		}
 		if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+		}
+	}
+	// --upfront-indexes (Streamer.UpfrontIndexes, item 111 phase 2): build the
+	// secondary indexes NOW — before the bulk copy — instead of the default
+	// deferred post-copy phase below, so the bulk INSERTs maintain them as they
+	// load. This is the sync cold-start mirror of the Migrator's upfront-index
+	// reorder (runBulkCopyPhases); it relocates the SAME
+	// migcore.RunDDLPhaseWithReparentRetry("indexes", … CreateIndexes) block on
+	// the FULL schema (not the CreateSchema subset — a skipped, shape-matched
+	// table still gets its indexes verified/built). Skipped when SkipSchemaApply
+	// is set (the operator owns the catalog). When false this block is skipped
+	// and the phase order is byte-identical to before.
+	if opts.UpfrontIndexes && !opts.SkipSchemaApply {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+			return sw.CreateIndexes(ctx, schema)
+		}); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes (upfront): %w", err))
 		}
 	}
 	// Bug 125: the MySQL VStream snapshot reader re-emits COPY-phase
@@ -1362,10 +1387,16 @@ func runBulkCopyWithOpts(
 		}); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
-			return sw.CreateIndexes(ctx, schema)
-		}); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+		// Skip the post-copy index build when --upfront-indexes already built
+		// them before the copy (item 111 phase 2) — otherwise they build here,
+		// deferred, exactly as before. verifyBuiltIndexes below stays
+		// UNCONDITIONAL on every path.
+		if !opts.UpfrontIndexes {
+			if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+				return sw.CreateIndexes(ctx, schema)
+			}); err != nil {
+				return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+			}
 		}
 		// Loud-failure safety net (SLUICE-E-INDEX-MISSING): the serial cold-start
 		// path builds indexes via CreateIndexes directly (not the bug's overlap

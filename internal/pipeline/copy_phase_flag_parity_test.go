@@ -42,15 +42,15 @@ import (
 func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 	// parityFlags: copy-phase capabilities that MUST exist on both Migrator and
 	// Streamer (they share the copy phases), keyed by the struct field name each
-	// carries. The four un-exempt entries are the known-good "wired to both"
-	// anchors that prove the positive case; the exempt entries are the recorded
-	// asymmetries.
+	// carries. The un-exempt entries are the known-good "wired to both" anchors
+	// that prove the positive case (UpfrontIndexes joined them in item 111 phase
+	// 2); the exempt entries are the recorded asymmetries.
 	parityFlags := []string{
 		"IndexBuildFallback", // both: the deploy-request out-of-band index build
 		"Redactor",           // both: PII redaction policy applied per copied row
 		"InjectShardColumn",  // both: ADR-0048 shard-discriminator stamp
 		"BulkBatchSize",      // both: per-batch row count for the copy
-		"UpfrontIndexes",     // EXEMPT (migrate-only) — see parityExempt
+		"UpfrontIndexes",     // both: build secondary indexes before the copy (item 111 phase 2)
 		"RaiseQueryTimeout",  // EXEMPT (migrate-only) — see parityExempt
 		"AnalyzeAfter",       // EXEMPT (migrate-only) — see parityExempt
 	}
@@ -60,20 +60,6 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 	// wires it to both (or renames it away) this gate fails and forces the
 	// exemption to be removed — a stale exemption cannot rot silently.
 	parityExempt := map[string]string{
-		// Confirmed architectural fork (item 111 phase 2). The upfront-index
-		// REORDERING — build every secondary index BEFORE the copy instead of
-		// after — is orchestrated in runBulkCopyPhases (migrate.go) + the
-		// ADR-0077 budget-split skip in migrate_phases.go, NOT in the shared
-		// runBulkCopyWithOpts. The sync cold-start (streamer_coldstart.go) calls
-		// runBulkCopyWithOpts DIRECTLY, which has no upfront branch and always
-		// builds indexes post-copy. bulkCopyOpts carries no upfront field, so
-		// this is NOT pure field-threading: wiring it to sync means adding a
-		// mirrored upfront branch to runBulkCopyWithOpts, a bulkCopyOpts field,
-		// the Streamer field, and the --upfront-indexes sync CLI flag. Modest
-		// and additive, but a new sync-copy code path rather than wiring — a
-		// deliberate follow-up, not forced under the parity chunk.
-		"UpfrontIndexes": "upfront-index REORDERING is orchestrated in runBulkCopyPhases/migrate_phases.go, which the sync cold-start bypasses (it calls runBulkCopyWithOpts directly); bulkCopyOpts carries no upfront field, so wiring sync needs a mirrored upfront branch in runBulkCopyWithOpts, not pure field-threading — item 111 phase 2",
-
 		// Confirmed design fork. RaiseQueryTimeout wraps the copy via the
 		// *Migrator method maybeRaiseQueryTimeout, whose ADR-0182 crash-safe
 		// auto-revert records the dangling raise in sluice_migrate_state through

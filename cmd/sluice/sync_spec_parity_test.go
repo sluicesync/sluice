@@ -78,6 +78,7 @@ var syncStartFleetExclusions = map[string]string{
 	"apply-tune-target-latency":         "AIMD tuning override; not yet curated (fleet uses engine defaults)",
 	"index-build-mem":                   "cold-start index-phase tuning; not yet curated into the fleet subset",
 	"index-build-parallelism":           "see index-build-mem",
+	"upfront-indexes":                   "cold-start index-phase ordering knob (item 111 phase 2); not yet curated into the fleet subset",
 	"bulk-parallelism":                  "cold-start copy tuning (ADR-0079); not yet curated into the fleet subset",
 	"table-parallelism":                 "see bulk-parallelism",
 	"bulk-parallel-min-rows":            "see bulk-parallelism",

@@ -660,6 +660,16 @@ type Streamer struct {
 	// fallback existed.
 	IndexBuildFallback ir.IndexBuildFallback
 
+	// UpfrontIndexes mirrors [Migrator.UpfrontIndexes] (item 111 phase 2): when
+	// true, the cold-start builds every secondary index BEFORE the bulk copy
+	// (maintained during load) instead of the default deferred post-copy build.
+	// Threaded into the cold-start copy via [bulkCopyOpts.UpfrontIndexes] on both
+	// the single- and multi-database cold-start paths. Zero value (false) keeps
+	// the deferred post-copy build, byte-identical to before for every
+	// programmatic / fleet / broker / test caller. Inert when
+	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
+	UpfrontIndexes bool
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a

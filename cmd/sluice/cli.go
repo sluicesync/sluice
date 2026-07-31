@@ -1199,6 +1199,8 @@ type SyncStartCmd struct {
 
 	SkipForeignKeys bool `help:"Skip creating foreign-key constraints on the target at cold-start, and instead ensure each skipped FK's referencing column tuple is indexed (an index is synthesized only if an existing target index doesn't already cover those columns as a left-prefix). Only the cold-start schema-apply creates FKs — steady-state CDC apply never does — so this affects the initial cold-start only. Primary use case: a continuous-sync transition onto a target with limited FK support (Vitess/PlanetScale sharded keyspaces) or when FKs are managed out-of-band. On a MySQL target this also preserves the backing index MySQL would otherwise create only alongside the FK."`
 
+	UpfrontIndexes bool `help:"Create secondary indexes before the cold-start bulk copy (maintained during load) instead of the default deferred post-copy build. Useful for large PlanetScale-MySQL targets where a deferred ADD INDEX can exceed the statement-time limit; trades slower load for no post-copy index build."`
+
 	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a CROSS-engine migration they are skipped by default (the source's migration history is invalid on a different target engine); this flag forces keeping them. Mutually exclusive with --skip-orm-tables."`
 	SkipORMTables    bool `help:"Skip ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a SAME-engine migration they are kept by default (the migration history is valid); this flag forces skipping them. Mutually exclusive with --include-orm-tables."`
 
@@ -2119,6 +2121,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		ViewFilter:           viewFilter,
 		SkipViews:            s.SkipViews,
 		SkipForeignKeys:      s.SkipForeignKeys,
+		UpfrontIndexes:       s.UpfrontIndexes,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine sync; a same-engine sync KEEPS them by default (the history
 		// is valid). --include-orm-tables / --skip-orm-tables override. (The

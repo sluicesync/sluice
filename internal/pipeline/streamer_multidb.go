@@ -696,7 +696,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	migcore.ApplyGrowGate(rw, gate)
 	s.startStorageHeadroomWatch(ctx, streamID, gate)
 
-	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, NoIntraTableStealing: s.NoIntraTableStealing}
+	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, UpfrontIndexes: s.UpfrontIndexes, NoIntraTableStealing: s.NoIntraTableStealing}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)
