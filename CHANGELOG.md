@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-07-31
+
+### Added
+
+**Opt-in: `migrate --planetscale-raise-query-timeout` raises the target keyspace's query timeout to its 3600-second maximum for the migration, then reverts it.** PlanetScale's ~900-second per-query statement wall (errno 3024) is the root of the whole index-build / FK-validation family of failures, and it is a *configurable* keyspace setting. With this flag sluice raises `queryserver-config-query-timeout` to 3600 before the copy begins, runs the whole migration under the raised limit, and reverts it to the value it found when the run finishes — giving the direct paths headroom on tiers where an operation fits 3600s but not 900s. It is off by default and tightly gated: it fires only on a PlanetScale/Vitess target with `--planetscale-org` and the service token present (the same credentials the ADR-0148 deploy-request fallback uses), and refuses loudly rather than silently no-op if the flag is set without them. It skips the raise for a migration whose largest table is under a million rows, since the change is not worth its cost on a run that would never hit the wall. **That cost is real and worth understanding: the change is keyspace-wide and its rollout is a rolling tablet restart** — measured at several minutes each way, so the raise-plus-revert overhead can be 10–20 minutes depending on tier, which is exactly why it is opt-in and size-gated. The raise happens once up front and is reverted once at the very end (or on abort), never per table. The previous value is recorded — an operator who had customized it gets that value back, not a hardcoded 900 — and the record is persisted to `sluice_migrate_state` *before* the change takes effect, so a crash mid-run is recoverable: a `--resume` or even a bare re-run detects and reverts a dangling raise before touching anything. It composes with `--upfront-indexes`, the deploy-request fallback, and the metadata-only foreign-key path rather than replacing them. Reverse-engineered from PlanetScale's config-changes API (the documented `update_keyspace` PATCH does not set these options); the value is tier-dependent — it helps the deferred index path on fast local-NVMe targets, and does not help network-attached storage where a large index build exceeds even 3600 seconds. See [ADR-0182](docs/adr/adr-0182-planetscale-query-timeout-raise.md). (Roadmap item 110.)
+
 ## [0.105.0] - 2026-07-30
 
 ### Added
