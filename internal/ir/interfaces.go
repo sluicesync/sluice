@@ -2248,24 +2248,35 @@ type QueryTimeoutController interface {
 	Revert(ctx context.Context, previous string) error
 }
 
-// QueryTimeoutRaiseRecorder is the OPTIONAL [MigrationStateStore] surface
-// that persists the crash-recovery record for the ADR-0182 query-timeout
-// raise: "we raised the keyspace timeout; the value to restore is <previous>".
-// Only the MySQL store implements it (the raise only ever targets a
-// PlanetScale/Vitess keyspace); the pipeline type-asserts it and refuses
-// loudly rather than raise a timeout it could never auto-revert. The record
-// rides a dedicated column on the same sluice_migrate_state header row keyed
-// by migration_id, written through its OWN statements (never the generic
-// header upsert), so ordinary phase transitions cannot clobber it.
+// QueryTimeoutRaiseRecorder is the OPTIONAL surface that persists the
+// crash-recovery record for the ADR-0182 query-timeout raise: "we raised the
+// keyspace timeout; the value to restore is <previous>". Only the MySQL engine
+// implements it (the raise only ever targets a PlanetScale/Vitess keyspace);
+// the pipeline type-asserts it and refuses loudly rather than raise a timeout
+// it could never auto-revert. Two implementations exist, one per copy-phase
+// entry point:
+//
+//   - migrate keys the record by migration_id, on a dedicated column of the
+//     sluice_migrate_state header row, written through its OWN statements
+//     (never the generic header upsert) so ordinary phase transitions cannot
+//     clobber a live raise record (MigrationStateStore);
+//   - the sync cold-start keys it by stream_id, in the dedicated
+//     sluice_cdc_query_timeout_raise table owned by the MySQL ChangeApplier —
+//     a separate table because the raise happens BEFORE the cold-start copy,
+//     when the sluice_cdc_state position row does not yet exist (item 111
+//     phase 3).
+//
+// The migrationID parameter is therefore an OPAQUE record key: the migration_id
+// for the migrate store, the stream_id for the CDC-state applier.
 type QueryTimeoutRaiseRecorder interface {
-	// ReadQueryTimeoutRaise returns the recorded raise for migrationID, or
+	// ReadQueryTimeoutRaise returns the recorded raise for the record key, or
 	// ok=false when none is recorded (the common fresh-run case). previous
-	// is the value Revert restores.
+	// is the value Revert restores. A missing table/row reads as ok=false,
+	// never an error.
 	ReadQueryTimeoutRaise(ctx context.Context, migrationID string) (previous string, ok bool, err error)
 
-	// RecordQueryTimeoutRaise persists the raise for migrationID BEFORE it
-	// takes effect. Requires the header row to already exist (the pipeline's
-	// loadOrInitState guarantees it).
+	// RecordQueryTimeoutRaise persists the raise for the record key BEFORE it
+	// takes effect.
 	RecordQueryTimeoutRaise(ctx context.Context, migrationID, previous string) error
 
 	// ClearQueryTimeoutRaise removes the record after a successful revert.

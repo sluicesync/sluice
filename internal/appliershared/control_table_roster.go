@@ -54,6 +54,12 @@ func ControlTableNames() []string {
 		"sluice_target_metrics_history",
 		"sluice_keysets",
 
+		// The MySQL sync-side ADR-0182 query-timeout raise crash-recovery
+		// table (mysql/change_applier_query_timeout.go —
+		// cdcQueryTimeoutRaiseTableName; item 111 phase 3). Literal to keep
+		// this package's dependency surface at ir only.
+		"sluice_cdc_query_timeout_raise",
+
 		// internal/pipeline's source-side heartbeat table
 		// (DefaultSourceHeartbeatTableName). The name is the DEFAULT —
 		// an operator-renamed table (--source-heartbeat-table-name) is

@@ -85,6 +85,22 @@ type resumeContext struct {
 	enabled     bool // store != nil (i.e. target engine supports MigrationStateStore)
 }
 
+// migrateRaiseRecorder resolves the ADR-0182 crash-safe recorder for the
+// query-timeout raise from the migrate resume context: the resumable
+// migrate-state store when it can record raises (the MySQL/Vitess target), else
+// nil. The shared query-timeout helpers ([autoRevertDanglingQueryTimeoutRaise],
+// [maybeRaiseQueryTimeout]) treat a nil recorder as "this target can't record a
+// raise crash-safely" — a no-op for the auto-revert, a loud refusal when the
+// raise is armed. Mirrors the pre-item-111 `!rc.enabled` / store-type-assert
+// gate the *Migrator methods carried inline.
+func migrateRaiseRecorder(rc resumeContext) ir.QueryTimeoutRaiseRecorder {
+	if !rc.enabled {
+		return nil
+	}
+	recorder, _ := rc.store.(ir.QueryTimeoutRaiseRecorder)
+	return recorder
+}
+
 // openMigrationStateStore type-asserts the target engine for the
 // optional [ir.MigrationStateStoreOpener]. Engines that don't
 // implement it (none today) cause the Migrator to fall back to the

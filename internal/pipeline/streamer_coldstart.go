@@ -202,6 +202,26 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// ADR-0182 (item 111 phase 3): raise the PlanetScale keyspace query timeout
+	// (and wait out its rolling restart) BEFORE the cold-start copy — the
+	// restart must not hit an in-flight copy, and the copy's large index/FK
+	// build is exactly what would otherwise blow the ~900s statement wall. Only
+	// the cold-start path reaches here (warm resume never calls coldStart), and
+	// the raise is armed + size-gated inside maybeRaiseQueryTimeout. The
+	// returned revert is deferred so it runs on EVERY exit path of coldStart —
+	// success (after the copy + CDC handoff) and abort — restoring the keyspace
+	// before steady-state CDC begins rather than leaving it raised for the
+	// stream's whole lifetime. nil revert (unarmed / size-gated / already-max)
+	// makes the defer a no-op. The record is keyed by streamID in the applier's
+	// dedicated sluice_cdc_query_timeout_raise table.
+	revertQueryTimeout, err := maybeRaiseQueryTimeout(ctx, s.RaiseQueryTimeout, s.QueryTimeoutController, queryTimeoutRaiseRecorder(applier), streamID, schema, stream.Rows)
+	if err != nil {
+		return nil, stop, err
+	}
+	if revertQueryTimeout != nil {
+		defer revertQueryTimeout()
+	}
+
 	// Bulk-copy: the ADR-0079 FAST parallel path when eligible, the
 	// serial path otherwise. Releases the writers and the snapshot
 	// transaction (Bug 21) on success.

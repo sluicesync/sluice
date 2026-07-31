@@ -79,6 +79,7 @@ var syncStartFleetExclusions = map[string]string{
 	"index-build-mem":                   "cold-start index-phase tuning; not yet curated into the fleet subset",
 	"index-build-parallelism":           "see index-build-mem",
 	"upfront-indexes":                   "cold-start index-phase ordering knob (item 111 phase 2); not yet curated into the fleet subset",
+	"planetscale-raise-query-timeout":   "cold-start-only PlanetScale keyspace query-timeout raise (ADR-0182 / item 111 phase 3); a per-invocation control-plane action, not fleet standing config — not yet curated into the fleet subset",
 	"bulk-parallelism":                  "cold-start copy tuning (ADR-0079); not yet curated into the fleet subset",
 	"table-parallelism":                 "see bulk-parallelism",
 	"bulk-parallel-min-rows":            "see bulk-parallelism",

@@ -499,6 +499,46 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 	return nil
 }
 
+// queryTimeoutRaiseRecorder resolves the ADR-0182 crash-safe recorder from the
+// applier: the MySQL ChangeApplier's sluice_cdc_query_timeout_raise table
+// ([ir.QueryTimeoutRaiseRecorder]), keyed by stream_id. nil for every other
+// target — the raise only ever targets a PlanetScale/Vitess MySQL keyspace.
+func queryTimeoutRaiseRecorder(applier ir.ChangeApplier) ir.QueryTimeoutRaiseRecorder {
+	recorder, _ := applier.(ir.QueryTimeoutRaiseRecorder)
+	return recorder
+}
+
+// phasePrepareQueryTimeoutRaise (---- 2.75 ----) runs the ADR-0182
+// crash-recovery auto-revert and the up-front arm check, once per attempt
+// (warm AND cold), BEFORE any change stream opens. Two responsibilities:
+//
+//   - LOUD refusal, mirroring migrate, when the raise is armed
+//     (--planetscale-raise-query-timeout) but the target applier can't record
+//     it crash-safely (a non-MySQL/Vitess target). Checked here — not only on
+//     the cold-start path — so a warm-resume attempt against a mis-targeted
+//     stream still refuses immediately rather than silently no-opping.
+//   - Auto-revert of a dangling raise a prior crashed cold-start left behind.
+//     It runs on EVERY attempt because a crash whose revert failed but whose CDC
+//     anchor persisted would warm-resume next — never re-entering coldStart, the
+//     only other place the revert lives. A dangling record with no controller
+//     is a loud refusal (the keyspace is modified and sluice must restore it).
+//
+// The actual raise (and its post-copy revert) is scoped to the cold-start copy
+// in [Streamer.coldStart] — a warm resume that skips the copy never raises.
+func (s *Streamer) phasePrepareQueryTimeoutRaise(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	recorder := queryTimeoutRaiseRecorder(applier)
+	if s.RaiseQueryTimeout && recorder == nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, errors.New(
+			"pipeline: --planetscale-raise-query-timeout requires a target that can record the raise crash-safely "+
+				"(a PlanetScale/Vitess MySQL target), which this target does not provide",
+		))
+	}
+	if err := autoRevertDanglingQueryTimeoutRaise(ctx, s.QueryTimeoutController, recorder, streamID); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, err)
+	}
+	return nil
+}
+
 // phaseLookupPosition resolves the stream's starting position
 // (---- 3 ----) and reports whether one was found (warm resume) or
 // not (cold start). The position-source priority and the cross-engine

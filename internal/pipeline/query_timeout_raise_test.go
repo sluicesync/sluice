@@ -121,20 +121,22 @@ func (w *copyOrderRowWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-ch
 	return w.writeErr
 }
 
-// ---- method-level unit tests ----
-
-func rcFor(store ir.MigrationStateStore) resumeContext {
-	return resumeContext{store: store, migrationID: "mig-1", enabled: true}
-}
+// ---- function-level unit tests ----
+//
+// item 111 phase 3 extracted the three helpers from *Migrator methods to
+// package-level functions taking (controller, recorder, recordKey) explicitly,
+// so these direct-call tests pass those explicitly (byte-identical assertions).
+// The "mig-1" record key stands in for the migration_id / stream_id the real
+// callers pass. The Run-level sequencing tests below exercise the migrate wiring
+// end-to-end and are untouched — they prove the extraction is behaviour-preserving.
 
 func TestAutoRevert_DanglingReverted(t *testing.T) {
 	var order []string
 	store := newFakeRecorderStore()
 	store.raise["mig-1"] = "1200"
 	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order}
-	m := &Migrator{QueryTimeoutController: ctrl}
 
-	if err := m.autoRevertDanglingQueryTimeoutRaise(context.Background(), rcFor(store)); err != nil {
+	if err := autoRevertDanglingQueryTimeoutRaise(context.Background(), ctrl, store, "mig-1"); err != nil {
 		t.Fatalf("autoRevert: %v", err)
 	}
 	if ctrl.reverts != 1 {
@@ -151,8 +153,7 @@ func TestAutoRevert_DanglingReverted(t *testing.T) {
 func TestAutoRevert_NoRecordIsNoOp(t *testing.T) {
 	var order []string
 	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order}
-	m := &Migrator{QueryTimeoutController: ctrl}
-	if err := m.autoRevertDanglingQueryTimeoutRaise(context.Background(), rcFor(newFakeRecorderStore())); err != nil {
+	if err := autoRevertDanglingQueryTimeoutRaise(context.Background(), ctrl, newFakeRecorderStore(), "mig-1"); err != nil {
 		t.Fatalf("autoRevert: %v", err)
 	}
 	if ctrl.reverts != 0 {
@@ -160,11 +161,23 @@ func TestAutoRevert_NoRecordIsNoOp(t *testing.T) {
 	}
 }
 
+func TestAutoRevert_NilRecorderIsNoOp(t *testing.T) {
+	var order []string
+	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order}
+	// A target that can't record raises (nil recorder) is a silent no-op — the
+	// gate migrateRaiseRecorder collapses `!rc.enabled` / non-recording store to.
+	if err := autoRevertDanglingQueryTimeoutRaise(context.Background(), ctrl, nil, "mig-1"); err != nil {
+		t.Fatalf("autoRevert: %v", err)
+	}
+	if ctrl.reverts != 0 {
+		t.Errorf("reverts = %d; want 0 (no recorder ⇒ nothing to revert)", ctrl.reverts)
+	}
+}
+
 func TestAutoRevert_DanglingWithNoControllerRefuses(t *testing.T) {
 	store := newFakeRecorderStore()
 	store.raise["mig-1"] = "900"
-	m := &Migrator{QueryTimeoutController: nil} // credentials absent on this run
-	err := m.autoRevertDanglingQueryTimeoutRaise(context.Background(), rcFor(store))
+	err := autoRevertDanglingQueryTimeoutRaise(context.Background(), nil, store, "mig-1") // credentials absent on this run
 	if err == nil || !strings.Contains(err.Error(), "left it raised") {
 		t.Fatalf("err = %v; want a loud refusal that the keyspace is still raised", err)
 	}
@@ -175,29 +188,37 @@ func TestAutoRevert_DanglingWithNoControllerRefuses(t *testing.T) {
 }
 
 func TestMaybeRaise_UnarmedIsNoOp(t *testing.T) {
-	m := &Migrator{RaiseQueryTimeout: false, QueryTimeoutController: &fakeController{mu: &sync.Mutex{}, order: new([]string)}}
-	revert, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(newFakeRecorderStore()), sampleSchema(), &recordingRowReader{})
+	revert, err := maybeRaiseQueryTimeout(context.Background(), false, &fakeController{mu: &sync.Mutex{}, order: new([]string)}, newFakeRecorderStore(), "mig-1", sampleSchema(), &recordingRowReader{})
 	if err != nil || revert != nil {
 		t.Fatalf("unarmed maybeRaise = (revert!=nil:%v, %v); want (false, nil)", revert != nil, err)
 	}
 }
 
 func TestMaybeRaise_ArmedWithoutControllerRefuses(t *testing.T) {
-	m := &Migrator{RaiseQueryTimeout: true, QueryTimeoutController: nil}
-	_, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(newFakeRecorderStore()), sampleSchema(), &recordingRowReader{})
+	_, err := maybeRaiseQueryTimeout(context.Background(), true, nil, newFakeRecorderStore(), "mig-1", sampleSchema(), &recordingRowReader{})
 	if err == nil {
 		t.Fatal("armed raise with no controller must refuse loudly")
+	}
+}
+
+func TestMaybeRaise_ArmedWithoutRecorderRefuses(t *testing.T) {
+	ctrl := &fakeController{mu: &sync.Mutex{}, order: new([]string)}
+	// Armed + a controller present but NO recorder (a target that cannot record
+	// the raise crash-safely) is a loud refusal, not a silent raise sluice could
+	// never auto-revert.
+	_, err := maybeRaiseQueryTimeout(context.Background(), true, ctrl, nil, "mig-1", sampleSchema(), &recordingRowReader{})
+	if err == nil || !strings.Contains(err.Error(), "crash-safely") {
+		t.Fatalf("err = %v; want a loud refusal naming the crash-safe recording requirement", err)
 	}
 }
 
 func TestMaybeRaise_SizeGateSkipsSmallMigration(t *testing.T) {
 	var order []string
 	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order}
-	m := &Migrator{RaiseQueryTimeout: true, QueryTimeoutController: ctrl}
 	// Reader estimates a tiny table (below the floor) → skip, no raise, no record.
 	rr := &estimatingReader{rows: 10}
 	store := newFakeRecorderStore()
-	revert, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(store), sampleSchema(), rr)
+	revert, err := maybeRaiseQueryTimeout(context.Background(), true, ctrl, store, "mig-1", sampleSchema(), rr)
 	if err != nil {
 		t.Fatalf("maybeRaise: %v", err)
 	}
@@ -215,11 +236,10 @@ func TestMaybeRaise_SizeGateSkipsSmallMigration(t *testing.T) {
 func TestMaybeRaise_LargeMigrationRaisesAndRecordsBeforeApply(t *testing.T) {
 	var order []string
 	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order, recordPrevious: "900"}
-	m := &Migrator{RaiseQueryTimeout: true, QueryTimeoutController: ctrl}
 	rr := &estimatingReader{rows: queryTimeoutRaiseMinRows + 1}
 	store := newFakeRecorderStore()
 
-	revert, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(store), sampleSchema(), rr)
+	revert, err := maybeRaiseQueryTimeout(context.Background(), true, ctrl, store, "mig-1", sampleSchema(), rr)
 	if err != nil {
 		t.Fatalf("maybeRaise: %v", err)
 	}
@@ -242,9 +262,8 @@ func TestMaybeRaise_LargeMigrationRaisesAndRecordsBeforeApply(t *testing.T) {
 func TestMaybeRaise_AlreadyAtMaxReturnsNilRevert(t *testing.T) {
 	var order []string
 	ctrl := &fakeController{mu: &sync.Mutex{}, order: &order, skipRaise: true}
-	m := &Migrator{RaiseQueryTimeout: true, QueryTimeoutController: ctrl}
 	store := newFakeRecorderStore()
-	revert, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(store), sampleSchema(), &recordingRowReader{})
+	revert, err := maybeRaiseQueryTimeout(context.Background(), true, ctrl, store, "mig-1", sampleSchema(), &recordingRowReader{})
 	if err != nil {
 		t.Fatalf("maybeRaise: %v", err)
 	}
@@ -264,10 +283,9 @@ func TestMaybeRaise_RaiseFailureAfterRecordReverts(t *testing.T) {
 	// failure in this fake, so maybeRaise must revert it.
 	ctrl.raiseErr = nil
 	failing := &recordThenFailController{fakeController: ctrl}
-	m := &Migrator{RaiseQueryTimeout: true, QueryTimeoutController: failing}
 	store := newFakeRecorderStore()
 
-	_, err := m.maybeRaiseQueryTimeout(context.Background(), rcFor(store), sampleSchema(), &estimatingReader{rows: queryTimeoutRaiseMinRows + 1})
+	_, err := maybeRaiseQueryTimeout(context.Background(), true, failing, store, "mig-1", sampleSchema(), &estimatingReader{rows: queryTimeoutRaiseMinRows + 1})
 	if err == nil {
 		t.Fatal("a raise failure must surface as an error")
 	}

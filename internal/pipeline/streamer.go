@@ -670,6 +670,29 @@ type Streamer struct {
 	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
 	UpfrontIndexes bool
 
+	// RaiseQueryTimeout mirrors [Migrator.RaiseQueryTimeout] (ADR-0182, item 111
+	// phase 3): arms the opt-in raise of the PlanetScale keyspace's
+	// queryserver-config-query-timeout to its 3600s maximum for the duration of
+	// the COLD-START bulk copy, then reverts it to the value it had (CLI:
+	// --planetscale-raise-query-timeout). It only fires on the cold-start path
+	// (a warm resume skips the copy, so has no large index/copy to protect),
+	// when QueryTimeoutController is also set and the target applier can record
+	// the raise crash-safely (the MySQL [ir.QueryTimeoutRaiseRecorder]), and the
+	// copy is large enough to plausibly hit the wall (the size gate). Zero value
+	// (false) leaves the stream byte-identical to before ADR-0182.
+	RaiseQueryTimeout bool
+
+	// QueryTimeoutController mirrors [Migrator.QueryTimeoutController] (ADR-0182):
+	// the optional control-plane object that raises and reverts the PlanetScale
+	// keyspace query timeout, composed by the CLI (which knows the target is
+	// PlanetScale and holds the credentials) and passed through opaquely so the
+	// orchestrator stays engine-neutral. Consulted for the armed cold-start RAISE
+	// and, independently of RaiseQueryTimeout, for the crash-recovery auto-revert
+	// of a raise a prior crashed cold-start left dangling. nil (every
+	// programmatic / broker / test caller, and any run whose credentials don't
+	// resolve) disables both.
+	QueryTimeoutController ir.QueryTimeoutController
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a
@@ -1695,6 +1718,21 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// dry-run.
 	if err := s.phasePrepareControlTable(ctx, applier, streamID); err != nil {
 		return err
+	}
+
+	// ---- 2.75. ADR-0182 query-timeout raise: crash-recovery + arm check ----
+	// Revert a keyspace query-timeout raise a prior crashed cold-start left
+	// dangling, BEFORE any change stream opens. Runs on EVERY attempt (warm and
+	// cold) so a dangling raise is reverted even when this attempt warm-resumes
+	// — the cold-start that would otherwise revert it never runs then. Also
+	// refuses loudly up front if the raise is armed against a target whose
+	// applier can't record it crash-safely. Skipped on dry-run (no target
+	// mutation). No-op on every non-planetscale target. The actual raise is
+	// scoped to the cold-start copy inside [Streamer.coldStart].
+	if !s.DryRun {
+		if err := s.phasePrepareQueryTimeoutRaise(ctx, applier, streamID); err != nil {
+			return err
+		}
 	}
 
 	// ---- 2.8. Resolve the stream's EFFECTIVE publication (ADR-0176

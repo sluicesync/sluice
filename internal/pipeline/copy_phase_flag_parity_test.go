@@ -51,7 +51,7 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 		"InjectShardColumn",  // both: ADR-0048 shard-discriminator stamp
 		"BulkBatchSize",      // both: per-batch row count for the copy
 		"UpfrontIndexes",     // both: build secondary indexes before the copy (item 111 phase 2)
-		"RaiseQueryTimeout",  // EXEMPT (migrate-only) — see parityExempt
+		"RaiseQueryTimeout",  // both: ADR-0182 query-timeout raise around the copy (item 111 phase 3)
 		"AnalyzeAfter",       // EXEMPT (migrate-only) — see parityExempt
 	}
 
@@ -60,18 +60,6 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 	// wires it to both (or renames it away) this gate fails and forces the
 	// exemption to be removed — a stale exemption cannot rot silently.
 	parityExempt := map[string]string{
-		// Confirmed design fork. RaiseQueryTimeout wraps the copy via the
-		// *Migrator method maybeRaiseQueryTimeout, whose ADR-0182 crash-safe
-		// auto-revert records the dangling raise in sluice_migrate_state through
-		// the resumeContext's state store (rc.store). The sync cold-start
-		// (streamer_coldstart.go) calls runBulkCopyWithOpts directly and has NO
-		// resumeContext and NO migrate-state store, so the recorder has no home
-		// on the sync path; a sync that dies mid-copy could not revert a dangling
-		// keyspace-wide raise. Wiring it needs a recorder-home design decision
-		// (a shared embedded type or a sync-side state store) — deliberately not
-		// attempted under item 111.
-		"RaiseQueryTimeout": "sync cold-start (streamer_coldstart.go) calls runBulkCopyWithOpts directly and has no resumeContext/migrate-state store, so the ADR-0182 crash-safe QueryTimeoutRaiseRecorder (rc.store) has no home on the sync path; wiring it needs a recorder-home design decision — item 111 phase 3 (deliberately not attempted)",
-
 		// Pending, NOT a designed fork. AnalyzeAfter runs an advisory post-copy
 		// statistics refresh (ANALYZE) after constraints/views. A sync cold-start
 		// bulk-loads and leaves stale planner stats exactly like migrate does, so

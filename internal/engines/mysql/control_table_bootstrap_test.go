@@ -178,6 +178,9 @@ func TestControlTableCreateSites_1105ClassifiedPerSite(t *testing.T) {
 		{"shard consolidation lease", func(ctx context.Context, db *sql.DB) error {
 			return ensureShardConsolidationLeaseTable(ctx, db, "")
 		}},
+		{"cdc query-timeout raise", func(ctx context.Context, db *sql.DB) error {
+			return ensureCDCQueryTimeoutRaiseTable(ctx, db, "")
+		}},
 		{"migrate state (header)", func(ctx context.Context, db *sql.DB) error {
 			return newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx)
 		}},
@@ -266,6 +269,9 @@ func TestEnsurePathsIssueZeroDDLWhenCurrent(t *testing.T) {
 		{"shard consolidation lease", func(ctx context.Context, db *sql.DB) error {
 			return ensureShardConsolidationLeaseTable(ctx, db, "")
 		}},
+		{"cdc query-timeout raise", func(ctx context.Context, db *sql.DB) error {
+			return ensureCDCQueryTimeoutRaiseTable(ctx, db, "")
+		}},
 		{"migrate state", func(ctx context.Context, db *sql.DB) error {
 			return newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx)
 		}},
@@ -300,6 +306,7 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 		controlTableName,
 		schemaHistoryTableName,
 		shardConsolidationLeaseTableName,
+		cdcQueryTimeoutRaiseTableName,
 	}
 	if len(stmts) != len(wantTables) {
 		t.Fatalf("ControlTableDDL returned %d statements; want %d", len(stmts), len(wantTables))
@@ -327,6 +334,9 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 	}
 	if err := ensureShardConsolidationLeaseTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureShardConsolidationLeaseTable: %v", err)
+	}
+	if err := ensureCDCQueryTimeoutRaiseTable(ctx, db, ""); err != nil {
+		t.Fatalf("ensureCDCQueryTimeoutRaiseTable: %v", err)
 	}
 	if err := newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx); err != nil {
 		t.Fatalf("migrate-state EnsureControlTable: %v", err)

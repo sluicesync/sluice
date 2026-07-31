@@ -111,7 +111,7 @@ func TestControlTablesDDLCmd_DefaultEngineIsPlanetScale(t *testing.T) {
 }
 
 // TestControlTablesDDLCmd_PrintsBootstrapSet runs the real printer and
-// pins the five-table bootstrap set plus the deploy-ddl recipe line —
+// pins the six-table bootstrap set plus the deploy-ddl recipe line —
 // stdout is pure SQL + `--` comments, pasteable per statement.
 func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 	c := parseInto(t, "control-tables", "ddl").ControlTables.DDL
@@ -141,13 +141,14 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 		"-- sluice_cdc_state\n",
 		"-- sluice_cdc_schema_history\n",
 		"-- sluice_shard_consolidation_lease\n",
+		"-- sluice_cdc_query_timeout_raise\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 5 {
-		t.Errorf("CREATE statements = %d; want 5", got)
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 6 {
+		t.Errorf("CREATE statements = %d; want 6", got)
 	}
 	// Pasteable: every non-empty line is SQL or a -- comment.
 	for _, line := range strings.Split(out, "\n") {

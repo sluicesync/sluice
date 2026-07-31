@@ -1343,6 +1343,8 @@ type SyncStartCmd struct {
 	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
 	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request wait for the ADR-0148 index-build fallback. DEFAULT 0 = wait indefinitely for the deploy to finish, which is what a large table needs (its index builds via VReplication — async, unbounded by errno 3024, and genuinely hours on a ~100 GB table; progress, ETA and throttling are logged as it runs). Terminal failure states still fail fast. Set a duration to stop waiting after it — nothing fails, the deploy keeps running in PlanetScale and a re-run picks up: the cold-start index phase re-probes and rebuilds only what is still missing." default:"0" placeholder:"DUR"`
 
+	PlanetScaleRaiseQueryTimeout bool `name:"planetscale-raise-query-timeout" help:"OPT-IN (PlanetScale target only): raise the keyspace's queryserver-config-query-timeout to its 3600s maximum for the duration of the COLD-START bulk copy, then revert it to the value it had. This is a KEYSPACE-WIDE config change whose rollout is a ROLLING TABLET RESTART (~2–6m each way, and again on revert) that affects anyone else on the keyspace. Requires --planetscale-org plus the service token (PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN); refused loudly if set on a non-planetscale target or without them. Only the cold-start raises — a warm resume skips the copy, so has no large index/copy to protect. Skipped with an INFO line on a small cold-start (no table large enough to approach the wall). Crash-safe: the raise is recorded in the target's sluice_cdc_query_timeout_raise table keyed by stream_id (NOT sluice_migrate_state — sync has no migrate-state store), and the next cold-start or resume of that stream reverts a dangling raise before anything else. Composes with --upfront-indexes and the deploy-request fallback; it gives headroom on fast-enough tiers, not a guarantee (a large index build on network-attached storage can exceed even 3600s). Off by default (a no-op on non-planetscale targets). See ADR-0182."`
+
 	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planetscale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
 
 	// ADR-0107 item 36 — sync-scoped target-metrics threshold ALERTER. Opt-in,
@@ -1570,6 +1572,30 @@ func (s *SyncStartCmd) planetScaleIndexFallback() ir.IndexBuildFallback {
 		token:         s.PlanetScaleServiceToken,
 		deployTimeout: s.PlanetScaleDeployTimeout,
 	})
+}
+
+// planetScaleQueryTimeoutController composes the ADR-0182 controller for the
+// sync cold-start from the SAME shared PlanetScale flags the index fallback
+// uses (item 111 phase 3). Mirrors [MigrateCmd.planetScaleQueryTimeoutController]:
+// the controller is built whenever the credentials resolve (so it is also
+// available for the crash-recovery auto-revert on a run that does not pass the
+// flag but does carry the credentials); when the raise flag IS set but nothing
+// can honor it, it returns a loud refusal instead of a silent no-op.
+func (s *SyncStartCmd) planetScaleQueryTimeoutController() (ir.QueryTimeoutController, error) {
+	ctrl := composePlanetScaleQueryTimeoutController(indexFallbackParams{
+		targetDriver: s.TargetDriver,
+		targetDSN:    s.Target,
+		org:          s.PlanetScaleOrg,
+		database:     s.PlanetScaleDatabase,
+		branch:       s.PlanetScaleBranch,
+		tokenID:      s.PlanetScaleServiceTokenID,
+		token:        s.PlanetScaleServiceToken,
+	})
+	if s.PlanetScaleRaiseQueryTimeout && ctrl == nil {
+		return nil, errors.New("--planetscale-raise-query-timeout requires a PlanetScale target (--target-driver planetscale) with --planetscale-org and a service token " +
+			"(PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN); it cannot raise a keyspace query timeout without them")
+	}
+	return ctrl, nil
 }
 
 // buildTargetTelemetryProvider constructs the optional PlanetScale telemetry
@@ -2249,6 +2275,15 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	streamer.Redactor = redactor
 	logKeysetLoaded(keyset)
 	logRedactionConfig(redactor, "sync start")
+	// ADR-0182 (item 111 phase 3): compose the opt-in cold-start query-timeout
+	// raise controller (also available for the crash-recovery auto-revert). A
+	// flag set without a planetscale target / credentials is a loud refusal.
+	queryTimeoutController, err := s.planetScaleQueryTimeoutController()
+	if err != nil {
+		return err
+	}
+	streamer.RaiseQueryTimeout = s.PlanetScaleRaiseQueryTimeout
+	streamer.QueryTimeoutController = queryTimeoutController
 	// ADR-0056 auto-on-crash hook (opt-in). When
 	// --diagnose-on-crash-dir is set, the hook writes a bundle to the
 	// directory if Run returns an error. The hook NEVER masks the

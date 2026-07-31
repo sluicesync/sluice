@@ -749,7 +749,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// so a --reset-target-data re-run still restores the keyspace first. A
 	// no-op on every non-planetscale target and every run with no dangling
 	// raise recorded.
-	if err := m.autoRevertDanglingQueryTimeoutRaise(ctx, rc); err != nil {
+	if err := autoRevertDanglingQueryTimeoutRaise(ctx, m.QueryTimeoutController, migrateRaiseRecorder(rc), rc.migrationID); err != nil {
 		return err
 	}
 
@@ -893,7 +893,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// in-flight copy. The returned revert runs on every exit path (deferred
 	// immediately so an abort still restores the keyspace); nil when unarmed,
 	// size-gated out, or a non-planetscale target.
-	revertQueryTimeout, err := m.maybeRaiseQueryTimeout(ctx, rc, schema, rr)
+	revertQueryTimeout, err := maybeRaiseQueryTimeout(ctx, m.RaiseQueryTimeout, m.QueryTimeoutController, migrateRaiseRecorder(rc), rc.migrationID, schema, rr)
 	if err != nil {
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}

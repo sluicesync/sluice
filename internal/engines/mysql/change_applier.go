@@ -820,7 +820,14 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	if err := ensureSchemaHistoryTable(ctx, a.db, a.controlKeyspace); err != nil {
 		return err
 	}
-	return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlKeyspace)
+	if err := ensureShardConsolidationLeaseTable(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
+	// ADR-0182 (item 111 phase 3): the dedicated sync-side crash-recovery table
+	// for the query-timeout raise, created here so it exists before the
+	// cold-start copy can raise. Additive; a no-op on a same-engine MySQL→MySQL
+	// sync that never raises (the table is created but never written).
+	return ensureCDCQueryTimeoutRaiseTable(ctx, a.db, a.controlKeyspace)
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]
