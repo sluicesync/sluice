@@ -1857,7 +1857,26 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
 
-### 109. The errno-3024 statement-wall handling stops at the INDEX phase — the CONSTRAINTS phase hits the same wall with no fallback, no hint, no code, and the resume loop spins on it forever (observed live 2026-07-30 at 153M rows) — *FIXED (A + B + D landed; C rejected). Awaiting main-session review + CI.*
+### 110. Opt-in: raise PlanetScale's `queryserver-config-query-timeout` to its 3600s max for the migration, then revert — via the config-changes API (operator-requested 2026-07-31) — *OPEN*
+
+**Why.** The ~900s statement wall is the root of the whole errno-3024 family (index builds, FK validation, and — measured 2026-07-31 — even a single `--upfront-indexes` bulk-copy insert on network-attached storage). The wall is a *configurable* keyspace setting, `queryserver-config-query-timeout` (default 900, max 3600). Measured head-to-head: on a Metal (local-NVMe) target the deferred 4-index build on 153M rows completes in ~35m — which fits 3600s but not 900s — so raising the timeout makes the *direct* path viable there without a deploy request. (On network-attached Scaler the same build exceeds even 3600s, so the raise does NOT help that case; value is tier-dependent.)
+
+**API flow (fully reverse-engineered 2026-07-31 — NOT in the `update_keyspace` docs; the keyspace PATCH does nothing for these options):**
+1. Read current: `GET …/branches/{branch}/keyspaces/{ks}` → `vttablet_options` (may be `{}` = default 900).
+2. Stage: `POST …/branches/{branch}/keyspaces/{ks}/config-changes` with `{"change_type":"vttablet","options":{"queryserver-config-query-timeout":"3600"}}` — note the field is **`options`** (not `vttablet_options`) and the **value is a STRING** — → returns `{id, state:"draft", previous_options}`.
+3. Submit: `POST …/branches/{branch}/config-changes/submit` with `{"ids":["<id>"]}` → `state:"applying"`.
+4. Poll `GET …/keyspaces/{ks}/rollout-status` to `state:"complete"` + `config_change_in_progress:false` (the rollout is a rolling tablet restart, ~2–6m). Revert repeats 2–4 with the recorded previous value.
+
+**What (design decided with the operator 2026-07-31):**
+- **Opt-in flag, tightly gated** — a `--planetscale-raise-query-timeout` (name TBD). Fires ONLY on a PlanetScale/Vitess target with `--planetscale-org` + the service token already present (reuse the ADR-0148 plumbing, `internal/planetscale/api`), and never by default. Consider a size gate (skip on a migration with no large table) so a small run doesn't eat two rolling restarts for nothing.
+- **Revert to the PREVIOUS value, not a hardcoded 900** — the API returns `previous_options`; record it and restore exactly that (an operator who set 1200 gets 1200 back). Empty `vttablet_options` ⇒ revert by clearing / setting the documented default.
+- **Crash-safe, record-and-auto-revert** — persist "raised, previous=X" in `sluice_migrate_state` at raise time; revert on success AND on failure; a `--resume` or bare re-run detects a dangling raise and reverts it before anything else. This is the "leave it as you found it" guarantee and the bulk of the work.
+- **Sequencing:** raise (+wait for rollout) BEFORE any copy — the rolling restart must not hit an in-flight copy. Revert AFTER all phases complete (or on abort).
+- **Compose, don't replace:** orthogonal to `--upfront-indexes`, ADR-0148 deploy-request fallback, and item-109 metadata-only FK. It gives headroom so the direct path succeeds where it'd wall; the fallbacks remain.
+
+**Gotchas.** The config change is KEYSPACE-WIDE and causes a rolling restart affecting anyone else on that keyspace — the flag's help must say so. Rollout adds ~5–12m total per migration. The `config-changes` create is keyspace-level (`change_type` accepts `vttablet`/`mysqld`); vtgate config is branch-level (`vtgate`). Keyspace name = database name for single-keyspace PlanetScale MySQL, but resolve it (list keyspaces) rather than assume. **Honest scope note for the ADR:** the measured evidence says `--upfront-indexes` on Metal is already the cleaner path needing no timeout tuning; this feature's real value is the deferred path on fast tiers and possibly rescuing the upfront-copy wall on Scaler (untested — the my5 insert walled at 900s; whether 3600s clears it is a hypothesis to verify). Frame it as a useful option, not a silver bullet. Wants ADR-0182.
+
+### 109. The errno-3024 statement-wall handling stops at the INDEX phase — the CONSTRAINTS phase hits the same wall with no fallback, no hint, no code, and the resume loop spins on it forever (observed live 2026-07-30 at 153M rows) — *SHIPPED v0.105.0 (A metadata-only FK + chunked orphan scan, D loop guard; C rejected on evidence — Online DDL refuses FK tables)*
 
 **RESOLUTION (2026-07-30).** Landed **A + B + D**; **C rejected** on evidence. Verdicts, each with the code/live proof that decided it.
 
