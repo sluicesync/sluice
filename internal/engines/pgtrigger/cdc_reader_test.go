@@ -50,20 +50,22 @@ func TestCDCReader_SetPollInterval_NegativeIsNoop(t *testing.T) {
 	}
 }
 
-// TestPollQuery_ComparesInXID8Domain pins the epoch-safety shape of
-// the §2 safety-lag hold-back: the poll must compare the
-// trigger-recorded `txid` (xid8-as-bigint, epoch-carrying, NOT NULL
-// since the engine's first release) against pg_snapshot_xmin — never
-// the row's system `xmin`. Row xmin is a 32-bit epoch-LESS xid, so an
-// xmin-based predicate degenerates to always-true once the cluster's
-// lifetime txid count crosses 2^32 and in-flight rows silently stop
-// being held back — the overlap-commit gap the predicate exists to
-// prevent (live-confirmed on a pg_resetwal-epoch-bumped PG 16; the
-// live pin is TestCDCReader_XIDEpochBump).
-func TestPollQuery_ComparesInXID8Domain(t *testing.T) {
+// TestPollQuery_BoundsTheWindowByTheSettledCeiling pins the poll's
+// fetch shape: an id-ordered, LIMIT-ed window truncated at the shared
+// settled ceiling. The window is what keeps a catch-up backlog from
+// turning the ceiling's aggregates into a per-poll tail scan, and the
+// `id > $1` / `ORDER BY id ASC` pair is what lets [CDCReader.poll] walk
+// the contiguous run (cdc_gapfree.go).
+func TestPollQuery_BoundsTheWindowByTheSettledCeiling(t *testing.T) {
 	q := pollQuery(`"public"."sluice_change_log"`)
-	if !strings.Contains(q, "txid < pg_snapshot_xmin(pg_current_snapshot())::text::bigint") {
-		t.Errorf("poll query lost the xid8-domain hold-back predicate:\n%s", q)
+	for _, want := range []string{
+		"WITH " + changeLogWindow + " AS MATERIALIZED",
+		"WHERE id > $1 ORDER BY id ASC LIMIT $2",
+		"WHERE id <= " + settledCeilingSQL(changeLogWindow),
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("poll query lost %q:\n%s", want, q)
+		}
 	}
 	if strings.Contains(q, "xmin::text") {
 		t.Errorf("poll query compares the 32-bit row xmin against a 64-bit xid8 — the epoch-wrap silent-gap bug:\n%s", q)

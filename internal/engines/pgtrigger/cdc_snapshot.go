@@ -82,6 +82,13 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 			cfg.schema, ChangeLogTable,
 		)
 	}
+	// The anchor's gap-freedom case split and the poller's contiguity
+	// rule both rest on CACHE 1 monotonic id allocation (cdc_gapfree.go).
+	// Refuse before the snapshot opens rather than mid-handoff.
+	if err := verifyChangeLogSequenceCache(ctx, db, cfg.schema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Perf-parity gap 3: the trigger-CDC cold-start copies tables SERIALLY on
 	// the one snapshot-pinned connection below — there is no parallel option

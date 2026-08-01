@@ -339,6 +339,19 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 // serialised per database, so id-order = commit-order (ADR-0136 §4) — NOT a
 // lagging read replica. When a poll returns a full batch the next poll fires
 // immediately so a bursty source isn't throttled by the cadence.
+//
+// EXEMPT from pgtrigger's contiguous-prefix rule (internal/engines/pgtrigger/
+// cdc_gapfree.go), and this is why — the exemption is a property of SQLite's
+// locking, not of the code above. A SQLite write transaction takes the write
+// lock at its FIRST write and holds it until commit or rollback, so two write
+// transactions can never interleave change-log inserts: while a lower id is
+// uncommitted, no HIGHER id can have been committed by anyone else. The
+// "committed higher id above an invisible lower id" shape that costs pgtrigger
+// a contiguity walk plus an abort proof is therefore unconstructible here, and
+// an aborted write rolls its AUTOINCREMENT allocation back with it. What WOULD
+// invalidate this: concurrent writers (a future BEGIN CONCURRENT / multi-writer
+// backend), or a D1 poll served by a replica rather than the primary. Either
+// change means porting the pgtrigger rule, not re-deriving this comment.
 func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Change) {
 	lastSeen := startID
 	timer := time.NewTimer(0) // fire immediately on the first iteration

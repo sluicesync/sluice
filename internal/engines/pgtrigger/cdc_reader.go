@@ -97,6 +97,14 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 			cfg.schema, ChangeLogTable,
 		)
 	}
+	// The gap-free ordering rests on the change-log id sequence being a
+	// CACHE 1 BIGSERIAL (see cdc_gapfree.go's premises). Preflight it
+	// here so a source someone ALTERed refuses at open time rather than
+	// dropping changes mid-stream.
+	if err := verifyChangeLogSequenceCache(ctx, db, cfg.schema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &CDCReader{
 		db:           db,
 		schema:       cfg.schema,
@@ -209,14 +217,18 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	return out, nil
 }
 
-// pump is the polling-loop body. ADR-0066 §2 / §6: each iteration
-// runs the safety-lag query (`txid < pg_snapshot_xmin(...)`) plus
-// `id > $lastSeen` to fetch the next batch in commit-safe id order.
-// When a poll returns exactly batchSize rows the next poll fires
-// immediately so the back-pressure pull saturates against bursty
-// sources without batch-cap throttling.
+// pump is the polling-loop body. Each iteration fetches the next batch
+// window in id order and consumes the CONTIGUOUS committed run out of
+// it (cdc_gapfree.go — the invariant, and why a per-row hold-back is
+// not enough). A hole in that run stops the watermark until the hole
+// either fills (the allocating transaction committed) or is PROVEN
+// permanent by [holeGuard] (it aborted). When a poll returns exactly
+// batchSize events the next poll fires immediately so the
+// back-pressure pull saturates against bursty sources without batch-cap
+// throttling.
 func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Change) {
 	lastSeen := startID
+	var holes holeGuard
 	timer := time.NewTimer(0) // fire immediately on first iteration
 	defer timer.Stop()
 	for {
@@ -225,7 +237,15 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			return
 		case <-timer.C:
 		}
-		fetched, newLast, ddl, err := r.poll(ctx, lastSeen)
+		// Step 3 of the abort proof runs BEFORE this poll's snapshot: a
+		// settle probe taken AFTER the observation it licenses would
+		// admit a transaction that committed in between, and skipping
+		// there is the silent loss the guard exists to prevent.
+		if err := holes.refresh(ctx, r.db); err != nil {
+			slog.DebugContext(ctx, "pgtrigger: change-log gap settle probe failed; the stream keeps waiting",
+				slog.Any("err", err))
+		}
+		b, err := r.poll(ctx, lastSeen)
 		if err != nil {
 			// Classify transients so the ADR-0038 pipeline retry loop reopens
 			// the pump instead of terminating a long-running poll on a routine
@@ -241,36 +261,79 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			r.setErr(classifyPollError(err))
 			return
 		}
-		if ddl != "" {
+		if b.ddl != "" {
 			// §7 — refuse-loudly on observed DDL. The polling loop
 			// terminates; the operator runs the drained-model
 			// recovery (ADR-0054 hint).
 			r.setErr(fmt.Errorf(
 				"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --reset-position`",
-				ddl,
+				b.ddl,
 			))
 			return
 		}
-		for _, ev := range fetched {
+		for _, ev := range b.events {
 			select {
 			case <-ctx.Done():
 				return
 			case out <- ev:
 			}
 		}
-		if newLast > lastSeen {
-			lastSeen = newLast
+		if b.lastID > lastSeen {
+			lastSeen = b.lastID
+		}
+		if b.holeAt > 0 {
+			if next, ok := r.resolveHole(ctx, &holes, b); ok {
+				lastSeen = next
+				timer.Reset(0)
+				continue
+			}
+		} else {
+			holes.clear()
 		}
 		// Adaptive cadence: a full batch means the source is busy;
 		// fire the next poll immediately so back-pressure has the
 		// shortest possible feedback window. Otherwise wait the
 		// configured interval.
-		if len(fetched) == r.batchSize {
+		if len(b.events) == r.batchSize {
 			timer.Reset(0)
 		} else {
 			timer.Reset(r.pollInterval)
 		}
 	}
+}
+
+// resolveHole runs one round of the gap-freedom hole protocol for a
+// poll that stopped short of the window's end, and reports the
+// watermark the stream may jump to when the hole is PROVEN permanent
+// (its allocating transaction aborted). Otherwise the stream simply
+// waits: over-holding is safe, skipping an unproven hole is silent
+// loss. See [holeGuard] for the ordering that makes the proof sound.
+func (r *CDCReader) resolveHole(ctx context.Context, holes *holeGuard, b pollBatch) (int64, bool) {
+	now := time.Now()
+	holes.observe(b.holeAt, now)
+	if to, ok := holes.skipTo(b.holeAt, b.holeEnd); ok {
+		slog.InfoContext(
+			ctx, "pgtrigger: skipping a permanently-absent change-log id range (the transactions that allocated it rolled back; every transaction that could still have committed one has settled)",
+			slog.Int64("from_id", b.holeAt),
+			slog.Int64("through_id", to),
+		)
+		return to, true
+	}
+	if holes.needsBound() {
+		// Assign the xid bound AFTER the observation above (step 2).
+		bound, err := captureTxidUpperBound(ctx, r.db)
+		if err != nil {
+			slog.WarnContext(
+				ctx, "pgtrigger: cannot assign the txid bound that proves a change-log gap permanent; the stream will keep waiting at the gap rather than risk skipping a change",
+				slog.Int64("change_log_id", b.holeAt),
+				slog.Any("err", err),
+			)
+		} else {
+			holes.arm(bound, b.seenTo)
+		}
+	}
+	holes.warnStuck(ctx, now)
+	return 0, false
 }
 
 // classifyPollError wraps a change-log poll failure for the pipeline retry
@@ -287,57 +350,71 @@ func classifyPollError(err error) error {
 	return triggercdc.ClassifyTransient(wrapped)
 }
 
-// pollQuery renders the one-poll fetch with the §2 safety-lag
-// hold-back: `txid < pg_snapshot_xmin(pg_current_snapshot())` holds
-// back any row whose allocating transaction is still in-flight.
-// Without it an overlapping txn that allocated id=5 but committed
-// AFTER id=6 would be skipped forever by a reader that observed id=6
-// first (the watermark advances past 5 before 5 becomes visible).
+// pollQuery renders the one-poll fetch: the next batch WINDOW of the
+// change log in id order, truncated at the shared settled ceiling
+// ([settledCeilingSQL] — the same expression the cold-start anchor
+// computes, over the window instead of over the whole table).
 //
-// BOTH sides of the hold-back comparison live in the 64-bit
-// epoch-carrying xid8 domain: `txid` is the allocating transaction's
-// `pg_current_xact_id()::text::bigint`, recorded by the capture
-// trigger at insert time (ADR-0066 §2 — the column exists precisely so
-// this query can read it, and it has been NOT NULL since the engine's
-// first release, so there are no legacy rows to special-case), and the
-// right side is the poll snapshot's xmin through the same cast. The
-// text → bigint cast keeps both values on the driver's int64 path (a
-// JSON-number float64 would lose precision above 2^53).
+// That ceiling is the conservative arm only. The load-bearing rule for
+// gap-freedom is the CONTIGUOUS run [CDCReader.poll] walks out of this
+// window: an id missing from the window belongs to a transaction that
+// has not committed, and consuming past it is the silent loss
+// cdc_gapfree.go documents. Rows beyond the first hole are still
+// fetched — an id above a hole is what proves the hole's row was
+// already allocated — but not consumed.
 //
-// The row's system `xmin` column MUST NOT be used on the left side:
-// xmin is the 32-bit epoch-LESS xid, while pg_snapshot_xmin() is
-// epoch-carrying, so once the cluster's lifetime txid count crosses
-// 2^32 (routine on long-lived busy PG) the cross-domain comparison is
-// ALWAYS true and the hold-back silently stops — reopening the
-// overlap-commit gap this predicate exists to prevent. That regression
-// shipped (the original implementation compared `xmin::text::bigint`;
-// live-confirmed on a pg_resetwal-epoch-bumped PG 16, 2026-07-08).
-// Pinned by TestPollQuery_ComparesInXID8Domain and
-// TestCDCReader_XIDEpochBump.
+// The window is MATERIALIZED so both ceiling arms aggregate over the
+// LIMIT-ed batch instead of re-scanning the change-log tail; without it
+// a multi-million-row catch-up backlog makes every poll O(backlog).
+// MATERIALIZED is PG 12+; the engine's floor is PG 13.
 func pollQuery(tableRef string) string {
-	return "SELECT id, txid, EXTRACT(epoch FROM committed_at)::bigint, schema_name, table_name, op, " +
-		"pk_jsonb::text, before_jsonb::text, after_jsonb::text " +
-		"FROM " + tableRef + " " +
-		"WHERE id > $1 " +
-		"  AND txid < pg_snapshot_xmin(pg_current_snapshot())::text::bigint " +
-		"ORDER BY id ASC LIMIT $2"
+	return "WITH " + changeLogWindow + " AS MATERIALIZED (\n" +
+		"  SELECT id, txid, EXTRACT(epoch FROM committed_at)::bigint AS committed_epoch,\n" +
+		"         schema_name, table_name, op,\n" +
+		"         pk_jsonb::text AS pk_text, before_jsonb::text AS before_text,\n" +
+		"         after_jsonb::text AS after_text\n" +
+		"    FROM " + tableRef + "\n" +
+		"   WHERE id > $1 ORDER BY id ASC LIMIT $2\n" +
+		")\n" +
+		"SELECT id, txid, committed_epoch, schema_name, table_name, op, pk_text, before_text, after_text\n" +
+		"  FROM " + changeLogWindow + "\n" +
+		" WHERE id <= " + settledCeilingSQL(changeLogWindow) + "\n" +
+		" ORDER BY id ASC"
 }
 
-// poll runs one safety-lag-bounded fetch (see [pollQuery] for the
-// hold-back predicate and its xid8-domain rationale). Returns the
-// events, the new high-water id, and (when non-empty) the
-// human-readable DDL command tag that fired a refuse-loudly path. A
-// zero-row, zero-DDL return is the steady-state "nothing new" shape.
-func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Change, newLast int64, ddl string, err error) {
+// pollBatch is one poll's outcome. lastID is the watermark the stream
+// may durably advance to — the end of the contiguous committed run, NOT
+// the highest id fetched — and holeAt/holeEnd/seenTo carry what this
+// poll learned about the first gap so [holeGuard] can choose between
+// waiting and skipping.
+type pollBatch struct {
+	events  []ir.Change
+	lastID  int64  // end of the contiguous run this poll consumed
+	holeAt  int64  // lowest id > lastID missing from the window (0 = the run reached the window's end)
+	holeEnd int64  // lowest VISIBLE id above holeAt — the row that proves holeAt was allocated
+	seenTo  int64  // highest id observed in this poll's window
+	ddl     string // non-empty → §7 refuse-loudly DDL marker
+}
+
+// poll runs one bounded fetch and consumes the contiguous committed run
+// out of it (see [pollQuery] and cdc_gapfree.go for why contiguity, not
+// a per-row predicate, is what makes the watermark gap-free). A
+// zero-event, zero-hole, zero-DDL return is the steady-state "nothing
+// new" shape.
+func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error) {
 	tableRef := quoteIdent(r.schema) + "." + quoteIdent(ChangeLogTable)
 	q := pollQuery(tableRef)
+	b := pollBatch{lastID: lastSeen, seenTo: lastSeen}
 	//nolint:rowserrcheck,sqlclosecheck // closed via defer below; linter can't track the early-return path
 	rows, qErr := r.db.QueryContext(ctx, q, lastSeen, r.batchSize)
 	if qErr != nil {
-		return nil, lastSeen, "", qErr
+		return pollBatch{}, qErr
 	}
 	defer func() { _ = rows.Close() }()
-	newLast = lastSeen
+	// want is the next id the contiguous run needs. The first row that
+	// is not it opens the hole; from there the loop keeps scanning to
+	// extend seenTo (the abort proof's upper bound) and decodes nothing.
+	want := lastSeen + 1
 	for rows.Next() {
 		var (
 			id         int64
@@ -351,11 +428,21 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 			afterJSON  sql.NullString
 		)
 		if err := rows.Scan(&id, &txid, &committed, &schema, &table, &op, &pkJSON, &beforeJSON, &afterJSON); err != nil {
-			return nil, lastSeen, "", fmt.Errorf("scan row: %w", err)
+			return pollBatch{}, fmt.Errorf("scan row: %w", err)
 		}
-		if id > newLast {
-			newLast = id
+		if id > b.seenTo {
+			b.seenTo = id
 		}
+		if b.holeAt > 0 {
+			// Past the first hole: this row is only evidence that the
+			// hole's id was already allocated. Do not decode or consume it.
+			continue
+		}
+		if id != want {
+			b.holeAt, b.holeEnd = want, id
+			continue
+		}
+		want = id + 1
 
 		// §7 DDL marker handling — short-circuit the loop and
 		// surface the refusal to the pump.
@@ -366,26 +453,27 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		commitTime := pgTriggerCommitTime(committed)
 
 		if op == "X" {
-			tag := decodeDDLTag(pkJSON.String)
-			return nil, newLast, tag, nil
+			b.ddl = decodeDDLTag(pkJSON.String)
+			return b, nil
 		}
 		// Truncate handling.
 		if op == "T" {
 			pos, err := encodePos(pgTriggerPos{LastID: id})
 			if err != nil {
-				return nil, lastSeen, "", fmt.Errorf("encode position: %w", err)
+				return pollBatch{}, fmt.Errorf("encode position: %w", err)
 			}
-			events = append(events, ir.Truncate{Position: pos, Schema: schema, Table: table, CommitTime: commitTime})
+			b.events = append(b.events, ir.Truncate{Position: pos, Schema: schema, Table: table, CommitTime: commitTime})
+			b.lastID = id
 			continue
 		}
 
 		pos, err := encodePos(pgTriggerPos{LastID: id})
 		if err != nil {
-			return nil, lastSeen, "", fmt.Errorf("encode position: %w", err)
+			return pollBatch{}, fmt.Errorf("encode position: %w", err)
 		}
 		pkRow, err := decodeJSONBRow(pkJSON.String)
 		if err != nil {
-			return nil, lastSeen, "", fmt.Errorf("decode pk_jsonb (id=%d): %w", id, err)
+			return pollBatch{}, fmt.Errorf("decode pk_jsonb (id=%d): %w", id, err)
 		}
 		_ = pkRow // §2: pk_jsonb is part of before_jsonb / after_jsonb already
 
@@ -393,19 +481,19 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		if beforeJSON.Valid {
 			beforeRow, err = decodeJSONBRow(beforeJSON.String)
 			if err != nil {
-				return nil, lastSeen, "", fmt.Errorf("decode before_jsonb (id=%d): %w", id, err)
+				return pollBatch{}, fmt.Errorf("decode before_jsonb (id=%d): %w", id, err)
 			}
 		}
 		if afterJSON.Valid {
 			afterRow, err = decodeJSONBRow(afterJSON.String)
 			if err != nil {
-				return nil, lastSeen, "", fmt.Errorf("decode after_jsonb (id=%d): %w", id, err)
+				return pollBatch{}, fmt.Errorf("decode after_jsonb (id=%d): %w", id, err)
 			}
 		}
 
 		switch op {
 		case "I":
-			events = append(events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime})
 		case "U":
 			// `before`/`after` completeness is a deliberate
 			// capture-payload mode choice (ADR-0068), NOT a REPLICA
@@ -420,7 +508,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 			// the applier builds its WHERE from `before` and SET from
 			// `after` — both correct and idempotent for any of the
 			// modes, with no reader/applier code change.
-			events = append(events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime})
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
 			// path uses Before to identify the row.
@@ -429,32 +517,35 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 				// for DELETE. If we ever see a NULL it indicates a
 				// driver-side mis-decode and the loud-failure path
 				// is correct.
-				return nil, lastSeen, "", fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
+				return pollBatch{}, fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
 			}
-			events = append(events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime})
 		default:
-			return nil, lastSeen, "", fmt.Errorf("unknown op %q at id=%d", op, id)
+			return pollBatch{}, fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
+		b.lastID = id
 		// txid is scanned (the SELECT projects it for schema-shape
 		// stability with the trigger's audit table) but not consumed in
-		// Go: ordering uses the bigserial id alone, and the safety-lag
-		// hold-back consumes txid inside the SQL WHERE (see [pollQuery]).
-		// It becomes load-bearing in Go if/when transactional batching
-		// lands. committed is consumed above as the sync-lag commit
-		// timestamp (roadmap item 45).
+		// Go: the watermark rides the bigserial id alone, and the
+		// settled-ceiling arm consumes txid inside the SQL (see
+		// [pollQuery] / [settledCeilingSQL]). It becomes load-bearing in
+		// Go if/when transactional batching lands. committed is consumed
+		// above as the sync-lag commit timestamp (roadmap item 45).
 		_ = txid
 	}
 	if err := rows.Err(); err != nil {
-		return nil, lastSeen, "", fmt.Errorf("iter rows: %w", err)
+		return pollBatch{}, fmt.Errorf("iter rows: %w", err)
 	}
-	if len(events) > 0 {
+	if len(b.events) > 0 || b.holeAt > 0 {
 		slog.DebugContext(
 			ctx, "pgtrigger: poll batch",
-			slog.Int("events", len(events)),
-			slog.Int64("last_id", newLast),
+			slog.Int("events", len(b.events)),
+			slog.Int64("last_id", b.lastID),
+			slog.Int64("hole_at", b.holeAt),
+			slog.Int64("seen_to", b.seenTo),
 		)
 	}
-	return events, newLast, "", nil
+	return b, nil
 }
 
 // decodeJSONBRow decodes a JSONB column value (as a TEXT-cast string)
@@ -611,21 +702,14 @@ type anchorQuerier interface {
 }
 
 // anchorQuery renders the CDC-handoff anchor computation (semantics in
-// [readChangeLogAnchor]). The `txid >=` arm must compare in the 64-bit
-// epoch-carrying xid8 domain for the same reason as [pollQuery]: with
-// the row's 32-bit epoch-less `xmin` on the left, the comparison
-// against pg_snapshot_xmin() is false for EVERY row once the cluster's
-// lifetime txid count crosses 2^32, the arm never matches, and
-// COALESCE silently falls through to MAX(id) — the exact too-high
-// anchor Bug 94 exists to prevent. Pinned by
-// TestAnchorQuery_ComparesInXID8Domain and TestCDCReader_XIDEpochBump.
+// [readChangeLogAnchor]) as the shared settled ceiling over the WHOLE
+// change log. It is the same [settledCeilingSQL] expression the
+// steady-state [pollQuery] applies to its batch window — deliberately,
+// so the two cannot drift back into encoding two different rules (see
+// cdc_gapfree.go's header for the drift that shipped, and
+// TestPollAndAnchorShareTheSettledCeiling for the pin).
 func anchorQuery(tableRef string) string {
-	return `
-SELECT COALESCE(
-  (SELECT MIN(id) - 1 FROM ` + tableRef + `
-     WHERE txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
-  (SELECT COALESCE(MAX(id), 0) FROM ` + tableRef + `)
-)`
+	return "SELECT " + settledCeilingSQL(tableRef)
 }
 
 // readChangeLogAnchor computes the CDC handoff anchor: the highest
@@ -645,8 +729,8 @@ SELECT COALESCE(
 // MAX(id)" — see [anchorQuery] for the SQL. `txid >=
 // pg_snapshot_xmin(current)` selects visible rows whose allocating
 // transaction is NOT definitely-finished-before-our-snapshot — the
-// rows the [pollQuery] steady-state hold-back would currently keep
-// back. Anchoring below the FIRST such id means CDC replays all of
+// rows the steady-state poll's shared ceiling ([settledCeilingSQL])
+// would keep back too. Anchoring below the FIRST such id means CDC replays all of
 // them. Over-replay (anchor too LOW) is SAFE: the applier is
 // idempotent (ADR-0010), so an event whose row is ALSO in the
 // bulk-copy snapshot just re-applies to the same value. A GAP (anchor

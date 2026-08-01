@@ -47,7 +47,7 @@ const snapshotTextQuery = `SELECT pg_current_snapshot()::text`
 
 // txidUpperBoundQuery assigns a REAL txid to its (implicit,
 // immediately-committed) transaction and returns it in the 64-bit
-// epoch-carrying bigint domain ([pollQuery]'s xid8 rationale). Run on a
+// epoch-carrying bigint domain ([settledCeilingSQL]'s xid8 rationale). Run on a
 // fresh connection AFTER the snapshot is established, the returned
 // value strictly exceeds every txid assigned before the snapshot — the
 // sound upper bound for the settle wait.
@@ -124,9 +124,10 @@ func captureTxidUpperBound(ctx context.Context, q settleQuerier) (int64, error) 
 //   - txid ≥ U — first wrote after S, so their change-log ids were
 //     allocated after S and exceed every id the anchor query or the
 //     clamp can return (the id sequence is a plain BIGSERIAL, CACHE 1:
-//     nextval is monotonic in allocation order). Safe by construction;
-//     the steady-state [pollQuery] hold-back emits them in order once
-//     they settle.
+//     nextval is monotonic in allocation order — the premise
+//     [verifyChangeLogSequenceCache] now preflights rather than
+//     assuming). Safe by construction; the steady-state poll emits them
+//     in order once they settle.
 //
 // The wait covers ALL pre-bound transactions, not just change-log
 // writers: an uncommitted txn's writes are invisible (the same MVCC
@@ -200,7 +201,7 @@ func waitForPreSnapshotTxnsToSettle(ctx context.Context, q settleQuerier, upperB
 // CDC anchor to min−1 so those rows replay. The txid column round-trips
 // through its text form back into the xid8 domain for
 // pg_visible_in_snapshot — never the row's 32-bit epoch-less xmin
-// ([pollQuery]'s rationale).
+// ([settledCeilingSQL]'s rationale).
 func minChangeLogIDForInvisibleTxns(ctx context.Context, q settleQuerier, schema, snapText string, upperBound int64) (minID int64, found bool, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
 	var got sql.NullInt64

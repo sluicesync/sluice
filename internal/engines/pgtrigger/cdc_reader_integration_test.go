@@ -217,117 +217,14 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 	}
 }
 
-// TestCDCReader_SafetyLag_OverlappingTxns is the §2 commit-order
-// correctness pin. Two transactions overlap: tx-A allocates id=N,
-// tx-B allocates id=N+1, tx-B commits FIRST, tx-A commits SECOND.
-// A naive reader observing id=N+1 before id=N is durable would skip
-// id=N forever — the txid safety-lag query holds back id=N+1 until
-// tx-A is also visible.
-//
-// The test uses two concurrent connections so the overlap is real
-// from PG's perspective (each connection has its own snapshot).
-func TestCDCReader_SafetyLag_OverlappingTxns(t *testing.T) {
-	dsn, cleanup := startPGForTrigger(t)
-	defer cleanup()
-
-	applyPGSQL(t, dsn, `CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT);`)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"items"}, Schema: "public"}); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	e := Engine{}
-	reader, err := e.OpenCDCReader(ctx, dsn)
-	if err != nil {
-		t.Fatalf("OpenCDCReader: %v", err)
-	}
-	defer func() {
-		if c, ok := reader.(interface{ Close() error }); ok {
-			_ = c.Close()
-		}
-	}()
-
-	out, err := reader.StreamChanges(ctx, ir.Position{})
-	if err != nil {
-		t.Fatalf("StreamChanges: %v", err)
-	}
-
-	// Two overlapping txns. txA opens first (allocating id=1 in the
-	// change-log via the trigger), txB opens second (allocating
-	// id=2), txB commits FIRST, txA commits SECOND. A reader that
-	// doesn't apply the txid safety-lag would see id=2 land before
-	// id=1 in pg_class but skip id=1 forever.
-	dbA, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open A: %v", err)
-	}
-	defer func() { _ = dbA.Close() }()
-	dbB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open B: %v", err)
-	}
-	defer func() { _ = dbB.Close() }()
-
-	txA, err := dbA.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("begin A: %v", err)
-	}
-	if _, err := txA.ExecContext(ctx, `INSERT INTO items (id, label) VALUES (1, 'A')`); err != nil {
-		_ = txA.Rollback()
-		t.Fatalf("insert A: %v", err)
-	}
-
-	txB, err := dbB.BeginTx(ctx, nil)
-	if err != nil {
-		_ = txA.Rollback()
-		t.Fatalf("begin B: %v", err)
-	}
-	if _, err := txB.ExecContext(ctx, `INSERT INTO items (id, label) VALUES (2, 'B')`); err != nil {
-		_ = txA.Rollback()
-		_ = txB.Rollback()
-		t.Fatalf("insert B: %v", err)
-	}
-
-	// Commit B first; A second.
-	if err := txB.Commit(); err != nil {
-		_ = txA.Rollback()
-		t.Fatalf("commit B: %v", err)
-	}
-	// Hold A open briefly so the reader has a chance to poll
-	// without A's row visible. The safety-lag predicate should
-	// keep B's row OUT of the first poll because B's txid is
-	// still >= the snapshot's xmin (A is in-flight).
-	time.Sleep(2 * time.Second)
-	if err := txA.Commit(); err != nil {
-		t.Fatalf("commit A: %v", err)
-	}
-
-	got := drainEvents(t, out, 2, 10*time.Second)
-	if len(got) != 2 {
-		t.Fatalf("got %d events; want 2 (commit-order safety)", len(got))
-	}
-
-	// Both events must land. The order they emit in is allocation
-	// order (id ASC), but the load-bearing assertion is "no event
-	// is skipped". A naive reader would emit the 'B' event in the
-	// first poll, advance the watermark past id=1, and then skip
-	// 'A' forever.
-	labels := map[string]bool{}
-	for _, ev := range got {
-		if ins, ok := ev.(ir.Insert); ok {
-			labels[fmt.Sprint(ins.Row["label"])] = true
-		}
-	}
-	if !labels["A"] {
-		t.Errorf("missing event for tx-A (the late-committed txn) — safety-lag predicate failed")
-	}
-	if !labels["B"] {
-		t.Errorf("missing event for tx-B")
-	}
-}
+// The §2 commit-order correctness pin used to live here as
+// TestCDCReader_SafetyLag_OverlappingTxns, which constructed exactly
+// ONE orientation of the overlap (the open transaction holding both the
+// lower xid AND the lower change-log id) — the one orientation that
+// cannot expose the steady-state gap. It is superseded by
+// TestCDCReader_GapFreedom_OverlapMatrix in cdc_gapfree_integration_test.go,
+// which drives every (xid order × id order × commit order) cell against
+// real overlapping sessions and asserts COMPLETENESS of the emitted set.
 
 // TestSetup_RefusesNoPK exercises one of the §14 refuse-loudly
 // boundaries via the live preflight query. The hint string is part
