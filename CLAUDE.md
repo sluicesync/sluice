@@ -104,6 +104,28 @@ Nine instances surfaced in a single day, every one a comment or doc that was tru
 
 **The corollary, and the sharper half.** A gate can carry this defect too. Item 104's frozen-golden schema-hash test was shipped *specifically* to prevent a field addition from silently repartitioning every backup chain — and it could not, because its fixture carried the new field at its new value, a value no older binary could ever have written. It proved the current binary agrees with itself, which was never in doubt. **A fixture built from post-change values makes a gate self-referential.** When a gate exists to protect compatibility with something *older*, its fixture must be what the older thing would have produced, and the cheapest honest check is usually behavioural and cross-version rather than a hash compared against itself. What actually caught item 104 was a regression cycle asking "does the new release's output still read on the old one?"
 
+### Name the independent expected value, or say there is none (the 2026-08-01 rule)
+
+Four separate silent-loss findings in one sweep turned out to be one shape: **a verification whose "all clear" derives from the same artifact or predicate as the thing it verifies.** `verify --depth count` re-ran the very mydumper lexer that had dropped the rows, so it counted the same truncated file and reported MATCH. `backup verify` rehashed exactly the chunks the interrupted manifest listed — internally consistent, and not all of the backup. `backfill`'s completion gate rendered the same `--where` as the UPDATE, so "finished" and "the predicate never matched anything" are the same answer, and that answer authorizes dropping a column. Restore compared rows decoded *from the archive* against the row count recorded *in that archive*, never consulting the target.
+
+In every case an independent number was cheaply available and unused: the dump's own recorded count, `PartialState`, `RowsUpdated`, a post-restore `COUNT(*)`.
+
+**The rule, for the new-surface checklist and for review:** *name the independent expected value this check compares against — or state in the doc that there is none.* It costs one question at review time. It generalizes the existing "verification paths must not ride the reader under test" from **code sharing** to **evidence sharing**, which is the property that actually matters — sharing a reader is only one way to end up with no independent evidence.
+
+### Closing a class means enumerating the siblings (the sibling-sweep step)
+
+A commit whose message says it "fixes the class" must **enumerate the other implementors and state, for each, fixed-or-exempt-with-a-reason.** Not "I looked around" — the list, in the commit or the code.
+
+This is the single most expensive recurring shape in the project: a guard that reached `dispatchRow` and not `dispatchCDCRow`; a preflight closed in `restore` and left in `verifyBackupIDs`; the grow gate wired into MySQL's two write cores and only Postgres's COPY path; `flushWithReparentRetry` on the batched paths and not `LOAD DATA`; a bind-parameter clamp on two engines of three. Each was found later, by an audit, at far higher cost than the enumeration would have taken.
+
+The mechanical form is cheap and already proven here: a roster derived from the registry (`TestControlTableRoster_AllSchemaReaderDoors`), a fail-by-default divergence map (`TestMigrateSyncFlagSurfaceParity`), an AST walker with an anti-vacuity floor (`internal/errclassgate`). Prefer any of those to a promise.
+
+### A safety argument that cites an environmental fact owes that fact a check (the premise-naming step)
+
+Distinct from the unverified-invariant rule above, and with a different fix shape. When a comment or ADR justifies a **safety** argument by citing a fact about the world outside the code — `BIGSERIAL CACHE 1`, collation weights at `8.0.30`, "the VStream carrier carries DOUBLE at full precision", "PG only ever emits rectangular arrays" — that fact gets **a runtime preflight or a named test in the same PR**, or the comment says **UNVERIFIED PREMISE** in those words.
+
+The distinction matters because the remedies differ. A sibling gap closes by enumeration: mechanical, cheap, delegable. A premise gap needs someone to ask *"what would have to be true for this argument to fail, and can I make the machine assert it?"* — and in every instance found so far the answer was a sub-20-line runtime check or one binding test. Note the specific trap in the last example: two facts can each be pinned and still leave the *argument* unpinned. The VStream FLOAT carrier is pinned, and sluice's classification of it is pinned, and **nothing binds the two** — so if the carrier's behaviour changed, the exemption that depends on it would keep passing.
+
 ## Pre-release QA triggers (delta-scoped review)
 
 The periodic full audit (`C:\code\REPO_AUDIT_PROMPT.md` — a blind multi-agent fan-out) is a heavy backstop; running it every release wastes tokens re-deriving unchanged code. Instead, QA layers in three cheapest-first tiers so most of the audit's silent-loss-catching value lands per-release at a fraction of the cost.
