@@ -73,6 +73,25 @@ const (
 	// schema deltas (which bind d.Table) were already parent-bound; this
 	// closes the row-chunk gap. Everything else is byte-identical to v3.
 	//
+	// v5 (ADR-0183, audit-2026-08-01 C1): the manifest's RAW SERIALIZED
+	// `schema` BYTES are folded in. Through v4 the signature covered
+	// ZERO bytes of [Manifest.Schema] — only the recorded `schema_hash`
+	// STRING — so schema authenticity was TRANSITIVE: it held only where
+	// something recomputed the fingerprint from the schema and compared
+	// it. That recomputation is a chain-path check, so on a signed BARE
+	// FULL (the ordinary product of `backup full --encrypt --sign`)
+	// nothing authenticated the schema at all, and a store adversary
+	// could rewrite it — planting `Index.Method = "btree; CREATE ROLE
+	// attacker SUPERUSER; --"`, flipping RLS off, or dropping CHECK
+	// constraints — while the signature still verified GREEN.
+	//
+	// What is folded is the raw bytes as they appear ON DISK
+	// ([Manifest.SchemaCanonBytes]), NOT a re-marshal of the decoded
+	// [Manifest.Schema]: bytes on disk have no fingerprint epoch, so a
+	// field addition to ir.Column cannot invalidate signatures already in
+	// the field. Same rationale as the [SchemaHistoryEntry.TableJSON]
+	// fold below, which has always worked this way.
+	//
 	// The WRITER always emits the newest version (this constant); the
 	// VERIFIER is DUAL-VERSION — it recomputes at the signature's OWN
 	// recorded [ManifestSignature.CanonVersion] via
@@ -82,8 +101,16 @@ const (
 	// always reads older" invariant). v2 has NO scheme token — Phase 1 only
 	// had HMAC-off-KEK — so a v2 signature's scheme is implicitly
 	// [SignatureSchemeHMACKEK]; v3 has the scheme token but NOT the
-	// row-chunk parent-table fields.
-	ManifestCanonVersion = "sluice-manifest-canon/v4"
+	// row-chunk parent-table fields; v4 has both but no schema bytes.
+	ManifestCanonVersion = "sluice-manifest-canon/v5"
+
+	// ManifestCanonVersionV4 is the SEC-F1 (v0.99.2xx–v0.104.x) canonical
+	// serialization: the scheme token and the row-chunk parent-table
+	// fields, but the schema covered only through its recorded
+	// `schema_hash` string (the ADR-0183 gap). Preserved verbatim as
+	// ON-DISK CONTRACT so the dual-version verifier can still authenticate
+	// every chain those binaries wrote. NEVER change the v4 rendering.
+	ManifestCanonVersionV4 = "sluice-manifest-canon/v4"
 
 	// ManifestCanonVersionV3 is the Phase-2/3 (v0.99.209–21x) canonical
 	// serialization: the scheme token folded in, but row chunks flattened
@@ -243,7 +270,8 @@ func ManifestChunkCount(m *Manifest) int {
 // covers: the canon version, the signature SCHEME (the Phase 2
 // scheme-binding — see below), format version, identity (created_at /
 // source_engine / kind / backup_id), the lineage parent pointer, the
-// schema fingerprint, the resume anchors (start/end position), the
+// schema fingerprint AND (v5+, ADR-0183) the schema's raw on-disk
+// bytes, the resume anchors (start/end position), the
 // chain-encryption descriptor, the table→row-count mapping, the full
 // chunk list (row chunks by path PLUS their parent (schema, name) at v4+
 // — SEC-F1; change chunks by ordinal, because change-replay order is
@@ -290,15 +318,22 @@ type manifestCanonFeatures struct {
 	// into its token (v4+; v2/v3 flattened row chunks without it — the
 	// SEC-F1 blind spot).
 	rowChunkParentTable bool
+
+	// schemaBytes folds the manifest's RAW serialized `schema` bytes in
+	// (v5+, ADR-0183; v2/v3/v4 covered the schema only through the
+	// recorded schema_hash STRING, which authenticates nothing on a chain
+	// shape whose restore never recomputes the fingerprint).
+	schemaBytes bool
 }
 
 // manifestCanonVersions maps each SUPPORTED manifest canon version to its
 // feature set. A version absent from this map is unsupported (a newer
 // sluice wrote it) and renders [ErrUnsupportedCanonVersion].
 var manifestCanonVersions = map[string]manifestCanonFeatures{
-	ManifestCanonVersionV2: {scheme: false, rowChunkParentTable: false},
-	ManifestCanonVersionV3: {scheme: true, rowChunkParentTable: false},
-	ManifestCanonVersion:   {scheme: true, rowChunkParentTable: true},
+	ManifestCanonVersionV2: {scheme: false, rowChunkParentTable: false, schemaBytes: false},
+	ManifestCanonVersionV3: {scheme: true, rowChunkParentTable: false, schemaBytes: false},
+	ManifestCanonVersionV4: {scheme: true, rowChunkParentTable: true, schemaBytes: false},
+	ManifestCanonVersion:   {scheme: true, rowChunkParentTable: true, schemaBytes: true},
 }
 
 // CanonicalManifestBytesForVersion renders the canonical bytes at a
@@ -327,6 +362,19 @@ func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme
 	field(&b, "backup_id", m.BackupID)
 	field(&b, "parent_backup_id", m.ParentBackupID)
 	field(&b, "schema_hash", m.SchemaHash)
+	// The schema itself (v5+, ADR-0183), as the RAW on-disk bytes of the
+	// `schema` member — length-prefixed like every other token, so a `\n`
+	// or `:` inside a source-derived identifier cannot forge a boundary.
+	// [Manifest.SchemaCanonBytes] is what makes this independent of the
+	// decoded struct: the bytes a v5 signature covers are the bytes that
+	// were written, not what re-marshalling them today would produce.
+	if feat.schemaBytes {
+		raw, err := m.SchemaCanonBytes()
+		if err != nil {
+			return nil, err
+		}
+		field(&b, "schema", string(raw))
+	}
 	field(&b, "sequence", strconv.Itoa(seq))
 	field(&b, "chunk_count", strconv.Itoa(ManifestChunkCount(m)))
 	canonPosition(&b, "start_position", m.StartPosition)

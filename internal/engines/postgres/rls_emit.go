@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sqlident"
 )
 
 // emitRLSStatements renders the row-level-security DDL for a single
@@ -47,13 +48,13 @@ import (
 // have effect. The reader never produces this shape (RLSEnabled comes
 // directly from pg_class) so the inverse — Policies set but
 // RLSEnabled false — is exercised only by hand-built IR / tests.
-func emitRLSStatements(schema string, table *ir.Table) []string {
+func emitRLSStatements(schema string, table *ir.Table) ([]string, error) {
 	if table == nil {
-		return nil
+		return nil, nil
 	}
 	hasPolicies := len(table.Policies) > 0
 	if !table.RLSEnabled && !table.RLSForced && !hasPolicies {
-		return nil
+		return nil, nil
 	}
 
 	qualified := quoteIdent(schema) + "." + quoteIdent(table.Name)
@@ -71,9 +72,13 @@ func emitRLSStatements(schema string, table *ir.Table) []string {
 	}
 
 	for _, p := range table.Policies {
-		out = append(out, emitCreatePolicy(qualified, p))
+		stmt, err := emitCreatePolicy(qualified, p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, stmt)
 	}
-	return out
+	return out, nil
 }
 
 // emitCreatePolicy renders one `CREATE POLICY` statement for a single
@@ -97,13 +102,22 @@ func emitRLSStatements(schema string, table *ir.Table) []string {
 // ALL / SELECT / INSERT / UPDATE / DELETE — only the FOR keyword
 // varies. This prevents the "tested SELECT, missed UPDATE" trap the
 // ADR's test-strategy section calls out.
-func emitCreatePolicy(qualifiedTable string, p *ir.Policy) string {
+func emitCreatePolicy(qualifiedTable string, p *ir.Policy) (string, error) {
 	if p == nil {
-		return ""
+		return "", nil
 	}
 	cmd := strings.ToUpper(p.Command)
 	if cmd == "" {
 		cmd = "ALL"
+	}
+	// `FOR <command>` takes a keyword, not a quotable name — PG's grammar
+	// has exactly these five, so the allowlist IS the grammar (ADR-0183
+	// Tier 1). Checked after the upper-casing above so a lowercase source
+	// value keeps working.
+	if err := sqlident.CheckOneOf("policy command",
+		fmt.Sprintf("postgres: policy %q on %s", p.Name, qualifiedTable),
+		cmd, "ALL", "SELECT", "INSERT", "UPDATE", "DELETE"); err != nil {
+		return "", err
 	}
 	roles := p.Roles
 	if len(roles) == 0 {
@@ -137,7 +151,7 @@ func emitCreatePolicy(qualifiedTable string, p *ir.Policy) string {
 		sb.WriteByte(')')
 	}
 	sb.WriteByte(';')
-	return sb.String()
+	return sb.String(), nil
 }
 
 // formatPolicyRoles renders the `TO` role-list for CREATE POLICY.

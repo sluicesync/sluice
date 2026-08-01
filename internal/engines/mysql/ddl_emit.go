@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
+	"sluicesync.dev/sluice/internal/sqlident"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -133,7 +134,7 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Character ----
 	case ir.Char:
-		return emitCharType("CHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
+		return emitCharType("CHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation))
 	case ir.Varchar:
 		// A bounded VARCHAR(N) wider than MySQL can represent
 		// (utf8mb4's ~16383-char creatable cap, and the 65535-byte
@@ -144,11 +145,11 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 		// `varchar(16383)` Error 1118 at create-tables (catalog
 		// Bug 72). Narrow VARCHARs (the common case) are unchanged.
 		if size, downmap := mysqlTextTierForWideVarchar(v.Length); downmap {
-			return emitTextType(size, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
+			return emitTextType(size, v.Charset, m.emittableCollation(v.Charset, v.Collation))
 		}
-		return emitCharType("VARCHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
+		return emitCharType("VARCHAR", v.Length, v.Charset, m.emittableCollation(v.Charset, v.Collation))
 	case ir.Text:
-		return emitTextType(v.Size, v.Charset, m.emittableCollation(v.Charset, v.Collation)), nil
+		return emitTextType(v.Size, v.Charset, m.emittableCollation(v.Charset, v.Collation))
 
 	// ---- Binary ----
 	case ir.Binary:
@@ -377,14 +378,14 @@ func mysqlTextTierForWideVarchar(length int) (ir.TextSize, bool) {
 }
 
 // emitCharType returns CHAR(N)/VARCHAR(N) plus optional charset/collation.
-func emitCharType(prefix string, length int, charset, collation string) string {
+func emitCharType(prefix string, length int, charset, collation string) (string, error) {
 	out := fmt.Sprintf("%s(%d)", prefix, length)
 	return appendCharsetCollation(out, charset, collation)
 }
 
 // emitTextType returns the appropriate TEXT family keyword for the
 // given size, plus optional charset/collation.
-func emitTextType(size ir.TextSize, charset, collation string) string {
+func emitTextType(size ir.TextSize, charset, collation string) (string, error) {
 	var keyword string
 	switch size {
 	case ir.TextTiny:
@@ -578,9 +579,23 @@ func mysqlTableNameForLog(t *ir.Table) string {
 // a type expression when the values are non-empty. Useful for
 // character types where the charset/collation are conventionally
 // part of the type spec rather than the column-level annotations.
-func appendCharsetCollation(typeExpr, charset, collation string) string {
+// ADR-0183 Tier 1: both land BARE (`CHARACTER SET utf8mb4 COLLATE
+// utf8mb4_0900_ai_ci`), so both are shape-checked before interpolation.
+// Every real MySQL charset and collation name is a bare identifier, so
+// the check changes no emitted byte for legitimate input; what it refuses
+// is a hand-edited or tampered schema whose value carries a `;`. The
+// COLUMN is named by [mysqlEmitter.emitColumnDef]'s wrap of this error,
+// which is the only path a type expression reaches DDL through.
+func appendCharsetCollation(typeExpr, charset, collation string) (string, error) {
 	if charset == "" && collation == "" {
-		return typeExpr
+		return typeExpr, nil
+	}
+	const where = "column type"
+	if err := sqlident.Check("charset", where, charset); err != nil {
+		return "", err
+	}
+	if err := sqlident.Check("collation", where, collation); err != nil {
+		return "", err
 	}
 	var sb strings.Builder
 	sb.WriteString(typeExpr)
@@ -592,7 +607,7 @@ func appendCharsetCollation(typeExpr, charset, collation string) string {
 		sb.WriteString(" COLLATE ")
 		sb.WriteString(collation)
 	}
-	return sb.String()
+	return sb.String(), nil
 }
 
 // emitStringList formats a sequence of strings as a comma-separated

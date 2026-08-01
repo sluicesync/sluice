@@ -211,6 +211,31 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 		return fmt.Errorf("export-as-parquet: %w", err)
 	}
 
+	// 2.5. The SHARED manifest-integrity preflight list (Bug 218), the same
+	//      one restore and `backup verify` run. Export used to run the
+	//      interrupted-manifest check by itself and NEITHER recompute, on
+	//      any chain shape — the third command in the class, holding a
+	//      hand-rolled subset of the list. It now takes the list, so the
+	//      next preflight added there reaches all three or none.
+	//
+	//      needsWalk is restore's own predicate over this store, NOT `true`:
+	//      the schema-fingerprint recompute is a CHAIN-path check, and a
+	//      one-segment-no-incrementals lineage legitimately crosses a
+	//      fingerprint epoch (roadmap item 102), so forcing it on would make
+	//      export refuse bare fulls that restore accepts. That leaves the
+	//      bare full's schema authenticated by the SIGNATURE rather than by
+	//      a recompute — which is the ADR-0183 canon-v5 binding, and the
+	//      reason the fingerprint was the wrong thing to authenticate
+	//      through in the first place. On an UNSIGNED chain the schema
+	//      remains forgeable here exactly as it does for restore.
+	needsWalk, err := verifyLineageNeedsWalk(ctx, e.Store)
+	if err != nil {
+		return fmt.Errorf("export-as-parquet: resolve lineage: %w", err)
+	}
+	if err := restoreManifestIntegrityPreflights(ctx, records, needsWalk); err != nil {
+		return fmt.Errorf("export-as-parquet: %w", err)
+	}
+
 	// 3. Select the snapshot to export: the latest full, or --backup-id.
 	rec, trailingIncrementals, err := selectExportFull(records, e.BackupID)
 	if err != nil {
@@ -220,16 +245,13 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 	if manifest.Schema == nil {
 		return errors.New("export-as-parquet: selected manifest carries no schema")
 	}
-	// The third read path in the class restore and verify belong to: a
-	// snapshot whose run never finished would export a Parquet set covering
-	// only the tables the run reached, under an index claiming to be the
-	// source as of the full's snapshot position. Gated on the SELECTED full
-	// alone, because that manifest's chunks are the only ones this command
-	// reads — a trailing incremental is already outside the export (the
-	// WARN below says so).
-	if err := refuseInterruptedManifest(manifest, rec.Path); err != nil {
-		return fmt.Errorf("export-as-parquet: %w", err)
-	}
+	// The interrupted-manifest check that used to live here now runs in
+	// step 2.5 over EVERY link, via the shared list. That widens its scope
+	// from the selected full to the whole chain, deliberately: restore and
+	// verify both refuse a chain carrying an interrupted link wherever it
+	// sits, and a third command quietly holding a narrower rule is the
+	// divergence Bug 218 is about. The selected full is always in that set,
+	// so the case this command actually reads is still covered.
 	if trailingIncrementals > 0 {
 		slog.WarnContext(
 			ctx, "export-as-parquet: the chain carries incremental windows AFTER the exported snapshot; their changes are NOT in this export — the Parquet files represent the source exactly at the full's snapshot position (restore the chain and re-export for point-in-time state)",

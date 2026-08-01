@@ -27,7 +27,7 @@ import (
 // best, parse error at worst.
 func TestEmitRLSStatements_NoOpWhenNothingToEmit(t *testing.T) {
 	tbl := &ir.Table{Name: "plain"}
-	got := emitRLSStatements("public", tbl)
+	got := mustRLS(t, "public", tbl)
 	if len(got) != 0 {
 		t.Errorf("expected zero statements for plain table; got %d: %v", len(got), got)
 	}
@@ -39,7 +39,7 @@ func TestEmitRLSStatements_NoOpWhenNothingToEmit(t *testing.T) {
 // policies (PG's default with RLS on is "deny all" for non-owners).
 func TestEmitRLSStatements_EnableOnly(t *testing.T) {
 	tbl := &ir.Table{Name: "secrets", RLSEnabled: true}
-	got := emitRLSStatements("public", tbl)
+	got := mustRLS(t, "public", tbl)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 statement; got %d: %v", len(got), got)
 	}
@@ -54,7 +54,7 @@ func TestEmitRLSStatements_EnableOnly(t *testing.T) {
 // invariant explicit.
 func TestEmitRLSStatements_EnablePlusForce(t *testing.T) {
 	tbl := &ir.Table{Name: "audits", RLSEnabled: true, RLSForced: true}
-	got := emitRLSStatements("public", tbl)
+	got := mustRLS(t, "public", tbl)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 statements; got %d: %v", len(got), got)
 	}
@@ -81,7 +81,7 @@ func TestEmitRLSStatements_EmitOrder(t *testing.T) {
 			{Name: "p_two", Command: "SELECT", Permissive: true, Roles: []string{"public"}, Using: "active = true"},
 		},
 	}
-	got := emitRLSStatements("public", tbl)
+	got := mustRLS(t, "public", tbl)
 	if len(got) != 4 {
 		t.Fatalf("expected 4 statements (ENABLE + FORCE + 2 policies); got %d: %v", len(got), got)
 	}
@@ -128,7 +128,7 @@ func TestEmitCreatePolicy_CommandMatrix(t *testing.T) {
 				Roles:      []string{"public"},
 				Using:      "tenant = current_user",
 			}
-			got := emitCreatePolicy(`"public"."t"`, p)
+			got := mustPolicy(t, `"public"."t"`, p)
 			if !strings.Contains(got, tc.wantFor) {
 				t.Errorf("Command %q: emit missing %q\n got %q", tc.cmd, tc.wantFor, got)
 			}
@@ -141,13 +141,13 @@ func TestEmitCreatePolicy_CommandMatrix(t *testing.T) {
 // AS RESTRICTIVE explicitly. Pinning both branches ensures a future
 // refactor to "always emit AS X" doesn't slip through.
 func TestEmitCreatePolicy_PermissiveAndRestrictive(t *testing.T) {
-	perm := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	perm := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "ALL", Permissive: true, Roles: []string{"public"}, Using: "true",
 	})
 	if strings.Contains(perm, "AS PERMISSIVE") || strings.Contains(perm, "AS RESTRICTIVE") {
 		t.Errorf("permissive default should omit AS clause; got %q", perm)
 	}
-	restr := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	restr := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "ALL", Permissive: false, Roles: []string{"public"}, Using: "true",
 	})
 	if !strings.Contains(restr, "AS RESTRICTIVE") {
@@ -161,7 +161,7 @@ func TestEmitCreatePolicy_PermissiveAndRestrictive(t *testing.T) {
 //   - CHECK only (INSERT policies)
 //   - both USING and CHECK (UPDATE policies)
 func TestEmitCreatePolicy_UsingCheckShapes(t *testing.T) {
-	usingOnly := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	usingOnly := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "SELECT", Permissive: true,
 		Roles: []string{"public"}, Using: "owner = current_user",
 	})
@@ -172,7 +172,7 @@ func TestEmitCreatePolicy_UsingCheckShapes(t *testing.T) {
 		t.Errorf("USING-only: spurious WITH CHECK; got %q", usingOnly)
 	}
 
-	checkOnly := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	checkOnly := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "INSERT", Permissive: true,
 		Roles: []string{"public"}, Check: "owner = current_user",
 	})
@@ -183,7 +183,7 @@ func TestEmitCreatePolicy_UsingCheckShapes(t *testing.T) {
 		t.Errorf("CHECK-only: spurious USING; got %q", checkOnly)
 	}
 
-	both := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	both := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "UPDATE", Permissive: true,
 		Roles: []string{"public"},
 		Using: "owner = current_user", Check: "owner = current_user",
@@ -204,14 +204,14 @@ func TestEmitCreatePolicy_UsingCheckShapes(t *testing.T) {
 // (PG-pg_dump convention), arbitrary role names get double-quoted.
 // Multiple roles are comma-joined.
 func TestEmitCreatePolicy_RolesRendering(t *testing.T) {
-	pub := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	pub := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "ALL", Permissive: true, Roles: []string{"public"}, Using: "true",
 	})
 	if !strings.Contains(pub, "TO public ") {
 		t.Errorf("public role should emit unquoted; got %q", pub)
 	}
 
-	named := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	named := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "ALL", Permissive: true,
 		Roles: []string{"app_user", "admin"}, Using: "true",
 	})
@@ -226,7 +226,7 @@ func TestEmitCreatePolicy_RolesRendering(t *testing.T) {
 // the test covers the defensive fallback so the writer can't emit
 // `TO ` (syntax error).
 func TestEmitCreatePolicy_EmptyRolesDefaultsToPublic(t *testing.T) {
-	got := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	got := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Command: "ALL", Permissive: true, Using: "true",
 	})
 	if !strings.Contains(got, "TO public") {
@@ -239,7 +239,7 @@ func TestEmitCreatePolicy_EmptyRolesDefaultsToPublic(t *testing.T) {
 // (PG's CREATE POLICY default). Same defensive shape as the roles
 // fallback above.
 func TestEmitCreatePolicy_EmptyCommandDefaultsToAll(t *testing.T) {
-	got := emitCreatePolicy(`"public"."t"`, &ir.Policy{
+	got := mustPolicy(t, `"public"."t"`, &ir.Policy{
 		Name: "p", Permissive: true, Roles: []string{"public"}, Using: "true",
 	})
 	if !strings.Contains(got, "FOR ALL") {
@@ -252,7 +252,7 @@ func TestEmitCreatePolicy_EmptyCommandDefaultsToAll(t *testing.T) {
 // quoting, but the table reference is passed in pre-qualified by the
 // caller so quoting policy is uniform across all writer surfaces.
 func TestEmitCreatePolicy_IdentifierQuoting(t *testing.T) {
-	got := emitCreatePolicy(`"my-schema"."Audit Log"`, &ir.Policy{
+	got := mustPolicy(t, `"my-schema"."Audit Log"`, &ir.Policy{
 		Name: "Policy With Spaces", Command: "ALL", Permissive: true,
 		Roles: []string{"app-user"}, Using: "true",
 	})
@@ -301,7 +301,7 @@ func TestEmitRLSStatements_PoliciesWithoutEnableStillEnable(t *testing.T) {
 			{Name: "p", Command: "ALL", Permissive: true, Roles: []string{"public"}, Using: "true"},
 		},
 	}
-	got := emitRLSStatements("public", tbl)
+	got := mustRLS(t, "public", tbl)
 	if len(got) != 2 {
 		t.Fatalf("expected ENABLE + CREATE POLICY; got %d: %v", len(got), got)
 	}

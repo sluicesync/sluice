@@ -156,7 +156,12 @@ func TestEmitCreateSequence(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		if got := emitCreateSequence("public", c.seq); got != c.want {
+		got, err := emitCreateSequence("public", c.seq)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if got != c.want {
 			t.Errorf("%s:\n got  %s\n want %s", c.name, got, c.want)
 		}
 	}

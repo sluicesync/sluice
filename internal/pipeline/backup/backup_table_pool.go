@@ -49,7 +49,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -792,9 +791,13 @@ func (c *manifestCommitter) finalize(ctx context.Context) error {
 // commitLocked is the marshal+Put core. Callers hold mu — the marshal
 // MUST happen under the lock because it reads every worker's entry.
 func (c *manifestCommitter) commitLocked(ctx context.Context) error {
-	b, err := json.MarshalIndent(c.manifest, "", "  ")
+	// irbackup.MarshalManifest, not a bare MarshalIndent: it records the
+	// raw `schema` bytes it renders on the manifest, which is what the
+	// ADR-0183 canon-v5 signature folds. The final commit is the write
+	// the full's signature is taken over.
+	b, err := irbackup.MarshalManifest(c.manifest)
 	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
+		return err
 	}
 	return c.store.Put(ctx, lineage.ManifestFileName, bytes.NewReader(b))
 }

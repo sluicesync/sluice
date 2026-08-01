@@ -342,7 +342,11 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	// Policies + RLSEnabled=false (the common case on most schemas)
 	// is a no-op.
 	for _, table := range orderedTables(s) {
-		for _, stmt := range emitRLSStatements(w.schema, table) {
+		stmts, err := emitRLSStatements(w.schema, table)
+		if err != nil {
+			return err
+		}
+		for _, stmt := range stmts {
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: apply RLS on %q: %w", table.Name, err)
 			}
@@ -1236,10 +1240,14 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		if seq == nil {
 			continue
 		}
+		seqStmt, err := emitCreateSequence(w.schema, seq)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, ir.DDLStatement{
 			Table: seq.Name,
 			Kind:  "CREATE SEQUENCE",
-			SQL:   trimTrailingSemicolon(emitCreateSequence(w.schema, seq)),
+			SQL:   trimTrailingSemicolon(seqStmt),
 		})
 	}
 
@@ -1282,7 +1290,11 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	// Phase 1d: row-level security (ADR-0063). Same order as the
 	// apply path: ALTER ... ENABLE / FORCE before any CREATE POLICY.
 	for _, table := range orderedTables(s) {
-		for _, stmt := range emitRLSStatements(w.schema, table) {
+		stmts, err := emitRLSStatements(w.schema, table)
+		if err != nil {
+			return nil, err
+		}
+		for _, stmt := range stmts {
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  rlsStatementKind(stmt),

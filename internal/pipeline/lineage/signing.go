@@ -314,6 +314,9 @@ func ManifestSigPath(manifestPath string) string {
 // ctx is used only by the kms scheme (the KMS Sign call); HMAC/Ed25519
 // ignore it.
 func (s *Signer) SignManifest(ctx context.Context, m *irbackup.Manifest, seq int) (*irbackup.ManifestSignature, error) {
+	if err := refuseSigningInProgressManifest(m); err != nil {
+		return nil, err
+	}
 	payload, err := irbackup.CanonicalManifestBytes(m, seq, s.schemeTag())
 	if err != nil {
 		return nil, err
@@ -332,6 +335,33 @@ func (s *Signer) SignManifest(ctx context.Context, m *irbackup.Manifest, seq int
 		ChunkCount:   irbackup.ManifestChunkCount(m),
 		MAC:          hex.EncodeToString(mac),
 	}, nil
+}
+
+// refuseSigningInProgressManifest is the ORDERING INVARIANT the canonical
+// serialization's [irbackup.Manifest.PartialState] exemption rests on,
+// made checkable instead of assumed (ADR-0183 gate 1).
+//
+// PartialState is NOT folded into the signed bytes. That is only sound
+// because a signature is never produced over an in-progress manifest:
+// `backup full` flips PartialState to complete and writes it BEFORE it
+// signs (backup.go), and the incremental/stream writers build theirs
+// in-progress in memory and flip to complete before their single write.
+// With no valid signature over an in-progress manifest to start from, a
+// store adversary cannot flip in_progress→complete (there is nothing to
+// forge from) and flipping complete→in_progress lands on
+// refuseInterruptedManifest — loud either way.
+//
+// That was read off three writers and asserted nowhere, which is exactly
+// the shape of invariant this project has been bitten by. It is a guard
+// rather than a test so a FOURTH writer cannot quietly break it: sign at
+// the wrong moment and the run fails loudly instead of publishing a
+// signature whose exemption no longer holds. Pinned by
+// TestSignManifestRefusesInProgressManifest.
+func refuseSigningInProgressManifest(m *irbackup.Manifest) error {
+	if m == nil || m.PartialState != irbackup.BackupStateInProgress {
+		return nil
+	}
+	return fmt.Errorf("lineage: refusing to sign manifest with partial_state=%q — a signature is only ever taken over a COMPLETE manifest (the canonical bytes do not cover partial_state; see refuseSigningInProgressManifest)", m.PartialState)
 }
 
 // WriteManifestSig signs m at seq and writes the detached signature next

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sqlident"
 )
 
 // Standalone-sequence emission (item-51 TRIAGE finding #1, the writer
@@ -95,7 +96,11 @@ func (w *SchemaWriter) createAndPrimeSequence(ctx context.Context, seq *ir.Seque
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, emitCreateSequence(w.schema, seq)); err != nil {
+	stmt, err := emitCreateSequence(w.schema, seq)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("postgres: create sequence %q: %w", seq.Name, err)
 	}
 	if seq.LastValueValid {
@@ -235,7 +240,17 @@ func sequencePositionBehind(increment, aLV int64, aCalled bool, bLV int64, bCall
 // makes the item-51 pg_dump parity oracle read the two sides as
 // equal. `AS <type>` is emitted only when the IR carries a data type
 // and it isn't the bigint default, matching pg_dump's shape.
-func emitCreateSequence(schema string, seq *ir.Sequence) string {
+func emitCreateSequence(schema string, seq *ir.Sequence) (string, error) {
+	// `AS <type>` takes a bare type name — there is no quoted spelling PG
+	// resolves (`AS "bigint"` looks up a type literally named bigint and
+	// fails). A closed allowlist is available and is what PG itself
+	// permits here, so the refusal is exact rather than shape-based
+	// (ADR-0183 Tier 1).
+	if err := sqlident.CheckOneOf("sequence data type",
+		fmt.Sprintf("postgres: sequence %s.%s", schema, seq.Name),
+		seq.DataType, "smallint", "integer", "bigint"); err != nil {
+		return "", err
+	}
 	stmt := "CREATE SEQUENCE " + quoteIdent(schema) + "." + quoteIdent(seq.Name)
 	if seq.DataType != "" && seq.DataType != "bigint" {
 		stmt += " AS " + seq.DataType
@@ -247,7 +262,7 @@ func emitCreateSequence(schema string, seq *ir.Sequence) string {
 	} else {
 		stmt += " NO CYCLE"
 	}
-	return stmt + ";"
+	return stmt + ";", nil
 }
 
 // emitAlterSequenceOwnedBy renders the OWNED BY binding for a

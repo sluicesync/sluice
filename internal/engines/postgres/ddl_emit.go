@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
+	"sluicesync.dev/sluice/internal/sqlident"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -1337,7 +1338,12 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	}
 
 	if table.PrimaryKey != nil {
-		pk := "PRIMARY KEY " + emitIndexColumnList(table.PrimaryKey.Columns, opts)
+		pkCols, err := emitIndexColumnList(table.PrimaryKey.Columns, opts,
+			fmt.Sprintf("postgres: primary key on %s.%s", schema, table.Name))
+		if err != nil {
+			return "", err
+		}
+		pk := "PRIMARY KEY " + pkCols
 		// Roadmap item 84: carry the source's own constraint NAME when the
 		// source engine names primary keys as first-class constraints
 		// ([ir.Index.ConstraintNamed] — Postgres today). Emitted inline and
@@ -1405,10 +1411,15 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 		if err := validatePGIndexName(name, idx.Name, table.Name); err != nil {
 			return "", err
 		}
+		uniqCols, err := emitIndexColumnList(idx.Columns, opts,
+			fmt.Sprintf("postgres: inline unique key %q on %s.%s", idx.Name, schema, table.Name))
+		if err != nil {
+			return "", err
+		}
 		parts = append(parts, fmt.Sprintf(
 			"CONSTRAINT %s UNIQUE %s",
 			quoteIdent(name),
-			emitIndexColumnList(idx.Columns, opts),
+			uniqCols,
 		))
 	}
 
@@ -1448,7 +1459,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // so a MySQL-source `json_unquote(json_extract(j,'$.k'))` index
 // rewrites to `(j->>'k')` instead of failing at CREATE INDEX.
 // Same-dialect / untagged expressions pass through verbatim.
-func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
+func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string) (string, error) {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
@@ -1467,7 +1478,17 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 		// and similar) that pre-fix dropped silently into the
 		// default opclass on round-trip. Default-opclass cases on
 		// built-in types leave this empty and emit nothing extra.
+		//
+		// ADR-0183 Tier 1: the opclass lands BARE (PG's `<column>
+		// <opclass>` takes an unquoted name), so it is shape-checked
+		// before interpolation. The check is a bare-identifier test, not a
+		// known-opclass allowlist — `gin_trgm_ops`, `vector_l2_ops` and
+		// every future extension-introduced opclass must keep working;
+		// what is refused is a value carrying a quote, a space, or a `;`.
 		if c.OperatorClass != "" {
+			if err := sqlident.Check("index operator class", where, c.OperatorClass); err != nil {
+				return "", err
+			}
 			entry += " " + c.OperatorClass
 		}
 		if c.Desc {
@@ -1487,7 +1508,7 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 		}
 		parts[i] = entry
 	}
-	return "(" + strings.Join(parts, ", ") + ")"
+	return "(" + strings.Join(parts, ", ") + ")", nil
 }
 
 // translateIndexExpr returns the index expression to emit, applying
@@ -1592,12 +1613,24 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 	sb.WriteByte('.')
 	sb.WriteString(quoteIdent(tableName))
 	sb.WriteByte(' ')
+	where := fmt.Sprintf("postgres: index %q on %s.%s", idx.Name, schema, tableName)
 	if method := resolveIndexMethod(idx); method != "" {
+		// ADR-0183 Tier 1: `USING <am>` takes a bare access-method name.
+		// Shape-checked, never allowlisted — [ir.Index.Method] carries real
+		// extension-introduced methods by design (pgvector's ivfflat/hnsw
+		// under ADR-0032), and an allowlist would refuse the next one.
+		if err := sqlident.Check("index access method", where, method); err != nil {
+			return "", err
+		}
 		sb.WriteString("USING ")
 		sb.WriteString(method)
 		sb.WriteByte(' ')
 	}
-	sb.WriteString(emitIndexColumnList(idx.Columns, opts))
+	cols, err := emitIndexColumnList(idx.Columns, opts, where)
+	if err != nil {
+		return "", err
+	}
+	sb.WriteString(cols)
 	// Covering index: non-key payload columns ride in INCLUDE (...),
 	// kept distinct from the key columns above. Flattening them into
 	// the key list silently changes index semantics (catalog Bug 19b).

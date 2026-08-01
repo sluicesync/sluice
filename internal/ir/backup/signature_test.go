@@ -17,18 +17,24 @@ import (
 
 // fixedSignedManifest is a deterministic manifest exercising every field
 // the canonical serialization covers: identity, parent pointer, schema
-// hash, positions, chain-encryption (with Argon2id), a multi-table
-// row-chunk set, an ordered change-chunk list, schema deltas, and
-// schema-history entries.
+// hash, the schema itself (v5+), positions, chain-encryption (with
+// Argon2id), a multi-table row-chunk set, an ordered change-chunk list,
+// schema deltas, and schema-history entries.
 func fixedSignedManifest() *Manifest {
 	col := &ir.Column{Name: "id", Type: ir.Integer{Width: 8}}
 	tbl := &ir.Table{Name: "orders", Columns: []*ir.Column{col}}
 	tblJSON, _ := ir.MarshalTable(tbl)
+	// A SEPARATE allocation of the same shape for Manifest.Schema: sharing
+	// tbl with the SchemaDelta entry would make a test that mutates the
+	// schema also mutate the delta (which IS folded at every version), and
+	// the v4-is-schema-blind pin would read as green-for-the-wrong-reason.
+	schemaTbl := &ir.Table{Name: "orders", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 8}}}}
 	return &Manifest{
 		FormatVersion:  FormatVersionSignedManifest,
 		SluiceVersion:  "test", // NOT in the canonical bytes (informational)
 		CreatedAt:      time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
 		SourceEngine:   "postgres",
+		Schema:         &ir.Schema{Tables: []*ir.Table{schemaTbl}},
 		SchemaHash:     "abc123",
 		BackupID:       "deadbeefcafe0001",
 		ParentBackupID: "deadbeefcafe0000",
@@ -92,7 +98,7 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 		Kind:          BackupKindFull,
 	}
 	want := strings.Join([]string{
-		"24:sluice-manifest-canon/v4",
+		"24:sluice-manifest-canon/v5",
 		"6:scheme", "8:hmac-kek",
 		"14:format_version", "1:6",
 		"13:source_engine", "8:postgres",
@@ -101,6 +107,9 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 		"9:backup_id", "0:",
 		"16:parent_backup_id", "0:",
 		"11:schema_hash", "0:",
+		// A nil Schema renders as the JSON literal `null` — distinct from
+		// a document with no `schema` member at all (empty token).
+		"6:schema", "4:null",
 		"8:sequence", "1:0",
 		"11:chunk_count", "1:0",
 		"14:start_position", "0:", "0:",
@@ -114,18 +123,58 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 }
 
 // TestCanonicalManifestBytes_FullGolden pins the SHA-256 of the full
-// fixture's canonical bytes at the NEWEST canon version (v4) — a compact
+// fixture's canonical bytes at the NEWEST canon version (v5) — a compact
 // golden over every folded field, including the SEC-F1 row-chunk parent
-// (schema, name) tokens.
+// (schema, name) tokens and the ADR-0183 raw schema bytes.
 func TestCanonicalManifestBytes_FullGolden(t *testing.T) {
 	b, err := CanonicalManifestBytes(fixedSignedManifest(), 2, SignatureSchemeHMACKEK)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(b)
-	const want = "c8ae25dbf505a9a4cc49814c7078ac431d02e284627af4bbdeb17b1d467f9c64"
+	const want = "0606b0485599e921cbff3c1808ba2f60cca2959c4ae02a67b0446167e5de589a"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("full canonical SHA drift (on-disk contract): got %s want %s\n(canonical bytes:\n%q)", got, want, b)
+	}
+}
+
+// TestCanonicalManifestBytes_V4PreservedGolden is the BACK-COMPAT guard for
+// the SEC-F1 (pre-ADR-0183) canonicalization: v4 must byte-match what every
+// binary from the SEC-F1 fix through v0.104.x signed — scheme token, row
+// chunks WITH their parent (schema, name), and the schema covered ONLY
+// through the recorded schema_hash string.
+//
+// The SHA is not recomputed for this test: it is verbatim the value
+// TestCanonicalManifestBytes_FullGolden pinned when v4 WAS the newest
+// version, so a green run here proves the v5 work left the v4 rendering
+// byte-identical — including under a fixture that now carries a Schema
+// (v4 does not fold it, and must not start).
+func TestCanonicalManifestBytes_V4PreservedGolden(t *testing.T) {
+	b, err := CanonicalManifestBytesForVersion(fixedSignedManifest(), 2, ManifestCanonVersionV4, SignatureSchemeHMACKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	const wantSHA = "c8ae25dbf505a9a4cc49814c7078ac431d02e284627af4bbdeb17b1d467f9c64"
+	if got := hex.EncodeToString(sum[:]); got != wantSHA {
+		t.Fatalf("v4 canonical SHA drift — this BREAKS every chain signed before ADR-0183: got %s want %s", got, wantSHA)
+	}
+	// v4 renders NO schema token — the ADR-0183 blind spot v5 closes. Pin it
+	// directly: under v4 the canonical bytes are INVARIANT to the schema, so
+	// the demonstrated forgery (a hostile Index.Method planted into a signed
+	// manifest's schema) verifies green. This is the same shape as the v3
+	// chunk-swap pin below, and it is what keeps the v5 forgery pin in
+	// internal/pipeline/lineage non-vacuous.
+	tampered := fixedSignedManifest()
+	tampered.Schema.Tables[0].Indexes = []*ir.Index{
+		{Name: "idx", Method: `btree; CREATE ROLE attacker SUPERUSER; --`},
+	}
+	tb, err := CanonicalManifestBytesForVersion(tampered, 2, ManifestCanonVersionV4, SignatureSchemeHMACKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b, tb) {
+		t.Fatal("v4 rendering unexpectedly changed under a schema edit — v4 is defined as the pre-ADR-0183 (schema-blind) rendering")
 	}
 }
 
@@ -210,7 +259,7 @@ func TestCanonicalManifestBytes_V2PreservedGolden(t *testing.T) {
 	}
 	// An unknown (future) version is refused with ErrUnsupportedCanonVersion,
 	// NOT a silent wrong-bytes render.
-	if _, err := CanonicalManifestBytesForVersion(m, 0, "sluice-manifest-canon/v5", ""); !errors.Is(err, ErrUnsupportedCanonVersion) {
+	if _, err := CanonicalManifestBytesForVersion(m, 0, "sluice-manifest-canon/v6", ""); !errors.Is(err, ErrUnsupportedCanonVersion) {
 		t.Fatalf("future canon version: got %v, want ErrUnsupportedCanonVersion", err)
 	}
 }
@@ -259,38 +308,18 @@ func TestCanonicalManifestBytes_Injective(t *testing.T) {
 	}
 }
 
-// TestCanonicalManifestBytes_TamperSensitivity re-derives the family of
-// security-relevant fields and pins that mutating ANY of them changes the
-// canonical bytes (so the signature covers it). Pin-the-class discipline.
-func TestCanonicalManifestBytes_TamperSensitivity(t *testing.T) {
+// TestCanonicalManifestBytes_OrderSensitivity pins the two ORDER-bearing
+// properties the per-field coverage gate (manifest_canon_coverage_test.go)
+// cannot express, because they mutate no field: change-replay order is
+// semantic (ADR-0152), and the change-chunk tail is the R2 truncation
+// surface the freshness anchors exist for.
+func TestCanonicalManifestBytes_OrderSensitivity(t *testing.T) {
 	base := canon(t, fixedSignedManifest(), 2)
 	mutations := map[string]func(*Manifest){
-		"format_version": func(m *Manifest) { m.FormatVersion = 5 },
-		"source_engine":  func(m *Manifest) { m.SourceEngine = "mysql" },
-		"created_at":     func(m *Manifest) { m.CreatedAt = m.CreatedAt.Add(time.Second) },
-		"kind":           func(m *Manifest) { m.Kind = BackupKindFull },
-		"backup_id":      func(m *Manifest) { m.BackupID = "x" },
-		"parent_pointer": func(m *Manifest) { m.ParentBackupID = "x" },
-		"schema_hash":    func(m *Manifest) { m.SchemaHash = "x" },
-		"start_position": func(m *Manifest) { m.StartPosition.Token = "x" },
-		"end_position":   func(m *Manifest) { m.EndPosition.Token = "x" },
-		"row_count":      func(m *Manifest) { m.Tables[0].RowCount = 99 },
-		"row_chunk_sha":  func(m *Manifest) { m.Tables[0].Chunks[0].SHA256 = "x" },
-		// SEC-F1: reassigning a row chunk to a DIFFERENT parent table (here by
-		// swapping the two tables' Chunks slices) must change the canonical
-		// bytes — the exact cross-table corruption v4's parent-table token
-		// closes. Pre-v4 this was byte-invisible (see the v3-preserved golden).
-		"row_chunk_reassignment": func(m *Manifest) {
-			m.Tables[0].Chunks, m.Tables[1].Chunks = m.Tables[1].Chunks, m.Tables[0].Chunks
+		"change_reorder": func(m *Manifest) {
+			m.ChangeChunks[0], m.ChangeChunks[1] = m.ChangeChunks[1], m.ChangeChunks[0]
 		},
-		"chain_enc_wrap":   func(m *Manifest) { m.ChainEncryption.WrappedCEK = []byte{0x00} },
-		"argon2id_memory":  func(m *Manifest) { m.ChainEncryption.Argon2id.Memory = 1 },
-		"change_sha":       func(m *Manifest) { m.ChangeChunks[0].SHA256 = "x" },
-		"change_reorder":   func(m *Manifest) { m.ChangeChunks[0], m.ChangeChunks[1] = m.ChangeChunks[1], m.ChangeChunks[0] },
-		"truncate_tail":    func(m *Manifest) { m.ChangeChunks = m.ChangeChunks[:1] },
-		"schemadelta_kind": func(m *Manifest) { m.SchemaDelta[0].Kind = SchemaDeltaDropTable },
-		"schemadelta_tbl":  func(m *Manifest) { m.SchemaDelta[0].After.Columns[0].Type = ir.Text{} },
-		"schemahistory":    func(m *Manifest) { m.SchemaHistory[0].TableJSON = []byte("{}") },
+		"truncate_tail": func(m *Manifest) { m.ChangeChunks = m.ChangeChunks[:1] },
 	}
 	for name, mut := range mutations {
 		m := fixedSignedManifest()
@@ -298,16 +327,6 @@ func TestCanonicalManifestBytes_TamperSensitivity(t *testing.T) {
 		if canon(t, m, 2) == base {
 			t.Errorf("mutation %q did not change the canonical bytes (field is NOT under the signature)", name)
 		}
-	}
-	// Sequence is a signed freshness anchor.
-	if canon(t, fixedSignedManifest(), 3) == base {
-		t.Error("sequence change did not alter the canonical bytes")
-	}
-	// The informational SluiceVersion is NOT signed.
-	m := fixedSignedManifest()
-	m.SluiceVersion = "different"
-	if canon(t, m, 2) != base {
-		t.Error("SluiceVersion (informational) unexpectedly changed the canonical bytes")
 	}
 }
 
@@ -412,7 +431,7 @@ func TestCanonicalManifestBytes_NilEntriesNoPanic(t *testing.T) {
 			mut(m)
 			// Recompute at every SUPPORTED version — the nil-skip must hold
 			// across the whole dual-version matrix, not just the newest.
-			for _, v := range []string{ManifestCanonVersionV2, ManifestCanonVersionV3, ManifestCanonVersion} {
+			for _, v := range []string{ManifestCanonVersionV2, ManifestCanonVersionV3, ManifestCanonVersionV4, ManifestCanonVersion} {
 				b, err := CanonicalManifestBytesForVersion(m, 0, v, SignatureSchemeHMACKEK)
 				if err != nil {
 					t.Fatalf("version %s: unexpected error %v (must not fail, just skip nils)", v, err)

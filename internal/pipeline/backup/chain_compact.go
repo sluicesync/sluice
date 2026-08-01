@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1010,7 +1009,10 @@ func executeMergeGroup(
 			prevLinkID = lineage.ManifestBackupID(im)
 			newPath := fmt.Sprintf("%sincr-%05d-%s.json",
 				lineage.IncrementalManifestPrefix, incrCount, lineage.ManifestBackupID(im))
-			b, err := json.MarshalIndent(im, "", "  ")
+			// irbackup.MarshalManifest records the raw `schema` bytes it
+			// renders on im — the compact/prune re-sign that follows folds
+			// them (ADR-0183 canon v5).
+			b, err := irbackup.MarshalManifest(im)
 			if err != nil {
 				return fmt.Errorf("marshal staged incremental manifest: %w", err)
 			}

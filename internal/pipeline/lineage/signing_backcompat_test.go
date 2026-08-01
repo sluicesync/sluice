@@ -100,7 +100,7 @@ func TestVerifyManifest_FutureVersionUpgrade(t *testing.T) {
 	m := testManifest()
 	// A well-formed sig envelope claiming a future canon version.
 	sig := &irbackup.ManifestSignature{
-		CanonVersion: "sluice-manifest-canon/v5",
+		CanonVersion: "sluice-manifest-canon/v6",
 		Scheme:       irbackup.SignatureSchemeHMACKEK,
 		KeyID:        s.KeyID,
 		Sequence:     0,

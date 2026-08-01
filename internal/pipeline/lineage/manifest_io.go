@@ -60,9 +60,9 @@ func isIncrementalManifestPath(path string) bool {
 // path. The full-backup writer's [WriteManifest] hard-codes
 // [ManifestFileName]; the incremental writer needs an arbitrary path.
 func WriteManifestAt(ctx context.Context, store irbackup.Store, path string, manifest *irbackup.Manifest) error {
-	b, err := json.MarshalIndent(manifest, "", "  ")
+	b, err := irbackup.MarshalManifest(manifest)
 	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
+		return err
 	}
 	return store.Put(ctx, path, bytes.NewReader(b))
 }
@@ -162,9 +162,9 @@ func ReadManifestAt(ctx context.Context, store irbackup.Store, path string) (*ir
 // WriteManifest serialises manifest as indented JSON and writes it to
 // the conventional [ManifestFileName] path.
 func WriteManifest(ctx context.Context, store irbackup.Store, manifest *irbackup.Manifest) error {
-	b, err := json.MarshalIndent(manifest, "", "  ")
+	b, err := irbackup.MarshalManifest(manifest)
 	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
+		return err
 	}
 	return store.Put(ctx, ManifestFileName, bytes.NewReader(b))
 }

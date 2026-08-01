@@ -146,6 +146,7 @@ const (
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
+	CodeSchemaIdentifierInvalid   Code = "SLUICE-E-SCHEMA-IDENTIFIER-INVALID"
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
 	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
 	CodeValueUnrepresentable      Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
@@ -367,6 +368,7 @@ var registry = map[Code]Info{
 
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
+	CodeSchemaIdentifierInvalid:    {ClassRefusal, "a schema value bound for a DDL position that takes a BARE (unquotable) identifier — index access method, operator class, sequence data type, RLS policy command, MySQL charset/collation — is not a bare identifier or not an accepted keyword; refused rather than interpolated, because at those positions a `;` in the value is a second statement"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},

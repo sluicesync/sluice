@@ -239,6 +239,10 @@ var docRows = map[Code]docRow{
 		Meaning: "A column's type is owned by a PostgreSQL extension the operator has not opted into.",
 		Remedy:  "Pass `--enable-pg-extension <ext>`; see [type-mapping](../type-mapping.md).",
 	},
+	"SLUICE-E-SCHEMA-IDENTIFIER-INVALID": {
+		Meaning: "A schema value bound for one of the DDL positions that take a BARE, unquotable identifier — an index access method (`USING <am>`), an index operator class, a sequence data type (`AS <type>`), an RLS policy command (`FOR <command>`), or a MySQL charset/collation — is not a bare identifier (or, for the keyword positions, not one of the accepted values). Everywhere else a name is quoted and a hostile value is inert; at these positions it is not, and because sluice runs DDL with no bind parameters the driver uses the simple protocol, where a `;` in the value starts a second statement. Real values (`btree`, `ivfflat`, `hnsw`, `gin_trgm_ops`, `utf8mb4_0900_ai_ci`) always pass, so this fires on a hand-edited schema, a foreign catalog, or a tampered backup manifest.",
+		Remedy:  "Correct the value at the named object in the source schema (or the backup manifest it was read from) and re-run; there is deliberately no flag to emit it anyway. If it came from a backup, treat the manifest as suspect — sign chains (`--sign`/`--sign-key` plus `--require-signature`) so a schema edit is caught at verify time rather than at DDL time.",
+	},
 	"SLUICE-E-SCHEMA-PERMISSION-DENIED": {
 		Meaning: "The target role lacks CREATE on the schema.",
 		Remedy:  "GRANT the privilege or use a different role.",

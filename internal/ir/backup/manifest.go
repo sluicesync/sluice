@@ -29,7 +29,10 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"time"
 
@@ -725,6 +728,110 @@ type Manifest struct {
 	// [ChainEncryption] to set up the [crypto.EnvelopeEncryption] used
 	// to decrypt every chunk in the chain.
 	ChainEncryption *ChainEncryption `json:"chain_encryption,omitempty"`
+
+	// rawSchema is the serialized bytes of THIS manifest's `schema`
+	// member, compacted (insignificant whitespace removed), captured at
+	// the JSON boundary: on decode from the document that was read, and
+	// in [MarshalManifest] from the document that is written. It is what
+	// the ADR-0183 canon-v5 signature folds — the bytes on disk, never a
+	// re-marshal of the decoded [Manifest.Schema].
+	//
+	// A re-marshal would put the schema binding back on the wrong side of
+	// a fingerprint epoch, in a worse form than the schema_hash binding
+	// it replaces: adding a field to ir.Column — or reading a manifest an
+	// OLDER binary wrote carrying a field this build's structs no longer
+	// have — changes the re-marshalled bytes, so a routine field addition
+	// would invalidate every v5 signature in the field at once. Bytes on
+	// disk have no epoch. This is the same reason
+	// [SchemaHistoryEntry.TableJSON] is folded verbatim (signature.go).
+	//
+	// Unexported on purpose: it is DERIVED from the on-disk shape, not
+	// part of it, so it must never be marshalled back out. Every consumer
+	// keeps reading the decoded [Manifest.Schema]; canonicalization is
+	// the only reader of this field.
+	rawSchema json.RawMessage
+}
+
+// UnmarshalJSON decodes a manifest and captures the raw bytes of its
+// `schema` member (see [Manifest.rawSchema]). It is the single capture
+// point on the read side: every manifest reader in the product decodes
+// through encoding/json, so no caller opts in and none can forget.
+func (m *Manifest) UnmarshalJSON(data []byte) error {
+	// manifestFields drops the method set, so the decode below cannot
+	// recurse back into this function.
+	type manifestFields Manifest
+	var f manifestFields
+	if err := json.Unmarshal(data, &f); err != nil {
+		return err
+	}
+	*m = Manifest(f)
+	return m.captureRawSchema(data)
+}
+
+// MarshalManifest renders m in the on-disk manifest form AND records the
+// raw `schema` bytes it just produced on m, so a signature taken after
+// this call folds exactly the bytes a reader decoding the written object
+// will fold back. Every manifest write goes through here; a writer that
+// marshalled the manifest itself would sign one rendering and store
+// another (pinned by TestManifestSchemaBytesWriteReadRoundTrip).
+func MarshalManifest(m *Manifest) ([]byte, error) {
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("backup: marshal manifest: %w", err)
+	}
+	if err := m.captureRawSchema(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// captureRawSchema records the `schema` member of doc — the serialized
+// manifest document these bytes belong to — on m, COMPACTED.
+//
+// Compaction is what makes the capture independent of the document's
+// INDENTATION: the writer renders indented JSON, so the raw sub-slice of
+// the `schema` member carries the writer's indentation, while an
+// in-memory manifest that never crossed the JSON boundary falls back to
+// a compact marshal ([Manifest.SchemaCanonBytes]). Whitespace BETWEEN
+// JSON tokens carries no information, and json.Compact removes exactly
+// that and nothing else — so the three renderings (write, read-back,
+// in-memory fallback) fold identical bytes.
+func (m *Manifest) captureRawSchema(doc []byte) error {
+	var probe struct {
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := json.Unmarshal(doc, &probe); err != nil {
+		return fmt.Errorf("backup: capture manifest schema bytes: %w", err)
+	}
+	if probe.Schema == nil {
+		// No `schema` member at all (a hand-built or truncated document).
+		// Distinguishable from `"schema": null`, which captures as "null".
+		m.rawSchema = nil
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, probe.Schema); err != nil {
+		return fmt.Errorf("backup: compact manifest schema bytes: %w", err)
+	}
+	m.rawSchema = buf.Bytes()
+	return nil
+}
+
+// SchemaCanonBytes returns the bytes the ADR-0183 canon-v5 signature
+// folds for this manifest's schema: the captured on-disk bytes when the
+// manifest has crossed the JSON boundary in either direction, else a
+// compact marshal of the decoded [Manifest.Schema] for an in-memory
+// manifest that has not. The two coincide by construction — see
+// [Manifest.captureRawSchema].
+func (m *Manifest) SchemaCanonBytes() ([]byte, error) {
+	if m.rawSchema != nil {
+		return m.rawSchema, nil
+	}
+	b, err := json.Marshal(m.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("backup: marshal manifest schema for canonicalization: %w", err)
+	}
+	return b, nil
 }
 
 // SchemaHistoryAnchors reports whether any SchemaHistory entry is anchored
