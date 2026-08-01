@@ -1126,7 +1126,10 @@ func TestEmitTableDef_CheckConstraints(t *testing.T) {
 
 func TestEmitCreateEnumType(t *testing.T) {
 	// MySQL-source enum (no type name) → synthesized table+column name.
-	got := emitCreateEnumType(ir.Enum{Values: []string{"admin", "user", "guest"}}, "public", "users", "role")
+	got, err := emitCreateEnumType(ir.Enum{Values: []string{"admin", "user", "guest"}}, "public", "users", "role")
+	if err != nil {
+		t.Fatalf("emitCreateEnumType: %v", err)
+	}
 	want := `CREATE TYPE "public"."users_role_enum" AS ENUM ('admin', 'user', 'guest');`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -1137,10 +1140,13 @@ func TestEmitCreateEnumType(t *testing.T) {
 // name; it must round-trip verbatim instead of being renamed to the
 // synthesized <table>_<col>_enum.
 func TestEmitCreateEnumType_PreservesSourceTypeName(t *testing.T) {
-	got := emitCreateEnumType(
+	got, err := emitCreateEnumType(
 		ir.Enum{Values: []string{"draft", "published", "archived", "deleted"}, TypeName: "post_status"},
 		"public", "posts", "status",
 	)
+	if err != nil {
+		t.Fatalf("emitCreateEnumType: %v", err)
+	}
 	want := `CREATE TYPE "public"."post_status" AS ENUM ('draft', 'published', 'archived', 'deleted');`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -1154,7 +1160,10 @@ func TestEmitCreateEnumType_PreservesSourceTypeName(t *testing.T) {
 // DO block swallowing duplicate_object. This pins the wrapper shape; the
 // integration test pins the behavior (create twice → no error).
 func TestGuardedCreateEnumType_WrapsInDuplicateObjectGuard(t *testing.T) {
-	bare := emitCreateEnumType(ir.Enum{Values: []string{"a", "b"}}, "public", "t", "c")
+	bare, err := emitCreateEnumType(ir.Enum{Values: []string{"a", "b"}}, "public", "t", "c")
+	if err != nil {
+		t.Fatalf("emitCreateEnumType: %v", err)
+	}
 	got := guardedCreateEnumType(bare)
 	want := `DO $$ BEGIN ` + bare + ` EXCEPTION WHEN duplicate_object THEN NULL; END $$;`
 	if got != want {

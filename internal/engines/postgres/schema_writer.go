@@ -223,6 +223,14 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if err := w.ensureSchema(ctx); err != nil {
 		return err
 	}
+	// Phase 0: prove the source's index names map injectively onto the
+	// per-schema Postgres index namespace before anything is created.
+	// emitTableDef re-checks per table (it is the chokepoint every path
+	// funnels through); this call is what sees CROSS-table collisions,
+	// which are the same silent `CREATE INDEX IF NOT EXISTS` no-op.
+	if err := validatePGIndexNamespace(orderedTables(s)); err != nil {
+		return err
+	}
 
 	// Phase 1a: enum types. We walk all columns and emit one
 	// CREATE TYPE per enum *type*. A MySQL source has no enum type
@@ -246,6 +254,10 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 				continue
 			}
 			createdEnumTypes[typeName] = struct{}{}
+			create, err := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
+			if err != nil {
+				return err
+			}
 			// Bug 154: guard the CREATE TYPE so a resumed/restarted
 			// cold-start (interrupted after this CREATE but before the
 			// migration committed) re-runs idempotently instead of
@@ -254,7 +266,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			// progress. PG has no `CREATE TYPE IF NOT EXISTS`; the
 			// DO-block guard (shared with the CDC forward path via
 			// guardedCreateEnumType) swallows duplicate_object.
-			stmt := guardedCreateEnumType(emitCreateEnumType(enum, w.schema, table.Name, col.Name))
+			stmt := guardedCreateEnumType(create)
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: create enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
@@ -1202,6 +1214,12 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	if s == nil {
 		return nil, errors.New("postgres: PreviewDDL: schema is nil")
 	}
+	// Same Phase-0 namespace proof the apply path runs, so `schema
+	// preview` surfaces a collision BEFORE the operator schedules the
+	// migration rather than at apply time.
+	if err := validatePGIndexNamespace(orderedTables(s)); err != nil {
+		return nil, err
+	}
 
 	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
 	opts := w.emitOpts()
@@ -1224,10 +1242,14 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 				continue
 			}
 			previewedEnumTypes[typeName] = struct{}{}
+			create, err := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  "CREATE TYPE",
-				SQL:   trimTrailingSemicolon(emitCreateEnumType(enum, w.schema, table.Name, col.Name)),
+				SQL:   trimTrailingSemicolon(create),
 			})
 		}
 	}
@@ -1586,6 +1608,14 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 	if len(indexes) == 0 {
 		return nil
 	}
+	// This path promotes to IF NOT EXISTS too, so two of the passed
+	// indexes collapsing to one identifier lose one build SILENTLY —
+	// the same class the cold-start namespace proof refuses. Scoped to
+	// the delta's own set; a collision against an index already on the
+	// target is the diff's business, not this loop's.
+	if err := validatePGIndexNamespace([]*ir.Table{{Name: table.Name, Indexes: indexes}}); err != nil {
+		return err
+	}
 	for _, idx := range indexes {
 		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
 			continue
@@ -1697,7 +1727,11 @@ func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col 
 	if !ok || col.IsGenerated() {
 		return nil
 	}
-	stmt := guardedCreateEnumType(emitCreateEnumType(enum, w.schema, table.Name, col.Name))
+	create, err := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
+	if err != nil {
+		return err
+	}
+	stmt := guardedCreateEnumType(create)
 	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("ensure enum type for %s.%s.%s: %w", w.schema, table.Name, col.Name, err)
 	}

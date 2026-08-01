@@ -716,6 +716,18 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	if c == nil {
 		return "", errors.New("postgres: emitColumnDef: column is nil")
 	}
+	// pg_attribute names are NAMEDATALEN-limited like every other
+	// identifier: PG truncates a >63-byte column name at CREATE, and two
+	// source columns sharing their first 63 bytes then collide — the
+	// second one either errors deep in the CREATE or, on the ALTER ADD
+	// COLUMN path, lands writes on the wrong column.
+	owner := ""
+	if table != nil {
+		owner = table.Name
+	}
+	if err := validatePGIdentifier("column", c.Name, c.Name, owner); err != nil {
+		return "", err
+	}
 
 	var typeStr string
 	if enum, isEnum := c.Type.(ir.Enum); isEnum {
@@ -1081,53 +1093,179 @@ func pgIndexName(tableName, sourceName string) string {
 	return full
 }
 
-// validatePGIndexName refuses an effective PG index identifier that
-// exceeds PostgreSQL's 63-byte NAMEDATALEN-1 ceiling (roadmap item 43,
-// the `pgIndexName` >63-byte latent silent-collapse class flagged in the
-// Bug #114 RCA).
+// validatePGIdentifier refuses an effective PG identifier that exceeds
+// PostgreSQL's 63-byte NAMEDATALEN-1 ceiling (roadmap item 43, the
+// `pgIndexName` >63-byte latent silent-collapse class flagged in the
+// Bug #114 RCA — generalised past index names to every emitted
+// identifier).
 //
-// Why this is a value-fidelity issue: PG silently TRUNCATES any
-// identifier longer than 63 BYTES at CREATE time. Two distinct indexes
-// whose names share the same first 63 bytes both truncate to the same
-// catalog identifier — and because sluice emits `CREATE INDEX IF NOT
-// EXISTS` ([SchemaWriter.buildOneIndex]), the second create silently
-// no-ops. Result: an index the source declared is silently MISSING on
-// the target. No error, no row-data loss, but a missing index is a
-// silent schema-fidelity loss. Per the "contain Postgres complexity,
-// surface explicitly" tenet the safe behaviour is to fail loudly here
-// rather than auto-truncate or auto-rename (either would silently
-// transform the operator's schema).
+// Why this is a fidelity issue: PG silently TRUNCATES any identifier
+// longer than 63 BYTES at CREATE time. Two distinct objects whose names
+// share the same first 63 bytes both truncate to the same catalog
+// identifier — and because sluice emits the `IF NOT EXISTS` form for
+// both indexes ([SchemaWriter.buildOneIndex]) and tables
+// ([emitTableDef]), the second create silently no-ops. For an index that
+// means an index the source declared is silently MISSING on the target;
+// for a TABLE it is far worse — the second CREATE TABLE resolves onto
+// the first relation, and the subsequent COPY (whose target name
+// truncates identically) lands table 2's rows INSIDE table 1. A SQLite/
+// D1 source imposes no identifier-length limit of its own, so it can
+// hand the writer exactly that pair. Per the "contain Postgres
+// complexity, surface explicitly" tenet the safe behaviour is to fail
+// loudly here rather than auto-truncate or auto-rename (either would
+// silently transform the operator's schema).
 //
 // The limit is BYTES, not runes: PG counts bytes against NAMEDATALEN, so
 // a multibyte UTF-8 name whose rune count is <=63 but whose byte length
 // is >63 still truncates. Go's len() on a string is the byte count, so
 // the check is byte-correct as written.
 //
-// effectiveName is the identifier pgIndexName resolved (either the
-// table-prefixed form or a verbatim source name); sourceName and
-// tableName are carried only for an actionable error message. Names
-// <=63 bytes pass through unchanged (no behaviour change).
+// kind names the object class for the message ("index", "table",
+// "column", …); effectiveName is the identifier sluice resolved (a
+// transformed form such as pgIndexName's table-prefixed name, or the
+// verbatim source name); sourceName and owner are carried only for an
+// actionable error message. Names <=63 bytes pass through unchanged (no
+// behaviour change).
 //
-// Note on same-prefix collisions among <=63-byte names: two index names
-// that both already fit 63 bytes cannot share a 63-byte truncation
-// prefix unless they are byte-identical for their full length — in which
-// case they are the SAME catalog identifier and the IR carries one, not
-// two (index names are unique per table on every source engine sluice
-// reads). The only way two DISTINCT indexes collide on a 63-byte prefix
-// is if at least one exceeds 63 bytes, which this refusal already
-// catches. So the >63-byte refusal is sufficient to close the collision
-// class; no separate same-prefix check is needed.
-func validatePGIndexName(effectiveName, sourceName, tableName string) error {
+// This closes the >63-byte TRUNCATION collision class ONLY. Two names
+// that both fit 63 bytes cannot collide by truncation — but they can
+// collide by TRANSFORMATION, which is a different class this check
+// cannot see and does not claim to: [pgIndexName] is not injective
+// (`("posts","user_id")` and `("posts","posts_user_id")` both render
+// `posts_user_id`), so two <=63-byte source names can still land on one
+// catalog identifier. That class is closed by
+// [validatePGIndexNamespace], which compares the EFFECTIVE names sluice
+// will actually emit. (An earlier revision of this comment argued no
+// same-prefix check was needed because two fitting names cannot share a
+// 63-byte prefix unless byte-identical. That is true of truncation and
+// blind to transformation — it is precisely the reasoning that let the
+// silent no-op through, so it is recorded here rather than deleted.)
+func validatePGIdentifier(kind, effectiveName, sourceName, owner string) error {
 	if len(effectiveName) <= maxPGIdentifierLen {
 		return nil
 	}
-	return fmt.Errorf(
-		"postgres: index name %q on table %q is %d bytes, exceeding PostgreSQL's %d-byte identifier limit; "+
-			"PostgreSQL would silently truncate it, risking a collision with another index that shares the "+
-			"same first %d bytes (the second CREATE INDEX IF NOT EXISTS would silently no-op, leaving the "+
-			"index missing) — shorten or alias the source index name (source name: %q) to %d bytes or fewer",
-		effectiveName, tableName, len(effectiveName), maxPGIdentifierLen, maxPGIdentifierLen, sourceName, maxPGIdentifierLen,
+	return sluicecode.Wrap(
+		sluicecode.CodeSchemaIdentifierTooLong,
+		fmt.Sprintf("shorten or alias the source name to %d bytes or fewer, then re-run", maxPGIdentifierLen),
+		fmt.Errorf(
+			"postgres: %s name %q on %q is %d bytes, exceeding PostgreSQL's %d-byte identifier limit; "+
+				"PostgreSQL would silently truncate it, colliding with any sibling that shares the same "+
+				"first %d bytes — and because sluice emits the IF NOT EXISTS form, that second CREATE "+
+				"silently no-ops (a missing index, or a second table whose rows land in the first) — "+
+				"shorten or alias the source %s name (source name: %q) to %d bytes or fewer",
+			kind, effectiveName, owner, len(effectiveName), maxPGIdentifierLen,
+			maxPGIdentifierLen, kind, sourceName, maxPGIdentifierLen,
+		),
 	)
+}
+
+// validatePGIndexName is the index-position spelling of
+// [validatePGIdentifier], kept as a named helper because the index
+// namespace is where the refusal originated (roadmap item 43) and the
+// three index call sites read better without the literal kind argument.
+func validatePGIndexName(effectiveName, sourceName, tableName string) error {
+	return validatePGIdentifier("index", effectiveName, sourceName, tableName)
+}
+
+// effectivePGIndexIdent returns the pg_class relation name sluice will
+// ACTUALLY create for one of a table's indexes — the single source of
+// truth the emitters and [validatePGIndexNamespace] must agree on.
+//
+// A constraint-backed unique index is re-created by [CreateConstraints]
+// as `ALTER TABLE … ADD CONSTRAINT <source name>` (verbatim, so
+// `ON CONFLICT ON CONSTRAINT` keeps working); everything else goes
+// through [pgIndexName]'s table-scoping transformation.
+func effectivePGIndexIdent(tableName string, idx *ir.Index) string {
+	if idx.ConstraintBacked {
+		return idx.Name
+	}
+	return pgIndexName(tableName, idx.Name)
+}
+
+// validatePGIndexNamespace refuses a schema whose source indexes do NOT
+// map injectively onto the Postgres index namespace — two distinct
+// source indexes that resolve to ONE catalog identifier.
+//
+// Why this is a silent-loss refusal and not a rename: [pgIndexName] is a
+// transformation, not an escape. `("posts", "user_id")` prepends to
+// `posts_user_id`, and `("posts", "posts_user_id")` is already
+// table-prefixed so it emits verbatim as `posts_user_id` — the same
+// name. Index names are TABLE-scoped on MySQL (which auto-names a
+// single-column index after its column, making that exact pair routine)
+// and SCHEMA-scoped on Postgres, so the pair is reachable from either
+// source engine. The index build then emits `CREATE INDEX IF NOT EXISTS`
+// (load-bearing for the ADR-0114 whole-phase reparent retry — see
+// [SchemaWriter.buildOneIndex]), so the SECOND build is a silent no-op:
+// the target keeps whichever index sorted first and permanently loses
+// the other. When the loser is the UNIQUE one, the target admits
+// duplicate rows the source rejects, forever, with exit 0.
+//
+// sluice refuses instead of auto-renaming because a silently renamed
+// index is its own surprise (application code, `pg_dump` diffs and
+// `ON CONFLICT ON CONSTRAINT` all name indexes), and because the
+// operator genuinely needs to know their source carries two indexes
+// sluice cannot tell apart on the target.
+//
+// The namespace is pg_class-wide per schema, so callers pass the WHOLE
+// table set where they have it ([SchemaWriter.CreateTablesWithoutConstraints],
+// [SchemaWriter.PreviewDDL] — a cross-table collision like table `a`'s
+// index `b_c` versus table `a_b`'s index `c` is the same silent no-op)
+// and a single-element slice where they don't ([emitTableDef]).
+func validatePGIndexNamespace(tables []*ir.Table) error {
+	type origin struct{ table, index string }
+	seen := make(map[string]origin)
+	claim := func(ident string, o origin) error {
+		prior, dup := seen[ident]
+		if !dup {
+			seen[ident] = o
+			return nil
+		}
+		return sluicecode.Wrap(
+			sluicecode.CodeSchemaIndexNameCollision,
+			"rename one of the two source indexes so they no longer collapse to the same Postgres name, then re-run",
+			fmt.Errorf(
+				"postgres: index-name collision: source index %q on table %q and source index %q on table %q "+
+					"both resolve to the Postgres identifier %q; Postgres index names are schema-scoped and "+
+					"sluice emits CREATE INDEX IF NOT EXISTS, so the second build would SILENTLY no-op and "+
+					"that index would be missing on the target (if it is the UNIQUE one, the target would "+
+					"accept duplicate rows the source rejects) — rename one of the two source indexes",
+				prior.index, prior.table, o.index, o.table, ident,
+			),
+		)
+	}
+	for _, table := range tables {
+		if table == nil {
+			continue
+		}
+		// A source-named PRIMARY KEY constraint takes its name in the same
+		// per-schema relation namespace (its backing index is a pg_class
+		// row), and emitTableDef emits it verbatim.
+		if pk := table.PrimaryKey; pk != nil && pk.ConstraintNamed && pk.Name != "" {
+			if err := claim(pk.Name, origin{table: table.Name, index: pk.Name + " (primary key)"}); err != nil {
+				return err
+			}
+		}
+		for _, idx := range table.Indexes {
+			switch {
+			case idx == nil, idx.Name == "":
+				// An unnamed index is auto-named by PG; nothing to collide.
+				continue
+			case strings.EqualFold(idx.Name, "PRIMARY"):
+				// MySQL's PK index; emitted inline by emitTableDef, never as
+				// a CREATE INDEX (emitCreateIndex refuses it outright).
+				continue
+			}
+			if _, portable := sqliteIndexPortablePG(idx); !portable {
+				// ADR-0133 follow-up: emitCreateIndex WARN-skips this index
+				// entirely, so it never reaches the namespace.
+				continue
+			}
+			if err := claim(effectivePGIndexIdent(table.Name, idx), origin{table: table.Name, index: idx.Name}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // emitCreateDomainType produces a CREATE DOMAIN statement for a single
@@ -1170,7 +1308,19 @@ func emitCreateDomainType(d ir.Domain, schema string, opts emitOpts) (string, er
 // emitCreateEnumType produces a CREATE TYPE statement for a single
 // enum, named by the table+column generator. Values are quoted and
 // comma-separated.
-func emitCreateEnumType(enum ir.Enum, schema, tableName, columnName string) string {
+//
+// The type name is length-validated because the MySQL-source fallback
+// SYNTHESIZES it (`<table>_<column>_enum`, [enumTypeName]) from two
+// names that individually fit 63 bytes and together need not — and
+// [guardedCreateEnumType] swallows `duplicate_object`, so a truncated
+// name silently binds the second column to the FIRST column's enum type
+// and every value outside that list fails at COPY time (or, when the
+// lists overlap, lands wrong values with no error at all).
+func emitCreateEnumType(enum ir.Enum, schema, tableName, columnName string) (string, error) {
+	typeName := resolveEnumTypeName(enum, tableName, columnName)
+	if err := validatePGIdentifier("enum type", typeName, typeName, tableName+"."+columnName); err != nil {
+		return "", err
+	}
 	parts := make([]string, len(enum.Values))
 	for i, v := range enum.Values {
 		parts[i] = quoteSQLString(v)
@@ -1178,9 +1328,9 @@ func emitCreateEnumType(enum ir.Enum, schema, tableName, columnName string) stri
 	return fmt.Sprintf(
 		"CREATE TYPE %s.%s AS ENUM (%s);",
 		quoteIdent(schema),
-		quoteIdent(resolveEnumTypeName(enum, tableName, columnName)),
+		quoteIdent(typeName),
 		strings.Join(parts, ", "),
-	)
+	), nil
 }
 
 // emitCommentStatements returns the COMMENT ON TABLE / COMMENT ON
@@ -1255,6 +1405,25 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	}
 	if len(table.Columns) == 0 {
 		return "", fmt.Errorf("postgres: emitTableDef: table %q has no columns", table.Name)
+	}
+	// The table name lands in the same 63-byte-limited pg_class namespace
+	// as its indexes, and `CREATE TABLE IF NOT EXISTS` below makes an
+	// over-length name's truncation collision SILENT: the second table
+	// resolves onto the first, and the COPY that follows (whose target
+	// name truncates identically) lands its rows in the first table.
+	// SQLite/D1 sources impose no length limit of their own, so this is
+	// reachable, not theoretical.
+	if err := validatePGIdentifier("table", table.Name, table.Name, schema); err != nil {
+		return "", err
+	}
+	// Two source indexes on this table that collapse to one Postgres
+	// identifier would lose one build to `CREATE INDEX IF NOT EXISTS`,
+	// silently. Refused here — the earliest chokepoint every apply and
+	// preview path funnels through — so nothing is copied first. The
+	// whole-schema (cross-table) sweep runs in the callers that hold the
+	// full table set.
+	if err := validatePGIndexNamespace([]*ir.Table{table}); err != nil {
+		return "", err
 	}
 
 	parts := make([]string, 0, len(table.Columns)+2)
@@ -1787,6 +1956,12 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 		return "", fmt.Errorf("postgres: emitAddForeignKey: fk %q column count mismatch (%d vs %d)",
 			fk.Name, len(fk.Columns), len(fk.ReferencedColumns))
 	}
+	// A constraint name shares pg_constraint's 63-byte ceiling; a
+	// truncated one collides with a sibling and the ADD fails with an
+	// opaque duplicate-name error naming a name the operator never wrote.
+	if err := validatePGIdentifier("foreign key constraint", fk.Name, fk.Name, childTable); err != nil {
+		return "", err
+	}
 
 	refSchema := fk.ReferencedSchema
 	if refSchema == "" {
@@ -1933,6 +2108,14 @@ func emitAddUniqueConstraint(schema, tableName string, idx *ir.Index) (string, e
 func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) (string, error) {
 	exprText := translateCheckExpr(c, tbl, opts)
 	if err := refuseUntranslatedCheckExprPG(c, exprText); err != nil {
+		return "", err
+	}
+	owner := ""
+	if tbl != nil {
+		owner = tbl.Name
+	}
+	// Same pg_constraint ceiling as the FK path above.
+	if err := validatePGIdentifier("check constraint", c.Name, c.Name, owner); err != nil {
 		return "", err
 	}
 	var sb strings.Builder

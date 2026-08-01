@@ -89,12 +89,19 @@ var (
 	_ ir.IncrementalIndexBuilder = (*SchemaWriter)(nil)
 	_ ir.IndexBuildBudgetSetter  = (*SchemaWriter)(nil)
 	_ ir.IndexBuildTuner         = (*SchemaWriter)(nil)
-	_ ir.SchemaDeltaApplier      = (*SchemaWriter)(nil)
-	_ ir.SchemaSetter            = (*SchemaWriter)(nil)
-	_ ir.SequencePrimer          = (*SchemaWriter)(nil)
-	_ ir.ShapeDeltaApplier       = (*SchemaWriter)(nil)
-	_ ir.TableAnalyzer           = (*SchemaWriter)(nil)
-	_ ir.TableIndexedNotifier    = (*SchemaWriter)(nil)
+	// IndexVerifier is the post-index-phase loud-failure net. It is
+	// runtime-dispatched (pipeline.verifyBuiltIndexes type-asserts
+	// the writer), so an unpinned rename or receiver flip would leave
+	// every build green while the net silently stopped running — on the
+	// engine whose index build is the one that no-ops SILENTLY, since it
+	// emits CREATE INDEX IF NOT EXISTS.
+	_ ir.IndexVerifier        = (*SchemaWriter)(nil)
+	_ ir.SchemaDeltaApplier   = (*SchemaWriter)(nil)
+	_ ir.SchemaSetter         = (*SchemaWriter)(nil)
+	_ ir.SequencePrimer       = (*SchemaWriter)(nil)
+	_ ir.ShapeDeltaApplier    = (*SchemaWriter)(nil)
+	_ ir.TableAnalyzer        = (*SchemaWriter)(nil)
+	_ ir.TableIndexedNotifier = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces (RawCopy* is the ADR-0043 raw-COPY
 	// fast path; RowCountEstimator drives the parallel-copy split).

@@ -2168,6 +2168,17 @@ type IndexBuildBudgetSetter interface {
 // inline-emitted indexes a CREATE TABLE already carries are excluded, so
 // they are never falsely flagged). A writer that does not implement the
 // surface is a no-op — the net simply doesn't run for that engine.
+//
+// MySQL and Postgres both implement it (the compile-time pins live in each
+// engine's capabilities_assert.go — check those, not this sentence, for
+// today's list). Postgres joined second and needed it most: its index
+// build emits `CREATE INDEX IF NOT EXISTS`, which is load-bearing for the
+// ADR-0114 whole-phase reparent retry and therefore turns EVERY reason a
+// build does not happen into a silent no-op. Its implementation adds one
+// check MySQL's does not — an index present under the expected name but
+// NOT UNIQUE where UNIQUE was requested — because that is precisely what a
+// no-op'd `CREATE UNIQUE INDEX IF NOT EXISTS` leaves behind, and it lets
+// the target accept duplicate rows the source rejects.
 type IndexVerifier interface {
 	VerifyIndexes(ctx context.Context, s *Schema) error
 }

@@ -162,7 +162,10 @@ func TestEnumTypeName_PreservesShape(t *testing.T) {
 // load-bearing invariant for ADR-0031's "two sources both have
 // accounts.status enum" collision avoidance.
 func TestEmitCreateEnumType_QualifiesWithSchema(t *testing.T) {
-	got := emitCreateEnumType(ir.Enum{Values: []string{"active", "inactive"}}, "customer_svc", "accounts", "status")
+	got, err := emitCreateEnumType(ir.Enum{Values: []string{"active", "inactive"}}, "customer_svc", "accounts", "status")
+	if err != nil {
+		t.Fatalf("emitCreateEnumType: %v", err)
+	}
 	wantSubstr := `CREATE TYPE "customer_svc"."accounts_status_enum"`
 	if !strings.Contains(got, wantSubstr) {
 		t.Errorf("emitCreateEnumType = %q; want to contain %q", got, wantSubstr)

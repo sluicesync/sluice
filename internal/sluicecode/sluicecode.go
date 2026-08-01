@@ -147,14 +147,28 @@ const (
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
 	CodeSchemaIdentifierInvalid   Code = "SLUICE-E-SCHEMA-IDENTIFIER-INVALID"
-	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
-	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
-	CodeValueUnrepresentable      Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
-	CodeValueRaggedArray          Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
-	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
-	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
-	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
-	CodeVStreamFloatLossy         Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
+
+	// An emitted PostgreSQL identifier exceeds NAMEDATALEN-1 (63 bytes).
+	// PG truncates silently at CREATE time, and sluice emits the
+	// `IF NOT EXISTS` form for both indexes and tables, so a truncation
+	// collision is a SILENT no-op rather than an error — a missing index,
+	// or (for a table) a second table's rows landing inside the first.
+	CodeSchemaIdentifierTooLong Code = "SLUICE-E-SCHEMA-IDENTIFIER-TOO-LONG"
+
+	// Two distinct source indexes resolve to ONE Postgres index
+	// identifier: sluice's table-scoping transform is not injective
+	// (`("posts","user_id")` and `("posts","posts_user_id")` both render
+	// `posts_user_id`), and `CREATE INDEX IF NOT EXISTS` makes the
+	// second build a silent no-op.
+	CodeSchemaIndexNameCollision Code = "SLUICE-E-SCHEMA-INDEX-NAME-COLLISION"
+	CodeValueZeroDate            Code = "SLUICE-E-VALUE-ZERO-DATE"
+	CodeValueNULByte             Code = "SLUICE-E-VALUE-NUL-BYTE"
+	CodeValueUnrepresentable     Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
+	CodeValueRaggedArray         Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
+	CodeExprBackslashLiteral     Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
+	CodeConfirmationRequired     Code = "SLUICE-E-CONFIRMATION-REQUIRED"
+	CodeDriverHostMismatch       Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
+	CodeVStreamFloatLossy        Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
 
 	CodeBackupSignatureInvalid     Code = "SLUICE-E-BACKUP-SIGNATURE-INVALID"
 	CodeBackupSignatureMissing     Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
@@ -366,9 +380,12 @@ var registry = map[Code]Info{
 
 	CodeDecommissionStreamActive: {ClassRefusal, "sync decommission refused: the stream's replication slot is active on the source (a CDC consumer is attached — the stream looks live); drain it with `sluice sync stop --wait` first, then re-run decommission"},
 
-	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
-	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
-	CodeSchemaIdentifierInvalid:    {ClassRefusal, "a schema value bound for a DDL position that takes a BARE (unquotable) identifier — index access method, operator class, sequence data type, RLS policy command, MySQL charset/collation — is not a bare identifier or not an accepted keyword; refused rather than interpolated, because at those positions a `;` in the value is a second statement"},
+	CodeColdStartTargetNotEmpty:   {ClassRefusal, "cold-start refused: a target table already contains data"},
+	CodeSchemaExtensionNotEnabled: {ClassRefusal, "column type owned by a PG extension not opted into"},
+	CodeSchemaIdentifierInvalid:   {ClassRefusal, "a schema value bound for a DDL position that takes a BARE (unquotable) identifier — index access method, operator class, sequence data type, RLS policy command, MySQL charset/collation — is not a bare identifier or not an accepted keyword; refused rather than interpolated, because at those positions a `;` in the value is a second statement"},
+
+	CodeSchemaIdentifierTooLong:    {ClassRefusal, "an emitted PostgreSQL identifier (table, column, index, constraint or enum type) exceeds NAMEDATALEN-1 = 63 bytes, which PG truncates SILENTLY at CREATE time — and because sluice emits the IF NOT EXISTS form, the resulting collision is a silent no-op rather than an error; shorten or alias the source name"},
+	CodeSchemaIndexNameCollision:   {ClassRefusal, "two distinct source indexes resolve to ONE Postgres index identifier (sluice's table-scoping transform is not injective: index `user_id` on table `posts` and index `posts_user_id` on the same table both render `posts_user_id`), and CREATE INDEX IF NOT EXISTS would silently no-op the second build; rename one of the two source indexes"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},
@@ -376,7 +393,7 @@ var registry = map[Code]Info{
 	CodeExprBackslashLiteral:       {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:       {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:         {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
-	CodeIndexMissing:               {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
+	CodeIndexMissing:               {ClassRefusal, "a secondary index the migration was expected to build is absent on the target — or, on Postgres, present under the expected name but NOT UNIQUE when a UNIQUE index was requested (the shape a silently-no-op'd colliding build leaves behind)"},
 	CodeVStreamFloatLossy:          {ClassRefusal, "--strict-float: a VStream-COPY FLOAT column cannot be re-read exactly on a backup or a sync cold-start (keyless / float-PK / over the backup row cap / no streamed row matched / contradicted by --no-float-exact-reread)"},
 	CodeBackupSignatureInvalid:     {ClassRefusal, "a signed backup manifest's detached signature failed verification (tampered / rolled-back / wrong key)"},
 	CodeBackupSignatureMissing:     {ClassRefusal, "a signed (v6) backup manifest is missing its detached signature"},
