@@ -61,16 +61,7 @@ func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error
 // TIMESTAMP stamps, composite PK (name, generation), one active row
 // per name. Idempotent.
 func (s *mysqlKeysetStore) EnsureKeysetTable(ctx context.Context) error {
-	const ddl = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + keysetTableName + "`" + ` (
-			name        VARCHAR(255) NOT NULL,
-			generation  INT          NOT NULL,
-			bytes       BLOB         NOT NULL,
-			created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			retired_at  TIMESTAMP    NULL,
-			active      BOOLEAN      NOT NULL DEFAULT false,
-			PRIMARY KEY (name, generation)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+	ddl := keysetTableDDL()
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		// The safe-migrations refusal is classified into the coded
 		// bootstrap refusal like every control-table create site
@@ -79,7 +70,27 @@ func (s *mysqlKeysetStore) EnsureKeysetTable(ctx context.Context) error {
 		// operator ships this exact echoed statement via deploy-ddl.
 		return fmt.Errorf("mysql: ensure keyset table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 	}
+	// sluice_keysets lives wherever the `db:` keyset URL points — always
+	// the connection's default database, so no keyspace qualification.
+	// A table this CREATE just made is already binary-collated and
+	// reports nothing; a pre-existing one from an older binary WARNs.
+	warnLegacyControlTableCollation(ctx, s.db, "", keysetTableName, "name")
 	return nil
+}
+
+// keysetTableDDL renders the sluice_keysets CREATE — a named renderer
+// rather than an inline const so the control-table collation gate can
+// hold this table to the same rule as its siblings.
+func keysetTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + "`" + keysetTableName + "`" + ` (
+	name        VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	generation  INT          NOT NULL,
+	bytes       BLOB         NOT NULL,
+	created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	retired_at  TIMESTAMP    NULL,
+	active      BOOLEAN      NOT NULL DEFAULT false,
+	PRIMARY KEY (name, generation)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
 
 // LoadKeyset reads every row and resolves it via the shared

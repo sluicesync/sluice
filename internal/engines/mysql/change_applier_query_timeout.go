@@ -57,7 +57,7 @@ const cdcQueryTimeoutRaiseTableName = "sluice_cdc_query_timeout_raise"
 // raise is recorded"; the row is DELETEd on revert), carrying the JSON envelope.
 func cdcQueryTimeoutRaiseTableDDL(controlKeyspace string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, cdcQueryTimeoutRaiseTableName) + ` (
-	stream_id              VARCHAR(255) NOT NULL,
+	stream_id              VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
 	ps_query_timeout_raise TEXT         NOT NULL,
 	PRIMARY KEY (stream_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
@@ -81,6 +81,8 @@ func ensureCDCQueryTimeoutRaiseTable(ctx context.Context, db *sql.DB, controlKey
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure cdc query-timeout raise table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 		}
+	} else {
+		warnLegacyControlTableCollation(ctx, db, controlKeyspace, cdcQueryTimeoutRaiseTableName, "stream_id")
 	}
 	return nil
 }

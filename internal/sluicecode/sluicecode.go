@@ -149,6 +149,7 @@ const (
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
 	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
 	CodeValueUnrepresentable      Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
+	CodeValueRaggedArray          Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
 	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
 	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
 	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
@@ -344,6 +345,7 @@ var registry = map[Code]Info{
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},
+	CodeValueRaggedArray:           {ClassRefusal, "a non-rectangular (jagged) array value bound for a PostgreSQL array column — PG arrays are rectangular by definition, so there is no faithful target value"},
 	CodeExprBackslashLiteral:       {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:       {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:         {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},

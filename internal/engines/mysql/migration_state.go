@@ -146,6 +146,11 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure migrate-state table: %w", wrapControlTableBootstrapError(err, ddl))
 		}
+	} else {
+		// The migrate-state tables always live in the connection's
+		// default database (no sidecar-keyspace variant), hence the
+		// empty controlKeyspace.
+		warnLegacyControlTableCollation(ctx, s.db, "", migrateStateTableName, "migration_id")
 	}
 	if err := s.ensureStateFormatColumn(ctx); err != nil {
 		return err
@@ -162,6 +167,8 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure migrate-state progress table: %w", wrapControlTableBootstrapError(err, ddl))
 		}
+	} else {
+		warnLegacyControlTableCollation(ctx, s.db, "", migrateProgressTableName, "migration_id", "table_name")
 	}
 	return nil
 }
@@ -174,7 +181,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 // connection's default database (no sidecar-keyspace variant).
 func migrateStateHeaderDDL() string {
 	return `CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
-	migration_id    VARCHAR(255) NOT NULL,
+	migration_id    VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
 	phase           VARCHAR(32)  NOT NULL,
 	table_progress  TEXT         NULL,
 	state_format    INT          NOT NULL DEFAULT 1,
@@ -189,8 +196,8 @@ func migrateStateHeaderDDL() string {
 
 func migrateProgressDDL() string {
 	return `CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
-	migration_id    VARCHAR(255) NOT NULL,
-	table_name      VARCHAR(255) NOT NULL,
+	migration_id    VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	table_name      VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
 	progress        TEXT         NOT NULL,
 	updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 		ON UPDATE CURRENT_TIMESTAMP,

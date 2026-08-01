@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -581,6 +582,39 @@ func TestDecodeVStreamCell(t *testing.T) {
 		{"blob → bytes", query.Type_BLOB, "blob", "blobdata", []byte("blobdata")},
 		{"json → bytes", query.Type_JSON, "json", `{"k":"v"}`, []byte(`{"k":"v"}`)},
 
+		// ---- BIT ----
+		//
+		// catalog Bug 75: the IR-canonical form for a BIT(N) value is the
+		// N-character '0'/'1' bit-string, NOT the raw wire bytes — the raw
+		// form is what the PG writer silently corrupted, which is why the
+		// canonical form exists at all. VStream used to group BIT with the
+		// byte families here, so a MySQL/PlanetScale target bound the raw
+		// bytes (MySQL coerces some patterns and rejects others) while a PG
+		// target refused. The wants below are hand-derived from MySQL's
+		// layout (ceil(N/8) big-endian bytes, value right-justified) —
+		// deliberately NOT computed via decodeBit, so this table stays an
+		// independent check and the parity test below is not vacuous.
+		{"bit(1) one", query.Type_BIT, "bit(1)", "\x01", "1"},
+		{"bit(1) zero", query.Type_BIT, "bit(1)", "\x00", "0"},
+		{"bit no width is bit(1)", query.Type_BIT, "bit", "\x01", "1"},
+		{"bit(3)", query.Type_BIT, "bit(3)", "\x05", "101"},
+		{"bit(8) mixed", query.Type_BIT, "bit(8)", "\xb3", "10110011"},
+		{"bit(8) zero", query.Type_BIT, "bit(8)", "\x00", "00000000"},
+		// Multi-byte width whose HIGH bits are set — the shape that made
+		// the raw-bytes passthrough lossy in a way a single-byte pin misses.
+		{"bit(17) high bit set", query.Type_BIT, "bit(17)", "\x01\x00\x01", "10000000000000001"},
+		{"bit(17) all ones", query.Type_BIT, "bit(17)", "\x01\xff\xff", "11111111111111111"},
+		{"bit(17) zero", query.Type_BIT, "bit(17)", "\x00\x00\x00", "00000000000000000"},
+		{"bit(64) top bit", query.Type_BIT, "bit(64)", "\x80\x00\x00\x00\x00\x00\x00\x00", "1" + strings.Repeat("0", 63)},
+		// Width unavailable (empty column_type — the errFieldMetadataUnavailable
+		// shape) falls back to the payload's own byte width rather than
+		// bitWidth's bare-"bit" default of 1, which would have silently
+		// truncated a 3-byte cell to its lowest bit.
+		{"bit with absent column_type widens to the payload", query.Type_BIT, "", "\x01\x00\x01", "000000010000000000000001"},
+		// A declared width that disagrees with the payload is not trusted
+		// either — same reason.
+		{"bit width disagreeing with payload widens", query.Type_BIT, "bit(8)", "\x01\x00\x01", "000000010000000000000001"},
+
 		// ---- NULL_TYPE (rare; fields normally use lengths=-1 for NULL) ----
 		{"null type", query.Type_NULL_TYPE, "", "", nil},
 	}
@@ -594,6 +628,64 @@ func TestDecodeVStreamCell(t *testing.T) {
 			got := decodeVStreamCell(f, []byte(c.raw))
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("\n got: %#v (%T)\nwant: %#v (%T)", got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// TestDecodeVStreamCellBitMatchesBinlogDecode is the cross-path parity
+// pin for BIT. decodeVStreamCell's doc promises "identical Go shapes
+// from either CDC path"; for BIT that promise was FALSE — VStream
+// returned copyBytes(raw) while the binlog and bulk-copy paths returned
+// decodeBit's canonical '0'/'1' string. A PG target refused the raw
+// bytes loudly, but a MySQL/PlanetScale target fell through the row
+// writer's scalar passthrough and bound them silently.
+//
+// The pin walks every byte width class — sub-byte, exactly one byte,
+// multi-byte with the high bits set, and the 64-bit ceiling MySQL caps
+// BIT at — because the wire form is width-dependent (ceil(N/8) bytes,
+// right-justified) and a single-width pin cannot see a mis-derived N.
+func TestDecodeVStreamCellBitMatchesBinlogDecode(t *testing.T) {
+	cases := []struct {
+		width int
+		raw   string
+	}{
+		{1, "\x00"},
+		{1, "\x01"},
+		{2, "\x03"},
+		{3, "\x05"},
+		{7, "\x7f"},
+		{8, "\x00"},
+		{8, "\xb3"},
+		{8, "\xff"},
+		{9, "\x01\x00"},
+		{9, "\x01\xff"},
+		{16, "\x80\x01"},
+		{17, "\x01\x00\x01"},
+		{17, "\x01\xff\xff"},
+		{33, "\x01\x00\x00\x00\x01"},
+		{63, "\x7f\xff\xff\xff\xff\xff\xff\xff"},
+		{64, "\x80\x00\x00\x00\x00\x00\x00\x00"},
+		{64, "\xff\xff\xff\xff\xff\xff\xff\xff"},
+	}
+	for _, c := range cases {
+		name := fmt.Sprintf("bit(%d)/%x", c.width, c.raw)
+		t.Run(name, func(t *testing.T) {
+			raw := []byte(c.raw)
+			// The binlog / bulk-copy authority: decodeValue driven by the
+			// resolved ir.Bit column type.
+			want, err := decodeValue(raw, ir.Bit{Length: c.width})
+			if err != nil {
+				t.Fatalf("decodeValue: %v", err)
+			}
+			f := &query.Field{Type: query.Type_BIT, ColumnType: fmt.Sprintf("bit(%d)", c.width)}
+			got := decodeVStreamCell(f, raw)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("VStream decode diverges from the binlog decode\n got: %#v (%T)\nwant: %#v (%T)",
+					got, got, want, want)
+			}
+			if s, ok := got.(string); !ok || len(s) != c.width {
+				t.Errorf("got %#v; want a %d-character bit string", got, c.width)
 			}
 		})
 	}

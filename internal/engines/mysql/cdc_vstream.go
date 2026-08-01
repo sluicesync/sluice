@@ -1825,7 +1825,10 @@ func vstreamFieldNullable(f *query.Field) bool {
 //   - TIME → string (HH:MM:SS textual; matches the binlog reader).
 //   - JSON → []byte (binary; the IR contract for JSON is "bytes
 //     of the JSON document", consumers parse as needed).
-//   - VARBINARY / BINARY / BLOB / BIT / GEOMETRY → []byte.
+//   - BIT → the IR-canonical '0'/'1' bit-string (internal/ir/bit.go),
+//     the same shape decodeBit produces on the binlog / bulk-copy
+//     paths (catalog Bug 75).
+//   - VARBINARY / BINARY / BLOB / GEOMETRY → []byte.
 //   - NULL_TYPE → nil.
 //   - Everything else → []byte fallback so the consumer at least
 //     sees the bytes when a future Vitess release adds a type the
@@ -1910,8 +1913,22 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// time-only columns consistent.
 		return v.ToString()
 	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY,
-		query.Type_BINARY, query.Type_BIT:
+		query.Type_BINARY:
 		return copyBytes(raw)
+	case query.Type_BIT:
+		// catalog Bug 75: BIT(N) arrives on the wire as ceil(N/8)
+		// big-endian, right-justified bytes. Every OTHER MySQL path
+		// (bulk copy, binlog CDC) converts that to the IR-canonical
+		// '0'/'1' bit-string via decodeBit — a form that exists
+		// SPECIFICALLY because the raw-bytes form was silently
+		// corrupted by the PG writer. Grouping BIT with the byte
+		// families here broke this function's own promise of
+		// "identical Go shapes from either CDC path": a PG target
+		// refused loudly, but a MySQL/PlanetScale target fell through
+		// row_writer.go's scalar passthrough and bound the raw bytes,
+		// which MySQL coerces successfully for some byte patterns and
+		// not others. Reached on CDC and on cold-start COPY alike.
+		return ir.BitBytesToString(raw, vstreamBitWidth(field, raw))
 	case query.Type_GEOMETRY:
 		// Bug 27: VStream delivers spatial values in MySQL's on-wire
 		// geometry format — `<srid uint32 LE><wkb>`. The IR contract
@@ -1937,6 +1954,38 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 	// something. Future Vitess releases may add types the IR
 	// doesn't yet model.
 	return copyBytes(raw)
+}
+
+// vstreamBitWidth resolves the declared bit width N for a BIT cell —
+// the argument [ir.BitBytesToString] needs to render exactly N '0'/'1'
+// characters. Unlike the binlog/bulk paths, which are driven by the
+// resolved ir.Bit column type, VStream gives us only the FIELD event's
+// column_type DDL string, so the width is parsed from it through the
+// SAME authority the schema translator uses (bitWidth — which correctly
+// answers 1 for a bare "bit", MySQL's documented default).
+//
+// The width is only trusted when the field really is a bit column AND
+// the declared width agrees with the payload's byte count, because
+// ceil(N/8) == len(raw) is an invariant of MySQL's BIT wire form on
+// both the binlog and rowstreamer sides. When it does not hold — an
+// absent/garbled column_type (the errFieldMetadataUnavailable shape,
+// which real Vitess does not produce but the projector already guards
+// against), or a payload wider than the declared width — the width is
+// taken from the payload itself as len(raw)*8. That is deliberately
+// NOT a guess at N: it renders every bit the source actually sent, so
+// no set bit is ever dropped. It can only ever add LEADING ZEROS, which
+// a MySQL target parses to the identical integer and a fixed-width PG
+// `bit(n)` target refuses loudly on length — never a silent truncation,
+// which is what taking bitWidth's 1-for-unparseable default would have
+// been for a BIT(17) cell.
+func vstreamBitWidth(field *query.Field, raw []byte) int {
+	ct := strings.ToLower(strings.TrimSpace(field.GetColumnType()))
+	if leadingTypeWord(ct) == "bit" {
+		if w := bitWidth(ct); (w+7)/8 == len(raw) {
+			return w
+		}
+	}
+	return len(raw) * 8
 }
 
 // isMySQLBoolColumnType returns true when the field's MySQL

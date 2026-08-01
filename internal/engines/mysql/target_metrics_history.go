@@ -45,24 +45,7 @@ const targetMetricsHistoryTableName = "sluice_target_metrics_history"
 // Same MySQL-can't-CREATE-in-an-explicit-tx caveat as ensureControlTable —
 // run from the *sql.DB pool, not a per-change tx.
 func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB) error {
-	const ddl = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + targetMetricsHistoryTableName + "`" + ` (
-			id                      BIGINT       NOT NULL AUTO_INCREMENT,
-			stream_id               VARCHAR(255) NOT NULL,
-			sampled_at              TIMESTAMP(6) NOT NULL,
-			database_name           VARCHAR(255) NOT NULL DEFAULT '',
-			branch                  VARCHAR(255) NOT NULL DEFAULT '',
-			cpu_util                DOUBLE       NULL,
-			mem_util                DOUBLE       NULL,
-			storage_util            DOUBLE       NULL,
-			storage_available_bytes BIGINT       NULL,
-			storage_capacity_bytes  BIGINT       NULL,
-			replica_lag_seconds     DOUBLE       NULL,
-			active_connections      INT          NULL,
-			max_connections         INT          NULL,
-			PRIMARY KEY (id),
-			KEY idx_stream_sampled (stream_id, sampled_at)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+	ddl := targetMetricsHistoryTableDDL()
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		// Coded bootstrap classification (roadmap item 66):
 		// sluice_target_metrics_history is not in the printed bootstrap
@@ -70,7 +53,32 @@ func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB) error {
 		// refusal echoes the exact statement for deploy-ddl.
 		return fmt.Errorf("mysql: ensure target-metrics-history table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 	}
+	warnLegacyControlTableCollation(ctx, db, "", targetMetricsHistoryTableName, "stream_id")
 	return nil
+}
+
+// targetMetricsHistoryTableDDL renders the sluice_target_metrics_history
+// CREATE — a named renderer rather than an inline const so the
+// control-table collation gate can hold this table to the same rule as
+// its siblings.
+func targetMetricsHistoryTableDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + "`" + targetMetricsHistoryTableName + "`" + ` (
+	id                      BIGINT       NOT NULL AUTO_INCREMENT,
+	stream_id               VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	sampled_at              TIMESTAMP(6) NOT NULL,
+	database_name           VARCHAR(255) NOT NULL DEFAULT '',
+	branch                  VARCHAR(255) NOT NULL DEFAULT '',
+	cpu_util                DOUBLE       NULL,
+	mem_util                DOUBLE       NULL,
+	storage_util            DOUBLE       NULL,
+	storage_available_bytes BIGINT       NULL,
+	storage_capacity_bytes  BIGINT       NULL,
+	replica_lag_seconds     DOUBLE       NULL,
+	active_connections      INT          NULL,
+	max_connections         INT          NULL,
+	PRIMARY KEY (id),
+	KEY idx_stream_sampled (stream_id, sampled_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
 
 // EnsureTargetMetricsHistory implements [ir.TargetMetricsHistoryStore].

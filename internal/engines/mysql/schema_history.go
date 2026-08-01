@@ -94,6 +94,9 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, controlKeyspace s
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure schema-history table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 		}
+	} else {
+		warnLegacyControlTableCollation(ctx, db, controlKeyspace, schemaHistoryTableName,
+			"version_key", "stream_id", "schema_name", "table_name")
 	}
 	// Migration path for v0.70.0 deployments whose
 	// sluice_cdc_schema_history table pre-dates the source_engine column
@@ -112,10 +115,10 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, controlKeyspace s
 // the bootstrap printer ([Engine.ControlTableDDL], ADR-0165).
 func schemaHistoryTableDDL(controlKeyspace string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, schemaHistoryTableName) + ` (
-	version_key     CHAR(64)     NOT NULL,
-	stream_id       VARCHAR(255) NOT NULL,
-	schema_name     VARCHAR(255) NOT NULL,
-	table_name      VARCHAR(255) NOT NULL,
+	version_key     CHAR(64)     ` + controlIdentifierCollateClause + ` NOT NULL,
+	stream_id       VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	schema_name     VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	table_name      VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
 	anchor_position LONGTEXT     NOT NULL,
 	ir_schema_json  LONGTEXT     NOT NULL,
 	source_engine   VARCHAR(64)  NULL,

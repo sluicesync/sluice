@@ -259,6 +259,10 @@ var docRows = map[Code]docRow{
 		Meaning: "A string value carries a NUL byte (0x00), which PostgreSQL text types cannot store.",
 		Remedy:  "Clean the source data, or map the column to bytea with `--type-override COL=bytea`.",
 	},
+	"SLUICE-E-VALUE-RAGGED-ARRAY": {
+		Meaning: "An array value bound for a PostgreSQL array column is **not rectangular** — some sub-array at a given nesting depth has a different length than its siblings (`[[1,2],[3,4,5]]`). PostgreSQL arrays are rectangular by definition: the wire form carries one length per dimension plus a flat row-major element list, so a jagged value has no faithful representation at all. Before this refusal existed the writer took every dimension's length from the FIRST sub-array at that depth and then appended every leaf it found, so a long row silently DROPPED its extra elements, a short first row silently dropped the tail of every later row, and a short TRAILING row panicked the writer with an index-out-of-range. The message names the column, the nesting depth, and the expected-vs-actual sub-array lengths. A Postgres source can never produce this (PG arrays are rectangular on the way out); the reachable producer is the pgtrigger change-payload path, whose `to_jsonb()` capture carries a JSON array that is under no rectangularity obligation.",
+		Remedy:  "Fix the source value so every sub-array at a given depth has the same length (pad the short rows, or model the column as `jsonb`, which stores jagged structure faithfully). If the value arrived through the trigger-CDC path from a genuinely rectangular source column, report it as a sluice bug with the logged column and depth.",
+	},
 	"SLUICE-E-VALUE-UNREPRESENTABLE": {
 		Meaning: "A value no target column type can represent — e.g. a `NaN`/±`Infinity` float from a PostgreSQL `double precision` source into a MySQL `FLOAT`/`DOUBLE` (MySQL has no NaN/Infinity). Refused before the driver sees it so it fails loudly instead of corrupting the value or retry-looping on the server's misleading error.",
 		Remedy:  "Filter or transform the source value (e.g. `NULLIF` / `CASE` on the source query).",

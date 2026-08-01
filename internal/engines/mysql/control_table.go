@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -44,6 +45,112 @@ var controlCfg = &appliershared.ControlTableConfig{
 	// so RequestStop's missing-row detection uses the shared
 	// SELECT-then-UPDATE shape rather than a rows-affected check.
 	RowsAffectedIsChangedRows: true,
+}
+
+// Control-table IDENTIFIER columns are binary-collated. Every MySQL
+// control-table CREATE below declares `DEFAULT CHARSET=utf8mb4` with no
+// COLLATE clause, which on MySQL 8 resolves to `utf8mb4_0900_ai_ci` —
+// case- AND accent-INSENSITIVE. Any column that is a key part or an
+// equality predicate then folds two DISTINCT source identifiers into
+// one row: source tables `Foo` and `foo` (or `café` and `cafe`) collide
+// on `sluice_migrate_table_progress`'s PRIMARY KEY, and its upsert is
+// `ON DUPLICATE KEY UPDATE`, so one table's copy cursor silently
+// OVERWRITES the other's. A later `--resume` then restarts `Foo` from
+// `foo`'s LastPK and never copies the rows below it — exit 0, no
+// warning. The same shape sits on `sluice_cdc_state.stream_id`,
+// `sluice_cdc_schema_history`'s (stream_id, schema_name, table_name)
+// lookup, the shard-lease CAS, and every other identifier key. The
+// Postgres siblings were never exposed (PG identifiers compare byte-
+// exact), which is what made this a silent cross-engine asymmetry.
+//
+// utf8mb4_bin is the portable answer: MySQL 5.7/8.x, MariaDB, and
+// Vitess/PlanetScale all have it, whereas the NO-PAD `utf8mb4_0900_bin`
+// is MySQL-8-only. Named wart — the ONE thing utf8mb4_bin gives up
+// relative to `utf8mb4_0900_ai_ci` is PAD-SPACE semantics: under
+// utf8mb4_bin a VARCHAR key compares `'foo '` equal to `'foo'`, where
+// the NO-PAD 0900 collation held them apart. That trade is deliberate
+// and strictly narrower — MySQL forbids trailing spaces in identifiers
+// outright, so the only reachable producer is a Postgres source with a
+// quoted `"foo "` table name alongside a `"foo"`, versus the case/accent
+// class which every mixed-case schema hits. There is no collation that
+// is both binary and NO PAD across all supported servers; if one
+// becomes portable this is the line to change.
+//
+// [TestControlTableIdentifierColumnsAreBinaryCollated] holds the
+// rendered DDL to this rule so a new identifier column cannot land
+// without it, and the real-MySQL integration pins assert two
+// case-differing identifiers survive as two rows.
+const (
+	// controlIdentifierCollation is the collation every control-table
+	// identifier column is created with.
+	controlIdentifierCollation = "utf8mb4_bin"
+
+	// controlIdentifierCollateClause is the DDL fragment spliced into
+	// each identifier column definition.
+	controlIdentifierCollateClause = "COLLATE " + controlIdentifierCollation
+)
+
+// warnLegacyControlTableCollation reports, at WARN, any identifier
+// column on an ALREADY-EXISTING control table that is not
+// [controlIdentifierCollation].
+//
+// Why a warning and not an ALTER: every control-table ensure is
+// detect-then-create precisely because a PlanetScale safe-migrations
+// branch refuses direct DDL outright (Error 1105), so an automatic
+// `ALTER TABLE … MODIFY` on the exists-already path would break exactly
+// the deployments the detect gate exists to serve — and on a large
+// table it is a full rebuild besides. Doing nothing was the other
+// option and it is the one that would have been a NEW instance of this
+// same class: a fresh target keyed exactly while an upgraded one keeps
+// silently folding `Foo` into `foo`, with no signal anywhere. So the
+// divergence is made LOUD instead, once per ensure, naming the table,
+// the columns, and the exact statement to run.
+//
+// A probe failure is not fatal — this is an advisory over an
+// information_schema read, and a control-table ensure that otherwise
+// succeeded must not be failed by it. Nothing is logged in that case
+// (an unreadable information_schema is its own louder problem
+// elsewhere).
+func warnLegacyControlTableCollation(ctx context.Context, db *sql.DB, controlKeyspace, table string, columns ...string) {
+	if len(columns) == 0 {
+		return
+	}
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	q := "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? " +
+		"AND COLUMN_NAME IN (" + strings.TrimSuffix(strings.Repeat("?,", len(columns)), ",") + ") " +
+		"AND COLLATION_NAME IS NOT NULL AND COLLATION_NAME <> ? " +
+		"ORDER BY COLUMN_NAME"
+	args := append(append([]any{}, schemaArgs...), table)
+	for _, c := range columns {
+		args = append(args, c)
+	}
+	args = append(args, controlIdentifierCollation)
+
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return
+	}
+	defer func() { _ = rows.Close() }()
+
+	var stale []string
+	for rows.Next() {
+		var name, colType string
+		if err := rows.Scan(&name, &colType); err != nil {
+			return
+		}
+		stale = append(stale, "MODIFY `"+name+"` "+colType+" "+controlIdentifierCollateClause)
+	}
+	if rows.Err() != nil || len(stale) == 0 {
+		return
+	}
+	slog.WarnContext(ctx,
+		"mysql: control table pre-dates the binary-collation fix; two identifiers differing only in LETTER CASE or ACCENTS "+
+			"share one row on this table and will silently overwrite each other. Run the printed ALTER to correct it "+
+			"(not applied automatically: a PlanetScale safe-migrations branch refuses direct DDL)",
+		"table", table,
+		"want_collation", controlIdentifierCollation,
+		"alter", "ALTER TABLE "+controlTableRef(controlKeyspace, table)+" "+strings.Join(stale, ", "))
 }
 
 // controlTableRef returns the backtick-quoted reference to a control table,
@@ -183,6 +290,8 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure control table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 		}
+	} else {
+		warnLegacyControlTableCollation(ctx, db, controlKeyspace, controlTableName, "stream_id")
 	}
 	if err := ensureStopRequestedColumn(ctx, db, controlKeyspace); err != nil {
 		return err
@@ -236,7 +345,7 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 // ADR-0165).
 func controlTableDDL(controlKeyspace string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, controlTableName) + ` (
-	stream_id              VARCHAR(255) NOT NULL,
+	stream_id              VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
 	source_position        LONGTEXT     NOT NULL,
 	updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 		ON UPDATE CURRENT_TIMESTAMP,
@@ -505,6 +614,9 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, control
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 		}
+	} else {
+		warnLegacyControlTableCollation(ctx, db, controlKeyspace, shardConsolidationLeaseTableName,
+			"target_table_full_name", "lease_holder_stream_id")
 	}
 	// Migration path for v0.75.0 deployments whose
 	// sluice_shard_consolidation_lease table pre-dates the v0.76.0 anchor
@@ -536,8 +648,8 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, control
 // ([Engine.ControlTableDDL], ADR-0165).
 func shardConsolidationLeaseTableDDL(controlKeyspace string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + ` (
-	target_table_full_name        VARCHAR(512) NOT NULL,
-	lease_holder_stream_id        VARCHAR(64)  NULL,
+	target_table_full_name        VARCHAR(512) ` + controlIdentifierCollateClause + ` NOT NULL,
+	lease_holder_stream_id        VARCHAR(64)  ` + controlIdentifierCollateClause + ` NULL,
 	lease_expires_at              TIMESTAMP    NULL,
 	ddl_text                      TEXT         NULL,
 	ddl_checksum                  VARCHAR(64)  NULL,

@@ -634,6 +634,20 @@ func copyColumnNames(table *ir.Table) []string {
 // Returns the rows pgx reports copied (for the error message) and the raw
 // CopyFrom / codec-registration error unwrapped (the caller classifies and
 // wraps it).
+//
+// # Why the SOURCE's sticky error wins over CopyFrom's
+//
+// When a copy source refuses a value (prepareValue: a NUL byte, a ragged
+// array, …), pgx aborts the COPY by sending the message TEXT to the server
+// and returns the server's echo — a *pgconn.PgError, SQLSTATE 57014, whose
+// text quotes our refusal but whose Go error CHAIN is a fresh one. The
+// sluicecode is gone with it, so a refusal would reach the exit boundary as
+// a generic failure (exit 1) instead of a refusal (exit 3), and nothing
+// downstream could match on the code. The sources already keep the real
+// error sticky in Err(); prefer it, since a source that failed IS why the
+// copy failed. Context errors are the one exception — an aborting server
+// can cancel the attempt context out from under a source mid-Next, and the
+// resulting context.Canceled would mask the server's real complaint.
 func (w *RowWriter) copyFromOnSQLConn(
 	ctx context.Context,
 	sqlConn *sql.Conn,
@@ -674,6 +688,12 @@ func (w *RowWriter) copyFromOnSQLConn(
 		copied = n
 		return copyErr
 	})
+	if rawErr != nil {
+		if srcErr := source.Err(); srcErr != nil &&
+			!errors.Is(srcErr, context.Canceled) && !errors.Is(srcErr, context.DeadlineExceeded) {
+			return copied, srcErr
+		}
+	}
 	return copied, rawErr
 }
 
@@ -1142,9 +1162,14 @@ func prepareValue(v any, t ir.Type) (any, error) {
 // beats a silently corrupted one).
 //
 // Dimensions and shape are read from the value (ir.Array.Element is
-// the scalar leaf type even for multi-dim, per the Bug 68 reader). PG
-// only ever emits rectangular arrays, so dimension lengths are taken
-// from the first element at each depth.
+// the scalar leaf type even for multi-dim, per the Bug 68 reader).
+// Dimension lengths are taken from the first element at each depth and
+// then CHECKED against every sibling: a jagged value is refused loudly
+// (SLUICE-E-VALUE-RAGGED-ARRAY) rather than silently truncated. The
+// older comment here asserted "PG only ever emits rectangular arrays"
+// and left the check out — true of the SQL read paths, but this
+// function's other documented input is the trigger-payload path below,
+// where a JSON array is under no such obligation. See [buildPGArray].
 //
 // # Leaf input shapes: SQL-decoded AND trigger-payload (RDS F3)
 //
@@ -1396,11 +1421,34 @@ func timeOfDayMicros(s string) (int64, error) {
 // catalog Bug 74). pgtype.Array[*T] is itself an ArrayGetter, so its
 // explicit Dims survive the encode path; the *T element pointer lets
 // a SQL NULL element round-trip as a typed nil.
+//
+// # The rectangularity check is LOAD-BEARING, not a formality
+//
+// [arrayDims] only ever walks the FIRST element at each depth, so it
+// describes the shape of the first row and nothing else. Without a
+// per-level length comparison a jagged input was not an error — it was
+// a silent rewrite of the value, measured against real pgx v5.10.0:
+//
+//	[[1,2],[3,4,5]] → {{1,2},{3,4}}  (the 5 vanished)
+//	[[1],[2,3,4]]   → {{1},{2}}      (the 3 and 4 vanished)
+//	[[1,2],[3]]     → panic          (Elements underran Dims)
+//
+// The invariant the old code asserted ("PG only ever emits rectangular
+// arrays") holds for the SQL read paths and is not checkable at this
+// layer — convertArray's other documented input is the pgtrigger
+// change-payload path (ADR-0066 §4), where the value came out of
+// to_jsonb() and a JSON array is under no rectangularity obligation.
+// A refusal is the only faithful answer: PG's array wire form is one
+// length per dimension plus a flat row-major element list, so a jagged
+// value has no representation to fall back to.
 func buildPGArray[T any](v []any, conv func(any) (T, error)) (any, error) {
 	dims := arrayDims(v)
 	elems := make([]*T, 0, arrayCardinality(dims))
 	var flatten func(level []any, depth int) error
 	flatten = func(level []any, depth int) error {
+		if want := int(dims[depth].Length); len(level) != want {
+			return raggedArrayError(depth, want, len(level))
+		}
 		if depth == len(dims)-1 {
 			for _, e := range level {
 				if e == nil {
@@ -1436,9 +1484,28 @@ func buildPGArray[T any](v []any, conv func(any) (T, error)) (any, error) {
 	}, nil
 }
 
+// raggedArrayError is the loud, coded refusal for a non-rectangular
+// array value ([buildPGArray]'s per-level length check). depth is the
+// nesting level the ragged edge was found at (0 = outermost); want is
+// the length [arrayDims] recorded for that dimension (the length of the
+// FIRST sub-array at that depth) and got the offending sibling's.
+// The caller — every prepareValue call site — wraps this with the
+// column name, so the operator sees column, depth, and expected-vs-
+// actual together.
+func raggedArrayError(depth, want, got int) error {
+	return sluicecode.Wrap(sluicecode.CodeValueRaggedArray,
+		"pad the short sub-arrays on the source so every one at a given depth has the same length, or model the column as jsonb",
+		fmt.Errorf("postgres: array value is not rectangular: at nesting depth %d a sub-array has %d element(s) but this dimension is %d wide; PostgreSQL arrays cannot hold a jagged value",
+			depth, got, want))
+}
+
 // arrayDims walks the first element at each depth to recover the
 // rectangular dimension lengths of a (possibly nested) PG array value.
 // An empty array is a single zero-length dimension.
+//
+// It describes the FIRST row only — it cannot detect a jagged value on
+// its own. [buildPGArray] compares every level against these lengths
+// and refuses a mismatch; see the rectangularity note there.
 func arrayDims(v []any) []pgtype.ArrayDimension {
 	var dims []pgtype.ArrayDimension
 	level := v
