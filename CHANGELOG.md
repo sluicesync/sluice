@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.107.0] - 2026-08-01
+
 ### Fixed
 
 **A stray `/*` in a mydumper dump silently dropped every row after it, and `migrate` exited 0.** A block comment with no closing `*/` — a hand-edited dump, a truncated upload, a chunk severed mid-comment — put the dump reader's lexer into comment state for the rest of the file, which is correct; what was not correct is that the classifier then treated the whole remainder as a comment and skipped it. Every `INSERT` after the stray `/*` vanished, the table arrived short, and the migration reported success. `sluice verify --depth count` could not catch it either: it reads the dump through the same path, so it counted the same truncated file and agreed. This is the same class as the audit fix that made a severed `INSERT` fragment or a mid-file byte-order mark refuse loudly — the versioned `/*!…*/` form was already handled, and the plain form was the one branch that fix did not close. An unterminated comment of either flavour now refuses naming the chunk file, so the loss is a non-zero exit instead of a short table. Nothing else changes: a dump whose comments are all closed reads exactly as before, and a genuinely comment-only chunk is still skipped.
