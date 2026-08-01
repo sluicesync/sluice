@@ -1296,6 +1296,8 @@ type SyncStartCmd struct {
 
 	NoFloatExactReread bool `name:"no-float-exact-reread" help:"VStream (PlanetScale/Vitess source) cold-start only: DISABLE the post-COPY single-precision FLOAT exact re-read repair. vttablet's rowstreamer renders FLOAT at mysqld's 6-significant-digit display precision (8388608 → 8388610), so a VStream cold-start COPY lands single-precision FLOAT columns rounded. By DEFAULT sluice re-reads those columns EXACTLY from the source over SQL (the ADR-0153 (col * 1E0) projection) and UPDATEs the target rows by PK before CDC begins, restoring float32 exactness. Set this to skip the repair — the columns retain the rounding (a small extra read pass is the only cost of the default; disable it only if you don't care about sub-6-significant-digit FLOAT precision). Inert on every source whose snapshot COPY is already float-exact (native MySQL, Postgres). A keyless table (no primary key to target the re-read) cannot be repaired regardless — it WARNs and retains the rounding."`
 
+	StrictFloat bool `name:"strict-float" help:"VStream (PlanetScale/Vitess source) cold-start only: demand EXACT single-precision FLOAT or FAIL. By default a table the post-COPY exact re-read cannot repair — no primary key to target the re-read, or a single-precision FLOAT inside the primary key — WARNs and cold-starts with the COPY's display-rounded values. Set this to REFUSE loudly instead (SLUICE-E-VSTREAM-FLOAT-LOSSY, exit 3) before any row moves, naming the columns. The sync-side mirror of 'backup full --strict-float'. Contradictory with --no-float-exact-reread (which disables the repair that produces the exactness) — passing both is refused. Inert on non-VStream sources and on schemas with no single-precision FLOAT column."`
+
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (no raw-copy lane there)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
@@ -2184,6 +2186,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		CopyFanoutDegree:                        s.CopyFanoutDegree,
 		NoIntraTableStealing:                    s.NoIntraTableStealing,
 		NoFloatExactReread:                      s.NoFloatExactReread,
+		StrictFloat:                             s.StrictFloat,
 		RawCopyFormat:                           parseRawCopyFormat(s.RawCopyFormat),
 		ReapStaleBackends:                       s.ReapStaleBackends,
 		ApplyExecTimeout:                        s.ApplyExecTimeout,
@@ -2245,7 +2248,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		EnabledPGExtensions:       s.EnablePGExtension,
 		InjectShardColumn:         shardSpec,
 		AllowCrossShardMerge:      s.AllowCrossShardMerge,
-		CoordinateLiveDDL:         !s.NoCoordinateLiveDDL,
+		NoCoordinateLiveDDL:       s.NoCoordinateLiveDDL,
 		SchemaChanges:             s.SchemaChanges,
 		ForwardSchemaAddColumn:    s.ForwardSchemaAddColumn,
 		BackfillAddedColumn:       s.BackfillAddedColumn,

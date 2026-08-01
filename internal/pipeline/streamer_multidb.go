@@ -703,7 +703,19 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	migcore.ApplyGrowGate(rw, gate)
 	s.startStorageHeadroomWatch(ctx, streamID, gate)
 
-	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, UpfrontIndexes: s.UpfrontIndexes, AnalyzeAfter: s.AnalyzeAfter, NoIntraTableStealing: s.NoIntraTableStealing}
+	// CopyFanoutDegree joined the list 2026-08-01: runBulkCopyWithOpts already
+	// resolved a fan-out degree here (the zero value resolves to the
+	// conservative DEFAULT, never "no workers"), so the multi-database
+	// cold-copy always fanned out — it just could not hear the operator's
+	// --copy-fanout-degree. Same one-sided-knob class as the rest of this
+	// change; found by the new bulkCopyOpts assignment gate.
+	bulkOpts := bulkCopyOpts{
+		Redactor:             s.Redactor,
+		UpfrontIndexes:       s.UpfrontIndexes,
+		AnalyzeAfter:         s.AnalyzeAfter,
+		CopyFanoutDegree:     s.CopyFanoutDegree,
+		NoIntraTableStealing: s.NoIntraTableStealing,
+	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)

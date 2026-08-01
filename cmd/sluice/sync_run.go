@@ -115,6 +115,23 @@ type SyncSpec struct {
 	InjectShardColumn    string `koanf:"inject-shard-column"`
 	AllowCrossShardMerge bool   `koanf:"allow-cross-shard-merge"`
 
+	// NoCoordinateLiveDDL mirrors `sync start --no-coordinate-live-ddl`
+	// (ADR-0054 Shape A Phase 2): opt OUT of live cross-shard DDL
+	// coordination and keep the v0.72.x drained model. Omitted (false) =
+	// coordination ON when inject-shard-column is engaged, exactly as
+	// `sync start` defaults.
+	//
+	// It is HERE because inject-shard-column is here. The DEVEX-1 rule
+	// (audit 2026-07-23 / TestSyncSpecFlagParity) is that a refusal's
+	// documented escape must be expressible on the surface most likely to
+	// hit it: refuseEngineMissingCoordination names
+	// `--no-coordinate-live-ddl` as THE recovery for a target engine that
+	// can't satisfy the lease contract, and a fleet leg that can engage
+	// Shape A can hit exactly that refusal. The former exclusion entry
+	// ("rides inject-shard-column's deeper surface") had stopped being
+	// true the moment inject-shard-column itself was curated in.
+	NoCoordinateLiveDDL bool `koanf:"no-coordinate-live-ddl"`
+
 	IncludeTable []string `koanf:"include-table"`
 	ExcludeTable []string `koanf:"exclude-table"`
 	TypeOverride []string `koanf:"type-override"`
@@ -972,6 +989,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 
 		InjectShardColumn:    shardSpec,
 		AllowCrossShardMerge: spec.AllowCrossShardMerge,
+		NoCoordinateLiveDDL:  spec.NoCoordinateLiveDDL,
 
 		ApplyBatchSize:   applyBatchSize,
 		AutoTune:         !spec.NoAutoTune,

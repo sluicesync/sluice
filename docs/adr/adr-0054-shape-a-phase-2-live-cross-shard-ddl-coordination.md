@@ -621,6 +621,33 @@ The two remaining task #22 sub-shapes (CHECK constraint changes,
 generated-column changes) still surface as `Unrecognized` with the
 operator-actionable drained-model recovery hint.
 
+## Implementation note (2026-08-01) — "always-on" was true of `sync start` only
+
+DP-D resolved to always-on with a `--no-coordinate-live-ddl` opt-out, and
+Phase 2b implemented it as a `Streamer.CoordinateLiveDDL bool` documented
+"Default true". That is the v0.99.51 zero-value trap, and it fired: the field
+was assigned in exactly ONE production place, `sync start`'s CLI wiring. Every
+other construction — the supervised fleet (`sync run`, which does accept
+`inject-shard-column`), the broker paths, every programmatic caller — got Go's
+zero value `false` and silently took the suppressed branch in
+`engageShardCoordination`, one line above the `refuseEngineMissingCoordination`
+refusal, which was therefore unreachable there. A byte-identical fleet YAML and
+`sync start` invocation ran OPPOSITE DDL postures with no WARN.
+
+The field is now the opt-out `Streamer.NoCoordinateLiveDDL`, so the zero value
+IS the ADR's decision, and `SyncSpec` gained a `no-coordinate-live-ddl:` key so
+the refusal's documented recovery is expressible on the fleet surface (the
+DEVEX-1 rule; `TestSyncSpecFlagParity`'s exclusion entry for the flag —
+"rides inject-shard-column's deeper surface" — had stopped being true the
+moment `inject-shard-column` itself was curated into the spec). The engagement
+unit tests no longer set the field at all, which is what makes them a pin: they
+now assert the zero value coordinates.
+
+The general lesson is filed as a gate rather than a note —
+`TestSharedPhaseFieldAssignmentParity` (cmd/sluice) fails the build when a
+shared-pipeline-phase field is left unassigned at any production construction
+site.
+
 ## Out of scope (Phase 3+)
 
 - **Operator-issued DDL through sluice**: a future `sluice schema

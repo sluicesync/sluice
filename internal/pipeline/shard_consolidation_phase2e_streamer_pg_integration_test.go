@@ -308,7 +308,6 @@ func startPhase2eStreamer(t *testing.T, i int, sourceDSN, targetDSN string) (
 			Name:  "source_shard_id",
 			Value: phase2eShardLabels()[i],
 		},
-		CoordinateLiveDDL: true,
 		ShardCoordinationLease: LeaseConfig{
 			LeaseDuration: 10 * time.Second,
 			RenewDeadline: 6 * time.Second,

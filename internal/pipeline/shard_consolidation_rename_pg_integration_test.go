@@ -66,7 +66,6 @@ func TestStreamer_RenameColumn_PG_LiveCoordination(t *testing.T) {
 			Name:  "source_shard_id",
 			Value: "shard_a",
 		},
-		CoordinateLiveDDL: true,
 		ShardCoordinationLease: LeaseConfig{
 			LeaseDuration: 30 * time.Second,
 			RenewDeadline: 20 * time.Second,
@@ -263,7 +262,6 @@ func TestStreamer_RenameColumn_PG_LiveCoordination_TypeFamilyMatrix(t *testing.T
 					Name:  "source_shard_id",
 					Value: "shard_a",
 				},
-				CoordinateLiveDDL: true,
 				ShardCoordinationLease: LeaseConfig{
 					LeaseDuration: 30 * time.Second,
 					RenewDeadline: 20 * time.Second,

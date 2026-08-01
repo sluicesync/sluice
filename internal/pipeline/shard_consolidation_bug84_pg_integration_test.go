@@ -83,7 +83,6 @@ func TestStreamer_Bug84_PG_LiveCoordination_AddColumn(t *testing.T) {
 		},
 		// Engage live coordination — this is what the CLI default
 		// (--no-coordinate-live-ddl absent) produces.
-		CoordinateLiveDDL: true,
 		ShardCoordinationLease: LeaseConfig{
 			LeaseDuration: 30 * time.Second,
 			RenewDeadline: 20 * time.Second,

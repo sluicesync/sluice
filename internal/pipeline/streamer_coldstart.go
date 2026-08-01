@@ -180,6 +180,16 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// exact re-read that actually repairs it runs below, after bulk-copy.
 	floatCopyRounds := floatCopyDisplayRounds(stream) && len(floatPlan) > 0
 	if floatCopyRounds {
+		// --strict-float: refuse UPFRONT (before any row moves) when a
+		// FLOAT-bearing table can never be repaired exactly. Placed here,
+		// after the snapshot open, because the display-rounding property is a
+		// property of the OPENED reader; Abandon drops the just-created slot
+		// exactly as the publication re-verification above does (Bug 177 —
+		// refuse before the anchor so the slot is dropped, not orphaned).
+		if err := s.strictFloatRefusal(floatPlan); err != nil {
+			_ = stream.Abandon()
+			return nil, stop, err
+		}
 		warnFloatDisplayRounding(ctx, floatPlan, s.NoFloatExactReread)
 	}
 
@@ -456,7 +466,7 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// PG sources already work without this seed because pgoutput emits
 	// RelationMessage on first-touch (before any DDL); MySQL's binlog
 	// has no first-touch equivalent.
-	if (s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL) ||
+	if (s.InjectShardColumn.Engaged() && !s.NoCoordinateLiveDDL) ||
 		(s.forwardSchemaEnabled() && !s.InjectShardColumn.Engaged() && !s.multiDatabaseMode()) {
 		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema, s.Source)
 	}

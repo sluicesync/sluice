@@ -12,7 +12,8 @@ package pipeline
 //   1. The operator has set --inject-shard-column NAME=VALUE
 //      (ShardColumnSpec.Engaged()).
 //   2. The operator has NOT passed --no-coordinate-live-ddl
-//      (Streamer.CoordinateLiveDDL == true).
+//      (Streamer.NoCoordinateLiveDDL == false — the zero value, so
+//      every non-CLI construction coordinates by default).
 //   3. The target applier implements [ir.ShardConsolidationLeaseStore]
 //      AND [ir.ShardConsolidationProber] (the shipping PG and MySQL
 //      engines both do; an unknown engine refuses loudly).
@@ -37,7 +38,7 @@ import (
 // can't satisfy the contract.
 //
 // No-op (returns nil) when Shape A is not engaged or
-// CoordinateLiveDDL is false. When live-coordination is engaged but
+// NoCoordinateLiveDDL is set. When live-coordination is engaged but
 // the applier doesn't implement the lease store / prober, refuses
 // with a clear "engine X does not support live cross-shard DDL
 // coordination" message naming `--no-coordinate-live-ddl` as the
@@ -49,7 +50,7 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	if !s.InjectShardColumn.Engaged() {
 		return nil
 	}
-	if !s.CoordinateLiveDDL {
+	if s.NoCoordinateLiveDDL {
 		return nil
 	}
 	store, ok := applier.(ir.ShardConsolidationLeaseStore)

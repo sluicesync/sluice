@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // # VStream-COPY FLOAT display-rounding repair (roadmap open-bug 2026-07-09)
@@ -165,6 +167,54 @@ func floatCopyDisplayRounds(stream *ir.SnapshotStream) bool {
 	}
 	r, ok := stream.Rows.(ir.LossyFloatCopyReader)
 	return ok && r.CopyDisplayRoundsFloats()
+}
+
+// strictFloatRefusal is the `--strict-float` gate for the sync cold-start:
+// "exact, or fail; never rounded". It mirrors backup's applyVStreamFloatPolicy
+// upfront refusal — same VStream COPY reader, same repairable/un-repairable
+// classification, same code — for the entry point that had the repair but
+// never the refusal.
+//
+// Two refusals, both BEFORE any row moves:
+//
+//   - --strict-float with --no-float-exact-reread: contradictory instructions
+//     ("demand exact" + "repair nothing"). backup lets the opt-out win
+//     silently; the sync path refuses instead, because a flag that silently
+//     loses to its neighbour is the inert-flag class this exists to close.
+//   - --strict-float over a table the re-read can NEVER repair (keyless, or a
+//     single-precision FLOAT in the PK — see [planFloatRepair]): those columns
+//     would retain the COPY's 6-significant-digit rounding forever.
+//
+// Returns nil when --strict-float is unset, or when every FLOAT-bearing table
+// in the plan is repairable (the repair below then makes them exact).
+func (s *Streamer) strictFloatRefusal(plan []floatRepairTable) error {
+	if !s.StrictFloat {
+		return nil
+	}
+	if s.NoFloatExactReread {
+		return sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy,
+			"pass exactly one: --strict-float (exact or refuse) or --no-float-exact-reread (accept the rounding)",
+			errors.New("pipeline: --strict-float and --no-float-exact-reread are contradictory — the first demands "+
+				"EXACT single-precision FLOAT, the second disables the exact re-read that produces it"))
+	}
+	var unrepairable []string
+	for _, ft := range plan {
+		if ft.repairable {
+			continue
+		}
+		for _, col := range ft.floatColumns {
+			unrepairable = append(unrepairable, ft.name+"."+col)
+		}
+	}
+	if len(unrepairable) == 0 {
+		return nil
+	}
+	return sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy,
+		"add a primary key to the table (or exclude it with --exclude-table), or drop --strict-float "+
+			"(the default repairs exact where it can and WARNs + retains the rounding elsewhere)",
+		fmt.Errorf("pipeline: --strict-float: %d single-precision FLOAT column(s) cannot be re-read exactly on the "+
+			"cold-start — the table has no primary key to target the re-read, or the FLOAT is part of the PK (%s)",
+			len(unrepairable), strings.Join(unrepairable, ", ")))
 }
 
 // warnFloatDisplayRounding emits a once-per-column loud WARN naming every

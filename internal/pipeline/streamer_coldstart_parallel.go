@@ -332,7 +332,16 @@ func (s *Streamer) runColdStartParallel(
 		s.BulkBatchSize,
 		deps, tableParallelism,
 		s.Redactor, s.InjectShardColumn,
-		false, // upfrontIndexes: --upfront-indexes is a migrate-path flag; the sync cold-start keeps the deferred post-copy index build
-		false, // analyzeAfter: --analyze-after is a migrate-path flag; the sync target keeps receiving CDC writes, so its statistics churn regardless
+		// item 111 phase 2/cleanup, gap closed 2026-08-01: these two were
+		// hardcoded `false` here with a comment calling both "a migrate-path
+		// flag". They are not — both are live `sync start` flags, and the
+		// SERIAL sibling (coldStartRunCopy → bulkCopyOpts) has threaded them
+		// since item 111. This is the DEFAULT cold-start path for any PG source
+		// that exports a shareable snapshot, so `sync start --upfront-indexes`
+		// / `--analyze-after` against Postgres were silently ignored. The
+		// receiving phases in runBulkCopyPhases are engine-neutral and identical
+		// to the ones migrate drives.
+		s.UpfrontIndexes,
+		s.AnalyzeAfter,
 	)
 }

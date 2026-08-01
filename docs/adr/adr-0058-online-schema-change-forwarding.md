@@ -181,7 +181,7 @@ Why opt-in and not default-on:
   conservative path is "operators opt into the new behavior";
   flipping the default-on could happen in a major-version bump
   after the feature has soaked in production.
-- **Symmetry with `CoordinateLiveDDL`.** Shape A's live-coordination
+- **Symmetry with `--no-coordinate-live-ddl`.** Shape A's live-coordination
   defaults ON because it's only active when Shape A itself is
   engaged (operator already opted into multi-shard coordination by
   setting `--inject-shard-column`). The single-stream path has no

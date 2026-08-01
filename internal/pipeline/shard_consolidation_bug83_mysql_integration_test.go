@@ -54,7 +54,6 @@ func TestStreamer_Bug83_MySQL_LiveCoordination_AddColumn(t *testing.T) {
 			Name:  "source_shard_id",
 			Value: "shard_a",
 		},
-		CoordinateLiveDDL: true,
 		ShardCoordinationLease: LeaseConfig{
 			LeaseDuration: 30 * time.Second,
 			RenewDeadline: 20 * time.Second,

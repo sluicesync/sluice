@@ -663,19 +663,26 @@ type Streamer struct {
 	// UpfrontIndexes mirrors [Migrator.UpfrontIndexes] (item 111 phase 2): when
 	// true, the cold-start builds every secondary index BEFORE the bulk copy
 	// (maintained during load) instead of the default deferred post-copy build.
-	// Threaded into the cold-start copy via [bulkCopyOpts.UpfrontIndexes] on both
-	// the single- and multi-database cold-start paths. Zero value (false) keeps
-	// the deferred post-copy build, byte-identical to before for every
-	// programmatic / fleet / broker / test caller. Inert when
-	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
+	// Threaded into ALL THREE cold-start copy paths: the serial single-database
+	// and the multi-database ones via [bulkCopyOpts.UpfrontIndexes], and the
+	// ADR-0079 fast parallel one ([Streamer.runColdStartParallel]) via
+	// runBulkCopyPhases' upfrontIndexes argument. The fast path hardcoded
+	// `false` until 2026-08-01 — and it is the DEFAULT whenever the PG source
+	// exports a shareable snapshot, so the flag was silently inert there.
+	// Zero value (false) keeps the deferred post-copy build, byte-identical to
+	// before for every programmatic / fleet / broker / test caller. Inert when
+	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog) —
+	// which is also one of the fast path's disqualifiers, so on that path the
+	// two can never both apply.
 	UpfrontIndexes bool
 
 	// AnalyzeAfter mirrors [Migrator.AnalyzeAfter] (item 111): when true, the
 	// cold-start runs the advisory post-copy per-table statistics refresh
 	// (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) after
 	// constraints and views, so the first post-cutover queries plan against
-	// fresh statistics. Threaded into the cold-start copy via
-	// [bulkCopyOpts.AnalyzeAfter] on both cold-start paths. Advisory: a
+	// fresh statistics. Threaded into ALL THREE cold-start copy paths, exactly
+	// as [Streamer.UpfrontIndexes] is (see its note — the ADR-0079 fast path
+	// hardcoded `false` for both until 2026-08-01). Advisory: a
 	// per-table failure WARNs and never fails the copy. Zero value (false) is
 	// byte-identical to before for every caller; inert when
 	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
@@ -774,6 +781,26 @@ type Streamer struct {
 	// (the v0.99.51 zero-value trap). Inert on every source whose snapshot
 	// reader does not display-round FLOAT (vanilla MySQL, Postgres).
 	NoFloatExactReread bool
+
+	// StrictFloat demands EXACT single-precision FLOAT on a VStream cold-start
+	// or FAILS (CLI: `--strict-float`) — the sync-side mirror of
+	// [backup.Backup.StrictFloat]. Without it, a table the post-COPY exact
+	// re-read cannot repair — keyless, or a single-precision FLOAT anywhere in
+	// the PK — WARNs and cold-starts with the display-rounded values, which is
+	// a fidelity loss the operator may not accept. With it, that table refuses
+	// UPFRONT (SLUICE-E-VSTREAM-FLOAT-LOSSY) before any row moves, naming the
+	// columns.
+	//
+	// `backup full` has had this since the repair landed; the sync cold-start —
+	// the OTHER consumer of the same display-rounding VStream COPY reader, with
+	// the same repairable/un-repairable classification — did not. Wired
+	// 2026-08-01. Opt-in: the zero value keeps the WARN-and-proceed posture,
+	// byte-identical to before.
+	//
+	// Refuses loudly in combination with [Streamer.NoFloatExactReread]:
+	// "repair nothing" and "exact or fail" are contradictory instructions, and
+	// silently letting one win is the class this change exists to close.
+	StrictFloat bool
 
 	// ReapStaleBackends opts the operator into terminating sluice's own
 	// orphaned backends on the target during the cold-start preflight
@@ -1018,13 +1045,24 @@ type Streamer struct {
 	// unique across shards; the safe default is false (guard active).
 	AllowCrossShardMerge bool
 
-	// CoordinateLiveDDL controls ADR-0054 Shape A Phase 2 live
-	// cross-shard DDL coordination. Default true (engaged when
-	// [InjectShardColumn] is engaged; no-op otherwise). Operators on
-	// the v0.72.x drained model — `sync stop --wait` → migrate →
-	// `sync start --resume` — set this to false via the CLI's
-	// `--no-coordinate-live-ddl` flag to preserve pre-ADR-0054
-	// semantics.
+	// NoCoordinateLiveDDL opts OUT of ADR-0054 Shape A Phase 2 live
+	// cross-shard DDL coordination (CLI: `--no-coordinate-live-ddl`).
+	// OPT-OUT-named so the Go zero value (false) keeps live
+	// coordination ON — the shipping default — for every non-CLI
+	// construction (the v0.99.51 zero-value trap). Operators on the
+	// v0.72.x drained model — `sync stop --wait` → migrate →
+	// `sync start --resume` — set it to preserve pre-ADR-0054
+	// semantics. A no-op when [InjectShardColumn] is not engaged.
+	//
+	// It was `CoordinateLiveDDL bool` ("default true") through
+	// v0.106.x, and the trap fired exactly as CLAUDE.md predicts: the
+	// ONLY assignment was `sync start`'s CLI wiring, so the fleet
+	// (`sync run`, buildStreamerFromSpec) — which DOES accept
+	// `inject-shard-column` — silently got `false` and took the
+	// suppressed branch in [Streamer.engageShardCoordination], making
+	// the refuseEngineMissingCoordination refusal directly below it
+	// unreachable there. A byte-identical fleet YAML and `sync start`
+	// invocation disagreed on DDL posture with no WARN.
 	//
 	// When engaged, observed DDL boundaries on each per-shard stream
 	// route through a [LeaseManager] keyed off the consolidated
@@ -1033,13 +1071,13 @@ type Streamer struct {
 	// version + DDL checksum. Peer streams observe the recorded
 	// state and skip the apply, continuing CDC against the migrated
 	// target without a drain.
-	CoordinateLiveDDL bool
+	NoCoordinateLiveDDL bool
 
 	// ShardCoordinationLease holds the lease-timing knobs operator-
 	// tunable via the `--shard-coordination-{lease-duration,
 	// renew-deadline,retry-period}` CLI flags. The zero value uses
 	// the ADR-0054 §2 defaults (30s / 20s / 10s). Only consulted
-	// when [CoordinateLiveDDL] is true and [InjectShardColumn] is
+	// when [NoCoordinateLiveDDL] is unset and [InjectShardColumn] is
 	// engaged.
 	ShardCoordinationLease LeaseConfig
 
@@ -1258,7 +1296,7 @@ type Streamer struct {
 
 	// leaseMgr is the ADR-0054 Shape A Phase 2 live-coordination
 	// lease manager. Constructed by [engageShardCoordination] when
-	// [CoordinateLiveDDL] is true, [InjectShardColumn] is engaged,
+	// [NoCoordinateLiveDDL] is unset, [InjectShardColumn] is engaged,
 	// and the target applier implements
 	// [ir.ShardConsolidationLeaseStore]. Nil otherwise (drained
 	// model or non-Shape-A stream).

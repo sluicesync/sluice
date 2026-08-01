@@ -153,7 +153,6 @@ func TestStreamer_SweepFiresEndToEnd_OnRealPGEngagement(t *testing.T) {
 			Name:  "source_shard_id",
 			Value: "shard_a",
 		},
-		CoordinateLiveDDL: true,
 		ShardCoordinationLease: LeaseConfig{
 			// Aggressive cadence for the test: heartbeat every 100ms,
 			// renew window 5s, lease TTL 30s. The TTL > RenewDeadline >

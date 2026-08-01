@@ -39,6 +39,28 @@ import (
 // mechanism, not the policy — a struct-reflection-with-naming-convention gate
 // would flag every non-copy field and drown the signal, so the flags are named
 // explicitly and each exemption is reasoned.
+//
+// # What this gate CANNOT see, and which gate does (2026-08-01)
+//
+// Two limitations are structural, not incidental, and both shipped defects
+// while this test was green. Naming them here so the next reader does not
+// mistake a green run for full coverage:
+//
+//  1. It is CURATED. A copy-phase flag nobody adds to parityFlags is invisible
+//     to it — the gate needs a human to do the thing it exists to guarantee.
+//     The fail-by-default replacement is cmd/sluice's
+//     TestMigrateSyncFlagSurfaceParity, which diffs the two commands' REAL
+//     kong flag sets and demands a written reason for every difference.
+//  2. It checks PRESENCE, not wiring. A field that exists and is never
+//     assigned, or is assigned a constant at the call site, passes.
+//     TestSharedPhaseFieldAssignmentParity (cmd/sluice) covers the
+//     construction sites; [TestCopyPhaseKnobsReachTheOrchestratorFromAField]
+//     and [TestBulkCopyOptsProductionSitesSetEveryKnob] (this package) cover
+//     the orchestrator crossings.
+//
+// This test remains useful as the cheap structural anchor — it is what fails
+// first, and most legibly, when a flag lands on one struct — but it is no
+// longer the enforcement.
 func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 	// parityFlags: copy-phase capabilities that MUST exist on both Migrator and
 	// Streamer (they share the copy phases), keyed by the struct field name each

@@ -163,9 +163,8 @@ func (*fakeSchemaWriter) Close() error                                  { return
 func TestEngage_NoopWhenNotShapeA(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
-		StreamID:          "stream-a",
-		CoordinateLiveDDL: true,
-		Target:            stubNamedEngine{name: "stub"},
+		StreamID: "stream-a",
+		Target:   stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
@@ -178,10 +177,10 @@ func TestEngage_NoopWhenNotShapeA(t *testing.T) {
 func TestEngage_NoopWhenOptOut(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
-		StreamID:          "stream-a",
-		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: false,
-		Target:            stubNamedEngine{name: "stub"},
+		StreamID:            "stream-a",
+		InjectShardColumn:   ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		NoCoordinateLiveDDL: true,
+		Target:              stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
@@ -191,13 +190,19 @@ func TestEngage_NoopWhenOptOut(t *testing.T) {
 	}
 }
 
+// TestEngage_RefusesNonSupportingEngine also pins the v0.99.51 zero-value
+// posture of NoCoordinateLiveDDL: this Streamer never assigns the field — the
+// shape every fleet / broker / programmatic construction has — and the loud
+// refusal is still REACHABLE. Under the former `CoordinateLiveDDL bool`
+// ("default true", assigned only by `sync start`) this test only passed
+// because it set the field by hand; the fleet path silently returned nil at
+// the suppressed branch directly above the refusal.
 func TestEngage_RefusesNonSupportingEngine(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
 		StreamID:          "stream-a",
 		Target:            stubNamedEngine{name: "fictitious"},
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 	}
 	err := s.engageShardCoordination(context.Background(), nonSupportingApplier{})
 	if err == nil {
@@ -211,12 +216,13 @@ func TestEngage_RefusesNonSupportingEngine(t *testing.T) {
 	}
 }
 
+// TestEngage_ConstructsManagerWhenSupported is the positive half of the same
+// zero-value pin: an unassigned NoCoordinateLiveDDL COORDINATES.
 func TestEngage_ConstructsManagerWhenSupported(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
@@ -243,7 +249,6 @@ func TestEngage_DefaultsZeroLeaseConfig(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
@@ -276,7 +281,6 @@ func TestEngage_WiresGCDepsWhenAllSurfacesPresent(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 		Source:            stubNamedEngine{name: "src-stub"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
@@ -313,7 +317,6 @@ func TestEngage_NoGCWhenSourceLacksOrderer(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 		Source:            engineWithoutOrderer{name: "no-orderer-src"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
@@ -394,7 +397,6 @@ func TestEngage_InheritsNoGCDefaultWhenSurfacesMissing(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: true,
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	applier := &leaseStoreOnlyApplier{
