@@ -163,6 +163,20 @@ manifest Put per run.
   slot-persisted log line both name the retention cost.
 - A graceful failure that never wrote the in-progress manifest leaves
   no slot and no manifest — re-runs start clean, as before.
+- **Impl note (later): §9's guard was the WRITE half only, and the read
+  half was missing for two years.** `resolveParent` refused to *extend* a
+  chain off an `in_progress` manifest, and its comment said why —
+  "restore would be missing tables while exiting 0". Nothing on the read
+  side checked the field: `restore` created every table in the crashed
+  manifest's embedded schema, loaded the ones it listed, logged the rest
+  at INFO and exited 0, and `backup verify` rehashed the listed chunks,
+  found them all intact, and called the backup healthy. That is now
+  refused as `SLUICE-E-BACKUP-INTERRUPTED` (exit 3) from
+  `restoreManifestIntegrityPreflights` — the shared list restore and
+  verify both run — plus `export-as-parquet`. The general lesson is the
+  one this ADR's §9 half-learned: a state written to protect a chain has
+  to be read by everything that consumes the chain, not just by the
+  operation that motivated writing it.
 - Older binaries resuming a post-fix crashed manifest still exhibit
   the pre-fix behaviour (they overwrite the anchor); nothing can be
   done about that from this side. Post-fix binaries resuming pre-fix
