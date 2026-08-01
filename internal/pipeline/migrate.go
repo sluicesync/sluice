@@ -1191,6 +1191,14 @@ type bulkCopyOpts struct {
 	// (the target catalog, indexes included, is the operator's responsibility).
 	UpfrontIndexes bool
 
+	// AnalyzeAfter, when true, runs the advisory post-copy per-table
+	// statistics refresh (runAnalyzeAfterPhase) after constraints and views
+	// — the sync cold-start mirror of Migrator.AnalyzeAfter (item 111). Zero
+	// value (false) is byte-identical to the prior behavior for every caller.
+	// Advisory: a per-table ANALYZE failure WARNs and never fails the copy.
+	// Unreachable under SkipSchemaApply (the operator owns the catalog + stats).
+	AnalyzeAfter bool
+
 	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for
 	// the idempotent VStream/CDC snapshot cold-start copy (ADR-0097).
 	// Resolved through [resolveCopyFanoutDegree]: the Go zero value (0)
@@ -1420,6 +1428,15 @@ func runBulkCopyWithOpts(
 	reportDegradedFKs(ctx, sw)
 	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseViews, err)
+	}
+	// Advisory post-success phase: --analyze-after (item 111 AnalyzeAfter
+	// parity). Runs LAST — after constraints and views — so the refreshed
+	// statistics reflect the final table shape; the sync cold-start mirror of
+	// the Migrator's runBulkCopyPhases analyze phase. Advisory: per-table WARN
+	// only, never fails the copy. Reached only on the schema-applied path (the
+	// SkipSchemaApply early return above owns the operator-owns-catalog case).
+	if opts.AnalyzeAfter {
+		runAnalyzeAfterPhase(ctx, schema, sw)
 	}
 	return nil
 }

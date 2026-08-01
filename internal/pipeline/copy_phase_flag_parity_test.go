@@ -52,23 +52,21 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 		"BulkBatchSize",      // both: per-batch row count for the copy
 		"UpfrontIndexes",     // both: build secondary indexes before the copy (item 111 phase 2)
 		"RaiseQueryTimeout",  // both: ADR-0182 query-timeout raise around the copy (item 111 phase 3)
-		"AnalyzeAfter",       // EXEMPT (migrate-only) — see parityExempt
+		"AnalyzeAfter",       // both: advisory post-copy ANALYZE statistics refresh (item 111)
 	}
 
 	// parityExempt: field -> reason, for deliberate or pending asymmetries. An
 	// exempt flag is asserted present on EXACTLY ONE struct, so the day someone
 	// wires it to both (or renames it away) this gate fails and forces the
 	// exemption to be removed — a stale exemption cannot rot silently.
-	parityExempt := map[string]string{
-		// Pending, NOT a designed fork. AnalyzeAfter runs an advisory post-copy
-		// statistics refresh (ANALYZE) after constraints/views. A sync cold-start
-		// bulk-loads and leaves stale planner stats exactly like migrate does, so
-		// this arguably applies to sync too — there is no known architectural
-		// blocker, it simply was never wired. Recorded here so the gap is durable
-		// and actionable rather than invisible; a future session can wire it and
-		// remove this exemption.
-		"AnalyzeAfter": "advisory post-copy ANALYZE statistics refresh; migrate-only today with NO known architectural blocker — an unwired candidate for sync cold-start, not a designed fork. Recorded so the gap stays visible; wire it and drop this exemption when addressed",
-	}
+	//
+	// EMPTY as of item 111: every copy-phase flag above is wired to BOTH
+	// entry points — full parity. The map and its enforcement stay in place so
+	// the moment a future copy-phase flag lands on one struct and not the other,
+	// the gate fails until it's either wired to both or exempted here with a
+	// reason. (UpfrontIndexes/RaiseQueryTimeout/AnalyzeAfter were each exempt in
+	// turn during item 111 and dropped as they were wired.)
+	parityExempt := map[string]string{}
 
 	migType := reflect.TypeOf(Migrator{})
 	strType := reflect.TypeOf(Streamer{})

@@ -670,6 +670,17 @@ type Streamer struct {
 	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
 	UpfrontIndexes bool
 
+	// AnalyzeAfter mirrors [Migrator.AnalyzeAfter] (item 111): when true, the
+	// cold-start runs the advisory post-copy per-table statistics refresh
+	// (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) after
+	// constraints and views, so the first post-cutover queries plan against
+	// fresh statistics. Threaded into the cold-start copy via
+	// [bulkCopyOpts.AnalyzeAfter] on both cold-start paths. Advisory: a
+	// per-table failure WARNs and never fails the copy. Zero value (false) is
+	// byte-identical to before for every caller; inert when
+	// [Streamer.SchemaAlreadyApplied] is set (the operator owns the catalog).
+	AnalyzeAfter bool
+
 	// RaiseQueryTimeout mirrors [Migrator.RaiseQueryTimeout] (ADR-0182, item 111
 	// phase 3): arms the opt-in raise of the PlanetScale keyspace's
 	// queryserver-config-query-timeout to its 3600s maximum for the duration of

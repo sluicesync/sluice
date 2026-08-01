@@ -1201,6 +1201,8 @@ type SyncStartCmd struct {
 
 	UpfrontIndexes bool `help:"Create secondary indexes before the cold-start bulk copy (maintained during load) instead of the default deferred post-copy build. Useful for large PlanetScale-MySQL targets where a deferred ADD INDEX can exceed the statement-time limit; trades slower load for no post-copy index build."`
 
+	AnalyzeAfter bool `help:"Refresh the target's planner statistics after the cold-start copy completes: one per-table ANALYZE (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) once constraints and views are in place. A freshly bulk-loaded table has stale statistics, so the first post-cutover queries plan badly until autovacuum or a background ANALYZE catches up — this closes that window at cutover time. Advisory: a per-table failure WARNs and never fails the cold-start. Applies to the cold-start only (steady-state CDC apply is unaffected). Default off."`
+
 	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a CROSS-engine migration they are skipped by default (the source's migration history is invalid on a different target engine); this flag forces keeping them. Mutually exclusive with --skip-orm-tables."`
 	SkipORMTables    bool `help:"Skip ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a SAME-engine migration they are kept by default (the migration history is valid); this flag forces skipping them. Mutually exclusive with --include-orm-tables."`
 
@@ -2148,6 +2150,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		SkipViews:            s.SkipViews,
 		SkipForeignKeys:      s.SkipForeignKeys,
 		UpfrontIndexes:       s.UpfrontIndexes,
+		AnalyzeAfter:         s.AnalyzeAfter,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine sync; a same-engine sync KEEPS them by default (the history
 		// is valid). --include-orm-tables / --skip-orm-tables override. (The
