@@ -2291,12 +2291,18 @@ type QueryTimeoutRaiseRecorder interface {
 // provably redundant (roadmap item 109).
 //
 // It is set true ONLY on the safe-by-construction path: an UNFILTERED migrate
-// (no `--where` row filters) from a source that enforced those FKs, whose
-// per-table reparent reconciliation re-derives every touched table to exactly
-// match that source before the constraints phase (ADR-0141). A `--where` run
-// can legitimately orphan children (filtering a parent), so it must NOT set
-// this — the target-side validation is the loud net that catches those; and
-// sync cold-start / a pre-populated target never set it either.
+// OR an unfiltered sync cold-start (item 112; no `--where` row filters) from a
+// source that enforced those FKs. A `--where` run can legitimately orphan
+// children (filtering a parent), so it must NOT set this — the target-side
+// validation is the loud net that catches those; and a pre-populated target
+// (`--schema-already-applied`, which skips the constraints phase entirely) never
+// sets it either. The declaration substitutes metadata-only add + a bounded
+// chunked orphan scan for full re-validation; the orphan scan gives the
+// IDENTICAL FK-correctness guarantee (both catch a child pointing at a missing
+// parent and refuse loudly), so no functioning safety net is removed — see
+// [ArmForeignKeyConsistency]. (Migrate additionally reconciles reparent-touched
+// tables from source before constraints, ADR-0141; sync relies on the same
+// orphan scan, which is the load-bearing net for FK validity on both paths.)
 //
 // A MySQL/Vitess target uses the declaration to add a foreign key that would
 // otherwise blow PlanetScale's statement-time wall (errno 3024 — InnoDB

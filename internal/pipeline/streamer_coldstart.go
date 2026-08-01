@@ -635,6 +635,16 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	migcore.ApplyIndexBuildFallback(sw, s.IndexBuildFallback)
+	// Item 112: arm the item-109 metadata-only FK path for the sync cold-start,
+	// exactly as migrate does (migrate.go). UNFILTERED only — a `--where` stream
+	// can legitimately orphan children by filtering a parent, so it keeps full
+	// target-side FK validation (the loud net). The metadata-only add is still
+	// followed by the writer's bounded chunked orphan scan, so the FK-correctness
+	// guarantee is identical to full validation (both catch orphans and refuse
+	// loudly via SLUICE-E-FK-SOURCE-ORPHAN); it only skips the re-validation that
+	// would otherwise blow PlanetScale's statement-time wall on a large child
+	// table. Zero value (no setter → PG/SQLite) skips cleanly.
+	migcore.ArmForeignKeyConsistency(sw, len(s.RowFilters) == 0)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
@@ -964,6 +974,21 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 		_ = stream.Abandon()
 		return copyErr
 	}
+	// Item 112: prove any metadata-only-added FKs clean BEFORE closing sw and
+	// BEFORE the CDC anchor. The unfiltered cold-start armed the item-109
+	// metadata-only FK path (coldStartOpenTargetWriters), which skips InnoDB's
+	// O(rows) validation to dodge PlanetScale's statement-time wall; the bounded
+	// chunked orphan scan is the load-bearing net that recovers the loud signal
+	// (identical FK-correctness guarantee to full validation). A no-op unless FKs
+	// were actually added metadata-only. On a violation the scan drops the FK and
+	// returns SLUICE-E-FK-SOURCE-ORPHAN — abandon the stream (Bug 177: refuse
+	// before the anchor so the just-created slot is dropped, not orphaned).
+	if fkErr := s.verifyUnvalidatedForeignKeys(ctx, sw, schema); fkErr != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return fkErr
+	}
 	migcore.CloseIf(rw)
 	migcore.CloseIf(sw)
 	// Release the snapshot transaction and import-side connections
@@ -981,6 +1006,34 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 	}
 	slog.InfoContext(ctx, "bulk-copy complete; entering CDC mode")
 	return nil
+}
+
+// verifyUnvalidatedForeignKeys runs the roadmap-item-109 post-constraints
+// orphan scan for the sync cold-start — the mirror of [Migrator.verifyUnvalidatedForeignKeys]
+// (item 112). For every FK the target added metadata-only under
+// foreign_key_checks=0 (the item-109 statement-wall recovery, armed for the
+// unfiltered cold-start in [coldStartOpenTargetWriters]), it proves the copied
+// child rows clean with a bounded chunked scan, dropping the FK and refusing
+// loudly (SLUICE-E-FK-SOURCE-ORPHAN) on a violation. A no-op unless the writer
+// reports metadata-only-added FKs — so it opens no target reader on the common
+// path (no armed FK walled, a PG/SQLite target, or a filtered run). The chunk
+// boundaries are computed on a TARGET-side reader (the samplers the parallel
+// copy uses); the scan itself runs on the writer.
+func (s *Streamer) verifyUnvalidatedForeignKeys(ctx context.Context, sw ir.SchemaWriter, schema *ir.Schema) error {
+	r, ok := sw.(ir.UnvalidatedForeignKeyReporter)
+	if !ok || len(r.UnvalidatedForeignKeys()) == 0 {
+		return nil
+	}
+	tr, err := s.Target.OpenRowReader(ctx, s.TargetDSN)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConstraints,
+			fmt.Errorf("pipeline: open target reader to verify metadata-only foreign keys: %w", err))
+	}
+	defer migcore.CloseIf(tr)
+	migcore.ApplyTargetSchema(tr, s.TargetSchema)
+	// The returned error is already coded (SLUICE-E-FK-SOURCE-ORPHAN) or a loud
+	// wrapped scan failure — return it unchanged.
+	return migcore.ValidateUnvalidatedForeignKeys(ctx, sw, schema, tr)
 }
 
 // coldStartAnchorWriteTimeout bounds the cold-start CDC anchor write

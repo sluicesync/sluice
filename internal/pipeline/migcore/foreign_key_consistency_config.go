@@ -11,12 +11,16 @@ import "sluicesync.dev/sluice/internal/ir"
 // foreign keys the constraints phase will create — roadmap item 109.
 //
 // consistent is true ONLY for the safe-by-construction path: an UNFILTERED
-// migrate (no `--where` row filters) from a source that enforced those FKs,
-// whose reparent reconciliation (ADR-0141) re-derives every touched table to
-// match that source before the constraints phase. A `--where` run can orphan
-// children by filtering a parent, so it passes false and the target keeps its
-// loud FK validation. Only the migrate orchestrator calls this — sync
-// cold-start / add-table open their own writers and never arm it.
+// migrate OR an unfiltered sync cold-start (item 112; no `--where` row filters)
+// from a source that enforced those FKs. A `--where` run can orphan children by
+// filtering a parent, so it passes false and the target keeps its loud FK
+// validation. Both the migrate orchestrator (migrate.go / migrate_multidb.go)
+// and the sync cold-start (streamer_coldstart.go / streamer_multidb.go) call
+// this on their freshly-opened writers; add-table and warm-resume do not (they
+// create no constraints). The metadata-only add it enables is always followed
+// by the writer's bounded chunked orphan scan, which is the load-bearing
+// FK-correctness net — identical guarantee to full validation, minus the
+// re-validation that would blow the statement-time wall.
 //
 // Engine-neutral: a target without the setter (today: PG — it adds FKs
 // `NOT VALID` then validates, with no statement-time wall to route around —

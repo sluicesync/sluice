@@ -640,6 +640,13 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	migcore.ApplyIndexBuildFallback(sw, s.IndexBuildFallback)
+	// Item 112 is deliberately NOT armed on the multi-database cold-start: the
+	// item-109 metadata-only FK add is only safe when its bounded orphan scan
+	// runs, and that scan is wired into the single-DB coldStartRunCopy path, not
+	// coldStartMultiDatabase. Arming here without the scan would add unvalidated
+	// FKs and silently accept a dirty source's orphans. So the multi-DB path
+	// keeps full target-side FK validation (safe, just not wall-optimized) —
+	// wiring the scan into the multi-DB path is a follow-up if demand appears.
 
 	rw, err := s.Target.OpenRowWriter(ctx, targetDSN)
 	if err != nil {

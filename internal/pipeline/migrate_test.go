@@ -529,6 +529,10 @@ type recordingEngine struct {
 	// hands out: under the ADR-0076 cross-table pool, peer tables call
 	// WriteRows concurrently on sibling writers that share this slice.
 	mu sync.Mutex
+	// fkConsistent captures the last value passed to the writer's
+	// SetCopiedRowsForeignKeyConsistent (item 109/112 arming). Default false
+	// (nothing armed); a nil-safe capture, harmless for tests that ignore it.
+	fkConsistent bool
 }
 
 func newRecordingEngine(name string) *recordingEngine {
@@ -544,7 +548,7 @@ func (e *recordingEngine) OpenSchemaReader(_ context.Context, _ string) (ir.Sche
 
 func (e *recordingEngine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, error) {
 	e.openSchemaWriterCalls++
-	return &recordingSchemaWriter{phaseLog: &e.phaseLog, createdTables: &e.createdTables}, nil
+	return &recordingSchemaWriter{phaseLog: &e.phaseLog, createdTables: &e.createdTables, fkConsistent: &e.fkConsistent}, nil
 }
 
 func (e *recordingEngine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
@@ -583,6 +587,18 @@ func (r *recordingSchemaReader) ReadSchema(context.Context) (*ir.Schema, error) 
 type recordingSchemaWriter struct {
 	phaseLog      *[]string
 	createdTables *[]string
+	// fkConsistent, when non-nil, captures SetCopiedRowsForeignKeyConsistent
+	// (the item-109/112 metadata-only FK arming). nil = ignore the declaration.
+	fkConsistent *bool
+}
+
+// SetCopiedRowsForeignKeyConsistent implements ir.ForeignKeyConsistencyDeclarer
+// so tests can assert whether an orchestrator armed the item-109 metadata-only
+// FK path. Captures into fkConsistent when set; nil-safe otherwise.
+func (w *recordingSchemaWriter) SetCopiedRowsForeignKeyConsistent(consistent bool) {
+	if w.fkConsistent != nil {
+		*w.fkConsistent = consistent
+	}
 }
 
 func (w *recordingSchemaWriter) CreateTablesWithoutConstraints(_ context.Context, s *ir.Schema) error {
