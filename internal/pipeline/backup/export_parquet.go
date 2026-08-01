@@ -220,6 +220,16 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 	if manifest.Schema == nil {
 		return errors.New("export-as-parquet: selected manifest carries no schema")
 	}
+	// The third read path in the class restore and verify belong to: a
+	// snapshot whose run never finished would export a Parquet set covering
+	// only the tables the run reached, under an index claiming to be the
+	// source as of the full's snapshot position. Gated on the SELECTED full
+	// alone, because that manifest's chunks are the only ones this command
+	// reads — a trailing incremental is already outside the export (the
+	// WARN below says so).
+	if err := refuseInterruptedManifest(manifest, rec.Path); err != nil {
+		return fmt.Errorf("export-as-parquet: %w", err)
+	}
 	if trailingIncrementals > 0 {
 		slog.WarnContext(
 			ctx, "export-as-parquet: the chain carries incremental windows AFTER the exported snapshot; their changes are NOT in this export — the Parquet files represent the source exactly at the full's snapshot position (restore the chain and re-export for point-in-time state)",

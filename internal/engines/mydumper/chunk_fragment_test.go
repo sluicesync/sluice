@@ -35,6 +35,14 @@ func TestChunkKeywordlessFragments(t *testing.T) {
 		{"digit-leading-garbage", insertA + "40101 SET NAMES binary;\n" + insertB, 0, "does not begin with a SQL keyword"},
 		{"mid-file-bom", insertA + "\xef\xbb\xbf" + insertB, 0, "does not begin with a SQL keyword"},
 		{"unterminated-versioned-comment", insertA + "/*!40101 SET NAMES binary\n", 0, "does not begin with a SQL keyword"},
+		// The plain-comment twin of the line above, and the operator-
+		// observable shape of the one-line fix in
+		// [stripLeadingCommentsAndSpace]: the splitter's block-comment
+		// state runs to EOF, so `/* note` with no `*/` sweeps insertB into
+		// the same fragment. Pre-fix the stripper reported that fragment as
+		// comment-only, so insertB's rows vanished and `migrate` exited 0.
+		{"unterminated-block-comment", insertA + "/* note\n" + insertB, 0, "does not begin with a SQL keyword"},
+		{"unterminated-block-comment-at-eof", insertA + "/* trailer with no close\n", 0, "does not begin with a SQL keyword"},
 		{"block-comment-fragment-skipped", "/* header */;\n" + insertA + "/* trailer */", 2, ""},
 		{"line-comment-fragment-skipped", "-- header\n;\n" + insertA + "# trailer\n", 2, ""},
 	}

@@ -348,6 +348,15 @@ func (s *statementStream) Next() (string, error) {
 // its matching `*/` are removed and the inner text spliced in. The result
 // starts at the statement's first meaningful token (or is empty for a
 // comment-only fragment).
+//
+// The load-bearing invariant, and the one [errNonSQLFragment] rests its
+// skip on: EMPTY OUT MEANS COMMENT/WHITESPACE ONLY IN. No branch may
+// return "" for input that still carries unrecognised bytes — an
+// unterminated comment (plain or versioned) is handed back whole so the
+// caller refuses it. Pinned in both directions by
+// TestErrNonSQLFragmentRefusesEveryContentShape (nothing with content
+// skips) and TestErrNonSQLFragmentSkipsCommentOnlyFragments (comment-only
+// still skips).
 func stripLeadingCommentsAndSpace(stmt string) string {
 	for {
 		stmt = strings.TrimLeft(stmt, " \t\r\n")
@@ -370,7 +379,15 @@ func stripLeadingCommentsAndSpace(stmt string) string {
 		case strings.HasPrefix(stmt, "/*"):
 			end := strings.Index(stmt, "*/")
 			if end < 0 {
-				return "" // comment swallows the rest
+				// Unterminated; hand the bytes BACK so the caller's parser
+				// refuses loudly — exactly as the versioned sibling above
+				// does. Returning "" here — the shape this replaced — told
+				// [errNonSQLFragment] "pure comment, skip it", so a data
+				// chunk containing a `/*` with no `*/` silently dropped
+				// every INSERT after it and `migrate` exited 0 — the
+				// audit-2026-07-15 CRITICAL-1 class reopened through the
+				// one branch that fix did not close.
+				return stmt
 			}
 			stmt = stmt[end+2:]
 		default:

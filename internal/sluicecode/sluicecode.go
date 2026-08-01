@@ -160,6 +160,7 @@ const (
 	CodeBackupChunkAuthFailed      Code = "SLUICE-E-BACKUP-CHUNK-AUTH-FAILED"
 	CodeBackupChunkCorrupt         Code = "SLUICE-E-BACKUP-CHUNK-CORRUPT"
 	CodeBackupIncomplete           Code = "SLUICE-E-BACKUP-INCOMPLETE"
+	CodeBackupInterrupted          Code = "SLUICE-E-BACKUP-INTERRUPTED"
 	CodeBackupManifestInvalid      Code = "SLUICE-E-BACKUP-MANIFEST-INVALID"
 	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
 	CodeBackupEncryptionMismatch   Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
@@ -354,6 +355,7 @@ var registry = map[Code]Info{
 	CodeBackupChunkAuthFailed:      {ClassRefusal, "an encrypted backup chunk failed authenticated decryption (tampered / corrupt / spliced or reordered store) — the loud, coded twin of the signed-manifest tamper refusal for backups that are encrypted but not signed"},
 	CodeBackupChunkCorrupt:         {ClassRefusal, "a backup chunk's stored bytes do not match the SHA-256 recorded for it in the manifest — at-rest corruption / bit-rot, or a tamper that altered the stored bytes; caught by rehashing at restore, broker replay, and backup verify, before decryption, so it fires on plaintext and encrypted chunks alike (the integrity twin of -CHUNK-AUTH-FAILED, which is the GCM/AAD check)"},
 	CodeBackupIncomplete:           {ClassRefusal, "a restore/replay/export decoded or applied a DIFFERENT number of rows/changes than the manifest records (change-chunk tail truncated, a layer-2 row-count mismatch, or a zeroed RowCount) — the signing-independent backstop against silent truncation/edit of an unsigned backup"},
+	CodeBackupInterrupted:          {ClassRefusal, "a backup manifest records partial_state=in_progress — the run that wrote it was interrupted (or is still going), so it lists only the tables finished at that moment; refused by restore, backup verify, and export-as-parquet before any data is read, because reading it creates every table and loads only some while exiting 0"},
 	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},
 	CodeBackupChainConflict:        {ClassRefusal, "another writer advanced this backup chain mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — either the conditional catalog write refused rather than interleave, or this run's parent is no longer the chain's tip and committing it would fork the lineage; no catalog change was written"},
 	CodeBackupEncryptionMismatch:   {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},

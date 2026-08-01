@@ -792,12 +792,76 @@ const schemaFingerprintRemedy = "restore this chain with a sluice release that s
 // handling with a different contract; folding it in would make verify
 // refuse chains restore accepts whenever a key is absent.
 func restoreManifestIntegrityPreflights(ctx context.Context, links []lineage.SegmentRecord, needsWalk bool) error {
+	// First, because it is the one failure the other two cannot see: an
+	// interrupted manifest is INTERNALLY CONSISTENT — its hash matches its
+	// schema, its id matches its content, its chunks match their SHAs. It
+	// is simply not all of the backup.
+	if err := refuseInterruptedManifests(links); err != nil {
+		return err
+	}
 	if needsWalk {
 		if err := verifySchemaHashes(ctx, links); err != nil {
 			return err
 		}
 	}
 	return verifyBackupIDs(links)
+}
+
+// backupInterruptedRemedy is the remedy half of [refuseInterruptedManifest].
+// It names a real action and invents no flag: an interrupted full is
+// FINISHED by re-running the same command (the backup path resumes from the
+// prior manifest's per-table progress), or abandoned with --force-overwrite.
+// There is deliberately no "restore it anyway" escape hatch — the tables the
+// run never reached are not in the store, so there is nothing for such a flag
+// to read.
+const backupInterruptedRemedy = "finish the interrupted backup by re-running the same `sluice backup full` command against the same destination (it resumes: complete tables are kept, the rest re-stream), then retry. To abandon the partial run instead, re-run it with --force-overwrite for a fresh backup, or restore an older complete backup. Background: docs/operator/error-codes.md, SLUICE-E-BACKUP-INTERRUPTED"
+
+// refuseInterruptedManifests is [refuseInterruptedManifest] over every link
+// of a lineage, in walk order, so a chain whose ROOT full was interrupted
+// refuses at the root rather than after the earlier links have applied.
+func refuseInterruptedManifests(links []lineage.SegmentRecord) error {
+	for i := range links {
+		if err := refuseInterruptedManifest(links[i].Manifest, links[i].Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refuseInterruptedManifest refuses to READ DATA out of a manifest whose
+// [irbackup.Manifest.PartialState] is still "in_progress" — a crashed,
+// cancelled, or still-running `sluice backup full`.
+//
+// It is the read-side twin of the pipeline package's
+// refuseInProgressParent, which has refused to EXTEND a chain off such a
+// manifest since task #42 (ADR-0085) and whose comment described this exact
+// consequence — "restore would be missing tables while exiting 0" — for the
+// paths that then had no guard. A full interrupted after 40 of 60 tables
+// writes a manifest listing 40; every chunk it names is intact and
+// correctly hashed, so `backup verify` rehashed them all and reported the
+// backup healthy, and `restore` created all 60 tables from the embedded
+// schema, loaded 40, logged 20 INFO lines, and exited 0. Silent loss on the
+// DR path, which is the worst place for it.
+//
+// EMPTY PartialState is NOT in-progress. A Phase-1 manifest predates the
+// field entirely and is an immutable complete backup — the same reading
+// [priorResumableTables] and [irbackup.Manifest.PartialState]'s own doc
+// take, and the reason this cannot start refusing old backups.
+//
+// In practice only a `backup full` ever persists an in-progress manifest:
+// `backup incremental` and `backup stream` build theirs in-progress in
+// memory and flip it to complete BEFORE their single write. That is read off those
+// two writers, NOT enforced by a test — so it is stated as an expectation,
+// and the guard deliberately does not depend on it: it runs over every link
+// of the walk, so an in-progress manifest appearing anywhere refuses
+// wherever it is (pinned by TestRefuseInterruptedManifestClass).
+func refuseInterruptedManifest(m *irbackup.Manifest, path string) error {
+	if m == nil || m.PartialState != irbackup.BackupStateInProgress {
+		return nil
+	}
+	return sluicecode.Wrap(sluicecode.CodeBackupInterrupted, backupInterruptedRemedy,
+		fmt.Errorf("backup manifest %q records an interrupted run (partial_state=%q): it lists only the %d table(s) that had finished when the run stopped, so it is not a complete copy of the source — refusing before anything is read",
+			path, m.PartialState, len(m.Tables)))
 }
 
 // verifySchemaHashes recomputes every link's schema fingerprint and
