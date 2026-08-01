@@ -135,9 +135,10 @@ func TestChainRestore_EmptiedWindowForgedAnchor_RefusedRegardlessOfEngine(t *tes
 			// this is free for a store adversary — which is why the gate no longer
 			// trusts the anchor at all: the shape is refused regardless of engine.
 			incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
-				Kind:  irbackup.SchemaDeltaAlterTable,
-				Table: "users",
-				After: users,
+				Kind:   irbackup.SchemaDeltaAlterTable,
+				Table:  "users",
+				Before: users,
+				After:  users,
 			}}
 			incr.BackupID = irbackup.ComputeBackupID(incr)
 			incrPath := "manifests/incr-0001.json"

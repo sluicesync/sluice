@@ -179,12 +179,37 @@ const (
 	// and the post-sweep leg names a recovery.
 	CodeBackupChainUnreadable Code = "SLUICE-E-BACKUP-CHAIN-UNREADABLE"
 
+	// CodeBackupSchemaDeltaUnsupported is the chain-replay side's
+	// refusal for an `alter_table` schema delta carrying a structural
+	// change that has no faithful replay on the target: a dropped
+	// column, a changed primary key, a column that gained or lost its
+	// GENERATED-ness, or a malformed entry. Both replay sites (chain
+	// restore and the broker's incremental follower) previously looked
+	// only for ADDED columns and skipped every other shape in silence —
+	// a pure retype (numeric(10,2) → numeric(20,8)) therefore restored
+	// at the OLD width and let the target round the replayed values on
+	// insert, exit 0. The shapes an engine can apply are now applied;
+	// this code is the loud half for the ones it cannot.
+	CodeBackupSchemaDeltaUnsupported Code = "SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED"
+
 	CodeBackfillNoPrimaryKey      Code = "SLUICE-E-BACKFILL-NO-PRIMARY-KEY"
 	CodeBackfillUnsupportedEngine Code = "SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE"
 	CodeBackfillUnknownColumn     Code = "SLUICE-E-BACKFILL-UNKNOWN-COLUMN"
 	CodeBackfillIncomplete        Code = "SLUICE-E-BACKFILL-INCOMPLETE"
 	CodeBackfillCorruptCursor     Code = "SLUICE-E-BACKFILL-CORRUPT-CURSOR"
 	CodeBackfillConcurrentRun     Code = "SLUICE-E-BACKFILL-CONCURRENT-RUN"
+
+	// CodeBackfillVerifyNoEvidence is the completion gate's refusal to
+	// AUTHORIZE the contract step when the run it is verifying did no
+	// work. `CountRemaining` renders the same verbatim `--where` the
+	// chunk UPDATE does, so a predicate that is valid SQL but
+	// semantically wrong (wrong column, a coercion matching nothing)
+	// counts 0 before the walk, updates 0 rows, and counts 0 after —
+	// every step agrees and none of them is evidence. `--verify`
+	// therefore authorizes only when the backfill it verifies updated at
+	// least one row (this run, a run it resumed, or the completed run it
+	// no-ops over); the three zero-work shapes refuse.
+	CodeBackfillVerifyNoEvidence Code = "SLUICE-E-BACKFILL-VERIFY-NO-EVIDENCE"
 
 	CodeTargetTableShapeMismatch Code = "SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH"
 
@@ -363,12 +388,15 @@ var registry = map[Code]Info{
 	CodeBackupEncryptionMismatch:   {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
 	CodeBackupChainUnreadable:      {ClassRefusal, "backup compact / backup prune re-read the chain the way a restore would and could not: the chain does not walk, or its identity/key material (the chain-root manifest.json a passphrase chain's Argon2id salt is recorded on) is missing or inconsistent — refused BEFORE the destructive sweep with nothing deleted, or reported AFTER it so the run never exits 0 over a chain it just made unreadable"},
 
+	CodeBackupSchemaDeltaUnsupported: {ClassRefusal, "a chain restore / broker replay hit an alter_table schema delta whose shape has no faithful replay on the target (a dropped column, a changed primary key, a column that gained or lost GENERATED, or a malformed entry) — the appliable shapes (added column, column type, nullability, indexes) are emitted through the engine's delta surface; this is the loud half for the rest"},
+
 	CodeBackfillNoPrimaryKey:      {ClassRefusal, "backfill refused: the table has no usable orderable primary key to drive the keyset-chunked walk"},
 	CodeBackfillUnsupportedEngine: {ClassRefusal, "backfill refused: the engine does not implement the in-place backfill surface"},
 	CodeBackfillUnknownColumn:     {ClassRefusal, "backfill refused: a --set column does not exist on the table"},
 	CodeBackfillIncomplete:        {ClassRuntime, "backfill verify found rows still matching the --where guard after the walk — online catch-up needed (rows written behind the cursor), or the guard does not self-describe doneness"},
 	CodeBackfillCorruptCursor:     {ClassRefusal, "backfill refused to resume: the persisted cursor was written by an older sluice whose JSON store mangled binary or large-integer PK values — resuming from it would silently skip or replay PK ranges; re-run with --restart"},
 	CodeBackfillConcurrentRun:     {ClassRefusal, "backfill refused to start: the spec's state row shows a heartbeat fresher than the freshness window while still in the walking phase — another run (typically an overlapping cron invocation) looks live, and two concurrent walks of one spec interleave cursor writes; wait for it to finish or for its heartbeat to go stale"},
+	CodeBackfillVerifyNoEvidence:  {ClassRefusal, "backfill --verify refused to authorize the contract step: the run it verified updated no rows, so its zero remaining-count is not evidence the backfill happened — the guard matched nothing before the walk (typically a wrong --where), rows matched and none were updated, or the completed run it no-ops over recorded no work"},
 
 	CodeSourceForeignDump:   {ClassRefusal, "the --source file is a plain mysqldump/pg_dump SQL dump or a pg_dump custom-format (PGDMP) archive — formats sluice deliberately does not parse; the message carries the scratch-server-replay recipe"},
 	CodeSourceWrongDriver:   {ClassRefusal, "the --source is a recognisable format this source driver does not read (e.g. a mydumper directory handed to the csv driver) — the message names the right driver or preparation step"},

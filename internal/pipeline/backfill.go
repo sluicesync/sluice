@@ -97,11 +97,14 @@ type Backfiller struct {
 	Restart bool
 
 	// Verify runs the completion post-pass AFTER the walk (or after the
-	// completed-spec no-op): one whole-table CountRemaining on Where.
-	// Zero remaining is the explicit safe-to-contract signal; a nonzero
-	// count is the coded SLUICE-E-BACKFILL-INCOMPLETE error. Requires a
-	// non-empty Where — without a self-describing guard the count is
-	// the whole table and the signal is meaningless.
+	// completed-spec no-op): one whole-table CountRemaining on Where,
+	// plus the evidence test ([Backfiller.walkEvidence]). Zero remaining
+	// over a run that moved rows is the safe-to-contract signal; a
+	// nonzero count is the coded SLUICE-E-BACKFILL-INCOMPLETE error, and
+	// zero remaining with no work done anywhere is the coded
+	// SLUICE-E-BACKFILL-VERIFY-NO-EVIDENCE refusal. Requires a non-empty
+	// Where — without a self-describing guard the count is the whole
+	// table and the signal is meaningless.
 	Verify bool
 
 	// VerifyOnly skips the walk entirely — no UPDATEs, no control-table
@@ -164,7 +167,10 @@ type BackfillResult struct {
 	Statement string
 
 	// Verified reports the Verify/VerifyOnly post-pass ran and found
-	// zero rows still matching Where — the safe-to-contract signal.
+	// zero rows still matching Where. Under Verify it additionally
+	// means the run had EVIDENCE a backfill happened (see
+	// [Backfiller.walkEvidence]); under VerifyOnly it is the bare
+	// count, which the printed report says so plainly.
 	Verified bool
 	// VerifiedRemaining is the post-pass count. Always 0 on a returned
 	// result by construction: a nonzero verify count surfaces as the
@@ -294,7 +300,7 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 		// reads/writes — just the whole-table remaining-count on the
 		// guard and the 0-clean / >0-coded-error exit contract.
 		result := &BackfillResult{Table: b.Table}
-		if err := b.verifyComplete(ctx, ex, table, result); err != nil {
+		if err := b.verifyComplete(ctx, ex, table, result, evidenceCountOnly); err != nil {
 			return nil, err
 		}
 		sink.Summary(progress.Result{Fields: []progress.Field{
@@ -331,13 +337,25 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 		return nil, err
 	}
 	sink.PhaseCompleted(backfillPhaseUpdate)
+	ev := b.walkEvidence(result)
+	if ev != evidenceWalkDidWork {
+		// Loud even without --verify: a run that updated nothing is
+		// almost always a wrong guard, and the operator who does not
+		// pass --verify gets no other signal (the walk's own summary
+		// prints "Rows updated: 0" and reads like success).
+		slog.WarnContext(ctx, "backfill: no run of this spec has moved a row",
+			"table", b.Table, "where", b.Where,
+			"remaining_before_walk", result.Remaining,
+			"already_complete", result.AlreadyComplete,
+			"evidence", ev.String())
+	}
 	if b.Verify {
 		// The post-pass runs AFTER the walk (and after the completed-
 		// spec no-op) so it sees the WHOLE table, not just the walked
 		// range. A failed verify does NOT mark the migration state
 		// failed: the walk itself succeeded and its persisted work
 		// stands — the count is the online catch-up signal.
-		if err := b.verifyComplete(ctx, ex, table, result); err != nil {
+		if err := b.verifyComplete(ctx, ex, table, result, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -353,16 +371,113 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 	return result, nil
 }
 
+// backfillEvidence answers the question the completion gate actually
+// needs and the remaining-count cannot: did the backfill this gate is
+// about to authorize ever DO anything?
+//
+// [ir.BackfillExecutor.CountRemaining] renders the SAME verbatim
+// `--where` the chunk UPDATE does, so a predicate that is valid SQL but
+// semantically wrong — a mistyped column, a coercion that matches no
+// row — counts 0 before the walk, updates 0 rows, and counts 0 after.
+// Every step agrees with every other step and not one of them is
+// evidence; the old gate turned that agreement into "safe to run the
+// contract step (drop/rename the old column)", which
+// `sluice expand-contract` consumes as its authorization to DROP.
+type backfillEvidence int
+
+const (
+	// evidenceWalkDidWork — this invocation's walk (or the earlier run
+	// of the same spec whose cursor it resumed, or the completed run it
+	// no-ops over) updated at least one row. The only shape that
+	// authorizes the contract step.
+	evidenceWalkDidWork backfillEvidence = iota
+
+	// evidenceGuardNeverMatched — a fresh, non-resumed walk whose guard
+	// matched NOTHING before it started, and which updated nothing. The
+	// overwhelmingly common producer is a wrong --where.
+	evidenceGuardNeverMatched
+
+	// evidenceWalkDidNothing — rows matched the guard when the walk
+	// began and the walk updated none of them.
+	evidenceWalkDidNothing
+
+	// evidenceCompletedRunDidNothing — the spec's stored state is
+	// terminal `complete`, so this run walked nothing, and the run that
+	// completed it recorded zero rows updated.
+	evidenceCompletedRunDidNothing
+
+	// evidenceCountOnly — --verify-only: no walk ran and there is no
+	// control-table context to consult (the migration id hashes the
+	// --set clauses, which --verify-only does not require). The count is
+	// a fact; "the backfill finished" is an inference this run cannot
+	// make, so it reports the fact and says what it cannot vouch for.
+	evidenceCountOnly
+)
+
+// String renders the evidence shape for logs and refusal messages.
+func (e backfillEvidence) String() string {
+	switch e {
+	case evidenceWalkDidWork:
+		return "walk-did-work"
+	case evidenceGuardNeverMatched:
+		return "guard-never-matched"
+	case evidenceWalkDidNothing:
+		return "walk-did-nothing"
+	case evidenceCompletedRunDidNothing:
+		return "completed-run-did-nothing"
+	case evidenceCountOnly:
+		return "count-only"
+	}
+	return "unknown"
+}
+
+// walkEvidence classifies what a completed [Backfiller.runWalk] proved.
+// RowsUpdated is cumulative across the spec's runs — the walk seeds it
+// from the resumed cursor's RowsCopied, and the completed-spec no-op
+// seeds it from the stored terminal progress row — so a nonzero value
+// means "some run of THIS spec moved rows", which is exactly the
+// evidence the contract step needs.
+func (b *Backfiller) walkEvidence(result *BackfillResult) backfillEvidence {
+	switch {
+	case result.RowsUpdated > 0:
+		return evidenceWalkDidWork
+	case result.AlreadyComplete:
+		return evidenceCompletedRunDidNothing
+	case result.Remaining == 0:
+		return evidenceGuardNeverMatched
+	default:
+		return evidenceWalkDidNothing
+	}
+}
+
 // verifyComplete is the --verify/--verify-only completion gate: one
-// whole-table CountRemaining on the Where guard. Zero rows is the
-// explicit "safe to run the contract step" signal; a nonzero count is
-// the coded SLUICE-E-BACKFILL-INCOMPLETE error — rows written behind
-// the walk's cursor during an online run (or since a completed run)
-// still need a catch-up pass, and on a quiesced database a nonzero
-// count after a clean walk means the guard does not self-describe
-// doneness. Runtime class, not a refusal: the check ran truthfully and
-// found incomplete work (the SLUICE-E-BACKUP-INCOMPLETE analogue).
-func (b *Backfiller) verifyComplete(ctx context.Context, ex ir.BackfillExecutor, table *ir.Table, result *BackfillResult) error {
+// whole-table CountRemaining on the Where guard, plus the evidence test
+// above. A nonzero count is the coded SLUICE-E-BACKFILL-INCOMPLETE
+// error — rows written behind the walk's cursor during an online run
+// (or since a completed run) still need a catch-up pass, and on a
+// quiesced database a nonzero count after a clean walk means the guard
+// does not self-describe doneness. Runtime class, not a refusal: the
+// check ran truthfully and found incomplete work (the
+// SLUICE-E-BACKUP-INCOMPLETE analogue).
+//
+// A ZERO count is where the two statements are separated:
+//
+//   - "0 rows match the guard" is a FACT the count establishes, and it
+//     is what gets reported (and what sets Verified — the signal
+//     `expand-contract` and any scripted gate consume).
+//   - "safe to run the contract step" is an INFERENCE, and it is
+//     printed only when the run has evidence a backfill happened.
+//
+// With --verify (a run that just walked), a zero count with no work
+// done refuses: the gate exists to authorize a DROP COLUMN and it has
+// nothing to authorize it with. With --verify-only there IS no walk to
+// have evidence about — refusing would break the legitimate "the
+// backfill ran yesterday, gate my contract step today" workflow — so it
+// reports the count as the bare fact it is and names what it cannot
+// vouch for. That asymmetry is the design, not an oversight: --verify
+// speaks for the run it just performed, --verify-only speaks only for
+// the count.
+func (b *Backfiller) verifyComplete(ctx context.Context, ex ir.BackfillExecutor, table *ir.Table, result *BackfillResult, ev backfillEvidence) error {
 	n, err := ex.CountRemaining(ctx, table, b.Where)
 	if err != nil {
 		return fmt.Errorf("backfill: verify count remaining (is --where valid SQL for this engine?): %w", err)
@@ -375,14 +490,62 @@ func (b *Backfiller) verifyComplete(ctx context.Context, ex ir.BackfillExecutor,
 				n, b.Table, b.Where),
 		)
 	}
+	if err := b.refuseUnevidencedVerify(ev, result); err != nil {
+		return err
+	}
 	result.Verified = true
 	result.VerifiedRemaining = 0
+	if ev == evidenceCountOnly {
+		fmt.Fprintf(b.out(),
+			"backfill verify: 0 rows of %q match the --where guard (%s). --verify-only ran no backfill, so that count is the only thing this run can attest to — it does not show a backfill ever ran. Confirm the backfill's own run reported rows updated (or re-run it with --verify) before the contract step (drop/rename the old column)\n",
+			b.Table, b.Where)
+		slog.InfoContext(ctx, "backfill verify-only clean (count only, no backfill evidence)",
+			"table", b.Table, "where", b.Where, "remaining", int64(0))
+		return nil
+	}
 	fmt.Fprintf(b.out(),
-		"backfill verified complete: 0 rows of %q match the --where guard (%s) — safe to run the contract step (drop/rename the old column)\n",
-		b.Table, b.Where)
+		"backfill verified complete: 0 rows of %q match the --where guard (%s) after %d row(s) updated — safe to run the contract step (drop/rename the old column)\n",
+		b.Table, b.Where, result.RowsUpdated)
 	slog.InfoContext(ctx, "backfill verified complete",
-		"table", b.Table, "where", b.Where, "remaining", int64(0))
+		"table", b.Table, "where", b.Where, "remaining", int64(0),
+		"rows_updated", result.RowsUpdated)
 	return nil
+}
+
+// refuseUnevidencedVerify turns a zero-work evidence shape into the
+// coded refusal. Each shape gets its own diagnosis because the
+// operator's next move differs: a guard that never matched is a
+// predicate to fix, a walk that did nothing on matching rows is a
+// --set/engine question, and a completed spec that recorded no work is
+// a prior run to look at.
+func (b *Backfiller) refuseUnevidencedVerify(ev backfillEvidence, result *BackfillResult) error {
+	var detail string
+	switch ev {
+	case evidenceWalkDidWork, evidenceCountOnly:
+		return nil
+	case evidenceGuardNeverMatched:
+		detail = fmt.Sprintf(
+			"the --where guard (%s) matched 0 rows of %q BEFORE the walk started and the walk updated none, so the post-walk zero proves nothing — the same predicate is rendered for the count and for the UPDATE, and one that is valid SQL but selects nothing agrees with itself at every step",
+			b.Where, b.Table,
+		)
+	case evidenceWalkDidNothing:
+		detail = fmt.Sprintf(
+			"%d row(s) of %q matched the --where guard (%s) when the walk started and the walk updated none of them, yet none match now — something other than this backfill changed them, so this run cannot vouch for the result",
+			result.Remaining, b.Table, b.Where,
+		)
+	case evidenceCompletedRunDidNothing:
+		detail = fmt.Sprintf(
+			"the stored state for this exact spec is already `complete`, so this run walked nothing — and the run that completed it recorded 0 rows updated, so no run of this spec has ever moved a row of %q",
+			b.Table,
+		)
+	default:
+		detail = "the run produced no evidence a backfill happened"
+	}
+	return sluicecode.Wrap(
+		sluicecode.CodeBackfillVerifyNoEvidence,
+		"check that the --where guard selects the un-backfilled rows (run the count yourself: SELECT count(*) FROM <table> WHERE <guard>) and re-run with --verify. If the backfill genuinely ran earlier — by hand, or in a run whose state is gone — use --verify-only, which reports the count without claiming the work happened",
+		fmt.Errorf("backfill verify: refusing to authorize the contract step — %s", detail),
+	)
 }
 
 // runWalk owns the resume-state lifecycle plus the chunk loop.
@@ -443,6 +606,13 @@ func (b *Backfiller) runWalk(ctx context.Context, ex ir.BackfillExecutor, table 
 			// A completed spec re-run is a no-op by contract: report and
 			// touch no rows. --restart is the explicit start-over.
 			result.AlreadyComplete = true
+			// Carry the completed run's recorded work forward. Without
+			// this the no-op reports RowsUpdated=0 (contradicting the
+			// field's documented "plus the rows recorded by earlier runs
+			// of the same spec"), and the --verify evidence test cannot
+			// tell a spec that backfilled a million rows yesterday from
+			// one whose guard has never matched anything.
+			result.RowsUpdated = state.TableProgress[b.Table].RowsCopied
 			fmt.Fprintf(b.out(),
 				"backfill of %q with this exact spec already completed (state %s); nothing to do — pass --restart to run it again\n",
 				b.Table, migID)

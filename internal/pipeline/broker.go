@@ -1198,7 +1198,6 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.Se
 	}
 	defer migcore.CloseIf(sw)
 
-	deltaApplier, _ := sw.(ir.SchemaDeltaApplier)
 	for _, d := range link.Manifest.SchemaDelta {
 		switch d.Kind {
 		case irbackup.SchemaDeltaAddTable:
@@ -1218,37 +1217,20 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.Se
 				slog.String("table", d.Table),
 			)
 		case irbackup.SchemaDeltaAlterTable:
-			if d.Before == nil || d.After == nil {
-				continue
+			// Every aspect of the delta is disposed of by the shared
+			// [migcore.ApplyAlterDelta] — the same classifier chain
+			// restore uses, so the two replay sites cannot drift again
+			// (both carried the identical added-columns-only loop, and
+			// therefore the identical silent skip of a pure retype).
+			if err := migcore.ApplyAlterDelta(ctx, sw, d, migcore.AlterDeltaContext{
+				SourceEngine: sourceEngine,
+				TargetEngine: targetEngine,
+				BackupID:     lineage.ManifestBackupID(link.Manifest),
+				Origin:       "broker",
+				StreamID:     b.StreamID,
+			}); err != nil {
+				return err
 			}
-			added := lineage.AddedColumns(d.Before, d.After)
-			if len(added) == 0 {
-				continue
-			}
-			if deltaApplier == nil {
-				slog.WarnContext(
-					ctx, "broker: schema delta — altered table with added columns; engine has no SchemaDeltaApplier",
-					slog.String("stream_id", b.StreamID),
-					slog.String("table", d.Table),
-					slog.Int("added_columns", len(added)),
-				)
-				continue
-			}
-			retargetedSchema := translate.RetargetForEngine(
-				&ir.Schema{Tables: []*ir.Table{d.After}},
-				sourceEngine, targetEngine,
-			)
-			retargetedTable := retargetedSchema.Tables[0]
-			retargetedAdded := lineage.AddedColumns(d.Before, retargetedTable)
-			if err := deltaApplier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
-				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
-			}
-			slog.InfoContext(
-				ctx, "broker: schema delta — applied ADD COLUMN",
-				slog.String("stream_id", b.StreamID),
-				slog.String("table", d.Table),
-				slog.Int("added_columns", len(added)),
-			)
 		case irbackup.SchemaDeltaDropTable:
 			slog.WarnContext(
 				ctx, "broker: schema delta — drop ignored (v1 does not auto-DROP)",

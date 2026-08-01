@@ -789,6 +789,12 @@ func TestBackfill_VerifyRunsAfterCompletedNoOp(t *testing.T) {
 	b.Verify = true
 	id := BackfillMigrationID(b.Table, b.Sets, b.Where)
 	store.headers[id] = ir.MigrationState{MigrationID: id, Phase: ir.MigrationPhaseComplete}
+	// The completed run's own progress row: a real walk records the
+	// rows it moved, and that record is the evidence the verify gate
+	// authorizes the contract step with.
+	store.progress[id] = map[string]ir.TableProgress{
+		"items": {State: ir.TableProgressComplete, RowsCopied: 3},
+	}
 
 	_, err := b.Run(context.Background())
 	wantBackfillCode(t, err, sluicecode.CodeBackfillIncomplete)
@@ -833,8 +839,19 @@ func TestBackfill_VerifyOnlyTouchesNothing(t *testing.T) {
 	if ex.execCalls != 0 || store.writes != 0 {
 		t.Errorf("execCalls=%d store writes=%d; --verify-only must touch neither rows nor the control table", ex.execCalls, store.writes)
 	}
-	if !strings.Contains(out.String(), "safe to run the contract step") {
-		t.Errorf("report %q missing the safe-to-contract signal", out.String())
+	// --verify-only reports the FACT (0 rows match) and explicitly does
+	// NOT claim the inference (a backfill happened) — it ran no walk and
+	// reads no control table, so it has no evidence to claim it with.
+	// The unqualified "safe to run the contract step" belongs to
+	// --verify, which speaks for a walk it just performed.
+	if !strings.Contains(out.String(), "0 rows of") {
+		t.Errorf("report %q missing the remaining-count fact", out.String())
+	}
+	if !strings.Contains(out.String(), "does not show a backfill ever ran") {
+		t.Errorf("report %q missing the no-evidence caveat", out.String())
+	}
+	if strings.Contains(out.String(), "safe to run the contract step") {
+		t.Errorf("report %q claims the safe-to-contract inference; --verify-only cannot make it", out.String())
 	}
 
 	// The incomplete shape: still no writes, just the coded error.

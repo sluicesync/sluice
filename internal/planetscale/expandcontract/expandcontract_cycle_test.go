@@ -72,7 +72,14 @@ func TestExpandContract_ResumeFromMigrateHonorsCompletedState(t *testing.T) {
 	ps := newFakePS(t)
 	o, eng, _, _ := newTestOrchestrator(t, ps)
 	o.ResumeFrom = LegMigrate
-	seedBackfillState(o, eng, ir.MigrationPhaseComplete, nil)
+	// A REAL completed walk leaves both the terminal header and the
+	// table-progress row that records the work it did; the verify gate
+	// reads that RowsCopied as the evidence that authorizes the
+	// contract step (a `complete` marker recording zero work is the
+	// wrong-guard shape, refused).
+	seedBackfillState(o, eng, ir.MigrationPhaseComplete, &ir.TableProgress{
+		State: ir.TableProgressComplete, RowsCopied: 10,
+	})
 	for i := range eng.ex.rows {
 		eng.ex.rows[i].filled = true // the completed walk's outcome — verify must pass
 	}

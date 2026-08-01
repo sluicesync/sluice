@@ -192,9 +192,10 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 			}
 			if tc.schemaDelta {
 				incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
-					Kind:  irbackup.SchemaDeltaAlterTable,
-					Table: "users",
-					After: users,
+					Kind:   irbackup.SchemaDeltaAlterTable,
+					Table:  "users",
+					Before: users,
+					After:  users,
 				}}
 			}
 			incr.BackupID = irbackup.ComputeBackupID(incr)

@@ -120,18 +120,31 @@ func qualifiedTableKey(schema, name string) string {
 	return schema + "." + name
 }
 
-// tablesEqual compares two table values for structural equality. The
-// comparison covers: column count, per-column name + type-string +
-// nullable + IsGenerated, primary-key column list, and index name set.
+// tablesEqual compares two table values for structural equality.
+//
+// The comparison is DEFINED BY [ClassifyAlterDelta]: two tables are
+// equal exactly when the classifier reports no differing aspect. That
+// is deliberate rather than incidental — the chain-replay side has to
+// dispose of every difference the diff can see (apply it, prove it
+// needs no DDL, or refuse), and a hand-written equality here plus a
+// hand-written aspect list there is exactly how a shape reaches a
+// silent skip. One list, two consumers. See incremental_delta_shape.go
+// for the aspect registry and the per-aspect disposition.
 //
 // Deliberately coarse — the chain-restore applier reads the After
-// shape verbatim and emits its own ALTER, so a column-comment-only
-// drift that produced an alter_table entry is harmless. The opposite
-// (subtle drift the diff misses) would matter; the comparison
-// includes column types via Type.String() which catches the common
-// shape changes (TINYINT → BOOLEAN, VARCHAR(50) → VARCHAR(100), etc.)
-// and the comment fields are compared via reflect.DeepEqual on the
-// table struct as a whole.
+// shape verbatim, so a column-comment-only drift produces no delta at
+// all (Comment is not a compared aspect). The opposite (subtle drift
+// the diff misses) would matter; the comparison includes column types
+// via Type.String(), which catches the common shape changes (TINYINT →
+// BOOLEAN, VARCHAR(50) → VARCHAR(100), …).
+//
+// Index comparison is a name-keyed SET, not positional: index order is
+// not semantic, and pre-task-#41 manifests recorded Indexes in
+// randomized map-iteration order — so a recorded parent schema vs a
+// fresh (now-deterministic) catalog read can present the identical
+// index set in different order. Positional comparison turned that into
+// phantom alter_table deltas (observed live: schema_deltas=6 on a
+// DDL-free incremental, 2026-06-10 benchmark).
 func tablesEqual(a, b *ir.Table) bool {
 	if a == nil && b == nil {
 		return true
@@ -139,81 +152,7 @@ func tablesEqual(a, b *ir.Table) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.Schema != b.Schema || a.Name != b.Name {
-		return false
-	}
-	if len(a.Columns) != len(b.Columns) {
-		return false
-	}
-	for i, ca := range a.Columns {
-		cb := b.Columns[i]
-		if !columnsEqual(ca, cb) {
-			return false
-		}
-	}
-	if !indicesEqual(a.PrimaryKey, b.PrimaryKey) {
-		return false
-	}
-	if len(a.Indexes) != len(b.Indexes) {
-		return false
-	}
-	// Compare indexes as a name-keyed SET, not positionally: index
-	// order is not semantic, and pre-task-#41 manifests recorded
-	// Indexes in randomized map-iteration order — so a recorded parent
-	// schema vs a fresh (now-deterministic) catalog read can present
-	// the identical index set in different order. Positional comparison
-	// turned that into phantom alter_table deltas (observed live:
-	// schema_deltas=6 on a DDL-free incremental, 2026-06-10 benchmark).
-	byName := make(map[string]*ir.Index, len(b.Indexes))
-	for _, ib := range b.Indexes {
-		if ib != nil {
-			byName[ib.Name] = ib
-		}
-	}
-	for _, ia := range a.Indexes {
-		if ia == nil {
-			return false
-		}
-		ib, ok := byName[ia.Name]
-		if !ok || !indicesEqual(ia, ib) {
-			return false
-		}
-	}
-	return true
-}
-
-func columnsEqual(a, b *ir.Column) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	if a.Name != b.Name {
-		return false
-	}
-	// Type.String() captures width / nullable / etc. on every concrete
-	// IR type — the same property the cross-engine diff relies on.
-	if TypeString(a.Type) != TypeString(b.Type) {
-		return false
-	}
-	if a.Nullable != b.Nullable {
-		return false
-	}
-	if a.IsGenerated() != b.IsGenerated() {
-		return false
-	}
-	// Default values compared via canonicalized form: nil and
-	// DefaultNone{} are operationally equivalent (both mean "no
-	// default"), but reflect.DeepEqual distinguishes them. The IR's
-	// Column.UnmarshalJSON normalises absent defaults to
-	// DefaultNone{}, so a parent manifest round-tripped through JSON
-	// arrives with DefaultNone{} where the in-memory source struct
-	// might have nil. Treat them as equal here.
-	if !defaultsEqual(a.Default, b.Default) {
-		return false
-	}
-	return true
+	return ClassifyAlterDelta(a, b).Equal()
 }
 
 // defaultsEqual compares two DefaultValue interfaces, treating nil

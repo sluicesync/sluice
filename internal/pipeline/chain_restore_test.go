@@ -790,10 +790,15 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 			TableJSON: postDDLPayload,
 		},
 	}
+	// Both sides populated, as [migcore.DiffSchemas] always emits them
+	// for an alter_table (the manifest format pins it) — an ADD COLUMN
+	// delta, which the replay applies through the engine's schema-delta
+	// surface.
 	incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
-		Kind:  irbackup.SchemaDeltaAlterTable,
-		Table: "users",
-		After: postDDL,
+		Kind:   irbackup.SchemaDeltaAlterTable,
+		Table:  "users",
+		Before: schema.Tables[0],
+		After:  postDDL,
 	}}
 	incr.ChangeChunks = nil // no DML
 	incr.BackupID = irbackup.ComputeBackupID(incr)

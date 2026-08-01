@@ -1132,23 +1132,21 @@ func (r *ChainRestore) applyIncremental(
 }
 
 // applySchemaDeltas applies the manifest's SchemaDelta entries to
-// the target. Phase 3.2 strategy: AddTable creates the new table
-// (no rows yet — they arrive via subsequent change events);
-// AlterTable applies via CreateTablesWithoutConstraints if the
-// target supports IF NOT EXISTS / additive ALTER, otherwise refuses
-// loudly; DropTable is a no-op for v1 (the chain might also include
-// inserts into a table being dropped — out-of-order; the
-// conservative thing is to keep the table around and let the
-// operator drop manually after restore).
+// the target:
 //
-// The IR schema writers don't currently expose a "merge alter"
-// surface; they take a whole schema and emit "create everything".
-// For Phase 3.2 we lean on this by re-applying the Schema field's
-// CreateTables — it's idempotent (engine writers IF NOT EXISTS) so
-// a re-apply against an existing table is a no-op for the original
-// columns. New tables get created. Column additions (the common
-// alter case) are NOT picked up by this path; we surface a clear
-// log line and document the limitation.
+//   - AddTable creates the new table via
+//     CreateTablesWithoutConstraints (idempotent — engine writers use
+//     IF NOT EXISTS). No rows yet; they arrive via the change events.
+//   - AlterTable is classified aspect by aspect by
+//     [migcore.ApplyAlterDelta] and each aspect is applied through the
+//     engine's delta surface, proven not to need DDL, or refused
+//     loudly. (The stale note this comment used to carry — "column
+//     additions are NOT picked up by this path" — stopped being true
+//     in v0.17.0 when the [ir.SchemaDeltaApplier] surface landed.)
+//   - DropTable is a no-op for v1: the chain might also include
+//     inserts into a table being dropped (out-of-order under replay),
+//     so the conservative thing is to keep the table and let the
+//     operator drop it manually after restore.
 func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.SegmentRecord) error {
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
@@ -1205,47 +1203,31 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 		)
 	}
 
-	// AlterTable: emit ADD COLUMN for newly-added columns via the
-	// engine's optional [ir.SchemaDeltaApplier] surface. Both PG and
-	// MySQL implement it as of v0.17.0. Engines without the surface
-	// fall through to the legacy "rely on change-stream
-	// reconciliation" path, which works for additive INSERT shapes
-	// on some engines but not all — the loud-failure tenet means
-	// that's the operator's signal to take a fresh full.
+	// AlterTable: dispose of EVERY aspect of the delta through the
+	// shared [migcore.ApplyAlterDelta] — ADD COLUMN and the other
+	// engine-appliable shapes (column type, nullability, indexes) emit
+	// via the engine's [ir.SchemaDeltaApplier] / [ir.ShapeDeltaApplier]
+	// surfaces; the shapes with no faithful replay refuse loudly.
+	//
+	// This loop used to look ONLY for added columns and `continue` when
+	// there were none, so a pure retype mid-window (numeric(10,2) →
+	// numeric(20,8)) was skipped in silence and the replay's values
+	// were ROUNDED by the target on insert, exit 0. The
+	// aspect-classified dispatch is what closes that class, not just
+	// that one shape.
 	if alters > 0 {
-		applier, _ := sw.(ir.SchemaDeltaApplier)
 		for _, d := range link.Manifest.SchemaDelta {
-			if d.Kind != irbackup.SchemaDeltaAlterTable || d.Before == nil || d.After == nil {
+			if d.Kind != irbackup.SchemaDeltaAlterTable {
 				continue
 			}
-			added := lineage.AddedColumns(d.Before, d.After)
-			if len(added) == 0 {
-				continue
+			if err := migcore.ApplyAlterDelta(ctx, sw, d, migcore.AlterDeltaContext{
+				SourceEngine: link.Manifest.SourceEngine,
+				TargetEngine: r.Target.Name(),
+				BackupID:     lineage.ManifestBackupID(link.Manifest),
+				Origin:       "chain restore",
+			}); err != nil {
+				return err
 			}
-			if applier == nil {
-				slog.WarnContext(
-					ctx, "chain restore: schema delta — altered table with added columns; engine has no SchemaDeltaApplier; replay will rely on the applier's column-list reconciliation. If inserts fail, force a fresh full + new chain.",
-					slog.String("table", d.Table),
-					slog.Int("added_columns", len(added)),
-				)
-				continue
-			}
-			// Retarget the After-shape so cross-engine column types
-			// (UUID → CHAR(36) etc.) get rewritten before emit.
-			retargetSchema := translate.RetargetForEngine(
-				&ir.Schema{Tables: []*ir.Table{d.After}},
-				link.Manifest.SourceEngine, r.Target.Name(),
-			)
-			retargetTable := retargetSchema.Tables[0]
-			retargetAdded := lineage.AddedColumns(d.Before, retargetTable)
-			if err := applier.AlterAddColumn(ctx, retargetTable, retargetAdded); err != nil {
-				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
-			}
-			slog.InfoContext(
-				ctx, "chain restore: schema delta — applied ADD COLUMN",
-				slog.String("table", d.Table),
-				slog.Int("added_columns", len(added)),
-			)
 		}
 	}
 

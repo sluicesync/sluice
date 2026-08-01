@@ -436,26 +436,10 @@ func DetectAmbiguousDeltas(deltas []*irbackup.SchemaDeltaEntry) error {
 	return nil
 }
 
-// AddedColumns returns the columns in after but not in before,
-// preserving after's declaration order.
-func AddedColumns(before, after *ir.Table) []*ir.Column {
-	if after == nil {
-		return nil
-	}
-	beforeNames := map[string]bool{}
-	if before != nil {
-		for _, c := range before.Columns {
-			beforeNames[c.Name] = true
-		}
-	}
-	out := make([]*ir.Column, 0, len(after.Columns))
-	for _, c := range after.Columns {
-		if !beforeNames[c.Name] {
-			out = append(out, c)
-		}
-	}
-	return out
-}
+// AddedColumns moved to [migcore.AddedColumns] when the chain-replay
+// sites were unified behind migcore's alter-delta classifier — the
+// column-set diff is one of the aspects that classifier compares, and
+// two copies of it is exactly how the two replay loops drifted.
 
 // ManifestBackupID returns m's stored or computed BackupID. Pre-
 // Phase-3 manifests have an empty BackupID; we compute it on demand
