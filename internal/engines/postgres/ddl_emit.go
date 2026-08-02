@@ -1508,7 +1508,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 
 	if table.PrimaryKey != nil {
 		pkCols, err := emitIndexColumnList(table.PrimaryKey.Columns, opts,
-			fmt.Sprintf("postgres: primary key on %s.%s", schema, table.Name))
+			fmt.Sprintf("postgres: primary key on %s.%s", schema, table.Name), true)
 		if err != nil {
 			return "", err
 		}
@@ -1581,7 +1581,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 			return "", err
 		}
 		uniqCols, err := emitIndexColumnList(idx.Columns, opts,
-			fmt.Sprintf("postgres: inline unique key %q on %s.%s", idx.Name, schema, table.Name))
+			fmt.Sprintf("postgres: inline unique key %q on %s.%s", idx.Name, schema, table.Name), true)
 		if err != nil {
 			return "", err
 		}
@@ -1614,10 +1614,59 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	return sb.String(), nil
 }
 
+// checkIndexPrefixLength enforces the MySQL-prefix-length policy for every
+// Postgres key-emitting site (audit 2026-08-01 S8). See
+// [emitIndexColumnList] for the reasoning; it lives in its own function
+// because emitAddUniqueConstraint renders its column list independently and
+// the two must not diverge.
+func checkIndexPrefixLength(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	for _, c := range cols {
+		if c.Length <= 0 || c.Expression != "" {
+			continue
+		}
+		if enforcesUniqueness {
+			return fmt.Errorf(
+				"%s: column %q carries a %d-character index prefix, and Postgres has no prefix-length "+
+					"equivalent. On a key that enforces uniqueness the prefix is part of the constraint: the "+
+					"source forbids two rows whose first %d characters of %q match, and a Postgres key over the "+
+					"whole column would ALLOW them — so the target would silently accept data the source "+
+					"rejects. Rewrite the key as a unique index over an expression that reproduces the prefix "+
+					"(for example `left(%s, %d)`), widen it to the full column on the source if the prefix was "+
+					"only a size optimisation, or exclude the table",
+				where, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
+			)
+		}
+		slog.Warn(
+			"index prefix length dropped: Postgres has no prefix-length equivalent, so this index covers the "+
+				"whole column. This changes the index's size and performance, not which rows are legal",
+			slog.String("context", where),
+			slog.String("column", c.Column),
+			slog.Int("source_prefix_length", c.Length),
+		)
+	}
+	return nil
+}
+
 // emitIndexColumnList renders a parenthesised, comma-separated list
-// of index columns. Postgres doesn't support prefix-length on indexes
-// the way MySQL does, so c.Length is ignored (lossy if the source
-// used it; documented).
+// of index columns.
+//
+// enforcesUniqueness reports whether the key this list belongs to
+// constrains the data (a PRIMARY KEY, a UNIQUE constraint, or a UNIQUE
+// index) as opposed to merely indexing it. It decides what happens to a
+// MySQL prefix length, which Postgres has no equivalent for:
+//
+//   - On a UNIQUE key the prefix is part of the CONSTRAINT. MySQL's
+//     `UNIQUE KEY (email(10))` forbids two rows whose first 10 characters
+//     match; a Postgres `UNIQUE (email)` permits them. Dropping the prefix
+//     therefore WEAKENS the constraint, and the target silently admits rows
+//     the source rejected — permanently, at exit 0. That is refused
+//     (audit 2026-08-01 S8).
+//   - On a non-unique index the prefix is a size/performance choice with no
+//     effect on which rows are legal, so it is dropped with a WARN.
+//
+// This function is the chokepoint for all three PG key-emitting sites
+// (inline PRIMARY KEY, inline UNIQUE CONSTRAINT, CREATE INDEX), which is why
+// the check lives here rather than at each caller.
 //
 // Functional/expression entries (Expression non-empty, Column empty)
 // render as `(expression_text)` — Postgres expression-index syntax
@@ -1628,7 +1677,10 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // so a MySQL-source `json_unquote(json_extract(j,'$.k'))` index
 // rewrites to `(j->>'k')` instead of failing at CREATE INDEX.
 // Same-dialect / untagged expressions pass through verbatim.
-func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string) (string, error) {
+func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string, enforcesUniqueness bool) (string, error) {
+	if err := checkIndexPrefixLength(cols, where, enforcesUniqueness); err != nil {
+		return "", err
+	}
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
@@ -1795,7 +1847,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 		sb.WriteString(method)
 		sb.WriteByte(' ')
 	}
-	cols, err := emitIndexColumnList(idx.Columns, opts, where)
+	cols, err := emitIndexColumnList(idx.Columns, opts, where, idx.Unique)
 	if err != nil {
 		return "", err
 	}
@@ -2043,6 +2095,15 @@ func emitAddUniqueConstraint(schema, tableName string, idx *ir.Index) (string, e
 	}
 	if idx.Name == "" || len(idx.Columns) == 0 {
 		return "", fmt.Errorf("postgres: emitAddUniqueConstraint: constraint on %q has no name or no columns", tableName)
+	}
+	// This function renders its own column list rather than calling
+	// [emitIndexColumnList], so it needs the prefix-length gate explicitly —
+	// a UNIQUE CONSTRAINT enforces uniqueness by definition. Sharing the
+	// helper rather than the loop is what keeps the two from drifting
+	// (audit 2026-08-01 S8).
+	if err := checkIndexPrefixLength(idx.Columns,
+		fmt.Sprintf("postgres: unique constraint %q on %s.%s", idx.Name, schema, tableName), true); err != nil {
+		return "", err
 	}
 
 	var sb strings.Builder
