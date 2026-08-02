@@ -1210,26 +1210,18 @@ func orderedTables(s *ir.Schema) []*ir.Table {
 // `geometry(<subtype>, <srid>)` form. Operators previewing a target
 // without PostGIS still see the same loud rejection the actual
 // schema-write phase would raise.
-func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStatement, error) {
-	if s == nil {
-		return nil, errors.New("postgres: PreviewDDL: schema is nil")
-	}
-	// Same Phase-0 namespace proof the apply path runs, so `schema
-	// preview` surfaces a collision BEFORE the operator schedules the
-	// migration rather than at apply time.
-	if err := validatePGIndexNamespace(orderedTables(s)); err != nil {
-		return nil, err
-	}
-
-	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
-	opts := w.emitOpts()
-
-	// Phase 1a: enum types, in deterministic table+column order.
-	// Deduped by resolved type name so a same-engine PG source's
-	// shared enum type (catalog Bug 19c) previews one CREATE TYPE,
-	// matching the apply path. Generated enum columns are skipped
-	// (Bug 25): they emit as TEXT + table-level CHECK in the CREATE
-	// TABLE body, so no enum type is needed.
+// previewEnumTypes renders Phase 1a of [SchemaWriter.PreviewDDL] — the
+// CREATE TYPE statements, in deterministic table+column order. Deduped by
+// resolved type name so a same-engine PG source's shared enum type
+// (catalog Bug 19c) previews ONE CREATE TYPE, matching the apply path.
+// Generated enum columns are skipped (Bug 25): they emit as TEXT plus a
+// table-level CHECK in the CREATE TABLE body, so no enum type is needed.
+//
+// Extracted from PreviewDDL only to keep it under the funlen ratchet
+// (.golangci.yml pins 180 and says never to raise it to admit new code);
+// the behaviour is byte-identical to the inline block it replaced.
+func (w *SchemaWriter) previewEnumTypes(s *ir.Schema) ([]ir.DDLStatement, error) {
+	var out []ir.DDLStatement
 	previewedEnumTypes := map[string]struct{}{}
 	for _, table := range orderedTables(s) {
 		for _, col := range table.Columns {
@@ -1253,6 +1245,28 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			})
 		}
 	}
+	return out, nil
+}
+
+func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStatement, error) {
+	if s == nil {
+		return nil, errors.New("postgres: PreviewDDL: schema is nil")
+	}
+	// Same Phase-0 namespace proof the apply path runs, so `schema
+	// preview` surfaces a collision BEFORE the operator schedules the
+	// migration rather than at apply time.
+	if err := validatePGIndexNamespace(orderedTables(s)); err != nil {
+		return nil, err
+	}
+
+	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
+	opts := w.emitOpts()
+
+	enums, err := w.previewEnumTypes(s)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, enums...)
 
 	// Phase 1a'': standalone sequences (item-51) — before tables,
 	// matching the apply path. The setval position prime is a runtime
