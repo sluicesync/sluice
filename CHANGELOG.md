@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.108.0] - 2026-08-02
+
 ### Fixed
 
 **A Postgres trigger-CDC sync silently dropped committed changes whenever two transactions overlapped, and reported healthy the whole time.** The change-log `id` is a sequence value handed out when a row is written; the transaction id is assigned at the transaction's *first* write. The two orders are independent, so an ordinary multi-statement transaction separates them — `T_A` writes change-log id 1, `T_B` writes id 2 and stays open, `T_A` writes id 3 and commits. A poll taken in that window sees ids 1 and 3, cannot see id 2 (it is uncommitted), and the old poller emitted 1 and 3 and moved its durable position to 3. When `T_B` committed, id 2 was already behind that position: it was never emitted, on any later poll or any restart. The change simply never arrived on the target, `sync status` stayed green, the lag metric stayed flat, and the process exited 0 — the operator's only signal was a row that was right on the source and stale or absent downstream. Two concurrent transactions and one multi-statement write are enough to reach it; this was the default configuration of a shipped source engine under ordinary concurrent load. The poller now consumes only a *contiguous* run of change-log ids and stops at the first missing one, because "missing from this snapshot" is exactly "written by a transaction that has not committed". The cold-start anchor, whose separate and sound argument this poll had drifted away from, now shares one ceiling expression with the poll so the two cannot diverge again.
