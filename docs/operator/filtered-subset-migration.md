@@ -90,7 +90,17 @@ An `UPDATE` that moves a row *into* scope becomes a target `INSERT` (the target 
 
 - **Identifier and time-of-day literals must be written in canonical form.** For `uuid`, `inet`, `cidr`, `macaddr` and `time` columns the literal is compared against the value the change stream delivers, which is always canonicalised — so a non-canonical spelling is refused at sync-start with the canonical form named (write `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`, not `A0EEBC99-…`; `08:00:2b:01:02:03`, not `08-00-2B-01-02-03`; `08:30:00`, not `08:30`). The source itself accepts every one of those spellings — it coerces the literal to the column type before comparing — which is exactly why the mismatch was silent: the cold-start copy succeeded and the continuous leg then classified every change to that row as out-of-scope. A **fractional-second `TIME`** column is refused for any comparison: its value renders as `08:30:00.000000` on the snapshot leg and `08:30:00` on the binlog leg, so no single literal is correct on both.
 
-- **`inet` / `cidr` literals are canonical per SOURCE ENGINE, and the two disagree.** A **Postgres** source delivers every network value with a prefix length, including the full-width mask on a host address — so write `ip = '10.0.0.1/32'`, not `ip = '10.0.0.1'`. That is a property of the driver's decode path rather than of Postgres's text output: `SELECT ip` in psql prints `10.0.0.1`, so the spelling an operator naturally copies is the one that matches nothing. A **MariaDB** source's native `inet4` / `inet6` columns deliver the address bare — so write `ip = '10.0.0.1'` there, and a literal carrying a mask is refused, because those columns hold an address and no stored value could ever carry one. Both refusals name the spelling to use instead. A source engine that has not declared its rendering refuses network comparisons outright rather than guessing, since guessing wrong is silent in exactly the way described above.
+- **`inet` and `cidr` literals have different canonical spellings — on the same server, in the same table.** Postgres's `inet` output drops the prefix length when it is the full width of the address family and keeps it otherwise; `cidr` keeps it always. So for the same address:
+
+  | column type | write | not |
+  | --- | --- | --- |
+  | `inet` holding a host | `ip = '10.0.0.1'` | `ip = '10.0.0.1/32'` |
+  | `inet` holding a network | `ip = '10.0.0.0/24'` | — |
+  | `cidr` holding a host | `net = '10.0.0.1/32'` | `net = '10.0.0.1'` |
+
+  Both of the "not" spellings are ones Postgres itself accepts — it coerces the literal to the column type before comparing — which is why writing one used to succeed at sync-start and then silently match nothing. They are now refused, naming the spelling to use. Note that `SELECT ip::text` shows the mask at every width while `SELECT ip` does not: the **uncast** output is what the change stream carries, so that is the spelling to copy.
+
+  A **MariaDB** source's native `inet4` / `inet6` columns deliver the address bare and cannot hold a network at all, so write `ip = '10.0.0.1'`, and a literal naming a network is refused outright — no stored value could ever equal it. A source engine that has not declared its rendering refuses network comparisons rather than guessing, since guessing wrong is silent in exactly the way described above.
 
 - **`--backfill-added-column` respects `--where`.** The backfill that fills a newly-added column reads only the rows the filter admits, so a filtered sync keeps its bounded source-read volume when a schema change lands.
 

@@ -57,16 +57,29 @@ func (pgCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLiteralS
 	return ir.TemporalLiteralCastToColumn
 }
 
-// ResolveNetworkLiteralRendering implements [ir.NetworkLiteralResolver]:
-// Postgres delivers inet/cidr values with a prefix length ALWAYS, including
-// the full-width mask on a host address. This is a property of the driver's
-// decode path rather than of Postgres's text output — `SELECT ip` on an inet
-// column holding 10.0.0.1 prints "10.0.0.1", but pgx's InetCodec.DecodeValue
-// (v5.10.0, pgtype/inet.go:128-144) scans unconditionally into a
-// netip.Prefix, so the value sluice's decodeNetwork receives and renders is
-// "10.0.0.1/32". A `--where` literal therefore has to carry the mask, and the
-// bare spelling — the one an operator naturally copies out of psql — is the
-// one that silently matches nothing (audit 2026-08-01 S2).
-func (pgCollationResolver) ResolveNetworkLiteralRendering() ir.NetworkLiteralRendering {
-	return ir.NetworkLiteralRenderingMasked
+// ResolveNetworkLiteralRendering implements [ir.NetworkLiteralResolver].
+// Postgres renders its two network types DIFFERENTLY, and both renderings are
+// ground truth from a live PG 16 reading the column (not a `::text` cast,
+// which always shows the mask and is the trap that misled the first cut of
+// this fix — see [ir.NetworkLiteralRendering]'s cost note):
+//
+//	inet '10.0.0.1'     → "10.0.0.1"      (full-width mask omitted)
+//	inet '10.0.0.0/24'  → "10.0.0.0/24"   (narrower mask kept)
+//	cidr '10.0.0.1/32'  → "10.0.0.1/32"   (mask ALWAYS kept, even full width)
+//
+// So each type has its own silent-drop spelling, and they are mirror images:
+// `--where "ip = '10.0.0.1/32'"` on an inet column and
+// `--where "net = '10.0.0.1'"` on a cidr column both compiled clean and
+// matched nothing (audit 2026-08-01 S2, which filed only the first).
+//
+// Both legs agree on these renderings — the snapshot read and the pgoutput
+// CDC read return the same string — which is what makes canonicalisation
+// possible at all; a disagreement would have put these columns in the
+// refuse-outright bucket beside fractional TIME. Pinned live, both legs, by
+// TestNetworkRendering_BothLegsAgree_AndMatchTheDeclaredRendering.
+func (pgCollationResolver) ResolveNetworkLiteralRendering(isCidr bool) ir.NetworkLiteralRendering {
+	if isCidr {
+		return ir.NetworkLiteralRenderingAlwaysMasked
+	}
+	return ir.NetworkLiteralRenderingHostBare
 }

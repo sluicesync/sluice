@@ -45,33 +45,45 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 			},
 		},
 		{
-			name:      "inet/bare rendering (MariaDB inet4)",
+			// MariaDB native inet4/inet6: address-only.
+			name:      "inet/address-only rendering (MariaDB inet4)",
 			colType:   ir.Inet{},
-			rendering: ir.NetworkLiteralRenderingBare,
+			rendering: ir.NetworkLiteralRenderingAddressOnly,
 			canonical: "10.0.0.1",
 			divergent: []string{
 				"010.000.000.001", // zero-padded octets
-				"10.0.0.1/32",     // a mask the bare rendering never delivers
+				"10.0.0.1/32",     // a mask this rendering never delivers
 			},
 		},
 		{
-			// The S2 case: under Postgres's rendering the canonical spelling
-			// is the MASKED one, and the bare address — what an operator
-			// copies out of psql — is the divergent spelling that used to
-			// compile and then match nothing.
-			name:      "inet/masked rendering (Postgres)",
+			// S2, bug one: a Postgres `inet` column does NOT deliver the
+			// full-width mask, so `ip = '10.0.0.1/32'` — a spelling PG itself
+			// accepts — compiled clean and then matched nothing.
+			name:      "inet/host-bare rendering (Postgres inet)",
 			colType:   ir.Inet{},
-			rendering: ir.NetworkLiteralRenderingMasked,
-			canonical: "10.0.0.1/32",
+			rendering: ir.NetworkLiteralRenderingHostBare,
+			canonical: "10.0.0.1",
 			divergent: []string{
-				"10.0.0.1",        // the bare spelling psql prints
+				"10.0.0.1/32",     // the full-width mask PG does not deliver
 				"010.000.000.001", // zero-padded octets
 			},
 		},
 		{
-			name:      "cidr",
+			// S2, bug two — the mirror image the audit did not file. A
+			// Postgres `cidr` column ALWAYS delivers the mask, even at full
+			// width, so the bare spelling is the one that matches nothing.
+			name:      "cidr/always-masked rendering (Postgres cidr)",
 			colType:   ir.Cidr{},
-			rendering: ir.NetworkLiteralRenderingMasked,
+			rendering: ir.NetworkLiteralRenderingAlwaysMasked,
+			canonical: "10.0.0.1/32",
+			divergent: []string{
+				"10.0.0.1", // bare: never delivered by a cidr column
+			},
+		},
+		{
+			name:      "cidr/network prefix",
+			colType:   ir.Cidr{},
+			rendering: ir.NetworkLiteralRenderingAlwaysMasked,
 			canonical: "10.0.0.0/24",
 			divergent: []string{
 				"010.000.000.000/24",
@@ -167,7 +179,7 @@ func TestIdentifierLiteral_InvalidValuesAreRefused(t *testing.T) {
 		// A declared network rendering keeps the inet row exercising the
 		// INVALID-LITERAL path; under the undeclared zero value it would
 		// refuse for the unrelated no-rendering reason and go vacuous.
-		infos := ColumnInfosFromIR(fakeNetworkResolver{rendering: ir.NetworkLiteralRenderingBare},
+		infos := ColumnInfosFromIR(fakeNetworkResolver{rendering: ir.NetworkLiteralRenderingAddressOnly},
 			[]*ir.Column{{Name: "v", Type: tc.colType}}, false)
 		if _, err := Compile("t", "v = '"+tc.lit+"'", infos); err == nil {
 			t.Errorf("%v compared to invalid literal %q compiled; it can never match, so the filter would "+
@@ -194,9 +206,9 @@ func TestCanonicalIdentifierLiteral_MatchesDecoderOutput(t *testing.T) {
 	}{
 		{kind: identifierUUID, in: "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", want: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
 		{kind: identifierUUID, in: "a0eebc999c0b4ef8bb6d6bb9bd380a11", want: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
-		{kind: identifierNetwork, in: "010.000.000.001", want: "10.0.0.1", network: ir.NetworkLiteralRenderingBare},
-		{kind: identifierNetwork, in: "10.0.0.0/24", want: "10.0.0.0/24", network: ir.NetworkLiteralRenderingMasked},
-		{kind: identifierNetwork, in: "2001:0db8:0000:0000:0000:0000:0000:0001", want: "2001:db8::1", network: ir.NetworkLiteralRenderingBare},
+		{kind: identifierNetwork, in: "010.000.000.001", want: "10.0.0.1", network: ir.NetworkLiteralRenderingAddressOnly},
+		{kind: identifierNetwork, in: "10.0.0.0/24", want: "10.0.0.0/24", network: ir.NetworkLiteralRenderingHostBare},
+		{kind: identifierNetwork, in: "2001:0db8:0000:0000:0000:0000:0000:0001", want: "2001:db8::1", network: ir.NetworkLiteralRenderingAddressOnly},
 		{kind: identifierMAC, in: "08-00-2B-01-02-03", want: "08:00:2b:01:02:03"},
 		{kind: identifierMAC, in: "0800.2b01.0203", want: "08:00:2b:01:02:03"},
 		{kind: identifierTime, in: "08:30:00", want: "08:30:00"},
@@ -215,10 +227,16 @@ func TestCanonicalIdentifierLiteral_MatchesDecoderOutput(t *testing.T) {
 // importing an engine package.
 type fakeNetworkResolver struct {
 	ir.ByteExactCollationResolver
-	rendering ir.NetworkLiteralRendering
+	// rendering answers for ir.Inet; cidrRendering, when set, answers for
+	// ir.Cidr — the two differ on Postgres, which is the whole point.
+	rendering     ir.NetworkLiteralRendering
+	cidrRendering ir.NetworkLiteralRendering
 }
 
-func (r fakeNetworkResolver) ResolveNetworkLiteralRendering() ir.NetworkLiteralRendering {
+func (r fakeNetworkResolver) ResolveNetworkLiteralRendering(isCidr bool) ir.NetworkLiteralRendering {
+	if isCidr && r.cidrRendering != ir.NetworkLiteralRenderingUnknown {
+		return r.cidrRendering
+	}
 	return r.rendering
 }
 
@@ -238,20 +256,32 @@ func TestCanonicalNetworkLiteral_FollowsTheEngineRendering(t *testing.T) {
 		want      string
 		wantOK    bool
 	}{
-		// Postgres: the mask is always present, so a bare literal
-		// canonicalises UP to its full-width prefix. This is the case that
-		// was silently dropping every change before the fix.
-		{"masked/bare v4 gains /32", ir.NetworkLiteralRenderingMasked, "10.0.0.1", "10.0.0.1/32", true},
-		{"masked/bare v6 gains /128", ir.NetworkLiteralRenderingMasked, "2001:db8::1", "2001:db8::1/128", true},
-		{"masked/full-width prefix is already canonical", ir.NetworkLiteralRenderingMasked, "10.0.0.1/32", "10.0.0.1/32", true},
-		{"masked/network prefix is already canonical", ir.NetworkLiteralRenderingMasked, "10.0.0.0/24", "10.0.0.0/24", true},
-		{"masked/zero-padded octets normalise and gain the mask", ir.NetworkLiteralRenderingMasked, "010.000.000.001", "10.0.0.1/32", true},
+		// Postgres `inet`: the full-width mask is NOT delivered, so a
+		// masked host literal canonicalises DOWN. This is the S2 case —
+		// `ip = '10.0.0.1/32'` compiled clean and matched nothing.
+		{"hostbare/bare v4 is already canonical", ir.NetworkLiteralRenderingHostBare, "10.0.0.1", "10.0.0.1", true},
+		{"hostbare/bare v6 is already canonical", ir.NetworkLiteralRenderingHostBare, "2001:db8::1", "2001:db8::1", true},
+		{"hostbare/full-width v4 mask drops", ir.NetworkLiteralRenderingHostBare, "10.0.0.1/32", "10.0.0.1", true},
+		{"hostbare/full-width v6 mask drops", ir.NetworkLiteralRenderingHostBare, "2001:db8::1/128", "2001:db8::1", true},
+		{"hostbare/narrower mask is kept", ir.NetworkLiteralRenderingHostBare, "10.0.0.0/24", "10.0.0.0/24", true},
+		// PG delivers a host-bits-set inet verbatim ("10.0.0.5/24"), so it
+		// must NOT be normalised to its network address.
+		{"hostbare/host bits set are kept verbatim", ir.NetworkLiteralRenderingHostBare, "10.0.0.5/24", "10.0.0.5/24", true},
+		{"hostbare/zero-padded octets normalise, stay bare", ir.NetworkLiteralRenderingHostBare, "010.000.000.001", "10.0.0.1", true},
 
-		// MariaDB: the value is an address, never a network.
-		{"bare/bare v4 is already canonical", ir.NetworkLiteralRenderingBare, "10.0.0.1", "10.0.0.1", true},
-		{"bare/bare v6 is already canonical", ir.NetworkLiteralRenderingBare, "2001:db8::1", "2001:db8::1", true},
-		{"bare/full-width mask reduces to the address", ir.NetworkLiteralRenderingBare, "10.0.0.1/32", "10.0.0.1", true},
-		{"bare/a real network can never match an address column", ir.NetworkLiteralRenderingBare, "10.0.0.0/24", "", false},
+		// Postgres `cidr`: the mirror image — the mask is ALWAYS delivered,
+		// so a bare literal canonicalises UP. The second S2 bug, which the
+		// audit did not file.
+		{"alwaysmasked/bare v4 gains /32", ir.NetworkLiteralRenderingAlwaysMasked, "10.0.0.1", "10.0.0.1/32", true},
+		{"alwaysmasked/bare v6 gains /128", ir.NetworkLiteralRenderingAlwaysMasked, "2001:db8::1", "2001:db8::1/128", true},
+		{"alwaysmasked/full-width prefix is already canonical", ir.NetworkLiteralRenderingAlwaysMasked, "10.0.0.1/32", "10.0.0.1/32", true},
+		{"alwaysmasked/network prefix is already canonical", ir.NetworkLiteralRenderingAlwaysMasked, "10.0.0.0/24", "10.0.0.0/24", true},
+
+		// MariaDB native inet4/inet6: the value is an address, never a network.
+		{"addressonly/bare v4 is already canonical", ir.NetworkLiteralRenderingAddressOnly, "10.0.0.1", "10.0.0.1", true},
+		{"addressonly/bare v6 is already canonical", ir.NetworkLiteralRenderingAddressOnly, "2001:db8::1", "2001:db8::1", true},
+		{"addressonly/full-width mask reduces to the address", ir.NetworkLiteralRenderingAddressOnly, "10.0.0.1/32", "10.0.0.1", true},
+		{"addressonly/a real network can never match an address column", ir.NetworkLiteralRenderingAddressOnly, "10.0.0.0/24", "", false},
 
 		// Undeclared: no spelling is knowable, so nothing canonicalises.
 		{"unknown/bare refuses", ir.NetworkLiteralRenderingUnknown, "10.0.0.1", "", false},
@@ -268,23 +298,42 @@ func TestCanonicalNetworkLiteral_FollowsTheEngineRendering(t *testing.T) {
 	}
 }
 
-// TestNetworkLiteral_BareSpellingRefusedOnPostgresRendering is the end-to-end
-// half: the S2 defect was that `ip = '10.0.0.1'` COMPILED against a Postgres
-// source and then matched nothing, so the pin is that it now refuses, and that
-// the masked spelling still compiles. A compile success here would be the
-// silent-loss regression.
-func TestNetworkLiteral_BareSpellingRefusedOnPostgresRendering(t *testing.T) {
-	infos := ColumnInfosFromIR(
-		fakeNetworkResolver{rendering: ir.NetworkLiteralRenderingMasked},
-		[]*ir.Column{{Name: "ip", Type: ir.Inet{}}}, false,
-	)
-
-	if _, err := Compile("t", "ip = '10.0.0.1'", infos); err == nil {
-		t.Fatal("bare literal compiled against a masked-rendering source; the change stream delivers " +
-			"`10.0.0.1/32`, so the filter would score every row out of scope and silently drop every change")
+// TestNetworkLiteral_PostgresInetAndCidrDivergeEndToEnd is the end-to-end half
+// of S2, and it pins BOTH bugs at once — which is the point, because they are
+// mirror images and a fix for either alone reads as complete.
+//
+// On a Postgres source, an `inet` column and a `cidr` column in the SAME table
+// have opposite canonical spellings for the same address: `inet` never
+// delivers the full-width mask, `cidr` always does. Before this fix both wrong
+// spellings compiled clean and matched nothing.
+func TestNetworkLiteral_PostgresInetAndCidrDivergeEndToEnd(t *testing.T) {
+	// One resolver answering both shapes, exactly as pgCollationResolver does.
+	pg := fakeNetworkResolver{
+		rendering:     ir.NetworkLiteralRenderingHostBare,
+		cidrRendering: ir.NetworkLiteralRenderingAlwaysMasked,
 	}
-	if _, err := Compile("t", "ip = '10.0.0.1/32'", infos); err != nil {
-		t.Fatalf("masked literal must still compile against a masked-rendering source: %v", err)
+	infos := ColumnInfosFromIR(pg, []*ir.Column{
+		{Name: "ip", Type: ir.Inet{}},
+		{Name: "net", Type: ir.Cidr{}},
+	}, false)
+
+	// inet: bare is canonical; the full-width mask is the silent-drop spelling.
+	if _, err := Compile("t", "ip = '10.0.0.1'", infos); err != nil {
+		t.Errorf("bare literal must compile against a PG inet column (that is what the column delivers): %v", err)
+	}
+	if _, err := Compile("t", "ip = '10.0.0.1/32'", infos); err == nil {
+		t.Error("`ip = '10.0.0.1/32'` compiled against a PG inet column. PG delivers that value as `10.0.0.1`, " +
+			"so the filter scores every row out of scope and silently drops every change to it (S2, bug one)")
+	}
+
+	// cidr: the exact opposite, on the sibling type in the same table.
+	if _, err := Compile("t", "net = '10.0.0.1/32'", infos); err != nil {
+		t.Errorf("masked literal must compile against a PG cidr column (that is what the column delivers): %v", err)
+	}
+	if _, err := Compile("t", "net = '10.0.0.1'", infos); err == nil {
+		t.Error("`net = '10.0.0.1'` compiled against a PG cidr column. PG delivers that value as `10.0.0.1/32` — " +
+			"cidr keeps the mask even at full width — so this silently matches nothing (S2, bug two, which the " +
+			"audit did not file)")
 	}
 }
 

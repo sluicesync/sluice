@@ -5,31 +5,45 @@ package ir
 //
 // A client-side `--where` filter compares an operator-written literal against
 // the value the CHANGE STREAM delivers, so the literal must be spelled the way
-// that stream renders it. For the network families the two engines eligible for
-// continuous filtered sync disagree, and the disagreement is invisible:
+// that stream renders it. There are THREE renderings in play across two
+// engines and two IR types, and they were ground-truthed on a real server
+// (PG 16.14, MariaDB 11.4) rather than reasoned about — see the cost note
+// below for why that distinction earned its own paragraph.
 //
-//   - Postgres delivers inet/cidr through pgx's InetCodec, whose DecodeValue
-//     always yields a [net/netip.Prefix] — so a host address stored in an
-//     `inet` column arrives as "10.0.0.1/32", carrying a mask Postgres's own
-//     text output omits. (pgx v5.10.0 pgtype/inet.go: DecodeValue scans into a
-//     netip.Prefix unconditionally; the netip.Addr shape never comes back from
-//     an untyped scan.)
-//   - MariaDB delivers native inet4/inet6 as BARE text — a dotted quad, or the
-//     BSD inet_ntop6 rendering for inet6 — with no mask, because those columns
-//     hold an address rather than a network.
+//   - Postgres `inet` omits the prefix length at FULL WIDTH and shows it
+//     otherwise: a stored 10.0.0.1 is delivered "10.0.0.1", a stored
+//     10.0.0.0/24 is delivered "10.0.0.0/24". ([NetworkLiteralRenderingHostBare])
+//   - Postgres `cidr` ALWAYS shows the prefix length, including at full width:
+//     a stored 10.0.0.1/32 is delivered "10.0.0.1/32", never "10.0.0.1".
+//     ([NetworkLiteralRenderingAlwaysMasked])
+//   - MariaDB native inet4/inet6 are always BARE — a dotted quad, or the BSD
+//     inet_ntop6 rendering — because those columns hold an address and cannot
+//     hold a network at all. ([NetworkLiteralRenderingAddressOnly])
 //
-// Both collapse to [Inet] in the IR, so a canonicaliser keyed on the IR type
-// alone cannot be right for both: normalizing to the prefix form fixes
-// Postgres and breaks MariaDB, and normalizing to the bare form does the
-// reverse. The engine has to name its own rendering, which is what
-// [NetworkLiteralResolver] is for — the same shape as
-// [TemporalLiteralResolver] on the temporal axis.
+// So the rendering depends on the engine AND on which network type the column
+// is, which is why [NetworkLiteralResolver] takes the shape flag rather than
+// answering per engine — the same shape as ResolveStringEquality's fixedChar
+// argument, and of [TemporalLiteralResolver] on the temporal axis.
 //
 // Getting it wrong is silent: the literal simply never equals the delivered
 // value, so every row scores out-of-scope and every change to it is dropped
 // with no error. That is why the zero value REFUSES rather than guessing —
 // unlike the temporal axis, where "no normalization" is a safe pre-existing
 // behavior, there is no neutral rendering to fall back to here.
+//
+// # What this cost, because the shape recurs
+//
+// The audit filed this as one Postgres bug. The first fix attempt inverted its
+// direction after reading pgx v5.10.0's InetCodec.DecodeValue, which scans
+// unconditionally into a netip.Prefix and therefore renders "10.0.0.1/32".
+// That reading was of real code and was still wrong about THIS program: the
+// row reader goes through database/sql, where the value arrives as Postgres's
+// own text output, and decodeNetwork takes its string arm. Reading the right
+// module says nothing about which path the caller takes. Only a live two-leg
+// integration pin settled it, and it also surfaced the cidr/inet split that
+// neither the audit nor the module source hinted at — so the ONE filed bug is
+// actually two mirror-image bugs: a masked literal on an `inet` column, and a
+// bare literal on a `cidr` column, each silently matching nothing.
 
 // NetworkLiteralRendering names how the SOURCE engine's change stream renders
 // an inet/cidr value, which fixes the spelling a `--where` literal must use to
@@ -45,24 +59,39 @@ const (
 	// implement [NetworkLiteralResolver] gets — and what hand-built test
 	// ColumnInfos get, deliberately.
 	NetworkLiteralRenderingUnknown NetworkLiteralRendering = iota
-	// NetworkLiteralRenderingMasked is the Postgres rule: the delivered value
-	// ALWAYS carries a prefix length, including the full-width mask on a host
-	// address ("10.0.0.1/32", "2001:db8::/128"). A bare literal is refused
-	// with the masked spelling to write instead.
-	NetworkLiteralRenderingMasked
-	// NetworkLiteralRenderingBare is the MariaDB rule for native inet4/inet6:
-	// the delivered value is an address with no mask ("10.0.0.1",
-	// "2001:db8::"). A literal carrying a prefix length is refused — those
-	// columns cannot hold a network, so no stored value could match it.
-	NetworkLiteralRenderingBare
+	// NetworkLiteralRenderingHostBare is the Postgres `inet` rule: the prefix
+	// length is omitted when it is the FULL width of the address family and
+	// shown otherwise. "10.0.0.1" stays bare; "10.0.0.1/32" canonicalises DOWN
+	// to "10.0.0.1"; "10.0.0.0/24" and even the host-bits-set "10.0.0.5/24"
+	// keep their mask.
+	NetworkLiteralRenderingHostBare
+	// NetworkLiteralRenderingAlwaysMasked is the Postgres `cidr` rule: the
+	// prefix length is ALWAYS present, including at full width. A bare
+	// "10.0.0.1" canonicalises UP to "10.0.0.1/32". This is the mirror image
+	// of HostBare, on the sibling type — which is why one rendering per
+	// engine was not enough.
+	NetworkLiteralRenderingAlwaysMasked
+	// NetworkLiteralRenderingAddressOnly is the MariaDB rule for native
+	// inet4/inet6: the delivered value is an address with no mask. A
+	// full-width prefix literal canonicalises down to the bare address; a
+	// NARROWER prefix names a network, which such a column cannot hold, so no
+	// stored value could ever match it and it is refused outright.
+	NetworkLiteralRenderingAddressOnly
 )
 
 // NetworkLiteralResolver is the optional [CollationResolver] companion surface
-// a source engine implements to name how its change stream renders inet/cidr
-// values. A resolver that does not implement it gets
+// a source engine implements to name how its change stream renders network
+// values.
+//
+// isCidr distinguishes the two IR network types, because Postgres renders them
+// DIFFERENTLY — `inet` drops a full-width mask, `cidr` keeps it — so an
+// engine-only answer would be wrong for one of them whichever way it went.
+// Mirrors the fixedChar argument on ResolveStringEquality.
+//
+// A resolver that does not implement this gets
 // [NetworkLiteralRenderingUnknown], under which network columns are refused
-// for value comparison — the fail-closed default, because both concrete
-// renderings are silently wrong for the other engine.
+// for value comparison — the fail-closed default, because every concrete
+// rendering is silently wrong for at least one of the others.
 type NetworkLiteralResolver interface {
-	ResolveNetworkLiteralRendering() NetworkLiteralRendering
+	ResolveNetworkLiteralRendering(isCidr bool) NetworkLiteralRendering
 }

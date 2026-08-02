@@ -324,12 +324,12 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 	}
 	// The network-literal lens is the same optional-companion shape on the
 	// inet/cidr axis (audit 2026-08-01 S2). Its zero value REFUSES rather than
-	// falling through to a default rendering: Postgres always delivers a mask
-	// and MariaDB never does, so there is no neutral spelling — see
-	// [ir.NetworkLiteralRendering].
-	var network ir.NetworkLiteralRendering
+	// falling through to a default rendering: there is no neutral spelling —
+	// see [ir.NetworkLiteralRendering]. Resolved per network TYPE, because
+	// Postgres renders `inet` and `cidr` differently.
+	netRendering := func(bool) ir.NetworkLiteralRendering { return ir.NetworkLiteralRenderingUnknown }
 	if nr, ok := resolver.(ir.NetworkLiteralResolver); ok {
-		network = nr.ResolveNetworkLiteralRendering()
+		netRendering = nr.ResolveNetworkLiteralRendering
 	}
 	out := make(map[string]ColumnInfo, len(cols))
 	for _, c := range cols {
@@ -337,11 +337,14 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 			continue
 		}
 		info := columnInfoFor(resolver, c, strict, temporal)
-		// Set OUTSIDE columnInfoFor's type switch for the same reason
-		// Generated is: the rendering is a property of the engine, not of the
-		// column's family, and threading it through one arm is how the next
-		// network-shaped type comes to forget it.
-		info.NetworkRendering = network
+		// Set OUTSIDE columnInfoFor's type switch, like Generated: the
+		// rendering is a property of the engine × network type, and the only
+		// thing the type switch would contribute is the isCidr bit, which is
+		// read straight off the column here.
+		if info.Identifier == identifierNetwork {
+			_, isCidr := c.Type.(ir.Cidr)
+			info.NetworkRendering = netRendering(isCidr)
+		}
 		// Set OUTSIDE columnInfoFor's type switch: whether a column is
 		// generated is orthogonal to its family, and threading it through
 		// every arm is exactly how one arm comes to forget it.

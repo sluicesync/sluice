@@ -134,18 +134,26 @@ func (r mysqlCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLit
 }
 
 // ResolveNetworkLiteralRendering implements [ir.NetworkLiteralResolver] for the
-// MySQL family: BARE, no prefix length. MariaDB is the only flavor with native
-// network types, and its inet4/inet6 columns hold an ADDRESS rather than a
-// network — the binlog decode renders them as a dotted quad or through
-// MariaDB's inet_ntop6 (value_decode_mariadb.go formatMariaDBInet), never with
-// a mask. The other flavors have no native inet type at all, so an [ir.Inet]
-// column cannot arise from a vanilla MySQL / PlanetScale / Vitess SOURCE and
-// the answer is unreachable there; it is declared rather than left Unknown
-// because "bare" is what those engines would deliver if the type were ever
-// added, and leaving it Unknown would refuse a comparison that is fine.
-// Opposite of Postgres, which always carries the mask (audit 2026-08-01 S2).
-func (mysqlCollationResolver) ResolveNetworkLiteralRendering() ir.NetworkLiteralRendering {
-	return ir.NetworkLiteralRenderingBare
+// MySQL family: address-only, no prefix length, for BOTH shape flags. MariaDB
+// is the only flavor with native network types, and its inet4/inet6 columns
+// hold an ADDRESS rather than a network — the binlog decode renders them as a
+// dotted quad or through MariaDB's inet_ntop6 (value_decode_mariadb.go
+// formatMariaDBInet), never with a mask — so a `--where` literal naming a
+// NETWORK can never match any stored value and is refused outright rather than
+// silently widened to its address.
+//
+// isCidr is ignored because no MySQL-family type maps to [ir.Cidr]: the family
+// has no CIDR-shaped native type, so that arm is unreachable from a source of
+// this family. The other flavors have no native network type at all, so
+// [ir.Inet] cannot arise from a vanilla MySQL / PlanetScale / Vitess SOURCE
+// either; the answer is declared rather than left Unknown because address-only
+// is what they would deliver if such a type were ever added, and Unknown would
+// refuse a comparison that is fine.
+//
+// Contrast Postgres, whose two network types render two DIFFERENT ways
+// (audit 2026-08-01 S2).
+func (mysqlCollationResolver) ResolveNetworkLiteralRendering(bool) ir.NetworkLiteralRendering {
+	return ir.NetworkLiteralRenderingAddressOnly
 }
 
 // collationByteExactMySQL reports whether a MySQL collation's `=` is a raw

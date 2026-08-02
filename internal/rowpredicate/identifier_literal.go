@@ -108,16 +108,25 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 				continue
 			}
 			if p, err := netip.ParsePrefix(cand); err == nil {
+				fullWidth := p.Bits() == p.Addr().BitLen()
 				switch network {
-				case ir.NetworkLiteralRenderingMasked:
+				case ir.NetworkLiteralRenderingHostBare:
+					// PG `inet`: a full-width mask is not delivered, so the
+					// canonical spelling drops it. A narrower mask IS
+					// delivered and stays.
+					if fullWidth {
+						return p.Addr().String(), true
+					}
 					return p.String(), true
-				case ir.NetworkLiteralRenderingBare:
-					// A bare-rendering column holds an address, never a
-					// network, so no stored value can carry a mask. Only a
-					// full-width mask is reducible to something that could
-					// match; anything narrower names a network and is refused
-					// outright rather than silently widened to its address.
-					if p.Bits() == p.Addr().BitLen() {
+				case ir.NetworkLiteralRenderingAlwaysMasked:
+					// PG `cidr`: the mask is always delivered, at every width.
+					return p.String(), true
+				case ir.NetworkLiteralRenderingAddressOnly:
+					// MariaDB inet4/inet6 hold an address, never a network. A
+					// full-width mask reduces to the address; anything
+					// narrower names a network no stored value can equal, so
+					// it is refused rather than silently widened.
+					if fullWidth {
 						return p.Addr().String(), true
 					}
 					return "", false
@@ -126,13 +135,13 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 			}
 			if a, err := netip.ParseAddr(cand); err == nil {
 				switch network {
-				case ir.NetworkLiteralRenderingMasked:
+				case ir.NetworkLiteralRenderingHostBare, ir.NetworkLiteralRenderingAddressOnly:
+					return a.String(), true
+				case ir.NetworkLiteralRenderingAlwaysMasked:
 					// The delivered value always carries a prefix length, so
 					// the canonical spelling of a bare address is its
 					// full-width prefix — "10.0.0.1" → "10.0.0.1/32".
 					return netip.PrefixFrom(a, a.BitLen()).String(), true
-				case ir.NetworkLiteralRenderingBare:
-					return a.String(), true
 				}
 				return "", false
 			}
