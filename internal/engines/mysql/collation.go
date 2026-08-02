@@ -133,6 +133,21 @@ func (r mysqlCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLit
 	return ir.TemporalLiteralPromoteRoundHalfUp
 }
 
+// ResolveNetworkLiteralRendering implements [ir.NetworkLiteralResolver] for the
+// MySQL family: BARE, no prefix length. MariaDB is the only flavor with native
+// network types, and its inet4/inet6 columns hold an ADDRESS rather than a
+// network — the binlog decode renders them as a dotted quad or through
+// MariaDB's inet_ntop6 (value_decode_mariadb.go formatMariaDBInet), never with
+// a mask. The other flavors have no native inet type at all, so an [ir.Inet]
+// column cannot arise from a vanilla MySQL / PlanetScale / Vitess SOURCE and
+// the answer is unreachable there; it is declared rather than left Unknown
+// because "bare" is what those engines would deliver if the type were ever
+// added, and leaving it Unknown would refuse a comparison that is fine.
+// Opposite of Postgres, which always carries the mask (audit 2026-08-01 S2).
+func (mysqlCollationResolver) ResolveNetworkLiteralRendering() ir.NetworkLiteralRendering {
+	return ir.NetworkLiteralRenderingBare
+}
+
 // collationByteExactMySQL reports whether a MySQL collation's `=` is a raw
 // byte/codepoint comparison (memcmp), so a client-side byte compare is faithful.
 // ONLY the `_bin` collations and the `binary` pseudo-collation are byte-exact.

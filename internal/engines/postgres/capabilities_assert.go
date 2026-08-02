@@ -172,6 +172,12 @@ var (
 	// reverted to ClientExact — re-opening the exact granularity defect the
 	// previous release fixed.
 	_ ir.TemporalLiteralResolver = pgCollationResolver{}
+	// The network-literal lens is the same shape on the inet/cidr axis (audit
+	// 2026-08-01 S2). Drift here fails CLOSED rather than silently — the
+	// rendering reverts to Unknown, which refuses the comparison — but that
+	// still turns a working `--where` on an inet column into a refusal on
+	// upgrade, so the pin holds the method to the interface.
+	_ ir.NetworkLiteralResolver = pgCollationResolver{}
 
 	// Logical-replication CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)

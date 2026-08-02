@@ -56,3 +56,17 @@ func (pgCollationResolver) ResolveStringEquality(collation string, determinism i
 func (pgCollationResolver) ResolveTemporalLiteralSemantics() ir.TemporalLiteralSemantics {
 	return ir.TemporalLiteralCastToColumn
 }
+
+// ResolveNetworkLiteralRendering implements [ir.NetworkLiteralResolver]:
+// Postgres delivers inet/cidr values with a prefix length ALWAYS, including
+// the full-width mask on a host address. This is a property of the driver's
+// decode path rather than of Postgres's text output — `SELECT ip` on an inet
+// column holding 10.0.0.1 prints "10.0.0.1", but pgx's InetCodec.DecodeValue
+// (v5.10.0, pgtype/inet.go:128-144) scans unconditionally into a
+// netip.Prefix, so the value sluice's decodeNetwork receives and renders is
+// "10.0.0.1/32". A `--where` literal therefore has to carry the mask, and the
+// bare spelling — the one an operator naturally copies out of psql — is the
+// one that silently matches nothing (audit 2026-08-01 S2).
+func (pgCollationResolver) ResolveNetworkLiteralRendering() ir.NetworkLiteralRendering {
+	return ir.NetworkLiteralRenderingMasked
+}

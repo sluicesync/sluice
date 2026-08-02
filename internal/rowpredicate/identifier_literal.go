@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // The identifier / time-of-day literal lens (audit 2026-07-26 SL-3).
@@ -67,7 +69,7 @@ var timeCanonicalRE = regexp.MustCompile(`^(-?)(\d{1,3}):(\d{2})(?::(\d{2}))?(?:
 // the form the engine's decoder produces, and therefore the only form the
 // client evaluator can compare byte-exactly. ok is false when s is not a valid
 // value of that kind at all.
-func canonicalIdentifierLiteral(kind identifierKind, s string) (canonical string, ok bool) {
+func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.NetworkLiteralRendering) (canonical string, ok bool) {
 	switch kind {
 	case identifierUUID:
 		// Accept the spellings a source would (braces, no hyphens, any case)
@@ -85,8 +87,15 @@ func canonicalIdentifierLiteral(kind identifierKind, s string) (canonical string
 		return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], true
 
 	case identifierNetwork:
-		// decodeNetwork renders through netip, so netip is the canonicaliser.
-		// A prefix keeps its mask; a bare address stays bare.
+		// netip is the canonicaliser for both renderings — but WHICH form is
+		// canonical is the engine's call, not netip's (audit 2026-08-01 S2).
+		// Postgres delivers every inet/cidr value through pgx's InetCodec,
+		// which always yields a netip.Prefix, so a host address arrives as
+		// "10.0.0.1/32"; MariaDB's native inet4/inet6 arrive bare. Rendering
+		// the literal under the wrong one is SILENT — it simply never equals
+		// the delivered value, so every row scores out-of-scope. An engine
+		// that has not named its rendering is refused by the caller before
+		// reaching here.
 		//
 		// netip deliberately REJECTS zero-padded octets ("010.0.0.1") because
 		// they are ambiguous with octal in C-family resolvers. Postgres accepts
@@ -99,10 +108,33 @@ func canonicalIdentifierLiteral(kind identifierKind, s string) (canonical string
 				continue
 			}
 			if p, err := netip.ParsePrefix(cand); err == nil {
-				return p.String(), true
+				switch network {
+				case ir.NetworkLiteralRenderingMasked:
+					return p.String(), true
+				case ir.NetworkLiteralRenderingBare:
+					// A bare-rendering column holds an address, never a
+					// network, so no stored value can carry a mask. Only a
+					// full-width mask is reducible to something that could
+					// match; anything narrower names a network and is refused
+					// outright rather than silently widened to its address.
+					if p.Bits() == p.Addr().BitLen() {
+						return p.Addr().String(), true
+					}
+					return "", false
+				}
+				return "", false
 			}
 			if a, err := netip.ParseAddr(cand); err == nil {
-				return a.String(), true
+				switch network {
+				case ir.NetworkLiteralRenderingMasked:
+					// The delivered value always carries a prefix length, so
+					// the canonical spelling of a bare address is its
+					// full-width prefix — "10.0.0.1" → "10.0.0.1/32".
+					return netip.PrefixFrom(a, a.BitLen()).String(), true
+				case ir.NetworkLiteralRenderingBare:
+					return a.String(), true
+				}
+				return "", false
 			}
 		}
 		return "", false
@@ -191,7 +223,24 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		)
 	}
 
-	canonical, ok := canonicalIdentifierLiteral(info.Identifier, lit.str)
+	// An inet/cidr comparison depends on the source engine having named how its
+	// change stream renders the value, because the two eligible engines
+	// disagree and neither spelling is safe to assume: Postgres always delivers
+	// a prefix length, MariaDB never does, and comparing against the wrong one
+	// drops every change to every matching row with no error. Refuse rather
+	// than guess (audit 2026-08-01 S2).
+	if info.Identifier == identifierNetwork && info.NetworkRendering == ir.NetworkLiteralRenderingUnknown {
+		return fmt.Errorf(
+			"column %q is an inet/cidr column, but this source engine has not declared how its change stream "+
+				"renders network values — Postgres delivers them with a prefix length (`10.0.0.1/32`) and MariaDB "+
+				"delivers them bare (`10.0.0.1`), so no literal spelling can be known to compare correctly, and the "+
+				"wrong one would score every row out of scope and silently drop every change to it. Filter on a "+
+				"different column",
+			col,
+		)
+	}
+
+	canonical, ok := canonicalIdentifierLiteral(info.Identifier, lit.str, info.NetworkRendering)
 	if !ok {
 		return fmt.Errorf("literal %q is not a valid value for %s column %q",
 			lit.str, identifierKindName(info.Identifier), col)

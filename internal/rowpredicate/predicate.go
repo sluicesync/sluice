@@ -256,6 +256,15 @@ type ColumnInfo struct {
 	// rather than normalizes.
 	Identifier identifierKind
 
+	// NetworkRendering is meaningful only when Identifier is
+	// identifierNetwork: how the SOURCE engine's change stream renders an
+	// inet/cidr value, resolved from the engine's [ir.NetworkLiteralResolver]
+	// by [ColumnInfosFromIR]. It decides which literal spelling is canonical —
+	// Postgres always delivers a prefix length, MariaDB never does — and the
+	// zero value ([ir.NetworkLiteralRenderingUnknown]) REFUSES the comparison
+	// rather than guessing, because a guess is silent (audit 2026-08-01 S2).
+	NetworkRendering ir.NetworkLiteralRendering
+
 	// TimeFractionAmbiguous marks a TIME column with fractional-second
 	// precision, whose value renders differently on the snapshot and binlog
 	// legs — so no single literal is correct on both, and any value
@@ -313,12 +322,26 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 	if tr, ok := resolver.(ir.TemporalLiteralResolver); ok {
 		temporal = tr.ResolveTemporalLiteralSemantics()
 	}
+	// The network-literal lens is the same optional-companion shape on the
+	// inet/cidr axis (audit 2026-08-01 S2). Its zero value REFUSES rather than
+	// falling through to a default rendering: Postgres always delivers a mask
+	// and MariaDB never does, so there is no neutral spelling — see
+	// [ir.NetworkLiteralRendering].
+	var network ir.NetworkLiteralRendering
+	if nr, ok := resolver.(ir.NetworkLiteralResolver); ok {
+		network = nr.ResolveNetworkLiteralRendering()
+	}
 	out := make(map[string]ColumnInfo, len(cols))
 	for _, c := range cols {
 		if c == nil {
 			continue
 		}
 		info := columnInfoFor(resolver, c, strict, temporal)
+		// Set OUTSIDE columnInfoFor's type switch for the same reason
+		// Generated is: the rendering is a property of the engine, not of the
+		// column's family, and threading it through one arm is how the next
+		// network-shaped type comes to forget it.
+		info.NetworkRendering = network
 		// Set OUTSIDE columnInfoFor's type switch: whether a column is
 		// generated is orthogonal to its family, and threading it through
 		// every arm is exactly how one arm comes to forget it.

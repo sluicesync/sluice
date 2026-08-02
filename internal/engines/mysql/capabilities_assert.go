@@ -31,6 +31,7 @@ var (
 	// from rowpredicate; without this pin a method drift reverts this engine to
 	// ClientExact silently, re-opening the granularity defect it was built for.
 	_ ir.TemporalLiteralResolver               = mysqlCollationResolver{}
+	_ ir.NetworkLiteralResolver                = mysqlCollationResolver{}
 	_ ir.CollationResolverProvider             = Engine{}
 	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
