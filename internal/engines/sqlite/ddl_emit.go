@@ -122,6 +122,21 @@ func emitColumnDef(c *ir.Column, inlinePK bool) (string, error) {
 	if c == nil {
 		return "", errors.New("sqlite: emitColumnDef: column is nil")
 	}
+	// SQLite has no column-level ON UPDATE CURRENT_TIMESTAMP, so a source
+	// column carrying it stops being maintained on the target (audit
+	// 2026-08-01 S7). Warned at the TOP rather than beside a return because
+	// this function has two success paths, and a warn on one of them is how
+	// the next branch comes to skip it. Migrated rows are unaffected; the
+	// divergence is on post-cutover UPDATEs.
+	if c.OnUpdateCurrentTimestamp {
+		slog.Warn(
+			"source column re-stamps itself on UPDATE (ON UPDATE CURRENT_TIMESTAMP) and SQLite has no "+
+				"column-level equivalent; migrated rows are unaffected, but after cutover an UPDATE that does "+
+				"not name this column will leave it stale. Add an AFTER UPDATE trigger on the target if the "+
+				"application relies on it",
+			slog.String("column", c.Name),
+		)
+	}
 	typeStr, err := emitColumnType(c.Type)
 	if err != nil {
 		return "", fmt.Errorf("sqlite: column %q: %w", c.Name, err)

@@ -364,6 +364,27 @@ type Column struct {
 	// to keep "no default", "literal default", and "expression default"
 	// distinguishable without sentinel strings.
 	Default DefaultValue
+	// OnUpdateCurrentTimestamp reports that the column re-stamps itself
+	// with the current instant on every UPDATE that does not name it —
+	// MySQL's `ON UPDATE CURRENT_TIMESTAMP` (audit 2026-08-01 S7).
+	//
+	// This is a WRITE-BEHAVIOUR attribute, not a default: DEFAULT fires on
+	// INSERT, this fires on UPDATE, and a column can carry either, both, or
+	// neither. It was previously unread and therefore silently discarded —
+	// including MySQL→MySQL, where the source and target both support it and
+	// the target simply stopped maintaining the column.
+	//
+	// No precision field is needed. MySQL requires the ON UPDATE fractional
+	// precision to equal the column's own and rejects a mismatch with errno
+	// 1294 ("Invalid ON UPDATE clause"), verified on MySQL 8.0 in both
+	// directions — so the emitter renders the precision from [Column.Type]
+	// and nothing is lost by carrying a bool.
+	//
+	// Engines with no equivalent (Postgres, SQLite) cannot honour it; they
+	// WARN at emit time rather than dropping it silently. It is deliberately
+	// EXCLUDED from the backup schema fingerprint — see
+	// internal/ir/backup.canonicalColumnsForHash for why.
+	OnUpdateCurrentTimestamp bool
 	// Comment is the column-level comment, if any.
 	Comment string
 

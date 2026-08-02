@@ -1166,6 +1166,25 @@ func loadPrimaryKeyDB(ctx context.Context, db *sql.DB, schema, table string) ([]
 // case), the operator must rewrite the source column or drop the
 // GENERATED clause via the per-column mappings hook.
 func applyGenerated(col *ir.Column, genExpr, extra string) {
+	// ON UPDATE CURRENT_TIMESTAMP rides the SAME information_schema `extra`
+	// column and was previously unread, so it was silently discarded on every
+	// path — including MySQL→MySQL (audit 2026-08-01 S7). It is applied here,
+	// inside the function both schema-read call sites already funnel `extra`
+	// through, so neither can acquire the attribute without the other.
+	//
+	// It is INDEPENDENT of genExpr and must be set before the early return:
+	// a generated column cannot carry ON UPDATE, but a plain one can, and the
+	// early return below fires for exactly those plain columns.
+	//
+	// Ground truth (MySQL 8.0, information_schema.columns.extra):
+	//   "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+	//   "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)"
+	//   "on update CURRENT_TIMESTAMP(6)"      (ON UPDATE with no DEFAULT)
+	//   "DEFAULT_GENERATED"                    (DEFAULT only — must NOT match)
+	col.OnUpdateCurrentTimestamp = strings.Contains(
+		strings.ToUpper(extra), "ON UPDATE CURRENT_TIMESTAMP",
+	)
+
 	if genExpr == "" {
 		return
 	}

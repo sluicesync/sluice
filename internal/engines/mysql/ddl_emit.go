@@ -1060,11 +1060,44 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 			sb.WriteString(dflt)
 		}
 	}
+	// ON UPDATE CURRENT_TIMESTAMP re-stamps the column on every UPDATE that
+	// does not name it. It follows DEFAULT and precedes COMMENT, which is the
+	// order MySQL's own SHOW CREATE TABLE emits (audit 2026-08-01 S7).
+	//
+	// The fractional precision is rendered from the COLUMN's type rather than
+	// carried separately: MySQL requires the two to match and rejects a
+	// mismatch with errno 1294, verified in both directions on 8.0, so the
+	// column's own precision is the only legal value.
+	if c.OnUpdateCurrentTimestamp {
+		sb.WriteString(" ON UPDATE CURRENT_TIMESTAMP")
+		if p, ok := temporalFractionalPrecision(c.Type); ok && p > 0 {
+			fmt.Fprintf(&sb, "(%d)", p)
+		}
+	}
 	if c.Comment != "" {
 		sb.WriteString(" COMMENT ")
 		sb.WriteString(m.quoteSQLString(c.Comment))
 	}
 	return sb.String(), nil
+}
+
+// temporalFractionalPrecision returns the fractional-seconds precision of a
+// TIMESTAMP / DATETIME IR type. ok is false for any other type — a column
+// that is not temporal cannot carry ON UPDATE CURRENT_TIMESTAMP at all.
+func temporalFractionalPrecision(t ir.Type) (int, bool) {
+	switch v := t.(type) {
+	case ir.Timestamp:
+		if v.PrecisionUnspecified {
+			return 0, true
+		}
+		return v.Precision, true
+	case ir.DateTime:
+		if v.PrecisionUnspecified {
+			return 0, true
+		}
+		return v.Precision, true
+	}
+	return 0, false
 }
 
 // inlineAutoIncrementIndex returns the secondary index that

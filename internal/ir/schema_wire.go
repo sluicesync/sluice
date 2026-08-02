@@ -485,6 +485,10 @@ type columnWire struct {
 	GeneratedExpr        string          `json:"generated_expr,omitempty"`
 	GeneratedStored      bool            `json:"generated_stored,omitempty"`
 	GeneratedExprDialect string          `json:"generated_expr_dialect,omitempty"`
+	// OnUpdateCurrentTimestamp must ride the wire: a backup manifest records
+	// the schema and restore rebuilds from it, so a field missing here is
+	// schema loss on the restore path (audit 2026-08-01 S7).
+	OnUpdateCurrentTimestamp bool `json:"on_update_current_timestamp,omitempty"`
 }
 
 // MarshalJSON for [Column] emits the tagged-union envelope for Type
@@ -502,6 +506,8 @@ func (c *Column) MarshalJSON() ([]byte, error) {
 		GeneratedExpr:        c.GeneratedExpr,
 		GeneratedStored:      c.GeneratedStored,
 		GeneratedExprDialect: c.GeneratedExprDialect,
+
+		OnUpdateCurrentTimestamp: c.OnUpdateCurrentTimestamp,
 	}
 	tb, err := MarshalType(c.Type)
 	if err != nil {
@@ -538,6 +544,7 @@ func (c *Column) UnmarshalJSON(b []byte) error {
 	c.GeneratedExpr = w.GeneratedExpr
 	c.GeneratedStored = w.GeneratedStored
 	c.GeneratedExprDialect = w.GeneratedExprDialect
+	c.OnUpdateCurrentTimestamp = w.OnUpdateCurrentTimestamp
 	t, err := UnmarshalType(w.Type)
 	if err != nil {
 		return fmt.Errorf("column %q type: %w", w.Name, err)

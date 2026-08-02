@@ -114,10 +114,22 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 // changes, and returning the input slice untouched when nothing needs
 // normalizing (the common round-tripped case). Column ORDER is
 // semantic and preserved as-is.
+// It also zeroes [ir.Column.OnUpdateCurrentTimestamp], which is
+// fingerprint-EXCLUDED for the same compatibility reason
+// [ir.Index.ConstraintNamed] is (see the block comment below). That field
+// landed after several backup-format epochs already existed, and it is TRUE
+// on the most idiomatic column in the MySQL world — the
+// `updated_at TIMESTAMP ... ON UPDATE CURRENT_TIMESTAMP` that appears in a
+// large share of real schemas. Including it would therefore have moved the
+// fingerprint of nearly every MySQL chain and minted a FIFTH epoch, breaking
+// restore of existing chains on exactly the schemas most likely to have them
+// (roadmap items 102/104). Excluding it costs a narrow, stated thing: chain
+// drift detection does not notice this one attribute changing between the
+// backup and the restore target.
 func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 	normalize := false
 	for _, c := range in {
-		if c != nil && c.Default == nil {
+		if c != nil && (c.Default == nil || c.OnUpdateCurrentTimestamp) {
 			normalize = true
 			break
 		}
@@ -127,12 +139,15 @@ func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 	}
 	out := make([]*ir.Column, len(in))
 	for i, c := range in {
-		if c == nil || c.Default != nil {
+		if c == nil || (c.Default != nil && !c.OnUpdateCurrentTimestamp) {
 			out[i] = c
 			continue
 		}
 		cc := *c
-		cc.Default = ir.DefaultNone{}
+		if cc.Default == nil {
+			cc.Default = ir.DefaultNone{}
+		}
+		cc.OnUpdateCurrentTimestamp = false
 		out[i] = &cc
 	}
 	return out

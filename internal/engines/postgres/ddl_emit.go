@@ -850,7 +850,42 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			sb.WriteString(qualifiedEnumTypeRef(enum, opts.TargetSchema, table.Name, c.Name))
 		}
 	}
+	warnOnUpdateCurrentTimestampUnsupported(table, c)
 	return sb.String(), nil
+}
+
+// warnOnUpdateCurrentTimestampUnsupported reports a source column that
+// re-stamps itself on UPDATE (MySQL's ON UPDATE CURRENT_TIMESTAMP) landing on
+// Postgres, which has no column-level equivalent (audit 2026-08-01 S7).
+//
+// This is NOT a refusal, and the boundary is worth stating. No migrated ROW is
+// wrong: the copy carries every value faithfully, and `sluice` is not the thing
+// that would write to the target afterwards. What changes is the target's
+// behaviour on FUTURE updates — after cutover, an UPDATE that does not name
+// the column leaves it stale where the source would have re-stamped it. That
+// is a real divergence the operator must act on (a BEFORE UPDATE trigger is
+// the Postgres idiom), and it is squarely their call, so it warns loudly
+// rather than blocking a migration that is otherwise correct.
+//
+// Auto-creating the trigger is deliberately NOT done: per the "contain
+// Postgres complexity" tenet, trigger lifecycle on the target is surfaced
+// explicitly, never silently synthesised.
+func warnOnUpdateCurrentTimestampUnsupported(table *ir.Table, c *ir.Column) {
+	if c == nil || !c.OnUpdateCurrentTimestamp {
+		return
+	}
+	name := ""
+	if table != nil {
+		name = table.Name
+	}
+	slog.Warn(
+		"source column re-stamps itself on UPDATE (ON UPDATE CURRENT_TIMESTAMP) and Postgres has no "+
+			"column-level equivalent; migrated rows are unaffected, but after cutover an UPDATE that does not "+
+			"name this column will leave it stale. Add a BEFORE UPDATE trigger on the target if the "+
+			"application relies on it",
+		slog.String("table", name),
+		slog.String("column", c.Name),
+	)
 }
 
 // pgCollateClause returns the ` COLLATE "<name>"` suffix for a column
