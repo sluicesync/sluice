@@ -351,3 +351,148 @@ func TestTableProgressUnmarshalV04Compat(t *testing.T) {
 		t.Errorf("Chunks: got %v; want nil for v0.4.0 row", got.Chunks)
 	}
 }
+
+// TestTableProgressBareStringNeverDropsDetail is the Bug 221 class pin.
+//
+// The compact bare-string wire form carries EXACTLY one field — State —
+// so any other populated field is discarded by it, and discarded
+// silently: a reader cannot tell a dropped RowsCopied from a recorded
+// zero. `sluice backfill` persists its completed walk as
+// {State: complete, RowsCopied: n}; the bare string dropped n on the
+// way to the store, and the re-run's --verify evidence gate then
+// refused to authorize the contract step, asserting that no run of the
+// spec had ever moved a row.
+//
+// Pin the CLASS, not the representative (the Bug 74 lesson): the matrix
+// is every bare-string-ELIGIBLE state × every non-State field, and the
+// field axis is derived by reflection so a field ADDED to TableProgress
+// fails this test until carriesDetail enumerates it. A field type with
+// no sample value below is a failure, never a skip — an unenumerated
+// field is precisely what this guard exists to catch.
+func TestTableProgressBareStringNeverDropsDetail(t *testing.T) {
+	// The states MarshalJSON may render as a bare string. Any state NOT
+	// listed here already takes the object form unconditionally.
+	bareStringStates := []TableProgressState{
+		TableProgressComplete,
+		TableProgressNoPKTruncateAndRedo,
+		"", // the zero value
+	}
+
+	typ := reflect.TypeOf(TableProgress{})
+	fields := 0
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Name == "State" {
+			continue
+		}
+		fields++
+		for _, state := range bareStringStates {
+			t.Run(string(state)+"/"+field.Name, func(t *testing.T) {
+				in := TableProgress{State: state}
+				setNonZeroProgressField(t, &in, field.Name)
+
+				b, err := json.Marshal(in)
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				if b[0] == '"' {
+					t.Fatalf("%s with %s set marshalled to the bare string %s — the %s is silently dropped",
+						state, field.Name, b, field.Name)
+				}
+				var got TableProgress
+				if err := json.Unmarshal(b, &got); err != nil {
+					t.Fatalf("Unmarshal %s: %v", b, err)
+				}
+				if !reflect.DeepEqual(got, in) {
+					t.Errorf("round-trip through %s: got %#v; want %#v", b, got, in)
+				}
+			})
+		}
+	}
+	if fields == 0 {
+		t.Fatal("derived zero non-State fields; the reflection walk is vacuous")
+	}
+}
+
+// setNonZeroProgressField populates ONE named field of p with a
+// non-zero value. It fails the test on a field it has no sample for,
+// which is what makes TestTableProgressBareStringNeverDropsDetail a
+// completeness guard rather than a fixed list.
+func setNonZeroProgressField(t *testing.T, p *TableProgress, name string) {
+	t.Helper()
+	switch name {
+	case "LastPK":
+		p.LastPK = []any{int64(9007199254740995)}
+	case "RowsCopied":
+		p.RowsCopied = 500
+	case "Chunks":
+		p.Chunks = []TableChunkProgress{{
+			ChunkIndex: 0,
+			UpperPK:    []any{int64(100)},
+			LastPK:     []any{int64(42)},
+			RowsCopied: 42,
+			State:      TableProgressInProgress,
+		}}
+	case "IndexesBuilt":
+		p.IndexesBuilt = true
+	default:
+		t.Fatalf("TableProgress grew field %q with no sample value here — add one, and make sure "+
+			"TableProgress.carriesDetail enumerates the field so the bare-string form can't drop it", name)
+	}
+}
+
+// TestTableProgressBareStringStillCompactsWhenEmpty is the other half
+// of the pin above: an entry with nothing but its label MUST keep the
+// compact bare-string form. The promotion is a loss guard, not a
+// blanket switch to the object form — operators read these rows in
+// psql, and the v0.3.0 wire shape stays byte-identical.
+func TestTableProgressBareStringStillCompactsWhenEmpty(t *testing.T) {
+	cases := []struct {
+		in   TableProgress
+		want string
+	}{
+		{TableProgress{State: TableProgressComplete}, `"complete"`},
+		{TableProgress{State: TableProgressNoPKTruncateAndRedo}, `"no_pk_truncate_and_redo"`},
+		{TableProgress{}, `""`},
+	}
+	for _, c := range cases {
+		b, err := json.Marshal(c.in)
+		if err != nil {
+			t.Fatalf("Marshal %#v: %v", c.in, err)
+		}
+		if string(b) != c.want {
+			t.Errorf("Marshal %#v: got %s; want %s", c.in, b, c.want)
+		}
+	}
+}
+
+// TestTableProgressBackfillCompletionRoundTrip pins the exact entry
+// `sluice backfill` writes when its walk finishes, at the exact
+// boundary that mattered: a completed spec that moved rows keeps its
+// count, and a completed spec that genuinely moved none stays the
+// compact bare string (so the refusal it produces is honest).
+func TestTableProgressBackfillCompletionRoundTrip(t *testing.T) {
+	moved := TableProgress{State: TableProgressComplete, RowsCopied: 500}
+	b, err := json.Marshal(moved)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(b) != `{"state":"complete","rows_copied":500}` {
+		t.Errorf("completed-with-work wire shape: got %s", b)
+	}
+	var got TableProgress
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.RowsCopied != 500 {
+		t.Errorf("RowsCopied after round-trip: got %d; want 500", got.RowsCopied)
+	}
+
+	none := TableProgress{State: TableProgressComplete}
+	if b, err = json.Marshal(none); err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(b) != `"complete"` {
+		t.Errorf("completed-no-work wire shape: got %s; want \"complete\"", b)
+	}
+}

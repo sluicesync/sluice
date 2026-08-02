@@ -261,6 +261,130 @@ func TestBackfillVerify_CompletedSpecNoOpUsesTheRecordedWork(t *testing.T) {
 	}
 }
 
+// TestBackfillVerify_RerunBoundary pins all four evidence outcomes
+// TOGETHER, so the boundary between "authorize" and "refuse" is
+// readable in one place rather than inferred across five tests.
+//
+// The first two rows are the Bug 221 regression: an operator re-runs
+// the IDENTICAL `backfill --verify` command — the normal, correct
+// thing to do in cron / Airflow / CI, and the third authorizing case
+// the gate's own contract promises. v0.108.0 refused it with
+// SLUICE-E-BACKFILL-VERIFY-NO-EVIDENCE and told the operator no run of
+// the spec had ever moved a row, because the completed walk's row
+// count was silently dropped by the migrate-state codec's bare-string
+// form for terminal states. Each row drives a REAL first walk through
+// the store and then re-invokes an identical Backfiller against it, so
+// the count crosses the serialization boundary the way it does in
+// production (backfillFakeStore.Read round-trips through the codec).
+//
+// The last three rows are the hole the evidence gate closed; they must
+// stay refusals. Pinning them here alongside the re-run makes it
+// impossible to "fix" the false refusal by weakening the gate.
+func TestBackfillVerify_RerunBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// seed prepares the store as an earlier run would have left it
+		// (nil = fresh spec).
+		seed func(store *backfillFakeStore, id string)
+		// first is the executor script for the first invocation.
+		first *scriptedBackfillExecutor
+		// rerun, when true, runs a SECOND identical --verify invocation
+		// (walking nothing) and scores THAT one.
+		rerun         bool
+		wantRefusal   bool
+		wantRowsMoved int64
+	}{
+		{
+			name:          "rerun of a completed spec that moved rows authorizes",
+			first:         &scriptedBackfillExecutor{counts: []int64{6, 0}, chunks: 3, rowsPerChunk: 2},
+			rerun:         true,
+			wantRowsMoved: 6,
+		},
+		{
+			name: "rerun of a RESUMED spec that moved rows authorizes",
+			seed: func(store *backfillFakeStore, id string) {
+				store.headers[id] = ir.MigrationState{MigrationID: id, Phase: backfillPhaseRunning}
+				store.progress[id] = map[string]ir.TableProgress{
+					"items": {State: ir.TableProgressInProgress, LastPK: []any{int64(9)}, RowsCopied: 42},
+				}
+			},
+			first:         &scriptedBackfillExecutor{counts: []int64{4, 0}, chunks: 11, rowsPerChunk: 2},
+			rerun:         true,
+			wantRowsMoved: 46,
+		},
+		{
+			name:        "wrong guard on a fresh spec refuses",
+			first:       &scriptedBackfillExecutor{counts: []int64{0}, chunks: 3, rowsPerChunk: 0},
+			wantRefusal: true,
+		},
+		{
+			name:        "work existed and none was done refuses",
+			first:       &scriptedBackfillExecutor{counts: []int64{5, 0}, chunks: 2, rowsPerChunk: 0},
+			wantRefusal: true,
+		},
+		{
+			name: "truly no-work completed spec refuses on re-run",
+			seed: func(store *backfillFakeStore, id string) {
+				store.headers[id] = ir.MigrationState{MigrationID: id, Phase: ir.MigrationPhaseComplete}
+				store.progress[id] = map[string]ir.TableProgress{
+					"items": {State: ir.TableProgressComplete},
+				}
+			},
+			first:       &scriptedBackfillExecutor{counts: []int64{0}},
+			wantRefusal: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newBackfillFakeStore()
+			b, out := newScriptedBackfiller(t, tc.first, store)
+			b.Verify = true
+			if tc.seed != nil {
+				tc.seed(store, BackfillMigrationID(b.Table, b.Sets, b.Where))
+			}
+
+			res, err := b.Run(context.Background())
+			if !tc.rerun {
+				if tc.wantRefusal {
+					wantBackfillCode(t, err, sluicecode.CodeBackfillVerifyNoEvidence)
+					return
+				}
+				if err != nil {
+					t.Fatalf("Run: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("first run: %v", err)
+			}
+			if res.RowsUpdated != tc.wantRowsMoved {
+				t.Fatalf("first run RowsUpdated = %d; want %d (the fixture is wrong, not the gate)",
+					res.RowsUpdated, tc.wantRowsMoved)
+			}
+
+			// The IDENTICAL command again. Nothing else touched the DB.
+			b2, out2 := newScriptedBackfiller(t, &scriptedBackfillExecutor{counts: []int64{0}}, store)
+			b2.Verify = true
+			res2, err2 := b2.Run(context.Background())
+			if err2 != nil {
+				t.Fatalf("re-run of the identical command: %v\n(first run reported %q)", err2, out.String())
+			}
+			if !res2.AlreadyComplete {
+				t.Error("re-run did not take the completed-spec no-op path")
+			}
+			if res2.RowsUpdated != tc.wantRowsMoved {
+				t.Errorf("re-run RowsUpdated = %d; want the completed run's %d carried forward",
+					res2.RowsUpdated, tc.wantRowsMoved)
+			}
+			if !res2.Verified {
+				t.Error("re-run Verified = false; the authorization must still hold")
+			}
+			if !strings.Contains(out2.String(), "safe to run the contract step") {
+				t.Errorf("re-run report %q missing the safe-to-contract signal", out2.String())
+			}
+		})
+	}
+}
+
 // A zero-work walk WITHOUT --verify is not a refusal — no
 // authorization is being issued — but it must not read as success
 // either. The evidence classification is what the WARN reports.

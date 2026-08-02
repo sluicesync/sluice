@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -199,6 +200,20 @@ func (f *backfillFakeExecutor) Close() error {
 }
 
 // backfillFakeStore is an in-memory ir.MigrationStateStore.
+//
+// Every WRITE goes through the real ir.TableProgress JSON codec (see
+// roundTripProgress) — the serialization boundary every shipping store
+// crosses — so what a later Read returns is what a real store would
+// have been able to persist. A fake that hands back the Go value it
+// was given cannot see a codec that drops a field, and that is exactly
+// how Bug 221 stayed green here while a real Postgres silently lost
+// the completed walk's row count.
+//
+// Entries seeded DIRECTLY into s.progress deliberately skip the
+// round-trip: those fixtures stand in for rows an OLDER binary wrote
+// (legacy un-enveloped cursors, pre-fix terminal entries), and
+// re-encoding them with today's codec would launder exactly the
+// property they exist to test.
 type backfillFakeStore struct {
 	mu       sync.Mutex
 	headers  map[string]ir.MigrationState
@@ -229,6 +244,21 @@ func (s *backfillFakeStore) Read(_ context.Context, id string) (ir.MigrationStat
 	return st, true, nil
 }
 
+// roundTripProgress encodes and decodes one progress entry exactly as
+// a persisting store does. Any field the wire form cannot carry is
+// gone on the way back — which is the point.
+func roundTripProgress(p ir.TableProgress) (ir.TableProgress, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return ir.TableProgress{}, err
+	}
+	var out ir.TableProgress
+	if err := json.Unmarshal(b, &out); err != nil {
+		return ir.TableProgress{}, err
+	}
+	return out, nil
+}
+
 func (s *backfillFakeStore) Write(_ context.Context, state ir.MigrationState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -238,7 +268,11 @@ func (s *backfillFakeStore) Write(_ context.Context, state ir.MigrationState) er
 		if s.progress[state.MigrationID] == nil {
 			s.progress[state.MigrationID] = map[string]ir.TableProgress{}
 		}
-		s.progress[state.MigrationID][k] = v
+		entry, err := roundTripProgress(v)
+		if err != nil {
+			return fmt.Errorf("fake store: encode progress for %q: %w", k, err)
+		}
+		s.progress[state.MigrationID][k] = entry
 	}
 	return nil
 }
@@ -250,7 +284,11 @@ func (s *backfillFakeStore) WriteTableProgress(_ context.Context, id, table stri
 	if s.progress[id] == nil {
 		s.progress[id] = map[string]ir.TableProgress{}
 	}
-	s.progress[id][table] = p
+	entry, err := roundTripProgress(p)
+	if err != nil {
+		return fmt.Errorf("fake store: encode progress for %q: %w", table, err)
+	}
+	s.progress[id][table] = entry
 	return nil
 }
 

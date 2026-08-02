@@ -24,9 +24,17 @@
 //     the cost of the object form.
 //
 // MarshalJSON emits the bare string for `complete` and
-// `no_pk_truncate_and_redo` (no cursor data to preserve), and the
-// object form for `in_progress` (the cursor and row count are the
-// load-bearing fields). UnmarshalJSON accepts either shape on input.
+// `no_pk_truncate_and_redo` ONLY when the entry carries nothing but
+// its label, and the object form for `in_progress` (the cursor and
+// row count are the load-bearing fields) and for any entry with
+// detail in another field. UnmarshalJSON accepts either shape on
+// input.
+//
+// That "only when" is load-bearing and was learned the hard way: the
+// bare string carries exactly one field, so a terminal entry with a
+// populated RowsCopied lost the count between the caller and the
+// store, and nothing downstream could tell the dropped count from a
+// recorded zero. See [TableProgress.carriesDetail].
 //
 // # The cursor-value envelope (audit 2026-07-15 CRITICAL-2 / HIGH-1)
 //
@@ -91,7 +99,8 @@ import (
 // EXISTS). A `complete` table with IndexesBuilt=true forces the object
 // form (the bare-string `complete` can't carry the flag); a `complete`
 // table with IndexesBuilt=false stays the compact bare string (false is
-// the wire default anyway).
+// the wire default anyway). That promotion is not special to this field
+// — [TableProgress.carriesDetail] applies it to every non-State field.
 type tableProgressObject struct {
 	State        TableProgressState   `json:"state"`
 	LastPK       []any                `json:"last_pk,omitempty"`
@@ -173,35 +182,58 @@ func (c *TableChunkProgress) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// carriesDetail reports whether the entry holds anything OTHER than
+// its State — i.e. anything the compact bare-string form physically
+// cannot represent.
+//
+// It is the guard that makes the bare string a compaction rather than
+// a lossy one (Bug 221). The bare string carries exactly one field;
+// every other field of [TableProgress] is silently discarded by it,
+// and "silently" is the whole problem — nothing downstream can tell a
+// dropped count from a recorded zero. Enumerate every non-State field
+// here, so a field added to TableProgress that a caller populates on a
+// bare-string-eligible state promotes the entry to the object form
+// instead of evaporating on the way to the store.
+func (p TableProgress) carriesDetail() bool {
+	return len(p.LastPK) > 0 || p.RowsCopied != 0 || len(p.Chunks) > 0 || p.IndexesBuilt
+}
+
 // MarshalJSON emits the compact bare-string form for terminal states
-// (`complete`, `no_pk_truncate_and_redo`) and the object form for
-// `in_progress` (where the cursor and row count are the load-bearing
-// fields). An empty State marshals as the bare string "" so a
-// zero-value TableProgress round-trips unchanged.
+// (`complete`, `no_pk_truncate_and_redo`) that carry nothing but their
+// label, and the object form for everything else — `in_progress`
+// (where the cursor and row count are the load-bearing fields) and any
+// entry [TableProgress.carriesDetail] finds detail on. An empty State
+// with no detail marshals as the bare string "" so a zero-value
+// TableProgress round-trips unchanged.
+//
+// The carriesDetail promotion is the Bug 221 fix. `sluice backfill`
+// records its completed walk as {State: complete, RowsCopied: n}, and
+// the bare string dropped the count on the way to the store, so the
+// re-run no-op read RowsCopied=0 back and the --verify evidence gate
+// refused to authorize the contract step with a message asserting no
+// run had ever moved a row. Every existing writer of a terminal state
+// leaves the other fields zero (the migrator writes a bare
+// `{State: complete}`), so the wire shape for migrate state rows is
+// unchanged; only entries that would otherwise LOSE data promote.
 func (p TableProgress) MarshalJSON() ([]byte, error) {
+	if p.carriesDetail() {
+		// Includes the ADR-0077 IndexesBuilt=true case: a `complete`
+		// table whose indexes are also built must round-trip that flag,
+		// or a resume re-feeds the table to the index pool.
+		return p.marshalObject()
+	}
 	switch p.State {
-	case TableProgressComplete:
-		// Terminal copy state. Emit the compact bare string UNLESS the
-		// table also carries IndexesBuilt=true (ADR-0077) — the bare
-		// string can't carry that flag, so promote to the object form so
-		// a resume reads "copy done AND indexes done" and skips the table
-		// entirely. IndexesBuilt=false stays the compact bare string
-		// (false is the wire default, decoded back the same way).
-		if p.IndexesBuilt {
-			return p.marshalObject()
-		}
-		return json.Marshal(string(p.State))
-	case TableProgressNoPKTruncateAndRedo:
-		// Terminal-style state: nothing useful to carry beyond the
-		// label. Emit the bare string for compact wire output.
+	case TableProgressComplete, TableProgressNoPKTruncateAndRedo:
+		// Terminal states with nothing to carry beyond the label. Emit
+		// the bare string for compact, psql-readable wire output.
 		return json.Marshal(string(p.State))
 	case TableProgressInProgress:
 		// In-progress entries carry cursor data; emit the object form
-		// so resume can pick the cursor up. omitempty on LastPK and
-		// RowsCopied keeps a v0.3.0-style "in_progress with no cursor"
-		// degenerate-case write compact, even though the orchestrator
-		// shouldn't be producing those — defensive against future
-		// callers that pass a zero LastPK.
+		// so resume can pick the cursor up. A v0.3.0-style "in_progress
+		// with no cursor" degenerate write reaches here with no detail
+		// and still takes the object form — the orchestrator shouldn't
+		// produce those, and `{"state":"in_progress"}` is the shape
+		// resume classification has always been pinned against.
 		return p.marshalObject()
 	case "":
 		// Zero value. Emit an empty bare string so the round-trip is

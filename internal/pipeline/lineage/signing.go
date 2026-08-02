@@ -412,6 +412,12 @@ func ReadManifestSig(ctx context.Context, store irbackup.Store, manifestPath str
 // sequence, chunk-count, or MAC. The sequence and chunk-count are also
 // under the MAC; the explicit checks give a precise error before the
 // MAC comparison.
+//
+// A signature that verifies under a canon version predating the
+// schema's inclusion in the signed bytes (ADR-0183 / v5) is still
+// VALID — the MAC covers what it covers — but emits
+// [WarnPreSchemaCanonSignature], because "valid" means materially less
+// on such a chain and nothing else tells the operator so.
 func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath string, m *irbackup.Manifest, seq int, s *Signer) error {
 	sig, ok, err := ReadManifestSig(ctx, store, manifestPath)
 	if err != nil {
@@ -458,6 +464,11 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 		return fmt.Errorf("manifest %q (key_id recorded %q, verifying %q): %w",
 			manifestPath, sig.KeyID, s.KeyID, ErrSignatureInvalid)
 	}
+	// GREEN — but a green pre-v5 signature does not cover the schema, and
+	// the operator has no other way to learn that (Bug 220). Warned HERE,
+	// at the one chokepoint every verification entry point goes through,
+	// so a new caller cannot be added without it.
+	WarnPreSchemaCanonSignature(ctx, manifestPath, sig.CanonVersion)
 	return nil
 }
 

@@ -402,8 +402,14 @@ const (
 	evidenceWalkDidNothing
 
 	// evidenceCompletedRunDidNothing — the spec's stored state is
-	// terminal `complete`, so this run walked nothing, and the run that
-	// completed it recorded zero rows updated.
+	// terminal `complete`, so this run walked nothing, and its stored
+	// progress row carries no rows-updated count. A completed walk now
+	// always persists its count (Bug 221), so on a row this release
+	// wrote that means "the completing run moved nothing" — but on a
+	// row a ≤v0.108.0 binary wrote the count was dropped by the state
+	// codec and is unrecoverable. The refusal names both, because it
+	// cannot distinguish them and must not guess in the direction of
+	// authorizing a DROP.
 	evidenceCompletedRunDidNothing
 
 	// evidenceCountOnly — --verify-only: no walk ran and there is no
@@ -535,7 +541,7 @@ func (b *Backfiller) refuseUnevidencedVerify(ev backfillEvidence, result *Backfi
 		)
 	case evidenceCompletedRunDidNothing:
 		detail = fmt.Sprintf(
-			"the stored state for this exact spec is already `complete`, so this run walked nothing — and the run that completed it recorded 0 rows updated, so no run of this spec has ever moved a row of %q",
+			"the stored state for this exact spec is already `complete`, so this run walked nothing — and its stored progress row records no rows updated for %q. Either the run that completed it moved nothing, or it was completed by a sluice at or below v0.108.0, whose state codec dropped the count for a completed spec — this release records it, but the count is not recoverable from a row already stored without it. This run cannot tell those apart and will not authorize a DROP on the guess",
 			b.Table,
 		)
 	default:

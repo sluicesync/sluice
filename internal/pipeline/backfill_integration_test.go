@@ -116,6 +116,38 @@ func (s *cancelAfterNChunksSink) TableProgress(string, int64, int64) {
 	}
 }
 
+// assertPersistedBackfillRows reads the spec's migrate-state row back
+// through the engine's own store and asserts the completed walk's row
+// count survived persistence. This is the layer Bug 221 broke: the
+// walk reported the right number, the CLI printed it, and the store
+// held a terminal entry that could not carry it.
+func assertPersistedBackfillRows(ctx context.Context, t *testing.T, eng ir.Engine, dsn, table string, sets []ir.BackfillSet, where string, want int64) {
+	t.Helper()
+	opener, ok := eng.(ir.MigrationStateStoreOpener)
+	if !ok {
+		t.Fatalf("engine %q does not open a migrate-state store", eng.Name())
+	}
+	store, err := opener.OpenMigrationStateStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open migrate-state store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	state, found, err := store.Read(ctx, BackfillMigrationID(table, sets, where))
+	if err != nil {
+		t.Fatalf("read migrate-state: %v", err)
+	}
+	if !found {
+		t.Fatalf("no migrate-state row for the completed backfill of %q", table)
+	}
+	if state.Phase != ir.MigrationPhaseComplete {
+		t.Errorf("persisted phase = %q; want complete", state.Phase)
+	}
+	if got := state.TableProgress[table].RowsCopied; got != want {
+		t.Errorf("persisted RowsCopied for %q = %d; want %d — the completed walk's count did not survive the state store",
+			table, got, want)
+	}
+}
+
 func runBackfillScenarios(t *testing.T, db *sql.DB, eng ir.Engine, dsn string) {
 	ctx := context.Background()
 
@@ -156,8 +188,15 @@ func runBackfillScenarios(t *testing.T, db *sql.DB, eng ir.Engine, dsn string) {
 			if err != nil {
 				t.Fatalf("re-run: %v", err)
 			}
-			if !res2.AlreadyComplete || res2.RowsUpdated != 0 || res2.Chunks != 0 {
-				t.Errorf("re-run = %+v; want AlreadyComplete with 0 rows and 0 chunks", res2)
+			// Chunks 0 — the no-op walks nothing — but RowsUpdated
+			// carries the COMPLETED run's recorded count forward (Bug
+			// 221). This assertion read `!= 0` until the completed
+			// walk's count actually survived the state store: the
+			// bare-string wire form for terminal entries dropped it, so
+			// the carry-forward silently produced 0 and this test
+			// pinned the loss instead of the contract.
+			if !res2.AlreadyComplete || res2.RowsUpdated != 95 || res2.Chunks != 0 {
+				t.Errorf("re-run = %+v; want AlreadyComplete carrying the completed run's 95 rows, 0 chunks", res2)
 			}
 		})
 
@@ -362,6 +401,128 @@ func runBackfillScenarios(t *testing.T, db *sql.DB, eng ir.Engine, dsn string) {
 		}
 		if !res3.Verified {
 			t.Error("Verified = false after the catch-up walk; want true")
+		}
+	})
+
+	// The Bug 221 gate, on a REAL database because that is where it
+	// broke: an operator re-runs the IDENTICAL `backfill --verify`
+	// command — what cron / Airflow / CI do, and the third case the
+	// gate's contract authorizes. v0.108.0 exited 3 with
+	// SLUICE-E-BACKFILL-VERIFY-NO-EVIDENCE and told the operator no run
+	// of the spec had ever moved a row, because the completed walk's
+	// row count never reached the store: the migrate-state codec's
+	// compact bare-string form for terminal entries carries only the
+	// state label, so {complete, RowsCopied: n} persisted as
+	// `"complete"` and read back as 0.
+	//
+	// The independent expected value here is the count the FIRST run
+	// reported — asserted both through the store's own Read (what the
+	// no-op consults) and through the second run's result.
+	t.Run("verify_rerun_of_a_completed_spec_still_authorizes", func(t *testing.T) {
+		mustExecBF(t, db, "CREATE TABLE bf_rerun (id INT PRIMARY KEY, old_col INT NOT NULL, new_col INT NULL)")
+		seedBackfillRows(t, db, "bf_rerun", 60)
+
+		var out1 strings.Builder
+		b1 := newIntgBackfiller(eng, dsn, "bf_rerun", "old_col + 1", "new_col IS NULL", 10)
+		b1.Verify = true
+		b1.Out = &out1
+		res1, err := b1.Run(ctx)
+		if err != nil {
+			t.Fatalf("run 1: %v", err)
+		}
+		if res1.RowsUpdated != 60 || !res1.Verified {
+			t.Fatalf("run 1: RowsUpdated=%d Verified=%v; want 60, true", res1.RowsUpdated, res1.Verified)
+		}
+		if !strings.Contains(out1.String(), "safe to run the contract step") {
+			t.Fatalf("run 1 report %q missing the safe-to-contract signal", out1.String())
+		}
+
+		// The count must have SURVIVED the state store — this is the
+		// assertion the bug fails, one layer below the CLI's exit code.
+		assertPersistedBackfillRows(ctx, t, eng, dsn, "bf_rerun",
+			[]ir.BackfillSet{{Column: "new_col", Expr: "old_col + 1"}}, "new_col IS NULL", 60)
+
+		// RUN 2 — the identical command, nothing else touched.
+		var out2 strings.Builder
+		b2 := newIntgBackfiller(eng, dsn, "bf_rerun", "old_col + 1", "new_col IS NULL", 10)
+		b2.Verify = true
+		b2.Out = &out2
+		res2, err := b2.Run(ctx)
+		if err != nil {
+			t.Fatalf("re-run of the identical command: %v", err)
+		}
+		if !res2.AlreadyComplete {
+			t.Error("re-run did not take the completed-spec no-op path")
+		}
+		if res2.RowsUpdated != 60 || !res2.Verified {
+			t.Errorf("re-run: RowsUpdated=%d Verified=%v; want the carried-forward 60, true",
+				res2.RowsUpdated, res2.Verified)
+		}
+		if !strings.Contains(out2.String(), "safe to run the contract step") {
+			t.Errorf("re-run report %q missing the safe-to-contract signal", out2.String())
+		}
+	})
+
+	// The resumed-spec variant of the same gate: a spec whose walk was
+	// killed and resumed to completion must also re-verify clean, with
+	// the CUMULATIVE count (the resumed run seeds RowsUpdated from the
+	// persisted cursor, and that total is what the terminal entry has
+	// to carry).
+	t.Run("verify_rerun_of_a_resumed_spec_still_authorizes", func(t *testing.T) {
+		mustExecBF(t, db, "CREATE TABLE bf_rerun_resumed (id INT PRIMARY KEY, old_col INT NOT NULL, new_col INT NULL)")
+		seedBackfillRows(t, db, "bf_rerun_resumed", 60)
+
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		killed := newIntgBackfiller(eng, dsn, "bf_rerun_resumed", "old_col + 1", "new_col IS NULL", 10)
+		killed.Progress = &cancelAfterNChunksSink{after: 2, cancel: cancel}
+		if _, err := killed.Run(runCtx); err == nil {
+			t.Fatal("cancelled run returned nil error; the kill lever failed")
+		}
+
+		resumed := newIntgBackfiller(eng, dsn, "bf_rerun_resumed", "old_col + 1", "new_col IS NULL", 10)
+		resumed.Verify = true
+		res, err := resumed.Run(ctx)
+		if err != nil {
+			t.Fatalf("resume run: %v", err)
+		}
+		if !res.Resumed || res.RowsUpdated != 60 {
+			t.Fatalf("resume run: Resumed=%v RowsUpdated=%d; want true, the cumulative 60", res.Resumed, res.RowsUpdated)
+		}
+		assertPersistedBackfillRows(ctx, t, eng, dsn, "bf_rerun_resumed",
+			[]ir.BackfillSet{{Column: "new_col", Expr: "old_col + 1"}}, "new_col IS NULL", 60)
+
+		again := newIntgBackfiller(eng, dsn, "bf_rerun_resumed", "old_col + 1", "new_col IS NULL", 10)
+		again.Verify = true
+		res2, err := again.Run(ctx)
+		if err != nil {
+			t.Fatalf("re-run after a resumed completion: %v", err)
+		}
+		if !res2.AlreadyComplete || res2.RowsUpdated != 60 || !res2.Verified {
+			t.Errorf("re-run = %+v; want AlreadyComplete carrying 60 with Verified", res2)
+		}
+	})
+
+	// The other side of the boundary, on a real engine: the fix must
+	// not restore the hole the evidence gate closed. A guard that is
+	// valid SQL and matches nothing counts 0 before the walk, updates
+	// 0 rows, counts 0 after — and must still refuse.
+	t.Run("verify_wrong_guard_on_a_fresh_spec_still_refuses", func(t *testing.T) {
+		mustExecBF(t, db, "CREATE TABLE bf_badguard (id INT PRIMARY KEY, old_col INT NOT NULL, new_col INT NULL)")
+		seedBackfillRows(t, db, "bf_badguard", 20)
+		// Already-backfilled by hand: the guard below matches nothing
+		// from the start, which is what a mistyped predicate looks like.
+		mustExecBF(t, db, "UPDATE bf_badguard SET new_col = old_col + 1")
+
+		b := newIntgBackfiller(eng, dsn, "bf_badguard", "old_col + 1", "new_col IS NULL", 10)
+		b.Verify = true
+		if _, err := b.Run(ctx); err == nil {
+			t.Fatal("wrong-guard run returned nil; want SLUICE-E-BACKFILL-VERIFY-NO-EVIDENCE")
+		} else {
+			coded, ok := sluicecode.FromError(err)
+			if !ok || coded.Code != sluicecode.CodeBackfillVerifyNoEvidence {
+				t.Fatalf("err = %v; want code %s", err, sluicecode.CodeBackfillVerifyNoEvidence)
+			}
 		}
 	})
 

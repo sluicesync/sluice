@@ -336,6 +336,28 @@ var manifestCanonVersions = map[string]manifestCanonFeatures{
 	ManifestCanonVersion:   {scheme: true, rowChunkParentTable: true, schemaBytes: true},
 }
 
+// ManifestCanonCoversSchema reports whether a signature recorded under
+// canonVersion authenticates the manifest's `schema` member itself, or
+// only the `schema_hash` STRING beside it — which an adversary editing
+// the schema simply restates, so it authenticates nothing.
+//
+// Derived from [manifestCanonVersions], not from a version-string
+// comparison, so a future canon version inherits the answer from the
+// one place that defines what its bytes cover. An UNKNOWN version — one
+// a newer sluice wrote — reports false: this build cannot recompute
+// those bytes at all, so it must not claim they cover anything. The
+// verify path reaches [ErrUnsupportedCanonVersion] first in that case.
+//
+// The read side uses this to tell operators that a green signature over
+// a pre-v5 chain does NOT make its schema tamper-evident (Bug 220):
+// dropped CHECK/UNIQUE/FK constraints and flipped RLS flags stay
+// forgeable on every chain signed before ADR-0183, and no re-seal
+// migration exists because a signature cannot be strengthened after the
+// fact.
+func ManifestCanonCoversSchema(canonVersion string) bool {
+	return manifestCanonVersions[canonVersion].schemaBytes
+}
+
 // CanonicalManifestBytesForVersion renders the canonical bytes at a
 // SPECIFIC canon version — the dual-version verify entry point. The
 // writer always uses [ManifestCanonVersion] (via [CanonicalManifestBytes]);
