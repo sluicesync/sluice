@@ -27,6 +27,34 @@ import (
 // tune with real-world data.
 const defaultMaxRowsPerBatch = 500
 
+// maxBindParamsPerStmt is Postgres's hard ceiling on bound parameters in one
+// extended-protocol message: the wire format carries the parameter count as a
+// signed 16-bit integer, so 65535 is a protocol limit, not a tunable
+// (audit 2026-08-01 Q3).
+//
+// It matters because a multi-row INSERT binds rowCount × columnCount
+// parameters. At the default 500 rows per batch a table of 132 columns emits
+// 66,000 — over the ceiling — and the statement fails outright. MySQL and
+// SQLite both already bound their batches this way (SQLite's
+// maxBindParamsPerStmt is the direct analogue); Postgres was the one engine of
+// the three without the clamp.
+const maxBindParamsPerStmt = 65535
+
+// clampRowsToBindLimit reduces a per-statement row count so that
+// rows × cols stays within [maxBindParamsPerStmt]. Returns at least 1: a
+// single row of more than 65535 columns cannot be bound at all, and is left
+// to fail loudly against the server rather than be silently dropped here —
+// Postgres's own column limit (1600) makes that unreachable in practice.
+func clampRowsToBindLimit(rows, cols int) int {
+	if cols <= 0 || rows*cols <= maxBindParamsPerStmt {
+		return rows
+	}
+	if n := maxBindParamsPerStmt / cols; n > 0 {
+		return n
+	}
+	return 1
+}
+
 // defaultMaxBufferBytes is the soft per-batch byte cap when the
 // caller doesn't set one explicitly. Bounds heap usage at ~64 MiB
 // for wide-row workloads; tunable via --max-buffer-bytes. See
@@ -841,6 +869,9 @@ func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-c
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	// Postgres binds rowCount x columnCount parameters per multi-row INSERT
+	// and the wire protocol caps that at 65535 (audit 2026-08-01 Q3).
+	limit = clampRowsToBindLimit(limit, len(nonGeneratedColumns(table.Columns)))
 	byteCap := w.maxBufferBytes
 	if byteCap <= 0 {
 		byteCap = defaultMaxBufferBytes

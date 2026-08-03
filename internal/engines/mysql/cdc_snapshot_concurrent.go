@@ -677,6 +677,18 @@ func (r *concurrentBinlogRows) ConcurrentCopyGroups() [][]string {
 // see identical data — which is what makes work-stealing correct (roadmap
 // item 21a). >1 here by construction (the opener gates on n > 1).
 func (r *concurrentBinlogRows) ConcurrentReaderCount() int {
+	return r.readerCount()
+}
+
+// readerCount returns len(readers) under connMu. The ADR-0111 recovery
+// REPLACES the slice, so reading its header unlocked is a data race even
+// though the count itself is invariant across a swap ("the reader count is
+// preserved across recovery"). A stable value does not make the read safe;
+// it only makes the race benign in outcome, which -race does not grade on
+// (audit 2026-08-01 P2, swept from the CountRows instance).
+func (r *concurrentBinlogRows) readerCount() int {
+	r.connMu.RLock()
+	defer r.connMu.RUnlock()
 	return len(r.readers)
 }
 
@@ -693,10 +705,10 @@ func (r *concurrentBinlogRows) ReadRowsOn(ctx context.Context, table *ir.Table, 
 	if table == nil {
 		return nil, errors.New("mysql: concurrent ReadRowsOn: table is nil")
 	}
-	if reader < 0 || reader >= len(r.readers) {
+	if n := r.readerCount(); reader < 0 || reader >= n {
 		return nil, fmt.Errorf(
 			"mysql: concurrent ReadRowsOn: reader index %d out of range [0,%d) — caller bug",
-			reader, len(r.readers),
+			reader, n,
 		)
 	}
 	// ADR-0111: read through the resumable wrapper, pinned to the requested
@@ -721,10 +733,10 @@ func (r *concurrentBinlogRows) ReadRowsRangeOn(ctx context.Context, table *ir.Ta
 	if table == nil {
 		return nil, errors.New("mysql: concurrent ReadRowsRangeOn: table is nil")
 	}
-	if reader < 0 || reader >= len(r.readers) {
+	if n := r.readerCount(); reader < 0 || reader >= n {
 		return nil, fmt.Errorf(
 			"mysql: concurrent ReadRowsRangeOn: reader index %d out of range [0,%d) — caller bug",
-			reader, len(r.readers),
+			reader, n,
 		)
 	}
 	return r.readResumable(ctx, table, lowerPK, upperPK, workItemCursorKey(table.Name, chunkIndex), reader)
@@ -807,14 +819,30 @@ func (r *concurrentBinlogRows) metaReader() *RowReader {
 // an honest "no estimate" (the ticker shows rows-copied without a %/ETA) rather
 // than a wrong total.
 func (r *concurrentBinlogRows) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
-	if table == nil || r.metaDB == nil || r.dbName == "" {
+	if table == nil {
+		return 0, nil
+	}
+	// metaDB / dbName are SWAPPED by the ADR-0111 recovery under connMu, so
+	// they are read under the same lock into locals here — exactly as
+	// [concurrentBinlogRows.metaReader] twenty lines above already does, and
+	// for the same reason (audit 2026-08-01 P2).
+	//
+	// Reading them unlocked was both a data race and a nil-deref: the guard
+	// and the use were separate reads, so a recovery landing between them
+	// left a nil *sql.DB to call QueryRowContext on. This runs on the DEFAULT
+	// MySQL cold-start path — the progress ticker's per-table ETA — so the
+	// window is hit by ordinary operation, not by an exotic shape.
+	r.connMu.RLock()
+	db, dbName := r.metaDB, r.dbName
+	r.connMu.RUnlock()
+	if db == nil || dbName == "" {
 		return 0, nil
 	}
 	const q = `SELECT COALESCE(TABLE_ROWS, 0)
 	      FROM information_schema.tables
 	      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
 	var n int64
-	if err := r.metaDB.QueryRowContext(ctx, q, r.dbName, table.Name).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, q, dbName, table.Name).Scan(&n); err != nil {
 		return 0, fmt.Errorf("mysql: concurrent CountRows estimate for %q: %w", table.Name, err)
 	}
 	return n, nil
@@ -826,8 +854,17 @@ func (r *concurrentBinlogRows) CountRows(ctx context.Context, table *ir.Table) (
 // so concurrentBinlogRows satisfies the io.Closer the orchestrator may call
 // on stream.Rows, mirroring the single-reader RowReader.Close contract.
 func (r *concurrentBinlogRows) Close() error {
+	// Snapshot the slice under connMu rather than ranging the field: the
+	// ADR-0111 recovery replaces it, and while Close is lifecycle-ordered
+	// after the copy in the shipped callers, "no caller does that today" is
+	// not a memory model (audit 2026-08-01 P2 sweep). Closing happens outside
+	// the lock so a slow rr.Close cannot block a recovery.
+	r.connMu.RLock()
+	readers := r.readers
+	r.connMu.RUnlock()
+
 	var firstErr error
-	for _, rr := range r.readers {
+	for _, rr := range readers {
 		if err := rr.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}

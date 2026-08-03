@@ -92,6 +92,8 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	// Same bind-parameter ceiling as the plain batch path (audit 2026-08-01 Q3).
+	limit = clampRowsToBindLimit(limit, len(nonGeneratedColumns(table.Columns)))
 	byteCap := w.maxBufferBytes
 	if byteCap <= 0 {
 		byteCap = defaultMaxBufferBytes
