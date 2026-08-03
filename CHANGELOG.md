@@ -4,6 +4,26 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.109.1] - 2026-08-03
+
+### Fixed
+
+**A cold copy from a PlanetScale or Vitess source failed outright on any table containing a wide row.** The copy aborted with `ResourceExhausted … grpc: received message after decompression larger than max 4194304`, which reads like the source rejecting an oversized row and is not that at all: 4194304 is 4 MiB, gRPC's stock **client** default, and sluice was the end refusing to receive. sluice builds its VStream client directly rather than through Vitess's own dial helper, so it inherited that 4 MiB ceiling while every Vitess-native client gets 16 MiB. VStream sends whole rows and cannot split one across messages, so a single wide row is enough — a `mediumtext` column is 16 MiB by itself, and a couple of `json` columns alongside it clear 4 MiB comfortably. Nothing about the source schema or data was at fault, and no workaround was needed on that side.
+
+The receive ceiling is now 128 MiB, overridable with a `vstream_max_recv_bytes=<bytes>` source-DSN parameter. The size is chosen on a rule rather than a guess: two independent ceilings bound a VStream message — vtgate's `--grpc_max_message_size` governs what the server will send, and this one governs what sluice will receive — and **sluice should never be the stricter of the two**. Vitess defaults to 16 MiB and PlanetScale runs a larger ceiling, so 128 MiB clears both; matching a server ceiling exactly would leave sluice back on the boundary, where a message the server sends at its own limit still exceeds ours once protocol framing is counted. It is a limit rather than an allocation, so the headroom costs nothing on ordinary traffic.
+
+**That failure was also retried as though it were transient, so it took far longer to surface than it should have.** The error text carries `code = ResourceExhausted`, which sluice classifies as a vttablet throttler or pool transient — right for those, wrong for this one, because the same row is re-sent on every reconnect and the outcome can never change. A run burned its stream-reconnect budget and then its copy-retry budget before failing. It is now terminal on first occurrence, with a message that names the DSN override, names vtgate's own ceiling as the remaining server-side limit, and states plainly that it is not retriable. The carve-out matches gRPC's specific size wording, so a genuine throttle still retries.
+
+**Postgres batched writes ignored the coordinated storage-grow pause.** The pause exists so every cold-copy lane quiesces together while a target grows its volume, and it reached only the COPY path — both batched write cores were invisible to it, while MySQL wired the equivalent into both of its cores. This was not a corner case: a PlanetScale or Vitess source requires an idempotent writer, so that cold-start lands on one of the two ungated cores and nowhere else. Both now participate. The upsert core additionally rides a transient by replaying its batch, which is safe there because a replayed upsert converges; the plain-insert core awaits and signals but does not replay, because a failed insert batch on a dropped connection is ambiguous and has no conflict target to absorb a duplicate.
+
+**MySQL's `LOAD DATA` cold copy ignored the same pause, and a transient on it cannot be resumed.** It now waits for the pause before starting and signals siblings when it hits one. The no-resume-point property is inherent rather than an oversight — that path streams a whole table through a single statement and consumes its source rows as it goes, so there is nothing left to replay — and the error now says so instead of surfacing as a bare driver failure. Chunking it into resumable segments is tracked separately.
+
+**A relabelled signature scheme told operators to supply key material they had already supplied.** Editing a backup chain's recorded scheme to one the operator holds no key for moves the chain from *verified* to *unverifiable*, and unverifiable warns and proceeds. The warning advised passing the chain's key material — which was already passed — so the one signal worth acting on read as a forgotten step. It now distinguishes "no key material supplied" from "material supplied that cannot verify the claimed scheme", names the claimed scheme against what was actually provided, and states that an edited scheme produces exactly this shape. `--require-signature` continues to refuse outright.
+
+### Changed
+
+**Two scope claims in the v0.109.0 release notes were corrected.** Both were wrong in the direction that tells operators they were affected when they were not: the `--restart-from-scratch` change does not affect Postgres sources (which already cleared their target), and the resume-position fix applies to the serial apply path rather than the default. The v0.109.0 notes carry a dated correction, and the engine list behind the first claim is now held to the code by a doc-sync gate.
+
 ## [0.109.0] - 2026-08-03
 
 ### Fixed
