@@ -122,6 +122,16 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	}
 	defer func() { _ = conn.Close() }()
 
+	// ADR-0110 / audit 2026-08-01 Q2: quiesce with the run's other cold-copy
+	// lanes BEFORE opening a statement that will hold this connection for the
+	// whole table. This path was invisible to the grow gate while both batched
+	// write cores were wired into it, and it is the one that can least afford
+	// to start into a grow window — see the terminal-error note below for why
+	// it cannot recover from one.
+	if aerr := w.awaitGrowGate(ctx); aerr != nil {
+		return aerr
+	}
+
 	stmt := buildLoadDataStmt(w.schema, table.Name, cols, name)
 	_, execErr := conn.ExecContext(ctx, stmt)
 
@@ -148,6 +158,30 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 		return fmt.Errorf("mysql: LOAD DATA: serialize rows for %q: %w", table.Name, serErr)
 	}
 	if execErr != nil {
+		// ADR-0110 / audit 2026-08-01 Q2: a classified transient here TRIPS
+		// the shared gate so sibling lanes quiesce for the grow window rather
+		// than each discovering it independently.
+		//
+		// It is NOT retried, and that is a real limitation rather than an
+		// oversight, so the error says so. This path streams the WHOLE table
+		// through ONE statement, consuming the row channel as it goes — by the
+		// time the statement fails the rows are gone, so there is nothing left
+		// to replay and no cursor to resume from. The batched cores next door
+		// can re-drive their buffered batch; this one cannot re-read its
+		// source. Chunking it into resumable segments is the real fix and is
+		// filed rather than faked.
+		var re ir.RetriableError
+		if errors.As(classifyApplierError(execErr), &re) && re.Retriable() {
+			w.tripGrowGate("mysql LOAD DATA cold-copy transient: " + execErr.Error())
+			return fmt.Errorf(
+				"mysql: LOAD DATA into %q hit a transient target error and CANNOT be resumed: this path streams "+
+					"the whole table through a single statement, so its source rows are already consumed and "+
+					"there is no chunk cursor to restart from. Re-run the copy for this table. (A target with "+
+					"local_infile=OFF uses the batched writer instead, which rides a transient by retrying the "+
+					"failed batch in place; the writer is chosen by the engine flavor, not by a flag): %w",
+				table.Name, execErr,
+			)
+		}
 		return fmt.Errorf("mysql: LOAD DATA into %q: %w", table.Name, execErr)
 	}
 

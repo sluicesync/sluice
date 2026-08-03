@@ -888,7 +888,17 @@ func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-c
 		if err != nil {
 			return fmt.Errorf("postgres: prepare args for %q: %w", table.Name, err)
 		}
+		// ADR-0110 / audit 2026-08-01 Q1: quiesce with the run's other
+		// cold-copy lanes before writing. This core gets Await + Trip but NOT
+		// replay — a plain INSERT batch that fails with a dropped connection
+		// is ambiguous (the server may have applied it), and there is no
+		// conflict target to absorb a duplicate. See
+		// [RowWriter.quiesceAndReportTransient].
+		if aerr := w.awaitGrowGate(ctx); aerr != nil {
+			return aerr
+		}
 		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
+			_ = w.quiesceAndReportTransient(err, "batch insert")
 			return fmt.Errorf("postgres: insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
 		batch = batch[:0]

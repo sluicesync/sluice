@@ -138,8 +138,26 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		if err != nil {
 			return fmt.Errorf("postgres: prepare args for %q: %w", table.Name, err)
 		}
-		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
+		// ADR-0110 / audit 2026-08-01 Q1: this batch core was invisible to the
+		// run's shared grow gate — it could neither Await a coordinated pause
+		// nor Trip one — while the COPY path and BOTH MySQL write cores were
+		// wired. It is not a corner: a VStream (PlanetScale / Vitess) source
+		// demands an idempotent writer, so a VStream→PG cold-start lands here
+		// and nowhere else, and that is exactly the auto-grow-target shape the
+		// gate exists for.
+		//
+		// The full retry wrapper is correct HERE specifically because this
+		// flush is an UPSERT: a replayed batch converges rather than
+		// duplicating, so an ambiguous commit (the server applied it, the
+		// connection dropped before the ack) is safe to re-drive. The plain
+		// INSERT core next door gets Await + Trip but NOT replay, for the
+		// mirror-image reason — see writeViaBatch.
+		batched := len(batch)
+		if err := w.copyChunkWithRetry(ctx, table.Name, batched, func(attemptCtx context.Context) error {
+			_, execErr := w.db.ExecContext(attemptCtx, query, args...)
+			return execErr
+		}); err != nil {
+			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, batched, err)
 		}
 		// Report the durable-write delta (v0.99.9): this batch is now
 		// committed, so a resumable source reader's (VStream→PG) checkpoint

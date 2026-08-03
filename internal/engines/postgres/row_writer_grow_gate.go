@@ -132,6 +132,37 @@ func (w *RowWriter) tripGrowGate(reason string) {
 	w.growGate.Trip(reason)
 }
 
+// quiesceAndReportTransient gives a write core the two HALVES of the grow
+// gate that are safe without replay — Await before the write, Trip after a
+// classified transient — for a path whose flush cannot be re-driven
+// (audit 2026-08-01 Q1).
+//
+// The plain multi-row INSERT core is that path. A batch that fails with a
+// dropped connection is AMBIGUOUS: the server may have applied it before the
+// ack was lost, so replaying would duplicate rows into a table with no
+// conflict target to absorb them. Retrying is therefore wrong there, and the
+// upsert core next door gets the full [RowWriter.copyChunkWithRetry] for
+// exactly the reason this one cannot.
+//
+// Await and Trip are unconditionally safe regardless: Await only parks this
+// lane while a sibling is riding a grow window, and Trip only tells the
+// siblings that this lane hit one. Withholding them bought nothing and cost
+// the run its coordination — a lane that can neither wait nor signal hammers
+// a struggling target while every other lane politely backs off.
+//
+// Returns err unchanged; the classification is used only to decide whether to
+// Trip.
+func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
+	if err == nil {
+		return nil
+	}
+	var re ir.RetriableError
+	if errors.As(classifyApplierError(err), &re) && re.Retriable() {
+		w.tripGrowGate("postgres cold-copy " + what + " transient: " + err.Error())
+	}
+	return err
+}
+
 // copyChunkWithRetry runs ONE buffered chunk's COPY with the bounded
 // reparent-retry around it (roadmap item 38). It is the single place the PG
 // chunked-COPY retry policy lives.
