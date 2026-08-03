@@ -155,12 +155,13 @@ func hmacVerifier(env crypto.EnvelopeEncryption) (s *lineage.Signer, ok bool, er
 // chainVerifier probes the chain's claimed signature scheme and returns
 // the matching verifier from mat. ok is false when no material for the
 // claimed scheme is supplied.
-func chainVerifier(ctx context.Context, store irbackup.Store, mat verifyMaterial) (s *lineage.Signer, ok bool, err error) {
+func chainVerifier(ctx context.Context, store irbackup.Store, mat verifyMaterial) (s *lineage.Signer, claimedScheme string, ok bool, err error) {
 	scheme, _, serr := lineage.ChainSignatureScheme(ctx, store)
 	if serr != nil {
-		return nil, false, serr
+		return nil, "", false, serr
 	}
-	return mat.signerForScheme(scheme)
+	signer, ok, err := mat.signerForScheme(scheme)
+	return signer, scheme, ok, err
 }
 
 // manifestSigPresent reports whether the detached `.sig` object for
@@ -222,12 +223,12 @@ func verifyManifestSignaturePolicy(
 	if !requireStrict && !sigPresent && !lineageSigPresent {
 		return nil // genuinely unsigned (or fully-stripped residual — option b)
 	}
-	signer, ok, err := chainVerifier(ctx, segStore, mat)
+	signer, claimedScheme, ok, err := chainVerifier(ctx, segStore, mat)
 	if err != nil {
 		return lineage.CodeForSignatureError(err) // UNSUPPORTED scheme → upgrade, not tamper
 	}
 	if !ok {
-		return unverifiableSignedManifest(ctx, manifestPath, requireStrict)
+		return unverifiableSignedArtifact(ctx, manifestPath, claimedScheme, mat, requireStrict)
 	}
 	if err := lineage.VerifyManifest(ctx, segStore, manifestPath, manifest, seq, signer); err != nil {
 		return lineage.CodeForSignatureError(annotateSchemaFingerprintSkew(err, manifest))
@@ -261,12 +262,12 @@ func verifyChainSignatures(
 	if !requireStrict && !hasArtifacts {
 		return nil
 	}
-	signer, ok, err := chainVerifier(ctx, rootStore, mat)
+	signer, claimedScheme, ok, err := chainVerifier(ctx, rootStore, mat)
 	if err != nil {
 		return lineage.CodeForSignatureError(err) // UNSUPPORTED scheme → upgrade, not tamper
 	}
 	if !ok {
-		return unverifiableSignedManifest(ctx, "chain", requireStrict)
+		return unverifiableSignedArtifact(ctx, "chain", claimedScheme, mat, requireStrict)
 	}
 	for i := range links {
 		link := &links[i]
@@ -308,7 +309,7 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 		slog.InfoContext(ctx, "backup verify: chain is unsigned (pre-ADR-0154 / no signature objects); no signatures to check")
 		return 0
 	}
-	signer, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyPub: opts.VerifyKey})
+	signer, claimedScheme, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyPub: opts.VerifyKey})
 	if err != nil {
 		if errors.Is(err, lineage.ErrSignatureUnsupportedScheme) {
 			// Forward-incompatibility, not tamper: a newer sluice wrote this
@@ -322,9 +323,36 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 		return 1
 	}
 	if !ok {
+		mat := verifyMaterial{env: opts.Envelope, verifyPub: opts.VerifyKey}
+		haveMaterial := mat.env != nil || mat.verifyPub != nil
 		if opts.RequireSignature {
+			if haveMaterial && claimedScheme != "" {
+				slog.ErrorContext(ctx,
+					"backup verify: the chain claims a signature scheme the supplied key material cannot verify, "+
+						"and --require-signature is set",
+					slog.String("claimed_scheme", claimedScheme),
+					slog.String("supplied_material", describeVerifyMaterial(mat)))
+				return 1
+			}
 			slog.ErrorContext(ctx, "backup verify: signed chain but no matching verification key supplied and --require-signature set")
 			return 1
+		}
+		if haveMaterial && claimedScheme != "" {
+			// The audit-Sec2 case. The operator DID supply key material; the
+			// old message told them to go and supply it. Editing the recorded
+			// scheme to one they hold no key for is how a signed chain is
+			// moved from "verified" to "unverified-but-accepted" with every
+			// .sig left in place, so say that rather than implying a
+			// forgotten flag.
+			slog.WarnContext(ctx,
+				"backup verify: the chain claims a signature scheme the supplied key material CANNOT verify, so "+
+					"its signatures were NOT checked — this is not a missing-key warning, you already supplied "+
+					"material. Either the chain is signed with a different key type than you passed, or its "+
+					"recorded scheme was edited, which downgrades a signed chain to an unverified one with every "+
+					"signature file still present. Re-run with --require-signature to fail instead of passing.",
+				slog.String("claimed_scheme", claimedScheme),
+				slog.String("supplied_material", describeVerifyMaterial(mat)))
+			return 0
 		}
 		slog.WarnContext(ctx, "backup verify: chain is signed but no matching verification key supplied — signatures are present-but-unverified. Re-run with the chain's --encrypt passphrase (HMAC-off-KEK) or --verify-key (Ed25519) to verify.")
 		return 0
@@ -382,18 +410,90 @@ func resignIfSigned(ctx context.Context, store irbackup.Store, signed bool, sign
 	return lineage.ResignLineage(ctx, store, signer)
 }
 
-// unverifiableSignedManifest is the WARN-or-refuse branch for a v6
-// manifest the caller cannot check (no KEK-holding verify key). The DR
-// default is warn-and-proceed; RequireSignature makes it a refusal.
-func unverifiableSignedManifest(ctx context.Context, what string, requireStrict bool) error {
+// unverifiableSignedArtifact reports a signed artifact that cannot be
+// verified, distinguishing the two reasons it can happen — which the single
+// message it replaces did not (audit 2026-08-01 Sec2).
+//
+// The two cases are operationally different and only one of them is ordinary:
+//
+//   - NO verification material was supplied at all. The operator did not ask
+//     to verify anything; telling them to pass key material is correct advice.
+//   - Material WAS supplied, and it cannot verify the scheme the chain
+//     CLAIMS. The old message told this operator to "pass the chain's
+//     --encrypt key material" — which they had already done — so the one
+//     signal worth acting on was worded as though they had forgotten a step.
+//
+// The second case is what a SCHEME RELABEL looks like. The scheme token is
+// folded into the signed canonical bytes, so an attacker cannot relabel a
+// chain and still have it verify — but they do not need it to verify. Editing
+// the scheme to one the operator holds no key for moves the chain from
+// "verified" to "unverifiable", and unverifiable is a WARN that proceeds. One
+// field edit, every .sig left in place, exit 0.
+//
+// This does not refuse by default, because sluice cannot tell a relabel from
+// an operator who legitimately holds only the encryption KEK for a chain
+// signed with an asymmetric key — both present as "material supplied, wrong
+// family". What it can do is stop giving advice the operator has already
+// followed, name the claimed scheme against what was actually supplied, and
+// say plainly that a relabel produces exactly this. --require-signature turns
+// it into a refusal, and the message says so.
+func unverifiableSignedArtifact(
+	ctx context.Context,
+	what string,
+	claimedScheme string,
+	mat verifyMaterial,
+	requireStrict bool,
+) error {
+	haveMaterial := mat.env != nil || mat.verifyPub != nil
+
 	if requireStrict {
+		if haveMaterial && claimedScheme != "" {
+			return lineage.SignatureMissingError(fmt.Errorf(
+				"%s requires a verified signature (--require-signature is set): the backup claims signature "+
+					"scheme %q, and the key material supplied (%s) cannot verify that scheme. Either supply a "+
+					"key for %q, or treat this as tampering — editing the recorded scheme to one you hold no "+
+					"key for is how a signed chain is downgraded to an unverified one",
+				what, claimedScheme, describeVerifyMaterial(mat), claimedScheme,
+			))
+		}
 		return lineage.SignatureMissingError(fmt.Errorf(
 			"%s requires a verified signature (--require-signature is set) but no verification key is available",
 			what,
 		))
 	}
+
+	if haveMaterial && claimedScheme != "" {
+		slog.WarnContext(ctx,
+			"restore: the backup claims a signature scheme the supplied key material CANNOT verify, so its "+
+				"signature was not checked; proceeding. You already supplied key material — this is not a "+
+				"missing-key warning. Either the chain is signed with a different key type than you passed, "+
+				"or its recorded scheme was edited, which is how a signed chain is downgraded to an "+
+				"unverified one with every signature file left in place. Re-run with --require-signature to "+
+				"refuse instead of proceeding",
+			slog.String("what", what),
+			slog.String("claimed_scheme", claimedScheme),
+			slog.String("supplied_material", describeVerifyMaterial(mat)))
+		return nil
+	}
+
 	slog.WarnContext(ctx,
 		"restore: backup asserts a signature but no verification key is available to check it; proceeding (pass the chain's --encrypt key material to verify, or --require-signature to refuse)",
 		slog.String("what", what))
 	return nil
+}
+
+// describeVerifyMaterial names what the operator actually supplied, so the
+// unverifiable message can contrast it with the claimed scheme instead of
+// assuming nothing was supplied.
+func describeVerifyMaterial(mat verifyMaterial) string {
+	switch {
+	case mat.env != nil && mat.verifyPub != nil:
+		return "an encryption KEK and a public verify key"
+	case mat.env != nil:
+		return "an encryption KEK only (verifies hmac-kek signatures)"
+	case mat.verifyPub != nil:
+		return "a public verify key only (verifies asymmetric signatures)"
+	default:
+		return "none"
+	}
 }
