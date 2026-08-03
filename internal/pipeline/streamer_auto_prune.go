@@ -99,6 +99,32 @@ func (s *Streamer) startAutoPruneChangeLog(ctx context.Context, streamID string,
 		slog.Duration("interval", interval),
 		slog.Int64("keep", keep),
 	)
+	// The prune cut is THIS stream's durable frontier, and the DELETE keys on
+	// the change log's `id` alone — not on which tables the rows belong to. A
+	// source change log is shared by every stream reading that database, so a
+	// second stream that is BEHIND this one loses the rows between the two
+	// frontiers: they are deleted before it reads them, and it has no way to
+	// discover they existed (audit 2026-08-01 S4).
+	//
+	// That is exactly the staged-wave shape the docs describe — several syncs
+	// off one source, moving disjoint table sets, necessarily at different
+	// speeds. sluice cannot currently detect the peer: the change log carries
+	// no consumer registry, and each stream's position lives on its own
+	// TARGET, out of reach of the source-side pruner.
+	//
+	// So this warns rather than refusing. Refusing would break the
+	// single-stream case, which is the common one and is entirely safe; and
+	// auto-prune is opt-in, so an operator reaching this line asked for it and
+	// can act on being told. The durable fix is a scoped prune — roadmap item
+	// 115.
+	slog.WarnContext(
+		ctx, "auto-prune: the source change log is shared by EVERY stream reading this database, and the "+
+			"prune cuts at THIS stream's frontier by change-log id — it does not know which tables a row "+
+			"belongs to. If a second sync reads the same source and is behind this one, the rows between "+
+			"the two frontiers are deleted before it reads them and are lost silently. Safe for a single "+
+			"stream; do NOT enable it on a staged/wave migration where several syncs share one source",
+		slog.String("stream_id", streamID),
+	)
 	gate := &autoPruneGate{interval: interval}
 	go func() {
 		ticker := time.NewTicker(interval)
