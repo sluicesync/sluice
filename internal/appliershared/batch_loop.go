@@ -296,6 +296,13 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 	// the position and consumes its own batch's DML immediately. Owned
 	// here so it survives across RunOneBatch calls within one ApplyBatch.
 	var pendingRowsApplied int64
+	// inSourceTx tracks whether the stream is currently between a TxBegin and
+	// its TxCommit, so CheckpointOnlyAtTxBoundary can withhold the position
+	// for a genuine MID-TRANSACTION flush while still advancing it for a
+	// source that emits no transaction markers at all (audit 2026-08-01 S3).
+	// Owned here so it survives across runOneBatch calls within one
+	// ApplyBatch, exactly like pendingRowsApplied.
+	var inSourceTx bool
 	for {
 		// ADR-0052: when an AIMD controller is wired via
 		// SetBatchSizeProvider, consult it before each batch so the
@@ -310,7 +317,7 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 				effective = next
 			}
 		}
-		batchN, lastPos, channelClosed, err := runOneBatch(ctx, cfg, streamID, changes, effective, &pendingRowsApplied)
+		batchN, lastPos, channelClosed, err := runOneBatch(ctx, cfg, streamID, changes, effective, &pendingRowsApplied, &inSourceTx)
 		if err != nil {
 			return err
 		}
@@ -347,13 +354,14 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 // boundary write.
 func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
 	var pending int64
-	return runOneBatch(ctx, cfg, streamID, changes, maxBatchSize, &pending)
+	var inSourceTx bool
+	return runOneBatch(ctx, cfg, streamID, changes, maxBatchSize, &pending, &inSourceTx)
 }
 
 // runOneBatch is the RunOneBatch body threaded with the cross-batch
 // rows_applied carry (pending); see [RunBatchLoop] for why the carry is
 // loop-owned.
-func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int, pending *int64) (n int, lastPos ir.Position, channelClosed bool, err error) {
+func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int, pending *int64, inSourceTx *bool) (n int, lastPos ir.Position, channelClosed bool, err error) {
 	// GitHub #18 Phase 1 + roadmap item 18: batch-latency telemetry.
 	// Measure wall-clock for the APPLY WORK only — begin-tx →
 	// dispatch(es) → position write → commit — NOT the time spent
@@ -403,7 +411,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// shutdown signal; a ctx cancel or a boundary-only position-write
 	// failure surfaces as an error — batchStart is still zero on both,
 	// so the defer's IsZero guard keeps them out of the AIMD window.
-	first, chClosed, werr := waitForFirstChange(ctx, cfg, streamID, changes, pending)
+	first, chClosed, werr := waitForFirstChange(ctx, cfg, streamID, changes, pending, inSourceTx)
 	if werr != nil {
 		return 0, ir.Position{}, false, werr
 	}
@@ -471,10 +479,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// after commitBatch reports nil (Chunk C cache-after-commit).
 	if cfg.TransactionalDDL {
 		if _, isTruncate := first.(ir.Truncate); isTruncate {
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx)
 		}
 		if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
-			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending); err != nil {
+			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx); err != nil {
 				return 0, ir.Position{}, false, err
 			}
 			cfg.CacheSchemaSnapshot(snap)
@@ -491,7 +499,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// above) and has just dispatched, so the engine's key cache is populated
 	// for the lookup.
 	if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, first) {
-		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 	}
 
 	// Idle-flush timer: commit a partial batch if no further change
@@ -506,7 +514,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		case c, ok := <-changes:
 			if !ok {
 				channelClosed = true
-				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 			}
 			// Source-tx boundary handling (ADR-0027). TxCommit flushes
 			// the in-flight target tx so the apply aligns with the
@@ -518,9 +526,17 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// to keep alignment.
 			if _, isTxCommit := c.(ir.TxCommit); isTxCommit {
 				lastPos = c.Pos()
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
+				// The transaction closes here; the boundary flush below
+				// carries atBoundary=true regardless, but clearing the flag
+				// keeps it accurate for any later flush in this batch run.
+				*inSourceTx = false
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, false)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
+				// From here until the matching TxCommit, a flush lands
+				// mid-transaction and must not persist a position under
+				// CheckpointOnlyAtTxBoundary (audit 2026-08-01 S3).
+				*inSourceTx = true
 				// Reset the idle timer so a TxBegin observed mid-batch
 				// doesn't make the next idle window expire from the
 				// previous row event's timestamp; otherwise an
@@ -536,7 +552,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// the per-change path. Return rows=1 and the event's
 			// position so the outer loop logs it as its own batch.
 			if !cfg.TransactionalDDL && isSchemaEvent(c) {
-				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending); err != nil {
+				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx); err != nil {
 					return 0, ir.Position{}, false, err
 				}
 				logBatchCommitted(ctx, cfg.EngineName, streamID, n, lastPos.Token)
@@ -571,10 +587,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// arrive in later batches) are applied.
 			if cfg.TransactionalDDL {
 				if _, isTruncate := c.(ir.Truncate); isTruncate {
-					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
+					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx)
 				}
 				if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
-					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending); err != nil {
+					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx); err != nil {
 						return 0, ir.Position{}, false, err
 					}
 					// ADR-0049 Chunk C cache-after-commit: see the
@@ -593,7 +609,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// (keyless CDC is at-least-once; see the IsKeylessTable doc and
 			// the first-change branch above; Bug 143).
 			if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, c) {
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked
@@ -618,7 +634,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 						hinter.NoteByteCapDominant(ctx, n, batchBytes, cfg.ByteCap)
 					}
 				}
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 			}
 			// Reset the idle timer for each successful change so the
 			// timer measures gaps between events, not absolute time
@@ -631,14 +647,14 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				slog.Int("rows", n),
 				slog.Duration("idle", DefaultIdleFlushPeriod),
 			)
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()
 		}
 	}
 
-	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
+	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, *inSourceTx)
 }
 
 // waitForFirstChange blocks until the first row-bearing change of a
@@ -660,7 +676,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 //     position-only tx (the rows are already durable via serial in-order
 //     apply). Without the flag (PG) this is a pure no-op — PG already
 //     advanced its position on the rows' own flushes.
-func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, pending *int64) (first ir.Change, channelClosed bool, err error) {
+func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, pending *int64, inSourceTx *bool) (first ir.Change, channelClosed bool, err error) {
 	for {
 		select {
 		case c, ok := <-changes:
@@ -669,8 +685,12 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 			}
 			switch c.(type) {
 			case ir.TxBegin:
+				// A source tx opened with no batch open yet; the rows that
+				// follow are mid-transaction (audit 2026-08-01 S3).
+				*inSourceTx = true
 				continue
 			case ir.TxCommit:
+				*inSourceTx = false
 				if cfg.CheckpointOnlyAtTxBoundary {
 					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token, pending); err != nil {
 						return nil, false, err
@@ -715,8 +735,27 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 //     counted at the next boundary write. A crash before that boundary
 //     replays the whole tx from the last boundary and re-counts once on
 //     resume (idempotent apply; the persisted counter never advanced).
-func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows, rowDML int, atBoundary bool, pending *int64) error {
-	skipPosition := cfg.CheckpointOnlyAtTxBoundary && !atBoundary
+//
+// inSourceTx reports whether the loop is currently between a TxBegin and its
+// TxCommit. It is what makes "mid-transaction" mean mid-transaction rather
+// than merely "not at a boundary" (audit 2026-08-01 S3). See
+// [commitBatch] for why the distinction is load-bearing.
+func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows, rowDML int, atBoundary bool, pending *int64, inSourceTx bool) error {
+	// The hazard CheckpointOnlyAtTxBoundary guards is landing the resume
+	// position INSIDE a source transaction, which a MySQL binlog resume
+	// cannot start from. That requires there to BE an open source
+	// transaction. A source that emits no transaction markers at all —
+	// VStream (PlanetScale / Vitess) and every trigger-CDC engine — never
+	// opens one, so there is no mid-transaction point to land in and
+	// withholding the position buys nothing.
+	//
+	// It costs a great deal: the flag is set on the MySQL ChangeApplier (the
+	// TARGET) while encoding a constraint about the SOURCE, so any of those
+	// sources pointed at a MySQL-family target on the serial path — the
+	// DEFAULT, since the concurrent lane path needs --apply-concurrency > 1 —
+	// never advanced its durable position at all, for the life of the stream
+	// (audit 2026-08-01 S3).
+	skipPosition := cfg.CheckpointOnlyAtTxBoundary && inSourceTx && !atBoundary
 	if !skipPosition {
 		if err := cfg.WritePosition(ctx, tx, streamID, token, *pending+int64(rowDML)); err != nil {
 			_ = tx.Rollback()
