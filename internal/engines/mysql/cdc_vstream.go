@@ -695,7 +695,39 @@ func vstreamDialOptions(cfg *gomysql.Config) ([]grpc.DialOption, string, error) 
 	transport := cfg.Params["vstream_transport"]
 	authMode := cfg.Params["vstream_auth"]
 
-	dialOpts := make([]grpc.DialOption, 0, 2)
+	dialOpts := make([]grpc.DialOption, 0, 3)
+
+	// gRPC's stock client ceiling on a received message is 4 MiB, and sluice
+	// builds this client by hand rather than through Vitess's own
+	// grpcclient.DialContext — so before this option it inherited 4 MiB while
+	// every Vitess-native client gets 16 MiB (grpccommon.MaxMessageSize).
+	//
+	// VStream ships whole ROWS; it cannot split one across messages. A single
+	// wide row therefore fails the COPY outright with
+	//
+	//	rpc error: code = ResourceExhausted desc = grpc: received message
+	//	after decompression larger than max 4194304
+	//
+	// which reads like a server-side rejection and is not one — nothing in
+	// MySQL or vtgate refused the row, sluice's own client refused to receive
+	// it. A `mediumtext` column (16 MiB max) plus a couple of `json` columns
+	// reaches this easily; reported from a real 148 GB chat-message table.
+	//
+	// The default is deliberately ABOVE Vitess's 16 MiB rather than equal to
+	// it: 16 MiB is the size of ONE maximal mediumtext value, and the message
+	// also carries the row's other columns plus protobuf framing, so matching
+	// Vitess exactly would still fail on the row that motivated this. vtgate's
+	// own --grpc_max_message_size still bounds what the server will SEND, so
+	// raising the client ceiling cannot make sluice accept something vtgate
+	// refused to emit — it only stops sluice from being the stricter of the
+	// two.
+	maxMsg, err := vstreamMaxRecvBytesFromDSN(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(maxMsg),
+	))
 
 	switch transport {
 	case "", "tls":
@@ -2276,4 +2308,56 @@ func (r *vstreamCDCReader) applyReshardState(resh *ShardLayoutChangedError) erro
 	clear(r.fields)
 
 	return nil
+}
+
+// defaultVStreamMaxRecvBytes is the default ceiling on a single VStream gRPC
+// message sluice will accept (64 MiB).
+//
+// The governing principle is that sluice must never be the STRICTER of the
+// two ends. Two independent ceilings apply to a VStream message: vtgate's
+// --grpc_max_message_size bounds what the server will SEND, and this bounds
+// what sluice will RECEIVE. Only the second is ours. If sluice sits at or
+// below the server's ceiling it can reject a message the server was willing
+// to send — which is the ticket-36535 failure, where sluice sat at gRPC's
+// stock 4 MiB.
+//
+// So this is set ABOVE the known server ceilings rather than equal to any of
+// them: Vitess's own default is 16 MiB and PlanetScale is understood to run
+// 64 MiB, so 128 MiB clears both. Matching 64 MiB exactly would put sluice
+// back on the boundary, where a message the server sends at its own limit can
+// still exceed ours once protobuf framing is counted.
+//
+// It is a LIMIT, not an allocation — gRPC does not preallocate it — so the
+// headroom costs nothing on ordinary traffic, where VStream packs to
+// vtgate's ~250 KB packet size. It is deliberately not unbounded: that would
+// turn a malformed or hostile stream into an OOM instead of an error.
+const defaultVStreamMaxRecvBytes = 128 << 20 // 128 MiB
+
+// vstreamMaxRecvBytesFromDSN reads the optional `vstream_max_recv_bytes` DSN
+// parameter — the ceiling on one received VStream message. Absent ⇒
+// [defaultVStreamMaxRecvBytes].
+//
+// A malformed value is a LOUD error rather than a silent fallback: an
+// operator who set this knob is working around a specific oversized-row
+// failure, and silently ignoring their value would put them back on the
+// default with no indication of why nothing changed (the loud-failure tenet,
+// same shape as nativeCopyTableParallelismFromDSN).
+func vstreamMaxRecvBytesFromDSN(cfg *gomysql.Config) (int, error) {
+	v := cfg.Params["vstream_max_recv_bytes"]
+	if v == "" {
+		return defaultVStreamMaxRecvBytes, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"mysql/vstream: invalid vstream_max_recv_bytes %q (want a positive byte count, e.g. %d): %w",
+			v, defaultVStreamMaxRecvBytes, err,
+		)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf(
+			"mysql/vstream: vstream_max_recv_bytes must be positive, got %d", n,
+		)
+	}
+	return n, nil
 }

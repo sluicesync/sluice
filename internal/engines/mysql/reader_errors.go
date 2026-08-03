@@ -105,6 +105,31 @@ func classifyReaderError(err error) error {
 			"source mariadb cannot resume: the persisted domain-GTID position is older than the source's retained binlogs (required binlog files have been purged); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
 		)
 	}
+	// Oversized gRPC message. Checked BEFORE the retriable classifier for the
+	// same reason the purged-position branches are: the text carries
+	// `code = ResourceExhausted`, which vitessRetriableSubstrings matches as
+	// a throttler/pool transient — and this one is DETERMINISTIC. The same
+	// row is re-sent on every reconnect, so retrying spins the reconnect
+	// budget (10 attempts) and then the copy's retry budget (8 more) against
+	// an error that cannot clear, turning an actionable failure into a slow
+	// one with a misleading trail.
+	//
+	// The message also reads like a server-side rejection and is not one:
+	// nothing in MySQL or vtgate refused the row. It is the gRPC CLIENT
+	// declining to receive a message above its ceiling, so the remedy is a
+	// client setting, and the error now says so.
+	if isVStreamMessageTooLargeError(err) {
+		return fmt.Errorf(
+			"source vstream: a row exceeded this client's gRPC receive ceiling, so the copy cannot proceed: "+
+				"nothing on the server rejected the row — sluice's own client declined to receive a message "+
+				"larger than its limit. VStream ships whole rows and cannot split one across messages, so a "+
+				"single wide row (a large mediumtext/longtext or json column) trips this. Raise the ceiling "+
+				"with the `vstream_max_recv_bytes=<bytes>` source-DSN parameter (default %d); if that does "+
+				"not clear it, the row also exceeds vtgate's own --grpc_max_message_size and only the server "+
+				"side can raise it. This is NOT retriable — the same row is re-sent on every reconnect: %w",
+			defaultVStreamMaxRecvBytes, err,
+		)
+	}
 	if isVStreamPurgedGTIDError(err) {
 		// Both the original error AND ir.ErrPositionInvalid are wrapped
 		// (%w, Go 1.20 multi-error): the streamer routes on
@@ -353,4 +378,26 @@ func isRetriableGRPCCode(c codes.Code) bool {
 	default:
 		return false
 	}
+}
+
+// isVStreamMessageTooLargeError reports whether err is gRPC's
+// received-message-too-large rejection.
+//
+// Matched on the DISTINCTIVE phrase rather than on `code = ResourceExhausted`
+// alone, because that code legitimately covers vttablet's throttler and pool
+// exhaustion — both genuinely transient and both correctly retried by
+// vitessRetriableSubstrings. Only the size flavour is deterministic, so only
+// the size flavour is carved out.
+//
+// gRPC's text is stable across the compressed and uncompressed forms:
+//
+//	grpc: received message larger than max (N vs. M)
+//	grpc: received message after decompression larger than max N
+func isVStreamMessageTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "grpc: received message") &&
+		strings.Contains(msg, "larger than max")
 }
