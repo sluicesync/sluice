@@ -21,7 +21,7 @@ Worth knowing if you are checking your own filters: `SELECT ip::text` shows the 
 
 MariaDB's native `inet4` / `inet6` columns are a third rendering — they hold an address and cannot hold a network, so they deliver it bare and a literal naming a network is refused outright. Each source engine now declares its rendering per network type rather than having one assumed for it, and an engine that has not declared one refuses network comparisons rather than guessing.
 
-**A continuous sync from PlanetScale, Vitess, or any trigger-CDC source into a MySQL-family target never advanced its durable resume position.** The applier withholds the resume position except at a source-transaction boundary, because a MySQL binlog resume cannot start mid-transaction. But that flag sits on the MySQL *target* while the constraint it encodes is about the *source* — and VStream and the trigger-CDC engines emit no transaction markers at all. With no boundary to hang the write on, the position stayed at its cold-start value for the life of the stream, on the default serial apply path.
+**A continuous sync from PlanetScale, Vitess, or any trigger-CDC source into a MySQL-family target never advanced its durable resume position.** The applier withholds the resume position except at a source-transaction boundary, because a MySQL binlog resume cannot start mid-transaction. But that flag sits on the MySQL *target* while the constraint it encodes is about the *source* — and VStream and the trigger-CDC engines emit no transaction markers at all. With no boundary to hang the write on, the position stayed at its cold-start value for the life of the stream, on the SERIAL apply path — `--apply-concurrency=1`, or an auto-resolution that clamps to one lane on a constrained target.
 
 The effects compound in the order you would meet them: every restart replays the whole CDC history since cold-start; trigger-CDC auto-prune, which reads that position as its frontier, never advances; and once the source's retention passes the stale position the resume is refused and forces a re-snapshot. The loop now distinguishes "mid-transaction" from "no transaction context at all", so a marker-less source checkpoints normally while the mid-transaction protection is unchanged for the case it was built for.
 
@@ -41,7 +41,7 @@ It is now carried and re-emitted at the correct fractional precision. Targets wi
 
 ## Changed
 
-**`sluice sync start --restart-from-scratch` now clears the in-scope target tables before re-copying, on every source engine.** Previously it did so only for sources whose copy cannot tolerate existing rows, and left them in place for PlanetScale, Vitess and Postgres on the reasoning that the re-copy's upsert absorbs the overlap. It absorbs rows that still exist at the source; it cannot remove one the source **deleted** since the previous copy, so those rows survived on the target permanently. "From scratch" is now taken at its word.
+**`sluice sync start --restart-from-scratch` now clears the in-scope target tables before re-copying, on every source engine.** Previously it did so only for sources whose copy cannot tolerate existing rows, and left them in place for PlanetScale and Vitess on the reasoning that the re-copy's upsert absorbs the overlap. It absorbs rows that still exist at the source; it cannot remove one the source **deleted** since the previous copy, so those rows survived on the target permanently. "From scratch" is now taken at its word.
 
 **If you were relying on the merge behaviour, this is a change in what the command does.**
 
@@ -60,7 +60,18 @@ It is now carried and re-emitted at the correct fractional precision. Targets wi
 ## Who needs this
 
 - **Anyone running `sync --where` against an `inet` or `cidr` column** — check your literal against the table above; the wrong spelling matched nothing.
-- **PlanetScale, Vitess, or trigger-CDC sources syncing into MySQL or MariaDB** — your resume position was not advancing.
+- **PlanetScale, Vitess, or trigger-CDC sources syncing into MySQL or MariaDB on the serial apply path** (`--apply-concurrency=1`, or an auto-resolution clamped to one lane) — your resume position was not advancing.
 - **MySQL-to-Postgres migrations** with prefix indexes, or with tables of 132+ columns.
 - **MySQL-to-MySQL migrations** using `ON UPDATE CURRENT_TIMESTAMP`.
-- **Anyone scripting `--restart-from-scratch`** — read the Changed section before upgrading.
+- **PlanetScale or Vitess sources scripting `--restart-from-scratch`** — read the Changed section before upgrading.
+
+---
+
+## Correction (2026-08-03)
+
+Two scope claims in the notes above were **narrower than first published**, and both were wrong in the direction that would tell an operator they were affected when they were not. Found by the post-release regression cycle and corrected in place here, in the CHANGELOG, and in the GitHub release body.
+
+- The `--restart-from-scratch` entry originally said the target was left in place for "PlanetScale, Vitess and **Postgres**". A Postgres source was never on that path — the idempotent-copy surface has exactly one implementor, the VStream snapshot reader — so a Postgres source already cleared its target before this release and its behaviour is unchanged by it.
+- The resume-position entry originally said "on the **default** serial apply path". The default is not serial: an unset `--apply-concurrency` resolves to a multi-lane value, and the lane path already advanced the position correctly. The defect needed the serial path — an explicit `--apply-concurrency=1`, or an auto-resolution clamped to one lane on a constrained target.
+
+Both underlying fixes are correct and independently verified; only these two sentences were wrong.

@@ -259,6 +259,34 @@ only rows strictly below the target's durable applied watermark (see
 full operator walkthrough, including teardown, is in
 [sqlite-d1-import.md](sqlite-d1-import.md).
 
+## Re-copying onto a target that already holds data
+
+`sync start --restart-from-scratch` and the automatic re-snapshot (which fires
+when a stream's persisted position has aged out of the source's retention
+window) both re-copy onto a target that already holds the previous copy. What
+happens to the rows already there depends on whether the source's snapshot
+reader is **idempotent**:
+
+- A **non-idempotent** reader's copy is a plain `INSERT`, so the in-scope
+  target tables are cleared first — they always were, or the copy would
+  dup-key. This is every source except the one below.
+- The **idempotent** reader — the VStream snapshot, which backs the
+  **PlanetScale** and **Vitess** flavors — upserts, so its target used to be
+  left in place. From v0.109.0 an explicit `--restart-from-scratch` clears it
+  there too, because an upsert converges on rows that still exist at the source
+  and cannot remove one the source deleted. The **automatic** re-snapshot still
+  merges, by design, and warns about exactly that.
+
+A native MySQL binlog snapshot is **not** idempotent, so a plain `mysql` source
+is on the cleared side even though it lives in the same engine package as the
+VStream reader.
+
+<!-- idempotent-copy-engines: mysql -->
+
+The marker above is held to the code by `internal/docsync` — it lists the
+engine PACKAGE that pins `ir.IdempotentCopyReader`. The flavor sentence beside
+it is the part the gate cannot check, so read both together.
+
 ## See also
 
 - [ADR-0038](../adr/adr-0038-applier-retry-on-transient-errors.md) —
