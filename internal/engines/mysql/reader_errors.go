@@ -389,10 +389,20 @@ func isRetriableGRPCCode(c codes.Code) bool {
 // vitessRetriableSubstrings. Only the size flavour is deterministic, so only
 // the size flavour is carved out.
 //
-// gRPC's text is stable across the compressed and uncompressed forms:
+// gRPC emits THREE receive-side size rejections, verified against the pinned
+// google.golang.org/grpc@v1.66.0 rather than assumed — an earlier version of
+// this comment listed two of them, which is the kind of "stable across the
+// forms" claim that is true until it is not:
 //
 //	grpc: received message larger than max (N vs. M)
-//	grpc: received message after decompression larger than max N
+//	grpc: received message after decompression larger than max (N vs. M)
+//	grpc: received message larger than max length allowed on current machine (N vs. M)
+//
+// All three carry both substrings matched below, so the pair covers the set.
+// The SEND-side rejections ("trying to send message larger than max") are
+// deliberately NOT matched: those are sluice exceeding its own send ceiling,
+// a different failure with a different remedy, and folding them in here would
+// hand an operator the receive-side advice for a send-side problem.
 func isVStreamMessageTooLargeError(err error) bool {
 	if err == nil {
 		return false

@@ -163,3 +163,34 @@ func TestIsVStreamMessageTooLargeError_BothGRPCWordings(t *testing.T) {
 		}
 	}
 }
+
+// TestIsVStreamMessageTooLargeError_CoversEveryGRPCReceiveWording pins the
+// premise the matcher rests on: gRPC's receive-side size rejections all carry
+// the two substrings it looks for. Verified against the pinned grpc v1.66.0 —
+// an earlier comment claimed the text was "stable across the compressed and
+// uncompressed forms" and listed two of the three, which is exactly the
+// unverified-premise shape this project keeps paying for.
+//
+// The send-side wording is included as a NEGATIVE: it must not match, because
+// exceeding our own send ceiling is a different failure with a different
+// remedy, and the receive-side advice would be wrong for it.
+func TestIsVStreamMessageTooLargeError_CoversEveryGRPCReceiveWording(t *testing.T) {
+	for _, msg := range []string{
+		"grpc: received message larger than max (8388811 vs. 4194304)",
+		"grpc: received message after decompression larger than max (8388608 vs. 4194304)",
+		"grpc: received message larger than max length allowed on current machine (99 vs. 4194304)",
+	} {
+		if !isVStreamMessageTooLargeError(errors.New(msg)) {
+			t.Errorf("gRPC receive-side rejection not matched, so it would be retried forever: %s", msg)
+		}
+	}
+	for _, msg := range []string{
+		"grpc: trying to send message larger than max (99 vs. 42)",
+		"trying to send message larger than max (99 vs. 42)",
+	} {
+		if isVStreamMessageTooLargeError(errors.New(msg)) {
+			t.Errorf("a SEND-side rejection matched the receive-side matcher; the operator would be told to "+
+				"raise vstream_max_recv_bytes for a problem that is not about receiving: %s", msg)
+		}
+	}
+}

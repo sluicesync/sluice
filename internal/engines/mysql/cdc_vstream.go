@@ -2311,7 +2311,7 @@ func (r *vstreamCDCReader) applyReshardState(resh *ShardLayoutChangedError) erro
 }
 
 // defaultVStreamMaxRecvBytes is the default ceiling on a single VStream gRPC
-// message sluice will accept (64 MiB).
+// message sluice will accept (128 MiB).
 //
 // The governing principle is that sluice must never be the STRICTER of the
 // two ends. Two independent ceilings apply to a VStream message: vtgate's
