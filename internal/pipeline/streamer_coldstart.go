@@ -65,7 +65,7 @@ import (
 // auto-resnapshot path took the default branch with force=false and ALWAYS
 // dead-ended on the populated-target refusal (a re-snapshot of an existing
 // stream is populated by definition) — the live Track-B/D finding.
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, forceFresh bool) (changes <-chan ir.Change, stop func(), err error) {
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, fresh freshCopyReason) (changes <-chan ir.Change, stop func(), err error) {
 	// resumingCopy is the interrupted-cold-start discriminator: a non-zero
 	// resume position. It gates the seeded snapshot open and the preflight
 	// skip in the phases below. Read once here so the call sites can't drift.
@@ -207,7 +207,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// followed by the ADR-0166 pre-create shape gate (roadmap item 25
 	// residual) — whose returned create subset excludes pre-existing
 	// tables with a matching column shape (nil = create everything).
-	createSchema, err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy, forceFresh)
+	createSchema, err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy, fresh)
 	if err != nil {
 		return nil, stop, err
 	}
@@ -754,7 +754,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // idempotently per the long-standing resume contract (mirroring
 // migrate's --resume carve-out). Warm resume never creates tables and
 // never reaches this function.
-func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy, forceFresh bool) (*ir.Schema, error) {
+func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy bool, fresh freshCopyReason) (*ir.Schema, error) {
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
@@ -795,24 +795,33 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			ctx, "cold-start COPY resume: skipping populated-target preflight (partial copy is the expected state)",
 			slog.String("stream_id", streamID),
 		)
-	case forceFresh && !s.InjectShardColumn.Engaged() && !copyReaderIsIdempotent(stream.Rows):
-		// restart-from-scratch / auto-resnapshot (ADR-0093) onto a
-		// NON-idempotent snapshot reader (native MySQL binlog: the cold-copy
-		// runs plain INSERT — see [runBulkCopyWithOpts]). forceFresh is set by
-		// BOTH the operator's --restart-from-scratch AND the automatic
-		// auto-resnapshot fall-through (warm-resume → ir.ErrPositionInvalid).
-		// "From scratch" means a clean re-copy, but the dispatch routes here
-		// WITHOUT dropping the target, so the leftover rows from the prior copy
-		// would dup-key-collide (MySQL Error 1062) on the plain INSERT. The
-		// idempotent VStream/PG path genuinely absorbs the overlap (UPSERT)
-		// and stays on the default skip-preflight branch below; this branch
-		// makes the non-idempotent case actually start from a clean target by
-		// dropping the in-scope tables first (CreateTablesWithoutConstraints
-		// recreates them empty). Reuses the FK-safe drop machinery
-		// --reset-target-data uses, but leaves the cdc-state row alone (the
-		// restart/resnapshot dispatch already discards the position). This is
-		// the loud-failure fix for the misleading "the idempotent copy absorbs
-		// the overlap" hint, which only ever held for idempotent readers.
+	case fresh.forcesFresh() && !s.InjectShardColumn.Engaged() &&
+		(!copyReaderIsIdempotent(stream.Rows) || fresh.clearsTarget()):
+		// Clear the in-scope target tables before the re-copy. Two distinct
+		// reasons land here, and they arrive by different routes:
+		//
+		//  1. A NON-idempotent snapshot reader (native MySQL binlog: the
+		//     cold-copy runs plain INSERT — see [runBulkCopyWithOpts]) on
+		//     EITHER fresh reason. Without the drop, leftover rows from the
+		//     prior copy dup-key-collide (MySQL Error 1062).
+		//
+		//  2. The operator's explicit --restart-from-scratch on an IDEMPOTENT
+		//     reader (VStream, PG) — added for audit 2026-08-01 S5. The old
+		//     code sent this to the default branch on the reasoning that "the
+		//     UPSERT writer absorbs the overlap". It absorbs rows that still
+		//     exist at the source; it cannot remove rows the source DELETED
+		//     since the prior copy, so those survived on the target
+		//     permanently and silently. "From scratch" is taken at its word.
+		//
+		// The AUTOMATIC auto-resnapshot on an idempotent reader deliberately
+		// does NOT land here: it fires without operator involvement on a live
+		// stream, and dropping the target would open an empty-target window
+		// nobody asked for. It warns instead — see the default branch.
+		//
+		// Reuses the FK-safe drop machinery --reset-target-data uses
+		// (CreateTablesWithoutConstraints recreates them empty), but leaves
+		// the cdc-state row alone: the restart/resnapshot dispatch already
+		// discards the position.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
@@ -850,16 +859,30 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// check above is the operator-opted-in replacement; the
 		// classic cold-start preflight is suppressed in that case.
 		if !s.InjectShardColumn.Engaged() {
-			// forceFresh (--restart-from-scratch OR auto-resnapshot) reaches
-			// this default branch only for an IDEMPOTENT reader (VStream/PG) —
-			// the non-idempotent case is drained by the dedicated case above,
-			// which drops the target first. For the idempotent reader the
-			// pre-flight skip is correct: this is a deliberate re-copy onto
-			// existing rows and the UPSERT writer absorbs the overlap. (A
-			// genuine fresh cold-start has forceFresh=false and is still
-			// refused on a populated target — Bug 9. --force-cold-start keeps
-			// its existing skip semantics for either reader.)
-			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
+			// A fresh reason reaches this default branch only for the
+			// AUTOMATIC auto-resnapshot on an IDEMPOTENT reader (VStream/PG).
+			// Everything else that forces a fresh copy is drained by the
+			// clear-the-target case above. (A genuine fresh cold-start has
+			// freshCopyNone and is still refused on a populated target —
+			// Bug 9. --force-cold-start keeps its existing skip semantics.)
+			//
+			// The re-copy UPSERTs onto the rows already there. That absorbs
+			// every row that still exists at the source and CANNOT remove one
+			// the source deleted while the stream was behind, so those rows
+			// stay on the target. sluice does not clear the target here —
+			// this fires automatically on a live stream and an empty-target
+			// window is not something to open unasked — but it must not be
+			// silent about what it cannot reconcile (audit 2026-08-01 S5).
+			if fresh == freshCopyAutoResnapshot && copyReaderIsIdempotent(stream.Rows) {
+				slog.WarnContext(
+					ctx, "auto-resnapshot: re-copying onto the existing target rows — a row DELETED at the "+
+						"source while this stream was behind cannot be removed by the re-copy and will remain "+
+						"on the target. Run `sluice sync start --restart-from-scratch` (clears the in-scope "+
+						"target tables first) if the source may have had deletes in that window",
+					slog.String("stream_id", streamID),
+				)
+			}
+			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || fresh.forcesFresh(), preflightModeSync); err != nil {
 				migcore.CloseIf(rw)
 				migcore.CloseIf(sw)
 				_ = stream.Abandon()

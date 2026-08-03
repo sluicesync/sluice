@@ -703,7 +703,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// forceFresh = RestartFromScratch (ResetTargetData has its own
 			// destructive drop+clear branch inside; restart re-copies onto the
 			// populated target).
-			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, s.RestartFromScratch)
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, restartReason(s.RestartFromScratch))
 		case found:
 			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, lsnTracker, applier, streamID)
 			warmResumed = err == nil
@@ -741,14 +741,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 				// =false here so the gate refuses LOUDLY (the ADR-0075 Phase 2b
 				// deliberate-recovery contract; TestStreamer_MultiSchema_
 				// SlotLossRefusesLoudly). Same engine-aware gate as single-DB.
-				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, sourceAutoResnapshotOnInvalidPosition(s.Source))
+				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, autoResnapshotReason(s.Source))
 				warmResumed = false
 			}
 		default:
-			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, false)
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, freshCopyNone)
 		}
 	case s.ResetTargetData:
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, false)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyNone)
 	case s.RestartFromScratch:
 		// Force a fresh cold-start from row 0, ignoring any persisted
 		// position (incl. a mid-COPY cursor). The cold-start gate
@@ -765,7 +765,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			ctx, "restart-from-scratch: forcing a fresh cold-start, ignoring the persisted position",
 			slog.String("stream_id", streamID),
 		)
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, true)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyOperatorRestart)
 	case resumeCopyFrom.Token != "" || resumeCopyFrom.Engine != "":
 		// Interrupted cold-start: resume the bulk COPY from the persisted
 		// cursor (seeded snapshot stream → batched bulk-COPY writer), then
@@ -780,7 +780,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(persisted.Token, 60)),
 		)
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, resumeCopyFrom, false)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, resumeCopyFrom, freshCopyNone)
 	case found:
 		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		warmResumed = err == nil
@@ -825,14 +825,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// (TestStreamer_MultiSchema_SlotLossRefusesLoudly). The operator's
 			// explicit --restart-from-scratch is unaffected (forces fresh for
 			// any engine); this governs only the AUTOMATIC fall-through.
-			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, sourceAutoResnapshotOnInvalidPosition(s.Source))
+			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, autoResnapshotReason(s.Source))
 			// coldStart supersedes the warm resume — schema-history
 			// stays brand-new from the applier's perspective (the
 			// snapshot bulk-copy reset effective state).
 			warmResumed = false
 		}
 	default:
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, false)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyNone)
 	}
 	return changes, stop, warmResumed, err
 }

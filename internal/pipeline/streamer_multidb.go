@@ -179,7 +179,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
-	forceFresh bool,
+	fresh freshCopyReason,
 ) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
 
@@ -265,7 +265,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// qualifies its SELECT by that schema, so the single pinned snapshot
 	// connection reads across every database at the one consistent view. ----
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, forceFresh); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
@@ -529,7 +529,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	inScope func(string) bool,
 	targetDeriver ir.DatabaseDSNDeriver,
 	targetCanDeriveDB bool,
-	forceFresh bool,
+	fresh freshCopyReason,
 ) error {
 	// Per-database source DSN so the scoped SchemaReader reads the right
 	// database's information_schema. The bulk-copy ROW reads come from the
@@ -667,7 +667,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
 		}
-	case forceFresh && !copyReaderIsIdempotent(stream.Rows):
+	case fresh.forcesFresh() && (!copyReaderIsIdempotent(stream.Rows) || fresh.clearsTarget()):
 		// restart-from-scratch / auto-resnapshot onto a NON-idempotent reader
 		// (multi-database fan-out is MySQL-source native binlog, plain
 		// INSERT). forceFresh covers BOTH --restart-from-scratch AND the
@@ -683,7 +683,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
 		}
 	default:
-		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
+		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || fresh.forcesFresh(), preflightModeSync); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)

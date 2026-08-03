@@ -208,7 +208,7 @@ func runMultiDBGate(t *testing.T, s *Streamer, rows ir.RowReader, database strin
 		context.Background(), stream, &stubChangeApplier{},
 		"stream-1", database, inScope,
 		nil /*targetDeriver*/, false, /*targetCanDeriveDB → target-schema routing*/
-		s.RestartFromScratch, /*forceFresh: these tests express intent via RestartFromScratch*/
+		restartReason(s.RestartFromScratch), /*these tests express intent via RestartFromScratch*/
 	)
 	if err != nil {
 		t.Fatalf("coldStartCopyOneDatabase(%q): %v", database, err)
@@ -237,7 +237,13 @@ func TestColdStartCopyOneDatabase_RestartFromScratch_NonIdempotent_DropsTarget(t
 // (b) idempotent reader → the target is NOT dropped (the
 // absorb-the-overlap path; the gate falls through to the force-skipped
 // preflight). Mirrors TestColdStartGate_RestartFromScratch_Idempotent_DoesNotDrop.
-func TestColdStartCopyOneDatabase_RestartFromScratch_Idempotent_DoesNotDrop(t *testing.T) {
+// The multi-database sibling of
+// TestColdStartGate_RestartFromScratch_Idempotent_DropsTarget. This path had
+// the same S5 defect, dormant — its own comment said the idempotent case
+// "keeps the absorb-the-overlap behaviour" — and it is closed at the same
+// time, because a fix applied to one of two identical dispatches is the shape
+// this project keeps paying for.
+func TestColdStartCopyOneDatabase_RestartFromScratch_Idempotent_DropsTarget(t *testing.T) {
 	captureSlog(t)
 	src := &multiDBGateSource{
 		name:       "planetscale",
@@ -247,8 +253,10 @@ func TestColdStartCopyOneDatabase_RestartFromScratch_Idempotent_DoesNotDrop(t *t
 
 	rw := runMultiDBGate(t, s, idempotentReader{}, "shop", func(string) bool { return true })
 
-	if len(rw.dropped) != 0 {
-		t.Errorf("idempotent restart must NOT drop (absorb-the-overlap path); dropped = %v", rw.dropped)
+	if len(rw.dropped) != 2 {
+		t.Errorf("an explicit --restart-from-scratch must CLEAR the target even on an idempotent reader, "+
+			"or a row deleted at the source since the prior copy survives forever (S5); dropped = %v",
+			rw.dropped)
 	}
 }
 

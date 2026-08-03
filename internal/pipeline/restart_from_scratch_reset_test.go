@@ -175,7 +175,7 @@ func TestColdStartGate_RestartFromScratch_NonIdempotent_DropsTarget(t *testing.T
 
 	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(nonIdempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyOperatorRestart,
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
@@ -185,7 +185,14 @@ func TestColdStartGate_RestartFromScratch_NonIdempotent_DropsTarget(t *testing.T
 	}
 }
 
-func TestColdStartGate_RestartFromScratch_Idempotent_DoesNotDrop(t *testing.T) {
+// The operator's explicit --restart-from-scratch now clears the target on an
+// IDEMPOTENT reader too (audit 2026-08-01 S5). This test previously asserted
+// the opposite — that the absorb-the-overlap path was correct here — which is
+// the defect: an UPSERT re-copy absorbs rows that still exist at the source
+// and cannot remove one the source DELETED since the prior copy, so those rows
+// survived on the target permanently and silently. "From scratch" is taken at
+// its word.
+func TestColdStartGate_RestartFromScratch_Idempotent_DropsTarget(t *testing.T) {
 	captureSlog(t)
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
 	rw := &emptyCheckingDropper{}
@@ -199,13 +206,46 @@ func TestColdStartGate_RestartFromScratch_Idempotent_DoesNotDrop(t *testing.T) {
 
 	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(idempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyOperatorRestart,
+	)
+	if err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if len(rw.dropped) != 1 || rw.dropped[0] != "users" {
+		t.Errorf("an explicit --restart-from-scratch must CLEAR the target even on an idempotent reader, "+
+			"or a row deleted at the source since the prior copy survives forever (S5); dropped = %v",
+			rw.dropped)
+	}
+}
+
+// The AUTOMATIC auto-resnapshot keeps the absorb-the-overlap behaviour: it
+// fires without operator involvement on a live stream, so it must not open an
+// empty-target window. It is required to WARN about what it cannot reconcile —
+// a silent merge is what S5 was.
+func TestColdStartGate_AutoResnapshot_Idempotent_DoesNotDropButWarns(t *testing.T) {
+	logs := captureSlog(t)
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	rw := &emptyCheckingDropper{}
+	s := &Streamer{
+		Source:             &copyResumeEngine{name: "planetscale"},
+		Target:             newRecordingEngine("planetscale"),
+		RestartFromScratch: false,
+	}
+
+	_, err := s.coldStartGatePreflight(
+		context.Background(), schema, nil /*sw*/, rw, gateStream(idempotentReader{}),
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyAutoResnapshot,
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
 	}
 	if len(rw.dropped) != 0 {
-		t.Errorf("idempotent restart must NOT drop (absorb-the-overlap path); dropped = %v", rw.dropped)
+		t.Errorf("the automatic auto-resnapshot must NOT clear the target (it runs unattended on a live "+
+			"stream); dropped = %v", rw.dropped)
+	}
+	if !strings.Contains(logs.String(), "cannot be removed by the re-copy") {
+		t.Errorf("auto-resnapshot on an idempotent reader must WARN that source-side deletes from the gap "+
+			"are not reconciled — silence here is exactly the S5 defect. logs:\n%s", logs.String())
 	}
 }
 
@@ -223,7 +263,7 @@ func TestColdStartGate_RestartFromScratch_SurfaceFalse_DropsTarget(t *testing.T)
 
 	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, gateStream(idempotentReaderFalse{}),
-		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyOperatorRestart,
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
@@ -292,18 +332,35 @@ func TestColdStartGate_ForceFresh_DiscriminatesPopulatedTarget(t *testing.T) {
 	// residual); an empty recorded catalog makes the gate a no-op.
 	s := &Streamer{Source: &copyResumeEngine{name: "planetscale"}, Target: newRecordingEngine("planetscale")}
 
-	// forceFresh=true on a POPULATED idempotent target: proceed, no refusal,
-	// no drop (the UPSERT cold-copy absorbs the overlap). This is the fix —
-	// the auto-resnapshot / restart-from-scratch re-copy path.
-	rwFresh := &populatedChecker{}
+	// The AUTOMATIC auto-resnapshot on a POPULATED idempotent target: proceed,
+	// no refusal, no drop. This is the original fix — the resnapshot must be
+	// able to re-copy at all — and it stays intact, because clearing the
+	// target unattended on a live stream is not something to do on sluice's
+	// own initiative (audit 2026-08-01 S5 option b).
+	rwAuto := &populatedChecker{}
 	if _, err := s.coldStartGatePreflight(
-		context.Background(), schema, nil, rwFresh, gateStream(idempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
+		context.Background(), schema, nil, rwAuto, gateStream(idempotentReader{}),
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyAutoResnapshot,
 	); err != nil {
-		t.Fatalf("forceFresh=true must PROCEED on a populated idempotent target (auto-resnapshot/restart): %v", err)
+		t.Fatalf("auto-resnapshot must PROCEED on a populated idempotent target: %v", err)
 	}
-	if len(rwFresh.dropped) != 0 {
-		t.Errorf("idempotent forceFresh must NOT drop (UPSERT absorbs the overlap); dropped = %v", rwFresh.dropped)
+	if len(rwAuto.dropped) != 0 {
+		t.Errorf("the automatic auto-resnapshot must NOT drop; dropped = %v", rwAuto.dropped)
+	}
+
+	// The OPERATOR'S explicit restart on the same populated target: proceed
+	// AND clear, so the re-copy reproduces the source rather than merging onto
+	// rows the source may have deleted (S5).
+	rwRestart := &populatedChecker{}
+	if _, err := s.coldStartGatePreflight(
+		context.Background(), schema, nil, rwRestart, gateStream(idempotentReader{}),
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyOperatorRestart,
+	); err != nil {
+		t.Fatalf("--restart-from-scratch must PROCEED on a populated idempotent target: %v", err)
+	}
+	if len(rwRestart.dropped) != 1 || rwRestart.dropped[0] != "users" {
+		t.Errorf("--restart-from-scratch must CLEAR the target on an idempotent reader; dropped = %v",
+			rwRestart.dropped)
 	}
 
 	// forceFresh=false on the SAME populated target: still refuses (Bug 9
@@ -311,7 +368,7 @@ func TestColdStartGate_ForceFresh_DiscriminatesPopulatedTarget(t *testing.T) {
 	rwGenuine := &populatedChecker{}
 	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rwGenuine, gateStream(idempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, false, /*forceFresh*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, freshCopyNone,
 	)
 	if err == nil {
 		t.Fatal("forceFresh=false on a populated target must REFUSE (Bug 9 cold-start guard)")

@@ -44,7 +44,7 @@ func TestColdStartGatePreflight_RefusalAbandonsStream(t *testing.T) {
 
 	_, err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, stream, nil, "stream-1",
-		false /* resumingCopy */, false, /* forceFresh */
+		false /* resumingCopy */, freshCopyNone,
 	)
 	if err == nil {
 		t.Fatal("expected the populated-target refusal; got nil")
@@ -76,7 +76,7 @@ func TestColdStartGatePreflight_PassLeavesStreamOpen(t *testing.T) {
 	s := &Streamer{Source: stubEngine{}, Target: newRecordingEngine("stub")}
 
 	if _, err := s.coldStartGatePreflight(
-		context.Background(), schema, nil, rw, stream, nil, "stream-1", false, false,
+		context.Background(), schema, nil, rw, stream, nil, "stream-1", false, freshCopyNone,
 	); err != nil {
 		t.Fatalf("preflight: %v", err)
 	}

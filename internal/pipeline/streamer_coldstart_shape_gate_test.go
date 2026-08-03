@@ -51,7 +51,7 @@ func TestSyncColdStartShapeGate_DrifterRefusesCodedAndAbandons(t *testing.T) {
 
 	_, err := s.coldStartGatePreflight(
 		context.Background(), intended, nil, rw, stream, nil, "stream-1",
-		false /* resumingCopy */, false, /* forceFresh */
+		false /* resumingCopy */, freshCopyNone,
 	)
 	if err == nil {
 		t.Fatal("empty-but-drifted target must refuse at the shape gate; got nil (the pre-fix silent-coercion hole)")
@@ -88,7 +88,7 @@ func TestSyncColdStartShapeGate_MatchingSkipsCreate(t *testing.T) {
 	rw := &stubEmptyChecker{empty: map[string]bool{"existing": true, "fresh": true}}
 
 	createSchema, err := s.coldStartGatePreflight(
-		context.Background(), intended, nil, rw, stream, nil, "stream-1", false, false,
+		context.Background(), intended, nil, rw, stream, nil, "stream-1", false, freshCopyNone,
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
@@ -125,7 +125,7 @@ func TestSyncColdStartShapeGate_SkipBranchesNeverConsultTargetCatalog(t *testing
 		var abandoned, closed bool
 		createSchema, err := s.coldStartGatePreflight(
 			context.Background(), intended, nil, &stubEmptyChecker{empty: map[string]bool{"items": true}},
-			recordingSnapshotStream(&abandoned, &closed), nil, "stream-1", false, false,
+			recordingSnapshotStream(&abandoned, &closed), nil, "stream-1", false, freshCopyNone,
 		)
 		if err != nil {
 			t.Fatalf("--schema-already-applied must skip the gate (operator promise): %v", err)
@@ -140,7 +140,7 @@ func TestSyncColdStartShapeGate_SkipBranchesNeverConsultTargetCatalog(t *testing
 		var abandoned, closed bool
 		createSchema, err := s.coldStartGatePreflight(
 			context.Background(), intended, nil, &stubEmptyChecker{empty: map[string]bool{"items": true}},
-			recordingSnapshotStream(&abandoned, &closed), nil, "stream-1", true /* resumingCopy */, false,
+			recordingSnapshotStream(&abandoned, &closed), nil, "stream-1", true /* resumingCopy */, freshCopyNone,
 		)
 		if err != nil {
 			t.Fatalf("the COPY resume must skip the gate (resume contract): %v", err)
