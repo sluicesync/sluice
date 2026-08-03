@@ -911,6 +911,39 @@ func (b *tableBuilder) parseOptionValue() (string, error) {
 	t := p.next()
 	switch t.kind {
 	case tokIdent, tokNumber:
+		// A BACKTICK-QUOTED table-option value is refused (audit 2026-08-01
+		// Sec1). The lexer lets a backtick-quoted identifier carry arbitrary
+		// bytes up to its closing backtick — semicolons, spaces, quotes — and
+		// this function's result flows into CHARSET / COLLATE, which the
+		// target emitters render as bare identifiers.
+		//
+		// Ground truth from MySQL 8.0, because the reason to refuse is not
+		// "MySQL forbids it": MySQL ACCEPTS `COLLATE=`utf8mb4_general_ci``,
+		// but it VALIDATES the name (a hostile `x; DROP TABLE y; --` is
+		// rejected with errno 1273, Unknown collation), and SHOW CREATE
+		// TABLE — which is exactly what mydumper writes out — always emits
+		// the value UNQUOTED. So a quoted option value cannot appear in a
+		// dump any real MySQL produced, and refusing it costs nothing on a
+		// genuine dump while making a tampered file fail at the boundary
+		// where it is detectable rather than at a distant emit site.
+		//
+		// The arbitrary-SQL escalation this guards is separately closed
+		// downstream — the MySQL emitter runs sqlident.Check on charset and
+		// collation (audit C1, v0.108.0) and the Postgres emitter drops
+		// foreign-dialect collations entirely — so this is defence in depth
+		// at the read boundary, which is where the loud-failure tenet puts it.
+		//
+		// Quoting stays legitimate for NAMES (tables, columns, FK targets);
+		// those go through expectIdent and are untouched, because real dumps
+		// quote them on every line.
+		if t.quoted {
+			return "", p.errAt(t,
+				"table-option value is backtick-quoted; MySQL never writes one that way "+
+					"(SHOW CREATE TABLE, which mydumper dumps verbatim, always emits it bare), so this "+
+					"file was not produced by mysqldump/mydumper against a real server. A quoted value can "+
+					"carry arbitrary SQL text into a CHARSET/COLLATE position; refusing it here rather "+
+					"than passing it on")
+		}
 		return t.text, nil
 	case tokString:
 		return string(t.val), nil

@@ -391,23 +391,50 @@ func matchesFunctionCall(expr, name string) bool {
 	return re.MatchString(expr)
 }
 
-// gapMatcherCache caches compiled regexes per function name. The
-// pattern is `(?i)\bNAME\s*\(`. Sized to the number of gapPatterns
-// (~10 entries); never grows during normal sluice runtime.
-var gapMatcherCache = map[string]*regexp.Regexp{}
+// gapMatchers holds the compiled `(?i)\bNAME\s*\(` regex for every name in
+// [gapPatterns], built once during package initialization and NEVER written
+// again. Concurrent reads of a map that is never written are safe; that is
+// the whole reason this is a pre-built table rather than a lazy cache.
+//
+// It replaces a lazily-populated cache whose doc comment read: "Concurrent
+// calls are racy but the worst case is duplicate compilation, not a wrong
+// match" (audit 2026-08-01 A2). That was wrong about Go, not merely
+// optimistic. A concurrent map read and map write is not a benign data race
+// with a redundant-work outcome — the runtime DETECTS it and throws
+// `fatal error: concurrent map read and map write`, which is unrecoverable:
+// it bypasses deferred recover entirely and takes the process down. A
+// migration that dies that way loses whatever the run had not yet committed,
+// so the stated worst case understated the real one by the width of the
+// program.
+//
+// Reachability: detectGaps runs per expression during schema translation, and
+// the concurrent cross-table copy paths translate more than one table at a
+// time — so more than one goroutine can call this on a cold cache.
+//
+// The lazy cache was never needed. gapMatcher's only caller iterates
+// gapPatterns, so the key set is exactly that fixed registry, known at compile
+// time. Building the table up front removes the write entirely rather than
+// guarding it: no mutex on the read path, no sync.Map indirection, and no
+// duplicate compilation either.
+var gapMatchers = func() map[string]*regexp.Regexp {
+	m := make(map[string]*regexp.Regexp, len(gapPatterns))
+	for _, pat := range gapPatterns {
+		// `(?i)` makes the match case-insensitive; `\b` is a word boundary;
+		// `\s*` permits whitespace between the function name and `(`.
+		m[pat.name] = regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(pat.name) + `\s*\(`)
+	}
+	return m
+}()
 
 // gapMatcher returns the compiled `\bNAME\s*\(` regex for name.
-// First-use caches; subsequent calls reuse the cached *Regexp.
-// Concurrent calls are racy but the worst case is duplicate
-// compilation, not a wrong match — acceptable for the scanner's
-// once-per-preview-run usage.
+//
+// A name outside [gapPatterns] compiles on the spot rather than being cached:
+// there is no such caller today (detectGaps iterates the registry), and
+// compiling is far cheaper than reintroducing a write to a shared map for a
+// path that does not exist.
 func gapMatcher(name string) *regexp.Regexp {
-	if re, ok := gapMatcherCache[name]; ok {
+	if re, ok := gapMatchers[name]; ok {
 		return re
 	}
-	// `(?i)` makes the match case-insensitive; `\b` is a word boundary;
-	// `\s*` permits whitespace between the function name and `(`.
-	re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\s*\(`)
-	gapMatcherCache[name] = re
-	return re
+	return regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\s*\(`)
 }
