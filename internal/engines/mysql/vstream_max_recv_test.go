@@ -1,10 +1,10 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// The VStream gRPC receive ceiling (ticket 36535).
+// The VStream gRPC receive ceiling.
 //
-// A PlanetScale region move failed its cold copy on a 148 GB chat-message
-// table with:
+// Reported from the field: a PlanetScale region move failed its cold copy on
+// a large table with:
 //
 //	rpc error: code = ResourceExhausted desc = grpc: received message after
 //	decompression larger than max 4194304
@@ -16,8 +16,8 @@
 // row; sluice refused to receive it.
 //
 // VStream ships whole ROWS and cannot split one across messages, so a single
-// wide row is enough. The reporting table has a `mediumtext` content column
-// (16 MiB max) plus two `json` columns.
+// wide row is enough — a `mediumtext` column is 16 MiB on its own, and a
+// couple of `json` columns alongside it comfortably clear 4 MiB.
 //
 // Two defects, pinned separately below, because fixing only the first would
 // still have left an operator burning 10 reconnects on a deterministic error.
@@ -50,7 +50,7 @@ func TestVStreamMaxRecvBytesFromDSN(t *testing.T) {
 		// stock ceiling, which is what shipped.
 		const grpcStockDefault = 4 << 20
 		if got <= grpcStockDefault {
-			t.Errorf("default ceiling is %d, at or below gRPC's stock %d — the ticket-36535 failure returns",
+			t.Errorf("default ceiling is %d, at or below gRPC's stock %d — the oversized-row failure returns",
 				got, grpcStockDefault)
 		}
 		// And above every server ceiling we know of, so sluice is never the
@@ -62,7 +62,7 @@ func TestVStreamMaxRecvBytesFromDSN(t *testing.T) {
 		if got <= knownServerCeiling {
 			t.Errorf("default ceiling is %d, at or below the known server ceiling %d — sluice would be the "+
 				"stricter end and could reject a message vtgate was willing to send, which is the "+
-				"ticket-36535 failure one size up",
+				"same oversized-row failure one size up",
 				got, knownServerCeiling)
 		}
 	})

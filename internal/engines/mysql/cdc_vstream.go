@@ -711,7 +711,7 @@ func vstreamDialOptions(cfg *gomysql.Config) ([]grpc.DialOption, string, error) 
 	// which reads like a server-side rejection and is not one — nothing in
 	// MySQL or vtgate refused the row, sluice's own client refused to receive
 	// it. A `mediumtext` column (16 MiB max) plus a couple of `json` columns
-	// reaches this easily; reported from a real 148 GB chat-message table.
+	// reaches this easily; reported from the field on a large production table.
 	//
 	// The default is deliberately ABOVE Vitess's 16 MiB rather than equal to
 	// it: 16 MiB is the size of ONE maximal mediumtext value, and the message
@@ -2318,8 +2318,8 @@ func (r *vstreamCDCReader) applyReshardState(resh *ShardLayoutChangedError) erro
 // --grpc_max_message_size bounds what the server will SEND, and this bounds
 // what sluice will RECEIVE. Only the second is ours. If sluice sits at or
 // below the server's ceiling it can reject a message the server was willing
-// to send — which is the ticket-36535 failure, where sluice sat at gRPC's
-// stock 4 MiB.
+// to send — the failure this constant exists to prevent, where sluice sat
+// at gRPC's stock 4 MiB.
 //
 // So this is set ABOVE the known server ceilings rather than equal to any of
 // them: Vitess's own default is 16 MiB and PlanetScale is understood to run
