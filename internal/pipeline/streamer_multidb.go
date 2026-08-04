@@ -594,6 +594,16 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// is immaterial.
 	emitCrossEngineTranslationNotices(ctx, schema, s.Source.Name(), s.Target.Name(), "sync cold-start")
 
+	// Index-emit pre-flight refusal (roadmap item 118), per database and
+	// before this database's target tables are created — the multi-database
+	// sibling of the single-database cold-start's call. The fan-out copies
+	// one database at a time, so an unrepresentable index in database N
+	// would otherwise be discovered after N-1 databases had already been
+	// copied AND after this one's rows had landed.
+	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return fmt.Errorf("pipeline: preflight indexes for %q: %w", database, err)
+	}
+
 	// Foreign keys are deferred to keep the first cut symmetric with the
 	// multi-database migrate path: a same-named cross-database FK may
 	// reference a database whose tables are created in a later iteration.

@@ -376,6 +376,33 @@ func (r *Restore) newChainRestore() *ChainRestore {
 	}
 }
 
+// refuseUnrepresentableTargetShape runs the two pre-DDL "can this target hold
+// this schema's SHAPE?" refusals, in the order they were added:
+//
+//	1.4   ADR-0047 verbatim-extension restore-time engine gate. A backup
+//	      carrying verbatim (uncatalogued) PG extension-typed columns is
+//	      PG-restore-only; restoring it to a non-PG target is a LOUD refusal
+//	      before any data moves (never a silent drop/mangle). The
+//	      single-manifest path gates on the manifest schema directly — the
+//	      same schema the lineage marker is derived from, so the two restore
+//	      paths agree.
+//	1.47  Index-emit pre-flight (roadmap item 118). Restore runs migrate's
+//	      phase order — tables, rows, then indexes — so an index the target
+//	      cannot represent surfaced only after the whole archive had landed.
+//	      Asked unconditionally rather than on the cross-engine branch: a
+//	      same-engine restore is not proof of representability.
+//
+// Grouped because they take the same two inputs and answer the same question
+// about them; kept out of [Restore.Run] because that function is at its length
+// ceiling and this is a coherent phase to carve out rather than a way to hide
+// lines.
+func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *ir.Schema) error {
+	if err := refuseVerbatimManifestRestoreToNonPG(schema, r.Target); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+	return migcore.PreflightIndexEmit(ctx, r.Target, schema, "restore")
+}
+
 func (r *Restore) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
@@ -438,15 +465,11 @@ func (r *Restore) Run(ctx context.Context) error {
 		return errors.New("restore: manifest carries no schema")
 	}
 
-	// 1.4. ADR-0047 verbatim-extension restore-time engine gate. A
-	//      backup carrying verbatim (uncatalogued) PG extension-typed
-	//      columns is PG-restore-only; restoring it to a non-PG target
-	//      is a LOUD refusal before any data moves (never a silent
-	//      drop/mangle). The single-manifest path gates on the
-	//      manifest schema directly — the same schema the lineage
-	//      marker is derived from, so the two restore paths agree.
-	if err := refuseVerbatimManifestRestoreToNonPG(manifest.Schema, r.Target); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	// 1.4 + 1.47. The two schema-shape-versus-target refusals, both pre-DDL
+	//      and both taking (manifest.Schema, r.Target) — see
+	//      [Restore.refuseUnrepresentableTargetShape].
+	if err := r.refuseUnrepresentableTargetShape(ctx, manifest.Schema); err != nil {
+		return err
 	}
 
 	// 1.45. Cross-engine supportability gate (Bug 134). The chain

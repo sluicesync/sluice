@@ -578,25 +578,15 @@ func quoteSQLString(s string) string {
 // over expressions: `CREATE UNIQUE INDEX u ON t (substr(email, 1, 20))`
 // reproduces the source's semantics exactly.
 func checkIndexPrefixLength(idx *ir.Index, where string) error {
+	if err := refuseUnrepresentablePrefix(idx, where); err != nil {
+		return err
+	}
 	if idx == nil {
 		return nil
 	}
 	for _, c := range idx.Columns {
 		if c.Length <= 0 || c.Expression != "" {
 			continue
-		}
-		if idx.Unique {
-			return fmt.Errorf(
-				"%s: index %q constrains column %q to its first %d characters, and SQLite has no "+
-					"prefix-length equivalent. On a key that enforces uniqueness the prefix is part of the "+
-					"CONSTRAINT: the source forbids two rows whose first %d characters of %q match, and a "+
-					"SQLite unique index over the whole column would ALLOW them — so the target would "+
-					"silently accept data the source rejects. Rewrite it as a unique index over an "+
-					"expression that reproduces the prefix (for example `substr(%s, 1, %d)`), widen it to "+
-					"the full column on the source if the prefix was only a size optimisation, or exclude "+
-					"the table",
-				where, idx.Name, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
-			)
 		}
 		slog.Warn(
 			"index prefix length dropped: SQLite has no prefix-length equivalent, so this index covers the "+
@@ -605,6 +595,39 @@ func checkIndexPrefixLength(idx *ir.Index, where string) error {
 			slog.String("index", idx.Name),
 			slog.String("column", c.Column),
 			slog.Int("source_prefix_length", c.Length),
+		)
+	}
+	return nil
+}
+
+// refuseUnrepresentablePrefix is the REFUSAL half of
+// [checkIndexPrefixLength] — the same condition and the same message, with
+// the advisory WARN left behind.
+//
+// Split out (roadmap item 118) so [Engine.PreflightIndexes] can ask the
+// question before any data moves without ALSO emitting the non-unique
+// index's "prefix length dropped" WARN a second time: that warning describes
+// what the emitter actually did, so it belongs at the emitter, once. The
+// refusal text lives here and nowhere else, which is what keeps the early
+// answer and the late one from drifting apart.
+func refuseUnrepresentablePrefix(idx *ir.Index, where string) error {
+	if idx == nil || !idx.Unique {
+		return nil
+	}
+	for _, c := range idx.Columns {
+		if c.Length <= 0 || c.Expression != "" {
+			continue
+		}
+		return fmt.Errorf(
+			"%s: index %q constrains column %q to its first %d characters, and SQLite has no "+
+				"prefix-length equivalent. On a key that enforces uniqueness the prefix is part of the "+
+				"CONSTRAINT: the source forbids two rows whose first %d characters of %q match, and a "+
+				"SQLite unique index over the whole column would ALLOW them — so the target would "+
+				"silently accept data the source rejects. Rewrite it as a unique index over an "+
+				"expression that reproduces the prefix (for example `substr(%s, 1, %d)`), widen it to "+
+				"the full column on the source if the prefix was only a size optimisation, or exclude "+
+				"the table",
+			where, idx.Name, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
 		)
 	}
 	return nil

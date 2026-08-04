@@ -57,21 +57,28 @@ var indexShapeMatrix = map[string]map[string]struct {
 	Does  handling
 	Proof string // a symbol that must appear in the engine's non-test sources
 	Why   string
+	// Preflight names the symbol [ir.IndexEmitPreflighter] routes through for
+	// this attribute on this engine — the refusal helper the pre-copy gate and
+	// the emitter SHARE (roadmap item 118). Required on every `refuses` row and
+	// only there: a refusal that fires only at emit time arrives after the
+	// whole table has been copied, which is the defect item 118 closed, and an
+	// `emits` / `warns-and-drops` row has nothing to refuse early.
+	Preflight string
 }{
 	// A PREFIX LENGTH on a uniqueness-enforcing key is part of the constraint:
 	// dropping it WIDENS what the target admits.
 	"IndexColumn.Length": {
-		"mysql":    {emits, "emitIndexColumnListWithPrefix", "native feature — `KEY (col(20))`"},
-		"postgres": {refuses, "checkIndexPrefixLength", "no prefix indexes; a unique key would admit rows the source rejects"},
-		"sqlite":   {refuses, "checkIndexPrefixLength", "no prefix indexes; same widening as Postgres"},
+		"mysql":    {emits, "emitIndexColumnListWithPrefix", "native feature — `KEY (col(20))`", ""},
+		"postgres": {refuses, "checkIndexPrefixLength", "no prefix indexes; a unique key would admit rows the source rejects", "refuseUnrepresentablePrefix"},
+		"sqlite":   {refuses, "checkIndexPrefixLength", "no prefix indexes; same widening as Postgres", "refuseUnrepresentablePrefix"},
 	},
 	// A PARTIAL PREDICATE on a uniqueness-enforcing key is also part of the
 	// constraint, but dropping it NARROWS: the target rejects rows the source
 	// holds legally.
 	"Index.Predicate": {
-		"mysql":    {refuses, "checkIndexPredicate", "no partial indexes; an unconditional UNIQUE rejects rows the source permits"},
-		"postgres": {emits, "translateIndexPredicate", "native feature — `CREATE INDEX … WHERE`; the source predicate is dialect-translated on the way out"},
-		"sqlite":   {emits, "idx.Predicate", "native feature — `CREATE INDEX … WHERE`"},
+		"mysql":    {refuses, "checkIndexPredicate", "no partial indexes; an unconditional UNIQUE rejects rows the source permits", "refuseUnrepresentablePredicate"},
+		"postgres": {emits, "translateIndexPredicate", "native feature — `CREATE INDEX … WHERE`; the source predicate is dialect-translated on the way out", ""},
+		"sqlite":   {emits, "idx.Predicate", "native feature — `CREATE INDEX … WHERE`", ""},
 	},
 }
 
@@ -108,6 +115,31 @@ func TestEveryEngineHandlesEveryIndexShapeAttribute(t *testing.T) {
 					"internal/engines/%s.\n\nEither the handling regressed or the row is stale — and a stale "+
 					"row here is worse than no row, because it reads as coverage.",
 					attr, engine, h.Does, h.Proof, engine)
+			}
+			// Roadmap item 118: a refusal is only half a policy if it fires
+			// after the copy. Every `refuses` row must name the shared refusal
+			// helper the pre-copy preflight routes through, and that helper —
+			// plus the engine's PreflightIndexes method — must exist.
+			if h.Does != refuses {
+				if h.Preflight != "" {
+					t.Errorf("%s/%s is %q but names a Preflight symbol (%q); only a refusal has anything "+
+						"to refuse early", attr, engine, h.Does, h.Preflight)
+				}
+				continue
+			}
+			if h.Preflight == "" {
+				t.Errorf("%s/%s REFUSES but names no Preflight symbol.\n\nA refusal reachable only from "+
+					"the emitter fires in the index phase — after the entire table has been copied "+
+					"(roadmap item 118). Route it through a shared refusal helper, call that helper from "+
+					"the engine's PreflightIndexes, and name it here.", attr, engine)
+				continue
+			}
+			for _, sym := range []string{h.Preflight, "PreflightIndexes"} {
+				if !symbolInEnginePackage(t, root, engine, sym) {
+					t.Errorf("%s/%s names %q for its pre-copy refusal, which does not appear in "+
+						"internal/engines/%s — the early half of this refusal is gone, so it is back to "+
+						"firing after the bulk copy.", attr, engine, sym, engine)
+				}
 			}
 		}
 	}

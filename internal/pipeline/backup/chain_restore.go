@@ -278,6 +278,16 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		)
 	}
 
+	// 2.45. Index-emit pre-flight refusal (roadmap item 118), on the chain
+	//       ROOT's schema — the shape the target tables are created from.
+	//       Same reason as the single-manifest twin in restore.go: the
+	//       index phase runs after the whole chain has been replayed, so
+	//       an unrepresentable index was discovered at the very end. Asked
+	//       unconditionally, not only on the cross-engine branch.
+	if err := migcore.PreflightIndexEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
+		return err
+	}
+
 	// 2.5. Encryption pre-flight at the chain's IDENTITY (not merely at
 	//      the first restorable link — see [ChainRestore.chainIdentityManifest]).
 	if err := r.preflightEncryption(r.chainIdentityManifest(ctx, root.Manifest)); err != nil {

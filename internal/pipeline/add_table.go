@@ -400,6 +400,15 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// manifest there in v0.24.0; the early-create is still the
 	// correct shape — it removes engine-specific timing assumptions
 	// from the orchestrator.
+	// Index-emit pre-flight refusal (roadmap item 118). runBulkCopyForAddTable
+	// below copies the table and THEN emits its indexes, so the new table's
+	// unrepresentable index was discovered after its rows had landed — and
+	// mid-sync, with the publication already extended. Same one-pass check the
+	// migrate and cold-start paths run, on the single-table scoped schema.
+	if err := migcore.PreflightIndexEmit(ctx, a.Target, scoped, "add-table"); err != nil {
+		return err
+	}
+
 	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))
 	}

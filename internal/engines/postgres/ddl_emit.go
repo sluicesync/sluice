@@ -1655,21 +1655,12 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // because emitAddUniqueConstraint renders its column list independently and
 // the two must not diverge.
 func checkIndexPrefixLength(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if err := refuseUnrepresentablePrefix(cols, where, enforcesUniqueness); err != nil {
+		return err
+	}
 	for _, c := range cols {
 		if c.Length <= 0 || c.Expression != "" {
 			continue
-		}
-		if enforcesUniqueness {
-			return fmt.Errorf(
-				"%s: column %q carries a %d-character index prefix, and Postgres has no prefix-length "+
-					"equivalent. On a key that enforces uniqueness the prefix is part of the constraint: the "+
-					"source forbids two rows whose first %d characters of %q match, and a Postgres key over the "+
-					"whole column would ALLOW them — so the target would silently accept data the source "+
-					"rejects. Rewrite the key as a unique index over an expression that reproduces the prefix "+
-					"(for example `left(%s, %d)`), widen it to the full column on the source if the prefix was "+
-					"only a size optimisation, or exclude the table",
-				where, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
-			)
 		}
 		slog.Warn(
 			"index prefix length dropped: Postgres has no prefix-length equivalent, so this index covers the "+
@@ -1677,6 +1668,38 @@ func checkIndexPrefixLength(cols []ir.IndexColumn, where string, enforcesUniquen
 			slog.String("context", where),
 			slog.String("column", c.Column),
 			slog.Int("source_prefix_length", c.Length),
+		)
+	}
+	return nil
+}
+
+// refuseUnrepresentablePrefix is the REFUSAL half of
+// [checkIndexPrefixLength] — the same condition and the same message, with
+// the advisory WARN left behind.
+//
+// Split out (roadmap item 118) so [Engine.PreflightIndexes] can ask the
+// question before any data moves without ALSO emitting the non-unique
+// index's "prefix length dropped" WARN a second time: that warning describes
+// what the emitter actually did, so it belongs at the emitter, once. The
+// refusal text lives here and nowhere else, which is what keeps the early
+// answer and the late one from drifting apart.
+func refuseUnrepresentablePrefix(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if !enforcesUniqueness {
+		return nil
+	}
+	for _, c := range cols {
+		if c.Length <= 0 || c.Expression != "" {
+			continue
+		}
+		return fmt.Errorf(
+			"%s: column %q carries a %d-character index prefix, and Postgres has no prefix-length "+
+				"equivalent. On a key that enforces uniqueness the prefix is part of the constraint: the "+
+				"source forbids two rows whose first %d characters of %q match, and a Postgres key over the "+
+				"whole column would ALLOW them — so the target would silently accept data the source "+
+				"rejects. Rewrite the key as a unique index over an expression that reproduces the prefix "+
+				"(for example `left(%s, %d)`), widen it to the full column on the source if the prefix was "+
+				"only a size optimisation, or exclude the table",
+			where, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
 		)
 	}
 	return nil

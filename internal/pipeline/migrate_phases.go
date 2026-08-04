@@ -359,6 +359,24 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 		emitCrossEngineTranslationNotices(ctx, schema, m.Source.Name(), m.Target.Name(), "migrate")
 	}
 
+	// ---- 1.7. Index-emit pre-flight refusal (roadmap item 118) ----
+	// Ask the TARGET engine whether it can represent every index in the
+	// finalized schema. Each of these refusals already existed and was
+	// already loud and zero-loss — a MySQL partial UNIQUE, a Postgres or
+	// SQLite index prefix length — but each lived in a SECONDARY-index
+	// emitter, and secondary indexes are built in phase three, so the
+	// refusal arrived after the whole table had been copied. Nothing about
+	// WHAT is refused changes here; only WHEN.
+	//
+	// Deliberately OUTSIDE the cross-engine block above: "only a
+	// cross-engine run can carry an unrepresentable index" is a premise
+	// about the readers, not a property of this gate, and the preflight
+	// costs one pass over the schema. Running it unconditionally means
+	// there is no premise to keep true.
+	if err := migcore.PreflightIndexEmit(ctx, m.Target, schema, "migrate"); err != nil {
+		return nil, false, err
+	}
+
 	return schema, rawCopyOK, nil
 }
 

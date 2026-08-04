@@ -1607,24 +1607,15 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 // permits unlimited NULLs in a unique key, which reproduces partial-unique
 // semantics exactly.
 func checkIndexPredicate(idx *ir.Index, where string) error {
+	if err := refuseUnrepresentablePredicate(idx, where); err != nil {
+		return err
+	}
 	if idx == nil {
 		return nil
 	}
 	pred := strings.TrimSpace(idx.Predicate)
 	if pred == "" {
 		return nil
-	}
-	if idx.Unique {
-		return fmt.Errorf(
-			"%s: index %q is PARTIAL (`WHERE %s`) and enforces uniqueness, and MySQL has no partial-index "+
-				"equivalent. The predicate is part of the constraint: the source permits duplicate values "+
-				"among the rows the predicate EXCLUDES, and a MySQL unique key over the whole table would "+
-				"reject them — so the target is stricter than the source and would refuse data the source "+
-				"holds legally. Reproduce it with a generated column that is NULL outside the predicate and "+
-				"a UNIQUE key over that column (MySQL permits unlimited NULLs in a unique key), drop the "+
-				"predicate on the source if it was only a size optimisation, or exclude the table",
-			where, idx.Name, pred,
-		)
 	}
 	slog.Warn(
 		"partial-index predicate dropped: MySQL has no partial-index equivalent, so this index covers every "+
@@ -1635,6 +1626,36 @@ func checkIndexPredicate(idx *ir.Index, where string) error {
 		slog.String("source_predicate", pred),
 	)
 	return nil
+}
+
+// refuseUnrepresentablePredicate is the REFUSAL half of
+// [checkIndexPredicate] — the same condition and the same message, with the
+// advisory WARN left behind.
+//
+// Split out (roadmap item 118) so [Engine.PreflightIndexes] can ask the
+// question before any data moves without ALSO emitting the non-unique
+// index's "predicate dropped" WARN a second time: that warning describes
+// what the emitter actually did, so it belongs at the emitter, once. The
+// refusal text lives here and nowhere else, which is what keeps the early
+// answer and the late one from drifting apart.
+func refuseUnrepresentablePredicate(idx *ir.Index, where string) error {
+	if idx == nil {
+		return nil
+	}
+	pred := strings.TrimSpace(idx.Predicate)
+	if pred == "" || !idx.Unique {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: index %q is PARTIAL (`WHERE %s`) and enforces uniqueness, and MySQL has no partial-index "+
+			"equivalent. The predicate is part of the constraint: the source permits duplicate values "+
+			"among the rows the predicate EXCLUDES, and a MySQL unique key over the whole table would "+
+			"reject them — so the target is stricter than the source and would refuse data the source "+
+			"holds legally. Reproduce it with a generated column that is NULL outside the predicate and "+
+			"a UNIQUE key over that column (MySQL permits unlimited NULLs in a unique key), drop the "+
+			"predicate on the source if it was only a size optimisation, or exclude the table",
+		where, idx.Name, pred,
+	)
 }
 
 // emitIndexColumnListWithPrefix renders the parenthesised column list,

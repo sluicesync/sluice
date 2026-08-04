@@ -3359,6 +3359,47 @@ type Engine interface {
 	OpenSnapshotStream(ctx context.Context, dsn string) (*SnapshotStream, error)
 }
 
+// IndexEmitPreflighter is the optional engine surface that answers, with
+// no database connection and before any data moves, "can you represent
+// every index in this schema?" (roadmap item 118).
+//
+// # Why it exists
+//
+// sluice's phase order is create tables → bulk-copy → create indexes →
+// create constraints. Every "this index cannot be represented on the
+// target" refusal lives in an engine's DDL emitter, and the emitters for
+// SECONDARY indexes are only reached in that third phase — so a MySQL
+// partial UNIQUE, a Postgres index prefix length, and a SQLite index
+// prefix length were each loud, zero-loss and correct, and each arrived
+// AFTER the whole table had been copied. Two shipped releases claimed
+// otherwise in their notes.
+//
+// Moving each check individually would re-run the sibling sweep every
+// time a new target-unrepresentable index shape is added, and those two
+// false claims are the evidence that the sweep is not reliably run. One
+// preflight that asks the target engine the question closes the present
+// members and every future one that goes through the same refusal
+// helpers.
+//
+// # Contract
+//
+// PreflightIndexes returns the SAME refusal the engine's emitter would
+// return later — same index, same offending attribute, same remedy —
+// or nil. It must not refuse anything the emit phase would accept: an
+// over-refusing preflight is a worse defect than the late refusal it
+// replaces, because it breaks migrations that work today. Advisory
+// WARN-and-drop cases (a partial NON-unique index onto MySQL, a prefix
+// length on a non-unique index) are NOT refusals and stay silent here —
+// their warning is emitted once, at the real emit site.
+//
+// It takes no context and opens no connection, which is what lets it run
+// beside the other pre-DDL gates rather than after the target writers
+// are open. Engines that are sources only (no schema writer) omit the
+// method; the orchestrator type-asserts and skips.
+type IndexEmitPreflighter interface {
+	PreflightIndexes(s *Schema) error
+}
+
 // ConnectionLabeler is the optional engine surface for engines that can
 // stamp every connection they open with an operator-visible label
 // carrying the run's stream-/migration-id, so operators can find a

@@ -145,6 +145,16 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// lossless path.
 	emitCrossEngineTranslationNotices(ctx, schema, s.Source.Name(), s.Target.Name(), "sync cold-start")
 
+	// Index-emit pre-flight refusal (roadmap item 118). The shared-copy-phase
+	// parity agreement applies: the index build is a phase `migrate` and
+	// `sync` cold-start both run, so a refusal that fires before any data
+	// moves on one must fire before any data moves on the other. Placed here,
+	// beside the advisory notices and BEFORE the snapshot stream is opened,
+	// so nothing has been created source-side either (no slot to abandon).
+	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return nil, stop, err
+	}
+
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from
 	// the beginning otherwise.

@@ -153,6 +153,20 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	return e.pg.OpenSchemaWriter(ctx, dsn)
 }
 
+// PreflightIndexes implements [ir.IndexEmitPreflighter] by delegating to the
+// composed [postgres.Engine] (roadmap item 118). This engine's schema WRITER
+// is vanilla PG's, so its index-representability answer must be vanilla PG's
+// too — an omission here would silently un-gate the trigger target while the
+// interface assertion on postgres.Engine kept reading as coverage.
+func (e Engine) PreflightIndexes(s *ir.Schema) error {
+	return e.pg.PreflightIndexes(s)
+}
+
+// Compile-time proof the trigger engine carries the pre-copy
+// index-representability gate rather than losing it at the delegation
+// boundary.
+var _ ir.IndexEmitPreflighter = Engine{}
+
 // OpenRowReader delegates to the composed [postgres.Engine].
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	return e.pg.OpenRowReader(ctx, dsn)
