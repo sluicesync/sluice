@@ -87,6 +87,12 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 		return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], true
 
 	case identifierNetwork:
+		// A zone-scoped address is refused here as well as by the caller. This
+		// arm is what defines "canonical", and there is no canonical spelling
+		// of a value neither server can store — see checkNetworkLiteralZone.
+		if strings.Contains(s, "%") {
+			return "", false
+		}
 		// netip PARSES; it does not get to decide the spelling. WHICH form is
 		// canonical is the engine's call (audit 2026-08-01 S2), and so is how
 		// the address itself is rendered (audit 2026-08-04 C1) — both servers
@@ -160,8 +166,12 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 		return "", false
 
 	case identifierMAC:
+		// net.ParseMAC also accepts 8-byte EUI-64 and 20-byte InfiniBand
+		// forms. Only the 6-byte form has a canonical spelling this package
+		// can stand behind — see checkMACLiteralWidth for why, and for what
+		// it deliberately does NOT close.
 		hw, err := net.ParseMAC(s)
-		if err != nil {
+		if err != nil || len(hw) != 6 {
 			return "", false
 		}
 		return hw.String(), true
@@ -260,6 +270,17 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		)
 	}
 
+	if info.Identifier == identifierNetwork {
+		if err := checkNetworkLiteralZone(col, lit.str); err != nil {
+			return err
+		}
+	}
+	if info.Identifier == identifierMAC {
+		if err := checkMACLiteralWidth(col, lit.str); err != nil {
+			return err
+		}
+	}
+
 	canonical, ok := canonicalIdentifierLiteral(info.Identifier, lit.str, info.NetworkRendering)
 	if !ok {
 		return fmt.Errorf("literal %q is not a valid value for %s column %q",
@@ -275,6 +296,88 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		)
 	}
 	return nil
+}
+
+// checkNetworkLiteralZone refuses a zone-scoped address (`fe80::1%eth0`).
+//
+// netip PARSES a zone, and [ir.RenderNetworkAddr] deliberately returns such an
+// address unchanged so that the zone survives to be seen here rather than
+// being silently dropped by the dotted-quad branch. That makes the literal
+// round-trip to itself, so without this check it compiles clean — and then
+// matches nothing, for the whole life of the stream, at exit 0.
+//
+// Nothing can match it: neither engine can STORE a zone. Postgres raises
+// "invalid input syntax for type inet" and MariaDB errno 1292, so there is no
+// value in any column of either type that a zoned literal could equal. This is
+// the same adjudication as a narrower-than-full prefix on a MariaDB inet4
+// column — refuse a literal no stored value can be, rather than compare
+// against it forever.
+func checkNetworkLiteralZone(col, lit string) error {
+	bare, zone, hasZone := strings.Cut(lit, "%")
+	if !hasZone {
+		return nil
+	}
+	return fmt.Errorf(
+		"literal %q on inet/cidr column %q carries an IPv6 zone (%q), which neither Postgres nor MariaDB can "+
+			"store in a network column — Postgres rejects it as invalid input syntax and MariaDB raises errno "+
+			"1292. No stored value can carry a zone, so this filter would compile and then match nothing, "+
+			"silently dropping every change to every row. Write it as %q",
+		lit, col, "%"+zone, bare,
+	)
+}
+
+// checkMACLiteralWidth refuses a MAC literal that is not the 6-byte EUI-48
+// form, because [net.ParseMAC] also accepts 8-byte EUI-64 and 20-byte
+// InfiniBand spellings and both render back to themselves — so they compile
+// clean and match nothing on a `macaddr` column.
+//
+// WHAT THIS DOES NOT CLOSE, stated because the narrow scope is deliberate and
+// reads as broader than it is: [ir.Macaddr] is an EMPTY STRUCT, and the
+// Postgres reader maps BOTH `macaddr` and `macaddr8` onto it
+// (engines/postgres/types.go). The width is therefore indistinguishable here
+// BY CONSTRUCTION, and this check picks the side that fails loudly on the
+// common column type:
+//
+//   - 8-byte literal on `macaddr`  — impossible to store. REFUSED by this.
+//   - 8-byte literal on `macaddr8` — correct today. Also refused by this, and
+//     that is the cost: a working filter becomes a loud error naming why.
+//   - 6-byte literal on `macaddr`  — correct. Accepted.
+//   - 6-byte literal on `macaddr8` — STILL SILENTLY WRONG, and NOT closed
+//     here. Postgres widens EUI-48 to EUI-64 on input (`08:00:2b:01:02:03` is
+//     stored and delivered as `08:00:2b:ff:fe:01:02:03`), so the literal never
+//     equals the delivered value.
+//
+// That last row needs a width on the IR type plus a fingerprint exclusion for
+// the new field (the item-104 trap), which is the queued C1 residual and not
+// this. Until it lands, a `--where` on a macaddr8 column is unsafe in one
+// direction and this comment is the only thing that says so.
+func checkMACLiteralWidth(col, lit string) error {
+	// A literal that does not parse as a MAC at all is not this check's
+	// business — it falls through to the generic invalid-literal refusal,
+	// which already names the column and the kind.
+	width, parsed := macLiteralWidth(lit)
+	if !parsed || width == 6 {
+		return nil
+	}
+	return fmt.Errorf(
+		"literal %q on macaddr column %q is a %d-byte address; Postgres `macaddr` holds 6 bytes, so no stored "+
+			"value can equal it and this filter would compile and then match nothing, silently dropping every "+
+			"change to every row. sluice cannot tell `macaddr` from `macaddr8` (both read as ir.Macaddr), so an "+
+			"8-byte literal is refused even on a macaddr8 column rather than guessed at. Filter on a different "+
+			"column, or write the 6-byte form if the column is `macaddr`",
+		lit, col, width,
+	)
+}
+
+// macLiteralWidth reports the byte width [net.ParseMAC] reads out of lit, and
+// whether it parsed at all. Split out so the not-a-MAC case returns a value
+// rather than a nil error alongside a non-nil one.
+func macLiteralWidth(lit string) (width int, parsed bool) {
+	hw, err := net.ParseMAC(lit)
+	if err != nil {
+		return 0, false
+	}
+	return len(hw), true
 }
 
 func identifierKindName(k identifierKind) string {

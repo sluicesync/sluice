@@ -82,6 +82,18 @@ func TestDecodeMariaDBNativeInet6(t *testing.T) {
 		{"leading group", "00010000000000000000000000000000", "1::"},
 		{"trailing group", "ffff0000000000000000000000000000", "ffff::"},
 		{"two zero runs (leftmost wins)", "20010db8000000000001000000000001", "2001:db8::1:0:0:1"},
+
+		// A longest zero run of length ONE. MariaDB compresses it; RFC 5952
+		// §4.2.2 forbids that and both Postgres and Go's netip obey the RFC.
+		// The matrix carried no such address before, which is exactly why the
+		// `if bestLen < 2` guard could sit in mariadbInet6Text under a doc
+		// claiming byte-exact verification (value-fidelity review 2026-08-04).
+		// Every other row here has a longest run of 0 or >=2, so all three
+		// positions of the single hextet are pinned: interior, leading and
+		// trailing.
+		{"single zero hextet, interior", "20010db8000000010002000300040005", "2001:db8::1:2:3:4:5"},
+		{"single zero hextet, leading", "00000001000200030004000500060007", "::1:2:3:4:5:6:7"},
+		{"single zero hextet, trailing", "00010002000300040005000600070000", "1:2:3:4:5:6:7::"},
 		{"nat64 prefix (not dotted)", "0064ff9b000000000000000001020304", "64:ff9b::102:304"},
 		{"mixed hextets", "000a000b000c00000000000000010002", "a:b:c::1:2"},
 		{"fe80 link-local", "fe800000000000000000000000000001", "fe80::1"},

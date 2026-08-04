@@ -191,9 +191,13 @@ func TestIdentifierLiteral_InvalidValuesAreRefused(t *testing.T) {
 // TestCanonicalIdentifierLiteral_MatchesDecoderOutput guards the premise the
 // refusal rests on: the canonical form this package computes must be the form
 // the ENGINE DECODERS produce, or the gate would refuse correct literals and
-// accept wrong ones. The decoders render UUIDs via hex, networks via netip,
-// and MACs via net.HardwareAddr.String — so these expectations are that
-// contract written down.
+// accept wrong ones. The decoders render UUIDs via hex, MACs via
+// net.HardwareAddr.String, and networks via [ir.RenderNetworkAddr] — NOT via
+// netip, which this doc used to claim. netip disagrees with both servers on
+// the IPv4-compatible shape (`::1.2.3.4` vs `::102:304`) and with MariaDB on a
+// single zero hextet, so "via netip" named the exact defect that audit
+// 2026-08-04 C1 was filed for. These expectations are that contract written
+// down.
 func TestCanonicalIdentifierLiteral_MatchesDecoderOutput(t *testing.T) {
 	cases := []struct {
 		kind identifierKind
@@ -242,12 +246,25 @@ func (r fakeNetworkResolver) ResolveNetworkLiteralRendering(isCidr bool) ir.Netw
 
 // TestCanonicalNetworkLiteral_FollowsTheEngineRendering pins the audit-2026-08-01
 // S2 contract: the canonical spelling of an inet/cidr literal is decided by the
-// SOURCE engine's delivered rendering, not by netip. Postgres delivers every
-// value through pgx's InetCodec as a netip.Prefix, so a host address arrives
-// masked ("10.0.0.1/32") and a bare literal must be refused-and-corrected;
-// MariaDB's native inet4/inet6 arrive bare, so the opposite holds. Getting it
-// backwards is SILENT — the literal simply never equals the delivered value —
-// which is why both directions are pinned rather than one representative.
+// SOURCE engine's delivered rendering, not by netip.
+//
+// This doc used to say "Postgres delivers every value through pgx's InetCodec
+// as a netip.Prefix, so a host address arrives masked (10.0.0.1/32)". That
+// claim was removed from production in the same fix and is removed here: it is
+// real code on a path sluice does not take (the row reader goes through
+// database/sql, so the value arrives as Postgres's own text output), and it is
+// BACKWARDS. What a live PG 16 actually delivers, pinned by
+// engines/postgres/network_rendering_integration_test.go:
+//
+//	inet '10.0.0.1'    → "10.0.0.1"      full-width mask DROPPED
+//	inet '10.0.0.0/24' → "10.0.0.0/24"   narrower mask kept
+//	cidr '10.0.0.1/32' → "10.0.0.1/32"   mask ALWAYS kept
+//
+// So inet and cidr have OPPOSITE canonical spellings on the same server, and
+// MariaDB's native inet4/inet6 arrive bare — three renderings, not two.
+// Getting any of them backwards is SILENT: the literal simply never equals the
+// delivered value, which is why every direction is pinned rather than one
+// representative.
 func TestCanonicalNetworkLiteral_FollowsTheEngineRendering(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -361,5 +378,104 @@ func TestNetworkLiteral_UndeclaredRenderingRefuses(t *testing.T) {
 			t.Errorf("literal %q was refused, but not for the undeclared-rendering reason — the fail-closed "+
 				"branch did not run. got: %v", spelling, err)
 		}
+	}
+}
+
+// TestNetworkLiteral_ZoneScopedIsRefused pins the zone hole the 2026-08-04
+// value-fidelity review found.
+//
+// `fe80::1%eth0` PARSES as a netip.Addr, and ir.RenderNetworkAddr returns a
+// zoned address UNCHANGED — deliberately, so the zone survives rendering for
+// this refusal to see it rather than being silently dropped by the dotted-quad
+// branch. That means the literal canonicalises to ITSELF, so before the fix it
+// compiled clean and then matched nothing for the life of the stream, at
+// exit 0. Neither engine can store a zone (PG: invalid input syntax; MariaDB:
+// errno 1292), so no stored value could ever equal it.
+func TestNetworkLiteral_ZoneScopedIsRefused(t *testing.T) {
+	for _, rendering := range []ir.NetworkLiteralRendering{
+		ir.NetworkLiteralRenderingHostBare,
+		ir.NetworkLiteralRenderingAlwaysMasked,
+		ir.NetworkLiteralRenderingAddressOnly,
+	} {
+		infos := ColumnInfosFromIR(fakeNetworkResolver{rendering: rendering},
+			[]*ir.Column{{Name: "ip", Type: ir.Inet{}}}, false)
+
+		for _, zoned := range []string{"fe80::1%eth0", "fe80::1%25", "::1.2.3.4%eth0"} {
+			_, err := Compile("t", "ip = '"+zoned+"'", infos)
+			if err == nil {
+				t.Errorf("rendering %v: zoned literal %q compiled; no stored value can carry a zone, so this "+
+					"filter matches nothing and silently drops every change", rendering, zoned)
+				continue
+			}
+			// Assert the REASON. Without this, deleting the zone branch still
+			// leaves the test green on the AlwaysMasked arm, where a zoned
+			// bare address is refused by netip.ParsePrefix for an unrelated
+			// reason and falls through to the generic invalid-literal message.
+			if !strings.Contains(err.Error(), "carries an IPv6 zone") {
+				t.Errorf("rendering %v: %q was refused, but not for the zone reason — the zone branch did not "+
+					"run. got: %v", rendering, zoned, err)
+			}
+		}
+
+		// Anti-vacuity floor: the SAME addresses without a zone must still
+		// compile. If they did not, the test above would pass for a reason
+		// that has nothing to do with zones.
+		//
+		// The spelling is rendering-dependent, which is the whole S2 contract:
+		// under AlwaysMasked (Postgres `cidr`) a BARE address is itself
+		// non-canonical and canonicalises UP to /128, so the floor has to ask
+		// for the masked form there or it fails for an unrelated reason.
+		plains := []string{"fe80::1", "::1.2.3.4"}
+		if rendering == ir.NetworkLiteralRenderingAlwaysMasked {
+			plains = []string{"fe80::1/128", "::1.2.3.4/128"}
+		}
+		for _, plain := range plains {
+			if _, err := Compile("t", "ip = '"+plain+"'", infos); err != nil {
+				t.Errorf("rendering %v: zoneless %q was refused (%v); the zone test above is then vacuous",
+					rendering, plain, err)
+			}
+		}
+	}
+}
+
+// TestMACLiteral_NonEUI48WidthsAreRefused pins the other half of the same
+// review finding. net.ParseMAC accepts 8-byte EUI-64 and 20-byte InfiniBand
+// forms, and HardwareAddr.String renders them back to themselves — so they
+// canonicalise to themselves and compiled clean against a `macaddr` column
+// that can only hold 6 bytes.
+//
+// SCOPE, because it is narrower than the name suggests: ir.Macaddr is an empty
+// struct and the Postgres reader maps BOTH `macaddr` and `macaddr8` onto it,
+// so a 6-byte literal on a macaddr8 column — which PG widens to EUI-64 on
+// input and therefore never delivers back — is STILL silently wrong and is NOT
+// covered here. That needs a width on the IR type and is the queued C1
+// residual. See checkMACLiteralWidth.
+func TestMACLiteral_NonEUI48WidthsAreRefused(t *testing.T) {
+	infos := ColumnInfosFromIR(ir.ByteExactCollationResolver{},
+		[]*ir.Column{{Name: "mac", Type: ir.Macaddr{}}}, false)
+
+	wide := []string{
+		"08:00:2b:01:02:03:04:05",                                     // EUI-64
+		"00:00:00:00:fe:80:00:00:00:00:00:00:02:00:5e:10:00:00:00:01", // InfiniBand, 20 bytes
+	}
+	for _, lit := range wide {
+		_, err := Compile("t", "mac = '"+lit+"'", infos)
+		if err == nil {
+			t.Errorf("literal %q compiled against a macaddr column; PG macaddr holds 6 bytes, so it matches "+
+				"nothing and silently drops every change", lit)
+			continue
+		}
+		// The REASON matters: net.ParseMAC accepts these, so a generic
+		// "not a valid value" would mean the width branch never ran.
+		if !strings.Contains(err.Error(), "byte address") {
+			t.Errorf("%q was refused, but not for the width reason — the width branch did not run. got: %v",
+				lit, err)
+		}
+	}
+
+	// Anti-vacuity floor: the 6-byte form still compiles, in every spelling
+	// net.ParseMAC accepts that canonicalises to the colon form.
+	if _, err := Compile("t", "mac = '08:00:2b:01:02:03'", infos); err != nil {
+		t.Errorf("canonical 6-byte MAC was refused (%v); the width test above is then vacuous", err)
 	}
 }

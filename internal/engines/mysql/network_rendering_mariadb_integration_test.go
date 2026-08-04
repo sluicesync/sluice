@@ -74,6 +74,23 @@ func TestMariaDBNetworkRendering_IsAddressOnly_AndBindsToTheDeclaration(t *testi
 		// renderer ever reverts to netip.String.
 		{"v6compat", "inet6", "::1.2.3.4", "::1.2.3.4"},
 		{"v6compatHigh", "inet6", "::255.255.255.255", "::255.255.255.255"},
+
+		// A longest zero run of length ONE, which MariaDB COMPRESSES and RFC
+		// 5952 §4.2.2 forbids — so Postgres and Go's netip both leave these
+		// uncompressed and MariaDB does not. These are the rows that separate
+		// the two renderings; without them the per-engine split in
+		// ir.RenderNetworkAddr would be indistinguishable from a shared rule.
+		//
+		// This is also the shape that was live with NO --where involved:
+		// ir.Inet emits VARCHAR on a MySQL-family target, so a cold copy wrote
+		// the server's compressed spelling while a later CDC UPDATE of the same
+		// row wrote the uncompressed one, and the target held a different
+		// string depending on whether the row had ever been updated. Interior,
+		// leading and trailing are all pinned — the trailing one exercises the
+		// renderer's separate end-of-address colon.
+		{"v6single", "inet6", "2001:db8:0:1:2:3:4:5", "2001:db8::1:2:3:4:5"},
+		{"v6lead", "inet6", "0:1:2:3:4:5:6:7", "::1:2:3:4:5:6:7"},
+		{"v6trail", "inet6", "1:2:3:4:5:6:7:0", "1:2:3:4:5:6:7::"},
 	}
 
 	for _, image := range mariadbLTSImages() {
