@@ -2,6 +2,18 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+**An index the target cannot represent is now refused before any data moves, on every entry point.** sluice builds secondary indexes after the bulk copy, and every "this index cannot be represented on the target" refusal lived in the emitter for that phase — so each one was loud, zero-loss and correct, and arrived after the whole table had already been copied. On a large table that is hours of work discarded to report something knowable from the schema alone. Three refusals were affected: a MySQL partial `UNIQUE` (its ordinary path is the deferred `ADD INDEX`), a SQLite or D1 index prefix length (whose only call site is `CREATE INDEX`, with no early path at all), and a Postgres index prefix length on the deferred `ADD CONSTRAINT … UNIQUE`. **Nothing about what is refused changes — only when.** The target engine is now asked before the copy, at `migrate`, both `sync` cold-start paths, `add-table`, `restore` and chain `restore`. Two previous releases claimed the earlier timing that this actually delivers; those entries carry dated corrections.
+
+One consequence worth naming: `migrate --dry-run` against such a schema now reports the refusal instead of printing a plan. That matches every other gate in the same phase, and a plan that could never execute should not exit 0.
+
+### Internal
+
+The refusal for each engine was split so the pre-copy check and the emitter share one copy of the policy rather than two that can drift, and the advisory "predicate dropped" / "prefix dropped" warning stays at the emitter, fired once. The pre-copy check deliberately does **not** re-run the whole emitter: Postgres's index emitter takes the run's enabled-extension set, and a check fabricating an empty one would have refused a pgvector or pg_trgm index the real writer accepts — an over-refusal, which breaks migrations that work today and is the worse failure. Correctness is pinned as *agreement with the real emitter* over a per-engine shape matrix, so an over-refusal fails as loudly as an under-refusal, and the end-to-end pins assert the target table does not exist after the refusal.
+
 ## [0.110.1] - 2026-08-04
 
 Everything here comes out of a blind multi-agent audit of the v0.110.0 release, run specifically because that release's own contents were themselves audit remediation — the same author auditing their own work is exactly when an independent pass earns its cost. It found one Critical, and the recurring shape behind most of the rest was a sibling sweep that stopped at the surface a finding named rather than the class it belonged to.
