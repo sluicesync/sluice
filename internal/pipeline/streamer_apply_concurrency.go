@@ -40,12 +40,22 @@ import (
 //     resolver degrades to serial (1) rather than refusing here — the
 //     cold-start connection-budget preflight owns the loud refusal, and a
 //     warm-resume that can't spare lane slots is correct to run serial.
-//   - MySQL / PlanetScale-MySQL target (and any engine without a slot
-//     probe): N = migcore.DefaultApplyConcurrency, a fixed conservative ceiling.
-//     --max-target-connections is documented inert against engines without a
-//     connection-slot model, so there is no budget to probe; PlanetScale
-//     per-branch connection limits are generous relative to 4 lanes + 4
-//     dedicated backends across every tier.
+//
+//   - Any engine without a slot probe: N = migcore.DefaultApplyConcurrency, a
+//     fixed conservative ceiling, and --max-target-connections is inert
+//     because there is no budget to probe.
+//
+//     NOTE: this branch is currently DEAD. It named "MySQL /
+//     PlanetScale-MySQL" until 2026-08-04, and that stopped being true in
+//     v0.100.0 (9c042c10), when MySQL gained ProbeTargetConnectionBudget —
+//     compile-asserted at engines/mysql/capabilities_assert.go, and all four
+//     MySQL flavors register Engine{} values, so every shipped engine
+//     satisfies the assertion above. The stale text was load-bearing: it was
+//     copied into the perf-parity matrix as gap #10 ("MySQL apply lanes
+//     fixed-4, budget flag inert"), which told operators a flag that works
+//     does nothing, and concealed the serial-degradation path below. Keep the
+//     branch for a future engine, but do not name engines here — assert over
+//     the registry instead (the retired gap #10 note explains why).
 //
 // The resolver never RAISES an explicit operator value — `n > 1` is honored
 // verbatim (the operator owns their target's budget), mirroring how
@@ -88,9 +98,14 @@ func (s *Streamer) autoApplyConcurrency(ctx context.Context) int {
 func (s *Streamer) budgetBoundedAutoConcurrency(ctx context.Context) int {
 	prober, ok := s.Target.(ir.TargetConnectionBudgetProber)
 	if !ok {
-		// No connection-slot model (today: MySQL / PlanetScale-MySQL). The
-		// fixed conservative ceiling stands; --max-target-connections is inert
-		// here, so there is nothing to probe.
+		// No connection-slot model. The fixed conservative ceiling stands;
+		// --max-target-connections is inert here, so there is nothing to probe.
+		//
+		// DEAD for every engine shipped today — see the note on
+		// [Streamer.resolveApplyConcurrency]. This comment named MySQL and
+		// PlanetScale-MySQL until 2026-08-04, years after both gained the
+		// prober, and that stale naming is what put a nonexistent gap in the
+		// perf-parity matrix. Do not name engines here.
 		return migcore.DefaultApplyConcurrency
 	}
 
