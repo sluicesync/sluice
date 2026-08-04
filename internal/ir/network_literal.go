@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"strings"
 )
 
 // Network-literal rendering — the inet/cidr axis of the "filtered replicas
@@ -106,12 +107,27 @@ type NetworkLiteralResolver interface {
 // actually deliver, which is NOT always what Go's netip produces
 // (audit 2026-08-04 C1).
 //
-// # The divergence
+// # THE TWO SERVERS DO NOT AGREE WITH EACH OTHER
 //
-// Both servers render IPv6 through the BSD `inet_ntop6` convention, which
-// prints the trailing 32 bits as a dotted quad whenever the leading 96 bits
-// are zero and the address is not one of the short forms. Go's netip prints a
-// dotted quad ONLY for IPv4-mapped addresses (`::ffff:a.b.c.d`). So:
+// An earlier version of this doc said "both servers render IPv6 through the
+// BSD inet_ntop6 convention … and they AGREE on everything else". The second
+// half is false, and it was false when written (value-fidelity review,
+// 2026-08-04). MariaDB compresses a zero run of length ONE, which RFC 5952
+// §4.2.2 forbids and Postgres obeys. Ground-truthed on mariadb 11.4 and 10.11:
+//
+//	stored 2001:db8:0:1:2:3:4:5   MariaDB 2001:db8::1:2:3:4:5   PG (uncompressed)
+//	stored 0:1:2:3:4:5:6:7        MariaDB ::1:2:3:4:5:6:7       PG (uncompressed)
+//
+// So the rendering is chosen per [NetworkLiteralRendering], not once for all
+// engines: the two Postgres arms use the RFC's minimum run of 2, and the
+// MariaDB arm uses 1. Sharing one rule is what made the claim above look
+// plausible.
+//
+// # The dotted-quad divergence, which BOTH servers share
+//
+// Both render the trailing 32 bits as a dotted quad whenever the leading 96
+// bits are zero and the address is not one of the short forms. Go's netip
+// prints a dotted quad ONLY for IPv4-mapped addresses (`::ffff:a.b.c.d`). So:
 //
 //	::1.2.3.4          server ::1.2.3.4          netip ::102:304
 //	::10.0.0.1         server ::10.0.0.1         netip ::a00:1
@@ -140,26 +156,89 @@ type NetworkLiteralResolver interface {
 // because a run of length 7 covers word 6 and the loop skips it. That leaves
 // exactly one shape netip gets differently: leading 96 bits zero, word 6
 // non-zero.
-func RenderNetworkAddr(a netip.Addr) string {
+// A zone-scoped address (`fe80::1%eth0`) is returned unchanged. Neither server
+// accepts one — PG raises "invalid input syntax for type inet", MariaDB errno
+// 1292 — so no stored value can carry a zone, and the CALLER refuses such a
+// literal rather than silently dropping the zone here (which the dotted-quad
+// branch would otherwise do).
+func RenderNetworkAddr(a netip.Addr, rendering NetworkLiteralRendering) string {
+	if a.Zone() != "" {
+		return a.String()
+	}
 	if !a.Is6() || a.Is4In6() {
-		// IPv4, and IPv4-mapped v6, already agree.
+		// IPv4, and IPv4-mapped v6, already agree everywhere.
 		return a.String()
 	}
 	b := a.As16()
+
+	leading96Zero := true
 	for i := range 12 {
 		if b[i] != 0 {
-			return a.String()
+			leading96Zero = false
+			break
 		}
 	}
-	if b[12] == 0 && b[13] == 0 {
-		// Word 6 is zero, so the zero run swallows it and the server prints
-		// the short form too — `::`, `::1`, `::2` and friends.
-		return a.String()
+	// The dotted-quad form, shared by both servers: leading 96 bits zero and
+	// word 6 non-zero (if word 6 were zero the run would swallow it and the
+	// server prints `::`, `::1`, `::2` instead).
+	if leading96Zero && (b[12] != 0 || b[13] != 0) {
+		return fmt.Sprintf("::%d.%d.%d.%d", b[12], b[13], b[14], b[15])
 	}
-	return fmt.Sprintf("::%d.%d.%d.%d", b[12], b[13], b[14], b[15])
+
+	if rendering == NetworkLiteralRenderingAddressOnly {
+		// MariaDB: minimum zero-run of ONE. netip obeys RFC 5952's minimum of
+		// two, so it leaves `2001:db8:0:1:2:3:4:5` uncompressed where MariaDB
+		// sends `2001:db8::1:2:3:4:5`.
+		return compressIPv6MinRunOne(b)
+	}
+	// Postgres: RFC-conformant, which is what netip already produces.
+	return a.String()
+}
+
+// compressIPv6MinRunOne renders the 16 bytes with MariaDB's zero-run
+// compression: longest run wins, leftmost on a tie, and a run of ONE is
+// compressed.
+func compressIPv6MinRunOne(b [16]byte) string {
+	var w [8]uint16
+	for i := range w {
+		w[i] = uint16(b[2*i])<<8 | uint16(b[2*i+1])
+	}
+	bestBase, bestLen, curBase, curLen := -1, 0, -1, 0
+	for i, v := range w {
+		if v == 0 {
+			if curBase == -1 {
+				curBase, curLen = i, 1
+			} else {
+				curLen++
+			}
+			if curLen > bestLen {
+				bestBase, bestLen = curBase, curLen
+			}
+			continue
+		}
+		curBase, curLen = -1, 0
+	}
+
+	var sb strings.Builder
+	for i := range 8 {
+		if bestBase != -1 && i >= bestBase && i < bestBase+bestLen {
+			if i == bestBase {
+				sb.WriteByte(':')
+			}
+			continue
+		}
+		if i != 0 {
+			sb.WriteByte(':')
+		}
+		sb.WriteString(strconv.FormatUint(uint64(w[i]), 16))
+	}
+	if bestBase != -1 && bestBase+bestLen == 8 {
+		sb.WriteByte(':')
+	}
+	return sb.String()
 }
 
 // RenderNetworkPrefix is [RenderNetworkAddr] for a masked value.
-func RenderNetworkPrefix(p netip.Prefix) string {
-	return RenderNetworkAddr(p.Addr()) + "/" + strconv.Itoa(p.Bits())
+func RenderNetworkPrefix(p netip.Prefix, rendering NetworkLiteralRendering) string {
+	return RenderNetworkAddr(p.Addr(), rendering) + "/" + strconv.Itoa(p.Bits())
 }

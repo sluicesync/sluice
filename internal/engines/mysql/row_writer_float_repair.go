@@ -68,13 +68,11 @@ func (e *mysqlFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, 
 		return aerr
 	}
 
-	// Placeholder ceiling, computed rather than assumed. MySQL's protocol
-	// caps a prepared statement at 65535 placeholders (a 16-bit count, same
-	// shape as Postgres's bind limit), and this statement binds
-	// len(batch) x (pk + set). At the shared floatRepairBatchRows of 500 that
-	// overflows at 132 combined columns. Split rather than fail mid-repair.
-	cols := len(pkColumns) + len(setColumns)
-	perStmt := clampRowsToPlaceholderLimit(len(batch), cols)
+	// Placeholder ceiling: handled ONE LAYER UP — see the postgres sibling for
+	// the full note. floatrepair.RepairByPK already sizes every batch by
+	// 60000 / (pk + set) before calling ExecBatch, and it is the only caller,
+	// so a clamp here could never fire.
+	perStmt := len(batch)
 
 	for start := 0; start < len(batch); start += perStmt {
 		end := min(start+perStmt, len(batch))
@@ -97,22 +95,6 @@ func (e *mysqlFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, 
 		}
 	}
 	return nil
-}
-
-// clampRowsToPlaceholderLimit reduces a per-statement row count so that
-// rows x cols stays within MySQL's 65535-placeholder protocol ceiling.
-// Returns at least 1: a single row wider than the ceiling cannot be bound at
-// all and is left to fail loudly against the server rather than be silently
-// dropped here. Mirrors Postgres's clampRowsToBindLimit.
-func clampRowsToPlaceholderLimit(rows, cols int) int {
-	const maxPlaceholdersPerStmt = 65535
-	if cols <= 0 || rows*cols <= maxPlaceholdersPerStmt {
-		return rows
-	}
-	if n := maxPlaceholdersPerStmt / cols; n > 0 {
-		return n
-	}
-	return 1
 }
 
 // buildFloatRepairBatchSQL renders the batched UPDATE-against-a-UNION-join

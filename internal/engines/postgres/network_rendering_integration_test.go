@@ -145,6 +145,8 @@ func TestNetworkRendering_BothLegsAgree_AndMatchTheDeclaredRendering(t *testing.
 			{Name: "c4_host", Type: ir.Cidr{}},
 			{Name: "c4_net", Type: ir.Cidr{}},
 			{Name: "c6_net", Type: ir.Cidr{}},
+			{Name: "v6_compat", Type: ir.Inet{}},
+			{Name: "v6_high", Type: ir.Inet{}},
 		},
 	}
 	snapRows := drainAllRows(t, ctx, rr, tbl)
@@ -173,7 +175,8 @@ func TestNetworkRendering_BothLegsAgree_AndMatchTheDeclaredRendering(t *testing.
 		INSERT INTO nets VALUES (
 			2, '10.0.0.1', '2001:db8::1', '10.0.0.0/24', '2001:db8::/32',
 			'10.0.0.1/32',
-			'10.0.0.0/24', '2001:db8::/32'
+			'10.0.0.0/24', '2001:db8::/32',
+			'::1.2.3.4', '::255.255.255.255'
 		);
 	`)
 

@@ -231,7 +231,30 @@ func mariadbInet6Text(ip []byte) string {
 			curBase, curLen = -1, 0
 		}
 	}
-	if bestLen < 2 {
+	// MariaDB compresses a run of ONE zero hextet. RFC 5952 §4.2.2 forbids
+	// that, and both Postgres and Go's netip obey the RFC — but this function
+	// exists to reproduce what MariaDB actually sends, not what the RFC says.
+	//
+	// The `if bestLen < 2` guard that used to sit here made this renderer
+	// RFC-correct and therefore WRONG against the server (value-fidelity
+	// review, 2026-08-04). Ground truth, mariadb:11.4 and 10.11:
+	//
+	//	stored 2001:db8:0:1:2:3:4:5  ->  2001:db8::1:2:3:4:5
+	//	stored 0:1:2:3:4:5:6:7       ->  ::1:2:3:4:5:6:7
+	//	stored 1:2:3:4:5:6:7:0       ->  1:2:3:4:5:6:7::
+	//
+	// The consequence of the old behaviour was a two-leg divergence with no
+	// --where involved: ir.Inet emits VARCHAR on a MySQL-family target, so a
+	// cold copy wrote the server's compressed spelling while a later CDC
+	// UPDATE of the same row wrote this function's uncompressed one. The
+	// target then held a different string depending on whether the row had
+	// ever been updated — exit 0, sync status green.
+	//
+	// The prior doc claimed this was "verified byte-exact across the family ×
+	// shape matrix"; that matrix contained no address whose longest zero run
+	// was 1, so it could not have detected this. See the v6single/v6lead rows
+	// added alongside this fix.
+	if bestLen < 1 {
 		bestBase, bestLen = -1, 0
 	}
 

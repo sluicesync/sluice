@@ -1,40 +1,27 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Every Postgres BULK-WRITE lane must participate in the grow gate — and this
-// discovers the lanes instead of being told them (audit 2026-08-04).
+// Every MySQL BULK-WRITE lane must participate in the grow gate — the SIBLING
+// of the Postgres roster (perf-parity review, 2026-08-04).
 //
-// The gate this replaces, TestGrowGate_ReachesEveryWriteCore, constructed a
-// bare &RowWriter{}, called SetGrowGate, then called awaitGrowGate and
-// tripGrowGate DIRECTLY and asserted they worked. It never invoked a write
-// core. The audit mutation-proved the consequence: reverting all three
-// grow-gate wirings left both engine suites green. A gate named for "every
-// write core" measured neither the cores nor construction — and its existence
-// is what stopped anyone looking, while two of the six lanes were ungated,
-// including one on the very receiver that stores the gate.
+// The commit that wired the last two ungated lanes fixed them on BOTH engines
+// and then gated only ONE. Its own message says "the float-repair core, AND
+// ITS MYSQL TWIN", so the cross-engine nature was understood at the time; the
+// gate simply was not carried across. That is the exact shape CLAUDE.md warns
+// about — a fix made for the class, guarded for the instance — reproduced in
+// the very change that closed two instances of it.
 //
-// # How a lane is identified, and why not by name
+// MySQL had no ungated lane at the time this was written; the gap was in the
+// GUARD, not the code. A new MySQL bulk-write lane could have been added
+// ungated and nothing would have failed. The pre-existing MySQL grow-gate
+// tests are behavioural and drive WriteRows on the batched-insert path only,
+// so they reach neither writeLoadData nor the float-repair core.
 //
-// A bulk-write lane is one that accepts ROWS IN BULK: a `<-chan ir.Row`, a
-// `[]ir.Row`, or an `io.Reader` of raw COPY bytes. That is a structural
-// property of the signature, so a new lane is discovered whether or not it is
-// called writeViaSomething — which matters, because the two lanes that were
-// missed are named ImportRawCopy and ExecBatch and would not have matched any
-// naming convention.
-//
-// Deliberately NOT "executes SQL": that catches every reader, probe, DDL
-// helper and catalog query in the package (~90 methods), which would need an
-// exemption list larger than the thing it guards. Scope stated here rather
-// than left implied.
-//
-// A lane satisfies the rule by reaching the gate itself OR by delegating to
-// another lane that does — dispatchers are legitimate.
-//
-// LIMIT, stated: this proves the lane MENTIONS the gate, not that it calls it
-// on every branch at runtime. The integration suites cover the runtime half
-// for the chunked-COPY core.
+// Lane identification, exemption semantics and the stated limits are
+// identical to the Postgres roster; see internal/engines/postgres/
+// grow_gate_roster_test.go for the full rationale.
 
-package postgres
+package mysql
 
 import (
 	"go/ast"
@@ -47,9 +34,9 @@ import (
 	"testing"
 )
 
-// growGateExempt lists bulk-write lanes that legitimately never touch the
+// mysqlGrowGateExempt lists bulk-write lanes that legitimately never touch the
 // gate, each with the reason. An entry is a claim someone can check.
-var growGateExempt = map[string]string{
+var mysqlGrowGateExempt = map[string]string{
 	// Delegates through floatrepair.RepairByPK to pgFloatBatchExecer.ExecBatch,
 	// which carries the gate. The delegation is invisible to the body scan
 	// because the callee is named only as a struct literal, so it is recorded
@@ -57,16 +44,20 @@ var growGateExempt = map[string]string{
 	"UpdateFloatColumnsByPK": "dispatcher; the gate lives in pgFloatBatchExecer.ExecBatch, reached via floatrepair.RepairByPK",
 }
 
-// gateCalls are the ways a lane can reach the gate.
-var gateCalls = []string{"awaitGrowGate", "tripGrowGate", "quiesceAndReportTransient", "copyChunkWithRetry"}
+// mysqlGateCalls are the ways a lane can reach the gate.
+// MySQL reaches the gate through flushWithReparentRetry (its Await+Trip+
+// replay helper, the analogue of Postgres copyChunkWithRetry) as well as
+// directly. Deriving this list from the POSTGRES one without checking is how
+// the first run of this gate flagged seven lanes that are in fact covered.
+var mysqlGateCalls = []string{"awaitGrowGate", "tripGrowGate", "flushWithReparentRetry"}
 
-func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
-	lanes, bodies := discoverBulkWriteLanes(t)
+func TestEveryMySQLBulkWriteLaneReachesTheGrowGate(t *testing.T) {
+	lanes, bodies := discoverMySQLBulkWriteLanes(t)
 
 	// Anti-vacuity: a walk that stops finding lanes passes on nothing, which
 	// is precisely how the gate this replaces failed.
 	if len(lanes) < 5 {
-		t.Fatalf("found only %d bulk-write lanes in package postgres (%v); the signature walk is not "+
+		t.Fatalf("found only %d bulk-write lanes in package mysql (%v); the signature walk is not "+
 			"reaching the tree and this roster would pass on an empty set", len(lanes), lanes)
 	}
 
@@ -84,7 +75,7 @@ func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
 	// replaces went bad.)
 	ok := map[string]bool{}
 	for _, name := range lanes {
-		for _, g := range gateCalls {
+		for _, g := range mysqlGateCalls {
 			if bodies[name][g] {
 				ok[name] = true
 				break
@@ -97,16 +88,9 @@ func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
 			if ok[name] {
 				continue
 			}
-			// DELEGATION COUNTS ONLY FOR A PURE DISPATCHER. A lane that
-			// executes SQL itself must reach the gate itself — crediting it
-			// for a fallback branch that delegates would pass a lane whose
-			// PRIMARY path is ungated.
-			//
-			// Found by mutation on the MySQL sibling: un-gating writeLoadData
-			// did not fail the roster, because it falls back to writeBatched
-			// on two branches (geometry present, local_infile off) and the
-			// fixed point credited the whole lane for it.
-			if executesSQL(bodies[name]) {
+			// Delegation counts only for a pure dispatcher — see the Postgres
+			// roster for the mutation that produced this rule.
+			if executesMySQLSQL(bodies[name]) {
 				continue
 			}
 			for _, other := range lanes {
@@ -125,7 +109,7 @@ func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
 		if satisfied(name) {
 			continue
 		}
-		if _, ok := growGateExempt[name]; ok {
+		if _, ok := mysqlGrowGateExempt[name]; ok {
 			continue
 		}
 		missing = append(missing, name)
@@ -137,11 +121,11 @@ func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
 			"wait nor signal keeps writing into a grow window that every other lane is backing off from — "+
 			"which makes it STRICTLY LESS resilient than the lane it replaces, not merely unoptimised.\n\n"+
 			"Call awaitGrowGate before the write and quiesceAndReportTransient (or tripGrowGate) on its "+
-			"error, or add the lane to growGateExempt with the reason it cannot participate.", missing)
+			"error, or add the lane to mysqlGrowGateExempt with the reason it cannot participate.", missing)
 	}
 
 	// The other direction: an exemption that is stale lies about the debt.
-	for name, why := range growGateExempt {
+	for name, why := range mysqlGrowGateExempt {
 		if strings.TrimSpace(why) == "" {
 			t.Errorf("exemption %q carries no reason; an unexplained exemption is indistinguishable from "+
 				"an oversight", name)
@@ -154,17 +138,17 @@ func TestEveryPostgresBulkWriteLaneReachesTheGrowGate(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("growGateExempt lists %q, which is no longer a bulk-write lane — remove it", name)
+			t.Errorf("mysqlGrowGateExempt lists %q, which is no longer a bulk-write lane — remove it", name)
 		} else if satisfied(name) {
-			t.Errorf("growGateExempt lists %q, but it now reaches the gate — remove the exemption so the "+
+			t.Errorf("mysqlGrowGateExempt lists %q, but it now reaches the gate — remove the exemption so the "+
 				"lane stays gated", name)
 		}
 	}
 }
 
-// discoverBulkWriteLanes returns every method whose signature accepts rows in
+// discoverMySQLBulkWriteLanes returns every method whose signature accepts rows in
 // bulk, plus its rendered body for call-site matching.
-func discoverBulkWriteLanes(t *testing.T) (names []string, bodies map[string]map[string]bool) {
+func discoverMySQLBulkWriteLanes(t *testing.T) (names []string, bodies map[string]map[string]bool) {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -186,7 +170,7 @@ func discoverBulkWriteLanes(t *testing.T) (names []string, bodies map[string]map
 			if !ok || fn.Recv == nil || fn.Body == nil || fn.Type.Params == nil {
 				continue
 			}
-			if !acceptsRowsInBulk(fset, fn.Type.Params) {
+			if !acceptsMySQLRowsInBulk(fset, fn.Type.Params) {
 				continue
 			}
 			calls := map[string]bool{}
@@ -211,9 +195,9 @@ func discoverBulkWriteLanes(t *testing.T) (names []string, bodies map[string]map
 	return names, bodies
 }
 
-// acceptsRowsInBulk reports whether a parameter list carries rows in bulk:
+// acceptsMySQLRowsInBulk reports whether a parameter list carries rows in bulk:
 // a channel of ir.Row, a slice of ir.Row, or an io.Reader (raw COPY bytes).
-func acceptsRowsInBulk(fset *token.FileSet, params *ast.FieldList) bool {
+func acceptsMySQLRowsInBulk(fset *token.FileSet, params *ast.FieldList) bool {
 	for _, p := range params.List {
 		var b strings.Builder
 		_ = printer.Fprint(&b, fset, p.Type)
@@ -227,10 +211,10 @@ func acceptsRowsInBulk(fset *token.FileSet, params *ast.FieldList) bool {
 	return false
 }
 
-// executesSQL reports whether a lane runs a statement itself, as opposed to
-// only dispatching to another lane.
-func executesSQL(calls map[string]bool) bool {
-	for _, c := range []string{"ExecContext", "CopyFrom", "QueryContext", "QueryRowContext"} {
+// executesMySQLSQL reports whether a lane runs a statement itself, as opposed
+// to only dispatching to another lane.
+func executesMySQLSQL(calls map[string]bool) bool {
+	for _, c := range []string{"ExecContext", "QueryContext", "QueryRowContext"} {
 		if calls[c] {
 			return true
 		}

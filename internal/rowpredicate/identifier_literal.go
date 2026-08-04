@@ -126,19 +126,19 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 					// canonical spelling drops it. A narrower mask IS
 					// delivered and stays.
 					if fullWidth {
-						return ir.RenderNetworkAddr(p.Addr()), true
+						return ir.RenderNetworkAddr(p.Addr(), network), true
 					}
-					return ir.RenderNetworkPrefix(p), true
+					return ir.RenderNetworkPrefix(p, network), true
 				case ir.NetworkLiteralRenderingAlwaysMasked:
 					// PG `cidr`: the mask is always delivered, at every width.
-					return ir.RenderNetworkPrefix(p), true
+					return ir.RenderNetworkPrefix(p, network), true
 				case ir.NetworkLiteralRenderingAddressOnly:
 					// MariaDB inet4/inet6 hold an address, never a network. A
 					// full-width mask reduces to the address; anything
 					// narrower names a network no stored value can equal, so
 					// it is refused rather than silently widened.
 					if fullWidth {
-						return ir.RenderNetworkAddr(p.Addr()), true
+						return ir.RenderNetworkAddr(p.Addr(), network), true
 					}
 					return "", false
 				}
@@ -147,12 +147,12 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 			if a, err := netip.ParseAddr(cand); err == nil {
 				switch network {
 				case ir.NetworkLiteralRenderingHostBare, ir.NetworkLiteralRenderingAddressOnly:
-					return ir.RenderNetworkAddr(a), true
+					return ir.RenderNetworkAddr(a, network), true
 				case ir.NetworkLiteralRenderingAlwaysMasked:
 					// The delivered value always carries a prefix length, so
 					// the canonical spelling of a bare address is its
 					// full-width prefix — "10.0.0.1" → "10.0.0.1/32".
-					return ir.RenderNetworkPrefix(netip.PrefixFrom(a, a.BitLen())), true
+					return ir.RenderNetworkPrefix(netip.PrefixFrom(a, a.BitLen()), network), true
 				}
 				return "", false
 			}

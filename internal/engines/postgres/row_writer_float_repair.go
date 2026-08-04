@@ -60,14 +60,22 @@ func (e *pgFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, pkC
 	colTypes := colTypesByName(table.Columns)
 	opts := emitOpts{HasPostGIS: e.w.hasPostGIS, TargetSchema: e.w.schema}
 
-	// BIND CEILING, computed rather than asserted (audit 2026-08-04).
-	// floatRepairBatchRows's doc claimed headroom under Postgres's 65535-
-	// parameter limit and never did the arithmetic. The statement binds
-	// len(batch) x (pk + set) parameters, so at 500 rows it overflows at 132
-	// combined columns — reachable on a wide table, and the failure is a hard
-	// server error mid-repair. Split instead.
-	cols := len(pkColumns) + len(setColumns)
-	perStmt := clampRowsToBindLimit(len(batch), cols)
+	// BIND CEILING: already handled ONE LAYER UP, and this comment exists so
+	// nobody re-adds it here (perf-parity review, 2026-08-04).
+	//
+	// A first pass at this file added a per-engine clamp on the premise that
+	// floatRepairBatchRows asserted headroom without doing the arithmetic.
+	// The arithmetic is real — 500 rows x 132 combined columns would exceed
+	// Postgres's 65535 — but the clamp was already there:
+	// floatrepair.RepairByPK sizes every batch by
+	// maxBindParamsPerBatch (60000) / (pk + set) before calling ExecBatch, and
+	// RepairByPK is the ONLY caller of this method. So the added clamp could
+	// never fire, and the commit message describing it was wrong.
+	//
+	// Removed rather than kept as belt-and-braces: dead code with a false
+	// rationale is worse than no code, because the next reader takes the
+	// rationale at face value.
+	perStmt := len(batch)
 
 	// ADR-0110 / audit 2026-08-04: this is a cold-copy write core and was the
 	// one the Q1/Q3 sweep missed — on BOTH engines. It is reached from the
