@@ -58,9 +58,22 @@ func TestMariaDBNetworkRendering_IsAddressOnly_AndBindsToTheDeclaration(t *testi
 		{"v4zero", "inet4", "0.0.0.0", "0.0.0.0"},
 		{"v6zero", "inet6", "::", "::"},
 		{"v6trunc", "inet6", "2001:db8::", "2001:db8::"},
-		// IPv4-compatible v6, where MariaDB's BSD inet_ntop6 and Go's netip
-		// disagree — so this also guards the renderer choice.
+		// IPv4-MAPPED. netip and MariaDB agree on this one, so it does NOT
+		// guard the renderer choice — it is kept as the control that proves
+		// the agreeing case still works.
+		//
+		// The comment here used to claim this was "IPv4-compatible v6, where
+		// MariaDB's BSD inet_ntop6 and Go's netip disagree". It is not: the
+		// case is even named `v6mapped`. That mislabel is why this pin was
+		// green while the divergence it named was live (audit 2026-08-04 C1).
 		{"v6mapped", "inet6", "::ffff:10.0.0.1", "::ffff:10.0.0.1"},
+
+		// IPv4-COMPATIBLE, which is the shape that actually diverges: MariaDB
+		// renders the trailing 32 bits as a dotted quad, Go's netip renders
+		// hex groups (`::102:304`). These are the rows that fail if the
+		// renderer ever reverts to netip.String.
+		{"v6compat", "inet6", "::1.2.3.4", "::1.2.3.4"},
+		{"v6compatHigh", "inet6", "::255.255.255.255", "::255.255.255.255"},
 	}
 
 	for _, image := range mariadbLTSImages() {

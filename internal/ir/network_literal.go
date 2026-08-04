@@ -1,5 +1,11 @@
 package ir
 
+import (
+	"fmt"
+	"net/netip"
+	"strconv"
+)
+
 // Network-literal rendering — the inet/cidr axis of the "filtered replicas
 // follow the source engine's comparison semantics" contract.
 //
@@ -94,4 +100,66 @@ const (
 // rendering is silently wrong for at least one of the others.
 type NetworkLiteralResolver interface {
 	ResolveNetworkLiteralRendering(isCidr bool) NetworkLiteralRendering
+}
+
+// RenderNetworkAddr renders a in the textual form Postgres and MariaDB
+// actually deliver, which is NOT always what Go's netip produces
+// (audit 2026-08-04 C1).
+//
+// # The divergence
+//
+// Both servers render IPv6 through the BSD `inet_ntop6` convention, which
+// prints the trailing 32 bits as a dotted quad whenever the leading 96 bits
+// are zero and the address is not one of the short forms. Go's netip prints a
+// dotted quad ONLY for IPv4-mapped addresses (`::ffff:a.b.c.d`). So:
+//
+//	::1.2.3.4          server ::1.2.3.4          netip ::102:304
+//	::10.0.0.1         server ::10.0.0.1         netip ::a00:1
+//	::255.255.255.255  server ::255.255.255.255  netip ::ffff:ffff
+//	::1:0              server ::0.1.0.0          netip ::1:0
+//
+// and they AGREE on everything else, including `::`, `::1`, `::2`,
+// `::ffff:10.0.0.1` and every ordinary global address.
+//
+// # Why this matters, and why it is not cosmetic
+//
+// The `--where` gate compares an operator's literal against the spelling the
+// change stream delivers, byte-exactly. Rendering the literal with netip meant
+// a predicate on a diverging address compiled clean and then matched NOTHING —
+// every CDC change to a matching row silently dropped, at exit 0. The gate was
+// asking "is this canonical as a Go value?" when the only question that matters
+// is "is this what the server will send?".
+//
+// # The rule
+//
+// Derived from `inet_ntop6`'s longest-zero-run logic and then checked against
+// the enumerated shapes above. The C code's dotted branch fires when the best
+// zero run starts at word 0 and either has length 6, or has length 5 with
+// word 5 == 0xffff (the IPv4-mapped case netip already handles). Its third
+// documented clause — length 7 with a non-1 final word — is unreachable,
+// because a run of length 7 covers word 6 and the loop skips it. That leaves
+// exactly one shape netip gets differently: leading 96 bits zero, word 6
+// non-zero.
+func RenderNetworkAddr(a netip.Addr) string {
+	if !a.Is6() || a.Is4In6() {
+		// IPv4, and IPv4-mapped v6, already agree.
+		return a.String()
+	}
+	b := a.As16()
+	for i := range 12 {
+		if b[i] != 0 {
+			return a.String()
+		}
+	}
+	if b[12] == 0 && b[13] == 0 {
+		// Word 6 is zero, so the zero run swallows it and the server prints
+		// the short form too — `::`, `::1`, `::2` and friends.
+		return a.String()
+	}
+	return fmt.Sprintf("::%d.%d.%d.%d", b[12], b[13], b[14], b[15])
+}
+
+// RenderNetworkPrefix is [RenderNetworkAddr] for a masked value.
+func RenderNetworkPrefix(p netip.Prefix) string {
+	return RenderNetworkAddr(p.Addr()) + "/" + strconv.Itoa(p.Bits())
 }

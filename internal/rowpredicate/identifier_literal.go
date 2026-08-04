@@ -87,15 +87,26 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 		return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], true
 
 	case identifierNetwork:
-		// netip is the canonicaliser for both renderings — but WHICH form is
-		// canonical is the engine's call, not netip's (audit 2026-08-01 S2).
-		// Postgres delivers every inet/cidr value through pgx's InetCodec,
-		// which always yields a netip.Prefix, so a host address arrives as
-		// "10.0.0.1/32"; MariaDB's native inet4/inet6 arrive bare. Rendering
-		// the literal under the wrong one is SILENT — it simply never equals
-		// the delivered value, so every row scores out-of-scope. An engine
-		// that has not named its rendering is refused by the caller before
-		// reaching here.
+		// netip PARSES; it does not get to decide the spelling. WHICH form is
+		// canonical is the engine's call (audit 2026-08-01 S2), and so is how
+		// the address itself is rendered (audit 2026-08-04 C1) — both servers
+		// use the BSD inet_ntop6 dotted-quad convention that netip applies
+		// only to IPv4-mapped addresses, so `::1.2.3.4` is delivered as
+		// `::1.2.3.4` and netip would have written `::102:304`. Every
+		// rendering below therefore goes through [ir.RenderNetworkAddr] /
+		// [ir.RenderNetworkPrefix] rather than netip's String.
+		//
+		// Getting either axis wrong is SILENT: the literal simply never equals
+		// the delivered value, so every row scores out-of-scope and every CDC
+		// change to a matching row is dropped at exit 0. An engine that has
+		// not named its rendering is refused by the caller before reaching
+		// here.
+		//
+		// The earlier version of this comment asserted that PG delivers
+		// through pgx's InetCodec as a netip.Prefix. That is real code on a
+		// path this program does not take — sluice reads through database/sql
+		// — and it is what legitimised netip as the canonicaliser in the first
+		// place. See [ir.NetworkLiteralRendering] for the live ground truth.
 		//
 		// netip deliberately REJECTS zero-padded octets ("010.0.0.1") because
 		// they are ambiguous with octal in C-family resolvers. Postgres accepts
@@ -115,19 +126,19 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 					// canonical spelling drops it. A narrower mask IS
 					// delivered and stays.
 					if fullWidth {
-						return p.Addr().String(), true
+						return ir.RenderNetworkAddr(p.Addr()), true
 					}
-					return p.String(), true
+					return ir.RenderNetworkPrefix(p), true
 				case ir.NetworkLiteralRenderingAlwaysMasked:
 					// PG `cidr`: the mask is always delivered, at every width.
-					return p.String(), true
+					return ir.RenderNetworkPrefix(p), true
 				case ir.NetworkLiteralRenderingAddressOnly:
 					// MariaDB inet4/inet6 hold an address, never a network. A
 					// full-width mask reduces to the address; anything
 					// narrower names a network no stored value can equal, so
 					// it is refused rather than silently widened.
 					if fullWidth {
-						return p.Addr().String(), true
+						return ir.RenderNetworkAddr(p.Addr()), true
 					}
 					return "", false
 				}
@@ -136,12 +147,12 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 			if a, err := netip.ParseAddr(cand); err == nil {
 				switch network {
 				case ir.NetworkLiteralRenderingHostBare, ir.NetworkLiteralRenderingAddressOnly:
-					return a.String(), true
+					return ir.RenderNetworkAddr(a), true
 				case ir.NetworkLiteralRenderingAlwaysMasked:
 					// The delivered value always carries a prefix length, so
 					// the canonical spelling of a bare address is its
 					// full-width prefix — "10.0.0.1" → "10.0.0.1/32".
-					return netip.PrefixFrom(a, a.BitLen()).String(), true
+					return ir.RenderNetworkPrefix(netip.PrefixFrom(a, a.BitLen())), true
 				}
 				return "", false
 			}

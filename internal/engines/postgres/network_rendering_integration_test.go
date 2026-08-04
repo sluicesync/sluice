@@ -79,7 +79,9 @@ func TestNetworkRendering_BothLegsAgree_AndMatchTheDeclaredRendering(t *testing.
 			v6_net    inet,
 			c4_host   cidr,
 			c4_net    cidr,
-			c6_net    cidr
+			c6_net    cidr,
+			v6_compat inet,
+			v6_high   inet
 		);
 		ALTER TABLE nets REPLICA IDENTITY FULL;
 	`)
@@ -98,12 +100,21 @@ func TestNetworkRendering_BothLegsAgree_AndMatchTheDeclaredRendering(t *testing.
 		{col: "c4_host", stored: "10.0.0.1/32", wantDelivered: "10.0.0.1/32"},
 		{col: "c4_net", stored: "10.0.0.0/24", wantDelivered: "10.0.0.0/24"},
 		{col: "c6_net", stored: "2001:db8::/32", wantDelivered: "2001:db8::/32"},
+		// IPv4-COMPATIBLE v6: PG renders the trailing 32 bits as a dotted
+		// quad (BSD inet_ntop6); Go's netip renders hex groups, so a literal
+		// canonicalised through netip.String would be `::102:304` and could
+		// never equal this (audit 2026-08-04 C1). Every other v6 row above
+		// uses a 2001:db8:: shape, where the two agree -- which is why they
+		// were all green while the divergence was live.
+		{col: "v6_compat", stored: "::1.2.3.4", wantDelivered: "::1.2.3.4"},
+		{col: "v6_high", stored: "::255.255.255.255", wantDelivered: "::255.255.255.255"},
 	}
 
 	applyPGSQL(t, dsn, `
 		INSERT INTO nets VALUES (
 			1, '10.0.0.1', '2001:db8::1', '10.0.0.0/24', '2001:db8::/32',
-			'10.0.0.1/32', '10.0.0.0/24', '2001:db8::/32'
+			'10.0.0.1/32', '10.0.0.0/24', '2001:db8::/32',
+			'::1.2.3.4', '::255.255.255.255'
 		);
 	`)
 
