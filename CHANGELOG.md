@@ -2,7 +2,7 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — drafted for 0.110.1, NOT yet cut
+## [0.110.1] - 2026-08-04
 
 Everything here comes out of a blind multi-agent audit of the v0.110.0 release, run specifically because that release's own contents were themselves audit remediation — the same author auditing their own work is exactly when an independent pass earns its cost. It found one Critical, and the recurring shape behind most of the rest was a sibling sweep that stopped at the surface a finding named rather than the class it belonged to.
 
