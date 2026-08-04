@@ -1472,6 +1472,13 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	// Phase 2 (CreateIndexes) skips this same index via the same
 	// [inlineAutoIncrementIndex] detector.
 	if hasInlineIdx {
+		// Audit 2026-08-01 S8: this site picks an index out of table.Indexes
+		// (inlineAutoIncrementIndex) and renders its column list directly, so
+		// it never reaches emitAddIndexClause's check. A source partial UNIQUE
+		// index on the auto-increment column lands here.
+		if err := checkIndexPredicate(inlineIdx, "mysql: table "+table.Name+" (inline auto-increment key)"); err != nil {
+			return "", err
+		}
 		sb.WriteString("  ")
 		if inlineIdx.Unique {
 			sb.WriteString("UNIQUE KEY ")
@@ -1492,6 +1499,13 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	// has a key present on the target while rows land. Phase 2
 	// (CreateIndexes) skips this same index via [inlineUniqueKeyForCopy].
 	if hasCopyUniqueIdx {
+		// Same as the inline auto-increment site above: pickNonNullUniqueIndex
+		// selects from table.Indexes with no predicate filter, and this renders
+		// the column list directly (audit 2026-08-01 S8). A partial unique
+		// index promoted as the PK-less table's copy key would arrive widened.
+		if err := checkIndexPredicate(copyUniqueIdx, "mysql: table "+table.Name+" (inline copy unique key)"); err != nil {
+			return "", err
+		}
 		sb.WriteString("  UNIQUE KEY ")
 		sb.WriteString(quoteIdent(copyUniqueIdx.Name))
 		sb.WriteByte(' ')
@@ -1554,6 +1568,73 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 // loudly on the target rather than be silently rewritten.
 func emitIndexColumnList(cols []ir.IndexColumn) string {
 	return emitIndexColumnListWithPrefix(cols, true)
+}
+
+// checkIndexPredicate decides what happens to a PARTIAL index's WHERE clause
+// when the target is MySQL, which has no partial-index feature at all
+// (audit 2026-08-01 S8, the second half).
+//
+// This is the mirror image of Postgres's [checkIndexPrefixLength], and the
+// reasoning is the same shape run the other way. There, a MySQL prefix length
+// had no PG equivalent and dropping it WIDENED what a unique key admits. Here,
+// a Postgres or SQLite `WHERE` has no MySQL equivalent and dropping it
+// NARROWS what a unique key admits — but the direction of the resulting damage
+// is what matters, and it is the reverse:
+//
+//   - On a key that ENFORCES UNIQUENESS the predicate is part of the
+//     constraint. `CREATE UNIQUE INDEX ... ON t (email) WHERE deleted_at IS
+//     NULL` forbids two LIVE rows with the same email while permitting any
+//     number of soft-deleted ones. A MySQL `UNIQUE KEY (email)` forbids the
+//     duplicates too. So the target is STRICTER than the source, and rows the
+//     source holds legally cannot be written. That is refused here.
+//   - On a NON-UNIQUE index the predicate is a size/performance choice: the
+//     full index covers a superset of the rows and every query still gets a
+//     correct answer. Dropped with a WARN.
+//
+// # Why refuse at translation rather than let the copy fail
+//
+// The audit classified this half as LOUD rather than silent, and it is: the
+// widened UNIQUE rejects the offending row with a duplicate-key error. But it
+// rejects it MID-COPY, potentially hours in, on a target whose schema is
+// already wrong — and only if the data happens to contain a collision today.
+// A soft-delete table with no current duplicate would migrate clean and then
+// reject the operator's first ordinary write, long after the migration was
+// declared successful. Refusing up front turns both cases into one actionable
+// message before any data moves.
+//
+// The refusal names the rewrite because there IS one on MySQL 8: a generated
+// column that collapses to NULL outside the predicate, indexed UNIQUE. MySQL
+// permits unlimited NULLs in a unique key, which reproduces partial-unique
+// semantics exactly.
+func checkIndexPredicate(idx *ir.Index, where string) error {
+	if idx == nil {
+		return nil
+	}
+	pred := strings.TrimSpace(idx.Predicate)
+	if pred == "" {
+		return nil
+	}
+	if idx.Unique {
+		return fmt.Errorf(
+			"%s: index %q is PARTIAL (`WHERE %s`) and enforces uniqueness, and MySQL has no partial-index "+
+				"equivalent. The predicate is part of the constraint: the source permits duplicate values "+
+				"among the rows the predicate EXCLUDES, and a MySQL unique key over the whole table would "+
+				"reject them — so the target is stricter than the source and would refuse data the source "+
+				"holds legally. Reproduce it with a generated column that is NULL outside the predicate and "+
+				"a UNIQUE key over that column (MySQL permits unlimited NULLs in a unique key), drop the "+
+				"predicate on the source if it was only a size optimisation, or exclude the table",
+			where, idx.Name, pred,
+		)
+	}
+	slog.Warn(
+		"partial-index predicate dropped: MySQL has no partial-index equivalent, so this index covers every "+
+			"row instead of the predicate's subset. This changes the index's size and maintenance cost, not "+
+			"which rows are legal or which answers queries return",
+		slog.String("context", where),
+		slog.String("index", idx.Name),
+		slog.String("source_predicate", pred),
+	)
+	return nil
 }
 
 // emitIndexColumnListWithPrefix renders the parenthesised column list,
@@ -1619,6 +1700,13 @@ func emitAddIndexClause(idx *ir.Index) (string, error) {
 	}
 	if len(idx.Columns) == 0 {
 		return "", fmt.Errorf("mysql: emitAddIndexClause: index %q has no columns", idx.Name)
+	}
+	// Audit 2026-08-01 S8. This clause is the chokepoint for BOTH ALTER paths
+	// (emitCreateIndex and emitCreateIndexesCombined); the two CREATE TABLE
+	// inline sites carry their own call, since they render a column list
+	// directly and never reach here.
+	if err := checkIndexPredicate(idx, "mysql"); err != nil {
+		return "", err
 	}
 
 	var sb strings.Builder
