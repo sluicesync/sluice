@@ -14,7 +14,9 @@ The same fault had a second form the original report did not name. Collapsing tw
 
 **A partial `UNIQUE` index was carried to a MySQL-family target as a whole-table one, making the target stricter than the source.** Postgres and SQLite can constrain uniqueness over a subset of rows — `CREATE UNIQUE INDEX … ON t (email) WHERE deleted_at IS NULL` forbids duplicate live emails while permitting any number of soft-deleted ones. MySQL has no partial-index feature, and the predicate was dropped without comment, leaving a `UNIQUE KEY (email)` that forbids both. The target then refuses rows the source holds legally.
 
-sluice now refuses this at translation, before any data moves, and names the rewrite that reproduces the semantics on MySQL 8: a generated column that is NULL outside the predicate, indexed `UNIQUE`, since MySQL permits unlimited NULLs in a unique key. Dropping the predicate on the source or excluding the table are the other ways forward.
+sluice now refuses this, and names the rewrite that reproduces the semantics on MySQL 8: a generated column that is NULL outside the predicate, indexed `UNIQUE`, since MySQL permits unlimited NULLs in a unique key. Dropping the predicate on the source or excluding the table are the other ways forward.
+
+> **Correction (2026-08-04).** This section first said the refusal happens "before any data moves". That holds for the two `CREATE TABLE` inline paths and **not** for an ordinary secondary index, which is emitted in the deferred `CreateIndexes` phase — *after* the bulk copy. On a large table the refusal therefore arrives having already copied every row. Passing `--upfront-indexes` moves index creation ahead of the copy and restores the early refusal today; moving the check into preflight so it is unconditional is tracked as follow-up work. The refusal itself is correct in every case — only its timing was misstated, and that timing was the stated reason for preferring a refusal to a warning.
 
 ## Changed
 
@@ -24,7 +26,7 @@ sluice cannot currently detect the peer: the change log carries no consumer regi
 
 ## Compatibility
 
-**One behaviour change that can stop a migration that previously ran.** A partial `UNIQUE` index against a MySQL, MariaDB, PlanetScale or Vitess target is now refused at translation. This is deliberate. The old behaviour failed mid-copy, potentially hours in, if a collision already existed in the data — and otherwise migrated clean and then rejected the operator's first ordinary write, long after the migration had been called a success. One message before any data moves covers both cases.
+**One behaviour change that can stop a migration that previously ran.** A partial `UNIQUE` index against a MySQL, MariaDB, PlanetScale or Vitess target is now refused at translation. This is deliberate. The old behaviour failed mid-copy, potentially hours in, if a collision already existed in the data — and otherwise migrated clean and then rejected the operator's first ordinary write, long after the migration had been called a success. One message instead of a mid-copy duplicate-key error covers both cases (see the timing correction above).
 
 Partial **non-unique** indexes are unaffected and still carried with a warning: the widened index covers a superset of the rows, so cost changes and correctness does not.
 
