@@ -175,9 +175,15 @@ func (s *BlobStore) stripBlobPrefix(key string) string {
 	return key
 }
 
-// URL returns the (annotated) URL the store was opened with. Useful
-// for log lines and tests; credentials are never embedded — gocloud's
-// drivers source them from the environment.
+// URL returns the (annotated) URL the store was opened with, REDACTED.
+//
+// The previous doc here said "credentials are never embedded — gocloud's
+// drivers source them from the environment". That was an assumption about
+// operator behaviour stated as a property of the code, and it was wrong in
+// the direction that matters: gocloud reads u.Host and IGNORES u.User, so
+// `s3://KEY:SECRET@bucket` works fine and an operator who writes one gets no
+// signal. The return value reaches durable, replicated, operator-readable
+// places (see [redactBlobURL]), so it is redacted rather than trusted.
 func (s *BlobStore) URL() string { return redactBlobURL(s.url) }
 
 // Close releases the underlying bucket handle. Idempotent.
@@ -532,10 +538,34 @@ func isFileBlobURL(urlStr string) bool {
 func redactBlobURL(s string) string {
 	if u, err := url.Parse(s); err == nil {
 		u.RawQuery = ""
+		// USERINFO TOO, and this is the whole finding (audit 2026-08-04).
+		// Clearing only the query left `s3://KEY:SECRET@bucket/p` fully
+		// intact, and gocloud's drivers read u.Host and ignore u.User — so
+		// embedding credentials there WORKS, which is what made the leak
+		// silent. The redacted value reaches an INFO log, the
+		// sluice_cdc_state row on the TARGET database (durable, replicated,
+		// SELECT-readable) and a PrivacyBasic diagnose bundle, whose own
+		// help text promises no DSN.
+		//
+		// diagnose.RedactDSN already strips userinfo correctly for the same
+		// value elsewhere in the same bundle; that two-redactor asymmetry is
+		// why this went unnoticed.
+		u.User = nil
 		return u.String()
 	}
+	// Parse failed, so the string cannot be reasoned about structurally. Strip
+	// conservatively rather than returning it: the query first, then anything
+	// up to and including the last '@' in the authority, which is where
+	// userinfo lives. A redactor whose fallback leaks is not a redactor.
 	if i := strings.IndexByte(s, '?'); i >= 0 {
-		return s[:i]
+		s = s[:i]
+	}
+	if at := strings.LastIndexByte(s, '@'); at >= 0 {
+		scheme := ""
+		if sep := strings.Index(s, "://"); sep >= 0 {
+			scheme = s[:sep+3]
+		}
+		return scheme + "[redacted]@" + s[at+1:]
 	}
 	return s
 }
