@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -58,14 +59,60 @@ type mysqlFloatBatchExecer struct{ w *RowWriter }
 // runs before the CDC anchor persists, so no explicit transaction is needed.
 func (e *mysqlFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, pkColumns, setColumns []string, batch []ir.Row) error {
 	colTypes := colTypesByName(table.Columns)
-	stmt, args, err := buildFloatRepairBatchSQL(e.w.qualifiedRef(table.Name), pkColumns, setColumns, batch, colTypes)
-	if err != nil {
-		return fmt.Errorf("mysql: UpdateFloatColumnsByPK: %s: build batch: %w", table.Name, err)
+
+	// ADR-0110 / audit 2026-08-04, the SIBLING of the Postgres fix. This is a
+	// cold-copy write core and was invisible to the grow gate on both engines
+	// — the Q1 sweep enumerated the writeVia*/LOAD DATA family and this one
+	// sits outside it.
+	if aerr := e.w.awaitGrowGate(ctx); aerr != nil {
+		return aerr
 	}
-	if _, err := e.w.db.ExecContext(ctx, stmt, args...); err != nil {
-		return fmt.Errorf("mysql: UpdateFloatColumnsByPK: %s: exec batch: %w", table.Name, err)
+
+	// Placeholder ceiling, computed rather than assumed. MySQL's protocol
+	// caps a prepared statement at 65535 placeholders (a 16-bit count, same
+	// shape as Postgres's bind limit), and this statement binds
+	// len(batch) x (pk + set). At the shared floatRepairBatchRows of 500 that
+	// overflows at 132 combined columns. Split rather than fail mid-repair.
+	cols := len(pkColumns) + len(setColumns)
+	perStmt := clampRowsToPlaceholderLimit(len(batch), cols)
+
+	for start := 0; start < len(batch); start += perStmt {
+		end := min(start+perStmt, len(batch))
+		stmt, args, err := buildFloatRepairBatchSQL(
+			e.w.qualifiedRef(table.Name), pkColumns, setColumns, batch[start:end], colTypes,
+		)
+		if err != nil {
+			return fmt.Errorf("mysql: UpdateFloatColumnsByPK: %s: build batch: %w", table.Name, err)
+		}
+		if _, err := e.w.db.ExecContext(ctx, stmt, args...); err != nil {
+			// Signal the siblings on a transient so the run's other lanes park
+			// with this one. The statement is an idempotent UPDATE keyed on
+			// the PK, so a replay would be safe; not retried here because that
+			// is a separate change from the Await/Trip parity this closes.
+			var re ir.RetriableError
+			if errors.As(classifyApplierError(err), &re) && re.Retriable() {
+				e.w.tripGrowGate("mysql float-repair transient: " + err.Error())
+			}
+			return fmt.Errorf("mysql: UpdateFloatColumnsByPK: %s: exec batch: %w", table.Name, err)
+		}
 	}
 	return nil
+}
+
+// clampRowsToPlaceholderLimit reduces a per-statement row count so that
+// rows x cols stays within MySQL's 65535-placeholder protocol ceiling.
+// Returns at least 1: a single row wider than the ceiling cannot be bound at
+// all and is left to fail loudly against the server rather than be silently
+// dropped here. Mirrors Postgres's clampRowsToBindLimit.
+func clampRowsToPlaceholderLimit(rows, cols int) int {
+	const maxPlaceholdersPerStmt = 65535
+	if cols <= 0 || rows*cols <= maxPlaceholdersPerStmt {
+		return rows
+	}
+	if n := maxPlaceholdersPerStmt / cols; n > 0 {
+		return n
+	}
+	return 1
 }
 
 // buildFloatRepairBatchSQL renders the batched UPDATE-against-a-UNION-join

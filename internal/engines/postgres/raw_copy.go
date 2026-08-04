@@ -160,6 +160,21 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 	}
 	sqlStmt := buildRawCopyFromStmt(w.schema, table, format)
 
+	// ADR-0110 / audit 2026-08-04. Quiesce with the run's other cold-copy
+	// lanes BEFORE opening a COPY that holds this connection for a whole table
+	// or PK-bounded chunk.
+	//
+	// This path was invisible to the grow gate while all four writeVia* cores
+	// were wired into it — it is a *RowWriter method on the SAME receiver that
+	// stores the gate, so the omission was neither structural nor visible in a
+	// grep for the cores. The consequence was worse than a missing
+	// optimisation: raw lanes kept writing into a grow window every IR lane
+	// was backing off from, which made the raw "fast lane" STRICTLY less
+	// resilient than the lane it replaces.
+	if aerr := w.awaitGrowGate(ctx); aerr != nil {
+		return 0, aerr
+	}
+
 	sqlConn, err := w.db.Conn(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("postgres: ImportRawCopy: acquire conn: %w", err)
@@ -190,6 +205,27 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		return nil
 	})
 	if rawErr != nil {
+		// Signal the siblings, and classify. Trip is the half that matters
+		// here: this lane cannot retry, so telling the other lanes to park is
+		// the ONLY contribution it can make to riding out a grow window.
+		//
+		// NOT RETRIED, and that is inherent rather than an omission — r is a
+		// one-shot stream (a pipe from the exporter, or a chunk reader already
+		// partially consumed), so there is nothing to replay. Same property as
+		// MySQL's LOAD DATA path, and the message says so rather than leaving
+		// the operator with a bare driver error.
+		rawErr = w.quiesceAndReportTransient(rawErr, "raw COPY import")
+		var re ir.RetriableError
+		if errors.As(classifyApplierError(rawErr), &re) && re.Retriable() {
+			return 0, fmt.Errorf(
+				"%w. This is the raw-COPY fast path, which streams the source bytes straight into "+
+					"COPY FROM STDIN and therefore has NO resume point — the stream is consumed as it goes, "+
+					"so it cannot be replayed. Re-run the copy for this table; the other cold-copy lanes have "+
+					"been asked to pause. (A transform on any column routes the table through the IR lane "+
+					"instead, which retries chunk-by-chunk.)",
+				rawErr,
+			)
+		}
 		return 0, rawErr
 	}
 	return copied, nil

@@ -59,12 +59,42 @@ type pgFloatBatchExecer struct{ w *RowWriter }
 func (e *pgFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, pkColumns, setColumns []string, batch []ir.Row) error {
 	colTypes := colTypesByName(table.Columns)
 	opts := emitOpts{HasPostGIS: e.w.hasPostGIS, TargetSchema: e.w.schema}
-	stmt, args, err := buildFloatRepairBatchSQL(e.w.schema, table.Name, pkColumns, setColumns, batch, colTypes, opts)
-	if err != nil {
-		return fmt.Errorf("postgres: UpdateFloatColumnsByPK: %s: build batch: %w", table.Name, err)
+
+	// BIND CEILING, computed rather than asserted (audit 2026-08-04).
+	// floatRepairBatchRows's doc claimed headroom under Postgres's 65535-
+	// parameter limit and never did the arithmetic. The statement binds
+	// len(batch) x (pk + set) parameters, so at 500 rows it overflows at 132
+	// combined columns — reachable on a wide table, and the failure is a hard
+	// server error mid-repair. Split instead.
+	cols := len(pkColumns) + len(setColumns)
+	perStmt := clampRowsToBindLimit(len(batch), cols)
+
+	// ADR-0110 / audit 2026-08-04: this is a cold-copy write core and was the
+	// one the Q1/Q3 sweep missed — on BOTH engines. It is reached from the
+	// sync cold-start float-repair phase on VStream sources, which is exactly
+	// the shape the grow gate's own justification cites.
+	if aerr := e.w.awaitGrowGate(ctx); aerr != nil {
+		return aerr
 	}
-	if _, err := e.w.db.ExecContext(ctx, stmt, args...); err != nil {
-		return fmt.Errorf("postgres: UpdateFloatColumnsByPK: %s: exec batch: %w", table.Name, err)
+
+	for start := 0; start < len(batch); start += perStmt {
+		end := min(start+perStmt, len(batch))
+		stmt, args, err := buildFloatRepairBatchSQL(
+			e.w.schema, table.Name, pkColumns, setColumns, batch[start:end], colTypes, opts,
+		)
+		if err != nil {
+			return fmt.Errorf("postgres: UpdateFloatColumnsByPK: %s: build batch: %w", table.Name, err)
+		}
+		if _, err := e.w.db.ExecContext(ctx, stmt, args...); err != nil {
+			// Signal the siblings before returning. The statement itself is
+			// idempotent (an UPDATE keyed on the PK), so a replay would be
+			// safe — it is not retried here only because that is a separate
+			// change; the parity this closes is Await + Trip.
+			return e.w.quiesceAndReportTransient(
+				fmt.Errorf("postgres: UpdateFloatColumnsByPK: %s: exec batch: %w", table.Name, err),
+				"float repair",
+			)
+		}
 	}
 	return nil
 }
