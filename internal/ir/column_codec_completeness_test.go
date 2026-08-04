@@ -93,6 +93,24 @@ func TestColumnCodecCoversEveryField(t *testing.T) {
 // It sets every wire-carried field on Column to a non-zero value, round-trips
 // through the real codec, and requires equality. A field marshalled but never
 // unmarshalled (or the reverse) comes back zero and fails here.
+//
+// # This gate previously could not do what that paragraph claims
+//
+// It set three of its eight wire fields — GeneratedExpr, GeneratedStored,
+// GeneratedExprDialect — to the ZERO value, and then asserted only a
+// hand-picked four. Both halves were vacuous in the same direction: a field
+// that fails this way comes back ZERO, so a fixture that sends zero cannot
+// tell a working round trip from a broken one, and a field nobody thought to
+// assert is not checked at all. Its own anti-vacuity guard checked that each
+// columnWire field EXISTS on Column — never that the fixture gives it a value.
+//
+// That is this project's most expensive recurring shape (a gate whose coverage
+// is narrower than its name), and it is doubly bad here because this gate was
+// itself built as a §4 audit remedy for exactly one field being forgotten.
+//
+// Both halves are now reflective over columnWire: every field must be non-zero
+// in the fixture, and every field is compared after the round trip. Adding a
+// field to columnWire fails this test until the fixture exercises it.
 func TestColumnCodecRoundTripsEveryWireField(t *testing.T) {
 	src := &Column{
 		Name:                     "updated_at",
@@ -100,22 +118,30 @@ func TestColumnCodecRoundTripsEveryWireField(t *testing.T) {
 		Nullable:                 true,
 		Default:                  DefaultExpression{Expr: "CURRENT_TIMESTAMP(3)"},
 		Comment:                  "a comment",
-		GeneratedExpr:            "",
-		GeneratedStored:          false,
-		GeneratedExprDialect:     "",
+		GeneratedExpr:            "concat(a, b)",
+		GeneratedStored:          true,
+		GeneratedExprDialect:     "mysql",
 		OnUpdateCurrentTimestamp: true,
 	}
 
-	// Guard against this test silently stopping short of the wire surface:
-	// every columnWire field must be represented above. Name-matched, so a
-	// newly added wire field fails here until it is exercised.
 	wireT := reflect.TypeOf(columnWire{})
 	srcV := reflect.ValueOf(*src)
+
+	// Anti-vacuity floor, and the half that was missing. Every columnWire
+	// field must exist on Column AND be NON-ZERO in the fixture. Without the
+	// second condition a field can be "covered" by a value that is
+	// indistinguishable from the failure it is meant to detect.
 	for i := range wireT.NumField() {
 		name := wireT.Field(i).Name
 		f := srcV.FieldByName(name)
 		if !f.IsValid() {
 			t.Fatalf("columnWire field %q has no counterpart on ir.Column", name)
+		}
+		if f.IsZero() {
+			t.Fatalf("columnWire field %q is set to its ZERO value in this test's fixture.\n\n"+
+				"A field dropped by MarshalJSON or UnmarshalJSON comes back ZERO, so a zero-valued "+
+				"fixture cannot distinguish a working round trip from a broken one — the assertion below "+
+				"would pass either way. Give %q a non-zero value.", name, name)
 		}
 	}
 
@@ -128,17 +154,19 @@ func TestColumnCodecRoundTripsEveryWireField(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if got.OnUpdateCurrentTimestamp != src.OnUpdateCurrentTimestamp {
-		t.Errorf("OnUpdateCurrentTimestamp did not survive the round trip: got %v, want %v.\n"+
-			"JSON was: %s\n"+
-			"A field present in columnWire but wired into only one of MarshalJSON/UnmarshalJSON fails "+
-			"exactly this way, and a schema restored from a backup would lose it silently.",
-			got.OnUpdateCurrentTimestamp, src.OnUpdateCurrentTimestamp, b)
-	}
-	if got.Name != src.Name || got.Comment != src.Comment || got.Nullable != src.Nullable {
-		t.Errorf("a baseline field did not round-trip; got %+v", got)
-	}
-	if got.Default == nil {
-		t.Error("Default did not round-trip")
+	// Compare every wire field, not a hand-picked subset — the subset is how a
+	// newly added field goes unchecked while the test still reads as complete.
+	gotV := reflect.ValueOf(got)
+	for i := range wireT.NumField() {
+		name := wireT.Field(i).Name
+		want := srcV.FieldByName(name).Interface()
+		have := gotV.FieldByName(name).Interface()
+		if !reflect.DeepEqual(want, have) {
+			t.Errorf("%s did not survive the round trip: got %#v, want %#v.\n"+
+				"JSON was: %s\n"+
+				"A field present in columnWire but wired into only one of MarshalJSON/UnmarshalJSON fails "+
+				"exactly this way, and a schema restored from a backup would lose it silently.",
+				name, have, want, b)
+		}
 	}
 }

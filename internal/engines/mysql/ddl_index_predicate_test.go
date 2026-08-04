@@ -31,6 +31,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -137,6 +139,18 @@ func TestPartialUniqueIndexRefusedAtTheInlineCreateTableSite(t *testing.T) {
 	}
 }
 
+// indexEmitExempt names functions the DISCOVERY rule below flags which are not
+// actually emit sites, each with the reason. A function here is a DECISION; a
+// function merely absent from the discovered set is invisible to this gate,
+// which is why discovery must not be a curated list.
+var indexEmitExempt = map[string]string{
+	"emitIndexColumnList": "the shared column-list renderer itself — it receives " +
+		"[]ir.IndexColumn and never sees the ir.Index, so it cannot inspect a predicate; " +
+		"its CALLERS are the sites",
+	"emitIndexColumnListWithPrefix": "the prefix-aware half of the same shared renderer, " +
+		"same reason",
+}
+
 // TestEveryMySQLIndexEmitSiteChecksThePredicate is the fail-by-default roster.
 //
 // It walks ddl_emit.go for every site that renders an index into MySQL DDL and
@@ -144,22 +158,41 @@ func TestPartialUniqueIndexRefusedAtTheInlineCreateTableSite(t *testing.T) {
 // check fails here rather than shipping a silently-widened unique key — the
 // sibling-sweep step in mechanical form, since the recurring cost in this
 // project is a guard that reached one implementor and not its siblings.
+//
+// # This gate previously could not fail on an added site, which is the one
+// # thing its own doc promises
+//
+// It was a CURATED two-entry allowlist, and non-members were `continue`d past.
+// So it verified that the two known sites still call the check — useful — while
+// being structurally incapable of noticing a THIRD site, which is the entire
+// scenario the paragraph above describes. A gate whose coverage is narrower
+// than its name is worse than no gate, because it stops anyone from looking;
+// that this one was built as the mechanical form of the sibling-sweep step
+// makes it the sharpest instance of the class yet found here.
+//
+// It is now DISCOVERY-based: a function is an emit site if it renders an
+// index's column list (calls emitIndexColumnList / …WithPrefix) or writes an
+// index-DDL keyword literal. Both signals are used, because the first half of
+// S8 undercounted precisely by assuming every site goes through the shared
+// helper — a future site that renders its own column list is caught by the
+// literal. Anything discovered must either call checkIndexPredicate or be in
+// indexEmitExempt with a reason.
 func TestEveryMySQLIndexEmitSiteChecksThePredicate(t *testing.T) {
-	// Each entry: the function that renders index DDL, and why it is a site.
+	// Calling one of these means the function renders an index column list.
+	renderers := map[string]bool{
+		"emitIndexColumnList":           true,
+		"emitIndexColumnListWithPrefix": true,
+	}
+	// Writing one of these means the function renders index DDL directly.
+	ddlKeyword := regexp.MustCompile(`^\s*(UNIQUE |FULLTEXT |SPATIAL )?(INDEX|KEY) $`)
+
+	// declName renders a FuncDecl as it appears in the roster.
 	//
 	// Keyed on the FULL declaration identity, receiver included. There are two
 	// declarations named emitTableDefWithDomainChecks — a free function and a
 	// mysqlEmitter method — and only the method carries the body that renders
 	// the inline indexes. A name-only roster matched the wrong one and reported
 	// the check missing while it was present, so the receiver is part of the key.
-	sites := map[string]string{
-		"emitAddIndexClause": "renders ADD [UNIQUE] INDEX for both emitCreateIndex and " +
-			"emitCreateIndexesCombined",
-		"(mysqlEmitter).emitTableDefWithDomainChecks": "renders the two CREATE TABLE inline index sites " +
-			"(inlineAutoIncrementIndex, inlineUniqueKeyForCopy) directly",
-	}
-
-	// declName renders a FuncDecl as it appears in the roster.
 	declName := func(fn *ast.FuncDecl) string {
 		if fn.Recv == nil || len(fn.Recv.List) == 0 {
 			return fn.Name.Name
@@ -181,51 +214,75 @@ func TestEveryMySQLIndexEmitSiteChecksThePredicate(t *testing.T) {
 		t.Fatalf("parse ddl_emit.go: %v", err)
 	}
 
-	found := map[string]bool{}
+	type site struct{ rendersList, writesDDL, checks bool }
+	discovered := map[string]*site{}
+
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok {
+		if !ok || fn.Body == nil {
 			continue
 		}
-		name := declName(fn)
-		if _, want := sites[name]; !want {
-			continue
-		}
+		s := &site{}
 		ast.Inspect(fn, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "checkIndexPredicate" {
-				found[name] = true
+			switch v := n.(type) {
+			case *ast.CallExpr:
+				if id, ok := v.Fun.(*ast.Ident); ok {
+					switch {
+					case id.Name == "checkIndexPredicate":
+						s.checks = true
+					case renderers[id.Name]:
+						s.rendersList = true
+					}
+				}
+			case *ast.BasicLit:
+				if v.Kind == token.STRING {
+					if lit, err := strconv.Unquote(v.Value); err == nil && ddlKeyword.MatchString(lit) {
+						s.writesDDL = true
+					}
+				}
 			}
 			return true
 		})
+		if s.rendersList || s.writesDDL {
+			discovered[declName(fn)] = s
+		}
 	}
 
-	// Anti-vacuity: if the walk stops finding the functions at all — renamed,
-	// moved to another file — this gate would pass on an empty set forever.
-	seen := 0
-	for _, decl := range f.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok {
-			if _, want := sites[declName(fn)]; want {
-				seen++
+	// Anti-vacuity floor. Discovery returning nothing — or losing the two sites
+	// S8 was filed for — would let this pass on an empty set forever, which is
+	// the failure mode of the version this replaces.
+	for _, must := range []string{"emitAddIndexClause", "(mysqlEmitter).emitTableDefWithDomainChecks"} {
+		if _, ok := discovered[must]; !ok {
+			t.Fatalf("discovery did not find %s in ddl_emit.go. It is a known index emit site, so either it "+
+				"was renamed/moved (update the floor) or the discovery signals no longer match how index DDL "+
+				"is rendered — in which case this gate is checking nothing.", must)
+		}
+	}
+	if len(discovered) <= len(indexEmitExempt) {
+		t.Fatalf("discovery found %d functions and %d are exempt, leaving nothing checked; the discovery "+
+			"rule has stopped working", len(discovered), len(indexEmitExempt))
+	}
+
+	for name, s := range discovered {
+		if reason, ok := indexEmitExempt[name]; ok {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("%s is exempt with an EMPTY reason; an exemption without a reason is "+
+					"indistinguishable from an oversight", name)
 			}
+			continue
 		}
-	}
-	if seen != len(sites) {
-		t.Fatalf("found %d of %d rostered emit sites in ddl_emit.go; a function was renamed or moved and "+
-			"this gate is no longer checking what it names", seen, len(sites))
-	}
-
-	for name, why := range sites {
-		if !found[name] {
-			t.Errorf("%s does not call checkIndexPredicate, but it %s.\n\n"+
-				"MySQL has no partial-index syntax, so an index emitted from here drops any WHERE clause. "+
-				"On a UNIQUE key that makes the target STRICTER than the source and it refuses rows the "+
-				"source holds legally. Call checkIndexPredicate before rendering, or — if this site "+
-				"genuinely cannot receive a partial index — remove it from the roster with the reason.",
-				name, why)
+		if s.checks {
+			continue
 		}
+		how := "renders an index column list"
+		if s.writesDDL {
+			how = "writes index DDL directly"
+		}
+		t.Errorf("%s does not call checkIndexPredicate, but it %s.\n\n"+
+			"MySQL has no partial-index syntax, so an index emitted from here drops any WHERE clause. "+
+			"On a UNIQUE key that makes the target STRICTER than the source and it refuses rows the "+
+			"source holds legally. Call checkIndexPredicate before rendering, or — if this site "+
+			"genuinely cannot receive a partial index — add it to indexEmitExempt with the reason.",
+			name, how)
 	}
 }
