@@ -4,7 +4,21 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
-## [0.109.1] - 2026-08-03
+## [0.110.0] - 2026-08-03
+
+### Fixed
+
+**`backup compact --smart-compaction` could drop a large column's value from a backup chain, silently.** Collapsing an INSERT and a later UPDATE into a single INSERT kept the UPDATE's column values and discarded the INSERT's — which is correct only if every after-image is a complete row, and against a Postgres source it is not. Postgres omits an unchanged out-of-line (TOASTed) column from an UPDATE's after-image, where a missing column means "leave the target's value alone". That reading is right for an UPDATE and wrong once the event becomes an INSERT, which has no existing value to leave alone: the column arrived on restore as NULL or its default. The same fault had a second form the original report did not name — collapsing two UPDATEs kept only the later after-image, so a column the *first* UPDATE wrote and the second left untouched was carried by neither the merged event nor the target, which still held the value from before the first UPDATE. Compaction now unions the after-images. This affects only chains compacted with `--smart-compaction`, which is off by default, and only tables without a row filter; a filtered table already received the complete image for unrelated reasons. `backup verify` could not have caught either form, because compaction re-stamps the hashes it then checks.
+
+**A partial `UNIQUE` index was carried to a MySQL-family target as a whole-table one, making the target stricter than the source.** Postgres and SQLite can constrain uniqueness over a subset of rows — `CREATE UNIQUE INDEX … ON t (email) WHERE deleted_at IS NULL` forbids duplicate live emails while permitting any number of soft-deleted ones. MySQL has no partial-index feature and the predicate was dropped without comment, leaving a `UNIQUE KEY (email)` that forbids both. The target then refuses rows the source holds legally. sluice now refuses this at translation, before any data moves, and names the rewrite that reproduces the semantics on MySQL 8: a generated column that is NULL outside the predicate, indexed `UNIQUE`, since MySQL permits unlimited NULLs in a unique key. Dropping the source predicate or excluding the table are the other ways forward. **This will stop migrations that previously appeared to succeed** — deliberately: the old behaviour failed mid-copy hours in if a collision already existed in the data, and otherwise migrated clean and then rejected the operator's first ordinary write, long after the migration was called a success. Partial *non-unique* indexes are unchanged and still carried with a warning, because the widened index covers a superset of the rows and every query still returns the correct answer.
+
+### Changed
+
+**`--auto-prune-change-log` now warns that it is single-stream only.** The prune cuts at one stream's durably-applied frontier and deletes by change-log id, without regard for which tables a row belongs to. A source change log is shared by every sync reading that database, so a second, slower sync loses the rows between the two frontiers before it ever reads them. sluice cannot currently detect the peer — the change log carries no consumer registry, and each stream's position lives on its own target, out of reach of the source-side pruner — so the flag now says so at startup and in its help text rather than refusing, which would break the single-stream case that is both common and entirely safe. A scoped prune is tracked separately.
+
+### Internal
+
+**The 2026-08-01 audit's remaining findings are closed, and several of its gate proposals are now permanent gates.** The pipeline's optional-interface surfaces are pinned against real engine types rather than test stubs — a stub satisfies an interface by construction and proves nothing about any engine — starting with the seven preflight probers, each of which guards a refusal that would silently stop running if its type assertion quietly stopped matching. The layering tenet the architecture document asserts is now enforced by a test over the module's transitive dependency graph, with the exceptions named individually. Two backup cost characteristics that had been reasoned about rather than measured are now pinned by tests that log the real numbers. Neither of those two is a fix; both are tracked for follow-up.
 
 ### Fixed
 
