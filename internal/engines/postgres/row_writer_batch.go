@@ -360,6 +360,27 @@ func pickNonNullUniqueIndex(table *ir.Table) *ir.Index {
 		if idx == nil || !idx.Unique || len(idx.Columns) == 0 {
 			continue
 		}
+		// PARTIAL indexes are not eligible (audit 2026-08-04, the Postgres
+		// sibling of S8). Two independent reasons, and either alone settles it:
+		//
+		//  1. A partial unique index constrains only the rows its predicate
+		//     selects. The caller renders the winner as an inline
+		//     `CONSTRAINT … UNIQUE (cols)`, which PG cannot qualify with a
+		//     WHERE — so the emitted constraint is UNCONDITIONAL, and the
+		//     target then rejects rows the source holds legally.
+		//  2. It is not a valid conflict target anyway: `ON CONFLICT (cols)`
+		//     does not match a partial index unless the statement repeats its
+		//     predicate, so an unconditional upsert could never have inferred
+		//     it.
+		//
+		// Skipping it here also un-breaks the index itself. The winner is added
+		// to inlineSkipIndexNames so the build phase does not re-create it as a
+		// duplicate — which meant a selected partial index was widened into a
+		// constraint AND then never built as the partial index the source had.
+		// Declining to select it restores the normal build path.
+		if strings.TrimSpace(idx.Predicate) != "" {
+			continue
+		}
 		allNotNull := true
 		for _, c := range idx.Columns {
 			if c.Expression != "" || !notNull[c.Column] {

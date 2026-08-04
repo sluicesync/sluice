@@ -474,6 +474,9 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 	if len(idx.Columns) == 0 {
 		return "", fmt.Errorf("sqlite: emitCreateIndex: index %q has no columns", idx.Name)
 	}
+	if err := checkIndexPrefixLength(idx, "sqlite: table "+tableName); err != nil {
+		return "", err
+	}
 
 	var sb strings.Builder
 	sb.WriteString("CREATE ")
@@ -548,4 +551,61 @@ func quoteColumnList(names []string) string {
 // single quote. (quoteIdent is shared with the reader, in row_reader.go.)
 func quoteSQLString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// checkIndexPrefixLength decides what happens to a MySQL index PREFIX LENGTH
+// when the target is SQLite, which has no prefix-index feature
+// (audit 2026-08-04, the SQLite sibling of S8's first half).
+//
+// This is the same rule Postgres's checkIndexPrefixLength applies, ported
+// because the original fix enumerated four POSTGRES emit sites and never asked
+// whether the other targets had the same gap. SQLite does — and its version is
+// no milder:
+//
+//   - On a key that ENFORCES UNIQUENESS the prefix is part of the constraint.
+//     MySQL's `UNIQUE KEY (email(20))` forbids two rows whose first 20 bytes
+//     of email match; a SQLite `UNIQUE INDEX (email)` permits them. Dropping
+//     the prefix therefore WEAKENS the constraint and the target silently
+//     admits rows the source rejected — permanently, at exit 0. Refused.
+//   - On a NON-unique index the prefix is a size/performance choice with no
+//     effect on which rows are legal, so it is dropped with a WARN.
+//
+// Note the direction differs from the partial-predicate case on this engine:
+// SQLite DOES support partial indexes and emits `WHERE` verbatim, so there is
+// nothing to refuse there. Prefix length is the one axis SQLite cannot carry.
+//
+// The rewrite named in the refusal works because SQLite indexes may be built
+// over expressions: `CREATE UNIQUE INDEX u ON t (substr(email, 1, 20))`
+// reproduces the source's semantics exactly.
+func checkIndexPrefixLength(idx *ir.Index, where string) error {
+	if idx == nil {
+		return nil
+	}
+	for _, c := range idx.Columns {
+		if c.Length <= 0 || c.Expression != "" {
+			continue
+		}
+		if idx.Unique {
+			return fmt.Errorf(
+				"%s: index %q constrains column %q to its first %d characters, and SQLite has no "+
+					"prefix-length equivalent. On a key that enforces uniqueness the prefix is part of the "+
+					"CONSTRAINT: the source forbids two rows whose first %d characters of %q match, and a "+
+					"SQLite unique index over the whole column would ALLOW them — so the target would "+
+					"silently accept data the source rejects. Rewrite it as a unique index over an "+
+					"expression that reproduces the prefix (for example `substr(%s, 1, %d)`), widen it to "+
+					"the full column on the source if the prefix was only a size optimisation, or exclude "+
+					"the table",
+				where, idx.Name, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
+			)
+		}
+		slog.Warn(
+			"index prefix length dropped: SQLite has no prefix-length equivalent, so this index covers the "+
+				"whole column. This changes the index's size and performance, not which rows are legal",
+			slog.String("context", where),
+			slog.String("index", idx.Name),
+			slog.String("column", c.Column),
+			slog.Int("source_prefix_length", c.Length),
+		)
+	}
+	return nil
 }
