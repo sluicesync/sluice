@@ -2,7 +2,31 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [Unreleased] — drafted for 0.110.1, NOT yet cut
+
+Everything here comes out of a blind multi-agent audit of the v0.110.0 release, run specifically because that release's own contents were themselves audit remediation — the same author auditing their own work is exactly when an independent pass earns its cost. It found one Critical, and the recurring shape behind most of the rest was a sibling sweep that stopped at the surface a finding named rather than the class it belonged to.
+
+### Fixed
+
+**A `--where` filter on an `inet`, `cidr` or `macaddr` column could silently drop every CDC change to the rows it matched.** sluice decided whether an operator's literal was "the spelling the change stream delivers" by rendering it with Go's `net/netip`. That answers a subtly different question — whether the literal is canonical as a *Go* value — and where the two disagree the predicate compiled cleanly and then matched nothing: the cold-start copy landed the rows (that leg is evaluated by the server), and every subsequent insert, update and delete to them was dropped at exit 0 with `sync status` green, so the filtered subset froze permanently. Both Postgres and MariaDB print the trailing 32 bits as a dotted quad when the leading 96 bits are zero, where netip does that only for IPv4-mapped addresses — and MariaDB additionally compresses a single zero hextet, which RFC 5952 forbids and Postgres obeys, so the two servers do not agree with each other either. So `::1.2.3.4` is delivered as `::1.2.3.4` and sluice was writing `::102:304`. Literals are now rendered the way the source engine renders them. Affects `--where` on network columns only; a sync without a row filter, and every other column type, were never involved.
+
+**A partial `UNIQUE` index could be silently widened on a Postgres target, and the real index never built.** For a table with no primary key, sluice inlines a non-null unique index into `CREATE TABLE` so the cold-start copy has a conflict target. The selection never considered whether the index was partial, and Postgres cannot put a `WHERE` on a table constraint — so a partial unique index became an unconditional one, making the target stricter than the source, *and* it was then skipped by the index-build phase, so the source's partial index existed on the target in no form at all. Partial indexes are no longer eligible for that role, which also restores their normal build path. They were never a valid conflict target for an unconditional upsert anyway.
+
+**A MySQL index prefix length was silently dropped against a SQLite or D1 target.** `UNIQUE KEY (email(20))` forbids two rows whose first 20 characters match; the emitted `UNIQUE INDEX (email)` forbids only exact duplicates, so the target silently accepted data the source rejects. This is now refused before any data moves, naming the rewrite that reproduces the semantics (`substr(email, 1, 20)`, since SQLite indexes may be built over expressions). Non-unique prefixed indexes are unchanged and still carried with a warning — there the prefix affects size, not which rows are legal.
+
+**Two cold-copy write lanes ignored the coordinated storage-grow pause.** The Postgres raw-COPY fast path and the float-repair core on both engines were invisible to it, so they kept writing into a grow window every other lane was backing off from — which made the raw fast path *less* resilient than the lane it replaces, not merely unoptimised. Both now participate. The raw path signals its siblings but cannot retry, and says so: it streams its source bytes, so there is no resume point.
+
+**Blob-store credentials survived redaction into a durable, replicated location.** The redactor stripped a URL's query string and left its userinfo intact, so `s3://KEY:SECRET@bucket/path` redacted to `s3://KEY:SECRET@bucket/path`. What made it silent is that embedding credentials there *works* — the cloud drivers read the host and ignore the userinfo — so an operator got a functioning backup and no signal. The redacted value reaches a log line, the CDC-state row on the **target database**, and a diagnose bundle collected at the privacy level whose help text promises no DSN. Both the parse path and the parse-failure fallback now strip credentials.
+
+### Changed
+
+**Release artifacts now carry build provenance.** Every archive, package and `checksums.txt` is attested via GitHub's artifact attestations, verifiable with `gh attestation verify <file> --repo sluicesync/sluice`. Previously the integrity chain ended at an unsigned `checksums.txt`. This is additive and is deliberately not a publish gate — a release whose attestation step failed still ships working, checksummed binaries.
+
+**`sluice sync run` now says at startup that it will restart a failing sync forever.** That has always been the default (`--max-consecutive-failures` is 0), but nothing said so, and the supervisor's own documentation claimed the opposite. A sync that can never start — an unreachable target, a bad DSN — retries behind backoff while the process looks healthy to systemd, an orchestrator or CI. The behaviour is unchanged; it is now stated, and the escape hatch is named.
+
+### Internal
+
+The guard that ensures build-tagged suites actually run in CI compared its manifest to the workflow with an unanchored substring search and never checked package scopes at all — so dropping a package from a job, or narrowing a job's `-run` filter, hid whole suites while it reported full coverage. It now parses each job's real command. Three legs whose invocation cannot be read from a single literal command keep the weaker check and are named at every run rather than left to look fully covered.
 
 ## [0.110.0] - 2026-08-03
 
@@ -6423,6 +6447,8 @@ The Phase A diagnostic skip in v0.33.2 (assumed PostGIS encoded Z in the type co
 ### Deferred
 
 - **hstore PG → PG passthrough deferred to v0.31.1.** Preflight refuses `--enable-pg-extension hstore` when target is PG with an actionable hint. Workaround until the binary codec lands: `--type-override hstore_col=text` per column (preserves text form on PG target). Cross-engine PG → MySQL hstore works as advertised — the value translator handles the wire format. Tracked: the COPY binary codec needs to mirror `pgvectorBinaryCodec`'s shape, accepting `[]byte` text-form hstore input and emitting PG's binary hstore wire format (int32 BE pair-count + length-prefixed key/value pairs).
+
+## [0.31.0]
 
 ### Added
 
