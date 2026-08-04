@@ -198,14 +198,57 @@ func NewSupervisor(syncs []SupervisedSync, policy RestartPolicy) *Supervisor {
 // the fleet stops. On ctx cancel (Ctrl-C / SIGTERM) every sync's loop
 // stops and Run returns nil. If ctx is still live but every sync has
 // ended on its own (all drained or permanently failed), Run returns the
-// aggregated error of the failed syncs — so a single-sync fleet that
-// can't start exits non-zero, while a fleet where one sync fails and
+// aggregated error of the failed syncs — a fleet where one sync fails and
 // others run on keeps blocking (the failed peer is isolated, not fatal).
+//
+// # AT THE SHIPPED DEFAULT, THIS FUNCTION CANNOT RETURN NON-NIL
+//
+// This doc used to end "so a single-sync fleet that can't start exits
+// non-zero". That is false under the configuration everyone runs, and it is
+// worth stating plainly rather than deleting (audit 2026-08-04).
+//
+// A sync only becomes permanently failed at [RestartPolicy.MaxConsecutiveFailures],
+// and that field's default is 0, meaning restart forever (see RestartConfig in
+// cmd/sluice/sync_run.go — no default tag, so the Go zero value ships). The
+// guard below is `MaxConsecutiveFailures > 0 && …`, so with the default the
+// terminal branch is unreachable: no sync ever ends on its own, the
+// all-ended path never fires, aggregateFailures always returns nil, and the
+// only other exit is ctx.Done, which returns nil deliberately. A sync
+// pointed at an unreachable target retries forever behind backoff while
+// `sluice sync run` looks perfectly healthy to systemd, a container
+// orchestrator, or a CI job.
+//
+// That is a defensible DEFAULT for a supervisor — restart-forever is what a
+// service usually wants — so it is not changed here. What was wrong is that
+// nothing said so: the doc claimed the opposite, and the test that pinned the
+// claim ([TestSupervisor_SingleSyncFailureSurfaces]) uses fastTestPolicy(2),
+// proving the property under a policy the shipped default never takes. The
+// startup log line added in Run now names the behaviour, and
+// TestSupervisor_DefaultPolicyRestartsForever pins it at the real default.
+//
+// An operator who wants a failing fleet to exit sets
+// `--max-consecutive-failures` (or `restart.max-consecutive-failures` in
+// syncs.yaml) to a positive number.
 func (s *Supervisor) Run(ctx context.Context) error {
 	s.mu.Lock()
 	if len(s.initial) == 0 {
 		s.mu.Unlock()
 		return errors.New("supervisor: no syncs configured")
+	}
+	// Say out loud that this fleet can never exit non-zero (audit
+	// 2026-08-04). A supervisor that restarts forever is a reasonable
+	// default, but an operator wrapping it in systemd or a CI job is entitled
+	// to know that a sync which can NEVER start will look healthy from the
+	// outside indefinitely — the failure surfaces only in the log.
+	if s.policy.MaxConsecutiveFailures <= 0 {
+		slog.WarnContext(
+			ctx, "sync supervisor will restart a failing sync FOREVER and will never exit non-zero: "+
+				"max-consecutive-failures is 0 (the default). A sync that can never start — an unreachable "+
+				"target, a missing table, a bad DSN — retries behind backoff while this process stays alive "+
+				"and healthy-looking to systemd, a container orchestrator or CI. Set "+
+				"--max-consecutive-failures to a positive number if you want the fleet to give up and exit",
+			slog.Int("syncs", len(s.initial)),
+		)
 	}
 	s.fleetCtx = ctx
 	for _, sy := range s.initial {

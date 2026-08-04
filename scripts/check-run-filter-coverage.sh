@@ -176,8 +176,104 @@ while IFS=';' read -r mtag mpattern mscopes mlabel; do
 		status=1
 		continue
 	fi
-	if ! grep -qF -- "$mpattern" "$wfpath"; then
-		echo "::error::MANIFEST regex '$mpattern' (axis $mtag) does not appear verbatim in $wfpath — the workflow's -run filter drifted from the manifest (or vice versa); update them TOGETHER"
+	# Extract the job's ACTUAL `go test` invocation and compare both halves
+	# exactly. The previous version did `grep -qF "$mpattern" "$wfpath"` — an
+	# unanchored substring search over the whole file, with no job scoping —
+	# and never compared mscopes at all. Two drifts slipped through it,
+	# demonstrated by the 2026-08-04 audit:
+	#
+	#   * dropping ./internal/engines/postgres/... from the postgis job hid
+	#     the ADR-0092 pipelined geometry-codec pins, and this guard said
+	#     "every package covered";
+	#   * narrowing the vstream filter to -run 'TestVStream_OversizedRow'
+	#     hid the whole Bug-125 COPY-dedup matrix, and the substring
+	#     'TestVStream_' still matched, so it said "no drift".
+	#
+	# Both are the "compiles but never runs" class this guard exists to make
+	# impossible, and it has already bitten twice for real (11 hidden PostGIS
+	# tests through v0.99.53; three hidden vstream pins in 2026-07-03).
+	# check-shard-coverage.sh has parsed the real matrix and required set
+	# equality both directions since audit TEST-3; this is that hardening,
+	# finally ported to its sibling.
+	mjob=$(printf '%s' "$mlabel" | awk '{print $2}')
+	# Join \-continuations before matching: every one of these commands wraps,
+	# so a line-at-a-time scan sees "go test …" and "-run …" as separate lines
+	# and matches neither. \047 is the apostrophe — requiring -run to be
+	# followed by one keeps the vacuous-green guards (which call
+	# `go test -list`) from being mistaken for the real invocation.
+	gotest=$(awk -v job="  $mjob:" '
+		index($0, job) == 1 { injob = 1; acc = ""; next }
+		injob && /^  [A-Za-z0-9_-]+:/ { injob = 0 }
+		!injob { next }
+		{
+			line = $0
+			sub(/^[ \t]+/, "", line)
+			if (line ~ /\\$/) { sub(/\\$/, "", line); acc = acc line " "; next }
+			acc = acc line
+			if (acc ~ /go test/ && acc ~ /-run \047/) { print acc; exit }
+			acc = ""
+		}
+	' "$wfpath")
+	# Legs whose invocation cannot be read from a single literal command, with
+	# the reason. These fall back to the OLD substring check — weaker, and
+	# stated as such rather than left to look like full coverage. The list is
+	# frozen: a leg that starts parsing must be PROMOTED (see below), and a new
+	# unparseable leg is an error, not a silent addition.
+	weak_reason=""
+	case "$mlabel" in
+	"extended-suites.yml vstream-pipeline")
+		weak_reason="the -run pattern is defined once in an env: block (VSTREAM_PIPELINE_RUN) and referenced as a variable, so it is not on the command line" ;;
+	"vitess-version-matrix.yml cluster (weekly default)")
+		weak_reason="the command is built from the version matrix, so no single literal invocation exists" ;;
+	esac
+
+	if [ -z "$gotest" ]; then
+		if [ -n "$weak_reason" ]; then
+			# Weak fallback: the manifest pattern must at least still appear
+			# somewhere in the workflow file.
+			if ! grep -qF -- "$mpattern" "$wfpath"; then
+				echo "::error::MANIFEST regex '$mpattern' (axis $mtag) does not appear anywhere in $wfpath — the workflow's -run filter drifted from the manifest (or vice versa); update them TOGETHER"
+				status=1
+			fi
+			echo "check-run-filter-coverage: NOTE leg '$mlabel' is substring-checked only — $weak_reason"
+			continue
+		fi
+		echo "::error::MANIFEST leg '$mlabel' (axis $mtag) names job '$mjob' in $wf, but no 'go test … -run …' line was found in that job block — the job was renamed or its command restructured; fix the manifest label or the workflow"
+		status=1
+		continue
+	fi
+	if [ -n "$weak_reason" ]; then
+		echo "::error::MANIFEST leg '$mlabel' is listed as substring-checked-only, but its command now parses — remove it from the weak list in scripts/check-run-filter-coverage.sh so it gets the exact check"
+		status=1
+	fi
+
+	# -run '<pattern>' — exact, not substring.
+	wfpattern=$(printf '%s' "$gotest" | sed -n "s/.*-run '\([^']*\)'.*/\1/p")
+	if [ "$wfpattern" != "$mpattern" ]; then
+		echo "::error::MANIFEST regex mismatch for axis $mtag ($mlabel): manifest has '$mpattern', workflow job '$mjob' runs '-run $wfpattern'. A NARROWED workflow filter silently stops whole suites from running anywhere; update them TOGETHER."
+		status=1
+	fi
+
+	# Package scope — set equality, both directions. Normalise the leading
+	# ./ the workflow uses and sort, so ordering is not drift.
+	wfscopes=$(printf '%s' "$gotest" | tr ' ' '\n' | sed -e 's|^\./||' -e 's|/$||' | grep -E '^internal/' | sort -u | tr '\n' ' ')
+	mscopes_n=$(printf '%s' "$mscopes" | tr ' ' '\n' | sed -e 's|^\./||' -e 's|/$||' | grep -E '^internal/' | sort -u | tr '\n' ' ')
+	# psverify runs one `go test` per package SEQUENTIALLY (deliberately — see
+	# the comment in psverify.yml), so no single invocation carries the whole
+	# scope set. Its -run pattern is still checked exactly above; only the
+	# scope half falls back.
+	if [ "$mlabel" = "psverify.yml psverify" ]; then
+		for scope in $mscopes_n; do
+			if ! grep -qF -- "$scope" "$wfpath"; then
+				echo "::error::MANIFEST scope '$scope' (axis $mtag) does not appear in $wfpath — a package was dropped from the sequential psverify run"
+				status=1
+			fi
+		done
+		echo "check-run-filter-coverage: NOTE leg '$mlabel' scope is substring-checked only — it runs one go test per package sequentially, so no single command carries the full set"
+		continue
+	fi
+	if [ "$wfscopes" != "$mscopes_n" ]; then
+		echo "::error::MANIFEST package-scope mismatch for axis $mtag ($mlabel): manifest has [$mscopes_n], workflow job '$mjob' runs [$wfscopes]. A package DROPPED from the workflow stops every test in it from running while this guard still reports full coverage."
 		status=1
 	fi
 done <<EOF
