@@ -32,7 +32,9 @@ No flags were added, renamed or removed. No error codes changed. Backup chain fo
 
 ## Who needs this
 
-- **Anyone running `backup compact --smart-compaction` against a Postgres source.** The flag is off by default, so an operator who has never set it is unaffected. If you have used it on a chain containing tables with large `text`, `bytea`, `json` or `jsonb` columns, a restore from that chain may hold a NULL or a stale value in those columns. Only tables *without* a row filter are affected — a filtered table already received the complete image, for unrelated reasons.
+- **Anyone running `backup compact --smart-compaction` against a Postgres source.** The flag is off by default, so an operator who has never set it is unaffected. If you have used it on a chain containing tables with large `text`, `bytea`, `json` or `jsonb` columns, a restore from that chain may hold a NULL or a stale value in those columns. **Assume every table in such a chain is exposed.**
+
+> **Correction (2026-08-04).** As first published, this bullet ended "Only tables *without* a row filter are affected — a filtered table already received the complete image, for unrelated reasons." That sentence is true of the *sync* path and meaningless here: no `backup` subcommand accepts `--where`, so the completeness backfill that exempts a filtered table is never engaged when building a chain. It read as a narrowing, and the narrowing does not exist. It was written from the mechanism (the backfill has exactly one caller, on the filtered path) without asking whether a filtered table can occur in a backup at all — an error in the under-warning direction, which is the expensive one.
 - **Anyone migrating Postgres or SQLite to a MySQL-family target whose schema uses partial unique indexes.** Soft-delete tables are the common case. You will now get a refusal at translation naming the index, the predicate and the rewrite, instead of a duplicate-key failure later.
 - **Anyone using `--auto-prune-change-log` with more than one sync off a single trigger-CDC source.** Read the new warning; the combination is unsafe today and the flag will tell you so.
 
