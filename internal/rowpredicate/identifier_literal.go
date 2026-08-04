@@ -65,12 +65,17 @@ const (
 // optional seconds, optional fraction.
 var timeCanonicalRE = regexp.MustCompile(`^(-?)(\d{1,3}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?$`)
 
-// canonicalIdentifierLiteral returns the canonical spelling of s for kind —
-// the form the engine's decoder produces, and therefore the only form the
-// client evaluator can compare byte-exactly. ok is false when s is not a valid
-// value of that kind at all.
-func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.NetworkLiteralRendering) (canonical string, ok bool) {
-	switch kind {
+// canonicalIdentifierLiteral returns the canonical spelling of s for the
+// column described by info — the form the engine's decoder produces, and
+// therefore the only form the client evaluator can compare byte-exactly. ok is
+// false when s is not a valid value of that kind at all.
+//
+// It takes the whole [ColumnInfo] rather than the kind alone because two of
+// the four kinds need a per-column engine fact to answer: the network
+// rendering, and the MAC width.
+func canonicalIdentifierLiteral(s string, info ColumnInfo) (canonical string, ok bool) {
+	network := info.NetworkRendering
+	switch info.Identifier {
 	case identifierUUID:
 		// Accept the spellings a source would (braces, no hyphens, any case)
 		// and render the decoder's form: lowercase hex, 8-4-4-4-12.
@@ -166,15 +171,26 @@ func canonicalIdentifierLiteral(kind identifierKind, s string, network ir.Networ
 		return "", false
 
 	case identifierMAC:
-		// net.ParseMAC also accepts 8-byte EUI-64 and 20-byte InfiniBand
-		// forms. Only the 6-byte form has a canonical spelling this package
-		// can stand behind — see checkMACLiteralWidth for why, and for what
-		// it deliberately does NOT close.
+		// net.ParseMAC also accepts a 20-byte InfiniBand form, which neither
+		// PG MAC type can hold; checkMACLiteralWidth has already refused
+		// every width the column cannot store by the time this runs.
 		hw, err := net.ParseMAC(s)
-		if err != nil || len(hw) != 6 {
+		if err != nil {
 			return "", false
 		}
-		return hw.String(), true
+		switch {
+		case len(hw) == info.MACWidth:
+			return hw.String(), true
+		case len(hw) == ir.MacaddrEUI48 && info.MACWidth == ir.MacaddrEUI64:
+			// A `macaddr8` column ACCEPTS a 6-byte literal and stores it
+			// WIDENED — so the canonical spelling of `08:00:2b:01:02:03` on
+			// such a column is `08:00:2b:ff:fe:01:02:03`, and the generic
+			// not-the-canonical-spelling refusal names it. That is the C1
+			// residual: before the width existed this literal compiled clean
+			// and then matched nothing, forever, at exit 0.
+			return widenEUI48(hw).String(), true
+		}
+		return "", false
 
 	case identifierTime:
 		// Only reached for a TIME(0) column — a fractional one is refused
@@ -276,12 +292,12 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		}
 	}
 	if info.Identifier == identifierMAC {
-		if err := checkMACLiteralWidth(col, lit.str); err != nil {
+		if err := checkMACLiteralWidth(col, lit.str, info.MACWidth); err != nil {
 			return err
 		}
 	}
 
-	canonical, ok := canonicalIdentifierLiteral(info.Identifier, lit.str, info.NetworkRendering)
+	canonical, ok := canonicalIdentifierLiteral(lit.str, info)
 	if !ok {
 		return fmt.Errorf("literal %q is not a valid value for %s column %q",
 			lit.str, identifierKindName(info.Identifier), col)
@@ -326,46 +342,66 @@ func checkNetworkLiteralZone(col, lit string) error {
 	)
 }
 
-// checkMACLiteralWidth refuses a MAC literal that is not the 6-byte EUI-48
-// form, because [net.ParseMAC] also accepts 8-byte EUI-64 and 20-byte
-// InfiniBand spellings and both render back to themselves — so they compile
-// clean and match nothing on a `macaddr` column.
+// checkMACLiteralWidth refuses a MAC literal the column cannot STORE, because
+// [net.ParseMAC] accepts 6-byte EUI-48, 8-byte EUI-64 and 20-byte InfiniBand
+// spellings and each renders back to itself — so a too-wide one compiles clean
+// and then matches nothing.
 //
-// WHAT THIS DOES NOT CLOSE, stated because the narrow scope is deliberate and
-// reads as broader than it is: [ir.Macaddr] is an EMPTY STRUCT, and the
-// Postgres reader maps BOTH `macaddr` and `macaddr8` onto it
-// (engines/postgres/types.go). The width is therefore indistinguishable here
-// BY CONSTRUCTION, and this check picks the side that fails loudly on the
-// common column type:
+// THE TRUTH TABLE, now that [ir.Macaddr] carries the width (roadmap item 117;
+// the previous version of this comment recorded the same four rows under the
+// constraint that the width was unknowable, and over-refused row 2 as a
+// result):
 //
-//   - 8-byte literal on `macaddr`  — impossible to store. REFUSED by this.
-//   - 8-byte literal on `macaddr8` — correct today. Also refused by this, and
-//     that is the cost: a working filter becomes a loud error naming why.
+//   - 8-byte literal on `macaddr`  — impossible to store. REFUSED here.
+//   - 8-byte literal on `macaddr8` — correct, and now ACCEPTED. This is the
+//     over-refusal v0.110.1 shipped deliberately and this lifts.
 //   - 6-byte literal on `macaddr`  — correct. Accepted.
-//   - 6-byte literal on `macaddr8` — STILL SILENTLY WRONG, and NOT closed
-//     here. Postgres widens EUI-48 to EUI-64 on input (`08:00:2b:01:02:03` is
-//     stored and delivered as `08:00:2b:ff:fe:01:02:03`), so the literal never
-//     equals the delivered value.
+//   - 6-byte literal on `macaddr8` — accepted HERE and then refused by the
+//     canonical-spelling check, which names the widened form to write. That
+//     is the C1 residual closing: Postgres stores a 6-byte input in a
+//     macaddr8 column widened to EUI-64 (`08:00:2b:01:02:03` is delivered as
+//     `08:00:2b:ff:fe:01:02:03`), so the literal never equals the delivered
+//     value and every change to every matching row was silently dropped.
+//   - 20-byte InfiniBand literal on either — no PG MAC type holds it.
+//     REFUSED.
 //
-// That last row needs a width on the IR type plus a fingerprint exclusion for
-// the new field (the item-104 trap), which is the queued C1 residual and not
-// this. Until it lands, a `--where` on a macaddr8 column is unsafe in one
-// direction and this comment is the only thing that says so.
-func checkMACLiteralWidth(col, lit string) error {
+// THE WIDENING IS AN ENGINE FACT, not sluice's invention: it is Postgres's
+// documented macaddr8 input coercion (FF:FE inserted in the middle; the 7th-bit
+// flip is the separate `macaddr8_set7bit()` function and is NOT applied on
+// input). Per the premise-naming rule it is ground-truthed against a real
+// server rather than asserted — TestMacaddr8WidensEUI48OnInput in
+// engines/postgres. Postgres is the only engine that produces [ir.Macaddr] at
+// all, so the rule has exactly one claimant.
+func checkMACLiteralWidth(col, lit string, colWidth int) error {
 	// A literal that does not parse as a MAC at all is not this check's
 	// business — it falls through to the generic invalid-literal refusal,
 	// which already names the column and the kind.
 	width, parsed := macLiteralWidth(lit)
-	if !parsed || width == 6 {
+	if !parsed {
+		return nil
+	}
+	// An unspecified column width means a producer of ir.Macaddr appeared
+	// that did not decide (both Postgres readers do). Refuse rather than
+	// assume 6: assuming is how the macaddr8 row above stayed silent for the
+	// whole life of this check, and refusing surfaces the drift loudly. Same
+	// adjudication, and the same shape, as an unknown NetworkRendering.
+	if colWidth == 0 {
+		return fmt.Errorf(
+			"column %q is a macaddr column whose WIDTH this source engine did not report — `macaddr` holds 6 "+
+				"bytes and `macaddr8` holds 8, and Postgres widens a 6-byte value on input to the latter, so no "+
+				"literal spelling can be known to compare correctly and the wrong one would score every row out "+
+				"of scope and silently drop every change to it. Filter on a different column",
+			col,
+		)
+	}
+	if width == colWidth || (width == ir.MacaddrEUI48 && colWidth == ir.MacaddrEUI64) {
 		return nil
 	}
 	return fmt.Errorf(
-		"literal %q on macaddr column %q is a %d-byte address; Postgres `macaddr` holds 6 bytes, so no stored "+
-			"value can equal it and this filter would compile and then match nothing, silently dropping every "+
-			"change to every row. sluice cannot tell `macaddr` from `macaddr8` (both read as ir.Macaddr), so an "+
-			"8-byte literal is refused even on a macaddr8 column rather than guessed at. Filter on a different "+
-			"column, or write the 6-byte form if the column is `macaddr`",
-		lit, col, width,
+		"literal %q on macaddr column %q is a %d-byte address; that column holds %d bytes, so no stored value "+
+			"can equal it and this filter would compile and then match nothing, silently dropping every change "+
+			"to every row. Write the %d-byte form, or filter on a different column",
+		lit, col, width, colWidth, colWidth,
 	)
 }
 
@@ -378,6 +414,18 @@ func macLiteralWidth(lit string) (width int, parsed bool) {
 		return 0, false
 	}
 	return len(hw), true
+}
+
+// widenEUI48 renders a 6-byte MAC in the 8-byte form Postgres stores it as in
+// a `macaddr8` column: the two halves separated by FF:FE. It is deliberately
+// NOT a general EUI-48→EUI-64 conversion — the IEEE modified-EUI-64 form also
+// flips the universal/local bit, and Postgres does not do that on input (that
+// is `macaddr8_set7bit()`, which an operator calls explicitly).
+func widenEUI48(hw net.HardwareAddr) net.HardwareAddr {
+	out := make(net.HardwareAddr, 0, ir.MacaddrEUI64)
+	out = append(out, hw[:3]...)
+	out = append(out, 0xff, 0xfe)
+	return append(out, hw[3:]...)
 }
 
 func identifierKindName(k identifierKind) string {

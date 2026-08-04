@@ -125,7 +125,9 @@ func TestSchemaReader_TypeMatrix(t *testing.T) {
 		"external_id": ir.UUID{},
 		"ip_address":  ir.Inet{},
 		"network":     ir.Cidr{},
-		"mac":         ir.Macaddr{},
+		// Item 117: the width is read, not discarded — MACADDR8 vs MACADDR
+		// on emit depends on it. TestSchemaReader_MacaddrWidths covers both.
+		"mac": ir.Macaddr{Width: ir.MacaddrEUI48},
 		// TRIAGE #3: the seed declares BARE TIMESTAMPTZ / TIME (no
 		// precision), which reads as PrecisionUnspecified — not the
 		// materialized information_schema default 6.

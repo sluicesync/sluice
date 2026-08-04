@@ -67,6 +67,7 @@ func TestRegistry_CoversEveryBugClass(t *testing.T) {
 		"inet":         {true, "Bug 73/74 inet[] element class"},
 		"cidr":         {true, "Bug 73/74 cidr[] element class"},
 		"macaddr":      {true, "Bug 73/74 macaddr[] element class"},
+		"macaddr8":     {true, "Bug 225 / item 117 macaddr8[] element class — a DIFFERENT pgx codec"},
 		"enum":         {false, "enum"},
 	}
 
@@ -571,7 +572,7 @@ func TestRegistry_SQLiteExpectations(t *testing.T) {
 	}
 
 	// SQLite as a TARGET: the ADR-0134 emit-refusal classes are LOUD.
-	for _, fam := range []string{"bit8", "varbit", "inet", "cidr", "macaddr"} {
+	for _, fam := range []string{"bit8", "varbit", "inet", "cidr", "macaddr", "macaddr8"} {
 		f := byName[fam]
 		d := pgToSQ
 		if f.pgType == "" {

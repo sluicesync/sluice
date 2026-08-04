@@ -457,6 +457,12 @@ func registry() []*family {
 		netFamily("inet", "inet"),
 		netFamily("cidr", "cidr"),
 		netFamily("macaddr", "macaddr"),
+		// macaddr8 is its OWN family, not a variant of macaddr: the pgx
+		// codec is keyed on the target OID, and `_macaddr8` turned out to
+		// have no registered array codec at all while `_macaddr` did
+		// (Bug 225 / item 117). A macaddr-only corpus could never have
+		// found that.
+		netFamily("macaddr8", "macaddr8"),
 
 		// --- Enum.
 		enumFamily(),
@@ -982,6 +988,12 @@ func netFamily(name, pgType string) *family {
 				lit = fmt.Sprintf("%d.%d.%d.%d", r.Intn(256), r.Intn(256), r.Intn(256), r.Intn(256))
 			case "cidr":
 				lit = fmt.Sprintf("%d.%d.%d.0/24", r.Intn(256), r.Intn(256), r.Intn(256))
+			case "macaddr8":
+				// Always the 8-byte EUI-64 spelling: Postgres WIDENS a 6-byte
+				// input into a macaddr8 column (FF:FE inserted), so generating
+				// the narrow form would make the round-trip compare a value
+				// the corpus never wrote (roadmap item 117).
+				lit = fmt.Sprintf("08:00:2b:ff:fe:%02x:%02x:%02x", r.Intn(256), r.Intn(256), r.Intn(256))
 			default: // macaddr
 				lit = fmt.Sprintf("08:00:2b:%02x:%02x:%02x", r.Intn(256), r.Intn(256), r.Intn(256))
 			}

@@ -126,10 +126,12 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 // (roadmap items 102/104). Excluding it costs a narrow, stated thing: chain
 // drift detection does not notice this one attribute changing between the
 // backup and the restore target.
+// Finally it strips [ir.Macaddr.Width] via [fingerprintType], for the same
+// reason and with the same cost — see that function.
 func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 	normalize := false
 	for _, c := range in {
-		if c != nil && (c.Default == nil || c.OnUpdateCurrentTimestamp) {
+		if c != nil && columnNeedsFingerprintNormalizing(c) {
 			normalize = true
 			break
 		}
@@ -139,7 +141,7 @@ func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 	}
 	out := make([]*ir.Column, len(in))
 	for i, c := range in {
-		if c == nil || (c.Default != nil && !c.OnUpdateCurrentTimestamp) {
+		if c == nil || !columnNeedsFingerprintNormalizing(c) {
 			out[i] = c
 			continue
 		}
@@ -148,9 +150,78 @@ func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
 			cc.Default = ir.DefaultNone{}
 		}
 		cc.OnUpdateCurrentTimestamp = false
+		if t, changed := fingerprintType(cc.Type); changed {
+			cc.Type = t
+		}
 		out[i] = &cc
 	}
 	return out
+}
+
+// columnNeedsFingerprintNormalizing is the early-out predicate for
+// [canonicalColumnsForHash]. It is deliberately ONE function used by both the
+// scan and the rewrite: when those two drifted apart the scan short-circuited
+// on a column the rewrite would have changed, and the exclusion silently did
+// not apply. Extend THIS when a new field or type joins the excluded set.
+func columnNeedsFingerprintNormalizing(c *ir.Column) bool {
+	if c.Default == nil || c.OnUpdateCurrentTimestamp {
+		return true
+	}
+	_, changed := fingerprintType(c.Type)
+	return changed
+}
+
+// fingerprintType strips the fingerprint-EXCLUDED fields from an IR type,
+// returning the rewritten type and whether anything changed. It recurses
+// through the two types that nest another one — [ir.Array.Element] and
+// [ir.Domain.BaseType] — because `macaddr8[]` is a real Postgres column and
+// an exclusion that only reached the scalar would have moved the fingerprint
+// of every chain carrying the array form.
+//
+// TODAY THE SET IS EXACTLY ONE FIELD: [ir.Macaddr.Width] (roadmap item 117 /
+// Bug 225). The reason is the one that governs the whole exclusion block
+// below — the Postgres reader sets the width to 6 for an ORDINARY `macaddr`
+// column, so `omitempty` (which drops only the zero value) would not hold it
+// back: the key would be present in the type envelope of every real Postgres
+// chain carrying a MAC column, the fingerprint would move, and a new epoch
+// would be minted that makes those chains unrestorable. Excluding it restores
+// the pre-change bytes EXACTLY, for both widths.
+//
+// WHAT THE EXCLUSION COSTS, stated exactly. The recorded schema still carries
+// the width (it rides the wire — see [ir.MarshalType]), so a restore rebuilds
+// `macaddr8` correctly; what is lost is the fingerprint's ability to NOTICE a
+// `macaddr` ⇄ `macaddr8` retype between a backup and its restore target, and
+// — since [canonicalManifestBytes] folds the fingerprint STRING rather than
+// the schema bytes — signing does not backstop a tampered width either. The
+// schema DIFF still sees it: [ir.Macaddr.String] renders the two forms
+// differently, which is what both diff paths compare.
+//
+// The input is never mutated: the manifest records the schema exactly as the
+// reader produced it, and only the FINGERPRINT is canonical.
+func fingerprintType(t ir.Type) (ir.Type, bool) {
+	switch v := t.(type) {
+	case ir.Macaddr:
+		if v.Width == 0 {
+			return t, false
+		}
+		return ir.Macaddr{}, true
+	case ir.Array:
+		elem, changed := fingerprintType(v.Element)
+		if !changed {
+			return t, false
+		}
+		return ir.Array{Element: elem}, true
+	case ir.Domain:
+		base, changed := fingerprintType(v.BaseType)
+		if !changed {
+			return t, false
+		}
+		out := v
+		out.BaseType = base
+		return out, true
+	default:
+		return t, false
+	}
 }
 
 // FINGERPRINT-EXCLUDED FIELDS (roadmap item 104 / Bug 216).

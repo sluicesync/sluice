@@ -246,7 +246,14 @@ func TestEmitColumnType_PGNativeAutoEmit(t *testing.T) {
 	}{
 		{ir.Inet{}, "VARCHAR(45)"},
 		{ir.Cidr{}, "VARCHAR(45)"},
+		// Both MAC widths land on the same VARCHAR — the emitter's own
+		// comment already sized it for the EUI-64 form (23 chars). Pinned
+		// per width (item 117) so a future width-aware branch cannot narrow
+		// the 8-byte one without failing here, which is the shape Bug 225
+		// took on the Postgres side.
 		{ir.Macaddr{}, "VARCHAR(30)"},
+		{ir.Macaddr{Width: ir.MacaddrEUI48}, "VARCHAR(30)"},
+		{ir.Macaddr{Width: ir.MacaddrEUI64}, "VARCHAR(30)"},
 		{ir.Array{Element: ir.Integer{Width: 32}}, "JSON"},
 	}
 	for _, c := range cases {

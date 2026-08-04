@@ -686,6 +686,7 @@ func (w *RowWriter) copyFromOnSQLConn(
 	needsPGVectorCodec := tableHasPGVectorColumn(table)
 	needsPGHstoreCodec := tableHasHstoreColumn(table)
 	needsPGTimetzCodec := tableHasTimetzColumn(table)
+	needsMacaddr8Array := tableHasMacaddr8ArrayColumn(table)
 
 	var copied int64
 	rawErr := sqlConn.Raw(func(driverConn any) error {
@@ -706,6 +707,11 @@ func (w *RowWriter) copyFromOnSQLConn(
 		}
 		if needsPGTimetzCodec {
 			registerPGTimetzCodec(conn)
+		}
+		if needsMacaddr8Array {
+			if err := registerPGMacaddr8ArrayCodec(conn); err != nil {
+				return err
+			}
 		}
 		n, copyErr := conn.CopyFrom(
 			ctx,

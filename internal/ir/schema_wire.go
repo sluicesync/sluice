@@ -152,6 +152,22 @@ type schemaTypeEnvelope struct {
 	DomainName     string              `json:"domain_name,omitempty"`
 	DomainBaseType json.RawMessage     `json:"domain_base_type,omitempty"`
 	DomainChecks   []domainCheckOnDisk `json:"domain_checks,omitempty"`
+
+	// Macaddr width in BYTES (roadmap item 117 / Bug 225): 6 for
+	// `macaddr`, 8 for `macaddr8`. It gets its OWN envelope field rather
+	// than reusing `Width` (which carries Integer's BIT width) because the
+	// units differ and a shared key would read as the same quantity.
+	//
+	// It MUST ride the wire: without it a manifest records a `macaddr8`
+	// column as a bare Macaddr and restore rebuilds it as `MACADDR`, which
+	// is silent narrowing on the restore path. It is excluded from the
+	// schema FINGERPRINT instead — see internal/ir/backup/chain.go.
+	//
+	// Append-only, and forward-compatible in the direction that matters: an
+	// older binary reading a newer manifest ignores this key and decodes a
+	// bare Macaddr, i.e. emits `MACADDR` — exactly what it does today for a
+	// macaddr8 column. No regression, no format bump.
+	MacaddrWidth int `json:"macaddr_width,omitempty"`
 }
 
 // domainCheckOnDisk is the wire shape of one [DomainCheck] inside a
@@ -263,6 +279,7 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Kind = "Cidr"
 	case Macaddr:
 		env.Kind = "Macaddr"
+		env.MacaddrWidth = v.Width
 	case VerbatimType:
 		// ADR-0047: uncatalogued PG extension type carried verbatim.
 		// PG-restore-only; the lineage-segment marker + restore-time
@@ -386,7 +403,7 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "Cidr":
 		return Cidr{}, nil
 	case "Macaddr":
-		return Macaddr{}, nil
+		return Macaddr{Width: env.MacaddrWidth}, nil
 	case "VerbatimType":
 		// ADR-0047. Recover the exact PG type spelling. Decode is
 		// engine-agnostic; the restore-time engine gate (checked before

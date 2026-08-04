@@ -448,8 +448,14 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 		return ir.Inet{}, nil
 	case pgtype.CIDROID:
 		return ir.Cidr{}, nil
-	case pgtype.MacaddrOID, pgtype.Macaddr8OID:
-		return ir.Macaddr{}, nil
+	// Split by width, in family-parity with the schema reader's text-keyed
+	// arm (Bug 97's dual-registry-drift lesson): a CDC relation that read a
+	// `macaddr8` column as a bare Macaddr would hand the applier a 6-byte
+	// target type for an 8-byte value. TestOIDToType pins both OIDs.
+	case pgtype.MacaddrOID:
+		return ir.Macaddr{Width: ir.MacaddrEUI48}, nil
+	case pgtype.Macaddr8OID:
+		return ir.Macaddr{Width: ir.MacaddrEUI64}, nil
 	}
 	// Bug 97 (v0.92.0): verbatim-carry families landed in the schema
 	// reader via [coreVerbatimEligibleTypes] (ADR-0051 Stage 1, then

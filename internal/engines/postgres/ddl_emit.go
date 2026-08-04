@@ -173,7 +173,27 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Cidr:
 		return "CIDR", nil
 	case ir.Macaddr:
-		return "MACADDR", nil
+		// Bug 225: emitting MACADDR unconditionally NARROWED a source
+		// `macaddr8` to six bytes, and the COPY then failed on the first
+		// 8-byte value — a PG macaddr8 column could not be migrated or
+		// synced to a PG target at all. The unspecified width still renders
+		// MACADDR (the v0.99.51 zero-value rule: every construction site
+		// that predates the field, and every manifest written by an older
+		// binary, keeps exactly its old output).
+		switch v.Width {
+		case 0, ir.MacaddrEUI48:
+			return "MACADDR", nil
+		case ir.MacaddrEUI64:
+			return "MACADDR8", nil
+		default:
+			// Postgres has exactly two MAC types. A third width can only
+			// have come from a corrupt or future manifest, and quietly
+			// rounding it to one of the two is how a value gets truncated
+			// on the first COPY instead of here.
+			return "", fmt.Errorf(
+				"postgres: macaddr width %d bytes has no Postgres type (6 = MACADDR, 8 = MACADDR8)", v.Width,
+			)
+		}
 
 	// ---- Composite (extension) ----
 	case ir.Array:

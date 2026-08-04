@@ -287,7 +287,15 @@ func TestOIDToType(t *testing.T) {
 		{"uuid", pgtype.UUIDOID, -1, ir.UUID{}},
 		{"inet", pgtype.InetOID, -1, ir.Inet{}},
 		{"cidr", pgtype.CIDROID, -1, ir.Cidr{}},
-		{"macaddr", pgtype.MacaddrOID, -1, ir.Macaddr{}},
+		// Both widths, split: a bare ir.Macaddr for macaddr8 would hand the
+		// applier a 6-byte target type for an 8-byte value (Bug 225). The
+		// array siblings ride the same recursion and are pinned here rather
+		// than assumed, because `_macaddr8` is the OID this reader carries a
+		// hand-written constant for.
+		{"macaddr", pgtype.MacaddrOID, -1, ir.Macaddr{Width: ir.MacaddrEUI48}},
+		{"macaddr8", pgtype.Macaddr8OID, -1, ir.Macaddr{Width: ir.MacaddrEUI64}},
+		{"macaddr[]", pgtype.MacaddrArrayOID, -1, ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI48}}},
+		{"macaddr8[]", macaddr8ArrayOID, -1, ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI64}}},
 		// numeric(8,2) typmod = ((8<<16)|2) + 4 = 524294
 		{"numeric(8,2)", pgtype.NumericOID, 524294, ir.Decimal{Precision: 8, Scale: 2}},
 		// NEGATIVE scale (PG 15+): typmod = ((5<<16) | ((-2)&0x7ff)) + 4

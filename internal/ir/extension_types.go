@@ -351,12 +351,57 @@ func (Cidr) isType()        {}
 func (Cidr) Tier() Tier     { return TierExtension }
 func (Cidr) String() string { return "Cidr" }
 
-// Macaddr represents a hardware (MAC) address (Postgres macaddr).
-type Macaddr struct{}
+// MacaddrEUI48 / MacaddrEUI64 are the two widths a Postgres MAC-address
+// column can have, in BYTES: `macaddr` holds a 6-byte EUI-48 and
+// `macaddr8` holds an 8-byte EUI-64. Postgres has no other MAC type, so
+// these two plus the unspecified zero value are the whole domain.
+const (
+	MacaddrEUI48 = 6
+	MacaddrEUI64 = 8
+)
 
-func (Macaddr) isType()        {}
-func (Macaddr) Tier() Tier     { return TierExtension }
-func (Macaddr) String() string { return "Macaddr" }
+// Macaddr represents a hardware (MAC) address (Postgres `macaddr` or
+// `macaddr8`).
+type Macaddr struct {
+	// Width is the address width in BYTES — [MacaddrEUI48] for `macaddr`,
+	// [MacaddrEUI64] for `macaddr8`.
+	//
+	// ZERO MEANS UNSPECIFIED, and every consumer must treat it exactly as
+	// it treated the field-less type this replaced: the Postgres emitter
+	// renders `MACADDR`, [String] renders "Macaddr". That is the
+	// v0.99.51 zero-value rule — the width arrived after the type, so
+	// every construction site that predates it (a manifest written by an
+	// older binary, a translate/test fixture) keeps its old behaviour
+	// rather than silently acquiring the wider one.
+	//
+	// Only the two Postgres readers set it: the text-keyed schema reader
+	// (engines/postgres/types.go) and the OID-keyed CDC relation reader
+	// (engines/postgres/cdc_relations.go). They are the only producers of
+	// this type in the tree, which is what lets consumers treat an
+	// unspecified width on a live read as drift rather than as "6"
+	// (see rowpredicate.checkMACLiteralWidth).
+	//
+	// The width rides the backup wire (schema_wire.go) but is DELIBERATELY
+	// EXCLUDED from the schema fingerprint — see the exclusion block in
+	// internal/ir/backup/chain.go, and roadmap item 104 for why a field
+	// that is non-zero on ordinary source data must never reach that hash.
+	Width int
+}
+
+func (Macaddr) isType()    {}
+func (Macaddr) Tier() Tier { return TierExtension }
+
+// String renders the EUI-64 form distinctly, so the two schema-diff paths
+// that compare RENDERED TYPE STRINGS (diff.typeString, diff.typeStringDrift)
+// report a `macaddr` → `macaddr8` change instead of silently agreeing. The
+// unspecified width renders as the historical "Macaddr", so a legacy
+// manifest does not read as a type change against a freshly-read `macaddr`.
+func (m Macaddr) String() string {
+	if m.Width == MacaddrEUI64 {
+		return "Macaddr8"
+	}
+	return "Macaddr"
+}
 
 // ExtensionType represents a column type defined by a PG extension
 // (ADR-0032). The IR is engine-neutral by name (Extension + Name); the

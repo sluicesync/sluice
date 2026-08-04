@@ -311,12 +311,19 @@ func TestEmitColumnType(t *testing.T) {
 		{"uuid", ir.UUID{}, "UUID"},
 		{"inet", ir.Inet{}, "INET"},
 		{"cidr", ir.Cidr{}, "CIDR"},
-		{"macaddr", ir.Macaddr{}, "MACADDR"},
+		// Bug 225: the width picks the type. The UNSPECIFIED width must keep
+		// emitting MACADDR — every pre-width construction site, and every
+		// manifest an older binary wrote, carries it (the v0.99.51 rule).
+		{"macaddr (unspecified width)", ir.Macaddr{}, "MACADDR"},
+		{"macaddr", ir.Macaddr{Width: ir.MacaddrEUI48}, "MACADDR"},
+		{"macaddr8", ir.Macaddr{Width: ir.MacaddrEUI64}, "MACADDR8"},
 
 		// ---- Arrays ----
 		{"int array", ir.Array{Element: ir.Integer{Width: 32}}, "INTEGER[]"},
 		{"text array", ir.Array{Element: ir.Text{Size: ir.TextLong}}, "TEXT[]"},
 		{"uuid array", ir.Array{Element: ir.UUID{}}, "UUID[]"},
+		{"macaddr array", ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI48}}, "MACADDR[]"},
+		{"macaddr8 array", ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI64}}, "MACADDR8[]"},
 
 		// ---- Set → TEXT[] (membership CHECK emitted by emitTableDef) ----
 		{"set", ir.Set{Values: []string{"a", "b", "c"}}, "TEXT[]"},

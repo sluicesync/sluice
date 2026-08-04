@@ -184,8 +184,8 @@ func TestTranslateType(t *testing.T) {
 		{"uuid", columnMeta{DataType: "uuid"}, ir.UUID{}},
 		{"inet", columnMeta{DataType: "inet"}, ir.Inet{}},
 		{"cidr", columnMeta{DataType: "cidr"}, ir.Cidr{}},
-		{"macaddr", columnMeta{DataType: "macaddr"}, ir.Macaddr{}},
-		{"macaddr8", columnMeta{DataType: "macaddr8"}, ir.Macaddr{}},
+		{"macaddr", columnMeta{DataType: "macaddr"}, ir.Macaddr{Width: ir.MacaddrEUI48}},
+		{"macaddr8", columnMeta{DataType: "macaddr8"}, ir.Macaddr{Width: ir.MacaddrEUI64}},
 
 		// ---- Enum ----
 		{

@@ -91,12 +91,26 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 		},
 		{
 			name:      "macaddr",
-			colType:   ir.Macaddr{},
+			colType:   ir.Macaddr{Width: ir.MacaddrEUI48},
 			canonical: "08:00:2b:01:02:03",
 			divergent: []string{
 				"08-00-2B-01-02-03", // dashes + uppercase
 				"0800.2b01.0203",    // Cisco dotted
 				"08:00:2B:01:02:03", // uppercase
+			},
+		},
+		{
+			// Item 117 / the C1 residual. A macaddr8 column delivers the
+			// WIDENED form, so the 6-byte spelling an operator naturally
+			// writes is the divergent one — the row that compiled clean and
+			// then matched nothing for the whole life of this check.
+			name:      "macaddr8",
+			colType:   ir.Macaddr{Width: ir.MacaddrEUI64},
+			canonical: "08:00:2b:ff:fe:01:02:03",
+			divergent: []string{
+				"08:00:2b:01:02:03",       // the EUI-48 form PG widens on input
+				"08-00-2B-FF-FE-01-02-03", // dashes + uppercase
+				"08:00:2B:FF:FE:01:02:03", // uppercase
 			},
 		},
 		{
@@ -172,7 +186,8 @@ func TestIdentifierLiteral_InvalidValuesAreRefused(t *testing.T) {
 	}{
 		{ir.UUID{}, "not-a-uuid"},
 		{ir.Inet{}, "999.999.999.999"},
-		{ir.Macaddr{}, "zz:00:2b:01:02:03"},
+		{ir.Macaddr{Width: ir.MacaddrEUI48}, "zz:00:2b:01:02:03"},
+		{ir.Macaddr{Width: ir.MacaddrEUI64}, "zz:00:2b:ff:fe:01:02:03"},
 		{ir.Time{Precision: 0}, "25:99"},
 	}
 	for _, tc := range cases {
@@ -207,21 +222,29 @@ func TestCanonicalIdentifierLiteral_MatchesDecoderOutput(t *testing.T) {
 		// rendering matrix lives in
 		// TestCanonicalNetworkLiteral_FollowsTheEngineRendering.
 		network ir.NetworkLiteralRendering
+		// macWidth is meaningful only for identifierMAC.
+		macWidth int
 	}{
 		{kind: identifierUUID, in: "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", want: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
 		{kind: identifierUUID, in: "a0eebc999c0b4ef8bb6d6bb9bd380a11", want: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
 		{kind: identifierNetwork, in: "010.000.000.001", want: "10.0.0.1", network: ir.NetworkLiteralRenderingAddressOnly},
 		{kind: identifierNetwork, in: "10.0.0.0/24", want: "10.0.0.0/24", network: ir.NetworkLiteralRenderingHostBare},
 		{kind: identifierNetwork, in: "2001:0db8:0000:0000:0000:0000:0000:0001", want: "2001:db8::1", network: ir.NetworkLiteralRenderingAddressOnly},
-		{kind: identifierMAC, in: "08-00-2B-01-02-03", want: "08:00:2b:01:02:03"},
-		{kind: identifierMAC, in: "0800.2b01.0203", want: "08:00:2b:01:02:03"},
+		{kind: identifierMAC, macWidth: ir.MacaddrEUI48, in: "08-00-2B-01-02-03", want: "08:00:2b:01:02:03"},
+		{kind: identifierMAC, macWidth: ir.MacaddrEUI48, in: "0800.2b01.0203", want: "08:00:2b:01:02:03"},
+		// macaddr8: the decoder delivers 8 bytes, so a native 8-byte literal
+		// canonicalises to itself and a 6-byte one canonicalises to the form
+		// Postgres actually stores it as.
+		{kind: identifierMAC, macWidth: ir.MacaddrEUI64, in: "08-00-2B-FF-FE-01-02-03", want: "08:00:2b:ff:fe:01:02:03"},
+		{kind: identifierMAC, macWidth: ir.MacaddrEUI64, in: "08:00:2b:01:02:03", want: "08:00:2b:ff:fe:01:02:03"},
 		{kind: identifierTime, in: "08:30:00", want: "08:30:00"},
 	}
 	for _, tc := range cases {
-		got, ok := canonicalIdentifierLiteral(tc.kind, tc.in, tc.network)
+		info := ColumnInfo{Identifier: tc.kind, NetworkRendering: tc.network, MACWidth: tc.macWidth}
+		got, ok := canonicalIdentifierLiteral(tc.in, info)
 		if !ok || got != tc.want {
-			t.Errorf("canonicalIdentifierLiteral(%v, %q, %v) = %q, %v; want %q, true",
-				tc.kind, tc.in, tc.network, got, ok, tc.want)
+			t.Errorf("canonicalIdentifierLiteral(%q, %+v) = %q, %v; want %q, true",
+				tc.in, info, got, ok, tc.want)
 		}
 	}
 }
@@ -306,7 +329,8 @@ func TestCanonicalNetworkLiteral_FollowsTheEngineRendering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := canonicalIdentifierLiteral(identifierNetwork, tc.in, tc.rendering)
+			got, ok := canonicalIdentifierLiteral(tc.in,
+				ColumnInfo{Identifier: identifierNetwork, NetworkRendering: tc.rendering})
 			if ok != tc.wantOK || got != tc.want {
 				t.Errorf("canonicalIdentifierLiteral(network, %q, %v) = %q, %v; want %q, %v",
 					tc.in, tc.rendering, got, ok, tc.want, tc.wantOK)
@@ -438,44 +462,77 @@ func TestNetworkLiteral_ZoneScopedIsRefused(t *testing.T) {
 	}
 }
 
-// TestMACLiteral_NonEUI48WidthsAreRefused pins the other half of the same
-// review finding. net.ParseMAC accepts 8-byte EUI-64 and 20-byte InfiniBand
-// forms, and HardwareAddr.String renders them back to themselves — so they
-// canonicalise to themselves and compiled clean against a `macaddr` column
-// that can only hold 6 bytes.
+// TestMACLiteral_WidthTruthTable is the FULL matrix of checkMACLiteralWidth's
+// doc — every column width × every literal width, with the disposition and,
+// where it is refused, the REASON. The previous version of this test pinned
+// one column width (the empty ir.Macaddr) against two over-wide literals, and
+// its own doc said so: the 6-byte-literal-on-macaddr8 row was the one that
+// mattered and was the one it could not reach. That is the class-vs-
+// representative shape, so the replacement enumerates the product.
 //
-// SCOPE, because it is narrower than the name suggests: ir.Macaddr is an empty
-// struct and the Postgres reader maps BOTH `macaddr` and `macaddr8` onto it,
-// so a 6-byte literal on a macaddr8 column — which PG widens to EUI-64 on
-// input and therefore never delivers back — is STILL silently wrong and is NOT
-// covered here. That needs a width on the IR type and is the queued C1
-// residual. See checkMACLiteralWidth.
-func TestMACLiteral_NonEUI48WidthsAreRefused(t *testing.T) {
-	infos := ColumnInfosFromIR(ir.ByteExactCollationResolver{},
-		[]*ir.Column{{Name: "mac", Type: ir.Macaddr{}}}, false)
+// `verdict` is what the operator gets, and the distinction between the two
+// refusal kinds is load-bearing: `refusedWidth` means the column cannot STORE
+// the literal, `refusedSpelling` means it can but delivers it differently and
+// the message must name the spelling to write instead.
+func TestMACLiteral_WidthTruthTable(t *testing.T) {
+	const (
+		accepted        = "accepted"
+		refusedWidth    = "byte address"       // checkMACLiteralWidth's wording
+		refusedSpelling = "canonical spelling" // the generic canonicaliser's
+		refusedUnknown  = "did not report"     // the undeclared-width refusal
+	)
+	const infiniband = "00:00:00:00:fe:80:00:00:00:00:00:00:02:00:5e:10:00:00:00:01"
 
-	wide := []string{
-		"08:00:2b:01:02:03:04:05",                                     // EUI-64
-		"00:00:00:00:fe:80:00:00:00:00:00:00:02:00:5e:10:00:00:00:01", // InfiniBand, 20 bytes
-	}
-	for _, lit := range wide {
-		_, err := Compile("t", "mac = '"+lit+"'", infos)
-		if err == nil {
-			t.Errorf("literal %q compiled against a macaddr column; PG macaddr holds 6 bytes, so it matches "+
-				"nothing and silently drops every change", lit)
-			continue
-		}
-		// The REASON matters: net.ParseMAC accepts these, so a generic
-		// "not a valid value" would mean the width branch never ran.
-		if !strings.Contains(err.Error(), "byte address") {
-			t.Errorf("%q was refused, but not for the width reason — the width branch did not run. got: %v",
-				lit, err)
-		}
+	cases := []struct {
+		name    string
+		width   int
+		lit     string
+		verdict string
+	}{
+		// `macaddr` — 6 bytes.
+		{"eui48 literal on macaddr", ir.MacaddrEUI48, "08:00:2b:01:02:03", accepted},
+		{"eui64 literal on macaddr", ir.MacaddrEUI48, "08:00:2b:ff:fe:01:02:03", refusedWidth},
+		{"infiniband literal on macaddr", ir.MacaddrEUI48, infiniband, refusedWidth},
+
+		// `macaddr8` — 8 bytes. Row two is the over-refusal v0.110.1 shipped
+		// on purpose and this lifts; row one is the C1 residual closing.
+		{"eui48 literal on macaddr8 names the widened form", ir.MacaddrEUI64, "08:00:2b:01:02:03", refusedSpelling},
+		{"eui64 literal on macaddr8", ir.MacaddrEUI64, "08:00:2b:ff:fe:01:02:03", accepted},
+		{"infiniband literal on macaddr8", ir.MacaddrEUI64, infiniband, refusedWidth},
+
+		// Unspecified width — no producer in the tree leaves it, so this is
+		// drift, and drift is refused rather than assumed to be 6.
+		{"eui48 literal on an undeclared width", 0, "08:00:2b:01:02:03", refusedUnknown},
+		{"eui64 literal on an undeclared width", 0, "08:00:2b:ff:fe:01:02:03", refusedUnknown},
 	}
 
-	// Anti-vacuity floor: the 6-byte form still compiles, in every spelling
-	// net.ParseMAC accepts that canonicalises to the colon form.
-	if _, err := Compile("t", "mac = '08:00:2b:01:02:03'", infos); err != nil {
-		t.Errorf("canonical 6-byte MAC was refused (%v); the width test above is then vacuous", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			infos := ColumnInfosFromIR(ir.ByteExactCollationResolver{},
+				[]*ir.Column{{Name: "mac", Type: ir.Macaddr{Width: tc.width}}}, false)
+			_, err := Compile("t", "mac = '"+tc.lit+"'", infos)
+			if tc.verdict == accepted {
+				if err != nil {
+					t.Fatalf("literal %q on a %d-byte macaddr column was refused (%v); that column stores "+
+						"and delivers exactly this value, so the refusal costs a working filter", tc.lit, tc.width, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("literal %q compiled against a %d-byte macaddr column; no stored value can equal it, "+
+					"so the filter matches nothing and silently drops every change at exit 0", tc.lit, tc.width)
+			}
+			// The REASON matters: net.ParseMAC accepts every literal here, so
+			// a generic "not a valid value" would mean the intended branch
+			// never ran and the test passes for the wrong reason.
+			if !strings.Contains(err.Error(), tc.verdict) {
+				t.Fatalf("refused for the WRONG reason — want a message containing %q, got: %v", tc.verdict, err)
+			}
+			// A spelling refusal owes the operator the spelling to use.
+			if tc.verdict == refusedSpelling && !strings.Contains(err.Error(), "08:00:2b:ff:fe:01:02:03") {
+				t.Errorf("the refusal did not name the widened form Postgres actually stores; the operator "+
+					"cannot act on it. got: %v", err)
+			}
+		})
 	}
 }

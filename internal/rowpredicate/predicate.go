@@ -265,6 +265,16 @@ type ColumnInfo struct {
 	// rather than guessing, because a guess is silent (audit 2026-08-01 S2).
 	NetworkRendering ir.NetworkLiteralRendering
 
+	// MACWidth is meaningful only when Identifier is identifierMAC: the
+	// column's MAC width in BYTES, read straight off [ir.Macaddr.Width]
+	// (6 = `macaddr`, 8 = `macaddr8`). Like NetworkRendering, its ZERO
+	// value REFUSES the comparison rather than assuming a width: the only
+	// producers of [ir.Macaddr] are the two Postgres readers and both set
+	// it, so an unspecified width on a live schema read means a NEW
+	// producer appeared without deciding — and the failure mode of
+	// guessing is silent (roadmap item 117 / audit 2026-08-04 C1).
+	MACWidth int
+
 	// TimeFractionAmbiguous marks a TIME column with fractional-second
 	// precision, whose value renders differently on the snapshot and binlog
 	// legs — so no single literal is correct on both, and any value
@@ -392,7 +402,11 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool, tem
 	case ir.Inet, ir.Cidr:
 		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierNetwork}
 	case ir.Macaddr:
-		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierMAC}
+		// MACWidth decides which literals are valid AND what the canonical
+		// spelling of a valid one is — Postgres widens a 6-byte literal to
+		// EUI-64 on a macaddr8 column, so the two widths need different
+		// answers. See checkMACLiteralWidth for the truth table.
+		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierMAC, MACWidth: t.Width}
 	case ir.Time:
 		// Stored as a fixed-width string ("08:30:00[.ffffff]"); equality is
 		// byte-exact. Ordering is refused (over-24h / fractional edge

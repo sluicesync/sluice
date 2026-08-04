@@ -14,9 +14,11 @@
 //     timestamp(tz) / bool / NULLs, PLUS the Bug-74-corollary families —
 //     arrays (int[], text[], the EXACT numeric[][] multi-dim Bug-74 case, and
 //     a NULL-element text[]), the string-shaped non-text OIDs (uuid / inet /
-//     cidr / macaddr), the temporal leaves (date / time / timetz — timetz
-//     exercises the per-conn registerPGTimetzCodec registration that must fire
-//     on BOTH paths via copyFromOnSQLConn), and bit / varbit. This is the
+//     cidr / macaddr / macaddr8, plus BOTH MAC array widths — `_macaddr8` is
+//     the second per-conn registration, registerPGMacaddr8ArrayCodec), the
+//     temporal leaves (date / time / timetz — timetz exercises the per-conn
+//     registerPGTimetzCodec registration that must fire on BOTH paths via
+//     copyFromOnSQLConn), and bit / varbit. This is the
 //     Bug-74 discipline: the chunked path must not introduce a second
 //     encoding. The two tables are copied BOTH ways and compared via an md5
 //     over PG's own canonical ::text rendering of every row, ordered by PK.
@@ -80,7 +82,20 @@ func growFixtureSchema(name string) *ir.Schema {
 			{Name: "u", Type: ir.UUID{}, Nullable: true},
 			{Name: "ip", Type: ir.Inet{}, Nullable: true},
 			{Name: "net", Type: ir.Cidr{}, Nullable: true},
-			{Name: "mac", Type: ir.Macaddr{}, Nullable: true},
+			{Name: "mac", Type: ir.Macaddr{Width: ir.MacaddrEUI48}, Nullable: true},
+			// macaddr8 and BOTH MAC array widths (roadmap item 117 / Bug 225).
+			// mac8_arr is the reason they are here: pgx registers a codec for
+			// the macaddr8 SCALAR and for `_macaddr` but NOT for `_macaddr8`,
+			// so it needs the per-conn registerPGMacaddr8ArrayCodec — the same
+			// copyFromOnSQLConn seam timetz exercises, and it must fire on the
+			// CHUNKED path as well as the monolithic one. Dropping it aborts
+			// the COPY with "binary data has array element type 25 (text)
+			// instead of expected 774". The 6-byte siblings are alongside it
+			// because a green macaddr8 pin does not cover macaddr: the pgx
+			// codec is keyed on the target OID (the Bug-74 rule).
+			{Name: "mac8", Type: ir.Macaddr{Width: ir.MacaddrEUI64}, Nullable: true},
+			{Name: "mac6_arr", Type: ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI48}}, Nullable: true},
+			{Name: "mac8_arr", Type: ir.Array{Element: ir.Macaddr{Width: ir.MacaddrEUI64}}, Nullable: true},
 
 			// Temporal leaves. timetz exercises the per-conn
 			// registerPGTimetzCodec registration that must fire identically on
@@ -149,10 +164,15 @@ func growFixtureRows(n int) []ir.Row {
 
 			// String-shaped non-text OIDs (canonical text form, as the readers
 			// emit under pgx stdlib mode).
-			"u":   fmtUUID(i),
-			"ip":  fmtInet(i),
-			"net": fmtCidr(i),
-			"mac": fmtMac(i),
+			"u":    fmtUUID(i),
+			"ip":   fmtInet(i),
+			"net":  fmtCidr(i),
+			"mac":  fmtMac(i),
+			"mac8": fmtMac8(i),
+			// One array of each width, each with a NULL element so the
+			// typed-nil leaf is exercised on both widths too.
+			"mac6_arr": []any{fmtMac(i), nil, fmtMac(i + 1)},
+			"mac8_arr": []any{fmtMac8(i), nil, fmtMac8(i + 1)},
 
 			// Temporal: date (time.Time), time-of-day + timetz (canonical text).
 			"d":     time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i),
@@ -182,6 +202,9 @@ func growFixtureRows(n int) []ir.Row {
 			r["ip"] = nil
 			r["net"] = nil
 			r["mac"] = nil
+			r["mac8"] = nil
+			r["mac6_arr"] = nil
+			r["mac8_arr"] = nil
 			r["d"] = nil
 			r["tod"] = nil
 			r["todtz"] = nil
@@ -249,6 +272,14 @@ func fmtCidr(i int) string {
 
 func fmtMac(i int) string {
 	return "08:00:2b:01:02:" + fmtHex2(i)
+}
+
+// fmtMac8 is the 8-byte EUI-64 form, written out in full rather than as
+// fmtMac's value widened: PG would widen a 6-byte input on the way in, so a
+// derived value would compare against a DIFFERENT string than it was given and
+// the byte-identity assertion would be measuring the coercion, not the codec.
+func fmtMac8(i int) string {
+	return "08:00:2b:ff:fe:01:02:" + fmtHex2(i)
 }
 
 func fmtHex2(i int) string {

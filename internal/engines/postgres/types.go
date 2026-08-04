@@ -490,8 +490,14 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 		return ir.Inet{}, nil
 	case "cidr":
 		return ir.Cidr{}, nil
-	case "macaddr", "macaddr8":
-		return ir.Macaddr{}, nil
+	// The width is what makes `macaddr8` migratable at all: the emitter
+	// renders MACADDR for anything narrower, and an 8-byte value does not
+	// fit one (Bug 225). This is the text-keyed half; [oidToType] is the
+	// OID-keyed half and the two must stay in family-parity (Bug 97).
+	case "macaddr":
+		return ir.Macaddr{Width: ir.MacaddrEUI48}, nil
+	case "macaddr8":
+		return ir.Macaddr{Width: ir.MacaddrEUI64}, nil
 	}
 
 	// ADR-0051 (consolidating catalog Bug 17): core pg_catalog types
