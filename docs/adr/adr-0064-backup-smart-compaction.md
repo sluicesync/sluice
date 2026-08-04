@@ -64,12 +64,34 @@ Within one merge window, per `(schema, table, pk_tuple)`:
 
 | Input chain                          | Collapses to                                  |
 |--------------------------------------|-----------------------------------------------|
-| INSERT then UPDATE(s)                | INSERT with the final UPDATE's column values |
-| UPDATE(s) only                       | One UPDATE with the final UPDATE's values    |
+| INSERT then UPDATE(s)                | INSERT with the UNION of the column values (see below) |
+| UPDATE(s) only                       | One UPDATE with the UNION of the column values |
 | INSERT then DELETE                   | Nothing (the row never existed durably)      |
 | UPDATE(s) then DELETE                | Just the DELETE                              |
 | DELETE then INSERT (row reused)      | Replace chain (treated as two distinct logical rows; emit both verbatim, do NOT collapse) |
 | Single INSERT / UPDATE / DELETE      | Pass through unchanged                       |
+
+**UNION, not "the final values" (audit 2026-08-01 S1, fixed after this ADR was
+written).** The first two rows originally said "the final UPDATE's values", and
+that was wrong because it assumed every after-image is a COMPLETE row. Postgres
+omits an unchanged out-of-line TOAST column from the new tuple, where an absent
+key means "preserve the target's existing value" — correct for a standalone
+UPDATE, and not correct once the event is reinterpreted:
+
+- On the **INSERT** arm there is no existing value to preserve, so an omitted
+  column lands as NULL or the column default on restore.
+- On the **UPDATE** arm the event that wrote the value has been collapsed away,
+  so what the target preserves is the value from *before* it.
+
+Both were silent, and `backup verify` was green over them because compaction
+re-stamps the hashes it subsequently checks — the check and the thing checked
+sharing an artifact. The collapse now unions the after-images: later wins for
+every column the later image carries, and a column only an earlier image
+carries survives. This is sound only because an absent column means *unchanged*
+and never *set to NULL* — `'n'` decodes to a present nil, only `'u'` is omitted,
+and an unrecognised marker refuses. That premise is pinned by
+`postgres.TestNullAndUnchangedToastAreDistinguishable`, which exists because
+both halves were previously pinned separately and nothing bound them.
 
 TRUNCATE is a table-scoped barrier: when emitted on table T, every
 accumulator for table T (across every PK) is dropped, and the

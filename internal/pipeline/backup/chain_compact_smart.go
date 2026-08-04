@@ -13,12 +13,21 @@ package backup
 // source-order, and rewrites the chunks with the collapsed event
 // stream per ADR-0064 §2's policy table:
 //
-//   - INSERT then UPDATE(s)   → INSERT with final UPDATE's column values
-//   - UPDATE(s) only          → one UPDATE with final values
+//   - INSERT then UPDATE(s)   → INSERT with the UNION of the column values
+//   - UPDATE(s) only          → one UPDATE with the UNION of the values
 //   - INSERT then DELETE      → nothing (the row never existed durably)
 //   - UPDATE(s) then DELETE   → just the DELETE
 //   - DELETE then INSERT      → both, verbatim (logically distinct rows)
 //   - single event            → pass-through unchanged
+//
+// "UNION", not "the final values", and the distinction is load-bearing
+// (audit 2026-08-01 S1). An after-image can be PARTIAL — Postgres omits an
+// unchanged out-of-line TOAST column from the new tuple, where an absent key
+// means "preserve the target's existing value". Taking the last after-image
+// verbatim dropped exactly those columns: on the INSERT arm the column has no
+// existing value to preserve and lands NULL/default, and on the UPDATE arm the
+// event that wrote the value has been collapsed away, so what the target
+// preserves is the value from before it. See [mergeAfterImage].
 //
 // TRUNCATE and ir.SchemaSnapshot are accumulator barriers: TRUNCATE
 // drops every per-PK accumulator FOR THAT TABLE; SchemaSnapshot
@@ -189,6 +198,54 @@ type rowAccumulator struct {
 // rows) is detected during append: append marks the accumulator's
 // state machine so the resulting flush emits both events verbatim
 // without further collapsing.
+// mergeAfterImage overlays a later after-image on an earlier one and returns a
+// NEW row — neither input is mutated, since both are still referenced by the
+// un-collapsed events the caller may yet emit.
+//
+// Later wins for every column the later image CARRIES; a column only the
+// earlier image carries is preserved. That is what makes collapsing two events
+// into one lossless when either is partial (audit 2026-08-01 S1).
+//
+// # The premise, named because the whole fix rests on it
+//
+// This is correct only if an absent column means "unchanged" and never "set to
+// NULL" — otherwise the union would resurrect a stale value over a deliberate
+// SET NULL. That is the ONE thing the fix depends on, and it is checked rather
+// than assumed: postgres.decodeTuple maps pgoutput's 'n' (null) to a PRESENT
+// key with a nil value and omits ONLY 'u' (unchanged TOAST), with an
+// unrecognised marker a loud error so a future wire addition cannot quietly
+// join the omitted set.
+//
+// Both halves were already pinned SEPARATELY, which is not the same as pinning
+// the argument. postgres.TestNullAndUnchangedToastAreDistinguishable now binds
+// them, and says in the test why this package depends on it.
+// TestMergeAfterImage_AbsentMeansUnchangedNotNull pins this end.
+//
+// No claim is made here about which engines emit partial images. It does not
+// matter: on a complete after-image the union is an identity operation, so the
+// merge is correct for a source that always sends full rows and for one that
+// does not, without anyone having to maintain a list.
+//
+// Schema changes cannot smuggle a stale column through: ir.SchemaSnapshot is
+// an accumulator barrier that flushes every table (ADR-0064 §6), so no merge
+// ever spans a DDL boundary.
+func mergeAfterImage(earlier, later ir.Row) ir.Row {
+	if earlier == nil {
+		return later
+	}
+	if later == nil {
+		return earlier
+	}
+	merged := make(ir.Row, len(earlier)+len(later))
+	for k, v := range earlier {
+		merged[k] = v
+	}
+	for k, v := range later {
+		merged[k] = v
+	}
+	return merged
+}
+
 func (a *rowAccumulator) flush() []ir.Change {
 	if len(a.events) == 0 {
 		return nil
@@ -253,11 +310,19 @@ func (a *rowAccumulator) flush() []ir.Change {
 			case ir.Insert:
 				// INSERT followed by UPDATE: keep INSERT but with
 				// the UPDATE's After row values (final state).
+				//
+				// UNION, not replace (audit 2026-08-01 S1). An
+				// after-image can be PARTIAL: Postgres omits an
+				// unchanged out-of-line TOAST column from the new
+				// tuple, and an absent key means "preserve the
+				// target's existing value". An INSERT has no
+				// existing value to preserve, so taking ev.After
+				// verbatim wrote NULL/default over the column.
 				net = ir.Insert{
 					Position: prev.Position, // keep INSERT's position
 					Schema:   prev.Schema,
 					Table:    prev.Table,
-					Row:      ev.After, // final column values
+					Row:      mergeAfterImage(prev.Row, ev.After),
 				}
 			case ir.Update:
 				// UPDATE then UPDATE: keep the FIRST update's
@@ -269,12 +334,22 @@ func (a *rowAccumulator) flush() []ir.Change {
 				// trailing TxCommit carries the closing position;
 				// the row event's own position is informational —
 				// the applier acks on TxCommit per ADR-0027).
+				//
+				// After is a UNION for the same reason as the
+				// INSERT arm above (audit 2026-08-01 S1): the
+				// column an earlier UPDATE wrote and a later one
+				// left unchanged is present in the earlier
+				// after-image and absent from the later one.
+				// Taking the last one verbatim dropped it, and
+				// because the earlier UPDATE has been collapsed
+				// away there is nothing left to re-apply it — the
+				// target keeps its PRE-update value.
 				net = ir.Update{
 					Position: prev.Position,
 					Schema:   prev.Schema,
 					Table:    prev.Table,
 					Before:   prev.Before,
-					After:    ev.After,
+					After:    mergeAfterImage(prev.After, ev.After),
 				}
 			case ir.Delete:
 				// UPDATE after DELETE: malformed (row was deleted).
