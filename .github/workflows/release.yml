@@ -25,6 +25,18 @@ on:
 permissions:
   contents: write
   packages: write
+  # Build provenance (audit 2026-08-04). id-token lets the runner mint the
+  # short-lived OIDC token Sigstore signs against; attestations lets it record
+  # the result. Both are scoped to this workflow run and neither can push code.
+  #
+  # Why provenance matters here specifically: sluice is the tool that MAKES the
+  # backups whose manifests it signs, so a substituted binary defeats canon-v5
+  # upstream of every guarantee SECURITY.md reasons about. Before this, the
+  # integrity chain bottomed out at "trust GitHub's release storage" —
+  # checksums.txt authenticates the binaries and nothing authenticated
+  # checksums.txt.
+  id-token: write
+  attestations: write
 
 jobs:
   goreleaser:
@@ -92,3 +104,36 @@ jobs:
           # Renders empty until the secret exists; brews/scoops/winget then
           # fail at release time, so don't tag a release until it's set.
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      # Build provenance for every release artifact (audit 2026-08-04).
+      #
+      # DELIBERATELY A SEPARATE STEP, not goreleaser's own `signs:` block. The
+      # binaries, checksums and GHCR image are already uploaded by the time
+      # this runs, so a failure here leaves the draft intact and is fixed by
+      # re-running one job — no tag force-move, no duplicate draft. That shape
+      # is chosen because the tap publishers have already failed a release
+      # once, AFTER upload, for an expired token; adding provenance inside
+      # goreleaser would put a second such failure on the same critical path.
+      #
+      # Attests the archives, packages and checksums.txt — i.e. everything a
+      # consumer downloads. checksums.txt is the important one: it authenticates
+      # the binaries, and until now nothing authenticated it.
+      #
+      # Consumers verify with:
+      #   gh attestation verify sluice_<ver>_Linux_x86_64.tar.gz \
+      #     --repo sluicesync/sluice
+      #
+      # This step is NOT one of the six publish gates. It is additive
+      # provenance; a release whose attestation failed is still a valid
+      # release, and gating publication on it would trade a real property
+      # (working binaries) for a newer one.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/*.apk
+            dist/checksums.txt
