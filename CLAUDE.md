@@ -120,6 +120,15 @@ This is the single most expensive recurring shape in the project: a guard that r
 
 The mechanical form is cheap and already proven here: a roster derived from the registry (`TestControlTableRoster_AllSchemaReaderDoors`), a fail-by-default divergence map (`TestMigrateSyncFlagSurfaceParity`), an AST walker with an anti-vacuity floor (`internal/errclassgate`). Prefer any of those to a promise.
 
+**A GATE owes the same enumeration, and this is the half that keeps getting missed (2026-08-02).** The sibling-sweep step reads as being about fixes. It applies just as hard to the checks — and a gate whose coverage is narrower than its name implies is worse than no gate, because it stops anyone from looking. Four instances in one remediation pass, all the same shape:
+
+- `TestManifestCommitter_SidecarCheckpointCost` pinned checkpoint cost to a single `Put` — on the `Appender` path, whose only implementor is `LocalStore`. Every CLOUD store takes the legacy full-rewrite path, which had no cost gate at all. **The gate measured the fast path and its existence implied the slow one was covered.**
+- Smart compaction "refuses loudly on an incomplete payload" — for PRIMARY KEY columns. The columns that actually go missing are large ones (that is why they are out of line), and large columns are not what people key on. Guard shape and defect shape were nearly disjoint.
+- The pipeline's optional interfaces were documented as "pinned by the pipeline unit tests". Those use a test-local stub that satisfies the interface **by construction** — proof that the pipeline calls what it declared, and no evidence at all about any real engine.
+- The site's error-code drift check counted rows present in both places and never asked which were missing from one.
+
+So: **when you write or cite a gate, state which implementors/paths it reaches, and prefer a name that cannot be read as broader than the truth.** If the narrow scope is deliberate, say so where the gate is defined — "measures the `Appender` path only; the legacy path is ungated" is a fine thing to write and a terrible thing to leave implied. And the cheapest check on any gate remains the mutation run: break the thing it names, in **both** directions, and watch it fail.
+
 ### A safety argument that cites an environmental fact owes that fact a check (the premise-naming step)
 
 Distinct from the unverified-invariant rule above, and with a different fix shape. When a comment or ADR justifies a **safety** argument by citing a fact about the world outside the code — `BIGSERIAL CACHE 1`, collation weights at `8.0.30`, "the VStream carrier carries DOUBLE at full precision", "PG only ever emits rectangular arrays" — that fact gets **a runtime preflight or a named test in the same PR**, or the comment says **UNVERIFIED PREMISE** in those words.
