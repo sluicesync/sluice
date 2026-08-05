@@ -19,17 +19,78 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
+// valueProvenance records WHERE a leaf value came from, which is the
+// only sound way to tell a Postgres TEXT RENDERING of a value from a
+// value the driver has already decoded. Item 135: `bytea` is the one
+// family where the two are mutually ambiguous — PG's `bytea_output =
+// hex` rendering `\xdead` is six perfectly legal raw bytes — so a
+// decoder that decides by looking at the CONTENT silently shrinks any
+// genuine binary value that happens to spell that shape (`\xdead` →
+// 2 bytes; the bare 2-byte `\x` → 0 bytes). Provenance is carried
+// instead of sniffed.
+//
+// Deliberately NOT a bool, and deliberately reached only through
+// [decodeValueFromText] / [decodeValueFromBinary]: each call site then
+// names its own provenance at the call, and a new caller cannot default
+// into a lane by writing `false`.
+type valueProvenance int
+
+const (
+	// provUnset is the zero value and is never legal. A leaf whose
+	// provenance was never declared refuses loudly rather than picking
+	// a lane — the zero-value trap in reverse (CLAUDE.md's v0.99.51
+	// note): there is no safe default here, only a named one.
+	provUnset valueProvenance = iota
+
+	// provText: the raw form is a Postgres text rendering of the value
+	// (a pgoutput text-format tuple column, or one leaf token of an
+	// array's text literal). bytea in this lane is `\x`+even-hex and
+	// anything else is refused.
+	provText
+
+	// provBinary: the driver already decoded the value to a Go type
+	// (a database/sql scan through pgx stdlib mode, or an element of a
+	// slice pgx decoded itself). bytea in this lane is already the raw
+	// bytes and is copied verbatim, never inspected.
+	provBinary
+)
+
+// decodeValueFromText converts a leaf whose raw form is a POSTGRES TEXT
+// RENDERING — a pgoutput text-format tuple column, or one token of an
+// array text literal — into the canonical Go type the IR uses for the
+// given column type. See [decodeValue] for the shared contract.
+func decodeValueFromText(raw any, t ir.Type) (any, error) {
+	return decodeValue(raw, t, provText)
+}
+
+// decodeValueFromBinary converts a leaf the DRIVER already decoded —
+// a `database/sql` scan through pgx stdlib mode, or an element of a
+// slice pgx produced — into the canonical Go type the IR uses for the
+// given column type. See [decodeValue] for the shared contract.
+func decodeValueFromBinary(raw any, t ir.Type) (any, error) {
+	return decodeValue(raw, t, provBinary)
+}
+
 // decodeValue converts a single value as returned by the pgx driver
-// (scanned into *any) into the canonical Go type the IR uses for the
-// given column type.
+// (scanned into *any) or by the pgoutput text protocol into the
+// canonical Go type the IR uses for the given column type. prov says
+// which of the two it is; call through [decodeValueFromText] /
+// [decodeValueFromBinary] rather than passing it directly.
 //
 // SQL NULL is represented as a nil interface value, both as input and
 // as output. Callers must therefore allow nil values for nullable
 // columns.
 //
+// Provenance is INERT for every family except `bytea` — every other
+// decoder accepts both the driver's Go type and PG's text spelling
+// unambiguously. TestDecodeValue runs its whole family table through
+// BOTH entry points and requires the same answer, so a family that newly
+// becomes provenance-sensitive fails there rather than diverging
+// silently between the CDC door and the copy door.
+//
 // The function is pure — no I/O, no shared state — and exhaustively
 // table-tested in value_decode_test.go.
-func decodeValue(raw any, t ir.Type) (any, error) {
+func decodeValue(raw any, t ir.Type, prov valueProvenance) (any, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -46,7 +107,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Char, ir.Varchar, ir.Text:
 		return decodeString(raw)
 	case ir.Binary, ir.Varbinary, ir.Blob:
-		return decodeBytea(raw)
+		return decodeBytea(raw, prov)
 	case ir.Bit:
 		// catalog Bug 75: PG `bit`/`varbit` surfaces under pgx stdlib
 		// mode as the canonical '0'/'1' text ("10101010"). The IR
@@ -74,6 +135,13 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Macaddr:
 		return decodeMacaddr(raw)
 	case ir.Array:
+		// prov is deliberately NOT forwarded. decodeArray is reached
+		// from both lanes, but each of its three sub-paths has a FIXED
+		// provenance that the caller's says nothing about: an array
+		// scanned into *any arrives as PG's array TEXT whichever lane
+		// we came from, and a slice pgx decoded itself has already-
+		// decoded elements whichever lane we came from. Forwarding
+		// would reproduce item 135 in mirror image. See decodeArray.
 		return decodeArray(raw, v.Element)
 	case ir.Geometry:
 		// PostGIS geometry columns have a dynamic OID assigned at
@@ -124,7 +192,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		if v.BaseType == nil {
 			return nil, fmt.Errorf("postgres: decode: DOMAIN %q has nil BaseType", v.Name)
 		}
-		return decodeValue(raw, v.BaseType)
+		return decodeValue(raw, v.BaseType, prov)
 	}
 	return nil, fmt.Errorf("postgres: no decoder for IR type %T", t)
 }
@@ -355,45 +423,122 @@ func decodeBytes(raw any) (any, error) {
 	return nil, fmt.Errorf("postgres: cannot decode %T as bytes", raw)
 }
 
-// decodeBytea decodes a PG `bytea` value to its raw bytes. It must
-// handle two shapes the two reader paths deliver:
+// decodeBytea decodes a PG `bytea` value to its raw bytes. The two
+// reader paths deliver two shapes that are MUTUALLY AMBIGUOUS by
+// content, so the shape is decided by prov (item 135), never sniffed:
 //
-//   - row-reader (database/sql via pgx stdlib mode): pgx decodes bytea
-//     to the raw Go []byte already. Copied verbatim.
-//   - CDC (pgoutput tuple, text format): the value arrives as the
-//     server's `bytea_output` text representation. With the PG default
-//     `bytea_output = hex` that is a `\x`-prefixed, even-length lowercase
-//     hex string (e.g. `\xcafebabe`), delivered as the ASCII bytes of
-//     that text. Copying it verbatim — as the old shared decodeBytes did
-//     — stored the literal 10 ASCII bytes `\xcafebabe` instead of the 4
-//     bytes 0xCAFEBABE: silent bytea corruption over CDC, uncaught until
-//     the Bug 92 family-matrix pin exercised a bytea column end-to-end.
+//   - provBinary — row-reader (database/sql via pgx stdlib mode) and
+//     the already-decoded array sub-paths: pgx hands back the raw Go
+//     []byte. Copied verbatim, never inspected.
+//   - provText — CDC (pgoutput tuple, text format) and each leaf of an
+//     array text literal: the value arrives as the server's
+//     `bytea_output` rendering. Hex-decoded, and REFUSED if it isn't
+//     the `\x`+even-hex form.
 //
-// Disambiguation mirrors [decodePGGeometry] (which already strips the
-// same `\x` bytea-style prefix): a value is treated as hex-encoded text
-// ONLY when it carries the `\x` prefix AND the remainder is valid,
-// even-length hex. Raw bytes that don't fit that shape — the row-reader
-// path — fall through to a verbatim copy unchanged.
-func decodeBytea(raw any) (any, error) {
+// The pre-item-135 decoder disambiguated by CONTENT — hex-decode iff
+// `\x` + even-length valid hex — which is unsound in the binary lane
+// because those bytes are also a perfectly ordinary binary value:
+// `convert_to('\xdead','UTF8')` is 6 bytes and decoded to 2, and the
+// 2-byte `convert_to('\x','UTF8')` decoded to ZERO. Every lane using
+// the RowReader was affected — migrate bulk copy, sync cold-start, and
+// backup, where the shrunken value is durable in the chain and restore
+// reproduces it faithfully.
+//
+// Neither half may be dropped. The audit's proposed "hex-decode only in
+// decodeTuple" would have broken `bytea[]`, which is a supported family
+// on both doors: a bytea[] scanned into *any comes back as a STRING in
+// PG array-text form with every element already hex-rendered, in all
+// four pgx exec modes. The array lane is correct today precisely
+// because it hex-decodes on the scan path.
+func decodeBytea(raw any, prov valueProvenance) (any, error) {
+	switch prov {
+	case provText:
+		return decodeByteaFromText(raw)
+	case provBinary:
+		return decodeByteaFromBinary(raw)
+	}
+	return nil, fmt.Errorf(
+		"postgres: bytea decode: value provenance was never declared (%T); "+
+			"call decodeValueFromText or decodeValueFromBinary", raw,
+	)
+}
+
+// decodeByteaFromText hex-decodes PG's `bytea_output = hex` rendering.
+//
+// The `bytea_output = hex` premise is not assumed here — it is ASSERTED
+// PER VALUE, which is this lane's half of a two-layer argument (the
+// premise-naming step). The other half is the `SET bytea_output = hex`
+// pinned on both pools sluice opens: `afterConnectSessionPins` for every
+// ordinary connection and the walsender pin in `replicationConn` (audit
+// 2026-08-05 B-1). Those pins are what keep the stream WORKING; this
+// refusal is what keeps a LOST pin from being silent — and one can be
+// lost, because both are session SETs and the connect hook's own doc
+// says it is insufficient under TRANSACTION-mode pooling, where the
+// backend can change per statement.
+//
+// So a rendering that is not `\x`+even-hex is refused by name rather
+// than copied verbatim. Verbatim is what the old sniffing decoder did,
+// and it is silent corruption: the ASCII of the rendering stored as the
+// value (`bytea_output = escape`'s `\001\002` becoming eight bytes).
+//
+// Named non-goal: the `escape` rendering is refused, not decoded. It is
+// unambiguously distinguishable (escape output spells a backslash byte
+// as `\\`, so a leading single `\x` can only ever be the hex prefix),
+// so support is addable — but it is a second codec and would owe its
+// own family matrix. Refusing loudly is the honest state until then.
+func decodeByteaFromText(raw any) (any, error) {
 	var s string
 	switch v := raw.(type) {
 	case []byte:
 		s = string(v)
-		if b, ok := decodeHexByteaText(s); ok {
-			return b, nil
-		}
-		// Not `\x`-hex text: row-reader raw bytes. Copy (pgx reuses
-		// buffers across rows).
+	case string:
+		s = v
+	default:
+		return nil, fmt.Errorf("postgres: cannot decode %T as bytea", raw)
+	}
+	b, ok := decodeHexByteaText(s)
+	if !ok {
+		return nil, sluicecode.Wrap(
+			sluicecode.CodeValueByteaTextUnrecognized,
+			"set the source's bytea_output back to the `hex` default",
+			fmt.Errorf(
+				"postgres: bytea text rendering %q is not the `\\x`+even-hex form "+
+					"`bytea_output = hex` produces", truncateForError(s),
+			),
+		)
+	}
+	return b, nil
+}
+
+// decodeByteaFromBinary copies the driver-decoded bytes. pgx reuses
+// buffers across rows, so the copy is load-bearing.
+//
+// A `string` here is not a shape any known production path produces
+// (pgx stdlib scans bytea into []byte — pinned against a real server by
+// TestPremise_ByteaScanShapes). It is accepted as its literal bytes
+// anyway, because verbatim is the only reading that cannot lose data
+// without provenance below this point, and a refusal would be a new
+// failure mode with no known trigger.
+func decodeByteaFromBinary(raw any) (any, error) {
+	switch v := raw.(type) {
+	case []byte:
 		out := make([]byte, len(v))
 		copy(out, v)
 		return out, nil
 	case string:
-		if b, ok := decodeHexByteaText(v); ok {
-			return b, nil
-		}
 		return []byte(v), nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as bytea", raw)
+}
+
+// truncateForError bounds a value echoed into an error message so a
+// multi-megabyte bytea can't turn a refusal into a log flood.
+func truncateForError(s string) string {
+	const limit = 64
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…"
 }
 
 // decodeHexByteaText recognises the PG `bytea_output = hex` text form
@@ -670,16 +815,27 @@ func decodeMacaddr(raw any) (any, error) {
 // contract demands a typed slice. Falling back to a parser keeps the
 // reader independent of pgx-version-specific scan behaviour and
 // avoids forcing every column-type handler to know about arrays.
+//
+// decodeArray takes NO provenance, and that is the load-bearing part of
+// item 135. It is reached from both lanes, yet each sub-path's leaves
+// have a FIXED provenance the caller's says nothing about: (1) and (2)
+// hold values pgx already decoded (binary, whoever called us), (3)/(3b)
+// hold PG's array text whose leaves are text renderings (text, whoever
+// called us). So each sub-path SETS its own lane. A `decodeValue(raw,
+// t, prov)` that forwarded prov here would reproduce the very bug this
+// change fixes, in mirror image — a `bytea[]` on the scan path would
+// stop hex-decoding and store the ASCII of every element.
 func decodeArray(raw any, elementType ir.Type) (any, error) {
 	if elementType == nil {
 		return nil, errors.New("postgres: array decode: element type is nil")
 	}
 
 	// (1) Some pgx setups return arrays as []any directly; fast-path it.
+	// Elements are values pgx decoded — the binary lane.
 	if asAny, ok := raw.([]any); ok {
 		out := make([]any, len(asAny))
 		for i, e := range asAny {
-			d, err := decodeValue(e, elementType)
+			d, err := decodeValueFromBinary(e, elementType)
 			if err != nil {
 				return nil, fmt.Errorf("postgres: array element %d: %w", i, err)
 			}
@@ -720,14 +876,15 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 		return v, nil
 	}
 
-	// (2) Any other slice/array via reflection.
+	// (2) Any other slice/array via reflection. Elements are values pgx
+	// decoded into a typed slice — the binary lane.
 	rv := reflect.ValueOf(raw)
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
 		return nil, fmt.Errorf("postgres: cannot decode %T as Array (not a slice/array)", raw)
 	}
 	out := make([]any, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
-		d, err := decodeValue(rv.Index(i).Interface(), elementType)
+		d, err := decodeValueFromBinary(rv.Index(i).Interface(), elementType)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: array element %d: %w", i, err)
 		}
@@ -827,7 +984,11 @@ func (p *pgArrayParser) parseArray(elementType ir.Type) (any, error) {
 			if isNull {
 				elem = nil
 			} else {
-				d, err := decodeValue(tok, elementType)
+				// Leaf of an array TEXT literal: text lane, always —
+				// the array's own arrival shape says nothing about it
+				// (item 135). A `bytea[]` element arrives here as the
+				// unescaped `\xdead` and MUST be hex-decoded.
+				d, err := decodeValueFromText(tok, elementType)
 				if err != nil {
 					return nil, fmt.Errorf("array element %d: %w", len(out), err)
 				}

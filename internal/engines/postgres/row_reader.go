@@ -263,7 +263,11 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 
 		row := make(ir.Row, len(cols))
 		for i, col := range cols {
-			v, err := decodeValue(scanBuf[i], col.Type)
+			// Binary lane (item 135): these values came out of
+			// database/sql via pgx stdlib mode, so the driver has
+			// already decoded them — a bytea here is the raw bytes and
+			// must never be content-sniffed for a `\x`-hex spelling.
+			v, err := decodeValueFromBinary(scanBuf[i], col.Type)
 			if err != nil {
 				r.setErr(fmt.Errorf("postgres: column %q: %w", col.Name, err))
 				return

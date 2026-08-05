@@ -95,14 +95,14 @@ func TestDecodePGGeometry_Errors(t *testing.T) {
 // decodePGGeometry, and nil is preserved.
 func TestDecodePGGeometry_ViaDecodeValue(t *testing.T) {
 	hexBytes := []byte(hex.EncodeToString(ewkbPointLE()))
-	got, err := decodeValue(hexBytes, ir.Geometry{})
+	got, err := decodeValueFromBinary(hexBytes, ir.Geometry{})
 	if err != nil {
 		t.Fatalf("decodeValue(ir.Geometry): %v", err)
 	}
 	if b, ok := got.([]byte); !ok || len(b) == 0 {
 		t.Errorf("decodeValue(ir.Geometry) = %T(%v); want non-empty []byte WKB", got, got)
 	}
-	if v, err := decodeValue(nil, ir.Geometry{}); err != nil || v != nil {
+	if v, err := decodeValueFromBinary(nil, ir.Geometry{}); err != nil || v != nil {
 		t.Errorf("decodeValue(nil, Geometry) = (%v,%v); want (nil,nil)", v, err)
 	}
 }

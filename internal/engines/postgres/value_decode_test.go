@@ -12,8 +12,18 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
+// TestDecodeValue is the family table AND the provenance-inertness gate
+// (item 135). Every case runs through BOTH entry points and must give
+// the same answer: provenance exists for exactly one family — `bytea`,
+// where PG's text rendering and a raw binary value are mutually
+// ambiguous by content — and every other decoder accepts the driver's
+// Go type and PG's text spelling unambiguously. bytea therefore has no
+// case in this table; its lanes are pinned in TestDecodeBytea. A family
+// that newly becomes provenance-sensitive fails here rather than
+// diverging silently between the CDC door and the copy door.
 func TestDecodeValue(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 34, 56, 0, time.UTC)
 	prefix := netip.MustParsePrefix("192.168.1.0/24")
@@ -51,7 +61,10 @@ func TestDecodeValue(t *testing.T) {
 		{"text string", "longer text", ir.Text{Size: ir.TextLong}, "longer text"},
 
 		// ---- Bytes ----
-		{"bytea bytes", []byte{0xde, 0xad}, ir.Blob{Size: ir.BlobLong}, []byte{0xde, 0xad}},
+		// bytea is the ONE provenance-sensitive family and is
+		// deliberately absent from this table: []byte{0xde,0xad} is a
+		// verbatim 2-byte value in the binary lane and is not a legal
+		// text rendering at all. See TestDecodeBytea.
 
 		// ---- Temporal ----
 		{"timestamp passthrough", now, ir.Timestamp{Precision: 0, WithTimeZone: true}, now},
@@ -386,12 +399,14 @@ func TestDecodeValue(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := decodeValue(c.raw, c.t)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("decodeValue(%#v, %T)\n got = %#v\nwant = %#v", c.raw, c.t, got, c.want)
+			for _, lane := range decodeLanes() {
+				got, err := lane.decode(c.raw, c.t)
+				if err != nil {
+					t.Fatalf("%s: unexpected error: %v", lane.name, err)
+				}
+				if !reflect.DeepEqual(got, c.want) {
+					t.Errorf("%s(%#v, %T)\n got = %#v\nwant = %#v", lane.name, c.raw, c.t, got, c.want)
+				}
 			}
 		})
 	}
@@ -427,16 +442,34 @@ func TestDecodeValueErrors(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := decodeValue(c.raw, c.t); err == nil {
-				t.Errorf("expected error for %s; got nil", c.name)
+			for _, lane := range decodeLanes() {
+				if _, err := lane.decode(c.raw, c.t); err == nil {
+					t.Errorf("expected error for %s via %s; got nil", c.name, lane.name)
+				}
 			}
 		})
 	}
 }
 
+// decodeLanes returns the two provenance entry points (item 135). The
+// helper exists so a table test cannot exercise one lane and imply the
+// other — the shape that let the bytea sniffing survive.
+func decodeLanes() []struct {
+	name   string
+	decode func(any, ir.Type) (any, error)
+} {
+	return []struct {
+		name   string
+		decode func(any, ir.Type) (any, error)
+	}{
+		{"decodeValueFromText", decodeValueFromText},
+		{"decodeValueFromBinary", decodeValueFromBinary},
+	}
+}
+
 func TestDecodeBytesIsCopy(t *testing.T) {
 	src := []byte{0xaa, 0xbb, 0xcc}
-	got, err := decodeValue(src, ir.Blob{Size: ir.BlobLong})
+	got, err := decodeValueFromBinary(src, ir.Blob{Size: ir.BlobLong})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,67 +483,301 @@ func TestDecodeBytesIsCopy(t *testing.T) {
 	}
 }
 
-// TestDecodeBytea pins the two shapes the bytea value-decoder must
-// disambiguate (Bug 92 follow-up — surfaced by the FULL family-matrix
-// pin exercising a bytea column end-to-end):
+// TestDecodeBytea is the item-135 provenance matrix, and it replaces a
+// pin that asserted ONE answer for BOTH readings of the same bytes.
 //
-//   - CDC (pgoutput tuple text format): the value arrives as the
-//     server's `bytea_output = hex` text — `\x`-prefixed even-length
-//     hex, delivered as the ASCII bytes of that text. It MUST be
-//     hex-decoded to the raw bytes, not copied verbatim (verbatim was
-//     the pre-fix silent bytea corruption: `\xcafebabe` stored as the
-//     10 literal ASCII bytes instead of 4).
-//   - row-reader (database/sql via pgx): pgx hands raw decoded bytes
-//     that do NOT carry the `\x` text prefix; those are copied verbatim.
+// bytea is the one family where PG's text rendering and a genuine
+// binary value are mutually ambiguous by content: `\xdead` is both the
+// hex spelling of two bytes and six perfectly ordinary bytes. The old
+// decoder decided by CONTENT, so the SCAN path silently shrank the
+// binary value (6 → 2 bytes; the bare 2-byte `\x` → ZERO bytes) — and
+// the old test blessed that zero-length result as correct, which it is
+// for the CDC tuple path and destructive for the scan path.
+//
+// Each row therefore carries an answer PER LANE. wantTextErr marks the
+// renderings the text lane must REFUSE rather than guess at (verbatim
+// there is the Bug-92 corruption: the ASCII of the rendering stored as
+// the value). Ground truth for the collision cells is PG's own
+// `octet_length()`, pinned end-to-end in the integration matrix.
 func TestDecodeBytea(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  any
-		want []byte
+
+		// wantFromText is the answer when the value is a PG text
+		// rendering (pgoutput tuple column, array-literal leaf).
+		wantFromText []byte
+		wantTextErr  bool
+
+		// wantFromBinary is the answer when the driver already decoded
+		// it (database/sql scan, pgx-decoded slice element).
+		wantFromBinary []byte
 	}{
+		// ---- The collision cells: legal hex spellings AND legal bytes.
 		{
-			name: "CDC hex text (bytes) decodes to raw bytes",
-			raw:  []byte(`\xcafebabe`),
-			want: []byte{0xca, 0xfe, 0xba, 0xbe},
+			name:           `\xdead — the audit's cell (6 bytes of binary, 2 bytes of hex)`,
+			raw:            []byte(`\xdead`),
+			wantFromText:   []byte{0xde, 0xad},
+			wantFromBinary: []byte(`\xdead`),
 		},
 		{
-			name: "CDC hex text (string) decodes to raw bytes",
-			raw:  `\xdeadbeef`,
-			want: []byte{0xde, 0xad, 0xbe, 0xef},
+			name:           `bare \x — the worst cell: 2 bytes of binary, ZERO bytes of hex`,
+			raw:            []byte(`\x`),
+			wantFromText:   []byte{},
+			wantFromBinary: []byte{0x5c, 0x78},
 		},
 		{
-			name: "CDC empty bytea (\\x prefix only) decodes to empty",
-			raw:  []byte(`\x`),
-			want: []byte{},
+			name:           `\xdeadbeef — 10 bytes of binary, 4 bytes of hex`,
+			raw:            []byte(`\xdeadbeef`),
+			wantFromText:   []byte{0xde, 0xad, 0xbe, 0xef},
+			wantFromBinary: []byte(`\xdeadbeef`),
 		},
 		{
-			name: "row-reader raw bytes copied verbatim",
-			raw:  []byte{0xde, 0xad},
-			want: []byte{0xde, 0xad},
+			name: `\xDEAD uppercase — PG never emits it, encoding/hex accepts it`,
+			raw:  []byte(`\xDEAD`),
+			// Kept decoding rather than refusing: a rendering that is
+			// unambiguously hex is not the failure this refusal exists
+			// for, and refusing it would be a new failure mode.
+			wantFromText:   []byte{0xde, 0xad},
+			wantFromBinary: []byte(`\xDEAD`),
 		},
 		{
-			name: "row-reader raw bytes that happen to start with 0x5c not hex",
-			// 0x5c 0x78 is the ASCII for `\x`, but the remainder ("zz")
-			// is not valid hex, so it falls through to a verbatim copy.
-			raw:  []byte{0x5c, 0x78, 'z', 'z'},
-			want: []byte{0x5c, 0x78, 'z', 'z'},
+			name:           "hex text as a string, not bytes",
+			raw:            `\xcafebabe`,
+			wantFromText:   []byte{0xca, 0xfe, 0xba, 0xbe},
+			wantFromBinary: []byte(`\xcafebabe`),
+		},
+
+		// ---- The mutation controls: the neighbours that made content
+		// sniffing look safe. Both are verbatim in the binary lane and
+		// REFUSED in the text lane (they are not renderings PG's
+		// `bytea_output = hex` can produce).
+		{
+			name:           `invalid hex \xzz`,
+			raw:            []byte{0x5c, 0x78, 'z', 'z'},
+			wantTextErr:    true,
+			wantFromBinary: []byte{0x5c, 0x78, 'z', 'z'},
+		},
+		{
+			name:           `odd-length hex \xabc`,
+			raw:            []byte(`\xabc`),
+			wantTextErr:    true,
+			wantFromBinary: []byte(`\xabc`),
+		},
+		{
+			name:           "escape-format rendering (bytea_output = escape)",
+			raw:            []byte(`\001\002abc`),
+			wantTextErr:    true,
+			wantFromBinary: []byte(`\001\002abc`),
+		},
+
+		// ---- The non-colliding shapes.
+		{
+			name:           "genuine binary",
+			raw:            []byte{0x00, 0xff, 0x10, 0x80},
+			wantTextErr:    true,
+			wantFromBinary: []byte{0x00, 0xff, 0x10, 0x80},
+		},
+		{
+			name:           "empty",
+			raw:            []byte{},
+			wantTextErr:    true,
+			wantFromBinary: []byte{},
+		},
+		{
+			name:           "embedded NUL",
+			raw:            []byte{0x61, 0x00, 0x62},
+			wantTextErr:    true,
+			wantFromBinary: []byte{0x61, 0x00, 0x62},
+		},
+		{
+			name:           "hex text carrying an embedded NUL byte value",
+			raw:            []byte(`\x610062`),
+			wantFromText:   []byte{0x61, 0x00, 0x62},
+			wantFromBinary: []byte(`\x610062`),
 		},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := decodeValue(c.raw, ir.Blob{Size: ir.BlobLong})
-			if err != nil {
-				t.Fatalf("decodeValue: %v", err)
+			gotText, errText := decodeValueFromText(c.raw, ir.Blob{Size: ir.BlobLong})
+			switch {
+			case c.wantTextErr && errText == nil:
+				t.Errorf("decodeValueFromText(%#v) = %#v; want a loud refusal", c.raw, gotText)
+			case !c.wantTextErr && errText != nil:
+				t.Errorf("decodeValueFromText(%#v): %v", c.raw, errText)
+			case !c.wantTextErr:
+				b, ok := gotText.([]byte)
+				if !ok {
+					t.Fatalf("decodeValueFromText returned %T; want []byte", gotText)
+				}
+				if !bytes.Equal(b, c.wantFromText) {
+					t.Errorf("decodeValueFromText(%#v) = %#v; want %#v", c.raw, b, c.wantFromText)
+				}
 			}
-			b, ok := got.([]byte)
+
+			gotBin, errBin := decodeValueFromBinary(c.raw, ir.Blob{Size: ir.BlobLong})
+			if errBin != nil {
+				t.Fatalf("decodeValueFromBinary(%#v): %v", c.raw, errBin)
+			}
+			b, ok := gotBin.([]byte)
 			if !ok {
-				t.Fatalf("decodeValue returned %T; want []byte", got)
+				t.Fatalf("decodeValueFromBinary returned %T; want []byte", gotBin)
 			}
-			if !bytes.Equal(b, c.want) {
-				t.Errorf("got %#v; want %#v", b, c.want)
+			if !bytes.Equal(b, c.wantFromBinary) {
+				t.Errorf("decodeValueFromBinary(%#v) = %#v; want %#v", c.raw, b, c.wantFromBinary)
+			}
+			// The binary lane must never inspect the content: whatever
+			// it was handed comes back byte-identical.
+			if raw, isBytes := c.raw.([]byte); isBytes && !bytes.Equal(b, raw) {
+				t.Errorf("binary lane transformed its input: %#v → %#v", raw, b)
 			}
 		})
+	}
+}
+
+// TestDecodeByteaTextRefusalCarriesItsCode pins the operator-facing half
+// of the text lane's refusal: a rendering it cannot read fails with
+// SLUICE-E-VALUE-BYTEA-TEXT-UNRECOGNIZED, not a bare error, so the
+// operator gets the `bytea_output` remedy rather than a decode string.
+func TestDecodeByteaTextRefusalCarriesItsCode(t *testing.T) {
+	_, err := decodeValueFromText([]byte(`\001\002`), ir.Blob{Size: ir.BlobLong})
+	if err == nil {
+		t.Fatal("decodeValueFromText accepted an escape-format rendering; want a refusal")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeValueByteaTextUnrecognized {
+		t.Fatalf("refusal carries %v; want %s", err, sluicecode.CodeValueByteaTextUnrecognized)
+	}
+}
+
+// TestDecodeByteaUndeclaredProvenanceRefuses pins the zero value. There
+// is no safe default lane for bytea — one silently shrinks binary, the
+// other silently stores ASCII — so an undeclared provenance refuses
+// rather than picking one.
+func TestDecodeByteaUndeclaredProvenanceRefuses(t *testing.T) {
+	if _, err := decodeValue([]byte(`\xdead`), ir.Blob{Size: ir.BlobLong}, provUnset); err == nil {
+		t.Fatal("decodeValue with provUnset decoded a bytea; want a refusal")
+	}
+	// Every other family is provenance-inert, so provUnset must NOT
+	// break them — the refusal is scoped to the ambiguous family.
+	if _, err := decodeValue(int32(7), ir.Integer{Width: 32}, provUnset); err != nil {
+		t.Fatalf("provUnset broke a provenance-inert family: %v", err)
+	}
+}
+
+// TestDecodeByteaArrayLeafProvenance is the half the audit's proposed
+// fix ("hex-decode only in decodeTuple") would have broken. A `bytea[]`
+// scanned into *any comes back as a STRING in PG array-text form with
+// every element already hex-rendered — so the array leaves are TEXT
+// whichever door the array itself arrived through, and the pgx-decoded
+// slice shapes are BINARY whichever door they arrived through. Both
+// entry points are exercised on every shape for exactly that reason:
+// decodeArray must NOT forward its caller's provenance.
+func TestDecodeByteaArrayLeafProvenance(t *testing.T) {
+	byteaArray := ir.Array{Element: ir.Blob{Size: ir.BlobLong}}
+
+	textShapes := []struct {
+		name string
+		raw  any
+		want []any
+	}{
+		{
+			// PG renders a bytea element with its backslash escaped
+			// inside the quoted token: {"\\xdead","\\x"}.
+			name: "1-D",
+			raw:  `{"\\xdead","\\x","\\xdeadbeef"}`,
+			want: []any{[]byte{0xde, 0xad}, []byte{}, []byte{0xde, 0xad, 0xbe, 0xef}},
+		},
+		{
+			name: "2-D not flattened",
+			raw:  `{{"\\xdead","\\xbeef"},{"\\x","\\x00"}}`,
+			want: []any{
+				[]any{[]byte{0xde, 0xad}, []byte{0xbe, 0xef}},
+				[]any{[]byte{}, []byte{0x00}},
+			},
+		},
+		{
+			name: "NULL element",
+			raw:  `{"\\xdead",NULL,"\\x"}`,
+			want: []any{[]byte{0xde, 0xad}, nil, []byte{}},
+		},
+		{
+			// The pgoutput CDC door delivers the same literal as bytes.
+			name: "1-D delivered as []byte (pgoutput)",
+			raw:  []byte(`{"\\xcafe",NULL}`),
+			want: []any{[]byte{0xca, 0xfe}, nil},
+		},
+	}
+	for _, s := range textShapes {
+		s := s
+		t.Run("arrayText/"+s.name, func(t *testing.T) {
+			for _, lane := range decodeLanes() {
+				got, err := lane.decode(s.raw, byteaArray)
+				if err != nil {
+					t.Fatalf("%s: %v", lane.name, err)
+				}
+				if !reflect.DeepEqual(got, s.want) {
+					t.Errorf("%s\n got = %#v\nwant = %#v", lane.name, got, s.want)
+				}
+			}
+		})
+	}
+
+	// The already-decoded sub-paths: elements pgx produced are raw
+	// bytes and must NOT be hex-decoded, whichever door we came in.
+	binaryShapes := []struct {
+		name string
+		raw  any
+		want []any
+	}{
+		{
+			name: "[]any of raw bytes spelling the hex form",
+			raw:  []any{[]byte(`\xdead`), []byte(`\x`), nil},
+			want: []any{[]byte(`\xdead`), []byte{0x5c, 0x78}, nil},
+		},
+		{
+			name: "[][]byte via reflect",
+			raw:  [][]byte{[]byte(`\xdead`), {0x00, 0xff}},
+			want: []any{[]byte(`\xdead`), []byte{0x00, 0xff}},
+		},
+	}
+	for _, s := range binaryShapes {
+		s := s
+		t.Run("driverSlice/"+s.name, func(t *testing.T) {
+			for _, lane := range decodeLanes() {
+				got, err := lane.decode(s.raw, byteaArray)
+				if err != nil {
+					t.Fatalf("%s: %v", lane.name, err)
+				}
+				if !reflect.DeepEqual(got, s.want) {
+					t.Errorf("%s\n got = %#v\nwant = %#v", lane.name, got, s.want)
+				}
+			}
+		})
+	}
+}
+
+// TestDecodeByteaThroughDomain pins that provenance survives the
+// ir.Domain recursion — a DOMAIN over bytea is decoded by its base
+// type, and dropping the lane there would reintroduce the sniff.
+func TestDecodeByteaThroughDomain(t *testing.T) {
+	dom := ir.Domain{Name: "hashval", BaseType: ir.Blob{Size: ir.BlobLong}}
+
+	got, err := decodeValueFromBinary([]byte(`\xdead`), dom)
+	if err != nil {
+		t.Fatalf("decodeValueFromBinary(domain): %v", err)
+	}
+	if b := got.([]byte); !bytes.Equal(b, []byte(`\xdead`)) {
+		t.Errorf("domain binary lane = %#v; want the 6 verbatim bytes", b)
+	}
+
+	got, err = decodeValueFromText([]byte(`\xdead`), dom)
+	if err != nil {
+		t.Fatalf("decodeValueFromText(domain): %v", err)
+	}
+	if b := got.([]byte); !bytes.Equal(b, []byte{0xde, 0xad}) {
+		t.Errorf("domain text lane = %#v; want the 2 decoded bytes", b)
 	}
 }
 

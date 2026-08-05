@@ -885,6 +885,21 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	// Hex-decode the `\x`-prefixed text here so the raw bytes land. Raw
 	// []byte (same-engine / pgoutput path) and non-`\x` strings pass
 	// through unchanged.
+	//
+	// SIBLING SWEEP, item 135 (the Postgres decoder's content sniffing).
+	// This is the same shape and it is NOT fixed here, for a stated
+	// reason: the guard is `ir.Binary/Varbinary/Blob` AND `v.(string)`,
+	// and every reader that produces a genuinely-binary blob value hands
+	// a `[]byte`. The only production producer of a `string` in this
+	// branch is the pgtrigger reader, where the value IS PG bytea text
+	// and hex-decoding is the correct reading. The residual is one cell:
+	// a PG `text` column `--type-override`n to varbinary whose content
+	// spells `\x`+even-hex.
+	//
+	// Fixing it the item-135 way would mean carrying provenance on the
+	// VALUE across the engine-neutral IR Row — a cross-cutting contract
+	// change, not a decoder change — so it is recorded rather than
+	// half-fixed. Do not close it by adding more sniffing.
 	switch t.(type) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		if s, ok := v.(string); ok {

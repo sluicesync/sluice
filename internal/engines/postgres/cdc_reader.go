@@ -2229,7 +2229,11 @@ func decodeTuple(tuple *pglogrepl.TupleData, cols []relationColumn) (ir.Row, err
 			// Unchanged TOAST: omit from row map.
 			continue
 		case 't':
-			v, err := decodeValue(col.Data, c.Type)
+			// Text lane (item 135): pgoutput streams text-format
+			// payloads, so col.Data is PG's text RENDERING of the
+			// value — a bytea here is the `\x`-hex spelling and must
+			// be hex-decoded (and refused if it isn't that spelling).
+			v, err := decodeValueFromText(col.Data, c.Type)
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", c.Name, err)
 			}
@@ -2382,18 +2386,26 @@ func openReplicationConn(ctx context.Context, dsn, appID string) (*pgconn.PgConn
 	// real PG 16 with an escape-format tuple observed on the wire).
 	//
 	// pgoutput renders bytea with the WALSENDER's `bytea_output`, inherited
-	// from the server/database/role default. sluice's decoder recognises the
-	// PG-default `\x`-prefixed hex and copies anything else verbatim — so on a
-	// server set to the legacy `bytea_output = escape`, every streamed bytea
-	// row stores the escape-format ASCII text as the target's bytes. Silent
-	// corruption on every CDC bytea value, with nothing in the stream to
-	// suggest it.
+	// from the server/database/role default. On a server set to the legacy
+	// `bytea_output = escape`, every streamed bytea row would carry the
+	// escape-format ASCII text — and before item 135 the decoder copied
+	// anything it did not recognise as `\x`+hex verbatim, so those ASCII
+	// bytes became the target's value. Silent corruption on every CDC bytea
+	// value, with nothing in the stream to suggest it.
 	//
 	// The fix belongs HERE rather than in the decoder: making the wire format
 	// deterministic removes the ambiguity instead of teaching the decoder to
-	// guess between two renderings (which is the B-2 hazard next door — a raw
+	// guess between two renderings (which was the B-2 hazard next door — a raw
 	// value that merely LOOKS like `\x`+hex). One line, same session, same
 	// justification as the float pin it sits beside.
+	//
+	// Item 135 made the decoder's half LOUD rather than verbatim, so the two
+	// layers now compose: this pin is what keeps the stream WORKING, and
+	// [decodeByteaFromText]'s refusal is what keeps a lost pin from being
+	// silent. That matters because this is a SET on one session — anything
+	// that reaches the decoder without it (a future path, a pooler that
+	// re-uses a different backend) refuses by column name instead of storing
+	// ASCII.
 	if _, err := conn.Exec(ctx, "SET bytea_output = hex").ReadAll(); err != nil {
 		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("postgres: pin bytea_output on replication conn: %w", err)

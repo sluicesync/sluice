@@ -165,10 +165,18 @@ const (
 	CodeValueNULByte             Code = "SLUICE-E-VALUE-NUL-BYTE"
 	CodeValueUnrepresentable     Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
 	CodeValueRaggedArray         Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
-	CodeExprBackslashLiteral     Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
-	CodeConfirmationRequired     Code = "SLUICE-E-CONFIRMATION-REQUIRED"
-	CodeDriverHostMismatch       Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
-	CodeVStreamFloatLossy        Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
+
+	// A PostgreSQL `bytea` value arrived as a TEXT rendering sluice
+	// cannot read — not the `\x`+even-hex form `bytea_output = hex`
+	// produces. Item 135: the decoder used to fall through to a
+	// verbatim copy here, storing the ASCII of the rendering as the
+	// value.
+	CodeValueByteaTextUnrecognized Code = "SLUICE-E-VALUE-BYTEA-TEXT-UNRECOGNIZED"
+
+	CodeExprBackslashLiteral Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
+	CodeConfirmationRequired Code = "SLUICE-E-CONFIRMATION-REQUIRED"
+	CodeDriverHostMismatch   Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
+	CodeVStreamFloatLossy    Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
 
 	CodeBackupSignatureInvalid     Code = "SLUICE-E-BACKUP-SIGNATURE-INVALID"
 	CodeBackupSignatureMissing     Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
@@ -410,6 +418,7 @@ var registry = map[Code]Info{
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},
 	CodeValueRaggedArray:           {ClassRefusal, "a non-rectangular (jagged) array value bound for a PostgreSQL array column — PG arrays are rectangular by definition, so there is no faithful target value"},
+	CodeValueByteaTextUnrecognized: {ClassRefusal, "a PostgreSQL bytea value rendered as text sluice cannot read — not the `\\x`+even-hex form `bytea_output = hex` produces"},
 	CodeExprBackslashLiteral:       {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:       {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:         {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
