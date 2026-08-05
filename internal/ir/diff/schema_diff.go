@@ -112,6 +112,7 @@ func (d SchemaDiff) Summary() string {
 		colMissing, colExtra, colMismatched int
 		idxMissing, idxExtra, idxMismatched int
 		chkMissing, chkExtra, chkMismatched int
+		fkMissing, fkExtra, fkMismatched    int
 		exMissing, exExtra, exMismatched    int
 	)
 	for _, td := range d.TablesMismatched {
@@ -124,6 +125,9 @@ func (d SchemaDiff) Summary() string {
 		chkMissing += len(td.ChecksMissing)
 		chkExtra += len(td.ChecksExtra)
 		chkMismatched += len(td.ChecksMismatched)
+		fkMissing += len(td.ForeignKeysMissing)
+		fkExtra += len(td.ForeignKeysExtra)
+		fkMismatched += len(td.ForeignKeysMismatched)
 		exMissing += len(td.ExcludesMissing)
 		exExtra += len(td.ExcludesExtra)
 		exMismatched += len(td.ExcludesMismatched)
@@ -137,6 +141,9 @@ func (d SchemaDiff) Summary() string {
 	add(chkMissing, "missing CHECK", "missing CHECKs")
 	add(chkExtra, "extra CHECK", "extra CHECKs")
 	add(chkMismatched, "CHECK mismatch", "CHECK mismatches")
+	add(fkMissing, "missing foreign key", "missing foreign keys")
+	add(fkExtra, "extra foreign key", "extra foreign keys")
+	add(fkMismatched, "foreign-key mismatch", "foreign-key mismatches")
 	add(exMissing, "missing EXCLUDE", "missing EXCLUDEs")
 	add(exExtra, "extra EXCLUDE", "extra EXCLUDEs")
 	add(exMismatched, "EXCLUDE mismatch", "EXCLUDE mismatches")
@@ -175,9 +182,31 @@ type TableDiff struct {
 	// Index column ORDERING remains out of scope per ADR-0029, which is a
 	// different claim from the column SET or a per-column prefix length.
 	IndexesMismatched []IndexDiff `json:"indexes_mismatched,omitempty"`
-	ChecksMissing     []string    `json:"checks_missing,omitempty"`
-	ChecksExtra       []string    `json:"checks_extra,omitempty"`
-	ChecksMismatched  []CheckDiff `json:"checks_mismatched,omitempty"`
+
+	// Foreign-key deltas (roadmap item 125, the FK half of audit S9).
+	// TableDiff carried NO foreign-key fields at all, so every FK
+	// difference — a dropped constraint, a re-pointed parent, a weakened
+	// referential action — compared equal on the one surface an operator
+	// uses to check a target against its source.
+	//
+	// Matched by constraint NAME, the same set semantics the CHECK and
+	// EXCLUDE comparisons use.
+	ForeignKeysMissing    []string         `json:"foreign_keys_missing,omitempty"`
+	ForeignKeysExtra      []string         `json:"foreign_keys_extra,omitempty"`
+	ForeignKeysMismatched []ForeignKeyDiff `json:"foreign_keys_mismatched,omitempty"`
+
+	// ForeignKeysUnnamed counts foreign keys on EITHER side that carry no
+	// constraint name and were therefore not compared — an unnamed FK has
+	// no stable identity to match on across two schema reads.
+	//
+	// It is reported rather than silently skipped because "this comparison
+	// did not look at N of your foreign keys" is exactly the kind of
+	// coverage gap that makes a clean report misleading. MySQL always names
+	// FK constraints, so this is normally zero.
+	ForeignKeysUnnamed int         `json:"foreign_keys_unnamed,omitempty"`
+	ChecksMissing      []string    `json:"checks_missing,omitempty"`
+	ChecksExtra        []string    `json:"checks_extra,omitempty"`
+	ChecksMismatched   []CheckDiff `json:"checks_mismatched,omitempty"`
 	// EXCLUDE constraint deltas (ADR-0053). PG-only; MySQL sides always
 	// have empty slices. Definition equality is byte-exact against PG's
 	// canonical pg_get_constraintdef output.
@@ -480,6 +509,9 @@ func (td TableDiff) hasChanges() bool {
 		len(td.IndexesMissing) > 0 ||
 		len(td.IndexesExtra) > 0 ||
 		len(td.IndexesMismatched) > 0 ||
+		len(td.ForeignKeysMissing) > 0 ||
+		len(td.ForeignKeysExtra) > 0 ||
+		len(td.ForeignKeysMismatched) > 0 ||
 		len(td.ChecksMissing) > 0 ||
 		len(td.ChecksExtra) > 0 ||
 		len(td.ChecksMismatched) > 0 ||
@@ -565,6 +597,7 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 	diffIndexDefinitions(&td, expected, actual)
 
 	diffChecks(&td, expected, actual, opts)
+	diffForeignKeys(&td, expected, actual, opts)
 	diffExcludes(&td, expected, actual, opts)
 
 	return td
@@ -1116,4 +1149,159 @@ func diffIndexDefinitions(td *TableDiff, expected, actual *ir.Table) {
 			td.IndexesMismatched = append(td.IndexesMismatched, d)
 		}
 	}
+}
+
+// foreignKeysByName maps a table's foreign keys by constraint name.
+// UNNAMED foreign keys (Name == "") are skipped: this comparison is
+// name-matched set semantics like every other constraint here, and an
+// unnamed FK has no stable identity to match on across two schema reads.
+// Their absence is recorded on the diff via [TableDiff.ForeignKeysUnnamed]
+// rather than silently — an FK the comparison cannot see is exactly the
+// kind of gap this item exists to close.
+func foreignKeysByName(t *ir.Table) (byName map[string]*ir.ForeignKey, unnamedCount int) {
+	out := make(map[string]*ir.ForeignKey, len(t.ForeignKeys))
+	unnamed := 0
+	for _, fk := range t.ForeignKeys {
+		if fk == nil {
+			continue
+		}
+		if fk.Name == "" {
+			unnamed++
+			continue
+		}
+		out[fk.Name] = fk
+	}
+	return out, unnamed
+}
+
+// renderFKRef renders an FK's referencing side for comparison and display:
+// `(user_id) -> accounts(id)`.
+func renderFKRef(fk *ir.ForeignKey) string {
+	ref := fk.ReferencedTable
+	if fk.ReferencedSchema != "" {
+		ref = fk.ReferencedSchema + "." + ref
+	}
+	return "(" + strings.Join(fk.Columns, ", ") + ") -> " +
+		ref + "(" + strings.Join(fk.ReferencedColumns, ", ") + ")"
+}
+
+// diffForeignKeys compares foreign keys by name and, for those present on
+// both sides, by the attributes that change what the constraint ENFORCES
+// (roadmap item 125, the FK half of audit S9).
+//
+// Before this, TableDiff carried no FK fields at all: every foreign-key
+// difference — a dropped constraint, a re-pointed parent, a weakened
+// referential action — compared equal on the one surface an operator uses to
+// check a target against its source.
+//
+// The compared attributes are the ones that decide which rows are legal and
+// what happens to them:
+//
+//   - the referencing and referenced column lists and the parent table, since
+//     re-pointing an FK changes what it constrains entirely
+//   - OnDelete / OnUpdate, where a source CASCADE against a target RESTRICT
+//     (or the reverse) changes what a delete on the parent DOES
+//   - Match, a constraint-STRENGTH difference: under MATCH FULL the source
+//     rejects a partially-NULL composite key that MATCH SIMPLE accepts
+//     (audit 2026-07-26 SL-7)
+//   - Deferrable / InitiallyDeferred, the same in the other direction: a
+//     target that is not deferrable rejects a transaction ordering the source
+//     accepts
+func diffForeignKeys(td *TableDiff, expected, actual *ir.Table, opts Options) {
+	expFK, expUnnamed := foreignKeysByName(expected)
+	actFK, actUnnamed := foreignKeysByName(actual)
+	td.ForeignKeysUnnamed = expUnnamed + actUnnamed
+
+	for name := range expFK {
+		if _, ok := actFK[name]; !ok {
+			td.ForeignKeysMissing = append(td.ForeignKeysMissing, name)
+		}
+	}
+	sort.Strings(td.ForeignKeysMissing)
+
+	if !opts.IgnoreExtras {
+		for name := range actFK {
+			if _, ok := expFK[name]; !ok {
+				td.ForeignKeysExtra = append(td.ForeignKeysExtra, name)
+			}
+		}
+		sort.Strings(td.ForeignKeysExtra)
+	}
+
+	common := make([]string, 0, len(expFK))
+	for name := range expFK {
+		if _, ok := actFK[name]; ok {
+			common = append(common, name)
+		}
+	}
+	sort.Strings(common)
+
+	for _, name := range common {
+		exp, act := expFK[name], actFK[name]
+		d := ForeignKeyDiff{Name: name}
+		mismatched := false
+
+		if er, ar := renderFKRef(exp), renderFKRef(act); er != ar {
+			d.ExpectedReference, d.ActualReference = er, ar
+			mismatched = true
+		}
+		if exp.OnDelete != act.OnDelete {
+			d.ExpectedOnDelete, d.ActualOnDelete = string(exp.OnDelete), string(act.OnDelete)
+			mismatched = true
+		}
+		if exp.OnUpdate != act.OnUpdate {
+			d.ExpectedOnUpdate, d.ActualOnUpdate = string(exp.OnUpdate), string(act.OnUpdate)
+			mismatched = true
+		}
+		if exp.Match != act.Match {
+			d.ExpectedMatch, d.ActualMatch = string(exp.Match), string(act.Match)
+			mismatched = true
+		}
+		if exp.Deferrable != act.Deferrable || exp.InitiallyDeferred != act.InitiallyDeferred {
+			d.DeferrabilityMismatched = true
+			d.ExpectedDeferrable, d.ActualDeferrable = exp.Deferrable, act.Deferrable
+			d.ExpectedInitiallyDeferred, d.ActualInitiallyDeferred = exp.InitiallyDeferred, act.InitiallyDeferred
+			mismatched = true
+		}
+
+		if mismatched {
+			td.ForeignKeysMismatched = append(td.ForeignKeysMismatched, d)
+		}
+	}
+}
+
+// ForeignKeyDiff captures one foreign key's expected-vs-actual mismatch, for
+// a constraint present on both sides under the same name. Only the fields
+// that actually differ are populated. See [diffForeignKeys] for why these
+// attributes and not others.
+type ForeignKeyDiff struct {
+	Name string `json:"name"`
+
+	// ExpectedReference / ActualReference render as
+	// `(user_id) -> accounts(id)` — the referencing columns, the parent
+	// table, and the referenced columns, which is the whole of what the
+	// constraint points at.
+	ExpectedReference string `json:"expected_reference,omitempty"`
+	ActualReference   string `json:"actual_reference,omitempty"`
+
+	ExpectedOnDelete string `json:"expected_on_delete,omitempty"`
+	ActualOnDelete   string `json:"actual_on_delete,omitempty"`
+	ExpectedOnUpdate string `json:"expected_on_update,omitempty"`
+	ActualOnUpdate   string `json:"actual_on_update,omitempty"`
+
+	// ExpectedMatch / ActualMatch carry MATCH FULL vs MATCH SIMPLE — a
+	// constraint-STRENGTH difference, not a cosmetic one: under MATCH FULL
+	// the source rejects a partially-NULL composite key that MATCH SIMPLE
+	// accepts.
+	ExpectedMatch string `json:"expected_match,omitempty"`
+	ActualMatch   string `json:"actual_match,omitempty"`
+
+	// Deferrability is reported as a unit because the two flags are only
+	// meaningful together, and because false is both a real value and the
+	// zero value — a bare bool pair cannot say "this differs".
+	DeferrabilityMismatched   bool `json:"deferrability_mismatched,omitempty"`
+	ExpectedDeferrable        bool `json:"expected_deferrable,omitempty"`
+	ActualDeferrable          bool `json:"actual_deferrable,omitempty"`
+	ExpectedInitiallyDeferred bool `json:"expected_initially_deferred,omitempty"`
+	ActualInitiallyDeferred   bool `json:"actual_initially_deferred,omitempty"`
 }

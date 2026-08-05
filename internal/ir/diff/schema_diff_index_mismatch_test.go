@@ -197,3 +197,143 @@ func TestSchemaDiff_IndexMismatchReachesExitCodeAndSummary(t *testing.T) {
 		t.Fatalf("Summary() = %q with an index mismatch present", got)
 	}
 }
+
+// fkTable builds a table carrying one named foreign key.
+func fkTable(fk *ir.ForeignKey) *ir.Table {
+	return &ir.Table{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "user_id", Type: ir.Integer{Width: 64}},
+		},
+		ForeignKeys: []*ir.ForeignKey{fk},
+	}
+}
+
+func baseFK() *ir.ForeignKey {
+	return &ir.ForeignKey{
+		Name: "fk_orders_user", Columns: []string{"user_id"},
+		ReferencedTable: "users", ReferencedColumns: []string{"id"},
+		OnDelete: ir.FKActionCascade, OnUpdate: ir.FKActionNoAction,
+	}
+}
+
+// The FK half of item 125. TableDiff carried NO foreign-key fields, so every
+// FK difference compared equal on the surface an operator uses to check a
+// target against its source.
+func TestSchemaDiff_SeesForeignKeyDrift(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*ir.ForeignKey)
+		want   bool
+		why    string
+	}{
+		{
+			name:   "referential action weakened",
+			mutate: func(fk *ir.ForeignKey) { fk.OnDelete = ir.FKActionRestrict },
+			want:   true,
+			why:    "a source CASCADE against a target RESTRICT changes what a delete on the parent DOES",
+		},
+		{
+			name:   "parent table re-pointed",
+			mutate: func(fk *ir.ForeignKey) { fk.ReferencedTable = "accounts" },
+			want:   true,
+			why:    "the constraint now constrains something else entirely",
+		},
+		{
+			name:   "referencing column changed",
+			mutate: func(fk *ir.ForeignKey) { fk.Columns = []string{"id"} },
+			want:   true,
+			why:    "a different child column is constrained",
+		},
+		{
+			name:   "MATCH strength changed",
+			mutate: func(fk *ir.ForeignKey) { fk.Match = ir.FKMatchFull },
+			want:   true,
+			why: "under MATCH FULL the source rejects a partially-NULL composite key that MATCH SIMPLE " +
+				"accepts — a constraint-strength difference (audit 2026-07-26 SL-7)",
+		},
+		{
+			name:   "deferrability changed",
+			mutate: func(fk *ir.ForeignKey) { fk.Deferrable, fk.InitiallyDeferred = true, true },
+			want:   true,
+			why:    "a target that is not deferrable rejects a transaction ordering the source accepts",
+		},
+		{
+			name:   "identical FK is clean",
+			mutate: func(*ir.ForeignKey) {},
+			want:   false,
+			why:    "no drift",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			act := baseFK()
+			tc.mutate(act)
+			d := Schemas(
+				&ir.Schema{Tables: []*ir.Table{fkTable(baseFK())}},
+				&ir.Schema{Tables: []*ir.Table{fkTable(act)}},
+				Options{},
+			)
+			var got []ForeignKeyDiff
+			for _, td := range d.TablesMismatched {
+				got = append(got, td.ForeignKeysMismatched...)
+			}
+			if (len(got) > 0) != tc.want {
+				t.Fatalf("ForeignKeysMismatched = %+v; want mismatch=%v\n\nwhy this matters: %s",
+					got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// A dropped foreign key must surface as missing — the simplest and most
+// likely real drift, and it was invisible too.
+func TestSchemaDiff_SeesDroppedForeignKey(t *testing.T) {
+	withFK := &ir.Schema{Tables: []*ir.Table{fkTable(baseFK())}}
+	without := &ir.Schema{Tables: []*ir.Table{{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "user_id", Type: ir.Integer{Width: 64}},
+		},
+	}}}
+	d := Schemas(withFK, without, Options{})
+	if !d.HasChanges() {
+		t.Fatal("a foreign key present on the source and absent on the target reported NO drift")
+	}
+	found := false
+	for _, td := range d.TablesMismatched {
+		for _, n := range td.ForeignKeysMissing {
+			if n == "fk_orders_user" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("the dropped FK was not reported under ForeignKeysMissing")
+	}
+}
+
+// An UNNAMED foreign key cannot be name-matched, and the diff must SAY it
+// skipped one rather than reporting clean — "this comparison did not look at
+// N of your foreign keys" is the coverage gap that makes a clean report
+// misleading.
+func TestSchemaDiff_ReportsUnnamedForeignKeysAsUncompared(t *testing.T) {
+	unnamed := baseFK()
+	unnamed.Name = ""
+	d := Schemas(
+		&ir.Schema{Tables: []*ir.Table{fkTable(unnamed)}},
+		&ir.Schema{Tables: []*ir.Table{fkTable(unnamed)}},
+		Options{},
+	)
+	// Both sides identical, so no drift — but the count must be recorded.
+	td := TableDiff{}
+	diffForeignKeys(&td, fkTable(unnamed), fkTable(unnamed), Options{})
+	if td.ForeignKeysUnnamed != 2 {
+		t.Errorf("ForeignKeysUnnamed = %d; want 2 (one per side).\n\n"+
+			"An FK the comparison cannot see must be counted, not silently skipped.", td.ForeignKeysUnnamed)
+	}
+	_ = d
+}
