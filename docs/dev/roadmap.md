@@ -1967,9 +1967,21 @@ Known members, all confirmed by reading the call sites:
 
 **The trap this must not walk into is item 104's, and it is live here.** A new field on an IR type reaches the backup schema fingerprint and partitions every existing chain by release. `ir.Column` has a hand-written `MarshalJSON` over an enumerated `columnWire`, so the field must be added in three places to reach the wire at all — and the moment it does, it must be **excluded from the fingerprint** (`fingerprintIndex` / `computeSchemaHash`) or it mints a new epoch. Note the exclusion is not free: `canonicalManifestBytes` folds the fingerprint string, so signing does not backstop a flipped width. Pin the exclusion with a with-field-vs-without-field equality test, not a frozen golden built from post-change values.
 
-### 116. The backup chunk writer rolls on ROW COUNT only, and the legacy manifest checkpoint re-PUTs the whole manifest per chunk (audit 2026-08-01 P3 + P4; both MEASURED, neither fixed) — *OPEN*
+### 116. The backup chunk writer rolls on ROW COUNT only, and the legacy manifest checkpoint re-PUTs the whole manifest per chunk (audit 2026-08-01 P3 + P4) — *P3 ✅ SHIPPED to `main` 2026-08-04; P4 still OPEN*
 
-Filed together because they are the same corpus shape seen from two sides, and because both were previously argued rather than measured. The numbers below are from `TestChunkRoll_IgnoresRowWidth` and `TestLegacyCheckpointCost_*`, which are committed and stay as the regression floor.
+**P3 implementation notes.** `DefaultBackupChunkBytes = 64 << 20` — the same figure as `pgCopyChunkBytes`, chosen so the two answers to "how much may one in-flight chunk hold" agree. The roll is now `RowCount() >= chunkRows || BytesWritten() >= chunkBytes`; on narrow rows the byte arm never fires and boundaries are exactly where they have always been, which is the half that matters for compatibility and has its own control test.
+
+**The ceiling counts UNCOMPRESSED bytes, and that is the load-bearing choice.** A compressed-size trigger would move every boundary the day the codec or its level changed, and since `flush`'s content-addressed same-path skip compares a chunk's SHA at its allocated path, every moved boundary re-uploads. `ChunkWriter.BytesWritten()` therefore counts the JSON Lines handed to the writer, before compression and encryption. Pinned by `TestChunkByteCeiling_BoundariesAreCodecIndependent` (same rows, `CodecNone` vs `CodecGzip`, identical boundaries) and `_RerunSkipsReuploadingIdenticalChunks` (same path AND same SHA across two runs).
+
+**The resume half of the stated gotcha turned out not to exist, and saying so is the point.** Resume works at **TABLE** granularity (Bug 135): a partially written table is re-streamed from scratch and its prior chunks are never reused, because chunk contents already depended on scan order. Nothing keys on where a chunk ends. A test asserting otherwise would have asserted the absence of a coupling that was never there, so the file states the reasoning instead of carrying a vacuous pin.
+
+`Backup.ChunkBytes` is zero-value-safe by construction (the v0.99.51 rule): zero resolves to the default via `chunkByteCeiling()`, never to "unlimited", because zero is what every test, broker path and future caller gets. Mutation-run three ways — dropping the byte arm fails the roll test, shrinking the default to 64 B fails the narrow-row control, and switching to `s.buf.Len()` fails the codec-independence pin — each failing exactly one test.
+
+**No new CLI flag.** `--chunk-size` remains the operator knob; this is a ceiling that stops the row count from meaning gigabytes, not a second target to tune. `perf-parity-matrix.md` gap 16 is closed in the same pass.
+
+**P4 (the cloud-store checkpoint amplification) is untouched and still OPEN** — it needs the numbered-sidecar design below, which is a real design decision rather than a ceiling.
+
+Filed together because they are the same corpus shape seen from two sides, and because both were previously argued rather than measured. The numbers below are from `TestChunkRoll_MeasuresRowWidth` (renamed when the ceiling landed) and `TestLegacyCheckpointCost_*`, which are committed and stay as the regression floor.
 
 **P3 — no byte ceiling on the chunk buffer.** `backupChunkStreamer.writeRow` ends with `if s.writer.RowCount() >= int64(s.chunkRows)`, and that is the only roll condition. The chunk accumulates in an in-memory `bytes.Buffer` until it fires, so the peak buffer is `chunkRows × average serialized row size` with the row size unbounded and unconsulted.
 

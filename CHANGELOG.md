@@ -2,6 +2,14 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+**A backup chunk could buffer gigabytes in memory before it rolled.** The chunk writer rolled on row count and nothing else, while the chunk accumulated in an in-memory buffer — so the peak was the row count times the average serialized row size, with the row size unbounded and never consulted. Measured: at a fixed 500 rows, widening rows from 64 B to 64 KiB grew the buffered chunk 644×, which extrapolates to roughly 6.1 GiB for a single chunk at the shipped 100,000-row default. A wide `mediumtext` or `json` column is exactly the shape that reaches it. There is now a 64 MiB ceiling beside the row cap, the same figure the Postgres chunked `COPY` path already used, and the writer rolls on whichever it hits first. Narrow rows are unaffected — they still roll on the row count, at exactly the boundaries they always did.
+
+The ceiling counts bytes *before* compression, deliberately. Chunk boundaries feed the content-addressed same-path upload skip, so where a chunk ends must not depend on how well it happened to compress; otherwise the day a codec or its level changed, every boundary would move and every existing chunk would re-upload. Resume is unaffected either way: it works at table granularity, so nothing keys on a boundary.
+
 ## [0.111.0] - 2026-08-04
 
 Three fixes from the v0.110.1 regression cycle and the sibling sweeps its findings set off: a Postgres column type that could never migrate at all, a primary key that was silently widened on a SQLite target, and every "the target cannot represent this index" refusal moved ahead of the copy.

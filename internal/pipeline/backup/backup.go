@@ -97,6 +97,26 @@ import (
 // time on commodity hardware. Operators tune via --chunk-size.
 const DefaultBackupChunkRows = 100_000
 
+// DefaultBackupChunkBytes is the per-chunk UNCOMPRESSED byte ceiling
+// when [Backup]'s ChunkBytes is left at zero (roadmap item 116 P3).
+//
+// The row count alone bounds nothing: a chunk accumulates in an
+// in-memory buffer until its roll fires, so the peak is
+// `chunkRows × average serialized row size` with the row size
+// unbounded. Measured, at a fixed 500 rows, widening rows from 64 B to
+// 64 KiB grew the buffered chunk from 50 KB to 32.8 MB — 644× the bytes
+// for the same row count. Extrapolated to the shipped 100,000-row
+// default at that width: ~6.1 GiB buffered for ONE chunk. A wide
+// mediumtext or json column is exactly the shape that reaches it.
+//
+// 64 MiB matches [postgres.pgCopyChunkBytes], the same soft cap on the
+// same kind of buffer, chosen so the two answers to "how much may one
+// in-flight chunk hold" agree. This is a CEILING, not a target: a table
+// of narrow rows still rolls on the row count and is unaffected, which
+// is why it needs no operator flag — --chunk-size remains the knob, and
+// this only stops the row count from meaning gigabytes.
+const DefaultBackupChunkBytes int64 = 64 << 20
+
 // ManifestProgressFileName is the filename of the in-progress
 // checkpoint sidecar next to the manifest (ADR-0086): one appended
 // JSON line per chunk-finished / table-finished event, so checkpoints
@@ -131,6 +151,19 @@ type Backup struct {
 	// [DefaultBackupChunkRows]. The writer rolls over to a new chunk
 	// file whenever the current one hits this row count.
 	ChunkRows int
+
+	// ChunkBytes is the per-chunk UNCOMPRESSED byte ceiling. Zero falls
+	// back to [DefaultBackupChunkBytes]; the writer rolls on whichever
+	// of the two limits it reaches first.
+	//
+	// Zero means the DEFAULT, never "unlimited" — the ceiling is the
+	// safe behaviour, so it must be what every construction that never
+	// sets this field gets (the v0.99.51 zero-value trap: a field whose
+	// zero value disables the protection silently opts out every test,
+	// every broker path and every future caller). Nothing in the tree
+	// can turn the ceiling off; a caller that wants larger chunks
+	// raises this rather than zeroing it.
+	ChunkBytes int64
 
 	// SluiceVersion is the build identifier of the running binary,
 	// recorded in the manifest. Optional — empty leaves the field
@@ -307,6 +340,18 @@ type Backup struct {
 	// byte-identical non-TTY stream, so the sink adds nothing there. The
 	// CLI sets a [progress.TTYSink] only for an interactive terminal.
 	Progress progress.Sink
+}
+
+// chunkByteCeiling resolves [Backup.ChunkBytes], defaulting a zero or
+// negative value to [DefaultBackupChunkBytes]. It is the single place
+// the fallback lives, so no construction path can end up uncapped by
+// forgetting to set the field — which is every construction path except
+// the CLI's.
+func (b *Backup) chunkByteCeiling() int64 {
+	if b.ChunkBytes <= 0 {
+		return DefaultBackupChunkBytes
+	}
+	return b.ChunkBytes
 }
 
 // Run executes the backup. Returns nil on success; a wrapped error on

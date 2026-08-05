@@ -120,6 +120,21 @@ type ChunkWriter struct {
 	rowCount int64
 	closed   bool
 
+	// encodedBytes is the cumulative size of the JSON Lines this writer
+	// has been handed — payload plus its newline, BEFORE compression and
+	// encryption. It backs [ChunkWriter.BytesWritten], the byte half of
+	// the caller's chunk-roll decision (roadmap item 116 P3).
+	//
+	// Deliberately the UNCOMPRESSED count, not the length of the output
+	// buffer. Chunk boundaries are load-bearing beyond memory — resume
+	// keys on them and the content-addressed same-path upload skip
+	// compares a chunk's SHA at its allocated path — so where a chunk
+	// ends must depend only on the ROWS, never on how well they happened
+	// to compress. A compressed-size trigger would move every boundary
+	// the day the codec or its level changed, silently invalidating the
+	// re-run skip for every existing chunk.
+	encodedBytes int64
+
 	// cek, when non-nil, enables encrypted mode. It's the Content
 	// Encryption Key handed in by the orchestrator; ChunkWriter is
 	// not responsible for generating or wrapping it.
@@ -231,6 +246,7 @@ func (w *ChunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 			return fmt.Errorf("chunk row newline: %w", err)
 		}
 		w.rowCount++
+		w.encodedBytes += int64(len(b)) + 1
 		return nil
 	}
 	w.encBuf = b[:0]
@@ -262,6 +278,7 @@ func (w *ChunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
 		return fmt.Errorf("chunk row newline: %w", err)
 	}
 	w.rowCount++
+	w.encodedBytes += int64(len(b)) + 1
 	return nil
 }
 
@@ -327,6 +344,16 @@ func (w *ChunkWriter) Hash() string {
 
 // RowCount returns the number of rows written so far.
 func (w *ChunkWriter) RowCount() int64 { return w.rowCount }
+
+// BytesWritten returns the cumulative UNCOMPRESSED size of the rows
+// written so far, in bytes — each row's JSON Lines payload plus its
+// newline. It is the byte half of the caller's chunk-roll decision; see
+// [ChunkWriter.encodedBytes] for why it is not the compressed size.
+//
+// It counts ROWS only. The chunk header written at construction is not
+// included, so this is not the size of the resulting file — it is the
+// quantity that scales with the data and drives the in-memory buffer.
+func (w *ChunkWriter) BytesWritten() int64 { return w.encodedBytes }
 
 // ChunkReader is the inverse of [ChunkWriter]: streams rows from a
 // gzip-compressed JSON Lines stream while computing a SHA-256 to

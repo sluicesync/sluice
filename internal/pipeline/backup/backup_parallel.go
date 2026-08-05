@@ -453,6 +453,14 @@ type backupChunkStreamer struct {
 	chainCEK  []byte
 	chunkRows int
 
+	// chunkBytes is the UNCOMPRESSED byte ceiling, resolved once at
+	// construction from [Backup.ChunkBytes] (roadmap item 116 P3). It is
+	// read off the Backup rather than threaded through the table-pool
+	// call chain like chunkRows: it has no per-table or per-range
+	// variation, and adding a fourth parameter to four signatures to say
+	// the same number every time is worse than one resolver.
+	chunkBytes int64
+
 	// manifest is the run's in-flight manifest (the committer's), read
 	// here ONLY for its immutable identity fields (FormatVersion,
 	// CreatedAt, SourceEngine, Kind — all fixed before the table pool
@@ -490,18 +498,19 @@ func (b *Backup) newBackupChunkStreamer(
 		colNames[i] = c.Name
 	}
 	return &backupChunkStreamer{
-		b:         b,
-		table:     table,
-		entry:     entry,
-		committer: committer,
-		chainCEK:  chainCEK,
-		chunkRows: chunkRows,
-		manifest:  committer.manifest,
-		cols:      cols,
-		colNames:  colNames,
-		pkCols:    migcore.TablePKColumns(table),
-		chunkIdx:  chunkIdx,
-		rowsTotal: rowsTotal,
+		b:          b,
+		table:      table,
+		entry:      entry,
+		committer:  committer,
+		chainCEK:   chainCEK,
+		chunkRows:  chunkRows,
+		chunkBytes: b.chunkByteCeiling(),
+		manifest:   committer.manifest,
+		cols:       cols,
+		colNames:   colNames,
+		pkCols:     migcore.TablePKColumns(table),
+		chunkIdx:   chunkIdx,
+		rowsTotal:  rowsTotal,
 	}
 }
 
@@ -544,7 +553,11 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 		return fmt.Errorf("write row: %w", err)
 	}
 	s.rowsTotal.Add(1)
-	if s.writer.RowCount() >= int64(s.chunkRows) {
+	// Roll on whichever limit arrives first. The byte ceiling is what
+	// keeps the row count from meaning gigabytes on a wide table
+	// (roadmap item 116 P3); on narrow rows it never fires and chunk
+	// boundaries are exactly where they have always been.
+	if s.writer.RowCount() >= int64(s.chunkRows) || s.writer.BytesWritten() >= s.chunkBytes {
 		return s.flush(ctx)
 	}
 	return nil
