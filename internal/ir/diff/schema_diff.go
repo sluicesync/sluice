@@ -110,7 +110,7 @@ func (d SchemaDiff) Summary() string {
 	add(len(d.TablesExtra), "extra table", "extra tables")
 	var (
 		colMissing, colExtra, colMismatched int
-		idxMissing, idxExtra                int
+		idxMissing, idxExtra, idxMismatched int
 		chkMissing, chkExtra, chkMismatched int
 		exMissing, exExtra, exMismatched    int
 	)
@@ -120,6 +120,7 @@ func (d SchemaDiff) Summary() string {
 		colMismatched += len(td.ColumnsMismatched)
 		idxMissing += len(td.IndexesMissing)
 		idxExtra += len(td.IndexesExtra)
+		idxMismatched += len(td.IndexesMismatched)
 		chkMissing += len(td.ChecksMissing)
 		chkExtra += len(td.ChecksExtra)
 		chkMismatched += len(td.ChecksMismatched)
@@ -132,6 +133,7 @@ func (d SchemaDiff) Summary() string {
 	add(colMismatched, "type mismatch", "type mismatches")
 	add(idxMissing, "missing index", "missing indexes")
 	add(idxExtra, "extra index", "extra indexes")
+	add(idxMismatched, "index mismatch", "index mismatches")
 	add(chkMissing, "missing CHECK", "missing CHECKs")
 	add(chkExtra, "extra CHECK", "extra CHECKs")
 	add(chkMismatched, "CHECK mismatch", "CHECK mismatches")
@@ -157,9 +159,25 @@ type TableDiff struct {
 	ColumnsMismatched []ColumnDiff `json:"columns_mismatched,omitempty"`
 	IndexesMissing    []string     `json:"indexes_missing,omitempty"`
 	IndexesExtra      []string     `json:"indexes_extra,omitempty"`
-	ChecksMissing     []string     `json:"checks_missing,omitempty"`
-	ChecksExtra       []string     `json:"checks_extra,omitempty"`
-	ChecksMismatched  []CheckDiff  `json:"checks_mismatched,omitempty"`
+
+	// IndexesMismatched holds indexes present on BOTH sides under the same
+	// name whose definition differs in a way that changes which rows are
+	// legal (roadmap item 125 / audit 2026-08-04 S9).
+	//
+	// Until this existed the index comparison was name-only, so a source
+	// `UNIQUE (email(10))` and a target `UNIQUE (email)` compared EQUAL —
+	// and that is precisely the silent constraint weakening the emit-time
+	// refusals in items 118 and 120 exist to prevent. The one operator
+	// surface for CHECKING whether a target's constraints still match the
+	// source could not see it.
+	//
+	// Only semantics-changing attributes are compared; see [IndexDiff].
+	// Index column ORDERING remains out of scope per ADR-0029, which is a
+	// different claim from the column SET or a per-column prefix length.
+	IndexesMismatched []IndexDiff `json:"indexes_mismatched,omitempty"`
+	ChecksMissing     []string    `json:"checks_missing,omitempty"`
+	ChecksExtra       []string    `json:"checks_extra,omitempty"`
+	ChecksMismatched  []CheckDiff `json:"checks_mismatched,omitempty"`
 	// EXCLUDE constraint deltas (ADR-0053). PG-only; MySQL sides always
 	// have empty slices. Definition equality is byte-exact against PG's
 	// canonical pg_get_constraintdef output.
@@ -255,6 +273,46 @@ type CheckDiff struct {
 	Name         string `json:"name"`
 	ExpectedExpr string `json:"expected_expr,omitempty"`
 	ActualExpr   string `json:"actual_expr,omitempty"`
+}
+
+// IndexDiff captures one index's expected-vs-actual mismatch, for an index
+// present on both sides under the same name. Only the fields that actually
+// differ are populated; equal ones are left zero, matching [ColumnDiff].
+//
+// # What is compared, and why exactly these
+//
+// The attributes below are the ones that decide WHICH ROWS ARE LEGAL, which
+// is the property an operator runs `schema diff` to confirm:
+//
+//   - Columns — rendered including any per-column prefix length, so MySQL's
+//     `email(10)` and a plain `email` are distinguishable. This is the S8
+//     class: dropping the prefix widens a unique key and the target starts
+//     admitting rows the source rejects.
+//   - Unique — a key that stops enforcing uniqueness is the same class of
+//     weakening, arriving by a different route.
+//   - Predicate — a partial index's `WHERE`. Dropping it makes the target
+//     STRICTER (rows the source holds legally are refused), the mirror of
+//     the prefix case and equally worth seeing.
+//
+// Deliberately NOT compared: index KIND/method (BTREE vs HASH vs GIN), which
+// is a performance property no cross-engine pair agrees on and which would
+// make every MySQL↔PG diff noisy; and index column ORDERING, which ADR-0029
+// puts out of scope for v1. Neither changes which rows are legal.
+type IndexDiff struct {
+	Name string `json:"name"`
+
+	ExpectedColumns string `json:"expected_columns,omitempty"`
+	ActualColumns   string `json:"actual_columns,omitempty"`
+
+	// ExpectedUnique / ActualUnique are only meaningful when
+	// UniqueMismatched is true — false is both a real value and the zero
+	// value, so a bare bool pair cannot say "this differs".
+	UniqueMismatched bool `json:"unique_mismatched,omitempty"`
+	ExpectedUnique   bool `json:"expected_unique,omitempty"`
+	ActualUnique     bool `json:"actual_unique,omitempty"`
+
+	ExpectedPredicate string `json:"expected_predicate,omitempty"`
+	ActualPredicate   string `json:"actual_predicate,omitempty"`
 }
 
 // ExcludeDiff captures a single EXCLUDE constraint's
@@ -421,6 +479,7 @@ func (td TableDiff) hasChanges() bool {
 		len(td.ColumnsMismatched) > 0 ||
 		len(td.IndexesMissing) > 0 ||
 		len(td.IndexesExtra) > 0 ||
+		len(td.IndexesMismatched) > 0 ||
 		len(td.ChecksMissing) > 0 ||
 		len(td.ChecksExtra) > 0 ||
 		len(td.ChecksMismatched) > 0 ||
@@ -503,6 +562,7 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 		}
 		sort.Strings(td.IndexesExtra)
 	}
+	diffIndexDefinitions(&td, expected, actual)
 
 	diffChecks(&td, expected, actual, opts)
 	diffExcludes(&td, expected, actual, opts)
@@ -959,4 +1019,101 @@ func indexNames(t *ir.Table) map[string]struct{} {
 		out[idx.Name] = struct{}{}
 	}
 	return out
+}
+
+// indexesByName maps a table's indexes by name, including the PRIMARY KEY
+// when it carries one — mirroring [indexNames] so the definition comparison
+// covers exactly the set the missing/extra comparison does.
+func indexesByName(t *ir.Table) map[string]*ir.Index {
+	out := make(map[string]*ir.Index, len(t.Indexes)+1)
+	if t.PrimaryKey != nil && t.PrimaryKey.Name != "" {
+		out[t.PrimaryKey.Name] = t.PrimaryKey
+	}
+	for _, idx := range t.Indexes {
+		if idx == nil || idx.Name == "" {
+			continue
+		}
+		out[idx.Name] = idx
+	}
+	return out
+}
+
+// renderIndexColumns renders an index's column list for comparison and for
+// operator display: `(email(10), id DESC)`.
+//
+// The prefix LENGTH is included deliberately and is the whole point — it is
+// what makes MySQL's `email(10)` distinguishable from a plain `email`, and a
+// renderer that dropped it would reproduce the blindness this comparison was
+// added to remove (roadmap item 125). An expression entry renders as its
+// expression text.
+func renderIndexColumns(idx *ir.Index) string {
+	if idx == nil || len(idx.Columns) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(idx.Columns))
+	for _, c := range idx.Columns {
+		var seg string
+		switch {
+		case c.Expression != "":
+			seg = "(" + c.Expression + ")"
+		default:
+			seg = c.Column
+			if c.Length > 0 {
+				seg += fmt.Sprintf("(%d)", c.Length)
+			}
+		}
+		if c.Desc {
+			seg += " DESC"
+		}
+		parts = append(parts, seg)
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// diffIndexDefinitions compares indexes present on BOTH sides under the same
+// name, populating [TableDiff.IndexesMismatched] (roadmap item 125).
+//
+// Missing/extra are handled by the caller's name-set pass; this is only about
+// the ones that LOOK the same and are not. Compared attributes and the
+// reasoning for the set live on [IndexDiff].
+//
+// opts is deliberately not consulted: IgnoreExtras scopes which SIDE's
+// absences are reported, and there is no absence here — both sides have the
+// index. IgnoreCharsetCollation is about column types, which this does not
+// compare.
+func diffIndexDefinitions(td *TableDiff, expected, actual *ir.Table) {
+	expIdx := indexesByName(expected)
+	actIdx := indexesByName(actual)
+
+	common := make([]string, 0, len(expIdx))
+	for name := range expIdx {
+		if _, ok := actIdx[name]; ok {
+			common = append(common, name)
+		}
+	}
+	sort.Strings(common)
+
+	for _, name := range common {
+		exp, act := expIdx[name], actIdx[name]
+		d := IndexDiff{Name: name}
+		mismatched := false
+
+		if ec, ac := renderIndexColumns(exp), renderIndexColumns(act); ec != ac {
+			d.ExpectedColumns, d.ActualColumns = ec, ac
+			mismatched = true
+		}
+		if exp.Unique != act.Unique {
+			d.UniqueMismatched = true
+			d.ExpectedUnique, d.ActualUnique = exp.Unique, act.Unique
+			mismatched = true
+		}
+		if ep, ap := strings.TrimSpace(exp.Predicate), strings.TrimSpace(act.Predicate); ep != ap {
+			d.ExpectedPredicate, d.ActualPredicate = ep, ap
+			mismatched = true
+		}
+
+		if mismatched {
+			td.IndexesMismatched = append(td.IndexesMismatched, d)
+		}
+	}
 }

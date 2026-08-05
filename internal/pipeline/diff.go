@@ -137,6 +137,7 @@ type DiffJSONCounts struct {
 	ColumnsMismatched int `json:"columns_mismatched"`
 	IndexesMissing    int `json:"indexes_missing"`
 	IndexesExtra      int `json:"indexes_extra"`
+	IndexesMismatched int `json:"indexes_mismatched"`
 	ChecksMissing     int `json:"checks_missing"`
 	ChecksExtra       int `json:"checks_extra"`
 	ChecksMismatched  int `json:"checks_mismatched"`
@@ -636,6 +637,9 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 		for _, idx := range td.IndexesExtra {
 			fmt.Fprintf(&sb, "DROP INDEX %s; -- not in source schema\n", quote(idx))
 		}
+		for _, id := range td.IndexesMismatched {
+			renderIndexMismatch(&sb, td.Name, id, quote)
+		}
 		for _, name := range td.ChecksMissing {
 			renderMissingCheck(&sb, td.Name, name, quote, b.expected)
 		}
@@ -944,6 +948,7 @@ func summarise(d irdiff.SchemaDiff) DiffJSONCounts {
 		c.ColumnsExtra += len(td.ColumnsExtra)
 		c.ColumnsMismatched += len(td.ColumnsMismatched)
 		c.IndexesMissing += len(td.IndexesMissing)
+		c.IndexesMismatched += len(td.IndexesMismatched)
 		c.IndexesExtra += len(td.IndexesExtra)
 		c.ChecksMissing += len(td.ChecksMissing)
 		c.ChecksExtra += len(td.ChecksExtra)
@@ -971,4 +976,40 @@ func renderDiffJSON(w io.Writer, srcEngine, tgtEngine string, diff irdiff.Schema
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// renderIndexMismatch writes the human-readable suggestion for an index that
+// exists on both sides under one name but enforces something different
+// (roadmap item 125).
+//
+// It leads with the CONSEQUENCE rather than the attribute, because that is
+// what an operator needs to decide urgency: a target that admits rows the
+// source rejects is a live data-integrity gap, while one that admits fewer is
+// a availability problem. The suggestion is a comment rather than executable
+// DDL — rebuilding a unique index on a live target is not something to hand
+// someone as a paste-ready statement without them choosing the moment.
+func renderIndexMismatch(sb *strings.Builder, table string, id irdiff.IndexDiff, quote func(string) string) {
+	fmt.Fprintf(sb, "-- index %s on %s differs between source and target:\n",
+		quote(id.Name), quote(table))
+	if id.ExpectedColumns != "" || id.ActualColumns != "" {
+		fmt.Fprintf(sb, "--   columns:   source %s   target %s\n", id.ExpectedColumns, id.ActualColumns)
+		if strings.Contains(id.ExpectedColumns, "(") && !strings.Contains(id.ActualColumns, "(") {
+			fmt.Fprintln(sb, "--   ^ the source constrains a PREFIX of the column and the target does not, so the "+
+				"target ACCEPTS ROWS THE SOURCE REJECTS")
+		}
+	}
+	if id.UniqueMismatched {
+		fmt.Fprintf(sb, "--   unique:    source %v   target %v\n", id.ExpectedUnique, id.ActualUnique)
+		if id.ExpectedUnique && !id.ActualUnique {
+			fmt.Fprintln(sb, "--   ^ the target no longer enforces uniqueness, so it ACCEPTS ROWS THE SOURCE REJECTS")
+		}
+	}
+	if id.ExpectedPredicate != "" || id.ActualPredicate != "" {
+		fmt.Fprintf(sb, "--   predicate: source %q   target %q\n", id.ExpectedPredicate, id.ActualPredicate)
+		if id.ExpectedPredicate != "" && id.ActualPredicate == "" {
+			fmt.Fprintln(sb, "--   ^ the source's index is PARTIAL and the target's is not, so the target "+
+				"REJECTS ROWS THE SOURCE HOLDS")
+		}
+	}
+	fmt.Fprintf(sb, "-- review before acting; rebuilding %s on a live target takes a lock\n", quote(id.Name))
 }
