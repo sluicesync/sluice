@@ -63,6 +63,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -1880,8 +1881,24 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 			out.Advanced = windowAdvancedPast(cb.b.Source, cb.manifest.StartPosition, pos)
 		}
 	}
-	// Roll the chunk on per-chunk-row cap.
-	if cb.writer.ChangeCount() >= int64(chunkSize) {
+	// Roll the chunk on whichever ceiling it reaches FIRST — the event count
+	// or the accumulated bytes.
+	//
+	// The byte ceiling is the SIBLING the C-3 fix missed. That fix added one to
+	// `incremental.go`'s capture loop and stopped there, and its own commit
+	// enumerated the change lane as covered — but change chunks are written by
+	// TWO lanes, and this one (the continuous `backup stream run` rollover) is
+	// the one that writes most of them. Without it a rollover could buffer
+	// `chunkSize` events of unbounded width in memory before rolling, which is
+	// exactly the shape item 116 P3 fixed for data chunks.
+	//
+	// `RolloverMaxBytes` is NOT this ceiling: it bounds a whole rollover, counts
+	// compressed bytes, and only closes on a transaction boundary. This bounds
+	// one chunk's uncompressed accumulation, for the same reason the data lane
+	// does — chunk boundaries feed the content-addressed same-path upload skip,
+	// so where a chunk ends must not depend on how well it compressed.
+	if cb.writer.ChangeCount() >= int64(chunkSize) ||
+		cb.writer.BytesWritten() >= backup.DefaultBackupChunkBytes {
 		if err := cb.flushTo(ctx, out); err != nil {
 			return true, err
 		}

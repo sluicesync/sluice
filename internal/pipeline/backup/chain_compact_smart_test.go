@@ -24,6 +24,27 @@ import (
 // transition family (initial / collapse / barrier-flush), so the pin
 // must exercise every cell — not one representative cell.
 
+// finalizeCollected drains a compactor that is using the default [sliceSink]
+// and returns everything it emitted.
+//
+// The compactor streams into a [changeSink] rather than accumulating an output
+// slice (roadmap item 130), so the whole-output assertions these unit pins are
+// built around go through this helper. It is deliberately restricted to the
+// slice sink: a test that installs [chunkStreamSink] wants to assert on chunk
+// bytes, not on a slice that would not exist.
+func finalizeCollected(t *testing.T, s *smartCompactor) ([]ir.Change, *smartCompactResult) {
+	t.Helper()
+	res, err := s.finalize()
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	sl, ok := s.sink.(*sliceSink)
+	if !ok {
+		t.Fatalf("compactor sink is %T, not *sliceSink", s.sink)
+	}
+	return sl.out, res
+}
+
 // pos builds a positionable PG-shaped LSN bookmark for an event.
 func pos(lsn uint64) ir.Position {
 	return ir.Position{
@@ -104,7 +125,7 @@ func runPolicy(t *testing.T, schema *ir.Schema, events []ir.Change) ([]ir.Change
 			t.Fatalf("process(%T): %v", e, err)
 		}
 	}
-	emitted, res := c.finalize()
+	emitted, res := finalizeCollected(t, c)
 	return emitted, res
 }
 
@@ -504,7 +525,7 @@ func TestSmart_PKStrategyNone_PassesThroughEverything(t *testing.T) {
 			t.Fatalf("process: %v", err)
 		}
 	}
-	emitted, _ := c.finalize()
+	emitted, _ := finalizeCollected(t, c)
 	if got := kindsOf(emitted); got != "IUU" {
 		t.Fatalf("emitted = %q; want IUU (every event passes through)", got)
 	}

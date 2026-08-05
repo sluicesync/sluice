@@ -84,7 +84,7 @@ func runCompactor(t *testing.T, evs []ir.Change) []ir.Change {
 			t.Fatalf("process: %v", err)
 		}
 	}
-	out, _ := s.finalize()
+	out, _ := finalizeCollected(t, s)
 	return out
 }
 

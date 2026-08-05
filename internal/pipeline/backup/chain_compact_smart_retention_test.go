@@ -9,10 +9,11 @@
 // and a 100:1-COLLAPSING corpus → 248 MiB — i.e. no relief from collapsing,
 // because the inputs are held until flush however well they collapse.
 //
-// These tests gate the retained-INPUT term. Read
-// [defaultMaxRetainedBytes] for what is bounded and what is explicitly not:
-// smartCompactor.out still accumulates the emitted stream, so the peak is
-// O(cap + output), not O(cap).
+// These tests gate the retained-INPUT term ONLY, and the name is narrower than
+// "retention" on purpose. The EMITTED term — the other structure the audit
+// named — is a separate bound with its own gates in
+// chain_compact_smart_output_test.go (roadmap item 130); nothing here says
+// anything about it.
 
 package backup
 
@@ -94,7 +95,7 @@ func TestSmartCompactRetention_PeakStaysUnderTheCap(t *testing.T) {
 			t.Fatalf("process: %v", err)
 		}
 	}
-	cappedOut, cappedRes := capped.finalize()
+	cappedOut, cappedRes := finalizeCollected(t, capped)
 
 	if capped.peakRetainedBytes > cap0 {
 		t.Errorf("peak retention %d bytes exceeded the %d-byte cap.\n\n"+
@@ -114,7 +115,7 @@ func TestSmartCompactRetention_PeakStaysUnderTheCap(t *testing.T) {
 			t.Fatalf("process (uncapped): %v", err)
 		}
 	}
-	uncappedOut, uncappedRes := uncapped.finalize()
+	uncappedOut, uncappedRes := finalizeCollected(t, uncapped)
 
 	if uncapped.peakRetainedBytes <= cap0 {
 		t.Fatalf("uncapped peak retention was %d bytes, at or below the %d-byte cap — the corpus "+
@@ -196,7 +197,7 @@ func TestSmartCompactRetention_BelowTheCapOutputIsUnchanged(t *testing.T) {
 				t.Fatalf("process: %v", err)
 			}
 		}
-		out, res := s.finalize()
+		out, res := finalizeCollected(t, s)
 		if res.chainsEvicted != 0 {
 			t.Fatalf("cap %d evicted %d chains; this corpus must stay under every cap tested",
 				capBytes, res.chainsEvicted)
@@ -272,7 +273,7 @@ func TestSmartCompactRetention_NoCollapseCorpusIsUnreordered(t *testing.T) {
 			t.Fatalf("process: %v", err)
 		}
 	}
-	out, res := s.finalize()
+	out, res := finalizeCollected(t, s)
 
 	if res.chainsEvicted == 0 {
 		t.Fatal("no eviction happened, so this test proves nothing about eviction order")
@@ -331,7 +332,7 @@ func TestSmartCompactRetention_EvictionKeepsTheClosingCommitLast(t *testing.T) {
 			t.Fatalf("process: %v", err)
 		}
 	}
-	out, res := s.finalize()
+	out, res := finalizeCollected(t, s)
 
 	if res.chainsEvicted == 0 {
 		t.Fatal("no eviction happened, so this test proves nothing about the closing commit")
