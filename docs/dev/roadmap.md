@@ -1856,6 +1856,39 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 137. The copy retry budget is keyed by chunk index alone, so two tables share one chunk's budget — *OPEN, low; the known limitation item 136 declared rather than bundled*
+
+`attemptsByChunk` / `waitByChunk` in `copy_parallelism_gate.go` are keyed by chunk index, and the comment justifying that ("the gate is constructed per table, so the index is unique within a gate") is **false under the ADR-0123 run-wide gate**: table A's chunk 3 and table B's chunk 3 share a retry budget. Item 126's per-chunk bound can therefore fire earlier than advertised.
+
+Bounded and **loud** — an early abort, never a stall — which is why item 136 documented it in place instead of bundling the fix. The fix is keying by `(table, chunk)`, which needs `tableName` threaded into `ShrinkAndBackoff`.
+
+Worth noting the shape: this is the *same* comment-asserted uniqueness argument that item 126's own entry called out as "checked, not assumed" — and it was true then, of the per-table gate it was written against. ADR-0123 made it false without touching it.
+
+### 136. A CLEARED connection-slot transient DEADLOCKS the copy — Bug 228, regression from item 126 — *✅ FIXED on `main` 2026-08-05 (published inside `764cf018`, see the attribution note); unreleased. `-race` Integration must be green before the tag — concurrency chunk.*
+
+**Shipped in v0.112.0.** A transient SQLSTATE 53300 that then CLEARS stops the copy permanently: no log line, no error, **no exit code**, 1,593,750 of 6,000,000 rows, 48 of 67 goroutines blocked in `Acquire`. v0.111.1 aborted loudly in ~4s. Reproduced 2/2 against 0/2 by the v0.112.0 regression cycle.
+
+**Item 126 caused it by removing the thing that hid it.** The run-wide give-up bound was also the only thing that aborted the run before the token pool could drain. A loud failure became a silent hang.
+
+**Two wrong hypotheses, both killed by measurement — worth recording because both were plausible and both were mine.**
+
+1. *The reported lead — unbounded `retire`.* False. `retire` telescopes: any monotone descent from N sums to exactly `N-1`, and `NextCopyBackoff` clamps at 1. A deterministic reproduction driving the real gate through the shipped 16-worker ladder does **not** deadlock.
+2. *The main session's follow-up — no additive increase, so parallelism collapses to 1 and merely crawls.* Also false as the ROOT cause. The forensic dump measured `live_tokens_in_pool=0`, not 1, and **zero** chunks completing over the following second. Real, but the second half.
+
+**The actual root cause is a token-CLASS confusion, and the comment was arithmetically true while being operationally false.** Under ADR-0123 the budget's 16 tokens are **1 base + 15 chunk**: `migrate_table_pool.go` takes a token from the *same shared gate* and holds it for the whole table copy while blocked on its own chunks. Retiring 15 swallows every chunk token, and the lone survivor the "at least one token survives" argument protected is the base token held by the goroutine *waiting on those chunks*. Circular wait. **The invariant was about token COUNT when the property needed was "one token that can make progress."**
+
+The run-wide gate is necessary, not merely aggravating: the same harness on a per-table gate (no base token) finishes all 63 chunks. At `--table-parallelism 2` it stalls at 30/62 — one table's shrink freezes every table.
+
+**Fix:** the channel + `retire` mechanism is replaced by a resizable counting semaphore, which makes the whole accounting-underflow class inexpressible. Token CLASSES (`AcquireBase`/`ReleaseBase`) with the shrink floor at `max(aimdTarget, baseHeld+1)` — not a fudge: a base connection is already open and a shrink cannot close it, so the only thing a shrink governs is *further* opens. Plus the missing additive increase, gated on **evidence not a timer** (`NoteOpenSucceeded` after a successful open), so a still-saturated target grows the cap exactly zero times while any concurrent 53300 halves it — decrease dominates by construction. Item 126's per-chunk budget is untouched and a persistent shortage still aborts loudly.
+
+**A second deadlock, found while ground-truthing the fix's own doc comment:** the claim `baseHeld <= ceiling-1` is false on `--resume` with a recorded chunk plan, which bypasses `shouldParallelChunk` and yields `budget == tableParallelism`. Pre-fix that deadlocks **with no 53300 at all**. Closed by the same floor and pinned separately.
+
+**Sibling swept:** `backup/backup_table_pool.go` has the identical topology and is fixed too, documented in-code as currently unreachable (nothing on the backup read path calls `ShrinkAndBackoff`) — fixed as a class, not an instance.
+
+**The mutation that mattered:** M4 (reverting a table pool to the untagged `Acquire`) initially passed EVERYTHING, because the gate's own tests cannot see whether the *call site* tags the token class. Closed by an AST roster over both table pools and both chunk fan-outs, with anti-vacuity floors in both directions.
+
+**Attribution note, because the commit message cannot be repaired.** This fix was authored by a background investigator working in the shared tree while the main session committed with `git add -A`, so it was published inside `764cf018`, a commit titled for item 113's doc sync. Force-push to `main` is hard-blocked, so the history stands. `CLAUDE.local.md` warns about exactly this: **do main-session commits in a dedicated worktree, or path-scope the `git add`, whenever a subagent shares the tree.** The cost here was only a misleading commit title; the same mistake with a half-finished edit would have published broken code.
+
 ### 135. PG `bytea` decode SNIFFS its input, so genuine binary that spells `\x`+hex is silently shrunk — *OPEN, high (audit 2026-08-05 B-2, with the audit's own fix shape CORRECTED)*
 
 `postgres/value_decode.go:377`. `decodeBytea` decides whether its input is hex-encoded *text* by looking at the content: `\x` prefix + even-length valid hex ⇒ decode. Raw binary that happens to spell that is silently shrunk.
