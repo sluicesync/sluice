@@ -34,13 +34,20 @@ func TestBufferPoolParallelismCap(t *testing.T) {
 		// tablet, not a smaller instance. Field-observed 2026-08-04: a
 		// PS-160 branch returned 32 MiB and was throttled to parallelism 2.
 		{name: "1 byte ⇒ implausible, no cap", bytes: 1, want: 0},
-		{name: "32 MiB (the field report) ⇒ implausible, no cap", bytes: 32 * mib, want: 0},
+		// 32 MiB is not a hypothetical: it is what a real PlanetScale DEV
+		// branch returns, measured 2026-08-05 against aws.connect.psdb.cloud
+		// (dev 33554432 vs the same database's production PS-10 branch at
+		// 134217728). It is the exact value the field report saw.
+		{name: "32 MiB (a real PlanetScale DEV branch) ⇒ implausible, no cap", bytes: 32 * mib, want: 0},
 		{name: "just under the PS-10 floor ⇒ no cap", bytes: 128*mib - 1, want: 0},
 
 		// Smallest bucket (< 256 MB ⇒ cap 2), floor-inclusive. PS-10 =
 		// 0.125 GB = 128 MB, and a bare-minimum self-hosted dev MySQL
 		// (128 MB default) both land here.
-		{name: "PS-10 (0.125 GB / 128 MB)", bytes: 134217728, want: bufferPoolCapSmall},
+		// Measured 2026-08-05 on a real production PS-10 branch: EXACTLY this
+		// value. The floor is strictly-below, so the smallest real tier is
+		// still capped — one byte higher and the check would break it.
+		{name: "PS-10 (0.125 GB / 128 MB), measured on real PlanetScale", bytes: 134217728, want: bufferPoolCapSmall},
 		{name: "just under 256 MB", bytes: 256*mib - 1, want: bufferPoolCapSmall},
 
 		// Boundary 256 MB ⇒ medium bucket (half-open: 256 MB is NOT < 256 MB).

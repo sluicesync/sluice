@@ -162,8 +162,10 @@ func computeConnectionBudget(p connectionBudgetProbe, reserve int, applyTierCap 
 			// tightest cap — is the defect this branch exists to prevent.
 			slog.Warn(
 				"mysql: @@innodb_buffer_pool_size is below the smallest known PlanetScale tier, so it is "+
-					"not reporting the tablet's real pool; the buffer-pool tier cap is NOT applied and the "+
-					"connection budget stands (ADR-0116 Part B)",
+					"not reporting a plan tier; the buffer-pool parallelism cap is NOT applied and the "+
+					"connection budget stands. A PlanetScale DEV branch reports ~32 MiB regardless of the "+
+					"database's tier (measured 2026-08-05) — if this is a dev branch, connect to the "+
+					"production branch to get tier-sized copy parallelism (ADR-0116 Part B)",
 				slog.Int64("innodb_buffer_pool_size", p.bufferPoolBytes),
 				slog.Int64("smallest_known_tier_bytes", int64(bufferPoolPlanetScaleFloorBytes)),
 			)

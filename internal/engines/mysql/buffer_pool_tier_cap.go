@@ -61,8 +61,10 @@ const (
 	// bufferPoolPlanetScaleFloorBytes is PS-10's measured pool — the
 	// SMALLEST value the tier table above records. On the PlanetScale
 	// flavor a reading below it is not a smaller tier, it is a reading
-	// that isn't reporting the tablet (field-observed 2026-08-04: a
-	// PS-160 returning 32 MiB). See [bufferPoolParallelismCap].
+	// that is not reporting a plan tier at all: a PlanetScale DEV branch
+	// returns 32 MiB regardless of the database's tier (MEASURED
+	// 2026-08-05, and the explanation for the 2026-08-04 field report).
+	// See [bufferPoolParallelismCap].
 	bufferPoolPlanetScaleFloorBytes = 128 << 20 // 128 MiB = PS-10
 
 	bufferPoolCapSmall  = 2 // < 256 MB  (PS-10-class / tiny dev box)
@@ -87,16 +89,36 @@ const (
 // returns the tablet's real pool, monotonic by plan tier, with PS-10's
 // 128 MiB as the floor.
 //
-// That premise has been observed to FAIL. A 2026-08-04 field report on a
-// PS-160 branch — a tier the table above measures at 9.80 GB — read
-// 32 MiB, which bucketed to the TIGHTEST cap of 2 instead of 8. The
-// operator saw a copy running 4x narrower than their instance could carry,
-// with nothing naming the cause. A reading below the PS-10 floor cannot be
-// a real tier answer on this flavor, so it is treated as UNREADABLE rather
-// than as evidence of a tiny instance. That direction is deliberate: an
-// absent cap falls back to the connection-derived budget (which is a real
-// slot bound), whereas a wrong tight cap silently throttles the copy and
-// looks like sluice being slow.
+// That premise has been observed to FAIL, and the cause is now MEASURED
+// rather than guessed. A 2026-08-04 field report on what the operator
+// believed was a PS-160 branch — a tier the table above measures at
+// 9.80 GB — read 32 MiB, which bucketed to the TIGHTEST cap of 2 instead
+// of 8. The copy ran 4x narrower than the instance could carry, with
+// nothing naming the cause.
+//
+// Reproduced against real PlanetScale on 2026-08-05, and the answer is
+// that the premise holds for PRODUCTION branches and NOT for dev ones:
+//
+//	main, production, PS-10   134217728  (128 MiB)  8.4.6-Vitess
+//	devbranch, non-production  33554432  ( 32 MiB)  8.4.9-Vitess
+//
+// A DEV branch reports a small fixed pool that does not track the
+// database's plan tier — the same 32 MiB the field report saw, on a
+// database whose production branch reports its tier correctly. The two
+// branches report different Vitess versions (8.4.6 vs 8.4.9), so they are
+// demonstrably not the same infrastructure; the mechanism beyond that was
+// not investigated and is not claimed. Every measurement in the table above was
+// taken on a production branch, which is why the exception went unnoticed.
+//
+// A reading below the PS-10 floor therefore cannot be a tier answer, and
+// is treated as UNREADABLE rather than as evidence of a tiny instance.
+// That direction is deliberate: an absent cap falls back to the
+// connection-derived budget (which is a real slot bound), whereas a wrong
+// tight cap silently throttles the copy and looks like sluice being slow.
+//
+// Note how close the boundary is: a real PS-10 returns EXACTLY the floor
+// value, so it is still capped (the check is strictly-below). One byte
+// higher and this would break the smallest tier it exists to protect.
 //
 // This is the runtime check the premise-naming rule asks for. Its cost if
 // PlanetScale ever ships a tier genuinely below 128 MiB is that such a tier
