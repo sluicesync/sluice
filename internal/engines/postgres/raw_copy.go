@@ -211,9 +211,15 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		//
 		// NOT RETRIED, and that is inherent rather than an omission — r is a
 		// one-shot stream (a pipe from the exporter, or a chunk reader already
-		// partially consumed), so there is nothing to replay. Same property as
-		// MySQL's LOAD DATA path, and the message says so rather than leaving
-		// the operator with a bare driver error.
+		// partially consumed), so there is nothing to replay. The message says
+		// so rather than leaving the operator with a bare driver error.
+		//
+		// This used to say "same property as MySQL's LOAD DATA path". Roadmap
+		// item 114 made that false: LOAD DATA now buffers each segment and
+		// drives it through flushWithReparentRetry, so it DOES replay. This
+		// lane is now the only unretryable one-shot write path in the tree —
+		// which is a reason to look at it, not a reason it is fine. Tracked as
+		// the re-priced gap 18 in docs/dev/perf-parity-matrix.md.
 		rawErr = w.quiesceAndReportTransient(rawErr, "raw COPY import")
 		var re ir.RetriableError
 		if errors.As(classifyApplierError(rawErr), &re) && re.Retriable() {
