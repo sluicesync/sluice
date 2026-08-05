@@ -154,6 +154,14 @@ type smartCompactResult struct {
 	// strictly less (or equal in the no-collapse case).
 	bytesBefore int64
 	bytesAfter  int64
+
+	// chainsEvicted counts row chains the retention cap drained early
+	// (roadmap item 127). Non-zero means the collapse was PARTIAL: the
+	// output is correct, but some chains that could have collapsed did
+	// not. Reported rather than left to be inferred from the ratio,
+	// because "compacted less well than it could have" and "had nothing
+	// to compact" are the same number otherwise.
+	chainsEvicted int64
 }
 
 func newSmartCompactResult() *smartCompactResult {
@@ -170,6 +178,7 @@ func (r *smartCompactResult) merge(other *smartCompactResult) {
 	r.rowsCollapsed += other.rowsCollapsed
 	r.bytesBefore += other.bytesBefore
 	r.bytesAfter += other.bytesAfter
+	r.chainsEvicted += other.chainsEvicted
 	for k := range other.tablesWithoutPK {
 		r.tablesWithoutPK[k] = struct{}{}
 	}
@@ -213,6 +222,10 @@ type rowAccumulator struct {
 	table  string
 	pkKey  string      // serialised PK tuple for map identity
 	events []ir.Change // INSERT/UPDATE/DELETE in source-order
+
+	// bytes is the running [estimateChangeBytes] total for events. Kept
+	// incrementally so the retention cap never has to re-walk the chain.
+	bytes int64
 }
 
 // flush collapses the accumulator's events into 0, 1, or 2 net
@@ -476,17 +489,110 @@ type smartCompactor struct {
 	// Subsequent appends on the same accumulator don't re-trigger.
 	// Used by [finalize] to populate the report's RowsCollapsed.
 	rowsCollapsedCount int64
+
+	// maxRetainedBytes bounds what [accumulators] may hold before
+	// [maybeEvict] starts draining chains early. See
+	// [defaultMaxRetainedBytes] for what the number means and does not
+	// mean. Zero disables the cap (tests that assert the pre-cap shape).
+	maxRetainedBytes int64
+
+	// retainedBytes is the current [estimateChangeBytes] total across
+	// every live accumulator; peakRetainedBytes is its high-water mark,
+	// which is what the retention gate asserts on.
+	retainedBytes     int64
+	peakRetainedBytes int64
+
+	// chainsEvicted counts chains drained early by the cap. Reported so
+	// an operator can tell a partially-collapsed incremental from a
+	// fully-collapsed one rather than inferring it from the ratio.
+	chainsEvicted int64
+}
+
+// defaultMaxRetainedBytes bounds the ESTIMATED SERIALIZED size of the event
+// chains smart compaction holds in memory at once (roadmap item 127).
+//
+// # What was unbounded, and what this does and does not bound
+//
+// The compactor retained every input event until a flush barrier — and the
+// only barriers are TRUNCATE, SchemaSnapshot and end-of-incremental, so an
+// incremental with none of those retained ALL of them. Measured by the
+// 2026-08-04 audit: 100k events → 261 MiB, and a 100:1-collapsing corpus →
+// 248 MiB, i.e. NO relief from collapsing, because the inputs are held until
+// flush however well they collapse. ~2.6 GiB extrapolated at 1M events.
+//
+// This cap bounds that retained-INPUT term. It does NOT bound the emitted-
+// OUTPUT term: [smartCompactor.out] still accumulates every emitted event for
+// the whole incremental, so peak is O(cap + output) rather than O(input).
+// For the collapsing workloads smart compaction exists for, output is small
+// and this is the whole win; for an incremental with no collapse opportunity
+// at all, output ≈ input and the peak is largely unchanged. That residual is
+// filed rather than implied — see roadmap item 130 for why bounding it needs
+// the read/write phases restructured and not just another counter.
+//
+// # The number is in estimated WIRE bytes, not Go heap bytes
+//
+// [estimateChangeBytes] approximates the serialized size of an event. Live Go
+// heap for the same events is a MULTIPLE of that — maps, interface boxes and
+// string headers dominate a small event, and the audit's 261 MiB for 100k
+// events implies roughly 2.6 KiB of heap apiece for events whose wire form is
+// far smaller. So 32 MiB of retained wire bytes is a low-hundreds-of-MiB heap
+// ceiling, not a 32 MiB one. Stated because a reader who takes this number for
+// a heap budget would be wrong by an order of magnitude.
+const defaultMaxRetainedBytes int64 = 32 << 20
+
+// estimateChangeBytes approximates one event's serialized size. It is an
+// ESTIMATE by design — marshalling every event just to size it would cost more
+// than the cap saves — but it is not a guess: TestEstimateChangeBytes_TracksReal
+// MarshalledSize pins it against real json.Marshal output across the value
+// families this format carries, so the cap cannot silently drift into meaning
+// nothing.
+func estimateChangeBytes(c ir.Change) int64 {
+	const envelope = 64 // kind tag, schema/table keys, position, punctuation
+	switch ev := c.(type) {
+	case ir.Insert:
+		return envelope + int64(len(ev.Schema)+len(ev.Table)) + estimateRowBytes(ev.Row)
+	case ir.Update:
+		return envelope + int64(len(ev.Schema)+len(ev.Table)) + estimateRowBytes(ev.Before) + estimateRowBytes(ev.After)
+	case ir.Delete:
+		return envelope + int64(len(ev.Schema)+len(ev.Table)) + estimateRowBytes(ev.Before)
+	default:
+		return envelope
+	}
+}
+
+// estimateRowBytes approximates a row map's serialized size: each key plus its
+// value's own width, with a flat allowance for the fixed-width scalars whose
+// rendering does not vary much.
+func estimateRowBytes(r ir.Row) int64 {
+	var n int64
+	for k, v := range r {
+		n += int64(len(k)) + 4 // key, quotes, colon, comma
+		switch tv := v.(type) {
+		case string:
+			n += int64(len(tv)) + 2
+		case []byte:
+			// Rendered through an encodeValue envelope, roughly base64.
+			n += int64(len(tv))*4/3 + 16
+		case nil:
+			n += 4
+		default:
+			// int64 / float64 / bool / time.Time and friends.
+			n += 24
+		}
+	}
+	return n
 }
 
 func newSmartCompactor(pkStrategy PKStrategy, schema *ir.Schema) *smartCompactor {
 	return &smartCompactor{
-		pkStrategy:      resolvePKStrategy(pkStrategy),
-		schema:          schema,
-		accumulators:    make(map[string]*rowAccumulator),
-		order:           nil,
-		tablesWithoutPK: make(map[string]struct{}),
-		tablesUnmatched: make(map[string]struct{}),
-		pkLookup:        make(map[string]pkLookupResult),
+		pkStrategy:       resolvePKStrategy(pkStrategy),
+		schema:           schema,
+		accumulators:     make(map[string]*rowAccumulator),
+		order:            nil,
+		tablesWithoutPK:  make(map[string]struct{}),
+		tablesUnmatched:  make(map[string]struct{}),
+		pkLookup:         make(map[string]pkLookupResult),
+		maxRetainedBytes: defaultMaxRetainedBytes,
 	}
 }
 
@@ -722,6 +828,14 @@ func (s *smartCompactor) routeRowEvent(schema, table string, row ir.Row, e ir.Ch
 	if err != nil {
 		return err
 	}
+	// Make room BEFORE retaining the event, so the ceiling is one the
+	// compactor actually stays under rather than one it overshoots by an
+	// event and then recovers from. This also has to run before the
+	// accumulator lookup: eviction can drop the very chain this event belongs
+	// to, and a pointer taken first would be stale.
+	sz := estimateChangeBytes(e)
+	s.reserve(sz)
+
 	tk := tableKey(schema, table)
 	mapKey := tk + "\x01" + key
 	acc, ok := s.accumulators[mapKey]
@@ -735,10 +849,113 @@ func (s *smartCompactor) routeRowEvent(schema, table string, row ir.Row, e ir.Ch
 		s.order = append(s.order, mapKey)
 	}
 	acc.events = append(acc.events, e)
+	acc.bytes += sz
+	s.retainedBytes += sz
+	if s.retainedBytes > s.peakRetainedBytes {
+		s.peakRetainedBytes = s.retainedBytes
+	}
 	if len(acc.events) == 2 {
 		s.rowsCollapsedCount++
 	}
 	return nil
+}
+
+// reserve makes room for an incoming event, draining chains early when
+// retaining it would push [smartCompactor.retainedBytes] past the cap — so an
+// incremental with no TRUNCATE and no DDL cannot retain itself entirely
+// (roadmap item 127).
+//
+// # What is sacrificed, and the order that minimises it
+//
+// A cap on a collapsing transform has to give something up: the compactor
+// cannot flush a chain mid-way without forgoing the collapse it exists to
+// perform, and flushing early changes WHICH events collapse — an observable
+// output change, not merely a memory one. So the eviction order is chosen to
+// spend the cheapest chains first:
+//
+//  1. SINGLE-EVENT chains, in insertion order. These cost NOTHING: a
+//     one-event accumulator's flush emits that event verbatim, which is
+//     exactly what it would have emitted at finalize, and insertion order is
+//     the order flushAll would have used. This matters more than it looks —
+//     an incremental with no collapse opportunity is ALL single-event chains,
+//     so the workload with the worst retention is also the one where the cap
+//     changes nothing observable.
+//  2. Then the LARGEST remaining chains. A big chain is where the memory
+//     actually is, and evicting one loses the collapse of one row rather than
+//     of many.
+//
+// Correctness under eviction rests on one property: a chain evicted at time T
+// is emitted at T, and any later event for the same PK starts a fresh
+// accumulator that is emitted after it. Per-PK source order therefore holds,
+// which is what ADR-0064 §2's policy table is defined over. The events simply
+// collapse in two groups instead of one — always a superset of the events full
+// collapse would emit, never a different end state.
+//
+// Draining to a LOW-WATER mark rather than to exactly the cap is what keeps
+// this from degenerating: without hysteresis a corpus that sits at the cap
+// would re-sort its accumulator set on every subsequent event.
+//
+// The one case the ceiling cannot hold is a SINGLE event whose own estimated
+// size exceeds the cap: there is nothing left to evict, so it is retained
+// anyway. Peak is therefore bounded by max(cap, largest single event), and the
+// chunk format's per-row limit ([blobcodec.MaxChunkLineBytes], 64 MiB) is what
+// bounds that second term.
+func (s *smartCompactor) reserve(incoming int64) {
+	if s.maxRetainedBytes <= 0 || s.retainedBytes+incoming <= s.maxRetainedBytes {
+		return
+	}
+	lowWater := s.maxRetainedBytes / 2
+	fits := func() bool { return s.retainedBytes+incoming <= lowWater }
+
+	// Pass 1: the free ones, oldest first.
+	survivors := s.order[:0]
+	for _, k := range s.order {
+		acc := s.accumulators[k]
+		if !fits() && len(acc.events) == 1 {
+			s.evict(k, acc)
+			continue
+		}
+		survivors = append(survivors, k)
+	}
+	s.order = survivors
+	if fits() {
+		return
+	}
+
+	// Pass 2: the largest of what is left. Sorting a copy keeps s.order's
+	// insertion ordering intact for the survivors, which flushAll relies on.
+	bySize := make([]string, len(s.order))
+	copy(bySize, s.order)
+	sort.SliceStable(bySize, func(i, j int) bool {
+		return s.accumulators[bySize[i]].bytes > s.accumulators[bySize[j]].bytes
+	})
+	evicted := make(map[string]struct{}, len(bySize))
+	for _, k := range bySize {
+		if fits() {
+			break
+		}
+		s.evict(k, s.accumulators[k])
+		evicted[k] = struct{}{}
+	}
+	if len(evicted) == 0 {
+		return
+	}
+	survivors = s.order[:0]
+	for _, k := range s.order {
+		if _, gone := evicted[k]; !gone {
+			survivors = append(survivors, k)
+		}
+	}
+	s.order = survivors
+}
+
+// evict drains one chain into the output stream and drops it. The caller is
+// responsible for removing k from s.order.
+func (s *smartCompactor) evict(k string, acc *rowAccumulator) {
+	s.out = append(s.out, acc.flush()...)
+	s.retainedBytes -= acc.bytes
+	delete(s.accumulators, k)
+	s.chainsEvicted++
 }
 
 // flushTable drops every accumulator for the given table (TRUNCATE
@@ -757,6 +974,7 @@ func (s *smartCompactor) flushTable(schema, table string) {
 	newOrder := s.order[:0]
 	for _, k := range s.order {
 		if strings.HasPrefix(k, prefix) {
+			s.retainedBytes -= s.accumulators[k].bytes
 			delete(s.accumulators, k)
 			continue
 		}
@@ -776,6 +994,7 @@ func (s *smartCompactor) flushAll() {
 	}
 	s.accumulators = make(map[string]*rowAccumulator)
 	s.order = nil
+	s.retainedBytes = 0
 }
 
 // flushCollapsedInsideClosingTx drains the accumulators into the output
@@ -931,6 +1150,21 @@ func (s *smartCompactor) finalize() ([]ir.Change, *smartCompactResult) {
 	// re-trigger). This is set during process() — see
 	// trackCollapseCandidate.
 	res.rowsCollapsed = s.rowsCollapsedCount
+	res.chainsEvicted = s.chainsEvicted
+	if s.chainsEvicted > 0 {
+		// Said out loud for the same reason the tablesUnmatched warning
+		// above exists: an operator comparing two compactions of similar
+		// chains deserves to know one of them ran into its memory ceiling
+		// rather than being left to read it out of a ratio.
+		slog.Info(
+			"smart compaction: the retained-event ceiling was reached, so some row chains were "+
+				"written out before they could finish collapsing; the output is correct but the "+
+				"compaction is partial",
+			slog.Int64("chains_evicted", s.chainsEvicted),
+			slog.Int64("peak_retained_bytes", s.peakRetainedBytes),
+			slog.Int64("max_retained_bytes", s.maxRetainedBytes),
+		)
+	}
 	return s.out, res
 }
 

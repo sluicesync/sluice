@@ -1856,6 +1856,22 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 130. Smart compaction's EMITTED stream is still unbounded — the other half of item 127 — *OPEN, medium; the named residual of item 127*
+
+Item 127 bounded the retained-INPUT term: `s.accumulators` now evicts under a byte ceiling. `s.out` was the OTHER growing structure the audit named, and it is untouched — the compactor appends every emitted event and holds them all until `applySmartCompactionToIncremental` re-encodes them. So peak is now O(cap + output) rather than O(input).
+
+**Why that is a real improvement and still not a bound.** For the collapsing workloads smart compaction exists for, output is small and the cap is the whole win — the audit's 100:1 corpus goes from 248 MiB to roughly the cap. For an incremental with NO collapse opportunity, output ≈ input and the peak is essentially unchanged. Both halves are worth saying: the fix is not cosmetic, and it is not a ceiling.
+
+**Why it was not just another counter.** Three things stack up, and only the first is the compactor's own:
+
+1. `s.out []ir.Change` — would need the compactor to stream into a sink instead of accumulating. Tractable on its own: the only ordering subtlety is `flushCollapsedInsideClosingTx`, which needs the closing `TxCommit` held back, and a one-slot lookahead reproduces that exactly.
+2. **Step 2 packs every emitted event into `chunkBuckets[0]`** and leaves the other chunks empty, so the rewritten chunk is one unbounded blob regardless of how many chunks the incremental had. Distributing across the existing chunk slots under a byte budget is the natural fix, and `DefaultBackupChunkBytes` is the obvious budget — output bytes are ≤ input bytes, so for chains written by ≥v0.111.1 (whose chunks are already capped at 64 MiB) the slots always suffice.
+3. **The encrypted `ChangeChunkWriter` buffers the whole gzipped chunk in `gzBuf`** and encrypts at Close — one GCM tag per chunk is the format. So bounding (1) without (2) achieves nothing for encrypted chains, which is the shape that would make a gate pass on a plaintext test and be inert where it matters.
+
+**And the reason this cannot be done as a small change:** step 1 READS every staged chunk and step 3 WRITES them. Streaming output during the read phase would overwrite staged input chunks that have not been read yet. The escape routes both have real cost — writing to fresh paths changes the chunk AAD (`ChangeChunkAAD` binds `c.File` and the index, deliberately, as the anti-splice property) and would ripple through every surface that references a chunk path; staging to temp paths and moving costs a full extra read+write of every chunk, on object storage, on a maintenance path.
+
+**Take it with the same gate shape item 127 used:** a measured ceiling with an anti-vacuity control (the same corpus, uncapped, must blow past it), plus a byte-identical control for a corpus that never reaches the ceiling. Note that a peak-memory assertion on `s.out` needs a real accounting hook, not `runtime.MemStats` — the latter is flaky enough to be worse than no gate.
+
 ### 129. `backup verify` cannot detect an unreadable chunk, because it never parses a row — *OPEN, medium; the named residual of item 128*
 
 Item 128 stopped new backups containing a row larger than `MaxChunkLineBytes`. It did nothing for artifacts ALREADY written, and the reason those were possible is still live: **`backup verify` rehashes chunk BYTES and never parses a row**, so it confirms the bytes are intact while saying nothing about whether they can be read back.
@@ -1898,7 +1914,23 @@ Pinned by a refusal test, a large-but-readable control (1 MiB round-trips — wi
 
 **Residual, stated rather than implied:** `backup verify` still cannot detect this class on backups written by OLDER binaries — it does not parse rows. A verify that scans each chunk with the real reader would be the independent check; that is its own item (129), not folded in here. Note that item 129 now covers strictly more than it did when filed: change chunks are in its scope too.
 
-### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *OPEN*
+### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *✅ RETAINED-INPUT HALF FIXED on `main` 2026-08-05; unreleased. The emitted-output half is item 130.*
+
+**What landed.** A byte ceiling on retained accumulator state (`defaultMaxRetainedBytes`, 32 MiB of ESTIMATED SERIALIZED bytes) with early eviction, so an incremental carrying no TRUNCATE and no DDL can no longer retain itself entirely.
+
+**The eviction ORDER is the design, not the ceiling.** A cap on a collapsing transform must sacrifice something, and the roadmap's original suggestion — largest-first — is only half right. The policy is: single-event chains first in INSERTION order, then largest-first among the rest. Single-event chains cost *nothing* to evict (a one-event accumulator's flush emits that event verbatim, which is exactly what finalize would have emitted, in the order `flushAll` would have used). That matters more than it looks: **an incremental with no collapse opportunity is all single-event chains, so the workload with the worst retention is also the one where the cap changes nothing observable.** Hysteresis (drain to cap/2) stops a corpus sitting at the ceiling from re-sorting its accumulator set on every event. Reservation happens BEFORE the append, so the ceiling is one the compactor stays under rather than overshoots by an event.
+
+**Correctness under eviction** rests on one property: a chain evicted at time T is emitted at T, and any later event for the same PK starts a fresh accumulator emitted after it — so per-PK source order holds, which is what ADR-0064 §2's policy table is defined over. A chain collapses in two groups instead of one: always a superset of the events full collapse emits, never a different end state. Pinned by replaying both streams and asserting identical final row state.
+
+**Gates, and what the mutation runs caught.** Peak-under-cap with an anti-vacuity control (same corpus uncapped must blow past it — measured 19.3×); a byte-identical control for a corpus below the ceiling; the no-collapse corpus asserted unreordered. Mutating the policy to largest-first-only initially PASSED, because every row in that corpus had the same width and `sort.SliceStable` left equal elements in insertion order — the test could not tell the two policies apart. Widths now vary, and the mutation fails. Worth recording as its own small lesson: **a gate over an ordering policy needs inputs whose natural order and policy order differ, or it pins nothing.**
+
+**The cap is enforced on an ESTIMATE**, so `TestEstimateChangeBytes_TracksRealMarshalledSize` binds `estimateChangeBytes` to real `json.Marshal` output across the value families the format carries. Without it the cap would be checked against its own arithmetic — the shared-evidence shape the 2026-08-01 rule names.
+
+**Two things the constant's doc says out loud** because a reader would otherwise get them wrong: the number is wire bytes, not Go heap bytes (heap is a multiple — the audit's 261 MiB for 100k events implies ~2.6 KiB apiece for far smaller events), and a single event larger than the cap is still retained because there is nothing left to evict, bounded in turn by the chunk format's 64 MiB per-row limit.
+
+**Not fixed here: the emitted-output term.** Filed as item 130 with the reasons it is not a small change.
+
+**Original filing follows.**
 
 **Confirmed at HEAD (2026-08-05):** `chain_compact_smart.go` has no `maxEvents` / `maxBytes` / byte-cap of any kind. The compactor holds two growing structures for the whole pass — `s.out` (every emitted event, appended at three sites) and `s.accumulators` (every per-PK chain, retained until a flush barrier) — and the only barriers are TRUNCATE, `SchemaSnapshot` and end-of-incremental. An incremental with none of those retains everything.
 
