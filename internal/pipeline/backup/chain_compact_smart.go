@@ -596,13 +596,35 @@ func newSmartCompactor(pkStrategy PKStrategy, schema *ir.Schema) *smartCompactor
 	}
 }
 
-// tableKey is the schema.table identifier for accumulator routing
-// + tables-without-PK reporting.
+// tableKey is the schema.table identifier an OPERATOR reads — the
+// tables-without-PK and tables-unmatched report buckets. It is deliberately
+// human-shaped and deliberately NOT used for routing: see [tableRoutingKey].
 func tableKey(schema, table string) string {
 	if schema == "" {
 		return table
 	}
 	return schema + "." + table
+}
+
+// tableRoutingKey is the INJECTIVE identifier used for accumulator routing and
+// the pkLookup cache — the PG-side twin of the [pkValueKey] collision (audit
+// 2026-08-05 B-5).
+//
+// `schema + "." + table` is ambiguous the moment an identifier contains a dot,
+// which Postgres and MySQL both permit in a quoted name: schema `a.b` table `c`
+// and schema `a` table `b.c` render identically. That collapses two tables into
+// one accumulator namespace AND poisons the pkLookup cache, so the second table
+// silently inherits the first's primary key — a wrong key means a wrong
+// collapse, which on a backup path is silent loss.
+//
+// Kept separate from [tableKey] rather than length-prefixing that one, because
+// the display form is read by operators in the compaction report and a
+// length-prefixed rendering there would be gibberish.
+func tableRoutingKey(schema, table string) string {
+	var b strings.Builder
+	writeLengthPrefixed(&b, schema)
+	writeLengthPrefixed(&b, table)
+	return b.String()
 }
 
 // pkLookupStatus is why a (schema, table) lookup did or did not yield a
@@ -659,7 +681,7 @@ type pkLookupResult struct {
 //     point of this item is that an argument like that had already been wrong
 //     once.
 func (s *smartCompactor) pkColumns(schema, table string) ([]string, pkLookupStatus) {
-	tk := tableKey(schema, table)
+	tk := tableRoutingKey(schema, table)
 	if r, ok := s.pkLookup[tk]; ok {
 		return r.cols, r.status
 	}
@@ -718,25 +740,43 @@ func (s *smartCompactor) lookupPKUncached(schema, table string) pkLookupResult {
 // pkValue extracts the PK column values from a row map and returns a
 // stable string key. Returns an error if any PK column is missing
 // from the row map (ADR-0064 §7 refuse-loudly clause).
+// # Injectivity is the whole contract (audit 2026-08-05 B-5)
+//
+// This used to render each value with %v and join with \x00, which is NOT
+// injective: ("a\x00","b") and ("a","\x00b") produced the same key, and so did
+// (int64(1),"2") and ("1",int64(2)). Two DIFFERENT rows then shared one
+// accumulator, so an INSERT of one and a DELETE of the other netted to nothing
+// and the compacted backup silently lost a row. The NUL case needs a
+// NUL-significant collation (utf8mb4_bin) to be reachable; the cross-type case
+// needs only a column whose decode varies.
+//
+// Now each component is LENGTH-PREFIXED and TYPE-TAGGED, which makes the
+// encoding unambiguously parseable and therefore injective.
+//
+// The type tag errs in the SAFE direction deliberately. If one column's value
+// ever decodes as []byte in one event and string in another, tagging SPLITS
+// that row's chain in two — less collapse, both halves emitted in order, output
+// still correct. Merging two distinct rows is the direction that loses data,
+// and that is the one this makes impossible.
 func pkValueKey(cols []string, row ir.Row, schema, table string) (string, error) {
 	var b strings.Builder
-	for i, c := range cols {
+	for _, c := range cols {
 		v, ok := row[c]
 		if !ok {
 			return "", fmt.Errorf("smart compact: PK column %q missing from row payload for %s.%s; corrupt or mis-decoded event — re-run with --smart-compaction-off to fall through to naive concat",
 				c, schema, table)
 		}
-		if i > 0 {
-			b.WriteByte('\x00')
-		}
-		// fmt.Sprintf with %v gives a stable rendering across IR
-		// value types (int64, string, time.Time, []byte → byte
-		// slice's String form, bool). Two events sharing the same
-		// PK tuple share the same key. The string is opaque to
-		// consumers; only used as a map key.
-		fmt.Fprintf(&b, "%v", v)
+		writeLengthPrefixed(&b, fmt.Sprintf("%T\x1f%v", v, v))
 	}
 	return b.String(), nil
+}
+
+// writeLengthPrefixed appends s to b as `<len>\x1e<s>`. The length is decimal
+// and \x1e cannot appear in a decimal, so the boundary is unambiguous however
+// the payload is spelled — which is what makes a concatenation of these
+// injective.
+func writeLengthPrefixed(b *strings.Builder, s string) {
+	fmt.Fprintf(b, "%d\x1e%s", len(s), s)
 }
 
 // process feeds one event into the compactor. Returns an error only
@@ -777,11 +817,16 @@ func (s *smartCompactor) process(e ir.Change) error {
 		return s.routeRowEvent(ev.Schema, ev.Table, ev.Row, e)
 	case ir.Update:
 		s.eventsBefore++
-		// For routing we need to identify the row. The After image
-		// always carries the PK (PG/MySQL row-image conventions —
-		// the PK is part of every UPDATE's after-image even when
-		// it's unchanged; key-only changes are represented as
-		// DELETE+INSERT in MySQL and as a separate event in PG).
+		// A PK-CHANGING update is a two-key barrier, not a routable row
+		// event (audit 2026-08-05 A-3). See [smartCompactor.pkChangeBarrier]
+		// for the defect this closes and why the previous comment here —
+		// "key-only changes are represented as DELETE+INSERT in MySQL and as
+		// a separate event in PG" — was false of sluice's own readers.
+		if handled, err := s.pkChangeBarrier(ev, e); handled || err != nil {
+			return err
+		}
+		// Otherwise the After image identifies the row: the PK is part of
+		// every UPDATE's after-image even when unchanged.
 		return s.routeRowEvent(ev.Schema, ev.Table, ev.After, e)
 	case ir.Delete:
 		s.eventsBefore++
@@ -794,6 +839,99 @@ func (s *smartCompactor) process(e ir.Change) error {
 		// Unknown change kind — pass through to be defensive.
 		s.out = append(s.out, e)
 		return nil
+	}
+}
+
+// pkChangeBarrier handles an UPDATE that MOVES a row from one primary key to
+// another. It reports whether it consumed the event.
+//
+// # The defect (audit 2026-08-05 A-3): a compacted backup that resurrects a
+// deleted row
+//
+// The Update arm used to route on the After image alone, justified by a comment
+// asserting that "key-only changes are represented as DELETE+INSERT in MySQL
+// and as a separate event in PG". Both halves are contradicted by sluice's own
+// readers: the MySQL CDC reader emits ONE ir.Update whose narrowed Before
+// carries the OLD key and whose After carries the new one (`cdc_reader.go`
+// says exactly that), Postgres emits one UpdateMessage carrying an OldTuple,
+// and [laneapply.PKChangedUpdate] exists precisely because the appliers
+// receive them.
+//
+// So on INSERT(1) / UPDATE(1→2) / DELETE(2), the INSERT bucketed under key 1
+// while the UPDATE and DELETE both bucketed under key 2. Key 2's chain
+// collapsed to the DELETE; key 1's chain still emitted its INSERT. The
+// compacted stream was INSERT(1) + DELETE(2) — replaying it leaves row 1 ALIVE
+// where the source has no rows. `backup verify` could not see it: compaction
+// re-stamps the very hashes verify checks.
+//
+// # Why the barrier is scoped to the two KEYS, not the whole table
+//
+// The audit proposed the Truncate pattern (flush the whole table). Two keys is
+// sufficient and strictly less disruptive: the only identities this event
+// disturbs are the one it vacates and the one it occupies. Flushing the table
+// would stop every unrelated row in it from collapsing whenever one row is
+// re-keyed, which is a real cost on the workload smart compaction exists for
+// — pinned by TestSmartCompact_PKChangeUpdate_UnrelatedChainsStillCollapse.
+//
+// Both keys are flushed EMITTING, not dropped: the vacated key's pending chain
+// is real history that must still ship. That is the difference from
+// [smartCompactor.flushTable], where a TRUNCATE genuinely makes pending chains
+// irrelevant.
+//
+// # The named premise
+//
+// A nil Before means this cannot be detected, and such an event routes on After
+// exactly as before. That is safe for the engines sluice supports because a nil
+// Before means the key did NOT change: MySQL's binlog always carries a before
+// image, and Postgres emits an OldTuple precisely WHEN the key changes. Stated
+// rather than assumed — if an engine is ever added whose reader omits the
+// before image on a key change, this barrier goes blind and A-3 returns.
+func (s *smartCompactor) pkChangeBarrier(ev ir.Update, e ir.Change) (bool, error) {
+	if ev.Before == nil || ev.After == nil {
+		return false, nil
+	}
+	cols, status := s.pkColumns(ev.Schema, ev.Table)
+	if status != pkFound {
+		return false, nil // not collapsible anyway; routeRowEvent reports why
+	}
+	oldKey, err := pkValueKey(cols, ev.Before, ev.Schema, ev.Table)
+	if err != nil {
+		// A before-image missing a PK column cannot be compared. Fall through
+		// to the normal path rather than refusing: the Before may legitimately
+		// be narrowed, and routeRowEvent keys off After.
+		return false, nil //nolint:nilerr // deliberate: see comment above
+	}
+	newKey, err := pkValueKey(cols, ev.After, ev.Schema, ev.Table)
+	if err != nil {
+		return false, err
+	}
+	if oldKey == newKey {
+		return false, nil // an ordinary in-place update
+	}
+
+	tk := tableRoutingKey(ev.Schema, ev.Table)
+	s.flushKeyEmitting(tk + "\x01" + oldKey)
+	s.flushKeyEmitting(tk + "\x01" + newKey)
+	s.out = append(s.out, e)
+	return true, nil
+}
+
+// flushKeyEmitting drains one accumulator into the output stream and drops it.
+// Unlike [smartCompactor.flushTable] the events are EMITTED, because the chain
+// is real history rather than state a TRUNCATE made irrelevant.
+func (s *smartCompactor) flushKeyEmitting(mapKey string) {
+	acc, ok := s.accumulators[mapKey]
+	if !ok {
+		return
+	}
+	s.out = append(s.out, acc.flush()...)
+	s.retainedBytes -= acc.bytes
+	delete(s.accumulators, mapKey)
+	for i, k := range s.order {
+		if k == mapKey {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
 	}
 }
 
@@ -836,7 +974,7 @@ func (s *smartCompactor) routeRowEvent(schema, table string, row ir.Row, e ir.Ch
 	sz := estimateChangeBytes(e)
 	s.reserve(sz)
 
-	tk := tableKey(schema, table)
+	tk := tableRoutingKey(schema, table)
 	mapKey := tk + "\x01" + key
 	acc, ok := s.accumulators[mapKey]
 	if !ok {
@@ -996,7 +1134,10 @@ func (s *smartCompactor) evict(k string, acc *rowAccumulator) {
 // "the table was truncated; whatever was in the accumulator is now
 // gone."
 func (s *smartCompactor) flushTable(schema, table string) {
-	tk := tableKey(schema, table)
+	// Must be the ROUTING key, matching what routeRowEvent built the accumulator
+	// map keys from — a prefix scan against the display form would silently
+	// match the wrong table's chains (or none).
+	tk := tableRoutingKey(schema, table)
 	prefix := tk + "\x01"
 	newOrder := s.order[:0]
 	for _, k := range s.order {
