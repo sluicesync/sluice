@@ -132,11 +132,19 @@ func runBulkCopyTablePool(
 			// the initial base acquires never block. nil gate (serial
 			// cold-start / no measured budget / a unit test) ⇒ no base gating,
 			// byte-identical to pre-ADR-0123.
+			//
+			// AcquireBase, not Acquire: this token is held for the WHOLE table
+			// copy — including while this goroutine sits in runChunks'
+			// errgroup.Wait on chunk workers that need tokens of their own. It
+			// is the one class of holder that cannot make progress by itself,
+			// and telling the gate so is what stops a 53300 shrink from
+			// retiring every chunk token and leaving THIS one as the sole
+			// survivor. That is Bug 228; see the gate's file header.
 			if parallel != nil && parallel.copyGate != nil {
-				if err := parallel.copyGate.Acquire(tctx); err != nil {
+				if err := parallel.copyGate.AcquireBase(tctx); err != nil {
 					return err
 				}
-				defer parallel.copyGate.Release()
+				defer parallel.copyGate.ReleaseBase()
 			}
 			pair, release, err := acquireTablePair(tctx, freePair, parallel)
 			if err != nil {

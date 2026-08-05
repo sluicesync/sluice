@@ -8,8 +8,8 @@
 //
 // The unit suite (copy_backoff_test.go, copy_parallelism_gate_test.go,
 // copy_chunk_retry_test.go, and the engine's connection_slot_test.go)
-// pins the pure decision, the gate's shrink/retire/give-up mechanics, the
-// retry seam, and the classifier against synthetic *pgconn.PgError
+// pins the pure decision, the gate's shrink/floor/recovery/give-up mechanics,
+// the retry seam, and the classifier against synthetic *pgconn.PgError
 // values. This file closes the one thing a synthetic error can't prove:
 // that a REAL PostgreSQL `too_many_connections` / superuser-reserved-
 // slots FATAL actually carries SQLSTATE 53300 on the wire, so the

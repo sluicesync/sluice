@@ -723,8 +723,8 @@ func acquireChunkConn(
 	}
 	// The token is held for the whole lifetime of this chunk's connections
 	// (across every transient/slot retry — the same chunk keeps its budget
-	// slot); release() returns it (or swallows it if a shrink retired it)
-	// when the caller's deferred releaseConn runs, or on any error exit here.
+	// slot); release() returns it when the caller's deferred releaseConn
+	// runs, or on any error exit here.
 	release := func() { gate.Release() }
 
 	rdr, wr, err := openChunkConnWithRetry(
@@ -740,6 +740,11 @@ func acquireChunkConn(
 		release()
 		return nil, nil, nil, err
 	}
+	// The target just seated a brand-new connection: that is the evidence
+	// the AIMD's additive increase runs on. A no-op unless an earlier 53300
+	// shrank the cap, and the only thing that lets a copy recover its
+	// parallelism after a TRANSIENT shortage clears (Bug 228).
+	gate.NoteOpenSucceeded()
 	closeConns := func() {
 		if wr != nil {
 			migcore.CloseIf(wr)

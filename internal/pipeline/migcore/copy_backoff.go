@@ -28,16 +28,27 @@
 //     parallelism + the retry attempt, what is the next parallelism, how
 //     long to wait, and have we hit the give-up bound.
 //
-// Why multiplicative-decrease ONLY (no additive-increase within a copy):
-// the applier's AIMD (change_applier_batch.go) both decreases on latency
-// pressure and additively re-probes upward because its workload is a
-// long-lived stream whose pressure ebbs and flows. A bulk copy is a
-// bounded, one-shot phase: once the target proves it can't seat N
-// writers, re-probing upward mid-copy would just re-trigger the same
-// 53300 and waste a backoff cycle. Staying decreased for the rest of the
-// copy is simpler and strictly safe — the only cost is finishing the copy
-// at a lower parallelism than a (possibly) now-freed target could
-// sustain, which the next migration's preflight re-measures from scratch.
+// This file is the DECREASE half. The increase half lives on the gate
+// ([CopyParallelismGate.NoteOpenSucceeded]) because it is driven by an
+// event this pure function never sees: an open that actually succeeded.
+//
+// It did not always exist. The original design was multiplicative-decrease
+// ONLY, on the argument that "a bulk copy is a bounded, one-shot phase;
+// once the target proves it can't seat N writers, re-probing upward
+// mid-copy would just re-trigger the same 53300", and that the only cost
+// was "finishing the copy at a lower parallelism than a now-freed target
+// could sustain". Bug 228 priced that cost properly and it is not small:
+// the decrease is permanent and the copy is not short, so a two-second
+// blip six seconds into a six-million-row table pinned the remaining
+// hours of it at parallelism 1 — and under the ADR-0123 run-wide gate,
+// with no chunk slot left at all. "The next migration's preflight
+// re-measures from scratch" is no comfort to the migration in progress.
+//
+// The re-probe worry was answered rather than ignored: recovery is gated
+// on a PROVEN-GOOD open, not on a timer, so a target that is still
+// saturated grows the cap exactly zero times (its opens are still
+// failing), and any concurrent 53300 halves what the probes gained.
+// Decrease dominates increase by construction — standard AIMD.
 
 package migcore
 

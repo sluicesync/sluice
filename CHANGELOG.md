@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.112.1] - 2026-08-05
+
+A regression sluice shipped in v0.112.0 earlier the same day: a transient connection-slot shortage that then clears could stop a copy permanently, silently. v0.112.0 is the only affected release.
+
+### Fixed
+
+**A transient SQLSTATE 53300 (`too many connections`) that then CLEARS deadlocked the parallel bulk copy — no log line, no error, no exit code.** v0.112.0 made the copy's retry budget per-chunk instead of per-table, which was correct and fixed a real defect; what it also did was remove the run-wide give-up bound, and that bound was the only thing aborting the run before the token pool could drain. A loud failure became a silent hang. Measured on a six-million-row migrate with a shortage injected and then lifted: 1,593,750 of 6,000,000 rows on the target, 48 of 67 goroutines blocked in the copy gate's `Acquire`, zero further progress; v0.111.1 aborted loudly in about four seconds on the identical injection. Two plausible explanations were investigated and killed by measurement first — an unbounded token retirement (it telescopes; any monotone descent from N sums to exactly N−1) and a mere collapse to parallelism 1 (the pool measured zero live tokens, not one).
+
+**The root cause is a token-class confusion, and the guarding comment was arithmetically true while being operationally false.** One connection-budget gate is shared by the whole run, and two kinds of worker draw from it: a chunk worker takes a token, opens, copies its key range and gives it back, so it can always finish on its own; a table-pool worker holds its token for the whole table copy, including while blocked waiting on that table's chunk workers, so it can never finish until chunk tokens are available. At the shipped `--bulk-parallelism 16 --table-parallelism 1` shape the 16 tokens are one base token plus fifteen chunk tokens, a shrink retires at most fifteen, and so "at least one token always survives" is true — but the survivor is the base token, held by the goroutine waiting on the chunks whose tokens were just retired. Circular wait. The invariant was about token *count* when the property needed was "one token that can make progress."
+
+The token channel and its retirement counter are replaced by a resizable counting semaphore, which makes the whole accounting-underflow class inexpressible rather than merely absent, and makes a shrink take effect immediately for new acquires instead of lazily as workers finish. Base and chunk tokens are now distinct classes at the API, and the shrink floor is `max(aimdTarget, baseHeld+1)` so a shrink can never leave a long-lived base holder owning the last slot — the honest number rather than a fudge, since a base connection is already open and a shrink can only govern how many *more* get opened. The missing additive-increase half is added, gated on evidence rather than a timer: recovery fires on an open that actually succeeded, so a still-saturated target grows its cap exactly zero times while any concurrent shortage halves it. v0.112.0's per-chunk retry budget is untouched and a persistent shortage still aborts loudly.
+
+**A second deadlock, reachable with no connection shortage at all, is closed by the same floor.** The copy budget is table parallelism × within-table parallelism, and a fresh run cannot reach the chunked path at within-table parallelism 1 because the chunking preflight refuses it — but a `--resume` whose recorded chunk plan re-engages chunking bypasses that check, yielding a budget the base holders alone can consume. That one predates v0.112.0 and has been reachable since the run-wide budget gate shipped in v0.99.134.
+
+`backup`'s table pool has the identical topology and declares the base class too, documented in place as currently unreachable because nothing on the backup read path classifies a slot shortage or calls the shrink — fixed as a class, not as the one reachable instance. Pinned by the gate's own tests (floor, recovery-after-clear, a full-topology storm that must complete, the resume-shaped budget) plus an AST roster over both table pools and both chunk fan-outs, because the gate's tests cannot see whether a call site tags its token class: reverting one call site to the untagged acquire restores the deadlock in full and leaves them all green, confirmed by mutation.
+
+### Changed
+
+**Copy parallelism now recovers after a transient connection-slot shortage clears, where previously it only ever decreased.** A run that degrades under pressure and then finds the pressure gone returns to its measured budget instead of crawling at the floor for the rest of the copy. Recovery never exceeds the budget the preflight measured and only advances on a connection the target actually seated. No flags were added, renamed or removed; no error codes changed; no on-disk format is touched.
+
+**Known limitation, recorded rather than bundled in:** the per-chunk retry budget is keyed by chunk index alone, and under the run-wide gate that index is not unique across tables, so table A's chunk 3 and table B's chunk 3 share one budget and a give-up can fire earlier than the per-chunk bound advertises. Bounded and loud — an early abort, never a stall — tracked as roadmap item 137.
+
 ## [0.112.0] - 2026-08-05
 
 Three fixes found by reading rather than by a failing test, and the one that matters most is a backup you could take, verify clean, and never restore.

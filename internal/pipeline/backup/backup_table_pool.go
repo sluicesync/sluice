@@ -205,10 +205,20 @@ func (b *Backup) runBackupTablePool(
 				// worker's own held reader counts against the same
 				// table × within read budget the extra range readers draw
 				// from, so the product ceiling holds by construction.
-				if err := within.gate.Acquire(tctx); err != nil {
+				//
+				// AcquireBase for the same reason migrate's table pool uses
+				// it (Bug 228): this token is held while the goroutine waits
+				// on the range fan-out below, which needs tokens of its own,
+				// so a shrink must never retire the last chunk slot in favour
+				// of this one. Backup is the SIBLING, not the site of the
+				// bug — nothing here calls ShrinkAndBackoff today (no 53300
+				// classifier on the read side), so the gate never shrinks and
+				// the deadlock is currently unreachable. Declared anyway: the
+				// class, not the reachable instance.
+				if err := within.gate.AcquireBase(tctx); err != nil {
 					return err
 				}
-				defer within.gate.Release()
+				defer within.gate.ReleaseBase()
 			}
 			rr, release, err := acquireBackupReader(tctx, freeReader, factory)
 			if err != nil {
