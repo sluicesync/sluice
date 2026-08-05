@@ -241,6 +241,9 @@ func (w *ChunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 	b, ok := appendRowJSON(w.encBuf[:0], row, w.columnNamesSorted(columns))
 	if ok {
 		w.encBuf = b
+		if err := checkChunkLineLength(len(b)); err != nil {
+			return err
+		}
 		if _, err := w.bufW.Write(b); err != nil {
 			return fmt.Errorf("chunk row write: %w", err)
 		}
@@ -272,6 +275,12 @@ func (w *ChunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
 	b, err := json.Marshal(enc)
 	if err != nil {
 		return fmt.Errorf("chunk row marshal: %w", err)
+	}
+	// The legacy path is the OTHER write core; a refusal on only the fast
+	// path would leave the same unrestorable backup reachable through any
+	// row the fast path declines to encode.
+	if err := checkChunkLineLength(len(b)); err != nil {
+		return err
 	}
 	if _, err := w.bufW.Write(b); err != nil {
 		return fmt.Errorf("chunk row write: %w", err)
@@ -477,9 +486,11 @@ func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 	}
 	gz = cr
 	sc := bufio.NewScanner(gz)
-	// Allow large rows: 64 MiB max line buffer covers the wide-row
-	// workloads --max-buffer-bytes targets without blowing out memory.
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	// The SAME constant the writer refuses on — see [MaxChunkLineBytes].
+	// These were two independent numbers (a reader limit and an absent
+	// writer one), which is how a backup could be written, verified, and
+	// then fail to restore.
+	sc.Buffer(make([]byte, 0, 64*1024), MaxChunkLineBytes)
 	if !sc.Scan() {
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("chunk reader: read header line: %w", err)
@@ -968,4 +979,56 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown value tag %q", tag)
 	}
+}
+
+// MaxChunkLineBytes is the largest a single chunk line (one serialized row
+// plus its newline) may be, and it is the SAME number on both sides of the
+// format — the reader's bufio.Scanner buffer cap and the writer's refusal.
+//
+// # Why this is one constant and not two (Bug 226)
+//
+// It used to be one number and an absent one. The reader capped a line at
+// 64 MiB with a comment asserting that covered "the wide-row workloads
+// --max-buffer-bytes targets"; the writer had no cap at all. A row whose
+// serialized form exceeded it was therefore written happily, and:
+//
+//	backup full    rc=0
+//	backup verify  rc=0        <-- says the backup is fine
+//	restore        rc=1, 0 rows   "bufio.Scanner: token too long"
+//
+// An operator could take a backup, verify it, and discover only at restore
+// time — the moment they need it — that it was never restorable. `verify`
+// cannot see it because it rehashes the chunk BYTES and never parses a row:
+// its evidence is the same artifact, so it confirms the bytes are intact
+// while saying nothing about whether they can be read back. Found by the
+// v0.111.1 regression cycle while bounding item 116's new byte ceiling;
+// pre-existing, not a regression.
+//
+// # Why the writer REFUSES rather than the reader growing
+//
+// Raising the reader's limit moves the wall without removing it, and does
+// nothing for backups already written. Refusing at write time converts an
+// unrestorable artifact with a green verify into a loud failure at the one
+// moment the operator can still act — before it is the only copy they have.
+//
+// Note this is a per-ROW limit and is unrelated to the per-CHUNK ceiling in
+// the backup package (DefaultBackupChunkBytes). A chunk rolls on accumulated
+// bytes; this bounds a single line within one. A row larger than the chunk
+// ceiling is not by itself a problem — the roll is checked after the row is
+// written, so it simply lands in a chunk of its own.
+const MaxChunkLineBytes = 64 << 20 // 64 MiB
+
+// checkChunkLineLength refuses a row whose serialized line would exceed what
+// the reader can scan. n is the payload length; the newline is accounted for.
+func checkChunkLineLength(n int) error {
+	if n+1 <= MaxChunkLineBytes {
+		return nil
+	}
+	return fmt.Errorf(
+		"chunk row write: a single row serializes to %d bytes, which exceeds the %d-byte per-row limit "+
+			"of the backup chunk format; writing it would produce a backup that `backup verify` reports "+
+			"as OK and `restore` cannot read (it fails with \"token too long\"). Exclude the table, or "+
+			"reduce the row's largest value — the limit is per ROW, so splitting the table does not help",
+		n+1, MaxChunkLineBytes,
+	)
 }

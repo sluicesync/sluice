@@ -2,6 +2,14 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+**A backup containing a row larger than 64 MiB could be written, verified clean, and then fail to restore.** The chunk reader caps a single line at 64 MiB; the writer had no matching cap, so an over-long row was written happily — `backup full` succeeded, `backup verify` reported the backup fine, and `restore` failed with `token too long` and zero rows. The operator would discover it at the one moment the backup matters. `verify` could not see it because it rehashes the chunk bytes and never parses a row, so its evidence is the same artifact it is checking. The limit is now a single shared constant that the reader sizes its scanner from and the writer refuses on, so the two cannot drift; the refusal names what would otherwise have happened. Refusing at write time is deliberate — raising the reader's limit would move the wall without removing it and would do nothing for backups already written. Rows below the limit are unaffected, and a 1 MiB row round-trips as before. **Existing backups that already contain such a row are still unrestorable**; this prevents new ones, and `verify` still cannot detect the condition on an older artifact.
+
+**`sluice schema diff` could not see index drift that changes which rows are legal.** Indexes were compared by NAME only, so a source `UNIQUE (email(10))` against a target `UNIQUE (email)` was reported as in sync — the exact silent constraint weakening sluice now refuses at migration time. The diff now compares the column list including any prefix length, uniqueness, and the partial `WHERE` predicate, on secondary indexes and the primary key alike, and reports the consequence rather than the attribute (`the target ACCEPTS ROWS THE SOURCE REJECTS`). Foreign keys are still not compared; that half is tracked.
+
 ## [0.111.1] - 2026-08-05
 
 The first production field report — a 2.64 GB MariaDB → PlanetScale move where `migrate` completed clean and `sync` failed every attempt — and the four queue items waiting behind it.

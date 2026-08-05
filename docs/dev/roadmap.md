@@ -1856,6 +1856,30 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 128. A backup you can take, VERIFY CLEAN, and never restore — a row over 64 MiB (Bug 226) — *✅ FIXED on `main` 2026-08-05; unreleased*
+
+Found by the v0.111.1 regression cycle while BOUNDING item 116's new chunk byte ceiling — pushing on the limit next door is what surfaced it. **Pre-existing**, identical on v0.111.0 and earlier, not a regression from 116.
+
+**The shape, which is the worst one this project has:**
+
+```
+backup full    rc=0
+backup verify  rc=0        <-- reports the backup fine
+restore        rc=1, 0 rows   "chunk reader: scan: bufio.Scanner: token too long"
+```
+
+The operator finds out at the moment they need the backup. Measured by the cycle: a 60 MiB row round-trips, a 70 MiB row does not, and `migrate` of the SAME rows is rc=0 — so the data is fine and only the backup format's read path was not.
+
+**Root cause.** `backup_chunk.go` sized the reader's `bufio.Scanner` at 64 MiB with a comment asserting that covered "the wide-row workloads `--max-buffer-bytes` targets" — an unverified premise about row size — and **the writer had no corresponding cap at all**. Two numbers where there should have been one, and one of them did not exist.
+
+**Why `verify` could not see it, and why that is the interesting half.** `backup verify` rehashes the chunk BYTES and never parses a row. Its evidence is the same artifact it is checking, so it confirms the bytes are intact while saying nothing about whether they can be read back — the shared-evidence class the 2026-08-01 rule names ("a verification whose all-clear derives from the same artifact as the thing it verifies"). The independent evidence available and unused: whether the chunk's own reader can scan it.
+
+**Fix.** `MaxChunkLineBytes` is now ONE exported constant; the reader sizes its scanner from it and the writer refuses on it, on BOTH write cores (the fast append encoder and `writeRowLegacy` — a refusal on one leaves the defect reachable through any row the fast path declines to encode). The writer refuses rather than the reader growing: raising the limit moves the wall without removing it and does nothing for backups already written, whereas refusing converts an unrestorable artifact with a green verify into a loud failure while the operator can still act. The message names what would otherwise have happened.
+
+Pinned by a refusal test, a large-but-readable control (1 MiB round-trips — wide rows are what this format is for), a both-cores count, and a SOURCE-level assertion that the scanner is configured from the shared constant rather than a literal. That last one is the durable fix: a value-equality test would pass against two literals that agree today and drift tomorrow, which is precisely the failure being closed. Mutation-confirmed both ways.
+
+**Residual, stated rather than implied:** `backup verify` still cannot detect this class on backups written by OLDER binaries — it does not parse rows. A verify that scans each chunk with the real reader would be the independent check; that is its own item, not folded in here.
+
 ### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *OPEN*
 
 **Confirmed at HEAD (2026-08-05):** `chain_compact_smart.go` has no `maxEvents` / `maxBytes` / byte-cap of any kind. The compactor holds two growing structures for the whole pass — `s.out` (every emitted event, appended at three sites) and `s.accumulators` (every per-PK chain, retained until a flush barrier) — and the only barriers are TRUNCATE, `SchemaSnapshot` and end-of-incremental. An incremental with none of those retains everything.
