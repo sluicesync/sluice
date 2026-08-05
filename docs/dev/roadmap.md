@@ -1856,6 +1856,25 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 144. The tier cap fails OPEN, so a PlanetScale dev branch is driven at DOUBLE the fan-out of a production branch on the same tier — *OPEN, high (measured on real PlanetScale 2026-08-05)*
+
+Item 123 made sluice treat an `@@innodb_buffer_pool_size` below the smallest known tier as *no reading* rather than as a tiny instance, so it stops throttling instead of capping at 2. That is correct for what it fixed — a production PS-10 was being throttled to a quarter of its parallelism. **Its consequence on a DEV branch was never measured, and it is the trigger behind the field report's stall.**
+
+Measured on a real PS-10 database, both branches, 1.7M rows / 918 MB:
+
+- **Production branch** reports 128 MiB — exactly the PS-10 floor — so the cap fires: `tier_cap=2`, `requested=4 effective=2`, 4×2 = **8 lanes**.
+- **Dev branch** reports 32 MiB, below the floor, so the cap goes inert and the copy runs 4×4 = **16 lanes** — twice the write fan-out, against the weaker branch.
+
+**The control that establishes causation, not correlation.** Pre-fix binary, dev branch, `--copy-fanout-degree 2` (matching production's effective fan-out, nothing else changed): **234.8s, ZERO drops, ZERO gate windows** — statistically indistinguishable from the production run's 225.8s. Re-running at the default fan-out on the same branch afterwards brought the storm back (6 windows, 75 drops, 28.7% quiesced). A/B/A rules out "the branch had finished growing".
+
+**And the counterintuitive operational fact, measured twice: halving the write fan-out made the dev-branch copy 2.5× FASTER** (579s → 235s). More lanes were strictly worse.
+
+**Two defects compose.** The tier signal fails open (this item) and item 138's ladder amplified the consequence into a 30-second all-lane stop per shed connection. Item 138 fixed the amplifier — correctly, it is the one that was measured — but **the trigger is still live on every dev branch**.
+
+**Operator workaround available today:** `--copy-fanout-degree 2` on a dev branch. Worth documenting regardless of how this is fixed.
+
+**Fix shape, and why it needs thought rather than a constant.** Reverting to a cap-on-sub-floor would restore the item-123 defect. Options: treat a sub-floor reading as evidence of a DEV branch specifically (it is a reliable signal — a dev branch reports a small fixed pool that does not track the plan tier) and cap on that; or derive the ceiling from an observable that is honest on both branch classes; or make the copy adaptive to shed connections rather than to a static tier guess. Note the two branch classes also run **different server builds** (dev 8.4.11-Vitess, production 8.4.9-Vitess), so a comparison between them is not a controlled comparison of one server.
+
 ### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *OPEN, medium; the sibling audit C-3's own fix missed, found while ground-truthing item 130's premise*
 
 Audit 2026-08-05 C-3 added a per-chunk byte ceiling to the change lane, because item 116 P3 had added one to the DATA lane and stopped there. Its commit (`56a37f49`) and the item-116 entry both read as if the change lane were now covered. **It is covered in one of two places.**
@@ -1904,6 +1923,14 @@ The shape is the one this project keeps paying for: item 122's fix was correct a
 
 ### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *✅ FIXED 2026-08-05; unreleased. `-race` Integration must be green before the tag — concurrency chunk (the gate quiesces lanes).*
 
+**VALIDATED ON REAL PLANETSCALE, 2026-08-05** — PS-10, 1.7M rows / 918 MB, the reporter's scale rather than a proxy. The clean signal is not the duty percentage, it is the HOLD DISTRIBUTION. Pre-fix, across 20 windows in two runs, every hold was either ~0.20s or 30.0s and nothing in between (`0.204, 30.014, 30.019, 0.205, 30.016, 30.019`) — the fingerprint of a ladder consumed instantly by fan-out. Post-fix, on the same branch under the same storm, the ladder ran properly twice with the episode reset firing between: `0.105 0.201 0.404 0.806 1.605 3.204 6.406 12.805 25.604 30.005` at cycles 1..10. **Escalation is now driven by time, not fan-out width, on real infrastructure.**
+
+The robust scalar is quiesce PER ABSORBED DROP, because the raw duty share confounds with the drop rate: **1.38 / 1.61 s per drop pre-fix vs 0.50 / 0.50 s post-fix — 2.9x.** Sharper still: post-fix total quiesce was 150.1s in BOTH runs despite 302 vs 300 drops and 13 vs 20 windows, while pre-fix quiesce tracked drop volume (267.6s at 194 drops, 120.5s at 75). Post-fix, quiesce is a function of the ladder and the ceiling; pre-fix it was a function of how many lanes happened to be in flight. That is the thesis, measured. The run-level share ceiling engaged once, so that half is exercised on real infrastructure too.
+
+**The 81% did NOT reproduce — worst measured was 46.2%**, because the drop rate was lower and less clustered, so windows did not chain 246 deep. Reported as 46.2%, not extrapolated. Wall-clock improved ~12% on average but the pre/post ranges overlap and the drop rates differed, so **no wall-clock win is claimed from this data**. The defensible claims are the hold distribution and quiesce-per-drop.
+
+**Methodological note for anyone reproducing this class:** it only appears when cold-start takes the native-concurrent path, which needs MORE THAN ONE TABLE in scope. A single-table repro logs `using serial cold-start`, produces zero gate activity, looks clean, and proves nothing.
+
 **Root cause, ground-truthed against the reporter's log and reproduced deterministically: the gate's exponential ladder advanced once per `Trip`, so its escalation was driven by FAN-OUT WIDTH, not by time.** Every lane parks in `Await` while the gate is closed, so the only trips arriving during a window are the sibling lanes that were mid-flush when it closed — all reporting the same target event, carrying no new information. Across the 246 close/reopen pairs the hold matched `backoff(tripCount)` to the millisecond (0.100s at 1 trip, 0.81s at 4, 12.87s at 8, 30.0s at ≥14); with the default 16-lane fan-out one connection drop burned the ladder to its 30s cap in ~4ms. **The 30s was never a design choice — it is the cap of a ladder consumed by concurrency.**
 
 **The diagnostic question's premise did not survive contact.** `migrate` does not survive this because it avoids the gate: it engages the SAME gate with MORE lanes (~32 = table-parallelism 4 × within-table 8, vs sync cold-start's W×D = 4×4 = 16), on one run-wide instance, and `runBulkCopyPhases`/`openOneChunkConn` wire every one of them. The comparison was also uncontrolled: the successful 45-minute `migrate` ran against a **production branch on a paid tier**, the stalled `sync` runs against a **development branch** (the log's own sub-tier buffer-pool signal confirms it — the same DEV-branch tier-signal shape item 129 fixed the reporting for). Different target class, different availability, different drop rate. So there was no path-scoped fix to make: the defect is path-independent and would hit `migrate` identically on the same target.
@@ -1943,6 +1970,10 @@ Totalled across the run: **4369.3s closed vs 1015.8s open — 81.1% quiesced.** 
 </details>
 
 ### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *OPEN, MEDIUM (split out of item 138, 2026-08-05)*
+
+**Independently confirmed on real PlanetScale, 2026-08-05.** Across ~870 absorbed drops over six A/B runs on a PS-10 database, **zero carried any reparent evidence** — every one was `vtgate connection error: no endpoints` or `no healthy endpoints`. Not one `not serving`, 1021, 1114, 1290 or `TerminateAll`. That is a second independent dataset agreeing with the field log's 244-of-246, on different infrastructure.
+
+**One correction to this entry's own wording:** a SECOND vtgate phrasing appeared in validation — `no healthy endpoints`, 43 occurrences alongside 95 of `no endpoints` in a single run. The classifier matches on the substring `vtgate connection error`, so both are already covered and there is no gap — but this entry should not be read as naming a closed set of wordings.
 
 Item 138 fixed how much the gate quiesces. It did not change WHEN the gate decides a storage-grow reparent is underway, and that decision is still a guess: `flushWithReparentRetry` trips the gate on whatever the engine classifier calls retriable, which is one flat verdict spanning genuine reparent faces (`not serving`, ER_DISK_FULL 1021/1114, read-only 1290, `QueryList.TerminateAll`) and pure transport losses (`vtgate connection error`, `connection reset by peer`, `unexpected EOF`).
 
