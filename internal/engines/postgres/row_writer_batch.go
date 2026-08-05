@@ -152,8 +152,18 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		// connection dropped before the ack) is safe to re-drive. The plain
 		// INSERT core next door gets Await + Trip but NOT replay, for the
 		// mirror-image reason — see writeViaBatch.
+		//
+		// The helper's audit-B-9 keyless gate is unreachable here by
+		// construction — effectiveUpsertKeyColumns already refused a keyless
+		// table upfront (errKeylessIdempotent), and TestPGReplayKeyPredicatesAgree
+		// pins that THIS package's effectiveUpsertKeyColumns and
+		// irbackup.TableReplayIdempotent classify every table shape the same
+		// way. (The mysql package has its own copy of that pin for its own
+		// predicate — one test cannot cover both, since each engine keeps a
+		// private effectiveUpsertKeyColumns.) Riding the same gate anyway is
+		// deliberate: one gate for every caller beats two that can drift apart.
 		batched := len(batch)
-		if err := w.copyChunkWithRetry(ctx, table.Name, batched, func(attemptCtx context.Context) error {
+		if err := w.copyChunkWithRetry(ctx, table, batched, func(attemptCtx context.Context) error {
 			_, execErr := w.db.ExecContext(attemptCtx, query, args...)
 			return execErr
 		}); err != nil {

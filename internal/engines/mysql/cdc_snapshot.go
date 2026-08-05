@@ -424,28 +424,71 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// captured by CDC from the frozen position.
 	//
 	// FTWRL needs the RELOAD privilege. If it's absent we warn and fall
-	// back to the lock-free capture (the prior behaviour) rather than
-	// failing the run — keyless/least-privilege single-DB users who never
-	// hit the window keep working; the warning tells multi-DB/root users
-	// to grant RELOAD to close the gap. On AWS RDS the grant advice is a
-	// dead end (RDS validation 2026-07-16): the master user HOLDS RELOAD
-	// yet the platform blocks FTWRL itself with 1045 — so the remedy is
-	// provider-aware.
+	// back to the lock-free capture rather than failing the run —
+	// keyless/least-privilege single-DB users who never hit the window keep
+	// working; the warning tells multi-DB/root users to grant RELOAD to
+	// close the gap. On AWS RDS the grant advice is a dead end (RDS
+	// validation 2026-07-16): the master user HOLDS RELOAD yet the platform
+	// blocks FTWRL itself with 1045 — so the remedy is provider-aware.
+	//
+	// What the fallback costs changed with audit B-4: it used to be a
+	// possible LOSS, it is now a possible RE-DELIVERY (see the ordering
+	// note below and cdc_snapshot_lockfree.go). The warning says so
+	// because "could be lost" was the sentence that made this look
+	// acceptable, and it was the wrong one.
 	locked := false
 	if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
-		remedy := "Grant RELOAD to close this gap."
+		remedy := "Grant RELOAD to close this window."
 		if isRDSMySQLAddr(cfg.Addr) {
 			remedy = "On AWS RDS no grant closes it — the platform blocks FLUSH TABLES WITH READ LOCK " +
 				"even for the master user (which already holds RELOAD); quiesce writers during the snapshot " +
 				"capture if the no-freeze window matters, and configure binlog retention first " +
 				"(CALL mysql.rds_set_configuration('binlog retention hours', 24))."
 		}
-		slog.Warn("mysql: snapshot: FLUSH TABLES WITH READ LOCK failed; "+
-			"capturing snapshot position without a write freeze (a concurrent "+
-			"commit during capture could be lost). "+remedy,
+		slog.Warn("mysql: snapshot: FLUSH TABLES WITH READ LOCK failed; capturing the snapshot without a "+
+			"write freeze. The CDC handoff position is taken BEFORE the snapshot opens, so a commit inside "+
+			"the capture window is delivered twice rather than dropped; whether one actually happened is "+
+			"reported next. "+remedy,
 			"error", err)
 	} else {
 		locked = true
+	}
+
+	// Audit B-4 — the ORDER of these two operations is the whole safety
+	// argument on the lock-free path, and it used to be the losing one.
+	//
+	// Under FTWRL no commit can happen between them, so either order names
+	// the same logical cut and the code below keeps the historical
+	// inside-the-transaction capture (it is also the one that reads on the
+	// snapshot's own clock).
+	//
+	// WITHOUT the freeze the two operations bracket a real window, and the
+	// two orderings are NOT symmetric:
+	//
+	//   snapshot → position  a commit inside the window is BELOW the
+	//                        captured position (so CDC starts after it) and
+	//                        ABOVE the read view (so the copy never saw it):
+	//                        it lands in NEITHER. Silent loss.
+	//   position → snapshot  the same commit is ABOVE the captured position
+	//                        (CDC replays it) and may also be below the read
+	//                        view: it lands in BOTH. Duplicate delivery,
+	//                        which the idempotent apply absorbs.
+	//
+	// So the lock-free path captures FIRST and hands the CDC reader that
+	// earlier position. This does not CLOSE the window — it moves the
+	// residual from loss to duplication. See
+	// [resolveLockFreeCapturePosition] for the probe that reports whether
+	// the window actually caught anything, and for the one case where the
+	// duplicate side is not free either.
+	var prePos *binlogTip
+	if !locked {
+		f, p, err := snapshotMasterStatus(ctx, conn)
+		if err != nil {
+			_ = conn.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("mysql: snapshot: capture position (lock-free pre-snapshot): %w", err)
+		}
+		prePos = &binlogTip{File: f, Pos: p}
 	}
 
 	if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
@@ -471,6 +514,19 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: capture position: %w", err)
 	}
+	// On the lock-free path the post-snapshot read above is not the handoff
+	// position — it is the far edge of the window, and comparing the two
+	// edges is what turns "we warned you something might have happened" into
+	// a statement about whether anything did.
+	if prePos != nil {
+		file, pos = resolveLockFreeCapturePosition(ctx, *prePos, binlogTip{File: file, Pos: pos})
+	}
+	slog.InfoContext(
+		ctx, "mysql: snapshot: captured consistent snapshot and CDC handoff position",
+		"freeze", snapshotFreezeMode(locked),
+		"binlog_file", file,
+		"binlog_pos", pos,
+	)
 
 	// Release the write freeze now that both the snapshot view and the
 	// binlog position are captured. The open transaction keeps the

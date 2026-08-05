@@ -1083,6 +1083,10 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		// here rather than from the trailing-zero-stripped byte length.
 		// mariadbNativeNone for every ordinary column / non-MariaDB source.
 		out.NativeKinds = append(out.NativeKinds, mariadbNativeKindOf(meta.DataType))
+		// Audit CDC-4: keep the raw catalog data_type parallel to Columns so
+		// the TABLE_MAP guard can ask "was this event recorded under this
+		// shape?" without re-querying. See cdc_table_map_guard.go.
+		out.DataTypes = append(out.DataTypes, meta.DataType)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

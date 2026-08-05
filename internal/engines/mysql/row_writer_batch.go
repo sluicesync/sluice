@@ -351,7 +351,17 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// never reused. The idempotent UPSERT absorbs an ambiguous-commit
 		// replay natively, so no 1062-on-retry tolerance is needed here
 		// (contrast the plain path's wart).
-		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch.rows), func(c *sql.Conn, _ bool) error {
+		//
+		// The helper's audit-B-9 keyless gate is unreachable on this path by
+		// construction — [effectiveUpsertKeyColumns] already refused a
+		// keyless table upfront (errKeylessIdempotent), and
+		// TestReplayKeyPredicatesAgree pins that THIS package's
+		// effectiveUpsertKeyColumns and irbackup.TableReplayIdempotent
+		// classify every table shape identically. (Postgres keeps its own
+		// predicate and its own copy of that pin — one test cannot cover
+		// both.) Passing through it anyway is deliberate: ONE gate for every
+		// caller beats two that can drift.
+		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, _ bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
 				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
 			}

@@ -23,8 +23,19 @@
 // the gate, replay the buffered chunk, Trip on a classified transient"
 // discipline. The one structural difference: a PG chunk's CopyFrom is its
 // OWN atomic COPY into the append-only fresh cold-copy table, so a
-// rolled-back chunk wrote NOTHING — a replay is clean (no dup, no partial),
+// ROLLED-BACK chunk wrote NOTHING — a replay is clean (no dup, no partial),
 // and there is no MySQL-style 1062-on-retry tolerance wart to carry.
+//
+// That argument covers ONE of the two branches, and the correction matters
+// (audit B-9's PG sibling). A transient can also arrive AFTER the server
+// committed the chunk's COPY and BEFORE pgx read the CommandComplete — the
+// committed-but-unacked branch. Replaying then re-COPIES rows that are
+// already durable. On a KEYED table the target refuses the replay loudly
+// (23505 unique violation — this path has no ON CONFLICT), which is
+// annoying but not silent. On a KEYLESS table there is no constraint to
+// notice and the chunk is silently doubled. So the replay is gated on the
+// same predicate the MySQL core uses: see the keyless refusal in
+// [RowWriter.copyChunkWithRetry].
 
 package postgres
 
@@ -36,6 +47,8 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // pgCopyChunkRowsVar caps how many rows accumulate into one buffered chunk on
@@ -177,7 +190,11 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 //
 // A chunk's CopyFrom is its own atomic COPY into the append-only fresh table:
 // a rolled-back attempt wrote nothing, so replaying the buffered chunk is
-// clean (no dup, no partial). The first error is routed through
+// clean (no dup, no partial). The committed-but-unacked branch is the one the
+// file header now spells out, and it is why this helper takes the *ir.Table
+// rather than its name: a table with no PRIMARY KEY and no all-NOT-NULL
+// UNIQUE index cannot notice a doubled chunk, so the replay is refused for it
+// (audit B-9). The first error is routed through
 // classifyApplierError; the loop retries ONLY a transient that satisfies
 // ir.RetriableError (53100 disk-full / 57P0x reparent / 08* connection / bad
 // conn) — exactly the storage-grow / serving-transition set. Any non-
@@ -185,10 +202,12 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 // returns a LOUD terminal error wrapping the most recent transient.
 func (w *RowWriter) copyChunkWithRetry(
 	ctx context.Context,
-	tableName string,
+	table *ir.Table,
 	rows int,
 	attempt func(ctx context.Context) error,
 ) error {
+	tableName := pgTableNameOf(table)
+	replaySafe := irbackup.TableReplayIdempotent(table)
 	// ADR-0110: quiesce with the run's other cold-copy lanes if a coordinated
 	// grow-window pause is in effect before the first try.
 	if err := w.awaitGrowGate(ctx); err != nil {
@@ -217,6 +236,16 @@ func (w *RowWriter) copyChunkWithRetry(
 		// gate so every sibling cold-copy lane quiesces together for the grow
 		// window instead of independently hammering the struggling target.
 		w.tripGrowGate("postgres cold-copy chunk transient: " + err.Error())
+		// Audit B-9 (PG sibling): the replay below re-COPIES a byte-identical
+		// chunk. Safe when the prior attempt rolled back, and safe-because-
+		// loud on a keyed table when it did not (23505). On a keyless table
+		// neither the target nor this code can tell the two apart, so the
+		// chunk would silently double. Refuse before replaying. The Trip
+		// above still runs — the transient was real and the sibling lanes
+		// should still quiesce.
+		if !replaySafe {
+			return errKeylessAmbiguousReplay(tableName, rows, err)
+		}
 		// Terminal on the WALL-CLOCK deadline (the real bound) or the runaway
 		// attempt backstop. A genuinely-wedged target surfaces loudly after
 		// ~30 min; a transient grow is ridden regardless of probe cadence.
@@ -260,4 +289,41 @@ func (w *RowWriter) copyChunkWithRetry(
 			return nil
 		}
 	}
+}
+
+// pgTableNameOf renders a table's name for a message, total over nil so a
+// refusal path can never itself panic.
+func pgTableNameOf(table *ir.Table) string {
+	if table == nil {
+		return "<nil>"
+	}
+	return table.Name
+}
+
+// errKeylessAmbiguousReplay is the PG twin of the MySQL core's refusal
+// (audit B-9). Same predicate ([irbackup.TableReplayIdempotent]), same
+// code, same reasoning: a transient that arrived after the server
+// committed the chunk but before the client saw the acknowledgement is
+// indistinguishable from one that rolled it back, and a table with no
+// PRIMARY KEY and no NOT NULL UNIQUE index has nothing that would make
+// the second COPY of those rows fail. The MySQL helper's doc carries
+// the full refuse-vs-reconcile argument; it applies here unchanged.
+//
+// The PG-specific note: on a KEYED table this path would have surfaced a
+// 23505 rather than duplicating, so the refusal changes behaviour only
+// for the keyless case — which is exactly the case that was silent.
+func errKeylessAmbiguousReplay(tableName string, rows int, cause error) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeCopyRetryAmbiguousKeyless,
+		"add a PRIMARY KEY or a NOT NULL UNIQUE index to the table, then re-run",
+		fmt.Errorf(
+			"postgres: cold-copy into %q: the target hit a transient error mid-chunk (%d rows) and this table has "+
+				"no PRIMARY KEY and no NOT NULL UNIQUE index, so replaying the chunk could silently duplicate every "+
+				"row in it: an attempt that committed but lost its acknowledgement is indistinguishable from one "+
+				"that rolled back, and with no unique key there is no constraint violation to tell them apart. "+
+				"Refusing rather than risking duplicate rows. Add a PRIMARY KEY or a NOT NULL UNIQUE index to the "+
+				"source table and re-run, or re-run this table's copy from an empty target: %w",
+			tableName, rows, cause,
+		),
+	)
 }

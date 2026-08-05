@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Cold-copy reparent-retry bounds. Zero-value-safe by construction:
@@ -125,6 +127,19 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 //     provably "already landed" ONLY on a retry. A first-attempt 1062
 //     (isRetry=false) stays terminal (real dup-key / dirty target).
 //
+// The KEYLESS CARVE-OUT (audit B-9). Everything above is an argument
+// about a COLLISION, and a collision needs something to collide with. A
+// table with no PRIMARY KEY and no all-NOT-NULL UNIQUE index has nothing
+// — so on such a table the committed-but-unacked branch produces no 1062
+// at all and the retry silently DOUBLE-INSERTS the batch. That is why
+// this helper, not either caller, owns the decision: it takes the
+// *ir.Table and refuses the retry for a table
+// [irbackup.TableReplayIdempotent] reports false for, rather than
+// re-sending a batch whose outcome it cannot distinguish. See
+// [errKeylessAmbiguousReplay] for the reasoning and the remedy, and
+// ADR-0108's "keyless carve-out" section. Putting the gate HERE means a
+// future third caller inherits it instead of re-deriving it.
+//
 // The first error is routed through classifyApplierError; the loop
 // retries ONLY when it satisfies ir.RetriableError (the same transient
 // set the CDC apply path retries — connection-reset / EOF / vttablet
@@ -137,11 +152,15 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 // the most recent transient (never silent, never infinite).
 func (w *RowWriter) flushWithReparentRetry(
 	ctx context.Context,
-	tableName string,
+	table *ir.Table,
 	rows int,
 	attempt func(conn *sql.Conn, isRetry bool) error,
 	firstConn *sql.Conn,
 ) error {
+	tableName := tableNameOf(table)
+	// Derived ONCE per flush: the predicate is pure and the schema cannot
+	// change under a cold copy.
+	replaySafe := irbackup.TableReplayIdempotent(table)
 	// ADR-0110: quiesce with the run's other cold-copy lanes if a
 	// coordinated grow-window pause is in effect. Await is a cheap open
 	// read when no pause is active (the common case) and returns ctx.Err()
@@ -186,6 +205,19 @@ func (w *RowWriter) flushWithReparentRetry(
 		// the first transient was seen (the silent under-copy fix). No-op
 		// when no observer is wired (every non-restore path).
 		w.notifyReparent(tableName)
+		// Audit B-9: the retry below re-sends a byte-identical batch. On a
+		// keyed table that is safe because the two outcomes are
+		// DISTINGUISHABLE after the fact (rolled back ⇒ clean apply;
+		// committed-but-unacked ⇒ 1062, which writeBatchedConn tolerates as
+		// proof the rows landed). On a keyless table they are NOT — both
+		// outcomes look like a clean apply, and one of them has quietly
+		// doubled the batch. Refuse before re-sending. Trip + notifyReparent
+		// above still run: the target really did hit a transient, so the
+		// sibling lanes should still quiesce and the restore reconciler
+		// should still hear about this table.
+		if !replaySafe {
+			return errKeylessAmbiguousReplay(tableName, rows, err)
+		}
 		// Terminal on the WALL-CLOCK deadline (the real bound) or the
 		// runaway attempt backstop. A genuinely-wedged target surfaces
 		// loudly after ~30 min; a transient grow is ridden regardless of
@@ -261,4 +293,68 @@ func (w *RowWriter) tripGrowGate(reason string) {
 		return
 	}
 	w.growGate.Trip(reason)
+}
+
+// tableNameOf renders a table's name for a message, total over nil so a
+// refusal path can never itself panic.
+func tableNameOf(table *ir.Table) string {
+	if table == nil {
+		return "<nil>"
+	}
+	return table.Name
+}
+
+// errKeylessAmbiguousReplay is the loud refusal that stands in for
+// ADR-0108's 1062-on-retry tolerance on a table the collision can never
+// fire on (audit finding B-9).
+//
+// # Why this is a refusal and not a reconciliation
+//
+// The audit offered two remedies: refuse the retry, or let it run and
+// reconcile the table afterwards with an independent `COUNT(*)`. The
+// reconciliation reads better on paper — it detects rather than prevents,
+// and it keeps a keyless table riding a reparent the way a keyed one does
+// — but it cannot be made honest at this layer:
+//
+//   - It needs a trustworthy BASELINE to compare against, and this core
+//     has none. [RowWriter.WriteRowsParallel] runs N workers over ONE
+//     table on one writer, so no single call knows the table's total; and
+//     the resume/restore paths write into a target that is deliberately
+//     NOT empty. "rows I sent" is the writer's own bookkeeping, which is
+//     exactly the evidence-sharing shape the project's
+//     name-the-independent-expected-value rule rejects.
+//   - The count it would need is a full scan of the table that just
+//     failed to write, issued at the moment the target is least able to
+//     serve it (mid-reparent / mid-grow).
+//   - It detects only after the whole table has copied — potentially
+//     hours — and the remedy at that point is the same restart the
+//     refusal names immediately.
+//
+// So the choice is the tenet's: loud failure now over a detection we
+// cannot ground. It also makes the two engines' plain write cores AGREE
+// rather than diverge — Postgres's plain multi-row INSERT core already
+// declines to retry for precisely this reason (see
+// quiesceAndReportTransient in the postgres engine).
+//
+// # What the operator loses, stated plainly
+//
+// A keyless table whose cold copy hits a genuine transient now fails
+// where it would usually have succeeded (the rolled-back branch is the
+// common one). That cost is real and is the reason the remedy names the
+// durable fix — a key — first.
+func errKeylessAmbiguousReplay(tableName string, rows int, cause error) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeCopyRetryAmbiguousKeyless,
+		"add a PRIMARY KEY or a NOT NULL UNIQUE index to the table, then re-run",
+		fmt.Errorf(
+			"mysql: cold-copy into %q: the target hit a transient error mid-batch (%d rows) and this table has "+
+				"no PRIMARY KEY and no NOT NULL UNIQUE index, so re-sending the batch could silently duplicate every "+
+				"row in it: a prior attempt that committed but lost its acknowledgement is indistinguishable from one "+
+				"that rolled back, and with no unique key there is no duplicate-key collision to tell them apart "+
+				"(ADR-0108 keyless carve-out). Refusing rather than risking duplicate rows. Add a PRIMARY KEY or a "+
+				"NOT NULL UNIQUE index to the source table and re-run, or re-run this table's copy from an empty "+
+				"target: %w",
+			tableName, rows, cause,
+		),
+	)
 }

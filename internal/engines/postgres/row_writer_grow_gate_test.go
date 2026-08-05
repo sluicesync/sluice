@@ -71,7 +71,7 @@ func TestPGCopyChunkRetry_AwaitsBeforeEachAttempt(t *testing.T) {
 	w := &RowWriter{growGate: gate}
 
 	var calls int
-	err := w.copyChunkWithRetry(context.Background(), "t", 3, func(context.Context) error {
+	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 3, func(context.Context) error {
 		calls++
 		if calls == 1 {
 			return diskFull53100() // transient on the first attempt
@@ -98,7 +98,7 @@ func TestPGCopyChunkRetry_TripsOnClassifiedTransient(t *testing.T) {
 	w := &RowWriter{growGate: gate}
 
 	var calls int
-	err := w.copyChunkWithRetry(context.Background(), "t", 1, func(context.Context) error {
+	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 1, func(context.Context) error {
 		calls++
 		if calls == 1 {
 			return diskFull53100()
@@ -123,7 +123,7 @@ func TestPGCopyChunkRetry_NoTripNoRetryOnTerminal(t *testing.T) {
 
 	terminal := &pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"}
 	var calls int
-	err := w.copyChunkWithRetry(context.Background(), "t", 1, func(context.Context) error {
+	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 1, func(context.Context) error {
 		calls++
 		return terminal
 	})
@@ -153,7 +153,7 @@ func TestPGCopyChunkRetry_LoudOnExhaustion(t *testing.T) {
 	gate := &recordingGrowGate{}
 	w := &RowWriter{growGate: gate}
 
-	err := w.copyChunkWithRetry(context.Background(), "big_table", 42, func(context.Context) error {
+	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("big_table"), 42, func(context.Context) error {
 		return diskFull53100() // never clears
 	})
 	if err == nil {
@@ -183,7 +183,7 @@ func TestPGCopyChunkRetry_AwaitCtxCancelHalts(t *testing.T) {
 	cancel() // Await returns ctx.Err() immediately
 
 	var calls int
-	err := w.copyChunkWithRetry(ctx, "t", 1, func(context.Context) error {
+	err := w.copyChunkWithRetry(ctx, pgKeyedPinTable("t"), 1, func(context.Context) error {
 		calls++
 		return nil
 	})
@@ -204,7 +204,7 @@ func TestPGCopyChunkRetry_NilGateInert(t *testing.T) {
 	w := &RowWriter{} // nil growGate
 
 	var calls int
-	err := w.copyChunkWithRetry(context.Background(), "t", 1, func(context.Context) error {
+	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 1, func(context.Context) error {
 		calls++
 		if calls == 1 {
 			return diskFull53100()

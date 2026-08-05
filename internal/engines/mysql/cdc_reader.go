@@ -364,6 +364,15 @@ type tableSchema struct {
 	// ([decodeBinlogRow]) consults it only when the reader's flavor is
 	// MariaDB.
 	NativeKinds []mariadbNativeKind
+
+	// DataTypes is parallel to Columns: the raw lowercased
+	// information_schema.columns.DATA_TYPE of Columns[i]. Kept because the
+	// IR type is a lossy view for one specific purpose — comparing the
+	// table's CURRENT shape against the shape a replayed row event was
+	// RECORDED under (audit CDC-4, see cdc_table_map_guard.go). Populated
+	// only by [loadTableSchema], production's sole constructor; a
+	// hand-built *tableSchema leaves it empty and the guard skips.
+	DataTypes []string
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
@@ -1186,6 +1195,18 @@ func (r *CDCReader) dispatchRows(
 	tbl, err := r.tableFor(ctx, qn)
 	if err != nil {
 		return fmt.Errorf("mysql: cdc: load schema for %s: %w", qn, err)
+	}
+
+	// Audit CDC-4: tableFor's contract ("the information_schema lookup at
+	// this point sees the correct shape") holds at the binlog HEAD, where
+	// the server serialises DDL against DML. It does NOT hold while a warm
+	// resume replays buffered history recorded before a DDL that ran during
+	// the downtime. The TABLE_MAP event states the shape these values were
+	// written under; compare it against the shape we are about to decode
+	// with, BEFORE any row is decoded or emitted, and refuse loudly on a
+	// family mismatch. See cdc_table_map_guard.go.
+	if err := verifyTableMapMatchesSchema(ev, tbl); err != nil {
+		return err
 	}
 
 	if r.boolWarn == nil { // single-goroutine pump — no lock needed

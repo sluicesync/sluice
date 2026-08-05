@@ -322,6 +322,25 @@ const (
 	// observe. Refusing names the escapes (re-pass the original --where,
 	// --restart-from-scratch, --reset-target-data).
 	CodeWherePushdownDrift Code = "SLUICE-E-WHERE-PUSHDOWN-DRIFT"
+
+	// CodeCopyRetryAmbiguousKeyless is the cold-copy write cores' refusal
+	// to RE-SEND a batch/chunk on a table that could not notice a
+	// duplicate. Both engines' bounded transient retry re-sends the same
+	// rows on a classified transient; that is sound only because a table
+	// with a key turns "the prior attempt committed but lost its ack" into
+	// an observable collision. Keyless, the two outcomes are identical to
+	// every observer — so the retry is refused instead (audit B-9).
+	CodeCopyRetryAmbiguousKeyless Code = "SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS"
+
+	// CodeCDCSchemaReplayMismatch is the MySQL binlog reader's refusal
+	// when a buffered row event's TABLE_MAP type vector disagrees with the
+	// table's CURRENT information_schema shape. Live at the binlog head
+	// that cannot happen (MySQL serialises DDL against DML on one table),
+	// but a warm resume REPLAYS history recorded before a DDL that ran
+	// while sluice was down — and a DDL that keeps the column COUNT the
+	// same decodes old values against the new types, right count and wrong
+	// meaning (audit CDC-4).
+	CodeCDCSchemaReplayMismatch Code = "SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -447,6 +466,9 @@ var registry = map[Code]Info{
 	CodeWhereCDCBeforeImage:          {ClassRefusal, "continuous filtered sync (--where on `sync`) refused at start: the source is not configured to deliver full row before-images (MySQL binlog_row_image!=FULL, or a filtered PG table without REPLICA IDENTITY FULL), which the --where row-move evaluation requires to decide whether an UPDATE moved a row into or out of the filter's scope"},
 	CodeWhereCDCAfterImage:           {ClassRefusal, "continuous filtered sync (--where on `sync`) stopped mid-stream: an UPDATE on a filtered table arrived with an AFTER-image missing a column the predicate references, so the row-move evaluation cannot decide whether the row left the filter's scope — evaluating over the missing column would read NULL and could emit a spurious DELETE for a row still in scope at the source (the audit 2026-07-23 D0-1 unchanged-TOAST class; the PG reader backfills that producer, so this belt firing means an unexpected partial after-image reached the filter)"},
 	CodeWherePushdownDrift:           {ClassRefusal, "warm resume refused: the current --where flags don't match the row-filter subset this stream PUSHED into its Postgres publication at cold start — the publication filter is durable source-side state a warm resume never re-ensures, so resuming would leave the SERVER silently filtering on the stale predicate (under-delivery the client cannot observe); re-run with the --where the stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (on a PG source the restart first refuses on the stream's existing replication slot — drop it as that refusal instructs, then re-run), or --reset-target-data for a destructive reset"},
+
+	CodeCopyRetryAmbiguousKeyless: {ClassRefusal, "a cold copy hit a transient target error mid-batch on a table with no PRIMARY KEY and no NOT NULL UNIQUE index, and refused to re-send those rows: an attempt that committed but lost its acknowledgement is indistinguishable from one that rolled back, and with no unique key there is nothing that would make the second write fail — so the retry that rides a PlanetScale reparent or a storage-grow window on every other table would silently duplicate this one"},
+	CodeCDCSchemaReplayMismatch:   {ClassRefusal, "a MySQL binlog row event's TABLE_MAP column-type vector disagrees with the table's current information_schema shape — the event was recorded under a DIFFERENT schema than the one it is about to be decoded against, which for a same-column-count DDL (a type change) would remap every replayed value silently; refused rather than decoded"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

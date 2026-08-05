@@ -548,7 +548,7 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 		// pinned conn on the first try, a FRESH pool conn (reconnected to
 		// the new primary) on every retry. The dead post-reparent conn is
 		// never reused.
-		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch.rows), func(c *sql.Conn, isRetry bool) error {
+		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, isRetry bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
 				// WART: tolerate-1062-on-retry (ADR-0108). A plain cold-copy
 				// batch is a SINGLE atomic multi-row INSERT. On a classified
@@ -566,6 +566,14 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// violation / dirty target must fail loudly — unchanged
 				// ADR-0038 policy). The idempotent path needs no such wart
 				// (its UPSERT absorbs the collision).
+				//
+				// The whole argument is about a COLLISION, so it holds only
+				// for a table that HAS something to collide on — a keyless
+				// table produces no 1062 and the retry would double-insert.
+				// flushWithReparentRetry refuses to retry such a table at all
+				// (audit B-9 / errKeylessAmbiguousReplay), which is what keeps
+				// this arm's "PROVES" honest: by the time isRetry is true, the
+				// table is known to carry a PK or a NOT NULL UNIQUE index.
 				if isRetry && isMySQLDupKey(err) {
 					slog.WarnContext(
 						ctx, "mysql: cold-copy plain INSERT retry collided with a duplicate key (Error 1062); "+

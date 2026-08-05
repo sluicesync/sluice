@@ -136,8 +136,23 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 	}
 
 	// Capture the position INSIDE the snapshot tx so it refers to the
-	// snapshot's logical clock (the same shape openBinlogSnapshotStream
-	// uses). Prefer GTID when gtid_mode is on; fall back to file/pos.
+	// snapshot's logical clock. Prefer GTID when gtid_mode is on; fall
+	// back to file/pos.
+	//
+	// UNFIXED SIBLING of audit B-4 (recorded 2026-08-05, filed in
+	// docs/dev/audit-backlog.md). This path holds NO lock — it is the
+	// fallback taken whenever the coordinated FTWRL open failed, which is
+	// every RDS backup — so the snapshot-then-position order here is the
+	// same window openBinlogSnapshotStreamShared just flipped: a commit
+	// between the read view freezing and this capture is above the read
+	// view and below the recorded position, so it is in neither the backup
+	// nor an incremental taken from it.
+	//
+	// It is NOT flipped here in the same change, deliberately. The chain
+	// anchor is load-bearing for incremental lineage and replay-window
+	// invariants (ADR-0088), and moving it earlier is safe in direction but
+	// interacts with machinery this change did not validate. Do not read
+	// the B-4 fix next door as covering this.
 	position, err := captureBackupPositionInTx(ctx, conn, e.Flavor)
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")

@@ -588,7 +588,7 @@ func (w *RowWriter) writeViaCopyChunked(ctx context.Context, table *ir.Table, ro
 			return nil
 		}
 		attemptNo := 0
-		return w.copyChunkWithRetry(ctx, table.Name, len(chunk), func(attemptCtx context.Context) error {
+		return w.copyChunkWithRetry(ctx, table, len(chunk), func(attemptCtx context.Context) error {
 			attemptNo++
 			// TEST-ONLY fault injection (nil in production): lets a test inject
 			// one classified-retriable fault on a given attempt to prove the

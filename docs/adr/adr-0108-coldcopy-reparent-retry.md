@@ -144,6 +144,64 @@ there). This is implemented as a named, commented wart in
 `writeBatchedConn` ("tolerate-1062-on-retry"), with a loud WARN when it
 fires.
 
+### The keyless carve-out — where the argument above does NOT hold
+
+> **Added 2026-08-05 (audit finding B-9).** The paragraph above was
+> written as if it were universal. It is not, and the exception is a
+> silent-duplication hole rather than a corner case.
+
+The entire proof is about a **collision**, and a collision needs
+something to collide with. On a table with **no PRIMARY KEY and no
+all-NOT-NULL UNIQUE index**, branch (2) produces **no 1062 at all** — the
+re-sent batch simply inserts a second copy of every row, the flush
+reports success, and the copy exits 0 with the table silently doubled.
+Nothing in the original design noticed, because the design reasoned about
+the collision and never about its absence.
+
+This mattered more after v0.111.1 widened the vtgate 1105 classification:
+that widening ARMED the retry on exactly the production PlanetScale path
+the first field report came from.
+
+**What sluice does now.** `flushWithReparentRetry` — the one place the
+retry policy lives — takes the `*ir.Table` and, before re-sending
+anything, refuses when `irbackup.TableReplayIdempotent` reports false.
+The refusal is coded `SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS`, names the
+table and the batch size, and points at the durable remedy (add a key).
+The grow gate is still tripped and the reparent still recorded before the
+refusal: the transient was real, so the sibling lanes should still
+quiesce and the restore reconciler should still hear about the table.
+
+**Refuse, not reconcile — and why.** The audit's alternative was a
+post-table `COUNT(*)` reconciliation, which detects instead of prevents
+and would keep a keyless table riding a reparent. It was rejected because
+it cannot be made honest at this layer: there is no trustworthy baseline
+to compare against (`WriteRowsParallel` runs N workers over one table, and
+the resume/restore paths write into a deliberately non-empty target), the
+comparison would be a full scan issued at the moment the target is least
+able to serve it, and it would only fire after the whole table had copied
+— at which point the remedy is the same restart the refusal names
+immediately. Comparing against "rows I sent" is the writer's own
+bookkeeping, which is the evidence-sharing shape the project's
+name-the-independent-expected-value rule exists to reject.
+
+**The cost, stated plainly.** A keyless table whose cold copy hits a
+genuine transient now fails where it would usually have succeeded (the
+rolled-back branch is the common one). That is a real regression in
+resilience for that table shape, accepted because the alternative is a
+silent double-insert.
+
+**Where else this shape lives.** The gate sits in the shared helper, so
+both MySQL write cores that retry inherit it. The Postgres chunked-COPY
+retry (`copyChunkWithRetry`) carried the same hole with a narrower
+rationale — its comment argued only the rolled-back branch — and now
+carries the same gate and the same code. `LOAD DATA`, `raw_copy`, and
+Postgres's plain multi-row INSERT core never re-send at all and are
+exempt for that reason.
+
+**What this does NOT change.** The at-least-once CDC apply accounting for
+keyless tables (ADR-0089) is unaffected; that is a separate, documented
+window with its own reasoning.
+
 **The tolerance is scoped to `isRetry` ONLY.** A FIRST-attempt 1062 stays
 **terminal** — a real non-PK uniqueness violation or a dirty target must
 fail loudly (unchanged ADR-0038 policy: 1062 is non-retriable). The
@@ -153,7 +211,12 @@ the helper itself never tolerates anything (it only retries classified
 transients).
 
 The **idempotent path needs no such wart** — its `ON DUPLICATE KEY
-UPDATE` absorbs the ambiguous-commit replay natively.
+UPDATE` absorbs the ambiguous-commit replay natively. It, too, needs a
+key for that to be true, and it already refuses a keyless table upfront
+(`errKeylessIdempotent`); `TestReplayKeyPredicatesAgree` pins that its
+predicate and the carve-out's classify every table shape identically, so
+routing it through the shared gate cannot refuse a table it used to
+accept.
 
 ### Fan-out composition
 
@@ -171,17 +234,26 @@ siblings. The loud-on-genuine-error abort is unchanged.
   is ridden out in-process instead of crash-looping the supervisor.
 - The recovery is bounded and observable (≤ ~4 min, WARN per retry, loud
   terminal on exhaustion).
-- The plain-path 1062 wart is the one subtlety; it is provably safe
-  (atomic single-statement batch + sole writer onto a fresh target) and
-  scoped to retry-after-classified-transient only.
+- The plain-path 1062 wart is the one subtlety. It is safe for a table
+  that HAS a key (atomic single-statement batch + sole writer onto a
+  fresh target) and scoped to retry-after-classified-transient only —
+  **but not for a keyless table**, where the collision it rests on cannot
+  occur. That case is now refused rather than retried; see "The keyless
+  carve-out" above. The earlier wording here read "provably safe" without
+  qualification, which is the overclaim the carve-out corrects.
+- A keyless table's cold copy no longer rides a transient at all. It
+  fails loudly and restartably instead of possibly duplicating.
 
 ## Scope / non-goals
 
-- **MySQL cold-copy only** (the demonstrated Track-D path). The PG COPY
-  writer has the analogous gap (a reparent/failover mid-COPY would abort
-  the copy); it is **NOT** addressed here — noted as a follow-up. PG's
-  cold-copy uses the COPY protocol, a different recovery shape, and was
-  not the live failure.
+- **MySQL cold-copy only** (the demonstrated Track-D path) *as originally
+  written*. **Superseded 2026-08-05:** the PG chunked-COPY retry shipped
+  since (roadmap item 38 / `postgres/row_writer_grow_gate.go`), and audit
+  B-9 found it carrying the same committed-but-unacked hole behind a
+  narrower rationale, so the keyless gate landed on both engines in one
+  change. This bullet is kept rather than deleted because "NOT addressed
+  here — noted as a follow-up" is exactly the kind of line that stops the
+  next reader from checking.
 - No new CLI flag or config field — the bounds are baked constants (the
   envelope is sized for the managed-Vitess reparent window; the apply
   path's `--apply-retry-*` knobs remain apply-phase only). If a future
