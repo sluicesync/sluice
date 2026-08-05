@@ -127,6 +127,9 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if p, ok := cdc.(ir.ChangeLogPruner); ok {
 		s.changeLogPruner = p
 	}
+	// Roadmap item 115: and its consumer-registry companion, which the
+	// registration sidecar needs even when this stream never prunes.
+	s.captureChangeLogConsumerRegistry(cdc)
 	return changes, stop, nil
 }
 

@@ -164,7 +164,8 @@ polling reader streams them.
 sluice trigger setup --source-driver sqlite-trigger --dsn ./app.db --tables=users,orders
 ```
 
-This creates `sluice_change_log` + `sluice_change_log_meta` and three AFTER
+This creates `sluice_change_log`, `sluice_change_log_meta`, `sluice_change_log_columns`,
+`sluice_change_log_consumers`, and three AFTER
 INSERT/UPDATE/DELETE triggers per table. Each listed table must have a PRIMARY KEY (the
 CDC applier identifies rows by PK); a PK-less table is refused loudly. Re-running setup is
 idempotent. Use `--dry-run` to print the DDL without applying it.

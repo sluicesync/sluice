@@ -2270,7 +2270,18 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 
 **Gotcha for whoever takes P3.** Chunk boundaries are load-bearing beyond memory: resume keys on them, and the content-addressed same-path upload skip compares a chunk's SHA at its allocated path. Changing when a chunk rolls changes both, so the ceiling wants to land with a resume test and a re-run-skip test, not on its own.
 
-### 115. A shared trigger-CDC change log is pruned against ONE stream's frontier, so a slower peer silently loses rows (audit 2026-08-01 S4; warned, not fixed) — *OPEN*
+### 115. A shared trigger-CDC change log is pruned against ONE stream's frontier, so a slower peer silently loses rows (audit 2026-08-01 S4) — *✅ FIXED (fix shape (a): a source-side consumer registry) — unreleased on `main`*
+
+**What shipped.** ADR-0137 Phase C. `sluice trigger setup` now installs a third source-side table, `sluice_change_log_consumers`, and moves the change-log `schema_version` 1 → 2. Every trigger-CDC stream publishes its durably-applied frontier there on a one-minute cadence — **whether or not it opted into `--auto-prune-change-log`**, because the sync that loses rows is typically the one without the flag — and the prune cuts at `min(MIN(applied_id) across the registry, this stream's freshly-read frontier) - keep`. That is correct for every shape including two streams replicating the SAME table to different targets, which the scoped-prune option (b) could not close; option (b) was not implemented, and the `(schema_name, table_name, id)` index N-16 dropped was NOT re-added — the registry rides its own tiny PK and the change-log DELETE still rides the existing `id` PK range scan.
+
+**The seam, and the fail-closed half.** A new OPTIONAL COMPANION `ir.ChangeLogConsumerRegistry` sits beside `ir.ChangeLogPruner` (the `ir.NetworkLiteralResolver` pattern). A source exposing the base pruner WITHOUT the companion is **not pruned at all** — the sidecar logs at ERROR and spawns nothing. The cut decision lives once, in `triggercdc.RegistryCut`, shared by all three engines. **Sibling sweep:** `pgtrigger` — FIXED (own PG SQL, integration-pinned); `sqlite-trigger` — FIXED (real-file unit pins); `d1-trigger` — FIXED by the same `CDCReader` over the D1 executor, with its HTTP decode separately pinned. The one sibling deliberately NOT gated is the operator-run `sluice trigger prune`, which is CLAMPED to the registry MIN and prints that it was, but does not refuse when there is no registry evidence — refusing an explicit operator action that has been safe for a single stream since Phase A would be a regression.
+
+**The empty-registry hazard, handled explicitly.** An empty registry is indistinguishable from one nobody has written to yet, so `RegistryCut` REFUSES on it rather than reading it as "no consumers ⇒ prune everything", and refuses again when the calling stream's own `consumer_id` is absent (a cut derived from peers alone is not a safe bound for the caller). Both are unit- and integration-pinned, and mutation-run in both directions.
+
+**What is NOT closed, in the flag help and a startup WARN.** A peer running a sluice OLDER than the registry never registers and leaves no trace on the source, so it cannot be detected; every sync on a shared source must be upgraded before enabling the flag. A peer that ran an old `trigger setup` IS caught — that rewrites `schema_version` below the floor and the engine refuses. A stopped-but-still-registered consumer holds the change log until an operator deletes its row (WARNed at 30 min, never auto-evicted — eviction would delete the rows a stream down for maintenance has not read).
+
+<details>
+<summary>Original filing</summary>
 
 **The defect.** `runAutoPruneTick` reads THIS stream's durable position from its own target and hands the token to the source's `PruneConsumedChangeLog`, which deletes `id <= appliedLastID - keep`. The cut keys on `id` alone. A source change log is shared by every stream reading that database, so a second stream that is behind loses everything between the two frontiers — deleted before it reads it, with no way to discover it existed. This is precisely the staged-wave shape the docs recommend: several syncs off one source, disjoint table sets, necessarily different speeds.
 
@@ -2285,6 +2296,8 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 **Fix shape, in preference order.** (a) A source-side consumer registry — each stream records its applied frontier there, prune cuts at the MIN. Correct for every shape including same-table peers; costs a schema bump. (b) Scoped prune per constraint 2 — cheaper, closes the documented staged-wave case only, and must be documented as partial. (c) Refuse auto-prune outright when the change log carries rows for tables outside this stream's scope — detects a peer without a registry, but false-positives when triggers are installed on tables nobody consumes.
 
 **Gotcha for whoever takes it.** `ir.ChangeLogPruner` takes only the position token, so any of these needs the stream's table scope threaded through an interface implemented by three engines (pgtrigger, sqlite-trigger, d1-trigger). Prefer the optional-companion-surface pattern (`ir.NetworkLiteralResolver` is the recent precedent) over widening the existing method, so an engine that has not implemented it fails closed rather than silently pruning unscoped.
+
+</details>
 
 ### 114. MySQL's `LOAD DATA` cold-copy is one monolithic statement per table, so a transient has NO resume point (audit 2026-08-01 Q2; coordination half fixed, chunking half open) — *OPEN*
 

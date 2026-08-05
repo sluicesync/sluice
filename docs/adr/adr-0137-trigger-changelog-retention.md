@@ -2,7 +2,8 @@
 
 ## Status
 
-**Accepted — both phases shipped: Phase A v0.99.151, Phase B v0.99.174.**
+**Accepted — three phases shipped: Phase A v0.99.151, Phase B v0.99.174, Phase C
+(the source-side consumer registry, roadmap item 115) unreleased on `main`.**
 Proposed 2026-06-28. Phase A is `sluice trigger prune`; Phase B is
 `--auto-prune-change-log`. Roadmap item 49 follow-up —
 addresses Bug 165 (and the shared growth vector behind pgtrigger Bug 159). Phase A: an
@@ -86,6 +87,65 @@ durable watermark, never the source reader's read cursor.
      safe/pre-Phase-B default for every construction (CLI, tests, broker/chain, future callers).
      Default-ON is a possible future once the cadence is field-proven on real continuous syncs.
 
+3. **Phase C — the SOURCE-SIDE CONSUMER REGISTRY (roadmap item 115, IMPLEMENTED).**
+   Phases A and B both cut at ONE stream's frontier by change-log `id`. A source change
+   log is shared by every sync reading that database, so on the staged/wave shape the
+   docs recommend — several syncs off one source, disjoint table sets, necessarily
+   different speeds — the faster stream deleted the rows between the two frontiers before
+   the slower one read them: silent, permanent, undiscoverable from the slow side (audit
+   2026-08-01 S4). v0.110.0 warned about it; this phase fixes it.
+
+   - *The registry.* `sluice trigger setup` installs a third source-side table,
+     `sluice_change_log_consumers (consumer_id TEXT PRIMARY KEY, applied_id, updated_at)`,
+     and the change-log `schema_version` moves 1 → 2. EVERY trigger-CDC stream publishes
+     its durably-applied frontier there on a one-minute cadence — **whether or not it
+     opted into auto-prune**, because the stream that loses rows is typically the one
+     WITHOUT the flag. The prune then cuts at
+     `min(MIN(applied_id) across the registry, this stream's freshly-read frontier) - keep`.
+   - *Engine-neutral seam.* A new OPTIONAL COMPANION capability
+     `ir.ChangeLogConsumerRegistry` (`RegisterChangeLogConsumer` +
+     `PruneConsumedChangeLogToRegisteredMin`) sits beside `ir.ChangeLogPruner`. A source
+     that exposes the base pruner WITHOUT the companion is **not pruned at all** — the
+     sidecar fails CLOSED and says so at ERROR. A fail-open default would recreate the
+     defect for exactly the engine someone forgot to migrate. The cut decision itself
+     lives once, in `internal/engines/internal/triggercdc.RegistryCut`, shared by all
+     three engines.
+   - *The empty-registry hazard (the primary one).* An empty registry is
+     indistinguishable from one nobody has written to yet, so reading it as "no consumers
+     ⇒ prune everything" would be a worse silent-loss bug than the original. `RegistryCut`
+     REFUSES on an empty registry, and refuses again when the calling stream's own
+     `consumer_id` is absent — a cut derived from peers alone is not a safe bound for the
+     caller.
+   - *Cold-copy window.* Registration starts at the cold-start SNAPSHOT OPEN, not at first
+     apply: the CDC anchor is already taken, a bulk copy can run for hours, and every
+     change captured in that window is one the copying stream must eventually apply. It
+     publishes frontier 0 until the apply loop starts, which blocks every peer's prune —
+     the safe direction.
+   - *Stale consumers are WARNED about, never evicted.* A registration that has gone quiet
+     (>30 min) still holds the prune back and is named at WARN. Auto-eviction would delete
+     the rows a stream that is down for maintenance has not read — the exact silent loss
+     the registry exists to prevent. An operator releases it by deleting its registry row.
+   - *Cross-version.* A NEW binary meeting an UN-MIGRATED change log (no registry table,
+     or `schema_version` < 2) refuses to auto-prune and names `sluice trigger setup` as
+     the migration — which is idempotent, so re-running it IS the migration. The version
+     half of that check is what catches an OLD binary sharing the source: re-running ITS
+     `trigger setup` leaves the registry table but rewrites `schema_version` back to 1,
+     and such a binary streams without ever registering. **UNCLOSED, and stated in the
+     flag help + a startup WARN:** a pre-registry peer that merely STREAMS (never runs
+     setup) leaves no trace on the source, so it cannot be detected — every sync on a
+     shared source must be upgraded before enabling the flag.
+   - *Migration is a maintenance-window action.* On PG the migration's own
+     `CREATE TABLE sluice_change_log_consumers` is picked up by the engine's DDL event
+     trigger as an `op='X'` marker, which a live reader turns into a loud schema-change
+     refusal. Re-running `trigger setup` already drops and recreates the capture triggers,
+     so it was never safe against a live stream; this does not change that, it just makes
+     the reason visible (pinned in `TestItem115_SetupMigratesAV1Install_PG`).
+   - *The operator command is CLAMPED, not gated.* `sluice trigger prune` lowers its
+     computed cut to the registry MIN and prints that it did. It deliberately does NOT
+     fail closed when there is no registry evidence (no table, or no rows): refusing an
+     explicit operator action that has been safe for a single stream since Phase A would
+     be a regression, where clamping is a strict improvement.
+
 ## Consequences
 
 - Operators can bound change-log growth with a scheduled `sluice trigger prune`, safely:
@@ -95,6 +155,11 @@ durable watermark, never the source reader's read cursor.
   both pointed at is now shared.
 - Bounding growth on a continuous sync is automatic once `--auto-prune-change-log` is set
   (Phase B); with the flag off — the default — it stays an explicit operator action.
+- Several syncs may share one trigger-CDC source with auto-prune enabled (Phase C): the
+  prune waits for the slowest registered consumer. The cost is that a stopped-but-still-
+  registered sync holds the change log until an operator removes its registry row, and a
+  source installed before v2 must be migrated (`sluice trigger setup`) before auto-prune
+  will do anything at all.
 
 ## Alternatives considered
 

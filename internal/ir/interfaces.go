@@ -1527,8 +1527,81 @@ type CDCReader interface {
 // A source that doesn't implement this (vanilla PG/MySQL/vitess — they have no
 // change-log) is a typed-nil no-op: the sidecar type-asserts and simply does
 // not run.
+//
+// # Single-consumer semantics (roadmap item 115) — the sidecar no longer calls this
+//
+// The cut this method computes keys on THIS stream's frontier and the change-log
+// `id` alone, so on a change log SHARED by several streams it deletes rows a
+// slower peer has not read. The auto-prune sidecar therefore prunes exclusively
+// through the [ChangeLogConsumerRegistry] companion below, which cuts at the MIN
+// across every registered consumer. This method survives as the BASE surface —
+// its presence is what tells the orchestrator "this source has a change log at
+// all" — and as the implementation the operator-driven `sluice trigger prune`
+// still reaches (which clamps to the registry itself, engine-side). Do not wire
+// it back into an automatic path.
 type ChangeLogPruner interface {
 	PruneConsumedChangeLog(ctx context.Context, durablePositionToken string, keep int64) (deleted int64, err error)
+}
+
+// ChangeLogConsumerRegistry is the OPTIONAL COMPANION to [ChangeLogPruner]
+// (roadmap item 115) that makes automatic pruning safe on a change log shared by
+// MORE THAN ONE stream. A source change log is shared by every sync reading that
+// database; the base pruner cuts at one stream's frontier by `id`, so a slower
+// peer loses everything between the two frontiers — deleted before it reads
+// them, with no way to discover they existed.
+//
+// The companion adds a SOURCE-SIDE consumer registry
+// (`sluice_change_log_consumers`): every trigger-CDC stream records its own
+// durably-applied frontier there, and the prune cuts at the MIN across all
+// registered consumers, so no consumer's unread rows are ever reaped. This is
+// correct for every shape — including two streams replicating the SAME table to
+// different targets, which a table-scoped prune could not close.
+//
+// # Fail CLOSED
+//
+// The sidecar refuses to prune when a source exposes [ChangeLogPruner] but NOT
+// this companion. A fail-OPEN default would recreate the defect for any engine
+// that has not implemented the registry, which is exactly the failure mode the
+// split exists to prevent. Implementors: `pgtrigger` and `sqlite-trigger` (whose
+// CDCReader also serves `d1-trigger` over the D1 transport).
+//
+// # The empty-registry hazard
+//
+// "No rows in the registry" and "nobody has registered yet" are the SAME state,
+// and reading either as "no consumers, prune everything" turns a silent-loss bug
+// into a worse one. Implementations MUST refuse loudly on an empty registry, and
+// MUST refuse when the calling stream's own consumerID is absent from it (the
+// caller cannot vouch for a cut derived from peers alone).
+type ChangeLogConsumerRegistry interface {
+	// RegisterChangeLogConsumer records/refreshes consumerID's durably-applied
+	// frontier in the SOURCE-side registry. durablePositionToken is the TARGET's
+	// durably-persisted CDC position token — decoded by the engine's own codec
+	// (a foreign token is refused loudly, as in [ChangeLogPruner]). An empty
+	// token means "nothing durably applied yet" and registers a frontier of 0,
+	// which blocks every peer's prune until this stream applies something: the
+	// safe direction, and the reason registration starts before the cold copy
+	// rather than at first apply.
+	//
+	// Called by EVERY trigger-CDC stream, on a cadence, whether or not that
+	// stream opted into auto-prune — a peer that never registers is a peer the
+	// pruner cannot see.
+	RegisterChangeLogConsumer(ctx context.Context, consumerID, durablePositionToken string) error
+
+	// PruneConsumedChangeLogToRegisteredMin reaps change-log rows at or below
+	// `min(MIN(applied_id) over the registry, this stream's own frontier) - keep`
+	// and returns the number deleted. It refuses loudly — deleting nothing —
+	// when the registry is absent (a change log installed before the registry
+	// existed), when the source's change-log schema version predates it, when
+	// the registry is empty, or when consumerID is not registered.
+	//
+	// Clamping to the caller's own freshly-read frontier as well as the registry
+	// MIN is deliberate: the registry row for this stream is written from an
+	// EARLIER read of the same token, so the fresh token is an INDEPENDENT bound
+	// on our own frontier — a stale or corrupted registry row cannot push the
+	// cut above what this stream has actually applied.
+	PruneConsumedChangeLogToRegisteredMin(
+		ctx context.Context, consumerID, durablePositionToken string, keep int64,
+	) (deleted int64, err error)
 }
 
 // ChangeApplier applies [Change] events to a target database and

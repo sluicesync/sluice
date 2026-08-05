@@ -507,7 +507,7 @@ func (c *TriggerPruneCmd) Run(g *Globals) error {
 		func() error {
 			sink.PhaseStarted(triggerPhasePrune)
 			var e error
-			out, e = c.runPrune(runCtx, cut)
+			out, e = c.runPrune(runCtx, cut, appliedLastID)
 			if e != nil {
 				return e
 			}
@@ -525,7 +525,7 @@ func (c *TriggerPruneCmd) Run(g *Globals) error {
 		return runErr
 	}
 	if !pretty {
-		printPruneResult(out.label, cut, out.deleted, out.remainingMin, out.remaining, out.vacuumed)
+		printPruneResult(out.label, cut, out.deleted, out.remainingMin, out.remaining, out.vacuumed, out.clampedTo)
 	}
 	return nil
 }
@@ -654,33 +654,54 @@ type triggerPruneOutcome struct {
 	remainingMin int64
 	remaining    int64
 	vacuumed     bool
+
+	// clampedTo is the registered-consumer MIN the engine lowered the
+	// requested cut to (roadmap item 115), or 0 when nothing clamped. Surfaced
+	// so an operator whose prune deleted less than asked is TOLD it was to
+	// protect another sync reading the same change log, rather than left to
+	// wonder.
+	clampedTo int64
 }
 
 // runPrune dispatches the SOURCE-side DELETE to the trigger engine and
 // returns the normalized outcome (the caller renders it).
-func (c *TriggerPruneCmd) runPrune(ctx context.Context, cut int64) (triggerPruneOutcome, error) {
+//
+// frontier is the durably-applied last_id this cut was derived from. It travels
+// alongside the cut as the SELF half of the item-115 registry clamp: the engine
+// substitutes it for this stream's own registry row (a cache the sidecar
+// refreshes once a minute) and clamps the cut to the MIN over the remaining
+// consumers, so an operator prune cannot reap a PEER sync's unread rows and is
+// never blocked by a stale copy of its own frontier.
+func (c *TriggerPruneCmd) runPrune(ctx context.Context, cut, frontier int64) (triggerPruneOutcome, error) {
+	self := pipeline.ChangeLogConsumerID(c.StreamID, c.TargetDriver, c.Target)
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
-		res, err := sqlitetrigger.Prune(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
+		res, err := sqlitetrigger.Prune(ctx, c.Source, sqlitetrigger.PruneOptions{
+			Cut: cut, Vacuum: c.Vacuum, SelfConsumerID: self, SelfFrontier: frontier,
+		})
 		if err != nil {
 			return triggerPruneOutcome{}, err
 		}
-		return triggerPruneOutcome{"sqlite-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed}, nil
+		return triggerPruneOutcome{"sqlite-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed, res.ClampedTo}, nil
 	case triggerDriverD1:
-		res, err := sqlitetrigger.PruneD1(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
+		res, err := sqlitetrigger.PruneD1(ctx, c.Source, sqlitetrigger.PruneOptions{
+			Cut: cut, Vacuum: c.Vacuum, SelfConsumerID: self, SelfFrontier: frontier,
+		})
 		if err != nil {
 			return triggerPruneOutcome{}, err
 		}
-		return triggerPruneOutcome{"d1-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed}, nil
+		return triggerPruneOutcome{"d1-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed, res.ClampedTo}, nil
 	case triggerDriverPostgres:
 		if c.Vacuum {
 			return triggerPruneOutcome{}, errors.New("--vacuum is not supported for postgres-trigger (PG reclaims space via autovacuum); re-run without --vacuum")
 		}
-		res, err := pgtrigger.Prune(ctx, c.Source, pgtrigger.PruneOptions{Cut: cut, Schema: c.Schema})
+		res, err := pgtrigger.Prune(ctx, c.Source, pgtrigger.PruneOptions{
+			Cut: cut, Schema: c.Schema, SelfConsumerID: self, SelfFrontier: frontier,
+		})
 		if err != nil {
 			return triggerPruneOutcome{}, err
 		}
-		return triggerPruneOutcome{"pgtrigger", res.Deleted, res.RemainingMin, res.Remaining, false}, nil
+		return triggerPruneOutcome{"pgtrigger", res.Deleted, res.RemainingMin, res.Remaining, false, res.ClampedTo}, nil
 	default:
 		return triggerPruneOutcome{}, fmt.Errorf("unknown --source-driver %q", c.SourceDriver)
 	}
@@ -723,7 +744,18 @@ func (c *TriggerPruneCmd) runPruneDryRun(ctx context.Context) error {
 }
 
 // printPruneResult renders the operator-facing prune outcome on stdout.
-func printPruneResult(label string, cut, deleted, remainingMin, remaining int64, vacuumed bool) {
+func printPruneResult(label string, cut, deleted, remainingMin, remaining int64, vacuumed bool, clampedTo int64) {
+	if clampedTo > 0 {
+		// Roadmap item 115. The engine lowered the operator's cut to the
+		// slowest REGISTERED consumer of this shared change log. Say so before
+		// the counts, so "it deleted fewer rows than I asked for" is answered
+		// on the spot rather than filed as a bug.
+		fmt.Fprintf(os.Stdout,
+			"%s prune: cut lowered from %d to %d — another sync registered in %s has only applied through %d, "+
+				"and the rows above that are ones it has not read yet\n",
+			label, cut, clampedTo, "sluice_change_log_consumers", clampedTo)
+		cut = clampedTo
+	}
 	if remaining == 0 {
 		fmt.Fprintf(os.Stdout,
 			"%s prune: deleted %d change-log row(s) with id <= %d; change-log now empty\n",

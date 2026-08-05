@@ -1258,6 +1258,23 @@ type Streamer struct {
 	// populated where sourceErrFn is (coldStart / warmResume).
 	changeLogPruner ir.ChangeLogPruner
 
+	// changeLogConsumers is the per-attempt CDC reader cast to
+	// [ir.ChangeLogConsumerRegistry] — the item-115 COMPANION to
+	// changeLogPruner. Two sidecars use it: the always-on registration
+	// ([startChangeLogConsumerRegistration]) that publishes this stream's
+	// applied frontier so a PEER's prune can see it, and the auto-prune, which
+	// prunes through it or not at all (nil here ⇒ the sidecar refuses; see
+	// [startAutoPruneChangeLog]'s fail-closed branch). Reset to nil per attempt
+	// alongside changeLogPruner; populated at the same two sites.
+	changeLogConsumers ir.ChangeLogConsumerRegistry
+
+	// changeLogConsumerStarted guards the once-per-attempt start of the
+	// registration sidecar, which two paths race to reach first: cold start
+	// (before the bulk copy, so a long copy is visible to peers) and the apply
+	// sidecars (the warm-resume path). Both callers run on the runOnce
+	// goroutine, so a plain bool suffices. Reset per attempt.
+	changeLogConsumerStarted bool
+
 	// runOnceFn is a test seam: when non-nil, [Run] / [runWithRetry]
 	// invoke it in place of [runOnce]. Production always leaves it nil
 	// (runOnceCall defaults to s.runOnce), so behaviour is identical;

@@ -190,7 +190,17 @@ func TestTriggerPrune_SQLiteToPostgres_WarmResumeStillExactlyOnce(t *testing.T) 
 	}
 
 	before := sqliteChangeLogIDs(t, src)
-	res, err := sqlitetrigger.Prune(context.Background(), src, sqlitetrigger.PruneOptions{Cut: cut})
+	// The self identity `sluice trigger prune` passes (roadmap item 115): the
+	// stream's own row in the source consumer registry is a cache the sidecar
+	// refreshes once a minute, so the command substitutes the frontier it just
+	// read from the target for it and clamps only against PEER consumers. A
+	// prune that did not pass it would be blocked here by this very stream's
+	// cold-start registration at frontier 0.
+	res, err := sqlitetrigger.Prune(context.Background(), src, sqlitetrigger.PruneOptions{
+		Cut:            cut,
+		SelfConsumerID: ChangeLogConsumerID(streamID, pgEng.Name(), pgTarget),
+		SelfFrontier:   frontier,
+	})
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
@@ -262,7 +272,11 @@ func TestTriggerPrune_SQLiteToPostgres_WarmResumeStillExactlyOnce(t *testing.T) 
 	if !containsID(before0, frontier0) {
 		t.Fatalf("test setup: change-log %v does not contain the frontier id %d (can't pin cut==frontier)", before0, frontier0)
 	}
-	res0, err := sqlitetrigger.Prune(context.Background(), src, sqlitetrigger.PruneOptions{Cut: frontier0}) // keep=0 ⇒ cut == frontier
+	res0, err := sqlitetrigger.Prune(context.Background(), src, sqlitetrigger.PruneOptions{
+		Cut:            frontier0, // keep=0 ⇒ cut == frontier
+		SelfConsumerID: ChangeLogConsumerID(streamID, pgEng.Name(), pgTarget),
+		SelfFrontier:   frontier0,
+	})
 	if err != nil {
 		t.Fatalf("keep=0 Prune: %v", err)
 	}
@@ -415,7 +429,14 @@ func TestTriggerPrune_PgtriggerToPostgres(t *testing.T) {
 	}
 
 	before := pgChangeLogIDs(t, srcDSN)
-	res, err := pgtrigger.Prune(context.Background(), srcDSN, pgtrigger.PruneOptions{Cut: cut})
+	// SelfConsumerID/SelfFrontier as `sluice trigger prune` passes them (roadmap
+	// item 115) — see the sqlite leg's comment for why the command substitutes
+	// its own freshly-read frontier for its cached registry row.
+	res, err := pgtrigger.Prune(context.Background(), srcDSN, pgtrigger.PruneOptions{
+		Cut:            cut,
+		SelfConsumerID: ChangeLogConsumerID(streamID, pgEng.Name(), dstDSN),
+		SelfFrontier:   frontier,
+	})
 	if err != nil {
 		t.Fatalf("pgtrigger.Prune: %v", err)
 	}

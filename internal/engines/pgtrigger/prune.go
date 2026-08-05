@@ -48,6 +48,16 @@ type PruneOptions struct {
 
 	// DryRun reports the current change-log stats without deleting anything.
 	DryRun bool
+
+	// SelfConsumerID / SelfFrontier identify the stream Cut was derived from, in
+	// the source's consumer registry (roadmap item 115). The clamp below
+	// substitutes SelfFrontier for that consumer's registry row — a cache
+	// refreshed on a cadence — and takes the MIN over the rest, so an operator
+	// prune cannot reap a PEER sync's unread rows but is never blocked by a
+	// stale copy of its own frontier. Empty/zero means "no stream identity in
+	// play" (a direct engine call): every registry row then counts as a peer.
+	SelfConsumerID string
+	SelfFrontier   int64
 }
 
 // PruneResult is the operator-facing outcome of a prune.
@@ -55,6 +65,12 @@ type PruneResult struct {
 	Deleted      int64 // rows DELETEd (0 on a dry-run)
 	RemainingMin int64 // MIN(id) of the change-log after the prune (0 when empty)
 	Remaining    int64 // COUNT(*) of the change-log after the prune
+
+	// ClampedTo is the registry MIN the requested Cut was lowered to
+	// (roadmap item 115), or 0 when no clamp applied. Reported so the CLI
+	// can tell the operator its cut was reduced to protect a peer sync
+	// rather than silently deleting less than asked.
+	ClampedTo int64
 }
 
 // Prune reaps durably-applied rows from the source PG change-log. It connects to
@@ -103,6 +119,20 @@ func Prune(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, er
 		return res, nil
 	}
 
+	// Roadmap item 115: clamp the operator's cut to the slowest REGISTERED
+	// consumer's frontier, so an explicit prune cannot reap a peer sync's
+	// unread rows either. Unlike the automatic path this does NOT fail closed
+	// when there is no registry evidence (no table, or no rows): refusing here
+	// would break the single-stream operator workflow that has been safe since
+	// ADR-0137 Phase A. The clamp is reported so the CLI can say what happened.
+	cut := opts.Cut
+	if registryMin, ok, err := pgRegisteredConsumerMin(ctx, db, schema, opts.SelfConsumerID, opts.SelfFrontier); err != nil {
+		return nil, err
+	} else if ok && registryMin < cut {
+		cut = registryMin
+		res.ClampedTo = registryMin
+	}
+
 	// id <= cut (not <): cut is the durably-applied frontier minus a margin, so
 	// id == cut is itself durably applied and safe to remove. Batched (P-1) with
 	// no time budget — the operator asked for this prune, so it runs to
@@ -112,7 +142,7 @@ func Prune(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, er
 		return nil, fmt.Errorf("pgtrigger: prune: min id: %w", err)
 	}
 	if res.Deleted, _, err = triggercdc.InBatches(
-		ctx, minID, opts.Cut, pgPruneBatchSize, 0, pgPruneBatch(db, tableRef),
+		ctx, minID, cut, pgPruneBatchSize, 0, pgPruneBatch(db, tableRef),
 	); err != nil {
 		return nil, fmt.Errorf("pgtrigger: prune: delete: %w", err)
 	}

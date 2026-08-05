@@ -82,7 +82,11 @@ func TestRenderSetupDDL_ChangeLogShape(t *testing.T) {
 		`CREATE TABLE IF NOT EXISTS "sluice_change_log"`,
 		"id           INTEGER PRIMARY KEY AUTOINCREMENT",
 		`CREATE TABLE IF NOT EXISTS "sluice_change_log_meta"`,
-		`INSERT INTO "sluice_change_log_meta" (singleton_pk, schema_version) VALUES (1, 1)`,
+		// Item 115: the consumer registry ships with the change log, and the
+		// version pin is what tells a newer binary the registry is there.
+		`CREATE TABLE IF NOT EXISTS "sluice_change_log_consumers"`,
+		"consumer_id  TEXT PRIMARY KEY",
+		`INSERT INTO "sluice_change_log_meta" (singleton_pk, schema_version) VALUES (1, 2)`,
 	} {
 		if !strings.Contains(all, want) {
 			t.Errorf("setup DDL missing fragment:\n  %s", want)

@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -204,6 +205,18 @@ func (s *spyExecutor) checkpointWAL(context.Context) error {
 	return nil
 }
 func (s *spyExecutor) vacuum(context.Context) error { return nil }
+func (s *spyExecutor) upsertConsumer(context.Context, string, int64) error {
+	return nil
+}
+
+func (s *spyExecutor) consumerRegistryState(context.Context) (exists bool, ver int, err error) {
+	return true, triggercdc.ConsumerRegistrySchemaVer, nil
+}
+
+func (s *spyExecutor) readConsumers(context.Context) ([]triggercdc.Consumer, error) {
+	return nil, nil
+}
+
 func (s *spyExecutor) changeLogStats(context.Context) (minID, count int64, err error) {
 	return 0, 0, nil
 }

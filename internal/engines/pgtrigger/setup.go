@@ -29,7 +29,13 @@ const (
 	CapturePrefixRow   = "sluice_capture_" // for per-table CREATE TRIGGER names
 	CaptureTriggerRow  = "sluice_capture"  // per-table row-trigger name
 	CaptureTriggerDDL  = "sluice_capture_ddl_trg"
-	ChangeLogSchemaVer = 1 // schema-version pin recorded in the meta table
+	// ChangeLogSchemaVer is the schema-version pin recorded in the meta
+	// table. v1 was the original change-log + meta pair; v2 (roadmap item
+	// 115) adds [ChangeLogConsumersTable], the source-side registry the
+	// auto-prune cuts against. Setup is idempotent, so re-running it against
+	// a v1 install IS the migration: the CREATE TABLE IF NOT EXISTS adds the
+	// registry and the meta upsert lifts the version.
+	ChangeLogSchemaVer = 2
 )
 
 // CapturePayload selects how much of each changed row the capture
@@ -391,7 +397,7 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 // writes into sluice_change_log, so a trigger there recurses to a stack-depth
 // failure, and sluice_change_log_meta is engine state, not user data.
 func isEngineInternalTable(name string) bool {
-	return name == ChangeLogTable || name == ChangeLogMetaTable
+	return name == ChangeLogTable || name == ChangeLogMetaTable || name == ChangeLogConsumersTable
 }
 
 // filterEngineInternalTables splits a caller-supplied table list into the
@@ -471,6 +477,19 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
     installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT sluice_change_log_meta_singleton CHECK (singleton_pk = TRUE)
 )`,
+		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
+		// trigger-CDC stream reading this database records its own
+		// durably-applied frontier here and the auto-prune cuts at the MIN
+		// across all of them, so a slower peer's unread rows are never
+		// reaped. Created before the meta upsert below lifts
+		// schema_version to 2, so the version can never claim a registry
+		// that isn't there.
+		"CREATE TABLE IF NOT EXISTS " + tableRef(ChangeLogConsumersTable) + ` (
+    consumer_id  TEXT PRIMARY KEY,
+    applied_id   BIGINT NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+)`,
+
 		fmt.Sprintf(
 			"INSERT INTO %s (singleton_pk, schema_version) VALUES (TRUE, %d) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version",
 			tableRef(ChangeLogMetaTable), ChangeLogSchemaVer,
@@ -869,6 +888,7 @@ func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
 			out,
 			"DROP TABLE IF EXISTS "+quoteIdent(schema)+"."+quoteIdent(ChangeLogTable),
 			"DROP TABLE IF EXISTS "+quoteIdent(schema)+"."+quoteIdent(ChangeLogMetaTable),
+			"DROP TABLE IF EXISTS "+quoteIdent(schema)+"."+quoteIdent(ChangeLogConsumersTable),
 		)
 	}
 	return out

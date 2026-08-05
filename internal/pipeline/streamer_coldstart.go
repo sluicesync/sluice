@@ -163,6 +163,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// Roadmap item 115: register this stream in the SOURCE's change-log
+	// consumer registry NOW — before the bulk copy, not after it. The CDC
+	// anchor was just taken; every change captured from here on is one this
+	// stream must eventually apply, and a cold copy can run for hours. A peer
+	// sync pruning that shared change log has to see this stream for the WHOLE
+	// window, or it reaps rows past our anchor while we are still copying. The
+	// registration publishes a frontier of 0 until the apply loop starts, which
+	// blocks a peer's prune entirely — the safe direction. No-op for every
+	// non-trigger source (no registry surface) and idempotent per attempt.
+	s.captureChangeLogConsumerRegistry(stream.Changes)
+	s.startChangeLogConsumerRegistration(ctx, streamID, applier)
+
 	// ---- Post-slot publication re-verification (audit 2026-07-23
 	// D0-7). The EnsurePublication above ran BEFORE this stream's slot
 	// existed, so a simultaneously cold-starting peer sharing the
@@ -1246,6 +1258,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if p, ok := stream.Changes.(ir.ChangeLogPruner); ok {
 		s.changeLogPruner = p
 	}
+	// Roadmap item 115: and its consumer-registry companion. Cold start
+	// normally captures this far earlier (coldStartOpenSnapshot, so a long copy
+	// is visible to a peer's pruner); this re-capture covers the paths that
+	// reach CDC without it and is a no-op when it already ran.
+	s.captureChangeLogConsumerRegistry(stream.Changes)
 	// stream stays alive for the rest of Run; the returned stop closure
 	// closes it when Run unwinds, joining the engine-side streaming
 	// goroutine deterministically (no longer left to process-exit

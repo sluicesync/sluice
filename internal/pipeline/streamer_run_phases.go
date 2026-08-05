@@ -233,6 +233,10 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	s.sourceReshard = nil
 	// ADR-0137 Phase B: same per-attempt reset for the change-log-pruner handle.
 	s.changeLogPruner = nil
+	// Item 115: and for its consumer-registry companion + the once-guard on the
+	// registration sidecar (a new attempt opens a new reader and must re-register).
+	s.changeLogConsumers = nil
+	s.changeLogConsumerStarted = false
 
 	// Apply the sluice-prefix convention to the operator-supplied
 	// slot name (v0.10.2). Empty stays empty (engine default);
@@ -949,6 +953,14 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// (--auto-prune-change-log off) or a non-trigger source ⇒ no goroutine.
 	// Failure-isolated: a prune error is logged-and-swallowed, never able to
 	// stall or crash the stream.
+	// Roadmap item 115: publish this stream's applied frontier into the source's
+	// change-log consumer registry so a PEER sync's auto-prune cannot reap rows
+	// this stream has not read. Unconditional for a trigger-CDC source — the
+	// stream that loses rows is usually the one WITHOUT the prune flag. The
+	// cold-start path already started it before the copy; this is the
+	// warm-resume entry point, and the once-guard makes the second call a no-op.
+	s.startChangeLogConsumerRegistration(applyCtx, streamID, applier)
+
 	s.startAutoPruneChangeLog(applyCtx, streamID, applier)
 
 	// ADR-0107 items 35 (rolling-history recorder) + 36 (threshold alerter)

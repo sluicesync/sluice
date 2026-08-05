@@ -23,6 +23,7 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -226,6 +227,17 @@ func TestAutoPruneChangeLog_PgtriggerToPostgres(t *testing.T) {
 		t.Fatalf("pgtrigger CDC batch never converged: %v", pgEventIDs(t, dstDSN))
 	}
 
+	// (a0) Roadmap item 115: the stream published itself to the SOURCE's consumer
+	// registry — unprompted, as every trigger-CDC stream does — under the id the
+	// prune keys on. Without that row the prune below would refuse (fail closed),
+	// so this is what makes (a) meaningful rather than a coincidence.
+	wantConsumer := ChangeLogConsumerID(streamID, pgEng.Name(), dstDSN)
+	if !waitForPgRegisteredConsumer(t, srcDSN, wantConsumer, 30*time.Second) {
+		cancel1()
+		t.Fatalf("the stream never registered itself as %q in %s.%s on the source",
+			wantConsumer, "public", pgtrigger.ChangeLogConsumersTable)
+	}
+
 	// (a) The source change-log shrinks in-stream (MIN(id) advances past 1).
 	if !waitForPgChangeLogMinAdvance(t, srcDSN, 1, 30*time.Second) {
 		cancel1()
@@ -281,6 +293,31 @@ func TestAutoPruneChangeLog_PgtriggerToPostgres(t *testing.T) {
 
 // waitForPgChangeLogMinAdvance polls the pgtrigger source change-log until its
 // MIN(id) is strictly greater than aboveID, or the timeout elapses.
+// waitForPgRegisteredConsumer polls the SOURCE's item-115 consumer registry
+// until consumerID appears, or the timeout elapses. The registration is what
+// makes this stream visible to a PEER sync's prune — and what keeps its own
+// prune from failing closed.
+func waitForPgRegisteredConsumer(t *testing.T, dsn, consumerID string, timeout time.Duration) bool {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var n int
+		err := db.QueryRowContext(context.Background(),
+			`SELECT count(*) FROM public.`+pgtrigger.ChangeLogConsumersTable+` WHERE consumer_id = $1`,
+			consumerID).Scan(&n)
+		if err == nil && n == 1 {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
 func waitForPgChangeLogMinAdvance(t *testing.T, dsn string, aboveID int64, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

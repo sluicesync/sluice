@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Several syncs can now share one trigger-CDC source with `--auto-prune-change-log` on, without the fast one deleting the slow one's unread rows.** A source change log is shared by every sync reading that database, and the prune cut at THIS stream's durably-applied frontier by change-log id — so on the staged/wave shape the docs recommend, the faster sync reaped everything between the two frontiers before the slower one read it. Silent, permanent, and undiscoverable from the slow side: it just never sees those changes. v0.110.0 added a warning; this fixes it. `sluice trigger setup` now installs a `sluice_change_log_consumers` table on the source (change-log `schema_version` 1 → 2), every trigger-CDC stream publishes its applied frontier there once a minute — **whether or not that stream enabled auto-prune**, because the sync that loses rows is usually the one without the flag — and the prune cuts at the MIN across every registered consumer, clamped to the pruning stream's own freshly-read frontier. Registration starts at the cold-start snapshot open rather than at first apply, so a peer's multi-hour bulk copy holds the log for its whole duration.
+
+Two things fail CLOSED rather than guessing. A source engine that can be pruned but does not implement the new consumer-registry surface is not pruned at all (logged at ERROR) — a fallback to the old cut would recreate the bug for exactly the engine someone forgot to migrate. And an EMPTY registry is refused rather than read as "no consumers, prune everything": empty and "nobody has registered yet" are the same observable state, and reading it the other way would have been a worse silent-loss bug than the original. A change log installed before the registry existed is likewise refused, naming `sluice trigger setup` — which is idempotent, so re-running it IS the migration. Do that with the syncs stopped: re-running setup drops and recreates the capture triggers, and on Postgres the migration's own `CREATE TABLE` is captured as a DDL marker a live reader refuses on.
+
+**What this does not close, and it is in the flag's help text:** a peer running a sluice older than the registry never registers and leaves no trace on the source, so it cannot be detected — upgrade every sync on a shared source before enabling the flag. A peer that ran an *older* `sluice trigger setup` is caught, because that rewrites the change log's schema version below the floor. A stopped-but-still-registered sync holds the change log until an operator deletes its registry row; sluice warns after 30 minutes and never evicts it, since eviction would delete the rows a sync down for maintenance has not read.
+
+The operator-run `sluice trigger prune` is clamped to the registry MIN the same way and prints when its cut was lowered. It deliberately does not refuse when there is no registry to consult — that path has been safe for a single stream since it shipped, and refusing would break it.
+
 ## [0.112.0] - 2026-08-05
 
 Three fixes found by reading rather than by a failing test, and the one that matters most is a backup you could take, verify clean, and never restore.

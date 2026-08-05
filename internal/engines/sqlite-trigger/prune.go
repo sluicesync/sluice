@@ -48,6 +48,16 @@ type PruneOptions struct {
 
 	// DryRun reports the current change-log stats without deleting anything.
 	DryRun bool
+
+	// SelfConsumerID / SelfFrontier identify the stream Cut was derived from, in
+	// the source's consumer registry (roadmap item 115). The clamp below
+	// substitutes SelfFrontier for that consumer's registry row — a cache
+	// refreshed on a cadence — and takes the MIN over the rest, so an operator
+	// prune cannot reap a PEER sync's unread rows but is never blocked by a
+	// stale copy of its own frontier. Empty/zero means "no stream identity in
+	// play" (a direct engine call): every registry row then counts as a peer.
+	SelfConsumerID string
+	SelfFrontier   int64
 }
 
 // PruneResult is the operator-facing outcome of a prune.
@@ -56,6 +66,12 @@ type PruneResult struct {
 	Vacuumed     bool  // VACUUM was applied
 	RemainingMin int64 // MIN(id) of the change-log after the prune (0 when empty)
 	Remaining    int64 // COUNT(*) of the change-log after the prune
+
+	// ClampedTo is the registry MIN the requested Cut was lowered to
+	// (roadmap item 115), or 0 when no clamp applied. Reported so the CLI
+	// can tell the operator its cut was reduced to protect a peer sync
+	// rather than silently deleting less than asked.
+	ClampedTo int64
 }
 
 // Prune reaps durably-applied rows from a local SQLite file's change-log.
@@ -166,6 +182,22 @@ func prune(ctx context.Context, b backend, opts PruneOptions) (*PruneResult, err
 		return res, nil
 	}
 
+	// Roadmap item 115: clamp the operator's cut to the slowest REGISTERED
+	// consumer's frontier, so an explicit prune cannot reap a peer sync's
+	// unread rows either. Unlike the automatic path this does NOT fail closed
+	// when there is no registry evidence (no table, or no rows): refusing here
+	// would break the single-stream operator workflow that has been safe since
+	// ADR-0137 Phase A. The clamp is reported so the CLI can say what happened.
+	cut := opts.Cut
+	registryMin, ok, err := registeredConsumerMin(ctx, exec, opts.SelfConsumerID, opts.SelfFrontier)
+	if err != nil {
+		return nil, fmt.Errorf("%s: prune: consumer registry: %w", b.driver, err)
+	}
+	if ok && registryMin < cut {
+		cut = registryMin
+		res.ClampedTo = registryMin
+	}
+
 	// Batched (P-1) with no time budget — the operator asked for this prune,
 	// so it runs to completion.
 	minID, err := exec.minChangeLogID(ctx)
@@ -173,7 +205,7 @@ func prune(ctx context.Context, b backend, opts PruneOptions) (*PruneResult, err
 		return nil, fmt.Errorf("%s: prune: min id: %w", b.driver, err)
 	}
 	if res.Deleted, _, err = triggercdc.InBatches(
-		ctx, minID, opts.Cut, exec.pruneBatchSize(), 0, exec.pruneChangeLogBatch,
+		ctx, minID, cut, exec.pruneBatchSize(), 0, exec.pruneChangeLogBatch,
 	); err != nil {
 		return nil, fmt.Errorf("%s: prune: delete: %w", b.driver, err)
 	}

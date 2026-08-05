@@ -68,9 +68,13 @@ func ControlTableNames() []string {
 
 		// The trigger-CDC capture tables (pgtrigger.ChangeLogTable /
 		// ChangeLogMetaTable; the sqlite trio adds ChangeLogColumnsTable).
+		// triggercdc.ConsumerRegistryTable (roadmap item 115) is the
+		// source-side registry every trigger-CDC stream records its applied
+		// frontier in so the auto-prune can cut at the MIN across consumers.
 		"sluice_change_log",
 		"sluice_change_log_meta",
 		"sluice_change_log_columns",
+		"sluice_change_log_consumers",
 	}
 }
 

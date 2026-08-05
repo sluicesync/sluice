@@ -6,6 +6,7 @@ package sqlitetrigger
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -48,6 +50,12 @@ type mockD1 struct {
 	// SQL is answered arithmetically against it.
 	pruneLo int64
 	pruneHi int64
+
+	// Item 115 consumer registry. schemaVer 0 means "answer the current
+	// registry floor" so pre-existing tests need no change; consumers is the
+	// registry snapshot the MIN is computed over (empty = nobody registered).
+	schemaVer int
+	consumers []triggercdc.Consumer
 
 	ddl          []string        // captured non-SELECT statements (setup/teardown DDL)
 	pollSQL      []string        // captured poll SELECTs
@@ -91,6 +99,25 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 	switch {
 	case sql == "SELECT 1":
 		return http.StatusOK, d1OK(nil)
+	// Item 115: the consumer registry. Dispatched before the generic
+	// branches — its projection carries no COUNT/MIN(id) marker, and the
+	// registry read must not fall through to the poll branch.
+	case strings.Contains(sql, "schema_version"):
+		ver := m.schemaVer
+		if ver == 0 {
+			ver = triggercdc.ConsumerRegistrySchemaVer
+		}
+		return http.StatusOK, d1OK([]map[string]any{{"v": strconv.Itoa(ver)}})
+	case strings.Contains(sql, ChangeLogConsumersTable):
+		rows := make([]map[string]any, 0, len(m.consumers))
+		for _, c := range m.consumers {
+			rows = append(rows, map[string]any{
+				"consumer_id": c.ID,
+				"applied_id":  strconv.FormatInt(c.AppliedID, 10),
+				"age_seconds": strconv.FormatInt(c.AgeSeconds, 10),
+			})
+		}
+		return http.StatusOK, d1OK(rows)
 	case strings.Contains(sql, "sluice_change_log_columns"):
 		rows := make([]map[string]any, 0, len(m.fingerprints))
 		for _, fp := range m.fingerprints {
@@ -361,7 +388,11 @@ func TestD1Setup_IssuesExpectedDDL(t *testing.T) {
 		"id           INTEGER PRIMARY KEY AUTOINCREMENT",
 		`CREATE TABLE IF NOT EXISTS "sluice_change_log_meta"`,
 		`CREATE TABLE IF NOT EXISTS "sluice_change_log_columns"`,
-		`INSERT INTO "sluice_change_log_meta" (singleton_pk, schema_version) VALUES (1, 1)`,
+		// Item 115: the consumer registry installs over the D1 transport too —
+		// the d1-trigger engine shares this installer, so a registry that only
+		// reached the local file would leave D1 sources unable to register.
+		`CREATE TABLE IF NOT EXISTS "sluice_change_log_consumers"`,
+		`INSERT INTO "sluice_change_log_meta" (singleton_pk, schema_version) VALUES (1, 2)`,
 		`CREATE TRIGGER "sluice_capture_t_ins" AFTER INSERT ON "t"`,
 		`CREATE TRIGGER "sluice_capture_t_upd" AFTER UPDATE ON "t"`,
 		`CREATE TRIGGER "sluice_capture_t_del" AFTER DELETE ON "t"`,
@@ -793,5 +824,96 @@ func TestD1Poll_BatchClampedToTransportCeiling(t *testing.T) {
 	defer m.mu.Unlock()
 	if !strings.Contains(m.pollSQL[0], "LIMIT "+strconv.Itoa(d1PollBatchSize)) {
 		t.Errorf("poll SQL sent to D1 = %q; want the clamped LIMIT %d", m.pollSQL[0], d1PollBatchSize)
+	}
+}
+
+// TestD1Item115_PruneCutsAtTheRegisteredMinOverHTTP is the d1-trigger half of
+// the item-115 sibling sweep. The registry LOGIC is shared (this package's
+// CDCReader serves both the local file and D1) and pinned on a real SQLite file
+// in consumers_test.go; what is NOT shared is the D1 transport's JSON decode of
+// the registry snapshot — exact-TEXT applied_id, exact-TEXT age, the
+// schema-version probe. This pins that decode end to end: a slow peer at 20 and
+// a fast peer at 100 must produce a cut of 20 over HTTP, not 100.
+func TestD1Item115_PruneCutsAtTheRegisteredMinOverHTTP(t *testing.T) {
+	m := &mockD1{
+		exists: true, pruneLo: 1, pruneHi: 100,
+		consumers: []triggercdc.Consumer{
+			{ID: "fast-sync", AppliedID: 100},
+			{ID: "slow-sync", AppliedID: 20},
+		},
+	}
+	conn := startMockD1(t, m)
+	r := &CDCReader{b: d1TestBackend(conn, &ir.Schema{})}
+
+	deleted, err := r.PruneConsumedChangeLogToRegisteredMin(bg(), "fast-sync", `{"last_id":100}`, 0)
+	if err != nil {
+		t.Fatalf("prune over D1: %v", err)
+	}
+	if deleted != 20 {
+		t.Errorf("deleted = %d; want 20 (the slow peer's registered frontier, decoded over HTTP)", deleted)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, d := range m.pruneDeletes {
+		if d.upper > 20 {
+			t.Errorf("a DELETE reached id %d, above the slowest consumer's frontier 20: %v", d.upper, m.pruneDeletes)
+		}
+	}
+}
+
+// TestD1Item115_UnmigratedChangeLogFailsClosedOverHTTP pins the fail-closed
+// migration gate on the D1 transport: schema_version 1 (what a pre-registry
+// binary writes — the mock answers the version the test sets, not one this code
+// produced) refuses the prune with nothing deleted.
+func TestD1Item115_UnmigratedChangeLogFailsClosedOverHTTP(t *testing.T) {
+	m := &mockD1{
+		exists: true, pruneLo: 1, pruneHi: 100,
+		schemaVer: 1,
+		consumers: []triggercdc.Consumer{{ID: "self", AppliedID: 100}},
+	}
+	conn := startMockD1(t, m)
+	r := &CDCReader{b: d1TestBackend(conn, &ir.Schema{})}
+
+	deleted, err := r.PruneConsumedChangeLogToRegisteredMin(bg(), "self", `{"last_id":100}`, 0)
+	if err == nil {
+		t.Fatal("prune against a v1 change log over D1 returned nil; want a loud refusal")
+	}
+	if !errors.Is(err, triggercdc.ErrConsumerRegistryUnavailable) {
+		t.Errorf("error %v does not wrap ErrConsumerRegistryUnavailable", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d; a refused prune must delete nothing", deleted)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pruneDeletes) != 0 {
+		t.Errorf("a refused prune issued DELETEs: %v", m.pruneDeletes)
+	}
+}
+
+// TestD1Item115_RegistrationBindsTheFrontierAsExactText pins the ADR-0132
+// discipline on the new write path: the frontier crosses the D1 wire as a
+// STRING param, never a JSON number.
+func TestD1Item115_RegistrationBindsTheFrontierAsExactText(t *testing.T) {
+	m := &mockD1{exists: true}
+	conn := startMockD1(t, m)
+	r := &CDCReader{b: d1TestBackend(conn, &ir.Schema{})}
+
+	if err := r.RegisterChangeLogConsumer(bg(), "c1", `{"last_id":9007199254740993}`); err != nil {
+		t.Fatalf("register over D1: %v", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var seen bool
+	for _, body := range m.bodies {
+		if strings.Contains(body, "9007199254740993") {
+			seen = true
+			if !strings.Contains(body, `"9007199254740993"`) {
+				t.Errorf("registration bound the frontier as a JSON number: %s", body)
+			}
+		}
+	}
+	if !seen {
+		t.Fatalf("no registration request carried the frontier; bodies = %v", m.bodies)
 	}
 }

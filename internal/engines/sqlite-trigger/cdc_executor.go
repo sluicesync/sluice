@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strconv"
 
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -77,6 +78,16 @@ type executor interface {
 	// changeLogStats returns the post-prune MIN(id) (0 on an empty change-log)
 	// and total row count, for the operator-facing prune report.
 	changeLogStats(ctx context.Context) (minID, count int64, err error)
+	// upsertConsumer records/refreshes one consumer's durably-applied frontier
+	// in the source-side registry (roadmap item 115).
+	upsertConsumer(ctx context.Context, consumerID string, appliedID int64) error
+	// consumerRegistryState reports whether the registry table exists and the
+	// change log's recorded schema_version — the two halves of the fail-closed
+	// migration gate. ver is 0 when the meta row is absent.
+	consumerRegistryState(ctx context.Context) (exists bool, ver int, err error)
+	// readConsumers snapshots the registry, with each row's age measured by the
+	// SOURCE's own clock (immune to skew between the hosts running the syncs).
+	readConsumers(ctx context.Context) ([]triggercdc.Consumer, error)
 	close() error
 }
 
@@ -198,6 +209,32 @@ const (
 		`AND name LIKE 'sluice\_capture\_%' ESCAPE '\' ORDER BY name`
 	// readFingerprintsSQL reads the per-table captured-column fingerprints.
 	readFingerprintsSQL = `SELECT tbl, columns FROM "` + ChangeLogColumnsTable + `" ORDER BY tbl`
+	// tableExistsSQL probes for any table by exact name (the change-log probe
+	// generalised — the consumer registry uses the same shape).
+	tableExistsSQL = changeLogExistsSQL
+
+	// upsertConsumerSQL records/refreshes one consumer's frontier (item 115).
+	// applied_id is OVERWRITTEN, never max()'d forward: the writer of a row is
+	// the consumer itself, so there is no rogue writer to defend against —
+	// while a frontier that legitimately moves BACKWARD (an operator restored
+	// an older target and resumed the stream) must be able to lower the
+	// registry, or the next prune would cut above what that target has applied.
+	upsertConsumerSQL = `INSERT INTO "` + ChangeLogConsumersTable + `" (consumer_id, applied_id, updated_at) ` +
+		`VALUES (?, ?, strftime('%Y-%m-%d %H:%M:%f', 'now')) ` +
+		`ON CONFLICT (consumer_id) DO UPDATE SET applied_id = excluded.applied_id, updated_at = excluded.updated_at`
+
+	// readConsumersSQL snapshots the registry. applied_id and the age are
+	// projected as exact TEXT so the D1 transport never routes an integer it
+	// keys on through a JSON number (ADR-0132); the local path parses the same
+	// text, so both transports run byte-identical SQL. The age is the SOURCE
+	// clock's (julianday('now') - julianday(updated_at)), floored at 0.
+	readConsumersSQL = `SELECT consumer_id, CAST(applied_id AS TEXT) AS applied_id, ` +
+		`CAST(CAST(max(0, (julianday('now') - julianday(updated_at)) * 86400) AS INTEGER) AS TEXT) AS age_seconds ` +
+		`FROM "` + ChangeLogConsumersTable + `"`
+
+	// readSchemaVersionSQL reads the change-log schema-version pin.
+	readSchemaVersionSQL = `SELECT CAST(schema_version AS TEXT) AS v FROM "` +
+		ChangeLogMetaTable + `" WHERE singleton_pk = 1`
 )
 
 // --- localExecutor: the Phase-1 *sql.DB transport ---------------------------
@@ -363,6 +400,55 @@ func (e *localExecutor) changeLogStats(ctx context.Context) (minID, count int64,
 		minID = m.Int64
 	}
 	return minID, count, nil
+}
+
+func (e *localExecutor) upsertConsumer(ctx context.Context, consumerID string, appliedID int64) error {
+	_, err := e.db.ExecContext(ctx, upsertConsumerSQL, consumerID, appliedID)
+	return err
+}
+
+func (e *localExecutor) consumerRegistryState(ctx context.Context) (exists bool, ver int, err error) {
+	var name string
+	err = e.db.QueryRowContext(ctx, tableExistsSQL, ChangeLogConsumersTable).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	var verText string
+	err = e.db.QueryRowContext(ctx, readSchemaVersionSQL).Scan(&verText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if ver, err = strconv.Atoi(verText); err != nil {
+		return false, 0, fmt.Errorf("change-log schema_version %q is not an integer: %w", verText, err)
+	}
+	return true, ver, nil
+}
+
+func (e *localExecutor) readConsumers(ctx context.Context) ([]triggercdc.Consumer, error) {
+	rows, err := e.db.QueryContext(ctx, readConsumersSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []triggercdc.Consumer
+	for rows.Next() {
+		var id, appliedText, ageText string
+		if err := rows.Scan(&id, &appliedText, &ageText); err != nil {
+			return nil, err
+		}
+		c, err := decodeConsumerRow(id, appliedText, ageText)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func (e *localExecutor) close() error {
@@ -610,6 +696,90 @@ func (e *d1Executor) changeLogStats(ctx context.Context) (minID, count int64, er
 		return 0, 0, fmt.Errorf("d1-trigger: decode change-log count: %w", err)
 	}
 	return minID, count, nil
+}
+
+func (e *d1Executor) upsertConsumer(ctx context.Context, consumerID string, appliedID int64) error {
+	// applied_id crosses as exact TEXT (never a JSON number); the column's
+	// INTEGER affinity converts it on the way in.
+	return e.conn.Exec(ctx, upsertConsumerSQL, consumerID, strconv.FormatInt(appliedID, 10))
+}
+
+func (e *d1Executor) consumerRegistryState(ctx context.Context) (exists bool, ver int, err error) {
+	rows, err := e.conn.Query(ctx, tableExistsSQL, ChangeLogConsumersTable)
+	if err != nil {
+		return false, 0, err
+	}
+	if len(rows) == 0 {
+		return false, 0, nil
+	}
+	verRows, err := e.conn.Query(ctx, readSchemaVersionSQL)
+	if err != nil {
+		return false, 0, err
+	}
+	if len(verRows) == 0 {
+		return true, 0, nil
+	}
+	verText, ok, err := d1CellString(verRows[0]["v"])
+	if err != nil {
+		return false, 0, err
+	}
+	if !ok {
+		return true, 0, nil
+	}
+	if ver, err = strconv.Atoi(verText); err != nil {
+		return false, 0, fmt.Errorf("d1-trigger: change-log schema_version %q is not an integer: %w", verText, err)
+	}
+	return true, ver, nil
+}
+
+func (e *d1Executor) readConsumers(ctx context.Context) ([]triggercdc.Consumer, error) {
+	rows, err := e.conn.Query(ctx, readConsumersSQL)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]triggercdc.Consumer, 0, len(rows))
+	for _, row := range rows {
+		id, _, err := d1CellString(row["consumer_id"])
+		if err != nil {
+			return nil, fmt.Errorf("d1-trigger: decode consumer_id: %w", err)
+		}
+		appliedText, _, err := d1CellString(row["applied_id"])
+		if err != nil {
+			return nil, fmt.Errorf("d1-trigger: decode consumer applied_id: %w", err)
+		}
+		ageText, _, err := d1CellString(row["age_seconds"])
+		if err != nil {
+			return nil, fmt.Errorf("d1-trigger: decode consumer age: %w", err)
+		}
+		c, err := decodeConsumerRow(id, appliedText, ageText)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// decodeConsumerRow turns one registry row's exact-TEXT projection into a
+// [triggercdc.Consumer]. Shared by both transports so the local path and the D1
+// path can never disagree on what a registry row MEANS — the same reason the SQL
+// itself is shared. An unparseable frontier is refused loudly rather than
+// defaulted: a consumer whose frontier we cannot read must not be silently
+// treated as one at id 0 (harmless) or dropped from the MIN (silent loss).
+func decodeConsumerRow(id, appliedText, ageText string) (triggercdc.Consumer, error) {
+	applied, err := strconv.ParseInt(appliedText, 10, 64)
+	if err != nil {
+		return triggercdc.Consumer{}, fmt.Errorf(
+			"change-log consumer %q has an unreadable applied_id %q: %w", id, appliedText, err,
+		)
+	}
+	age, err := strconv.ParseInt(ageText, 10, 64)
+	if err != nil {
+		// The age is advisory (it only drives a staleness WARN); an
+		// unreadable one must not take the whole prune down.
+		age = 0
+	}
+	return triggercdc.Consumer{ID: id, AppliedID: applied, AgeSeconds: age}, nil
 }
 
 // d1IntCell decodes a CAST(... AS TEXT) integer cell to int64. A NULL/absent

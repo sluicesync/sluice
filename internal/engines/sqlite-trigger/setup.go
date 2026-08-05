@@ -34,7 +34,12 @@ const (
 	CaptureTriggerPrefix = "sluice_capture_"
 
 	// ChangeLogSchemaVer is the schema-version pin recorded in the meta table.
-	ChangeLogSchemaVer = 1
+	// v1 was the original change-log + meta + columns trio; v2 (roadmap item
+	// 115) adds [ChangeLogConsumersTable], the source-side registry the
+	// auto-prune cuts against. Setup is idempotent, so re-running it against a
+	// v1 install IS the migration: the CREATE TABLE IF NOT EXISTS adds the
+	// registry and the meta upsert lifts the version.
+	ChangeLogSchemaVer = 2
 )
 
 // triggerOp is one of the three captured DML operations, carrying the SQLite
@@ -251,8 +256,8 @@ func preflight(tables []*ir.Table) []TableRefusal {
 // renderSetupDDL produces the ordered DDL that installs the engine. Order
 // matters: the change-log table must exist before the triggers reference it.
 func renderSetupDDL(tables []*ir.Table) []string {
-	// 4 base statements + 7 per table (DROP+CREATE×3 triggers + 1 fingerprint upsert).
-	out := make([]string, 0, 4+len(tables)*(2*len(triggerOps)+1))
+	// 5 base statements + 7 per table (DROP+CREATE×3 triggers + 1 fingerprint upsert).
+	out := make([]string, 0, 5+len(tables)*(2*len(triggerOps)+1))
 	out = append(
 		out,
 		// id is INTEGER PRIMARY KEY AUTOINCREMENT — the monotonic, never-reused
@@ -279,6 +284,17 @@ func renderSetupDDL(tables []*ir.Table) []string {
 		"CREATE TABLE IF NOT EXISTS "+quoteIdent(ChangeLogColumnsTable)+` (
     tbl     TEXT PRIMARY KEY,
     columns TEXT NOT NULL
+)`,
+		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
+		// trigger-CDC stream reading this database records its own
+		// durably-applied frontier here and the auto-prune cuts at the MIN
+		// across all of them, so a slower peer's unread rows are never reaped.
+		// Created before the meta upsert below lifts schema_version to 2, so
+		// the version can never claim a registry that isn't there.
+		"CREATE TABLE IF NOT EXISTS "+quoteIdent(ChangeLogConsumersTable)+` (
+    consumer_id  TEXT PRIMARY KEY,
+    applied_id   INTEGER NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
 )`,
 		fmt.Sprintf(
 			"INSERT INTO %s (singleton_pk, schema_version) VALUES (1, %d) "+
@@ -399,6 +415,7 @@ func renderTeardownDDL(triggers []string, keepData bool) []string {
 			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogTable),
 			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogMetaTable),
 			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogColumnsTable),
+			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogConsumersTable),
 		)
 	}
 	return out
@@ -427,7 +444,7 @@ func triggerName(table, suffix string) string {
 func filterInternal(tables []string) []string {
 	out := tables[:0:0]
 	for _, t := range tables {
-		if t == ChangeLogTable || t == ChangeLogMetaTable {
+		if t == ChangeLogTable || t == ChangeLogMetaTable || t == ChangeLogConsumersTable {
 			continue
 		}
 		out = append(out, t)
