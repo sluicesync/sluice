@@ -139,3 +139,64 @@ func TestVtgateTransportLoss_ReachesBothRetryConsumers(t *testing.T) {
 		}
 	}
 }
+
+// TestVitessTransportLoss_AndGateCoversUnknownWordings pins the half that
+// exists because the field-reported literal is UNCONFIRMED: it appears
+// nowhere in upstream Vitess v0.24.2, and the report's text reads as two
+// messages merged, so sluice cannot rely on matching that sentence exactly.
+//
+// A message naming a Vitess component AND carrying a transport-loss phrase is
+// a dropped connection whatever the surrounding prose. Requiring BOTH is what
+// keeps an echoed statement from arming a false transient.
+func TestVitessTransportLoss_AndGateCoversUnknownWordings(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{
+			// Wordings sluice has never seen, which is the point.
+			name: "unknown vtgate prose + transport phrase",
+			msg:  "internal: vtgate could not reach the tablet: read tcp 10.0.0.1:3306: connection reset by peer",
+			want: true,
+		},
+		{
+			name: "vttablet prose + unexpected EOF",
+			msg:  "internal: vttablet stream ended: unexpected EOF",
+			want: true,
+		},
+		{
+			name: "vtgate + broken pipe",
+			msg:  "internal: vtgate: write tcp: broken pipe",
+			want: true,
+		},
+		{
+			// NEITHER half alone may fire. A transport phrase with no Vitess
+			// noun is exactly what an echoed statement looks like.
+			name: "transport phrase with no Vitess noun",
+			msg:  `Sql: "insert into logs (msg) values ('connection reset by peer')"`,
+			want: false,
+		},
+		{
+			// A Vitess noun with no transport phrase must fall through to the
+			// literal availability set, which decides on its own terms.
+			name: "Vitess noun with no transport phrase",
+			msg:  "internal: vtgate rejected the query for an unrelated reason",
+			want: false,
+		},
+		{
+			// A bare "EOF" is deliberately NOT a token: three characters that
+			// appear in ordinary prose and in migrated data.
+			name: "bare EOF is not enough",
+			msg:  "internal: vtgate says EOF",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifiedRetriable(hy000(1105, tc.msg)); got != tc.want {
+				t.Fatalf("retriable = %v; want %v for 1105 %q", got, tc.want, tc.msg)
+			}
+		})
+	}
+}

@@ -344,7 +344,7 @@ func classifyApplierError(err error) error {
 			// prevent. See [vtgateTransientSubstrings] for the derivation,
 			// the rejected sentences, and why upstream's own constant list
 			// was NOT a sufficient source.
-			if isVtgateTransientMessage(mysqlErr.Message) {
+			if isVtgateTransientMessage(mysqlErr.Message) || isVitessTransportLossMessage(mysqlErr.Message) {
 				return &retriableMySQLError{err: err}
 			}
 		case 3:
@@ -650,6 +650,69 @@ var vtgateTransientSubstrings = []string{
 	// matched on their own for exactly that reason; the vtgate framing is
 	// the anchor and it carries any tail.
 	"vtgate connection error",
+}
+
+// vitessTransportNouns and vitessTransportLossTokens form the AND-gate that
+// catches a Vitess-layer TRANSPORT loss whose exact sentence sluice does not
+// know — the case [vtgateTransientSubstrings]'s literal list cannot cover.
+//
+// # Why an AND-gate rather than another literal
+//
+// The literal "vtgate connection error" came from a field report (2026-08-04)
+// and is matched above. But it does NOT appear anywhere in upstream Vitess
+// v0.24.2 — checked, not assumed — and the report's own text reads as two
+// messages merged ("(read: connection reset by peer  /  unexpected EOF)"), so
+// the verbatim wording is UNCONFIRMED. It is probably PlanetScale's edge
+// proxy rather than vtgate itself; `aws.connect.psdb.cloud` is not raw vtgate.
+//
+// Anchoring a retry on one uncertain literal risks a fix that is simply
+// INERT: the operator's copy still dies, and nothing says why. So the literal
+// stays (it costs nothing if it never matches) and this gate covers the class
+// it belongs to — a message that names a Vitess component AND carries a
+// transport-loss phrase is a dropped connection whatever the surrounding
+// prose, and retrying it on a fresh connection is right.
+//
+// # Echo-safety, which is why it is an AND and not an OR
+//
+// A 1105 message can carry an echoed statement (`... : Sql: "insert into
+// ..."`), and a false transient is worse than a missed one here: it also arms
+// the cold-copy tolerate-1062-on-retry wart on the next attempt. Requiring
+// BOTH halves means migrated row data would have to contain a Vitess
+// component noun *and* a transport phrase to false-positive. The tokens are
+// deliberately transport-specific: a bare "EOF" is excluded because it is
+// three characters that appear in ordinary text, while "unexpected eof" and
+// "connection reset by peer" are not phrases business data carries.
+var (
+	vitessTransportNouns      = []string{"vtgate", "vttablet"}
+	vitessTransportLossTokens = []string{
+		"connection reset by peer",
+		"unexpected eof",
+		"broken pipe",
+		"use of closed network connection",
+		"no such host",
+	}
+)
+
+// isVitessTransportLossMessage reports whether msg names a Vitess component
+// AND carries a transport-loss phrase. See the vars above for the reasoning.
+func isVitessTransportLossMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	named := false
+	for _, n := range vitessTransportNouns {
+		if strings.Contains(lower, n) {
+			named = true
+			break
+		}
+	}
+	if !named {
+		return false
+	}
+	for _, t := range vitessTransportLossTokens {
+		if strings.Contains(lower, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // isVtgateTransientMessage reports whether msg carries one of the canonical
