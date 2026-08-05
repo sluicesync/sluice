@@ -66,6 +66,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -139,6 +140,14 @@ type smartCompactResult struct {
 	// CompactPlanGroup's TablesWithoutPK report field.
 	tablesWithoutPK map[string]struct{}
 
+	// tablesUnmatched tracks tables whose change-event qualifier matched
+	// NO table in the manifest schema (or matched ambiguously). This is a
+	// DEFECT bucket, not an expected one: every event for such a table
+	// passes through uncollapsed, so the compaction silently does nothing.
+	// Kept separate from tablesWithoutPK because reporting it as "no
+	// primary key" is what hid Bug 223 for three releases.
+	tablesUnmatched map[string]struct{}
+
 	// bytesBefore / bytesAfter track the chunk-byte deltas for this
 	// incremental's change-chunks. Naive compact has
 	// bytesBefore == bytesAfter; smart compact has bytesAfter
@@ -148,7 +157,10 @@ type smartCompactResult struct {
 }
 
 func newSmartCompactResult() *smartCompactResult {
-	return &smartCompactResult{tablesWithoutPK: make(map[string]struct{})}
+	return &smartCompactResult{
+		tablesWithoutPK: make(map[string]struct{}),
+		tablesUnmatched: make(map[string]struct{}),
+	}
 }
 
 // merge adds other's tallies into r.
@@ -161,6 +173,9 @@ func (r *smartCompactResult) merge(other *smartCompactResult) {
 	for k := range other.tablesWithoutPK {
 		r.tablesWithoutPK[k] = struct{}{}
 	}
+	for k := range other.tablesUnmatched {
+		r.tablesUnmatched[k] = struct{}{}
+	}
 }
 
 // tablesWithoutPKList returns the schema.table references that fell
@@ -168,6 +183,17 @@ func (r *smartCompactResult) merge(other *smartCompactResult) {
 func (r *smartCompactResult) tablesWithoutPKList() []string {
 	out := make([]string, 0, len(r.tablesWithoutPK))
 	for k := range r.tablesWithoutPK {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// tablesUnmatchedList returns the schema.table references whose qualifier
+// matched no manifest table, sorted for deterministic reporting.
+func (r *smartCompactResult) tablesUnmatchedList() []string {
+	out := make([]string, 0, len(r.tablesUnmatched))
+	for k := range r.tablesUnmatched {
 		out = append(out, k)
 	}
 	sort.Strings(out)
@@ -413,6 +439,11 @@ type smartCompactor struct {
 	// pass through verbatim (no collapse).
 	tablesWithoutPK map[string]struct{}
 
+	// tablesUnmatched collects schema.table refs whose qualifier matched no
+	// manifest table at all (or matched ambiguously) — the DEFECT half of
+	// the old single bucket. See [pkLookupStatus].
+	tablesUnmatched map[string]struct{}
+
 	// passthroughEvents is the verbatim emission queue: TxBegin /
 	// TxCommit / SchemaSnapshot, and every row event for a table
 	// without a PK. They INTERLEAVE with the accumulator-flushed
@@ -437,7 +468,7 @@ type smartCompactor struct {
 
 	// pkLookup caches the PK column list per (schema, table) so we
 	// don't repeatedly walk the IR schema.
-	pkLookup map[string][]string
+	pkLookup map[string]pkLookupResult
 
 	// rowsCollapsedCount is incremented every time a row
 	// accumulator's events slice grows from len 1 → len 2 — i.e.
@@ -454,7 +485,8 @@ func newSmartCompactor(pkStrategy PKStrategy, schema *ir.Schema) *smartCompactor
 		accumulators:    make(map[string]*rowAccumulator),
 		order:           nil,
 		tablesWithoutPK: make(map[string]struct{}),
-		pkLookup:        make(map[string][]string),
+		tablesUnmatched: make(map[string]struct{}),
+		pkLookup:        make(map[string]pkLookupResult),
 	}
 }
 
@@ -467,43 +499,114 @@ func tableKey(schema, table string) string {
 	return schema + "." + table
 }
 
-// pkColumns returns the PK column list for (schema, table). Returns
-// (nil, false) when the table is not in the schema OR has no
-// declared PK. Cached for repeated lookups within one incremental.
-func (s *smartCompactor) pkColumns(schema, table string) ([]string, bool) {
+// pkLookupStatus is why a (schema, table) lookup did or did not yield a
+// PK column list. The three not-found reasons need OPPOSITE operator
+// responses, and conflating them is what hid Bug 223 for three releases:
+// "this table declares no primary key" is expected and actionable by the
+// operator, while "the event's qualifier matched no table in the manifest"
+// is a sluice bug that makes the whole collapse silently inert.
+type pkLookupStatus int
+
+const (
+	pkFound          pkLookupStatus = iota // collapsible
+	pkNoneDeclared                         // table found, no usable PK — expected
+	pkTableUnmatched                       // no manifest table matched — a defect
+	pkAmbiguous                            // several unqualified tables share the name
+)
+
+// pkLookupResult is the cached outcome of one (schema, table) lookup.
+type pkLookupResult struct {
+	cols   []string
+	status pkLookupStatus
+}
+
+// pkColumns returns the PK column list for a change event's (schema,
+// table), and why not when it cannot.
+//
+// # The qualifier mismatch this has to bridge (Bug 223 / roadmap item 119)
+//
+// A MySQL change event carries Schema = the DATABASE name, because that is
+// what the binlog gives it. The manifest's IR records Schema = "" for a
+// single-database MySQL source: the schema reader's namespaceName() returns
+// the database name only in multi-database mode. So an exact comparison can
+// never succeed on the most common MySQL shape, every table fell through to
+// passthrough, and smart compaction was INERT on every MySQL-family source
+// while reporting those tables as having "no primary key" — including tables
+// with a plain INT PRIMARY KEY.
+//
+// The fix is deliberately NOT a name-only fallback, which the item filed as
+// the hazard: picking the wrong table's PK columns yields a wrong collapse,
+// and a wrong collapse is silent data loss on a BACKUP path — strictly worse
+// than the inertness. The rule instead reads the recorded schema for what it
+// means:
+//
+//   - An exact (schema, name) match always wins, so a multi-database or
+//     Postgres manifest — where the qualifier is real — behaves exactly as
+//     before.
+//   - Only when NO exact match exists does an UNQUALIFIED manifest table
+//     (Schema == "") match by name. An empty recorded schema means the reader
+//     had exactly one namespace, so within one manifest such a name is unique
+//     by construction.
+//   - If more than one unqualified table somehow shares the name, it REFUSES
+//     to pick and reports the ambiguity in its own bucket. Belt and braces:
+//     the construction argument above says this cannot happen, and the whole
+//     point of this item is that an argument like that had already been wrong
+//     once.
+func (s *smartCompactor) pkColumns(schema, table string) ([]string, pkLookupStatus) {
 	tk := tableKey(schema, table)
-	if cols, ok := s.pkLookup[tk]; ok {
-		return cols, len(cols) > 0
+	if r, ok := s.pkLookup[tk]; ok {
+		return r.cols, r.status
 	}
+	res := s.lookupPKUncached(schema, table)
+	s.pkLookup[tk] = res
+	return res.cols, res.status
+}
+
+func (s *smartCompactor) lookupPKUncached(schema, table string) pkLookupResult {
 	if s.schema == nil {
-		s.pkLookup[tk] = nil
-		return nil, false
+		return pkLookupResult{status: pkTableUnmatched}
 	}
+	var (
+		exact       *ir.Table
+		unqualified []*ir.Table
+	)
 	for _, t := range s.schema.Tables {
-		if t.Schema != schema || t.Name != table {
+		if t == nil || t.Name != table {
 			continue
 		}
-		if t.PrimaryKey == nil || len(t.PrimaryKey.Columns) == 0 {
-			s.pkLookup[tk] = nil
-			return nil, false
+		switch t.Schema {
+		case schema:
+			exact = t
+		case "":
+			unqualified = append(unqualified, t)
 		}
-		cols := make([]string, 0, len(t.PrimaryKey.Columns))
-		for _, ic := range t.PrimaryKey.Columns {
-			if ic.Column == "" {
-				// Expression-PK (functional/expression index acting
-				// as PK). Not collapsible: we can't compute the
-				// expression's value from the row map. Fall through
-				// to passthrough for this table.
-				s.pkLookup[tk] = nil
-				return nil, false
-			}
-			cols = append(cols, ic.Column)
-		}
-		s.pkLookup[tk] = cols
-		return cols, true
 	}
-	s.pkLookup[tk] = nil
-	return nil, false
+	match := exact
+	if match == nil {
+		switch len(unqualified) {
+		case 0:
+			return pkLookupResult{status: pkTableUnmatched}
+		case 1:
+			match = unqualified[0]
+		default:
+			return pkLookupResult{status: pkAmbiguous}
+		}
+	}
+	if match.PrimaryKey == nil || len(match.PrimaryKey.Columns) == 0 {
+		return pkLookupResult{status: pkNoneDeclared}
+	}
+	cols := make([]string, 0, len(match.PrimaryKey.Columns))
+	for _, ic := range match.PrimaryKey.Columns {
+		if ic.Column == "" {
+			// Expression-PK (functional/expression index acting as PK).
+			// Not collapsible: we can't compute the expression's value
+			// from the row map. Passthrough, and it is genuinely a
+			// "no usable PK" case rather than a lookup failure.
+			return pkLookupResult{status: pkNoneDeclared}
+		}
+		cols = append(cols, ic.Column)
+	}
+	return pkLookupResult{cols: cols, status: pkFound}
 }
 
 // pkValue extracts the PK column values from a row map and returns a
@@ -593,11 +696,17 @@ func (s *smartCompactor) process(e ir.Change) error {
 // passthrough. Returns an error only on the refuse-loudly path
 // (corrupt PK).
 func (s *smartCompactor) routeRowEvent(schema, table string, row ir.Row, e ir.Change) error {
-	cols, hasPK := s.pkColumns(schema, table)
-	if !hasPK {
-		// No PK declared: pass through verbatim. Record the table
-		// for the report.
-		s.tablesWithoutPK[tableKey(schema, table)] = struct{}{}
+	cols, status := s.pkColumns(schema, table)
+	if status != pkFound {
+		// Not collapsible: pass through verbatim, and record the table
+		// in the bucket that says WHY. The two buckets need opposite
+		// operator responses — see [pkLookupStatus].
+		key := tableKey(schema, table)
+		if status == pkNoneDeclared {
+			s.tablesWithoutPK[key] = struct{}{}
+		} else {
+			s.tablesUnmatched[key] = struct{}{}
+		}
 		s.out = append(s.out, e)
 		return nil
 	}
@@ -763,6 +872,24 @@ func (s *smartCompactor) finalize() ([]ir.Change, *smartCompactResult) {
 	res.eventsBefore = s.eventsBefore
 	for k := range s.tablesWithoutPK {
 		res.tablesWithoutPK[k] = struct{}{}
+	}
+	for k := range s.tablesUnmatched {
+		res.tablesUnmatched[k] = struct{}{}
+	}
+	// A qualifier that matched no manifest table means every event for
+	// that table passed through uncollapsed — the compaction ran and did
+	// nothing. That is a defect, not a table property, so it is said out
+	// loud rather than folded into a report line the operator has to go
+	// looking for. Bug 223 survived three releases precisely because its
+	// only symptom was a quiet "no primary key" line about tables that
+	// had one.
+	if len(s.tablesUnmatched) > 0 {
+		slog.Warn(
+			"smart compaction: change events name tables that are not in the backup's recorded schema, "+
+				"so their rows could not be collapsed and passed through verbatim; the compaction did "+
+				"nothing for them",
+			slog.Any("tables", res.tablesUnmatchedList()),
+		)
 	}
 	// Count emitted per-row events for eventsAfter.
 	for _, e := range s.out {

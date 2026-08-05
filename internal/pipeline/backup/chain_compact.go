@@ -208,6 +208,20 @@ type CompactResult struct {
 	// a PK.
 	TablesWithoutPK []string
 
+	// TablesUnmatched is the sorted list of "schema.table" references
+	// whose CHANGE EVENTS named a table that is not in the backup's
+	// recorded schema, so no PK could be resolved and every event passed
+	// through uncollapsed.
+	//
+	// This is a DEFECT signal, not a table property, and it is separate
+	// from TablesWithoutPK for that reason: the two need opposite
+	// responses. "No primary key" is expected and is the operator's to
+	// act on; "the qualifier matched nothing" means the compaction ran
+	// and did nothing, which is sluice's to fix. Conflating them is what
+	// hid Bug 223 for three releases — the report named tables with a
+	// plain INT PRIMARY KEY as having none.
+	TablesUnmatched []string
+
 	// Plan is the per-group breakdown — populated under DryRun (the
 	// reporting-only path) AND under real compact (so callers can log
 	// what actually happened). One entry per CONSIDERED group AFTER the
@@ -254,6 +268,12 @@ type CompactPlanGroup struct {
 	// in this group. Empty for naive compact and for groups where
 	// every touched table has a PK.
 	TablesWithoutPK []string
+
+	// TablesUnmatched lists "schema.table" refs in this group whose
+	// change-event qualifier matched no table in the recorded schema.
+	// See [CompactResult.TablesUnmatched] — a defect signal, not a table
+	// property.
+	TablesUnmatched []string
 }
 
 // compactStagingDirPrefix is the on-disk marker for a mid-compact
@@ -499,6 +519,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 
 	smartPK := resolvePKStrategy(opts.PKStrategy)
 	tablesWithoutPK := make(map[string]struct{})
+	tablesUnmatched := make(map[string]struct{})
 	for i := range planned {
 		pg := &planned[i]
 		if pg.plan.MergedSegmentID == "" {
@@ -546,6 +567,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 			res.Plan[pi].EventsCollapsed = groupRes.eventsBefore - groupRes.eventsAfter
 			res.Plan[pi].RowsCollapsed = groupRes.rowsCollapsed
 			res.Plan[pi].TablesWithoutPK = groupRes.tablesWithoutPKList()
+			res.Plan[pi].TablesUnmatched = groupRes.tablesUnmatchedList()
 			break
 		}
 		res.EventsBefore += groupRes.eventsBefore
@@ -560,6 +582,9 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		for k := range groupRes.tablesWithoutPK {
 			tablesWithoutPK[k] = struct{}{}
 		}
+		for k := range groupRes.tablesUnmatched {
+			tablesUnmatched[k] = struct{}{}
+		}
 	}
 	res.EventsCollapsed = res.EventsBefore - res.EventsAfter
 	if len(tablesWithoutPK) > 0 {
@@ -568,6 +593,13 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 			res.TablesWithoutPK = append(res.TablesWithoutPK, k)
 		}
 		sort.Strings(res.TablesWithoutPK)
+	}
+	if len(tablesUnmatched) > 0 {
+		res.TablesUnmatched = make([]string, 0, len(tablesUnmatched))
+		for k := range tablesUnmatched {
+			res.TablesUnmatched = append(res.TablesUnmatched, k)
+		}
+		sort.Strings(res.TablesUnmatched)
 	}
 
 	if err := commitCompactedChain(ctx, store, cat, planned, opts, now()); err != nil {
