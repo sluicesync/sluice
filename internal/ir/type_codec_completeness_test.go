@@ -46,37 +46,61 @@ var envelopeExempt = map[string]string{
 		"compiles from a fresh schema read and therefore always has the live collation. DDL " +
 		"emission is unaffected, so a decoded schema not carrying it loses nothing a consumer " +
 		"could act on",
+
+	// ADJUDICATED 2026-08-04 (roadmap item 121). Promoted from
+	// envelopeKnownGap after the three checks the gap entry demanded, each
+	// run rather than assumed:
+	//
+	//  1. ONE consumer. `Determinism` reaches exactly one call site —
+	//     rowpredicate/predicate.go's ResolveStringEquality — via the
+	//     engines' CollationResolver implementations.
+	//  2. NO DDL consumer. Neither the Postgres, MySQL nor SQLite emitter
+	//     mentions it, so a decoded schema that reads back Unknown emits
+	//     byte-identical DDL. This is the check that would have made it a
+	//     MUST-WIRE: had the emitter rendered a non-deterministic collation
+	//     from it, dropping it on restore would change `=` semantics on the
+	//     restored column.
+	//  3. The consumer cannot receive a DECODED schema. The predicate is
+	//     compiled in buildWhereCDCFilter from the Streamer's LIVE source
+	//     schema read, on a path restricted to MySQL and Postgres sources;
+	//     no restore or manifest path compiles a predicate.
+	//
+	// So this is Enum.Collation's argument, verified for these fields
+	// rather than inherited from them. The reflect.DeepEqual concern the
+	// gap entry raised (SchemaSignature.Equal, diffRenameColumnIR) resolves
+	// the same way Enum.Collation's own doc resolves it: a decoded and a
+	// fresh-read column disagreeing can only ADD an advisory delta, never
+	// hide a decode-affecting change, and no data is mutated on either path.
+	"Char.Determinism":    determinismExemptReason,
+	"Varchar.Determinism": determinismExemptReason,
+	"Text.Determinism":    determinismExemptReason,
 }
 
+const determinismExemptReason = "set by the PG reader from collisdeterministic and read back as " +
+	"CollationDeterminismUnknown. Adjudicated as a DECISION (item 121): its only consumer is the " +
+	"--where string-equality resolver, no engine's DDL emitter consults it, and the predicate is " +
+	"compiled from a LIVE schema read on a path no decoded manifest schema reaches — so a decoded " +
+	"schema not carrying it loses nothing a consumer could act on. See envelopeExempt's comment " +
+	"for the three checks this rests on"
+
 // envelopeKnownGap names Type fields that do NOT survive the round trip and
-// are NOT adjudicated decisions — they are acknowledged holes, found by this
-// gate when it was built (roadmap item 117), left in place deliberately
-// because closing them is a fingerprint change and therefore its own item.
+// are NOT adjudicated decisions — they are acknowledged holes, left in place
+// deliberately because closing one is a fingerprint change and therefore its
+// own item.
 //
 // The distinction from envelopeExempt is the point: an exemption says "this is
 // right", a gap says "this is a finding nobody has closed". Collapsing the two
 // is how a gate comes to certify its own blind spot.
 //
+// EMPTY as of item 121, and that is a real state rather than a defaulted one:
+// the four entries this gate found when it was built (Enum.TypeName and the
+// three *.Determinism fields) have all been closed — the first by WIRING it
+// (restore was re-creating enums under a synthesized name), the other three by
+// ADJUDICATING them into envelopeExempt above. A future finding belongs here,
+// with its reason, until someone does the same for it.
+//
 // Keys are "ConcreteType.Field".
-var envelopeKnownGap = map[string]string{
-	"Enum.TypeName": "FINDING (item 117 sweep, not fixed here). The Postgres reader sets it for " +
-		"every PG enum column (types.go: ir.Enum{Values: c.EnumValues, TypeName: c.EnumTypeName}), " +
-		"and it is documented as the thing that keeps a same-engine PG restore from renaming " +
-		"`post_status` to `posts_status_enum`. Dropping it on a manifest round trip therefore " +
-		"means restore re-creates the enum type under a synthesized name. Wiring it is NOT free: " +
-		"it is non-zero on ordinary PG source data, so adding it to the envelope moves the schema " +
-		"fingerprint of every chain with a PG enum column and mints a new epoch — the item-104 " +
-		"trap. Needs the same ride-the-wire + exclude-from-the-hash treatment Macaddr.Width got",
-	"Char.Determinism": "FINDING (item 117 sweep, not fixed here). Set by the PG reader from " +
-		"collisdeterministic; a decoded schema reads back CollationDeterminismUnknown. The same " +
-		"argument that makes Enum.Collation a decision plausibly applies (the only consumer, the " +
-		"--where evaluator, compiles from a fresh schema read) — but unlike Enum.Collation nobody " +
-		"has written that down on the field, and ir.Type participates in reflect.DeepEqual " +
-		"comparisons (SchemaSignature.Equal, diffRenameColumnIR) where a fresh-read column and a " +
-		"decoded one would disagree. Adjudicate it; do not assume it",
-	"Varchar.Determinism": "FINDING (item 117 sweep, not fixed here). See Char.Determinism",
-	"Text.Determinism":    "FINDING (item 117 sweep, not fixed here). See Char.Determinism",
-}
+var envelopeKnownGap = map[string]string{}
 
 // TestTypeEnvelopeRoundTripsEveryExportedField is the gate. It drives
 // [AllTypes] — itself held exhaustive by TestAllTypes_CoversEveryIsTypeImplementor

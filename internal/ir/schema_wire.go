@@ -116,6 +116,24 @@ type schemaTypeEnvelope struct {
 	// Enum / Set values. Empty for other types.
 	Values []string `json:"values,omitempty"`
 
+	// EnumTypeName is [Enum.TypeName] — the source-side named-type
+	// identifier for engines that model enums as standalone types
+	// (Postgres `CREATE TYPE ... AS ENUM`). Empty for MySQL's
+	// column-inline enums, and for every non-enum type.
+	//
+	// It rides the wire so a RESTORE re-creates the type under its real
+	// name: without it the writer synthesizes one, renaming `post_status`
+	// to `posts_status_enum` and breaking casts, shared-enum tables and
+	// any app code naming the type — exactly what the field was added to
+	// prevent (roadmap item 121, found by the type-envelope gate).
+	//
+	// It is deliberately EXCLUDED from the chain schema fingerprint (see
+	// fingerprintType in internal/ir/backup). It is non-zero on ordinary
+	// PG source data, so folding it in would move the hash of every chain
+	// carrying an enum column and mint a new epoch — the item-104 trap,
+	// and the same treatment Macaddr.Width needed.
+	EnumTypeName string `json:"enum_type_name,omitempty"`
+
 	// Geometry.
 	GeometrySubtype uint8 `json:"geometry_subtype,omitempty"`
 	SRID            int   `json:"srid,omitempty"`
@@ -252,6 +270,7 @@ func MarshalType(t Type) ([]byte, error) {
 	case Enum:
 		env.Kind = "Enum"
 		env.Values = v.Values
+		env.EnumTypeName = v.TypeName
 	case Set:
 		env.Kind = "Set"
 		env.Values = v.Values
@@ -375,7 +394,7 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "JSON":
 		return JSON{Binary: env.Binary}, nil
 	case "Enum":
-		return Enum{Values: env.Values}, nil
+		return Enum{Values: env.Values, TypeName: env.EnumTypeName}, nil
 	case "Set":
 		return Set{Values: env.Values}, nil
 	case "UUID":

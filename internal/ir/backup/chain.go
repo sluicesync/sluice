@@ -178,23 +178,33 @@ func columnNeedsFingerprintNormalizing(c *ir.Column) bool {
 // an exclusion that only reached the scalar would have moved the fingerprint
 // of every chain carrying the array form.
 //
-// TODAY THE SET IS EXACTLY ONE FIELD: [ir.Macaddr.Width] (roadmap item 117 /
-// Bug 225). The reason is the one that governs the whole exclusion block
-// below — the Postgres reader sets the width to 6 for an ORDINARY `macaddr`
-// column, so `omitempty` (which drops only the zero value) would not hold it
-// back: the key would be present in the type envelope of every real Postgres
-// chain carrying a MAC column, the fingerprint would move, and a new epoch
-// would be minted that makes those chains unrestorable. Excluding it restores
-// the pre-change bytes EXACTLY, for both widths.
+// THE SET IS TWO FIELDS: [ir.Macaddr.Width] (roadmap item 117 / Bug 225) and
+// [ir.Enum.TypeName] (item 121). Both are governed by the same reason as the
+// exclusion block below — the Postgres reader sets each for an ORDINARY
+// column of that type, so `omitempty` (which drops only the zero value) would
+// not hold either back: the key would be present in the type envelope of
+// every real Postgres chain carrying a MAC or enum column, the fingerprint
+// would move, and a new epoch would be minted that makes those chains
+// unrestorable. Excluding them restores the pre-change bytes EXACTLY.
 //
-// WHAT THE EXCLUSION COSTS, stated exactly. The recorded schema still carries
-// the width (it rides the wire — see [ir.MarshalType]), so a restore rebuilds
-// `macaddr8` correctly; what is lost is the fingerprint's ability to NOTICE a
-// `macaddr` ⇄ `macaddr8` retype between a backup and its restore target, and
+// Enum.TypeName is the stronger case of the two. A MAC column is uncommon; an
+// enum column is not, and the PG reader populates the type name for EVERY one
+// of them, so folding it in would repartition close to every Postgres chain
+// in existence.
+//
+// WHAT THE EXCLUSIONS COST, stated exactly. The recorded schema still carries
+// both (they ride the wire — see [ir.MarshalType]), so a restore rebuilds
+// `macaddr8` at the right width and re-creates an enum under its real name;
+// what is lost is the fingerprint's ability to NOTICE a `macaddr` ⇄ `macaddr8`
+// retype or an enum TYPE RENAME between a backup and its restore target, and
 // — since [canonicalManifestBytes] folds the fingerprint STRING rather than
-// the schema bytes — signing does not backstop a tampered width either. The
-// schema DIFF still sees it: [ir.Macaddr.String] renders the two forms
-// differently, which is what both diff paths compare.
+// the schema bytes — signing does not backstop a tampered width or type name
+// either. The schema DIFF still sees the MAC case ([ir.Macaddr.String] renders
+// the two widths differently, which is what both diff paths compare); it does
+// NOT see an enum type rename, because [ir.Enum.String] renders only the
+// VALUES. That is a real, named residual, not an oversight: a rename with
+// identical values changes no data and no column type, and the alternative —
+// folding the name in — costs every existing chain.
 //
 // The input is never mutated: the manifest records the schema exactly as the
 // reader produced it, and only the FINGERPRINT is canonical.
@@ -205,6 +215,20 @@ func fingerprintType(t ir.Type) (ir.Type, bool) {
 			return t, false
 		}
 		return ir.Macaddr{}, true
+	case ir.Enum:
+		// Enum.TypeName (roadmap item 121) — same treatment, same reason,
+		// and a stronger case than Macaddr.Width: the Postgres reader sets
+		// it for EVERY enum column, so it is non-zero on ordinary source
+		// data and folding it in would move the fingerprint of every chain
+		// carrying an enum. It rides the wire so restore re-creates the
+		// type under its real name; it is excluded here so no chain is
+		// repartitioned.
+		if v.TypeName == "" {
+			return t, false
+		}
+		out := v
+		out.TypeName = ""
+		return out, true
 	case ir.Array:
 		elem, changed := fingerprintType(v.Element)
 		if !changed {
