@@ -297,6 +297,56 @@ func TestSmartCompactRetention_NoCollapseCorpusIsUnreordered(t *testing.T) {
 	}
 }
 
+// The F3 invariant under eviction — roadmap item 101's failure mode, reachable
+// again the moment chains start draining mid-pass.
+//
+// A collapsed event carries its chain's FIRST position, so if one is emitted
+// after the incremental's closing TxCommit the rewritten stream ENDS BELOW its
+// own recorded EndPosition, and chain_restore.go's F1 backstop refuses the
+// chain as truncated (SLUICE-E-BACKUP-INCOMPLETE). `flushCollapsedInsideClosingTx`
+// enforces that at finalize; eviction has to preserve it throughout.
+//
+// The shape that reaches it: an incremental whose window ends mid-transaction,
+// so row events follow the last TxCommit. A naive append during eviction would
+// put a collapsed row event after the closing commit, finalize would see a
+// non-TxCommit tail and take the plain flushAll path, and the stream would end
+// on a row event.
+func TestSmartCompactRetention_EvictionKeepsTheClosingCommitLast(t *testing.T) {
+	const cap0 = 32 << 10
+
+	corpus := []ir.Change{
+		ir.TxBegin{Position: ir.Position{Engine: "postgres", Token: `{"lsn":"0/1"}`}},
+		retentionInsert(1, 1<<10),
+		ir.TxCommit{Position: ir.Position{Engine: "postgres", Token: `{"lsn":"0/500"}`}},
+	}
+	// Rows AFTER the closing commit, enough of them to force eviction.
+	for id := int64(2); id < 120; id++ {
+		corpus = append(corpus, retentionInsert(id, 1<<10))
+	}
+
+	s := newSmartCompactor(PKStrategyPK, retentionSchema())
+	s.maxRetainedBytes = cap0
+	for _, e := range corpus {
+		if err := s.process(e); err != nil {
+			t.Fatalf("process: %v", err)
+		}
+	}
+	out, res := s.finalize()
+
+	if res.chainsEvicted == 0 {
+		t.Fatal("no eviction happened, so this test proves nothing about the closing commit")
+	}
+	if len(out) == 0 {
+		t.Fatal("no output")
+	}
+	if _, ok := out[len(out)-1].(ir.TxCommit); !ok {
+		t.Errorf("the rewritten stream ends on a %T, not the closing TxCommit.\n\n"+
+			"A collapsed event carries its chain's FIRST position, so a stream ending on one ends "+
+			"BELOW its own recorded EndPosition — chain_restore's F1 backstop refuses that chain as "+
+			"truncated. This is roadmap item 101, reachable again through eviction.", out[len(out)-1])
+	}
+}
+
 // TestEstimateChangeBytes_TracksRealMarshalledSize is the independent expected
 // value the retention cap is otherwise missing.
 //

@@ -951,8 +951,35 @@ func (s *smartCompactor) reserve(incoming int64) {
 
 // evict drains one chain into the output stream and drops it. The caller is
 // responsible for removing k from s.order.
+//
+// # Why this splices BEFORE a trailing TxCommit (roadmap item 101, again)
+//
+// [flushCollapsedInsideClosingTx] exists because a collapsed event carries its
+// chain's FIRST position, so emitting one after the incremental's closing
+// TxCommit leaves the rewritten stream ENDING BELOW its own recorded
+// EndPosition — which chain_restore.go's F1 tail-truncation backstop reads as
+// a truncated change-list and refuses (SLUICE-E-BACKUP-INCOMPLETE). A
+// `backup compact` could thus leave a chain that no longer restores.
+//
+// A naive append here reopens exactly that. If the incremental's last event is
+// a TxCommit and a row event follows it (an incremental whose window ends
+// mid-transaction), eviction would append after the commit, finalize would see
+// a non-TxCommit tail, take the plain flushAll path, and the stream would end
+// on a collapsed row event. Splicing before the trailing commit keeps the
+// closing position last at every point in the pass, not just at finalize —
+// which is the invariant, rather than the one place it happened to be enforced.
 func (s *smartCompactor) evict(k string, acc *rowAccumulator) {
-	s.out = append(s.out, acc.flush()...)
+	emitted := acc.flush()
+	if n := len(s.out); n > 0 && len(emitted) > 0 {
+		if _, closing := s.out[n-1].(ir.TxCommit); closing {
+			s.out = append(s.out[:n-1], append(emitted, s.out[n-1])...)
+			s.retainedBytes -= acc.bytes
+			delete(s.accumulators, k)
+			s.chainsEvicted++
+			return
+		}
+	}
+	s.out = append(s.out, emitted...)
 	s.retainedBytes -= acc.bytes
 	delete(s.accumulators, k)
 	s.chainsEvicted++
