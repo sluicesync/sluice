@@ -2,7 +2,9 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.111.1] - 2026-08-05
+
+The first production field report — a 2.64 GB MariaDB → PlanetScale move where `migrate` completed clean and `sync` failed every attempt — and the four queue items waiting behind it.
 
 ### Fixed
 

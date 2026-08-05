@@ -1770,6 +1770,14 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 			slog.Int64("events_collapsed", res.EventsCollapsed),
 			slog.Int64("rows_collapsed", res.RowsCollapsed),
 			slog.Any("tables_without_pk", res.TablesWithoutPK),
+			// The DEFECT bucket, kept distinct from tables_without_pk on
+			// purpose (roadmap item 119): "declares no PK" is expected and
+			// the operator's to act on, while "the event named a table this
+			// backup does not carry" means the collapse silently did
+			// nothing. Printed unconditionally rather than only when
+			// non-empty, so an operator diffing two runs sees the field go
+			// from empty to populated.
+			slog.Any("tables_unmatched", res.TablesUnmatched),
 		)
 	}
 	slog.InfoContext(ctx, "backup compact: "+mode, topArgs...)
