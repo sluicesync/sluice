@@ -45,6 +45,27 @@ type PlanTable struct {
 	SecondaryIndexes int    `json:"secondary_indexes"`
 	ForeignKeys      int    `json:"foreign_keys"`
 	RowCount         int64  `json:"row_count"`
+
+	// RowCountEstimated reports that RowCount came from the engine's
+	// STATISTICS rather than from counting rows — MySQL's
+	// information_schema.TABLE_ROWS, Postgres's pg_class.reltuples. True
+	// whenever a count was obtained at all; false only when RowCount is
+	// -1 (unavailable).
+	//
+	// It exists because the number is routinely wrong by a wide margin and
+	// nothing here said so. A 2026-08-04 field report on a MariaDB source
+	// saw 1,026,026 planned against 1,701,520 actually copied — 40% low —
+	// and read the difference as sluice reporting a mismatch. Nothing was
+	// wrong: InnoDB's estimate lags cardinality badly on a table that has
+	// not been ANALYZEd recently, and it can even read 0 for a freshly
+	// loaded one. The copy-progress line has carried
+	// `total_rows_estimated` for this reason since roadmap #22; the plan
+	// had not, so the one number an operator naturally diffs against the
+	// final count was the one presented as exact (roadmap item 124).
+	//
+	// `sluice verify` is unaffected and always was: it counts both sides
+	// exactly, which is why it agreed with the target while this did not.
+	RowCountEstimated bool `json:"row_count_estimated"`
 }
 
 // buildDryRunPlan assembles the migration plan from the already-read,
@@ -61,12 +82,13 @@ func (m *Migrator) buildDryRunPlan(ctx context.Context, schema *ir.Schema) *Migr
 	}
 	for _, t := range schema.Tables {
 		plan.Tables = append(plan.Tables, PlanTable{
-			Name:             t.Name,
-			Columns:          len(t.Columns),
-			PrimaryKey:       t.PrimaryKey != nil,
-			SecondaryIndexes: len(t.Indexes),
-			ForeignKeys:      len(t.ForeignKeys),
-			RowCount:         counts[t.Name],
+			Name:              t.Name,
+			Columns:           len(t.Columns),
+			PrimaryKey:        t.PrimaryKey != nil,
+			SecondaryIndexes:  len(t.Indexes),
+			ForeignKeys:       len(t.ForeignKeys),
+			RowCount:          counts[t.Name],
+			RowCountEstimated: counts[t.Name] >= 0,
 		})
 	}
 	return plan
@@ -107,6 +129,7 @@ func (m *Migrator) logPlan(ctx context.Context, plan *MigrationPlan) {
 			slog.Int("secondary_indexes", t.SecondaryIndexes),
 			slog.Int("foreign_keys", t.ForeignKeys),
 			slog.Int64("row_count", t.RowCount),
+			slog.Bool("row_count_estimated", t.RowCountEstimated),
 		)
 	}
 	if plan.AnalyzeAfter {
