@@ -21,17 +21,40 @@
 // byte ceiling — the neighbouring fix is what led someone to push on the
 // limit next door. Pre-existing on v0.111.0 and earlier.
 //
-// The pin that matters most is TestChunkLineLimit_WriterAndReaderShareOneLimit:
-// the defect was two independent numbers where there should have been one, so
-// the durable fix is that they cannot drift apart again.
+// # The sibling sweep, and why this file's gate was rewritten
+//
+// The first fix closed the DATA-chunk path and its gate asserted
+// "checkChunkLineLength appears on 2 write paths", counted by substring in
+// backup_chunk.go alone. There was a THIRD write core — [ChangeChunkWriter],
+// in another file — with no refusal at all, and its reader capped a line at a
+// LITERAL 64 MiB rather than the shared constant. So the original defect was
+// still fully live on the incremental/CDC path, where a change event carries a
+// whole row image and a wide TEXT/JSON/BLOB column reaches the limit by
+// exactly the same route.
+//
+// The gate did worse than miss it: pinned to `== 2`, it would have FAILED on a
+// correct fix. That is the "a gate owes the same enumeration" shape, in its
+// sharpest form — a check whose name says "both write cores" and whose reach
+// is "the two in this file", which stops anyone from looking.
+//
+// So the roster is no longer a number in a string search. It is DERIVED from
+// the package's AST: every function that writes a marshalled record to a chunk
+// stream must refuse over-long lines, and every scanner that reads one back
+// must be sized from the shared constant. A fourth write core added tomorrow
+// fails this test until it is guarded, without anyone remembering to bump a
+// count.
 
 package blobcodec
 
 import (
 	"bytes"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -112,48 +135,291 @@ func TestChunkLineLimit_LargeButReadableRowRoundTrips(t *testing.T) {
 	}
 }
 
-// TestChunkLineLimit_WriterAndReaderShareOneLimit is the structural pin, and
-// the reason this bug was possible at all: the reader's scanner cap and the
-// writer's refusal were two independent numbers, one of which did not exist.
+// The CHANGE-chunk half of the same defect — the third write core, and the one
+// the original fix missed. An incremental backup's chunks are written by this
+// writer, so before this refusal existed the full Bug 226 sequence reproduced
+// on `backup incremental` exactly as it did on `backup full`.
+func TestChunkLineLimit_ChangeWriterRefusesAnUnreadableRow(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewChangeChunkWriter(&buf, nil, CodecNone, nil)
+	if err != nil {
+		t.Fatalf("NewChangeChunkWriter: %v", err)
+	}
+	ins := ir.Insert{
+		Position: ir.Position{Engine: "postgres", Token: `{"lsn":"0/100"}`},
+		Schema:   "public",
+		Table:    "wide",
+		Row:      ir.Row{"id": int64(1), "body": strings.Repeat("x", MaxChunkLineBytes+1024)},
+	}
+
+	err = w.WriteChange(ins)
+	if err == nil {
+		t.Fatal("WriteChange ACCEPTED a change whose row exceeds the reader's line limit.\n\n" +
+			"An incremental carrying it verifies clean and cannot be restored — Bug 226 on the " +
+			"CDC path, which is where the first fix's sibling sweep stopped short.")
+	}
+	for _, want := range []string{"exceeds", "restore", "verify"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q — it must say what would have happened.\ngot: %v", want, err)
+		}
+	}
+}
+
+// The change-chunk control: a large-but-readable change still round-trips
+// through the real reader. Read back with the reader rather than asserting on
+// the writer's own bookkeeping — the whole bug was a writer that agreed with
+// itself.
+func TestChunkLineLimit_ChangeWriterLargeButReadableRoundTrips(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewChangeChunkWriter(&buf, nil, CodecNone, nil)
+	if err != nil {
+		t.Fatalf("NewChangeChunkWriter: %v", err)
+	}
+	body := strings.Repeat("y", 1<<20) // 1 MiB
+	if err := w.WriteChange(ir.Insert{
+		Position: ir.Position{Engine: "postgres", Token: `{"lsn":"0/110"}`},
+		Schema:   "public",
+		Table:    "wide",
+		Row:      ir.Row{"id": int64(1), "body": body},
+	}); err != nil {
+		t.Fatalf("WriteChange refused an ordinary wide row: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecNone, nil)
+	if err != nil {
+		t.Fatalf("NewChangeChunkReader: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	c, err := r.ReadChange()
+	if err != nil {
+		t.Fatalf("ReadChange: %v", err)
+	}
+	ins, ok := c.(ir.Insert)
+	if !ok {
+		t.Fatalf("read back %T; want ir.Insert", c)
+	}
+	if s, _ := ins.Row["body"].(string); len(s) != len(body) {
+		t.Fatalf("body round-tripped at %d bytes; want %d", len(s), len(body))
+	}
+}
+
+// The refusal must be identifiable with errors.Is, because the compaction path
+// adds a remedy the codec cannot know about (--smart-compaction-off) and keys
+// that off the sentinel. Dropping the %w would leave the refusal correct and
+// the hint silently dead, which is the kind of regression nothing else notices.
+func TestChunkLineLimit_RefusalWrapsTheSentinel(t *testing.T) {
+	err := checkChunkLineLength(MaxChunkLineBytes + 1)
+	if err == nil {
+		t.Fatal("checkChunkLineLength accepted a line over the limit")
+	}
+	if !errors.Is(err, ErrChunkLineTooLong) {
+		t.Errorf("refusal does not wrap ErrChunkLineTooLong, so callers cannot recognise it: %v", err)
+	}
+	if err := checkChunkLineLength(MaxChunkLineBytes - 1); err != nil {
+		t.Errorf("checkChunkLineLength refused a line under the limit: %v", err)
+	}
+}
+
+// TestChunkLineLimit_EveryWriteCoreAndReaderShareOneLimit is the structural
+// pin, and the reason this bug was possible at all: the reader's scanner cap
+// and the writer's refusal were independent numbers, one of which did not
+// exist — and after the first fix, one of which was still a literal.
 //
-// It asserts by SOURCE that the scanner is configured from the same exported
-// constant the writer refuses on — a value-equality test would pass happily
-// against two literals that agree today and drift tomorrow, which is exactly
-// the failure being closed.
-func TestChunkLineLimit_WriterAndReaderShareOneLimit(t *testing.T) {
-	src := readOwnSource(t, "backup_chunk.go")
+// The roster is DERIVED from the package AST rather than counted by substring
+// in one file, because the counting version pinned the wrong number and would
+// have failed on the correct fix. Two rules, each with an anti-vacuity floor
+// so a parse that finds nothing cannot pass silently:
+//
+//   - every function writing a marshalled record to a chunk stream (the
+//     `bufW.Write(b)` shape) must call checkChunkLineLength;
+//   - every bufio.Scanner over a chunk stream must be sized from
+//     MaxChunkLineBytes, never a literal.
+func TestChunkLineLimit_EveryWriteCoreAndReaderShareOneLimit(t *testing.T) {
+	files := parsePackageSource(t)
 
-	if strings.Contains(src, "64*1024*1024") {
-		t.Error("the chunk reader still configures its scanner from a LITERAL.\n\n" +
-			"The writer's refusal and the reader's capacity must be the same named constant, or a " +
-			"future edit to one silently re-opens Bug 226: rows the writer accepts that the reader " +
-			"cannot scan.")
+	var (
+		writeCores  []string
+		unguarded   []string
+		scanners    []string
+		unsizedScan []string
+	)
+	for name, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				return true
+			}
+			where := name + ":" + fn.Name.Name
+			if bodyCallsBufWWrite(fn.Body) {
+				writeCores = append(writeCores, where)
+				if !bodyCallsIdent(fn.Body, "checkChunkLineLength") {
+					unguarded = append(unguarded, where)
+				}
+			}
+			if bodyCallsSelector(fn.Body, "bufio", "NewScanner") {
+				scanners = append(scanners, where)
+				if !bodyScannerSizedFromConstant(fn.Body) {
+					unsizedScan = append(unsizedScan, where)
+				}
+			}
+			return true
+		})
 	}
-	if !strings.Contains(src, "sc.Buffer(make([]byte, 0, 64*1024), MaxChunkLineBytes)") {
-		t.Error("the scanner is no longer sized from MaxChunkLineBytes — writer and reader can drift")
+
+	// Anti-vacuity floors. Three write cores and two readers exist today; a
+	// walker that suddenly finds fewer has stopped matching the code, and a
+	// silent zero is precisely how a derived gate rots into a green no-op.
+	if len(writeCores) < 3 {
+		t.Fatalf("found %d chunk write core(s) %v; expected at least 3 (the fast encoder, "+
+			"writeRowLegacy, and the change-chunk writer).\n\nThe walker is no longer matching the "+
+			"code, so this gate is vacuous — fix the walker, do not lower the floor.", len(writeCores), writeCores)
+	}
+	if len(scanners) < 2 {
+		t.Fatalf("found %d chunk scanner(s) %v; expected at least 2 (the data-chunk and "+
+			"change-chunk readers). The walker is no longer matching the code.", len(scanners), scanners)
+	}
+
+	if len(unguarded) > 0 {
+		t.Errorf("these chunk write cores do not refuse an over-long line: %v\n\n"+
+			"Each one can write a row that `backup verify` reports as OK and `restore` cannot read "+
+			"(Bug 226). Call checkChunkLineLength on the marshalled bytes before writing them.", unguarded)
+	}
+	if len(unsizedScan) > 0 {
+		t.Errorf("these chunk scanners are not sized from MaxChunkLineBytes: %v\n\n"+
+			"A literal here is how the writer's refusal and the reader's capacity drift apart, which "+
+			"is the defect this constant exists to make impossible.", unsizedScan)
+	}
+
+	// Belt and braces: the specific literal that was the original defect must
+	// not reappear anywhere in the package's production source.
+	for name, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			bl, ok := n.(*ast.BasicLit)
+			if ok && bl.Kind == token.INT && (bl.Value == "67108864") {
+				t.Errorf("%s carries a raw 67108864 literal — use MaxChunkLineBytes", name)
+			}
+			return true
+		})
+		if strings.Contains(mustReadFile(t, name), "64*1024*1024") {
+			t.Errorf("%s still configures a limit from the LITERAL 64*1024*1024 rather than "+
+				"MaxChunkLineBytes; writer and reader can drift again", name)
+		}
 	}
 }
 
-// Both write cores must refuse. The fast append-based encoder and the legacy
-// reflection marshal are two separate paths to the same artifact, and a
-// refusal on only one leaves the defect reachable through any row the fast
-// path declines to encode.
-func TestChunkLineLimit_BothWriteCoresRefuse(t *testing.T) {
-	src := readOwnSource(t, "backup_chunk.go")
-	if got := strings.Count(src, "checkChunkLineLength(len(b))"); got != 2 {
-		t.Errorf("checkChunkLineLength appears on %d write path(s); want 2 (the fast encoder and "+
-			"writeRowLegacy).\n\nA refusal on one core only is the sibling gap this project keeps "+
-			"paying for.", got)
+// parsePackageSource parses every non-test .go file in this package.
+func parsePackageSource(t *testing.T) map[string]*ast.File {
+	t.Helper()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob package sources: %v", err)
 	}
+	fset := token.NewFileSet()
+	out := make(map[string]*ast.File, len(names))
+	for _, n := range names {
+		if strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", n, err)
+		}
+		out[n] = f
+	}
+	if len(out) == 0 {
+		t.Fatal("parsed no package sources — the gate would be vacuous")
+	}
+	return out
 }
 
-// readOwnSource reads a source file from this package for the
-// writer/reader-share-one-limit assertion above.
-func readOwnSource(t *testing.T, name string) string {
+func mustReadFile(t *testing.T, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(name)
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
 	return string(b)
+}
+
+// bodyCallsBufWWrite reports whether body contains a `<recv>.bufW.Write(...)`
+// call — the shape every chunk write core uses to emit one marshalled record.
+func bodyCallsBufWWrite(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		outer, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || outer.Sel.Name != "Write" {
+			return true
+		}
+		inner, ok := outer.X.(*ast.SelectorExpr)
+		if ok && inner.Sel.Name == "bufW" {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// bodyCallsIdent reports whether body calls the named package-level function.
+func bodyCallsIdent(body *ast.BlockStmt, name string) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == name {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// bodyCallsSelector reports whether body calls pkg.fn(...).
+func bodyCallsSelector(body *ast.BlockStmt, pkg, fn string) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != fn {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); ok && id.Name == pkg {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// bodyScannerSizedFromConstant reports whether body contains a
+// `<sc>.Buffer(..., MaxChunkLineBytes)` call.
+func bodyScannerSizedFromConstant(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Buffer" || len(call.Args) != 2 {
+			return true
+		}
+		if id, ok := call.Args[1].(*ast.Ident); ok && id.Name == "MaxChunkLineBytes" {
+			found = true
+		}
+		return true
+	})
+	return found
 }

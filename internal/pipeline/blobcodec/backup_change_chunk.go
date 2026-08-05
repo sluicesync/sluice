@@ -165,6 +165,16 @@ func (w *ChangeChunkWriter) WriteChange(c ir.Change) error {
 	if err != nil {
 		return fmt.Errorf("change chunk record marshal: %w", err)
 	}
+	// Bug 226's third write core. The data-chunk writer's two cores refuse an
+	// unreadable row; this one did not, and its reader capped a line at a
+	// LITERAL 64 MiB rather than the shared constant — so an incremental
+	// carrying one wide CDC row reproduced the original defect exactly:
+	// `backup incremental` rc=0, `backup verify` rc=0, `restore` "token too
+	// long". A change event carries a full row image, so a wide TEXT/JSON/BLOB
+	// column reaches it by the same route.
+	if err := checkChunkLineLength(len(b)); err != nil {
+		return err
+	}
 	if _, err := w.bufW.Write(b); err != nil {
 		return fmt.Errorf("change chunk record write: %w", err)
 	}
@@ -302,7 +312,8 @@ func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	}
 	gz = cr
 	sc := bufio.NewScanner(gz)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	// The SAME constant the writer refuses on — see [MaxChunkLineBytes].
+	sc.Buffer(make([]byte, 0, 64*1024), MaxChunkLineBytes)
 	if !sc.Scan() {
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("change chunk reader: read header: %w", err)

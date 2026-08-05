@@ -1097,6 +1097,20 @@ func applySmartCompactionToIncremental(
 		}
 		for _, e := range chunkBuckets[i] {
 			if err := cw.WriteChange(e); err != nil {
+				if errors.Is(err, blobcodec.ErrChunkLineTooLong) {
+					// Collapsing merges after-images as a UNION of their
+					// columns (see [mergeAfterImage]), so a collapsed event
+					// can serialize larger than any of the events it replaced
+					// — a chain whose events the source backup wrote happily.
+					// Refusing is right (the rewritten chunk would not restore),
+					// but the remedy is specific to this path and the codec
+					// cannot know it.
+					return nil, fmt.Errorf("write collapsed change to chunk %q: %w\n\n"+
+						"This row's events were each individually writable; collapsing them merged "+
+						"their column values into one larger row. Re-run with --smart-compaction-off "+
+						"to keep the naive concatenation, which leaves the events uncollapsed and "+
+						"within the limit", ch.File, err)
+				}
 				return nil, fmt.Errorf("write change to chunk %q: %w", ch.File, err)
 			}
 		}

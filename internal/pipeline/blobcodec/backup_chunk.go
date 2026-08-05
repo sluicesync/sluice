@@ -982,8 +982,16 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 }
 
 // MaxChunkLineBytes is the largest a single chunk line (one serialized row
-// plus its newline) may be, and it is the SAME number on both sides of the
-// format — the reader's bufio.Scanner buffer cap and the writer's refusal.
+// plus its newline) may be, and it is the SAME number on every side of the
+// format — BOTH readers' bufio.Scanner buffer caps and ALL THREE writers'
+// refusals.
+//
+// The roster, because "both sides" was the phrasing that let a third writer
+// go uncovered for a release: the data-chunk writer's fast append encoder and
+// its legacy reflection marshal ([ChunkWriter.WriteRow]), plus the change-chunk
+// writer ([ChangeChunkWriter.WriteChange]); read back by [NewChunkReader] and
+// [NewChangeChunkReader]. TestChunkLineLimit_EveryWriteCoreAndReaderShareOneLimit
+// derives that roster from the package source rather than trusting this comment.
 //
 // # Why this is one constant and not two (Bug 226)
 //
@@ -1018,6 +1026,14 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 // written, so it simply lands in a chunk of its own.
 const MaxChunkLineBytes = 64 << 20 // 64 MiB
 
+// ErrChunkLineTooLong marks a refusal from [checkChunkLineLength] so callers
+// that know a caller-specific remedy can add it. The compaction path is the
+// one that needs this: collapsing an event chain merges after-images as a
+// UNION of their columns, so a collapse can produce a line larger than any of
+// its inputs — a chain whose events were each individually writable. There the
+// remedy is --smart-compaction-off, which the codec cannot know about.
+var ErrChunkLineTooLong = errors.New("chunk line exceeds the format's per-row limit")
+
 // checkChunkLineLength refuses a row whose serialized line would exceed what
 // the reader can scan. n is the payload length; the newline is accounted for.
 func checkChunkLineLength(n int) error {
@@ -1025,10 +1041,11 @@ func checkChunkLineLength(n int) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"chunk row write: a single row serializes to %d bytes, which exceeds the %d-byte per-row limit "+
-			"of the backup chunk format; writing it would produce a backup that `backup verify` reports "+
-			"as OK and `restore` cannot read (it fails with \"token too long\"). Exclude the table, or "+
-			"reduce the row's largest value — the limit is per ROW, so splitting the table does not help",
-		n+1, MaxChunkLineBytes,
+		"%w: chunk row write: a single row serializes to %d bytes, which exceeds the %d-byte per-row "+
+			"limit of the backup chunk format; writing it would produce a backup that `backup verify` "+
+			"reports as OK and `restore` cannot read (it fails with \"token too long\"). Exclude the "+
+			"table, or reduce the row's largest value — the limit is per ROW, so splitting the table "+
+			"does not help",
+		ErrChunkLineTooLong, n+1, MaxChunkLineBytes,
 	)
 }
