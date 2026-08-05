@@ -64,6 +64,39 @@ type SchemaDiff struct {
 	ViewsMissing    []string   `json:"views_missing,omitempty"`
 	ViewsExtra      []string   `json:"views_extra,omitempty"`
 	ViewsMismatched []ViewDiff `json:"views_mismatched,omitempty"`
+
+	// Standalone-sequence deltas (audit 2026-08-04 B-10). [ir.Schema]
+	// carries Sequences specifically to close a named silent-loss item —
+	// before the field existed, a re-optioned `CREATE SEQUENCE ... START
+	// 1000 INCREMENT 5` collapsed to a plain identity column and the
+	// migrated target generated DIFFERENT numbers than the source would.
+	// This comparison walked Tables and Views only, so the one surface an
+	// operator uses to CHECK that outcome could not see it.
+	//
+	// Matched by name (set semantics, mirroring tables and views).
+	SequencesMissing    []string       `json:"sequences_missing,omitempty"`
+	SequencesExtra      []string       `json:"sequences_extra,omitempty"`
+	SequencesMismatched []SequenceDiff `json:"sequences_mismatched,omitempty"`
+
+	// ForeignKeysUnnamed totals the foreign keys across EVERY table
+	// compared on both sides that carry no constraint name and were
+	// therefore not compared. A COVERAGE figure, not a drift figure.
+	//
+	// It is hoisted to the schema level because the per-table
+	// [TableDiff.ForeignKeysUnnamed] could only ever be seen when the
+	// table ALSO had real drift — a TableDiff with nothing but an unnamed
+	// count fails [TableDiff.hasChanges] and is dropped from the result.
+	// So the field's own promise that the skip is "reported rather than
+	// silent" held only by accident, on tables that happened to differ for
+	// another reason. That is the shape of a written invariant nobody
+	// checks; TestForeignKeysUnnamedIsReportedNotSilentlySkipped is the
+	// test that now fails when it breaks.
+	//
+	// Deliberately NOT part of [SchemaDiff.HasChanges]: an unnamed FK is
+	// not drift, and making a healthy pair exit 1 forever would earn the
+	// check a permanent suppression — which would hide the real drift
+	// alongside it.
+	ForeignKeysUnnamed int `json:"foreign_keys_unnamed,omitempty"`
 }
 
 // ViewDiff captures a single view's expected-vs-actual definition
@@ -87,7 +120,8 @@ type ViewDiff struct {
 // this to pick exit code 0 vs 1; same-shape unit-test predicate.
 func (d SchemaDiff) HasChanges() bool {
 	return len(d.TablesMissing) > 0 || len(d.TablesExtra) > 0 || len(d.TablesMismatched) > 0 ||
-		len(d.ViewsMissing) > 0 || len(d.ViewsExtra) > 0 || len(d.ViewsMismatched) > 0
+		len(d.ViewsMissing) > 0 || len(d.ViewsExtra) > 0 || len(d.ViewsMismatched) > 0 ||
+		len(d.SequencesMissing) > 0 || len(d.SequencesExtra) > 0 || len(d.SequencesMismatched) > 0
 }
 
 // Summary returns a short human-readable rollup of the diff (e.g.
@@ -114,8 +148,16 @@ func (d SchemaDiff) Summary() string {
 		chkMissing, chkExtra, chkMismatched int
 		fkMissing, fkExtra, fkMismatched    int
 		exMissing, exExtra, exMismatched    int
+		polMissing, polExtra, polMismatched int
+		rlsMismatched                       int
 	)
 	for _, td := range d.TablesMismatched {
+		polMissing += len(td.PoliciesMissing)
+		polExtra += len(td.PoliciesExtra)
+		polMismatched += len(td.PoliciesMismatched)
+		if td.RLSMismatched {
+			rlsMismatched++
+		}
 		colMissing += len(td.ColumnsMissing)
 		colExtra += len(td.ColumnsExtra)
 		colMismatched += len(td.ColumnsMismatched)
@@ -147,9 +189,19 @@ func (d SchemaDiff) Summary() string {
 	add(exMissing, "missing EXCLUDE", "missing EXCLUDEs")
 	add(exExtra, "extra EXCLUDE", "extra EXCLUDEs")
 	add(exMismatched, "EXCLUDE mismatch", "EXCLUDE mismatches")
+	// RLS leads the security block: a table whose row-level security is
+	// off on the target is the one entry here that means "every tenant
+	// can read every tenant's rows".
+	add(rlsMismatched, "row-level-security mismatch", "row-level-security mismatches")
+	add(polMissing, "missing policy", "missing policies")
+	add(polExtra, "extra policy", "extra policies")
+	add(polMismatched, "policy mismatch", "policy mismatches")
 	add(len(d.ViewsMissing), "missing view", "missing views")
 	add(len(d.ViewsExtra), "extra view", "extra views")
 	add(len(d.ViewsMismatched), "view mismatch", "view mismatches")
+	add(len(d.SequencesMissing), "missing sequence", "missing sequences")
+	add(len(d.SequencesExtra), "extra sequence", "extra sequences")
+	add(len(d.SequencesMismatched), "sequence mismatch", "sequence mismatches")
 	if len(parts) == 0 {
 		return "in sync"
 	}
@@ -213,6 +265,32 @@ type TableDiff struct {
 	ExcludesMissing    []string      `json:"excludes_missing,omitempty"`
 	ExcludesExtra      []string      `json:"excludes_extra,omitempty"`
 	ExcludesMismatched []ExcludeDiff `json:"excludes_mismatched,omitempty"`
+
+	// Row-level-security deltas (audit 2026-08-04 B-10). ADR-0063 put
+	// RLSEnabled / RLSForced / Policies in the IR to close task #52's
+	// silent-SECURITY-regression failure mode; none of the three was
+	// compared here, so a target-side `DISABLE ROW LEVEL SECURITY`
+	// reported "in sync" and exited 0 while every tenant read every
+	// tenant's rows.
+	//
+	// RLSMismatched gates the two flag pairs for the reason
+	// [IndexDiff.UniqueMismatched] does: false is both a real value and
+	// the zero value, so a bare bool pair cannot say "this differs". The
+	// two flags are reported as ONE unit because they are only meaningful
+	// together — FORCE without ENABLE enforces nothing, so a diff that
+	// showed them independently would invite reconciling half of it.
+	RLSMismatched      bool `json:"rls_mismatched,omitempty"`
+	ExpectedRLSEnabled bool `json:"expected_rls_enabled,omitempty"`
+	ActualRLSEnabled   bool `json:"actual_rls_enabled,omitempty"`
+	ExpectedRLSForced  bool `json:"expected_rls_forced,omitempty"`
+	ActualRLSForced    bool `json:"actual_rls_forced,omitempty"`
+
+	// Policy deltas, matched by policy name (set semantics, the same the
+	// CHECK / EXCLUDE / FK comparisons use). PG-only; MySQL sides always
+	// have empty slices.
+	PoliciesMissing    []string     `json:"policies_missing,omitempty"`
+	PoliciesExtra      []string     `json:"policies_extra,omitempty"`
+	PoliciesMismatched []PolicyDiff `json:"policies_mismatched,omitempty"`
 }
 
 // ColumnDiff captures a single column's expected-vs-actual mismatch.
@@ -420,12 +498,18 @@ func Schemas(expected, actual *ir.Schema, opts Options) SchemaDiff {
 	sort.Strings(commonNames)
 	for _, name := range commonNames {
 		td := diffTable(expByName[name], actByName[name], opts)
+		// Accumulated BEFORE the hasChanges gate: a table whose only
+		// notable property is that N of its foreign keys could not be
+		// compared is dropped from TablesMismatched, and the coverage gap
+		// would vanish with it.
+		d.ForeignKeysUnnamed += td.ForeignKeysUnnamed
 		if td.hasChanges() {
 			d.TablesMismatched = append(d.TablesMismatched, td)
 		}
 	}
 
 	diffViews(&d, expected, actual, opts)
+	diffSequences(&d, expected, actual, opts)
 	return d
 }
 
@@ -517,7 +601,11 @@ func (td TableDiff) hasChanges() bool {
 		len(td.ChecksMismatched) > 0 ||
 		len(td.ExcludesMissing) > 0 ||
 		len(td.ExcludesExtra) > 0 ||
-		len(td.ExcludesMismatched) > 0
+		len(td.ExcludesMismatched) > 0 ||
+		td.RLSMismatched ||
+		len(td.PoliciesMissing) > 0 ||
+		len(td.PoliciesExtra) > 0 ||
+		len(td.PoliciesMismatched) > 0
 }
 
 func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
@@ -599,6 +687,7 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 	diffChecks(&td, expected, actual, opts)
 	diffForeignKeys(&td, expected, actual, opts)
 	diffExcludes(&td, expected, actual, opts)
+	diffRowLevelSecurity(&td, expected, actual, opts)
 
 	return td
 }
@@ -1245,16 +1334,24 @@ func diffForeignKeys(td *TableDiff, expected, actual *ir.Table, opts Options) {
 			d.ExpectedReference, d.ActualReference = er, ar
 			mismatched = true
 		}
+		// .String(), NOT string(...): [ir.FKAction] and [ir.FKMatch] are
+		// uint8-backed, so the conversion form yields the raw code point
+		// ("\x02" for CASCADE) rather than the keyword — and `go vet` is
+		// SILENT on it precisely because both types implement Stringer,
+		// which makes the conversion legal. That shipped in v0.112.0 and
+		// put control bytes in the JSON diff's referential-action fields;
+		// TestForeignKeyActionsRenderAsKeywordsNotCodePoints pins it,
+		// since the compiler and vet will not.
 		if exp.OnDelete != act.OnDelete {
-			d.ExpectedOnDelete, d.ActualOnDelete = string(exp.OnDelete), string(act.OnDelete)
+			d.ExpectedOnDelete, d.ActualOnDelete = exp.OnDelete.String(), act.OnDelete.String()
 			mismatched = true
 		}
 		if exp.OnUpdate != act.OnUpdate {
-			d.ExpectedOnUpdate, d.ActualOnUpdate = string(exp.OnUpdate), string(act.OnUpdate)
+			d.ExpectedOnUpdate, d.ActualOnUpdate = exp.OnUpdate.String(), act.OnUpdate.String()
 			mismatched = true
 		}
 		if exp.Match != act.Match {
-			d.ExpectedMatch, d.ActualMatch = string(exp.Match), string(act.Match)
+			d.ExpectedMatch, d.ActualMatch = exp.Match.String(), act.Match.String()
 			mismatched = true
 		}
 		if exp.Deferrable != act.Deferrable || exp.InitiallyDeferred != act.InitiallyDeferred {

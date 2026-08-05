@@ -144,6 +144,21 @@ func baseTable() *ir.Table {
 		Indexes: []*ir.Index{
 			{Name: "idx_amount", Columns: []ir.IndexColumn{{Column: "amount"}}},
 		},
+		// A CHECK and an FK on the base shape so the DROPPED and REDEFINED
+		// fixtures for both have something to remove or edit (roadmap
+		// item 113). Both sides of every other fixture carry them
+		// identically, so they add no aspect of their own.
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "amount_nonneg", Expr: "amount >= 0"},
+		},
+		ForeignKeys: []*ir.ForeignKey{
+			{
+				Name:              "fk_orders_user",
+				Columns:           []string{"id"},
+				ReferencedTable:   "users",
+				ReferencedColumns: []string{"id"},
+			},
+		},
 	}
 }
 
@@ -159,6 +174,19 @@ func cloneTable(t *ir.Table) *ir.Table {
 	for i, idx := range t.Indexes {
 		ii := *idx
 		out.Indexes[i] = &ii
+	}
+	// Deep-copied for the same reason the two above are: an "added"
+	// fixture appends, and appending to a slice header shared with the
+	// before-shape can write through to it.
+	out.CheckConstraints = make([]*ir.CheckConstraint, len(t.CheckConstraints))
+	for i, c := range t.CheckConstraints {
+		cc := *c
+		out.CheckConstraints[i] = &cc
+	}
+	out.ForeignKeys = make([]*ir.ForeignKey, len(t.ForeignKeys))
+	for i, fk := range t.ForeignKeys {
+		ff := *fk
+		out.ForeignKeys[i] = &ff
 	}
 	return &out
 }
@@ -264,6 +292,48 @@ var alterFixtures = map[AlterAspect]alterFixture{
 				t.Errorf("recreated index = %+v; want the UNIQUE after-shape", w.createdIdx[0])
 			}
 		},
+	},
+
+	// Roadmap item 113. The check-added fixture IS the scenario the item-60
+	// integration ground truth printed as schemaDelta=0: a mid-window
+	// `ADD CHECK` that produced no delta at all, so a restore of the chain
+	// landed a target missing the constraint and exited 0.
+	AlterAspectCheckAdded: {
+		mutate: func(a *ir.Table) {
+			a.CheckConstraints = append(a.CheckConstraints,
+				&ir.CheckConstraint{Name: "amount_under_1m", Expr: "amount < 1000000"})
+		},
+	},
+	AlterAspectCheckDropped: {
+		mutate: func(a *ir.Table) { a.CheckConstraints = nil },
+		wantCall: func(t *testing.T, w *recordingSchemaWriter) {
+			t.Helper()
+			if len(w.droppedChecks) != 1 || w.droppedChecks[0].Name != "amount_nonneg" {
+				t.Errorf("AlterDropCheck calls = %+v; want [amount_nonneg]", w.droppedChecks)
+			}
+		},
+	},
+	AlterAspectCheckRedefined: {
+		mutate: func(a *ir.Table) { a.CheckConstraints[0].Expr = "amount >= 100" },
+	},
+	AlterAspectForeignKeyAdded: {
+		mutate: func(a *ir.Table) {
+			a.ForeignKeys = append(a.ForeignKeys, &ir.ForeignKey{
+				Name:              "fk_orders_region",
+				Columns:           []string{"amount"},
+				ReferencedTable:   "regions",
+				ReferencedColumns: []string{"id"},
+			})
+		},
+	},
+	AlterAspectForeignKeyDropped: {
+		mutate: func(a *ir.Table) { a.ForeignKeys = nil },
+	},
+	AlterAspectForeignKeyRedefined: {
+		// A weakened referential action, not a renamed column: this is the
+		// shape that changes what a parent DELETE does to child rows while
+		// leaving the constraint looking identical by name.
+		mutate: func(a *ir.Table) { a.ForeignKeys[0].OnDelete = ir.FKActionCascade },
 	},
 }
 

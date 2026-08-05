@@ -128,6 +128,10 @@ type DiffJSON struct {
 
 // DiffJSONCounts is the high-level rollup the CI consumer looks at
 // first. Per-table breakdowns live in the embedded SchemaDiff.
+// Every count here is derived in [summarise] and pinned against the
+// renderer by TestDiffSurfaceRosterEveryTableDiffFieldIsRenderedAndCounted
+// — a TableDiff/SchemaDiff field that reaches neither this rollup nor the
+// text output fails that gate rather than silently reading zero.
 type DiffJSONCounts struct {
 	TablesMissing     int `json:"tables_missing"`
 	TablesExtra       int `json:"tables_extra"`
@@ -141,9 +145,43 @@ type DiffJSONCounts struct {
 	ChecksMissing     int `json:"checks_missing"`
 	ChecksExtra       int `json:"checks_extra"`
 	ChecksMismatched  int `json:"checks_mismatched"`
-	ViewsMissing      int `json:"views_missing"`
-	ViewsExtra        int `json:"views_extra"`
-	ViewsMismatched   int `json:"views_mismatched"`
+
+	// Foreign-key counts (audit 2026-08-04 C-7 / Bug 227). The v0.112.0
+	// FK work wired the comparison and HasChanges but neither the text
+	// renderer nor this rollup, so a CI consumer keying off `summary` read
+	// zeros while the command exited 1.
+	ForeignKeysMissing    int `json:"foreign_keys_missing"`
+	ForeignKeysExtra      int `json:"foreign_keys_extra"`
+	ForeignKeysMismatched int `json:"foreign_keys_mismatched"`
+
+	// ForeignKeysUnnamed is a COVERAGE figure, not a drift figure: the
+	// number of foreign keys the comparison could not match on either side
+	// because they carry no constraint name. Surfaced so a zero-drift
+	// report cannot quietly mean "nothing was compared". Both shipping
+	// engines auto-name FK constraints, so this is normally zero.
+	ForeignKeysUnnamed int `json:"foreign_keys_unnamed"`
+
+	// EXCLUDE counts. Same omission as the FK block above and found by the
+	// same sweep — ADR-0053 added the comparison, no render, no count.
+	ExcludesMissing    int `json:"excludes_missing"`
+	ExcludesExtra      int `json:"excludes_extra"`
+	ExcludesMismatched int `json:"excludes_mismatched"`
+
+	// Row-level-security counts (audit 2026-08-04 B-10). RLSMismatched is
+	// a count of TABLES whose ENABLE/FORCE flags disagree, not of flags.
+	RLSMismatched      int `json:"rls_mismatched"`
+	PoliciesMissing    int `json:"policies_missing"`
+	PoliciesExtra      int `json:"policies_extra"`
+	PoliciesMismatched int `json:"policies_mismatched"`
+
+	ViewsMissing    int `json:"views_missing"`
+	ViewsExtra      int `json:"views_extra"`
+	ViewsMismatched int `json:"views_mismatched"`
+
+	// Standalone-sequence counts (audit 2026-08-04 B-10).
+	SequencesMissing    int `json:"sequences_missing"`
+	SequencesExtra      int `json:"sequences_extra"`
+	SequencesMismatched int `json:"sequences_mismatched"`
 }
 
 // Run executes the diff. Returns the computed diff plus an error.
@@ -517,6 +555,13 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 	if b.opts.IgnoreExtras {
 		sb.WriteString("-- (extra-on-target entries suppressed via --ignore-extras)\n")
 	}
+	if n := b.diff.ForeignKeysUnnamed; n > 0 {
+		// A coverage caveat on the WHOLE report, so it belongs in the
+		// preamble next to the suppression notices rather than buried in a
+		// per-table section the reader may never reach — the tables whose
+		// FKs went uncompared are frequently the ones with no other drift.
+		fmt.Fprintf(&sb, "-- (COVERAGE: %d foreign key(s) carry no constraint name and were NOT compared)\n", n)
+	}
 	sb.WriteString("--\n")
 	sb.WriteString("-- The ALTER/DROP statements below are starting points for manual\n")
 	sb.WriteString("-- reconciliation. sluice does not execute them. Review carefully\n")
@@ -617,6 +662,8 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 		sb.WriteByte('\n')
 	}
 
+	renderSequenceSections(&sb, b.diff, quote, b.expected)
+
 	// Per-table mismatched sections.
 	for _, td := range b.diff.TablesMismatched {
 		fmt.Fprintf(&sb, "-- ──────────── %s (mismatched) ────────────\n", td.Name)
@@ -654,6 +701,9 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 			fmt.Fprintf(&sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
 				quote(td.Name), quote(ck.Name), ck.ExpectedExpr)
 		}
+		renderForeignKeySection(&sb, td, quote, b.expected)
+		renderExcludeSection(&sb, td, quote, b.expected)
+		renderRowLevelSecuritySection(&sb, td, quote)
 		sb.WriteByte('\n')
 	}
 
@@ -936,12 +986,19 @@ func countTables(s *ir.Schema) int {
 // summarise rolls per-table counts up into the header summary line.
 func summarise(d irdiff.SchemaDiff) DiffJSONCounts {
 	c := DiffJSONCounts{
-		TablesMissing:    len(d.TablesMissing),
-		TablesExtra:      len(d.TablesExtra),
-		TablesMismatched: len(d.TablesMismatched),
-		ViewsMissing:     len(d.ViewsMissing),
-		ViewsExtra:       len(d.ViewsExtra),
-		ViewsMismatched:  len(d.ViewsMismatched),
+		TablesMissing:       len(d.TablesMissing),
+		TablesExtra:         len(d.TablesExtra),
+		TablesMismatched:    len(d.TablesMismatched),
+		ViewsMissing:        len(d.ViewsMissing),
+		ViewsExtra:          len(d.ViewsExtra),
+		ViewsMismatched:     len(d.ViewsMismatched),
+		SequencesMissing:    len(d.SequencesMissing),
+		SequencesExtra:      len(d.SequencesExtra),
+		SequencesMismatched: len(d.SequencesMismatched),
+		// Read from the SCHEMA-level total, not summed from
+		// TablesMismatched: a table whose only notable property is an
+		// uncompared FK never reaches TablesMismatched at all.
+		ForeignKeysUnnamed: d.ForeignKeysUnnamed,
 	}
 	for _, td := range d.TablesMismatched {
 		c.ColumnsMissing += len(td.ColumnsMissing)
@@ -953,6 +1010,18 @@ func summarise(d irdiff.SchemaDiff) DiffJSONCounts {
 		c.ChecksMissing += len(td.ChecksMissing)
 		c.ChecksExtra += len(td.ChecksExtra)
 		c.ChecksMismatched += len(td.ChecksMismatched)
+		c.ForeignKeysMissing += len(td.ForeignKeysMissing)
+		c.ForeignKeysExtra += len(td.ForeignKeysExtra)
+		c.ForeignKeysMismatched += len(td.ForeignKeysMismatched)
+		c.ExcludesMissing += len(td.ExcludesMissing)
+		c.ExcludesExtra += len(td.ExcludesExtra)
+		c.ExcludesMismatched += len(td.ExcludesMismatched)
+		c.PoliciesMissing += len(td.PoliciesMissing)
+		c.PoliciesExtra += len(td.PoliciesExtra)
+		c.PoliciesMismatched += len(td.PoliciesMismatched)
+		if td.RLSMismatched {
+			c.RLSMismatched++
+		}
 	}
 	return c
 }

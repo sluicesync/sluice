@@ -30,6 +30,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -91,6 +93,39 @@ const (
 	// AlterAspectIndexRedefined — a same-named index whose columns or
 	// uniqueness differ.
 	AlterAspectIndexRedefined AlterAspect = "index-redefined"
+
+	// The CHECK and foreign-key aspects (roadmap item 113). Before these
+	// existed the registry closed the DISPOSITION hole one level below a
+	// COVERAGE hole: [tablesEqual] never compared CheckConstraints or
+	// ForeignKeys at all, so a mid-window `ADD CHECK` produced no delta to
+	// dispose OF. The item-60 integration ground truth printed it —
+	// scenario="ADD CHECK CONSTRAINT only (no DML)" schemaDelta=0 — and a
+	// restore of that chain landed a target missing the constraint, exit 0.
+
+	// AlterAspectCheckAdded — a CHECK constraint present in after and
+	// absent from before.
+	AlterAspectCheckAdded AlterAspect = "check-added"
+
+	// AlterAspectCheckDropped — a CHECK constraint present in before and
+	// absent from after.
+	AlterAspectCheckDropped AlterAspect = "check-dropped"
+
+	// AlterAspectCheckRedefined — a same-named CHECK whose expression
+	// differs.
+	AlterAspectCheckRedefined AlterAspect = "check-redefined"
+
+	// AlterAspectForeignKeyAdded — a foreign key present in after and
+	// absent from before.
+	AlterAspectForeignKeyAdded AlterAspect = "foreign-key-added"
+
+	// AlterAspectForeignKeyDropped — a foreign key present in before and
+	// absent from after.
+	AlterAspectForeignKeyDropped AlterAspect = "foreign-key-dropped"
+
+	// AlterAspectForeignKeyRedefined — a same-named foreign key whose
+	// enforced shape (referenced table/columns, referential actions, match
+	// rule, deferrability) differs.
+	AlterAspectForeignKeyRedefined AlterAspect = "foreign-key-redefined"
 )
 
 // AlterColumnChange pairs a same-named column's before- and after-shape
@@ -119,6 +154,13 @@ type AlterResidual struct {
 	CreatedIndexes   []*ir.Index
 	DroppedIndexes   []*ir.Index
 	RedefinedIndexes []*ir.Index
+
+	// DroppedChecks carries the payload for [AlterAspectCheckDropped], the
+	// only one of the six constraint aspects with an AlterApply
+	// disposition. The other five refuse, and a refusal names the table and
+	// the aspect rather than the objects — carrying payload nobody reads
+	// would be a claim that something acts on it.
+	DroppedChecks []*ir.CheckConstraint
 }
 
 // Equal reports whether the two shapes were structurally identical.
@@ -204,6 +246,30 @@ var alterAspectComparators = []struct {
 		Aspect: AlterAspectIndexRedefined,
 		Same:   func(a, b *ir.Table) bool { return len(redefinedIndexes(a, b)) == 0 },
 	},
+	{
+		Aspect: AlterAspectCheckAdded,
+		Same:   func(a, b *ir.Table) bool { return len(addedChecks(a, b)) == 0 },
+	},
+	{
+		Aspect: AlterAspectCheckDropped,
+		Same:   func(a, b *ir.Table) bool { return len(addedChecks(b, a)) == 0 },
+	},
+	{
+		Aspect: AlterAspectCheckRedefined,
+		Same:   func(a, b *ir.Table) bool { return len(redefinedChecks(a, b)) == 0 },
+	},
+	{
+		Aspect: AlterAspectForeignKeyAdded,
+		Same:   func(a, b *ir.Table) bool { return len(addedForeignKeys(a, b)) == 0 },
+	},
+	{
+		Aspect: AlterAspectForeignKeyDropped,
+		Same:   func(a, b *ir.Table) bool { return len(addedForeignKeys(b, a)) == 0 },
+	},
+	{
+		Aspect: AlterAspectForeignKeyRedefined,
+		Same:   func(a, b *ir.Table) bool { return len(redefinedForeignKeys(a, b)) == 0 },
+	},
 }
 
 // AllAlterAspects returns every aspect the diff can report, DERIVED
@@ -241,6 +307,7 @@ func ClassifyAlterDelta(before, after *ir.Table) AlterResidual {
 	res.CreatedIndexes = addedIndexes(before, after)
 	res.DroppedIndexes = addedIndexes(after, before)
 	res.RedefinedIndexes = redefinedIndexes(before, after)
+	res.DroppedChecks = addedChecks(after, before)
 
 	// Per-column aspects, paired BY NAME (positional pairing would
 	// report a reorder as a type change on every moved column).
@@ -383,6 +450,168 @@ func redefinedIndexes(before, after *ir.Table) []*ir.Index {
 	return out
 }
 
+// constraintKey is the identity a CHECK or foreign key is matched on
+// across the before/after shapes: its NAME when it has one, otherwise its
+// full fingerprint.
+//
+// The fallback matters. Every other name-keyed comparison in sluice SKIPS
+// unnamed constraints, which is right for `schema diff` (it reports the
+// skip as a coverage figure the operator can act on) and wrong here:
+// there is no operator in the loop on a chain replay, and two unnamed
+// constraints would collide on the key "" and hide each other. Keying an
+// unnamed constraint by its own fingerprint makes an edit to it surface
+// as an add PLUS a drop rather than vanishing — noisier, and never
+// silent.
+func constraintKey(name, fingerprint string) string {
+	if name != "" {
+		return name
+	}
+	return "\x00fingerprint:" + fingerprint
+}
+
+// checkFingerprint renders a CHECK's enforced content: its expression.
+// ExprDialect is deliberately excluded — a dialect retag with an
+// unchanged expression is a manifest-provenance change, not a DDL the
+// source ran.
+func checkFingerprint(c *ir.CheckConstraint) string {
+	return strings.TrimSpace(c.Expr)
+}
+
+// fkFingerprint renders a foreign key's enforced shape: everything that
+// decides which rows are legal and what happens to them. Same attribute
+// set the cross-engine `schema diff` comparison settled on.
+func fkFingerprint(fk *ir.ForeignKey) string {
+	return strings.Join([]string{
+		strings.Join(fk.Columns, ","),
+		fk.ReferencedSchema,
+		fk.ReferencedTable,
+		strings.Join(fk.ReferencedColumns, ","),
+		fk.OnDelete.String(),
+		fk.OnUpdate.String(),
+		fk.Match.String(),
+		strconv.FormatBool(fk.Deferrable),
+		strconv.FormatBool(fk.InitiallyDeferred),
+	}, "|")
+}
+
+// checksByKey indexes a table's CHECK constraints by [constraintKey].
+func checksByKey(t *ir.Table) map[string]*ir.CheckConstraint {
+	out := make(map[string]*ir.CheckConstraint, len(t.CheckConstraints))
+	for _, c := range t.CheckConstraints {
+		if c == nil {
+			continue
+		}
+		out[constraintKey(c.Name, checkFingerprint(c))] = c
+	}
+	return out
+}
+
+// foreignKeysByKey indexes a table's foreign keys by [constraintKey].
+func foreignKeysByKey(t *ir.Table) map[string]*ir.ForeignKey {
+	out := make(map[string]*ir.ForeignKey, len(t.ForeignKeys))
+	for _, fk := range t.ForeignKeys {
+		if fk == nil {
+			continue
+		}
+		out[constraintKey(fk.Name, fkFingerprint(fk))] = fk
+	}
+	return out
+}
+
+// addedChecks returns the CHECK constraints keyed in after but not
+// before, preserving after's declaration order.
+func addedChecks(before, after *ir.Table) []*ir.CheckConstraint {
+	if after == nil {
+		return nil
+	}
+	var beforeKeys map[string]*ir.CheckConstraint
+	if before != nil {
+		beforeKeys = checksByKey(before)
+	}
+	var out []*ir.CheckConstraint
+	for _, c := range after.CheckConstraints {
+		if c == nil {
+			continue
+		}
+		if _, ok := beforeKeys[constraintKey(c.Name, checkFingerprint(c))]; !ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// redefinedChecks returns after's CHECKs that share a NAME with a before
+// CHECK but carry a different expression. Unnamed constraints cannot be
+// redefined by definition — their key IS their content, so a change makes
+// them an add plus a drop.
+func redefinedChecks(before, after *ir.Table) []*ir.CheckConstraint {
+	if before == nil || after == nil {
+		return nil
+	}
+	byName := make(map[string]*ir.CheckConstraint, len(before.CheckConstraints))
+	for _, c := range before.CheckConstraints {
+		if c != nil && c.Name != "" {
+			byName[c.Name] = c
+		}
+	}
+	var out []*ir.CheckConstraint
+	for _, c := range after.CheckConstraints {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		if prev, ok := byName[c.Name]; ok && checkFingerprint(prev) != checkFingerprint(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// addedForeignKeys returns the foreign keys keyed in after but not
+// before, preserving after's declaration order.
+func addedForeignKeys(before, after *ir.Table) []*ir.ForeignKey {
+	if after == nil {
+		return nil
+	}
+	var beforeKeys map[string]*ir.ForeignKey
+	if before != nil {
+		beforeKeys = foreignKeysByKey(before)
+	}
+	var out []*ir.ForeignKey
+	for _, fk := range after.ForeignKeys {
+		if fk == nil {
+			continue
+		}
+		if _, ok := beforeKeys[constraintKey(fk.Name, fkFingerprint(fk))]; !ok {
+			out = append(out, fk)
+		}
+	}
+	return out
+}
+
+// redefinedForeignKeys returns after's foreign keys that share a NAME
+// with a before FK but enforce a different shape.
+func redefinedForeignKeys(before, after *ir.Table) []*ir.ForeignKey {
+	if before == nil || after == nil {
+		return nil
+	}
+	byName := make(map[string]*ir.ForeignKey, len(before.ForeignKeys))
+	for _, fk := range before.ForeignKeys {
+		if fk != nil && fk.Name != "" {
+			byName[fk.Name] = fk
+		}
+	}
+	var out []*ir.ForeignKey
+	for _, fk := range after.ForeignKeys {
+		if fk == nil || fk.Name == "" {
+			continue
+		}
+		if prev, ok := byName[fk.Name]; ok && fkFingerprint(prev) != fkFingerprint(fk) {
+			out = append(out, fk)
+		}
+	}
+	return out
+}
+
 // AlterDisposition is what the chain-replay side does with an aspect.
 type AlterDisposition int
 
@@ -422,6 +651,28 @@ type alterDisposition struct {
 //     pre-DDL events that still name the column, and dropping it before
 //     the replay discards those values with no trace. Refusing is the
 //     loud half of the same posture.
+//
+//   - check-dropped has a surface and APPLIES, while check-added and
+//     check-redefined REFUSE despite [ir.ShapeDeltaApplier.AlterAddCheck]
+//     existing. The asymmetry is about REPLAY ORDER, not about surfaces.
+//     Dropping a constraint only ever widens what is legal, so applying
+//     it before the window replays cannot reject anything. ADDING one
+//     cannot be ordered faithfully at all: the source's own `ADD CHECK`
+//     landed PARTWAY THROUGH the window and validated only the rows
+//     present at that instant, so an earlier event in the same window can
+//     legally carry a value the constraint forbids. Applying the CHECK
+//     first makes the target reject that event; applying it after the
+//     replay leaves the target disagreeing with the manifest for the rest
+//     of the chain. Refusing names the table and sends the operator to a
+//     fresh full — the same posture column-dropped takes.
+//
+//   - the three foreign-key aspects REFUSE for a plainer reason: the IR
+//     exposes NO applier surface for foreign keys (there is no
+//     AlterAddForeignKey / AlterDropForeignKey on any engine), so there
+//     is nothing to apply through. foreign-key-dropped is the one that
+//     WOULD be safely applicable on the check-dropped argument above if
+//     such a surface existed; that is the follow-up, not a silent skip.
+//
 //   - column-default has NO surface and is still not refused: a DEFAULT
 //     is only consulted for a column a statement omits, and row-based
 //     CDC replay writes an explicit value for every column of every
@@ -478,6 +729,30 @@ var alterDispositions = map[AlterAspect]alterDisposition{
 	AlterAspectIndexRedefined: {
 		Verdict: AlterApply,
 		Reason:  "DROP + CREATE INDEX via the engine's shape-delta surface",
+	},
+	AlterAspectCheckAdded: {
+		Verdict: AlterRefuse,
+		Reason:  "the source's own ADD CHECK landed partway through the window and validated only the rows present at that instant, so an earlier event in the same window can legally carry a value the constraint forbids — applying the CHECK before the replay rejects that event, and applying it after leaves the target disagreeing with the manifest",
+	},
+	AlterAspectCheckDropped: {
+		Verdict: AlterApply,
+		Reason:  "ALTER TABLE ... DROP CONSTRAINT via the engine's shape-delta surface; dropping a CHECK only widens what is legal, so removing it before the replay cannot reject an event the window carries",
+	},
+	AlterAspectCheckRedefined: {
+		Verdict: AlterRefuse,
+		Reason:  "a redefinition is a DROP followed by an ADD, and the ADD half carries the same mid-window validation hazard as check-added; the diff cannot tell whether the new expression is a widening or a tightening from its text",
+	},
+	AlterAspectForeignKeyAdded: {
+		Verdict: AlterRefuse,
+		Reason:  "the IR exposes no foreign-key applier surface on any engine, so there is no way to emit the constraint — and the mid-window ordering hazard that refuses check-added applies here too, since a replayed child row can precede its parent",
+	},
+	AlterAspectForeignKeyDropped: {
+		Verdict: AlterRefuse,
+		Reason:  "the IR exposes no foreign-key applier surface on any engine, so the target keeps enforcing a reference the source dropped and rejects replayed rows whose parent no longer exists; this is the one FK aspect that would be safely applicable if the surface existed",
+	},
+	AlterAspectForeignKeyRedefined: {
+		Verdict: AlterRefuse,
+		Reason:  "the IR exposes no foreign-key applier surface on any engine, so a re-pointed parent, a weakened referential action or a changed match rule cannot be reproduced on the target",
 	},
 }
 
@@ -637,11 +912,29 @@ func applyAlterAspect(
 				"the target engine's schema writer does not implement ir.ShapeDeltaApplier, so the index change cannot be applied")
 		}
 		return applyAlterIndexAspect(ctx, aspect, res, retargeted, d, shapeApplier, ac)
+	case AlterAspectCheckDropped:
+		if shapeApplier == nil {
+			return alterDeltaRefusal(ac, d.Table, aspect,
+				"the target engine's schema writer does not implement ir.ShapeDeltaApplier, so the dropped CHECK cannot be removed — and leaving it makes the target reject rows the source now accepts")
+		}
+		if err := shapeApplier.AlterDropCheck(ctx, retargeted, res.DroppedChecks); err != nil {
+			return fmt.Errorf("drop check on %s: %w", d.Table, err)
+		}
+		slog.InfoContext(ctx, ac.Origin+": schema delta — applied DROP CONSTRAINT (CHECK)",
+			append(ac.logAttrs(d.Table), "dropped_checks", len(res.DroppedChecks))...)
 	case AlterAspectTableIdentity, AlterAspectColumnDropped, AlterAspectColumnOrder,
-		AlterAspectColumnGenerated, AlterAspectColumnDefault, AlterAspectPrimaryKey:
+		AlterAspectColumnGenerated, AlterAspectColumnDefault, AlterAspectPrimaryKey,
+		AlterAspectCheckAdded, AlterAspectCheckRedefined,
+		AlterAspectForeignKeyAdded, AlterAspectForeignKeyDropped, AlterAspectForeignKeyRedefined:
 		// Not AlterApply aspects — unreachable; the caller dispatched on
 		// the disposition. Refuse rather than fall through silently.
 		return alterDeltaRefusal(ac, d.Table, aspect, "aspect is not an apply-disposition aspect")
+	default:
+		// A new AlterApply aspect with no arm above would otherwise fall
+		// out of this switch and return nil having emitted nothing — the
+		// exact silent skip this whole file exists to prevent. Fail closed.
+		return alterDeltaRefusal(ac, d.Table, aspect,
+			"this sluice build has an apply disposition for the aspect but no emit path for it (development gap)")
 	}
 	return nil
 }
