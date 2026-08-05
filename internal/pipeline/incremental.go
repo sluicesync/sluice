@@ -44,6 +44,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -1263,8 +1264,25 @@ func (b *IncrementalBackup) captureWindow(
 					advanced = windowAdvancedPast(b.Source, startPos, pos)
 				}
 			}
-			// Roll the chunk when it hits the row cap.
-			if writer.ChangeCount() >= int64(chunkSize) {
+			// Roll the chunk on whichever ceiling it reaches FIRST — the
+			// event count or the accumulated bytes.
+			//
+			// The byte ceiling is audit 2026-08-05 C-3: item 116 P3 added one
+			// to the data-chunk lane and stopped there, so THIS lane still
+			// rolled on event count alone while the chunk accumulated in an
+			// in-memory buffer. With the per-row limit at 64 MiB, the shipped
+			// default of DefaultIncrementalChunkChanges events could buffer
+			// arbitrarily much before rolling — and a wide TEXT/JSON/BLOB
+			// column arriving over CDC is exactly the shape that reaches it.
+			// 116 P3's commit and roadmap entry both enumerated the buffering
+			// paths as covered; that enumeration was false for this one.
+			//
+			// Same constant as the data lane, and uncompressed for the same
+			// reason: chunk boundaries feed the content-addressed same-path
+			// upload skip, so where a chunk ends must not depend on how well
+			// it compressed.
+			if writer.ChangeCount() >= int64(chunkSize) ||
+				writer.BytesWritten() >= backup.DefaultBackupChunkBytes {
 				if err := flush(); err != nil {
 					return endPos, totalChanges, advanced, err
 				}

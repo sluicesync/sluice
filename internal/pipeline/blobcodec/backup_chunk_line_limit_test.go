@@ -345,26 +345,75 @@ func mustReadFile(t *testing.T, name string) string {
 	return string(b)
 }
 
-// bodyCallsBufWWrite reports whether body contains a `<recv>.bufW.Write(...)`
-// call — the shape every chunk write core uses to emit one marshalled record.
+// bodyCallsBufWWrite reports whether body emits one marshalled chunk record.
+//
+// # Dual-signal discovery, because the field name alone was escapable
+// (audit 2026-08-05 B-8)
+//
+// The first version of this walker matched `<recv>.bufW.Write(...)` — the field
+// NAME. An executed mutation proved that hollow: a fourth write core spelling
+// its buffer `out *bufio.Writer` stayed GREEN, and renaming it to `bufW` went
+// RED. So the gate's promise that "a fourth write core added tomorrow fails
+// this test until it is guarded" held only under an unstated naming
+// convention — the same single-signal undercount this file's own header
+// criticises one paragraph earlier. A gate that can be escaped by choosing a
+// different identifier is a naming lint wearing a correctness gate's name.
+//
+// Two independent signals now, unioned:
+//
+//	(1) the conventional field name `bufW`, and
+//	(2) the SHAPE of emitting a line — a `Write(...)` and a `WriteByte('\n')`
+//	    on the SAME buffer field, whatever it is called.
+//
+// Signal (2) is what makes renaming useless. It also stays precise: the
+// change-chunk writer's `Close` writes ciphertext to a bare `out` with no
+// trailing newline, so requiring both calls on one field keeps Close out of the
+// roster rather than demanding a line-length check on a whole-chunk write.
 func bodyCallsBufWWrite(body *ast.BlockStmt) bool {
-	found := false
+	writesTo := map[string]bool{}   // field name → saw Write(...)
+	newlinesTo := map[string]bool{} // field name → saw WriteByte('\n')
+
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		outer, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || outer.Sel.Name != "Write" {
+		if !ok {
 			return true
 		}
 		inner, ok := outer.X.(*ast.SelectorExpr)
-		if ok && inner.Sel.Name == "bufW" {
-			found = true
+		if !ok {
+			return true
+		}
+		switch outer.Sel.Name {
+		case "Write":
+			writesTo[inner.Sel.Name] = true
+		case "WriteByte":
+			if len(call.Args) == 1 && isNewlineLiteral(call.Args[0]) {
+				newlinesTo[inner.Sel.Name] = true
+			}
 		}
 		return true
 	})
-	return found
+
+	// Signal 1: the conventional name.
+	if writesTo["bufW"] {
+		return true
+	}
+	// Signal 2: the line-emitting shape, under any field name.
+	for field := range writesTo {
+		if newlinesTo[field] {
+			return true
+		}
+	}
+	return false
+}
+
+// isNewlineLiteral reports whether e is the char literal '\n'.
+func isNewlineLiteral(e ast.Expr) bool {
+	bl, ok := e.(*ast.BasicLit)
+	return ok && bl.Kind == token.CHAR && bl.Value == `'\n'`
 }
 
 // bodyCallsIdent reports whether body calls the named package-level function.

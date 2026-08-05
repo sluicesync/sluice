@@ -60,7 +60,12 @@ type ChangeChunkWriter struct {
 	gzWriter    codecWriteCloser
 	bufW        *bufio.Writer
 	changeCount int64
-	closed      bool
+
+	// encodedBytes is the cumulative UNCOMPRESSED size of the JSON Lines
+	// accepted so far — the change-chunk twin of [ChunkWriter.encodedBytes],
+	// so this lane can roll on bytes and not only on a row count.
+	encodedBytes int64
+	closed       bool
 
 	// cek, when non-nil, enables encrypted mode (mirrors ChunkWriter).
 	// aad, when additionally non-nil, is the chunk's position binding
@@ -182,8 +187,18 @@ func (w *ChangeChunkWriter) WriteChange(c ir.Change) error {
 		return fmt.Errorf("change chunk record newline: %w", err)
 	}
 	w.changeCount++
+	w.encodedBytes += int64(len(b)) + 1
 	return nil
 }
+
+// BytesWritten returns the cumulative UNCOMPRESSED size of the JSON Lines this
+// writer has accepted, mirroring [ChunkWriter.BytesWritten] — the number a
+// caller rolls a chunk on (audit 2026-08-05 C-3).
+//
+// Uncompressed, deliberately and for the same reason as the data-chunk lane:
+// where a chunk ends must not depend on how well it happened to compress, or
+// the day a codec or its level changes, every boundary moves.
+func (w *ChangeChunkWriter) BytesWritten() int64 { return w.encodedBytes }
 
 // Close flushes the buffered writer and gzip stream. Idempotent. In
 // encrypted mode, encrypts the gzipped buffer and writes the
