@@ -254,11 +254,28 @@ func assertDriverInet6Renders(t *testing.T, dsn string, want map[int]string) {
 	}
 }
 
-// TestMariaDB_CDCReader_ResumeAfterKill pins exactly-once warm resume on
-// both LTS lines: stream a change, capture its domain-GTID position, close
-// the reader, apply a while-down change, then reopen from the captured
-// position and assert the while-down change arrives exactly once (and the
-// already-consumed change does NOT replay).
+// TestMariaDB_CDCReader_ResumeAfterKill pins warm resume on every LTS line:
+// stream a change, capture the domain-GTID positions it produced, close the
+// reader, apply a while-down change, then reopen and assert what each captured
+// position resumes to.
+//
+// # Both halves, because item 132 made them different
+//
+// This test used to capture the ROW's position and assert the while-down
+// change arrived exactly once — which is satisfiable ONLY if a row's position
+// contains the transaction that row belongs to. That was the item-132 defect
+// (a mid-transaction checkpoint of such a position skips the rest of its own
+// transaction on resume), so the old assertion was pinning the bug. It now
+// pins the contract on both sides:
+//
+//   - the TxCommit position is the EXACTLY-ONCE boundary: resuming there sees
+//     the while-down row and nothing else. This is the original intent, moved
+//     to the position that can actually honour it;
+//   - the ROW position is an AT-LEAST-ONCE restart point: resuming there
+//     replays its own transaction, which is exactly what makes a mid-
+//     transaction checkpoint safe (ADR-0010 idempotent re-apply).
+//
+// If the two ever collapse back to the same answer, the defect is back.
 func TestMariaDB_CDCReader_ResumeAfterKill(t *testing.T) {
 	// Across the full LTS spread: each line proves a live cold-start →
 	// domain-GTID capture → warm-resume exactly-once cycle, so the 12.x
@@ -290,22 +307,24 @@ func TestMariaDB_CDCReader_ResumeAfterKill(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 
 			applyMySQL(t, dsn, "INSERT INTO t (v) VALUES (100)")
-			got := drainChanges(t, ctx, changes, 1, 30*time.Second)
-			if len(got) != 1 {
-				t.Fatalf("initial: got %d changes; want 1", len(got))
+			// TxBegin, the Insert, TxCommit — the boundary events matter here,
+			// so the boundary-preserving drain is the right one.
+			got := drainChangesWithBoundaries(t, ctx, changes, 3, 30*time.Second)
+			if len(got) != 3 {
+				t.Fatalf("initial: got %d changes; want 3 (TxBegin, Insert, TxCommit): %#v", len(got), got)
 			}
-			capturedPos := got[0].Pos()
-			decoded, ok, derr := decodeBinlogPos(capturedPos)
-			if derr != nil || !ok {
-				t.Fatalf("decode captured position: ok=%v err=%v", ok, derr)
+			rowPos, commitPos := got[1].Pos(), got[2].Pos()
+			if _, isCommit := got[2].(ir.TxCommit); !isCommit {
+				t.Fatalf("initial: change 2 is %T; want ir.TxCommit", got[2])
 			}
-			if decoded.Mode != positionModeGTID {
-				t.Fatalf("captured position mode = %q; want %q (MariaDB is always GTID mode)", decoded.Mode, positionModeGTID)
+			decodedRow := mustDecodeGTIDPos(t, rowPos, "row")
+			decodedCommit := mustDecodeGTIDPos(t, commitPos, "TxCommit")
+			t.Logf("captured MariaDB sets: row = %q, commit = %q", decodedRow.GTIDSet, decodedCommit.GTIDSet)
+			if decodedRow.GTIDSet == decodedCommit.GTIDSet {
+				t.Fatalf("the row position and its TxCommit position carry the SAME set %q — the row's "+
+					"position contains its own transaction, which is the item-132 defect (a mid-transaction "+
+					"checkpoint of it would skip the rest of that transaction on resume)", decodedRow.GTIDSet)
 			}
-			if decoded.GTIDSet == "" {
-				t.Fatal("captured MariaDB GTID position has empty gtid_set")
-			}
-			t.Logf("captured MariaDB resume set = %q", decoded.GTIDSet)
 
 			// "Kill" the reader, then apply a while-down change.
 			if c, ok := rdr.(interface{ Close() error }); ok {
@@ -313,36 +332,53 @@ func TestMariaDB_CDCReader_ResumeAfterKill(t *testing.T) {
 			}
 			applyMySQL(t, dsn, "INSERT INTO t (v) VALUES (200)")
 
-			// Reopen from the captured position: the while-down INSERT must
-			// arrive exactly once, and the pre-capture INSERT (v=100) must
-			// NOT replay.
-			rdr2, err := eng.OpenCDCReader(ctx, dsn)
-			if err != nil {
-				t.Fatalf("OpenCDCReader (resume): %v", err)
-			}
-			defer func() {
-				if c, ok := rdr2.(interface{ Close() error }); ok {
-					_ = c.Close()
+			// resumeFirstV reopens at pos and returns the `v` of the first row
+			// change the resumed stream delivers.
+			resumeFirstV := func(t *testing.T, pos ir.Position, what string) int64 {
+				t.Helper()
+				rdr2, err := eng.OpenCDCReader(ctx, dsn)
+				if err != nil {
+					t.Fatalf("OpenCDCReader (resume from %s): %v", what, err)
 				}
-			}()
-			changes2, err := rdr2.StreamChanges(ctx, capturedPos)
-			if err != nil {
-				t.Fatalf("StreamChanges (resume): %v", err)
-			}
-			got2 := drainChanges(t, ctx, changes2, 1, 30*time.Second)
-			if len(got2) != 1 {
-				if streamErr := rdr2.(*CDCReader).Err(); streamErr != nil {
-					t.Fatalf("resume: got %d changes; want 1 (stream error: %v)", len(got2), streamErr)
+				defer func() {
+					if c, ok := rdr2.(interface{ Close() error }); ok {
+						_ = c.Close()
+					}
+				}()
+				changes2, err := rdr2.StreamChanges(ctx, pos)
+				if err != nil {
+					t.Fatalf("StreamChanges (resume from %s): %v", what, err)
 				}
-				t.Fatalf("resume: got %d changes; want 1 (the single while-down INSERT)", len(got2))
+				got2 := drainChanges(t, ctx, changes2, 1, 30*time.Second)
+				if len(got2) != 1 {
+					if streamErr := rdr2.(*CDCReader).Err(); streamErr != nil {
+						t.Fatalf("resume from %s: got %d row changes; want 1 (stream error: %v)", what, len(got2), streamErr)
+					}
+					t.Fatalf("resume from %s: got %d row changes; want 1", what, len(got2))
+				}
+				ins, ok := got2[0].(ir.Insert)
+				if !ok {
+					t.Fatalf("resume from %s: change = %T; want ir.Insert", what, got2[0])
+				}
+				v, _ := ins.Row["v"].(int64)
+				return v
 			}
-			ins, ok := got2[0].(ir.Insert)
-			if !ok {
-				t.Fatalf("resume change = %T; want ir.Insert", got2[0])
+
+			// The COMMIT boundary is the exactly-once resume point.
+			if v := resumeFirstV(t, commitPos, "the TxCommit boundary"); v != 200 {
+				t.Errorf("resuming at the TxCommit boundary delivered v = %d; want 200 (the while-down row). "+
+					"A value of 100 means the already-committed transaction replayed — the commit position "+
+					"does not include its own transaction (item 132: the fold must precede the commit position)", v)
 			}
-			if v, _ := ins.Row["v"].(int64); v != 200 {
-				t.Errorf("resume INSERT v = %#v; want 200 (the while-down row) — a value of 100 means the "+
-					"pre-capture change REPLAYED (resume started too early); anything else is a wrong-position gap", ins.Row["v"])
+
+			// The ROW position is an at-least-once restart point: it resumes at
+			// its transaction's START, so that transaction replays. This is what
+			// makes a mid-transaction checkpoint SAFE, and it is the half the old
+			// version of this test asserted backwards.
+			if v := resumeFirstV(t, rowPos, "the row position"); v != 100 {
+				t.Errorf("resuming at a ROW position delivered v = %d; want 100 (its own transaction, "+
+					"replayed at-least-once). A value of 200 means the row's position contained its own "+
+					"transaction and the resume SKIPPED it — item 132's silent-loss shape", v)
 			}
 		})
 	}

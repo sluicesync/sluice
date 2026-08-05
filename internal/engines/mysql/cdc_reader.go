@@ -279,12 +279,32 @@ type CDCReader struct {
 	forwardNullSig map[string]string
 
 	// posMode and gtidSet track the current resume position. In GTID
-	// mode, gtidSet accumulates committed GTIDs and is encoded into
+	// mode, gtidSet accumulates COMMITTED GTIDs and is encoded into
 	// each emitted Change. In file/pos mode, currentFile and the
 	// per-event LogPos are encoded instead.
 	posMode     positionMode
 	gtidSet     mysql.GTIDSet
 	currentFile string
+
+	// pendingGTID holds the in-flight transaction's own GTID between its
+	// opening group event and its COMMIT; foldPendingGTID moves it into
+	// gtidSet at the commit. Roadmap item 132: gtidSet used to be updated
+	// at transaction START, so every ROW position already CONTAINED the
+	// transaction it belonged to — and StartSyncGTID with a set containing
+	// tx N skips tx N ENTIRELY. A mid-transaction checkpoint (the serial
+	// apply loop's row-cap / byte-cap / idle / channel-close flush) therefore
+	// persisted a position that silently dropped the rest of that
+	// transaction. Staging makes a row's position the PRE-transaction set —
+	// a legal restart point at every row — and only the TxCommit carries the
+	// post-transaction set. See [CDCReader.stageGTID].
+	//
+	// inSourceTx tracks whether the dispatcher is between a transaction's
+	// opening event (BEGIN QueryEvent / non-standalone MARIADB_GTID) and its
+	// commit. It is what keeps a mid-transaction SAVEPOINT QueryEvent — which
+	// reaches the same generic-DDL arm a real implicit-committing DDL does —
+	// from folding the staged GTID early and reintroducing the defect.
+	pendingGTID string
+	inSourceTx  bool
 
 	// serverUUID is the source instance's @@server_uuid, read once at
 	// stream start. Stamped into every file/pos position so a resume
@@ -698,6 +718,11 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 // r.gtidSet (in GTID mode) or r.currentFile (in file/pos mode) so the
 // per-event position emitter has something to anchor on.
 func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, error) {
+	// A (re)start replays from a committed boundary, so nothing may be
+	// carried over from the previous connection's in-flight transaction
+	// (item 132). Reset before the mode switch so BOTH modes get it.
+	r.pendingGTID = ""
+	r.inSourceTx = false
 	switch p.Mode {
 	case positionModeGTID:
 		set, err := mysql.ParseGTIDSet(r.goMySQLFlavor(), p.GTIDSet)
@@ -848,8 +873,10 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		return nil
 
 	case *replication.GTIDEvent:
-		// Append the new GTID to the running executed set. In file/pos
-		// mode we don't maintain a set, so this is a no-op by structure.
+		// STAGE the new GTID — it joins the running executed set at this
+		// transaction's commit, not at its start (item 132; see
+		// [CDCReader.pendingGTID]). In file/pos mode we don't maintain a
+		// set, so this is a no-op by structure.
 		if r.posMode != positionModeGTID || r.gtidSet == nil {
 			return nil
 		}
@@ -857,10 +884,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		if err != nil {
 			return fmt.Errorf("mysql: cdc: gtid sid: %w", err)
 		}
-		if err := r.gtidSet.Update(fmt.Sprintf("%s:%d", uuidStr, e.GNO)); err != nil {
-			return fmt.Errorf("mysql: cdc: gtid update: %w", err)
-		}
-		return nil
+		return r.stageGTID(fmt.Sprintf("%s:%d", uuidStr, e.GNO))
 
 	case *replication.MariadbGTIDEvent:
 		// MariaDB opens each transaction with its domain-GTID event; there
@@ -875,7 +899,9 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		//     by go-mysql's parser); MariadbGTIDSet keeps one GTID per
 		//     domain via forward(). Without this the reader's gtidSet would
 		//     never move and every position would resume from the stale
-		//     cold-start point — a silent wrong-position gap.
+		//     cold-start point — a silent wrong-position gap. Item 132: the
+		//     accumulation is STAGED here and folded at the group's commit,
+		//     so the group's own rows carry the PRE-transaction set.
 		//  2. Surface the transaction boundary. A transactional (non-
 		//     standalone) group is the MySQL "BEGIN" analogue: emit TxBegin
 		//     so the batched applier and the backup/stream window logic see
@@ -885,13 +911,18 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		//     path (GTID → QueryEvent, no BEGIN); its QueryEvent below drives
 		//     the schema-cache invalidation.
 		if r.posMode == positionModeGTID && r.gtidSet != nil {
-			if err := r.gtidSet.Update(e.GTID.String()); err != nil {
-				return fmt.Errorf("mysql: cdc: mariadb gtid update: %w", err)
+			if err := r.stageGTID(e.GTID.String()); err != nil {
+				return err
 			}
 		}
 		if e.IsStandalone() {
-			return nil
+			// A STANDALONE group is an IMPLICIT COMMIT with no XID (a DDL, a
+			// non-transactional statement). Item 132: fold here or the group's
+			// GTID stays staged forever and every later position silently omits
+			// it — a resume would replay the DDL and everything after it.
+			return r.foldPendingGTID()
 		}
+		r.inSourceTx = true
 		pos, err := r.positionFor(ev.Header)
 		if err != nil {
 			return err
@@ -930,6 +961,11 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// InnoDB transactions. The COMMIT QueryEvent only
 			// appears on non-transactional storage engines, which
 			// sluice doesn't target.)
+			//
+			// The staged GTID is NOT folded here — this is the
+			// transaction's start, so the emitted TxBegin (and every row
+			// after it) must carry the PRE-transaction set (item 132).
+			r.inSourceTx = true
 			pos, err := r.positionFor(ev.Header)
 			if err != nil {
 				return err
@@ -941,12 +977,32 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// QueryEvent surface (non-InnoDB storage engines).
 			// Sluice doesn't formally support those, but if one
 			// shows up we'd rather flush than silently drop the
-			// boundary signal.
+			// boundary signal. Fold BEFORE positionFor so the emitted
+			// TxCommit carries the POST-commit set — get that ordering
+			// wrong and a resume from the commit re-runs the whole
+			// transaction it just acknowledged (item 132).
+			if err := r.foldPendingGTID(); err != nil {
+				return err
+			}
+			r.inSourceTx = false
 			pos, err := r.positionFor(ev.Header)
 			if err != nil {
 				return err
 			}
 			return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
+		}
+		// Everything below is DDL (TRUNCATE included). DDL IMPLICIT-COMMITS,
+		// gets its own GTID group, and carries no XID — so fold here, or the
+		// group's GTID stays staged forever and every later position silently
+		// omits it (item 132). The !inSourceTx guard is load-bearing: a
+		// mid-transaction SAVEPOINT / ROLLBACK TO SAVEPOINT arrives as a
+		// QueryEvent and reaches this same arm, and folding on one of those
+		// would put the enclosing transaction back into its own rows'
+		// positions — exactly the defect being closed.
+		if !r.inSourceTx {
+			if err := r.foldPendingGTID(); err != nil {
+				return err
+			}
 		}
 		// TRUNCATE TABLE arrives as a QUERY_EVENT carrying the SQL
 		// text. The IR has ir.Truncate; PG's pgoutput emits typed
@@ -1014,6 +1070,16 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// row events between, e.g. an aborted-but-still-recorded
 		// transaction) is handled by the applier's flush path, which
 		// skips when no rows have accumulated. See ADR-0027.
+		//
+		// Item 132: fold the staged GTID BEFORE computing the position, so
+		// the emitted TxCommit carries the POST-commit set while every row
+		// event of this transaction carried the pre-commit one. That
+		// ordering IS the fix; reversed, TxCommit resumes one transaction
+		// early and the transaction is applied twice.
+		if err := r.foldPendingGTID(); err != nil {
+			return err
+		}
+		r.inSourceTx = false
 		pos, err := r.positionFor(ev.Header)
 		if err != nil {
 			return err
@@ -1049,9 +1115,19 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// applied, and any earlier interruption re-reads + idempotently
 		// re-applies the ENTIRE payload (ADR-0010). This also keeps the
 		// transaction-boundary alignment that avoids the "no corresponding table
-		// map event" mid-payload resume failure. In GTID mode positionFor
-		// ignores LogPos (the GTID rides the GTIDEvent preceding the payload), so
-		// the stamping is a no-op there. Payloads do not nest (one level deep).
+		// map event" mid-payload resume failure. Payloads do not nest (one level
+		// deep).
+		//
+		// GTID MODE (item 132): positionFor ignores LogPos there — the GTID rides
+		// the GTIDEvent PRECEDING the payload — so the LogPos stamping below is a
+		// no-op in GTID mode and never protected it. The equivalent protection now
+		// comes from the same staging every other arm uses: the payload's inner
+		// events are dispatched through THIS function, so the inner BEGIN opens
+		// the transaction and the inner XID folds the staged GTID. Every inner row
+		// therefore carries the pre-payload set and only the inner XID carries the
+		// post-payload one — the compressed shape gets the identical guarantee as
+		// the uncompressed one, by construction, because it reuses the arms.
+		// (Pinned by TestGTIDStaging_CompressedTransactionPayload.)
 		payloadEnd := ev.Header.LogPos
 		payloadStart := payloadEnd - ev.Header.EventSize
 		lastIdx := -1
@@ -1455,9 +1531,49 @@ func nullabilitySignature(tbl *tableSchema) string {
 	return b.String()
 }
 
+// stageGTID holds gtid as the in-flight transaction's own GTID instead of
+// folding it into the running executed set immediately (item 132 — see
+// [CDCReader.pendingGTID] for why the fold moved to commit time).
+//
+// A new group means the previous one is definitively over, so anything still
+// staged is folded first. That matters for transaction terminators sluice does
+// not model — an XA PREPARE group ends in XA_PREPARE_LOG_EVENT, not an XID —
+// whose GTID would otherwise be dropped when the next group staged over it.
+// Folding at the next group degrades an unrecognised shape to the PRE-item-132
+// behaviour (the GTID lands in the set one group late) rather than to loss.
+//
+// Clearing inSourceTx here is the same reasoning applied to the guard: a new
+// group means any previous transaction is over, so an unterminated one cannot
+// leave the flag stuck true and suppress the NEXT group's implicit-commit fold.
+func (r *CDCReader) stageGTID(gtid string) error {
+	if err := r.foldPendingGTID(); err != nil {
+		return err
+	}
+	r.inSourceTx = false
+	r.pendingGTID = gtid
+	return nil
+}
+
+// foldPendingGTID moves the staged GTID into the running executed set. It is
+// idempotent and safe to call at any commit-ish boundary — a group that staged
+// nothing (file/pos mode, an already-folded standalone group) folds nothing.
+func (r *CDCReader) foldPendingGTID() error {
+	gtid := r.pendingGTID
+	r.pendingGTID = ""
+	if gtid == "" || r.gtidSet == nil {
+		return nil
+	}
+	if err := r.gtidSet.Update(gtid); err != nil {
+		return fmt.Errorf("mysql: cdc: gtid update %q: %w", gtid, err)
+	}
+	return nil
+}
+
 // positionFor builds the [ir.Position] to attach to events emitted from
 // the given binlog event header. In GTID mode the bookmark is the
-// running executed set; in file/pos mode it's (currentFile, LogPos).
+// running executed set — which, per item 132, EXCLUDES the transaction
+// currently being read until its commit event folds it in; in file/pos
+// mode it's (currentFile, LogPos).
 func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, error) {
 	switch r.posMode {
 	case positionModeGTID:
@@ -1844,6 +1960,18 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 	if subset == 1 {
 		return nil
 	}
+	// Item 132 interaction, checked rather than assumed: a resume set is now
+	// the PRE-transaction set of whatever the reader was in the middle of, so
+	// it is a strict SUBSET of what the old start-anchored code would have
+	// produced — which makes GTID_SUBSET(purged, resume) strictly HARDER to
+	// satisfy, never easier. That is the correct direction: the one case it
+	// newly refuses is a source that has purged the very transaction the
+	// position resumes at, where the old set would have passed this check and
+	// then silently skipped that transaction. Refusing routes to ADR-0022
+	// cold-start instead. Pinned by
+	// TestCDCReader_GTIDPositionLoss_DetectedLoud (the loud-refusal oracle)
+	// and TestCDCReader_GTIDStaging_RowPositionExcludesOwnTransaction (the
+	// set shape the refusal is evaluated against).
 	// Cloud SQL PITR-toggle hint, same as the file/pos path: with the
 	// binlogs destroyed, gtid_purged advances to gtid_executed and the
 	// pre-toggle resume set fails this check.

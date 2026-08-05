@@ -21,7 +21,12 @@ package postgres
 //     of any prefix of the change stream produces the same final
 //     state, so the position written at the end of a batch can be
 //     the position of the *last* applied change — replay from that
-//     position via idempotency reproduces the missed work.
+//     position via idempotency reproduces the missed work. That
+//     argument assumes the SOURCE can actually restart at the position
+//     it stamped, which is a property of the source, not of this
+//     applier: item 132 found it false for a MySQL binlog source in
+//     both position modes. Hence CheckpointOnlyAtTxBoundary=true
+//     below — see its comment in batchConfig.
 //
 //   - **Position-and-data atomicity (ADR-0007).** The position
 //     write happens inside the same target transaction as the
@@ -128,10 +133,34 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		EngineName: "postgres",
 		// PG DDL is transactional — a schema event joins the batch tx
 		// and flushes as its own batch (ADR-0049 locked decision #4a).
-		TransactionalDDL:  true,
-		ByteCap:           byteCap,
-		BatchSizeProvider: a.batchSizeProvider,
-		BatchObserver:     a.batchObserver,
+		TransactionalDDL: true,
+		// Roadmap item 132. This flag reads like a TARGET knob and encodes a
+		// SOURCE property: "is a position stamped mid-source-transaction a legal
+		// restart point?". A Postgres TARGET can be fed by any source, so the
+		// old `false` — justified by "PG logical-replication resume is by LSN
+		// and the walsender resends whole transactions", a fact about a PG
+		// SOURCE — was answering the wrong question. For a MySQL binlog source
+		// it is false in BOTH position modes: a GTID-mode set stamped mid-tx
+		// used to contain its own transaction (StartSyncGTID then skips it
+		// entirely — silent loss), and a file/pos offset stamped mid-tx lands
+		// past the TABLE_MAP its row event needs ("no corresponding table map
+		// event" — a warm-resume crash-loop). Both are reachable here: the
+		// serial loop runs on --apply-concurrency 1, on the budget-probe
+		// degrade-to-serial, and under the ADR-0107 headroom clamp.
+		//
+		// The cost is bounded and the ADR-0020 concern is not what it looks
+		// like. Withholding the position also withholds the AfterCommit
+		// slot-ack, but only for the span of ONE source transaction, and only
+		// when the loop is genuinely INSIDE one (commitBatch's inSourceTx
+		// guard — the audit-2026-08-01 S3 fix — so a marker-less source like
+		// VStream or any trigger-CDC engine is completely unaffected). The
+		// F3 invariant confirmed_flush_lsn <= applied position is preserved by
+		// direction: the ack and the position are withheld together, never
+		// separately. See confirmed_flush_invariant_integration_test.go.
+		CheckpointOnlyAtTxBoundary: true,
+		ByteCap:                    byteCap,
+		BatchSizeProvider:          a.batchSizeProvider,
+		BatchObserver:              a.batchObserver,
 		// BeginTx returns the ADR-0092 pipelined handle (*pgxBatchTx) for
 		// the batch path; if the raw-conn escape is unavailable it falls
 		// back to the serial *sql.Tx path with a one-time WARN — loud,

@@ -1900,7 +1900,23 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 
 This is exactly the C1 network-literal class, on the cells item 117 scoped out. Item 117's scope-out said the residual "can be filed separately" — **and no item was ever filed**, so a commit message became the only record of an open silent-loss finding. Fix mirrors `MACWidth == 0`: give `ir.Inet` a Family field and refuse loudly when the discriminant is missing.
 
-### 132. GTID-mode row positions contain their own in-flight transaction, so a mid-tx checkpoint silently loses the transaction's tail — *OPEN, CRITICAL (audit 2026-08-05 A-2)*
+### 132. GTID-mode row positions contain their own in-flight transaction, so a mid-tx checkpoint silently loses the transaction's tail — *✅ FIXED (implemented; pending review + land, unreleased). Audit 2026-08-05 A-2.*
+
+**What landed.** The reader stages a transaction's GTID and folds it into `r.gtidSet` at the transaction's COMMIT rather than its START, so a row's position is the PRE-transaction set — a legal restart point at every row — and only the TxCommit carries the post-transaction set. Ground-truthed on a real gtid_mode=ON MySQL: the three rows of one transaction carry `…:1` and their TxCommit carries `…:1-2`, with the source's own `GTID_SUBSET` as the oracle.
+
+**The three implicit-commit shapes are the part that would have been missed.** A group that ends without an XID has to fold somewhere else or its GTID stays staged forever and every later position silently omits it: a MySQL DDL `QueryEvent`, a `TRUNCATE` (same arm, and it also emits an `ir.Truncate` whose position must be post-commit), and a MariaDB STANDALONE group. Two shapes are the inverse — a mid-transaction `SAVEPOINT` reaches the same generic-DDL arm and must NOT fold (hence the `inSourceTx` guard), and a group whose terminator sluice does not model (XA PREPARE ends in `XA_PREPARE_LOG_EVENT`) folds at the NEXT group's GTID event, so an unrecognised shape degrades to the pre-fix behaviour rather than to a dropped GTID.
+
+**`TransactionPayloadEvent` needed no change and now says why.** Its LogPos re-stamping was always a file/pos-mode device — `positionFor` ignores LogPos in GTID mode — so it never protected the compressed path. The protection comes from the payload dispatching its inner events through the same arms, which is now pinned rather than asserted.
+
+**The Postgres applier took `CheckpointOnlyAtTxBoundary=true` rather than an exemption**, which is the second half. No honest exemption could be written for it: a MySQL file/pos source pointed at a PG target still has no valid mid-transaction restart point (the "no corresponding table map event" crash-loop), so the knob's safe value belongs on every target. The `inSourceTx` guard (audit 2026-08-01 S3) means marker-less sources — VStream and every trigger-CDC engine, verified by which readers emit `ir.TxBegin`/`ir.TxCommit` at all — are unaffected, and the F3 `confirmed_flush_lsn <= applied position` invariant holds by direction because the ack and the position are withheld together.
+
+**`verifyGTIDSetReachable` gets strictly stricter, in the right direction.** A pre-transaction set is a subset of what the old code produced, so `GTID_SUBSET(purged, resume)` is harder to satisfy — and the one case it newly refuses is a source that purged the very transaction being resumed at, where the old set passed the check and then silently skipped that transaction.
+
+**A test that pinned the bug.** `TestMariaDB_CDCReader_ResumeAfterKill` asserted exactly-once resume from a ROW position, which is satisfiable only if the row's position contains its own transaction. It now pins both halves: the TxCommit position is exactly-once, the row position is at-least-once (its transaction replays, which is what makes a mid-transaction checkpoint safe), and it fails if the two ever collapse to the same answer.
+
+**Not done, deliberately:** the file/pos arm's BEGIN-anchored LogPos (the CDC-2 sibling). Different symptom class — a loud warm-resume crash-loop, not silent loss — and a different mechanism, since the payload arm's LogPos rewriting makes `LogPos - EventSize` meaningless for inner events. Its remaining exposure is now bounded to appliers that checkpoint mid-transaction, and after this change there are none.
+
+**Original filing follows.**
 
 `mysql/cdc_reader.go:860`. `gtidSet.Update` runs at transaction START, and `positionFor` stamps the running set on every row — so a row's recorded position is a GTID set that **already contains the transaction being read**. Such a position is a valid resume point only at or after commit: `StartSyncGTID` with a set containing tx N skips tx N *entirely*.
 
@@ -1911,6 +1927,10 @@ The only guard, `CheckpointOnlyAtTxBoundary`, is set **only on the MySQL target 
 **Fix:** hold the pending GTID in a staging variable on GTIDEvent and fold it into `r.gtidSet` on XIDEvent / MariaDB commit, so rows naturally carry the PRE-transaction set. Fix the `TransactionPayloadEvent` arm and the DDL QueryEvent implicit-commit in the same pass; check `verifyPositionResumable`'s purged-check still passes pre-tx sets. The file/pos arm wants BEGIN-anchored LogPos for the CDC-2 sibling (a crash-loop on warm resume — "rows event for unknown table_id", which is not `ErrPositionInvalid` so auto-resnapshot never fires).
 
 **Gate (G-2):** a fail-by-default divergence map over EVERY registered ChangeApplier's `BatchConfig` — `CheckpointOnlyAtTxBoundary=true` OR a written exemption proving mid-tx positions from every possible SOURCE are valid restart points (the `TestMigrateSyncFlagSurfaceParity` pattern) — plus a reader-side pin that a GTID-mode row position does NOT contain its enclosing transaction. **This is a concurrency/resume-semantics chunk: the `-race` integration gate must be green BEFORE any tag ships it.**
+
+*Built as `TestCheckpointOnlyAtTxBoundaryDivergenceMap` (`internal/appliershared`): an AST walk over `internal/engines/**` covering every `BatchConfig` literal AND every `ApplyBatch` declaration, cross-checked so an applier that hand-rolls a loop the gate cannot see is itself a finding, with anti-vacuity floors on both halves and a stale-exemption check. The reader-side pin is a ten-case arm matrix (`cdc_reader_gtid_staging_test.go`) plus the real-server oracle (`cdc_reader_gtid_staging_integration_test.go`). Mutation-confirmed both directions on each.*
+
+*Resolution note: the Postgres applier took `CheckpointOnlyAtTxBoundary=true` rather than an exemption, because no honest exemption existed — a MySQL file/pos source into a PG target still has no valid mid-transaction restart point. Verified as inert for every marker-less source: only the MySQL binlog reader and the PG reader emit `ir.TxBegin`/`ir.TxCommit` at all (checked, not assumed), so the trigger-CDC and VStream paths are unaffected.*
 
 ### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *FIXED (unreleased; `-race` Integration must be green before the tag — concurrency chunk)*
 

@@ -23,9 +23,15 @@ import (
 // row's position.
 //
 // Sequence: GTIDEvent(g1) → DDL QueryEvent (captures anchor =
-// {g1}) → GTIDEvent(g2) advances r.gtidSet. The captured
+// {g1}) → a COMPLETE g2 transaction advances r.gtidSet. The captured
 // pendingDDLAnchor must STILL be the g1-only set (the DDL's own
 // position), unmoved by the later g2.
+//
+// Item 132 note: g2's transaction is driven to its XID here rather than
+// stopping at the GTIDEvent, because a GTID no longer joins r.gtidSet at
+// transaction START — it is staged and folds at the commit. Stopping at
+// the GTIDEvent would leave r.gtidSet at {g1} and the "anchor didn't
+// move" assertion would pass for the wrong reason.
 func TestB1_AnchorCapturedAtClearTime(t *testing.T) {
 	g0, _ := gomysql.ParseGTIDSet(gomysql.MySQLFlavor, "")
 	r := &CDCReader{
@@ -65,14 +71,16 @@ func TestB1_AnchorCapturedAtClearTime(t *testing.T) {
 	}
 	capturedAnchor := r.pendingDDLAnchor
 
-	// A LATER GTID (g2) advances r.gtidSet — simulating the first
-	// post-DDL transaction. The captured anchor must NOT move.
-	g2 := &replication.BinlogEvent{
-		Header: &replication.EventHeader{},
-		Event:  &replication.GTIDEvent{SID: sid, GNO: 2},
-	}
-	if err := r.dispatch(ctx, g2, out); err != nil {
-		t.Fatalf("GTID g2: %v", err)
+	// A LATER, COMPLETE transaction (g2) advances r.gtidSet — simulating
+	// the first post-DDL transaction. The captured anchor must NOT move.
+	for _, ev := range []*replication.BinlogEvent{
+		{Header: &replication.EventHeader{}, Event: &replication.GTIDEvent{SID: sid, GNO: 2}},
+		{Header: &replication.EventHeader{}, Event: &replication.QueryEvent{Schema: []byte("app"), Query: []byte("BEGIN")}},
+		{Header: &replication.EventHeader{}, Event: &replication.XIDEvent{}},
+	} {
+		if err := r.dispatch(ctx, ev, out); err != nil {
+			t.Fatalf("g2 transaction: %v", err)
+		}
 	}
 	if r.pendingDDLAnchor != capturedAnchor {
 		t.Fatalf("anchor moved after a later GTID: was %q now %q (#4c violated — replay would resolve to pre-DDL schema)",
@@ -89,6 +97,13 @@ func TestB1_AnchorCapturedAtClearTime(t *testing.T) {
 	curSet := r.gtidSet.String() // g1+g2
 	if decoded.GTIDSet == curSet {
 		t.Fatalf("anchor == current set %q; it must be frozen at the DDL's own (g1-only) position", curSet)
+	}
+	// The independent expected value: the DDL's own GTID is uuid:1 by
+	// construction of this test, and a DDL implicit-commits, so its anchor
+	// must be exactly that — the DDL is already applied at the anchor.
+	if wantSet := uuid + ":1"; decoded.GTIDSet != wantSet {
+		t.Fatalf("anchor set = %q, want %q (the DDL's own group, folded by its implicit commit)",
+			decoded.GTIDSet, wantSet)
 	}
 }
 

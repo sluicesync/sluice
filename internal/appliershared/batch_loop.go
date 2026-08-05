@@ -141,12 +141,20 @@ type BatchConfig struct {
 	// re-applies it (ADR-0010) — at-least-once for the interrupted tx, the
 	// same model the keyless guard and the concurrent frontier already use.
 	//
-	// false (Postgres): unchanged. PG logical-replication resume is by LSN
-	// and the walsender resends whole transactions from restart_lsn, so a
-	// mid-tx position is a valid restart point; persisting lastPos every
-	// flush keeps the slot's confirmed_flush_lsn advancing promptly
-	// (ADR-0020). Engines whose AfterCommit advances a slot ack must leave
-	// this false.
+	// false is the Go zero value and the UNSAFE setting; item 132 turned it
+	// on for the Postgres applier too, so no engine sets it false today. The
+	// argument that used to justify false — PG logical-replication resume is
+	// by LSN and the walsender resends whole transactions from restart_lsn,
+	// so a mid-tx position is a valid restart point, and persisting lastPos
+	// every flush keeps confirmed_flush_lsn advancing promptly (ADR-0020) —
+	// is a fact about a Postgres SOURCE, stated on a TARGET's knob. Every
+	// target can be fed by every source, so the claim an engine must make to
+	// leave this false is the much stronger "a mid-transaction position from
+	// EVERY source engine is a valid restart point for me".
+	//
+	// [TestCheckpointOnlyAtTxBoundaryDivergenceMap] is the fail-by-default
+	// gate over that claim: an engine applier either sets this true or
+	// carries a written exemption arguing it per source engine.
 	CheckpointOnlyAtTxBoundary bool
 
 	// TransactionalDDL names the one structural divergence between the
