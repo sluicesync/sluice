@@ -129,6 +129,10 @@ The mechanical form is cheap and already proven here: a roster derived from the 
 
 So: **when you write or cite a gate, state which implementors/paths it reaches, and prefer a name that cannot be read as broader than the truth.** If the narrow scope is deliberate, say so where the gate is defined — "measures the `Appender` path only; the legacy path is ungated" is a fine thing to write and a terrible thing to leave implied. And the cheapest check on any gate remains the mutation run: break the thing it names, in **both** directions, and watch it fail.
 
+**Verify the mutant actually applied — a mutation that didn't mutate is indistinguishable from a gate that missed (2026-08-05).** This bit three times in one session. A `sed` whose pattern didn't match, and an edit that skipped an early return while the function still ran its side effects, each produced a PASSING test — which reads exactly like "the gate does not catch this," and in one case would have been recorded as a genuine coverage gap in a commit message. The tell is a mutation run whose result surprises you: that is the moment to check the file, not to write down the finding.
+
+So the mutation-run protocol is three steps, not two: **(1) apply the mutation, (2) confirm the source actually changed in the way you intended — `grep` the mutant marker, or read the diff, (3) run the gate.** Step 2 costs one command. Skipping it converts your strongest evidence into your most confident error, because a green mutation run is the only signal that *looks* like proof while carrying none.
+
 ### A safety argument that cites an environmental fact owes that fact a check (the premise-naming step)
 
 Distinct from the unverified-invariant rule above, and with a different fix shape. When a comment or ADR justifies a **safety** argument by citing a fact about the world outside the code — `BIGSERIAL CACHE 1`, collation weights at `8.0.30`, "the VStream carrier carries DOUBLE at full precision", "PG only ever emits rectangular arrays" — that fact gets **a runtime preflight or a named test in the same PR**, or the comment says **UNVERIFIED PREMISE** in those words.
