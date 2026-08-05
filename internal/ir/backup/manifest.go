@@ -851,6 +851,20 @@ func (m *Manifest) SchemaCanonBytes() ([]byte, error) {
 // its snapshot with an EMPTY EndPosition (never an advancing one), so the only
 // producer of "anchor == a position-bearing EndPosition with 0 chunks" is a
 // forgery — restore/broker rest completeness solely on the change-chunk tail.
+//
+// NOTE (item 132): "strictly before EndPosition" above is no longer universally
+// true on a MySQL GTID source, and the writer-side assert can consequently
+// false-positive in one narrow shape. A GTID position is a SET of committed
+// transactions, and since item 132 a row carries the set as of BEFORE its own
+// transaction — so a DDL's anchor ({…through group N}) and the rows of the very
+// next transaction carry the SAME set, by construction. The anchor is still
+// causally before those rows; the position simply cannot express the gap. That
+// only becomes visible when a data-bearing window ENDS on such a row, which
+// requires the mid-transaction window exits (`backup stream`'s eager
+// stop-signal or a ctx-cancel drain) to land inside the first transaction after
+// a DDL. It is a LOUD refusal, not silent loss, and the restore side does not
+// depend on the property — but the message blames the reader for something that
+// is now correct reader behaviour. Tracked as an item-132 residual.
 func (m *Manifest) SchemaHistoryAnchors(pos ir.Position) bool {
 	for _, e := range m.SchemaHistory {
 		if e != nil && e.AnchorPosition == pos {

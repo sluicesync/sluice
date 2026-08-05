@@ -1326,6 +1326,19 @@ func (b *IncrementalBackup) captureWindow(
 // transaction's rows — which is WHY they set CDCPositionCommitsAfterRows and the
 // restore net distrusts their anchors — so the invariant is asserted only when
 // the flag is false.)
+//
+// KNOWN NARROW FALSE POSITIVE (item 132), recorded rather than implied: on a
+// MySQL GTID source a row now carries the executed set as of BEFORE its own
+// transaction, so a DDL's anchor and the rows of the NEXT transaction share a
+// position — the set cannot express the gap even though the anchor is causally
+// first. A data-bearing window that ENDS on such a row therefore trips this
+// refusal legitimately. It needs all of: a MySQL GTID source, a DDL inside the
+// window, and one of the two documented mid-transaction window exits
+// (`backup stream`'s eager stop-signal, the ctx-cancel drain) landing in the
+// first transaction after that DDL. Loud, never silent, and the restore side
+// rests completeness on the change-chunk tail rather than on this property
+// (see [irbackup.Manifest.SchemaHistoryAnchors]) — so the cost is a refused
+// backup whose message misattributes the cause, not unsound data.
 func assertDataWindowEndPositionInvariant(manifest *irbackup.Manifest) error {
 	if manifest.CDCPositionCommitsAfterRows || len(manifest.ChangeChunks) == 0 {
 		return nil
