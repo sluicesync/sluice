@@ -70,8 +70,13 @@ func (scriptConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New(
 func (scriptConn) Close() error                        { return nil }
 func (scriptConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
 
+// ExecContext scripts the outcome of every BULK-WRITE statement — INSERT
+// (both batched cores) and LOAD DATA (item 114's segmented core, which
+// re-drives the same statement per segment). Anything else succeeds
+// silently.
 func (c scriptConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
-	if strings.HasPrefix(strings.TrimSpace(query), "INSERT") {
+	q := strings.TrimSpace(query)
+	if strings.HasPrefix(q, "INSERT") || strings.HasPrefix(q, "LOAD DATA") {
 		if err := c.script.nextExecErr(); err != nil {
 			return nil, err
 		}
@@ -80,12 +85,33 @@ func (c scriptConn) ExecContext(_ context.Context, query string, _ []driver.Name
 	return driver.RowsAffected(0), nil
 }
 
-// QueryContext serves SHOW WARNINGS as an empty result set (clean flush).
+// QueryContext serves SHOW WARNINGS as an empty result set (clean flush)
+// and `SELECT @@local_infile` as enabled, so the LOAD DATA core reaches its
+// statement instead of falling back to the batched writer.
 func (scriptConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	if strings.Contains(query, "SHOW WARNINGS") {
-		return &emptyWarningsRows{}, nil
+	if strings.Contains(query, "@@local_infile") {
+		return &singleValueRows{col: "@@local_infile", val: "1"}, nil
 	}
 	return &emptyWarningsRows{}, nil
+}
+
+// singleValueRows is a one-column, one-row result for the scalar session
+// probes (`SELECT @@local_infile`).
+type singleValueRows struct {
+	col  string
+	val  string
+	done bool
+}
+
+func (r *singleValueRows) Columns() []string { return []string{r.col} }
+func (r *singleValueRows) Close() error      { return nil }
+func (r *singleValueRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = []byte(r.val)
+	return nil
 }
 
 // emptyWarningsRows is a 3-column (Level, Code, Message) empty result.

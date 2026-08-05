@@ -4,12 +4,11 @@
 package mysql
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,8 +30,64 @@ const loadDataReaderPrefix = "sluice_loaddata_"
 // writeLoadData streams rows to MySQL via LOAD DATA LOCAL INFILE using
 // the go-sql-driver Reader-handler protocol. The serializer encodes
 // rows as TSV with MySQL's default escape rules (tab/newline/backslash
-// escaped, NUL → \0, NULL → \N) and pipes them to the driver, which
-// forwards bytes to the server. No real file is ever written.
+// escaped, NUL → \0, NULL → \N) and hands the bytes to the driver, which
+// forwards them to the server. No real file is ever written.
+//
+// # Segmented, replayable (item 114)
+//
+// The table is loaded as a SEQUENCE of bounded LOAD DATA statements —
+// [loadDataSegmentTarget] encoded TSV bytes each — rather than one
+// statement per table, and each segment is driven through the SAME
+// [RowWriter.flushWithReparentRetry] the two batched write cores use. That
+// is the whole point: the batched cores ride a transient by re-driving
+// their BUFFERED batch, and until this change LOAD DATA had nothing
+// buffered to re-drive, so a transient minutes into a large table
+// discarded the whole table's copy with no resume point. Holding one
+// segment's encoded bytes gives the retry the same thing the batched
+// cores have, and the retry policy, the ADR-0110 grow-gate Await/Trip, the
+// wall-clock bound and the ADR-0108 keyless carve-out all come from the
+// shared helper rather than being re-derived here.
+//
+// # Why the replay is exactly-once and not at-least-once
+//
+// LOAD DATA *LOCAL* INFILE downgrades a duplicate-key error to a warning
+// and SKIPS the offending row — the server cannot stop a transfer already
+// in flight, so it behaves as if IGNORE were given. Verified against a
+// real MySQL 8.0, not assumed: see
+// TestLoadDataLocal_DuplicateKeyIsAWarningAndSkipsTheRow. That makes a
+// byte-identical replay CONVERGENT on a table with a key — whether the
+// prior attempt rolled back, committed fully, or committed a prefix, the
+// replay inserts exactly the rows that are missing. A table with no key
+// has nothing to collide on, so the replay would double its rows;
+// flushWithReparentRetry refuses that case loudly ([errKeylessAmbiguousReplay])
+// on this core exactly as it does on the batched ones.
+//
+// The wart the IGNORE behaviour costs us is the post-load warning probe:
+// a replay legitimately produces one 1062 warning per already-landed row,
+// and those must NOT trip the Bugs-102/103 silent-clamp refusal while a
+// real coercion warning hiding among them still must. See
+// [RowWriter.reportLoadDataWarnings].
+//
+// # One deliberate divergence from the Postgres twin
+//
+// The PG COPY core got this same treatment first (roadmap item 38,
+// [writeViaCopyChunked]) but gates its chunked path on `growGate != nil`,
+// leaving a monolithic path for no-gate constructions. This one segments
+// UNCONDITIONALLY: there is one code path, so a future caller that forgets
+// to wire the gate cannot silently inherit the un-resumable form, and the
+// measured cost of segmenting is within noise at the shipping budget
+// (see [defaultLoadDataSegmentBytes]). Two paths would also mean two
+// encoders to keep byte-identical, which is the shape Bug 74 came from.
+//
+// # What it does NOT do
+//
+// Segment boundaries are an IN-RUN replay point, not a durable cursor: a
+// process that dies mid-table still restarts that table (or, on the
+// chunked copy path, that chunk) on the next run. Cross-run resume is the
+// pipeline's job and it already has one — per-(table, chunk) progress with
+// an idempotent replay writer (ADR-0043/0096). Recording a row cursor here
+// would need a stable source order this writer's input channel does not
+// promise.
 //
 // On any failure (server with local_infile=OFF, geometry column
 // present, runtime serialization error) the caller falls through to
@@ -76,136 +131,131 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 		return fmt.Errorf("mysql: LOAD DATA: generate handler name: %w", err)
 	}
 
-	pr, pw := io.Pipe()
-	driver.RegisterReaderHandler(name, func() io.Reader { return pr })
+	// ONE registry slot for the whole call. The handler hands the driver a
+	// fresh reader over the CURRENT segment's bytes every time the statement
+	// executes — which is precisely what makes a retry a byte-identical
+	// replay instead of a re-read of a source that has already been consumed.
+	// The bytes are only mutated between flushes, never during one, and
+	// WriteRowsParallel never routes here (it is batched-only), so the
+	// closure is read on the calling goroutine only.
+	seg := &loadDataSegment{}
+	driver.RegisterReaderHandler(name, func() io.Reader { return bytes.NewReader(seg.buf.Bytes()) })
 	defer driver.DeregisterReaderHandler(name)
-
-	// Producer: serialize rows to TSV bytes on the pipe writer.
-	// CloseWithError propagates serializer failures to the driver-
-	// side read so the LOAD DATA statement aborts cleanly instead of
-	// hanging on a half-written stream.
-	//
-	// The pipe writer is wrapped in a bufio.Writer so rows batch into
-	// ~64 KiB pipe writes instead of one write PER ROW. io.Pipe is
-	// unbuffered — every Write is a producer↔consumer goroutine
-	// rendezvous, and the driver ships whatever each pipe Read carries
-	// — so per-row writes meant per-row handoffs and small driver
-	// packets. Same finding and fix as the PG raw-copy lane
-	// (rawCopyPipeBufSize, task #37: per-row frames were 80%+ of
-	// single-stream CPU there). Flush before Close on success; on
-	// error CloseWithError poisons the read anyway, so no flush.
-	encErr := make(chan error, 1)
-	go func() {
-		bw := bufio.NewWriterSize(pw, loadDataPipeBufSize)
-		err := encodeRowsTSV(ctx, bw, cols, rows)
-		if err == nil {
-			err = bw.Flush()
-		}
-		// Always close the pipe writer so the driver's read loop
-		// terminates.
-		if err != nil {
-			_ = pw.CloseWithError(err)
-		} else {
-			_ = pw.Close()
-		}
-		encErr <- err
-	}()
 
 	// Pin a single connection for the LOAD DATA + post-load warning
 	// check (Bugs 102/103/106 closure, v0.92.2). @@warning_count and
 	// SHOW WARNINGS are session-scoped; without connection affinity
 	// the pool can hand us a different conn for the warning probe and
-	// the refusal silently misses.
+	// the refusal silently misses. On a RETRY flushWithReparentRetry
+	// substitutes a fresh conn and the probe follows it there (ADR-0108).
 	conn, err := w.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("mysql: LOAD DATA: pin connection: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	// ADR-0110 / audit 2026-08-01 Q2: quiesce with the run's other cold-copy
-	// lanes BEFORE opening a statement that will hold this connection for the
-	// whole table. This path was invisible to the grow gate while both batched
-	// write cores were wired into it, and it is the one that can least afford
-	// to start into a grow window — see the terminal-error note below for why
-	// it cannot recover from one.
-	if aerr := w.awaitGrowGate(ctx); aerr != nil {
-		return aerr
-	}
-
 	stmt := buildLoadDataStmt(w.schema, table.Name, cols, name)
-	_, execErr := conn.ExecContext(ctx, stmt)
-
-	// Liveness guard (Bug 178): if the LOAD DATA statement errors during
-	// parse/validation — BEFORE the server requests the LOCAL INFILE
-	// stream — the driver never invokes the registered reader, so nobody
-	// drains `pr` and the encoder goroutine blocks forever on its buffered
-	// pipe write. That turns a fast, informative exec error into an
-	// indefinite hang at `<-encErr` below (the ctx cancel can't reach a
-	// goroutine parked in io.Pipe.Write). Closing the read side unblocks a
-	// stuck encoder with io.ErrClosedPipe (tolerated by the errors.Is check
-	// below), so the real execErr surfaces LOUDLY instead of deadlocking.
-	// On the success path the driver has already drained and closed the
-	// pipe, so this is a no-op. This is defence-in-depth: the hex-literal
-	// framing in buildLoadDataStmt removes the NBE trigger that first
-	// surfaced this, but ANY early statement error must fail loud, not hang.
-	_ = pr.CloseWithError(io.ErrClosedPipe)
-
-	// Wait for the encoder so we don't leak a goroutine.
-	serErr := <-encErr
-
-	// Encoder error is the most informative; surface it first.
-	if serErr != nil && !errors.Is(serErr, io.ErrClosedPipe) {
-		return fmt.Errorf("mysql: LOAD DATA: serialize rows for %q: %w", table.Name, serErr)
-	}
-	if execErr != nil {
-		// ADR-0110 / audit 2026-08-01 Q2: a classified transient here TRIPS
-		// the shared gate so sibling lanes quiesce for the grow window rather
-		// than each discovering it independently.
-		//
-		// It is NOT retried, and that is a real limitation rather than an
-		// oversight, so the error says so. This path streams the WHOLE table
-		// through ONE statement, consuming the row channel as it goes — by the
-		// time the statement fails the rows are gone, so there is nothing left
-		// to replay and no cursor to resume from. The batched cores next door
-		// can re-drive their buffered batch; this one cannot re-read its
-		// source. Chunking it into resumable segments is the real fix and is
-		// filed rather than faked.
-		var re ir.RetriableError
-		if errors.As(classifyApplierError(execErr), &re) && re.Retriable() {
-			w.tripGrowGate("mysql LOAD DATA cold-copy transient: " + execErr.Error())
-			return fmt.Errorf(
-				"mysql: LOAD DATA into %q hit a transient target error and CANNOT be resumed: this path streams "+
-					"the whole table through a single statement, so its source rows are already consumed and "+
-					"there is no chunk cursor to restart from. Re-run the copy for this table. (A target with "+
-					"local_infile=OFF uses the batched writer instead, which rides a transient by retrying the "+
-					"failed batch in place; the writer is chosen by the engine flavor, not by a flag): %w",
-				table.Name, execErr,
-			)
+	target := w.loadDataSegmentTarget()
+	for segment := 1; ; segment++ {
+		// Encode a bounded segment BEFORE opening the statement. The
+		// encode is synchronous rather than a producer goroutine feeding
+		// an io.Pipe (the pre-item-114 shape): the retry needs the whole
+		// segment in hand anyway, and materializing it first removes the
+		// pipe, the goroutine, and the Bug-178 liveness guard that existed
+		// only because an early statement error could park an encoder on a
+		// pipe write nobody was draining. Measured cost of losing the
+		// encode/transfer overlap: see the item-114 throughput note in
+		// row_writer_loaddata_resume_integration_test.go.
+		seg.buf.Reset()
+		n, drained, encErr := encodeRowsTSV(ctx, &seg.buf, cols, rows, target)
+		if encErr != nil {
+			return fmt.Errorf("mysql: LOAD DATA: serialize rows for %q: %w", table.Name, encErr)
 		}
-		return fmt.Errorf("mysql: LOAD DATA into %q: %w", table.Name, execErr)
+		seg.rows = n
+		if seg.rows > 0 {
+			if err := w.flushLoadDataSegment(ctx, conn, table, stmt, seg, segment); err != nil {
+				return err
+			}
+		}
+		if drained {
+			return nil
+		}
 	}
+}
 
-	// CRITICAL (Bugs 102/103 v0.92.2 root cause): LOAD DATA LOCAL
-	// INFILE silently bypasses strict sql_mode for per-row type-
-	// conversion errors. The session's @@sql_mode is strict (we
-	// inject it in parseDSN), and a direct INSERT of an 80-digit
-	// NUMERIC into DECIMAL(65,30) correctly errors 1264 — but the
-	// same value through LOAD DATA with `(@var) SET col=@var`
-	// indirection silently clamps to MAX and bumps @@warning_count.
-	//
-	// Empirically (probed against MySQL 8.0 with strict sql_mode):
-	//   - Direct INSERT 80-digit → Error 1264, statement aborts
-	//   - LOAD DATA same value → row inserted with MAX clamp;
-	//     @@warning_count = 1; SHOW WARNINGS exposes the truncation
-	//   - Same for TIMESTAMP out-of-range / zero-date
-	//   - Explicit CAST(@var AS DECIMAL(65,30)) in SET still clamps
-	//
-	// The only reliable closure is the post-load warning probe.
-	// Surface any warnings: a loud refusal under strict sql_mode, a loud
-	// one-time WARN under `--mysql-sql-mode=''` (Vector B — the relaxed
-	// path no longer skips silently; a silent clamp/truncation is still
-	// reported, just not refused, since the operator opted into coercion).
-	return w.reportBulkWriteWarnings(ctx, conn, table.Name)
+// loadDataSegment is one LOAD DATA statement's worth of encoded TSV,
+// retained IN FULL for the length of the flush so a classified transient
+// can be ridden by re-driving the identical bytes. It is the LOAD DATA
+// analogue of the batched cores' buffered batch — the thing item 114
+// existed because this path did not have.
+type loadDataSegment struct {
+	buf  bytes.Buffer
+	rows int
+}
+
+// flushLoadDataSegment executes one segment through the shared ADR-0108
+// retry helper, which owns the grow-gate Await/Trip, the transient
+// classification, the fresh-connection re-acquire, the wall-clock bound and
+// the keyless carve-out. The only LOAD-DATA-specific parts are the
+// statement itself and the replay-aware warning probe.
+func (w *RowWriter) flushLoadDataSegment(ctx context.Context, conn *sql.Conn, table *ir.Table, stmt string, seg *loadDataSegment, segment int) error {
+	if err := w.flushWithReparentRetry(ctx, table, seg.rows, func(c *sql.Conn, isRetry bool) error {
+		if injected := injectedSegmentFailure(segment, isRetry, loadDataBeforeExec); injected != nil {
+			return injected
+		}
+		res, err := c.ExecContext(ctx, stmt)
+		if err != nil {
+			return fmt.Errorf("mysql: LOAD DATA into %q (%d rows): %w", table.Name, seg.rows, err)
+		}
+		if injected := injectedSegmentFailure(segment, isRetry, loadDataAfterExec); injected != nil {
+			return injected
+		}
+		// Rows the server actually INSERTED. On a replay the shortfall is
+		// the duplicate-key skips, and that difference is the independent
+		// number reportLoadDataWarnings uses to prove the replay's warnings
+		// are all harmless. A driver that cannot report it yields -1, which
+		// that accounting treats as "unprovable" and refuses on.
+		inserted, raErr := res.RowsAffected()
+		if raErr != nil {
+			inserted = -1
+		}
+		// CRITICAL (Bugs 102/103 v0.92.2 root cause): LOAD DATA LOCAL
+		// INFILE silently bypasses strict sql_mode for per-row type-
+		// conversion errors. The session's @@sql_mode is strict (we
+		// inject it in parseDSN), and a direct INSERT of an 80-digit
+		// NUMERIC into DECIMAL(65,30) correctly errors 1264 — but the
+		// same value through LOAD DATA with `(@var) SET col=@var`
+		// indirection silently clamps to MAX and bumps @@warning_count.
+		//
+		// Empirically (probed against MySQL 8.0 with strict sql_mode):
+		//   - Direct INSERT 80-digit → Error 1264, statement aborts
+		//   - LOAD DATA same value → row inserted with MAX clamp;
+		//     @@warning_count = 1; SHOW WARNINGS exposes the truncation
+		//   - Same for TIMESTAMP out-of-range / zero-date
+		//   - Explicit CAST(@var AS DECIMAL(65,30)) in SET still clamps
+		//
+		// The only reliable closure is the post-load warning probe, and it
+		// runs on the conn this attempt used — every segment, never
+		// sampled, because on this path the warning IS the error.
+		return w.reportLoadDataWarnings(ctx, c, table.Name, seg.rows, inserted, isRetry)
+	}, conn); err != nil {
+		return err
+	}
+	if bulkFlushHookForTest != nil {
+		bulkFlushHookForTest(seg.rows, int64(seg.buf.Len()))
+	}
+	return nil
+}
+
+// loadDataSegmentTarget is the encoded-TSV byte budget for one segment.
+// Zero-value-safe: the operator knob only ever LOWERS it, so every
+// construction that never sets maxBufferBytes (tests, direct API use, the
+// broker) gets the package default.
+func (w *RowWriter) loadDataSegmentTarget() int64 {
+	if w.maxBufferBytes > 0 && w.maxBufferBytes < defaultLoadDataSegmentBytes {
+		return w.maxBufferBytes
+	}
+	return defaultLoadDataSegmentBytes
 }
 
 // reportBulkWriteWarnings inspects the diagnostic-area warnings produced
@@ -218,7 +268,11 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 // reading `@@warning_count` first empties the diagnostic list, so the
 // prior code's subsequent SHOW WARNINGS returned nothing and the refusal
 // rendered an empty `Examples: []`. Reading SHOW WARNINGS directly gives
-// both the count (row count) AND the detail.
+// both the count (row count) AND the detail. The reverse ordering — the
+// list first, then the count — IS safe, and item 114's replay accounting
+// depends on it; that is pinned by
+// TestLoadDataLocal_TrueWarningCountSurvivesShowWarnings rather than left
+// as a claim.
 //
 // Strict sql_mode: LOAD DATA / non-strict-INSERT downgrade per-row
 // type-conversion errors to warnings; a non-empty list is silent
@@ -241,38 +295,88 @@ type diagnosticQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// showWarnings is what one SHOW WARNINGS read yielded. Visible is the
+// number of rows the server RETURNED, which the server caps at
+// @@max_error_count (1024 by default) — it is NOT necessarily the number of
+// warnings the statement produced. Anything that needs the true total must
+// read @@warning_count ([readTrueWarningCount]); the item-114 replay
+// accounting does, and the difference is load-bearing there.
+type showWarnings struct {
+	// Details holds up to 8 formatted lines for the operator message.
+	Details []string
+	// Visible counts the rows SHOW WARNINGS returned (capped, see above).
+	Visible int
+	// NonDup counts the VISIBLE rows whose code is not 1062 (duplicate
+	// key). Used as a second, sample-based signal alongside the replay
+	// accounting — see [replayWarningsAreOnlyDuplicates].
+	NonDup int
+}
+
+// mysqlDupKeyWarningCode is the SHOW WARNINGS code column value for the
+// duplicate-key warning LOAD DATA LOCAL emits instead of an error.
+const mysqlDupKeyWarningCode = "1062"
+
 // readShowWarnings reads SHOW WARNINGS on q (must be read before any
 // other statement on the session, which would clear the diagnostic list),
-// returning up to 8 formatted detail lines and the total warning count.
-func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (details []string, count int, err error) {
+// returning up to 8 formatted detail lines and the visible warning count.
+func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (showWarnings, error) {
+	var sw showWarnings
 	rows, err := q.QueryContext(ctx, "SHOW WARNINGS")
 	if err != nil {
-		return nil, 0, fmt.Errorf("mysql: write into %q: SHOW WARNINGS failed: %w", table, err)
+		return showWarnings{}, fmt.Errorf("mysql: write into %q: SHOW WARNINGS failed: %w", table, err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var level, code, msg string
 		if err := rows.Scan(&level, &code, &msg); err != nil {
-			return nil, 0, fmt.Errorf("mysql: write into %q: scan warning: %w", table, err)
+			return showWarnings{}, fmt.Errorf("mysql: write into %q: scan warning: %w", table, err)
 		}
-		count++
+		sw.Visible++
+		if code != mysqlDupKeyWarningCode {
+			sw.NonDup++
+		}
 		// Cap at a few warnings — gigantic loads can emit thousands and
 		// we just need enough for the operator to diagnose.
-		if len(details) < 8 {
-			details = append(details, fmt.Sprintf("%s %s: %s", level, code, msg))
+		if len(sw.Details) < 8 {
+			sw.Details = append(sw.Details, fmt.Sprintf("%s %s: %s", level, code, msg))
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("mysql: write into %q: iterate warnings: %w", table, err)
+		return showWarnings{}, fmt.Errorf("mysql: write into %q: iterate warnings: %w", table, err)
 	}
-	return details, count, nil
+	return sw, nil
+}
+
+// readTrueWarningCount reads @@warning_count — the number of warnings the
+// last statement produced, UNCAPPED, unlike the SHOW WARNINGS row count
+// which the server truncates at @@max_error_count. It must be read AFTER
+// the SHOW WARNINGS that consumes the detail list: SHOW WARNINGS does not
+// clear the count (verified against MySQL 8.0 in
+// TestLoadDataLocal_TrueWarningCountSurvivesShowWarnings), while a
+// prepared-statement read of @@warning_count DOES clear the list — which is
+// why this is a no-argument query (go-sql-driver sends it as a plain
+// COM_QUERY) and why it runs second.
+func readTrueWarningCount(ctx context.Context, conn *sql.Conn) (int64, error) {
+	var n int64
+	if err := conn.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&n); err != nil {
+		return 0, fmt.Errorf("mysql: read @@warning_count: %w", err)
+	}
+	return n, nil
 }
 
 func (w *RowWriter) reportBulkWriteWarnings(ctx context.Context, conn *sql.Conn, table string) error {
-	details, count, err := readShowWarnings(ctx, conn, table)
+	sw, err := readShowWarnings(ctx, conn, table)
 	if err != nil {
 		return err
 	}
+	return w.decideBulkWriteWarnings(ctx, table, sw, sw.Visible)
+}
+
+// decideBulkWriteWarnings is the refuse-or-WARN policy over an already-read
+// warning list. count is the number to REPORT — the visible count for the
+// ordinary paths, the true @@warning_count where the caller has read it.
+func (w *RowWriter) decideBulkWriteWarnings(ctx context.Context, table string, sw showWarnings, count int) error {
+	details := sw.Details
 	if count == 0 {
 		return nil
 	}
@@ -314,6 +418,86 @@ func (w *RowWriter) reportBulkWriteWarnings(ctx context.Context, conn *sql.Conn,
 		"corrupted data. --mysql-sql-mode='' is appropriate ONLY for accepting genuinely legacy "+
 		"zero-date data as-is (see docs/operator/migrating-legacy-mysql.md)",
 		table, count, strings.Join(details, "; "), more)
+}
+
+// reportLoadDataWarnings is the LOAD DATA segment's post-load warning probe
+// (item 114). On a FIRST attempt it is exactly [RowWriter.reportBulkWriteWarnings]
+// — any warning is the Bugs-102/103 silent-clamp signal and refuses under
+// strict sql_mode.
+//
+// On a REPLAY it has one more job. LOAD DATA LOCAL downgrades duplicate-key
+// to a warning and skips the row, so a byte-identical re-drive of a segment
+// whose prior attempt landed some or all of its rows legitimately produces
+// one 1062 warning PER already-landed row. Refusing on those would make the
+// retry useless; tolerating warnings wholesale would let a real coercion
+// hide among them. So the tolerance is bought with an INDEPENDENT number
+// rather than asserted:
+//
+//   - duplicates skipped = rows in the segment − rows the server reports
+//     INSERTED (driver-side affected-rows, not sluice's bookkeeping);
+//   - total warnings = @@warning_count, the server's UNCAPPED count;
+//   - anything left over is a warning duplicates cannot explain ⇒ refuse.
+//
+// The sampled SHOW WARNINGS list cannot serve as that evidence on its own:
+// the server caps it at @@max_error_count (1024), so on a large replay a
+// single truncation warning can sit entirely outside the visible window.
+// That exact case is pinned in
+// TestLoadDataLocal_TruncationHidesBehindDuplicateWarnings.
+func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string, segRows int, inserted int64, replay bool) error {
+	sw, err := readShowWarnings(ctx, conn, table)
+	if err != nil {
+		return err
+	}
+	if sw.Visible == 0 {
+		return nil
+	}
+	if !replay {
+		return w.decideBulkWriteWarnings(ctx, table, sw, sw.Visible)
+	}
+	total, err := readTrueWarningCount(ctx, conn)
+	if err != nil {
+		return fmt.Errorf(
+			"mysql: LOAD DATA into %q: the replayed segment produced warnings and the true warning count "+
+				"needed to prove they are only duplicate-key skips could not be read, so a silent value "+
+				"coercion could be hiding among them; refusing rather than tolerating them blind: %w",
+			table, err,
+		)
+	}
+	if !replayWarningsAreOnlyDuplicates(segRows, inserted, total, sw.NonDup) {
+		return w.decideBulkWriteWarnings(ctx, table, sw, int(total))
+	}
+	slog.WarnContext(
+		ctx, "mysql: LOAD DATA replay after a transient re-sent rows the target had already committed; "+
+			"MySQL skipped them as duplicate keys (LOAD DATA LOCAL reports duplicate-key as a warning), "+
+			"so the segment landed exactly once",
+		slog.String("table", table),
+		slog.Int("segment_rows", segRows),
+		slog.Int64("inserted", inserted),
+		slog.Int64("duplicates_skipped", int64(segRows)-inserted),
+	)
+	return nil
+}
+
+// replayWarningsAreOnlyDuplicates reports whether every warning a replayed
+// segment produced is accounted for by a duplicate-key skip.
+//
+// Pure, so the decision matrix is unit-pinned without a server. The
+// conservative direction is always "no": an accounting that does not add up
+// (unknown affected-rows, more warnings than skipped rows, a visible warning
+// that is not 1062) refuses, because the cost of a false refusal is a
+// restart and the cost of a false tolerance is a silently coerced value.
+//
+// Note a row can be BOTH truncated and duplicate — two warnings, one skip —
+// which shows up here as total > skipped and refuses. That is intended.
+func replayWarningsAreOnlyDuplicates(segRows int, inserted, totalWarnings int64, visibleNonDup int) bool {
+	if inserted < 0 || visibleNonDup > 0 {
+		return false
+	}
+	skipped := int64(segRows) - inserted
+	if skipped <= 0 {
+		return false
+	}
+	return totalWarnings <= skipped
 }
 
 // checkLocalInfile reports whether the server's `local_infile` system
@@ -461,19 +645,31 @@ func mintReaderName() (string, error) {
 
 // encodeRowsTSV consumes rows from the channel, runs each value
 // through prepareValue + tsvEncode, and writes tab-separated lines to
-// w until the channel closes or ctx is cancelled. Returns the first
-// error it encounters.
-func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-chan ir.Row) error {
+// w until the byte budget is reached, the channel closes, or ctx is
+// cancelled. Returns the first error it encounters.
+//
+// limitBytes is the item-114 segment budget: a non-positive value means
+// "the whole channel" (the pre-item-114 behaviour, still what the encoder's
+// own unit tests exercise). The budget is SOFT and bounds accumulation, not
+// individual rows — the check runs after a row is appended, so a row larger
+// than the whole budget still ships as a one-row segment. Rows are never
+// split, so a segment boundary is always a row boundary, which is what
+// makes a segment independently replayable.
+//
+// drained is true only when the row channel CLOSED; a budget-closed segment
+// returns false and the caller comes back for the next one.
+func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-chan ir.Row, limitBytes int64) (rowsWritten int, drained bool, err error) {
 	// One reusable byte buffer so the per-row hot path doesn't
 	// allocate per-field. The serializer writes to buf, then flushes
 	// the row at end-of-line.
 	buf := make([]byte, 0, 4096)
+	var written int64
 
 	for {
 		select {
 		case row, ok := <-rows:
 			if !ok {
-				return nil
+				return rowsWritten, true, nil
 			}
 			buf = buf[:0]
 			for i, c := range cols {
@@ -495,19 +691,24 @@ func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-c
 				}
 				v, err := prepareValue(raw, c)
 				if err != nil {
-					return err
+					return rowsWritten, false, err
 				}
 				buf, err = tsvEncode(buf, v)
 				if err != nil {
-					return err
+					return rowsWritten, false, err
 				}
 			}
 			buf = append(buf, '\n')
 			if _, err := w.Write(buf); err != nil {
-				return err
+				return rowsWritten, false, err
+			}
+			rowsWritten++
+			written += int64(len(buf))
+			if limitBytes > 0 && written >= limitBytes {
+				return rowsWritten, false, nil
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return rowsWritten, false, ctx.Err()
 		}
 	}
 }
@@ -616,9 +817,81 @@ func appendEscapedByte(dst []byte, c byte) []byte {
 	}
 }
 
-// loadDataPipeBufSize is the bufio.Writer capacity in front of the
-// LOAD DATA pipe writer. Mirrors the PG raw-copy lane's
-// rawCopyPipeBufSize (task #37): large enough to amortize the
-// per-write pipe rendezvous into ~64 KiB batches, small enough to be
-// irrelevant against per-stream memory budgets.
-const loadDataPipeBufSize = 64 * 1024
+// defaultLoadDataSegmentBytes is the encoded-TSV byte target that closes
+// one LOAD DATA segment (item 114) — the single knob trading the three
+// things the segmentation moves.
+//
+// RESUME GRANULARITY. A transient costs one segment's re-send instead of
+// the whole table. Against the defect this closes — a multi-hour copy
+// discarded entirely — anything from a few MiB up is a rounding error, so
+// this end of the trade is insensitive.
+//
+// THROUGHPUT. Measured, not assumed (TestLoadDataSegments_ThroughputCost):
+// an extra segment costs exactly one extra TRANSACTION COMMIT on the target
+// and nothing else. On the development box a one-row LOAD DATA and a
+// one-row INSERT both cost ~53 ms — identical, so the cost is the target's
+// commit, not anything LOAD DATA does — against a 0.6 ms round trip and a
+// 0.35 ms added SHOW WARNINGS probe. End-to-end over a 7.2 MiB corpus that
+// prices in linearly with the segment COUNT: 8 MiB budget 0.99x, 4 MiB
+// 1.09x, 2 MiB 1.19x, 1 MiB 1.46x, 256 KiB 2.59x. At 16 MiB the shipping
+// configuration is within measurement noise of the pre-item-114
+// single-statement copy. For scale, the batched-INSERT core this same
+// writer falls back to commits every ~1 MiB — a 16 MiB-segmented LOAD DATA
+// commits 16x LESS often than the alternative write path, so the throughput
+// advantage LOAD DATA is chosen for survives intact.
+//
+// MEMORY, the binding constraint and a genuinely new cost: one segment's
+// bytes are held per CONCURRENT WRITER, where the streaming pre-item-114
+// form held 64 KiB. A PG→MySQL cold copy can run --table-parallelism ×
+// --bulk-parallelism writers (auto 4 × min(8,NumCPU)), so the worst case is
+// tens of these. 16 MiB keeps each one well inside the ADR-0028 per-writer
+// buffer budget (--max-buffer-bytes, 64 MiB default) that the batched cores
+// already work within, and --max-buffer-bytes lowers it for a
+// memory-constrained run (see [RowWriter.loadDataSegmentTarget]).
+//
+// 16 MiB also sits under MySQL's default 64 MiB max_allowed_packet, so a
+// segment never depends on the driver's packet splitting to be deliverable.
+//
+// A package var, not a const, ONLY so tests can shrink it to get many
+// segments out of a small table (and, in the throughput pin, raise it to
+// re-create the pre-item-114 one-statement-per-table shape for the
+// before/after comparison). Production never mutates it, so there is no
+// config field and no zero-value path — the v0.99.51 trap does not apply.
+// Same disposition as coldCopyReparentMaxWallVar next door.
+var defaultLoadDataSegmentBytes int64 = 16 << 20
+
+// loadDataSegmentPhase names where within one segment attempt the test
+// failpoint fires. BOTH shapes matter and they exercise different halves of
+// the replay's correctness, which is why the hook carries the phase rather
+// than picking one:
+//
+//   - [loadDataBeforeExec] models an attempt that ROLLED BACK. The replay
+//     must then carry the segment's bytes, because nothing landed — a
+//     replay that sent an empty stream would pass every post-commit
+//     assertion.
+//   - [loadDataAfterExec] models COMMITTED-BUT-UNACKED, the shape a killed
+//     connection cannot produce on demand: the server has the rows and the
+//     client does not know it, so the replay must converge rather than
+//     duplicate.
+type loadDataSegmentPhase int
+
+const (
+	loadDataBeforeExec loadDataSegmentPhase = iota
+	loadDataAfterExec
+)
+
+// loadDataSegmentFailHookForTest, when non-nil, is consulted at each phase
+// of every LOAD DATA segment attempt with the 1-based segment number and
+// whether this attempt is a replay; a non-nil return is injected as the
+// attempt's error. nil in production — two nil checks on a per-segment (not
+// per-row) path.
+var loadDataSegmentFailHookForTest func(segment int, replay bool, phase loadDataSegmentPhase) error
+
+// injectedSegmentFailure returns the test failpoint's error for this phase,
+// or nil when no hook is installed (always, in production).
+func injectedSegmentFailure(segment int, replay bool, phase loadDataSegmentPhase) error {
+	if loadDataSegmentFailHookForTest == nil {
+		return nil
+	}
+	return loadDataSegmentFailHookForTest(segment, replay, phase)
+}

@@ -100,7 +100,7 @@ func TestEncodeRowsTSV_HappyPath(t *testing.T) {
 	close(rows)
 
 	var buf bytes.Buffer
-	if err := encodeRowsTSV(context.Background(), &buf, cols, rows); err != nil {
+	if _, _, err := encodeRowsTSV(context.Background(), &buf, cols, rows, 0); err != nil {
 		t.Fatalf("encodeRowsTSV: %v", err)
 	}
 
@@ -129,7 +129,7 @@ func TestEncodeRowsTSV_GeneratedColumnsExcludedByCaller(t *testing.T) {
 	close(rows)
 
 	var buf bytes.Buffer
-	if err := encodeRowsTSV(context.Background(), &buf, cols, rows); err != nil {
+	if _, _, err := encodeRowsTSV(context.Background(), &buf, cols, rows, 0); err != nil {
 		t.Fatalf("encodeRowsTSV: %v", err)
 	}
 	if buf.String() != "1\t3\n" {
@@ -145,7 +145,7 @@ func TestEncodeRowsTSV_ContextCancelled(t *testing.T) {
 	cancel()
 
 	var buf bytes.Buffer
-	err := encodeRowsTSV(ctx, &buf, cols, rows)
+	_, _, err := encodeRowsTSV(ctx, &buf, cols, rows, 0)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("encodeRowsTSV with cancelled ctx: got %v; want context.Canceled", err)
 	}
@@ -163,7 +163,7 @@ func TestEncodeRowsTSV_PrepareValueAppliedToSet(t *testing.T) {
 	close(rows)
 
 	var buf bytes.Buffer
-	if err := encodeRowsTSV(context.Background(), &buf, cols, rows); err != nil {
+	if _, _, err := encodeRowsTSV(context.Background(), &buf, cols, rows, 0); err != nil {
 		t.Fatalf("encodeRowsTSV: %v", err)
 	}
 	if buf.String() != "a,c\n" {
@@ -183,7 +183,7 @@ func TestEncodeRowsTSV_PrepareValueAppliedToJSON(t *testing.T) {
 	close(rows)
 
 	var buf bytes.Buffer
-	if err := encodeRowsTSV(context.Background(), &buf, cols, rows); err != nil {
+	if _, _, err := encodeRowsTSV(context.Background(), &buf, cols, rows, 0); err != nil {
 		t.Fatalf("encodeRowsTSV: %v", err)
 	}
 	if buf.String() != `{"k":"v"}`+"\n" {
@@ -313,7 +313,7 @@ func TestEncodeRowsTSV_LargeBatch(t *testing.T) {
 	}()
 
 	var buf bytes.Buffer
-	if err := encodeRowsTSV(context.Background(), &buf, cols, rows); err != nil {
+	if _, _, err := encodeRowsTSV(context.Background(), &buf, cols, rows, 0); err != nil {
 		t.Fatalf("encodeRowsTSV: %v", err)
 	}
 
@@ -342,7 +342,7 @@ func TestEncodeRowsTSV_StreamsToReader(t *testing.T) {
 	pr, pw := io.Pipe()
 	encErr := make(chan error, 1)
 	go func() {
-		err := encodeRowsTSV(context.Background(), pw, cols, rows)
+		_, _, err := encodeRowsTSV(context.Background(), pw, cols, rows, 0)
 		_ = pw.Close()
 		encErr <- err
 	}()

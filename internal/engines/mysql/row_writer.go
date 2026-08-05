@@ -90,8 +90,12 @@ type RowWriter struct {
 	// target lowers the effective per-statement byte trigger, while
 	// zero/negative or a larger value leaves the target in charge
 	// (the target already sits far under the ADR-0028 64 MiB
-	// accumulation default). The LOAD DATA path is already streaming
-	// (rows go through an io.Pipe to the driver) and is unaffected.
+	// accumulation default). Since item 114 it ALSO lowers the LOAD
+	// DATA path's per-segment encoded-TSV budget when it is below
+	// defaultLoadDataSegmentBytes — that path buffers one segment so a
+	// transient can be ridden by replaying it, so it has a heap
+	// footprint to bound now where the pre-item-114 streaming form did
+	// not. See [RowWriter.loadDataSegmentTarget].
 	maxBufferBytes int64
 
 	// upsert is the ON DUPLICATE KEY UPDATE spelling the idempotent

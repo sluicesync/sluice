@@ -26,11 +26,14 @@ import (
 //
 // Which paths these reach: the plain batched-INSERT core
 // (writeBatchedConn, via WriteRows and WriteRowsParallel) and the
-// idempotent upsert core (writeBatchedIdempotentConn) — every caller of
-// flushWithReparentRetry, which is where the gate lives. The LOAD DATA
-// core is out of scope because it never retries at all (it returns a loud
-// "CANNOT be resumed" terminal error), and the PG twin is pinned in the
-// postgres package.
+// idempotent upsert core (writeBatchedIdempotentConn). The THIRD caller of
+// flushWithReparentRetry — the LOAD DATA per-segment core, which since item
+// 114 retries like the others rather than returning a terminal "CANNOT be
+// resumed" — is pinned by its own sibling in load_data_segment_test.go
+// (TestLoadDataSegments_KeylessRefusesRatherThanReplay) and end-to-end
+// against a real server in
+// TestLoadDataSegments_KeylessInterruptedCopyRefusesLoudly. The PG twin is
+// pinned in the postgres package.
 
 // keylessPinTable is pinReparentTable's shape with the primary key
 // removed and no unique index — a truly keyless table, the shape the

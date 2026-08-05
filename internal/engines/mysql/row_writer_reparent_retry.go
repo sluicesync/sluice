@@ -109,8 +109,11 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 
 // flushWithReparentRetry runs a single cold-copy batch flush with the
 // ADR-0108 bounded reparent-retry around it. It is the ONE place the
-// retry policy lives so the plain and idempotent paths (and their
-// parallel-worker callers) share one shape, one log, one bound.
+// retry policy lives so all THREE MySQL bulk-write cores — plain batched
+// INSERT ([RowWriter.writeBatchedConn]), idempotent upsert
+// ([RowWriter.writeBatchedIdempotentConn]) and, since item 114, LOAD DATA
+// per segment ([RowWriter.flushLoadDataSegment]) — and their
+// parallel-worker callers share one shape, one log, one bound.
 //
 //   - tableName names the table for the WARN/terminal messages.
 //   - rows is the row count of the batch being flushed (for the logs).
@@ -125,7 +128,11 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 //     byte-identical atomic batch re-applied after a classified transient
 //     may collide on a committed-but-unacked prior attempt; that 1062 is
 //     provably "already landed" ONLY on a retry. A first-attempt 1062
-//     (isRetry=false) stays terminal (real dup-key / dirty target).
+//     (isRetry=false) stays terminal (real dup-key / dirty target). The
+//     LOAD DATA core reads the same flag for the same reason in a
+//     different spelling: LOAD DATA LOCAL reports the collision as a
+//     WARNING rather than an error, so its replay tolerance lives in the
+//     post-load warning probe (see [RowWriter.reportLoadDataWarnings]).
 //
 // The KEYLESS CARVE-OUT (audit B-9). Everything above is an argument
 // about a COLLISION, and a collision needs something to collide with. A

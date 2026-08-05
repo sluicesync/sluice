@@ -1327,10 +1327,11 @@ func (a *ChangeApplier) reportApplyClampWarnings(ctx context.Context, tx *sql.Tx
 	if !warningsCheckDue(int(a.clampProbes.Add(1))) {
 		return nil
 	}
-	details, count, err := readShowWarnings(ctx, tx, table)
+	sw, err := readShowWarnings(ctx, tx, table)
 	if err != nil {
 		return err
 	}
+	details, count := sw.Details, sw.Visible
 	if count == 0 {
 		return nil
 	}
