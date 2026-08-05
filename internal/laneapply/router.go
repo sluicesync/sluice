@@ -13,19 +13,90 @@ import (
 )
 
 // Router maps each row-bearing change to one of `lanes` apply lanes by a
-// stable hash of the change's (qualified table, ordered primary-key
-// values). The mapping is deterministic and total: the same logical key
-// always resolves to the same lane, which is the load-bearing
-// same-key-closed property — all changes to one row are applied in source
-// order on a single lane, so the dependent-row hazard (INSERT then
-// DELETE/UPDATE of the same key racing on two transactions) cannot occur.
+// stable hash of the change's [Route]. The mapping is deterministic and
+// total: the same route always resolves to the same lane, which is the
+// load-bearing same-route-closed property — all changes sharing a route are
+// applied in source order on a single lane, so the dependent-row hazard
+// (INSERT then DELETE/UPDATE racing on two transactions) cannot occur
+// BETWEEN THEM.
+//
+// What "between them" covers is the [RouteScope]. Hashing the primary key
+// closes the hazard for one row and ONLY for one row: two changes to
+// DIFFERENT primary keys that collide on a table's SECONDARY UNIQUE index
+// are dependent on each other and hash apart (roadmap item 131 / audit
+// 2026-08-05 A-1). That is why the scope exists and why its zero value is
+// the whole-table one.
 //
 // The router is pure and immutable; it holds no state and is safe to call
 // from the single routing goroutine. Keyless changes (no primary key) are
 // NOT routed here — they take the barrier path (drain all lanes, apply
-// single-row), so LaneFor is only ever called with a non-empty pkVals.
+// single-row).
 type Router struct {
 	lanes int
+}
+
+// RouteScope selects what a change's lane hash covers — i.e. which OTHER
+// changes it is guaranteed to be ordered against.
+//
+// The zero value is [RouteScopeTable], the SAFE one, deliberately: a Route an
+// engine leaves unset (a new implementor, a path that could not read the
+// target's index metadata, a struct built by a test) gets whole-table
+// ordering rather than the fast path. A fail-OPEN default would silently
+// recreate item 131 for everything it missed, and a missed case is invisible
+// — both lanes report success (the v0.99.51 zero-value discipline, applied to
+// a correctness switch rather than a config bool).
+type RouteScope uint8
+
+const (
+	// RouteScopeTable routes EVERY change on the table to ONE lane: the hash
+	// covers the qualified table name alone. Required when the target table
+	// can refuse two rows on something other than the primary key — a
+	// secondary UNIQUE index, an exclusion constraint — because then changes
+	// to different keys are dependent on each other and must not commit out
+	// of source order. Cross-TABLE concurrency is preserved; concurrency
+	// within the table is not.
+	RouteScopeTable RouteScope = iota
+
+	// RouteScopeKey is the fast path: the hash covers (table, primary key),
+	// so distinct rows of the table spread across all lanes. An engine may
+	// only choose it once it has PROVEN the target table carries no non-PK
+	// uniqueness constraint. "Could not determine" is not a proof — it takes
+	// [RouteScopeTable].
+	RouteScopeKey
+)
+
+// Route is the lane-routing decision for one row change: which table it
+// belongs to, which row within that table, and how much of that the lane hash
+// must cover ([RouteScope]). It is produced by the engine
+// ([LaneApplier.RouteForChange], which owns the target-metadata knowledge)
+// and consumed by [Router.LaneForRoute], which is the single place the
+// decision turns into a lane index.
+type Route struct {
+	// Qualified is the engine's qualified target table name (the form its
+	// own caches key on). Never empty for a routable change.
+	Qualified string
+
+	// PKVals are the change's ordered primary-key values. Always populated
+	// for a routable change — including under [RouteScopeTable], where the
+	// hash ignores them — so a diagnostic or a future scope can read the row
+	// identity without a second decode.
+	PKVals []any
+
+	// Scope selects what the hash covers. Zero value = [RouteScopeTable].
+	Scope RouteScope
+}
+
+// LaneForRoute returns the lane index in [0, lanes) for rt, honouring its
+// scope: [RouteScopeKey] hashes (table, primary key) so distinct rows spread;
+// anything else — including the zero value — hashes the table alone so every
+// change on it lands on one in-order lane. This is the ONLY place a Route
+// becomes a lane, so the fail-closed default has exactly one enforcement
+// point (pinned by TestLaneForRoute_ScopeDecidesTheHash).
+func (r *Router) LaneForRoute(rt Route) int {
+	if rt.Scope == RouteScopeKey {
+		return r.LaneFor(rt.Qualified, rt.PKVals)
+	}
+	return r.LaneFor(rt.Qualified, nil)
 }
 
 // NewRouter returns a router over `lanes` lanes. lanes < 1 is clamped to 1
@@ -114,7 +185,7 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 // pk cache). An empty pkCols means a keyless table → ok=false → barrier
 // path (the keyless guard applies single-row regardless).
 //
-// This is the PURE traversal half of the engine's PKValuesForRouting seam
+// This is the PURE traversal half of the engine's RouteForChange seam
 // method: the engine loads pkCols (and decides PK-changing-update barrier
 // detection) on its side, then calls this with the resolved columns.
 //

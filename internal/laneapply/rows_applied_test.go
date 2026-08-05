@@ -22,7 +22,7 @@ type countingSeam struct {
 	rowsDeltas []int64
 }
 
-func (s *countingSeam) PKValuesForRouting(_ context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error) {
+func (s *countingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool, error) {
 	var row ir.Row
 	switch v := c.(type) {
 	case ir.Insert:
@@ -32,14 +32,14 @@ func (s *countingSeam) PKValuesForRouting(_ context.Context, c ir.Change) (quali
 	case ir.Delete:
 		row = v.Before
 	default:
-		return "", nil, false, nil
+		return Route{}, false, nil
 	}
 	id, has := row["id"]
 	if !has {
 		// Keyless → barrier (still counted as DML in handle).
-		return "", nil, false, nil
+		return Route{}, false, nil
 	}
-	return "ks.t", []any{id}, true, nil
+	return Route{Qualified: "ks.t", PKVals: []any{id}, Scope: RouteScopeKey}, true, nil
 }
 
 func (s *countingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change) (int, error) {

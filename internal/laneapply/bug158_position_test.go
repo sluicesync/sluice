@@ -25,14 +25,14 @@ type recordingSeam struct {
 	barriers    []ir.Change // changes passed to ApplyBarrierChange, in order
 }
 
-func (s *recordingSeam) PKValuesForRouting(_ context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error) {
+func (s *recordingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool, error) {
 	// Route every Insert/Update/Delete to a single lane by a fixed key so the
 	// stream's ordering is deterministic; non-row events go to the barrier.
 	switch c.(type) {
 	case ir.Insert, ir.Update, ir.Delete:
-		return "ks.t", []any{int64(1)}, true, nil
+		return Route{Qualified: "ks.t", PKVals: []any{int64(1)}, Scope: RouteScopeKey}, true, nil
 	}
-	return "", nil, false, nil
+	return Route{}, false, nil
 }
 
 func (s *recordingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change) (int, error) {

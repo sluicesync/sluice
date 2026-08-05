@@ -27,14 +27,23 @@
 // when same-key operations are guaranteed onto a single in-order lane.
 //
 // This package is the correctness core of that safe partitioning: the
-// **key-hash router** (every change for a given primary key lands on the
-// same lane, dispatched in source order there) and the **contiguous
-// checkpoint frontier** (the resume position advances only to a source
-// transaction boundary all of whose changes are durable across every
-// lane). Both are pure, lock-disciplined, and unit-tested independently of
-// any database or goroutine wiring; the lane orchestration that consumes
-// them is layered on top (and carries the -race integration gate before
-// any tag — concurrency chunk).
+// **key-hash router** (every change sharing a [Route] lands on the same
+// lane, dispatched in source order there) and the **contiguous checkpoint
+// frontier** (the resume position advances only to a source transaction
+// boundary all of whose changes are durable across every lane). Both are
+// pure, lock-disciplined, and unit-tested independently of any database or
+// goroutine wiring; the lane orchestration that consumes them is layered on
+// top (and carries the -race integration gate before any tag — concurrency
+// chunk).
+//
+// A primary key is not always a wide enough route. Two changes to DIFFERENT
+// primary keys that collide on a table's SECONDARY UNIQUE index are
+// dependent on each other in exactly the way above, and hashing the PK puts
+// them on different lanes — silently losing a row on a MySQL-family target,
+// where every lane INSERT's ON DUPLICATE KEY UPDATE fires on any unique
+// index (roadmap item 131 / audit 2026-08-05 A-1). [RouteScope] is how the
+// engine widens the route to the whole table for those, keeping cross-table
+// concurrency but ordering the table against itself.
 //
 // Why key-hash and not per-shard: the source shard is not on ir.Change
 // (the engine-neutral IR carries no Vitess concept, and the merged
@@ -97,8 +106,9 @@ import (
 // the lane-local read cap, and all concurrency; the engine owns the
 // database contact and value encoding.
 type LaneApplier interface {
-	// PKValuesForRouting returns the source-qualified table name and the
-	// ordered primary-key values of a row change for lane hashing.
+	// RouteForChange returns the lane [Route] for a row change: the
+	// source-qualified table, the ordered primary-key values, and the
+	// [RouteScope] the lane hash must use.
 	//
 	// ok=false routes the change to the BARRIER path (drain all lanes, apply
 	// single-row in global order). The contract: ok=false covers EVERY case
@@ -116,7 +126,15 @@ type LaneApplier interface {
 	// All four are barriered identically, preserving the GA behavior exactly.
 	// err is for a genuine engine error (e.g. a PK-metadata lookup failure),
 	// already classified, and aborts the run.
-	PKValuesForRouting(ctx context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error)
+	//
+	// The SCOPE is the item-131 half: an implementation may return
+	// [RouteScopeKey] only where it has proven the target table carries no
+	// non-PK uniqueness constraint, because a secondary UNIQUE index makes
+	// changes to DIFFERENT primary keys dependent on each other. Everything
+	// else — including "the metadata probe failed" — leaves the zero value
+	// [RouteScopeTable] and gets whole-table ordering. The zero-value default
+	// is what makes a new implementor safe before anyone reviews it.
+	RouteForChange(ctx context.Context, c ir.Change) (route Route, ok bool, err error)
 
 	// ApplyLaneBatch applies the (sub-)batch on lane `lane`'s dedicated
 	// backend in one transaction (idempotent UPSERT per ADR-0010) and
@@ -688,14 +706,16 @@ func (o *Orchestrator) flushPendingBoundary() {
 	}
 }
 
-// routeRow routes a keyed row-change to its key-hash lane, or falls to the
-// barrier path when the change is keyless, malformed, or a PK-changing
-// update (where the old and new keys could land on different lanes and the
-// old/new ordering must be preserved globally). All of those distinctions
-// are made by the engine's [LaneApplier.PKValuesForRouting] returning
-// ok=false (see its contract); the orchestrator only hashes + pushes.
+// routeRow routes a keyed row-change to its lane, or falls to the barrier
+// path when the change is keyless, malformed, or a PK-changing update (where
+// the old and new keys could land on different lanes and the old/new ordering
+// must be preserved globally). All of those distinctions are made by the
+// engine's [LaneApplier.RouteForChange] returning ok=false (see its
+// contract); the orchestrator only hashes + pushes. The returned [Route]'s
+// [RouteScope] decides whether the hash covers the row or the whole table
+// (item 131) — resolved in exactly one place, [Router.LaneForRoute].
 func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) error {
-	qualified, vals, ok, err := o.la.PKValuesForRouting(ctx, c)
+	route, ok, err := o.la.RouteForChange(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -705,7 +725,7 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 		// mis-routed).
 		return o.barrier(ctx, seq, c)
 	}
-	lane := o.router.LaneFor(qualified, vals)
+	lane := o.router.LaneForRoute(route)
 	// Push the {seq, change} envelope so the lane reads the sequence and its
 	// change inherently paired (the FIFO-alignment fix — no sibling seq
 	// channel to drift out of step). The select honours ctx cancel so a

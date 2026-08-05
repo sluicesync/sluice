@@ -265,8 +265,9 @@ type ChangeApplier struct {
 	// pre-v0.52.0 unbounded-block behavior).
 	execTimeout time.Duration
 
-	// cacheMu guards the four lazily-populated metadata caches below
-	// (pkCache, colTypeCache, keylessCache, warnedKeyless) so the
+	// cacheMu guards the lazily-populated metadata caches below
+	// (pkCache, colTypeCache, keylessCache, warnedKeyless,
+	// nonPKUniqueCache, warnedRouteProbe) so the
 	// ADR-0104 concurrent key-hash apply lanes can call dispatch from W
 	// goroutines safely. EVERY access to those maps goes through the
 	// guarded accessors in change_applier_concurrent.go — there is no
@@ -291,6 +292,19 @@ type ChangeApplier struct {
 	// already WARNed about so the guard logs at most once per table.
 	keylessCache  map[string]bool
 	warnedKeyless map[string]bool
+
+	// nonPKUniqueCache maps "schema.table" → whether the TARGET table
+	// carries a UNIQUE index other than the PRIMARY KEY (roadmap item
+	// 131). It decides the lane [laneapply.RouteScope]: a table with one
+	// must be ordered against ITSELF, because ON DUPLICATE KEY UPDATE
+	// fires on any unique index, so two changes to different primary keys
+	// can be dependent. Populated lazily via one information_schema probe
+	// per table and invalidated with the rest on a schema boundary.
+	// warnedRouteProbe tracks tables whose probe FAILED so the
+	// fail-closed fallback is WARNed at most once per table rather than
+	// per change.
+	nonPKUniqueCache map[string]bool
+	warnedRouteProbe map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier

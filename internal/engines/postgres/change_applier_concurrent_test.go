@@ -5,10 +5,12 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"reflect"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 )
 
 // Unit pins for the Postgres side of the ADR-0105 [laneapply.LaneApplier]
@@ -85,42 +87,46 @@ func TestGuardedCacheAccessors_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestPKValuesForRouting_Decision pins the lane-routing decision: a keyed row
+// TestRouteForChange_Decision pins the lane-routing decision: a keyed row
 // change routes (ok=true, qualified+PK values); a keyless table, a malformed
 // change, and a PK-changing UPDATE all fall to the barrier path (ok=false).
-// The PK cache is pre-seeded so pkForRedact never hits a DB.
-func TestPKValuesForRouting_Decision(t *testing.T) {
+// The PK and unique-index caches are pre-seeded so the decision never hits a DB.
+func TestRouteForChange_Decision(t *testing.T) {
 	a := newCacheTestApplier()
 	// Routed schema for a single-database run is the bound schema ("public");
 	// seed both the keyed and keyless tables.
 	a.storePK("public.keyed", []string{"id"})
 	a.storePK("public.keyless", []string{}) // table exists, no PK
+	a.storeNonPKUnique("public.keyed", false)
 
 	la := &laneApplierAdapter{a: a, streamID: testStreamIDUnit}
 	ctx := context.Background()
 
 	t.Run("keyed insert routes", func(t *testing.T) {
-		qn, vals, ok, err := la.PKValuesForRouting(ctx, ir.Insert{Schema: "public", Table: "keyed", Row: ir.Row{"id": int64(7), "v": "x"}})
+		r, ok, err := la.RouteForChange(ctx, ir.Insert{Schema: "public", Table: "keyed", Row: ir.Row{"id": int64(7), "v": "x"}})
 		if err != nil || !ok {
 			t.Fatalf("ok=%v err=%v; want ok=true", ok, err)
 		}
-		if qn != "public.keyed" {
-			t.Errorf("qualified = %q; want public.keyed", qn)
+		if r.Qualified != "public.keyed" {
+			t.Errorf("qualified = %q; want public.keyed", r.Qualified)
 		}
-		if !reflect.DeepEqual(vals, []any{int64(7)}) {
-			t.Errorf("pkVals = %v; want [7]", vals)
+		if !reflect.DeepEqual(r.PKVals, []any{int64(7)}) {
+			t.Errorf("pkVals = %v; want [7]", r.PKVals)
+		}
+		if r.Scope != laneapply.RouteScopeKey {
+			t.Errorf("scope = %v; want RouteScopeKey (no non-PK unique index)", r.Scope)
 		}
 	})
 
 	t.Run("keyless table → barrier", func(t *testing.T) {
-		_, _, ok, err := la.PKValuesForRouting(ctx, ir.Insert{Schema: "public", Table: "keyless", Row: ir.Row{"v": "x"}})
+		_, ok, err := la.RouteForChange(ctx, ir.Insert{Schema: "public", Table: "keyless", Row: ir.Row{"v": "x"}})
 		if err != nil || ok {
 			t.Fatalf("ok=%v err=%v; want ok=false (keyless → barrier)", ok, err)
 		}
 	})
 
 	t.Run("malformed (PK col absent) → barrier", func(t *testing.T) {
-		_, _, ok, err := la.PKValuesForRouting(ctx, ir.Insert{Schema: "public", Table: "keyed", Row: ir.Row{"v": "x"}})
+		_, ok, err := la.RouteForChange(ctx, ir.Insert{Schema: "public", Table: "keyed", Row: ir.Row{"v": "x"}})
 		if err != nil || ok {
 			t.Fatalf("ok=%v err=%v; want ok=false (missing PK col → barrier)", ok, err)
 		}
@@ -128,7 +134,7 @@ func TestPKValuesForRouting_Decision(t *testing.T) {
 
 	t.Run("PK-changing update → barrier", func(t *testing.T) {
 		u := ir.Update{Schema: "public", Table: "keyed", Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(2)}}
-		_, _, ok, err := la.PKValuesForRouting(ctx, u)
+		_, ok, err := la.RouteForChange(ctx, u)
 		if err != nil || ok {
 			t.Fatalf("ok=%v err=%v; want ok=false (PK migration → barrier)", ok, err)
 		}
@@ -136,14 +142,51 @@ func TestPKValuesForRouting_Decision(t *testing.T) {
 
 	t.Run("same-PK update routes", func(t *testing.T) {
 		u := ir.Update{Schema: "public", Table: "keyed", Before: ir.Row{"id": int64(3), "v": "a"}, After: ir.Row{"id": int64(3), "v": "b"}}
-		qn, vals, ok, err := la.PKValuesForRouting(ctx, u)
+		r, ok, err := la.RouteForChange(ctx, u)
 		if err != nil || !ok {
 			t.Fatalf("ok=%v err=%v; want ok=true (same-PK update routes)", ok, err)
 		}
-		if qn != "public.keyed" || !reflect.DeepEqual(vals, []any{int64(3)}) {
-			t.Errorf("qn=%q vals=%v; want public.keyed [3]", qn, vals)
+		if r.Qualified != "public.keyed" || !reflect.DeepEqual(r.PKVals, []any{int64(3)}) {
+			t.Errorf("qn=%q vals=%v; want public.keyed [3]", r.Qualified, r.PKVals)
 		}
 	})
+
+	t.Run("non-PK unique index → whole-table scope", func(t *testing.T) {
+		a.storePK("public.natural", []string{"id"})
+		a.storeNonPKUnique("public.natural", true)
+		r, ok, err := la.RouteForChange(ctx, ir.Insert{Schema: "public", Table: "natural", Row: ir.Row{"id": int64(9)}})
+		if err != nil || !ok {
+			t.Fatalf("ok=%v err=%v; want ok=true", ok, err)
+		}
+		if r.Scope != laneapply.RouteScopeTable {
+			t.Errorf("scope = %v; want RouteScopeTable (item 131 — a secondary unique index makes distinct keys dependent)", r.Scope)
+		}
+	})
+}
+
+// TestTableHasNonPKUniqueIndex_ProbeFailureFailsClosed pins the fail-closed
+// half of item 131: when the catalog probe cannot answer, the table must be
+// treated as CARRYING a non-PK uniqueness constraint (whole-table lane) and
+// the verdict must NOT be cached, so a later probe can correct it. The probe
+// is forced to fail by handing the applier a closed *sql.DB — the cheapest
+// stand-in for a target blip that does not need a container.
+func TestTableHasNonPKUniqueIndex_ProbeFailureFailsClosed(t *testing.T) {
+	db, err := sql.Open("pgx", "postgres://sluice:sluice@127.0.0.1:1/none")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	a := newCacheTestApplier()
+	a.db = db
+
+	if !a.tableHasNonPKUniqueIndex(context.Background(), "public", "unknowable") {
+		t.Error("probe failure returned false (per-key routing); it must fail CLOSED to whole-table routing")
+	}
+	if _, cached := a.cachedNonPKUnique("public.unknowable"); cached {
+		t.Error("a failed probe was cached; it must stay uncached so a later probe can correct it")
+	}
 }
 
 // testStreamIDUnit is a fixed stream id for the unit pins (the integration

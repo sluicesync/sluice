@@ -60,8 +60,8 @@ type testSeam struct {
 	commit func(ctx context.Context, batch []ir.Change) error
 }
 
-func (s *testSeam) PKValuesForRouting(context.Context, ir.Change) (qualified string, pkVals []any, ok bool, err error) {
-	return "", nil, false, nil
+func (s *testSeam) RouteForChange(context.Context, ir.Change) (Route, bool, error) {
+	return Route{}, false, nil
 }
 
 func (s *testSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
@@ -436,8 +436,8 @@ type routingSeam struct {
 	commit func(ctx context.Context, batch []ir.Change) error
 }
 
-func (s *routingSeam) PKValuesForRouting(context.Context, ir.Change) (qualified string, pkVals []any, ok bool, err error) {
-	return "ks.t", []any{int64(1)}, true, nil
+func (s *routingSeam) RouteForChange(context.Context, ir.Change) (Route, bool, error) {
+	return Route{Qualified: "ks.t", PKVals: []any{int64(1)}, Scope: RouteScopeKey}, true, nil
 }
 
 func (s *routingSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {

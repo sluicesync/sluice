@@ -24,6 +24,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
@@ -103,14 +104,56 @@ func (a *ChangeApplier) markWarnedKeyless(qn string) (firstTime bool) {
 	return true
 }
 
-// invalidateMetadataCaches drops the PK + column-type cache entries for qn
-// (the ADR-0049 schema-change cache invalidation). Guarded so a
-// barrier-path invalidation is safe against concurrent lane reads.
+func (a *ChangeApplier) cachedNonPKUnique(qn string) (hasUnique, ok bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.nonPKUniqueCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storeNonPKUnique(qn string, hasUnique bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.nonPKUniqueCache == nil {
+		a.nonPKUniqueCache = make(map[string]bool)
+	}
+	a.nonPKUniqueCache[qn] = hasUnique
+}
+
+// markWarnedRouteProbe records that the fail-closed routing-probe WARN has
+// been emitted for qn and reports whether THIS call recorded it, so a table
+// whose index probe keeps failing is WARNed once rather than per change.
+func (a *ChangeApplier) markWarnedRouteProbe(qn string) (firstTime bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.warnedRouteProbe == nil {
+		a.warnedRouteProbe = make(map[string]bool)
+	}
+	if a.warnedRouteProbe[qn] {
+		return false
+	}
+	a.warnedRouteProbe[qn] = true
+	return true
+}
+
+// invalidateMetadataCaches drops the PK + column-type + lane-routing cache
+// entries for qn (the ADR-0049 schema-change cache invalidation). Guarded so
+// a barrier-path invalidation is safe against concurrent lane reads.
+//
+// nonPKUniqueCache belongs here because a DDL that ADDS a unique index flips
+// the table's routing scope, and a stale "no unique index" verdict would keep
+// its changes key-hashed across lanes — item 131's defect, re-armed by a
+// schema change. That the re-route is SAFE rests on the barrier: schema
+// events reach [Orchestrator.barrier], which drains every lane to the
+// event's predecessor before applying it, so all key-scoped work is durably
+// committed before any table-scoped work is routed. The barrier drain is
+// pinned by TestBarrier_DrainsAllLanesBeforeApply.
 func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	a.cacheMu.Lock()
 	defer a.cacheMu.Unlock()
 	delete(a.colTypeCache, qn)
 	delete(a.pkCache, qn)
+	delete(a.nonPKUniqueCache, qn)
 }
 
 // --- Concurrent apply: MySQL adapter for the laneapply seam (ADR-0105) ---
@@ -148,31 +191,80 @@ type laneApplierAdapter struct {
 	laneCommitHook func(buf []laneChange) error
 }
 
-// PKValuesForRouting decodes the row change's schema/table, loads the PK
-// columns, and returns the source-qualified name + ordered PK values for
-// lane hashing. ok=false routes to the barrier path for: a non-row event, a
-// keyless/malformed change, OR a PK-changing update (a key migration whose
-// old/new effects must stay globally ordered) — exactly the cases the GA
-// routeRow barriered. A PK-metadata lookup error is classified and aborts.
-func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error) {
+// RouteForChange decodes the row change's schema/table, loads the PK columns,
+// and returns the lane [laneapply.Route]. ok=false routes to the barrier path
+// for: a non-row event, a keyless/malformed change, OR a PK-changing update (a
+// key migration whose old/new effects must stay globally ordered) — exactly
+// the cases the GA routeRow barriered. A PK-metadata lookup error is
+// classified and aborts.
+//
+// The SCOPE is item 131. Per-key hashing is taken only for a table PROVEN to
+// carry no unique index besides the PRIMARY KEY; everything else — including a
+// failed probe — stays at the zero-value whole-table scope, because MySQL's ON
+// DUPLICATE KEY UPDATE fires on ANY unique index (with the PK excluded from
+// its SET list), which makes changes to different primary keys dependent on
+// each other and silently loses a row when they commit out of source order.
+func (la *laneApplierAdapter) RouteForChange(ctx context.Context, c ir.Change) (laneapply.Route, bool, error) {
 	schema, table := laneapply.RowChangeSchemaTable(c)
 	routed := la.a.routedSchema(schema)
 	pkCols, perr := la.a.pkForRedact(ctx, schema, table)
 	if perr != nil {
-		return "", nil, false, classifyApplierError(perr)
+		return laneapply.Route{}, false, classifyApplierError(perr)
 	}
 	vals, routable := laneapply.PKValuesFromRow(c, pkCols)
 	if !routable {
 		// Keyless / malformed → barrier (ADR-0089 at-least-once; never
 		// silently mis-routed).
-		return "", nil, false, nil
+		return laneapply.Route{}, false, nil
 	}
 	if u, isUpd := c.(ir.Update); isUpd && laneapply.PKChangedUpdate(u, pkCols) {
 		// PK-changing update → barrier so old-key/new-key effects stay
 		// globally ordered (they could hash to different lanes).
-		return "", nil, false, nil
+		return laneapply.Route{}, false, nil
 	}
-	return qualifiedName(routed, table), vals, true, nil
+	route := laneapply.Route{Qualified: qualifiedName(routed, table), PKVals: vals}
+	if !la.a.tableHasNonPKUniqueIndex(ctx, routed, table) {
+		route.Scope = laneapply.RouteScopeKey
+	}
+	return route, true, nil
+}
+
+// tableHasNonPKUniqueIndex reports whether the TARGET table carries a UNIQUE
+// index other than the PRIMARY KEY, caching the verdict per qualified name
+// (one information_schema round trip per table, then a map read per change).
+//
+// It FAILS CLOSED: a probe error returns true — "assume the hazard" — is NOT
+// cached (so a later probe can correct it once a transient clears), and WARNs
+// once per table so an operator can see why that table lost its lane
+// concurrency. Returning false on a failed probe would silently re-arm item
+// 131 for the table, and the resulting loss is invisible (every lane reports
+// success).
+//
+// Excluding the PK by NAME is exact on MySQL: the server names the clustered
+// primary-key index 'PRIMARY' and reserves that name — a user cannot create
+// another index called PRIMARY, and cannot rename the PK's. The premise is
+// ground-truthed on a real server by the roster's `pk_only` /
+// `composite_pk_only` cases, which demand MULTI-lane routing and therefore
+// fail if 'PRIMARY' ever stopped being excluded.
+func (a *ChangeApplier) tableHasNonPKUniqueIndex(ctx context.Context, schema, table string) bool {
+	qn := qualifiedName(schema, table)
+	if v, ok := a.cachedNonPKUnique(qn); ok {
+		return v
+	}
+	const q = `SELECT COUNT(*) FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ? AND non_unique = 0 AND index_name <> 'PRIMARY'`
+	var n int
+	if err := a.db.QueryRowContext(ctx, q, schema, table).Scan(&n); err != nil {
+		if a.markWarnedRouteProbe(qn) {
+			slog.WarnContext(ctx,
+				"mysql: applier: unique-index probe failed; routing every change on this table to a SINGLE apply lane "+
+					"(fail-closed — a wrong 'no unique index' verdict would let a secondary-unique reassignment lose a row, item 131)",
+				slog.String("table", qn), slog.String("err", err.Error()))
+		}
+		return true
+	}
+	a.storeNonPKUnique(qn, n > 0)
+	return n > 0
 }
 
 // ApplyLaneBatch dispatches every change in batch onto a single lane

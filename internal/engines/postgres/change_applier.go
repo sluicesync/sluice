@@ -253,10 +253,11 @@ type ChangeApplier struct {
 	// resume signal.
 	targetSchema string
 
-	// cacheMu guards the five lazily-populated metadata caches the lane
+	// cacheMu guards the lazily-populated metadata caches the lane
 	// dispatch tree can touch from W goroutines under the ADR-0105
 	// concurrent key-hash apply path: pkCache, colTypeCache,
-	// conflictKeyCache, warnedKeyless, and schemaDirtyTables. EVERY access
+	// conflictKeyCache, warnedKeyless, nonPKUniqueCache, warnedRouteProbe
+	// and schemaDirtyTables. EVERY access
 	// to those maps goes through the guarded accessors in
 	// change_applier_concurrent.go — there is no direct map access elsewhere
 	// in the dispatch call tree — so a missed-lock race cannot hide from the
@@ -293,6 +294,20 @@ type ChangeApplier struct {
 	// has already logged its one-time WARN (a table with no PK and no
 	// usable unique index, held at single-row apply). Lazily allocated.
 	warnedKeyless map[string]bool
+
+	// nonPKUniqueCache maps "schema.table" → whether the TARGET table can
+	// refuse a row on something other than its PRIMARY KEY: a non-primary
+	// UNIQUE index (constraint, bare, partial or expression) or an
+	// EXCLUSION constraint (roadmap item 131). It decides the lane
+	// [laneapply.RouteScope] — such a table must be ordered against ITSELF,
+	// because two changes to different primary keys can then be dependent.
+	// It is deliberately WIDER than conflictKeyCache, which names the ONE
+	// arbiter index the Insert path targets; here every conflicting index
+	// counts. Invalidated with the rest on a schema boundary.
+	// warnedRouteProbe tracks tables whose probe FAILED so the fail-closed
+	// fallback is WARNed at most once per table rather than per change.
+	nonPKUniqueCache map[string]bool
+	warnedRouteProbe map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier

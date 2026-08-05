@@ -1912,7 +1912,7 @@ The only guard, `CheckpointOnlyAtTxBoundary`, is set **only on the MySQL target 
 
 **Gate (G-2):** a fail-by-default divergence map over EVERY registered ChangeApplier's `BatchConfig` — `CheckpointOnlyAtTxBoundary=true` OR a written exemption proving mid-tx positions from every possible SOURCE are valid restart points (the `TestMigrateSyncFlagSurfaceParity` pattern) — plus a reader-side pin that a GTID-mode row position does NOT contain its enclosing transaction. **This is a concurrency/resume-semantics chunk: the `-race` integration gate must be green BEFORE any tag ships it.**
 
-### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *OPEN, CRITICAL, DEFAULT-ON (audit 2026-08-05 A-1)*
+### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *FIXED (unreleased; `-race` Integration must be green before the tag — concurrency chunk)*
 
 `internal/laneapply/router.go:21`. The key-hash apply is default-on (`--apply-concurrency 0` → W=4) and engaged by the streamer, the broker and chain-restore. It guarantees ordering per **(table, PRIMARY KEY)** — its doc says the dependent-row hazard "cannot occur", which is true for one key and false across two.
 
@@ -1929,6 +1929,16 @@ A PG target manifests this loudly instead (23505, terminal), so the silent form 
 **Owner question, recorded because it changes the work:** single-lane routing costs concurrency on exactly the hot tables that most want it. The alternative is unique-value-aware sequencing (barrier only on an observed value collision), which is more code and more risk. Single-lane is the recommended first cut; measure lane skew on unique-heavy schemas before deciding whether to invest further.
 
 **Gate (G-1):** a `PKValuesForRouting` roster asserting every table with a secondary unique index resolves to one lane (mutation both directions), plus a `laneCommitHookForTest` stall-ordering integration pin — DELETE lane stalled, INSERT lane commits, final state must equal source. That pin **fails today on MySQL and crashes on PG**, which is the point: write it first, watch it go red, then fix. **Concurrency chunk — `-race` integration green before the tag.**
+
+**Implementation notes (2026-08-05).** Both gates were built first and confirmed red at HEAD: on MySQL `rows = 1; want 2` + `no row carries uq='x' … the row was silently lost` with `ApplyBatch` returning **nil** (the silent form), and on PG `SQLSTATE 23505` taking the run down. Fix shape is the recommended one — a routing SCOPE. The seam method `LaneApplier.PKValuesForRouting` is renamed **`RouteForChange`** and now returns `laneapply.Route{Qualified, PKVals, Scope}`; `Router.LaneForRoute` is the single place a `Route` becomes a lane. `RouteScope`'s **zero value is `RouteScopeTable`** (whole-table, one lane), so an engine gets the fail-closed branch by default and must prove the absence of a non-PK uniqueness constraint to earn `RouteScopeKey`. The signature change is deliberate: it makes the compiler enumerate the implementors.
+
+Divergences from the entry as written, all widening:
+
+- **PG's probe covers more than "a unique index."** Non-primary UNIQUE constraints, bare unique indexes, PARTIAL and EXPRESSION unique indexes (no `indisvalid`/`indpred`/`indexprs` filter — each still refuses a duplicate), **and EXCLUSION constraints** (`pg_constraint.contype='x'`), which are the same cross-key conflict with a different operator. The roster covers all five plus both negative shapes.
+- **A failed probe fails CLOSED and WARNs once per table** rather than aborting the run: whole-table routing is correct-but-slower, so degrading is right, but a silent degrade would hide a throughput cliff.
+- **The cache is invalidated on a schema boundary** (a DDL that ADDS a unique index flips the scope). That re-route is safe because the barrier drains every lane first — an argument that was previously only written down, and is now pinned by `TestBarrier_DrainsAllLanesBeforeApply` in `internal/laneapply`.
+
+**Measured cost (the owner question, answered).** Local MySQL 8.0, W=4, 8,000 inserts into ONE unique-carrying table: **3.9s per-key vs 10.2/11.1s whole-table (~2.6× slower)** — that is the pathological cell, a single hot natural-keyed table. It reverses with table count, because whole-table routing improves ADR-0140 coalescing locality: 4 tables × 500 rows measured 23.8s per-key vs 3.9s whole-table (~6× **faster**), 8 and 32 tables within ±10%. Lane histograms at 32 tables: per-key `{4004, 4000, 3996, 4000}` vs whole-table `{3500, 3500, 4500, 4500}` (1.29× skew). So the cost is real but concentrated; unique-value-aware sequencing stays the named, unbuilt follow-up if a single hot unique-heavy table becomes the binding constraint.
 
 ### 130. Smart compaction's EMITTED stream is still unbounded — the other half of item 127 — *OPEN, medium; the named residual of item 127*
 
