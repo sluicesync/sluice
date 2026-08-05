@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -139,8 +140,33 @@ func computeConnectionBudget(p connectionBudgetProbe, reserve int, applyTierCap 
 	tierCap := 0
 	if applyTierCap {
 		tierCap = bufferPoolParallelismCap(p.bufferPoolBytes)
-		if tierCap > 0 && tierCap < copyBudget {
-			copyBudget = tierCap
+		switch {
+		case tierCap > 0:
+			// Say so. This field's doc has always claimed the cap is
+			// "carried for the operator-facing log so the cap's provenance
+			// is visible" and nothing read it — which is why a field report
+			// of a copy running at parallelism 2 could not tell whether that
+			// was the connection budget, the tier cap, or a flag.
+			slog.Info(
+				"mysql: buffer-pool tier cap applied to copy parallelism (ADR-0116 Part B)",
+				slog.Int64("innodb_buffer_pool_size", p.bufferPoolBytes),
+				slog.Int("tier_cap", tierCap),
+				slog.Int("copy_budget_before_cap", copyBudget),
+			)
+			if tierCap < copyBudget {
+				copyBudget = tierCap
+			}
+		case p.bufferPoolBytes > 0:
+			// Readable but below the PS-10 floor: not a tier answer. Loud,
+			// because the alternative — silently bucketing it to the
+			// tightest cap — is the defect this branch exists to prevent.
+			slog.Warn(
+				"mysql: @@innodb_buffer_pool_size is below the smallest known PlanetScale tier, so it is "+
+					"not reporting the tablet's real pool; the buffer-pool tier cap is NOT applied and the "+
+					"connection budget stands (ADR-0116 Part B)",
+				slog.Int64("innodb_buffer_pool_size", p.bufferPoolBytes),
+				slog.Int64("smallest_known_tier_bytes", int64(bufferPoolPlanetScaleFloorBytes)),
+			)
 		}
 	}
 

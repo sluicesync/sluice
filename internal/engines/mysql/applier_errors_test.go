@@ -997,6 +997,11 @@ func TestVtgateTransientSubstrings_PinDown(t *testing.T) {
 		"primary buffer is full",
 		"buffer full: request evicted for newer request",
 		"destination shard is missing after a resharding operation",
+		// FIELD-DERIVED (2026-08-04), not read off an upstream constant —
+		// see the production slice for the provenance and the echo-safety
+		// argument. vtgate's own transport-loss framing, the sibling of
+		// the Number-2013 branch one wire framing over.
+		"vtgate connection error",
 	}
 	if len(vtgateTransientSubstrings) != len(want) {
 		t.Fatalf("vtgateTransientSubstrings = %q; pinned set is exactly %q. "+

@@ -126,11 +126,13 @@ type ChunkWriter struct {
 	// the caller's chunk-roll decision (roadmap item 116 P3).
 	//
 	// Deliberately the UNCOMPRESSED count, not the length of the output
-	// buffer. Chunk boundaries are load-bearing beyond memory — resume
-	// keys on them and the content-addressed same-path upload skip
-	// compares a chunk's SHA at its allocated path — so where a chunk
-	// ends must depend only on the ROWS, never on how well they happened
-	// to compress. A compressed-size trigger would move every boundary
+	// buffer. Chunk boundaries are load-bearing beyond memory: the
+	// content-addressed same-path upload skip compares a chunk's SHA at
+	// its allocated path, so where a chunk ends must depend only on the
+	// ROWS, never on how well they happened to compress. (Resume is NOT
+	// a second reason — it works at TABLE granularity, so a partial
+	// table re-streams from scratch and nothing keys on a boundary;
+	// see Bug 135.) A compressed-size trigger would move every boundary
 	// the day the codec or its level changed, silently invalidating the
 	// re-run skip for every existing chunk.
 	encodedBytes int64

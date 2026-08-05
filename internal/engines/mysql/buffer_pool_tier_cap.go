@@ -58,6 +58,13 @@ const (
 	bufferPoolBucketMediumBytes = 2 << 30   // 2 GiB
 	bufferPoolBucketLargeBytes  = 8 << 30   // 8 GiB
 
+	// bufferPoolPlanetScaleFloorBytes is PS-10's measured pool — the
+	// SMALLEST value the tier table above records. On the PlanetScale
+	// flavor a reading below it is not a smaller tier, it is a reading
+	// that isn't reporting the tablet (field-observed 2026-08-04: a
+	// PS-160 returning 32 MiB). See [bufferPoolParallelismCap].
+	bufferPoolPlanetScaleFloorBytes = 128 << 20 // 128 MiB = PS-10
+
 	bufferPoolCapSmall  = 2 // < 256 MB  (PS-10-class / tiny dev box)
 	bufferPoolCapMedium = 4 // < 2 GB    (PS-20 / PS-40-class)
 	bufferPoolCapLarge  = 6 // < 8 GB    (PS-80-class)
@@ -71,10 +78,36 @@ const (
 // the "cap not applied" sentinel: the caller treats 0 as a no-op and the
 // connection-derived budget stands unchanged. The cap NEVER fails — a
 // missing reading is simply not a cap.
+//
+// # The plausibility floor, and the premise it protects
+//
+// This function is only reached on the PlanetScale flavor (see
+// computeConnectionBudget's applyTierCap gate), where the whole heuristic
+// rests on ONE environmental premise: that `SELECT @@innodb_buffer_pool_size`
+// returns the tablet's real pool, monotonic by plan tier, with PS-10's
+// 128 MiB as the floor.
+//
+// That premise has been observed to FAIL. A 2026-08-04 field report on a
+// PS-160 branch — a tier the table above measures at 9.80 GB — read
+// 32 MiB, which bucketed to the TIGHTEST cap of 2 instead of 8. The
+// operator saw a copy running 4x narrower than their instance could carry,
+// with nothing naming the cause. A reading below the PS-10 floor cannot be
+// a real tier answer on this flavor, so it is treated as UNREADABLE rather
+// than as evidence of a tiny instance. That direction is deliberate: an
+// absent cap falls back to the connection-derived budget (which is a real
+// slot bound), whereas a wrong tight cap silently throttles the copy and
+// looks like sluice being slow.
+//
+// This is the runtime check the premise-naming rule asks for. Its cost if
+// PlanetScale ever ships a tier genuinely below 128 MiB is that such a tier
+// goes uncapped; that is visible in the log the caller emits, and is the
+// safer of the two errors.
 func bufferPoolParallelismCap(bufferPoolBytes int64) int {
 	switch {
 	case bufferPoolBytes <= 0:
 		return 0 // unreadable ⇒ cap not applied (no-op).
+	case bufferPoolBytes < bufferPoolPlanetScaleFloorBytes:
+		return 0 // implausible for this flavor ⇒ not a tier reading.
 	case bufferPoolBytes < bufferPoolBucketSmallBytes:
 		return bufferPoolCapSmall
 	case bufferPoolBytes < bufferPoolBucketMediumBytes:

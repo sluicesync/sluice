@@ -618,6 +618,38 @@ var vtgateTransientSubstrings = []string{
 	"primary buffer is full",
 	"buffer full: request evicted for newer request",
 	"destination shard is missing after a resharding operation",
+	// (3) vtgate's own TRANSPORT-loss framing — the connection between
+	// vtgate and the tablet died mid-statement, which vtgate reports in
+	// its own wording rather than in vttablet's gRPC framing:
+	//
+	//	Error 1105 (HY000): internal: vtgate connection error
+	//	  (read: connection reset by peer)
+	//
+	// Provenance, stated because it differs from (1) and (2): this one is
+	// FIELD-DERIVED (a 2026-08-04 report of a MariaDB→PlanetScale cold
+	// copy failing 5 times out of 5 on the same wide table, 90–130s in),
+	// not read off an upstream constant. The sentence above is the
+	// observed text.
+	//
+	// It is the SIBLING of the Number-2013 branch above, one wire framing
+	// over, and the miss has exactly the shape that branch's comment
+	// describes: the transport cause is TEXT inside a *MySQLError message,
+	// so errors.Is(err, io.EOF) cannot see it, and under Number 1105 only
+	// this substring set is consulted. sluice already retried the SAME
+	// underlying loss when vttablet framed it
+	// (`... vttablet: rpc error: code = Unavailable desc = connection
+	// reset by peer` matches via classifyVitessMessage) — so the two
+	// framings of one condition disagreed, and the one an operator
+	// actually hits on a cold copy was the terminal one.
+	//
+	// Echo-safety (the rule this set is built on): "vtgate connection
+	// error" is vtgate's own product noun, not three generic English
+	// words — it cannot plausibly appear in a migrated row the way
+	// "no available connection" could. The generic transport tails
+	// ("connection reset by peer", "unexpected EOF") are deliberately NOT
+	// matched on their own for exactly that reason; the vtgate framing is
+	// the anchor and it carries any tail.
+	"vtgate connection error",
 }
 
 // isVtgateTransientMessage reports whether msg carries one of the canonical

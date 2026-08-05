@@ -27,10 +27,19 @@ func TestBufferPoolParallelismCap(t *testing.T) {
 		{name: "zero (unreadable) ⇒ no cap", bytes: 0, want: 0},
 		{name: "negative (defensive) ⇒ no cap", bytes: -1, want: 0},
 
-		// Smallest bucket (< 256 MB ⇒ cap 2). PS-10 = 0.125 GB = 128 MB,
-		// and a bare-minimum self-hosted dev MySQL (128 MB default) both
-		// land here.
-		{name: "1 byte ⇒ smallest cap", bytes: 1, want: bufferPoolCapSmall},
+		// BELOW the PS-10 floor ⇒ not a tier reading on this flavor, so no
+		// cap rather than the tightest cap. This function is only reached
+		// on PlanetScale, where 128 MiB is the smallest pool any measured
+		// tier reports; a value under it is the probe not reaching the
+		// tablet, not a smaller instance. Field-observed 2026-08-04: a
+		// PS-160 branch returned 32 MiB and was throttled to parallelism 2.
+		{name: "1 byte ⇒ implausible, no cap", bytes: 1, want: 0},
+		{name: "32 MiB (the field report) ⇒ implausible, no cap", bytes: 32 * mib, want: 0},
+		{name: "just under the PS-10 floor ⇒ no cap", bytes: 128*mib - 1, want: 0},
+
+		// Smallest bucket (< 256 MB ⇒ cap 2), floor-inclusive. PS-10 =
+		// 0.125 GB = 128 MB, and a bare-minimum self-hosted dev MySQL
+		// (128 MB default) both land here.
 		{name: "PS-10 (0.125 GB / 128 MB)", bytes: 134217728, want: bufferPoolCapSmall},
 		{name: "just under 256 MB", bytes: 256*mib - 1, want: bufferPoolCapSmall},
 
@@ -83,5 +92,50 @@ func TestBufferPoolBucketCapsMonotonic(t *testing.T) {
 		bufferPoolBucketMediumBytes >= bufferPoolBucketLargeBytes {
 		t.Errorf("tier boundaries must be strictly increasing: small=%d medium=%d large=%d",
 			bufferPoolBucketSmallBytes, bufferPoolBucketMediumBytes, bufferPoolBucketLargeBytes)
+	}
+}
+
+// TestBufferPoolTierCap_ImplausibleReadingDoesNotThrottleTheCopy is the
+// end-to-end half of the plausibility floor: the change-detector above pins
+// the bucket function, this pins what the operator actually experiences —
+// the resolved copy budget.
+//
+// The case is the 2026-08-04 field report: a PlanetScale branch whose plan
+// tier the ADR-0116 table measures at 9.80 GB reported
+// @@innodb_buffer_pool_size = 32 MiB. Pre-fix that bucketed to the tightest
+// cap and the copy ran 4x narrower than the instance could carry, with
+// nothing in the output naming the cause.
+//
+// The assertion is deliberately "not throttled to the tier cap" rather than
+// an exact number, so it survives a change to the connection-derived budget
+// arithmetic — the defect is the CAP being applied to a reading that cannot
+// be a tier, not any particular budget value.
+func TestBufferPoolTierCap_ImplausibleReadingDoesNotThrottleTheCopy(t *testing.T) {
+	probe := connectionBudgetProbe{
+		maxConnections:  1000,
+		inUse:           6,
+		roleLimit:       unlimited,
+		bufferPoolBytes: 32 << 20, // what the PS-160 branch actually returned
+	}
+	got := computeConnectionBudget(probe, connBudgetReserve, true /* PlanetScale flavor */)
+
+	if got.tierCap != 0 {
+		t.Errorf("tierCap = %d; want 0 — a reading below the smallest known tier is the probe not "+
+			"reaching the tablet, not evidence of a tiny instance", got.tierCap)
+	}
+	if got.CopyBudget <= bufferPoolCapSmall {
+		t.Fatalf("CopyBudget = %d; want well above the tightest tier cap of %d.\n\n"+
+			"This is the field-reported defect: an implausible @@innodb_buffer_pool_size bucketed to the "+
+			"smallest tier and throttled a large instance's copy, silently.",
+			got.CopyBudget, bufferPoolCapSmall)
+	}
+
+	// The control: a PLAUSIBLE small reading must still cap. The floor must
+	// not have disabled the heuristic altogether — a real PS-10 is exactly
+	// the instance the cap exists to protect.
+	probe.bufferPoolBytes = bufferPoolPlanetScaleFloorBytes
+	if capped := computeConnectionBudget(probe, connBudgetReserve, true); capped.CopyBudget != bufferPoolCapSmall {
+		t.Errorf("a real PS-10 reading resolved CopyBudget = %d; want the tier cap %d — the floor must "+
+			"reject implausible readings, not the heuristic", capped.CopyBudget, bufferPoolCapSmall)
 	}
 }
