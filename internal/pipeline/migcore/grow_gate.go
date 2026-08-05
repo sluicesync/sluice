@@ -90,12 +90,72 @@ var (
 	// enough to ride a prolonged multi-step storage-grow, short enough
 	// that a genuinely-wedged target surfaces via the lanes' own budgets
 	// rather than hiding behind a forever-closed gate.
+	//
+	// SCOPE, stated because its name reads broader than it is: this bounds
+	// ONE window. It is NOT a bound on how long the gate may stall a run —
+	// consecutive windows each get a fresh max-hold. The run-level bound is
+	// [GrowGateMaxQuiesceShare]; see [GrowGate.quiesceAllowanceLocked].
 	GrowGateMaxHold = 20 * time.Minute
+
+	// GrowGateEpisodeIdle is the gate-OPEN, un-tripped stretch that ends a
+	// trouble EPISODE and resets the escalation ladder to rung 1. Trouble
+	// that returns sooner than this is treated as the same episode
+	// continuing, so the ladder climbs; trouble that returns after a
+	// genuinely healthy stretch starts over at the fast probe interval.
+	GrowGateEpisodeIdle = 60 * time.Second
+
+	// GrowGateQuiesceWindow / GrowGateMaxQuiesceShare are the RUN-level
+	// ceiling on coordinated quiesce: over any trailing GrowGateQuiesceWindow
+	// the gate may hold the cold copy closed for at most GrowGateMaxQuiesceShare
+	// of that window. Past that it declines to close at all and the per-lane
+	// retry budgets — the authoritative floor — carry the run alone.
+	//
+	// WHY THIS IS SAFE, and it is a measured premise rather than an argument
+	// (the premise-naming step): ADR-0110's cost case is that ~W×D lanes
+	// "independently hammer-retry the struggling target". They do not hammer.
+	// Every lane runs its OWN exponential reparent-retry backoff (100ms → 30s
+	// cap) and the 2026-08-05 field log shows 1061 of 2195 lane retries
+	// already sitting at the 30s cap. A gate that declines to close therefore
+	// hands the target back to lanes attempting at roughly one try per 30s
+	// each — not a hammer. The gate's marginal value is ALIGNMENT (contiguous
+	// quiet rather than a smear), not rate limiting, which is why capping its
+	// share cannot reintroduce the thrashing ADR-0110 was written against.
+	// [TestGrowGate_DecliningToCloseLeavesTheLaneBackoffIntact] is the check
+	// that binds this argument to the code rather than leaving it prose.
+	GrowGateQuiesceWindow   = 5 * time.Minute
+	GrowGateMaxQuiesceShare = 0.5
 )
+
+// growGateMaxCycle bounds the escalation ladder's integer so a long-running
+// episode cannot grow it without limit (backoff() saturates at its cap long
+// before this; the bound exists so backoff()'s loop stays O(1)-ish and the
+// counter cannot overflow on a multi-day run).
+const growGateMaxCycle = 32
 
 // GrowGate is the concrete [ir.GrowGate] coordinator. State is open/closed
 // guarded by mu plus a closed-channel-broadcast reopenCh (re-created on
 // each close→open) so Await can park without holding mu across the block.
+//
+// # The escalation model (item 138)
+//
+// A pause WINDOW is one close→reopen of exactly backoff(cycle). Three
+// separate things govern how much of a run the gate may quiesce, and they
+// answer three different questions:
+//
+//   - cycle — the EPISODE ladder. How long should THIS window be? It
+//     advances one rung per window while trouble persists and resets after
+//     GrowGateEpisodeIdle of healthy open time. It is deliberately sized to
+//     track the per-lane reparent-retry ladder (same 100ms → 30s shape), so
+//     the gate's hold OVERLAPS the backoff each lane would have taken
+//     anyway; the gate buys alignment, not extra waiting.
+//   - maxHold — the per-WINDOW ceiling. Bounds one window only.
+//   - maxQuiesceShare over quiesceWindow — the RUN-level ceiling, and the
+//     only one of the three that can see a run being quiesced to death by a
+//     long sequence of individually-reasonable windows. That is exactly what
+//     the 2026-08-05 field report was.
+//
+// What does NOT govern it, and this is the item-138 correction: the NUMBER
+// of lanes reporting a fault. See [GrowGate.Trip].
 type GrowGate struct {
 	mu sync.Mutex
 
@@ -109,11 +169,26 @@ type GrowGate struct {
 	// has a fresh channel. nil until the first close.
 	reopenCh chan struct{}
 
-	// extend is non-nil while the owner goroutine is running; a Trip on an
-	// already-closed gate signals it (non-blocking) so the owner extends
-	// the pause / re-arms its probe cycle (coalescing). Re-created with
-	// reopenCh on each close.
-	extend chan struct{}
+	// cycle is the escalation ladder's rung, EPISODE-scoped: it advances by
+	// exactly ONE per pause WINDOW while a trouble episode persists, and
+	// resets to 1 when the gate has been open and un-tripped for
+	// episodeIdle. Read the type doc for why it may not advance per Trip.
+	cycle int
+
+	// lastReopen is when the previous window ended. A Trip arriving within
+	// episodeIdle of it continues the episode (the ladder climbs); a Trip
+	// arriving later starts a fresh episode at rung 1.
+	lastReopen time.Time
+
+	// quiesced is the trailing ledger of closed spans backing the
+	// run-level quiesce-share ceiling. Pruned to quiesceWindow on every
+	// consultation, so it holds O(quiesceWindow / backoffCap) entries.
+	quiesced []quiesceSpan
+
+	// shareExhaustedLogged suppresses the "declining to close" WARN to once
+	// per episode rather than once per Trip (the field shape is thousands of
+	// trips per episode). Cleared when a new episode starts.
+	shareExhaustedLogged bool
 
 	// recovered, when non-nil, is consulted by a PROACTIVE (telemetry)
 	// pause: the owner reopens on the earlier of {max-hold | recovered()
@@ -136,9 +211,12 @@ type GrowGate struct {
 	// on cleanup can never race a still-running owner (the v0.99.100 -race
 	// lesson). Production always gets the package defaults; tests shrink a
 	// global before constructing the gate they then drive.
-	backoffBase time.Duration
-	backoffCap  time.Duration
-	maxHold     time.Duration
+	backoffBase     time.Duration
+	backoffCap      time.Duration
+	maxHold         time.Duration
+	episodeIdle     time.Duration
+	quiesceWindow   time.Duration
+	maxQuiesceShare float64
 
 	// clock-injection seams for deterministic tests; nil ⇒ real time.
 	afterFn func(time.Duration) <-chan time.Time
@@ -148,6 +226,16 @@ type GrowGate struct {
 	// top of each owner goroutine so a test can count how many windows /
 	// owners a Trip burst spawned (the coalescing pin). nil in production.
 	onOwnerStart func()
+
+	// onWindowClosed is a test-only observability seam: called from
+	// finishWindow with the window's ACTUAL closed duration, so the item-138
+	// duty-cycle gates can measure the quiesce the gate imposed exactly
+	// rather than by sampling g.closed. nil in production.
+	onWindowClosed func(held time.Duration)
+
+	// windowStart is when the live window closed the gate; it backs
+	// onWindowClosed and is meaningless while the gate is open.
+	windowStart time.Time
 }
 
 // NewGrowGate constructs the run's shared coordinator. ctx is the
@@ -163,10 +251,59 @@ func NewGrowGate(ctx context.Context, recovered func() bool) *GrowGate {
 		// Snapshot the timing envelope at construction so the owner
 		// goroutine reads instance fields, never the mutable package
 		// globals (the -race safety property; see the var block above).
-		backoffBase: GrowGateBackoffBase,
-		backoffCap:  GrowGateBackoffCap,
-		maxHold:     GrowGateMaxHold,
+		backoffBase:     GrowGateBackoffBase,
+		backoffCap:      GrowGateBackoffCap,
+		maxHold:         GrowGateMaxHold,
+		episodeIdle:     GrowGateEpisodeIdle,
+		quiesceWindow:   GrowGateQuiesceWindow,
+		maxQuiesceShare: GrowGateMaxQuiesceShare,
 	}
+}
+
+// quiesceSpan is one closed window in the trailing quiesce ledger. end is
+// the window's PLANNED reopen at close time and is corrected to the actual
+// reopen by finishWindow, so an early release (recovery / ctx-cancel) does
+// not over-charge the run-level share.
+type quiesceSpan struct {
+	start time.Time
+	end   time.Time
+}
+
+// quiesceAllowanceLocked returns how much MORE closed time the gate may
+// impose right now without exceeding maxQuiesceShare of the trailing
+// quiesceWindow, pruning the ledger as it goes. A non-positive result means
+// the gate has already spent its share and must decline to close.
+//
+// This is the RUN-level bound that [GrowGateMaxHold] is not: max-hold bounds
+// one window, and consecutive windows each get a fresh one. The 2026-08-05
+// field report is what proved the difference matters — 246 windows, none
+// remotely near the 20-minute max-hold, totalling 73 minutes of quiesce in a
+// 91-minute run. A bound scoped to the window could not see that.
+//
+// Caller holds g.mu.
+func (g *GrowGate) quiesceAllowanceLocked(now time.Time) time.Duration {
+	cutoff := now.Add(-g.quiesceWindow)
+	kept := g.quiesced[:0]
+	var spent time.Duration
+	for _, s := range g.quiesced {
+		if !s.end.After(cutoff) {
+			continue // wholly outside the trailing window — drop it
+		}
+		kept = append(kept, s)
+		start, end := s.start, s.end
+		if start.Before(cutoff) {
+			start = cutoff
+		}
+		if end.After(now) {
+			end = now
+		}
+		if end.After(start) {
+			spent += end.Sub(start)
+		}
+	}
+	g.quiesced = kept
+	budget := time.Duration(float64(g.quiesceWindow) * g.maxQuiesceShare)
+	return budget - spent
 }
 
 // backoff returns the per-cycle hold duration for the gate's owner
@@ -212,34 +349,94 @@ func (g *GrowGate) Await(ctx context.Context) error {
 	}
 }
 
-// Trip implements [ir.GrowGate]. If NO pause window is live it closes the
-// gate and spawns the single owner goroutine. If a window is already live
-// (g.extend != nil — true whether the owner is in its closed HOLD or its
-// reopened PROBE/SETTLE phase) it coalesces onto that owner by signalling
-// extend, so a re-trip during the probe window does NOT spawn a second
-// owner. Idempotent and concurrency-safe; concurrent trips from many lanes
-// + the telemetry sidecar collapse into ONE window.
+// Trip implements [ir.GrowGate]. If a pause window is already live the trip
+// COALESCES into it and returns, changing nothing. Otherwise it advances the
+// episode ladder, consults the run-level quiesce share, and (if there is
+// share left) closes the gate and spawns the single owner goroutine for one
+// window of exactly [GrowGate.backoff](cycle).
+//
+// # Why an in-window trip must not lengthen the window (item 138)
+//
+// This is the load-bearing correction. The ladder expresses TEMPORAL
+// persistence — "the target is still bad after we waited" — so it may only
+// advance on evidence of that. A trip arriving while the gate is CLOSED is
+// not that evidence: every sibling lane is already parked in [GrowGate.Await],
+// so the only trips that can arrive during a window come from the lanes that
+// were mid-flush when it closed, all reporting the SAME target event. They
+// carry no information the first trip did not.
+//
+// The shipped v0.111.1 gate advanced the ladder once per trip, via an
+// `extend` signal the owner consumed as fast as it arrived. Measured on the
+// 2026-08-05 field log: with the default fan-out (W×D = 16 lanes on sync
+// cold-start, up to 32 on migrate) ONE target event produced 13–16 trips
+// within ~4ms, burning the ladder to its 30s cap in those 4ms. Across 246
+// windows the hold matched backoff(tripCount) to the millisecond — 0.100s at
+// 1 trip, 12.87s at 8, 30.0s at ≥14 — and the copy spent 81.1% of a 91-minute
+// run quiesced, four chunks in the last hour, on a target that was merely
+// dropping connections. The gate's escalation was being driven by FAN-OUT
+// WIDTH, not by time.
+//
+// So: in-window trips coalesce and are otherwise inert, and persistence is
+// observed where it actually lives — ACROSS windows, one rung per window.
 func (g *GrowGate) Trip(reason string) {
 	g.mu.Lock()
 	g.reason = reason
-	if g.extend != nil {
-		// A window is live (closed-hold or reopened-probe). Coalesce: nudge
-		// the owner to extend / re-close. Non-blocking — a pending extend
-		// already means "at least one more cycle is coming".
-		extend := g.extend
+	if g.closed {
+		// A window is live. Sibling lanes reporting the same event are
+		// already quiesced; nothing to do.
 		g.mu.Unlock()
-		select {
-		case extend <- struct{}{}:
-		default:
+		return
+	}
+
+	now := g.now()
+	// EPISODE LADDER. A prompt re-trip (the previous quiesce did not suffice)
+	// climbs one rung; a trip after a genuinely healthy stretch starts over
+	// at the fast probe interval. This is the ONLY place cycle advances, and
+	// it is what makes the long-standing "the exponential backoff grows
+	// across windows" claim true — before item 138 every window restarted at
+	// rung 1 and all the growth happened inside a single window instead.
+	switch {
+	case g.lastReopen.IsZero(), now.Sub(g.lastReopen) >= g.episodeIdle:
+		g.cycle = 1
+		g.shareExhaustedLogged = false
+	case g.cycle < growGateMaxCycle:
+		g.cycle++
+	}
+	cycle := g.cycle
+
+	hold := g.backoff(cycle)
+	if hold > g.maxHold {
+		hold = g.maxHold
+	}
+	allowance := g.quiesceAllowanceLocked(now)
+	if allowance <= 0 {
+		// The gate has spent its share of the trailing window. Decline to
+		// close: the per-lane retry budgets (each with its own exponential
+		// backoff) are the authoritative floor and carry the run alone.
+		first := !g.shareExhaustedLogged
+		g.shareExhaustedLogged = true
+		g.mu.Unlock()
+		if first {
+			slog.WarnContext(
+				g.ownerCtx, "pipeline: cold-copy grow-gate DECLINING to close — it has already quiesced "+
+					"its permitted share of the recent wall clock and further quiescing would stall the copy "+
+					"rather than help the target; the per-lane retry budgets carry the run from here (ADR-0110, item 138)",
+				slog.String("reason", reason),
+				slog.Duration("quiesce_window", g.quiesceWindow),
+				slog.Float64("max_quiesce_share", g.maxQuiesceShare),
+			)
 		}
 		return
 	}
-	// No live window — arm a fresh one.
+	if hold > allowance {
+		hold = allowance
+	}
+
 	g.closed = true
 	g.reopenCh = make(chan struct{})
-	g.extend = make(chan struct{}, 1)
+	g.windowStart = now
+	g.quiesced = append(g.quiesced, quiesceSpan{start: now, end: now.Add(hold)})
 	reopenCh := g.reopenCh
-	extend := g.extend
 	proactive := g.recovered != nil
 	g.mu.Unlock()
 
@@ -247,132 +444,102 @@ func (g *GrowGate) Trip(reason string) {
 		g.ownerCtx, "pipeline: cold-copy grow-gate CLOSED — quiescing all cold-copy lanes for a coordinated target storage-grow / reparent window (ADR-0110)",
 		slog.String("reason", reason),
 		slog.Bool("proactive", proactive),
+		// hold + cycle are here because their ABSENCE is what made item 138
+		// invisible: the shipped log recorded only the close and the reopen,
+		// so the hold had to be reverse-engineered from timestamps across 246
+		// windows before anyone could see it was a function of fan-out width.
+		slog.Duration("hold", hold),
+		slog.Int("escalation_cycle", cycle),
 	)
-	go g.runOwner(reopenCh, extend)
+	go g.runOwner(reopenCh, hold)
 }
 
-// runOwner is the single owner goroutine for one pause window. It holds
-// the gate closed across a sequence of exponential-backoff cycles, ALL
-// owned by this one goroutine (so there is exactly ONE owner per window —
-// no owner-spawn race), then reopens exactly once when the window ends.
-// The window ends — and the gate reopens (via finishWindow's single
-// teardown, so a parked Await always unwinds) — on the FIRST of:
+// growGateRecoveryProbeInterval is how often a PROACTIVE (telemetry) window
+// re-consults recovered() while holding, so a long hold can still be released
+// early by a trustworthy recovery signal. Signal-driven windows (recovered ==
+// nil) sleep the whole hold in one wait and never poll.
+const growGateRecoveryProbeInterval = time.Second
+
+// runOwner is the single owner goroutine for ONE pause window. It holds the
+// gate closed for hold — the interval Trip already computed from the episode
+// ladder and the run-level quiesce share — and reopens exactly once, via
+// finishWindow's single teardown, so a parked Await always unwinds. The
+// window ends on the FIRST of:
 //
-//   - QUIET: a full backoff cycle elapsed with NO re-trip (no pending
-//     extend). The transient burst is over; reopening lets the lanes
-//     resume and PROBE the target. If the target is still bad the first
-//     lane to re-hit the transient opens a FRESH window — the "reopen to
-//     let lanes probe, re-trip if still bad" loop, expressed as
-//     window-ends-then-new-window rather than a mid-window reopen (which
-//     would need a second owner / a probe-vs-trip race; this is simpler
-//     and race-free).
-//   - RECOVERED (proactive pauses only): recovered() reports the target's
-//     storage headroom restored — reopen immediately (the earlier of
-//     {max-hold | recovery}).
-//   - MAX-HOLD: the cumulative pause hit GrowGateMaxHold. Reopen so each
-//     lane's own bounded retry budget (the AUTHORITATIVE floor) takes over
-//     and surfaces a genuinely-dead target loudly, rather than the gate
-//     hiding it behind a forever-closed door.
-//   - CTX-CANCEL: the run ctx was cancelled (e.g. the errgroup unwound on
-//     a lane's terminal error). Reopen and exit so no goroutine leaks.
+//   - HOLD ELAPSED (the primary reopen): the interval is up. Reopening lets
+//     the lanes resume and PROBE the target. If the target is still bad the
+//     first lane to re-hit the transient opens a FRESH window one rung higher
+//     — "reopen to let lanes probe, re-trip if still bad", expressed as
+//     window-ends-then-new-window rather than a mid-window reopen (which would
+//     need a second owner / a probe-vs-Trip race; this is simpler and
+//     race-free).
+//   - RECOVERED (proactive windows only): recovered() reports the target's
+//     storage headroom restored — reopen immediately. An ACCELERATOR, never
+//     the sole reopen path: the volume_* gauges swing wildly and transiently
+//     DISAPPEAR across a reparent (v0.99.104 v14 live: 62GB@85.9% →
+//     1.66TB@~0% mid-reparent, series absent), so recovered() often cannot
+//     confirm "grow finished" exactly when it matters.
+//   - CTX-CANCEL: the run ctx was cancelled (e.g. the errgroup unwound on a
+//     lane's terminal error). Reopen and exit so no goroutine leaks.
 //
-// A re-trip while closed (a coalesced Trip) sends on extend; the owner
-// observes it at the end of the cycle and holds another (longer) cycle —
-// this is how concurrent trips from ~16 lanes collapse into one extending
-// window.
-func (g *GrowGate) runOwner(reopenCh, extend chan struct{}) {
+// The owner has NO extend channel and no re-trip accounting: a trip arriving
+// while this window is closed is inert by construction (see [GrowGate.Trip]).
+// Removing that channel is deliberate — it is what made the item-138 defect
+// (a ladder advanced by trip count) inexpressible rather than merely fixed.
+func (g *GrowGate) runOwner(reopenCh chan struct{}, hold time.Duration) {
 	if g.onOwnerStart != nil {
 		g.onOwnerStart()
 	}
-	deadline := g.now().Add(g.maxHold)
-	for cycle := 1; ; cycle++ {
-		hold := g.backoff(cycle)
-		if remaining := deadline.Sub(g.now()); remaining < hold {
-			hold = remaining
+	deadline := g.now().Add(hold)
+	for {
+		remaining := deadline.Sub(g.now())
+		if remaining <= 0 {
+			g.finishWindow(reopenCh, "hold elapsed — lanes resume and probe")
+			return
 		}
-		if hold < 0 {
-			hold = 0
+		step := remaining
+		if g.recovered != nil && step > growGateRecoveryProbeInterval {
+			step = growGateRecoveryProbeInterval
 		}
-
-		retripped := false
 		select {
-		case <-extend:
-			// A lane re-tripped during this hold — the grow isn't over yet.
-			retripped = true
-		case <-g.after(hold):
-			// Hold elapsed with no re-trip observed in the blocking select;
-			// a trip that raced the timer is still caught by the drain below.
+		case <-g.after(step):
+			if g.recovered != nil && g.recovered() {
+				g.finishWindow(reopenCh, "storage headroom recovered")
+				return
+			}
 		case <-g.ownerCtx.Done():
 			g.finishWindow(reopenCh, "run ctx cancelled")
 			return
 		}
-		// Catch a re-trip that raced the timer (extend is buffered, depth 1).
-		select {
-		case <-extend:
-			retripped = true
-		default:
-		}
-
-		// EARLY REOPEN (telemetry, when present): if a fresh sample shows the
-		// storage headroom genuinely recovered, reopen before the quiet cycle
-		// would. This is an ACCELERATOR, not the sole reopen path — it must not
-		// be relied on, because the volume_* gauges swing wildly and transiently
-		// DISAPPEAR across a reparent (v0.99.104 v14 live: capacity 62GB@85.9%
-		// → 1.66TB@~0% mid-reparent, series absent), so recovered() often can't
-		// confirm "grow finished" exactly when it matters.
-		if g.recovered != nil && g.recovered() {
-			g.finishWindow(reopenCh, "storage headroom recovered")
-			return
-		}
-
-		// MAX-HOLD: surface a stalled target via the lanes' own budgets.
-		if !g.now().Before(deadline) {
-			g.finishWindow(reopenCh, "max-hold reached — per-lane retry budgets take over")
-			return
-		}
-
-		// QUIET CYCLE (the primary reopen, ALWAYS applied — telemetry or not):
-		// a backoff cycle elapsed with no re-trip, so the transient burst (or an
-		// anticipated grow that hasn't actually faulted yet) is over for now.
-		// Reopen so the lanes resume and PROBE; if the target is still bad the
-		// next transient re-trips a FRESH window (the exponential backoff grows
-		// across windows). This applies to BOTH signal-driven and proactive
-		// (telemetry) trips: a proactive trip is a BRIEF anticipatory pause that
-		// hands off to this reactive cycling — NOT a hold for the whole grow.
-		//
-		// v0.99.104 v14 live proved the old "proactive holds until
-		// recovered()/max-hold" rode a flat ~20-min max-hold on every reparent
-		// (zero progress) because recovered() is defeated by the mid-reparent
-		// metric instability above — strictly worse than the reactive cycling
-		// (which makes incremental progress every ~30s window). Cycling-always
-		// matches the proven reactive behaviour; recovered() above only reopens
-		// EARLIER when the signal is trustworthy; max-hold stays the backstop.
-		if !retripped {
-			g.finishWindow(reopenCh, "quiet cycle — lanes resume and probe")
-			return
-		}
-		// Otherwise (re-tripped this cycle): keep holding for the next (longer)
-		// cycle, bounded by max-hold.
 	}
 }
 
 // finishWindow is the SINGLE teardown for a pause window: it flips the gate
-// open and broadcasts to every parked Await by closing reopenCh, then
-// clears the window state (extend, reopenCh) so the next Trip arms a fresh
-// window rather than coalescing onto this dead owner. Guarded so a
-// defensive double-finish is a no-op rather than a close-of-closed panic.
-// Every owner-exit path goes through here, so a parked Await never hangs
-// and g.extend is never left dangling.
+// open and broadcasts to every parked Await by closing reopenCh, then clears
+// the window state so the next Trip arms a fresh window rather than
+// coalescing onto this dead owner. It also stamps lastReopen (the episode
+// ladder's clock) and trues up the trailing quiesce ledger's last span to
+// the ACTUAL reopen, so an early release does not over-charge the run-level
+// share. Guarded so a defensive double-finish is a no-op rather than a
+// close-of-closed panic. Every owner-exit path goes through here, so a parked
+// Await never hangs.
 func (g *GrowGate) finishWindow(reopenCh chan struct{}, why string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.closed || g.reopenCh != reopenCh {
 		return // already reopened / a newer window owns the gate
 	}
+	now := g.now()
 	g.closed = false
-	g.extend = nil
 	g.reopenCh = nil
+	g.lastReopen = now
+	if n := len(g.quiesced); n > 0 && g.quiesced[n-1].end.After(now) {
+		g.quiesced[n-1].end = now
+	}
 	close(reopenCh)
+	if g.onWindowClosed != nil {
+		g.onWindowClosed(now.Sub(g.windowStart))
+	}
 	slog.InfoContext(
 		g.ownerCtx, "pipeline: cold-copy grow-gate reopened — lanes resuming (ADR-0110)",
 		slog.String("reason", g.reason),

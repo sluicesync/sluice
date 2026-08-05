@@ -78,6 +78,21 @@ that hands off to the reactive cycling, not a hold for the whole grow. (Smarter 
 behaviour — a rate-of-change trigger and reparent-robust recovery detection — is the
 Phase-3 metrics follow-up, roadmap item 32/§Phase 3.)
 
+**Escalation is per WINDOW, not per trip (item 138, 2026-08-05 — the second field report).** The shipped coordinator advanced its exponential ladder once per `Trip`, via an `extend` signal the owner goroutine consumed as fast as it arrived. The ladder was meant to express *temporal* persistence — "the target is still bad after we waited" — but what actually fed it was *fan-out width*. Every lane parks in `Await` while the gate is closed, so the only trips that can arrive during a window come from the lanes that were mid-flush when it closed: all of them reporting the SAME target event, carrying no information the first trip did not.
+
+Measured on the reporter's log, not inferred: 246 close/reopen pairs, and the hold matched `backoff(tripCount)` to the millisecond — 0.100 s at 1 trip, 0.81 s at 4, 12.87 s at 8, 30.0 s at ≥14. With the default fan-out (W×D = 16 lanes on the sync cold-start native-concurrent path; up to 32 on `migrate`) one connection drop produced 13–16 trips within ~4 ms and burned the ladder to its 30 s cap in those 4 ms. **The 30 s was never a design choice — it is the cap of a ladder consumed by concurrency.** The run spent 4369.3 s closed against 1015.8 s open: **81.1 % of a 91-minute copy quiesced**, four chunks in the last hour, on a target that was merely dropping connections (244 of the 246 windows were tripped by `vtgate connection error: no endpoints`, a routing/transport availability error carrying no reparent evidence at all).
+
+Two further defects surfaced with it, both of the "written invariant nobody checks" class:
+
+- The code claimed "the exponential backoff grows across windows". It did not. `finishWindow` cleared all window state and every new window restarted at rung 1, so *all* the growth happened inside a single window — which is exactly why it had to be driven by trip count.
+- `GrowGateMaxHold` (20 min) reads like a bound on how long the gate may stall a run. It bounds **one window**. No window in the field run came close to it, so the backstop never fired while the gate accumulated 73 minutes of quiesce. A gate whose scope is narrower than its name.
+
+The fix, therefore: a window is one hold of `backoff(cycle)` and nothing can lengthen it (the `extend` channel is **deleted**, which makes the defect inexpressible rather than merely fixed); `cycle` is EPISODE-scoped and advances exactly one rung per window while trouble persists, resetting after `GrowGateEpisodeIdle` of healthy open time; and a new RUN-level ceiling — at most `GrowGateMaxQuiesceShare` of any trailing `GrowGateQuiesceWindow` — bounds the thing max-hold never could, after which the gate declines to close and the per-lane budgets carry the run.
+
+Sizing rationale, since it is not arbitrary: the ladder deliberately tracks the *per-lane* reparent-retry ladder (same 100 ms → 30 s shape, now also advancing once per lane attempt), so the gate's hold OVERLAPS the backoff each lane would have taken anyway. The gate buys **alignment**, not extra waiting. That is also why declining to close is safe rather than a return to thrashing: ADR-0110's cost case assumes lanes "independently hammer-retry", and they do not — the same field log shows 1061 of 2195 lane retries already sitting at their own 30 s cap.
+
+Pinned by five gates in `internal/pipeline/migcore/grow_gate_duty_test.go`, stated as a PAIR because a gate proving only "the gate closes" would have passed the broken behaviour: a sustained storm must leave the copy most of the wall clock, AND sustained trouble must still escalate to a meaningful quiesce. Mutation-verified in both directions, including the "just shorten the quiesce" non-fix, which the anti-vacuity half catches.
+
 ## Context
 
 A non-Metal PlanetScale MySQL volume auto-grows in steps (12 → 39 → 62 → 214 GB).

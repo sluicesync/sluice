@@ -1902,7 +1902,20 @@ internal: vtgate connection error: read tcp …:15999: read: connection reset by
 
 The shape is the one this project keeps paying for: item 122's fix was correct and its enumeration stopped at the operation, not the connection the operation needs.
 
-### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *OPEN, HIGH (field report 2026-08-05, run 3; MEASURED from the reporter's log)*
+### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *✅ FIXED 2026-08-05; unreleased. `-race` Integration must be green before the tag — concurrency chunk (the gate quiesces lanes).*
+
+**Root cause, ground-truthed against the reporter's log and reproduced deterministically: the gate's exponential ladder advanced once per `Trip`, so its escalation was driven by FAN-OUT WIDTH, not by time.** Every lane parks in `Await` while the gate is closed, so the only trips arriving during a window are the sibling lanes that were mid-flush when it closed — all reporting the same target event, carrying no new information. Across the 246 close/reopen pairs the hold matched `backoff(tripCount)` to the millisecond (0.100s at 1 trip, 0.81s at 4, 12.87s at 8, 30.0s at ≥14); with the default 16-lane fan-out one connection drop burned the ladder to its 30s cap in ~4ms. **The 30s was never a design choice — it is the cap of a ladder consumed by concurrency.**
+
+**The diagnostic question's premise did not survive contact.** `migrate` does not survive this because it avoids the gate: it engages the SAME gate with MORE lanes (~32 = table-parallelism 4 × within-table 8, vs sync cold-start's W×D = 4×4 = 16), on one run-wide instance, and `runBulkCopyPhases`/`openOneChunkConn` wire every one of them. The comparison was also uncontrolled: the successful 45-minute `migrate` ran against a **production branch on a paid tier**, the stalled `sync` runs against a **development branch** (the log's own sub-tier buffer-pool signal confirms it — the same DEV-branch tier-signal shape item 129 fixed the reporting for). Different target class, different availability, different drop rate. So there was no path-scoped fix to make: the defect is path-independent and would hit `migrate` identically on the same target.
+
+**Fix (three coupled parts of one mechanism, not three hypotheses).** In-window trips coalesce without advancing the ladder, and a window is one hold of `backoff(cycle)` that nothing can lengthen — the `extend` channel is **deleted**, making the defect inexpressible. `cycle` becomes EPISODE-scoped, advancing one rung per window while trouble persists and resetting after `GrowGateEpisodeIdle` of healthy open time; this is the first time the long-standing "the exponential backoff grows across windows" comment has been true. And a RUN-level ceiling (`GrowGateMaxQuiesceShare` of a trailing `GrowGateQuiesceWindow`) bounds what `GrowGateMaxHold` never could: max-hold bounds ONE window, no window in the field run came near it, and the gate still accumulated 73 minutes of quiesce — a gate whose scope was narrower than its name.
+
+**Not fixed here, deliberately, and filed as item 143:** the trip SIGNAL is still an inference. The gate trips on the engine's whole retriable-transient class, so 244 of the 246 windows were opened by `vtgate connection error: no endpoints` — a routing/transport error carrying no reparent evidence whatever. That is real, but it is not what produced the 81%; bundling it would have obscured the measured fix.
+
+**Gates:** five in `internal/pipeline/migcore/grow_gate_duty_test.go`, stated as a PAIR because a gate proving only "the gate closes" would have passed the broken behaviour — a sustained storm must leave the copy most of the wall clock, AND sustained trouble must still escalate to a meaningful quiesce. Mutation-verified in both directions (each mutant confirmed applied before trusting the result), including the "just shorten the quiesce" non-fix, which the anti-vacuity half catches, and a partial re-introduction that the first draft of the invariance pin missed because it measured only the first window.
+
+<details>
+<summary>Original report (kept for provenance)</summary>
 
 The reporter ran `sync` cold-start for 91 minutes against a PlanetScale target. The v0.111.1 retry work behaved exactly as designed — **2,687 vtgate drops absorbed, zero unhandled, 9 duplicate-key collisions tolerated** — and the table still never finished. Four chunks in the last sixty minutes. `migrate` copies the same table as part of a 45-minute whole-database run.
 
@@ -1926,6 +1939,18 @@ Totalled across the run: **4369.3s closed vs 1015.8s open — 81.1% quiesced.** 
 **Why `migrate` survives and `sync` cold-start does not** is the diagnostic question to answer first, and the answer decides the fix. Establish it before designing: if `migrate` does not share this gate, the gate's cost is being paid on one path for a hazard both share.
 
 **Gate it on the reporter's shape:** a drop arriving every ~2s must not hold the copy below some stated fraction of its open duty cycle, and a genuine sustained grow event must still quiesce. A test that only proves "the gate closes" would pass on today's behaviour.
+
+</details>
+
+### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *OPEN, MEDIUM (split out of item 138, 2026-08-05)*
+
+Item 138 fixed how much the gate quiesces. It did not change WHEN the gate decides a storage-grow reparent is underway, and that decision is still a guess: `flushWithReparentRetry` trips the gate on whatever the engine classifier calls retriable, which is one flat verdict spanning genuine reparent faces (`not serving`, ER_DISK_FULL 1021/1114, read-only 1290, `QueryList.TerminateAll`) and pure transport losses (`vtgate connection error`, `connection reset by peer`, `unexpected EOF`).
+
+**Measured, not assumed:** in the 2026-08-05 field log, 244 of 246 gate windows were opened by `Error 1105 (HY000): unavailable: vtgate connection error: no endpoints` — a routing/availability error carrying no reparent evidence at all — and 1642 of the 2195 lane retries were that same shape. Zero windows were opened by any of the reparent-evidenced faces. ADR-0110's justification ("the target completes the transition faster if left alone") is an argument about a serving transition; it does not apply to a dropped connection, where quiescing every lane buys the target nothing.
+
+The reporter's shape also argues against the inference on its own terms: drops arrived at a flat ~24/min for 91 minutes (per-bucket 176, 354, 336, 247, 290, 292, 255, 303, 313). A storage-grow reparent is a bounded event of minutes. **A sustained drop storm is evidence AGAINST a single reparent**, and the gate has no way to say so.
+
+Fix direction: split the trip decision from the retry decision — retriability stays as broad as it is (that part works: 2,687 drops absorbed, zero unhandled), while GROW-GATE tripping requires either a reparent-evidenced error face or a corroborating observation (the tier-signal probe, `--min-storage`, the telemetry headroom sidecar). Everything else stays retriable but does not open a coordinated quiesce window. Note the gate is engine-neutral and the signal is engine-specific, so the verdict belongs behind an engine surface, not in `migcore`.
 
 ### 137. The copy retry budget is keyed by chunk index alone, so two tables share one chunk's budget — *OPEN, low; the known limitation item 136 declared rather than bundled*
 

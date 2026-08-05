@@ -1552,18 +1552,25 @@ func runBulkCopyPhases(
 	upfrontIndexes bool,
 	analyzeAfter bool,
 ) error {
-	// ADR-0110 (v0.99.102): wire the run's coordinated grow-pause gate onto
-	// the TOP-LEVEL cold-copy writer here, centrally. The native-concurrent /
+	// ADR-0110: wire the run's coordinated grow-pause gate onto the TOP-LEVEL
+	// cold-copy writer here, centrally, so the single-reader / chunk-0 lanes
+	// that flush through THIS rw participate. The migrate keyset-chunked path
+	// ADDITIONALLY wires each fresh per-chunk/per-table writer in
+	// openOneChunkConn — that is where migrate's other lanes get their gate.
+	// nil gate or a non-setter writer ⇒ no-op (pre-ADR-0110 behaviour,
+	// byte-for-byte).
+	//
+	// SCOPE CORRECTION (item 138, 2026-08-05). A v0.99.102-era version of this
+	// comment claimed the wiring here also covered "the native-concurrent /
 	// fan-out path (copyTablePlainParallel / copyTableColdStartIdempotentParallel)
-	// reuses THIS rw across all D workers — they all call w.flushWithReparentRetry
-	// on the same *RowWriter — so setting the gate on rw engages the coordination
-	// for the whole fan-out. (The migrate keyset-chunked path ADDITIONALLY wires
-	// each fresh per-chunk writer in openOneChunkConn.) v0.99.100 wired ONLY the
-	// chunked openOneChunkConn path, so the gate was inert in the sync cold-start /
-	// native concurrent cold-copy path — the Track-D / PlanetScale CDC path — and
-	// the v0.99.101 PS-320-v11 live run proved it: the gate tripped ZERO times
-	// while the writers rode 74 real grow-window retries independently. nil gate
-	// or a non-setter writer ⇒ no-op (pre-ADR-0110 behaviour, byte-for-byte).
+	// … across all D workers". It does not, and has not since v0.99.103: those
+	// helpers are reachable only from runBulkCopyWithOpts and
+	// runConcurrentTableCopy, neither of which runBulkCopyPhases calls. The
+	// sync cold-start native-concurrent path wires its own gate at
+	// streamer_coldstart.go's ApplyGrowGate, which is what actually covers the
+	// W×D fan-out. The claim was true when written about a different call
+	// graph and quietly stopped being true; it is corrected rather than
+	// deleted so the next reader knows which path this line really reaches.
 	if parallel != nil {
 		migcore.ApplyGrowGate(rw, parallel.growGate)
 		// ADR-0141: wire the run's reparent observer onto the TOP-LEVEL writer
