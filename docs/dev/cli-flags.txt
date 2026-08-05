@@ -216,6 +216,7 @@ backup verify --azure-wrap-algorithm
 backup verify --backup-endpoint
 backup verify --backup-path-style
 backup verify --backup-region
+backup verify --depth
 backup verify --encrypt
 backup verify --encrypt-mode
 backup verify --encryption-passphrase

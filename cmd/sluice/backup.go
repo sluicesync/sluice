@@ -1328,18 +1328,32 @@ func (b *BackupStreamStopCmd) Run(_ *Globals) error {
 // archived backups — confirms the bits are still good without needing
 // a target database to restore into.
 //
-// Verify has TWO depths and the difference is what a green result
-// promises. Key-less it is sha256-only: the bytes have not rotted, but
-// bytes that hash correctly can still be sealed under a key or a
-// binding the restore path will not reproduce. When the chain is
-// encrypted and the operator supplies `--encrypt` + a passphrase / KMS
-// reference, verify additionally performs the REAL AES-GCM
-// authenticated open of every encrypted chunk — the same CEK and the
-// same AAD binding `restore` uses, in per-chain mode too. A chunk
+// Verify's default work is byte-level, and what a green result promises
+// depends on how much you give it. Key-less it is sha256-only: the bytes
+// have not rotted, but bytes that hash correctly can still be sealed
+// under a key or a binding the restore path will not reproduce. When the
+// chain is encrypted and the operator supplies `--encrypt` + a
+// passphrase / KMS reference, verify additionally performs the REAL
+// AES-GCM authenticated open of every encrypted chunk — the same CEK and
+// the same AAD binding `restore` uses, in per-chain mode too. A chunk
 // restore cannot read fails HERE, as
 // `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`, rather than during a recovery.
-// (BOTH depths walk the lineage first, the way restore does, so a
-// mis-stitched chain is refused at either.)
+// (Every depth walks the lineage first, the way restore does, so a
+// mis-stitched chain is refused at all of them.)
+//
+// `--depth read` is the depth that PARSES (roadmap item 129). Everything
+// above re-hashes or re-opens the same bytes it is checking, so it
+// confirms the artifact is intact and says nothing about whether it can
+// be READ BACK — which is how Bug 226 shipped a backup that verified
+// rc=0 and restored rc=1 with 0 rows. At `--depth read` every chunk,
+// data and CHANGE alike, is streamed through its own real reader and the
+// rows discarded; an unreadable one fails as
+// `SLUICE-E-BACKUP-CHUNK-UNREADABLE`. It costs one full read per chunk,
+// which is why it is not the default — the hash-only depth exists so a
+// cron probe can run cheaply against object storage. See
+// internal/pipeline/backup/verify_read_depth.go for the honest list of
+// what a parse proves and what it does not (it is a READABILITY check,
+// not a check that the values are correct).
 //
 // The reported `decrypted=N` is the honest coverage signal and is why
 // it sits next to `chunks=N`: the pre-Bug-215 probe unwrapped each
@@ -1354,6 +1368,8 @@ type BackupVerifyCmd struct {
 	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --from is an s3:// URL." placeholder:"URL"`
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
+
+	Depth string `help:"How much of each chunk to read. 'hash' (default) re-hashes every chunk's stored bytes against the manifest SHA-256 — plus, with --encrypt, the real authenticated open every encrypted chunk gets at restore. 'read' additionally streams every chunk (data AND change chunks) through its own real reader and discards the rows, which is the only evidence verify has that is NOT the artifact it is checking: it catches an over-long row line, a truncated stream, and a wrong recorded codec, all of which hash perfectly and fail at restore (Bug 226). Costs one full read per chunk; the default stays hash-only so a cron probe runs cheaply against object storage. On an ENCRYPTED chain 'read' requires --encrypt + key material and refuses without it — it must decrypt a chunk before it can parse one, so it cannot fall back to the key-less depth. A parse proves the chunk DECODES, not that its values are correct." default:"hash" enum:"hash,read" placeholder:"DEPTH"`
 
 	RebuildCatalog bool `help:"Rebuild lineage.json from scratch by walking the conventional one-segment layout (manifest.json + manifests/incr-*.json), then exit. Use after manual mutation of a single-segment backup. The segment's compression codec is sniffed from chunk magic bytes; for an ENCRYPTED chain also pass --encrypt + the chain's passphrase / KMS reference (the codec is sealed inside the encryption envelope). NOTE: a multi-segment (rotated) lineage's sub-dir structure is NOT reconstructable from a bare walk by design — lineage.json IS the structural record for a rotated backup."`
 
@@ -1454,10 +1470,15 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 			// when chunks fail — SLUICE-E-BACKUP-CHUNK-CORRUPT (SHA-256
 			// mismatch) / -CHUNK-AUTH-FAILED (decrypt/splice) — so operators
 			// can script `backup verify` against the code, matching restore.
+			depth, err := backup.ParseVerifyDepth(v.Depth)
+			if err != nil {
+				return err
+			}
 			rep, err := backup.VerifyBackupCodedReport(runCtx, store, backup.VerifyOptions{
 				Envelope:         envelope,
 				VerifyKey:        verifyKey,
 				RequireSignature: v.RequireSignature,
+				Depth:            depth,
 			})
 			if err != nil {
 				return err
@@ -1469,17 +1490,25 @@ func (v *BackupVerifyCmd) Run(g *Globals) error {
 			// under the key + binding the restore path would use, so a
 			// non-zero `decrypted` is the claim that verify and restore
 			// agree.
+			//
+			// `depth` rides the same line for the same reason: at the
+			// default it is the hash-only claim, which cannot tell a
+			// readable chunk from an unreadable one whose bytes are
+			// intact (roadmap item 129). A green run says which
+			// question it answered.
 			slog.InfoContext(
 				runCtx, "backup verify: all chunks OK",
 				slog.Int("chunks", rep.Chunks),
 				slog.Int("decrypted", rep.Authenticated),
 				slog.Bool("decrypt_probe", envelope != nil),
+				slog.String("depth", string(depth)),
 			)
 			sink.PhaseCompleted(backup.VerifyPhaseCheck)
 			sink.Summary(progress.Result{Fields: []progress.Field{
 				{Label: "Chunks", Value: progress.HumanCount(int64(rep.Chunks))},
 				{Label: "Mismatched", Value: "0"},
 				{Label: "Decrypted", Value: progress.HumanCount(int64(rep.Authenticated))},
+				{Label: "Depth", Value: string(depth)},
 			}})
 			return nil
 		})

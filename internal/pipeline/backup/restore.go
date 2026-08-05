@@ -1259,19 +1259,12 @@ func (r *Restore) streamChunkRows(
 	// 0 that decodes rows is a zeroed entry that would disable this per-chunk
 	// backstop. The table-level ACTUAL-vs-recorded sum catches the loss
 	// regardless; refusing here names the tamper at the chunk that carries it.
-	switch {
-	case chunk.RowCount > 0 && rows != chunk.RowCount:
-		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
-			"restore from an untampered copy, or sign the chain so a truncated/edited chunk is caught at verify time",
-			fmt.Errorf("layer-2 chunk row-count mismatch on %s: manifest says %d, decoded %d",
-				chunk.File, chunk.RowCount, rows))
-	case chunk.RowCount == 0 && rows > 0:
-		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
-			"restore from an untampered copy, or sign the chain so a zeroed chunk row-count is caught at verify time",
-			fmt.Errorf("layer-2 chunk row-count anomaly on %s: manifest records 0 rows but decoded %d (zeroed chunk RowCount)",
-				chunk.File, rows))
-	}
-	return rows, nil
+	//
+	// The predicate lives in [checkChunkRowCount] because `backup verify
+	// --depth read` applies the SAME one — a chain restore refuses must not
+	// verify green, and two copies of a predicate is how the manifest
+	// preflight LIST drifted between the two commands (Bug 217/218).
+	return rows, checkChunkRowCount(chunk, rows)
 }
 
 // sourceChunkColumns maps every manifest-schema table to its
@@ -1532,6 +1525,14 @@ type VerifyOptions struct {
 	// no matching verify key — a verify failure rather than a WARN. An
 	// INVALID signature is always a failure regardless. Default false.
 	RequireSignature bool
+
+	// Depth selects how much of each chunk is read (roadmap item 129). The
+	// zero value is [VerifyDepthHash] — the historical byte-level check, so
+	// every existing caller is unchanged. [VerifyDepthRead] additionally
+	// streams each chunk through its own real reader, which is the only
+	// evidence `backup verify` has that is not the artifact it is checking.
+	// See verify_read_depth.go for what that covers and what it does not.
+	Depth VerifyDepth
 }
 
 // VerifyBackup walks every chunk referenced by the manifest in store,
@@ -1626,11 +1627,14 @@ func VerifyBackupCodedReport(ctx context.Context, store irbackup.Store, opts Ver
 }
 
 // aggregateVerifyError wraps the verify-failure summary in the right
-// coded Refusal (Bug 185). Prefer -CHUNK-CORRUPT when any SHA-256
-// mismatch was seen (at-rest corruption/bit-rot), else -CHUNK-AUTH-FAILED
-// when an auth/decrypt/splice failure was seen. When neither chunk-kind
-// fired — a signature-only failure — the aggregate stays uncoded
-// (the signature refusal was already reported per-manifest), matching the
+// coded Refusal (Bug 185), most-diagnostic first: -CHUNK-CORRUPT when any
+// SHA-256 mismatch was seen (at-rest corruption/bit-rot), else
+// -CHUNK-AUTH-FAILED for an auth/decrypt/splice failure, else — reachable
+// only at [VerifyDepthRead], which is the depth that decodes —
+// -CHUNK-UNREADABLE for a byte-intact chunk its reader cannot read, then
+// -BACKUP-INCOMPLETE for the layer-2 row-count refusal. When no chunk-kind
+// fired — a signature-only failure — the aggregate stays uncoded (the
+// signature refusal was already reported per-manifest), matching the
 // pre-Bug-185 shape for that path.
 func aggregateVerifyError(tally verifyScanTally) error {
 	msg := verifyFailureSummary(tally.total, tally.chunkFailed, tally.sigFailed)
@@ -1641,6 +1645,14 @@ func aggregateVerifyError(tally verifyScanTally) error {
 	case tally.sawAuth:
 		return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
 			"restore from an untampered copy; sign the chain (--sign/--sign-key + --require-signature) to make tamper evident earlier", msg)
+	case tally.sawUnreadable:
+		return sluicecode.Wrap(sluicecode.CodeBackupChunkUnreadable, chunkUnreadableHint, msg)
+	case tally.sawIncomplete:
+		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a truncated/edited chunk is caught at verify time", msg)
+	case tally.sawEncryptionMismatch:
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"re-run with --encrypt plus the chain's passphrase / KMS reference, or drop --depth read", msg)
 	default:
 		return msg
 	}
@@ -1682,11 +1694,47 @@ type verifyScanTally struct {
 	authenticated int  // chunks whose ciphertext was actually GCM-opened
 	sawCorrupt    bool // a SHA-256 mismatch fired
 	sawAuth       bool // a decrypt/GCM-auth failure or plaintext splice fired
+
+	// sawUnreadable records a chunk whose bytes are intact and whose own
+	// reader still cannot decode it — only [VerifyDepthRead] can raise it,
+	// and it is the whole reason that depth exists (roadmap item 129).
+	sawUnreadable bool
+
+	// sawIncomplete records the layer-2 row-count refusal restore also
+	// raises ([checkChunkRowCount]); reachable only at [VerifyDepthRead],
+	// because counting decoded rows requires decoding them.
+	sawIncomplete bool
+
+	// sawEncryptionMismatch records an encrypted chunk that reached the read
+	// depth with no CEK ([chunkReadTarget.requireKey]) — the operator's key
+	// is missing, the artifact is not at fault.
+	sawEncryptionMismatch bool
 }
 
 // failed is the aggregate count the [VerifyBackupWith] contract exposes:
 // both failure kinds, so a wrong-key signed chain still reads failed > 0.
 func (t verifyScanTally) failed() int { return t.chunkFailed + t.sigFailed }
+
+// verifyChunkKind distinguishes the two chunk lanes the verify loop walks.
+// It replaced a pair of bare strings when the read depth needed to DISPATCH
+// on the lane rather than only label it — a string that is both the log
+// label and the dispatch key is one typo away from silently verifying a
+// change chunk with the row reader.
+type verifyChunkKind int
+
+const (
+	verifyRowChunk verifyChunkKind = iota
+	verifyChangeChunk
+)
+
+// String is the operator-facing label, unchanged from the strings it
+// replaced so existing log-scraping keeps working.
+func (k verifyChunkKind) String() string {
+	if k == verifyChangeChunk {
+		return "change chunk"
+	}
+	return "row chunk"
+}
 
 // verifyBackupScan is the shared verify loop behind [VerifyBackupWith] and
 // [VerifyBackupCoded]. An operational error (bad manifest, wrong key)
@@ -1852,6 +1900,18 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// verify catches what restore catches. ChainEncryption lives on the
 	// chain's identity manifest; incrementals inherit it by reference.
 	chainEncrypted := identity.ChainEncryption != nil
+	// The read depth needs a key it can decrypt with, and it needs it for
+	// EVERY chunk — parsing is the whole of what that depth does. The hash
+	// depth degrades gracefully on an unkeyed encrypted chain (it WARNs and
+	// runs sha256-only); the read depth cannot, so it refuses ONCE here with
+	// the missing input named, rather than emitting a per-chunk
+	// "unreadable" over an artifact that is perfectly fine.
+	if opts.Depth.readsRows() && chainEncrypted && opts.Envelope == nil {
+		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"re-run with --encrypt plus the chain's passphrase / KMS reference, or drop --depth read for the sha256-only check that needs no key",
+			fmt.Errorf("verify: --depth read requires key material on an encrypted chain (kek_mode=%q, kek_ref=%q) — it must decrypt every chunk before it can parse one",
+				identity.ChainEncryption.KEKMode, identity.ChainEncryption.KEKRef))
+	}
 	plaintextSplice := func(manifestPath, kind, file string) {
 		tally.chunkFailed++
 		tally.sawAuth = true // a plaintext splice is coded -CHUNK-AUTH-FAILED (Bug 185)
@@ -1859,21 +1919,58 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			slog.String("manifest", manifestPath), slog.String("kind", kind), slog.String("file", file),
 			slog.String("error", "chunk carries no encryption metadata on an encrypted chain — refusing (SLUICE-E-BACKUP-CHUNK-AUTH-FAILED at restore)"))
 	}
-	scan := func(rec lineage.SegmentRecord, kind, table, file string, cek, aad []byte, chunk *irbackup.ChunkInfo) {
+	scan := func(rec lineage.SegmentRecord, kind verifyChunkKind, table, file string, cek, aad []byte, chunk *irbackup.ChunkInfo) {
 		tally.total++
 		if chainEncrypted && chunk.Encryption == nil {
-			plaintextSplice(rec.Path, kind, file)
+			plaintextSplice(rec.Path, kind.String(), file)
 			return
 		}
 		segStore := rec.Segment.Store(store)
-		opened, err := verifyChunkAuthenticated(ctx, segStore, chunk, cek, aad)
+		// The depth split, and the only place it lives. The hash depth
+		// re-hashes the stored bytes (plus the authenticated open when key
+		// material was supplied); the read depth streams the chunk through
+		// its own real reader, which subsumes both — the reader hashes as it
+		// goes and decrypts at open — while additionally proving the bytes
+		// DECODE. Roadmap item 129.
+		var (
+			opened bool
+			err    error
+		)
+		if opts.Depth.readsRows() {
+			target := chunkReadTarget{
+				store:    segStore,
+				chunk:    chunk,
+				codec:    rec.Segment.CodecOrDefault(),
+				cek:      cek,
+				aad:      aad,
+				tableKey: table,
+			}
+			var res chunkReadResult
+			if kind == verifyChangeChunk {
+				res, err = target.readChanges(ctx)
+			} else {
+				res, err = target.readRows(ctx)
+				if err == nil {
+					// The layer-2 count check restore runs on every row chunk,
+					// from the SAME predicate, for the same reason verify runs
+					// restore's manifest preflights from one list (Bug 217/218):
+					// a chain restore refuses must not verify green. Change
+					// chunks are deliberately outside it — see
+					// [checkChunkRowCount].
+					err = checkChunkRowCount(chunk, res.records)
+				}
+			}
+			opened = res.opened
+		} else {
+			opened, err = verifyChunkAuthenticated(ctx, segStore, chunk, cek, aad)
+		}
 		if err != nil {
 			tally.chunkFailed++
-			classifyChunkFailure(err, &tally.sawCorrupt, &tally.sawAuth)
+			classifyChunkFailure(err, &tally)
 			slog.ErrorContext(
 				ctx, "verify: chunk failed",
 				slog.String("manifest", rec.Path),
-				slog.String("kind", kind),
+				slog.String("kind", kind.String()),
 				slog.String("table", table),
 				slog.String("file", file),
 				slog.String("error", err.Error()),
@@ -1886,7 +1983,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		slog.DebugContext(
 			ctx, "verify: chunk OK",
 			slog.String("manifest", rec.Path),
-			slog.String("kind", kind),
+			slog.String("kind", kind.String()),
 			slog.String("table", table),
 			slog.String("file", file),
 		)
@@ -1907,7 +2004,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 						slog.String("file", chunk.File), slog.String("error", err.Error()))
 					continue
 				}
-				scan(rec, "row chunk", table.Name, chunk.File, cek, aad, chunk)
+				scan(rec, verifyRowChunk, table.Name, chunk.File, cek, aad, chunk)
 			}
 		}
 		// Change chunks (incremental backups).
@@ -1922,7 +2019,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 					slog.String("error", err.Error()))
 				continue
 			}
-			scan(rec, "change chunk", "", chunk.File, cek, aad, chunk)
+			scan(rec, verifyChangeChunk, "", chunk.File, cek, aad, chunk)
 		}
 	}
 	return tally, nil
@@ -2073,19 +2170,37 @@ func (p *chunkAuthProber) ownerCEK(owner *irbackup.Manifest, chunk *irbackup.Chu
 // classifyChunkFailure inspects a per-chunk verify error's coded class and
 // records which Bug-185 failure kind it is: a SHA-256 mismatch
 // ([sluicecode.CodeBackupChunkCorrupt]) sets sawCorrupt; a GCM/AAD auth
-// failure ([sluicecode.CodeBackupChunkAuthFailed]) sets sawAuth. An uncoded
-// error (a missing chunk / I/O fault — "incomplete", not corruption) sets
-// neither, so the aggregate stays uncoded for that path.
-func classifyChunkFailure(err error, sawCorrupt, sawAuth *bool) {
+// failure ([sluicecode.CodeBackupChunkAuthFailed]) sets sawAuth; and, at
+// [VerifyDepthRead] only, a byte-intact-but-undecodable chunk
+// ([sluicecode.CodeBackupChunkUnreadable]) sets sawUnreadable while the
+// layer-2 row-count refusal ([sluicecode.CodeBackupIncomplete]) sets
+// sawIncomplete. An uncoded error (a missing chunk / I/O fault —
+// "incomplete", not corruption) sets none of them, so the aggregate stays
+// uncoded for that path.
+//
+// Every code the read path can produce must have an arm here: a coded
+// per-chunk refusal whose class is unrecorded degrades the AGGREGATE to
+// uncoded, so `backup verify` would exit non-zero with no machine-readable
+// class while the per-chunk log line carried one.
+func classifyChunkFailure(err error, tally *verifyScanTally) {
 	ce, ok := sluicecode.FromError(err)
 	if !ok {
 		return
 	}
 	switch ce.Code {
 	case sluicecode.CodeBackupChunkCorrupt:
-		*sawCorrupt = true
+		tally.sawCorrupt = true
 	case sluicecode.CodeBackupChunkAuthFailed:
-		*sawAuth = true
+		tally.sawAuth = true
+	case sluicecode.CodeBackupChunkUnreadable:
+		tally.sawUnreadable = true
+	case sluicecode.CodeBackupIncomplete:
+		tally.sawIncomplete = true
+	case sluicecode.CodeBackupEncryptionMismatch:
+		// The read depth's per-chunk backstop for an encrypted chunk with no
+		// key: the chain-level preflight catches the ordinary shape, this
+		// covers a chunk encrypted without the chain saying so.
+		tally.sawEncryptionMismatch = true
 	}
 }
 

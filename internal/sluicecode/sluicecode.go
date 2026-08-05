@@ -175,6 +175,7 @@ const (
 	CodeBackupSignatureUnsupported Code = "SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED"
 	CodeBackupChunkAuthFailed      Code = "SLUICE-E-BACKUP-CHUNK-AUTH-FAILED"
 	CodeBackupChunkCorrupt         Code = "SLUICE-E-BACKUP-CHUNK-CORRUPT"
+	CodeBackupChunkUnreadable      Code = "SLUICE-E-BACKUP-CHUNK-UNREADABLE"
 	CodeBackupIncomplete           Code = "SLUICE-E-BACKUP-INCOMPLETE"
 	CodeBackupInterrupted          Code = "SLUICE-E-BACKUP-INTERRUPTED"
 	CodeBackupManifestInvalid      Code = "SLUICE-E-BACKUP-MANIFEST-INVALID"
@@ -400,6 +401,7 @@ var registry = map[Code]Info{
 	CodeBackupSignatureUnsupported: {ClassRefusal, "a signed backup manifest uses a newer signature scheme/canonicalization than this build supports; upgrade sluice (not a tamper signal)"},
 	CodeBackupChunkAuthFailed:      {ClassRefusal, "an encrypted backup chunk failed authenticated decryption (tampered / corrupt / spliced or reordered store) — the loud, coded twin of the signed-manifest tamper refusal for backups that are encrypted but not signed"},
 	CodeBackupChunkCorrupt:         {ClassRefusal, "a backup chunk's stored bytes do not match the SHA-256 recorded for it in the manifest — at-rest corruption / bit-rot, or a tamper that altered the stored bytes; caught by rehashing at restore, broker replay, and backup verify, before decryption, so it fires on plaintext and encrypted chunks alike (the integrity twin of -CHUNK-AUTH-FAILED, which is the GCM/AAD check)"},
+	CodeBackupChunkUnreadable:      {ClassRefusal, "a backup chunk's bytes are INTACT — they hash to the manifest's SHA-256 and, when encrypted, open under the chain's key and binding — and its own reader still cannot decode it: an over-long row line, a truncated codec stream, a wrong recorded codec, or a row the decoder rejects. Raised only by `backup verify --depth read`, which is the depth that parses; the hash-only default cannot see this class at all"},
 	CodeBackupIncomplete:           {ClassRefusal, "a restore/replay/export decoded or applied a DIFFERENT number of rows/changes than the manifest records (change-chunk tail truncated, a layer-2 row-count mismatch, or a zeroed RowCount) — the signing-independent backstop against silent truncation/edit of an unsigned backup"},
 	CodeBackupInterrupted:          {ClassRefusal, "a backup manifest records partial_state=in_progress — the run that wrote it was interrupted (or is still going), so it lists only the tables finished at that moment; refused by restore, backup verify, and export-as-parquet before any data is read, because reading it creates every table and loads only some while exiting 0"},
 	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},

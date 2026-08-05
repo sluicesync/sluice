@@ -26,7 +26,9 @@ recipe still works.
 3. **`sluice backup verify`** — periodic verification that the chain
    on disk matches its manifests, and — with `--encrypt` + the chain's
    key material — that every encrypted chunk still opens under the same
-   key and binding `restore` would use.
+   key and binding `restore` would use. Add `--depth read` to also parse
+   every chunk with its own reader, which is the only check here whose
+   evidence is not the artifact itself.
 4. **`sluice restore`** — when you actually need to recover, restore
    the chain to a fresh target.
 
@@ -171,8 +173,8 @@ sluice backup verify \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase'
 ```
 
-Verify has **two depths**, and the difference is what a green result
-promises.
+What a green result promises depends on how much you give the command,
+and on `--depth`.
 
 Without the `--encrypt` flag it is sha256-only — chunk bytes are hashed
 and compared against the manifest's recorded hashes. That proves the
@@ -188,9 +190,54 @@ DR archive. A chunk `restore` cannot read (tampered, spliced, or sealed
 under the wrong key) fails here as
 `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`, exit 3.
 
-Both depths walk the chain's lineage first, the way `restore` does, so
-a chain a `prune` or `compact` left un-walkable is refused either way —
-verify never reports a chain healthy that `restore` will not start on.
+Every depth walks the chain's lineage first, the way `restore` does, so
+a chain a `prune` or `compact` left un-walkable is refused at all of
+them — verify never reports a chain healthy that `restore` will not
+start on.
+
+### `--depth read`: the depth that actually parses a row
+
+Everything above re-hashes or re-opens the same bytes it is checking. That is
+enough to prove the artifact is intact and it says **nothing about whether the
+artifact can be read back** — which is how a real backup once reported
+`backup full` rc=0, `backup verify` rc=0, and `restore` rc=1 with 0 rows and
+`token too long`.
+
+```sh
+sluice backup verify \
+    --from-dir /var/backups/myapp \
+    --depth read \
+    --encrypt --encryption-passphrase 'pick-a-real-passphrase'
+```
+
+At `--depth read` every chunk — data chunks **and** the change chunks of every
+incremental — is streamed through the same reader `restore` uses: decompress,
+decrypt, scan lines, decode rows, discard. It catches an over-long row line
+(the shape above, on chains written by sluice v0.111.1 or earlier), a truncated
+codec stream whose hash was re-stamped, and a segment whose recorded
+compression codec is not the one its chunks were written with. Each of those
+passes the hash depth perfectly and fails at restore;
+`SLUICE-E-BACKUP-CHUNK-UNREADABLE` is the refusal, exit 3.
+
+**What it does not prove, stated plainly.** A parse shows the chunk *decodes*
+— not that its values are what the source held, and not that the rows will
+apply to a target. No depth of `backup verify` can tell you that: a backup
+cannot be independent evidence about itself, and only a comparison against a
+live source (`sluice verify`) or an actual restore can close that gap. Treat
+`--depth read` as the strongest readability claim available offline, not as a
+restore rehearsal.
+
+**On an encrypted chain `--depth read` REQUIRES `--encrypt` + key material**,
+and refuses loudly (`SLUICE-E-BACKUP-ENCRYPTION-MISMATCH`) without it. Parsing
+is the whole of what the depth does, so it cannot degrade to the sha256-only
+answer the way the default depth does — and reporting every chunk of a healthy
+chain as unreadable because a passphrase was missing would send you looking for
+a corrupt backup. Key-less probes keep using the default depth.
+
+**Cost.** One full read, decompress, decrypt and decode of every chunk — which
+is why it is not the default. The hash depth stays cheap so a frequent cron
+probe against object storage is affordable; run `--depth read` on a slower
+cadence, and always before you start relying on an archive.
 
 **Read the `decrypted=` count, not just the exit status.** The summary
 line reports `chunks=N decrypted=M`; `M` is how many chunks were

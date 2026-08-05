@@ -1525,6 +1525,16 @@ func applySmartCompactionToIncremental(
 		}
 		ch.SHA256 = cw.Hash()
 		ch.RowCount = cw.ChangeCount()
+		// Both numbers above came from the compactor's OWN writer, and nothing
+		// on this path ever read the object back — so every later consumer
+		// would check the store's bytes against a figure the writer asserted
+		// rather than one anything observed (audit 2026-08-04 C-4). Read it
+		// back through the store with the real reader before moving on; one
+		// extra read of a chunk this pass has already read once, on the only
+		// maintenance path that rewrites restore-critical bytes.
+		if err := verifyRewrittenChangeChunk(ctx, store, ch, cek, codec, irbackup.ChangeChunkAADFor(im, ch, i)); err != nil {
+			return nil, fmt.Errorf("re-read rewritten chunk %q: %w", ch.File, err)
+		}
 		bytesAfter += int64(len(newBytes))
 	}
 	res.bytesAfter = bytesAfter

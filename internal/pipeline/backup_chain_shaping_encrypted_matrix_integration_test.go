@@ -737,12 +737,46 @@ func TestChainShaping_EncryptedRoundTripMatrix(t *testing.T) {
 	}
 }
 
-// verifyChain runs `backup verify` exactly as the CLI does.
+// verifyChain runs `backup verify` exactly as the CLI does — at BOTH depths.
+//
+// The hash depth runs first and its verdict is returned unchanged, so every
+// cell that expects a verify FAILURE keeps failing for exactly the reason it
+// did before. Only when the hash depth is green does the read depth
+// (`--depth read`, roadmap item 129) run, and a refusal there fails the cell
+// too.
+//
+// That ordering is the point. This matrix's second gate is "verify and restore
+// must AGREE", and the read depth is the half of verify that can DISAGREE in
+// the dangerous direction — it resolves a (CEK, AAD, codec, segment store)
+// quadruple per chunk, exactly as restore does, across chains that have been
+// rotated, pruned and compacted. A cell where the read depth refuses a chain
+// that then restores row-exact is a FALSE REFUSAL, and this is where it would
+// surface: on hand-built unit fixtures every one of those four is whatever the
+// fixture said it was.
 func (f *shapingFixture) verifyChain(t *testing.T) (backup.VerifyReport, error) {
 	t.Helper()
-	return backup.VerifyBackupCodedReport(context.Background(), f.store, backup.VerifyOptions{
-		Envelope: f.readEnvelope(t),
+	ctx := context.Background()
+	env := f.readEnvelope(t)
+	rep, err := backup.VerifyBackupCodedReport(ctx, f.store, backup.VerifyOptions{Envelope: env})
+	if err != nil {
+		return rep, err
+	}
+	readRep, readErr := backup.VerifyBackupCodedReport(ctx, f.store, backup.VerifyOptions{
+		Envelope: env,
+		Depth:    backup.VerifyDepthRead,
 	})
+	if readErr != nil {
+		return readRep, fmt.Errorf("backup verify --depth read refused a chain the hash depth passed: %w", readErr)
+	}
+	if readRep.Chunks != rep.Chunks {
+		t.Errorf("the two verify depths walked different chunk counts (hash=%d, read=%d) — one of them is skipping chunks",
+			rep.Chunks, readRep.Chunks)
+	}
+	if readRep.Authenticated != rep.Authenticated {
+		t.Errorf("the read depth opened %d chunks vs the hash depth's %d — the `decrypted=N` coverage signal disagrees between depths",
+			readRep.Authenticated, rep.Authenticated)
+	}
+	return rep, nil
 }
 
 // restoreChain restores the whole chain into the fresh target through
