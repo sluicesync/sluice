@@ -1856,6 +1856,54 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 140. A pre-existing target schema's foreign keys abort a cold copy in 20 seconds, and nothing warns first — *OPEN, medium (field report 2026-08-05, run 1)*
+
+The reporter branched their target from an existing database, so the schema — including foreign keys — was already there. The copy died at ~20s on `Error 1452 (23000): Cannot add or update a child row`, because sluice's deferred-constraint discipline only governs constraints **it creates**. When the target already carries them, child rows arrive before parents and the FK rejects them.
+
+Their own read was right: "wouldn't have been an issue on a totally new db." That is exactly the problem — the failure is invisible until 20 seconds in, and the remedy (`--skip-foreign-keys`, or dropping them for the copy) is only obvious to someone who already knows the deferred-constraint design.
+
+**This is a preflight gap, not a copy bug.** sluice can see the target's foreign keys before copying a row. Detect them on a target it did not create and refuse or warn UP FRONT, naming `--skip-foreign-keys` — the same posture the existing target-shape preflight (item 25 / ADR-0166) already takes for a drifted table. Check whether that preflight is simply not consulting FKs, in which case this is a small extension rather than a new surface.
+
+### 139. Connection ACQUISITION bypasses the transient-error classifier, so a vtgate drop between batches kills the run — *OPEN, HIGH (field report 2026-08-05, run 2; the sibling item 122's fix did not reach)*
+
+Item 122 taught the classifier vtgate's own wording for a dropped connection and wired it into the cold-copy retry. The reporter's run 2 confirmed that works — 78 drops caught and retried — and then died on this:
+
+```
+mysql: batched insert into "audits": pin connection: Error 1105 (HY000):
+internal: vtgate connection error: read tcp …:15999: read: connection reset by peer
+```
+
+**`pin connection` is the tell.** `row_writer.go:506` acquires the connection with `w.db.Conn(ctx)` and wraps a failure as `pin connection`; `flushWithReparentRetry` — the whole retry apparatus — is called at `:551`, INSIDE `writeBatchedConn`, i.e. only AFTER the connection is already in hand. A drop during ACQUISITION is returned raw and terminates the run, on a path where the identical drop one line later would be retried.
+
+**Sibling roster to sweep, not a single site:** `row_writer.go:508`, `row_writer_batch.go:142`, `:165`, `:236`, and `load_data_writer.go:121` all wrap `Conn()` the same way. Fix the class.
+
+The shape is the one this project keeps paying for: item 122's fix was correct and its enumeration stopped at the operation, not the connection the operation needs.
+
+### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *OPEN, HIGH (field report 2026-08-05, run 3; MEASURED from the reporter's log)*
+
+The reporter ran `sync` cold-start for 91 minutes against a PlanetScale target. The v0.111.1 retry work behaved exactly as designed — **2,687 vtgate drops absorbed, zero unhandled, 9 duplicate-key collisions tolerated** — and the table still never finished. Four chunks in the last sixty minutes. `migrate` copies the same table as part of a 45-minute whole-database run.
+
+**Measured from their log, not inferred.** 246 `grow-gate CLOSED` / `reopened` pairs. The gate closes for a fixed ~30s, reopens, and re-closes within ~0.1s:
+
+```
+13:34:10.682 CLOSED → 13:34:40.687 reopened   (30.005s closed)
+13:34:40.785 CLOSED → 13:35:10.826 reopened   (30.041s closed, 0.098s open)
+13:35:10.919 CLOSED → 13:35:40.952 reopened   (30.033s closed, 0.093s open)
+```
+
+Totalled across the run: **4369.3s closed vs 1015.8s open — 81.1% quiesced.** The reporter's own estimate was "about 80% of the time was basically doing nothing", which the log confirms precisely.
+
+**Root cause.** ADR-0110's grow gate exists to quiesce every cold-copy lane during a genuine storage-grow reparent, where continuing to write is actively harmful. It trips on a transient target error whose message shape *resembles* a reparent — and the log line says so out loud: "likely a primary reparent / 'not serving'". At ~30 drops/minute the gate is retriggered before the previous quiesce has ended, so the copy is stopped almost continuously. Every drop stops ALL lanes, including lanes on tables that were making progress.
+
+**Two things are wrong and they are separable:**
+
+1. **The trip signal is an inference, not evidence.** "Looks like a reparent" is a guess; a real grow event is observable (the tier-signal probe, `--min-storage`, the metrics endpoint when configured). A gate this expensive should not fire on a guess. At minimum it must distinguish "one drop" from "a drop storm", because a storm is evidence AGAINST a single reparent.
+2. **There is no adaptation to a gate that keeps re-closing.** A fixed 30s quiesce with no hysteresis, no cap on consecutive closures, and no escalation means the pathological case is a livelock that reports success at every level: every drop retried, nothing lost, no progress. **This is the same shape as Bug 228 one layer up** — a mechanism that degrades correctly in the small and stalls in the large, while every log line reads healthy.
+
+**Why `migrate` survives and `sync` cold-start does not** is the diagnostic question to answer first, and the answer decides the fix. Establish it before designing: if `migrate` does not share this gate, the gate's cost is being paid on one path for a hazard both share.
+
+**Gate it on the reporter's shape:** a drop arriving every ~2s must not hold the copy below some stated fraction of its open duty cycle, and a genuine sustained grow event must still quiesce. A test that only proves "the gate closes" would pass on today's behaviour.
+
 ### 137. The copy retry budget is keyed by chunk index alone, so two tables share one chunk's budget — *OPEN, low; the known limitation item 136 declared rather than bundled*
 
 `attemptsByChunk` / `waitByChunk` in `copy_parallelism_gate.go` are keyed by chunk index, and the comment justifying that ("the gate is constructed per table, so the index is unique within a gate") is **false under the ADR-0123 run-wide gate**: table A's chunk 3 and table B's chunk 3 share a retry budget. Item 126's per-chunk bound can therefore fire earlier than advertised.
