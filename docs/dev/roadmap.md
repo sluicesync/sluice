@@ -1856,6 +1856,42 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *OPEN*
+
+**Confirmed at HEAD (2026-08-05):** `chain_compact_smart.go` has no `maxEvents` / `maxBytes` / byte-cap of any kind. The compactor holds two growing structures for the whole pass — `s.out` (every emitted event, appended at three sites) and `s.accumulators` (every per-PK chain, retained until a flush barrier) — and the only barriers are TRUNCATE, `SchemaSnapshot` and end-of-incremental. An incremental with none of those retains everything.
+
+*Measured by the audit:* 100k events → **261 MiB**; a 100:1-collapsing corpus → **248 MiB**, i.e. **no relief from collapsing**, because the inputs are retained until flush regardless of how well they collapse. ~2.6 GiB extrapolated at 1M events.
+
+**This is NOT roadmap 116, and the audit says so explicitly.** Item 116 P3 capped the backup CHUNK WRITER's buffer (shipped v0.111.1, 64 MiB). This is the compaction transform's own accumulator, a different buffer on a different path — and fixing the neighbour is exactly the kind of near-miss that makes a reader assume the class is closed. It is not.
+
+**Why it is harder than 116 P3.** The chunk writer could roll at any row boundary; the compactor cannot flush an accumulator mid-chain without giving up the collapse it exists to perform, and flushing early changes WHICH events collapse — an observable output change, not just a memory one. So a cap has to decide what to sacrifice: likely flush the LARGEST accumulators first (bounded memory, partial collapse, correct output) rather than refusing. Whatever is chosen, the output must remain correct under ADR-0064 §2's policy table, and the F3 position invariant must still hold — see `flushCollapsedInsideClosingTx` and item 101 for how easy that is to break.
+
+**Gate it with a measured ceiling**, in the shape item 116 P3 used: a test that drives the real compactor with wide events and asserts peak retention stays under the cap, plus a control asserting a narrow corpus still collapses exactly as it does today (byte-identical output).
+
+### 126. Copy-parallelism AIMD burns its whole retry budget on the first wave, so a transient slot shortage aborts the run (audit 2026-08-04 HIGH) — *OPEN*
+
+**Confirmed at HEAD (2026-08-05):** `CopyParallelismGate.attempts` (`copy_parallelism_gate.go:69`) is documented as "the total slot-exhaustion retries across all chunks of this table" and `ShrinkAndBackoff` increments it once per FAILING WORKER (`:143`), then feeds that run-wide count straight into `NextCopyBackoff`'s give-up bound.
+
+So the counter conflates two different things: how many times ONE chunk has retried, and how many workers have hit 53300 at all. At the shipped 4×4 = 16 concurrent, sixteen workers hitting a slot shortage at nearly the same moment consume the entire budget (`MaxRetries` 6) between them — **the 7th aborts the whole run while workers 1–6 are still parked in their first backoff, having executed ZERO retries.** The gate's stated purpose — "a transient slot shortage degrades to slower-but-correct" — does not hold at any parallelism ≥ 7, which is every default multi-core run.
+
+**The shrink half still works**, which is what hides it: parallelism does come down, so an operator sees the AIMD "working" right up until the abort.
+
+**Fix shape.** Separate the two quantities: a PER-CHUNK attempt count feeding the give-up bound, and a run-wide tally for the shrink signal (which is what the AIMD genuinely wants — many concurrent 53300s SHOULD shrink hard). `totalWait` has the same shape and deserves the same look. **Gotcha:** the give-up bound is also what stops an infinite retry against a genuinely full target, so the per-chunk budget must still terminate; the goal is that 16 workers get 16 chunks' worth of retries, not that any one chunk retries forever.
+
+**Gate it at parallelism ≥ 7 specifically** — the audit's finding is that the property holds at low parallelism and fails at the default, so a test at 1–4 workers is green and vacuous.
+
+### 125. `sluice schema diff` is structurally blind to the constraint drift the S8 work exists to prevent (audit 2026-08-04 HIGH, S9; MIS-MAPPED and untracked until now) — *OPEN*
+
+**Confirmed at HEAD (2026-08-05):** `TableDiff` (`internal/ir/diff/schema_diff.go:153`) carries `IndexesMissing []string` and `IndexesExtra []string` — **name-only** — with no `IndexesMismatched` and **no foreign-key fields at all**. A source `UNIQUE(email(10))` against a target `UNIQUE(email)` therefore compares **EQUAL**: same name, present on both sides. So does a dropped partial predicate, a changed column list, and any FK difference whatsoever.
+
+That is the operator-facing surface someone would reach for to CHECK for exactly the silent constraint weakening items 118 and 120 were built to refuse. It cannot see it.
+
+**Read the mis-mapping before starting, because it is the instructive part.** The 08-01 audit's remediation status recorded S9 as "already roadmap item 113". Item 113 is `migcore/incremental_delta_shape.go` — the incremental-backup delta, a different surface entirely. The 08-04 confirming pass caught it. **A finding marked as tracked by the wrong item is worse than one marked open**, because the status line reads as covered and nobody looks again.
+
+**There is a second trap waiting for whoever takes this.** `internal/ir/diff/schema_drift.go` DOES have `ForeignKeysAdded` / `ForeignKeysDropped` / `ForeignKeysAltered`. A grep for "does diff know about foreign keys?" answers YES and is answering about a **different type on a different surface** (drift reports, not `schema diff`). Confirm which struct the command renders before concluding anything.
+
+**Fix shape.** Add index-mismatch and FK entries to `TableDiff`, comparing the attributes that actually change semantics — the column list including `IndexColumn.Length`, `Unique`, the partial predicate, and the FK's columns/referenced table/actions. The drift-report structs are the model for the shape. **Pin it against the class it exists to catch:** the S8 matrix — prefix length, partial predicate, uniqueness — must each produce a diff entry, with a control that an identical schema still reports clean.
+
 ### 124. `information_schema.table_rows` on MariaDB undershot by 40%, so progress read as a count mismatch — *✅ FIXED on `main` 2026-08-04; unreleased*
 
 **The surface was narrower than the filing assumed, and finding that out was the work.** Both progress surfaces ALREADY labelled the number: the TTY panel renders `100%+` and annotates the count "est. exceeded", and the non-TTY `bulk copy progress` line has carried `total_rows_estimated=true` since roadmap #22. The one that did not was the **dry-run plan** — which is precisely the number an operator diffs against the final copied count, since it is printed once, up front, per table. Fixed by adding `row_count_estimated` to `PlanTable` (JSON and slog), mirroring the progress line's existing convention. `-1` (unavailable) is deliberately NOT labelled estimated: "unknown" and "an approximate zero" are different claims, and the sentinel exists so consumers cannot confuse unknown with empty.
