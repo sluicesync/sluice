@@ -520,7 +520,7 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 	// is enforced at restore). Cross-engine leaves it false, so the
 	// generic fallthrough refusal below still fires — the cross-engine
 	// loud-refuse default is NOT weakened. The cross-engine refusal at
-	// `internal/pipeline/cross_engine_supportable.go` rejects
+	// `internal/pipeline/migcore/cross_engine_supportable.go` rejects
 	// ir.VerbatimType regardless, so the safety is doubly enforced.
 	if coreVerbatimEligibleTypes[c.DataType] && c.VerbatimEligible {
 		if c.FormatType == "" {
@@ -547,14 +547,14 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 // multirange family — all share opaque text-I/O semantics with no
 // locale / dialect quirks, no portable MySQL form (cross-engine stays
 // loud-refuse via [ir.VerbatimType]'s default in
-// `cross_engine_supportable.go`).
+// `migcore/cross_engine_supportable.go`).
 //
 // Stage 2 (promoted 2026-05-30 in ADR-0070 after the per-type
 // round-trip pins shipped in v0.90.0): xml, money, pg_lsn,
 // txid_snapshot, pg_snapshot. Each pin asserts the three-outcome
 // shape (refuse-loudly / preserve / SILENT-TYPE-LOSS) and now hits
 // the "preserve" branch with this promotion. Cross-engine stays
-// loud-refuse via [ir.VerbatimType] in `cross_engine_supportable.go`.
+// loud-refuse via [ir.VerbatimType] in `migcore/cross_engine_supportable.go`.
 // Do NOT add a Stage 3 entry without the same evidence: per-type
 // integration pin + ADR update + cross-engine refusal verified.
 var coreVerbatimEligibleTypes = map[string]bool{

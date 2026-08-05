@@ -4,12 +4,12 @@
 // Package jsonbench is a build-tagged micro-benchmark + fidelity harness
 // that compares JSON encode/decode libraries against sluice's Phase 1
 // backup chunk record shapes (the tagged-value envelope and the CDC
-// change wrapper — see `internal/pipeline/backup_chunk.go` and
-// `internal/pipeline/backup_change_chunk.go`).
+// change wrapper — see `internal/pipeline/blobcodec/backup_chunk.go` and
+// `internal/pipeline/blobcodec/backup_change_chunk.go`).
 //
 // It exists to inform one decision: should the backup chunk path keep
 // stdlib `encoding/json` (what ships today — see
-// `internal/pipeline/backup_chunk.go` / `backup_change_chunk.go`), or is
+// `internal/pipeline/blobcodec/backup_chunk.go` / `backup_change_chunk.go`), or is
 // a faster library a compelling replacement for the DR-critical restore
 // (decode) axis? Speed is secondary to correctness here: a library that
 // is lossy or semantically divergent on the sluice tagged-value envelope

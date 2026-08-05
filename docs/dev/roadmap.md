@@ -1856,6 +1856,38 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 135. PG `bytea` decode SNIFFS its input, so genuine binary that spells `\x`+hex is silently shrunk — *OPEN, high (audit 2026-08-05 B-2, with the audit's own fix shape CORRECTED)*
+
+`postgres/value_decode.go:377`. `decodeBytea` decides whether its input is hex-encoded *text* by looking at the content: `\x` prefix + even-length valid hex ⇒ decode. Raw binary that happens to spell that is silently shrunk.
+
+**Ground-truthed against real PG 16 + pgx v5.10.0, and the reported cell is not the worst one:**
+
+| stored | server bytes | decoded | |
+|---|---|---|---|
+| `convert_to('\xdead','UTF8')` | 6 | 2 | the audit's cell |
+| `convert_to('\x','UTF8')` | **2** | **0** | **worse, and not in the audit** |
+| `convert_to('\xdeadbeef','UTF8')` | 10 | 4 | |
+| `'\xzz'` (invalid hex) | 4 | 4 | the neighbour the existing pin covers |
+
+**The existing unit pin currently asserts the `\x` → empty case as CORRECT** (`value_decode_test.go:482-485`) — which it is for the CDC tuple path and destructive for the scan path. One test blessing both readings of the same bytes is the sharpest statement of the defect.
+
+**Reach is wider than the audit said.** Every lane using `RowReader` is affected — migrate bulk copy, `sync` cold-start, **and backup** (`backup.go:1444`), where the shrunken value is durable in the chain and `restore` reproduces it faithfully. "PG→PG raw COPY is immune" is true but must not be read as "PG→PG is immune": `rawCopyGate` refuses raw copy whenever `--redact`, `--type-override`, `--expr-override`, `--inject-shard-column` or `--where` is set, and any table carrying an `ir.Array` column is routed to the IR path regardless.
+
+**THE AUDIT'S PROPOSED FIX IS A REGRESSION — do not implement it as written.** "Hex decoding only in `decodeTuple`, never on the scan path" breaks `bytea[]`, a supported family on both doors. Measured: a `bytea[]` column scanned into `*any` comes back as a **string in PG array-text form with each element already hex-rendered**, in all four pgx exec modes. The array lane is correct today *precisely because* it hex-decodes on the scan path.
+
+**The correct discriminator is PROVENANCE — is this leaf a PG text rendering, or a driver-decoded value?** Four call sites, not two:
+
+- **text ⇒ hex-decode, and refuse loudly when the input is not `\x`+even-hex:** `cdc_reader.go:2232`; the array leaf at `value_decode.go:830` (via `decodePGArrayText`).
+- **binary ⇒ verbatim copy, never sniff:** `row_reader.go:266`; the `[]any` / reflect array sub-paths at `value_decode.go:682`, `:730`.
+
+**The trap:** `decodeArray` is reached from BOTH a binary caller and a text caller, yet its three sub-paths have FIXED, OPPOSITE provenance regardless of who called it. So provenance cannot simply be forwarded — `decodePGArrayText` must SET text for its leaves and the `[]any`/reflect paths must SET binary, overriding the caller. A naive `decodeValue(raw, t, prov)` that forwards `prov` into `decodeArray` reproduces the bug in mirror image. Prefer two entry points (`decodeValueFromText` / `decodeValueFromBinary`) over a bool, so a new caller cannot default into the wrong lane.
+
+**Verification honesty.** Cross-engine `verify` cannot catch this at all — `verify.go:248` refuses `--depth sample` unless the engines match, so PG→MySQL gets a `COUNT(*)` a shrunk value does not change. Same-engine `--depth sample` IS a genuinely independent check (it hashes server-side on both endpoints and never touches `decodeBytea`) but is `LIMIT n` sampled, so it is probabilistic per row. `backup verify` is evidence-sharing here: the archive carries the already-shrunken bytes and verify rehashes exactly those. The independent number available and unused is a post-restore `encode(col,'hex')` / `octet_length` against the source.
+
+**Gate:** provenance × value-shape, src==dst ground-truthed with `encode()`/`octet_length()` on the real target. Provenance rows: scan-scalar, chunked scan (>100k rows, so the batch reader is exercised), pgoutput tuple, array leaf 1-D / 2-D / NULL-element, and a backup→restore round trip. Value shapes: the collision cells above, the invalid-hex and odd-length neighbours (the mutation controls), genuine binary, empty, embedded NUL, NULL. **`bytea[]` has zero value-level coverage anywhere today** — only an OID-parity pin. Add a premise pin too (the premise-naming step): assert against a real PG that a scalar `bytea` scans as raw `[]byte` and a `bytea[]` scans as array TEXT, across at least `cache_statement` and `simple_protocol`. Both facts are load-bearing and neither is asserted anywhere.
+
+**MySQL sibling — narrower than reported.** `mysql/row_writer.go:880-887` sniffs, but guarded by `ir.Binary/Varbinary/Blob` AND `v.(string)`. Every reader producing genuinely-binary blob values hands `[]byte`; the only production producer of a `string` there is the pgtrigger reader, where the value IS PG bytea text and hex decoding is correct. Residual is narrow: a PG `text` column `--type-override`n to `varbinary` whose content spells `\x`+hex. Fix by the same provenance discipline, not by more sniffing.
+
 ### 134. SQLite index emit uses `IF NOT EXISTS` with a bare name and no collision check — *OPEN, high; the 08-04 HIGH that was never filed*
 
 `sqlite/ddl_emit.go:507`. The one 08-04 HIGH-family finding that got neither a fix nor an item: `f442e9d3`'s commit message said "the three audit HIGHs still open" and silently dropped the fourth. SQLite index names are SCHEMA-scoped, not table-scoped, so two tables' same-named indexes collide — and because the emit uses `CREATE INDEX IF NOT EXISTS` with a bare name, the collision is a **silent no-op**: the second table is left without the index the source declared. Same shape as item 120 (the PG `SLUICE-E-SCHEMA-INDEX-NAME-COLLISION` path), on the engine that has no such check.

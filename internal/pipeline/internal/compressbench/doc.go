@@ -4,7 +4,7 @@
 // Package compressbench is a build-tagged micro-benchmark harness that
 // compares compression algorithms against sluice's Phase 1 backup chunk
 // shape (JSON Lines of tagged-value envelopes — see
-// `internal/pipeline/backup_chunk.go`).
+// `internal/pipeline/blobcodec/backup_chunk.go`).
 //
 // It exists to inform the Phase 1 → Phase 2 swap question — Phase 1
 // shipped stdlib gzip because correctness mattered most; Phase 2 will

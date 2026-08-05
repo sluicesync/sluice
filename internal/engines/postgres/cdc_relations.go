@@ -467,7 +467,7 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	// to the unsupported-type refusal. The OID-based lookup below
 	// reconciles the two for every verbatim family. Cross-engine
 	// safety is preserved by the orchestrator's `ir.VerbatimType`
-	// refusal in cross_engine_supportable.go.
+	// refusal in migcore/cross_engine_supportable.go.
 	// ---- Array families (Bug 144) ----
 	// pgoutput carries an array column under its array OID (e.g. _int4 = 1007).
 	// The element type is resolved by recursing oidToType on the element OID, so

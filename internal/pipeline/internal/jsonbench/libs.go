@@ -59,7 +59,7 @@ type Lib struct {
 // (both its v1-compat surface and its v2 semantic surface), then the
 // third-party drop-ins.
 //
-//   - stdlib_v1            — what `internal/pipeline/backup_chunk.go`
+//   - stdlib_v1            — what `internal/pipeline/blobcodec/backup_chunk.go`
 //     uses today. The baseline every other row is judged against.
 //   - exp_v1compat         — go-json-experiment via its v1 subpackage
 //     (`json/v1`): DefaultOptionsV1, the migration-compatible surface.

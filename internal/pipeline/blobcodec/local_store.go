@@ -8,8 +8,8 @@ package blobcodec
 // This is the Phase 1 reference backend. Pure stdlib (`os` +
 // `path/filepath` + `io.fs`); zero external dependencies. Phase 2 cloud
 // backends (S3, GCS, Azure) implement the same interface so the
-// orchestrator code in `internal/pipeline/backup.go` and
-// `internal/pipeline/restore.go` doesn't change when those land.
+// orchestrator code in `internal/pipeline/backup/backup.go` and
+// `internal/pipeline/backup/restore.go` doesn't change when those land.
 //
 // Path semantics:
 //

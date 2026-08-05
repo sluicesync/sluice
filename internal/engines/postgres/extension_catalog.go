@@ -378,7 +378,7 @@ func pgVectorDimFromTypmod(typmod int32) (dim int, ok bool) {
 //
 // The cross-engine refusal (PG → MySQL with a pg_trgm-indexed column)
 // rides on the [ir.IndexColumn.OperatorClass] non-empty signal — see
-// `internal/pipeline/cross_engine_supportable.go`. Sluice never
+// `internal/pipeline/migcore/cross_engine_supportable.go`. Sluice never
 // populates OperatorClass for core-PG opclasses (Bug 47 design), so
 // the field's presence is an honest "extension-owned opclass" marker.
 var pgTrgmDef = extensionDef{
@@ -1185,7 +1185,7 @@ func extensionOperatorClassEnabled(opclass string, enabledExtensions map[string]
 // extensionOperatorClassRegistered reports whether `opclass` is the
 // operator-class name of any extension in the catalog (regardless of
 // whether the operator enabled it). Used by the cross-engine
-// refusal path in `internal/pipeline/cross_engine_supportable.go`
+// refusal path in `internal/pipeline/migcore/cross_engine_supportable.go`
 // indirectly via the [ir.IndexColumn.OperatorClass] non-empty
 // signal — sluice only populates that field for extension-owned
 // opclasses, so any non-empty value passing through the IR is by
