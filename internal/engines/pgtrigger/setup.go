@@ -586,12 +586,24 @@ func renderCaptureRowFunction(schema, changeLogTableRef string, payload CaptureP
 	// class fix as the raw-copy/walsender statement-level pins, at the
 	// only layer that survives arbitrary application sessions. Existing
 	// installs pick it up on the next setup re-run (CREATE OR REPLACE).
+	//
+	// SET bytea_output = hex, by the SAME argument on the same clause (audit
+	// 2026-08-05 B-1's sibling sweep). to_jsonb() renders a bytea through the
+	// type's text output function too, so it honors the FIRING session's
+	// bytea_output exactly as it does extra_float_digits. Ground-truthed on
+	// real PG: under `escape`, to_jsonb of a 2-byte 0xDEAD yields
+	// "\\336\\255", the downstream writer's hex-sniff correctly declines it,
+	// and the escape ASCII is bound to the target VARBINARY/BLOB verbatim —
+	// silent corruption of every captured bytea on the pgtrigger→MySQL lane.
+	// Same one-line remedy, same layer, same reason it must not rely on the
+	// application's session.
 	return `CREATE OR REPLACE FUNCTION ` + rowFunctionRef(schema) + `()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 SET extra_float_digits = 3
+SET bytea_output = hex
 AS $sluice$
 DECLARE
     v_pk_cols  TEXT[];

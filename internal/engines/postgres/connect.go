@@ -180,6 +180,24 @@ func afterConnectSessionPins(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3"); err != nil {
 		return fmt.Errorf("postgres: pin extra_float_digits: %w", err)
 	}
+	// bytea_output, for the same reason and by the same argument — the
+	// SIBLING SWEEP of the walsender pin (audit 2026-08-05 B-1, whose first
+	// fix reached the replication connection and stopped there).
+	//
+	// A SCALAR bytea is immune: pgx decodes it to raw []byte whatever the GUC
+	// says. A `bytea[]` is NOT, because pgx hands the array back as PG's own
+	// ARRAY TEXT rendering, whose elements the server formats per
+	// bytea_output. Ground-truthed on real PG 16: under `bytea_output =
+	// escape` a genuine 2-byte `0xDEAD` element arrives as `\336\255` and is
+	// stored as 8 bytes — every element of every bytea array, silently, on
+	// migrate, on sync cold-start, and into the backup archive.
+	//
+	// Cross-engine `verify` cannot see it (it refuses --depth sample across
+	// engines, so PG→MySQL gets a COUNT that a shrunk value does not change),
+	// which is why this is worth a pin rather than a note.
+	if _, err := conn.Exec(ctx, "SET bytea_output = hex"); err != nil {
+		return fmt.Errorf("postgres: pin bytea_output: %w", err)
+	}
 	return nil
 }
 
