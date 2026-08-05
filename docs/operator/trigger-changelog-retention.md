@@ -12,6 +12,13 @@ it is also billable rows-written / storage).
 rows the **target has already durably applied**, so it is safe to run at
 any time — including while a sync is live.
 
+There is also an **in-stream automatic reaper** — `sync start
+--auto-prune-change-log`, off by default — which does the same work on a
+cadence without a cron. It is documented in
+[Automatic in-stream pruning](#automatic-in-stream-pruning---auto-prune-change-log)
+below. Read [Several syncs on one source](#several-syncs-on-one-source-the-consumer-registry)
+before enabling it if more than one sync reads this database.
+
 ## The one safety rule (read this)
 
 A change-log row may be reaped **only if it has been durably applied on
@@ -95,8 +102,8 @@ ignored for the SQLite/D1 engines (flat namespace).
 
 ## Scheduling it
 
-Phase A is an explicit operator action. Run it on a cron / timer
-alongside the continuous sync — e.g. hourly:
+If you are not using `--auto-prune-change-log`, run `trigger prune` on a
+cron / timer alongside the continuous sync — e.g. hourly:
 
 ```
 # crontab: prune the change-log every hour
@@ -148,12 +155,94 @@ If you want to inspect WAL behaviour, watch the `<db>-wal` file size next
 to your source `.db` while a sync runs; with the fix it stays small
 (roughly one checkpoint interval of churn) instead of climbing.
 
-## Deferred: automatic in-stream pruning
+## Automatic in-stream pruning (`--auto-prune-change-log`)
 
-Having the streamer prune the change-log itself on a durable-checkpoint
-cadence (so operators don't schedule anything) is **ADR-0137 Phase B**,
-a deferred follow-up. Until it lands, bounding change-log growth on a
-continuous sync is the explicit operator action documented here.
+ADR-0137 **Phase B** shipped in v0.99.174: the streamer can prune the
+change log itself on a cadence, so nothing has to be scheduled.
+
+```
+sluice sync start … --auto-prune-change-log \
+  [--auto-prune-interval 5m] [--auto-prune-keep 1000]
+```
+
+- **Off by default** — auto-`DELETE`ing rows on someone's source database
+  is an explicit opt-in.
+- Applies only to trigger-CDC sources (`postgres-trigger` /
+  `sqlite-trigger` / `d1-trigger`); a no-op for every other engine, which
+  has no change log.
+- It reaps the same rows `trigger prune` does — only ids below the
+  target's persisted CDC frontier, minus `--auto-prune-keep` (default
+  1000) — so warm-resume is never starved.
+- A prune failure is logged and swallowed. It never fails the sync.
+- `--auto-prune-interval` (default `5m`) sets the cadence. Each tick runs
+  under a bounded budget and deletes in batches, so a large backlog is
+  worked down across ticks rather than in one long transaction.
+
+## Several syncs on one source (the consumer registry)
+
+A source change log is shared by **every** sync reading that database.
+The prune originally cut at *this* stream's frontier alone — so on a
+staged/wave rollout the faster sync reaped rows the slower one had not
+read yet. Silent, permanent, and undiscoverable from the slow side.
+
+`sluice trigger setup` now installs a **`sluice_change_log_consumers`**
+table on the source (change-log `schema_version` 1 → 2). Every
+trigger-CDC stream publishes its own durably-applied frontier there about
+once a minute — **whether or not that stream enabled auto-prune**,
+because the sync that loses rows is usually the one without the flag —
+and both pruners cut at the **MIN across every registered consumer**,
+clamped to the pruning stream's own freshly-read frontier. Registration
+starts when the cold-start snapshot opens rather than at first apply, so
+a peer's multi-hour bulk copy holds the log for its whole duration.
+
+**Migrating an existing source.** Re-run `sluice trigger setup` against
+it — the command is idempotent, so re-running it *is* the migration. Do
+it **with the syncs stopped**: setup drops and recreates the capture
+triggers, and on Postgres the migration's own `CREATE TABLE` is captured
+as a DDL marker that a live reader refuses on.
+
+**Two things fail CLOSED on the automatic path, and prune nothing:**
+
+- A change log with no registry table, or one whose `schema_version` is
+  below the floor (`2`). The second case is how an **older sluice
+  sharing this source** is caught: re-running its `trigger setup`
+  rewrites `schema_version` back to 1 while leaving the table behind, and
+  such a binary streams without ever registering.
+- An **empty** registry, or a registry that does not contain this stream.
+  "No rows" and "nobody has registered yet" are the same observable
+  state; reading either as "no consumers, prune everything" would be a
+  worse silent-loss bug than the one being fixed.
+
+Each refusal names `sluice trigger setup` as the remedy and deletes
+nothing.
+
+**The residual, stated plainly: a peer running a sluice older than the
+registry that only STREAMS is undetectable.** It never registers, and
+streaming leaves no trace on the source — so nothing can see it and the
+prune cannot account for it. Upgrade every sync on a shared source before
+enabling `--auto-prune-change-log`. (A peer that ran an *older* `trigger
+setup` **is** caught, by the `schema_version` floor above; that is a
+different peer and a different signal.)
+
+**A stopped-but-still-registered sync holds the change log** until an
+operator deletes its registry row. After 30 minutes without a refresh
+sluice WARNs, naming the consumer id and the frontier it is holding — and
+it never evicts automatically, because evicting would delete exactly the
+rows a sync that is down for maintenance has not read.
+
+**The operator-run `sluice trigger prune` is clamped the same way**, and
+says so when it happens:
+
+```
+pgtrigger prune: cut lowered from 90000 to 41000 — another sync registered
+in sluice_change_log_consumers has only applied through 41000, and the rows
+above that are ones it has not read yet
+```
+
+Report the number it printed, not the one you asked for. Unlike the
+automatic path it deliberately does **not** refuse when there is no
+registry to consult: that path has been safe for a single stream since it
+shipped, and refusing would break it.
 
 ## See also
 

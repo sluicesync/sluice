@@ -191,12 +191,32 @@ resilience for that table shape, accepted because the alternative is a
 silent double-insert.
 
 **Where else this shape lives.** The gate sits in the shared helper, so
-both MySQL write cores that retry inherit it. The Postgres chunked-COPY
+every MySQL write core that retries inherits it. The Postgres chunked-COPY
 retry (`copyChunkWithRetry`) carried the same hole with a narrower
 rationale — its comment argued only the rolled-back branch — and now
-carries the same gate and the same code. `LOAD DATA`, `raw_copy`, and
-Postgres's plain multi-row INSERT core never re-send at all and are
-exempt for that reason.
+carries the same gate and the same code. `raw_copy` and Postgres's plain
+multi-row INSERT core never re-send at all and are exempt for that reason
+— the plain INSERT core deliberately so, and it takes the Await/Trip
+halves of the grow gate without the replay (`quiesceAndReportTransient`).
+
+**`LOAD DATA` was on that exempt list, and as of item 114 it is not.**
+When this ADR was written, MySQL's `LOAD DATA LOCAL INFILE` core streamed
+one statement per table and had nothing buffered to re-drive, so it could
+not replay and the exemption was accurate. Item 114 segmented it into
+bounded statements and drove **each segment through this same
+`flushWithReparentRetry`** — deliberately the shared helper, so the retry
+policy, the ADR-0110 grow-gate Await/Trip and the wall-clock bound are not
+re-derived per core. That means the `LOAD DATA` core now re-sends, and it
+**inherits this keyless carve-out rather than the exemption**: a keyless
+table hitting a classified transient there refuses with the same
+`SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS`. On a KEYED table the replay is
+convergent for a reason specific to this core — `LOAD DATA` *LOCAL*
+downgrades a duplicate-key error to a warning and skips the offending row,
+so a byte-identical replay inserts exactly the rows that are missing
+whether the prior attempt rolled back, committed, or committed a prefix
+(verified against a real MySQL 8.0, not assumed). See
+`internal/engines/mysql/load_data_writer.go`'s header for that argument and
+for the post-load warning-probe wart it costs.
 
 **What this does NOT change.** The at-least-once CDC apply accounting for
 keyless tables (ADR-0089) is unaffected; that is a separate, documented

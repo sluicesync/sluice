@@ -137,7 +137,7 @@ sluice backup restore --from-chain-id <id> --target <dsn>
 
 - **Slot-health monitoring** (F13, v0.80.0). The PG slot powering the backup stream gets pre-emptive warnings at 70% / 85% consumption and at 30m inactive. Operators learn before the slot evicts.
 - **Source-side heartbeat writer** (F17, v0.82.0). On quiet sources, the writer keeps the slot's `restart_lsn` advancing so off-hours periods don't accumulate WAL that PG eventually drops.
-- **Backup chain compaction** (chain 14a/b/d). Multiple capture windows merge into one compact archive; smart compaction (same-row event collapsing, chain 14e — pending) trims further.
+- **Backup chain compaction** (chain 14a/b/d). Multiple capture windows merge into one compact archive; **smart compaction** (`backup compact --smart-compaction`, chain 14e) collapses same-row events (INSERT+UPDATE → INSERT, UPDATE+DELETE → DELETE, INSERT+DELETE → nothing) to trim further. Default off — opt in once an update-heavy workload makes the CPU tax worthwhile; not supported on encrypted chains, which refuse and name `--smart-compaction-off`.
 
 ---
 
