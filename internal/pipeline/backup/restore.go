@@ -314,6 +314,29 @@ func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
 // shape does not reach here through either caller today (verify refuses
 // on zero manifests earlier, restore resolves a catalog it just built),
 // but a predicate that panics on it would be a poor thing to share.
+//
+// THREE things send a lineage down the walk, and the third — the segment's
+// on-disk LOCATION — is the one that was missing (audit B-6). The
+// single-manifest path does not consult the catalog for WHERE the full is:
+// it reads [lineage.ManifestFileName] at the lineage ROOT. That is the same
+// file for a never-rotated backup, and a DIFFERENT file the moment the one
+// surviving segment lives under a `seg-*` dir — which is exactly what
+// `backup prune` leaves behind when retention retires every earlier
+// segment and the floor segment holds no incrementals (a `--keep-duration`
+// cutoff older than the whole chain, on a rotated chain). Segment count 1,
+// incrementals 0, and the full is NOT at the root: pre-fix the restore was
+// then handed the RETIRED root manifest that [keepsChainIdentity] keeps for
+// the chain's identity, while `backup verify` walked the catalog floor. The
+// two commands read different manifests for one directory — verify-green /
+// restore-chunk-missing on an intact chain, or, when the retired segment's
+// chunk deletes had failed, a SILENT STALE RESTORE of older data with
+// everything reporting success.
+//
+// Pinned by TestVerifyLineageNeedsWalk_SegmentShapes (the predicate) and
+// TestPruneToFloorFull_RestoreReadsTheFloorNotTheRetiredRoot (the dispatch
+// through the real [Restore.Run]); end-to-end across
+// {plaintext, encrypted, signed} by
+// TestPruneToFloorFull_RestoreDispatchMatrix in internal/pipeline.
 func verifyLineageNeedsWalk(ctx context.Context, store irbackup.Store) (bool, error) {
 	cat, err := lineage.ResolveLineage(ctx, store)
 	if err != nil {
@@ -324,9 +347,26 @@ func verifyLineageNeedsWalk(ctx context.Context, store irbackup.Store) (bool, er
 		return false, nil
 	case len(cat.Segments) > 1:
 		return true, nil
+	case len(cat.Segments[0].Incrementals) > 0:
+		return true, nil
 	default:
-		return len(cat.Segments[0].Incrementals) > 0, nil
+		return !singleManifestPathReaches(&cat.Segments[0]), nil
 	}
+}
+
+// singleManifestPathReaches reports whether the single-manifest restore
+// path — which resolves the full by CONVENTION ([lineage.ManifestFileName]
+// at the lineage root), never through the catalog — would read THIS
+// segment's full. It is the layout half of [verifyLineageNeedsWalk]'s
+// question, split out so the convention it encodes is written down once
+// next to the two fields it reads.
+//
+// An empty FullManifestPath (never written by any sluice release, but
+// cheap to be honest about) reports false, so a catalog that cannot say
+// where its full is takes the lineage walk and fails loudly there rather
+// than silently resolving to the root file.
+func singleManifestPathReaches(seg *lineage.Segment) bool {
+	return seg.Dir == "" && seg.FullManifestPath == lineage.ManifestFileName
 }
 
 // rootSegmentCodec returns the codec recorded for segment 0 (the root

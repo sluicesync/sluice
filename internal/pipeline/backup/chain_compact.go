@@ -1154,11 +1154,19 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 //
 // What survives is an identity HEADER, not a restorable segment: its
 // table/chunk references point at the root chunks this sweep does remove.
-// That is safe by construction — the post-compact catalog never names it,
-// and the one reader that could reach it without the catalog
-// ([lineage.ResolveLineage]'s legacy single-segment synthesis, used only
-// when lineage.json is ABSENT) refuses loudly the moment it sees a
-// `seg-*` directory, which a compacted chain always has.
+// The pre-2026-08 comment called that "safe by construction" and named ONE
+// reader that could reach it without the catalog ([lineage.ResolveLineage]'s
+// legacy single-segment synthesis, which refuses on sight of a `seg-*`
+// dir). The enumeration was short by one — [Restore.Run]'s single-manifest
+// path resolved this file by convention too (audit B-6) — so the roster is
+// derived rather than asserted now: TestRootManifestReaderRoster classifies
+// every by-convention root-manifest read as identity-only or
+// catalog-dispatched, and a new one fails the build until it says which.
+//
+// Its detached `.sig` is NOT kept with it. The body is retained for key
+// material; a signature is a claim that the manifest is a LINK of this
+// chain, and after the merge it is not one — [retireManifest] carries the
+// reasoning (audit C-8).
 //
 // Best-effort within the sweep: every delete is ATTEMPTED, and each
 // failure is collected (naming its path) into the joined return so
@@ -1170,9 +1178,13 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *lineage.Segment) error {
 	var errs []error
 	for _, ip := range seg.Incrementals {
-		if err := store.Delete(ctx, ip); err != nil {
-			errs = append(errs, fmt.Errorf("delete %q: %w", ip, err))
+		if err := retireManifest(ctx, store, ip, false); err != nil {
+			errs = append(errs, err)
 		}
+	}
+	// The identity manifest itself: body KEPT, signature retired.
+	if err := retireManifest(ctx, store, seg.FullManifestPath, true); err != nil {
+		errs = append(errs, err)
 	}
 	paths, err := store.List(ctx, "chunks/")
 	if err != nil {
@@ -1191,6 +1203,13 @@ func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *l
 // after the catalog swap committed them out of authority. Per-file
 // delete failures are collected and joined (see
 // [sweepRootSegmentArtifacts] for the best-effort contract).
+//
+// Detached `.sig` siblings need no special handling here, and this is the
+// one place in the C-8 sibling sweep ([retireManifest]) that is EXEMPT
+// rather than fixed: the sweep is by PREFIX, and a segment's signatures
+// live under that same `seg-*/` prefix, so they go with their manifests
+// already. Asserted rather than assumed by
+// TestCompactRetiresSignatureSiblings.
 func sweepSegmentSubdir(ctx context.Context, store irbackup.Store, dir string) error {
 	paths, err := store.List(ctx, dir+"/")
 	if err != nil {

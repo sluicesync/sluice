@@ -748,10 +748,19 @@ func (f *shapingFixture) verifyChain(t *testing.T) (backup.VerifyReport, error) 
 // restoreChain restores the whole chain into the fresh target through
 // the production read path. Returns the error rather than failing, so
 // the caller can compare it against verify's verdict.
+//
+// It goes through [backup.Restore] — the entry point the CLI constructs —
+// NOT [backup.ChainRestore] directly, which is what it used to do. The
+// difference is the DISPATCH: Restore.Run decides whether a lineage needs
+// the walk at all, and calling ChainRestore straight assumes the answer.
+// Audit B-6 was a wrong answer (a pruned-to-floor chain sent to the
+// single-manifest path, which reads the RETIRED chain-root manifest), and
+// this harness could not have seen it while it skipped the decision. Every
+// cell of the matrix now exercises the choice as well as the branch.
 func (f *shapingFixture) restoreChain(t *testing.T) error {
 	t.Helper()
 	eng, _ := engines.Get("postgres")
-	return (&backup.ChainRestore{
+	return (&backup.Restore{
 		Target: eng, TargetDSN: f.targetDSN, Store: f.store, Envelope: f.readEnvelope(t),
 	}).Run(context.Background())
 }

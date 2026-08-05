@@ -76,12 +76,14 @@ import (
 // INFO line above exists to prevent.
 //
 // What prune physically deletes: every dropped incremental's change
-// chunks + manifest, and every dropped whole segment's full manifest +
-// data chunks + sub-dir contents. lineage.json is rewritten in one
-// atomic Put. What it preserves: the oldest kept segment's full +
-// every kept incremental + every later segment — and, when the dropped
-// segment is the lineage ROOT, its `manifest.json`
-// ([keepsChainIdentity], roadmap item 95).
+// chunks + manifest, every dropped whole segment's full manifest + data
+// chunks + sub-dir contents, and — for each retired manifest — its detached
+// ADR-0154 `.sig` sibling ([retireManifest], audit C-8). lineage.json is
+// rewritten in one atomic Put. What it preserves: the oldest kept segment's
+// full + every kept incremental + every later segment — and, when the
+// dropped segment is the lineage ROOT, the BODY of its `manifest.json`
+// ([keepsChainIdentity], roadmap item 95), which is kept for the chain's
+// key material and whose signature is retired with the segment.
 
 // prunerOp is the operator-facing verb the readability gate and its
 // pre/post-sweep decorators name in their refusals — the CLI command,
@@ -388,9 +390,10 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 
 	if opts.DryRun {
-		// Enumerate (without deleting) what a real run would drop.
-		pruneWholeSegments(ctx, store, &origCat, floorSeg, true, res)
-		pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
+		// Enumerate (without deleting) what a real run would drop. Neither
+		// helper touches storage under DryRun, so neither can fail here.
+		_ = pruneWholeSegments(ctx, store, &origCat, floorSeg, true, res)
+		_ = pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
 		return res, nil
 	}
 	// The readability gate's FIRST leg (Bug 214 / item 95), against the
@@ -425,10 +428,8 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		return nil, fmt.Errorf("prune: re-sign pruned chain: %w", err)
 	}
 	// Post-commit delete pass: everything the new catalog no longer
-	// references. Per-file failures are already best-effort inside the
-	// helpers (a leaked orphan is disk, not correctness).
-	pruneWholeSegments(ctx, store, &origCat, floorSeg, false, res)
-	pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, false, res)
+	// references.
+	sweepPrunedOrphans(ctx, store, &origCat, floorSeg, floor, floorStore, keepFromInSeg, res)
 	// The gate's SECOND leg, against what is actually on disk. It cannot
 	// un-delete; its entire job is to stop a retention run reporting
 	// success over a chain it has just made unreadable — the difference
@@ -444,6 +445,55 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		slog.Int("chunks_deleted", res.ChunksDeleted),
 	)
 	return res, nil
+}
+
+// sweepPrunedOrphans is prune's post-commit delete pass: every manifest,
+// `.sig` sibling and chunk the new catalog no longer references.
+//
+// A per-file failure is NOT a run failure. The catalog commit is the
+// linearization point, so by the time this runs the chain is already
+// correctly shaped and every object below is uncatalogued — nothing
+// resolves it: restore dispatches through the catalog
+// ([verifyLineageNeedsWalk]), and the one reader that reaches a manifest
+// without the catalog ([lineage.ResolveLineage]'s legacy single-segment
+// synthesis) refuses loudly the moment it sees a `seg-*` dir. Returning an
+// error would tell an operator their retention run failed when it succeeded
+// and merely leaked disk.
+//
+// It is NOT nothing either, which is the half that was missing (audit F-8).
+// Pre-fix every delete error was discarded with `_ =`, so a store that
+// silently refused deletes — an expired credential, an object-lock/WORM
+// retention policy, a read-only mount — produced a prune that reported
+// segments dropped and manifests pruned while the bytes stayed. That is how
+// B-6's "restore fails on a missing chunk" became "restore silently returns
+// OLDER data": the retired segment's chunks were still there for the
+// mis-dispatched read to find. The dispatch bug is fixed, but a maintenance
+// command must still say when its sweep did not happen, so the failures are
+// collected and named at WARN — the same posture, and the same reasoning,
+// as compaction's [sweepOneSupersededSegment]. Pinned by
+// TestPruneChain_OrphanSweepDeleteFailure_Warns.
+func sweepPrunedOrphans(
+	ctx context.Context,
+	store irbackup.Store,
+	origCat *lineage.Catalog,
+	floorSeg int,
+	floor *lineage.Segment,
+	floorStore irbackup.Store,
+	keepFromInSeg int,
+	res *PruneResult,
+) {
+	sweepErr := errors.Join(
+		pruneWholeSegments(ctx, store, origCat, floorSeg, false, res),
+		pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, false, res),
+	)
+	if sweepErr == nil {
+		return
+	}
+	slog.WarnContext(
+		ctx, "prune: orphan sweep incomplete — retired backup files remain in the store (the chain is correctly pruned; this is leaked disk, not lost data). A store that refuses deletes — expired credentials, an object-lock/WORM retention policy, a read-only mount — will repeat this every run",
+		slog.Int("chunks_deleted", res.ChunksDeleted),
+		slog.String("error", sweepErr.Error()),
+	)
 }
 
 // pruneTrim is the retention the operator REQUESTED, in the terms the
@@ -591,7 +641,11 @@ func joinKeepCounts(ns []int) string {
 // deleting. A segment full is a self-contained snapshot, so dropping
 // whole segments strictly older than the floor is unconditionally
 // restore-safe.
-func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, floorSeg int, dryRun bool, res *PruneResult) {
+// Per-file delete failures are COLLECTED and returned joined (audit F-8),
+// never swallowed — see [PruneChain]'s post-commit sweep for why that is a
+// WARN rather than a run failure, and why silence was the wrong posture.
+func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, floorSeg int, dryRun bool, res *PruneResult) error {
+	var errs []error
 	for si := cat.RestorableFromSegment; si < floorSeg; si++ {
 		seg := &cat.Segments[si]
 		ss := seg.Store(store)
@@ -603,13 +657,19 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 					if !dryRun {
 						if derr := ss.Delete(ctx, ch.File); derr == nil {
 							res.ChunksDeleted++
+						} else {
+							errs = append(errs, fmt.Errorf("delete %q: %w", segQualify(seg.Dir, ch.File), derr))
 						}
 					}
 				}
 			}
 		}
-		if !dryRun && !keepsChainIdentity(seg) {
-			_ = ss.Delete(ctx, seg.FullManifestPath)
+		if !dryRun {
+			// The chain-identity root keeps its BODY and loses its
+			// SIGNATURE — see [retireManifest].
+			if err := retireManifest(ctx, ss, seg.FullManifestPath, keepsChainIdentity(seg)); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		// Incrementals + their change chunks.
 		for _, ip := range seg.Incrementals {
@@ -618,17 +678,22 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 					if !dryRun {
 						if derr := ss.Delete(ctx, ch.File); derr == nil {
 							res.ChunksDeleted++
+						} else {
+							errs = append(errs, fmt.Errorf("delete %q: %w", segQualify(seg.Dir, ch.File), derr))
 						}
 					}
 				}
 			}
 			res.Pruned = append(res.Pruned, segQualify(seg.Dir, ip))
 			if !dryRun {
-				_ = ss.Delete(ctx, ip)
+				if err := retireManifest(ctx, ss, ip, false); err != nil {
+					errs = append(errs, err)
+				}
 			}
 		}
 		res.SegmentsDropped++
 	}
+	return errors.Join(errs...)
 }
 
 // keepsChainIdentity reports whether seg's full manifest IS the
@@ -658,24 +723,44 @@ func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.
 // keep-it-when rule is one future encryption mode or one future reader
 // away from the same outage, and nobody notices until a restore.
 //
-// What survives is safe by construction, for the same reason the
-// compaction side is: the post-prune catalog never names it, and the one
-// reader that could reach it without the catalog
-// ([lineage.ResolveLineage]'s legacy single-segment synthesis, used only
-// when lineage.json is ABSENT) refuses loudly the moment it sees a
-// `seg-*` directory — and a prune that drops a whole segment is by
-// definition operating on a multi-segment (rotated) chain, which always
-// has one.
+// What survives is an identity HEADER, not a restorable manifest — and
+// that distinction is only safe while every reader agrees on it. The
+// previous version of this comment said it was "safe by construction"
+// because the post-prune catalog never names the file and the one reader
+// that could reach it without the catalog ([lineage.ResolveLineage]'s
+// legacy single-segment synthesis) refuses on sight of a `seg-*` dir. That
+// enumeration was ONE reader short, and had been since it was written:
+// [Restore.Run]'s single-manifest path also resolves this file by
+// convention, and on the prune-to-floor shape it was handed the retired
+// root while `backup verify` walked the catalog floor (audit B-6). The
+// claim was true when written, nothing checked it, and it stopped being
+// true one dispatch predicate away.
+//
+// So the enumeration is DERIVED now, not asserted:
+// TestRootManifestReaderRoster walks the source of every package that reads
+// a manifest at the lineage root by convention and requires each call site
+// to be classified — identity-only, or catalog-dispatched — with a reason.
+// A new reader of this file fails the build until it says which it is.
+// [retireManifest] closes the other half: the retired root keeps its body
+// and loses its SIGNATURE, so nothing reports a green signature check over
+// a manifest that has left the chain (audit C-8).
 func keepsChainIdentity(seg *lineage.Segment) bool {
 	return seg.Dir == "" && seg.FullManifestPath == lineage.ManifestFileName
 }
 
 // pruneFloorLeadingIncrementals physically deletes the first
-// keepFromInSeg incrementals (+ their change chunks) of the floor
-// segment — the incrementals older than the retained window whose full
-// is kept as the restore base. Records dropped paths + chunk-delete
-// count on res; DryRun records without deleting.
-func pruneFloorLeadingIncrementals(ctx context.Context, floor *lineage.Segment, floorStore irbackup.Store, keepFromInSeg int, dryRun bool, res *PruneResult) {
+// keepFromInSeg incrementals (+ their change chunks and their `.sig`
+// siblings) of the floor segment — the incrementals older than the
+// retained window whose full is kept as the restore base. Records dropped
+// paths + chunk-delete count on res; DryRun records without deleting.
+// Per-file delete failures are collected and returned joined (audit F-8).
+//
+// This is the path a SINGLE-segment signed chain takes when a
+// `--keep-duration` cutoff older than the whole chain retires every
+// incremental: the floor keeps its full, and each retired incremental's
+// signature used to survive it.
+func pruneFloorLeadingIncrementals(ctx context.Context, floor *lineage.Segment, floorStore irbackup.Store, keepFromInSeg int, dryRun bool, res *PruneResult) error {
+	var errs []error
 	for ii := 0; ii < keepFromInSeg; ii++ {
 		ip := floor.Incrementals[ii]
 		if im, err := lineage.ReadManifestAt(ctx, floorStore, ip); err == nil {
@@ -683,15 +768,20 @@ func pruneFloorLeadingIncrementals(ctx context.Context, floor *lineage.Segment, 
 				if !dryRun {
 					if derr := floorStore.Delete(ctx, ch.File); derr == nil {
 						res.ChunksDeleted++
+					} else {
+						errs = append(errs, fmt.Errorf("delete %q: %w", segQualify(floor.Dir, ch.File), derr))
 					}
 				}
 			}
 		}
 		res.Pruned = append(res.Pruned, segQualify(floor.Dir, ip))
 		if !dryRun {
-			_ = floorStore.Delete(ctx, ip)
+			if err := retireManifest(ctx, floorStore, ip, false); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // r0 is the "nothing to prune" early return: report the full kept set
