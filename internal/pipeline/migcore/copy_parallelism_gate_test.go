@@ -58,10 +58,17 @@ func TestCopyParallelismGate_AcquireHonoursCtx(t *testing.T) {
 	}
 }
 
-// TestCopyParallelismGate_ShrinkRetiresTokens pins the multiplicative
-// shrink: a 53300 halves the effective cap, and finishing workers swallow
-// the retired tokens so the live pool drains to the new cap.
-func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
+// TestCopyParallelismGate_ShrinkTakesEffectImmediately pins the
+// multiplicative shrink: a 53300 halves the cap, and the new cap binds the
+// very next acquire.
+//
+// This replaces TestCopyParallelismGate_ShrinkRetiresTokens, which pinned
+// the retire-counter mechanism the Bug 228 fix deleted. The OBSERVABLE
+// contract is stronger now and the test says so: under the old lazy
+// retirement a shrink to 2 still admitted workers up to the ORIGINAL
+// capacity until enough releases had been swallowed, so the cap the log
+// line announced was not the cap in force. It is now.
+func TestCopyParallelismGate_ShrinkTakesEffectImmediately(t *testing.T) {
 	// Zero-delay policy so the test never actually sleeps.
 	p := CopyBackoffPolicy{MaxRetries: 10, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
 	g := NewCopyParallelismGate(4, p)
@@ -74,45 +81,13 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 	if _, err := g.ShrinkAndBackoff(ctx, 1); err != nil {
 		t.Fatalf("shrinkAndBackoff: %v", err)
 	}
-
-	g.mu.Lock()
-	gotEff, gotRetire := g.effective, g.retire
-	g.mu.Unlock()
-	if gotEff != 2 {
-		t.Errorf("effective after shrink = %d, want 2", gotEff)
-	}
-	// prev=4, next=2 → retire 2 tokens.
-	if gotRetire != 2 {
-		t.Errorf("retire after shrink = %d, want 2", gotRetire)
+	if got := g.Effective(); got != 2 {
+		t.Errorf("effective after shrink = %d, want 2", got)
 	}
 
-	// The 3 not-yet-held tokens are still in the channel. As workers
-	// finish, the first `retire` releases swallow tokens. Drain the
-	// channel after the retirements settle and confirm the live capacity
-	// is the new cap (2) minus the one this test still holds = 1 free.
-	// Simulate: 3 peers each acquire then release.
-	for i := 0; i < 3; i++ {
-		if err := g.Acquire(ctx); err != nil {
-			t.Fatalf("peer acquire %d: %v", i, err)
-		}
-	}
-	// Now 0 tokens free (held: this test's 1 + 3 peers = 4 acquired, but
-	// 0 retired yet because nobody released). Release the 3 peers: the
-	// first 2 releases are swallowed (retire 2→0), the 3rd returns a real
-	// token.
-	for i := 0; i < 3; i++ {
-		g.Release()
-	}
-	g.mu.Lock()
-	if g.retire != 0 {
-		t.Errorf("retire after 3 releases = %d, want 0 (2 swallowed)", g.retire)
-	}
-	g.mu.Unlock()
-
-	// Exactly one token should now be free (the 3rd release). A second
-	// acquire must block.
+	// Cap 2 with 1 held ⇒ exactly one more admission, then the gate blocks.
 	if err := g.Acquire(ctx); err != nil {
-		t.Fatalf("acquire the one surviving free token: %v", err)
+		t.Fatalf("second acquire under the shrunk cap: %v", err)
 	}
 	blocked := make(chan error, 1)
 	go func() {
@@ -121,7 +96,24 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 		blocked <- g.Acquire(c)
 	}()
 	if err := <-blocked; !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("after shrink to cap 2 with 2 held, extra acquire = %v, want DeadlineExceeded (no free tokens)", err)
+		t.Errorf("after shrink to cap 2 with 2 held, a third acquire = %v, want DeadlineExceeded", err)
+	}
+
+	// Releasing frees the slots back up to the shrunk cap — and no further.
+	g.Release()
+	g.Release()
+	for i := range 2 {
+		if err := g.Acquire(ctx); err != nil {
+			t.Fatalf("post-release acquire %d under cap 2: %v", i, err)
+		}
+	}
+	go func() {
+		c, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		blocked <- g.Acquire(c)
+	}()
+	if err := <-blocked; !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the shrunk cap stopped being enforced after a release cycle: %v", err)
 	}
 }
 

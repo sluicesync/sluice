@@ -5,23 +5,31 @@
 // (audit 2026-08-01 P1, which reported that the gate "can permanently deadlock
 // migrate after two connection-slot shrinks, silently, with no error").
 //
-// These exist to ATTEMPT that deadlock rather than to argue about it. A shrink
-// does not hand a token back — it retires one, meaning some future Release
-// swallows its token instead of returning it — so the accounting is easy to
-// get wrong in the direction that starves the pool, and a starved pool is
-// exactly the reported failure: every worker blocked in Acquire, no error, no
-// give-up, because the code that gives up only runs on a slot-exhaustion the
-// blocked workers can never reach.
+// These exist to ATTEMPT that deadlock rather than to argue about it: a
+// starved pool is exactly the reported failure — every worker blocked in
+// Acquire, no error, no give-up, because the code that gives up only runs on a
+// slot-exhaustion the blocked workers can never reach.
 //
-// The invariant the implementation actually maintains is:
+// SCOPE, stated because getting this wrong is what let Bug 228 ship: every
+// test in this file exercises the CHUNK token class only. That was the audit
+// finding's own framing, and it is not the whole gate. Under the ADR-0123
+// run-wide gate a table-pool worker also holds a long-lived BASE token while
+// blocked on the chunks, and the deadlock the audit predicted turned out to be
+// real in exactly that shape — three months later, in the field, as Bug 228.
+// These tests were green against the binary that hung. They were not wrong;
+// they were narrower than their names suggested, which is the more expensive
+// failure. The base class is covered in copy_parallelism_gate_bug228_test.go.
 //
-//	physical tokens == effective + retire-pending,   effective >= 1
+// The invariant now under test, post-Bug-228 (the "retire" counter these were
+// originally written against no longer exists):
 //
-// A shrink moves d from effective into retire, and a swallowing Release moves
-// one out of retire and destroys one physical token — so physical never falls
-// below effective, and effective is floored at 1. That is the property under
-// test. If it holds, the reported deadlock cannot occur; if any future change
-// breaks it, these fail rather than a migration hanging in the field.
+//	held <= effective for every admission,   effective >= max(1, baseHeld+1)
+//
+// A shrink lowers the cap without revoking held tokens, so it admits nobody
+// new until releases catch up, and the floor guarantees a slot that a worker
+// able to finish on its own can take. If that holds, the reported deadlock
+// cannot occur; if a future change breaks it, these fail rather than a
+// migration hanging in the field.
 
 package migcore
 

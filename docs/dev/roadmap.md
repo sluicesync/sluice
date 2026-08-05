@@ -2332,7 +2332,7 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 **Gotcha for whoever takes it.** The writer is chosen by the ENGINE FLAVOR (`ir.BulkLoadLoadDataInfile` in `flavor.go`), not by an operator flag — there is no way for an operator to opt into the retryable batched writer on a vanilla MySQL target today. If chunking proves expensive, exposing that choice is the cheaper interim.
 
 
-### 113. The incremental schema diff never compares CHECK constraints or foreign keys, so a mid-window `ADD CHECK` is not skipped — it is never recorded (found 2026-08-01 while fixing the retype-delta skip) — *OPEN*
+### 113. The incremental schema diff never compares CHECK constraints or foreign keys, so a mid-window `ADD CHECK` is not skipped — it is never recorded (found 2026-08-01 while fixing the retype-delta skip) — *✅ FIXED on `main` 2026-08-05; unreleased. BEHAVIOUR CHANGE: a chain whose window carries an ADD CHECK or any FK DDL now REFUSES loudly at replay (SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED, remedy: fresh full) where it previously exited 0 having silently restored a target missing the constraint. Same posture column-dropped already took; needs a release note.*
 
 **Why.** Item A5's fix (`9d373be6`) turned `tablesEqual` into a registry of structural aspects so no delta shape can reach a silent `continue`, and gated it so a new comparator forces a written disposition. That closes the *disposition* hole. It does not close a **coverage** hole one level up: `tablesEqual` never compared `CheckConstraints` or foreign keys at all, so those changes produce **no delta to dispose of**.
 

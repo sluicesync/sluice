@@ -91,10 +91,18 @@ func TestAcquireChunkConn_RetriesOnSlotExhaustionThenSucceeds(t *testing.T) {
 	if got := atomic.LoadInt32(&eng.readerOpens); got != 3 {
 		t.Errorf("reader opens = %d, want 3 (2 failed + 1 success)", got)
 	}
-	// Parallelism shrank twice (4→2→1) across the two retries.
+	// Parallelism shrank twice (4→2→1) across the two retries, and then the
+	// open that SUCCEEDED handed one unit back (the Bug 228 additive
+	// increase, wired in acquireChunkConn). Both halves are pinned here
+	// because this is the only place the pipeline-layer wiring of either is
+	// observable: drop the gate.NoteOpenSucceeded() call and this reads 1;
+	// drop the shrink and it reads 4.
 	eff := gate.Effective()
-	if eff != 1 {
-		t.Errorf("effective parallelism after 2 shrinks = %d, want 1", eff)
+	if eff != 2 {
+		t.Errorf("effective parallelism = %d, want 2 — two shrinks (4→2→1) followed by one "+
+			"proven-good open recovering a single unit.\n\nIf this is 1, acquireChunkConn is no "+
+			"longer reporting the successful open to the gate and a copy that survives a TRANSIENT "+
+			"shortage will crawl at the floor for the rest of the run (Bug 228, recovery half).", eff)
 	}
 }
 
