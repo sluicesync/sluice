@@ -6,6 +6,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -107,15 +108,55 @@ func (e Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
 			return false, nil
 		}
 		if pp.File != ap.File {
-			// Binlog filenames sort lexically in rotation order
-			// (mysql-bin.000001 < mysql-bin.000002 < …); the fixed
-			// zero-padded width makes string comparison correct.
-			return pp.File > ap.File, nil
+			return binlogFileAfter(pp.File, ap.File), nil
 		}
 		return pp.Pos >= ap.Pos, nil
 	default:
 		return false, fmt.Errorf("mysql: position-orderer: unsupported position mode %q", pp.Mode)
 	}
+}
+
+// binlogFileAfter reports whether binlog file a rotates strictly after b.
+//
+// # Why this is not a string comparison (audit 2026-08-05 C-13)
+//
+// It used to be, behind the comment "the fixed zero-padded width makes string
+// comparison correct". The width is NOT fixed. MySQL pads the rotation
+// sequence to six digits and then simply grows it: `mysql-bin.999999` is
+// followed by `mysql-bin.1000000`. Lexically `"1000000" < "999999"`, because
+// '1' < '9' — so across that one boundary the comparison answers BACKWARDS,
+// and a position-ordering predicate that answers backwards is how a resume
+// decides a newer position is older.
+//
+// The premise was true for the first 999999 files of any server's life, which
+// is precisely why it reads as safe and why nothing catches it.
+//
+// Compares the basename lexically (it only changes if `log_bin_basename`
+// changes, which is a different-lineage condition the ServerUUID check above
+// already owns) and the rotation suffix NUMERICALLY. Anything that does not
+// split into basename + all-digit suffix falls back to the lexical compare —
+// no worse than before for a shape neither of us can order.
+func binlogFileAfter(a, b string) bool {
+	aBase, aSeq, aOK := splitBinlogName(a)
+	bBase, bSeq, bOK := splitBinlogName(b)
+	if !aOK || !bOK || aBase != bBase {
+		return a > b
+	}
+	return aSeq > bSeq
+}
+
+// splitBinlogName splits "mysql-bin.000123" into ("mysql-bin", 123, true).
+// Reports false when there is no dot-separated all-digit suffix.
+func splitBinlogName(name string) (base string, seq uint64, ok bool) {
+	i := strings.LastIndex(name, ".")
+	if i < 0 || i == len(name)-1 {
+		return "", 0, false
+	}
+	seq, err := strconv.ParseUint(name[i+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return name[:i], seq, true
 }
 
 // gtidAtOrAfter reports whether GTID set p is at or after anchor —

@@ -120,6 +120,66 @@ func TestAttrs(t *testing.T) {
 	}
 }
 
+// TestRegistryDocSync_TableIsContiguous is the RENDERING gate (audit
+// 2026-08-05 C-15). A single blank line inside a GitHub-flavoured Markdown
+// table ends the table: every row after it renders as raw pipe-delimited text.
+// One had crept in after row 28, so 48 of the 74 documented codes were
+// unreadable on the published docs — and BOTH existing doc gates stayed green,
+// because each parses the file LINE BY LINE and never asks whether the lines
+// form one table.
+//
+// That is the "gate narrower than its name" shape: two checks named for
+// doc/registry synchronisation, neither of which could see that the document
+// was broken. This asserts the property the other two assume — every
+// registered code's row lives in the SAME uninterrupted block as the header.
+func TestRegistryDocSync_TableIsContiguous(t *testing.T) {
+	docPath := filepath.Join("..", "..", "docs", "operator", "error-codes.md")
+	raw, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", docPath, err)
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+
+	start := -1
+	for i, l := range lines {
+		if strings.HasPrefix(l, "| Code | Class | Meaning | Remedy |") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatal("could not find the error-code table header — this gate is vacuous; fix the locator")
+	}
+	end := start
+	for end+1 < len(lines) && strings.HasPrefix(lines[end+1], "|") {
+		end++
+	}
+	inTable := map[Code]bool{}
+	codeRe := regexp.MustCompile(`^\| ` + "`" + `(SLUICE-E-[A-Z0-9-]+)` + "`")
+	for _, l := range lines[start : end+1] {
+		if m := codeRe.FindStringSubmatch(l); m != nil {
+			inTable[Code(m[1])] = true
+		}
+	}
+
+	if len(inTable) == 0 {
+		t.Fatal("found no code rows in the table block — the locator no longer matches the doc")
+	}
+	var stranded []string
+	for _, c := range All() {
+		if !inTable[c] {
+			stranded = append(stranded, string(c))
+		}
+	}
+	if len(stranded) > 0 {
+		t.Errorf("%d of %d registered codes sit OUTSIDE the contiguous table block that begins at "+
+			"line %d and ends at line %d: %v\n\n"+
+			"A blank line inside a GFM table ends it, so every row past the break renders as raw "+
+			"text on the published docs. The other doc gates parse line-by-line and cannot see this.",
+			len(stranded), len(All()), start+1, end+1, stranded)
+	}
+}
+
 // TestRegistryDocSync enforces the docs/operator/error-codes.md table
 // against the registry IN BOTH DIRECTIONS: every registered code has a
 // doc row, and every SLUICE-E-… token in the doc is a registered code.

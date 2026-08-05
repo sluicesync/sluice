@@ -48,19 +48,18 @@ if ! sh scripts/check-tree-hygiene.sh; then
 	exit 1
 fi
 
-# Only run Go checks if Go files are staged. Lets non-code commits
-# (docs, CI config, etc.) skip the slow steps.
-if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.go$'; then
-	green "pre-commit: no Go files staged, skipping checks"
-	exit 0
-fi
-
-echo "pre-commit: running gofumpt check, go vet, and tests..."
-
 # ---- NUL-byte guard on staged text files ----
 # AI-tooling parameter layers decode a literal backslash-u-0000 sequence
 # into a real NUL byte; this has reached committed docs 4x (2026-07-16).
 # A NUL in a text file flips grep/ripgrep into binary mode repo-wide.
+#
+# Deliberately ABOVE the "no Go files staged" early return, for the same
+# reason check-tree-hygiene is (audit 2026-08-05 C-16): every incident this
+# guard names happened in a MARKDOWN file, and a docs-only commit is exactly
+# the shape that used to skip it. CI skips docs-only pushes too, so this hook
+# was the only thing standing in that path — and it was standing in the wrong
+# place. A guard whose motivating incidents are all in the class it cannot
+# see is worse than none, because its presence reads as coverage.
 nul_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
 	[ -f "$f" ] && LC_ALL=C grep -qP '\x00' "$f" && echo "$f"
 done)
@@ -77,6 +76,7 @@ fi
 # and skips other lines, so a leftover "<<<<<<< HEAD" rode a green gate.
 # Match a line-start marker followed by a space or EOL (the real conflict
 # shape), so prose/underlines like "=======" in a NOTICE don't false-fire.
+# Above the early return for the same reason as the NUL guard.
 conflict_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
 	[ -f "$f" ] && grep -Eq '^(<{7}|>{7}) |^<{7}$|^>{7}$' "$f" && echo "$f"
 done)
@@ -86,6 +86,16 @@ if [ -n "$conflict_hits" ]; then
 	echo "Finish resolving the conflict before committing."
 	exit 1
 fi
+
+# Only run Go checks if Go files are staged. Lets non-code commits
+# (docs, CI config, etc.) skip the slow steps. Everything ABOVE this line
+# is text-shaped and applies to every commit.
+if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.go$'; then
+	green "pre-commit: no Go files staged, skipping Go checks"
+	exit 0
+fi
+
+echo "pre-commit: running gofumpt check, go vet, and tests..."
 
 # ---- gofumpt ----
 if ! command -v gofumpt >/dev/null 2>&1; then

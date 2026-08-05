@@ -2377,6 +2377,27 @@ func openReplicationConn(ctx context.Context, dsn, appID string) (*pgconn.PgConn
 		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("postgres: pin extra_float_digits on replication conn: %w", err)
 	}
+	// Pin bytea text rendering to hex, for exactly the reason above and on
+	// exactly the same wire path (audit 2026-08-05 B-1; ground-truthed on a
+	// real PG 16 with an escape-format tuple observed on the wire).
+	//
+	// pgoutput renders bytea with the WALSENDER's `bytea_output`, inherited
+	// from the server/database/role default. sluice's decoder recognises the
+	// PG-default `\x`-prefixed hex and copies anything else verbatim — so on a
+	// server set to the legacy `bytea_output = escape`, every streamed bytea
+	// row stores the escape-format ASCII text as the target's bytes. Silent
+	// corruption on every CDC bytea value, with nothing in the stream to
+	// suggest it.
+	//
+	// The fix belongs HERE rather than in the decoder: making the wire format
+	// deterministic removes the ambiguity instead of teaching the decoder to
+	// guess between two renderings (which is the B-2 hazard next door — a raw
+	// value that merely LOOKS like `\x`+hex). One line, same session, same
+	// justification as the float pin it sits beside.
+	if _, err := conn.Exec(ctx, "SET bytea_output = hex").ReadAll(); err != nil {
+		_ = conn.Close(ctx)
+		return nil, fmt.Errorf("postgres: pin bytea_output on replication conn: %w", err)
+	}
 	return conn, nil
 }
 

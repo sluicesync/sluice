@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -354,14 +355,43 @@ func decodeBytes(raw any) (any, error) {
 // string input (some driver configs surface BIT as text) is parsed
 // the same way. n is the column's declared bit width. NULL is
 // handled by the caller (decodeValue) before reaching here.
+// The BINLOG arm is int64, and its absence killed CDC outright (audit
+// 2026-08-05 B-3). go-mysql's own row_event.go documents
+// `MYSQL_TYPE_BIT: int64` — the binlog decoder hands BIT up as an integer, not
+// as the ceil(N/8) byte slice the row reader delivers. With only the []byte and
+// string arms, the FIRST change touching a BIT(N>1) column failed
+// "cannot decode int64 as Bit" and took the sync down — loud and deterministic,
+// but only after the cold copy had already succeeded, which is the worst moment
+// to discover an unsupported type.
+//
+// BIT(1) escaped because the type mapper renders it as ir.Boolean, so it never
+// reaches here. That is why this survived: the one width anybody tests was the
+// one width immune to it.
+//
+// This is the unswept third sibling of the Bug 145/148 ENUM/SET int64 arms —
+// same wire path, same driver, same shape of omission. The family matrix now
+// carries the binlog row for all three.
 func decodeBit(raw any, n int) (any, error) {
 	switch v := raw.(type) {
 	case []byte:
 		return ir.BitBytesToString(v, n), nil
 	case string:
 		return ir.BitBytesToString([]byte(v), n), nil
+	case int64:
+		return ir.BitBytesToString(bitUint64Bytes(uint64(v)), n), nil
+	case uint64:
+		return ir.BitBytesToString(bitUint64Bytes(v), n), nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as Bit", raw)
+}
+
+// bitUint64Bytes renders v as the 8-byte big-endian, right-justified buffer
+// [ir.BitBytesToString] expects. MySQL caps BIT at 64 bits, so 8 bytes always
+// covers the declared width and the helper indexes from the tail.
+func bitUint64Bytes(v uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	return b[:]
 }
 
 // decodeMySQLGeometry strips MySQL's 4-byte little-endian SRID prefix
