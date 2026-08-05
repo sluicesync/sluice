@@ -30,6 +30,13 @@
 //	Postgres target  index prefix length         MySQL src  → refuse
 //	SQLite target    index prefix length         MySQL src  → refuse
 //
+// The SQLite pair carries a fourth row added later, for roadmap item 120: the
+// prefix on the PRIMARY KEY rather than on a secondary index. That one was not
+// a timing defect at all — SQLite's table-level PRIMARY KEY clause dropped the
+// prefix and migrated SILENTLY, so the assertion it needs from this harness is
+// the refusal itself, with the target-state check confirming the new refusal
+// still lands before anything is created.
+//
 // Each pair also carries its CONTROL — the same attribute on a NON-unique
 // index, which changes cost and not which rows are legal and must still
 // migrate, rows and all. The control is the half that matters most here: an
@@ -348,6 +355,71 @@ func TestMigrate_IndexPreflight_MySQLToSQLite_PrefixUnique(t *testing.T) {
 		}
 		if n != 2 {
 			t.Errorf("sq_prefixlog row count on the target = %d; want 2", n)
+		}
+	})
+
+	// Roadmap item 120. The same unrepresentable attribute on the PRIMARY KEY
+	// instead of a secondary index — the arm that had NO refusal at all, on
+	// either engine or in the preflight, and migrated at exit 0 with the key
+	// silently widened. The MySQL DDL below is also the ground truth for the
+	// premise the fix rests on: that a real MySQL accepts a prefix in a PK.
+	t.Run("prefixed PRIMARY KEY is refused, not silently widened", func(t *testing.T) {
+		applyMySQLDDL(t, mysqlSource, `
+			DROP TABLE IF EXISTS sq_prefixed, sq_prefixlog;
+			CREATE TABLE sq_pkprefix (
+				email VARCHAR(255) NOT NULL,
+				id    BIGINT NOT NULL,
+				PRIMARY KEY (email(20), id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO sq_pkprefix (email, id) VALUES ('a@example.com', 1), ('b@example.com', 2);
+		`)
+
+		dst := filepath.Join(t.TempDir(), "item120-refused.db")
+		mig := &Migrator{
+			Source: mysqlEng, Target: sqliteEng,
+			SourceDSN: mysqlSource, TargetDSN: dst,
+			MigrationID: "item120-mysql-to-sqlite-prefixed-pk",
+		}
+		err := mig.Run(ctx2min(t))
+		requireRefusalBeforeAnyDataMoved(t, err,
+			[]string{"primary key", "email", "20", "substr("},
+			sqliteHasTable(dst, "sq_pkprefix"))
+	})
+
+	// The control for the arm above: a composite PRIMARY KEY with NO prefix is
+	// the ordinary shape and must still migrate. An over-refusal here would
+	// break every MySQL→SQLite migration with a composite key.
+	t.Run("unprefixed composite PRIMARY KEY still migrates, rows and all", func(t *testing.T) {
+		applyMySQLDDL(t, mysqlSource, `
+			DROP TABLE IF EXISTS sq_prefixed, sq_prefixlog, sq_pkprefix;
+			CREATE TABLE sq_pkplain (
+				email VARCHAR(255) NOT NULL,
+				id    BIGINT NOT NULL,
+				PRIMARY KEY (email, id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO sq_pkplain (email, id) VALUES ('a@example.com', 1), ('b@example.com', 2);
+		`)
+
+		dst := filepath.Join(t.TempDir(), "item120-allowed.db")
+		mig := &Migrator{
+			Source: mysqlEng, Target: sqliteEng,
+			SourceDSN: mysqlSource, TargetDSN: dst,
+			MigrationID: "item120-mysql-to-sqlite-plain-pk",
+		}
+		if err := mig.Run(ctx2min(t)); err != nil {
+			t.Fatalf("a composite PRIMARY KEY without a prefix must still migrate to SQLite: %v", err)
+		}
+		db, err := sql.Open("sqlite", dst)
+		if err != nil {
+			t.Fatalf("open sqlite target: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sq_pkplain`).Scan(&n); err != nil {
+			t.Fatalf("count sq_pkplain on the target: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("sq_pkplain row count on the target = %d; want 2", n)
 		}
 	})
 }

@@ -5,6 +5,7 @@ package sqlite
 
 import (
 	"errors"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -26,24 +27,28 @@ var _ ir.IndexEmitPreflighter = Engine{}
 // the whole table had been copied.
 //
 // SQLite's one unrepresentable index attribute is a MySQL PREFIX LENGTH on a
-// UNIQUE index: SQLite has no prefix-index feature, so the widened key ADMITS
-// rows the source rejects. A partial predicate is NOT a member — SQLite has
-// real partial indexes and emits the `WHERE` verbatim. The method delegates
-// to [refuseUnrepresentablePrefix], the refusal half of the same check
-// [emitCreateIndex] calls, so the early answer and the late one cannot drift.
+// key that enforces uniqueness — a UNIQUE index or the PRIMARY KEY: SQLite has
+// no prefix-index feature, so the widened key ADMITS rows the source rejects. A
+// partial predicate is NOT a member — SQLite has real partial indexes and emits
+// the `WHERE` verbatim. The method delegates to [refuseUnrepresentablePrefix],
+// the refusal half of the check both emit sites call, so the early answer and
+// the late one cannot drift.
 //
-// # Which indexes it reaches
+// # Which keys it reaches, and with which uniqueness verdict
 //
-// Every entry of table.Indexes — exactly the set [SchemaWriter.CreateIndexes]
-// walks, with no skip set on this engine.
+// The two SQLite key-emitting sites and what this walk pairs with each:
 //
-// table.PrimaryKey is deliberately NOT walked, and the reason is a gap rather
-// than a proof: SQLite's table-level PRIMARY KEY clause renders through
-// [quoteIndexColumnList], which has never consulted the prefix length, so a
-// prefixed composite PK is silently widened TODAY at emit time. Walking it
-// here would make this preflight refuse a shape the run currently accepts,
-// which is a different change from moving a refusal earlier. Filed rather
-// than folded in; see roadmap item 118's follow-up note.
+//	table-level PRIMARY KEY   table.PrimaryKey, always [primaryKeyKey]
+//	CREATE INDEX              table.Indexes, kind from idx.Unique
+//
+// So the walk is table.PrimaryKey plus every table.Indexes entry — the latter
+// exactly the set [SchemaWriter.CreateIndexes] walks, with no skip set on this
+// engine.
+//
+// The PRIMARY KEY arm landed later than the rest (roadmap item 120): until the
+// emitter refused a prefixed PK, walking it here would have refused a shape the
+// run accepted — it accepted it by SILENTLY WIDENING the key, which is why the
+// two had to move together and why the emitter moved first.
 func (Engine) PreflightIndexes(s *ir.Schema) error {
 	if s == nil {
 		return errors.New("sqlite: PreflightIndexes: schema is nil")
@@ -52,8 +57,18 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 		if table == nil {
 			continue
 		}
+		if pk := table.PrimaryKey; pk != nil {
+			where := "sqlite: primary key on " + table.Name
+			if err := refuseUnrepresentablePrefix(pk.Columns, where, primaryKeyKey); err != nil {
+				return err
+			}
+		}
 		for _, idx := range table.Indexes {
-			if err := refuseUnrepresentablePrefix(idx, "sqlite: table "+table.Name); err != nil {
+			if idx == nil {
+				continue
+			}
+			where := fmt.Sprintf("sqlite: index %q on table %s", idx.Name, table.Name)
+			if err := refuseUnrepresentablePrefix(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 				return err
 			}
 		}

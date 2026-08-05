@@ -376,6 +376,26 @@ func emitTableDef(table *ir.Table) (string, error) {
 	// A composite or non-integer PK uses a table-level PRIMARY KEY clause.
 	inlinePKCol := soleIntegerPKColumn(table)
 
+	// A PRIMARY KEY column carrying a MySQL prefix length is unrepresentable
+	// here, and dropping the prefix WEAKENS the key — the target then admits
+	// rows the source rejects, silently, at exit 0 (roadmap item 120; the
+	// sibling of the secondary-index refusal in [checkIndexPrefixLength]).
+	//
+	// The check sits AHEAD of the inline/table-level branch on purpose. The
+	// inline rowid-alias form is only reached for an INTEGER column and MySQL
+	// rejects a prefix on an integer key (errno 1089) — but that is a premise
+	// about the SOURCE, not a property of this emitter, so neither rendering
+	// gets to depend on it. enforcesUniqueness is true unconditionally: a
+	// PRIMARY KEY constrains the data by definition, and pk.Unique is NOT a
+	// reliable stand-in (the CDC readers build a PrimaryKey with it unset).
+	if table.PrimaryKey != nil {
+		if err := refuseUnrepresentablePrefix(
+			table.PrimaryKey.Columns, "sqlite: primary key on "+table.Name, primaryKeyKey,
+		); err != nil {
+			return "", err
+		}
+	}
+
 	parts := make([]string, 0, len(table.Columns)+len(table.CheckConstraints)+len(table.ForeignKeys)+2)
 	for _, col := range table.Columns {
 		def, err := emitColumnDef(col, col.Name == inlinePKCol)
@@ -474,7 +494,8 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 	if len(idx.Columns) == 0 {
 		return "", fmt.Errorf("sqlite: emitCreateIndex: index %q has no columns", idx.Name)
 	}
-	if err := checkIndexPrefixLength(idx, "sqlite: table "+tableName); err != nil {
+	where := fmt.Sprintf("sqlite: index %q on table %s", idx.Name, tableName)
+	if err := checkIndexPrefixLength(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 		return "", err
 	}
 
@@ -529,6 +550,11 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 // quoteIndexColumnList is the plain-column form used for the table-level
 // PRIMARY KEY clause (PK columns are always real columns, never
 // expressions, in the IR).
+//
+// It drops IndexColumn.Length, which is correct ONLY because [emitTableDef]
+// has already refused a prefixed PRIMARY KEY outright (roadmap item 120).
+// Until that refusal existed this function silently widened the key — the
+// prefix vanished here and nothing else looked at it.
 func quoteIndexColumnList(cols []ir.IndexColumn) string {
 	names := make([]string, len(cols))
 	for i, c := range cols {
@@ -577,14 +603,11 @@ func quoteSQLString(s string) string {
 // The rewrite named in the refusal works because SQLite indexes may be built
 // over expressions: `CREATE UNIQUE INDEX u ON t (substr(email, 1, 20))`
 // reproduces the source's semantics exactly.
-func checkIndexPrefixLength(idx *ir.Index, where string) error {
-	if err := refuseUnrepresentablePrefix(idx, where); err != nil {
+func checkIndexPrefixLength(cols []ir.IndexColumn, where string, kind keyKind) error {
+	if err := refuseUnrepresentablePrefix(cols, where, kind); err != nil {
 		return err
 	}
-	if idx == nil {
-		return nil
-	}
-	for _, c := range idx.Columns {
+	for _, c := range cols {
 		if c.Length <= 0 || c.Expression != "" {
 			continue
 		}
@@ -592,7 +615,6 @@ func checkIndexPrefixLength(idx *ir.Index, where string) error {
 			"index prefix length dropped: SQLite has no prefix-length equivalent, so this index covers the "+
 				"whole column. This changes the index's size and performance, not which rows are legal",
 			slog.String("context", where),
-			slog.String("index", idx.Name),
 			slog.String("column", c.Column),
 			slog.Int("source_prefix_length", c.Length),
 		)
@@ -610,25 +632,82 @@ func checkIndexPrefixLength(idx *ir.Index, where string) error {
 // what the emitter actually did, so it belongs at the emitter, once. The
 // refusal text lives here and nowhere else, which is what keeps the early
 // answer and the late one from drifting apart.
-func refuseUnrepresentablePrefix(idx *ir.Index, where string) error {
-	if idx == nil || !idx.Unique {
+//
+// It takes a COLUMN LIST and a [keyKind] rather than an *ir.Index because
+// SQLite has two key-emitting sites and only one of them has an [ir.Index]
+// to hand: the table-level PRIMARY KEY clause in [emitTableDef] is the other
+// (roadmap item 120). Postgres's function of the same name took the same
+// shape for the same reason.
+func refuseUnrepresentablePrefix(cols []ir.IndexColumn, where string, kind keyKind) error {
+	if !kind.enforcesUniqueness() {
 		return nil
 	}
-	for _, c := range idx.Columns {
+	for _, c := range cols {
 		if c.Length <= 0 || c.Expression != "" {
 			continue
 		}
 		return fmt.Errorf(
-			"%s: index %q constrains column %q to its first %d characters, and SQLite has no "+
-				"prefix-length equivalent. On a key that enforces uniqueness the prefix is part of the "+
-				"CONSTRAINT: the source forbids two rows whose first %d characters of %q match, and a "+
-				"SQLite unique index over the whole column would ALLOW them — so the target would "+
-				"silently accept data the source rejects. Rewrite it as a unique index over an "+
-				"expression that reproduces the prefix (for example `substr(%s, 1, %d)`), widen it to "+
-				"the full column on the source if the prefix was only a size optimisation, or exclude "+
-				"the table",
-			where, idx.Name, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
+			"%s: column %q carries a %d-character key prefix, and SQLite has no prefix-length "+
+				"equivalent. On a key that enforces uniqueness the prefix is part of the CONSTRAINT: "+
+				"the source forbids two rows whose first %d characters of %q match, and a SQLite key "+
+				"over the whole column would ALLOW them — so the target would silently accept data the "+
+				"source rejects. %s",
+			where, c.Column, c.Length, c.Length, c.Column, kind.prefixRemedy(c),
 		)
 	}
 	return nil
+}
+
+// keyKind distinguishes the three keys a prefix length can ride into this
+// engine on. It decides both halves of the policy — whether the key
+// constrains the data at all, and what the operator can do about it — so
+// that neither is inferred from the message text.
+type keyKind int
+
+const (
+	nonUniqueIndexKey keyKind = iota // prefix is a size choice: dropped with a WARN
+	uniqueIndexKey                   // prefix is part of the constraint: refused
+	primaryKeyKey                    // ditto, with a different way forward
+)
+
+// indexKeyKind classifies a secondary index. A PRIMARY KEY never arrives
+// here — [emitTableDef] names [primaryKeyKey] directly, because ir.Index.Unique
+// is unset on the PrimaryKey the CDC readers build and must not be trusted
+// as the uniqueness signal for a key that enforces it by definition.
+func indexKeyKind(unique bool) keyKind {
+	if unique {
+		return uniqueIndexKey
+	}
+	return nonUniqueIndexKey
+}
+
+func (k keyKind) enforcesUniqueness() bool { return k != nonUniqueIndexKey }
+
+// prefixRemedy is the "way forward" half of [refuseUnrepresentablePrefix].
+// The two refusing kinds have genuinely different options, which is why the
+// refusal has one condition and two endings:
+//
+//   - A secondary index can be rebuilt over an expression, which reproduces
+//     the source's rule exactly: `CREATE UNIQUE INDEX u ON t (substr(email, 1, 20))`.
+//   - A PRIMARY KEY cannot. SQLite's table-level PRIMARY KEY clause takes
+//     column names, so the prefix has to leave the PK — either by widening it
+//     on the source or by keying the table on something else and reproducing
+//     the old rule as a unique expression index alongside.
+func (k keyKind) prefixRemedy(c ir.IndexColumn) string {
+	if k == primaryKeyKey {
+		return fmt.Sprintf(
+			"A SQLite PRIMARY KEY takes column names, so the prefix cannot move to an expression the "+
+				"way a secondary index can: widen the key to the whole column on the source if the "+
+				"prefix was only a size optimisation, key the table on something else and reproduce "+
+				"the source's rule with `CREATE UNIQUE INDEX ... (substr(%s, 1, %d))`, or exclude the "+
+				"table",
+			c.Column, c.Length,
+		)
+	}
+	return fmt.Sprintf(
+		"Rewrite it as a unique index over an expression that reproduces the prefix (for example "+
+			"`substr(%s, 1, %d)`), widen it to the full column on the source if the prefix was only a "+
+			"size optimisation, or exclude the table",
+		c.Column, c.Length,
+	)
 }

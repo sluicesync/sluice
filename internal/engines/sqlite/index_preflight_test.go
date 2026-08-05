@@ -147,44 +147,146 @@ func TestPreflightIndexesNilSafe(t *testing.T) {
 	}
 }
 
-// TestPreflightIndexesDoesNotWalkThePrimaryKey records a KNOWN GAP rather than
-// a proof, so that reading this file cannot leave the impression the PK is
-// covered.
+// The PRIMARY KEY half (roadmap item 120). SQLite's table-level PRIMARY KEY
+// clause renders through [quoteIndexColumnList], which never consulted
+// IndexColumn.Length — so a MySQL `PRIMARY KEY (email(20), id)` was SILENTLY
+// widened on a SQLite target: the source forbids two rows sharing the first 20
+// characters of email, the target admitted them, and nothing said so.
 //
-// SQLite's table-level PRIMARY KEY clause renders through
-// [quoteIndexColumnList], which has never consulted IndexColumn.Length — so a
-// MySQL composite PK like `PRIMARY KEY (email(20), id)` is silently widened on
-// a SQLite target TODAY, at emit time. That is a separate defect (a silent
-// constraint weakening at the emitter), not a timing one, and closing it here
-// would make this preflight refuse a shape the run currently accepts.
-//
-// The test asserts the CURRENT behaviour so the gap is visible and so whoever
-// fixes the emitter is told, by a failing test, to revisit the preflight in
-// the same pass.
-func TestPreflightIndexesDoesNotWalkThePrimaryKey(t *testing.T) {
-	tbl := &ir.Table{
+// The matrix is the same verdict-agreement shape as [sqliteIndexShapes], run
+// against [emitTableDef] instead of [emitCreateIndex]. It has to drive the
+// emitter and the preflight together because the two arms landed together: the
+// preflight could not refuse a prefixed PK while the emitter still accepted one.
+var sqlitePKShapes = []struct {
+	name        string
+	pk          *ir.Index
+	wantRefused bool
+}{
+	{
+		// The defect, in the shape a MySQL source produces: composite, so it
+		// takes the table-level clause.
+		name: "composite PRIMARY KEY with a prefix",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email", Length: 20}, {Column: "id"}},
+		},
+		wantRefused: true,
+	},
+	{
+		name: "composite PRIMARY KEY without a prefix",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email"}, {Column: "id"}},
+		},
+	},
+	{
+		// Single-column and non-integer, so it ALSO takes the table-level
+		// clause — the same rendering as the composite case, one column wide.
+		name: "single-column non-integer PRIMARY KEY with a prefix",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email", Length: 20}},
+		},
+		wantRefused: true,
+	},
+	{
+		// The rowid-alias path: a single INTEGER PK renders INLINE on the
+		// column and never reaches [quoteIndexColumnList]. The refusal sits
+		// ahead of that branch, so a (source-impossible, IR-expressible)
+		// prefix here is refused too rather than depending on MySQL's errno
+		// 1089 to keep it away.
+		name: "single-column INTEGER PRIMARY KEY (rowid alias) with a prefix",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "id", Length: 4}},
+		},
+		wantRefused: true,
+	},
+	{
+		name: "single-column INTEGER PRIMARY KEY (rowid alias), no prefix",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+	},
+	{
+		// Unique UNSET, which is what the MySQL and PG CDC readers build
+		// (`&ir.Index{Columns: pkCols}`). A PRIMARY KEY enforces uniqueness by
+		// definition, so the verdict must not consult that field — this row is
+		// what fails if someone passes pk.Unique instead of primaryKeyKey.
+		name: "prefixed PRIMARY KEY with ir.Index.Unique unset",
+		pk: &ir.Index{
+			Columns: []ir.IndexColumn{{Column: "email", Length: 20}, {Column: "id"}},
+		},
+		wantRefused: true,
+	},
+	{
+		// A Length riding an expression entry constrains no column prefix.
+		name: "PRIMARY KEY expression entry carrying a stray Length",
+		pk: &ir.Index{
+			Name: "PRIMARY", Unique: true,
+			Columns: []ir.IndexColumn{{Expression: "lower(email)", Length: 20}, {Column: "id"}},
+		},
+	},
+}
+
+func sqlitePKTable(pk *ir.Index) *ir.Table {
+	return &ir.Table{
 		Name: "users",
 		Columns: []*ir.Column{
 			{Name: "email", Type: ir.Varchar{Length: 255}},
 			{Name: "id", Type: ir.Integer{Width: 64}},
 		},
-		PrimaryKey: &ir.Index{
-			Name: "PRIMARY", Unique: true,
-			Columns: []ir.IndexColumn{{Column: "email", Length: 20}, {Column: "id"}},
-		},
+		PrimaryKey: pk,
 	}
-	stmt, emitErr := emitTableDef(tbl)
-	if emitErr != nil {
-		t.Fatalf("the EMITTER now refuses a prefixed PRIMARY KEY (%v).\n\n"+
-			"Good — that closes the silent widening this test documents. Now walk table.PrimaryKey in "+
-			"Engine.PreflightIndexes too, and delete this test in favour of a row in sqliteIndexShapes.",
-			emitErr)
+}
+
+func TestPreflightIndexesAgreesWithTheEmitterOnThePrimaryKey(t *testing.T) {
+	for _, tc := range sqlitePKShapes {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, emitErr := emitTableDef(sqlitePKTable(tc.pk))
+			preErr := (Engine{}).PreflightIndexes(&ir.Schema{Tables: []*ir.Table{sqlitePKTable(tc.pk)}})
+
+			if (emitErr != nil) != tc.wantRefused {
+				t.Fatalf("the EMITTER's verdict changed: refused=%v, want %v (%v)\nDDL: %s",
+					emitErr != nil, tc.wantRefused, emitErr, stmt)
+			}
+			if emitErr == nil && strings.Contains(stmt, "(20)") {
+				t.Fatalf("emitted MySQL prefix syntax into SQLite DDL: %q", stmt)
+			}
+			if (preErr != nil) != (emitErr != nil) {
+				if preErr != nil {
+					t.Fatalf("PreflightIndexes REFUSED a PRIMARY KEY the emitter accepts: %v\n\n"+
+						"An over-refusal breaks migrations that work today.", preErr)
+				}
+				t.Fatalf("PreflightIndexes accepted a PRIMARY KEY the emitter REFUSES (%v).\n\n"+
+					"The two must agree: whichever one is right, the operator should hear it before "+
+					"any DDL runs, not at CREATE TABLE.", emitErr)
+			}
+		})
 	}
-	if strings.Contains(stmt, "(20)") {
-		t.Fatalf("emitted MySQL prefix syntax into SQLite DDL: %q", stmt)
+}
+
+// The PK refusal must not be the index refusal with a different subject line:
+// a SQLite PRIMARY KEY takes column names, so "rewrite it as an expression
+// index" — true and useful for a secondary index — is not something the
+// operator can do to the key that is refused here.
+func TestPrimaryKeyRefusalNamesAPrimaryKeyRemedy(t *testing.T) {
+	pk := &ir.Index{
+		Name: "PRIMARY", Unique: true,
+		Columns: []ir.IndexColumn{{Column: "email", Length: 20}, {Column: "id"}},
 	}
-	if err := (Engine{}).PreflightIndexes(&ir.Schema{Tables: []*ir.Table{tbl}}); err != nil {
-		t.Fatalf("the preflight refused a prefixed PRIMARY KEY the emitter still accepts: %v\n\n"+
-			"That is an over-refusal — it breaks migrations that succeed today. Fix the emitter first.", err)
+	err := (Engine{}).PreflightIndexes(&ir.Schema{Tables: []*ir.Table{sqlitePKTable(pk)}})
+	if err == nil {
+		t.Fatal("a prefixed PRIMARY KEY passed the preflight")
+	}
+	for _, want := range []string{"users", "primary key", "email", "substr(", "20"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q — it must name the table, the KEY KIND, the column "+
+				"and a way forward.\ngot: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "Rewrite it as a unique index over an expression") {
+		t.Errorf("the PRIMARY KEY refusal offers the SECONDARY-INDEX remedy, which SQLite does not "+
+			"accept for a PK.\ngot: %v", err)
 	}
 }
