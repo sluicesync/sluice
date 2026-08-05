@@ -235,7 +235,7 @@ func TestEnvelope_DryRunMigratePlanGolden(t *testing.T) {
 		TargetEngine: "postgres",
 		Views:        1,
 		Tables: []pipeline.PlanTable{
-			{Name: "users", Columns: 3, PrimaryKey: true, SecondaryIndexes: 2, ForeignKeys: 0, RowCount: 7},
+			{Name: "users", Columns: 3, PrimaryKey: true, SecondaryIndexes: 2, ForeignKeys: 0, RowCount: 7, RowCountEstimated: true},
 		},
 	})
 	// Second sink call (multi-database fan-out) merges.
@@ -264,7 +264,8 @@ func TestEnvelope_DryRunMigratePlanGolden(t *testing.T) {
         "primary_key": true,
         "secondary_indexes": 2,
         "foreign_keys": 0,
-        "row_count": 7
+        "row_count": 7,
+        "row_count_estimated": true
       },
       {
         "name": "orders",
@@ -272,7 +273,8 @@ func TestEnvelope_DryRunMigratePlanGolden(t *testing.T) {
         "primary_key": false,
         "secondary_indexes": 0,
         "foreign_keys": 1,
-        "row_count": -1
+        "row_count": -1,
+        "row_count_estimated": false
       }
     ]
   }
