@@ -98,7 +98,9 @@ var (
 	GrowGateMaxHold = 20 * time.Minute
 
 	// GrowGateEpisodeIdle is the gate-OPEN, un-tripped stretch that ends a
-	// trouble EPISODE and resets the escalation ladder to rung 1. Trouble
+	// trouble EPISODE and resets the escalation ladder, so the next window the
+	// gate arms is rung 1 again (the reset is applied on the trip; the rung is
+	// taken when a window is actually armed — see [GrowGate.Trip]). Trouble
 	// that returns sooner than this is treated as the same episode
 	// continuing, so the ladder climbs; trouble that returns after a
 	// genuinely healthy stretch starts over at the fast probe interval.
@@ -107,21 +109,67 @@ var (
 	// GrowGateQuiesceWindow / GrowGateMaxQuiesceShare are the RUN-level
 	// ceiling on coordinated quiesce: over any trailing GrowGateQuiesceWindow
 	// the gate may hold the cold copy closed for at most GrowGateMaxQuiesceShare
-	// of that window. Past that it declines to close at all and the per-lane
-	// retry budgets — the authoritative floor — carry the run alone.
+	// of that window. Past that it declines to close at all and each lane
+	// carries itself.
 	//
-	// WHY THIS IS SAFE, and it is a measured premise rather than an argument
-	// (the premise-naming step): ADR-0110's cost case is that ~W×D lanes
-	// "independently hammer-retry the struggling target". They do not hammer.
-	// Every lane runs its OWN exponential reparent-retry backoff (100ms → 30s
-	// cap) and the 2026-08-05 field log shows 1061 of 2195 lane retries
-	// already sitting at the 30s cap. A gate that declines to close therefore
-	// hands the target back to lanes attempting at roughly one try per 30s
-	// each — not a hammer. The gate's marginal value is ALIGNMENT (contiguous
-	// quiet rather than a smear), not rate limiting, which is why capping its
-	// share cannot reintroduce the thrashing ADR-0110 was written against.
-	// [TestGrowGate_DecliningToCloseLeavesTheLaneBackoffIntact] is the check
-	// that binds this argument to the code rather than leaving it prose.
+	// # Why capping the share does not reintroduce the thrashing (the lanes
+	// that retry)
+	//
+	// ADR-0110's cost case is that ~W×D lanes "independently hammer-retry the
+	// struggling target". The retrying lanes do not hammer: each runs its own
+	// exponential reparent backoff (100ms → 30s cap), and the 2026-08-05 field
+	// log shows 1061 of 2195 lane retries already sitting at the 30s cap. So
+	// for those lanes a gate that declines to close hands the target back at
+	// roughly one try per 30s each — the gate's marginal value there is
+	// ALIGNMENT (contiguous quiet rather than a smear), not rate limiting.
+	//
+	// The BACKOFF half of that argument is pinned where the backoff lives:
+	// [mysql.TestColdCopyReparentBackoffShape] and
+	// [postgres.TestPGCopyReparentBackoffShape] assert both ladders reach and
+	// hold the 30s cap. The GATE half — that declining RELEASES a lane rather
+	// than parking it — is [TestGrowGate_DeclinesToCloseOnceItsShareIsSpent].
+	//
+	// # WHICH LANES, because the argument above is FALSE for four of them
+	//
+	// It was written as a generalisation over "every lane" and cited a test
+	// that was never written. Four of the nine bulk-write lanes have no retry
+	// to fall back on, so for them a decline is not "back to one try per 30s",
+	// it is "the next transient this lane meets is terminal":
+	//
+	//	RETRY (bounded replay, then loud)   REFUSE-KEYLESS   NO RETRY
+	//	pg  writeViaCopyChunked             yes              —
+	//	pg  writeViaBatchIdempotent         n/a (refused up front)
+	//	my  writeBatchedConn                yes              —
+	//	my  writeBatchedIdempotentConn      yes              —
+	//	my  flushLoadDataSegment (item 114) yes              —
+	//	pg  writeViaBatch                   —                YES (ambiguous ack, no conflict target)
+	//	pg  ImportRawCopy                   —                YES (one-shot io.Reader)
+	//	pg  pgFloatBatchExecer.ExecBatch    —                YES (Await+Trip parity only)
+	//	my  mysqlFloatBatchExecer.ExecBatch —                YES (Await+Trip parity only)
+	//
+	// The roster is DERIVED, not asserted here: mysql.TestMySQLGrowGateLane-
+	// RetryPostureRoster and postgres.TestPostgresGrowGateLaneRetryPosture-
+	// Roster walk each engine package, discover its bulk-write lanes by
+	// signature, derive each lane's posture from whether it reaches the
+	// bounded-replay helper, and fail on a lane whose declared posture is
+	// wrong or missing. A tenth lane cannot appear unclassified.
+	//
+	// The exposure those four carry, stated plainly rather than left implied:
+	// while the share is spent, a lane that would have PARKED instead issues
+	// its write into the bad window and fails. That failure is LOUD on all
+	// four (a wrapped driver error out of writeViaBatch / the float-repair
+	// cores, and ImportRawCopy's explicit "no resume point, re-run this table"
+	// refusal) — never a silent under-copy — which is why the ceiling stays.
+	// Note also what the gate never was for them: it is a probabilistic SHIELD,
+	// not a floor. A non-retrying lane that is the FIRST to meet a transient
+	// dies whatever the gate does; it is only protected when a sibling trips
+	// first and it has not yet issued its write. Capping the share narrows
+	// that shield, it does not remove a guarantee that existed.
+	//
+	// (Two of the four have an outer net on SOME callers — ImportRawCopy's
+	// migrate whole-table leg rides the pipeline's truncate-restart source-read
+	// retry — but not on the chunked leg or sync cold-start. That asymmetry is
+	// filed in docs/dev/perf-parity-matrix.md row 17, not re-argued here.)
 	GrowGateQuiesceWindow   = 5 * time.Minute
 	GrowGateMaxQuiesceShare = 0.5
 )
@@ -171,8 +219,14 @@ type GrowGate struct {
 
 	// cycle is the escalation ladder's rung, EPISODE-scoped: it advances by
 	// exactly ONE per pause WINDOW while a trouble episode persists, and
-	// resets to 1 when the gate has been open and un-tripped for
-	// episodeIdle. Read the type doc for why it may not advance per Trip.
+	// resets when the gate has been open and un-tripped for episodeIdle. Read
+	// the type doc for why it may not advance per Trip. "Per WINDOW" is the
+	// whole invariant and it has two ways to break: a trip arriving DURING a
+	// window (pinned by
+	// [TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent]) and a
+	// trip the share ceiling DECLINES, which also arms no window (pinned by
+	// [TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder]). The first
+	// cut of the ceiling closed only the first of those.
 	cycle int
 
 	// lastReopen is when the previous window ended. A Trip arriving within
@@ -389,30 +443,27 @@ func (g *GrowGate) Trip(reason string) {
 	}
 
 	now := g.now()
-	// EPISODE LADDER. A prompt re-trip (the previous quiesce did not suffice)
-	// climbs one rung; a trip after a genuinely healthy stretch starts over
-	// at the fast probe interval. This is the ONLY place cycle advances, and
-	// it is what makes the long-standing "the exponential backoff grows
-	// across windows" claim true — before item 138 every window restarted at
-	// rung 1 and all the growth happened inside a single window instead.
-	switch {
-	case g.lastReopen.IsZero(), now.Sub(g.lastReopen) >= g.episodeIdle:
-		g.cycle = 1
+	// EPISODE BOUNDARY. Whether trouble is CONTINUING or has returned after a
+	// genuinely healthy stretch is a question about TIME, so it is answered on
+	// every trip — including one the share ceiling is about to decline.
+	if g.lastReopen.IsZero() || now.Sub(g.lastReopen) >= g.episodeIdle {
+		g.cycle = 0
 		g.shareExhaustedLogged = false
-	case g.cycle < growGateMaxCycle:
-		g.cycle++
 	}
-	cycle := g.cycle
 
-	hold := g.backoff(cycle)
-	if hold > g.maxHold {
-		hold = g.maxHold
-	}
 	allowance := g.quiesceAllowanceLocked(now)
 	if allowance <= 0 {
 		// The gate has spent its share of the trailing window. Decline to
-		// close: the per-lane retry budgets (each with its own exponential
-		// backoff) are the authoritative floor and carry the run alone.
+		// close and hand each lane back to itself — for five of the nine
+		// bulk-write lanes that means their own exponential retry budget; for
+		// the other four it means their next transient is terminal-but-loud.
+		// The roster and the exposure are in [GrowGateMaxQuiesceShare]'s doc.
+		//
+		// Note what does NOT happen here: the episode ladder does not advance.
+		// A declined trip arms no window, and the ladder measures windows (see
+		// below). Advancing it here would let one fan-out burst of declined
+		// trips climb the ladder by its WIDTH — the exact item-138 defect, in
+		// the state item 138 introduced.
 		first := !g.shareExhaustedLogged
 		g.shareExhaustedLogged = true
 		g.mu.Unlock()
@@ -420,13 +471,33 @@ func (g *GrowGate) Trip(reason string) {
 			slog.WarnContext(
 				g.ownerCtx, "pipeline: cold-copy grow-gate DECLINING to close — it has already quiesced "+
 					"its permitted share of the recent wall clock and further quiescing would stall the copy "+
-					"rather than help the target; the per-lane retry budgets carry the run from here (ADR-0110, item 138)",
+					"rather than help the target. Each lane now carries itself: the batched/chunked/LOAD DATA "+
+					"cores fall back to their own bounded reparent-retry, but the plain-INSERT, raw-COPY and "+
+					"float-repair cores have no replay, so a transient reaching one of those will fail this "+
+					"table loudly rather than being ridden out (ADR-0110, item 138)",
 				slog.String("reason", reason),
 				slog.Duration("quiesce_window", g.quiesceWindow),
 				slog.Float64("max_quiesce_share", g.maxQuiesceShare),
 			)
 		}
 		return
+	}
+
+	// EPISODE LADDER, advanced ONLY here — on the path that actually ARMS a
+	// window. A prompt re-trip (the previous quiesce did not suffice) climbs
+	// one rung; a trip after a genuinely healthy stretch has already been
+	// reset to the fast probe interval above. This is what makes the
+	// "the exponential backoff grows across windows" claim true — before item
+	// 138 every window restarted at rung 1 and all the growth happened inside
+	// a single window instead.
+	if g.cycle < growGateMaxCycle {
+		g.cycle++
+	}
+	cycle := g.cycle
+
+	hold := g.backoff(cycle)
+	if hold > g.maxHold {
+		hold = g.maxHold
 	}
 	if hold > allowance {
 		hold = allowance

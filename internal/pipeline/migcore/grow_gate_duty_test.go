@@ -364,9 +364,16 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 // released lane, not a stalled one. It does NOT bind the other half, that the
 // released lane then waits on its OWN exponential reparent backoff rather than
 // hammering; that lives in the engine packages (mysql's
-// coldCopyReparentBackoff, pinned by TestColdCopyReparentBackoffShape) and is
-// not reachable from here. Stated rather than implied, because a reader who
-// assumed this test covered both would be wrong.
+// coldCopyReparentBackoff / postgres's pgCopyReparentBackoff, pinned by
+// mysql.TestColdCopyReparentBackoffShape and
+// postgres.TestPGCopyReparentBackoffShape) and is not reachable from here.
+// Stated rather than implied, because a reader who assumed this test covered
+// both would be wrong.
+//
+// And it binds NOTHING about the four lanes that have no backoff to be handed
+// back to — see the roster in [GrowGateMaxQuiesceShare]'s doc and the two
+// engine-side posture rosters that derive it. When this test was written its
+// sibling comment generalised over "every lane"; four of nine do not fit.
 func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 	captureSlog(t)
 	const window = 400 * time.Millisecond
@@ -413,5 +420,93 @@ func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Await blocked while the gate's share was spent — declining to close must RELEASE lanes, not park them")
+	}
+}
+
+// TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder is the item-138
+// regression pin for the DECLINING state, the half the first cut of the
+// run-level ceiling left open.
+//
+// The ladder's whole meaning is "how many WINDOWS has this episode already
+// spent without the trouble clearing" — [GrowGate.cycle]'s doc, the type doc,
+// and Trip's doc all say per-window. A trip the share ceiling declines arms no
+// window, so it is not evidence of temporal persistence; it is evidence that
+// some lane failed while the gate happened to be out of budget. Advancing on
+// it lets ONE target event observed by a W×D fan-out climb the ladder by the
+// fan-out's WIDTH in the few milliseconds the burst spans — which is exactly
+// the defect item 138 was written to remove, reproduced inside the code that
+// removed it. Measured cost when it fires: the moment budget frees up the gate
+// arms at or near its 30s cap instead of the fast probe interval, so a run
+// whose ladder should have been at rung 1 pays cap-length holds for the rest
+// of the episode.
+//
+// The pin is white-box on g.cycle deliberately. Observing it through hold
+// durations is what the two duty gates already do, and the allowance clamp
+// (hold = min(backoff(cycle), allowance)) hides the rung precisely in the
+// state under test — measuring the observable would have been blind to it.
+//
+// BOTH directions, per the mutation-run rule: the climb before the decline is
+// asserted too, so freezing the ladder outright fails this test rather than
+// passing it.
+func TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder(t *testing.T) {
+	captureSlog(t)
+	const window = 400 * time.Millisecond
+	// episodeIdle an hour: the ladder must never reset by luck mid-test, so a
+	// rung that fails to advance can only be the arming rule and not a reset.
+	withScaledGrowGate(t, 40*time.Millisecond, 40*time.Millisecond, time.Hour, window, 0.5)
+
+	g := NewGrowGate(context.Background(), nil)
+	rung := func() int {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.cycle
+	}
+	isClosed := func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.closed
+	}
+
+	// Drive windows until the share is spent, asserting the ladder climbs by
+	// exactly one per ARMED window on the way (the anti-vacuity half).
+	windows := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for windows < 12 && time.Now().Before(deadline) {
+		before := rung()
+		g.Trip("target rejecting writes")
+		if !isClosed() {
+			break // declined — the share is spent
+		}
+		if got := rung(); got != before+1 {
+			t.Fatalf("armed window %d advanced the ladder from %d to %d, want exactly one rung", windows+1, before, got)
+		}
+		windows++
+		if err := g.Await(context.Background()); err != nil {
+			t.Fatalf("Await: %v", err)
+		}
+	}
+	if windows == 0 {
+		t.Fatal("the gate never closed; this test cannot reach the declining state it exists to pin")
+	}
+	if windows >= 12 {
+		t.Fatalf("the gate closed %d times without ever declining; the run-level share is not bounding it", windows)
+	}
+
+	// Now the state under test: the share is spent and the gate is declining.
+	// One target event, reported by 16 lanes — the sync cold-start W×D fan-out
+	// from the field log — must move the ladder by NOTHING.
+	spent := rung()
+	tripBurst(g, 16)
+	if isClosed() {
+		t.Fatal("the gate closed after declaring its share spent; this test is no longer measuring the declining state")
+	}
+	if got := rung(); got != spent {
+		t.Errorf(
+			"16 lanes reporting ONE event while the share was spent climbed the episode ladder from rung %d to %d. "+
+				"A declined trip arms no window, so it is not evidence the trouble persisted — and a ladder driven by "+
+				"fan-out WIDTH is the item-138 defect. When budget frees up the gate will now arm at rung %d "+
+				"(near its cap) instead of resuming the fast probe.",
+			spent, got, got,
+		)
 	}
 }
