@@ -43,6 +43,15 @@ import (
 // tests prove the answer is right, and the cross-engine integration test
 // TestMigratePartialUniqueRefusedBeforeAnyRowsCopied proves the timing
 // end-to-end on a real target.
+//
+// And the roster below is HAND-MAINTAINED, which bounds this gate in the
+// direction the defect actually arrives from. It fails when a rostered entry
+// point drops its call, and when an unrostered function starts making one —
+// but a NEW copies-then-indexes entry point that never calls the preflight and
+// is never added here is invisible to it. Nothing in the tree derives that set
+// mechanically today; the honest statement is that this gate protects the four
+// known callers, not the class. If a fifth copy path is ever added, adding it
+// here is a manual step nothing will remind you of.
 
 // indexPreflightEntryPoints is the roster: package-relative directory →
 // declaration identity → why this entry point copies-then-indexes.

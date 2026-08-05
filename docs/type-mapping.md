@@ -113,7 +113,7 @@ type Geometry struct { Subtype GeometrySubtype } // PostGIS / MySQL spatial
 
 type Inet    struct{}
 type Cidr    struct{}
-type Macaddr struct{}
+type Macaddr struct{ Width int } // 6 = macaddr, 8 = macaddr8
 ```
 
 ### Engine opt-in to extension types

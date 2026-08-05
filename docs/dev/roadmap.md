@@ -1864,7 +1864,7 @@ The first finding from the reflective `schemaTypeEnvelope` gate built in item 11
 
 **Sibling findings from the same sweep, filed together because they share a cause** (`Char/Varchar/Text.Determinism`): set by the PG reader from `collisdeterministic` and read back as `Unknown`. `ir.Enum.Collation`'s written rationale plausibly covers them, but nobody wrote it down for these, and `ir.Type` participates in `reflect.DeepEqual` via `SchemaSignature.Equal` and `diffRenameColumnIR` — so a lossy round trip is not obviously harmless. Decide and record: either wire them (same fingerprint treatment) or move them from `envelopeKnownGap` to `envelopeExempt` with the argument written out.
 
-### 120. A MySQL `PRIMARY KEY (col(20), …)` is SILENTLY widened on a SQLite target — *✅ SHIPPED to `main` 2026-08-04; CI green. Unreleased — rides the next tag.*
+### 120. A MySQL `PRIMARY KEY (col(20), …)` is SILENTLY widened on a SQLite target — *✅ SHIPPED to `main` 2026-08-04; CI green. Released in **v0.111.0**.*
 
 **Implementation notes.** The refusal sits in [`emitTableDef`](../../internal/engines/sqlite/ddl_emit.go) **ahead of the inline/table-level PK branch**, not inside `quoteIndexColumnList`. The rowid-alias path (`INTEGER PRIMARY KEY`, rendered on the column) never reaches that renderer, and the only argument that it is safe there is *MySQL rejects a prefix on an integer key (errno 1089)* — a premise about the SOURCE, which the emitter should not have to hold. Checking ahead of the branch costs one call and makes both renderings covered; `TestPreflightIndexesAgreesWithTheEmitterOnThePrimaryKey` carries the rowid-alias row that fails if it moves back.
 
@@ -1896,7 +1896,7 @@ Postgres has no equivalent gap: its inline PK goes through `emitIndexColumnList`
 
 **Gate it with a MySQL-source cell that asserts `events_collapsed > 0`** — the v0.110.0 cycle's prescribed non-vacuity control was a MySQL leg that was byte-identical on both binaries and would have been scored a clean pass, because no collapse ever ran. An assertion that the collapse *happened* is what turns that from a green into a finding.
 
-### 118. Every deferred-index refusal fires AFTER the bulk copy, and two shipped releases claimed otherwise (Bug 224 + its SQLite sibling) — *✅ SHIPPED to `main` 2026-08-04 (`6ec63868`); CI green. Unreleased — rides the next tag.*
+### 118. Every deferred-index refusal fires AFTER the bulk copy, and two shipped releases claimed otherwise (Bug 224 + its SQLite sibling) — *✅ SHIPPED to `main` 2026-08-04 (`6ec63868`); CI green. Released in **v0.111.0**.*
 
 **Implementation notes.** `ir.IndexEmitPreflighter` (`PreflightIndexes(*ir.Schema) error`) is implemented by `mysql.Engine` (all four flavors), `postgres.Engine`, `sqlite.Engine`, and — the delegation that a compile-assert on `postgres.Engine` would have silently missed — `pgtrigger.Engine`, whose schema writer IS vanilla PG's. The orchestrator calls `migcore.PreflightIndexEmit` at **six** entry points, not the two the spec named: `migrate` (`phaseTranslateAndGateSchema`), `sync` cold-start single-database and multi-database, `add-table`, `restore`, and chain `restore` — every path that copies and then indexes. `TestIndexEmitPreflightReachesEveryCopyEntryPoint` is the fail-by-default roster over those six.
 
@@ -1920,7 +1920,7 @@ Known members, all confirmed by reading the call sites:
 
 **Two constraints that are easy to miss.** (1) The parity agreement applies — this touches a shared copy phase, so it belongs on **both** `migrate` and `sync` cold-start, not one. (2) Pin against **real engine types**, not a pipeline test stub; a stub satisfies the interface by construction and proves nothing about any engine, which is the v0.110.0 finding about the pipeline's other optional interfaces.
 
-### 117. `ir.Macaddr` carries no WIDTH, which breaks a `macaddr8` migration outright and leaves a silent `--where` hole (Bug 225 + the audit 2026-08-04 C1 residual) — *✅ SHIPPED to `main` 2026-08-04 (`e1547e7c`). Unreleased — rides the next tag. **`ir.Inet` was deliberately scoped OUT on evidence** (see below); the title said "and `ir.Inet`" while this was open, and leaving that on a DONE item would claim coverage the change does not have.*
+### 117. `ir.Macaddr` carries no WIDTH, which breaks a `macaddr8` migration outright and leaves a silent `--where` hole (Bug 225 + the audit 2026-08-04 C1 residual) — *✅ SHIPPED to `main` 2026-08-04 (`e1547e7c`). Released in **v0.111.0**. **`ir.Inet` was deliberately scoped OUT on evidence** (see below); the title said "and `ir.Inet`" while this was open, and leaving that on a DONE item would claim coverage the change does not have.*
 
 *Full outcome:* `ir.Macaddr` carries a `Width`; both PG readers set it, the emitter picks `MACADDR`/`MACADDR8`, the width rides the wire and is EXCLUDED from the schema fingerprint, and the `--where` gate's four-row truth table is now decided rather than guessed. The `schemaTypeEnvelope` reflective codec gate was built alongside it and found four pre-existing holes (below).*
 

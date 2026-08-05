@@ -36,6 +36,8 @@ A zone-scoped IPv6 address (`fe80::1%eth0`) and a MAC literal wider than six byt
 
 > **Correction (2026-08-04, post-publish).** This section first said "refused **before any data moves**". It is not. SQLite's check lives only in `emitCreateIndex`, which runs in the deferred index phase *after* the bulk copy. The refusal is still loud and zero-loss — nothing is written wrong, and the migration stops rather than producing a weaker constraint — but it arrives later than stated, so a large table is copied first. `--upfront-indexes` moves it earlier today. This is the same timing the v0.110.0 regression cycle reported for the partial-`UNIQUE` refusal, and it was found by looking for siblings once that bug named the shape; a preflight that closes the whole class is filed as roadmap item 118.
 
+> **Correction (2026-08-04, later).** "or D1" over-claims a target that does not exist. sluice has **no D1 target engine** — `d1` is a migrate SOURCE only (`OpenSchemaWriter` returns `ErrD1NotImplemented`), and a D1-bound migration is written through the `sqlite` engine into a file you then import with `wrangler`. Everyone this fix reaches is still reached; what is wrong is that the sentence names an engine you cannot select as a target. Found by the pre-release value-fidelity review for v0.111.0.
+
 **Two cold-copy write lanes ignored the coordinated storage-grow pause.** The Postgres raw-COPY fast path and the float-repair core on both engines were invisible to it, so they kept writing into a grow window every other lane was backing off from — which made the raw fast path *less* resilient than the lane it replaces, not merely unoptimised. Both now participate. The raw path signals its siblings but cannot retry, and says so: it streams its source bytes, so there is no resume point.
 
 **Blob-store credentials survived redaction into a durable, replicated location.** The redactor stripped a URL's query string and left its userinfo intact. What made it silent is that embedding credentials there *works* — the cloud drivers read the host and ignore the userinfo — so an operator got a working backup and no signal. The redacted value reaches a log line, the CDC-state row on the **target database**, and a diagnose bundle collected at the privacy level whose help text promises no DSN.
@@ -54,7 +56,7 @@ Previously the integrity chain ended at an unsigned `checksums.txt`. This is add
 
 ## Compatibility
 
-**One behaviour change that can stop a migration that previously ran:** a MySQL index prefix length on a uniqueness-enforcing key is now refused against a SQLite or D1 target. This is the same refusal Postgres targets have had since v0.108.0, finally applied to the engine its original sweep missed.
+**One behaviour change that can stop a migration that previously ran:** a MySQL index prefix length on a uniqueness-enforcing key is now refused against a SQLite target (see the correction above: there is no D1 target engine). This is the same refusal Postgres targets have had since v0.108.0, finally applied to the engine its original sweep missed.
 
 If you use `--where` on a network column, **check your predicate against what the server actually returns** — `SELECT col FROM t LIMIT 1`, uncast. A predicate that was silently matching nothing will now either work or be refused with a message naming the correct spelling.
 

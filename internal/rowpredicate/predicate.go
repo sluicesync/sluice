@@ -268,11 +268,18 @@ type ColumnInfo struct {
 	// MACWidth is meaningful only when Identifier is identifierMAC: the
 	// column's MAC width in BYTES, read straight off [ir.Macaddr.Width]
 	// (6 = `macaddr`, 8 = `macaddr8`). Like NetworkRendering, its ZERO
-	// value REFUSES the comparison rather than assuming a width: the only
-	// producers of [ir.Macaddr] are the two Postgres readers and both set
-	// it, so an unspecified width on a live schema read means a NEW
-	// producer appeared without deciding — and the failure mode of
-	// guessing is silent (roadmap item 117 / audit 2026-08-04 C1).
+	// value REFUSES the comparison rather than assuming a width: every
+	// producer of [ir.Macaddr] that can REACH a predicate is one of the two
+	// Postgres readers, and both set it, so an unspecified width on a live
+	// schema read means a NEW producer appeared without deciding — and the
+	// failure mode of guessing is silent (roadmap item 117 / audit
+	// 2026-08-04 C1).
+	//
+	// "Every producer sets it" would be the stronger claim and it is NOT
+	// true: `parquetexport/duckdbverify/matrix.go` builds a bare
+	// `ir.Macaddr{}` for its fixture corpus. That one never reaches a
+	// predicate resolver — which is the property this refusal actually
+	// depends on, so it is the one stated here.
 	MACWidth int
 
 	// TimeFractionAmbiguous marks a TIME column with fractional-second

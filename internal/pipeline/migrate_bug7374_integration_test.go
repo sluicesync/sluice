@@ -25,6 +25,14 @@
 // ground-truthed via PG ::text rendering on the real target (which
 // makes element-NULL and dimensionality observable in one compare).
 // timetz[] is asserted to loud-refuse (no faithful binary array leaf).
+//
+// macaddr8 joined the matrix in v0.111.0 (roadmap item 117). It is the
+// sharpest member of the class the file exists for: pgx ships no codec
+// for `macaddr8[]` at all — only for the scalar and for `macaddr[]` —
+// so sluice registers that array codec itself. A hand-registered
+// per-OID array codec is EXACTLY the Bug 74 shape, and the ≥2-D cell
+// is the one that silently flattened last time, so both widths carry
+// all three shapes here rather than macaddr standing in for both.
 
 package pipeline
 
@@ -41,7 +49,7 @@ import (
 
 // bug7374SeedDDL covers every element FAMILY at 1-D, multi-dim (2x2),
 // and with a NULL element. Native (int/float/bool), string-shaped
-// (text/uuid/inet/cidr/macaddr — all use the same *pgtype.Text leaf;
+// (text/uuid/inet/cidr/macaddr/macaddr8 — all use the same *pgtype.Text leaf;
 // bounded varchar(N)[]/char(N)[] share that leaf and are pinned at
 // the value layer by TestConvertArrayPerFamilyLeafAndDims — they are
 // omitted here only because the PG array-element DDL emitter doesn't
@@ -60,6 +68,7 @@ const bug7374SeedDDL = `
 	  a_in  inet[],         a_in2  inet[][],
 	  a_ci  cidr[],         a_ci2  cidr[][],
 	  a_ma  macaddr[],      a_ma2  macaddr[][],
+	  a_ma8 macaddr8[],     a_ma82 macaddr8[][],
 	  a_n   numeric[],      a_n2   numeric[][],
 	  a_d   date[],         a_d2   date[][],
 	  a_ts  timestamp[],    a_ts2  timestamp[][],
@@ -78,6 +87,7 @@ const bug7374SeedDDL = `
 	  ARRAY['10.0.0.1','10.0.0.2']::inet[], ARRAY[ARRAY['10.0.0.1','10.0.0.2'],ARRAY['10.0.0.3','10.0.0.4']]::inet[][],
 	  ARRAY['10.0.0.0/24','10.0.1.0/24']::cidr[], ARRAY[ARRAY['10.0.0.0/24','10.0.1.0/24'],ARRAY['10.0.2.0/24','10.0.3.0/24']]::cidr[][],
 	  ARRAY['08:00:2b:01:02:03','08:00:2b:01:02:04']::macaddr[], ARRAY[ARRAY['08:00:2b:01:02:03','08:00:2b:01:02:04'],ARRAY['08:00:2b:01:02:05','08:00:2b:01:02:06']]::macaddr[][],
+	  ARRAY['08:00:2b:ff:fe:01:02:03','08:00:2b:ff:fe:01:02:04']::macaddr8[], ARRAY[ARRAY['08:00:2b:ff:fe:01:02:03','08:00:2b:ff:fe:01:02:04'],ARRAY['08:00:2b:ff:fe:01:02:05','08:00:2b:ff:fe:01:02:06']]::macaddr8[][],
 	  ARRAY[1.5,2.5]::numeric[], ARRAY[ARRAY[1.5,2.5],ARRAY[3.5,4.5]]::numeric[][],
 	  ARRAY['2026-01-01','2026-02-01']::date[], ARRAY[ARRAY['2026-01-01','2026-02-01'],ARRAY['2026-03-01','2026-04-01']]::date[][],
 	  ARRAY['2026-01-01 00:00:00','2026-02-01 12:34:56']::timestamp[], ARRAY[ARRAY['2026-01-01 00:00:00','2026-02-01 12:34:56'],ARRAY['2026-03-01 01:02:03','2026-04-01 23:59:59']]::timestamp[][],
@@ -93,6 +103,7 @@ const bug7374SeedDDL = `
 	  ARRAY['10.0.0.1',NULL]::inet[], ARRAY[ARRAY['10.0.0.1',NULL],ARRAY[NULL,'10.0.0.4']]::inet[][],
 	  ARRAY['10.0.0.0/24',NULL]::cidr[], ARRAY[ARRAY['10.0.0.0/24',NULL],ARRAY[NULL,'10.0.3.0/24']]::cidr[][],
 	  ARRAY['08:00:2b:01:02:03',NULL]::macaddr[], ARRAY[ARRAY['08:00:2b:01:02:03',NULL],ARRAY[NULL,'08:00:2b:01:02:06']]::macaddr[][],
+	  ARRAY['08:00:2b:ff:fe:01:02:03',NULL]::macaddr8[], ARRAY[ARRAY['08:00:2b:ff:fe:01:02:03',NULL],ARRAY[NULL,'08:00:2b:ff:fe:01:02:06']]::macaddr8[][],
 	  ARRAY[1.5,NULL]::numeric[], ARRAY[ARRAY[1.5,NULL],ARRAY[NULL,4.5]]::numeric[][],
 	  ARRAY['2026-01-01',NULL]::date[], ARRAY[ARRAY['2026-01-01',NULL],ARRAY[NULL,'2026-04-01']]::date[][],
 	  ARRAY['2026-01-01 00:00:00',NULL]::timestamp[], ARRAY[ARRAY['2026-01-01 00:00:00',NULL],ARRAY[NULL,'2026-04-01 23:59:59']]::timestamp[][],
@@ -130,7 +141,7 @@ func TestMigrate_PostgresToPostgres_Bug7374ArrayFamilyClass(t *testing.T) {
 		"a_i", "a_i2", "a_f", "a_f2", "a_b", "a_b2",
 		"a_t", "a_t2",
 		"a_u", "a_u2", "a_in", "a_in2", "a_ci", "a_ci2",
-		"a_ma", "a_ma2", "a_n", "a_n2", "a_d", "a_d2",
+		"a_ma", "a_ma2", "a_ma8", "a_ma82", "a_n", "a_n2", "a_d", "a_d2",
 		"a_ts", "a_ts2", "a_tz", "a_tz2", "a_tm", "a_tm2",
 	}
 

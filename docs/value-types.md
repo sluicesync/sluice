@@ -57,7 +57,7 @@ Nullability itself is a property of the IR `Column` (`Column.Nullable`), not of 
 | `Geometry` | `[]byte` | Raw WKB (Well-Known Binary). The subtype is recorded on `Column.Type`. |
 | `Inet` | `string` | Canonical textual form (`"192.168.1.1"`, `"2001:db8::1"`). |
 | `Cidr` | `string` | Canonical textual form (`"192.168.1.0/24"`). |
-| `Macaddr` | `string` | Lower-case, colon-separated (`"08:00:2b:01:02:03"`). |
+| `Macaddr` | `string` | Lower-case, colon-separated. Six bytes when `Width` is 6 (`"08:00:2b:01:02:03"`), eight when it is 8 (`"08:00:2b:ff:fe:01:02:03"`). Postgres widens an EUI-48 literal to EUI-64 on input to a `macaddr8` column, so a value read back from such a column always carries eight. |
 
 ## Memory ownership of byte slices
 
