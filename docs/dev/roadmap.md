@@ -1892,7 +1892,13 @@ Pinned by a refusal test, a large-but-readable control (1 MiB round-trips — wi
 
 **Gate it with a measured ceiling**, in the shape item 116 P3 used: a test that drives the real compactor with wide events and asserts peak retention stays under the cap, plus a control asserting a narrow corpus still collapses exactly as it does today (byte-identical output).
 
-### 126. Copy-parallelism AIMD burns its whole retry budget on the first wave, so a transient slot shortage aborts the run (audit 2026-08-04 HIGH) — *OPEN*
+### 126. Copy-parallelism AIMD burns its whole retry budget on the first wave, so a transient slot shortage aborts the run (audit 2026-08-04 HIGH) — *✅ FIXED on `main` 2026-08-05; unreleased*
+
+**Implementation notes.** `attempts` / `totalWait` became `attemptsByChunk` / `waitByChunk`, keyed on the `chunkIndex` the API already carried. Safe because the gate is constructed PER TABLE over that table's chunk set (`NewCopyParallelismGate(len(chunks), …)`), so the index is unique within a gate — checked, not assumed.
+
+**The SHRINK deliberately stays run-wide.** Many concurrent 53300s SHOULD collapse parallelism hard and fast; that is the AIMD working. Only the give-up bound and the backoff exponent are properties of one chunk's own progress. The new test asserts both halves — sixteen concurrent first attempts all proceed AND the effective parallelism still collapses to the floor of 1.
+
+**The existing test asserted the DEFECT as the contract.** `TestCopyParallelismGate_ConcurrentShrinkBackoffBound` pinned "many chunks hammering concurrently produce exactly MaxRetries successes and the rest give up" — sixteen distinct chunks, each on its FIRST attempt, eleven aborted. That is the bug written down as an expectation, and it is why the audit had to find this by reading rather than by a red test. Replaced with `_ConcurrentFirstAttemptsAllProceed`, plus `_OneChunkStillGivesUp` for the other half: a per-chunk budget must still be BOUNDED, and one chunk exhausting its budget must not pre-abort its peers. Mutation-confirmed by re-sharing the counter across chunks.
 
 **Confirmed at HEAD (2026-08-05):** `CopyParallelismGate.attempts` (`copy_parallelism_gate.go:69`) is documented as "the total slot-exhaustion retries across all chunks of this table" and `ShrinkAndBackoff` increments it once per FAILING WORKER (`:143`), then feeds that run-wide count straight into `NextCopyBackoff`'s give-up bound.
 

@@ -24,10 +24,12 @@
 //     count drops without ever blocking inside the lock. The first
 //     workers to finish after a shrink absorb the retirement.
 //   - backoff bookkeeping (attempt count + accumulated wait) is guarded
-//     by mu so the AIMD give-up bound is enforced across all peer chunks,
-//     not per-goroutine. A permanently-saturated target therefore gives
-//     up after a bounded *total* number of retries across the whole
-//     table, not MaxRetries-per-chunk.
+//     by mu and kept PER CHUNK (roadmap item 126). The give-up bound is a
+//     property of one chunk's own progress; the SHRINK stays run-wide, so
+//     many concurrent 53300s still collapse parallelism hard. Keeping the
+//     bound run-wide meant 16 concurrent workers consumed the whole
+//     MaxRetries budget between them and aborted the run with zero retries
+//     actually executed.
 //
 // All shared mutable state is touched only under mu or via the channel,
 // so there are no data races on the cap or the backoff counters.
@@ -63,11 +65,29 @@ type CopyParallelismGate struct {
 	// than return, draining the live token pool down to a shrunk cap
 	// without blocking under the lock. Guarded by mu.
 	retire int
-	// attempts is the total slot-exhaustion retries across all chunks of
-	// this table; totalWait is the summed backoff already spent. Both
-	// feed the give-up bound and are guarded by mu.
-	attempts  int
-	totalWait time.Duration
+	// attemptsByChunk / waitByChunk track the retry budget PER CHUNK, and
+	// that is the whole of roadmap item 126.
+	//
+	// They used to be two run-wide scalars, so the budget was consumed by
+	// however many workers happened to hit 53300 at all rather than by how
+	// many times any one chunk had retried. At the shipped 4x4 = 16
+	// concurrent, sixteen workers meeting a slot shortage at nearly the
+	// same moment burned the whole MaxRetries budget between them: the
+	// seventh aborted the entire run while workers 1-6 were still parked
+	// in their FIRST backoff, having executed zero retries. The gate's
+	// stated purpose — "a transient slot shortage degrades to
+	// slower-but-correct" — did not hold at any parallelism >= 7, which is
+	// every default multi-core run.
+	//
+	// The shrink stays RUN-WIDE deliberately (see [CopyParallelismGate.effective]):
+	// many concurrent 53300s SHOULD collapse parallelism hard and fast.
+	// It is only the give-up bound and the backoff exponent that are a
+	// property of one chunk's own progress.
+	//
+	// Keyed by chunkIndex, which is unique within a gate: the gate is
+	// constructed per table over that table's chunk set.
+	attemptsByChunk map[int]int
+	waitByChunk     map[int]time.Duration
 
 	policy CopyBackoffPolicy
 }
@@ -83,9 +103,11 @@ func NewCopyParallelismGate(parallelism int, policy CopyBackoffPolicy) *CopyPara
 		tokens <- struct{}{}
 	}
 	return &CopyParallelismGate{
-		tokens:    tokens,
-		effective: parallelism,
-		policy:    policy,
+		tokens:          tokens,
+		effective:       parallelism,
+		attemptsByChunk: make(map[int]int),
+		waitByChunk:     make(map[int]time.Duration),
+		policy:          policy,
 	}
 }
 
@@ -140,10 +162,10 @@ func (g *CopyParallelismGate) Release() {
 // count therefore targets *other* live tokens.
 func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, chunkIndex int) (time.Duration, error) {
 	g.mu.Lock()
-	g.attempts++
-	attempt := g.attempts
+	g.attemptsByChunk[chunkIndex]++
+	attempt := g.attemptsByChunk[chunkIndex]
 	current := g.effective
-	prior := g.totalWait
+	prior := g.waitByChunk[chunkIndex]
 
 	decision := NextCopyBackoff(current, attempt, prior, g.policy)
 	if decision.GiveUp {
@@ -168,7 +190,7 @@ func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, chunkIndex i
 		g.retire += prev - next
 		g.effective = next
 	}
-	g.totalWait += decision.Delay
+	g.waitByChunk[chunkIndex] += decision.Delay
 	g.mu.Unlock()
 
 	if prev != next {

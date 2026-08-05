@@ -149,12 +149,22 @@ func TestCopyParallelismGate_GivesUpLoudly(t *testing.T) {
 	}
 }
 
-// TestCopyParallelismGate_ConcurrentShrinkBackoffBound pins, under the
-// race detector, that the shared backoff bound is enforced across peer
-// goroutines: many chunks hammering shrinkAndBackoff concurrently produce
-// exactly MaxRetries successes and the rest give up, with no data race on
-// the shared counters.
-func TestCopyParallelismGate_ConcurrentShrinkBackoffBound(t *testing.T) {
+// TestCopyParallelismGate_ConcurrentFirstAttemptsAllProceed pins roadmap
+// item 126 under the race detector.
+//
+// This test previously asserted the DEFECT as if it were the contract:
+// "many chunks hammering concurrently produce exactly MaxRetries successes
+// and the rest give up". That is the bug stated as an expectation. Sixteen
+// DISTINCT chunks each meeting a slot shortage for the FIRST time have
+// collectively retried nothing, and aborting eleven of them abandons the
+// whole table on a transient the gate exists to ride out. The gate's own
+// doc promised "a transient slot shortage degrades to slower-but-correct";
+// at the shipped 4x4 it degraded to a failed run.
+//
+// The retry budget belongs to a CHUNK. The shrink stays run-wide, which the
+// assertion below also checks: sixteen concurrent events must collapse the
+// effective parallelism hard.
+func TestCopyParallelismGate_ConcurrentFirstAttemptsAllProceed(t *testing.T) {
 	p := CopyBackoffPolicy{MaxRetries: 5, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
 	g := NewCopyParallelismGate(16, p)
 	ctx := context.Background()
@@ -182,16 +192,48 @@ func TestCopyParallelismGate_ConcurrentShrinkBackoffBound(t *testing.T) {
 	}
 	wg.Wait()
 
-	if proceeds != p.MaxRetries {
-		t.Errorf("concurrent proceeds = %d, want exactly MaxRetries=%d", proceeds, p.MaxRetries)
+	if proceeds != peers || giveUps != 0 {
+		t.Errorf("first attempt on %d DISTINCT chunks: %d proceeded, %d gave up; want all %d to proceed.\n\n"+
+			"Each of these chunks has retried ZERO times. Giving up here aborts the whole table on a "+
+			"transient slot shortage the gate exists to ride out — and it is what happened at every "+
+			"default multi-core parallelism (roadmap item 126).",
+			peers, proceeds, giveUps, peers)
 	}
-	if giveUps != peers-p.MaxRetries {
-		t.Errorf("concurrent give-ups = %d, want %d", giveUps, peers-p.MaxRetries)
+
+	// The multiplicative decrease is still RUN-WIDE and must have bitten
+	// hard: 16 concurrent events halve repeatedly down to the floor.
+	if got := g.Effective(); got != 1 {
+		t.Errorf("effective parallelism = %d after %d concurrent slot-exhaustion events; want the floor "+
+			"of 1 — the shrink is deliberately run-wide and must still collapse fast", got, peers)
 	}
-	// Effective parallelism must never drop below the floor of 1.
-	g.mu.Lock()
-	if g.effective < 1 {
-		t.Errorf("effective parallelism dropped below floor: %d", g.effective)
+}
+
+// TestCopyParallelismGate_OneChunkStillGivesUp is the other half: making the
+// budget per-chunk must NOT make it unbounded. A single chunk that keeps
+// meeting a saturated target still fails loudly at MaxRetries, which is what
+// stops an unavailable target from stalling the run forever.
+func TestCopyParallelismGate_OneChunkStillGivesUp(t *testing.T) {
+	p := CopyBackoffPolicy{MaxRetries: 5, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
+	g := NewCopyParallelismGate(16, p)
+	ctx := context.Background()
+
+	for i := 1; i <= p.MaxRetries; i++ {
+		if _, err := g.ShrinkAndBackoff(ctx, 7); err != nil {
+			t.Fatalf("chunk 7 attempt %d gave up early: %v", i, err)
+		}
 	}
-	g.mu.Unlock()
+	_, err := g.ShrinkAndBackoff(ctx, 7)
+	if err == nil {
+		t.Fatal("chunk 7 never gave up past MaxRetries — a per-chunk budget must still be BOUNDED, or a " +
+			"genuinely saturated target stalls the run indefinitely")
+	}
+	if !errors.Is(err, ErrCopySlotsExhausted) {
+		t.Errorf("give-up error does not wrap ErrCopySlotsExhausted: %v", err)
+	}
+
+	// And a DIFFERENT chunk still has its own budget — that is the point.
+	if _, err := g.ShrinkAndBackoff(ctx, 8); err != nil {
+		t.Errorf("chunk 8 inherited chunk 7's exhausted budget: %v\n\n"+
+			"The budget is per chunk; one chunk failing must not pre-abort its peers.", err)
+	}
 }
