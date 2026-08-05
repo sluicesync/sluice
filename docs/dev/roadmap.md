@@ -1856,6 +1856,48 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
+### 134. SQLite index emit uses `IF NOT EXISTS` with a bare name and no collision check — *OPEN, high; the 08-04 HIGH that was never filed*
+
+`sqlite/ddl_emit.go:507`. The one 08-04 HIGH-family finding that got neither a fix nor an item: `f442e9d3`'s commit message said "the three audit HIGHs still open" and silently dropped the fourth. SQLite index names are SCHEMA-scoped, not table-scoped, so two tables' same-named indexes collide — and because the emit uses `CREATE INDEX IF NOT EXISTS` with a bare name, the collision is a **silent no-op**: the second table is left without the index the source declared. Same shape as item 120 (the PG `SLUICE-E-SCHEMA-INDEX-NAME-COLLISION` path), on the engine that has no such check.
+
+**Worth recording as process, not just as a bug:** a commit message that enumerates "the N open findings" is itself a claim surface, and this one was wrong by one. The reconciler caught it a day later only because it re-derived the list from the audit rather than from the commit.
+
+### 133. `--where` on an `ir.Inet` column freezes a filtered sync at exit 0 — *OPEN, high; live-verified, and the residual that was said to be filed but never was*
+
+`rowpredicate/identifier_literal.go:161`. `ir.Inet` is an empty struct — it carries no family discriminator — and MariaDB's INET6 stores `'10.0.0.1'` as `::ffff:10.0.0.1`. So a `--where ip = '10.0.0.1'` matches server-side during the cold copy and NEVER matches in the client-side CDC evaluator: the sync freezes, having caught up, at exit 0. **Live-verified on mariadb:11.4.**
+
+This is exactly the C1 network-literal class, on the cells item 117 scoped out. Item 117's scope-out said the residual "can be filed separately" — **and no item was ever filed**, so a commit message became the only record of an open silent-loss finding. Fix mirrors `MACWidth == 0`: give `ir.Inet` a Family field and refuse loudly when the discriminant is missing.
+
+### 132. GTID-mode row positions contain their own in-flight transaction, so a mid-tx checkpoint silently loses the transaction's tail — *OPEN, CRITICAL (audit 2026-08-05 A-2)*
+
+`mysql/cdc_reader.go:860`. `gtidSet.Update` runs at transaction START, and `positionFor` stamps the running set on every row — so a row's recorded position is a GTID set that **already contains the transaction being read**. Such a position is a valid resume point only at or after commit: `StartSyncGTID` with a set containing tx N skips tx N *entirely*.
+
+The only guard, `CheckpointOnlyAtTxBoundary`, is set **only on the MySQL target applier**. The PG applier persists the last change's position on every row-cap/byte-cap/idle/channel-close flush, mid-source-transaction included — and its own header justifies that with "replay from that position via idempotency reproduces the missed work", which is true for PG *sources* and false for MySQL GTID sources. **A source-engine property encoded on a target-engine knob**, which is the item-111 flag-parity lesson generalized from flags to correctness contracts.
+
+**Scope, as the verifier corrected it:** the DEFAULT concurrent laneapply path is IMMUNE (it checkpoints only at TxCommit). Serial apply remains reachable in supported configurations — `--apply-concurrency 1`, the budget-probe degrade-to-serial, the ADR-0107 headroom clamp — which is exactly the constrained-target environment where AIMD also shrinks batches, i.e. where a large transaction is most likely to straddle a flush. The `TransactionPayloadEvent` start-anchoring cited as prior art is itself a no-op in GTID mode and shares the hazard.
+
+**Fix:** hold the pending GTID in a staging variable on GTIDEvent and fold it into `r.gtidSet` on XIDEvent / MariaDB commit, so rows naturally carry the PRE-transaction set. Fix the `TransactionPayloadEvent` arm and the DDL QueryEvent implicit-commit in the same pass; check `verifyPositionResumable`'s purged-check still passes pre-tx sets. The file/pos arm wants BEGIN-anchored LogPos for the CDC-2 sibling (a crash-loop on warm resume — "rows event for unknown table_id", which is not `ErrPositionInvalid` so auto-resnapshot never fires).
+
+**Gate (G-2):** a fail-by-default divergence map over EVERY registered ChangeApplier's `BatchConfig` — `CheckpointOnlyAtTxBoundary=true` OR a written exemption proving mid-tx positions from every possible SOURCE are valid restart points (the `TestMigrateSyncFlagSurfaceParity` pattern) — plus a reader-side pin that a GTID-mode row position does NOT contain its enclosing transaction. **This is a concurrency/resume-semantics chunk: the `-race` integration gate must be green BEFORE any tag ships it.**
+
+### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *OPEN, CRITICAL, DEFAULT-ON (audit 2026-08-05 A-1)*
+
+`internal/laneapply/router.go:21`. The key-hash apply is default-on (`--apply-concurrency 0` → W=4) and engaged by the streamer, the broker and chain-restore. It guarantees ordering per **(table, PRIMARY KEY)** — its doc says the dependent-row hazard "cannot occur", which is true for one key and false across two.
+
+Changes to DIFFERENT primary keys that collide on a **secondary unique index** land on different lanes with unconstrained commit order. On MySQL-family targets every lane INSERT carries `ON DUPLICATE KEY UPDATE`, and that clause fires on ANY unique index — `change_applier_multirow.go`'s own comment says so. So for source order `DELETE(pk=1, uniq='x')` then `INSERT(pk=2, uniq='x')`, with the INSERT lane committing first:
+
+1. the INSERT conflicts on `uniq` against the surviving row pk=1, and ODKU **mutates pk=1 in place** (PK excluded from the SET list) rather than inserting pk=2;
+2. the DELETE lane then removes pk=1;
+3. **zero rows where the source has one.** Both lanes report success and the checkpoint advances past the loss.
+
+A PG target manifests this loudly instead (23505, terminal), so the silent form is MySQL-family-specific. **ODKU mechanism observed on real MySQL 8.0.** No ADR analyses the cross-key unique hazard; the FK analogue (Bug 164) got a bypass and unique constraints got nothing.
+
+**Fix shape.** The architecture already has the right seam: `PKValuesForRouting` returning `ok=false` sends a change to the globally-ordered barrier path, which is how keyless and PK-changing updates are already handled. But a barrier per row on such a table is expensive. Prefer **routing every change on a table carrying a non-PK unique index to a SINGLE lane** — that orders the table's changes against each other while keeping cross-table concurrency. The index metadata is already loaded and cacheable.
+
+**Owner question, recorded because it changes the work:** single-lane routing costs concurrency on exactly the hot tables that most want it. The alternative is unique-value-aware sequencing (barrier only on an observed value collision), which is more code and more risk. Single-lane is the recommended first cut; measure lane skew on unique-heavy schemas before deciding whether to invest further.
+
+**Gate (G-1):** a `PKValuesForRouting` roster asserting every table with a secondary unique index resolves to one lane (mutation both directions), plus a `laneCommitHookForTest` stall-ordering integration pin — DELETE lane stalled, INSERT lane commits, final state must equal source. That pin **fails today on MySQL and crashes on PG**, which is the point: write it first, watch it go red, then fix. **Concurrency chunk — `-race` integration green before the tag.**
+
 ### 130. Smart compaction's EMITTED stream is still unbounded — the other half of item 127 — *OPEN, medium; the named residual of item 127*
 
 Item 127 bounded the retained-INPUT term: `s.accumulators` now evicts under a byte ceiling. `s.out` was the OTHER growing structure the audit named, and it is untouched — the compactor appends every emitted event and holds them all until `applySmartCompactionToIncremental` re-encodes them. So peak is now O(cap + output) rather than O(input).
@@ -1882,9 +1924,16 @@ That is the shared-evidence class the 2026-08-01 rule names — a verification w
 
 **Scope it honestly when taking it:** the point is not only the >64 MiB row. It is that the whole verify surface's evidence is the artifact itself. State which failure modes the new depth actually covers and which it still cannot, rather than implying a parse makes verify complete.
 
-**Where the wider audit backlog lives, because it is NOT in git:** `workspace/` is gitignored (`.gitignore:99`), so `workspace/repo-audit-2026-08-01.md` and `workspace/repo-audit-2026-08-04.md` exist on the author's machine only. The 08-01 audit's section-4 MEDIUMs (compaction re-stamps its own verify hashes; `verifySchemaHashes` never runs for a bare full; the broker hand-rolls a subset of the shared preflights and drops target tables off an UNVERIFIED manifest) and **nine of its ten §4 gate proposals** are recorded there and nowhere else. If those files are lost, that backlog is lost with them.
+**Where the wider audit backlog lives — now TRACKED: [`audit-backlog.md`](audit-backlog.md).** The full audit reports still live in gitignored `workspace/`, but the open findings they carry no longer exist only there. That file is the durable copy; add to it whenever an audit lands, and promote anything with a confirmed silent-loss consequence to a numbered item here instead.
 
-### 128. A backup you can take, VERIFY CLEAN, and never restore — a row over 64 MiB (Bug 226) — *✅ FIXED on `main` 2026-08-05; unreleased*
+**Two corrections the 2026-08-05 reconciler made to this paragraph, both of which had been repeated as fact:**
+
+- **The 08-01 gate proposals are NOT "nine of ten open".** Verified against the code: **6 BUILT, 2 PARTIAL, 2 OPEN.** Proposals 2/4/5 were built during the C1/C3 remediation itself (`f9389105`, `7e2a2d94`). Still open: the IR field-classification/DDL property gate, and the goroutine global-read analyzer. The wrong figure also propagated into project memory and was corrected there.
+- **The MEDIUMs named here are the 08-04 audit's, not 08-01's** (compaction re-stamping its own verify hashes; `verifySchemaHashes` never running for a bare full; the broker's hand-rolled preflight subset).
+
+This is the doc-lags-code shape the working agreements already name, on a paragraph whose whole purpose was to record what is untracked — worth noting that a note *about* backlog durability rotted the same way anything else does.
+
+### 128. A backup you can take, VERIFY CLEAN, and never restore — a row over 64 MiB (Bug 226) — *✅ SHIPPED in **v0.112.0** (2026-08-05)*
 
 Found by the v0.111.1 regression cycle while BOUNDING item 116's new chunk byte ceiling — pushing on the limit next door is what surfaced it. **Pre-existing**, identical on v0.111.0 and earlier, not a regression from 116.
 
@@ -1944,7 +1993,7 @@ Pinned by a refusal test, a large-but-readable control (1 MiB round-trips — wi
 
 **Gate it with a measured ceiling**, in the shape item 116 P3 used: a test that drives the real compactor with wide events and asserts peak retention stays under the cap, plus a control asserting a narrow corpus still collapses exactly as it does today (byte-identical output).
 
-### 126. Copy-parallelism AIMD burns its whole retry budget on the first wave, so a transient slot shortage aborts the run (audit 2026-08-04 HIGH) — *✅ FIXED on `main` 2026-08-05; unreleased*
+### 126. Copy-parallelism AIMD burns its whole retry budget on the first wave, so a transient slot shortage aborts the run (audit 2026-08-04 HIGH) — *✅ SHIPPED in **v0.112.0** (2026-08-05)*
 
 **Implementation notes.** `attempts` / `totalWait` became `attemptsByChunk` / `waitByChunk`, keyed on the `chunkIndex` the API already carried. Safe because the gate is constructed PER TABLE over that table's chunk set (`NewCopyParallelismGate(len(chunks), …)`), so the index is unique within a gate — checked, not assumed.
 
@@ -1962,7 +2011,7 @@ So the counter conflates two different things: how many times ONE chunk has retr
 
 **Gate it at parallelism ≥ 7 specifically** — the audit's finding is that the property holds at low parallelism and fails at the default, so a test at 1–4 workers is green and vacuous.
 
-### 125. `sluice schema diff` is structurally blind to the constraint drift the S8 work exists to prevent (audit 2026-08-04 HIGH, S9) — *✅ FIXED on `main` 2026-08-05 (both halves); unreleased*
+### 125. `sluice schema diff` is structurally blind to the constraint drift the S8 work exists to prevent (audit 2026-08-04 HIGH, S9) — *✅ SHIPPED in **v0.112.0** (2026-08-05, both halves)*
 
 **Index half — DONE.** `TableDiff.IndexesMismatched []IndexDiff` compares indexes present on both sides under one name, on the attributes that decide WHICH ROWS ARE LEGAL: the column list rendered INCLUDING per-column prefix length (so `email(10)` vs `email` is visible — the S8 class), `Unique`, and the partial `Predicate`. The PRIMARY KEY participates, matching `indexNames`' set. Deliberately NOT compared: index kind/method (a performance property no cross-engine pair agrees on; would make every MySQL↔PG diff noisy) and column ORDERING (ADR-0029 v1 scope). Wired through `HasChanges`, `Summary`, the JSON counts and the text renderer — the renderer leads with the CONSEQUENCE (`the target ACCEPTS ROWS THE SOURCE REJECTS`) rather than the attribute, because that is what decides urgency. Pinned by a matrix derived from the defect family (prefix dropped/differs, uniqueness dropped, predicate dropped, column set) plus two clean controls; mutation-confirmed twice — removing the comparison, and dropping the prefix from the renderer, each fail exactly the rows they should.
 
@@ -1982,7 +2031,7 @@ That is the operator-facing surface someone would reach for to CHECK for exactly
 
 **Fix shape.** Add index-mismatch and FK entries to `TableDiff`, comparing the attributes that actually change semantics — the column list including `IndexColumn.Length`, `Unique`, the partial predicate, and the FK's columns/referenced table/actions. The drift-report structs are the model for the shape. **Pin it against the class it exists to catch:** the S8 matrix — prefix length, partial predicate, uniqueness — must each produce a diff entry, with a control that an identical schema still reports clean.
 
-### 124. `information_schema.table_rows` on MariaDB undershot by 40%, so progress read as a count mismatch — *✅ FIXED on `main` 2026-08-04; unreleased*
+### 124. `information_schema.table_rows` on MariaDB undershot by 40%, so progress read as a count mismatch — *✅ SHIPPED in **v0.111.1** (2026-08-05)*
 
 **The surface was narrower than the filing assumed, and finding that out was the work.** Both progress surfaces ALREADY labelled the number: the TTY panel renders `100%+` and annotates the count "est. exceeded", and the non-TTY `bulk copy progress` line has carried `total_rows_estimated=true` since roadmap #22. The one that did not was the **dry-run plan** — which is precisely the number an operator diffs against the final copied count, since it is printed once, up front, per table. Fixed by adding `row_count_estimated` to `PlanTable` (JSON and slog), mirroring the progress line's existing convention. `-1` (unavailable) is deliberately NOT labelled estimated: "unknown" and "an approximate zero" are different claims, and the sentinel exists so consumers cannot confuse unknown with empty.
 
@@ -1994,7 +2043,7 @@ The TTY panel already handles it (`model.go` renders `100%+` and annotates the c
 
 Note the class this belongs to: it is a *verification whose expected value is not independent* wearing UX clothes. The estimate and the true count come from different oracles, and the display implied they should agree.
 
-### 123. The buffer-pool tier proxy mis-tiered a PS-160 to the tightest cap, and its own "operator-visible" provenance was never logged — *✅ FIXED on `main` 2026-08-04 (from the field report); unreleased*
+### 123. The buffer-pool tier proxy mis-tiered a PS-160 to the tightest cap, and its own "operator-visible" provenance was never logged — *✅ SHIPPED in **v0.111.1** (2026-08-05, from the field report)*
 
 ADR-0116 Part B caps copy parallelism from `@@innodb_buffer_pool_size`, on the premise that the value scales monotonically by PlanetScale plan tier (live-measured PS-10 0.125 GB → PS-160 9.80 GB) and is not masked by vtgate. **The premise failed in the field:** a PS-160 branch returned **32 MiB**, which bucketed to the smallest tier and capped table parallelism at **2 instead of 8** — a silent 4× throughput loss on a large instance. The reporter noticed only because they read the code.
 
@@ -2006,7 +2055,7 @@ ADR-0116 Part B caps copy parallelism from `@@innodb_buffer_pool_size`, on the p
 
 **Residual, stated because it is real:** sluice still has no credential-free way to read a PlanetScale branch's actual tier, so when the probe is masked there is now NO tier cap rather than a wrong one. The metrics-aware clamp (ADR-0115/0107) remains the robust path when telemetry is configured. What the fix buys is that the failure is loud and the fallback is the safe direction.
 
-### 122. A vtgate transport loss was terminal in one wire framing and retriable in the other, so a cold copy died 5 times out of 5 — *✅ FIXED on `main` 2026-08-04 (from the field report); unreleased*
+### 122. A vtgate transport loss was terminal in one wire framing and retriable in the other, so a cold copy died 5 times out of 5 — *✅ SHIPPED in **v0.111.1** (2026-08-05, from the field report)*
 
 The blocking finding from the first production field report: `sluice migrate` completed a 2.64 GB / ~16M row MariaDB → PlanetScale move cleanly, and `sluice sync` failed **every** attempt during cold-start bulk copy — always on the widest table, always 90–130 s in, at a **varying** chunk index (so: not one bad row), with
 
@@ -2024,7 +2073,7 @@ Error 1105 (HY000): internal: vtgate connection error (read: connection reset by
 
 **What is NOT established, stated so nobody inherits it:** *why* the connection dropped. A storage-grow reparent on the downsized branch fits the timing, but their logs were not available and the classifier gap is provable without it. Their batch size is explained, though, and it rules one theory out: ~4,000 rows/statement is exactly `maxBulkInsertPlaceholders`(60000) ÷ 15 columns, i.e. the placeholder ceiling, which means the statement was under the ~1 MiB byte target and the failure was **not** an oversized write. Whether the retry now rides their specific drop out is unverified until they re-run.
 
-### 121. `ir.Enum.TypeName` is dropped by every manifest round trip, so a restored PG enum is re-created under a synthesized name — *✅ FIXED on `main` 2026-08-04; unreleased*
+### 121. `ir.Enum.TypeName` is dropped by every manifest round trip, so a restored PG enum is re-created under a synthesized name — *✅ SHIPPED in **v0.111.1** (2026-08-05)*
 
 **Implementation notes.** The split Macaddr.Width needed, for a field that is non-zero far more often: `TypeName` now rides the type envelope (`enum_type_name`) so a restore re-creates the type under its real name, and `fingerprintType` strips it so no chain is repartitioned. The PG reader sets it for EVERY enum column, so folding it into the hash would have moved close to every Postgres chain in existence — a bigger blast radius than item 104 itself. Pinned by with-vs-without EQUALITY (which a self-consistent binary cannot satisfy by agreeing with itself), a byte-level assertion that the hashed bytes carry no `enum_type_name` key at all (the cross-version half), a no-mutation check, a rides-the-wire check at all three nesting sites (scalar, array element, domain base), and an anti-vacuity floor asserting an enum VALUE change still moves the hash. Mutation-confirmed both ways: removing the exclusion fails the fingerprint tests, dropping the decode half fails the envelope gate and the wire test.
 
@@ -2058,7 +2107,7 @@ Postgres has no equivalent gap: its inline PK goes through `emitIndexColumnList`
 
 **Why it needs its own change rather than a line in 118.** Closing it makes `PreflightIndexes` refuse a schema that migrates (wrongly) today, so it is a behaviour change with a compatibility note, not a timing fix. `TestPreflightIndexesDoesNotWalkThePrimaryKey` pinned the current behaviour and **failed the moment the emitter was fixed**, which is the signal that told that author to walk `table.PrimaryKey` in SQLite's preflight in the same pass — the two had to land together or the preflight and the emitter disagree. They did, and that test is now deleted in favour of a PRIMARY KEY matrix.
 
-### 119. `--smart-compaction`'s per-row collapse is INERT on every MySQL-family source, and its own report says "no primary key" (Bug 223) — *✅ FIXED on `main` 2026-08-04; unreleased*
+### 119. `--smart-compaction`'s per-row collapse is INERT on every MySQL-family source, and its own report says "no primary key" (Bug 223) — *✅ SHIPPED in **v0.111.1** (2026-08-05)*
 
 **Implementation notes.** Fixed at the LOOKUP, not with the name-only fallback the item filed as the hazard. The rule reads the recorded schema for what it means: an exact (schema, name) match always wins, so a Postgres or multi-database manifest — where the qualifier is real — behaves exactly as before; only when no exact match exists does an UNQUALIFIED manifest table (`Schema == ""`) match by name, because an empty recorded schema means the reader had exactly one namespace and such a name is unique within one manifest by construction. Ambiguity REFUSES to pick and reports itself, which is belt-and-braces: the construction argument says it cannot happen, and this whole item exists because an argument of that shape was already wrong once. A wrong PK tuple means a wrong collapse, which is silent data loss on a BACKUP path — strictly worse than the inertness.
 
