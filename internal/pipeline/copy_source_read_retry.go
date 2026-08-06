@@ -213,12 +213,22 @@ func copyTableWithSourceReadRetry(
 		if !isRetriableSourceReadError(err) {
 			return err
 		}
-		// ADR-0110: a classified source-read drop is the READ-side face of a
-		// target storage-grow stall (the backpressure-EOF a stalled target
-		// induces). TRIP the shared gate so sibling lanes quiesce together
-		// for the grow window. Coalescing + idempotent; this lane keeps its
-		// own bounded retry below as the authoritative floor.
-		migcore.TripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error())
+		// ADR-0110: trip the shared gate so sibling lanes quiesce together
+		// rather than each hammering on independently. Coalescing +
+		// idempotent; this lane keeps its own bounded retry below as the
+		// authoritative floor.
+		//
+		// [ir.GrowEvidenceNone], and this is the honest value rather than a
+		// conservative one (item 143). The comment here used to read "a
+		// classified source-read drop is the READ-side face of a target
+		// storage-grow stall (the backpressure-EOF a stalled target induces)",
+		// which is a two-step inference — the SOURCE dropped, therefore the
+		// target may be backpressuring, therefore the target may be growing —
+		// asserted as a fact. It can be true. Nothing on this path observes
+		// the target at all: `err` came from the source connection, and
+		// [isRetriableSourceReadError] classifies source transport shapes. So
+		// there is no target-side evidence to report and the trip says so.
+		migcore.TripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error(), ir.GrowEvidenceNone)
 		if time.Now().After(deadline) || try >= coldCopySourceReadRetryAttempts {
 			return fmt.Errorf(
 				"pipeline: cold-copy of %q: source read still failing after riding the reconnect-and-resume window "+

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // withFastGrowGate shrinks the gate's time envelope to near-zero for the
@@ -53,7 +55,7 @@ func TestGrowGate_NilGateHelpersArePreADRNoOps(t *testing.T) {
 	if err := AwaitGrowGate(context.Background(), nil); err != nil {
 		t.Fatalf("AwaitGrowGate(nil) = %v, want nil", err)
 	}
-	TripGrowGate(nil, "no-op") // must not panic
+	TripGrowGate(nil, "no-op", ir.GrowEvidenceNone) // must not panic
 	// GrowGateOrNil(nil) must be a TRUE nil interface (no typed-nil trap).
 	if got := GrowGateOrNil(nil); got != nil {
 		t.Fatal("GrowGateOrNil(nil) must be a true nil interface")
@@ -72,7 +74,7 @@ func TestGrowGate_TripPausesThenReopens(t *testing.T) {
 	withFastGrowGate(t)
 
 	g := NewGrowGate(context.Background(), nil)
-	g.Trip("storage grow")
+	g.Trip("storage grow", ir.GrowEvidenceNone)
 
 	done := make(chan error, 1)
 	go func() { done <- g.Await(context.Background()) }()
@@ -95,7 +97,7 @@ func TestGrowGate_ReopenWakesAllParkedAwaiters(t *testing.T) {
 	withFastGrowGate(t)
 
 	g := NewGrowGate(context.Background(), nil)
-	g.Trip("grow")
+	g.Trip("grow", ir.GrowEvidenceNone)
 
 	const n = 32
 	var wg sync.WaitGroup
@@ -145,7 +147,7 @@ func TestGrowGate_ConcurrentTripsCoalesceOneWindow(t *testing.T) {
 	for i := range n {
 		go func(i int) {
 			defer wg.Done()
-			g.Trip("lane trip")
+			g.Trip("lane trip", ir.GrowEvidenceNone)
 			_ = i
 		}(i)
 	}
@@ -180,7 +182,7 @@ func TestGrowGate_CtxCancelUnwindsAllParked(t *testing.T) {
 	})
 
 	g := NewGrowGate(context.Background(), nil)
-	g.Trip("grow that won't lift on its own")
+	g.Trip("grow that won't lift on its own", ir.GrowEvidenceNone)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	const n = 16
@@ -224,7 +226,7 @@ func TestGrowGate_OwnerExitsOnRunCtxCancel(t *testing.T) {
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	g := NewGrowGate(runCtx, nil)
-	g.Trip("grow")
+	g.Trip("grow", ir.GrowEvidenceNone)
 
 	// Park one Awaiter on its own ctx (not the run ctx) so the ONLY thing
 	// that can release it is the owner reopening the gate on run-ctx cancel.
@@ -262,7 +264,7 @@ func TestGrowGate_MaxHoldBoundsAGenuinelyDeadTarget(t *testing.T) {
 	})
 
 	g := NewGrowGate(context.Background(), nil)
-	g.Trip("dead target")
+	g.Trip("dead target", ir.GrowEvidenceNone)
 
 	// Hammer re-trips so the window keeps trying to extend; max-hold must
 	// still force a reopen.
@@ -275,7 +277,7 @@ func TestGrowGate_MaxHoldBoundsAGenuinelyDeadTarget(t *testing.T) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				g.Trip("still dead")
+				g.Trip("still dead", ir.GrowEvidenceNone)
 			}
 		}
 	}()
@@ -311,7 +313,7 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 
 	var healthy atomic.Bool // starts false (not recovered)
 	g := NewGrowGate(context.Background(), healthy.Load)
-	g.Trip("proactive: storage near boundary")
+	g.Trip("proactive: storage near boundary", ir.GrowEvidenceNone)
 
 	// Continuously re-trip so the QUIET-CYCLE reopen is suppressed (retripped
 	// stays true every cycle) — this isolates the recovery() accelerator as the
@@ -327,7 +329,7 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 			case <-stop:
 				return
 			case <-tk.C:
-				g.Trip("still near boundary")
+				g.Trip("still near boundary", ir.GrowEvidenceNone)
 			}
 		}
 	}()
@@ -373,7 +375,7 @@ func TestGrowGate_ProactiveQuietCyclesNotHeldToMaxHold(t *testing.T) {
 	// across a reparent) — so ONLY the quiet cycle can reopen it.
 	neverRecovered := func() bool { return false }
 	g := NewGrowGate(context.Background(), neverRecovered)
-	g.Trip("proactive: storage near boundary") // no further re-trips
+	g.Trip("proactive: storage near boundary", ir.GrowEvidenceNone) // no further re-trips
 
 	done := make(chan error, 1)
 	go func() { done <- g.Await(context.Background()) }()
@@ -430,14 +432,14 @@ func TestGrowGate_ReTripAfterReopenStartsFreshWindow(t *testing.T) {
 	g.onOwnerStart = func() { owners.Add(1) }
 
 	// First window.
-	g.Trip("grow step 1")
+	g.Trip("grow step 1", ir.GrowEvidenceNone)
 	if err := g.Await(context.Background()); err != nil {
 		t.Fatalf("Await(1) = %v", err)
 	}
 	// A small settle so the first owner fully tears down (extend nulled).
 	time.Sleep(20 * time.Millisecond)
 	// Second window (target still bad after probe).
-	g.Trip("grow step 2")
+	g.Trip("grow step 2", ir.GrowEvidenceNone)
 	if err := g.Await(context.Background()); err != nil {
 		t.Fatalf("Await(2) = %v", err)
 	}

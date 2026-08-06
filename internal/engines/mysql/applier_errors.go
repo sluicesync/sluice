@@ -605,52 +605,60 @@ var reparentRetriableSubstrings = []string{
 // before comparing, so these MUST be lower-case.
 // [TestVtgateTransientSubstrings_PinDown] pins the literals; extend that
 // test and this slice together.
-var vtgateTransientSubstrings = []string{
-	// (1) buffer.ClusterEvents — Code_CLUSTER_EVENT.
-	"primary is not serving",
-	"reparent operation in progress",
-	"current keyspace is being resharded",
-	// (2) tabletgateway.go withRetry — Code_UNAVAILABLE.
-	"inconsistent state detected, primary is serving",
-	"no healthy tablet available for",
-	"no connection for tablet",
-	// (2) buffer.go sentinels, reached via the WaitForFailoverEnd wrap.
-	"primary buffer is full",
-	"buffer full: request evicted for newer request",
-	"destination shard is missing after a resharding operation",
-	// (3) vtgate's own TRANSPORT-loss framing — the connection between
-	// vtgate and the tablet died mid-statement, which vtgate reports in
-	// its own wording rather than in vttablet's gRPC framing:
-	//
-	//	Error 1105 (HY000): internal: vtgate connection error
-	//	  (read: connection reset by peer)
-	//
-	// Provenance, stated because it differs from (1) and (2): this one is
-	// FIELD-DERIVED (a 2026-08-04 report of a MariaDB→PlanetScale cold
-	// copy failing 5 times out of 5 on the same wide table, 90–130s in),
-	// not read off an upstream constant. The sentence above is the
-	// observed text.
-	//
-	// It is the SIBLING of the Number-2013 branch above, one wire framing
-	// over, and the miss has exactly the shape that branch's comment
-	// describes: the transport cause is TEXT inside a *MySQLError message,
-	// so errors.Is(err, io.EOF) cannot see it, and under Number 1105 only
-	// this substring set is consulted. sluice already retried the SAME
-	// underlying loss when vttablet framed it
-	// (`... vttablet: rpc error: code = Unavailable desc = connection
-	// reset by peer` matches via classifyVitessMessage) — so the two
-	// framings of one condition disagreed, and the one an operator
-	// actually hits on a cold copy was the terminal one.
-	//
-	// Echo-safety (the rule this set is built on): "vtgate connection
-	// error" is vtgate's own product noun, not three generic English
-	// words — it cannot plausibly appear in a migrated row the way
-	// "no available connection" could. The generic transport tails
-	// ("connection reset by peer", "unexpected EOF") are deliberately NOT
-	// matched on their own for exactly that reason; the vtgate framing is
-	// the anchor and it carries any tail.
-	"vtgate connection error",
-}
+//
+// # Why this is a concatenation rather than a literal list (item 143)
+//
+// The groupings below — "(1)/(2) vtgate availability sentences" versus
+// "(3) vtgate's own TRANSPORT-loss framing" — were comments describing a
+// distinction the code did not hold. Item 143 needs that distinction as a
+// VALUE (a trip's grow-gate log states which class it observed instead of
+// asserting "likely a primary reparent"), so the two halves are now the
+// declarations and this set is their union. RETRIABILITY IS UNCHANGED: the
+// matcher still scans the whole set, and the concatenation preserves the
+// original order literal-for-literal. See
+// [vtgateServingTransitionSubstrings] / [vtgateTransportSubstrings] in
+// grow_evidence.go, and [TestVtgateSubstringHalves_PartitionTheTransientSet],
+// which fails if a literal is added to one half but not to the union — the
+// drift this shape exists to make impossible.
+//
+// The per-entry provenance for each half stays with its own declaration; what
+// follows is the derivation of the SET, which is the part that must not be
+// lost:
+//
+//	(1) buffer.ClusterEvents — Code_CLUSTER_EVENT.
+//	(2) tabletgateway.go withRetry — Code_UNAVAILABLE, plus the buffer.go
+//	    sentinels reached via the WaitForFailoverEnd wrap.
+//	(3) vtgate's own TRANSPORT-loss framing — the connection between vtgate
+//	    and the tablet died mid-statement, which vtgate reports in its own
+//	    wording rather than in vttablet's gRPC framing:
+//
+//	Error 1105 (HY000): internal: vtgate connection error
+//	  (read: connection reset by peer)
+//
+// Provenance, stated because it differs from (1) and (2): (3) is
+// FIELD-DERIVED (a 2026-08-04 report of a MariaDB→PlanetScale cold copy
+// failing 5 times out of 5 on the same wide table, 90–130s in), not read off
+// an upstream constant. The sentence above is the observed text. It is the
+// SIBLING of the Number-2013 branch above, one wire framing over, and the miss
+// has exactly the shape that branch's comment describes: the transport cause
+// is TEXT inside a *MySQLError message, so errors.Is(err, io.EOF) cannot see
+// it, and under Number 1105 only this substring set is consulted. sluice
+// already retried the SAME underlying loss when vttablet framed it
+// (`... vttablet: rpc error: code = Unavailable desc = connection reset by
+// peer` matches via classifyVitessMessage) — so the two framings of one
+// condition disagreed, and the one an operator actually hits on a cold copy
+// was the terminal one.
+//
+// Echo-safety (the rule this set is built on): "vtgate connection error" is
+// vtgate's own product noun, not three generic English words — it cannot
+// plausibly appear in a migrated row the way "no available connection" could.
+// The generic transport tails ("connection reset by peer", "unexpected EOF")
+// are deliberately NOT matched on their own for exactly that reason; the
+// vtgate framing is the anchor and it carries any tail.
+var vtgateTransientSubstrings = append(
+	append([]string{}, vtgateServingTransitionSubstrings...),
+	vtgateTransportSubstrings...,
+)
 
 // vitessTransportNouns and vitessTransportLossTokens form the AND-gate that
 // catches a Vitess-layer TRANSPORT loss whose exact sentence sluice does not

@@ -45,11 +45,95 @@ type GrowGate interface {
 	// measurable cost to an untroubled copy.
 	Await(ctx context.Context) error
 
-	// Trip closes the gate (or extends an in-effect pause) and records
-	// reason for the structured log. Idempotent and concurrency-safe:
-	// concurrent trips from many lanes + the telemetry sidecar COALESCE
-	// into ONE pause window rather than stacking.
-	Trip(reason string)
+	// Trip closes the gate (or coalesces into an in-effect pause) and records
+	// reason + evidence for the structured log. Idempotent and
+	// concurrency-safe: concurrent trips from many lanes + the telemetry
+	// sidecar COALESCE into ONE pause window rather than stacking.
+	//
+	// evidence is what the caller ACTUALLY OBSERVED, not what it suspects —
+	// see [GrowEvidence]. It is descriptive only: the gate's behaviour is
+	// identical for every value, so a caller can never make the copy quiesce
+	// harder by claiming more.
+	Trip(reason string, evidence GrowEvidence)
+}
+
+// GrowEvidence records what a [GrowGate.Trip] actually OBSERVED about the
+// target, as opposed to what the trip's cause might have been.
+//
+// # Why this exists (roadmap item 143)
+//
+// The gate trips on the engine's whole retriable-transient class, and every
+// operator-facing sentence attached to that trip used to assert a cause it had
+// no evidence for — "likely a primary reparent / 'not serving'". Two
+// independent datasets say that assertion is almost always wrong: in the
+// 2026-08-05 field log 244 of 246 gate windows were opened by
+// `vtgate connection error: no endpoints`, a routing/transport error carrying
+// no reparent evidence at all, and zero by any reparent-evidenced face; and
+// across ~870 absorbed drops over six A/B runs on real PlanetScale, zero
+// carried reparent evidence. A word like "likely" in a log line is a
+// hypothesis nobody can check, and it sent readers looking for a reparent
+// that did not happen.
+//
+// So the claim is DERIVED rather than asserted. Each engine classifies the
+// error it is tripping on with the SAME predicates its retriable classifier
+// uses, and the log states the verdict instead of guessing at a cause.
+//
+// # What this does NOT do, deliberately
+//
+// It does not narrow WHEN the gate trips. Phase A of item 143 could not
+// establish that a real storage-grow reparent is distinguishable at the trip
+// point — a genuine grow's most common face on an in-flight write is the
+// connection dying, which is byte-identical to a plain transport drop — so
+// gating the quiesce on [GrowEvidenceTargetFace] would trade a cheap
+// false-positive quiesce for the possibility of missing the very event the
+// gate exists for. Absence of evidence is not evidence of absence, and this
+// type is named for what it is: evidence, not cause.
+//
+// What it DOES buy is that the next field log can answer the question this
+// item could not: how often the gate fires on a face that actually names a
+// serving transition. Today every trip reason is raw error text and the
+// answer has to be re-derived by hand from 246 log lines.
+type GrowEvidence uint8
+
+const (
+	// GrowEvidenceNone — the trip carried NO storage-grow / serving-transition
+	// evidence. The error is a transport/connection loss, a contention shape, a
+	// timeout, or any other classified transient that says nothing about the
+	// target's serving state. This is the ZERO VALUE on purpose (the v0.99.51
+	// zero-value trap, applied to a CLAIM rather than to behaviour): a caller
+	// that forgets to classify must under-claim, never over-claim, because
+	// over-claiming a cause is the defect this type was added to remove.
+	GrowEvidenceNone GrowEvidence = iota
+
+	// GrowEvidenceTargetFace — the error IS one of the documented storage-grow
+	// / serving-transition faces: the target said it was out of disk, that it
+	// was read-only, or that no primary was serving / a reparent was in
+	// progress. The engine derives this from the same predicates that made the
+	// error retriable, so the two cannot drift.
+	GrowEvidenceTargetFace
+
+	// GrowEvidenceTelemetry — no error at all: an out-of-band storage-headroom
+	// observation (the ADR-0110 telemetry sidecar) says the target is
+	// approaching its auto-grow boundary. This is the only PROACTIVE trip
+	// source and the only one whose evidence is about storage rather than
+	// about a failed write.
+	GrowEvidenceTelemetry
+)
+
+// String renders the verdict as the stable token that appears in the
+// structured logs. These strings are operator-facing and greppable across a
+// run's log, which is the whole point of the type — keep them stable.
+func (e GrowEvidence) String() string {
+	switch e {
+	case GrowEvidenceTargetFace:
+		return "target-grow-face"
+	case GrowEvidenceTelemetry:
+		return "telemetry-headroom"
+	case GrowEvidenceNone:
+		return "no-grow-evidence"
+	default:
+		return "no-grow-evidence"
+	}
 }
 
 // GrowGateQuiesceObserver is the OPTIONAL surface a [GrowGate] implements so

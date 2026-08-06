@@ -194,7 +194,12 @@ func evalStorageHeadroomTickWithGate(
 ) bool {
 	next := evalStorageHeadroomTick(ctx, logger, provider, streamID, warned)
 	if !warned && next && gate != nil {
-		gate.Trip("proactive: target storage headroom approaching the auto-grow boundary (ADR-0110 telemetry)")
+		// The ONE trip source whose evidence is a storage observation rather
+		// than a failed write, and the only one entitled to say so (item 143).
+		gate.Trip(
+			"proactive: target storage headroom approaching the auto-grow boundary (ADR-0110 telemetry)",
+			ir.GrowEvidenceTelemetry,
+		)
 	}
 	return next
 }

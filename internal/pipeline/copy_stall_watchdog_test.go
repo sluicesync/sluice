@@ -187,7 +187,7 @@ func TestCopyStallWatchdog_SilentDuringADeliberateGrowGateQuiesce(t *testing.T) 
 		t.Fatal("the grow gate did not bind as a quiesce source; the watchdog would report every ADR-0110 window as a stall")
 	}
 
-	gate.Trip("test: simulated target storage grow")
+	gate.Trip("test: simulated target storage grow", ir.GrowEvidenceNone)
 
 	w := startCopyStallWatchdog(qctx, &copyStallWatchdog{
 		table:     "orders",
@@ -246,7 +246,7 @@ func TestGrowGateQuiescedSince_AnswersTheThreeCases(t *testing.T) {
 	if gate.QuiescedSince(time.Now().Add(-time.Hour)) {
 		t.Error("a gate that never closed reports quiesced")
 	}
-	gate.Trip("test")
+	gate.Trip("test", ir.GrowEvidenceNone)
 	if !gate.QuiescedSince(time.Now()) {
 		t.Error("a CLOSED gate does not report quiesced — every grow window would be read as a stall")
 	}

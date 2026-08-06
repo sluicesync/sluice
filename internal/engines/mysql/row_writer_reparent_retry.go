@@ -205,7 +205,7 @@ func (w *RowWriter) flushWithReparentRetry(
 		// target. Idempotent + coalescing: the ~W×D lanes that hit the
 		// transient at once collapse into one pause window. This lane keeps
 		// its own bounded retry below as the floor.
-		w.tripGrowGate("mysql cold-copy flush transient: " + err.Error())
+		w.tripGrowGate("mysql cold-copy flush transient: "+err.Error(), err)
 		// ADR-0113: mark this table as reparent-touched so the restore's
 		// reconciliation phase re-derives it from its chunks — the grow-gate
 		// quiesces lanes but cannot recover rows the reparent dropped before
@@ -238,10 +238,17 @@ func (w *RowWriter) flushWithReparentRetry(
 		}
 
 		backoff := coldCopyReparentBackoff(try)
+		// The message states the VERDICT, not a guess at the cause. "(likely a
+		// primary reparent / 'not serving')" is the exact sentence roadmap item
+		// 143 was filed against: it was printed for every transient, and two
+		// independent datasets say the cause it named was almost never present
+		// — see [ir.GrowEvidence]. `evidence` is derived from this exact error
+		// by [growEvidenceOf], so it cannot go stale the way the sentence did.
 		slog.WarnContext(
-			ctx, "mysql: cold-copy batch flush hit a transient target error (likely a primary reparent / 'not serving'); "+
+			ctx, "mysql: cold-copy batch flush hit a transient target error; "+
 				"re-acquiring a fresh connection and retrying",
 			slog.String("table", tableName),
+			slog.String("evidence", growEvidenceOf(err).String()),
 			slog.Int("rows", rows),
 			slog.Int("attempt", try),
 			slog.Duration("elapsed", time.Since(deadline.Add(-coldCopyReparentMaxWallVar))),
@@ -293,13 +300,20 @@ func (w *RowWriter) awaitGrowGate(ctx context.Context) error {
 }
 
 // tripGrowGate trips the run's shared coordinated-pause gate so sibling
-// cold-copy lanes quiesce together for a grow window. A nil gate ⇒ no-op.
-// Idempotent + coalescing (see [ir.GrowGate.Trip]).
-func (w *RowWriter) tripGrowGate(reason string) {
+// cold-copy lanes quiesce together. A nil gate ⇒ no-op. Idempotent +
+// coalescing (see [ir.GrowGate.Trip]).
+//
+// It takes the ERROR rather than a pre-computed verdict so every MySQL trip
+// site — this flush loop and item 139's connection-acquire loop — classifies
+// through the one predicate ([growEvidenceOf]) instead of each deciding for
+// itself what it saw. That is the arrangement the acquire helper's own doc
+// asked for when it said it "deliberately does not invent a second answer" to
+// item 143.
+func (w *RowWriter) tripGrowGate(reason string, cause error) {
 	if w.growGate == nil {
 		return
 	}
-	w.growGate.Trip(reason)
+	w.growGate.Trip(reason, growEvidenceOf(cause))
 }
 
 // tableNameOf renders a table's name for a message, total over nil so a

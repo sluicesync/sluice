@@ -136,13 +136,18 @@ func (w *RowWriter) awaitGrowGate(ctx context.Context) error {
 }
 
 // tripGrowGate trips the run's shared coordinated-pause gate so sibling
-// cold-copy lanes quiesce together for a grow window. A nil gate ⇒ no-op.
-// Idempotent + coalescing (see [ir.GrowGate.Trip]). Mirrors the MySQL helper.
-func (w *RowWriter) tripGrowGate(reason string) {
+// cold-copy lanes quiesce together. A nil gate ⇒ no-op. Idempotent +
+// coalescing (see [ir.GrowGate.Trip]). Mirrors the MySQL helper.
+//
+// It takes the ERROR rather than a pre-computed verdict so every PG trip site
+// classifies through the one predicate ([growEvidenceOf]) instead of each
+// deciding for itself what it saw — item 143's whole subject is a claim that
+// was made per-site and checked nowhere.
+func (w *RowWriter) tripGrowGate(reason string, cause error) {
 	if w.growGate == nil {
 		return
 	}
-	w.growGate.Trip(reason)
+	w.growGate.Trip(reason, growEvidenceOf(cause))
 }
 
 // quiesceAndReportTransient gives a write core the two HALVES of the grow
@@ -171,7 +176,7 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 	}
 	var re ir.RetriableError
 	if errors.As(classifyApplierError(err), &re) && re.Retriable() {
-		w.tripGrowGate("postgres cold-copy " + what + " transient: " + err.Error())
+		w.tripGrowGate("postgres cold-copy "+what+" transient: "+err.Error(), err)
 	}
 	return err
 }
@@ -235,7 +240,7 @@ func (w *RowWriter) copyChunkWithRetry(
 		// ADR-0110: this lane hit a classified grow-transient — TRIP the shared
 		// gate so every sibling cold-copy lane quiesces together for the grow
 		// window instead of independently hammering the struggling target.
-		w.tripGrowGate("postgres cold-copy chunk transient: " + err.Error())
+		w.tripGrowGate("postgres cold-copy chunk transient: "+err.Error(), err)
 		// Audit B-9 (PG sibling): the replay below re-COPIES a byte-identical
 		// chunk. Safe when the prior attempt rolled back, and safe-because-
 		// loud on a keyed table when it did not (23505). On a keyless table
@@ -258,10 +263,17 @@ func (w *RowWriter) copyChunkWithRetry(
 		}
 
 		backoff := pgCopyReparentBackoff(try)
+		// The message states the VERDICT, not a guess at the cause. It used to
+		// read "(likely a storage auto-grow / 'could not extend file' /
+		// reparent)" for every transient, including the connection drops that
+		// are the overwhelming majority — see [ir.GrowEvidence] for the two
+		// datasets and roadmap item 143. `evidence` is derived from this exact
+		// error by [growEvidenceOf].
 		slog.WarnContext(
-			ctx, "postgres: cold-copy chunk COPY hit a transient target error (likely a storage auto-grow / 'could not extend file' / reparent); "+
+			ctx, "postgres: cold-copy chunk COPY hit a transient target error; "+
 				"re-acquiring a fresh connection and retrying the chunk",
 			slog.String("table", tableName),
+			slog.String("evidence", growEvidenceOf(err).String()),
 			slog.Int("rows", rows),
 			slog.Int("attempt", try),
 			slog.Duration("elapsed", time.Since(deadline.Add(-pgCopyReparentMaxWallVar))),

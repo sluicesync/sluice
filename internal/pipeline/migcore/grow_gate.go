@@ -15,6 +15,58 @@
 // and breeding secondary 1205 lock-wait-timeouts. The target completes
 // the transition faster if left alone.
 //
+// # WHAT THE GATE ACTUALLY TRIPS ON, versus what that paragraph describes
+//
+// The paragraph above is the argument this gate was designed around, and it is
+// an argument about a SERVING TRANSITION. It is not the situation the gate
+// spends most of its time in, and roadmap item 143 exists because nothing said
+// so. The gate trips on the engine's whole retriable-transient class, and by
+// two independent datasets that class is dominated by plain transport drops:
+// 244 of the 246 windows in the 2026-08-05 field log were opened by
+// `vtgate connection error: no endpoints`, with ZERO opened by a
+// reparent-evidenced face; and across ~870 absorbed drops over six A/B runs on
+// real PlanetScale, none carried reparent evidence either.
+//
+// The trip set is unchanged, deliberately. What a real grow looks like on the
+// wire is not reliably separable from a plain drop at the trip point — a
+// grow's most common face on an in-flight write is the connection dying — and
+// the corroborating observations are not available where the decision is made:
+// the tier probe is a one-shot preflight capacity read, and the telemetry
+// sidecar is opt-in (`--planetscale-org`), absent entirely on `migrate` and
+// `restore`, lagging by up to a poll interval plus its freshness window, and
+// documented right here (see [GrowGate.runOwner]) as transiently DISAPPEARING
+// across the very reparent it would corroborate. So the gate cannot be made
+// evidence-GATED; what it can do is stop pretending, which is
+// [ir.GrowEvidence].
+//
+// # So why quiesce on a plain transport drop at all
+//
+// Two reasons, and neither is the paragraph above — writing them down is half
+// of what item 143 delivered:
+//
+//   - ALIGNMENT for the lane that tripped: its hold overlaps the per-lane
+//     backoff it would have taken anyway, so the target gets contiguous quiet
+//     rather than a smear of retries. Note the scope, because the earlier
+//     wording of this claim was broader than the truth: it holds for the lane
+//     that hit the transient. For a SIBLING lane that was mid-successful-copy
+//     the hold is not alignment, it is added latency — [GrowGate.Await] is
+//     consulted before EVERY attempt, including the first, so a healthy lane
+//     parks too.
+//   - A probabilistic SHIELD for the four bulk-write lanes that have no replay
+//     (see [GrowGateMaxQuiesceShare]'s roster): while the gate is closed they
+//     do not issue a write into a window where it would fail loudly. That is a
+//     real benefit and it is unrelated to whether the target is growing.
+//
+// And the cost, quantified rather than assumed, because item 138 changed it:
+// the run-level ceiling means a sustained storm converges on
+// [GrowGateMaxQuiesceShare] of the wall clock — half, not the 81% that started
+// this — and item 138's real-PlanetScale validation measured that ceiling
+// actually engaging (150.1 s of quiesce per 300 s window, in both runs). Half
+// of a copy is not a rounding error, so this is a live tension and not a
+// settled question; what it is NOT is a silent-loss risk, since the gate never
+// swallows an error and each lane's own bounded retry remains the
+// loud-on-exhaustion floor.
+//
 // GrowGate is ONE engine-neutral coordinated-pause primitive shared
 // across every cold-copy write lane in a run, tripped from two sources
 // driving the SAME mechanism:
@@ -194,8 +246,12 @@ const growGateMaxCycle = 32
 //     advances one rung per window while trouble persists and resets after
 //     GrowGateEpisodeIdle of healthy open time. It is deliberately sized to
 //     track the per-lane reparent-retry ladder (same 100ms → 30s shape), so
-//     the gate's hold OVERLAPS the backoff each lane would have taken
-//     anyway; the gate buys alignment, not extra waiting.
+//     the gate's hold OVERLAPS the backoff the TRIPPING lane would have taken
+//     anyway. Scope correction (item 143): that is alignment for the lane that
+//     hit the transient, and it is NOT true of a sibling that was copying
+//     successfully — [GrowGate.Await] runs before EVERY attempt, so a healthy
+//     lane's hold is added latency, not overlap. The package doc carries the
+//     full accounting of what the quiesce buys and costs.
 //   - maxHold — the per-WINDOW ceiling. Bounds one window only.
 //   - maxQuiesceShare over quiesceWindow — the RUN-level ceiling, and the
 //     only one of the three that can see a run being quiesced to death by a
@@ -256,6 +312,13 @@ type GrowGate struct {
 
 	// reason is the most recent Trip reason, for the structured log.
 	reason string
+
+	// evidence is the most recent Trip's verdict — what the tripping lane
+	// actually OBSERVED, not what it suspects (roadmap item 143). Carried
+	// alongside reason and logged with it; it never influences any timing
+	// decision, which is the property [TestGrowGate_EvidenceIsDescriptive-
+	// OnlyAndNeverChangesTheHold] pins.
+	evidence ir.GrowEvidence
 
 	// owner scopes the owner goroutine to the gate's lifetime ctx so it
 	// exits on run-ctx cancel and on the gate's own Close. Captured at
@@ -441,9 +504,22 @@ func (g *GrowGate) Await(ctx context.Context) error {
 //
 // So: in-window trips coalesce and are otherwise inert, and persistence is
 // observed where it actually lives — ACROSS windows, one rung per window.
-func (g *GrowGate) Trip(reason string) {
+// # What the gate may CLAIM about why it closed (item 143)
+//
+// evidence is recorded and logged, and it changes NOTHING else — every timing
+// decision below is identical for every value. That is deliberate. Phase A of
+// item 143 established that a real storage-grow reparent is not reliably
+// distinguishable from a plain transport drop at the trip point (a genuine
+// grow's most common face on an in-flight write is the connection dying), so
+// gating the quiesce on the evidence would trade a bounded false-positive cost
+// for the chance of missing the event the gate exists for. What changed is the
+// CLAIM: this log line used to announce "a coordinated target storage-grow /
+// reparent window" for every close, and by two independent datasets that was
+// almost never what had happened.
+func (g *GrowGate) Trip(reason string, evidence ir.GrowEvidence) {
 	g.mu.Lock()
 	g.reason = reason
+	g.evidence = evidence
 	if g.closed {
 		// A window is live. Sibling lanes reporting the same event are
 		// already quiesced; nothing to do.
@@ -521,8 +597,17 @@ func (g *GrowGate) Trip(reason string) {
 	g.mu.Unlock()
 
 	slog.WarnContext(
-		g.ownerCtx, "pipeline: cold-copy grow-gate CLOSED — quiescing all cold-copy lanes for a coordinated target storage-grow / reparent window (ADR-0110)",
+		g.ownerCtx, "pipeline: cold-copy grow-gate CLOSED — quiescing all cold-copy lanes so they back off together "+
+			"instead of independently retrying a target that just refused a write (ADR-0110)",
 		slog.String("reason", reason),
+		// evidence says what the tripping lane OBSERVED — see [ir.GrowEvidence].
+		// This line used to name a "target storage-grow / reparent window" for
+		// every close; 244 of the 246 windows in the 2026-08-05 field log were
+		// opened by a transport drop and none by a reparent-evidenced face, so
+		// the sentence sent readers hunting for an event that had not occurred.
+		// The verdict is derived per trip and is the field the next report
+		// should be counted on.
+		slog.String("evidence", evidence.String()),
 		slog.Bool("proactive", proactive),
 		// hold + cycle are here because their ABSENCE is what made item 138
 		// invisible: the shipped log recorded only the close and the reopen,
@@ -623,6 +708,7 @@ func (g *GrowGate) finishWindow(reopenCh chan struct{}, why string) {
 	slog.InfoContext(
 		g.ownerCtx, "pipeline: cold-copy grow-gate reopened — lanes resuming (ADR-0110)",
 		slog.String("reason", g.reason),
+		slog.String("evidence", g.evidence.String()),
 		slog.String("why", why),
 	)
 }
@@ -687,11 +773,14 @@ func AwaitGrowGate(ctx context.Context, gate ir.GrowGate) error {
 }
 
 // TripGrowGate trips the gate so sibling lanes quiesce. A nil gate ⇒ no-op.
-func TripGrowGate(gate ir.GrowGate, reason string) {
+// evidence is what the caller OBSERVED — see [ir.GrowEvidence]; a caller with
+// no target-side verdict to offer passes [ir.GrowEvidenceNone], which is the
+// zero value precisely so under-claiming is the default.
+func TripGrowGate(gate ir.GrowGate, reason string, evidence ir.GrowEvidence) {
 	if gate == nil {
 		return
 	}
-	gate.Trip(reason)
+	gate.Trip(reason, evidence)
 }
 
 // ApplyGrowGate wires the cold-copy run's shared coordinated-pause gate

@@ -176,11 +176,12 @@ func classifyApplierError(err error) error {
 		// non-read-only XX000 stays terminal (no over-match) — only the
 		// read-only wording is retriable. Live finding (item 38 PG cold-copy
 		// re-validation, 2026-06-23).
-		if pgErr.Code == "XX000" {
-			m := strings.ToLower(pgErr.Message)
-			if strings.Contains(m, "cluster is read-only") || strings.Contains(m, "pg_readonly") {
-				return &retriablePGError{err: err}
-			}
+		//
+		// The wording lives in [pgReadOnlyClusterSubstrings] (grow_evidence.go)
+		// so this retriability decision and the item-143 evidence verdict read
+		// ONE list rather than two spellings of it.
+		if pgErr.Code == "XX000" && isPGReadOnlyClusterMessage(pgErr.Message) {
+			return &retriablePGError{err: err}
 		}
 		// Connection-availability SQLSTATEs (57P0x admin shutdown/crash, plus
 		// class 08 connection_exception) delegate to the shared predicate,

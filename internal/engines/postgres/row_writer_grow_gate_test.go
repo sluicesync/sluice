@@ -30,8 +30,9 @@ import (
 // is a pass-through (always open) so it never blocks — the FSM blocking
 // behaviour is tested in the pipeline package.
 type recordingGrowGate struct {
-	awaits atomic.Int64
-	trips  atomic.Int64
+	awaits       atomic.Int64
+	trips        atomic.Int64
+	lastEvidence atomic.Int32
 }
 
 func (g *recordingGrowGate) Await(ctx context.Context) error {
@@ -39,7 +40,17 @@ func (g *recordingGrowGate) Await(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (g *recordingGrowGate) Trip(string) { g.trips.Add(1) }
+func (g *recordingGrowGate) Trip(_ string, ev ir.GrowEvidence) {
+	g.trips.Add(1)
+	g.lastEvidence.Store(int32(ev))
+}
+
+// LastEvidence reports the verdict of the most recent Trip, so a test can
+// assert what the CALL SITE claimed rather than merely that it called — the
+// item-136 M4 lesson, that a gate's own tests cannot see call-site tagging.
+func (g *recordingGrowGate) LastEvidence() ir.GrowEvidence {
+	return ir.GrowEvidence(g.lastEvidence.Load())
+}
 
 // withFastPGCopyBackoff shrinks the chunked-COPY reparent-retry envelope so
 // the unit tests run fast, restoring the production values after the test.

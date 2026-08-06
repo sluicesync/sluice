@@ -89,7 +89,7 @@ func (e *mysqlFloatBatchExecer) ExecBatch(ctx context.Context, table *ir.Table, 
 			// is a separate change from the Await/Trip parity this closes.
 			var re ir.RetriableError
 			if errors.As(classifyApplierError(err), &re) && re.Retriable() {
-				e.w.tripGrowGate("mysql float-repair transient: " + err.Error())
+				e.w.tripGrowGate("mysql float-repair transient: "+err.Error(), err)
 			}
 			return fmt.Errorf("mysql: UpdateFloatColumnsByPK: %s: exec batch: %w", table.Name, err)
 		}

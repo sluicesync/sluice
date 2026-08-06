@@ -18,8 +18,9 @@ import (
 
 // recordingGate is a pass-through ir.GrowGate that counts Await/Trip.
 type recordingGate struct {
-	awaits atomic.Int64
-	trips  atomic.Int64
+	awaits       atomic.Int64
+	trips        atomic.Int64
+	lastEvidence atomic.Int32
 }
 
 func (g *recordingGate) Await(ctx context.Context) error {
@@ -27,11 +28,21 @@ func (g *recordingGate) Await(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (g *recordingGate) Trip(string) { g.trips.Add(1) }
+func (g *recordingGate) Trip(_ string, ev ir.GrowEvidence) {
+	g.trips.Add(1)
+	g.lastEvidence.Store(int32(ev))
+}
+
+// LastEvidence reports the verdict of the most recent Trip.
+func (g *recordingGate) LastEvidence() ir.GrowEvidence {
+	return ir.GrowEvidence(g.lastEvidence.Load())
+}
 
 // TestSourceReadGrowGate_AwaitsAndTrips pins that a classified source-read
-// drop (the READ-side face of a target storage-grow stall) trips the shared
-// gate so siblings quiesce, and that every (re)attempt Awaits the gate.
+// drop trips the shared gate so siblings quiesce, and that every (re)attempt
+// Awaits the gate. It also pins the trip's CLAIM: a source-side drop reports
+// [ir.GrowEvidenceNone], because nothing on this path observed the target
+// (item 143).
 func TestSourceReadGrowGate_AwaitsAndTrips(t *testing.T) {
 	captureSlog(t)
 	withFastSourceReadBackoff(t)
@@ -62,6 +73,16 @@ func TestSourceReadGrowGate_AwaitsAndTrips(t *testing.T) {
 	// 2 classified transients ⇒ 2 Trips.
 	if got := gate.trips.Load(); got != 2 {
 		t.Errorf("gate.Trip calls = %d; want 2 (one per classified transient)", got)
+	}
+	// Item 143: this path classifies a SOURCE-side error and observes the
+	// target not at all, so it has nothing to claim. The comment it replaced
+	// asserted the opposite — "the READ-side face of a target storage-grow
+	// stall" — as a fact, via a two-step inference nothing here can check.
+	if got := gate.LastEvidence(); got != ir.GrowEvidenceNone {
+		t.Errorf(
+			"a source-read drop tripped the gate claiming %s; it must claim %s — nothing on this path "+
+				"observed the target", got, ir.GrowEvidenceNone,
+		)
 	}
 }
 

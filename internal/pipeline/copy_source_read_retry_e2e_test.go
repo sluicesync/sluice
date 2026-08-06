@@ -401,9 +401,9 @@ func (g *observingGate) Await(ctx context.Context) error {
 	return g.inner.Await(ctx)
 }
 
-func (g *observingGate) Trip(reason string) {
+func (g *observingGate) Trip(reason string, ev ir.GrowEvidence) {
 	atomic.AddInt64(g.trips, 1)
-	g.inner.Trip(reason)
+	g.inner.Trip(reason, ev)
 }
 
 // TestSourceReadRetryE2E_Idempotent_AbsorbsOverlap pins ADR-0109 case 2:

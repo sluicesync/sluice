@@ -38,6 +38,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // withScaledGrowGate shrinks the whole timing envelope — ladder, per-window
@@ -70,7 +72,7 @@ func tripBurst(g *GrowGate, n int) {
 	var wg sync.WaitGroup
 	for range n {
 		wg.Add(1)
-		go func() { defer wg.Done(); g.Trip("lane transient") }()
+		go func() { defer wg.Done(); g.Trip("lane transient", ir.GrowEvidenceNone) }()
 		time.Sleep(tripBurstStagger)
 	}
 	wg.Wait()
@@ -208,7 +210,7 @@ func TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock(t *testing.T
 					return
 				}
 				time.Sleep(time.Millisecond) // the failing attempt
-				g.Trip("target rejecting writes")
+				g.Trip("target rejecting writes", ir.GrowEvidenceNone)
 			}
 		}()
 	}
@@ -386,7 +388,7 @@ func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	closes := 0
 	for closes < 12 && time.Now().Before(deadline) {
-		g.Trip("target rejecting writes")
+		g.Trip("target rejecting writes", ir.GrowEvidenceNone)
 		g.mu.Lock()
 		closed := g.closed
 		g.mu.Unlock()
@@ -404,7 +406,7 @@ func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 
 	// While the share is spent, a Trip must leave the gate OPEN and Await must
 	// return immediately — the lane proceeds on its own retry budget.
-	g.Trip("target still rejecting writes")
+	g.Trip("target still rejecting writes", ir.GrowEvidenceNone)
 	g.mu.Lock()
 	stillClosed := g.closed
 	g.mu.Unlock()
@@ -473,7 +475,7 @@ func TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for windows < 12 && time.Now().Before(deadline) {
 		before := rung()
-		g.Trip("target rejecting writes")
+		g.Trip("target rejecting writes", ir.GrowEvidenceNone)
 		if !isClosed() {
 			break // declined — the share is spent
 		}

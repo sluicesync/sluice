@@ -25,8 +25,9 @@ import (
 // Await is a pass-through (always open) so it never blocks the flush loop —
 // the FSM blocking behaviour is tested in the pipeline package.
 type recordingGrowGate struct {
-	awaits atomic.Int64
-	trips  atomic.Int64
+	awaits       atomic.Int64
+	trips        atomic.Int64
+	lastEvidence atomic.Int32
 }
 
 func (g *recordingGrowGate) Await(ctx context.Context) error {
@@ -34,7 +35,17 @@ func (g *recordingGrowGate) Await(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (g *recordingGrowGate) Trip(string) { g.trips.Add(1) }
+func (g *recordingGrowGate) Trip(_ string, ev ir.GrowEvidence) {
+	g.trips.Add(1)
+	g.lastEvidence.Store(int32(ev))
+}
+
+// LastEvidence reports the verdict of the most recent Trip, so a test can
+// assert what the CALL SITE claimed rather than merely that it called — the
+// item-136 M4 lesson, that a gate's own tests cannot see call-site tagging.
+func (g *recordingGrowGate) LastEvidence() ir.GrowEvidence {
+	return ir.GrowEvidence(g.lastEvidence.Load())
+}
 
 // TestColdCopyGrowGate_AwaitsBeforeEachFlushAttempt pins that the flush hot
 // path consults the gate before the first attempt AND before each retry

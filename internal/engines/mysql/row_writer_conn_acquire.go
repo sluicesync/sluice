@@ -73,9 +73,10 @@ import (
 // The grow gate is engaged on both halves, matching the flush loop: Await
 // before every attempt (park with the sibling lanes rather than hammer a
 // target they are all backing off from) and Trip on a classified
-// transient (tell the siblings this lane hit one). Item 143 tracks the
-// quality of that trip SIGNAL for both loops at once; this helper
-// deliberately does not invent a second answer to it.
+// transient (tell the siblings this lane hit one). Item 143 asked what that
+// trip SIGNAL actually means, for both loops at once, and answered it in one
+// place: [growEvidenceOf], reached through [RowWriter.tripGrowGate]. This
+// helper still does not invent a second answer — it now shares the first one.
 func (w *RowWriter) acquireConnWithRetry(ctx context.Context, table *ir.Table) (*sql.Conn, error) {
 	tableName := tableNameOf(table)
 	if err := w.awaitGrowGate(ctx); err != nil {
@@ -97,7 +98,7 @@ func (w *RowWriter) acquireConnWithRetry(ctx context.Context, table *ir.Table) (
 		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
 			return nil, err
 		}
-		w.tripGrowGate("mysql cold-copy connection acquire transient: " + err.Error())
+		w.tripGrowGate("mysql cold-copy connection acquire transient: "+err.Error(), err)
 		// ADR-0113: a target that cannot hand out a connection is a target
 		// mid-transition, which is exactly what the restore reconciler wants
 		// to hear about. Notifying here can only ever over-report (the
@@ -113,10 +114,12 @@ func (w *RowWriter) acquireConnWithRetry(ctx context.Context, table *ir.Table) (
 		}
 
 		backoff := coldCopyReparentBackoff(try)
+		// Sibling of the flush loop's WARN, corrected in the same pass (item
+		// 143): the verdict is derived from this error, not asserted about it.
 		slog.WarnContext(
-			ctx, "mysql: cold-copy could not acquire a connection because of a transient target error "+
-				"(likely a primary reparent / dropped vtgate connection); retrying",
+			ctx, "mysql: cold-copy could not acquire a connection because of a transient target error; retrying",
 			slog.String("table", tableName),
+			slog.String("evidence", growEvidenceOf(err).String()),
 			slog.Int("attempt", try),
 			slog.Duration("elapsed", time.Since(deadline.Add(-coldCopyReparentMaxWallVar))),
 			slog.Duration("max_wall", coldCopyReparentMaxWallVar),
