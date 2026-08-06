@@ -507,7 +507,11 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 	// relaxed-sql_mode silent clamp would otherwise go unreported. The
 	// write was already sequential (one flush at a time), so pinning
 	// loses no parallelism.
-	conn, err := w.db.Conn(ctx)
+	//
+	// Item 139: the acquire rides the SAME transient retry the flush one
+	// line later gets — a vtgate drop between batches used to kill the run
+	// here (see row_writer_conn_acquire.go).
+	conn, err := w.acquireConnWithRetry(ctx, table)
 	if err != nil {
 		return fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err)
 	}

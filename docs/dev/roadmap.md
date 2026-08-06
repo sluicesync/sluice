@@ -1867,6 +1867,7 @@ Found by the v0.113.0 regression cycle. A cold copy whose target connection dies
 **The pattern is the point, and it is now three deep.** Bug 228 was a silent hang (a cleared transient deadlocking the copy). Item 138 was a silent stall (81% quiesced, every layer reporting success). This is a silent hang on a dead socket. Each was found by a different route and none was caught by a gate, because **every one of them looks like healthy slow progress from the outside.** Bug 228's carry proposed an idle-progress copy WATCHDOG — a run that has made no forward progress for N minutes says so loudly — and this is the third argument for it. That watchdog would catch this class WITHOUT knowing the mechanism, which is exactly what a class-level gate should do.
 
 **Fix shape:** set a write deadline on the target DSN by default (the workaround, promoted), and/or the watchdog. Prefer BOTH — the deadline fixes this instance, the watchdog catches the next one. Check whether the same missing deadline exposes the read side and the other engines' write paths.
+### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *OPEN, medium; found while ground-truthing item 134*
 
 
 SQLite index names are schema-scoped, which is item 134. Ground-truthing that turned up a SECOND silent no-op on the same engine, with a different shape: `CREATE VIEW IF NOT EXISTS "a"` against an existing TABLE or VIEW named `a` returns OK and creates nothing. The view the source declared is simply absent on the target, exit 0.
@@ -1915,6 +1916,16 @@ Needs its own error code rather than borrowing `SLUICE-E-SCHEMA-INDEX-NAME-COLLI
 <details>
 <summary>Original report (kept for provenance — note its mechanism is corrected above)</summary>
 
+### 145. A `json[]` / `jsonb[]` column cannot reach a Postgres target either — *OPEN, medium; surfaced BY item 141's gate on its first run, 2026-08-05*
+
+Item 141's divergence map (`TestEveryDecodableArrayElementIsWritable`) compares the two PG reader doors' array-element rosters against `convertArray`'s dispatch. Its first run found `bytea` — the item it was written for — and **also `ir.JSON`**, which both reader doors produce (`_json` → `json`, `_jsonb` → `jsonb`) and the writer has no arm for. A table carrying a `json[]` or `jsonb[]` column therefore aborts the copy with `postgres: array of element type ir.JSON not supported`, exactly item 141's failure on a different family.
+
+**Loud, not silent** — nothing is corrupted, the copy refuses — which is why this is medium and why it is FILED rather than bundled into item 141: choosing the leaf type is the load-bearing decision and it is Bug-74-class. `pgtype` has no `JSON` value wrapper; `JSONCodec.PlanEncode` accepts a wide set (`[]byte`, `string`, `json.RawMessage`, anything marshalable), and "accepts" is precisely the property that turned out not to be sufficient for `numeric[][]` in v0.69.3. **Whatever leaf is chosen owes a real-target `array_dims` matrix before it is believed** — the item-141 mutation run shows the failure mode is a 1-D-passes / 2-D-flattens split that a scalar pin cannot see.
+
+**Scope note:** the value shapes differ per door. The SQL read path decodes `ir.JSON` to `[]byte` (`decodeBytes`); the pgtrigger payload path delivers a decoded JSON value. The leaf has to accept both, like `byteaArrayLeaf` does, and the refusal for anything else must be loud. The gate entry in `pgUnwritableArrayElement` is the tracking anchor — closing this item means deleting that entry, which the gate's other direction enforces.
+
+### 144. The tier cap fails OPEN, so a PlanetScale dev branch is driven at DOUBLE the fan-out of a production branch on the same tier — *OPEN, high (measured on real PlanetScale 2026-08-05)*
+
 Item 123 made sluice treat an `@@innodb_buffer_pool_size` below the smallest known tier as *no reading* rather than as a tiny instance, so it stops throttling instead of capping at 2. That is correct for what it fixed — a production PS-10 was being throttled to a quarter of its parallelism. **Its consequence on a DEV branch was never measured, and it is the trigger behind the field report's stall.**
 
 Measured on a real PS-10 database, both branches, 1.7M rows / 918 MB:
@@ -1960,7 +1971,18 @@ Audit 2026-08-05 C-3 added a per-chunk byte ceiling to the change lane, because 
 
 **The fix is the same five lines**, plus a gate that enumerates BOTH lanes rather than pinning one — the roster shape item 128's `checkChunkLineLength` walker used, since "both write cores" meaning "both in this file" is exactly how Bug 226's third core survived. Not bundled into item 130: it is the streamer's rollover path (a concurrency surface needing `-race`), and item 130 neither needs nor assumes it.
 
-### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *OPEN, medium; found while gating item 135*
+### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *✅ FIXED on `main` (unreleased). `byteaArrayLeaf` + the two-door divergence map `TestEveryDecodableArrayElementIsWritable`. The gate surfaced a THIRD unwritable family on its first run — `json[]`/`jsonb[]` — recorded as an explicit exemption rather than fixed; see the impl notes below.*
+
+**Impl notes (2026-08-05).**
+
+- **The leaf is `[]byte`, not `pgtype.Bytea`** — pgx v5 has no such wrapper. `ByteaCodec.PlanEncode` plans `[]byte` (and `BytesValuer`) directly, so `pgtype.Array[*[]byte]` reaches the element codec by the same deref-pointer route the `*bool`/`*int64`/`*float64` arms already take. Ground-truthed rather than argued: **mutating the leaf to a `\x`-hex `string` reproduces the Bug-74 silent flatten exactly** — 1-D rows still compared equal while `array_dims` went `[1:2][1:2]` → `[1:4]` on both 2-D rows.
+- **A named wart: nil-slice ⇒ empty bytea, never NULL.** `buildPGArray` handles a SQL NULL element before the leaf runs, so every value reaching the leaf is PRESENT — but pgx encodes a nil `[]byte` as SQL NULL, so passing one through would silently turn a present empty `bytea` into a NULL. The leaf normalises; `TestByteaArrayLeaf_EmptyElementIsNotNull` pins it and the integration matrix carries an empty-element row.
+- **The string input shape is decided, not sniffed.** The pgtrigger payload renders `bytea` through `bytea_output`, which the trigger capture PINS to `hex` — so the leaf accepts `\x`+hex and refuses every other rendering loudly, including `escape`. That is item 135's lesson applied on the write side.
+- **THE GATE FOUND MORE THAN THE ITEM.** Two things its first runs surfaced that the filing did not predict:
+  - **`json[]` / `jsonb[]` are unwritable too** — the same shape, still open, recorded in `pgUnwritableArrayElement` with the reason. Loud (`array of element type ir.JSON not supported`), never silent. Not bundled: picking a leaf pgx's `JSONCodec` plans for the `_json`/`_jsonb` element OIDs is a Bug-74-class decision that owes its own real-target dimension matrix. **Filed as item 145.**
+  - **The two reader doors resolve `timetz` DIFFERENTLY.** `cdc_relations.go`'s `case pgtype.TimeOID, pgtype.TimetzOID` returns `ir.Time` with `WithTimeZone` UNSET, while the schema-read door sets it. So a `timetz[]` over CDC takes the plain `time[]` arm and refuses further down at `timeOfDayMicros` (`malformed time-of-day "12:34:56+02"`) instead of at `convertArray`'s own arm. Verified LOUD for every offset spelling (`+hh`, `-hh:mm`, `Z`) — a message-quality divergence, not a fidelity one. `TestOIDToType_ArrayParity` cannot see it because it compares FAMILIES, not the resolved `ir.Type`. **The first draft of this gate derived its roster from the CDC door alone and MISSED timetz entirely** — which is why the shipped gate derives from BOTH doors.
+
+### 141 (original filing)
 
 `row_writer.go`'s `convertArray` element dispatch has arms for boolean, integer, float, the string-leaf family, decimal, date, datetime, timestamp(tz) and time — and none for `ir.Binary`/`ir.Varbinary`/`ir.Blob`. A table carrying a `bytea[]` column therefore fails the copy with `postgres: array of element type ir.Blob not supported` and aborts the run.
 
@@ -1970,6 +1992,8 @@ Audit 2026-08-05 C-3 added a per-chunk byte ceiling to the change lane, because 
 
 **Fix shape:** a `buildPGArray` leaf converting `[]byte` to `pgtype.Bytea`, mirroring the string-leaf arm. **Gate:** a fail-by-default divergence map asserting that every `ir.Type` the PG decoder accepts as an array element is also accepted by `convertArray` — which would also surface the `timetz` arm (deliberately refused, with a written reason) as an exemption rather than an accident. Prefer that to a per-family test, because the shape here is "the two halves were never compared."
 
+**Where the fix landed:** `byteaArrayLeaf` in `internal/engines/postgres/row_writer.go`; the gate is `TestEveryDecodableArrayElementIsWritable` in `row_writer_array_writable_roster_test.go`; the family × shape pins are `TestMigrate_PGToPG_ByteaArrays` (real PG→PG, `array_dims` + `::text` + `octet_length`) and the three bytea rows added to `arrayLeafFamilies()`.
+
 ### 140. A pre-existing target schema's foreign keys abort a cold copy in 20 seconds, and nothing warns first — *OPEN, medium (field report 2026-08-05, run 1)*
 
 The reporter branched their target from an existing database, so the schema — including foreign keys — was already there. The copy died at ~20s on `Error 1452 (23000): Cannot add or update a child row`, because sluice's deferred-constraint discipline only governs constraints **it creates**. When the target already carries them, child rows arrive before parents and the FK rejects them.
@@ -1978,7 +2002,17 @@ Their own read was right: "wouldn't have been an issue on a totally new db." Tha
 
 **This is a preflight gap, not a copy bug.** sluice can see the target's foreign keys before copying a row. Detect them on a target it did not create and refuse or warn UP FRONT, naming `--skip-foreign-keys` — the same posture the existing target-shape preflight (item 25 / ADR-0166) already takes for a drifted table. Check whether that preflight is simply not consulting FKs, in which case this is a small extension rather than a new surface.
 
-### 139. Connection ACQUISITION bypasses the transient-error classifier, so a vtgate drop between batches kills the run — *OPEN, HIGH (field report 2026-08-05, run 2; the sibling item 122's fix did not reach)*
+### 139. Connection ACQUISITION bypasses the transient-error classifier, so a vtgate drop between batches kills the run — *✅ FIXED on `main` (unreleased). `RowWriter.acquireConnWithRetry` + the AST roster `TestEveryRowWriterConnAcquireRidesTheTransientRetry`. **`-race` Integration must be green before the tag** — the helper runs on the fan-out worker goroutines and trips the shared grow gate.*
+
+**Impl notes (2026-08-05).**
+
+- **The filing's roster was short by three.** It named five sites (`row_writer.go:508`, `row_writer_batch.go:142/:165/:236`, `load_data_writer.go:121`). The AST walk found **eight**: both fan-out lanes acquire TWICE (the `len(workers)==1` shortcut and the per-worker goroutine — `WriteRowsParallel` and `WriteRowsIdempotentParallel` each), `writeBatchedIdempotent` has its own, and — found by the pins, not by reading — **`checkLocalInfile`'s `SELECT @@local_infile` probe runs BEFORE the pin on the LOAD DATA lane**, so a drop killed that lane one statement EARLIER than the reported `pin connection` site, invisible to any roster that looks only at `Conn()` call sites. The probe now checks out through the same helper and runs on that session (also the more faithful read of a session variable).
+- **One deliberate divergence from `flushWithReparentRetry`, and it is load-bearing:** the acquire loop has **no keyless carve-out**. The flush's audit-B-9 refusal exists because a committed-but-unacked batch is indistinguishable from a rolled-back one; an acquire writes nothing, so a re-acquire is idempotent by construction. Importing the carve-out would refuse a keyless table's copy for a hazard it cannot have. Pinned by `TestColdCopyConnAcquire_KeylessTableIsStillRetried`.
+- **Behaviour change worth a release note:** every acquire now `Await`s the grow gate before checking a connection out, so a cold-copy lane no longer grabs a connection during a window its siblings are parked in. `TestColdCopyGrowGate_NoTripOnTerminalError`'s Await count moved 1 → 2 accordingly.
+- **Postgres was checked and has the same shape in exactly one place.** `row_writer.go`'s CHUNKED COPY already acquires INSIDE `copyChunkWithRetry`'s attempt closure (correct); the monolithic COPY path has no retry apparatus at all and only runs with `growGate == nil` (unit tests / non-cold-copy callers), so there is no divergence to fix. **`raw_copy.go`'s `ImportRawCopy` DID have it** — the COPY error went through `quiesceAndReportTransient` while the acquire one line above returned raw, so a drop a moment earlier told the sibling lanes nothing. Fixed (Trip, not retry: `r` is a one-shot stream, and gap 18 in `docs/dev/perf-parity-matrix.md` already prices that). Pinned both directions by `TestImportRawCopy_Acquire{TripsTheGrowGate,DoesNotTripOnTerminal}`.
+- **Out of scope, named rather than implied:** `*SchemaWriter` acquisition (DDL / index / FK-wall) is NOT covered by the roster — a different lane with its own retry (`schema_writer_index_reparent_retry.go`), and not the field-report class. The roster's doc says so where it is defined.
+
+### 139 (original filing)
 
 Item 122 taught the classifier vtgate's own wording for a dropped connection and wired it into the cold-copy retry. The reporter's run 2 confirmed that works — 78 drops caught and retried — and then died on this:
 
@@ -1989,7 +2023,7 @@ internal: vtgate connection error: read tcp …:15999: read: connection reset by
 
 **`pin connection` is the tell.** `row_writer.go:506` acquires the connection with `w.db.Conn(ctx)` and wraps a failure as `pin connection`; `flushWithReparentRetry` — the whole retry apparatus — is called at `:551`, INSIDE `writeBatchedConn`, i.e. only AFTER the connection is already in hand. A drop during ACQUISITION is returned raw and terminates the run, on a path where the identical drop one line later would be retried.
 
-**Sibling roster to sweep, not a single site:** `row_writer.go:508`, `row_writer_batch.go:142`, `:165`, `:236`, and `load_data_writer.go:121` all wrap `Conn()` the same way. Fix the class.
+**Sibling roster to sweep, not a single site:** `row_writer.go:508`, `row_writer_batch.go:142`, `:165`, `:236`, and `load_data_writer.go:121` all wrap `Conn()` the same way. Fix the class. *(That list turned out to be five of eight — see the impl notes above.)*
 
 The shape is the one this project keeps paying for: item 122's fix was correct and its enumeration stopped at the operation, not the connection the operation needs.
 

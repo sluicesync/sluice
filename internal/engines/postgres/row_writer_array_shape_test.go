@@ -61,6 +61,13 @@ func arrayLeafFamilies() []arrayLeafFamily {
 		{"inet", ir.Inet{}, func(i int) any { return fmt.Sprintf("10.0.0.%d", i) }},
 		{"cidr", ir.Cidr{}, func(i int) any { return fmt.Sprintf("10.0.%d.0/24", i) }},
 		{"macaddr", ir.Macaddr{}, func(i int) any { return fmt.Sprintf("08:00:2b:01:02:%02d", i) }},
+		// The three bytea spellings share ONE convertArray arm, so they are
+		// the same code path by construction — but they are listed
+		// separately because "by construction" is the reasoning that Bug 74
+		// made untrustworthy, and the cost of three rows is nil (item 141).
+		{"bytea/blob", ir.Blob{}, func(i int) any { return []byte{0x00, byte(i)} }},
+		{"bytea/binary", ir.Binary{Length: 2}, func(i int) any { return []byte{0xff, byte(i)} }},
+		{"bytea/varbinary", ir.Varbinary{Length: 4}, func(i int) any { return []byte{byte(i)} }},
 		{"numeric", ir.Decimal{Precision: 20, Scale: 4}, func(i int) any { return fmt.Sprintf("%d.5000", i) }},
 		{"date", ir.Date{}, func(i int) any { return base.AddDate(0, 0, i) }},
 		{"datetime", ir.DateTime{}, func(i int) any { return base.Add(time.Duration(i) * time.Hour) }},

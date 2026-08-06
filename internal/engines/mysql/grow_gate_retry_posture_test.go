@@ -67,6 +67,11 @@ var mysqlReplayHelpers = []string{"flushWithReparentRetry"}
 // exemption, and the roster fails on those.
 var mysqlGatePlumbing = map[string]string{
 	"RowWriter.flushWithReparentRetry": "the bounded-replay helper itself; the thing the roster classifies cores BY",
+	"RowWriter.acquireConnWithRetry": "item 139's connection-ACQUIRE loop, not a write core: it loses no write, " +
+		"so the replay-safety question this roster classifies cores by does not arise (re-acquiring is " +
+		"idempotent by construction — see row_writer_conn_acquire.go). Its answer to a DECLINING gate is " +
+		"nonetheless the retrying one: Await returns, the acquire is re-tried on the same 100ms→30s ladder " +
+		"TestColdCopyReparentBackoffShape binds, and it is loud on the wall-clock bound.",
 }
 
 // mysqlLaneRetryPosture is the DECLARED roster. Fail-by-default: a gate-

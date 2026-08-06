@@ -45,6 +45,12 @@ type flushScript struct {
 	// execErrs[i] is returned by the (i+1)-th INSERT ExecContext call;
 	// calls past the end return nil (success). A nil entry is success.
 	execErrs []error
+	// openErrs[i] is returned by the (i+1)-th driver.Open call; calls past
+	// the end succeed. Item 139: this models a target that refuses to hand
+	// out a CONNECTION at all, which is a different failure from one that
+	// accepts the connection and fails the statement — and was the half
+	// nothing retried.
+	openErrs []error
 
 	execCalls atomic.Int64 // total INSERT ExecContext calls
 	opens     atomic.Int64 // total driver.Open calls (distinct conns)
@@ -62,7 +68,12 @@ func (s *flushScript) nextExecErr() error {
 type scriptConn struct{ script *flushScript }
 
 func (d scriptDriver) Open(string) (driver.Conn, error) {
-	d.script.opens.Add(1)
+	n := d.script.opens.Add(1) // 1-based
+	if idx := int(n - 1); idx < len(d.script.openErrs) {
+		if err := d.script.openErrs[idx]; err != nil {
+			return nil, err
+		}
+	}
 	return scriptConn(d), nil // identical single-field shape; staticcheck S1016 prefers the conversion
 }
 

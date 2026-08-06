@@ -175,9 +175,26 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		return 0, aerr
 	}
 
+	// Roadmap item 139's Postgres sibling. The COPY further down routes its
+	// error through quiesceAndReportTransient, so a classified transient
+	// there tells the other lanes to park; this ACQUIRE returned raw, so a
+	// target that dropped the connection a moment EARLIER produced a
+	// terminal error and no signal to the siblings at all — the same
+	// "the handling reached the operation, not the connection it needs"
+	// shape the MySQL cold-copy lanes had.
+	//
+	// It Trips but does not RETRY, deliberately and for a different reason
+	// than the COPY below: this lane is unretryable because r is a one-shot
+	// stream, and while the stream is in fact untouched at acquire time,
+	// retrying only the acquire would leave the very next failure — the
+	// COPY — terminal anyway. The gap is the same one gap 18 in
+	// docs/dev/perf-parity-matrix.md already prices; narrowing it by one
+	// statement would obscure that rather than close it.
 	sqlConn, err := w.db.Conn(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("postgres: ImportRawCopy: acquire conn: %w", err)
+		return 0, w.quiesceAndReportTransient(
+			fmt.Errorf("postgres: ImportRawCopy: acquire conn: %w", err), "raw COPY import",
+		)
 	}
 	defer func() { _ = sqlConn.Close() }() // returns conn to pool
 

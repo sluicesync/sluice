@@ -6,6 +6,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1196,6 +1197,10 @@ func prepareValue(v any, t ir.Type) (any, error) {
 //     of these element OIDs (bare *string does not for uuid/inet/cidr).
 //   - numeric/decimal — *pgtype.Numeric (built from the IR's canonical
 //     numeric string; NumericCodec plans NumericValuer, never string).
+//   - bytea (Binary/Varbinary/Blob) — *[]byte. pgx has no pgtype.Bytea
+//     wrapper and ByteaCodec plans []byte directly, so the deref-pointer
+//     route reaches it (roadmap item 141; see [byteaArrayLeaf], which
+//     also carries this arm's nil-slice wart).
 //   - date — *pgtype.Date; datetime / timestamp-without-tz —
 //     *pgtype.Timestamp; timestamp-with-tz — *pgtype.Timestamptz;
 //     time-without-tz — *pgtype.Time. The temporal codecs plan their
@@ -1263,6 +1268,8 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 			}
 			return pgtype.Text{String: s, Valid: true}, nil
 		})
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		return buildPGArray(v, byteaArrayLeaf)
 	case ir.Decimal:
 		return buildPGArray(v, numericArrayLeaf)
 	case ir.Date:
@@ -1379,6 +1386,70 @@ func numericArrayLeaf(x any) (pgtype.Numeric, error) {
 		return pgtype.Numeric{}, fmt.Errorf("parse numeric %q: %w", s, err)
 	}
 	return n, nil
+}
+
+// byteaArrayLeaf converts one bytea array element to its []byte leaf
+// (roadmap item 141). Until this existed, `bytea[]` could not reach a
+// Postgres target AT ALL: convertArray fell through to its
+// "array of element type ir.Blob not supported" refusal, so a table
+// carrying one simply could not be copied — while item 135's matrix
+// pinned that same family DECODING correctly across three doors. A
+// family can be fully decodable and completely unwritable; the roster
+// gate next door (TestEveryDecodableArrayElementIsWritable) is what
+// makes that comparison mechanical.
+//
+// The leaf type is []byte — pgx has no pgtype.Bytea wrapper; ByteaCodec
+// plans []byte (and BytesValuer) directly, so pgtype.Array[*[]byte]
+// reaches the element codec by the same deref-pointer route the *bool /
+// *int64 / *float64 arms already take. That is the Bug-74 requirement
+// (the element encode must PLAN against the target's element OID, or pgx
+// falls through its wrap chain and silently flattens ≥2-D);
+// TestMigrate_PGToPG_ByteaArrays ground-truths the dimensions on a real
+// target rather than trusting the reasoning.
+//
+// # WART: nil-slice ⇒ empty bytea, never NULL
+//
+// [buildPGArray] handles a SQL NULL element BEFORE calling this function
+// (a nil slot becomes a typed nil pointer), so every value that reaches
+// here is a PRESENT element. But pgx's bytea encoder maps a nil []byte to
+// SQL NULL — so passing a nil slice through would turn a present empty
+// bytea into a NULL, which is silent loss of exactly the kind this
+// project refuses. Normalising nil to an empty non-nil slice keeps
+// "present" and "NULL" distinguishable at the wire. Pinned by the
+// empty-element row of TestMigrate_PGToPG_ByteaArrays.
+//
+// Input shapes, per the convertArray doc's contract:
+//
+//   - []byte — the IR-canonical leaf (decodeBytea, both provenance lanes).
+//   - string — the pgtrigger change-payload shape. to_jsonb renders a
+//     bytea through PG's bytea_output, and the trigger's capture clause
+//     PINS `SET bytea_output = hex` (pgtrigger/setup.go, audit 2026-08-05
+//     B-1), so the rendering here is DECIDED, not sniffed — item 135's
+//     lesson applied to the array leaf. Anything that is not `\x` + an
+//     even run of hex digits is refused loudly rather than guessed at;
+//     in particular the `escape` rendering is NOT accepted, because
+//     accepting both is exactly the ambiguity item 135 removed.
+func byteaArrayLeaf(x any) ([]byte, error) {
+	switch b := x.(type) {
+	case []byte:
+		if b == nil {
+			return []byte{}, nil // see the WART note above
+		}
+		return b, nil
+	case string:
+		if !strings.HasPrefix(b, `\x`) {
+			return nil, fmt.Errorf(
+				`expected []byte or a \x-prefixed hex rendering, got string %q `+
+					"(the trigger capture pins bytea_output=hex, so any other rendering is unrecognised)", b,
+			)
+		}
+		raw, err := hex.DecodeString(b[2:])
+		if err != nil {
+			return nil, fmt.Errorf("parse bytea array element %q: %w", b, err)
+		}
+		return raw, nil
+	}
+	return nil, fmt.Errorf("expected []byte, got %T", x)
 }
 
 // Temporal array-leaf layouts. to_jsonb renders timestamps in ISO 8601

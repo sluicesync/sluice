@@ -137,7 +137,7 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 	// case never advances the durable watermark, so the fan-out vs serial
 	// durability contract is uniform regardless of degree.
 	if len(workers) == 1 {
-		conn, err := w.db.Conn(ctx)
+		conn, err := w.acquireConnWithRetry(ctx, table)
 		if err != nil {
 			return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 		}
@@ -160,7 +160,7 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 		wg.Add(1)
 		go func(rows <-chan ir.Row) {
 			defer wg.Done()
-			conn, err := w.db.Conn(workerCtx)
+			conn, err := w.acquireConnWithRetry(workerCtx, table)
 			if err != nil {
 				errOnce.Do(func() { firstEr = fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err) })
 				cancel()
@@ -231,7 +231,7 @@ func (w *RowWriter) WriteRowsParallel(ctx context.Context, table *ir.Table, work
 	// A single worker is just the serial core — no fan-out machinery needed
 	// (the pipeline only calls this with len==1 on the degenerate path).
 	if len(workers) == 1 {
-		conn, err := w.db.Conn(ctx)
+		conn, err := w.acquireConnWithRetry(ctx, table)
 		if err != nil {
 			return fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err)
 		}
@@ -254,7 +254,7 @@ func (w *RowWriter) WriteRowsParallel(ctx context.Context, table *ir.Table, work
 		wg.Add(1)
 		go func(rows <-chan ir.Row) {
 			defer wg.Done()
-			conn, err := w.db.Conn(workerCtx)
+			conn, err := w.acquireConnWithRetry(workerCtx, table)
 			if err != nil {
 				errOnce.Do(func() { firstEr = fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err) })
 				cancel()
@@ -297,7 +297,7 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 	// parallel chunked copy (>100k threshold), add-table, and the VStream
 	// cold-start COPY; without the check a silent clamp under
 	// --mysql-sql-mode='' would go unreported on exactly those runs.
-	conn, err := w.db.Conn(ctx)
+	conn, err := w.acquireConnWithRetry(ctx, table)
 	if err != nil {
 		return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 	}

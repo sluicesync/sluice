@@ -99,10 +99,12 @@ func TestColdCopyGrowGate_NoTripOnTerminalError(t *testing.T) {
 	if got := gate.trips.Load(); got != 0 {
 		t.Errorf("gate.Trip calls = %d; want 0 (terminal error must not trip the coordinated pause)", got)
 	}
-	// The first attempt still Awaited (the gate gates every attempt), but no
-	// retry attempt followed (terminal), so Await fired exactly once.
-	if got := gate.awaits.Load(); got != 1 {
-		t.Errorf("gate.Await calls = %d; want 1 (first attempt only — terminal, no retry)", got)
+	// Two Awaits, no retry: the ACQUIRE awaits before checking a connection
+	// out of the pool (item 139 — a lane must not grab a conn during a
+	// window its siblings are parked in), and the first flush attempt awaits
+	// again. The error is terminal, so no retry attempt follows either one.
+	if got := gate.awaits.Load(); got != 2 {
+		t.Errorf("gate.Await calls = %d; want 2 (acquire + first flush attempt — terminal, no retry)", got)
 	}
 }
 

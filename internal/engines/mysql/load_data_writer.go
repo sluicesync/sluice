@@ -113,7 +113,7 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 		}
 	}
 
-	enabled, err := w.checkLocalInfile(ctx)
+	enabled, err := w.checkLocalInfile(ctx, table)
 	if err != nil {
 		return fmt.Errorf("mysql: LOAD DATA: probe @@local_infile: %w", err)
 	}
@@ -148,7 +148,8 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	// the pool can hand us a different conn for the warning probe and
 	// the refusal silently misses. On a RETRY flushWithReparentRetry
 	// substitutes a fresh conn and the probe follows it there (ADR-0108).
-	conn, err := w.db.Conn(ctx)
+	// Item 139: the acquire itself rides the same transient retry.
+	conn, err := w.acquireConnWithRetry(ctx, table)
 	if err != nil {
 		return fmt.Errorf("mysql: LOAD DATA: pin connection: %w", err)
 	}
@@ -505,9 +506,23 @@ func replayWarningsAreOnlyDuplicates(segRows int, inserted, totalWarnings int64,
 // which case any LOAD DATA LOCAL INFILE statement fails server-side.
 // Pre-flighting here lets the writer fall back to BatchedInsert with
 // one WARN line instead of crashing mid-stream.
-func (w *RowWriter) checkLocalInfile(ctx context.Context) (bool, error) {
+//
+// Item 139 sibling, found by the acquire pin rather than by the field
+// report: this probe runs BEFORE the pin, so on the LOAD DATA lane a
+// vtgate drop killed the run one statement EARLIER than the reported
+// `pin connection` site — same error, same run-ending disposition, and
+// invisible to a roster that looks only at Conn() call sites. It now
+// checks its connection out through [RowWriter.acquireConnWithRetry] and
+// runs the probe on that session, which is also the more faithful read
+// (a session variable read on the pool is a read of some other session).
+func (w *RowWriter) checkLocalInfile(ctx context.Context, table *ir.Table) (bool, error) {
+	conn, err := w.acquireConnWithRetry(ctx, table)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close() }()
 	var v string
-	if err := w.db.QueryRowContext(ctx, "SELECT @@local_infile").Scan(&v); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT @@local_infile").Scan(&v); err != nil {
 		return false, err
 	}
 	v = strings.TrimSpace(v)
