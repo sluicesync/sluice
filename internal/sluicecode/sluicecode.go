@@ -163,10 +163,19 @@ const (
 	// `posts_user_id`); SQLite reaches it with no transform at all — two
 	// tables' identically named indexes are one name there (item 134).
 	CodeSchemaIndexNameCollision Code = "SLUICE-E-SCHEMA-INDEX-NAME-COLLISION"
-	CodeValueZeroDate            Code = "SLUICE-E-VALUE-ZERO-DATE"
-	CodeValueNULByte             Code = "SLUICE-E-VALUE-NUL-BYTE"
-	CodeValueUnrepresentable     Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
-	CodeValueRaggedArray         Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
+
+	// A source VIEW's name lands on a name a TABLE or another view
+	// already occupies on a SQLite target, where `CREATE VIEW IF NOT
+	// EXISTS` returns OK and creates nothing — so the view is simply
+	// absent at exit 0 (item 147). Deliberately NOT the index code: the
+	// object lost is a view, the namespace is the table/view one rather
+	// than the index one, and the remedy names a different rename.
+	CodeSchemaViewNameCollision Code = "SLUICE-E-SCHEMA-VIEW-NAME-COLLISION"
+
+	CodeValueZeroDate        Code = "SLUICE-E-VALUE-ZERO-DATE"
+	CodeValueNULByte         Code = "SLUICE-E-VALUE-NUL-BYTE"
+	CodeValueUnrepresentable Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
+	CodeValueRaggedArray     Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
 
 	// A PostgreSQL `bytea` value arrived as a TEXT rendering sluice
 	// cannot read — not the `\x`+even-hex form `bytea_output = hex`
@@ -432,6 +441,7 @@ var registry = map[Code]Info{
 
 	CodeSchemaIdentifierTooLong:    {ClassRefusal, "an emitted PostgreSQL identifier (table, column, index, constraint or enum type) exceeds NAMEDATALEN-1 = 63 bytes, which PG truncates SILENTLY at CREATE time — and because sluice emits the IF NOT EXISTS form, the resulting collision is a silent no-op rather than an error; shorten or alias the source name"},
 	CodeSchemaIndexNameCollision:   {ClassRefusal, "two distinct source indexes resolve to ONE index identifier on a target whose index names are SCHEMA-scoped — on Postgres because sluice's table-scoping transform is not injective (index `user_id` on table `posts` and index `posts_user_id` on the same table both render `posts_user_id`), on SQLite because there is no transform at all and two tables' identically named indexes land on one name — and CREATE INDEX IF NOT EXISTS would silently no-op the second build; rename one of the two source indexes"},
+	CodeSchemaViewNameCollision:    {ClassRefusal, "a source VIEW resolves to a name a TABLE or another view already occupies on a SQLite target, where `CREATE VIEW IF NOT EXISTS` returns OK and creates NOTHING — the view is absent at exit 0; rename the view (or the table) on the source"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},

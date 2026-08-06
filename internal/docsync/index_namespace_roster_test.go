@@ -65,8 +65,10 @@ import (
 // pinned by each engine's own tests. Nor does it reach the OTHER silent
 // `IF NOT EXISTS` no-op found alongside item 134: a SQLite
 // `CREATE VIEW IF NOT EXISTS` whose name matches an existing table or view
-// returns OK and creates nothing. That one loses a view rather than an index,
-// carries no error code yet, and is filed rather than folded in here.
+// returns OK and creates nothing. That one loses a view rather than an index
+// and carries its own code, so it has its own registry walk —
+// TestEveryTargetRefusesACollidingViewNamespace, roadmap item 147 — rather
+// than being folded in here.
 var indexNamespaceExempt = map[string]string{
 	// Source-only engines: no index DDL is ever emitted for them as a target,
 	// so there is no target namespace to collide in. Same set and same reasons

@@ -376,6 +376,9 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	if err := migcore.PreflightIndexEmit(ctx, m.Target, schema, "migrate"); err != nil {
 		return nil, false, err
 	}
+	if err := migcore.PreflightViewEmit(ctx, m.Target, schema, "migrate"); err != nil {
+		return nil, false, err
+	}
 
 	return schema, rawCopyOK, nil
 }

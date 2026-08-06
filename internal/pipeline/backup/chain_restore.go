@@ -287,6 +287,9 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	if err := migcore.PreflightIndexEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
 		return err
 	}
+	if err := migcore.PreflightViewEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
+		return err
+	}
 
 	// 2.5. Encryption pre-flight at the chain's IDENTITY (not merely at
 	//      the first restorable link — see [ChainRestore.chainIdentityManifest]).

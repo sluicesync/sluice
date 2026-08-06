@@ -904,41 +904,72 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 	var refusals []TableRefusal
 	pkColsByTable := make(map[string][]string, len(tables))
 	for _, t := range tables {
-		pkCols, isUnlogged, hasGenerated, hasUnrecognisedDomain, err := loadTableShape(ctx, db, schema, t)
+		shape, err := loadTableShape(ctx, db, schema, t)
 		if err != nil {
 			return nil, nil, fmt.Errorf("load table shape %s.%s: %w", schema, t, err)
 		}
-		pkColsByTable[t] = pkCols
-		if len(pkCols) == 0 {
+		pkColsByTable[t] = shape.pkCols
+		if len(shape.pkCols) == 0 {
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "no-primary-key",
 				Hint:   "add a PRIMARY KEY to " + schema + "." + t + " before including it in the trigger engine's replication set",
 			})
 		}
-		if isUnlogged {
+		if shape.isUnlogged {
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "unlogged-table",
 				Hint:   "exclude UNLOGGED tables explicitly via --exclude-table, or convert them to LOGGED",
 			})
 		}
-		if hasGenerated {
+		if shape.hasGenerated {
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "generated-stored-column",
 				Hint:   "the trigger engine does not replicate GENERATED ALWAYS AS ... STORED columns; use the `postgres` engine or exclude the column via --exclude-column",
 			})
 		}
-		if hasUnrecognisedDomain {
+		if shape.hasUnrecognisedDomain {
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "custom-domain-over-udt",
 				Hint:   "the trigger engine refuses custom domains whose underlying type is also user-defined; remap the column with --type-override or use the `postgres` engine",
 			})
 		}
+		// Roadmap item 145's other half. Every other column type survives the
+		// to_jsonb capture because its rendering is a JSON leaf; a json[] /
+		// jsonb[] column does not, and it is the ONLY family where that is
+		// true. to_jsonb embeds each element AS JSON rather than as a string,
+		// so after the payload decode a JSON `null` element is byte-identical
+		// to a SQL NULL element and an array-valued element `[1,2]` is
+		// byte-identical to a nested array dimension. Neither is recoverable
+		// downstream — the postgres writer's jsonArrayLeaf refuses every
+		// payload-decoded shape it CAN see for exactly that reason — so the
+		// column is refused HERE, before any trigger is installed, rather than
+		// as a mid-stream apply error on the first array-bearing change.
+		if shape.hasJSONArrayColumn {
+			refusals = append(refusals, TableRefusal{
+				Schema: schema, Table: t,
+				Reason: "json-array-column",
+				Hint:   "the trigger engine's to_jsonb capture cannot distinguish a JSON `null` element from a SQL NULL element, nor an array-valued element from a nested array dimension, in a json[]/jsonb[] column; exclude the column via --exclude-column, remap it with --type-override, or use the `postgres` engine (logical replication carries this family faithfully)",
+			})
+		}
 	}
 	return refusals, pkColsByTable, nil
+}
+
+// tableShape is what [loadTableShape] reads out of the catalog: the
+// per-table facts the §14 preflight classifies on, in one value so a new
+// classification axis is a field rather than another return slot.
+type tableShape struct {
+	// pkCols is the PK column list in PK-constraint (conkey) order.
+	pkCols []string
+
+	isUnlogged            bool
+	hasGenerated          bool
+	hasUnrecognisedDomain bool
+	hasJSONArrayColumn    bool
 }
 
 // loadTableShape returns the per-table flags the preflight classifies
@@ -951,7 +982,7 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 // it's better than a raw catalog error). The list crosses the wire as
 // a JSON array (`to_jsonb(...)::text`) because database/sql has no
 // portable text[] scan; encoding/json decodes it exactly.
-func loadTableShape(ctx context.Context, db *sql.DB, schema, table string) (pkCols []string, isUnlogged, hasGenerated, hasUnrecognisedDomain bool, err error) {
+func loadTableShape(ctx context.Context, db *sql.DB, schema, table string) (tableShape, error) {
 	const q = `
 SELECT
     COALESCE((
@@ -990,17 +1021,38 @@ SELECT
            AND a.attnum > 0 AND NOT a.attisdropped
            AND t.typtype = 'd'                       -- domain
            AND bt.typtype IN ('c', 'e', 'd', 'p')    -- composite/enum/domain/pseudo: refuse
-    ) AS has_unrecognised_domain
+    ) AS has_unrecognised_domain,
+    EXISTS (
+        SELECT 1
+          FROM pg_attribute a
+          JOIN pg_class     c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_type      t ON t.oid = a.atttypid
+          JOIN pg_type     et ON et.oid = t.typelem
+         WHERE c.relname = $2 AND n.nspname = $1
+           AND a.attnum > 0 AND NOT a.attisdropped
+           AND t.typcategory = 'A'                   -- an array type…
+           AND et.typname IN ('json', 'jsonb')       -- …of json/jsonb: refuse (item 145)
+    ) AS has_json_array_column
 `
-	var pkColsJSONText string
+	var (
+		shape          tableShape
+		pkColsJSONText string
+	)
 	row := db.QueryRowContext(ctx, q, schema, table)
-	if err := row.Scan(&pkColsJSONText, &isUnlogged, &hasGenerated, &hasUnrecognisedDomain); err != nil {
-		return nil, false, false, false, err
+	if err := row.Scan(
+		&pkColsJSONText,
+		&shape.isUnlogged,
+		&shape.hasGenerated,
+		&shape.hasUnrecognisedDomain,
+		&shape.hasJSONArrayColumn,
+	); err != nil {
+		return tableShape{}, err
 	}
-	if err := json.Unmarshal([]byte(pkColsJSONText), &pkCols); err != nil {
-		return nil, false, false, false, fmt.Errorf("decode PK column list %q: %w", pkColsJSONText, err)
+	if err := json.Unmarshal([]byte(pkColsJSONText), &shape.pkCols); err != nil {
+		return tableShape{}, fmt.Errorf("decode PK column list %q: %w", pkColsJSONText, err)
 	}
-	return pkCols, isUnlogged, hasGenerated, hasUnrecognisedDomain, nil
+	return shape, nil
 }
 
 // canCreateEventTrigger reports whether the connecting role can run

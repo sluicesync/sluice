@@ -33,9 +33,10 @@
 //     which reaches the type switch and nothing else. It proves the arm
 //     EXISTS. It proves nothing about leaf fidelity, dimensions, or NULL
 //     elements — that is the family × shape matrix's job
-//     (TestMigrate_PGToPG_ByteaArrays, TestMigrate_PGToPG_ArrayElement
-//     Modifiers, TestCDCApply_ArrayElementFamilies). Those two halves
-//     are complementary and neither substitutes for the other.
+//     (TestMigrate_PGToPG_ByteaArrays, TestMigrate_PGToPG_JSONArrays,
+//     TestMigrate_PGToPG_ArrayElementModifiers,
+//     TestCDCApply_ArrayElementFamilies). Those two halves are
+//     complementary and neither substitutes for the other.
 //   - It reaches the POSTGRES writer only. The MySQL target's array
 //     handling (convertArrayLikeToJSON) is a different mechanism.
 package postgres
@@ -55,7 +56,9 @@ import (
 // family that is neither writable nor listed here fails the test.
 //
 // This map is the finding's real output. Before item 141 it would have
-// held THREE entries and only one of them on purpose.
+// held THREE entries and only one of them on purpose; item 141 fixed
+// bytea and item 145 fixed json/jsonb, so the one that remains is the
+// one that was ever deliberate.
 var pgUnwritableArrayElement = map[string]string{
 	"ir.Time{WithTimeZone:true}": "timetz[] — DELIBERATE, and the refusal is loud (convertArray's own arm). " +
 		"There is no faithful binary leaf: the per-conn scalar timetz codec is not registered for the " +
@@ -68,12 +71,6 @@ var pgUnwritableArrayElement = map[string]string{
 		"Still LOUD (verified: every offset spelling, +hh, -hh:mm and Z, fails the parse), so this is a " +
 		"message-quality divergence and not a fidelity one — but it is a real divergence between the two " +
 		"doors' resolved ir.Type, which TestOIDToType_ArrayParity cannot see because it compares FAMILIES.",
-	"ir.JSON": "json[] / jsonb[] — NOT deliberate: OPEN roadmap item 145, exactly item 141's shape, surfaced by " +
-		"this gate on its first run rather than by a field report. It is LOUD (the copy refuses with " +
-		"\"array of element type ir.JSON not supported\"), never silent, which is why it is recorded " +
-		"here instead of being fixed in the same change as bytea: choosing a leaf that pgx's JSONCodec " +
-		"plans for the _json/_jsonb element OIDs is a Bug-74-class decision that needs its own " +
-		"real-target dimension matrix, not a guess bundled into another item's diff.",
 }
 
 // TestEveryDecodableArrayElementIsWritable is the divergence map.
@@ -141,6 +138,15 @@ func TestEveryDecodableArrayElementIsWritable(t *testing.T) {
 		if _, err := convertArray([]any{}, elem); err != nil {
 			t.Errorf("convertArray refuses %T: %v — item 141's whole finding was that bytea[] could not "+
 				"reach a PG target", elem, err)
+		}
+	}
+	// And item 145, the family THIS gate found. Both spellings, because the
+	// writer arm is keyed on ir.JSON while the two reader doors resolve
+	// `json` and `jsonb` to the Binary=false / Binary=true variants of it.
+	for _, elem := range []ir.Type{ir.JSON{}, ir.JSON{Binary: true}} {
+		if _, err := convertArray([]any{}, elem); err != nil {
+			t.Errorf("convertArray refuses %#v: %v — item 145's whole finding was that json[]/jsonb[] could "+
+				"not reach a PG target", elem, err)
 		}
 	}
 }

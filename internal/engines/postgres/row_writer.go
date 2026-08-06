@@ -1201,6 +1201,10 @@ func prepareValue(v any, t ir.Type) (any, error) {
 //     wrapper and ByteaCodec plans []byte directly, so the deref-pointer
 //     route reaches it (roadmap item 141; see [byteaArrayLeaf], which
 //     also carries this arm's nil-slice wart).
+//   - json / jsonb — *[]byte, the IR-canonical shape decodeBytes
+//     produces (roadmap item 145; see [jsonArrayLeaf], which also
+//     explains why this is the ONE family whose leaf choice cannot
+//     flatten and whose real hazard is a different one).
 //   - date — *pgtype.Date; datetime / timestamp-without-tz —
 //     *pgtype.Timestamp; timestamp-with-tz — *pgtype.Timestamptz;
 //     time-without-tz — *pgtype.Time. The temporal codecs plan their
@@ -1270,6 +1274,8 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 		})
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return buildPGArray(v, byteaArrayLeaf)
+	case ir.JSON:
+		return buildPGArray(v, jsonArrayLeaf)
 	case ir.Decimal:
 		return buildPGArray(v, numericArrayLeaf)
 	case ir.Date:
@@ -1450,6 +1456,91 @@ func byteaArrayLeaf(x any) ([]byte, error) {
 		return raw, nil
 	}
 	return nil, fmt.Errorf("expected []byte, got %T", x)
+}
+
+// jsonArrayLeaf converts one json/jsonb array element to its []byte leaf
+// (roadmap item 145 — the sibling item 141's own roster gate surfaced on
+// its first run, rather than a field report). Until this existed,
+// `json[]` and `jsonb[]` could not reach a Postgres target AT ALL:
+// convertArray fell through to "array of element type ir.JSON not
+// supported" and the copy aborted.
+//
+// The leaf type is []byte because that is what the IR carries: both PG
+// read lanes decode an ir.JSON leaf through decodeBytes, which yields
+// []byte for a string or a []byte input and refuses anything else.
+//
+// # This family's Bug-74 hazard is a DIFFERENT one, and saying so is the point
+//
+// Every other arm above picks its leaf so pgx's ArrayCodec can plan the
+// element encode against the target's element OID — because when it
+// CANNOT, ArrayCodec declines, pgx falls through its wrap chain to a
+// plain-slice encoder, and ≥2-D arrays silently flatten (Bug 74). That
+// failure mode is structurally absent here: JSONCodec.PlanEncode is a
+// TOTAL function — string, []byte, json.RawMessage, driver.Valuer and
+// json.Marshaler have plans, and anything else falls through to a
+// marshal plan — so it never returns nil, ArrayCodec never declines for
+// the _json/_jsonb element OIDs, and the wrap chain is never reached.
+// Ground-truthed rather than reasoned: TestMigrate_PGToPG_JSONArrays
+// pins array_dims on real 2-D json[] AND jsonb[] rows.
+//
+// What replaces it is quieter. Because the fallback plan MARSHALS, a
+// leaf pgx does not recognise is not refused — it is re-encoded. A
+// []byte that reached the marshal plan would land as a base64 STRING
+// where the document belongs, with no error at any layer. So the leaf's
+// job here is to keep the value on the recognised []byte plan and refuse
+// everything else loudly, which is the opposite discipline from the
+// temporal arms (pick the type the codec plans) reaching the same place.
+//
+// # WART: an empty leaf is REFUSED, where the bytea arm normalises
+//
+// [buildPGArray] resolves a SQL NULL element before the leaf runs, so
+// every value arriving here is PRESENT — and pgx encodes a nil []byte as
+// SQL NULL, the same trap [byteaArrayLeaf] normalises around. The answer
+// differs because the values differ: an empty bytea is a real value worth
+// preserving, while an empty byte slice is not valid JSON and no PG
+// json/jsonb column can hold one. There is nothing to preserve, so it is
+// refused by name rather than turned into a NULL. Pinned by
+// TestJSONArrayLeaf_EmptyElementIsRefusedNotNulled.
+//
+// # Input shapes: the SQL door only, and the trigger door refused BY NAME
+//
+//   - []byte / json.RawMessage — the IR-canonical leaf (decodeBytes, both
+//     provenance lanes). json.RawMessage is []byte under a JSON-specific
+//     name; refusing it would be a Go type-name accident rather than a
+//     fidelity decision.
+//   - EVERYTHING the pgtrigger change-payload path delivers — refused.
+//     This is the one array family whose value space collides with the
+//     capture format's own encoding, and the collision is not repairable
+//     at the leaf: to_jsonb embeds a json/jsonb element AS JSON, not as a
+//     string, so after the payload decode a JSON `null` element is
+//     indistinguishable from a SQL NULL element, and an array-valued
+//     element `[1,2]` is indistinguishable from a nested array dimension
+//     (buildPGArray would walk it as one). Accepting map/string/number/
+//     bool leaves would therefore convert today's loud refusal into
+//     silent loss for the two shapes no leaf can see. They are refused
+//     here, and pgtrigger.Setup refuses a json[]/jsonb[] column outright
+//     so the operator hears it before any value moves rather than as a
+//     mid-stream apply error (see pgtrigger's json-array-column refusal).
+func jsonArrayLeaf(x any) ([]byte, error) {
+	var b []byte
+	switch j := x.(type) {
+	case []byte:
+		b = j
+	case json.RawMessage:
+		b = j
+	default:
+		return nil, fmt.Errorf(
+			"expected []byte, got %T (a json[]/jsonb[] element must arrive as the IR-canonical JSON bytes; "+
+				"the trigger-CDC capture format cannot carry this family faithfully and is refused at setup)", x,
+		)
+	}
+	if len(b) == 0 {
+		return nil, errors.New(
+			"json array element is empty, which is not a valid JSON document; refusing rather than " +
+				"writing it as a SQL NULL (pgx encodes an empty/nil byte slice for json as NULL)",
+		)
+	}
+	return b, nil
 }
 
 // Temporal array-leaf layouts. to_jsonb renders timestamps in ISO 8601

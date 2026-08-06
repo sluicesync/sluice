@@ -77,6 +77,12 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if err := validateSQLiteIndexNamespace(s.Tables); err != nil {
 		return err
 	}
+	// And the sibling that loses a VIEW instead of an index (roadmap item
+	// 147). Same phase, same reason: the view phase is the LAST one, so a
+	// refusal there arrives after the whole database has been written.
+	if err := validateSQLiteViewNamespace(s.Tables, s.Views); err != nil {
+		return err
+	}
 	if len(s.Sequences) > 0 {
 		return fmt.Errorf(
 			"sqlite: schema carries standalone sequence %q (%d total); SQLite has no sequence "+
@@ -234,6 +240,15 @@ func (w *SchemaWriter) SyncIdentitySequences(context.Context, *ir.Schema) error 
 func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("sqlite: CreateViews: schema is nil")
+	}
+	// The belt behind CreateTablesWithoutConstraints' brace, and the phase
+	// where the silent no-op would actually happen: a view whose name a table
+	// or an earlier view already holds is created by `CREATE VIEW IF NOT
+	// EXISTS` as a successful no-op (roadmap item 147). Reached by the paths
+	// that never ran the create-tables phase (`--resume`, restore, a target
+	// whose schema already exists).
+	if err := validateSQLiteViewNamespace(s.Tables, s.Views); err != nil {
+		return err
 	}
 	for _, view := range s.Views {
 		if view == nil || view.Name == "" {

@@ -322,6 +322,59 @@ func TestSetup_RefusesGeneratedStored(t *testing.T) {
 	}
 }
 
+// TestSetup_RefusesJSONArrayColumn covers roadmap item 145's other half: the
+// ONE column family the to_jsonb capture format cannot carry.
+//
+// to_jsonb embeds a json/jsonb array element AS JSON rather than as a string,
+// so after the payload's UseNumber decode a JSON `null` element is
+// byte-identical to a SQL NULL element and an array-valued element `[1,2]` is
+// byte-identical to a nested array dimension. Neither is recoverable
+// downstream, so the column is refused HERE — before any trigger is installed
+// — rather than as a mid-stream apply error on the first array-bearing change.
+//
+// The negative half runs in the same test: a plain jsonb column, and a text[]
+// column, must both still be accepted. A refusal that fired on "the table has
+// JSON somewhere" or "the table has an array somewhere" would satisfy the
+// positive assertion while breaking two ordinary shapes.
+func TestSetup_RefusesJSONArrayColumn(t *testing.T) {
+	dsn, cleanup := startPGForTrigger(t)
+	defer cleanup()
+
+	applyPGSQL(t, dsn, `
+		CREATE TABLE ja  (id BIGINT PRIMARY KEY, docs jsonb[]);
+		CREATE TABLE ja2 (id BIGINT PRIMARY KEY, docs json[]);
+		CREATE TABLE ok  (id BIGINT PRIMARY KEY, doc jsonb, tags text[]);
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	for _, table := range []string{"ja", "ja2"} {
+		plan, err := Setup(ctx, dsn, SetupOptions{Tables: []string{table}, Schema: "public"})
+		if err == nil {
+			t.Fatalf("Setup(%s): expected refusal; got nil err (plan=%+v)", table, plan)
+		}
+		var sawJSONArray bool
+		for _, r := range plan.Refusals {
+			if r.Reason == "json-array-column" {
+				sawJSONArray = true
+				if !contains(r.Hint, "--exclude-column") {
+					t.Errorf("Refusal.Hint = %q; want contains '--exclude-column'", r.Hint)
+				}
+			}
+		}
+		if !sawJSONArray {
+			t.Errorf("Refusals for %s = %+v; want a json-array-column refusal", table, plan.Refusals)
+		}
+	}
+
+	plan, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"ok"}, Schema: "public"})
+	if err != nil {
+		t.Fatalf("Setup(ok): a scalar jsonb column and a text[] column are both carried faithfully and "+
+			"must NOT be refused: %v (refusals=%+v)", err, plan.Refusals)
+	}
+}
+
 // TestSetup_DryRun_NoSideEffects asserts the dry-run path emits the
 // DDL without applying it. The change-log table must NOT exist after
 // the call.

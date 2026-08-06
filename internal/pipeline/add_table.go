@@ -408,6 +408,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := migcore.PreflightIndexEmit(ctx, a.Target, scoped, "add-table"); err != nil {
 		return err
 	}
+	if err := migcore.PreflightViewEmit(ctx, a.Target, scoped, "add-table"); err != nil {
+		return err
+	}
 
 	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))

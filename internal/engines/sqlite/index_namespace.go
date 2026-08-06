@@ -53,10 +53,11 @@ import (
 //     surfaces at the index phase.
 //   - VIEW vs an existing table or view name: `CREATE VIEW IF NOT EXISTS "a"`
 //     against a table `a` returns OK and creates NOTHING — a genuine silent
-//     drop, of the same shape and on the same engine. It is NOT closed here:
-//     the object lost is a view rather than an index, which is a different
-//     operator-facing refusal and a different error code. Filed rather than
-//     folded in, so this gate's name stays no broader than what it checks.
+//     drop, of the same shape and on the same engine. Still not closed HERE,
+//     and now closed next door: the object lost is a view rather than an index,
+//     which is a different operator-facing refusal under a different code, so
+//     it lives in [validateSQLiteViewNamespace] (roadmap item 147) and this
+//     gate's name stays no broader than what it checks.
 //
 // It reaches no PRIMARY KEY either, and that one is genuinely vacuous rather
 // than deferred: [emitTableDef] renders a PK as an inline `PRIMARY KEY (...)`

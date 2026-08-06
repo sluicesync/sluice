@@ -3473,6 +3473,45 @@ type IndexEmitPreflighter interface {
 	PreflightIndexes(s *Schema) error
 }
 
+// ViewEmitPreflighter is the optional engine surface that answers, with no
+// database connection and before any data moves, "can every view in this
+// schema actually be created on you?" (roadmap item 147).
+//
+// # Why it is a SECOND interface rather than a second question for
+// [IndexEmitPreflighter]
+//
+// PreflightIndexes already carries two questions (index representability and
+// index-name collision), and both are about indexes. A view question folded
+// into it would make the method's name broader than the truth — the failure
+// shape CLAUDE.md's gate-scope rule names: a check whose coverage is wider
+// than its title stops anyone from looking for the missing one. The two are
+// wired at the same call sites and dispatched by sibling helpers in
+// pipeline/migcore, so the parity that matters is enforced without conflating
+// the names.
+//
+// # Contract
+//
+// PreflightViews returns the SAME refusal the engine's view phase would
+// return later — or, where the view phase would NOT refuse because the loss
+// is silent there, the refusal that loss deserves. It must not refuse
+// anything the view phase would accept. It takes no context and opens no
+// connection. Engines that are sources only, or whose view emit cannot lose
+// a view (Postgres and MySQL both emit `CREATE OR REPLACE VIEW`, and both
+// raise loudly when the name is held by a base table), omit the method; the
+// orchestrator type-asserts and skips.
+//
+// # Why the class exists at all
+//
+// It is the same `IF NOT EXISTS` mechanism as item 134's index collision, on
+// the object kind where it is silent rather than loud: SQLite keeps tables and
+// views in one case-folded namespace, and `CREATE VIEW IF NOT EXISTS` against
+// a name a table already holds returns OK and creates nothing. Without this
+// surface the only doors are the SQLite writer's own phases, and the phase
+// where the loss happens runs AFTER the entire copy.
+type ViewEmitPreflighter interface {
+	PreflightViews(s *Schema) error
+}
+
 // ConnectionLabeler is the optional engine surface for engines that can
 // stamp every connection they open with an operator-visible label
 // carrying the run's stream-/migration-id, so operators can find a

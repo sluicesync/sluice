@@ -68,6 +68,11 @@ func arrayLeafFamilies() []arrayLeafFamily {
 		{"bytea/blob", ir.Blob{}, func(i int) any { return []byte{0x00, byte(i)} }},
 		{"bytea/binary", ir.Binary{Length: 2}, func(i int) any { return []byte{0xff, byte(i)} }},
 		{"bytea/varbinary", ir.Varbinary{Length: 4}, func(i int) any { return []byte{byte(i)} }},
+		// json and jsonb likewise share ONE arm (item 145), and are likewise
+		// listed twice: the two reader doors resolve them to different
+		// ir.JSON variants, and "same arm" is the reasoning Bug 74 spent.
+		{"json", ir.JSON{}, func(i int) any { return []byte(fmt.Sprintf(`{"i":%d}`, i)) }},
+		{"jsonb", ir.JSON{Binary: true}, func(i int) any { return []byte(fmt.Sprintf(`[%d]`, i)) }},
 		{"numeric", ir.Decimal{Precision: 20, Scale: 4}, func(i int) any { return fmt.Sprintf("%d.5000", i) }},
 		{"date", ir.Date{}, func(i int) any { return base.AddDate(0, 0, i) }},
 		{"datetime", ir.DateTime{}, func(i int) any { return base.Add(time.Duration(i) * time.Hour) }},

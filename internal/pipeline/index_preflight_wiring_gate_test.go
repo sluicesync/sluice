@@ -15,7 +15,7 @@ import (
 )
 
 // EVERY ENTRY POINT THAT COPIES THEN INDEXES MUST ASK THE INDEX PREFLIGHT
-// FIRST (roadmap item 118).
+// FIRST (roadmap item 118) — AND, since item 147, the VIEW preflight too.
 //
 // # Why a gate rather than a promise
 //
@@ -35,6 +35,17 @@ import (
 // field to compare — so it gets its own roster, in the same fail-by-default
 // shape: an entry point is either in the list and calls the preflight, or it
 // is exempt with a reason.
+//
+// # Both helpers, one roster
+//
+// Item 147 added [migcore.PreflightViewEmit] beside [migcore.PreflightIndexEmit]
+// — a separate helper on purpose (a view question inside a method named for
+// indexes would make that name broader than its truth), asked at the SAME six
+// entry points for the same reason. The entry-point roster is therefore shared:
+// each rostered declaration must call BOTH, so the sibling that arrives next
+// cannot land on one helper's call sites and miss the other's. Forking a
+// second roster would have re-created exactly the drift this gate exists to
+// stop.
 //
 // # Scope, stated so the name cannot be read as broader than the truth
 //
@@ -93,9 +104,15 @@ func declIdentity(fn *ast.FuncDecl) string {
 	return "(" + star + id.Name + ")." + fn.Name.Name
 }
 
+// preflightHelpers is the set of migcore dispatchers every rostered entry
+// point must call. Both are unconditional pre-DDL gates over the whole schema
+// and both are silent-or-late without the call; they differ only in the object
+// kind they refuse on.
+var preflightHelpers = []string{"PreflightIndexEmit", "PreflightViewEmit"}
+
 // callersOfPreflight parses every non-test .go file in dir and returns the set
-// of declarations that call migcore.PreflightIndexEmit.
-func callersOfPreflight(t *testing.T, dir string) (callers map[string]bool, parsed int) {
+// of declarations that call migcore.<helper>.
+func callersOfPreflight(t *testing.T, dir, helper string) (callers map[string]bool, parsed int) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -124,7 +141,7 @@ func callersOfPreflight(t *testing.T, dir string) (callers map[string]bool, pars
 					return true
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "PreflightIndexEmit" {
+				if !ok || sel.Sel.Name != helper {
 					return true
 				}
 				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "migcore" {
@@ -138,48 +155,51 @@ func callersOfPreflight(t *testing.T, dir string) (callers map[string]bool, pars
 }
 
 func TestIndexEmitPreflightReachesEveryCopyEntryPoint(t *testing.T) {
-	for dir, wanted := range indexPreflightEntryPoints {
-		callers, parsed := callersOfPreflight(t, dir)
+	for _, helper := range preflightHelpers {
+		for dir, wanted := range indexPreflightEntryPoints {
+			callers, parsed := callersOfPreflight(t, dir, helper)
 
-		// Anti-vacuity floor. A walk that saw no files, or that stopped
-		// matching the call because the helper was renamed, would pass this
-		// gate on an empty set forever — which is the failure mode the
-		// sibling gates in this package were rebuilt to avoid.
-		if parsed < 5 {
-			t.Fatalf("parsed only %d non-test files in %q — the walk is not seeing the package", parsed, dir)
-		}
-		if len(callers) == 0 {
-			t.Fatalf("no call to migcore.PreflightIndexEmit found anywhere in %q. Either the helper was "+
-				"renamed (re-point this gate) or every entry point lost the call — in which case roadmap "+
-				"item 118 has silently regressed and every index refusal is back to firing after the copy.",
-				dir)
-		}
-
-		for decl, why := range wanted {
-			if strings.TrimSpace(why) == "" {
-				t.Errorf("%s/%s is rostered with an EMPTY reason", dir, decl)
+			// Anti-vacuity floor. A walk that saw no files, or that stopped
+			// matching the call because the helper was renamed, would pass this
+			// gate on an empty set forever — which is the failure mode the
+			// sibling gates in this package were rebuilt to avoid.
+			if parsed < 5 {
+				t.Fatalf("parsed only %d non-test files in %q — the walk is not seeing the package", parsed, dir)
 			}
-			if !callers[decl] {
-				got := make([]string, 0, len(callers))
-				for c := range callers {
-					got = append(got, c)
+			if len(callers) == 0 {
+				t.Fatalf("no call to migcore.%s found anywhere in %q. Either the helper was "+
+					"renamed (re-point this gate) or every entry point lost the call — in which case roadmap "+
+					"item 118/147 has silently regressed and every index or view refusal is back to firing "+
+					"after the copy.", helper, dir)
+			}
+
+			for decl, why := range wanted {
+				if strings.TrimSpace(why) == "" {
+					t.Errorf("%s/%s is rostered with an EMPTY reason", dir, decl)
 				}
-				sort.Strings(got)
-				t.Errorf("%s in %q does not call migcore.PreflightIndexEmit.\n\nThis entry point %s, so "+
-					"every \"this index cannot be represented on the target\" refusal it can hit fires "+
-					"AFTER the copy — roadmap item 118's whole defect, re-opened for this path.\n"+
-					"callers found in %q: %v", decl, dir, why, dir, got)
+				if !callers[decl] {
+					got := make([]string, 0, len(callers))
+					for c := range callers {
+						got = append(got, c)
+					}
+					sort.Strings(got)
+					t.Errorf("%s in %q does not call migcore.%s.\n\nThis entry point %s, so "+
+						"every \"this index/view cannot be created on the target\" refusal it can hit fires "+
+						"AFTER the copy — roadmap item 118's whole defect (and, for views, item 147's silent "+
+						"no-op), re-opened for this path.\ncallers found in %q: %v",
+						decl, dir, helper, why, dir, got)
+				}
 			}
-		}
 
-		// The reverse direction: a NEW caller is fine, but it must be
-		// rostered, because the roster is the only place the entry-point list
-		// is written down.
-		for decl := range callers {
-			if _, ok := wanted[decl]; !ok {
-				t.Errorf("%s in %q calls migcore.PreflightIndexEmit but is not in "+
-					"indexPreflightEntryPoints. Add it with the reason it copies-then-indexes, so the "+
-					"roster stays the answer to \"which entry points are covered?\"", decl, dir)
+			// The reverse direction: a NEW caller is fine, but it must be
+			// rostered, because the roster is the only place the entry-point list
+			// is written down.
+			for decl := range callers {
+				if _, ok := wanted[decl]; !ok {
+					t.Errorf("%s in %q calls migcore.%s but is not in "+
+						"indexPreflightEntryPoints. Add it with the reason it copies-then-indexes, so the "+
+						"roster stays the answer to \"which entry points are covered?\"", decl, dir, helper)
+				}
 			}
 		}
 	}
