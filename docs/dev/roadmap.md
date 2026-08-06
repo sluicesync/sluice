@@ -1873,7 +1873,7 @@ Measured on a real PS-10 database, both branches, 1.7M rows / 918 MB:
 
 **Operator workaround available today:** `--copy-fanout-degree 2` on a dev branch. Worth documenting regardless of how this is fixed.
 
-**Fix shape, and why it needs thought rather than a constant.** Reverting to a cap-on-sub-floor would restore the item-123 defect. Options: treat a sub-floor reading as evidence of a DEV branch specifically (it is a reliable signal — a dev branch reports a small fixed pool that does not track the plan tier) and cap on that; or derive the ceiling from an observable that is honest on both branch classes; or make the copy adaptive to shed connections rather than to a static tier guess. Note the two branch classes also run **different server builds** (dev 8.4.11-Vitess, production 8.4.9-Vitess), so a comparison between them is not a controlled comparison of one server.
+**Fix shape, and why it needs thought rather than a constant.** Reverting to a cap-on-sub-floor would restore the item-123 defect. Options: treat a sub-floor reading as evidence of a DEV branch specifically (it is a reliable signal — a dev branch reports a small fixed pool that does not track the plan tier) and cap on that; or derive the ceiling from an observable that is honest on both branch classes; or make the copy adaptive to shed connections rather than to a static tier guess. Note the two branch classes also run **different server builds** — and the pair MOVES: an earlier measurement the same day recorded production 8.4.6 / dev 8.4.9 (`buffer_pool_tier_cap.go:102-103`), this one recorded production 8.4.9 / dev 8.4.11, on a different database. Do NOT publish either pair as a fact about PlanetScale; the durable claim is the INVARIANT — the two branch classes are demonstrably not the same infrastructure, so a dev-vs-production comparison is never a controlled comparison of one server, so a comparison between them is not a controlled comparison of one server.
 
 ### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *OPEN, medium; the sibling audit C-3's own fix missed, found while ground-truthing item 130's premise*
 
@@ -1921,7 +1921,7 @@ internal: vtgate connection error: read tcp …:15999: read: connection reset by
 
 The shape is the one this project keeps paying for: item 122's fix was correct and its enumeration stopped at the operation, not the connection the operation needs.
 
-### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *✅ FIXED 2026-08-05; unreleased. `-race` Integration must be green before the tag — concurrency chunk (the gate quiesces lanes).*
+### 138. The storage-grow gate quiesces 81% of the wall clock on a busy Vitess target, so a cold copy never finishes — *✅ FIXED 2026-08-05; shipped in **v0.113.0**. `-race` Integration must be green before the tag — concurrency chunk (the gate quiesces lanes).*
 
 **VALIDATED ON REAL PLANETSCALE, 2026-08-05** — PS-10, 1.7M rows / 918 MB, the reporter's scale rather than a proxy. The clean signal is not the duty percentage, it is the HOLD DISTRIBUTION. Pre-fix, across 20 windows in two runs, every hold was either ~0.20s or 30.0s and nothing in between (`0.204, 30.014, 30.019, 0.205, 30.016, 30.019`) — the fingerprint of a ladder consumed instantly by fan-out. Post-fix, on the same branch under the same storm, the ladder ran properly twice with the episode reset firing between: `0.105 0.201 0.404 0.806 1.605 3.204 6.406 12.805 25.604 30.005` at cycles 1..10. **Escalation is now driven by time, not fan-out width, on real infrastructure.**
 
@@ -1991,7 +1991,7 @@ Bounded and **loud** — an early abort, never a stall — which is why item 136
 
 Worth noting the shape: this is the *same* comment-asserted uniqueness argument that item 126's own entry called out as "checked, not assumed" — and it was true then, of the per-table gate it was written against. ADR-0123 made it false without touching it.
 
-### 136. A CLEARED connection-slot transient DEADLOCKS the copy — Bug 228, regression from item 126 — *✅ FIXED on `main` 2026-08-05 (published inside `764cf018`, see the attribution note); unreleased. `-race` Integration must be green before the tag — concurrency chunk.*
+### 136. A CLEARED connection-slot transient DEADLOCKS the copy — Bug 228, regression from item 126 — *✅ FIXED on `main` 2026-08-05 (published inside `764cf018`, see the attribution note); shipped in **v0.113.0**. `-race` Integration must be green before the tag — concurrency chunk.*
 
 **Shipped in v0.112.0.** A transient SQLSTATE 53300 that then CLEARS stops the copy permanently: no log line, no error, **no exit code**, 1,593,750 of 6,000,000 rows, 48 of 67 goroutines blocked in `Acquire`. v0.111.1 aborted loudly in ~4s. Reproduced 2/2 against 0/2 by the v0.112.0 regression cycle.
 
@@ -2016,7 +2016,7 @@ The run-wide gate is necessary, not merely aggravating: the same harness on a pe
 
 **Attribution note, because the commit message cannot be repaired.** This fix was authored by a background investigator working in the shared tree while the main session committed with `git add -A`, so it was published inside `764cf018`, a commit titled for item 113's doc sync. Force-push to `main` is hard-blocked, so the history stands. `CLAUDE.local.md` warns about exactly this: **do main-session commits in a dedicated worktree, or path-scope the `git add`, whenever a subagent shares the tree.** The cost here was only a misleading commit title; the same mistake with a half-finished edit would have published broken code.
 
-### 135. PG `bytea` decode SNIFFS its input, so genuine binary that spells `\x`+hex is silently shrunk — *✅ FIXED on `main` 2026-08-05; unreleased. Provenance-split decode (two entry points, decodeArray sub-paths setting their own), text lane REFUSES an unrecognised rendering with SLUICE-E-VALUE-BYTEA-TEXT-UNRECOGNIZED. Residual: `bytea[]` cannot be WRITTEN to a PG target at all — item 141.*
+### 135. PG `bytea` decode SNIFFS its input, so genuine binary that spells `\x`+hex is silently shrunk — *✅ FIXED in **v0.113.0**. Provenance-split decode (two entry points, decodeArray sub-paths setting their own), text lane REFUSES an unrecognised rendering with SLUICE-E-VALUE-BYTEA-TEXT-UNRECOGNIZED. Residual: `bytea[]` cannot be WRITTEN to a PG target at all — item 141.*
 
 `postgres/value_decode.go:377`. `decodeBytea` decides whether its input is hex-encoded *text* by looking at the content: `\x` prefix + even-length valid hex ⇒ decode. Raw binary that happens to spell that is silently shrunk.
 
@@ -2060,7 +2060,7 @@ The run-wide gate is necessary, not merely aggravating: the same harness on a pe
 
 This is exactly the C1 network-literal class, on the cells item 117 scoped out. Item 117's scope-out said the residual "can be filed separately" — **and no item was ever filed**, so a commit message became the only record of an open silent-loss finding. Fix mirrors `MACWidth == 0`: give `ir.Inet` a Family field and refuse loudly when the discriminant is missing.
 
-### 132. GTID-mode row positions contain their own in-flight transaction, so a mid-tx checkpoint silently loses the transaction's tail — *✅ FIXED (implemented; pending review + land, unreleased). Audit 2026-08-05 A-2.*
+### 132. GTID-mode row positions contain their own in-flight transaction, so a mid-tx checkpoint silently loses the transaction's tail — *✅ SHIPPED in **v0.113.0**. Audit 2026-08-05 A-2.*
 
 **What landed.** The reader stages a transaction's GTID and folds it into `r.gtidSet` at the transaction's COMMIT rather than its START, so a row's position is the PRE-transaction set — a legal restart point at every row — and only the TxCommit carries the post-transaction set. Ground-truthed on a real gtid_mode=ON MySQL: the three rows of one transaction carry `…:1` and their TxCommit carries `…:1-2`, with the source's own `GTID_SUBSET` as the oracle.
 
@@ -2094,7 +2094,7 @@ The only guard, `CheckpointOnlyAtTxBoundary`, is set **only on the MySQL target 
 
 *Resolution note: the Postgres applier took `CheckpointOnlyAtTxBoundary=true` rather than an exemption, because no honest exemption existed — a MySQL file/pos source into a PG target still has no valid mid-transaction restart point. Verified as inert for every marker-less source: only the MySQL binlog reader and the PG reader emit `ir.TxBegin`/`ir.TxCommit` at all (checked, not assumed), so the trigger-CDC and VStream paths are unaffected.*
 
-### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *FIXED (unreleased; `-race` Integration must be green before the tag — concurrency chunk)*
+### 131. Concurrent apply routes lanes by PRIMARY KEY only, so a secondary-unique reassignment silently loses a row — *FIXED (v0.113.0; `-race` Integration must be green before the tag — concurrency chunk)*
 
 `internal/laneapply/router.go:21`. The key-hash apply is default-on (`--apply-concurrency 0` → W=4) and engaged by the streamer, the broker and chain-restore. It guarantees ordering per **(table, PRIMARY KEY)** — its doc says the dependent-row hazard "cannot occur", which is true for one key and false across two.
 
@@ -2138,7 +2138,7 @@ Item 127 bounded the retained-INPUT term: `s.accumulators` now evicts under a by
 
 **Take it with the same gate shape item 127 used:** a measured ceiling with an anti-vacuity control (the same corpus, uncapped, must blow past it), plus a byte-identical control for a corpus that never reaches the ceiling. Note that a peak-memory assertion on `s.out` needs a real accounting hook, not `runtime.MemStats` — the latter is flaky enough to be worse than no gate.
 
-### 129. `backup verify` cannot detect an unreadable chunk, because it never parses a row — *✅ IMPLEMENTED on branch 2026-08-05; unreleased*
+### 129. `backup verify` cannot detect an unreadable chunk, because it never parses a row — *✅ IMPLEMENTED on branch 2026-08-05; shipped in **v0.113.0***
 
 **What landed: `backup verify --depth read`.** A second depth that streams every chunk — data chunks AND change chunks — through the real `ChunkReader`/`ChangeChunkReader` with the exact (CEK, AAD, codec, segment store) quadruple `restore` resolves, and discards the rows. `hash` stays the default and is byte-identical to before; the depth is a `VerifyDepth` whose ZERO VALUE is `hash`, so the CLI is the only thing that can turn the cost on (the v0.99.51 zero-value trap, applied in the safe direction). A byte-intact chunk its own reader cannot decode is the new `SLUICE-E-BACKUP-CHUNK-UNREADABLE`.
 
@@ -2203,7 +2203,7 @@ Pinned by a refusal test, a large-but-readable control (1 MiB round-trips — wi
 
 **Residual, stated rather than implied:** `backup verify` still cannot detect this class on backups written by OLDER binaries — it does not parse rows. A verify that scans each chunk with the real reader would be the independent check; that is its own item (129), not folded in here. Note that item 129 now covers strictly more than it did when filed: change chunks are in its scope too.
 
-### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *✅ RETAINED-INPUT HALF FIXED on `main` 2026-08-05; unreleased. The emitted-output half is item 130.*
+### 127. `--smart-compaction` buffers an ENTIRE incremental in RAM — no row cap, no byte cap (audit 2026-08-04 HIGH, measured) — *✅ RETAINED-INPUT HALF FIXED in **v0.113.0**. The emitted-output half is item 130.*
 
 **What landed.** A byte ceiling on retained accumulator state (`defaultMaxRetainedBytes`, 32 MiB of ESTIMATED SERIALIZED bytes) with early eviction, so an incremental carrying no TRUNCATE and no DDL can no longer retain itself entirely.
 
@@ -2468,7 +2468,7 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 
 **Gotcha for whoever takes P3.** Chunk boundaries are load-bearing beyond memory: resume keys on them, and the content-addressed same-path upload skip compares a chunk's SHA at its allocated path. Changing when a chunk rolls changes both, so the ceiling wants to land with a resume test and a re-run-skip test, not on its own.
 
-### 115. A shared trigger-CDC change log is pruned against ONE stream's frontier, so a slower peer silently loses rows (audit 2026-08-01 S4) — *✅ FIXED (fix shape (a): a source-side consumer registry) — unreleased on `main`*
+### 115. A shared trigger-CDC change log is pruned against ONE stream's frontier, so a slower peer silently loses rows (audit 2026-08-01 S4) — *✅ SHIPPED in **v0.113.0** (fix shape (a): a source-side consumer registry)*
 
 **What shipped.** ADR-0137 Phase C. `sluice trigger setup` now installs a third source-side table, `sluice_change_log_consumers`, and moves the change-log `schema_version` 1 → 2. Every trigger-CDC stream publishes its durably-applied frontier there on a one-minute cadence — **whether or not it opted into `--auto-prune-change-log`**, because the sync that loses rows is typically the one without the flag — and the prune cuts at `min(MIN(applied_id) across the registry, this stream's freshly-read frontier) - keep`. That is correct for every shape including two streams replicating the SAME table to different targets, which the scoped-prune option (b) could not close; option (b) was not implemented, and the `(schema_name, table_name, id)` index N-16 dropped was NOT re-added — the registry rides its own tiny PK and the change-log DELETE still rides the existing `id` PK range scan.
 
@@ -2497,7 +2497,7 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 
 </details>
 
-### 114. MySQL's `LOAD DATA` cold-copy is one monolithic statement per table, so a transient has NO resume point (audit 2026-08-01 Q2) — *✅ FIXED on `main`; unreleased. BEHAVIOUR CHANGE: a failed LOAD DATA table copy can now leave PARTIAL rows where it previously left none (each segment is its own transaction), which the resume/preflight paths already handle for the batched cores; and a keyless table whose copy hits a transient now REFUSES with `SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS` where it previously refused with a different message — the same disposition the batched cores took in the same situation. Needs a release note.*
+### 114. MySQL's `LOAD DATA` cold-copy is one monolithic statement per table, so a transient has NO resume point (audit 2026-08-01 Q2) — *✅ FIXED on `main`; shipped in **v0.113.0**. BEHAVIOUR CHANGE: a failed LOAD DATA table copy can now leave PARTIAL rows where it previously left none (each segment is its own transaction), which the resume/preflight paths already handle for the batched cores; and a keyless table whose copy hits a transient now REFUSES with `SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS` where it previously refused with a different message — the same disposition the batched cores took in the same situation. Needs a release note.*
 
 **What shipped.** `writeLoadData` now loads a table as a SEQUENCE of bounded `LOAD DATA` statements (16 MiB of encoded TSV each, `defaultLoadDataSegmentBytes`, lowered by `--max-buffer-bytes`), each driven through the SAME `flushWithReparentRetry` the two batched write cores use. The segment's encoded bytes are retained for the length of the flush, which is exactly what the path lacked: the batched cores ride a transient by re-driving their buffered batch, and LOAD DATA had nothing buffered to re-drive. The retry policy, the ADR-0110 grow-gate Await/Trip, the wall-clock bound and the ADR-0108 keyless carve-out are all INHERITED from the shared helper rather than re-derived — `flushWithReparentRetry` now serves three cores, and the roster gate (`TestEveryMySQLBulkWriteLaneReachesTheGrowGate`) already recognised it.
 
@@ -2516,7 +2516,7 @@ Every other buffering path in the tree already has a byte cap beside its row cap
 **The gotcha is now moot.** The filing offered "expose an operator flag to pick the retryable batched writer on a vanilla target" as the cheaper interim; the LOAD DATA core now has the retry itself, so there is nothing to opt into.
 
 
-### 113. The incremental schema diff never compares CHECK constraints or foreign keys, so a mid-window `ADD CHECK` is not skipped — it is never recorded (found 2026-08-01 while fixing the retype-delta skip) — *✅ FIXED on `main` 2026-08-05; unreleased. BEHAVIOUR CHANGE: a chain whose window carries an ADD CHECK or any FK DDL now REFUSES loudly at replay (SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED, remedy: fresh full) where it previously exited 0 having silently restored a target missing the constraint. Same posture column-dropped already took; needs a release note.*
+### 113. The incremental schema diff never compares CHECK constraints or foreign keys, so a mid-window `ADD CHECK` is not skipped — it is never recorded (found 2026-08-01 while fixing the retype-delta skip) — *✅ FIXED in **v0.113.0**. BEHAVIOUR CHANGE: a chain whose window carries an ADD CHECK or any FK DDL now REFUSES loudly at replay (SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED, remedy: fresh full) where it previously exited 0 having silently restored a target missing the constraint. Same posture column-dropped already took; needs a release note.*
 
 **Why.** Item A5's fix (`9d373be6`) turned `tablesEqual` into a registry of structural aspects so no delta shape can reach a silent `continue`, and gated it so a new comparator forces a written disposition. That closes the *disposition* hole. It does not close a **coverage** hole one level up: `tablesEqual` never compared `CheckConstraints` or foreign keys at all, so those changes produce **no delta to dispose of**.
 
