@@ -1046,7 +1046,10 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if view == nil || view.Name == "" {
 			continue
 		}
-		stmt := emitCreateView(w.schema, view)
+		stmt, err := emitCreateView(w.schema, view)
+		if err != nil {
+			return err
+		}
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
 		}
@@ -1067,13 +1070,28 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 // "... ; WITH DATA;" (which PG rejects as SQLSTATE 42601) or
 // "... ;;" (which PG silently parses but is still ugly DDL). Trim
 // trailing whitespace + semicolon before appending the trailer.
-func emitCreateView(schema string, v *ir.View) string {
+// **Identifier-length refusal (roadmap item 148, the "also named" sibling):**
+// views were the one object kind [validatePGIdentifier] had no call site for,
+// and the omission is worse here than for the kinds it did cover. PG truncates
+// at NAMEDATALEN-1 = 63 bytes, so two source views sharing their first 63 bytes
+// become one catalog name — and this emit is `CREATE OR REPLACE VIEW`, which
+// does not no-op on an existing name, it REPLACES it. So the second view's body
+// silently overwrites the first's and the target keeps one view carrying the
+// wrong definition, at exit 0. (Materialized views take the same check for the
+// same reason; their statement errors on a genuine duplicate, but the
+// truncation still merges two distinct source views into one name.) A
+// SQLite/D1 source imposes no identifier-length limit of its own, so it can
+// hand the writer exactly that pair.
+func emitCreateView(schema string, v *ir.View) (string, error) {
+	if err := validatePGIdentifier("view", v.Name, v.Name, schema); err != nil {
+		return "", err
+	}
 	qualified := quoteIdent(schema) + "." + quoteIdent(v.Name)
 	body := trimTrailingSemicolon(v.Definition)
 	if v.Materialized {
-		return "CREATE MATERIALIZED VIEW " + qualified + " AS " + body + " WITH DATA;"
+		return "CREATE MATERIALIZED VIEW " + qualified + " AS " + body + " WITH DATA;", nil
 	}
-	return "CREATE OR REPLACE VIEW " + qualified + " AS " + body + ";"
+	return "CREATE OR REPLACE VIEW " + qualified + " AS " + body + ";", nil
 }
 
 // syncOneIdentity reads MAX(<col>) on the target table; if non-NULL,
@@ -1432,10 +1450,14 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		if view.Materialized {
 			kind = "CREATE MATERIALIZED VIEW"
 		}
+		stmt, err := emitCreateView(w.schema, view)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, ir.DDLStatement{
 			Table: view.Name,
 			Kind:  kind,
-			SQL:   trimTrailingSemicolon(emitCreateView(w.schema, view)),
+			SQL:   trimTrailingSemicolon(stmt),
 		})
 	}
 

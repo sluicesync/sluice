@@ -405,6 +405,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// unrepresentable index was discovered after its rows had landed — and
 	// mid-sync, with the publication already extended. Same one-pass check the
 	// migrate and cold-start paths run, on the single-table scoped schema.
+	if err := migcore.PreflightTableEmit(ctx, a.Target, scoped, "add-table"); err != nil {
+		return err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, a.Target, scoped, "add-table"); err != nil {
 		return err
 	}

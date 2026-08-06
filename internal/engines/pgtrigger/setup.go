@@ -440,6 +440,19 @@ func pkColsJSON(cols []string) string {
 // engine. Order matters: the change-log table must exist before the
 // capture function references it; the function must exist before the
 // per-table triggers reference it.
+//
+// KNOWN GAP — a pre-existing user table of the same name in the same schema is
+// ADOPTED SILENTLY (roadmap item 149b, the trigger-engine sibling of item 148,
+// and the exact twin of the note on sqlite-trigger.renderSetupDDL). The
+// change-log create is `CREATE TABLE IF NOT EXISTS`, so an existing
+// `<schema>.sluice_change_log` is not refused — setup proceeds against the
+// user's table and the first captured change fails on a missing column, on the
+// operator's own write path rather than at setup. Closing it needs a shape
+// probe (the expected column set versus information_schema) wired into BOTH
+// trigger engines; existence alone is not a usable signal because a legitimate
+// re-`setup` always finds the table. The trigger DDL itself is not a member:
+// it emits `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is
+// loud.
 func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)

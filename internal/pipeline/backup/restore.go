@@ -440,6 +440,9 @@ func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *
 	if err := refuseVerbatimManifestRestoreToNonPG(schema, r.Target); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
+	if err := migcore.PreflightTableEmit(ctx, r.Target, schema, "restore"); err != nil {
+		return err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, r.Target, schema, "restore"); err != nil {
 		return err
 	}

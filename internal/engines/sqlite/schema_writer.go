@@ -70,10 +70,17 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	// refusals below). `--exclude-table` is no escape (a sequence is
 	// schema-level, not a table), so the remedy names the source-side
 	// options instead.
-	// Before anything is created or copied: two source indexes that resolve
-	// to one SQLite name would make the second CREATE INDEX a silent no-op
-	// three phases from now, after the whole database has been written
-	// (roadmap item 134). Same phase the Postgres sibling refuses in.
+	// Before anything is created or copied. The worst member of the
+	// `IF NOT EXISTS` class first: two source tables that resolve to one
+	// SQLite name would make the second CREATE TABLE below a silent no-op and
+	// send its rows into the first table (roadmap item 148).
+	if err := validateSQLiteTableNamespace(s.Tables); err != nil {
+		return err
+	}
+	// Two source indexes that resolve to one SQLite name would make the second
+	// CREATE INDEX a silent no-op three phases from now, after the whole
+	// database has been written (roadmap item 134). Same phase the Postgres
+	// sibling refuses in.
 	if err := validateSQLiteIndexNamespace(s.Tables); err != nil {
 		return err
 	}

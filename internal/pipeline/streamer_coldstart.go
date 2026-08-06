@@ -151,6 +151,9 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// moves on one must fire before any data moves on the other. Placed here,
 	// beside the advisory notices and BEFORE the snapshot stream is opened,
 	// so nothing has been created source-side either (no slot to abandon).
+	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return nil, stop, err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return nil, stop, err
 	}

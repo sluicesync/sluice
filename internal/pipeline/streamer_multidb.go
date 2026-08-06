@@ -207,6 +207,20 @@ func (s *Streamer) coldStartMultiDatabase(
 		slog.Any("databases", selected),
 	)
 
+	// ---- 1.5. A target that cannot namespace at all is refused before the
+	// spanning snapshot is taken (roadmap item 148, route 2 — the `migrate`
+	// sibling in runMultiDatabase). The `else` arm in
+	// coldStartCopyOneDatabase sets targetSchema on the same premise the
+	// migrate path did, and [migcore.ApplyTargetSchema] discards it on an
+	// engine with no [ir.SchemaSetter]. Every source database would then
+	// write bare names into ONE target namespace. Placed before step 3's
+	// FLUSH TABLES WITH READ LOCK for the same reason the connection-budget
+	// preflight is: a run that cannot succeed should not freeze the source
+	// first. ----
+	if err := migcore.ValidateMultiNamespaceTarget(s.Target, "multi-namespace sync", selected); err != nil {
+		return nil, stop, err
+	}
+
 	// ---- 2. Ensure each target namespace exists BEFORE cold-start so the
 	// applier (which does NOT create namespaces) lands CDC events into
 	// existing ones. MySQL → MySQL: CREATE DATABASE IF NOT EXISTS per
@@ -622,6 +636,9 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// one database at a time, so an unrepresentable index in database N
 	// would otherwise be discovered after N-1 databases had already been
 	// copied AND after this one's rows had landed.
+	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return fmt.Errorf("pipeline: preflight tables for %q: %w", database, err)
+	}
 	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return fmt.Errorf("pipeline: preflight indexes for %q: %w", database, err)
 	}

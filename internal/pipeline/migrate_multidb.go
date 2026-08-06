@@ -142,16 +142,28 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		return err
 	}
 
+	// ---- Pre-flight: a target that cannot namespace at all (roadmap item
+	// 148, route 2). This used to be an unchecked premise in the `else`
+	// branch below, whose comment claimed that arm was "unreachable with
+	// today's engines" — it was reachable via any flat target (SQLite/D1),
+	// and it set TargetSchema on an engine that discards it. See
+	// [migcore.ValidateMultiNamespaceTarget] for the full mechanism. ----
+	if err := migcore.ValidateMultiNamespaceTarget(m.Target, "multi-namespace migrate", selected); err != nil {
+		return err
+	}
+
 	// Per-namespace target routing is keyed on the TARGET engine exposing
 	// [ir.DatabaseDSNDeriver]: auto-create each same-named target namespace
 	// and re-point the target DSN at it. Both shipped targets implement it —
 	// MySQL's EnsureDatabase is `CREATE DATABASE IF NOT EXISTS` (ADR-0074),
 	// PG's is `CREATE SCHEMA IF NOT EXISTS` (ADR-0075) — so MySQL→MySQL and
 	// {MySQL,PG}→PG all take the deriver branch below. The non-deriver `else`
-	// is the fallback for a hypothetical namespaced target without the
-	// surface (it routes via --target-schema and leans on the writer's own
-	// auto-create); it is unreachable with today's engines but kept so the
-	// orchestrator stays engine-neutral.
+	// is the fallback for a NAMESPACED target without the surface; it routes
+	// via --target-schema and leans on the writer's own auto-create. No
+	// shipped engine takes it today, but the preflight above is what makes
+	// that statement safe rather than a hope: a target reaching the `else`
+	// arm is now guaranteed to honour TargetSchema, because a flat one was
+	// refused before any data moved.
 	targetDeriver, targetCanDeriveDB := m.Target.(ir.DatabaseDSNDeriver)
 
 	// ---- Pre-flight: read every selected database's schema up front so
@@ -215,9 +227,12 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 			perDB.TargetDSN = targetDSN
 			perDB.TargetSchema = ""
 		} else {
-			// Fallback for a namespaced target without [ir.DatabaseDSNDeriver]
+			// Fallback for a NAMESPACED target without [ir.DatabaseDSNDeriver]
 			// (none today): route to the (possibly renamed) target namespace
 			// via --target-schema and lean on the writer's own auto-create.
+			// A FLAT target cannot get here — ValidateMultiNamespaceTarget
+			// refused it above — which is what stops this assignment from
+			// being silently discarded by an engine with no [ir.SchemaSetter].
 			perDB.TargetSchema = target
 		}
 

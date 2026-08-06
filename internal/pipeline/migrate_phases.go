@@ -373,6 +373,9 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	// about the readers, not a property of this gate, and the preflight
 	// costs one pass over the schema. Running it unconditionally means
 	// there is no premise to keep true.
+	if err := migcore.PreflightTableEmit(ctx, m.Target, schema, "migrate"); err != nil {
+		return nil, false, err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, m.Target, schema, "migrate"); err != nil {
 		return nil, false, err
 	}

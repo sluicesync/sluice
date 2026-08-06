@@ -255,6 +255,25 @@ func preflight(tables []*ir.Table) []TableRefusal {
 
 // renderSetupDDL produces the ordered DDL that installs the engine. Order
 // matters: the change-log table must exist before the triggers reference it.
+//
+// KNOWN GAP — a pre-existing user table of the same name is ADOPTED SILENTLY
+// (roadmap item 149b, the trigger-engine sibling of item 148). Every statement
+// below is `CREATE TABLE IF NOT EXISTS`, so if the source already carries a
+// table named `sluice_change_log` (or the meta / columns / consumer tables),
+// the CREATE returns OK, creates nothing, and setup proceeds against the user's
+// table. It fails eventually — the first captured INSERT hits a column that is
+// not there — but "eventually" is on the OPERATOR'S OWN WRITE PATH, after the
+// triggers are installed, which is a worse place to find out than setup.
+//
+// Not fixed here on purpose, and the reason is scope rather than severity: an
+// honest check is a per-table SHAPE probe (does the existing table have the
+// columns this engine expects), which needs a new query on the [executor]
+// interface implemented for BOTH transports — local SQLite and D1 over HTTP —
+// plus the Postgres twin in pgtrigger.renderSetupDDL, which carries the
+// identical shape. Existence alone is not a usable signal: a legitimate
+// re-`setup` finds the table there every time. The trigger DDL itself is NOT a
+// member of this class — it emits `DROP TRIGGER IF EXISTS` plus a plain
+// `CREATE TRIGGER`, which is loud on a name collision.
 func renderSetupDDL(tables []*ir.Table) []string {
 	// 5 base statements + 7 per table (DROP+CREATE×3 triggers + 1 fingerprint upsert).
 	out := make([]string, 0, 5+len(tables)*(2*len(triggerOps)+1))

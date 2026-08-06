@@ -48,10 +48,13 @@ import (
 //     Postgres/MySQL exemption does NOT cover, said here rather than left
 //     implied: `CREATE OR REPLACE VIEW` silently REPLACES an existing VIEW, so
 //     two source views resolving to one target name lose one there too — on
-//     Postgres reachable through NAMEDATALEN truncation, which
-//     `validatePGIdentifier` does not currently walk for views. That is the
-//     SLUICE-E-SCHEMA-IDENTIFIER-TOO-LONG class on an object kind it does not
-//     yet reach, a different item, and it is out of scope here.
+//     Postgres reachable through NAMEDATALEN truncation. That is the
+//     SLUICE-E-SCHEMA-IDENTIFIER-TOO-LONG class on an object kind it did not
+//     reach, and it is now CLOSED (item 148's "also named" sibling):
+//     `validatePGIdentifier("view", …)` runs inside `emitCreateView`, pinned by
+//     postgres.TestEmitCreateView_RefusesAnOverLongName. It stays out of scope
+//     for THIS roster, which asks the connection-free
+//     [ir.ViewEmitPreflighter] question and not the emit-time length one.
 var viewNamespaceExempt = map[string]string{
 	// Source-only engines: no view DDL is ever emitted for them as a target,
 	// so there is no target namespace to collide in. Same set and same reasons

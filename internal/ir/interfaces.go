@@ -3512,6 +3512,51 @@ type ViewEmitPreflighter interface {
 	PreflightViews(s *Schema) error
 }
 
+// TableEmitPreflighter is the optional engine surface that answers, with no
+// database connection and before any data moves, "can every table in this
+// schema actually be created on you under its own name?" (roadmap item 148).
+//
+// # Why it is a THIRD interface, and where the sharing actually is
+//
+// The three members of the `IF NOT EXISTS` silent-no-op class — index (item
+// 134), view (item 147), table (item 148) — look like one question and are
+// not. The question is "does this bare name already name something else in
+// this NAMESPACE", and SQLite has two namespaces with different rules: the
+// flat table/view one, where a colliding CREATE ... IF NOT EXISTS returns OK
+// and creates nothing, and the index one, where a CREATE INDEX against a
+// table's name is a LOUD error. Folding them into one surface would force one
+// walk to claim names the index question must NOT claim, which is an
+// over-refusal that breaks migrations that work today.
+//
+// So the sharing is in the WALK, not in the door: SQLite's table and view
+// refusals are two reports off ONE claim pass over its one object namespace
+// (engines/sqlite/object_namespace.go), while the index walk stays separate
+// for the reason above. The doors stay one-question-per-name so no method's
+// name is broader than its truth, and drift between them is prevented
+// mechanically rather than by promise — TestIndexEmitPreflightReachesEveryCopyEntryPoint
+// requires every rostered copy entry point to call ALL THREE migcore helpers.
+//
+// # Contract
+//
+// PreflightTables returns the refusal the table-create phase CANNOT return,
+// because on the engines in this class that phase does not fail: it succeeds
+// and creates nothing. It must not refuse anything the create phase would
+// accept. It takes no context and opens no connection. Engines that are
+// sources only, or whose table emit cannot silently adopt another table's
+// rows, omit the method; the orchestrator type-asserts and skips.
+//
+// # Why this member is the worst of the three
+//
+// An index or a view that vanishes is a missing object. A table that vanishes
+// is not missing: the rows destined for it are written into the table that won
+// the name, because the INSERT's target name folds the same way the CREATE's
+// did. Both tables' rows are present, the surviving name's count is right, and
+// `verify` agrees — so the run reports success and the corruption has no
+// operator-visible signal at all.
+type TableEmitPreflighter interface {
+	PreflightTables(s *Schema) error
+}
+
 // ConnectionLabeler is the optional engine surface for engines that can
 // stamp every connection they open with an operator-visible label
 // carrying the run's stream-/migration-id, so operators can find a

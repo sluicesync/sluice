@@ -284,6 +284,9 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//       index phase runs after the whole chain has been replayed, so
 	//       an unrepresentable index was discovered at the very end. Asked
 	//       unconditionally, not only on the cross-engine branch.
+	if err := migcore.PreflightTableEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
+		return err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
 		return err
 	}
