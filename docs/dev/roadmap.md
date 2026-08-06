@@ -1856,7 +1856,18 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
-### 145. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *OPEN, medium; found while ground-truthing item 134*
+### 146. A cold copy whose target connection dies mid-`LOAD DATA` HANGS FOREVER — Bug 229 — *OPEN, HIGH; pre-existing, and the rig's SECOND silent hang in two cycles*
+
+Found by the v0.113.0 regression cycle. A cold copy whose target connection dies mid-`LOAD DATA` on the **single-reader lane** never returns: no error, no exit code, no log line, ~0.3s CPU, 0 rows. Goroutine dump shows it blocked in `net.(*conn).Write` under go-sql-driver's `handleInFileRequest`, from `load_data_writer.go:206`.
+
+**Pre-existing, not a v0.113.0 regression** — reproduced 3/3 on v0.113.0 and 1/1 on v0.112.0. Scoped to the single-reader lane; a KEYED table at `--bulk-parallelism=1` stalls identically, so this is not the keyless carve-out.
+
+**Root cause and workaround are the same one-flag experiment:** `?writeTimeout=15s` on the target DSN turns the identical injection into a clean 23s exit carrying item 114's own `SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS`. Without a write deadline the driver blocks forever on a socket whose peer is gone, and item 114's retry never gets the error it would have ridden.
+
+**The pattern is the point, and it is now three deep.** Bug 228 was a silent hang (a cleared transient deadlocking the copy). Item 138 was a silent stall (81% quiesced, every layer reporting success). This is a silent hang on a dead socket. Each was found by a different route and none was caught by a gate, because **every one of them looks like healthy slow progress from the outside.** Bug 228's carry proposed an idle-progress copy WATCHDOG — a run that has made no forward progress for N minutes says so loudly — and this is the third argument for it. That watchdog would catch this class WITHOUT knowing the mechanism, which is exactly what a class-level gate should do.
+
+**Fix shape:** set a write deadline on the target DSN by default (the workaround, promoted), and/or the watchdog. Prefer BOTH — the deadline fixes this instance, the watchdog catches the next one. Check whether the same missing deadline exposes the read side and the other engines' write paths.
+
 
 SQLite index names are schema-scoped, which is item 134. Ground-truthing that turned up a SECOND silent no-op on the same engine, with a different shape: `CREATE VIEW IF NOT EXISTS "a"` against an existing TABLE or VIEW named `a` returns OK and creates nothing. The view the source declared is simply absent on the target, exit 0.
 
