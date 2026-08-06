@@ -1887,17 +1887,24 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 <details>
 <summary>Original report (kept for provenance)</summary>
 
-### 146. A cold copy whose target connection dies mid-`LOAD DATA` HANGS FOREVER — Bug 229 — *OPEN, HIGH; pre-existing, and the rig's SECOND silent hang in two cycles*
+### 148. SQLite `CREATE TABLE IF NOT EXISTS` has the identical silent no-op, and it LOSES ROWS — *OPEN, HIGH; found while fixing item 147*
 
-Found by the v0.113.0 regression cycle. A cold copy whose target connection dies mid-`LOAD DATA` on the **single-reader lane** never returns: no error, no exit code, no log line, ~0.3s CPU, 0 rows. Goroutine dump shows it blocked in `net.(*conn).Write` under go-sql-driver's `handleInFileRequest`, from `load_data_writer.go:206`.
+Item 147 is a lost VIEW. This is the same `IF NOT EXISTS` silent no-op on `ddl_emit.go`'s table emit, which writes a bare, never-qualified name — and the consequence is rows landing in the WRONG TABLE at exit 0. Two routes:
 
-**Pre-existing, not a v0.113.0 regression** — reproduced 3/3 on v0.113.0 and 1/1 on v0.112.0. Scoped to the single-reader lane; a KEYED table at `--bulk-parallelism=1` stalls identically, so this is not the keyless carve-out.
+1. **ASCII case-fold within one namespace.** A Postgres source legitimately holds `public.orders` and `public."Orders"` as distinct tables. SQLite folds them, the second `CREATE TABLE IF NOT EXISTS` no-ops, and the second table's rows are copied into the first.
 
-**Root cause and workaround are the same one-flag experiment:** `?writeTimeout=15s` on the target DSN turns the identical injection into a clean 23s exit carrying item 114's own `SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS`. Without a write deadline the driver blocks forever on a socket whose peer is gone, and item 114's retry never gets the error it would have ridden.
+2. **The multi-database fan-out.** `migrate_multidb.go:217` takes an `else` branch whose own comment says it "is unreachable with today's engines" — **that comment is FALSE.** SQLite implements neither `ir.DatabaseDSNDeriver` nor `ir.SchemaSetter`, so `perDB.TargetSchema` is set and then ignored, and every source schema writes BARE names into one file. Two source schemas carrying a same-named table silently merge.
 
-**The pattern is the point, and it is now three deep.** Bug 228 was a silent hang (a cleared transient deadlocking the copy). Item 138 was a silent stall (81% quiesced, every layer reporting success). This is a silent hang on a dead socket. Each was found by a different route and none was caught by a gate, because **every one of them looks like healthy slow progress from the outside.** Bug 228's carry proposed an idle-progress copy WATCHDOG — a run that has made no forward progress for N minutes says so loudly — and this is the third argument for it. That watchdog would catch this class WITHOUT knowing the mechanism, which is exactly what a class-level gate should do.
+Nothing refuses either route today.
 
-**Fix shape:** set a write deadline on the target DSN by default (the workaround, promoted), and/or the watchdog. Prefer BOTH — the deadline fixes this instance, the watchdog catches the next one. Check whether the same missing deadline exposes the read side and the other engines' write paths.
+**This outranks item 147.** A lost view is a missing object an operator can notice; merged rows are silent corruption that *verifies clean* — both tables' rows are present, and the count is right for the surviving name.
+
+**Note the shape, because it is now three deep.** An `IF NOT EXISTS` added to make emit idempotent silently converts a name collision into a merge. Item 134 (indexes) and item 147 (views) are the same mechanism on objects that carry no rows; this is the one that does. A fix should probably treat all three together rather than accrete a third one-off refusal — the common question is "does this bare name already name something else in this namespace?", asked once.
+
+**Lower-severity sibling, also unfixed:** the trigger engines' change-log tables (`sqlite-trigger/setup.go:266+`, `pgtrigger/setup.go:448+`) are `CREATE TABLE IF NOT EXISTS`, so a pre-existing user table of that name is adopted silently at setup. The trigger DDL itself is NOT a member — both emit `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is loud.
+
+**Also named, not fixed (different class, same file):** PG's `validatePGIdentifier` has no view call site, so two source views whose names truncate to the same 63 bytes are silently overwritten by `CREATE OR REPLACE VIEW` — the `SLUICE-E-SCHEMA-IDENTIFIER-TOO-LONG` class on an object kind it does not reach.
+
 ### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *OPEN, medium; found while ground-truthing item 134*
 
 </details>
@@ -1957,52 +1964,10 @@ Item 141's divergence map (`TestEveryDecodableArrayElementIsWritable`) compares 
 
 **Scope note:** the value shapes differ per door. The SQL read path decodes `ir.JSON` to `[]byte` (`decodeBytes`); the pgtrigger payload path delivers a decoded JSON value. The leaf has to accept both, like `byteaArrayLeaf` does, and the refusal for anything else must be loud. The gate entry in `pgUnwritableArrayElement` is the tracking anchor — closing this item means deleting that entry, which the gate's other direction enforces.
 
-### 144. The tier cap fails OPEN, so a PlanetScale dev branch is driven at DOUBLE the fan-out of a production branch on the same tier — *OPEN, high (measured on real PlanetScale 2026-08-05)*
-
-Item 123 made sluice treat an `@@innodb_buffer_pool_size` below the smallest known tier as *no reading* rather than as a tiny instance, so it stops throttling instead of capping at 2. That is correct for what it fixed — a production PS-10 was being throttled to a quarter of its parallelism. **Its consequence on a DEV branch was never measured, and it is the trigger behind the field report's stall.**
-
-Measured on a real PS-10 database, both branches, 1.7M rows / 918 MB:
-
-- **Production branch** reports 128 MiB — exactly the PS-10 floor — so the cap fires: `tier_cap=2`, `requested=4 effective=2`, 4×2 = **8 lanes**.
-- **Dev branch** reports 32 MiB, below the floor, so the cap goes inert and the copy runs 4×4 = **16 lanes** — twice the write fan-out, against the weaker branch.
-
-**The control that establishes causation, not correlation.** Pre-fix binary, dev branch, `--copy-fanout-degree 2` (matching production's effective fan-out, nothing else changed): **234.8s, ZERO drops, ZERO gate windows** — statistically indistinguishable from the production run's 225.8s. Re-running at the default fan-out on the same branch afterwards brought the storm back (6 windows, 75 drops, 28.7% quiesced). A/B/A rules out "the branch had finished growing".
-
-**And the counterintuitive operational fact, measured twice: halving the write fan-out made the dev-branch copy 2.5× FASTER** (579s → 235s). More lanes were strictly worse.
-
-**Two defects compose.** The tier signal fails open (this item) and item 138's ladder amplified the consequence into a 30-second all-lane stop per shed connection. Item 138 fixed the amplifier — correctly, it is the one that was measured — but **the trigger is still live on every dev branch**.
-
-**Operator workaround available today:** `--copy-fanout-degree 2` on a dev branch. Worth documenting regardless of how this is fixed.
-
-**Fix shape, and why it needs thought rather than a constant.** Reverting to a cap-on-sub-floor would restore the item-123 defect. Options: treat a sub-floor reading as evidence of a DEV branch specifically (it is a reliable signal — a dev branch reports a small fixed pool that does not track the plan tier) and cap on that; or derive the ceiling from an observable that is honest on both branch classes; or make the copy adaptive to shed connections rather than to a static tier guess. Note the two branch classes also run **different server builds** — and the pair MOVES: an earlier measurement the same day recorded production 8.4.6 / dev 8.4.9 (`buffer_pool_tier_cap.go:102-103`), this one recorded production 8.4.9 / dev 8.4.11, on a different database. Do NOT publish either pair as a fact about PlanetScale; the durable claim is the INVARIANT — the two branch classes are demonstrably not the same infrastructure, so a dev-vs-production comparison is never a controlled comparison of one server, so a comparison between them is not a controlled comparison of one server.
-
 ### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *✅ FIXED on branch 2026-08-05 (the GATE half; the second lane's ceiling had already landed). `-race` Integration must be green before the tag — the fix's subject is the streamer's rollover path.*
 </details>
 
 A third version-pair was recorded during the fix's validation (2026-08-06, a freshly created PS-10): production 8.4.9-Vitess / dev 8.4.11-Vitess. Three databases, three pairs, no two alike — which settles the entry's own advice: the version pair is not a publishable fact, the INVARIANT is.
-
-### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *OPEN, medium; the sibling audit C-3's own fix missed, found while ground-truthing item 130's premise*
-
-**Correcting this entry's own text first, because it was stale on arrival.** As filed it described `stream.go` as still count-only. That was already false when it was written: the byte ceiling reached the stream lane in the same unreleased delta. What was genuinely missing was not the ceiling but the thing that would have caught the first miss — a check holding the lanes together. That is what landed.
-
-Audit 2026-08-05 C-3 added a per-chunk byte ceiling to the change lane, because item 116 P3 had added one to the DATA lane and stopped there. Its commit (`56a37f49`) and the item-116 entry both read as if the change lane were now covered. Two fixes, two enumerations, two misses — and nothing in the tree compared the lanes.
-
-- `internal/pipeline/incremental.go` (the one-shot `backup incremental` lane) rolls on `writer.ChangeCount() >= chunkSize || writer.BytesWritten() >= backup.DefaultBackupChunkBytes`.
-- `internal/pipeline/stream.go`'s `changeChunkBuffer.processChange` (the continuous `backup stream run` lane — **the one that writes most change chunks in practice**) rolls on the same pair.
-
-**What shipped: `TestChunkWriteLanes_EveryLaneBoundsAChunkByBytes`** (`internal/pipeline/chunk_byte_ceiling_gate_test.go`). Discovery is by CALL SITE, not by a written list: every production construction of a `blobcodec.NewChunkWriter` / `NewChangeChunkWriter` under `internal/pipeline` is a lane, grouped by the receiver type that owns the writer, and each must compare `BytesWritten()` inside a roll condition. A marker read into a manifest field is a stamp, not a ceiling, and does not count. The byte half has **no exemption**; the count half has a fail-by-default `countCeilingExempt` map with a written reason per entry, and a stale entry fails the build.
-
-**The roster it derives — four lanes, three of them change lanes:** `IncrementalBackup` (`incremental.go`, change) ✓ bytes+count · `changeChunkBuffer` (`stream.go`, change) ✓ bytes+count · `chunkStreamSink` (`chain_compact_smart.go`, change) ✓ bytes, count-EXEMPT (it rewrites the collapsed stream into a FIXED set of pre-existing manifest slots per item 130, so there is no event-count semantics to bound) · `backupChunkStreamer` (`backup_parallel.go`, data) ✓ bytes+count. Anti-vacuity floors in both dimensions: fewer than 4 lanes, or fewer than 3 CHANGE lanes, is a Fatal — a walker that stopped matching, or one that found only data lanes, would otherwise be green for exactly the defect it was built for. Mutation-verified three ways (strip the byte clause from `stream.go` → fails naming that lane; strip it from `incremental.go` → fails naming that one; rename an exempt lane → stale-entry failure), each mutant confirmed applied by grepping its marker before the run.
-
-`RolloverMaxBytes` is deliberately NOT accepted as the ceiling and the gate says so: it bounds a whole rollover in COMPRESSED bytes at a transaction boundary, which is a different quantity at a different granularity.
-
-**Residual, recorded at the gate rather than left implied:** this is a STRUCTURAL check, and only two of the four lanes have a BEHAVIOURAL pin behind it — the data lane (`TestChunkByteCeiling_*`) and compaction (`chain_compact_smart_output_test.go`). Neither CHANGE lane has one: nothing today writes a wide change and asserts the chunk rolled on bytes rather than count. The gate closes the "one lane and not its sibling" class, not the "the threshold is wrong" class, and that next pin is the obvious follow-up.
-
-`RolloverMaxBytes` is not the missing ceiling and should not be mistaken for it: it closes a ROLLOVER at a transaction boundary once `out.TotalBytes + cb.buf.Len()` crosses 64 MiB — compressed bytes, whole-rollover scope, gated on `out.Advanced`. A single chunk under the shipped 100,000-event `DefaultIncrementalChunkChanges` can hold far more than 64 MiB uncompressed before any of that fires, which is the identical shape item 116 P3 measured on the data lane (644× the bytes for the same row count).
-
-**Consequences, both live.** The chunk buffers in memory unbounded during capture, which is 116 P3's finding on the lane it was never applied to. And it is the premise item 130's tight output bound would like to rest on — "chunks written by a recent binary are ≤ `DefaultBackupChunkBytes`" — so that bound degrades to "the chain's largest chunk" for essentially every real chain, which item 130 handles by logging and pinning the degraded case rather than assuming the premise. Note also that C-3 itself is **unreleased**: `git tag --contains 56a37f49` is empty, so no published binary caps a change chunk on either lane.
-
-**The fix is the same five lines**, plus a gate that enumerates BOTH lanes rather than pinning one — the roster shape item 128's `checkChunkLineLength` walker used, since "both write cores" meaning "both in this file" is exactly how Bug 226's third core survived. Not bundled into item 130: it is the streamer's rollover path (a concurrency surface needing `-race`), and item 130 neither needs nor assumes it.
 
 ### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *✅ FIXED on `main` (unreleased). `byteaArrayLeaf` + the two-door divergence map `TestEveryDecodableArrayElementIsWritable`. The gate surfaced a THIRD unwritable family on its first run — `json[]`/`jsonb[]` — recorded as an explicit exemption rather than fixed; see the impl notes below.*
 
