@@ -74,6 +74,32 @@ func resolveCopyFanoutDegree(n int) int {
 	}
 }
 
+// applyCopyFanoutCeiling folds the TARGET-declared write fan-out ceiling
+// ([ir.ConnectionBudget.CopyFanoutCeiling]) into an already-resolved
+// degree. Roadmap item 144.
+//
+// It is one-directional in exactly the sense every other budget clamp in
+// this codebase is: it can only ever LOWER the degree, never raise it, and
+// a 0 (or negative) ceiling — the zero value of a report the orchestrator
+// built on a degraded probe, a non-prober target, or an engine that
+// declares no ceiling — is a strict no-op. So every caller that does not
+// have a report keeps byte-identical behaviour.
+//
+// It lowers an EXPLICIT --copy-fanout-degree too, matching
+// [migcore.ResolveTargetCopyParallelism]'s treatment of an explicit
+// --bulk-parallelism: the target's measured capacity is the authority and
+// the operator's value is the request. The caller logs the transition, so
+// an operator whose 8 became 2 is told, and by what.
+//
+// A ceiling below 1 is the "none declared" sentinel and is ignored, so
+// there is no input that resolves to "zero workers".
+func applyCopyFanoutCeiling(degree, ceiling int) (effective int, capped bool) {
+	if ceiling < 1 || degree <= ceiling {
+		return degree, false
+	}
+	return ceiling, true
+}
+
 // copyTablePlainMaybeParallel routes a cold-start PLAIN-INSERT table copy
 // through the WRITE-side fan-out (ADR-0102) when it is both eligible and
 // beneficial, and through the serial single-writer [copyTable] otherwise.

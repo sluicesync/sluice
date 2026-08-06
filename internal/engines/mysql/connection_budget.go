@@ -83,6 +83,12 @@ type connectionBudget struct {
 	// visible.
 	tierCap int
 
+	// fanoutCeiling is the WRITE-side copy fan-out ceiling this target
+	// declares (0 = none). It is a DIFFERENT axis from CopyBudget and is
+	// deliberately not folded into it — see [copyFanoutCeiling] and
+	// [ir.ConnectionBudget.CopyFanoutCeiling]. Roadmap item 144.
+	fanoutCeiling int
+
 	probe connectionBudgetProbe
 }
 
@@ -160,23 +166,31 @@ func computeConnectionBudget(p connectionBudgetProbe, reserve int, applyTierCap 
 			// Readable but below the PS-10 floor: not a tier answer. Loud,
 			// because the alternative — silently bucketing it to the
 			// tightest cap — is the defect this branch exists to prevent.
+			//
+			// The connection budget still stands uncapped (item 123). What
+			// item 144 adds is the WRITE-side fan-out ceiling named below:
+			// an unknown tier is no longer driven at the widest fan-out.
 			slog.Warn(
 				"mysql: @@innodb_buffer_pool_size is below the smallest known PlanetScale tier, so it is "+
 					"not reporting a plan tier; the buffer-pool parallelism cap is NOT applied and the "+
-					"connection budget stands. A PlanetScale DEV branch reports ~32 MiB regardless of the "+
-					"database's tier (measured 2026-08-05) — if this is a dev branch, connect to the "+
-					"production branch to get tier-sized copy parallelism (ADR-0116 Part B)",
+					"connection budget stands, but the copy WRITE fan-out is held to a conservative "+
+					"ceiling because the target's capacity is unknown. A PlanetScale DEV branch reports "+
+					"~32 MiB regardless of the database's tier (measured 2026-08-05/06) — if this is a dev "+
+					"branch, connect to the production branch to get tier-sized copy parallelism "+
+					"(ADR-0116 Part B)",
 				slog.Int64("innodb_buffer_pool_size", p.bufferPoolBytes),
 				slog.Int64("smallest_known_tier_bytes", int64(bufferPoolPlanetScaleFloorBytes)),
+				slog.Int("copy_fanout_ceiling", copyFanoutCeiling(p.bufferPoolBytes, applyTierCap)),
 			)
 		}
 	}
 
 	return connectionBudget{
-		CopyBudget: copyBudget,
-		Available:  available,
-		tierCap:    tierCap,
-		probe:      p,
+		CopyBudget:    copyBudget,
+		Available:     available,
+		tierCap:       tierCap,
+		fanoutCeiling: copyFanoutCeiling(p.bufferPoolBytes, applyTierCap),
+		probe:         p,
 	}
 }
 
@@ -348,13 +362,14 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 	}
 
 	report := ir.ConnectionBudget{
-		MaxConnections:   probe.maxConnections,
-		InUse:            probe.inUse,
-		RoleLimit:        probe.roleLimit,
-		DatabaseLimit:    unlimited, // MySQL has no per-database connection cap.
-		Available:        budget.Available,
-		CopyBudget:       budget.CopyBudget,
-		RequestedCeiling: ceiling,
+		MaxConnections:    probe.maxConnections,
+		InUse:             probe.inUse,
+		RoleLimit:         probe.roleLimit,
+		DatabaseLimit:     unlimited, // MySQL has no per-database connection cap.
+		Available:         budget.Available,
+		CopyBudget:        budget.CopyBudget,
+		RequestedCeiling:  ceiling,
+		CopyFanoutCeiling: budget.fanoutCeiling,
 	}
 
 	if effectiveBudget < 1 {

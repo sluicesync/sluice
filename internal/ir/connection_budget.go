@@ -49,6 +49,26 @@ type ConnectionBudget struct {
 	// budget as an upper bound the auto-cap further reduces.
 	RequestedCeiling int
 
+	// CopyFanoutCeiling is the maximum WRITE-side copy fan-out degree
+	// (--copy-fanout-degree, ADR-0097) this target's measured capacity
+	// supports. It is a SEPARATE axis from CopyBudget: CopyBudget answers
+	// "how many connection slots are free" (a slot bound), this answers
+	// "how many concurrent writers should be pointed at this target"
+	// (a capacity bound). On a vtgate-fronted target the two diverge
+	// sharply — slots are abundant and write capacity is not.
+	//
+	// 0 is the sentinel "this engine declares no fan-out ceiling", and it
+	// is the zero-value-safe default (the v0.99.51 trap): every engine
+	// that does not set it, and every zero-valued report the orchestrator
+	// builds on a degraded/absent probe, leaves the operator's resolved
+	// degree untouched. A ceiling NEVER raises the degree.
+	//
+	// Set today only by the MySQL engine on the PlanetScale flavor, and
+	// only when the ADR-0116 Part-B tier probe read a value it cannot
+	// place on the plan-tier scale (roadmap item 144). See
+	// mysql.copyFanoutCeiling for the derivation and the measurements.
+	CopyFanoutCeiling int
+
 	// EffectiveParallelism is the resolved bulk-copy parallelism after
 	// clamping the requested value to [1, min(CopyBudget, ceiling)].
 	// Meaningful only when Refuse is false.

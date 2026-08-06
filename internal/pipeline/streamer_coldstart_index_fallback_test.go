@@ -115,7 +115,7 @@ func TestColdStartOpenTargetWriters_ThreadsIndexBuildFallback(t *testing.T) {
 		eng := &coldStartFallbackEngine{sw: &coldStartFallbackSchemaWriter{}}
 		fb := coldStartFallback{id: "armed"}
 		s := &Streamer{Target: eng, TargetDSN: "tgt", IndexBuildFallback: fb}
-		sw, rw, err := s.coldStartOpenTargetWriters(context.Background(), schema, &ir.SnapshotStream{})
+		sw, rw, _, err := s.coldStartOpenTargetWriters(context.Background(), schema, &ir.SnapshotStream{})
 		if err != nil {
 			t.Fatalf("coldStartOpenTargetWriters: %v", err)
 		}
@@ -129,7 +129,7 @@ func TestColdStartOpenTargetWriters_ThreadsIndexBuildFallback(t *testing.T) {
 	t.Run("unarmed never touches the setter", func(t *testing.T) {
 		eng := &coldStartFallbackEngine{sw: &coldStartFallbackSchemaWriter{}}
 		s := &Streamer{Target: eng, TargetDSN: "tgt"}
-		if _, _, err := s.coldStartOpenTargetWriters(context.Background(), schema, &ir.SnapshotStream{}); err != nil {
+		if _, _, _, err := s.coldStartOpenTargetWriters(context.Background(), schema, &ir.SnapshotStream{}); err != nil {
 			t.Fatalf("coldStartOpenTargetWriters: %v", err)
 		}
 		if eng.sw.sets != 0 {

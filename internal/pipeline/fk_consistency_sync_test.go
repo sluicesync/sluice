@@ -24,7 +24,7 @@ func TestItem112_SyncColdStartArmsMetadataOnlyFK(t *testing.T) {
 		tgt := newRecordingEngine("target")
 		s := &Streamer{Target: tgt, RowFilters: rowFilters}
 		stream := &ir.SnapshotStream{CloseFn: func() error { return nil }, AbandonFn: func() error { return nil }}
-		if _, _, err := s.coldStartOpenTargetWriters(context.Background(), schema, stream); err != nil {
+		if _, _, _, err := s.coldStartOpenTargetWriters(context.Background(), schema, stream); err != nil {
 			t.Fatalf("coldStartOpenTargetWriters: %v", err)
 		}
 		return tgt.fkConsistent

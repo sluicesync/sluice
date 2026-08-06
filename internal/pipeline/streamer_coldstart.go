@@ -218,7 +218,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Open the target-side writers and run the target-side preflights
 	// (stale backends, connection budget, RLS) against them. On error
 	// the phase has already closed the writers AND the snapshot stream.
-	sw, rw, err := s.coldStartOpenTargetWriters(ctx, schema, stream)
+	sw, rw, fanoutCeiling, err := s.coldStartOpenTargetWriters(ctx, schema, stream)
 	if err != nil {
 		return nil, stop, err
 	}
@@ -257,7 +257,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Bulk-copy: the ADR-0079 FAST parallel path when eligible, the
 	// serial path otherwise. Releases the writers and the snapshot
 	// transaction (Bug 21) on success.
-	if err := s.coldStartRunCopy(ctx, schema, createSchema, stream, sw, rw, streamID, resumingCopy); err != nil {
+	if err := s.coldStartRunCopy(ctx, schema, createSchema, stream, sw, rw, streamID, resumingCopy, fanoutCeiling); err != nil {
 		return nil, stop, err
 	}
 
@@ -657,11 +657,17 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 // pre-anchor rule governs every stream teardown through
 // [Streamer.coldStartBeginCDC]'s anchor write; after that write the
 // slot is the warm-resume anchor and teardowns switch to Close.
-func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream) (ir.SchemaWriter, ir.RowWriter, error) {
+//
+// The third return is the TARGET-declared write fan-out ceiling the
+// connection-budget preflight read ([ir.ConnectionBudget.CopyFanoutCeiling],
+// roadmap item 144); 0 means the target declared none. It is returned
+// rather than stashed on the Streamer so the value cannot be read by a
+// path that never ran this preflight.
+func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream) (ir.SchemaWriter, ir.RowWriter, int, error) {
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Abandon()
-		return nil, nil, connectHint(fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return nil, nil, 0, connectHint(fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -680,13 +686,13 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, connectHint(fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+		return nil, nil, 0, connectHint(fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, connectHint(fmt.Errorf("pipeline: open target row writer: %w", err))
+		return nil, nil, 0, connectHint(fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(rw, s.TargetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
@@ -705,7 +711,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	// Connection-budget preflight (connection-resilience item 4). The
@@ -714,18 +720,27 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// table at a time per ADR-0095), so the budget request is the
 	// resolved fan-out degree, not 1 — this is what makes the loud
 	// refusal fire (and the --max-target-connections ceiling apply) when
-	// the fan-out would exceed the target's free slots. No-op on engines
-	// without a connection-slot model (MySQL — which is exactly where
-	// fan-out runs today; the refusal is the live guard for a future
-	// slot-modelled fan-out target). We run it for the refusal; the
-	// effective value is discarded (the per-table fan-out degree governs
-	// the actual worker count).
-	if _, _, err := migcore.ResolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
+	// the fan-out would exceed the target's free slots.
+	//
+	// SCOPE CORRECTION (item 144, 2026-08-06). This comment used to say the
+	// step was a "no-op on engines without a connection-slot model (MySQL)"
+	// and that "the effective value is discarded". The first half stopped
+	// being true in v0.100.0, when MySQL gained ProbeTargetConnectionBudget
+	// (see mysql/capabilities_assert.go) — and the second half was the
+	// defect: on a PlanetScale target the probe DOES run, DOES compute a
+	// tier cap, and its verdict was thrown away, so the tier signal never
+	// reached the copy this preflight is named for. What the report is used
+	// for now is the fan-out CEILING (item 144); the effective parallelism
+	// is still not the fan-out degree (that is a per-table property), which
+	// is why the ceiling is carried as its own axis rather than as a budget.
+	_, budgetReport, err := migcore.ResolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections)
+	if err != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
+	fanoutCeiling := budgetReport.CopyFanoutCeiling
 
 	// Target-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// when any in-scope target table has RLS enabled AND the connecting
@@ -739,7 +754,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 	}
 
@@ -747,7 +762,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// only, never blocks the stream. No-op on non-PG targets / Default role.
 	preflightTargetOwnershipAdvisory(ctx, rw)
 
-	return sw, rw, nil
+	return sw, rw, fanoutCeiling, nil
 }
 
 // coldStartGatePreflight is the cold-start gate switch:
@@ -957,7 +972,12 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 // createSchema is the ADR-0166 create subset from the shape gate
 // (nil = create everything); only the CREATE TABLE phase consumes it —
 // the copy/index/constraint phases keep the full schema.
-func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *ir.Schema, stream *ir.SnapshotStream, sw ir.SchemaWriter, rw ir.RowWriter, streamID string, resumingCopy bool) error {
+//
+// fanoutCeiling is the TARGET-declared write fan-out ceiling from the
+// connection-budget preflight (0 = none; roadmap item 144). It is inert on
+// the ADR-0079 fast path, which drives migrate's chunk/table pool rather
+// than the ADR-0097 D-way fan-out and is already budget-capped.
+func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *ir.Schema, stream *ir.SnapshotStream, sw ir.SchemaWriter, rw ir.RowWriter, streamID string, resumingCopy bool, fanoutCeiling int) error {
 	// ADR-0079: take the FAST parallel cold-start (migrate's cross-table
 	// pool + index-build overlap + same-engine raw passthrough) when the
 	// source surfaced a SHAREABLE exported snapshot AND implements the
@@ -1019,6 +1039,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 			UpfrontIndexes:       s.UpfrontIndexes,
 			AnalyzeAfter:         s.AnalyzeAfter,
 			CopyFanoutDegree:     s.CopyFanoutDegree,
+			CopyFanoutCeiling:    fanoutCeiling,
 			NoIntraTableStealing: s.NoIntraTableStealing,
 		}
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)

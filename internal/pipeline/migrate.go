@@ -1211,6 +1211,14 @@ type bulkCopyOpts struct {
 	// (the v0.99.51 trap): no value produces "zero workers".
 	CopyFanoutDegree int
 
+	// CopyFanoutCeiling is the TARGET-declared upper bound on the write
+	// fan-out degree ([ir.ConnectionBudget.CopyFanoutCeiling]), carried
+	// from the caller's connection-budget preflight. The Go zero value (0)
+	// means "no ceiling declared" and leaves CopyFanoutDegree untouched —
+	// the byte-identical prior behaviour for every caller that does not
+	// probe. Roadmap item 144; folded in by [applyCopyFanoutCeiling].
+	CopyFanoutCeiling int
+
 	// NoIntraTableStealing opts OUT of intra-table PK-range work-stealing on
 	// the native-MySQL concurrent cold-copy (ADR-0119, roadmap 21b): when true,
 	// every table is copied as ONE whole-table work item (the tier-(a)
@@ -1333,7 +1341,23 @@ func runBulkCopyWithOpts(
 	// degree > 1 + a per-table usable PK (the partition key). Falls
 	// through to the serial idempotent copy otherwise — never silently
 	// no-ops.
-	fanoutDegree := resolveCopyFanoutDegree(opts.CopyFanoutDegree)
+	//
+	// Item 144: the resolved degree is then held to the ceiling the TARGET
+	// declared at the caller's connection-budget preflight. Until that
+	// landed this path took the operator's degree and nothing else — so a
+	// target whose plan tier the probe could not read (a PlanetScale dev
+	// branch, measured) was driven at the WIDEST write fan-out, twice what
+	// a production branch of the same tier is worth. A zero ceiling (every
+	// non-probing caller, every non-declaring engine) is a strict no-op.
+	fanoutDegree, fanoutCapped := applyCopyFanoutCeiling(
+		resolveCopyFanoutDegree(opts.CopyFanoutDegree), opts.CopyFanoutCeiling,
+	)
+	if fanoutCapped {
+		slog.InfoContext(ctx, "capping copy write fan-out: target declared a fan-out ceiling",
+			slog.Int("requested", resolveCopyFanoutDegree(opts.CopyFanoutDegree)),
+			slog.Int("effective", fanoutDegree),
+			slog.Int("target_fanout_ceiling", opts.CopyFanoutCeiling))
+	}
 	// ADR-0100 / ADR-0101: WRITE-side cross-table concurrency. When the
 	// snapshot reader surfaces a disjoint concurrent-copy partition (≥2
 	// groups), drive W consumer pipelines, one per group, each writing its

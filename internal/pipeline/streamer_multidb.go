@@ -236,6 +236,27 @@ func (s *Streamer) coldStartMultiDatabase(
 		}
 	}
 
+	// Connection-budget preflight, ONCE for the run (item 144). Every
+	// per-database copy below fans out D writers at the SAME target server —
+	// only the database in the DSN differs — so the target's declared write
+	// fan-out ceiling is a property of the run, and probing per database
+	// would open one control connection per database for the same answer.
+	// This is the multi-database sibling of the single-database preflight in
+	// [Streamer.coldStartOpenTargetWriters]; without it the multi-database
+	// cold-start was the one W x D fan-out path that never heard the target's
+	// capacity at all.
+	//
+	// Placed BEFORE the spanning snapshot deliberately, unlike its
+	// single-database sibling: step 3 takes a FLUSH TABLES WITH READ LOCK
+	// that briefly freezes writes on the SOURCE, and a target with no free
+	// slot for the fan-out should refuse without paying that.
+	_, budgetReport, err := migcore.ResolveTargetCopyParallelism(
+		ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections,
+	)
+	if err != nil {
+		return nil, stop, err
+	}
+
 	// ---- 3. Open the SINGLE spanning consistent snapshot. One tx, one
 	// binlog position spanning ALL selected databases. This is the crux:
 	// the position handed to CDC below is captured at one consistent cut. ----
@@ -265,7 +286,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// qualifies its SELECT by that schema, so the single pinned snapshot
 	// connection reads across every database at the one consistent view. ----
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
@@ -530,6 +551,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	targetDeriver ir.DatabaseDSNDeriver,
 	targetCanDeriveDB bool,
 	fresh freshCopyReason,
+	fanoutCeiling int,
 ) error {
 	// Per-database source DSN so the scoped SchemaReader reads the right
 	// database's information_schema. The bulk-copy ROW reads come from the
@@ -724,6 +746,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		UpfrontIndexes:       s.UpfrontIndexes,
 		AnalyzeAfter:         s.AnalyzeAfter,
 		CopyFanoutDegree:     s.CopyFanoutDegree,
+		CopyFanoutCeiling:    fanoutCeiling,
 		NoIntraTableStealing: s.NoIntraTableStealing,
 	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {

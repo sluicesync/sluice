@@ -71,6 +71,35 @@ const (
 	bufferPoolCapMedium = 4 // < 2 GB    (PS-20 / PS-40-class)
 	bufferPoolCapLarge  = 6 // < 8 GB    (PS-80-class)
 	bufferPoolCapXLarge = 8 // >= 8 GB   (PS-160+ / sizeable self-hosted)
+
+	// copyFanoutCeilingUnknownTier is the WRITE-side fan-out degree
+	// ([ir.ConnectionBudget.CopyFanoutCeiling]) sluice will point at a
+	// PlanetScale target whose buffer-pool reading is below
+	// bufferPoolPlanetScaleFloorBytes — i.e. a target whose plan tier the
+	// probe could NOT establish. Roadmap item 144.
+	//
+	// It is 2 because 2 is the degree that was MEASURED, twice, on exactly
+	// that target class (2026-08-05, 1.7M rows / 918 MB, four in-scope
+	// tables so the native-concurrent W x D path engages):
+	//
+	//	degree 4 (the default)  579 s, a connection-drop storm, 6 grow-gate
+	//	                        windows, 75 drops, 28.7% of the wall clock
+	//	                        quiesced
+	//	degree 2                234.8 s, ZERO drops, ZERO gate windows
+	//
+	// Halving the fan-out made the copy 2.5x FASTER, and re-raising it on
+	// the same target brought the storm back (an A/B/A, so "the target had
+	// finished settling" is ruled out). More lanes were strictly worse.
+	//
+	// This constant governs ONLY the fan-out axis, and ONLY when the tier
+	// is unknown. It is deliberately NOT a value returned from
+	// [bufferPoolParallelismCap]: folding it in there would put a cap back
+	// on the CONNECTION BUDGET for a sub-floor reading, which is precisely
+	// the shape roadmap item 123 removed (a wrong tight budget throttles
+	// migrate's whole table x within-table product). The two decisions
+	// share the SAME predicate — see [copyFanoutCeiling] — so they cannot
+	// drift apart, but they do different work.
+	copyFanoutCeilingUnknownTier = 2
 )
 
 // bufferPoolParallelismCap maps @@innodb_buffer_pool_size (bytes) to a
@@ -139,4 +168,65 @@ func bufferPoolParallelismCap(bufferPoolBytes int64) int {
 	default:
 		return bufferPoolCapXLarge
 	}
+}
+
+// copyFanoutCeiling derives the WRITE-side copy fan-out ceiling
+// ([ir.ConnectionBudget.CopyFanoutCeiling]) from the same probe reading
+// [bufferPoolParallelismCap] buckets. Roadmap item 144.
+//
+// # The defect this closes
+//
+// Item 123 correctly stopped treating a sub-floor reading as evidence of a
+// tiny instance — but "not a tier reading" then meant NO ceiling at all, so
+// the cap failed OPEN. Measured on real PlanetScale (2026-08-05, confirmed
+// again 2026-08-06 on a freshly-created PS-10): a production branch reports
+// exactly the 128 MiB floor and a DEV branch on the same database reports
+// 32 MiB, below every known tier. So the weakest target sluice can be
+// pointed at was the one target it drove at the WIDEST write fan-out.
+//
+// # What this function claims, and what it does not
+//
+// The predicate is a statement about sluice's own tier table, not about
+// anyone's platform: a reading below the smallest tier the table records
+// cannot be placed on the tier scale, so the target's capacity is UNKNOWN.
+// The policy for unknown capacity is a conservative fan-out — not the
+// widest, and not the tightest-tier's budget cap (that is item 123's
+// defect, and this function deliberately cannot cause it: it returns a
+// FAN-OUT ceiling, never a connection budget).
+//
+// The VALUE, however, is calibrated on measurement rather than derived:
+// see [copyFanoutCeilingUnknownTier]. Every sub-floor reading observed so
+// far — 2026-08-04 (field report, a database the operator believed was
+// PS-160), 2026-08-05 (PS-10, both branches), 2026-08-06 (a fresh PS-10,
+// both branches) — came from a PlanetScale DEV branch reporting a small
+// FIXED pool that does not track the database's plan tier, which is why
+// the calibration runs were taken there.
+//
+// RESIDUAL, stated rather than implied: if some other target class ever
+// reports sub-floor, this ceiling is conservative for it on no evidence.
+// The cost of that error is a narrower copy, which is slower at worst and
+// LOUD (computeConnectionBudget WARNs, naming the reading, the floor and
+// the ceiling, and the pipeline logs the degree it resolved and why) —
+// versus the cost of the opposite error, which is the measured drop storm.
+//
+// applyTierCap is computeConnectionBudget's PlanetScale-flavor gate: on
+// vanilla MySQL and self-hosted Vitess the buffer pool is sized to the
+// operator's own hardware and is not a tier signal at all, so no ceiling
+// is declared. A completely unreadable probe (<= 0) likewise declares
+// none — an absent reading is not evidence of anything.
+//
+// Pinned by TestCopyFanoutCeiling_* (including the item-123 control: a
+// real PS-10 at EXACTLY the floor declares no ceiling).
+func copyFanoutCeiling(bufferPoolBytes int64, applyTierCap bool) int {
+	if !applyTierCap || bufferPoolBytes <= 0 {
+		return 0
+	}
+	if bufferPoolParallelismCap(bufferPoolBytes) > 0 {
+		// The probe placed this target on the plan-tier scale. Its tier cap
+		// already bounds the connection budget; the fan-out axis is left to
+		// the operator's --copy-fanout-degree, which is what the production
+		// branch was measured clean at.
+		return 0
+	}
+	return copyFanoutCeilingUnknownTier
 }

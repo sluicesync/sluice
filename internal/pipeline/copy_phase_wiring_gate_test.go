@@ -58,8 +58,17 @@ var bulkCopyOptsKnobs = []string{
 	"UpfrontIndexes",
 	"AnalyzeAfter",
 	"CopyFanoutDegree",
+	"CopyFanoutCeiling",
 	"NoIntraTableStealing",
 }
+
+// bulkCopyOptsProbeSourcedKnobs are [bulkCopyOpts] fields whose value must
+// come from the caller's TARGET PROBE, not from a constant. Presence is not
+// enough for these: item 144's defect was a probe that ran, produced the
+// right verdict, and had it discarded — and a site writing
+// `CopyFanoutCeiling: 2` would satisfy the presence check while being
+// exactly the static guess this design refuses to make.
+var bulkCopyOptsProbeSourcedKnobs = []string{"CopyFanoutCeiling"}
 
 // bulkCopyOptsOmissionReason records, per "file.go:Field", why a production
 // bulkCopyOpts literal leaves a knob unset. Every entry must name a reason the
@@ -205,6 +214,7 @@ func TestBulkCopyOptsProductionSitesSetEveryKnob(t *testing.T) {
 	type site struct {
 		file string
 		set  map[string]bool
+		expr map[string]ast.Expr
 	}
 	var sites []site
 	for name, f := range files {
@@ -217,11 +227,12 @@ func TestBulkCopyOptsProductionSitesSetEveryKnob(t *testing.T) {
 			if !ok || id.Name != "bulkCopyOpts" {
 				return true
 			}
-			s := site{file: name, set: map[string]bool{}}
+			s := site{file: name, set: map[string]bool{}, expr: map[string]ast.Expr{}}
 			for _, elt := range lit.Elts {
 				if kv, ok := elt.(*ast.KeyValueExpr); ok {
 					if k, ok := kv.Key.(*ast.Ident); ok {
 						s.set[k.Name] = true
+						s.expr[k.Name] = kv.Value
 					}
 				}
 			}
@@ -245,6 +256,24 @@ func TestBulkCopyOptsProductionSitesSetEveryKnob(t *testing.T) {
 				t.Errorf("%s builds a bulkCopyOpts without setting %s — the knob silently takes its zero value on that "+
 					"cold-start path (--copy-fanout-degree was inert on the multi-database copy this way). Set it, or "+
 					"record %q in bulkCopyOptsOmissionReason with the reason it is PROVABLY zero there.", s.file, knob, key)
+			}
+		}
+	}
+
+	// Probe-sourced knobs: present is not enough, the value must be a
+	// runtime expression rather than a literal constant. A `2` written here
+	// is a static guess about someone else's infrastructure wearing the
+	// clothes of a measurement.
+	for _, s := range sites {
+		for _, knob := range bulkCopyOptsProbeSourcedKnobs {
+			e, ok := s.expr[knob]
+			if !ok {
+				continue // the presence loop above already reported it.
+			}
+			if _, literal := e.(*ast.BasicLit); literal {
+				t.Errorf("%s sets %s to a literal constant. It must carry the value the TARGET reported at the "+
+					"connection-budget preflight (ir.ConnectionBudget.CopyFanoutCeiling); a constant here is the "+
+					"static tier guess item 144 exists to avoid.", s.file, knob)
 			}
 		}
 	}
