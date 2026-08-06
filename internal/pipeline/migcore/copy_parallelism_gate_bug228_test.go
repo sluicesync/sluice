@@ -77,7 +77,7 @@ func TestCopyParallelismGate_BaseHolderNeverOwnsTheLastSlot(t *testing.T) {
 	// Every chunk worker meets the shortage and shrinks, keeping its token
 	// across the backoff (the documented contract).
 	for i := range budget - 1 {
-		if _, err := g.ShrinkAndBackoff(ctx, i); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, i); err != nil {
 			t.Fatalf("chunk %d gave up on attempt 1, which the per-chunk budget must not do: %v", i, err)
 		}
 	}
@@ -116,7 +116,7 @@ func TestCopyParallelismGate_RecoversAfterTransientClears(t *testing.T) {
 
 	// A storm collapses the cap to the floor.
 	for i := range 8 {
-		if _, err := g.ShrinkAndBackoff(ctx, i); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, i); err != nil {
 			t.Fatalf("shrink %d: %v", i, err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestCopyParallelismGate_TransientStormUnderRealTopologyCompletes(t *testing
 							completed.Add(1)
 							return
 						}
-						delay, err := g.ShrinkAndBackoff(runCtx, chunk)
+						delay, err := g.ShrinkAndBackoff(runCtx, gateTestTable, chunk)
 						if err != nil {
 							t.Errorf("chunk %d hit the give-up bound during a TRANSIENT the gate "+
 								"exists to ride out: %v", chunk, err)

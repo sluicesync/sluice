@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// gateTestTable is the single table every pre-item-137 gate test implicitly
+// modelled. Naming it keeps those tests' semantics byte-identical while the
+// budget key grows its table component; the cross-table property is pinned
+// separately by TestShrinkAndBackoff_BudgetIsPerTableChunkNotChunkIndex.
+const gateTestTable = "orders"
+
 // TestCopyParallelismGate_AcquireRelease pins the basic semaphore
 // behaviour: a gate seeded with N tokens lets N acquires through and the
 // (N+1)th blocks until a release.
@@ -78,7 +84,7 @@ func TestCopyParallelismGate_ShrinkTakesEffectImmediately(t *testing.T) {
 	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if _, err := g.ShrinkAndBackoff(ctx, 1); err != nil {
+	if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 1); err != nil {
 		t.Fatalf("shrinkAndBackoff: %v", err)
 	}
 	if got := g.Effective(); got != 2 {
@@ -127,12 +133,12 @@ func TestCopyParallelismGate_GivesUpLoudly(t *testing.T) {
 
 	// Attempts 1..3 proceed.
 	for i := 1; i <= 3; i++ {
-		if _, err := g.ShrinkAndBackoff(ctx, 0); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 0); err != nil {
 			t.Fatalf("attempt %d unexpectedly gave up: %v", i, err)
 		}
 	}
 	// Attempt 4 gives up loudly.
-	_, err := g.ShrinkAndBackoff(ctx, 0)
+	_, err := g.ShrinkAndBackoff(ctx, gateTestTable, 0)
 	if err == nil {
 		t.Fatal("expected a give-up error after exhausting MaxRetries, got nil")
 	}
@@ -172,7 +178,7 @@ func TestCopyParallelismGate_ConcurrentFirstAttemptsAllProceed(t *testing.T) {
 		wg.Add(1)
 		go func(chunk int) {
 			defer wg.Done()
-			_, err := g.ShrinkAndBackoff(ctx, chunk)
+			_, err := g.ShrinkAndBackoff(ctx, gateTestTable, chunk)
 			mu.Lock()
 			if err == nil {
 				proceeds++
@@ -210,11 +216,11 @@ func TestCopyParallelismGate_OneChunkStillGivesUp(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= p.MaxRetries; i++ {
-		if _, err := g.ShrinkAndBackoff(ctx, 7); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 7); err != nil {
 			t.Fatalf("chunk 7 attempt %d gave up early: %v", i, err)
 		}
 	}
-	_, err := g.ShrinkAndBackoff(ctx, 7)
+	_, err := g.ShrinkAndBackoff(ctx, gateTestTable, 7)
 	if err == nil {
 		t.Fatal("chunk 7 never gave up past MaxRetries — a per-chunk budget must still be BOUNDED, or a " +
 			"genuinely saturated target stalls the run indefinitely")
@@ -224,7 +230,7 @@ func TestCopyParallelismGate_OneChunkStillGivesUp(t *testing.T) {
 	}
 
 	// And a DIFFERENT chunk still has its own budget — that is the point.
-	if _, err := g.ShrinkAndBackoff(ctx, 8); err != nil {
+	if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 8); err != nil {
 		t.Errorf("chunk 8 inherited chunk 7's exhausted budget: %v\n\n"+
 			"The budget is per chunk; one chunk failing must not pre-abort its peers.", err)
 	}

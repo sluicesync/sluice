@@ -60,7 +60,7 @@ func TestCopyGate_SurvivesRepeatedShrinks(t *testing.T) {
 			// Shrink repeatedly, as concurrent slot-exhaustion on several
 			// chunks would. More than two, since two is what was reported.
 			for range 5 {
-				if _, err := g.ShrinkAndBackoff(ctx, 0); err != nil {
+				if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 0); err != nil {
 					break // give-up verdict is a legitimate, loud outcome
 				}
 			}
@@ -102,7 +102,7 @@ func TestCopyGate_ConcurrentShrinkAndReleaseNeverStarves(t *testing.T) {
 			}
 			// Half the workers report slot exhaustion before finishing.
 			if i%2 == 0 {
-				_, _ = g.ShrinkAndBackoff(ctx, i)
+				_, _ = g.ShrinkAndBackoff(ctx, gateTestTable, i)
 			}
 			g.Release()
 		}(i)
@@ -128,7 +128,7 @@ func TestCopyGate_EffectiveNeverReachesZero(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 	for range 3 {
-		if _, err := g.ShrinkAndBackoff(ctx, 0); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 0); err != nil {
 			break
 		}
 		if eff := g.Effective(); eff < 1 {

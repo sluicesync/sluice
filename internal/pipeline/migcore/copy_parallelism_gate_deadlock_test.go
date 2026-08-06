@@ -81,7 +81,7 @@ func TestCopyParallelismGate_PoolNeverFullyDrains(t *testing.T) {
 	// Each meets the shortage and shrinks. The worker KEEPS its token across
 	// the backoff, which is the documented contract.
 	for i := range workers {
-		if _, err := g.ShrinkAndBackoff(ctx, i); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, i); err != nil {
 			t.Fatalf("worker %d gave up on attempt 1, which the per-chunk budget must not do: %v", i, err)
 		}
 	}
@@ -122,7 +122,7 @@ func TestCopyParallelismGate_InterleavedShrinkAndReleaseKeepsProgress(t *testing
 		if err := g.Acquire(ctx); err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
-		if _, err := g.ShrinkAndBackoff(ctx, i); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, i); err != nil {
 			t.Fatalf("shrink %d: %v", i, err)
 		}
 		g.Release()
@@ -148,7 +148,7 @@ func TestCopyParallelismGate_ShrinkStillReducesLiveConcurrency(t *testing.T) {
 	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if _, err := g.ShrinkAndBackoff(ctx, 0); err != nil {
+	if _, err := g.ShrinkAndBackoff(ctx, gateTestTable, 0); err != nil {
 		t.Fatalf("shrink: %v", err)
 	}
 	g.Release()

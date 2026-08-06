@@ -100,8 +100,8 @@ func noSlot(error) bool { return false }
 
 // failSlotBackoff is a slotBackoff callback that fails the test if invoked —
 // the transient-path tests must never route through the slot-exhaustion seam.
-func failSlotBackoff(t *testing.T) func(context.Context, int) (time.Duration, error) {
-	return func(context.Context, int) (time.Duration, error) {
+func failSlotBackoff(t *testing.T) func(context.Context, string, int) (time.Duration, error) {
+	return func(context.Context, string, int) (time.Duration, error) {
 		t.Fatal("slotBackoff called on a non-slot-exhaustion path")
 		return 0, nil
 	}

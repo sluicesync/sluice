@@ -175,6 +175,8 @@ func isRetriableChunkOpenError(err error) bool {
 //   - isSlotExhausted is the engine-supplied 53300 predicate.
 //   - slotBackoff is gate.ShrinkAndBackoff — it shrinks parallelism and
 //     returns the delay to wait, or a loud give-up error at the AIMD bound.
+//     It takes (table, chunk) because the gate is run-wide since ADR-0123 and
+//     the chunk index alone is not unique across tables (item 137).
 //
 // Error routing per open failure:
 //   - slot-exhaustion  → shrink + back off + retry (EXACT existing behaviour).
@@ -189,7 +191,7 @@ func openChunkConnWithRetry(
 	tableName string,
 	open func(context.Context) (ir.RowReader, ir.RowWriter, error),
 	isSlotExhausted func(error) bool,
-	slotBackoff func(context.Context, int) (time.Duration, error),
+	slotBackoff func(ctx context.Context, table string, chunkIndex int) (time.Duration, error),
 ) (ir.RowReader, ir.RowWriter, error) {
 	var (
 		transientTry      int
@@ -205,7 +207,7 @@ func openChunkConnWithRetry(
 		// Slot exhaustion (SQLSTATE 53300): shrink parallelism + back off, then
 		// retry the open. Unchanged from the original acquireChunkConn loop.
 		if isSlotExhausted(err) {
-			delay, giveErr := slotBackoff(ctx, chunkIndex)
+			delay, giveErr := slotBackoff(ctx, tableName, chunkIndex)
 			if giveErr != nil {
 				return nil, nil, giveErr
 			}

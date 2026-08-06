@@ -86,6 +86,14 @@ import (
 // the message text.
 var ErrCopySlotsExhausted = errors.New("pipeline: target connection slots stayed exhausted during parallel copy")
 
+// copyChunkKey names one chunk's retry budget. Both fields are load-bearing:
+// the gate is run-wide (ADR-0123), so the chunk index alone collides across
+// tables and two tables' chunk 3 would share one give-up bound (item 137).
+type copyChunkKey struct {
+	table string
+	chunk int
+}
+
 // CopyParallelismGate caps concurrently-open chunk connections and
 // applies the Phase 2b AIMD backoff. One gate is shared by the whole run
 // (ADR-0123); see the file header for the two token classes.
@@ -132,15 +140,22 @@ type CopyParallelismGate struct {
 	// bound and the backoff exponent that are a property of one chunk's
 	// own progress.
 	//
-	// KNOWN LIMITATION, stated rather than implied: the key is the chunk
-	// index alone, and under the ADR-0123 run-wide gate that index is NOT
-	// unique across tables — table A's chunk 3 and table B's chunk 3 share
-	// a budget. The effect is a give-up that can fire earlier than the
-	// per-chunk bound advertises. It is bounded and LOUD (an early abort,
-	// never a stall), which is why it is documented here rather than
-	// bundled into the Bug 228 fix; keying by (table, chunk) is the fix.
-	attemptsByChunk map[int]int
-	waitByChunk     map[int]time.Duration
+	// The key is (table, chunk) — roadmap item 137. It was the chunk INDEX
+	// alone, justified by a comment reading "the gate is constructed per
+	// table, so the index is unique within a gate". That was true of the
+	// per-table gate item 126 was written against, and ADR-0123's run-wide
+	// gate made it false without touching it: table A's chunk 3 and table
+	// B's chunk 3 shared one budget, so the give-up could fire earlier than
+	// the per-chunk bound advertised. Bounded and LOUD (an early abort,
+	// never a stall), which is why item 136 declared it in place rather
+	// than bundling the fix.
+	//
+	// The uniqueness argument is now CHECKED, not asserted: the key carries
+	// the table, so it is unique by construction, and
+	// TestShrinkAndBackoff_BudgetIsPerTableChunkNotChunkIndex fails if the
+	// table is dropped from it.
+	attemptsByChunk map[copyChunkKey]int
+	waitByChunk     map[copyChunkKey]time.Duration
 
 	policy CopyBackoffPolicy
 }
@@ -157,8 +172,8 @@ func NewCopyParallelismGate(parallelism int, policy CopyBackoffPolicy) *CopyPara
 		ceiling:         parallelism,
 		aimdTarget:      parallelism,
 		notify:          make(chan struct{}),
-		attemptsByChunk: make(map[int]int),
-		waitByChunk:     make(map[int]time.Duration),
+		attemptsByChunk: make(map[copyChunkKey]int),
+		waitByChunk:     make(map[copyChunkKey]time.Duration),
 		policy:          policy,
 	}
 	g.recomputeEffectiveLocked()
@@ -305,16 +320,24 @@ func (g *CopyParallelismGate) wakeLocked() {
 // retrying its chunk. On a give-up verdict it returns a loud, bounded
 // error wrapping ErrCopySlotsExhausted.
 //
+// table + chunkIndex together name the retry budget (item 137). The gate is
+// run-wide since ADR-0123, so the index alone collides across tables; the
+// caller passes the table it is copying and gets its own bound. An empty
+// table is accepted and simply keys a run-scoped bucket — no caller on the
+// copy path passes one, and refusing here would convert a retry into an
+// abort, which is the wrong trade for a label.
+//
 // The token the failing worker currently holds is NOT returned here — the
 // caller keeps it across the wait+retry so the retry re-uses the same slot
 // (one fewer connection in flight during the backoff), and returns it via
 // Release when the chunk ultimately finishes. A shrink never revokes a
 // held token; it only stops NEW admissions until enough workers release.
-func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, chunkIndex int) (time.Duration, error) {
+func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, table string, chunkIndex int) (time.Duration, error) {
+	key := copyChunkKey{table: table, chunk: chunkIndex}
 	g.mu.Lock()
-	g.attemptsByChunk[chunkIndex]++
-	attempt := g.attemptsByChunk[chunkIndex]
-	prior := g.waitByChunk[chunkIndex]
+	g.attemptsByChunk[key]++
+	attempt := g.attemptsByChunk[key]
+	prior := g.waitByChunk[key]
 
 	decision := NextCopyBackoff(g.aimdTarget, attempt, prior, g.policy)
 	if decision.GiveUp {
@@ -334,19 +357,21 @@ func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, chunkIndex i
 		g.recomputeEffectiveLocked()
 	}
 	next := g.effective
-	g.waitByChunk[chunkIndex] += decision.Delay
+	g.waitByChunk[key] += decision.Delay
 	g.mu.Unlock()
 
 	if prev != next {
 		slog.InfoContext(ctx, "reducing copy parallelism after too_many_connections; retrying chunk",
 			slog.Int("from", prev),
 			slog.Int("to", next),
+			slog.String("table", table),
 			slog.Int("chunk", chunkIndex),
 			slog.Duration("backoff", decision.Delay),
 			slog.Int("attempt", attempt))
 	} else {
 		slog.InfoContext(ctx, "copy parallelism already at floor; backing off and retrying chunk after too_many_connections",
 			slog.Int("parallelism", next),
+			slog.String("table", table),
 			slog.Int("chunk", chunkIndex),
 			slog.Duration("backoff", decision.Delay),
 			slog.Int("attempt", attempt))

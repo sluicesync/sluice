@@ -46,8 +46,16 @@ import (
 // (binlog retention is server-configured via
 // binlog_expire_logs_seconds, not a per-consumer slot). The captured
 // EndPosition is `@@global.gtid_executed` (when GTID mode is on) or
-// `(file, pos)` (when off), captured INSIDE the snapshot transaction
-// so the recorded position refers to the snapshot's logical clock.
+// `(file, pos)` (when off). WHEN it is captured relative to the
+// snapshot is the whole chain-completeness argument and differs by
+// path: under the coordinated open it is read while FTWRL is held (so
+// the order cannot matter); on the serial floor it is read BEFORE the
+// snapshot transaction opens (audit B-4b — see
+// backup_snapshot_lockfree.go). It is NOT captured "inside the
+// transaction so it refers to the snapshot's clock": neither
+// `SHOW BINARY LOG STATUS` nor `@@global.gtid_executed` is
+// transactional, so an unlocked in-tx read names a LATER instant than
+// the read view, which is the losing order.
 //
 // Caller closes the returned snapshot to commit the snapshot tx,
 // release the pinned conn, and close the underlying DB pool.
@@ -109,9 +117,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 
 // openBackupSnapshotSerial opens today's single-reader consistent
 // snapshot: one pinned conn running REPEATABLE READ + START
-// TRANSACTION WITH CONSISTENT SNAPSHOT, position captured inside the
-// tx. It is the floor every coordinated-open failure path falls back
-// to, and the only path when ReaderParallelism <= 1.
+// TRANSACTION WITH CONSISTENT SNAPSHOT. It is the floor every
+// coordinated-open failure path falls back to (i.e. every RDS backup),
+// and the only path when ReaderParallelism <= 1.
+//
+// It holds NO lock, so the anchor read and the snapshot open bracket a
+// real window. The anchor is therefore captured FIRST — audit B-4b; the
+// ordering argument, the chain invariants it has to satisfy, and the
+// churn probe all live in backup_snapshot_lockfree.go.
 func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Config, zeroDate zeroDateMode) (*irbackup.Snapshot, error) {
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
@@ -124,42 +137,47 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 		return nil, fmt.Errorf("mysql: backup snapshot: pin conn: %w", err)
 	}
 
-	// REPEATABLE READ + WITH CONSISTENT SNAPSHOT in two statements is
-	// the canonical InnoDB snapshot capture (mirrors
-	// [openBinlogSnapshotStream]). The session isolation is set
-	// explicitly first so the behaviour doesn't depend on the
-	// server's tx_isolation default.
-	if err := startConsistentReaderTx(ctx, conn); err != nil {
+	// The session isolation is set explicitly first so the behaviour
+	// doesn't depend on the server's tx_isolation default. Splitting it
+	// from the START TRANSACTION is what lets the anchor read sit BETWEEN
+	// them — inside the smallest window the two statements can bracket.
+	if err := setConsistentReaderIsolation(ctx, conn); err != nil {
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, err
 	}
 
-	// Capture the position INSIDE the snapshot tx so it refers to the
-	// snapshot's logical clock. Prefer GTID when gtid_mode is on; fall
-	// back to file/pos.
-	//
-	// UNFIXED SIBLING of audit B-4 (recorded 2026-08-05, filed in
-	// docs/dev/audit-backlog.md). This path holds NO lock — it is the
-	// fallback taken whenever the coordinated FTWRL open failed, which is
-	// every RDS backup — so the snapshot-then-position order here is the
-	// same window openBinlogSnapshotStreamShared just flipped: a commit
-	// between the read view freezing and this capture is above the read
-	// view and below the recorded position, so it is in neither the backup
-	// nor an incremental taken from it.
-	//
-	// It is NOT flipped here in the same change, deliberately. The chain
-	// anchor is load-bearing for incremental lineage and replay-window
-	// invariants (ADR-0088), and moving it earlier is safe in direction but
-	// interacts with machinery this change did not validate. Do not read
-	// the B-4 fix next door as covering this.
-	position, err := captureBackupPositionInTx(ctx, conn, e.Flavor)
+	// The near edge of the capture window (best-effort — see
+	// [reportBackupCaptureWindow]). Read BEFORE the anchor so the probed
+	// interval CONTAINS the window rather than starting inside it.
+	preTip := readBinlogTip(ctx, conn)
+
+	// Audit B-4b: the anchor is captured BEFORE the read view freezes, so
+	// the full's sweep is a SUPERSET of everything at or below the recorded
+	// EndPosition. Prefer GTID when gtid_mode is on; fall back to file/pos.
+	position, err := captureBackupPosition(ctx, conn, e.Flavor)
 	if err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: backup snapshot: capture position: %w", err)
 	}
+
+	if err := beginConsistentSnapshotTx(ctx, conn); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, err
+	}
+
+	// The far edge. Comparing the two edges is what turns "a commit may
+	// have landed in the window" into a per-run statement about whether one
+	// did. Skipped when the near edge was unreadable — the verdict is
+	// already UNKNOWN, and a second unreadable probe costs three failed
+	// round-trips to learn nothing.
+	var postTip *binlogTip
+	if preTip != nil {
+		postTip = readBinlogTip(ctx, conn)
+	}
+	reportBackupCaptureWindow(ctx, preTip, postTip)
 
 	rowReader := &RowReader{
 		q:        conn,
@@ -200,13 +218,31 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 
 // startConsistentReaderTx puts conn into the canonical InnoDB
 // consistent-read posture: explicit REPEATABLE READ isolation, then
-// START TRANSACTION WITH CONSISTENT SNAPSHOT. Factored out so the
-// serial path and each of the N coordinated readers start their read
-// view identically (ADR-0088).
+// START TRANSACTION WITH CONSISTENT SNAPSHOT. Used by each of the N
+// coordinated readers, which open under FTWRL and so have nothing to
+// interleave between the two statements (ADR-0088). The serial floor
+// calls the two halves separately because audit B-4b's anchor read has
+// to sit between them.
 func startConsistentReaderTx(ctx context.Context, conn *sql.Conn) error {
+	if err := setConsistentReaderIsolation(ctx, conn); err != nil {
+		return err
+	}
+	return beginConsistentSnapshotTx(ctx, conn)
+}
+
+// setConsistentReaderIsolation pins the session to REPEATABLE READ so
+// the snapshot's behaviour doesn't depend on the server's tx_isolation
+// default.
+func setConsistentReaderIsolation(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
 		return fmt.Errorf("mysql: backup snapshot: set isolation: %w", err)
 	}
+	return nil
+}
+
+// beginConsistentSnapshotTx freezes the read view. Everything committed
+// before it returns is visible to the sweep; everything after is not.
+func beginConsistentSnapshotTx(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
 		return fmt.Errorf("mysql: backup snapshot: start tx: %w", err)
 	}
@@ -323,8 +359,11 @@ func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.
 	}
 
 	// Capture the position on R[0] while FTWRL is still held — it refers
-	// to the frozen instant shared by all N readers.
-	position, err := captureBackupPositionInTx(ctx, conns[0], e.Flavor)
+	// to the frozen instant shared by all N readers. This is the one
+	// capture site in the package for which the snapshot/anchor ORDER is
+	// genuinely irrelevant (audit B-4b's exemption): no commit can happen
+	// between them, so both orders name the same cut.
+	position, err := captureBackupPosition(ctx, conns[0], e.Flavor)
 	if err != nil {
 		return abort("could not capture snapshot position", err)
 	}
@@ -440,15 +479,23 @@ func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.SnapshotOpti
 	)
 }
 
-// captureBackupPositionInTx queries the source-side cursor against the
+// captureBackupPosition queries the source-side cursor against the
 // pinned snapshot connection and encodes it the same way the standalone
 // CDC reader emits via [encodeBinlogPos]. The function is the conn-
 // scoped sibling of [SchemaReader.CaptureBackupPosition]. flavor threads
 // the MariaDB branch (GTID always on; @@gtid_binlog_pos cold-start
 // position; ADR-0170) through the shared [gtidModeOnFor] /
-// [coldStartGTIDSetFor] helpers. The probes run INSIDE the snapshot tx on
-// the pinned *sql.Conn so the position refers to the snapshot's read-view.
-func captureBackupPositionInTx(ctx context.Context, conn *sql.Conn, flavor Flavor) (ir.Position, error) {
+// [coldStartGTIDSetFor] helpers.
+//
+// It runs on the pinned *sql.Conn so the anchor and the read view belong
+// to one session, but NOTHING it reads is transactional: `SHOW BINARY LOG
+// STATUS` and `@@global.gtid_executed` both report the server's current
+// global state whether or not a transaction is open. It was named
+// captureBackupPositionInTx until audit B-4b, and the name was the
+// argument — it read as if being inside the tx bound the anchor to the
+// read view, and callers relied on that. The caller now owns the
+// ordering, and each caller documents why its order is safe.
+func captureBackupPosition(ctx context.Context, conn *sql.Conn, flavor Flavor) (ir.Position, error) {
 	useGTID, err := gtidModeOnFor(ctx, conn, flavor)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("detect gtid mode: %w", err)
