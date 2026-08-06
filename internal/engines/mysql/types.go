@@ -205,13 +205,18 @@ func translateType(c columnMeta) (ir.Type, error) {
 	// gaining a decoder (a mapping without a decoder would silently
 	// stringify raw binlog bytes on the CDC tail — the Bug-74 class).
 	//
-	// Both INET6 and INET4 collapse to ir.Inet{} in the registry: the IR
-	// has no IPv4-only variant, and the address value round-trips
-	// losslessly as canonical text (PG `inet` natively, a MySQL-family
-	// target as VARCHAR(45) via the writer's auto-emit). MariaDB's own
-	// INET4 is a storage optimisation over INET6, not a distinct value
-	// space. MySQL 8 reports none of these data_type strings, so the lookup
-	// misses there and control falls through to the geometry check below.
+	// Both INET6 and INET4 map to ir.Inet, but with DIFFERENT
+	// [ir.InetFamily] discriminants — the earlier version of this comment
+	// said INET4 was "a storage optimisation over INET6, not a distinct
+	// value space", and that is false in the way that mattered: an INET6
+	// column WIDENS an IPv4 address to its IPv4-mapped form on the way in,
+	// so the two types deliver different text for the same input and a
+	// client-side `--where` needs to know which (roadmap item 133). The
+	// value still round-trips losslessly as canonical text (PG `inet`
+	// natively, a MySQL-family target as VARCHAR(45) via the writer's
+	// auto-emit). MySQL 8 reports none of these data_type strings, so the
+	// lookup misses there and control falls through to the geometry check
+	// below.
 	if nt, ok := mariadbNativeDataTypes[c.DataType]; ok {
 		return nt.irType, nil
 	}

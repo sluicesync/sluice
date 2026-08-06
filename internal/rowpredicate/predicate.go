@@ -265,6 +265,21 @@ type ColumnInfo struct {
 	// rather than guessing, because a guess is silent (audit 2026-08-01 S2).
 	NetworkRendering ir.NetworkLiteralRendering
 
+	// InetFamily is meaningful only when Identifier is identifierNetwork:
+	// which address family the column CONSTRAINS its values to, read
+	// straight off [ir.Inet.Family] / [ir.Cidr.Family]. Like
+	// NetworkRendering and MACWidth, its ZERO value REFUSES the comparison
+	// rather than assuming "any".
+	//
+	// The rendering and the family are two independent axes and both are
+	// load-bearing. NetworkRendering answers "is a prefix length shown?";
+	// InetFamily answers "was the address itself coerced into another
+	// family before it was rendered?". MariaDB's INET4 and INET6 share one
+	// rendering (AddressOnly) and disagree on the second question — an
+	// INET6 column delivers `10.0.0.1` as `::ffff:10.0.0.1` — which is why
+	// the rendering alone could not have caught roadmap item 133.
+	InetFamily ir.InetFamily
+
 	// MACWidth is meaningful only when Identifier is identifierMAC: the
 	// column's MAC width in BYTES, read straight off [ir.Macaddr.Width]
 	// (6 = `macaddr`, 8 = `macaddr8`). Like NetworkRendering, its ZERO
@@ -406,8 +421,20 @@ func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool, tem
 		// (canonical) value will not match. checkIdentifierLiteral refuses
 		// those loudly (audit 2026-07-26 SL-3).
 		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierUUID}
-	case ir.Inet, ir.Cidr:
-		return ColumnInfo{Family: FamilyString, Faithful: true, Identifier: identifierNetwork}
+	case ir.Inet:
+		// The family is read off the TYPE, not resolved from the engine:
+		// MariaDB's INET4 and INET6 are two source types on one IR type and
+		// one engine, so no per-engine resolver could tell them apart
+		// (roadmap item 133). Its zero value refuses.
+		return ColumnInfo{
+			Family: FamilyString, Faithful: true,
+			Identifier: identifierNetwork, InetFamily: t.Family,
+		}
+	case ir.Cidr:
+		return ColumnInfo{
+			Family: FamilyString, Faithful: true,
+			Identifier: identifierNetwork, InetFamily: t.Family,
+		}
 	case ir.Macaddr:
 		// MACWidth decides which literals are valid AND what the canonical
 		// spelling of a valid one is — Postgres widens a 6-byte literal to

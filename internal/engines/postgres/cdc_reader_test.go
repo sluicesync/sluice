@@ -285,8 +285,8 @@ func TestOIDToType(t *testing.T) {
 		{"json", pgtype.JSONOID, -1, ir.JSON{Binary: false}},
 		{"jsonb", pgtype.JSONBOID, -1, ir.JSON{Binary: true}},
 		{"uuid", pgtype.UUIDOID, -1, ir.UUID{}},
-		{"inet", pgtype.InetOID, -1, ir.Inet{}},
-		{"cidr", pgtype.CIDROID, -1, ir.Cidr{}},
+		{"inet", pgtype.InetOID, -1, ir.Inet{Family: ir.InetFamilyAny}},
+		{"cidr", pgtype.CIDROID, -1, ir.Cidr{Family: ir.InetFamilyAny}},
 		// Both widths, split: a bare ir.Macaddr for macaddr8 would hand the
 		// applier a 6-byte target type for an 8-byte value (Bug 225). The
 		// array siblings ride the same recursion and are pinned here rather

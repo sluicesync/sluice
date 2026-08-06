@@ -182,8 +182,8 @@ func TestTranslateType(t *testing.T) {
 
 		// ---- Identity / network ----
 		{"uuid", columnMeta{DataType: "uuid"}, ir.UUID{}},
-		{"inet", columnMeta{DataType: "inet"}, ir.Inet{}},
-		{"cidr", columnMeta{DataType: "cidr"}, ir.Cidr{}},
+		{"inet", columnMeta{DataType: "inet"}, ir.Inet{Family: ir.InetFamilyAny}},
+		{"cidr", columnMeta{DataType: "cidr"}, ir.Cidr{Family: ir.InetFamilyAny}},
 		{"macaddr", columnMeta{DataType: "macaddr"}, ir.Macaddr{Width: ir.MacaddrEUI48}},
 		{"macaddr8", columnMeta{DataType: "macaddr8"}, ir.Macaddr{Width: ir.MacaddrEUI64}},
 

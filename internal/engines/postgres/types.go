@@ -486,10 +486,17 @@ func translateScalarType(c columnMeta) (ir.Type, error) {
 	// ---- Identity / network ----
 	case "uuid":
 		return ir.UUID{}, nil
+	// Postgres constrains neither type to an address family — a single
+	// `inet` column holds v4 and v6 side by side and coerces nothing — so
+	// the family is declared [ir.InetFamilyAny] rather than left
+	// unspecified. Declaring it is what makes an UNSPECIFIED family mean
+	// "a new producer appeared without deciding" (roadmap item 133); the
+	// OID-keyed half in [oidToType] must stay in family-parity, the same
+	// dual-registry-drift rule Bug 97 left on the MAC arm.
 	case "inet":
-		return ir.Inet{}, nil
+		return ir.Inet{Family: ir.InetFamilyAny}, nil
 	case "cidr":
-		return ir.Cidr{}, nil
+		return ir.Cidr{Family: ir.InetFamilyAny}, nil
 	// The width is what makes `macaddr8` migratable at all: the emitter
 	// renders MACADDR for anything narrower, and an 8-byte value does not
 	// fit one (Bug 225). This is the text-keyed half; [oidToType] is the

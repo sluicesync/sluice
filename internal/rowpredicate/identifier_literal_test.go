@@ -47,7 +47,7 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 		{
 			// MariaDB native inet4/inet6: address-only.
 			name:      "inet/address-only rendering (MariaDB inet4)",
-			colType:   ir.Inet{},
+			colType:   ir.Inet{Family: ir.InetFamilyIPv4},
 			rendering: ir.NetworkLiteralRenderingAddressOnly,
 			canonical: "10.0.0.1",
 			divergent: []string{
@@ -60,7 +60,7 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 			// full-width mask, so `ip = '10.0.0.1/32'` — a spelling PG itself
 			// accepts — compiled clean and then matched nothing.
 			name:      "inet/host-bare rendering (Postgres inet)",
-			colType:   ir.Inet{},
+			colType:   ir.Inet{Family: ir.InetFamilyAny},
 			rendering: ir.NetworkLiteralRenderingHostBare,
 			canonical: "10.0.0.1",
 			divergent: []string{
@@ -73,7 +73,7 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 			// Postgres `cidr` column ALWAYS delivers the mask, even at full
 			// width, so the bare spelling is the one that matches nothing.
 			name:      "cidr/always-masked rendering (Postgres cidr)",
-			colType:   ir.Cidr{},
+			colType:   ir.Cidr{Family: ir.InetFamilyAny},
 			rendering: ir.NetworkLiteralRenderingAlwaysMasked,
 			canonical: "10.0.0.1/32",
 			divergent: []string{
@@ -82,7 +82,7 @@ func TestIdentifierLiteral_NonCanonicalSpellingsAreRefused(t *testing.T) {
 		},
 		{
 			name:      "cidr/network prefix",
-			colType:   ir.Cidr{},
+			colType:   ir.Cidr{Family: ir.InetFamilyAny},
 			rendering: ir.NetworkLiteralRenderingAlwaysMasked,
 			canonical: "10.0.0.0/24",
 			divergent: []string{
@@ -185,7 +185,7 @@ func TestIdentifierLiteral_InvalidValuesAreRefused(t *testing.T) {
 		lit     string
 	}{
 		{ir.UUID{}, "not-a-uuid"},
-		{ir.Inet{}, "999.999.999.999"},
+		{ir.Inet{Family: ir.InetFamilyAny}, "999.999.999.999"},
 		{ir.Macaddr{Width: ir.MacaddrEUI48}, "zz:00:2b:01:02:03"},
 		{ir.Macaddr{Width: ir.MacaddrEUI64}, "zz:00:2b:ff:fe:01:02:03"},
 		{ir.Time{Precision: 0}, "25:99"},
@@ -240,7 +240,10 @@ func TestCanonicalIdentifierLiteral_MatchesDecoderOutput(t *testing.T) {
 		{kind: identifierTime, in: "08:30:00", want: "08:30:00"},
 	}
 	for _, tc := range cases {
-		info := ColumnInfo{Identifier: tc.kind, NetworkRendering: tc.network, MACWidth: tc.macWidth}
+		info := ColumnInfo{
+			Identifier: tc.kind, NetworkRendering: tc.network,
+			InetFamily: ir.InetFamilyAny, MACWidth: tc.macWidth,
+		}
 		got, ok := canonicalIdentifierLiteral(tc.in, info)
 		if !ok || got != tc.want {
 			t.Errorf("canonicalIdentifierLiteral(%q, %+v) = %q, %v; want %q, true",
@@ -329,8 +332,13 @@ func TestCanonicalNetworkLiteral_FollowsTheEngineRendering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := canonicalIdentifierLiteral(tc.in,
-				ColumnInfo{Identifier: identifierNetwork, NetworkRendering: tc.rendering})
+			got, ok := canonicalIdentifierLiteral(tc.in, ColumnInfo{
+				Identifier: identifierNetwork, NetworkRendering: tc.rendering,
+				// The family axis is held at Any here so this table stays
+				// about the RENDERING axis alone; the family matrix is
+				// TestNetworkLiteral_InetFamilyCoercion.
+				InetFamily: ir.InetFamilyAny,
+			})
 			if ok != tc.wantOK || got != tc.want {
 				t.Errorf("canonicalIdentifierLiteral(network, %q, %v) = %q, %v; want %q, %v",
 					tc.in, tc.rendering, got, ok, tc.want, tc.wantOK)
@@ -354,8 +362,8 @@ func TestNetworkLiteral_PostgresInetAndCidrDivergeEndToEnd(t *testing.T) {
 		cidrRendering: ir.NetworkLiteralRenderingAlwaysMasked,
 	}
 	infos := ColumnInfosFromIR(pg, []*ir.Column{
-		{Name: "ip", Type: ir.Inet{}},
-		{Name: "net", Type: ir.Cidr{}},
+		{Name: "ip", Type: ir.Inet{Family: ir.InetFamilyAny}},
+		{Name: "net", Type: ir.Cidr{Family: ir.InetFamilyAny}},
 	}, false)
 
 	// inet: bare is canonical; the full-width mask is the silent-drop spelling.
@@ -383,7 +391,7 @@ func TestNetworkLiteral_PostgresInetAndCidrDivergeEndToEnd(t *testing.T) {
 // guess, because both concrete renderings are silently wrong for the other.
 func TestNetworkLiteral_UndeclaredRenderingRefuses(t *testing.T) {
 	infos := ColumnInfosFromIR(ir.ByteExactCollationResolver{},
-		[]*ir.Column{{Name: "ip", Type: ir.Inet{}}}, false)
+		[]*ir.Column{{Name: "ip", Type: ir.Inet{Family: ir.InetFamilyAny}}}, false)
 	for _, spelling := range []string{"10.0.0.1", "10.0.0.1/32", "10.0.0.0/24"} {
 		_, err := Compile("t", "ip = '"+spelling+"'", infos)
 		if err == nil {
@@ -422,7 +430,7 @@ func TestNetworkLiteral_ZoneScopedIsRefused(t *testing.T) {
 		ir.NetworkLiteralRenderingAddressOnly,
 	} {
 		infos := ColumnInfosFromIR(fakeNetworkResolver{rendering: rendering},
-			[]*ir.Column{{Name: "ip", Type: ir.Inet{}}}, false)
+			[]*ir.Column{{Name: "ip", Type: ir.Inet{Family: ir.InetFamilyAny}}}, false)
 
 		for _, zoned := range []string{"fe80::1%eth0", "fe80::1%25", "::1.2.3.4%eth0"} {
 			_, err := Compile("t", "ip = '"+zoned+"'", infos)

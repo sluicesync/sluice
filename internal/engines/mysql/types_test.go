@@ -204,16 +204,20 @@ func TestTranslateType(t *testing.T) {
 			want: ir.UUID{},
 		},
 		{
+			// The FAMILY is the load-bearing half (roadmap item 133): an
+			// INET6 column widens `10.0.0.1` to `::ffff:10.0.0.1`, so a
+			// `--where` on it needs a different canonical literal than the
+			// same predicate on an INET4 column. Both map to ir.Inet; a
+			// mapping that dropped the family would compile a filter that
+			// matches nothing on the CDC leg, at exit 0.
 			name: "mariadb native inet6",
 			in:   columnMeta{DataType: "inet6", ColumnType: "inet6"},
-			want: ir.Inet{},
+			want: ir.Inet{Family: ir.InetFamilyIPv6},
 		},
 		{
-			// INET4 collapses to ir.Inet{} — no IPv4-only IR variant; the
-			// address value round-trips as canonical text.
-			name: "mariadb native inet4 collapses to Inet",
+			name: "mariadb native inet4 carries the IPv4 family",
 			in:   columnMeta{DataType: "inet4", ColumnType: "inet4"},
-			want: ir.Inet{},
+			want: ir.Inet{Family: ir.InetFamilyIPv4},
 		},
 
 		// ----- Geometry -----

@@ -178,33 +178,40 @@ func columnNeedsFingerprintNormalizing(c *ir.Column) bool {
 // an exclusion that only reached the scalar would have moved the fingerprint
 // of every chain carrying the array form.
 //
-// THE SET IS TWO FIELDS: [ir.Macaddr.Width] (roadmap item 117 / Bug 225) and
-// [ir.Enum.TypeName] (item 121). Both are governed by the same reason as the
-// exclusion block below — the Postgres reader sets each for an ORDINARY
-// column of that type, so `omitempty` (which drops only the zero value) would
-// not hold either back: the key would be present in the type envelope of
-// every real Postgres chain carrying a MAC or enum column, the fingerprint
-// would move, and a new epoch would be minted that makes those chains
-// unrestorable. Excluding them restores the pre-change bytes EXACTLY.
+// THE SET IS FOUR FIELDS: [ir.Macaddr.Width] (roadmap item 117 / Bug 225),
+// [ir.Enum.TypeName] (item 121), and [ir.Inet.Family] / [ir.Cidr.Family]
+// (item 133). All are governed by the same reason as the exclusion block
+// below — the Postgres reader sets each for an ORDINARY column of that type,
+// so `omitempty` (which drops only the zero value) would not hold any of them
+// back: the key would be present in the type envelope of every real Postgres
+// chain carrying a MAC, enum or network column, the fingerprint would move,
+// and a new epoch would be minted that makes those chains unrestorable.
+// Excluding them restores the pre-change bytes EXACTLY.
 //
-// Enum.TypeName is the stronger case of the two. A MAC column is uncommon; an
+// Enum.TypeName is the stronger case of the four. A MAC column is uncommon; an
 // enum column is not, and the PG reader populates the type name for EVERY one
 // of them, so folding it in would repartition close to every Postgres chain
-// in existence.
+// in existence. Inet/Cidr.Family sits between the two on frequency and is
+// exactly as unconditional: the PG reader sets [ir.InetFamilyAny] on every
+// inet and cidr column it reads, so the key is present whenever such a column
+// exists at all.
 //
 // WHAT THE EXCLUSIONS COST, stated exactly. The recorded schema still carries
-// both (they ride the wire — see [ir.MarshalType]), so a restore rebuilds
-// `macaddr8` at the right width and re-creates an enum under its real name;
-// what is lost is the fingerprint's ability to NOTICE a `macaddr` ⇄ `macaddr8`
-// retype or an enum TYPE RENAME between a backup and its restore target, and
-// — since [canonicalManifestBytes] folds the fingerprint STRING rather than
-// the schema bytes — signing does not backstop a tampered width or type name
+// all of them (they ride the wire — see [ir.MarshalType]), so a restore
+// rebuilds `macaddr8` at the right width and re-creates an enum under its real
+// name; what is lost is the fingerprint's ability to NOTICE a `macaddr` ⇄
+// `macaddr8` retype, an enum TYPE RENAME, or an `inet4` ⇄ `inet6` retype
+// between a backup and its restore target, and — since
+// [canonicalManifestBytes] folds the fingerprint STRING rather than the schema
+// bytes — signing does not backstop a tampered width, type name or family
 // either. The schema DIFF still sees the MAC case ([ir.Macaddr.String] renders
 // the two widths differently, which is what both diff paths compare); it does
 // NOT see an enum type rename, because [ir.Enum.String] renders only the
-// VALUES. That is a real, named residual, not an oversight: a rename with
-// identical values changes no data and no column type, and the alternative —
-// folding the name in — costs every existing chain.
+// VALUES, and it does NOT see a family retype, because [ir.Inet.String]
+// deliberately renders every family the same (that doc says why: the family
+// changes no target DDL). That is a real, named residual, not an oversight:
+// each of the three changes no column type on the target, and the alternative
+// — folding them in — costs every existing chain.
 //
 // The input is never mutated: the manifest records the schema exactly as the
 // reader produced it, and only the FINGERPRINT is canonical.
@@ -229,6 +236,22 @@ func fingerprintType(t ir.Type) (ir.Type, bool) {
 		out := v
 		out.TypeName = ""
 		return out, true
+	case ir.Inet:
+		// Inet.Family / Cidr.Family (roadmap item 133) — same treatment,
+		// same reason: the Postgres reader sets InetFamilyAny on every
+		// inet/cidr column, so the key is non-zero on ordinary source data
+		// and folding it in would move the fingerprint of every chain
+		// carrying one. It rides the wire so a manifest records which
+		// MariaDB network type the column was.
+		if v.Family == 0 {
+			return t, false
+		}
+		return ir.Inet{}, true
+	case ir.Cidr:
+		if v.Family == 0 {
+			return t, false
+		}
+		return ir.Cidr{}, true
 	case ir.Array:
 		elem, changed := fingerprintType(v.Element)
 		if !changed {

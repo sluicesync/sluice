@@ -88,10 +88,19 @@ type mariadbNativeType struct {
 // fixed-width identity/network data_types. Keyed by the lowercased
 // information_schema data_type string; MySQL 8 reports none of these, so a
 // lookup misses on every non-MariaDB flavor.
+//
+// INET4 and INET6 both map to [ir.Inet] but carry DIFFERENT families
+// (roadmap item 133). The value space is not the same: an INET6 column
+// WIDENS every address into IPv6, so `10.0.0.1` is stored and delivered as
+// `::ffff:10.0.0.1` while the server still matches the bare literal — which
+// is exactly how a `--where ip = '10.0.0.1'` matched the server-evaluated
+// cold copy and then nothing at all on the client-side CDC leg. The family
+// is what lets the predicate compiler name the canonical spelling instead of
+// freezing a filtered sync at exit 0.
 var mariadbNativeDataTypes = map[string]mariadbNativeType{
 	"uuid":  {mariadbNativeUUID, ir.UUID{}},
-	"inet4": {mariadbNativeInet4, ir.Inet{}},
-	"inet6": {mariadbNativeInet6, ir.Inet{}},
+	"inet4": {mariadbNativeInet4, ir.Inet{Family: ir.InetFamilyIPv4}},
+	"inet6": {mariadbNativeInet6, ir.Inet{Family: ir.InetFamilyIPv6}},
 }
 
 // mariadbNativeKindOf maps an information_schema.columns data_type string

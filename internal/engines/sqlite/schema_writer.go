@@ -70,6 +70,13 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	// refusals below). `--exclude-table` is no escape (a sequence is
 	// schema-level, not a table), so the remedy names the source-side
 	// options instead.
+	// Before anything is created or copied: two source indexes that resolve
+	// to one SQLite name would make the second CREATE INDEX a silent no-op
+	// three phases from now, after the whole database has been written
+	// (roadmap item 134). Same phase the Postgres sibling refuses in.
+	if err := validateSQLiteIndexNamespace(s.Tables); err != nil {
+		return err
+	}
 	if len(s.Sequences) > 0 {
 		return fmt.Errorf(
 			"sqlite: schema carries standalone sequence %q (%d total); SQLite has no sequence "+
@@ -124,6 +131,13 @@ func refuseUnrepresentableTableFeatures(table *ir.Table) error {
 func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("sqlite: CreateIndexes: schema is nil")
+	}
+	// The belt behind the brace in CreateTablesWithoutConstraints: this method
+	// is also reached by paths that never ran the create-tables phase
+	// (`--resume`, a target whose schema already exists), and it is the phase
+	// where the silent no-op would actually happen.
+	if err := validateSQLiteIndexNamespace(s.Tables); err != nil {
+		return err
 	}
 	for _, table := range s.Tables {
 		for _, idx := range table.Indexes {

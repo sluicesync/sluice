@@ -186,6 +186,24 @@ type schemaTypeEnvelope struct {
 	// bare Macaddr, i.e. emits `MACADDR` — exactly what it does today for a
 	// macaddr8 column. No regression, no format bump.
 	MacaddrWidth int `json:"macaddr_width,omitempty"`
+
+	// Inet/Cidr address family (roadmap item 133): which family the source
+	// column CONSTRAINS its values to. One key serves both arms — the two
+	// types share the discriminant and no schema carries both on one column.
+	//
+	// It rides the wire so a manifest records whether the column was a
+	// MariaDB `INET4`, a MariaDB `INET6` or an unconstrained Postgres
+	// `inet`; it is excluded from the schema FINGERPRINT instead — see
+	// internal/ir/backup/chain.go, because the Postgres reader sets
+	// [InetFamilyAny] on EVERY inet/cidr column and folding a
+	// non-zero-on-ordinary-data key into the hash mints a new epoch
+	// (item 104).
+	//
+	// Append-only, and forward-compatible in the direction that matters: an
+	// older binary reading a newer manifest ignores this key and decodes an
+	// unconstrained Inet/Cidr, i.e. emits `INET`/`CIDR` — exactly what it
+	// does today. No regression, no format bump.
+	InetFamily uint8 `json:"inet_family,omitempty"`
 }
 
 // domainCheckOnDisk is the wire shape of one [DomainCheck] inside a
@@ -294,8 +312,10 @@ func MarshalType(t Type) ([]byte, error) {
 		env.HasM = v.HasM
 	case Inet:
 		env.Kind = "Inet"
+		env.InetFamily = uint8(v.Family)
 	case Cidr:
 		env.Kind = "Cidr"
+		env.InetFamily = uint8(v.Family)
 	case Macaddr:
 		env.Kind = "Macaddr"
 		env.MacaddrWidth = v.Width
@@ -418,9 +438,9 @@ func UnmarshalType(b []byte) (Type, error) {
 			HasM:        env.HasM,
 		}, nil
 	case "Inet":
-		return Inet{}, nil
+		return Inet{Family: InetFamily(env.InetFamily)}, nil
 	case "Cidr":
-		return Cidr{}, nil
+		return Cidr{Family: InetFamily(env.InetFamily)}, nil
 	case "Macaddr":
 		return Macaddr{Width: env.MacaddrWidth}, nil
 	case "VerbatimType":

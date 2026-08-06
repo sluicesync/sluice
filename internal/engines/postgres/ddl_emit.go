@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/engines/internal/namecollide"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/sqlident"
@@ -1268,11 +1269,15 @@ func effectivePGIndexIdent(tableName string, idx *ir.Index) string {
 // and a single-element slice where they don't ([emitTableDef]).
 func validatePGIndexNamespace(tables []*ir.Table) error {
 	type origin struct{ table, index string }
-	seen := make(map[string]origin)
+	// The bookkeeping is shared with SQLite's sibling check
+	// ([sqlite.validateSQLiteIndexNamespace], roadmap item 134); the WORDING
+	// is not, because the two engines collide for different reasons. nil fold
+	// = byte-exact, which is right here: sluice always emits quoted
+	// identifiers and Postgres compares those byte-for-byte.
+	seen := namecollide.New[origin](nil)
 	claim := func(ident string, o origin) error {
-		prior, dup := seen[ident]
+		prior, dup := seen.Claim(ident, o)
 		if !dup {
-			seen[ident] = o
 			return nil
 		}
 		return sluicecode.Wrap(

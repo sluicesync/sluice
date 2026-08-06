@@ -337,18 +337,99 @@ func (g Geometry) String() string {
 	return fmt.Sprintf("%s[%s,SRID=%d]", name, subtype, g.SRID)
 }
 
-// Inet represents an IPv4 or IPv6 host address (Postgres inet).
-type Inet struct{}
+// InetFamily names the address family a network column CONSTRAINS its stored
+// values to (roadmap item 133). It is a property of the COLUMN, not of a
+// value: a column that constrains the family COERCES every value into it, and
+// the coerced value is what the change stream delivers.
+//
+// It exists because the IR collapses two distinct engine types onto one IR
+// type. MariaDB has separate INET4 and INET6 columns and both read to
+// [Inet]; an INET6 column stores `10.0.0.1` as the IPv4-MAPPED
+// `::ffff:10.0.0.1` and delivers it that way, while accepting (and matching)
+// the bare literal server-side. Without a discriminant, a `--where
+// ip = '10.0.0.1'` therefore matched during the server-evaluated cold copy
+// and never again in the client-side CDC evaluator — the filtered sync froze,
+// caught up, at exit 0 (live-verified on mariadb:11.4).
+//
+// ZERO MEANS UNSPECIFIED and consumers must FAIL CLOSED on it, exactly as
+// [Macaddr.Width] does: the two Postgres readers and MariaDB's native-type
+// registry are the only producers that can reach a `--where` resolver and all
+// three decide, so an unspecified family on a live schema read means a NEW
+// producer appeared without deciding — and the failure mode of guessing is
+// silent. `parquetexport/duckdbverify/matrix.go` builds a bare `Inet{}` for
+// its fixture corpus; that one never reaches a predicate resolver, which is
+// the property the refusal actually rests on.
+//
+// The family rides the backup wire (schema_wire.go) so a manifest records
+// which MariaDB type the column was, but it is DELIBERATELY EXCLUDED from the
+// schema fingerprint — see the exclusion block in internal/ir/backup/chain.go,
+// and roadmap item 104 for why a field that is non-zero on ordinary source
+// data must never reach that hash.
+type InetFamily uint8
 
-func (Inet) isType()        {}
-func (Inet) Tier() Tier     { return TierExtension }
+const (
+	// InetFamilyUnspecified is the zero value: the producer has not named
+	// what the column constrains, so no literal spelling can be known
+	// correct. Value comparisons against such a column are REFUSED.
+	InetFamilyUnspecified InetFamily = iota
+	// InetFamilyAny is the Postgres `inet`/`cidr` rule: the column holds
+	// either family and coerces nothing — a stored `10.0.0.1` is delivered
+	// `10.0.0.1` and a stored `::ffff:10.0.0.1` is delivered
+	// `::ffff:10.0.0.1`. It is a DECLARED answer, not a default; that is
+	// what makes the zero value mean "nobody decided".
+	InetFamilyAny
+	// InetFamilyIPv4 is the MariaDB `INET4` rule: the column holds only an
+	// IPv4 address. The server REFUSES an IPv6 literal on insert
+	// (errno 1292) and matches nothing for one in a WHERE, so a predicate
+	// naming an IPv6 address is refused rather than compiled into a filter
+	// that can never be true.
+	InetFamilyIPv4
+	// InetFamilyIPv6 is the MariaDB `INET6` rule: every value is widened
+	// into IPv6, so an IPv4 address is stored and delivered as its
+	// IPv4-MAPPED form (`10.0.0.1` -> `::ffff:10.0.0.1`, `0.0.0.0` ->
+	// `::ffff:0.0.0.0`). This is the family that made item 133 silent.
+	InetFamilyIPv6
+)
+
+// Inet represents an IPv4 or IPv6 host address (Postgres inet, MariaDB
+// inet4/inet6).
+type Inet struct {
+	// Family is what the column constrains its values to; see [InetFamily]
+	// for why the zero value must fail closed.
+	Family InetFamily
+}
+
+func (Inet) isType()    {}
+func (Inet) Tier() Tier { return TierExtension }
+
+// String deliberately renders the SAME "Inet" for every family, unlike
+// [Macaddr.String], which renders its two widths distinctly.
+//
+// The difference is principled rather than an oversight. A `macaddr` ⇄
+// `macaddr8` retype changes the TARGET DDL (`MACADDR` vs `MACADDR8`), so the
+// two schema-diff paths that compare rendered type strings must see it. An
+// inet family does not: every family emits the same target column (Postgres
+// `INET`, a MySQL-family target `VARCHAR(45)`), so a rendered-type diff that
+// reported them differently would flag drift on every MariaDB-source inet
+// column with nothing an operator could act on. The family is a SOURCE-side
+// comparison discriminant, not a target type distinction.
 func (Inet) String() string { return "Inet" }
 
 // Cidr represents an IPv4 or IPv6 network specification (Postgres cidr).
-type Cidr struct{}
+type Cidr struct {
+	// Family carries the same discriminant as [Inet.Family] and for the same
+	// fail-closed reason. Postgres's `cidr` is the only type any engine maps
+	// here today and it constrains nothing ([InetFamilyAny]) — the field is
+	// present so a future engine with a family-constrained network type is
+	// REFUSED until it decides, rather than silently inheriting "any" from a
+	// premise about the current producer set.
+	Family InetFamily
+}
 
-func (Cidr) isType()        {}
-func (Cidr) Tier() Tier     { return TierExtension }
+func (Cidr) isType()    {}
+func (Cidr) Tier() Tier { return TierExtension }
+
+// String renders "Cidr" for every family, for the reason [Inet.String] gives.
 func (Cidr) String() string { return "Cidr" }
 
 // MacaddrEUI48 / MacaddrEUI64 are the two widths a Postgres MAC-address

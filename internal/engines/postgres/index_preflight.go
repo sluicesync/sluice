@@ -50,6 +50,16 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: PreflightIndexes: schema is nil")
 	}
+	// The index-NAMESPACE half (roadmap item 120), answered here as well as at
+	// [SchemaWriter.CreateTablesWithoutConstraints]. It refuses nothing the run
+	// would have accepted — that emit path already refuses it, one phase later
+	// — and asking it through the same optional surface SQLite uses (item 134)
+	// is what lets a single roster gate assert that EVERY target-capable
+	// engine answers the question, rather than each engine's own test implying
+	// the others do.
+	if err := validatePGIndexNamespace(s.Tables); err != nil {
+		return err
+	}
 	for _, table := range s.Tables {
 		if table == nil {
 			continue

@@ -444,10 +444,14 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	// ---- Identity / network ----
 	case pgtype.UUIDOID:
 		return ir.UUID{}, nil
+	// Family-parity with the schema reader's text-keyed arm (roadmap
+	// item 133): PG constrains neither type to an address family, and the
+	// answer is DECLARED so an unspecified family stays a "nobody decided"
+	// signal rather than PG's normal state.
 	case pgtype.InetOID:
-		return ir.Inet{}, nil
+		return ir.Inet{Family: ir.InetFamilyAny}, nil
 	case pgtype.CIDROID:
-		return ir.Cidr{}, nil
+		return ir.Cidr{Family: ir.InetFamilyAny}, nil
 	// Split by width, in family-parity with the schema reader's text-keyed
 	// arm (Bug 97's dual-registry-drift lesson): a CDC relation that read a
 	// `macaddr8` column as a bare Macaddr would hand the applier a 6-byte

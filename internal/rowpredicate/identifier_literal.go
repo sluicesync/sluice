@@ -71,8 +71,9 @@ var timeCanonicalRE = regexp.MustCompile(`^(-?)(\d{1,3}):(\d{2})(?::(\d{2}))?(?:
 // false when s is not a valid value of that kind at all.
 //
 // It takes the whole [ColumnInfo] rather than the kind alone because two of
-// the four kinds need a per-column engine fact to answer: the network
-// rendering, and the MAC width.
+// the four kinds need per-column engine facts to answer: the network rendering
+// AND the network family (two independent axes — see [coerceToInetFamily]),
+// and the MAC width.
 func canonicalIdentifierLiteral(s string, info ColumnInfo) (canonical string, ok bool) {
 	network := info.NetworkRendering
 	switch info.Identifier {
@@ -130,6 +131,16 @@ func canonicalIdentifierLiteral(s string, info ColumnInfo) (canonical string, ok
 				continue
 			}
 			if p, err := netip.ParsePrefix(cand); err == nil {
+				coerced, ok := coerceToInetFamily(p.Addr(), info.InetFamily)
+				if !ok {
+					return "", false
+				}
+				// Mapping an IPv4 address into IPv6 prepends 96 bits, so the
+				// mask moves with it: a /32 host prefix becomes /128 and a
+				// /24 network becomes /120. Without the shift a mapped host
+				// literal would read as a 32-bit network of a 128-bit
+				// address and lose its full-width status.
+				p = netip.PrefixFrom(coerced, p.Bits()+coerced.BitLen()-p.Addr().BitLen())
 				fullWidth := p.Bits() == p.Addr().BitLen()
 				switch network {
 				case ir.NetworkLiteralRenderingHostBare:
@@ -156,6 +167,10 @@ func canonicalIdentifierLiteral(s string, info ColumnInfo) (canonical string, ok
 				return "", false
 			}
 			if a, err := netip.ParseAddr(cand); err == nil {
+				var ok bool
+				if a, ok = coerceToInetFamily(a, info.InetFamily); !ok {
+					return "", false
+				}
 				switch network {
 				case ir.NetworkLiteralRenderingHostBare, ir.NetworkLiteralRenderingAddressOnly:
 					return ir.RenderNetworkAddr(a, network), true
@@ -286,6 +301,28 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		)
 	}
 
+	// The second network axis, independent of the rendering above: which
+	// address family the COLUMN constrains its values to. MariaDB's INET4 and
+	// INET6 share one rendering and disagree here — an INET6 column widens
+	// `10.0.0.1` to `::ffff:10.0.0.1` on the way in and delivers the widened
+	// form, while still matching the bare literal server-side — so a filtered
+	// sync copied the row in the cold phase and then silently dropped every
+	// CDC change to it, freezing caught-up at exit 0 (roadmap item 133,
+	// live-verified on mariadb:11.4). The zero value refuses for the reason
+	// [ir.InetFamily] gives: every producer that can reach this decides, so an
+	// unspecified family means a new one appeared without deciding.
+	if info.Identifier == identifierNetwork && info.InetFamily == ir.InetFamilyUnspecified {
+		return fmt.Errorf(
+			"column %q is an inet/cidr column, but this source engine has not declared which address family the "+
+				"column constrains its values to — a MariaDB INET6 column stores `10.0.0.1` as the IPv4-mapped "+
+				"`::ffff:10.0.0.1` and delivers it that way while still matching the bare literal server-side, so "+
+				"without knowing the family no literal spelling can be known to compare correctly, and the wrong "+
+				"one would score every row out of scope and silently drop every change to it. Filter on a "+
+				"different column",
+			col,
+		)
+	}
+
 	if info.Identifier == identifierNetwork {
 		if err := checkNetworkLiteralZone(col, lit.str); err != nil {
 			return err
@@ -312,6 +349,58 @@ func checkIdentifierLiteral(col string, info ColumnInfo, lit literal) error {
 		)
 	}
 	return nil
+}
+
+// coerceToInetFamily applies the COLUMN's address-family coercion to a literal
+// address, returning ok=false when the column could never store it (roadmap
+// item 133).
+//
+// This is the second axis of a network literal, independent of
+// [ir.NetworkLiteralRendering]'s "is a prefix length shown?": before the value
+// is rendered at all, a family-constrained column may have moved the address
+// into another family. Ground-truthed on mariadb:11.4 (`HEX(ip)` on the stored
+// row, plus the server's own `WHERE ip = <literal>` count):
+//
+//	INET6 stored '10.0.0.1'        HEX 00000000000000000000FFFF0A000001
+//	                               SELECT delivers ::ffff:10.0.0.1
+//	INET6 stored '0.0.0.0'         SELECT delivers ::ffff:0.0.0.0
+//	INET6 stored '::1.2.3.4'       SELECT delivers ::1.2.3.4 (NOT re-mapped)
+//	INET4 INSERT '::ffff:10.0.0.1' errno 1292, Incorrect inet4 value
+//	INET4 WHERE  ip='::ffff:10.0.0.1'  0 rows (no coercion, matches nothing)
+//
+// The IPv6 row is what made item 133 silent: `WHERE ip = '10.0.0.1'` matches
+// server-side (2 of 2 rows on the fixture above), so the cold copy is right and
+// only the client-side CDC leg, comparing against the delivered
+// `::ffff:10.0.0.1`, scores every change out of scope — forever, at exit 0.
+//
+// [ir.InetFamilyUnspecified] never reaches here: checkIdentifierLiteral
+// refuses the column outright first.
+func coerceToInetFamily(a netip.Addr, family ir.InetFamily) (netip.Addr, bool) {
+	switch family {
+	case ir.InetFamilyIPv6:
+		// The column widens every address into IPv6. netip's As16 produces
+		// the IPv4-MAPPED bytes for an IPv4 address, which is exactly what
+		// MariaDB stores, and AddrFrom16 renders them `::ffff:a.b.c.d` —
+		// byte-for-byte the server's own spelling. An address already in v6
+		// (including a v4-COMPATIBLE `::1.2.3.4`) is returned untouched,
+		// because the server does not re-map those either.
+		if a.Is4() {
+			return netip.AddrFrom16(a.As16()), true
+		}
+		return a, true
+	case ir.InetFamilyIPv4:
+		// The column holds only IPv4 and coerces nothing — the server
+		// REFUSES an IPv6 literal on insert and matches nothing for one in a
+		// WHERE, so a predicate naming one is refused rather than compiled
+		// into a filter that can never be true. An IPv4-mapped spelling is
+		// refused with it: `::ffff:10.0.0.1` is an IPv6 literal to MariaDB,
+		// and unmapping it here would silently rewrite a predicate the
+		// server rejects into one it accepts.
+		return a, a.Is4()
+	default:
+		// InetFamilyAny — Postgres, which constrains nothing.
+		return a, true
+	}
 }
 
 // checkNetworkLiteralZone refuses a zone-scoped address (`fe80::1%eth0`).

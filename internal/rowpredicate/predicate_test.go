@@ -340,7 +340,7 @@ func TestColumnInfosFromIR(t *testing.T) {
 		{Name: "vc_cs", Type: ir.Varchar{Collation: "utf8mb4_0900_as_cs"}},
 		{Name: "vc_empty", Type: ir.Varchar{}},
 		{Name: "u", Type: ir.UUID{}},
-		{Name: "net", Type: ir.Inet{}},
+		{Name: "net", Type: ir.Inet{Family: ir.InetFamilyAny}},
 		{Name: "tm", Type: ir.Time{}},
 		{Name: "blob", Type: ir.Blob{}},
 		{Name: "js", Type: ir.JSON{}},

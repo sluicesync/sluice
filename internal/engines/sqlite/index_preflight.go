@@ -53,6 +53,16 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 	if s == nil {
 		return errors.New("sqlite: PreflightIndexes: schema is nil")
 	}
+	// This method now answers TWO questions, and its name covers both only if
+	// you read "representable" broadly — so state it: (1) can every index
+	// shape be emitted (the prefix-length refusal below), and (2) do two
+	// source indexes resolve to one SQLite name (roadmap item 134). Both are
+	// connectionless and both are silent-or-late otherwise, and running the
+	// namespace check here is what makes the refusal reach the paths that
+	// preflight but do not create tables (restore, `sync` cold start).
+	if err := validateSQLiteIndexNamespace(s.Tables); err != nil {
+		return err
+	}
 	for _, table := range s.Tables {
 		if table == nil {
 			continue
