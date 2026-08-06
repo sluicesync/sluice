@@ -239,6 +239,22 @@ const (
 
 	CodeTargetTableShapeMismatch Code = "SLUICE-E-TARGET-TABLE-SHAPE-MISMATCH"
 
+	// CodeTargetPreexistingForeignKey fires when the TARGET already
+	// carries a foreign key on a table this run is about to copy into
+	// AND that constraint's parent table is copied by the same run.
+	// sluice's deferred-constraint discipline (create tables bare, copy,
+	// then add indexes and constraints) governs only the constraints
+	// sluice CREATES; a target branched from an existing database arrives
+	// with its own, the copy is not parent-first ordered, and a child row
+	// reaches the target before its parent. A field report (2026-08-05,
+	// roadmap item 140) died ~20 s into a `sync` cold start on exactly
+	// this, with nothing having warned first. Refused before any data
+	// moves instead. `--skip-foreign-keys` is deliberately NOT an
+	// exemption: it strips foreign keys from the IR so the constraints
+	// phase creates none, issues no DDL against the target, and therefore
+	// leaves a pre-existing constraint enforcing.
+	CodeTargetPreexistingForeignKey Code = "SLUICE-E-TARGET-PREEXISTING-FOREIGN-KEY"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -459,6 +475,8 @@ var registry = map[Code]Info{
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
+
+	CodeTargetPreexistingForeignKey: {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
 
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state, was closed without deploying, computed an empty diff, or computed a diff outside the leg's intended blast radius — the message carries the DR number, state, and URL. A deploy sluice merely stopped WAITING on is the separate SLUICE-E-PS-DEPLOY-REQUEST-INCOMPLETE"},

@@ -46,6 +46,16 @@ func TestEngine_Capabilities(t *testing.T) {
 		JSONSupport:              ir.JSONNone,
 		UnsignedIntegers:         false,
 		DDLDialect:               ir.DDLDialectANSI,
+		// Inherited from the composed `d1`/`sqlite` shape, where every
+		// writable connection opens with foreign_keys(0) (ADR-0134). It is
+		// INERT for this engine — d1-trigger is a CDC source only, its
+		// write surfaces return ErrNotImplemented (see
+		// TestEngine_WriteSurfacesNotImplemented), so no cold copy ever
+		// consults the bit here. internal/docsync's
+		// TestEveryTargetCapableEngineDeclaresItsBulkCopyFKEnforcement
+		// exempts this engine on exactly that ground; the value is pinned
+		// only so a silent inheritance change still fails.
+		BulkCopyBypassesForeignKeys: true,
 	}
 	if got := (Engine{}).Capabilities(); got != want {
 		t.Errorf("Capabilities() drifted:\n got %+v\nwant %+v", got, want)

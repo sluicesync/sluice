@@ -275,6 +275,13 @@ var capabilities = ir.Capabilities{
 	JSONSupport:              ir.JSONNone,
 	UnsignedIntegers:         false,
 	DDLDialect:               ir.DDLDialectANSI,
+	// Every WRITABLE connection opens with `_pragma=foreign_keys(0)`
+	// (see writePragmas / ADR-0134), so a cold copy into a table that
+	// already carries foreign keys cannot fail child-before-parent —
+	// which is what exempts a SQLite target from the item-140 pre-copy
+	// refusal. Ground-truthed against a real file by
+	// TestWriteRows_ChildBeforeParentIsAcceptedOnAPreExistingForeignKey.
+	BulkCopyBypassesForeignKeys: true,
 }
 
 // init registers this engine with the engines registry. A blank import

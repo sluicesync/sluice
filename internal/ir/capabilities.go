@@ -273,4 +273,27 @@ type Capabilities struct {
 	// (GitHub #18: cross-region PlanetScale failed at batch=100,
 	// worked at 25-50).
 	TransactionKiller bool
+
+	// BulkCopyBypassesForeignKeys reports that this engine's COLD/BULK
+	// COPY write path loads rows with the server's foreign-key
+	// enforcement OFF, so a copy into a table that ALREADY carries
+	// foreign keys cannot fail on child-before-parent ordering.
+	//
+	// It is deliberately narrower than "the engine bypasses foreign
+	// keys". On MySQL the CDC APPLIER bypasses them — `foreign_key_checks=0`
+	// on every apply connection, Bug 164 — while the bulk-copy pool does
+	// not, and it is the copy that roadmap item 140's preflight is about.
+	// Today only the SQLite target declares this: every writable
+	// connection opens with `_pragma=foreign_keys(0)` (ADR-0134) because
+	// the writer emits foreign keys INLINE in CREATE TABLE and the copy
+	// sweep is unordered, with the post-copy `PRAGMA foreign_key_check`
+	// surfacing a genuine violation loudly on a fresh scan.
+	//
+	// The ZERO VALUE is the ENFORCING answer, which is the one that keeps
+	// the item-140 preflight ARMED: a new target engine is fail-closed
+	// (it gets the refusal) rather than silently un-gated. Which engines
+	// declare what is kept honest by
+	// TestEveryTargetCapableEngineDeclaresItsBulkCopyFKEnforcement in
+	// internal/docsync.
+	BulkCopyBypassesForeignKeys bool
 }

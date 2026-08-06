@@ -533,6 +533,12 @@ type recordingEngine struct {
 	// SetCopiedRowsForeignKeyConsistent (item 109/112 arming). Default false
 	// (nothing armed); a nil-safe capture, harmless for tests that ignore it.
 	fkConsistent bool
+	// caps is what Capabilities() returns. The zero value is what every
+	// existing test got before it existed, so declaring nothing keeps a
+	// test on the fail-closed side of every capability gate (roadmap
+	// item 140's pre-existing-FK check reads
+	// BulkCopyBypassesForeignKeys through here).
+	caps ir.Capabilities
 }
 
 func newRecordingEngine(name string) *recordingEngine {
@@ -540,7 +546,7 @@ func newRecordingEngine(name string) *recordingEngine {
 }
 
 func (e *recordingEngine) Name() string                  { return e.name }
-func (e *recordingEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
+func (e *recordingEngine) Capabilities() ir.Capabilities { return e.caps }
 
 func (e *recordingEngine) OpenSchemaReader(_ context.Context, _ string) (ir.SchemaReader, error) {
 	return &recordingSchemaReader{schema: e.schema, err: e.readSchemaErr}, nil

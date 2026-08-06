@@ -47,13 +47,22 @@ type constraintWalledEngine struct {
 	name string
 	// wall, when non-nil, is returned by CreateConstraints.
 	wall error
+	// freshTarget makes OpenSchemaReader return an EMPTY catalog. The
+	// target side of this fixture models a FRESH database — the whole
+	// premise of the gate is that sluice creates the foreign key itself,
+	// after the copy, and walls doing so. Handing the target reader the
+	// same FK-bearing catalog as the source would model a target that
+	// already carries the constraint, which roadmap item 140 now refuses
+	// upfront (correctly) — long before the constraints phase this gate
+	// exists to reach.
+	freshTarget bool
 }
 
 func (e *constraintWalledEngine) Name() string                  { return e.name }
 func (e *constraintWalledEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
 
 func (e *constraintWalledEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
-	return constraintWalledSchemaReader{}, nil
+	return constraintWalledSchemaReader{empty: e.freshTarget}, nil
 }
 
 func (e *constraintWalledEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
@@ -83,9 +92,12 @@ func (e *constraintWalledEngine) OpenSnapshotStream(context.Context, string) (*i
 // constraintWalledSchemaReader yields a child table carrying a foreign key —
 // the minimum shape that makes the constraints phase load-bearing, and the
 // same shape the field capture had (a child table's FK to a parent).
-type constraintWalledSchemaReader struct{}
+type constraintWalledSchemaReader struct{ empty bool }
 
-func (constraintWalledSchemaReader) ReadSchema(context.Context) (*ir.Schema, error) {
+func (r constraintWalledSchemaReader) ReadSchema(context.Context) (*ir.Schema, error) {
+	if r.empty {
+		return &ir.Schema{}, nil
+	}
 	return &ir.Schema{Tables: []*ir.Table{
 		{
 			Name:       "customers",
@@ -150,7 +162,7 @@ func (w *fkWallWrap) Unwrap() error { return w.inner }
 
 func init() {
 	engines.Register(&constraintWalledEngine{name: "cwalledsrc"})
-	engines.Register(&constraintWalledEngine{name: "cwalledtgt", wall: fieldCapturedFKWall()})
+	engines.Register(&constraintWalledEngine{name: "cwalledtgt", wall: fieldCapturedFKWall(), freshTarget: true})
 }
 
 // TestMigrateConstraintWall_HintAndCodeReachTheOperator is the gate. It runs

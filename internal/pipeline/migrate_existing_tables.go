@@ -48,6 +48,11 @@ package pipeline
 // coercion class ADR-0166 closed for migrate. The comparison core
 // lives on [existingTablesGate] so both orchestrators share one
 // implementation; the Migrator methods below are thin delegates.
+//
+// The same one catalog read also feeds the roadmap-item-140 check for
+// foreign keys the target ALREADY carries — a different failure class
+// (child-before-parent during the copy, not a wrong column shape) on the
+// same evidence. It lives in migrate_existing_tables_fks.go.
 
 import (
 	"context"
@@ -143,6 +148,15 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 				slog.String("target_engine", g.Target.Name()),
 				slog.String("tables", strings.Join(tolerated, ", ")))
 		}
+		// Roadmap item 140 still applies here. The foreign-key check is
+		// NAME-level (which table, which parent), not storage-level, so
+		// the missing storage-shape mapping that disqualifies the column
+		// compare has no bearing on it — and mysql→postgres, the pair
+		// that takes this branch, hits the pre-existing-FK failure
+		// exactly as a same-engine pair does.
+		if err := g.checkPreExistingForeignKeys(ctx, schema, actual); err != nil {
+			return nil, err
+		}
 		return schema, nil
 	}
 
@@ -210,6 +224,16 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 			),
 		)
 	}
+
+	// Roadmap item 140, run AFTER the shape verdict: a table whose
+	// COLUMNS differ is the more fundamental problem and its refusal is
+	// the more actionable one, so a target that is wrong in both ways
+	// reports the shape first. See migrate_existing_tables_fks.go for
+	// the refuse-vs-warn split and the paths this does not reach.
+	if err := g.checkPreExistingForeignKeys(ctx, schema, actual); err != nil {
+		return nil, err
+	}
+
 	if len(skip) == 0 {
 		return schema, nil
 	}
@@ -230,7 +254,7 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 func (g *existingTablesGate) readTargetTablesForShapeGate(ctx context.Context) (map[string]*ir.Table, bool) {
 	warnFallback := func(step string, err error) {
 		slog.WarnContext(ctx,
-			g.Mode+": cannot read the target's existing tables — skipping the pre-create shape compare (pre-existing same-name tables are tolerated as before)",
+			g.Mode+": cannot read the target's existing tables — skipping the pre-create shape compare AND the pre-existing-foreign-key check (pre-existing same-name tables are tolerated as before; a foreign key the target already carries would surface mid-copy as MySQL Error 1452 / Postgres SQLSTATE 23503)",
 			slog.String("step", step), slog.String("err", err.Error()))
 	}
 	tr, err := g.Target.OpenSchemaReader(ctx, g.TargetDSN)
