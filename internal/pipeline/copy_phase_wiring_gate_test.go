@@ -60,6 +60,12 @@ var bulkCopyOptsKnobs = []string{
 	"CopyFanoutDegree",
 	"CopyFanoutCeiling",
 	"NoIntraTableStealing",
+	// Item 146: the run's grow gate, carried so the copy stall watchdog can
+	// tell a deliberate ADR-0110 quiesce from a stall. A site that omits it
+	// gets a watchdog that reports every storage-grow pause as a stall —
+	// noise, which gets suppressed, which is how a watchdog stops catching
+	// anything.
+	"GrowGate",
 }
 
 // bulkCopyOptsProbeSourcedKnobs are [bulkCopyOpts] fields whose value must

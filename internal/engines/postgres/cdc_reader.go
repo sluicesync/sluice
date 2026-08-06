@@ -22,7 +22,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/netdeadline"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events buffered before
@@ -2353,13 +2353,14 @@ func openReplicationConn(ctx context.Context, dsn, appID string) (*pgconn.PgConn
 	}
 	// Parse then connect-by-config so the streaming connection — the
 	// longest-lived, most idle-prone connection sluice holds — gets the
-	// shared TCP keep-alive policy on its dial path (see [netkeepalive])
-	// and the cdc-reader application_name label (see [withApplicationName]).
+	// shared transport policy on its dial path — TCP keep-alive plus the
+	// item-146 per-write deadline (see [netdeadline.Dialer]) — and the
+	// cdc-reader application_name label (see [withApplicationName]).
 	connConfig, err := pgconn.ParseConfig(withApplicationName(withRepl, roleCDCReader, appID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse replication DSN: %w", err)
 	}
-	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	connConfig.DialFunc = netdeadline.Dialer()
 	conn, err := pgconn.ConnectConfig(ctx, connConfig)
 	if err != nil {
 		return nil, err

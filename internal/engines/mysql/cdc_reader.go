@@ -24,7 +24,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/netdeadline"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events the CDC channel
@@ -656,8 +656,13 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// while sluice's shared TCP keep-alive policy keeps a cloud-NAT
 		// mapping warm on an idle binlog stream and bounds dead-peer
 		// detection to seconds rather than the kernel's multi-minute
-		// default. #77.
-		Dialer: netkeepalive.Dialer().DialContext,
+		// default. #77. Item 146 adds the second half of the transport
+		// policy — the per-write deadline — because the syncer does NOT read
+		// the [mysql.Config.WriteTimeout] the query paths get in connect.go,
+		// so a binlog connection whose peer stops draining (the ACK / dump
+		// command writes are small, and a small write to a gone peer blocks
+		// exactly as long as a large one) would otherwise park forever.
+		Dialer: netdeadline.Dialer(),
 	}
 	r.syncer = replication.NewBinlogSyncer(syncerCfg)
 

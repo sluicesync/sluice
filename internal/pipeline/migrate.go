@@ -1228,6 +1228,16 @@ type bulkCopyOpts struct {
 	// on-behavior would silently invert to off for every non-CLI construction.
 	// Inert on every path that isn't the native-MySQL work-stealing reader.
 	NoIntraTableStealing bool
+
+	// GrowGate is the run's ADR-0110 coordinated-pause gate, carried here so
+	// the item-146 copy stall watchdog can tell a DELIBERATE quiesce from a
+	// stall (see [withCopyQuiesceSource]). The gate is separately applied to
+	// the writer by the caller — this field does not replace that wiring, it
+	// makes the pause OBSERVABLE to the watchdog on the two cold-start paths
+	// that reach the copy through this function rather than through
+	// runBulkCopyPhases. nil ⇒ the watchdog reads "never quiesced", which
+	// over-reports rather than under-reports.
+	GrowGate ir.GrowGate
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
@@ -1241,6 +1251,9 @@ func runBulkCopyWithOpts(
 	rw ir.RowWriter,
 	opts bulkCopyOpts,
 ) error {
+	// Item 146: bind the run's grow gate as the copy watchdog's quiesce
+	// source before any ticker is constructed downstream.
+	ctx = withCopyQuiesceSource(ctx, opts.GrowGate)
 	if !opts.SkipSchemaApply {
 		// The CREATE phase consumes the ADR-0166 create subset when the
 		// pre-create shape gate ran (sync cold-start); nil keeps the full
@@ -1597,6 +1610,15 @@ func runBulkCopyPhases(
 	// deleted so the next reader knows which path this line really reaches.
 	if parallel != nil {
 		migcore.ApplyGrowGate(rw, parallel.growGate)
+		// Item 146: the same gate, bound to the ctx as the copy watchdog's
+		// quiesce source. Every progressTicker (and the raw lane's byte
+		// watchdog) resolves it from the context it is constructed with, so
+		// an ADR-0110 pause window — which stops every lane on purpose for up
+		// to 20 minutes — is not reported as a stall. Bound HERE rather than
+		// at the gate's construction site because this is the ctx that
+		// actually reaches the copy graph; phaseBuildCopyDeps returns deps,
+		// not a context.
+		ctx = withCopyQuiesceSource(ctx, parallel.growGate)
 		// ADR-0141: wire the run's reparent observer onto the TOP-LEVEL writer
 		// here too, centrally, alongside the grow-gate — the single-reader /
 		// chunk-0 / fan-out lanes all flush through THIS rw, so a grow/reparent

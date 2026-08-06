@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"sluicesync.dev/sluice/internal/netdeadline"
 	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
@@ -25,6 +26,13 @@ import (
 // `tcp` DSN onto this network so every MySQL query connection inherits
 // the keep-alive policy; unix sockets and operator-specified networks
 // are left untouched (TCP keep-alive is meaningless off TCP).
+//
+// Deliberately keep-alive ONLY — this is the one dial site in sluice that
+// does not compose [netdeadline.Dialer]. The item-146 per-write deadline
+// reaches these connections through the driver's own
+// [mysql.Config.WriteTimeout], set in [finishParseDSN], which covers unix
+// sockets and operator-specified networks too; wrapping here as well would
+// arm the same deadline twice on the same socket.
 const keepaliveNet = "tcp+sluicekeepalive"
 
 func init() {
@@ -275,6 +283,32 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
+
+	// Bug 229 / item 146: a SOCKET WRITE DEADLINE on every MySQL connection.
+	// Without one the driver blocks in net.(*conn).Write for as long as the
+	// peer refuses to drain — forever, against a target whose connection died
+	// mid-`LOAD DATA` (the reported hang: no error, no exit code, zero rows).
+	// See [netdeadline] for why keep-alive does not cover a blocked write, why
+	// this is a per-PACKET bound rather than a statement timeout, and why the
+	// READ side deliberately gets none.
+	//
+	// This is the mechanism the item-146 experiment actually measured
+	// (`?writeTimeout=15s` turned the identical injection into a clean exit
+	// carrying item 114's retry-ambiguous refusal), and it is the driver's own
+	// first-class field, so it covers EVERY MySQL write path — the LOAD DATA
+	// core, the batched inserts, the change applier, the DDL emitters — on TCP
+	// and unix sockets alike, without a conn wrapper. The go-mysql BINLOG
+	// syncer does not read this cfg and is wired separately in cdc_reader.go.
+	//
+	// Two-tier override, matching sql_mode / time_zone / the source session
+	// timeouts above: an operator's `writeTimeout=` DSN parameter wins
+	// absolutely. ParseDSN collapses "absent" and an explicit `writeTimeout=0s`
+	// into the same zero Duration, so the two are indistinguishable here and
+	// both take the default; an operator who genuinely wants no bound spells it
+	// `writeTimeout=8760h` rather than `0s`.
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = netdeadline.Write
+	}
 
 	// The driver's handleParams emits each cfg.Params entry as
 	// `SET <key> = <value>` after the connection handshake. Quoting

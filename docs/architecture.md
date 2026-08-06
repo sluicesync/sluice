@@ -95,6 +95,7 @@ sluice/
 │   ├── crypto/                 # Envelope-encryption primitives for encrypted backup chains
 │   ├── diagnose/               # `sluice diagnose` operator support-bundle assembler
 │   ├── fleettui/               # `sluice sync tui` full-screen fleet view
+│   ├── netdeadline/            # Per-socket-write deadline (a peer that stops draining fails loudly, never hangs)
 │   ├── netkeepalive/           # TCP keep-alive policy for long-lived database connections
 │   ├── notify/                 # Notification sinks (webhook / Slack / SMTP) with failure isolation
 │   ├── planetscale/

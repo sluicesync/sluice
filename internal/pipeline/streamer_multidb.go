@@ -748,6 +748,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		CopyFanoutDegree:     s.CopyFanoutDegree,
 		CopyFanoutCeiling:    fanoutCeiling,
 		NoIntraTableStealing: s.NoIntraTableStealing,
+		GrowGate:             gate,
 	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		migcore.CloseIf(rw)

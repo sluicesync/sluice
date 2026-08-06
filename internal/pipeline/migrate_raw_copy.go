@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -278,8 +279,22 @@ const rawCopyPipeBufSize = 64 * 1024
 //
 // Returns the server-reported row count from the import side (a byte-pipe
 // has no per-row visibility, so progress is incremented once per chunk).
-func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopyImporter, table *ir.Table, chunk *ir.RawCopyChunk, format ir.RawCopyFormat) (int64, error) {
+//
+// stallChunk is the chunk index for the item-146 idle-progress watchdog's
+// label (-1 on the whole-table path). This lane is the one copy lane with NO
+// [progressTicker], because it has no rows to observe — so it starts its own
+// watchdog over BYTES through the pipe. Without it the raw lane would be the
+// single hole in a class-level gate, and a hole in a gate is worse than no
+// gate: it stops anyone from looking. Bytes are the honest signal here and
+// they freeze for both stall directions — the counter advances only when a
+// pipe write completes, which needs the importer to be draining, which needs
+// the target to be alive.
+func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopyImporter, table *ir.Table, chunk *ir.RawCopyChunk, format ir.RawCopyFormat, stallChunk int) (int64, error) {
 	pr, pw := io.Pipe()
+
+	var piped atomic.Int64
+	stall := newCopyStallWatchdog(ctx, table.Name, stallChunk, "bytes", piped.Load)
+	defer stall.Stop()
 
 	var rowsCopied int64
 	g, gctx := errgroup.WithContext(ctx)
@@ -305,7 +320,7 @@ func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopy
 	// the importer sees EOF; close-with-error on failure so the importer's
 	// read returns the cause (no flush then — the partial tail is moot).
 	g.Go(func() error {
-		bw := bufio.NewWriterSize(pw, rawCopyPipeBufSize)
+		bw := bufio.NewWriterSize(countingWriter{w: pw, n: &piped}, rawCopyPipeBufSize)
 		err := exp.ExportRawCopy(gctx, table, chunk, format, bw)
 		if err == nil {
 			err = bw.Flush()
@@ -324,6 +339,23 @@ func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopy
 		rawCopyTakenObserver(table.Name)
 	}
 	return rowsCopied, nil
+}
+
+// countingWriter records bytes that COMPLETED a write to the underlying
+// writer — the raw lane's progress signal for the item-146 watchdog. It
+// counts after the write returns, never before, so a write parked on a pipe
+// nobody is draining contributes nothing, which is the whole point.
+type countingWriter struct {
+	w io.Writer
+	n *atomic.Int64
+}
+
+func (c countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if n > 0 {
+		c.n.Add(int64(n))
+	}
+	return n, err
 }
 
 // asRawCopyEndpoints type-asserts a reader/writer pair to the raw-copy

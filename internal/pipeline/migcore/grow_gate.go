@@ -204,6 +204,10 @@ const growGateMaxCycle = 32
 //
 // What does NOT govern it, and this is the item-138 correction: the NUMBER
 // of lanes reporting a fault. See [GrowGate.Trip].
+//
+// It satisfies [ir.GrowGate] and, for the item-146 copy watchdog,
+// [ir.GrowGateQuiesceObserver] — both asserted on the REAL type just below,
+// not on a test stub that would satisfy them by construction.
 type GrowGate struct {
 	mu sync.Mutex
 
@@ -291,6 +295,11 @@ type GrowGate struct {
 	// onWindowClosed and is meaningless while the gate is open.
 	windowStart time.Time
 }
+
+var (
+	_ ir.GrowGate                = (*GrowGate)(nil)
+	_ ir.GrowGateQuiesceObserver = (*GrowGate)(nil)
+)
 
 // NewGrowGate constructs the run's shared coordinator. ctx is the
 // cold-copy run context: when it is cancelled (e.g. the errgroup unwinds
@@ -616,6 +625,27 @@ func (g *GrowGate) finishWindow(reopenCh chan struct{}, why string) {
 		slog.String("reason", g.reason),
 		slog.String("why", why),
 	)
+}
+
+// QuiescedSince implements [ir.GrowGateQuiesceObserver] (roadmap item 146):
+// it reports whether any part of the interval [t, now] was spent with the
+// gate CLOSED, so the idle-progress copy watchdog can tell a deliberate
+// coordinated pause from a stall and stay silent for the former.
+//
+// It answers from [GrowGate.lastReopen] rather than from the trailing
+// [GrowGate.quiesced] ledger on purpose: the ledger is a run-level SHARE
+// accounting structure whose spans age out of the trailing window, so a
+// window that closed and reopened long enough ago to be trimmed would read as
+// "never quiesced". lastReopen is stamped by [GrowGate.finishWindow] on every
+// window-exit path and never rolls back, which is precisely the "was there a
+// pause in this interval" question.
+func (g *GrowGate) QuiescedSince(t time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return true // a window is live right now
+	}
+	return !g.lastReopen.IsZero() && !g.lastReopen.Before(t)
 }
 
 func (g *GrowGate) now() time.Time {

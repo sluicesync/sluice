@@ -3,7 +3,10 @@
 
 package ir
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // GrowGate coordinates a cold-copy quiesce during a target storage-grow /
 // reparent window (ADR-0110). One gate is shared across every cold-copy
@@ -47,6 +50,27 @@ type GrowGate interface {
 	// concurrent trips from many lanes + the telemetry sidecar COALESCE
 	// into ONE pause window rather than stacking.
 	Trip(reason string)
+}
+
+// GrowGateQuiesceObserver is the OPTIONAL surface a [GrowGate] implements so
+// an observer can tell a DELIBERATE pause from a stall (roadmap item 146).
+//
+// The idle-progress copy watchdog reports a run that has made no forward
+// progress for N minutes. An ADR-0110 pause window is exactly that — every
+// lane parked in [GrowGate.Await], by design, for up to GrowGateMaxHold — so
+// a watchdog that could not see it would cry wolf on every storage grow, get
+// suppressed, and then catch nothing. Asking the gate is what keeps the
+// warning meaningful.
+//
+// A gate that does not implement this reads as "never quiesced", which is the
+// conservative direction for a WARN-only signal (it may over-report, never
+// under-report). The concrete [migcore.GrowGate] implements it, asserted
+// against the real type rather than a test stub.
+type GrowGateQuiesceObserver interface {
+	// QuiescedSince reports whether the gate was CLOSED at any point at or
+	// after t — i.e. whether any part of the interval [t, now] was a
+	// deliberate coordinated pause rather than lost time.
+	QuiescedSince(t time.Time) bool
 }
 
 // GrowGateSetter is the OPTIONAL surface a cold-copy [RowWriter] implements

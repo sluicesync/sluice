@@ -185,6 +185,15 @@ type progressTicker struct {
 	// noisy at small sample sizes.
 	startedAt atomic.Pointer[time.Time]
 
+	// stall is the item-146 idle-progress watchdog for this lane. The ticker
+	// deliberately stays SILENT when the count has not moved (see [loop]) —
+	// the right call for a progress line, and precisely why three silent
+	// hangs in three cycles produced no output at all. The watchdog is the
+	// other half of that decision: the ticker says nothing about a stall, and
+	// this says it loudly once the silence has gone on long enough to mean
+	// something. Never nil once constructed through the constructors below.
+	stall *copyStallWatchdog
+
 	stopOnce sync.Once
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -204,6 +213,7 @@ func newProgressTicker(ctx context.Context, interval time.Duration, table string
 		runRows:  runRowTotalFromContext(ctx),
 		done:     make(chan struct{}),
 	}
+	p.stall = newCopyStallWatchdog(ctx, table, -1, "rows", p.rows.Load)
 	p.wg.Add(1)
 	go p.loop(ctx)
 	return p
@@ -224,6 +234,7 @@ func newProgressTickerForChunk(ctx context.Context, interval time.Duration, tabl
 		runRows:  runRowTotalFromContext(ctx),
 		done:     make(chan struct{}),
 	}
+	p.stall = newCopyStallWatchdog(ctx, table, chunk, "rows", p.rows.Load)
 	p.wg.Add(1)
 	go p.loop(ctx)
 	return p
@@ -386,6 +397,9 @@ func (p *progressTicker) Stop(ctx context.Context, err error) {
 	p.stopOnce.Do(func() {
 		close(p.done)
 		p.wg.Wait()
+		if p.stall != nil {
+			p.stall.Stop()
+		}
 		msg := "bulk copy complete"
 		if err != nil {
 			msg = "bulk copy aborted"

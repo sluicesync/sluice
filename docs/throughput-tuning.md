@@ -278,6 +278,35 @@ default. Advisory: a per-table failure WARNs and never fails the
 migration. Default off. Migrate-only — a sync target's statistics
 churn under continuous CDC apply, so the flag doesn't apply there.
 
+## Socket write deadline and the copy stall warning (automatic, no flag)
+
+Every database connection sluice opens carries a **10-minute
+per-socket-write deadline**. It bounds how long one write may block on a
+peer that has stopped draining — not how long a statement may take, so a
+slow-but-live target is unaffected: each packet that completes re-arms a
+fresh deadline. Without it, a connection whose peer vanishes mid-write
+(no FIN, no RST — a dropped NAT mapping, a wedged proxy, a target that
+went away) blocks forever, which is exactly the hang this default exists
+to end.
+
+The value is generous on purpose. A PlanetScale storage auto-grow stops
+the target consuming its socket for seconds-to-minutes, and turning that
+healthy pause into a copy abort would be worse than the hang. If you
+genuinely need a different bound on MySQL, `writeTimeout=` in the target
+DSN wins absolutely (`writeTimeout=8760h` is how you effectively disable
+it; `writeTimeout=0s` is indistinguishable from "absent" to the driver
+and takes the default). Postgres has no DSN spelling for it.
+
+Reads deliberately have **no** deadline: a read deadline is a whole-query
+timeout in disguise and would kill legitimate long `COUNT(*)`s, `ALTER`s,
+and index builds. What covers the read side is the copy **stall
+watchdog** — if a copy lane makes no forward progress for 5 minutes,
+sluice emits a WARN naming the table and chunk. It never aborts the copy,
+it excludes deliberate storage-grow pauses, and any forward progress
+resets its clock, so it reports STOPPED rather than SLOW. Seeing it means
+something between the source read and the target write is not returning:
+check the target's active queries and locks.
+
 ## See also
 
 - [ADR-0017 — Batched CDC apply](adr/adr-0017-batched-cdc-apply.md)

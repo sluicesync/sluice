@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"sluicesync.dev/sluice/internal/diagnose"
-	"sluicesync.dev/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/netdeadline"
 )
 
 // pgConfig captures the bits of the DSN sluice cares about beyond what
@@ -112,8 +112,10 @@ func parseKVDSN(dsn string) (*pgConfig, error) {
 }
 
 // OpenPgxDB opens a lazy *sql.DB against the Postgres server named by
-// dsn, with sluice's standard TCP keep-alive policy installed on the
-// dial path (see [netkeepalive]). It does not ping — like [sql.Open],
+// dsn, with sluice's standard transport policy installed on the dial path
+// — TCP keep-alive plus the item-146 per-socket-write deadline, which is
+// what keeps a write to a target that stopped draining from parking
+// forever (see [netdeadline.Dialer]). It does not ping — like [sql.Open],
 // the first real connection is established on first use; callers that
 // need an eager liveness check should call PingContext themselves.
 //
@@ -145,7 +147,7 @@ func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionO
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
-	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	connConfig.DialFunc = netdeadline.Dialer()
 	pinStandardConformingStrings(connConfig)
 	opts = append([]stdlib.OptionOpenDB{stdlib.OptionAfterConnect(afterConnectSessionPins)}, opts...)
 	return stdlib.OpenDB(*connConfig, opts...), nil
@@ -270,7 +272,7 @@ func openPgxDBDescribeExec(dsn string, role connRole, appID string, opts ...stdl
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
-	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	connConfig.DialFunc = netdeadline.Dialer()
 	connConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
 	pinStandardConformingStrings(connConfig)
 	// Same default AfterConnect pin + last-wins caveat as [openPgxDBAs].

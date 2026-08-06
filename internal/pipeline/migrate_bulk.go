@@ -279,7 +279,7 @@ func copyOneTableData(
 			// Breadcrumb so a mid-pipe crash leaves a clean truncate-and-redo
 			// entry for the next attempt (same disposition as copyTable's).
 			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressInProgress})
-			rowsN, rawErr := runRawCopyChunk(ctx, exp, imp, table, nil, parallel.rawCopyFormat)
+			rowsN, rawErr := runRawCopyChunk(ctx, exp, imp, table, nil, parallel.rawCopyFormat, -1)
 			if rawErr != nil {
 				wrapped := fmt.Errorf("pipeline: copy table %q (raw copy): %w", table.Name, rawErr)
 				return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))

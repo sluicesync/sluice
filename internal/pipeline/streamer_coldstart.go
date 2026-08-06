@@ -1041,6 +1041,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 			CopyFanoutDegree:     s.CopyFanoutDegree,
 			CopyFanoutCeiling:    fanoutCeiling,
 			NoIntraTableStealing: s.NoIntraTableStealing,
+			GrowGate:             gate,
 		}
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
 	}
