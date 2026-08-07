@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -856,7 +857,11 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	_, isJSON := t.(ir.JSON)
 	_, isArray := t.(ir.Array)
 	if isJSON || isArray {
-		if converted, ok := convertArrayLikeToJSON(v, col); ok {
+		converted, ok, err := convertArrayLikeToJSON(v, col)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			return converted, nil
 		}
 		if b, ok := v.([]byte); ok {
@@ -1035,10 +1040,6 @@ func refuseUnrepresentableFloat(v any, col *ir.Column) error {
 	if !ok || (!math.IsNaN(f) && !math.IsInf(f, 0)) {
 		return nil
 	}
-	colName := "(unknown column)"
-	if col != nil {
-		colName = col.Name
-	}
 	return sluicecode.Wrap(
 		sluicecode.CodeValueUnrepresentable,
 		"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
@@ -1047,7 +1048,7 @@ func refuseUnrepresentableFloat(v any, col *ir.Column) error {
 				"(MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or "+
 				"retry-looping on the server's misleading error — filter or transform the source value "+
 				"(e.g. NULLIF / CASE on the source query)",
-			colName, f,
+			columnNameForError(col), f,
 		),
 	)
 }
@@ -1400,7 +1401,9 @@ func parseHstoreText(s string) (map[string]any, error) {
 //
 //   - []any — the canonical IR shape for an [ir.Array] value
 //     decoded by the postgres reader against an ir.Array column.
-//     Marshalled element-by-element via [encoding/json].
+//     Each leaf is first put in a form [encoding/json] renders
+//     FAITHFULLY (see [arrayLeafForJSON]), then the whole nested
+//     value is marshalled.
 //   - string of the form "{...}" — the PG array text literal that
 //     surfaces when the override leaves the value as a string (e.g.
 //     CDC tuple values, or some database/sql scan paths). Parsed
@@ -1415,22 +1418,28 @@ func parseHstoreText(s string) (map[string]any, error) {
 //     array literal verbatim). Routed through the same parser as
 //     the string case.
 //
-// Returns (jsonString, true) on a recognised shape; (nil, false)
-// when the value doesn't match either, signalling the caller to
-// fall back to the next branch in [prepareValue].
+// Returns (jsonString, true, nil) on a recognised shape; (nil, false,
+// nil) when the value doesn't match any of them, signalling the caller
+// to fall back to the next branch in [prepareValue]; and a non-nil
+// error when the value IS one of these shapes but cannot be carried
+// faithfully — see [arrayLeafForJSON].
 //
-// Errors during marshalling are swallowed: returning the un-
-// converted value is safe because the next branch (the []byte →
-// string branch) handles bytes correctly, and the driver's own
-// error handling will report any genuinely-bad value the operator
-// supplied.
+// A failed PG-array-literal PARSE still returns (nil, false, nil)
+// rather than an error: that is the shape DISAMBIGUATION described
+// below (a JSON object is not an array literal), not a fidelity
+// verdict. A failed MARSHAL is loud, because at that point the shape
+// is settled and the only remaining reading would be a wrong value —
+// pre-v0.113 it was swallowed, and an ir.Float array holding NaN
+// therefore fell out of this function unconverted and surfaced as the
+// LOAD DATA serializer's `unsupported value type []interface {}`,
+// which names neither the column nor the offending element.
 //
 // The col parameter carries the column's pre-override source type
 // in [ir.Column.SourceColumnType]; the `[]byte` branch consults it
 // to disambiguate the literal `{}` shape — see the branch comment
 // for Bug 47 (round-trip empty JSON object) vs Bug 14 (override
 // empty PG array landing as JSON).
-func convertArrayLikeToJSON(v any, col *ir.Column) (any, bool) {
+func convertArrayLikeToJSON(v any, col *ir.Column) (converted any, recognized bool, err error) {
 	switch shaped := v.(type) {
 	case map[string]any:
 		// Cross-engine trigger-CDC path (task #72 / Bug-74 family pin):
@@ -1445,26 +1454,42 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (any, bool) {
 		// top-level JSON array. json.Number leaves marshal to their exact
 		// numeric text (no float widening), preserving numeric precision
 		// inside the document.
+		//
+		// The leaf normalisation the []any arm below runs is deliberately
+		// NOT applied here, and this is a claim rather than an omission:
+		// this arm's only producer is the pgtrigger reader's
+		// decodeJSONBRow, a UseNumber json.Unmarshal, whose leaves are
+		// therefore drawn from {string, json.Number, bool, nil, []any,
+		// map[string]any} and can never be a []byte. Held by
+		// TestConvertArrayLikeToJSON_MapArmHasNoByteLeaves.
 		out, err := json.Marshal(shaped)
 		if err != nil {
-			return nil, false
+			return nil, false, refuseUnmarshalableArrayLike(col, err)
 		}
-		return string(out), true
+		return string(out), true, nil
 	case []any:
-		out, err := json.Marshal(shaped)
+		normalized, err := normalizeArrayLeavesForJSON(shaped, arrayElementType(col), col)
 		if err != nil {
-			return nil, false
+			return nil, false, err
 		}
-		return string(out), true
+		out, err := json.Marshal(normalized)
+		if err != nil {
+			return nil, false, refuseUnmarshalableArrayLike(col, err)
+		}
+		return string(out), true, nil
 	case string:
 		if !looksLikePGArrayLiteral(shaped) {
-			return nil, false
+			return nil, false, nil
 		}
-		converted, err := pgArrayLiteralToJSON(shaped)
-		if err != nil {
-			return nil, false
+		parsed, parseErr := pgArrayLiteralToJSON(shaped)
+		if parseErr != nil {
+			// Deliberately NOT surfaced: a failed parse is the shape
+			// DISAMBIGUATION (a JSON object is not an array literal), so
+			// the answer is "not this branch", not "bad value". The caller
+			// falls through to the next prepareValue branch.
+			return nil, false, nil //nolint:nilerr // a parse failure is a shape verdict, not an error
 		}
-		return converted, true
+		return parsed, true, nil
 	case []byte:
 		// A `[]byte` for a JSON-target column is normally already
 		// valid JSON (the canonical IR shape for ir.JSON values).
@@ -1497,24 +1522,270 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (any, bool) {
 		// to the next branch in [prepareValue] which emits `"{}"`
 		// (the JSON-object preservation Bug 47 demands).
 		if len(shaped) < 2 || shaped[0] != '{' || shaped[len(shaped)-1] != '}' {
-			return nil, false
+			return nil, false, nil
 		}
 		if len(shaped) == 2 {
 			// Empty `{}`. Only treat as PG empty array when an
 			// override carries that intent in SourceColumnType.
 			if col != nil {
 				if _, fromArray := col.SourceColumnType.(ir.Array); fromArray {
-					return "[]", true
+					return "[]", true, nil
 				}
 			}
-			return nil, false
+			return nil, false, nil
 		}
 		if converted, err := pgArrayLiteralToJSON(string(shaped)); err == nil {
-			return converted, true
+			return converted, true, nil
 		}
-		return nil, false
+		return nil, false, nil
 	}
-	return nil, false
+	return nil, false, nil
+}
+
+// arrayElementType resolves the scalar leaf type of an array-valued
+// column, or nil when the column is not (and did not start as) an
+// array. Both spellings are consulted because both reach this writer:
+// on the migrate/CDC lanes the column's own Type is the [ir.Array],
+// while a `--type-override=col=jsonb` rewrites Type to [ir.JSON] and
+// parks the pre-override array in SourceColumnType (the Bug 14 / Bug 47
+// disambiguation next door already leans on that field).
+//
+// [ir.Array.Element] is the SCALAR leaf even for a multi-dimensional
+// value — the PG reader's Bug-68 contract — so one element type
+// describes every depth, which is what lets
+// [normalizeArrayLeavesForJSON] recurse with a single type.
+func arrayElementType(col *ir.Column) ir.Type {
+	if col == nil {
+		return nil
+	}
+	if arr, ok := col.Type.(ir.Array); ok {
+		return arr.Element
+	}
+	if arr, ok := col.SourceColumnType.(ir.Array); ok {
+		return arr.Element
+	}
+	return nil
+}
+
+// normalizeArrayLeavesForJSON walks a (possibly nested) IR array value
+// and replaces each LEAF with the form [encoding/json] renders
+// faithfully for that element family. Nested []any are dimensions and
+// recurse; a nil slot is a SQL NULL element and stays nil (JSON null).
+func normalizeArrayLeavesForJSON(v []any, elem ir.Type, col *ir.Column) ([]any, error) {
+	out := make([]any, len(v))
+	for i, e := range v {
+		if e == nil {
+			continue
+		}
+		if nested, isNested := e.([]any); isNested {
+			inner, err := normalizeArrayLeavesForJSON(nested, elem, col)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = inner
+			continue
+		}
+		leaf, err := arrayLeafForJSON(e, elem, col)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = leaf
+	}
+	return out, nil
+}
+
+// arrayLeafForJSON is the MySQL target's per-element-family leaf policy
+// — the counterpart to the Postgres writer's convertArray arms, and the
+// thing whose ABSENCE was the defect.
+//
+// # What was wrong
+//
+// This function used to not exist: the []any went straight to
+// json.Marshal, so every leaf got Go's default rendering. That is
+// correct for the native families (int64/float64/bool → JSON scalars)
+// and for every string-shaped one (text/varchar/char/uuid/inet/cidr/
+// macaddr/decimal → JSON strings), which is why it survived so long.
+// It is NOT correct for the two families whose IR-canonical leaf is a
+// `[]byte`, because Go renders a []byte as BASE64:
+//
+//	PG json[]  {"{\"a\":1}"}  →  ["eyJhIjoxfQ=="]
+//	PG bytea[] {"\\xdead"}    →  ["3q0="]
+//
+// The first is silent loss — a queryable JSON document replaced by an
+// opaque token, exit 0, row counts matching. The second is reversible
+// but was undeclared and unpinned, so nothing stopped it drifting.
+// Roadmap item 145 fixed exactly this family for the POSTGRES target
+// and swept the Postgres side; the MySQL target was never enumerated.
+//
+// # The two families, and why each lands the way it does
+//
+//   - json / jsonb (ir.JSON) — the document's own TEXT, carried as a
+//     JSON *string*. MySQL has no array type, so the target column is
+//     JSON and the obvious alternative is to NEST the document as a
+//     JSON value. That is rejected, for the reason item 145 rejected
+//     the trigger door: nesting makes a JSON `null` DOCUMENT
+//     byte-identical to a SQL NULL element, and makes an array-valued
+//     document (`[1,2]`) byte-identical to a nested dimension. Both
+//     are real, both are unrecoverable, and both would be silent.
+//     Carrying the text keeps every distinction and loses nothing: a
+//     consumer reaches the document with JSON_UNQUOTE. It is also what
+//     the sibling lane already does — [pgArrayLiteralToJSON] emits
+//     every element of a PG array LITERAL as a JSON string — so the
+//     two lanes now agree instead of diverging by door.
+//   - bytea (ir.Binary/Varbinary/Blob) — base64, DECLARED. There is no
+//     faithful JSON representation of arbitrary bytes; base64 is the
+//     universal one, it is reversible, and it is what the pre-fix
+//     accident already produced, so declaring it changes no stored
+//     value. What it adds is a name, a test and a wart note. The
+//     trigger door's `\x`-hex STRING leaf is hex-decoded to the same
+//     base64 rather than stored as its ASCII, so the two doors agree —
+//     the same discipline [byteaArrayLeaf] applies on the PG side, and
+//     the same one the scalar branch of [prepareValue] applies above.
+//
+// # WART: base64 is a ONE-WAY projection, and nothing reads it back
+//
+// sluice cannot reconstruct either family from a MySQL target. The
+// MySQL schema reader never emits [ir.Array] (there is no arm in its
+// translateType), so a MySQL-sourced JSON column carrying
+// `["3q0="]` migrates onward as a jsonb DOCUMENT holding that string,
+// not as a bytea[]. That asymmetry is a property of MySQL having no
+// array type, not of this encoding — the json[] text form has it too —
+// but it only shows up on a round trip, so it is named here rather
+// than left to be discovered. Pinned by
+// TestArrayLeafForJSON_NoMySQLReaderReconstructsAnArray.
+//
+// # Every other family, and the refusal
+//
+// Anything that is not one of the two []byte families passes through
+// untouched, because Go's default rendering IS the faithful one for
+// them (the pins are in TestArrayLeafForJSON_FamilyMatrix). But a
+// []byte leaf on such a family is refused loudly rather than base64'd:
+// the PG reader produces []byte leaves for bytea and json/jsonb ONLY,
+// so a []byte anywhere else means the element type and the value have
+// diverged, and guessing between "these are bytes" and "this is a
+// document" is the exact ambiguity roadmap item 135 removed.
+//
+// # The CDC applier lane, which has NO element type — and why it refuses
+//
+// The refusal above also catches the one lane that cannot resolve the
+// family at all. A ChangeApplier reads its column descriptors from the
+// TARGET's information_schema, where MySQL renders both `json[]` and
+// `bytea[]` as the same `JSON` column — so [arrayElementType] returns
+// nil and both families arrive here as the same `[]byte`. Refusing is
+// the only honest answer: whichever encoding were guessed, the cold
+// copy (which DOES see the source element type) would have used the
+// other for one of the two families, and the same column would disagree
+// with itself with no error on either side.
+//
+// That refusal arrives mid-stream, so pipeline's
+// preflightArrayBytesLeafOnCDC turns it into an early one at sync
+// cold-start and `schema add-table` — the same shape, and the same two
+// call sites, as preflightBinaryTargetColumnsOnCDC. This arm is the
+// backstop that keeps the halves that preflight does NOT reach (warm
+// resume, the multi-database fan-out) loud rather than silent. Pinned by
+// TestArrayLeafForJSON_CDCApplierLaneRefusesRatherThanGuesses.
+func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
+	switch elem.(type) {
+	case ir.JSON:
+		switch j := x.(type) {
+		case []byte:
+			if len(j) == 0 {
+				return nil, refuseArrayLeaf(col, errors.New(
+					"a json/jsonb array element is empty, which is not a valid JSON document",
+				))
+			}
+			return string(j), nil
+		case json.RawMessage:
+			if len(j) == 0 {
+				return nil, refuseArrayLeaf(col, errors.New(
+					"a json/jsonb array element is empty, which is not a valid JSON document",
+				))
+			}
+			return string(j), nil
+		case string:
+			// The array-text lane's leaf: decodePGArrayText hands the
+			// element's rendered document straight through as a string.
+			return j, nil
+		}
+		return nil, refuseArrayLeaf(col, fmt.Errorf(
+			"a json/jsonb array element arrived as %T; the IR-canonical leaf is the document's bytes", x,
+		))
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		switch b := x.(type) {
+		case []byte:
+			return base64.StdEncoding.EncodeToString(b), nil
+		case string:
+			// The pgtrigger change-payload leaf. to_jsonb renders a
+			// bytea through bytea_output, which the capture clause PINS
+			// to hex, so the rendering is DECIDED and anything else is
+			// refused rather than guessed at.
+			if raw, decoded := decodeHexByteaText(b); decoded {
+				return base64.StdEncoding.EncodeToString(raw), nil
+			}
+			return nil, refuseArrayLeaf(col, fmt.Errorf(
+				"a bytea array element carries %q, which is not the even-hex `\\x` form "+
+					"`bytea_output = hex` produces", truncateByteaForError(b),
+			))
+		}
+		return nil, refuseArrayLeaf(col, fmt.Errorf(
+			"a bytea array element arrived as %T; the IR-canonical leaf is []byte", x,
+		))
+	}
+	if b, isBytes := x.([]byte); isBytes {
+		return nil, refuseArrayLeaf(col, fmt.Errorf(
+			"an array element of family %s arrived as %d raw bytes; only json/jsonb and bytea elements "+
+				"have a byte-shaped leaf, so this value and its declared element type disagree "+
+				"(base64-encoding it would silently replace the value with an opaque token)",
+			elementFamilyForError(elem), len(b),
+		))
+	}
+	return x, nil
+}
+
+// elementFamilyForError renders an array element type for a refusal
+// message, including the "no element type at all" case.
+func elementFamilyForError(elem ir.Type) string {
+	if elem == nil {
+		return "(unresolved — the column is not declared as an array)"
+	}
+	return fmt.Sprintf("%T", elem)
+}
+
+// refuseArrayLeaf wraps a per-element fidelity refusal with the column
+// name and the SLUICE-E-VALUE-UNREPRESENTABLE code, so the operator
+// sees which column stopped the copy rather than a bare type name.
+func refuseArrayLeaf(col *ir.Column, cause error) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeValueUnrepresentable,
+		"exclude the column, or --type-override it to a text type and parse it downstream",
+		fmt.Errorf("column %q: %w", columnNameForError(col), cause),
+	)
+}
+
+// refuseUnmarshalableArrayLike reports a value that reached
+// [encoding/json] and could not be rendered at all. The reachable case
+// is a non-finite float LEAF (NaN / ±Inf), which the top-level
+// [refuseUnrepresentableFloat] cannot see because it type-asserts the
+// whole value.
+func refuseUnmarshalableArrayLike(col *ir.Column, cause error) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeValueUnrepresentable,
+		"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+		fmt.Errorf(
+			"column %q holds a value MySQL's JSON type cannot represent: %w "+
+				"(a NaN or ±Infinity element is the usual cause — JSON has no token for either)",
+			columnNameForError(col), cause,
+		),
+	)
+}
+
+// columnNameForError names a column for a refusal message, tolerating
+// the nil descriptor the applier's cache-miss lane can pass.
+func columnNameForError(col *ir.Column) string {
+	if col == nil {
+		return "(unknown column)"
+	}
+	return col.Name
 }
 
 // looksLikePGArrayLiteral is a cheap pre-filter: a Postgres array

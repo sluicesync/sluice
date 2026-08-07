@@ -402,6 +402,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	// The byte-shaped array-leaf half of the same shape — a source element
+	// type the applier's target-derived columns cannot carry. Keyed on the
+	// target ENGINE, not the catalog, because the table being added
+	// normally does not exist on the target yet.
+	if err := preflightArrayBytesLeafOnCDC(scoped, engineNameOrEmpty(a.Target), "add-table"); err != nil {
+		return err
+	}
 
 	// ---- 3a. Create the target table BEFORE publication-add
 	// (ADR-0036 Phase B fix). The Phase A diagnose work pinned the

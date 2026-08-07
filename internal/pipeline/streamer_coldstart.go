@@ -1005,6 +1005,21 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			return nil, err
 		}
 	}
+	// The same hazard SHAPE — a source-side distinction the applier's
+	// target-derived column types cannot carry — for the array families
+	// whose element leaf is byte-shaped. Deliberately NOT inside the
+	// catalog-read block above: the offending column is usually one
+	// sluice is about to CREATE, so a catalog-keyed check would find
+	// nothing and no-op on exactly the ordinary fresh cold start. It asks
+	// the target ENGINE instead and needs no connection. Ordered last so
+	// a target that is wrong in several ways reports the older, more
+	// general verdicts first.
+	if err := preflightArrayBytesLeafOnCDC(schema, engineNameOrEmpty(s.Target), "sync cold-start"); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return nil, err
+	}
 	return createSchema, nil
 }
 

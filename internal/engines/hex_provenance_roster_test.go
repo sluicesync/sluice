@@ -148,6 +148,19 @@ var hexDecodeRoster = map[string]hexSiteVerdict{
 			"bytea rendering or the source's own bytes (audit B-2). Pinned by " +
 			"TestPrepareValue_ByteaProvenanceMatrix + TestByteaProvenance_MySQLWriteCores.",
 	},
+	"mysql.arrayLeafForJSON": {
+		decidedByProvenance,
+		"the ARRAY leaf, and the lane is decided by the leaf's Go TYPE, not its content: the " +
+			"SQL doors (row scan, pgoutput) hand a bytea element back as []byte, which is " +
+			"copied verbatim and never inspected, while ONLY the pgtrigger change payload " +
+			"delivers a string — and to_jsonb renders bytea through bytea_output, which the " +
+			"capture clause PINS to hex (pgtrigger/setup.go). So a string here is a rendering " +
+			"by construction; anything that is not `\\x`+even-hex is refused rather than " +
+			"guessed at. Same discipline as postgres.byteaArrayLeaf, which this mirrors on " +
+			"the other target. Pinned by " +
+			"TestArrayLeafForJSON_TriggerDoorByteaAgreesWithTheSQLDoor (the two doors must " +
+			"produce the SAME base64) and the refusal rows of TestArrayLeafForJSON_LoudRefusals.",
+	},
 	"mysql.decodeMySQLHexToken": {
 		decidedByGrammar,
 		"a DDL DEFAULT token from SHOW CREATE TABLE, in a grammar position where a `0x` " +

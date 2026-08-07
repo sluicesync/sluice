@@ -393,6 +393,17 @@ MySQL has no array type.
 
 **Default policy:** emit as `JSON`. Reads and writes serialise/deserialise transparently in the row pipeline — a PG array value (`text[]`/`int[]`, incl. empty `{}`→`[]`, NULL whole-column→SQL NULL, NULL element→JSON `null`, nested→nested) is serialised to JSON text on all three MySQL write paths (LOAD DATA, batched INSERT, CDC apply) via the shared `prepareValue` chokepoint (v0.69.0 / Bug #18 — earlier releases crashed the LOAD DATA serializer on a non-empty array column).
 
+**Per-element encoding.** Each element is rendered as the JSON value its family maps to: booleans and integers/floats as JSON scalars; `numeric` as a JSON **string** (the IR carries it as its exact decimal text, and a JSON number would round-trip through `float64` in most consumers); `text`/`varchar`/`char`/`uuid`/`inet`/`cidr`/`macaddr` and the time-of-day families as JSON strings; `date`/`timestamp`/`timestamptz` as RFC 3339 strings. Two families have no scalar JSON form and get a stated encoding rather than a default one:
+
+- **`json[]` / `jsonb[]`** — each element is carried as the document's **exact text inside a JSON string** (`{"{\"a\":1}"}` → `["{\"a\":1}"]`), reached with `JSON_UNQUOTE`. Nesting the document as a JSON value would read more naturally and is deliberately not done: it would make a JSON `null` document indistinguishable from a SQL `NULL` element, and an array-valued document (`[1,2]`) indistinguishable from a nested array dimension. Both losses would be silent, so the text form is used and every distinction survives.
+- **`bytea[]`** — each element is **base64** (`{"\xdead"}` → `["3q0="]`). Raw bytes have no JSON representation; base64 is reversible and is the value PostgreSQL's own `encode(col, 'base64')` produces for the same element.
+
+Both encodings are **one-way**: sluice never reconstructs an `ir.Array` from a MySQL source (the MySQL schema reader has no array arm), so a later MySQL → Postgres migration of such a column lands a `jsonb` document holding those strings, not the original `json[]`/`bytea[]`. That is a consequence of MySQL having no array type, not of the encoding.
+
+An element whose value and declared element family disagree — a byte-shaped leaf on a family that has no byte-shaped leaf, or a `bytea` element that is not the `\x`+even-hex rendering `bytea_output = hex` produces — is **refused loudly** (`SLUICE-E-VALUE-UNREPRESENTABLE`) naming the column, never base64'd on a guess. So is a `NaN`/`±Infinity` float element, which JSON has no token for.
+
+**`json[]`/`jsonb[]`/`bytea[]` are `migrate`-only against a MySQL target.** A continuous-sync run is **refused at cold-start preflight** naming the column. The change applier reads column types from the *target*, where both families are the same `JSON` column, so it cannot tell which of the two encodings above applies — and the bytes cannot decide it either, since a `bytea` may legitimately spell a JSON document. Guessing would make the cold copy and every later CDC apply encode the same column differently with no error on either side, so sluice refuses instead. Every other array element family (text, numeric, temporal, uuid, network, native) syncs normally. Use `sluice migrate` for a one-shot copy, or `--exclude-table`.
+
 **Override:** `array_strategy: json | concat`. The `concat` option is offered for simple scalar arrays where a comma-delimited string is preferable.
 
 ### JSON semantics
