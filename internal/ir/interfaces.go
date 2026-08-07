@@ -3842,11 +3842,18 @@ type FilteredSnapshotResumer interface {
 // flood of internal-state churn that bears no relation to user data.
 //
 // The DSN is supplied so the engine can return DSN-derived defaults
-// (e.g. v0.8.1's PlanetScale hostname auto-detect for the vanilla
-// MySQL flavor: `*.connect.psdb.cloud` endpoints carry Vitess shadow
+// (e.g. v0.8.1's PlanetScale hostname auto-detect for the non-VStream
+// MySQL flavors: `*.connect.psdb.cloud` endpoints carry Vitess shadow
 // tables even when the operator chose `--source-driver=mysql`). An
 // empty DSN is acceptable — engines fall back to flag-keyed
 // defaults.
+//
+// Note that on `migrate` and `sync` that particular pairing no longer
+// gets here: [DSNValidator] refuses a non-VStream MySQL flavor aimed
+// at a PlanetScale host before any phase runs. The DSN-keyed branch
+// survives for the entry points that run no such preflight — see the
+// implementation's own comment in the mysql engine, and the call-site
+// roster it names.
 type DefaultTableExcluder interface {
 	// DefaultExcludePatterns returns a list of glob patterns to
 	// merge into the operator's exclude list. Empty / nil disables

@@ -37,6 +37,15 @@ func TestValidateDSN(t *testing.T) {
 	}{
 		{"vanilla rejects public psdb host", FlavorVanilla, publicPSDB, true, "planetscale"},
 		{"vanilla rejects private psdb host", FlavorVanilla, privatePSDB, true, "planetscale"},
+		// MariaDB is the FOURTH flavor and the second non-VStream one:
+		// the guard is `!usesVStream()`, not `== FlavorVanilla`, so it
+		// refuses too. It went unpinned here from v0.100.0 until
+		// 2026-08-07 while the docs described the refusal as a vanilla-
+		// only rule — one flavor of a flavor-dispatched branch is not
+		// coverage of the branch.
+		{"mariadb rejects public psdb host", FlavorMariaDB, publicPSDB, true, "planetscale"},
+		{"mariadb rejects private psdb host", FlavorMariaDB, privatePSDB, true, "planetscale"},
+		{"mariadb accepts a normal tcp host", FlavorMariaDB, normalHost, false, ""},
 		{"planetscale accepts public psdb host", FlavorPlanetScale, publicPSDB, false, ""},
 		{"planetscale accepts private psdb host", FlavorPlanetScale, privatePSDB, false, ""},
 		{"vitess accepts psdb host", FlavorVitess, publicPSDB, false, ""},

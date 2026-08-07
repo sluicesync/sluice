@@ -18,7 +18,14 @@ Fourteen engines are registered (`sluice engines` lists them): `mysql`, `mariadb
 | **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
 | **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-Every cell supports one-shot `migrate`; every cell whose source has a CDC mode (next section) also supports continuous `sync`. MySQL flavors (vanilla, MariaDB, PlanetScale, Vitess) share one engine implementation with per-flavor `Capabilities` declarations; MariaDB is first-class since v0.99.268 (native `uuid`/`inet6`/`inet4` carry, domain-GTID CDC, JSON-via-`json_valid`). A `*.connect.psdb.cloud` host also works under `--source-driver mysql` (binlog CDC) with the Vitess `_vt_*` shadow tables auto-excluded.
+Every cell supports one-shot `migrate`; every cell whose source has a CDC mode (next section) also supports continuous `sync`. MySQL flavors (vanilla, MariaDB, PlanetScale, Vitess) share one engine implementation with per-flavor `Capabilities` declarations; MariaDB is first-class since v0.99.268 (native `uuid`/`inet6`/`inet4` carry, domain-GTID CDC, JSON-via-`json_valid`).
+
+A PlanetScale MySQL host needs a VStream driver. `migrate` and `sync` **refuse** such a host under `--source-driver mysql` or `--source-driver mariadb` (and the `--target-driver` equivalents) with `SLUICE-E-DRIVER-HOST-MISMATCH`, from the DSN string alone and before any connection: those flavors drive binlog CDC and `LOAD DATA` cold-copy, both of which Vitess blocks, so the run would otherwise fail obscurely partway through. Use `--source-driver planetscale` — or `vitess` for a self-hosted Vitess — which gets VStream CDC with the Vitess `_vt_*` shadow tables auto-excluded. That preflight runs on `migrate` and `sync` only; the schema-read and backup surfaces (`schema diff`, `schema preview`, `backup`) do not consult it, and a non-VStream driver still gets the `_vt_*` auto-exclusion there.
+
+<!-- psdb-mysql-host-suffixes: *.connect.psdb.cloud, *.private-connect.psdb.cloud -->
+<!-- psdb-mysql-host-drivers: mariadb=refused, mysql=refused, planetscale=ok, vitess=ok -->
+
+The two markers above are derived, not maintained by hand: `TestPSDBMySQLHostDriverClaimMatchesTheCode` reads the endpoint suffixes out of the engine source and then asks every registered driver what it actually does with a host under each one, failing the build when this page, the README, or the error-code reference disagrees. This page told operators the opposite — that such a host "also works under `--source-driver mysql`" — for every release from v0.100.0 on, because the same sentence lives in three places and each of the two previous corrections fixed one of them. The gate is the difference between correcting it a third time and it staying correct.
 
 Cross-engine type translation covers the common surfaces (PG `UUID`/`INET`/`MACADDR`/`ARRAY` ↔ MySQL equivalents, `TINYINT(1)` ↔ `BOOLEAN`, `ENUM`/`SET`, PostGIS geometry with SRID, generated-column and `CHECK` idioms — see [translator-catalog](translator-catalog.md)); anything it cannot translate refuses loudly, with `--type-override` and `--expr-override` as the per-column escape hatches.
 

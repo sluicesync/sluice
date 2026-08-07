@@ -103,7 +103,11 @@ sluice is built around three product surfaces, each independently runnable:
 | **Diff** a target against what sluice would produce | `sluice schema diff` |
 | **Verify** that every row made it across | `sluice verify` |
 | **Probe** a running sync's freshness against a staleness threshold | `sluice sync health` |
-| Do all of the above against **PlanetScale** | Same commands, with `--source-driver planetscale` (VStream CDC, Vitess `_vt_*` shadow tables auto-excluded). A `*.connect.psdb.cloud` host is **refused** under `--source-driver mysql` (`SLUICE-E-DRIVER-HOST-MISMATCH`) — that driver uses binlog CDC and `LOAD DATA`, both blocked by Vitess |
+| Do all of the above against **PlanetScale** | Same commands, with `--source-driver planetscale` (VStream CDC, Vitess `_vt_*` shadow tables auto-excluded) — or `vitess` for a self-hosted Vitess. A `*.connect.psdb.cloud` / `*.private-connect.psdb.cloud` host is **refused** by `migrate` and `sync` under `--source-driver mysql` or `--source-driver mariadb` (`SLUICE-E-DRIVER-HOST-MISMATCH`) — those drivers use binlog CDC and `LOAD DATA`, both blocked by Vitess |
+
+<!-- psdb-mysql-host-suffixes: *.connect.psdb.cloud, *.private-connect.psdb.cloud -->
+<!-- psdb-mysql-host-drivers: mariadb=refused, mysql=refused, planetscale=ok, vitess=ok -->
+<!-- The two markers above are derived from the mysql engine by internal/docsync's TestPSDBMySQLHostDriverClaimMatchesTheCode; edit the PlanetScale row and the markers together, and see docs/production-readiness.md for the same claim in full. -->
 
 ### The four enterprise-class features that landed in v0.80.0 – v0.83.0
 

@@ -262,8 +262,8 @@ func registeredEngineNamesByPackage(t *testing.T) map[string][]string {
 //
 //   - Several sibling roster files here (bulk_copy_fk_enforcement,
 //     cdc_guide_engines, cdc_mode_engines, index_namespace, index_preflight,
-//     table_namespace, view_namespace) carry the same import list, so the
-//     union survives a deletion in any one of them.
+//     psdb_host_driver, table_namespace, view_namespace) carry the same import
+//     list, so the union survives a deletion in any one of them.
 //   - Engine packages import each other. `sqlite-trigger` and `d1-trigger`
 //     both import `internal/engines/sqlite`, so sqlite (and with it the `d1`
 //     engine) registers whether or not anything blank-imports it directly.

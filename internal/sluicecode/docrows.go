@@ -192,8 +192,8 @@ var docRows = map[Code]docRow{
 		Remedy:  "Declare the file's convention: `--csv-null=''` (an unquoted empty field means NULL — the PostgreSQL COPY CSV convention), or `--csv-null='\\N'` / `--csv-null=NULL` (that literal means NULL; empty fields are then empty strings). A quoted field is always data regardless.",
 	},
 	"SLUICE-E-DRIVER-HOST-MISMATCH": {
-		Meaning: "The chosen driver cannot drive the DSN's host — today: the vanilla `mysql` driver pointed at a PlanetScale endpoint (`*.connect.psdb.cloud`), whose binlog CDC and `LOAD DATA` cold-copy Vitess blocks. Caught up front, before any connection.",
-		Remedy:  "Pass `--source-driver planetscale` / `--target-driver planetscale` for the PlanetScale endpoint.",
+		Meaning: "The chosen driver cannot drive the DSN's host — today: a non-VStream MySQL flavor (`mysql` or `mariadb`) pointed at a PlanetScale MySQL endpoint (`*.connect.psdb.cloud` / `*.private-connect.psdb.cloud`), whose binlog CDC and `LOAD DATA` cold-copy Vitess blocks. Decided from the DSN string alone, so it is caught up front, before any connection. `migrate` and `sync` are the commands that run this preflight; the schema-read and backup surfaces do not.",
+		Remedy:  "Pass `--source-driver planetscale` / `--target-driver planetscale` for the PlanetScale endpoint (or `vitess` for a self-hosted Vitess).",
 	},
 	"SLUICE-E-EXPORT-UNREPRESENTABLE": {
 		Meaning: "`sluice backup export-as-parquet` refused a column type or value that has no faithful Parquet representation: a multi-dimensional array value (the column type declares no dimensionality, so the derived `LIST<element>` schema cannot hold nested lists), a TIME value outside a calendar day (MySQL TIME durations reach ±838h; PG allows `24:00:00`), a PG `NUMERIC` `NaN`/`Infinity` (Parquet DECIMAL has no non-finite form), a decimal with more digits than its declared precision/scale, or a timestamp with sub-microsecond precision. The export never silently narrows, rounds, or wraps a value — the documented string downgrades (unbounded NUMERIC, TIMETZ) carry the exact value text and are WARNs, not this refusal.",

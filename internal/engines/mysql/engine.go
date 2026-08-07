@@ -693,15 +693,13 @@ func (e Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, er
 //     `--source-driver=planetscale`, the flavor declares the default
 //     unconditionally — the operator's choice is unambiguous.
 //
-//  2. **DSN-hostname-keyed (v0.8.1):** when the operator chose
-//     `--source-driver=mysql` (vanilla flavor) but the DSN points at
-//     a PlanetScale endpoint, sluice still applies the exclusion. A
-//     vanilla MySQL connection to a PlanetScale endpoint is a
-//     legitimate configuration — the operator gets binlog CDC
-//     instead of VStream — but the underlying server is still
-//     Vitess and the shadow tables are still there. PlanetScale's
-//     hostnames follow stable patterns that we can sniff at
-//     orchestrator startup before any DB call:
+//  2. **DSN-hostname-keyed (v0.8.1):** when the operator chose a
+//     non-VStream flavor (`mysql` / `mariadb`) but the DSN points at
+//     a PlanetScale endpoint, sluice still applies the exclusion —
+//     the underlying server is still Vitess and the shadow tables
+//     are still there. PlanetScale's hostnames follow stable
+//     patterns that we can sniff at orchestrator startup before any
+//     DB call:
 //
 //     - `*.connect.psdb.cloud` (public PlanetScale MySQL)
 //     - `*.private-connect.psdb.cloud` (AWS PrivateLink)
@@ -711,6 +709,25 @@ func (e Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, er
 //     have `_vt_*` shadow tables; they're noted here for symmetry
 //     and would slot into the PG engine's own `DefaultTableExcluder`
 //     implementation if that future need ever surfaces.
+//
+//     **Which commands can still reach branch 2.** This comment used
+//     to justify the branch by calling that pairing "a legitimate
+//     configuration — the operator gets binlog CDC instead of
+//     VStream". That was true when written and v0.100.0 falsified
+//     it: [Engine.ValidateDSN] now REFUSES it
+//     (`SLUICE-E-DRIVER-HOST-MISMATCH`), and the binlog CDC the
+//     sentence promised only ever happens in `sync`, which is one of
+//     the two commands that refuse. What survives is narrower and
+//     real: `preflightDSNValidation` runs on `migrate` and `sync`
+//     ONLY, so `backup`, `schema diff` and `schema preview` consult
+//     this excluder without ever asking, and there a non-VStream
+//     flavor against a PlanetScale host still needs the `_vt_*`
+//     exclusion. That reachability split is a claim, so it is
+//     rostered rather than asserted:
+//     `TestDefaultExcludeCallSitesRecordTheirDSNPreflight` in
+//     internal/pipeline requires every consult site to record its
+//     preflight verdict, and `TestDSNValidationPreflightCallSites`
+//     fails if the set of validating entry points changes under it.
 //
 // Non-PlanetScale Vitess deployments (custom domains) still need a
 // manual `--exclude-table='_vt_*'`. Auto-detect via `@@version_comment`
@@ -756,10 +773,11 @@ func (e Engine) DiscoverShards(ctx context.Context, dsn string) ([]string, error
 
 // ValidateDSN implements [ir.DSNValidator]: it refuses, from the DSN
 // string alone (no connection), a DSN this flavor cannot faithfully
-// drive. The one such case today is the vanilla MySQL flavor pointed
-// at a PlanetScale endpoint (*.connect.psdb.cloud): the vanilla flavor
-// uses binlog CDC and LOAD DATA cold-copy, both of which Vitess blocks,
-// so the run would otherwise fail obscurely partway through — the
+// drive. The one such case today is a NON-VSTREAM flavor — `mysql` or
+// `mariadb`, the two that reach the guard below — pointed at a
+// PlanetScale endpoint (*.connect.psdb.cloud): those flavors use
+// binlog CDC and LOAD DATA cold-copy, both of which Vitess blocks, so
+// the run would otherwise fail obscurely partway through — the
 // operator wants the `planetscale` driver for a PlanetScale host.
 //
 // The VStream flavors (planetscale / vitess) correctly drive such a
@@ -767,6 +785,14 @@ func (e Engine) DiscoverShards(ctx context.Context, dsn string) ([]string, error
 // doesn't know whether this DSN is the source or the target — so it
 // names the host and the reason; the pipeline supplies the role and
 // the exact --source-driver / --target-driver flag.
+//
+// The operator-facing statement of all of this — which hosts count and
+// which drivers can drive them — is held to this function by
+// `TestPSDBMySQLHostDriverClaimMatchesTheCode` in internal/docsync,
+// which probes every registered driver with a DSN built from each
+// suffix below. Take any "does driver X work against a PlanetScale
+// host" sentence from that gate's markers, not from memory: the docs
+// said the opposite of this code for every release from v0.100.0 on.
 func (e Engine) ValidateDSN(dsn string) error {
 	if e.Flavor.usesVStream() {
 		return nil
