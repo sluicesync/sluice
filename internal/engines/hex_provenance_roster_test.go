@@ -35,6 +35,33 @@
 //     deliberate exclusions, not oversights: none of them is a place
 //     where a stored value's reading is in question.
 //
+// # Two ways this roster is NARROWER than its name, neither a defect
+// today (2026-08-07 review)
+//
+// Stated here rather than left implied, because a gate whose coverage is
+// narrower than its name is worse than no gate — it stops the next
+// reader from looking:
+//
+//   - It is FUNCTION-keyed with first-occurrence dedup (see
+//     findHexDecodeSites). A SECOND hex-decode added inside an
+//     already-blessed function is auto-blessed by the entry that covers
+//     the first — the roster records one verdict per function, and the
+//     new site inherits it whether or not the verdict applies. Checked
+//     rather than assumed: every rostered function today contains
+//     exactly ONE matched call (mydumper's two live in separate
+//     functions — scanBareHexValue and scanQuotedHexValue — and the
+//     `hex.DecodedLen` next to decodeGeometryHexOrRaw's `hex.Decode` is
+//     deliberately not a matched form).
+//   - [isHexDecodeCall] requires the selector base to be the literal
+//     identifier `hex`, so an aliased import (`import ehex
+//     "encoding/hex"`) evades the walk entirely. The
+//     [hexDecodeSiteFloor] catches a wholesale break, not one aliased
+//     site. No engine package aliases the import today.
+//
+// Both are fixable — key by position instead of function, and resolve
+// the import name per file — and neither was worth doing on a
+// release-blocking pass. Filed in docs/dev/audit-backlog.md.
+//
 // A site's verdict is one of three, and each names the thing that DECIDES
 // the reading — never the content:
 //

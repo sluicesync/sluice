@@ -804,6 +804,20 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // migrate's --resume carve-out). Warm resume never creates tables and
 // never reaches this function.
 func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy bool, fresh freshCopyReason) (*ir.Schema, error) {
+	// One gate value for the whole function: the ADR-0166 shape compare
+	// (default branch only) and the CDC-lane binary-column refusal (every
+	// branch) both consult the target catalog, and the gate memoizes that
+	// read so they share ONE answer and ONE round-trip.
+	gate := &existingTablesGate{
+		Source:              s.Source,
+		Target:              s.Target,
+		TargetDSN:           s.TargetDSN,
+		TargetSchema:        s.TargetSchema,
+		EnabledPGExtensions: s.EnabledPGExtensions,
+		Mode:                "sync cold-start",
+	}
+	var createSchema *ir.Schema
+
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
@@ -953,24 +967,45 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// — the reset/restart branches drop the in-scope tables first,
 		// --schema-already-applied skips DDL, and the COPY resume keeps
 		// the resume contract — so the gate lives here alone.
-		g := &existingTablesGate{
-			Source:              s.Source,
-			Target:              s.Target,
-			TargetDSN:           s.TargetDSN,
-			TargetSchema:        s.TargetSchema,
-			EnabledPGExtensions: s.EnabledPGExtensions,
-			Mode:                "sync cold-start",
-		}
-		createSchema, err := g.plan(ctx, schema)
+		plan, err := gate.plan(ctx, schema)
 		if err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return nil, err
 		}
-		return createSchema, nil
+		createSchema = plan
 	}
-	return nil, nil
+
+	// Audit B-2 follow-up: the CDC-lane binary-column refusal, on EVERY
+	// branch above rather than only the one that creates tables. The
+	// hazard is a property of the TARGET's column types, not of this
+	// invocation's flags, so a `migrate --type-override` that made the
+	// column binary and a `sync` with no override at all produce the same
+	// unapplicable cell — and the config-keyed refusal in Run sees
+	// nothing. Reuses the gate's memoized catalog read, so the default
+	// branch still reads the target once; the branches that CLEAR the
+	// target ran before this, so their read finds nothing and this
+	// no-ops. See preflightBinaryTargetColumnsOnCDC for what it does NOT
+	// reach (warm resume, the multi-database fan-out).
+	//
+	// Two deliberate choices, stated because both look like oversights:
+	// it runs AFTER the shape gate, so on the default branch a table that
+	// is wrong in both ways reports the more general mismatch first (the
+	// same precedence plan() gives the shape verdict over the FK one);
+	// and it runs even under --schema-already-applied, which waives the
+	// DDL phases on the operator's promise that the target schema is
+	// compatible. That promise is exactly what this reads one catalog to
+	// check, in the one respect where being wrong is silent.
+	if actual, ok := gate.readTargetTablesForShapeGate(ctx); ok {
+		if err := preflightBinaryTargetColumnsOnCDC(schema, actual, "sync cold-start"); err != nil {
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
+			_ = stream.Abandon()
+			return nil, err
+		}
+	}
+	return createSchema, nil
 }
 
 // coldStartRunCopy runs the bulk-copy phase: the ADR-0079 FAST

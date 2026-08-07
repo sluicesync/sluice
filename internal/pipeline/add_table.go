@@ -263,6 +263,20 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Item 135 / audit B-2: add-table is the SECOND entry point that
+	// hands its own Mappings to a CDC lane — it creates the target column
+	// from the mapped type and then gives the table to the LIVE stream
+	// (ADR-0030), so `--type-override t.c=binary_uuid` here reproduces
+	// exactly the configuration `sync` refuses: this command's own copy
+	// stores the source's bytes, and the running applier — whose column
+	// descriptors come from the target — stores the hex reading of the
+	// same value. Refused here, before any connection, for the same
+	// reasons and with the same message. The roster that keeps this list
+	// honest is TestMappingsCDCLaneRoster.
+	if err := preflightBinaryTypeOverrideOnCDC(a.Mappings); err != nil {
+		return err
+	}
+
 	slog.InfoContext(
 		ctx, "add-table starting",
 		slog.String("source", a.Source.Name()),
@@ -368,6 +382,25 @@ func (a *AddTable) Run(ctx context.Context) error {
 
 	if err := preflightAddTable(ctx, a.Source, scoped, rw); err != nil {
 		return err
+	}
+
+	// The SCHEMA-keyed half of the same refusal (see
+	// preflightBinaryTargetColumnsOnCDC): a pre-existing EMPTY target
+	// table whose column is already binary passes the emptiness check
+	// above and is then fed by the live stream, with no override on this
+	// command line for the config check to see. The usual case is that
+	// the table does not exist yet, and the catalog read finds nothing.
+	addGate := &existingTablesGate{
+		Source:       a.Source,
+		Target:       a.Target,
+		TargetDSN:    a.TargetDSN,
+		TargetSchema: preflight.resolvedTargetSchema,
+		Mode:         "add-table",
+	}
+	if actual, ok := addGate.readTargetTablesForShapeGate(ctx); ok {
+		if err := preflightBinaryTargetColumnsOnCDC(scoped, actual, "add-table"); err != nil {
+			return err
+		}
 	}
 
 	// ---- 3a. Create the target table BEFORE publication-add

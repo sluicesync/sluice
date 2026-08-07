@@ -434,6 +434,17 @@ type Column struct {
 	// Producers other than translate.ApplyMappings leave this nil;
 	// readers should never populate it (the field carries
 	// override-context, not the raw source-engine type).
+	//
+	// It deliberately does NOT ride the wire ([columnWire] has no field
+	// for it), so every column rebuilt from a backup manifest or any
+	// other persisted schema arrives nil and behaves as it did before
+	// the override-provenance readers existed. That is sound — restore
+	// applies no overrides — and it is load-bearing: MySQL's writer
+	// treats a nil as "natively binary" (columnIsNativelyBinary, audit
+	// B-2), so putting the field on the wire would make restore decide
+	// bytea provenance from what an OLD manifest recorded. Pinned by
+	// TestColumnWire_DoesNotCarrySourceColumnType, which is also where
+	// to record the decision if Bug 47 ever needs it persisted.
 	SourceColumnType Type
 
 	// SluiceInjected marks a column that sluice itself added to the

@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -76,6 +77,63 @@ func TestPreflightBinaryTypeOverrideOnCDC_NoOpCases(t *testing.T) {
 		{Table: "t", Column: "c", TargetType: "not_a_real_alias"},
 	}); err != nil {
 		t.Errorf("unknown alias refused HERE; ApplyMappings owns that error: %v", err)
+	}
+}
+
+// TestAddTableRefusesBinaryTypeOverride drives the refusal through
+// [AddTable.Run] — the entry point, not the predicate.
+//
+// The refusal shipped wired into `sync` only. add-table carries the same
+// `Mappings` field, exposes the same `--type-override` flag, creates the
+// target column from the mapped type and then hands the table to the
+// LIVE stream, so `sluice schema add-table --type-override t.c=bytea`
+// reproduced the refused configuration exactly: add-table's own copy
+// stored six bytes and the running applier then stored two, exit 0, row
+// counts matching.
+//
+// The second assertion is the ORDERING. The target fake records its
+// OpenRowWriter calls and its applier carries NO streams, so a refusal
+// that fired late would surface as the no-such-stream error instead —
+// and a refusal that fires after the writers are open is one that has
+// already touched the operator's databases.
+func TestAddTableRefusesBinaryTypeOverride(t *testing.T) {
+	tgt := newAddTableTargetEngine("target")
+	a := &AddTable{
+		Source: newAddTableSourceEngine("source"), Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "s", TableName: "docs",
+		Mappings: []config.Mapping{{Table: "docs", Column: "body", TargetType: "bytea"}},
+	}
+	err := a.Run(context.Background())
+	if err == nil {
+		t.Fatal("add-table accepted a binary --type-override; the live stream's applier reads " +
+			"column types from the TARGET and would store a `\\x`+hex value SHORT")
+	}
+	if !errors.Is(err, errBinaryOverrideOnCDC) {
+		t.Errorf("err = %v; want the errBinaryOverrideOnCDC sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "docs.body=bytea") {
+		t.Errorf("err = %v; want it to name the offending override", err)
+	}
+	if tgt.openRowWriterCalls != 0 {
+		t.Errorf("target row writer was opened %d time(s) before the refusal; it must fire "+
+			"before any connection", tgt.openRowWriterCalls)
+	}
+}
+
+// TestAddTableAllowsNonBinaryTypeOverride is the anti-over-refusal half:
+// add-table must still take the ordinary overrides. It fails further in
+// (the fake carries no stream row), so the success signal is that the
+// error is anything OTHER than the binary refusal.
+func TestAddTableAllowsNonBinaryTypeOverride(t *testing.T) {
+	a := &AddTable{
+		Source: newAddTableSourceEngine("source"), Target: newAddTableTargetEngine("target"),
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "s", TableName: "docs",
+		Mappings: []config.Mapping{{Table: "docs", Column: "body", TargetType: "jsonb"}},
+	}
+	if err := a.Run(context.Background()); errors.Is(err, errBinaryOverrideOnCDC) {
+		t.Errorf("--type-override docs.body=jsonb was refused as binary: %v", err)
 	}
 }
 

@@ -56,6 +56,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -86,6 +87,14 @@ type existingTablesGate struct {
 	EnabledPGExtensions []string
 
 	Mode string
+
+	// catalog / catalogOK / catalogRead memoize the one target-catalog
+	// read (see readTargetTablesForShapeGate). Not exported and not
+	// safe to share: a gate value is constructed per run, used, and
+	// dropped.
+	catalog     map[string]*ir.Table
+	catalogOK   bool
+	catalogRead bool
 }
 
 // phasePlanExistingTables is the Migrator's thin delegate onto the
@@ -251,11 +260,37 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 // the target engine's own SchemaReader (the schema-diff surface),
 // indexed by table name. ok=false means the compare is uncomputable —
 // already WARNed — and the caller must fall back to today's behavior.
+//
+// The result is MEMOIZED on the gate (one gate value per run, never
+// shared or reused across runs), because two consumers now ask for the
+// same catalog on the sync cold start: this shape compare and the
+// CDC-lane binary-column refusal (preflightBinaryTargetColumnsOnCDC).
+// One catalog read, and — load-bearing for the refusal's message — one
+// consistent answer for both.
 func (g *existingTablesGate) readTargetTablesForShapeGate(ctx context.Context) (map[string]*ir.Table, bool) {
+	if g.catalogRead {
+		return g.catalog, g.catalogOK
+	}
+	g.catalog, g.catalogOK = g.readTargetTablesUncached(ctx)
+	g.catalogRead = true
+	return g.catalog, g.catalogOK
+}
+
+func (g *existingTablesGate) readTargetTablesUncached(ctx context.Context) (map[string]*ir.Table, bool) {
 	warnFallback := func(step string, err error) {
 		slog.WarnContext(ctx,
 			g.Mode+": cannot read the target's existing tables — skipping the pre-create shape compare AND the pre-existing-foreign-key check (pre-existing same-name tables are tolerated as before; a foreign key the target already carries would surface mid-copy as MySQL Error 1452 / Postgres SQLSTATE 23503)",
 			slog.String("step", step), slog.String("err", err.Error()))
+	}
+	if g.Target == nil {
+		// Not reachable from either orchestrator (both validate a
+		// non-nil target before any phase runs), but the CDC-lane
+		// binary-column refusal now asks for this catalog on cold-start
+		// branches that previously touched nothing — so an
+		// incompletely-wired caller gets the documented uncomputable
+		// fallback rather than a nil dereference.
+		warnFallback("open target schema reader", errors.New("target engine is nil"))
+		return nil, false
 	}
 	tr, err := g.Target.OpenSchemaReader(ctx, g.TargetDSN)
 	if err != nil {
