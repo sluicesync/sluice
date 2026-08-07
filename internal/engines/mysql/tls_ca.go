@@ -143,7 +143,7 @@ func binlogTLSModeLabel(rawMode string, tc *tls.Config) string {
 func (Engine) DSNWithVerifyCATLS(dsn, caPath string) (string, error) {
 	if v, ok := dsnParamValue(dsn, "tls"); ok {
 		return "", fmt.Errorf(
-			"--tls-ca conflicts with the explicit tls=%q parameter already in the DSN; "+
+			"--source-tls-ca/--target-tls-ca conflicts with the explicit tls=%q parameter already in the DSN; "+
 				"supply exactly one (the flag provides CA-pinned verify-ca TLS)", v,
 		)
 	}

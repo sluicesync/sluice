@@ -75,7 +75,17 @@ type errorHint struct {
 
 	// hint is the line emitted after the wrapped error. No leading
 	// "hint:" prefix; that's added by WrapWithHint.
+	//
+	// It is the COMMAND-NEUTRAL text: every command that reaches this
+	// phase sees it unless perCommand carries a sharper one, so it must
+	// name no flag that is not valid on every one of them. See
+	// hints_command.go for why (Bug 230).
 	hint string
+
+	// perCommand overrides hint for one kong command path, so a remedy
+	// can name the flags THAT command accepts. Absent = the neutral text,
+	// which is less specific but never unrunnable.
+	perCommand map[Command]string
 
 	// code is the stable machine-parsable identifier for this hint's
 	// error class (docs/operator/error-codes.md). Every entry MUST
@@ -84,6 +94,62 @@ type errorHint struct {
 	// metadata; the human-facing message is unchanged.
 	code sluicecode.Code
 }
+
+// Per-command remedy prose, assembled from shared fragments so the same
+// explanation is not maintained in three near-copies. The naming is
+// mechanical: <entry>Explain is the part every command sees, <entry>ForX the
+// clause only command X can act on. See hints_command.go for the rule these
+// exist to satisfy (a text names only flags its command accepts).
+const (
+	// The bulk-copy catch-all (Bug 114's hint, Bug 230's defect). The
+	// "earlier tables" framing is itself command-specific: `schema
+	// add-table` copies exactly one table, so there are no earlier tables.
+	copyFailedEarlierTables = "any earlier tables in this run have data but NOT their declared secondary indexes " +
+		"(the indexes phase runs after ALL tables finish bulk-copy); "
+
+	// PlanetScale statement-time wall, index phase (errno 3024).
+	psIndexWallExplain = "the index build hit PlanetScale's statement-time limit (errno 3024); " +
+		"the data is already copied"
+	psIndexWallResumeForMigrate = ", so --resume finishes just the indexes with NO re-copy (increase the " +
+		"PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit)"
+	psIndexWallGrowOnly = ". Increase the PlanetScale resource size first — a larger cluster builds the index " +
+		"faster, more likely under the limit"
+	psIndexWallUpfrontAndToken = ". Alternatively start fresh with --upfront-indexes to build indexes during " +
+		"the copy — or, with safe migrations ON, give sluice a PlanetScale service token (--planetscale-org + " +
+		"PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN) and it builds the index via a deploy request automatically (ADR-0148)"
+	psIndexWallTokenNeutral = " — or, with safe migrations ON, give sluice a PlanetScale service token (this " +
+		"command's PlanetScale org setting + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN) and it builds the index via a " +
+		"deploy request automatically (ADR-0148)"
+
+	// PlanetScale safe-migrations direct-DDL block (errno 1105).
+	psDirectDDLExplain = "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; " +
+		"give sluice a service token ("
+	psDirectDDLTokenFlags   = "--planetscale-org + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN env"
+	psDirectDDLTokenNeutral = "this command's PlanetScale org setting + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN env"
+	psDirectDDLRemedy       = ") and it builds the indexes through a deploy request automatically (ADR-0148), " +
+		"or disable safe migrations on the branch for the migration"
+
+	// PlanetScale statement-time wall, constraints phase (roadmap item 109).
+	psFKWallExplain = "the foreign-key build hit PlanetScale's statement-time limit (errno 3024); ADD FOREIGN " +
+		"KEY validates every child row against the parent, so on a large table it is heavier than an index " +
+		"build and cannot finish under the ~900 s wall"
+	psFKWallResumeForMigrate = " — and --resume re-runs the identical validating ADD and re-hits the same wall, " +
+		"so it never converges"
+	psFKWallFlagRemedy = ". An UNFILTERED migrate adds such a constraint metadata-only automatically (the " +
+		"copied rows are FK-consistent by construction), so you are seeing this because a --where row filter " +
+		"is active (which can legitimately orphan children, so validation is kept) or this is not a migrate. " +
+		"Re-run with --skip-foreign-keys to complete WITHOUT the foreign keys (each FK's referencing columns " +
+		"stay indexed, so you can add the constraints out-of-band afterward), fix the --where filter so it " +
+		"does not orphan children, or grow the PlanetScale cluster so the child-row validation finishes under " +
+		"the limit"
+	psFKWallNeutralRemedy = ", and re-running the identical validating ADD re-hits the same wall. An UNFILTERED " +
+		"migrate adds such a constraint metadata-only automatically (the copied rows are FK-consistent by " +
+		"construction), so you are seeing this because a row filter is active (which can legitimately orphan " +
+		"children, so validation is kept) or this is not a migrate. Grow the PlanetScale cluster so the " +
+		"child-row validation finishes under the limit, or fix the row filter so it does not orphan children; " +
+		"if this command can skip foreign keys, completing without them keeps each FK's referencing columns " +
+		"indexed so the constraints can be added out-of-band afterward"
+)
 
 // hintRegistry is the ordered list of hints. Order matters because
 // the first match wins — put more-specific entries before more-
@@ -117,11 +183,37 @@ var hintRegistry = []errorHint{
 	// cleanly; in fact only the PK index is present. The substring
 	// matches the wrapper prefix in migrate_bulk.go's copy-table
 	// failure paths so this fires for any underlying engine error.
+	//
+	// Bug 230: the remedy is per-command. `migrate` keeps the original
+	// text; `sync start` has no --resume (it re-runs under the same
+	// --stream-id); `sync run` takes its scope from the fleet config and
+	// has neither flag; `schema add-table` has neither AND copies exactly
+	// one table, so the "earlier tables" framing is false there too.
 	{
 		phase:    PhaseBulkCopy,
 		contains: "pipeline: copy table",
-		hint:     "any earlier tables in this run have data but NOT their declared secondary indexes (the indexes phase runs after ALL tables finish bulk-copy); use --resume to continue after fixing the offending table, or --exclude-table=<name> to skip it",
-		code:     sluicecode.CodeBulkCopyTableFailed,
+		hint: copyFailedEarlierTables + "fix the offending table and re-run this command, or take the " +
+			"table out of this run's table scope and re-run",
+		perCommand: map[Command]string{
+			CommandMigrate: copyFailedEarlierTables + "use --resume to continue after fixing the offending " +
+				"table, or --exclude-table=<name> to skip it",
+			// "there is no resume flag", NOT "--resume": the house idiom for
+			// naming an absent flag writes it as prose without the `--`, and
+			// the gate is what keeps that honest — a remedy text may name
+			// only flags its command accepts, including when it is telling
+			// the operator one does not exist.
+			CommandSyncStart: copyFailedEarlierTables + "there is no resume flag on `sluice sync start`, so " +
+				"fix the offending table and re-run the same command with the same --stream-id, or add " +
+				"--exclude-table=<name> to skip it",
+			CommandSyncRun: copyFailedEarlierTables + "a fleet sync takes its table scope from the config, " +
+				"not from flags: fix the offending table and let the supervisor's restart policy re-run this " +
+				"sync, or add the table to this sync's `exclude-table` list in the fleet config",
+			CommandAddTable: "`sluice schema add-table` copies exactly the ONE table you named, so no other " +
+				"table is affected and there is nothing to resume past or exclude — it has neither flag. Fix " +
+				"the table on the source and re-run the same command; the row copy is idempotent, so a re-run " +
+				"does not duplicate rows",
+		},
+		code: sluicecode.CodeBulkCopyTableFailed,
 	},
 
 	// Connect-time DSN errors. These three cover the bulk of
@@ -147,8 +239,10 @@ var hintRegistry = []errorHint{
 	{
 		phase:    PhaseConnect,
 		contains: "does not exist",
-		hint:     "verify the --target DSN database name",
-		code:     sluicecode.CodeConnectDatabaseMissing,
+		// Not "--target": a fleet `sync run` reaches connect too and takes
+		// its endpoints from the config, not from a --target flag.
+		hint: "verify the database name in the target DSN",
+		code: sluicecode.CodeConnectDatabaseMissing,
 	},
 
 	// Schema-apply: target role lacks CREATE on the schema.
@@ -175,11 +269,20 @@ var hintRegistry = []errorHint{
 	// token + safe migrations ON) sluice recovers automatically and this
 	// hint never fires — it remains the no-token / no-safe-migrations
 	// path.
+	//
+	// Bug 230 sibling: the index phase runs under `migrate`, both `sync`
+	// cold-starts, `schema add-table` AND `restore`, so only `migrate` may
+	// be told about --resume and only migrate/sync-start about
+	// --upfront-indexes / --planetscale-org.
 	{
 		phase:    PhaseIndexes,
 		contains: "maximum statement execution time",
-		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); the data is already copied, so --resume finishes just the indexes with NO re-copy (increase the PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit). Alternatively start fresh with --upfront-indexes to build indexes during the copy — or, with safe migrations ON, give sluice a PlanetScale service token (--planetscale-org + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN) and it builds the index via a deploy request automatically (ADR-0148)",
-		code:     sluicecode.CodeIndexStatementTimeLimit,
+		hint:     psIndexWallExplain + psIndexWallGrowOnly + psIndexWallTokenNeutral,
+		perCommand: map[Command]string{
+			CommandMigrate:   psIndexWallExplain + psIndexWallResumeForMigrate + psIndexWallUpfrontAndToken,
+			CommandSyncStart: psIndexWallExplain + psIndexWallGrowOnly + psIndexWallUpfrontAndToken,
+		},
+		code: sluicecode.CodeIndexStatementTimeLimit,
 	},
 	// Indexes: PlanetScale safe-migrations blocks direct DDL. With
 	// safe-migrations enabled on the target branch, a direct ALTER is
@@ -190,8 +293,12 @@ var hintRegistry = []errorHint{
 	{
 		phase:    PhaseIndexes,
 		contains: "direct ddl is disabled",
-		hint:     "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; give sluice a service token (--planetscale-org + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN env) and it builds the indexes through a deploy request automatically (ADR-0148), or disable safe migrations on the branch for the migration",
-		code:     sluicecode.CodeIndexDirectDDLDisabled,
+		hint:     psDirectDDLExplain + psDirectDDLTokenNeutral + psDirectDDLRemedy,
+		perCommand: map[Command]string{
+			CommandMigrate:   psDirectDDLExplain + psDirectDDLTokenFlags + psDirectDDLRemedy,
+			CommandSyncStart: psDirectDDLExplain + psDirectDDLTokenFlags + psDirectDDLRemedy,
+		},
+		code: sluicecode.CodeIndexDirectDDLDisabled,
 	},
 
 	// Constraints: the SAME PlanetScale statement-time wall (errno 3024), one
@@ -210,8 +317,12 @@ var hintRegistry = []errorHint{
 	{
 		phase:    PhaseConstraints,
 		contains: "maximum statement execution time",
-		hint:     "the foreign-key build hit PlanetScale's statement-time limit (errno 3024); ADD FOREIGN KEY validates every child row against the parent, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall — and --resume re-runs the identical validating ADD and re-hits the same wall, so it never converges. An UNFILTERED migrate adds such a constraint metadata-only automatically (the copied rows are FK-consistent by construction), so you are seeing this because a --where row filter is active (which can legitimately orphan children, so validation is kept) or this is not a migrate. Re-run with --skip-foreign-keys to complete WITHOUT the foreign keys (each FK's referencing columns stay indexed, so you can add the constraints out-of-band afterward), fix the --where filter so it does not orphan children, or grow the PlanetScale cluster so the child-row validation finishes under the limit",
-		code:     sluicecode.CodeConstraintStatementTimeLimit,
+		hint:     psFKWallExplain + psFKWallNeutralRemedy,
+		perCommand: map[Command]string{
+			CommandMigrate:   psFKWallExplain + psFKWallResumeForMigrate + psFKWallFlagRemedy,
+			CommandSyncStart: psFKWallExplain + psFKWallFlagRemedy,
+		},
+		code: sluicecode.CodeConstraintStatementTimeLimit,
 	},
 
 	// CDC: replication-role attribute missing. Postgres surfaces
@@ -235,12 +346,15 @@ var hintRegistry = []errorHint{
 // An empty phase argument matches only entries that are themselves
 // phase-empty — the orchestrator always passes a concrete phase, so
 // this case is mostly for future use and tests.
+// The text is resolved against the command this process is running
+// ([RunningCommand]), so a remedy names only flags that command accepts;
+// see hints_command.go.
 func hintFor(phase string, err error) string {
 	h, ok := matchErrorHint(phase, err)
 	if !ok {
 		return ""
 	}
-	return h.hint
+	return h.textFor(RunningCommand())
 }
 
 // matchErrorHint returns the first registry entry whose phase scope
@@ -311,9 +425,10 @@ func WrapWithHint(phase string, err error) error {
 	if !ok {
 		return err
 	}
+	text := h.textFor(RunningCommand())
 	return &sluicecode.CodedError{
 		Code: h.code,
-		Hint: h.hint,
-		Err:  fmt.Errorf("%w\nhint: %s", err, h.hint),
+		Hint: text,
+		Err:  fmt.Errorf("%w\nhint: %s", err, text),
 	}
 }

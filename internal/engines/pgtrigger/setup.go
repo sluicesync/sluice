@@ -940,7 +940,7 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "generated-stored-column",
-				Hint:   "the trigger engine does not replicate GENERATED ALWAYS AS ... STORED columns; use the `postgres` engine or exclude the column via --exclude-column",
+				Hint:   "the trigger engine does not replicate GENERATED ALWAYS AS ... STORED columns; use the `postgres` engine (logical replication carries them), or take the whole table out of scope with --exclude-table — sluice has no column-scope filter (ADR-0177)",
 			})
 		}
 		if shape.hasUnrecognisedDomain {
@@ -965,7 +965,7 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "json-array-column",
-				Hint:   "the trigger engine's to_jsonb capture cannot distinguish a JSON `null` element from a SQL NULL element, nor an array-valued element from a nested array dimension, in a json[]/jsonb[] column; exclude the column via --exclude-column, remap it with --type-override, or use the `postgres` engine (logical replication carries this family faithfully)",
+				Hint:   "the trigger engine's to_jsonb capture cannot distinguish a JSON `null` element from a SQL NULL element, nor an array-valued element from a nested array dimension, in a json[]/jsonb[] column; remap the column with --type-override, take the whole table out of scope with --exclude-table (sluice has no column-scope filter — ADR-0177), or use the `postgres` engine (logical replication carries this family faithfully)",
 			})
 		}
 	}

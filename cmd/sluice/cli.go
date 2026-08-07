@@ -1630,7 +1630,7 @@ func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pste
 	}
 	if database == "" {
 		return nil, errors.New(
-			"--planetscale-org telemetry: could not determine the target database name from the --target DSN; supply --planetscale-metrics-database explicitly",
+			"--planetscale-org telemetry: could not determine the target database name from the --target DSN; supply --planetscale-metrics-db explicitly",
 		)
 	}
 

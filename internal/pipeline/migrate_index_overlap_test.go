@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -304,6 +305,12 @@ func (s *walledIndexBuilderSW) BuildTableIndexesFromChannel(ctx context.Context,
 // bulk-copy.
 func TestOverlapPhase_AttributesTheFailingAxis(t *testing.T) {
 	t.Run("index axis → indexes phase, hint and code attached", func(t *testing.T) {
+		// The overlap phase runs under `migrate` only (see the file header),
+		// so this pin asserts against migrate's per-command remedy — which
+		// the CLI records before Run and a bare unit test does not (Bug 230).
+		migcore.SetRunningCommand(string(migcore.CommandMigrate))
+		defer migcore.SetRunningCommand("")
+
 		schema := overlapTestSchema(3)
 		gauge := &concurrencyGauge{}
 		eng := &poolFakeEngine{rowsPerTable: 2, gauge: gauge}

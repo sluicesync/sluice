@@ -16,6 +16,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -216,6 +217,12 @@ func TestMigrateIndexWall_HintAndCodeReachTheOperator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
+
+	// main() does this between Parse and Run, and the hint under test is
+	// `migrate`'s per-command one (Bug 230) — without it this gate would be
+	// asserting against the command-neutral text.
+	recordRunningCommand(kctx)
+	defer migcore.SetRunningCommand("")
 
 	runErr := kctx.Run(&cli.Globals)
 	if runErr == nil {

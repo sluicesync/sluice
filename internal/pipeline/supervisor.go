@@ -245,8 +245,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			ctx, "sync supervisor will restart a failing sync FOREVER and will never exit non-zero: "+
 				"max-consecutive-failures is 0 (the default). A sync that can never start — an unreachable "+
 				"target, a missing table, a bad DSN — retries behind backoff while this process stays alive "+
-				"and healthy-looking to systemd, a container orchestrator or CI. Set "+
-				"--max-consecutive-failures to a positive number if you want the fleet to give up and exit",
+				"and healthy-looking to systemd, a container orchestrator or CI. Set the fleet config's "+
+				"`restart.max-consecutive-failures` key to a positive number if you want the fleet to give "+
+				"up and exit (it is a config key, not a flag)",
 			slog.Int("syncs", len(s.initial)),
 		)
 	}

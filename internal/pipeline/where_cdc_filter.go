@@ -186,7 +186,7 @@ func buildWhereCDCFilter(resolver ir.CollationResolver, rowFilters map[string]st
 				"remove the --where entry or correct the table name",
 				fmt.Errorf(
 					"continuous filtered sync: --where names table %q, which is not in the synced source schema "+
-						"(it may be misspelled or excluded by --include/--exclude-table); a filter that matches no "+
+						"(it may be misspelled or excluded by --include-table/--exclude-table); a filter that matches no "+
 						"table would silently do nothing",
 					table,
 				),

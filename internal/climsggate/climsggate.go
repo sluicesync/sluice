@@ -74,9 +74,10 @@
 // # Stated limits
 //
 //   - Short flags (`-n`) are not graded; only `--long` forms.
-//   - A flag named in PROSE (outside a delimited invocation) is not graded.
-//     That is deliberate — see (2) above — and it is where a removed-flag
-//     notice belongs.
+//   - A flag named in PROSE (outside a delimited invocation) is not graded
+//     BY THIS WALKER. That is deliberate — see (2) above — and it is where a
+//     removed-flag notice belongs. It is also where Bug 230 lived; see the
+//     next section for what does and does not cover that.
 //   - A span whose command path is interpolated (`fmt.Sprintf("sluice %s
 //     --x")`) cannot be resolved to one command, so its flags are graded
 //     name-only against the union of every flag. That is weaker than the
@@ -84,6 +85,38 @@
 //     as such.
 //   - The gate grades what a literal SAYS, not whether the code path that
 //     emits it is reachable.
+//
+// # The bare-flag hole, and exactly how much of it is closed (Bug 230)
+//
+// The anchoring rule above has a consequence its first statement of scope did
+// not spell out, and the v0.115.0 release notes' Open list named only the
+// narrower unknown-SUBCOMMAND case: a hint that says "use --resume to continue"
+// with no `sluice …` in sight is never looked at. Bug 230 was exactly that —
+// one bulk-copy-failure hint naming `--resume` and `--exclude-table`, printed
+// by five commands, three of which accept neither.
+//
+// Grading bare flags needs a command to grade against, and a bare `--foo` in
+// prose carries no command in the literal itself; the context is the call
+// graph. So the widened half is scoped to the ONE surface where the emitting
+// command is known by construction rather than by inference:
+// [migcore.HintTexts] — the phase-scoped hint registry, whose per-command
+// texts are keyed by the command that receives them and whose neutral text is
+// received by all of them. TestHintRegistryTextsNameOnlyFlagsTheirCommandAccepts
+// in cmd/sluice grades those with [BareFlags], fail-by-default, no exemptions.
+//
+// The rest of the tree's prose flags stay UNGRADED, and that is a measured
+// decision rather than an oversight. Census over every non-test string literal
+// under cmd/sluice and internal/ (2026-08-07): 2100 bare `--flag` tokens, of
+// which 58 occurrences (31 distinct names) name nothing on any sluice command
+// — and all but a handful are legitimately not sluice's flags at all
+// (`pg_dump --blobs`, `az … --resource-group`, `docker run --name`,
+// `mysqld --local-infile`, `pgcopydb --table-jobs`, MySQL's own
+// `--super-read-only` error text), or prefix families written as `--notify-*`.
+// A union-level gate over that surface would need an exemption list about as
+// long as its finding list, which this project has repeatedly paid for; the
+// honest statement is that this gate does not cover it. The genuine phantoms
+// the census did surface were fixed in the same pass and are recorded in
+// docs/dev/audit-backlog.md, which is also where the residual lives.
 package climsggate
 
 import (
@@ -631,6 +664,43 @@ func flagName(core string) string {
 		return ""
 	}
 	return name
+}
+
+// reBareFlag matches a long-flag token anywhere in prose. Deliberately
+// permissive at the tail so a family PREFIX (`--notify-*`, `--planetscale-`)
+// is matched WHOLE and then rejected by the trailing-hyphen rule in
+// [BareFlags] — matching only the prefix's stem would invent a flag name
+// (`--planetscale`) that nobody wrote.
+var reBareFlag = regexp.MustCompile(`--[a-z][a-z0-9-]*`)
+
+// BareFlags returns every long-flag name (without the `--`) a message names,
+// including the ones written in PROSE outside a quoted invocation — the shape
+// the span walker above deliberately does not grade.
+//
+// It is exported for callers that already know WHICH command a message is
+// shown to and can therefore grade prose flags without a call graph; today
+// that is the hint-registry gate described in the package doc. Using the same
+// tokenizer for both keeps one set of rules for what counts as a flag:
+//
+//   - `--exclude-table=<name>` yields `exclude-table` — a flag reference with
+//     its value attached is still a flag reference.
+//   - `--notify-*` and `--planetscale-` yield NOTHING: a token ending in `-`
+//     names a FAMILY, not a flag, and every occurrence of that shape in the
+//     tree is prose about a group of flags.
+//   - A bare `--` separator and short forms (`-n`) yield nothing.
+//
+// Duplicates are preserved in source order; a caller that wants a set can
+// build one.
+func BareFlags(text string) []string {
+	var out []string
+	for _, m := range reBareFlag.FindAllString(text, -1) {
+		name := strings.TrimPrefix(m, "--")
+		if name == "" || strings.HasSuffix(name, "-") {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 // isValueToken reports whether a token is an argument or placeholder rather

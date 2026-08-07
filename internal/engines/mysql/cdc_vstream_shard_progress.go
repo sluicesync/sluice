@@ -377,7 +377,8 @@ func vstreamShardStallWarnMessage(window time.Duration, keyspace, shard string, 
 			"mysql/vstream: shard %q of keyspace %q has not advanced for %s while a peer shard keeps advancing — "+
 				"a genuine per-shard source stall (source-tablet throttle, a large transaction, or a tablet issue; "+
 				"check `SHOW VITESS_THROTTLED_APPS` on shard %q's primary). MinimizeSkew is relaxed "+
-				"(--vstream-relax-skew), so this is not a skew catch-up hold "+
+				"(the ADR-0120 default; --vstream-preserve-skew is the opt-out that restores the hold), "+
+				"so this is not a skew catch-up hold "+
 				"(the stream stays connected and will catch up when the shard resumes)",
 			shard, keyspace, window, shard,
 		)

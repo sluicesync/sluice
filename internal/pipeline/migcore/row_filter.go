@@ -50,7 +50,7 @@ func ValidateRowFilterKeys(schema *ir.Schema, filters map[string]string) (map[st
 				"correct the --where table name (matching is case-insensitive) or remove the entry; pass the same --where to migrate and verify",
 				fmt.Errorf(
 					"--where names table %q, which is not in the source schema "+
-						"(it may be misspelled or excluded by --include/--exclude-table); the readers match "+
+						"(it may be misspelled or excluded by --include-table/--exclude-table); the readers match "+
 						"the filter by exact table name, so an unmatched key would silently disable the filter "+
 						"and copy/count the whole table",
 					key,

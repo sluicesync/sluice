@@ -460,7 +460,10 @@ func TestVStreamShardStallWarnMessage_RelaxSkewDropsHoldCause(t *testing.T) {
 	msg := vstreamShardStallWarnMessage(60*time.Second, "main", "-80", true)
 	for _, want := range []string{
 		`"-80"`, `"main"`, "has not advanced",
-		"SHOW VITESS_THROTTLED_APPS", "--vstream-relax-skew", "stays connected",
+		// --vstream-preserve-skew, not "--vstream-relax-skew": relaxed is the
+		// ADR-0120 DEFAULT and the relax flag never existed. This assertion
+		// pinned the phantom until the Bug 230 sweep.
+		"SHOW VITESS_THROTTLED_APPS", "--vstream-preserve-skew", "stays connected",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("relaxed shard-stall message missing %q: %v", want, msg)

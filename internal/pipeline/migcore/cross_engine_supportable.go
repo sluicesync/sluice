@@ -123,7 +123,7 @@ func CheckCrossEngineSupportable(
 					"no clean cross-engine translation. "+
 					"Recovery: re-run with --exclude-table=%s to skip the table, "+
 					"drop the index on the source before migrating, "+
-					"or supply a --type-override / --index-override mapping",
+					"or supply a --type-override mapping for the column the index is on",
 				contextID, idxName, tbl.Name, reason, colRef, tbl.Name,
 			)
 		}

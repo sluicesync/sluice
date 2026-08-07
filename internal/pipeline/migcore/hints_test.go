@@ -38,12 +38,15 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "target table not found",
 		},
 		{
-			name:  "bulk-copy generic copy-table failure surfaces resume hint (Bug 114)",
+			// Bug 114's hint, now command-neutral by default (Bug 230): with
+			// no command recorded, the remedy must be the flag-free one.
+			// TestHintTextIsPerCommand below covers the per-command texts.
+			name:  "bulk-copy generic copy-table failure surfaces the recovery hint (Bug 114)",
 			phase: PhaseBulkCopy,
 			err: errors.New(
 				`pipeline: copy table "sentry_releases": postgres: insert into "sentry_releases": array of element type ir.JSON not supported (SQLSTATE 57014)`,
 			),
-			want: "use --resume to continue",
+			want: "fix the offending table and re-run this command",
 		},
 		{
 			name:  "connect: connection refused",
@@ -61,7 +64,7 @@ func TestHintForRegistry(t *testing.T) {
 			name:  "connect: database does not exist",
 			phase: PhaseConnect,
 			err:   errors.New(`pq: database "wrongname" does not exist`),
-			want:  "verify the --target DSN database name",
+			want:  "verify the database name in the target DSN",
 		},
 		{
 			name:  "schema-apply: permission denied for schema",
@@ -70,12 +73,14 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "the target role lacks CREATE on the schema",
 		},
 		{
-			name:  "indexes: PlanetScale errno-3024 statement-time wall points at --resume (no re-copy)",
+			// The --resume half of this remedy is migrate-only now (Bug 230);
+			// the neutral text keeps the part every command can act on.
+			name:  "indexes: PlanetScale errno-3024 statement-time wall says the data is already copied",
 			phase: PhaseIndexes,
 			err: errors.New(
 				`pipeline: create indexes: mysql: ALTER TABLE bench ADD INDEX idx_val: Error 3024: target: db.-.primary: vttablet: Query execution was interrupted, maximum statement execution time exceeded`,
 			),
-			want: "--resume finishes just the indexes with NO re-copy",
+			want: "the data is already copied",
 		},
 		{
 			name:  "indexes: PlanetScale safe-migrations direct-DDL block points at disabling it (NOT upfront)",
@@ -88,12 +93,12 @@ func TestHintForRegistry(t *testing.T) {
 			// MUST diverge from the index wall's --resume (a constraints 3024 is
 			// deterministic — --resume re-hits it), so assert the FK-specific
 			// --skip-foreign-keys steer, not the index text.
-			name:  "constraints: PlanetScale errno-3024 FK wall points at --skip-foreign-keys (NOT --resume)",
+			name:  "constraints: PlanetScale errno-3024 FK wall says re-running re-hits the same wall (NOT --resume)",
 			phase: PhaseConstraints,
 			err: errors.New(
 				`pipeline: create constraints: mysql: add foreign key "events_customer_fk" on "events": Error 3024 (HY000): target: db.-.primary: vttablet: Query execution was interrupted, maximum statement execution time exceeded, elapsed time: 15m0.0006s`,
 			),
-			want: "--skip-foreign-keys",
+			want: "re-running the identical validating ADD re-hits the same wall",
 		},
 		{
 			name:  "cdc: permission denied for replication",

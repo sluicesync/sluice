@@ -40,6 +40,7 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	_ "sluicesync.dev/sluice/internal/engines/sqlite"
 	_ "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -77,6 +78,7 @@ func main() {
 		},
 	)
 	configureLogging(cli.LogLevel, cli.LogFormat)
+	recordRunningCommand(ctx)
 	// Flags can point at a secret by environment-variable NAME
 	// (--encryption-passphrase-env VAR, --sign-key env:VAR, …). Register
 	// those names so internal/config's SLUICE_ prefix scan doesn't warn
@@ -101,6 +103,40 @@ func main() {
 	// docs/operator/error-codes.md for the taxonomy).
 	logCodedError(err)
 	ctx.FatalIfErrorf(err)
+}
+
+// recordRunningCommand records WHICH command the operator invoked, so a
+// runtime hint on a SHARED pipeline phase names a remedy that command actually
+// accepts (Bug 230). The path comes from kong's own selected node rather than
+// a hand-kept roster, so it covers every command including ones that do not
+// exist yet.
+//
+// Split out of main() — which no test can call — so the tests that drive a
+// command through kong.Parse + Context.Run reproduce main's sequence rather
+// than a subset of it. TestMainRecordsTheRunningCommand pins that main still
+// calls it.
+func recordRunningCommand(kctx *kong.Context) {
+	migcore.SetRunningCommand(selectedCommandPath(kctx.Selected()))
+}
+
+// selectedCommandPath renders kong's selected node as the space-joined
+// command path — "sync start", "schema add-table" — keeping ONLY command
+// nodes.
+//
+// kong's own [kong.Node.Path] is not usable here: it interpolates argument
+// nodes ("schema add-table <table>") and alias lists ("sync start (up)"),
+// while the flag surface the gate grades against is keyed by the bare command
+// path. An alias the operator typed still resolves to its canonical Name, so
+// `sluice sync up` and `sluice sync start` record the same path.
+// TestSelectedCommandPathMatchesTheGradedSurface pins both halves.
+func selectedCommandPath(node *kong.Node) string {
+	var parts []string
+	for n := node; n != nil; n = n.Parent {
+		if n.Type == kong.CommandNode {
+			parts = append([]string{n.Name}, parts...)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // logCodedError emits one ERROR-level slog record carrying the stable

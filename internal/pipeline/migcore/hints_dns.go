@@ -83,15 +83,24 @@ func dnsResolveHint(err error) (errorHint, bool) {
 	if probeErr != nil || len(ips) == 0 {
 		return errorHint{}, false
 	}
+	return dnsHintFor(dnsErr.Name), true
+}
+
+// dnsHintTemplate is the AAAA-only remedy, hoisted to a const so [HintTexts]
+// can hand the CLI-surface gate the text this classifier emits without
+// staging a real resolve failure to trigger it. The verb takes the host name.
+const dnsHintTemplate = "host %q is IPv6-only (it has an AAAA record but did not resolve from this network, " +
+	"which appears IPv4-only — e.g. a Supabase direct endpoint without the IPv4 add-on): for bulk migrate use " +
+	"the provider's SESSION-mode pooler endpoint (Supabase port 5432, not the transaction-mode :6543); " +
+	"for CDC the direct endpoint is required — Supabase's pooler strips the " +
+	"replication parameter — so enable the provider's IPv4 add-on or run sluice from an IPv6-capable network"
+
+// dnsHintFor renders the AAAA-only hint for one host. This classifier's text
+// is command-NEUTRAL by construction — it names no flag, only endpoints — so
+// it carries no perCommand overrides.
+func dnsHintFor(host string) errorHint {
 	return errorHint{
-		hint: fmt.Sprintf(
-			"host %q is IPv6-only (it has an AAAA record but did not resolve from this network, which appears "+
-				"IPv4-only — e.g. a Supabase direct endpoint without the IPv4 add-on): for bulk migrate use the "+
-				"provider's SESSION-mode pooler endpoint (Supabase port 5432, not the transaction-mode :6543); "+
-				"for CDC the direct endpoint is required — Supabase's pooler strips the "+
-				"replication parameter — so enable the provider's IPv4 add-on or run sluice from an IPv6-capable network",
-			dnsErr.Name,
-		),
+		hint: fmt.Sprintf(dnsHintTemplate, host),
 		code: sluicecode.CodeConnectIPv6Only,
-	}, true
+	}
 }
