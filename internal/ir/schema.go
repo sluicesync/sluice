@@ -415,9 +415,15 @@ type Column struct {
 	// first. See ADR-0016 for the layered translation policy.
 	GeneratedExprDialect string
 
-	// SourceColumnType is the column's pre-override IR type, captured
-	// when [translate.ApplyMappings] rewrites Type from a per-column
-	// `--type-override`. Nil when no override fired (the common case).
+	// SourceColumnType is the column's pre-REWRITE IR type: whatever
+	// Type held before a translate pass replaced it. Two passes record
+	// it — [translate.ApplyMappings] (a per-column `--type-override`,
+	// and `--infer-types`, which rides the same rewrite) and
+	// [translate.RetargetForEngine] (the cross-engine shape rewrite;
+	// Bug 232). Nil when neither fired, which is the common case. When
+	// both would apply the OVERRIDE wins, because it recorded the
+	// operator's true source type and the retarget's would be one step
+	// nearer.
 	//
 	// Writers consult this to disambiguate value shapes that are
 	// indistinguishable from the post-override Type + bytes alone.
@@ -431,18 +437,20 @@ type Column struct {
 	// `ir.Array` source — i.e. SourceColumnType is non-nil and an
 	// [Array].
 	//
-	// Producers other than translate.ApplyMappings leave this nil;
-	// readers should never populate it (the field carries
-	// override-context, not the raw source-engine type).
+	// Producers other than those two translate passes leave this nil;
+	// SCHEMA READERS never populate it (the field carries
+	// sluice-rewrite context, not the raw source-engine type).
 	//
 	// It deliberately does NOT ride the wire ([columnWire] has no field
 	// for it), so every column rebuilt from a backup manifest or any
-	// other persisted schema arrives nil and behaves as it did before
-	// the override-provenance readers existed. That is sound — restore
-	// applies no overrides — and it is load-bearing: MySQL's writer
-	// treats a nil as "natively binary" (columnIsNativelyBinary, audit
-	// B-2), so putting the field on the wire would make restore decide
-	// bytea provenance from what an OLD manifest recorded. Pinned by
+	// other persisted schema arrives nil — and a cross-engine restore's
+	// own RetargetForEngine pass then re-derives it locally from the
+	// manifest's source-native IR, rather than trusting what an old
+	// binary happened to record. That distinction is load-bearing:
+	// MySQL's writer treats a nil as "natively binary"
+	// (columnIsNativelyBinary, audit B-2), so putting the field on the
+	// wire would make restore decide bytea provenance from a persisted
+	// value. Pinned by
 	// TestColumnWire_DoesNotCarrySourceColumnType, which is also where
 	// to record the decision if Bug 47 ever needs it persisted.
 	SourceColumnType Type

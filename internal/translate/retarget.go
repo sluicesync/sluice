@@ -183,6 +183,38 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 // replaced by rule(col.Type) when the rule produces a rewrite. Tables
 // with no rewritten columns return the original pointer to avoid
 // gratuitous copies.
+//
+// # The rewrite RECORDS what it replaced (Bug 232)
+//
+// A rule can rewrite a COMPOSITE type into a scalar one, and when it
+// does, information the target's value writer still needs goes with it.
+// `ir.Array{Element: ir.JSON{}}` → `ir.JSON{}` is the load-bearing case:
+// MySQL has no array type, so the column becomes JSON — and the MySQL
+// writer's per-element leaf policy (arrayLeafForJSON) then has no
+// element family to dispatch on and REFUSES every json[]/jsonb[]/bytea[]
+// value. That is what broke `sluice restore` of a PG-sourced chain into
+// MySQL in v0.116.0: the element type is in the manifest, and the
+// retarget dropped it one step before the writer asked.
+//
+// So the pre-rewrite type is parked in [ir.Column.SourceColumnType] —
+// the field that already carries exactly this ("what did sluice replace
+// here?") for `--type-override`, and the pair the MySQL writer already
+// consults. An override that fired FIRST is never clobbered: it recorded
+// the operator's true source type, which is further back than ours.
+//
+// It reaches every consumer of the retarget in one place rather than at
+// each row-writing lane, which is what makes `restore`, `chain restore`
+// and the from-backup broker's initial full load agree with `migrate`.
+// The lanes that only DDL-emit a retargeted table (the broker's and
+// chain replay's schema-delta apply, schema-forward) are unaffected:
+// schema writers emit from Type and ignore this field.
+//
+// The one consumer that could have been flipped by a newly non-nil value
+// is MySQL's columnIsNativelyBinary, which reads nil as "natively
+// binary" — but it only asks about a column whose (post-rewrite) Type is
+// already binary, and no rule here produces a binary type. That premise
+// is a fact about this rule table, so it is pinned here rather than
+// asserted: TestRetargetRules_NeverProduceABinaryType.
 func retargetTable(tbl *ir.Table, rule retargetRule) *ir.Table {
 	if tbl == nil {
 		return nil
@@ -199,6 +231,9 @@ func retargetTable(tbl *ir.Table, rule retargetRule) *ir.Table {
 		}
 		colCopy := *col
 		colCopy.Type = newType
+		if colCopy.SourceColumnType == nil {
+			colCopy.SourceColumnType = col.Type
+		}
 		rewrittenCols[i] = &colCopy
 	}
 	if rewrittenCols == nil {

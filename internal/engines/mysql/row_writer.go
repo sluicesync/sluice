@@ -1719,9 +1719,9 @@ func normalizeArrayLeavesForJSON(v []any, elem ir.Type, col *ir.Column) ([]any, 
 // between "these are bytes" and "this is a document" is the exact
 // ambiguity roadmap item 135 removed.
 //
-// # The CDC applier lane, which has NO element type
+// # The CHANGE-APPLIER lane, which has NO element type
 //
-// The refusal above also catches the one lane that cannot resolve the
+// The refusal above also catches the lane class that cannot resolve the
 // family at all. A ChangeApplier reads its column descriptors from the
 // TARGET's information_schema, where MySQL renders both `json[]` and
 // `bytea[]` as the same `JSON` column — so [arrayElementType] returns
@@ -1736,6 +1736,27 @@ func normalizeArrayLeavesForJSON(v []any, elem ir.Type, col *ir.Column) ([]any, 
 // cold-start and `schema add-table` — the same shape, and the same two
 // call sites, as preflightBinaryTargetColumnsOnCDC. Pinned by
 // TestArrayLeafForJSON_CDCApplierLaneRefusesRatherThanGuesses.
+//
+// # Which lane it is, DERIVED rather than assumed (Bug 232)
+//
+// "elem == nil" is not by itself "this is the applier". Every
+// SCHEMA-carrying lane — migrate, a sync cold copy, a `restore`'s bulk
+// load — resolves the element from the column, so an array column
+// reaching here with no element is a defect in that schema. The two
+// cases therefore take two refusals: [refuseArrayLeafElementUnknown]
+// when the column has array provenance ([columnIsArrayLike]), and
+// [refuseUnresolvedArrayLeafOnApplier] when it has none, which the
+// applier's target-derived descriptors never do (MySQL's schema reader
+// emits no ir.Array — TestArrayLeafForJSON_NoMySQLReaderReconstructsAnArray).
+//
+// This is the Bug 232 lesson in the code rather than in a comment. Until
+// v0.116.1 the applier text was ASSERTED here, and `sluice restore` —
+// whose cross-engine retarget had dropped [ir.Array.Element] on the way
+// to the writer — printed it, telling the operator they were in a CDC
+// lane a restore does not have and prescribing `sluice migrate`, which
+// cannot read an archive. The element is now preserved at the retarget
+// (translate.retargetTable), and the lane claim is derived, so neither
+// half can silently come back.
 //
 // # SCOPE of that backstop, which is narrower than "the CDC lane"
 //
@@ -1825,7 +1846,25 @@ func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
 	}
 	if b, isBytes := x.([]byte); isBytes {
 		if elem == nil {
-			return nil, refuseUnresolvedArrayLeafOnCDC(col, len(b))
+			// Which lane this is, DERIVED rather than assumed (Bug 232).
+			// A column that is (or started as) an [ir.Array] came from a
+			// lane holding a real SCHEMA — migrate, a sync cold copy, a
+			// restore's bulk load — so a missing Element is a defect in
+			// that schema, not the applier's structural blindness. A
+			// column with no array provenance at ALL is the applier's:
+			// its descriptors come from the target, whose MySQL reader
+			// never emits an ir.Array (pinned by
+			// TestArrayLeafForJSON_NoMySQLReaderReconstructsAnArray).
+			//
+			// The distinction is not cosmetic. Until Bug 232 the
+			// applier-lane message was printed during `sluice restore`,
+			// where it told the operator they were in a CDC lane that
+			// does not exist there and prescribed `sluice migrate`, which
+			// cannot read an archive.
+			if columnIsArrayLike(col) {
+				return nil, refuseArrayLeafElementUnknown(col, len(b))
+			}
+			return nil, refuseUnresolvedArrayLeafOnApplier(col, len(b))
 		}
 		return nil, refuseArrayLeaf(col, fmt.Errorf(
 			"an array element of family %T arrived as %d raw bytes; only json/jsonb and bytea elements "+
@@ -1837,9 +1876,9 @@ func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
 	return x, nil
 }
 
-// refuseUnresolvedArrayLeafOnCDC is the CDC-applier lane's refusal: a
-// byte-shaped array leaf on a column whose element family this lane
-// cannot resolve at all.
+// refuseUnresolvedArrayLeafOnApplier is the CHANGE-APPLIER lane's
+// refusal: a byte-shaped array leaf on a column whose element family
+// this lane cannot resolve at all.
 //
 // It carries the SAME remedies as pipeline's
 // preflightArrayBytesLeafOnCDC, deliberately, because the two are one
@@ -1854,14 +1893,30 @@ func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
 // engines must not import pipeline; the two are held together by
 // TestArrayLeafForJSON_CDCRefusalCarriesTheSyncRemedy and its pipeline
 // sibling.
-func refuseUnresolvedArrayLeafOnCDC(col *ir.Column, n int) error {
+//
+// # It says APPLIER, not "continuous sync" (Bug 232)
+//
+// Continuous sync is the common applier lane, not the only one: a chain
+// restore's incremental replay and the from-backup broker's replay both
+// go through [ir.ChangeApplier.ApplyBatch] with descriptors read from
+// the target, and reach exactly here. The older text ASSERTED "this is
+// the continuous-sync lane" and named `sluice migrate` as the remedy —
+// which is why v0.116.0 answered a `sluice restore` with CDC advice and
+// an unrunnable command. The caller now DERIVES that this is an applier
+// lane (see the columnIsArrayLike branch in [arrayLeafForJSON]) instead
+// of this text claiming it, and the remedy names the property that
+// decides the answer — reading the SOURCE schema — rather than one
+// command.
+func refuseUnresolvedArrayLeafOnApplier(col *ir.Column, n int) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeValueUnrepresentable,
-		"take the table out of scope with --exclude-table, or use `sluice migrate` for a one-shot copy — "+
-			"it has no CDC lane and carries every array element family faithfully",
+		"take the table out of scope with --exclude-table, or carry the column on a lane that reads the "+
+			"SOURCE schema — `sluice migrate`, a `sync` cold copy, or a `sluice restore` bulk load — which "+
+			"resolve the element family from the source's own element type",
 		fmt.Errorf(
 			"column %q: an array element arrived as %d raw bytes on a column with no resolvable element "+
-				"type, so this is the continuous-sync lane, where the applier reads column types from the "+
+				"type, so this is a CHANGE-APPLIER lane — continuous sync, or a chain restore's or "+
+				"from-backup broker's incremental replay — where the applier reads column types from the "+
 				"TARGET and MySQL renders json[]/jsonb[] and bytea[] as the same JSON column. A json/jsonb "+
 				"element is carried as the document's own text and a bytea element as base64, and nothing "+
 				"here can tell which applies — the bytes cannot decide it either, since a bytea may "+
@@ -1870,8 +1925,40 @@ func refuseUnresolvedArrayLeafOnCDC(col *ir.Column, n int) error {
 				"value. A json[]/jsonb[]/bytea[] source column is NOT supported by continuous sync "+
 				"against a target with no array type; `sluice sync` refuses it at cold-start preflight, "+
 				"and a stream resumed WARM onto such a column reaches this message instead. Remedies: "+
-				"take the table out of scope with --exclude-table, or use `sluice migrate` for a one-shot "+
-				"copy — it has no CDC lane and carries every array element family faithfully",
+				"take the table out of scope with --exclude-table, or carry the column on a lane that "+
+				"reads the SOURCE schema — `sluice migrate`, a `sync` cold copy, or a `sluice restore` "+
+				"bulk load — which resolve the element family from the source's own element type",
+			columnNameForError(col), n,
+		),
+	)
+}
+
+// refuseArrayLeafElementUnknown is the SCHEMA-carrying lanes' refusal:
+// the column is declared as an array, so this run does read a source
+// schema, and that schema still carries no element type.
+//
+// It exists so the applier-lane message above cannot be printed by a
+// lane that has a schema — the exact defect of Bug 232, where `sluice
+// restore` lost the element at the cross-engine retarget and then told
+// the operator they were in a CDC lane. Nothing sluice ships today
+// produces an [ir.Array] with a nil Element: the Postgres reader always
+// sets one, and the backup manifest wire round-trips it. So this arm is
+// a "should not happen" that says so, rather than a plausible-sounding
+// diagnosis of the wrong lane. Pinned by
+// TestArrayLeafForJSON_ArrayColumnWithNoElementDoesNotClaimTheApplierLane.
+func refuseArrayLeafElementUnknown(col *ir.Column, n int) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeValueUnrepresentable,
+		"exclude the table with --exclude-table, or --type-override the column to a text type and parse it "+
+			"downstream; then please report it — a schema-carrying lane should always know the element type",
+		fmt.Errorf(
+			"column %q: an array element arrived as %d raw bytes and the column IS declared as an array, "+
+				"but its element type is missing, so sluice cannot tell whether to carry the element as a "+
+				"json/jsonb document's own text or as base64 for a bytea — and the bytes cannot decide it, "+
+				"since a bytea may legitimately spell a JSON document. This is a sluice defect rather than "+
+				"a problem with your data: the source value (and, in a restore, the archive) is intact and "+
+				"unread. Remedies: exclude the table with --exclude-table, or --type-override the column "+
+				"to a text type and parse it downstream; then please report it",
 			columnNameForError(col), n,
 		),
 	)

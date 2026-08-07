@@ -113,6 +113,18 @@ var errArrayBytesLeafOnCDC = errors.New(
 //   - NOT warm resume, which reads no schema by design. Nor a
 //     mid-stream `ALTER TABLE … ADD COLUMN bytea[]`, which no preflight
 //     sees.
+//   - NOT the two REPLAY appliers — a chain restore's incremental leg
+//     (backup.ChainRestore) and the from-backup broker's
+//     (pipeline.SyncFromBackup). Both open an [ir.ChangeApplier] against
+//     the target and are therefore the same structurally-blind lane this
+//     refuses for, and neither runs this preflight. Named here rather
+//     than left implied (the Bug 232 sweep): the FULL leg of both is
+//     safe — it goes through backup.Restore's row writer, whose
+//     manifest-derived schema keeps the element family across
+//     translate.RetargetForEngine — so what is exposed is a `json[]` /
+//     `bytea[]` value arriving in an INCREMENTAL. That is loud at the
+//     writer's leaf (the archive is intact and unread), so it is a
+//     late-error residual, not a silent one.
 //
 // # What the blind halves cost, which is NOT uniformly a late error
 //
