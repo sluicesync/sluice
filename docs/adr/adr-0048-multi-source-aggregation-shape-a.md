@@ -283,16 +283,16 @@ implementation.
   MySQL's implicit-commit DDL does not. Options: (a) lease-timeout +
   idempotent-DDL re-attempt (guarded `... IF NOT EXISTS`) as the v1
   contract; (b) **drained model for v1** (ADR-0030 Strategy A:
-  `sync stop --wait` all shards → one cross-shard schema migrate →
-  `sync start --resume` all), deferring *live* cross-shard schema
+  `sync stop --wait` all shards → one cross-shard schema migration →
+  re-run `sync start` on all), deferring *live* cross-shard schema
   migration to a Phase 2. **Spike lean:** drained model for v1 — it is
   the simplest, mirrors ADR-0030's own Phase-1 conservative-refusal
   precedent, and live cross-shard schema migration is genuinely a
   Phase 2 problem. **This is the single biggest scope decision; owner
   to set the v1 boundary.** — **RESOLVED 2026-05-16: drained model for
   v1** (owner-confirmed; ADR-0030 Strategy-A precedent — `sync stop
-  --wait` all shards → one cross-shard schema migrate → `sync start
-  --resume`; *live* cross-shard schema migration + the lease-holder-
+  --wait` all shards → one cross-shard schema migration → re-run
+  `sync start`; *live* cross-shard schema migration + the lease-holder-
   failure contract on non-transactional-DDL MySQL is deferred to a
   Phase 2). Decision 4's control-table DDL-lease design is retained as
   the Phase-2 target, not v1.
@@ -401,7 +401,7 @@ pass. Test surface on implementation:
   (composite-PK identity correctness).
 - Cross-shard schema migration (DP-3 dependent): source ALTER applied
   exactly once to the shared target; N-1 streams skip cleanly; (drained
-  variant) `sync stop --wait`→migrate→`sync start --resume` round-trips.
+  variant) `sync stop --wait`→migrate→re-run `sync start` round-trips.
 - Regression guards: single-source migrate/sync unaffected (flag
   opt-in, zero-cost when unset); Shape B `--target-schema` unaffected.
 
@@ -418,3 +418,17 @@ tests + this ADR moved to Accepted. Touches the CDC apply path and a
 control-table migration → the push-first / CI-Integration-green-before-
 tag release discipline applies. Pairs with no in-flight ADR; independent
 of the v0.68.0 ADR-0047 work.
+
+## Correction (2026-08-06) — `sync start --resume` never existed
+
+The DP-3 drained-model description above spelled the resume step as
+`sync start --resume`. There is no such flag on `sync start` and there never
+was; the command warm-resumes by default when re-invoked with the same
+`--stream-id`, and passing `--resume` exits 80 with `unknown flag`. Corrected
+in place — DP-3's resolution (drained model for v1, live coordination deferred
+to Phase 2, taken up by ADR-0054) is untouched.
+
+Also reworded "one cross-shard schema migrate" to "…schema migration": it was
+prose for the activity, never a `sluice schema migrate` command (`schema` has
+only `preview`, `diff`, and `add-table`), but sitting between two backticked
+commands it read as one.

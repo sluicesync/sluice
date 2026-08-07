@@ -54,9 +54,9 @@ Auto-including the FK-referenced parent rows for a filtered child set (the pg_du
 
 ## `sync --where` — continuous *filtered* replication
 
-**Which sources can run one: MySQL (including PlanetScale and Vitess) and Postgres.** A filtered continuous sync needs the source's change stream to deliver full row before-images, so the row-move table below can be evaluated; the SQLite, D1 and trigger-CDC engines cannot supply them and refuse at preflight with `SLUICE-E-WHERE-CDC-BEFORE-IMAGE` rather than filtering approximately. `migrate --where` is unaffected — a one-shot copy pushes the predicate into the source read and works on every engine that supports `migrate`.
+**Which sources can run one — `mariadb`, `mysql`, `planetscale`, `postgres`, `vitess`.** Those are the five `--source-driver` values whose change stream can deliver full row before-images, which is what the row-move table below needs to evaluate the predicate. The SQLite, D1 and trigger-CDC engines cannot supply them and refuse at preflight with `SLUICE-E-WHERE-CDC-BEFORE-IMAGE` rather than filtering approximately. `migrate --where` is unaffected — a one-shot copy pushes the predicate into the source read and works on every engine that supports `migrate`.
 
-<!-- filtered-sync-engines: mysql, postgres -->
+<!-- filtered-sync-engines: mariadb, mysql, planetscale, postgres, vitess -->
 
 
 The **same** predicate scopes **both** legs of a sync. The cold-start snapshot pushes it down into the source read exactly like migrate; the CDC leg then evaluates it **client-side, per change event**, with full **row-move semantics**. That row-move handling is the whole difficulty of filtered replication, and getting it wrong silently leaks or drops rows:

@@ -281,11 +281,15 @@ A native MySQL binlog snapshot is **not** idempotent, so a plain `mysql` source
 is on the cleared side even though it lives in the same engine package as the
 VStream reader.
 
-<!-- idempotent-copy-engines: mysql -->
+<!-- idempotent-copy-engine-packages: mysql -->
 
 The marker above is held to the code by `internal/docsync` — it lists the
-engine PACKAGE that pins `ir.IdempotentCopyReader`. The flavor sentence beside
-it is the part the gate cannot check, so read both together.
+engine PACKAGE that pins `ir.IdempotentCopyReader`, which is why its key says
+`-engine-packages` rather than `-engines`. It is the one marker in that package
+that names packages instead of `--source-driver` values, because the pin sits on
+the VStream snapshot reader rather than on a type every flavor reaches. The
+flavor sentence beside it is the part the gate cannot check, so read both
+together.
 
 ## See also
 

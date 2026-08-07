@@ -31,17 +31,30 @@ import (
 // # The marker
 //
 // Prose stays prose; the doc carries a machine-checkable marker this test
-// owns, inside the Meaning cell of the `SLUICE-E-INDEX-MISSING` row:
+// owns, on its own line BELOW the error-code table:
 //
-//	<!-- index-verify-engines: mysql, postgres -->
+//	<!-- index-verify-engines: mariadb, mysql, planetscale, postgres, vitess -->
 //
 // The source of truth is the compile-time pin — `var _ ir.IndexVerifier =
 // …` — in each engine's capabilities_assert.go. An engine without that pin
 // is skipped by the orchestrator's type-assert and genuinely has no net.
+//
+// The marker lists ENGINE NAMES, not package directories, because "which
+// targets get the net" is answered by what an operator passes to
+// `--target-driver`. This is the name-level derivation, and the capability
+// meets its precondition: the pin is on each engine's `*SchemaWriter`, and
+// `OpenSchemaWriter` returns that one type for every flavor of its package
+// (mysql's carries the flavor as a field). See engine_roster_test.go.
+//
+// # The marker used to be flavor-blind
+//
+// It derived PACKAGE names, so it could only ever emit `mysql, postgres` —
+// correct by construction, and silently dropping mariadb / planetscale /
+// vitess from a claim about which targets are protected.
 func TestIndexVerifyEngineListMatchesTheCode(t *testing.T) {
 	const capability = "IndexVerifier"
 
-	fromCode := enginesImplementing(t, capability)
+	fromCode := registeredEnginesImplementing(t, capability)
 	if len(fromCode) == 0 {
 		t.Fatalf("no engine package declares a `var _ ir.%s` pin; either the capability was renamed or the "+
 			"scan broke — this gate cannot be allowed to pass on an empty set", capability)
@@ -67,8 +80,10 @@ func TestIndexVerifyEngineListMatchesTheCode(t *testing.T) {
 			"  code (engines pinning ir.%s): %s\n"+
 			"  doc  (marker):                %s\n\n"+
 			"The orchestrator dispatches this net by type-assertion, so an engine without the pin silently "+
-			"gets NO post-index-phase verification. Update the marker AND the prose beside it — and note that "+
-			"the docRows mirror in internal/sluicecode carries the same cell, so both homes move together.",
+			"gets NO post-index-phase verification. Update the marker AND the SLUICE-E-INDEX-MISSING row's "+
+			"prose — and note that the row's cells are mirrored byte-equal in internal/sluicecode/docrows.go "+
+			"(TestRegistryDocSync_ContentEquality), so a prose edit moves both homes. The marker itself sits "+
+			"OUTSIDE the table, so it is not part of that mirror.",
 			capability, strings.Join(fromCode, ", "), strings.Join(fromDoc, ", "))
 	}
 }

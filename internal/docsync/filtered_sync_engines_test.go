@@ -4,13 +4,9 @@
 package docsync
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -39,15 +35,29 @@ import (
 // Prose should stay prose, so the doc carries a machine-checkable marker that
 // this test owns:
 //
-//	<!-- filtered-sync-engines: mysql, postgres -->
+//	<!-- filtered-sync-engines: mariadb, mysql, planetscale, postgres, vitess -->
 //
 // The visible sentence next to it is for humans; the marker is what fails.
 // Anyone writing release notes about filtered sync now has one place to look
 // whose answer is derived rather than remembered.
+//
+// # The marker lists ENGINE NAMES, and for two years it could not
+//
+// This gate shipped deriving PACKAGE DIRECTORY names, which for a
+// multi-flavor package is not the set an operator can type. It could only
+// ever emit `mysql, postgres`, so the marker was correct by construction and
+// the prose beside it was bound to nothing — and the whole time MariaDB
+// could run a filtered continuous sync (its binlog `*CDCReader` carries the
+// pin) and appeared in no engine list sluice published. The derivation now
+// goes through the registry; see engine_roster_test.go for why the two
+// questions need two helpers, and for the flavor-uniformity precondition
+// this capability satisfies (every mysql flavor reaches a pinned reader:
+// binlog `*CDCReader` for mysql/mariadb, `*vstreamCDCReader` +
+// `*vstreamSnapshotChanges` for planetscale/vitess).
 func TestFilteredSyncEngineListMatchesTheCode(t *testing.T) {
 	const capability = "FullBeforeImageSetter"
 
-	fromCode := enginesImplementing(t, capability)
+	fromCode := registeredEnginesImplementing(t, capability)
 	if len(fromCode) == 0 {
 		t.Fatalf("no engine package declares a `var _ ir.%s` pin; either the capability was renamed or the "+
 			"scan broke — this gate cannot be allowed to pass on an empty set", capability)
@@ -78,84 +88,4 @@ func TestFilteredSyncEngineListMatchesTheCode(t *testing.T) {
 			"about which engines lack the capability.",
 			capability, strings.Join(fromCode, ", "), strings.Join(fromDoc, ", "))
 	}
-}
-
-// enginesImplementing returns the engine package names whose sources declare a
-// compile-time pin for the named ir capability.
-func enginesImplementing(t *testing.T, capability string) []string {
-	t.Helper()
-	root := filepath.Join("..", "..", "internal", "engines")
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatalf("read %s: %v", root, err)
-	}
-
-	var out []string
-	fset := token.NewFileSet()
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pkgDir := filepath.Join(root, e.Name())
-		files, err := os.ReadDir(pkgDir)
-		if err != nil {
-			continue
-		}
-		found := false
-		for _, f := range files {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".go") || strings.HasSuffix(f.Name(), "_test.go") {
-				continue
-			}
-			parsed, perr := parser.ParseFile(fset, filepath.Join(pkgDir, f.Name()), nil, 0)
-			if perr != nil {
-				continue
-			}
-			ast.Inspect(parsed, func(n ast.Node) bool {
-				vs, ok := n.(*ast.ValueSpec)
-				if !ok || len(vs.Names) != 1 || vs.Names[0].Name != "_" || vs.Type == nil {
-					return true
-				}
-				sel, ok := vs.Type.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != capability {
-					return true
-				}
-				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "ir" {
-					found = true
-				}
-				return true
-			})
-			if found {
-				break
-			}
-		}
-		if found {
-			out = append(out, e.Name())
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func splitList(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if v := strings.TrimSpace(p); v != "" {
-			out = append(out, v)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func equalStringSets(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

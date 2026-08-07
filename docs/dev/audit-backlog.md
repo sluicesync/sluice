@@ -61,12 +61,19 @@ MEDIUMs: ~~compaction re-stamps its own verify hashes (= C-4 above)~~ — **CLOS
 
 A `docs-drift-detector` pass over the unreleased delta (items 114 / 115 / 129 / 130 / 131) found nine false doc claims. Seven were in-repo and are fixed in the same pass; what is recorded here is the part that is **out of this repo** or is a **gate proposal rather than a copy fix**.
 
-### The sluicesync.com site build is HARD-RED and needs four rows plus two text edits
+### The sluicesync.com error-code table lags this repo's
 
-`C:\code\sluicesync.com` is a separate repository; nothing in this backlog entry was fixed here. As of this sweep its own drift check fails the build: the repo declares **78** error codes (`internal/sluicecode/docrows.go`, held byte-equal to `docs/operator/error-codes.md` by `TestRegistryDocSync_ContentEquality`) against **74** rows on the site.
+`C:\code\sluicesync.com` is a separate repository; nothing in this section is fixed here.
 
-- **Four missing rows.** Add the codes the site does not carry, sourced from `docs/operator/error-codes.md` — which is the authoritative text, since it is the file the equality test pins.
-- **Two text divergences.** Rows present on both sides whose Meaning/Remedy prose has drifted from the repo's.
+**These counts rot within a release, so derive them, don't read them.** The 2026-08-05 version of this entry said "78 codes … 74 rows, four missing, two text divergences" and every one of those numbers was wrong a day later — the repo had reached 82, eight rows were missing rather than four, and there were three divergences rather than two. Both sides move independently: the repo mints codes continuously while the site can only carry PUBLISHED ones, so a nonzero gap is the normal steady state and only its composition is actionable. The authoritative enumerator is the site build's own `errorCodeTextDrift()`, which names each divergent code and each one-sided row against a sibling checkout — run the site build rather than trusting any number written down here.
+
+The two structural facts that do NOT rot:
+
+- **`docs/operator/error-codes.md` is the source of truth for the text**, because it is the file `TestRegistryDocSync_ContentEquality` pins byte-equal against `internal/sluicecode/docrows.go`. Port site edits FROM it, never the reverse.
+- **A missing row is only actionable if the code is PUBLISHED.** Split the missing set by whether the code exists at the latest tag: `git show <tag>:docs/operator/error-codes.md`. Codes present only on `main` are correctly absent from the site until they ship, and adding them early documents a code no released binary can emit.
+
+As of this commit: 82 codes on `main`, 78 at `v0.114.0`, 78 rows on the site; the four missing rows (`SLUICE-E-CONFIG-MULTI-NAMESPACE-TARGET-FLAT`, `-SCHEMA-TABLE-NAME-COLLISION`, `-SCHEMA-VIEW-NAME-COLLISION`, `-TARGET-PREEXISTING-FOREIGN-KEY`) are all unreleased and therefore correctly absent. Outstanding text divergences: `SLUICE-E-BACKFILL-CORRUPT-CURSOR` (the site renders `2<sup>53</sup>`, which flattens to `253` against the repo's `2^53` — a real failure of the drift check, which strips tags), and `SLUICE-E-INDEX-MISSING`, whose Meaning this sweep rewrote to name the MySQL-family flavors.
+
 - **The site's `cliFlagDrift` check has a blind spot for `backup verify --depth`.** It compares flag NAMES, and `--depth` already exists on `sluice verify` — so a name-only comparison passes even though the two flags now take different value sets (`count|sample` vs `hash|read`). The check must key on (subcommand, flag), not flag name alone, or `backup verify --depth read` will stay undocumented on the site with the build green.
 
 ### Gate proposals — operator-facing engine-set claims with no docsync marker
@@ -75,3 +82,22 @@ Both are prose that names which engines a behaviour applies to, with nothing bin
 
 - **`SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS`'s Meaning** asserts "**Both engines** normally RIDE such a transient by re-sending the same rows on a fresh connection." True today, and it is exactly the sentence item 114 would have invalidated had it gone the other way. The derivable fact is the set of write cores that call a reparent-retry helper (`flushWithReparentRetry` / `copyChunkWithRetry`) — currently three on MySQL and two on Postgres, with `raw_copy` and PG's plain multi-row INSERT core deliberately outside. Note this text lives in `docrows.go` **and** `docs/operator/error-codes.md` byte-equal, so a marker has to sit outside both or be identical in both.
 - **ADR-0108's write-core enumeration** ("`raw_copy` and Postgres's plain multi-row INSERT core never re-send at all and are exempt for that reason") is the same list in a second place, and it is the one that went stale: it said `LOAD DATA` was exempt for ~1 commit after item 114 made it inherit the carve-out. A roster derived from the retry-helper call sites would have failed the build on that commit.
+
+## Open — 2026-08-06 docs-drift sweep
+
+### `sluice sync start --resume` is a phantom flag, and sluice's own RUNTIME messages hand it to operators
+
+`sync start` has no `--resume` and never has: it warm-resumes by default when re-invoked with the same `--stream-id`, and the flag exits 80 with `unknown flag`. (`--resume` is real on `migrate` and `restore`, which is where the slip comes from.) Roadmap item 53 caught and fixed one instance in a cookbook recipe in 2026-07; the class was never swept.
+
+The 2026-08-06 sweep corrected the ADRs it was scoped to — ADR-0030, ADR-0048, ADR-0054, each with a `## Correction` note recording that the flag never existed so the edit is not a silent rewrite of an accepted record. **The expensive half is still open, and it is not a docs problem:** the string appears in production code that operators read *at the moment they are recovering from a stalled stream*, i.e. exactly when a wrong command costs the most.
+
+- `internal/engines/postgres/cdc_relations.go:309` — `schemaRaceRecoveryHint`, step (3) of the drained-model recovery for an incompatible mid-stream DDL.
+- `internal/pipeline/schema_forward_intercept.go:547` — the schema-forward refusal's recovery hint (this is the text ADR-0157 pipes into the **schema-drift notification**, so it also reaches webhook/Slack/email).
+- `internal/pipeline/add_table.go:624` (completion log), `:1298` (dry-run log), plus the doc comments at `:17` and `:44`.
+- `internal/pipeline/shard_consolidation_engage.go:147` and `shard_consolidation_probe.go:679` — Shape A drained-model hints.
+- `cmd/sluice/schema_add_table.go:78` (the `--inject-shard-column` help text) and `:135` (a refusal message).
+- `cmd/sluice/preview.go:26` (doc comment).
+
+Not fixed in the docs sweep because it changes operator-visible message text and at least one pinned assertion (`cmd/sluice/schema_add_table_shape_a_test.go:60` asserts the substring `"sync start --resume"`), so it wants its own review rather than riding a docs diff. Remaining doc-only instances left with it so the class stays in one place: `docs/use-cases.md:29` (a copy-pasteable command block — the highest-harm doc instance), `docs/postgres-source-prep.md:184`, `docs/vitess-vstream-troubleshooting.md:234,443`, `docs/adr/adr-0058*:17,606,647`, `adr-0060*:374`, `adr-0094*:18`, `adr-0157*:12`, and `docs/dev/design/{logical-backups-phase-2,logical-backups-phase-3,mid-stream-add-table,sluice-verify}.md`. CHANGELOG and `docs/releases/` occurrences are historical records and should NOT be edited.
+
+**Gate proposal.** The derivable fact is the kong CLI's (command, flag) set, which `cmd/sluice/cli.go` already declares — a walker could extract every `` `sluice <cmd> --<flag>` `` occurrence from backticked spans in `docs/` + Go string literals and assert each names a real flag on that command. The obstacle is that ADRs and design notes legitimately describe planned-but-unbuilt surfaces (ADR-0054's `sluice schema migrate-shape-a` is correctly labelled Phase 3+), so a naive gate needs an exemption list — the curated-promise anti-pattern. A gate scoped to **Go string literals only** has no such problem: a runtime message has no business naming an unbuilt command, so it can fail-by-default with no exemptions, and it covers precisely the instances above that actually reach an operator mid-incident.

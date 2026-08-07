@@ -6,14 +6,14 @@ Accepted. Implemented in `internal/pipeline/add_table.go::AddTable.LiveMode` (th
 
 ## Context
 
-Phase 1 of mid-stream add-table (v0.10.x cycle, "Recently landed" in `docs/dev/roadmap.md`) shipped the drained-stream workflow: operator runs `sluice sync stop --wait`, then `sluice schema add-table TABLE`, then `sluice sync start --resume`. The orchestrator (`internal/pipeline/add_table.go`) is conservative — `preflightStream` refuses if the stream's `stop_requested_at IS NOT NULL`, on the assumption that running add-table against a live stream is unsafe.
+Phase 1 of mid-stream add-table (v0.10.x cycle, "Recently landed" in `docs/dev/roadmap.md`) shipped the drained-stream workflow: operator runs `sluice sync stop --wait`, then `sluice schema add-table TABLE`, then `sluice sync start` again with the same `--stream-id`. The orchestrator (`internal/pipeline/add_table.go`) is conservative — `preflightStream` refuses if the stream's `stop_requested_at IS NOT NULL`, on the assumption that running add-table against a live stream is unsafe.
 
 Re-reading the Phase 1 orchestrator after it shipped: **the conservative refusal is wider than the actual correctness gap.** The flow already does the load-bearing safe-overlap work:
 
 - Step 4: `AddPublicationTables` (`ALTER PUBLICATION ... ADD TABLE`) runs **before** the snapshot. PG's pgoutput evaluates publication membership at decode time, not write time — so any event on the new table at LSN ≥ the publication-add LSN gets delivered to the slot.
 - Step 5: snapshot uses a **temp slot** (default `sluice_addtable_<table>`) — independent from the active stream's `sluice_slot`. The snapshot's consistent-point LSN is the floor for what its rows cover.
 - Step 6: bulk-copy via the temp-slot snapshot stream, then drop the temp slot.
-- Persisted CDC position is intentionally NOT updated. The active stream's existing position is still the right resume point for the other tables; the **idempotent applier** (ADR-0010, `INSERT ... ON CONFLICT DO NOTHING`) absorbs the [persisted_LSN, snapshot_LSN] overlap on the new table when the operator runs `sync start --resume`.
+- Persisted CDC position is intentionally NOT updated. The active stream's existing position is still the right resume point for the other tables; the **idempotent applier** (ADR-0010, `INSERT ... ON CONFLICT DO NOTHING`) absorbs the [persisted_LSN, snapshot_LSN] overlap on the new table when the operator re-runs `sync start`.
 
 The ONLY thing keeping Phase 1 from being live-safe is the explicit refusal in `preflightStream` (lines 326–360 in the Phase 1 file). The `stop_requested_at` check is a partial-detection of stream activity that erred conservative because the proto-ADR (`docs/dev/design/mid-stream-add-table.md`) flagged Strategy B/C as v2 work. After implementation, Phase 1 already implements the correctness story for Strategy C variant (c) — publication-add-then-snapshot — and the refusal is the only gate.
 
@@ -112,6 +112,20 @@ Integration tests in `internal/pipeline/add_table_live_pg_integration_test.go`:
 - `TestAddTable_LiveMode_PG`: PG → PG, active stream, add a NEW table that already has rows on the source, verify rows + post-add INSERTs flow through CDC to the target.
 - `TestAddTable_LiveMode_PG_UnderLoad`: same but with a goroutine driving INSERTs on the new table during the add. Pin: zero data loss, no duplicates.
 - `TestAddTable_LiveMode_MySQL_Refused`: MySQL refuses live mode with the PG-only error.
+
+## Correction (2026-08-06) — `sync start --resume` never existed
+
+This ADR's Context and Consequences named `sluice sync start --resume` as the
+step that resumes the drained stream. There is no such flag, and there never
+was one: `sync start` warm-resumes by default when re-invoked with the same
+`--stream-id`, which was already true when this ADR was written (the flag set
+at that commit carries `--force-cold-start`, documented as "ignored on the
+warm-resume path"). Passing `--resume` exits 80 with `unknown flag`.
+
+Corrected in place rather than annotated inline, because no decision recorded
+here turns on it — the workflow the ADR describes is unchanged, only the
+command spelling was wrong. `--resume` is real on `migrate` and `restore`,
+which is the likely source of the slip.
 
 ## See also
 

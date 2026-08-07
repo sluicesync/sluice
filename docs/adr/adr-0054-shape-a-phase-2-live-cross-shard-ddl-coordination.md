@@ -14,7 +14,7 @@ populated-target preflight, and composite-PK rewrite (v0.72.0,
 hotfixed in v0.72.1 / v0.72.2). DP-3 resolved cross-shard schema
 migration to the **drained model** for v1: operator runs
 `sluice sync stop --wait` on every shard, runs one cross-shard
-schema migrate, then runs `sluice sync start --resume` on every
+schema migration, then re-runs `sluice sync start` on every
 shard.
 
 The drained model is correct but operationally heavy on N-shard
@@ -203,7 +203,7 @@ boundary:
    resume CDC against the now-migrated target.
 6. **Mismatch** → loud refusal naming both checksums, both DDL
    texts, and the recovery path (drained model: stop all shards,
-   reconcile the divergent DDL, sync start --resume).
+   reconcile the divergent DDL, re-run sync start).
 
 **Why normalize the DDL text:** byte-exact text comparison is too
 strict (different MySQL versions emit slightly different DDL
@@ -720,3 +720,21 @@ The PG-internals research runs (`sluice-pg-internals-research-2026-05-22.md` for
 - **F3** (`confirmed_flush_lsn` pin test) is an invariant that interacts with the lease's recorded-version: a lease APPLIED state implicitly assumes the position-write happened-before the slot's `confirmed_flush_lsn` advanced past the boundary. This is true today (the apply tx is ADR-0007's "position + data in one tx") but worth pinning.
 - **F5** (source-identity pinning — ADR-0051) closes the timeline-change silent-loss class on the resume path. A lease's recorded `applied_schema_version` references a specific source identity; if the source changes underneath sluice (PITR, promotion, wrong-instance pointer), ADR-0051's refusal kicks in before the lease takeover attempts to consume the recorded version against the new identity.
 - **F7** (synchronous_commit hardening — ADR-0007 amendment) closes the durability-bypass class. The lease's APPLIED state is durable only if the position-write tx is durable; F7's `SET LOCAL synchronous_commit = on` ensures that holds even when role/db-level defaults set `synchronous_commit = off`.
+
+## Correction (2026-08-06) — `sync start --resume` never existed
+
+The Context's drained-model description and the mismatch-recovery step in
+§"Boundary detection" spelled the resume step as `sync start --resume`. There
+is no such flag on `sync start` and there never was; the command warm-resumes
+by default when re-invoked with the same `--stream-id`, and passing `--resume`
+exits 80 with `unknown flag`. Corrected in place — this ADR's decision (live
+lease-coordinated cross-shard DDL, replacing the drained model it inherited
+from ADR-0048 DP-3) is untouched, and so is the drained model's availability
+behind `--no-coordinate-live-ddl`.
+
+"One cross-shard schema migrate" was likewise reworded to "…schema migration":
+it described the activity, not a `sluice schema migrate` command, which does
+not exist (`schema` has only `preview`, `diff`, `add-table`). The genuinely
+planned `sluice schema migrate-shape-a` in §"Closes v1 known follow-ups" is
+left alone — it is explicitly labelled a Phase 3+ item, i.e. correctly marked
+as not built.
