@@ -746,8 +746,16 @@ code in the orchestrator for source-trigger-engine.
 3. The operator upgrades their PG service tier (or migrates to a
    tier that supports logical replication).
 4. The operator runs `sluice sync start --source-driver=postgres
-   --reset-position`, which starts a fresh cold-start + cutover
+   --restart-from-scratch`, which starts a fresh cold-start + cutover
    via the pgoutput engine.
+
+   > **Correction (2026-08-07).** This step named `--reset-position`,
+   > a flag that has never existed — ADR-0022 §"Why not a
+   > `--reset-position` flag" records the decision not to build it.
+   > The surface that does what this step describes is
+   > `--restart-from-scratch`. Corrected rather than left standing
+   > because the line reads as an instruction, not as a reference to
+   > the rejected flag.
 
 The cutover is necessarily a cold re-snapshot at the boundary
 between the two engines — there's no shared position-encoding
