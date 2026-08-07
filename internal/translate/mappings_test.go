@@ -100,6 +100,55 @@ func TestApplyMappings_BasicOverride(t *testing.T) {
 	}
 }
 
+// TestApplyMappings_RecordsSourceType is the PREMISE half of the MySQL
+// writer's bytea provenance guard (audit 2026-08-05 B-2).
+//
+// `columnIsNativelyBinary` (internal/engines/mysql/row_writer.go) decides
+// whether a string on a binary-typed column is PG's `bytea` rendering by
+// asking whether SourceColumnType is nil. That reading is only sound
+// because an override ALWAYS records the type it replaced — a fact about
+// this function, in another package, that the guard cannot check for
+// itself. The two facts are useless apart (the 2026-08-01 "nothing binds
+// the two" lesson), so this binds them: if ApplyMappings ever stopped
+// recording, or recorded the POST-override type, the guard would silently
+// read every overridden column as natively binary and reintroduce the
+// bug with its own test still green.
+//
+// `bytea` is the alias used deliberately — it is the one that produces a
+// binary IR type from a non-binary source, which is the exact cell.
+func TestApplyMappings_RecordsSourceType(t *testing.T) {
+	s := schemaWith(struct {
+		table string
+		cols  []string
+	}{"docs", []string{"id", "body"}})
+	// body starts as Varchar(255) per schemaWith; retype it to Text so
+	// the pre-override type is unmistakably a non-binary family.
+	s.Tables[0].Columns[1].Type = ir.Text{Size: ir.TextLong}
+
+	got, err := ApplyMappings(s, []config.Mapping{
+		{Table: "docs", Column: "body", TargetType: "bytea"},
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	body := got.Tables[0].Columns[1]
+	if _, ok := body.Type.(ir.Blob); !ok {
+		t.Fatalf("body type = %T; want ir.Blob (the `bytea` alias)", body.Type)
+	}
+	if _, ok := body.SourceColumnType.(ir.Text); !ok {
+		t.Fatalf("body SourceColumnType = %T; want ir.Text — the PRE-override type. "+
+			"The MySQL writer's bytea guard reads this field to tell a PG bytea rendering "+
+			"from a source string that merely spells one; a nil or post-override value "+
+			"there silently reintroduces audit B-2.", body.SourceColumnType)
+	}
+	// The un-overridden column keeps nil, which is what the guard reads
+	// as "natively whatever it says it is".
+	if got.Tables[0].Columns[0].SourceColumnType != nil {
+		t.Errorf("id SourceColumnType = %v; want nil (no override fired)",
+			got.Tables[0].Columns[0].SourceColumnType)
+	}
+}
+
 func TestApplyMappings_UnaffectedTablesSharePointer(t *testing.T) {
 	s := schemaWith(
 		struct {

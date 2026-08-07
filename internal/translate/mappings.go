@@ -262,6 +262,16 @@ var postgisAliasSubtypes = map[string]ir.GeometrySubtype{
 	"postgis_geometry":           ir.GeometryUnspecified,
 }
 
+// ResolveTargetType is [resolveTargetType] for callers that must
+// classify a mapping WITHOUT a schema in hand — specifically the sync
+// preflight that refuses a `--type-override` landing a non-binary column
+// on a binary target type before any connection is opened (audit
+// 2026-08-05 B-2). Exported deliberately narrowly: it resolves, it does
+// not rewrite.
+func ResolveTargetType(m config.Mapping) (ir.Type, error) {
+	return resolveTargetType(m.TargetType, m.TargetTypeOptions)
+}
+
 // resolveTargetType maps a target_type alias plus any options to a
 // concrete ir.Type. Unknown aliases return an error naming the
 // alias and listing the recognised set so the operator can spot a

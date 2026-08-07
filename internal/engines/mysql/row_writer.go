@@ -894,25 +894,68 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	// []byte (same-engine / pgoutput path) and non-`\x` strings pass
 	// through unchanged.
 	//
-	// SIBLING SWEEP, item 135 (the Postgres decoder's content sniffing).
-	// This is the same shape and it is NOT fixed here, for a stated
-	// reason: the guard is `ir.Binary/Varbinary/Blob` AND `v.(string)`,
-	// and every reader that produces a genuinely-binary blob value hands
-	// a `[]byte`. The only production producer of a `string` in this
-	// branch is the pgtrigger reader, where the value IS PG bytea text
-	// and hex-decoding is the correct reading. The residual is one cell:
-	// a PG `text` column `--type-override`n to varbinary whose content
-	// spells `\x`+even-hex.
+	// SIBLING SWEEP, item 135 (the Postgres decoder's content sniffing) —
+	// CLOSED here (audit 2026-08-05 finding B-2's MySQL half).
 	//
-	// Fixing it the item-135 way would mean carrying provenance on the
-	// VALUE across the engine-neutral IR Row — a cross-cutting contract
-	// change, not a decoder change — so it is recorded rather than
-	// half-fixed. Do not close it by adding more sniffing.
+	// The residual this comment used to record was one cell: a PG `text`
+	// column `--type-override`n to a binary type whose content spells
+	// `\x`+even-hex. It was reachable — not on `migrate`, where the
+	// override rewrites the type the READER decodes with so the PG reader
+	// hands back `[]byte` and never reaches this branch, but on the two
+	// CDC doors, whose column types come from the SOURCE (pgoutput's
+	// Relation message; pgtrigger's untyped JSON payload) and are
+	// therefore blind to the override. So cold-start stored the six bytes
+	// and CDC then shrank the same cell to two.
+	//
+	// It is closed WITHOUT a value-level provenance contract, because the
+	// provenance that decides this case is a property of the COLUMN, not
+	// the value: [ir.Column.SourceColumnType] already records the
+	// pre-override type for exactly this kind of disambiguation (the Bug
+	// 47 precedent next door in [convertArrayLikeToJSON]). A string here
+	// is PG's bytea rendering only when the column is NATIVELY binary; a
+	// column an override MADE binary carries its source's own bytes.
+	//
+	// And a MALFORMED rendering attempt is now REFUSED rather than passed
+	// through. `\xabc` / `\xzz` on a natively-binary column cannot be a
+	// legitimate capture — the trigger clause pins `SET bytea_output = hex`
+	// (pgtrigger/setup.go, audit B-1), which only ever emits `\x`+even-hex
+	// — so storing its ASCII verbatim is the same silent corruption in
+	// smaller print. Same discipline [byteaArrayLeaf] applies next door.
+	//
+	// # WART: a string with NO `\x` prefix passes through, it is not refused
+	//
+	// [byteaArrayLeaf] refuses that case and this deliberately does not,
+	// because the scalar branch is reached by one lane the array leaf is
+	// not: the ChangeApplier, whose column descriptors come from the
+	// TARGET, so `SourceColumnType` is nil for every column it ever sees
+	// and columnIsNativelyBinary cannot say no. A `--type-override
+	// col=binary_uuid` landing a CHAR(36) UUID string on a MySQL
+	// BINARY(16) is exactly that shape, and refusing it would break a
+	// documented, recommended override (ADR-0024). Passing it through is
+	// safe on its own terms — a non-`\x` string was never a rendering, so
+	// its bytes are the only reading. What the pass-through does NOT
+	// resolve is the `\x`+valid-hex COLLISION on that same applier lane,
+	// which no writer-side rule can; preflightBinaryTypeOverrideOnCDC
+	// (internal/pipeline) makes it unreachable instead.
+	//
+	// Pinned by TestPrepareValue_ByteaProvenanceMatrix and, on a real
+	// server, TestByteaProvenance_MySQLWriteCores.
 	switch t.(type) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
-		if s, ok := v.(string); ok {
+		if s, ok := v.(string); ok && columnIsNativelyBinary(col) {
 			if b, decoded := decodeHexByteaText(s); decoded {
 				return b, nil
+			}
+			if strings.HasPrefix(s, `\x`) {
+				return nil, sluicecode.Wrap(
+					sluicecode.CodeValueByteaTextUnrecognized,
+					"set the source's bytea_output back to the `hex` default",
+					fmt.Errorf(
+						"column %q carries %q, which starts like PostgreSQL's `\\x` bytea rendering "+
+							"but is not the even-hex form `bytea_output = hex` produces",
+						col.Name, truncateByteaForError(s),
+					),
+				)
 			}
 		}
 	}
@@ -1162,6 +1205,51 @@ func decodeHexByteaText(s string) ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// columnIsNativelyBinary reports whether a binary-typed column's binary
+// type is the SOURCE's own, rather than one a `--type-override` imposed.
+// It is the column-level half of item 135's provenance rule, and the only
+// thing standing between a PG bytea rendering and a source string that
+// merely spells one (audit B-2's MySQL half — see the branch in
+// [prepareValue]).
+//
+// [ir.Column.SourceColumnType] is nil unless [translate.ApplyMappings] (or
+// `--infer-types`, which rides the same rewrite) replaced the type, so a
+// nil means "no override fired" and the column is natively whatever it
+// says it is. That binding — override ⇒ SourceColumnType set to the
+// pre-override type — is pinned by TestApplyMappings_RecordsSourceType,
+// because the two facts are useless apart: this guard is only sound if the
+// override plumbing really records what it replaced.
+//
+// A nil col is treated as natively binary: the applier's nil-descriptor
+// callers have no column at all, and the pre-existing decode is the safer
+// reading there (the only production string producer for a binary column
+// is the pgtrigger reader).
+func columnIsNativelyBinary(col *ir.Column) bool {
+	if col == nil || col.SourceColumnType == nil {
+		return true
+	}
+	src := col.SourceColumnType
+	if dom, isDomain := src.(ir.Domain); isDomain && dom.BaseType != nil {
+		src = dom.BaseType
+	}
+	switch src.(type) {
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		return true
+	}
+	return false
+}
+
+// truncateByteaForError bounds a rendering echoed into a refusal so a
+// multi-megabyte value can't turn one error into a log flood. Mirrors the
+// postgres decoder's truncateForError.
+func truncateByteaForError(s string) string {
+	const limit = 64
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…"
 }
 
 // prepareHstoreToJSON converts a PG hstore wire value into a JSON

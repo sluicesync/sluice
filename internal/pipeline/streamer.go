@@ -1508,6 +1508,16 @@ func (s *Streamer) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Item 135 / audit B-2: a `--type-override` onto a BINARY target type
+	// is ambiguous on the CDC lane and is refused here — once, before any
+	// attempt, cold-start or warm resume, and without a connection (see
+	// bytea_override_preflight.go for why the applier cannot decide it and
+	// why `migrate` is deliberately not refused). No-op when Mappings is
+	// empty or lands on no binary type.
+	if err := preflightBinaryTypeOverrideOnCDC(s.Mappings); err != nil {
+		return err
+	}
+
 	attempts := s.ApplyRetryAttempts
 	if attempts < 1 {
 		attempts = 1
