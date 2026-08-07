@@ -934,7 +934,9 @@ Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers 
 
 **What the answer left behind.** The probe is kept as a permanent pin, not deleted after answering: ADR-0109's premise had no test, and the existing source-timeout test only pins that the session timeouts are *raised*. It carries the anti-vacuity checks the other Tier-1 gates do — it fails if the kill never lands, if the stream was fully drained before the kill (proving nothing), and if `Err()` is nil after a truncated read (a truncated copy reported as success is silent loss). Mutation-verified: stripping `classifyApplierError` from the `rows.Err()` exit turns it red with the exact diagnosis.
 
-### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *confirmed Vitess-side; sluice already classifies + prints the remedy, but the TERMINAL disposition is wrong*
+### 82. A DROPPED table permanently poisons a VStream resume position — warm resume is UNRECOVERABLE, not merely delayed (observed 2026-07-26) — *✅ SHIPPED v0.102.1 (`b9277738`). The terminal disposition was the fix named below: an unreplayable VStream window that exhausts its budget is now classified position-invalid rather than a generic give-up, so the streamer routes to the ADR-0093 cold-start re-snapshot (or refuses loudly under `--no-auto-resnapshot`). `isUnreplayableWindowError` (`internal/pipeline/streamer_retry.go:606`), pinned by `TestIsUnreplayableWindowError`.*
+
+**Status note (2026-08-07):** this entry read OPEN for **thirteen releases** after it shipped — the worst stale-status instance found by the reconciliation sweep. It is worth naming because the entry is long and argues carefully for a fix that then landed almost verbatim, which is exactly the shape that makes a reader trust the header. The rest of this entry is preserved as the reasoning that produced the fix.
 
 **⚠️ CORRECTION 2026-07-26 (the first filing above overstated the gap).** Reading the full log rather than the fatal line alone shows sluice **already recognises this shape and already prints the remedy**. The condition is caught by `isVStreamSchemaResolutionError` and classified RETRIABLE, and every retry logs:
 
@@ -1884,6 +1886,20 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 
 **Mutation runs, each confirmed APPLIED (grep for the marker) before the result was trusted** — the 2026-08-05 rule, which cost a destroyed working file to relearn: M1 drop the MySQL default → the parse-entry-point pin FAILS; M2 revert one PG dial site to keep-alive only → the dial-site walker FAILS naming the file and line; M3 drop `postgres` from the roster → the registry gate FAILS in both directions (missing engine AND stale entry); M4 never warn → the stall pin and the live-ticker pin FAIL; M5 drop the quiesce exclusion → the grow-gate pin FAILS; M6 never reset on progress → the slow-but-progressing pin FAILS; M7 remove the watchdog from the chunk ticker → the lane roster and the live-ticker pin FAIL; M8 remove it from the raw lane → the lane roster FAILS naming that lane; M9 drop `GrowGate` at the multi-database site → the `bulkCopyOpts` roster FAILS; M10 make `QuiescedSince` always true → the QuiescedSince pin FAILS; M11 ignore the owner deadline → never-lengthens FAILS in three shapes; M12 no wrapper at all → arm-per-write and the real-socket pin FAIL; M13 fixed re-warn interval → the widening pin FAILS (9 warnings where ≤6 is the bound).
 
+### 152. A `json[]` / `bytea[]` column reaching a MySQL target silently base64s its elements — *OPEN, HIGH (SILENT LOSS); filed 2026-08-07 by the value-fidelity review of audit B-2's own fix (backlog entry B-2c)*
+
+`convertArrayLikeToJSON` (`internal/engines/mysql/row_writer.go:1433`) hands the array to `encoding/json` in its `[]any` arm (`:1453-1458`), and `encoding/json` renders a `[]byte` element as **base64**. So a Postgres `json[]` holding `{"{\"a\":1}"}` lands on a MySQL JSON column as `["eyJhIjoxfQ=="]` — a document replaced by an opaque string — at **exit 0**. `bytea[]` is the same shape on the same arm.
+
+**Why it is silent rather than loud.** `json.Marshal` succeeds; every layer reports success; the target holds a syntactically valid JSON array of the right length. Nothing downstream can tell a base64 string from a string the source actually contained, which is what puts it above the loud unwritable-family failures (items 141/145) rather than beside them.
+
+**It is item 145's unenumerated sibling, and that is the generalisable part.** Item 145 swept the `json[]` family across the PG target and the pgtrigger door and closed both; it did not look at the MySQL target. The two doors were fixed and their third was not — the sibling-sweep shape CLAUDE.md calls the project's most expensive recurring failure. No pin exists in any shape on the MySQL side of this family.
+
+**Fix shape, and the ambiguity that constrains it.** The leaf has to be decided rather than marshalled: `[]byte` elements need an explicit arm that renders the document (or the `\x`-hex bytes) rather than falling through to `json.Marshal`'s default. Note item 145's finding applies here verbatim and is already written down at the pgtrigger refusal — **`json`/`jsonb` is the one array family whose value space collides with the capture format's own encoding**, so a payload-decoded `json[]` cannot distinguish a JSON `null` element from a SQL NULL element, nor an array-valued element from a nested dimension. Item 145 resolved that by REFUSING the payload-decoded shapes by name and installing a target-independent `json-array-column` refusal in `pgtrigger.Setup`, which already covers a MySQL target arriving by that door. What is uncovered is the **SQL read door**, where the element is an unambiguous `[]byte`.
+
+**Gate.** A MySQL-target row in the array family × shape matrix, ground-truthed with the server's own `JSON_EXTRACT` / `->>` on the landed value rather than with sluice's own reader — the Bug 74 discipline, and the "reader ≠ writer" half of the new-surface checklist. The durable form is a divergence map on the MySQL side matching `TestEveryDecodableArrayElementIsWritable` on the Postgres side: the two halves have still never been compared for this target.
+
+**In flight at filing time:** a separate agent is fixing this. This entry is the FILING only — nothing in `row_writer.go` or its tests was touched by the pass that wrote it.
+
 ### 151. A `--where` literal whose only deviation from canonical is a family coercion could be accepted rather than refused — *OPEN, LOW (usability); identified by the v0.114.0 regression cycle, deliberately not filed as a defect*
 
 Item 133 made `--where "ip = '10.0.0.1'"` against a MariaDB `INET6` column **refuse**, naming `::ffff:10.0.0.1` as the spelling to write. That is correct and it closed a silent-loss defect — but `10.0.0.1` is what an operator naturally writes, the server itself accepts it, and the tool now demands a spelling most people would have to be told about.
@@ -1895,9 +1911,10 @@ Item 133 made `--where "ip = '10.0.0.1'"` against a MariaDB `INET6` column **ref
 **Gate.** Whatever lands must keep the existing refusal cases refusing. The pin is the matrix already in `network_literal.go` — the four dotted-quad divergence shapes and the two MariaDB compression shapes — plus a new accepted case for the bare-IPv4-into-INET6 pair, ground-truthed on a real 11.4 server rather than asserted.
 
 **Note the near-miss in the same area.** The fail-closed `InetFamilyUnspecified` branch is **unreachable today** — Postgres declares `Any`, MariaDB declares `IPv4`/`IPv6` — so no test cell reaches it. That is correct as a guard against a future producer that forgets to decide, but it means the branch has no behavioural coverage and should be treated as unverified if it ever starts firing.
+
 ### 150. The SQLite name-collision fold is Unicode, not ASCII, so it over-refuses a pair SQLite would keep — *OPEN, LOW; found by the v0.114.0 regression cycle*
 
-`namecollide.New[...](strings.ToLower)` at all three SQLite call sites — the index walk (item 134, shipped v0.114.0), and the table/view walk (items 147/148, unreleased) — folds through Go's `strings.ToLower`, which is **Unicode-aware**. SQLite folds **ASCII only**. The fold is therefore a strict superset of the engine's, and the difference is operator-visible: `idx_é` and `idx_É` are two distinct indexes on a real SQLite target and migrated correctly through v0.113.0, and are refused from v0.114.0 on. The table and view walks will carry the same over-refusal into the next release.
+`namecollide.New[...](strings.ToLower)` at all three SQLite call sites — the index walk (item 134, shipped v0.114.0), and the table/view walk (items 147/148, shipped v0.115.0) — folds through Go's `strings.ToLower`, which is **Unicode-aware**. SQLite folds **ASCII only**. The fold is therefore a strict superset of the engine's, and the difference is operator-visible: `idx_é` and `idx_É` are two distinct indexes on a real SQLite target and migrated correctly through v0.113.0, and are refused from v0.114.0 on. The table and view walks carry the same over-refusal from v0.115.0 on.
 
 **Severity is LOW and the direction is deliberate** — it is a loud refusal naming a rename, never a silent loss, and the residual is documented at each call site rather than implied. It is filed anyway because it is a behaviour regression on a schema shape that previously worked, the remedy it prints ("rename one of the two") is advice the operator did not need, and the fix is small.
 
@@ -1905,10 +1922,11 @@ Item 133 made `--where "ip = '10.0.0.1'"` against a MariaDB `INET6` column **ref
 
 **Gotcha, and the reason this is worth doing properly rather than inlining three times.** The correct fold is a property of the TARGET ENGINE, not of Go — MySQL's is `lower_case_table_names`-dependent and server-side (item 149), Postgres compares quoted identifiers byte-exactly, and SQLite is ASCII-only. A shared `namecollide` helper named for the *engine's* rule rather than for `ToLower` keeps item 149's fix from having to re-litigate this. Do NOT unify the fold itself across engines — unify the seam.
 
-**Update from item 149 (2026-08-07), which landed first and followed that instruction.** MySQL's fold is now a NAMED function, `engines/mysql.foldMySQLIdentifier`, used by both axes of `lower_case_table_names` (database names and table names) and deliberately NOT shared with SQLite's walk. So the seam this entry asked for exists on the MySQL side and item 150's ASCII fold must be a SQLite-side function of its own — not a replacement for `namecollide`'s `fold` parameter across engines. One measurement from that item is worth carrying here, because it makes the two engines' rules provably different rather than presumed so: **MySQL under lct=1 DOES fold `é`/`É`** (Note 1050, one table, on both `mysql:8` and `mariadb:11.4`), where SQLite does not. A single shared ASCII fold would therefore be correct for SQLite and an UNDER-refusal — the silent direction — for MySQL.
+**Update from item 149 (shipped v0.115.0), which landed first and followed that instruction.** MySQL's fold is now a NAMED function, `engines/mysql.foldMySQLIdentifier`, used by both axes of `lower_case_table_names` (database names and table names) and deliberately NOT shared with SQLite's walk. So the seam this entry asked for exists on the MySQL side and item 150's ASCII fold must be a SQLite-side function of its own — not a replacement for `namecollide`'s `fold` parameter across engines. One measurement from that item is worth carrying here, because it makes the two engines' rules provably different rather than presumed so: **MySQL under lct=1 DOES fold `é`/`É`** (Note 1050, one table, on both `mysql:8` and `mariadb:11.4`), where SQLite does not. A single shared ASCII fold would therefore be correct for SQLite and an UNDER-refusal — the silent direction — for MySQL.
 
 **Pin.** The ground-truth matrix in `object_namespace.go` already records `CREATE TABLE IF NOT EXISTS "É"` vs table `é` → **ok, CREATES BOTH**. That row is the assertion: it currently documents a case the check gets wrong. A test that migrates the non-ASCII pair to a real SQLite target and expects TWO objects is the gate, and it should fail today.
-### 149. A MySQL target under `lower_case_table_names != 0` merges two source tables exactly as SQLite does — *✅ FIXED 2026-08-07 (unreleased — ships after v0.114.0). NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement. 149b (the trigger engines' change-log tables) is deliberately NOT closed here — see below.*
+
+### 149. A MySQL target under `lower_case_table_names != 0` merges two source tables exactly as SQLite does — *✅ SHIPPED v0.115.0 (`d966191b`). NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement. 149b (the trigger engines' change-log tables) is deliberately NOT closed here — see below.*
 
 **Implementation notes (2026-08-07).**
 
@@ -1965,7 +1983,7 @@ The second row is why item 148's connection-free `ir.TableEmitPreflighter` canno
 
 </details>
 
-### 148. SQLite `CREATE TABLE IF NOT EXISTS` has the identical silent no-op, and it LOSES ROWS — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 148. SQLite `CREATE TABLE IF NOT EXISTS` has the identical silent no-op, and it LOSES ROWS — *✅ SHIPPED v0.115.0 (`5c8c699a`). NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -2026,7 +2044,7 @@ Nothing refuses either route today.
 
 </details>
 
-### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *✅ SHIPPED v0.115.0 (`206a0ad7`). NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -2101,10 +2119,11 @@ Needs its own error code rather than borrowing `SLUICE-E-SCHEMA-INDEX-NAME-COLLI
 
 **Mutation runs, each confirmed applied before the result was trusted** (the 2026-08-05 rule): M1 discard the ceiling at the copy core → worker-channel gate FAILS (this is the pre-fix behaviour); M2 hard-code the ceiling always-on → the "no ceiling ⇒ degree stands" half FAILS; M4 make the floor check `<=` so a real PS-10 reads as unknown → the item-123 control FAILS in three places; M5 re-open item 123 (sub-floor buckets to the tightest cap) → the coupling + budget-separation gates FAIL; M6 duplicate the floor predicate with a wrong value → the anti-drift gate FAILS; M7 drop the knob at the multi-database site → the roster gate FAILS; M8 hard-code it there → the probe-sourced check FAILS; M9 return 0 from the crossing → the carries-the-probed-ceiling gate FAILS. **M3 is recorded as an EQUIVALENT MUTANT, not a coverage gap**: replacing the derived predicate with `bytes >= floor` is behaviour-identical today and correctly does not fail anything — M6 is the version of it that actually diverges, and it is caught.
 
-<details>
-<summary>Original report (kept for provenance — note its mechanism is corrected above)</summary>
+A third version-pair was recorded during the fix's validation (2026-08-06, a freshly created PS-10): production 8.4.9-Vitess / dev 8.4.11-Vitess. Three databases, three pairs, no two alike — which settles the entry's own advice: the version pair is not a publishable fact, the INVARIANT is.
 
-### 145. A `json[]` / `jsonb[]` column cannot reach a Postgres target either — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk, so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+**Note on this entry's provenance block (2026-08-07), because it is the SECOND instance of one class.** `b05a2d88`'s duplicate-heading cleanup deleted item 144's original report but left its `<details>`/`<summary>` wrapper behind, and the matching `</details>` sat *below* item 142's heading — so on GitHub, items **145 and 142 both rendered inside item 144's collapsed disclosure**, and the paragraph above this one was orphaned away from the entry it belongs to. The empty wrapper is removed rather than re-closed, matching `9cbb5dbd`'s repair of the identical shape in item 146's section two days earlier. The deleted original report is recoverable at `git show e97ae2a7:docs/dev/roadmap.md`. **Both instances came from the same mechanism** — an awk/merge conflict resolution that kept both sides of a heading — so the cheap standing check is that every `<details>` in this file opens and closes without a `### ` heading between the two.
+
+### 145. A `json[]` / `jsonb[]` column cannot reach a Postgres target either — *✅ SHIPPED v0.115.0 (`206a0ad7`). NOT a concurrency chunk, so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -2130,10 +2149,19 @@ Item 141's divergence map (`TestEveryDecodableArrayElementIsWritable`) compares 
 
 **Scope note:** the value shapes differ per door. The SQL read path decodes `ir.JSON` to `[]byte` (`decodeBytes`); the pgtrigger payload path delivers a decoded JSON value. The leaf has to accept both, like `byteaArrayLeaf` does, and the refusal for anything else must be loud. The gate entry in `pgUnwritableArrayElement` is the tracking anchor — closing this item means deleting that entry, which the gate's other direction enforces.
 
-### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *✅ SHIPPED v0.114.0. `-race` Integration was green before the tag — the fix's subject is the streamer's rollover path.*
-</details>
+### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *✅ CLOSED, in two releases: the BEHAVIOUR shipped in **v0.113.0**, the GATE in **v0.114.0**. `-race` Integration was green before the v0.114.0 tag — the gate's subject is the streamer's rollover path.*
 
-A third version-pair was recorded during the fix's validation (2026-08-06, a freshly created PS-10): production 8.4.9-Vitess / dev 8.4.11-Vitess. Three databases, three pairs, no two alike — which settles the entry's own advice: the version pair is not a publishable fact, the INVARIANT is.
+**Recording both attributions, because this entry previously carried only the later one and the earlier one is the part an operator's binary actually contains.** Both change lanes got their byte ceiling in v0.113.0: `internal/pipeline/incremental.go` (the one-shot `backup incremental` lane) from `56a37f49`, which is audit C-3's own fix, and `internal/pipeline/stream.go`'s `changeChunkBuffer.processChange` (the continuous `backup stream run` lane — the one that writes most change chunks in practice) from `100c5a9b`. What landed in v0.114.0 (`4a6c3298`) is `TestChunkWriteLanes_EveryLaneBoundsAChunkByBytes`, which is what would have caught the first miss. A single "SHIPPED v0.114.0" stamp told a reader on v0.113.x that they were exposed when they were not.
+
+**The entry as filed was stale on arrival, which is itself the point.** It described `stream.go` as still count-only; that was already false when written, because the ceiling reached the stream lane in the same unreleased delta. Two fixes (item 116 P3 on the DATA lane, C-3 on the change lane), two enumerations, two misses — and nothing in the tree compared the lanes. What was genuinely missing was never the ceiling. It was a check holding the lanes together.
+
+**What the gate does.** Discovery is by CALL SITE, not by a written list: every production construction of a `blobcodec.NewChunkWriter` / `NewChangeChunkWriter` under `internal/pipeline` is a lane, grouped by the receiver type that owns the writer, and each must compare `BytesWritten()` inside a roll condition. A marker read into a manifest field is a stamp, not a ceiling, and does not count. The byte half has **no exemption**; the count half has a fail-by-default `countCeilingExempt` map with a written reason per entry, and a stale entry fails the build.
+
+**The roster it derives — four lanes, three of them change lanes:** `IncrementalBackup` (`incremental.go`, change) ✓ bytes+count · `changeChunkBuffer` (`stream.go`, change) ✓ bytes+count · `chunkStreamSink` (`chain_compact_smart.go`, change) ✓ bytes, count-EXEMPT (it rewrites the collapsed stream into a FIXED set of pre-existing manifest slots per item 130, so there is no event-count semantics to bound) · `backupChunkStreamer` (`backup_parallel.go`, data) ✓ bytes+count. Anti-vacuity floors in both dimensions: fewer than 4 lanes, or fewer than 3 CHANGE lanes, is a Fatal — a walker that stopped matching, or one that found only data lanes, would otherwise be green for exactly the defect it was built for. Mutation-verified three ways (strip the byte clause from `stream.go` → fails naming that lane; strip it from `incremental.go` → fails naming that one; rename an exempt lane → stale-entry failure), each mutant confirmed applied by grepping its marker before the run.
+
+`RolloverMaxBytes` is deliberately NOT accepted as the ceiling and the gate says so: it bounds a whole rollover in COMPRESSED bytes at a transaction boundary, which is a different quantity at a different granularity.
+
+**Residual, recorded at the gate rather than left implied:** this is a STRUCTURAL check, and only two of the four lanes have a BEHAVIOURAL pin behind it — the data lane (`TestChunkByteCeiling_*`) and compaction (`chain_compact_smart_output_test.go`). Neither CHANGE lane has one: nothing today writes a wide change and asserts the chunk rolled on bytes rather than count. The gate closes the "one lane and not its sibling" class, not the "the threshold is wrong" class, and that next pin is the obvious follow-up.
 
 ### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *✅ SHIPPED v0.114.0. `byteaArrayLeaf` + the two-door divergence map `TestEveryDecodableArrayElementIsWritable`. The gate surfaced a THIRD unwritable family on its first run — `json[]`/`jsonb[]` — recorded as an explicit exemption rather than fixed; see the impl notes below.*
 
@@ -2158,7 +2186,7 @@ A third version-pair was recorded during the fix's validation (2026-08-06, a fre
 
 **Where the fix landed:** `byteaArrayLeaf` in `internal/engines/postgres/row_writer.go`; the gate is `TestEveryDecodableArrayElementIsWritable` in `row_writer_array_writable_roster_test.go`; the family × shape pins are `TestMigrate_PGToPG_ByteaArrays` (real PG→PG, `array_dims` + `::text` + `octet_length`) and the three bytea rows added to `arrayLeafFamilies()`.
 
-### 140. A pre-existing target schema's foreign keys abort a cold copy in 20 seconds, and nothing warns first — *✅ FIXED on `main` (unreleased). `SLUICE-E-TARGET-PREEXISTING-FOREIGN-KEY`, an extension of the ADR-0166 gate (`existingTablesGate.checkPreExistingForeignKeys`), on `migrate` and BOTH `sync` cold-start paths (single-database and the multi-database fan-out, the latter added 2026-08-07 — see the follow-up notes); `restore` / `chain restore` / `add-table` are exempt with an argued reason and a fail-by-default roster gate. Not a concurrency chunk — no goroutines, channels or shared state touched — so the `-race` Integration job is the ordinary post-push signal, not a pre-tag blocker.*
+### 140. A pre-existing target schema's foreign keys abort a cold copy in 20 seconds, and nothing warns first — *✅ SHIPPED v0.115.0 (`f92f3ff0`, with the multi-database fan-out half following in `7d29aa62`). `SLUICE-E-TARGET-PREEXISTING-FOREIGN-KEY`, an extension of the ADR-0166 gate (`existingTablesGate.checkPreExistingForeignKeys`), on `migrate` and BOTH `sync` cold-start paths (single-database and the multi-database fan-out, the latter added 2026-08-07 — see the follow-up notes); `restore` / `chain restore` / `add-table` are exempt with an argued reason and a fail-by-default roster gate. Not a concurrency chunk — no goroutines, channels or shared state touched — so the `-race` Integration job is the ordinary post-push signal, not a pre-tag blocker.*
 
 **Impl notes (2026-08-06).**
 
@@ -2265,7 +2293,7 @@ Totalled across the run: **4369.3s closed vs 1015.8s open — 81.1% quiesced.** 
 
 </details>
 
-### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *✅ RESOLVED on `main` 2026-08-06 as a CLAIM fix, not a behaviour change (unreleased — ships after v0.114.0). NOT a concurrency chunk by subject (no goroutine/channel/FSM change — one field added to the gate's mu-guarded state and one interface parameter), but the file it touches IS the coordinator, so read the `-race` Integration job before the tag.*
+### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *✅ SHIPPED v0.115.0 (`af217acc`) as a CLAIM fix, not a behaviour change. NOT a concurrency chunk by subject (no goroutine/channel/FSM change — one field added to the gate's mu-guarded state and one interface parameter), but the file it touches IS the coordinator, so read the `-race` Integration job before the tag.*
 
 **Phase A's answer to the crux question is NO, and that is the finding.** sluice cannot distinguish a real storage-grow reparent from a plain transport drop at the point the gate trips, so an evidence-GATED trip is not available and the honest fix is the claim, not the trigger.
 
