@@ -149,9 +149,9 @@ func formatPartitionedRefusal(parents []string) string {
 		"partition hierarchy first, then re-run with `--exclude-table=<parent>` so this refusal clears and " +
 		"the children copy their rows into the pre-created partitions — sluice creates tables with " +
 		"CREATE TABLE IF NOT EXISTS, so the restored hierarchy is left alone. (Note there is no " +
-		"--schema-already-applied on migrate: that DDL-skip flag exists on sync start only, and this " +
-		"preflight does not run there, so a sync cold start would flatten the hierarchy instead of " +
-		"refusing.) ")
+		"--schema-already-applied on migrate: that DDL-skip flag exists on sync start only. This " +
+		"preflight runs on the sync cold start too, ahead of that flag's branches, so a filtered or " +
+		"schema-already-applied sync refuses here as well.) ")
 	b.WriteString("Native partition-aware support is roadmap-tracked but not yet shipped")
 	return b.String()
 }

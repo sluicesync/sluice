@@ -26,7 +26,8 @@
 // database/sql, never anything sluice reports — because the defect's entire
 // character is that sluice reports success. The merged run exits 0 with a row
 // count that is correct for the surviving name, and `verify` compares that name
-// against that name and agrees.
+// against that name and agrees — FALSE; see object_namespace.go. verify would
+// catch this; the MIGRATION is what reports success.
 //
 // # The pre-fix behaviour these tests pin against, measured
 //

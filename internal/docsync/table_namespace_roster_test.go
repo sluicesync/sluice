@@ -33,7 +33,8 @@ import (
 // OBJECT. This one covers the member where the casualty is ROWS: the second
 // CREATE no-ops, the copy INSERTs under a name that resolves to the first
 // table, both tables' rows end up in one, the surviving name's count is right,
-// and `verify` — which compares that name against that name — agrees. A gate is
+// and nothing during the run says so. (A later `verify --depth count` WOULD
+// catch it; the MIGRATION is what reports success.) A gate is
 // the only thing that can catch this class, because nothing at runtime can.
 //
 // # What it reaches, stated so the name cannot be read as broader

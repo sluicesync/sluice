@@ -56,8 +56,19 @@ import (
 // A lost index or view is a MISSING object. A lost table is not missing: the
 // rows destined for it are INSERTed under a name that resolves — by the same
 // fold — to the table that won, so both tables' rows land in one table. The
-// count is right for the surviving name, `verify` compares that name against
-// that name, and the run exits 0. There is no operator-visible signal at all.
+// count is right for the surviving name and the run exits 0 with no failing
+// statement and no warning.
+//
+// Corrected 2026-08-07, because this comment used to add "and `verify`
+// compares that name against that name, and agrees" — which is FALSE, and was
+// repeated into five other homes including the published operator doc.
+// [Verify] iterates SOURCE tables and compares `srcCount != tgtCount`
+// (`pipeline/verify.go:376`), so with `orders`=2 and `Orders`=2 against a
+// merged target of 4, BOTH source tables mismatch. A later `verify --depth
+// count` would catch this. What is silent is the MIGRATION: it reports
+// success. That is still worth a preflight — an operator should not need a
+// separate opt-in step to discover that two tables became one — but the
+// stronger claim was not checked and was not true.
 //
 // # Claim ORDER is the message's accuracy, not a detail
 //

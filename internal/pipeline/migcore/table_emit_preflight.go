@@ -23,7 +23,9 @@ import (
 // success that creates nothing when the (case-folded) name is taken, and the
 // copy then INSERTs that table's rows under a name that resolves to the table
 // which won. Both tables' rows sit in one table, the count is right for the
-// surviving name, `verify` compares that name against that name and agrees,
+// surviving name and the run exits 0 with no failing statement. (A later `verify
+// --depth count` WOULD catch it — it compares each SOURCE table against the
+// target, so both mismatch the merged count. The migration is what is silent.)
 // and the run exits 0. There is no signal anywhere in the run.
 //
 // # Why a third sibling rather than one more question inside either

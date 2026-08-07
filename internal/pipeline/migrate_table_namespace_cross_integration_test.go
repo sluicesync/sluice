@@ -20,7 +20,9 @@
 // the defect's entire character is that sluice reports success. A migration
 // that merges two tables copies every row, exits 0, and leaves a row count that
 // is correct for the surviving name; `verify` compares that name against that
-// name and agrees. So "the run failed" is not the assertion. The assertion is
+// name and agrees — FALSE; verify compares each SOURCE table against the target
+// and both would mismatch. The migration is what is silent. So "the run failed"
+// is not the assertion. The assertion is
 // what is in the file.
 //
 // # The pre-fix behaviour these tests pin against, measured
