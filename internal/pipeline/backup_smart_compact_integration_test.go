@@ -163,6 +163,25 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 			reduction)
 	}
 
+	// The emitted-side memory ceiling reached the operator's report (roadmap
+	// item 130). `smartCompactResult.merge` has always aggregated this as a
+	// MAX across incrementals, and `CompactChain` dropped the aggregate on the
+	// floor — so the careful max-not-sum arithmetic was computed and
+	// discarded, and the field's doc claiming it was "reported" was true only
+	// of a log line. A zero here means the wiring is gone again.
+	//
+	// A floor, not a ceiling: what the number should BE depends on the chain's
+	// chunk sizes and is pinned in the unit gates
+	// (chain_compact_smart_output_test.go). This asserts only that a real
+	// compaction of a real chain surfaces one.
+	if res.PeakChunkBufferBytes <= 0 {
+		t.Errorf("PeakChunkBufferBytes = %d after a smart compaction that rewrote %d events; want > 0 — "+
+			"the per-incremental peaks are aggregated and then never read, which is how the field's "+
+			"'reported' doc stopped being true", res.PeakChunkBufferBytes, res.EventsBefore)
+	}
+	t.Logf("emitted-side peak chunk buffer: %d B; chains evicted: %d",
+		res.PeakChunkBufferBytes, res.ChainsEvicted)
+
 	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) == 0 {
 		t.Fatal("post-compact catalog has no segments")

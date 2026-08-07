@@ -552,6 +552,180 @@ func TestSmartCompactOutput_PreCeilingChainDegradesToOneChunk(t *testing.T) {
 	}
 }
 
+// seedChangeChunksAtCeiling writes totalEvents events into change chunks using
+// the PRODUCTION roll rule — write the event, then roll if
+// `writer.BytesWritten() >= ceiling` — which is verbatim what both change-chunk
+// lanes do (`stream.go`'s changeChunkBuffer.processChange and `incremental.go`'s
+// captureWindow, each against [DefaultBackupChunkBytes]).
+//
+// The ceiling is a PARAMETER here and the real lanes hardcode the constant, so
+// this reproduces the rule at reduced scale rather than the number. That split
+// is deliberate and the other half is held mechanically: the constant-identity
+// half is pipeline's TestChangeChunkLanes_RollOnTheSameCeilingCompactionBudgets
+// From, which asserts both lanes and the compactor name ONE symbol. Running
+// this at the real 64 MiB would cost a ~200 MiB corpus to say the same thing
+// about arithmetic that does not vary with scale.
+func seedChangeChunksAtCeiling(
+	t *testing.T,
+	store irbackup.Store,
+	schema *ir.Schema,
+	cek []byte,
+	ceiling int64,
+	totalEvents, width int,
+) *irbackup.Manifest {
+	t.Helper()
+	im := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
+		SourceEngine:  "postgres",
+		CreatedAt:     time.Now().UTC(),
+		Kind:          irbackup.BackupKindIncremental,
+		Schema:        schema,
+	}
+	var (
+		w   *blobcodec.ChangeChunkWriter
+		buf *bytes.Buffer
+		ch  *irbackup.ChunkInfo
+	)
+	open := func() {
+		ch = &irbackup.ChunkInfo{File: fmt.Sprintf("chunks/_changes/incr-%03d.jsonl.gz", len(im.ChangeChunks))}
+		if cek != nil {
+			ch.Encryption = &irbackup.ChunkEncryption{Algorithm: crypto.AlgorithmAESGCM, NonceLen: 12, AuthTagLen: 16}
+		}
+		im.ChangeChunks = append(im.ChangeChunks, ch)
+		buf = &bytes.Buffer{}
+		var err error
+		// The AAD binds the manifest identity, this chunk's File and its
+		// index — none of which a LATER append changes, so building the list
+		// as we go is sound.
+		w, err = blobcodec.NewChangeChunkWriter(buf, cek, blobcodec.CodecGzip, irbackup.ChangeChunkAADFor(im, ch, len(im.ChangeChunks)-1))
+		if err != nil {
+			t.Fatalf("seed chunk writer: %v", err)
+		}
+	}
+	closeChunk := func() {
+		if err := w.Close(); err != nil {
+			t.Fatalf("seed chunk close: %v", err)
+		}
+		if err := store.Put(context.Background(), ch.File, bytes.NewReader(buf.Bytes())); err != nil {
+			t.Fatalf("seed chunk put: %v", err)
+		}
+		ch.RowCount = w.ChangeCount()
+		ch.SHA256 = w.Hash()
+		w = nil
+	}
+	for i := range totalEvents {
+		if w == nil {
+			open()
+		}
+		if err := w.WriteChange(wideInsert(int64(i), width)); err != nil {
+			t.Fatalf("seed write %d: %v", i, err)
+		}
+		if w.BytesWritten() >= ceiling {
+			closeChunk()
+		}
+	}
+	if w != nil {
+		closeChunk()
+	}
+	return im
+}
+
+// TestSmartCompactOutput_AChunkAtTheWriterCeilingIsNotDegraded carries
+// [chunkStreamSink]'s premise end to end: when the input chunks were produced
+// by the writers' roll rule at ceiling C, compacting them with a per-slot
+// budget of C lands in the TIGHT bound, not the degraded one.
+//
+// # The independent expected value, named
+//
+// The ceiling assertion here is `C + one event`, and the one-event term is
+// derived from the CORPUS — the payload width the test itself chose, plus a
+// generous envelope — NOT from the sink's own `maxEvent` accounting. That
+// distinction is the point: [chunkStreamSink.degraded] compares its peak
+// against its own recorded largest event, so a test that asserted `!degraded()`
+// would be asking the sink whether the sink thinks it did well. Both numbers
+// existing does not make the comparison independent; only one of them is
+// evidence.
+//
+// # What this is the other half of
+//
+// TestSmartCompactOutput_PreCeilingChainDegradesToOneChunk pins that an
+// OVERSIZED input chunk really does blow past the budget — that the degraded
+// branch is reachable and not imaginary. This pins the complementary claim, and
+// the two together are what make the bound's documented `max(B, I)` shape
+// falsifiable in both directions: a compactor that always degraded would fail
+// here, and one that never did would fail there.
+func TestSmartCompactOutput_AChunkAtTheWriterCeilingIsNotDegraded(t *testing.T) {
+	const (
+		ceiling = 32 << 10
+		events  = 400
+		width   = 512
+		// One event's serialized upper bound, from the corpus: the payload,
+		// the id, and a generous allowance for the JSON envelope and the
+		// position token. Derived here rather than read off the sink.
+		maxEventUpperBound = width + 1024
+	)
+
+	for _, mode := range []struct {
+		name string
+		enc  bool
+	}{{"plaintext", false}, {"encrypted", true}} {
+		t.Run(mode.name, func(t *testing.T) {
+			var cek []byte
+			if mode.enc {
+				cek = testCEK(t)
+			}
+			store := newMemStore()
+			im := seedChangeChunksAtCeiling(t, store, noPKWideSchema(), cek, ceiling, events, width)
+
+			// The corpus must actually exercise several chunks, or "the peak
+			// stayed under the budget" is a statement about a single chunk
+			// that never had to roll.
+			if len(im.ChangeChunks) < 3 {
+				t.Fatalf("the seed produced %d chunk(s) at a %d-byte ceiling; want >= 3 — the corpus does "+
+					"not reach the rolling behaviour it is supposed to model", len(im.ChangeChunks), ceiling)
+			}
+			for i, ch := range im.ChangeChunks {
+				t.Logf("seeded chunk %d: %d events", i, ch.RowCount)
+			}
+
+			res, err := applySmartCompactionToIncrementalSized(
+				context.Background(), store, im, blobcodec.CodecGzip, cek, PKStrategyPK, ceiling,
+			)
+			if err != nil {
+				t.Fatalf("compact: %v", err)
+			}
+
+			if res.peakChunkBufferBytes > ceiling+maxEventUpperBound {
+				t.Errorf("peak chunk buffer %d B exceeds the tight bound of %d B (budget %d + one event %d).\n\n"+
+					"Every input chunk here was produced by the writers' own roll rule at this very ceiling, "+
+					"so I <= B holds and the compaction peak must be the BUDGET, not a chain's largest chunk. "+
+					"A failure here means chunkStreamSink's documented tight bound does not hold on the shape "+
+					"the writers actually produce — which is the only shape that matters.",
+					res.peakChunkBufferBytes, ceiling+maxEventUpperBound, ceiling, maxEventUpperBound)
+			}
+			t.Logf("%s peak %d B against a %d-byte budget (+%d one-event allowance), %d input chunks",
+				mode.name, res.peakChunkBufferBytes, ceiling, maxEventUpperBound, len(im.ChangeChunks))
+
+			// The independent oracle: read the artifact back with the real
+			// reader and check nothing was lost or reordered by the
+			// distribution. Compaction's own tallies are not consulted.
+			got := readAllChanges(t, store, im, cek)
+			if len(got) != events {
+				t.Fatalf("read back %d events; want %d", len(got), events)
+			}
+			for i, e := range got {
+				ins, ok := e.(ir.Insert)
+				if !ok {
+					t.Fatalf("event %d is %T; want ir.Insert", i, e)
+				}
+				if ins.Row["id"] != int64(i) {
+					t.Fatalf("event %d carries id %v; want %d — order must survive the distribution", i, ins.Row["id"], i)
+				}
+			}
+		})
+	}
+}
+
 // TestSmartCompactOutput_ClosingCommitStaysLastAcrossEveryFlusher is the F3
 // invariant, generalised from the one flusher that had it to all of them.
 //

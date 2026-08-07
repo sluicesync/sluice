@@ -1807,6 +1807,13 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 			// non-empty, so an operator diffing two runs sees the field go
 			// from empty to populated.
 			slog.Any("tables_unmatched", res.TablesUnmatched),
+			// The two memory-ceiling tallies (roadmap items 127 and 130).
+			// Printed unconditionally for the same reason as the bucket
+			// above: an operator comparing two runs of similar chains needs
+			// to see one of them hit its ceiling, and a field that appears
+			// only when it fires is a field nobody knows to look for.
+			slog.Int64("chains_evicted", res.ChainsEvicted),
+			slog.Int64("peak_chunk_buffer_bytes", res.PeakChunkBufferBytes),
 		)
 	}
 	slog.InfoContext(ctx, "backup compact: "+mode, topArgs...)
@@ -1832,6 +1839,8 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 				slog.Int64("events_after", g.EventsAfter),
 				slog.Int64("events_collapsed", g.EventsCollapsed),
 				slog.Int64("rows_collapsed", g.RowsCollapsed),
+				slog.Int64("chains_evicted", g.ChainsEvicted),
+				slog.Int64("peak_chunk_buffer_bytes", g.PeakChunkBufferBytes),
 			)
 		}
 		slog.InfoContext(ctx, "  group merged", groupArgs...)

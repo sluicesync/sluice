@@ -222,6 +222,34 @@ type CompactResult struct {
 	// plain INT PRIMARY KEY as having none.
 	TablesUnmatched []string
 
+	// ChainsEvicted is the number of row chains smart compaction wrote out
+	// before they could finish collapsing, because the retained-event
+	// ceiling ([defaultMaxRetainedBytes], roadmap item 127) was reached.
+	// Non-zero means the collapse was PARTIAL: the output is correct, and
+	// less compact than it could have been. Summed across groups, because
+	// each eviction is its own forgone collapse.
+	//
+	// Reported rather than left to be inferred from the collapse ratio:
+	// "compacted less well than it could have" and "had nothing to
+	// compact" are the same EventsCollapsed otherwise.
+	ChainsEvicted int64
+
+	// PeakChunkBufferBytes is the high-water mark of the EMITTED bytes
+	// held for a not-yet-written output chunk — the number
+	// [chunkStreamSink] bounds (roadmap item 130).
+	//
+	// A MAXIMUM, not a total, at every level of aggregation: two
+	// incrementals compacted one after the other never hold their buffers
+	// at the same time, and neither do two groups.
+	//
+	// Worth reading when it is large. The bound is the per-slot budget for
+	// a chain whose chunks were written by >= v0.114.0, and that chain's
+	// LARGEST CHUNK for an older one — so a number far above
+	// [DefaultBackupChunkBytes] is the second case, and says the chain
+	// predates the per-chunk byte ceiling rather than that anything is
+	// wrong. See [chunkStreamSink] for the whole argument.
+	PeakChunkBufferBytes int64
+
 	// Plan is the per-group breakdown — populated under DryRun (the
 	// reporting-only path) AND under real compact (so callers can log
 	// what actually happened). One entry per CONSIDERED group AFTER the
@@ -274,6 +302,12 @@ type CompactPlanGroup struct {
 	// See [CompactResult.TablesUnmatched] — a defect signal, not a table
 	// property.
 	TablesUnmatched []string
+
+	// ChainsEvicted / PeakChunkBufferBytes are the two memory-ceiling
+	// tallies. See [CompactResult] for what each number means; the
+	// per-group values carry the same semantics over this group alone.
+	ChainsEvicted        int64
+	PeakChunkBufferBytes int64
 }
 
 // compactStagingDirPrefix is the on-disk marker for a mid-compact
@@ -568,11 +602,21 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 			res.Plan[pi].RowsCollapsed = groupRes.rowsCollapsed
 			res.Plan[pi].TablesWithoutPK = groupRes.tablesWithoutPKList()
 			res.Plan[pi].TablesUnmatched = groupRes.tablesUnmatchedList()
+			res.Plan[pi].ChainsEvicted = groupRes.chainsEvicted
+			res.Plan[pi].PeakChunkBufferBytes = groupRes.peakChunkBufferBytes
 			break
 		}
 		res.EventsBefore += groupRes.eventsBefore
 		res.EventsAfter += groupRes.eventsAfter
 		res.RowsCollapsed += groupRes.rowsCollapsed
+		res.ChainsEvicted += groupRes.chainsEvicted
+		// A peak is a MAXIMUM at every level: two groups compacted one
+		// after the other never hold their buffers at the same time. This
+		// mirrors [smartCompactResult.merge], which does the same for the
+		// incrementals within a group.
+		if groupRes.peakChunkBufferBytes > res.PeakChunkBufferBytes {
+			res.PeakChunkBufferBytes = groupRes.peakChunkBufferBytes
+		}
 		// Re-derive BytesAfter for this group: the chunks have been
 		// rewritten with possibly-fewer events, so the merged
 		// segment's actual byte total is groupRes.bytesAfter (chunk
@@ -632,6 +676,8 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 			slog.Int64("events_collapsed", res.EventsCollapsed),
 			slog.Int64("rows_collapsed", res.RowsCollapsed),
 			slog.Int("tables_without_pk", len(res.TablesWithoutPK)),
+			slog.Int64("chains_evicted", res.ChainsEvicted),
+			slog.Int64("peak_chunk_buffer_bytes", res.PeakChunkBufferBytes),
 		)
 	}
 	slog.InfoContext(ctx, "backup compact: lineage compacted", logArgs...)

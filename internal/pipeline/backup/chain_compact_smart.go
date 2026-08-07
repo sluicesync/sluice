@@ -1683,24 +1683,42 @@ func applySmartCompactionToIncrementalSized(
 // # I ≤ B is NOT something this code may assume, and that is checked, not hoped
 //
 // The tempting version of this comment says "chains written by a recent binary
-// cap a change chunk at [DefaultBackupChunkBytes], so I ≤ B". Ground-truthed
-// against the code, that is false in two ways worth writing down:
+// cap a change chunk at [DefaultBackupChunkBytes], so I ≤ B". As of v0.114.0
+// that is finally TRUE — and it is written down here with the gate that holds
+// it, because the same sentence was FALSE when this type shipped in v0.113.0
+// and the difference is invisible to anything in this file.
 //
-//   - The change-chunk byte ceiling (audit 2026-08-05 C-3) is on `main` and
-//     UNRELEASED, so no published binary has ever written a capped change
-//     chunk.
-//   - It reached ONE of the two lanes that write them. `incremental.go` rolls
-//     on `writer.BytesWritten() >= DefaultBackupChunkBytes`; `stream.go`'s
-//     `changeChunkBuffer.processChange` — the continuous `backup stream run`
-//     lane, which produces most change chunks in practice — still rolls on the
-//     event COUNT alone. Its rollover-level `RolloverMaxBytes` bounds a
-//     rollover at a transaction boundary, not a chunk.
+// The history is the reason for the ceremony. The change-chunk byte ceiling
+// (audit 2026-08-05 C-3) reached ONE of the two lanes that write change
+// chunks: `incremental.go`'s `captureWindow` rolled on
+// `writer.BytesWritten() >= DefaultBackupChunkBytes` while `stream.go`'s
+// `changeChunkBuffer.processChange` — the continuous `backup stream run` lane,
+// which produces most change chunks in practice — still rolled on the event
+// COUNT alone. Roadmap item 142 closed that sibling in v0.114.0, so BOTH lanes
+// now roll on the same constant this type budgets its slots from.
 //
-// So the degraded case is the NORMAL case today, not a legacy-chain edge, and
-// nothing here is allowed to depend on the tight bound. That is why the
-// degradation is logged and pinned rather than argued away, and why the gate
-// measures both. The stream lane's missing ceiling is its own sibling gap, not
-// this type's to close.
+// So the position today, stated in the two halves that differ:
+//
+//   - A chain whose change chunks were written by >= v0.114.0 has I <= B by
+//     construction, and the tight bound — peak <= B plus the one-event
+//     overshoot — is the one that applies.
+//   - A chain written by <= v0.113.x may carry an arbitrarily large change
+//     chunk, and for it the bound really is that chain's largest chunk. That is
+//     now a LEGACY-chain case rather than the normal one, but it is not a
+//     hypothetical: nothing rewrites an existing chunk, so every chain already
+//     in a store keeps whatever shape it was written with.
+//
+// Nothing in this type is allowed to DEPEND on the tight bound either way —
+// the degraded branch is live code, logged when it fires and pinned by
+// TestSmartCompactOutput_PreCeilingChainDegradesToOneChunk. What the premise
+// buys is the claim an operator reads, and that claim is the one that rots.
+// Two facts being separately true is not the same as the argument between them
+// being pinned, so the binding is mechanical rather than prose:
+// TestChangeChunkLanes_RollOnTheSameCeilingCompactionBudgetsFrom asserts that
+// every lane writing a change chunk rolls on the very symbol
+// [applySmartCompactionToIncrementalSized] resolves its default budget from,
+// and TestSmartCompactOutput_AChunkAtTheWriterCeilingIsNotDegraded carries the
+// implication end to end.
 //
 // # Slot exhaustion
 //
