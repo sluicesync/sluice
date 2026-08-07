@@ -358,8 +358,12 @@ func TestSetup_RefusesJSONArrayColumn(t *testing.T) {
 		for _, r := range plan.Refusals {
 			if r.Reason == "json-array-column" {
 				sawJSONArray = true
-				if !contains(r.Hint, "--exclude-column") {
-					t.Errorf("Refusal.Hint = %q; want contains '--exclude-column'", r.Hint)
+				// --type-override, not "--exclude-column": there is no
+				// column-scope filter in sluice at all (ADR-0177), so this
+				// assertion pinned a flag the operator could never pass
+				// until the Bug 230 sweep.
+				if !contains(r.Hint, "--type-override") {
+					t.Errorf("Refusal.Hint = %q; want contains '--type-override'", r.Hint)
 				}
 			}
 		}
