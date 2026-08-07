@@ -1028,6 +1028,56 @@ func (r *Restore) restoreChunkGroup(
 	table *ir.Table,
 	group []*irbackup.ChunkInfo,
 ) (int64, error) {
+	// Resolve the write door FIRST, before a single goroutine or channel
+	// exists, so a refusal here costs nothing and cannot strand a producer.
+	//
+	// DataOnly (later rotation-segment full): the snapshot is re-applied
+	// OVER the rows the prior segment already restored, so the write has to
+	// CONVERGE rather than accumulate — that is the idempotent upsert writer
+	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Each worker type-asserts its
+	// OWN writer, so the dispatch decision is independent, and idempotent
+	// upsert is order- and concurrency-independent for the disjoint rows of
+	// a snapshot.
+	//
+	// A writer WITHOUT the surface is REFUSED rather than silently falling
+	// back to plain WriteRows (2026-08-07 invariant sweep). The comment this
+	// replaces argued the fallback was safe because "the caller's lineage
+	// invariant (S_n >= prior end) means the rows are at-or-ahead, so a
+	// plain insert only collides on a PK the upsert would have updated to
+	// the same value" — an argument that silently assumes a PK exists. A
+	// KEYLESS table has nothing to collide on, so a plain INSERT of segment
+	// N's snapshot over segment N-1's restored rows duplicates every row it
+	// re-carries, at exit 0. Loud beats that.
+	//
+	// No registered engine reaches the refusal today, and the reason is
+	// STRUCTURAL rather than lucky: [ChainRestore.Run] opens
+	// OpenChangeApplier before the segment walk, so only a CDC-apply target
+	// ever gets here, and every engine implementing that door (mysql,
+	// postgres, pgtrigger) also implements [ir.IdempotentRowWriter]. The one
+	// target-capable engine with no idempotent form — sqlite — refuses
+	// OpenChangeApplier and so cannot reach a DataOnly segment at all. That
+	// is a premise about the engine REGISTRY, which this package cannot
+	// import, so it is checked rather than asserted: docsync's
+	// TestChainRestoreTargetsAreIdempotentWriters derives both sets and
+	// fails when they diverge. This refusal is the belt for the day they do.
+	//
+	// The replaced comment also claimed "no-PK tables fall back to plain
+	// WriteRows". There is no PK branch at this dispatch and never was: a
+	// no-PK table goes through WriteRowsIdempotent like any other, the
+	// engines key the upsert on a non-null UNIQUE index when there is no
+	// PRIMARY KEY, and a TRULY keyless table is refused loudly by the engine
+	// (errKeylessIdempotent, Bug 125). So a keyless table in a ROTATED chain
+	// fails the restore rather than duplicating into it — deliberate, and
+	// the same call ADR-0108's keyless carve-out makes for copy retries.
+	writeFn := rw.WriteRows
+	if r.DataOnly {
+		iw, ok := rw.(ir.IdempotentRowWriter)
+		if !ok {
+			return 0, errRestoreDataOnlyNotIdempotent(table, rw)
+		}
+		writeFn = iw.WriteRowsIdempotent
+	}
+
 	// Bug 40b fix (v0.20.1): wrap the producer goroutine in a derived
 	// context so a writer-side failure can cancel the producer.
 	// Pre-fix: the producer pushed rows into an unbuffered channel
@@ -1086,24 +1136,6 @@ func (r *Restore) restoreChunkGroup(
 		resCh <- groupResult{rows: rowsApplied}
 	}()
 
-	// DataOnly (later rotation-segment full): use the idempotent
-	// upsert writer when the engine exposes it so re-applying the
-	// snapshot over the prior segment's restored rows converges
-	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Each worker type-asserts
-	// its OWN writer, so the dispatch decision is independent and
-	// idempotent upsert is order- and concurrency-independent for the
-	// disjoint rows of a snapshot. Engines without the surface, or
-	// no-PK tables, fall back to plain WriteRows — the caller's lineage
-	// invariant (S_n >= prior end) means the rows are at-or-ahead, so a
-	// plain insert only collides on a PK the upsert would have updated
-	// to the same value; the idempotent path is the correct one and
-	// shipping engines (PG, MySQL) implement it.
-	writeFn := rw.WriteRows
-	if r.DataOnly {
-		if iw, ok := rw.(ir.IdempotentRowWriter); ok {
-			writeFn = iw.WriteRowsIdempotent
-		}
-	}
 	if err := writeFn(ctx, table, rowCh); err != nil {
 		// Bug 40b: cancel the producer's context so a goroutine
 		// blocked on `rowCh <- row` unblocks via the streamChunkRows
@@ -1123,6 +1155,24 @@ func (r *Restore) restoreChunkGroup(
 		return 0, res.err
 	}
 	return res.rows, nil
+}
+
+// errRestoreDataOnlyNotIdempotent is the loud refusal for a DataOnly
+// (rotation-segment) restore into a writer with no idempotent form. See
+// the block at the head of [Restore.restoreChunkGroup] for why this is a
+// refusal and not a plain-INSERT fallback: the fallback's safety argument
+// assumed a PK, and a keyless table would silently duplicate.
+//
+// It names the table AND the writer's concrete type, because the only way
+// to reach it is a new or changed engine and the type is what identifies
+// which one.
+func errRestoreDataOnlyNotIdempotent(table *ir.Table, rw ir.RowWriter) error {
+	name := "<nil table>"
+	if table != nil {
+		name = table.Name
+	}
+	return fmt.Errorf("pipeline: restore: table %q is part of a rotation-segment (data-only) restore, but the target's row writer (%T) does not implement ir.IdempotentRowWriter — re-applying this segment's snapshot with a plain INSERT would duplicate every row the previous segment already restored on a table with no key to collide on; refusing rather than restoring silently-doubled data. Restore this chain into an engine whose writer implements the idempotent upsert path (mysql, postgres, pgtrigger)",
+		name, rw)
 }
 
 // errRestoreChunkPoolNoFactory is the loud precondition guard for the

@@ -12,11 +12,21 @@
 // The contract. A manifest records the format version its own chunks were
 // sealed under, and every reader recomputes at the version the artifact
 // records (ADR-0154 / ADR-0181's dual-version rule). That rule is what
-// makes "newer sluice always reads older" true forever, and it is
+// makes newer-sluice-reads-older true for the FORMAT VERSION, and it is
 // deliberately PER-LINK. The consequence is not per-link: a restore walks
 // the WHOLE chain, so a binary that refuses ANY one manifest restores
 // NOTHING from that chain — including the segments it wrote itself, under
 // a version it understands perfectly well.
+//
+// This paragraph used to end "true forever" (corrected 2026-08-07,
+// invariant sweep). It is not forever and it is not unconditional, and the
+// counterexample is two screens down in this very file: CELL 5 asserts a
+// newer binary REFUSING an older chain across a schema-fingerprint epoch.
+// The dual-version rule covers what the artifact RECORDS a version for;
+// the schema fingerprint records none. Both halves are true and the
+// unqualified sentence was the problem.
+//
+// forward-compat-caveats: schema-fingerprint-epoch
 //
 // So when a v0.104.0 binary (BackupFormatVersion 9) takes `backup
 // incremental` against a chain rooted by a v0.103.2 binary (at most 8),

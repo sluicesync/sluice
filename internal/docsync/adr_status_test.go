@@ -90,6 +90,19 @@ const adrIndexExemptRows = 73
 // parsers narrowed and the gate went partly vacuous without failing.
 const adrStatusPairsChecked = 110
 
+// adrStatusFilesParsed is the floor on how many ADR FILES [fileStatus]
+// resolves a status for. It is the third vacuity guard, and it exists
+// because the first two could not see the hole that produced it: an ADR
+// whose file declares no parseable status is out of scope for BOTH gates
+// above, and neither of them counts that. ADR-0067 sat there for ~26
+// releases saying "Proposed … No code written yet" about a design that
+// shipped in the same commit, because the first non-blank line of its
+// `## Status` section is an ADR-0087 amendment blockquote and the scan
+// gave up on it. Fixed in the scan (blockquote/admonition lines are
+// skipped, not terminal) and held here: if a parser narrows again, the
+// count drops and this fails instead of the coverage silently shrinking.
+const adrStatusFilesParsed = 182
+
 // indexStatuses parses docs/adr/README.md's table rows into
 // filename → status keyword. A row declares its status either as a
 // bold blob ("| **Accepted** — …") or as plain leading text
@@ -131,6 +144,16 @@ var adrStatusLineRe = regexp.MustCompile(`^(?:[-*]\s+)?\*{0,2}Status:?\*{0,2}\s*
 // a `**Status:**` lead paragraph. Reading only the first left 32 of the
 // index's status-bearing rows uncheckable, which is coverage the
 // adrStatusPairsChecked floor now holds.
+//
+// A leading BLOCKQUOTE inside the `## Status` section is skipped rather
+// than treated as the section's declaration. Amendment and correction
+// notes are written as `> **Amended by ADR-XXXX:** …` above the status
+// line, and stopping at the first one made the whole FILE invisible to
+// both gates — the ADR-0067 hole (see [adrStatusFilesParsed]). Skipping
+// is the honest reading: a blockquote annotates the status, it is not
+// the status. Anything else non-blank still terminates the scan, so a
+// section whose real declaration is genuinely absent stays out of scope
+// rather than being guessed at from later prose.
 func fileStatus(t *testing.T, path string) string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -148,10 +171,14 @@ func fileStatus(t *testing.T, path string) string {
 		if !inStatus || trimmed == "" {
 			continue
 		}
-		// First non-blank line of the section. Read it bold-or-plain —
-		// "Accepted — design." and "Accepted (implemented; shipping)."
-		// are as much a declaration as "**Accepted**", and the
-		// bold-only reading exempted 26 ADRs from the gate.
+		if strings.HasPrefix(trimmed, ">") {
+			continue
+		}
+		// First non-blank, non-blockquote line of the section. Read it
+		// bold-or-plain — "Accepted — design." and "Accepted
+		// (implemented; shipping)." are as much a declaration as
+		// "**Accepted**", and the bold-only reading exempted 26 ADRs
+		// from the gate.
 		if kw := declaredStatus(trimmed); kw != "" {
 			return kw
 		}

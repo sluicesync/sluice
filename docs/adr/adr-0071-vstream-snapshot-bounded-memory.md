@@ -2,7 +2,20 @@
 
 ## Status
 
-Proposed. Extends [ADR-0028](adr-0028-memory-bounded-streaming.md) (memory-bounded streaming via `--max-buffer-bytes`), whose audit covered the SQL `RowReader` (one row in flight) and the writer/applier accumulators but **never reached the PlanetScale VStream snapshot reader**.
+**Accepted — Phases 1 and 2 SHIPPED v0.99.3 (`9404dcb3`, PR #156); Phase 3 deferred and then superseded** for the multi-table case by [ADR-0095](adr-0095-vstream-auto-shard-by-table-copy.md) (auto-shard-by-table COPY). Extends [ADR-0028](adr-0028-memory-bounded-streaming.md) (memory-bounded streaming via `--max-buffer-bytes`), whose audit covered the SQL `RowReader` (one row in flight) and the writer/applier accumulators but **never reached the PlanetScale VStream snapshot reader**.
+
+> **Correction (2026-08-07 invariant sweep).** This line read a bare
+> `Proposed.` for the whole of the design's shipped life. The
+> backpressured COPY pump it describes is live and load-bearing —
+> `copyPump`, the enqueue-side byte cap and the Phase-1 loud refusal all
+> live in `internal/engines/mysql/cdc_vstream_snapshot.go`, ten non-test
+> files across five packages cite this ADR by number, and
+> ADR-0095 (Accepted) is built on top of it and replaces its Phase 3. The
+> only thing still unbuilt is that deferred Phase 3 (disk-spill), and the
+> loud refusal that stands in for it names it in the operator's message.
+> Found by `TestProposedADRsAreNotContradictedByShippedCode`, added in the
+> same pass as the ADR-0067 correction — this is the sibling that gate
+> existed to find.
 
 ## Context
 

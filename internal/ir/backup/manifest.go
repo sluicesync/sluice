@@ -22,8 +22,13 @@
 //     serialised public contract of a backup directory. Operators
 //     interact with this via `sluice backup verify`; tooling depends
 //     on it; restore reads it first. The format-version field is the
-//     load-bearing forward-compat anchor — older sluice refuses
-//     newer manifests, newer sluice always reads older.
+//     load-bearing forward-compat anchor: older sluice refuses newer
+//     manifests, and newer sluice reads older ones — as far as the
+//     format version goes. It is NOT the whole story, and the rest of
+//     it is in [BackupFormatVersion]'s doc under "What
+//     newer-reads-older does not cover".
+//
+// forward-compat-caveats: schema-fingerprint-epoch
 //
 // See `docs/dev/design/logical-backups.md` for the full design.
 package backup
@@ -42,7 +47,38 @@ import (
 // BackupFormatVersion is the highest manifest-schema version this
 // build understands. Older sluice refuses newer manifests with a
 // clear error (preflight in `internal/pipeline.readManifest`); newer
-// sluice always reads older.
+// sluice reads older ones.
+//
+// # What newer-reads-older does not cover
+//
+// Corrected 2026-08-07 (invariant sweep). This sentence read
+// "…ALWAYS reads older", unqualified, and it is false — a newer
+// binary refuses an older CHAIN whenever the two sit on opposite sides
+// of a SCHEMA-FINGERPRINT epoch. `verifySchemaHashes` recomputes each
+// link's [Manifest.SchemaHash] with THIS build's [ComputeSchemaHash],
+// which is a SHA-256 over the marshalled IR structs and keys off NO
+// recorded algorithm version — so an untagged field addition to
+// [ir.Index] or [ir.Column] re-fingerprints schemas that never changed,
+// and the byte-perfect chain an older release wrote becomes unreadable
+// here. Boundaries have shipped: two from untagged additions to
+// [ir.Index] at v0.100.0 and v0.103.0 — both INSIDE format version 8, so
+// the version gate cannot see either (roadmap item 102) — and one more
+// at v0.104.3, where an `omitempty` field believed to leave the zero
+// value alone was set by the PG reader on every primary-keyed table
+// (roadmap item 104 / Bug 216). The behavioural proof is cross-version,
+// not a hash compared against itself:
+// `TestBackup_CrossVersionChainCompat` cell 5 pins the refusal and cell
+// 6 pins the forward direction, each against a real binary built from a
+// real tag.
+//
+// The guarantee this constant DOES carry, stated exactly: every reader
+// recomputes at the version the ARTIFACT records (ADR-0152 / ADR-0154 /
+// ADR-0181's dual-version rule), so no format bump ever retroactively
+// invalidates bytes an older writer sealed. That is per-LINK, and a
+// chain restore walks every link — a binary refusing any one of them
+// restores nothing from that chain.
+//
+// forward-compat-caveats: schema-fingerprint-epoch
 //
 // v0.16.x manifests carry FormatVersion=1 (full backups only). v0.17.0
 // kept FormatVersion=1: every Phase 3 addition was forward-compatible
@@ -150,17 +186,21 @@ import (
 // (incremental / streaming) that fold their [Manifest.CDCPositionCommitsAfterRows]
 // flag into the deterministic [ComputeBackupID] (audit item 57 fold). That
 // flag decides whether the recorded EndPosition commits AFTER the window's
-// rows (VStream) — restore reads it to know a schema anchor at EndPosition
-// can't prove the data was applied (Bug 184). Before v8 the flag rode OUTSIDE
-// the BackupID, so on an UNSIGNED CDC manifest it could be flipped without
-// invalidating the id. The fold RAISES the bar (a v8 flip must also recompute
-// the id) but does NOT by itself close it, because ComputeBackupID is a keyless
-// public hash an adversary can recompute; the actual signing-independent
-// closure for the flag is the restore/broker re-derivation of commit-after-rows
-// from the source engine's OWN registered capability (SourceEngine is
-// BackupID-covered + AAD-bound — see backup.SourceEngineCommitsAfterRows,
-// audit-2026-07-11 H-1). Signing (--require-signature) remains the closure for
-// the sibling PG/MySQL anchor-forge. A v8 manifest's id covers the flag;
+// rows (VStream), which is why a schema anchor at EndPosition can't prove the
+// data was applied on such an engine (Bug 184). Before v8 the flag rode
+// OUTSIDE the BackupID, so on an UNSIGNED CDC manifest it could be flipped
+// without invalidating the id. The fold RAISES the bar (a v8 flip must also
+// recompute the id) but does NOT by itself close it, because ComputeBackupID
+// is a keyless public hash an adversary can recompute; the signing-independent
+// CLOSURE turned out to be simpler than the re-derivation this paragraph used
+// to propose — restore stopped trusting the anchor at all (item 60 /
+// audit-2026-07-12) and rests completeness on the change-chunk tail, so
+// flipping the flag buys an adversary nothing on the read side. (Corrected
+// 2026-08-07: the sentence here cited "backup.SourceEngineCommitsAfterRows"
+// as that closure. No such symbol exists, in this package or any other — it
+// named a re-derivation that was designed and then made unnecessary.) Signing
+// (--require-signature) remains the closure for the sibling PG/MySQL
+// anchor-forge. A v8 manifest's id covers the flag;
 // ComputeBackupID gates the extra field on the manifest's OWN recorded version,
 // so a mixed-version chain stays coherent — pre-v8 segments recompute WITHOUT
 // the flag (their legacy id) and v8 segments WITH it. Proportional per the
@@ -708,13 +748,25 @@ type Manifest struct {
 	// [ir.Capabilities.CDCPositionCommitsAfterRows] at backup time: true
 	// when the engine stamps CDC positions per-transaction-commit AFTER the
 	// rows (Vitess/VStream), so a schema-history snapshot can share a
-	// position with the row changes in its transaction. The restore-side
-	// completeness backstop reads this to decide whether a schema anchor at
-	// EndPosition proves the window's data was applied (see
-	// [Manifest.SchemaHistoryAnchors] and the Bug 184 guard in
-	// chain_restore.go / broker.go): it must NOT trust the anchor when this
-	// is true. Absent (false) on older manifests and on non-VStream engines,
-	// where a schema anchor strictly precedes its rows.
+	// position with the row changes in its transaction. Absent (false) on
+	// older manifests and on non-VStream engines, where a schema anchor
+	// strictly precedes its rows.
+	//
+	// Two live consumers, both on the WRITE side: [ComputeBackupID] folds it
+	// at FormatVersion 8+ (item 57), and the writer-side
+	// assertDataWindowEndPositionInvariant asserts the anchor invariant only
+	// when it is false.
+	//
+	// Corrected 2026-08-07 (invariant sweep): this doc used to say "the
+	// restore-side completeness backstop reads this to decide whether a
+	// schema anchor at EndPosition proves the window's data was applied …
+	// it must NOT trust the anchor when this is true". No restore-side code
+	// reads the field, and the conditional it describes does not exist —
+	// since item 60 / audit-2026-07-12 restore distrusts an anchor at
+	// EndPosition UNCONDITIONALLY and rests completeness on the change-chunk
+	// tail (see [Manifest.SchemaHistoryAnchors]'s own NOTE, which has said so
+	// while this field's doc contradicted it). Held by
+	// TestSchemaHistoryAnchorHasNoRestoreSideConsumer in internal/pipeline.
 	CDCPositionCommitsAfterRows bool `json:"cdc_position_commits_after_rows,omitempty"`
 
 	// ChainEncryption, when non-nil, identifies this manifest's chain

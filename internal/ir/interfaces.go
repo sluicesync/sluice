@@ -600,12 +600,26 @@ type IdempotentRowWriter interface {
 	RowWriter
 
 	// WriteRowsIdempotent has the same shape as [RowWriter.WriteRows]
-	// but generates upsert-form INSERT statements that tolerate PK
+	// but generates upsert-form INSERT statements that tolerate key
 	// collisions (ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE).
-	// Tables without a PK fall back to plain INSERT semantics — the
-	// orchestrator never calls this method on no-PK tables (the
-	// classify step routes those to truncate-and-redo) but
-	// implementations should still degrade gracefully if it happens.
+	//
+	// A table with no PRIMARY KEY is NOT out of scope, and both shipping
+	// implementations key the upsert on a deterministic non-null UNIQUE
+	// index when there is no PK (Bug 125 cross-engine symmetry). A TRULY
+	// keyless table — no PK, no non-null UNIQUE — has nothing to collide
+	// on, and implementations REFUSE it loudly rather than degrading to
+	// plain INSERT semantics, because a plain INSERT on the paths that
+	// call this (resume replay, VStream COPY catchup, a rotation-segment
+	// restore) duplicates rows instead of converging.
+	//
+	// Corrected 2026-08-07 (invariant sweep): this doc previously said
+	// "tables without a PK fall back to plain INSERT semantics — the
+	// orchestrator never calls this method on no-PK tables". Both halves
+	// were stale. The fallback is a loud refusal, and the orchestrator
+	// does call this on no-PK tables — [IdempotentCopyReader]'s cold-start
+	// path deliberately does, and so does the DataOnly branch of
+	// `pipeline/backup.Restore.restoreChunkGroup`, which dispatches on
+	// this interface alone with no PK branch anywhere.
 	WriteRowsIdempotent(ctx context.Context, table *Table, rows <-chan Row) error
 }
 

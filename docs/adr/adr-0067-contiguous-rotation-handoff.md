@@ -13,17 +13,42 @@
 > stamping / resume-backfill as silent-DR-loss hazards. See
 > [ADR-0087](adr-0087-compact-group-split-and-rotation-boundary-resume.md).
 
-**Proposed (2026-05-29) — pending owner sign-off before implementation.**
-Driven by Bug 95 (project's internal regression catalog): `sluice backup
-compact --smart-compaction` can never merge across a rotation boundary
+**Accepted — SHIPPED v0.88.0 (`97a6423a`, PR #85).** Driven by Bug 95
+(project's internal regression catalog): before this ADR, `sluice backup
+compact --smart-compaction` could never merge across a rotation boundary
 on a continuously-written PG source, so the headline "rotate a long
-chain, then compact the churn" value-prop is unreachable via the
+chain, then compact the churn" value-prop was unreachable via the
 documented operator flow. Builds on ADR-0046 (native bounded-segment
-lineage + inline rotation) and ADR-0064 (smart compaction). No code
-written yet — this ADR locks the design first, per the "lay out the
-design before touching the rotation/crash-recovery FSM" working
-agreement (ADR-0046 calls the rotation correctness core the review
-focus).
+lineage + inline rotation) and ADR-0064 (smart compaction); amended by
+ADR-0087 (above).
+
+> **Correction (2026-08-07 invariant sweep).** Everything above the
+> `**Accepted**` was, until this commit, a Status block reading
+> *"**Proposed (2026-05-29) — pending owner sign-off before
+> implementation.** … No code written yet"*, with the Bug-95 sentence in
+> the PRESENT tense ("can never merge across a rotation boundary"). Both
+> halves were false, and the first was false **the moment it landed**:
+> `97a6423a` is a squashed PR carrying the design commit AND the
+> implementation commit, so "no code written yet" was published in the
+> same commit as the code. The present-tense Bug-95 sentence then read as
+> a live limitation of a feature this ADR had already removed it from —
+> `TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG`
+> (`internal/pipeline/backup_compact_integration_test.go`) asserts the
+> opposite against a real Postgres, and says so at its own definition.
+>
+> **Why the ADR-status gates did not catch it, which is the part worth
+> keeping.** `internal/docsync`'s `fileStatus` read only the FIRST
+> non-blank line of a `## Status` section and gave up there; here that
+> line is the ADR-0087 amendment blockquote above, so this file parsed as
+> declaring *no* status and fell out of the scope of BOTH
+> `TestADRIndexStatusParity` and `TestADRStatusSelfContradiction`. The
+> index row is one of the legacy no-status rows, so nothing else looked
+> either. Both were repaired in the same pass (the section scan now skips
+> blockquote/admonition lines and carries a parsed-file floor), and
+> `TestProposedADRsAreNotContradictedByShippedCode` is the new gate: a
+> `Proposed` ADR cited by non-test code under `internal/`/`cmd/` fails the
+> build until someone records which of the two is wrong. It found
+> ADR-0071 carrying the same defect.
 
 ## Context
 
