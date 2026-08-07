@@ -43,6 +43,30 @@
 // So the pre-deploy gates are absent from the adopt path by CONSTRUCTION
 // rather than by omission: adoption never reaches a Deploy call.
 //
+// # "Issued" is read off deployment_state, and off nothing else (Bug 231)
+//
+// The first cut ORed PlanetScale's `deployable` flag into that decision as
+// a second, independent refusal signal — and the flag stays TRUE while a
+// deployment runs, so the one shape this file exists for was the one it
+// refused. Live 2026-08-07: a leftover at `deployment_state "in_progress"`,
+// stamped between the deployment's own started_at and deployed_at, was
+// refused as "never deployed" — with `deployment_state "in_progress"`
+// printed in the same sentence as "Nothing is deploying, so the branch is
+// safe to delete".
+//
+// Two rules came out of it, and they are separate:
+//
+//   - For a `deployment_state` [drStates] documents, the state table is the
+//     WHOLE verdict. `deployable` answers a question about the fresh path
+//     ("will PlanetScale accept a Deploy call"), not about how far along an
+//     already-issued deployment is, so it is consulted only where the table
+//     has nothing to say — an undocumented state.
+//   - A refusal must not assert a condition the evidence it just printed
+//     denies. "Nothing is deploying, delete the branch" is a CLAIM, and it
+//     is made only from a state that establishes it; where sluice does not
+//     know, it says it does not know and names no delete
+//     ([adoptRefuseUnrecognizedState]).
+//
 // # How sluice knows the branch is its own (the identity argument)
 //
 // Three pieces of evidence, all cheap:
@@ -118,6 +142,13 @@ const (
 	// request cannot be revived; here the branch delete is genuinely the
 	// right advice.
 	adoptRefuseFailed
+
+	// adoptRefuseUnrecognizedState — the `deployment_state` is not one
+	// [drStates] documents AND PlanetScale reports the request
+	// deployable. sluice cannot tell from that pair whether something is
+	// running, so this refusal says so and names NO branch delete: it is
+	// the only refusal whose honest content is "I do not know".
+	adoptRefuseUnrecognizedState
 )
 
 // notYetDeployedStates are the `deployment_state` values that mean the
@@ -127,11 +158,22 @@ const (
 // (the ADR-0148 observed walk is open/pending → ready → queued → … →
 // complete_pending_revert).
 //
-// This table is not trusted alone. [classifyAdoption] also refuses on
-// PlanetScale's own `deployable` flag — an INDEPENDENT signal, and the same
-// one [legRunner.waitDeployable] releases on — so a state name sluice has
-// never seen that is nonetheless still awaiting its Deploy call is refused
-// rather than handed to a poller that would wait on it forever.
+// For a state [drStates] documents, this table is the WHOLE answer —
+// `deployable` is deliberately not consulted, because it does not mean what
+// its name suggests. PlanetScale keeps reporting deployable=true on a
+// request it is actively deploying (live-measured, Bug 231: deployment_state
+// "in_progress", deployable=true, stamped strictly between the deployment's
+// own started_at and deployed_at), so ORing the flag into this decision
+// refused the exact mid-deploy leftover adoption exists to join — and
+// [api.DeployRequest.CanDeploy] answers "will PlanetScale accept a Deploy
+// call", which is a question about the fresh path, not about how far along
+// an already-issued deployment is.
+//
+// The flag survives as a refusal signal for ONE case only: a
+// `deployment_state` sluice has never seen. There the state table has
+// nothing to say, and "PlanetScale would still accept a deploy call" is
+// evidence the request is probably pre-deploy — enough to refuse on, never
+// enough to claim nothing is running (see [adoptRefuseUnrecognizedState]).
 var notYetDeployedStates = map[string]bool{
 	"pending":    true,
 	"ready":      true,
@@ -142,28 +184,37 @@ var notYetDeployedStates = map[string]bool{
 // its GET-by-number response alone. Pure, so the state matrix can be pinned
 // without a server.
 func classifyAdoption(dr *api.DeployRequest) adoptVerdict {
-	switch class := classifyDeployState(dr.DeploymentState); {
-	case class == drSuccess:
+	class, documented := drStates[dr.DeploymentState]
+	switch {
+	case documented && class == drSuccess:
 		return adoptFinalize
-	case class == drFailure:
+	case documented && class == drFailure:
 		return adoptRefuseFailed
 	case dr.DeploymentState == "no_changes":
 		return adoptRefuseAlreadyDeployed
-	case notYetDeployedStates[dr.DeploymentState] || dr.CanDeploy():
-		// Two independent signals; either one refuses. See
-		// [notYetDeployedStates].
+	case notYetDeployedStates[dr.DeploymentState]:
 		return adoptRefuseNeverDeployed
 	case dr.State == "closed":
-		// Closed, not deployable, and not in a terminal state sluice
-		// recognizes — it was closed without ever deploying. Checked AFTER
-		// the success class on purpose: PlanetScale closes a deploy request
-		// when it DOES deploy too, so `state == "closed"` alone means
-		// nothing.
+		// Closed, and not in a terminal state sluice recognizes — it was
+		// closed without ever deploying. Checked AFTER the success class on
+		// purpose: PlanetScale closes a deploy request when it DOES deploy
+		// too, so `state == "closed"` alone means nothing.
 		return adoptRefuseFailed
-	default:
+	case documented:
 		// drInFlight past the deploy call, and drHumanGate — waitDeployed
 		// owns both (it downgrades pending_cutover on an auto_cutover
-		// deployment and stops on a real human gate).
+		// deployment and stops on a real human gate). The state is the
+		// whole answer here; `deployable` is not consulted (Bug 231).
+		return adoptJoin
+	case dr.CanDeploy():
+		// Undocumented state, and PlanetScale would still take a Deploy
+		// call: probably pre-deploy, certainly not something to hand a
+		// poller that could wait on it forever. See [notYetDeployedStates].
+		return adoptRefuseUnrecognizedState
+	default:
+		// Undocumented and not deployable — the same tolerance
+		// [classifyDeployState] extends: a new PlanetScale intermediate
+		// state must not fail a healthy deploy.
 		return adoptJoin
 	}
 }
@@ -184,7 +235,12 @@ func (r *legRunner) adoptLeftoverBranch(ctx context.Context, branchName string, 
 		return nil, err
 	}
 
-	switch classifyAdoption(dr) {
+	verdict := classifyAdoption(dr)
+	if refusal := r.adoptRefusalFor(verdict, branchName, dr); refusal != nil {
+		return nil, refusal
+	}
+
+	switch verdict {
 	case adoptFinalize:
 		fmt.Fprintf(r.out, "%s: adopting deploy request #%d left by an earlier run on dev branch %q — it already deployed (deployment_state %q); finalizing\n",
 			r.name, dr.Number, branchName, dr.DeploymentState)
@@ -193,7 +249,7 @@ func (r *legRunner) adoptLeftoverBranch(ctx context.Context, branchName string, 
 		fmt.Fprintf(r.out, "%s: deploy request #%d deployed\n", r.name, dr.Number)
 		return dr, nil
 
-	case adoptJoin:
+	default: // adoptJoin — adoptRefusalFor answered every other verdict.
 		fmt.Fprintf(r.out, "%s: adopting deploy request #%d left by an earlier run on dev branch %q — it is still deploying (deployment_state %q%s); joining it instead of starting over\n",
 			r.name, dr.Number, branchName, dr.DeploymentState, progressSuffix(dr))
 		// The branch is ours to tear down again from here on: every exit
@@ -208,27 +264,70 @@ func (r *legRunner) adoptLeftoverBranch(ctx context.Context, branchName string, 
 		r.finalizeRevertWindow(ctx, final)
 		fmt.Fprintf(r.out, "%s: deploy request #%d deployed\n", r.name, dr.Number)
 		return final, nil
+	}
+}
+
+// adoptRefusalFor renders the coded refusal for a verdict that does not
+// adopt, and returns nil for the two that do. Split out of
+// [legRunner.adoptLeftoverBranch] so every refusal TEXT can be graded
+// against the state that produced it without driving a control plane —
+// see TestAdoptRefusalNeverClaimsNothingIsDeployingAboutARunningState.
+//
+// The rule those texts obey, and the second half of Bug 231: a refusal must
+// not assert a state the evidence it just printed denies. Telling an
+// operator "nothing is deploying, delete the branch" one line after
+// printing `deployment_state "in_progress"` is worse than the refusal
+// itself — believed, it discards a healthy in-flight deploy. So the delete
+// claim is made ONLY where the named state establishes it, and the one
+// verdict that means "sluice does not know" says exactly that.
+func (r *legRunner) adoptRefusalFor(verdict adoptVerdict, branchName string, dr *api.DeployRequest) error {
+	switch verdict {
+	case adoptFinalize, adoptJoin:
+		return nil
 
 	case adoptRefuseAlreadyDeployed:
-		return nil, r.adoptRefusal(fmt.Sprintf(
-			"dev branch %q is left over from an earlier run and its deploy request #%d has NO schema changes (deployment_state %q) — this leg's DDL is already on %q; %s. Nothing is deploying, so the branch is safe to delete: `pscale branch delete %s %s --org %s` (%s)",
+		return r.adoptRefusal(fmt.Sprintf(
+			"dev branch %q is left over from an earlier run and its deploy request #%d has NO schema changes (deployment_state %q) — this leg's DDL is already on %q; %s. %s (%s)",
 			branchName, dr.Number, dr.DeploymentState, r.branch, r.alreadyDeployedAdvice,
-			r.database, branchName, r.org, dr.HTMLURL,
+			r.safeToDeleteAdvice(branchName), dr.HTMLURL,
 		), "the leg's DDL is already deployed — delete the leftover dev branch and continue past this leg")
 
 	case adoptRefuseNeverDeployed:
-		return nil, r.adoptRefusal(fmt.Sprintf(
-			"dev branch %q is left over from an earlier run and its deploy request #%d was never deployed (state %q, deployment_state %q, deployable=%t) — sluice adopts only a deploy request that is already deploying, because it cannot re-establish for a branch it did not provision this run the two things it checks before every deploy: that the branch's schema base still matches %q, and that the request's diff touches nothing outside %s. Deploying from a base that has fallen behind silently reverts newer production schema. Nothing is deploying, so the branch is safe to delete: `pscale branch delete %s %s --org %s`, then %s (%s)",
+		// Reachable only for `pending` / `ready` — PlanetScale has not been
+		// asked to deploy, so "nothing is deploying" is what the printed
+		// deployment_state says, not a guess layered on top of it.
+		return r.adoptRefusal(fmt.Sprintf(
+			"dev branch %q is left over from an earlier run and its deploy request #%d was never deployed (state %q, deployment_state %q, deployable=%t) — sluice adopts only a deploy request that is already deploying, because it cannot re-establish for a branch it did not provision this run the two things it checks before every deploy: that the branch's schema base still matches %q, and that the request's diff touches nothing outside %s. Deploying from a base that has fallen behind silently reverts newer production schema. %s, then %s (%s)",
 			branchName, dr.Number, dr.State, dr.DeploymentState, dr.CanDeploy(), r.branch,
-			r.intendedObjects(), r.database, branchName, r.org, r.rerunAdvice, dr.HTMLURL,
+			r.intendedObjects(), r.safeToDeleteAdvice(branchName), r.rerunAdvice, dr.HTMLURL,
 		), "delete the leftover dev branch and re-run — nothing is deploying, so nothing is lost, and the re-run re-provisions the branch from current production")
 
+	case adoptRefuseUnrecognizedState:
+		// The "I do not know" refusal. It names no branch delete, for the
+		// same reason the truncated-list refusal does not: the wrong guess
+		// here is "nothing is running", and that guess destroys a build.
+		return r.adoptRefusal(fmt.Sprintf(
+			"dev branch %q is left over from an earlier run and its deploy request #%d reports a deployment_state sluice does not recognize (state %q, deployment_state %q, deployable=%t) — sluice will not adopt it, and will not advise deleting the dev branch, because it cannot tell from an unknown state whether a deployment is running; deleting a dev branch mid-deploy discards the build (%s)",
+			branchName, dr.Number, dr.State, dr.DeploymentState, dr.CanDeploy(), dr.HTMLURL,
+		), "open that deploy request in PlanetScale and see what it is doing; do NOT delete the dev branch until you have confirmed nothing is deploying from it")
+
 	default: // adoptRefuseFailed
-		return nil, r.adoptRefusal(fmt.Sprintf(
-			"dev branch %q is left over from an earlier run and its deploy request #%d cannot be resumed (state %q, deployment_state %q) — its schema change is NOT applied. Nothing is deploying, so the branch is safe to delete: `pscale branch delete %s %s --org %s`, then %s (%s)",
-			branchName, dr.Number, dr.State, dr.DeploymentState,
+		if drStates[dr.DeploymentState] == drFailure {
+			return r.adoptRefusal(fmt.Sprintf(
+				"dev branch %q is left over from an earlier run and its deploy request #%d cannot be resumed (state %q, deployment_state %q) — that is a terminal state in which the schema change is NOT applied. %s, then %s (%s)",
+				branchName, dr.Number, dr.State, dr.DeploymentState,
+				r.safeToDeleteAdvice(branchName), r.rerunAdvice, dr.HTMLURL,
+			), "the deploy request failed and cannot be revived — delete the leftover dev branch and re-run")
+		}
+		// Closed, in a state that is not a terminal failure sluice knows.
+		// PlanetScale will not deploy a closed request, so re-running is
+		// right — but the state does not say whether anything already ran,
+		// and this message must not pretend otherwise.
+		return r.adoptRefusal(fmt.Sprintf(
+			"dev branch %q is left over from an earlier run and its deploy request #%d cannot be resumed: it is CLOSED, and PlanetScale does not deploy a closed request. sluice cannot tell from deployment_state %q whether the schema change already ran, so confirm on the deploy-request page that nothing is in flight, then delete the dev branch with `pscale branch delete %s %s --org %s` and %s (%s)",
+			branchName, dr.Number, dr.DeploymentState,
 			r.database, branchName, r.org, r.rerunAdvice, dr.HTMLURL,
-		), "the deploy request failed and cannot be revived — delete the leftover dev branch and re-run")
+		), "the deploy request is closed and cannot be revived — check it in PlanetScale, then delete the leftover dev branch and re-run")
 	}
 }
 
@@ -302,6 +401,18 @@ func (r *legRunner) finalizeRevertWindow(ctx context.Context, final *api.DeployR
 		slog.WarnContext(ctx, r.errPrefix+": skip-revert failed; finalize the deployment manually from the deploy-request page",
 			"deploy_request", final.Number, "url", final.HTMLURL, "err", err.Error())
 	}
+}
+
+// safeToDeleteAdvice renders the delete-is-safe CLAIM, in one place so it
+// can be graded in one place. Every use of it asserts something about the
+// world — that no deployment is running on the dev branch — so the
+// literal phrase exists exactly once in the codebase and
+// TestAdoptRefusalNeverClaimsNothingIsDeployingAboutARunningState greps
+// for it across the whole state matrix. A refusal that cannot support the
+// claim writes its own sentence and does not call this.
+func (r *legRunner) safeToDeleteAdvice(branchName string) string {
+	return fmt.Sprintf("Nothing is deploying, so the branch is safe to delete: `pscale branch delete %s %s --org %s`",
+		r.database, branchName, r.org)
 }
 
 // intendedObjects renders the leg's intended blast radius for the

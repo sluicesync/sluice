@@ -53,6 +53,14 @@ type fakePS struct {
 	preStates  []string
 	postStates []string
 
+	// predeployDeployable serves deployable=true on the PRE-deploy half
+	// of the walk regardless of the state name. The default rule there
+	// ("only `ready` is deployable") is a claim about states sluice
+	// documents; a state it does NOT document could report anything, and
+	// that pair — unknown state + deployable — is its own adoption
+	// verdict, so it needs a fixture that can produce it.
+	predeployDeployable bool
+
 	// staleNextBranches marks the next N created dev branches as
 	// seeded from a stale backup: their /schema differs from
 	// production's until recreated (the PlanetScale
@@ -413,7 +421,7 @@ func (f *fakePS) snapshot(fd *fakeDR) *api.DeployRequest {
 				fd.preStates = fd.preStates[1:]
 			}
 			out.Deployment.State = out.DeploymentState
-			out.Deployment.Deployable = out.DeploymentState == "ready"
+			out.Deployment.Deployable = f.predeployDeployable || out.DeploymentState == "ready"
 			return &out
 		}
 		out.DeploymentState = "ready"
@@ -427,6 +435,15 @@ func (f *fakePS) snapshot(fd *fakeDR) *api.DeployRequest {
 	}
 	fd.dr.DeploymentState = out.DeploymentState
 	out.Deployment.State = out.DeploymentState
+	// `deployable` STAYS TRUE once the deploy has been issued — the Bug 231
+	// premise, and the one this fake got wrong: it left the flag false for
+	// the whole post-deploy walk, which is why the adopt path's end-to-end
+	// pins were green against a classifier that refused every real
+	// mid-deploy leftover. Measured true at `in_progress` (live 2026-08-07,
+	// between the deployment's started_at and deployed_at); carried across
+	// the rest of the walk deliberately, as the STRICTER fixture — the flag
+	// must not influence any post-deploy verdict at all.
+	out.Deployment.Deployable = true
 	f.attachOperations(&out)
 	return &out
 }

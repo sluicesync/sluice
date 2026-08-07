@@ -386,6 +386,16 @@ type DeployOperation struct {
 // this request, reading the deployable flag from wherever the response
 // shape carried it (nested deployment object on the GET-by-number
 // endpoint; tolerated top-level for other shapes).
+//
+// It is NOT a "this request has not been deployed yet" signal, and
+// reading it as one is Bug 231: PlanetScale keeps reporting
+// deployable=true on a request it is ACTIVELY DEPLOYING (live-measured
+// 2026-08-07 — deploy request #3 read deployment_state "in_progress",
+// deployable=true at 20:31:07, strictly between its own started_at
+// 20:31:03.962Z and deployed_at 20:31:11.393Z). Only
+// [expandcontract.classifyDeployState] answers "how far along is this",
+// and the one place that needs both — the adoption verdict — consults
+// this flag ONLY for a deployment_state it does not recognize.
 func (dr *DeployRequest) CanDeploy() bool {
 	return dr.Deployable || dr.Deployment.Deployable
 }
