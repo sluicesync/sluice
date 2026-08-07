@@ -65,6 +65,27 @@ import (
 // prose bound to nothing. Naming that here rather than leaving it implied: a
 // gate whose coverage is narrower than its name reads as covering the sibling.
 //
+// # Which DOCUMENTS it reaches — one, and the claim is spread wider than that
+//
+// The marker this test holds lives in `docs/production-readiness.md` and
+// NOWHERE else. Every other home of the same claim is prose bound to nothing,
+// and that is not hypothetical: on 2026-08-07 a `perf-parity-checker` pass
+// found `docs/dev/perf-parity-matrix.md` row 3 still asserting "D1-as-target
+// ABSENT (stage-local instead)" — the FOURTH home of the sentence, wrong twice
+// over (there is no D1 target, and `--stage-local` is a D1 SOURCE mechanism),
+// contradicted by row 32 of the same file, and untouched by `78f04f19`, which
+// corrected the identical sentence in ADR-0150. That is one release AFTER this
+// gate was built, which is the point worth writing down: a gate whose coverage
+// is narrower than its claim's SPREAD does not merely miss a home, it stops
+// anyone from looking at the others.
+//
+// The matrix is deliberately OUT of scope rather than accidentally so: it is a
+// performance document that mentions the target set in passing, and giving it
+// an engine-list marker would be a marker on a sentence rather than on a list.
+// Widening the gate is the alternative if a fifth home appears — extend
+// `docPath` to a slice of (file, marker) pairs; the derivation halves need no
+// change.
+//
 // # Two derivations that share no evidence
 //
 // A verification whose answer comes from the same artifact as the thing it
