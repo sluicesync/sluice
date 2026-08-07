@@ -16,9 +16,19 @@ import (
 )
 
 // arrayLeafSourceSchema is a source schema carrying one column per
-// element family that matters here: the two byte-shaped leaves that
-// cannot survive a target with no array type, and three controls that
-// must NOT be refused.
+// element family AND per declaration SHAPE that matters here: the two
+// byte-shaped leaves that cannot survive a target with no array type,
+// the same thing behind a DOMAIN and behind a domain-over-domain, and
+// four controls that must NOT be refused.
+//
+// `dom` is the item-152 review finding: `CREATE DOMAIN d AS json[]` is
+// an ordinary Postgres shape the reader carries as ir.Domain over
+// ir.Array, and the first cut's `src.(ir.Array)` walked straight past
+// it — so the column skipped the cold-start refusal and failed
+// mid-stream at the writer's leaf instead, which is the one outcome
+// this preflight exists to prevent. `domtxt` is its control: a domain
+// over an array whose leaf is fine must still not be refused, so the
+// unwrap cannot be a blanket "any domain is suspicious".
 func arrayLeafSourceSchema() *ir.Schema {
 	return &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
@@ -26,7 +36,13 @@ func arrayLeafSourceSchema() *ir.Schema {
 			{Name: "j", Type: ir.Array{Element: ir.JSON{}}},
 			{Name: "b", Type: ir.Array{Element: ir.JSON{Binary: true}}},
 			{Name: "y", Type: ir.Array{Element: ir.Blob{}}},
+			{Name: "dom", Type: ir.Domain{Name: "d_jsonarr", BaseType: ir.Array{Element: ir.JSON{}}}},
+			{Name: "dom2", Type: ir.Domain{
+				Name:     "d_outer",
+				BaseType: ir.Domain{Name: "d_inner", BaseType: ir.Array{Element: ir.Blob{}}},
+			}},
 			{Name: "txt", Type: ir.Array{Element: ir.Text{}}},
+			{Name: "domtxt", Type: ir.Domain{Name: "d_txtarr", BaseType: ir.Array{Element: ir.Text{}}}},
 			{Name: "n", Type: ir.Array{Element: ir.Integer{Width: 32}}},
 			{Name: "scalar", Type: ir.JSON{}},
 		},
@@ -41,13 +57,14 @@ func TestPreflightArrayBytesLeafOnCDC(t *testing.T) {
 	if !errors.Is(err, errArrayBytesLeafOnCDC) {
 		t.Errorf("refusal does not wrap the sentinel: %v", err)
 	}
-	// Every byte-shaped family is named, and no control is.
-	for _, want := range []string{"t.j ", "t.b ", "t.y "} {
+	// Every byte-shaped family is named, in every declaration shape, and
+	// no control is.
+	for _, want := range []string{"t.j ", "t.b ", "t.y ", "t.dom ", "t.dom2 "} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal does not name %q: %v", want, err)
 		}
 	}
-	for _, unwanted := range []string{"t.txt", "t.n", "t.scalar"} {
+	for _, unwanted := range []string{"t.txt", "t.domtxt", "t.n", "t.scalar"} {
 		if strings.Contains(err.Error(), unwanted) {
 			t.Errorf("refusal names %q, which carries fine on this lane: %v", unwanted, err)
 		}

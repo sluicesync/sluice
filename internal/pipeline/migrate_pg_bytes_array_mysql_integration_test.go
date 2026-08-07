@@ -44,7 +44,11 @@
 //
 // The `migrate` bulk-copy door only, PG source → MySQL target, for the
 // two `[]byte`-leaf families plus the string-leaf control column that
-// proves the fixture is not vacuous. The CDC doors (pgoutput apply,
+// proves the fixture is not vacuous. Within that door it reaches BOTH
+// MySQL bulk-write cores — LOAD DATA and the batched-INSERT fallback —
+// and ASSERTS which one ran from the server's own `Com_load` counter,
+// because the two serialise values differently and the fallback is
+// silent (see the test's own header). The CDC doors (pgoutput apply,
 // pgtrigger apply) are covered by the roster gate
 // TestEveryDecodableArrayElementHasAMySQLLeafVerdict in the mysql
 // package, which is a dispatch check and not a fidelity one. The two
@@ -55,6 +59,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,10 +70,16 @@ import (
 )
 
 // bytesArrayMySQLSeedDDL carries the two `[]byte`-leaf families and a
-// text[] control, one row per shape: 1-D, 2-D, NULL-element, empty
+// text[] control, one row per shape: 1-D, 2-D, 3-D, NULL-element, empty
 // array, whole-column NULL, and the two traps this pair specifically
 // carries — a JSON document that IS `null` sitting beside a SQL NULL
 // element, and a bytea whose CONTENT spells the `\x`-hex prefix.
+//
+// Row 8 is the 3-D row, added by the item-152 review: the commit message
+// claimed the real-server matrix covered 3-D and this fixture stopped at
+// 2-D. Its dimensions are deliberately RAGGED across axes (1×2×2) so a
+// flatten or a transpose reads differently from the original at some
+// axis; a 2×2×2 would survive several wrong answers.
 const bytesArrayMySQLSeedDDL = `
 	CREATE TABLE bytesarr (
 		id INT PRIMARY KEY,
@@ -101,11 +112,39 @@ const bytesArrayMySQLSeedDDL = `
 		(7, ARRAY[$${"k":"a,b{c}\"d\" \\e"}$$::json],
 		    ARRAY[$${"k":"a,b{c}\"d\" \\e"}$$::jsonb],
 		    ARRAY['\x7b2c7d'::bytea],
-		    ARRAY['a,b{c}"d" \e']);
+		    ARRAY['a,b{c}"d" \e']),
+		(8, ARRAY[ARRAY[ARRAY[$${"a":1}$$::json, $${"b":2}$$::json],
+		                ARRAY[$${"c":3}$$::json, $${"d":4}$$::json]]],
+		    ARRAY[ARRAY[ARRAY[$${"a":1}$$::jsonb, $${"b":2}$$::jsonb],
+		                ARRAY[$${"c":3}$$::jsonb, $${"d":4}$$::jsonb]]],
+		    ARRAY[ARRAY[ARRAY['\x01'::bytea, '\x02'::bytea],
+		                ARRAY['\x03'::bytea, '\x04'::bytea]]],
+		    ARRAY[ARRAY[ARRAY['a','b'], ARRAY['c','d']]]);
 `
 
 // TestMigrate_PGToMySQL_JSONAndByteaArrays is the family × shape matrix
-// for the two `[]byte`-leaf array families on a MySQL target.
+// for the two `[]byte`-leaf array families on a MySQL target — run
+// through BOTH MySQL bulk-write cores, with the core that actually ran
+// asserted rather than assumed.
+//
+// # Why both cores, and why the assertion (the item-152 review finding)
+//
+// The MySQL engine defaults to LOAD DATA LOCAL INFILE and falls back
+// PER CALL to batched INSERT when the server has `local_infile=OFF`.
+// The two cores serialise values completely differently — LOAD DATA
+// writes TSV through `encodeRowsTSV`'s escaper, batched INSERT binds or
+// interpolates parameters — and the payloads this fixture carries are
+// exactly the ones an escaper gets wrong: backslashes (`\x`-hex text),
+// double quotes, commas, braces, tabs-adjacent punctuation. The first
+// cut ran once and asserted nothing about which core executed, so
+// whichever one the container happened to allow was the only one pinned
+// and the other was covered by nothing. That is the same fallback that
+// made a previous "three write cores" gate silently grade two.
+//
+// The independent expected value for "which core ran" is the SERVER's
+// own `Com_load` status counter — MySQL counting its own LOAD DATA
+// statements, which is not derived from sluice's logs, its config, or
+// its reporting.
 func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 	pgSource, _, pgCleanup := startPostgres(t)
 	defer pgCleanup()
@@ -122,18 +161,66 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 	if !ok {
 		t.Fatal("mysql engine not registered")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	mig := &Migrator{Source: pgEng, Target: myEng, SourceDSN: pgSource, TargetDSN: mysqlTarget}
-	if err := mig.Run(ctx); err != nil {
-		t.Fatalf("Migrator.Run PG→MySQL: %v", err)
-	}
 
 	db, err := sql.Open("mysql", mysqlTarget)
 	if err != nil {
 		t.Fatalf("open mysql target: %v", err)
 	}
 	defer func() { _ = db.Close() }()
+
+	// A distinct MigrationID per pass: the resume ledger keys on it and
+	// would report the second pass "already complete" (having only dropped
+	// the target table, not the bookkeeping row) and copy nothing — which
+	// would leave the batched core asserted against the FIRST pass's rows.
+	runMigrate := func(t *testing.T, migrationID string) {
+		t.Helper()
+		mig := &Migrator{
+			Source: pgEng, Target: myEng,
+			SourceDSN: pgSource, TargetDSN: mysqlTarget,
+			MigrationID: migrationID,
+		}
+		if err := mig.Run(ctx); err != nil {
+			t.Fatalf("Migrator.Run PG→MySQL: %v", err)
+		}
+	}
+
+	// ---- Core 1: LOAD DATA LOCAL INFILE (the engine default). ----
+	t.Run("load-data core", func(t *testing.T) {
+		setMySQLLocalInfile(t, ctx, db, "ON")
+		before := mysqlComLoad(t, ctx, db)
+		runMigrate(t, "arrays-loaddata")
+		if after := mysqlComLoad(t, ctx, db); after == before {
+			t.Fatalf("the server's Com_load counter did not move (%d → %d): the copy did NOT run through "+
+				"LOAD DATA, so this pass pinned the batched core twice and the TSV escaper not at all",
+				before, after)
+		}
+		assertBytesArrayMatrix(t, ctx, pgSource, db)
+	})
+
+	// ---- Core 2: batched INSERT, via the local_infile=OFF fallback. ----
+	t.Run("batched-insert core", func(t *testing.T) {
+		if _, err := db.ExecContext(ctx, "DROP TABLE bytesarr"); err != nil {
+			t.Fatalf("drop target table before the second pass: %v", err)
+		}
+		setMySQLLocalInfile(t, ctx, db, "OFF")
+		before := mysqlComLoad(t, ctx, db)
+		runMigrate(t, "arrays-batched")
+		if after := mysqlComLoad(t, ctx, db); after != before {
+			t.Fatalf("the server's Com_load counter moved (%d → %d) with local_infile=OFF: the fallback "+
+				"did not fire and this pass re-ran the LOAD DATA core, leaving batched INSERT unpinned",
+				before, after)
+		}
+		assertBytesArrayMatrix(t, ctx, pgSource, db)
+	})
+}
+
+// assertBytesArrayMatrix is the whole family × shape matrix, against
+// whatever the preceding copy left on the target. Extracted so it can be
+// run once per MySQL write core.
+func assertBytesArrayMatrix(t *testing.T, ctx context.Context, pgSource string, db *sql.DB) {
+	t.Helper()
 
 	// Every array family maps to a MySQL JSON column. A different column
 	// type would make every value comparison below meaningless.
@@ -151,7 +238,7 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 
 	// ---- Shape, per row per family: PG's array_length vs MySQL's
 	// JSON_LENGTH. A flattened 2-D row reads 4 where PG reads 2.
-	for _, id := range []int{1, 2, 3, 4, 6, 7} {
+	for _, id := range []int{1, 2, 3, 4, 6, 7, 8} {
 		for _, col := range []string{"j", "b", "y", "t"} {
 			want := pgString(t, pgSource, fmt.Sprintf(
 				"SELECT COALESCE(array_length(%s, 1)::text, '0') FROM bytesarr WHERE id = %d", col, id,
@@ -164,13 +251,45 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 			}
 		}
 	}
-	// The 2-D row's inner length too — JSON_LENGTH alone reads 2 for both
-	// a real 2×2 and a flattened-to-2 array.
-	for _, col := range []string{"j", "b", "y", "t"} {
-		if got := mysqlString(t, ctx, db, fmt.Sprintf(
-			"SELECT CAST(JSON_LENGTH(%s, '$[0]') AS CHAR) FROM bytesarr WHERE id = 2", col,
-		)); got != "2" {
-			t.Errorf("row 2 col %s: inner JSON_LENGTH = %q; want 2 — the array was FLATTENED", col, got)
+	// Every INNER axis too, against PG's own array_length on that axis.
+	// The outer JSON_LENGTH alone reads 2 for both a real 2×2 and a
+	// flattened-to-2 array, and reads 1 for BOTH the real 1×2×2 of row 8
+	// and a row-8 value that lost its innermost dimension entirely.
+	for _, tc := range []struct {
+		id   int
+		axis int    // PG dimension, 1-based
+		path string // the MySQL JSON path to the slice at that depth
+	}{
+		{2, 2, "$[0]"},
+		{8, 2, "$[0]"},
+		{8, 3, "$[0][0]"},
+	} {
+		for _, col := range []string{"j", "b", "y", "t"} {
+			want := pgString(t, pgSource, fmt.Sprintf(
+				"SELECT COALESCE(array_length(%s, %d)::text, '0') FROM bytesarr WHERE id = %d",
+				col, tc.axis, tc.id,
+			))
+			got := mysqlString(t, ctx, db, fmt.Sprintf(
+				"SELECT CAST(JSON_LENGTH(%s, '%s') AS CHAR) FROM bytesarr WHERE id = %d",
+				col, tc.path, tc.id,
+			))
+			if got != want {
+				t.Errorf("row %d col %s axis %d (%s): MySQL JSON_LENGTH = %q; PG array_length = %q — the "+
+					"array lost or gained a dimension", tc.id, col, tc.axis, tc.path, got, want)
+			}
+		}
+	}
+	// And the full dimension string, so a 1×2×2 that arrived as 2×2×1
+	// (same per-axis lengths read in the wrong order) still fails.
+	for _, id := range []int{2, 8} {
+		for _, col := range []string{"j", "b", "y", "t"} {
+			want := pgString(t, pgSource, fmt.Sprintf(
+				"SELECT array_dims(%s) FROM bytesarr WHERE id = %d", col, id,
+			))
+			got := mysqlJSONDims(t, ctx, db, col, id)
+			if got != want {
+				t.Errorf("row %d col %s: MySQL nesting reads %s; PG array_dims = %s", id, col, got, want)
+			}
 		}
 	}
 
@@ -199,6 +318,10 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 		{3, "b", "b[3]", "$[2]"},
 		{7, "j", "j[1]", "$[0]"},
 		{7, "b", "b[1]", "$[0]"},
+		{8, "j", "j[1][1][1]", "$[0][0][0]"},
+		{8, "j", "j[1][2][2]", "$[0][1][1]"},
+		{8, "b", "b[1][1][2]", "$[0][0][1]"},
+		{8, "b", "b[1][2][1]", "$[0][1][0]"},
 	} {
 		want := pgString(t, pgSource, fmt.Sprintf(
 			"SELECT %s::text FROM bytesarr WHERE id = %d", tc.pgExpr, tc.id,
@@ -226,6 +349,8 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 		{3, "y[1]", "$[0]"},
 		{6, "y[1]", "$[0]"}, // content spells the \x-hex prefix
 		{7, "y[1]", "$[0]"},
+		{8, "y[1][1][1]", "$[0][0][0]"},
+		{8, "y[1][2][2]", "$[0][1][1]"},
 	} {
 		want := pgString(t, pgSource, fmt.Sprintf(
 			"SELECT encode(%s, 'base64') FROM bytesarr WHERE id = %d", tc.pgExpr, tc.id,
@@ -298,6 +423,8 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 		{2, "t[2][1]", "$[1][0]"},
 		{6, "t[1]", "$[0]"}, // the four letters n-u-l-l as TEXT
 		{7, "t[1]", "$[0]"},
+		{8, "t[1][1][1]", "$[0][0][0]"},
+		{8, "t[1][2][2]", "$[0][1][1]"},
 	} {
 		want := pgString(t, pgSource, fmt.Sprintf(
 			"SELECT %s FROM bytesarr WHERE id = %d", tc.pgExpr, tc.id,
@@ -309,6 +436,67 @@ func TestMigrate_PGToMySQL_JSONAndByteaArrays(t *testing.T) {
 			t.Errorf("row %d text %s: MySQL = %q; PG %s = %q", tc.id, tc.myPath, got, tc.pgExpr, want)
 		}
 	}
+}
+
+// setMySQLLocalInfile flips the server's `local_infile` global, which is
+// what decides between the two bulk-write cores: the LOAD DATA writer
+// probes it per call and falls back to batched INSERT when it is OFF.
+// It is GLOBAL-only (no session scope), so this reaches the writer's own
+// connections through the pool.
+func setMySQLLocalInfile(t *testing.T, ctx context.Context, db *sql.DB, v string) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, "SET GLOBAL local_infile = "+v); err != nil {
+		t.Fatalf("SET GLOBAL local_infile = %s: %v", v, err)
+	}
+	if got := mysqlString(t, ctx, db, "SELECT @@local_infile"); (got == "1") != (v == "ON") {
+		t.Fatalf("local_infile reads %q after setting it %s; the write-core selection below would be "+
+			"asserting against a server that ignored us", got, v)
+	}
+}
+
+// mysqlComLoad reads the server's own count of executed LOAD DATA
+// statements. It is the INDEPENDENT evidence for which bulk-write core
+// ran: MySQL counting its own statements, derived from nothing sluice
+// says about itself. `SHOW GLOBAL STATUS` is used rather than SESSION
+// because the writer runs on its own pooled connections, not this one.
+func mysqlComLoad(t *testing.T, ctx context.Context, db *sql.DB) int64 {
+	t.Helper()
+	var name string
+	var value int64
+	if err := db.QueryRowContext(ctx,
+		"SHOW GLOBAL STATUS LIKE 'Com_load'").Scan(&name, &value); err != nil {
+		t.Fatalf("read Com_load: %v", err)
+	}
+	return value
+}
+
+// mysqlJSONDims renders the landed JSON array's nesting in PostgreSQL's
+// own `array_dims` spelling (`[1:1][1:2][1:2]`), by walking the first
+// element down each level. It exists so the comparison is against PG's
+// dimension STRING rather than against per-axis lengths, which a
+// transposed value could satisfy.
+//
+// It stops at the first level whose first element is not itself an
+// array, which is the same place PG's dimensionality ends for the
+// rectangular arrays PG produces.
+func mysqlJSONDims(t *testing.T, ctx context.Context, db *sql.DB, col string, id int) string {
+	t.Helper()
+	var dims strings.Builder
+	path := "$"
+	for depth := 0; depth < 8; depth++ {
+		kind := mysqlString(t, ctx, db, fmt.Sprintf(
+			"SELECT JSON_TYPE(JSON_EXTRACT(%s, '%s')) FROM bytesarr WHERE id = %d", col, path, id,
+		))
+		if kind != "ARRAY" {
+			break
+		}
+		n := mysqlString(t, ctx, db, fmt.Sprintf(
+			"SELECT CAST(JSON_LENGTH(%s, '%s') AS CHAR) FROM bytesarr WHERE id = %d", col, path, id,
+		))
+		fmt.Fprintf(&dims, "[1:%s]", n)
+		path += "[0]"
+	}
+	return dims.String()
 }
 
 // mysqlString runs a single-value query against the MySQL target and

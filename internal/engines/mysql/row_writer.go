@@ -1407,9 +1407,10 @@ func parseHstoreText(s string) (map[string]any, error) {
 //   - string of the form "{...}" — the PG array text literal that
 //     surfaces when the override leaves the value as a string (e.g.
 //     CDC tuple values, or some database/sql scan paths). Parsed
-//     into tokens and emitted as a JSON string array; nested
-//     arrays are not supported (the IR doesn't model multi-
-//     dimensional arrays today and the parser refuses them).
+//     into per-element tokens, and then routed through the SAME
+//     [arrayLeafForJSON] policy the []any arm uses; nested arrays
+//     are not supported (the IR doesn't model multi-dimensional
+//     arrays today and the parser refuses them).
 //   - []byte starting with `{` and ending with `}` — same shape
 //     as above when the source decodes the value as bytes (the
 //     [decodeValue] path for [ir.JSON] returns []byte and so when
@@ -1417,6 +1418,22 @@ func parseHstoreText(s string) (map[string]any, error) {
 //     reader's bytes path produces a `[]byte` containing the PG
 //     array literal verbatim). Routed through the same parser as
 //     the string case.
+//
+// # One leaf policy across all three arms (the arrival-shape gap)
+//
+// All three arms end at [normalizeArrayLeavesForJSON], so the element
+// family — not the arrival shape — decides the encoding. That was NOT
+// true when the leaf policy first landed: the two literal arms went
+// straight to a token marshal, so the same `bytea[]` value rendered
+// `["3q0="]` when it arrived as a decoded `[]any` and `["\\xdead"]`
+// when it arrived as the PG text literal an override produces. Same
+// declared family, same bytes, two encodings decided by which lane the
+// value came down — on the very family this policy exists to make
+// deterministic. Pinned by
+// TestConvertArrayLikeToJSON_LiteralArmsTakeTheSameLeafPolicy.
+//
+// The map[string]any arm is the deliberate exception and says why at
+// the arm: its leaves are a jsonb DOCUMENT's, not an array's.
 //
 // Returns (jsonString, true, nil) on a recognised shape; (nil, false,
 // nil) when the value doesn't match any of them, signalling the caller
@@ -1468,20 +1485,12 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (converted any, recognized bo
 		}
 		return string(out), true, nil
 	case []any:
-		normalized, err := normalizeArrayLeavesForJSON(shaped, arrayElementType(col), col)
-		if err != nil {
-			return nil, false, err
-		}
-		out, err := json.Marshal(normalized)
-		if err != nil {
-			return nil, false, refuseUnmarshalableArrayLike(col, err)
-		}
-		return string(out), true, nil
+		return marshalArrayLeaves(shaped, col)
 	case string:
 		if !looksLikePGArrayLiteral(shaped) {
 			return nil, false, nil
 		}
-		parsed, parseErr := pgArrayLiteralToJSON(shaped)
+		tokens, parseErr := pgArrayLiteralTokens(shaped)
 		if parseErr != nil {
 			// Deliberately NOT surfaced: a failed parse is the shape
 			// DISAMBIGUATION (a JSON object is not an array literal), so
@@ -1489,7 +1498,7 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (converted any, recognized bo
 			// falls through to the next prepareValue branch.
 			return nil, false, nil //nolint:nilerr // a parse failure is a shape verdict, not an error
 		}
-		return parsed, true, nil
+		return marshalArrayLeaves(tokens, col)
 	case []byte:
 		// A `[]byte` for a JSON-target column is normally already
 		// valid JSON (the canonical IR shape for ir.JSON values).
@@ -1516,30 +1525,57 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (converted any, recognized bo
 		//     and an empty array value. The correct landing is the
 		//     JSON array `[]`. The column's `SourceColumnType` is
 		//     an [ir.Array].
-		// We discriminate on `SourceColumnType`: only when the
-		// pre-override type is an array do we route `{}` through
-		// the array→JSON parser. Otherwise the bytes fall through
-		// to the next branch in [prepareValue] which emits `"{}"`
-		// (the JSON-object preservation Bug 47 demands).
+		// We discriminate on the column's ARRAY PROVENANCE: only
+		// when the column is (or started as) an array do we route
+		// `{}` through the array→JSON parser. Otherwise the bytes
+		// fall through to the next branch in [prepareValue] which
+		// emits `"{}"` (the JSON-object preservation Bug 47 demands).
+		//
+		// Both spellings are consulted — the same pair
+		// [arrayElementType] reads — and the un-overridden one was
+		// missing until the item-152 review. With only
+		// SourceColumnType checked, an empty array on a plain
+		// ir.Array column landed as the JSON OBJECT `{}` through
+		// THIS arm while the same value landed as `[]` through the
+		// other two, which is the arrival-shape divergence this
+		// function's header now forbids. Pinned by the `empty` row of
+		// TestConvertArrayLikeToJSON_LiteralArmsTakeTheSameLeafPolicy.
 		if len(shaped) < 2 || shaped[0] != '{' || shaped[len(shaped)-1] != '}' {
 			return nil, false, nil
 		}
 		if len(shaped) == 2 {
-			// Empty `{}`. Only treat as PG empty array when an
-			// override carries that intent in SourceColumnType.
-			if col != nil {
-				if _, fromArray := col.SourceColumnType.(ir.Array); fromArray {
-					return "[]", true, nil
-				}
+			// Empty `{}`. Only treat as PG empty array when the column
+			// carries that intent.
+			if columnIsArrayLike(col) {
+				return "[]", true, nil
 			}
 			return nil, false, nil
 		}
-		if converted, err := pgArrayLiteralToJSON(string(shaped)); err == nil {
-			return converted, true, nil
+		tokens, parseErr := pgArrayLiteralTokens(string(shaped))
+		if parseErr != nil {
+			return nil, false, nil //nolint:nilerr // a parse failure is a shape verdict, not an error
 		}
-		return nil, false, nil
+		return marshalArrayLeaves(tokens, col)
 	}
 	return nil, false, nil
+}
+
+// marshalArrayLeaves is the single exit every recognised array-like
+// shape takes: put each LEAF in the form [encoding/json] renders
+// faithfully for the column's element family, then marshal the whole
+// nested value. Sharing it is what keeps the decoded-[]any lane and the
+// two PG-array-LITERAL lanes on one policy — see the arrival-shape note
+// on [convertArrayLikeToJSON].
+func marshalArrayLeaves(v []any, col *ir.Column) (converted any, recognized bool, err error) {
+	normalized, err := normalizeArrayLeavesForJSON(v, arrayElementType(col), col)
+	if err != nil {
+		return nil, false, err
+	}
+	out, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, false, refuseUnmarshalableArrayLike(col, err)
+	}
+	return string(out), true, nil
 }
 
 // arrayElementType resolves the scalar leaf type of an array-valued
@@ -1554,6 +1590,21 @@ func convertArrayLikeToJSON(v any, col *ir.Column) (converted any, recognized bo
 // value — the PG reader's Bug-68 contract — so one element type
 // describes every depth, which is what lets
 // [normalizeArrayLeavesForJSON] recurse with a single type.
+// columnIsArrayLike reports whether a column is, or started life as, an
+// [ir.Array]. It is [arrayElementType]'s question minus the element:
+// `ir.Array{}` with a nil Element is still an array, and the `{}`
+// disambiguation next door needs the provenance rather than the leaf.
+func columnIsArrayLike(col *ir.Column) bool {
+	if col == nil {
+		return false
+	}
+	if _, ok := col.Type.(ir.Array); ok {
+		return true
+	}
+	_, ok := col.SourceColumnType.(ir.Array)
+	return ok
+}
+
 func arrayElementType(col *ir.Column) ir.Type {
 	if col == nil {
 		return nil
@@ -1658,14 +1709,17 @@ func normalizeArrayLeavesForJSON(v []any, elem ir.Type, col *ir.Column) ([]any, 
 //
 // Anything that is not one of the two []byte families passes through
 // untouched, because Go's default rendering IS the faithful one for
-// them (the pins are in TestArrayLeafForJSON_FamilyMatrix). But a
-// []byte leaf on such a family is refused loudly rather than base64'd:
-// the PG reader produces []byte leaves for bytea and json/jsonb ONLY,
-// so a []byte anywhere else means the element type and the value have
-// diverged, and guessing between "these are bytes" and "this is a
-// document" is the exact ambiguity roadmap item 135 removed.
+// them (the pins are the roster gate
+// TestEveryDecodableArrayElementHasAMySQLLeafVerdict, which probes every
+// family the Postgres reader can produce, and the shape half in
+// TestConvertArrayLikeToJSON_ShapeMatrix). But a []byte leaf on such a
+// family is refused loudly rather than base64'd: the PG reader produces
+// []byte leaves for bytea and json/jsonb ONLY, so a []byte anywhere else
+// means the element type and the value have diverged, and guessing
+// between "these are bytes" and "this is a document" is the exact
+// ambiguity roadmap item 135 removed.
 //
-// # The CDC applier lane, which has NO element type — and why it refuses
+// # The CDC applier lane, which has NO element type
 //
 // The refusal above also catches the one lane that cannot resolve the
 // family at all. A ChangeApplier reads its column descriptors from the
@@ -1680,10 +1734,48 @@ func normalizeArrayLeavesForJSON(v []any, elem ir.Type, col *ir.Column) ([]any, 
 // That refusal arrives mid-stream, so pipeline's
 // preflightArrayBytesLeafOnCDC turns it into an early one at sync
 // cold-start and `schema add-table` — the same shape, and the same two
-// call sites, as preflightBinaryTargetColumnsOnCDC. This arm is the
-// backstop that keeps the halves that preflight does NOT reach (warm
-// resume, the multi-database fan-out) loud rather than silent. Pinned by
+// call sites, as preflightBinaryTargetColumnsOnCDC. Pinned by
 // TestArrayLeafForJSON_CDCApplierLaneRefusesRatherThanGuesses.
+//
+// # SCOPE of that backstop, which is narrower than "the CDC lane"
+//
+// This refusal fires on a `[]byte` leaf, so it reaches exactly the CDC
+// doors that PRODUCE one: pgoutput (value_decode.go) and any
+// database/sql scan lane. It does NOT reach the pgtrigger door. That
+// reader decodes its capture payload with a `UseNumber`
+// [encoding/json] unmarshal and no column types, so its leaves are
+// drawn from {string, json.Number, bool, nil, []any, map[string]any}
+// and can NEVER be a []byte — the same property
+// TestConvertArrayLikeToJSON_MapArmHasNoByteLeaves pins one arm up.
+// On that door a `bytea[]` element arrives as PG's `\x`-hex STRING and
+// a `json[]` element as a nested map, and with no element type both
+// pass straight through: `["\\xdead"]` and `[{"a":1}]` where the cold
+// copy stored `["3q0="]` and `["{\"a\":1}"]`. Silent divergence, not
+// loss — nothing is destroyed, the two halves of one column simply do
+// not agree.
+//
+// It is NOT closed here, and that is a decision rather than an
+// omission. On that door the offending value is BYTE-IDENTICAL to
+// values that are correct today and common:
+//
+//   - a jsonb column whose DOCUMENT is an array (`[1,2,3]`,
+//     `["\\xdead"]`) decodes to the same top-level []any of the same
+//     leaf types. Refusing would break every jsonb array document over
+//     pgtrigger → MySQL.
+//   - a `text[]` / `int[]` CDC value arrives as []any of strings /
+//     json.Number on BOTH doors and renders exactly as the cold copy
+//     does. Refusing would break every string- and native-leaf array
+//     over CDC, which this whole design carries deliberately.
+//
+// Sniffing the CONTENT to tell them apart is the one thing item 135
+// forbids one layer up (a bytea may legitimately spell a JSON
+// document), so there is no evidence to refuse on. The answer is the
+// preflight, which reads the SOURCE schema where the element type IS
+// resolvable, and the residual is what the preflight does not reach:
+// see preflightArrayBytesLeafOnCDC's own scope section, which names it.
+// Pinned — as an enumeration of what passes, not a promise that
+// nothing does — by
+// TestArrayLeafForJSON_TriggerDoorApplierLaneIsUnguarded.
 func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
 	switch elem.(type) {
 	case ir.JSON:
@@ -1732,23 +1824,57 @@ func arrayLeafForJSON(x any, elem ir.Type, col *ir.Column) (any, error) {
 		))
 	}
 	if b, isBytes := x.([]byte); isBytes {
+		if elem == nil {
+			return nil, refuseUnresolvedArrayLeafOnCDC(col, len(b))
+		}
 		return nil, refuseArrayLeaf(col, fmt.Errorf(
-			"an array element of family %s arrived as %d raw bytes; only json/jsonb and bytea elements "+
+			"an array element of family %T arrived as %d raw bytes; only json/jsonb and bytea elements "+
 				"have a byte-shaped leaf, so this value and its declared element type disagree "+
 				"(base64-encoding it would silently replace the value with an opaque token)",
-			elementFamilyForError(elem), len(b),
+			elem, len(b),
 		))
 	}
 	return x, nil
 }
 
-// elementFamilyForError renders an array element type for a refusal
-// message, including the "no element type at all" case.
-func elementFamilyForError(elem ir.Type) string {
-	if elem == nil {
-		return "(unresolved — the column is not declared as an array)"
-	}
-	return fmt.Sprintf("%T", elem)
+// refuseUnresolvedArrayLeafOnCDC is the CDC-applier lane's refusal: a
+// byte-shaped array leaf on a column whose element family this lane
+// cannot resolve at all.
+//
+// It carries the SAME remedies as pipeline's
+// preflightArrayBytesLeafOnCDC, deliberately, because the two are one
+// verdict reached at two moments. `sync` cold-start and `schema
+// add-table` run that preflight and refuse before any data moves; a
+// stream that RESUMES WARM reads no schema by design and so arrives
+// here instead, mid-flight, per row. Without the remedies that late
+// message read as a bare per-value type complaint — leaving an operator
+// whose PG→MySQL sync carried `bytea[]` on an older sluice with a
+// broken stream and no statement that the family is now sync-
+// unsupported. The text is duplicated rather than shared because
+// engines must not import pipeline; the two are held together by
+// TestArrayLeafForJSON_CDCRefusalCarriesTheSyncRemedy and its pipeline
+// sibling.
+func refuseUnresolvedArrayLeafOnCDC(col *ir.Column, n int) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeValueUnrepresentable,
+		"take the table out of scope with --exclude-table, or use `sluice migrate` for a one-shot copy — "+
+			"it has no CDC lane and carries every array element family faithfully",
+		fmt.Errorf(
+			"column %q: an array element arrived as %d raw bytes on a column with no resolvable element "+
+				"type, so this is the continuous-sync lane, where the applier reads column types from the "+
+				"TARGET and MySQL renders json[]/jsonb[] and bytea[] as the same JSON column. A json/jsonb "+
+				"element is carried as the document's own text and a bytea element as base64, and nothing "+
+				"here can tell which applies — the bytes cannot decide it either, since a bytea may "+
+				"legitimately spell a JSON document. Guessing would make the cold copy and every later "+
+				"change disagree about one column with no error on either side, so sluice refuses the "+
+				"value. A json[]/jsonb[]/bytea[] source column is NOT supported by continuous sync "+
+				"against a target with no array type; `sluice sync` refuses it at cold-start preflight, "+
+				"and a stream resumed WARM onto such a column reaches this message instead. Remedies: "+
+				"take the table out of scope with --exclude-table, or use `sluice migrate` for a one-shot "+
+				"copy — it has no CDC lane and carries every array element family faithfully",
+			columnNameForError(col), n,
+		),
+	)
 }
 
 // refuseArrayLeaf wraps a per-element fidelity refusal with the column
@@ -1796,30 +1922,34 @@ func looksLikePGArrayLiteral(s string) bool {
 	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
 }
 
-// pgArrayLiteralToJSON parses a Postgres one-dimensional array text
-// literal ("{a,b,c}", "{\"x\",\"y\"}") and returns its JSON-array
-// equivalent. Element values are emitted as JSON strings — the
-// translation is a string-array view of the array, not a typed
-// re-decode. Operators who need typed-element translation (numeric
-// arrays as JSON numbers, etc.) should override to `text` instead
-// and parse downstream.
-func pgArrayLiteralToJSON(s string) (string, error) {
+// pgArrayLiteralTokens parses a Postgres one-dimensional array text
+// literal ("{a,b,c}", "{\"x\",\"y\"}") into its per-element tokens: a
+// `[]any` of unescaped element STRINGS, with a literal NULL element as
+// a nil slot — exactly the shape [normalizeArrayLeavesForJSON] walks.
+//
+// It is a PARSE only. Every fidelity decision — what a token of this
+// column's element family becomes in JSON — belongs to
+// [arrayLeafForJSON] and is applied by [marshalArrayLeaves], so this
+// lane and the decoded-[]any lane cannot diverge by arrival shape. The
+// split matters because the two failure modes are different verdicts: a
+// parse error means "this value is not an array literal" and the caller
+// falls through to the next [prepareValue] branch, while a leaf refusal
+// means "it is one and it cannot be carried faithfully" and is loud.
+//
+// Element tokens are UNTYPED text, so a family with no [arrayLeafForJSON]
+// arm keeps the string PG rendered: a `numeric[]` overridden to json
+// lands as JSON strings, not JSON numbers. Operators who need
+// typed-element translation should override to `text` and parse
+// downstream.
+func pgArrayLiteralTokens(s string) ([]any, error) {
 	if !looksLikePGArrayLiteral(s) {
-		return "", fmt.Errorf("not a PG array literal: %q", s)
+		return nil, fmt.Errorf("not a PG array literal: %q", s)
 	}
 	body := s[1 : len(s)-1]
 	if body == "" {
-		return "[]", nil
+		return []any{}, nil
 	}
-	tokens, err := splitPGArrayTokens(body)
-	if err != nil {
-		return "", err
-	}
-	out, err := json.Marshal(tokens)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	return splitPGArrayTokens(body)
 }
 
 // splitPGArrayTokens parses the inside of a PG array literal into

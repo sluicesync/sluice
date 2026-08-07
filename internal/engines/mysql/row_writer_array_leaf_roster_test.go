@@ -18,9 +18,16 @@
 //   - The ROSTER is derived from the Postgres schema reader's
 //     `builtinArrayElement` map, read out of its SOURCE (the map is
 //     package-private to `postgres`, and importing that package from
-//     this one to reach it is a coupling not worth buying). A family
-//     added there fails this test until someone states its MySQL
-//     verdict. The pgoutput CDC door's `pgArrayElementOID` registry is
+//     this one to reach it is a coupling not worth buying). BOTH halves
+//     of that map are derived — the UDT keys AND the `data_type` each
+//     maps to — so a family added there fails this test until someone
+//     states its MySQL verdict, and a family REPOINTED there (say
+//     `"_bpchar": "character"` becoming `"text"`) fails it too. The
+//     second half was the item-152 review finding: the keys were
+//     derived and the ir.Type each key resolves to was hand-written and
+//     bound to nothing, so the roster would have gone on probing
+//     ir.Char while the reader produced ir.Text, green either way.
+//     The pgoutput CDC door's `pgArrayElementOID` registry is
 //     NOT read: `TestOIDToType_ArrayParity` in the postgres package
 //     already holds the two doors to the same FAMILY set, and unlike
 //     the Postgres-target roster this one dispatches on the family and
@@ -44,6 +51,17 @@
 //     is the whole population — but that is a property of the current
 //     code, and it is why TestPrepareValueCallSiteRoster exists next
 //     door rather than being asserted here.
+//   - It does NOT bind the last link: that PG `data_type` → this
+//     `ir.Type`. That resolution is `postgres.translateType`, which is
+//     package-private and unreachable from here by any means short of
+//     moving this gate to a third package. So if `translateType`
+//     started resolving `"character"` to something other than ir.Char,
+//     this roster would keep probing ir.Char and stay green. The
+//     Postgres-side sibling TestEveryDecodableArrayElementIsWritable
+//     DOES call translateType and would see the change — as a
+//     writability verdict, not as a divergence from what this file
+//     declares. Stated rather than implied, because the two derived
+//     halves above make it easy to read this roster as fully bound.
 
 package mysql
 
@@ -227,10 +245,50 @@ var mysqlArrayLeafRoster = map[string]struct {
 	},
 }
 
+// mysqlArrayLeafSourceDataType anchors each roster entry's hand-written
+// `elem` to the PG `data_type` it was written against — the second half
+// of `builtinArrayElement`, which the key derivation alone does not see.
+//
+// It is deliberately a COPY of that map rather than a derivation of it,
+// and the copy is the point: the test asserts the two are identical in
+// both directions, so repointing a UDT at a different `data_type` in the
+// reader fails here and makes whoever did it revisit the `elem` and the
+// verdict beside it. Without this the reader could start resolving
+// `_bpchar` through `text` and the roster would keep probing ir.Char,
+// green either way. What it still does NOT bind is `data_type` →
+// `ir.Type`; see the "does NOT bind the last link" bullet in the header.
+var mysqlArrayLeafSourceDataType = map[string]string{
+	"_bool":        "boolean",
+	"_int2":        "smallint",
+	"_int4":        "integer",
+	"_int8":        "bigint",
+	"_float4":      "real",
+	"_float8":      "double precision",
+	"_numeric":     "numeric",
+	"_text":        "text",
+	"_varchar":     "character varying",
+	"_bpchar":      "character",
+	"_char":        "character",
+	"_bytea":       "bytea",
+	"_date":        "date",
+	"_time":        "time without time zone",
+	"_timetz":      "time with time zone",
+	"_timestamp":   "timestamp without time zone",
+	"_timestamptz": "timestamp with time zone",
+	"_json":        "json",
+	"_jsonb":       "jsonb",
+	"_uuid":        "uuid",
+	"_inet":        "inet",
+	"_cidr":        "cidr",
+	"_macaddr":     "macaddr",
+	"_macaddr8":    "macaddr8",
+}
+
 // TestEveryDecodableArrayElementHasAMySQLLeafVerdict is the divergence
 // map: derived roster in, probed verdict out.
 func TestEveryDecodableArrayElementHasAMySQLLeafVerdict(t *testing.T) {
-	derived := postgresBuiltinArrayElementUDTs(t)
+	derivedTypes := postgresBuiltinArrayElement(t)
+	derived := sortedKeysOf(derivedTypes)
 
 	// Anti-vacuity on the INPUT: the roster is derived, so a derivation
 	// that silently broke would compare an empty set against an empty set
@@ -238,6 +296,32 @@ func TestEveryDecodableArrayElementHasAMySQLLeafVerdict(t *testing.T) {
 	if len(derived) < 20 {
 		t.Fatalf("derived only %d array element UDTs from the postgres schema reader; the derivation is "+
 			"broken and this roster would pass on a shrunken set", len(derived))
+	}
+
+	// The value half. Both directions, so a UDT repointed at a different
+	// `data_type` — the change the key derivation cannot see — reports as
+	// itself rather than as silence.
+	for udt, dataType := range derivedTypes {
+		declared, ok := mysqlArrayLeafSourceDataType[udt]
+		if !ok {
+			t.Errorf("the postgres reader maps array UDT %q to data_type %q, but "+
+				"mysqlArrayLeafSourceDataType does not list it — add it, and check that the ir.Type in "+
+				"mysqlArrayLeafRoster is what that data_type actually resolves to", udt, dataType)
+			continue
+		}
+		if declared != dataType {
+			t.Errorf("the postgres reader now maps array UDT %q to data_type %q, not %q. The MySQL roster's "+
+				"element ir.Type for that family was written for %q and is bound to nothing else, so it "+
+				"would keep probing the old family with this test green. Re-derive the entry: update "+
+				"mysqlArrayLeafSourceDataType, and update mysqlArrayLeafRoster[%q].elem, .leaf and "+
+				".wantRaw to whatever %q resolves to", udt, dataType, declared, declared, udt, dataType)
+		}
+	}
+	for udt := range mysqlArrayLeafSourceDataType {
+		if _, ok := derivedTypes[udt]; !ok {
+			t.Errorf("mysqlArrayLeafSourceDataType declares %q, which builtinArrayElement no longer "+
+				"lists — remove the stale entry", udt)
+		}
 	}
 
 	for _, udt := range derived {
@@ -335,12 +419,13 @@ func TestArrayLeafForJSON_TimetzTakesTheSameVerdictAsTime(t *testing.T) {
 	}
 }
 
-// postgresBuiltinArrayElementUDTs reads the postgres schema reader's
-// `builtinArrayElement` map keys out of its source file. The map is
-// package-private to `postgres`; parsing the source is what keeps this
-// roster DERIVED (a family added there fails this test) without buying
-// an import edge from mysql to postgres.
-func postgresBuiltinArrayElementUDTs(t *testing.T) []string {
+// postgresBuiltinArrayElement reads the postgres schema reader's
+// `builtinArrayElement` map out of its source file — BOTH the UDT keys
+// and the `data_type` each maps to. The map is package-private to
+// `postgres`; parsing the source is what keeps this roster DERIVED (a
+// family added or repointed there fails this test) without buying an
+// import edge from mysql to postgres.
+func postgresBuiltinArrayElement(t *testing.T) map[string]string {
 	t.Helper()
 	const src = "../postgres/schema_reader.go"
 	fset := token.NewFileSet()
@@ -348,7 +433,7 @@ func postgresBuiltinArrayElementUDTs(t *testing.T) []string {
 	if err != nil {
 		t.Fatalf("parse %s: %v", src, err)
 	}
-	var out []string
+	out := map[string]string{}
 	ast.Inspect(file, func(n ast.Node) bool {
 		spec, ok := n.(*ast.ValueSpec)
 		if !ok || len(spec.Names) != 1 || spec.Names[0].Name != "builtinArrayElement" {
@@ -374,13 +459,33 @@ func postgresBuiltinArrayElementUDTs(t *testing.T) []string {
 			if err != nil {
 				t.Fatalf("unquote %s: %v", key.Value, err)
 			}
-			out = append(out, udt)
+			val, isLit := kv.Value.(*ast.BasicLit)
+			if !isLit || val.Kind != token.STRING {
+				t.Fatalf("builtinArrayElement[%q] is no longer a string literal; the value derivation "+
+					"below would silently read nothing", udt)
+			}
+			dataType, err := strconv.Unquote(val.Value)
+			if err != nil {
+				t.Fatalf("unquote %s: %v", val.Value, err)
+			}
+			out[udt] = dataType
 		}
 		return false
 	})
 	if len(out) == 0 {
-		t.Fatalf("found no builtinArrayElement keys in %s — the map was renamed or restructured and this "+
-			"roster is deriving from nothing", src)
+		t.Fatalf("found no builtinArrayElement entries in %s — the map was renamed or restructured and "+
+			"this roster is deriving from nothing", src)
+	}
+	return out
+}
+
+// sortedKeysOf returns a map's keys in lexicographic order, so the
+// roster walk is deterministic and a failure names families in a stable
+// order across runs.
+func sortedKeysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	sort.Strings(out)
 	return out

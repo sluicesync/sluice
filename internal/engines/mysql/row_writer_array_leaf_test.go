@@ -194,6 +194,146 @@ func TestArrayLeafForJSON_TriggerDoorByteaAgreesWithTheSQLDoor(t *testing.T) {
 	}
 }
 
+// TestConvertArrayLikeToJSON_LiteralArmsTakeTheSameLeafPolicy is the
+// ARRIVAL-SHAPE axis, which the first cut of the leaf policy did not
+// have. The family half above asks "what does this element family
+// become?"; this asks "does the answer depend on which SHAPE the value
+// showed up in?", and the answer has to be no.
+//
+// [convertArrayLikeToJSON] recognises the same array three ways — the
+// decoded []any the scan/pgoutput lanes hand it, the PG array TEXT
+// LITERAL a `--type-override=col=jsonb` leaves as a string, and that
+// same literal as []byte when the reader's bytes path produced it. The
+// two literal arms used to go straight to a token marshal, so a
+// `bytea[]` rendered `["3q0="]` down one lane and `["\\xdead"]` down the
+// other: same declared family, same bytes, two encodings decided by
+// arrival shape — on the family the policy exists to make deterministic.
+//
+// Both override spellings are exercised (Type=ir.Array, and
+// Type=ir.JSON with the array parked in SourceColumnType) because
+// [arrayElementType] consults them separately and the literal arms are
+// reached mainly through the second.
+func TestConvertArrayLikeToJSON_LiteralArmsTakeTheSameLeafPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		elem    ir.Type
+		decoded []any // the []any lane's leaves
+		literal string
+		want    string
+	}{
+		{
+			// The finding. PG renders a bytea inside an array literal as
+			// the quoted `\\xdead`, which unescapes to the `\xdead` hex
+			// text the trigger door also produces.
+			"bytea",
+			ir.Blob{},
+			[]any{[]byte{0xde, 0xad}, []byte{0xbe, 0xef}},
+			`{"\\xdead","\\xbeef"}`,
+			`["3q0=","vu8="]`,
+		},
+		{
+			// Already agreed before the fix — kept so a change that fixed
+			// bytea by breaking json reports as itself.
+			"json",
+			ir.JSON{},
+			[]any{[]byte(`{"a":1}`), []byte(`[1,2]`)},
+			`{"{\"a\":1}","[1,2]"}`,
+			`["{\"a\":1}","[1,2]"]`,
+		},
+		{
+			// The string-leaf control: a family with no arm must not start
+			// getting one because the tokens now walk the policy.
+			"text",
+			ir.Text{},
+			[]any{"a", "b"},
+			`{a,b}`,
+			`["a","b"]`,
+		},
+		{
+			// A NULL element has to survive the token walk as JSON null on
+			// every arm, not become the four letters n-u-l-l.
+			"bytea with a NULL element",
+			ir.Blob{},
+			[]any{[]byte{0xaa}, nil, []byte{0xbb}},
+			`{"\\xaa",NULL,"\\xbb"}`,
+			`["qg==",null,"uw=="]`,
+		},
+		{
+			"empty",
+			ir.Blob{},
+			[]any{},
+			`{}`,
+			`[]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The two override spellings the writer actually sees.
+			for _, col := range []*ir.Column{
+				{Name: "c", Type: ir.Array{Element: tc.elem}},
+				{Name: "c", Type: ir.JSON{}, SourceColumnType: ir.Array{Element: tc.elem}},
+			} {
+				fromDecoded, err := prepareValue(tc.decoded, col)
+				if err != nil {
+					t.Fatalf("[]any lane (%T column): %v", col.Type, err)
+				}
+				fromLiteral, err := prepareValue(tc.literal, col)
+				if err != nil {
+					t.Fatalf("literal-string lane (%T column): %v", col.Type, err)
+				}
+				fromLiteralBytes, err := prepareValue([]byte(tc.literal), col)
+				if err != nil {
+					t.Fatalf("literal-bytes lane (%T column): %v", col.Type, err)
+				}
+				for _, got := range []struct {
+					lane string
+					v    any
+				}{
+					{"[]any", fromDecoded},
+					{"literal string", fromLiteral},
+					{"literal []byte", fromLiteralBytes},
+				} {
+					if got.v != tc.want {
+						t.Errorf("column type %T, %s lane: got %v; want %s — the leaf encoding must be "+
+							"decided by the element FAMILY, never by which shape the value arrived in",
+							col.Type, got.lane, got.v, tc.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestConvertArrayLikeToJSON_LiteralArmRefusalIsLoud holds the other
+// half of routing the literal arms through the leaf policy: a token that
+// the declared family cannot carry is now a REFUSAL rather than a
+// verbatim store, and a value that is not an array literal at all is
+// still a shape verdict (fall through), not an error.
+func TestConvertArrayLikeToJSON_LiteralArmRefusalIsLoud(t *testing.T) {
+	// A bytea[] literal whose token is not the `\x`-hex form
+	// `bytea_output = hex` produces. Pre-fix this stored the token's own
+	// ASCII, disagreeing with the []any lane's base64.
+	for _, v := range []any{`{"nothex"}`, []byte(`{"nothex"}`)} {
+		got, err := prepareValue(v, byteaArrayCol)
+		if err == nil {
+			t.Errorf("a bytea[] literal with a non-hex token was accepted as %v", got)
+			continue
+		}
+		if !strings.Contains(err.Error(), "even-hex") || !strings.Contains(err.Error(), `"y"`) {
+			t.Errorf("refusal is not the named leaf one: %v", err)
+		}
+	}
+	// And the disambiguation still works: a JSON OBJECT on a plain JSON
+	// column is not an array literal, so the arm declines rather than
+	// refusing, and prepareValue's next branch emits the bytes.
+	got, err := prepareValue([]byte(`{"a":1}`), &ir.Column{Name: "j", Type: ir.JSON{}})
+	if err != nil {
+		t.Fatalf("a JSON object on a JSON column was refused: %v", err)
+	}
+	if got != `{"a":1}` {
+		t.Errorf("JSON object on a JSON column = %v; want the document verbatim", got)
+	}
+}
+
 // TestArrayLeafForJSON_CDCApplierLaneRefusesRatherThanGuesses pins the
 // one lane that cannot resolve the element family at all, and the
 // reason the pipeline grew a preflight for it.
@@ -234,6 +374,157 @@ func TestArrayLeafForJSON_CDCApplierLaneRefusesRatherThanGuesses(t *testing.T) {
 	}
 }
 
+// TestArrayLeafForJSON_TriggerDoorApplierLaneIsUnguarded is a
+// RESIDUAL pin, not a guard, and the name says so on purpose.
+//
+// The sibling above pins that the applier lane refuses a `[]byte` leaf.
+// That refusal was documented as "the backstop that keeps the halves
+// preflight does NOT reach (warm resume, the multi-database fan-out)
+// loud rather than silent" — the sentence the whole preflight-scope
+// argument rested on. It holds only for doors that PRODUCE a []byte.
+// The pgtrigger door does not: its payload decode is a `UseNumber`
+// json.Unmarshal with no column types, so its leaves are drawn from
+// {string, json.Number, bool, nil, []any, map[string]any}. On that door
+// the refusal cannot fire and a `bytea[]` diverges silently from what
+// the cold copy stored.
+//
+// This test enumerates exactly what passes, with the cold copy's answer
+// beside it, so the residual is a fact in the test suite rather than a
+// sentence in a doc comment. It fails if a shape's rendering changes —
+// including if someone closes the gap, which is the moment to re-read
+// the false-positive argument below.
+//
+// # Why it is not closed by refusing
+//
+// On this lane the offending value is byte-identical to values that are
+// correct today and common. `[]any{"\\xdead"}` is what a `bytea[]`
+// produces AND what a jsonb column holding the DOCUMENT `["\\xdead"]`
+// produces; `[]any{json.Number("1")}` is a `bytea[]`-free `int[]` CDC
+// value that renders exactly as the cold copy does. A blanket refusal
+// on "[]any with no resolvable element type" would break every jsonb
+// array document over pgtrigger → MySQL and every string- and
+// native-leaf array over CDC on both doors. Sniffing the CONTENT to
+// tell them apart is what item 135 forbids one layer up. The cold-start
+// preflight — which reads the SOURCE schema, whatever the source engine
+// — is where this family is refused; see preflightArrayBytesLeafOnCDC.
+func TestArrayLeafForJSON_TriggerDoorApplierLaneIsUnguarded(t *testing.T) {
+	// Exactly the shape colTypesFor builds: the TARGET's own column, on
+	// which MySQL renders every array family as one JSON column.
+	colTypes := map[string]*ir.Column{"c": {Name: "c", Type: ir.JSON{Binary: true}}}
+	num := func(s string) json.Number { return json.Number(s) }
+
+	for _, tc := range []struct {
+		name     string
+		leaves   []any
+		want     string
+		coldCopy string // "" ⇒ the applier and the cold copy agree
+	}{
+		{
+			// The divergence. PG's to_jsonb renders a bytea through
+			// bytea_output, which the capture clause pins to hex.
+			"bytea[] as the trigger door's hex string",
+			[]any{`\xdead`},
+			`["\\xdead"]`,
+			`["3q0="]`,
+		},
+		{
+			// Refused at pgtrigger.Setup, so this needs a stream set up
+			// before that refusal existed — pinned because the value path
+			// itself is silent about it.
+			"json[] as the trigger door's nested document",
+			[]any{map[string]any{"a": num("1")}},
+			`[{"a":1}]`,
+			`["{\"a\": 1}"]`,
+		},
+		{
+			// The item-145 collision, arriving through this door: nesting
+			// makes a `null` DOCUMENT and a SQL NULL element identical.
+			"json[] null document beside a SQL NULL element",
+			[]any{nil, nil, true},
+			`[null,null,true]`,
+			`["null",null,"true"]`,
+		},
+		// ---- and the families that AGREE, which is why a blanket
+		// refusal here is not available. ----
+		{"text[] agrees", []any{"a", nil, "b"}, `["a",null,"b"]`, ""},
+		{"int[] agrees", []any{num("1"), num("2")}, `[1,2]`, ""},
+		{"bool[] agrees", []any{true, false}, `[true,false]`, ""},
+		{"2-D text[] agrees", []any{[]any{"a"}, []any{"b"}}, `[["a"],["b"]]`, ""},
+		{
+			// A jsonb column whose DOCUMENT is an array reaches this arm
+			// byte-identically to a real array value. Refusing the arm
+			// would break this, and it is correct today.
+			"a jsonb array DOCUMENT, indistinguishable from a real array",
+			[]any{num("1"), "x", nil},
+			`[1,"x",null]`,
+			"",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := prepareApplierValue(tc.leaves, colTypes, "c")
+			if err != nil {
+				t.Fatalf("the applier lane refused a trigger-door leaf shape it accepts today "+
+					"(if this is a deliberate new guard, re-read the false-positive argument in this "+
+					"test's doc before keeping it): %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("applier lane = %v; want %s", got, tc.want)
+			}
+			if tc.coldCopy != "" && got == tc.coldCopy {
+				t.Errorf("the applier lane now agrees with the cold copy (%s) for %q — the residual this "+
+					"test records has been CLOSED. Update arrayLeafForJSON's SCOPE section and "+
+					"preflightArrayBytesLeafOnCDC's, both of which currently say it is open",
+					tc.coldCopy, tc.name)
+			}
+		})
+	}
+
+	// The other door, for contrast: a []byte leaf on the same lane IS
+	// refused. Keeping both in one test is what makes the scope of the
+	// backstop legible instead of implied.
+	if _, err := prepareApplierValue([]any{[]byte{0xde, 0xad}}, colTypes, "c"); err == nil {
+		t.Error("the pgoutput door's []byte leaf is no longer refused on the applier lane; the backstop " +
+			"this test scopes has gone away entirely")
+	}
+}
+
+// TestArrayLeafForJSON_CDCRefusalCarriesTheSyncRemedy holds the half of
+// the CDC-lane refusal that an operator actually reads.
+//
+// `sync` cold-start and `schema add-table` run
+// pipeline.preflightArrayBytesLeafOnCDC and refuse before any data
+// moves, with remedies. A stream that resumes WARM reads no schema and
+// so hits this refusal instead — mid-flight, per row. For `json[]` that
+// is a corrupting family being stopped; for `bytea[]` it is a v0.115.0
+// sync that worked, so the message has to say the family is now
+// sync-unsupported and what to do, not just complain about a type.
+func TestArrayLeafForJSON_CDCRefusalCarriesTheSyncRemedy(t *testing.T) {
+	colTypes := map[string]*ir.Column{"c": {Name: "c", Type: ir.JSON{Binary: true}}}
+	_, err := prepareApplierValue([]any{[]byte(`{"a":1}`)}, colTypes, "c")
+	if err == nil {
+		t.Fatal("no refusal on the applier lane")
+	}
+	for _, want := range []string{
+		`column "c"`,          // names the row
+		"--exclude-table",     // the scope remedy the preflight offers
+		"sluice migrate",      // the copy-it-anyway remedy the preflight offers
+		"NOT supported by co", // states the family is sync-unsupported
+		"resumed WARM",        // says why the operator is seeing it late
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the warm-resume refusal is missing %q, so it does not read like the preflight's:\n%v",
+				want, err)
+		}
+	}
+	var coded *sluicecode.CodedError
+	if !errors.As(err, &coded) || coded.Code != sluicecode.CodeValueUnrepresentable {
+		t.Fatalf("refusal is not a %s error: %v", sluicecode.CodeValueUnrepresentable, err)
+	}
+	if !strings.Contains(coded.Hint, "--exclude-table") || !strings.Contains(coded.Hint, "sluice migrate") {
+		t.Errorf("the coded HINT does not carry the two preflight remedies: %q", coded.Hint)
+	}
+}
+
 // TestArrayLeafForJSON_LoudRefusals covers every case the leaf policy
 // refuses rather than guesses at. Each one used to be a silent base64
 // substitution or a silently-stored rendering.
@@ -254,7 +545,7 @@ func TestArrayLeafForJSON_LoudRefusals(t *testing.T) {
 			"a byte leaf on a column with no resolvable element type",
 			&ir.Column{Name: "j", Type: ir.JSON{}},
 			[]any{[]byte("abc")},
-			"not declared as an array",
+			"no resolvable element type",
 		},
 		{
 			"an empty json document",

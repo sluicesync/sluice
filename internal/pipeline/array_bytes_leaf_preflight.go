@@ -105,14 +105,46 @@ var errArrayBytesLeafOnCDC = errors.New(
 //   - `sync` single-database cold start, on every branch of
 //     coldStartGatePreflight.
 //   - `schema add-table`, against the target the live stream applies to.
+//   - A column declared as a DOMAIN over such an array
+//     (`CREATE DOMAIN d AS json[]`) — see [unwrapDomainToArray]. The
+//     first cut asked `src.(ir.Array)` and skipped it.
 //   - NOT the multi-database cold-start fan-out, which has its own
-//     schema plumbing; filed rather than half-built, and the leaf
-//     refusal below still makes it loud.
-//   - NOT warm resume, which reads no schema by design. A stream
-//     resumed onto such a column still fails LOUDLY — at the applier's
-//     leaf, naming the column — so the blind halves cost a late error,
-//     never a silent one. That is the property that made refusing at the
-//     leaf the right backstop rather than a base64 fallback.
+//     schema plumbing; filed rather than half-built.
+//   - NOT warm resume, which reads no schema by design. Nor a
+//     mid-stream `ALTER TABLE … ADD COLUMN bytea[]`, which no preflight
+//     sees.
+//
+// # What the blind halves cost, which is NOT uniformly a late error
+//
+// The writer's leaf refusal is the backstop for the halves above, and
+// its own scope is narrower than "the CDC lane": it fires on a `[]byte`
+// leaf, so it reaches the doors that produce one.
+//
+//   - Multi-database fan-out — still LOUD. Its source is one of the two
+//     [ir.MultiDatabaseSnapshotOpener] implementors: MySQL, whose
+//     schema reader never produces an [ir.Array] at all, or Postgres,
+//     whose pgoutput door decodes both byte-shaped families to []byte
+//     and so trips the refusal.
+//   - Warm resume / mid-stream ADD COLUMN over the pgoutput or scan
+//     doors — still LOUD, at the applier's leaf, naming the column.
+//   - Warm resume / mid-stream ADD COLUMN over the PGTRIGGER door —
+//     SILENTLY DIVERGENT. That reader's payload decode is a `UseNumber`
+//     [encoding/json] unmarshal, whose leaves can never be a []byte, so
+//     the refusal cannot fire: a `bytea[]` element arrives as PG's
+//     `\x`-hex string and lands as `["\\xdead"]` where the cold copy
+//     stored `["3q0="]`. Cold start is covered — this preflight reads
+//     the SOURCE schema whatever the source engine — so the exposure is
+//     a stream STARTED on a sluice older than v0.116.0 and resumed on a
+//     newer one, or a column added to a live stream. It is not closed
+//     at the leaf because on that door the value is byte-identical to a
+//     jsonb array DOCUMENT and to a `text[]`/`int[]` CDC value, both of
+//     which are correct today; arrayLeafForJSON's scope section carries
+//     the full argument and the pin.
+//
+// So: the blind halves cost a LATE error on every door but one, and a
+// silent divergence on that one. The earlier form of this sentence said
+// "never a silent one", which was the claim the whole preflight-scope
+// argument rested on and was false for pgtrigger.
 func preflightArrayBytesLeafOnCDC(schema *ir.Schema, targetEngine, mode string) error {
 	if schema == nil || !migcore.IsMySQLFamilyEngine(targetEngine) {
 		return nil
@@ -130,7 +162,7 @@ func preflightArrayBytesLeafOnCDC(schema *ir.Schema, targetEngine, mode string) 
 			if c.SourceColumnType != nil {
 				src = c.SourceColumnType
 			}
-			arr, isArray := src.(ir.Array)
+			arr, isArray := unwrapDomainToArray(src)
 			if !isArray || !isByteShapedArrayLeaf(arr.Element) {
 				continue
 			}
@@ -166,6 +198,40 @@ func engineNameOrEmpty(e ir.Engine) string {
 		return ""
 	}
 	return e.Name()
+}
+
+// unwrapDomainToArray resolves a column's source type to the [ir.Array]
+// underneath it, seeing through any depth of [ir.Domain].
+//
+// `CREATE DOMAIN d AS json[]` is a real Postgres shape and the schema
+// reader carries it as `ir.Domain{BaseType: ir.Array{...}}`, so a bare
+// `src.(ir.Array)` skipped the cold-start refusal for exactly the
+// columns it exists to catch and left them to fail mid-stream at the
+// writer's leaf instead. The MySQL writer already unwraps domains the
+// same way before dispatching a value ([prepareValue]'s Bug-122 arm), so
+// the value path and this preflight now ask the same question.
+//
+// Recursion is bounded by nilling out a base type that is not itself a
+// domain; a self-referential domain is not constructible in Postgres, and
+// the loop bound below makes a malformed IR terminate rather than hang.
+func unwrapDomainToArray(t ir.Type) (ir.Array, bool) {
+	// 16 is far past any real nesting (PG's own domain-over-domain chains
+	// are shallow); the bound exists so a cyclic IR built by a test or a
+	// future reader bug fails closed rather than spinning.
+	for range 16 {
+		switch v := t.(type) {
+		case ir.Array:
+			return v, true
+		case ir.Domain:
+			if v.BaseType == nil {
+				return ir.Array{}, false
+			}
+			t = v.BaseType
+		default:
+			return ir.Array{}, false
+		}
+	}
+	return ir.Array{}, false
 }
 
 // isByteShapedArrayLeaf reports whether an array ELEMENT type's
