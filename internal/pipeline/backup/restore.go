@@ -446,7 +446,13 @@ func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *
 	if err := migcore.PreflightIndexEmit(ctx, r.Target, schema, "restore"); err != nil {
 		return err
 	}
-	return migcore.PreflightViewEmit(ctx, r.Target, schema, "restore")
+	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "restore"); err != nil {
+		return err
+	}
+	// Item 149: the archive's own table names, against the fold of the server
+	// this restore is pointed at. A backup taken from a case-sensitive MySQL
+	// (or from Postgres) can hold a pair that only collides on the target.
+	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, schema, "restore")
 }
 
 func (r *Restore) Run(ctx context.Context) error {

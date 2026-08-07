@@ -376,6 +376,18 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	if err := migcore.PreflightTableEmit(ctx, m.Target, schema, "migrate"); err != nil {
 		return nil, false, err
 	}
+	// The connection-BEARING member of the same family (roadmap item 149).
+	// Unlike its three neighbours this one asks the target SERVER a question —
+	// whether it folds table names — because on MySQL that is not a property of
+	// the schema. Consequence worth stating: a `--dry-run` against a MySQL
+	// target now opens one connection and reads one variable. That is
+	// deliberate, and it is the same trade the multi-namespace fan-out already
+	// makes for the DATABASE axis of this very setting
+	// (preflightNamespaceFoldCollisions runs in a dry run too) — a plan whose
+	// answer depends on a server setting cannot be produced without the server.
+	if err := migcore.PreflightTableNameFold(ctx, m.Target, m.TargetDSN, schema, "migrate"); err != nil {
+		return nil, false, err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, m.Target, schema, "migrate"); err != nil {
 		return nil, false, err
 	}

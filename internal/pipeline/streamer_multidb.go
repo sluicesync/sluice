@@ -639,6 +639,15 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return fmt.Errorf("pipeline: preflight tables for %q: %w", database, err)
 	}
+	// Item 149, per database. The fan-out's DATABASE-name fold is already
+	// refused once up front (preflightNamespaceFoldCollisions); this is the
+	// TABLE-name axis of the same server setting, and it is per-database
+	// because each iteration carries its own schema. s.TargetDSN is the server
+	// DSN rather than this database's derived one on purpose — the setting is
+	// global, and the derived DSN is not built until further down.
+	if err := migcore.PreflightTableNameFold(ctx, s.Target, s.TargetDSN, schema, "sync cold-start"); err != nil {
+		return fmt.Errorf("pipeline: preflight table-name fold for %q: %w", database, err)
+	}
 	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return fmt.Errorf("pipeline: preflight indexes for %q: %w", database, err)
 	}

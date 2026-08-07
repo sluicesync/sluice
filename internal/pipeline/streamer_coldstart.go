@@ -154,6 +154,12 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return nil, stop, err
 	}
+	// Item 149: the same refusal on a target whose fold only the SERVER knows.
+	// s.TargetDSN names the server; the setting is global, so the database
+	// component is immaterial.
+	if err := migcore.PreflightTableNameFold(ctx, s.Target, s.TargetDSN, schema, "sync cold-start"); err != nil {
+		return nil, stop, err
+	}
 	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return nil, stop, err
 	}

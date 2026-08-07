@@ -592,46 +592,70 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 	return nil
 }
 
-// FoldNamespace implements [ir.NamespaceFolder]: it reports the MySQL
-// database identifier a source namespace `name` would land under on the
-// server dsn points at, accounting for the server's
-// `lower_case_table_names` (lct) setting (ADR-0075 resolved decision #1).
-//
-// MySQL folds database (and table) names per lct:
+// foldMySQLIdentifier is sluice's imitation of the fold a MySQL server
+// applies to DATABASE and TABLE identifiers when it runs
+// `lower_case_table_names != 0`. Both axes go through this one function so
+// they cannot disagree about one server setting; see
+// engines/mysql/table_name_fold.go for the measured ground truth and for
+// the non-ASCII residual this imitation carries.
+func foldMySQLIdentifier(name string) string {
+	return strings.ToLower(name)
+}
+
+// lowerCaseTableNames reads the target server's `lower_case_table_names`
+// (lct) setting — the one fact that decides whether MySQL folds identifiers
+// at all (ADR-0075 resolved decision #1, roadmap item 149).
 //
 //   - lct=0 (the common Linux default): names are stored and compared
 //     case-SENSITIVELY — no fold, identity.
 //   - lct=1 (the Windows / macOS default, and some managed services):
 //     names are stored lowercased and compared case-insensitively — the
-//     fold is strings.ToLower.
-//   - lct=2 (macOS default): stored as given but compared
-//     case-insensitively — for COLLISION purposes this behaves like a
-//     lowercase fold (two names equal under case-insensitive compare).
+//     fold is [foldMySQLIdentifier].
+//   - lct=2: stored as given but compared case-insensitively — for
+//     COLLISION purposes that is the same lowercase fold (two names equal
+//     under a case-insensitive compare). The server only honours 2 on a
+//     case-INSENSITIVE filesystem; asked for it on a case-sensitive one it
+//     reports a different effective value, which is why every predicate in
+//     this engine tests `!= 0` rather than `== 1` and reads the EFFECTIVE
+//     global rather than trusting the operator's configured intent.
+//
+// One connection, one variable read. dsn may be a server DSN (database
+// component optional) — the setting is global.
+func (e Engine) lowerCaseTableNames(ctx context.Context, dsn string) (int, error) {
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return 0, err
+	}
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+
+	return readLowerCaseTableNames(ctx, db)
+}
+
+// FoldNamespace implements [ir.NamespaceFolder]: it reports the MySQL
+// database identifier a source namespace `name` would land under on the
+// server dsn points at, accounting for the server's
+// `lower_case_table_names` setting (ADR-0075 resolved decision #1). See
+// [Engine.lowerCaseTableNames] for what each value means.
 //
 // So lct != 0 ⇒ lowercase fold. The orchestrator uses the returned value
 // only to detect two distinct source namespaces folding to the same
 // target database (a silent-merge hazard it refuses loudly). Identity
-// (lct=0) means no folding-induced collision is possible.
+// (lct=0) means no folding-induced collision is possible. The TABLE-name
+// axis of the same setting is [Engine.PreflightTableNameFold].
 //
 // Used on a MySQL TARGET of a PG-source (or MySQL-source) multi-namespace
 // fan-out. dsn may be a server DSN (database component optional).
 func (e Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, error) {
-	cfg, err := parseServerDSN(dsn)
+	lct, err := e.lowerCaseTableNames(ctx, dsn)
 	if err != nil {
 		return "", err
-	}
-	db, err := openDB(ctx, cfg, e.opts.sqlMode)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = db.Close() }()
-
-	var lct int
-	if err := db.QueryRowContext(ctx, "SELECT @@global.lower_case_table_names").Scan(&lct); err != nil {
-		return "", fmt.Errorf("mysql: read lower_case_table_names: %w", err)
 	}
 	if lct != 0 {
-		return strings.ToLower(name), nil
+		return foldMySQLIdentifier(name), nil
 	}
 	return name, nil
 }

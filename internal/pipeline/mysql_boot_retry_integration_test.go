@@ -112,6 +112,23 @@ func mysqlBootBackoff(attempt int) time.Duration {
 // single-shot helpers' error path.
 func runMySQLWithRetry(t *testing.T, opts ...testcontainers.ContainerCustomizer) *mysqltc.MySQLContainer {
 	t.Helper()
+	return runMySQLImageWithRetry(t, mysqlBootImage, opts...)
+}
+
+// runMySQLImageWithRetry is [runMySQLWithRetry] with the image named, for the
+// one caller that cannot use the pre-baked one.
+//
+// The pre-baked image ships an ALREADY-INITIALIZED data directory, and
+// `lower_case_table_names` is fixed at initialization: booting it with
+// `--lower-case-table-names=1` aborts with `MY-011087: Different
+// lower_case_table_names settings for server ('1') and data dictionary ('0')`,
+// measured. A test that needs a folding server must therefore boot an
+// uninitialized upstream image and pay the cold init — see startMySQLFolding.
+// `--lower-case-table-names=0` is fine on the pre-baked image because that IS
+// the value its dictionary carries, which is why startMySQLCaseSensitive needs
+// nothing special.
+func runMySQLImageWithRetry(t *testing.T, image string, opts ...testcontainers.ContainerCustomizer) *mysqltc.MySQLContainer {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	// Wait-strategy override matching our per-attempt budget. testcontainers'
@@ -138,7 +155,7 @@ func runMySQLWithRetry(t *testing.T, opts ...testcontainers.ContainerCustomizer)
 	var lastErr error
 	for attempt := 1; attempt <= mysqlBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), mysqlBootTimeout)
-		container, err := mysqltc.Run(ctx, mysqlBootImage, waitOpts...)
+		container, err := mysqltc.Run(ctx, image, waitOpts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {

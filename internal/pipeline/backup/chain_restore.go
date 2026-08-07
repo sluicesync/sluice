@@ -173,6 +173,34 @@ type ChainRestore struct {
 // [ChainRestore.ApplyBatchSize] when left zero.
 const DefaultChainRestoreBatchSize = 100
 
+// refuseUnrepresentableTargetShape asks the target engine, before the chain
+// replays, whether the ROOT manifest's schema — the shape the target tables are
+// created from — can be created on it at all.
+//
+// It is the twin of [Restore.refuseUnrepresentableTargetShape] and exists for
+// the same two reasons: the phases these refusals would otherwise fire from
+// (indexes, views) run AFTER the entire chain has been replayed, and the
+// table-name ones do not fire at all — the emit succeeds and creates nothing.
+// Asked unconditionally, not only on the cross-engine branch.
+//
+// Carved out of [ChainRestore.Run] rather than inlined because Run is at its
+// length ceiling; this is a coherent phase, and it is the declaration
+// TestIndexEmitPreflightReachesEveryCopyEntryPoint rosters for this path.
+func (r *ChainRestore) refuseUnrepresentableTargetShape(ctx context.Context, schema *ir.Schema) error {
+	if err := migcore.PreflightTableEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightIndexEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+		return err
+	}
+	// Item 149: the chain's table names may only collide once the TARGET
+	// server's fold is applied, which is not knowable from the manifest.
+	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, schema, "chain restore")
+}
+
 // Run executes the lineage-walk restore (ADR-0046 §3). Returns nil on
 // success.
 //
@@ -278,19 +306,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		)
 	}
 
-	// 2.45. Index-emit pre-flight refusal (roadmap item 118), on the chain
-	//       ROOT's schema — the shape the target tables are created from.
-	//       Same reason as the single-manifest twin in restore.go: the
-	//       index phase runs after the whole chain has been replayed, so
-	//       an unrepresentable index was discovered at the very end. Asked
-	//       unconditionally, not only on the cross-engine branch.
-	if err := migcore.PreflightTableEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
-		return err
-	}
-	if err := migcore.PreflightIndexEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
-		return err
-	}
-	if err := migcore.PreflightViewEmit(ctx, r.Target, root.Manifest.Schema, "chain restore"); err != nil {
+	// 2.45. Object-emit pre-flight refusals, on the chain ROOT's schema.
+	if err := r.refuseUnrepresentableTargetShape(ctx, root.Manifest.Schema); err != nil {
 		return err
 	}
 

@@ -414,6 +414,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := migcore.PreflightViewEmit(ctx, a.Target, scoped, "add-table"); err != nil {
 		return err
 	}
+	// Item 149. On this path the scoped schema carries ONE table, so the
+	// implementations return before probing the server — the call is here so
+	// the entry-point roster stays the answer to "which paths ask all four",
+	// not because add-table can collide with itself.
+	if err := migcore.PreflightTableNameFold(ctx, a.Target, a.TargetDSN, scoped, "add-table"); err != nil {
+		return err
+	}
 
 	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))

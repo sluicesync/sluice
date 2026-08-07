@@ -167,6 +167,9 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if s == nil {
 		return errors.New("mysql: CreateTablesWithoutConstraints: schema is nil")
 	}
+	if err := w.refuseFoldedTableNames(ctx, s); err != nil {
+		return err
+	}
 	w.maybeWarnRLSDrop(ctx, s)
 	w.maybeWarnDomainCheckDrop(ctx, s)
 	for _, table := range orderedTables(s) {
@@ -179,6 +182,33 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		}
 	}
 	return nil
+}
+
+// refuseFoldedTableNames is the SECOND door for roadmap item 149: the phase
+// where the silent no-op actually happens. The emit below writes
+// `CREATE TABLE IF NOT EXISTS` with a bare name, so on a server running
+// `lower_case_table_names != 0` the second of two tables whose names differ
+// only in case returns Note 1050 — a WARNING — and creates nothing, and the
+// copy then INSERTs its rows into the table that won the name.
+//
+// It asks the same question as [Engine.PreflightTableNameFold] through the
+// same [validateMySQLTableNameFold], on this writer's own connection, so the
+// early answer and the late one cannot drift. Neither door is redundant: the
+// preflight is the only one a run against an already-created target passes
+// (that run never reaches this phase), and this one is the only one a copy
+// path outside the hand-maintained entry-point roster passes.
+//
+// A schema carrying fewer than two tables is skipped without a probe — one
+// name cannot collide with itself, and `add-table` creates exactly one.
+func (w *SchemaWriter) refuseFoldedTableNames(ctx context.Context, s *ir.Schema) error {
+	if len(s.Tables) < 2 {
+		return nil
+	}
+	lct, err := readLowerCaseTableNames(ctx, w.db)
+	if err != nil {
+		return err
+	}
+	return validateMySQLTableNameFold(lct, s.Tables)
 }
 
 // maybeWarnRLSDrop logs a single WARN per writer lifetime when the

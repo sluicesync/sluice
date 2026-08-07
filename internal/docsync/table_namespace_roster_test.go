@@ -44,10 +44,12 @@ import (
 //     prove an engine's notion of "collides" is complete; the engine's own
 //     tests do that.
 //   - IT IS BLIND TO ANY COLLISION THAT NEEDS A CONNECTION TO SEE, and exactly
-//     one engine's real collision is of that kind. See tableNamespaceKnownGaps
-//     below, which is deliberately NOT the exemption map: an exemption is a
-//     safety argument, a gap is an absence, and merging them would let this
-//     roster's existence imply coverage it does not have.
+//     one engine's real collision is of that kind. See
+//     tableNamespaceConnectionBearing below, which is deliberately NOT the
+//     exemption map: an exemption is a safety argument, and those engines have
+//     none — what they have is a DIFFERENT door (ir.TableNameFoldPreflighter,
+//     roadmap item 149) with its own gates, named there. Merging the two maps
+//     would let this roster's existence imply coverage it does not have.
 var tableNamespaceExempt = map[string]string{
 	// Source-only engines: no table DDL is ever emitted for them as a target,
 	// so there is no target namespace to collide in. Same set and same reasons
@@ -72,25 +74,31 @@ var tableNamespaceExempt = map[string]string{
 	"postgres-trigger": "delegates its whole schema write to postgres.Engine — same emit, same identifier-length refusal",
 }
 
-// tableNamespaceKnownGaps is NOT an exemption list. Each entry is an engine
-// whose table emit CAN silently adopt another table's rows and which this
-// roster does not cover, with the reason it is not covered. Kept separate and
-// asserted separately because CLAUDE.md's gate-scope rule is explicit that a
-// gate whose coverage is narrower than its name implies is worse than no gate:
-// an exemption line reading like the ones above would state a safety argument
-// where there is none.
-var tableNamespaceKnownGaps = map[string]string{
-	"mysql": "GAP (filed as roadmap item 149): emits a BARE `CREATE TABLE IF NOT EXISTS` and folds table " +
-		"names when the server runs `lower_case_table_names != 0`, so a PostgreSQL source holding `orders` " +
-		"and `Orders` merges there exactly as it would on SQLite. It is not covered here because the fold " +
-		"is a property of the SERVER, not of the schema: answering it needs a connection, and " +
-		"[ir.TableEmitPreflighter] is deliberately connection-free. The primitive already exists " +
-		"(ir.NamespaceFolder, which MySQL implements by reading @@global.lower_case_table_names) and is " +
-		"already used for the multi-namespace fan-out's database-name fold — item 149 is to apply the same " +
-		"fold to TABLE names at the copy entry points.",
-	"planetscale": "GAP — same engine as mysql, same statement, same server-side fold (item 149)",
-	"vitess":      "GAP — same engine as mysql, same statement, same server-side fold (item 149)",
-	"mariadb":     "GAP — same engine as mysql, same statement, same server-side fold (item 149)",
+// tableNamespaceConnectionBearing is the third bucket, and it is NOT an
+// exemption either. Each entry is an engine whose table emit CAN silently adopt
+// another table's rows, whose collision this connection-free roster is
+// STRUCTURALLY unable to see, and which answers the same question through
+// [ir.TableNameFoldPreflighter] instead (roadmap item 149).
+//
+// It replaced a `tableNamespaceKnownGaps` map that said, correctly, that
+// nothing asked these engines at all. What is asserted here is weaker than what
+// is asserted above and the difference is the point: this roster proves only
+// that the SURFACE is implemented. Whether the answer is right is proved by
+// TestMySQLTableNameFold* (unit, both lct values) and, end to end against real
+// servers with the variable actually set both ways, by
+// TestMigrate_TableNameFold_PGToMySQL_* in internal/pipeline. Naming those here
+// is the whole reason this bucket is allowed to exist.
+var tableNamespaceConnectionBearing = map[string]string{
+	"mysql": "emits a BARE `CREATE TABLE IF NOT EXISTS` and folds table names when the server runs " +
+		"`lower_case_table_names != 0`, so a PostgreSQL source holding `orders` and `Orders` merges " +
+		"there exactly as it would on SQLite — measured, Note 1050 and two rows in one table. The fold " +
+		"is a property of the SERVER, not of the schema, and a connection-free check would have to " +
+		"either stay silent or refuse that pair on every stock Linux MySQL (lct=0), so the question " +
+		"lives on the connection-bearing surface.",
+	"planetscale": "same engine as mysql, same statement, same server-side fold",
+	"vitess":      "same engine as mysql, same statement, same server-side fold",
+	"mariadb": "same engine as mysql, same statement, same server-side fold — measured identical on " +
+		"mariadb:11.4 for lct=1, lct=2 and the non-ASCII pair",
 }
 
 // tableNamespaceCollision holds each covered target's OWN collision shape.
@@ -122,9 +130,18 @@ func TestEveryTargetRefusesACollidingTableNamespace(t *testing.T) {
 		if !ok {
 			t.Fatalf("engines.Names() reported %q but engines.Get did not return it", name)
 		}
-		if reason, isGap := tableNamespaceKnownGaps[name]; isGap {
+		if reason, isConnBearing := tableNamespaceConnectionBearing[name]; isConnBearing {
 			if reason == "" {
-				t.Errorf("%q is listed as a known gap with an EMPTY reason", name)
+				t.Errorf("%q is listed as connection-bearing with an EMPTY reason", name)
+			}
+			// The one thing this roster CAN assert for them: the surface
+			// exists on the registered engine value. Without it, "answered
+			// elsewhere" would be a promise rather than a check — which is
+			// exactly what the gap map this replaced was recording.
+			if _, ok := e.(ir.TableNameFoldPreflighter); !ok {
+				t.Errorf("engine %q is listed as answering the table-name question through a connection, "+
+					"but does not implement ir.TableNameFoldPreflighter — so NOTHING asks it, and this "+
+					"roster is now stating coverage that does not exist (roadmap item 149)", name)
 			}
 			gapped = append(gapped, name)
 			continue
@@ -189,19 +206,20 @@ func TestEveryTargetRefusesACollidingTableNamespace(t *testing.T) {
 				"stale; drop it", name)
 		}
 	}
-	for name := range tableNamespaceKnownGaps {
+	for name := range tableNamespaceConnectionBearing {
 		if _, ok := engines.Get(name); !ok {
-			t.Errorf("tableNamespaceKnownGaps names %q, which is not a registered engine — the gap is "+
-				"stale; drop it", name)
+			t.Errorf("tableNamespaceConnectionBearing names %q, which is not a registered engine — the "+
+				"entry is stale; drop it", name)
 		}
 		if _, alsoExempt := tableNamespaceExempt[name]; alsoExempt {
-			t.Errorf("%q is listed BOTH as exempt and as a known gap; one of the two is a lie about "+
-				"whether that engine is safe", name)
+			t.Errorf("%q is listed BOTH as exempt and as connection-bearing; one of the two is a lie "+
+				"about how that engine is covered", name)
 		}
 	}
 	if len(exempted)+len(gapped) >= len(names) {
-		t.Fatalf("every registered engine (%d exempt + %d gapped of %d) is outside the table-namespace "+
-			"check; the roster has stopped requiring anything", len(exempted), len(gapped), len(names))
+		t.Fatalf("every registered engine (%d exempt + %d connection-bearing of %d) is outside the "+
+			"connection-free table-namespace check; the roster has stopped requiring anything",
+			len(exempted), len(gapped), len(names))
 	}
 	sort.Strings(checked)
 	if len(checked) < 1 {
@@ -209,5 +227,6 @@ func TestEveryTargetRefusesACollidingTableNamespace(t *testing.T) {
 			"table emit can send a table's rows into another table, and it must.", checked)
 	}
 	sort.Strings(gapped)
-	t.Logf("table-namespace roster: checked=%v exempt=%d KNOWN GAPS=%v (item 149)", checked, len(exempted), gapped)
+	t.Logf("table-namespace roster: checked=%v exempt=%d answered-with-a-connection=%v (item 149)",
+		checked, len(exempted), gapped)
 }

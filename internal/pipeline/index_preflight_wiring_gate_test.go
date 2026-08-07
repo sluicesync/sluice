@@ -36,18 +36,19 @@ import (
 // shape: an entry point is either in the list and calls the preflight, or it
 // is exempt with a reason.
 //
-// # All three helpers, one roster
+// # All four helpers, one roster
 //
-// Item 147 added [migcore.PreflightViewEmit] beside [migcore.PreflightIndexEmit]
-// and item 148 added [migcore.PreflightTableEmit] beside both — separate
-// helpers on purpose (a view or table question inside a method named for
-// indexes would make that name broader than its truth), asked at the SAME six
-// entry points for the same reason. The entry-point roster is therefore shared:
-// each rostered declaration must call ALL THREE, so the sibling that arrives
-// next cannot land on one helper's call sites and miss the others'. Forking a
-// second roster would have re-created exactly the drift this gate exists to
-// stop — and item 148's arrival is the evidence that "the sibling that arrives
-// next" is not hypothetical.
+// Item 147 added [migcore.PreflightViewEmit] beside [migcore.PreflightIndexEmit],
+// item 148 added [migcore.PreflightTableEmit] beside both, and item 149 added
+// [migcore.PreflightTableNameFold] beside all three — separate helpers on
+// purpose (a view, table or fold question inside a method named for indexes
+// would make that name broader than its truth), asked at the SAME six entry
+// points for the same reason. The entry-point roster is therefore shared: each
+// rostered declaration must call ALL FOUR, so the sibling that arrives next
+// cannot land on one helper's call sites and miss the others'. Forking a second
+// roster would have re-created exactly the drift this gate exists to stop — and
+// items 148 and 149 arriving in consecutive weeks, each for free, are the
+// evidence that "the sibling that arrives next" is not hypothetical.
 //
 // # Scope, stated so the name cannot be read as broader than the truth
 //
@@ -83,7 +84,10 @@ var indexPreflightEntryPoints = map[string]map[string]string{
 		"(*Restore).refuseUnrepresentableTargetShape": "`restore`: writes the whole archive to the " +
 			"target, then builds indexes. The call lives in the schema-shape refusal phase Run carves " +
 			"out, not in Run itself",
-		"(*ChainRestore).Run": "`restore` of a chain: same phase order, after the entire chain replays",
+		"(*ChainRestore).refuseUnrepresentableTargetShape": "`restore` of a chain: same phase order, " +
+			"after the entire chain replays. The call moved out of Run into the same carved-out refusal " +
+			"phase its single-manifest twin uses when item 149 added the fourth helper — Run was at its " +
+			"funlen ceiling, and one shared phase is where a fifth would go too",
 	},
 }
 
@@ -107,11 +111,21 @@ func declIdentity(fn *ast.FuncDecl) string {
 }
 
 // preflightHelpers is the set of migcore dispatchers every rostered entry
-// point must call. All three are unconditional pre-DDL gates over the whole
-// schema and all three are silent-or-late without the call; they differ only
-// in the object kind they refuse on. PreflightTableEmit joined in item 148 —
-// the member of the class that loses ROWS rather than an object.
-var preflightHelpers = []string{"PreflightIndexEmit", "PreflightViewEmit", "PreflightTableEmit"}
+// point must call. All four are unconditional pre-DDL gates over the whole
+// schema and all four are silent-or-late without the call; they differ in the
+// object kind they refuse on and, for the last, in needing a connection.
+// PreflightTableEmit joined in item 148 — the member of the class that loses
+// ROWS rather than an object — and PreflightTableNameFold in item 149, which
+// is that same loss on a target whose fold only the SERVER knows
+// (MySQL/PlanetScale/Vitess/MariaDB under lower_case_table_names != 0). The
+// fourth is the reason this roster was worth keeping shared: it took one line
+// per entry point and no new list.
+var preflightHelpers = []string{
+	"PreflightIndexEmit",
+	"PreflightViewEmit",
+	"PreflightTableEmit",
+	"PreflightTableNameFold",
+}
 
 // callersOfPreflight parses every non-test .go file in dir and returns the set
 // of declarations that call migcore.<helper>.
@@ -172,8 +186,8 @@ func TestIndexEmitPreflightReachesEveryCopyEntryPoint(t *testing.T) {
 			if len(callers) == 0 {
 				t.Fatalf("no call to migcore.%s found anywhere in %q. Either the helper was "+
 					"renamed (re-point this gate) or every entry point lost the call — in which case roadmap "+
-					"item 118/147 has silently regressed and every index or view refusal is back to firing "+
-					"after the copy.", helper, dir)
+					"item 118/147/148/149 has silently regressed and every index, view, table or fold refusal "+
+					"is back to firing after the copy, or not at all.", helper, dir)
 			}
 
 			for decl, why := range wanted {

@@ -3557,6 +3557,49 @@ type TableEmitPreflighter interface {
 	PreflightTables(s *Schema) error
 }
 
+// TableNameFoldPreflighter is the optional TARGET-engine surface that answers,
+// WITH a connection to the target server and before any data moves, "once YOUR
+// OWN name fold is applied, would two of these tables land on one table name?"
+// (roadmap item 149).
+//
+// # Why a connection-BEARING sibling of [TableEmitPreflighter]
+//
+// It is the same silent-merge defect and a different kind of question. On
+// SQLite the fold is a property of the engine, so [TableEmitPreflighter] can
+// answer it from the schema alone. On MySQL the fold is a property of the
+// SERVER: `lower_case_table_names` is fixed at initialization, and the same
+// schema is safe on one server and merges on another. A connection-free
+// preflight has exactly two options there and both are wrong — stay silent (the
+// gap this closes) or always fold, which would refuse `orders` + `Orders` on
+// every stock Linux MySQL (lct=0, case-sensitive), breaking migrations that
+// work today. So the question moves to a surface that can ask the server,
+// rather than [TableEmitPreflighter] being weakened into guessing.
+//
+// # Contract
+//
+// dsn names the target SERVER (its database component is optional — the setting
+// is global). Implementations probe the fold ONCE per call and return nil
+// without inspecting the schema when the server does not fold, so a
+// non-folding server costs one variable read and can never produce a refusal.
+// The refusal names both source tables and the folded identifier they share.
+//
+// It must not refuse anything the create phase would accept. Engines whose
+// target identifiers never fold — Postgres compares quoted identifiers
+// byte-exactly — and source-only engines omit the method; the orchestrator
+// type-asserts and skips.
+//
+// # Relationship to [NamespaceFolder]
+//
+// Same server property, other axis. [NamespaceFolder] exists so the
+// multi-namespace fan-out can refuse two source SCHEMAS folding onto one target
+// DATABASE; this exists so any copy entry point can refuse two source TABLES
+// folding onto one target TABLE. The fold itself is the engine's either way and
+// is deliberately NOT shared across engines — SQLite's is ASCII-only, MySQL's
+// is the server's, Postgres has none — only the seam is.
+type TableNameFoldPreflighter interface {
+	PreflightTableNameFold(ctx context.Context, dsn string, s *Schema) error
+}
+
 // ConnectionLabeler is the optional engine surface for engines that can
 // stamp every connection they open with an operator-visible label
 // carrying the run's stream-/migration-id, so operators can find a
