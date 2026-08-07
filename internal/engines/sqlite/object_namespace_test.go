@@ -465,16 +465,29 @@ func TestSQLiteNamespace_NonASCIICasePairLandsAsTwoObjects(t *testing.T) {
 
 	// Every door, in phase order, including the connection-free preflights the
 	// orchestrator runs before anything is written.
-	for name, run := range map[string]func() error{
-		"Engine.PreflightTables":         func() error { return Engine{}.PreflightTables(schema) },
-		"Engine.PreflightIndexes":        func() error { return Engine{}.PreflightIndexes(schema) },
-		"Engine.PreflightViews":          func() error { return Engine{}.PreflightViews(schema) },
-		"CreateTablesWithoutConstraints": func() error { return w.CreateTablesWithoutConstraints(ctx, schema) },
-		"CreateIndexes":                  func() error { return w.CreateIndexes(ctx, schema) },
-		"CreateViews":                    func() error { return w.CreateViews(ctx, schema) },
+	//
+	// A SLICE, not a map: these doors are order-DEPENDENT — CreateIndexes emits
+	// `CREATE INDEX ... ON <table>`, so it fails with `no such table` unless
+	// CreateTablesWithoutConstraints ran first, and CreateViews likewise needs
+	// the tables its definition selects from. Go randomizes map iteration
+	// order, so the original map form passed or failed by luck of the draw
+	// (~1 run in 3 put an emitting door ahead of the create). The failure
+	// masqueraded as an item-150 refusal — the loop reports ANY error as
+	// "refused a schema whose names SQLite keeps apart" — which is exactly the
+	// shape that gets written down as a real finding.
+	for _, door := range []struct {
+		name string
+		run  func() error
+	}{
+		{"Engine.PreflightTables", func() error { return Engine{}.PreflightTables(schema) }},
+		{"Engine.PreflightIndexes", func() error { return Engine{}.PreflightIndexes(schema) }},
+		{"Engine.PreflightViews", func() error { return Engine{}.PreflightViews(schema) }},
+		{"CreateTablesWithoutConstraints", func() error { return w.CreateTablesWithoutConstraints(ctx, schema) }},
+		{"CreateIndexes", func() error { return w.CreateIndexes(ctx, schema) }},
+		{"CreateViews", func() error { return w.CreateViews(ctx, schema) }},
 	} {
-		if err := run(); err != nil {
-			t.Fatalf("%s refused a schema whose names SQLite keeps apart (roadmap item 150): %v", name, err)
+		if err := door.run(); err != nil {
+			t.Fatalf("%s refused a schema whose names SQLite keeps apart (roadmap item 150): %v", door.name, err)
 		}
 	}
 
