@@ -148,36 +148,86 @@ func sortedKeys(m map[string]bool) []string {
 // TestSelectedCommandPathMatchesTheGradedSurface binds the two halves that
 // make the gate above meaningful: the path main.go RECORDS at runtime has to
 // be spelled the same way the surface the gate GRADES spells it. Two facts can
-// each be pinned and still leave the argument unpinned — kong's own
-// Node.Path() renders `schema add-table <table>`, which would match no key in
-// the flag map and silently drop every command onto its neutral text.
+// each be pinned and still leave the argument unpinned, so this walks the WHOLE
+// model rather than a hand-picked argv list — every node kong can select must
+// resolve to a key in the flag map, or every hint for that command silently
+// falls back to the neutral text.
 func TestSelectedCommandPathMatchesTheGradedSurface(t *testing.T) {
 	commands, _, _ := cliSurface(t)
 
-	for _, argv := range [][]string{
-		{"migrate"},
-		{"sync", "start"},
-		{"sync", "run"},
-		{"schema", "add-table", "widgets"},
-		{"restore"},
-	} {
-		kp, err := kong.New(&CLI{}, kong.Name("sluice"), kong.Vars{"version": "test"}, kong.Exit(func(int) {}))
-		if err != nil {
-			t.Fatalf("build kong parser: %v", err)
+	kp, err := kong.New(&CLI{}, kong.Name("sluice"), kong.Vars{"version": "test"}, kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatalf("build kong parser: %v", err)
+	}
+
+	var walked int
+	var walk func(n *kong.Node)
+	walk = func(n *kong.Node) {
+		if n.Type == kong.CommandNode || n.Type == kong.ArgumentNode {
+			walked++
+			if got := selectedCommandPath(n); !commands[got] {
+				t.Errorf("kong node %q records running command %q, which is not a key in the graded command "+
+					"surface — every hint for it would silently fall back to the neutral text", n.Path(), got)
+			}
 		}
-		// Trace, not Parse: command SELECTION is all that is under test, and
-		// Parse would additionally demand every required flag (--source-driver
-		// and friends), which would make this pin a list of DSNs to maintain.
-		kctx, err := kong.Trace(kp, argv)
-		if err != nil {
-			t.Fatalf("trace %v: %v", argv, err)
+		for _, c := range n.Children {
+			walk(c)
 		}
-		got := selectedCommandPath(kctx.Selected())
-		if !commands[got] {
-			t.Errorf("`sluice %s` records running command %q, which is not a key in the graded command "+
-				"surface — every hint for it would silently fall back to the neutral text",
-				strings.Join(argv, " "), got)
+	}
+	walk(kp.Model.Node)
+
+	// Anti-vacuity: a walk that saw nothing would pass forever.
+	if walked < 30 {
+		t.Fatalf("walked only %d selectable nodes (floor 30) — the model walk is broken", walked)
+	}
+}
+
+// TestSelectedCommandPathKeepsOnlyCommandNames is the pin the whole-model walk
+// above CANNOT provide, and the reason it is written separately is worth
+// stating: sluice's CLI today has no branch-argument node and no command
+// alias, so `selectedCommandPath` and kong's own `Node.Path()` agree on all 47
+// selectable nodes. Replacing one with the other is a mutation the real model
+// cannot detect — measured, not assumed. The difference is real in kong and
+// would bite the first command that grows either shape, so it is pinned here
+// against a synthetic model instead of left as an unverified premise about a
+// dependency's rendering.
+func TestSelectedCommandPathKeepsOnlyCommandNames(t *testing.T) {
+	var cli struct {
+		Widget struct {
+			Add struct {
+				Name string `arg:"" help:"widget name"`
+			} `cmd:"" aliases:"create" help:"add a widget"`
+		} `cmd:"" help:"widgets"`
+	}
+	kp, err := kong.New(&cli, kong.Name("sluice"), kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatalf("build synthetic parser: %v", err)
+	}
+
+	var target *kong.Node
+	var walk func(n *kong.Node)
+	walk = func(n *kong.Node) {
+		if n.Name == "add" {
+			target = n
 		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(kp.Model.Node)
+	if target == nil {
+		t.Fatal("synthetic model has no `add` node — the fixture stopped exercising the shape")
+	}
+
+	// The premise, asserted rather than described: kong's own rendering
+	// carries the alias list, and ours does not.
+	if kongPath := target.Path(); !strings.Contains(kongPath, "(create)") {
+		t.Fatalf("kong.Node.Path() = %q; the fixture was meant to produce an alias-bearing path, so this "+
+			"test is no longer showing the difference it exists to show", kongPath)
+	}
+	if got, want := selectedCommandPath(target), "widget add"; got != want {
+		t.Errorf("selectedCommandPath = %q; want %q — it must keep bare command NAMES only, because that is "+
+			"how cmd/sluice's kong-model walk keys the flag surface", got, want)
 	}
 }
 

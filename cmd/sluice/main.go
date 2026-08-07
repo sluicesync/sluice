@@ -123,12 +123,14 @@ func recordRunningCommand(kctx *kong.Context) {
 // command path — "sync start", "schema add-table" — keeping ONLY command
 // nodes.
 //
-// kong's own [kong.Node.Path] is not usable here: it interpolates argument
-// nodes ("schema add-table <table>") and alias lists ("sync start (up)"),
+// kong's own [kong.Node.Path] is not usable here: it interpolates branch
+// ARGUMENT nodes ("widget add <name>") and alias lists ("widget add (create)"),
 // while the flag surface the gate grades against is keyed by the bare command
-// path. An alias the operator typed still resolves to its canonical Name, so
-// `sluice sync up` and `sluice sync start` record the same path.
-// TestSelectedCommandPathMatchesTheGradedSurface pins both halves.
+// path. That difference does NOT bite today — sluice's CLI has neither shape,
+// and the two renderings agree on all 47 selectable nodes, so swapping this
+// body for `node.Path()` is a mutation the real model cannot detect. It is
+// pinned against a synthetic model instead:
+// TestSelectedCommandPathKeepsOnlyCommandNames.
 func selectedCommandPath(node *kong.Node) string {
 	var parts []string
 	for n := node; n != nil; n = n.Parent {
