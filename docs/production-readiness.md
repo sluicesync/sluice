@@ -43,6 +43,16 @@ D1 is not a target (emit a SQLite `.db` and `wrangler d1 import` it). Operator g
 
 All four migrate into any target; operator guide: [flat-file-sources](operator/flat-file-sources.md).
 
+### Which engines can be a target
+
+Most of the fourteen are source-only. These are the engine names `--target-driver` accepts for a `migrate` or a `sync` cold-start copy:
+
+<!-- target-engines: mariadb, mysql, planetscale, postgres, postgres-trigger, sqlite, vitess -->
+
+`mariadb`, `mysql`, `planetscale`, `vitess`, `postgres`, `postgres-trigger`, `sqlite`. Every other registered engine — `d1`, `d1-trigger`, `sqlite-trigger`, `csv`, `tsv`, `ndjson`, `mydumper` — refuses `OpenSchemaWriter`/`OpenRowWriter` and cannot be selected as a target at all.
+
+The marker above is not decoration: `TestTargetEngineListMatchesTheCode` derives the set twice — once from the shape of each engine's writer doors in the source, once by actually calling those doors and reading the error — and fails the build if the two disagree with each other or with this list. It exists because sluice published "fires on SQLite and D1 targets" across two releases, for a D1 target that has never existed. If you are writing release notes about a change to a target-side path, take the engine list from here rather than from the shape of the fix.
+
 ### Adjacent surfaces
 
 Encrypted logical backup chains (full + incremental) with restore, point-in-time chain replay, and a continuous broker work on every engine that migrates; `sluice backup export-as-parquet` transcodes any backup chain into Parquet for DuckDB / warehouse ingestion ([ADR-0164](adr/adr-0164-backup-export-as-parquet.md)). The online schema-change family (`backfill`, `expand-contract`, `deploy-ddl`) covers MySQL-family + Postgres in place ([schema-change-runbook](schema-change-runbook.md)).

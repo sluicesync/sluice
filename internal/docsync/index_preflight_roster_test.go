@@ -56,7 +56,7 @@ var indexPreflightExempt = map[string]string{
 	"tsv":            "source only — the same flatfile engine as csv, registered once per format",
 	"ndjson":         "source only — the same flatfile engine as csv, registered once per format",
 	"mydumper":       "source only — a dump directory is read, never written; OpenSchemaWriter returns ErrNotImplemented",
-	"d1":             "migrate/sync SOURCE only — OpenSchemaWriter returns ErrD1NotImplemented. A D1 TARGET would go through the `sqlite` engine, which does implement the preflight",
+	"d1":             "migrate/sync SOURCE only — OpenSchemaWriter returns ErrD1NotImplemented. There is no D1 target engine at all: a D1-bound migration writes a SQLite FILE via the `sqlite` engine, which does implement the preflight",
 	"sqlite-trigger": "CDC source only (ADR-0134) — a SQLite target uses the `sqlite` engine",
 	"d1-trigger":     "CDC source only — OpenSchemaWriter returns ErrNotImplemented",
 }

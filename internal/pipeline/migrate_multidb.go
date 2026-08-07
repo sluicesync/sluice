@@ -145,8 +145,10 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	// ---- Pre-flight: a target that cannot namespace at all (roadmap item
 	// 148, route 2). This used to be an unchecked premise in the `else`
 	// branch below, whose comment claimed that arm was "unreachable with
-	// today's engines" — it was reachable via any flat target (SQLite/D1),
-	// and it set TargetSchema on an engine that discards it. See
+	// today's engines" — it was reachable via a flat target (SQLite, the
+	// only flat-namespace engine that can BE a target; `d1` declares the
+	// same flat scope but refuses every writer door), and it set
+	// TargetSchema on an engine that discards it. See
 	// [migcore.ValidateMultiNamespaceTarget] for the full mechanism. ----
 	if err := migcore.ValidateMultiNamespaceTarget(m.Target, "multi-namespace migrate", selected); err != nil {
 		return err

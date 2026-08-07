@@ -33,7 +33,7 @@ The change lives in the two shared conn loops, so it reaches every mode that flo
 - **CR/BRK incremental replay and CDC steady-state apply** — ChangeApplier, **deliberately untouched**: already byte-targeted via ADR-0139/0140 coalescing (same 1 MiB constant).
 - **BK** — n/a (backup writes JSONL chunks, no RowWriter).
 - **LOAD DATA path (vanilla MySQL primary bulk path)** — untouched, already streaming.
-- **Other engines** — deliberately untouched: PG uses binary COPY (byte-stream, no statement composition); SQLite has its own 900-param-capped multi-row INSERT sized to its bind limits; D1-as-target is stage-local (ADR-0145).
+- **Other engines** — deliberately untouched: PG uses binary COPY (byte-stream, no statement composition); SQLite has its own 900-param-capped multi-row INSERT sized to its bind limits; there is no D1 target to consider — `d1` is a migrate SOURCE only, so it has no `RowWriter` at all. (This line first read "D1-as-target is stage-local (ADR-0145)", which was wrong twice over: there is no D1 target engine, and ADR-0145's `--stage-local` is a D1 *source* mechanism.)
 
 `docs/dev/perf-parity-matrix.md` row 3 updated in the same change.
 

@@ -79,7 +79,7 @@ sluice/
 │   │   ├── mysql/              # MySQL + wire-compatible flavors (vanilla, MariaDB, PlanetScale, Vitess): reader+writer+CDC+caps
 │   │   ├── postgres/           # Postgres engine: reader+writer+CDC+caps
 │   │   ├── pgtrigger/          # Trigger-based Postgres CDC (`postgres-trigger`) for managed PG that blocks logical replication
-│   │   ├── sqlite/             # SQLite engine: .db files, .sql dumps, live Cloudflare D1 (source + target)
+│   │   ├── sqlite/             # SQLite engine: .db files + .sql dumps (source + target), live Cloudflare D1 (source only)
 │   │   ├── sqlite-trigger/     # Trigger-based SQLite CDC (composes the base sqlite engine)
 │   │   └── d1-trigger/         # Trigger-based Cloudflare D1 CDC over the D1 HTTP query API
 │   ├── pipeline/               # Orchestrators: simple-mode Migrator, continuous-sync Streamer, metrics, backup/restore

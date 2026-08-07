@@ -158,6 +158,52 @@ func registeredEnginesImplementing(t *testing.T, capability string) []string {
 	return out
 }
 
+// registeredEngineNamesByPackageType groups every registered engine name by
+// `<package dir>.<concrete type name>` — one level finer than
+// [registeredEngineNamesByPackage].
+//
+// Use it when the property being derived lives on a METHOD rather than on the
+// package: `internal/engines/sqlite` declares two engine types with opposite
+// answers — `Engine` implements the writer doors, `d1Engine` refuses them — so
+// a package-keyed derivation cannot tell `sqlite` from `d1` at all. That is
+// exactly the pair [TestTargetEngineListMatchesTheCode] has to separate.
+//
+// It stays flavor-correct for the other direction: mysql's four flavors and
+// flatfile's three formats each share ONE concrete type (they differ by a
+// struct field), so every name still reaches the key its methods were parsed
+// from.
+func registeredEngineNamesByPackageType(t *testing.T) map[string][]string {
+	t.Helper()
+	out := map[string][]string{}
+	for _, name := range engines.Names() {
+		e, ok := engines.Get(name)
+		if !ok {
+			t.Fatalf("engines.Names() listed %q but engines.Get(%q) missed", name, name)
+		}
+		rt := reflect.TypeOf(e)
+		for rt.Kind() == reflect.Pointer {
+			rt = rt.Elem()
+		}
+		key := path.Base(rt.PkgPath()) + "." + rt.Name()
+		out[key] = append(out[key], name)
+	}
+	for k := range out {
+		sort.Strings(out[k])
+	}
+
+	// Anti-vacuity floor, the same one [registeredEngineNamesByPackage]
+	// carries and for the same reason: if every key ever held exactly one
+	// name, the grouping would do nothing and a per-type marker derived from
+	// it would be correct by construction.
+	if len(engines.Names()) <= len(out) {
+		t.Fatalf("every engine TYPE registers exactly one engine name (%d names across %d types), so mapping "+
+			"type→names does nothing and the markers derived from it cannot fail. sluice has multi-flavor "+
+			"types (mysql.Engine registers 4, flatfile.Engine 3); if that genuinely changed, delete this "+
+			"helper — do not delete this check", len(engines.Names()), len(out))
+	}
+	return out
+}
+
 // registeredEngineNamesByPackage groups every registered engine name by the
 // directory name of the package its value was constructed in.
 //

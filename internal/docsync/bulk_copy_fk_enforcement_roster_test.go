@@ -74,7 +74,7 @@ var bulkCopyFKExempt = map[string]string{
 	"tsv":            "source only — the same flatfile engine as csv, registered once per format",
 	"ndjson":         "source only — the same flatfile engine as csv, registered once per format",
 	"mydumper":       "source only — a dump directory is read, never written",
-	"d1":             "migrate/sync SOURCE only — OpenRowWriter returns ErrD1NotImplemented. A D1 TARGET goes through the `sqlite` engine, whose declaration is pinned above",
+	"d1":             "migrate/sync SOURCE only — OpenRowWriter returns ErrD1NotImplemented. There is no D1 target engine at all: a D1-bound migration writes a SQLite FILE (the `sqlite` engine, whose declaration is pinned above) that `wrangler d1 import` then loads",
 	"sqlite-trigger": "CDC source only (ADR-0134) — a SQLite target uses the `sqlite` engine",
 	"d1-trigger":     "CDC source only — OpenRowWriter returns ErrNotImplemented",
 }

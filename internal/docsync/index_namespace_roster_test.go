@@ -77,7 +77,7 @@ var indexNamespaceExempt = map[string]string{
 	"tsv":            "source only — the same flatfile engine as csv",
 	"ndjson":         "source only — the same flatfile engine as csv",
 	"mydumper":       "source only — a dump directory is read, never written",
-	"d1":             "migrate/sync SOURCE only; a D1 TARGET goes through the `sqlite` engine, which is checked",
+	"d1":             "migrate/sync SOURCE only — OpenSchemaWriter returns ErrD1NotImplemented. There is no D1 target engine at all: a D1-bound migration writes a SQLite FILE via the `sqlite` engine, which is checked",
 	"sqlite-trigger": "CDC source only (ADR-0134) — a SQLite target uses the `sqlite` engine",
 	"d1-trigger":     "CDC source only — OpenSchemaWriter returns ErrNotImplemented",
 

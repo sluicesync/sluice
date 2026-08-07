@@ -786,9 +786,10 @@ func TripGrowGate(gate ir.GrowGate, reason string, evidence ir.GrowEvidence) {
 // ApplyGrowGate wires the cold-copy run's shared coordinated-pause gate
 // (ADR-0110) onto a freshly-opened writer that opts into it via
 // [ir.GrowGateSetter]. Two of the three target engines implement the setter
-// today (MySQL and Postgres); SQLite/D1 does NOT, and that is believed
-// correct — a local file has no grow window, and D1-as-target is ABSENT from
-// the write path (rows stage locally instead) — but it is stated here rather
+// today (MySQL and Postgres); SQLite does NOT, and that is believed
+// correct — a local file has no grow window, and there is no D1 target on
+// this path to consider at all (`d1`'s OpenRowWriter returns
+// ErrD1NotImplemented; D1 is a migrate SOURCE only) — but it is stated rather
 // than left to "both engines", which is the phrasing that stops the next
 // reader checking there is a third. So on a cold-copy run — where the gate is constructed
 // unconditionally (see [NewGrowGate]) — the writer receives a non-nil gate

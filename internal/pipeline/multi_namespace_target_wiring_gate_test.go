@@ -159,7 +159,8 @@ func TestMultiNamespaceFanOutRefusesAFlatTarget(t *testing.T) {
 			name: "migcore.ValidateMultiNamespaceTarget",
 			why: "Its non-deriver arm then runs against a target that may have NO namespacing at all — " +
 				"the arm whose comment used to claim it was \"unreachable with today's engines\". On a " +
-				"flat target (sqlite/d1) it sets a TargetSchema the engine discards, and every source " +
+				"flat target (sqlite — the only one, since `d1` is a migrate source only) it sets a " +
+				"TargetSchema the engine discards, and every source " +
 				"namespace writes bare, unqualified table names into ONE target namespace: two namespaces " +
 				"carrying a same-named table merge, the second's rows landing in the first, at exit 0. " +
 				"That is roadmap item 148 route 2, re-opened for this path.",
