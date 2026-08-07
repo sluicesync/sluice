@@ -3067,7 +3067,7 @@ Verdicts, each with the code/live proof that decided it:
 
 **Not adopted-into: a leftover branch whose deploy request the operator merely APPROVED without deploying.** It reads as `ready`/deployable, so it takes the never-deployed refusal. That is the intended outcome (the branch's base may be stale), but it is the one case where a re-run costs the operator a full re-provision after they did the thing sluice told them to do; if it shows up in the field, the fix is to re-run the pre-deploy gates on the adopted branch rather than to widen the verdict.
 
-### 107. The preflight LIST was duplicated, so closing one instance left the class open — `verifyBackupIDs` was still restore-only (Bug 218) — *FIXED, ships in v0.104.6*
+### 107. The preflight LIST was duplicated, so closing one instance left the class open — `verifyBackupIDs` was still restore-only (Bug 218) — *✅ SHIPPED v0.104.6*
 
 **What.** Item 106 gave `backup verify` the schema-fingerprint check and shared the *predicate* deciding which lineage shapes get it. It left the *list* of preflights duplicated between the two commands — so a manifest whose recorded `BackupID` no longer matched its content still verified `all chunks OK` rc=0 while restore refused it with rc=3 and zero rows. Pre-existing back to v0.103.2 on all seven staged binaries; found by the v0.104.5 regression cycle, which did the thing a claim about a list invites: it enumerated the list.
 
@@ -3080,7 +3080,7 @@ Verdicts, each with the code/live proof that decided it:
 **Pins, mutation-verified.** A tampered recorded id on a chain incremental and on a bare full each refuse under the restore code; stubbing `verifyBackupIDs` fails both deterministically. The existing bare-full-fingerprint-stays-green pin still passes, which is what proves the two shape rules did not get merged.
 
 
-### 106. `backup verify` was green over chains `restore` refuses — the fingerprint preflight it never made (Bug 217) — *FIXED, ships in v0.104.5 — but see item 107: the fix shared the predicate and not the LIST, leaving a second preflight behind*
+### 106. `backup verify` was green over chains `restore` refuses — the fingerprint preflight it never made (Bug 217) — *✅ SHIPPED v0.104.5 — but see item 107: the fix shared the predicate and not the LIST, leaving a second preflight behind*
 
 **What.** `sluice backup verify` returned rc=0 `all chunks OK` over a chain `restore` refuses with rc=3 and zero rows. Found by the v0.104.4 regression cycle, which asked the question v0.104.3's own headline had turned into a house rule: does verify AGREE with restore? Pre-existing back to **v0.103.2** — every released binary has it.
 
@@ -3110,7 +3110,7 @@ Three properties worth keeping if it is ever edited. It checks the **mechanism**
 Mutation-verified: flipping `planetscale=vstream` to `binlog` in the marker — the exact error in v0.104.4's first-draft notes — fails with `WRONG mechanism for planetscale: doc says binlog, registry says vstream`.
 
 
-### 104. v0.104.3 added a FOURTH fingerprint epoch — the `omitempty` fix does not hold for the value a real Postgres source produces (Bug 216) — *FIXED, ships in v0.104.4*
+### 104. v0.104.3 added a FOURTH fingerprint epoch — the `omitempty` fix does not hold for the value a real Postgres source produces (Bug 216) — *✅ SHIPPED v0.104.4*
 
 **What.** A backup chain written by v0.104.3 from a Postgres source whose tables have primary keys cannot be restored by v0.104.2 or any earlier release: schema-fingerprint mismatch, rc=3, zero rows. Confirmed against v0.104.2, v0.104.1, v0.104.0 and v0.103.2. This is item 102's class, one release later, in the release that shipped the fix for it.
 
@@ -3139,7 +3139,7 @@ Three gates, in order of how much they would actually have caught:
 **Not fixed, and deliberately.** A chain v0.104.3 wrote from a primary-keyed Postgres source stays unreadable by everything including v0.104.4 — its manifest records a fingerprint computed *with* the field, and nothing re-derives it. That is item 102's demand-gated shim, unchanged by this. `docs/operator/error-codes.md` now documents E4 as the one-release detour it is, including which v0.104.3 chains are affected (PG source with a PK) and which are ordinary E3 chains (MySQL sources, PG without a PK).
 
 
-### 103. The MySQL CDC reader has the PG close-vs-pump race, unfixed — *FIXED, ships in v0.104.4*
+### 103. The MySQL CDC reader has the PG close-vs-pump race, unfixed — *✅ SHIPPED v0.104.4*
 
 **Found while fixing the Postgres one (roadmap item covering the v0.104.3 CI data race), and deliberately NOT bundled with it.** `internal/engines/mysql/cdc_reader.go` (~415-430) nils `r.db` in `Close` with no join against its pump goroutine, and that pump reads `r.db` via `tableFor` (~1260) on the TABLE_MAP path. Same shape as the Postgres defect: `Close` tears down state the pump still owns.
 

@@ -121,7 +121,20 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       # Checkout the code into the runner's working directory.
+      #
+      # fetch-depth: 0 — full history AND tags, which the unit suite needs.
+      # internal/docsync's roadmap-release gate compares each roadmap status
+      # marker against `git tag --contains`, and under the DEFAULT depth-1
+      # tagless checkout that command answers empty for every commit in the
+      # repository: the gate would report every roadmap item as legitimately
+      # unreleased and pass forever. That is the vacuously-green shape this
+      # project treats as worse than no check, so the gate refuses loudly
+      # rather than skipping when tags are invisible — meaning without this
+      # line the Test job goes red, by design, instead of going quiet.
+      # Cost is negligible here: ~35 MiB of pack over ~2.5k commits.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       # Install Go and enable the module cache so subsequent runs reuse
       # downloaded dependencies. setup-go@v6 enables caching by default.
