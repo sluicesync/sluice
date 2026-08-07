@@ -65,6 +65,20 @@ func TestSQLiteViewNamespace_RefusesTheSilentNoOp(t *testing.T) {
 			refuses: false,
 		},
 		{
+			// The item-150 boundary on the VIEW walk. It is a separate
+			// namecollide call site from the index walk and shared with the
+			// table walk, so it gets its own row rather than an assumption.
+			name:    "two views differing only in NON-ASCII case are two views",
+			views:   []*ir.View{vnsView("v_é"), vnsView("v_É")},
+			refuses: false,
+		},
+		{
+			name:    "a view differing from a table only in NON-ASCII case is a second object",
+			tables:  []*ir.Table{vnsTable("é")},
+			views:   []*ir.View{vnsView("É")},
+			refuses: false,
+		},
+		{
 			// The pair that is LOUD on SQLite and therefore NOT this check's
 			// business: an INDEX named like the view. `CREATE VIEW IF NOT
 			// EXISTS "ix"` against an index `ix` errors ("there is already an
@@ -244,6 +258,29 @@ func TestSQLiteTableNamespace_RefusesTheSilentNoOp(t *testing.T) {
 			refuses: false,
 		},
 		{
+			// The boundary roadmap item 150 fixed: SQLite's fold stops at `Z`,
+			// so this pair is TWO tables on the target and refusing it broke a
+			// migration that worked through v0.113.0. The whole character
+			// matrix is in TestFoldSQLiteIdentifierMatchesRealSQLite.
+			name:    "two tables differing only in NON-ASCII case are two tables",
+			tables:  []*ir.Table{vnsTable("é"), vnsTable("É")},
+			refuses: false,
+		},
+		{
+			// …and the partly-ASCII shape, where an off-by-one fold would show
+			// up: the ASCII letters fold and the É does not, so these differ.
+			name:    "two tables differing in ASCII case AND non-ASCII case",
+			tables:  []*ir.Table{vnsTable("Café_Order"), vnsTable("CAFÉ_ORDER")},
+			refuses: false,
+		},
+		{
+			// The same shape with the non-ASCII byte held constant: a name
+			// carrying one must NOT stop the ASCII fold applying to the rest.
+			name:    "two tables differing only in ASCII case around a non-ASCII byte",
+			tables:  []*ir.Table{vnsTable("Café_Order"), vnsTable("café_ORDER")},
+			refuses: true,
+		},
+		{
 			name:    "a nil table is skipped, not dereferenced",
 			tables:  []*ir.Table{nil, vnsTable("orders")},
 			refuses: false,
@@ -284,6 +321,41 @@ func TestSQLiteTableNamespace_RefusesTheSilentNoOp(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSQLiteTableNamespace_MessageNamesTheIdentifierTheCheckComputed pins the
+// DISPLAY half of roadmap item 150, which is a separate call from the key and
+// was separately wrong: the refusal renders "both resolve to the SQLite
+// identifier %q", and if that rendering does not use the fold the CHECK keyed
+// on, the message names a string nothing in sluice ever computed and no
+// operator can find on their target.
+//
+// The fixture is chosen so the two folds visibly disagree — U+0130 is the one
+// character where strings.ToLower produces a DIFFERENT NUMBER OF RUNES (`i` +
+// U+0307) — so the assertion cannot pass by the two folds happening to agree.
+func TestSQLiteTableNamespace_MessageNamesTheIdentifierTheCheckComputed(t *testing.T) {
+	const a, b = "İOrders", "İORDERS"
+
+	want := foldSQLiteIdentifier(b)
+	unicodeFold := strings.ToLower(b)
+	if want == unicodeFold {
+		t.Fatalf("fixture %q folds identically under both rules, so this test could not tell them "+
+			"apart; pick a name where they differ", b)
+	}
+
+	err := validateSQLiteTableNamespace([]*ir.Table{vnsTable(a), vnsTable(b)})
+	if err == nil {
+		t.Fatalf("%q and %q differ only in ASCII case and must collide", a, b)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("refusal must name the effective identifier the CHECK computed (%q); got %q",
+			want, err.Error())
+	}
+	if strings.Contains(err.Error(), unicodeFold) {
+		t.Errorf("refusal names %q, which is strings.ToLower's answer and not the key this check "+
+			"folded on — the operator would go looking for an identifier that does not exist; got %q",
+			unicodeFold, err.Error())
 	}
 }
 
@@ -349,6 +421,84 @@ func TestSQLiteTableNamespace_ReachesEveryWriteDoor(t *testing.T) {
 				t.Errorf("refusal must carry %s; got %v", sluicecode.CodeSchemaTableNameCollision, err)
 			}
 		})
+	}
+}
+
+// TestSQLiteNamespace_NonASCIICasePairLandsAsTwoObjects is roadmap item 150's
+// end-to-end pin at the engine boundary: a schema carrying a non-ASCII case
+// pair of TABLES, of VIEWS and of INDEXES must pass every door AND arrive on a
+// real SQLite target as two of each.
+//
+// # The independent expected value
+//
+// `sqlite_schema`, read here with database/sql after the writer has run — not
+// "the doors returned nil". The pre-fix failure was a refusal, so a door-only
+// assertion would have been enough to catch it; the catalog read is what says
+// the accept is CORRECT rather than merely permissive, which is the direction
+// that would be silent (two source objects arriving as one).
+//
+// All three walks are exercised because all three fold, and item 149's roster
+// is the standing reminder of how easily one sibling of a set gets missed.
+func TestSQLiteNamespace_NonASCIICasePairLandsAsTwoObjects(t *testing.T) {
+	schema := &ir.Schema{
+		Tables: []*ir.Table{
+			nsTable("é", &ir.Index{Name: "idx_é", Columns: idxCol("v")}),
+			nsTable("É", &ir.Index{Name: "idx_É", Columns: idxCol("v")}),
+			// The partly-ASCII shape in the same run, because that is where an
+			// off-by-one fold would show up.
+			vnsTable("Café_Order"),
+			vnsTable("CAFÉ_ORDER"),
+		},
+		Views: []*ir.View{
+			{Name: "v_é", Definition: `SELECT v FROM "é"`},
+			{Name: "v_É", Definition: `SELECT v FROM "É"`},
+		},
+	}
+
+	db, err := sql.Open("sqlite", "file:item150?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	w := &SchemaWriter{db: db, path: "item150"}
+	ctx := context.Background()
+
+	// Every door, in phase order, including the connection-free preflights the
+	// orchestrator runs before anything is written.
+	for name, run := range map[string]func() error{
+		"Engine.PreflightTables":         func() error { return Engine{}.PreflightTables(schema) },
+		"Engine.PreflightIndexes":        func() error { return Engine{}.PreflightIndexes(schema) },
+		"Engine.PreflightViews":          func() error { return Engine{}.PreflightViews(schema) },
+		"CreateTablesWithoutConstraints": func() error { return w.CreateTablesWithoutConstraints(ctx, schema) },
+		"CreateIndexes":                  func() error { return w.CreateIndexes(ctx, schema) },
+		"CreateViews":                    func() error { return w.CreateViews(ctx, schema) },
+	} {
+		if err := run(); err != nil {
+			t.Fatalf("%s refused a schema whose names SQLite keeps apart (roadmap item 150): %v", name, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		kind  string
+		names []string
+	}{
+		{"table", []string{"é", "É"}},
+		{"table", []string{"Café_Order", "CAFÉ_ORDER"}},
+		{"index", []string{"idx_é", "idx_É"}},
+		{"view", []string{"v_é", "v_É"}},
+	} {
+		var n int
+		if err := db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM sqlite_schema WHERE type = ? AND name IN (?, ?)`,
+			tc.kind, tc.names[0], tc.names[1],
+		).Scan(&n); err != nil {
+			t.Fatalf("count %ss: %v", tc.kind, err)
+		}
+		if n != 2 {
+			t.Errorf("target holds %d %s(s) named %v; want 2 — SQLite folds ASCII only, so the pair is "+
+				"two objects and a run that produced one has merged them", n, tc.kind, tc.names)
+		}
 	}
 }
 
@@ -438,9 +588,13 @@ func TestSQLiteTableNamespaceGroundTruth(t *testing.T) {
 		}
 	}
 
-	// (3) The fold is ASCII-ONLY on SQLite's side. strings.ToLower is
-	//     Unicode-aware, so sluice folds a SUPERSET — a named, deliberate
-	//     over-refusal. This is what says so rather than a comment claiming it.
+	// (3) The fold is ASCII-ONLY on SQLite's side, so a pair differing only in
+	//     non-ASCII case is TWO tables and sluice must not refuse it. This row
+	//     documented the opposite until roadmap item 150: the walk keyed on
+	//     Unicode-aware strings.ToLower, which folds a strict superset, and the
+	//     over-refusal shipped. The whole matrix now lives in
+	//     TestFoldSQLiteIdentifierMatchesRealSQLite; this cell stays here
+	//     because it is the row this file's own ground truth table asserts.
 	for _, stmt := range []string{
 		`CREATE TABLE "é" (v TEXT)`,
 		`CREATE TABLE IF NOT EXISTS "É" (v TEXT)`,
@@ -456,14 +610,14 @@ func TestSQLiteTableNamespaceGroundTruth(t *testing.T) {
 		t.Fatalf("count unicode tables: %v", err)
 	}
 	if unicodeTables != 2 {
-		t.Errorf("SQLite folded a NON-ASCII case pair (%d of 2 tables survived). sluice's strings.ToLower "+
-			"fold is documented as an over-refusal precisely because SQLite's is ASCII-only; if SQLite "+
-			"now folds Unicode, the over-refusal note is wrong in the other direction.", unicodeTables)
+		t.Errorf("SQLite folded a NON-ASCII case pair (%d of 2 tables survived). sluice's fold is "+
+			"ASCII-only BECAUSE SQLite's is; if SQLite now folds Unicode, foldSQLiteIdentifier is an "+
+			"under-refusal and this pair merges silently.", unicodeTables)
 	}
-	if err := validateSQLiteTableNamespace([]*ir.Table{vnsTable("é"), vnsTable("É")}); err == nil {
-		t.Error("sluice's fold is documented as a SUPERSET of SQLite's — it should refuse this " +
-			"non-ASCII case pair even though SQLite would have kept both. If that changed, the residual " +
-			"note in validateSQLiteTableNamespace's file comment is stale.")
+	if err := validateSQLiteTableNamespace([]*ir.Table{vnsTable("é"), vnsTable("É")}); err != nil {
+		t.Errorf("sluice refused a non-ASCII case pair the target above kept as TWO tables: %v. That is "+
+			"the over-refusal roadmap item 150 closed — the migration worked through v0.113.0 and the "+
+			"rename the message demands is unnecessary.", err)
 	}
 
 	// (4) THE CORRUPTION, reproduced. An INSERT under the losing name resolves

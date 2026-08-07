@@ -5,7 +5,6 @@ package sqlite
 
 import (
 	"fmt"
-	"strings"
 
 	"sluicesync.dev/sluice/internal/engines/internal/namecollide"
 	"sluicesync.dev/sluice/internal/ir"
@@ -31,6 +30,9 @@ import (
 //	CREATE TABLE            "vv"    vs view vv  -> error: view "vv" already exists
 //	CREATE TABLE IF NOT EXISTS "ix" vs index ix -> error: there is already an index named ix
 //	CREATE TABLE IF NOT EXISTS "É"  vs table é  -> ok, CREATES BOTH (no Unicode fold)
+//	CREATE TABLE IF NOT EXISTS "CAFÉ_ORDER" vs table Café_Order
+//	                                            -> ok, CREATES BOTH (the ASCII
+//	                                               letters fold, the É does not)
 //	CREATE VIEW IF NOT EXISTS "a"   vs table a  -> ok, NO-OP   <- item 147
 //	CREATE VIEW            "a"      vs table a  -> error: table "a" already exists
 //	CREATE VIEW IF NOT EXISTS "ix"  vs index ix -> error: there is already an index named ix
@@ -46,10 +48,12 @@ import (
 //     error, with or without IF NOT EXISTS — refusing it here would break runs
 //     that already fail correctly and visibly. That direction is pinned, in
 //     both this file's tests and [validateSQLiteIndexNamespace]'s.
-//   - The fold is ASCII-only on SQLite's side. [strings.ToLower] is
-//     Unicode-aware, so it folds a SUPERSET: the residual is over-refusal of a
-//     pair differing only in non-ASCII case (loud and rare) rather than
-//     under-refusal of the silent no-op this file exists to stop.
+//   - The fold is ASCII-only on SQLite's side, so this walk folds with
+//     [foldSQLiteIdentifier] and NOT with [strings.ToLower]. ToLower is
+//     Unicode-aware and folds a strict SUPERSET, which made rows 7 and 8 above
+//     — pairs a real SQLite target keeps as two objects — refuse. That was a
+//     documented residual until the v0.115.0 regression cycle measured its
+//     cost, and it is now closed (roadmap item 150).
 //
 // # Why the TABLE member is the worst of the three IF-NOT-EXISTS siblings
 //
@@ -101,7 +105,7 @@ type objectCollision struct {
 // A nil/nameless entry is skipped: it never reaches [emitTableDef] or
 // [emitCreateView] as a distinct object, so there is nothing to collide.
 func scanSQLiteObjectNamespace(tables []*ir.Table, views []*ir.View) []objectCollision {
-	seen := namecollide.New[sqliteObject](strings.ToLower)
+	seen := namecollide.New[sqliteObject](foldSQLiteIdentifier)
 	var out []objectCollision
 	claim := func(obj sqliteObject) {
 		prior, dup := seen.Claim(obj.name, obj)
@@ -183,7 +187,9 @@ func validateSQLiteTableNamespace(tables []*ir.Table) error {
 				"SILENTLY no-op and ITS ROWS WOULD BE INSERTED INTO THE FIRST TABLE — both tables' "+
 				"rows in one table, the right count under the surviving name, at exit 0 — rename one "+
 				"of the two source tables",
-			c.prior.name, c.loser.name, strings.ToLower(c.loser.name),
+			// The effective identifier is rendered with the SAME fold the
+			// check keyed on, or the message names a name nothing computed.
+			c.prior.name, c.loser.name, foldSQLiteIdentifier(c.loser.name),
 		),
 	)
 }

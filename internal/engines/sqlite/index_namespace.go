@@ -5,7 +5,6 @@ package sqlite
 
 import (
 	"fmt"
-	"strings"
 
 	"sluicesync.dev/sluice/internal/engines/internal/namecollide"
 	"sluicesync.dev/sluice/internal/ir"
@@ -36,10 +35,15 @@ import (
 //	CREATE UNIQUE INDEX IF NOT EXISTS "idx_v" ON "b" ("v")  -> ok, NO-OP
 //	CREATE UNIQUE INDEX IF NOT EXISTS "IDX_V" ON "b" ("v")  -> ok, NO-OP
 //	sqlite_schema afterwards: one index `idx_v`, on table `a`
+//	CREATE INDEX IF NOT EXISTS "idx_é" ON "a" ("v")         -> ok
+//	CREATE INDEX IF NOT EXISTS "idx_É" ON "b" ("v")         -> ok, CREATES BOTH
 //
 // The third line is why the comparison folds ASCII case: SQLite compares
 // identifiers case-insensitively for ASCII even inside double quotes, so two
-// source indexes differing only in case collide too.
+// source indexes differing only in case collide too. The last line is why it
+// folds ASCII ONLY, and it is the correction item 150 landed: SQLite's fold
+// stops at `Z`, so a pair differing only in NON-ASCII case is two indexes on
+// the target and must not be refused. See [foldSQLiteIdentifier].
 //
 // # WHAT THIS GATE REACHES, stated rather than implied
 //
@@ -76,13 +80,11 @@ import (
 // database-wide and a collision across two tables is the common shape.
 func validateSQLiteIndexNamespace(tables []*ir.Table) error {
 	type origin struct{ table, index string }
-	// ASCII fold, per the ground truth above. strings.ToLower is Unicode-aware
-	// where SQLite's built-in comparison is ASCII-only, so this folds a
-	// SUPERSET of what SQLite folds: the residual is over-refusal of a pair
-	// differing only in non-ASCII case, which is loud and rare, versus the
-	// under-refusal it would otherwise risk, which is the silent no-op this
-	// whole function exists to stop.
-	seen := namecollide.New[origin](strings.ToLower)
+	// ASCII fold, per the ground truth above — [foldSQLiteIdentifier], which is
+	// SQLite's own rule and NOT strings.ToLower. This walk passed the
+	// Unicode-aware ToLower through v0.114.0 and refused `idx_é`/`idx_É`, a
+	// pair a real SQLite target keeps as two indexes (roadmap item 150).
+	seen := namecollide.New[origin](foldSQLiteIdentifier)
 	for _, table := range tables {
 		if table == nil {
 			continue

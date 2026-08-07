@@ -121,6 +121,28 @@ func TestSQLiteIndexNamespace_RefusesTheSilentNoOp(t *testing.T) {
 			refuses: false,
 		},
 		{
+			// The boundary roadmap item 150 fixed, and this walk is where the
+			// over-refusal actually SHIPPED (v0.114.0): SQLite's fold stops at
+			// `Z`, so these are two indexes on the target. The whole character
+			// matrix is in TestFoldSQLiteIdentifierMatchesRealSQLite.
+			name: "index names differing only in NON-ASCII case are two indexes",
+			tables: []*ir.Table{
+				nsTable("posts", &ir.Index{Name: "idx_é", Columns: idxCol("v")}),
+				nsTable("comments", &ir.Index{Name: "idx_É", Columns: idxCol("v")}),
+			},
+			refuses: false,
+		},
+		{
+			// The partly-ASCII shape, both directions, because that is where an
+			// off-by-one fold shows up: the ASCII letters must still fold.
+			name: "index names differing only in ASCII case around a non-ASCII byte still collide",
+			tables: []*ir.Table{
+				nsTable("posts", &ir.Index{Name: "Café_Order", Columns: idxCol("v")}),
+				nsTable("comments", &ir.Index{Name: "café_ORDER", Columns: idxCol("v")}),
+			},
+			refuses: true,
+		},
+		{
 			name:    "a nil table is skipped, not dereferenced",
 			tables:  []*ir.Table{nil, nsTable("posts", &ir.Index{Name: "v", Columns: idxCol("v")})},
 			refuses: false,
