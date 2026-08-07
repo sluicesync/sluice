@@ -231,8 +231,8 @@ when vttablet runs with `--watch_replication_stream` and
 - Rare; recovery is automatic — restart the stream.
 - For correlated DDL bursts: follow [`docs/schema-change-runbook.md`
   ](schema-change-runbook.md) — `sync stop --wait` → apply
-  schema → `sync start --resume`. Avoid DDL during active sync
-  when you can.
+  schema → `sync start` (same `--stream-id`, warm-resumes on its
+  own). Avoid DDL during active sync when you can.
 
 ### 5. gRPC / network layer
 
@@ -440,7 +440,7 @@ proto-ADR in `docs/dev/design/sync-health-monitoring.md`.
 - `docs/managed-services.md` — DSN flags, sharded conventions,
   verification matrix.
 - `docs/schema-change-runbook.md` — `sync stop --wait` → ALTER →
-  `sync start --resume` workflow.
+  `sync start` workflow.
 
 ## Reference: external links
 

@@ -785,8 +785,9 @@ mid-stream) the following shapes:
 
 - **Tables with any `GENERATED ALWAYS AS ... STORED` column** — see
   §8. Refuse with "the trigger engine does not replicate generated
-  columns; use the `postgres` engine or exclude the column via
-  `--exclude-column`."
+  columns; use the `postgres` engine, or take the whole table out of
+  scope with `--exclude-table`." Note the refusal is necessarily
+  **table**-scoped: sluice has no column-scope filter (ADR-0177).
 
 - **Tables with custom domain types whose underlying type is
   unrecognized** — the `jsonb` round-trip works for built-in types

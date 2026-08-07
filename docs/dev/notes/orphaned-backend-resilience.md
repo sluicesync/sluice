@@ -168,7 +168,7 @@ half-open case.
 ## Test ideas
 
 - Pin: start a snapshot, `SIGKILL` the process mid-`COPY`, confirm a follow-up
-  `sync start --resume` (or `--reset-target-data`) detects the orphan in preflight
+  `sync start` (or `--reset-target-data`) detects the orphan in preflight
   and (with the flag) reaps it, then completes — instead of hanging on the lock.
 - Pin: assert every sluice connection carries the expected `application_name`
   across snapshot / applier / CDC, both engines.

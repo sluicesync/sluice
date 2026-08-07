@@ -25,8 +25,10 @@ The most common shape: an operator is on a managed-PG service (RDS, Aurora, Hero
 sluice migrate --config sluice.yaml
 
 # 2. Continuous CDC catch-up — apply changes from source to target while
-#    application traffic continues hitting source.
-sluice sync start --resume
+#    application traffic continues hitting source. Re-running this with the
+#    same --stream-id warm-resumes from the persisted position; there is no
+#    resume flag.
+sluice sync start
 
 # 3. When CDC lag is acceptable, stop writes on source.
 
@@ -92,11 +94,11 @@ The shape that motivated sluice's existence: a polyglot architecture (MySQL for 
 ```sh
 # Direction 1: MySQL → PG primary path
 sluice migrate --config mysql-to-pg.yaml
-sluice sync start --config mysql-to-pg.yaml --resume
+sluice sync start --config mysql-to-pg.yaml
 
 # Direction 2 (optional, hot-standby for rollback): PG → MySQL reverse path
 sluice migrate --config pg-to-mysql.yaml
-sluice sync start --config pg-to-mysql.yaml --resume
+sluice sync start --config pg-to-mysql.yaml
 ```
 
 The two configs name different stream IDs, different source-target pairings, and run as independent processes. sluice has no opinion about whether both directions are running; the source-of-truth question is the operator's.
@@ -123,14 +125,15 @@ A shape that surprises some operators: sluice's continuous-sync engine is the sa
 
 ```sh
 # Continuous backup to blob store
-sluice backup start --config backup.yaml
+sluice backup stream run --config backup.yaml
 
-# Compact + rotate
+# Compact + prune
 sluice backup compact --merge-window 1h
-sluice backup retain --rotate-at 168h
+sluice backup prune --keep-duration 168h
 
 # Restore: replay a backup chain into a fresh target
-sluice backup restore --from-chain-id <id> --target <dsn>
+# (restore is a TOP-LEVEL command, not a child of `backup`)
+sluice restore --from <chain-url> --target <dsn>
 ```
 
 ### Load-bearing capability

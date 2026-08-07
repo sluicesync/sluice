@@ -14,7 +14,7 @@ ADD COLUMN is the **only** shape v0.79.0 forwards on the live single-
 stream path. DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN, CHECK
 constraint changes, and generated-column changes continue to refuse
 loudly per the existing classifier — the drained model
-(`sync stop --wait` → schema migrate → `sync start --resume`) remains
+(`sync stop --wait` → apply the schema change → `sync start`) remains
 the recovery path for those shapes. The Shape A (`--inject-shard-column`)
 multi-shard coordination path is unaffected — it already handles every
 recognized shape via the lease + boundary-router catalog
@@ -602,8 +602,9 @@ COLUMN "created_at" on "public.widgets" has a computed DEFAULT
 expression "now()" which references volatile/stateful identifier
 "now" — target-session evaluation diverges from source per-row
 insert (ADR-0058 §2a). recovery: drained model — run 'sluice sync
-stop --wait', then run schema migrate … against "public.widgets",
-then resume via 'sluice sync start --resume'.
+stop --wait', then apply the schema change against "public.widgets"
+yourself …, then resume by re-running 'sluice sync start' with the
+SAME --stream-id (there is no resume flag) ….
 ```
 
 **Pinned by:**
@@ -644,5 +645,29 @@ to forward.
   newly-added column. Distinct from the column's DEFAULT
   expression (which the engine applies automatically).
 - "Drained recovery": the existing operator workflow — `sync stop
-  --wait` → schema migrate → `sync start --resume` — that remains
-  the fallback for every shape this ADR does NOT forward.
+  --wait` → apply the schema change → `sync start` (same
+  `--stream-id`) — that remains the fallback for every shape this
+  ADR does NOT forward.
+
+## Correction (2026-08-07) — the drained-recovery spelling named two commands that never existed
+
+The Status paragraph, the quoted refusal message in §"Volatile
+DEFAULT", and the "Drained recovery" glossary entry all spelled the
+workflow as `sync stop --wait` → `schema migrate` → `sync start
+--resume`. Two of those three steps were not real commands:
+
+- `sync start` has no `--resume` and never had one. It warm-resumes
+  by default when re-invoked with the same `--stream-id`; passing
+  `--resume` exits 80 with `unknown flag`. (`--resume` is real on
+  `migrate`, which is the likely source of the slip.)
+- `sluice schema migrate` does not exist either — `schema` has only
+  `preview`, `diff`, and `add-table`. The middle step was always
+  "apply the schema change to the target yourself"; on PlanetScale
+  `sluice deploy-ddl` ships one statement safely.
+
+Corrected in place rather than annotated inline, because nothing this
+ADR decides turns on the spelling — the drained model is unchanged and
+remains the fallback for every non-forwarded shape; only the operator
+commands were written wrong. The verbatim refusal message quoted in
+§"Volatile DEFAULT" was likewise re-quoted from the current
+`forwardRecoveryHint`, whose own text was fixed in the same pass.

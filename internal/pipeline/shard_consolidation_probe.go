@@ -675,7 +675,9 @@ func DispatchProbe(ctx context.Context, prober ShardConsolidationProber, table *
 func RecoveryHint(tableName string) string {
 	return fmt.Sprintf(
 		"recovery: drained model — run 'sluice sync stop --wait' on every shard, "+
-			"run one cross-shard schema migrate (manual or 'sluice schema migrate'), "+
+			"apply the schema change once across all shards yourself (sluice has no "+
+			"schema-migrate command; on PlanetScale, 'sluice deploy-ddl' ships one "+
+			"statement safely), "+
 			"then resume each shard by re-running 'sluice sync start' with that shard's own "+
 			"--stream-id (there is no resume flag). "+
 			"Per-table: %q. Pass --no-coordinate-live-ddl to keep the drained model "+

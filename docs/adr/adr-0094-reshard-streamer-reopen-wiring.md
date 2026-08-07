@@ -15,7 +15,7 @@ A Vitess reshard — a shard split, merge, or `MoveTables` — surfaces to a VSt
 
 **The gap:** the production `pipeline.Streamer` never calls `Reopen`. `ShardLayoutChangedError` implements only `Error()` and `Is()` — not `ir.RetriableError` — so when the change channel closes mid-stream and the Streamer surfaces the reader's `Err()` (the GitHub #19 `sourceErrFn` path, settled in `phaseSettleDispatch`), `runWithRetry`'s `classifyRetriable` returns false and the Streamer **exits loudly** (`"shard layout changed … reopen required"`). So today reshard is **LOUD-terminal, no silent loss** — but the reader's `Reopen` is dead code from the product's perspective.
 
-That terminal exit also leaves an **unverified restart path**: the persisted position is the *old* vgtid. On `sync start --resume`, the reader re-discovers the *new* shards but decodes *old* GTIDs against them — which most plausibly trips `ir.ErrPositionInvalid` → an ADR-0093/ADR-0022 cold-start **re-snapshot** (a full, expensive re-copy), with a worst-case risk of a partial-GTID-match gap. That path has no test.
+That terminal exit also leaves an **unverified restart path**: the persisted position is the *old* vgtid. On the next `sync start` with the same `--stream-id` (which warm-resumes from that position), the reader re-discovers the *new* shards but decodes *old* GTIDs against them — which most plausibly trips `ir.ErrPositionInvalid` → an ADR-0093/ADR-0022 cold-start **re-snapshot** (a full, expensive re-copy), with a worst-case risk of a partial-GTID-match gap. That path has no test.
 
 ## Decision
 

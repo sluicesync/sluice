@@ -344,7 +344,7 @@ N-process decision stands for the data path).
   re-attempt (CREATE/ALTER ... IF NOT EXISTS, guarded) the contract, or
   does Shape-A schema coordination require a drained-stream model
   (ADR-0030 Strategy A: `sync stop --wait` all shards, run one
-  cross-shard `schema add-table`/migrate, `sync start --resume` all)
+  cross-shard `schema add-table` / schema migration, `sync start` all)
   for v1, deferring live cross-shard schema migration to a Phase 2?**
   The spike's evidence leans toward **drained model for v1** (simplest,
   matches ADR-0030's own Phase-1 conservative-refusal precedent; live

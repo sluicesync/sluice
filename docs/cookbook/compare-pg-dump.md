@@ -124,8 +124,8 @@ then sluice for the data + continuous sync.
 pg_dump --schema-only ... | psql ... target
 
 # Data + sync via sluice from this point forward
-sluice migrate ... --schema-only=false --no-create-schema
-sluice sync start ... --resume
+sluice migrate ...
+sluice sync start ...   # same --stream-id warm-resumes; no resume flag
 ```
 
 This is fine. sluice doesn't have a problem with target schemas

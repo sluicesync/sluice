@@ -15,7 +15,8 @@ The full sluice-managed lifecycle:
 sluice migrate --config sluice.yaml
 
 # 2. CDC catch-up — continuous-sync apply from source binlog/WAL to target.
-sluice sync start --config sluice.yaml --resume
+#    Re-run with the same --stream-id to warm-resume; there is no resume flag.
+sluice sync start --config sluice.yaml
 
 # 3. Drain — stop the source-side writes (application-level: deploy a read-only
 #    config, drain user sessions, halt batch jobs). CDC catches up to source-current.
@@ -104,7 +105,7 @@ Set up a second sluice instance in the *opposite* direction *before* the traffic
 ```sh
 # Before traffic flip, on a second machine / process:
 sluice migrate --config reverse-direction.yaml   # cold-start old-source from new-target
-sluice sync start --config reverse-direction.yaml --resume
+sluice sync start --config reverse-direction.yaml
 
 # Both directions now run in parallel.
 # - Forward (sluice-1): old-source → new-target  (still draining residual)

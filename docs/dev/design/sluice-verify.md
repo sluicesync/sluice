@@ -214,7 +214,7 @@ JSON form preserves the same data with predictable field names; `VerifyResult` i
 ## What this is not
 
 - **Not a continuous monitoring framework.** `verify` is a point-in-time probe. The operator runs it on a schedule (cron, k8s CronJob, GitHub Actions); sluice doesn't ship its own scheduler. (Sync-lag / staleness monitoring is a separate concern; see parallel design proto-ADR.)
-- **Not a fix-up tool.** `verify` reports drift; remediation is the operator's call (`migrate --resume`, `sync start --resume` from a known-good position, manual repair). Sluice deliberately doesn't auto-heal — silent corruption that's auto-healed is hard to diagnose later.
+- **Not a fix-up tool.** `verify` reports drift; remediation is the operator's call (`migrate --resume`, re-running `sync start` from its persisted position, manual repair). Sluice deliberately doesn't auto-heal — silent corruption that's auto-healed is hard to diagnose later.
 - **Not a replacement for `schema diff`.** Different layers; both should be in the operator toolbox.
 - **Not a replacement for vendor-specific verification tools.** PlanetScale's `pscale data-branching diff`, Percona's `pt-table-checksum`, etc., are still useful in their respective domains. Sluice's `verify` covers the cross-engine case those tools don't.
 

@@ -29,7 +29,7 @@ Add a `LiveMode bool` field to `pipeline.AddTable` (CLI flag `--no-drain` on `sl
 
 3. **Snapshot-after-publication-add invariant.** The publication change is issued, then the snapshot is taken (same ordering as Phase 1). Capture the snapshot's consistent-point LSN. **Refuse loudly** if `snapshot-LSN < confirmed_flush_lsn` — this would mean the slot has somehow advanced past the snapshot's start point and events on the new table between [snapshot-LSN, confirmed_flush_lsn] would be lost. In normal operation snapshot-LSN ≥ pg_current_wal_lsn() at the moment of slot creation, which is by construction ≥ the running slot's confirmed_flush_lsn — but the explicit check pins the invariant so a regression in the flow's ordering trips a test rather than silently dropping rows.
 
-The success log nudges the operator toward "the slot will pick up new-table events on the next CDC consumption" rather than the Phase 1 message about `--resume`, since live mode doesn't require a restart.
+The success log nudges the operator toward "the slot will pick up new-table events on the next CDC consumption" rather than the Phase 1 message about restarting the stream, since live mode doesn't require a restart.
 
 ## Correctness story (why publication-add-then-snapshot works)
 
@@ -124,8 +124,14 @@ warm-resume path"). Passing `--resume` exits 80 with `unknown flag`.
 
 Corrected in place rather than annotated inline, because no decision recorded
 here turns on it — the workflow the ADR describes is unchanged, only the
-command spelling was wrong. `--resume` is real on `migrate` and `restore`,
-which is the likely source of the slip.
+command spelling was wrong. `--resume` is real on `migrate`, which is the
+likely source of the slip.
+
+Amended 2026-08-07: the sentence above previously said `--resume` was also
+real on `restore`. It is not — `restore` has no resume flag either (its flag
+set is in `docs/dev/cli-flags.txt`). The §Decision reference to "the Phase 1
+message about `--resume`" was reworded to "about restarting the stream" in the
+same pass, since that message's own text was corrected in v0.115.0.
 
 ## See also
 

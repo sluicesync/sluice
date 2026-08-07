@@ -55,7 +55,7 @@ This is the load-bearing tricky part. Two sub-problems:
 
 Three implementation strategies:
 
-**Strategy A — Pause + add.** `sync stop --wait` (already in v0.9.0) drains the in-flight CDC stream cleanly. Operator runs `add-table` while the stream is paused. Sluice creates the table on the target, snapshot-reads via the same `OpenSnapshotStream` that cold-start uses, bulk-copies, adds to publication. `sync start --resume` picks up CDC again. Simple but requires operator to drain the stream first.
+**Strategy A — Pause + add.** `sync stop --wait` (already in v0.9.0) drains the in-flight CDC stream cleanly. Operator runs `add-table` while the stream is paused. Sluice creates the table on the target, snapshot-reads via the same `OpenSnapshotStream` that cold-start uses, bulk-copies, adds to publication. Re-running `sync start` with the same `--stream-id` picks up CDC again (it warm-resumes by default; there is no resume flag). Simple but requires operator to drain the stream first.
 
 **Strategy B — In-stream snapshot.** Sluice's streamer keeps running. The add-table command opens a *new* snapshot stream (alongside the existing one) for just the new table, bulk-copies via that new stream, then atomically swaps the publication scope to include the new table at the LSN the new snapshot ended at. The CDC reader's existing replication slot keeps streaming; the publication-add ensures events on the new table from that LSN onwards are included. The publication-add itself is atomic on PG (single ALTER PUBLICATION command); MySQL has no equivalent (publications are a PG concept).
 
@@ -96,7 +96,7 @@ Phased so each phase is independently shippable.
 - Run translation pipeline (Mappings + ExpressionMappings + RetargetForEngine). Surface DDL via `schema preview` style.
 - On the PG side: `OpenSnapshotStream`-equivalent that exports a snapshot for just one table. Bulk-copy. Add to publication via `ALTER PUBLICATION ... ADD TABLE ...`.
 - On the MySQL side: read schema, translate, create on target, bulk-copy. No publication step (binlog is the stream).
-- After successful add, the operator runs `sync start --resume` to pick CDC back up.
+- After successful add, the operator re-runs `sync start` (same `--stream-id`) to pick CDC back up.
 
 Estimated size: ~600-900 LOC including tests + ADR.
 
@@ -107,7 +107,7 @@ Estimated size: ~600-900 LOC including tests + ADR.
 
 ### Phase 3: Cross-engine coordination polish (v0.12.x?)
 
-- Streamline the `sync stop --wait` → `add-table` → `sync start --resume` flow into a single command (`sluice schema add-table-now TABLE` that handles the drain internally). Optional QoL improvement.
+- Streamline the `sync stop --wait` → `add-table` → `sync start` flow into a single command (`sluice schema add-table-now TABLE` that handles the drain internally). Optional QoL improvement.
 
 ### Phase 4: Automatic detection (v1.x or later)
 

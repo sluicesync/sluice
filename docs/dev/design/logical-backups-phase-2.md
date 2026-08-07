@@ -111,7 +111,7 @@ Phase 3 (incrementals) ships the ability to restore a chain of `[full, incr, inc
 ```
 After restore: target's gtid_executed = manifest's terminal_GTID
 SET GLOBAL gtid_purged = '<manifest_GTID>'  -- target now declares "I have everything up to this set"
-sluice sync start --resume                  -- source streams everything NOT in target's GTID set
+sluice sync start                           -- source streams everything NOT in target's GTID set
 ```
 
 Clean: GTIDs are content-addressed, source has no per-target state. Works as long as source binlog covers the gap (default `binlog_expire_logs_seconds=7d` is plenty for most disaster windows).
@@ -120,8 +120,14 @@ Clean: GTIDs are content-addressed, source has no per-target state. Works as lon
 
 ```
 After restore: target has data through manifest's terminal_LSN
-sluice sync start --resume --lsn <manifest_LSN>  -- new flag (Phase 3)
+sluice sync start --lsn <manifest_LSN>      -- new flag (Phase 3)
 ```
+
+> **Correction (2026-08-07).** Both blocks above originally wrote
+> `sluice sync start --resume`. There is no `--resume` on `sync start` and
+> there never was — it warm-resumes by default when re-invoked with the same
+> `--stream-id`. The sketched Phase-3 `--lsn` flag shipped under a different
+> name, `--position-from-manifest`; the design intent it records is unchanged.
 
 **Operational catch**: `pg_create_logical_replication_slot()` creates a slot at the **current** server LSN, not an arbitrary historical one. To resume from `manifest_LSN`, the WAL between `manifest_LSN` and the slot's current `restart_lsn` must still be on disk. Two ways to guarantee this:
 

@@ -371,8 +371,8 @@ end-to-end refuse path that the live CDC reader exposes.
   pipeline imports.
 - Rendering lives in `internal/pipeline/schema_drift_render.go`.
   Operator-action wording is pipeline-specific (references
-  `--forward-schema-add-column`, `sluice sync start --resume`,
-  etc.) so it can't move down into IR without circular layering.
+  `--forward-schema-add-column`, `sluice sync start`, etc.) so it
+  can't move down into IR without circular layering.
 - The intercept wiring is in
   `internal/pipeline/schema_forward_intercept.go` —
   `renderDriftForRefusal` is the single helper used by both refuse

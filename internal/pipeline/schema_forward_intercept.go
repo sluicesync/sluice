@@ -543,8 +543,9 @@ func refuseShapeMultiCombo(tableName string, shape Shape, pre, post *ir.Table) e
 func forwardRecoveryHint(tableName string) string {
 	return fmt.Sprintf(
 		"recovery: drained model — run 'sluice sync stop --wait', "+
-			"then run schema migrate (manual or 'sluice schema migrate') "+
-			"against %q, then resume by re-running 'sluice sync start' with "+
+			"then apply the schema change against %q yourself (sluice has no "+
+			"schema-migrate command; on PlanetScale, 'sluice deploy-ddl' ships "+
+			"one statement safely), then resume by re-running 'sluice sync start' with "+
 			"the SAME --stream-id (there is no resume flag; a restart picks up "+
 			"the persisted position and skips the snapshot + bulk-copy phase). "+
 			"Set --schema-changes=refuse to keep the drained model as the "+

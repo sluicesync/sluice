@@ -145,7 +145,7 @@ Per the user's input on Open Question #4 (`wal_keep_size` UX), Phase 3 implement
 
 1. **`wal_keep_size` (PG 13+) / `max_slot_wal_keep_size`** sufficiency. Query `SHOW wal_keep_size`; estimate average WAL volume per minute from `pg_stat_wal` over the chain's incremental cadence; if `wal_keep_size < (incremental_interval × wal_volume_per_minute × 2)` (the "2" is a safety margin), `WARN wal_keep_size of <X> may not cover the worst-case CDC catch-up window from your backup chain (estimated <Y> WAL/incremental). Consider increasing.`
 2. **The idle-slot failover trap** (the user's 2026-05-07 finding). If the source is Patroni-managed (detect via `pg_settings.name LIKE '%patroni%'` or `application_name`), surface: `WARN this PG cluster is HA-managed (Patroni). The slot you're starting CDC from is subject to the idle-slot failover trap (see docs/postgres-source-prep.md). Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy.`
-3. **Slot existence + health.** `SELECT wal_status FROM pg_replication_slots WHERE slot_name = ?`. If `wal_status = 'lost'` or row is missing, refuse with the slot-recovery flow that already exists for `sync start --resume`.
+3. **Slot existence + health.** `SELECT wal_status FROM pg_replication_slots WHERE slot_name = ?`. If `wal_status = 'lost'` or row is missing, refuse with the slot-recovery flow that already exists for a warm-resuming `sync start`.
 
 The first two are warnings (proceed unless `--strict-preflight` is supplied); the third is a refusal because the slot can't deliver what we need.
 
@@ -174,7 +174,7 @@ CI: testcontainer-based round-trip for criteria 1, 2, 5, 6, 7. The wal_keep_size
 | `sluice backup incremental --since=<backup-id\|url>` | NEW. Writes incremental manifest + chunks; references parent. |
 | `sluice backup verify --from=<url>` | EXTENDED. Now walks chain (full + incrementals) and verifies all chunks. |
 | `sluice restore --from=<url>` | EXTENDED. Detects chain shape vs single-backup; walks chain in order. |
-| `sluice sync start --position-from-manifest=<url>` | NEW flag on existing command. Reads chain's terminal position. Mutually exclusive with `--resume` (different position sources). |
+| `sluice sync start --position-from-manifest=<url>` | NEW flag on existing command. Reads chain's terminal position, instead of the persisted position a plain re-invocation warm-resumes from. |
 | `sluice sync start --strict-preflight` | NEW flag on existing command. Promotes Phase 3 soft warnings to refusals. |
 
 ## Sluice-side mitigation for PG idle-slot trap (orthogonal, smaller chunk)
