@@ -514,6 +514,75 @@ func (c *Client) GetDeployRequest(ctx context.Context, org, db string, number in
 	return &out, nil
 }
 
+// DeployRequestRef is the DISCOVERY view of a deploy request — the three
+// fields the leftover-dev-branch adoption (roadmap item 108) reads off the
+// LIST endpoint, and deliberately no more. Every adoption DECISION is made
+// from the GET-by-number response instead, whose shape is live-captured
+// (the DR #2 fixture in client_test.go); the list is used only to learn
+// WHICH number was opened from a given dev branch. So a drift in the list
+// element's shape can cost sluice the discovery — which degrades to the
+// loud refusal that is today's behaviour — but can never feed a wrong
+// state into the adopt/refuse dispatch.
+//
+// Shape DERIVED from the public PlanetScale API reference, like
+// [DeployRequestDiff]; the next live psverify dispatch should replace it
+// with a sanitized capture.
+type DeployRequestRef struct {
+	Number     int    `json:"number"`
+	Branch     string `json:"branch"`
+	IntoBranch string `json:"into_branch"`
+}
+
+// Deploy-request listing is paginated (`page` / `per_page`; the reference
+// documents per_page default 25, maximum 100). The walk is BOUNDED, and
+// exhausting the bound is an ERROR rather than a short answer: the caller
+// (adoption) turns "no deploy request for this branch" into "delete the
+// dev branch", and handing that remedy to someone whose deploy request was
+// merely on a page sluice never read would destroy a running deployment.
+// Loud beats wrong.
+const (
+	deployRequestPageSize = 100
+	deployRequestMaxItems = 2000
+)
+
+// ErrDeployRequestListTruncated reports that the deploy-request collection
+// did not fit in [deployRequestMaxItems], so the returned set would not
+// have been exhaustive.
+var ErrDeployRequestListTruncated = errors.New("planetscale api: the database has more deploy requests than sluice enumerates")
+
+// ListDeployRequests returns every deploy request of the database, walking
+// the paginated collection to exhaustion.
+//
+// The walk stops on an EMPTY page rather than on a short one, which costs
+// one extra request and buys independence from the server's own per_page
+// cap: if PlanetScale ever answers a per_page=100 request with 25 rows,
+// a short-page stop would silently truncate — and truncation here reads as
+// "there is no deploy request", whose remedy is a branch delete. Pinned by
+// TestClient_ListDeployRequests_ServerCapsPerPage.
+//
+// Callers filter by branch themselves. The collection's filter parameters
+// are not part of the reference sluice models against, and a filter the
+// server silently ignores would be worse than none.
+func (c *Client) ListDeployRequests(ctx context.Context, org, db string) ([]DeployRequestRef, error) {
+	var all []DeployRequestRef
+	for page := 1; ; page++ {
+		var out struct {
+			Data []DeployRequestRef `json:"data"`
+		}
+		path := fmt.Sprintf("%s?page=%d&per_page=%d", deployRequestsPath(org, db), page, deployRequestPageSize)
+		if err := c.Get(ctx, path, &out); err != nil {
+			return nil, err
+		}
+		if len(out.Data) == 0 {
+			return all, nil
+		}
+		all = append(all, out.Data...)
+		if len(all) >= deployRequestMaxItems {
+			return nil, ErrDeployRequestListTruncated
+		}
+	}
+}
+
 // Deploy queues a deployable deploy request for deployment.
 func (c *Client) Deploy(ctx context.Context, org, db string, number int) (*DeployRequest, error) {
 	var out DeployRequest

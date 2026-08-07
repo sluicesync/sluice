@@ -326,6 +326,21 @@ const (
 	// be LEFT ALONE until it finishes.
 	CodePSDeployRequestIncomplete Code = "SLUICE-E-PS-DEPLOY-REQUEST-INCOMPLETE"
 
+	// CodePSDevBranchNotAdoptable fires when a re-run finds its own
+	// deterministic dev branch still there from an earlier attempt and
+	// CANNOT adopt the deploy request on it (roadmap item 108). Adoption
+	// is the normal outcome — a deploy request that is already deploying
+	// is joined by the same poller the fresh path uses, which is what
+	// rescues an operator holding a branch whose multi-hour index build is
+	// 78 % done. This code is the residue: no deploy request at all, more
+	// than one, one aimed at a different production branch, one that
+	// never got deployed, or one that ended in a terminal failure. Every
+	// shape names what was found and what to do with the branch, and the
+	// message is only ever "delete it" when nothing is deploying — the
+	// refusal it replaces said that unconditionally, and following it
+	// mid-build would have discarded hours of completed work.
+	CodePSDevBranchNotAdoptable Code = "SLUICE-E-PS-DEV-BRANCH-NOT-ADOPTABLE"
+
 	CodeSourceForeignDump     Code = "SLUICE-E-SOURCE-FOREIGN-DUMP"
 	CodeSourceWrongDriver     Code = "SLUICE-E-SOURCE-WRONG-DRIVER"
 	CodeCSVNullAmbiguous      Code = "SLUICE-E-CSV-NULL-AMBIGUOUS"
@@ -510,6 +525,8 @@ var registry = map[Code]Info{
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state, was closed without deploying, computed an empty diff, or computed a diff outside the leg's intended blast radius — the message carries the DR number, state, and URL. A deploy sluice merely stopped WAITING on is the separate SLUICE-E-PS-DEPLOY-REQUEST-INCOMPLETE"},
 
 	CodePSDeployRequestIncomplete: {ClassRuntime, "a PlanetScale deploy request sluice was waiting on did not reach a terminal state and NOTHING failed: a wall-clock bound was hit while the deploy was healthy and progressing, or the request is parked on a gate only a person can clear (deploy approval, a manual cutover confirmation). The deployment keeps running in PlanetScale and its dev branch must be LEFT ALONE until it finishes"},
+
+	CodePSDevBranchNotAdoptable: {ClassRefusal, "a re-run found its own deterministic PlanetScale dev branch left by an earlier attempt and could not ADOPT its deploy request: there is none, there is more than one, it merges into a different production branch, it was never deployed (sluice cannot re-establish the pre-deploy freshness/blast-radius guarantees for a branch it did not provision this run), or it ended in a terminal failure. A deploy request that is deploying or already deployed is adopted instead — no code, no refusal"},
 
 	CodePSBranchStaleBase:  {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup (a new dev branch's schema can lag production — intermittent, timing undocumented), or production's schema changed while a deploy request sat in its review/deploy wait — either way, deploying would silently revert newer production schema"},
 	CodePSDirectDDLBlocked: {ClassRefusal, "PlanetScale safe migrations refused a direct DDL statement sluice needs (Error 1105) — a user-table CREATE during schema apply, or sluice's own control tables. Ship the DDL through the governed channel (`sluice deploy-ddl`; `sluice control-tables ddl` / `sluice schema preview` print the statements) or disable safe migrations for the window — the message carries the per-case recipe"},

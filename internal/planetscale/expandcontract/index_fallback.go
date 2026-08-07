@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/planetscale/api"
 )
 
@@ -133,13 +134,15 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 		passwordName:  "sluice-index-fallback",
 		timeoutFlag:   "--planetscale-deploy-timeout",
 
-		// migrate's recovery is always --resume: the index phase
-		// re-probes the target and rebuilds only what is still missing,
-		// so an already-deployed DR's indexes are detected and skipped.
-		leftoverAdvice:        "continue with --resume (the index phase re-probes the target and rebuilds only what is still missing)",
-		alreadyDeployedAdvice: "close the DR, delete the dev branch, and re-run with --resume — the index phase detects already-built indexes and skips them",
-		reviewTimeoutAdvice:   "re-run with --resume (already-built indexes are detected and skipped)",
-		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume once it completes — already-deployed indexes are detected and skipped",
+		// The recovery is always "run the same phase again": the index
+		// phase re-probes the target and rebuilds only what is still
+		// missing, so an already-deployed DR's indexes are detected and
+		// skipped. HOW you run it again is command-specific — see
+		// [indexFallbackRerun].
+		alreadyDeployedAdvice: "close the DR, delete the dev branch, and " + indexFallbackRerun() + " — the index phase detects already-built indexes and skips them",
+		reviewTimeoutAdvice:   indexFallbackRerun() + " (already-built indexes are detected and skipped)",
+		deployTimeoutAdvice:   "watch it at the URL and " + indexFallbackRerun() + " once it completes — already-deployed indexes are detected and skipped",
+		rerunAdvice:           indexFallbackRerun() + " (the index phase re-probes the target and rebuilds only what is still missing)",
 
 		// Pre-Deploy blast-radius assertion (audit MED-D0-7): the
 		// fallback's DR carries index DDL for exactly ONE table.
@@ -219,6 +222,25 @@ func (f *IndexFallback) execDDLFunc() func(ctx context.Context, pw *api.BranchPa
 		return f.ExecDDL
 	}
 	return execBranchDDL
+}
+
+// indexFallbackRerun renders "run this again" for the command actually
+// running (Bug 230's mechanism, [migcore.RunningCommand]).
+//
+// The index-build fallback is armed on FIVE entry points — `migrate`,
+// `restore`, `sync start`, the fleet `sync run`, and the `sync from-backup`
+// broker (audit MED-A1 + the 2026-07-17 gap-#12 close) — and only `migrate`
+// has `--resume`. Every one of these strings used to name it
+// unconditionally, so four of the five told an operator mid-incident to
+// pass a flag their command exits 80 on. The NEUTRAL text is the zero value
+// and names no flag, so a command nobody sharpened for degrades to advice
+// that is less specific and still runnable (the CLAUDE.md zero-value-safe
+// rule applied to prose).
+func indexFallbackRerun() string {
+	if migcore.RunningCommand() == migcore.CommandMigrate {
+		return "re-run with --resume"
+	}
+	return "re-run the same command"
 }
 
 // indexFallbackBranchName derives the DETERMINISTIC dev-branch name from

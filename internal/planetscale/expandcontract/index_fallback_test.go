@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/planetscale/api"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -134,22 +135,26 @@ func TestIndexFallback_PreflightCachedAcrossTables(t *testing.T) {
 	}
 }
 
-// TestIndexFallback_LeftoverBranchRefused pins the crash-recovery shape:
-// a leftover deterministic branch refuses loudly with the inspect/delete
-// + --resume guidance — never silently reused, and NOT the unavailability
-// sentinel (the direct attempt already failed; hiding this would loop).
-func TestIndexFallback_LeftoverBranchRefused(t *testing.T) {
+// TestIndexFallback_LeftoverBranchWithNoDeployRequestRefused pins the
+// crash-recovery shape a leftover branch with NOTHING in flight takes: a
+// coded refusal that names the branch delete (safe here — no deployment
+// exists) and the re-run — never silently reused, and NOT the
+// unavailability sentinel (the direct attempt already failed; hiding this
+// would loop).
+func TestIndexFallback_LeftoverBranchWithNoDeployRequestRefused(t *testing.T) {
 	ps := newFakePS(t)
+	defer migcore.SetRunningCommand("")
+	migcore.SetRunningCommand(string(migcore.CommandMigrate))
 	leftover := indexFallbackBranchName("orders", indexFallbackDDLs)
 	ps.branches[leftover] = &api.Branch{Name: leftover, Ready: true}
 
 	f, _ := newTestIndexFallback(t, ps)
 	err := f.BuildIndexDDL(context.Background(), "orders", indexFallbackDDLs, err3024Stub())
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("BuildIndexDDL = %v; want the leftover-branch refusal", err)
-	}
-	if !strings.Contains(err.Error(), "--resume") {
-		t.Errorf("refusal should carry the --resume recovery guidance: %v", err)
+	wantCode(t, err, sluicecode.CodePSDevBranchNotAdoptable)
+	for _, want := range []string{"has NO deploy request", "pscale branch delete", "re-run with --resume"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q missing %q", err.Error(), want)
+		}
 	}
 	if errors.Is(err, ir.ErrIndexBuildFallbackUnavailable) {
 		t.Errorf("a leftover branch is a loud refusal, not unavailability: %v", err)
@@ -225,6 +230,11 @@ func TestIndexFallback_ZeroDeployTimeoutWaitsForTheBuild(t *testing.T) {
 // completely untouched.
 func TestIndexFallback_BoundedTimeoutIsIncompleteNotFailed(t *testing.T) {
 	ps := newFakePS(t)
+	// The `--resume` assertion below is migrate's text: this is a
+	// `migrate` operator's exit, and the same line reads "re-run the same
+	// command" on `sync start` / `restore`, which have no --resume.
+	defer migcore.SetRunningCommand("")
+	migcore.SetRunningCommand(string(migcore.CommandMigrate))
 	ps.postStates = []string{"in_progress"} // never terminal
 	ps.opPercents = []int{29}
 	f, _ := newTestIndexFallback(t, ps)

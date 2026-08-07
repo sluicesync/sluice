@@ -351,10 +351,13 @@ func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl s
 		passwordName:  "sluice-expand-contract",
 		timeoutFlag:   "--deploy-timeout",
 
-		leftoverAdvice:        continueAdvice(kind),
 		alreadyDeployedAdvice: "close the DR, delete the dev branch, and " + continueAdvice(kind),
 		reviewTimeoutAdvice:   continueAdvice(kind),
 		deployTimeoutAdvice:   "watch it at the URL; once it completes, " + continueAdvice(kind),
+		// The adoption refusals re-run THIS leg rather than continue past
+		// it, so they cannot reuse continueAdvice (which names the NEXT
+		// leg).
+		rerunAdvice: "re-run with --resume-from " + kind,
 
 		// Pre-Deploy blast-radius assertion (audit MED-D0-7): both legs
 		// intend to touch exactly --table; the expand leg additionally

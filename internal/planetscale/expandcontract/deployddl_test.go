@@ -120,8 +120,9 @@ func TestDeployDDL_RefusesLeftoverDevBranch(t *testing.T) {
 	ps.branches[leftover] = &api.Branch{Name: leftover, Ready: true}
 
 	_, err := d.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "already exists") || !strings.Contains(err.Error(), "nothing left to run") {
-		t.Fatalf("Run = %v; want the leftover-branch refusal with deploy-ddl guidance", err)
+	wantCode(t, err, sluicecode.CodePSDevBranchNotAdoptable)
+	if !strings.Contains(err.Error(), "has NO deploy request") || !strings.Contains(err.Error(), "re-run the same command") {
+		t.Fatalf("Run = %v; want the not-adoptable refusal with deploy-ddl guidance", err)
 	}
 	// The leftover is NOT ours to delete: cleanup must leave it alone.
 	if len(ps.deleted) != 0 {

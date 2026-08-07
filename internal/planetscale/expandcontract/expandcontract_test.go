@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,6 +127,16 @@ type fakePS struct {
 	// queuePaused / queuePauseReason mirror the deploy-queue pause.
 	queuePaused      bool
 	queuePauseReason string
+
+	// drListStatus, when non-zero, fails every deploy-request LIST with
+	// that HTTP status; drListCalls counts the successful ones (the
+	// adoption-discovery pins).
+	drListStatus int
+	drListCalls  int
+	// drListPadTo pads every LIST page to that many entries, so the
+	// client's bounded page walk never sees a short page and reports the
+	// list as truncated (the loud-beats-wrong pin).
+	drListPadTo int
 
 	// deleteAttempts counts every branch DELETE that REACHED the fake,
 	// scripted failures included — the pin that sluice does not even ASK
@@ -304,6 +315,32 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 			f.prodSchemaSuffix = f.flipProdSchemaOnDRCreate
 		}
 		writeJSON(w, fdr.dr)
+	case len(rest) == 0 && r.Method == http.MethodGet:
+		// The deploy-request LIST — the leftover-branch adoption's
+		// discovery read (roadmap item 108). drListStatus scripts a
+		// control-plane failure; otherwise every DR is returned on page 1
+		// (fewer than per_page, so the client's page walk stops there).
+		if f.drListStatus != 0 {
+			w.WriteHeader(f.drListStatus)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "internal", "message": "boom"})
+			return
+		}
+		f.drListCalls++
+		if f.drListPadTo == 0 && r.URL.Query().Get("page") != "1" {
+			writeJSON(w, map[string]any{"data": []any{}})
+			return
+		}
+		refs := make([]api.DeployRequestRef, 0, len(f.drs))
+		for _, fdr := range f.drs {
+			refs = append(refs, api.DeployRequestRef{
+				Number: fdr.dr.Number, Branch: fdr.dr.Branch, IntoBranch: fdr.dr.IntoBranch,
+			})
+		}
+		sort.Slice(refs, func(i, j int) bool { return refs[i].Number < refs[j].Number })
+		for len(refs) < f.drListPadTo {
+			refs = append(refs, api.DeployRequestRef{Number: -len(refs), Branch: "someone-elses", IntoBranch: "main"})
+		}
+		writeJSON(w, map[string]any{"data": refs})
 	case len(rest) == 2 && rest[1] == "diff" && r.Method == http.MethodGet:
 		n, _ := strconv.Atoi(rest[0])
 		if _, ok := f.drs[n]; !ok {
@@ -418,6 +455,32 @@ func (f *fakePS) attachOperations(out *api.DeployRequest) {
 		return
 	}
 	out.Deployment.DeployOperations = []api.DeployOperation{op}
+}
+
+// seedLeftover registers the dev branch a crashed earlier run left behind
+// together with ONE deploy request opened from it, frozen at
+// deploymentState. deployed selects which half of [fakePS.snapshot]'s walk
+// serves it: false is the pre-deploy shape (and PlanetScale's `deployable`
+// flag follows the real rule — only `ready` is deployable), true is the
+// post-deploy shape, which also carries the progress rows.
+//
+// It is the adoption path's entire fixture: everything the verdict rides
+// on comes from the GET-by-number response this produces.
+func (f *fakePS) seedLeftover(branch, state, deploymentState string, deployed bool) int {
+	f.branches[branch] = &api.Branch{Name: branch, Ready: true, ParentBranch: "main"}
+	n := f.nextDR
+	f.nextDR++
+	f.drs[n] = &fakeDR{
+		dr: &api.DeployRequest{
+			Number: n, Branch: branch, IntoBranch: "main",
+			State: state, DeploymentState: deploymentState,
+			HTMLURL: "https://app.planetscale.com/o/d/deploy-requests/" + strconv.Itoa(n),
+		},
+		deployed:  deployed,
+		preStates: []string{deploymentState},
+		states:    []string{deploymentState},
+	}
+	return n
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -1048,8 +1111,9 @@ func TestExpandContract_RefusesLeftoverDevBranch(t *testing.T) {
 	ps.branches[leftover] = &api.Branch{Name: leftover, Ready: true}
 
 	_, err := o.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "already exists") || !strings.Contains(err.Error(), "--resume-from migrate") {
-		t.Fatalf("Run = %v; want the leftover-branch refusal with resume guidance", err)
+	wantCode(t, err, sluicecode.CodePSDevBranchNotAdoptable)
+	if !strings.Contains(err.Error(), "has NO deploy request") || !strings.Contains(err.Error(), "--resume-from expand") {
+		t.Fatalf("Run = %v; want the not-adoptable refusal telling the operator to re-run the EXPAND leg (its DDL never shipped)", err)
 	}
 	// The leftover is NOT ours to delete: cleanup must leave it alone.
 	if len(ps.deleted) != 0 {
@@ -1136,9 +1200,42 @@ func TestExpandContract_ContractNoChangesAdviceDoesNotLoop(t *testing.T) {
 }
 
 // TestExpandContract_ContractLeftoverAdviceDoesNotLoop pins the same
-// de-loop on the refuse-on-leftover shape: a leftover CONTRACT branch
-// whose DDL already deployed has no next leg to resume.
+// de-loop on the leftover-branch shape: a leftover CONTRACT branch whose
+// DDL ALREADY DEPLOYED has no next leg to resume, so its advice must not
+// send the operator back through the contract leg.
+//
+// The leftover now carries the deploy request that proves the DDL shipped
+// (`no_changes` — an empty diff against production). Before roadmap item
+// 108 the refusal could not tell "already deployed" from "never shipped"
+// and gave the already-deployed advice to both; the sibling test below
+// pins the other half, where re-running the leg IS the right answer.
 func TestExpandContract_ContractLeftoverAdviceDoesNotLoop(t *testing.T) {
+	ps := newFakePS(t)
+	o, eng, _, _ := newTestOrchestrator(t, ps)
+	o.ResumeFrom = LegContract
+	for i := range eng.ex.rows {
+		eng.ex.rows[i].filled = true
+	}
+	ps.seedLeftover(o.contractBranchName(), "open", "no_changes", false)
+
+	_, err := o.Run(context.Background())
+	wantCode(t, err, sluicecode.CodePSDevBranchNotAdoptable)
+	msg := err.Error()
+	if !strings.Contains(msg, "NO schema changes") || !strings.Contains(msg, "pattern is complete") {
+		t.Errorf("contract leftover error = %q; want the already-deployed shape with the pattern-complete guidance", msg)
+	}
+	// "…--resume-from contract would refuse…" is the de-loop EXPLANATION
+	// and must survive; what must not appear is an instruction to run it.
+	if strings.Contains(msg, "re-run with --resume-from contract") {
+		t.Errorf("contract leftover error advises re-running the contract leg (the circular advice):\n%s", msg)
+	}
+}
+
+// TestExpandContract_ContractLeftoverWithNoDRSaysReRunTheLeg is the other
+// half: a leftover contract branch with NO deploy request means the
+// contract DDL never shipped, so `--resume-from contract` is now the
+// CORRECT advice — the distinction the old single refusal could not make.
+func TestExpandContract_ContractLeftoverWithNoDRSaysReRunTheLeg(t *testing.T) {
 	ps := newFakePS(t)
 	o, eng, _, _ := newTestOrchestrator(t, ps)
 	o.ResumeFrom = LegContract
@@ -1149,15 +1246,9 @@ func TestExpandContract_ContractLeftoverAdviceDoesNotLoop(t *testing.T) {
 	ps.branches[leftover] = &api.Branch{Name: leftover, Ready: true}
 
 	_, err := o.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("Run = %v; want the leftover-branch refusal", err)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "pattern is complete") {
-		t.Errorf("contract leftover error = %q; want the pattern-complete guidance", msg)
-	}
-	if strings.Contains(msg, "continue with --resume-from contract") {
-		t.Errorf("contract leftover error advises re-running the contract leg (the circular advice):\n%s", msg)
+	wantCode(t, err, sluicecode.CodePSDevBranchNotAdoptable)
+	if !strings.Contains(err.Error(), "has NO deploy request") || !strings.Contains(err.Error(), "--resume-from contract") {
+		t.Errorf("contract leftover with no DR = %q; want the never-shipped shape advising a contract re-run", err)
 	}
 }
 

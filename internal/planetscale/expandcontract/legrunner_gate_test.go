@@ -51,10 +51,10 @@ func newGateLegRunner(t *testing.T, ps *fakePS) (*legRunner, *branchCleanup, *by
 		passwordName: "gate-test",
 		timeoutFlag:  "--deploy-timeout",
 
-		leftoverAdvice:        "continue",
 		alreadyDeployedAdvice: "close the DR",
 		reviewTimeoutAdvice:   "approve it and re-run",
 		deployTimeoutAdvice:   "watch it",
+		rerunAdvice:           "run it again",
 	}
 	cleanup := &branchCleanup{api: client, org: "o", database: "d", out: out, command: "gate-test"}
 	return r, cleanup, out

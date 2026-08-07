@@ -59,14 +59,19 @@ type legRunner struct {
 	// Command-specific operator guidance spliced into the shared
 	// failure shapes (each completes the sentence it is spliced into):
 	//
-	//	leftoverAdvice        — "…if the DDL already deployed, %s; otherwise…"
 	//	alreadyDeployedAdvice — "…the DDL looks already deployed; %s"
 	//	reviewTimeoutAdvice   — "…approve it AND deploy it from the PlanetScale UI …, then %s"
 	//	deployTimeoutAdvice   — "…keeps running in PlanetScale; %s"
-	leftoverAdvice        string
+	//	rerunAdvice           — "…delete the branch …, then %s"
+	//
+	// rerunAdvice completes the adoption refusals (leg_adopt.go), which are
+	// the only ones that tell the operator to run the leg AGAIN rather than
+	// to move past it — so it is genuinely a fourth slot rather than a
+	// rewording of the other three.
 	alreadyDeployedAdvice string
 	reviewTimeoutAdvice   string
 	deployTimeoutAdvice   string
+	rerunAdvice           string
 
 	// timeoutFlag names the CLI flag that set deployTimeout, so the
 	// non-terminal exit can tell the operator exactly which knob to set
@@ -122,7 +127,7 @@ func legBranchName(kind, scope, ddl string) string {
 	h.Write([]byte(scope))
 	h.Write([]byte{0})
 	h.Write([]byte(ddl))
-	return "sluice-" + kind + "-" + hex.EncodeToString(h.Sum(nil))[:10]
+	return legBranchPrefix + kind + "-" + hex.EncodeToString(h.Sum(nil))[:10]
 }
 
 // preflightSafeMigrations verifies the service token / org / database /
@@ -154,21 +159,18 @@ func preflightSafeMigrations(ctx context.Context, client *api.Client, org, datab
 	return nil
 }
 
-// run drives the full leg: refuse-on-leftover, freshness-gated branch
-// provisioning, DDL (+ optional staging), deploy request, deploy,
-// skip-revert finalize.
+// run drives the full leg: adopt-or-refuse on a leftover branch,
+// freshness-gated branch provisioning, DDL (+ optional staging), deploy
+// request, deploy, skip-revert finalize.
 func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *branchCleanup) (*api.DeployRequest, error) {
 	out := r.out
 
-	// Refuse-on-leftover: a branch with our deterministic name means a
-	// previous run died mid-leg. Guessing whether its DDL/DR state is
-	// reusable would be the silent path; name it and let the operator
-	// decide.
+	// A branch with our deterministic name means a previous run died
+	// mid-leg. Look up what it left and ADOPT it when the deploy is
+	// already issued (leg_adopt.go); refuse loudly, naming what was found,
+	// when it is not.
 	if _, err := r.api.GetBranch(ctx, r.org, r.database, branchName); err == nil {
-		return nil, fmt.Errorf(
-			"%s: dev branch %q already exists — a previous run left it behind. Inspect its deploy request in PlanetScale; if the DDL already deployed, %s; otherwise delete the branch (`pscale branch delete %s %s --org %s`) and re-run",
-			r.errPrefix, branchName, r.leftoverAdvice, r.database, branchName, r.org,
-		)
+		return r.adoptLeftoverBranch(ctx, branchName, cleanup)
 	} else if !api.IsNotFound(err) {
 		return nil, fmt.Errorf("%s: probe dev branch %q: %w", r.errPrefix, branchName, err)
 	}
@@ -230,15 +232,9 @@ func (r *legRunner) run(ctx context.Context, branchName, ddl string, cleanup *br
 	// Finalize the revert window: PlanetScale holds a
 	// complete_pending_revert deployment "in progress" and blocks
 	// lifecycle ops (branch/database deletes) until it closes
-	// (ADR-0148 finding #4). The schema change itself IS applied at
-	// this point, so a skip-revert failure is a loud WARN, not a run
-	// failure — the operator can finalize from the DR page.
-	if final.DeploymentState == "complete_pending_revert" {
-		if _, err := r.api.SkipRevert(ctx, r.org, r.database, dr.Number); err != nil {
-			slog.WarnContext(ctx, r.errPrefix+": skip-revert failed; finalize the deployment manually from the deploy-request page",
-				"deploy_request", dr.Number, "url", final.HTMLURL, "err", err.Error())
-		}
-	}
+	// (ADR-0148 finding #4). Shared with the adopt path so an adopted leg
+	// finalizes identically.
+	r.finalizeRevertWindow(ctx, final)
 	fmt.Fprintf(out, "%s: deploy request #%d deployed\n", r.name, dr.Number)
 	return final, nil
 }
