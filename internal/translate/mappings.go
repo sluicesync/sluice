@@ -272,6 +272,28 @@ func ResolveTargetType(m config.Mapping) (ir.Type, error) {
 	return resolveTargetType(m.TargetType, m.TargetTypeOptions)
 }
 
+// IsBinaryFamily reports whether ty is one of the IR types whose values are
+// raw bytes — the family whose text rendering collides with its own value
+// space, and therefore the family a `--type-override` may not land on for a
+// continuous-sync run (audit 2026-08-05 finding B-2; see
+// pipeline.preflightBinaryTypeOverrideOnCDC).
+//
+// It lives here, next to the alias registry, because two callers must agree:
+// the sync-side REFUSAL and the `schema preview` HINT that suggests an
+// override in the first place. A hint that recommends a target type the next
+// command refuses is how an operator ends up reading a refusal for advice
+// sluice itself gave them.
+func IsBinaryFamily(ty ir.Type) bool {
+	if dom, isDomain := ty.(ir.Domain); isDomain && dom.BaseType != nil {
+		ty = dom.BaseType
+	}
+	switch ty.(type) {
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		return true
+	}
+	return false
+}
+
 // resolveTargetType maps a target_type alias plus any options to a
 // concrete ir.Type. Unknown aliases return an error naming the
 // alias and listing the recognised set so the operator can spot a

@@ -1051,7 +1051,7 @@ type Streamer struct {
 	// coordination ON — the shipping default — for every non-CLI
 	// construction (the v0.99.51 zero-value trap). Operators on the
 	// v0.72.x drained model — `sync stop --wait` → migrate →
-	// `sync start --resume` — set it to preserve pre-ADR-0054
+	// `sync start` (same --stream-id) — set it to preserve pre-ADR-0054
 	// semantics. A no-op when [InjectShardColumn] is not engaged.
 	//
 	// It was `CoordinateLiveDDL bool` ("default true") through

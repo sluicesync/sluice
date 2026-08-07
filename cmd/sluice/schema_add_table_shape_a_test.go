@@ -53,11 +53,19 @@ func TestSchemaAddTable_RefusesShapeAFlag(t *testing.T) {
 			//   (2) The drained model (the recovery path)
 			//   (3) Phase 2 / DP-3 (so the operator knows it's deferred,
 			//       not a permanent restriction)
+			// (4) is pinned as the invocation the operator can actually
+			// run. It read "sync start --resume" until the 2026-08-06
+			// CLI-surface sweep: `sync start` has no --resume and never
+			// had one (it warm-resumes on a re-run with the same
+			// --stream-id), so this pin was holding a command line that
+			// exits 80. TestRuntimeMessagesNameRealCLISurface is the
+			// gate that now makes that class a build failure.
 			wantSubstrings := []string{
 				"Shape A",
 				"ADR-0048",
 				"sync stop --wait",
-				"sync start --resume",
+				"sluice sync start --inject-shard-column",
+				"there is no resume flag",
 			}
 			for _, want := range wantSubstrings {
 				if !strings.Contains(msg, want) {

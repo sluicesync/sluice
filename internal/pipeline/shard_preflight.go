@@ -36,7 +36,7 @@ package pipeline
 //
 // DP-3 is owner-confirmed as drained-model-for-v1: cross-shard
 // schema migration is operator-driven via `sync stop --wait`
-// → schema migrate → `sync start --resume` (ADR-0030 Strategy
+// → schema migrate → `sync start` with the same --stream-id (ADR-0030 Strategy
 // A). This preflight does NOT lease, coordinate, or detect
 // in-flight cross-shard DDL; the existing schema-history
 // machinery is the loud-failure path if shards diverge mid-stream.

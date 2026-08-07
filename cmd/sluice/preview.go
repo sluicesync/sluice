@@ -22,8 +22,8 @@ import (
 // schema-shape mutation that the operator drives explicitly,
 // alongside the source-side `CREATE TABLE` they just ran. The flow
 // is: drain the stream (`sluice sync stop --wait`), run
-// `sluice schema add-table SOURCE.NAME`, then resume
-// (`sluice sync start --resume`).
+// `sluice schema add-table SOURCE.NAME`, then resume by re-running
+// `sluice sync start` with the same --stream-id.
 type SchemaCmd struct {
 	Preview  SchemaPreviewCmd  `cmd:"" help:"Render the target DDL sluice would emit, with cross-engine translation notes and advisory hints."`
 	Diff     SchemaDiffCmd     `cmd:"" help:"Compare the expected target DDL (source -> translation) against the actual on-target schema; report drift with copy-paste DDL suggestions."`

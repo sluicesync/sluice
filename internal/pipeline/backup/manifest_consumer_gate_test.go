@@ -66,7 +66,7 @@ var manifestConsumerExempt = map[string]string{
 	"pruneTrim.withinSegmentTrimRefusal": "roadmap item 100's purpose-built REFUSAL: it reads the survivor's manifest to explain why an " +
 		"within-segment trim would leave an unrestorable chain. It is itself a refusal path — running restore's " +
 		"list ahead of it would replace a precise message with a generic one.",
-	"oldestRetainedBackupResumePosition": "post-prune position probe: reads the retained root's header so `sync --position-from-manifest` " +
+	"oldestRetainedBackupResumePosition": "post-prune position probe: reads the retained root's header so `sync start --position-from-manifest` " +
 		"still has an anchor. Applies nothing.",
 	"r0": "prune's zero-result helper (chain_prune.go): reads segment headers to report what a no-op prune would " +
 		"have covered. Applies nothing, deletes nothing.",

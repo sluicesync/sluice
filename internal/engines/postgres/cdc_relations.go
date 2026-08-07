@@ -306,7 +306,9 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 const schemaRaceRecoveryHint = "sluice does not support this DDL shape mid-stream. Drained-model recovery: " +
 	"(1) `sluice sync stop --wait` on every shard, " +
 	"(2) apply the schema change via your migration tool on source AND target, " +
-	"(3) `sluice sync start --resume` to continue from the last applied LSN. " +
+	"(3) `sluice sync start` with the SAME --stream-id to continue from the last applied LSN " +
+	"(there is no resume flag: a restart looks up the persisted position and skips the " +
+	"snapshot + bulk-copy phase). " +
 	"For ADD COLUMN only, opt-in to live forwarding via --forward-schema-add-column (ADR-0058)."
 
 // projectRelation builds an [ir.Table] from a relationCacheEntry —

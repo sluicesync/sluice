@@ -85,6 +85,22 @@ Both are prose that names which engines a behaviour applies to, with nothing bin
 
 ## Open — 2026-08-06 docs-drift sweep
 
+### ~~`sluice sync start --resume` is a phantom flag, and sluice's own RUNTIME messages hand it to operators~~ — **CLOSED for the CODE half, and the gate proposed below is BUILT**
+
+`internal/climsggate` + `TestRuntimeMessagesNameRealCLISurface` (`cmd/sluice/cli_message_surface_test.go`) is the walker described at the bottom of this entry, built as specified: Go string literals only, fail-by-default, **no exemption list**, three anti-vacuity floors (spans / distinct commands / graded flag tokens). Truth comes from kong's model directly rather than from `docs/dev/cli-flags.txt`, because the manifest records flags only — a command owning no flags of its own leaves no line in it.
+
+It found **16** instances, not the 9 filed. The 7 the sweep did not have were a second class each: a flag that exists on a *sibling* command (`sluice migrate --schema-already-applied` — that flag is `sync start`-only, and the partition preflight it advertised does not even run on `sync`, so the advice was worse than wrong), a flag that exists **nowhere** (`sluice sync start --reset-position`, which ADR-0022 explicitly records as never having existed; corrected to `--restart-from-scratch`), and four shorthand invocations that omit the binary name (`restore --tables` → `--include-table`, in `docrows.go` **and** its byte-equal `docs/operator/error-codes.md` row; `sync --where` → `sync start --where`; `sync --position-from-manifest`).
+
+Two scope decisions are stated at the gate rather than left implied: it grades **string literals, not comments** (the tree carries a long-standing `sync --where` shorthand in doc comments that is prose, not instruction), and it **skips `_test.go`** — a gate's own fixtures have to be able to spell a phantom flag, and walking them would force in the exemption list the design exists to avoid.
+
+The false-positive rule, since a no-exemption gate lives or dies on it: a span is graded only when it starts at the word `sluice` (or, for the kong-help form, at a delimited region that *begins* with a real command **and** carries a flag), and a delimited span **ends at the author's own closing delimiter**. That last part is what makes the posture honest — a flag named in prose *outside* an invocation is a REFERENCE, which is exactly how a message tells an operator a flag was removed. `schemaRaceRecoveryHint`'s trailing mention of `--forward-schema-add-column` is ungraded for that reason, and the corrected `partition_preflight` message deliberately uses the same shape to say `--schema-already-applied` is not a `migrate` flag.
+
+**The sibling gate had the same hole and is fixed in the same pass.** `scripts/check-skills-flags.sh` validated flags and subcommands in two separate NAME-ONLY passes, so a skill saying `sluice sync start --resume` passed both — `sync`/`start` are real commands, `--resume` is a real flag on `migrate`. It now grades (command, flag) pairs against `docs/dev/cli-flags.txt` with ancestor inheritance and a vacuous-pass floor; 99 pairs graded today.
+
+**Doc instances remain open** and are listed below — including `docs/adr/adr-0066-*:749`, which carries the `--reset-position` phantom the code half just lost.
+
+The original entry follows.
+
 ### `sluice sync start --resume` is a phantom flag, and sluice's own RUNTIME messages hand it to operators
 
 `sync start` has no `--resume` and never has: it warm-resumes by default when re-invoked with the same `--stream-id`, and the flag exits 80 with `unknown flag`. (`--resume` is real on `migrate` and `restore`, which is where the slip comes from.) Roadmap item 53 caught and fixed one instance in a cookbook recipe in 2026-07; the class was never swept.

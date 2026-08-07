@@ -266,7 +266,7 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			// terminates; the operator runs the drained-model
 			// recovery (ADR-0054 hint).
 			r.setErr(fmt.Errorf(
-				"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --reset-position`",
+				"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
 				b.ddl,
 			))
 			return

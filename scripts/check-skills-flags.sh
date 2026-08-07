@@ -84,9 +84,105 @@ for c in $cmd_words; do
 done
 rm -f "$cmdset"
 
-if [ "$missing" != 0 ]; then
-	echo ""
-	echo "check-skills-flags FAILED: a skill names a flag or subcommand that no longer exists in the CLI. Fix the skill, or add the flag/command. (skills are the in-repo playbooks under skills/.)"
+# --- (subcommand, flag) PAIRING -------------------------------------------
+# The two passes above are both NAME-ONLY, and that is a hole with a name: a
+# skill saying `sluice sync start --resume` passes both of them, because
+# `sync`/`start` are real commands AND `--resume` is a real flag — on
+# `migrate`. It is not a flag on `sync start` and never has been, so an agent
+# following that skill gets `unknown flag --resume` and exit 80. Nine
+# instances of exactly that string were found in sluice's own runtime
+# messages (2026-08-06); this pass is the skills-side half of the fix, and
+# internal/climsggate is the Go-string half.
+#
+# Ground truth is docs/dev/cli-flags.txt, which cmd/sluice's
+# TestCLIFlagManifestIsCurrent generates from kong's model and holds current
+# — so this cannot drift from the parser the binary uses.
+manifest="docs/dev/cli-flags.txt"
+if [ ! -f "$manifest" ]; then
+	echo "check-skills-flags: $manifest is missing — regenerate it with 'SLUICE_UPDATE_CLI_MANIFEST=1 go test ./cmd/sluice/'. Failing."
 	exit 1
 fi
-echo "check-skills-flags: all $(echo "$flags" | wc -l | tr -d ' ') skill flags and $(echo "$cmd_words" | wc -l | tr -d ' ') skill subcommands resolve to a real CLI surface."
+
+pairs="$(mktemp)"
+paths="$(mktemp)"
+grep -v '^#' "$manifest" | grep -e '--' >"$pairs"
+# Every command path AND every prefix of one. The manifest only lists paths
+# that own at least one flag, so a group command like `sync` (whose flags all
+# live on its children) leaves no line of its own — without the prefixes the
+# resolver would fail to walk `sync start` and grade every flag against the
+# empty path.
+sed -E 's/ ?--.*$//' "$pairs" | sort -u | grep -v '^$' |
+	awk '{p=""; for (i=1; i<=NF; i++) { p = (p=="" ? $i : p" "$i); print p }}' |
+	sort -u >"$paths"
+
+if [ ! -s "$pairs" ] || [ ! -s "$paths" ]; then
+	echo "check-skills-flags: parsed ZERO (command, flag) pairs from $manifest — the manifest format changed. Failing."
+	rm -f "$pairs" "$paths"
+	exit 1
+fi
+
+# pair_ok <command path> <flag name>: a flag declared on an ANCESTOR node is
+# accepted on its descendants, because that is how kong resolves it.
+pair_ok() {
+	_p="$1"
+	while :; do
+		if [ -z "$_p" ]; then
+			grep -qxF -- "--$2" "$pairs" && return 0
+			return 1
+		fi
+		grep -qxF -- "$_p --$2" "$pairs" && return 0
+		case "$_p" in
+		*\ *) _p="${_p% *}" ;;
+		*) _p="" ;;
+		esac
+	done
+}
+
+checked=0
+while IFS= read -r span; do
+	[ -z "$span" ] && continue
+	path=""
+	seen_flag=0
+	for word in $span; do
+		case "$word" in
+		sluice) : ;;
+		--) : ;;
+		--*)
+			seen_flag=1
+			name="${word#--}"
+			name="${name%%=*}"
+			case "$name" in
+			'' | *[!a-z0-9-]*) continue ;;
+			esac
+			checked=$((checked + 1))
+			if ! pair_ok "$path" "$name"; then
+				echo "SKILLS-DRIFT: \`sluice ${path} --${name}\` — '--${name}' is not a flag on '${path}' (it may well be a flag on a DIFFERENT command; that is the slip this pass exists for)"
+				missing=1
+			fi
+			;;
+		[a-z]*)
+			[ "$seen_flag" = 1 ] && continue
+			cand="${path:+$path }$word"
+			grep -qxF -- "$cand" "$paths" && path="$cand"
+			;;
+		esac
+	done
+done <<EOF
+$(grep -rhoE '`sluice [^\`]+`' skills/ 2>/dev/null | tr -d '\`' || true)
+EOF
+
+rm -f "$pairs" "$paths"
+
+# Vacuous-pass guard: skills/ carries dozens of full invocations, so zero
+# graded pairs means the span extraction broke, not that the skills are clean.
+if [ "$checked" -lt 20 ]; then
+	echo "check-skills-flags: graded only ${checked} (command, flag) pairs from skills/ — span extraction broke. Failing."
+	exit 1
+fi
+
+if [ "$missing" != 0 ]; then
+	echo ""
+	echo "check-skills-flags FAILED: a skill names a flag or subcommand that no longer exists in the CLI, or pairs a real flag with the wrong command. Fix the skill, or add the flag/command. (skills are the in-repo playbooks under skills/.)"
+	exit 1
+fi
+echo "check-skills-flags: all $(echo "$flags" | wc -l | tr -d ' ') skill flags, $(echo "$cmd_words" | wc -l | tr -d ' ') skill subcommands and ${checked} (command, flag) pairs resolve to a real CLI surface."

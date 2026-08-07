@@ -146,7 +146,12 @@ func formatPartitionedRefusal(parents []string) string {
 	b.WriteString("(b) exclude the partitioned tables AND their children via `--include-table` to scope the " +
 		"migration to the non-partitioned subset; ")
 	b.WriteString("(c) on a same-engine PG → PG run, use `pg_dump --schema-only` + `pg_restore` to land the " +
-		"partition hierarchy first, then `sluice migrate --schema-already-applied` for the data. ")
+		"partition hierarchy first, then re-run with `--exclude-table=<parent>` so this refusal clears and " +
+		"the children copy their rows into the pre-created partitions — sluice creates tables with " +
+		"CREATE TABLE IF NOT EXISTS, so the restored hierarchy is left alone. (Note there is no " +
+		"--schema-already-applied on migrate: that DDL-skip flag exists on sync start only, and this " +
+		"preflight does not run there, so a sync cold start would flatten the hierarchy instead of " +
+		"refusing.) ")
 	b.WriteString("Native partition-aware support is roadmap-tracked but not yet shipped")
 	return b.String()
 }

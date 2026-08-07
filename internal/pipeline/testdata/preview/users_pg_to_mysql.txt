@@ -13,7 +13,7 @@ CREATE TABLE `users` (
   `bio` LONGTEXT NOT NULL  -- source: text -> target: longtext
 ) ENGINE=InnoDB;
 
--- hint: PG uuid expands 2.25x as CHAR(36); for binary storage, override to binary_uuid
+-- hint: PG uuid expands 2.25x as CHAR(36); for binary storage, override to binary_uuid (honoured by `migrate`; a continuous `sync` run REFUSES a binary --type-override)
 --       --type-override users.id=binary_uuid
 -- hint: PG text -> MySQL LONGTEXT (4GB cap, large overhead); if column is bounded, override to varchar:length=N or mediumtext
 --       --type-override users.bio=mediumtext

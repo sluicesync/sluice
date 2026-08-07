@@ -676,7 +676,8 @@ func RecoveryHint(tableName string) string {
 	return fmt.Sprintf(
 		"recovery: drained model — run 'sluice sync stop --wait' on every shard, "+
 			"run one cross-shard schema migrate (manual or 'sluice schema migrate'), "+
-			"then resume each shard via 'sluice sync start --resume'. "+
+			"then resume each shard by re-running 'sluice sync start' with that shard's own "+
+			"--stream-id (there is no resume flag). "+
 			"Per-table: %q. Pass --no-coordinate-live-ddl to keep the drained model "+
 			"as the default for all shards.",
 		tableName,

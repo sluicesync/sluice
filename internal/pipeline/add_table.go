@@ -14,7 +14,8 @@ package pipeline
 // Strategy A from `docs/dev/design/mid-stream-add-table.md`: the
 // operator drains the running stream first (`sluice sync stop --wait`),
 // then runs `sluice schema add-table SOURCE.NAME`, then resumes
-// (`sluice sync start --resume`). AddTable refuses if the stream is
+// (re-run `sluice sync start` with the same --stream-id; there is no
+// resume flag). AddTable refuses if the stream is
 // still active. Live add-table without the drain is Phase 2.
 //
 // The flow:
@@ -41,7 +42,7 @@ package pipeline
 //      position is still the right resume point for the other
 //      tables, and the applier's idempotent upsert handles the
 //      [persisted_LSN, snapshot_LSN] overlap on the new table.
-//  11. Operator restarts via `sluice sync start --resume` — the
+//  11. Operator restarts via `sluice sync start` (same --stream-id) — the
 //      stream picks up CDC for every table including the new one
 //      from its persisted position.
 
@@ -628,7 +629,8 @@ func (a *AddTable) logAddComplete(ctx context.Context) {
 		return
 	}
 	slog.InfoContext(
-		ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
+		ctx, "add-table: complete; resume the stream by re-running `sluice sync start` with the same "+
+			"--stream-id (there is no resume flag) to pick up CDC for the new table",
 		slog.String("table", a.TableName),
 		slog.String("stream_id", a.StreamID),
 	)
@@ -1302,7 +1304,7 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) binlog-source path (ADR-0034): would capture snapshot, bulk-copy rows, then record table on cdc-state.live_added_tables for the running streamer's poll to merge into the dispatch filter")
 		}
 	} else {
-		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to `sluice sync start --resume`")
+		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start` with the same --stream-id")
 	}
 	return nil
 }

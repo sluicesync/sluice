@@ -146,7 +146,7 @@ func ParseVerifyDepth(s string) (VerifyDepth, error) {
 // reader cannot decode. Kept next to the refusal because the useful advice is
 // specific: the artifact is already written, so the remedy is a fresh backup
 // taken by a binary that refuses the offending row at WRITE time.
-const chunkUnreadableHint = "this backup cannot be restored as it stands — take a fresh backup with a current sluice, whose write cores refuse an over-long row up front (a chain written by v0.111.1 or earlier had no such refusal); if this chain is the only copy, the named chunk is the loss and `restore --tables` can still recover the rest"
+const chunkUnreadableHint = "this backup cannot be restored as it stands — take a fresh backup with a current sluice, whose write cores refuse an over-long row up front (a chain written by v0.111.1 or earlier had no such refusal); if this chain is the only copy, the named chunk is the loss and `restore --include-table` can still recover the rest"
 
 // chunkReadTarget is one chunk to stream, carrying everything the real reader
 // needs — the same (CEK, AAD, codec, store) quadruple the restore path

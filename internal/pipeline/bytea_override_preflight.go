@@ -111,13 +111,12 @@ func preflightBinaryTypeOverrideOnCDC(mappings []config.Mapping) error {
 // isBinaryFamily reports whether ty is one of the IR types whose values
 // are raw bytes — the family whose text rendering collides with its own
 // value space.
+//
+// It delegates to [translate.IsBinaryFamily] so this refusal and the
+// `schema preview` hint that suggests a binary override are decided by ONE
+// predicate. They were two: preview kept recommending `binary_uuid` with no
+// mention that a sync run refuses it, and nothing would have noticed if a
+// second binary alias joined the hint registry.
 func isBinaryFamily(ty ir.Type) bool {
-	if dom, isDomain := ty.(ir.Domain); isDomain && dom.BaseType != nil {
-		ty = dom.BaseType
-	}
-	switch ty.(type) {
-	case ir.Binary, ir.Varbinary, ir.Blob:
-		return true
-	}
-	return false
+	return translate.IsBinaryFamily(ty)
 }

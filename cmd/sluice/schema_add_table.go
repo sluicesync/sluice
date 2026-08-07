@@ -75,7 +75,7 @@ type SchemaAddTableCmd struct {
 	// will still hit the underlying breakage. Persisting Shape A
 	// state in sluice_cdc_state for automatic detection is the
 	// follow-up. Task #8 / catalog backlog.
-	InjectShardColumn string `help:"Re-pass the Shape A discriminator column NAME=VALUE if this stream was started with --inject-shard-column on 'sync start'. Currently refuses loudly: Shape A add-table mid-stream is Phase 2 per ADR-0048 DP-3 — use the drained model: 'sync stop --wait' -> schema migrate (including add-table) -> 'sync start --resume'." placeholder:"NAME=VALUE"`
+	InjectShardColumn string `help:"Re-pass the Shape A discriminator column NAME=VALUE if this stream was started with --inject-shard-column on 'sync start'. Currently refuses loudly: Shape A add-table mid-stream is Phase 2 per ADR-0048 DP-3 — use the drained model: 'sync stop --wait' -> schema migrate (including add-table) -> 'sync start' re-run with the same --stream-id (a restart warm-resumes from the persisted position; there is no resume flag)." placeholder:"NAME=VALUE"`
 
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
@@ -132,8 +132,9 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 				"model (Phase 2 / live add-table is deferred). Recovery: stop the " +
 				"sharded streams via 'sluice sync stop --wait --stream-id <id>' on " +
 				"each shard; on the source side, evolve the table set as needed; " +
-				"resume each shard via 'sluice sync start --resume --inject-shard-column " +
-				"NAME=VALUE --stream-id <id>'. See ADR-0048 §4 'Cross-shard schema-" +
+				"resume each shard by re-running 'sluice sync start --inject-shard-column " +
+				"NAME=VALUE --stream-id <id>' (a restart warm-resumes from that stream's " +
+				"persisted position; there is no resume flag). See ADR-0048 §4 'Cross-shard schema-" +
 				"migration coordination' for the design rationale and the Phase 2 " +
 				"surface that would lift this restriction",
 		)

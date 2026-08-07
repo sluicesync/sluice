@@ -144,7 +144,8 @@ func (s *Streamer) refuseEngineMissingCoordination(missingSurface string) error 
 		"pipeline: target engine %q does not implement live cross-shard DDL coordination "+
 			"(missing %s, ADR-0054). Recovery: pass --no-coordinate-live-ddl to use the drained "+
 			"model (stop every shard with 'sluice sync stop --wait', run one cross-shard schema "+
-			"migrate, then resume every shard with 'sluice sync start --resume')",
+			"migrate, then resume every shard by re-running 'sluice sync start' with that shard's "+
+			"own --stream-id; there is no resume flag)",
 		engineName, missingSurface,
 	)
 }

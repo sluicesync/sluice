@@ -137,10 +137,54 @@ func HintsFor(table string, srcCol, tgtCol *ir.Column, srcEngine, tgtEngine stri
 			out = append(out, Hint{
 				Table:             table,
 				Column:            srcCol.Name,
-				Message:           entry.message,
+				Message:           entry.message + binaryOverrideCaveat(entry.suggestedAlias),
 				SuggestedOverride: fmt.Sprintf("--type-override %s.%s=%s", table, srcCol.Name, entry.suggestedAlias),
 			})
 		}
+	}
+	return out
+}
+
+// binaryOverrideCaveat names the command that honours a suggested override
+// when the suggestion lands on a BINARY target type, because one command
+// refuses it.
+//
+// `preflightBinaryTypeOverrideOnCDC` refuses a binary `--type-override` on a
+// continuous-sync run (audit 2026-08-05 finding B-2): the change reader types
+// values from the SOURCE and the applier reads column types from the TARGET,
+// so neither can see that an override made the column binary, and cold-start
+// and CDC would disagree about the same cell. `migrate` has no CDC lane and
+// honours it end to end.
+//
+// The predicate is [IsBinaryFamily] — the SAME one the refusal uses — rather
+// than a hard-coded "binary_uuid". Today `binary_uuid` is the only binary
+// alias any hint suggests; keying on the alias name would leave the day a
+// second one joins hintEntries as a silent divergence between what preview
+// recommends and what sync accepts.
+func binaryOverrideCaveat(alias string) string {
+	ty, err := resolveTargetType(alias, nil)
+	if err != nil || !IsBinaryFamily(ty) {
+		return ""
+	}
+	return " (honoured by `migrate`; a continuous `sync` run REFUSES a binary --type-override)"
+}
+
+// SuggestedOverrideAliases returns every target-type alias the advisory-hint
+// registry recommends, mapped to the caveat [HintsFor] appends for it (empty
+// when there is none).
+//
+// Exported for one reason, and it is the premise-naming one: the caveat
+// asserts a fact about a DIFFERENT package's behaviour — that
+// pipeline.preflightBinaryTypeOverrideOnCDC refuses this alias on a sync run.
+// Nothing in this package can check that. TestBinaryOverrideHintMatchesTheCDCRefusal
+// (internal/pipeline) reads this roster and binds the two sides, so a hint
+// that recommends something sync refuses — or a refusal that widens past
+// what the hint warns about — fails the build instead of reaching an
+// operator as contradictory advice.
+func SuggestedOverrideAliases() map[string]string {
+	out := make(map[string]string, len(hintEntries))
+	for _, entry := range hintEntries {
+		out[entry.suggestedAlias] = binaryOverrideCaveat(entry.suggestedAlias)
 	}
 	return out
 }
