@@ -97,11 +97,12 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 			cfg.schema, ChangeLogTable,
 		)
 	}
-	// The gap-free ordering rests on the change-log id sequence being a
-	// CACHE 1 BIGSERIAL (see cdc_gapfree.go's premises). Preflight it
-	// here so a source someone ALTERed refuses at open time rather than
-	// dropping changes mid-stream.
-	if err := verifyChangeLogSequenceCache(ctx, db, cfg.schema); err != nil {
+	// The gap-free ordering rests on the change-log id sequence being an
+	// untouched BIGSERIAL — CACHE 1, MINVALUE 1, INCREMENT 1, NO CYCLE
+	// (see cdc_gapfree.go's premises). Preflight it here so a source
+	// someone ALTERed refuses at open time rather than dropping changes
+	// mid-stream.
+	if err := verifyChangeLogSequence(ctx, db, cfg.schema); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -775,10 +776,23 @@ func readChangeLogAnchor(ctx context.Context, q anchorQuerier, schema string) (i
 		return 0, err
 	}
 	if anchor < 0 {
-		// MIN(id) - 1 can only go negative if the lowest in-flight id is
-		// 0, which BIGSERIAL never allocates (it starts at 1). Clamp
-		// defensively so the position decoder's last_id >= 0 invariant
-		// holds; anchoring at 0 replays everything (safe over-replay).
+		// Defensive floor for the position codec's last_id >= 0
+		// invariant; anchoring at 0 replays everything (safe
+		// over-replay).
+		//
+		// CORRECTION (2026-08-07): this used to read "MIN(id) - 1 can
+		// only go negative if the lowest in-flight id is 0, which
+		// BIGSERIAL never allocates (it starts at 1)" — asserted, never
+		// checked, and FALSE of a tampered sequence. `ALTER SEQUENCE …
+		// MINVALUE 0 RESTART WITH 0` really does allocate id 0, and
+		// `MINVALUE -100 RESTART WITH -100` really does allocate
+		// negative ids (both ground-truthed on PG 16), at which point
+		// this clamp silently declares them already-covered. The
+		// premise is now PREFLIGHTED rather than asserted —
+		// [verifyChangeLogSequence] refuses a MINVALUE below 1 at every
+		// CDC open — and pinned by
+		// TestCDCReader_RefusesSequenceConfigThatCanReissueIDs plus the
+		// defect proof TestChangeLogAnchor_MinValueZeroStrandsTheChange.
 		anchor = 0
 	}
 	return anchor, nil

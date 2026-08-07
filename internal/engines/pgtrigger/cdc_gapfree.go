@@ -54,16 +54,28 @@ import (
 //
 // PREMISES. Each is load-bearing and none is self-evident:
 //
-//   - The id sequence is a BIGSERIAL with CACHE 1, so nextval is
-//     globally monotonic in allocation order and no transaction can
-//     commit an id BELOW one already consumed. With a larger cache
-//     concurrent sessions draw from disjoint pre-allocated ranges, id
-//     order diverges from allocation order across sessions, and a
-//     session can commit a low id arbitrarily long after a higher one
-//     was consumed — which breaks both the contiguity rule and the
-//     hole-permanence proof outright. Nothing in the schema enforces
-//     it, so [verifyChangeLogSequenceCache] preflights it at every CDC
-//     open and refuses loudly.
+//   - The id sequence allocates strictly ASCENDING ids above zero, one
+//     at a time, and never re-issues one. That is what makes nextval
+//     globally monotonic in allocation order, so no transaction can
+//     commit an id BELOW one already consumed. FOUR sequence settings
+//     each break it on their own, and nothing in the schema enforces
+//     any of them, so [verifyChangeLogSequence] preflights all four at
+//     every CDC open and refuses loudly:
+//     CACHE > 1 (concurrent sessions draw from disjoint pre-allocated
+//     ranges, so a session can commit a low id arbitrarily long after a
+//     higher one was consumed); a MINVALUE below 1 (an id of 0 or less
+//     sits at or under the watermark floor — [readChangeLogMaxID]
+//     returns 0 for an empty log and [readChangeLogAnchor] clamps a
+//     negative anchor to 0 — so the change is skipped on the first
+//     poll); a negative INCREMENT (every id after the first lands below
+//     the last); and CYCLE (at MAXVALUE the sequence wraps back to
+//     MINVALUE and re-issues the whole id space). Each breaks the
+//     contiguity rule and the hole-permanence proof outright.
+//     These are CONFIGURATION checks read at open. A mid-stream
+//     `ALTER SEQUENCE … RESTART WITH <low>` re-introduces low ids
+//     against any configuration and is outside what an open-time
+//     preflight can see — the same stated limit the CACHE check has
+//     always had.
 //   - A hole is PERMANENT (its allocating transaction aborted) only
 //     once every transaction that could still fill it has settled.
 //     [holeGuard] proves that with the same freshly-ASSIGNED xid bound
@@ -262,34 +274,48 @@ func (g *holeGuard) warnStuck(ctx context.Context, now time.Time) {
 	)
 }
 
-// changeLogSequenceQuery reads the change-log id sequence's name and
-// CACHE setting. pg_get_serial_sequence resolves the sequence a
-// BIGSERIAL (or identity) column is attached to, so the probe survives
-// a renamed table; a NULL means the id column is backed by no sequence
-// at all, which is itself a refusal (see [verifyChangeLogSequenceCache]).
+// changeLogSequenceQuery reads the change-log id sequence's name and the
+// four allocation settings this file's first premise rests on.
+// pg_get_serial_sequence resolves the sequence a BIGSERIAL (or identity)
+// column is attached to, so the probe survives a renamed table; a NULL
+// means the id column is backed by no sequence at all, which is itself a
+// refusal (see [verifyChangeLogSequence]).
+//
+// The LEFT JOIN (rather than the obvious FROM pg_sequence WHERE …) is
+// load-bearing: it returns exactly one all-NULL row when the column has
+// no sequence, so that case reaches the named refusal below instead of
+// surfacing as sql.ErrNoRows from a query that found nothing.
 const changeLogSequenceQuery = `
-SELECT pg_get_serial_sequence($1, 'id'),
-       (SELECT s.seqcache FROM pg_sequence s
-         WHERE s.seqrelid = pg_get_serial_sequence($1, 'id')::regclass)`
+SELECT q.seq, s.seqcache, s.seqmin, s.seqincrement, s.seqcycle
+  FROM (SELECT pg_get_serial_sequence($1, 'id') AS seq) q
+  LEFT JOIN pg_sequence s ON s.seqrelid = q.seq::regclass`
 
-// verifyChangeLogSequenceCache preflights the CACHE 1 premise this
-// file's header states (monotone global id allocation). A sequence with
-// CACHE > 1 hands each session a disjoint pre-allocated range, so
-// session S2 can commit id 33 while S1 still holds id 5 unwritten —
-// after which id 5 arrives BELOW an already-consumed watermark and is
-// silently dropped, and the hole-permanence proof (which assumes a hole
-// can only be filled by a transaction that has already been assigned an
-// xid) is void. `sluice trigger setup` creates the column as BIGSERIAL,
-// whose default cache IS 1, so a non-1 value means someone ALTERed it;
-// refusing is right and costs a correctly-configured source nothing.
-func verifyChangeLogSequenceCache(ctx context.Context, db *sql.DB, schema string) error {
+// verifyChangeLogSequence preflights the ascending-monotone-allocation
+// premise this file's header states, across all four sequence settings
+// that can break it. `sluice trigger setup` creates the column as
+// BIGSERIAL — CACHE 1, MINVALUE 1, INCREMENT 1, NO CYCLE — so any other
+// value means someone ALTERed it; refusing is right and costs a
+// correctly-configured source nothing.
+//
+// SCOPE, stated so the name cannot be read as broader than the truth:
+// this grades the sequence's CONFIGURATION at CDC open. It does not and
+// cannot catch a mid-stream `ALTER SEQUENCE … RESTART WITH <low>`, which
+// re-issues low ids under a perfectly legal configuration. It is also
+// pgtrigger-only — the sibling sqlite-trigger engines allocate ids from
+// SQLite's own rowid/AUTOINCREMENT machinery, which has no pg_sequence
+// row to read and needs its own separate argument.
+func verifyChangeLogSequence(ctx context.Context, db *sql.DB, schema string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
 	var (
-		seqName sql.NullString
-		cache   sql.NullInt64
+		seqName   sql.NullString
+		cache     sql.NullInt64
+		minValue  sql.NullInt64
+		increment sql.NullInt64
+		cycle     sql.NullBool
 	)
-	if err := db.QueryRowContext(ctx, changeLogSequenceQuery, tableRef).Scan(&seqName, &cache); err != nil {
-		return fmt.Errorf("pgtrigger: preflight: read %s id sequence cache: %w", tableRef, err)
+	row := db.QueryRowContext(ctx, changeLogSequenceQuery, tableRef)
+	if err := row.Scan(&seqName, &cache, &minValue, &increment, &cycle); err != nil {
+		return fmt.Errorf("pgtrigger: preflight: read %s id sequence settings: %w", tableRef, err)
 	}
 	if !seqName.Valid || !cache.Valid {
 		return fmt.Errorf(
@@ -301,6 +327,24 @@ func verifyChangeLogSequenceCache(ctx context.Context, db *sql.DB, schema string
 		return fmt.Errorf(
 			"pgtrigger: change-log id sequence %s has CACHE %d, not 1 — with a cached range each session pre-allocates a disjoint block of ids, so a session can commit a LOW id after the stream has already consumed a HIGHER one and that change would be dropped silently; run `ALTER SEQUENCE %s CACHE 1` on the source, then restart the stream",
 			seqName.String, cache.Int64, seqName.String,
+		)
+	}
+	if minValue.Int64 < 1 {
+		return fmt.Errorf(
+			"pgtrigger: change-log id sequence %s has MINVALUE %d, not 1 — the poll only ever consumes ids ABOVE its watermark and that watermark floors at 0 (an empty change log starts the stream at 0, and a negative cold-start anchor is clamped to 0), so a change captured with id %d or lower is never emitted and is dropped silently; run `ALTER SEQUENCE %s MINVALUE 1 RESTART WITH <a value above every id already in the change log>` on the source, then restart the stream",
+			seqName.String, minValue.Int64, minValue.Int64, seqName.String,
+		)
+	}
+	if increment.Int64 < 1 {
+		return fmt.Errorf(
+			"pgtrigger: change-log id sequence %s has INCREMENT %d, not a positive step — a descending sequence allocates each id BELOW the previous one, so every change after the first lands under the stream's watermark and is dropped silently; run `ALTER SEQUENCE %s INCREMENT BY 1 RESTART WITH <a value above every id already in the change log>` on the source, then restart the stream",
+			seqName.String, increment.Int64, seqName.String,
+		)
+	}
+	if cycle.Bool {
+		return fmt.Errorf(
+			"pgtrigger: change-log id sequence %s is declared CYCLE — on reaching MAXVALUE it wraps back to MINVALUE and re-issues ids the stream has already consumed, and every re-issued change would be dropped silently; run `ALTER SEQUENCE %s NO CYCLE` on the source, then restart the stream",
+			seqName.String, seqName.String,
 		)
 	}
 	return nil

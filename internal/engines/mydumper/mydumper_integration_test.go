@@ -327,6 +327,75 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 		}
 	})
 
+	// The row-count tripwire's own premise, ground-truthed.
+	//
+	// warnIfRowCountMismatch is the ONLY independent evidence sluice has
+	// that a dump's chunk files are all present: `verify --depth count`
+	// re-scans the same directory with the same lexer, so it confirms a
+	// loss rather than catching it (audit-2026-07-15 MED-D0-2). All of
+	// that rests on an environmental fact — that real mydumper records
+	// per-table `rows = N` in a section this package's parser
+	// recognises — and every existing pin uses a HAND-WRITTEN metadata
+	// fixture, i.e. sluice agreeing with sluice. If mydumper changed the
+	// key or the section spelling, hasMetadataRows would go false for
+	// every table, the tripwire would silently never fire again, and
+	// every one of those pins would stay green.
+	//
+	// So this leg reads the counts a real `mydumper` wrote and compares
+	// them against a number that comes from neither the dump nor this
+	// package: `SELECT COUNT(*)` on the live source the dump was taken
+	// from. Both halves of the safety argument are asserted together —
+	// mydumper records counts sluice can parse, AND they are exact —
+	// because pinning either alone lets the other rot.
+	//
+	// What a mutation run can and cannot show here, stated so the
+	// evidence is not overread: breaking parseMetadata fires this leg
+	// (verified — the per-table assertion AND the anti-vacuity floor),
+	// but so do the hand-written unit pins. The coverage that is
+	// irreplaceable is of a change in MYDUMPER, which no mutation of
+	// sluice's own source can simulate. That is the whole reason a
+	// premise check has to ride a real tool.
+	t.Run("real-mydumper-records-parsable-exact-row-counts", func(t *testing.T) {
+		d, err := openDumpDir(dumpDirs["escape"])
+		if err != nil {
+			t.Fatalf("openDumpDir: %v", err)
+		}
+		live, err := sql.Open("mysql", srcDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = live.Close() }()
+
+		var graded int
+		for _, name := range d.tableOrder {
+			tf := d.tables[name]
+			if !tf.hasMetadataRows {
+				t.Errorf("real mydumper %s recorded NO row count sluice could parse for table %q — "+
+					"the MED-D0-2 tripwire is inert for this dump, and a lost chunk would be "+
+					"invisible; re-derive parseMetadata against this version's metadata file",
+					itDumperImage, name)
+				continue
+			}
+			var want int64
+			if err := live.QueryRow("SELECT COUNT(*) FROM `" + name + "`").Scan(&want); err != nil {
+				t.Fatalf("live COUNT(*) for %q: %v", name, err)
+			}
+			if tf.metadataRows != want {
+				t.Errorf("table %q: dump metadata records rows = %d, live source holds %d — "+
+					"the recorded count is not exact on %s, so the tripwire would fire on every "+
+					"clean dump; decide whether the count is still usable as a tripwire",
+					name, tf.metadataRows, want, itDumperImage)
+			}
+			graded++
+		}
+		// Anti-vacuity floor: an empty tableOrder (or a future refactor
+		// that stops populating it) must not read as "all clear".
+		if graded < 5 {
+			t.Fatalf("graded %d table(s); want at least the 5 seeded tables — this check passed "+
+				"without measuring anything", graded)
+		}
+	})
+
 	// verify --depth count: the dump source vs a migrated target is clean.
 	t.Run("verify-count-depth", func(t *testing.T) {
 		verifier := &pipeline.Verifier{

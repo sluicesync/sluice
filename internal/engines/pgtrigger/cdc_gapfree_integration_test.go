@@ -24,7 +24,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -343,48 +342,14 @@ func TestCDCReader_GapFreedom_SkipsAnAbortedHole(t *testing.T) {
 	assertSameSet(t, collectLabels(t, out, 1), []string{"after"})
 }
 
-// TestCDCReader_RefusesNonUnitSequenceCache pins the CACHE 1 premise
-// preflight. A cached sequence hands each session a disjoint
-// pre-allocated id range, so id order stops tracking allocation order
-// across sessions and both the contiguity rule and the abort proof
-// break — the stream must refuse at open rather than drop changes.
-func TestCDCReader_RefusesNonUnitSequenceCache(t *testing.T) {
-	dsn, cleanup := startPGForTrigger(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	setupCaptureTable(t, ctx, dsn, "cached_seq")
-
-	e := Engine{}
-	reader, err := e.OpenCDCReader(ctx, dsn)
-	if err != nil {
-		t.Fatalf("OpenCDCReader on a CACHE 1 source: %v", err)
-	}
-	if c, ok := reader.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
-
-	applyPGSQL(t, dsn, `ALTER SEQUENCE public.sluice_change_log_id_seq CACHE 32`)
-	if _, err := e.OpenCDCReader(ctx, dsn); err == nil {
-		t.Fatal("OpenCDCReader accepted a change-log sequence with CACHE 32; want a loud refusal")
-	} else if !strings.Contains(err.Error(), "CACHE 32") || !strings.Contains(err.Error(), "ALTER SEQUENCE") {
-		t.Errorf("refusal does not name the cache value and the remedy: %v", err)
-	}
-	if _, err := e.OpenSnapshotStream(ctx, dsn); err == nil {
-		t.Error("OpenSnapshotStream accepted a change-log sequence with CACHE 32; want a loud refusal")
-	}
-
-	applyPGSQL(t, dsn, `ALTER SEQUENCE public.sluice_change_log_id_seq CACHE 1`)
-	reader, err = e.OpenCDCReader(ctx, dsn)
-	if err != nil {
-		t.Fatalf("OpenCDCReader after restoring CACHE 1: %v", err)
-	}
-	if c, ok := reader.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
-}
+// The CACHE 1 preflight pin used to live here as
+// TestCDCReader_RefusesNonUnitSequenceCache. It was WIDENED and moved to
+// cdc_seqconfig_integration_test.go on 2026-08-07: CACHE is one of FOUR
+// sequence settings that can put an id at or below the stream's
+// watermark, and a gate covering one of four reads as broader than it
+// is. See TestCDCReader_RefusesSequenceConfigThatCanReissueIDs (which
+// carries the CACHE cell unchanged, plus the other three) and the defect
+// proof TestChangeLogAnchor_MinValueZeroStrandsTheChange.
 
 // assertSameSet compares emitted labels against the expected set,
 // naming what went missing — a dropped change is the failure this file

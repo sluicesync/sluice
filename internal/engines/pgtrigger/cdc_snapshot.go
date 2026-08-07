@@ -83,9 +83,10 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		)
 	}
 	// The anchor's gap-freedom case split and the poller's contiguity
-	// rule both rest on CACHE 1 monotonic id allocation (cdc_gapfree.go).
+	// rule both rest on ascending, never-reused monotonic id allocation
+	// (cdc_gapfree.go — CACHE 1, MINVALUE 1, INCREMENT 1, NO CYCLE).
 	// Refuse before the snapshot opens rather than mid-handoff.
-	if err := verifyChangeLogSequenceCache(ctx, db, cfg.schema); err != nil {
+	if err := verifyChangeLogSequence(ctx, db, cfg.schema); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

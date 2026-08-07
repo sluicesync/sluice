@@ -495,7 +495,22 @@ func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.SnapshotOpti
 // argument — it read as if being inside the tx bound the anchor to the
 // read view, and callers relied on that. The caller now owns the
 // ordering, and each caller documents why its order is safe.
+//
+// It shares [SchemaReader.CaptureBackupPosition]'s binlog preflight, and
+// for the same reason: without it the GTID arm encoded an empty
+// `@@global.gtid_executed` on a `log_bin=OFF` source into a
+// well-formed-looking cursor that resumes nothing. Both capturers had
+// that defect; fixing one and not the other is the sibling gap this
+// project keeps paying for.
 func captureBackupPosition(ctx context.Context, conn *sql.Conn, flavor Flavor) (ir.Position, error) {
+	on, err := binlogEnabled(ctx, conn)
+	if err != nil {
+		return ir.Position{}, err
+	}
+	if !on {
+		warnNoBinlogCursor(ctx)
+		return ir.Position{}, nil
+	}
 	useGTID, err := gtidModeOnFor(ctx, conn, flavor)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("detect gtid mode: %w", err)

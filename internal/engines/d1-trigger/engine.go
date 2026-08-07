@@ -39,7 +39,11 @@
 // The CDC poll uses D1's DEFAULT primary (strongly-consistent) query path, NOT
 // the Sessions/read-replica routing: the exactly-once `id > watermark` invariant
 // rests on commit-order = id-order, which holds at the write-serialised primary
-// but can wobble against a lagging replica.
+// but can wobble against a lagging replica. The poll reaches the network only
+// through [sqlite.D1Conn], whose doc names what enforces this and the test that
+// fails if someone adds Sessions routing
+// (TestD1Transport_NeverRoutesThroughTheSessionsAPI), plus the one residual
+// stated there as an UNVERIFIED PREMISE.
 package d1trigger
 
 import (

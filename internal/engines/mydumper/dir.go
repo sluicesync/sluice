@@ -59,11 +59,23 @@ type tableFiles struct {
 
 	// metadataRows is the dump's OWN recorded row count for this table,
 	// when it recorded one: the ini `rows =` entry in the dump-wide
-	// metadata file (mydumper ≥0.12; ground-truthed exact against
-	// v1.0.3) or, failing that, a bare-integer per-table `-metadata`
-	// companion (older mydumper; pscale-dump writes the companion but
-	// leaves it EMPTY, so absence is normal). Consumed by
-	// [dumpDir.warnIfRowCountMismatch] as a post-stream tripwire.
+	// metadata file (mydumper ≥0.12) or, failing that, a bare-integer
+	// per-table `-metadata` companion (older mydumper; pscale-dump
+	// writes the companion but leaves it EMPTY, so absence is normal).
+	// Consumed by [dumpDir.warnIfRowCountMismatch] as a post-stream
+	// tripwire.
+	//
+	// "Real mydumper writes a count this parser recognises, and it is
+	// exact" is an environmental premise, not a property of this code,
+	// and the whole tripwire is inert without it — a changed key or
+	// section spelling would leave hasMetadataRows false everywhere with
+	// every unit pin still green, because those pins are hand-written
+	// fixtures. It is therefore ground-truthed rather than asserted, by
+	// TestMydumperIntegration_RealDumpEndToEnd's
+	// real-mydumper-records-parsable-exact-row-counts leg, which reads
+	// the counts a real mydumper wrote and compares them against
+	// COUNT(*) on the live source — a number from neither the dump nor
+	// this package.
 	metadataRows    int64
 	hasMetadataRows bool
 }

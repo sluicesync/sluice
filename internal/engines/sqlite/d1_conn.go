@@ -33,6 +33,19 @@ import (
 // exactly-once `id > watermark` invariant rests on commit-order = id-order,
 // which holds at the write-serialised primary but can wobble against a lagging
 // replica. A replica-aware mode would have to re-introduce a safety-lag.
+//
+// That is enforced, not merely intended: [d1Client.queryRows] is the single
+// request builder every D1 read, write, setup DDL and CDC poll funnels through;
+// it constructs the `/query` URL in process and sets exactly two headers, so
+// there is no route by which a poll reaches a replica. Pinned by
+// TestD1Transport_NeverRoutesThroughTheSessionsAPI (path + session headers +
+// body) and TestD1EndpointBase_IsNotOperatorSettable (no DSN parameter can
+// re-point it) — the point being that ADDING Sessions routing is an attractive
+// latency win that nothing else in the tree would notice.
+//
+// UNVERIFIED PREMISE, in those words, for the residual: that Cloudflare serves
+// the D1 REST `/query` endpoint from the primary is THEIR contract, not
+// sluice's, and no test here can hold them to it.
 type D1Conn struct {
 	c *d1Client
 }
