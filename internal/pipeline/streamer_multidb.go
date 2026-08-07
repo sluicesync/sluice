@@ -749,6 +749,34 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
 		}
+		// Roadmap item 140, the multi-database sibling. This fan-out is the
+		// one copy entry point of the six that was neither covered nor named
+		// by the first cut; a target database branched from an existing one
+		// dies on Error 1452 / SQLSTATE 23503 here exactly as it does on the
+		// single-database path, N-1 databases into the run. See
+		// migrate_existing_tables_fks.go for the full entry-point roster and
+		// the three exemptions.
+		//
+		// Only this branch: the two above drop the in-scope target tables
+		// first, so nothing pre-existing survives to find — the same reason
+		// the single-database gate lives in its own default branch alone.
+		// The gate is built with THIS database's resolved targetDSN /
+		// targetSchema, not the server DSN, because a catalog is per
+		// database. Shape-compare is deliberately not run here (the fan-out
+		// creates every in-scope table); this is the FK verdict only.
+		fkGate := &existingTablesGate{
+			Source:              s.Source,
+			Target:              s.Target,
+			TargetDSN:           targetDSN,
+			TargetSchema:        targetSchema,
+			EnabledPGExtensions: s.EnabledPGExtensions,
+			Mode:                "sync cold-start",
+		}
+		if err := fkGate.readAndCheckPreExistingForeignKeys(ctx, schema); err != nil {
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
+			return err
+		}
 	}
 
 	slog.InfoContext(ctx, "multi-database: copying database from the spanning snapshot",

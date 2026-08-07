@@ -619,12 +619,20 @@ func foldMySQLIdentifier(name string) string {
 //     this engine tests `!= 0` rather than `== 1` and reads the EFFECTIVE
 //     global rather than trusting the operator's configured intent.
 //
-// One connection, one variable read. dsn may be a server DSN (database
-// component optional) — the setting is global.
+// One connection, one variable read — ONCE PER SERVER, not once per call.
+// dsn may be a server DSN (database component optional) because the setting is
+// global, and that same property is why the answer is memoised: both callers
+// are per-namespace and one of them is a fan-out, so this ran ~2× per database.
+// See lower_case_table_names_memo.go for the key, the successes-only rule, and
+// the runtime-immutability premise that licenses it.
 func (e Engine) lowerCaseTableNames(ctx context.Context, dsn string) (int, error) {
 	cfg, err := parseServerDSN(dsn)
 	if err != nil {
 		return 0, err
+	}
+	key := lctMemoKey(cfg)
+	if lct, ok := lookupLCT(key); ok {
+		return lct, nil
 	}
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
@@ -632,7 +640,12 @@ func (e Engine) lowerCaseTableNames(ctx context.Context, dsn string) (int, error
 	}
 	defer func() { _ = db.Close() }()
 
-	return readLowerCaseTableNames(ctx, db)
+	lct, err := readLowerCaseTableNames(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	rememberLCT(key, lct)
+	return lct, nil
 }
 
 // FoldNamespace implements [ir.NamespaceFolder]: it reports the MySQL

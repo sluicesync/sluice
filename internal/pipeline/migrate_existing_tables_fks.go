@@ -53,19 +53,79 @@ package pipeline
 // server, by TestMigrate_PreExistingTargetForeignKeys_MySQL's skip-flag
 // leg, which reads the constraint back off the target after the refusal.
 //
-// # Which paths this reaches, stated so it cannot be read as broader
+// # Which entry points this reaches — the roster, not a promise
 //
-// The check lives on [existingTablesGate], so it reaches exactly that
-// gate's two callers — migrate's non-resume cold start and the sync
-// cold-start default branch — and inherits ADR-0166's skip rules
-// verbatim. Deliberately NOT covered, each for the reason the branch
-// already carries: --reset-target-data and --restart-from-scratch (the
-// in-scope tables are dropped and recreated constraint-free, so nothing
-// pre-existing survives to find), --schema-already-applied (the operator
-// has explicitly opted out of the target round-trips this check needs),
-// and --resume / the interrupted-COPY resume (a resumed run may have
-// already finished its FK-bearing tables, so a refusal there could be a
-// false positive; the resume contract is unchanged).
+// The first cut of this check lived only on [existingTablesGate] and
+// therefore only on that gate's two constructors. The gate's doc named
+// four exclusions honestly, but all four were BRANCHES INSIDE those two
+// callers, so the four sibling COPY ENTRY POINTS went unmentioned — the
+// sibling-sweep shape CLAUDE.md exists to stop, in the half that keeps
+// getting missed. The entry-point set is
+// [indexPreflightEntryPoints] — the same six declarations items 147/148/
+// 149 each reached for one line — and every one of them is now covered
+// or exempt WITH A REASON, held to that roster by
+// TestPreExistingFKCheckNamesEveryCopyEntryPoint:
+//
+//	migrate                     COVERED via existingTablesGate.plan
+//	sync cold-start, single DB  COVERED via existingTablesGate.plan
+//	sync cold-start, multi DB   COVERED via readAndCheckPreExistingForeignKeys
+//	add-table                   EXEMPT — see below
+//	restore                     EXEMPT — see below
+//	chain restore               EXEMPT — see below (and with it
+//	                            `sync from-backup`, whose cold-start
+//	                            reset leg IS a ChainRestore)
+//
+// The multi-database fan-out was the one genuine sibling. It runs a
+// FIRST copy per database exactly as its single-database twin does, it
+// carries the same --reset-target-data / --restart-from-scratch branches
+// that make those cases moot, and a target branched from an existing
+// database fails there identically — per database, N-1 databases in.
+// Its own stripForeignKeys call is not a defence: that governs the
+// constraints sluice would CREATE, never one the target already has,
+// which is the same reason --skip-foreign-keys is not an exemption.
+//
+// # The three exemptions, and the single property they share
+//
+// This check cannot tell a foreign key the target was BRANCHED with from
+// one an earlier sluice run CREATED. Both read back from the catalog
+// identically. On an entry point whose contract is "run me again and I
+// converge", that ambiguity turns the refusal into a refusal for having
+// worked — which is exactly why --resume is excluded above, and it is
+// the same argument for all three:
+//
+//   - restore: idempotent by contract (CREATE TABLE IF NOT EXISTS +
+//     upsert). The re-run of a completed restore reads back the foreign
+//     keys its own constraints phase created, every parent in scope.
+//   - chain restore: worse than a re-run — it is BUILT out of them.
+//     [ChainRestore.applyFull] re-enters [Restore.Run] once per segment,
+//     segment 0 establishing schema, indexes AND constraints, so every
+//     segment from 1 on would meet segment 0's own foreign keys.
+//   - add-table: the scoped schema holds tables that are NOT on the
+//     target yet, so `actual[t.Name]` misses and the check is a no-op by
+//     construction — while the catalog read it needs is not free. A
+//     check that can only be vacuous or wrong is worth naming, not
+//     wiring.
+//
+// None of the three is exempt for being cheap or unimportant: a restore
+// onto a branched target hits Error 1452 exactly as a cold copy does.
+// The residual is REAL and it is filed, not implied — see the roadmap
+// entry for item 140 and gap 20 in docs/dev/perf-parity-matrix.md. What
+// would close it is a signal this check does not have: knowing whether a
+// constraint on the target predates this chain (a restore-time marker,
+// or comparing against the archive's own recorded schema rather than
+// against the in-scope name set).
+//
+// # The branch-level exclusions, unchanged
+//
+// Within the covered entry points the check inherits ADR-0166's skip
+// rules verbatim. Deliberately NOT covered, each for the reason the
+// branch already carries: --reset-target-data and --restart-from-scratch
+// (the in-scope tables are dropped and recreated constraint-free, so
+// nothing pre-existing survives to find), --schema-already-applied (the
+// operator has explicitly opted out of the target round-trips this check
+// needs), and --resume / the interrupted-COPY resume (a resumed run may
+// have already finished its FK-bearing tables, so a refusal there could
+// be a false positive; the resume contract is unchanged).
 
 import (
 	"context"
@@ -81,6 +141,38 @@ import (
 // the remainder is summarized as a count so a wide schema doesn't
 // produce a page of error.
 const preExistingFKsShown = 5
+
+// readAndCheckPreExistingForeignKeys is the form for a caller that has
+// NOT already read the target catalog: it takes the read itself, then
+// runs the same verdict. The multi-database sync fan-out is its only
+// caller — that path deliberately runs no shape compare (it creates
+// every in-scope table, which the nil create-subset already means), so
+// there is no existing read for the check to ride.
+//
+// The read is the cost this form adds and it is PER DATABASE, because a
+// catalog is per database — the one thing about it that is not cacheable
+// the way the server-level fold is. It is skipped entirely on a target
+// whose copy path bypasses FK enforcement, and on an empty scope, so a
+// SQLite target and a no-op iteration pay nothing. Recorded in the
+// perf-parity matrix's preflight-cost row rather than left to be
+// discovered.
+//
+// A catalog that cannot be read is WARNed and waved through by
+// [existingTablesGate.readTargetTablesForShapeGate], never a new failure
+// mode — the same fallback the covered paths get.
+func (g *existingTablesGate) readAndCheckPreExistingForeignKeys(ctx context.Context, schema *ir.Schema) error {
+	if schema == nil || len(schema.Tables) == 0 {
+		return nil
+	}
+	if g.Target.Capabilities().BulkCopyBypassesForeignKeys {
+		return nil
+	}
+	actual, ok := g.readTargetTablesForShapeGate(ctx)
+	if !ok || len(actual) == 0 {
+		return nil
+	}
+	return g.checkPreExistingForeignKeys(ctx, schema, actual)
+}
 
 // checkPreExistingForeignKeys refuses (coded) when the target already
 // carries a foreign key on an in-scope table whose parent this same run
