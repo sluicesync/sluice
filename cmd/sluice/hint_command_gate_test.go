@@ -33,6 +33,7 @@ import (
 	"go/parser"
 	"go/token"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -86,16 +87,40 @@ func TestHintRegistryTextsNameOnlyFlagsTheirCommandAccepts(t *testing.T) {
 			continue
 		}
 
-		for _, cmd := range targets {
-			for _, name := range climsggate.BareFlags(ht.Text) {
-				if flags[cmd][name] {
-					continue
+		// Reported per FLAG, not per (flag, command): the neutral text is
+		// graded against ~46 commands, and one line each would bury the one
+		// fact that matters — which flag — under a wall of repeats.
+		for _, name := range climsggate.BareFlags(ht.Text) {
+			var missing []string
+			for _, cmd := range targets {
+				if !flags[cmd][name] {
+					missing = append(missing, "`sluice "+cmd+"`")
 				}
-				t.Errorf("hint %s names --%s in the text shown to `sluice %s`, which has no such flag.\n"+
-					"  text: %s\n%s", ht.Code, name, cmd, ht.Text, bareFlagRemedy(ht.Command))
 			}
+			if len(missing) == 0 {
+				continue
+			}
+			t.Errorf("hint %s names --%s in a text shown to %s, which %s no such flag.\n  text: %s\n%s",
+				ht.Code, name, summarize(missing), plural(len(missing), "has", "have"),
+				ht.Text, bareFlagRemedy(ht.Command))
 		}
 	}
+}
+
+// summarize renders a command list as at most three names plus a count, so a
+// neutral-text failure reads as one fact rather than forty.
+func summarize(cmds []string) string {
+	if len(cmds) <= 3 {
+		return strings.Join(cmds, ", ")
+	}
+	return strings.Join(cmds[:3], ", ") + " and " + strconv.Itoa(len(cmds)-3) + " other command(s)"
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // bareFlagRemedy is the failure message's second half: what to do about it,
