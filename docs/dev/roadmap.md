@@ -1856,7 +1856,7 @@ The deferrable-key preflight refusal reaches `schema add-table` with its full pr
 **Root cause, and why the fix is the class not the instance.** `migcore.WrapWithHint` matched on message SUBSTRINGS and then *unconditionally* built a fresh `sluicecode.CodedError`, discarding whatever code the error already carried. The bulk-copy catch-all matches `"pipeline: copy table"`, which is the prefix every copy caller wraps with — so ANY precisely-coded refusal travelling up through that path was re-coded, and because `CodedError.ExitCode()` derives from the code's class, the exit status changed with it. A more specific substring entry for the deferrable case would have fixed the one report and left the class open; instead `WrapWithHint` now returns an already-coded error untouched. Confirmed by mutation: disabling the guard reproduces `SLUICE-E-BULKCOPY-TABLE-FAILED` / exit 1 exactly.
 
 The generic hint was not merely redundant in these cases but wrong — the bulk-copy catch-all tells the operator earlier tables are missing their secondary indexes, and a refusal by definition copied nothing. Pinned both directions in `hints_coded_passthrough_test.go`: a coded refusal survives intact, and a bare engine error still gets the phase code and remedy (the hint layer's actual job).
-### 146. A cold copy whose target connection dies mid-`LOAD DATA` HANGS FOREVER — Bug 229 — *✅ FIXED on a branch 2026-08-06, awaiting review/land. THIS IS A CONCURRENCY CHUNK (the watchdog is a new goroutine over shared progress state), so CI's `-race` Integration job must be green BEFORE any tag.*
+### 146. A cold copy whose target connection dies mid-`LOAD DATA` HANGS FOREVER — Bug 229 — *✅ SHIPPED v0.114.0. It was a CONCURRENCY CHUNK (the watchdog is a new goroutine over shared progress state), so CI's `-race` Integration job was required green before the tag — and was.*
 
 **Implementation notes.**
 
@@ -1904,7 +1904,7 @@ The second row is why item 148's connection-free `ir.TableEmitPreflighter` canno
 
 **149b (lower severity, same sweep): the trigger engines' change-log tables are adopted silently.** `sqlite-trigger/setup.go` and `pgtrigger/setup.go` both render `CREATE TABLE IF NOT EXISTS sluice_change_log` (plus the meta / columns / consumer tables), so a pre-existing user table of that name is not refused — setup proceeds against it and the first captured change fails on a missing column, **on the operator's own write path, after the triggers are installed**. Filed rather than fixed with item 148 because the honest check is a per-table SHAPE probe (expected column set vs. the catalog) needing a new query on the `executor` interface for BOTH sqlite-trigger transports (local file and D1-over-HTTP) plus the Postgres twin; existence alone is not a usable signal, because a legitimate re-`setup` finds the table every time. The gap is recorded at both `renderSetupDDL` sites so the next reader of either finds it. The trigger DDL itself is NOT a member — both engines emit `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is loud.
 
-### 148. SQLite `CREATE TABLE IF NOT EXISTS` has the identical silent no-op, and it LOSES ROWS — *✅ FIXED on a branch 2026-08-06, awaiting review/land. NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 148. SQLite `CREATE TABLE IF NOT EXISTS` has the identical silent no-op, and it LOSES ROWS — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk (no goroutine/channel/FSM/shared-state change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -1965,7 +1965,7 @@ Nothing refuses either route today.
 
 </details>
 
-### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *✅ FIXED on a branch 2026-08-06, awaiting review/land. NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 147. SQLite `CREATE VIEW IF NOT EXISTS` against an existing table or view is a SILENT no-op, so a view is lost — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -2003,7 +2003,7 @@ SQLite index names are schema-scoped, which is item 134. Ground-truthing that tu
 
 Needs its own error code rather than borrowing `SLUICE-E-SCHEMA-INDEX-NAME-COLLISION` — a view colliding with a table is not an index-namespace problem, and the remedy differs. Recorded at the check in `sqlite/index_namespace.go` and in item 134's roster gate scope note, so the next reader of either finds it.
 
-### 144. The tier cap fails OPEN, so a PlanetScale dev branch is driven at DOUBLE the fan-out of a production branch on the same tier — *✅ FIXED on a branch 2026-08-06, awaiting review/land. NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 144. The tier cap fails OPEN, so a PlanetScale dev branch is driven at DOUBLE the fan-out of a production branch on the same tier — *✅ SHIPPED v0.114.0. NOT a concurrency chunk (no goroutine/channel/FSM change), so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes — and the first one changes this entry's own diagnosis, so read it before the rest.**
 
@@ -2043,7 +2043,7 @@ Needs its own error code rather than borrowing `SLUICE-E-SCHEMA-INDEX-NAME-COLLI
 <details>
 <summary>Original report (kept for provenance — note its mechanism is corrected above)</summary>
 
-### 145. A `json[]` / `jsonb[]` column cannot reach a Postgres target either — *✅ FIXED on a branch 2026-08-06, awaiting review/land. NOT a concurrency chunk, so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
+### 145. A `json[]` / `jsonb[]` column cannot reach a Postgres target either — *✅ FIXED on `main` 2026-08-06 (unreleased — ships after v0.114.0). NOT a concurrency chunk, so the `-race` Integration job is the ordinary gate, not a pre-tag requirement.*
 
 **Implementation notes (2026-08-06).**
 
@@ -2069,12 +2069,12 @@ Item 141's divergence map (`TestEveryDecodableArrayElementIsWritable`) compares 
 
 **Scope note:** the value shapes differ per door. The SQL read path decodes `ir.JSON` to `[]byte` (`decodeBytes`); the pgtrigger payload path delivers a decoded JSON value. The leaf has to accept both, like `byteaArrayLeaf` does, and the refusal for anything else must be loud. The gate entry in `pgUnwritableArrayElement` is the tracking anchor — closing this item means deleting that entry, which the gate's other direction enforces.
 
-### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *✅ FIXED on branch 2026-08-05 (the GATE half; the second lane's ceiling had already landed). `-race` Integration must be green before the tag — the fix's subject is the streamer's rollover path.*
+### 142. The change-chunk byte ceiling reached ONE of the two lanes that write change chunks — *✅ SHIPPED v0.114.0. `-race` Integration was green before the tag — the fix's subject is the streamer's rollover path.*
 </details>
 
 A third version-pair was recorded during the fix's validation (2026-08-06, a freshly created PS-10): production 8.4.9-Vitess / dev 8.4.11-Vitess. Three databases, three pairs, no two alike — which settles the entry's own advice: the version pair is not a publishable fact, the INVARIANT is.
 
-### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *✅ FIXED on `main` (unreleased). `byteaArrayLeaf` + the two-door divergence map `TestEveryDecodableArrayElementIsWritable`. The gate surfaced a THIRD unwritable family on its first run — `json[]`/`jsonb[]` — recorded as an explicit exemption rather than fixed; see the impl notes below.*
+### 141. A `bytea[]` column cannot reach a Postgres target at all — the writer has no element leaf for it — *✅ SHIPPED v0.114.0. `byteaArrayLeaf` + the two-door divergence map `TestEveryDecodableArrayElementIsWritable`. The gate surfaced a THIRD unwritable family on its first run — `json[]`/`jsonb[]` — recorded as an explicit exemption rather than fixed; see the impl notes below.*
 
 **Impl notes (2026-08-05).**
 
@@ -2122,7 +2122,7 @@ Their own read was right: "wouldn't have been an issue on a totally new db." Tha
 
 </details>
 
-### 139. Connection ACQUISITION bypasses the transient-error classifier, so a vtgate drop between batches kills the run — *✅ FIXED on `main` (unreleased). `RowWriter.acquireConnWithRetry` + the AST roster `TestEveryRowWriterConnAcquireRidesTheTransientRetry`. **`-race` Integration must be green before the tag** — the helper runs on the fan-out worker goroutines and trips the shared grow gate.*
+### 139. Connection ACQUISITION bypasses the transient-error classifier, so a vtgate drop between batches kills the run — *✅ SHIPPED v0.114.0. `RowWriter.acquireConnWithRetry` + the AST roster `TestEveryRowWriterConnAcquireRidesTheTransientRetry`. **`-race` Integration must be green before the tag** — the helper runs on the fan-out worker goroutines and trips the shared grow gate.*
 
 **Impl notes (2026-08-05).**
 
@@ -2195,7 +2195,7 @@ Totalled across the run: **4369.3s closed vs 1015.8s open — 81.1% quiesced.** 
 
 </details>
 
-### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *✅ RESOLVED on a branch 2026-08-06 as a CLAIM fix, not a behaviour change; awaiting review/land. NOT a concurrency chunk by subject (no goroutine/channel/FSM change — one field added to the gate's mu-guarded state and one interface parameter), but the file it touches IS the coordinator, so read the `-race` Integration job before the tag.*
+### 143. The grow gate's trip signal is an inference, so a transport drop opens a storage-grow window — *✅ RESOLVED on `main` 2026-08-06 as a CLAIM fix, not a behaviour change (unreleased — ships after v0.114.0). NOT a concurrency chunk by subject (no goroutine/channel/FSM change — one field added to the gate's mu-guarded state and one interface parameter), but the file it touches IS the coordinator, so read the `-race` Integration job before the tag.*
 
 **Phase A's answer to the crux question is NO, and that is the finding.** sluice cannot distinguish a real storage-grow reparent from a plain transport drop at the point the gate trips, so an evidence-GATED trip is not available and the honest fix is the claim, not the trigger.
 
@@ -2233,7 +2233,7 @@ Fix direction: split the trip decision from the retry decision — retriability 
 
 </details>
 
-### 137. The copy retry budget is keyed by chunk index alone, so two tables share one chunk's budget — *✅ FIXED on branch 2026-08-05. `-race` Integration must be green before the tag — the subject is the run-wide copy gate's shared state.*
+### 137. The copy retry budget is keyed by chunk index alone, so two tables share one chunk's budget — *✅ SHIPPED v0.114.0. `-race` Integration was green before the tag — the subject is the run-wide copy gate's shared state.*
 
 `attemptsByChunk` / `waitByChunk` in `copy_parallelism_gate.go` were keyed by chunk index, and the comment justifying that ("the gate is constructed per table, so the index is unique within a gate") was **false under the ADR-0123 run-wide gate**: table A's chunk 3 and table B's chunk 3 shared a retry budget. Item 126's per-chunk bound could therefore fire earlier than advertised.
 
@@ -2302,7 +2302,7 @@ The run-wide gate is necessary, not merely aggravating: the same harness on a pe
 
 **MySQL sibling — narrower than reported.** `mysql/row_writer.go:880-887` sniffs, but guarded by `ir.Binary/Varbinary/Blob` AND `v.(string)`. Every reader producing genuinely-binary blob values hands `[]byte`; the only production producer of a `string` there is the pgtrigger reader, where the value IS PG bytea text and hex decoding is correct. Residual is narrow: a PG `text` column `--type-override`n to `varbinary` whose content spells `\x`+hex. Fix by the same provenance discipline, not by more sniffing.
 
-### 134. SQLite index emit uses `IF NOT EXISTS` with a bare name and no collision check — *✅ FIXED (unreleased). The 08-04 HIGH that was never filed.*
+### 134. SQLite index emit uses `IF NOT EXISTS` with a bare name and no collision check — *✅ SHIPPED v0.114.0. The 08-04 HIGH that was never filed.*
 
 `sqlite/ddl_emit.go:507`. The one 08-04 HIGH-family finding that got neither a fix nor an item: `f442e9d3`'s commit message said "the three audit HIGHs still open" and silently dropped the fourth. SQLite index names are SCHEMA-scoped, not table-scoped, so two tables' same-named indexes collide — and because the emit uses `CREATE INDEX IF NOT EXISTS` with a bare name, the collision is a **silent no-op**: the second table is left without the index the source declared. Same shape as item 120 (the PG `SLUICE-E-SCHEMA-INDEX-NAME-COLLISION` path), on the engine that has no such check.
 
@@ -2316,7 +2316,7 @@ The run-wide gate is necessary, not merely aggravating: the same harness on a pe
 
 **Named, not fixed here — and FIXED as item 147 (2026-08-06): the VIEW sibling.** Ground-truthing turned up a second silent `IF NOT EXISTS` no-op on the same engine — `CREATE VIEW IF NOT EXISTS "a"` against an existing TABLE or view `a` returns OK and creates nothing, so a view whose name collides with a table is silently dropped. (The index-vs-table pair is the opposite: LOUD, `there is already a table named a`, with or without IF NOT EXISTS.) It loses a view rather than an index and needs its own error code, so it is recorded at the check and here rather than folded in.
 
-### 133. `--where` on an `ir.Inet` column freezes a filtered sync at exit 0 — *✅ FIXED (unreleased). Live-verified, and the residual that was said to be filed but never was.*
+### 133. `--where` on an `ir.Inet` column freezes a filtered sync at exit 0 — *✅ SHIPPED v0.114.0. Live-verified, and the residual that was said to be filed but never was.*
 
 `rowpredicate/identifier_literal.go:161`. `ir.Inet` is an empty struct — it carries no family discriminator — and MariaDB's INET6 stores `'10.0.0.1'` as `::ffff:10.0.0.1`. So a `--where ip = '10.0.0.1'` matches server-side during the cold copy and NEVER matches in the client-side CDC evaluator: the sync freezes, having caught up, at exit 0. **Live-verified on mariadb:11.4.**
 
