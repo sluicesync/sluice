@@ -43,18 +43,51 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestGrowGate_EvidenceIsDescriptiveOnlyAndNeverChangesTheHold drives three
-// otherwise-identical gates through the same trip sequence, differing only in
-// the evidence value, and requires the window holds to match exactly.
+// TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds is the
+// item-154 replacement for TestGrowGate_EvidenceIsDescriptiveOnlyAndNever-
+// ChangesTheHold, which pinned the OPPOSITE property and was removed
+// deliberately rather than widened.
 //
-// The INDEPENDENT expected value is the OTHER gate's observed holds — not
-// anything the gate reports about its own intent — so a change that made the
-// timing evidence-dependent fails here regardless of how it is documented.
-func TestGrowGate_EvidenceIsDescriptiveOnlyAndNeverChangesTheHold(t *testing.T) {
+// # What changed and why the old pin had to go
+//
+// Item 143 derived [ir.GrowEvidence] and left it descriptive, on the argument
+// that a real grow reparent is not reliably distinguishable from a transport
+// drop AT THE TRIP POINT. Item 154 keeps exactly that argument for the trip
+// point and rejects it for the tenth consecutive re-trip: by then the episode
+// has produced no evidence at all across many armed-held-reopened-refuted
+// windows, and "this is a bounded serving transition" is no longer an
+// unfalsified hypothesis. See [GrowGateEvidenceFreeHoldCap] for the full
+// argument, including why prompt re-trip could NOT have been the
+// discriminator.
+//
+// # The two halves, because either alone is a wrong pin
+//
+// EARLY rungs must stay evidence-INDEPENDENT. That is the half item 143 was
+// right about and the half ADR-0110's shield actually rides on: the first hold
+// an episode takes is identical whatever the lane observed, so a real grow
+// that announces itself only in a way this codebase does not recognise is
+// still quiesced exactly as before.
+//
+// DEEP rungs must diverge. That is the fix: an episode that has never produced
+// evidence stops climbing at the cap, while an evidenced episode keeps the
+// full ladder.
+//
+// The INDEPENDENT expected value for both halves is the OTHER gate's observed
+// holds, measured in this run — not a constant written down here and not
+// anything a gate reports about its own intent.
+func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing.T) {
 	captureSlog(t)
-	withScaledGrowGate(t, 20*time.Millisecond, 400*time.Millisecond, time.Hour, time.Hour, 1.0)
+	const (
+		base = 20 * time.Millisecond
+		// The cap sits exactly on rung 3 (20 → 40 → 80), so rungs 1-3 are
+		// below-or-at it and must match across evidence values, while rungs
+		// 4+ are where an evidenced episode pulls away.
+		evidenceFreeCap = 80 * time.Millisecond
+		windows         = 6
+		sharedRungs     = 3
+	)
+	withScaledGrowGate(t, base, 1600*time.Millisecond, evidenceFreeCap, time.Hour, time.Hour, 1.0)
 
-	const windows = 4
 	holds := map[ir.GrowEvidence][]time.Duration{}
 	for _, ev := range []ir.GrowEvidence{ir.GrowEvidenceNone, ir.GrowEvidenceTargetFace, ir.GrowEvidenceTelemetry} {
 		g := NewGrowGate(context.Background(), nil)
@@ -76,30 +109,134 @@ func TestGrowGate_EvidenceIsDescriptiveOnlyAndNeverChangesTheHold(t *testing.T) 
 		}
 	}
 
-	base := holds[ir.GrowEvidenceNone]
-	// Anti-vacuity: the ladder must actually have climbed, or "identical" would
-	// be trivially true of a gate that did nothing.
-	if len(base) != windows || base[len(base)-1] <= base[0] {
-		t.Fatalf("the escalation ladder did not climb across %d windows (%v); the comparison below would be vacuous", windows, base)
+	free := holds[ir.GrowEvidenceNone]
+	// Anti-vacuity for the shared half: the early ladder must actually climb,
+	// or "identical" below would be trivially true of a gate that did nothing.
+	if free[sharedRungs-1] <= free[0] {
+		t.Fatalf("the ladder did not climb over its first %d rungs (%v); the comparison below would be vacuous",
+			sharedRungs, free)
 	}
+
 	for _, ev := range []ir.GrowEvidence{ir.GrowEvidenceTargetFace, ir.GrowEvidenceTelemetry} {
 		got := holds[ev]
-		for i := range base {
-			// Generous slack: the property is "the evidence is not an input",
-			// and any evidence-driven ladder would diverge by a factor, not by
-			// timer jitter.
-			lo, hi := base[i]/2, base[i]*2
+
+		// HALF ONE: the early rungs are evidence-independent.
+		for i := range sharedRungs {
+			lo, hi := free[i]/2, free[i]*2
 			if got[i] < lo || got[i] > hi {
 				t.Errorf(
-					"window %d: evidence=%s held %v but evidence=%s held %v — the gate's TIMING is reading the "+
-						"evidence. Item 143 deliberately kept the verdict descriptive: a real grow reparent is not "+
-						"reliably distinguishable from a transport drop at the trip point, so quiescing less on "+
-						"'no evidence' risks missing the event the gate exists for. If that decision is being "+
-						"reversed, revisit ADR-0110 and this test's doc — do not just widen the bound",
-					i+1, ev, got[i], ir.GrowEvidenceNone, base[i],
+					"window %d: evidence=%s held %v but evidence=%s held %v — the EARLY rungs must not depend on "+
+						"the evidence. Item 154 caps only the deep escalation precisely so that a real grow which "+
+						"presents without a recognised face is still quiesced normally at the trip point; making "+
+						"the first hold evidence-dependent gives up item 143's actual safety argument",
+					i+1, ev, got[i], ir.GrowEvidenceNone, free[i],
 				)
 			}
 		}
+
+		// HALF TWO: the deep rungs diverge. This is the livelock fix itself.
+		lastFree, lastEv := free[windows-1], got[windows-1]
+		if lastEv <= 3*lastFree {
+			t.Errorf(
+				"window %d: evidence=%s held %v and evidence=%s held %v — an episode that has produced NO grow "+
+					"evidence across %d refuted windows is escalating just as deep as one that has, which is the "+
+					"2026-08-05 livelock (246 windows, 2,687 drops, zero reparent evidence, ladder pinned at its "+
+					"cap). See [GrowGateEvidenceFreeHoldCap] (item 157)",
+				windows, ev, lastEv, ir.GrowEvidenceNone, lastFree, windows,
+			)
+		}
+		if lastFree > evidenceFreeCap*2 {
+			t.Errorf(
+				"window %d: an evidence-free episode held %v, above its declared cap of %v — the cap is not "+
+					"binding, so nothing bounds an evidence-free storm's hold",
+				windows, lastFree, evidenceFreeCap,
+			)
+		}
+	}
+}
+
+// TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder pins the
+// two state transitions [GrowGate.episodeSawGrowEvidence] has, which the
+// behavioural gate above only observes in aggregate.
+//
+// Both directions matter and they fail differently. If evidence did NOT stick
+// for the rest of an episode, a real grow whose drops mostly present as bare
+// transport errors would be demoted to the capped ladder by its own noise —
+// the false negative item 143 warned about, reintroduced. If it did NOT reset
+// with the ladder, one evidenced blip early in a multi-hour run would unlock
+// the deep ladder permanently and the livelock would return for every later
+// evidence-free storm.
+func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing.T) {
+	captureSlog(t)
+	const (
+		base = 20 * time.Millisecond
+		idle = 250 * time.Millisecond
+	)
+	withScaledGrowGate(t, base, 1600*time.Millisecond, base, idle, time.Hour, 1.0)
+
+	g := NewGrowGate(context.Background(), nil)
+	holds := make(chan time.Duration, 16)
+	g.onWindowClosed = func(d time.Duration) { holds <- d }
+	next := func() time.Duration {
+		select {
+		case d := <-holds:
+			return d
+		case <-time.After(10 * time.Second):
+			t.Fatal("no window observed")
+			return 0
+		}
+	}
+	// window drives one trip → reopen cycle and returns the hold taken.
+	window := func(ev ir.GrowEvidence) time.Duration {
+		g.Trip("lane transient", ev)
+		if err := g.Await(context.Background()); err != nil {
+			t.Fatalf("Await: %v", err)
+		}
+		return next()
+	}
+
+	// STICKINESS. One evidenced trip, then evidence-free trips in the same
+	// episode: the ladder must keep climbing past the cap.
+	window(ir.GrowEvidenceTargetFace)
+	var deepest time.Duration
+	for range 4 {
+		if d := window(ir.GrowEvidenceNone); d > deepest {
+			deepest = d
+		}
+	}
+	if deepest <= 2*base {
+		t.Errorf(
+			"after one EVIDENCED trip, four evidence-free trips in the same episode escalated only to %v "+
+				"(cap %v) — the evidence did not stick, so a real grow whose other drops present as bare "+
+				"transport errors is demoted to the capped ladder by its own noise",
+			deepest, base,
+		)
+	}
+
+	// RESET. A healthy stretch longer than the episode idle ends the episode;
+	// the next evidence-free STORM must be back under the cap.
+	//
+	// SEVERAL windows, not one, and a mutation run is why. The episode ladder
+	// resets to rung 1 independently of this flag, so the FIRST window after a
+	// healthy stretch holds exactly `base` whether or not the evidence flag
+	// reset with it — the cap is not binding at rung 1 and cannot be observed
+	// there. A single-window version of this check passed the mutant that
+	// deleted the reset outright. The divergence only appears once the ladder
+	// has had room to climb.
+	time.Sleep(idle + 150*time.Millisecond)
+	var deepestAfterReset time.Duration
+	for range 4 {
+		if d := window(ir.GrowEvidenceNone); d > deepestAfterReset {
+			deepestAfterReset = d
+		}
+	}
+	if deepestAfterReset > 2*base {
+		t.Errorf(
+			"after a healthy stretch, an evidence-free storm escalated to %v (cap %v) — the evidence flag did "+
+				"not reset with the episode ladder, so one evidenced blip early in a run unlocks the deep ladder "+
+				"for every later evidence-free storm and the livelock returns",
+			deepestAfterReset, base,
+		)
 	}
 }
 
@@ -117,7 +254,7 @@ func TestGrowGate_EvidenceIsDescriptiveOnlyAndNeverChangesTheHold(t *testing.T) 
 // So this asserts both halves: the derived verdict is PRESENT and correct, and
 // the unconditional cause-claim is ABSENT.
 func TestGrowGate_ClosedLogStatesTheObservedEvidenceAndNotACause(t *testing.T) {
-	withScaledGrowGate(t, 5*time.Millisecond, 20*time.Millisecond, time.Hour, time.Hour, 1.0)
+	withScaledGrowGate(t, 5*time.Millisecond, 20*time.Millisecond, 20*time.Millisecond, time.Hour, time.Hour, 1.0)
 
 	for _, tc := range []struct {
 		ev    ir.GrowEvidence

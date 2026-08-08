@@ -21,12 +21,23 @@
 // a 91-minute field run. So the property is stated as a PAIR, and neither
 // half is sufficient:
 //
-//   - a sustained drop storm must leave the copy most of the wall clock
-//     ([TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock]), and
+//   - an EVIDENCE-FREE drop storm must leave the copy most of its THROUGHPUT
+//     ([TestGrowGate_EvidenceFreeDropStormLeavesTheCopyMostOfItsThroughput],
+//     item 157) — stated in chunks copied against an ungated baseline, because
+//     "four chunks in the last sixty minutes" is the defect and a duty-cycle
+//     percentage is only a proxy for it;
+//   - a storm that rejects EVERY attempt must still be bounded by the declared
+//     quiesce share ([TestGrowGate_SustainedStormIsStillBoundedByTheShareCeiling],
+//     item 138); and
 //   - a sustained genuine grow must STILL quiesce meaningfully
 //     ([TestGrowGate_SustainedTroubleStillEscalatesToAMeaningfulQuiesce]) —
 //     the anti-vacuity half, which fails if anyone "fixes" the livelock by
 //     pinning the hold at its base or gutting the gate.
+//
+// The first two bound different things and neither implies the other: the
+// share ceiling is a fraction of wall clock, and a copy can satisfy it while
+// still making almost no progress, because half the clock spent in 30-second
+// units quantises a lane to one chunk per hold.
 //
 // [TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent] is the
 // direct regression pin on the root cause.
@@ -36,6 +47,7 @@ package migcore
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,19 +58,30 @@ import (
 // ceiling, episode idle, and the run-level quiesce share window — by a
 // constant factor so these gates run in seconds while preserving every RATIO
 // the production envelope has. Ratios are what the properties are about.
-func withScaledGrowGate(t *testing.T, base, capHold, episodeIdle, quiesceWindow time.Duration, share float64) {
+// evidenceFreeCap is an EXPLICIT parameter rather than a scaled-from-base
+// default on purpose. When [GrowGateEvidenceFreeHoldCap] was introduced, the
+// helper left it at its 1s production value while every test here scales the
+// ladder down to milliseconds — so the cap sat two orders of magnitude above
+// any hold the tests produced and the whole suite passed BLIND to the new
+// dimension. A green run in that state is indistinguishable from a green run
+// that actually covers the behaviour, which is the worst kind of pass. Making
+// it a parameter means a new test cannot silently omit it.
+func withScaledGrowGate(t *testing.T, base, capHold, evidenceFreeCap, episodeIdle, quiesceWindow time.Duration, share float64) {
 	t.Helper()
 	oBase, oCap, oHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
 	oIdle, oWin, oShare := GrowGateEpisodeIdle, GrowGateQuiesceWindow, GrowGateMaxQuiesceShare
+	oEvFree := GrowGateEvidenceFreeHoldCap
 	GrowGateBackoffBase = base
 	GrowGateBackoffCap = capHold
 	GrowGateMaxHold = capHold * 100
+	GrowGateEvidenceFreeHoldCap = evidenceFreeCap
 	GrowGateEpisodeIdle = episodeIdle
 	GrowGateQuiesceWindow = quiesceWindow
 	GrowGateMaxQuiesceShare = share
 	t.Cleanup(func() {
 		GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold = oBase, oCap, oHold
 		GrowGateEpisodeIdle, GrowGateQuiesceWindow, GrowGateMaxQuiesceShare = oIdle, oWin, oShare
+		GrowGateEvidenceFreeHoldCap = oEvFree
 	})
 }
 
@@ -68,11 +91,14 @@ func withScaledGrowGate(t *testing.T, base, capHold, episodeIdle, quiesceWindow 
 // ~4ms). The stagger is LOAD-BEARING for the pins below: a burst fired with
 // zero spacing is absorbed by any single-slot coalescing buffer and would let
 // the pre-fix code pass.
-func tripBurst(g *GrowGate, n int) {
+// ev is explicit for the same reason evidenceFreeCap is: since item 157 the
+// evidence value is a TIMING input, so a burst that did not say which
+// population it belongs to would be pinning an ambiguous thing.
+func tripBurst(g *GrowGate, n int, ev ir.GrowEvidence) {
 	var wg sync.WaitGroup
 	for range n {
 		wg.Add(1)
-		go func() { defer wg.Done(); g.Trip("lane transient", ir.GrowEvidenceNone) }()
+		go func() { defer wg.Done(); g.Trip("lane transient", ev) }()
 		time.Sleep(tripBurstStagger)
 	}
 	wg.Wait()
@@ -111,7 +137,7 @@ func TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent(t *testing.
 	// (32 lanes × 150µs ≈ 5ms) so a burst cannot straddle a window boundary
 	// and misalign the sequence; the cap is far above the base so a per-trip
 	// ladder has room to escalate visibly rather than being clipped.
-	withScaledGrowGate(t, 200*time.Millisecond, 8*time.Second, time.Hour, time.Hour, 1.0)
+	withScaledGrowGate(t, 200*time.Millisecond, 8*time.Second, 200*time.Millisecond, time.Hour, time.Hour, 1.0)
 
 	// held[lanes] = the first two window holds produced by bursts of that width.
 	held := make(map[int][]time.Duration)
@@ -125,7 +151,7 @@ func TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent(t *testing.
 			}
 		}
 		for range 2 {
-			tripBurst(g, lanes)
+			tripBurst(g, lanes, ir.GrowEvidenceTargetFace)
 			select {
 			case d := <-done:
 				held[lanes] = append(held[lanes], d)
@@ -163,11 +189,170 @@ func TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent(t *testing.
 	}
 }
 
-// TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock is the
-// livelock gate, stated as the field shape: a target that rejects every
-// attempt, with a full-width lane fan-out re-tripping the instant the gate
-// reopens, must not hold the copy closed for more than the gate's declared
-// share of the wall clock.
+// dropTarget models the target the 2026-08-05 field run actually hit: a
+// PlanetScale branch whose writes MOSTLY SUCCEED, with the transport dropping
+// at a steady rate that is a property of the target rather than of how hard
+// the lanes push it (the field log's drops-per-bucket were flat across 91
+// minutes: 176, 354, 336, 247, 290, 292, 255, 303, 313).
+//
+// This is the load-bearing difference from the "every attempt fails" model the
+// share-ceiling gate below uses. In that model the duty cycle is hold /
+// (hold + attempt) no matter what the hold is, so shortening the hold cannot
+// show up — only the share ceiling can bound it. The user's defect is the
+// opposite shape: one lane's drop parks FIFTEEN HEALTHY LANES that were
+// copying fine, and the cost of that is invisible unless the model has
+// healthy lanes in it to lose.
+type dropTarget struct {
+	mu       sync.Mutex
+	interval time.Duration
+	last     time.Time
+}
+
+// attempt performs one chunk write, reporting whether it landed.
+func (d *dropTarget) attempt(writeTime time.Duration) bool {
+	time.Sleep(writeTime)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if time.Since(d.last) < d.interval {
+		return true
+	}
+	d.last = time.Now()
+	return false
+}
+
+// runCopyLanes drives n cold-copy lanes against tgt for the given duration and
+// returns how many chunk writes LANDED. g may be nil, which is the ungated
+// baseline — the independent expected value the gated runs are scored against.
+func runCopyLanes(n int, g *GrowGate, ev ir.GrowEvidence, tgt *dropTarget, writeTime, run time.Duration) int64 {
+	ctx, cancel := context.WithTimeout(context.Background(), run)
+	defer cancel()
+
+	var landed atomic.Int64
+	var lanes sync.WaitGroup
+	for range n {
+		lanes.Add(1)
+		go func() {
+			defer lanes.Done()
+			for ctx.Err() == nil {
+				if g != nil {
+					if err := g.Await(ctx); err != nil {
+						return
+					}
+				}
+				if tgt.attempt(writeTime) {
+					landed.Add(1)
+					continue
+				}
+				if g != nil {
+					g.Trip("vtgate connection error: no endpoints", ev)
+				}
+			}
+		}()
+	}
+	lanes.Wait()
+	return landed.Load()
+}
+
+// TestGrowGate_EvidenceFreeDropStormLeavesTheCopyMostOfItsThroughput is the
+// item-154 livelock gate, and it is stated in the user's units — CHUNKS
+// COPIED — rather than in duty cycle, because "four chunks in the last sixty
+// minutes" is the defect and a duty-cycle number is only a proxy for it.
+//
+// The INDEPENDENT expected value is the throughput of the SAME lanes against
+// the SAME target with NO GATE AT ALL, measured by this test in this run. It
+// is not derived from the gate, from its ledger, or from any constant written
+// down here, so a change that made the gate mis-report its own quiescing
+// cannot move the baseline.
+//
+// # Why the share ceiling cannot substitute for this
+//
+// The run-level ceiling ([GrowGateMaxQuiesceShare], item 138) bounds quiesce
+// at half the wall clock, so the field's 81.1% is already impossible. Half is
+// still a 2× tax on a healthy sibling lane, and — the part the fraction hides
+// — it is spent in 30-SECOND UNITS: a lane that finishes a chunk one
+// millisecond after the gate closes waits a full cap-length hold before it may
+// start the next one, so its throughput is quantised to one chunk per hold no
+// matter what the duty cycle averages out to. The share is deliberately wide
+// open here so that ceiling cannot mask what this gate measures; the ceiling
+// has its own gate directly below.
+func TestGrowGate_EvidenceFreeDropStormLeavesTheCopyMostOfItsThroughput(t *testing.T) {
+	captureSlog(t)
+	const (
+		lanes     = 16 // the sync cold-start W×D fan-out from the field log
+		writeTime = 2 * time.Millisecond
+		// RATIOS mirror production and they are what this gate is really
+		// about. In the field the drops arrived ~30×/minute (one per ~2s);
+		// the evidence-free cap is 250ms, so cap : drop-interval is 1:8, while
+		// the backoff cap is 30s, i.e. 15:1 the other way — that inversion is
+		// what turned a degraded copy into a stalled one.
+		dropInterval    = 80 * time.Millisecond
+		evidenceFreeCap = 10 * time.Millisecond // 1:8, as production
+		backoffCap      = 640 * time.Millisecond
+		run             = 3 * time.Second
+	)
+	// episodeIdle far above any gap the storm produces, so the ladder is never
+	// reset by luck; share wide open so the ceiling cannot do this gate's job.
+	withScaledGrowGate(t, 5*time.Millisecond, backoffCap, evidenceFreeCap, time.Hour, time.Hour, 1.0)
+
+	baseline := runCopyLanes(lanes, nil, ir.GrowEvidenceNone, &dropTarget{interval: dropInterval}, writeTime, run)
+	if baseline == 0 {
+		t.Fatal("the ungated baseline copied nothing; the model is broken and every comparison below is vacuous")
+	}
+
+	gFree := NewGrowGate(context.Background(), nil)
+	free := runCopyLanes(lanes, gFree, ir.GrowEvidenceNone, &dropTarget{interval: dropInterval}, writeTime, run)
+
+	gEvid := NewGrowGate(context.Background(), nil)
+	evid := runCopyLanes(lanes, gEvid, ir.GrowEvidenceTargetFace, &dropTarget{interval: dropInterval}, writeTime, run)
+
+	// Reported unconditionally so a passing run still shows its margin: a gate
+	// whose numbers are only visible when it fails cannot be sanity-checked.
+	t.Logf("chunks landed — ungated baseline %d, evidence-free %d (%.1f%%), evidenced %d (%.1f%%)",
+		baseline, free, 100*float64(free)/float64(baseline), evid, 100*float64(evid)/float64(baseline))
+
+	// THE GATE. An evidence-free drop storm must leave the copy most of its
+	// throughput. The pre-fix gate scored 9.1% here (the evidenced number
+	// below is what it did for BOTH populations).
+	if got := float64(free) / float64(baseline); got < 0.5 {
+		t.Errorf(
+			"under a steady evidence-free transport-drop storm the copy landed %d chunks against an ungated "+
+				"baseline of %d (%.1f%%) — the gate is quiescing healthy sibling lanes for trouble that has "+
+				"produced no grow evidence across the whole episode, which is the livelock the 2026-08-05 field "+
+				"run hit (4 chunks in its last 60 minutes). See [GrowGateEvidenceFreeHoldCap] (item 157)",
+			free, baseline, 100*got,
+		)
+	}
+
+	// ANTI-VACUITY, and the reason this fix is not "shorten the quiesce". The
+	// SAME storm carrying real grow evidence must still be quiesced hard — if
+	// this passes at the same throughput as the evidence-free run, the cap has
+	// been applied to everything and ADR-0110 has been deleted rather than
+	// scoped.
+	if got := float64(evid) / float64(baseline); got > 0.25 {
+		t.Errorf(
+			"a storm carrying grow evidence landed %d chunks against an ungated baseline of %d (%.1f%%) — the "+
+				"gate is no longer quiescing meaningfully for a target that IS announcing a serving transition, "+
+				"so the evidence-free cap has leaked onto the evidenced path and ADR-0110's actual purpose is gone",
+			evid, baseline, 100*got,
+		)
+	}
+}
+
+// TestGrowGate_SustainedStormIsStillBoundedByTheShareCeiling is the item-138
+// gate: a target that rejects EVERY attempt, with a full-width lane fan-out
+// re-tripping the instant the gate reopens, must not hold the copy closed for
+// more than the gate's declared share of the wall clock.
+//
+// SCOPE, because the old name ("...LeavesTheCopyMostOfTheWallClock") read
+// broader than the truth: "the gate's declared share" is HALF, and half the
+// wall clock is not "most" of it. This gate bounds the ceiling and nothing
+// else. The throughput a real copy retains is the gate above.
+//
+// It trips with EVIDENCE, deliberately. Since item 157 the evidence-free path
+// is bounded by [GrowGateEvidenceFreeHoldCap] long before the share ceiling
+// can bind, so an evidence-free version of this test would pass without ever
+// reaching the declining state it exists to pin — the ceiling would be gated
+// by the cap instead of measured.
 //
 // The INDEPENDENT expected value this compares against is the wall clock
 // measured by the test, not anything the gate reports about itself: the
@@ -175,7 +360,7 @@ func TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent(t *testing.
 // summed from the observed close→reopen durations against elapsed real time.
 //
 // The shipped v0.111.1 gate scored 81.1% closed on this shape in the field.
-func TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock(t *testing.T) {
+func TestGrowGate_SustainedStormIsStillBoundedByTheShareCeiling(t *testing.T) {
 	captureSlog(t)
 	const (
 		share  = 0.5
@@ -184,7 +369,9 @@ func TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock(t *testing.T
 	)
 	// episodeIdle far above any gap the storm produces, so the ladder is NEVER
 	// reset by luck — the storm must be bounded by the share ceiling alone.
-	withScaledGrowGate(t, 5*time.Millisecond, 60*time.Millisecond, time.Hour, window, share)
+	// The evidence-free cap is non-binding here (this test trips WITH
+	// evidence); it is passed at the backoff cap to say so explicitly.
+	withScaledGrowGate(t, 5*time.Millisecond, 60*time.Millisecond, 60*time.Millisecond, time.Hour, window, share)
 
 	g := NewGrowGate(context.Background(), nil)
 	var mu sync.Mutex
@@ -210,7 +397,7 @@ func TestGrowGate_SustainedDropStormLeavesTheCopyMostOfTheWallClock(t *testing.T
 					return
 				}
 				time.Sleep(time.Millisecond) // the failing attempt
-				g.Trip("target rejecting writes", ir.GrowEvidenceNone)
+				g.Trip("target rejecting writes", ir.GrowEvidenceTargetFace)
 			}
 		}()
 	}
@@ -249,7 +436,7 @@ func TestGrowGate_SustainedTroubleStillEscalatesToAMeaningfulQuiesce(t *testing.
 	// Share ceiling wide open: this test is about escalation, and the storm
 	// test above is what bounds it. Keeping them separate means neither can
 	// mask the other.
-	withScaledGrowGate(t, base, 320*time.Millisecond, time.Hour, time.Hour, 1.0)
+	withScaledGrowGate(t, base, 320*time.Millisecond, base, time.Hour, time.Hour, 1.0)
 
 	g := NewGrowGate(context.Background(), nil)
 	holds := make(chan time.Duration, 32)
@@ -266,7 +453,7 @@ func TestGrowGate_SustainedTroubleStillEscalatesToAMeaningfulQuiesce(t *testing.
 	const windows = 8
 	var longest time.Duration
 	for range windows {
-		tripBurst(g, 4)
+		tripBurst(g, 4, ir.GrowEvidenceTargetFace)
 		if err := g.Await(ctx); err != nil {
 			t.Fatalf("Await: %v", err)
 		}
@@ -309,7 +496,7 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 		base = 20 * time.Millisecond
 		idle = 200 * time.Millisecond
 	)
-	withScaledGrowGate(t, base, 10*time.Second, idle, time.Hour, 1.0)
+	withScaledGrowGate(t, base, 10*time.Second, base, idle, time.Hour, 1.0)
 
 	g := NewGrowGate(context.Background(), nil)
 	holds := make(chan time.Duration, 8)
@@ -328,7 +515,7 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 	// Three consecutive windows, each re-tripped promptly: rungs 1, 2, 3.
 	climbed := make([]time.Duration, 0, 3)
 	for range 3 {
-		tripBurst(g, 3)
+		tripBurst(g, 3, ir.GrowEvidenceTargetFace)
 		if err := g.Await(context.Background()); err != nil {
 			t.Fatalf("Await: %v", err)
 		}
@@ -343,7 +530,7 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 
 	// Now a healthy stretch longer than the episode idle, then trouble returns.
 	time.Sleep(idle + 100*time.Millisecond)
-	tripBurst(g, 3)
+	tripBurst(g, 3, ir.GrowEvidenceTargetFace)
 	if err := g.Await(context.Background()); err != nil {
 		t.Fatalf("Await: %v", err)
 	}
@@ -379,7 +566,7 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 	captureSlog(t)
 	const window = 400 * time.Millisecond
-	withScaledGrowGate(t, 40*time.Millisecond, 40*time.Millisecond, time.Hour, window, 0.5)
+	withScaledGrowGate(t, 40*time.Millisecond, 40*time.Millisecond, 40*time.Millisecond, time.Hour, window, 0.5)
 
 	g := NewGrowGate(context.Background(), nil)
 
@@ -388,7 +575,7 @@ func TestGrowGate_DeclinesToCloseOnceItsShareIsSpent(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	closes := 0
 	for closes < 12 && time.Now().Before(deadline) {
-		g.Trip("target rejecting writes", ir.GrowEvidenceNone)
+		g.Trip("target rejecting writes", ir.GrowEvidenceTargetFace)
 		g.mu.Lock()
 		closed := g.closed
 		g.mu.Unlock()
@@ -455,7 +642,7 @@ func TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder(t *testing.T) {
 	const window = 400 * time.Millisecond
 	// episodeIdle an hour: the ladder must never reset by luck mid-test, so a
 	// rung that fails to advance can only be the arming rule and not a reset.
-	withScaledGrowGate(t, 40*time.Millisecond, 40*time.Millisecond, time.Hour, window, 0.5)
+	withScaledGrowGate(t, 40*time.Millisecond, 40*time.Millisecond, 40*time.Millisecond, time.Hour, window, 0.5)
 
 	g := NewGrowGate(context.Background(), nil)
 	rung := func() int {
@@ -475,7 +662,7 @@ func TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for windows < 12 && time.Now().Before(deadline) {
 		before := rung()
-		g.Trip("target rejecting writes", ir.GrowEvidenceNone)
+		g.Trip("target rejecting writes", ir.GrowEvidenceTargetFace)
 		if !isClosed() {
 			break // declined — the share is spent
 		}
@@ -498,7 +685,7 @@ func TestGrowGate_DeclinedTripDoesNotAdvanceTheEpisodeLadder(t *testing.T) {
 	// One target event, reported by 16 lanes — the sync cold-start W×D fan-out
 	// from the field log — must move the ladder by NOTHING.
 	spent := rung()
-	tripBurst(g, 16)
+	tripBurst(g, 16, ir.GrowEvidenceTargetFace)
 	if isClosed() {
 		t.Fatal("the gate closed after declaring its share spent; this test is no longer measuring the declining state")
 	}

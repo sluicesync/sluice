@@ -270,9 +270,18 @@ func TestGrowGateQuiescedSince_AnswersTheThreeCases(t *testing.T) {
 func setGrowGateWindowForTest(t *testing.T, hold time.Duration) func() {
 	t.Helper()
 	base, cap0, maxHold := migcore.GrowGateBackoffBase, migcore.GrowGateBackoffCap, migcore.GrowGateMaxHold
+	evFree := migcore.GrowGateEvidenceFreeHoldCap
 	migcore.GrowGateBackoffBase, migcore.GrowGateBackoffCap, migcore.GrowGateMaxHold = hold, hold, hold
+	// The evidence-free cap (item 157) is a fourth bound on the hold, so this
+	// helper has to move it too or its name stops being true: without this the
+	// caller below asks for a one-minute window, trips with GrowEvidenceNone,
+	// and silently gets a 250ms one. Setting it here keeps the watchdog test
+	// exercising the EVIDENCE-FREE path, which is the stronger property — the
+	// exclusion must hold for every deliberate quiesce, not just evidenced ones.
+	migcore.GrowGateEvidenceFreeHoldCap = hold
 	return func() {
 		migcore.GrowGateBackoffBase, migcore.GrowGateBackoffCap, migcore.GrowGateMaxHold = base, cap0, maxHold
+		migcore.GrowGateEvidenceFreeHoldCap = evFree
 	}
 }
 

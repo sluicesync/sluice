@@ -158,6 +158,85 @@ var (
 	// genuinely healthy stretch starts over at the fast probe interval.
 	GrowGateEpisodeIdle = 60 * time.Second
 
+	// GrowGateEvidenceFreeHoldCap bounds how long ONE window may quiesce the
+	// fleet during an episode in which no trip has yet carried positive
+	// storage-grow evidence (see [ir.GrowEvidence]). An episode that has seen
+	// evidence — a disk-full face, a read-only target, a vtgate or vttablet
+	// serving-transition sentence — is untouched by this and keeps the full
+	// [GrowGateBackoffCap] ladder.
+	//
+	// # Why this REVERSES item 143's "the evidence is descriptive only"
+	//
+	// Item 143 derived the evidence verdict and deliberately left both the trip
+	// set and the timing alone, on the argument that a real grow reparent is
+	// not reliably distinguishable from a transport drop AT THE TRIP POINT, so
+	// quiescing less on "no evidence" risks missing the event the gate exists
+	// for. That argument is sound about the FIRST trip of an episode, and this
+	// cap does not touch it: every rung below the cap is unchanged, so the
+	// first hold — the one ADR-0110's shield actually rides on — is identical
+	// for every evidence value.
+	//
+	// What the argument does NOT cover is the Nth consecutive re-trip. By then
+	// the gate has armed, held, reopened and been re-tripped, repeatedly, with
+	// never a shred of grow evidence anywhere in the episode. "This is a
+	// bounded serving transition that needs quiet" is at that point not an
+	// unfalsified hypothesis — it has been refuted by the gate's own
+	// measurements, because a grow window RESOLVES and that is what makes it a
+	// window. The 2026-08-05 field log is the case in point: 246 windows over a
+	// 91-minute run, 2,687 absorbed drops, not one carrying reparent evidence,
+	// and the ladder pinned at its 30s cap throughout because GrowGateEpisodeIdle
+	// can never elapse when drops arrive every ~2 seconds.
+	//
+	// # Why the discriminator has to be the EVIDENCE and not the re-trip
+	//
+	// The tempting evidence-free fix — "de-escalate when a window is re-tripped
+	// immediately, since that hold demonstrably bought nothing" — is wrong, and
+	// wrong in the dangerous direction. An immediate re-trip is exactly what a
+	// REAL multi-minute grow reparent produces as well; de-escalating on it
+	// would collapse the hold to the base probe interval and hammer the target
+	// during precisely the window ADR-0110 was built for. Prompt re-trip is
+	// ambiguous between the two populations. The evidence is the only signal
+	// available that is not, which is why item 143's derived-but-unused verdict
+	// is the right lever to reach for here.
+	//
+	// # Why capping this does not reintroduce the hammering
+	//
+	// The same argument [GrowGateMaxQuiesceShare] already makes: the retrying
+	// lanes are rate-limited by their OWN exponential reparent backoff
+	// (100ms → 30s cap), not by the gate. The gate's marginal value on an
+	// evidence-free drop is ALIGNMENT — contiguous quiet rather than a smear —
+	// and a cap this size still buys it, because it still parks every lane on
+	// the same boundary. What it stops buying is a 30-second stall for the
+	// fifteen SIBLINGS that were copying successfully, which ADR-0110's own
+	// scope correction already concedes is pure added latency for them.
+	//
+	// The four no-replay lanes keep a shield of this length rather than one of
+	// backoff-cap length. That is a NARROWING of a probabilistic shield, not the
+	// removal of a guarantee — the same thing item 138 said when it capped the
+	// share, and for the same reason: their failure is loud, never silent.
+	//
+	// # Where the NUMBER comes from, since a duty cycle is what it buys
+	//
+	// It is anchored to the tripping lane's OWN backoff, because that is the
+	// exact thing the ADR says an evidence-free quiesce buys: "its hold overlaps
+	// the backoff it would have taken anyway". The MySQL and Postgres cold-copy
+	// ladders both start at 100ms and double (mysql.coldCopyReparentBackoff /
+	// postgres.pgCopyReparentBackoff), so 250ms covers the tripping lane's first
+	// TWO rungs — full overlap of the backoff it was going to take — and stops
+	// there, which is where "alignment" ends and "extra waiting for fifteen
+	// healthy siblings" begins.
+	//
+	// The duty cycle that falls out is the acceptance criterion. The field
+	// target dropped ~30×/minute, i.e. one drop per ~2s; a hold of H against a
+	// drop interval of I costs at worst H/(H+I) of the wall clock before any
+	// coalescing. At 250ms that is ~11%, against the 81.1% measured in the
+	// field and the ~50% the share ceiling alone would still permit. A 1s cap
+	// was the first cut here and it is NOT enough: 1s against a 2s drop interval
+	// is 50%, i.e. exactly what the share ceiling already gave, which is how
+	// [TestGrowGate_EvidenceFreeDropStormLeavesTheCopyMostOfItsThroughput]
+	// caught it — it scored 49.7% and failed.
+	GrowGateEvidenceFreeHoldCap = 250 * time.Millisecond
+
 	// GrowGateQuiesceWindow / GrowGateMaxQuiesceShare are the RUN-level
 	// ceiling on coordinated quiesce: over any trailing GrowGateQuiesceWindow
 	// the gate may hold the cold copy closed for at most GrowGateMaxQuiesceShare
@@ -289,6 +368,16 @@ type GrowGate struct {
 	// cut of the ceiling closed only the first of those.
 	cycle int
 
+	// episodeSawGrowEvidence records whether ANY trip in the current episode
+	// carried positive grow evidence. It gates [GrowGateEvidenceFreeHoldCap],
+	// and it accumulates per EPISODE rather than being read per trip on
+	// purpose, in the conservative direction: one evidenced trip inside an
+	// otherwise transport-drop episode restores the full ladder for the rest
+	// of that episode, so a real grow that announces itself only once is not
+	// demoted by the drops around it. Reset with cycle at the episode
+	// boundary.
+	episodeSawGrowEvidence bool
+
 	// lastReopen is when the previous window ended. A Trip arriving within
 	// episodeIdle of it continues the episode (the ladder climbs); a Trip
 	// arriving later starts a fresh episode at rung 1.
@@ -332,12 +421,13 @@ type GrowGate struct {
 	// on cleanup can never race a still-running owner (the v0.99.100 -race
 	// lesson). Production always gets the package defaults; tests shrink a
 	// global before constructing the gate they then drive.
-	backoffBase     time.Duration
-	backoffCap      time.Duration
-	maxHold         time.Duration
-	episodeIdle     time.Duration
-	quiesceWindow   time.Duration
-	maxQuiesceShare float64
+	backoffBase         time.Duration
+	backoffCap          time.Duration
+	maxHold             time.Duration
+	episodeIdle         time.Duration
+	quiesceWindow       time.Duration
+	evidenceFreeHoldCap time.Duration
+	maxQuiesceShare     float64
 
 	// clock-injection seams for deterministic tests; nil ⇒ real time.
 	afterFn func(time.Duration) <-chan time.Time
@@ -377,12 +467,13 @@ func NewGrowGate(ctx context.Context, recovered func() bool) *GrowGate {
 		// Snapshot the timing envelope at construction so the owner
 		// goroutine reads instance fields, never the mutable package
 		// globals (the -race safety property; see the var block above).
-		backoffBase:     GrowGateBackoffBase,
-		backoffCap:      GrowGateBackoffCap,
-		maxHold:         GrowGateMaxHold,
-		episodeIdle:     GrowGateEpisodeIdle,
-		quiesceWindow:   GrowGateQuiesceWindow,
-		maxQuiesceShare: GrowGateMaxQuiesceShare,
+		backoffBase:         GrowGateBackoffBase,
+		backoffCap:          GrowGateBackoffCap,
+		maxHold:             GrowGateMaxHold,
+		episodeIdle:         GrowGateEpisodeIdle,
+		quiesceWindow:       GrowGateQuiesceWindow,
+		evidenceFreeHoldCap: GrowGateEvidenceFreeHoldCap,
+		maxQuiesceShare:     GrowGateMaxQuiesceShare,
 	}
 }
 
@@ -534,6 +625,18 @@ func (g *GrowGate) Trip(reason string, evidence ir.GrowEvidence) {
 	if g.lastReopen.IsZero() || now.Sub(g.lastReopen) >= g.episodeIdle {
 		g.cycle = 0
 		g.shareExhaustedLogged = false
+		// A new episode has not observed anything yet, so it starts back at
+		// "no evidence" and must re-earn the full ladder. Resetting this with
+		// the ladder rather than on its own keeps one notion of "episode".
+		g.episodeSawGrowEvidence = false
+	}
+
+	// Accumulate BEFORE the ceiling check so an evidenced trip that the share
+	// ceiling happens to decline still counts for the rest of the episode: the
+	// target announced itself, and whether the gate could afford to act on it
+	// is a separate question.
+	if evidence != ir.GrowEvidenceNone {
+		g.episodeSawGrowEvidence = true
 	}
 
 	allowance := g.quiesceAllowanceLocked(now)
@@ -584,9 +687,20 @@ func (g *GrowGate) Trip(reason string, evidence ir.GrowEvidence) {
 	if hold > g.maxHold {
 		hold = g.maxHold
 	}
+	// The evidence-free cap. Applied AFTER the ladder so the early rungs are
+	// bit-identical for every evidence value — only the deep escalation, the
+	// part refuted by an episode that has produced no evidence at all, is
+	// clipped. See [GrowGateEvidenceFreeHoldCap] for why this reverses item
+	// 143, and why prompt re-trip could not have been the discriminator.
+	evidenceFreeCapped := false
+	if !g.episodeSawGrowEvidence && hold > g.evidenceFreeHoldCap {
+		hold = g.evidenceFreeHoldCap
+		evidenceFreeCapped = true
+	}
 	if hold > allowance {
 		hold = allowance
 	}
+	episodeSawEvidence := g.episodeSawGrowEvidence
 
 	g.closed = true
 	g.reopenCh = make(chan struct{})
@@ -615,6 +729,13 @@ func (g *GrowGate) Trip(reason string, evidence ir.GrowEvidence) {
 		// windows before anyone could see it was a function of fan-out width.
 		slog.Duration("hold", hold),
 		slog.Int("escalation_cycle", cycle),
+		// The two inputs to the evidence-free cap, on the same line as the
+		// hold they explain, for the reason item 138 gave for logging the
+		// hold at all: a hold whose DERIVATION is not recorded has to be
+		// reverse-engineered from timestamps across hundreds of windows
+		// before anyone can see what drove it.
+		slog.Bool("episode_saw_grow_evidence", episodeSawEvidence),
+		slog.Bool("evidence_free_capped", evidenceFreeCapped),
 	)
 	go g.runOwner(reopenCh, hold)
 }

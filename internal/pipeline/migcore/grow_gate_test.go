@@ -172,13 +172,20 @@ func TestGrowGate_CtxCancelUnwindsAllParked(t *testing.T) {
 	// A long hold so the gate stays closed for the whole test — the only
 	// thing that should release the Awaiters is the ctx cancel.
 	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	evFree := GrowGateEvidenceFreeHoldCap
 	GrowGateBackoffBase = time.Hour
 	GrowGateBackoffCap = time.Hour
 	GrowGateMaxHold = time.Hour
+	// The item-154 evidence-free cap is a fourth bound on the hold, and these
+	// trips are evidence-free: without raising it too, "a long hold so the gate
+	// stays closed for the whole test" would silently become a 250ms hold, and
+	// this test would pass only because its cancel lands inside that window.
+	GrowGateEvidenceFreeHoldCap = time.Hour
 	t.Cleanup(func() {
 		GrowGateBackoffBase = base
 		GrowGateBackoffCap = capDur
 		GrowGateMaxHold = maxHold
+		GrowGateEvidenceFreeHoldCap = evFree
 	})
 
 	g := NewGrowGate(context.Background(), nil)
@@ -215,13 +222,20 @@ func TestGrowGate_OwnerExitsOnRunCtxCancel(t *testing.T) {
 	captureSlog(t)
 	// Long holds so only the run-ctx cancel can end the window.
 	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	evFree := GrowGateEvidenceFreeHoldCap
 	GrowGateBackoffBase = time.Hour
 	GrowGateBackoffCap = time.Hour
 	GrowGateMaxHold = time.Hour
+	// The item-154 evidence-free cap is a fourth bound on the hold, and these
+	// trips are evidence-free: without raising it too, "a long hold so the gate
+	// stays closed for the whole test" would silently become a 250ms hold, and
+	// this test would pass only because its cancel lands inside that window.
+	GrowGateEvidenceFreeHoldCap = time.Hour
 	t.Cleanup(func() {
 		GrowGateBackoffBase = base
 		GrowGateBackoffCap = capDur
 		GrowGateMaxHold = maxHold
+		GrowGateEvidenceFreeHoldCap = evFree
 	})
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
