@@ -80,6 +80,20 @@ import (
 // rather than a silent one, and it is why the cold-start preflight —
 // replica_identity_preflight.go — carries this check too, ahead of
 // scoping the publication.)
+//
+// That last paragraph is an environmental fact, so it is measured
+// rather than asserted:
+// [TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity] pins it
+// in both directions on whatever server the harness booted. Naming what
+// it found, because the sentence above is narrower than it reads in one
+// place and wider in another: PostgreSQL 18 refuses only once a
+// publication that publishes update/delete covers the table (no
+// publication, an insert-only one, or one scoped elsewhere all leave the
+// writes working, and the shape stays silent) — and under REPLICA
+// IDENTITY FULL its notion of the identity is EVERY column, so it also
+// refuses a FULL table whose generated column is nowhere near the
+// primary key. That last cell is the one the preflight below
+// deliberately does not grade; see its own known-limit note.
 
 // identityColumns is schema.table's EFFECTIVE replica-identity column
 // set as the catalog knows it — All in key order, plus the Generated

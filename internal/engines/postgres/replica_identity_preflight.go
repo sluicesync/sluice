@@ -121,10 +121,17 @@ func replicaIdentityUsable(row replicaIdentityRow) (usable bool, reason string) 
 	// the PRIMARY KEY, because that is what sluice narrows a FULL table
 	// to. PostgreSQL 18 takes a WIDER view — under FULL its own identity
 	// is every column, so it refuses the application's writes for a
-	// generated column ANYWHERE in a FULL table (verified on 18.4). A
-	// FULL table whose only generated column is outside the PK therefore
-	// passes here and would still break on 18. Widening it would
-	// over-refuse on every earlier version, where that shape is harmless.
+	// generated column ANYWHERE in a FULL table. A FULL table whose only
+	// generated column is outside the PK therefore passes here and would
+	// still break on 18. Widening it would over-refuse on every earlier
+	// version, where that shape is harmless.
+	//
+	// The wider PostgreSQL rule this limit is measured against is not
+	// left as a claim about 18.4: the two FULL cells of
+	// [TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity] —
+	// generated column outside the PK, and PK-less — assert it on the
+	// live server, so the day the limit stops being a limit is a test
+	// failure rather than a discovery.
 	if len(row.IdentityGeneratedCols) > 0 {
 		return false, fmt.Sprintf(
 			"its replica identity includes GENERATED column(s) %s, which PostgreSQL does not publish "+
