@@ -1744,6 +1744,23 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 // safe floor: the slot already had events past startLSN durably-
 // applied at startup, and the applier's first commit will report a
 // higher value via the tracker.
+//
+// CORRECTION (2026-08-07 invariant sweep): that justification covers the
+// TRACKER branch only, and the holdAck branch below has no tracker by
+// construction — `backup incremental` and `backup stream` call
+// [CDCReader.HoldSlotAckAtCommitted] precisely because they run without an
+// applier. What makes startLSN a safe ack floor for THEM is a different
+// fact: their start position is the parent manifest's EndPosition, a
+// position the chain has already committed durably, so acking it releases
+// only WAL the archive holds. The one shape where that substitute argument
+// does not apply is a pre-v0.16.x parent carrying no EndPosition, where
+// `resolveStartPosition` falls back to the server's current WAL insert
+// position — "now" — and the window is documented as starting from now
+// anyway. Stated rather than implied; the ack ARITHMETIC is pinned by
+// TestCDCReader_AckLSN_ChainConsumerHold and TestAckLSN_*, and nothing
+// binds startLSN to "a position the chain committed" because the reader
+// cannot see that. UNVERIFIED PREMISE at this level, discharged by the
+// callers.
 func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
 	ack := streamedLSN
 	if r.appliedLSN != nil {

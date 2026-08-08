@@ -112,12 +112,38 @@ func NewRouter(lanes int) *Router {
 // LaneFor returns the lane index in [0, lanes) for a change to `qualified`
 // (schema.table) whose ordered primary-key column values are pkVals. The
 // hash is FNV-1a over the qualified name and a canonical, type-tagged
-// encoding of each key value, so two values that are equal-but-typed
-// differently (int64(5) vs "5") never alias — a correctness requirement,
-// not just balance: the SAME row must always hash identically, and the
-// decode path guarantees a given column yields the same Go type across
-// Insert/Update/Delete, so a per-value type tag keeps distinct keys
-// distinct without depending on cross-type coincidences.
+// encoding of each key value, so two values from DIFFERENT families that
+// render the same (int64(5) vs the string "5") never alias — a correctness
+// requirement, not just balance.
+//
+// The property the same-lane guarantee actually needs is the converse, and
+// it is worth stating separately because it is the one that can rot: the
+// SAME row must always hash identically, so every producer that can place a
+// value in a given key column must place the same Go KIND there.
+//
+// ACROSS CHANGE KINDS that holds, and it is structural rather than lucky:
+// every CDC reader in the tree decodes the before- and after-images with one
+// function invoked BEFORE the Insert/Update/Delete switch, and both leaf
+// decoders dispatch on the IR COLUMN TYPE, never on the change kind
+// (mysql/postgres `value_decode.go`; pgtrigger and sqlite-trigger decode one
+// image function per row; PG's key-only Before is copied out of After by
+// `synthesizeKeyOnlyBefore`, values by reference). Ground-truthed against
+// real servers by TestCDCDecodeTypeStableAcrossChangeKinds.
+//
+// ACROSS PROVENANCE it is a weaker claim than it reads, and the 2026-08-07
+// invariant sweep is why this paragraph exists. The concurrent lanes are
+// ALSO driven by chain-restore's incremental replay and the from-backup
+// broker, whose changes come out of backup chunks rather than a live reader,
+// and that round trip is lossy ON TYPE: `blobcodec.encodeValue` folds the
+// whole signed-integer family onto one tag and the whole unsigned family
+// onto another, and float32 onto float64. Those streams are 100%
+// chunk-sourced today, so a run stays self-consistent — by stream
+// composition, which nothing enforces. What IS enforced is that the fold is
+// harmless: [WriteCanonicalKeyValue] aliases the sized integer kinds onto
+// the same tag their widened form gets, and
+// TestCanonicalKeyValue_SurvivesTheBackupRoundTrip binds the two packages so
+// a change to either side fails the build rather than splitting a row across
+// two lanes.
 func (r *Router) LaneFor(qualified string, pkVals []any) int {
 	if r.lanes <= 1 {
 		return 0
@@ -134,11 +160,28 @@ func (r *Router) LaneFor(qualified string, pkVals []any) int {
 
 // WriteCanonicalKeyValue writes a deterministic, type-tagged byte encoding
 // of a single primary-key value to h. The tag prefix ensures values of
-// different kinds never collide on identical byte content (int64(49) vs
-// the string "1"). The set of kinds mirrors what the VStream/binlog decode
-// path can place in a key column; an unrecognised kind falls back to the
-// fmt-style %v rendering under a generic tag — deterministic for the
-// scalar/byte-slice kinds that reach a primary key.
+// different FAMILIES never collide on identical byte content (int64(49) vs
+// the string "1"). An unrecognised kind falls back to the fmt-style %v
+// rendering under a generic tag — deterministic for the scalar/byte-slice
+// kinds that reach a primary key.
+//
+// Within the signed- and unsigned-integer families the tag is deliberately
+// SHARED across widths, so int8/16/32/int and int64 render identically (and
+// likewise for the unsigned side). That is not a convenience: the backup
+// change-chunk round trip widens every sized integer to its 64-bit form
+// (`blobcodec.encodeValue`), so a replayed chunk hands the router int64
+// where the live reader handed it int32. Aliasing the widths makes that fold
+// invisible to the lane hash BY CONSTRUCTION; before 2026-08-07 int32 fell
+// to the `'?'` fallback and int64 to `'i'`, which would have split one row
+// across two lanes the day a stream mixed provenances. Held by
+// TestCanonicalKeyValue_SurvivesTheBackupRoundTrip.
+//
+// KNOWN RESIDUAL, stated rather than implied: the same fold normalises
+// time.Time to UTC and float32 to float64, and both of those land in the
+// `'?'` fallback where %v is not width-neutral for an offset-bearing
+// timestamp. A temporal or float PRIMARY KEY is the only way to reach it,
+// and the round-trip test grades those cells so the exposure is measured
+// rather than assumed.
 func WriteCanonicalKeyValue(h io.Writer, v any) {
 	switch t := v.(type) {
 	case nil:
@@ -149,9 +192,30 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 	case int:
 		_, _ = h.Write([]byte{'i'})
 		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+	case int32:
+		_, _ = h.Write([]byte{'i'})
+		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+	case int16:
+		_, _ = h.Write([]byte{'i'})
+		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+	case int8:
+		_, _ = h.Write([]byte{'i'})
+		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
 	case uint64:
 		_, _ = h.Write([]byte{'u'})
 		_, _ = h.Write([]byte(strconv.FormatUint(t, 10)))
+	case uint:
+		_, _ = h.Write([]byte{'u'})
+		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+	case uint32:
+		_, _ = h.Write([]byte{'u'})
+		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+	case uint16:
+		_, _ = h.Write([]byte{'u'})
+		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+	case uint8:
+		_, _ = h.Write([]byte{'u'})
+		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
 	case string:
 		_, _ = h.Write([]byte{'s'})
 		_, _ = h.Write([]byte(t))

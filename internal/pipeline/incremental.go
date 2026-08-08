@@ -983,6 +983,18 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 // regress below start.) Those replayed events belong to the parent
 // segment; they are not this window's content.
 //
+// That parenthetical was a transcript of one manual run for fourteen
+// months, which is the shape the 2026-08-07 invariant sweep exists to
+// convert. It is now a test: postgres'
+// TestChainResume_WalsenderFloorsAtTheRequestedLSN_AndThePreflightPassesThatShape
+// provokes the strictly-trailing-flush slot state (asserting the
+// precondition first, since the steady-state shape cannot observe the floor
+// at all) and asserts both that only the post-request transaction is
+// delivered and that its position is >= the request. The same premise is
+// what `rotationBoundaryResumeStart` cites when it declines to build a
+// skipThrough filter, and what `Engine.PreflightChainResume`'s
+// at-or-behind pass-through rests on.
+//
 // Ordering comes from the engine's [ir.PositionMonotonicChecker] when it
 // has one — which today is POSTGRES ONLY (`grep 'func .*PrecedesOrEqual'`
 // returns one non-test hit, and `capabilities_assert.go` carries the only
@@ -1093,54 +1105,7 @@ func (b *IncrementalBackup) captureWindow(
 	// uniquely identifies a Run() invocation in practice.
 	runNamespace := changeChunkRunNamespace(manifest)
 
-	// schemaHistorySeen dedupes schema-history entries by
-	// [ir.SchemaVersionKey] across all chunks of this incremental's
-	// window. The Chunk-B true-delta gate means the CDC reader should
-	// only emit one SchemaSnapshot per genuine boundary, but defensive
-	// dedup is cheap and worth the pin (locked design point #3 — the
-	// engine's writeSchemaVersion is idempotent via the PK surrogate,
-	// but de-duping at the manifest level keeps the persisted envelope
-	// minimal).
-	schemaHistorySeen := map[string]struct{}{}
-	// drainSnapshots converts the writer's collected SchemaSnapshots to
-	// SchemaHistoryEntry values and appends them to the manifest. The
-	// StreamID is deliberately empty at backup time — the orchestrator
-	// has no applier in the loop and therefore no source-side streamID
-	// to record. Restore-time replay (applySchemaHistory in
-	// chain_restore.go) substitutes ChainRestoreStreamID when the
-	// entry's StreamID is empty.
-	drainSnapshots := func(snaps []ir.SchemaSnapshot) error {
-		for _, s := range snaps {
-			if s.IR == nil {
-				// A reader should never emit a nil-IR snapshot; if one
-				// does, that's the loud-failure class (locked decision
-				// #4b — never silently degrade schema history).
-				return fmt.Errorf("schema snapshot for %s.%s at %+v has nil IR table",
-					s.Schema, s.Table, s.Position)
-			}
-			key := ir.SchemaVersionKey("", s.Schema, s.Table, s.Position.Token)
-			if _, dup := schemaHistorySeen[key]; dup {
-				continue
-			}
-			schemaHistorySeen[key] = struct{}{}
-			payload, err := ir.MarshalTable(s.IR)
-			if err != nil {
-				return fmt.Errorf("marshal schema-history table %s.%s: %w",
-					s.Schema, s.Table, err)
-			}
-			manifest.SchemaHistory = append(manifest.SchemaHistory, &irbackup.SchemaHistoryEntry{
-				// StreamID stays empty at backup time; restore-side
-				// substitutes ChainRestoreStreamID. See drainSnapshots
-				// doc above.
-				StreamID:       "",
-				Schema:         s.Schema,
-				Table:          s.Table,
-				AnchorPosition: s.Position,
-				TableJSON:      payload,
-			})
-		}
-		return nil
-	}
+	drain := &schemaHistoryDrain{}
 
 	flush := func() error {
 		if writer == nil {
@@ -1149,8 +1114,8 @@ func (b *IncrementalBackup) captureWindow(
 		// ADR-0049 Chunk D: drain the writer's collected SchemaSnapshots
 		// into the manifest BEFORE closing the writer. Snapshots ride
 		// the manifest envelope, not the chunk's JSONL stream.
-		if err := drainSnapshots(writer.Snapshots()); err != nil {
-			return fmt.Errorf("drain schema snapshots: %w", err)
+		if err := drain.into(manifest, writer.Snapshots()); err != nil {
+			return err
 		}
 		if err := writer.Close(); err != nil {
 			return fmt.Errorf("close chunk: %w", err)
@@ -1256,9 +1221,11 @@ func (b *IncrementalBackup) captureWindow(
 				return endPos, totalChanges, advanced, err
 			}
 			totalChanges++
-			// Position-bearing changes update endPos.
+			// Position-bearing changes update endPos — but only the ones the
+			// chunk stream actually RECORDS. See
+			// [recordedInChangeChunkStream].
 			pos := change.Pos()
-			if pos.Engine != "" || pos.Token != "" {
+			if (pos.Engine != "" || pos.Token != "") && recordedInChangeChunkStream(change) {
 				endPos = pos
 				if !advanced {
 					advanced = windowAdvancedPast(b.Source, startPos, pos)
@@ -1360,14 +1327,134 @@ func (b *IncrementalBackup) captureWindow(
 // (see [irbackup.Manifest.SchemaHistoryAnchors]) — so the cost is a refused
 // backup whose message misattributes the cause, not unsound data.
 func assertDataWindowEndPositionInvariant(manifest *irbackup.Manifest) error {
-	if manifest.CDCPositionCommitsAfterRows || len(manifest.ChangeChunks) == 0 {
+	if manifest.CDCPositionCommitsAfterRows || manifestChangeRecordCount(manifest) == 0 {
 		return nil
 	}
 	if manifest.SchemaHistoryAnchors(manifest.EndPosition) {
 		return fmt.Errorf(
-			"reader invariant violated: a data-bearing incremental window (%d change chunks) on a non-commit-after-rows engine recorded EndPosition %+v coinciding with a schema-history anchor — the restore-side completeness check would be unsound (an emptied-data window could masquerade as schema-only). This is a CDC-reader bug: on this engine a schema snapshot must be anchored strictly before the rows it introduces",
-			len(manifest.ChangeChunks), manifest.EndPosition,
+			"reader invariant violated: a data-bearing incremental window (%d change records across %d chunks) on a non-commit-after-rows engine recorded EndPosition %+v coinciding with a schema-history anchor — the restore-side completeness check would be unsound (an emptied-data window could masquerade as schema-only). This is a CDC-reader bug: on this engine a schema snapshot must be anchored strictly before the rows it introduces",
+			manifestChangeRecordCount(manifest), len(manifest.ChangeChunks), manifest.EndPosition,
 		)
+	}
+	return nil
+}
+
+// manifestChangeRecordCount is how many CHANGE RECORDS an incremental's
+// chunk list actually carries, which is what "data-bearing" has to mean
+// here — a chunk ENTRY does not imply one.
+//
+// The distinction is not academic and it is why this is not
+// `len(ChangeChunks) != 0` (2026-08-07 invariant sweep, the false-refusal
+// direction). The capture loop opens a chunk writer on the FIRST change of
+// any kind, and an [ir.SchemaSnapshot] is diverted out of the JSONL stream
+// onto the manifest ([blobcodec.ChangeChunkWriter.WriteChange], ADR-0049
+// Chunk D) without bumping ChangeCount. A window whose only event is a
+// schema snapshot therefore committed a chunk carrying ZERO records, and
+// this guard read that entry as "data-bearing" and refused the backup —
+// loudly, at the writer, blaming the reader for a bug it did not have. The
+// message even called it data-bearing, so the counts are now both printed.
+func manifestChangeRecordCount(manifest *irbackup.Manifest) int64 {
+	var n int64
+	for _, c := range manifest.ChangeChunks {
+		if c != nil {
+			n += c.RowCount
+		}
+	}
+	return n
+}
+
+// recordedInChangeChunkStream reports whether the change-chunk writer keeps
+// c in the chunk's JSONL stream — as opposed to diverting it onto the
+// manifest envelope, which is what it does with an [ir.SchemaSnapshot]
+// (ADR-0049 Chunk D: snapshots ride [irbackup.Manifest.SchemaHistory], no
+// record written and no count bump).
+//
+// It gates whether c may move a window's EndPosition, and the reason is the
+// restore side. Chain restore and the broker rest completeness on the
+// change-chunk TAIL — `reachedEnd := lastApplied == end`, where lastApplied
+// comes from the positions replayed OUT OF THE CHUNKS. An EndPosition that
+// only a schema snapshot ever carried is therefore unreachable by
+// construction: the restore refuses the link as truncated, on a backup that
+// verified clean. Anchoring EndPosition to the last RECORDED change instead
+// is what makes the property the restore side documents
+// ([irbackup.Manifest.SchemaHistoryAnchors]'s NOTE — a legitimate DDL-only
+// window never presents a schema anchor at a position-bearing EndPosition)
+// true BY CONSTRUCTION at the writer, rather than an observation about what
+// today's readers happen to emit. The snapshot's own position is not lost:
+// it is recorded verbatim as [irbackup.SchemaHistoryEntry.AnchorPosition],
+// which is where restore reads it.
+//
+// Cost of the choice, stated: a window whose last event is a schema
+// snapshot does not advance the chain past it, so the next link re-reads
+// from the previous position and re-emits the snapshot. That replay is
+// idempotent (ADR-0010) and is the same trade the empty-rollover path in
+// [BackupStream.rollover] already makes.
+//
+// Held by TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition, which
+// drives both capture lanes.
+func recordedInChangeChunkStream(c ir.Change) bool {
+	_, isSnapshot := c.(ir.SchemaSnapshot)
+	return !isSnapshot
+}
+
+// schemaHistoryDrain moves the change-chunk writer's collected
+// [ir.SchemaSnapshot] events onto a manifest's SchemaHistory (ADR-0049
+// Chunk D). One drain per WINDOW, reused across that window's chunks, so
+// `seen` dedupes by [ir.SchemaVersionKey] across all of them: the Chunk-B
+// true-delta gate means a reader should emit one snapshot per genuine
+// boundary, but defensive dedup is cheap and keeps the persisted envelope
+// minimal (locked design point #3).
+//
+// It is a shared type rather than a closure because there are TWO capture
+// lanes and only ONE of them had this code. `backup stream`'s rollover lane
+// never drained snapshots at all — `ChangeChunkWriter.Snapshots()` had
+// exactly one production caller, in `IncrementalBackup.captureWindow` — so
+// every mid-stream DDL a continuous chain observed had its position-anchored
+// schema version dropped on the floor, on the lane that writes most change
+// chunks. The manifest still recorded the SchemaDelta, so a restore targeted
+// the right shape and only a restore-THEN-RESUME across that boundary paid,
+// by landing on the ADR-0022 cold-start floor instead of a primed history.
+// Found by the sibling sweep of the 2026-08-07 DDL-only-window entry; held by
+// TestRolloverWindow_SchemaSnapshotDoesNotMoveEndPosition, whose
+// SchemaHistory assertion is what fires.
+type schemaHistoryDrain struct {
+	seen map[string]struct{}
+}
+
+// into appends snaps to manifest.SchemaHistory, skipping ones this drain has
+// already recorded. The StreamID is deliberately empty at backup time — the
+// orchestrator has no applier in the loop and therefore no source-side
+// streamID to record; restore-time replay (applySchemaHistory in
+// chain_restore.go) substitutes ChainRestoreStreamID when it is empty.
+func (d *schemaHistoryDrain) into(manifest *irbackup.Manifest, snaps []ir.SchemaSnapshot) error {
+	for _, s := range snaps {
+		if s.IR == nil {
+			// A reader should never emit a nil-IR snapshot; if one does,
+			// that's the loud-failure class (locked decision #4b — never
+			// silently degrade schema history).
+			return fmt.Errorf("drain schema snapshots: schema snapshot for %s.%s at %+v has nil IR table",
+				s.Schema, s.Table, s.Position)
+		}
+		key := ir.SchemaVersionKey("", s.Schema, s.Table, s.Position.Token)
+		if _, dup := d.seen[key]; dup {
+			continue
+		}
+		if d.seen == nil {
+			d.seen = map[string]struct{}{}
+		}
+		d.seen[key] = struct{}{}
+		payload, err := ir.MarshalTable(s.IR)
+		if err != nil {
+			return fmt.Errorf("drain schema snapshots: marshal schema-history table %s.%s: %w",
+				s.Schema, s.Table, err)
+		}
+		manifest.SchemaHistory = append(manifest.SchemaHistory, &irbackup.SchemaHistoryEntry{
+			StreamID:       "",
+			Schema:         s.Schema,
+			Table:          s.Table,
+			AnchorPosition: s.Position,
+			TableJSON:      payload,
+		})
 	}
 	return nil
 }

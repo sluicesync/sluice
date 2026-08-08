@@ -1388,13 +1388,19 @@ func (r *ChainRestore) streamIncrementalChanges(
 	claimsAdvance := end != link.Manifest.StartPosition
 	// "Reached" = the last applied change-chunk position equals EndPosition.
 	// A schema-history snapshot anchored at EndPosition is NOT trusted as proof
-	// of completeness (audit-2026-07-12). Ground truth on real Postgres and
-	// MySQL (item60_anchor_schemadelta_{pg,mysql} integration tests, both
-	// engines) shows a legitimate window never presents a schema anchor at a
-	// position-bearing EndPosition: a DDL-only window emits its snapshot with an
-	// EMPTY EndPosition (posBearing false → this guard is skipped), and a data
-	// window reaches EndPosition through its change-chunk tail. The only
-	// producer of "anchor == EndPosition with a short/empty chunk tail" is a
+	// of completeness (audit-2026-07-12). A legitimate window never presents a
+	// schema anchor at a position-bearing EndPosition, and since the 2026-08-07
+	// invariant sweep that is enforced at the WRITER rather than observed of the
+	// readers: only a change the chunk stream RECORDS may move EndPosition
+	// (`pipeline.recordedInChangeChunkStream`, held by
+	// TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition), and a schema
+	// snapshot rides the manifest envelope instead. So a DDL-only window leaves
+	// EndPosition where the last recorded change left it — empty on a window
+	// that recorded none, in which case posBearing is false and this guard is
+	// skipped — and a data window reaches EndPosition through its change-chunk
+	// tail. That is what makes this guard's `!reachedEnd` arm safe to refuse on:
+	// every legitimate EndPosition is a position some chunk record carries. The
+	// only producer of "anchor == EndPosition with a short/empty chunk tail" is a
 	// store adversary who empties an unsigned window's chunks and re-anchors its
 	// routine first-touch snapshot — and the anchor/SchemaDelta fields it edits
 	// are outside every signing-independent cover (not the BackupID, not the

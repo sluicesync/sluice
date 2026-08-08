@@ -44,6 +44,16 @@ import (
 // still retained, PostgreSQL replays from the requested LSN, and the
 // chunk writer's dedup is not needed because the recorded EndPosition
 // is what the orchestrator restarts from).
+//
+// That BEHIND arm is an environmental premise — logical decoding begins at
+// max(requested_lsn, confirmed_flush_lsn) — and until 2026-08-07 its only
+// evidence was a hand-run transcript in a comment, with no server-touching
+// test on this branch at all (the slot tests cover the AHEAD refusal, the
+// missing slot, and the steady state where the two coincide, which is the
+// one shape in which the floor cannot be observed). It is now provoked and
+// asserted, TOGETHER with this classification so the argument rather than
+// the two halves is what is held, by
+// TestChainResume_WalsenderFloorsAtTheRequestedLSN_AndThePreflightPassesThatShape.
 func (e Engine) PreflightChainResume(ctx context.Context, dsn string, from ir.Position) error {
 	decoded, ok, err := decodePGPos(from)
 	if err != nil {

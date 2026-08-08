@@ -796,7 +796,12 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	//    committing strictly before the requested position — which is why the
 	//    rollover caps carry the item-98 advancement condition; that replay is
 	//    kept, not filtered, since the (P_N, S] window is exactly what this
-	//    heal exists to recover.)
+	//    heal exists to recover.) The "delivers nothing BELOW P_N" half is an
+	//    environmental premise about the walsender, not something this package
+	//    can see; it is pinned against a real server by postgres'
+	//    TestChainResume_WalsenderFloorsAtTheRequestedLSN_AndThePreflightPassesThatShape
+	//    (2026-08-07 invariant sweep). If it broke, this branch would silently
+	//    fold the prior segment's tail into the new segment's chunks.
 	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
 		slog.InfoContext(
 			ctx, "stream: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
@@ -1373,10 +1378,18 @@ func (b *BackupStream) runRollover(
 
 	warnReplayOnlyRollover(ctx, manifest, captured)
 	manifest.EndPosition = captured.EndPos
-	if (manifest.EndPosition.Engine == "" && manifest.EndPosition.Token == "") && captured.TotalChanges == 0 {
+	if (manifest.EndPosition.Engine == "" && manifest.EndPosition.Token == "") && manifestChangeRecordCount(manifest) == 0 {
 		// Empty rollover written-anyway path: the chain advances no
 		// position. Use the StartPosition as the EndPosition so the
 		// next rollover still has a valid resume cursor.
+		//
+		// Keyed on RECORDED CHANGES, not on captured.TotalChanges (2026-08-07
+		// invariant sweep). TotalChanges counts every event the window saw,
+		// including an [ir.SchemaSnapshot] that rides the manifest envelope and
+		// can no longer move EndPos ([recordedInChangeChunkStream]) — so a
+		// DDL-only rollover reaches here with TotalChanges > 0 and an empty
+		// EndPos, and the old spelling would have left the chain cursor empty
+		// and sent the next rollover to "from now".
 		manifest.EndPosition = startPos
 	}
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
@@ -1758,6 +1771,12 @@ type changeChunkBuffer struct {
 	buf           *bytes.Buffer
 	chunkIdx      int
 	curWrappedCEK []byte
+
+	// drain moves each chunk's collected [ir.SchemaSnapshot] events onto
+	// the manifest (ADR-0049 Chunk D). One per window, so it dedupes across
+	// the window's chunks. See [schemaHistoryDrain] for why this lane did
+	// not have it.
+	drain schemaHistoryDrain
 }
 
 // flushTo closes the open chunk writer, stores its buffer under the
@@ -1770,6 +1789,14 @@ type changeChunkBuffer struct {
 func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome) error {
 	if cb.writer == nil {
 		return nil
+	}
+	// ADR-0049 Chunk D: drain the writer's collected SchemaSnapshots onto
+	// the manifest BEFORE closing the writer — snapshots ride the manifest
+	// envelope, not the chunk's JSONL stream. Parity with
+	// [IncrementalBackup.captureWindow]'s flush, which is where this lived
+	// alone until 2026-08-07.
+	if err := cb.drain.into(cb.manifest, cb.writer.Snapshots()); err != nil {
+		return err
 	}
 	if err := cb.writer.Close(); err != nil {
 		return fmt.Errorf("close chunk: %w", err)
@@ -1874,8 +1901,10 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 		return true, err
 	}
 	out.TotalChanges++
+	// Only a change the chunk stream RECORDS may move EndPos — the rollover
+	// lane's half of [recordedInChangeChunkStream].
 	pos := change.Pos()
-	if pos.Engine != "" || pos.Token != "" {
+	if (pos.Engine != "" || pos.Token != "") && recordedInChangeChunkStream(change) {
 		out.EndPos = pos
 		if !out.Advanced {
 			out.Advanced = windowAdvancedPast(cb.b.Source, cb.manifest.StartPosition, pos)

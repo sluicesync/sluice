@@ -898,11 +898,22 @@ func (m *Manifest) SchemaCanonBytes() ([]byte, error) {
 // if it does, the writer refuses (an emptied-DATA masquerade).
 //
 // NOTE (audit-2026-07-12): the RESTORE side no longer trusts an anchor at
-// EndPosition as proof of completeness. Ground truth (item60_anchor_schemadelta_*
-// integration tests, real PG + MySQL) shows a legitimate DDL-only window emits
-// its snapshot with an EMPTY EndPosition (never an advancing one), so the only
-// producer of "anchor == a position-bearing EndPosition with 0 chunks" is a
-// forgery — restore/broker rest completeness solely on the change-chunk tail.
+// EndPosition as proof of completeness. A legitimate DDL-only window emits its
+// snapshot WITHOUT moving EndPosition onto the anchor, so the only producer of
+// "anchor == a position-bearing EndPosition with 0 chunks" is a forgery —
+// restore/broker rest completeness solely on the change-chunk tail.
+//
+// CORRECTION (2026-08-07 invariant sweep): that sentence used to cite the
+// item60_anchor_schemadelta_* integration tests as its ground truth, and those
+// tests do not assert it — they LOG posBearing and assert a different
+// invariant (an anchor at EndPosition implies a non-empty SchemaDelta). It was
+// an unverified premise wearing a citation. It is now true BY CONSTRUCTION
+// instead of by observation: the capture loops only let a change the CHUNK
+// STREAM records move EndPosition (pipeline's [recordedInChangeChunkStream]),
+// and a schema snapshot rides this envelope rather than the stream. Held by
+// TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition. Before that,
+// a window whose only position-bearing event was a snapshot was REFUSED at the
+// writer as "data-bearing" — the false-refusal direction nobody had checked.
 //
 // NOTE (item 132): "strictly before EndPosition" above is no longer universally
 // true on a MySQL GTID source, and the writer-side assert can consequently

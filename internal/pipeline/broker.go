@@ -1075,10 +1075,14 @@ func (b *SyncFromBackup) applyIncremental(
 		// refuse rather than silently advance the broker past dropped events.
 		//
 		// audit-2026-07-12: a schema anchor at EndPosition is NOT trusted as
-		// proof of a legitimate 0-chunk window. Ground truth on real Postgres and
-		// MySQL (item60_anchor_schemadelta_{pg,mysql}) shows a legitimate
-		// DDL-only window emits its snapshot with an EMPTY EndPosition (posBearing
-		// false → this branch is skipped, no refusal), while the only producer of
+		// proof of a legitimate 0-chunk window. A legitimate DDL-only window
+		// leaves EndPosition where the last RECORDED change left it — empty on a
+		// window that recorded none, so posBearing is false and this branch is
+		// skipped. That is a writer-enforced property since the 2026-08-07
+		// invariant sweep (`recordedInChangeChunkStream`, held by
+		// TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition), not the
+		// reader observation the earlier version of this comment cited. The only
+		// producer of
 		// "0 chunks + advanced EndPosition" is a store adversary who emptied an
 		// unsigned window's chunks. The anchor position and SchemaDelta such an
 		// adversary can forge are outside every signing-independent cover (not the

@@ -270,12 +270,22 @@ func TestRestore_EnvelopeSuppliedButPlaintextChain_Refused(t *testing.T) {
 // genuine DDL-only window from an emptied-data one). VStream engines legitimately
 // co-locate, so the invariant is asserted only when CDCPositionCommitsAfterRows
 // is false.
+//
+// The fixture takes a per-chunk RECORD COUNT rather than a chunk count
+// (2026-08-07 invariant sweep). The old spelling built `&ChunkInfo{}` — a chunk
+// entry carrying zero records — which is a shape the writer DOES emit (a
+// snapshot-only window opens a chunk writer and diverts the snapshot onto the
+// manifest) and which this guard then refused as "data-bearing". The fixture
+// looked like it covered the DDL-only case; it covered a manifest shape whose
+// real producer took the other branch. See
+// TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition for the
+// end-to-end half.
 func TestAssertDataWindowEndPositionInvariant(t *testing.T) {
 	end := pgPos("0/200")
-	mk := func(afterRows bool, chunks int, anchor *ir.Position) *irbackup.Manifest {
+	mk := func(afterRows bool, records []int64, anchor *ir.Position) *irbackup.Manifest {
 		m := &irbackup.Manifest{CDCPositionCommitsAfterRows: afterRows, EndPosition: end}
-		for i := 0; i < chunks; i++ {
-			m.ChangeChunks = append(m.ChangeChunks, &irbackup.ChunkInfo{})
+		for _, n := range records {
+			m.ChangeChunks = append(m.ChangeChunks, &irbackup.ChunkInfo{RowCount: n})
 		}
 		if anchor != nil {
 			m.SchemaHistory = []*irbackup.SchemaHistoryEntry{{AnchorPosition: *anchor}}
@@ -288,11 +298,16 @@ func TestAssertDataWindowEndPositionInvariant(t *testing.T) {
 		m       *irbackup.Manifest
 		wantErr bool
 	}{
-		{"non-vstream data window, anchor coincides with EndPosition — VIOLATION", mk(false, 1, &end), true},
-		{"non-vstream data window, anchor strictly before EndPosition — ok", mk(false, 1, &early), false},
-		{"non-vstream data window, no schema history — ok", mk(false, 1, nil), false},
-		{"non-vstream schema-only window (0 chunks), anchor==EndPosition — ok (legit DDL-only)", mk(false, 0, &end), false},
-		{"VStream data window, anchor==EndPosition — ok (co-locates by design)", mk(true, 1, &end), false},
+		{"non-vstream data window, anchor coincides with EndPosition — VIOLATION", mk(false, []int64{3}, &end), true},
+		{"non-vstream data window, anchor strictly before EndPosition — ok", mk(false, []int64{3}, &early), false},
+		{"non-vstream data window, no schema history — ok", mk(false, []int64{3}, nil), false},
+		{"non-vstream schema-only window (0 chunks), anchor==EndPosition — ok (legit DDL-only)", mk(false, nil, &end), false},
+		// The false-refusal direction: a snapshot-only window commits a chunk
+		// ENTRY carrying no records. That is not a data window and must not be
+		// refused as one.
+		{"non-vstream snapshot-only window (1 chunk, 0 records), anchor==EndPosition — ok", mk(false, []int64{0}, &end), false},
+		{"non-vstream mixed window (an empty chunk then a data chunk), anchor==EndPosition — VIOLATION", mk(false, []int64{0, 2}, &end), true},
+		{"VStream data window, anchor==EndPosition — ok (co-locates by design)", mk(true, []int64{3}, &end), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := assertDataWindowEndPositionInvariant(tc.m)
