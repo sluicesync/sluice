@@ -29,9 +29,35 @@
 // It is shared rather than package-local for the reason
 // internal/errclassgate is: the same defect exists once per target
 // engine, and a gate that can only see the engine it was born in
-// re-learns the lesson one engine at a time. Every engine that can be a
-// TARGET for a Postgres-family source instantiates it; an engine
-// without a gate file is itself a finding.
+// re-learns the lesson one engine at a time.
+//
+// # Which packages instantiate it (roadmap item 155 widened this)
+//
+// The original rule was "every engine that can be a TARGET for a
+// Postgres-family source; an engine without a gate file is itself a
+// finding". That drew the scope around WHO OWNS THE CODE, and the class
+// does not respect that line: item 153 put ir.Domain dispatch in
+// internal/translate, which is not an engine, and two real instances of
+// this exact defect were sitting there when the gate finally arrived
+// (the wide-varchar and unconstrained-numeric advisory scanners, both
+// silently suppressed for a DOMAIN-wrapped column that MySQL's emitter
+// down-maps regardless).
+//
+// The rule is therefore: **every package that DECIDES WHAT A COLUMN
+// LANDS AS by dispatching on its IR type instantiates this gate** —
+// each target engine, and internal/translate. A package that grows such
+// a dispatch and no gate file is the finding, whether or not it is an
+// engine. Current instantiations:
+//
+//   - internal/engines/mysql   (TestDomainTransparency_MySQLDispatchRoster)
+//   - internal/engines/sqlite  (TestDomainTransparency_SQLiteDispatchRoster)
+//   - internal/translate       (TestDomainTransparency_TranslateDispatchRoster)
+//
+// internal/engines/postgres is deliberately absent and this is the
+// reason rather than an oversight: PG is the engine that HAS domains, so
+// its writer creates the DOMAIN rather than downgrading to a base type,
+// and "what does this column land as" is answered by the wrapper itself.
+// The class is about targets that must flatten.
 //
 // # What a passing run proves, stated so it cannot be read as broader
 //
@@ -42,6 +68,13 @@
 // whether the unwrapped branch then does the right thing with the value
 // — that is the family × shape matrices' job, and neither substitutes
 // for the other.
+//
+// It reaches the two regions of a file named in [dispatchScopes]:
+// function bodies AND package-level var/const initialisers. The second
+// was missing until item 155, and a registry-shaped package (a
+// `var rules = []rule{{match: func(...) …}}`) was entirely invisible to
+// it — which the MinSites floor could not catch either, because the
+// floor counts what the walk reached.
 package domaingate
 
 import (
@@ -127,12 +160,8 @@ func Assert(t *testing.T, cfg Config) {
 		if rerr != nil {
 			t.Fatalf("read %s: %v", path, rerr)
 		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
+		for _, scope := range dispatchScopes(f) {
+			ast.Inspect(scope.node, func(n ast.Node) bool {
 				operand, ok := dispatchOperand(n)
 				if !ok {
 					return true
@@ -149,7 +178,7 @@ func Assert(t *testing.T, cfg Config) {
 				if kind != operandRaw {
 					return true
 				}
-				key := name + ":" + fn.Name.Name + ":" + exprText(fset, operand, src)
+				key := name + ":" + scope.name + ":" + exprText(fset, operand, src)
 				if _, allowed := cfg.Allowed[key]; allowed {
 					used[key] = true
 					return true
@@ -198,6 +227,56 @@ func Assert(t *testing.T, cfg Config) {
 			"the key to Allowed with the reason unwrapping would be wrong or inert.",
 			cfg.Engine, len(offenders), strings.Join(offenders, "\n  "))
 	}
+}
+
+// dispatchScope is one named region of a file the walk descends into.
+// The name becomes part of the exemption key, so it must be stable and
+// human-recognisable.
+type dispatchScope struct {
+	name string
+	node ast.Node
+}
+
+// dispatchScopes returns every region of a file that can contain a type
+// dispatch. There are TWO, and the second was missing until roadmap item
+// 155 — the gate walked function BODIES only, which is not where a
+// registry-shaped package puts its predicates.
+//
+// `internal/translate/notes.go` declares its advisory rules as a
+// package-level `var noteEntries = []noteEntry{{matches: func(...) …}}`;
+// those `src.Type.(ir.JSON)` dispatches live in a GenDecl, so the walk
+// never reached them and the package read as having fewer sites than it
+// has. That is the gate-coverage failure mode CLAUDE.md calls worse than
+// no gate: nothing about the walk's OUTPUT distinguished "this package
+// dispatches correctly" from "this package's dispatches are invisible to
+// me", and the MinSites floor cannot catch it either — a package whose
+// FuncDecl sites are all fine clears the floor while its registry rots.
+//
+// Function bodies keep their existing scope name (the function's own),
+// so instantiated rosters keyed on it are unaffected.
+func dispatchScopes(f *ast.File) []dispatchScope {
+	var scopes []dispatchScope
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Body != nil {
+				scopes = append(scopes, dispatchScope{d.Name.Name, d.Body})
+			}
+		case *ast.GenDecl:
+			// var/const initialisers. A type declaration carries no
+			// expressions to dispatch in, so only ValueSpecs matter.
+			for _, spec := range d.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || len(vs.Names) == 0 {
+					continue
+				}
+				for _, val := range vs.Values {
+					scopes = append(scopes, dispatchScope{vs.Names[0].Name, val})
+				}
+			}
+		}
+	}
+	return scopes
 }
 
 // dispatchOperand returns the expression a type switch or type

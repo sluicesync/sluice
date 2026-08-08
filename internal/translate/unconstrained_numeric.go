@@ -76,7 +76,11 @@ func ScanUnconstrainedNumericNotices(schema *ir.Schema, sourceEngine, targetEngi
 			if col == nil {
 				continue
 			}
-			d, ok := col.Type.(ir.Decimal)
+			// UnwrapDomain: same reason as the wide-varchar scanner —
+			// MySQL's emitColumnType recurses an ir.Domain into its base,
+			// so a `CREATE DOMAIN … AS numeric` column really is widened
+			// to DECIMAL(65,30) and really did lose its notice (item 155).
+			d, ok := ir.UnwrapDomain(col.Type).(ir.Decimal)
 			if !ok || !d.Unconstrained {
 				continue
 			}

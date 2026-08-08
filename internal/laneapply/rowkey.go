@@ -4,7 +4,7 @@
 package laneapply
 
 import (
-	"bytes"
+	"reflect"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -58,16 +58,38 @@ func PKChangedUpdate(u ir.Update, pkCols []string) bool {
 }
 
 // valuesEqualForKey compares two primary-key values for the PK-change check.
-// Byte slices ([]byte keys) need content comparison; everything else is a
-// comparable scalar the decode path produces, so == is correct.
+//
+// It uses STRUCTURAL equality, not `==`, because a primary-key value is not
+// necessarily a comparable Go kind. `==` on two interfaces holding an
+// uncomparable dynamic type PANICS, and two such kinds reach a PK column on
+// real, supported configurations (roadmap item 154):
+//
+//   - `[]any` — the IR contract for an ARRAY value (docs/value-types.md).
+//     Postgres permits a PRIMARY KEY on an array column (btree `array_ops`),
+//     both PG readers produce `[]any` for one (`postgres`'s decodeArray, and
+//     pgtrigger's to_jsonb payload, whose `text[]` columns are explicitly
+//     ACCEPTED by setup — only `json[]`/`jsonb[]` are refused), and PG's
+//     Update always carries a Before image (a real OldTuple, or the key-only
+//     one synthesizeKeyOnlyBefore copies out of After). So every UPDATE on
+//     such a table reached `==` and crashed the concurrent apply path.
+//   - `map[string]any` — pgtrigger's decode of a `jsonb` column, which PG
+//     also permits as a PRIMARY KEY (btree `jsonb_ops`).
+//
+// The one behavioural divergence from the previous []byte special case,
+// named rather than implied: a nil []byte and an empty []byte compared EQUAL
+// under bytes.Equal and compare UNEQUAL here. That direction is the safe one
+// — both callers treat "changed" as "take the barrier / don't coalesce" —
+// and a PK column is NOT NULL, so the pair is not reachable from a live
+// reader anyway. Pinned by TestValuesEqualForKey_FamilyMatrix.
+//
+// EQUALITY HERE MUST IMPLY SAME LANE. Both callers use a false result to
+// SKIP the barrier, and the barrier exists because a key migration's old and
+// new keys "could hash to different lanes" — so reporting equal for a pair
+// the router would hash APART would silently reintroduce exactly the hazard.
+// reflect.DeepEqual satisfies that (equal values encode identically under
+// [WriteCanonicalKeyValue], which is deterministic on the value), and
+// TestValuesEqualForKey_ImpliesSameLane binds the two functions so a change
+// to EITHER side fails the build rather than splitting a row across lanes.
 func valuesEqualForKey(a, b any) bool {
-	ab, aIsBytes := a.([]byte)
-	bb, bIsBytes := b.([]byte)
-	if aIsBytes || bIsBytes {
-		if !aIsBytes || !bIsBytes {
-			return false
-		}
-		return bytes.Equal(ab, bb)
-	}
-	return a == b
+	return reflect.DeepEqual(a, b)
 }

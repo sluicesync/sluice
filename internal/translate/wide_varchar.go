@@ -109,7 +109,13 @@ func ScanWideVarcharNotices(schema *ir.Schema, sourceEngine, targetEngine string
 			if col == nil {
 				continue
 			}
-			vc, ok := col.Type.(ir.Varchar)
+			// UnwrapDomain: MySQL's emitColumnType recurses through an
+			// ir.Domain into its base type, so a PG `CREATE DOMAIN … AS
+			// varchar(70000)` column IS down-mapped to a TEXT tier — and
+			// before item 155 this scanner matched no arm for it, so the
+			// operator got the down-map with no notice. The Bug 233 class
+			// on the advisory lane.
+			vc, ok := ir.UnwrapDomain(col.Type).(ir.Varchar)
 			if !ok || vc.Length <= wideVarcharThresholdChars {
 				continue
 			}

@@ -201,6 +201,16 @@ type noteEntry struct {
 // translations that carry a semantic caveat worth emitting on a
 // column line. Order is not significant — the preview formatter
 // emits all matching notes in registry order.
+//
+// Every predicate in this registry and in [hintEntries] reads its
+// column through [ir.UnwrapDomain]. Three of them (uuid, unbounded
+// text, unbounded numeric) gate on a POSTGRES source, where a
+// `CREATE DOMAIN` wrapper is exactly what the operator has, and the
+// note or hint was silently suppressed for it (roadmap item 155). The
+// MySQL-sourced predicates unwrap too, where it is inert: the
+// alternative was a domaingate exemption keyed on the whole `var`,
+// which is a coarser scope than a function and would have silently
+// shielded the next PG-sourced entry somebody adds here.
 var noteEntries = []noteEntry{
 	// MySQL JSON → PG JSONB. JSONB is the canonical fast path on PG;
 	// the note exists to remind the operator they can downgrade to
@@ -214,8 +224,8 @@ var noteEntries = []noteEntry{
 			if tgtEngine != "postgres" {
 				return false
 			}
-			_, srcJSON := src.Type.(ir.JSON)
-			tgtJSON, ok := tgt.Type.(ir.JSON)
+			_, srcJSON := ir.UnwrapDomain(src.Type).(ir.JSON)
+			tgtJSON, ok := ir.UnwrapDomain(tgt.Type).(ir.JSON)
 			return srcJSON && ok && tgtJSON.Binary
 		},
 		message: "binary JSONB preserves value semantics; for key-order preservation, override to json (text)",
@@ -246,7 +256,7 @@ var hintEntries = []hintEntry{
 			if tgtEngine != "mysql" && tgtEngine != "planetscale" {
 				return false
 			}
-			_, ok := src.Type.(ir.UUID)
+			_, ok := ir.UnwrapDomain(src.Type).(ir.UUID)
 			return ok
 		},
 		message:        "PG uuid expands 2.25x as CHAR(36); for binary storage, override to binary_uuid",
@@ -274,7 +284,7 @@ var hintEntries = []hintEntry{
 			if tgtEngine != "mysql" && tgtEngine != "planetscale" {
 				return false
 			}
-			t, ok := src.Type.(ir.Text)
+			t, ok := ir.UnwrapDomain(src.Type).(ir.Text)
 			return ok && t.Size == ir.TextLong
 		},
 		message:        "PG text -> MySQL LONGTEXT (4GB cap, large overhead); if column is bounded, override to varchar:length=N or mediumtext",
@@ -292,7 +302,7 @@ var hintEntries = []hintEntry{
 			if tgtEngine != "postgres" {
 				return false
 			}
-			_, ok := src.Type.(ir.DateTime)
+			_, ok := ir.UnwrapDomain(src.Type).(ir.DateTime)
 			return ok
 		},
 		message:        "MySQL DATETIME has no timezone; if source values are UTC-encoded, override to timestamptz",
@@ -314,7 +324,7 @@ var hintEntries = []hintEntry{
 			if tgtEngine != "postgres" {
 				return false
 			}
-			_, ok := src.Type.(ir.Time)
+			_, ok := ir.UnwrapDomain(src.Type).(ir.Time)
 			return ok
 		},
 		message:        "MySQL TIME is a duration (-838:59:59..838:59:59); PG time holds only 00:00-24:00 and out-of-range values refuse loudly at copy — if the column stores durations, override to interval (lossless)",
@@ -332,7 +342,7 @@ var hintEntries = []hintEntry{
 			if tgtEngine != "mysql" && tgtEngine != "planetscale" {
 				return false
 			}
-			d, ok := src.Type.(ir.Decimal)
+			d, ok := ir.UnwrapDomain(src.Type).(ir.Decimal)
 			// Unbounded PG numeric arrives as ir.Decimal{Unconstrained:
 			// true} from the PG schema reader (catalog Bug 69); bounded
 			// numerics carry their declared precision/scale.
