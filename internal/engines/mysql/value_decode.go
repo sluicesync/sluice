@@ -67,10 +67,14 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		// MySQL stores geometry on the wire as `<srid uint32 LE><wkb>`.
 		// The IR contract for ir.Geometry values is "raw WKB" (per
 		// docs/value-types.md), so strip the 4-byte SRID prefix before
-		// returning. Per-row SRID is intentionally lost here — the
-		// per-column SRID lives on ir.Geometry.SRID and is set at
-		// schema-translation time, not per-row at decode time.
-		return decodeMySQLGeometry(raw)
+		// returning. v.SRID is the column's declared SRID (0 when the
+		// column carries no `SRID n` attribute); a row whose prefix names
+		// a DIFFERENT one is refused rather than silently re-stamped,
+		// because the strip is what makes it unrepresentable (audit
+		// 2026-08-05 C-14). Reached by the bulk-copy scan, the binlog CDC
+		// decoder, the flatfile shim and mydumper — every MySQL read path
+		// except VStream, which has its own arm in decodeVStreamCell.
+		return decodeMySQLGeometry(raw, v.SRID)
 	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// MySQL doesn't have native types for these; they live in
 		// VARCHAR columns. The driver gives us bytes; canonical form
@@ -399,10 +403,15 @@ func bitUint64Bytes(v uint64) []byte {
 // []byte. Matches the IR contract for [ir.Geometry] values (raw WKB,
 // per docs/value-types.md).
 //
+// columnSRID is the column's declared [ir.Geometry.SRID]. A value whose
+// prefix names a different one is refused ([ir.CheckGeometryRowSRID]):
+// MySQL permits a per-row SRID on any spatial column declared WITHOUT the
+// `SRID n` attribute, and the strip below is what would lose it.
+//
 // Returns an error for anything shorter than 5 bytes — the SRID prefix
 // alone is 4, and a valid WKB body needs at least one more (the byte-
 // order flag).
-func decodeMySQLGeometry(raw any) (any, error) {
+func decodeMySQLGeometry(raw any, columnSRID int) (any, error) {
 	bytesAny, err := decodeBytes(raw)
 	if err != nil {
 		return nil, err
@@ -410,6 +419,9 @@ func decodeMySQLGeometry(raw any) (any, error) {
 	b := bytesAny.([]byte)
 	if len(b) < 5 {
 		return nil, fmt.Errorf("mysql: geometry too short (%d bytes; need >=5)", len(b))
+	}
+	if err := ir.CheckGeometryRowSRID(columnSRID, binary.LittleEndian.Uint32(b[:4])); err != nil {
+		return nil, fmt.Errorf("mysql: %w", err)
 	}
 	// Drop the 4-byte SRID prefix. The remaining bytes are WKB.
 	return b[4:], nil

@@ -18,6 +18,13 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// sridPointLE is the SRID the [ewkbPointLE] / [ewkbPointBE] fixtures carry
+// (4326). The decoder compares each value's own SRID against the COLUMN's
+// declared one (audit 2026-08-05 C-14), so these input-shape tests must
+// declare the column at the fixture's SRID — otherwise they would all be
+// testing the refusal rather than the shape handling.
+const sridPointLE = 4326
+
 // TestDecodePGGeometry_InputShapesAgree pins that the three shapes a
 // geometry value can arrive in — cold-start string (hex), CDC pgoutput
 // []byte (hex ASCII), and raw binary EWKB — all decode to the SAME WKB.
@@ -25,15 +32,15 @@ func TestDecodePGGeometry_InputShapesAgree(t *testing.T) {
 	rawEWKB := ewkbPointLE() // 25 bytes, leading byte-order 0x01
 	hexStr := hex.EncodeToString(rawEWKB)
 
-	fromString, err := decodePGGeometry(hexStr)
+	fromString, err := decodePGGeometry(hexStr, sridPointLE)
 	if err != nil {
 		t.Fatalf("decode string-hex: %v", err)
 	}
-	fromHexBytes, err := decodePGGeometry([]byte(hexStr)) // the CDC pgoutput shape
+	fromHexBytes, err := decodePGGeometry([]byte(hexStr), sridPointLE) // the CDC pgoutput shape
 	if err != nil {
 		t.Fatalf("decode []byte-hex (CDC path): %v", err)
 	}
-	fromRawBytes, err := decodePGGeometry(rawEWKB)
+	fromRawBytes, err := decodePGGeometry(rawEWKB, sridPointLE)
 	if err != nil {
 		t.Fatalf("decode raw EWKB []byte: %v", err)
 	}
@@ -62,15 +69,15 @@ func TestDecodePGGeometry_HexPrefix(t *testing.T) {
 	plain := hex.EncodeToString(rawEWKB)
 	prefixed := `\x` + plain
 
-	a, err := decodePGGeometry(prefixed)
+	a, err := decodePGGeometry(prefixed, sridPointLE)
 	if err != nil {
 		t.Fatalf("decode \\x string: %v", err)
 	}
-	b, err := decodePGGeometry([]byte(prefixed))
+	b, err := decodePGGeometry([]byte(prefixed), sridPointLE)
 	if err != nil {
 		t.Fatalf("decode \\x []byte: %v", err)
 	}
-	want, _ := decodePGGeometry(plain)
+	want, _ := decodePGGeometry(plain, sridPointLE)
 	if !bytes.Equal(a.([]byte), want.([]byte)) || !bytes.Equal(b.([]byte), want.([]byte)) {
 		t.Error("\\x-prefixed hex did not decode equal to the bare hex form")
 	}
@@ -79,13 +86,13 @@ func TestDecodePGGeometry_HexPrefix(t *testing.T) {
 // TestDecodePGGeometry_Errors: unsupported types and undecodable values
 // fail loudly (no silent fallback).
 func TestDecodePGGeometry_Errors(t *testing.T) {
-	if _, err := decodePGGeometry(42); err == nil {
+	if _, err := decodePGGeometry(42, sridPointLE); err == nil {
 		t.Error("expected error decoding a non-string/[]byte geometry value")
 	}
 	// Odd-length, non-hex bytes are neither valid hex nor valid EWKB; the
 	// odd length means isHexASCII=false → treated as raw EWKB → ewkbToWKB
 	// must reject it loudly rather than silently producing garbage.
-	if _, err := decodePGGeometry([]byte{0x01, 0x99, 0x7a}); err == nil {
+	if _, err := decodePGGeometry([]byte{0x01, 0x99, 0x7a}, 0); err == nil {
 		t.Error("expected error decoding malformed geometry bytes")
 	}
 }
@@ -95,14 +102,14 @@ func TestDecodePGGeometry_Errors(t *testing.T) {
 // decodePGGeometry, and nil is preserved.
 func TestDecodePGGeometry_ViaDecodeValue(t *testing.T) {
 	hexBytes := []byte(hex.EncodeToString(ewkbPointLE()))
-	got, err := decodeValueFromBinary(hexBytes, ir.Geometry{})
+	got, err := decodeValueFromBinary(hexBytes, ir.Geometry{SRID: sridPointLE})
 	if err != nil {
 		t.Fatalf("decodeValue(ir.Geometry): %v", err)
 	}
 	if b, ok := got.([]byte); !ok || len(b) == 0 {
 		t.Errorf("decodeValue(ir.Geometry) = %T(%v); want non-empty []byte WKB", got, got)
 	}
-	if v, err := decodeValueFromBinary(nil, ir.Geometry{}); err != nil || v != nil {
+	if v, err := decodeValueFromBinary(nil, ir.Geometry{SRID: sridPointLE}); err != nil || v != nil {
 		t.Errorf("decodeValue(nil, Geometry) = (%v,%v); want (nil,nil)", v, err)
 	}
 }

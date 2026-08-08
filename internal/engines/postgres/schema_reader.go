@@ -826,7 +826,94 @@ func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]g
 			HasM:    hasM,
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := r.addDomainGeometryColumnInfo(ctx, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// addDomainGeometryColumnInfo fills in the geometry columns that
+// `geometry_columns` cannot see: those typed through a DOMAIN.
+//
+// PostGIS's view joins on `pg_type.typname = 'geometry'`, and a domain
+// column's atttypid is the DOMAIN's oid, so `g geometry(POINT,4326)`
+// appears and `g rsg_pt` (a DOMAIN over the same) does not. Everything
+// downstream then read that column as GeometryUnspecified + SRID 0 — the
+// subtype and the SRID both silently gone at the COLUMN level, which is
+// how a 4326 value ended up re-stamped as SRID 0 on the target.
+//
+// Found by the row-level SRID guard (audit 2026-08-05 C-14): the guard
+// refused `rsgdom.g_pt`, whose rows carry 4326, against a column the
+// reader reported as SRID 0. The row guard was right and the column read
+// was wrong, so the fix is here — the value CAN be carried.
+//
+// The subtype/SRID/dimension live in the DOMAIN's own typmod, which
+// PostGIS's `postgis_typmod_*` accessors decode; `upper()` matches the
+// view's uppercase spelling so [parseGeometrySubtype] sees one form. An
+// unconstrained `CREATE DOMAIN d AS geometry` has typtypmod -1, for which the
+// accessors return NULL; the coalesces render that as ("GEOMETRY", 0, 2) —
+// the same degenerate answer the view gives a bare `geometry` column, which
+// is what we want. (Scanning them as NOT NULL was the first cut, and it
+// failed loudly on the first unconstrained domain it met, which is the right
+// way for that mistake to surface.)
+//
+// Entries already present from the view are NOT overwritten: a real
+// geometry column and a domain column cannot collide on table.column, so
+// the guard is defensive only.
+func (r *SchemaReader) addDomainGeometryColumnInfo(ctx context.Context, out map[string]geometryColumnInfo) error {
+	const q = `
+		SELECT c.relname,
+		       a.attname,
+		       coalesce(upper(postgis_typmod_type(t.typtypmod)), 'GEOMETRY'),
+		       coalesce(postgis_typmod_srid(t.typtypmod), 0),
+		       coalesce(postgis_typmod_dims(t.typtypmod), 2)
+		FROM   pg_attribute  a
+		JOIN   pg_class      c  ON c.oid = a.attrelid
+		JOIN   pg_namespace  n  ON n.oid = c.relnamespace
+		JOIN   pg_type       t  ON t.oid = a.atttypid
+		JOIN   pg_type       bt ON bt.oid = t.typbasetype
+		WHERE  n.nspname   = $1
+		  AND  c.relkind   IN ('r', 'p')
+		  AND  a.attnum    > 0
+		  AND  NOT a.attisdropped
+		  AND  t.typtype   = 'd'
+		  AND  bt.typname  = 'geometry'`
+
+	rows, err := r.catalogQuery(ctx, q, r.schema)
+	if err != nil {
+		// Reached only when geometry_columns resolved, so PostGIS is
+		// installed; a failure here is genuine and must not be swallowed
+		// the way a missing view is.
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			tableName, columnName string
+			subtype               string
+			srid                  int64
+			coordDim              int
+		)
+		if err := rows.Scan(&tableName, &columnName, &subtype, &srid, &coordDim); err != nil {
+			return err
+		}
+		key := tableName + "." + columnName
+		if _, exists := out[key]; exists {
+			continue
+		}
+		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
+		out[key] = geometryColumnInfo{
+			Subtype: subtype,
+			SRID:    int(srid),
+			HasZ:    hasZ,
+			HasM:    hasM,
+		}
+	}
+	return rows.Err()
 }
 
 // dimensionFlagsFromCoordDim maps PostGIS's two-channel dimension

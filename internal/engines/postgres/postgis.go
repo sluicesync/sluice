@@ -182,6 +182,39 @@ func ewkbToWKB(ewkb []byte) ([]byte, error) {
 	return out, nil
 }
 
+// ewkbSRID reads the spatial-reference id out of a PostGIS EWKB value
+// WITHOUT stripping anything — the read half of what [ewkbToWKB] discards.
+// It exists so the geometry decoder can compare the value's own SRID
+// against the column's declared one before the strip throws it away
+// (audit 2026-08-05 C-14, [ir.CheckGeometryRowSRID]).
+//
+// A value with no SRID-present flag reports 0, which is PostGIS's own
+// spelling of "no spatial reference declared" and matches what an
+// unconstrained `geometry` column reports for itself — so the two sides of
+// the comparison agree in the common case without a special branch.
+// Malformed input reports 0 as well: [ewkbToWKB] runs next on the same
+// bytes and produces the specific framing error, and duplicating that
+// judgement here would give one malformed value two different diagnoses.
+func ewkbSRID(ewkb []byte) uint32 {
+	if len(ewkb) < 9 {
+		return 0
+	}
+	var endian binary.ByteOrder
+	switch ewkb[0] {
+	case 0:
+		endian = binary.BigEndian
+	case 1:
+		endian = binary.LittleEndian
+	default:
+		return 0
+	}
+	const sridFlag uint32 = 0x20000000
+	if endian.Uint32(ewkb[1:5])&sridFlag == 0 {
+		return 0
+	}
+	return endian.Uint32(ewkb[5:9])
+}
+
 // mysqlGeometryToWKB strips MySQL's 4-byte little-endian SRID
 // prefix from a geometry value's bytes, returning the trailing WKB
 // payload and the SRID itself.

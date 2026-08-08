@@ -83,8 +83,13 @@ func TestParseSchemaFile_FullFamilyCreateTable(t *testing.T) {
 		"tags":    ir.Set{Values: []string{"x", "y"}},
 		"mask":    ir.Bit{Length: 5},
 		"onebit":  ir.Boolean{},
-		"pt":      ir.Geometry{Subtype: ir.GeometryPoint},
-		"up":      ir.Varchar{Length: 16},
+		// SRID 4326, from the `/*!80003 SRID 4326 */` the fixture DDL has
+		// always carried. This expectation said SRID 0 until audit
+		// 2026-08-05 C-14 — the fixture exercised the attribute and the
+		// assertion encoded the defect, so the lexer's blanket
+		// versioned-comment skip dropped it with nothing to notice.
+		"pt": ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+		"up": ir.Varchar{Length: 16},
 	}
 	if len(table.Columns) != len(wantTypes) {
 		t.Fatalf("columns = %d; want %d", len(table.Columns), len(wantTypes))

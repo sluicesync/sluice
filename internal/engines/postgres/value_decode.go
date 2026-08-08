@@ -154,7 +154,11 @@ func decodeValue(raw any, t ir.Type, prov valueProvenance) (any, error) {
 		// Same-engine PG → PG paths use the bytes-shape directly, so
 		// we accept []byte too; pre-EWKB-framed (raw WKB) input also
 		// passes through untouched via ewkbToWKB.
-		return decodePGGeometry(raw)
+		//
+		// v.SRID is the COLUMN's declared spatial reference; the decoder
+		// needs it to refuse a row whose own SRID differs, because the
+		// strip below is what would otherwise lose it (C-14).
+		return decodePGGeometry(raw, v.SRID)
 	case ir.ExtensionType:
 		// ADR-0032: extension passthrough decodes as opaque bytes
 		// (or canonical text for engines/codepaths that surface
@@ -214,15 +218,22 @@ func decodeValue(raw any, t ir.Type, prov valueProvenance) (any, error) {
 // with a byte-order byte (0x00/0x01) that is never an ASCII hex digit —
 // so isHexASCII cleanly distinguishes them (the Bug-144 []byte-is-text
 // trap, applied to geometry). Both ultimately reach [ewkbToWKB], which
-// strips the SRID framing and returns raw WKB. Per-row SRID is
-// intentionally dropped — the IR treats SRID as a per-column property
-// (ADR-0035), recovered target-side at apply time (#20).
-func decodePGGeometry(raw any) (any, error) {
+// strips the SRID framing and returns raw WKB.
+//
+// The strip is what makes the per-row SRID unrepresentable, so it is
+// gated: columnSRID is the column's declared [ir.Geometry.SRID], and a
+// value whose own EWKB names a DIFFERENT one is refused rather than
+// silently re-stamped with the column's (audit 2026-08-05 C-14 — the
+// pre-fix comment here said the drop was intentional "because the IR
+// treats SRID as a per-column property", which is a statement about the
+// IR and was being read as one about PostGIS, where an unconstrained
+// `geometry` column is per-ROW). See [ir.CheckGeometryRowSRID].
+func decodePGGeometry(raw any, columnSRID int) (any, error) {
 	switch v := raw.(type) {
 	case string:
-		return decodeGeometryHexOrRaw([]byte(v))
+		return decodeGeometryHexOrRaw([]byte(v), columnSRID)
 	case []byte:
-		return decodeGeometryHexOrRaw(v)
+		return decodeGeometryHexOrRaw(v, columnSRID)
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as Geometry", raw)
 }
@@ -230,17 +241,23 @@ func decodePGGeometry(raw any) (any, error) {
 // decodeGeometryHexOrRaw turns a geometry value's bytes into raw WKB,
 // accepting either the hex-EWKB text spelling (cold-start string /
 // pgoutput text-format bytes) or raw binary EWKB. See [decodePGGeometry]
-// for why the two are unambiguous.
-func decodeGeometryHexOrRaw(b []byte) (any, error) {
+// for why the two are unambiguous, and for the columnSRID gate.
+func decodeGeometryHexOrRaw(b []byte, columnSRID int) (any, error) {
 	b = bytes.TrimPrefix(b, []byte(`\x`))
+	ewkb := b
 	if isHexASCII(b) {
-		ewkb := make([]byte, hex.DecodedLen(len(b)))
+		ewkb = make([]byte, hex.DecodedLen(len(b)))
 		if _, err := hex.Decode(ewkb, b); err != nil {
 			return nil, fmt.Errorf("postgres: cannot decode geometry hex %q: %w", b, err)
 		}
-		return ewkbToWKB(ewkb)
 	}
-	return ewkbToWKB(b)
+	// Order matters: read the SRID off the framing BEFORE ewkbToWKB drops
+	// it. A malformed value reports SRID 0 here and gets its real framing
+	// error from ewkbToWKB below, so it is diagnosed once.
+	if err := ir.CheckGeometryRowSRID(columnSRID, ewkbSRID(ewkb)); err != nil {
+		return nil, fmt.Errorf("postgres: %w", err)
+	}
+	return ewkbToWKB(ewkb)
 }
 
 // isHexASCII reports whether b is a non-empty, even-length string of ASCII

@@ -113,16 +113,25 @@ func TestLiteralToRowValue_FamilyMatrix(t *testing.T) {
 		{"bit/bare-number", ir.Bit{Length: 5}, num("21"), "10101"},
 
 		// ---- Geometry: dump carries <SRID LE><WKB>; IR wants bare WKB ----
+		// The column's declared SRID must MATCH the dump literal's prefix;
+		// a mismatch is refused, not stripped (audit 2026-08-05 C-14 — see
+		// TestLiteralToRowValue_Refusals). 0xE6,0x10 = 4326 little-endian.
 		{
 			"geometry/hex",
-			ir.Geometry{Subtype: ir.GeometryPoint},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
 			hexb(0xE6, 0x10, 0x00, 0x00, 0x01, 0x01, 0x02),
 			[]byte{0x01, 0x01, 0x02},
 		},
 		{
 			"geometry/escaped",
-			ir.Geometry{Subtype: ir.GeometryPoint},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
 			str("\xe6\x10\x00\x00\x01\x01\x02"),
+			[]byte{0x01, 0x01, 0x02},
+		},
+		{
+			"geometry/srid-0-column-and-value",
+			ir.Geometry{Subtype: ir.GeometryPoint},
+			hexb(0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02),
 			[]byte{0x01, 0x01, 0x02},
 		},
 
@@ -181,6 +190,21 @@ func TestLiteralToRowValue_Refusals(t *testing.T) {
 		{"bit/overflow-hex", ir.Bit{Length: 5}, literal{kind: litHex, bytes: []byte{0xFF}}},
 		{"bit/overflow-number", ir.Bit{Length: 5}, literal{kind: litNumber, text: "63"}},
 		{"bit/overflow-wide-bytes", ir.Bit{Length: 8}, literal{kind: litHex, bytes: []byte{0x01, 0x00}}},
+		// Audit 2026-08-05 C-14: the dump literal's own SRID prefix must
+		// agree with the column's declared SRID. A mydumper dump of a
+		// MySQL column declared WITHOUT `SRID n` can carry a different
+		// SRID on every row; stripping it (the pre-fix behaviour) landed
+		// every one of them at the column's SRID. Both directions refuse.
+		{
+			"geometry/row-srid-not-declared-by-column",
+			ir.Geometry{Subtype: ir.GeometryPoint},
+			literal{kind: litHex, bytes: []byte{0xE6, 0x10, 0x00, 0x00, 0x01, 0x01, 0x02}},
+		},
+		{
+			"geometry/row-srid-differs-from-declared",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 3857},
+			literal{kind: litHex, bytes: []byte{0xE6, 0x10, 0x00, 0x00, 0x01, 0x01, 0x02}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -119,9 +119,26 @@ func isIdentByte(c byte) bool {
 		c == '_' || c == '$' || c >= 0x80
 }
 
-// tokenizeSQL lexes a single MySQL statement. Comments (all forms,
-// including versioned `/*!` blocks — which in CREATE TABLE bodies carry
-// only skippable physical options such as partition clauses) are dropped.
+// tokenizeSQL lexes a single MySQL statement. Comments (all forms) are
+// dropped, with ONE named exception: a versioned `/*!` block carrying a
+// geometry column's `SRID n` attribute is lexed as if the comment markers
+// were not there, because it is not a comment — it is the column's spatial
+// reference, and MySQL 8 has no other spelling for it in SHOW CREATE TABLE.
+//
+// The exception is deliberately narrow, and the general case is deliberately
+// NOT taken here. This function's own doc used to justify the blanket skip
+// with "versioned blocks in CREATE TABLE bodies carry only skippable
+// physical options such as partition clauses" — an environmental claim that
+// was simply false, and that cost a silent loss: a dumped
+// `POINT SRID 4326` column parsed as SRID 0, the target column was created
+// without an SRID, and every row was re-stamped (audit 2026-08-05 C-14; the
+// row-level guard is what surfaced it). Lexing EVERY versioned block would
+// also close the partition-clause hole, but it would convert that hole from
+// a silent drop into a loud parse refusal for every partitioned table —
+// a real change with its own blast radius, and a separate decision.
+// **UNVERIFIED PREMISE, stated rather than left implied: `/*!... PARTITION
+// BY ...*/` and the other versioned blocks a CREATE TABLE body can carry are
+// still dropped silently.**
 func tokenizeSQL(s, file string) ([]token, error) {
 	var toks []token
 	n := len(s)
@@ -134,6 +151,18 @@ func tokenizeSQL(s, file string) ([]token, error) {
 			break
 		}
 		i = next
+		// The skip above stops AT a versioned SRID block rather than
+		// consuming it, so its two tokens can be emitted here, outside any
+		// string or quoted identifier by construction.
+		if srid, end, ok := versionedSRIDComment(s, i); ok {
+			toks = append(
+				toks,
+				token{kind: tokIdent, text: "SRID", pos: i},
+				token{kind: tokNumber, text: srid, pos: i},
+			)
+			i = end
+			continue
+		}
 		tok, end, err := scanSQLToken(s, i, file)
 		if err != nil {
 			return nil, err
@@ -143,6 +172,60 @@ func tokenizeSQL(s, file string) ([]token, error) {
 	}
 	toks = append(toks, token{kind: tokEOF, pos: n})
 	return toks, nil
+}
+
+// versionedSRIDComment reports whether s[i:] begins with a MySQL versioned
+// comment whose entire payload is a geometry column's SRID attribute —
+// `/*!80003 SRID 4326 */`, the form SHOW CREATE TABLE emits and mydumper
+// copies verbatim. It returns the SRID digits and the index past `*/`.
+//
+// The match is strict on purpose: version digits, the SRID keyword, one
+// run of decimal digits, and nothing else before the terminator. A block
+// carrying anything more is not this case and keeps the blanket skip, so
+// the exception cannot quietly widen into "lex versioned comments".
+func versionedSRIDComment(s string, i int) (srid string, end int, ok bool) {
+	if !strings.HasPrefix(s[i:], "/*!") {
+		return "", 0, false
+	}
+	term := strings.Index(s[i:], "*/")
+	if term < 0 {
+		return "", 0, false
+	}
+	body := s[i+3 : i+term]
+	// Version digits, then the payload.
+	j := 0
+	for j < len(body) && body[j] >= '0' && body[j] <= '9' {
+		j++
+	}
+	payload := strings.TrimSpace(body[j:])
+	rest, found := cutFoldPrefix(payload, "SRID")
+	if !found {
+		return "", 0, false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "", 0, false
+	}
+	for k := 0; k < len(rest); k++ {
+		if rest[k] < '0' || rest[k] > '9' {
+			return "", 0, false
+		}
+	}
+	return rest, i + term + 2, true
+}
+
+// cutFoldPrefix strips a case-insensitive prefix, reporting whether it was
+// present. The prefix must be followed by a space (or end the string) so
+// `SRIDX` is not read as `SRID`.
+func cutFoldPrefix(s, prefix string) (rest string, found bool) {
+	if len(s) < len(prefix) || !strings.EqualFold(s[:len(prefix)], prefix) {
+		return s, false
+	}
+	rest = s[len(prefix):]
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+		return s, false
+	}
+	return rest, true
 }
 
 // skipSQLSpaceAndComments advances i past whitespace, `#`/`-- ` line
@@ -165,6 +248,11 @@ func skipSQLSpaceAndComments(s string, i int, file string) (int, error) {
 				i++
 			}
 		case c == '/' && i+1 < n && s[i+1] == '*':
+			// A versioned SRID block is not a comment (see tokenizeSQL);
+			// stop here so the caller lexes it into tokens.
+			if _, _, ok := versionedSRIDComment(s, i); ok {
+				return i, nil
+			}
 			end := strings.Index(s[i+2:], "*/")
 			if end < 0 {
 				return 0, fmt.Errorf("mydumper: %s: unterminated block comment at offset %d", file, i)

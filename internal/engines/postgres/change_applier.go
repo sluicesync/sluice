@@ -2318,6 +2318,14 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 // WHERE uses every column in Before with NULL-aware predicate
 // building.
 func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	// Audit 2026-08-05 C-9: refuse a before-image with nothing usable as a
+	// predicate, in the same words the MySQL applier uses. Pre-fix this
+	// rendered `UPDATE t SET … WHERE ` and PG answered 42601 "syntax error
+	// at end of input" — loud, but naming neither the stream nor the row,
+	// and NOT the same answer MySQL's coalescing path gave (it upserted).
+	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
+		return "", nil, appliershared.RefuseNoRowPredicate(engineNamePostgres, "update", schema, table, before)
+	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	setSQL, setArgs, err := buildSetClause(after, 1, colTypes)
 	if err != nil {
@@ -2335,8 +2343,13 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
-// as the WHERE predicate.
+// as the WHERE predicate. An unusable before-image is refused for the
+// same reason as [buildUpdateSQL] — and the stakes are higher, since a
+// predicate-less DELETE that reached the server would empty the table.
 func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
+		return "", nil, appliershared.RefuseNoRowPredicate(engineNamePostgres, "delete", schema, table, before)
+	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	whereSQL, whereArgs, err := buildWhereClause(before, 1, colTypes)
 	if err != nil {

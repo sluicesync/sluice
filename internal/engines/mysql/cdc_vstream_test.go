@@ -740,7 +740,8 @@ func TestDecodeVStreamCellDateTime(t *testing.T) {
 // tripped the WKB byte-order-flag check (SRID 4326 = E6 10 00 00 →
 // byte 0 of 0xE6 isn't a valid byte-order flag). The decoder strips
 // the prefix so downstream consumers see standard WKB matching the
-// IR contract for ir.Geometry values.
+// IR contract for ir.Geometry values — for an SRID-0 value. A NON-ZERO
+// prefix is refused instead of stripped (audit 2026-08-05 C-14).
 func TestDecodeVStreamCellGeometry(t *testing.T) {
 	// MySQL's on-wire geometry layout: <srid uint32 LE><wkb>.
 	// SRID 4326 little-endian is E6 10 00 00. The trailing 21 bytes
@@ -754,15 +755,25 @@ func TestDecodeVStreamCellGeometry(t *testing.T) {
 	srid4326 := []byte{0xE6, 0x10, 0x00, 0x00}
 	mysqlBytes := append(append([]byte{}, srid4326...), wkb...)
 
-	t.Run("strips SRID 4326 prefix yielding raw WKB", func(t *testing.T) {
+	t.Run("REFUSES a non-zero SRID prefix", func(t *testing.T) {
+		// Audit 2026-08-05 C-14. This subtest previously asserted the
+		// 4326 prefix was STRIPPED and the WKB returned — which is where
+		// the SRID went. It cannot be carried on this path: VStream's
+		// FieldEvent has no per-column SRID, so columnMetaFromField gives
+		// the column SRID 0 and the target column is created without one.
+		// Stripping therefore lost the SRID at both levels and landed the
+		// geometry at SRID 0 — valid geometry naming the wrong place.
 		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
 		got := decodeVStreamCell(f, mysqlBytes)
-		gotBytes, ok := got.([]byte)
+		sentinel, ok := got.(*vstreamGeometrySRIDError)
 		if !ok {
-			t.Fatalf("got %T; want []byte", got)
+			t.Fatalf("got %T; want *vstreamGeometrySRIDError (the SRID must not be silently stripped)", got)
 		}
-		if !reflect.DeepEqual(gotBytes, wkb) {
-			t.Errorf("got %x; want %x (raw WKB without SRID prefix)", gotBytes, wkb)
+		if sentinel.srid != 4326 {
+			t.Errorf("sentinel carries SRID %d; want 4326", sentinel.srid)
+		}
+		if !errors.Is(sentinel.err(), ir.ErrGeometryRowSRIDMismatch) {
+			t.Errorf("sentinel error %v does not wrap ir.ErrGeometryRowSRIDMismatch", sentinel.err())
 		}
 	})
 

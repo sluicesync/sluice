@@ -293,6 +293,12 @@ type ChangeApplier struct {
 	keylessCache  map[string]bool
 	warnedKeyless map[string]bool
 
+	// warnedPartialAfter tracks tables whose partial-after-image notice
+	// (audit 2026-08-05 C-10) has already been emitted, so the "UPDATEs
+	// are not coalescing for this table" INFO fires at most once per
+	// table. Same lock, same shape as warnedKeyless.
+	warnedPartialAfter map[string]bool
+
 	// nonPKUniqueCache maps "schema.table" → whether the TARGET table
 	// carries a UNIQUE index other than the PRIMARY KEY (roadmap item
 	// 131). It decides the lane [laneapply.RouteScope]: a table with one
@@ -1588,7 +1594,17 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 // in After (including ones whose value didn't change — unchanged-
 // column detection is a v1.5 optimization). WHERE uses every column
 // in Before with NULL-aware predicate building.
+//
+// A before-image with nothing usable as a predicate is REFUSED (audit
+// 2026-08-05 C-9). Pre-fix this rendered `UPDATE t SET … WHERE ` and left
+// the server to reject it — loud, but as a bare 1064 naming neither the
+// stream nor the row, and the coalescing path never reached it at all.
+// See [appliershared.RefuseNoRowPredicate] for why refusing beats every
+// alternative, and why both engines make the same call.
 func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
+		return "", nil, appliershared.RefuseNoRowPredicate(engineNameMySQL, "update", schema, table, before)
+	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	setSQL, setArgs, err := buildSetClause(after, colTypes)
 	if err != nil {
@@ -1606,8 +1622,13 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
-// as the WHERE predicate.
+// as the WHERE predicate. An unusable before-image is refused for the
+// same reason as [buildUpdateSQL] — and the stakes are higher, since a
+// predicate-less DELETE that reached the server would empty the table.
 func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
+		return "", nil, appliershared.RefuseNoRowPredicate(engineNameMySQL, "delete", schema, table, before)
+	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	whereSQL, whereArgs, err := buildWhereClause(before, colTypes)
 	if err != nil {

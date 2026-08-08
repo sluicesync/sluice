@@ -104,6 +104,23 @@ func (a *ChangeApplier) markWarnedKeyless(qn string) (firstTime bool) {
 	return true
 }
 
+// markWarnedPartialAfter is [markWarnedKeyless] for the C-10 partial
+// after-image notice: same atomic check-and-set under the same lock, so the
+// notice fires once per table even when several concurrent lanes hit the
+// table's first partial UPDATE at once.
+func (a *ChangeApplier) markWarnedPartialAfter(qn string) (firstTime bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.warnedPartialAfter == nil {
+		a.warnedPartialAfter = make(map[string]bool)
+	}
+	if a.warnedPartialAfter[qn] {
+		return false
+	}
+	a.warnedPartialAfter[qn] = true
+	return true
+}
+
 func (a *ChangeApplier) cachedNonPKUnique(qn string) (hasUnique, ok bool) {
 	a.cacheMu.RLock()
 	defer a.cacheMu.RUnlock()

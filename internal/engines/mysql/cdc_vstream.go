@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1839,6 +1840,14 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 			}
 			v = rv
 		}
+		// Audit 2026-08-05 C-14: a geometry cell whose on-wire SRID
+		// prefix is non-zero arrives as its own sentinel, for the same
+		// reason (no error channel in the cell decoder). There is no
+		// policy knob for it — the SRID cannot be carried on this path
+		// at all — so it becomes a loud stream error naming the column.
+		if gs, isSRID := v.(*vstreamGeometrySRIDError); isSRID {
+			return nil, false, fmt.Errorf("mysql/vstream: column %q: %w", f.GetName(), gs.err())
+		}
 		// Vector D: a TINYINT(1) value outside {0,1} is collapsed to a
 		// bool here too (same MySQL convention as the binlog / bulk-copy
 		// paths). VStream cells are text-encoded, so parse the literal
@@ -1867,6 +1876,23 @@ const mysqlNotNullFlag = 1
 // loudly — never silently.
 func vstreamFieldNullable(f *query.Field) bool {
 	return f.GetFlags()&mysqlNotNullFlag == 0
+}
+
+// vstreamGeometrySRIDError is the cell-level sentinel for the C-14
+// refusal on the VStream path: a geometry value whose MySQL on-wire SRID
+// prefix is non-zero, which this path cannot carry (see the Type_GEOMETRY
+// arm of [decodeVStreamCell]). It mirrors zeroDateValueError — a VALUE the
+// row decoder type-asserts and converts into a loud error, because
+// [decodeVStreamCell] has no error return.
+type vstreamGeometrySRIDError struct {
+	srid uint32
+}
+
+// err renders the sentinel as the shared IR refusal, so the VStream path's
+// wording and its errors.Is target are the same as every other read path's.
+// The column SRID is 0 by construction here (columnMetaFromField).
+func (e *vstreamGeometrySRIDError) err() error {
+	return ir.CheckGeometryRowSRID(0, e.srid)
 }
 
 // decodeVStreamCell maps a single Vitess-wire cell to its IR-Row
@@ -2003,13 +2029,26 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// (decodeMySQLGeometry). Strip the 4-byte SRID prefix so
 		// downstream consumers (most importantly the PG row writer's
 		// EWKB framing) see the same WKB bytes regardless of which
-		// MySQL CDC source delivered them. SRID is intentionally
-		// dropped here — per-column SRID lives on the IR's
-		// ir.Geometry.SRID and is set at schema-translation time.
+		// MySQL CDC source delivered them.
+		//
+		// Audit 2026-08-05 C-14: a NON-ZERO prefix is refused, not
+		// stripped. The comparison the other read paths make — row SRID
+		// vs the column's declared ir.Geometry.SRID — degenerates to
+		// "vs 0" here, because columnMetaFromField hardcodes SrsID 0:
+		// VStream's FieldEvent carries no per-column SRID, so the column
+		// sluice creates on the target has none either. Stripping a real
+		// SRID on this path therefore lost it TWICE over (column and
+		// row) and landed the geometry at SRID 0. Returned as a sentinel
+		// VALUE rather than an error because decodeVStreamCell has no
+		// error channel; decodeVStreamRow resolves it, exactly as it
+		// does for the zero-date sentinel.
 		// Malformed-prefix payloads (under 5 bytes) fall through with
 		// raw bytes copied; the downstream WKB validator surfaces a
 		// clearer error than a silent re-shape would.
 		if len(raw) >= 5 {
+			if srid := binary.LittleEndian.Uint32(raw[:4]); srid != 0 {
+				return &vstreamGeometrySRIDError{srid: srid}
+			}
 			return copyBytes(raw[4:])
 		}
 		return copyBytes(raw)

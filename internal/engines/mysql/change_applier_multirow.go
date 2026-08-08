@@ -67,6 +67,19 @@ package mysql
 // keyed stream (ADR-0140 §Correctness): the PK form realises "this PK's row
 // becomes <after> / is gone" and corrects a drifted target rather than
 // silently skipping it.
+//
+// # The precondition that self-healing claim rests on (audit 2026-08-05)
+//
+// "This PK's row becomes <after>" is only a faithful reading of the source
+// while <after> is a COMPLETE row image, because the healing INSERT writes a
+// whole row. ADR-0140 never said so and nothing checked it, and on the
+// cross-engine path the after-image is routinely PARTIAL — pgoutput omits an
+// unchanged out-of-line TOASTed column and the PG reader drops it on purpose,
+// because an absent key means "preserve the target's existing value". Healing
+// an absent row from a partial image therefore FABRICATED one, exit 0. Two
+// more exclusions now keep the upsert form on the ground it is sound on: an
+// empty before-image and a partial after-image both take the serial path. See
+// [mysqlBatchTx.dispatchUpdate] for the reachability and the cost.
 
 import (
 	"context"
@@ -276,28 +289,93 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 	return b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, ir.ApproximateChangeBytes(c))
 }
 
-// dispatchUpdate buffers a keyed, non-PK-changing Update into the upsert-run as
-// its after-image (the row exists in a valid CDC stream, so MySQL takes the
-// ON DUPLICATE KEY UPDATE branch — same end state as the serial UPDATE, keyed by
-// PK). It applies the Update serially (full-before WHERE) when the table has no
-// PK to key on or the Update changes a PK column — upserting the after-image at
-// the new PK would orphan the old-PK row (ADR-0140 §Correctness). The lane
-// router already barriers PK-changing updates; this guard makes the single-lane
-// path safe too.
+// dispatchUpdate buffers a keyed, non-PK-changing Update with a COMPLETE
+// after-image into the upsert-run (the row exists in a valid CDC stream, so
+// MySQL takes the ON DUPLICATE KEY UPDATE branch — same end state as the serial
+// UPDATE, keyed by PK). Anything else applies serially, on the full-before
+// WHERE, which is the same thing the Postgres applier does on every path:
+//
+//   - no PK to key on, or the Update changes a PK column — upserting the
+//     after-image at the new PK would orphan the old-PK row (ADR-0140
+//     §Correctness). The lane router already barriers PK-changing updates;
+//     this guard makes the single-lane path safe too.
+//   - no usable before-image — [buildUpdateSQL] refuses it by name (audit
+//     2026-08-05 C-9). Routing it here rather than upserting it is the whole
+//     point: [laneapply.PKChangedUpdate] answers false for a nil Before (it
+//     cannot compare what it does not have), so without this check the ONE
+//     shape that has no predicate at all was also the one shape that skipped
+//     the predicate builder entirely and got applied as an upsert.
+//   - a PARTIAL after-image — audit 2026-08-05 C-10. The upsert's INSERT
+//     branch writes a WHOLE row, so rewriting an UPDATE as one is sound only
+//     while the after-image covers every non-generated target column. It does
+//     not on the load-bearing cross-engine path: pgoutput sends an unchanged
+//     out-of-line TOASTed column as the 'u' datum and the PG reader's
+//     decodeTuple drops it, deliberately, because "absent key" means
+//     "preserve the target's existing value". An UPDATE honours that. An
+//     upsert honours it only while the target row EXISTS — and a CDC target
+//     row can be absent (an out-of-band delete, a resnapshot gap, a partial
+//     restore), which is precisely the drift ADR-0140 claims the upsert form
+//     "corrects". What it actually did was INSERT the columns the source
+//     mentioned and the target's DEFAULT for the ones it did not, fabricating
+//     a row that never existed at the source, exit 0. Whether that was even
+//     VISIBLE depended on the target column: NULLable columns took it
+//     silently, NOT NULL-without-DEFAULT ones failed the batch with 1364.
+//
+// The completeness test is against the TARGET's columns, which also catches a
+// target column the SOURCE does not have at all. That over-reads: a target-only
+// column is not an omission. It is accepted deliberately, because the applier
+// cannot tell the two apart from the after-image alone — both are "a target
+// column this row does not mention" — and of the two readings only the
+// conservative one never fabricates.
+//
+// The cost of the C-10 fallback is throughput, not correctness: a table whose
+// updates carry partial after-images loses ADR-0140 coalescing and goes back to
+// one round trip per UPDATE. That is the same rate the serial path always had,
+// and it is bounded to tables with out-of-line columns on a PG source (or a
+// target column the source lacks, per the paragraph above).
 func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir.Change, upd ir.Update) error {
 	schema := b.a.routedSchema(upd.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, upd.Table)
 	if err != nil {
 		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, upd.Table, err)
 	}
-	if len(pk) == 0 || upd.After == nil || laneapply.PKChangedUpdate(upd, pk) {
+	if len(pk) == 0 || upd.After == nil || len(upd.Before) == 0 || laneapply.PKChangedUpdate(upd, pk) {
 		return b.applySerial(ctx, streamID, c)
 	}
 	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, upd.Table)
 	if err != nil {
 		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, upd.Table, err)
 	}
+	if missing := appliershared.MissingNonGeneratedColumns(upd.After, colTypes); len(missing) > 0 {
+		b.a.logPartialAfterImage(ctx, schema, upd.Table, missing)
+		return b.applySerial(ctx, streamID, c)
+	}
 	return b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, ir.ApproximateChangeBytes(c))
+}
+
+// logPartialAfterImage emits the once-per-table notice that a table's UPDATEs
+// carry partial after-images, so ADR-0140 update-coalescing is off for it and
+// its UPDATEs cost one round trip each. INFO rather than WARN: nothing is
+// wrong — an omitted after-image column is the source telling us to preserve
+// the target's value — but the throughput consequence is real and an operator
+// comparing apply rates between tables deserves to see why.
+//
+// Fire-once is keyed on the table under the applier's cache lock, the same
+// mechanism (and the same reason: concurrent lanes) as the ADR-0089 keyless
+// WARN.
+func (a *ChangeApplier) logPartialAfterImage(ctx context.Context, schema, table string, missing []string) {
+	qn := qualifiedName(schema, table)
+	if !a.markWarnedPartialAfter(qn) {
+		return
+	}
+	slog.InfoContext(
+		ctx,
+		"mysql: applier: table's UPDATE after-images omit columns — applying UPDATEs individually "+
+			"(an omitted column means \"preserve the target's value\", which an upsert cannot honour "+
+			"when the target row is absent)",
+		slog.String("table", qn),
+		slog.Any("omitted_columns", missing),
+	)
 }
 
 // dispatchDelete buffers a keyed Delete into the delete-run (its primary-key

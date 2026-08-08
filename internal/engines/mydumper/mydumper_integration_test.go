@@ -158,17 +158,25 @@ CREATE TABLE skipme (
 
 INSERT INTO skipme VALUES (1), (2);
 
+-- g4326 exists so a NON-ZERO SRID prefix is still exercised through a real
+-- mydumper dump. It replaced a row that put SRID 4326 into the UNCONSTRAINED
+-- g column, which audit 2026-08-05 C-14 showed was silently re-stamped to
+-- SRID 0 — by the dump path AND the live path alike, so the leg-vs-oracle
+-- compare agreed on the same wrong answer and saw nothing. A per-row SRID the
+-- column does not declare is now refused (ir.CheckGeometryRowSRID); declaring
+-- it on the column is the shape that carries.
 CREATE TABLE geo (
-  id BIGINT NOT NULL,
-  pt POINT,
-  g  GEOMETRY,
+  id    BIGINT NOT NULL,
+  pt    POINT,
+  g     GEOMETRY,
+  g4326 POINT SRID 4326,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT INTO geo VALUES
-(1, ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('LINESTRING(0 0,1 1,2 0)')),
-(2, NULL, ST_GeomFromText('POINT(3 4)', 4326)),
-(3, ST_GeomFromText('POINT(-5.5 6.25)'), NULL);
+(1, ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('LINESTRING(0 0,1 1,2 0)'), ST_GeomFromText('POINT(10 20)', 4326)),
+(2, NULL, ST_GeomFromText('POINT(3 4)'), NULL),
+(3, ST_GeomFromText('POINT(-5.5 6.25)'), NULL, ST_GeomFromText('POINT(-1 -2)', 4326));
 `
 
 // TestMydumperIntegration_RealDumpEndToEnd is the ground-truth suite. One
