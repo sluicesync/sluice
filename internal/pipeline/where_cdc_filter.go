@@ -414,18 +414,84 @@ func primaryKeyColumnSet(tbl *ir.Table) map[string]bool {
 // full before-image so the predicate could be evaluated; the WHERE must
 // still be key-only per Bug-8/88/92). Returns before unchanged when the
 // table has no known primary key.
-func (f *whereCDCFilter) narrowBefore(table string, before ir.Row) ir.Row {
+//
+// It REFUSES when the narrowing would land on a PROPER SUBSET of the key,
+// which is the generated-PRIMARY-KEY identity class arriving here from a
+// direction the engines cannot guard (2026-08-08). The re-narrowing is
+// engine-agnostic and keys on the IR schema's PK, while the before-image
+// it narrows comes off whatever wire the source speaks — and the two
+// disagree exactly when a key column is not carriable:
+//
+//   - a Postgres source does not publish a STORED generated column before
+//     PG 18, so `PRIMARY KEY (a, g)` with g generated arrives as {a} and
+//     this would render `WHERE a = $1`, a NON-UNIQUE prefix. One source
+//     DELETE, every target row sharing the prefix;
+//   - a MySQL binlog source's decoder drops generated columns for the
+//     same key shape (engines/mysql/cdc_generated_pk.go), and the reader's
+//     own refusal sits on the arms that NARROW — which this path
+//     deliberately bypasses, since a filtered table is streamed
+//     un-narrowed so the predicate can read every OLD column.
+//
+// The check is on the EVIDENCE (a key column absent from the image), not
+// on the shape (a generated column in the PK), so it does not fire for a
+// source that does carry the value — a Vitess VStream before-image, or a
+// PG 18 publication created WITH (publish_generated_columns = stored) —
+// and it also catches any other producer of a partial key. This is the
+// [filterBeforeToKeyCols] guard the Postgres reader already has, at the
+// one narrowing site that had none.
+func (f *whereCDCFilter) narrowBefore(op, schema, table string, before ir.Row) (ir.Row, error) {
 	pk := f.pkCols[strings.ToLower(table)]
 	if len(pk) == 0 || before == nil {
-		return before
+		return before, nil
 	}
+	// Keys keep the image's own casing (the applier binds what the target
+	// knows); `seen` is the lower-cased tally that makes the completeness
+	// test exact regardless of casing.
 	out := make(ir.Row, len(pk))
+	seen := make(map[string]bool, len(pk))
 	for name, v := range before {
-		if pk[strings.ToLower(name)] {
+		if lower := strings.ToLower(name); pk[lower] {
 			out[name] = v
+			seen[lower] = true
 		}
 	}
-	return out
+	if len(seen) < len(pk) {
+		missing := make([]string, 0, len(pk)-len(seen))
+		for name := range pk {
+			if !seen[name] {
+				missing = append(missing, name)
+			}
+		}
+		sort.Strings(missing)
+		return nil, partialKeyImage(op, schema, table, missing)
+	}
+	return out, nil
+}
+
+// partialKeyImage builds the coded refusal for a filtered UPDATE/DELETE
+// whose before-image does not carry every primary-key column — so the
+// re-narrowed WHERE would be a proper subset of the row identity. See
+// [whereCDCFilter.narrowBefore] for the two known producers.
+func partialKeyImage(op, schema, table string, missing []string) error {
+	quoted := make([]string, len(missing))
+	for i, m := range missing {
+		quoted[i] = fmt.Sprintf("%q", m)
+	}
+	return sluicecode.Wrap(
+		sluicecode.CodeCDCGeneratedPrimaryKey,
+		"on the SOURCE, give the table a row identity the change stream can carry — demote any GENERATED column "+
+			"out of the PRIMARY KEY (a surrogate key, or an existing NOT NULL UNIQUE column); or drop the --where "+
+			"entry for this table; or copy it with `sluice migrate --where` instead",
+		fmt.Errorf(
+			"continuous filtered sync: a %s on filtered table %s arrived with a before-image that omits primary-key "+
+				"column(s) %s, so re-narrowing it for the applier's WHERE would yield only part of the row identity. "+
+				"The known cause is a GENERATED primary-key column, which no change stream carries: PostgreSQL does not "+
+				"publish generated columns before 18, and sluice's MySQL binlog decoder drops them. Applying the change "+
+				"would run a WHERE over a NON-UNIQUE prefix of the key and could delete or overwrite target rows the "+
+				"source never touched. The stream stops here rather than diverging",
+			op, qualifiedTableName(schema, table), strings.Join(quoted, ", "),
+		),
+	)
 }
 
 // imageMissingColumn reports whether a decoded row image (before OR after)
@@ -697,7 +763,11 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		if p.Eval(e.Before) {
 			// Re-narrow the (full) before-image to the key columns for the
 			// applier's WHERE.
-			e.Before = f.narrowBefore(e.Table, e.Before)
+			narrowed, err := f.narrowBefore("DELETE", e.Schema, e.Table, e.Before)
+			if err != nil {
+				return nil, err
+			}
+			e.Before = narrowed
 			return []ir.Change{e}, nil
 		}
 		f.debugServerDeliveredDrop("DELETE", e.Schema, e.Table)
@@ -729,7 +799,11 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 		case before && after:
 			// Stays in scope. Re-narrow Before to the key columns for the
 			// applier's WHERE (After keeps every column for the SET clause).
-			e.Before = f.narrowBefore(e.Table, e.Before)
+			narrowed, err := f.narrowBefore("UPDATE", e.Schema, e.Table, e.Before)
+			if err != nil {
+				return nil, err
+			}
+			e.Before = narrowed
 			return []ir.Change{e}, nil
 		case !before && !after:
 			f.debugServerDeliveredDrop("UPDATE", e.Schema, e.Table)
@@ -758,11 +832,15 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 			// documents it (docs/operator/filtered-subset-migration.md) rather
 			// than silently reshaping the move-OUT — the operator who opts into
 			// degraded FKs owns the referential-integrity reconciliation.
+			narrowed, err := f.narrowBefore("UPDATE", e.Schema, e.Table, e.Before)
+			if err != nil {
+				return nil, err
+			}
 			return []ir.Change{ir.Delete{
 				Position:   e.Position,
 				Schema:     e.Schema,
 				Table:      e.Table,
-				Before:     f.narrowBefore(e.Table, e.Before),
+				Before:     narrowed,
 				CommitTime: e.CommitTime,
 			}}, nil
 		}

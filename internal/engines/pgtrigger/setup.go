@@ -940,7 +940,16 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "generated-stored-column",
-				Hint:   "the trigger engine does not replicate GENERATED ALWAYS AS ... STORED columns; use the `postgres` engine (logical replication carries them), or take the whole table out of scope with --exclude-table — sluice has no column-scope filter (ADR-0177)",
+				// The `postgres` alternative is real but NARROWER than the
+				// original wording ("logical replication carries them"),
+				// which was false as stated: pgoutput does not publish a
+				// generated column at all before PG 18. What the postgres
+				// engine actually does is create the TARGET column as
+				// GENERATED so it recomputes — which works for an ordinary
+				// computed column and does NOT work when the column is part
+				// of the row identity, where that engine refuses too
+				// (SLUICE-E-CDC-GENERATED-PRIMARY-KEY, 2026-08-08).
+				Hint: "the trigger engine does not replicate GENERATED ALWAYS AS ... STORED columns; use the `postgres` engine (its target keeps the GENERATED clause, so the column is recomputed rather than carried — unless it is part of the PRIMARY KEY or replica identity, which that engine refuses too), or take the whole table out of scope with --exclude-table — sluice has no column-scope filter (ADR-0177)",
 			})
 		}
 		if shape.hasUnrecognisedDomain {

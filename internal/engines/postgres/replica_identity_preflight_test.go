@@ -108,6 +108,77 @@ func TestReplicaIdentityUsable(t *testing.T) {
 			want:      false,
 			reasonHas: "relreplident",
 		},
+
+		// ---- The 2026-08-08 generated-identity class. PostgreSQL does
+		// not publish a generated column before 18, so a replica identity
+		// containing one is unpublishable on EVERY identity letter that
+		// resolves to an index — for its own reason each time, which is
+		// why all three cells are here rather than one representative.
+		{
+			name: "DEFAULT whose primary key includes a generated column",
+			row: replicaIdentityRow{
+				Identity: "d", PrimaryKeyIndex: "t_pkey", PrimaryKeyUsable: true,
+				IdentityGeneratedCols: []string{"g"},
+			},
+			want:      false,
+			reasonHas: "GENERATED",
+		},
+		{
+			name: "USING INDEX whose nominated index includes a generated column",
+			row: replicaIdentityRow{
+				Identity: "i", ChosenIndex: "t_alt_key", ChosenIndexUsable: true,
+				IdentityGeneratedCols: []string{"g"},
+			},
+			want:      false,
+			reasonHas: "GENERATED",
+		},
+		{
+			// FULL is the remedy the item-93 refusal names, and it is NOT
+			// one here: pgoutput omits a generated column under FULL too,
+			// and sluice narrows a FULL table to its catalog PRIMARY KEY.
+			name: "FULL whose primary key includes a generated column",
+			row: replicaIdentityRow{
+				Identity: "f", PrimaryKeyIndex: "t_pkey", PrimaryKeyUsable: true,
+				IdentityGeneratedCols: []string{"g"},
+			},
+			want:      false,
+			reasonHas: "GENERATED",
+		},
+		{
+			// OVER-REFUSAL CONTROL. A generated column OUTSIDE the
+			// identity is untouched — the catalog read scopes
+			// IdentityGeneratedCols to the effective identity index, so
+			// this row is what an ordinary table with a computed column
+			// produces.
+			name: "a generated column that is NOT part of the identity",
+			row: replicaIdentityRow{
+				Identity: "d", PrimaryKeyIndex: "t_pkey", PrimaryKeyUsable: true,
+			},
+			want: true,
+		},
+		{
+			// OVER-REFUSAL CONTROL, the PG 18 case: a publication created
+			// WITH (publish_generated_columns = stored) carries the
+			// column, and exemptPublishedGeneratedCols empties the list
+			// before this function sees it.
+			name: "a generated identity column the publication actually carries",
+			row: replicaIdentityRow{
+				Identity: "d", PrimaryKeyIndex: "t_pkey", PrimaryKeyUsable: true,
+				IdentityGeneratedCols: nil,
+			},
+			want: true,
+		},
+		{
+			// The generated check must not MASK a more specific refusal
+			// it shares a table with: NOTHING publishes no old row at
+			// all, so the query leaves the generated list empty for it
+			// and the NOTHING reason survives.
+			name:       "NOTHING keeps its own reason",
+			row:        replicaIdentityRow{Identity: "n", PrimaryKeyIndex: "t_pkey", PrimaryKeyUsable: true},
+			want:       false,
+			reasonHas:  "NOTHING",
+			reasonOmit: "GENERATED",
+		},
 	}
 
 	for _, tc := range cases {
@@ -127,6 +198,9 @@ func TestReplicaIdentityUsable(t *testing.T) {
 			}
 			if tc.reasonHas != "" && !strings.Contains(reason, tc.reasonHas) {
 				t.Errorf("reason %q does not mention %q", reason, tc.reasonHas)
+			}
+			if tc.reasonOmit != "" && strings.Contains(reason, tc.reasonOmit) {
+				t.Errorf("reason %q wrongly mentions %q", reason, tc.reasonOmit)
 			}
 		})
 	}
@@ -176,6 +250,47 @@ func TestErrUnusableReplicaIdentity(t *testing.T) {
 	}
 	if !strings.Contains(lone, "REPLICA IDENTITY FULL;` makes it publishable") {
 		t.Errorf("a table with no candidate index was not offered the FULL remedy:\n%s", lone)
+	}
+}
+
+// TestErrUnusableReplicaIdentity_GeneratedRemedyIsNotFULL pins the half
+// of the refusal that would otherwise send an operator round a loop.
+// REPLICA IDENTITY FULL is the standard cure for a missing replica
+// identity, this refusal's own headline names it, and it does NOT fix a
+// GENERATED identity column — pgoutput omits one under FULL too
+// (verified on PostgreSQL 16.14 and 18.4; see cdc_generated_pk.go). So
+// the per-table note has to say so, and the aggregate sentence has to
+// stop claiming FULL is always sufficient.
+func TestErrUnusableReplicaIdentity_GeneratedRemedyIsNotFULL(t *testing.T) {
+	msg := errUnusableReplicaIdentity("public", []replicaIdentityGap{
+		{
+			Table:             "gpk",
+			Reason:            "its replica identity includes GENERATED column(s) \"g\"",
+			GeneratedIdentity: true,
+		},
+	}).Error()
+	if !strings.Contains(msg, "REPLICA IDENTITY FULL is NOT a fix here") {
+		t.Errorf("the generated-identity note does not rule out the FULL remedy:\n%s", msg)
+	}
+	if strings.Contains(msg, "REPLICA IDENTITY FULL is always sufficient") {
+		t.Errorf("the aggregate sentence still claims FULL is always sufficient:\n%s", msg)
+	}
+
+	// With a candidate index the narrow remedy is still offered — and it
+	// must still carry the "not FULL" correction, because an operator who
+	// skips the index step would otherwise reach for FULL.
+	withIdx := errUnusableReplicaIdentity("public", []replicaIdentityGap{
+		{
+			Table:             "gpk",
+			Reason:            "its replica identity includes GENERATED column(s) \"g\"",
+			CandidateIndex:    "gpk_alt_key",
+			GeneratedIdentity: true,
+		},
+	}).Error()
+	for _, want := range []string{"REPLICA IDENTITY USING INDEX", "gpk_alt_key", "NOT a fix here"} {
+		if !strings.Contains(withIdx, want) {
+			t.Errorf("refusal omits %q:\n%s", want, withIdx)
+		}
 	}
 }
 

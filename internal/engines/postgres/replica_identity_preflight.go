@@ -78,6 +78,27 @@ type replicaIdentityRow struct {
 	// NOT NULL columns that the operator could point `REPLICA IDENTITY
 	// USING INDEX` at. "" when the table has none.
 	CandidateIndex string
+
+	// IdentityGeneratedCols names the STORED GENERATED columns inside the
+	// table's EFFECTIVE replica identity (the PK index for 'd'/'f', the
+	// nominated index for 'i') that NO publication on this server
+	// currently carries. PostgreSQL will happily put a PRIMARY KEY on a
+	// generated column and then never publish it, which destroys row
+	// identity on the wire — see cdc_generated_pk.go for the mechanism
+	// and the ground truth. Empty for every table whose identity is
+	// entirely non-generated, which is essentially all of them.
+	//
+	// The "no publication carries it" half is what keeps this from
+	// over-refusing on PostgreSQL 18, where a publication created WITH
+	// (publish_generated_columns = stored) DOES carry the column. It is
+	// deliberately LENIENT — it asks whether SOME publication carries it,
+	// not whether the one this sync will use does, because the preflight
+	// runs before the publication is chosen or created. Being lenient
+	// here is safe precisely because it is not the floor: the CDC reader
+	// re-decides per RelationMessage against the wire itself
+	// ([refuseUnpublishedGeneratedIdentity]), which is exact. An early
+	// check may miss; it must never refuse something that works.
+	IdentityGeneratedCols []string
 }
 
 // replicaIdentityUsable applies PostgreSQL's OWN replica-identity
@@ -89,6 +110,30 @@ type replicaIdentityRow struct {
 // unit-testable across every relreplident × index shape without a
 // server (the family matrix, not one representative).
 func replicaIdentityUsable(row replicaIdentityRow) (usable bool, reason string) {
+	// The generated-identity refusal runs ahead of the per-letter rules
+	// because it is orthogonal to them: 'd', 'i' and 'f' all lose the
+	// column, and each loses it for its own reason (the PK index, the
+	// nominated index, and the PK that sluice narrows a FULL table to).
+	// The query leaves this empty for 'n', which the switch refuses on
+	// its own more specific ground.
+	//
+	// Known limit, stated rather than implied: for 'f' the set graded is
+	// the PRIMARY KEY, because that is what sluice narrows a FULL table
+	// to. PostgreSQL 18 takes a WIDER view — under FULL its own identity
+	// is every column, so it refuses the application's writes for a
+	// generated column ANYWHERE in a FULL table (verified on 18.4). A
+	// FULL table whose only generated column is outside the PK therefore
+	// passes here and would still break on 18. Widening it would
+	// over-refuse on every earlier version, where that shape is harmless.
+	if len(row.IdentityGeneratedCols) > 0 {
+		return false, fmt.Sprintf(
+			"its replica identity includes GENERATED column(s) %s, which PostgreSQL does not publish "+
+				"(pg_publication_tables.attnames omits a generated column unless the publication was created WITH "+
+				"(publish_generated_columns = stored), which needs PostgreSQL 18 and which sluice does not do) — so the "+
+				"change stream would carry no usable row identity for it",
+			strings.Join(quoteEachIdent(row.IdentityGeneratedCols), ", "),
+		)
+	}
 	switch row.Identity {
 	case "f":
 		// FULL publishes the whole old row; no index is involved and no
@@ -134,6 +179,14 @@ type replicaIdentityGap struct {
 	Table          string
 	Reason         string
 	CandidateIndex string
+
+	// GeneratedIdentity distinguishes the 2026-08-08 generated-column
+	// class from the item-93 deferrable/keyless one. It has to be carried
+	// separately because the two want OPPOSITE remedies: `REPLICA
+	// IDENTITY FULL` fixes a deferrable key and does NOT fix this — a
+	// generated column is unpublished under FULL too, so FULL just moves
+	// the failure (verified on PG 16 and PG 18; see cdc_generated_pk.go).
+	GeneratedIdentity bool
 }
 
 // replicaIdentityHint is the remedy that rides the coded refusal. Like
@@ -151,13 +204,24 @@ func errUnusableReplicaIdentity(schema string, gaps []replicaIdentityGap) error 
 	for i, g := range gaps {
 		qualified := qualifyForRemedy(schema, g.Table)
 		detail := fmt.Sprintf("%s (%s", qualified, g.Reason)
-		if g.CandidateIndex != "" {
+		switch {
+		case g.GeneratedIdentity && g.CandidateIndex != "":
+			detail += fmt.Sprintf(
+				"; the table already carries an immediate NOT NULL UNIQUE index %q over non-generated columns, so "+
+					"`ALTER TABLE %s REPLICA IDENTITY USING INDEX %s;` is the narrowest fix — note REPLICA IDENTITY "+
+					"FULL is NOT a fix here, because a generated column is unpublished under FULL too",
+				g.CandidateIndex, qualified, quoteIdent(g.CandidateIndex),
+			)
+		case g.GeneratedIdentity:
+			detail += "; REPLICA IDENTITY FULL is NOT a fix here (a generated column is unpublished under FULL too) — " +
+				"the table needs a row identity made of non-generated columns"
+		case g.CandidateIndex != "":
 			detail += fmt.Sprintf(
 				"; the table already carries an immediate NOT NULL UNIQUE index %q, so "+
 					"`ALTER TABLE %s REPLICA IDENTITY USING INDEX %s;` is the narrowest fix",
 				g.CandidateIndex, qualified, quoteIdent(g.CandidateIndex),
 			)
-		} else {
+		default:
 			detail += fmt.Sprintf("; `ALTER TABLE %s REPLICA IDENTITY FULL;` makes it publishable as-is", qualified)
 		}
 		parts[i] = detail + ")"
@@ -172,8 +236,10 @@ func errUnusableReplicaIdentity(schema string, gaps []replicaIdentityGap) error 
 				"identity and publishes updates\", and the same for DELETE) — INSERT keeps working, so the table looks "+
 				"healthy until the first update and the breakage surfaces in your application, not in sluice. Nothing has "+
 				"been changed on the source: sluice refuses BEFORE touching the publication. Fix each table on the source "+
-				"and re-run, or take it out of scope with --exclude-table. REPLICA IDENTITY FULL is always sufficient "+
-				"(it publishes the whole old row, at the cost of WAL volume on every UPDATE/DELETE)",
+				"and re-run, or take it out of scope with --exclude-table. REPLICA IDENTITY FULL is sufficient for a "+
+				"deferrable or missing key (it publishes the whole old row, at the cost of WAL volume on every "+
+				"UPDATE/DELETE) but NOT for a GENERATED identity column, which PostgreSQL leaves unpublished under FULL "+
+				"as well — each table's own note above says which case it is",
 			strings.Join(parts, ", "),
 		),
 	)
@@ -205,6 +271,9 @@ func (r *SchemaReader) PreflightReplicaIdentity(ctx context.Context, tables []st
 	if err != nil {
 		return err
 	}
+	if err := r.exemptPublishedGeneratedCols(ctx, rows); err != nil {
+		return err
+	}
 
 	var gaps []replicaIdentityGap
 	for _, row := range rows {
@@ -216,9 +285,10 @@ func (r *SchemaReader) PreflightReplicaIdentity(ctx context.Context, tables []st
 			continue
 		}
 		gaps = append(gaps, replicaIdentityGap{
-			Table:          row.Table,
-			Reason:         reason,
-			CandidateIndex: row.CandidateIndex,
+			Table:             row.Table,
+			Reason:            reason,
+			CandidateIndex:    row.CandidateIndex,
+			GeneratedIdentity: len(row.IdentityGeneratedCols) > 0,
 		})
 	}
 	if len(gaps) == 0 {
@@ -226,6 +296,98 @@ func (r *SchemaReader) PreflightReplicaIdentity(ctx context.Context, tables []st
 	}
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Table < gaps[j].Table })
 	return errUnusableReplicaIdentity(r.schema, gaps)
+}
+
+// pgVersionPublishGeneratedColumns is the first server that can publish a
+// generated column at all: PostgreSQL 18 added the
+// `publish_generated_columns` publication option and the `pubgencols`
+// catalog column that records it. Below this, [replicaIdentityRow.IdentityGeneratedCols]
+// needs no exemption pass — there is no publication on any earlier server
+// that carries a generated column.
+const pgVersionPublishGeneratedColumns = 180000
+
+// exemptPublishedGeneratedCols clears, in place, any generated
+// replica-identity column that a publication on this server DOES carry —
+// the PostgreSQL 18 `publish_generated_columns = stored` case. Without it
+// the preflight would refuse a configuration that works.
+//
+// Deliberately lenient (see [replicaIdentityRow.IdentityGeneratedCols]):
+// it asks whether ANY publication carries the column, not whether the one
+// this sync will use does, because the preflight runs before the
+// publication is chosen or created. The exact answer belongs to — and is
+// re-derived per RelationMessage by — the CDC reader
+// ([refuseUnpublishedGeneratedIdentity]), against the wire itself.
+//
+// Costs nothing on the normal path: it returns before opening its mouth
+// unless some in-scope table actually has a generated identity column,
+// which is the shape this whole file's addition exists for.
+func (r *SchemaReader) exemptPublishedGeneratedCols(ctx context.Context, rows []replicaIdentityRow) error {
+	needsCheck := false
+	for _, row := range rows {
+		if len(row.IdentityGeneratedCols) > 0 {
+			needsCheck = true
+			break
+		}
+	}
+	if !needsCheck {
+		return nil
+	}
+	version, err := serverVersionNum(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	if version < pgVersionPublishGeneratedColumns {
+		return nil
+	}
+	const q = `
+		SELECT pt.tablename, COALESCE(array_to_json(pt.attnames)::text, 'null')
+		FROM   pg_publication_tables pt
+		JOIN   pg_publication        p ON p.pubname = pt.pubname
+		WHERE  pt.schemaname = $1
+		  AND  p.pubgencols  = 's'`
+	catRows, err := r.catalogQuery(ctx, q, r.schema)
+	if err != nil {
+		return fmt.Errorf("postgres: read published generated columns for schema %q: %w", r.schema, err)
+	}
+	defer func() { _ = catRows.Close() }()
+
+	published := make(map[string]map[string]bool)
+	for catRows.Next() {
+		var table, namesJSON string
+		if err := catRows.Scan(&table, &namesJSON); err != nil {
+			return fmt.Errorf("postgres: scan published generated columns: %w", err)
+		}
+		names, err := decodeRoleArray(namesJSON)
+		if err != nil {
+			return fmt.Errorf("postgres: parse published columns for %q: %w", table, err)
+		}
+		set := published[table]
+		if set == nil {
+			set = make(map[string]bool, len(names))
+			published[table] = set
+		}
+		for _, n := range names {
+			set[n] = true
+		}
+	}
+	if err := catRows.Err(); err != nil {
+		return fmt.Errorf("postgres: read published generated columns for schema %q: %w", r.schema, err)
+	}
+
+	for i := range rows {
+		set := published[rows[i].Table]
+		if len(set) == 0 {
+			continue
+		}
+		var kept []string
+		for _, name := range rows[i].IdentityGeneratedCols {
+			if !set[name] {
+				kept = append(kept, name)
+			}
+		}
+		rows[i].IdentityGeneratedCols = kept
+	}
+	return nil
 }
 
 // replicaIdentityRows reads the replica-identity state of every ordinary
@@ -247,7 +409,8 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		       COALESCE(pk.usable, false),
 		       COALESCE(ri.name, ''),
 		       COALESCE(ri.usable, false),
-		       COALESCE(cand.name, '')
+		       COALESCE(cand.name, ''),
+		       COALESCE(array_to_json(gen.cols)::text, 'null')
 		FROM   pg_class     c
 		JOIN   pg_namespace n ON n.oid = c.relnamespace
 		LEFT   JOIN LATERAL (
@@ -277,8 +440,34 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		                  SELECT 1
 		                  FROM   unnest(i.indkey) AS k(attnum)
 		                  JOIN   pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-		                  WHERE  NOT a.attnotnull)
+		                  -- Nullable OR GENERATED: a generated column is
+		                  -- not published, so an index containing one is
+		                  -- not a remedy — suggesting it would hand the
+		                  -- operator a fix that reproduces the defect.
+		                  WHERE  NOT a.attnotnull OR a.attgenerated <> '')
 		       ) cand ON TRUE
+		LEFT   JOIN LATERAL (
+		         -- The STORED GENERATED members of the EFFECTIVE replica
+		         -- identity, in key order: the PK index for 'd' and 'f'
+		         -- (what sluice narrows a FULL table to), the nominated
+		         -- index for 'i', nothing for 'n'. Deliberately does NOT
+		         -- consult pg_publication here: pg_publication.pubgencols
+		         -- exists only on PG 18 and referencing it would 42703
+		         -- every older server, so the "is it published after all"
+		         -- exemption is applied in Go behind a version gate
+		         -- (see exemptPublishedGeneratedCols).
+		         SELECT array_agg(a.attname ORDER BY u.ord) AS cols
+		         FROM   pg_index i
+		         JOIN   LATERAL unnest(i.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		         JOIN   pg_attribute a ON a.attrelid = c.oid AND a.attnum = u.attnum
+		         WHERE  i.indrelid = c.oid
+		           AND  a.attgenerated <> ''
+		           AND  CASE c.relreplident
+		                  WHEN 'i' THEN i.indisreplident
+		                  WHEN 'n' THEN false
+		                  ELSE i.indisprimary
+		                END
+		       ) gen ON TRUE
 		WHERE  n.nspname = $1
 		  AND  c.relkind = 'r'
 		ORDER  BY c.relname`
@@ -291,7 +480,10 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 
 	var out []replicaIdentityRow
 	for catRows.Next() {
-		var row replicaIdentityRow
+		var (
+			row           replicaIdentityRow
+			generatedJSON string
+		)
 		if err := catRows.Scan(
 			&row.Table,
 			&row.Identity,
@@ -300,9 +492,19 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 			&row.ChosenIndex,
 			&row.ChosenIndexUsable,
 			&row.CandidateIndex,
+			&generatedJSON,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan replica identity row: %w", err)
 		}
+		// Same array_to_json idiom the policy reader uses
+		// ([decodeRoleArray]) — a text[] scanned through database/sql
+		// without a pgx-native type otherwise needs a driver-specific
+		// array wrapper.
+		gen, err := decodeRoleArray(generatedJSON)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: parse generated replica-identity columns for %q: %w", row.Table, err)
+		}
+		row.IdentityGeneratedCols = gen
 		out = append(out, row)
 	}
 	if err := catRows.Err(); err != nil {

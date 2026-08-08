@@ -2078,10 +2078,28 @@ func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOI
 //   - NOTHING ('n'): never reaches here with a usable tuple (emitDelete
 //     and synthesizeKeyOnlyBefore reject first).
 //
+// Before any of that it runs the generated-identity refusal
+// ([refuseUnpublishedGeneratedIdentity]): a generated column in the
+// effective replica identity is never published before PG 18, so the
+// identity resolved below would silently SHRINK to a non-unique prefix
+// (over-delete) or to nothing (zero-match drop). Both call sites — the
+// V1 and V2 RelationMessage arms — inherit it by living here rather than
+// beside them, which is the whole reason it is inside this function and
+// not next to them.
+//
 // A nil r.db (hand-built reader in non-streaming unit paths) skips the
-// FULL PK lookup and falls through to the wire flags; the integration
-// path always has a live pool.
+// FULL PK lookup and the generated-identity refusal and falls through to
+// the wire flags; the integration path always has a live pool.
 func (r *CDCReader) resolveIdentityKeyCols(ctx context.Context, entry *relationCacheEntry) error {
+	if r.db != nil {
+		identity, err := identityGeneratedColumns(ctx, r.db, entry.Schema, entry.Name)
+		if err != nil {
+			return fmt.Errorf("resolve generated replica-identity columns: %w", err)
+		}
+		if err := refuseUnpublishedGeneratedIdentity(entry, identity); err != nil {
+			return err
+		}
+	}
 	if entry.ReplicaIdentity == 'f' && r.db != nil {
 		pkCols, err := primaryKeyColumnsFromCatalog(ctx, r.db, entry.Schema, entry.Name)
 		if err != nil {
