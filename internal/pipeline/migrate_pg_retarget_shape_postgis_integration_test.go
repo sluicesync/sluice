@@ -78,10 +78,10 @@ const retargetShapeGeometrySeedDDL = `
 	INSERT INTO rsgdom SELECT * FROM rsgplain;
 `
 
-// TestMigrate_PGToMySQL_RetargetedGeometryShapeMatchesTheCatalogReadBack
+// TestMigrate_PostGIS_PGToMySQLRetargetedGeometryShapeMatchesTheCatalogReadBack
 // is the geometry × {bare, DOMAIN} cell of item 153's gate, plus the
 // re-run assertion the operator actually hits.
-func TestMigrate_PGToMySQL_RetargetedGeometryShapeMatchesTheCatalogReadBack(t *testing.T) {
+func TestMigrate_PostGIS_PGToMySQLRetargetedGeometryShapeMatchesTheCatalogReadBack(t *testing.T) {
 	_, pgSource, pgCleanup := startPostgresWithPostGIS(t)
 	defer pgCleanup()
 	_, mysqlTarget, mysqlCleanup := startMySQL(t)
