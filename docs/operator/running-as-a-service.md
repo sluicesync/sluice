@@ -123,6 +123,14 @@ echo "sluice mirroring is live."
 
 ## docker / docker-compose
 
+The image carries build provenance, so you can check it came from this repository's release workflow before you run it — worth doing once per version bump, since a container image is the artifact you are least likely to inspect by hand:
+
+```bash
+gh attestation verify oci://ghcr.io/sluicesync/sluice:<version> --repo sluicesync/sluice
+```
+
+That verifies the multi-arch index the tag resolves to; each per-architecture manifest (`:<version>-amd64`, `:<version>-arm64`) is attested separately, so a single-arch digest pin verifies too. The image has been attested since the first release after v0.116.1 — on any tag at or before that, this returns `HTTP 404`, which means "no attestation was recorded", not "the image is wrong". See [SECURITY.md](../../SECURITY.md) for the full roster of what is and is not attested.
+
 ```yaml
 services:
   sluice:

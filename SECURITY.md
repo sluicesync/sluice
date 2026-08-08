@@ -53,6 +53,36 @@ Out of scope:
 - Behaviour that requires the operator to already have privileged access they shouldn't have (privilege escalation against the database itself is the database's concern).
 - SQL contained in a *trusted-by-the-operator* source catalog executing on the target (see "The source-trust boundary" above) — that is the documented contract; review the dry-run DDL when the source isn't fully trusted.
 
+## Release artifact provenance
+
+Every release is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) on GitHub-hosted runners, and its artifacts carry [GitHub artifact attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) — Sigstore-backed SLSA build provenance naming the workflow, the repository and the tag that produced them. Verify before you install:
+
+```bash
+# any release asset — an archive, a .deb/.rpm/.apk, or checksums.txt
+gh attestation verify sluice_<version>_Linux_x86_64.tar.gz --repo sluicesync/sluice
+
+# the container image, by tag or by digest
+gh attestation verify oci://ghcr.io/sluicesync/sluice:<version> --repo sluicesync/sluice
+```
+
+**What is covered, and what is not.** This is written as a roster rather than a sentence because the sentence is what went wrong. Release assets have been attested since v0.110.1; the container image was **not** a subject until the first release after v0.116.1, while the workflow claimed provenance for "everything a consumer downloads" — so the tarball verified green and `gh attestation verify oci://ghcr.io/sluicesync/sluice:0.116.1` returned `HTTP 404` for the artifact most likely to be running in production. A narrowed security claim is worse than an absent one, because it is what stops the next person from checking. `TestEveryPublishedReleaseArtifactIsAttestedOrExempt` (`internal/docsync`) now fails the build when these two lists, the release workflow and `.goreleaser.yaml` disagree.
+
+Attested:
+
+<!-- attested-release-artifacts: GHCR image multi-arch index, GHCR image per-arch manifests, archives (.tar.gz/.zip), checksums.txt, native packages (.deb/.rpm/.apk) -->
+
+The image is attested at three digests, not one: the multi-arch OCI index that `:<version>` and `:latest` resolve to (the digest a `docker pull` reaches, and the one `gh attestation verify oci://` looks up), plus each per-architecture manifest, because `:<version>-amd64` and `:<version>-arm64` are published, pullable tags whose digests an attestation on the index does not cover.
+
+Not attested, each for a reason:
+
+<!-- unattested-release-artifacts: GitHub source archives, homebrew formula, scoop manifest, winget manifest -->
+
+- **Homebrew formula and Scoop manifest** are commits in sibling repositories rather than build outputs. Each is a download URL plus the SHA-256 of an archive that *is* attested, so verifying what they install routes through the archive; the control on the commit itself is the scope of the publishing token.
+- **The WinGet manifest** is generated but never published by CI (`skip_upload`); WinGet submissions are made by hand.
+- **GitHub's auto-generated "Source code (zip/tar.gz)"** is produced by GitHub from the tag, never passes through the build, and therefore has nothing for the workflow to hash. Its integrity control is the commit SHA the tag names — verify it with `git`, not with `gh attestation`.
+
+Attestation is deliberately **not** one of the release publish gates: a release whose attestation step failed still ships working, checksummed binaries, and gating publication on it would trade a real property for a newer one. If `gh attestation verify` fails for an artifact you downloaded, that is worth reporting through the channel at the top of this file.
+
 ## Supported versions
 
 While the project is in `0.x`, only the latest minor release line is supported for security fixes. Once `1.0` ships, we'll publish a longer support window in this document.

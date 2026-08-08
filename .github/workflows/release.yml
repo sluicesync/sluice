@@ -105,29 +105,69 @@ jobs:
           # fail at release time, so don't tag a release until it's set.
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
 
-      # Build provenance for every release artifact (audit 2026-08-04).
+      # ----------------------------------------------------------------------
+      # Build provenance (audit 2026-08-04; image coverage added for C-12).
       #
-      # DELIBERATELY A SEPARATE STEP, not goreleaser's own `signs:` block. The
+      # DELIBERATELY SEPARATE STEPS, not goreleaser's own `signs:` block. The
       # binaries, checksums and GHCR image are already uploaded by the time
-      # this runs, so a failure here leaves the draft intact and is fixed by
+      # these run, so a failure here leaves the draft intact and is fixed by
       # re-running one job — no tag force-move, no duplicate draft. That shape
       # is chosen because the tap publishers have already failed a release
       # once, AFTER upload, for an expired token; adding provenance inside
       # goreleaser would put a second such failure on the same critical path.
       #
-      # Attests the archives, packages and checksums.txt — i.e. everything a
-      # consumer downloads. checksums.txt is the important one: it authenticates
-      # the binaries, and until now nothing authenticated it.
+      # These steps are NOT one of the six publish gates. They are additive
+      # provenance; a release whose attestation failed is still a valid
+      # release, and gating publication on it would trade a real property
+      # (working binaries) for a newer one.
+      #
+      # WHAT IS COVERED AND WHAT IS NOT — the roster, because the previous
+      # wording here was the defect. It said the attestation covered
+      # "everything a consumer downloads", which was false of the single
+      # artifact people actually run in production: the GHCR image was not a
+      # subject, so `gh attestation verify oci://ghcr.io/sluicesync/sluice:X`
+      # returned HTTP 404 while the tarball verified green — a narrowed
+      # security claim, which is worse than an absent one because it stops
+      # anyone from looking. `TestEveryPublishedReleaseArtifactIsAttestedOrExempt`
+      # (internal/docsync) now fails the build when .goreleaser.yaml grows a
+      # publishing surface this roster does not name.
+      #
+      #   ATTESTED
+      #     archives         dist/*.tar.gz, dist/*.zip
+      #     native packages  dist/*.deb, dist/*.rpm, dist/*.apk
+      #     checksums.txt    the important one — it authenticates the binaries
+      #                      and nothing authenticated it before v0.110.1
+      #     GHCR image       the multi-arch OCI index behind :<ver> and
+      #                      :latest (ONE digest: both tags name identical
+      #                      index bytes, and a manifest list does not contain
+      #                      its own tag) AND both per-arch manifests, because
+      #                      :<ver>-amd64 / :<ver>-arm64 are published,
+      #                      pullable tags with digests of their own — an
+      #                      attestation on the index does not cover them.
+      #
+      #   NOT ATTESTED, each with its reason
+      #     homebrew formula, scoop manifest — git commits in sibling repos,
+      #       not build outputs of this run. Each is a download URL plus the
+      #       sha256 of an archive that IS attested, so a consumer's
+      #       verification routes through the archive; the control on the
+      #       commit itself is TAP_GITHUB_TOKEN's repo scope.
+      #     winget manifest — `skip_upload: "true"` in .goreleaser.yaml: it is
+      #       generated into dist/winget/ and never published by this workflow.
+      #     GitHub's auto "Source code (zip/tar.gz)" — produced by GitHub from
+      #       the tag, never present in dist/, so this job has nothing to hash.
+      #       Its integrity control is the commit SHA the tag names.
+      #     dist/digests.txt, dist/metadata.json, dist/artifacts.json — build
+      #       metadata, not release assets. Confirmed against a real release
+      #       rather than inferred: v0.116.1's published asset list is exactly
+      #       the 13 files the globs below match, and none of these three.
       #
       # Consumers verify with:
       #   gh attestation verify sluice_<ver>_Linux_x86_64.tar.gz \
       #     --repo sluicesync/sluice
-      #
-      # This step is NOT one of the six publish gates. It is additive
-      # provenance; a release whose attestation failed is still a valid
-      # release, and gating publication on it would trade a real property
-      # (working binaries) for a newer one.
-      - name: Attest build provenance
+      #   gh attestation verify oci://ghcr.io/sluicesync/sluice:<ver> \
+      #     --repo sluicesync/sluice
+      # ----------------------------------------------------------------------
+      - name: Attest build provenance (release assets)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
@@ -137,3 +177,82 @@ jobs:
             dist/*.rpm
             dist/*.apk
             dist/checksums.txt
+
+      # The digests come from GoReleaser's OWN artifact metadata, never from a
+      # re-inspection of the registry: re-resolving `:<ver>` after the push
+      # would attest whatever that tag points at NOW, which is a different
+      # question from "what did this run build and push". `.extra.Digest` is
+      # what the push itself reported.
+      #
+      # WHICH digest matters, because attesting the wrong one yields a
+      # verification that passes for something nobody pulls. A multi-arch tag
+      # resolves to an OCI INDEX, and the index digest is what
+      # `gh attestation verify oci://…:<tag>` looks up — ground-truthed against
+      # the live v0.116.1 image, where `docker buildx imagetools inspect`
+      # reports index sha256:85a93ac3…, and that is precisely the digest gh
+      # queried (and 404'd on). So the index is attested for the tags people
+      # pull, and the two per-arch manifests are attested separately for the
+      # tags a single-arch pin uses; the index is NOT assumed to cover them.
+      - name: Resolve the published GHCR image digests
+        id: image
+        run: |
+          set -euo pipefail
+          image=ghcr.io/sluicesync/sluice
+          version=$(jq -r '.version' dist/metadata.json)
+
+          # A missing digest FAILS the job rather than attesting nothing. An
+          # image-template rename in .goreleaser.yaml would otherwise leave
+          # the image silently unattested — which is the exact defect these
+          # steps exist to close, so it must not be reachable by accident.
+          digest_of() {
+            local kind=$1 ref=$2
+            local d
+            d=$(jq -r --arg kind "$kind" --arg ref "$ref" \
+              '[.[] | select(.type == $kind and .name == $ref) | .extra.Digest] | unique | .[0] // ""' \
+              dist/artifacts.json)
+            if ! printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              printf 'no %s digest for %s in dist/artifacts.json (got %q). The image names in .goreleaser.yaml and this step have drifted; the released image would ship UNATTESTED.\n' \
+                "$kind" "$ref" "$d" >&2
+              return 1
+            fi
+            printf '%s' "$d"
+          }
+
+          # Plain assignments so `set -e` aborts on a failing digest_of: inside
+          # `echo "$(digest_of …)"` the non-zero status is the substitution's,
+          # not echo's, and would be swallowed.
+          index=$(digest_of 'Docker Manifest' "$image:$version")
+          amd64=$(digest_of 'Published Docker Image' "$image:$version-amd64")
+          arm64=$(digest_of 'Published Docker Image' "$image:$version-arm64")
+
+          {
+            echo "index=$index"
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
+
+      # push-to-registry stores the attestation as an OCI referrer alongside
+      # the image, so it travels with a mirrored copy instead of living only
+      # in GitHub's attestations API. `gh attestation verify --repo` reads the
+      # API either way; the referrer is what non-gh tooling (cosign, oras) can
+      # find.
+      - name: Attest build provenance (GHCR image, multi-arch index)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/sluicesync/sluice
+          subject-digest: ${{ steps.image.outputs.index }}
+          push-to-registry: true
+
+      - name: Attest build provenance (GHCR image, linux/amd64)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/sluicesync/sluice
+          subject-digest: ${{ steps.image.outputs.amd64 }}
+          push-to-registry: true
+
+      - name: Attest build provenance (GHCR image, linux/arm64)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/sluicesync/sluice
+          subject-digest: ${{ steps.image.outputs.arm64 }}
+          push-to-registry: true
