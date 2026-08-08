@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines/internal/floatrepair"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Compile-time pin: a signature drift on UpdateFloatColumnsByPK would
@@ -218,7 +219,7 @@ func floatRepairCastType(col *ir.Column, opts emitOpts) (string, error) {
 		return "", errors.New("floatrepair cast: column type is unknown (not in the target table)")
 	}
 	if i, ok := col.Type.(ir.Integer); ok {
-		return postgresIntName(effectiveWidth(i)), nil
+		return postgresIntName(translate.PGStorageIntegerWidth(i)), nil
 	}
 	return emitColumnType(col.Type, opts)
 }

@@ -31,14 +31,14 @@ import (
 // runs; retarget's pattern match only fires on still-source-native
 // types).
 //
-// Identity for unknown engine pairs and same-engine pairs. The rule
-// table today covers the PG-storage → MySQL-dialect direction (the
-// v0.7.0 auto-emit defaults); other directions retarget no types and
-// the diff falls back to the pre-retarget IR comparison. Consumers
-// that REFUSE on the comparison (rather than report, as the diff
-// does) must gate on [HasStorageShapeMapping] first — a raw compare
-// against a foreign catalog's read-back mistakes translation for
-// drift.
+// Identity for unknown engine pairs and same-engine pairs. This
+// lane's rule table covers the PG-storage → MySQL-dialect direction
+// (the v0.7.0 auto-emit defaults) and nothing else; the
+// mysql→postgres rewrites are COMPARE-ONLY and deliberately do not
+// reach here (see [compareOnlyRuleFor]). Consumers that REFUSE on
+// the comparison (rather than report, as the diff does) must gate on
+// [HasStorageShapeMapping] first — a raw compare against a foreign
+// catalog's read-back mistakes translation for drift.
 //
 // This is the EMIT-lane entry point: use it when the result is handed
 // to a SchemaWriter or a RowWriter. Consumers that COMPARE the result
@@ -96,9 +96,18 @@ func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Sche
 // created, and including SAME-engine postgres→postgres pairs, where no
 // type rule fires at all. That is why the index-name pass runs
 // independently of whether a type rule exists.
+//
+// # The COMPARE-ONLY table (roadmap item 158)
+//
+// A pair can need a rewrite here that would be actively WRONG on the
+// emit lane. mysql→postgres is the first: two of its four rewrites erase
+// what the Postgres DDL emitter dispatches on, so running them ahead of
+// a SchemaWriter would trade this function's loud false report for a
+// silent constraint drop. Those rules live in [compareOnlyRuleFor],
+// which only this entry point consults.
 func RetargetForShapeCompare(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
 	var typeRule retargetRule
-	if rule := retargetRuleFor(sourceEngine, targetEngine); rule != nil {
+	if rule := shapeCompareRuleFor(sourceEngine, targetEngine); rule != nil {
 		typeRule = storageShapeRule(rule)
 	}
 	// A nil type rule means the pair is same-storage-family (or has no
@@ -182,6 +191,23 @@ func retargetRuleFor(sourceEngine, targetEngine string) retargetRule {
 	return nil
 }
 
+// shapeCompareRuleFor returns the type rule [RetargetForShapeCompare]
+// runs: the shared emit-lane table when the pair has one, otherwise the
+// COMPARE-ONLY table.
+//
+// The two are deliberately exclusive rather than composed. A pair with
+// an emit-lane table has its rewrite stated once, by the emitter's own
+// mirror; a pair that also wanted compare-only arms would be declaring
+// that its emit table is incomplete, which is a defect to fix there
+// rather than to patch here. Pinned by
+// TestShapeCompareRuleFor_NoPairHasBothTables.
+func shapeCompareRuleFor(sourceEngine, targetEngine string) retargetRule {
+	if rule := retargetRuleFor(sourceEngine, targetEngine); rule != nil {
+		return rule
+	}
+	return compareOnlyRuleFor(sourceEngine, targetEngine)
+}
+
 // Storage-shape family labels for [storageShapeFamily].
 const (
 	storageFamilyMySQL    = "mysql"
@@ -237,19 +263,37 @@ func SameStorageShapeFamily(a, b string) bool {
 	return storageShapeFamily(a) == storageShapeFamily(b)
 }
 
-// HasStorageShapeMapping reports whether [RetargetForShapeCompare] can
-// render source-native IR in the target's storage shapes for this
-// engine pair: either both engines share a storage-shape family
-// (identity is faithful) or a retarget rule exists. Consumers that
-// COMPARE the retargeted schema against a target catalog read-back —
-// the ADR-0166 migrate pre-create shape gate — must check this first
-// AND use [RetargetForShapeCompare] to build the expected side: with no
-// mapping, source-native IR lands against the target's lossy read-back
-// (MySQL INT UNSIGNED reads back from PG as BIGINT, TEXT tiers
-// collapse, VARBINARY becomes BYTEA) and translation is
-// indistinguishable from drift. That raw compare is the 2026-07-16
-// audit's HIGH-1: it false-refused every mysql→postgres re-run over
-// tables sluice itself had created.
+// HasStorageShapeMapping reports whether a consumer that REFUSES on the
+// shape comparison may arm itself for this engine pair: either both
+// engines share a storage-shape family (identity is faithful) or the
+// EMIT-lane retarget table has an entry. Its consumer is the ADR-0166
+// migrate pre-create shape gate, which must check this first AND use
+// [RetargetForShapeCompare] to build the expected side: with no mapping,
+// source-native IR lands against the target's lossy read-back and
+// translation is indistinguishable from drift. That raw compare is the
+// 2026-07-16 audit's HIGH-1: it false-refused every mysql→postgres
+// re-run over tables sluice itself had created.
+//
+// # It deliberately WITHHOLDS the compare-only pair, and that is a
+// # decision rather than an oversight (roadmap item 158)
+//
+// mysql→postgres now HAS a shape-compare mapping ([compareOnlyRuleFor]),
+// so read literally as "can the expected side be rendered", this
+// predicate is wrong for that pair. It keys on the emit table because
+// its only consumer REFUSES, and the bar for arming a refusal is higher
+// than the bar for improving a report: the compare-only table was
+// derived and pinned against a real Postgres for every family
+// internal/engines/mysql.translateType produces, but NOT for
+// ir.Geometry, which needs a PostGIS target and is unmeasured. Arming
+// `migrate` on an unmeasured family would turn a phantom diff line into
+// a blocked migration.
+//
+// So `schema diff` (which reports) gets the mapping today and `migrate`
+// (which refuses) does not. Closing that is its own chunk with its own
+// evidence: a PostGIS-tagged family matrix, then flipping this to
+// [shapeCompareRuleFor]. Pinned in both directions by
+// TestHasStorageShapeMapping_WithholdsTheCompareOnlyPair so the
+// divergence cannot be mistaken for a missing case.
 func HasStorageShapeMapping(sourceEngine, targetEngine string) bool {
 	return storageShapeFamily(sourceEngine) == storageShapeFamily(targetEngine) ||
 		retargetRuleFor(sourceEngine, targetEngine) != nil

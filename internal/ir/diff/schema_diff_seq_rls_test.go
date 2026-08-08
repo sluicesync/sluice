@@ -519,3 +519,87 @@ func TestIdenticalSequencesAreInSync(t *testing.T) {
 		t.Errorf("identical sequences reported drift: %s", d.Summary())
 	}
 }
+
+// ---- the target-cannot-hold-RLS suppression (Bug 234's deferred list) ----
+
+// TestTargetCannotHoldRowLevelSecuritySuppressesTheWholeComparison is the
+// phantom-drift half. A Postgres source's RLS flags and policies reach a
+// MySQL target as a one-time WARN and nothing else — MySQL has no
+// row-level security, its SchemaWriter drops them, and its SchemaReader
+// never populates them — so the expected side asserts something the actual
+// side structurally cannot carry, on a target `sluice migrate` itself
+// created.
+func TestTargetCannotHoldRowLevelSecuritySuppressesTheWholeComparison(t *testing.T) {
+	exp := tableWith(func(tb *ir.Table) {
+		tb.RLSEnabled = true
+		tb.RLSForced = true
+		tb.Policies = []*ir.Policy{
+			{Name: "tenant_isolation", Command: "ALL", Using: "(tenant_id = current_tenant())"},
+			{Name: "admin_all", Command: "SELECT", Using: "true"},
+		}
+	})
+	act := tableWith(nil) // what a MySQL catalog reads back, always
+
+	if d := Schemas(exp, act, Options{}); !d.HasChanges() {
+		t.Fatal("the un-suppressed comparison reported no drift; this test's premise is that it DOES, " +
+			"and without that premise the suppression below grades nothing")
+	}
+
+	d := Schemas(exp, act, Options{TargetCannotHoldRowLevelSecurity: true})
+	if d.HasChanges() {
+		t.Fatalf("a target with no row-level security still reported drift: %s\n%+v",
+			d.Summary(), d.TablesMismatched)
+	}
+}
+
+// TestTargetCannotHoldRowLevelSecurityDoesNotReachAPostgresTarget is the
+// over-suppression half, and it is the one that matters: the option must be
+// reachable ONLY when the target genuinely has no RLS. A Postgres target
+// that silently stopped enforcing its policies is the exact silent-loss the
+// B-10 comparison was added for, so every shape it catches must still be
+// caught with the option off.
+func TestTargetCannotHoldRowLevelSecurityDoesNotReachAPostgresTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		expected func(*ir.Table)
+		actual   func(*ir.Table)
+	}{
+		{
+			"RLS disabled on target",
+			func(tb *ir.Table) { tb.RLSEnabled = true; tb.RLSForced = true },
+			nil,
+		},
+		{
+			"FORCE dropped on target",
+			func(tb *ir.Table) { tb.RLSEnabled = true; tb.RLSForced = true },
+			func(tb *ir.Table) { tb.RLSEnabled = true },
+		},
+		{
+			"policy dropped on target",
+			func(tb *ir.Table) {
+				tb.RLSEnabled = true
+				tb.Policies = []*ir.Policy{{Name: "tenant_isolation", Command: "ALL", Using: "(t = c())"}}
+			},
+			func(tb *ir.Table) { tb.RLSEnabled = true },
+		},
+		{
+			"policy predicate widened on target",
+			func(tb *ir.Table) {
+				tb.RLSEnabled = true
+				tb.Policies = []*ir.Policy{{Name: "tenant_isolation", Command: "ALL", Using: "(t = c())"}}
+			},
+			func(tb *ir.Table) {
+				tb.RLSEnabled = true
+				tb.Policies = []*ir.Policy{{Name: "tenant_isolation", Command: "ALL", Using: "true"}}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Schemas(tableWith(tc.expected), tableWith(tc.actual), Options{})
+			if !d.HasChanges() {
+				t.Fatalf("%s reported IN SYNC with the suppression OFF — the option's default must leave "+
+					"every real RLS drift reportable", tc.name)
+			}
+		})
+	}
+}

@@ -78,6 +78,13 @@ type PolicyDiff struct {
 // ignore other applications' tables has not asked to be kept from hearing
 // that this one stopped enforcing its policies.
 func diffRowLevelSecurity(td *TableDiff, expected, actual *ir.Table, opts Options) {
+	// A target with no row-level security has nothing to compare against
+	// and no remedy to offer — see [Options.TargetCannotHoldRowLevelSecurity]
+	// for why this is a suppression and the sequence/EXCLUDE siblings are
+	// not.
+	if opts.TargetCannotHoldRowLevelSecurity {
+		return
+	}
 	if expected.RLSEnabled != actual.RLSEnabled || expected.RLSForced != actual.RLSForced {
 		td.RLSMismatched = true
 		td.ExpectedRLSEnabled, td.ActualRLSEnabled = expected.RLSEnabled, actual.RLSEnabled

@@ -1,0 +1,142 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+// The COMPARE-ONLY half of the shape-compare rule tables (roadmap item
+// 158). See [compareOnlyRuleFor] for why this file exists at all rather
+// than adding arms to [retargetRuleFor].
+
+package translate
+
+import "sluicesync.dev/sluice/internal/ir"
+
+// compareOnlyRuleFor returns the rule that rewrites a source's IR types
+// into the shapes the target's CATALOG will read back, for engine pairs
+// whose rewrite must NOT also run on the emit lane.
+//
+// # Why a second table rather than more arms on [retargetRuleFor]
+//
+// [retargetRuleFor]'s table is shared: [RetargetForEngine] hands its
+// output to a SchemaWriter (restore, chain restore, the broker's
+// schema-delta apply, schema-forward, and `schema diff`'s CREATE TABLE
+// suggestions), and [RetargetForShapeCompare] compares it against a
+// catalog. For postgres→mysql that sharing is correct — every arm of
+// [retargetPGtoMySQL] states what the MySQL emitter itself does, so
+// pre-applying it is idempotent.
+//
+// The mirror direction is NOT symmetric, and the asymmetry is the whole
+// reason this file exists. Two of the four mysql→postgres rewrites
+// DESTROY information the Postgres DDL emitter still needs:
+//
+//   - **ir.Set.** internal/engines/postgres.emitTableDef reads `ir.Set`
+//     to emit a table-level `CONSTRAINT <t>_<c>_set CHECK (<c> <@
+//     ARRAY[...])` enforcing the source's member list. Rewriting the
+//     column to `Array<Text>` first leaves the emitter with nothing to
+//     dispatch on and the membership constraint is SILENTLY DROPPED on
+//     every restore of a MySQL-sourced chain into Postgres. That is
+//     item 153's DOMAIN trap one direction over: a loud false report
+//     traded for a silent constraint loss, which is the worse side.
+//     Pinned by TestEmitTableDef_CompareOnlyRewriteWouldDropTheSetCheck.
+//   - **ir.Integer.Unsigned.** [ScanUnsignedBigintNotices] and
+//     [ScanMySQLTimeRangeNotices] dispatch on the source-native type to
+//     warn the operator about Bug 11's (2^63, 2^64) range narrowing.
+//     A rewrite that erases `Unsigned` before they run erases the
+//     warning with it. `migrate` happens not to retarget today, so this
+//     one is a LATENT rather than live loss — recorded because the next
+//     caller to add a retarget ahead of the notices would not find out.
+//
+// The other two arms (the TEXT-tier and binary-family collapses) are
+// genuinely inert on the emit lane — Postgres emits TEXT and BYTEA for
+// every tier either way. They travel with the two above rather than
+// being split across both tables, because one rule table per (source,
+// target, lane) is a shape a reader can hold; four arms distributed by
+// individual safety is not.
+//
+// Identity for every pair with no compare-only table.
+func compareOnlyRuleFor(sourceEngine, targetEngine string) retargetRule {
+	if IsMySQLFamily(sourceEngine) && storageShapeFamily(targetEngine) == storageFamilyPostgres {
+		return retargetMySQLtoPGShapeCompare
+	}
+	return nil
+}
+
+// retargetMySQLtoPGShapeCompare rewrites a MySQL-family source's IR
+// types into what a Postgres catalog reads back for the column
+// internal/engines/postgres.emitColumnType creates from them.
+//
+// Returning nil means "the catalog reads this type back unchanged" — the
+// large majority of families, so the table is deliberately a list of the
+// FOUR that move rather than a restatement of the type system.
+//
+// # The families were enumerated by measurement, not by symmetry
+//
+// The mirror of [retargetPGtoMySQL] is the wrong derivation: "what does
+// a PG `text` become on MySQL" is a different question from "what does a
+// MySQL `TEXT` read back as on PG". The list below came from migrating a
+// table carrying EVERY arm of internal/engines/mysql.translateType onto
+// a real PostgreSQL 16 and diffing the read-back against the source IR;
+// the same fixture is now TestSchemaDiffAfterMigrate_MySQLToPostgres_
+// TypeFamilyMatrix, so the derivation is re-run on every CI Integration
+// job rather than trusted. Sixteen columns moved and they fall into
+// exactly the four arms below; everything else — Boolean, Decimal,
+// Float, Bit, Char, Varchar, Date, Time, DateTime, Timestamp, Enum,
+// JSON, and the MariaDB-native UUID / INET families — round-tripped
+// identically, as did NOT NULL, DEFAULT and STORED generated columns.
+func retargetMySQLtoPGShapeCompare(t ir.Type) ir.Type {
+	switch v := t.(type) {
+	case ir.Integer:
+		// Postgres has no unsigned integers and only three widths, so a
+		// TINYINT reads back as Int16 and an INT UNSIGNED as Int64. The
+		// arithmetic is [PGStorageIntegerWidth]'s — the same function the
+		// PG emitter names its column from — so the prediction and the
+		// creation cannot disagree.
+		w := PGStorageIntegerWidth(v)
+		if w == v.Width && !v.Unsigned {
+			return nil
+		}
+		// AutoIncrement survives the round trip (PG `GENERATED BY DEFAULT
+		// AS IDENTITY` reads back as ir.Integer.AutoIncrement), so it is
+		// carried; a rewrite that dropped it would report phantom drift on
+		// every synthetic primary key, which is most of them.
+		return ir.Integer{Width: w, AutoIncrement: v.AutoIncrement}
+
+	case ir.Text:
+		// PG `text` is unbounded and has no tiers: emitColumnType collapses
+		// TINYTEXT/TEXT/MEDIUMTEXT/LONGTEXT to TEXT, and translateScalarType
+		// reads every one back as TextLong. Charset/collation ride along
+		// unchanged — the diff and the migrate shape gate both keep them out
+		// of a cross-family comparison (Bug 234), and dropping them here
+		// would discard source information for no gain.
+		if v.Size == ir.TextLong {
+			return nil
+		}
+		return ir.Text{Size: ir.TextLong, Charset: v.Charset, Collation: v.Collation}
+
+	case ir.Binary:
+		// PG has ONE binary type. BINARY(N), VARBINARY(N) and all four BLOB
+		// tiers land as BYTEA and read back as Blob[long], so the declared
+		// length is not recoverable from the target and must not be
+		// compared against it.
+		return ir.Blob{Size: ir.BlobLong}
+	case ir.Varbinary:
+		return ir.Blob{Size: ir.BlobLong}
+	case ir.Blob:
+		if v.Size == ir.BlobLong {
+			return nil
+		}
+		return ir.Blob{Size: ir.BlobLong}
+
+	case ir.Set:
+		// MySQL SET lands as TEXT[] plus a membership CHECK (the constraint
+		// is why this rule is compare-only — see [compareOnlyRuleFor]). The
+		// element reads back as an unbounded `text`, i.e. TextLong.
+		//
+		// KNOWN RESIDUAL, item 156's mirror: the membership CHECK itself
+		// still reports as `ChecksExtra` on every diff of a SET column,
+		// because the expected side has nowhere to carry it. This rule
+		// closes the TYPE axis only; that is stated here rather than left
+		// for a reader to discover, and pinned as a characterization by
+		// TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift.
+		return ir.Array{Element: ir.Text{Size: ir.TextLong}}
+	}
+	return nil
+}

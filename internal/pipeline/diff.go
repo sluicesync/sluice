@@ -316,10 +316,21 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// every mysql→postgres pair reported permanent drift (Bug 234's
 	// sibling sweep). Same-family pairs still compare, so a genuine
 	// `latin1` vs `utf8mb4` or a PG `COLLATE "C"` change surfaces.
+	//
+	// Row-level security joins the comparison only when the TARGET can
+	// hold it. RLS is Postgres-only — the PG reader is the only one that
+	// populates the flags and the policies, and MySQL's SchemaWriter WARNs
+	// once and creates the table without them — so a PG→MySQL pair
+	// `migrate` itself created reported `RLSMismatched` plus every policy
+	// as missing, forever, with no target-side action able to close it
+	// (Bug 234's deferred list). Keyed on the already-declared
+	// [ir.Capabilities.PostgresBackend] rather than an engine name, so a
+	// future PG-family flavor inherits the comparison by declaration.
 	sameFamily := translate.SameStorageShapeFamily(d.Source.Name(), d.Target.Name())
 	diff := irdiff.Schemas(expected, actual, irdiff.Options{
-		IgnoreExtras:           d.IgnoreExtras,
-		IgnoreCharsetCollation: d.IgnoreCharsetCollation || !sameFamily,
+		IgnoreExtras:                     d.IgnoreExtras,
+		IgnoreCharsetCollation:           d.IgnoreCharsetCollation || !sameFamily,
+		TargetCannotHoldRowLevelSecurity: !d.Target.Capabilities().PostgresBackend,
 	})
 
 	// ---- 4. Resolve missing-table DDL via the target engine's

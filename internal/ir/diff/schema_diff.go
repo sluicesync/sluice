@@ -452,6 +452,32 @@ type Options struct {
 	// `en_US.utf8` rarely match by name even when operators
 	// consider them equivalent.
 	IgnoreCharsetCollation bool
+
+	// TargetCannotHoldRowLevelSecurity drops the RLS flag pair and the
+	// whole policy comparison. It is set when the TARGET engine has no
+	// row-level security at all, which today means any non-Postgres
+	// backend: the PG reader populates RLSEnabled / RLSForced / Policies,
+	// no other reader ever does, and MySQL's SchemaWriter WARNs once and
+	// creates the table without them (mysql/schema_writer.go's
+	// maybeWarnRLSDrop). So on a target `migrate` itself just created,
+	// expected carries the flags and the policies, actual carries neither,
+	// and every future diff reports drift the operator cannot close by any
+	// action on the target (Bug 234's deferred list).
+	//
+	// The line this draws, stated because the sibling objects fall on the
+	// other side of it: suppress where sluice's own migrate WARNs and
+	// DROPS, keep reporting where migrate REFUSES. Standalone sequences
+	// and EXCLUDE constraints are refused outright by
+	// migcore.CheckCrossEngineSupportable for a MySQL or SQLite target, so
+	// `migrate` can never have produced the pair — a "missing on target"
+	// line there is not phantom, it is the diff telling an operator with a
+	// hand-built target exactly why a migration would refuse. Those two
+	// stay compared, deliberately.
+	//
+	// Same-engine PG→PG is unaffected: a genuinely disabled RLS flag or a
+	// dropped policy on a Postgres target still surfaces, because a
+	// Postgres target CAN hold them.
+	TargetCannotHoldRowLevelSecurity bool
 }
 
 // Schemas computes the structural delta between expected and
