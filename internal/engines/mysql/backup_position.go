@@ -13,15 +13,58 @@ import (
 )
 
 // binlogEnabledQuery reads whether the source is writing a binary log at
-// all. `@@GLOBAL.log_bin` is a 0/1 flag readable by an ordinary
-// connection on every supported line of both families (ground-truthed
-// 2026-08-07 on MySQL 8.0.46 and MariaDB 11.4, both booted
-// --skip-log-bin: it reads 0 rather than erroring or going missing).
+// all. A failed read FAILS the capture (see [binlogEnabled]), so "the
+// server answers this variable" is a PREMISE this preflight rests on —
+// and a premise about somebody else's server is exactly the thing this
+// project keeps writing down instead of measuring. The roster, per
+// flavor, measured rather than assumed:
+//
+//   - mysql, mariadb — ground-truthed 2026-08-07 on MySQL 8.0.46 and
+//     MariaDB 11.4, both booted --skip-log-bin: `@@GLOBAL.log_bin` reads
+//     0 rather than erroring or going missing. Both capturer doors are
+//     reachable on these two. Pinned by TestCaptureBackupPosition_NoBinlog.
+//   - planetscale, vitess — the connection terminates at VTGATE, not at
+//     mysqld, and vtgate serves its own PARTIAL system-variable surface,
+//     so neither measurement above says anything about these two. Measured
+//     2026-08-07 on the real multi-process Vitess 24.0.1 cluster
+//     (testdata/vitesscluster: etcd + vtctld + primary/replica vttablet +
+//     vtgate): `SELECT @@GLOBAL.log_bin` returns 1. vtgate does not answer
+//     it locally — it ROUTES the query to a tablet, which is visible when
+//     no tablet is serving yet ("target: test.0.primary: no healthy tablet
+//     available for … tablet_type:PRIMARY"). So the value is that tablet's
+//     mysqld's, and a Vitess tablet runs mysqld WITH binary logging —
+//     VReplication and VStream both ride it — which is why 1 here is
+//     structural rather than a lucky default. Pinned by
+//     TestVStream_BackupPositionProbesAnswerThroughVtgate (per-PR, vtcombo)
+//     and TestVitessCluster_BackupPositionProbesAnswerThroughVtgate (the
+//     weekly version matrix, vtgate v21..v24 — the axis on which a claim
+//     about someone else's proxy is likeliest to rot).
+//
+// Because that read is ROUTED, it fails when no tablet is serving. That
+// is not a NEW failure class on the only path a VStream flavor can reach
+// this preflight from: [SchemaReader.CaptureBackupPosition]'s own GTID
+// arm reads `SHOW VARIABLES LIKE 'gtid_mode'` and `@@global.gtid_executed`
+// through the same routing, so a tablet-less vtgate already failed the
+// capture before the preflight existed. Softening an unreadable variable
+// into "assume ON" was therefore rejected: it would buy nothing on the
+// flavors where the read is routed, and on the flavors where it is not it
+// would hand the GTID arm back a source it cannot describe — the exact
+// silent-loss shape (a well-formed, resumable-looking, EMPTY GTID cursor)
+// the preflight exists to close.
+//
+// Reachability on the two VStream flavors is narrow, and narrow is not
+// zero: `backup full` on a healthy planetscale/vitess source anchors on
+// [Engine.openBackupSnapshotVStream] and never calls either capturer. Only
+// the DEGRADED fallback reaches this — the VStream snapshot open failed
+// and --chain-slot was not requested, so the orchestrator falls through to
+// captureEndPosition — i.e. precisely when vtgate is already unhappy.
 const binlogEnabledQuery = "SELECT @@GLOBAL.log_bin"
 
 // binlogEnabled reports whether the source has binary logging on — the
 // premise both backup-position capturers rest on, and the one that used
 // to be asserted rather than read (see [SchemaReader.CaptureBackupPosition]).
+// An unreadable variable is an ERROR, not a "probably on"; the flavor
+// roster behind that choice is on [binlogEnabledQuery].
 func binlogEnabled(ctx context.Context, q rowQuerier) (bool, error) {
 	var on bool
 	if err := q.QueryRowContext(ctx, binlogEnabledQuery).Scan(&on); err != nil {
@@ -83,8 +126,14 @@ func warnNoBinlogCursor(ctx context.Context) {
 // binlog-less source records the empty [ir.Position] plus a WARN rather
 // than a plausible fake (see [warnNoBinlogCursor] for why that and not a
 // refusal). Pinned by TestCaptureBackupPosition_NoBinlog across both
-// families. The conn-scoped sibling [captureBackupPosition] carries the
-// same preflight — it had the identical defect.
+// binlog families. The conn-scoped sibling [captureBackupPosition] carries
+// the same preflight — it had the identical defect.
+//
+// This is the ONLY capturer door a VStream flavor can reach (the sibling's
+// two callers both sit behind `!usesVStream()`), and it reaches it only on
+// the degraded fallback. That the preflight's `@@GLOBAL.log_bin` read
+// survives a vtgate connection at all is a measured premise, not an
+// assumption — the roster is on [binlogEnabledQuery].
 //
 // In GTID mode the position is set-membership-comparable: the
 // incremental's CDC reader streams every transaction whose GTID is not

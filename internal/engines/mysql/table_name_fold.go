@@ -50,10 +50,16 @@ import (
 // target: the over-refusal direction, on the flavors least able to absorb it.
 // Measured on `vitess/vttestserver:mysql80` (2026-08-07): vtgate answers both
 // `SELECT @@global.lower_case_table_names` and the session form with **0**, so
-// those flavors take the no-fold path and this adds no failure mode. There is
-// no automated pin for that one — it needs a cluster boot — so treat it as a
-// measured premise rather than a checked one; its failure mode is a loud
-// refusal at the create-tables phase, never a silent merge.
+// those flavors take the no-fold path and this adds no failure mode. That
+// measurement is now CHECKED rather than merely recorded: the two vtgate
+// premise pins — TestVStream_BackupPositionProbesAnswerThroughVtgate (per-PR,
+// vtcombo) and TestVitessCluster_BackupPositionProbesAnswerThroughVtgate (the
+// weekly version matrix, vtgate v21..v24) — grade `readLowerCaseTableNames`
+// against a live vtgate alongside the backup-position preflight's own probe,
+// because it is the same surface with the same failure direction. What is
+// pinned is that vtgate ANSWERS it; the specific value stays a property of the
+// deployment. Its failure mode is a loud refusal at the create-tables phase,
+// never a silent merge.
 //
 // Those rows are the whole difficulty. The defect is identical to SQLite's
 // (item 148) — bare `CREATE TABLE IF NOT EXISTS`, a name that folds onto one

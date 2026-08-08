@@ -502,6 +502,12 @@ func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.SnapshotOpti
 // well-formed-looking cursor that resumes nothing. Both capturers had
 // that defect; fixing one and not the other is the sibling gap this
 // project keeps paying for.
+//
+// Both of ITS callers sit behind `!usesVStream()`, so this door is the
+// vanilla/mariadb one — a planetscale/vitess source can only ever reach
+// the [SchemaReader.CaptureBackupPosition] door, and only on the degraded
+// fallback. The flavor roster for the preflight's premise (does the
+// server serve `@@GLOBAL.log_bin` at all?) is on [binlogEnabledQuery].
 func captureBackupPosition(ctx context.Context, conn *sql.Conn, flavor Flavor) (ir.Position, error) {
 	on, err := binlogEnabled(ctx, conn)
 	if err != nil {
