@@ -272,7 +272,18 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// engine pairs are identity. Mappings already ran above, so any
 	// operator-supplied --type-override has already replaced the IR
 	// type and the retarget pattern match doesn't fire.
-	expected = translate.RetargetForEngine(expected, d.Source.Name(), d.Target.Name())
+	//
+	// TWO retargets, because this command does two different things with
+	// the result (roadmap item 153). The COMPARISON side reads a PG
+	// `CREATE DOMAIN` wrapper through its storage type, since that is
+	// what a MySQL catalog reads back — without it the diff reports
+	// phantom drift on every domain column of a target sluice itself
+	// created. The DDL-SUGGESTION side (step 4) keeps the wrapper: the
+	// target engine's emitter translates a domain's CHECKs into inline
+	// table CHECKs from Column.Type, so a flattened schema would suggest
+	// a CREATE TABLE missing constraints the migrate path does emit.
+	expectedDDL := translate.RetargetForEngine(expected, d.Source.Name(), d.Target.Name())
+	expected = translate.RetargetForShapeCompare(expected, d.Source.Name(), d.Target.Name())
 
 	// ---- 2. Read target's actual schema via the same SchemaReader
 	// surface (ADR-0029). The reader doesn't care whether a DSN points
@@ -303,7 +314,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// TABLE suggestions (MySQL/PG syntax) rather than a generic
 	// placeholder. PreviewDDL is optional; engines without it fall
 	// through to a simple comment.
-	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, d.EnabledPGExtensions, expected, diff)
+	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, d.EnabledPGExtensions, expectedDDL, diff)
 	if err != nil {
 		return nil, err
 	}

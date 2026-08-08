@@ -39,11 +39,67 @@ import (
 // does) must gate on [HasStorageShapeMapping] first — a raw compare
 // against a foreign catalog's read-back mistakes translation for
 // drift.
+//
+// This is the EMIT-lane entry point: use it when the result is handed
+// to a SchemaWriter or a RowWriter. Consumers that COMPARE the result
+// against a target catalog's read-back want
+// [RetargetForShapeCompare] instead; the difference is one thing (a
+// `CREATE DOMAIN` wrapper) and picking wrong is silent in both
+// directions, so TestRetargetCallSitesDeclareTheirLane in
+// internal/pipeline makes every call site declare which it is on.
 func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
+	return retargetSchema(s, retargetRuleFor(sourceEngine, targetEngine))
+}
+
+// RetargetForShapeCompare is [RetargetForEngine] for the consumers that
+// COMPARE the result against a target catalog's read-back rather than
+// emit DDL from it — the ADR-0166 pre-create shape gate and `sluice
+// schema diff`. It adds exactly one thing: a Postgres `CREATE DOMAIN`
+// wrapper is read through [ir.UnwrapDomain] before the rule table runs,
+// so the expected side names the STORAGE the target will actually hold.
+//
+// # Why this is a second entry point and not a rule arm (roadmap item 153)
+//
+// A DOMAIN is a CONSTRAINT wrapper, not a storage one, and
+// internal/ir/domain_storage.go already splits its two readings: every
+// decision about what a value LANDS AS unwraps ([ir.UnwrapDomain]);
+// the two decisions genuinely about the wrapper read it whole
+// ([ir.DomainOf]). A comparison against what a MySQL catalog HOLDS is
+// the first kind — MySQL has no DOMAIN, `emitColumnType` downgrades the
+// column to its base type, and the catalog reads that base type back —
+// so without the unwrap the gate compares `Domain{d AS JSON[text]}`
+// against `JSON[binary]` and refuses every re-run.
+//
+// Flattening inside [RetargetForEngine] itself was considered and
+// REJECTED on evidence: its other consumers (`restore`, `chain
+// restore`, the broker's schema-delta apply, schema-forward) feed the
+// result to a SchemaWriter, and MySQL's DDL emitter translates a
+// domain's CHECKs into inline table CHECKs — and its CHECK-drop WARN
+// fires — through [ir.DomainOf], which reads `Column.Type` and would
+// stop matching. That trades this item's loud false-refusal for a
+// SILENT constraint drop on the restore lane, which is the worse
+// direction. Which lanes take which entry point is not left to memory:
+// TestRetargetCallSitesDeclareTheirLane fails on a new call site.
+func RetargetForShapeCompare(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
+	rule := retargetRuleFor(sourceEngine, targetEngine)
+	if rule == nil {
+		// No rule means the pair is same-storage-family (or has no
+		// mapping at all — see [HasStorageShapeMapping], which the
+		// refusing consumers gate on first). A same-family target holds
+		// the DOMAIN itself, so unwrapping here would compare a wrapper
+		// against a wrapper the target really has.
+		return s
+	}
+	return retargetSchema(s, storageShapeRule(rule))
+}
+
+// retargetSchema applies rule to every column of every table. A nil
+// rule is the identity (unknown/same-engine pairs), returning the input
+// pointer so callers keep the untouched schema.
+func retargetSchema(s *ir.Schema, rule retargetRule) *ir.Schema {
 	if s == nil {
 		return nil
 	}
-	rule := retargetRuleFor(sourceEngine, targetEngine)
 	if rule == nil {
 		return s
 	}
@@ -60,6 +116,33 @@ func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Sche
 		out.Tables[i] = retargetTable(tbl, rule)
 	}
 	return out
+}
+
+// storageShapeRule decorates a rule so a DOMAIN-typed column is graded
+// on the storage its base type lands in: unwrap first, then run the
+// rule table on the base, and fall back to the bare base type when no
+// rule matches it. One place, one reading — the rule table itself never
+// grows a DOMAIN arm, so there is no second statement of the emit rules
+// to drift.
+//
+// A malformed nil-BaseType domain is NOT rewritten: [ir.UnwrapDomain]
+// hands the wrapper back, and passing it through unchanged keeps the
+// DDL emitter's named `DOMAIN %q has nil BaseType` refusal as the loud
+// path rather than turning it into a shape mismatch.
+func storageShapeRule(rule retargetRule) retargetRule {
+	return func(t ir.Type) ir.Type {
+		if _, isDomain := t.(ir.Domain); !isDomain {
+			return rule(t)
+		}
+		base := ir.UnwrapDomain(t)
+		if _, stillDomain := base.(ir.Domain); stillDomain {
+			return nil
+		}
+		if rewritten := rule(base); rewritten != nil {
+			return rewritten
+		}
+		return base
+	}
 }
 
 // retargetRule maps a source IR type to the target IR type the engine
@@ -118,12 +201,13 @@ func storageShapeFamily(engine string) string {
 	return strings.ToLower(engine)
 }
 
-// HasStorageShapeMapping reports whether [RetargetForEngine] can render
-// source-native IR in the target's storage shapes for this engine
-// pair: either both engines share a storage-shape family (identity is
-// faithful) or a retarget rule exists. Consumers that COMPARE the
-// retargeted schema against a target catalog read-back — the ADR-0166
-// migrate pre-create shape gate — must check this first: with no
+// HasStorageShapeMapping reports whether [RetargetForShapeCompare] can
+// render source-native IR in the target's storage shapes for this
+// engine pair: either both engines share a storage-shape family
+// (identity is faithful) or a retarget rule exists. Consumers that
+// COMPARE the retargeted schema against a target catalog read-back —
+// the ADR-0166 migrate pre-create shape gate — must check this first
+// AND use [RetargetForShapeCompare] to build the expected side: with no
 // mapping, source-native IR lands against the target's lossy read-back
 // (MySQL INT UNSIGNED reads back from PG as BIGINT, TEXT tiers
 // collapse, VARBINARY becomes BYTEA) and translation is
@@ -164,6 +248,32 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 		// varchars pass through unchanged (nil → no rewrite).
 		if size, downmap := mysqlTextTierForWideVarcharIR(v.Length); downmap {
 			return ir.Text{Size: size, Charset: v.Charset, Collation: v.Collation}
+		}
+		return nil
+	case ir.JSON:
+		// MySQL has ONE JSON type and its catalog reads it back as the
+		// binary form, so a PG `json` (text storage) column lands
+		// indistinguishably from a `jsonb` one — mysql/ddl_emit.go emits
+		// a bare `JSON` for both. Without this the expected side says
+		// JSON[text] against a read-back of JSON[binary] and the
+		// pre-create gate refuses every re-run over a `json` column
+		// (roadmap item 153). `jsonb` already matched, which is why the
+		// defect survived: the two spellings share every code path here
+		// and differ only in the field this arm normalises.
+		if !v.Binary {
+			return ir.JSON{Binary: true}
+		}
+		return nil
+	case ir.Bit:
+		// MySQL has no varying-bit type: mysql/ddl_emit.go lands a fixed
+		// BIT(N) for a PG `bit varying(N)` too (catalog Bug 75, values
+		// zero-extended). The catalog reads back Varying=false, so an
+		// un-normalised expected side false-refuses the same way `json`
+		// does — the second bare-column half of item 153, which the
+		// filing did not name because the report's fixture had no
+		// `bit varying` column.
+		if v.Varying {
+			return ir.Bit{Length: v.Length}
 		}
 		return nil
 	case ir.Array:
@@ -209,12 +319,32 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 // chain replay's schema-delta apply, schema-forward) are unaffected:
 // schema writers emit from Type and ignore this field.
 //
-// The one consumer that could have been flipped by a newly non-nil value
-// is MySQL's columnIsNativelyBinary, which reads nil as "natively
-// binary" — but it only asks about a column whose (post-rewrite) Type is
-// already binary, and no rule here produces a binary type. That premise
-// is a fact about this rule table, so it is pinned here rather than
-// asserted: TestRetargetRules_NeverProduceABinaryType.
+// # The premise the provenance rests on, re-derived (roadmap item 153)
+//
+// The one consumer a newly non-nil value could flip is MySQL's
+// columnIsNativelyBinary, which reads nil as "natively binary" and is
+// only ever asked about a column whose (post-rewrite) Type is already
+// binary. Through v0.116.1 the pin here was the strictly stronger claim
+// that NO rule produces a binary type at all — true then, and false
+// now: [RetargetForShapeCompare]'s DOMAIN unwrap rewrites
+// `Domain{d AS Blob}` to `Blob`, which is exactly a binary output.
+//
+// What columnIsNativelyBinary actually needs is narrower than "no
+// binary output", and it is this: **the retarget must never MANUFACTURE
+// binariness.** A binary output must come from an input whose own
+// storage type ([ir.UnwrapDomain]) is already binary, so the provenance
+// this records answers the same question the un-retargeted column would
+// have answered. The DOMAIN case satisfies it — a PG domain over
+// `bytea` IS natively binary — and it satisfies it only because
+// columnIsNativelyBinary unwraps domains; the two facts are bound
+// rather than separately believed by
+// TestColumnIsNativelyBinary_SurvivesTheRetargetsProvenance in
+// internal/engines/mysql, which drives the real pass.
+//
+// Pinned here by TestRetargetRules_BinaryOutputOnlyFromABinarySource.
+// What that no longer guarantees, stated plainly: a rule MAY now output
+// a binary type, so any future consumer that relies on "the retarget's
+// output is never binary" has lost its evidence and must re-derive it.
 func retargetTable(tbl *ir.Table, rule retargetRule) *ir.Table {
 	if tbl == nil {
 		return nil

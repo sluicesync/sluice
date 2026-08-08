@@ -418,9 +418,11 @@ type Column struct {
 	// SourceColumnType is the column's pre-REWRITE IR type: whatever
 	// Type held before a translate pass replaced it. Two passes record
 	// it — [translate.ApplyMappings] (a per-column `--type-override`,
-	// and `--infer-types`, which rides the same rewrite) and
-	// [translate.RetargetForEngine] (the cross-engine shape rewrite;
-	// Bug 232). Nil when neither fired, which is the common case. When
+	// and `--infer-types`, which rides the same rewrite) and the
+	// cross-engine shape rewrite [translate.RetargetForEngine] /
+	// [translate.RetargetForShapeCompare] (Bug 232; the latter also
+	// parks a flattened `CREATE DOMAIN` wrapper here — roadmap item
+	// 153). Nil when neither fired, which is the common case. When
 	// both would apply the OVERRIDE wins, because it recorded the
 	// operator's true source type and the retarget's would be one step
 	// nearer.

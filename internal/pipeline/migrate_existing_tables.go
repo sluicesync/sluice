@@ -173,9 +173,16 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 	// schema-diff command: cross-engine pairs rewrite source-native IR
 	// types to what the target writer would emit (PG uuid → CHAR(36),
 	// …) so the IR comparison sees the shape the catalog will read
-	// back. Same-engine pairs are identity. RetargetForEngine clones;
-	// the writer keeps the untouched schema.
-	expected := translate.RetargetForEngine(schema, g.Source.Name(), g.Target.Name())
+	// back. Same-engine pairs are identity. The retarget clones; the
+	// writer keeps the untouched schema.
+	//
+	// RetargetForShapeCompare, not RetargetForEngine: this is a
+	// COMPARISON against what the target holds, so a PG `CREATE DOMAIN`
+	// wrapper is read through its storage type — MySQL has no DOMAIN and
+	// its catalog reads the base type back. Roadmap item 153: without
+	// it, every DOMAIN column (and every plain `json` and `bit varying`
+	// one) refused a second migrate over tables sluice itself created.
+	expected := translate.RetargetForShapeCompare(schema, g.Source.Name(), g.Target.Name())
 	expTables := make(map[string]*ir.Table, len(expected.Tables))
 	for _, t := range expected.Tables {
 		expTables[t.Name] = t
