@@ -1886,6 +1886,25 @@ The generic hint was not merely redundant in these cases but wrong — the bulk-
 
 **Mutation runs, each confirmed APPLIED (grep for the marker) before the result was trusted** — the 2026-08-05 rule, which cost a destroyed working file to relearn: M1 drop the MySQL default → the parse-entry-point pin FAILS; M2 revert one PG dial site to keep-alive only → the dial-site walker FAILS naming the file and line; M3 drop `postgres` from the roster → the registry gate FAILS in both directions (missing engine AND stale entry); M4 never warn → the stall pin and the live-ticker pin FAIL; M5 drop the quiesce exclusion → the grow-gate pin FAILS; M6 never reset on progress → the slow-but-progressing pin FAILS; M7 remove the watchdog from the chunk ticker → the lane roster and the live-ticker pin FAIL; M8 remove it from the raw lane → the lane roster FAILS naming that lane; M9 drop `GrowGate` at the multi-database site → the `bulkCopyOpts` roster FAILS; M10 make `QuiescedSince` always true → the QuiescedSince pin FAILS; M11 ignore the owner deadline → never-lengthens FAILS in three shapes; M12 no wrapper at all → arm-per-write and the real-socket pin FAIL; M13 fixed re-warn interval → the widening pin FAILS (9 warnings where ≤6 is the bound).
 
+### 153. Re-running `migrate` PG→MySQL over an existing target FALSE-REFUSES on every `json` column, and on every DOMAIN column — *OPEN, MEDIUM; found by the Bug 233 fix, deliberately left out of it*
+
+`translate.retargetPGtoMySQL` has **no `ir.JSON` arm and no `ir.Domain` arm**, so the existing-tables shape gate — and `sluice schema diff` — compares an **un-retargeted** expected side against what MySQL actually read back. Ground truth, from a re-run over empty existing tables:
+
+```
+pipeline: 2 pre-existing target table(s) differ … refusing before any data moves:
+  table "dom"   (column "jarr": want Domain{d_jarr AS Array<JSON[text]>}, target has JSON[binary])
+  table "plain" (column "jscl": want JSON[text],                          target has JSON[binary])
+```
+
+**The `json` half is the wider one and has nothing to do with domains:** any plain PostgreSQL `json`/`jsonb` column makes a second `migrate` run against a populated-or-created target refuse. That is the `--resume`-shaped workflow and the "re-run after fixing one table" workflow, both of which an operator reaches for precisely when something already went wrong.
+
+**Loud, no data loss, and a different lane from Bug 233** — that fix corrected the value/DDL path, which is why it is landed and this is not.
+
+**Why it was deliberately NOT bundled with Bug 233.** The fix flattens `retargetTable`'s output, which invalidates the documented premise pin `TestRetargetRules_NeverProduceABinaryType` — the gate asserting "no rule here produces a binary type", which is load-bearing for `columnIsNativelyBinary`'s safety argument (nil `SourceColumnType` reads as "natively binary"). `Domain{d AS Blob}` → `Blob` would produce exactly that. So closing this means re-deriving that argument, which is a chunk, not a hunk — and bundling it would have been the Phase-B hedge CLAUDE.md warns against.
+
+**The entanglement, stated because the order matters.** Flattening the retarget *without* Bug 233's `arrayElementType` / `columnIsArrayLike` domain unwrap would **reintroduce Bug 232 through domains**. That unwrap is already in (`a44c0fa7`), so this is now safe to do — but it was not before, and a future reader reversing the order would ship a silent-loss regression.
+
+**Gate.** The shape gate's expected side must be built by the same retarget the writer's target-landing decisions use, and the pin should compare *retargeted expected* vs *catalog read-back* for every family that retargets — `json`/`jsonb`, `hstore`, `varchar`/`text`, `bit`, `geometry`, and each of those through a DOMAIN. Re-derive `TestRetargetRules_NeverProduceABinaryType`'s claim rather than deleting it: if flattening makes it false, the honest replacement is a pin on what `columnIsNativelyBinary` actually needs, not the removal of its evidence.
 ### 152. A `json[]` / `bytea[]` column reaching a MySQL target silently base64s its elements — *✅ SHIPPED v0.116.0 ( `f67dd126` + the review follow-up below). NOT a concurrency chunk, so the `-race` Integration job is the ordinary gate rather than a pre-tag requirement.*
 
 `convertArrayLikeToJSON` (`internal/engines/mysql/row_writer.go:1433`) hands the array to `encoding/json` in its `[]any` arm (`:1453-1458`), and `encoding/json` renders a `[]byte` element as **base64**. So a Postgres `json[]` holding `{"{\"a\":1}"}` lands on a MySQL JSON column as `["eyJhIjoxfQ=="]` — a document replaced by an opaque string — at **exit 0**. `bytea[]` is the same shape on the same arm.
