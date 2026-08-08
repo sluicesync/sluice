@@ -4,11 +4,17 @@
 package sqlitetrigger
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	_ "modernc.org/sqlite" // pure-Go driver; keeps these in the unit gate
+	sqlitedrv "modernc.org/sqlite"     // pure-Go driver; keeps these in the unit gate
+	sqlitelib "modernc.org/sqlite/lib" // the driver's SQLITE_* result codes
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -39,6 +45,63 @@ func openWritable(t *testing.T, path string) *sql.DB {
 	return db
 }
 
+// busyRetryAttempts bounds [insertRetryingBusy]. Each attempt already carries
+// its own full `busy_timeout` deadline, so exhausting the budget means the
+// connection was starved through N CONSECUTIVE deadlines -- which is not a
+// contention shape, it is a wedged database, and the test says so out loud.
+const busyRetryAttempts = 10
+
+// isSQLiteBusy reports whether err is SQLite's transient lock-contention
+// refusal -- the one class a writer is supposed to retry rather than surface.
+// Anything else (a constraint violation, a broken trigger, an I/O error) is a
+// real defect and must NOT be retried into silence.
+func isSQLiteBusy(err error) bool {
+	var se *sqlitedrv.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Code() == sqlitelib.SQLITE_BUSY || se.Code() == sqlitelib.SQLITE_LOCKED
+}
+
+// insertRetryingBusy performs one INSERT, retrying while SQLite reports
+// SQLITE_BUSY/SQLITE_LOCKED, and returns how many retries it took.
+//
+// WHY THIS EXISTS, since `busy_timeout` looks like it should already cover it:
+// the busy handler is a DEADLINE, not a queue, and it is not fair. It backs off
+// in sleeps of up to 100ms, so the connection that holds the write lock drains
+// its ENTIRE batch while the losers sleep -- measured on this shape, the insert
+// order is exactly [40 40 40 40] on every run, and a single INSERT was observed
+// blocking for 1.1s on this box. That is the mechanism: a loser does not wait a
+// lock-acquisition's worth of time, it waits a whole batch's worth, so the
+// deadline is a race between the timeout and the winner's remaining work. It
+// only lowers the PROBABILITY of a loss; it cannot remove it, and the only way
+// to keep the caller's assertion exact is to retry. A real application retries
+// here too, which is the other reason this belongs in a test whose subject is
+// what real writers observe.
+//
+// The 10s deadline therefore had roughly 10x headroom on the authoring box and
+// none to spare on a CI Windows runner about an order of magnitude slower --
+// which is precisely where it was first exercised, and where it lost exactly
+// one row of 160. Sweeping the deadline on this box reproduces the whole curve:
+// 5ms loses 80 rows of 160, 100ms loses 10, and 500ms loses exactly 1, the same
+// 159/160 CI reported. The tail never reaches zero; it just moves.
+func insertRetryingBusy(ctx context.Context, db *sql.DB, id int64, w int) (retries int, err error) {
+	for attempt := 0; attempt < busyRetryAttempts; attempt++ {
+		_, err = db.ExecContext(ctx, `INSERT INTO t (id, w) VALUES (?, ?)`, id, w)
+		if err == nil {
+			return attempt, nil
+		}
+		if !isSQLiteBusy(err) {
+			return attempt, err
+		}
+		// A short pause before re-entering a fresh deadline, so a starved
+		// connection is not immediately re-queued behind the same winners.
+		time.Sleep(time.Duration(attempt+1) * time.Millisecond)
+	}
+	return busyRetryAttempts, fmt.Errorf("still SQLITE_BUSY after %d attempts, each with its own 10s deadline: %w",
+		busyRetryAttempts, err)
+}
+
 // TestChangeLogIDsAreCommitOrderedUnderConcurrentWriters is the serialization
 // pin the audit entry asked for. It runs W concurrent writers against one
 // SQLite file while the real CDC reader polls, and asserts the two things the
@@ -50,8 +113,17 @@ func openWritable(t *testing.T, path string) *sql.DB {
 // confirmed committed — collected by the test, from neither the change log
 // nor the reader.
 //
-// It is a CONCURRENCY test by construction: the property under test is
-// SQLite's write serialisation, which cannot be observed without contention.
+// It is a CONCURRENCY test, and it CHECKS that rather than asserting it: the
+// property under test is SQLite's write serialisation, which cannot be observed
+// without contention, so the run is graded on whether the writers were actually
+// mid-flight at the same time (see the anti-vacuity check below).
+//
+// The writers RETRY on SQLITE_BUSY ([insertRetryingBusy]) and report anything
+// they could not land. `busy_timeout` alone is not enough to keep the exact
+// count honest, and finding that out cost a red Windows CI run on the v0.117.0
+// tag -- routine pushes are Linux-only and the Windows matrix joins on TAG
+// pushes, so any Windows-sensitive test here is first exercised at the worst
+// possible moment.
 func TestChangeLogIDsAreCommitOrderedUnderConcurrentWriters(t *testing.T) {
 	const (
 		writers  = 4
@@ -66,38 +138,107 @@ func TestChangeLogIDsAreCommitOrderedUnderConcurrentWriters(t *testing.T) {
 	var (
 		mu        sync.Mutex
 		committed = map[int64]bool{}
+		lost      []string
+		retried   int
 		wg        sync.WaitGroup
+	)
+	// Per-writer first/last write instants, so the run can be GRADED on whether
+	// the writers actually ran at the same time. See the anti-vacuity check.
+	var (
+		starts  = make([]time.Time, writers)
+		ends    = make([]time.Time, writers)
+		longest time.Duration
 	)
 	for w := 0; w < writers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			// busy_timeout is how a real application survives SQLite's
-			// single-writer lock; without it a contended INSERT returns
-			// SQLITE_BUSY immediately and the test measures the retry loop
-			// instead of the ordering property.
+			// single-writer lock, and it is NECESSARY BUT NOT SUFFICIENT --
+			// see [insertRetryingBusy] for why this loop also retries.
 			db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
 			if err != nil {
+				mu.Lock()
+				lost = append(lost, fmt.Sprintf("writer %d never opened its connection: %v", w, err))
+				mu.Unlock()
 				return
 			}
 			defer func() { _ = db.Close() }()
 			for i := 0; i < perW; i++ {
 				id := int64(w)*1_000_000 + int64(i) + 1
-				if _, eerr := db.ExecContext(bg(), `INSERT INTO t (id, w) VALUES (?, ?)`, id, w); eerr != nil {
-					continue
-				}
+				t0 := time.Now()
+				retries, eerr := insertRetryingBusy(bg(), db, id, w)
+				held := time.Since(t0)
 				mu.Lock()
-				committed[id] = true
+				if i == 0 {
+					starts[w] = t0
+				}
+				ends[w] = time.Now()
+				if held > longest {
+					longest = held
+				}
+				switch {
+				case eerr != nil:
+					lost = append(lost, fmt.Sprintf("row id=%d (writer %d): %v", id, w, eerr))
+				default:
+					committed[id] = true
+					retried += retries
+				}
 				mu.Unlock()
 			}
 		}(w)
 	}
 	wg.Wait()
 
-	if len(committed) != expected {
-		t.Fatalf("the writers committed %d of %d rows; the property under test is about CONTENDED writes, so "+
-			"a partial run makes this pin weaker than it claims", len(committed), expected)
+	// A write this loop could not land is reported with the driver's own error
+	// rather than skipped. That distinction is the whole point: before this,
+	// the writers swallowed every failure with a bare `continue`, so a lost row
+	// from lock contention and a lost row from a genuinely broken INSERT
+	// produced the identical "committed N of M" message and neither named the
+	// row or the reason.
+	if len(lost) > 0 {
+		t.Fatalf("%d of %d writes did not land even after the busy-retry budget; the property under test is "+
+			"about CONTENDED writes, so a partial run makes this pin weaker than it claims:\n  %s",
+			len(lost), expected, strings.Join(lost, "\n  "))
 	}
+	if len(committed) != expected {
+		t.Fatalf("the writers reported no failures but committed %d of %d distinct rows -- the ids this test "+
+			"generates are unique by construction, so this means the bookkeeping is wrong, not the database",
+			len(committed), expected)
+	}
+
+	// ANTI-VACUITY: the doc above calls this a concurrency test, and that is
+	// exactly the kind of claim this repo has learned not to leave unchecked.
+	// If the writers had in fact run back-to-back, every assertion below would
+	// still pass while proving nothing about SQLite's behaviour UNDER
+	// CONTENTION. So grade the overlap directly: the latest first-write must
+	// precede the earliest last-write, i.e. all W writers were mid-flight at
+	// once.
+	//
+	// Note what canNOT serve as this check, because it is the intuitive choice
+	// and it is wrong: the interleaving of writers in the change log. SQLite's
+	// busy handler backs off in sleeps of up to 100ms, so the connection
+	// holding the lock drains its whole batch while the losers sleep -- the
+	// insert order is measured to be exactly [40 40 40 40], four contiguous
+	// blocks, on every run of this shape. Blocky order is what MAXIMAL
+	// contention looks like here, not an absence of it.
+	latestStart, earliestEnd := starts[0], ends[0]
+	for w := 0; w < writers; w++ {
+		if starts[w].After(latestStart) {
+			latestStart = starts[w]
+		}
+		if ends[w].Before(earliestEnd) {
+			earliestEnd = ends[w]
+		}
+	}
+	if !latestStart.Before(earliestEnd) {
+		t.Fatalf("the %d writers did not overlap in time (last writer began at %v, first writer had already "+
+			"finished at %v), so this run did not actually CONTEND and the serialization property it claims "+
+			"to pin was never exercised", writers, latestStart, earliestEnd)
+	}
+	t.Logf("%d contended commits landed (%d needed a SQLITE_BUSY retry); all %d writers were concurrent for %v, "+
+		"and the longest single INSERT blocked for %v against its 10s busy deadline",
+		len(committed), retried, writers, earliestEnd.Sub(latestStart), longest)
 
 	r, err := openCDCReader(bg(), path)
 	if err != nil {

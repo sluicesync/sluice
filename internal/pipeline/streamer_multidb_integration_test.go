@@ -309,22 +309,42 @@ func TestStreamer_MultiDatabase_ConcurrentWritesDuringColdStart(t *testing.T) {
 	writerCtx, writerCancel := context.WithCancel(context.Background())
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
+	var liveA, liveB int
 	go func() {
 		defer writerWG.Done()
-		concurrentInsert(writerCtx, srcServer, "source_db", concurrentRows, "live-a")
-		concurrentInsert(writerCtx, srcServer, "shop_db", concurrentRows, "live-b")
+		liveA = concurrentInsert(writerCtx, srcServer, "source_db", concurrentRows, "live-a")
+		liveB = concurrentInsert(writerCtx, srcServer, "shop_db", concurrentRows, "live-b")
 	}()
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
-	wantA := seedRows + concurrentRows
-	wantB := seedRows + concurrentRows
-
-	// Let the concurrent writer finish before asserting catch-up.
+	// Let the concurrent writer finish before asserting catch-up. The Wait is
+	// also the happens-before edge that makes liveA/liveB safe to read here.
 	writerWG.Wait()
 	writerCancel()
+
+	// The expected count is what the writer CONFIRMED it committed, not what it
+	// was asked to write. This is NOT a relaxation of the zero-loss assertion
+	// below -- that assertion is still exact, and it is still "every row on the
+	// source is on the target". What changed is that its expected value is now
+	// an observation instead of a constant, so a tolerated source-side write
+	// error can no longer masquerade as target-side loss. See [concurrentInsert].
+	wantA := seedRows + liveA
+	wantB := seedRows + liveB
+	if liveA < concurrentRows || liveB < concurrentRows {
+		t.Logf("concurrent writer committed %d/%d and %d/%d rows; expectations adjusted to %d/%d",
+			liveA, concurrentRows, liveB, concurrentRows, wantA, wantB)
+	}
+	// ANTI-VACUITY: the point of this test is the CDC window, so the writer has
+	// to have actually written into it. Without a floor, a writer that failed
+	// every insert would leave a pure cold-copy test that passes.
+	if liveA == 0 || liveB == 0 {
+		t.Fatalf("the concurrent writer committed %d and %d rows; with no CDC-window writes this test "+
+			"degenerates into a cold-copy check and pins nothing about the snapshot->CDC handoff",
+			liveA, liveB)
+	}
 
 	// Catch-up ceiling. This is an async wait for the CDC tail to apply the
 	// 600 concurrent rows; the EXACT-count assertion below is the real
@@ -339,6 +359,11 @@ func TestStreamer_MultiDatabase_ConcurrentWritesDuringColdStart(t *testing.T) {
 	// TRANSACTION WITH CONSISTENT SNAPSHOT and the binlog-position read fell
 	// into neither the snapshot nor the CDC tail. The fix is FTWRL around the
 	// capture (see openBinlogSnapshotStreamShared); this test is its pin.
+	//
+	// Which is exactly why wantA/wantB are now derived from what the writer
+	// committed: a source-side write that never happened produced the SAME
+	// `got 2299/2300` message as that bug, so the one diagnostic this test
+	// owes its reader was ambiguous in precisely the case it matters most.
 	const catchUpCeiling = 180 * time.Second
 	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "source_db", "events", wantA, catchUpCeiling) {
 		streamCancel()
@@ -463,27 +488,44 @@ func seedEvents(t *testing.T, serverDSNStr, database string, n int, prefix strin
 	}
 }
 
-// concurrentInsert fires n single-row inserts into database.events. Best-
-// effort: stops on ctx cancellation; errors are tolerated (the test's
-// final source/target count comparison is the authority).
-func concurrentInsert(ctx context.Context, serverDSNStr, database string, n int, prefix string) {
+// concurrentInsert fires n single-row inserts into database.events and returns
+// how many actually COMMITTED. Best-effort by design: it stops on ctx
+// cancellation and tolerates a transient write error (a deadlock, a lock-wait
+// timeout, a connection blip during the FTWRL window) rather than failing the
+// test — those are legitimate things for a writer racing a cold start to hit.
+//
+// Returning the committed count is what makes tolerating them SAFE. The caller
+// derives its expected row count from this number, so a tolerated error costs
+// the test one row of load instead of turning into a phantom zero-loss failure.
+// The previous signature returned nothing and its doc claimed "the test's final
+// source/target count comparison is the authority" -- it was not: the caller
+// waited on a COMPILE-TIME constant and fataled ~180s before that comparison
+// could ever run, so a single tolerated error produced a message identical to
+// the real silent-loss bug this test exists to pin. Same defect class, and same
+// fix, as the sqlite-trigger watermark gate.
+func concurrentInsert(ctx context.Context, serverDSNStr, database string, n int, prefix string) (committed int) {
 	dsn, err := buildMySQLDSN(serverDSNStr, database)
 	if err != nil {
-		return
+		return 0
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return
+		return 0
 	}
 	defer func() { _ = db.Close() }()
 	for i := 0; i < n; i++ {
 		select {
 		case <-ctx.Done():
-			return
+			return committed
 		default:
 		}
-		_, _ = db.ExecContext(ctx, "INSERT INTO events (body) VALUES (?)", fmt.Sprintf("%s-%d", prefix, i))
+		if _, err := db.ExecContext(ctx, "INSERT INTO events (body) VALUES (?)",
+			fmt.Sprintf("%s-%d", prefix, i)); err != nil {
+			continue
+		}
+		committed++
 	}
+	return committed
 }
 
 // queryStringMySQL runs a single-value query against database on the
