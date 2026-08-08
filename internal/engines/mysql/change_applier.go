@@ -1006,6 +1006,11 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 // crash between them rolls back both — progress and data can never
 // diverge.
 //
+// That last sentence holds for every DML change type and is FALSE for
+// [ir.Truncate]; see [ChangeApplier.applyOneImpl]'s "the implicit-commit
+// rough edge" paragraph, which is the comment
+// change_applier_batch.go's TransactionalDDL note points at.
+//
 // Returns when the channel closes (clean shutdown), when ctx is
 // cancelled, or when a target write fails.
 //
@@ -1073,7 +1078,10 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 // the PG applier's same-named method; keeps the concurrent barrier's position
 // bookkeeping uniform across engines (the frontier — never the barrier's own
 // metadata-anchored token — names the resume LSN/GTID; Bug 158). The data +
-// ADR-0049 schema-history row + cache-after-commit still apply atomically.
+// ADR-0049 schema-history row + cache-after-commit still apply atomically —
+// for the SchemaSnapshot barrier. The Truncate barrier carries no
+// schema-history row and gets no atomicity at all on MySQL, for the reason
+// [ChangeApplier.applyOneImpl]'s implicit-commit paragraph gives.
 func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
 	return a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
 }
@@ -1083,6 +1091,43 @@ func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID str
 // gates the ADR-0007 position write: true for the serial per-change path
 // (position + data atomic); false for the concurrent barrier path (position
 // owned by the frontier checkpoint — see applyBarrierNoPosition).
+//
+// # The implicit-commit rough edge
+//
+// This is the comment change_applier_batch.go's TransactionalDDL note has
+// pointed at since ADR-0017 and which, until 2026-08-07, did not exist —
+// while [ChangeApplier.Apply]'s doc asserted the opposite. The premise is
+// an environmental fact about MySQL, not about this code: **MySQL commits
+// implicitly before and after every DDL statement**, and [ir.Truncate]
+// dispatches `TRUNCATE TABLE`, which is DDL. So on the Truncate arm the
+// `tx` opened below stops being a transaction the moment dispatch runs:
+// the truncate is already durable, the position write that follows
+// autocommits on its own, and the `tx.Rollback()` on the position-write
+// error path is a no-op. Position-and-data atomicity (ADR-0007) is
+// therefore NOT available for this one change type on this engine, and no
+// arrangement of statements can give it — the server drops the
+// transaction, not sluice.
+//
+// Why that is tolerable rather than a defect: the divergence it admits is
+// data-AHEAD-of-position (the truncate landed, the position did not), so a
+// resume replays from the older position and re-applies the truncate plus
+// everything after it. `TRUNCATE` is idempotent and ADR-0010 makes the
+// replayed DML idempotent, so the re-run converges. The forbidden
+// direction — position ahead of data — is unreachable here, because the
+// position write is issued strictly after the truncate has committed.
+//
+// Both halves are pinned against a real mysqld, in both directions, by
+// TestApplyOne_TruncateSurvivesTheRollback (the truncate is still applied
+// after a failed position write — the premise, proven rather than cited)
+// and TestApplyOne_SchemaSnapshotRollsBackWithItsPosition (the DML arm
+// really does roll back, so the paragraph above is a statement about
+// [ir.Truncate] specifically and not a general disclaimer).
+//
+// The BATCHED path never reaches this edge: `TransactionalDDL=false`
+// makes [appliershared.RunBatchLoop] flush the in-flight batch and route
+// every schema event (Truncate AND SchemaSnapshot — see
+// appliershared.isSchemaEvent) here, alone, so a DDL implicit commit can
+// never destroy a batch tx carrying other rows.
 func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
 	// PII Phase 1.5: redact CDC row data before dispatch when the
 	// operator has configured rules. nil/empty redactor is a no-op
@@ -1108,7 +1153,10 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// cold-start. dispatch handles the version write on `tx`; the
 	// position write that follows rides the same `tx`, and a single
 	// commit makes them atomic. A failure rolls back BOTH and
-	// propagates (locked decision #4b: fatal/loud, never
+	// propagates — a SchemaSnapshot's version write is pure DML, so
+	// this really is one transaction (the `ir.Truncate` arm is the
+	// exception, and only that arm; see the implicit-commit paragraph
+	// on this function) — (locked decision #4b: fatal/loud, never
 	// logged-and-continued). On the position-free barrier path the
 	// history-version write is still atomic with its data; the position
 	// is persisted separately by the frontier checkpoint.

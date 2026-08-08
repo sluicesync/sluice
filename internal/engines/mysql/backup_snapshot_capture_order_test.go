@@ -58,12 +58,31 @@ var nonAnchorCaptures = map[string]string{
 		"precedes the snapshot open by construction",
 }
 
-// captureOrderExempt lists the sites whose capture may follow their
-// snapshot open, each with the reason it is safe. Fail-by-default: a site
-// that is not listed here MUST capture first, and a listed name that the
-// walker no longer discovers fails too (a stale exemption is how a gate
-// quietly stops covering the thing it names).
-var captureOrderExempt = map[string]string{
+// ftwrlStmt / unlockStmt are the two edges of the write freeze. A site
+// that captures AFTER opening its snapshot is safe only while both edges
+// bracket the capture, so the walker has to be able to see them.
+const (
+	ftwrlStmt  = "FLUSH TABLES WITH READ LOCK"
+	unlockStmt = "UNLOCK TABLES"
+)
+
+// ftwrlBracketed lists the sites whose capture may follow their snapshot
+// open, each with the reason. It is NOT an exemption: a listed site is
+// GRADED on the reason itself (the capture must sit between this
+// function's own FTWRL and its UNLOCK, in source order — [gradeBracket]),
+// because every entry here says "the order cannot matter, because the
+// write freeze is held across both" and that clause is the whole safety
+// argument. A free-text exemption would leave it asserted and unchecked:
+// audit 2026-08-07 confirmed by mutation that moving
+// [acquireConsistentSnapshot]'s position read below its UNLOCK TABLES
+// left this gate GREEN, which is exactly ADR-0101 §3's "gaplessness is by
+// construction" claim resting on nothing.
+//
+// Fail-by-default in three directions: a site that is not listed here
+// MUST capture first; a listed name that the walker no longer discovers
+// fails (a stale entry is how a gate quietly stops covering the thing it
+// names); and a listed site whose bracket does not hold fails.
+var ftwrlBracketed = map[string]string{
 	"openBackupSnapshotCoordinated": "captures on R[0] while this function's own FLUSH TABLES WITH READ LOCK is " +
 		"held, so no commit can happen between the read views and the anchor — both orders name the same cut " +
 		"(ADR-0088 step 4)",
@@ -84,18 +103,25 @@ var captureOrderExempt = map[string]string{
 // the source implies; this one proves no THIRD site was added in the losing
 // order.
 //
-// Mutation-verified in four directions: swapping the anchor capture and
+// Mutation-verified in six directions: swapping the anchor capture and
 // `beginConsistentSnapshotTx` in openBackupSnapshotSerial fails it; deleting
 // B-4's pre-snapshot capture from openBinlogSnapshotStreamShared fails it
 // (so the gate reaches the OTHER lane too, which is the whole reason it
-// exists); dropping an entry from captureOrderExempt fails it; and a stale
-// exemption name fails it.
+// exists); dropping an entry from ftwrlBracketed fails it; a stale
+// exemption name fails it; moving acquireConsistentSnapshot's
+// snapshotMasterStatus below its UNLOCK TABLES fails it; and deleting the
+// FTWRL from a bracketed site fails it. The last two are the 2026-08-07
+// widening — before it, both were GREEN.
 //
 // KNOWN LIMIT, stated rather than implied: it grades SOURCE order, not
 // reachability. Guarding the pre-capture behind an always-false condition
 // leaves the tokens in place and passes here — that shape is caught by the
-// two general-log integration pins, which observe what the server was
-// actually asked to run.
+// general-log integration pins, which observe what the server was actually
+// asked to run (TestBackupSnapshotCapturesPositionBeforeSnapshot for the
+// backup lane, TestLockFreeSnapshotCapturesPositionBeforeSnapshot for the
+// cold-start floor, and
+// TestConcurrentSnapshotCapturesPositionUnderTheLock for the ADR-0101
+// bracketed lane this gate can only read statically).
 func TestSnapshotCaptureOrder_EveryUnlockedSiteCapturesBeforeTheSnapshot(t *testing.T) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
@@ -217,14 +243,15 @@ func TestSnapshotCaptureOrder_EveryUnlockedSiteCapturesBeforeTheSnapshot(t *test
 			len(sites), sites, wantSites)
 	}
 
-	checked := 0
+	checked, bracketed := 0, 0
 	for _, name := range sites {
-		if reason, exempt := captureOrderExempt[name]; exempt {
-			t.Logf("exempt: %s — %s", name, reason)
+		fn := funcs[name]
+		if reason, ok := ftwrlBracketed[name]; ok {
+			bracketed++
+			gradeBracket(t, fset, name, reason, fn, earliestMarker(fn, false, captureHelpers, fset, false))
 			continue
 		}
 		checked++
-		fn := funcs[name]
 		openPos := earliestMarker(fn, directOpen[name], openHelpers, fset, true)
 		capturePos := earliestMarker(fn, false, captureHelpers, fset, false)
 		if openPos < 0 || capturePos < 0 {
@@ -236,22 +263,83 @@ func TestSnapshotCaptureOrder_EveryUnlockedSiteCapturesBeforeTheSnapshot(t *test
 			t.Errorf("%s: the binlog position is captured at line %d, AFTER the consistent snapshot opens at "+
 				"line %d. That is the ordering where a commit inside the capture window is above the read view "+
 				"and below the recorded position, so it lands in NEITHER — audit B-4/B-4b's silent-loss case. "+
-				"Capture first, or add %q to captureOrderExempt with the reason the order cannot matter (today "+
-				"the only such reason is holding FLUSH TABLES WITH READ LOCK across both)",
+				"Capture first, or add %q to ftwrlBracketed with the reason the order cannot matter (today "+
+				"the only such reason is holding FLUSH TABLES WITH READ LOCK across both — and it is GRADED, "+
+				"not taken on trust)",
 				name, capturePos, openPos, name)
 		}
 	}
 	if checked < wantChecked {
-		t.Fatalf("only %d of %d discovered sites were actually graded; the rest are exempt. A roster that "+
-			"exempts everything is not a gate", checked, len(sites))
+		t.Fatalf("only %d of %d discovered sites were graded capture-first; the rest are FTWRL-bracketed. A roster "+
+			"that grades everything by the weaker rule is not a gate", checked, len(sites))
 	}
-	for name := range captureOrderExempt {
+	if bracketed != len(ftwrlBracketed) {
+		t.Errorf("graded %d FTWRL brackets but ftwrlBracketed lists %d — the bracket half of this gate is "+
+			"partly vacuous", bracketed, len(ftwrlBracketed))
+	}
+	for name := range ftwrlBracketed {
 		if !candidates[name] {
-			t.Errorf("captureOrderExempt names %q, which the walker no longer discovers as a capture site. "+
+			t.Errorf("ftwrlBracketed names %q, which the walker no longer discovers as a capture site. "+
 				"Either it was renamed/removed (drop the entry) or the walker stopped matching it (fix the "+
-				"walker) — a stale exemption silently shrinks this gate", name)
+				"walker) — a stale entry silently shrinks this gate", name)
 		}
 	}
+}
+
+// gradeBracket checks the ONE reason a site is allowed to capture AFTER it
+// opens its snapshot: this function's own write freeze is held across both,
+// so no commit can land between the read views and the recorded position.
+// The capture must sit strictly between a FLUSH TABLES WITH READ LOCK
+// literal and an UNLOCK TABLES literal, in source order.
+//
+// Missing edges FAIL. A bracket the walker cannot see is not a bracket, and
+// the two shapes that produce a missing edge are precisely the two that
+// break the argument: the capture moved below the UNLOCK (no closing edge
+// after it), and the FTWRL removed or made conditional-and-continue (no
+// opening edge before it). Both were green under the previous free-text
+// exemption.
+func gradeBracket(t *testing.T, fset *token.FileSet, name, reason string, fn *ast.FuncDecl, capturePos int) {
+	t.Helper()
+	if capturePos < 0 {
+		t.Errorf("%s: listed in ftwrlBracketed, but the walker cannot locate its position capture — it cannot "+
+			"grade a bracket it cannot read", name)
+		return
+	}
+	lockBefore, unlockAfter := -1, -1
+	for _, l := range literalLines(fn, ftwrlStmt, fset) {
+		if l < capturePos && (lockBefore < 0 || l > lockBefore) {
+			lockBefore = l
+		}
+	}
+	for _, l := range literalLines(fn, unlockStmt, fset) {
+		if l > capturePos && (unlockAfter < 0 || l < unlockAfter) {
+			unlockAfter = l
+		}
+	}
+	if lockBefore < 0 || unlockAfter < 0 {
+		t.Errorf("%s: captures its position at line %d, and its stated reason for capturing after the snapshot "+
+			"opens is %q — but the write freeze does NOT bracket the capture (%s at line %d, %s at line %d; "+
+			"want both, with the lock BEFORE and the unlock AFTER). Outside the freeze, a commit between the "+
+			"read views and the recorded position is above the views and below the position, so it lands in "+
+			"NEITHER — ADR-0101 §3's gaplessness argument is exactly this bracket and nothing else",
+			name, capturePos, reason, ftwrlStmt, lockBefore, unlockStmt, unlockAfter)
+		return
+	}
+	t.Logf("bracketed: %s — %s at line %d < capture at line %d < %s at line %d",
+		name, ftwrlStmt, lockBefore, capturePos, unlockStmt, unlockAfter)
+}
+
+// literalLines returns the source lines of every string literal in fn that
+// contains sub.
+func literalLines(fn *ast.FuncDecl, sub string, fset *token.FileSet) []int {
+	var out []int
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if v, ok := n.(*ast.BasicLit); ok && v.Kind == token.STRING && strings.Contains(v.Value, sub) {
+			out = append(out, fset.Position(v.Pos()).Line)
+		}
+		return true
+	})
+	return out
 }
 
 // helperClosure returns the functions that carry `marker` and NOT

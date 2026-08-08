@@ -205,6 +205,15 @@ func skippedColumnsFor(ev *replication.RowsEvent, i int) []int {
 // Generated columns are exempt: the row decoder drops them anyway
 // (their value is derived on the target), so a server that omits them
 // from the image loses nothing.
+//
+// That last clause is true of a generated column the target recomputes,
+// and FALSE of a generated column that is part of the PRIMARY KEY —
+// there the drop removes the row's identity, not a recomputable value.
+// The exemption is nonetheless correct as written, because that case is
+// refused earlier and unconditionally by [refuseGeneratedPKIdentity]
+// (it does not depend on the image being partial: it fires under
+// binlog_row_image=FULL too). Recorded here so the exemption is not
+// read as "a generated column can never matter".
 func refusePartialRowImage(tbl *tableSchema, skipped []int, op, img string) error {
 	for _, idx := range skipped {
 		if idx >= 0 && idx < len(tbl.Columns) && tbl.Columns[idx].IsGenerated() {

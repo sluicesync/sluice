@@ -1322,6 +1322,16 @@ func (r *CDCReader) dispatchRows(
 			// (the where row-move eval reads every OLD column); the
 			// where-intercept re-narrows to PK before apply. Otherwise keep
 			// the Bug-88 PK narrowing.
+			// The narrowing needs an identity the decoder kept. A
+			// GENERATED column in the PK is the one shape where it did
+			// not — refuse rather than emit a change whose WHERE can only
+			// be empty or `pk IS NULL`. Checked on BOTH narrowing arms
+			// (see the DELETE arm below); the filtered-sync full-before
+			// path re-narrows to PK before apply, so it needs the same
+			// guard and gets it here, ahead of the branch.
+			if err := refuseGeneratedPKIdentity(tbl, "update"); err != nil {
+				return err
+			}
 			if !r.emitFullBefore(tbl.Name) {
 				before = filterBeforeToPK(tbl, before)
 			}
@@ -1377,6 +1387,13 @@ func (r *CDCReader) dispatchRows(
 			// ADR-0173 Phase 2: emit the FULL before-image for a filtered
 			// table (the where intercept re-narrows to PK before apply);
 			// otherwise keep the Bug-88 PK narrowing.
+			//
+			// Same guard as the UPDATE arm: a GENERATED column in the PK
+			// is an identity the decoder already dropped, so the narrowing
+			// would hand the applier a nil key.
+			if err := refuseGeneratedPKIdentity(tbl, "delete"); err != nil {
+				return err
+			}
 			if !r.emitFullBefore(tbl.Name) {
 				before = filterBeforeToPK(tbl, before)
 			}
@@ -2525,16 +2542,27 @@ func filterBeforeToPK(tbl *tableSchema, before ir.Row) ir.Row {
 	}
 	out := make(ir.Row, len(tbl.PrimaryKey))
 	for _, col := range tbl.PrimaryKey {
-		// A PK column missing from the Before-image is structurally
-		// impossible under any binlog_row_image setting (the PK is
-		// always carried; that's the whole point of MINIMAL). If it
-		// somehow happens, copying the (possibly nil) value through
-		// produces a `pk IS NULL` predicate — the same behaviour
-		// the un-narrowed code path would have produced. We don't
-		// refuse loudly here because the binlog wire format makes
-		// the "PK missing" case unreachable in practice and the
-		// alternative (returning an error from the rows-loop) is
-		// noisier than the structural impossibility warrants.
+		// A PK column missing from the binlog's row IMAGE is
+		// structurally impossible under any binlog_row_image setting
+		// (the PK is always carried; that's the whole point of MINIMAL)
+		// — ground-truthed, not asserted, by
+		// TestCDCReader_MinimalDeleteCarriesThePK, which grades every PK
+		// shape MySQL accepts (first / last / composite-split /
+		// BLOB-prefix / invisible / server-generated `my_row_id`) ×
+		// {MINIMAL, NOBLOB, FULL}.
+		//
+		// Missing from the DECODED row is a different question, and the
+		// answer is not "impossible": [decodeBinlogRow] drops generated
+		// columns on purpose, so a PK on a generated column arrives here
+		// absent and this loop would copy nil through, producing the
+		// `pk IS NULL` predicate that matches nothing. That case is
+		// refused by [refuseGeneratedPKIdentity] before either arm calls
+		// this helper — the comment that used to sit here called it
+		// unreachable, and it was reachable under FULL.
+		//
+		// Any OTHER route to a missing PK column would still copy nil
+		// through, which is the same behaviour the un-narrowed path
+		// would have produced; no such route is known.
 		out[col] = before[col]
 	}
 	return out

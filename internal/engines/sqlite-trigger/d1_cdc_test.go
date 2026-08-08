@@ -19,6 +19,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // These httptest-backed tests pin the Phase-2 D1 transport substitution
@@ -44,6 +45,13 @@ type mockD1 struct {
 	maxID         string      // CAST(MAX(id) AS TEXT); "" → NULL (empty log)
 	rows          []clRow     // the canned change-log rows (filtered by id>since)
 	pollHTTPError bool        // when set, the poll returns HTTP 500 (transport error)
+
+	// The change log's id-allocation state, for the D1 half of
+	// verifyChangeLogWatermark. Zero values model a HEALTHY log (declared
+	// AUTOINCREMENT; sqlite_sequence at maxID), which is what every
+	// pre-existing test in this file assumes.
+	changeLogNoAutoincrement bool   // model a shadow table with no AUTOINCREMENT
+	sequenceSeq              string // CAST(sqlite_sequence.seq AS TEXT); "" → maxID
 
 	// pruneLo/pruneHi model a CONTIGUOUS change-log id range [lo, hi] for the
 	// P-1 batched-prune tests (empty when hi < lo); the MIN/COUNT/DELETE prune
@@ -118,6 +126,25 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 			})
 		}
 		return http.StatusOK, d1OK(rows)
+	// The change log's id-ALLOCATION probe (verifyChangeLogWatermark). Both
+	// halves are dispatched before the generic branches: the CREATE read
+	// carries no marker any later branch would claim, and the sequence read
+	// must not fall into the poll branch. The mock answers HEALTHY by
+	// default (an AUTOINCREMENT declaration and a counter at maxID) so the
+	// pre-existing D1 tests are unchanged; changeLogNoAutoincrement /
+	// sequenceSeq let a test model the tampered states.
+	// NOTE the projection in this predicate is load-bearing: the change-log
+	// EXISTS probe also selects `FROM sqlite_master`, and "sqlite_master"
+	// itself contains the substring "sql" — a looser match hijacks it and
+	// silently turns "the change log is absent" into "it is present".
+	case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+		create := `CREATE TABLE ` + ChangeLogTable + ` (id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT)`
+		if m.changeLogNoAutoincrement {
+			create = `CREATE TABLE ` + ChangeLogTable + ` (id INTEGER PRIMARY KEY, op TEXT)`
+		}
+		return http.StatusOK, d1OK([]map[string]any{{"sql": create}})
+	case strings.Contains(sql, "sqlite_sequence"):
+		return http.StatusOK, d1OK([]map[string]any{{"seq": m.healthySeqLocked()}})
 	case strings.Contains(sql, "sluice_change_log_columns"):
 		rows := make([]map[string]any, 0, len(m.fingerprints))
 		for _, fp := range m.fingerprints {
@@ -216,6 +243,32 @@ func (m *mockD1) rangeCountLocked(floor, upper int64) int64 {
 		return 0
 	}
 	return hi - lo + 1
+}
+
+// healthySeqLocked is the mock's `sqlite_sequence.seq` answer. An explicit
+// sequenceSeq wins (that is how a test models the lowered-counter tamper);
+// otherwise it reports the HIGH-WATER MARK across everything the mock models
+// — the canned rows, maxID, and the prune range — which is what a real
+// AUTOINCREMENT counter holds. Answering a lower value would make every
+// warm-resume test in this file trip verifyChangeLogWatermark, and answering
+// a fixed huge sentinel would make the gate untestable from here.
+func (m *mockD1) healthySeqLocked() string {
+	if m.sequenceSeq != "" {
+		return m.sequenceSeq
+	}
+	hi := int64(0)
+	if v, err := strconv.ParseInt(m.maxID, 10, 64); err == nil && v > hi {
+		hi = v
+	}
+	for _, r := range m.rows {
+		if r.id > hi {
+			hi = r.id
+		}
+	}
+	if m.pruneHi > hi {
+		hi = m.pruneHi
+	}
+	return strconv.FormatInt(hi, 10)
 }
 
 // parseRangeParams decodes the (floor, upper) params of a prune-range
@@ -916,4 +969,79 @@ func TestD1Item115_RegistrationBindsTheFrontierAsExactText(t *testing.T) {
 	if !seen {
 		t.Fatalf("no registration request carried the frontier; bodies = %v", m.bodies)
 	}
+}
+
+// TestD1CDCReader_RefusesChangeLogThatCanReissueIDs is the D1 half of the
+// sibling sweep for verifyChangeLogWatermark. The gate lives in shared code
+// but its probe is per-transport, so a gate exercised only against the local
+// SQLite executor would reach one of the engine's two implementors — the
+// "narrower than its name" shape. Both tampered states are modelled here,
+// plus the healthy control.
+func TestD1CDCReader_RefusesChangeLogThatCanReissueIDs(t *testing.T) {
+	tbl := &ir.Table{
+		Name:       "t",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{}}, {Name: "n", Type: ir.Integer{}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	newMock := func() *mockD1 {
+		return &mockD1{
+			exists:       true,
+			fingerprints: [][2]string{{"t", columnFingerprint(nonGeneratedColumnNames(tbl))}},
+			maxID:        "4",
+		}
+	}
+	openStream := func(t *testing.T, m *mockD1, resumeID int64) error {
+		t.Helper()
+		conn := startMockD1(t, m)
+		b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+		r, err := openCDCReaderBackend(bg(), b)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = r.(interface{ Close() error }).Close() }()
+		pos, perr := encodePos(sqliteTriggerPos{LastID: resumeID})
+		if perr != nil {
+			t.Fatalf("encodePos: %v", perr)
+		}
+		_, serr := r.StreamChanges(bg(), pos)
+		return serr
+	}
+
+	t.Run("no_autoincrement", func(t *testing.T) {
+		m := newMock()
+		m.changeLogNoAutoincrement = true
+		err := openStream(t, m, 4)
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCDCChangeLogIDReuse {
+			t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCChangeLogIDReuse, err, err)
+		}
+	})
+
+	t.Run("sequence_lowered_after_prune", func(t *testing.T) {
+		m := newMock()
+		m.maxID = ""        // the auto-prune drained the log
+		m.sequenceSeq = "0" // and the counter was lowered beneath the watermark
+		err := openStream(t, m, 4)
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCDCChangeLogIDReuse {
+			t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCChangeLogIDReuse, err, err)
+		}
+	})
+
+	t.Run("healthy_control", func(t *testing.T) {
+		if err := openStream(t, newMock(), 4); err != nil {
+			t.Fatalf("a healthy D1 change log was refused: %v", err)
+		}
+	})
+
+	// And the pruned-but-healthy control on the D1 transport: a drained log
+	// whose counter still holds the high-water mark must pass.
+	t.Run("pruned_but_healthy_control", func(t *testing.T) {
+		m := newMock()
+		m.maxID = ""
+		m.sequenceSeq = "4"
+		if err := openStream(t, m, 4); err != nil {
+			t.Fatalf("a drained-but-healthy D1 change log was refused: %v", err)
+		}
+	})
 }

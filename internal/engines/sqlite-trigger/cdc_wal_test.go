@@ -191,8 +191,17 @@ func (s *spyExecutor) pollChangeLog(context.Context, int64, int) ([]rawChangeRow
 
 func (s *spyExecutor) readFingerprints(context.Context) ([]fingerprintRow, error) { return nil, nil }
 
-func (s *spyExecutor) changeLogExists(context.Context) (bool, error)      { return true, nil }
-func (s *spyExecutor) maxChangeLogID(context.Context) (int64, error)      { return 0, nil }
+func (s *spyExecutor) changeLogExists(context.Context) (bool, error) { return true, nil }
+func (s *spyExecutor) maxChangeLogID(context.Context) (int64, error) { return 0, nil }
+
+// changeLogAllocation reports a HEALTHY allocation state. These WAL tests
+// drive the pump directly, past the CDC doors, so the value only has to keep
+// verifyChangeLogWatermark from refusing if a future edit routes one of them
+// through a door.
+func (s *spyExecutor) changeLogAllocation(context.Context) (changeLogAllocation, error) {
+	return changeLogAllocation{floor: 0, autoincrement: true}, nil
+}
+
 func (s *spyExecutor) discoverTriggers(context.Context) ([]string, error) { return nil, nil }
 func (s *spyExecutor) pruneChangeLogBatch(context.Context, int64, int64) (int64, error) {
 	return 0, nil

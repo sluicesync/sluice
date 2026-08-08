@@ -38,6 +38,17 @@ import (
 // MAX(id)-before-snapshot anchor gap-free. On D1 the same holds at the primary
 // query path (writes serialised per database; ADR-0136 §4).
 //
+// The argument above has TWO premises, and until 2026-08-07 neither had a test.
+// The first — writers are serialised, so ids are commit-ordered — is now
+// ground-truthed under real contention by
+// TestChangeLogIDsAreCommitOrderedUnderConcurrentWriters. The second, that the
+// AUTOINCREMENT id is never REUSED, is not a property of SQLite's locking at
+// all: it depends on the change log's own DDL and on `sqlite_sequence`, both
+// ordinary writable state, and both are now graded at this door and at
+// [CDCReader.StreamChanges] by [verifyChangeLogWatermark]. See that function
+// for the two constructible states that strand a change forever, and
+// TestChangeLog_SequenceTamperStrandsTheChange for the proof that they do.
+//
 // Lifecycle: Rows and Changes own independent read connections; ReleaseRows
 // closes the bulk-copy reader and Close stops the poller + closes both.
 func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
@@ -67,9 +78,20 @@ func openSnapshotStream(ctx context.Context, b backend) (*ir.SnapshotStream, err
 	}
 
 	anchor, err := anchorExec.maxChangeLogID(ctx)
-	_ = anchorExec.close()
 	if err != nil {
+		_ = anchorExec.close()
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: read CDC anchor: %w", err)
+	}
+	// CDC door 2 of 2 (the other is CDCReader.StreamChanges): the gap-freedom
+	// argument in this file's doc comment rests on the change-log id being
+	// monotonic and never reused, which is a property of the table's DDL and
+	// of sqlite_sequence rather than of SQLite's locking. Graded here, before
+	// any data moves — a cold start that hands back an anchor the log can dip
+	// below has already lost the changes captured while it dipped.
+	wmErr := verifyChangeLogWatermark(ctx, anchorExec, b.driver, anchor)
+	_ = anchorExec.close()
+	if wmErr != nil {
+		return nil, wmErr
 	}
 	position, err := encodePos(sqliteTriggerPos{LastID: anchor})
 	if err != nil {

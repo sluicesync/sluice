@@ -41,8 +41,10 @@ package mysql
 // mixed with row changes. Schema-changing events therefore flush the
 // in-progress batch and then apply alone via the per-change applyOne
 // path. (applyOne has the same implicit-commit rough edge — see the
-// comment there — but the resume idempotency story makes it tolerable
-// for both.)
+// "implicit-commit rough edge" section on
+// [ChangeApplier.applyOneImpl], which through 2026-08-07 this pointer
+// named and the file did not contain — but the resume idempotency
+// story makes it tolerable for both.)
 //
 // See ADR-0017 for the original design choice.
 

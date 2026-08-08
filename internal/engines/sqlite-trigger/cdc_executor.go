@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
@@ -45,6 +46,12 @@ type executor interface {
 	readFingerprints(ctx context.Context) ([]fingerprintRow, error)
 	changeLogExists(ctx context.Context) (bool, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
+	// changeLogAllocation reports the change log's id-allocation state — the
+	// floor below which it can never issue a new id, and whether the table is
+	// declared AUTOINCREMENT. Both CDC doors grade it against the resume
+	// watermark; see [verifyChangeLogWatermark] for why the id-reuse it
+	// detects is a silent-loss class rather than a cosmetic one.
+	changeLogAllocation(ctx context.Context) (changeLogAllocation, error)
 	discoverTriggers(ctx context.Context) ([]string, error)
 	// pruneChangeLogBatch DELETEs one bounded keyset step of change-log rows —
 	// floor < id <= upper — and returns the number deleted (ADR-0137, batched
@@ -204,6 +211,18 @@ func d1Backend(dsn string) (backend, error) {
 const (
 	// changeLogExistsSQL probes for the change-log table by exact name.
 	changeLogExistsSQL = `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`
+	// changeLogCreateSQL reads the change log's own CREATE statement back out
+	// of the catalog, verbatim — the only way to see whether the id column was
+	// declared AUTOINCREMENT (there is no pragma for it: PRAGMA table_info
+	// reports `pk` and the declared type, never the rowid-reuse policy).
+	changeLogCreateSQL = `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`
+	// changeLogSeqSQL reads the AUTOINCREMENT high-water counter. It is a LEFT
+	// JOIN off a one-row subquery rather than the obvious
+	// `SELECT seq FROM sqlite_sequence WHERE name = ?` so an ABSENT row still
+	// returns a row (with 0), which is exactly how SQLite reads it — the
+	// alternative returns no rows and would have to be special-cased into the
+	// same answer at every call site.
+	changeLogSeqSQL = `SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ?), 0) AS seq`
 	// discoverTriggersSQL lists every sluice-installed capture trigger.
 	discoverTriggersSQL = `SELECT name FROM sqlite_master WHERE type = 'trigger' ` +
 		`AND name LIKE 'sluice\_capture\_%' ESCAPE '\' ORDER BY name`
@@ -311,6 +330,40 @@ func (e *localExecutor) maxChangeLogID(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	return id.Int64, nil
+}
+
+func (e *localExecutor) changeLogAllocation(ctx context.Context) (changeLogAllocation, error) {
+	var createSQL sql.NullString
+	if err := e.db.QueryRowContext(ctx, changeLogCreateSQL, ChangeLogTable).Scan(&createSQL); err != nil {
+		return changeLogAllocation{}, err
+	}
+	maxID, err := e.maxChangeLogID(ctx)
+	if err != nil {
+		return changeLogAllocation{}, err
+	}
+	var seq int64
+	// A database that has never held an AUTOINCREMENT table has no
+	// sqlite_sequence table at all, and the query is then a hard "no such
+	// table" error rather than an empty result. That is not a failure to
+	// report: it means the counter is 0, which is what the DDL arm is there
+	// to explain.
+	if err := e.db.QueryRowContext(ctx, changeLogSeqSQL, ChangeLogTable).Scan(&seq); err != nil {
+		if !strings.Contains(err.Error(), "no such table") {
+			return changeLogAllocation{}, err
+		}
+		seq = 0
+	}
+	return changeLogAllocation{
+		floor:         maxChangeLogInt64(maxID, seq),
+		autoincrement: createSQL.Valid && changeLogDeclaresAutoincrement(createSQL.String),
+	}, nil
+}
+
+func maxChangeLogInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (e *localExecutor) discoverTriggers(ctx context.Context) ([]string, error) {
@@ -575,6 +628,59 @@ func (e *d1Executor) maxChangeLogID(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("d1-trigger: MAX(id) text %q is not a valid int64: %w", text, perr)
 	}
 	return id, nil
+}
+
+// changeLogAllocation mirrors the local implementation over the /query API.
+// `sqlite_master` and `sqlite_sequence` are ordinary tables on D1 too, so the
+// hazard and the check port unchanged; the counter is projected as exact TEXT
+// for the same ADR-0132 reason the poll's ids are.
+func (e *d1Executor) changeLogAllocation(ctx context.Context) (changeLogAllocation, error) {
+	createRows, err := e.conn.Query(ctx, changeLogCreateSQL, ChangeLogTable)
+	if err != nil {
+		return changeLogAllocation{}, err
+	}
+	var createSQL string
+	if len(createRows) > 0 {
+		s, ok, cerr := d1CellString(createRows[0]["sql"])
+		if cerr != nil {
+			return changeLogAllocation{}, fmt.Errorf("d1-trigger: decode change-log CREATE statement: %w", cerr)
+		}
+		if ok {
+			createSQL = s
+		}
+	}
+	maxID, err := e.maxChangeLogID(ctx)
+	if err != nil {
+		return changeLogAllocation{}, err
+	}
+	var seq int64
+	seqRows, err := e.conn.Query(ctx,
+		`SELECT CAST(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ?), 0) AS TEXT) AS seq`,
+		ChangeLogTable)
+	if err != nil {
+		// Same "the database has never held an AUTOINCREMENT table" case as
+		// the local path: a missing sqlite_sequence means the counter is 0.
+		if !strings.Contains(err.Error(), "no such table") {
+			return changeLogAllocation{}, err
+		}
+	} else if len(seqRows) > 0 {
+		text, ok, cerr := d1CellString(seqRows[0]["seq"])
+		if cerr != nil {
+			return changeLogAllocation{}, fmt.Errorf("d1-trigger: decode sqlite_sequence.seq: %w", cerr)
+		}
+		if ok {
+			seq, cerr = strconv.ParseInt(text, 10, 64)
+			if cerr != nil {
+				return changeLogAllocation{}, fmt.Errorf(
+					"d1-trigger: sqlite_sequence.seq text %q is not a valid int64: %w", text, cerr,
+				)
+			}
+		}
+	}
+	return changeLogAllocation{
+		floor:         maxChangeLogInt64(maxID, seq),
+		autoincrement: changeLogDeclaresAutoincrement(createSQL),
+	}, nil
 }
 
 func (e *d1Executor) discoverTriggers(ctx context.Context) ([]string, error) {

@@ -89,8 +89,25 @@ type CDCReader struct {
 	// pump goroutine; no locking.
 	walCheckpointFailures int
 
-	// pumpCancel cancels the polling goroutine when Close is called.
+	// pumpCancel cancels the polling goroutine when Close is called, and
+	// pumpDone is closed by that goroutine as it exits.
+	//
+	// Both are needed, and pumpDone is the one that was missing. Cancellation
+	// is ASYNCHRONOUS: it unblocks the pump's selects but does not stop it
+	// having already passed one, and the very next thing it does is read
+	// `r.exec` for the poll. Close used to close that executor and set the
+	// field to nil immediately after cancelling, so a Close landing in that
+	// window produced a nil-pointer dereference INSIDE the pump goroutine —
+	// an unrecovered panic, which takes the whole process down rather than
+	// failing the sync. (It is also an unsynchronised cross-goroutine
+	// read/write of the field, which is what `-race` grades.) The window is
+	// one scheduler slice wide and reopens on every poll tick, so it is
+	// ordinary-operation reachable, not exotic; a tight StreamChanges/Close
+	// loop reproduces it in well under a second.
+	//
+	// Pinned by TestCDCReaderClose_JoinsThePumpBeforeClosingTheExecutor.
 	pumpCancel context.CancelFunc
+	pumpDone   chan struct{}
 
 	// pruneBook tracks the auto-prune remaining-rows estimate (P-1). Owned by
 	// the single auto-prune sidecar goroutine; no locking.
@@ -268,6 +285,15 @@ func (r *CDCReader) Close() error {
 	if r.pumpCancel != nil {
 		r.pumpCancel()
 	}
+	// JOIN the pump before touching the executor it polls through. Every
+	// select in the pump is ctx-aware and every in-flight poll rides
+	// pumpCtx, so the wait is bounded by the cancellation that just fired —
+	// it is not a "hope it finishes" sleep. See the pumpDone field comment
+	// for what happened without it.
+	if r.pumpDone != nil {
+		<-r.pumpDone
+		r.pumpDone = nil
+	}
 	if r.exec != nil {
 		err := r.exec.close()
 		r.exec = nil
@@ -319,11 +345,22 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 			return nil, fmt.Errorf("sqlite-trigger: stream: read MAX(id) start anchor: %w", err)
 		}
 	}
+	// CDC door 1 of 2 (the other is openSnapshotStream): the `id > lastSeen`
+	// poll below is gap-free only while the change log can never re-issue an
+	// id at or below startID. That is a property of the table's DDL and of
+	// sqlite_sequence — both ordinary writable state — not of SQLite's
+	// locking. See cdc_watermark_gate.go.
+	if err := verifyChangeLogWatermark(ctx, r.exec, r.b.driver, startID); err != nil {
+		return nil, err
+	}
 
 	out := make(chan ir.Change, cdcChannelBuffer)
 	pumpCtx, cancel := context.WithCancel(ctx)
 	r.pumpCancel = cancel
+	done := make(chan struct{})
+	r.pumpDone = done
 	go func() {
+		defer close(done)
 		defer close(out)
 		r.pump(pumpCtx, startID, out)
 	}()
@@ -352,6 +389,14 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 // invalidate this: concurrent writers (a future BEGIN CONCURRENT / multi-writer
 // backend), or a D1 poll served by a replica rather than the primary. Either
 // change means porting the pgtrigger rule, not re-deriving this comment.
+//
+// Ground-truthed rather than reasoned since 2026-08-07:
+// TestChangeLogIDsAreCommitOrderedUnderConcurrentWriters runs four contending
+// writers against one file and asserts every committed row is emitted exactly
+// once, in strictly increasing id order, with no id ever arriving at or below
+// a watermark already passed. The SECOND premise this exemption rests on — that
+// an AUTOINCREMENT id is never re-issued — is NOT a property of the locking and
+// is graded separately at both CDC doors by [verifyChangeLogWatermark].
 func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Change) {
 	lastSeen := startID
 	timer := time.NewTimer(0) // fire immediately on the first iteration
