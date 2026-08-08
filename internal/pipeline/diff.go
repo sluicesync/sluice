@@ -304,9 +304,22 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	}
 
 	// ---- 3. Compute the diff. ----
+	//
+	// Charset/collation joins the comparison only for a same-storage-
+	// family pair, mirroring the migrate pre-create shape gate's rule
+	// ("cross-engine pairs keep charset out — translation noise, not
+	// drift", migrate_existing_tables.go). [irdiff.diffColumn]'s
+	// "empty-on-source means no opinion" rule already covered the
+	// postgres→mysql direction; its mirror — a MySQL source's `utf8mb4`
+	// against a Postgres or SQLite target, which have no per-column
+	// charset to expose — was never written, so every text column on
+	// every mysql→postgres pair reported permanent drift (Bug 234's
+	// sibling sweep). Same-family pairs still compare, so a genuine
+	// `latin1` vs `utf8mb4` or a PG `COLLATE "C"` change surfaces.
+	sameFamily := translate.SameStorageShapeFamily(d.Source.Name(), d.Target.Name())
 	diff := irdiff.Schemas(expected, actual, irdiff.Options{
 		IgnoreExtras:           d.IgnoreExtras,
-		IgnoreCharsetCollation: d.IgnoreCharsetCollation,
+		IgnoreCharsetCollation: d.IgnoreCharsetCollation || !sameFamily,
 	})
 
 	// ---- 4. Resolve missing-table DDL via the target engine's
@@ -689,10 +702,16 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 			renderColumnMismatch(&sb, td.Name, cd, quote, b.tgtDialect)
 		}
 		for _, idx := range td.IndexesMissing {
+			if renderMissingPrimaryKey(&sb, td.Name, idx, quote, b.expected) {
+				continue
+			}
 			fmt.Fprintf(&sb, "-- index %s missing on target; CREATE INDEX %s ON %s (...);\n",
 				quote(idx), quote(idx), quote(td.Name))
 		}
 		for _, idx := range td.IndexesExtra {
+			if renderExtraPrimaryKey(&sb, td.Name, idx, quote, b.actual, b.tgtDialect) {
+				continue
+			}
 			fmt.Fprintf(&sb, "DROP INDEX %s; -- not in source schema\n", quote(idx))
 		}
 		for _, id := range td.IndexesMismatched {
@@ -735,6 +754,92 @@ func renderMissingColumn(sb *strings.Builder, table, col string, quote func(stri
 	}
 	fmt.Fprintf(sb, "ALTER TABLE %s ADD COLUMN %s; -- TYPE; column missing on target\n",
 		quote(table), quote(col))
+}
+
+// renderMissingPrimaryKey / renderExtraPrimaryKey write the suggestion
+// for a table whose PRIMARY KEY is genuinely absent from one side, and
+// report whether they handled the entry.
+//
+// The generic index lines they pre-empt would suggest `CREATE INDEX
+// <name> ON <table> (...)`, which no engine accepts for a primary key —
+// and since Bug 234 matched the primary key by ROLE rather than by name,
+// the entry can arrive under the placeholder display name `PRIMARY KEY`
+// (a SQLite side leaves its primary-key index unnamed), where the
+// generic line reads as outright nonsense. A missing primary key is the
+// drift these two must keep reporting loudly, so its suggestion has to
+// be one the operator can actually run.
+//
+// Detection is by IDENTITY against the schema in hand — the entry is a
+// primary key iff that side's table declares a primary key rendering to
+// this display name — so an ordinary index that happens to be named
+// `PRIMARY KEY` still takes the generic path.
+func renderMissingPrimaryKey(sb *strings.Builder, table, name string, quote func(string) string, expected *ir.Schema) bool {
+	pk := lookupPrimaryKeyByDisplayName(expected, table, name)
+	if pk == nil {
+		return false
+	}
+	fmt.Fprintf(sb, "ALTER TABLE %s ADD PRIMARY KEY %s; -- PRIMARY KEY missing on target\n",
+		quote(table), renderPrimaryKeyColumns(pk, quote))
+	return true
+}
+
+func renderExtraPrimaryKey(sb *strings.Builder, table, name string, quote func(string) string, actual *ir.Schema, dialect ir.DDLDialect) bool {
+	pk := lookupPrimaryKeyByDisplayName(actual, table, name)
+	if pk == nil {
+		return false
+	}
+	// MySQL spells the drop `DROP PRIMARY KEY`; ANSI/Postgres needs the
+	// backing constraint's name, which a PG catalog always supplies.
+	if dialect == ir.DDLDialectMySQL || pk.Name == "" {
+		fmt.Fprintf(sb, "ALTER TABLE %s DROP PRIMARY KEY; -- PRIMARY KEY %s not in source schema\n",
+			quote(table), renderPrimaryKeyColumns(pk, quote))
+		return true
+	}
+	fmt.Fprintf(sb, "ALTER TABLE %s DROP CONSTRAINT %s; -- PRIMARY KEY %s not in source schema\n",
+		quote(table), quote(pk.Name), renderPrimaryKeyColumns(pk, quote))
+	return true
+}
+
+// lookupPrimaryKeyByDisplayName returns s's primary key for the named
+// table when it is the one the diff reported under displayName, and nil
+// otherwise. The empty-name fallback mirrors internal/ir/diff's
+// indexDisplayName.
+func lookupPrimaryKeyByDisplayName(s *ir.Schema, tableName, displayName string) *ir.Index {
+	if s == nil {
+		return nil
+	}
+	for _, t := range s.Tables {
+		if t == nil || t.Name != tableName || t.PrimaryKey == nil {
+			continue
+		}
+		pkName := t.PrimaryKey.Name
+		if pkName == "" {
+			pkName = "PRIMARY KEY"
+		}
+		if pkName == displayName {
+			return t.PrimaryKey
+		}
+		return nil
+	}
+	return nil
+}
+
+// renderPrimaryKeyColumns renders a primary key's column list for the
+// suggestion lines: `("a", "b")`. Prefix lengths and DESC are dropped —
+// a primary key carrying either is vanishingly rare and the line is a
+// starting point the operator edits, not a migration.
+func renderPrimaryKeyColumns(pk *ir.Index, quote func(string) string) string {
+	if pk == nil || len(pk.Columns) == 0 {
+		return "(...)"
+	}
+	parts := make([]string, 0, len(pk.Columns))
+	for _, c := range pk.Columns {
+		if c.Column == "" {
+			return "(...)"
+		}
+		parts = append(parts, quote(c.Column))
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
 }
 
 // renderMissingCheck writes the ADD CONSTRAINT ... CHECK suggestion

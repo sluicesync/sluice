@@ -666,23 +666,23 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 		td.ColumnsMismatched = append(td.ColumnsMismatched, cd)
 	}
 
-	expIdx := indexNames(expected)
-	actIdx := indexNames(actual)
-	for name := range expIdx {
-		if _, ok := actIdx[name]; !ok {
-			td.IndexesMissing = append(td.IndexesMissing, name)
+	expIdx := indexesByMatchKey(expected)
+	actIdx := indexesByMatchKey(actual)
+	for key, idx := range expIdx {
+		if _, ok := actIdx[key]; !ok {
+			td.IndexesMissing = append(td.IndexesMissing, indexDisplayName(key, idx))
 		}
 	}
 	sort.Strings(td.IndexesMissing)
 	if !opts.IgnoreExtras {
-		for name := range actIdx {
-			if _, ok := expIdx[name]; !ok {
-				td.IndexesExtra = append(td.IndexesExtra, name)
+		for key, idx := range actIdx {
+			if _, ok := expIdx[key]; !ok {
+				td.IndexesExtra = append(td.IndexesExtra, indexDisplayName(key, idx))
 			}
 		}
 		sort.Strings(td.IndexesExtra)
 	}
-	diffIndexDefinitions(&td, expected, actual)
+	diffIndexDefinitions(&td, expIdx, actIdx)
 
 	diffChecks(&td, expected, actual, opts)
 	diffForeignKeys(&td, expected, actual, opts)
@@ -1124,32 +1124,57 @@ func diffExcludes(td *TableDiff, expected, actual *ir.Table, opts Options) {
 	}
 }
 
-// indexNames returns the set of named indexes on t — both the primary
-// key (when named) and secondary indexes. Indexes with empty Name
-// (e.g. PG implicit PKs) are skipped: an unnamed index can't be
-// matched across sides without column-set comparison, which v1
-// deliberately doesn't do.
-func indexNames(t *ir.Table) map[string]struct{} {
-	out := make(map[string]struct{}, len(t.Indexes)+1)
-	if t.PrimaryKey != nil && t.PrimaryKey.Name != "" {
-		out[t.PrimaryKey.Name] = struct{}{}
-	}
-	for _, idx := range t.Indexes {
-		if idx.Name == "" {
-			continue
-		}
-		out[idx.Name] = struct{}{}
-	}
-	return out
-}
+// primaryKeyMatchKey is the key a table's PRIMARY KEY is matched under,
+// instead of its name (Bug 234).
+//
+// # Why the primary key cannot be matched by name
+//
+// Every engine names the primary key by its OWN convention, and none of
+// them takes the source's: MySQL calls it `PRIMARY`, PostgreSQL
+// auto-names it `<table>_pkey`, SQLite leaves it unnamed. So on any
+// cross-family pair — including a target `sluice migrate` created from
+// that very source moments earlier — a name-keyed comparison reports the
+// primary key as one MISSING index plus one EXTRA index, forever, on
+// every table. `schema diff` exits 1 on a clean pair, which makes the
+// natural "migrate, then diff to confirm" workflow unusable and buries
+// any real finding next to a guaranteed false one.
+//
+// The role is structural, not inferred: [ir.Table.PrimaryKey] is its own
+// field, so matching on it is engine-neutral and reaches every ordered
+// pair at once rather than needing a rename rule per pair.
+//
+// # What this deliberately stops reporting, and what it does not
+//
+// STOPS: a difference in the primary key's NAME alone. Both engines
+// auto-generate that name and neither takes the source's, so it is
+// translation, not drift — the same reading ADR-0029 already applies to
+// foreign-key constraint names.
+//
+// DOES NOT stop: a genuinely missing primary key (expected has one,
+// target has none, and vice versa — still one missing / one extra), or a
+// primary key over different COLUMNS, uniqueness, or predicate — those
+// go through [diffIndexDefinitions] exactly as before, now on a pair
+// that actually matches up. An over-refusal is bad; a diff that stops
+// reporting real drift is worse, so the role key narrows only the axis
+// that cannot carry signal.
+//
+// The sentinel starts with a NUL byte so it cannot collide with a real
+// index name from any engine's catalog.
+const primaryKeyMatchKey = "\x00primary-key-role"
 
-// indexesByName maps a table's indexes by name, including the PRIMARY KEY
-// when it carries one — mirroring [indexNames] so the definition comparison
-// covers exactly the set the missing/extra comparison does.
-func indexesByName(t *ir.Table) map[string]*ir.Index {
+// indexesByMatchKey maps a table's indexes by the key they are compared
+// under across sides: the PRIMARY KEY by its role
+// ([primaryKeyMatchKey]), every other index by name.
+//
+// Secondary indexes with an empty Name are skipped: an unnamed index
+// can't be matched across sides without column-set comparison, which v1
+// deliberately doesn't do. The primary key carries no such requirement —
+// its role is the key — which is what lets a SQLite side (whose reader
+// leaves the primary-key index unnamed) participate at all.
+func indexesByMatchKey(t *ir.Table) map[string]*ir.Index {
 	out := make(map[string]*ir.Index, len(t.Indexes)+1)
-	if t.PrimaryKey != nil && t.PrimaryKey.Name != "" {
-		out[t.PrimaryKey.Name] = t.PrimaryKey
+	if t.PrimaryKey != nil {
+		out[primaryKeyMatchKey] = t.PrimaryKey
 	}
 	for _, idx := range t.Indexes {
 		if idx == nil || idx.Name == "" {
@@ -1158,6 +1183,22 @@ func indexesByName(t *ir.Table) map[string]*ir.Index {
 		out[idx.Name] = idx
 	}
 	return out
+}
+
+// indexDisplayName renders the operator-facing name for an index matched
+// under key. Everything but the primary key is its own name; the primary
+// key reports the name the side in hand carries, falling back to the
+// role when that side does not name it (SQLite) — an empty name in the
+// renderer's "index X missing on target" line would be worse than
+// useless.
+func indexDisplayName(key string, idx *ir.Index) string {
+	if key != primaryKeyMatchKey {
+		return key
+	}
+	if idx != nil && idx.Name != "" {
+		return idx.Name
+	}
+	return "PRIMARY KEY"
 }
 
 // renderIndexColumns renders an index's column list for comparison and for
@@ -1193,31 +1234,35 @@ func renderIndexColumns(idx *ir.Index) string {
 }
 
 // diffIndexDefinitions compares indexes present on BOTH sides under the same
-// name, populating [TableDiff.IndexesMismatched] (roadmap item 125).
+// match key, populating [TableDiff.IndexesMismatched] (roadmap item 125).
 //
-// Missing/extra are handled by the caller's name-set pass; this is only about
+// Missing/extra are handled by the caller's key-set pass; this is only about
 // the ones that LOOK the same and are not. Compared attributes and the
-// reasoning for the set live on [IndexDiff].
+// reasoning for the set live on [IndexDiff]. It takes the caller's already-
+// built maps so the definition comparison covers EXACTLY the set the
+// missing/extra comparison does — the two reading the same map is what keeps
+// a primary key from being role-matched in one pass and name-matched in the
+// other.
 //
 // opts is deliberately not consulted: IgnoreExtras scopes which SIDE's
 // absences are reported, and there is no absence here — both sides have the
 // index. IgnoreCharsetCollation is about column types, which this does not
 // compare.
-func diffIndexDefinitions(td *TableDiff, expected, actual *ir.Table) {
-	expIdx := indexesByName(expected)
-	actIdx := indexesByName(actual)
-
+func diffIndexDefinitions(td *TableDiff, expIdx, actIdx map[string]*ir.Index) {
 	common := make([]string, 0, len(expIdx))
-	for name := range expIdx {
-		if _, ok := actIdx[name]; ok {
-			common = append(common, name)
+	for key := range expIdx {
+		if _, ok := actIdx[key]; ok {
+			common = append(common, key)
 		}
 	}
 	sort.Strings(common)
 
-	for _, name := range common {
-		exp, act := expIdx[name], actIdx[name]
-		d := IndexDiff{Name: name}
+	for _, key := range common {
+		exp, act := expIdx[key], actIdx[key]
+		// The EXPECTED side's spelling: the report is framed as "what
+		// sluice would produce vs what is there", and for a role-matched
+		// primary key the two sides legitimately carry different names.
+		d := IndexDiff{Name: indexDisplayName(key, exp)}
 		mismatched := false
 
 		if ec, ac := renderIndexColumns(exp), renderIndexColumns(act); ec != ac {

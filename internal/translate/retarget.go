@@ -48,7 +48,12 @@ import (
 // directions, so TestRetargetCallSitesDeclareTheirLane in
 // internal/pipeline makes every call site declare which it is on.
 func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
-	return retargetSchema(s, retargetRuleFor(sourceEngine, targetEngine))
+	// No index-name rule on the EMIT lane: the target's own DDL emitter
+	// applies its naming transformation as it writes, so pre-applying it
+	// here would either be a no-op (the rule is idempotent) or, on a
+	// future non-idempotent rule, a double application. The COMPARE lane
+	// is the one that has to predict the name.
+	return retargetSchema(s, retargetRuleFor(sourceEngine, targetEngine), nil)
 }
 
 // RetargetForShapeCompare is [RetargetForEngine] for the consumers that
@@ -80,27 +85,39 @@ func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Sche
 // SILENT constraint drop on the restore lane, which is the worse
 // direction. Which lanes take which entry point is not left to memory:
 // TestRetargetCallSitesDeclareTheirLane fails on a new call site.
+//
+// # The index-NAME half of the same job (Bug 234)
+//
+// The type rules answer "what will the target HOLD in this column"; they
+// do not answer "what will the target CALL this index". A Postgres
+// target table-prefixes secondary index names, so an expected side that
+// keeps the source spelling reports one missing + one extra index for
+// every index on every table — including on a target `migrate` itself
+// created, and including SAME-engine postgres→postgres pairs, where no
+// type rule fires at all. That is why the index-name pass runs
+// independently of whether a type rule exists.
 func RetargetForShapeCompare(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
-	rule := retargetRuleFor(sourceEngine, targetEngine)
-	if rule == nil {
-		// No rule means the pair is same-storage-family (or has no
-		// mapping at all — see [HasStorageShapeMapping], which the
-		// refusing consumers gate on first). A same-family target holds
-		// the DOMAIN itself, so unwrapping here would compare a wrapper
-		// against a wrapper the target really has.
-		return s
+	var typeRule retargetRule
+	if rule := retargetRuleFor(sourceEngine, targetEngine); rule != nil {
+		typeRule = storageShapeRule(rule)
 	}
-	return retargetSchema(s, storageShapeRule(rule))
+	// A nil type rule means the pair is same-storage-family (or has no
+	// mapping at all — see [HasStorageShapeMapping], which the refusing
+	// consumers gate on first). A same-family target holds the DOMAIN
+	// itself, so unwrapping there would compare a wrapper against a
+	// wrapper the target really has.
+	return retargetSchema(s, typeRule, indexNameRuleFor(targetEngine))
 }
 
-// retargetSchema applies rule to every column of every table. A nil
-// rule is the identity (unknown/same-engine pairs), returning the input
-// pointer so callers keep the untouched schema.
-func retargetSchema(s *ir.Schema, rule retargetRule) *ir.Schema {
+// retargetSchema applies rule to every column of every table and
+// nameRule to every secondary index. Both nil is the identity
+// (unknown/same-engine pairs with a verbatim-naming target), returning
+// the input pointer so callers keep the untouched schema.
+func retargetSchema(s *ir.Schema, rule retargetRule, nameRule indexNameRule) *ir.Schema {
 	if s == nil {
 		return nil
 	}
-	if rule == nil {
+	if rule == nil && nameRule == nil {
 		return s
 	}
 	out := &ir.Schema{
@@ -113,7 +130,7 @@ func retargetSchema(s *ir.Schema, rule retargetRule) *ir.Schema {
 		Sequences: s.Sequences,
 	}
 	for i, tbl := range s.Tables {
-		out.Tables[i] = retargetTable(tbl, rule)
+		out.Tables[i] = retargetTable(tbl, rule, nameRule)
 	}
 	return out
 }
@@ -199,6 +216,25 @@ func storageShapeFamily(engine string) string {
 		return storageFamilySQLite
 	}
 	return strings.ToLower(engine)
+}
+
+// SameStorageShapeFamily reports whether two engines read a
+// shape-identical table back to the SAME IR — i.e. whether an attribute
+// one side's catalog exposes is one the other side's catalog can
+// EXPRESS at all.
+//
+// Distinct from [HasStorageShapeMapping], which is true whenever a
+// translation exists (postgres→mysql has one and the two are NOT the
+// same family). The distinction matters for attributes sluice does not
+// translate but does compare: per-column charset/collation is the one
+// today. MySQL exposes it, Postgres and SQLite have no per-column
+// equivalent to expose, so comparing a MySQL source's `utf8mb4` against
+// a Postgres target's empty string reports drift on every text column
+// forever — the [diffColumn] "empty-on-source means no opinion" rule
+// already covers the postgres→mysql direction and its mirror was never
+// written (Bug 234's sibling sweep).
+func SameStorageShapeFamily(a, b string) bool {
+	return storageShapeFamily(a) == storageShapeFamily(b)
 }
 
 // HasStorageShapeMapping reports whether [RetargetForShapeCompare] can
@@ -345,31 +381,81 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 // What that no longer guarantees, stated plainly: a rule MAY now output
 // a binary type, so any future consumer that relies on "the retarget's
 // output is never binary" has lost its evidence and must re-derive it.
-func retargetTable(tbl *ir.Table, rule retargetRule) *ir.Table {
+//
+// # The second axis: index NAMES (Bug 234)
+//
+// A column's TYPE is not the only thing the target engine changes on its
+// way in. A Postgres target table-prefixes secondary index names
+// ([PGEffectiveIndexName]) because its index namespace is schema-scoped,
+// so an expected side that keeps the source spelling reports every index
+// as one missing + one extra — the same phantom-drift shape item 153
+// closed on the type axis, one axis over. nameRule is nil on the emit
+// lane and for targets that hold names verbatim.
+func retargetTable(tbl *ir.Table, rule retargetRule, nameRule indexNameRule) *ir.Table {
 	if tbl == nil {
 		return nil
 	}
 	var rewrittenCols []*ir.Column
-	for i, col := range tbl.Columns {
-		newType := rule(col.Type)
-		if newType == nil {
-			continue
+	if rule != nil {
+		for i, col := range tbl.Columns {
+			newType := rule(col.Type)
+			if newType == nil {
+				continue
+			}
+			if rewrittenCols == nil {
+				rewrittenCols = make([]*ir.Column, len(tbl.Columns))
+				copy(rewrittenCols, tbl.Columns)
+			}
+			colCopy := *col
+			colCopy.Type = newType
+			if colCopy.SourceColumnType == nil {
+				colCopy.SourceColumnType = col.Type
+			}
+			rewrittenCols[i] = &colCopy
 		}
-		if rewrittenCols == nil {
-			rewrittenCols = make([]*ir.Column, len(tbl.Columns))
-			copy(rewrittenCols, tbl.Columns)
-		}
-		colCopy := *col
-		colCopy.Type = newType
-		if colCopy.SourceColumnType == nil {
-			colCopy.SourceColumnType = col.Type
-		}
-		rewrittenCols[i] = &colCopy
 	}
-	if rewrittenCols == nil {
+	rewrittenIdx := retargetIndexNames(tbl, nameRule)
+	if rewrittenCols == nil && rewrittenIdx == nil {
 		return tbl
 	}
 	out := *tbl
-	out.Columns = rewrittenCols
+	if rewrittenCols != nil {
+		out.Columns = rewrittenCols
+	}
+	if rewrittenIdx != nil {
+		out.Indexes = rewrittenIdx
+	}
 	return &out
+}
+
+// retargetIndexNames renames a table's SECONDARY indexes to the names
+// the target engine will hold them under, returning nil when nothing
+// changes (so [retargetTable] can keep handing back the input pointer).
+//
+// [ir.Table.PrimaryKey] is deliberately untouched — see the note on
+// [indexNameRule]: no rename can reconcile `PRIMARY` with `<table>_pkey`
+// with SQLite's unnamed key, so the primary key is matched by ROLE in
+// internal/ir/diff instead.
+func retargetIndexNames(tbl *ir.Table, nameRule indexNameRule) []*ir.Index {
+	if nameRule == nil {
+		return nil
+	}
+	var out []*ir.Index
+	for i, idx := range tbl.Indexes {
+		if idx == nil || idx.Name == "" {
+			continue
+		}
+		renamed := nameRule(tbl.Name, idx)
+		if renamed == "" || renamed == idx.Name {
+			continue
+		}
+		if out == nil {
+			out = make([]*ir.Index, len(tbl.Indexes))
+			copy(out, tbl.Indexes)
+		}
+		idxCopy := *idx
+		idxCopy.Name = renamed
+		out[i] = &idxCopy
+	}
+	return out
 }

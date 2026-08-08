@@ -1072,81 +1072,24 @@ func qualifiedEnumTypeRef(enum ir.Enum, targetSchema, tableName, columnName stri
 // GitHub issue #26: two prepended index names that share their first
 // 63 chars truncate to the same PG identifier and the second CREATE
 // fires `SQLSTATE 42P07: relation "<truncated_name>" already exists`.
-const maxPGIdentifierLen = 63
+const maxPGIdentifierLen = translate.MaxPGIdentifierLen
 
-// indexNamingConventionPrefixes is the set of index-naming
-// convention prefixes that operator schemas use to mean "this index
-// is already scoped to a single table." When `pgIndexName` sees a
-// source name shaped like `ix_<table>_<rest>` / `idx_<table>_<rest>`
-// / `fk_<table>_<rest>` / `uq_<table>_<rest>` / etc., the table-name
-// portion is already encoded; sluice prepending another table prefix
-// would (a) double the table-name presence in the identifier and (b)
-// push past 63 chars on long table names.
-//
-// Coverage drawn from the conventions of SQLAlchemy/Alembic, Django,
-// Rails AR / ActiveRecord, Hibernate, Diesel, and operator-written
-// hand schemas. The list is intentionally generous on the read side
-// — false positives (treating an unconventional name as already-
-// scoped) are emit-verbatim, which is the same behavior the explicit
-// `<table>_` prefix check already handles.
-var indexNamingConventionPrefixes = []string{
-	"ix_", "idx_", "uix_", "uidx_", "uniq_", "uq_",
-	"pk_", "fk_", "chk_", "ck_",
-}
+// indexNamingConventionPrefixes aliases the canonical list in
+// internal/translate — see [translate.PGIndexNamingConventionPrefixes].
+var indexNamingConventionPrefixes = translate.PGIndexNamingConventionPrefixes
 
 // pgIndexName disambiguates a source-side index name against the
-// schema-scoped Postgres namespace. The rule (after GitHub #26):
+// schema-scoped Postgres namespace.
 //
-//  1. If sourceName already starts with `<tableName>_`, emit verbatim.
-//  2. If sourceName matches a known convention prefix
-//     (`ix_<table>_`, `idx_<table>_`, etc., per
-//     [indexNamingConventionPrefixes]) AND the convention-prefix +
-//     tableName segment matches, emit verbatim. This covers
-//     real-world SQLAlchemy / Alembic / Rails / Django shapes where
-//     the table name is already encoded in the index name.
-//  3. Otherwise, prepend `<tableName>_`. If the result would exceed
-//     PG's 63-char NAMEDATALEN limit, emit sourceName verbatim
-//     instead — the operator's source-declared name fits PG (it's <=
-//     64 chars on MySQL or natively under 63 on PG), and avoiding
-//     the truncation collision is the load-bearing concern. The
-//     historical reason for prefixing (sibling-table name disambig)
-//     is preserved for short names; long names sacrifice it.
-//
-// Pre-v0.49.0 emitted `<tableName>_<sourceName>` unconditionally
-// when (1) didn't match, causing the GitHub #26 truncation collision
-// on long names that share their first 63 chars after prepend.
+// The RULE moved to [translate.PGIndexName] (Bug 234): the
+// EXPECTED side of a shape comparison has to predict the name this
+// emitter lands, and `internal/translate` is the engine-neutral place
+// both can read it from. A second statement of the rule would drift, and
+// a drift between "the name we create" and "the name we expect" is
+// indistinguishable from real index drift. This spelling stays because
+// the emitter call sites read better without the package qualifier.
 func pgIndexName(tableName, sourceName string) string {
-	if sourceName == "" {
-		return ""
-	}
-	prefix := tableName + "_"
-	if strings.HasPrefix(sourceName, prefix) {
-		return sourceName
-	}
-	// Convention-prefix detection: if source name is shaped like
-	// `<convention_prefix><tableName>_<rest>`, treat as already
-	// table-scoped.
-	for _, conv := range indexNamingConventionPrefixes {
-		if strings.HasPrefix(sourceName, conv+tableName+"_") {
-			return sourceName
-		}
-		// Edge case: source name is exactly `<conv><tableName>`
-		// (table name suffix with no trailing column part) — still
-		// already-table-scoped.
-		if sourceName == conv+tableName {
-			return sourceName
-		}
-	}
-	full := prefix + sourceName
-	if len(full) > maxPGIdentifierLen {
-		// Prepending would overflow → emit verbatim. The
-		// historical disambiguation against sibling-table indexes
-		// (`idx_fk_film_id` on multiple tables) is sacrificed for
-		// the truncation-collision-free path, which is the more
-		// urgent failure mode.
-		return sourceName
-	}
-	return full
+	return translate.PGIndexName(tableName, sourceName)
 }
 
 // validatePGIdentifier refuses an effective PG identifier that exceeds
@@ -1231,11 +1174,12 @@ func validatePGIndexName(effectiveName, sourceName, tableName string) error {
 // as `ALTER TABLE … ADD CONSTRAINT <source name>` (verbatim, so
 // `ON CONFLICT ON CONSTRAINT` keeps working); everything else goes
 // through [pgIndexName]'s table-scoping transformation.
+//
+// Delegates to [translate.PGEffectiveIndexName] so the expected side of
+// a shape comparison predicts exactly this name — see the note on
+// [pgIndexName].
 func effectivePGIndexIdent(tableName string, idx *ir.Index) string {
-	if idx.ConstraintBacked {
-		return idx.Name
-	}
-	return pgIndexName(tableName, idx.Name)
+	return translate.PGEffectiveIndexName(tableName, idx)
 }
 
 // validatePGIndexNamespace refuses a schema whose source indexes do NOT

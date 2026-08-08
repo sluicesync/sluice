@@ -196,13 +196,64 @@ type replicaIdentityGap struct {
 	GeneratedIdentity bool
 }
 
-// replicaIdentityHint is the remedy that rides the coded refusal. Like
-// [deferrableUpsertKeyHint] it is the same advice for one table or
-// twenty, so it carries no names.
+// The remedy that rides the coded refusal. Like [deferrableUpsertKeyHint]
+// it is the same advice for one table or twenty, so it carries no names —
+// but it is NOT the same advice for every SHAPE, and that is Bug 235.
+//
+// # Why there are three of these and not one
+//
+// `hint=` is the short field: it is what a log pipeline surfaces and what
+// a terse reader acts on. Through v0.117.0 there was one hint for the
+// whole code, written for the three item-93 shapes (deferrable key, no
+// key, IDENTITY NOTHING) where `REPLICA IDENTITY FULL` genuinely IS the
+// remedy. When the generated-identity shape was routed through the same
+// code, the hint was not re-derived — so the refusal prescribed FULL in
+// the field an operator acts on while its own body said, twice, that FULL
+// is not a fix here. A message must not recommend what its own evidence
+// rules out; [refusalgate.Contradictions] is the mechanical form of that
+// rule, and TestReplicaIdentityRefusalHintNeverContradictsItsBody applies
+// it to every shape this file can render.
 const replicaIdentityHint = "on the SOURCE, either make the table's key immediate " +
 	"(ALTER TABLE … DROP CONSTRAINT …, then re-add it WITHOUT DEFERRABLE), or set a replica identity " +
 	"(ALTER TABLE … REPLICA IDENTITY FULL, or REPLICA IDENTITY USING INDEX <an immediate NOT NULL UNIQUE index>), " +
 	"or take the table out of scope with --exclude-table"
+
+// replicaIdentityGeneratedHint is the generated-identity shape's own
+// remedy — the one the reader-side refusal
+// ([refuseUnpublishedGeneratedIdentity]) already gets right. It names no
+// blanket `REPLICA IDENTITY FULL`, because a generated column is
+// unpublished under FULL too.
+const replicaIdentityGeneratedHint = "on the SOURCE, give the table a row identity made of NON-GENERATED " +
+	"columns — demote the generated column to an ordinary column, or point `ALTER TABLE … REPLICA IDENTITY " +
+	"USING INDEX` at an immediate NOT NULL UNIQUE index over non-generated columns — or take the table out of " +
+	"scope with --exclude-table"
+
+// replicaIdentityMixedHint covers a run that refused BOTH shapes at once.
+// It deliberately names no remedy at all: the two shapes want opposite
+// ones, so any blanket advice would be wrong for half the tables listed.
+// Each table's own note in the error body says which case it is.
+const replicaIdentityMixedHint = "on the SOURCE, fix each table named above with the remedy ITS OWN note gives — " +
+	"the tables listed do not all want the same one — or take them out of scope with --exclude-table"
+
+// hintForReplicaIdentityGaps picks the shape-appropriate hint.
+func hintForReplicaIdentityGaps(gaps []replicaIdentityGap) string {
+	generated, other := 0, 0
+	for _, g := range gaps {
+		if g.GeneratedIdentity {
+			generated++
+		} else {
+			other++
+		}
+	}
+	switch {
+	case generated > 0 && other > 0:
+		return replicaIdentityMixedHint
+	case generated > 0:
+		return replicaIdentityGeneratedHint
+	default:
+		return replicaIdentityHint
+	}
+}
 
 // errUnusableReplicaIdentity is the aggregated coded refusal, naming
 // every offending table at once (the [errDeferrableUpsertKeys] shape).
@@ -233,23 +284,64 @@ func errUnusableReplicaIdentity(schema string, gaps []replicaIdentityGap) error 
 		}
 		parts[i] = detail + ")"
 	}
+	quoted, remedy := replicaIdentityShapeProse(gaps)
 	return sluicecode.Wrap(
 		sluicecode.CodeSourceReplicaIdentity,
-		replicaIdentityHint,
+		hintForReplicaIdentityGaps(gaps),
 		fmt.Errorf(
 			"postgres: source table(s) %s have no usable replica identity, and this sync is about to add them to its "+
 				"publication with UPDATE and DELETE publishing. From that moment PostgreSQL refuses the SOURCE "+
-				"APPLICATION's own writes to them (\"cannot update table \\\"…\\\" because it does not have a replica "+
-				"identity and publishes updates\", and the same for DELETE) — INSERT keeps working, so the table looks "+
-				"healthy until the first update and the breakage surfaces in your application, not in sluice. Nothing has "+
-				"been changed on the source: sluice refuses BEFORE touching the publication. Fix each table on the source "+
-				"and re-run, or take it out of scope with --exclude-table. REPLICA IDENTITY FULL is sufficient for a "+
-				"deferrable or missing key (it publishes the whole old row, at the cost of WAL volume on every "+
-				"UPDATE/DELETE) but NOT for a GENERATED identity column, which PostgreSQL leaves unpublished under FULL "+
-				"as well — each table's own note above says which case it is",
-			strings.Join(parts, ", "),
+				"APPLICATION's own writes to them (%s, and the same for DELETE) — INSERT keeps working, so the table "+
+				"looks healthy until the first update and the breakage surfaces in your application, not in sluice. "+
+				"Nothing has been changed on the source: sluice refuses BEFORE touching the publication. Fix each table "+
+				"on the source and re-run, or take it out of scope with --exclude-table. %s",
+			strings.Join(parts, ", "), quoted, remedy,
 		),
 	)
+}
+
+// replicaIdentityShapeProse renders the two shape-dependent sentences of
+// the refusal body: the SERVER ERROR sluice is quoting, and the standing
+// of `REPLICA IDENTITY FULL` as a remedy.
+//
+// Both were written for the item-93 shapes and left unchanged when the
+// generated-identity shape joined the code (Bug 235). Rendering them per
+// shape is what stops the body discussing a case that is not present —
+// which is both better prose and the thing that keeps
+// [refusalgate.Contradictions] able to read the message: a blanket "FULL
+// is not a fix for X" sentence sitting next to a hint that correctly
+// prescribes FULL for the Y actually being refused reads as a
+// contradiction to any checker, and to a hurried operator.
+//
+// The generated quote is [pgGeneratedIdentityRefusalDetail], which is
+// bound to the live server by the premise test rather than transcribed.
+func replicaIdentityShapeProse(gaps []replicaIdentityGap) (quoted, remedy string) {
+	const missingIdentityQuote = `"cannot update table \"…\" because it does not have a replica identity and publishes updates"`
+	generatedQuote := fmt.Sprintf(`"cannot update table \"…\"" with DETAIL "%s." on PostgreSQL 18+`, pgGeneratedIdentityRefusalDetail)
+
+	generated, other := 0, 0
+	for _, g := range gaps {
+		if g.GeneratedIdentity {
+			generated++
+		} else {
+			other++
+		}
+	}
+	switch {
+	case generated > 0 && other > 0:
+		return "for a deferrable or missing key " + missingIdentityQuote + "; for a GENERATED identity column " + generatedQuote,
+			"REPLICA IDENTITY FULL is sufficient for a deferrable or missing key (it publishes the whole old row, at " +
+				"the cost of WAL volume on every UPDATE/DELETE) but not for a GENERATED identity column, which " +
+				"PostgreSQL leaves unpublished under FULL as well — each table's own note above says which case it is"
+	case generated > 0:
+		return generatedQuote,
+			"REPLICA IDENTITY FULL is NOT a fix for these tables: PostgreSQL leaves a generated column unpublished " +
+				"under FULL as well, so each table needs a row identity built from non-generated columns"
+	default:
+		return missingIdentityQuote,
+			"REPLICA IDENTITY FULL is sufficient here — it publishes the whole old row, at the cost of WAL volume on " +
+				"every UPDATE/DELETE"
+	}
 }
 
 // PreflightReplicaIdentity implements [ir.ReplicaIdentityPreflighter]: it

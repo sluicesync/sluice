@@ -111,6 +111,17 @@ func TestSchemas_ColumnMissingAndExtra(t *testing.T) {
 // `ColumnsExtra` drift. Without this suppression every Shape-A
 // `schema diff` would emit a permanent false-positive for the
 // discriminator column.
+//
+// The expected side carries the COMPOSITE primary key, because that is
+// what the caller hands in: `internal/pipeline.Differ` runs
+// [translate.InjectShardColumn] over the expected schema first, and that
+// pass prepends the discriminator to the primary key as well as adding
+// the column. Through v0.117.0 this fixture declared the single-column
+// key and still passed — both keys were UNNAMED, and the name-keyed
+// index comparison skipped unnamed indexes entirely, so no unnamed
+// primary key was ever compared on ANY pair. The role key (Bug 234) now
+// compares it, which is why the fixture has to say what the pipeline
+// actually produces.
 func TestSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "customer",
@@ -118,7 +129,9 @@ func TestSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
 			{Name: "customer_id", Type: ir.Integer{Width: 64}},
 			{Name: "email", Type: ir.Varchar{Length: 255}},
 		},
-		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "customer_id"}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{
+			{Column: "source_shard_id"}, {Column: "customer_id"},
+		}},
 	}}}
 	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "customer",

@@ -763,7 +763,10 @@ func isUnpublishedGeneratedIdentityRefusal(err error) bool {
 	if !errors.As(err, &pgErr) {
 		return false
 	}
-	return pgErr.Code == "42P10" && strings.Contains(pgErr.Detail, "unpublished generated columns")
+	// Matched against the SAME literal the preflight quotes to operators
+	// ([pgGeneratedIdentityRefusalDetail]) — that is what makes the quote
+	// a measurement rather than a claim (Bug 235).
+	return pgErr.Code == "42P10" && strings.Contains(pgErr.Detail, pgGeneratedIdentityRefusalDetail)
 }
 
 func pgCount(t *testing.T, dsn, q string) int {

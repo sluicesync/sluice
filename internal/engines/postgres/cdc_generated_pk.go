@@ -95,6 +95,35 @@ import (
 // primary key. That last cell is the one the preflight below
 // deliberately does not grade; see its own known-limit note.
 
+// pgGeneratedIdentityRefusalDetail is the DETAIL PostgreSQL emits when
+// it refuses the SOURCE APPLICATION's own UPDATE/DELETE over this shape
+// (SQLSTATE 42P10; the primary message is the bare `cannot update table
+// "t"`). Quoted verbatim in the preflight's refusal so an operator can
+// grep their PostgreSQL log for the exact line sluice printed.
+//
+// A quoted server string is an environmental fact, so it is bound to a
+// measurement rather than believed: it is the literal
+// [isUnpublishedGeneratedIdentityRefusal] matches against the live
+// server in [TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity].
+// If PostgreSQL rewords it, that test fails rather than sluice quietly
+// printing a string no log contains. Mutation-verified against a real
+// 18.4 (`SLUICE_TEST_PG_IMAGE=postgres:18`): changing one word here
+// fails three of that test's cells.
+//
+// SCOPE of the binding, stated because the default harness cannot check
+// it: only a server at or above [pgVersionGeneratedIdentityWriteRefusal]
+// emits this at all, so the assertion is live on the weekly
+// pg-version-matrix run and inert on the per-PR shard's PG 16. That is a
+// version gate, not a coverage gap — there is no PG 16 wording to check
+// against, because PG 16 does not refuse.
+//
+// Bug 235: the preflight previously quoted the MISSING-replica-identity
+// wording ("… because it does not have a replica identity and publishes
+// updates") for this shape too. That sentence is real, and it is what
+// PostgreSQL says for the item-93 deferrable/keyless case — it is simply
+// not what it says here, so an operator grepping for it found nothing.
+const pgGeneratedIdentityRefusalDetail = "Replica identity must not contain unpublished generated columns"
+
 // identityColumns is schema.table's EFFECTIVE replica-identity column
 // set as the catalog knows it — All in key order, plus the Generated
 // subset. Both are needed: Generated says whether there is a hazard, and
