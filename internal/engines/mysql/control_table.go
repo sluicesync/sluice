@@ -926,18 +926,6 @@ func listStreamsLegacy(ctx context.Context, db *sql.DB, controlKeyspace, engineN
 	return out, rows.Err()
 }
 
-// isMySQLMissingTableErr returns true when err looks like MySQL's
-// "Table 'X' doesn't exist" / error 1146. listStreams uses this to
-// degrade gracefully when the control table hasn't been created on
-// the target yet.
-func isMySQLMissingTableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "doesn't exist") || strings.Contains(msg, "Error 1146")
-}
-
 // writePositionTx upserts the (streamID, token, slotName,
 // publicationName, sourceFingerprint, targetSchema) row inside an open
 // transaction.

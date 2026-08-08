@@ -192,6 +192,14 @@ func (s *spyExecutor) pollChangeLog(context.Context, int64, int) ([]rawChangeRow
 func (s *spyExecutor) readFingerprints(context.Context) ([]fingerprintRow, error) { return nil, nil }
 
 func (s *spyExecutor) changeLogExists(context.Context) (bool, error) { return true, nil }
+
+// tableColumns answers with the healthy floor for whichever engine-internal
+// table is asked about, so a future edit that routes these WAL tests through
+// setup's shape probe doesn't read the spy as a foreign table.
+func (s *spyExecutor) tableColumns(_ context.Context, table string) ([]string, error) {
+	return internalTableColumnFloor[table], nil
+}
+
 func (s *spyExecutor) maxChangeLogID(context.Context) (int64, error) { return 0, nil }
 
 // changeLogAllocation reports a HEALTHY allocation state. These WAL tests

@@ -320,11 +320,13 @@ func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, er
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
-	// MySQL error 1146 ("Table 'x.y' doesn't exist") plus the Vitess
-	// equivalent both contain "doesn't exist" in the message — that's
-	// the simplest cross-flavor check without importing the driver's
-	// error type into this package.
-	if strings.Contains(err.Error(), "doesn't exist") {
+	// Classified on the server's error CODE, never its message text — this
+	// answer gates a REFUSAL (a non-empty target blocks the cold copy), so a
+	// misclassification either refuses a valid run or, worse, lets one past the
+	// refusal. See [isNoSuchTableErr] for the measured ways the TEXT moves
+	// while the code does not (`lc_messages`, vtgate's own wording, proxies).
+	// Anything else — including an error nobody here can classify — surfaces.
+	if isNoSuchTableErr(err) {
 		return true, nil
 	}
 	return false, fmt.Errorf("mysql: probe %q for emptiness: %w", table.Name, err)

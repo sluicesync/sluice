@@ -98,12 +98,12 @@ func TestExtractPGLSN_MalformedJSON(t *testing.T) {
 // surfaces ok=false rather than propagating the error to the operator.
 func TestIsUndefinedTableError_Matches42P01(t *testing.T) {
 	err := &pgconn.PgError{Code: "42P01", Message: `relation "pg_stat_replication_slots" does not exist`}
-	if !isUndefinedTableError(err) {
+	if !isUndefinedTableErr(err) {
 		t.Errorf("expected true for SQLSTATE 42P01; got false")
 	}
 	// Wrapped via fmt.Errorf — errors.As should still find it.
 	wrapped := fmt.Errorf("postgres: SlotSpillStats: %w", err)
-	if !isUndefinedTableError(wrapped) {
+	if !isUndefinedTableErr(wrapped) {
 		t.Errorf("expected true for wrapped 42P01; got false")
 	}
 }
@@ -115,16 +115,16 @@ func TestIsUndefinedTableError_Matches42P01(t *testing.T) {
 func TestIsUndefinedTableError_RejectsOtherCodes(t *testing.T) {
 	for _, code := range []string{"42501", "42703", "42000", "08006", "23505"} {
 		err := &pgconn.PgError{Code: code, Message: "not undefined_table"}
-		if isUndefinedTableError(err) {
+		if isUndefinedTableErr(err) {
 			t.Errorf("SQLSTATE %s should NOT match; got true", code)
 		}
 	}
 	// Plain (non-PG) error: must not match.
-	if isUndefinedTableError(errors.New("not a pgconn.PgError")) {
+	if isUndefinedTableErr(errors.New("not a pgconn.PgError")) {
 		t.Errorf("plain error should NOT match")
 	}
 	// Nil: must not match.
-	if isUndefinedTableError(nil) {
+	if isUndefinedTableErr(nil) {
 		t.Errorf("nil error should NOT match")
 	}
 }

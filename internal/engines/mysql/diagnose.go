@@ -7,10 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-
-	"github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -66,17 +63,6 @@ func (a *ChangeApplier) ListSchemaHistory(ctx context.Context, streamID string, 
 		return nil, fmt.Errorf("mysql: list schema history: %w", err)
 	}
 	return out, nil
-}
-
-// isNoSuchTableErr reports whether err is a *mysql.MySQLError with
-// error number 1146 (ER_NO_SUCH_TABLE) — the "the table doesn't
-// exist yet" case that diagnose handles silently rather than failing.
-func isNoSuchTableErr(err error) bool {
-	var mErr *mysql.MySQLError
-	if !errors.As(err, &mErr) {
-		return false
-	}
-	return mErr.Number == 1146
 }
 
 // DiagnoseBundle implements [ir.DiagnoseProber] for the MySQL schema

@@ -339,10 +339,14 @@ func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, er
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
-	// Postgres SQLSTATE 42P01 = undefined_table. The driver surfaces
-	// it as a *pgconn.PgError; we check the message text rather than
-	// importing pgconn here just for one check.
-	if strings.Contains(err.Error(), "does not exist") {
+	// Classified on the server's SQLSTATE, never its message text — this answer
+	// gates a REFUSAL (a non-empty target blocks the cold copy), so a
+	// misclassification either refuses a valid run or, worse, lets one past the
+	// refusal. "does not exist" is PG's phrasing for a whole family of
+	// unrelated conditions, one of which (`FATAL: database "x" does not exist`,
+	// SQLSTATE 3D000, reachable whenever the pool re-dials) used to read here as
+	// "the target table is empty". See [isUndefinedTableErr].
+	if isUndefinedTableErr(err) {
 		return true, nil
 	}
 	return false, fmt.Errorf("postgres: probe %q for emptiness: %w", table.Name, err)

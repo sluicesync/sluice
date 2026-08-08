@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -112,25 +110,13 @@ func (r *SchemaReader) SlotSpillStats(ctx context.Context, slotName string) (ir.
 		// 0 for "definitely no spill" when the real signal is "we can't
 		// tell yet."
 		return ir.SpillStats{}, false, nil
-	case isUndefinedTableError(err):
+	case isUndefinedTableErr(err):
 		// PG < 14 — the view doesn't exist. Same "unavailable" surface.
 		return ir.SpillStats{}, false, nil
 	case err != nil:
 		return ir.SpillStats{}, false, fmt.Errorf("postgres: SlotSpillStats: %w", err)
 	}
 	return stats, true, nil
-}
-
-// isUndefinedTableError reports whether err wraps a PG `undefined_table`
-// SQLSTATE (42P01). Used to detect the "view doesn't exist on PG < 14"
-// case for `pg_stat_replication_slots` without hard-coding a PG version
-// check.
-func isUndefinedTableError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code == "42P01"
-	}
-	return false
 }
 
 // extractPGLSN normalises an [ir.Position] into a bare LSN string

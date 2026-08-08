@@ -7,10 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -70,17 +67,6 @@ func (a *ChangeApplier) ListSchemaHistory(ctx context.Context, streamID string, 
 		return nil, fmt.Errorf("postgres: list schema history: %w", err)
 	}
 	return out, nil
-}
-
-// isUndefinedTableErr reports whether err is a pgconn.PgError with
-// SQLSTATE 42P01 (undefined_table) — the "the table doesn't exist
-// yet" case that diagnose handles silently rather than failing.
-func isUndefinedTableErr(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	return pgErr.Code == "42P01"
 }
 
 // DiagnoseBundle implements [ir.DiagnoseProber] for the Postgres

@@ -153,19 +153,129 @@ func setup(ctx context.Context, b backend, opts SetupOptions) (*Plan, error) {
 		// Refusals block the run even on dry-run — the operator sees them first.
 		return plan, fmt.Errorf("sqlite-trigger: setup: %d table(s) refused (see plan.Refusals)", len(refusals))
 	}
-	if opts.DryRun {
-		return plan, nil
-	}
 
-	exec, err := b.openExec(ctx, false)
+	// The engine's own tables are created with CREATE TABLE IF NOT EXISTS, so a
+	// pre-existing table at one of those names would be ADOPTED rather than
+	// refused (item 149b). Grade the shape of anything already there BEFORE the
+	// dry-run return, so `--dry-run` shows the refusal too — the connection is
+	// read-only on that path, so a plan still writes nothing.
+	exec, err := b.openExec(ctx, opts.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: setup: open: %w", err)
 	}
 	defer func() { _ = exec.close() }()
+	if err := preflightInternalTableShapes(ctx, exec); err != nil {
+		return plan, err
+	}
+	if opts.DryRun {
+		return plan, nil
+	}
 	if err := execAll(ctx, exec, plan.Statements); err != nil {
 		return plan, fmt.Errorf("sqlite-trigger: setup: %w", err)
 	}
 	return plan, nil
+}
+
+// internalTableColumnFloor is, per engine-internal table, the column set every
+// sluice-created copy of that table has carried since the table was introduced
+// — the evidence [preflightInternalTableShapes] grades an ALREADY-PRESENT table
+// against (roadmap item 149b).
+//
+// # Why a floor and not "the columns the current DDL emits"
+//
+// The probe runs on the CURRENT binary against a source an OLDER binary may
+// have set up, so the expected set must be what the oldest shipped installer
+// wrote, not what today's writes. Ground-truthed from the DDL's own history
+// (`git log -p` over this file): no column of any of these four tables has ever
+// been renamed or removed — the only schema evolution has been whole NEW tables
+// (the fingerprint table, then the consumer registry at schema_version 2), and
+// an absent table is created rather than graded. So today the floor and the
+// rendered DDL agree exactly, which is what [TestInternalTableColumnFloorMatchesTheRenderedDDL]
+// pins.
+//
+// If a future release ADDS a column to one of these, do NOT add it here unless
+// that release also migrates existing installs: a floor ahead of the installed
+// shape refuses every upgraded source. That gate fails on such a change, which
+// is the point — it forces the decision rather than letting an upgrade break.
+//
+// # Why column NAMES and not types or indexes
+//
+// Names are the evidence that is both stable and portable across the two
+// transports. Types are not worth their over-refusal risk (SQLite reports the
+// DECLARED type, so a user table is distinguished by its column names long
+// before its affinities matter), and INDEXES are actively wrong as evidence:
+// the pgtrigger twin's index set DID change (the N-16 index diet dropped two),
+// so an index-based probe would refuse exactly the pre-diet installs it exists
+// to leave alone.
+var internalTableColumnFloor = map[string][]string{
+	ChangeLogTable:          {"id", "op", "tbl", "before", "after", "captured_at"},
+	ChangeLogMetaTable:      {"singleton_pk", "schema_version", "installed_at"},
+	ChangeLogColumnsTable:   {"tbl", "columns"},
+	ChangeLogConsumersTable: {"consumer_id", "applied_id", "updated_at"},
+}
+
+// preflightInternalTableShapes refuses loudly when the source already carries a
+// table at one of the engine's own names whose shape is not sluice's — the
+// silent-adoption half of item 149b, closed on BOTH sqlite-trigger transports
+// (local file and D1) because the probe runs over the [executor] seam.
+//
+// Existence alone proves nothing: a legitimate re-`setup` finds every one of
+// these tables there. What distinguishes them is the column set, so an existing
+// table passes exactly when it carries every column in its floor. A table that
+// is absent (no columns) is skipped — the CREATE below makes it.
+//
+// SCOPE, stated narrowly so this is not read as broader than it is: the probe
+// grades column NAMES. A pre-existing change log carrying the right columns but
+// declared WITHOUT `AUTOINCREMENT` passes here and is refused later, by
+// [verifyChangeLogWatermark] at both CDC doors — that is the id-reuse gate's
+// job, on both transports, and it is where the check belongs (it also has to
+// catch a `sqlite_sequence` an operator lowered on a log this probe accepted).
+func preflightInternalTableShapes(ctx context.Context, exec executor) error {
+	names := make([]string, 0, len(internalTableColumnFloor))
+	for name := range internalTableColumnFloor {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		cols, err := exec.tableColumns(ctx, name)
+		if err != nil {
+			return fmt.Errorf("sqlite-trigger: setup: read the shape of %q: %w", name, err)
+		}
+		if len(cols) == 0 {
+			continue // absent; the setup DDL creates it
+		}
+		missing := missingFloorColumns(internalTableColumnFloor[name], cols)
+		if len(missing) == 0 {
+			continue
+		}
+		return fmt.Errorf(
+			"sqlite-trigger: setup: refuse-loudly foreign-table on %s — the source already has a table by that name "+
+				"and it is NOT sluice's change-log bookkeeping: it is missing the column(s) %v (it has %v). "+
+				"Setup creates its own tables with CREATE TABLE IF NOT EXISTS, so continuing would have ADOPTED this table silently "+
+				"and the first captured change would then fail on YOUR OWN write path, after the capture triggers were installed. "+
+				"Rename or move the conflicting table and re-run setup — its rows are yours, so `sluice trigger teardown` is not the fix "+
+				"(teardown DROPs tables by these names)",
+			name, missing, cols,
+		)
+	}
+	return nil
+}
+
+// missingFloorColumns returns the floor columns absent from have, in floor
+// order (a stable, operator-readable list).
+func missingFloorColumns(floor, have []string) []string {
+	present := make(map[string]bool, len(have))
+	for _, c := range have {
+		present[c] = true
+	}
+	var missing []string
+	for _, c := range floor {
+		if !present[c] {
+			missing = append(missing, c)
+		}
+	}
+	return missing
 }
 
 // Teardown removes the engine's source-side state. Idempotent — every DROP uses
@@ -256,24 +366,18 @@ func preflight(tables []*ir.Table) []TableRefusal {
 // renderSetupDDL produces the ordered DDL that installs the engine. Order
 // matters: the change-log table must exist before the triggers reference it.
 //
-// KNOWN GAP — a pre-existing user table of the same name is ADOPTED SILENTLY
-// (roadmap item 149b, the trigger-engine sibling of item 148). Every statement
-// below is `CREATE TABLE IF NOT EXISTS`, so if the source already carries a
-// table named `sluice_change_log` (or the meta / columns / consumer tables),
-// the CREATE returns OK, creates nothing, and setup proceeds against the user's
-// table. It fails eventually — the first captured INSERT hits a column that is
-// not there — but "eventually" is on the OPERATOR'S OWN WRITE PATH, after the
-// triggers are installed, which is a worse place to find out than setup.
+// Every table statement below is `CREATE TABLE IF NOT EXISTS`, so on its own it
+// would ADOPT a pre-existing table at one of these names rather than refuse it
+// (roadmap item 149b, the trigger-engine sibling of item 148). What keeps that
+// from happening is NOT this render — it is [preflightInternalTableShapes],
+// which runs over the [executor] seam (so both transports are covered) before
+// any of this is applied, and refuses a table whose column set is not sluice's.
+// The IF NOT EXISTS itself stays, because setup is idempotent by design: a
+// re-run against a healthy install must be silent.
 //
-// Not fixed here on purpose, and the reason is scope rather than severity: an
-// honest check is a per-table SHAPE probe (does the existing table have the
-// columns this engine expects), which needs a new query on the [executor]
-// interface implemented for BOTH transports — local SQLite and D1 over HTTP —
-// plus the Postgres twin in pgtrigger.renderSetupDDL, which carries the
-// identical shape. Existence alone is not a usable signal: a legitimate
-// re-`setup` finds the table there every time. The trigger DDL itself is NOT a
-// member of this class — it emits `DROP TRIGGER IF EXISTS` plus a plain
-// `CREATE TRIGGER`, which is loud on a name collision.
+// The trigger DDL is NOT a member of this class — it emits
+// `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is loud on a
+// name collision.
 func renderSetupDDL(tables []*ir.Table) []string {
 	// 5 base statements + 7 per table (DROP+CREATE×3 triggers + 1 fingerprint upsert).
 	out := make([]string, 0, 5+len(tables)*(2*len(triggerOps)+1))

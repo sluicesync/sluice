@@ -45,6 +45,12 @@ type executor interface {
 	pollChangeLog(ctx context.Context, sinceID int64, batch int) ([]rawChangeRow, error)
 	readFingerprints(ctx context.Context) ([]fingerprintRow, error)
 	changeLogExists(ctx context.Context) (bool, error)
+	// tableColumns returns the column NAMES of `table`, or an empty slice when
+	// no such table exists. It is the shape half of the change-log adoption
+	// refusal (roadmap item 149b): existence alone cannot distinguish sluice's
+	// own change log from a user table that happens to carry the name, because
+	// a legitimate re-`setup` finds the table there every time.
+	tableColumns(ctx context.Context, table string) ([]string, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
 	// changeLogAllocation reports the change log's id-allocation state — the
 	// floor below which it can never issue a new id, and whether the table is
@@ -256,6 +262,24 @@ const (
 		ChangeLogMetaTable + `" WHERE singleton_pk = 1`
 )
 
+// tableColumnsSQL renders the catalog read behind [executor.tableColumns].
+//
+// `PRAGMA table_info(<literal>)` rather than the table-valued
+// `pragma_table_info(?)` form deliberately: the PRAGMA spelling is the one the
+// SHIPPED, live-validated D1 cold-start schema reader already runs over the
+// same `/query` endpoint (`sqlite/d1_schema.go` reads `PRAGMA table_xinfo` /
+// `index_list` / `foreign_key_list` that way), so one query serves both
+// transports on evidence rather than on hope. PRAGMA takes no bind parameter,
+// hence the quoted string literal — the argument is always one of the engine's
+// own constant table names, and it is quoted regardless.
+//
+// table_info (not table_xinfo) is right here: the engine's own tables have no
+// generated columns, and a user table whose VIRTUAL generated column is
+// therefore omitted reports FEWER columns, which lands on the refusing side.
+func tableColumnsSQL(table string) string {
+	return "PRAGMA table_info(" + quoteSQLString(table) + ")"
+}
+
 // --- localExecutor: the Phase-1 *sql.DB transport ---------------------------
 
 // localExecutor runs the trigger SQL against a local SQLite file's *sql.DB. Its
@@ -321,6 +345,30 @@ func (e *localExecutor) changeLogExists(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+func (e *localExecutor) tableColumns(ctx context.Context, table string) ([]string, error) {
+	rows, err := e.db.QueryContext(ctx, tableColumnsSQL(table))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			declType  string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &declType, &notNull, &dfltValue, &pk); err != nil {
+			return nil, fmt.Errorf("sqlite-trigger: scan table_info(%q): %w", table, err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 func (e *localExecutor) maxChangeLogID(ctx context.Context) (int64, error) {
 	var id sql.NullInt64
 	if err := e.db.QueryRowContext(ctx, `SELECT MAX(id) FROM "`+ChangeLogTable+`"`).Scan(&id); err != nil {
@@ -347,6 +395,19 @@ func (e *localExecutor) changeLogAllocation(ctx context.Context) (changeLogAlloc
 	// table" error rather than an empty result. That is not a failure to
 	// report: it means the counter is 0, which is what the DDL arm is there
 	// to explain.
+	//
+	// SUBSTRING CLASSIFIER, ENUMERATED AND EXEMPT (audit backlog C-1's sweep).
+	// The MySQL/PG missing-table classifiers were moved onto the server's error
+	// CODE; this one and its D1 twin below cannot follow, because the two
+	// transports have no COMMON code to classify on — the local path could read
+	// modernc's extended result code, but the D1 path receives only an HTTP
+	// error body with no SQLite code in it, and a fix that reached one
+	// transport and not the other is the sibling failure this project keeps
+	// repeating. It is exempt rather than fixed on top of that: the answer
+	// gates a counter default (seq = 0), not a refusal, and the query is a
+	// fixed literal against `sqlite_sequence`, so the misclassification surface
+	// is one table name rather than an arbitrary user query. If D1 ever exposes
+	// a SQLite result code, fix both.
 	if err := e.db.QueryRowContext(ctx, changeLogSeqSQL, ChangeLogTable).Scan(&seq); err != nil {
 		if !strings.Contains(err.Error(), "no such table") {
 			return changeLogAllocation{}, err
@@ -608,6 +669,28 @@ func (e *d1Executor) changeLogExists(ctx context.Context) (bool, error) {
 	return len(rows) > 0, nil
 }
 
+func (e *d1Executor) tableColumns(ctx context.Context, table string) ([]string, error) {
+	rows, err := e.conn.Query(ctx, tableColumnsSQL(table))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		name, ok, err := d1CellString(row["name"])
+		if err != nil {
+			return nil, fmt.Errorf("d1-trigger: decode table_info(%q).name: %w", table, err)
+		}
+		if !ok {
+			// A PRAGMA row without a name is not a shape this can interpret;
+			// refusing beats silently shortening the column set, which is the
+			// direction that would ADOPT a foreign table.
+			return nil, fmt.Errorf("d1-trigger: table_info(%q) returned a row with a NULL name", table)
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
 func (e *d1Executor) maxChangeLogID(ctx context.Context) (int64, error) {
 	rows, err := e.conn.Query(ctx, `SELECT CAST(MAX(id) AS TEXT) AS m FROM "`+ChangeLogTable+`"`)
 	if err != nil {
@@ -660,6 +743,9 @@ func (e *d1Executor) changeLogAllocation(ctx context.Context) (changeLogAllocati
 	if err != nil {
 		// Same "the database has never held an AUTOINCREMENT table" case as
 		// the local path: a missing sqlite_sequence means the counter is 0.
+		// Substring-classified, enumerated and exempt for the reason spelled out
+		// on the local twin above — over HTTP there is no SQLite result code to
+		// classify on at all.
 		if !strings.Contains(err.Error(), "no such table") {
 			return changeLogAllocation{}, err
 		}
