@@ -48,6 +48,15 @@
 #     server doesn't exhibit the seeded clamp (data-dependent).
 #   - TestCDCReader_TimestampNonUTCHost: needs host tzdata for
 #     America/Los_Angeles.
+#   - TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity, the
+#     `publish_generated_columns` cell ONLY: that publication option
+#     does not exist before PostgreSQL 18, so on the PG 16 shard this
+#     one cell cannot be constructed at all. The boundary stays pinned
+#     in both directions everywhere — the pre-18 cells run here and
+#     assert that PG does NOT refuse, and pg-version-matrix.yml runs
+#     the 18+ half on 18/latest/19beta1. Deliberately anchored to the
+#     subtest rather than the parent: a skip of the whole premise test
+#     would mean the boot died, which must still fail this guard.
 ALLOWED_SKIPS='
 ^TestMigrate_Corpus_
 ^TestLoadColumnTypes_Bug97VerbatimEligibleTypes$
@@ -61,6 +70,7 @@ ALLOWED_SKIPS='
 ^TestLoadData
 ^TestWriteBatched
 ^TestCDCReader_TimestampNonUTCHost$
+^TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity/.*publish_generated_columns
 '
 
 usage() {
