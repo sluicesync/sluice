@@ -236,6 +236,17 @@ func (s *Streamer) runColdStartParallel(
 	// fast dispatch only ever sees the non-spanning (qualifyBySchema=false)
 	// OpenSnapshotStream. If a future change routes a spanning stream into
 	// coldStart's fast path, this becomes a live bug — re-gate here first.
+	//
+	// "Holds by construction" was a hypothesis with nothing asserting it until
+	// the 2026-08-08 invariant sweep. Two things assert it now:
+	// TestSpanningSnapshotNeverReachesTheParallelColdStartLane derives the two
+	// lanes' call graph from this package and fails if either reaches the
+	// other, and postgres' row reader refuses a table from a schema it is not
+	// bound to (errSchemaEscape) instead of silently substituting its own — so
+	// a rewiring that slips past the call-graph gate stops the copy rather
+	// than diverging it. ADR-0075's "Consistency model" carries the same
+	// correction, since the ADR states only the PostgreSQL half of the
+	// argument.
 	snapshotName := stream.SnapshotName
 	maxBuffer := s.MaxBufferBytes
 	// A-D1 invariant (audit 2026-07-19 / 2026-07-19c F-ARCH-1): every snapshot

@@ -146,6 +146,95 @@ func TestRepairByPK_NoPK(t *testing.T) {
 	}
 }
 
+// TestRepairByPK_RefusesAGeneratedKeyMember closes the generated-PK identity
+// class at this narrowing site (2026-08-08 invariant sweep).
+//
+// The class was recorded as "fixed or exempt" across six sites, and this one's
+// exemption read "refuses loudly when the effective PK is empty". That is what
+// the code did, and it is not what the class needs: the effective key is the
+// primary key MINUS its STORED generated members, so a composite key with one
+// generated member yields a non-empty PROPER SUBSET, which the empty-check
+// cannot see. `UPDATE … WHERE a = $1` then matches every row sharing the
+// prefix and writes one row's re-read FLOAT values over all of them.
+//
+// The matrix is generated-membership x key-arity, because the defect lives in
+// exactly one cell of it and the two neighbouring cells are the over-refusal
+// controls — pinning the refusal alone would not distinguish "refuses the
+// broken shape" from "refuses composite keys".
+func TestRepairByPK_RefusesAGeneratedKeyMember(t *testing.T) {
+	// col builds a table whose PK is pk, with genCols STORED generated.
+	build := func(pk []string, genCols ...string) *ir.Table {
+		gen := map[string]bool{}
+		for _, g := range genCols {
+			gen[g] = true
+		}
+		cols := make([]*ir.Column, 0, 4)
+		for _, name := range []string{"a", "b", "g"} {
+			c := &ir.Column{Name: name, Type: ir.Integer{Width: 64}}
+			if gen[name] {
+				c.GeneratedExpr = "a + 1"
+			}
+			cols = append(cols, c)
+		}
+		cols = append(cols, &ir.Column{Name: "fl", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true})
+		idx := &ir.Index{Name: "pk"}
+		for _, c := range pk {
+			idx.Columns = append(idx.Columns, ir.IndexColumn{Column: c})
+		}
+		return &ir.Table{Name: "t", Columns: cols, PrimaryKey: idx}
+	}
+
+	cases := []struct {
+		name       string
+		pk         []string
+		gen        []string
+		wantRefuse bool
+		why        string
+	}{
+		{
+			name: "single key, not generated", pk: []string{"a"},
+			why: "the ordinary shape — refusing it would break every float repair in the tree",
+		},
+		{
+			name: "composite key, none generated", pk: []string{"a", "b"},
+			why: "a composite key is fine; the refusal must key on GENERATED, not on arity",
+		},
+		{
+			name: "composite key, one member generated", pk: []string{"a", "g"}, gen: []string{"g"},
+			wantRefuse: true,
+			why:        "the defect cell: effective key {a} is a non-unique prefix of the real key",
+		},
+		{
+			name: "composite key, all members generated", pk: []string{"g"}, gen: []string{"g"},
+			wantRefuse: true,
+			why:        "the empty-effective-key arm the old check already caught; kept so a rewrite cannot drop it",
+		},
+		{
+			name: "generated column present but OUTSIDE the key", pk: []string{"a"}, gen: []string{"g"},
+			why: "TestRepairByPK_GeneratedColumnFiltered's shape — generated non-key columns are filtered from SET, not refused",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			table := build(c.pk, c.gen...)
+			row := ir.Row{"fl": float64(1.5)}
+			for _, k := range c.pk {
+				row[k] = int64(1)
+			}
+			rec := &recordingExecer{}
+			err := RepairByPK(context.Background(), table, c.pk, streamRows([]ir.Row{row}), 500, rec)
+			switch {
+			case c.wantRefuse && err == nil:
+				t.Fatalf("RepairByPK accepted PK %v with generated %v; want a loud refusal (%s). "+
+					"It would have keyed the UPDATE on a proper subset", c.pk, c.gen, c.why)
+			case !c.wantRefuse && err != nil:
+				t.Fatalf("RepairByPK refused PK %v with generated %v: %v — over-refusal (%s)", c.pk, c.gen, err, c.why)
+			}
+		})
+	}
+}
+
 // TestRepairByPK_Batching pins the PERF-P1 round-trip reduction: N rows are
 // flushed in ceil(N/batchRows) ExecBatch calls, with every row carried
 // through exactly once and no explicit transaction round-trips (the skeleton

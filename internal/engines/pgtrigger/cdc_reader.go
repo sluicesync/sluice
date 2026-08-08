@@ -42,8 +42,28 @@ type CDCReader struct {
 	pollInterval time.Duration
 	batchSize    int
 
-	// pumpCancel cancels the polling goroutine when Close is called.
+	// pumpCancel cancels the polling goroutine when Close is called, and
+	// pumpDone is closed by that goroutine as it exits.
+	//
+	// Both are needed, and pumpDone is the one that was missing (2026-08-08
+	// sibling sweep). Cancellation is ASYNCHRONOUS: it unblocks the pump's
+	// selects but does not stop it having already passed one, and the pump's
+	// next act is a query on r.db (holes.refresh, captureTxidUpperBound, or
+	// the batch QueryContext). Close used to close that pool and set the field
+	// to nil immediately after cancelling, so a Close landing in that window
+	// nil-dereferenced INSIDE the pump goroutine — an unrecovered panic, which
+	// takes the process down rather than failing the sync. It is also an
+	// unsynchronised cross-goroutine read/write of the field, which is what
+	// `-race` grades.
+	//
+	// This is the sqlite-trigger defect one engine over. That one was found by
+	// accident and recorded as "FIXED"; the CHANGELOG entry claimed the class
+	// without enumerating the siblings, and this reader — the other trigger
+	// engine, same polling shape — still had it.
+	//
+	// Pinned by TestCDCReaderClose_JoinsThePumpBeforeClosingThePool.
 	pumpCancel context.CancelFunc
+	pumpDone   chan struct{}
 
 	// pruneMu guards pruneDB — the lazily-opened pool the ADR-0137 Phase-B
 	// auto-prune ([PruneConsumedChangeLog]) reuses across ticks instead of
@@ -136,9 +156,16 @@ func (r *CDCReader) SetPollInterval(d time.Duration) {
 // Close releases the underlying connection pool (and the auto-prune
 // pool, if a prune tick ever opened one) and stops any in-flight
 // polling goroutine.
+//
+// Ordering: JOIN the pump before touching either pool. See [CDCReader]'s
+// pumpDone field for why cancellation alone is not enough.
 func (r *CDCReader) Close() error {
 	if r.pumpCancel != nil {
 		r.pumpCancel()
+	}
+	if r.pumpDone != nil {
+		<-r.pumpDone
+		r.pumpDone = nil
 	}
 	r.pruneMu.Lock()
 	if r.pruneDB != nil {
@@ -210,8 +237,14 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	out := make(chan ir.Change, cdcChannelBuffer)
 	pumpCtx, cancel := context.WithCancel(ctx)
 	r.pumpCancel = cancel
+	done := make(chan struct{})
+	r.pumpDone = done
 
 	go func() {
+		// close(done) is the OUTERMOST defer, so joining it also guarantees
+		// `out` is closed — a Close that returns cannot leave a consumer
+		// blocked on the channel.
+		defer close(done)
 		defer close(out)
 		r.pump(pumpCtx, startID, out)
 	}()

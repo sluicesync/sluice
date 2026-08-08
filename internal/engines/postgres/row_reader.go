@@ -170,6 +170,11 @@ func (r *RowReader) SetSchema(name string) {
 	r.schema = name
 }
 
+// errSchemaEscape is the loud refusal a NON-spanning reader returns when it
+// is handed a table belonging to some other schema. Sentinel so the pins can
+// match it structurally rather than on message text.
+var errSchemaEscape = errors.New("postgres: row reader is bound to a single schema and cannot read a table from another one")
+
 // effectiveSchema returns the schema a query should qualify table by. In
 // the multi-schema spanning snapshot (ADR-0075 Phase 2b) the one pinned
 // connection reads across N schemas, so qualify by the table's own Schema
@@ -179,11 +184,49 @@ func (r *RowReader) SetSchema(name string) {
 // stays false and this returns r.schema — byte-identical to the pre-ADR-0075
 // shape. Shared by ReadRows, CountRows, RangeBounds, and EstimateRowCount so
 // they all qualify identically.
-func (r *RowReader) effectiveSchema(table *ir.Table) string {
+//
+// # Why this can fail, and what it is protecting (2026-08-08 invariant sweep)
+//
+// ADR-0075's consistency argument — "one exported snapshot spans every
+// selected schema" — is true of PostgreSQL, and is now ground-truthed by
+// TestExportedSnapshotSpansEverySchema. But the argument as USED rests on a
+// SECOND premise that the ADR never stated: that every reader which actually
+// copies a spanning stream's tables also QUALIFIES by those tables' schemas.
+// The snapshot-importer readers minted for the ADR-0079 parallel cold start
+// (snapshot_importer.go) do not — they carry qualifyBySchema=false and
+// r.schema from the DSN — so routing a spanning stream into that fast lane
+// would have read the DSN's default schema N times over. With the canonical
+// multi-schema shape (a same-named table per tenant schema) that is not an
+// error, it is N copies of public.t written into N target schemas: silent
+// divergence, and CDC would then deliver the real per-schema changes on top.
+//
+// The pipeline states the counter-argument at runColdStartParallel — the fast
+// lane "holds by construction today" because the spanning opener is reached
+// only from coldStartMultiDatabase, which copies serially. That was a
+// hypothesis with nothing asserting it. It is now asserted two ways: from the
+// call graph (TestSpanningSnapshotNeverReachesTheParallelColdStartLane) and,
+// here, from EVIDENCE at the point of harm — a table naming a schema this
+// reader cannot span is refused rather than silently substituted. The refusal
+// is what makes the structural argument non-load-bearing: if a future change
+// does route a spanning stream into the fast lane, the copy stops instead of
+// diverging.
+//
+// It cannot over-refuse anything that works today: table.Schema is stamped by
+// the PG schema reader from its own bound schema, and in every single-schema
+// path the row reader and the schema reader are cloned from the same DSN, so
+// the two strings are equal by construction. A table with an empty Schema
+// (engine-neutral callers, hand-built test fixtures) is accepted as before.
+func (r *RowReader) effectiveSchema(table *ir.Table) (string, error) {
 	if r.qualifyBySchema && table.Schema != "" {
-		return table.Schema
+		return table.Schema, nil
 	}
-	return r.schema
+	if table.Schema != "" && table.Schema != r.schema {
+		return "", fmt.Errorf("%w: table %q names schema %q, reader is bound to %q "+
+			"(a spanning multi-schema snapshot must be read by a reader with qualifyBySchema set; "+
+			"reading it here would have silently returned %q.%q instead)",
+			errSchemaEscape, table.Name, table.Schema, r.schema, r.schema, table.Name)
+	}
+	return r.schema, nil
 }
 
 // Err returns the error, if any, that terminated the most recently
@@ -214,7 +257,12 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildSelect(r.effectiveSchema(table), table, r.rowFilters[table.Name])
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return nil, err
+	}
+
+	query := buildSelect(schema, table, r.rowFilters[table.Name])
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).

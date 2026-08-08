@@ -54,7 +54,11 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 	if pkColumn == "" {
 		return nil, nil, errors.New("postgres: RangeBounds: pkColumn is empty")
 	}
-	tableRef := quoteIdent(r.effectiveSchema(table)) + "." + quoteIdent(table.Name)
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return nil, nil, err
+	}
+	tableRef := quoteIdent(schema) + "." + quoteIdent(table.Name)
 	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
 		quoteIdent(pkColumn), quoteIdent(pkColumn), tableRef)
 
@@ -127,11 +131,15 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 		// "no estimate"; the ETA layer reports rate-only.
 		return 0, nil
 	}
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return 0, err
+	}
 	q := `SELECT COALESCE((SELECT reltuples::bigint
 	                       FROM pg_class c
 	                       JOIN pg_namespace n ON n.oid = c.relnamespace
 	                       WHERE n.nspname = $1 AND c.relname = $2), 0)`
-	rows, err := r.q.QueryContext(ctx, q, r.effectiveSchema(table), table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
+	rows, err := r.q.QueryContext(ctx, q, schema, table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return 0, fmt.Errorf("postgres: CountRows query: %w", err)
 	}
@@ -221,7 +229,11 @@ func (r *RowReader) reltuplesEstimate(ctx context.Context, q querier, table *ir.
 	                       FROM pg_class c
 	                       JOIN pg_namespace n ON n.oid = c.relnamespace
 	                       WHERE n.nspname = $1 AND c.relname = $2), 0)`
-	rows, err := q.QueryContext(ctx, stmt, r.effectiveSchema(table), table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := q.QueryContext(ctx, stmt, schema, table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return 0, fmt.Errorf("postgres: EstimateRowCount query: %w", err)
 	}
@@ -354,7 +366,11 @@ func (r *RowReader) SampleKeysetBoundaries(ctx context.Context, table *ir.Table,
 
 // sampleKeysetOn runs the windowed boundary-sample query against q.
 func (r *RowReader) sampleKeysetOn(ctx context.Context, q querier, table *ir.Table, pkColumns []string, n int) ([][]any, error) {
-	tableRef := quoteIdent(r.effectiveSchema(table)) + "." + quoteIdent(table.Name)
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return nil, err
+	}
+	tableRef := quoteIdent(schema) + "." + quoteIdent(table.Name)
 	pkQuoted := make([]string, len(pkColumns))
 	for i, c := range pkColumns {
 		pkQuoted[i] = quoteIdent(c)
@@ -427,7 +443,11 @@ func (r *RowReader) exactCount(ctx context.Context, table *ir.Table) (int64, err
 // ([RowReader.reltuplesOffConn] with estimatorExactCount). Identifiers
 // are quoted, not parameterized — Postgres does not bind identifiers.
 func (r *RowReader) exactCountOn(ctx context.Context, q querier, table *ir.Table) (int64, error) {
-	stmt := `SELECT COUNT(*) FROM ` + quoteIdent(r.effectiveSchema(table)) + `.` + quoteIdent(table.Name)
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return 0, err
+	}
+	stmt := `SELECT COUNT(*) FROM ` + quoteIdent(schema) + `.` + quoteIdent(table.Name)
 	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return 0, fmt.Errorf("postgres: CountRows exact COUNT(*): %w", err)

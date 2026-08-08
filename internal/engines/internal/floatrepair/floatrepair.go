@@ -99,9 +99,34 @@ func RepairByPK(ctx context.Context, table *ir.Table, pkColumns []string, rows <
 	for _, c := range pkColumns {
 		pkKeyRow[c] = struct{}{}
 	}
+	// The join key must be the WHOLE primary key. An EMPTY effective key was
+	// always refused; a non-empty PROPER SUBSET was not, and that is the cell
+	// that corrupts (2026-08-08 invariant sweep).
+	//
+	// PRIMARY KEY (a, g) with g STORED generated yields effPK = {a}: a
+	// non-unique prefix. Every batch then runs `UPDATE … WHERE a = $1`, which
+	// matches every row sharing that prefix and writes ONE row's re-read FLOAT
+	// values across all of them — silent corruption of rows nothing asked to
+	// repair, with a zero exit code. It is the same "narrowed key is a proper
+	// subset of the PK" shape that pipeline's narrowBefore refuses, and this
+	// site was recorded as exempt on the strength of the empty-key check
+	// above, which cannot see it.
+	//
+	// Refusing rather than carrying: the generated value is recomputed by the
+	// target's own GENERATED clause and is not in the row this driver receives,
+	// so there is nothing to carry. It cannot over-refuse a working table —
+	// today every such table is already being mis-updated.
+	//
+	// No SLUICE-E-CDC-GENERATED-PRIMARY-KEY here deliberately: this is the
+	// migrate/backup copy repair, not a CDC door, and borrowing the CDC code
+	// would send operators to the wrong remedy.
 	effPK := appliershared.NonGeneratedRowKeys(pkKeyRow, colTypes)
-	if len(effPK) == 0 {
-		return fmt.Errorf("floatrepair: RepairByPK: table %q has no non-generated primary key columns to key the repair on", table.Name)
+	if len(effPK) != len(pkColumns) {
+		return fmt.Errorf("floatrepair: RepairByPK: table %q: the FLOAT repair keys on the primary key, but "+
+			"%d of its %d key columns are STORED GENERATED and carry no value here (effective key %v of %v). "+
+			"Keying on a proper subset would UPDATE every row sharing that prefix. Refusing rather than "+
+			"corrupting: exclude the table from the float repair, or give it a key with no generated member",
+			table.Name, len(pkColumns)-len(effPK), len(pkColumns), effPK, pkColumns)
 	}
 
 	var (

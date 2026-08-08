@@ -191,7 +191,35 @@ type vstreamCDCReader struct {
 	// streamerCancel cancels the goroutine pumping events into the
 	// out channel. Stored on the reader so Close can stop a stream
 	// even when the caller's context isn't readily available.
+	//
+	// pumpDone is closed by that goroutine as it exits, and is what makes
+	// cancellation OBSERVABLE (2026-08-08 sibling sweep — the third instance
+	// of the class whose first two were the PG CDC reader and sqlite-trigger).
+	// Cancellation is asynchronous, so until the join existed both Close and
+	// applyReshardState returned while the old pump was still running. Two
+	// consequences, and the second is the one that corrupts:
+	//
+	//   - Close closed r.conn while the pump was still dispatching. Benign in
+	//     practice (the pump reads `stream`, not r.conn) but it is an
+	//     unsynchronised cross-goroutine read/write of reader fields —
+	//     r.currentVgtid (dispatch's VGTID arm) and r.fields (the FIELD arm) —
+	//     which is what `-race` grades.
+	//   - applyReshardState cancelled the old pump and then IMMEDIATELY
+	//     overwrote r.shards and r.currentVgtid with the post-reshard layout.
+	//     A straggling VGTID event from the old stream then wrote the OLD
+	//     layout's position over the new one, and Reopen built its request
+	//     from whichever won. That is a lost update on the resume position
+	//     across a reshard, not merely a reported race.
+	//
+	// The pump always exits promptly on cancellation: its channel sends go
+	// through [send], which selects on ctx.Done(), and gRPC's Recv unblocks on
+	// the same cancelled context. So the join cannot wedge on a consumer that
+	// stopped draining.
+	//
+	// Pinned by TestVStreamClose_JoinsThePump and
+	// TestApplyReshardState_JoinsThePumpBeforeReplacingTheLayout.
 	streamerCancel context.CancelFunc
+	pumpDone       chan struct{}
 
 	// fields caches column metadata keyed by qualified table name
 	// ("keyspace.table" or just "table" when keyspace is empty in
@@ -854,13 +882,19 @@ func (r *vstreamCDCReader) SetServerSideRowFilters(filters map[string]string) {
 	r.rowFilters = filters
 }
 
-// Close cancels the streaming goroutine (if any) and closes the
+// Close cancels the streaming goroutine (if any), JOINS it, and closes the
 // gRPC connection. Safe to call multiple times.
+//
+// The join is the 2026-08-08 sibling-sweep fix. See [vstreamCDCReader.pumpDone]
+// for why cancelling alone was not enough here — unlike the trigger engines the
+// symptom is not a nil deref, it is an unsynchronised write to r.currentVgtid
+// and r.fields by a pump that outlives the call that cancelled it.
 func (r *vstreamCDCReader) Close() error {
 	if r.streamerCancel != nil {
 		r.streamerCancel()
 		r.streamerCancel = nil
 	}
+	r.joinPump()
 	if r.conn != nil {
 		err := r.conn.Close()
 		r.conn = nil
@@ -941,7 +975,7 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go r.pump(loopCtx, cancel, req.GetTabletType(), stream, out)
+	r.startPump(loopCtx, cancel, req.GetTabletType(), stream, out)
 	return out, nil
 }
 
@@ -2260,8 +2294,38 @@ func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedE
 	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go r.pump(loopCtx, cancel, req.GetTabletType(), stream, out)
+	r.startPump(loopCtx, cancel, req.GetTabletType(), stream, out)
 	return out, nil
+}
+
+// startPump launches the event pump and records the done channel the join
+// path waits on. One helper for both launch sites (StreamChanges and Reopen)
+// so a future third site cannot forget the bookkeeping — the way the second
+// one already had.
+func (r *vstreamCDCReader) startPump(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	tabletType topodata.TabletType,
+	stream vtgateservice.Vitess_VStreamClient,
+	out chan ir.Change,
+) {
+	done := make(chan struct{})
+	r.pumpDone = done
+	go func() {
+		defer close(done)
+		r.pump(ctx, cancel, tabletType, stream, out)
+	}()
+}
+
+// joinPump waits for a previously-started pump to exit and clears the handle.
+// A no-op before the first StreamChanges and on a second call, which is what
+// keeps Close idempotent.
+func (r *vstreamCDCReader) joinPump() {
+	if r.pumpDone == nil {
+		return
+	}
+	<-r.pumpDone
+	r.pumpDone = nil
 }
 
 // applyReshardState mutates the reader to match the post-reshard
@@ -2281,10 +2345,20 @@ func (r *vstreamCDCReader) applyReshardState(resh *ShardLayoutChangedError) erro
 	// transition point between the old layout and the new, and
 	// holding two streams open against the same keyspace would
 	// confuse the position bookkeeping.
+	//
+	// And JOIN it before touching any of the state below. Cancelling is
+	// asynchronous, so without the join the old pump was still dispatching
+	// while this function replaced r.shards and r.currentVgtid — a straggling
+	// VGTID event would write the OLD layout's position over the new one and
+	// Reopen would build its request from it. The pump exits promptly (its
+	// sends select on ctx.Done, gRPC Recv unblocks on the same context), and
+	// pumpDone is nil in the unit tests that drive this function without a
+	// live client, so the join is a no-op there.
 	if r.streamerCancel != nil {
 		r.streamerCancel()
 		r.streamerCancel = nil
 	}
+	r.joinPump()
 
 	// Reset error state so the caller sees a clean slate after a
 	// successful reopen. The reshard error itself was already

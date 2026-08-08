@@ -191,6 +191,36 @@ This is *cleaner* than the MySQL binlog handoff (no `FLUSH TABLES WITH READ
 LOCK`; the slot's snapshot already is the boundary). Per-schema independent
 snapshots are explicitly **not** the model.
 
+**Correction, 2026-08-08 (invariant sweep).** The paragraph above was true and
+unchecked for its whole life — an environmental fact about PostgreSQL carrying
+a consistency guarantee, with no test and no preflight, which is the shape the
+premise-naming step exists to catch. It is now ground-truthed against a real
+server by `TestExportedSnapshotSpansEverySchema`
+(`internal/engines/postgres/snapshot_spans_schemas_integration_test.go`): three
+schemas each holding an identically-named table, a post-export write into
+*every* schema, and the assertion that the one pinned snapshot hides all three.
+Grading every schema is the point — a snapshot covering only the DSN's bound
+schema would still hide that schema's write.
+
+**And the paragraph was not the whole argument.** "One snapshot spans every
+schema" only yields a spanning *copy* if the reader that drains it qualifies
+each table by that table's own schema. The `ir.SnapshotImporter` readers minted
+for the ADR-0079 parallel cold start do **not** — they carry
+`qualifyBySchema=false` and the DSN's bound schema — so a spanning stream
+routed into that fast lane would read the default schema N times over. In the
+canonical multi-schema shape (the same table name in every tenant schema) that
+is not an error an operator would see: it is N copies of one schema's rows
+fanned into N target schemas, with CDC then delivering the real per-schema
+changes on top. The pipeline had the counter-argument written down at
+`runColdStartParallel` ("holds by construction today") and nothing asserting
+it. Two things now do: `TestSpanningSnapshotNeverReachesTheParallelColdStartLane`
+(`internal/pipeline`) derives the two lanes' call graph and fails if they meet,
+and the PG row reader refuses at the point of harm (`errSchemaEscape`,
+`row_reader.go`) rather than silently substituting its own schema. The refusal
+is what makes the structural argument non-load-bearing; it was mutation-proved
+against a real server, where removing it returned `public`'s row under
+`tenant_b`'s name.
+
 ## Phasing
 
 - **2a — Multi-schema `migrate` (snapshot).** PG `ir.DatabaseLister` (list

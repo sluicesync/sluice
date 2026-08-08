@@ -23,6 +23,20 @@ package blobcodec
 // the default there wrote a record that lied for gzip/none chains).
 // Restore still trusts the record; only the record's rebirth sniffs.
 //
+// Both halves of that are now held by tests rather than by this
+// paragraph (2026-08-08 invariant sweep — until then the claim was a
+// statement about CALL SITES with nothing enumerating them):
+// backup.TestChunkReaderCodecsAreThreadedFromTheRecord is a
+// fail-by-default roster over every production NewChunkReader /
+// NewChangeChunkReader call in the tree, keyed on the codec argument's
+// source text, refusing a literal outright; and
+// [TestChunkReader_DeclaredCodecMismatchIsLoud] grades the 3x3 of
+// written-codec x declared-codec, because the three arms do not share a
+// failure mechanism — gzip and zstd reject a bad magic header at
+// construction, while [nopCodecReadCloser] validates nothing and the
+// CodecNone arm's loudness was, until that test, an inference from
+// reading this file rather than an observation.
+//
 // zstd uses klauspost/compress/zstd at SpeedDefault and is the
 // v0.67.0+ default ([DefaultCodec]). Grounded in
 // docs/dev/notes/compression-benchmark.md's decode-inclusive evidence:
