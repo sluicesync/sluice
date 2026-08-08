@@ -1625,18 +1625,26 @@ func logUnknownTable(ctx context.Context, op, schema, table string) {
 	)
 }
 
-// isMissingTableErr returns true when err carries the Postgres
-// "relation does not exist" SQLSTATE 42P01. Used by the truncate
-// dispatch to recognise a stale-publication TRUNCATE without
-// taking a hard dependency on pgconn's error type.
+// isMissingTableErr reports whether err carries Postgres SQLSTATE 42P01
+// (undefined_table). The truncate dispatch uses it to recognise a
+// stale-publication TRUNCATE. It delegates to [isUndefinedTableErr], the
+// engine's one such classifier — which DOES take a dependency on pgconn's
+// error type, deliberately. (The previous doc here advertised the opposite,
+// "without taking a hard dependency on pgconn's error type", as a virtue; that
+// avoidance is precisely what forced the substring match below.)
+//
+// It used to match the substrings "42P01" OR "does not exist", which is the
+// audit-backlog C-1 defect in its most dangerous position: this site SWALLOWS
+// the error. "does not exist" is PostgreSQL's house phrasing for a family of
+// unrelated conditions, and the one that matters here is SQLSTATE 3D000 —
+// `FATAL: database "app" does not exist`, which a pooled *sql.DB can surface
+// from any statement after a re-dial. Under the old text match a TRUNCATE
+// against a vanished DATABASE was read as "the table is gone, skip it", logged
+// as a benign stale-publication event, and the stream continued as though the
+// truncate had happened. Two independent sweeps flagged this site on the same
+// day; it is the last one of its shape in this engine.
 func isMissingTableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	// SQLSTATE 42P01 = undefined_table. The text varies between
-	// pgx versions but the substring is stable.
-	msg := err.Error()
-	return strings.Contains(msg, "42P01") || strings.Contains(msg, "does not exist")
+	return isUndefinedTableErr(err)
 }
 
 // logZeroRowsAffected emits a debug-level log line when a target Exec

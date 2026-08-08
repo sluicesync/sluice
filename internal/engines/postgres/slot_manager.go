@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -37,7 +39,11 @@ func (m *SlotManager) Close() error {
 // errSlotNotFound is the sentinel returned by Drop when the named
 // slot doesn't exist. The CLI's `--if-exists` mode branches on
 // errors.Is(err, errSlotNotFound) to swallow that case quietly.
-var errSlotNotFound = errors.New("postgres: slot not found")
+//
+// It wraps [ir.ErrSlotNotFound] so engine-neutral callers — `sluice sync
+// decommission` in internal/pipeline, which cannot import this package — can
+// reach the same classification without matching the error text.
+var errSlotNotFound = fmt.Errorf("postgres: %w", ir.ErrSlotNotFound)
 
 // List returns every replication slot visible via pg_replication_slots
 // to the connecting role. Sorted by name for stable CLI output.
@@ -131,13 +137,26 @@ func (m *SlotManager) Drop(ctx context.Context, name string, force bool) error {
 	}
 	if active && !force {
 		return fmt.Errorf(
-			"postgres: drop slot %q: slot is active (a CDC consumer is currently connected); pass --force to drop anyway. The connected consumer will fail with a clear error and can be restarted",
-			name,
+			"postgres: drop slot %q: %w (a CDC consumer is currently connected); pass --force to drop anyway. The connected consumer will fail with a clear error and can be restarted",
+			name, ir.ErrSlotActive,
 		)
 	}
 
 	const q = `SELECT pg_drop_replication_slot($1)`
 	if _, err := m.db.ExecContext(ctx, q, name); err != nil {
+		// The pre-check above saw the slot, so reaching here with
+		// undefined_object means it was removed underneath us between
+		// the two round-trips — the caller's goal state, not a failure.
+		// SQLSTATE 55006 is the same race for the active flag.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "42704":
+				return fmt.Errorf("postgres: drop slot %q: %w", name, ir.ErrSlotNotFound)
+			case "55006":
+				return ir.WithMarker(fmt.Errorf("postgres: drop slot %q: %w", name, err), ir.ErrSlotActive)
+			}
+		}
 		return fmt.Errorf("postgres: drop slot %q: %w", name, err)
 	}
 	return nil

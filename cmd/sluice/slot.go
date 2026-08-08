@@ -381,13 +381,19 @@ func confirmTypedDestructive(ctx context.Context, in io.Reader, out io.Writer, p
 	}
 }
 
-// isSlotNotFoundErr returns true if err wraps a slot-not-found
-// signal from any engine. Today only Postgres exposes the error;
-// the helper string-matches the wrapped engine error rather than
-// import an engine-package sentinel (which would couple cmd/ to a
-// specific engine).
+// isSlotNotFoundErr returns true if err wraps [ir.ErrSlotNotFound], the
+// engine-neutral slot-not-found marker.
+//
+// It used to match the substring "slot not found", with the stated reason that
+// importing an engine-package sentinel "would couple cmd/ to a specific
+// engine". That reason was sound and the conclusion is now obsolete: the marker
+// lives in the [ir.SlotManager] contract, which this package already imports,
+// so the classification is both engine-neutral AND structural (audit backlog
+// C-1). This site is the mildest of the three the text match reached — it only
+// gates a did-you-mean hint on an already-failing path — but it is the same
+// class, and leaving it is how a class reopens.
 func isSlotNotFoundErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "slot not found")
+	return errors.Is(err, ir.ErrSlotNotFound)
 }
 
 // walStatusOrDash renders an empty wal_status as a dash so the

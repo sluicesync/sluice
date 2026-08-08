@@ -136,14 +136,19 @@ func TestSlotDropProceedsWithYes(t *testing.T) {
 	}
 }
 
-// errFakeSlotNotFound stands in for the postgres manager's
-// errSlotNotFound sentinel (unexported there, and cmd/ deliberately
-// doesn't import an engine package). Copied verbatim from
-// slot_manager.go — both the sentinel text and the `%w: %q` wrapping
-// below — so the prose these tests pin is the prose an operator sees,
-// and so the fake trips isSlotNotFoundErr exactly the way the real
-// path does.
-var errFakeSlotNotFound = errors.New("postgres: slot not found")
+// errFakeSlotNotFound stands in for the postgres manager's errSlotNotFound
+// sentinel (unexported there, and cmd/ deliberately doesn't import an engine
+// package). It mirrors slot_manager.go: the operator-facing prose these tests
+// pin, wrapping the engine-neutral [ir.ErrSlotNotFound] marker that
+// isSlotNotFoundErr actually classifies on.
+//
+// The claim this comment used to make — that copying the sentinel TEXT made the
+// fake "trip isSlotNotFoundErr exactly the way the real path does" — is the
+// trap: a fake and a classifier agreeing on a string prove only that the test
+// author wrote the same string twice. What binds this fake to reality is
+// TestSlotManager_DropMissing in the postgres package, which asserts a real
+// server's Drop wraps the same marker (audit backlog C-1).
+var errFakeSlotNotFound = fmt.Errorf("postgres: %w", ir.ErrSlotNotFound)
 
 // fakeSlotManager is an in-memory [ir.SlotManager] for the `slot drop`
 // did-you-mean tests. Drop mirrors the Postgres manager's contract: an
@@ -462,8 +467,14 @@ func TestIsSlotNotFoundErr(t *testing.T) {
 	if isSlotNotFoundErr(nil) {
 		t.Error("nil error should not be slot-not-found")
 	}
-	if !isSlotNotFoundErr(fmt.Errorf("postgres: slot not found: %q", "x")) {
+	if !isSlotNotFoundErr(fmt.Errorf("postgres: drop slot %q: %w", "x", errFakeSlotNotFound)) {
 		t.Error("wrapped slot-not-found should match")
+	}
+	// The direction that matters: PostgreSQL says "does not exist" for a whole
+	// family of conditions, and the substring form this replaced classified
+	// every one of them as a missing slot.
+	if isSlotNotFoundErr(errors.New(`drop slot "s": database "app" does not exist (SQLSTATE 3D000)`)) {
+		t.Error("a vanished DATABASE must not classify as a missing slot")
 	}
 	if isSlotNotFoundErr(errors.New("permission denied")) {
 		t.Error("unrelated error should not match")

@@ -10,6 +10,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -124,6 +125,51 @@ func TestSlotManager_DropMissing(t *testing.T) {
 	}
 	if !errors.Is(err, errSlotNotFound) {
 		t.Errorf("error should wrap errSlotNotFound; got %v", err)
+	}
+	// The engine-neutral half, and the reason this assertion is here rather
+	// than only in internal/pipeline: `sluice sync decommission` classifies a
+	// slot-already-gone drop with errors.Is(err, ir.ErrSlotNotFound) and
+	// SWALLOWS it (reports the slot absent). Its own unit stubs necessarily
+	// fabricate the error they classify, so they can only prove the classifier
+	// agrees with the stub. THIS is the binding that a real Postgres, through
+	// the real SlotManager, produces the marker those stubs imitate — without
+	// it the pipeline pins are satisfied by construction (audit backlog C-1).
+	if !errors.Is(err, ir.ErrSlotNotFound) {
+		t.Errorf("error should also wrap ir.ErrSlotNotFound for engine-neutral callers; got %v", err)
+	}
+}
+
+// TestSlotManager_DropActiveWrapsTheNeutralMarker is the [ir.ErrSlotActive] half
+// of the binding above, against a real slot with a live consumer attached.
+//
+// The decommission path retries for the whole wall-clock budget on this shape
+// and then emits a coded refusal, so a marker the engine never sets would turn
+// a live-consumer refusal into a generic error — and, before the markers
+// existed, the classifier matched the substring "is active", which any
+// unrelated message could carry.
+func TestSlotManager_DropActiveWrapsTheNeutralMarker(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+
+	mgr := openSlotManagerForTest(t, dsn)
+	defer func() { _ = mgr.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const slot = "sluice_active_marker"
+	stop := createActiveSlotForTest(t, dsn, slot)
+	defer stop()
+
+	err := mgr.Drop(ctx, slot, false)
+	if err == nil {
+		t.Fatal("expected a refusal dropping a slot with a live consumer")
+	}
+	if !errors.Is(err, ir.ErrSlotActive) {
+		t.Errorf("error should wrap ir.ErrSlotActive; got %v", err)
+	}
+	if errors.Is(err, ir.ErrSlotNotFound) {
+		t.Errorf("an active slot must not classify as absent; got %v", err)
 	}
 }
 
@@ -350,3 +396,76 @@ func openSlotManagerForTest(t *testing.T, dsn string) ir.SlotManager {
 // exported wrapping behaviour. fmt.Errorf %w-wraps it so the
 // integration test above just checks the wrapping works end-to-end.
 var _ = fmt.Errorf
+
+// createActiveSlotForTest creates a logical slot and leaves a real walsender
+// attached to it, so pg_replication_slots.active is genuinely true — the state
+// the drop refusal is about. Returns a stop func that releases the consumer.
+//
+// The slot only reports active while a START_REPLICATION is in flight; merely
+// creating it on a replication connection is not enough, since the server
+// releases the slot as soon as CREATE_REPLICATION_SLOT returns.
+func createActiveSlotForTest(t *testing.T, dsn, slotName string) func() {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const pub = "sluice_active_marker_pub"
+	adminConn, err := openReplicationConn(ctx, dsn, "-")
+	if err != nil {
+		t.Fatalf("createActiveSlotForTest: open conn: %v", err)
+	}
+	if _, err := pglogrepl.CreateReplicationSlot(ctx, adminConn, slotName, "pgoutput",
+		pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication}); err != nil {
+		_ = adminConn.Close(context.Background())
+		t.Fatalf("createActiveSlotForTest: CreateReplicationSlot: %v", err)
+	}
+	_ = adminConn.Close(context.Background())
+
+	applyPGSQL(t, dsn, "CREATE PUBLICATION "+pub+" FOR ALL TABLES")
+
+	streamConn, err := openReplicationConn(context.Background(), dsn, "-")
+	if err != nil {
+		t.Fatalf("createActiveSlotForTest: open streaming conn: %v", err)
+	}
+	if err := pglogrepl.StartReplication(context.Background(), streamConn, slotName, 0,
+		pglogrepl.StartReplicationOptions{PluginArgs: []string{
+			"proto_version '2'",
+			fmt.Sprintf("publication_names '%s'", pub),
+		}}); err != nil {
+		_ = streamConn.Close(context.Background())
+		t.Fatalf("createActiveSlotForTest: START_REPLICATION: %v", err)
+	}
+
+	// The walsender marks the slot active asynchronously; wait for the server
+	// to agree rather than assuming it, so the assertion under test is about
+	// the refusal and not about a race.
+	waitForSlotActive(t, dsn, slotName)
+
+	return func() { _ = streamConn.Close(context.Background()) }
+}
+
+// waitForSlotActive is the inverse of waitForSlotInactive: poll until the
+// server itself reports the slot active, so a test asserting the active-slot
+// refusal is not racing the walsender's own bookkeeping.
+func waitForSlotActive(t *testing.T, dsn, slotName string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("waitForSlotActive: open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var active bool
+		err := db.QueryRow(`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&active)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("waitForSlotActive: query: %v", err)
+		}
+		if err == nil && active {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("waitForSlotActive: slot %q never became active", slotName)
+}

@@ -38,7 +38,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -302,27 +301,31 @@ func dropSlotWithActiveRetry(ctx context.Context, slots ir.SlotManager, name str
 	}
 }
 
-// isSlotActiveShapeErr reports whether err is the active-slot refusal
-// from any engine: the manager's own pre-check wording ("slot ... is
-// active") or Postgres's SQLSTATE 55006 from pg_drop_replication_slot
-// racing a not-yet-reaped walsender. String-matched rather than typed
-// so this package stays engine-neutral — the same precedent as the
-// CLI's isSlotNotFoundErr.
+// isSlotActiveShapeErr reports whether err carries [ir.ErrSlotActive] — the
+// manager's own pre-check refusal, or SQLSTATE 55006 from a drop racing a
+// not-yet-reaped walsender, both of which the engine now marks.
+//
+// Previously substring-matched on "55006" OR "is active" to keep this package
+// engine-neutral. Naming the marker in [ir.SlotManager]'s contract buys the
+// same neutrality without the text dependence; a false positive here spends the
+// whole [decommissionSlotReleaseBudget] retrying and then reports a live
+// consumer that was never there.
 func isSlotActiveShapeErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "55006") || strings.Contains(msg, "is active")
+	return errors.Is(err, ir.ErrSlotActive)
 }
 
-// isSlotGoneShapeErr reports whether err is the slot-not-found shape
-// (the manager's sentinel wording, or PG's "does not exist") — the
+// isSlotGoneShapeErr reports whether err carries [ir.ErrSlotNotFound] — the
 // goal state for a drop, so idempotent re-runs treat it as success.
+//
+// This is a SWALLOW: a true answer sets rep.SlotAlreadyAbsent, telling the
+// operator the slot is gone. It used to match the substrings "slot not found"
+// OR "does not exist", because the marker was package-private to the postgres
+// engine and this package cannot import it. That reached far past its intent —
+// [ir.SlotManager] implementations wrap every failure with the slot name, so
+// `drop slot "s": database "app" does not exist` (SQLSTATE 3D000, from a pooled
+// *sql.DB re-dial) classified as already-absent while the slot survived and
+// kept pinning WAL on the source. The fix was to name the marker in the
+// contract rather than to add another token to the match (audit backlog C-1).
 func isSlotGoneShapeErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "slot not found") || strings.Contains(msg, "does not exist")
+	return errors.Is(err, ir.ErrSlotNotFound)
 }

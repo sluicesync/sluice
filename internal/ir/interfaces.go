@@ -2984,9 +2984,10 @@ type SlotManager interface {
 	List(ctx context.Context) ([]SlotInfo, error)
 
 	// Drop removes the named slot. Returns an error wrapping
-	// [sql.ErrNoRows] (or an engine-specific marker) when the slot
-	// does not exist; callers can branch on that to honor a
-	// `--if-exists` mode.
+	// [ErrSlotNotFound] when the slot does not exist and one wrapping
+	// [ErrSlotActive] when it refuses a live consumer; callers branch on
+	// those with [errors.Is] to honor a `--if-exists` mode or to retry.
+	// Classify structurally — never by matching the error text.
 	//
 	// Drop refuses to remove an active slot — an in-flight CDC
 	// consumer is connected to it and yanking the slot would crash
@@ -2997,6 +2998,28 @@ type SlotManager interface {
 	// Close releases the underlying connection pool.
 	Close() error
 }
+
+// ErrSlotNotFound is the marker [SlotManager.Drop] wraps when the named slot is
+// not there — whether the pre-check found no row or the drop itself lost a race
+// with a manual removal. It is the GOAL state for a drop, so callers honoring an
+// `--if-exists` / idempotent intent branch on it with [errors.Is].
+//
+// It exists at the IR layer because the contract below used to promise only "an
+// engine-specific marker", which no engine-neutral caller can reach.
+// `internal/pipeline`'s decommission step consequently classified this case by
+// matching the substrings "slot not found" OR "does not exist" against the
+// error text — and since Drop wraps every failure as `drop slot %q: %w`, a slot
+// whose DATABASE had vanished (SQLSTATE 3D000, which a pooled *sql.DB surfaces
+// after a re-dial) read as "already absent". The decommission report then said
+// the slot was gone while it survived, still pinning WAL on the source, which is
+// the leak the command exists to prevent (audit backlog C-1).
+var ErrSlotNotFound = errors.New("slot not found")
+
+// ErrSlotActive is the marker [SlotManager.Drop] wraps when it refuses because a
+// consumer is connected. Same rationale as [ErrSlotNotFound]: callers retry or
+// refuse on this shape, and text matching cannot distinguish it from an
+// unrelated error whose message happens to contain "is active".
+var ErrSlotActive = errors.New("slot is active")
 
 // SlotManagerOpener is the optional interface engines implement to
 // expose slot management to the CLI. The CLI checks for this method

@@ -485,7 +485,18 @@ func listStreamsLegacy(ctx context.Context, db *sql.DB, schema, engineName strin
 // does not exist" / SQLSTATE 42703 — the surface an upgraded binary's
 // widened SELECT hits against a control table created by a previous
 // release. Structural first (the driver's own PgError code), with a
-// string fallback for wrapped shapes that lost the type.
+// string fallback for wrapped shapes that lost the type — an error flattened
+// with %v instead of %w keeps pgx's rendered "(SQLSTATE 42703)" tail but not
+// the *pgconn.PgError.
+//
+// The fallback matches that full rendered form, not a bare "42703". This is the
+// only text-matching error classifier left in the engine (audit backlog C-1);
+// it survives the sweep because the structural check runs FIRST and the text is
+// only a recovery for a type that was already destroyed. Anchoring on "SQLSTATE
+// 42703" removes the one way it could still misfire: a message that happens to
+// quote those five digits — a column, identifier, or row value — is not a
+// missing column, and reading it as one silently degrades the control-table
+// SELECT to its narrow legacy form and masks the real error.
 func isUndefinedColumnErr(err error) bool {
 	if err == nil {
 		return false
@@ -494,7 +505,7 @@ func isUndefinedColumnErr(err error) bool {
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == "42703"
 	}
-	return strings.Contains(err.Error(), "42703")
+	return strings.Contains(err.Error(), "SQLSTATE 42703")
 }
 
 // writePositionTx upserts the (streamID, token, slotName) row inside

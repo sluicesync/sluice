@@ -9,8 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
@@ -359,16 +360,28 @@ func anchorSlotExistsErr(anchorSlot string, persistChainSlot bool) error {
 	)
 }
 
-// isSlotAlreadyGoneErr reports whether err is a "slot does not exist"
-// error from pg_drop_replication_slot. The drop call uses an
-// idempotent intent — finding the slot already gone (manual drop,
-// automatic cleanup on connection drop, etc.) is success, not failure.
+// isSlotAlreadyGoneErr reports whether err is the "slot does not exist"
+// answer from pg_drop_replication_slot — SQLSTATE 42704, undefined_object.
+// The drop call uses an idempotent intent, so finding the slot already gone
+// (manual drop, automatic cleanup on connection drop, etc.) is success.
+//
+// It matches on the SQLSTATE, never the text. The text form —
+// `strings.Contains(msg, "does not exist")`, unqualified — is the audit-backlog
+// C-1 shape, and this is a SWALLOW site: both callers treat a true answer as
+// "nothing to clean up". "does not exist" is PostgreSQL's house phrasing for a
+// whole family of conditions, so the unqualified match read
+// `database "app" does not exist` (3D000, which a pooled *sql.DB surfaces after
+// a re-dial) and `function pg_drop_replication_slot(unknown) does not exist`
+// (42883, an under-privileged or pre-9.4 server) as "the slot is already gone".
+// Both are the leak direction: the slot survives, keeps pinning WAL on the
+// SOURCE, and the operator is told cleanup succeeded. A leaked anchor slot is
+// exactly the failure whose warning the caller above suppresses.
 func isSlotAlreadyGoneErr(err error) bool {
-	if err == nil {
-		return false
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42704"
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "does not exist")
+	return false
 }
 
 // avoid an unused-import warning when sql is referenced indirectly.

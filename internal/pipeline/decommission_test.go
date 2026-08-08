@@ -14,6 +14,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -236,7 +237,7 @@ func TestDecommission_SlotDropRetriesActiveShape(t *testing.T) {
 	}
 	slots := &decomSlotMgr{
 		slots:    []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
-		dropErrs: []error{errors.New(`postgres: drop slot "sluice_wave_a": replication slot "sluice_wave_a" is active for PID 42 (SQLSTATE 55006)`)},
+		dropErrs: []error{fmt.Errorf(`postgres: drop slot "sluice_wave_a": replication slot "sluice_wave_a" is active for PID 42 (SQLSTATE 55006): %w`, ir.ErrSlotActive)},
 		pubOut:   ir.PublicationDropSkippedShared,
 		order:    &order,
 	}
@@ -264,7 +265,7 @@ func TestDecommission_SlotHeldPastBudgetRefusesCoded(t *testing.T) {
 		streams: []ir.StreamStatus{decomRow("wave-a", "sluice_wave_a", "sluice_wave_a")},
 		order:   &order,
 	}
-	active := errors.New(`postgres: drop slot "sluice_wave_a": slot is active (a CDC consumer is currently connected); pass --force to drop anyway`)
+	active := fmt.Errorf(`postgres: drop slot "sluice_wave_a": slot is active (a CDC consumer is currently connected); pass --force to drop anyway: %w`, ir.ErrSlotActive)
 	slots := &decomSlotMgr{
 		slots:      []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
 		stickyDrop: active, // held active through the whole wall-clock budget
@@ -398,7 +399,7 @@ func TestDecommission_DropRaceSlotGoneIsSuccess(t *testing.T) {
 	}
 	slots := &decomSlotMgr{
 		slots:    []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
-		dropErrs: []error{errors.New(`postgres: slot not found: "sluice_wave_a"`)},
+		dropErrs: []error{fmt.Errorf(`postgres: slot not found: "sluice_wave_a": %w`, ir.ErrSlotNotFound)},
 		pubOut:   ir.PublicationDropSkippedShared,
 	}
 
@@ -411,6 +412,39 @@ func TestDecommission_DropRaceSlotGoneIsSuccess(t *testing.T) {
 	}
 	if !rep.ControlRowCleared {
 		t.Error("row must still clear")
+	}
+}
+
+// TestDecommission_VanishedDatabaseIsNotASlotAlreadyGone is the negative half
+// of the test above, and the one the substring form could not pass.
+//
+// A drop that fails because the whole DATABASE is gone (SQLSTATE 3D000, which a
+// pooled *sql.DB surfaces after a re-dial) renders as `... does not exist` — the
+// text the classifier used to match. Under that form the report said the slot
+// was already absent and the control row cleared, so the slot survived, kept
+// pinning WAL on the source, and the record of its NAME was destroyed: the
+// operator is left with a leak and nothing to find it by. Nothing else in this
+// file fails if the classifier goes back to matching text, because every other
+// case here carries wording the substring also matched (audit backlog C-1).
+func TestDecommission_VanishedDatabaseIsNotASlotAlreadyGone(t *testing.T) {
+	applier := &decomApplier{
+		streams: []ir.StreamStatus{decomRow("wave-a", "sluice_wave_a", "")},
+	}
+	slots := &decomSlotMgr{
+		slots:      []ir.SlotInfo{{Name: "sluice_wave_a", Active: false}},
+		stickyDrop: errors.New(`postgres: drop slot "sluice_wave_a": database "app" does not exist (SQLSTATE 3D000)`),
+		pubOut:     ir.PublicationDropSkippedShared,
+	}
+
+	rep, err := DecommissionStream(context.Background(), applier, slots, "wave-a", false)
+	if err == nil {
+		t.Fatal("a drop that failed for an unrelated reason must surface, not report the slot absent")
+	}
+	if rep != nil && rep.SlotAlreadyAbsent {
+		t.Error("a vanished DATABASE must not be classified as a slot that is already gone")
+	}
+	if rep != nil && rep.ControlRowCleared {
+		t.Error("the control row records the slot name; clearing it here strands an unfindable leak")
 	}
 }
 

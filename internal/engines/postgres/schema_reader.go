@@ -998,21 +998,27 @@ func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]
 	return out, rows.Err()
 }
 
-// isUndefinedRelationErr returns true when err looks like Postgres's
-// "relation X does not exist" / SQLSTATE 42P01. The schema reader's
-// PostGIS lookup uses this to degrade gracefully when the extension
-// isn't installed.
+// isUndefinedRelationErr reports whether err carries SQLSTATE 42P01
+// (undefined_table) — "that relation is not there".
+//
+// Scope: this is NOT just the PostGIS lookup, which is what the doc here used
+// to say. It gates graceful degradation at six sites — the two PostGIS catalog
+// reads below, the change applier's relation probe, and (as the
+// `IsMissingTable` hook) the control-table and migration-state existence
+// checks. Those last two decide whether sluice creates its own state table, so
+// a false positive there is not cosmetic.
+//
+// It matches the SQLSTATE. The previous form required the text "does not exist"
+// AND one of {geometry_columns, geography_columns, 42P01}. That conjunction is
+// why this site was never actually exploitable — the SQLSTATE disjunct carried
+// every real case, and `database "app" does not exist` (3D000) failed the
+// second clause — but it left the classifier's correctness resting on a
+// coincidence of wording, and the two catalog-name disjuncts were dead: a
+// message naming geometry_columns and saying "does not exist" is a 42P01
+// anyway. Dropping the text costs nothing measurable and removes the last
+// text-dependent classifier in this engine (audit backlog C-1).
 func isUndefinedRelationErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// Postgres surfaces this through pgx as a string starting with
-	// "ERROR: relation \"...\" does not exist (SQLSTATE 42P01)".
-	return strings.Contains(msg, "does not exist") &&
-		(strings.Contains(msg, "geometry_columns") ||
-			strings.Contains(msg, "geography_columns") ||
-			strings.Contains(msg, "42P01"))
+	return isUndefinedTableErr(err)
 }
 
 // populateColumns fills in Column lists for each table.

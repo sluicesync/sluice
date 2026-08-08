@@ -86,3 +86,60 @@ func TestIsUndefinedTableErr_ClassifiesOnTheSQLSTATENotTheText(t *testing.T) {
 		})
 	}
 }
+
+// TestIsMissingTableErr_TheTruncateSwallowGateUsesTheSameClassification pins the
+// SITE, not just the classifier above.
+//
+// isMissingTableErr gates two `return nil`s — change_applier.go's truncate
+// dispatch and the pipelined batch's "truncate" arm. Both SWALLOW the error and
+// log a benign stale-publication skip, which makes a false positive here
+// strictly worse than one at the read-side probe: the TRUNCATE did not happen,
+// the applier reports success, and the stream advances past it.
+//
+// The expectations are the same real-`postgres:16` (code, message) pairs used
+// above, so this is not `isMissingTableErr` compared against `isUndefinedTableErr`
+// — it is the swallow gate compared against a server's answers. 3D000 is the row
+// that carries the test: it renders the same English phrase and, under the
+// substring match this replaced, a TRUNCATE issued against a vanished DATABASE
+// was silently accepted as a completed truncate.
+func TestIsMissingTableErr_TheTruncateSwallowGateUsesTheSameClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "42P01 undefined_table — the only swallowable shape",
+			err:  &pgconn.PgError{Code: "42P01", Message: `relation "app.orders" does not exist`},
+			want: true,
+		},
+		{
+			name: "3D000 database gone — must NOT be swallowed as a skipped truncate",
+			err:  &pgconn.PgError{Code: "3D000", Message: `database "app" does not exist`},
+			want: false,
+		},
+		{
+			name: "42883 missing function",
+			err:  &pgconn.PgError{Code: "42883", Message: `function now(unknown) does not exist`},
+			want: false,
+		},
+		{
+			name: "42501 permission denied — a refused truncate is not a missing table",
+			err:  &pgconn.PgError{Code: "42501", Message: "permission denied for table orders"},
+			want: false,
+		},
+		{
+			name: "bare text with the phrase and no SQLSTATE",
+			err:  errors.New(`relation "app.orders" does not exist`),
+			want: false,
+		},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isMissingTableErr(tc.err); got != tc.want {
+				t.Errorf("isMissingTableErr(%v) = %v; want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
