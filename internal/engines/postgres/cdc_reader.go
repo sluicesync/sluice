@@ -1079,6 +1079,9 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err
 		}
@@ -1114,6 +1117,9 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
@@ -2027,7 +2033,13 @@ func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOI
 		if err != nil {
 			switch {
 			case geomOID != 0 && c.DataType == geomOID:
-				t = ir.Geometry{}
+				// SRID starts UNKNOWN, not 0. pgoutput carries no SRID, and 0
+				// is a real declared value (an unconstrained column), so a
+				// bare ir.Geometry{} would assert "this column declares 0"
+				// about something never read — which refuses every row of a
+				// geometry(Point,4326) column. [CDCReader.resolveGeometryColumnSRIDs]
+				// fills in the catalog's answer right after this returns.
+				t = ir.Geometry{SRID: ir.GeometrySRIDUnknown}
 			case enumOIDs[c.DataType]:
 				t = ir.Enum{}
 			default:

@@ -39,6 +39,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -233,5 +234,104 @@ func TestCDCReader_PostGIS_GeometryFamily(t *testing.T) {
 	}
 	if w := asText("nopk.del.before.g", nopkDel.Before["g"]); w != "POINT(7 8)" {
 		t.Errorf("nopk.del.before.g = %q; want POINT(7 8) (geometry in a FULL before-image must decode)", w)
+	}
+}
+
+// TestCDCReader_PostGIS_UnconstrainedColumnPerRowSRIDStillRefuses is the
+// anti-vacuity half of the SRID work, and the reason it is a separate test.
+//
+// The C-14 per-row-SRID check first shipped to this lane comparing against a
+// bare `ir.Geometry{}` — an SRID of 0 that had never been read — so it refused
+// every row of every `geometry(Point,4326)` column and wedged the stream.
+// [CDCReader.resolveGeometryColumnSRIDs] fixes that by reading the declared
+// SRID from geometry_columns, and TestCDCReader_PostGIS_GeometryFamily above
+// now passes.
+//
+// But that test passing is EQUALLY CONSISTENT with the check having been
+// switched off on this lane: if the resolver never resolved anything, every
+// column would sit at [ir.GeometrySRIDUnknown] and nothing would ever refuse.
+// A green family test cannot tell the two apart, which is precisely the
+// evidence-sharing trap — so this test supplies the independent signal by
+// exercising the one shape that MUST still refuse.
+//
+// The shape is an unconstrained `geometry` column (PostGIS reports srid 0 for
+// it and accepts a different SRID per row) holding a row written at 4326. That
+// value decodes to bare WKB and would be re-framed with the column's 0, landing
+// valid geometry that no longer names a place — silent, at exit code 0. The
+// refusal firing here proves the resolver really read `srid = 0` from the
+// catalog, because an unresolved column would have stayed silent.
+func TestCDCReader_PostGIS_UnconstrainedColumnPerRowSRIDStillRefuses(t *testing.T) {
+	dsn, cleanup := startPostgresForCDCImage(t, pipelinedPostGISImage)
+	defer cleanup()
+
+	applyPGSQL(t, dsn, `CREATE EXTENSION IF NOT EXISTS postgis;`)
+	applyPGSQL(t, dsn, `
+		CREATE TABLE geo_loose (
+			id BIGINT PRIMARY KEY,
+			g  geometry
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	applyPGSQL(t, dsn, `INSERT INTO geo_loose VALUES (1, ST_GeomFromText('POINT(1 2)',4326));`)
+
+	// The stream must NOT deliver this row. Drain briefly with a short
+	// budget; a refusal shows up as the stream erroring rather than as a
+	// change, so the assertion is on the error, not on a timeout alone.
+	deadline := time.Now().Add(30 * time.Second)
+	var streamErr error
+	for time.Now().Before(deadline) {
+		if cdcRdr, ok := rdr.(*CDCReader); ok {
+			if e := cdcRdr.Err(); e != nil {
+				streamErr = e
+				break
+			}
+		}
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				if cdcRdr, ok := rdr.(*CDCReader); ok {
+					streamErr = cdcRdr.Err()
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			// Tx boundaries and schema snapshots are infra, not DML; the
+			// refusal is about the ROW never landing.
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit, ir.SchemaSnapshot:
+				continue
+			}
+			t.Fatalf("a per-row SRID mismatch on an unconstrained column was APPLIED, not refused: %+v — "+
+				"the C-14 guard is inert on the CDC lane, which is exactly what a green family test cannot see", c)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	if streamErr == nil {
+		t.Fatal("expected the stream to refuse a per-row SRID mismatch on an unconstrained geometry column; " +
+			"got neither a change nor an error, so the guard did not fire and the resolver may not be resolving")
+	}
+	if !errors.Is(streamErr, ir.ErrGeometryRowSRIDMismatch) {
+		t.Errorf("stream error = %v; want one wrapping ir.ErrGeometryRowSRIDMismatch", streamErr)
 	}
 }

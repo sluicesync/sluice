@@ -49,6 +49,9 @@ var ErrGeometryRowSRIDMismatch = errors.New("row geometry carries an SRID the co
 // pair (0, 0), which is the overwhelmingly common "no spatial reference
 // declared anywhere" case and costs one comparison.
 func CheckGeometryRowSRID(columnSRID int, rowSRID uint32) error {
+	if columnSRID == GeometrySRIDUnknown {
+		return nil
+	}
 	if uint32(columnSRID) == rowSRID {
 		return nil
 	}
@@ -60,3 +63,26 @@ func CheckGeometryRowSRID(columnSRID int, rowSRID uint32) error {
 		ErrGeometryRowSRIDMismatch, rowSRID, columnSRID, columnSRID, rowSRID, rowSRID,
 	)
 }
+
+// GeometrySRIDUnknown is the columnSRID value meaning "nobody established what
+// this column declares", which DISABLES the check.
+//
+// It exists because 0 is a legitimate declared SRID — an unconstrained PostGIS
+// `geometry` column reports srid 0 — so the zero value cannot also carry
+// "unresolved". Reading one as the other is not hypothetical: the first cut of
+// this check ran on the Postgres CDC lane, where pgoutput's RelationMessage
+// carries no SRID and the relation cache projected a bare `ir.Geometry{}`. Every
+// row of every `geometry(Point,4326)` column then compared 4326 against a
+// column that had never been read, and the stream wedged on the first spatial
+// DML. The PostGIS integration job caught it; it never shipped.
+//
+// -1 is safe as the sentinel: SRIDs are non-negative, and PostGIS itself has
+// historically used -1 for "unknown".
+//
+// A caller that cannot establish the SRID passes this rather than 0, and
+// thereby accepts the pre-check behaviour for that column — a silent re-stamp
+// remains possible there. That is a deliberate, narrow trade against wedging a
+// stream over metadata that merely could not be READ; see
+// the postgres engine's resolveGeometryColumnSRIDs for where it is
+// taken and why.
+const GeometrySRIDUnknown = -1

@@ -333,7 +333,7 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		// pipeline rename intercept can prove rename-vs-drop+add. It is
 		// METADATA only — SchemaSignatureOf / diffAlteredColumn ignore it,
 		// so it does not perturb the decode contract or alter-detection.
-		cols[i] = &ir.Column{Name: c.Name, Type: c.Type, StableID: c.StableID}
+		cols[i] = &ir.Column{Name: c.Name, Type: containSRIDSentinel(c.Type), StableID: c.StableID}
 	}
 	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
 	// Bug 89: surface PK column names from the RelationMessage's
@@ -634,4 +634,23 @@ func temporalTypmod(typmod int32) (precision int, unspecified bool) {
 		return 0, true
 	}
 	return int(typmod), false
+}
+
+// containSRIDSentinel maps [ir.GeometrySRIDUnknown] back to 0 on its way OUT of
+// the relation cache.
+//
+// The sentinel exists for exactly one consumer — the value decoder, which must
+// tell "declares 0" from "never read" before refusing a row. Everything else
+// downstream of [projectRelation] treats ir.Geometry.SRID as a number to put in
+// DDL or to compare: schema-forward would emit `geometry(Point,-1)`, which is
+// not valid PostGIS. 0 is what this lane projected before the sentinel existed,
+// so restoring it here keeps every other consumer bit-identical and confines
+// the new value to the cache it was invented for.
+func containSRIDSentinel(t ir.Type) ir.Type {
+	g, ok := t.(ir.Geometry)
+	if !ok || g.SRID != ir.GeometrySRIDUnknown {
+		return t
+	}
+	g.SRID = 0
+	return g
 }
