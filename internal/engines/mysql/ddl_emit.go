@@ -1010,7 +1010,10 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 	// EXCLUDED here — it spells the SRID as the `REF_SYSTEM_ID=<n>` type
 	// attribute emitted in emitColumnType (before NOT NULL); MariaDB
 	// rejects the `SRID <n>` form (roadmap item 73 Phase 2).
-	if geom, ok := c.Type.(ir.Geometry); ok && geom.SRID != 0 && m.flavor != FlavorMariaDB {
+	// Storage type, not declared type (Bug 233): emitColumnType already
+	// downgrades a DOMAIN to its base, so a DOMAIN over `geometry(POINT,
+	// 4326)` emits a POINT column and must carry the same SRID clause.
+	if geom, ok := ir.UnwrapDomain(c.Type).(ir.Geometry); ok && geom.SRID != 0 && m.flavor != FlavorMariaDB {
 		fmt.Fprintf(&sb, " SRID %d", geom.SRID)
 	}
 	// DEFAULT and AUTO_INCREMENT are mutually exclusive with GENERATED
@@ -1150,7 +1153,12 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 	}
 	var autoColName string
 	for _, col := range table.Columns {
-		intT, ok := col.Type.(ir.Integer)
+		// Storage type, not declared type (Bug 233): emitColumnType
+		// downgrades a DOMAIN over an auto-increment integer and emits
+		// `BIGINT AUTO_INCREMENT`, so MySQL's "the auto column must be a
+		// key" rule (Error 1075) applies to it and the supporting index
+		// below has to be emitted for it too.
+		intT, ok := ir.UnwrapDomain(col.Type).(ir.Integer)
 		if !ok || !intT.AutoIncrement {
 			continue
 		}
@@ -1385,7 +1393,10 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	var domainCheckClauses []string
 	if inlineCheckSupported {
 		for _, col := range table.Columns {
-			dom, ok := col.Type.(ir.Domain)
+			// [ir.DomainOf], not [ir.UnwrapDomain]: this is one of the two
+			// consumers that is genuinely about the WRAPPER (its CHECKs)
+			// rather than about the storage the column lands in.
+			dom, ok := ir.DomainOf(col)
 			if !ok {
 				continue
 			}
@@ -2255,7 +2266,13 @@ func emitColumnList(cols []string) string {
 // the restriction is documented at
 // https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html.
 // ir.Array also maps because emitColumnType routes it to JSON.
+//
+// It asks the STORAGE type, not the declared one (Bug 233): a DOMAIN
+// over `text` emits a MySQL LONGTEXT column, and Error 1101 is MySQL's
+// rule about the COLUMN's type, so a `CREATE DOMAIN d AS text DEFAULT
+// 'x'` column had its DEFAULT emitted and the CREATE TABLE failed.
 func mysqlForbidsDefault(t ir.Type) bool {
+	t = ir.UnwrapDomain(t)
 	switch t.(type) {
 	case ir.JSON, ir.Text, ir.Blob, ir.Geometry, ir.Array:
 		return true

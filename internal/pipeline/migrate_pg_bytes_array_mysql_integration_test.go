@@ -80,14 +80,30 @@ import (
 // 2-D. Its dimensions are deliberately RAGGED across axes (1×2×2) so a
 // flatten or a transpose reads differently from the original at some
 // axis; a 2×2×2 would survive several wrong answers.
-const bytesArrayMySQLSeedDDL = `
+// bytesArrayMySQLSeedDDL is the bare-type spelling: the four value
+// columns declared as PG array types directly.
+var bytesArrayMySQLSeedDDL = bytesArrayMySQLSeedDDLFor("", "json[]", "jsonb[]", "bytea[]", "text[]")
+
+// bytesArrayMySQLSeedDDLFor builds the fixture with the four value
+// columns declared as the given SQL types, optionally preceded by a
+// prelude (CREATE DOMAIN statements, for the Bug 233 type-path
+// sibling). The ROWS are shared by construction rather than copied, so
+// the type-path variant cannot drift into testing different values than
+// the bare one — the two are meant to be the same fixture reached two
+// ways, and a copied INSERT block is how that stops being true.
+func bytesArrayMySQLSeedDDLFor(prelude, jType, bType, yType, tType string) string {
+	return prelude + fmt.Sprintf(`
 	CREATE TABLE bytesarr (
 		id INT PRIMARY KEY,
-		j  json[],
-		b  jsonb[],
-		y  bytea[],
-		t  text[]
+		j  %s,
+		b  %s,
+		y  %s,
+		t  %s
 	);
+`, jType, bType, yType, tType) + bytesArrayMySQLSeedRows
+}
+
+const bytesArrayMySQLSeedRows = `
 	INSERT INTO bytesarr VALUES
 		(1, ARRAY[$${"a":1}$$::json, $$[1,2]$$::json, $$"str"$$::json, $$42$$::json],
 		    ARRAY[$${"a":1}$$::jsonb, $$[1,2]$$::jsonb, $$"str"$$::jsonb, $$42$$::jsonb],

@@ -297,7 +297,10 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 			if c == nil {
 				continue
 			}
-			dom, ok := c.Type.(ir.Domain)
+			// [ir.DomainOf], not [ir.UnwrapDomain]: the WARN is about the
+			// wrapper's dropped CHECKs, not about the storage the column
+			// lands in — the other of the two identity consumers.
+			dom, ok := ir.DomainOf(c)
 			if !ok {
 				continue
 			}

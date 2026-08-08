@@ -814,12 +814,21 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	// the base type and recurse so every downstream branch
 	// (Set / JSON / Array / Time-stripping / scalar passthrough)
 	// reaches its existing case.
-	if dom, isDomain := t.(ir.Domain); isDomain {
-		if dom.BaseType == nil {
+	//
+	// The unwrap itself is [ir.UnwrapDomain] (Bug 233) — the same one
+	// every other MySQL landing decision now shares, so a nested domain
+	// and a nil BaseType behave identically here and in columnSetExpr
+	// rather than by each site's own reading. A malformed nil-BaseType
+	// domain is still returned unchanged: UnwrapDomain hands the wrapper
+	// back, no arm below matches it, and the value passes through as it
+	// did before.
+	if _, isDomain := t.(ir.Domain); isDomain {
+		base := ir.UnwrapDomain(t)
+		if _, stillDomain := base.(ir.Domain); stillDomain {
 			return v, nil
 		}
 		baseCol := *col
-		baseCol.Type = dom.BaseType
+		baseCol.Type = base
 		return prepareValue(v, &baseCol)
 	}
 	if _, isSet := t.(ir.Set); isSet {
@@ -1231,11 +1240,7 @@ func columnIsNativelyBinary(col *ir.Column) bool {
 	if col == nil || col.SourceColumnType == nil {
 		return true
 	}
-	src := col.SourceColumnType
-	if dom, isDomain := src.(ir.Domain); isDomain && dom.BaseType != nil {
-		src = dom.BaseType
-	}
-	switch src.(type) {
+	switch ir.UnwrapDomain(col.SourceColumnType).(type) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return true
 	}
@@ -1590,6 +1595,16 @@ func marshalArrayLeaves(v []any, col *ir.Column) (converted any, recognized bool
 // value — the PG reader's Bug-68 contract — so one element type
 // describes every depth, which is what lets
 // [normalizeArrayLeavesForJSON] recurse with a single type.
+//
+// BOTH spellings are read through [ir.UnwrapDomain] (Bug 233): a PG
+// `CREATE DOMAIN d AS json[]` column declares an [ir.Domain] whose base
+// is the array, on either field, and "is this an array" is a question
+// about storage — the DOMAIN wrapper does not change the answer. Today
+// [prepareValue] unwraps before it reaches here, so no production lane
+// arrives with a wrapped Type; the unwrap is here because the answer
+// must not depend on which caller asked, and because the SourceColumnType
+// spelling has no such upstream unwrap at all.
+//
 // columnIsArrayLike reports whether a column is, or started life as, an
 // [ir.Array]. It is [arrayElementType]'s question minus the element:
 // `ir.Array{}` with a nil Element is still an array, and the `{}`
@@ -1598,10 +1613,10 @@ func columnIsArrayLike(col *ir.Column) bool {
 	if col == nil {
 		return false
 	}
-	if _, ok := col.Type.(ir.Array); ok {
+	if _, ok := ir.UnwrapDomain(col.Type).(ir.Array); ok {
 		return true
 	}
-	_, ok := col.SourceColumnType.(ir.Array)
+	_, ok := ir.UnwrapDomain(col.SourceColumnType).(ir.Array)
 	return ok
 }
 
@@ -1609,10 +1624,10 @@ func arrayElementType(col *ir.Column) ir.Type {
 	if col == nil {
 		return nil
 	}
-	if arr, ok := col.Type.(ir.Array); ok {
+	if arr, ok := ir.UnwrapDomain(col.Type).(ir.Array); ok {
 		return arr.Element
 	}
-	if arr, ok := col.SourceColumnType.(ir.Array); ok {
+	if arr, ok := ir.UnwrapDomain(col.SourceColumnType).(ir.Array); ok {
 		return arr.Element
 	}
 	return nil

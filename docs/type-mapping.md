@@ -387,6 +387,15 @@ A second, wider distinction rides alongside `ConstraintBacked`: whether an index
 
 MySQL `ENUM` is roughly equivalent in shape but is not a separate type — it is a column-level definition. The translator produces a column-level `ENUM(...)`. If the Postgres enum is used by multiple columns, each column gets its own MySQL `ENUM` declaration (no shared type).
 
+### Postgres DOMAIN → every target
+
+A Postgres `DOMAIN` is a **constraint** wrapper, not a storage one: the server stores, transmits and renders a domain-typed value exactly as it does its base type, and only the domain's *name* and its *CHECK constraints* belong to the wrapper. sluice's translation follows that split literally.
+
+- **Storage, encoding and value landing** always dispatch on the **base** type, however deeply the domain is nested. A `CREATE DOMAIN d AS json[]` column is a MySQL `JSON` column in every respect a bare `json[]` column is — same DDL, same per-element encoding, same `LOAD DATA` charset handling. Same-engine Postgres → Postgres re-creates the `CREATE DOMAIN` and keeps the column's declared type.
+- **The wrapper's own facts** — the domain name, and its CHECKs — are read separately. On a Postgres target the domain is re-emitted before the tables that reference it. On a MySQL target the column is downgraded to the base type; a CHECK that translates is inlined as a table-level CHECK on MySQL 8.0.16+, and anything dropped is named in a WARN. SQLite/D1 have no faithful carry and **refuse the column loudly at emit time**.
+
+This split used to be re-derived by each consumer that met a domain for the first time, and the eleventh one is what Bug 233 cost: MySQL's `LOAD DATA` `SET` clause decided which columns need a `CONVERT(… USING utf8mb4)` re-tag from the *declared* type, a domain matched no arm, and every domain whose base type lands on a MySQL `JSON` column — **every** array element family, plus scalar `json` — died with the server's own `Error 3144 … CHARACTER SET 'binary'` and copied zero rows, on `migrate` and `restore` alike. It is now one named unwrap (`ir.UnwrapDomain`) that every landing decision shares, held by a per-engine AST gate (`internal/domaingate`) that fails on a dispatch site which neither unwraps nor carries a written reason.
+
 ### Postgres ARRAY → MySQL
 
 MySQL has no array type.

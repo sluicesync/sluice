@@ -103,7 +103,11 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	// server side, which isn't expressible in column-only LOAD DATA).
 	// Fall back to BatchedInsert when geometry is present.
 	for _, c := range cols {
-		if _, isGeom := c.Type.(ir.Geometry); isGeom {
+		// Storage type, not declared type (Bug 233): a DOMAIN over
+		// geometry emits a MySQL GEOMETRY column exactly like a bare
+		// one, so it needs the same fallback — LOAD DATA cannot express
+		// the ST_GEOMFROMWKB the wire format requires either way.
+		if _, isGeom := ir.UnwrapDomain(c.Type).(ir.Geometry); isGeom {
 			slog.WarnContext(
 				ctx, "mysql: LOAD DATA: falling back to batched INSERT (table has geometry column)",
 				slog.String("table", table.Name),
@@ -597,7 +601,24 @@ func buildLoadDataStmt(schema, tableName string, cols []*ir.Column, readerName s
 // other column type takes the variable verbatim — MySQL's implicit
 // conversion handles VARCHAR/TEXT (binary→utf8mb4 reinterpretation),
 // numerics (string parse), and binary types (passthrough).
+//
+// # It dispatches on the STORAGE type, not the declared one (Bug 233)
+//
+// Every arm below is a statement about the MySQL column this IR type
+// EMITS to, so the question it asks is "what does this land as", and a
+// [ir.Domain] wrapper is not part of that answer — the DDL emitter
+// downgrades a DOMAIN to its base type, so a `CREATE DOMAIN d AS
+// json[]` column is a MySQL `JSON` column exactly like a bare `json[]`
+// one. Dispatching on the declared type instead matched no arm for
+// every DOMAIN-typed column, so the JSON ones took the bare
+// `varName` fall-through under `CHARACTER SET binary` and MySQL
+// answered with Error 3144, zero rows and no sluice refusal — on
+// `migrate` and on `restore` alike, for EVERY array element family and
+// for scalar `json`. Only the LOAD DATA core was affected: the batched
+// core binds what [prepareValue] returns, and that has unwrapped
+// domains since Bug 122.
 func columnSetExpr(col *ir.Column, varName string) string {
+	t := ir.UnwrapDomain(col.Type)
 	// ir.JSON and ir.Array both emit a MySQL `JSON` column
 	// (emitColumnType maps ir.Array → JSON; the IR keeps the source
 	// type ir.Array). Under `CHARACTER SET binary` MySQL's JSON
@@ -607,7 +628,7 @@ func columnSetExpr(col *ir.Column, varName string) string {
 	// the value-side ir.Array→JSON fix in prepareValue (Bug 18). The
 	// serializer already emits valid UTF-8 JSON text for an array
 	// value; this is only a charset re-tag.
-	switch col.Type.(type) {
+	switch t.(type) {
 	case ir.JSON, ir.Array:
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
@@ -617,14 +638,14 @@ func columnSetExpr(col *ir.Column, varName string) string {
 	// field (\N → SQL NULL) NULL rather than CONV('')→0. CAST to
 	// UNSIGNED so the assignment to BIT(N) is the integer value, not a
 	// re-stringified one.
-	if _, isBit := col.Type.(ir.Bit); isBit {
+	if _, isBit := t.(ir.Bit); isBit {
 		return "CAST(CONV(NULLIF(" + varName + ", ''), 2, 10) AS UNSIGNED)"
 	}
 	// Text-like columns: re-tag the binary stream as utf8mb4 so
 	// CHECK constraints and stored procedures see the column's
 	// declared charset rather than `binary`. The bytes themselves
 	// are unchanged.
-	switch col.Type.(type) {
+	switch t.(type) {
 	case ir.Varchar, ir.Text, ir.Set:
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
@@ -641,7 +662,7 @@ func columnSetExpr(col *ir.Column, varName string) string {
 	// vector / pg_trgm / postgis don't reach this path (they refuse at
 	// the cross-engine preflight); hstore and citext are the only
 	// ExtensionType arms with cross-engine default translators today.
-	if _, isExt := col.Type.(ir.ExtensionType); isExt {
+	if _, isExt := t.(ir.ExtensionType); isExt {
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
 	return varName
@@ -698,7 +719,13 @@ func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-c
 				// corrupts it. Instead emit the IR-canonical '0'/'1'
 				// bit-string verbatim and let columnSetExpr's CONV(...,2,10)
 				// SET expression parse it. NULL stays NULL.
-				if _, isBit := c.Type.(ir.Bit); isBit && raw != nil {
+				//
+				// Storage type, not declared type (Bug 233), and this half
+				// must move with columnSetExpr's: the two form one
+				// agreement about what the field on the wire means, so a
+				// DOMAIN over BIT that took one branch and not the other
+				// would write the '0'/'1' text and then not parse it.
+				if _, isBit := ir.UnwrapDomain(c.Type).(ir.Bit); isBit && raw != nil {
 					if s, ok := raw.(string); ok {
 						buf = appendEscapedString(buf, s)
 						continue

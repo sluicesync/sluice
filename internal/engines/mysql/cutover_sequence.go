@@ -74,7 +74,11 @@ func (r *SchemaReader) ReadSequenceState(ctx context.Context, schema *ir.Schema)
 		// most one per table.
 		autoCol := ""
 		for _, col := range table.Columns {
-			intT, isInt := col.Type.(ir.Integer)
+			// Storage type, not declared type (Bug 233) — the same
+			// unwrap PrimeSequences takes, for the same reason: the
+			// schema is the CALLER's, so whether a domain can appear in
+			// it is not this function's to assume.
+			intT, isInt := ir.UnwrapDomain(col.Type).(ir.Integer)
 			if isInt && intT.AutoIncrement {
 				autoCol = col.Name
 				break
@@ -201,7 +205,14 @@ func (w *SchemaWriter) PrimeSequences(ctx context.Context, schema *ir.Schema, so
 		}
 		autoCol := ""
 		for _, col := range table.Columns {
-			intT, isInt := col.Type.(ir.Integer)
+			// Storage type, not declared type (Bug 233). This writer is
+			// handed the SOURCE schema on a cross-engine cutover, and a
+			// PG `id d_int DEFAULT nextval(...)` column reaches here as an
+			// ir.Domain wrapping the auto-increment integer — the MySQL
+			// column it primes is an ordinary AUTO_INCREMENT one, so
+			// missing it would leave the target counter unprimed and the
+			// first post-cutover INSERT colliding on the primary key.
+			intT, isInt := ir.UnwrapDomain(col.Type).(ir.Integer)
 			if isInt && intT.AutoIncrement {
 				autoCol = col.Name
 				break

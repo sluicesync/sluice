@@ -276,7 +276,14 @@ func singleIntegerPKColumn(t *ir.Table) (string, bool) {
 		if c.Name != pkName {
 			continue
 		}
-		if _, ok := c.Type.(ir.Integer); ok {
+		// Storage type, not declared type (Bug 233). Cross-engine verify
+		// hands this the SOURCE table, so a PG `CREATE DOMAIN d AS
+		// bigint` primary key reaches here wrapped while the MySQL column
+		// it counts is an ordinary BIGINT. Missing the unwrap costs only
+		// speed (the caller falls back to single-shot counting, correct
+		// for every type), which is exactly why it would never have been
+		// noticed.
+		if _, ok := ir.UnwrapDomain(c.Type).(ir.Integer); ok {
 			return pkName, true
 		}
 		return "", false
