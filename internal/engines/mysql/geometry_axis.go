@@ -186,7 +186,7 @@ func swapPoints(b []byte, off int, count uint32, bo binary.ByteOrder) (int, erro
 
 // readCount reads a uint32 element count and returns it with the offset just
 // past it.
-func readCount(b []byte, off int, bo binary.ByteOrder) (uint32, int, error) {
+func readCount(b []byte, off int, bo binary.ByteOrder) (count uint32, next int, err error) {
 	if off+4 > len(b) {
 		return 0, 0, fmt.Errorf("mysql: geometry axis swap: truncated element count at byte %d", off)
 	}
