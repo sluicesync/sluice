@@ -280,3 +280,22 @@ Not fixed in the docs sweep because it changes operator-visible message text and
 - `migcore/row_filter.go` + `pipeline/where_cdc_filter.go` — `--include`, shorthand for `--include-table`.
 
 **Left alone on purpose, and why:** `pgtrigger/cdc_reader.go`'s "there is no `--reset-position` flag" and `cli.go`'s "the Phase 1 `--redact-key-source` flag … w[as] removed" are removed-flag NOTICES — correct prose a naive gate would flag. They are the shape that makes a union-level gate expensive, and they are why the house idiom for an absent flag writes it WITHOUT the `--` (the eight existing "there is no resume flag" sites). The new `sync start` hint follows that idiom; the hint gate caught the first draft that did not, which is the cheapest possible evidence the gate works. ~~Also still open: the two `sluice schema migrate` unknown-subcommand instances v0.115.0 named (`schema_forward_intercept.go:546`, `shard_consolidation_probe.go:678`), and the doc-side `--exclude-column` in `adr-0066:789` and `roadmap.md:411`.~~ **All four CLOSED 2026-08-07** with the doc half of the phantom-command class. The two Go literals now say "apply the schema change … yourself (sluice has no schema-migrate command; on PlanetScale, `sluice deploy-ddl` ships one statement safely)" — note `deploy-ddl` is PlanetScale-scoped, so it is named as a qualified example rather than as the general schema-apply surface. `climsggate`'s unknown-subcommand blind spot is unchanged and still stated above; widening it was out of scope for a docs pass.
+
+## 2026-08-09 — v0.118.0 regression cycle
+
+### Bug 237 (LOW, pre-existing): `schema diff` still reports phantom drift on a `migrate`-created target
+
+Two residual arms, both surviving the Bug 234 / item 158 index-and-type work and neither newly introduced:
+
+- **Unspecified-precision PG temporals.** A PG `TIME` / `TIMESTAMP` with no precision compares as `Time(unspecified)` against the faithful `Time(6)` the target actually holds. Same family as the `PrecisionUnspecified` collapse `NormalizeForCDCComparison` already performs for CDC — the shape-compare path does not.
+- **sluice's own `SET`-emulation CHECK reported as extra.** `migrate` emits a CHECK carrying the member list when it lands a MySQL `SET` on a target without one; the expected side is built without it, so the diff reports the constraint sluice itself created.
+
+Deferred rather than fixed with Bug 236 because the two have nothing in common beyond the command: this one is a comparison-normalisation gap that has been present since the cross-engine diff existed, it exits 1 with no data at risk, and folding it into a same-day regression patch would have widened a release cut specifically to close a shipped over-refusal. **It is the same shape as item 156** (a domain's translatable CHECKs landing as auto-named table-level CHECKs the flattened expected side cannot carry) and should be picked up with it — the SET-emulation arm is very nearly item 156 with a different constraint source.
+
+### The Bug 236 lesson: a pre-tag fix is still a fix, and it still owes the sweep
+
+Bug 236 is the sibling of a defect fixed **in the same release, four commits earlier**. The Postgres CDC lane could not tell "this column declares SRID 0" from "no catalog ever established what it declares"; CI caught it before the tag, it was fixed, and the MySQL lane — which had the identical defect for the identical reason, its own loader not reading `srs_id` — was never enumerated.
+
+The reason is worth naming because it will recur: the sweep discipline is attached to *filing a fix*, and this fix arrived as **a CI failure during a release**, where the felt task is "unblock the tag" rather than "close a class". Both engines' CDC lanes are obvious siblings the moment the question is asked; nobody asked it.
+
+**The rule, added to the release flow rather than to anyone's memory: a fix made between the release commit and the tag gets the same sibling enumeration as any other, written into the commit.** If there is no time to enumerate, there is no time to tag.
