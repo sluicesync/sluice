@@ -1206,3 +1206,78 @@ func TestMariaDB_UpsertSpelling_ExecutesLive(t *testing.T) {
 		t.Errorf("migrate-state phase after conflict-path write = %q; want indexes", st.Phase)
 	}
 }
+
+// TestMariaDB_LoadTableSchema_ResolvesGeometrySRID pins the CDC lane's view of
+// a MariaDB geometry column, which is a DIFFERENT code path from
+// TestMariaDB_GeometrySRID_ReadBack above and was the half that shipped broken.
+//
+// That test exercises the full SchemaReader, which has always resolved MariaDB
+// SRIDs (from GEOMETRY_COLUMNS, via populateMariaDBGeometrySRID). This one
+// exercises [loadTableSchema] — the loader the binlog CDC reader and the change
+// applier use — which did not, so every geometry column reached the per-row SRID
+// guard as 0 and a declared column had all its CDC rows refused (Bug 236).
+//
+// It is here rather than beside the MySQL pins because the two servers keep the
+// value in different catalogs and the resolver tries both: MySQL 8 answers from
+// st_geometry_columns.srs_id, while on MariaDB that view does not exist at all
+// (Error 1109, measured on 11.4) and the answer comes from
+// geometry_columns.srid. A fix verified on MySQL alone says nothing about this
+// path — it is the fallback arm that carries it.
+//
+// The undeclared columns are the anti-vacuity half: they must resolve to 0, not
+// to [ir.GeometrySRIDUnknown], because 0 is what keeps the guard armed for the
+// silent re-stamp it exists to catch.
+func TestMariaDB_LoadTableSchema_ResolvesGeometrySRID(t *testing.T) {
+	for _, image := range []string{mariadb114Image, mariadb1011Image} {
+		image := image
+		t.Run(image, func(t *testing.T) {
+			dsn := newMariaDB(t, image, "mdb_cdc_srid")
+			execSQLScript(t, dsn, `
+				CREATE TABLE geo_cdc (
+					id     INT NOT NULL PRIMARY KEY,
+					p_none POINT,
+					p_4326 POINT REF_SYSTEM_ID=4326
+				);`)
+
+			db, err := sql.Open("mysql", dsn)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			tbl, err := loadTableSchema(ctx, db, "mdb_cdc_srid", "geo_cdc")
+			if err != nil {
+				t.Fatalf("loadTableSchema: %v", err)
+			}
+
+			want := map[string]int{"p_none": 0, "p_4326": 4326}
+			seen := map[string]bool{}
+			for _, col := range tbl.Columns {
+				wantSRID, tracked := want[col.Name]
+				if !tracked {
+					continue
+				}
+				seen[col.Name] = true
+				geom, isGeom := col.Type.(ir.Geometry)
+				if !isGeom {
+					t.Errorf("column %q type = %#v; want ir.Geometry", col.Name, col.Type)
+					continue
+				}
+				if geom.SRID != wantSRID {
+					t.Errorf("column %q SRID = %d; want %d — the CDC loader must read MariaDB's "+
+						"GEOMETRY_COLUMNS, or a declared column's every CDC row is refused (Bug 236)",
+						col.Name, geom.SRID, wantSRID)
+				}
+			}
+			for name := range want {
+				if !seen[name] {
+					t.Errorf("column %q missing from loadTableSchema output; the fixture no longer "+
+						"exercises the path", name)
+				}
+			}
+		})
+	}
+}
