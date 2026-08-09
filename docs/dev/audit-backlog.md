@@ -319,6 +319,19 @@ Byte-verbatim carriage is correct in isolation and the cycle's controls prove it
 
 **Prefer normalising at the ENGINE boundary over special-casing the pair.** With the IR's geometry value defined as canonical `(lon, lat)`, only the vanilla-MySQL reader and writer change; MariaDB and PostGIS already match. Every pair then falls out correct, and MySQL→MySQL stays byte-identical because swap-on-read and swap-on-write compose to identity — which preserves the cycle's control. **It also fixes a pair nobody has tested: MySQL→PostGIS is verbatim today, and PostGIS is lon/lat, so that direction is very likely mis-landing exactly like this one. Measure it before building; if it is broken, it belongs in the same fix and the same release note.**
 
+**Part 1 LANDED (`eaa18e8c`, `71cb943d`): `swapWKBAxes`** — the 2D WKB walker, pinned against MySQL's own `ST_SwapXY` output for all seven types, plus involution, no-input-mutation, and refuse-rather-than-pass-through for every unwalkable shape. **MySQL→PostGIS was measured for it and IS broken** (MySQL `POINT(37.8 -122.4)` lands on PostGIS as lon 37.8 / lat -122.4, stored without complaint), so it belongs in this fix rather than a follow-up.
+
+**Part 2 — the WIRING — is NOT built, and the reason is the risk shape.** The swap must reach EVERY MySQL geometry path: bulk-copy read, binlog CDC decode, VStream cell decode, bulk-copy write, CDC apply. Reaching some but not all produces a read/write ASYMMETRY, which is strictly worse than today's consistent-but-wrong carriage — it corrupts in one direction only, and the family tests would still pass on the paths that were wired. This is the sibling-enumeration failure mode with a silent-corruption payload, so it wants doing deliberately rather than at the tail of a session.
+
+The plan, so it is turnkey:
+
+- **Canonical order is (longitude, latitude)** in the IR. Only vanilla MySQL swaps; MariaDB and PostGIS already match. MySQL→MySQL stays byte-identical because swap-on-read and swap-on-write compose to the identity — pinned already by the involution test.
+- **Gate on two inputs at each site: the flavor (swap unless `FlavorMariaDB`) and whether the column's SRID is GEOGRAPHIC.** Do not hardcode 4326: a stock `mysql:8` has 545 geographic SRSs, and the catalog distinguishes them — `SELECT SRS_ID FROM information_schema.st_spatial_reference_systems WHERE DEFINITION LIKE 'GEOGCS%'` (3857 is `PROJCS` and must NOT swap; SRID 0 has no definition). Resolve once per connection and cache.
+- **The plumbing is the work.** Neither `decodeValue` (value_decode.go:77, the `ir.Geometry` arm) nor `prepareValue` (row_writer.go, the `ir.Geometry` arm) carries the flavor today, and `decodeValue` recurses. Either thread a small policy value through both, or normalise one level out at row granularity in each reader/writer — the latter is less invasive but has MORE sites to enumerate, which is the trade to decide first.
+- **Enumerate the sites in the commit, and add a roster gate**, because "wired some paths" is the failure mode. An AST roster over the MySQL geometry read/write sites with an anti-vacuity floor is the mechanical form.
+- **Log once per table when a swap applies** (operator decision 2026-08-09: handle it automatically, but say so), and add the opt-out for a MariaDB user who deliberately stored lat/lon.
+- **Integration matrix**: MariaDB→MySQL (the Rome case), MySQL→PostGIS (the SF case), MySQL→MySQL (must stay byte-identical), MariaDB→PostGIS (must stay verbatim — the cycle's existing control), each over the seven geometry families.
+
 **Affected releases: NOT introduced by v0.118.x — byte-identical behaviour measured on v0.117.0, v0.118.0 and v0.118.1.** Treat the introducing tag as unbisected.
 
 ### Bug 239 (MEDIUM, LOUD): a VStream source with any geometry column cannot `sync`
