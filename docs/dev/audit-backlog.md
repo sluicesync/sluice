@@ -302,7 +302,32 @@ The reason is worth naming because it will recur: the sweep discipline is attach
 
 ## 2026-08-09 — v0.118.1 verification cycle
 
-### Bug 238 (HIGH, SILENT): MySQL↔MariaDB geographic geometry silently relocates points — DECIDED, not yet built
+### Bug 238: WITHDRAWN — NOT A BUG. MySQL and MariaDB store geographic geometry identically; the divergence is in the conversion functions, not the storage
+
+**Withdrawn 2026-08-09, on a measurement taken while building the wiring (part 2).** Everything below this block is the ORIGINAL filing, kept because the reasoning is instructive; its central premise is FALSE and the fix it specifies would have introduced the corruption it was designed to prevent. Read this block first.
+
+**What was measured.** Seed the same place on each server through that server's own WKT convention, then compare the STORED bytes:
+
+```
+mysql>   INSERT … ST_GeomFromText('POINT(12.5 41.9)', 4326, 'axis-order=long-lat');
+mysql>   SELECT HEX(g);  →  E6100000 0101000000 <12.5> <41.9>     ST_Latitude = 41.9, ST_Longitude = 12.5
+mariadb> INSERT … ST_GeomFromText('POINT(12.5 41.9)', 4326);
+mariadb> SELECT HEX(g);  →  E6100000 0101000000 <12.5> <41.9>     ST_X = 12.5, ST_Y = 41.9
+```
+
+Byte-identical. And MariaDB's exact stored bytes, inserted verbatim into a MySQL `POINT SRID 4326` column, read back as `ST_Latitude = 41.9, ST_Longitude = 12.5` — Rome. The `POINT(-122.4 37.8)` (San Francisco, `|lon| > 90`) row carries the same way, with no `ERROR 3617`.
+
+**Why the filing looked right.** MySQL's per-SRS axis order is a property of the CONVERSION FUNCTIONS — `ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_GeomFromWKB` — whose default for a geographic SRS is latitude-first. It is NOT a property of the stored form, which is `(longitude, latitude)` on MySQL, MariaDB and PostGIS alike. The original comparison put MariaDB's `ST_AsText` (lon-first) next to MySQL's `ST_AsText` (lat-first for a 4326 value) and read the differing RENDERINGS as differing storage. The `ERROR 3617` was the same artifact on the input side: `ST_GeomFromText('POINT(-122.4 37.8)', 4326)` on MySQL reads -122.4 as a latitude, which is a seeding mistake and not a carriage one. sluice reads and writes the stored form and touches neither function.
+
+**So byte-verbatim carriage was already correct**, in every cell of the matrix — including MySQL→PostGIS, which the filing added on the same reasoning.
+
+**What landed instead.** The premise is now a test rather than a paragraph: `TestGeometryAxisPremise_MySQLAndMariaDBStoreTheSameBytes` and `TestGeometryAxisPremise_MariaDBToMySQLCarriesThePlace` (`internal/pipeline/geometry_axis_premise_integration_test.go`) pin both halves against real `mysql:8` and `mariadb:11.4` over all seven geometry families, so a genuine future divergence in either server's stored form fails the build. `swapWKBAxes` (part 1, `internal/engines/mysql/geometry_axis.go`) stays in the tree, unwired, with its doc comment corrected — it is the remedy if that test ever fires.
+
+**The process lesson, and it is the expensive one.** This was filed HIGH-SILENT, graded, decided by the operator, and written up as a turnkey chunk with an implementation plan, a flag, an error code and an integration matrix — all on an environmental premise nobody had bound to a server. CLAUDE.md's premise-naming step exists for exactly this shape and was not applied to the FILING, only to fixes. **A bug report that asserts a fact about an engine's behaviour owes that fact the same runtime check a fix would**, and the cheapest form is the one used here: seed both servers, compare `HEX(col)`, before designing anything. What caught it was building the integration matrix the plan asked for — the MySQL→MySQL control passed and the MariaDB→MySQL cell failed in the direction that made the fix, not the bug, the cause.
+
+---
+
+**ORIGINAL FILING BELOW — PREMISE DISPROVEN, RETAINED FOR THE REASONING ONLY.**
 
 **Verdict: confirmed, with two corrections to the filing.** The report's headline example (`POINT(37.8 -122.4)` in, `POINT(-122.4 37.8)` out) does NOT reproduce: the WKT round-trips identically and both servers read the same NUMBERS. And the error is **3617**, not 3732. Re-measured on stock `mysql:8` and `mariadb:11.4`.
 
