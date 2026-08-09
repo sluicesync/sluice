@@ -980,7 +980,21 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 			out := make([]byte, 4+len(b))
 			// Little-endian uint32 SRID prefix, matching MySQL's
 			// on-wire geometry layout.
-			srid := uint32(geom.SRID)
+			//
+			// [ir.GeometrySRIDUnknown] is contained HERE rather than allowed
+			// to reach the wire. It is -1, a READ-side sentinel meaning "no
+			// catalog established what this column declares" (see
+			// resolveGeometryColumnSRIDs), and `uint32(-1)` is 4294967295 —
+			// so letting it through would stamp every such value with a
+			// nonsense SRID instead of losing one. 0 is what this path wrote
+			// for an unresolved column before the sentinel existed, and it is
+			// MySQL's own "no SRID declared", so it is both the safe and the
+			// unchanged answer.
+			declared := geom.SRID
+			if declared == ir.GeometrySRIDUnknown {
+				declared = 0
+			}
+			srid := uint32(declared)
 			out[0] = byte(srid)
 			out[1] = byte(srid >> 8)
 			out[2] = byte(srid >> 16)

@@ -43,6 +43,20 @@ func TestDomainTransparency_MySQLDispatchRoster(t *testing.T) {
 // A site that lands a VALUE or emits DDL from a SOURCE schema is never
 // exempt: that is the population Bug 233 lived in.
 var mysqlDomainDispatchExemptions = map[string]string{
+	"cdc_geometry_srid.go:resolveGeometryColumnSRIDs:col.Type": "SOURCE-SIDE: the *tableSchema being " +
+		"annotated was just built by loadTableSchema from information_schema.columns on THIS server, and " +
+		"MySQL has no CREATE DOMAIN — so ir.Domain cannot appear here and unwrapping would be inert. The " +
+		"decision is also not about storage: it selects which columns need a spatial-catalog lookup, and a " +
+		"domain over geometry (only reachable if a PG schema were ever fed through this loader, which no " +
+		"caller does) would still want the wrapper preserved rather than flattened.",
+	"cdc_geometry_srid.go:containSRIDSentinel:col.Type": "SOURCE-SIDE: it strips a MySQL-CDC-internal " +
+		"sentinel from columns loadTableSchema built off THIS server, where ir.Domain cannot occur. " +
+		"Unwrapping would also be actively wrong here: the function must return the column with its " +
+		"declared type INTACT apart from the sentinel, and flattening a wrapper would change what the " +
+		"SchemaSnapshot reports the source shape to be.",
+	"cdc_geometry_srid.go:tableHasGeometryColumn:col.Type": "SOURCE-SIDE: same schema, same argument — it " +
+		"only answers whether the catalog round-trip is worth making, and answering it for a wrapper type " +
+		"sluice cannot produce here would be dead code.",
 	"cdc_reader.go:decodeBinlogRow:col.Type": "SOURCE-SIDE: the binlog reader types its values from the " +
 		"MySQL source's own schema, which has no DOMAIN.",
 	"change_applier.go:placeholderFor:col.Type": "TARGET-DERIVED: the applier resolves column types from " +

@@ -1107,6 +1107,14 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 	}
 	out.PrimaryKey = pk
 
+	// Bug 236: the query above cannot carry the geometry SRID on either
+	// server (MySQL keeps it in st_geometry_columns, MariaDB in
+	// geometry_columns, and neither is in information_schema.columns for
+	// both), so every geometry column is still at SRID 0 here — which the
+	// per-row check would read as "declares 0" and refuse a declared
+	// column's every row. Resolve it before the schema is cached.
+	resolveGeometryColumnSRIDs(ctx, db, out)
+
 	return out, nil
 }
 

@@ -1490,7 +1490,7 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	if !r.pendingDDLActive || tbl == nil {
 		return nil
 	}
-	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: tbl.Columns}
+	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: containSRIDSentinel(tbl.Columns)}
 	// Bug 89: surface the PK so downstream consumers (ADR-0058 backfill,
 	// other future per-PK paths) can resolve a cursor-paginated iteration
 	// against the table. The CDC reader's tableSchema already carries the

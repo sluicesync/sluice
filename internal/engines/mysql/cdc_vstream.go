@@ -1890,7 +1890,24 @@ type vstreamGeometrySRIDError struct {
 
 // err renders the sentinel as the shared IR refusal, so the VStream path's
 // wording and its errors.Is target are the same as every other read path's.
-// The column SRID is 0 by construction here (columnMetaFromField).
+// The column SRID is 0 by construction here (columnMetaFromField), and passing
+// 0 rather than [ir.GeometrySRIDUnknown] is DELIBERATE — this is the one
+// geometry path where the refusal is the correct answer even though the column
+// SRID was never read from a catalog.
+//
+// The distinction against the binlog lane (Bug 236), because the two look
+// identical and are not: there, the declared SRID exists in
+// st_geometry_columns / geometry_columns and the loader simply was not reading
+// it, so refusing punished a column that had declared itself properly. Here,
+// VStream's FieldEvent carries no per-column SRID at all AND the target column
+// is therefore created without one — so stripping the prefix would lose the
+// SRID at BOTH levels and land valid geometry naming the wrong place, silently.
+// Marking it unknown would restore exactly that silent loss on the Vitess /
+// PlanetScale path.
+//
+// So: unknown-and-recoverable resolves (binlog); unknown-and-unrecoverable
+// refuses (here). Carriage needs the EWKB value-contract change filed with
+// C-14.
 func (e *vstreamGeometrySRIDError) err() error {
 	return ir.CheckGeometryRowSRID(0, e.srid)
 }
