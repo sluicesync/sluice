@@ -549,6 +549,7 @@ sync run --dry-run
 sync start --all-databases
 sync start --all-schemas
 sync start --allow-cross-shard-merge
+sync start --allow-unmapped-tables
 sync start --analyze-after
 sync start --apply-batch-size
 sync start --apply-concurrency

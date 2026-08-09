@@ -2543,3 +2543,23 @@ func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) 
 // (sortedKeys is shared with the schema reader — see schema_reader.go
 // for the implementation. The applier uses it to render generated SQL
 // in a deterministic column order.)
+
+// TargetTableExists implements [ir.TargetTableProbe] for the unmapped-table
+// preflight (audit backlog C-11).
+//
+// It reuses colTypesFor — the exact lookup [ChangeApplier] performs on every
+// Insert/Update/Delete — so the preflight's verdict and the runtime's behaviour
+// cannot disagree. errUnknownTable is the same sentinel the apply path treats
+// as "skip this change", which is precisely the condition being predicted.
+//
+// The cache warm-up is a side benefit rather than the point: a table the
+// preflight resolves is one the first change for it will not re-query.
+func (a *ChangeApplier) TargetTableExists(ctx context.Context, schema, table string) (bool, error) {
+	if _, err := a.colTypesFor(ctx, schema, table); err != nil {
+		if errors.Is(err, errUnknownTable) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}

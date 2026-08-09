@@ -146,6 +146,14 @@ const (
 	// (`sluice sync stop --wait`), then re-run.
 	CodeDecommissionStreamActive Code = "SLUICE-E-DECOMMISSION-STREAM-ACTIVE"
 
+	// audit backlog C-11: a CDC stream would replicate one or more tables
+	// that do NOT exist on the target. Postgres used to WARN and drop every
+	// change for them for the life of the stream (exit 0, nothing counted);
+	// MySQL halted mid-run on the first one. Now refused up front, with the
+	// complete list and the `sluice schema add-table` command that creates
+	// each one WITH its existing rows. --allow-unmapped-tables opts out.
+	CodeSyncUnmappedTables Code = "SLUICE-E-SYNC-UNMAPPED-TABLES"
+
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
 	CodeSchemaIdentifierInvalid   Code = "SLUICE-E-SCHEMA-IDENTIFIER-INVALID"
@@ -467,6 +475,7 @@ var registry = map[Code]Info{
 	CodeCDCMariaDBUnsupported:           {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB CDC (domain-GTID positions) shipped v0.99.271 (ADR-0170); the flavor now declares CDCBinlog and this refusal is no longer emitted. Kept registered because removing a published catalog code is breaking"},
 	CodeCDCMariaDBNativeTypeUnsupported: {ClassRefusal, "RETAINED-BUT-UNEMITTED: MariaDB native uuid/inet6/inet4 CDC binlog decode shipped v0.99.272 (ADR-0171), lifting this refusal — the CDC tail now converges byte-for-byte with the bulk-copy text. Kept registered because removing a published code is breaking; no longer emitted"},
 
+	CodeSyncUnmappedTables:       {ClassRefusal, "the stream would replicate one or more tables that do not exist on the target, whose changes would be silently DROPPED for the life of the stream; refused at start with the full list and the `sluice schema add-table` command that creates each WITH its pre-existing rows -- allow-unmapped-tables opts out"},
 	CodeDecommissionStreamActive: {ClassRefusal, "sync decommission refused: the stream's replication slot is active on the source (a CDC consumer is attached — the stream looks live); drain it with `sluice sync stop --wait` first, then re-run decommission"},
 
 	CodeColdStartTargetNotEmpty:   {ClassRefusal, "cold-start refused: a target table already contains data"},

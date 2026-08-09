@@ -1749,3 +1749,28 @@ func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) 
 // (sortedKeys is shared with the schema reader — see schema_reader.go
 // for the implementation. The applier uses it to render generated SQL
 // in a deterministic column order.)
+
+// TargetTableExists implements [ir.TargetTableProbe] for the unmapped-table
+// preflight (audit backlog C-11).
+//
+// It routes the change's schema exactly as the dispatch path does
+// ([ChangeApplier.routedSchema]) and then performs the dispatch path's own
+// column lookup, so the preflight resolves the same target relation the apply
+// path would. Re-deriving the routing here — or skipping it — would let the
+// preflight refuse a stream that multi-database fan-out would have applied
+// correctly, which is the over-refusal direction this whole area has already
+// paid for once.
+//
+// MySQL never had Postgres's silent skip: an unresolvable table fails the write
+// and halts the stream. The value here is therefore not a correctness fix but a
+// timing one — the operator gets the COMPLETE list before any change is read,
+// rather than the first offending table hours in.
+func (a *ChangeApplier) TargetTableExists(ctx context.Context, schema, table string) (bool, error) {
+	if _, err := a.colTypesFor(ctx, nil, a.routedSchema(schema), table); err != nil {
+		if errors.Is(err, errTableNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}

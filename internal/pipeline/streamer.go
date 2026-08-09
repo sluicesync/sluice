@@ -290,6 +290,30 @@ type Streamer struct {
 	// advances the position past the dropped ones.
 	Filter migcore.TableFilter
 
+	// AllowUnmappedTables opts out of the unmapped-table refusal: the stream
+	// starts even though some in-scope source tables do not exist on the
+	// target, and every change for those tables is DROPPED for the life of the
+	// stream (audit backlog C-11).
+	//
+	// The zero value is the SAFE one on purpose, per the v0.99.51 trap: false
+	// means refuse, so a Streamer constructed anywhere other than the CLI — a
+	// test, the broker, a future caller — inherits the loud behaviour rather
+	// than the silent one. Naming it Allow… rather than Refuse… is what makes
+	// that work; an EnforceUnmappedTables field defaulting true "by intent"
+	// would silently invert to off for every one of those constructions.
+	//
+	// The opt-out still logs the full list once at INFO, because "I chose to
+	// skip these" and "I forgot these exist" look identical in a log tail
+	// otherwise.
+	AllowUnmappedTables bool
+
+	// testInScopeTables overrides the source-schema read the unmapped-table
+	// preflight performs, so its DECISION can be unit-pinned without a
+	// database. Nil in production, where [Streamer.inScopeSourceTables] runs.
+	// Same seam the CDC reader uses for schemaLoader, and kept unexported for
+	// the same reason: it is a test affordance, not configuration.
+	testInScopeTables func(context.Context) ([]sourceTableRef, error)
+
 	// ViewFilter selects which source views are created on the
 	// target during the cold-start phase. CDC events for views
 	// don't exist (views aren't replicated by either engine's CDC
@@ -1830,6 +1854,20 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// widening inert (Bug 209). Ordered AFTER it so the PG legacy-hash
 	// acceptance can see the resolved publicationRowFilters.
 	if err := s.phaseCheckRowFilterDrift(ctx, applier, streamID); err != nil {
+		return err
+	}
+
+	// Refuse a stream that would replicate tables the target does not have
+	// (audit backlog C-11). Placed here deliberately: after the publication
+	// scope is settled, so the in-scope set is the real one, and BEFORE the
+	// change stream opens, so a refusal costs no slot, no position, and no
+	// partially-applied work.
+	// Refuse a stream that would replicate tables the target does not have
+	// (audit backlog C-11). Placed here deliberately: after the publication
+	// scope is settled, so the in-scope set is the real one, and BEFORE the
+	// change stream opens, so a refusal costs no slot, no position, and no
+	// partially-applied work.
+	if err := s.phasePreflightUnmappedTables(ctx, applier, streamID); err != nil {
 		return err
 	}
 
