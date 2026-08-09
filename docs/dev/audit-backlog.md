@@ -299,3 +299,32 @@ Bug 236 is the sibling of a defect fixed **in the same release, four commits ear
 The reason is worth naming because it will recur: the sweep discipline is attached to *filing a fix*, and this fix arrived as **a CI failure during a release**, where the felt task is "unblock the tag" rather than "close a class". Both engines' CDC lanes are obvious siblings the moment the question is asked; nobody asked it.
 
 **The rule, added to the release flow rather than to anyone's memory: a fix made between the release commit and the tag gets the same sibling enumeration as any other, written into the commit.** If there is no time to enumerate, there is no time to tag.
+
+## 2026-08-09 — v0.118.1 verification cycle
+
+### Bug 238 (HIGH, SILENT): MySQL↔MariaDB geographic geometry silently relocates points — DECIDED, not yet built
+
+**Verdict: confirmed, with two corrections to the filing.** The report's headline example (`POINT(37.8 -122.4)` in, `POINT(-122.4 37.8)` out) does NOT reproduce: the WKT round-trips identically and both servers read the same NUMBERS. And the error is **3617**, not 3732. Re-measured on stock `mysql:8` and `mariadb:11.4`.
+
+**The real mechanism.** The servers disagree about which coordinate is latitude. MySQL 8 applies the SRS's EPSG axis order, so SRID 4326 is `(lat, lon)` — `ST_Latitude` of `POINT(37.8 -122.4)` is 37.8. MariaDB is axis-agnostic and stores the GIS convention `(lon, lat)`, where `ST_X` is longitude. sluice carries the WKB verbatim, so the numbers survive and their MEANING does not:
+
+- `|lon| > 90` → `ERROR 3617 … Latitude -122.400000 is out of range` at insert. Loud.
+- `|lon| ≤ 90` → **silent**. Measured: MariaDB `POINT(12.5 41.9)` (Rome) lands on MySQL as latitude 12.5, longitude 41.9 — off the Somali coast, exit 0.
+
+Byte-verbatim carriage is correct in isolation and the cycle's controls prove it: MySQL→MySQL and MariaDB→PostGIS are both verbatim-correct. This pair is not.
+
+**Decision (operator, 2026-08-09): handle it AUTOMATICALLY — swap so the meaning is preserved — and log a warning saying it happened.** The one shape auto-swap is wrong for is a MariaDB user who deliberately stored lat/lon; that gets an opt-out flag so the rewrite is recoverable rather than silently unfixable.
+
+**Design note for whoever builds it — the cheap-looking route is the wrong one.** Swapping inside sluice means a WKB walker that rewrites every coordinate pair of every subtype (point / linestring / polygon / multi* / collection, × Z/M dimensions): error-prone, and it still needs a rule for which SRIDs are geographic. MySQL supplies the lever directly — `ST_AsBinary(col, 'axis-order=long-lat')` on read and `ST_GeomFromWKB(?, srid, 'axis-order=long-lat')` on write — which makes MySQL's wire form canonically lon/lat, applies each SRS's OWN axis order rather than hardcoding 4326, and needs no byte surgery. Cost: the read projection and the write binding both change, across bulk-copy AND the CDC apply path.
+
+**Prefer normalising at the ENGINE boundary over special-casing the pair.** With the IR's geometry value defined as canonical `(lon, lat)`, only the vanilla-MySQL reader and writer change; MariaDB and PostGIS already match. Every pair then falls out correct, and MySQL→MySQL stays byte-identical because swap-on-read and swap-on-write compose to identity — which preserves the cycle's control. **It also fixes a pair nobody has tested: MySQL→PostGIS is verbatim today, and PostGIS is lon/lat, so that direction is very likely mis-landing exactly like this one. Measure it before building; if it is broken, it belongs in the same fix and the same release note.**
+
+**Affected releases: NOT introduced by v0.118.x — byte-identical behaviour measured on v0.117.0, v0.118.0 and v0.118.1.** Treat the introducing tag as unbisected.
+
+### Bug 239 (MEDIUM, LOUD): a VStream source with any geometry column cannot `sync`
+
+`parse error - invalid geometry`, 0 rows, while `migrate` of the same table is rc=0 — so the capability exists and only the CDC path refuses. Loud and total, no data at risk. Filed against the VStream cell decoder; note that the Vitess flavor deliberately excludes `ir.ExtGeometry` from its declared `SupportedTypes` (`flavor.go`), so the first question is whether this is a missing capability refusal surfacing as a parse error, rather than a decoder defect.
+
+### Bug 236 arm B, silent half: still open
+
+The write arm is closed for a target column that DECLARES an SRID (`Error 3643` → applied, `ST_SRID` correct). An **undeclared** target column still accepts a 4326 row at `ST_SRID` 0 with no error, identically on v0.117.0/v0.118.0/v0.118.1. That is the same class as C-14's read side, on the write side, and it is not what v0.118.1 claimed to fix — the release notes say the loud arm.
