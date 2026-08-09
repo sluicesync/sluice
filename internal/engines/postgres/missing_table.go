@@ -26,7 +26,9 @@ import (
 //     installed keeps SQLSTATE 42P01 and loses the English phrase entirely.
 //   - "does not exist" is PostgreSQL's house phrasing for a whole family of
 //     unrelated conditions. Ground-truthed on a real PG 16: a missing function
-//     is 42883, a missing role is 22023, and — the one that matters here — a
+//     is 42883, a missing role is 22023 from SET ROLE but 42704 from DROP ROLE
+//     or GRANT (measured on a real PG 16 — the code depends on the STATEMENT,
+//     not on the object), and — the one that matters here — a
 //     connection whose database is gone answers
 //     `FATAL: database "app" does not exist` with SQLSTATE 3D000. A pooled
 //     `*sql.DB` re-dials, so that error can surface from any query, and reading

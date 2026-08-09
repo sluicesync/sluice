@@ -376,6 +376,13 @@ func anchorSlotExistsErr(anchorSlot string, persistChainSlot bool) error {
 // Both are the leak direction: the slot survives, keeps pinning WAL on the
 // SOURCE, and the operator is told cleanup succeeded. A leaked anchor slot is
 // exactly the failure whose warning the caller above suppresses.
+// Scope, because 42704 is undefined_OBJECT and not undefined_slot: PG raises it
+// for a missing type, collation, or role (from DROP ROLE / GRANT — SET ROLE
+// answers 22023 instead; both measured on a real PG 16) as well as for a
+// missing replication slot. That breadth is safe HERE and only here, because
+// the sole statement this classifies is `SELECT pg_drop_replication_slot($1)`,
+// which names no type, collation or role — so 42704 from it can only be the
+// slot. Do not lift this helper to a statement that references other objects.
 func isSlotAlreadyGoneErr(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

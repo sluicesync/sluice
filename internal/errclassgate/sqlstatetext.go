@@ -41,7 +41,9 @@ type SQLStateTextConfig struct {
 //   - "does not exist", which is PostgreSQL's house phrasing for a whole family
 //     of unrelated conditions: a missing table is 42P01, a missing column
 //     42703, a missing function 42883, a missing object 42704, a missing role
-//     22023, and a missing DATABASE is 3D000 — which a pooled *sql.DB surfaces
+//     22023 from SET ROLE but 42704 from DROP ROLE or GRANT (the code follows
+//     the STATEMENT, not the object — measured on a real PG 16), and a missing
+//     DATABASE is 3D000 — which a pooled *sql.DB surfaces
 //     from any query after a re-dial. Matching the phrase collapses all of them
 //     into whichever one the reading code assumed.
 var errorTextTokens = []string{"does not exist"}
