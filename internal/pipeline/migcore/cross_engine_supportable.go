@@ -327,7 +327,22 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 // capability declaration isn't resolvable. The names ARE the durable
 // record. Keep this list and [IsMySQLFamilyEngine] in lock-step with
 // the engine registrations.
-func isPGSourceEngine(engine string) bool {
+func isPGSourceEngine(engine string) bool { return IsPGSourceEngine(engine) }
+
+// IsPGSourceEngine reports whether engine is a PG-family SOURCE for
+// cross-engine supportability purposes — an engine whose schema surface can
+// carry PG-native shapes (PostGIS geometry, EXCLUDE constraints, standalone
+// sequences, opclass indexes) that a MySQL-family target cannot hold.
+//
+// Exported so the registry roster in internal/engines can hold it to the LIVE
+// engine list (audit backlog C-2). The classification genuinely cannot be
+// derived from the engine object: at restore time the source engine is a
+// lineage string recorded in a backup manifest and may not be registered in
+// this process at all, so these NAMES are the durable record. What can be
+// mechanised is the decision — a newly registered engine must be classified
+// deliberately rather than defaulting to "not PG" by omission, which is what a
+// bare literal list does.
+func IsPGSourceEngine(engine string) bool {
 	return engine == "postgres" || engine == "postgres-trigger"
 }
 
