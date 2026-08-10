@@ -1725,15 +1725,21 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (
 //
 // Enum-valued columns are resolved through readEnumValuesForSchema,
 // which loads the enum type values in the same call. Arrays of
-// supported scalar element types are also resolved. Geometry is left
-// without per-column subtype/SRID metadata — the applier doesn't
-// re-encode geometry on the write path's IR-Geometry → EWKB step
-// (that happens via prepareValue using the column's SRID, which here
-// defaults to 0; row_writer's PostGIS-aware path is the canonical
-// place to recover the SRID, and the applier does not currently do
-// so for replicated UPDATE/DELETE rows). When the cross-engine
-// PostGIS replication path lands we'll need to extend this to read
-// the geometry_columns view too.
+// supported scalar element types are also resolved. Geometry columns
+// ARE resolved too, via loadGeometryColumnInfo below — the subtype and
+// the declared SRID both, because prepareValue → wkbToEWKB frames every
+// replicated geometry with the column's SRID and a bare 0 would silently
+// re-stamp a constrained geometry(<type>,<srid>) target (#20).
+//
+// The SRID it recovers is the TARGET column's. That is the only one
+// available here — an [ir.Change] carries values, not column types, and
+// the reader already stripped the row's own framing — so a target column
+// declaring a different SRID than the source's re-stamps every row on
+// this path. Divergence between the two is caught before the stream
+// starts, by the existing-target shape gate
+// (internal/pipeline/migrate_existing_tables.go); see the wart note on
+// the MySQL writer's geometry arm (row_writer.go) for what that gate
+// does NOT cover.
 func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map[string]*ir.Column, error) {
 	enumValues, err := readEnumValuesForSchema(ctx, db, schema)
 	if err != nil {

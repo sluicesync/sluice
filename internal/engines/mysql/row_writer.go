@@ -990,6 +990,45 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 			// for an unresolved column before the sentinel existed, and it is
 			// MySQL's own "no SRID declared", so it is both the safe and the
 			// unchanged answer.
+			//
+			// # The wart: WHOSE column this is differs by path
+			//
+			// This stamps the SRID of whatever column descriptor the caller
+			// supplied, and the two write paths supply different ones. Bulk
+			// copy passes the SOURCE schema, so a cold copy carries the
+			// source's SRID even onto a target column that declares none
+			// (measured: MySQL 8.4 stores ST_SRID 4326 in an undeclared
+			// POINT column quite happily). The CDC applier passes the TARGET
+			// schema — colTypesFor reads it from the target's own catalog —
+			// because an [ir.Change] carries values, not column types, and
+			// the reader already stripped the row's own framing. So when the
+			// two columns declare different SRIDs, every CDC-applied row is
+			// re-stamped to the target's, silently, and the target is
+			// perfectly willing to hold it.
+			//
+			// What keeps that off an operator is the existing-target shape
+			// gate (internal/pipeline/migrate_existing_tables.go): both
+			// `migrate` and `sync` cold start refuse a pre-existing target
+			// whose column shape differs, and [ir.Geometry.String] renders
+			// the SRID, so an SRID-only divergence is refused by name before
+			// any data moves. Pinned by
+			// TestGeometrySRIDTargetDivergence_RefusedBeforeAnyDataMoves
+			// (internal/pipeline) and, per geometry family, by
+			// TestTableColumnShape_GeometrySRIDDivergenceRefused
+			// (internal/ir/diff) — the protection was incidental to a
+			// rendering choice and unpinned until those landed.
+			//
+			// NOT covered, deliberately and stated so it is not implied:
+			// nothing re-runs that gate on a WARM RESUME, so a target-side
+			// ALTER after cold start goes undetected (measured 2026-08-10:
+			// cold-copy row landed 4326, CDC rows after `ALTER TABLE … MODIFY
+			// loc POINT NOT NULL` on the target landed 0, one column holding
+			// both, no ERROR and no WARN). Refusing here cannot close it —
+			// this path has no source-side SRID to compare against — and
+			// re-checking is not geometry-specific: no column property is
+			// re-validated after cold start. Carrying the row's own SRID end
+			// to end would close it properly, and that is the EWKB
+			// value-contract change [ir.CheckGeometryRowSRID] defers.
 			declared := geom.SRID
 			if declared == ir.GeometrySRIDUnknown {
 				declared = 0
