@@ -1092,12 +1092,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		return nil, err
 	}
 	if len(out.Columns) == 0 {
-		// Wrapped in a typed sentinel so callers can distinguish "this table is
-		// not there" from "the lookup failed" structurally rather than by
-		// matching this message (audit backlog C-1). information_schema
-		// answers zero rows for a missing table rather than erroring, so this
-		// IS the missing-table signal on this path.
-		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?): %w", schema, table, errTableNotFound)
+		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
 	}
 
 	// Bug 88 (DELETE) / Bug 193 (UPDATE): the CDC reader's emit paths

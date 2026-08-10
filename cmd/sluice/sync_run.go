@@ -71,14 +71,8 @@ type SyncSpec struct {
 	TargetDriver string `koanf:"target-driver"`
 	Target       string `koanf:"target"`
 
-	SlotName string `koanf:"slot-name"`
-
-	// AllowUnmappedTables mirrors `sync start --allow-unmapped-tables` (audit
-	// backlog C-11): start even though some in-scope source tables do not
-	// exist on the target, dropping their changes for the life of the stream.
-	// The zero value refuses, which is the safe direction.
-	AllowUnmappedTables bool   `koanf:"allow-unmapped-tables"`
-	TargetSchema        string `koanf:"target-schema"`
+	SlotName     string `koanf:"slot-name"`
+	TargetSchema string `koanf:"target-schema"`
 
 	// PublicationName mirrors `sync start --publication-name` (ADR-0175):
 	// the per-stream Postgres publication, the refusal's PRIMARY documented
@@ -974,19 +968,18 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 	}
 
 	return &pipeline.Streamer{
-		Source:              source,
-		Target:              target,
-		SourceDSN:           sourceDSN,
-		TargetDSN:           spec.Target,
-		StreamID:            spec.StreamID,
-		SlotName:            spec.SlotName,
-		PublicationName:     spec.PublicationName,
-		Mappings:            mappings,
-		ExpressionMappings:  exprMappings,
-		RowFilters:          rowFilters,
-		Filter:              filter,
-		AllowUnmappedTables: spec.AllowUnmappedTables,
-		TargetSchema:        spec.TargetSchema,
+		Source:             source,
+		Target:             target,
+		SourceDSN:          sourceDSN,
+		TargetDSN:          spec.Target,
+		StreamID:           spec.StreamID,
+		SlotName:           spec.SlotName,
+		PublicationName:    spec.PublicationName,
+		Mappings:           mappings,
+		ExpressionMappings: exprMappings,
+		RowFilters:         rowFilters,
+		Filter:             filter,
+		TargetSchema:       spec.TargetSchema,
 
 		// ADR-0148 / audit MED-A1 gap #12: arm the deploy-request index-build
 		// fallback for this sync's cold-start deferred index phase. nil unless

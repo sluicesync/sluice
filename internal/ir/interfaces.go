@@ -4046,24 +4046,3 @@ type ControlTableStatement struct {
 type ControlTableDDLProvider interface {
 	ControlTableDDL() []ControlTableStatement
 }
-
-// TargetTableProbe is the OPTIONAL surface a [ChangeApplier] implements to
-// answer "can you resolve a target table for this source table?" — the same
-// question the apply path asks on every change.
-//
-// It exists for the unmapped-table preflight (audit backlog C-11), which
-// refuses a stream that would replicate tables the target does not have. The
-// probe is deliberately the applier's own resolution rather than an independent
-// schema comparison: the apply path performs NO name mapping (it looks the
-// source's schema-qualified name up directly in the target catalog), so a
-// preflight that re-derived a mapping could refuse a stream that would in fact
-// have worked. Same predicate, same verdict, by construction.
-//
-// An engine that does not implement it keeps whatever behaviour it had, and the
-// preflight is skipped. That is a gap rather than a pass — see the phase's doc.
-type TargetTableProbe interface {
-	// TargetTableExists reports whether the applier can resolve a target table
-	// for the given SOURCE schema and table name. A missing table is
-	// (false, nil); only a genuine failure to ask returns an error.
-	TargetTableExists(ctx context.Context, schema, table string) (bool, error)
-}

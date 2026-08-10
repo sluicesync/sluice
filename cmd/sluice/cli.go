@@ -1179,9 +1179,8 @@ type SyncStartCmd struct {
 	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
 	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 
-	IncludeTable        []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
-	ExcludeTable        []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
-	AllowUnmappedTables bool     `help:"Start even when in-scope source tables do not exist on the target. Their changes are DROPPED for the life of the stream; the full list is logged once at startup. Without this, sluice refuses at start, names the tables, and prints the 'sluice schema add-table' command that creates each one with its existing rows."`
+	IncludeTable []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
+	ExcludeTable []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
 	IncludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync ONLY these source databases (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source database routes to a same-named target namespace (PG schema / MySQL database). The selected databases are cold-started under ONE spanning consistent snapshot, then the single server-wide binlog CDC stream is routed per-change to each namespace. Mutually exclusive with --exclude-database. When any database-scope flag is set, the source DSN's database is optional (it's a server connection). System databases (information_schema, performance_schema, mysql, sys) are always excluded. Warm-resume across N databases is not yet supported (ADR-0074 Phase 1b.3)." sep:"," placeholder:"DATABASE"`
 	ExcludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync every non-system source database EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-database." sep:"," placeholder:"DATABASE"`
@@ -2149,7 +2148,6 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		WhereStrictCollation: s.WhereStrictCollation,
 		DryRun:               s.DryRun,
 		Filter:               filter,
-		AllowUnmappedTables:  s.AllowUnmappedTables,
 		ViewFilter:           viewFilter,
 		SkipViews:            s.SkipViews,
 		SkipForeignKeys:      s.SkipForeignKeys,

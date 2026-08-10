@@ -6,7 +6,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"errors"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -191,12 +190,3 @@ func containSRIDSentinel(cols []*ir.Column) []*ir.Column {
 	}
 	return out
 }
-
-// errTableNotFound is the sentinel [loadTableSchema] wraps when
-// information_schema returns no columns for the requested table — which is how
-// a missing table presents there, since the catalog answers zero rows rather
-// than raising errno 1146.
-//
-// It exists so the unmapped-table probe can tell "absent" from "the lookup
-// failed" without matching the message (audit backlog C-1).
-var errTableNotFound = errors.New("mysql: table not found")

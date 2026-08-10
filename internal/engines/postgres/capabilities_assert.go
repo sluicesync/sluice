@@ -140,7 +140,6 @@ var (
 	_ ir.ApplyConcurrencySetter         = (*ChangeApplier)(nil)
 	_ ir.ApplyExecTimeoutSetter         = (*ChangeApplier)(nil)
 	_ ir.BatchObserverSetter            = (*ChangeApplier)(nil)
-	_ ir.TargetTableProbe               = (*ChangeApplier)(nil) // audit backlog C-11
 	_ ir.BatchSizeProviderSetter        = (*ChangeApplier)(nil)
 	_ ir.BatchedChangeApplier           = (*ChangeApplier)(nil)
 	_ ir.LaneAIMDSetter                 = (*ChangeApplier)(nil)

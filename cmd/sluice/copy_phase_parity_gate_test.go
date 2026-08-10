@@ -113,8 +113,6 @@ var migrateSyncDivergenceReason = map[string]string{
 	"migration-id":       "paired, not missing: this is migrate's run-identity key (`sluice_migrate_state`); sync's is --stream-id, which is sync-only for the mirror-image reason",
 	"resume":             "paired, not missing: migrate opts INTO resuming a recorded migration; a sync stream resumes from its persisted position automatically, with no flag to ask for it",
 
-	"allow-unmapped-tables": "inapplicable: the condition cannot arise on migrate, which CREATES the target tables it copies into (schema-apply phase) rather than requiring them to pre-exist. The refusal it opts out of (audit backlog C-11) fires only where a CDC stream carries changes for a table the target never got — a steady-state apply concern with no migrate counterpart",
-
 	// ---- sync-only: steady-state CDC apply loop ----
 	"apply-batch-size":          reasonCDCApply,
 	"apply-concurrency":         reasonCDCApply,
