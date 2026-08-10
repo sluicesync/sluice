@@ -398,3 +398,29 @@ That is the Vitess/PlanetScale flavor excluding `ir.ExtGeometry`. Wiring `Suppor
 3. **Gate it**: a declaration must be bound to a test that fails if the engine's real behaviour diverges, or the field returns to being decoration the moment someone adds an engine.
 
 **Not filed as a defect with a severity, deliberately.** Nothing is lost and nothing is silently wrong today; what is wrong is that a whole declarative surface reads as enforcement. Sizing it honestly: step 1 is the expensive part and is a measurement chunk, not a coding one.
+
+### The `SupportedTypes` declaration audit (2026-08-10)
+
+Step 1 of the plan above, done. Verdicts below are from the code (type constructors, DDL emitters, capability pins), not from the comments beside the declarations.
+
+**The finding that frames the rest: three of the eleven extension kinds are declared by ZERO engines.** `ExtDomain`, `ExtVerbatimType` and `ExtExtensionType` appear in no engine's `SupportedTypes`. All three are LATER additions to the `ExtensionKind` enum (their own doc comments date them — domains at v0.95.1, verbatim types at ADR-0047, catalogued extension types at ADR-0032). The enum grew; no declaration was revisited. That is exactly what an unenforced declarative surface looks like after two years, and it means the rot is systemic rather than one stale entry.
+
+| engine | declares | verdict |
+|---|---|---|
+| `mysql` (vanilla) | Enum, Set, Geometry | **consistent.** All three are core MySQL. Correctly omits UUID/Inet (MySQL has no native type — the BINARY(16) convention is not one) and Array/Cidr/Macaddr/Domain (absent from MySQL entirely). |
+| `planetscale` / `vitess` | Enum, Set, Geometry | **CORRECTED 2026-08-10** (`c13e27db`). Geometry was excluded as self-described conservatism; measured working end to end over a real vtgate. |
+| `mariadb` | Enum, Set, Geometry, UUID, Inet | **plausible, unmeasured.** UUID (10.7+) and INET6/INET4 (10.10+) are genuinely native and ADR-0170/0171 implement them; correctly omits Cidr/Macaddr. No end-to-end capability measurement was made for this audit. |
+| `postgres` | Enum, UUID, Array, Inet, Cidr, Macaddr | **WRONG for `ExtDomain`, ambiguous for three others.** `CREATE DOMAIN` is core PostgreSQL, and the engine both READS it (`schema_reader.go` builds `ir.Domain`) and EMITS it (`ddl_emit.go`'s `emitCreateDomainType`) — there is no reading under which PG does not handle it natively. Geometry, ExtensionType and VerbatimType are the ambiguous three; see below. |
+| `pgtrigger` | same six as `postgres` | **inherits every one of the above**, by design — its comment says "same set as vanilla PG". |
+| `mydumper` | Enum, Set, Geometry | **plausible.** A MySQL dump format; the set matches vanilla MySQL minus what dumps cannot carry. |
+| `sqlite`, `d1-trigger`, `flatfile` | *(empty)* | **plausible.** SQLite has no native enum/set/uuid/array/geometry/inet, and the engine refuses an `ir.Domain` column loudly at emit rather than silently flattening it. |
+
+### The blocker: "handles natively" is underspecified, and the answer changes the wiring
+
+PostGIS `geometry` on a PG target requires an installed EXTENSION. `ExtExtensionType` is by definition operator-opted-in (`--enable-pg-extension`, ADR-0032). So PG's omission of them is defensible under *"declares what the engine supports unconditionally"* and wrong under *"declares what the engine can handle when the relevant extension is present"*.
+
+Both readings are coherent; the field's doc — "the extension types the engine handles natively" — chooses neither. **That ambiguity must be resolved before anything consults the field, because the wiring silently encodes whichever reading the implementer happened to hold.** Under the first reading a preflight would refuse PostGIS geometry on a PG target, which is a shipping, tested configuration. Under the second, an engine cannot declare its capabilities statically at all and the field needs to become a method taking a live connection.
+
+`ExtDomain` is unaffected by the ambiguity and is simply missing. It is left uncorrected here on purpose: adding one kind to two engines while the semantics are undecided would make the surface look audited without making it enforceable, and it is the enforceability that has been absent the whole time.
+
+**Recommendation:** decide the semantics first (a method over a static field is the likely answer, given PostGIS), then re-derive all eight declarations against it, then wire and gate. Sizing: the semantics decision is small and the re-derivation is a measurement chunk; the wiring is trivial once both are settled.
