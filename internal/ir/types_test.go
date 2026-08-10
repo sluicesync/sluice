@@ -126,31 +126,6 @@ func TestExtensionKindEnumIsAppendOnly(t *testing.T) {
 	}
 }
 
-// TestTypeSet exercises the bitset operations on TypeSet.
-func TestTypeSet(t *testing.T) {
-	s := NewTypeSet(ExtEnum, ExtArray)
-	if !s.Has(ExtEnum) {
-		t.Error("Has(ExtEnum) = false; want true")
-	}
-	if !s.Has(ExtArray) {
-		t.Error("Has(ExtArray) = false; want true")
-	}
-	if s.Has(ExtUUID) {
-		t.Error("Has(ExtUUID) = true; want false")
-	}
-	s2 := s.With(ExtUUID)
-	if !s2.Has(ExtUUID) {
-		t.Error("after With(ExtUUID): Has() = false")
-	}
-	if s.Has(ExtUUID) {
-		t.Error("With() mutated original (it should return a copy)")
-	}
-	s3 := s2.Without(ExtEnum)
-	if s3.Has(ExtEnum) {
-		t.Error("after Without(ExtEnum): Has(ExtEnum) = true")
-	}
-}
-
 // TestStringSamples spot-checks a few String() outputs to guard against
 // accidental format regressions in golden-file consumers.
 func TestStringSamples(t *testing.T) {

@@ -301,8 +301,4 @@ func TestEngine_SourceOnlySurfaces(t *testing.T) {
 	if _, err := e.OpenSnapshotStream(ctx, "x"); !errors.Is(err, ErrNotImplemented) {
 		t.Fatalf("OpenSnapshotStream err = %v", err)
 	}
-	caps := e.Capabilities()
-	if caps.CDC != ir.CDCNone || caps.BulkLoad != ir.BulkLoadNone || !caps.UnsignedIntegers {
-		t.Fatalf("capabilities = %+v", caps)
-	}
 }

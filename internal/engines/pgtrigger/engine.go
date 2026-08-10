@@ -226,21 +226,7 @@ var capabilities = ir.Capabilities{
 	BulkLoad:    ir.BulkLoadCopy, // inherited shape from postgres
 	CDC:         ir.CDCTriggers,  // NEW: not CDCLogicalReplication
 	SchemaScope: ir.SchemaScopeNamespaced,
-	SupportedTypes: ir.NewTypeSet(
-		ir.ExtEnum,
-		ir.ExtUUID,
-		ir.ExtArray,
-		ir.ExtInet,
-		ir.ExtCidr,
-		ir.ExtMacaddr,
-	),
-	SupportsCheckConstraint:  true,
-	SupportsGeneratedColumns: false, // §8 — refuse-loudly per §14
-	SupportsPartitioning:     true,
-	EnumSupport:              ir.EnumTypeLevel,
-	JSONSupport:              ir.JSONBoth,
-	UnsignedIntegers:         false,
-	DDLDialect:               ir.DDLDialectANSI,
+	DDLDialect:  ir.DDLDialectANSI,
 
 	// The engine fronts a genuine PG server — PG catalog probes, the
 	// XID-wraparound preflight, and the declarative-partitioning

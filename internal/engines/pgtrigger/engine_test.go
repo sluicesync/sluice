@@ -36,17 +36,8 @@ func TestEngine_Capabilities(t *testing.T) {
 	if c.CDC != ir.CDCTriggers {
 		t.Errorf("CDC = %v; want CDCTriggers", c.CDC)
 	}
-	if c.SupportsGeneratedColumns {
-		t.Errorf("SupportsGeneratedColumns = true; want false (§14)")
-	}
 	if c.SchemaScope != ir.SchemaScopeNamespaced {
 		t.Errorf("SchemaScope = %v; want SchemaScopeNamespaced", c.SchemaScope)
-	}
-	if c.JSONSupport != ir.JSONBoth {
-		t.Errorf("JSONSupport = %v; want JSONBoth", c.JSONSupport)
-	}
-	if !c.SupportsCheckConstraint {
-		t.Errorf("SupportsCheckConstraint = false; want true")
 	}
 	if !c.PostgresBackend {
 		t.Error("PostgresBackend = false; want true (genuine PG server — XID/partition preflights must fire)")

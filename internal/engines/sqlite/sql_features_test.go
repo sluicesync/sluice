@@ -107,10 +107,11 @@ func TestReadSchema_SchemaFeatures(t *testing.T) {
 		`CREATE INDEX calc_lname_idx ON calc(lower(name))`,
 	)
 
-	// Capability flags carry honestly.
-	if c := (Engine{}).Capabilities(); !c.SupportsCheckConstraint || !c.SupportsGeneratedColumns {
-		t.Errorf("capabilities = %+v; want SupportsCheckConstraint && SupportsGeneratedColumns true", c)
-	}
+	// NOTE: this used to assert SupportsCheckConstraint / SupportsGeneratedColumns
+	// on the capability struct. Both fields were deleted 2026-08-10 — declared by
+	// every engine, read by nothing. The real assertions are below: the schema
+	// reader round-trips a CHECK constraint and a generated column off a live
+	// SQLite, which is the behaviour those flags claimed and never enforced.
 
 	calc := tableByName(schema, "calc")
 	if calc == nil {

@@ -479,9 +479,12 @@ func TestMigrate_Corpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun(t *testing.
 	// differ from vanilla — otherwise this leg isn't exercising the
 	// delta it claims to. Asserting the documented divergence keeps the
 	// leg honest (and would FAIL loudly if flavor.go's caps regressed).
-	if psEng.Capabilities().SupportsPartitioning {
-		t.Error("planetscale Capabilities.SupportsPartitioning = true; want false (Vitess sharding, not PARTITION BY)")
-	}
+	// SupportsPartitioning was asserted here too until 2026-08-10, when it was
+	// deleted along with the other six type-fidelity capability fields — every
+	// one declared by all eight engines and read by nothing. BulkLoad is the
+	// stronger half of this sanity check anyway: it is a STRATEGY selector the
+	// orchestrator genuinely consults, so a regression in it changes behaviour
+	// rather than just a struct literal.
 	if psEng.Capabilities().BulkLoad == ir.BulkLoadLoadDataInfile {
 		t.Error("planetscale Capabilities.BulkLoad = LoadDataInfile; want BatchedInsert (no LOAD DATA INFILE on PS)")
 	}

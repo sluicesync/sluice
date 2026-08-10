@@ -35,17 +35,10 @@ func TestEngine_Registered(t *testing.T) {
 // this engine silently inherits a nonzero value for.
 func TestEngine_Capabilities(t *testing.T) {
 	want := ir.Capabilities{
-		BulkLoad:                 ir.BulkLoadBatchedInsert,
-		CDC:                      ir.CDCTriggers,
-		SchemaScope:              ir.SchemaScopeFlat,
-		SupportedTypes:           ir.NewTypeSet(), // no extension types
-		SupportsCheckConstraint:  true,
-		SupportsGeneratedColumns: true,
-		SupportsPartitioning:     false,
-		EnumSupport:              ir.EnumNone,
-		JSONSupport:              ir.JSONNone,
-		UnsignedIntegers:         false,
-		DDLDialect:               ir.DDLDialectANSI,
+		BulkLoad:    ir.BulkLoadBatchedInsert,
+		CDC:         ir.CDCTriggers,
+		SchemaScope: ir.SchemaScopeFlat,
+		DDLDialect:  ir.DDLDialectANSI,
 		// Inherited from the composed `d1`/`sqlite` shape, where every
 		// writable connection opens with foreign_keys(0) (ADR-0134). It is
 		// INERT for this engine — d1-trigger is a CDC source only, its

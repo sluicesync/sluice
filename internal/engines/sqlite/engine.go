@@ -264,17 +264,10 @@ func (Engine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, e
 // generated columns ARE read and carried (ADR-0133), so both are declared
 // true; partitioning has no SQLite equivalent and stays false.
 var capabilities = ir.Capabilities{
-	BulkLoad:                 ir.BulkLoadBatchedInsert,
-	CDC:                      ir.CDCNone,
-	SchemaScope:              ir.SchemaScopeFlat,
-	SupportedTypes:           ir.NewTypeSet(), // no extension types
-	SupportsCheckConstraint:  true,
-	SupportsGeneratedColumns: true,
-	SupportsPartitioning:     false,
-	EnumSupport:              ir.EnumNone,
-	JSONSupport:              ir.JSONNone,
-	UnsignedIntegers:         false,
-	DDLDialect:               ir.DDLDialectANSI,
+	BulkLoad:    ir.BulkLoadBatchedInsert,
+	CDC:         ir.CDCNone,
+	SchemaScope: ir.SchemaScopeFlat,
+	DDLDialect:  ir.DDLDialectANSI,
 	// Every WRITABLE connection opens with `_pragma=foreign_keys(0)`
 	// (see writePragmas / ADR-0134), so a cold copy into a table that
 	// already carries foreign keys cannot fail child-before-parent —

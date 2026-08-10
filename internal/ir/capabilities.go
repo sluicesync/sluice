@@ -79,60 +79,6 @@ func (s SchemaScope) String() string {
 	}
 }
 
-// EnumSupport describes how an engine represents enumerations.
-type EnumSupport uint8
-
-// Recognised EnumSupport values.
-const (
-	EnumNone        EnumSupport = iota // engine has no native enum representation
-	EnumColumnLevel                    // MySQL-style: ENUM declared on the column
-	EnumTypeLevel                      // Postgres-style: CREATE TYPE ... AS ENUM
-)
-
-func (s EnumSupport) String() string {
-	switch s {
-	case EnumColumnLevel:
-		return "column-level"
-	case EnumTypeLevel:
-		return "type-level"
-	case EnumNone:
-		return "none"
-	default:
-		return "unknown"
-	}
-}
-
-// JSONSupport describes which JSON variants an engine supports.
-type JSONSupport uint8
-
-// JSONSupport variants:
-//
-//   - JSONNone:   no native JSON type
-//   - JSONText:   only a textual JSON type
-//   - JSONBinary: only a parsed/normalised JSON type
-//   - JSONBoth:   both textual and binary variants
-const (
-	JSONNone JSONSupport = iota
-	JSONText
-	JSONBinary
-	JSONBoth
-)
-
-func (s JSONSupport) String() string {
-	switch s {
-	case JSONText:
-		return "text"
-	case JSONBinary:
-		return "binary"
-	case JSONBoth:
-		return "both"
-	case JSONNone:
-		return "none"
-	default:
-		return "unknown"
-	}
-}
-
 // DDLDialect identifies the SQL dialect family used when sluice
 // renders DDL *suggestions* for an engine (schema-diff ALTER hints,
 // identifier quoting). It is a rendering concern only — actual schema
@@ -158,32 +104,6 @@ func (d DDLDialect) String() string {
 		return "unknown"
 	}
 }
-
-// TypeSet is a small fixed-size set of [ExtensionKind] values used by
-// [Capabilities] to declare which extension types an engine supports.
-//
-// It is implemented as a bitset so capability checks are O(1) and cheap
-// to copy. Up to 64 extension kinds are representable; the IR has far
-// fewer.
-type TypeSet uint64
-
-// NewTypeSet returns a TypeSet containing the given kinds.
-func NewTypeSet(kinds ...ExtensionKind) TypeSet {
-	var s TypeSet
-	for _, k := range kinds {
-		s = s.With(k)
-	}
-	return s
-}
-
-// With returns a copy of s with k added.
-func (s TypeSet) With(k ExtensionKind) TypeSet { return s | (1 << uint(k)) }
-
-// Without returns a copy of s with k removed.
-func (s TypeSet) Without(k ExtensionKind) TypeSet { return s &^ (1 << uint(k)) }
-
-// Has reports whether k is present in s.
-func (s TypeSet) Has(k ExtensionKind) bool { return s&(1<<uint(k)) != 0 }
 
 // Capabilities declares what a database engine can do natively.
 // Each [Engine] implementation returns a Capabilities value so the
@@ -211,20 +131,25 @@ type Capabilities struct {
 	CDCPositionCommitsAfterRows bool
 	// SchemaScope is the table-namespacing model.
 	SchemaScope SchemaScope
-	// SupportedTypes lists the extension types the engine handles natively.
-	SupportedTypes TypeSet
-	// SupportsCheckConstraint reports whether CHECK constraints are honoured.
-	SupportsCheckConstraint bool
-	// SupportsGeneratedColumns reports whether generated/computed columns are supported.
-	SupportsGeneratedColumns bool
-	// SupportsPartitioning reports whether table partitioning is supported.
-	SupportsPartitioning bool
-	// EnumSupport describes how the engine represents enumerations.
-	EnumSupport EnumSupport
-	// JSONSupport describes which JSON variants the engine supports.
-	JSONSupport JSONSupport
-	// UnsignedIntegers reports whether the engine has native unsigned integer types.
-	UnsignedIntegers bool
+	// NOTE: seven TYPE-FIDELITY fields were removed here on 2026-08-10
+	// (SupportedTypes, SupportsCheckConstraint, SupportsGeneratedColumns,
+	// SupportsPartitioning, EnumSupport, JSONSupport, UnsignedIntegers).
+	//
+	// Every one was declared by all eight engines and read by NOTHING for
+	// three months. They were a second copy of a truth the engines already
+	// hold structurally — whether an engine can represent a type is decided
+	// by its own type dispatch, and a missing arm in translateType IS the
+	// answer — so the copy drifted exactly as second copies do: three
+	// extension kinds declared by no engine at all, and the Vitess flavor
+	// recording a sluice bug (Bug 239) as a vendor limitation.
+	//
+	// The fields that REMAIN are strategy selectors — BulkLoad, CDC,
+	// SchemaScope, DDLDialect and friends — facts about an engine's
+	// operational shape that the orchestrator cannot derive by inspection.
+	// That is the line: declare strategy, derive type fidelity.
+	//
+	// Where an EARLY answer is needed, use [TableEmitPreflighter]: the
+	// target dry-runs its own emit and reports what it cannot render.
 
 	// DDLDialect is the SQL dialect family used when sluice renders
 	// DDL suggestions for this engine (schema-diff ALTER hints,

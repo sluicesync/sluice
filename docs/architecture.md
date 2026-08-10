@@ -192,7 +192,11 @@ type Engine interface {
 }
 ```
 
-The translator and the simple-mode pipeline consult capabilities to pick a strategy. The Postgres writer's emission of an `Enum` IR value is decided by `cap.EnumSupport`. The MySQL writer's emission of an `Array` IR value is decided by `cap.SupportedTypes.Has(ArrayType)`. The bulk-load phase asks `cap.BulkLoad` rather than guessing.
+The orchestrator consults capabilities to pick a STRATEGY: the bulk-load phase asks `cap.BulkLoad` rather than guessing, the CDC phase asks `cap.CDC` (binlog vs VStream vs trigger), and namespace handling asks `cap.SchemaScope`. These are facts about an engine's operational shape that no amount of code inspection substitutes for, so they are declared as data.
+
+TYPE FIDELITY is deliberately NOT declared this way, and an earlier version of this document said otherwise. It claimed the Postgres writer decided enum emission from `cap.EnumSupport` and the MySQL writer decided array emission from `cap.SupportedTypes.Has(ArrayType)`. Neither was ever true — both fields were declared by every engine and read by nothing, for three months, until the 2026-08-10 audit. What decides whether an engine can represent a type is the engine's own type dispatch: MySQL's `translateType` has no arm for `ir.Array`, and that missing arm IS the answer. A capability table would be a second copy of that truth, and the audit found it had drifted exactly as a second copy does — three extension kinds declared by no engine at all, and one flavor recording a sluice bug as a vendor limitation.
+
+Where an EARLY answer is needed — refusing before a copy starts rather than at emit time — the pattern is [ir.TableEmitPreflighter]: the target engine dry-runs its own emit against the schema and reports what it cannot render. One source of truth, asked ahead of time, and it cannot drift from the emitter because it IS the emitter.
 
 This pattern means new engines slot in without touching the core. It also means *behaviour differences* between engines are documented as data — readable, diffable, easy to inspect — rather than scattered conditionals. (See [ADR-0005](adr/adr-0005-mysql-flavors.md) for the per-flavor capability variant model that proves out the pattern.)
 

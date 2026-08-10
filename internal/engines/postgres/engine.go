@@ -648,27 +648,13 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 // capabilities declares what this engine supports. Values reflect a
 // vanilla PostgreSQL 14+ baseline.
 var capabilities = ir.Capabilities{
-	BulkLoad:    ir.BulkLoadCopy,
-	CDC:         ir.CDCLogicalReplication,
-	SchemaScope: ir.SchemaScopeNamespaced,
-	SupportedTypes: ir.NewTypeSet(
-		ir.ExtEnum,  // CREATE TYPE ... AS ENUM
-		ir.ExtUUID,  // native uuid type
-		ir.ExtArray, // native T[] arrays
-		ir.ExtInet,  // network address types
-		ir.ExtCidr,
-		ir.ExtMacaddr,
-	),
-	SupportsCheckConstraint:  true,
-	SupportsGeneratedColumns: true, // 12+
-	SupportsPartitioning:     true, // 10+
-	EnumSupport:              ir.EnumTypeLevel,
-	JSONSupport:              ir.JSONBoth, // json + jsonb
-	UnsignedIntegers:         false,       // Postgres has no unsigned integers
-	DDLDialect:               ir.DDLDialectANSI,
-	PostgresBackend:          true, // PG catalogs / XID wraparound / declarative partitioning
-	PGExtensionCatalog:       true, // --enable-pg-extension resolves extension-owned types (ADR-0032)
-	VerbatimExtensionTypes:   true, // uncatalogued-extension verbatim passthrough (ADR-0047)
+	BulkLoad:               ir.BulkLoadCopy,
+	CDC:                    ir.CDCLogicalReplication,
+	SchemaScope:            ir.SchemaScopeNamespaced,
+	DDLDialect:             ir.DDLDialectANSI,
+	PostgresBackend:        true, // PG catalogs / XID wraparound / declarative partitioning
+	PGExtensionCatalog:     true, // --enable-pg-extension resolves extension-owned types (ADR-0032)
+	VerbatimExtensionTypes: true, // uncatalogued-extension verbatim passthrough (ADR-0047)
 }
 
 // init registers this engine with the engines registry. The blank

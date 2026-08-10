@@ -33,24 +33,9 @@ func TestMariaDBCapabilities(t *testing.T) {
 	if caps.CDC != ir.CDCBinlog {
 		t.Errorf("mariadb CDC = %v; want CDCBinlog (domain-GTID binlog CDC shipped in item 73 Phase 3, ADR-0170)", caps.CDC)
 	}
-	if caps.JSONSupport != ir.JSONText {
-		t.Errorf("mariadb JSONSupport = %v; want JSONText (MariaDB JSON is a LONGTEXT alias)", caps.JSONSupport)
-	}
 	// Phase 2: geometry (SRID via REF_SYSTEM_ID), UUID, and INET are now
 	// declared. Geometry SRID read-back is proven live in the integration
 	// suite (a POINT with SRID 4326 must not read back as 0).
-	if !caps.SupportedTypes.Has(ir.ExtGeometry) {
-		t.Error("mariadb should declare Geometry support (Phase 2: SRID recovered from REF_SYSTEM_ID)")
-	}
-	if !caps.SupportedTypes.Has(ir.ExtUUID) {
-		t.Error("mariadb should declare UUID support (Phase 2: native uuid type)")
-	}
-	if !caps.SupportedTypes.Has(ir.ExtInet) {
-		t.Error("mariadb should declare Inet support (Phase 2: native inet6/inet4 types)")
-	}
-	if !caps.SupportedTypes.Has(ir.ExtEnum) || !caps.SupportedTypes.Has(ir.ExtSet) {
-		t.Error("mariadb should declare ENUM and SET support")
-	}
 	if caps.DDLDialect != ir.DDLDialectMySQL {
 		t.Errorf("mariadb DDLDialect = %v; want DDLDialectMySQL", caps.DDLDialect)
 	}

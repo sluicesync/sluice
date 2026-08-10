@@ -125,18 +125,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		BulkLoad:    ir.BulkLoadLoadDataInfile,
 		CDC:         ir.CDCBinlog,
 		SchemaScope: ir.SchemaScopeFlat,
-		SupportedTypes: ir.NewTypeSet(
-			ir.ExtEnum,     // column-level ENUM
-			ir.ExtSet,      // column-level SET
-			ir.ExtGeometry, // built-in spatial types
-		),
-		SupportsCheckConstraint:  true, // 8.0.16+
-		SupportsGeneratedColumns: true,
-		SupportsPartitioning:     true,
-		EnumSupport:              ir.EnumColumnLevel,
-		JSONSupport:              ir.JSONBinary,
-		UnsignedIntegers:         true,
-		DDLDialect:               ir.DDLDialectMySQL,
+		DDLDialect:  ir.DDLDialectMySQL,
 	},
 
 	// ---------------------------------------------------------------
@@ -191,18 +180,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		// schema anchor at EndPosition as proof of data (Bug 184).
 		CDCPositionCommitsAfterRows: true,
 		SchemaScope:                 ir.SchemaScopeFlat,
-		SupportedTypes: ir.NewTypeSet(
-			ir.ExtEnum,
-			ir.ExtSet,
-			ir.ExtGeometry, // measured 2026-08-10 — see the spatial note above
-		),
-		SupportsCheckConstraint:  true,
-		SupportsGeneratedColumns: true,
-		SupportsPartitioning:     false, // sharding is Vitess's concern
-		EnumSupport:              ir.EnumColumnLevel,
-		JSONSupport:              ir.JSONBinary,
-		UnsignedIntegers:         true,
-		DDLDialect:               ir.DDLDialectMySQL,
+		DDLDialect:                  ir.DDLDialectMySQL,
 
 		// vtgate kills transactions at ~20s by default; the streamer's
 		// AIMD controller and apply-batch-size warning both gate on
@@ -278,19 +256,6 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		BulkLoad:    ir.BulkLoadLoadDataInfile,
 		CDC:         ir.CDCBinlog, // Phase 3: MariaDB domain GTIDs (ADR-0170)
 		SchemaScope: ir.SchemaScopeFlat,
-		SupportedTypes: ir.NewTypeSet(
-			ir.ExtEnum,     // column-level ENUM
-			ir.ExtSet,      // column-level SET
-			ir.ExtGeometry, // built-in spatial types (Phase 2: SRID via REF_SYSTEM_ID)
-			ir.ExtUUID,     // native UUID (Phase 2)
-			ir.ExtInet,     // native INET6/INET4 (Phase 2)
-		),
-		SupportsCheckConstraint:  true, // MariaDB 10.2+ enforces CHECK
-		SupportsGeneratedColumns: true,
-		SupportsPartitioning:     true,
-		EnumSupport:              ir.EnumColumnLevel,
-		JSONSupport:              ir.JSONText, // LONGTEXT alias, see above
-		UnsignedIntegers:         true,
-		DDLDialect:               ir.DDLDialectMySQL,
+		DDLDialect:  ir.DDLDialectMySQL,
 	},
 }

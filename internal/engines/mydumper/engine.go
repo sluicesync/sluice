@@ -165,18 +165,7 @@ var capabilities = ir.Capabilities{
 	BulkLoad:    ir.BulkLoadNone,
 	CDC:         ir.CDCNone,
 	SchemaScope: ir.SchemaScopeFlat,
-	SupportedTypes: ir.NewTypeSet(
-		ir.ExtEnum,     // column-level ENUM
-		ir.ExtSet,      // column-level SET
-		ir.ExtGeometry, // built-in spatial types (hex-blob dumps)
-	),
-	SupportsCheckConstraint:  true,
-	SupportsGeneratedColumns: true,
-	SupportsPartitioning:     false, // partition clauses are versioned comments; not carried
-	EnumSupport:              ir.EnumColumnLevel,
-	JSONSupport:              ir.JSONBinary,
-	UnsignedIntegers:         true,
-	DDLDialect:               ir.DDLDialectMySQL,
+	DDLDialect:  ir.DDLDialectMySQL,
 }
 
 // init registers this engine with the engines registry. A blank import

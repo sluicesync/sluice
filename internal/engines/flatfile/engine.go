@@ -271,17 +271,10 @@ func (Engine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, e
 // validated --infer-types promotion), and the operational surface is the
 // source-only flat-file shape (no bulk-load path, no CDC).
 var capabilities = ir.Capabilities{
-	BulkLoad:                 ir.BulkLoadNone,
-	CDC:                      ir.CDCNone,
-	SchemaScope:              ir.SchemaScopeFlat,
-	SupportedTypes:           ir.NewTypeSet(), // no extension types
-	SupportsCheckConstraint:  false,
-	SupportsGeneratedColumns: false,
-	SupportsPartitioning:     false,
-	EnumSupport:              ir.EnumNone,
-	JSONSupport:              ir.JSONNone,
-	UnsignedIntegers:         false,
-	DDLDialect:               ir.DDLDialectANSI,
+	BulkLoad:    ir.BulkLoadNone,
+	CDC:         ir.CDCNone,
+	SchemaScope: ir.SchemaScopeFlat,
+	DDLDialect:  ir.DDLDialectANSI,
 }
 
 // init registers the three drivers. A blank import in cmd/sluice triggers

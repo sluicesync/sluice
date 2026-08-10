@@ -37,9 +37,6 @@ func TestCapabilities(t *testing.T) {
 	if c.BulkLoad != ir.BulkLoadBatchedInsert {
 		t.Errorf("BulkLoad = %v; want batched-insert (SQLite is a valid target, ADR-0134)", c.BulkLoad)
 	}
-	if c.SupportedTypes != ir.NewTypeSet() {
-		t.Errorf("SupportedTypes = %v; want empty", c.SupportedTypes)
-	}
 }
 
 // TestCDCSideNotImplemented confirms the CDC / change-apply / snapshot
