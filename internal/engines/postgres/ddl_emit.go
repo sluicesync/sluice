@@ -642,6 +642,17 @@ func setDefaultToArrayLiteral(commaSeparated string) string {
 // is degenerate (the column can only be the empty set) but
 // well-formed; the source DDL was already strange in that case.
 func emitSetCheckConstraint(tableName, columnName string, values []string) string {
+	name, body := setCheckConstraint(tableName, columnName, values)
+	return fmt.Sprintf("CONSTRAINT %s CHECK (%s)", quoteIdent(name), body)
+}
+
+// setCheckConstraint produces the (name, body) pair
+// [emitSetCheckConstraint] wraps. Split out so
+// [SchemaWriter.PredictEmittedChecks] can state what this writer emits
+// by CALLING it rather than by restating it — a second statement of the
+// predicate would drift, and a drift here is indistinguishable from an
+// operator having tampered with the constraint.
+func setCheckConstraint(tableName, columnName string, values []string) (name, body string) {
 	literal := "'{}'::TEXT[]"
 	if len(values) > 0 {
 		quoted := make([]string, len(values))
@@ -650,12 +661,7 @@ func emitSetCheckConstraint(tableName, columnName string, values []string) strin
 		}
 		literal = "ARRAY[" + strings.Join(quoted, ",") + "]::TEXT[]"
 	}
-	return fmt.Sprintf(
-		"CONSTRAINT %s CHECK (%s <@ %s)",
-		quoteIdent(setCheckName(tableName, columnName)),
-		quoteIdent(columnName),
-		literal,
-	)
+	return setCheckName(tableName, columnName), fmt.Sprintf("%s <@ %s", quoteIdent(columnName), literal)
 }
 
 // setCheckName generates the CHECK-constraint name for a SET
@@ -679,22 +685,23 @@ func setCheckName(tableName, columnName string) string {
 // That matches the source's enum-with-no-values shape, which is
 // already degenerate.
 func emitGeneratedEnumCheckConstraint(tableName, columnName string, values []string) string {
+	name, body := generatedEnumCheckConstraint(tableName, columnName, values)
+	return fmt.Sprintf("CONSTRAINT %s CHECK (%s)", quoteIdent(name), body)
+}
+
+// generatedEnumCheckConstraint produces the (name, body) pair
+// [emitGeneratedEnumCheckConstraint] wraps, for the same
+// state-it-once reason as [setCheckConstraint].
+func generatedEnumCheckConstraint(tableName, columnName string, values []string) (name, body string) {
+	name = generatedEnumCheckName(tableName, columnName)
 	if len(values) == 0 {
-		return fmt.Sprintf(
-			"CONSTRAINT %s CHECK (false)",
-			quoteIdent(generatedEnumCheckName(tableName, columnName)),
-		)
+		return name, "false"
 	}
 	quoted := make([]string, len(values))
 	for i, v := range values {
 		quoted[i] = quoteSQLString(v)
 	}
-	return fmt.Sprintf(
-		"CONSTRAINT %s CHECK (%s IN (%s))",
-		quoteIdent(generatedEnumCheckName(tableName, columnName)),
-		quoteIdent(columnName),
-		strings.Join(quoted, ","),
-	)
+	return name, fmt.Sprintf("%s IN (%s)", quoteIdent(columnName), strings.Join(quoted, ","))
 }
 
 // generatedEnumCheckName generates the CHECK-constraint name for a

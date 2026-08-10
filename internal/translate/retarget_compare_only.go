@@ -130,12 +130,14 @@ func retargetMySQLtoPGShapeCompare(t ir.Type) ir.Type {
 		// is why this rule is compare-only — see [compareOnlyRuleFor]). The
 		// element reads back as an unbounded `text`, i.e. TextLong.
 		//
-		// KNOWN RESIDUAL, item 156's mirror: the membership CHECK itself
-		// still reports as `ChecksExtra` on every diff of a SET column,
-		// because the expected side has nowhere to carry it. This rule
-		// closes the TYPE axis only; that is stated here rather than left
-		// for a reader to discover, and pinned as a characterization by
-		// TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift.
+		// The membership CHECK itself was item 156's mirror and this
+		// rule's KNOWN RESIDUAL: it reported as `ChecksExtra` on every
+		// diff of a SET column, because the expected side had nowhere to
+		// carry it. CLOSED 2026-08-10 — the Postgres SchemaWriter now
+		// answers [ir.EmittedCheckPredictor] and the diff matches these
+		// by canonicalized expression. This rule still closes the TYPE
+		// axis ONLY, which remains the honest scope statement: the
+		// constraint half lives in the engine's predictor, not here.
 		return ir.Array{Element: ir.Text{Size: ir.TextLong}}
 	}
 	return nil

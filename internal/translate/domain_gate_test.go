@@ -59,6 +59,15 @@ var translateDomainDispatchExemptions = map[string]string{
 		"were read out of a MySQL catalog.",
 	"unsigned_bigint.go:ScanUnsignedBigintNotices:col.Type": "SOURCE-SIDE: same guard — `bigint unsigned` " +
 		"is a MySQL-source shape, so the schema walked here cannot carry a domain wrapper.",
+	"target_emit_shape.go:postgresTargetEmitShape:c.Type": "MIRRORS-THE-EMITTER: internal/engines/postgres " +
+		"dispatches the Bug-25 generated-enum rewrite on the DECLARED type at all three of its sites " +
+		"(emitColumnDef's `c.Type.(ir.Enum)`, and emitTableDef's SET / generated-enum constraint loops), so " +
+		"a DOMAIN-wrapped enum does NOT take that branch and lands as its domain type. Unwrapping here " +
+		"would predict TEXT for a column the emitter creates as the domain — a prediction that disagrees " +
+		"with the DDL is worse than none, because the comparison then reports drift on a target migrate " +
+		"just created. If the emitter's declared-type dispatch is itself the Bug 233 class, that is a " +
+		"defect to fix THERE and this mirror follows it; TestPostgresGeneratedEnumEmitDispatchIsDeclaredType " +
+		"in internal/engines/postgres is the premise pin so the two cannot drift apart silently.",
 }
 
 // TestMySQLFamilySourceCannotCarryADomain is the premise the SOURCE-SIDE

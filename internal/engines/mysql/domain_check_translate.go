@@ -93,11 +93,14 @@ var rangeHalfPattern = regexp.MustCompile(`(?s)^\(?\s*VALUE\s*(?P<op>>=|<=|>|<|=
 // caller then falls through to the v0.96.2 silent-downgrade WARN
 // behavior.
 //
-// The returned clause is the bare CHECK clause body suitable for
+// The returned clause is a full `CHECK (...)` clause suitable for
 // inline emission inside `CREATE TABLE (..., CHECK (...))`. The
 // caller is responsible for the surrounding column-list comma and
 // any CONSTRAINT-name prefix (this translator does NOT name the
 // constraint; MySQL auto-generates a name per `tablename_chk_N`).
+// [mysqlEmitter.domainCheckBodyForMySQL] returns the same text without
+// the wrapper, for the comparison path that needs what a catalog
+// stores.
 //
 // Conservative by design: see file-header docstring for the rationale
 // behind handling only regex and range shapes. Broadening this
@@ -111,7 +114,24 @@ func translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause strin
 // pattern as a SQL string literal ([mysqlEmitter.quoteSQLString]), so the
 // backslash-escaping follows this writer's resolved sql_mode (task 2.5).
 func (m mysqlEmitter) translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause string, ok bool) {
-	body := strings.TrimSpace(check.Body)
+	translated, ok := m.domainCheckBodyForMySQL(col, check)
+	if !ok {
+		return "", false
+	}
+	return "CHECK (" + translated + ")", true
+}
+
+// domainCheckBodyForMySQL is [mysqlEmitter.translateDomainCheckToMySQL]
+// without the `CHECK (...)` wrapper — the constraint BODY, which is what
+// a catalog stores and therefore what a comparison needs.
+//
+// Split out for [SchemaWriter.PredictEmittedChecks], so the prediction
+// states what this writer emits by CALLING the translator rather than by
+// restating it. A second statement would drift, and a drift here is
+// indistinguishable from an operator having tampered with the target's
+// constraint.
+func (m mysqlEmitter) domainCheckBodyForMySQL(col string, check ir.DomainCheck) (body string, ok bool) {
+	body = strings.TrimSpace(check.Body)
 	if body == "" {
 		return "", false
 	}
@@ -158,12 +178,30 @@ func (m mysqlEmitter) translateDomainCheckToMySQL(col string, check ir.DomainChe
 // backslash + any char). The mode-awareness also fixes v0.97.1's
 // residual: under NO_BACKSLASH_ESCAPES the old unconditional doubling
 // was itself wrong.
+//
+// # The apostrophe half (found 2026-08-10)
+//
+// The capture group is the pattern as it appears INSIDE PG's SQL string
+// literal, so an apostrophe in the pattern arrives still DOUBLED — the
+// pattern's own regex deliberately admits a doubled apostrophe for
+// exactly that reason.
+// Un-doubling it before [mysqlEmitter.quoteSQLString] re-escapes is what
+// makes the translated CHECK enforce the SOURCE's predicate; without it
+// the doubling compounds and a DOMAIN over the pattern `^o'brien$` lands
+// on MySQL as a regex requiring TWO apostrophes, which REJECTS a row PostgreSQL
+// accepts. That is the Bug 113 shape this whole translator exists to
+// avoid — "a CHECK present on dst with different enforcement semantics
+// than the source is MORE dangerous than no CHECK" — arriving through
+// the escaping rather than through the grammar. Found 2026-08-10 by the
+// item-156 comparison fixture; pinned by
+// TestRegexDomainCheckApostropheIsNotDoubleEscaped.
 func (m mysqlEmitter) translateRegexCheckBody(col, body string) (string, bool) {
 	sm := regexCheckBodyPattern.FindStringSubmatch(body)
 	if sm == nil {
 		return "", false
 	}
-	return fmt.Sprintf("CHECK (REGEXP_LIKE(%s, %s))", quoteIdent(col), m.quoteSQLString(sm[1])), true
+	pattern := strings.ReplaceAll(sm[1], "''", "'")
+	return fmt.Sprintf("REGEXP_LIKE(%s, %s)", quoteIdent(col), m.quoteSQLString(pattern)), true
 }
 
 // translateRangeCheckBody handles `VALUE >= X AND VALUE <= Y` and
@@ -187,7 +225,7 @@ func translateRangeCheckBody(col, body string) (string, bool) {
 		return "", false
 	}
 	c := quoteIdent(col)
-	return fmt.Sprintf("CHECK (%s %s %s AND %s %s %s)", c, loOp, loVal, c, hiOp, hiVal), true
+	return fmt.Sprintf("%s %s %s AND %s %s %s", c, loOp, loVal, c, hiOp, hiVal), true
 }
 
 // parseRangeHalf pulls the operator and value out of one half of a

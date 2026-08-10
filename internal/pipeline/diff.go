@@ -283,6 +283,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// table CHECKs from Column.Type, so a flattened schema would suggest
 	// a CREATE TABLE missing constraints the migrate path does emit.
 	expectedDDL := translate.RetargetForEngine(expected, d.Source.Name(), d.Target.Name())
+	sourceShaped := expected
 	expected = translate.RetargetForShapeCompare(expected, d.Source.Name(), d.Target.Name())
 
 	// ---- 2. Read target's actual schema via the same SchemaReader
@@ -301,6 +302,43 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	actual, err := tr.ReadSchema(ctx)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: read target schema: %w", err))
+	}
+
+	// ---- 2b. Teach the expected side about the CHECK constraints the
+	// TARGET's own emitter synthesizes (Bug 237(b) / roadmap item 156).
+	//
+	// A MySQL `SET` column lands on Postgres as TEXT[] plus a membership
+	// CHECK; a PG DOMAIN's translatable CHECKs land on MySQL as inline
+	// table CHECKs. Neither is on the source, so the expected side had
+	// nowhere to put them and the diff reported every one as extra on a
+	// target `migrate` itself created.
+	//
+	// The predictor is asked with the SOURCE-shaped schema, before the
+	// shape-compare retarget: it dispatches on the source construct
+	// (`ir.Set`, `ir.Domain`, a generated `ir.Enum`) and the retarget has
+	// by then replaced exactly those types with the storage the target
+	// holds.
+	//
+	// A failure to OPEN the writer is deliberately not fatal here, and
+	// that is a decision rather than laxity: before this step the writer
+	// was opened LAZILY, only when there was drift to render DDL for, so
+	// a target the operator can read but not open a writer against ran a
+	// clean `schema diff` fine. Making the open fatal would break that
+	// working configuration to add a report improvement. The error is
+	// carried to [previewMissingDDL], which is where it WAS fatal and
+	// still is — so no previously-failing case quietly starts passing
+	// either.
+	sw, swErr := d.openTargetSchemaWriter(ctx)
+	if swErr != nil {
+		slog.WarnContext(ctx,
+			"diff: could not open a target schema writer; CHECK constraints sluice's own DDL emitter "+
+				"synthesizes (a MySQL SET column's membership CHECK, a PG DOMAIN's inlined CHECKs) will be "+
+				"reported as extra on target because the expected side cannot know about them",
+			slog.String("engine", d.Target.Name()),
+			slog.String("error", swErr.Error()))
+	} else {
+		defer migcore.CloseIf(sw)
+		expected = attachEmittedChecks(expected, sourceShaped, sw)
 	}
 
 	// ---- 3. Compute the diff. ----
@@ -338,7 +376,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// TABLE suggestions (MySQL/PG syntax) rather than a generic
 	// placeholder. PreviewDDL is optional; engines without it fall
 	// through to a simple comment.
-	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, d.EnabledPGExtensions, expectedDDL, diff)
+	missingDDL, missingColDDL, err := previewMissingDDL(ctx, sw, swErr, expectedDDL, diff)
 	if err != nil {
 		return nil, err
 	}
@@ -413,38 +451,112 @@ type diffRenderOpts struct {
 	IgnoreExtras           bool
 }
 
-// previewMissingDDL opens the target engine's schema writer once and
-// asks it for two flavours of "render the DDL you would emit"
-// material: full CREATE TABLE statements for tables missing from the
-// target, and per-column-def fragments for individual columns missing
-// from a present-on-both-sides table. Returning both from a single
-// helper keeps the connection lifecycle in one place — the writer
-// (and its connection pool) is opened once and closed before this
-// function returns regardless of which preview surface the engine
-// implements.
+// openTargetSchemaWriter opens the target engine's schema writer for
+// the diff's two write-side-knowledge needs: the emitted-CHECK
+// prediction ([ir.EmittedCheckPredictor]) and the missing-table /
+// missing-column DDL suggestions.
+//
+// It is opened UNCONDITIONALLY, where the suggestion path used to open
+// it lazily only when there was drift to render. That is the cost of the
+// prediction and it is deliberate: whether MySQL inlines a DOMAIN's
+// CHECKs at all depends on the live server version, which the writer
+// probes at open (see mysql.SchemaWriter.PredictEmittedChecks). Guessing
+// instead would invent a permanent "missing on target" line on an older
+// server that no action could close — and the clean-diff case is exactly
+// the one the prediction exists to produce, so a lazy open would never
+// fire for it.
+//
+// Both engines' OpenSchemaWriter are side-effect-free (connect, plus a
+// version / PostGIS probe); this adds a connection to a command that
+// already opens two, and creates nothing.
+func (d *Differ) openTargetSchemaWriter(ctx context.Context) (ir.SchemaWriter, error) {
+	sw, err := d.Target.OpenSchemaWriter(ctx, d.TargetDSN)
+	if err != nil {
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", err))
+	}
+	migcore.ApplyTargetSchema(sw, d.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, sw, d.EnabledPGExtensions); err != nil {
+		migcore.CloseIf(sw)
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
+	}
+	return sw, nil
+}
+
+// attachEmittedChecks returns compared with each table's
+// CheckConstraints extended by the constraints the target's writer would
+// SYNTHESIZE for the corresponding sourceShaped table, marked
+// [ir.CheckConstraint.SluiceEmitted].
+//
+// Two schemas because the two questions need different shapes: the
+// comparison runs against `compared` (retargeted to the target's storage
+// shapes), while the predictor dispatches on the SOURCE construct that
+// retarget just replaced. They are the same tables, by name.
+//
+// Returns compared unchanged when the engine doesn't expose the optional
+// surface or predicts nothing — the pre-existing behaviour, in which
+// those constraints report as extra on target.
+func attachEmittedChecks(compared, sourceShaped *ir.Schema, sw ir.SchemaWriter) *ir.Schema {
+	predictor, ok := sw.(ir.EmittedCheckPredictor)
+	if !ok || compared == nil || sourceShaped == nil {
+		return compared
+	}
+	srcTables := make(map[string]*ir.Table, len(sourceShaped.Tables))
+	for _, t := range sourceShaped.Tables {
+		if t != nil {
+			srcTables[t.Name] = t
+		}
+	}
+	out := *compared
+	out.Tables = make([]*ir.Table, len(compared.Tables))
+	copy(out.Tables, compared.Tables)
+	changed := false
+	for i, t := range compared.Tables {
+		if t == nil {
+			continue
+		}
+		emitted := predictor.PredictEmittedChecks(srcTables[t.Name])
+		if len(emitted) == 0 {
+			continue
+		}
+		tableCopy := *t
+		tableCopy.CheckConstraints = make([]*ir.CheckConstraint, 0, len(t.CheckConstraints)+len(emitted))
+		tableCopy.CheckConstraints = append(tableCopy.CheckConstraints, t.CheckConstraints...)
+		tableCopy.CheckConstraints = append(tableCopy.CheckConstraints, emitted...)
+		out.Tables[i] = &tableCopy
+		changed = true
+	}
+	if !changed {
+		return compared
+	}
+	return &out
+}
+
+// previewMissingDDL asks the already-open target schema writer for two
+// flavours of "render the DDL you would emit" material: full CREATE
+// TABLE statements for tables missing from the target, and per-column-def
+// fragments for individual columns missing from a present-on-both-sides
+// table.
 //
 // The returned maps may be nil when there's nothing to preview or the
 // engine doesn't expose the relevant optional surface
 // ([ir.DDLPreviewer] / [ir.ColumnDDLPreviewer]); the renderer falls
 // back to placeholder output in those cases. Errors from the
 // underlying preview calls are returned verbatim.
-func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, enabledExtensions []string, expected *ir.Schema, diff irdiff.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
+//
+// openErr carries a failure from the writer open, which the caller now
+// performs up front for the emitted-CHECK prediction. It is surfaced
+// HERE and only here, because here is where it was fatal before the
+// open moved: a diff with nothing to render never needed a writer and
+// must not start failing for want of one.
+func previewMissingDDL(ctx context.Context, sw ir.SchemaWriter, openErr error, expected *ir.Schema, diff irdiff.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
 	missingTables := diff.TablesMissing
 	missingCols := collectMissingColumns(diff)
 	if len(missingTables) == 0 && len(missingCols) == 0 {
 		return nil, nil, nil
 	}
-
-	sw, openErr := target.OpenSchemaWriter(ctx, dsn)
 	if openErr != nil {
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
+		return nil, nil, openErr
 	}
-	migcore.ApplyTargetSchema(sw, targetSchema)
-	if err := applyEnabledPGExtensions(ctx, sw, enabledExtensions); err != nil {
-		migcore.CloseIf(sw)
-		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
-	}
-	defer migcore.CloseIf(sw)
 
 	tableDDL, err = previewDDLForTables(ctx, sw, expected, missingTables)
 	if err != nil {

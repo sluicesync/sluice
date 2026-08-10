@@ -48,12 +48,15 @@ import (
 // directions, so TestRetargetCallSitesDeclareTheirLane in
 // internal/pipeline makes every call site declare which it is on.
 func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
-	// No index-name rule on the EMIT lane: the target's own DDL emitter
-	// applies its naming transformation as it writes, so pre-applying it
-	// here would either be a no-op (the rule is idempotent) or, on a
-	// future non-idempotent rule, a double application. The COMPARE lane
-	// is the one that has to predict the name.
-	return retargetSchema(s, retargetRuleFor(sourceEngine, targetEngine), nil)
+	// No index-name rule and no target-emit-shape rule on the EMIT lane:
+	// the target's own DDL emitter applies both as it writes, so
+	// pre-applying them here would either be a no-op (the rules are
+	// idempotent) or, on a future non-idempotent rule, a double
+	// application — and the target-emit-shape pass would additionally
+	// stamp [ir.Column.SourceColumnType] provenance the emit lane's
+	// RowWriter consumers would then see. The COMPARE lane is the one
+	// that has to predict both.
+	return retargetSchema(s, retargetPasses{typeRule: retargetRuleFor(sourceEngine, targetEngine)})
 }
 
 // RetargetForShapeCompare is [RetargetForEngine] for the consumers that
@@ -105,6 +108,17 @@ func RetargetForEngine(s *ir.Schema, sourceEngine, targetEngine string) *ir.Sche
 // a SchemaWriter would trade this function's loud false report for a
 // silent constraint drop. Those rules live in [compareOnlyRuleFor],
 // which only this entry point consults.
+//
+// # The TARGET-only third pass (Bug 237(a))
+//
+// Two of the target emitters' shape decisions are keyed on the TARGET
+// ALONE and are not a function of the source column's type, so they fit
+// neither pair table: a MySQL target materializes a bare temporal's
+// precision (and has no `timetz` at all), and a Postgres target emits a
+// GENERATED enum column as TEXT. [targetEmitShapeRuleFor] states both,
+// and it runs for same-engine pairs too — postgres→postgres has no rule
+// table and still lands the generated-enum rewrite. Compare-lane only,
+// for the provenance reason given at that function.
 func RetargetForShapeCompare(s *ir.Schema, sourceEngine, targetEngine string) *ir.Schema {
 	var typeRule retargetRule
 	if rule := shapeCompareRuleFor(sourceEngine, targetEngine); rule != nil {
@@ -115,18 +129,45 @@ func RetargetForShapeCompare(s *ir.Schema, sourceEngine, targetEngine string) *i
 	// consumers gate on first). A same-family target holds the DOMAIN
 	// itself, so unwrapping there would compare a wrapper against a
 	// wrapper the target really has.
-	return retargetSchema(s, typeRule, indexNameRuleFor(targetEngine))
+	return retargetSchema(s, retargetPasses{
+		typeRule:   typeRule,
+		columnRule: targetEmitShapeRuleFor(targetEngine),
+		nameRule:   indexNameRuleFor(targetEngine),
+	})
 }
 
-// retargetSchema applies rule to every column of every table and
-// nameRule to every secondary index. Both nil is the identity
-// (unknown/same-engine pairs with a verbatim-naming target), returning
-// the input pointer so callers keep the untouched schema.
-func retargetSchema(s *ir.Schema, rule retargetRule, nameRule indexNameRule) *ir.Schema {
+// retargetPasses bundles the (up to three) independent rewrites a
+// retarget applies. Grouping them keeps [retargetSchema] and
+// [retargetTable] from growing a positional argument list whose order a
+// caller can silently get wrong. The zero value is the identity.
+type retargetPasses struct {
+	// typeRule rewrites a column's storage type from the (source,
+	// target) pair's rule table. BOTH lanes.
+	typeRule retargetRule
+	// columnRule rewrites a column's type from target-emitter effects
+	// that need the whole column rather than just its type. COMPARE lane
+	// only ([targetEmitShapeRuleFor] says why).
+	columnRule columnShapeRule
+	// nameRule renames secondary indexes to the names the target holds
+	// them under. COMPARE lane only.
+	nameRule indexNameRule
+}
+
+// empty reports whether every pass is absent, i.e. the retarget is the
+// identity and the caller can keep the input schema.
+func (p retargetPasses) empty() bool {
+	return p.typeRule == nil && p.columnRule == nil && p.nameRule == nil
+}
+
+// retargetSchema applies p's passes to every column of every table and
+// every secondary index. An empty p is the identity (unknown/same-engine
+// pairs with a verbatim-naming target), returning the input pointer so
+// callers keep the untouched schema.
+func retargetSchema(s *ir.Schema, p retargetPasses) *ir.Schema {
 	if s == nil {
 		return nil
 	}
-	if rule == nil && nameRule == nil {
+	if p.empty() {
 		return s
 	}
 	out := &ir.Schema{
@@ -139,7 +180,7 @@ func retargetSchema(s *ir.Schema, rule retargetRule, nameRule indexNameRule) *ir
 		Sequences: s.Sequences,
 	}
 	for i, tbl := range s.Tables {
-		out.Tables[i] = retargetTable(tbl, rule, nameRule)
+		out.Tables[i] = retargetTable(tbl, p)
 	}
 	return out
 }
@@ -435,30 +476,44 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 // as one missing + one extra — the same phantom-drift shape item 153
 // closed on the type axis, one axis over. nameRule is nil on the emit
 // lane and for targets that hold names verbatim.
-func retargetTable(tbl *ir.Table, rule retargetRule, nameRule indexNameRule) *ir.Table {
+// # The THIRD axis: target-emitter effects that need the whole COLUMN
+//
+// [retargetPasses.columnRule] runs AFTER the type rule and sees the
+// already-rewritten column, so the two compose rather than race: on
+// mysql→postgres the pair table leaves `ir.Enum` alone and the column
+// rule then turns a GENERATED one into TEXT. It is COMPARE-lane only.
+func retargetTable(tbl *ir.Table, p retargetPasses) *ir.Table {
 	if tbl == nil {
 		return nil
 	}
 	var rewrittenCols []*ir.Column
-	if rule != nil {
-		for i, col := range tbl.Columns {
-			newType := rule(col.Type)
-			if newType == nil {
-				continue
+	rewriteCol := func(i int, col *ir.Column, newType ir.Type) *ir.Column {
+		if rewrittenCols == nil {
+			rewrittenCols = make([]*ir.Column, len(tbl.Columns))
+			copy(rewrittenCols, tbl.Columns)
+		}
+		colCopy := *col
+		colCopy.Type = newType
+		if colCopy.SourceColumnType == nil {
+			colCopy.SourceColumnType = col.Type
+		}
+		rewrittenCols[i] = &colCopy
+		return &colCopy
+	}
+	for i, col := range tbl.Columns {
+		current := col
+		if p.typeRule != nil {
+			if newType := p.typeRule(current.Type); newType != nil {
+				current = rewriteCol(i, current, newType)
 			}
-			if rewrittenCols == nil {
-				rewrittenCols = make([]*ir.Column, len(tbl.Columns))
-				copy(rewrittenCols, tbl.Columns)
+		}
+		if p.columnRule != nil {
+			if newType := p.columnRule(current); newType != nil {
+				rewriteCol(i, current, newType)
 			}
-			colCopy := *col
-			colCopy.Type = newType
-			if colCopy.SourceColumnType == nil {
-				colCopy.SourceColumnType = col.Type
-			}
-			rewrittenCols[i] = &colCopy
 		}
 	}
-	rewrittenIdx := retargetIndexNames(tbl, nameRule)
+	rewrittenIdx := retargetIndexNames(tbl, p.nameRule)
 	if rewrittenCols == nil && rewrittenIdx == nil {
 		return tbl
 	}

@@ -283,7 +283,13 @@ Not fixed in the docs sweep because it changes operator-visible message text and
 
 ## 2026-08-09 — v0.118.0 regression cycle
 
-### Bug 237 (LOW, pre-existing): `schema diff` still reports phantom drift on a `migrate`-created target
+### Bug 237 (filed LOW, RE-GRADED — arm (a) is a loud `migrate` refusal, not an advisory-surface defect): `schema diff` still reports phantom drift on a `migrate`-created target
+
+**CLOSED 2026-08-10, together with roadmap item 156** — the two are the same shape and were fixed as one chunk; see item 156 in `docs/dev/roadmap.md` for the fix, the sibling enumeration, the named wart, and the two findings the work surfaced.
+
+**The re-grading, and why it is worth writing down.** Arm (a) was filed as an advisory-surface problem that "exits 1 with no data at risk". Measured on real containers before the fix, it is also this: the ADR-0166 migrate pre-create shape gate compares the SAME `translate.RetargetForShapeCompare` rendering `schema diff` does, so a SECOND `sluice migrate` over a target the first one created REFUSED — `1 pre-existing target table(s) differ … column "ts_bare": want DateTime(unspecified), target has DateTime(6)` — for any PG schema carrying a bare `TIME`/`TIMESTAMP`/`TIMESTAMPTZ`. A re-run and a resume are ordinary operations, so this was a loud failure on a working configuration (queue priority 2), not a LOW. The filing graded the SURFACE it was found on rather than the shared code path underneath it; the general lesson is that a defect in a comparison helper inherits the severity of its most consequential consumer, and `RetargetForShapeCompare` has two — one that reports and one that REFUSES.
+
+**Arm (a) was also WIDER than filed.** The filing named precision (`Time(unspecified)` vs `Time(6)`). The measured matrix has a second, independent axis: MySQL has no `timetz`, so a PG `TIME WITH TIME ZONE` reads back with the zone flag CLEAR at every precision — `TimeTZ(3)` mismatches `Time(3)` with no precision problem at all. A fix derived from the filed witness alone would have left it.
 
 Two residual arms, both surviving the Bug 234 / item 158 index-and-type work and neither newly introduced:
 
@@ -291,6 +297,14 @@ Two residual arms, both surviving the Bug 234 / item 158 index-and-type work and
 - **sluice's own `SET`-emulation CHECK reported as extra.** `migrate` emits a CHECK carrying the member list when it lands a MySQL `SET` on a target without one; the expected side is built without it, so the diff reports the constraint sluice itself created.
 
 Deferred rather than fixed with Bug 236 because the two have nothing in common beyond the command: this one is a comparison-normalisation gap that has been present since the cross-engine diff existed, it exits 1 with no data at risk, and folding it into a same-day regression patch would have widened a release cut specifically to close a shipped over-refusal. **It is the same shape as item 156** (a domain's translatable CHECKs landing as auto-named table-level CHECKs the flattened expected side cannot carry) and should be picked up with it — the SET-emulation arm is very nearly item 156 with a different constraint source.
+
+### NEW (filed 2026-08-10, found while closing Bug 237 / item 156): MySQL's SchemaReader mangles any CHECK clause or generated-column body containing an APOSTROPHE
+
+`normalizeMySQLExpressionText` → `convertMySQLEscapedApostrophes` is a blind `strings.ReplaceAll(s, "\\'", "'")`. But `information_schema` renders a string literal DOUBLE-escaped when its value itself contains a quote: a CHECK on the pattern `^o'brien$` comes back as ``regexp_like(`quoted`,_utf8mb4\'^o\\\'brien$\')``, and a single un-escaping pass leaves `'^o\\'brien$'` — two backslashes, a literal that terminates in the wrong place, and an expression the IR then carries as malformed text.
+
+**Measured**, real `mysql:8.0`, `internal/pipeline` scratch probe (RAW `information_schema.CHECK_CLAUSE` vs the reader's `ir.CheckConstraint.Expr`). Reachable by any PG DOMAIN CHECK or MySQL user CHECK whose literal contains an apostrophe, and by any generated-column body likewise — the same normalization serves `GENERATION_EXPRESSION`.
+
+**Not fixed in that chunk, deliberately.** The blast radius is wider than the comparison surface that found it, and doing it right needs its own escaping matrix: quote-only, backslash-only, both, and the `NO_BACKSLASH_ESCAPES` sql_mode where the doubling convention inverts (`quoteSQLString` is already mode-keyed for exactly this reason, and the READER is not mode-aware at all). Consequence today is loud rather than silent — such a constraint reports as one missing plus one extra on `schema diff` rather than being matched — but a mangled generated-column body re-emitted on a restore lane is the shape to look at first when this is taken up.
 
 ### The Bug 236 lesson: a pre-tag fix is still a fix, and it still owes the sweep
 

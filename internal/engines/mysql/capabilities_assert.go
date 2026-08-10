@@ -70,6 +70,7 @@ var (
 	// SchemaWriter optional surfaces.
 	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)
 	_ ir.DDLPreviewer            = (*SchemaWriter)(nil)
+	_ ir.EmittedCheckPredictor   = (*SchemaWriter)(nil)
 	_ ir.IncrementalIndexBuilder = (*SchemaWriter)(nil)
 	_ ir.IndexBuildBudgetSetter  = (*SchemaWriter)(nil)
 	_ ir.SchemaDeltaApplier      = (*SchemaWriter)(nil)

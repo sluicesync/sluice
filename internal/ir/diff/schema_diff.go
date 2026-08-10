@@ -723,9 +723,23 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 // Unnamed CHECKs are skipped: an anonymous constraint can't be
 // matched across sides without expression-text comparison, which
 // would produce false positives on cross-engine spelling differences.
+//
+// # The one exception, and why it is not a suppression (Bug 237(b) / item 156)
+//
+// An expected-side constraint carrying [ir.CheckConstraint.SluiceEmitted]
+// is one sluice's own target-side emitter SYNTHESIZES — the target holds
+// it, the source never declared it, and its NAME on the target is
+// frequently unpredictable (MySQL numbers an inline CHECK `<t>_chk_N` by
+// position). Those are matched to the actual side by CANONICALIZED
+// EXPRESSION first, by [matchEmittedChecks], and both sides drop out of
+// the name-keyed pass below when they pair up.
+//
+// It is expression matching rather than blanket suppression precisely so
+// the command keeps its job: a SET-membership CHECK an operator DROPPED
+// still reports missing, and one they EDITED reports as both missing (the
+// predicate sluice would emit) and extra (the predicate that is there).
 func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
-	expChecks := checksByName(expected)
-	actChecks := checksByName(actual)
+	expChecks, actChecks := matchEmittedChecks(checksByName(expected), checksByName(actual))
 
 	for name := range expChecks {
 		if _, ok := actChecks[name]; !ok {
@@ -764,6 +778,77 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 			ActualExpr:   actExpr,
 		})
 	}
+}
+
+// matchEmittedChecks pairs off the expected-side constraints sluice's
+// own emitter synthesizes against the actual-side constraints that carry
+// the same predicate, and returns the two maps with every matched pair
+// REMOVED — so [diffChecks]'s name-keyed pass sees only what is left.
+//
+// Matching is on [canonicalCheckExpr], never on the name: MySQL's
+// positional `<table>_chk_N` is not predictable from the source schema,
+// which is the obstacle that kept roadmap item 156 open. Both sides are
+// walked in sorted-name order so a table with two identical predicates
+// pairs them deterministically.
+//
+// The inputs are not mutated; the caller's maps are rebuilt.
+func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (exp, act map[string]*ir.CheckConstraint) {
+	emitted := make([]string, 0, len(expChecks))
+	for name, c := range expChecks {
+		if c != nil && c.SluiceEmitted {
+			emitted = append(emitted, name)
+		}
+	}
+	if len(emitted) == 0 {
+		return expChecks, actChecks
+	}
+	sort.Strings(emitted)
+
+	actNames := make([]string, 0, len(actChecks))
+	for name := range actChecks {
+		actNames = append(actNames, name)
+	}
+	sort.Strings(actNames)
+
+	matchedExp := make(map[string]struct{}, len(emitted))
+	matchedAct := make(map[string]struct{}, len(emitted))
+	for _, expName := range emitted {
+		want := canonicalCheckExpr(expChecks[expName].Expr)
+		if want == "" {
+			// A predictor that produced an empty predicate has told us
+			// nothing; leave the entry in the name-keyed pass rather than
+			// letting it match another empty one.
+			continue
+		}
+		for _, actName := range actNames {
+			if _, taken := matchedAct[actName]; taken {
+				continue
+			}
+			a := actChecks[actName]
+			if a == nil || canonicalCheckExpr(a.Expr) != want {
+				continue
+			}
+			matchedExp[expName] = struct{}{}
+			matchedAct[actName] = struct{}{}
+			break
+		}
+	}
+	if len(matchedExp) == 0 {
+		return expChecks, actChecks
+	}
+	return withoutKeys(expChecks, matchedExp), withoutKeys(actChecks, matchedAct)
+}
+
+// withoutKeys returns a copy of m with the keys in drop removed.
+func withoutKeys(m map[string]*ir.CheckConstraint, drop map[string]struct{}) map[string]*ir.CheckConstraint {
+	out := make(map[string]*ir.CheckConstraint, len(m))
+	for k, v := range m {
+		if _, dropped := drop[k]; dropped {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // diffColumn returns a ColumnDiff and a flag indicating whether any

@@ -322,6 +322,30 @@ type CheckConstraint struct {
 	// cross-dialect translation pass first. See ADR-0016 for the
 	// layered translation policy.
 	ExprDialect string
+
+	// SluiceEmitted marks a constraint that the SOURCE does not declare
+	// and that sluice's own target-side DDL emitter SYNTHESIZES — the
+	// Postgres writer's SET-membership and generated-enum CHECKs, the
+	// MySQL writer's inlined PG-DOMAIN CHECKs. See
+	// [EmittedCheckPredictor] for who produces these and why the
+	// comparison needs them.
+	//
+	// Set ONLY on the expected side of a shape comparison, by
+	// internal/pipeline's diff orchestrator. No SchemaReader ever sets
+	// it (a reader reports what the catalog holds, and the catalog does
+	// not record who asked for it), and no SchemaWriter reads it — the
+	// emitters synthesize these constraints from the column, so a writer
+	// handed one back would emit it twice.
+	//
+	// `json:"-"` is load-bearing, not tidiness. These structs are
+	// marshalled untagged into the backup-chain schema fingerprint
+	// (internal/ir/backup's ComputeSchemaHash, frozen-golden tested), so
+	// an untagged field here would move the fingerprint of every schema
+	// that never changed and make every chain an operator already holds
+	// unrestorable. Excluding it is also the honest encoding: a
+	// compare-lane annotation is not part of what the target holds, so
+	// it has no business in a manifest.
+	SluiceEmitted bool `json:"-"`
 }
 
 // ExcludeConstraint represents a PostgreSQL EXCLUDE constraint

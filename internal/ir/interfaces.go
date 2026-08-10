@@ -80,6 +80,49 @@ type ColumnDDLPreviewer interface {
 	EmitColumnDef(ctx context.Context, table *Table, col *Column) (string, error)
 }
 
+// EmittedCheckPredictor is the optional engine surface for "name the
+// CHECK constraints you would SYNTHESIZE for this table" — the ones the
+// source schema does not declare and that this writer adds anyway to
+// carry a source construct the target has no native form for.
+//
+// # Why the comparison cannot do without it (Bug 237(b) / roadmap item 156)
+//
+// Three such constraints exist today, and every one of them made `sluice
+// schema diff` report drift on a target `sluice migrate` had just
+// created, because the expected side is built from the SOURCE schema and
+// the source never declared them:
+//
+//   - Postgres, for a MySQL `SET` column: `CONSTRAINT <t>_<c>_set CHECK
+//     (<c> <@ ARRAY[...])`, carrying the member list.
+//   - Postgres, for a GENERATED enum column (Bug 25): `CONSTRAINT
+//     <t>_<c>_enum_chk CHECK (<c> IN (...))`, carrying the value list
+//     the column loses when it emits as TEXT.
+//   - MySQL, for a PG `DOMAIN`'s translatable CHECKs (v0.97.0): an
+//     inline `CHECK (...)` per translated clause.
+//
+// Implementations return constraints with [CheckConstraint.SluiceEmitted]
+// set. The NAME is best-effort and is NOT the matching key — MySQL
+// auto-names an inline CHECK `<table>_chk_N` by position, which no
+// expected side can predict — so the diff matches these by NORMALIZED
+// EXPRESSION and uses the name only to render a suggestion. An
+// unmatched one is still reported (a dropped SET-membership CHECK is
+// real drift), which is what keeps this from being a blanket
+// suppression.
+//
+// Engines implement this on the same type that satisfies [SchemaWriter],
+// because whether the constraint is emitted at all can depend on the
+// live server (MySQL inlines CHECKs only on 8.0.16+, probed at writer
+// open). Predicting a constraint an older server never received would
+// invent a permanent "missing on target" line no action could close.
+//
+// table is the SOURCE-side table, before any compare-lane retarget: the
+// emitters dispatch on the source construct (`ir.Set`, `ir.Domain`, a
+// generated `ir.Enum`), which a retarget to the target's storage shape
+// has by then replaced.
+type EmittedCheckPredictor interface {
+	PredictEmittedChecks(table *Table) []*CheckConstraint
+}
+
 // SchemaWriter applies an IR [Schema] to a target database in three
 // phases plus a small post-bulk-copy reconciliation step. Splitting
 // schema creation from index/constraint creation is what enables

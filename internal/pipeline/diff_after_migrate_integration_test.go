@@ -37,6 +37,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -468,31 +469,41 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres_TypeFamilyMatrix(t *testing.T) {
 	}
 }
 
-// TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift is a
-// CHARACTERIZATION test and says so in its own name: it asserts the
-// defect IS present.
+// TestSchemaDiffAfterMigrate_MySQLToPostgres_EmittedChecksAreReconciled
+// closes the CHECK axis item 158 left open — the mirror of roadmap item
+// 156, one target over — and it carries BOTH constraints the Postgres
+// writer synthesizes, not one.
 //
-// Item 158 closed the TYPE axis for a MySQL `SET` column — the expected
-// side now names `Array<Text[long]>`, which is what a Postgres catalog
-// reads back for the TEXT[] sluice lands. It did NOT close the CHECK
-// axis: internal/engines/postgres emits `CONSTRAINT "<table>_<column>_set"
-// CHECK (<column> <@ ARRAY[…])` beside that column to carry the source's
-// member list, the expected side has nowhere to carry a table-level CHECK
-// the SOURCE never had, and `diffChecks` reports it as ChecksExtra on
-// every run.
+// This file's earlier version was a CHARACTERIZATION pin asserting the
+// defect was present, and it instructed its own inversion. Inverted here,
+// with the sibling it named only implicitly.
 //
-// This is roadmap item 156's mirror. The obstacle measured there applies
-// here too and only halfway: the constraint NAME is deterministic (unlike
-// MySQL's positional `<table>_chk_N`), but PostgreSQL does not return the
-// expression it was given — `("c_set" <@ ARRAY['x','y']::TEXT[])` reads
-// back as `(c_set <@ ARRAY['x'::text, 'y'::text])` — so matching still
-// needs an expression normalizer, and a name-only match would accept a
-// TAMPERED predicate as in sync. That is the decision this test defers.
+// # The two, and why one would not have done
 //
-// INVERT THIS TEST when the CHECK axis is closed, in both directions: the
-// partial-fix state, where the type is reconciled and the check is not, is
-// the dangerous one because the remaining line looks like real drift.
-func TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift(t *testing.T) {
+// internal/engines/postgres appends TWO kinds of table-level CHECK the
+// source never declared, in two separate emitter loops:
+//
+//   - `<t>_<c>_set` for a MySQL `SET` column, carrying the member list
+//     the column loses when it lands as TEXT[];
+//   - `<t>_<c>_enum_chk` for a GENERATED enum column (Bug 25), carrying
+//     the value list the column loses when it lands as TEXT.
+//
+// Item 158's own residual note named only the first. The second has the
+// identical shape and was reported as phantom drift the identical way —
+// plus a phantom TYPE line, since a generated enum column reads back as
+// `Text[long]` against an expected `Enum{…}`. That is a COLUMN-level
+// emitter effect, not a type-level one, which is why it needed
+// translate's target-emit-shape pass rather than an arm in a rule table.
+//
+// # Both directions, because the alternative is a blindfold
+//
+// PostgreSQL does not return the expression it was given — `("flags" <@
+// ARRAY['email','sms']::TEXT[])` reads back as `(flags <@ ARRAY['email'::
+// text, 'sms'::text])`, and an `IN (…)` list comes back as `= ANY
+// (ARRAY[…])` — so the match is on a canonicalized predicate. A name-only
+// match would have been cheaper and would have accepted a TAMPERED
+// membership list as in sync; the DIRTY halves are what rule that out.
+func TestSchemaDiffAfterMigrate_MySQLToPostgres_EmittedChecksAreReconciled(t *testing.T) {
 	mysqlSource, _, mysqlCleanup := startMySQL(t)
 	defer mysqlCleanup()
 	_, pgTarget, pgCleanup := startPostgres(t)
@@ -500,8 +511,10 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift(t *testin
 
 	applyMySQLDDL(t, mysqlSource, `
 		CREATE TABLE prefs (
-			id    INT NOT NULL PRIMARY KEY,
-			flags SET('email','sms')
+			id     INT NOT NULL PRIMARY KEY,
+			flags  SET('email','sms'),
+			mood   ENUM('happy','sad'),
+			g_mood ENUM('happy','sad') AS (mood) STORED
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`)
 
@@ -522,29 +535,94 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres_SetCheckIsPhantomDrift(t *testin
 		t.Fatalf("Migrator.Run: %v", err)
 	}
 
+	// Anti-vacuity, asked of PostgreSQL's catalog rather than of sluice:
+	// a run where the emitter created NO constraints would produce a
+	// clean diff for the wrong reason, which is the shape that makes a
+	// gate worse than none.
+	landed := pgCheckConstraintNames(t, ctx, pgTarget, "prefs")
+	if len(landed) != 2 {
+		t.Fatalf("pg_constraint reports %d CHECK constraint(s) on `prefs` (%v); want exactly 2 — the SET "+
+			"membership CHECK and the Bug-25 generated-enum CHECK. `mood` is the control: a NON-generated "+
+			"enum column keeps the native PG enum type and needs no CHECK, so a count of 3 means the emitter "+
+			"has started constraining it and this pin's reasoning no longer holds", len(landed), landed)
+	}
+
+	assertNoDrift(t, runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget))
+
+	// DIRTY 1 — the membership CHECK DROPPED. The target now accepts any
+	// text array, including members the MySQL source would reject.
+	applyPGDDL(t, pgTarget, `ALTER TABLE "prefs" DROP CONSTRAINT "prefs_flags_set"`)
 	diff := runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
 	td := findTableDiff(*diff, "prefs")
-	if td == nil {
-		t.Fatalf("no table diff for prefs at all — the SET membership CHECK residual this test characterizes "+
-			"has been CLOSED. Invert this test: assert the diff is clean.\n%s", diff.Summary())
+	if td == nil || len(td.ChecksMissing) != 1 || td.ChecksMissing[0] != "prefs_flags_set" {
+		t.Fatalf("a DROPPED SET-membership CHECK went unreported — the emitted-check attachment has become a "+
+			"blanket suppression of target-side CHECKs: %+v", td)
 	}
 
-	// The TYPE axis IS closed. If this fires, item 158's ir.Set arm is gone
-	// and the test below would be characterizing the wrong defect.
-	for _, cd := range td.ColumnsMismatched {
-		if cd.Name == "flags" {
-			t.Errorf("column flags reported type drift (expected=%s actual=%s); item 158's ir.Set arm closed "+
-				"that axis and this test's premise is that only the CHECK remains", cd.ExpectedType, cd.ActualType)
+	// DIRTY 2 — re-added under the same name with an EXTRA member. Same
+	// name, different predicate: exactly what a name-only match would
+	// have accepted.
+	applyPGDDL(t, pgTarget,
+		`ALTER TABLE "prefs" ADD CONSTRAINT "prefs_flags_set" CHECK ("flags" <@ ARRAY['email','sms','fax']::TEXT[])`)
+	diff = runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
+	td = findTableDiff(*diff, "prefs")
+	if td == nil || (len(td.ChecksMismatched) == 0 && len(td.ChecksMissing) == 0) {
+		t.Fatalf("a WIDENED SET-membership CHECK reported as in sync. The comparison is matching sluice-emitted "+
+			"constraints by NAME rather than by predicate, so a target that accepts 'fax' while the source "+
+			"cannot store it looks clean: %+v", td)
+	}
+	t.Logf("tampered-check report: mismatched=%+v missing=%v extra=%v",
+		td.ChecksMismatched, td.ChecksMissing, td.ChecksExtra)
+
+	// DIRTY 3 — the generated-enum value list widened, the sibling
+	// constraint, tampered the same way. Enumerated rather than assumed
+	// to travel with its sibling: item 158 is the precedent for a fix
+	// reaching one of these and silently missing the other.
+	applyPGDDL(t, pgTarget, `ALTER TABLE "prefs" DROP CONSTRAINT "prefs_g_mood_enum_chk"`)
+	applyPGDDL(t, pgTarget,
+		`ALTER TABLE "prefs" ADD CONSTRAINT "prefs_g_mood_enum_chk" CHECK ("g_mood" IN ('happy','sad','livid'))`)
+	diff = runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
+	td = findTableDiff(*diff, "prefs")
+	if td == nil || (len(td.ChecksMismatched) == 0 && len(td.ChecksMissing) == 0) {
+		t.Fatalf("a WIDENED generated-enum CHECK reported as in sync: %+v", td)
+	}
+}
+
+// pgCheckConstraintNames asks PostgreSQL's own catalog which CHECK
+// constraints a table carries. Deliberately not routed through sluice's
+// SchemaReader: this is the independent evidence the clean-diff
+// assertion rests on, and reading it with a component under test would
+// put both halves on one producer.
+func pgCheckConstraintNames(t *testing.T, ctx context.Context, dsn, table string) []string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open pg target: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const q = `
+		SELECT con.conname
+		FROM   pg_constraint con
+		JOIN   pg_class rel ON rel.oid = con.conrelid
+		JOIN   pg_namespace n ON n.oid = rel.relnamespace
+		WHERE  con.contype = 'c' AND n.nspname = 'public' AND rel.relname = $1
+		ORDER  BY con.conname`
+	rows, err := db.QueryContext(ctx, q, table)
+	if err != nil {
+		t.Fatalf("list target CHECK constraints: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan constraint name: %v", err)
 		}
+		out = append(out, name)
 	}
-
-	// The CHECK axis is NOT.
-	if len(td.ChecksExtra) != 1 || td.ChecksExtra[0] != "prefs_flags_set" {
-		t.Fatalf("expected exactly the phantom membership CHECK `prefs_flags_set` in checks_extra; got %v.\n"+
-			"If it is now absent the residual is closed — invert this test and update roadmap item 158's "+
-			"residual note. If a DIFFERENT name appeared, the emitter's constraint naming changed and every "+
-			"already-migrated target will report the old name as extra AND the new one as missing",
-			td.ChecksExtra)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraint names: %v", err)
 	}
-	t.Logf("characterized residual (item 156's mirror): checks_extra=%v", td.ChecksExtra)
+	return out
 }

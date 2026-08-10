@@ -82,6 +82,7 @@ var (
 	// SchemaWriter optional surfaces.
 	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)
 	_ ir.DDLPreviewer            = (*SchemaWriter)(nil)
+	_ ir.EmittedCheckPredictor   = (*SchemaWriter)(nil)
 	_ ir.DegradedFKAllower       = (*SchemaWriter)(nil)
 	_ ir.DegradedFKReporter      = (*SchemaWriter)(nil)
 	_ ir.FKOrphanClassifier      = (*SchemaWriter)(nil)
