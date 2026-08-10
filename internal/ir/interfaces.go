@@ -3637,6 +3637,71 @@ type TableNameFoldPreflighter interface {
 	PreflightTableNameFold(ctx context.Context, dsn string, s *Schema) error
 }
 
+// ColumnTypeEmitPreflighter is the optional TARGET-engine surface that answers,
+// with no database connection and before any data moves, "can you render every
+// COLUMN TYPE in this schema?".
+//
+// # Why it exists, and what it replaces
+//
+// The hand-coded alternative is [migcore.CheckCrossEngineSupportable], which
+// enumerates PG-native shapes that have no MySQL form. It is keyed on engine
+// NAME strings and it covers exactly ONE direction: `isPGSourceEngine(src) &&
+// IsMySQLFamilyEngine(dst)`. Every other pair — PG → SQLite, MySQL → SQLite,
+// SQLite → anything — falls straight through it, so a type the target cannot
+// hold is found by the target's own CREATE TABLE, in the schema-apply phase,
+// after the plan is printed, the writers are open, and (in a multi-table
+// schema) the tables ahead of the offending one have already been created.
+//
+// This surface asks the target ENGINE instead, so it works for pairs nobody
+// hand-coded — including pairs that do not exist yet. The engine answers by
+// running its OWN type dispatch (`emitColumnType`), which is the same function
+// its DDL emitter calls, so the early verdict and the late one cannot drift:
+// they are one function.
+//
+// # Why a FIFTH interface rather than a question inside PreflightTables
+//
+// Because [TableEmitPreflighter] already means something narrower than its
+// name, and a roster gate depends on that meaning. It is the connection-free
+// half of the `IF NOT EXISTS` silent-merge class, and
+// TestEveryTargetRefusesACollidingTableNamespace records `postgres` /
+// `postgres-trigger` as EXEMPT from it with a safety argument about identifier
+// comparison — and FAILS an engine that both implements it and is exempt.
+// Folding the column-type question in would make Postgres an implementor for a
+// reason that has nothing to do with namespaces, and the roster would then read
+// as covering a question it does not ask. That is the exact failure CLAUDE.md's
+// gate-scope rule names. One question per name; the sharing is at the call
+// sites, which are the same six for all five helpers.
+//
+// # Contract
+//
+// PreflightColumnTypes returns the SAME refusal the engine's column emitter
+// would return later — same column, same type, same remedy — or nil, and it
+// names the TABLE and COLUMN the emitter's own error may not (the emitter
+// refuses a TYPE; the operator needs the column). It must not refuse anything
+// the emit phase would accept: an over-refusing preflight is a worse defect
+// than the late refusal it replaces.
+//
+// # The GAP, stated rather than implied
+//
+// It takes no context and opens no connection, so a refusal that depends on the
+// target SERVER's state or on a run's flags is deliberately NOT asked here.
+// Two exist today, both on Postgres: `GEOMETRY requires PostGIS` (detected at
+// writer-open) and `--enable-pg-extension` (a flag this surface does not
+// carry). Both stay where they are, in the emitter, and both still fire in the
+// create-tables phase — which is phase one, before any row moves. The engine
+// implementations run their emitter under the MOST PERMISSIVE configuration the
+// run could have, precisely so that what survives is refusable under every
+// configuration.
+//
+// An engine that does not implement this is SKIPPED, and that is a GAP rather
+// than a pass — nothing about a missing implementation says the engine can hold
+// every type. Which engines answer, and which are exempt with a written reason,
+// is held to the registry by
+// TestEveryTargetCapableEngineAnswersTheColumnTypePreflight.
+type ColumnTypeEmitPreflighter interface {
+	PreflightColumnTypes(s *Schema) error
+}
+
 // ConnectionLabeler is the optional engine surface for engines that can
 // stamp every connection they open with an operator-visible label
 // carrying the run's stream-/migration-id, so operators can find a

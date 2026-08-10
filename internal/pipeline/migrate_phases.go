@@ -394,6 +394,18 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	if err := migcore.PreflightViewEmit(ctx, m.Target, schema, "migrate"); err != nil {
 		return nil, false, err
 	}
+	// The COLUMN-TYPE member of the family. Deliberately last of the five and
+	// deliberately AFTER the cross-engine block above: on the one pair
+	// CheckCrossEngineSupportable covers (PG-family source → MySQL-family
+	// target) both can refuse the same column, and that one carries recovery
+	// guidance this one cannot derive, so it keeps owning those messages. What
+	// this adds is every OTHER pair — PG → SQLite, MySQL → PG, SQLite → MySQL —
+	// where the refusal previously came from the target's own CREATE TABLE,
+	// after the plan was printed and with the tables ahead of the offending one
+	// already created.
+	if err := migcore.PreflightColumnTypeEmit(ctx, m.Target, schema, "migrate"); err != nil {
+		return nil, false, err
+	}
 
 	return schema, rawCopyOK, nil
 }

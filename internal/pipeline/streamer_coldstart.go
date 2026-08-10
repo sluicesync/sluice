@@ -166,6 +166,13 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err := migcore.PreflightViewEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return nil, stop, err
 	}
+	// The COLUMN-TYPE member, under the same parity agreement: schema-apply is
+	// a phase both entry points run, so a type the target cannot render must
+	// refuse at the same point on both. Here that is before the snapshot stream
+	// opens, so a refusal leaves no replication slot to abandon either.
+	if err := migcore.PreflightColumnTypeEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return nil, stop, err
+	}
 
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from

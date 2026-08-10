@@ -167,6 +167,20 @@ func (e Engine) PreflightIndexes(s *ir.Schema) error {
 // boundary.
 var _ ir.IndexEmitPreflighter = Engine{}
 
+// PreflightColumnTypes implements [ir.ColumnTypeEmitPreflighter] by delegating
+// to the composed [postgres.Engine]. Same reason as PreflightIndexes above, and
+// the same trap: a method on the composed struct is NOT promoted through this
+// wrapper's method set unless it is written, so omitting it would leave the
+// trigger target un-gated with postgres.Engine's own interface assertion still
+// green.
+func (e Engine) PreflightColumnTypes(s *ir.Schema) error {
+	return e.pg.PreflightColumnTypes(s)
+}
+
+// Compile-time proof the trigger engine carries the pre-copy column-type gate
+// rather than losing it at the delegation boundary.
+var _ ir.ColumnTypeEmitPreflighter = Engine{}
+
 // OpenRowReader delegates to the composed [postgres.Engine].
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	return e.pg.OpenRowReader(ctx, dsn)

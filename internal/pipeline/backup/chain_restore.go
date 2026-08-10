@@ -196,6 +196,13 @@ func (r *ChainRestore) refuseUnrepresentableTargetShape(ctx context.Context, sch
 	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "chain restore"); err != nil {
 		return err
 	}
+	// The COLUMN-TYPE member, on the ROOT manifest's schema — the shape the
+	// target tables are created from. Same pre-retarget note as its
+	// single-manifest twin: safe because the emit-lane retarget mirrors the
+	// MySQL emitter, pinned by TestPreflightColumnTypes_IsRetargetInvariant.
+	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+		return err
+	}
 	// Item 149: the chain's table names may only collide once the TARGET
 	// server's fold is applied, which is not knowable from the manifest.
 	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, schema, "chain restore")

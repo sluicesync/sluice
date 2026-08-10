@@ -449,6 +449,16 @@ func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *
 	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "restore"); err != nil {
 		return err
 	}
+	// The COLUMN-TYPE member. NOTE the schema it is handed: this phase runs on
+	// the manifest's SOURCE-shaped schema, and [translate.RetargetForEngine]
+	// rewrites it for the target further down in Run. That is safe because the
+	// only emit-lane rule table (PG → MySQL) mirrors the MySQL emitter's own
+	// auto-emit arms, so every type it would rewrite the emitter already
+	// accepts unrewritten — a premise pinned, rather than asserted, by
+	// TestPreflightColumnTypes_IsRetargetInvariant in internal/engines/mysql.
+	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, schema, "restore"); err != nil {
+		return err
+	}
 	// Item 149: the archive's own table names, against the fold of the server
 	// this restore is pointed at. A backup taken from a case-sensitive MySQL
 	// (or from Postgres) can hold a pair that only collides on the target.

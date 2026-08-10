@@ -148,8 +148,11 @@ type Capabilities struct {
 	// operational shape that the orchestrator cannot derive by inspection.
 	// That is the line: declare strategy, derive type fidelity.
 	//
-	// Where an EARLY answer is needed, use [TableEmitPreflighter]: the
+	// Where an EARLY answer is needed, use the emit-preflighter family: the
 	// target dry-runs its own emit and reports what it cannot render.
+	// [ColumnTypeEmitPreflighter] is the member that answers this question
+	// for column TYPES — it runs the engine's own emitColumnType, so it is
+	// the derived answer the deleted table was pretending to be.
 
 	// DDLDialect is the SQL dialect family used when sluice renders
 	// DDL suggestions for this engine (schema-diff ALTER hints,

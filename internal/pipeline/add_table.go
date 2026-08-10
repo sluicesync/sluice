@@ -455,6 +455,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := migcore.PreflightViewEmit(ctx, a.Target, scoped, "add-table"); err != nil {
 		return err
 	}
+	// The COLUMN-TYPE member, and on this path it is the one with teeth: a
+	// table joining a running sync brings columns the original cold start never
+	// saw, so an unrenderable type here is genuinely NEW information rather
+	// than something the cold start would already have refused.
+	if err := migcore.PreflightColumnTypeEmit(ctx, a.Target, scoped, "add-table"); err != nil {
+		return err
+	}
 	// Item 149. On this path the scoped schema carries ONE table, so the
 	// implementations return before probing the server — the call is here so
 	// the entry-point roster stays the answer to "which paths ask all four",

@@ -36,19 +36,21 @@ import (
 // shape: an entry point is either in the list and calls the preflight, or it
 // is exempt with a reason.
 //
-// # All four helpers, one roster
+// # All five helpers, one roster
 //
 // Item 147 added [migcore.PreflightViewEmit] beside [migcore.PreflightIndexEmit],
-// item 148 added [migcore.PreflightTableEmit] beside both, and item 149 added
-// [migcore.PreflightTableNameFold] beside all three — separate helpers on
-// purpose (a view, table or fold question inside a method named for indexes
-// would make that name broader than its truth), asked at the SAME six entry
-// points for the same reason. The entry-point roster is therefore shared: each
-// rostered declaration must call ALL FOUR, so the sibling that arrives next
-// cannot land on one helper's call sites and miss the others'. Forking a second
-// roster would have re-created exactly the drift this gate exists to stop — and
-// items 148 and 149 arriving in consecutive weeks, each for free, are the
-// evidence that "the sibling that arrives next" is not hypothetical.
+// item 148 added [migcore.PreflightTableEmit] beside both, item 149 added
+// [migcore.PreflightTableNameFold] beside all three, and the column-type member
+// [migcore.PreflightColumnTypeEmit] beside all four — separate helpers on
+// purpose (a view, table, fold or column-type question inside a method named
+// for indexes would make that name broader than its truth), asked at the SAME
+// six entry points for the same reason. The entry-point roster is therefore
+// shared: each rostered declaration must call ALL FIVE, so the sibling that
+// arrives next cannot land on one helper's call sites and miss the others'.
+// Forking a second roster would have re-created exactly the drift this gate
+// exists to stop — and items 148, 149 and the column-type member arriving in
+// consecutive weeks, each for free, are the evidence that "the sibling that
+// arrives next" is not hypothetical.
 //
 // # Scope, stated so the name cannot be read as broader than the truth
 //
@@ -111,20 +113,25 @@ func declIdentity(fn *ast.FuncDecl) string {
 }
 
 // preflightHelpers is the set of migcore dispatchers every rostered entry
-// point must call. All four are unconditional pre-DDL gates over the whole
-// schema and all four are silent-or-late without the call; they differ in the
-// object kind they refuse on and, for the last, in needing a connection.
-// PreflightTableEmit joined in item 148 — the member of the class that loses
-// ROWS rather than an object — and PreflightTableNameFold in item 149, which
-// is that same loss on a target whose fold only the SERVER knows
-// (MySQL/PlanetScale/Vitess/MariaDB under lower_case_table_names != 0). The
-// fourth is the reason this roster was worth keeping shared: it took one line
-// per entry point and no new list.
+// point must call. All five are unconditional pre-DDL gates over the whole
+// schema and all five are silent-or-late without the call; they differ in the
+// object kind they refuse on and, for PreflightTableNameFold, in needing a
+// connection. PreflightTableEmit joined in item 148 — the member of the class
+// that loses ROWS rather than an object — and PreflightTableNameFold in item
+// 149, which is that same loss on a target whose fold only the SERVER knows
+// (MySQL/PlanetScale/Vitess/MariaDB under lower_case_table_names != 0).
+// PreflightColumnTypeEmit is the fifth and the odd one out in KIND: its refusal
+// was never silent and never late-by-phase (a column type is refused at CREATE
+// TABLE, phase one) — what it was is UNREACHED, covered for exactly one engine
+// pair by a hand-coded name-keyed check, and late enough that a multi-table
+// schema left the tables ahead of the offending one created. Same six call
+// sites, so it took one line per entry point and no new list.
 var preflightHelpers = []string{
 	"PreflightIndexEmit",
 	"PreflightViewEmit",
 	"PreflightTableEmit",
 	"PreflightTableNameFold",
+	"PreflightColumnTypeEmit",
 }
 
 // callersOfPreflight parses every non-test .go file in dir and returns the set

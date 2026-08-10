@@ -665,6 +665,12 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	if err := migcore.PreflightViewEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return fmt.Errorf("pipeline: preflight views for %q: %w", database, err)
 	}
+	// The COLUMN-TYPE member. The same per-database residual noted above
+	// applies to it unchanged: database N's unrenderable column is still found
+	// when the loop reaches N.
+	if err := migcore.PreflightColumnTypeEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
+		return fmt.Errorf("pipeline: preflight column types for %q: %w", database, err)
+	}
 
 	// Foreign keys are deferred to keep the first cut symmetric with the
 	// multi-database migrate path: a same-named cross-database FK may
