@@ -366,3 +366,35 @@ The plan, so it is turnkey:
 ### Bug 236 arm B, silent half: still open
 
 The write arm is closed for a target column that DECLARES an SRID (`Error 3643` → applied, `ST_SRID` correct). An **undeclared** target column still accepts a 4326 row at `ST_SRID` 0 with no error, identically on v0.117.0/v0.118.0/v0.118.1. That is the same class as C-14's read side, on the write side, and it is not what v0.118.1 claimed to fix — the release notes say the loud arm.
+
+## 2026-08-10 — `ir.Capabilities.SupportedTypes` is a declared surface that enforces nothing
+
+**Verified, not reported.** Every reference to `SupportedTypes` in the tree is either a DECLARATION (eight engines: mysql's three flavors + mariadb, postgres, pgtrigger, sqlite, d1-trigger, flatfile, mydumper) or a TEST assertion. `SupportedTypes.Has(` appears in exactly two files, both `_test.go`. **No production code reads it.** An engine's declaration that it does not handle an extension type has never refused anything.
+
+The actual cross-engine enforcement is `migcore.CheckCrossEngineSupportable`, which is hand-coded, keyed on engine NAME strings (`isPGSourceEngine` / `IsMySQLFamilyEngine` — the same hand-kept list C-2 is about), and returns `nil` for every direction except PG→MySQL:
+
+```go
+pgToMySQL := isPGSourceEngine(sourceEngine) && IsMySQLFamilyEngine(targetEngine)
+if !pgToMySQL { return nil }
+```
+
+So for every other pair the only backstop is the target emitter refusing a type it cannot render — which SQLite does do, loudly. That makes this **defence-in-depth missing plus a misleading declaration**, not a silent-loss class: the practical cost today is that the refusal arrives at emit time instead of preflight, and that a reader of `flavor.go` reasonably believes the declarations are load-bearing when they are inert.
+
+### Do NOT simply wire it — the declarations are stale BECAUSE nothing enforces them
+
+This is the trap, and it is the same shape as the C-11 revert on this branch: switching on a check whose inputs were never validated. The evidence is in the tree, admitted:
+
+```go
+//   - Spatial types are excluded from SupportedTypes here for
+//     conservatism; flip the flag if a user reports they work.
+```
+
+That is the Vitess/PlanetScale flavor excluding `ir.ExtGeometry`. Wiring `SupportedTypes` as it stands would refuse geometry on a Vitess source — **the exact configuration Bug 239 was just fixed and pinned to make work** (`TestStreamer_Bug239Geometry_VStream_PostGIS_ColdStartAndCDC`, real vtgate → real PostGIS, cold start + CDC, seven WKB families). A capability audit that took the declarations at face value would have undone a shipped fix.
+
+### The order of work, therefore
+
+1. **Audit every declaration against measured behaviour**, engine by engine, before any of them gates anything. Each entry ends as either "measured true, here is the test" or "measured false, corrected". The Vitess `ExtGeometry` exclusion is the first known-false one and its correction is already evidenced — it needs one confirming run of the Bug 239 VStream test, which is on the weekly `vstream-pipeline` leg rather than the per-PR shard.
+2. **Then** consult it in a preflight covering ALL directions, which generalises `CheckCrossEngineSupportable`'s one hand-coded direction and removes one of C-2's two name-keyed predicates as a side effect.
+3. **Gate it**: a declaration must be bound to a test that fails if the engine's real behaviour diverges, or the field returns to being decoration the moment someone adds an engine.
+
+**Not filed as a defect with a severity, deliberately.** Nothing is lost and nothing is silently wrong today; what is wrong is that a whole declarative surface reads as enforcement. Sizing it honestly: step 1 is the expensive part and is a measurement chunk, not a coding one.
