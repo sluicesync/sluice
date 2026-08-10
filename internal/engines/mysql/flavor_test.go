@@ -100,8 +100,17 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 	if caps.SupportsPartitioning {
 		t.Error("planetscale SupportsPartitioning = true; want false (Vitess handles sharding)")
 	}
-	if caps.SupportedTypes.Has(ir.ExtGeometry) {
-		t.Error("planetscale should not declare Geometry support (excluded for conservatism)")
+	// Measured 2026-08-10, not assumed. The exclusion this replaces was
+	// explicitly conservatism ("flip the flag if a user reports they work"),
+	// i.e. an absence of evidence recorded as a capability — and the absence
+	// was sluice's own Bug 239 (the PostGIS codec missing from the row
+	// writer's pool), never a Vitess limitation. The evidence is
+	// TestStreamer_Bug239Geometry_VStream_PostGIS_ColdStartAndCDC: a real
+	// vtgate through sync's cold start AND live CDC into real PostGIS, over
+	// all seven WKB families, asserted on the target's own functions.
+	if !caps.SupportedTypes.Has(ir.ExtGeometry) {
+		t.Error("planetscale should declare Geometry support — measured working over VStream " +
+			"once Bug 239 was fixed; see TestStreamer_Bug239Geometry_VStream_PostGIS_ColdStartAndCDC")
 	}
 	if !caps.TransactionKiller {
 		t.Error("planetscale TransactionKiller = false; want true (vtgate ~20s tx-killer drives the AIMD + batch-size rails)")

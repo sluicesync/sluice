@@ -154,8 +154,24 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	//     for the spatial-types CDC bytes-parsing detail.
 	//   - Table partitioning is handled by Vitess sharding rather
 	//     than user-defined PARTITION BY clauses.
-	//   - Spatial types are excluded from SupportedTypes here for
-	//     conservatism; flip the flag if a user reports they work.
+	//   - Spatial types ARE supported, and were measured rather than
+	//     assumed (2026-08-10). This entry previously excluded them "for
+	//     conservatism; flip the flag if a user reports they work" — an
+	//     absence of evidence recorded as a capability. The evidence now
+	//     exists and is a test, not a user report:
+	//     [TestStreamer_Bug239Geometry_VStream_PostGIS_ColdStartAndCDC]
+	//     drives a real vtgate through `sync`'s own cold start AND a live
+	//     CDC insert into real PostGIS over all seven WKB geometry
+	//     families, asserting on the target's own ST_AsBinary /
+	//     ST_GeometryType. It went green once Bug 239 was fixed (the
+	//     PostGIS codec was missing from the row writer's pool, which is
+	//     what made VStream spatial cold starts fail — a sluice defect,
+	//     never a Vitess limitation).
+	//
+	//     Flipping it matters even though SupportedTypes is currently
+	//     consulted by NOTHING (see the 2026-08-10 backlog entry): the
+	//     day it is wired into a preflight, a stale exclusion here would
+	//     refuse the very configuration Bug 239 exists to support.
 	//
 	// References:
 	//   - Compatibility:    https://planetscale.com/docs/vitess/troubleshooting/mysql-compatibility
@@ -178,7 +194,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		SupportedTypes: ir.NewTypeSet(
 			ir.ExtEnum,
 			ir.ExtSet,
-			// ExtGeometry intentionally excluded — see comment above.
+			ir.ExtGeometry, // measured 2026-08-10 — see the spatial note above
 		),
 		SupportsCheckConstraint:  true,
 		SupportsGeneratedColumns: true,
