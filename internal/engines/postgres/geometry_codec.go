@@ -15,7 +15,9 @@ import (
 )
 
 // pgGeometryBinaryCodec implements [pgtype.Codec] for the PostGIS
-// `geometry` type on the CDC applier connections.
+// `geometry` type on every connection that binds a geometry value as a
+// query parameter — the CDC applier's three pools and the [RowWriter]'s
+// (see [afterConnectRegisterGeometry] for the full roster).
 //
 // # Why this codec exists (the geometry-over-CDC gap)
 //
@@ -202,12 +204,19 @@ func lookupGeometryOIDConn(ctx context.Context, conn *pgx.Conn) (uint32, error) 
 	return oid, nil
 }
 
-// afterConnectRegisterGeometry is the [stdlib.OptionAfterConnect] hook the
-// CDC applier installs on BOTH its pools (the serial primary pool and the
-// ADR-0092 pipelined DescribeExec pool), so every applier connection can
-// ship EWKB to a `geometry` column regardless of which apply path a batch
-// takes. It runs once per new connection (connections are pooled, so the
-// catalog lookup is amortised); a target without PostGIS is a clean no-op.
+// afterConnectRegisterGeometry is the [stdlib.OptionAfterConnect] hook every
+// pool that BINDS a geometry value as a query parameter installs. That is
+// four pools, not two: the applier's serial pool, its ADR-0092 pipelined
+// DescribeExec pool, its concurrent lane pool — and the [RowWriter]'s pool,
+// whose plain and idempotent batch cores bind values exactly the same way
+// (Bug 239; the COPY core needs no codec because COPY-BINARY reaches
+// `geometry_recv` directly). This comment said "BOTH its pools" while the
+// writer's two batch cores were unreachable for any spatial column, which is
+// why the roster gate ([TestPGPoolRoster_GeometryCodecRegistration]) now
+// derives the list from the AST instead of from a sentence.
+//
+// It runs once per new connection (connections are pooled, so the catalog
+// lookup is amortised); a target without PostGIS is a clean no-op.
 //
 // Idempotent: re-running on a conn that already has the codec is skipped.
 func afterConnectRegisterGeometry(ctx context.Context, conn *pgx.Conn) error {

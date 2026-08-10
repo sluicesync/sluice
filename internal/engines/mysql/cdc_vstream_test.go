@@ -777,14 +777,49 @@ func TestDecodeVStreamCellGeometry(t *testing.T) {
 		}
 	})
 
-	t.Run("malformed too-short value passes through", func(t *testing.T) {
-		// 3-byte input is shorter than the 4-byte SRID prefix; pass
-		// through so the downstream WKB validator surfaces the
-		// problem rather than silently re-shaping garbage.
+	t.Run("malformed too-short value is REFUSED, not passed through", func(t *testing.T) {
+		// Bug 239. This subtest previously asserted the raw bytes were
+		// passed through, on the premise that "the downstream WKB
+		// validator surfaces the problem". Nothing checked that premise,
+		// and it is only true for a PostGIS target (wkbToEWKB refuses
+		// under 5 bytes) — a MySQL/PlanetScale target binds the buffer
+		// straight through. Every length below the interpretable floor
+		// refuses, including the boundary at floor-1.
 		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
-		got := decodeVStreamCell(f, []byte{0x01, 0x02, 0x03})
-		if _, ok := got.([]byte); !ok {
-			t.Errorf("got %T; want []byte fallback", got)
+		for n := 0; n < minVStreamGeometryBytes; n++ {
+			got := decodeVStreamCell(f, make([]byte, n))
+			sentinel, ok := got.(*vstreamGeometryFramingError)
+			if !ok {
+				t.Fatalf("len=%d: got %T; want *vstreamGeometryFramingError "+
+					"(a cell this decoder cannot interpret must refuse loudly)", n, got)
+			}
+			if sentinel.n != n {
+				t.Errorf("len=%d: sentinel reports %d bytes", n, sentinel.n)
+			}
+		}
+		// The floor itself is interpretable: SRID word + a bare WKB header.
+		atFloor := decodeVStreamCell(f, make([]byte, minVStreamGeometryBytes))
+		if _, ok := atFloor.([]byte); !ok {
+			t.Errorf("len=%d: got %T; want []byte (the floor must not refuse)", minVStreamGeometryBytes, atFloor)
+		}
+	})
+
+	t.Run("the framing refusal names the table and the column", func(t *testing.T) {
+		// The sentinel is resolved by decodeVStreamRow, which is where
+		// the identifying names live (decodeVStreamCell has none).
+		fields := []*query.Field{
+			{Name: "id", Type: query.Type_INT64},
+			{Name: "geom", Type: query.Type_GEOMETRY, ColumnType: "point"},
+		}
+		row := &query.Row{Lengths: []int64{1, 3}, Values: []byte("1abc")}
+		_, _, err := decodeVStreamRow(row, fields, "places", newBoolRangeWarner(), zeroDateInherit)
+		if err == nil {
+			t.Fatal("decodeVStreamRow err = nil; want a loud refusal for the short geometry cell")
+		}
+		for _, want := range []string{`"places"`, `"geom"`, "too short"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q does not mention %s", err, want)
+			}
 		}
 	})
 

@@ -249,12 +249,28 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 // by default. The caller is responsible for closing the returned
 // RowWriter (via its Close method) to release the underlying
 // connection pool.
+//
+// Bug 239: the pool registers the PostGIS geometry codec, exactly as the
+// three applier pools do — see [afterConnectRegisterGeometry]. The writer
+// has THREE cores, not one, and only the COPY core was covered: COPY ships
+// values in COPY-BINARY, which `geometry_recv` accepts with no codec, but
+// [writeViaBatch] and [writeViaBatchIdempotent] bind them as query
+// PARAMETERS, where pgx has no codec for PostGIS's dynamic `geometry` OID,
+// falls back to TEXT, and `geometry_in` rejects the EWKB bytes with
+// "parse error - invalid geometry" (SQLSTATE XX000). That made a VStream
+// (Vitess / PlanetScale) cold start — which ALWAYS demands the idempotent
+// core ([ir.IdempotentCopyReader]) — unable to copy any spatial column,
+// while `migrate` over the identical source succeeded on COPY.
 func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
 	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDBAs(ctx, cfg, roleSnapshot)
+	// composeAfterConnect, not a bare hook: stdlib.OptionAfterConnect is
+	// last-wins, so passing the geometry hook alone would silently DROP the
+	// default [afterConnectSessionPins] this pool gets from openPgxDBAs.
+	db, err := openDBAs(ctx, cfg, roleSnapshot,
+		stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
 	if err != nil {
 		return nil, err
 	}

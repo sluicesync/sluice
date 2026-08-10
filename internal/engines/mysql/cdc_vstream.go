@@ -1848,6 +1848,13 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		if gs, isSRID := v.(*vstreamGeometrySRIDError); isSRID {
 			return nil, false, fmt.Errorf("mysql/vstream: column %q: %w", f.GetName(), gs.err())
 		}
+		// Bug 239: same idiom for a geometry cell whose FRAMING the
+		// decoder cannot interpret. Named with the table as well as the
+		// column — a short cell points at a truncated event or a
+		// mis-typed column, and an operator needs both to find it.
+		if gf, isFraming := v.(*vstreamGeometryFramingError); isFraming {
+			return nil, false, fmt.Errorf("mysql/vstream: table %q column %q: %w", tableName, f.GetName(), gf.err())
+		}
 		// Vector D: a TINYINT(1) value outside {0,1} is collapsed to a
 		// bool here too (same MySQL convention as the binlog / bulk-copy
 		// paths). VStream cells are text-encoded, so parse the literal
@@ -1910,6 +1917,34 @@ type vstreamGeometrySRIDError struct {
 // C-14.
 func (e *vstreamGeometrySRIDError) err() error {
 	return ir.CheckGeometryRowSRID(0, e.srid)
+}
+
+// minVStreamGeometryBytes is the shortest byte count a VStream geometry
+// cell can legitimately have: MySQL's 4-byte internal SRID word followed
+// by WKB's own 5-byte header (1-byte byte-order flag + 4-byte geometry
+// type). Every real geometry is far longer — the smallest MySQL can store
+// is an empty GEOMETRYCOLLECTION at 13 bytes — so this is a floor on what
+// is *interpretable*, not a guess at what is *plausible*.
+const minVStreamGeometryBytes = 4 + 5
+
+// vstreamGeometryFramingError is the cell-level sentinel for a geometry
+// payload too short to be MySQL's on-wire `<srid uint32 LE><wkb>` form
+// (Bug 239). Like [vstreamGeometrySRIDError] it is a VALUE, because
+// [decodeVStreamCell] has no error channel; [decodeVStreamRow] converts it
+// into a loud stream error naming the table and column.
+type vstreamGeometryFramingError struct {
+	n int
+}
+
+// err renders the refusal. It names the byte count and the floor so an
+// operator can tell a truncated event from a wrong-type column without
+// re-running with debug logging.
+func (e *vstreamGeometryFramingError) err() error {
+	return fmt.Errorf(
+		"geometry cell is %d bytes, too short to be MySQL's on-wire <srid><wkb> form (need >= %d); "+
+			"refusing rather than carrying a value this decoder cannot interpret",
+		e.n, minVStreamGeometryBytes,
+	)
 }
 
 // decodeVStreamCell maps a single Vitess-wire cell to its IR-Row
@@ -2059,16 +2094,24 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// VALUE rather than an error because decodeVStreamCell has no
 		// error channel; decodeVStreamRow resolves it, exactly as it
 		// does for the zero-date sentinel.
-		// Malformed-prefix payloads (under 5 bytes) fall through with
-		// raw bytes copied; the downstream WKB validator surfaces a
-		// clearer error than a silent re-shape would.
-		if len(raw) >= 5 {
-			if srid := binary.LittleEndian.Uint32(raw[:4]); srid != 0 {
-				return &vstreamGeometrySRIDError{srid: srid}
-			}
-			return copyBytes(raw[4:])
+		// Bug 239 (Phase A): a payload too short to BE the on-wire form is
+		// refused, not passed through. It previously fell through with the
+		// raw bytes copied, on the premise that "the downstream WKB
+		// validator surfaces a clearer error" — a premise nothing checked,
+		// and one that holds only for a PostGIS target (wkbToEWKB refuses
+		// under 5 bytes); a MySQL/PlanetScale target binds the buffer
+		// straight through. The floor is the 4-byte SRID word plus WKB's
+		// own 5-byte header (byte-order flag + geometry-type uint32):
+		// below that there is no reading of the cell this decoder can
+		// defend, so it becomes a loud, table-and-column-named refusal via
+		// the same sentinel idiom as the SRID case above.
+		if len(raw) < minVStreamGeometryBytes {
+			return &vstreamGeometryFramingError{n: len(raw)}
 		}
-		return copyBytes(raw)
+		if srid := binary.LittleEndian.Uint32(raw[:4]); srid != 0 {
+			return &vstreamGeometrySRIDError{srid: srid}
+		}
+		return copyBytes(raw[4:])
 	case query.Type_NULL_TYPE:
 		return nil
 	}
