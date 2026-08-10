@@ -632,10 +632,21 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	// Index-emit pre-flight refusal (roadmap item 118), per database and
 	// before this database's target tables are created — the multi-database
-	// sibling of the single-database cold-start's call. The fan-out copies
-	// one database at a time, so an unrepresentable index in database N
-	// would otherwise be discovered after N-1 databases had already been
-	// copied AND after this one's rows had landed.
+	// sibling of the single-database cold-start's call.
+	//
+	// What it prevents, stated exactly, because the earlier wording here
+	// claimed more than it delivers (audit backlog C-6): it stops THIS
+	// database's rows from landing before the refusal. It does NOT stop the
+	// run from having copied the preceding databases — this call is inside
+	// the per-database copy loop, and each database's schema is read here, so
+	// an unrepresentable index in database N is still discovered only when the
+	// loop reaches N, with N-1 databases already fully copied.
+	//
+	// That residual is FILED, not fixed (see the C-6 entry): hoisting it means
+	// reading all N schemas before the copy loop, which either doubles the
+	// schema reads or needs a cache threaded through. The cost of the residual
+	// is wasted copy time and a target holding N-1 complete databases — loud,
+	// and resumable — which is why it did not outrank the silent-loss work.
 	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return fmt.Errorf("pipeline: preflight tables for %q: %w", database, err)
 	}
