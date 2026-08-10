@@ -457,3 +457,57 @@ Both readings are coherent; the field's doc — "the extension types the engine 
 `ExtDomain` is unaffected by the ambiguity and is simply missing. It is left uncorrected here on purpose: adding one kind to two engines while the semantics are undecided would make the surface look audited without making it enforceable, and it is the enforceability that has been absent the whole time.
 
 **Recommendation:** decide the semantics first (a method over a static field is the likely answer, given PostGIS), then re-derive all eight declarations against it, then wire and gate. Sizing: the semantics decision is small and the re-derivation is a measurement chunk; the wiring is trivial once both are settled.
+
+## 2026-08-10 — perf-parity arrears from v0.117.0 (found by the pre-v0.119.0 checker)
+
+The pre-release checker confirmed the trigger was a **false positive on the v0.118.1..v0.119.0 delta** — no throughput or latency technique in it — but found real arrears one release back. Filed rather than fixed in the v0.119.0 commit because it is v0.117.0's missing work and the matrix edit is substantial; nothing here blocks a tag.
+
+### HIGH — item 157's `GrowGateEvidenceFreeHoldCap` has no matrix cell, and row 17 currently reads as though item 138 already solved the field shape
+
+`GrowGateEvidenceFreeHoldCap = 250ms` (`internal/pipeline/migcore/grow_gate.go:238`, applied `:696-697`) shipped in **v0.117.0** and never reached `docs/dev/perf-parity-matrix.md`. Row 17 documents item 138's three bounds and closes on the field log — "246 windows … 73 minutes of quiesce in a 91-minute run" — as the shape the run-level ceiling addresses. Item 157's own analysis is that the ceiling did **not** fix it: "half the wall clock spent in 30-SECOND units quantises a lane to one chunk per hold." So the row is not merely incomplete, it implies a solved problem that item 157 exists because it was not solved.
+
+The cell must carry the MEASURED figure, not the projection: v0.116.1 died at 105 s having landed 309,212 of 1.8M rows; v0.117.0 completed all 1,800,000 in 95 s — **14,173 rows/s vs 2,379, 5.96×**, 86% of an ungated reference, gate duty **92.6% → 36.4%**. The roadmap entry still carries the superseded ~11% arithmetic projection.
+
+**Parity itself is fine — the gap is the matrix.** The cap lives in the shared `migcore` primitive, so all five `NewGrowGate` sites inherit it identically (`migrate_phases.go:647`, `backup/restore.go:632`, `streamer_coldstart.go:1099`, `streamer_coldstart_parallel.go:310`, `streamer_multidb.go:808`) and both engines classify grow evidence. No code gap, no new ranked gap.
+
+**One parity note nobody has written down**, and it belongs in the cell: the cap keys on `episodeSawGrowEvidence`, and `ir.GrowEvidenceTelemetry` has exactly one producer (`streamer_telemetry.go:201`). Migrate and restore construct `NewGrowGate(ctx, nil)` with no telemetry seam, so on those modes an episode can only earn evidence from a target-face error classification — making the 250 ms cap **strictly more likely to bind on migrate/restore than on cold start**. Same technique, mode-dependent trigger condition, conservative direction.
+
+### MEDIUM — ~22 stale `file:line` citations, drifted in DIFFERENT directions
+
+Re-derived by symbol lookup rather than offset, which matters: the amounts differ, so a uniform shift would encode the error (the matrix's own 2026-08-07 lesson). Notable: `mysql/cdc_vstream.go:2334`→`:2507` (this delta shifted it +43 on top of pre-existing drift), `:729`→`:723`, `:399`→`:428`; `pg/row_writer.go` `:478/:534/:580/:874/:881`→`+4` each; row 4's `raw_copy.go:217` lands on `return nil` (the two real sites are `:195`/`:240`); every `NewGrowGate` site and `migcore/grow_gate.go:225,226,410`→`:304,:305,:501` — all item 157's commit, which the matrix missed. The roadmap's item 157 entry carries the same stale set. Roughly 25 other citations were spot-checked and hold, so the sweep is not vacuous.
+
+## 2026-08-10 — value-fidelity review findings, pre-v0.119.0 (VERDICT: safe to land)
+
+Full re-derivation of the delta's matrices. **No silent-loss defect introduced.** Five gaps, all in the loud-failure direction, filed here rather than fixed in the release commit.
+
+### GAP 1 (MEDIUM) — `geography` has no codec AND no refusal, and I was about to claim otherwise
+
+Bug 239's commit message and my release prose said geography stays "loud-refused off the COPY path." Half of that is true and the important half is not. No codec is registered for the `geography` OID on any pool — correct. But there is no REFUSAL: `prepareValue` treats `ir.Geometry{IsGeography:true}` identically to geometry (`postgres/row_writer.go:1041-1056`; `IsGeography` appears nowhere in that file), so it reaches parameter binding and dies with the raw PostGIS `parse error - invalid geometry` — **the exact symptom Bug 239 just fixed for the sibling type**, with no column named and no remedy, mid-copy rather than at preflight.
+
+Reachability is wider than "off the COPY path" implies: `WriteRowsIdempotent` ALWAYS takes the batch core (`row_writer_batch.go:76` — no COPY variant) with four production callers, and the plain batch core is entered for any table carrying an `ir.Interval` or `ir.VerbatimType` column. A PG→PG table with a geography column plus one uncatalogued extension column is an ordinary shape.
+
+Minimal close: register the codec against the geography OID in `afterConnectRegisterGeometry` (same lookup, one extra row) — which makes it WORK — or add a named refusal for `IsGeography` off COPY. Either way the family matrix needs `IsGeography: true` rows; its 42 cells key on `Subtype` and never touch the flag.
+
+### GAP 2 (MEDIUM) — the geometry family matrix has no SRID≠0 cell
+
+Every cell of `TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores` uses `ir.Geometry{Subtype: X}` (SRID 0) into a bare `geometry NULL` column, so `wkbToEWKB` takes its no-SRID-flag branch in all 42. The production shape — `geometry(Point,4326)`, where EWKB carries the `0x20000000` type flag plus a 4-byte SRID word — is a DIFFERENT byte layout into `geometry_recv` and is unexercised on both newly-covered cores. Same for M / ZM (ISO WKB 2000/3000 type codes; the matrix covers 2-D and Z only). Loud failure direction, but it is exactly the Bug-74 shape axis and 4326 is the common field case.
+
+### GAP 3 (LOW, message-only) — C-14 is not literally "untouched" for a 4-byte window
+
+For `4 ≤ len(raw) ≤ 8` the payload does carry a complete SRID word, and previously a non-zero SRID produced the C-14 refusal; now the framing refusal fires first. Both are loud stream errors so there is no fidelity change — but the claim "C-14 untouched" is false for that window, and the operator sees "too short to be MySQL's on-wire form" rather than "SRID cannot be carried."
+
+### GAP 4 (LOW) — the CHECK tamper arm covers the range translator only
+
+`diff_domain_check_mysql_integration_test.go` tampers the range arm. The REGEX arm is the one whose canonicalization exercises the literal decoder, the `_utf8mb4` introducer skip, the `\'` un-escape and the bracket stripper — where a false MATCH is most plausible. Add a third DIRTY arm widening `dcheck_chk_1`.
+
+### GAP 5 (LOW, latent) — two greedy traps in the CHECK canonicalizer
+
+`pgAnyArrayRewrite` (`check_expr_norm.go:64`) is greedy: two `= ANY (ARRAY[…])` terms would canonicalize by spanning first `array[` to last `])`. No emitted shape produces two today; failure direction is a spurious DIFFERENCE. And `matchEmittedChecks` consumes actual-side constraints greedily in sorted-name order, so an emitted prediction can pair with a source-declared constraint carrying the same canonical predicate. Both false-positive direction.
+
+### Adjacent, pre-existing, belongs in the invariant queue
+
+`mysql/cdc_vstream.go:1813-1818`: on `len(lengths) != len(fields)` the decoder returns an EMPTY `ir.Row` with `ok=true`, commented "so the caller surfaces the issue" — a premise nothing checks. All five callers treat it as a normal row; on the snapshot/copy path an empty row reaches `flattenArgs` where every missing key becomes nil → NULL. That is the silent-loss shape, gated behind a malformed VStream event. Not introduced by this delta, but the delta edits adjacent lines.
+
+### One behavioural consequence for the release notes, not a defect
+
+`mysqlTargetEmitShape` drops `WithTimeZone` from `ir.Time`, and that pass now feeds the data-moving ADR-0166 existing-target gate, not only `schema diff`. A PG `time with time zone` source against a pre-existing MySQL `TIME(6)` target now compares EQUAL where it previously refused the re-run. The refusal protected nothing — `mysql/row_writer.go:890` `stripTimeZoneOffset` drops the offset on the first migrate too — so this is consistent rather than a regression, but it is the one place in this delta where a loosened comparison sits directly upstream of a silently-lossy value path.

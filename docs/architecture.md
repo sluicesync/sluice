@@ -168,16 +168,8 @@ type Capabilities struct {
     // The schema scope model.
     SchemaScope SchemaScope    // Flat (MySQL), Namespaced (Postgres), ...
 
-    // Which extension IR types this engine supports natively.
-    SupportedTypes TypeSet     // see internal/ir/capabilities.go
-
-    // Type-system feature flags.
-    SupportsCheckConstraint   bool
-    SupportsGeneratedColumns  bool
-    SupportsPartitioning      bool
-    EnumSupport               EnumSupport      // None, ColumnLevel, TypeLevel
-    JSONSupport               JSONSupport      // None, Json, Jsonb, Both
-    UnsignedIntegers          bool
+    // NOTE: seven TYPE-FIDELITY fields lived here until 2026-08-10 and were
+    // deleted — declared by all eight engines, read by nothing. See below.
 }
 
 type Engine interface {
@@ -210,7 +202,7 @@ The `sqlite` engine (`internal/engines/sqlite`, shipped) is the canonical worked
 
 1. Create `internal/engines/sqlite/`.
 2. Implement the relevant interfaces — `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`. CDC interfaces are optional; the base `sqlite` engine declares `CDC: CDCNone` and skips them (continuous sync arrived later as the separate `sqlite-trigger` / `d1-trigger` engines, which *compose* the base engine and add the trigger-CDC surface).
-3. Declare a `Capabilities` value that reflects what SQLite actually supports — a flat namespace, no extension types, `JSONSupport: None`, and the type-affinity behaviour documented in [type-mapping.md](type-mapping.md).
+3. Declare a `Capabilities` value for the STRATEGY facts — how bulk loading works, whether CDC exists and in what form, whether the namespace is flat or nested. Type fidelity is NOT declared: the engine's own `translateType` / `emitColumnType` decides what it can render, and the emit preflighters surface that early. See the type-affinity behaviour documented in [type-mapping.md](type-mapping.md).
 4. Register the engine in the package's `init()` function. `Register` takes the engine value; the registry reads its name from `Name()`:
 
 ```go
@@ -231,9 +223,9 @@ That's the entire surface area of "add a new engine." No changes to `ir`, the tr
 
 The contract for a new engine:
 
-- The reader must produce IR that uses **only** types declared in its own `Capabilities.SupportedTypes`. If the underlying engine has types beyond what we model, the reader either maps them to existing IR types with a documented loss, or extends the IR with a new extension type (and updates other engines' capability declarations to either support or reject it).
+- The reader must produce IR the ENGINES' OWN TYPE DISPATCH can render. If the underlying engine has types beyond what we model, the reader either maps them to existing IR types with a documented loss, or extends the IR with a new extension type — and then each other engine either grows an arm for it or refuses it, which its `emitColumnType` already expresses. There is no capability list to update; that list existed until 2026-08-10 and was deleted for being a second copy that drifted.
 - The writer must accept any IR schema and either emit valid DDL or return a clear, structured error explaining what's not supported and why. Silently dropping fields is not allowed.
-- The capability declaration must be honest. If the writer claims `SupportsCheckConstraint: true`, it had better.
+- The capability declaration must be honest. It now covers only strategy — if the engine declares `BulkLoad: Copy`, COPY had better work — and honesty is cheaper to keep because the orchestrator actually consults every remaining field.
 - The engine package owns its own integration tests (in `internal/engines/<name>/`); the cross-engine matrix tests live in `internal/pipeline`, which resolves engines through the registry.
 
 ## Configuration

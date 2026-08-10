@@ -14,7 +14,7 @@ The IR is organised into two tiers:
 
 **Core IR types** are the types every relational engine has, in some form. The translator and pipeline assume any engine can read and write these. Core types are the lingua franca.
 
-**Extension IR types** are types that only some engines support natively. They exist in the IR so engines that have them can express them faithfully, but every engine declares (via its `Capabilities`) which extension types it supports. Engines that don't support an extension type either decline the migration with a clear error or apply a documented degradation policy (e.g., `Array` → `JSON` on MySQL).
+**Extension IR types** are types that only some engines support natively. They exist in the IR so engines that have them can express them faithfully, but which of them an engine supports is derived from that engine's own type dispatch rather than declared in a table (see below). Engines that don't support an extension type either decline the migration with a clear error or apply a documented degradation policy (e.g., `Array` → `JSON` on MySQL).
 
 This split is the mechanism that lets the IR remain genuinely engine-neutral as more engines are added. The core stays small and universal. New engine-specific richness arrives as new extension types — never by amending the core.
 
@@ -89,7 +89,7 @@ type Timestamp struct { Precision int; WithTimeZone bool }
 type JSON struct { Binary bool } // Postgres JSON vs JSONB
 
 // =====================================================================
-// EXTENSION IR TYPES — engines opt in via Capabilities.SupportedTypes.
+// EXTENSION IR TYPES — an engine supports what its own emitter can render.
 // =====================================================================
 
 // --- Categorical ---
@@ -118,15 +118,15 @@ type Macaddr struct{ Width int } // 6 = macaddr, 8 = macaddr8
 
 ### Engine opt-in to extension types
 
-Each engine's `Capabilities` value (see [architecture.md](architecture.md#engine-capabilities)) includes a `SupportedTypes` set listing the extension types it handles natively. Three things follow from this:
+Which extension types an engine handles is DERIVED from the engine, not declared. Until v0.119.0 there was a `Capabilities.SupportedTypes` set; it was deleted because all eight engines declared it and nothing read it, so it drifted — three extension kinds ended up declared by no engine at all. Three things follow from the derived model:
 
-1. **Readers** may only emit extension types listed in their own `SupportedTypes`. A MySQL reader cannot emit `Inet{}` because MySQL doesn't have it; it would emit `Varchar{Length: 45}` instead.
+1. **Readers** produce the types their own engine actually has. A MySQL reader does not emit `Inet{}` because MySQL has no such type; it emits `Varchar{Length: 45}`.
 
-2. **Writers** consult their own `SupportedTypes` and the source engine's capabilities to decide what to do with an extension type they don't natively support. The default behaviour is documented degradation (e.g., `Array` → `JSON`); the user may override with a stricter `error` mode that fails the migration rather than degrading silently.
+2. **Writers** answer through their own `emitColumnType`: an engine that cannot render a type has no arm for it, and the missing arm IS the refusal. Some types are degraded by a documented policy instead (e.g. `Array` → `JSON` on MySQL). There is no `error`-vs-degrade mode switch — the policy is per type and documented in the tables below.
 
-3. **Adding a new engine** does not require touching core IR types. It requires declaring which extension types the new engine supports, and providing the reader/writer code for those.
+3. **Adding a new engine** does not require touching core IR types, and no longer requires declaring a type list. It requires reader/writer code; whatever that code can render is what the engine supports, and the emit preflighters surface the gaps before any data moves.
 
-The contract is intentionally one-directional: engines describe themselves to the orchestrator. The orchestrator never asks "are you MySQL?" — it asks "do you support arrays?"
+The contract stays one-directional — engines describe themselves to the orchestrator, which never asks "are you MySQL?" — but for TYPE questions it asks the emitter rather than a table, so the answer cannot drift from the behaviour.
 
 Each leaf type implements `isType()` so the compiler enforces that only IR types satisfy the interface — no dialect-specific shapes can sneak in through interface satisfaction.
 
@@ -295,9 +295,11 @@ These are the cases that historically turn type-mapping code into a regex zoo. E
 
 MySQL accepts `'0000-00-00'` as a `DATE` value when `NO_ZERO_DATE` is not in `sql_mode`. PostgreSQL does not.
 
-**Default policy:** detect during read, surface a count in the pre-migration report, replace with `NULL` if the column is nullable, otherwise replace with `'0001-01-01'` (a minimum sentinel) and log every replacement.
+**Default policy: REFUSE, loudly, naming the column.** `--zero-date` defaults to `error`; nothing is substituted and no migration proceeds on a zero date unless the operator asks for it.
 
-**Override:** `on_zero_date: error | null | sentinel | <literal>`.
+This paragraph previously described the opposite — "replace with `NULL` if the column is nullable, otherwise replace with `'0001-01-01'` … and log every replacement" — which inverted the loud-failure posture the tool actually takes, and named an `on_zero_date:` config key that has never existed. Corrected 2026-08-10; `docs/operator/migrating-legacy-mysql.md` had it right all along.
+
+**Override:** `--zero-date=error|null|epoch` process-wide (`null` carries them as NULL and is itself refused on a NOT NULL column; `epoch` substitutes `1970-01-01`). Per-source override via `?zero_date=` on a MySQL DSN, which wins over the flag (ADR-0127), or the `zero-date:` key in a sync-run fleet config.
 
 ### MySQL unsigned integers
 
@@ -452,20 +454,15 @@ Charset and collation are stored on `Char`, `Varchar`, and `Text`. The readers r
 
 The default policies cover the common case. The config file is the canonical place to override on a per-column basis. Overrides are typed against the IR, not against dialect-specific syntax.
 
+The ONLY keys a `mappings:` entry accepts are `table`, `column`, `target_type` and `target_type_options`. An earlier version of this example used `enum_strategy`, `on_zero_date` and `nullable_override`, none of which have ever existed in the config struct — corrected 2026-08-10. Zero-date policy is `--zero-date` / `?zero_date=` (see above), not a per-column mapping.
+
 ```yaml
 mappings:
   - table: orders
     column: status
-    # Force this column to be emitted as text with a CHECK constraint
-    # instead of a Postgres ENUM type.
-    enum_strategy: text_check
-
-  - table: legacy_users
-    column: created_at
-    # This column has known zero-dates; replace with NULL even though
-    # the column is currently NOT NULL (we'll relax the constraint).
-    on_zero_date: null
-    nullable_override: true
+    # Force this column to be emitted as text rather than a Postgres
+    # ENUM type.
+    target_type: text
 
   - table: events
     column: payload

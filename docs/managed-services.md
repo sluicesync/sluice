@@ -173,8 +173,17 @@ Key constraints inherited from the Vitess platform:
   asks the caller to drop and reopen the snapshot stream from
   scratch (in-place reshard recovery during COPY is a future
   chunk).
-- Spatial types not supported in v1 (conservative default; flip the
-  capability flag if you've confirmed otherwise).
+- Spatial types ARE supported, and were measured rather than assumed
+  (2026-08-10, v0.119.0). This previously read "not supported in v1
+  (conservative default; flip the capability flag if you've confirmed
+  otherwise)" — an absence of evidence written down as a limitation, and
+  the absence was sluice's own Bug 239 (the PostGIS codec was missing from
+  the Postgres row writer's pool, so a VStream spatial cold start failed on
+  the target side), never a Vitess one. The evidence is a test: a real
+  vtgate through `sync`'s cold start AND a live CDC insert into real
+  PostGIS, over all seven WKB geometry families. There is also no capability
+  flag left to flip — the declarative type table was deleted in the same
+  release.
 
 Use `--source-driver=planetscale` (or the equivalent in
 `sluice.yaml`) when targeting any Vitess deployment.
