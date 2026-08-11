@@ -804,8 +804,8 @@ func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (ex
 	}
 	sort.Strings(emitted)
 
-	// Candidates are ONLY the actual-side constraints no expected-side
-	// check claims by NAME (audit GAP 5): the name-keyed pass in
+	// Candidates exclude the actual-side constraints a SOURCE-DECLARED
+	// expected check claims by NAME (audit GAP 5): the name-keyed pass in
 	// [diffTableChecks] owns those pairs, and letting an emitted
 	// prediction consume one greedily left its name-matched expected
 	// twin comparing against nothing — a source-declared constraint that
@@ -813,9 +813,21 @@ func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (ex
 	// a target that holds it. False-positive direction, but a phantom
 	// drift report on a clean target is precisely what item 156 exists
 	// to prevent.
+	//
+	// The exclusion is deliberately NARROWER than "any expected check
+	// claims the name": when the name-claimer is itself the EMITTED
+	// prediction — the Postgres writer names its synthesized checks
+	// predictably, so on a PG target expected and actual share the name
+	// — the pair still needs the canonical-EXPRESSION match, because the
+	// target re-renders the predicate (`IN (…)` comes back as
+	// `= ANY (ARRAY[…])`) and the raw name-keyed comparison would report
+	// a mismatch on a target migrate just created. The first cut of this
+	// filter excluded those too and CI's MySQL→PG reconciliation pin
+	// caught it — the PG-target and MySQL-target name behaviours are
+	// siblings, and only the MySQL one had been run locally.
 	actNames := make([]string, 0, len(actChecks))
 	for name := range actChecks {
-		if _, nameClaimed := expChecks[name]; nameClaimed {
+		if claimer, nameClaimed := expChecks[name]; nameClaimed && (claimer == nil || !claimer.SluiceEmitted) {
 			continue
 		}
 		actNames = append(actNames, name)

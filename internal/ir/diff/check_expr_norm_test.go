@@ -269,6 +269,45 @@ func TestDiffChecks_EmittedMatchDoesNotStealANameClaimedConstraint(t *testing.T)
 	}
 }
 
+// TestDiffChecks_EmittedMatchStillFiresWhenTheNameRoundTrips pins the
+// half the GAP 5 filter's first cut broke (caught by CI's MySQL→PG
+// reconciliation pin, 2026-08-11): the POSTGRES writer names its
+// synthesized checks predictably, so on a PG target the emitted expected
+// check and the actual constraint share a NAME — and the target
+// re-renders the predicate (`IN (…)` reads back as `= ANY (ARRAY[…])`),
+// so the raw name-keyed comparison can never match them. The name-claimed
+// exclusion must therefore apply only when the claimer is SOURCE-DECLARED;
+// an emitted name-claimer still needs the canonical-expression match.
+func TestDiffChecks_EmittedMatchStillFiresWhenTheNameRoundTrips(t *testing.T) {
+	table := func(checks ...*ir.CheckConstraint) *ir.Table {
+		return &ir.Table{
+			Name:             "prefs",
+			Columns:          []*ir.Column{{Name: "g_mood", Type: ir.Text{Size: ir.TextLong}}},
+			CheckConstraints: checks,
+		}
+	}
+	expected := &ir.Schema{Tables: []*ir.Table{table(
+		&ir.CheckConstraint{
+			Name:          "prefs_g_mood_enum_chk",
+			Expr:          `"g_mood" IN ('happy','sad')`,
+			SluiceEmitted: true,
+		},
+	)}}
+	// The PG target's own rendering of the same predicate, under the SAME
+	// name — the exact shape a MySQL→PG migrate leaves behind.
+	actual := &ir.Schema{Tables: []*ir.Table{table(
+		&ir.CheckConstraint{
+			Name: "prefs_g_mood_enum_chk",
+			Expr: `(g_mood = ANY (ARRAY['happy'::text, 'sad'::text]))`,
+		},
+	)}}
+	if d := Schemas(expected, actual, Options{}); d.HasChanges() {
+		t.Fatalf("a PG target migrate just created reported drift: the name-claimed exclusion is eating the "+
+			"emitted prediction's own name-twin, which only the expression match can reconcile: %s %+v",
+			d.Summary(), d.TablesMismatched)
+	}
+}
+
 // TestDiffChecks_EmittedChecksAreMatchedByExpressionNotName is the
 // comparison-level half: the same four states an operator can leave a
 // sluice-emitted constraint in, graded through [Schemas].
