@@ -30,16 +30,22 @@
 //
 // [TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores] drives ALL
 // THREE cores — COPY, plain batch, idempotent batch — over the seven WKB
-// geometry families × {2-D, 3-D (Z), NULL} × BOTH spatial column types,
-// `geometry` and `geography`. One family is not a representative here
-// (Bug 74): `geometry_recv` parses each family's WKB body differently,
-// and the pre-fix failure was a whole-format rejection that any single
-// family would have caught only for itself. Geography is not a
-// representative of geometry either (audit GAP 1, 2026-08-10): it is a
+// geometry families × {2-D, Z, M, ZM, NULL} × BOTH spatial column types
+// (`geometry`, `geography`) × the SRID axis ({bare column + SRID 0,
+// typmod-constrained + SRID 4326}). One family is not a representative
+// here (Bug 74): `geometry_recv` parses each family's WKB body
+// differently, and the pre-fix failure was a whole-format rejection that
+// any single family would have caught only for itself. Geography is not
+// a representative of geometry either (audit GAP 1, 2026-08-10): it is a
 // DIFFERENT dynamic OID routed to a different receive function
 // (`geography_recv`), and it spent Bug 239's whole lifetime failing on
 // the batch cores with the identical error text after geometry was
-// fixed — because only the geometry OID had the codec registered.
+// fixed — because only the geometry OID had the codec registered. Nor is
+// Z a representative of M/ZM, nor SRID 0 of SRID 4326 (audit GAP 2,
+// closed 2026-08-11): ST_AsBinary spells M/ZM with the ISO WKB
+// 2000/3000-range type codes — a byte layout the Z-only matrix never
+// shipped — and a typmod-constrained `geometry(Point,4326)` column adds
+// the receive-side SRID/typmod check that a bare column never runs.
 //
 // Reaching the plain-batch core uses the PRODUCTION route rather than
 // poking unexported state: an `interval` column on the table, which
@@ -83,31 +89,53 @@ type geometryFamilyCase struct {
 	wkt string
 	// wantType is PostGIS's own ST_GeometryType spelling.
 	wantType string
-	// wantNDims is 2 for planar, 3 for Z.
+	// wantNDims is 2 for planar, 3 for Z or M, 4 for ZM.
 	wantNDims int
 	// subtype is the IR column subtype the target column is declared with.
 	subtype ir.GeometrySubtype
+	// typmodBase is the PostGIS typmod spelling for the SRID-constrained
+	// arm, e.g. "POINTZM" for `geometry(POINTZM, 4326)`. Derived per case
+	// rather than from wkt so a typo fails DDL loudly.
+	typmodBase string
+	hasZ, hasM bool
 }
 
-// geometryFamilyMatrix is every WKB geometry family × {2-D, Z}. NULL is a
-// third shape, handled per-case by the driver (each family also writes a
-// NULL row into its nullable column).
+// geometryFamilyMatrix is every WKB geometry family × {2-D, Z, M, ZM}.
+// NULL is a fifth shape, handled per-case by the driver (each family also
+// writes a NULL row into its nullable column). M and ZM matter as cases
+// and not merely as flags (audit GAP 2): ST_AsBinary spells them with the
+// ISO WKB 2000/3000-range type codes — a byte layout the Z-only matrix
+// never shipped through wkbToEWKB and the receive functions.
 func geometryFamilyMatrix() []geometryFamilyCase {
 	return []geometryFamilyCase{
-		{"point", "POINT(1 2)", "ST_Point", 2, ir.GeometryPoint},
-		{"point_z", "POINT Z (1 2 3)", "ST_Point", 3, ir.GeometryPoint},
-		{"linestring", "LINESTRING(0 0,1 1,2 2)", "ST_LineString", 2, ir.GeometryLineString},
-		{"linestring_z", "LINESTRING Z (0 0 0,1 1 1)", "ST_LineString", 3, ir.GeometryLineString},
-		{"polygon", "POLYGON((0 0,4 0,4 4,0 4,0 0))", "ST_Polygon", 2, ir.GeometryPolygon},
-		{"polygon_z", "POLYGON Z ((0 0 1,4 0 1,4 4 1,0 4 1,0 0 1))", "ST_Polygon", 3, ir.GeometryPolygon},
-		{"multipoint", "MULTIPOINT((0 0),(1 1))", "ST_MultiPoint", 2, ir.GeometryMultiPoint},
-		{"multipoint_z", "MULTIPOINT Z ((0 0 1),(1 1 2))", "ST_MultiPoint", 3, ir.GeometryMultiPoint},
-		{"multilinestring", "MULTILINESTRING((0 0,1 1),(2 2,3 3))", "ST_MultiLineString", 2, ir.GeometryMultiLineString},
-		{"multilinestring_z", "MULTILINESTRING Z ((0 0 1,1 1 1))", "ST_MultiLineString", 3, ir.GeometryMultiLineString},
-		{"multipolygon", "MULTIPOLYGON(((0 0,1 0,1 1,0 1,0 0)))", "ST_MultiPolygon", 2, ir.GeometryMultiPolygon},
-		{"multipolygon_z", "MULTIPOLYGON Z (((0 0 1,1 0 1,1 1 1,0 1 1,0 0 1)))", "ST_MultiPolygon", 3, ir.GeometryMultiPolygon},
-		{"geometrycollection", "GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,1 1))", "ST_GeometryCollection", 2, ir.GeometryCollection},
-		{"geometrycollection_z", "GEOMETRYCOLLECTION Z (POINT Z (1 2 3))", "ST_GeometryCollection", 3, ir.GeometryCollection},
+		{"point", "POINT(1 2)", "ST_Point", 2, ir.GeometryPoint, "POINT", false, false},
+		{"point_z", "POINT Z (1 2 3)", "ST_Point", 3, ir.GeometryPoint, "POINTZ", true, false},
+		{"point_m", "POINT M (1 2 5)", "ST_Point", 3, ir.GeometryPoint, "POINTM", false, true},
+		{"point_zm", "POINT ZM (1 2 3 5)", "ST_Point", 4, ir.GeometryPoint, "POINTZM", true, true},
+		{"linestring", "LINESTRING(0 0,1 1,2 2)", "ST_LineString", 2, ir.GeometryLineString, "LINESTRING", false, false},
+		{"linestring_z", "LINESTRING Z (0 0 0,1 1 1)", "ST_LineString", 3, ir.GeometryLineString, "LINESTRINGZ", true, false},
+		{"linestring_m", "LINESTRING M (0 0 5,1 1 6)", "ST_LineString", 3, ir.GeometryLineString, "LINESTRINGM", false, true},
+		{"linestring_zm", "LINESTRING ZM (0 0 0 5,1 1 1 6)", "ST_LineString", 4, ir.GeometryLineString, "LINESTRINGZM", true, true},
+		{"polygon", "POLYGON((0 0,4 0,4 4,0 4,0 0))", "ST_Polygon", 2, ir.GeometryPolygon, "POLYGON", false, false},
+		{"polygon_z", "POLYGON Z ((0 0 1,4 0 1,4 4 1,0 4 1,0 0 1))", "ST_Polygon", 3, ir.GeometryPolygon, "POLYGONZ", true, false},
+		{"polygon_m", "POLYGON M ((0 0 5,4 0 5,4 4 5,0 4 5,0 0 5))", "ST_Polygon", 3, ir.GeometryPolygon, "POLYGONM", false, true},
+		{"polygon_zm", "POLYGON ZM ((0 0 1 5,4 0 1 5,4 4 1 5,0 4 1 5,0 0 1 5))", "ST_Polygon", 4, ir.GeometryPolygon, "POLYGONZM", true, true},
+		{"multipoint", "MULTIPOINT((0 0),(1 1))", "ST_MultiPoint", 2, ir.GeometryMultiPoint, "MULTIPOINT", false, false},
+		{"multipoint_z", "MULTIPOINT Z ((0 0 1),(1 1 2))", "ST_MultiPoint", 3, ir.GeometryMultiPoint, "MULTIPOINTZ", true, false},
+		{"multipoint_m", "MULTIPOINT M ((0 0 5),(1 1 6))", "ST_MultiPoint", 3, ir.GeometryMultiPoint, "MULTIPOINTM", false, true},
+		{"multipoint_zm", "MULTIPOINT ZM ((0 0 1 5),(1 1 2 6))", "ST_MultiPoint", 4, ir.GeometryMultiPoint, "MULTIPOINTZM", true, true},
+		{"multilinestring", "MULTILINESTRING((0 0,1 1),(2 2,3 3))", "ST_MultiLineString", 2, ir.GeometryMultiLineString, "MULTILINESTRING", false, false},
+		{"multilinestring_z", "MULTILINESTRING Z ((0 0 1,1 1 1))", "ST_MultiLineString", 3, ir.GeometryMultiLineString, "MULTILINESTRINGZ", true, false},
+		{"multilinestring_m", "MULTILINESTRING M ((0 0 5,1 1 6))", "ST_MultiLineString", 3, ir.GeometryMultiLineString, "MULTILINESTRINGM", false, true},
+		{"multilinestring_zm", "MULTILINESTRING ZM ((0 0 1 5,1 1 1 6))", "ST_MultiLineString", 4, ir.GeometryMultiLineString, "MULTILINESTRINGZM", true, true},
+		{"multipolygon", "MULTIPOLYGON(((0 0,1 0,1 1,0 1,0 0)))", "ST_MultiPolygon", 2, ir.GeometryMultiPolygon, "MULTIPOLYGON", false, false},
+		{"multipolygon_z", "MULTIPOLYGON Z (((0 0 1,1 0 1,1 1 1,0 1 1,0 0 1)))", "ST_MultiPolygon", 3, ir.GeometryMultiPolygon, "MULTIPOLYGONZ", true, false},
+		{"multipolygon_m", "MULTIPOLYGON M (((0 0 5,1 0 5,1 1 5,0 1 5,0 0 5)))", "ST_MultiPolygon", 3, ir.GeometryMultiPolygon, "MULTIPOLYGONM", false, true},
+		{"multipolygon_zm", "MULTIPOLYGON ZM (((0 0 1 5,1 0 1 5,1 1 1 5,0 1 1 5,0 0 1 5)))", "ST_MultiPolygon", 4, ir.GeometryMultiPolygon, "MULTIPOLYGONZM", true, true},
+		{"geometrycollection", "GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,1 1))", "ST_GeometryCollection", 2, ir.GeometryCollection, "GEOMETRYCOLLECTION", false, false},
+		{"geometrycollection_z", "GEOMETRYCOLLECTION Z (POINT Z (1 2 3))", "ST_GeometryCollection", 3, ir.GeometryCollection, "GEOMETRYCOLLECTIONZ", true, false},
+		{"geometrycollection_m", "GEOMETRYCOLLECTION M (POINT M (1 2 5))", "ST_GeometryCollection", 3, ir.GeometryCollection, "GEOMETRYCOLLECTIONM", false, true},
+		{"geometrycollection_zm", "GEOMETRYCOLLECTION ZM (POINT ZM (1 2 3 5))", "ST_GeometryCollection", 4, ir.GeometryCollection, "GEOMETRYCOLLECTIONZM", true, true},
 	}
 }
 
@@ -171,8 +199,8 @@ func TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores(t *testing.T) {
 	}
 
 	matrix := geometryFamilyMatrix()
-	if len(matrix) < 14 {
-		t.Fatalf("family matrix has %d cases; want all 7 WKB families × {2-D, Z} (anti-vacuity floor)", len(matrix))
+	if len(matrix) < 28 {
+		t.Fatalf("family matrix has %d cases; want all 7 WKB families × {2-D, Z, M, ZM} (anti-vacuity floor)", len(matrix))
 	}
 
 	cores := []writeCore{
@@ -184,13 +212,22 @@ func TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores(t *testing.T) {
 		{name: "geometry"},
 		{name: "geography", isGeography: true},
 	}
+	// The SRID axis (audit GAP 2): srid 0 into a bare column exercises an
+	// EWKB whose SRID word is zero; srid 4326 into a TYPMOD-CONSTRAINED
+	// column is the common field shape, and it is a different receive path
+	// — the typmod check in `geometry_recv`/`geography_recv` compares the
+	// value's SRID word against the column's constraint, so a mis-framed
+	// SRID that a bare column absorbs is a loud refusal here.
+	srids := []int{0, 4326}
 
 	for _, ct := range colTypes {
-		for _, core := range cores {
-			for _, tc := range matrix {
-				t.Run(ct.name+"/"+core.name+"/"+tc.name, func(t *testing.T) {
-					runGeometryCoreCase(ctx, t, db, writer, idem, ct, core, tc)
-				})
+		for _, srid := range srids {
+			for _, core := range cores {
+				for _, tc := range matrix {
+					t.Run(fmt.Sprintf("%s/srid%d/%s/%s", ct.name, srid, core.name, tc.name), func(t *testing.T) {
+						runGeometryCoreCase(ctx, t, db, writer, idem, ct, srid, core, tc)
+					})
+				}
 			}
 		}
 	}
@@ -207,13 +244,18 @@ func runGeometryCoreCase(
 	writer *RowWriter,
 	idem ir.IdempotentRowWriter,
 	ct spatialColumnType,
+	srid int,
 	core writeCore,
 	tc geometryFamilyCase,
 ) {
 	t.Helper()
 
-	table := fmt.Sprintf("geo_%s_%s_%s", ct.name, core.name, tc.name)
-	ddl := fmt.Sprintf(`CREATE TABLE %s (id bigint PRIMARY KEY, g %s NULL`, quoteIdent(table), ct.name)
+	colDDL := ct.name // bare column: `geometry` / `geography`
+	if srid != 0 {
+		colDDL = fmt.Sprintf("%s(%s, %d)", ct.name, tc.typmodBase, srid)
+	}
+	table := fmt.Sprintf("geo_%s_%d_%s_%s", ct.name, srid, core.name, tc.name)
+	ddl := fmt.Sprintf(`CREATE TABLE %s (id bigint PRIMARY KEY, g %s NULL`, quoteIdent(table), colDDL)
 	if core.intervalColumn {
 		ddl += `, span interval NULL`
 	}
@@ -236,7 +278,13 @@ func runGeometryCoreCase(
 
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
-		{Name: "g", Type: ir.Geometry{Subtype: tc.subtype, IsGeography: ct.isGeography}, Nullable: true},
+		{Name: "g", Type: ir.Geometry{
+			Subtype:     tc.subtype,
+			SRID:        srid,
+			IsGeography: ct.isGeography,
+			HasZ:        tc.hasZ,
+			HasM:        tc.hasM,
+		}, Nullable: true},
 	}
 	row1 := ir.Row{"id": int64(1), "g": wkb}
 	row2 := ir.Row{"id": int64(2), "g": nil}
@@ -292,6 +340,24 @@ func runGeometryCoreCase(
 	}
 	if !gotEqual {
 		t.Errorf("ST_OrderingEquals(target, %q) = false; the landed geometry is not the seeded one", tc.wkt)
+	}
+
+	// SRID leg: the landed value's SRID must be what the arm declared —
+	// 4326 on the typed arm, 4326 on a bare geography column (the type's
+	// default, stamped at ingest), 0 on a bare geometry column. A silent
+	// re-stamp here is the C-14 loss shape.
+	wantSRID := srid
+	if wantSRID == 0 && ct.isGeography {
+		wantSRID = 4326
+	}
+	var gotSRID int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT ST_SRID(g::geometry) FROM %s WHERE id = 1`, quoteIdent(table),
+	)).Scan(&gotSRID); err != nil {
+		t.Fatalf("read back SRID %s: %v", table, err)
+	}
+	if gotSRID != wantSRID {
+		t.Errorf("landed SRID = %d; want %d (a re-stamped SRID is a coordinate pair that no longer names a place)", gotSRID, wantSRID)
 	}
 
 	// Leg 2 — byte-exactness against what the writer was handed. Catches a

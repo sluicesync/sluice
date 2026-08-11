@@ -496,9 +496,9 @@ Reachability is wider than "off the COPY path" implies: `WriteRowsIdempotent` AL
 
 Minimal close: register the codec against the geography OID in `afterConnectRegisterGeometry` (same lookup, one extra row) — which makes it WORK — or add a named refusal for `IsGeography` off COPY. Either way the family matrix needs `IsGeography: true` rows; its 42 cells key on `Subtype` and never touch the flag.
 
-### GAP 2 (MEDIUM) — the geometry family matrix has no SRID≠0 cell
+### ~~GAP 2~~ (MEDIUM) — the geometry family matrix has no SRID≠0 cell
 
-Every cell of `TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores` uses `ir.Geometry{Subtype: X}` (SRID 0) into a bare `geometry NULL` column, so `wkbToEWKB` takes its no-SRID-flag branch in all 42. The production shape — `geometry(Point,4326)`, where EWKB carries the `0x20000000` type flag plus a 4-byte SRID word — is a DIFFERENT byte layout into `geometry_recv` and is unexercised on both newly-covered cores. Same for M / ZM (ISO WKB 2000/3000 type codes; the matrix covers 2-D and Z only). Loud failure direction, but it is exactly the Bug-74 shape axis and 4326 is the common field case.
+**RESOLVED (2026-08-11).** The matrix gained the SRID axis ({bare column + SRID 0, typmod-constrained + SRID 4326}) and the M/ZM dimension cases (ISO WKB 2000/3000-range type codes) on top of the GAP 1 geography axis: 3 cores × 28 family/dimension cases × {geometry, geography} × {srid 0, 4326} = **336 cells, all byte-exact** on real PostGIS, each cell now also asserting the LANDED SRID (the C-14 silent-re-stamp direction the old matrix could not see). Mutation-run: a mis-stamped SRID word in `wkbToEWKB` (`srid+1`) fails every arm — the bare-column cells via the new SRID leg (landed 1, want 0 — the SILENT direction), the typed cells via the server's own typmod refusal (`Geometry SRID (4327) does not match column SRID (4326)`), geography via `spatial_ref_sys`. One correction to the filing: `wkbToEWKB` has no "no-SRID-flag branch" — it sets the `0x20000000` flag and writes the SRID word unconditionally (0 included), so the genuinely unexercised axes were the SRID *value* ≠ 0 against a typmod-constrained receive path, and the M/ZM type codes; both now covered.
 
 ### GAP 3 (LOW, message-only) — C-14 is not literally "untouched" for a 4-byte window
 
