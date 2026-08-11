@@ -226,6 +226,70 @@ func untranslatableFunctions(expr string, enabledExt map[string]bool) []string {
 	if tok := mysqlOnlyCastTarget(expr); tok != "" && !seen[tok] {
 		out = append(out, tok)
 	}
+	// Bug 242: MySQL-family INFIX operators PostgreSQL cannot parse.
+	// MySQL 8 normalizes `c REGEXP '...'` to the regexp_like() call the
+	// function scan above sees; MariaDB's information_schema renders the
+	// INFIX spelling — no call, no parens — so the operator sailed past
+	// this gate and died in PostgreSQL's parser (SQLSTATE 42601) after
+	// earlier tables had been created. Same class as the cast-target arm
+	// above: an untranslatable construct that is not function-shaped.
+	for _, tok := range mysqlInfixOperators(expr) {
+		if !seen[tok] {
+			seen[tok] = true
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// mysqlInfixOperators reports the MySQL-family infix operator tokens in
+// expr that PostgreSQL has no parse for, as synthetic `infix-<op>`
+// tokens (the cast-target arm's naming convention). String-literal-aware
+// — a literal containing the word `regexp` is data — and word-bounded,
+// so `regexp_like` (an identifier byte follows) never matches. A COLUMN
+// literally named `regexp`/`rlike` (bare after the read-boundary
+// backtick strip) would false-trip this; that is the loud direction on
+// a vanishingly rare name, and `--expr-override` is its escape hatch.
+//
+// Deliberately only the two MEASURED spellings: MariaDB renders infix
+// `REGEXP` (Bug 242's shape) and accepts `RLIKE` as its synonym. MySQL's
+// `SOUNDS LIKE` operator is NOT listed — no catalog rendering of it has
+// been measured, and this gate adds spellings from measurements, not
+// from the manual (if a catalog renders it infix, it dies at PG's
+// parser exactly as Bug 242 did, and the fix is one entry here plus its
+// measurement).
+func mysqlInfixOperators(expr string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i := 0; i < len(expr); {
+		c := expr[i]
+		if c == '\'' {
+			i = exprident.ScanStringLiteral(expr, i)
+			continue
+		}
+		if !isIdentStartByte(c) {
+			i++
+			continue
+		}
+		start := i
+		j := i + 1
+		for j < len(expr) && exprident.IsIdentifierByte(expr[j]) {
+			j++
+		}
+		switch strings.ToLower(expr[start:j]) {
+		case "regexp":
+			if !seen["infix-regexp"] {
+				seen["infix-regexp"] = true
+				out = append(out, "infix-regexp")
+			}
+		case "rlike":
+			if !seen["infix-rlike"] {
+				seen["infix-rlike"] = true
+				out = append(out, "infix-rlike")
+			}
+		}
+		i = j
+	}
 	return out
 }
 
@@ -440,6 +504,10 @@ func RefuseOnUntranslatableExprs(
 			what = "a `CAST(... AS UNSIGNED)` whose MySQL-only target type has no PostgreSQL spelling and"
 		case "cast-as-signed":
 			what = "a `CAST(... AS SIGNED)` whose MySQL-only target type has no PostgreSQL spelling and"
+		case "infix-regexp":
+			what = "the infix `REGEXP` operator (MariaDB's catalog spelling — MySQL 8 renders it as regexp_like()), which PostgreSQL does not parse — its equivalent is `x ~ 'pattern'`, minding the ICU-vs-POSIX regex flavour difference — and"
+		case "infix-rlike":
+			what = "the infix `RLIKE` operator, which PostgreSQL does not parse — its equivalent is `x ~ 'pattern'`, minding the ICU-vs-POSIX regex flavour difference — and"
 		default:
 			what = u.Function + "(...) is not a PostgreSQL built-in and"
 		}

@@ -75,7 +75,20 @@ func TestGapMatchers_CoverTheRegistry(t *testing.T) {
 	if len(gapPatterns) == 0 {
 		t.Fatal("gapPatterns is empty; this test and the matcher table are both vacuous")
 	}
+	callForm := 0
 	for _, pat := range gapPatterns {
+		if pat.infix {
+			// Bug 242: operator-form entries are matched by the shared
+			// token scan (matchesInfixOperator), never by a call-form
+			// regex — a table entry here would be dead weight that reads
+			// as coverage.
+			if _, ok := gapMatchers[pat.name]; ok {
+				t.Errorf("infix gapPatterns entry %q has a call-form matcher — the call regex can never "+
+					"match an infix operator, so this entry is vacuous and misleading", pat.name)
+			}
+			continue
+		}
+		callForm++
 		re, ok := gapMatchers[pat.name]
 		if !ok {
 			t.Errorf("gapPatterns entry %q has no pre-built matcher — it would compile on every call, "+
@@ -86,9 +99,9 @@ func TestGapMatchers_CoverTheRegistry(t *testing.T) {
 			t.Errorf("matcher for %q is nil", pat.name)
 		}
 	}
-	if len(gapMatchers) != len(gapPatterns) {
-		t.Errorf("gapMatchers has %d entries, gapPatterns has %d — the table and the registry have drifted",
-			len(gapMatchers), len(gapPatterns))
+	if len(gapMatchers) != callForm {
+		t.Errorf("gapMatchers has %d entries, gapPatterns has %d call-form entries — the table and the "+
+			"registry have drifted", len(gapMatchers), callForm)
 	}
 }
 

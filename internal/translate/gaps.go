@@ -206,6 +206,12 @@ type gapPattern struct {
 	severity    Severity
 	note        string
 	requiresExt string // when non-empty, pattern is skipped if extension is enabled
+
+	// infix marks an OPERATOR-form pattern (Bug 242): matched as a bare
+	// word token with literals masked, instead of the `name(` call form —
+	// MariaDB's catalog renders `c REGEXP '...'` infix, which no call-form
+	// matcher can see.
+	infix bool
 }
 
 // gapPatterns is the registry of MySQL → PG translator gaps the
@@ -229,6 +235,25 @@ var gapPatterns = []gapPattern{
 		rule:     13,
 		severity: SeveritySilent,
 		note:     "PG 15+ accepts regexp_like() but uses POSIX regex flavour; MySQL uses ICU. Lookaheads, named groups, and Unicode-property classes don't translate. Use --expr-override with `x ~ 'pattern'` for compatible patterns.",
+	},
+	{
+		// Bug 242: MariaDB's information_schema renders `c REGEXP '...'`
+		// as the INFIX operator (MySQL 8 normalizes it to the
+		// regexp_like() call above), and PostgreSQL does not parse the
+		// operator at all — without this entry the construct died in PG's
+		// parser mid-pipeline instead of surfacing here.
+		name:     "REGEXP",
+		rule:     13,
+		severity: SeverityLoud,
+		note:     "PG has no infix REGEXP operator. Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU — lookaheads, named groups, and Unicode-property classes don't translate). Use --expr-override.",
+		infix:    true,
+	},
+	{
+		name:     "RLIKE",
+		rule:     13,
+		severity: SeverityLoud,
+		note:     "PG has no infix RLIKE operator. Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU). Use --expr-override.",
+		infix:    true,
 	},
 	{
 		name:     "FIND_IN_SET",
@@ -363,7 +388,11 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 			// Extension enabled → rewrite ships, skip the warning.
 			continue
 		}
-		if !matchesFunctionCall(expr, pat.name) {
+		if pat.infix {
+			if !matchesInfixOperator(expr, pat.name) {
+				continue
+			}
+		} else if !matchesFunctionCall(expr, pat.name) {
 			continue
 		}
 		out = append(out, Gap{
@@ -389,6 +418,23 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 func matchesFunctionCall(expr, name string) bool {
 	re := gapMatcher(name)
 	return re.MatchString(expr)
+}
+
+// matchesInfixOperator is the operator-form twin of
+// [matchesFunctionCall] (Bug 242), and it deliberately rides the SAME
+// scanner the refusal gate uses ([mysqlInfixOperators]) — one
+// literal-aware, word-bounded token scan, two consumers, so the
+// advisory and the refusal can never disagree about what counts as the
+// operator. Unlike the call-form matcher it masks string literals: an
+// advisory firing on the word `regexp` inside a value would be noise
+// the loud gate never produces.
+func matchesInfixOperator(expr, name string) bool {
+	for _, tok := range mysqlInfixOperators(expr) {
+		if strings.EqualFold(tok, "infix-"+name) {
+			return true
+		}
+	}
+	return false
 }
 
 // gapMatchers holds the compiled `(?i)\bNAME\s*\(` regex for every name in
@@ -419,6 +465,11 @@ func matchesFunctionCall(expr, name string) bool {
 var gapMatchers = func() map[string]*regexp.Regexp {
 	m := make(map[string]*regexp.Regexp, len(gapPatterns))
 	for _, pat := range gapPatterns {
+		if pat.infix {
+			// Operator-form patterns are matched by the shared token scan
+			// ([matchesInfixOperator]), never by a call-form regex.
+			continue
+		}
 		// `(?i)` makes the match case-insensitive; `\b` is a word boundary;
 		// `\s*` permits whitespace between the function name and `(`.
 		m[pat.name] = regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(pat.name) + `\s*\(`)
