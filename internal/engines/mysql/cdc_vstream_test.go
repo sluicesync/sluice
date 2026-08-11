@@ -2046,6 +2046,74 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 	}
 }
 
+// TestDecodeVStreamRow_MalformedEventRefusesLoudly pins the closure of the
+// empty-row premise (audit 2026-08-10 adjacent-invariant filing): a row
+// event whose Lengths count disagrees with the field count used to decode
+// as an EMPTY ir.Row with ok=true, commented "so the caller surfaces the
+// issue" — and no caller checked, so on the snapshot/copy path every
+// missing key reached the writer as NULL. Both malformed shapes must now
+// land on the error channel every caller already propagates:
+//
+//  1. length-count mismatch (the filed shape), and
+//  2. a Values buffer shorter than its own Lengths claim (the same class
+//     one step later, which previously PANICKED on the slice instead of
+//     erroring the stream).
+//
+// The nil-row half (ok=false, the absent side of an Insert/Delete) and the
+// well-formed path must be unaffected.
+func TestDecodeVStreamRow_MalformedEventRefusesLoudly(t *testing.T) {
+	fields := []*query.Field{
+		{Name: "id", Type: query.Type_INT64, ColumnType: "bigint"},
+		{Name: "name", Type: query.Type_VARCHAR, ColumnType: "varchar(10)"},
+	}
+
+	t.Run("length_count_mismatch", func(t *testing.T) {
+		row := &query.Row{Lengths: []int64{1}, Values: []byte("1")} // 1 length, 2 fields
+		out, ok, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		if err == nil {
+			t.Fatalf("decodeVStreamRow = (%#v, %v, nil); want a loud refusal — an empty row with ok=true silently NULLs every column downstream", out, ok)
+		}
+		for _, want := range []string{"users", "malformed row event", "1 length entries for 2 fields"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q missing %q", err, want)
+			}
+		}
+	})
+
+	t.Run("values_shorter_than_lengths_claim", func(t *testing.T) {
+		// Lengths claim 1+5 bytes; Values holds 3. Pre-fix this panicked on
+		// the slice expression rather than erroring the stream.
+		row := &query.Row{Lengths: []int64{1, 5}, Values: []byte("1ab")}
+		_, _, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		if err == nil {
+			t.Fatal("decodeVStreamRow accepted a Values buffer shorter than its own Lengths claim")
+		}
+		for _, want := range []string{"users", `column "name"`, "truncated"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q missing %q", err, want)
+			}
+		}
+	})
+
+	t.Run("nil_row_still_ok_false", func(t *testing.T) {
+		out, ok, err := decodeVStreamRow(nil, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		if err != nil || ok || out != nil {
+			t.Fatalf("decodeVStreamRow(nil) = (%#v, %v, %v); want (nil, false, nil) — the absent half of an Insert/Delete is not malformed", out, ok, err)
+		}
+	})
+
+	t.Run("well_formed_row_unaffected", func(t *testing.T) {
+		row := &query.Row{Lengths: []int64{1, 3}, Values: []byte("1bob")}
+		out, ok, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		if err != nil || !ok {
+			t.Fatalf("decodeVStreamRow well-formed = (ok=%v, err=%v); want (true, nil)", ok, err)
+		}
+		if out["name"] != "bob" {
+			t.Errorf("name = %#v; want %q", out["name"], "bob")
+		}
+	})
+}
+
 // TestDecodeVStreamCell_ZeroDateSentinel pins Vector A VStream parity at the
 // cell level: a zero/partial date decodes to the shared *zeroDateValueError
 // sentinel (resolved by decodeVStreamRow per --zero-date), a valid date to

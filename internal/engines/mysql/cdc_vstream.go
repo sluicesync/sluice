@@ -1811,10 +1811,18 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 	values := row.GetValues()
 	lengths := row.GetLengths()
 	if len(lengths) != len(fields) {
-		// Malformed event (length count != field count) — produce
-		// an empty row so the caller surfaces the issue rather
-		// than silently misaligning columns.
-		return out, true, nil
+		// Malformed event (length count != field count). This used to
+		// return an EMPTY row with ok=true, commented "so the caller
+		// surfaces the issue" — a premise nothing checked: all five
+		// production callers treated the empty row as a normal one, and on
+		// the snapshot/copy path every missing key reached the writer as
+		// NULL. That is the silent-loss shape, so the answer is the loud
+		// one on the error channel every caller already propagates
+		// (audit 2026-08-10, adjacent-invariant filing).
+		return nil, false, fmt.Errorf(
+			"mysql/vstream: table %q: malformed row event: %d length entries for %d fields — refusing to decode rather than misalign columns",
+			tableName, len(lengths), len(fields),
+		)
 	}
 	offset := 0
 	for i, f := range fields {
@@ -1822,6 +1830,16 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		if l < 0 {
 			out[f.GetName()] = nil
 			continue
+		}
+		// The same malformed-event class one step later: a Values buffer
+		// shorter than its own Lengths claim would panic on the slice
+		// below, killing the reader goroutine instead of erroring the
+		// stream. Refuse it the same way.
+		if offset+int(l) > len(values) {
+			return nil, false, fmt.Errorf(
+				"mysql/vstream: table %q column %q: malformed row event: lengths claim %d more bytes at offset %d but Values holds %d — refusing to decode a truncated event",
+				tableName, f.GetName(), l, offset, len(values),
+			)
 		}
 		raw := values[offset : offset+int(l)]
 		offset += int(l)

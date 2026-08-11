@@ -512,9 +512,11 @@ For `4 ≤ len(raw) ≤ 8` the payload does carry a complete SRID word, and prev
 
 `pgAnyArrayRewrite` (`check_expr_norm.go:64`) is greedy: two `= ANY (ARRAY[…])` terms would canonicalize by spanning first `array[` to last `])`. No emitted shape produces two today; failure direction is a spurious DIFFERENCE. And `matchEmittedChecks` consumes actual-side constraints greedily in sorted-name order, so an emitted prediction can pair with a source-declared constraint carrying the same canonical predicate. Both false-positive direction.
 
-### Adjacent, pre-existing, belongs in the invariant queue
+### ~~Adjacent, pre-existing, belongs in the invariant queue~~ — RESOLVED
 
-`mysql/cdc_vstream.go:1813-1818`: on `len(lengths) != len(fields)` the decoder returns an EMPTY `ir.Row` with `ok=true`, commented "so the caller surfaces the issue" — a premise nothing checks. All five callers treat it as a normal row; on the snapshot/copy path an empty row reaches `flattenArgs` where every missing key becomes nil → NULL. That is the silent-loss shape, gated behind a malformed VStream event. Not introduced by this delta, but the delta edits adjacent lines.
+**RESOLVED (2026-08-11).** `decodeVStreamRow`'s malformed-event branch now refuses on the error channel all five callers already propagate (verified caller-by-caller), naming the table and both counts — the empty-row-with-`ok=true` shape and its "the caller surfaces the issue" comment are gone. The same sweep closed the sibling one step later that the filing did not name: a `Values` buffer shorter than its own `Lengths` claim PANICKED on the slice expression (mutation-confirmed: `slice bounds out of range`, killing the reader goroutine), and now refuses with the same loud shape. Pinned by `TestDecodeVStreamRow_MalformedEventRefusesLoudly` (both malformed shapes, plus the nil-row `ok=false` half and the well-formed path unchanged); both mutants applied-verified-caught before trusting the run.
+
+Original filing: `mysql/cdc_vstream.go:1813-1818`: on `len(lengths) != len(fields)` the decoder returns an EMPTY `ir.Row` with `ok=true`, commented "so the caller surfaces the issue" — a premise nothing checks. All five callers treat it as a normal row; on the snapshot/copy path an empty row reaches `flattenArgs` where every missing key becomes nil → NULL. That is the silent-loss shape, gated behind a malformed VStream event. Not introduced by this delta, but the delta edits adjacent lines.
 
 ### One behavioural consequence for the release notes, not a defect
 
