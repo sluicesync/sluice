@@ -181,6 +181,33 @@ func TestDiff_PGToMySQL_DomainChecksAreReconciled_Item156(t *testing.T) {
 			"refuses it looks clean: %+v", td)
 	}
 	t.Logf("tampered-check report: missing=%v extra=%v", td.ChecksMissing, td.ChecksExtra)
+
+	// ---- DIRTY 3 (audit GAP 4): a TAMPERED REGEX-arm CHECK is still real ----
+	// ---- drift.                                                          ----
+	//
+	// DIRTY 1 and 2 exercise the RANGE translator arm only. The regex arm
+	// is the one whose canonicalization does the delicate work — the
+	// literal decoder, the `_utf8mb4` introducer skip, the `\'` un-escape
+	// and the bracket stripper — which is exactly where a FALSE MATCH is
+	// most plausible: a canonicalizer that collapsed two different regex
+	// literals to the same canonical form would report this tampered
+	// pattern as in sync. Same drop/re-add-under-the-auto-name shape as
+	// DIRTY 2, with the pattern's domain changed (com → org): the target
+	// now accepts addresses the source's DOMAIN refuses. Runs on top of
+	// DIRTY 2's still-widened chk_2, so the expected report is BOTH
+	// tampers — 2 missing + 2 extra; a regex false-match shows up as this
+	// arm contributing nothing (1 + 1).
+	applyMySQLDDL(t, mysqlTarget, "ALTER TABLE `dcheck` DROP CHECK `dcheck_chk_1`")
+	applyMySQLDDL(t, mysqlTarget, "ALTER TABLE `dcheck` ADD CONSTRAINT `dcheck_chk_1` CHECK (`email` REGEXP '^[a-z]+@example[.]org$')")
+	diff = runDomainCheckDiff(ctx, t, pgEng, myEng, pgSource, mysqlTarget)
+	td = findTableDiff(*diff, "dcheck")
+	if td == nil || len(td.ChecksMissing) != 2 || len(td.ChecksExtra) != 2 {
+		t.Fatalf("a TAMPERED REGEX-arm CHECK did not report as drift alongside DIRTY 2's (want 2 missing + 2 extra). "+
+			"The regex canonicalization path — literal decode, _utf8mb4 introducer skip, apostrophe un-escape, "+
+			"bracket strip — is collapsing two DIFFERENT patterns to one canonical form, so a target that "+
+			"accepts addresses the source refuses looks clean: %+v", td)
+	}
+	t.Logf("tampered-regex report: missing=%v extra=%v", td.ChecksMissing, td.ChecksExtra)
 }
 
 // TestDomainRegexApostrophePredicateIsEnforcedAsWritten is the
