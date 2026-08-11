@@ -1194,6 +1194,18 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	}
 	defer migcore.CloseIf(sw)
 
+	// Bug 243, the delta door: delta tables are applied without table
+	// filtering, so a mangled recorded expression in an added/altered
+	// table refuses unconditionally here — pre-DDL, named — rather than
+	// dying in the target's parser mid-apply.
+	var deltaProblems []string
+	for _, d := range link.Manifest.SchemaDelta {
+		deltaProblems = append(deltaProblems, ir.TableExpressionLexProblems(d.After)...)
+	}
+	if err := refuseMalformedRecordedSchema("chain restore: schema delta", deltaProblems); err != nil {
+		return err
+	}
+
 	// Bucket the deltas by kind for clear logging + clean strategy
 	// dispatch.
 	var (

@@ -229,6 +229,16 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("incremental: resolve parent: %w", err)
 	}
+
+	// Bug 243: a WARN, deliberately not a refusal. The incremental's own
+	// data is valid and an operator may still want it captured — but this
+	// chain's recorded schema cannot be emitted as valid SQL (the
+	// pre-v0.120.0 apostrophe mangle), so the chain will NOT restore
+	// until a fresh `backup full` re-records it, and silently extending
+	// it is exactly how Bug 243 presented: incrementals kept succeeding
+	// on a chain whose restore was already broken.
+	warnIfParentChainUnrestorable(ctx, parent, parentPath)
+
 	startPos := parent.EndPosition
 	if startPos.Engine == "" && startPos.Token == "" {
 		// v0.16.x fulls didn't record an EndPosition. Phase 3.1 still
@@ -1738,4 +1748,32 @@ func schemaWithRefreshedSequences(recorded, after *ir.Schema) *ir.Schema {
 	cp := *recorded
 	cp.Sequences = after.Sequences
 	return &cp
+}
+
+// warnIfParentChainUnrestorable is the Bug 243 incremental-door signal:
+// a WARN, deliberately not a refusal. The incremental's own data is
+// valid and an operator may still want it captured — but a parent chain
+// whose recorded schema carries an expression that cannot be emitted as
+// valid SQL (the pre-v0.120.0 apostrophe mangle) will NOT restore until
+// a fresh `backup full` re-records it, and silently extending such a
+// chain is exactly how Bug 243 presented: incrementals kept succeeding
+// on a chain whose restore was already broken, and nothing said so
+// until a restore was attempted.
+func warnIfParentChainUnrestorable(ctx context.Context, parent *irbackup.Manifest, parentPath string) {
+	if parent == nil {
+		return
+	}
+	problems := ir.SchemaExpressionLexProblems(parent.Schema)
+	if len(problems) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx,
+		"incremental: the parent chain's recorded schema carries expressions that cannot be emitted as valid SQL — "+
+			"this chain will NOT restore until a fresh `backup full` re-records the schema "+
+			"(recorded by a sluice older than v0.120.0; restore/verify refuse it as SLUICE-E-BACKUP-RECORDED-SCHEMA-MALFORMED)",
+		slog.String("parent_path", parentPath),
+		slog.Int("affected_expressions", len(problems)),
+		slog.String("first", problems[0]),
+	)
 }

@@ -218,6 +218,17 @@ const (
 	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
 	CodeBackupEncryptionMismatch   Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
 
+	// CodeBackupRecordedSchemaMalformed is the Bug 243 refusal: the
+	// chain's RECORDED schema carries an expression whose string literal
+	// never closes (the mangle a pre-v0.120.0 MySQL-family reader
+	// produced for apostrophe-carrying expressions), so its DDL cannot
+	// be emitted as valid SQL. Raised by `backup verify` (any depth),
+	// by `restore`/`chain restore` BEFORE any DDL is emitted, and
+	// WARNed (not refused) when `backup incremental` extends such a
+	// chain — the incremental's data is valid; the chain's restorability
+	// is what is broken.
+	CodeBackupRecordedSchemaMalformed Code = "SLUICE-E-BACKUP-RECORDED-SCHEMA-MALFORMED"
+
 	// CodeBackupChainUnreadable is the chain-maintenance readability
 	// gate's refusal: `backup compact` / `backup prune` re-read the chain
 	// the way a restore would — before the destructive sweep, and again
@@ -500,6 +511,7 @@ var registry = map[Code]Info{
 	CodeBackupManifestInvalid:          {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},
 	CodeBackupChainConflict:            {ClassRefusal, "another writer advanced this backup chain mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — either the conditional catalog write refused rather than interleave, or this run's parent is no longer the chain's tip and committing it would fork the lineage; no catalog change was written"},
 	CodeBackupEncryptionMismatch:       {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
+	CodeBackupRecordedSchemaMalformed:  {ClassRefusal, "the chain's recorded schema carries an expression whose string literal never closes (a pre-v0.120.0 MySQL-family reader mangled apostrophe-carrying expressions at schema read), so the recorded DDL cannot be emitted as valid SQL — raised by backup verify and pre-DDL by restore/chain restore; Bug 243"},
 	CodeBackupChainUnreadable:          {ClassRefusal, "backup compact / backup prune re-read the chain the way a restore would and could not: the chain does not walk, or its identity/key material (the chain-root manifest.json a passphrase chain's Argon2id salt is recorded on) is missing or inconsistent — refused BEFORE the destructive sweep with nothing deleted, or reported AFTER it so the run never exits 0 over a chain it just made unreadable"},
 
 	CodeBackupSchemaDeltaUnsupported: {ClassRefusal, "a chain restore / broker replay hit an alter_table schema delta whose shape has no faithful replay on the target (a dropped column, a changed primary key, a column that gained or lost GENERATED, or a malformed entry) — the appliable shapes (added column, column type, nullability, indexes) are emitted through the engine's delta surface; this is the loud half for the rest"},

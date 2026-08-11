@@ -437,6 +437,21 @@ func (r *Restore) newChainRestore() *ChainRestore {
 // ceiling and this is a coherent phase to carve out rather than a way to hide
 // lines.
 func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *ir.Schema) error {
+	// 1.42. Bug 243, FIRST of the schema refusals and deliberately
+	//       filter-aware: a recorded expression whose string literal never
+	//       closes (the pre-v0.120.0 apostrophe mangle) refuses here —
+	//       pre-DDL, with the affected table and field named — instead of
+	//       the target server's raw parse error after earlier tables had
+	//       already been created. It precedes the shape-versus-target
+	//       preflights because a recording that cannot be emitted as SQL
+	//       at all makes shape questions moot, and it honours the table
+	//       filter because `--exclude-table=<affected>` is the documented
+	//       remedy when the source no longer exists — a filter-blind gate
+	//       would make its own remedy impossible.
+	if err := refuseMalformedRecordedSchema("restore",
+		filteredSchemaLexProblems(schema, r.Filter)); err != nil {
+		return err
+	}
 	if err := refuseVerbatimManifestRestoreToNonPG(schema, r.Target); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
@@ -527,9 +542,9 @@ func (r *Restore) Run(ctx context.Context) error {
 		return errors.New("restore: manifest carries no schema")
 	}
 
-	// 1.4 + 1.47. The two schema-shape-versus-target refusals, both pre-DDL
-	//      and both taking (manifest.Schema, r.Target) — see
-	//      [Restore.refuseUnrepresentableTargetShape].
+	// 1.4 + 1.42 + 1.47. The schema refusals — the Bug 243 recorded-
+	//      schema lex gate first, then the two shape-versus-target
+	//      preflights — see [Restore.refuseUnrepresentableTargetShape].
 	if err := r.refuseUnrepresentableTargetShape(ctx, manifest.Schema); err != nil {
 		return err
 	}
@@ -1862,6 +1877,22 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		return verifyScanTally{}, sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
 			lineage.ChainNotRestorableHint,
 			fmt.Errorf("verify: the chain is not restorable: %w", cerr))
+	}
+
+	// Bug 243, the verify half of the same doctrine: `restore` refuses a
+	// recorded schema whose expression literals never close (the
+	// pre-v0.120.0 apostrophe mangle), so verify must refuse it too —
+	// pre-fix, verify returned rc=0 `all chunks OK` over a chain restore
+	// fails on, because every chunk really was intact and the corruption
+	// was in the manifest's recorded SCHEMA, which no depth ever read.
+	// Chain-level and unfiltered, like the walkability check above:
+	// verify predicts the UNFILTERED restore.
+	for _, rec := range records {
+		if problems := manifestRecordedSchemaProblems(rec.Manifest); len(problems) > 0 {
+			return verifyScanTally{}, refuseMalformedRecordedSchema(
+				fmt.Sprintf("verify: manifest %q", rec.Path), problems,
+			)
+		}
 	}
 
 	// The manifest-integrity preflights restore runs, run here from the
