@@ -506,9 +506,11 @@ Minimal close: register the codec against the geography OID in `afterConnectRegi
 
 **RESOLVED (2026-08-11).** The matrix gained the SRID axis ({bare column + SRID 0, typmod-constrained + SRID 4326}) and the M/ZM dimension cases (ISO WKB 2000/3000-range type codes) on top of the GAP 1 geography axis: 3 cores × 28 family/dimension cases × {geometry, geography} × {srid 0, 4326} = **336 cells, all byte-exact** on real PostGIS, each cell now also asserting the LANDED SRID (the C-14 silent-re-stamp direction the old matrix could not see). Mutation-run: a mis-stamped SRID word in `wkbToEWKB` (`srid+1`) fails every arm — the bare-column cells via the new SRID leg (landed 1, want 0 — the SILENT direction), the typed cells via the server's own typmod refusal (`Geometry SRID (4327) does not match column SRID (4326)`), geography via `spatial_ref_sys`. One correction to the filing: `wkbToEWKB` has no "no-SRID-flag branch" — it sets the `0x20000000` flag and writes the SRID word unconditionally (0 included), so the genuinely unexercised axes were the SRID *value* ≠ 0 against a typmod-constrained receive path, and the M/ZM type codes; both now covered.
 
-### GAP 3 (LOW, message-only) — C-14 is not literally "untouched" for a 4-byte window
+### ~~GAP 3~~ (LOW, message-only) — C-14 is not literally "untouched" for a 4-byte window
 
-For `4 ≤ len(raw) ≤ 8` the payload does carry a complete SRID word, and previously a non-zero SRID produced the C-14 refusal; now the framing refusal fires first. Both are loud stream errors so there is no fidelity change — but the claim "C-14 untouched" is false for that window, and the operator sees "too short to be MySQL's on-wire form" rather than "SRID cannot be carried."
+**RESOLVED (2026-08-11).** The decode order in `decodeVStreamCell`'s geometry branch now checks the SRID word first whenever it is COMPLETE (`len >= 4`): a short cell carrying a non-zero SRID refuses with the C-14 shape (which names the remedy) rather than the framing shape, restoring the pre-v0.119.0 message for that window — and making the "C-14 fires for a carried SRID" claim true again rather than merely re-wording it. Pinned by the new short-cell-with-SRID subtest beside the Bug 239 framing pins; the zero-filled framing loop is unchanged and still passes.
+
+Original filing: for `4 ≤ len(raw) ≤ 8` the payload does carry a complete SRID word, and previously a non-zero SRID produced the C-14 refusal; now the framing refusal fires first. Both are loud stream errors so there is no fidelity change — but the claim "C-14 untouched" is false for that window, and the operator sees "too short to be MySQL's on-wire form" rather than "SRID cannot be carried."
 
 ### ~~GAP 4~~ (LOW) — the CHECK tamper arm covers the range translator only
 

@@ -2123,11 +2123,19 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// below that there is no reading of the cell this decoder can
 		// defend, so it becomes a loud, table-and-column-named refusal via
 		// the same sentinel idiom as the SRID case above.
+		// Order matters for the 4..8-byte window (audit GAP 3): a payload
+		// that short is malformed either way, but if it carries a COMPLETE,
+		// non-zero SRID word the actionable refusal is the C-14 one ("this
+		// SRID cannot be carried on this path — declare it on the column"),
+		// not "too short to interpret". Checking framing first told the
+		// operator the less useful of two true things.
+		if len(raw) >= 4 {
+			if srid := binary.LittleEndian.Uint32(raw[:4]); srid != 0 {
+				return &vstreamGeometrySRIDError{srid: srid}
+			}
+		}
 		if len(raw) < minVStreamGeometryBytes {
 			return &vstreamGeometryFramingError{n: len(raw)}
-		}
-		if srid := binary.LittleEndian.Uint32(raw[:4]); srid != 0 {
-			return &vstreamGeometrySRIDError{srid: srid}
 		}
 		return copyBytes(raw[4:])
 	case query.Type_NULL_TYPE:

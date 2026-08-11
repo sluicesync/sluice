@@ -804,6 +804,27 @@ func TestDecodeVStreamCellGeometry(t *testing.T) {
 		}
 	})
 
+	t.Run("short cell with a COMPLETE non-zero SRID word refuses as C-14, not as framing", func(t *testing.T) {
+		// Audit GAP 3: for 4 <= len < floor the payload is malformed either
+		// way, but when the SRID word is complete and non-zero the useful
+		// refusal is "this SRID cannot be carried — declare it on the
+		// column", not "too short". Both are loud; this pins which one the
+		// operator sees.
+		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
+		for n := 4; n < minVStreamGeometryBytes; n++ {
+			cell := make([]byte, n)
+			copy(cell, srid4326)
+			got := decodeVStreamCell(f, cell)
+			sentinel, ok := got.(*vstreamGeometrySRIDError)
+			if !ok {
+				t.Fatalf("len=%d with SRID 4326: got %T; want *vstreamGeometrySRIDError (the SRID refusal names the remedy)", n, got)
+			}
+			if sentinel.srid != 4326 {
+				t.Errorf("len=%d: sentinel carries SRID %d; want 4326", n, sentinel.srid)
+			}
+		}
+	})
+
 	t.Run("the framing refusal names the table and the column", func(t *testing.T) {
 		// The sentinel is resolved by decodeVStreamRow, which is where
 		// the identifying names live (decodeVStreamCell has none).
