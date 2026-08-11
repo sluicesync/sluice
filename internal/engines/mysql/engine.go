@@ -447,6 +447,7 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 		// is the row alias, so direct-API / unit constructions are
 		// byte-identical to today.
 		upsert:        e.Flavor.upsertSpelling(),
+		flavor:        e.Flavor,
 		pkCache:       make(map[string][]string),
 		colTypeCache:  make(map[string]map[string]*ir.Column),
 		keylessCache:  make(map[string]bool),

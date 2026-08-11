@@ -123,6 +123,14 @@ type ChangeApplier struct {
 	// constructions stay byte-identical (roadmap item 73).
 	upsert upsertSpelling
 
+	// flavor is the engine flavor this applier was opened under, set by
+	// [Engine.OpenChangeApplier] alongside upsert. It selects the
+	// expression-normalization variant [loadTableSchema] uses (MariaDB's
+	// information_schema renders stored expressions without MySQL's extra
+	// escaping layer). Zero value = FlavorVanilla, preserving direct-API /
+	// unit constructions.
+	flavor Flavor
+
 	// pipelineCfg is the parsed target DSN, retained so the ADR-0104
 	// concurrent key-hash apply path can open its dedicated pool lazily on
 	// the first concurrent batch (see change_applier_concurrent.go). nil for
@@ -1489,7 +1497,7 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	// not interleave with row events on the applier side.
 	// schema is the already-resolved target database (see pkFor) — used
 	// verbatim for the lookup; the routing decision lives in the caller.
-	tbl, err := loadTableSchema(ctx, a.db, schema, table)
+	tbl, err := loadTableSchema(ctx, a.db, schema, table, a.flavor)
 	if err != nil {
 		return nil, err
 	}

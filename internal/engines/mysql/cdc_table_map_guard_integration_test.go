@@ -251,7 +251,7 @@ func TestLoadTableSchemaPopulatesDataTypes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tbl, err := loadTableSchema(ctx, db, "cdc4_datatypes_db", "shapes")
+	tbl, err := loadTableSchema(ctx, db, "cdc4_datatypes_db", "shapes", FlavorVanilla)
 	if err != nil {
 		t.Fatalf("loadTableSchema: %v", err)
 	}

@@ -163,9 +163,13 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 	if mariadbNumericDefault(raw) {
 		return ir.DefaultLiteral{Value: raw}
 	}
-	// Everything else is expression text (MariaDB stores it bare, with
-	// the same backtick/introducer decorations MySQL uses).
-	expr := canonMariaDBTimestampExpr(normalizeMySQLExpressionText(raw))
+	// Everything else is expression text. MariaDB's information_schema
+	// renders it in the SHOW CREATE spelling directly (measured on
+	// MariaDB 11, 2026-08-11 — bare literal delimiters, \' interior
+	// escapes, no extra escaping layer), so this takes the SHOW CREATE
+	// variant; the MySQL variant's information_schema decode would strip
+	// a literal value's own escapes.
+	expr := canonMariaDBTimestampExpr(normalizeShowCreateExpressionText(raw))
 	return ir.DefaultExpression{Expr: expr, Dialect: "mysql"}
 }
 

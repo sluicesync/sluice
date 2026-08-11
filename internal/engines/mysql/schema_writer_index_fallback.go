@@ -234,7 +234,7 @@ func (w *SchemaWriter) routeIndexJobToFallback(ctx context.Context, job indexBui
 	if len(pending) == 0 {
 		return nil
 	}
-	stmts, err := emitCreateIndexesCombined(job.tableName, pending)
+	stmts, err := emitCreateIndexesCombined(job.tableName, pending, w.emitter.backslashEscapes)
 	if err != nil {
 		return err
 	}

@@ -67,7 +67,7 @@ func partialUniqueTable(idxName string, unique bool) *ir.Table {
 func TestPartialUniqueIndexRefusedOnAddIndex(t *testing.T) {
 	tbl := partialUniqueTable("users_email_live_uniq", true)
 
-	_, err := emitCreateIndex("users", tbl.Indexes[0])
+	_, err := emitCreateIndex("users", tbl.Indexes[0], true)
 	if err == nil {
 		t.Fatal("a PARTIAL UNIQUE index was emitted as a whole-table UNIQUE key with no complaint.\n\n" +
 			"The source permits many soft-deleted rows to share an email and forbids only live duplicates; " +
@@ -90,7 +90,7 @@ func TestPartialUniqueIndexRefusedOnAddIndex(t *testing.T) {
 func TestPartialNonUniqueIndexIsCarriedWithoutThePredicate(t *testing.T) {
 	tbl := partialUniqueTable("users_email_live_idx", false)
 
-	stmt, err := emitCreateIndex("users", tbl.Indexes[0])
+	stmt, err := emitCreateIndex("users", tbl.Indexes[0], true)
 	if err != nil {
 		t.Fatalf("a partial NON-UNIQUE index was refused (%v); dropping its predicate changes cost, not "+
 			"correctness, so it must be carried with a WARN", err)

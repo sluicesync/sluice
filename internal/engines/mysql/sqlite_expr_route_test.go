@@ -16,14 +16,14 @@ import (
 // emits the TRANSLATED MySQL form (|| → CONCAT, length → CHAR_LENGTH).
 func TestSQLiteRoute_GeneratedAndCheck_Portable(t *testing.T) {
 	gen := translateGeneratedExpr(
-		&ir.Column{Type: ir.Text{}, GeneratedExpr: "a || '-' || b", GeneratedExprDialect: "sqlite"},
+		&ir.Column{Type: ir.Text{}, GeneratedExpr: "a || '-' || b", GeneratedExprDialect: "sqlite"}, true,
 	)
 	if want := "CONCAT(a, '-', b)"; gen != want {
 		t.Errorf("generated = %q; want %q", gen, want)
 	}
 
 	chk := translateCheckExpr(
-		&ir.CheckConstraint{Expr: "length(x) > 0", ExprDialect: "sqlite"},
+		&ir.CheckConstraint{Expr: "length(x) > 0", ExprDialect: "sqlite"}, true,
 	)
 	if want := "(CHAR_LENGTH(x) > 0)"; chk != want {
 		t.Errorf("check = %q; want %q", chk, want)
@@ -48,7 +48,7 @@ func TestSQLiteRoute_GeneratedAndCheck_NonPortableRefused(t *testing.T) {
 		}
 
 		chk := &ir.CheckConstraint{Name: "c_bad", Expr: body, ExprDialect: "sqlite"}
-		if _, err := emitCheckConstraint(chk); err == nil {
+		if _, err := emitCheckConstraint(chk, true); err == nil {
 			t.Errorf("emitCheckConstraint(sqlite CHECK %q) err=nil; want a LOUD refusal", body)
 		} else if !strings.Contains(err.Error(), "c_bad") {
 			t.Errorf("emitCheckConstraint(%q) err=%v; want it to name the constraint", body, err)
@@ -81,7 +81,7 @@ func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
 			{Expression: "coalesce(email, '')", ExpressionDialect: "sqlite"},
 		},
 	}
-	stmt, err := emitCreateIndex("users", idx)
+	stmt, err := emitCreateIndex("users", idx, true)
 	if err != nil {
 		t.Fatalf("emitCreateIndex: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 
 	// CHECK: the trailing-\ quote-swallow shape.
 	chk := &ir.CheckConstraint{Name: "ck_bs", Expr: `a <> 'x\'`, ExprDialect: "sqlite"}
-	if _, err := emitCheckConstraint(chk); err == nil {
+	if _, err := emitCheckConstraint(chk, true); err == nil {
 		t.Error(`emitCheckConstraint(a <> 'x\') err=nil; want a LOUD backslash refusal`)
 	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "ck_bs") {
 		t.Errorf("CHECK refusal = %v; want it to name the backslash and the constraint", err)
@@ -137,7 +137,7 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 			{Expression: `coalesce(a, 'x\y')`, ExpressionDialect: "sqlite"},
 		},
 	}
-	if stmt, err := emitCreateIndex("t", idx); err != nil || stmt != "" {
+	if stmt, err := emitCreateIndex("t", idx, true); err != nil || stmt != "" {
 		t.Errorf("backslash-literal expr index = (%q, %v); want (\"\", nil) — WARN-skip, never verbatim", stmt, err)
 	}
 
@@ -233,7 +233,7 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 	}
 
 	chk := &ir.CheckConstraint{Name: "ck_dq", Expr: `a <> "x\"`, ExprDialect: "sqlite"}
-	if _, err := emitCheckConstraint(chk); err == nil {
+	if _, err := emitCheckConstraint(chk, true); err == nil {
 		t.Error(`emitCheckConstraint(a <> "x\") err=nil; want a LOUD double-quoted refusal`)
 	} else if !strings.Contains(err.Error(), "double-quoted") || !strings.Contains(err.Error(), "ck_dq") {
 		t.Errorf("CHECK refusal = %v; want it to name the double-quoted token and the constraint", err)
@@ -245,7 +245,7 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 			{Expression: `coalesce(a, "z\q")`, ExpressionDialect: "sqlite"},
 		},
 	}
-	if stmt, err := emitCreateIndex("t", idx); err != nil || stmt != "" {
+	if stmt, err := emitCreateIndex("t", idx, true); err != nil || stmt != "" {
 		t.Errorf("double-quoted expr index = (%q, %v); want (\"\", nil) — WARN-skip, never emitted", stmt, err)
 	}
 
@@ -253,7 +253,7 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 	// silent meaning change on MySQL (identifier → string literal, vacating
 	// the predicate), so it refuses too.
 	noBs := &ir.CheckConstraint{Name: "ck_dq2", Expr: `"status" <> ''`, ExprDialect: "sqlite"}
-	if _, err := emitCheckConstraint(noBs); err == nil {
+	if _, err := emitCheckConstraint(noBs, true); err == nil {
 		t.Error(`emitCheckConstraint("status" <> '') err=nil; want a LOUD double-quoted refusal (no backslash needed)`)
 	} else if !strings.Contains(err.Error(), "double-quoted") {
 		t.Errorf("backslash-free DQS refusal = %v; want it to name the double-quoted token", err)
@@ -289,12 +289,12 @@ func TestSQLiteRoute_Index_NonPortableSkipped(t *testing.T) {
 			{Expression: "strftime('%Y', d)", ExpressionDialect: "sqlite"},
 		},
 	}
-	if stmt, err := emitCreateIndex("t", bad); err != nil || stmt != "" {
+	if stmt, err := emitCreateIndex("t", bad, true); err != nil || stmt != "" {
 		t.Errorf("non-portable expr index = (%q, %v); want (\"\", nil) — WARN-skip", stmt, err)
 	}
 
 	good := &ir.Index{Name: "ix_ok", Columns: []ir.IndexColumn{{Column: "id"}}}
-	stmts, err := emitCreateIndexesCombined("t", []*ir.Index{bad, good})
+	stmts, err := emitCreateIndexesCombined("t", []*ir.Index{bad, good}, true)
 	if err != nil {
 		t.Fatalf("emitCreateIndexesCombined: %v", err)
 	}

@@ -42,7 +42,7 @@ func (w *SchemaWriter) AlterAddCheck(ctx context.Context, table *ir.Table, check
 		if exists {
 			continue
 		}
-		exprText := translateCheckExpr(chk)
+		exprText := translateCheckExpr(chk, w.emitter.backslashEscapes)
 		if err := refuseUntranslatedCheckExprMySQL(chk, exprText); err != nil {
 			return fmt.Errorf("alter add check %q on %s: %w", chk.Name, table.Name, err)
 		}
@@ -97,7 +97,7 @@ func (w *SchemaWriter) AlterModifyCheck(ctx context.Context, table *ir.Table, ol
 	if oldConstraint.Name == "" || newConstraint.Name == "" {
 		return errors.New("mysql: alter modify check: constraint names must be non-empty")
 	}
-	exprText := translateCheckExpr(newConstraint)
+	exprText := translateCheckExpr(newConstraint, w.emitter.backslashEscapes)
 	if err := refuseUntranslatedCheckExprMySQL(newConstraint, exprText); err != nil {
 		return fmt.Errorf("alter modify check %q on %s: %w", newConstraint.Name, table.Name, err)
 	}

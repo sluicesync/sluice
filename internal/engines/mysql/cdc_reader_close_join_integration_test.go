@@ -75,7 +75,7 @@ func TestCDCReader_CloseJoinsLivePump(t *testing.T) {
 	// live reader — and on this engine, unlike Postgres, there is not even
 	// a nil check between that and a panicking method call.
 	var once bool
-	rdr.schemaLoader = func(ctx context.Context, db *sql.DB, schema, table string) (*tableSchema, error) {
+	rdr.schemaLoader = func(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor) (*tableSchema, error) {
 		if !once {
 			once = true
 			close(parked)
@@ -86,7 +86,7 @@ func TestCDCReader_CloseJoinsLivePump(t *testing.T) {
 			// scheduler may or may not lose.
 			poolOpen <- db.PingContext(context.Background())
 		}
-		return loadTableSchema(ctx, db, schema, table)
+		return loadTableSchema(ctx, db, schema, table, flavor)
 	}
 
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})

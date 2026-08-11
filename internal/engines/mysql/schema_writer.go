@@ -581,7 +581,7 @@ func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, j
 	if len(pending) == 0 {
 		return nil
 	}
-	stmts, err := emitCreateIndexesCombined(job.tableName, pending)
+	stmts, err := emitCreateIndexesCombined(job.tableName, pending, w.emitter.backslashEscapes)
 	if err != nil {
 		return err
 	}
@@ -808,7 +808,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
-			stmt, err := emitCreateIndex(table.Name, idx)
+			stmt, err := emitCreateIndex(table.Name, idx, w.emitter.backslashEscapes)
 			if err != nil {
 				return nil, err
 			}
@@ -1162,7 +1162,7 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 		if exists {
 			continue
 		}
-		stmt, err := emitCreateIndex(table.Name, idx)
+		stmt, err := emitCreateIndex(table.Name, idx, w.emitter.backslashEscapes)
 		if err != nil {
 			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
 		}

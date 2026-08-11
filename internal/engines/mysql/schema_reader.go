@@ -735,7 +735,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Default:  r.translateColumnDefault(defaultVal, meta.Extra, typ),
 			Comment:  comment,
 		}
-		applyGenerated(col, genExpr, meta.Extra)
+		applyGenerated(col, genExpr, meta.Extra, r.flavor)
 		t.Columns = append(t.Columns, col)
 
 		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
@@ -819,7 +819,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			// translator to MySQL idioms in the expression body
 			// (json_unquote/json_extract → ->>, IFNULL → COALESCE,
 			// etc.) instead of emitting them verbatim.
-			entry.Expression = normalizeMySQLExpressionText(expression)
+			entry.Expression = r.normalizeExpr(expression)
 			entry.ExpressionDialect = dialectName
 		}
 		idx.Columns = append(idx.Columns, entry)
@@ -993,7 +993,7 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		}
 		t.CheckConstraints = append(t.CheckConstraints, &ir.CheckConstraint{
 			Name:        name,
-			Expr:        normalizeMySQLExpressionText(clause),
+			Expr:        r.normalizeExpr(clause),
 			ExprDialect: dialectName,
 		})
 	}
@@ -1007,7 +1007,7 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 //
 // Indexes and foreign keys are not loaded — the CDC dispatcher only
 // needs column names and types to decode row events.
-func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*tableSchema, error) {
+func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor) (*tableSchema, error) {
 	const q = `
 		SELECT
 			column_name,
@@ -1072,10 +1072,17 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  translateDefault(defaultVal, meta.Extra, typ),
-			Comment:  comment,
+			// Deliberately NOT flavor-dispatched (unlike the SchemaReader's
+			// translateColumnDefault): this loader serves the CDC applier,
+			// which uses Default for nothing it re-emits — column presence
+			// and generated-ness are what the builders consume. Routing
+			// MariaDB here through translateMariaDBDefault would change
+			// applier-side behaviour this chunk has no pin for; if a future
+			// consumer re-emits these defaults, add the dispatch WITH one.
+			Default: translateDefault(defaultVal, meta.Extra, typ),
+			Comment: comment,
 		}
-		applyGenerated(col, genExpr, meta.Extra)
+		applyGenerated(col, genExpr, meta.Extra, flavor)
 		out.Columns = append(out.Columns, col)
 		// Capture the MariaDB native fixed-width kind (uuid/inet4/inet6)
 		// parallel to Columns. The IR collapses inet4/inet6 to ir.Inet, so
@@ -1177,7 +1184,7 @@ func loadPrimaryKeyDB(ctx context.Context, db *sql.DB, schema, table string) ([]
 // actually need quoting on the target (a reserved word or unusual
 // case), the operator must rewrite the source column or drop the
 // GENERATED clause via the per-column mappings hook.
-func applyGenerated(col *ir.Column, genExpr, extra string) {
+func applyGenerated(col *ir.Column, genExpr, extra string, flavor Flavor) {
 	// ON UPDATE CURRENT_TIMESTAMP rides the SAME information_schema `extra`
 	// column and was previously unread, so it was silently discarded on every
 	// path — including MySQL→MySQL (audit 2026-08-01 S7). It is applied here,
@@ -1200,7 +1207,7 @@ func applyGenerated(col *ir.Column, genExpr, extra string) {
 	if genExpr == "" {
 		return
 	}
-	col.GeneratedExpr = normalizeMySQLExpressionText(genExpr)
+	col.GeneratedExpr = normalizeExprForFlavor(flavor, genExpr)
 	col.GeneratedExprDialect = dialectName
 	upper := strings.ToUpper(extra)
 	switch {
@@ -1213,105 +1220,96 @@ func applyGenerated(col *ir.Column, genExpr, extra string) {
 	}
 }
 
-// stripMySQLIdentifierQuotes removes backtick characters from s.
-// Used to normalise the dialect-specific identifier quoting MySQL
-// embeds in stored generation expressions; see applyGenerated for
-// the rationale. An identifier that contains an embedded backtick
-// (escaped as a doubled backtick in the source — exceedingly rare
-// in real-world schemas) collapses to a single backtick after
-// stripping, which is at worst a target-side parse error, not
-// silent corruption — same loud-failure outcome as any other
-// non-portable expression.
-func stripMySQLIdentifierQuotes(s string) string {
-	if !strings.ContainsRune(s, '`') {
-		return s
-	}
-	return strings.ReplaceAll(s, "`", "")
-}
-
-// normalizeMySQLExpressionText folds a parsed-and-reformatted
-// information_schema expression (CHECK_CLAUSE, GENERATION_EXPRESSION)
-// back toward portable SQL. Used at the read boundary so the IR
-// holds expression text that's grammatical in both MySQL and
-// Postgres without further translation.
+// normalizeMySQLExpressionText folds the information_schema rendering of
+// a stored MySQL expression (CHECK_CLAUSE, GENERATION_EXPRESSION, the
+// STATISTICS.EXPRESSION of a functional index, COLUMN_DEFAULT expression
+// defaults) into portable SQL: identifier backticks and charset
+// introducers stripped, and every string literal re-spelled in the
+// SQL-standard form — apostrophe-delimited, interior apostrophes DOUBLED,
+// backslashes bare. That spelling is what Postgres reads under
+// standard_conforming_strings=on and what MySQL itself accepts in both
+// sql_mode families for the apostrophe half; literal backslashes are
+// re-escaped at the MYSQL emit boundary instead (option (a) of the
+// 2026-08-11 escaping memo), because no single spelling of a backslash is
+// correct for both engines.
 //
-// Three normalizations apply:
+// # The two input layers, measured on a real MySQL 8.0 (2026-08-11)
 //
-//   - Backtick identifier quotes are stripped. MySQL stores `qty`
-//     where the source had qty; Postgres rejects backticks at apply
-//     time. (Same as stripMySQLIdentifierQuotes.)
+// All four information_schema sources render the stored expression as its
+// SHOW CREATE spelling plus ONE extra escaping layer: every ' as \' and
+// every \ as \\ (measured; `"` is NOT escaped). The SHOW CREATE spelling
+// itself is normalized at DDL time to standard-mode backslash escapes and
+// is MODE-INVARIANT on read — a constraint created under
+// NO_BACKSLASH_ESCAPES reads back in the same spelling (and an
+// apostrophe-carrying CHECK cannot be created under that mode at all: the
+// server itself refuses with 1064 at DDL time). So this decoder handles
+// exactly one input shape, and [decodeISExpressionEscapes] +
+// [renormalizeMySQLExpr] are its two stages. Text that is ALREADY in
+// SHOW CREATE spelling (the mydumper schema parser's input) enters at
+// stage 2 via [normalizeShowCreateExpressionText] — running stage 1 on it
+// would strip escapes that are load-bearing.
 //
-//   - Charset introducers — MySQL's `_latin1'foo'` / `_utf8mb4'foo'`
-//     prefixes that the parser inserts on every string literal — are
-//     stripped. The introducer is a MySQL-internal artifact;
-//     Postgres rejects it as a syntax error. Stripping is dialect-
-//     decoration removal, not function/operator translation, so
-//     verbatim passthrough still applies to the substantive
-//     expression body.
+// # Why a literal-aware scanner and not sequential text replaces
 //
-//   - The backslash-escaped form MySQL wraps every string literal's
-//     delimiters in (so 'open' is stored as backslash-apostrophe-
-//     open-backslash-apostrophe) is rewritten to the bare
-//     apostrophe form. MySQL accepts both; Postgres with
-//     standard_conforming_strings=on (default since 9.1) only
-//     accepts the bare form.
-//
-// Other non-portable constructs (function-name differences, operator
-// spelling, etc.) are intentionally NOT translated — verbatim
-// passthrough plus loud failure on the target is the v1 policy.
+// The predecessor ran three blind passes (backtick strip, introducer
+// strip, a bare `\'` → `'` replace) over the whole text, and each was
+// wrong inside literal VALUES: an interior apostrophe arrives as \\\' and
+// the blind replace consumed the wrong pair, yielding a malformed literal
+// for every CHECK / generated column / functional index whose value
+// carries an apostrophe (filed 2026-08-10; live since v0.97.0); a
+// backtick inside a value was stripped as identifier quoting; and a value
+// that merely LOOKS like a charset introducer was partially deleted. The
+// scanner knows where literals begin and end, so the structural strips
+// apply OUTSIDE literals only and values ride through byte-faithfully.
 func normalizeMySQLExpressionText(s string) string {
-	s = stripMySQLIdentifierQuotes(s)
-	s = stripMySQLCharsetIntroducers(s)
-	s = convertMySQLEscapedApostrophes(s)
-	return s
+	return renormalizeMySQLExpr(decodeISExpressionEscapes(s))
 }
 
-// stripMySQLCharsetIntroducers removes _<charset>' prefixes from
-// string literals in MySQL's stored expression text. The introducer
-// is a MySQL-internal artifact: `_latin1'open'` is the parser's
-// canonical form for the source text 'open' under a latin1
-// connection. Other dialects don't accept it.
-//
-// We walk character by character and only strip the introducer when
-// it actually precedes a string literal opener — either a bare `'`
-// or the C-style escape `\'` MySQL also stores. The dual recognition
-// is needed because [convertMySQLEscapedApostrophes] runs after this
-// pass (it only recognises `'` as a literal opener; the introducer
-// strip has to fire first or `_latin1\'foo\'` would never match).
-//
-// A column or alias that happens to start with an underscore (rare
-// but possible after backtick-stripping) is unaffected — the strip
-// only fires when the trailing apostrophe is present.
-func stripMySQLCharsetIntroducers(s string) string {
-	if !strings.Contains(s, "_") {
+// normalizeShowCreateExpressionText is [normalizeMySQLExpressionText] for
+// text already in the SHOW CREATE spelling: CREATE TABLE text from a
+// mydumper/flat-file dump, and everything MariaDB's information_schema
+// returns — measured on MariaDB 11 (2026-08-11), its I_S renders stored
+// expressions with bare literal delimiters and \' interior escapes, i.e.
+// the SHOW CREATE spelling with NO extra layer.
+func normalizeShowCreateExpressionText(s string) string {
+	return renormalizeMySQLExpr(s)
+}
+
+// normalizeExprForFlavor picks the normalization variant for the server
+// flavor the expression text was read from. Running the MySQL variant's
+// information_schema decode on MariaDB text would strip load-bearing
+// escapes (`\'` inside a literal is the VALUE's apostrophe there, not the
+// I_S layer's delimiter escape); running the MariaDB variant on MySQL
+// text would leave the I_S layer in place.
+func normalizeExprForFlavor(flavor Flavor, s string) string {
+	if flavor == FlavorMariaDB {
+		return normalizeShowCreateExpressionText(s)
+	}
+	return normalizeMySQLExpressionText(s)
+}
+
+// normalizeExpr is [normalizeExprForFlavor] bound to the reader's own
+// flavor — the form the reader's catalog-scan sites use.
+func (r *SchemaReader) normalizeExpr(s string) string {
+	return normalizeExprForFlavor(r.flavor, s)
+}
+
+// decodeISExpressionEscapes undoes the escaping layer information_schema
+// applies on top of the SHOW CREATE spelling: `\\` → `\` and `\'` → `'`,
+// left to right. Any other backslash sequence is preserved verbatim (the
+// measured layer escapes exactly those two bytes; being conservative here
+// keeps an unexpected shape loud downstream instead of half-decoded).
+func decodeISExpressionEscapes(s string) string {
+	if !strings.ContainsRune(s, '\\') {
 		return s
 	}
 	var sb strings.Builder
 	sb.Grow(len(s))
-	i := 0
-	for i < len(s) {
-		// Identify a candidate introducer: an underscore that follows
-		// a non-identifier character (or string start) and is itself
-		// followed by a charset name and a string-literal opener.
-		if s[i] == '_' && (i == 0 || !isIdentRune(rune(s[i-1]))) {
-			j := i + 1
-			for j < len(s) && isIdentRune(rune(s[j])) {
-				j++
-			}
-			if j > i+1 && j < len(s) {
-				switch {
-				case s[j] == '\'':
-					// `_latin1'foo'` → `'foo'`: skip the introducer.
-					i = j
-					continue
-				case s[j] == '\\' && j+1 < len(s) && s[j+1] == '\'':
-					// `_latin1\'foo\'` → `\'foo\'`: skip the
-					// introducer. The escape itself is rewritten by
-					// the next pass.
-					i = j
-					continue
-				}
-			}
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+1 < len(s) && (s[i+1] == '\\' || s[i+1] == '\'') {
+			sb.WriteByte(s[i+1])
+			i += 2
+			continue
 		}
 		sb.WriteByte(s[i])
 		i++
@@ -1319,28 +1317,61 @@ func stripMySQLCharsetIntroducers(s string) string {
 	return sb.String()
 }
 
-// convertMySQLEscapedApostrophes rewrites the C-style \' escape
-// MySQL uses around string-literal delimiters in stored expression
-// text to a bare apostrophe '. MySQL's information_schema wraps both
-// the opening and closing delimiters of every literal in this
-// escape — for the source text 'open' the parser stores \'open\'.
-// Postgres with standard_conforming_strings=on (default since 9.1)
-// rejects \' as a syntax error, so we drop the leading backslash at
-// the read boundary.
+// renormalizeMySQLExpr walks an expression in SHOW CREATE spelling and
+// produces the portable form: outside literals it strips identifier
+// backticks and charset introducers (`_latin1'…'` → `'…'`) and copies
+// everything else; each literal is decoded with the package's full MySQL
+// literal scanner ([scanMySQLQuotedString] — the ADR-0161 escape set,
+// so `\'`, `\\`, doubled quotes and the control escapes all agree with
+// what the server means) and re-emitted with the SQL-standard doubling.
 //
-// We only rewrite \' (backslash directly before apostrophe) — bare
-// backslashes are left alone so non-portable expressions still fail
-// loudly on the target rather than be silently rewritten. Literals
-// containing embedded apostrophes are stored with a more elaborate
-// escape sequence (\'foo\\\'bar\'); those round-trip imperfectly,
-// which is acceptable v1 behaviour given the verbatim-passthrough
-// policy — the target rejects malformed expressions loudly rather
-// than silently corrupting data.
-func convertMySQLEscapedApostrophes(s string) string {
-	if !strings.Contains(s, `\'`) {
-		return s
+// An unterminated literal is emitted as-is from its opening quote: the
+// expression is malformed, and the loud direction is to let the two sides
+// compare (or the target parse) as the different things they are.
+func renormalizeMySQLExpr(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '`':
+			// Identifier quoting: MySQL stores `qty` where the source had
+			// qty; Postgres rejects backticks. Structural strip, outside
+			// literals only.
+			i++
+		case c == '_' && (i == 0 || !isIdentRune(rune(s[i-1]))):
+			// Candidate charset introducer: `_latin1'foo'` is the parser's
+			// canonical form for 'foo'. Strip only when the ident run is
+			// immediately followed by a literal opener; `_some_identifier`
+			// stays.
+			j := i + 1
+			for j < len(s) && isIdentRune(rune(s[j])) {
+				j++
+			}
+			if j > i+1 && j < len(s) && s[j] == '\'' {
+				i = j
+				continue
+			}
+			sb.WriteByte(c)
+			i++
+		case c == '\'':
+			raw, end, ok := scanMySQLQuotedString(s[i:])
+			if !ok {
+				// Unterminated literal — malformed expression; emit the
+				// rest verbatim and stop.
+				sb.WriteString(s[i:])
+				return sb.String()
+			}
+			sb.WriteByte('\'')
+			sb.WriteString(strings.ReplaceAll(string(raw), "'", "''"))
+			sb.WriteByte('\'')
+			i += end
+		default:
+			sb.WriteByte(c)
+			i++
+		}
 	}
-	return strings.ReplaceAll(s, `\'`, `'`)
+	return sb.String()
 }
 
 // isIdentRune reports whether r is a character that can appear in a

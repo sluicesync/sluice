@@ -1248,7 +1248,7 @@ func TestMariaDB_LoadTableSchema_ResolvesGeometrySRID(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
-			tbl, err := loadTableSchema(ctx, db, "mdb_cdc_srid", "geo_cdc")
+			tbl, err := loadTableSchema(ctx, db, "mdb_cdc_srid", "geo_cdc", FlavorMariaDB)
 			if err != nil {
 				t.Fatalf("loadTableSchema: %v", err)
 			}

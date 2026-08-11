@@ -195,16 +195,16 @@ func TestTranslateGeneratedExpr_PGSourceReservedWord(t *testing.T) {
 		GeneratedExprDialect: "postgres",
 		Type:                 ir.Integer{},
 	}
-	if got, want := translateGeneratedExpr(c), "(`order` * 2)"; got != want {
+	if got, want := translateGeneratedExpr(c, true), "(`order` * 2)"; got != want {
 		t.Errorf("translateGeneratedExpr = %q; want %q", got, want)
 	}
 	chk := &ir.CheckConstraint{Expr: `("order" >= 0)`, ExprDialect: "postgres"}
-	if got, want := translateCheckExpr(chk), "(`order` >= 0)"; got != want {
+	if got, want := translateCheckExpr(chk, true), "(`order` >= 0)"; got != want {
 		t.Errorf("translateCheckExpr = %q; want %q", got, want)
 	}
 	// D2: PG functional index body now translate+requote.
 	ic := ir.IndexColumn{Expression: `(("order" + 1))`, ExpressionDialect: "postgres"}
-	if got, want := translateIndexExpr(ic), "((`order` + 1))"; got != want {
+	if got, want := translateIndexExpr(ic, true), "((`order` + 1))"; got != want {
 		t.Errorf("translateIndexExpr = %q; want %q", got, want)
 	}
 }

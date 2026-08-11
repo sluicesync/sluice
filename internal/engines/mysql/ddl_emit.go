@@ -807,6 +807,13 @@ func (m mysqlEmitter) emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			expr = requoteMySQLReservedIdents(expr)
 		}
 
+		// The DEFAULT position's leg of the expression-literal contract
+		// (see [escapeExprLiteralBackslashes]): the IR spelling carries
+		// literal backslashes bare, and this session's lexer would eat
+		// them. Applied after every arm, same as the other three
+		// expression positions; a '\\'-free expression is a no-op.
+		expr = escapeExprLiteralBackslashes(expr, m.backslashEscapes)
+
 		// Canonical PG-default-form coverage + MySQL DEFAULT-grammar
 		// shaping. This block is byte-identical to the pre-ADR-0045
 		// code and runs on every non-bit DefaultExpression (the lookup
@@ -989,7 +996,7 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 			return "", err
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
-		sb.WriteString(translateGeneratedExpr(c))
+		sb.WriteString(translateGeneratedExpr(c, m.backslashEscapes))
 		sb.WriteByte(')')
 		if c.GeneratedStored {
 			sb.WriteString(" STORED")
@@ -1471,7 +1478,7 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 					"aborts on the target with a duplicate-key error; verify any such workload before cutover")
 		}
 		sb.WriteString("  PRIMARY KEY ")
-		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
+		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns, m.backslashEscapes))
 		if hasInlineIdx || hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}
@@ -1498,7 +1505,7 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 		}
 		sb.WriteString(quoteIdent(inlineIdx.Name))
 		sb.WriteByte(' ')
-		sb.WriteString(emitIndexColumnList(inlineIdx.Columns))
+		sb.WriteString(emitIndexColumnList(inlineIdx.Columns, m.backslashEscapes))
 		if hasCopyUniqueIdx || hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}
@@ -1520,7 +1527,7 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 		sb.WriteString("  UNIQUE KEY ")
 		sb.WriteString(quoteIdent(copyUniqueIdx.Name))
 		sb.WriteByte(' ')
-		sb.WriteString(emitIndexColumnList(copyUniqueIdx.Columns))
+		sb.WriteString(emitIndexColumnList(copyUniqueIdx.Columns, m.backslashEscapes))
 		if hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}
@@ -1532,7 +1539,7 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	// phase would gain nothing and lose diff-readability against the
 	// source's pg_dump shape.
 	for i, chk := range table.CheckConstraints {
-		clause, err := emitCheckConstraint(chk)
+		clause, err := emitCheckConstraint(chk, m.backslashEscapes)
 		if err != nil {
 			return "", fmt.Errorf("table %q: %w", table.Name, err)
 		}
@@ -1577,8 +1584,8 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 // shape `((LOWER(email)))`. Verbatim-passthrough policy applies: the
 // expression text is preserved as-is, so non-portable constructs fail
 // loudly on the target rather than be silently rewritten.
-func emitIndexColumnList(cols []ir.IndexColumn) string {
-	return emitIndexColumnListWithPrefix(cols, true)
+func emitIndexColumnList(cols []ir.IndexColumn, backslashEscapes bool) string {
+	return emitIndexColumnListWithPrefix(cols, true, backslashEscapes)
 }
 
 // checkIndexPredicate decides what happens to a PARTIAL index's WHERE clause
@@ -1676,12 +1683,12 @@ func refuseUnrepresentablePredicate(idx *ir.Index, where string) error {
 // string …"). The source reader can legitimately surface a SUB_PART on a
 // spatial index's geometry column, so the prefix is dropped at emit time for
 // those kinds (allowPrefix=false) rather than relying on the reader.
-func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix bool) string {
+func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix, backslashEscapes bool) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + translateIndexExpr(c) + ")"
+			entry = "(" + translateIndexExpr(c, backslashEscapes) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 			if allowPrefix && c.Length > 0 {
@@ -1699,7 +1706,7 @@ func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix bool) stri
 // emitCreateIndex renders an ALTER TABLE ... ADD [UNIQUE] INDEX
 // statement for a non-primary index. PRIMARY indexes are inline in
 // the CREATE TABLE statement and must not be passed here.
-func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
+func emitCreateIndex(tableName string, idx *ir.Index, backslashEscapes bool) (string, error) {
 	// SQLite source (ADR-0133 follow-up): WARN-skip a non-portable
 	// expression-index body rather than abort the migration at ADD INDEX.
 	// Signalled to the caller as an empty statement with a nil error.
@@ -1709,7 +1716,7 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 			return "", nil
 		}
 	}
-	clause, err := emitAddIndexClause(idx)
+	clause, err := emitAddIndexClause(idx, backslashEscapes)
 	if err != nil {
 		return "", err
 	}
@@ -1723,7 +1730,7 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 // several with commas into one ALTER so they share a single InnoDB scan.
 // Factored out so both paths render byte-identical clause text, preserving the
 // v0.99.30 SPATIAL/FULLTEXT prefix suppression and the USING storage hint.
-func emitAddIndexClause(idx *ir.Index) (string, error) {
+func emitAddIndexClause(idx *ir.Index, backslashEscapes bool) (string, error) {
 	if idx == nil {
 		return "", errors.New("mysql: emitAddIndexClause: index is nil")
 	}
@@ -1762,7 +1769,7 @@ func emitAddIndexClause(idx *ir.Index) (string, error) {
 	// SPATIAL / FULLTEXT indexes reject a column prefix (Error 1089); every
 	// other kind keeps the source's prefix length.
 	allowPrefix := idx.Kind != ir.IndexKindSpatial && idx.Kind != ir.IndexKindFullText
-	sb.WriteString(emitIndexColumnListWithPrefix(idx.Columns, allowPrefix))
+	sb.WriteString(emitIndexColumnListWithPrefix(idx.Columns, allowPrefix, backslashEscapes))
 
 	// Storage type: MySQL accepts USING BTREE / USING HASH for
 	// regular indexes. FULLTEXT and SPATIAL ignore it.
@@ -1801,7 +1808,7 @@ func indexCombinable(idx *ir.Index) bool {
 // combined statement preserves the incoming order of its clauses; the separate
 // statements follow, in incoming order. idxs must already be filtered (skip
 // set applied, no PRIMARY, no already-existing index) by the caller.
-func emitCreateIndexesCombined(tableName string, idxs []*ir.Index) ([]string, error) {
+func emitCreateIndexesCombined(tableName string, idxs []*ir.Index, backslashEscapes bool) ([]string, error) {
 	var combinedClauses []string
 	var separate []string
 	for _, idx := range idxs {
@@ -1811,7 +1818,7 @@ func emitCreateIndexesCombined(tableName string, idxs []*ir.Index) ([]string, er
 			warnSkipSQLiteIndex(tableName, idx, offending)
 			continue
 		}
-		clause, err := emitAddIndexClause(idx)
+		clause, err := emitAddIndexClause(idx, backslashEscapes)
 		if err != nil {
 			return nil, err
 		}
@@ -1932,8 +1939,8 @@ func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (strin
 // operator) is rejected with an operator-actionable error at
 // CREATE-TABLE time rather than emitted verbatim and failing on the
 // MySQL parser with an opaque Error 1064.
-func emitCheckConstraint(c *ir.CheckConstraint) (string, error) {
-	exprText := translateCheckExpr(c)
+func emitCheckConstraint(c *ir.CheckConstraint, backslashEscapes bool) (string, error) {
+	exprText := translateCheckExpr(c, backslashEscapes)
 	if err := refuseUntranslatedCheckExprMySQL(c, exprText); err != nil {
 		return "", err
 	}
@@ -1957,12 +1964,89 @@ func emitCheckConstraint(c *ir.CheckConstraint) (string, error) {
 // translatableSourceDialect == "postgres").
 const sqliteSourceDialect = "sqlite"
 
+// escapeExprLiteralBackslashes re-escapes the bare backslashes inside the
+// string literals of an expression in the IR's portable spelling
+// (apostrophe-delimited, ” doubling, backslashes bare — see
+// normalizeMySQLExpressionText) for a MySQL session whose sql_mode treats
+// backslash as an escape introducer. It is the expression-text half of the
+// contract [mysqlEmitter.quoteSQLString] already implements for single
+// values (option (a) of the 2026-08-11 escaping memo): the IR carries the
+// SQL-standard spelling — correct for Postgres under
+// standard_conforming_strings=on — and each engine re-spells at its own
+// boundary. Without this, a literal backslash in a CHECK / generated /
+// index / default expression is silently EATEN by MySQL's lexer on emit
+// (`'a\d'` stores as `'ad'`), and a value ENDING in a backslash swallows
+// the closing quote — the same SEC-1 shape quoteSQLString closes.
+//
+// Under NO_BACKSLASH_ESCAPES the backslash is an ordinary character and
+// doubling would itself corrupt, so the pass is keyed off the emitter's
+// resolved mode, exactly like quoteSQLString.
+//
+// Only literal VALUES are touched: text outside literals is copied
+// verbatim, and backtick-quoted identifier spans are skipped whole so an
+// identifier containing an apostrophe cannot open a phantom literal.
+func escapeExprLiteralBackslashes(expr string, backslashEscapes bool) string {
+	if !backslashEscapes || !strings.ContainsRune(expr, '\\') {
+		return expr
+	}
+	var sb strings.Builder
+	sb.Grow(len(expr) + 8)
+	for i := 0; i < len(expr); {
+		switch expr[i] {
+		case '`':
+			// Identifier span: copy through the closing backtick verbatim.
+			j := strings.IndexByte(expr[i+1:], '`')
+			if j < 0 {
+				sb.WriteString(expr[i:])
+				return sb.String()
+			}
+			sb.WriteString(expr[i : i+j+2])
+			i += j + 2
+		case '\'':
+			sb.WriteByte('\'')
+			i++
+			for i < len(expr) {
+				switch {
+				case expr[i] == '\\':
+					sb.WriteString(`\\`)
+					i++
+					continue
+				case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
+					sb.WriteString("''")
+					i += 2
+					continue
+				case expr[i] == '\'':
+					sb.WriteByte('\'')
+					i++
+				default:
+					sb.WriteByte(expr[i])
+					i++
+					continue
+				}
+				break
+			}
+		default:
+			sb.WriteByte(expr[i])
+			i++
+		}
+	}
+	return sb.String()
+}
+
 // translateGeneratedExpr returns the generated-column expression to
 // emit, applying the cross-dialect translation pass when the IR's
 // dialect tag indicates a different source dialect (see ADR-0016).
 // An empty / matching dialect tag emits verbatim — same behaviour as
 // before the translation layer landed.
-func translateGeneratedExpr(c *ir.Column) string {
+//
+// backslashEscapes is the emitter's resolved sql_mode rule; every arm's
+// result passes through [escapeExprLiteralBackslashes], because every
+// source dialect's IR spelling carries literal backslashes BARE.
+func translateGeneratedExpr(c *ir.Column, backslashEscapes bool) string {
+	return escapeExprLiteralBackslashes(translateGeneratedExprText(c), backslashEscapes)
+}
+
+func translateGeneratedExprText(c *ir.Column) string {
 	// SQLite source (ADR-0133 follow-up): route the portable subset through
 	// the shared SQLite→MySQL translator. A generated column is
 	// DATA-load-bearing, so a non-portable body (ok=false) emits VERBATIM (the
@@ -1988,8 +2072,13 @@ func translateGeneratedExpr(c *ir.Column) string {
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
 // applying the cross-dialect translation pass when the IR's dialect
-// tag indicates a different source dialect.
-func translateCheckExpr(c *ir.CheckConstraint) string {
+// tag indicates a different source dialect. backslashEscapes is the
+// emitter's resolved sql_mode rule (see [escapeExprLiteralBackslashes]).
+func translateCheckExpr(c *ir.CheckConstraint, backslashEscapes bool) string {
+	return escapeExprLiteralBackslashes(translateCheckExprText(c), backslashEscapes)
+}
+
+func translateCheckExprText(c *ir.CheckConstraint) string {
 	// SQLite source (ADR-0133 follow-up): a CHECK is DATA-load-bearing —
 	// translate the portable subset, emit a non-portable body VERBATIM for a
 	// loud target reject, never warn-DROP.
@@ -2024,7 +2113,11 @@ func translateCheckExpr(c *ir.CheckConstraint) string {
 // `lower(name)` / `||`-concat / `::`-cast index body now translates to
 // MySQL spelling instead of emitting verbatim and failing on the
 // target).
-func translateIndexExpr(c ir.IndexColumn) string {
+func translateIndexExpr(c ir.IndexColumn, backslashEscapes bool) string {
+	return escapeExprLiteralBackslashes(translateIndexExprText(c), backslashEscapes)
+}
+
+func translateIndexExprText(c ir.IndexColumn) string {
 	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
 	// non-portable expression-index body WARN-skips the WHOLE index in
 	// emitCreateIndex / emitCreateIndexesCombined, so ok=false here is a

@@ -72,7 +72,14 @@ func (a *ChangeApplier) ProbeModifyCheck(ctx context.Context, table *ir.Table, o
 	case oldPresent && !newPresent:
 		return ir.ProbeOutcomeNotApplied, nil
 	case !oldPresent && newPresent:
-		if mysqlCheckExprsEquivalent(newExpr, newConstraint.Expr) {
+		// The observed side is the RAW information_schema clause (escape
+		// layer, charset introducers); the recorded side is the IR's
+		// portable spelling. Decode the observed side through the same
+		// flavor-aware normalizer the reader uses, or any literal-carrying
+		// CHECK compares as divergent on spelling alone — which is what it
+		// silently did before the 2026-08-11 escaping fix, for every
+		// literal-carrying CHECK, in both directions.
+		if mysqlCheckExprsEquivalent(normalizeExprForFlavor(a.flavor, newExpr), newConstraint.Expr) {
 			return ir.ProbeOutcomeApplied, nil
 		}
 		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
@@ -167,7 +174,9 @@ func mysqlCheckPairPresence(ctx context.Context, a *ChangeApplier, tableName, ol
 }
 
 // mysqlCheckExprsEquivalent reports whether two CHECK expression
-// texts are equivalent for probe-comparison. MySQL's
+// texts are equivalent for probe-comparison. Both inputs are expected in
+// the IR's portable spelling (the caller decodes the live
+// information_schema clause first — see the call site). MySQL's
 // CHECK_CONSTRAINTS.CHECK_CLAUSE adds outer parens around the
 // expression; equality is whitespace-collapsed + outer-paren-stripped
 // on both sides — enough to catch the "expression changed"

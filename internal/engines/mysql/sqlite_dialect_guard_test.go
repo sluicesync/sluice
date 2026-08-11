@@ -45,13 +45,13 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gen := translateGeneratedExpr(
-				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: tc.body, GeneratedExprDialect: tc.dialect},
+				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: tc.body, GeneratedExprDialect: tc.dialect}, true,
 			)
 			chk := translateCheckExpr(
-				&ir.CheckConstraint{Expr: tc.body, ExprDialect: tc.dialect},
+				&ir.CheckConstraint{Expr: tc.body, ExprDialect: tc.dialect}, true,
 			)
 			expr := translateIndexExpr(
-				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect},
+				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect}, true,
 			)
 			for label, got := range map[string]string{
 				"generated": gen, "check": chk, "indexExpr": expr,

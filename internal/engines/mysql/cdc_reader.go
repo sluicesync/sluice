@@ -211,7 +211,7 @@ type CDCReader struct {
 	// production construction gets — means the real loadTableSchema; tests
 	// override it to inject a transient source failure on the dispatch path.
 	// See the comment in tableFor for why this indirection is worth its cost.
-	schemaLoader func(ctx context.Context, db *sql.DB, schema, table string) (*tableSchema, error)
+	schemaLoader func(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor) (*tableSchema, error)
 
 	// schemaCacheClears counts blanket schemaCache invalidations — one per
 	// in-scope DDL QueryEvent. It pins the MariaDB no-per-transaction-churn
@@ -1451,7 +1451,7 @@ func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, erro
 	if load == nil {
 		load = loadTableSchema
 	}
-	tbl, err := load(ctx, r.db, schema, table)
+	tbl, err := load(ctx, r.db, schema, table, r.flavor)
 	if err != nil {
 		return nil, err
 	}

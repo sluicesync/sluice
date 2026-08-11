@@ -756,7 +756,7 @@ func TestEmitCheckConstraint(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitCheckConstraint(c.in)
+			got, err := emitCheckConstraint(c.in, true)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1305,7 +1305,7 @@ func TestEmitCreateIndex(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitCreateIndex("users", c.idx)
+			got, err := emitCreateIndex("users", c.idx, true)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1321,7 +1321,7 @@ func TestEmitCreateIndexRejectsPrimary(t *testing.T) {
 		Name:    "PRIMARY",
 		Columns: []ir.IndexColumn{{Column: "id"}},
 	}
-	if _, err := emitCreateIndex("t", idx); err == nil {
+	if _, err := emitCreateIndex("t", idx, true); err == nil {
 		t.Error("expected error for PRIMARY index; got nil")
 	}
 }
@@ -1339,7 +1339,7 @@ func TestEmitCreateIndexesCombined(t *testing.T) {
 			{Name: "b_uniq", Unique: true, Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "b"}}},
 			{Name: "c_idx", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "c"}}},
 		}
-		stmts, err := emitCreateIndexesCombined("t", idxs)
+		stmts, err := emitCreateIndexesCombined("t", idxs, true)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1358,7 +1358,7 @@ func TestEmitCreateIndexesCombined(t *testing.T) {
 			{Name: "body_ft", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "body"}}},
 			{Name: "pt_sp", Kind: ir.IndexKindSpatial, Columns: []ir.IndexColumn{{Column: "pt", Length: 32}}},
 		}
-		stmts, err := emitCreateIndexesCombined("t", idxs)
+		stmts, err := emitCreateIndexesCombined("t", idxs, true)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1380,7 +1380,7 @@ func TestEmitCreateIndexesCombined(t *testing.T) {
 			{Name: "ft1", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "title"}}},
 			{Name: "ft2", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "body"}}},
 		}
-		stmts, err := emitCreateIndexesCombined("t", idxs)
+		stmts, err := emitCreateIndexesCombined("t", idxs, true)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1397,12 +1397,12 @@ func TestEmitCreateIndexesCombined(t *testing.T) {
 		idxs := []*ir.Index{
 			{Name: "solo", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "x"}}},
 		}
-		stmts, err := emitCreateIndexesCombined("t", idxs)
+		stmts, err := emitCreateIndexesCombined("t", idxs, true)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		// Byte-identical to the standalone emitCreateIndex output.
-		single, err := emitCreateIndex("t", idxs[0])
+		single, err := emitCreateIndex("t", idxs[0], true)
 		if err != nil {
 			t.Fatalf("emitCreateIndex: %v", err)
 		}

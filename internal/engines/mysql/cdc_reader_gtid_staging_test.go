@@ -88,7 +88,7 @@ func newStagingReader(t *testing.T, flavor Flavor, startSet string) *CDCReader {
 		schemaCache: map[string]*tableSchema{"app.users": users()},
 		// A DDL clears the schema cache, so the next row event rebuilds
 		// through this seam rather than a live information_schema query.
-		schemaLoader: func(context.Context, *sql.DB, string, string) (*tableSchema, error) {
+		schemaLoader: func(context.Context, *sql.DB, string, string, Flavor) (*tableSchema, error) {
 			return users(), nil
 		},
 		snapshotSig:    map[string]ir.SchemaSignature{},

@@ -62,14 +62,18 @@ func ScanDoubleQuotedString(s string) (raw []byte, end int, ok bool) {
 	return scanQuotedStringDelim(s, '"')
 }
 
-// NormalizeExpressionText folds MySQL stored-form expression text (backtick
-// identifier quotes, charset introducers, C-style apostrophe escapes) toward
-// portable SQL — the exported face of [normalizeMySQLExpressionText]. Used
-// by the mydumper schema parser at the same read-boundary positions the
-// live reader uses it (CHECK, generated-column, index expressions, DEFAULT
-// expressions).
+// NormalizeExpressionText folds MySQL SHOW CREATE-form expression text
+// (backtick identifier quotes, charset introducers, MySQL-syntax string
+// literals) toward portable SQL — the exported face of
+// [normalizeShowCreateExpressionText]. Used by the mydumper schema parser
+// at the same read-boundary positions the live reader uses its
+// information_schema sibling (CHECK, generated-column, index expressions,
+// DEFAULT expressions). The two differ by exactly one escaping layer:
+// dump-file CREATE TABLE text never passed through information_schema, so
+// running the live reader's I_S decode on it would strip load-bearing
+// escapes (see [normalizeMySQLExpressionText]).
 func NormalizeExpressionText(s string) string {
-	return normalizeMySQLExpressionText(s)
+	return normalizeShowCreateExpressionText(s)
 }
 
 // Dialect tags for [ir.DefaultExpression] values whose surface syntax is

@@ -71,7 +71,7 @@ func TestCDCReader_DispatchPathSchemaLoadTransient_IsRetriable(t *testing.T) {
 	// the whole point is that classifyReaderError on the dispatch path is what
 	// makes it retriable, so an unclassified path leaves it terminal.
 	var loads int
-	cdc.schemaLoader = func(context.Context, *sql.DB, string, string) (*tableSchema, error) {
+	cdc.schemaLoader = func(context.Context, *sql.DB, string, string, Flavor) (*tableSchema, error) {
 		loads++
 		return nil, errors.New("invalid connection")
 	}

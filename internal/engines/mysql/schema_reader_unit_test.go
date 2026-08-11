@@ -278,128 +278,51 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 	})
 }
 
-func TestStripMySQLIdentifierQuotes(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"qty * price", "qty * price"},
-		{"`qty` * `price`", "qty * price"},
-		{"(`qty` >= 0)", "(qty >= 0)"},
-		{"", ""},
-	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.in, func(t *testing.T) {
-			if got := stripMySQLIdentifierQuotes(c.in); got != c.want {
-				t.Errorf("\n got  %q\n want %q", got, c.want)
-			}
-		})
-	}
-}
-
-// TestStripMySQLCharsetIntroducers covers the _<charset>'...' prefix
-// MySQL's parser inserts on every string literal in stored
-// expression text. The strip is structural — it walks the string
-// and only removes _<word> when followed by an apostrophe — so a
-// genuine identifier or function name that happens to start with an
-// underscore (rare after backtick stripping) is preserved.
-func TestStripMySQLCharsetIntroducers(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{
-			"single literal with utf8mb4 introducer",
-			"status = _utf8mb4'open'",
-			"status = 'open'",
-		},
+// TestRenormalizeMySQLExpr_StructuralStrips covers the OUTSIDE-literal
+// half of the scanner: backtick identifier quotes and charset introducers
+// are structure, stripped; the same byte sequences INSIDE a literal are
+// VALUE, preserved. The inside cases are the two sibling defects the
+// blind-replace predecessor carried (filed with the escaping matrix,
+// 2026-08-11): `strings.ReplaceAll` ate backticks inside values, and the
+// introducer stripper fired on introducer-looking value text.
+func TestRenormalizeMySQLExpr_StructuralStrips(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"idents unquoted", "qty * price", "qty * price"},
+		{"idents backticked", "`qty` * `price`", "qty * price"},
+		{"parens preserved", "(`qty` >= 0)", "(qty >= 0)"},
+		{"empty", "", ""},
+		{"single literal with utf8mb4 introducer", "status = _utf8mb4'open'", "status = 'open'"},
 		{
 			"latin1 introducers in IN list",
 			"status in (_latin1'open',_latin1'closed',_latin1'cancelled')",
 			"status in ('open','closed','cancelled')",
 		},
-		{
-			"no introducer present",
-			"qty >= 0",
-			"qty >= 0",
-		},
-		{
-			"introducer not followed by apostrophe is preserved",
-			"_some_identifier + 1",
-			"_some_identifier + 1",
-		},
-		{
-			"identifier-internal underscore is preserved",
-			"first_name = _utf8mb4'foo'",
-			"first_name = 'foo'",
-		},
-		{
-			"empty string",
-			"",
-			"",
-		},
+		{"introducer not followed by apostrophe is preserved", "_some_identifier + 1", "_some_identifier + 1"},
+		{"identifier-internal underscore is preserved", "first_name = _utf8mb4'foo'", "first_name = 'foo'"},
+		{"backtick INSIDE a literal is value, not structure", "concat(`c`,'a`b')", "concat(c,'a`b')"},
+		{"introducer-looking VALUE is not stripped", "upper('_utf8mb4')", "upper('_utf8mb4')"},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := stripMySQLCharsetIntroducers(c.in); got != c.want {
+			if got := normalizeShowCreateExpressionText(c.in); got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})
 	}
 }
 
-// TestConvertMySQLEscapedApostrophes covers the \' → ' rewrite that
-// turns MySQL's stored-form delimiter escape (\'foo\') into the
-// portable form ('foo') Postgres requires under
-// standard_conforming_strings=on.
-func TestConvertMySQLEscapedApostrophes(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{
-			// Realistic stored form: every literal delimiter is \'.
-			"escaped delimiters around literal",
-			`x = \'open\'`,
-			`x = 'open'`,
-		},
-		{
-			"IN list with three escaped literals",
-			`status in (\'open\',\'closed\',\'cancelled\')`,
-			`status in ('open','closed','cancelled')`,
-		},
-		{
-			"backslash without trailing apostrophe is preserved",
-			`x = a\b`,
-			`x = a\b`,
-		},
-		{
-			"no backslash present",
-			"x = 'abc'",
-			"x = 'abc'",
-		},
-		{
-			"no string literal present",
-			`qty >= 0`,
-			`qty >= 0`,
-		},
-	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			if got := convertMySQLEscapedApostrophes(c.in); got != c.want {
-				t.Errorf("\n got  %q\n want %q", got, c.want)
-			}
-		})
-	}
-}
-
-// TestNormalizeMySQLExpressionText is the integration of the three
-// normalizations above: the input is the kind of text MySQL stores
-// in information_schema.check_constraints / generation_expression,
-// and the output is portable SQL the writer for either engine can
-// emit verbatim.
+// TestNormalizeMySQLExpressionText is the information_schema-input
+// escaping matrix (the live reader's shape): the input strings are the
+// BYTES a real MySQL 8.0 returns — every apostrophe-carrying and
+// backslash-carrying case below was captured verbatim from
+// information_schema on 2026-08-11 (CHECK_CLAUSE, GENERATION_EXPRESSION,
+// COLUMN_DEFAULT and STATISTICS.EXPRESSION all measured to share the
+// rendering: the SHOW CREATE spelling plus one escaping layer, ' → \'
+// and \ → \\, with `"` untouched). The output contract is portable SQL:
+// literals in the SQL-standard spelling — apostrophes doubled,
+// backslashes bare (the MySQL emit boundary re-escapes those; the memo's
+// option (a)).
 func TestNormalizeMySQLExpressionText(t *testing.T) {
 	cases := []struct {
 		name string
@@ -415,24 +338,102 @@ func TestNormalizeMySQLExpressionText(t *testing.T) {
 		{
 			// The actual storage form for
 			// `CHECK (status IN ('open','closed','cancelled'))`.
-			// The raw string carries literal backslash-apostrophe
-			// pairs, matching the bytes MySQL stores.
 			"IN list with charset introducers",
 			`(` + "`status`" + ` in (_latin1\'open\',_latin1\'closed\',_latin1\'cancelled\'))`,
 			`(status in ('open','closed','cancelled'))`,
 		},
 		{
-			// CONCAT with a space literal — common in generated
-			// columns.
+			// CONCAT with a space literal — common in generated columns.
 			"CONCAT with space literal",
 			"concat(`first_name`,_latin1\\' \\',`last_name`)",
 			"concat(first_name,' ',last_name)",
+		},
+		{
+			// MEASURED: CHECK (c REGEXP '^o''brien$') — the interior
+			// apostrophe arrives as \\\' and the blind-replace
+			// predecessor consumed the wrong pair, yielding the
+			// malformed `'^o\'brien$'`-with-a-stray-backslash literal
+			// (the filed defect, live since v0.97.0).
+			"interior apostrophe (the filed defect)",
+			`regexp_like(` + "`c`" + `,_latin1\'^o\\\'brien$\')`,
+			`regexp_like(c,'^o''brien$')`,
+		},
+		{
+			// MEASURED: generated column CONCAT(c, '''s') — value `'s`.
+			"leading apostrophe in a generated-column literal",
+			`concat(` + "`c`" + `,_latin1\'\\\'s\')`,
+			`concat(c,'''s')`,
+		},
+		{
+			// MEASURED: CHECK (c REGEXP '^a\d$') created under
+			// NO_BACKSLASH_ESCAPES (a literal backslash) — normalized by
+			// the server to the standard-mode spelling `\\d`, which the
+			// I_S layer renders as four backslashes. The VALUE has one;
+			// the portable output carries it bare.
+			"literal backslash",
+			`regexp_like(` + "`c`" + `,_latin1\'^a\\\\d$\')`,
+			`regexp_like(c,'^a\d$')`,
+		},
+		{
+			// MEASURED: a double-quote inside the value is NOT escaped by
+			// the I_S layer and rides through.
+			"double-quote in value",
+			`regexp_like(` + "`c`" + `,_latin1\'^[d]+"x%_$\')`,
+			`regexp_like(c,'^[d]+"x%_$')`,
 		},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			if got := normalizeMySQLExpressionText(c.in); got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeShowCreateExpressionText_MariaDBAndDumpShapes is the
+// SHOW CREATE-input half of the matrix: MariaDB's information_schema
+// (measured on MariaDB 11, 2026-08-11) and mydumper CREATE TABLE text
+// both carry the SHOW CREATE spelling with NO extra layer — bare literal
+// delimiters, MySQL-syntax escapes inside. Running the MySQL variant's
+// information_schema decode on these inputs would strip the value's own
+// escapes, which is why [normalizeExprForFlavor] dispatches on flavor.
+func TestNormalizeShowCreateExpressionText_MariaDBAndDumpShapes(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"mariadb interior apostrophe (backslash spelling)",
+			"`c` regexp '^o\\'brien$'",
+			"c regexp '^o''brien$'",
+		},
+		{
+			"mariadb doubled-apostrophe default (plain literal)",
+			"'o''brien'",
+			"'o''brien'",
+		},
+		{
+			"mariadb literal backslash",
+			`'a\\d'`,
+			`'a\d'`,
+		},
+		{
+			"mariadb expression default",
+			"concat('x\\'y',`c`)",
+			"concat('x''y',c)",
+		},
+		{
+			"dump-file generated column",
+			"concat(`c`,_utf8mb4'\\'s')",
+			"concat(c,'''s')",
+		},
+	} {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := normalizeShowCreateExpressionText(c.in); got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})

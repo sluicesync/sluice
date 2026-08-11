@@ -117,7 +117,7 @@ var mysqlIndexShapes = []struct {
 func TestPreflightIndexesAgreesWithTheEmitter(t *testing.T) {
 	for _, tc := range mysqlIndexShapes {
 		t.Run(tc.name, func(t *testing.T) {
-			_, emitErr := emitCreateIndex("users", tc.idx)
+			_, emitErr := emitCreateIndex("users", tc.idx, true)
 			preErr := Engine{}.PreflightIndexes(preflightSchema(tc.idx))
 
 			if (emitErr != nil) != tc.wantRefused {
