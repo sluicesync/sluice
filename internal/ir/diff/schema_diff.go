@@ -772,6 +772,17 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 		if expExpr == actExpr {
 			continue
 		}
+		// Bug 241: a name-matched pair whose raw texts differ may still be
+		// ONE predicate wearing two servers' renderings — a numeric literal
+		// under `cast(0 as decimal(10,0))` on MySQL and `(0)::numeric` on
+		// PG, `char_length()` for `length()` — and byte comparison reported
+		// phantom drift on a target `migrate` itself created, in both
+		// directions. Compare canonically before reporting; "" is
+		// un-matchable (an expression that folded to nothing tells us
+		// nothing), same rule as the emitted-match path.
+		if ce := canonicalCheckExpr(expExpr); ce != "" && ce == canonicalCheckExpr(actExpr) {
+			continue
+		}
 		td.ChecksMismatched = append(td.ChecksMismatched, CheckDiff{
 			Name:         name,
 			ExpectedExpr: expExpr,

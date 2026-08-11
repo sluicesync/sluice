@@ -135,6 +135,20 @@ func TestSchemaDiffAfterMigrate_PostgresToMySQL(t *testing.T) {
 		);
 		ALTER TABLE secured ENABLE ROW LEVEL SECURITY;
 		CREATE POLICY tenant_isolation ON secured USING (tenant_id > 0);
+
+		-- Bug 241: user CHECKs whose predicates the target server
+		-- RE-RENDERS — a numeric literal wearing a cast (PG stores
+		-- (0)::numeric, MySQL cast(0 as decimal(10,0))) and length()
+		-- (MySQL renders char_length()) — used to phantom as CHECK
+		-- mismatches on the target migrate itself just created. The
+		-- CLEAN assertion below is the pin.
+		CREATE TABLE bounded (
+			id INT PRIMARY KEY,
+			v  NUMERIC(12,3),
+			s  VARCHAR(20),
+			CONSTRAINT ck_v   CHECK (v > 0),
+			CONSTRAINT ck_len CHECK (length(s) > 2)
+		);
 	`)
 
 	pgEng, ok := engines.Get("postgres")
@@ -178,6 +192,17 @@ func TestSchemaDiffAfterMigrate_PostgresToMySQL(t *testing.T) {
 	if td == nil || len(td.IndexesMissing) != 1 || td.IndexesMissing[0] != "plain_pkey" {
 		t.Fatalf("expected plain_pkey in indexes_missing after DROP PRIMARY KEY; got %+v", td)
 	}
+
+	// DIRTY (Bug 241's guard direction): the canonical comparison folds
+	// server RENDERINGS, not predicates — a WEAKENED name-matched user
+	// CHECK must still report.
+	applyMySQLDDL(t, mysqlTarget, "ALTER TABLE `bounded` DROP CHECK `ck_v`")
+	applyMySQLDDL(t, mysqlTarget, "ALTER TABLE `bounded` ADD CONSTRAINT `ck_v` CHECK (`v` > -1000)")
+	diff = runDiffForDrift(ctx, t, "postgres", "mysql", pgSource, mysqlTarget)
+	td = findTableDiff(*diff, "bounded")
+	if td == nil || len(td.ChecksMismatched) != 1 || td.ChecksMismatched[0].Name != "ck_v" {
+		t.Fatalf("a WEAKENED name-matched user CHECK went unreported — the Bug 241 fold has over-folded: %+v", td)
+	}
 }
 
 // TestSchemaDiffAfterMigrate_MySQLToPostgres is the sibling direction,
@@ -207,6 +232,17 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 			nickname VARCHAR(120) NOT NULL,
 			KEY idx_email (email),
 			KEY keyed_nickname_idx (nickname)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		-- Bug 241, this direction's arms: MySQL stores the numeric CHECK
+		-- with cast(0 as decimal(10,0)) and length() as char_length();
+		-- the PG target re-renders them as (0)::numeric and length().
+		CREATE TABLE bounded (
+			id INT NOT NULL PRIMARY KEY,
+			v  DECIMAL(12,3),
+			s  VARCHAR(20),
+			CONSTRAINT ck_v   CHECK (v > 0),
+			CONSTRAINT ck_len CHECK (char_length(s) > 2)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`)
 

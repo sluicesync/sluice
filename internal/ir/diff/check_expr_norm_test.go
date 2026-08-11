@@ -269,6 +269,123 @@ func TestDiffChecks_EmittedMatchDoesNotStealANameClaimedConstraint(t *testing.T)
 	}
 }
 
+// TestCanonicalCheckExpr_ServerRenderingFolds pins the Bug 241 fold set
+// (operator decision 2026-08-11, option (a) of the memo): the two
+// measured server-rendering divergences fold — MySQL's `cast(X as T)`
+// against PG's `(X)::T`, and `char_length()` against `length()` — while
+// everything that constitutes REAL drift stays visible. The accepted
+// false-match window (a hand-edit of ONLY the cast type or only the
+// length-function choice) is pinned deliberately as documentation of the
+// trade, not discovered later as a surprise.
+func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a    string
+		b    string
+		same bool
+	}{
+		{
+			"the Bug 241 NUMERIC arm: cast form vs :: form",
+			`(v > cast(0 as decimal(10,0)))`,
+			`(v > (0)::numeric)`,
+			true,
+		},
+		{
+			"the Bug 241 VARCHAR arm: char_length vs length",
+			`(char_length(v) > 2)`,
+			`(length(v) > 2)`,
+			true,
+		},
+		{
+			"keyword context glues after whitespace-fold — the reason the pass runs on raw text",
+			`(a and char_length(v) > 2)`,
+			`(a and length(v) > 2)`,
+			true,
+		},
+		{
+			"nested casts fold recursively",
+			`cast(cast(a as char) as decimal(10,0))`,
+			`a`,
+			true,
+		},
+		{
+			"a widened range is still drift",
+			`(v > 0)`,
+			`(v > -1000)`,
+			false,
+		},
+		{
+			"the cast ARGUMENT is preserved, literals included",
+			`cast('a' as char)`,
+			`cast('b' as char)`,
+			false,
+		},
+		{
+			"ACCEPTED WINDOW, pinned as documentation: a cast-type-only edit folds equal",
+			`(v > cast(0 as decimal(10,0)))`,
+			`(v > cast(0 as unsigned))`,
+			true,
+		},
+		{
+			"a column whose name contains 'as' is not mangled",
+			`(class > 0)`,
+			`(cl > 0)`,
+			false,
+		},
+		{
+			"a COLUMN named char_length (no call parens) is not folded",
+			`(char_length > 2)`,
+			`(length > 2)`,
+			false,
+		},
+		{
+			"a malformed cast (no 'as') is left verbatim — spurious difference, never spurious match",
+			`(v > cast(0))`,
+			`(v > 0)`,
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalCheckExpr(tc.a) == canonicalCheckExpr(tc.b); got != tc.same {
+				t.Fatalf("canonicalCheckExpr(%q)==canonicalCheckExpr(%q) is %v; want %v\n  %q\n  %q",
+					tc.a, tc.b, got, tc.same, canonicalCheckExpr(tc.a), canonicalCheckExpr(tc.b))
+			}
+		})
+	}
+}
+
+// TestDiffChecks_NameMatchedPairComparesCanonically is the Bug 241 pin at
+// the comparison level: a name-matched user CHECK whose two sides are the
+// two servers' renderings of one predicate is clean, and one whose
+// predicate genuinely changed still reports — under the same name, which
+// is exactly where the byte comparison used to phantom.
+func TestDiffChecks_NameMatchedPairComparesCanonically(t *testing.T) {
+	table := func(expr string) *ir.Table {
+		return &ir.Table{
+			Name:    "m",
+			Columns: []*ir.Column{{Name: "v", Type: ir.Decimal{Precision: 12, Scale: 3}}},
+			CheckConstraints: []*ir.CheckConstraint{
+				{Name: "ck_v", Expr: expr},
+			},
+		}
+	}
+	t.Run("two renderings of one predicate are clean", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(v > (0)::numeric)`)}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`(v > cast(0 as decimal(10,0)))`)}}
+		if d := Schemas(expected, actual, Options{}); d.HasChanges() {
+			t.Fatalf("phantom drift on a migrate-created CHECK pair (Bug 241): %s %+v", d.Summary(), d.TablesMismatched)
+		}
+	})
+	t.Run("a genuinely changed predicate under the same name still reports", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(v > (0)::numeric)`)}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`(v > cast(-1000 as decimal(10,0)))`)}}
+		td := findTable(t, Schemas(expected, actual, Options{}), "m")
+		if len(td.ChecksMismatched) != 1 {
+			t.Fatalf("a WEAKENED name-matched CHECK went unreported — the canonical comparison has over-folded: %+v", td)
+		}
+	})
+}
+
 // TestDiffChecks_EmittedMatchStillFiresWhenTheNameRoundTrips pins the
 // half the GAP 5 filter's first cut broke (caught by CI's MySQL→PG
 // reconciliation pin, 2026-08-11): the POSTGRES writer names its

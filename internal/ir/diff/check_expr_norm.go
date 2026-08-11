@@ -86,9 +86,154 @@ const (
 // Returns "" for an expression that is empty after folding, which the
 // caller treats as un-matchable rather than as matching another empty.
 func canonicalCheckExpr(expr string) string {
-	folded := foldOutsideLiterals(expr)
+	folded := foldOutsideLiterals(foldServerRenderings(expr))
 	folded = foldPGAnyArrayLists(folded)
 	return stripGrouping(folded)
+}
+
+// foldServerRenderings folds the spellings the two servers give the SAME
+// predicate different renderings of (Bug 241): a `migrate`-created CHECK
+// read back from each side compares its own server's DDL-time
+// normalization against the other's, and the differences are decoration,
+// not meaning:
+//
+//   - `cast(X as T)` → `(X)` — MySQL's spelling of the literal cast PG
+//     renders as `(X)::T` (whose `::T` suffix [foldOutsideLiterals]
+//     already strips). Folding BOTH spellings to the bare argument makes
+//     `v > cast(0 as decimal(10,0))` and `v > (0)::numeric` one
+//     predicate. The argument is preserved verbatim (and folded
+//     recursively, for nested casts); only the cast decoration goes.
+//   - `char_length(` → `length(` — MySQL renders `length()` back as
+//     `char_length()`.
+//
+// The deliberate cost, stated: two predicates differing ONLY in the cast
+// TYPE (`cast(0 as decimal)` vs `cast(0 as unsigned)`) or only in
+// length-function choice canonicalize equal, so a hand-edit of exactly
+// that much on a name-matched constraint reports clean. That window was
+// weighed in the Bug 241 memo and accepted (operator decision,
+// 2026-08-11): both sides of every migrate-created pair are renderings
+// of ONE source predicate, and every REAL drift the filing enumerates —
+// dropped names, widened ranges, changed members, changed columns —
+// changes more than the decoration. The fold is pinned in both
+// directions (phantom → clean; a genuinely-different predicate still
+// differs).
+//
+// It runs on the RAW expression, BEFORE [foldOutsideLiterals], because
+// both folds need real token boundaries: whitespace removal glues
+// `... and char_length(` into `andchar_length(` and makes keyword
+// detection unsound. Literals are copied verbatim (both escape
+// conventions, via [rawLiteralEnd]) so nothing inside a value is folded.
+func foldServerRenderings(expr string) string {
+	var sb strings.Builder
+	sb.Grow(len(expr))
+	for i := 0; i < len(expr); {
+		c := expr[i]
+		switch {
+		case c == '\'':
+			end := rawLiteralEnd(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+		case isIdentByte(c) && (i == 0 || !isIdentByte(expr[i-1])):
+			j := skipIdent(expr, i)
+			switch {
+			case strings.EqualFold(expr[i:j], "cast"):
+				if inner, next, ok := splitCastCall(expr, j); ok {
+					sb.WriteString("(")
+					sb.WriteString(foldServerRenderings(inner))
+					sb.WriteString(")")
+					i = next
+					continue
+				}
+			case strings.EqualFold(expr[i:j], "char_length"):
+				if k := skipSpaces(expr, j); k < len(expr) && expr[k] == '(' {
+					sb.WriteString("length")
+					i = j
+					continue
+				}
+			}
+			sb.WriteString(expr[i:j])
+			i = j
+		default:
+			sb.WriteByte(c)
+			i++
+		}
+	}
+	return sb.String()
+}
+
+// splitCastCall parses `( X as T )` starting just past a `cast` token:
+// it returns X's raw text and the index just past the closing paren. The
+// `as` separator is the FIRST one at paren depth 1 outside literals — a
+// nested cast's own `as` sits at depth ≥ 2, and a CHECK expression has
+// no aliasing, so no other bare `as` can appear at depth 1. Anything
+// that does not complete the shape (no paren, no `as`, unbalanced)
+// reports ok=false and the caller copies the text verbatim — the
+// spurious-DIFFERENCE direction, never a spurious match.
+func splitCastCall(expr string, i int) (inner string, next int, ok bool) {
+	i = skipSpaces(expr, i)
+	if i >= len(expr) || expr[i] != '(' {
+		return "", 0, false
+	}
+	depth := 1
+	asStart := -1
+	j := i + 1
+	for j < len(expr) {
+		switch c := expr[j]; {
+		case c == '\'':
+			j = rawLiteralEnd(expr, j)
+		case c == '(':
+			depth++
+			j++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				if asStart < 0 {
+					return "", 0, false
+				}
+				return expr[i+1 : asStart], j + 1, true
+			}
+			j++
+		case depth == 1 && isIdentByte(c) && !isIdentByte(expr[j-1]):
+			k := skipIdent(expr, j)
+			if asStart < 0 && strings.EqualFold(expr[j:k], "as") {
+				asStart = j
+			}
+			j = k
+		default:
+			j++
+		}
+	}
+	return "", 0, false
+}
+
+// rawLiteralEnd returns the index just past the single-quoted literal
+// starting at expr[i] — the scan twin of [decodeLiteral], for passes
+// that copy raw text instead of decoding it. Both escape conventions;
+// unterminated runs to end-of-string.
+func rawLiteralEnd(expr string, i int) int {
+	i++
+	for i < len(expr) {
+		switch {
+		case expr[i] == '\\' && i+1 < len(expr):
+			i += 2
+		case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
+			i += 2
+		case expr[i] == '\'':
+			return i + 1
+		default:
+			i++
+		}
+	}
+	return i
+}
+
+// skipSpaces returns the index of the first non-whitespace byte at or
+// after i.
+func skipSpaces(expr string, i int) int {
+	for i < len(expr) && (expr[i] == ' ' || expr[i] == '\t' || expr[i] == '\n' || expr[i] == '\r') {
+		i++
+	}
+	return i
 }
 
 // foldPGAnyArrayLists rewrites every `=any(array[…])` term in the folded
