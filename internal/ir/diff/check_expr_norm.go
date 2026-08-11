@@ -53,15 +53,14 @@ package diff
 // produce one.
 
 import (
-	"regexp"
 	"strings"
 )
 
-// pgAnyArrayRewrite matches PostgreSQL's canonical rendering of an
-// `IN (…)` list — `= ANY (ARRAY[…])` — so it can be folded back to the
-// `IN (…)` form the emitter wrote. Applied AFTER case folding and
-// whitespace removal, so the pattern sees the compact lowercase form.
-var pgAnyArrayRewrite = regexp.MustCompile(`=any\(array\[(.*)\]\)`)
+// pgAnyArrayMarker is PostgreSQL's canonical rendering of an `IN (…)`
+// list — `= ANY (ARRAY[…])` — in the compact lowercase form the fold
+// pass produces. [foldPGAnyArrayLists] folds each such term back to the
+// `IN (…)` form the emitter wrote.
+const pgAnyArrayMarker = "=any(array["
 
 // Sentinel delimiters the fold pass wraps each DECODED literal value in.
 //
@@ -88,8 +87,76 @@ const (
 // caller treats as un-matchable rather than as matching another empty.
 func canonicalCheckExpr(expr string) string {
 	folded := foldOutsideLiterals(expr)
-	folded = pgAnyArrayRewrite.ReplaceAllString(folded, "in($1)")
+	folded = foldPGAnyArrayLists(folded)
 	return stripGrouping(folded)
+}
+
+// foldPGAnyArrayLists rewrites every `=any(array[…])` term in the folded
+// expression to `in(…)`, scanning for the BALANCED close rather than
+// matching a regex. The predecessor (`=any\(array\[(.*)\]\)`) was greedy
+// (audit GAP 5): an expression carrying TWO such terms canonicalized by
+// spanning from the first `array[` to the LAST `])`, folding everything
+// between — including the `and`/`or` joining the terms — into one
+// fictitious member list. A lazy regex would merely trade that trap for
+// its mirror: a sentinel-wrapped literal VALUE may carry `])` verbatim
+// (values are decoded before this pass runs), and `(.*?)` would
+// terminate on it. So the scan tracks bracket depth and skips
+// literal-sentinel spans, exactly like every other pass over this form.
+//
+// A term with no balanced `])` close is left unfolded — the expression
+// is malformed for this shape, and the two sides then compare as the
+// different things they are (a spurious DIFFERENCE at worst, never a
+// spurious match).
+func foldPGAnyArrayLists(s string) string {
+	var sb strings.Builder
+	for {
+		i := strings.Index(s, pgAnyArrayMarker)
+		if i < 0 {
+			sb.WriteString(s)
+			return sb.String()
+		}
+		sb.WriteString(s[:i])
+		rest := s[i+len(pgAnyArrayMarker):]
+
+		depth := 0
+		end := -1 // index in rest of the depth-0 ']' whose next byte is ')'
+	scan:
+		for j := 0; j < len(rest); j++ {
+			switch rest[j] {
+			case literalOpen[0]:
+				k := strings.IndexByte(rest[j+1:], literalClose[0])
+				if k < 0 {
+					// Unterminated literal sentinel — malformed; stop scanning.
+					break scan
+				}
+				j += 1 + k
+			case '[':
+				depth++
+			case ']':
+				if depth > 0 {
+					depth--
+					continue
+				}
+				if j+1 < len(rest) && rest[j+1] == ')' {
+					end = j
+				}
+				// A depth-0 ']' either closes the term or the shape is not
+				// the one this fold handles; stop scanning either way.
+				break scan
+			}
+		}
+		if end < 0 {
+			// No balanced close: emit the marker verbatim and keep scanning
+			// after it so a later well-formed term still folds.
+			sb.WriteString(pgAnyArrayMarker)
+			s = rest
+			continue
+		}
+		sb.WriteString("in(")
+		sb.WriteString(rest[:end])
+		sb.WriteString(")")
+		s = rest[end+2:]
+	}
 }
 
 // foldOutsideLiterals lowercases, removes whitespace and identifier

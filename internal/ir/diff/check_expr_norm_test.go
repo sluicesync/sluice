@@ -183,6 +183,92 @@ func TestCanonicalCheckExpr_LiteralScanning(t *testing.T) {
 	}
 }
 
+// TestCanonicalCheckExpr_AnyArrayFoldIsBalanced pins the audit GAP 5
+// closure in the canonicalizer: the `= ANY (ARRAY[…])` → `IN (…)` fold
+// must find the BALANCED close of each term, not a regex's idea of one.
+// The greedy predecessor spanned from the FIRST `array[` to the LAST
+// `])`, so an expression carrying two ANY terms folded them — and the
+// AND joining them — into one fictitious member list; the lazy mirror
+// would instead terminate inside a literal VALUE that carries `])`
+// verbatim (values are sentinel-wrapped, not escaped, by the time the
+// fold runs). Both traps, both directions.
+func TestCanonicalCheckExpr_AnyArrayFoldIsBalanced(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a    string
+		b    string
+		same bool
+	}{
+		{
+			"two ANY terms fold independently (the greedy trap)",
+			`a = ANY (ARRAY['x','y']) AND b = ANY (ARRAY['p','q'])`,
+			`a IN ('x','y') AND b IN ('p','q')`,
+			true,
+		},
+		{
+			"two folded terms are not one member list",
+			`a = ANY (ARRAY['x','y']) AND b = ANY (ARRAY['p','q'])`,
+			`a IN ('x','y','p','q')`,
+			false,
+		},
+		{
+			"a literal carrying '])' does not terminate the scan (the lazy trap)",
+			`c = ANY (ARRAY['a])b','z'])`,
+			`c IN ('a])b','z')`,
+			true,
+		},
+		{
+			"a tampered member in the second term is still visible",
+			`a = ANY (ARRAY['x']) AND b = ANY (ARRAY['p'])`,
+			`a IN ('x') AND b IN ('q')`,
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalCheckExpr(tc.a) == canonicalCheckExpr(tc.b); got != tc.same {
+				t.Fatalf("canonicalCheckExpr(%q)==canonicalCheckExpr(%q) is %v; want %v\n  %q\n  %q",
+					tc.a, tc.b, got, tc.same, canonicalCheckExpr(tc.a), canonicalCheckExpr(tc.b))
+			}
+		})
+	}
+}
+
+// TestDiffChecks_EmittedMatchDoesNotStealANameClaimedConstraint pins the
+// other GAP 5 trap, at the matcher: an emitted prediction must only
+// consume actual-side constraints NO expected-side check claims by name.
+// Pre-fix it walked every actual constraint in sorted-name order, so a
+// SOURCE-DECLARED constraint whose name round-trips to the target and
+// whose predicate happens to equal an emitted one was consumed by the
+// expression match — its name-keyed expected twin then compared against
+// nothing, and a clean target reported one missing + one extra.
+func TestDiffChecks_EmittedMatchDoesNotStealANameClaimedConstraint(t *testing.T) {
+	mk := func(name, expr string, sluice bool) *ir.CheckConstraint {
+		return &ir.CheckConstraint{Name: name, Expr: expr, SluiceEmitted: sluice}
+	}
+	table := func(checks ...*ir.CheckConstraint) *ir.Table {
+		return &ir.Table{
+			Name:             "t",
+			Columns:          []*ir.Column{{Name: "c", Type: ir.Text{Size: ir.TextLong}}},
+			CheckConstraints: checks,
+		}
+	}
+	// `op_chk` sorts BEFORE `t_chk_1`, so the pre-fix greedy walk paired
+	// the emitted prediction with it first — the fixture encodes the
+	// collision order deliberately.
+	expected := &ir.Schema{Tables: []*ir.Table{table(
+		mk("t_c_domain_chk", "`c` > 0", true),
+		mk("op_chk", "(c > 0)", false),
+	)}}
+	actual := &ir.Schema{Tables: []*ir.Table{table(
+		mk("op_chk", "(c > 0)", false),
+		mk("t_chk_1", "(c > 0)", false),
+	)}}
+	if d := Schemas(expected, actual, Options{}); d.HasChanges() {
+		t.Fatalf("a clean target reported drift: the emitted-expression match consumed a constraint the "+
+			"name-keyed pass owns, orphaning its expected twin: %s %+v", d.Summary(), d.TablesMismatched)
+	}
+}
+
 // TestDiffChecks_EmittedChecksAreMatchedByExpressionNotName is the
 // comparison-level half: the same four states an operator can leave a
 // sluice-emitted constraint in, graded through [Schemas].

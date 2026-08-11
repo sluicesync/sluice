@@ -504,13 +504,15 @@ Minimal close: register the codec against the geography OID in `afterConnectRegi
 
 For `4 ≤ len(raw) ≤ 8` the payload does carry a complete SRID word, and previously a non-zero SRID produced the C-14 refusal; now the framing refusal fires first. Both are loud stream errors so there is no fidelity change — but the claim "C-14 untouched" is false for that window, and the operator sees "too short to be MySQL's on-wire form" rather than "SRID cannot be carried."
 
-### GAP 4 (LOW) — the CHECK tamper arm covers the range translator only
+### ~~GAP 4~~ (LOW) — the CHECK tamper arm covers the range translator only
 
-`diff_domain_check_mysql_integration_test.go` tampers the range arm. The REGEX arm is the one whose canonicalization exercises the literal decoder, the `_utf8mb4` introducer skip, the `\'` un-escape and the bracket stripper — where a false MATCH is most plausible. Add a third DIRTY arm widening `dcheck_chk_1`.
+**RESOLVED (2026-08-11).** DIRTY 3 added to `TestDiff_PGToMySQL_DomainChecksAreReconciled_Item156`: drops `dcheck_chk_1` and re-adds it under the auto-name with the pattern's domain changed (com → org), on top of DIRTY 2's still-widened range constraint — the report must carry both tampers (2 missing + 2 extra; verified on real containers with the regex constraint named in both lists). The match direction was already pinned by the same test's CLEAN arm, so the pair now covers the regex canonicalization in both directions.
 
-### GAP 5 (LOW, latent) — two greedy traps in the CHECK canonicalizer
+### ~~GAP 5~~ (LOW, latent) — two greedy traps in the CHECK canonicalizer
 
-`pgAnyArrayRewrite` (`check_expr_norm.go:64`) is greedy: two `= ANY (ARRAY[…])` terms would canonicalize by spanning first `array[` to last `])`. No emitted shape produces two today; failure direction is a spurious DIFFERENCE. And `matchEmittedChecks` consumes actual-side constraints greedily in sorted-name order, so an emitted prediction can pair with a source-declared constraint carrying the same canonical predicate. Both false-positive direction.
+**RESOLVED (2026-08-11), both traps.** The greedy `pgAnyArrayRewrite` regex is replaced by `foldPGAnyArrayLists`, a balanced scan that tracks bracket depth and skips literal-sentinel spans — closing the greedy trap AND the mirror a lazy regex would have introduced (a decoded literal VALUE may carry `])` verbatim). `matchEmittedChecks` now excludes actual-side constraints any expected check claims by NAME from expression-match candidacy, so an emitted prediction can no longer steal a source-declared constraint's target twin and orphan its name-keyed pair. Pinned by `TestCanonicalCheckExpr_AnyArrayFoldIsBalanced` (both traps, both directions) and `TestDiffChecks_EmittedMatchDoesNotStealANameClaimedConstraint`; both fixes mutation-run (greedy regex restored → the two-ANY-terms pin fails; filter removed → the steal pin fails), mutants grep-verified before and after.
+
+Original filings: `pgAnyArrayRewrite` (`check_expr_norm.go:64`) is greedy: two `= ANY (ARRAY[…])` terms would canonicalize by spanning first `array[` to last `])`. No emitted shape produces two today; failure direction is a spurious DIFFERENCE. And `matchEmittedChecks` consumes actual-side constraints greedily in sorted-name order, so an emitted prediction can pair with a source-declared constraint carrying the same canonical predicate. Both false-positive direction.
 
 ### ~~Adjacent, pre-existing, belongs in the invariant queue~~ — RESOLVED
 

@@ -804,8 +804,20 @@ func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (ex
 	}
 	sort.Strings(emitted)
 
+	// Candidates are ONLY the actual-side constraints no expected-side
+	// check claims by NAME (audit GAP 5): the name-keyed pass in
+	// [diffTableChecks] owns those pairs, and letting an emitted
+	// prediction consume one greedily left its name-matched expected
+	// twin comparing against nothing — a source-declared constraint that
+	// happens to share the emitted predicate then reported as MISSING on
+	// a target that holds it. False-positive direction, but a phantom
+	// drift report on a clean target is precisely what item 156 exists
+	// to prevent.
 	actNames := make([]string, 0, len(actChecks))
 	for name := range actChecks {
+		if _, nameClaimed := expChecks[name]; nameClaimed {
+			continue
+		}
 		actNames = append(actNames, name)
 	}
 	sort.Strings(actNames)
