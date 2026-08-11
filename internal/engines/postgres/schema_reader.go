@@ -788,8 +788,14 @@ func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.Do
 // Map key shape: "<table>.<column>". One key per geometry-typed
 // column.
 func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
+	// The COALESCEs defend against NULLs the view is not expected to
+	// produce — geometry_columns coalesces coord_dimension internally
+	// (unlike geography_columns; see the Bug 240 note on
+	// [SchemaReader.readGeographyColumnInfo]) — so they cost nothing and
+	// keep this query from depending on that view-definition asymmetry.
 	const q = `
-		SELECT f_table_name, f_geometry_column, type, srid, coord_dimension
+		SELECT f_table_name, f_geometry_column,
+		       COALESCE(type, 'GEOMETRY'), COALESCE(srid, 0), COALESCE(coord_dimension, 2)
 		FROM   geometry_columns
 		WHERE  f_table_schema = $1`
 
@@ -960,9 +966,24 @@ func dimensionFlagsFromCoordDim(typeName string, coordDim int) (hasZ, hasM bool)
 // As with the geometry lookup: PostGIS-absent → "relation doesn't
 // exist" → empty map (the translator's existing graceful-degradation
 // path handles missing entries).
+//
+// Bug 240: the COALESCEs are load-bearing. geography_columns exposes the
+// raw postgis_typmod_* accessors with NO null-handling (measured on
+// PostGIS 3.4: pg_get_viewdef shows bare `postgis_typmod_dims(a.atttypmod)`
+// etc.), so a BARE `geography` column — typmod -1 — reports
+// coord_dimension = NULL, and scanning that into a Go int killed every
+// schema-reading command (migrate / sync / schema diff / backup) for the
+// whole database, not just the table carrying the column. The defaults
+// mirror addDomainGeometryColumnInfo's, and ('GEOMETRY', 0, 2) is exactly
+// what geometry_columns reports for a bare `geometry` column — that view
+// coalesces internally (same measurement), which is why the geometry
+// lookups never hit this. type and srid measured non-NULL for typmod -1
+// on 3.4, but that rests on accessor behaviour this query has no reason
+// to depend on, so all three are coalesced.
 func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
 	const q = `
-		SELECT f_table_name, f_geography_column, type, srid, coord_dimension
+		SELECT f_table_name, f_geography_column,
+		       COALESCE(type, 'GEOMETRY'), COALESCE(srid, 0), COALESCE(coord_dimension, 2)
 		FROM   geography_columns
 		WHERE  f_table_schema = $1`
 
@@ -989,7 +1010,7 @@ func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]
 		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
 		out[tableName+"."+columnName] = geometryColumnInfo{
 			Subtype:     subtype,
-			SRID:        int(srid),
+			SRID:        effectiveGeographySRID(int(srid)),
 			IsGeography: true,
 			HasZ:        hasZ,
 			HasM:        hasM,
@@ -1276,13 +1297,19 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 				meta.GeometryInfo = &info
 			} else {
 				// Fallback: the operator may have a `geography`
-				// column declared without a typmod (no row in
-				// geography_columns? — rare, since PostGIS always
-				// populates the view). Synthesize a minimal entry
-				// so the translator dispatches to the geography
-				// branch with default subtype/SRID rather than
-				// falling through to the user-defined hint path.
-				meta.GeometryInfo = &geometryColumnInfo{IsGeography: true}
+				// column the view lookup could not see (rare, since
+				// PostGIS always populates the view). Synthesize a
+				// minimal entry so the translator dispatches to the
+				// geography branch rather than falling through to
+				// the user-defined hint path. The SRID is the
+				// geography default for the same reason
+				// [effectiveGeographySRID] exists: 0 would make the
+				// row-level SRID guard refuse every value the
+				// column holds.
+				meta.GeometryInfo = &geometryColumnInfo{
+					IsGeography: true,
+					SRID:        geographyDefaultSRID,
+				}
 			}
 		}
 

@@ -33,10 +33,14 @@
 // the COPY path. These pins are what catch a pipelined-only divergence or
 // a per-subtype encoding bug.
 //
+// `geography` columns ride the SAME codec since the audit GAP 1 fix:
+// [afterConnectRegisterGeometry] registers [pgGeometryBinaryCodec] for both
+// spatial OIDs, and the geography arm of
+// [TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores] is its family
+// matrix over the writer's cores (the applier pools install the identical
+// hook, so the registration is shared by construction).
+//
 // Out of scope (still LOUD-refused over CDC apply, never silent loss):
-//   - `geography` columns — the codec registers only the `geometry` OID, so
-//     a geography value's EWKB hits the text fallback and PostGIS rejects it
-//     loudly (a dedicated geography codec + matrix is separate work).
 //   - `geometry[]` (array-of-geometry) — convertArray / oidToType have no
 //     geometry element branch, so it fails loudly at relation/array build.
 // Per-row SRID in an UNconstrained `geometry` column is dropped by design

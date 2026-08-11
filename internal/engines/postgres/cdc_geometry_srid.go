@@ -120,14 +120,19 @@ func entryHasGeometryColumn(entry *relationCacheEntry) bool {
 func geometryColumnSRIDsFromCatalog(ctx context.Context, db *sql.DB, schema, table string) (map[string]int, error) {
 	out := map[string]int{}
 	queries := []struct {
-		what string
-		sql  string
+		what        string
+		sql         string
+		isGeography bool
 	}{
-		{"geometry_columns", `SELECT f_geometry_column, srid FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2`},
-		{"geography_columns", `SELECT f_geography_column, srid FROM geography_columns WHERE f_table_schema = $1 AND f_table_name = $2`},
+		// COALESCE per Bug 240: geography_columns does no null-handling of
+		// its own (a bare `geography` column measured srid = 0 on PostGIS
+		// 3.4, but that is accessor behaviour, not a view guarantee — see
+		// [SchemaReader.readGeographyColumnInfo]).
+		{"geometry_columns", `SELECT f_geometry_column, COALESCE(srid, 0) FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2`, false},
+		{"geography_columns", `SELECT f_geography_column, COALESCE(srid, 0) FROM geography_columns WHERE f_table_schema = $1 AND f_table_name = $2`, true},
 	}
 	for _, q := range queries {
-		if err := scanGeometrySRIDsInto(ctx, db, q.sql, schema, table, out); err != nil {
+		if err := scanGeometrySRIDsInto(ctx, db, q.sql, schema, table, q.isGeography, out); err != nil {
 			if isUndefinedRelationErr(err) {
 				continue // PostGIS not installed; nothing to learn here.
 			}
@@ -139,8 +144,11 @@ func geometryColumnSRIDsFromCatalog(ctx context.Context, db *sql.DB, schema, tab
 
 // scanGeometrySRIDsInto runs one registration-view query and merges its rows
 // into out. Split from the caller so the rows handle has a single scope and a
-// plain defer.
-func scanGeometrySRIDsInto(ctx context.Context, db *sql.DB, query, schema, table string, out map[string]int) error {
+// plain defer. Geography rows get [effectiveGeographySRID], same as every
+// other reader of that view: the raw 0 a bare column reports is not what the
+// column declares, and comparing rows (which physically carry 4326) against
+// it would wedge the CDC lane on the first spatial DML.
+func scanGeometrySRIDsInto(ctx context.Context, db *sql.DB, query, schema, table string, isGeography bool, out map[string]int) error {
 	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		return err
@@ -155,7 +163,11 @@ func scanGeometrySRIDsInto(ctx context.Context, db *sql.DB, query, schema, table
 		if err := rows.Scan(&col, &srid); err != nil {
 			return err
 		}
-		out[col] = int(srid)
+		sridInt := int(srid)
+		if isGeography {
+			sridInt = effectiveGeographySRID(sridInt)
+		}
+		out[col] = sridInt
 	}
 	return rows.Err()
 }

@@ -148,10 +148,13 @@ type geometryColumnInfo struct {
 	// callers seeing the empty string treat it the same way).
 	Subtype string
 	// SRID is geometry_columns.srid. PostGIS uses 0 to mean "unknown
-	// CRS", which matches sluice's IR default. PostGIS's
-	// geography_columns view defaults SRID to 4326 (WGS84) when the
-	// column was declared without an explicit modifier; the reader
-	// passes the view's value through unchanged.
+	// CRS", which matches sluice's IR default. For geography entries the
+	// readers map the view's 0 to 4326 via [effectiveGeographySRID] —
+	// this doc used to claim the geography_columns VIEW did that
+	// defaulting itself, which was false (measured on PostGIS 3.4: the
+	// view exposes the raw typmod accessor, which reports 0 for a bare
+	// `geography` column), and the un-mapped 0 made the row-level SRID
+	// guard refuse every value the column actually held.
 	SRID int
 	// IsGeography is true when this entry came from PostGIS's
 	// geography_columns view (rather than geometry_columns). The
@@ -171,6 +174,39 @@ type geometryColumnInfo struct {
 	// [ir.Geometry.HasZ] / [ir.Geometry.HasM] are the OR-merge.
 	HasZ bool
 	HasM bool
+}
+
+// geographyDefaultSRID is WGS84, the SRID PostGIS's `geography` type
+// declares when none is specified.
+const geographyDefaultSRID = 4326
+
+// effectiveGeographySRID maps the spatial catalog's raw SRID for a
+// GEOGRAPHY column to what the column effectively declares.
+//
+// A bare `geography` column (typmod -1) reports srid = 0 through
+// geography_columns, but that 0 is an artifact of the raw
+// postgis_typmod_srid accessor, not a declaration: PostGIS's geography
+// type defaults to 4326, stamps 4326 on every SRID-less value it ingests,
+// and normalizes even an explicit `geography(X, 0)` typmod to 4326 at DDL
+// time (all three measured on PostGIS 3.4 — the last one on sluice's own
+// emitted DDL, whose created column reads back srid=4326 from the view).
+// Recording the raw 0 made the [ir.CheckGeometryRowSRID] guard refuse
+// every row a bare geography column actually holds (each one physically
+// carries 4326), and made `schema diff` see phantom drift between a bare
+// source column and the 4326-normalized column sluice's own migrate
+// created. The mapping records what PostGIS itself says the column is.
+//
+// A geography value CAN carry a different geographic SRID (e.g. 4269) in
+// a bare column; such a row still refuses loudly at the guard — correct
+// under the IR's per-COLUMN SRID contract, and unchanged by this mapping.
+//
+// The premise (geography defaults to 4326) is pinned against a real
+// server in TestSchemaReader_PostGIS_BareGeographyColumn's premise leg.
+func effectiveGeographySRID(srid int) int {
+	if srid == 0 {
+		return geographyDefaultSRID
+	}
+	return srid
 }
 
 // translateType maps a Postgres column's metadata to an IR type. The

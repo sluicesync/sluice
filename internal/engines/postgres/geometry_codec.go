@@ -15,9 +15,13 @@ import (
 )
 
 // pgGeometryBinaryCodec implements [pgtype.Codec] for the PostGIS
-// `geometry` type on every connection that binds a geometry value as a
-// query parameter — the CDC applier's three pools and the [RowWriter]'s
-// (see [afterConnectRegisterGeometry] for the full roster).
+// `geometry` AND `geography` types on every connection that binds a
+// spatial value as a query parameter — the CDC applier's three pools and
+// the [RowWriter]'s (see [afterConnectRegisterGeometry] for the full
+// roster). One codec serves both types because their binary wire format is
+// the same EWKB framing — `geography_recv` reads exactly what
+// `geometry_recv` reads (geography additionally validates coordinate
+// bounds server-side, which is the server's job, not the codec's).
 //
 // # Why this codec exists (the geometry-over-CDC gap)
 //
@@ -179,64 +183,96 @@ func (encodePlanGeometryTextString) Encode(value any, buf []byte) ([]byte, error
 
 // ---------- OID lookup + per-conn registration ----------
 
-// errGeometryTypeNotFound signals that pg_type contains no `geometry` row
-// — PostGIS isn't installed, so the target can hold no geometry columns
-// and there is no codec to register. Callers treat it as a clean skip.
-var errGeometryTypeNotFound = errors.New(
-	"postgres: geometry type not found in pg_type — PostGIS not installed",
-)
+// pgSpatialTypeNames are the PostGIS types the EWKB codec is registered
+// for. `geography` rides the same codec as `geometry` (audit GAP 1,
+// 2026-08-10): its binary receive function (`geography_recv`) reads the
+// identical EWKB framing prepareValue produces — the COPY core has always
+// shipped those exact bytes to it — so a parameter-bound geography value
+// needs the same binary passthrough, and without it pgx's TEXT fallback
+// died in `geography_in` with the very "parse error - invalid geometry"
+// the geometry side was cured of in Bug 239.
+var pgSpatialTypeNames = []string{"geometry", "geography"}
 
-// lookupGeometryOIDConn resolves the runtime OID of the PostGIS `geometry`
-// type on conn. The OID is dynamic (assigned at CREATE EXTENSION postgis
-// time), so it must come from the catalog, not a compile-time constant.
-func lookupGeometryOIDConn(ctx context.Context, conn *pgx.Conn) (uint32, error) {
-	var oid uint32
-	err := conn.QueryRow(ctx, `SELECT oid FROM pg_type WHERE typname = 'geometry' LIMIT 1`).Scan(&oid)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return 0, errGeometryTypeNotFound
-	case err != nil:
-		return 0, fmt.Errorf("postgres: lookup geometry OID: %w", err)
+// lookupSpatialOIDsConn resolves the runtime OIDs of the PostGIS spatial
+// types on conn, keyed by type name. The OIDs are dynamic (assigned at
+// CREATE EXTENSION postgis time), so they must come from the catalog, not
+// compile-time constants. PostGIS absent → empty map (a clean skip for the
+// caller: no spatial columns can exist, so no codec is needed).
+func lookupSpatialOIDsConn(ctx context.Context, conn *pgx.Conn) (map[string]uint32, error) {
+	rows, err := conn.Query(ctx,
+		`SELECT typname, oid FROM pg_type WHERE typname = ANY($1)`, pgSpatialTypeNames)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: lookup spatial type OIDs: %w", err)
 	}
-	if oid == 0 {
-		return 0, errGeometryTypeNotFound
+	defer rows.Close()
+
+	out := map[string]uint32{}
+	for rows.Next() {
+		var name string
+		var oid uint32
+		if err := rows.Scan(&name, &oid); err != nil {
+			return nil, fmt.Errorf("postgres: lookup spatial type OIDs: %w", err)
+		}
+		if oid != 0 {
+			out[name] = oid
+		}
 	}
-	return oid, nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: lookup spatial type OIDs: %w", err)
+	}
+	return out, nil
 }
 
 // afterConnectRegisterGeometry is the [stdlib.OptionAfterConnect] hook every
-// pool that BINDS a geometry value as a query parameter installs. That is
+// pool that BINDS a spatial value as a query parameter installs. That is
 // four pools, not two: the applier's serial pool, its ADR-0092 pipelined
 // DescribeExec pool, its concurrent lane pool — and the [RowWriter]'s pool,
 // whose plain and idempotent batch cores bind values exactly the same way
 // (Bug 239; the COPY core needs no codec because COPY-BINARY reaches
-// `geometry_recv` directly). This comment said "BOTH its pools" while the
-// writer's two batch cores were unreachable for any spatial column, which is
-// why the roster gate ([TestPGPoolRoster_GeometryCodecRegistration]) now
-// derives the list from the AST instead of from a sentence.
+// `geometry_recv` / `geography_recv` directly). This comment said "BOTH its
+// pools" while the writer's two batch cores were unreachable for any spatial
+// column, which is why the roster gate
+// ([TestPGPoolRoster_GeometryCodecRegistration]) now derives the list from
+// the AST instead of from a sentence.
+//
+// It registers the codec for BOTH `geometry` and `geography` (see
+// [pgSpatialTypeNames]); registering only geometry left geography
+// parameter-binds dying in `geography_in` with the same error text Bug 239
+// had already fixed for geometry, which made the defect look cured while
+// the sibling type was untouched.
 //
 // It runs once per new connection (connections are pooled, so the catalog
 // lookup is amortised); a target without PostGIS is a clean no-op.
 //
-// Idempotent: re-running on a conn that already has the codec is skipped.
+// Idempotent: re-running on a conn that already has both codecs is skipped.
 func afterConnectRegisterGeometry(ctx context.Context, conn *pgx.Conn) error {
 	tm := conn.TypeMap()
-	if _, already := tm.TypeForName("geometry"); already {
+	missing := make([]string, 0, len(pgSpatialTypeNames))
+	for _, name := range pgSpatialTypeNames {
+		if _, already := tm.TypeForName(name); !already {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
 		return nil
 	}
-	oid, err := lookupGeometryOIDConn(ctx, conn)
-	switch {
-	case errors.Is(err, errGeometryTypeNotFound):
-		// No PostGIS on this target — nothing to register. Geometry
-		// columns cannot exist here, so the applier never needs the codec.
-		return nil
-	case err != nil:
+	oids, err := lookupSpatialOIDsConn(ctx, conn)
+	if err != nil {
 		return err
 	}
-	tm.RegisterType(&pgtype.Type{
-		Name:  "geometry",
-		OID:   oid,
-		Codec: pgGeometryBinaryCodec{},
-	})
+	for _, name := range missing {
+		oid, found := oids[name]
+		if !found {
+			// Not in pg_type — PostGIS isn't installed (or, for a single
+			// missing name, an unexpected partial install): no columns of
+			// this type can exist here, so there is nothing to register.
+			continue
+		}
+		tm.RegisterType(&pgtype.Type{
+			Name:  name,
+			OID:   oid,
+			Codec: pgGeometryBinaryCodec{},
+		})
+	}
 	return nil
 }

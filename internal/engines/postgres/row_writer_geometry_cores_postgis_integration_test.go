@@ -30,10 +30,16 @@
 //
 // [TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores] drives ALL
 // THREE cores — COPY, plain batch, idempotent batch — over the seven WKB
-// geometry families × {2-D, 3-D (Z), NULL}. One family is not a
-// representative here (Bug 74): `geometry_recv` parses each family's WKB
-// body differently, and the pre-fix failure was a whole-format rejection
-// that any single family would have caught only for itself.
+// geometry families × {2-D, 3-D (Z), NULL} × BOTH spatial column types,
+// `geometry` and `geography`. One family is not a representative here
+// (Bug 74): `geometry_recv` parses each family's WKB body differently,
+// and the pre-fix failure was a whole-format rejection that any single
+// family would have caught only for itself. Geography is not a
+// representative of geometry either (audit GAP 1, 2026-08-10): it is a
+// DIFFERENT dynamic OID routed to a different receive function
+// (`geography_recv`), and it spent Bug 239's whole lifetime failing on
+// the batch cores with the identical error text after geometry was
+// fixed — because only the geometry OID had the codec registered.
 //
 // Reaching the plain-batch core uses the PRODUCTION route rather than
 // poking unexported state: an `interval` column on the table, which
@@ -118,9 +124,18 @@ type writeCore struct {
 	idempotent bool
 }
 
-// TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores is the Bug 239
-// pin. Every geometry family × dimensional shape × NULL must land
-// byte-identically through EVERY write core, not just COPY.
+// spatialColumnType is the {geometry, geography} axis: the target column's
+// declared type, which selects the receive function (and, pre-GAP-1-fix,
+// decided whether the batch cores had a codec at all).
+type spatialColumnType struct {
+	name        string
+	isGeography bool
+}
+
+// TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores is the Bug 239 +
+// GAP 1 pin. Every geometry family × dimensional shape × NULL must land
+// byte-identically through EVERY write core, not just COPY — into BOTH
+// spatial column types, not just `geometry`.
 func TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores(t *testing.T) {
 	dsn, cleanup := startPGForPipelinedPostGIS(t)
 	defer cleanup()
@@ -165,12 +180,18 @@ func TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores(t *testing.T) {
 		{name: "batch", intervalColumn: true},
 		{name: "idempotent", idempotent: true},
 	}
+	colTypes := []spatialColumnType{
+		{name: "geometry"},
+		{name: "geography", isGeography: true},
+	}
 
-	for _, core := range cores {
-		for _, tc := range matrix {
-			t.Run(core.name+"/"+tc.name, func(t *testing.T) {
-				runGeometryCoreCase(ctx, t, db, writer, idem, core, tc)
-			})
+	for _, ct := range colTypes {
+		for _, core := range cores {
+			for _, tc := range matrix {
+				t.Run(ct.name+"/"+core.name+"/"+tc.name, func(t *testing.T) {
+					runGeometryCoreCase(ctx, t, db, writer, idem, ct, core, tc)
+				})
+			}
 		}
 	}
 }
@@ -185,13 +206,14 @@ func runGeometryCoreCase(
 	db *sql.DB,
 	writer *RowWriter,
 	idem ir.IdempotentRowWriter,
+	ct spatialColumnType,
 	core writeCore,
 	tc geometryFamilyCase,
 ) {
 	t.Helper()
 
-	table := fmt.Sprintf("geo_%s_%s", core.name, tc.name)
-	ddl := fmt.Sprintf(`CREATE TABLE %s (id bigint PRIMARY KEY, g geometry NULL`, quoteIdent(table))
+	table := fmt.Sprintf("geo_%s_%s_%s", ct.name, core.name, tc.name)
+	ddl := fmt.Sprintf(`CREATE TABLE %s (id bigint PRIMARY KEY, g %s NULL`, quoteIdent(table), ct.name)
 	if core.intervalColumn {
 		ddl += `, span interval NULL`
 	}
@@ -214,7 +236,7 @@ func runGeometryCoreCase(
 
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
-		{Name: "g", Type: ir.Geometry{Subtype: tc.subtype}, Nullable: true},
+		{Name: "g", Type: ir.Geometry{Subtype: tc.subtype, IsGeography: ct.isGeography}, Nullable: true},
 	}
 	row1 := ir.Row{"id": int64(1), "g": wkb}
 	row2 := ir.Row{"id": int64(2), "g": nil}
@@ -245,12 +267,19 @@ func runGeometryCoreCase(
 			table, tc.name, core.name, err)
 	}
 
-	// Leg 1 — the target's own functions against this file's literals.
+	// Leg 1 — the target's own functions against this file's literals. The
+	// `::geometry` cast is exact (same serialization) and is what lets one
+	// query serve both arms: geography-typed columns lack ST_OrderingEquals,
+	// and a bare geography column stamps SRID 4326 on ingest, which
+	// ST_OrderingEquals would refuse against the literal's SRID 0 — so the
+	// comparison normalizes the SRID away (the coordinate bytes are the
+	// fidelity claim here; SRID handling has its own pins).
 	var gotType string
 	var gotNDims int
 	var gotEqual bool
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT ST_GeometryType(g), ST_NDims(g), ST_OrderingEquals(g, ST_GeomFromText($1)) FROM %s WHERE id = 1`,
+		`SELECT ST_GeometryType(g::geometry), ST_NDims(g::geometry),
+		        ST_OrderingEquals(ST_SetSRID(g::geometry, 0), ST_GeomFromText($1)) FROM %s WHERE id = 1`,
 		quoteIdent(table),
 	), tc.wkt).Scan(&gotType, &gotNDims, &gotEqual); err != nil {
 		t.Fatalf("read back %s: %v", table, err)
@@ -269,7 +298,7 @@ func runGeometryCoreCase(
 	// re-shaping (dimension drop, ring reorder) the WKT comparison tolerates.
 	var backHex string
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT encode(ST_AsBinary(g), 'hex') FROM %s WHERE id = 1`, quoteIdent(table),
+		`SELECT encode(ST_AsBinary(g::geometry), 'hex') FROM %s WHERE id = 1`, quoteIdent(table),
 	)).Scan(&backHex); err != nil {
 		t.Fatalf("read back WKB %s: %v", table, err)
 	}

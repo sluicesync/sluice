@@ -1925,9 +1925,16 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 // exist) is a clean empty map: no geometry columns can exist.
 func loadGeometryColumnInfo(ctx context.Context, db *sql.DB, schema, table string) (map[string]geometryColumnInfo, error) {
 	out := map[string]geometryColumnInfo{}
-	const geomQ = `SELECT f_geometry_column, type, srid, coord_dimension
+	// Bug 240: geography_columns reports coord_dimension = NULL for a BARE
+	// `geography` column (the view wraps no COALESCE around its
+	// postgis_typmod_* accessors, unlike geometry_columns) — the COALESCEs
+	// keep the int scan alive; defaults match the schema reader's
+	// ([SchemaReader.readGeographyColumnInfo] has the full story).
+	const geomQ = `SELECT f_geometry_column,
+			COALESCE(type, 'GEOMETRY'), COALESCE(srid, 0), COALESCE(coord_dimension, 2)
 		FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2`
-	const geogQ = `SELECT f_geography_column, type, srid, coord_dimension
+	const geogQ = `SELECT f_geography_column,
+			COALESCE(type, 'GEOMETRY'), COALESCE(srid, 0), COALESCE(coord_dimension, 2)
 		FROM geography_columns WHERE f_table_schema = $1 AND f_table_name = $2`
 	if err := scanGeometryColumnView(ctx, db, geomQ, schema, table, false, out); err != nil {
 		return nil, err
@@ -1961,9 +1968,13 @@ func scanGeometryColumnView(ctx context.Context, db *sql.DB, query, schema, tabl
 			return err
 		}
 		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
+		sridInt := int(srid)
+		if isGeography {
+			sridInt = effectiveGeographySRID(sridInt)
+		}
 		out[colName] = geometryColumnInfo{
 			Subtype:     subtype,
-			SRID:        int(srid),
+			SRID:        sridInt,
 			IsGeography: isGeography,
 			HasZ:        hasZ,
 			HasM:        hasM,

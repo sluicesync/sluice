@@ -42,10 +42,12 @@
 //
 // Neither proves a statement encodes correctly — that is
 // [TestRowWriter_PostGIS_GeometryFamiliesAcrossWriteCores] (the postgis-
-// tagged family matrix over all three write cores) and the pipelined /
-// concurrent applier PostGIS pins. Nor do they reach the `geography` type,
-// which has no codec on ANY pool by design and stays loud-refused off the
-// COPY path.
+// tagged family matrix over all three write cores, geometry AND geography
+// arms) and the pipelined / concurrent applier PostGIS pins. The
+// `geography` type rides the same registration: [afterConnectRegister-
+// Geometry] registers [pgGeometryBinaryCodec] for both spatial OIDs
+// (audit GAP 1 — before that, geography parameter-binds died in
+// `geography_in` with the same error text Bug 239 fixed for geometry).
 
 package postgres
 
