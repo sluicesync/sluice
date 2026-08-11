@@ -462,7 +462,9 @@ Both readings are coherent; the field's doc — "the extension types the engine 
 
 The pre-release checker confirmed the trigger was a **false positive on the v0.118.1..v0.119.0 delta** — no throughput or latency technique in it — but found real arrears one release back. Filed rather than fixed in the v0.119.0 commit because it is v0.117.0's missing work and the matrix edit is substantial; nothing here blocks a tag.
 
-### HIGH — item 157's `GrowGateEvidenceFreeHoldCap` has no matrix cell, and row 17 currently reads as though item 138 already solved the field shape
+### ~~HIGH~~ — item 157's `GrowGateEvidenceFreeHoldCap` has no matrix cell, and row 17 currently reads as though item 138 already solved the field shape
+
+**RESOLVED (2026-08-11, docs-only commit).** Row 17 gained the item-157 cell with the measured figures (verified against `sluice-testing/session-reports/v0.117.0.md` before writing, including the report's own explanation of why ~11% under-predicted — fleet-wide severs open one window per tripped lane), the item-138 block no longer closes on the field log as though the ceiling addressed it, the mode-dependent-trigger parity note is written into the cell, and the roadmap's projection paragraph carries the measured annotation. Gap 19's price raised in place rather than filing a duplicate.
 
 `GrowGateEvidenceFreeHoldCap = 250ms` (`internal/pipeline/migcore/grow_gate.go:238`, applied `:696-697`) shipped in **v0.117.0** and never reached `docs/dev/perf-parity-matrix.md`. Row 17 documents item 138's three bounds and closes on the field log — "246 windows … 73 minutes of quiesce in a 91-minute run" — as the shape the run-level ceiling addresses. Item 157's own analysis is that the ceiling did **not** fix it: "half the wall clock spent in 30-SECOND units quantises a lane to one chunk per hold." So the row is not merely incomplete, it implies a solved problem that item 157 exists because it was not solved.
 
@@ -472,9 +474,11 @@ The cell must carry the MEASURED figure, not the projection: v0.116.1 died at 10
 
 **One parity note nobody has written down**, and it belongs in the cell: the cap keys on `episodeSawGrowEvidence`, and `ir.GrowEvidenceTelemetry` has exactly one producer (`streamer_telemetry.go:201`). Migrate and restore construct `NewGrowGate(ctx, nil)` with no telemetry seam, so on those modes an episode can only earn evidence from a target-face error classification — making the 250 ms cap **strictly more likely to bind on migrate/restore than on cold start**. Same technique, mode-dependent trigger condition, conservative direction.
 
-### MEDIUM — ~22 stale `file:line` citations, drifted in DIFFERENT directions
+### ~~MEDIUM~~ — ~22 stale `file:line` citations, drifted in DIFFERENT directions
 
-Re-derived by symbol lookup rather than offset, which matters: the amounts differ, so a uniform shift would encode the error (the matrix's own 2026-08-07 lesson). Notable: `mysql/cdc_vstream.go:2334`→`:2507` (this delta shifted it +43 on top of pre-existing drift), `:729`→`:723`, `:399`→`:428`; `pg/row_writer.go` `:478/:534/:580/:874/:881`→`+4` each; row 4's `raw_copy.go:217` lands on `return nil` (the two real sites are `:195`/`:240`); every `NewGrowGate` site and `migcore/grow_gate.go:225,226,410`→`:304,:305,:501` — all item 157's commit, which the matrix missed. The roadmap's item 157 entry carries the same stale set. Roughly 25 other citations were spot-checked and hold, so the sweep is not vacuous.
+**RESOLVED (2026-08-11, same commit as the HIGH above).** Every citation in the filing was re-verified by symbol against the current tree before editing (all held except two of the filing's own examples: `raw_copy.go:217` and `cdc_vstream.go:729` appear nowhere in the live matrix — the matrix carries `:174/:234/:243` for raw_copy, which verify, and the `:729` was the BARE `(:729)` beside the `:2334` citation, now `:723`). The matrix's row 3, row 8, row 17, gap 19 and the roadmap item-157 entry now carry the re-derived values; the full list is in the matrix header's 2026-08-11 note.
+
+Original filing, kept for traceability: re-derived by symbol lookup rather than offset, which matters: the amounts differ, so a uniform shift would encode the error (the matrix's own 2026-08-07 lesson). Notable: `mysql/cdc_vstream.go:2334`→`:2507` (this delta shifted it +43 on top of pre-existing drift), `:729`→`:723`, `:399`→`:428`; `pg/row_writer.go` `:478/:534/:580/:874/:881`→`+4` each; row 4's `raw_copy.go:217` lands on `return nil` (the two real sites are `:195`/`:240`); every `NewGrowGate` site and `migcore/grow_gate.go:225,226,410`→`:304,:305,:501` — all item 157's commit, which the matrix missed. The roadmap's item 157 entry carries the same stale set. Roughly 25 other citations were spot-checked and hold, so the sweep is not vacuous.
 
 ## 2026-08-10 — value-fidelity review findings, pre-v0.119.0 (VERDICT: safe to land)
 
