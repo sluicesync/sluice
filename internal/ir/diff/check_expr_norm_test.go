@@ -146,13 +146,38 @@ func TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision(t *testin
 	if canonicalCheckExpr("a AND (b OR c)") != canonicalCheckExpr("(a AND b) OR c") {
 		t.Error("the documented grouping collision no longer happens; [canonicalCheckExpr]'s named wart is stale")
 	}
-	// The reason it is tolerable: a pure conjunction cannot be regrouped
-	// into a different meaning, which is the only boolean structure any
-	// emitted shape has.
+	// For the EMITTED shapes the collision is tolerable by construction: a
+	// pure conjunction cannot be regrouped into a different meaning, which
+	// is the only boolean structure any emitted shape has.
 	if canonicalCheckExpr("((pct >= 0) and (pct <= 100))") != canonicalCheckExpr("pct >= 0 AND pct <= 100") {
 		t.Error("the DOMAIN range shape's two renderings must canonicalize equal — that is the collision doing " +
 			"its job")
 	}
+
+	// ACCEPTED WINDOW, pinned as documentation (found by the pre-v0.120.0
+	// value-fidelity review): since Bug 241 routed NAME-MATCHED user CHECKs
+	// through this canonicalizer, the grouping collapse applies to
+	// arbitrary user predicates too — a hand-regroup on the target under
+	// the same constraint name reports IN SYNC. Weighed against the
+	// alternative (a paren-preserving comparison would re-open Bug 241 for
+	// any renderings differing in parenthesization, the commoner case) and
+	// accepted; if this pin surprises a future reader, the trade lives in
+	// the file header's "named wart" section.
+	t.Run("name-matched user CHECKs inherit the grouping window", func(t *testing.T) {
+		table := func(expr string) *ir.Table {
+			return &ir.Table{
+				Name:             "t",
+				Columns:          []*ir.Column{{Name: "a", Type: ir.Boolean{}}},
+				CheckConstraints: []*ir.CheckConstraint{{Name: "user_chk", Expr: expr}},
+			}
+		}
+		expected := &ir.Schema{Tables: []*ir.Table{table("a AND (b OR c)")}}
+		actual := &ir.Schema{Tables: []*ir.Table{table("(a AND b) OR c")}}
+		if d := Schemas(expected, actual, Options{}); d.HasChanges() {
+			t.Fatal("the documented name-matched grouping window has closed — the comparison grew a parser " +
+				"or stopped canonicalizing; rewrite the file header's named-wart section to match")
+		}
+	})
 }
 
 // TestCanonicalCheckExpr_LiteralScanning covers the boundary the whole

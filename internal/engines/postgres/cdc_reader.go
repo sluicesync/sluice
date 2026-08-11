@@ -74,12 +74,14 @@ type CDCReader struct {
 	// (no PostGIS on the source — no geometry columns possible).
 	// extOIDsResolved guards the one-time lookup (off the per-row path).
 	//
-	// PostGIS `geography` is deliberately NOT resolved here: the CDC apply
-	// path has no geography codec yet (#20 registered geometry only), so
-	// geography-over-CDC stays loudly refused at the reader (unknown OID) —
-	// a single clean refusal point rather than reader-accepts/applier-
-	// refuses. Geography end-to-end (reader + applier codec + matrix) is a
-	// tracked follow-up.
+	// PostGIS `geography` is deliberately NOT resolved here: this READER
+	// does not decode geography yet, so geography-over-PG-CDC stays loudly
+	// refused at the reader (unknown OID) — a single clean refusal point.
+	// The APPLY side is no longer the blocker (the 2026-08-11 GAP 1 fix
+	// registers the EWKB codec for both spatial OIDs on every
+	// parameter-binding pool, and the write-core family matrix covers
+	// geography); geography end-to-end over PG CDC now needs only the
+	// reader decode + its matrix, a tracked follow-up.
 	geometryOID     uint32
 	extOIDsResolved bool
 
@@ -2018,7 +2020,8 @@ func (r *CDCReader) ensureEnumTypeOIDs(ctx context.Context, cols []*pglogrepl.Re
 // ir.Geometry here, after the static lookup declines. pgoutput carries no
 // SRID/subtype, so they are left unset — recovered target-side from
 // geometry_columns at apply time (ADR-0035 / #20). geography is intentionally
-// not handled (stays loud-refused — see CDCReader.geometryOID).
+// not decoded by this reader (stays loud-refused here — the apply-side codec
+// exists since the 2026-08-11 GAP 1 fix; see CDCReader.geometryOID).
 //
 // enumOIDs is the set of the source's user-defined ENUM type OIDs (catalog
 // Bug 151), also dynamic and resolved at runtime ([ensureEnumTypeOIDs]). A

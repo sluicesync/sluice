@@ -28,12 +28,16 @@ package diff
 // redundant parens, and PG's `IN` → `= ANY (ARRAY[…])` rewrite are all
 // noise the catalog adds. The value lists and the operators are not.
 //
-// # Where it is and is NOT used
+// # Where it is used (widened for Bug 241 — this section used to say
+// # "SluiceEmitted only", and that stopped being true on 2026-08-11)
 //
-// ONLY to match [ir.CheckConstraint.SluiceEmitted] entries. Source-
-// declared CHECKs keep the byte-exact trim-and-compare they have always
-// had: those are matched by NAME on both sides, and softening their
-// expression comparison would trade a class of real drift for nothing.
+// Two consumers: matching [ir.CheckConstraint.SluiceEmitted] entries
+// (the original use), and — since Bug 241 — the NAME-matched user-CHECK
+// comparison in diffChecks, as a fallback after byte equality fails,
+// because the two servers re-render one predicate differently (a numeric
+// literal wearing a cast, `length` spelled `char_length`) and byte
+// comparison reported phantom drift on a target `migrate` itself
+// created.
 //
 // # The named wart: parentheses are DROPPED, not balanced
 //
@@ -42,15 +46,22 @@ package diff
 // predicates that differ ONLY in grouping canonicalize equal — e.g.
 // `a AND (b OR c)` and `(a AND b) OR c`.
 //
-// That is sound HERE and only here, because the shapes sluice emits have
-// no grouping freedom: `<@`, `IN`, and `REGEXP_LIKE` are single
-// operators with no boolean structure at all, and the DOMAIN range shape
-// is a pure conjunction, where regrouping cannot change meaning. A
-// tamper that changes an operator, a column, or a literal still changes
-// the token stream and is still reported.
-// TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision
-// pins both halves: the collision exists, and no emitted shape can
-// produce one.
+// For the EMITTED shapes that is sound by construction: `<@`, `IN`, and
+// `REGEXP_LIKE` are single operators with no boolean structure at all,
+// and the DOMAIN range shape is a pure conjunction, where regrouping
+// cannot change meaning. For the Bug 241 name-matched fallback the same
+// collapse is a KNOWN, ACCEPTED false-clean window: a user predicate
+// hand-regrouped on the target under the same name — `a AND (b OR c)`
+// edited to `(a AND b) OR c` — reports in sync, as does a cast added or
+// removed around a literal ([foldServerRenderings]'s own documented
+// window). Both windows are pinned as documentation
+// (TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision's
+// name-matched half, TestCanonicalCheckExpr_ServerRenderingFolds); the
+// alternative — a paren-preserving comparison for the name-matched path
+// — would re-open Bug 241 for any pair of renderings that differ in
+// parenthesization, which is the commoner case by far. A tamper that
+// changes an operator, a column, or a literal still changes the token
+// stream and is still reported.
 
 import (
 	"strings"

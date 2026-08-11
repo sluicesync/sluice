@@ -164,14 +164,39 @@ func TestSchemaReader_ExpressionEscapingMatrix(t *testing.T) {
 	for name := range wantChecks {
 		t.Errorf("CHECK %s missing from the read schema", name)
 	}
-	var gcol *ir.Column
+	var gcol, dcol *ir.Column
 	for _, c := range esc.Columns {
-		if c.Name == "g" {
+		switch c.Name {
+		case "g":
 			gcol = c
+		case "d":
+			dcol = c
 		}
 	}
 	if gcol == nil || gcol.GeneratedExpr != `concat(c,'''s')` {
 		t.Errorf("generated g = %+v; want GeneratedExpr %q", gcol, `concat(c,'''s')`)
+	}
+	// The other two expression positions ride the same normalizer and owe
+	// their own IR assertion (pre-v0.120.0 review GAP 4): the expression
+	// DEFAULT and the functional-index expression.
+	if dcol == nil {
+		t.Fatal("column d missing from the read schema")
+	} else if de, ok := dcol.Default.(ir.DefaultExpression); !ok || de.Expr != `concat('x''y',c)` {
+		t.Errorf("default d = %#v; want DefaultExpression %q", dcol.Default, `concat('x''y',c)`)
+	}
+	var fidxExpr string
+	for _, idx := range esc.Indexes {
+		if idx.Name != "esc_fidx" {
+			continue
+		}
+		for _, c := range idx.Columns {
+			if c.Expression != "" {
+				fidxExpr = c.Expression
+			}
+		}
+	}
+	if fidxExpr != `concat(c,'''s')` {
+		t.Errorf("functional index esc_fidx expression = %q; want %q", fidxExpr, `concat(c,'''s')`)
 	}
 
 	// ---- The write half + the server-enforcement leg: round-trip the
