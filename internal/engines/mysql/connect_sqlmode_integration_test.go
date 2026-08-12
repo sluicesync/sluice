@@ -148,6 +148,80 @@ func TestLoadDataWarningCountRefusesSilentClamp(t *testing.T) {
 	}
 }
 
+// TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp is the COLD-1 pin
+// (audit 2026-08-11). The silent-clamp refusal reads the SHOW WARNINGS row
+// count, which the server truncates at @@max_error_count; a server running
+// max_error_count=0 leaves @@warning_count accurate but SHOW WARNINGS empty, so
+// pre-fix the truncating LOAD DATA committed the clamped value and exited 0.
+//
+// sluice now pins max_error_count=1024 on its OWN connections (cfg.Params), so
+// even with the SERVER GLOBAL set to 0 the warning list is not suppressed and
+// the refusal still fires. The mutation is removing that cfg.Params floor: the
+// sluice session then inherits GLOBAL=0 and this test's write lands silently.
+func TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp(t *testing.T) {
+	dsn := getenvOr("MYSQL_PROBE_DSN", "")
+	if dsn == "" {
+		host, port, user, password := ensureSharedMySQL(t)
+		dsn = sharedDSN(host, port, user, password, "mysql")
+	}
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	db, err := openDB(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "SET GLOBAL local_infile = 1"); err != nil {
+		t.Skipf("LOAD DATA pin requires SET GLOBAL local_infile = 1; cannot grant: %v", err)
+	}
+	// Suppress the server's warning buffer globally — the documented bulk-load
+	// tuning this finding turns on. Restore it so the shared server is clean.
+	if _, err := db.ExecContext(ctx, "SET GLOBAL max_error_count = 0"); err != nil {
+		t.Skipf("COLD-1 pin requires SET GLOBAL max_error_count = 0; cannot grant: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(ctx, "SET GLOBAL max_error_count = 1024") }()
+	// Sanity: a session that did NOT get sluice's floor would read 0 here.
+	// sluice's own connection must read the pinned floor.
+	var sessionMEC int
+	if err := db.QueryRowContext(ctx, "SELECT @@SESSION.max_error_count").Scan(&sessionMEC); err != nil {
+		t.Fatalf("read session max_error_count: %v", err)
+	}
+	if sessionMEC == 0 {
+		t.Fatal("sluice connection inherited the server's max_error_count=0 — the cfg.Params floor is missing (COLD-1)")
+	}
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_mec_pin"); err != nil {
+		t.Fatalf("DROP: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sluice_mec_pin (id INT PRIMARY KEY, big DECIMAL(20,5))"); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_mec_pin") }()
+
+	rowCh := make(chan ir.Row, 1)
+	rowCh <- ir.Row{"id": int64(1), "big": "999999999999999999999.99999"}
+	close(rowCh)
+
+	writer := &RowWriter{db: db}
+	tbl := &ir.Table{
+		Name: "sluice_mec_pin",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "big", Type: ir.Decimal{Precision: 20, Scale: 5}},
+		},
+	}
+	if err := writer.writeLoadData(ctx, tbl, rowCh); err == nil {
+		var got string
+		_ = db.QueryRowContext(ctx, "SELECT CAST(big AS CHAR) FROM sluice_mec_pin WHERE id=1").Scan(&got)
+		t.Fatalf("writeLoadData accepted an out-of-range NUMERIC silently under GLOBAL max_error_count=0; "+
+			"row landed with big=%q — the max_error_count floor regressed (COLD-1)", got)
+	}
+}
+
 // TestLoadDataWarningCountSkippedWhenSQLModeEmpty pins the legacy-data
 // escape hatch interaction. When sessionSQLMode is "" (operator
 // passed --mysql-sql-mode=”), the writer trusts the server's

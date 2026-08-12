@@ -320,6 +320,20 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	if _, ok := cfg.Params["time_zone"]; !ok {
 		cfg.Params["time_zone"] = "'+00:00'"
 	}
+	// max_error_count floor (audit 2026-08-11, COLD-1). sluice's silent-clamp
+	// detection (Bugs 102/103 Vector B) and item-114 replay accounting are
+	// triggered off the SHOW WARNINGS row count, which the server TRUNCATES at
+	// @@max_error_count. `max_error_count = 0` is a legal, documented bulk-load
+	// memory tuning that leaves @@warning_count accurate but makes SHOW WARNINGS
+	// return zero rows — so a truncating LOAD DATA under it committed the clamped
+	// value and the run exited 0 (observed on mysql:8.0). sluice already distrusts
+	// server settings on this exact surface for sql_mode / time_zone / charset;
+	// pin max_error_count to MySQL's own default floor so the warning list is
+	// never suppressed below what detection needs. Two-tier like the others: a
+	// DSN `max_error_count=` param wins (an explicit, visible operator choice).
+	if _, ok := cfg.Params["max_error_count"]; !ok {
+		cfg.Params["max_error_count"] = "1024"
+	}
 	// The session sql_mode injection (Bug 102/103 strict-by-default) lives in
 	// [openDB] → [injectSessionSQLMode], not here: it depends on the
 	// per-instance --mysql-sql-mode override the [Engine] carries (task 2.5,
