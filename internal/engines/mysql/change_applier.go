@@ -1041,26 +1041,55 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 	if streamID == "" {
 		return errors.New("mysql: applier: streamID is empty (Streamer is responsible for resolving it)")
 	}
+	// CDCPOS-2 (audit 2026-08-11): the per-change path must never persist a
+	// position MID-source-transaction. In file/pos mode every row of one
+	// RowsEvent carries the event's END LogPos, so persisting row K's
+	// position and crashing before row K+1 resumed PAST the un-applied
+	// remainder — silent skip, and a default-adjacent one (gtid_mode=OFF
+	// auto-selects file/pos; --apply-batch-size=1 is the documented
+	// conservative option). GTID mode was already safe (item-132 staging
+	// makes every mid-tx position carry the pre-tx set) and is byte-identical
+	// under this rule, so there is deliberately no mode branch: rows between
+	// the delivered TxBegin/TxCommit apply through the writePosition=false
+	// seam with their rows_applied deltas accumulated, and the TxCommit —
+	// whose position is the post-commit point in both modes — is the only
+	// mid-stream persist, carrying the accumulated delta. A crash mid-
+	// transaction resumes at the last commit and re-delivers the whole
+	// transaction, which ADR-0010's idempotent apply absorbs: re-delivery,
+	// never loss. Changes OUTSIDE a source transaction (DDL-anchored
+	// Truncate/SchemaSnapshot arrive in their own implicit-commit groups)
+	// keep the position-with-data write unchanged.
+	inSourceTx := false
+	pendingRows := int64(0)
 	for {
 		select {
 		case c, ok := <-changes:
 			if !ok {
 				return nil
 			}
-			// Source-tx boundary events are no-ops on the per-change
-			// path (ADR-0027): each row event already commits its
-			// own target transaction, so a TxBegin / TxCommit
-			// signal carries no extra information here. The
-			// boundary semantics are only useful to the batched
-			// applier, which observes them to align target tx
-			// boundaries to source tx boundaries.
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin:
+				inSourceTx = true
+				pendingRows = 0
+				continue
+			case ir.TxCommit:
+				if err := a.persistSourceTxCommit(ctx, streamID, c, pendingRows); err != nil {
+					return err
+				}
+				inSourceTx = false
+				pendingRows = 0
 				continue
 			}
 			applyStart := time.Now()
-			if err := a.applyOne(ctx, streamID, c); err != nil {
-				return err
+			if inSourceTx {
+				if err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */); err != nil {
+					return err
+				}
+				pendingRows += ir.RowsAppliedDelta(c)
+			} else {
+				if err := a.applyOne(ctx, streamID, c); err != nil {
+					return err
+				}
 			}
 			slog.DebugContext(
 				ctx, "applier: apply latency",
@@ -1199,6 +1228,30 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// above; the cache is never mutated on the rolled-back path.
 	if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
 		a.cacheActiveSchemaAfterCommit(snap)
+	}
+	return nil
+}
+
+// persistSourceTxCommit writes the position a delivered [ir.TxCommit]
+// carries — the post-commit point in both position modes — together with the
+// rows_applied delta accumulated across the transaction's deferred-position
+// rows (CDCPOS-2; see the Apply loop). It cannot ride applyOneImpl because
+// dispatch has no boundary arm (boundaries carry no SQL), and it must not
+// grow one: a position-only write is exactly what this is.
+func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID string, c ir.Change, rowsApplied int64) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx (commit position): %w", err))
+	}
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert)
+	posCancel()
+	if err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
+	if err := a.commitWithTimeout(tx); err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: commit (commit position): %w", err))
 	}
 	return nil
 }

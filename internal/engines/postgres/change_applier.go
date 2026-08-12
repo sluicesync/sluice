@@ -1274,26 +1274,54 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 	if streamID == "" {
 		return errors.New("postgres: applier: streamID is empty (Streamer is responsible for resolving it)")
 	}
+	// CDCPOS-2 (audit 2026-08-11): the per-change path must never persist a
+	// position MID-source-transaction. The defect is a property of the
+	// SOURCE, and this target is fed by every source — the exact
+	// justification-shape item 132 warns about: "a PG source's slot
+	// re-delivers whole transactions" is true and IRRELEVANT for a MySQL
+	// file/pos source feeding this applier, where every row of one RowsEvent
+	// carries the event's END LogPos and persisting row K's position skips
+	// the tail on a crash (gtid_mode=OFF auto-selects file/pos;
+	// --apply-batch-size=1 is the documented conservative option). So the
+	// rule is uniform with the MySQL applier: rows between the delivered
+	// TxBegin/TxCommit apply through the writePosition=false seam with their
+	// rows_applied deltas accumulated, and the TxCommit — post-commit in
+	// every source's position scheme — is the only mid-stream persist. Slot
+	// feedback (PG→PG) moves to commit granularity with it, which is the
+	// granularity confirmed_flush advances at server-side anyway. A crash
+	// mid-transaction resumes at the last commit and re-delivers the whole
+	// transaction; ADR-0010's idempotent apply absorbs the replay.
+	inSourceTx := false
+	pendingRows := int64(0)
 	for {
 		select {
 		case c, ok := <-changes:
 			if !ok {
 				return nil
 			}
-			// Source-tx boundary events are no-ops on the per-change
-			// path (ADR-0027): each row event already commits its
-			// own target transaction, so a TxBegin / TxCommit
-			// signal carries no extra information here. The
-			// boundary semantics are only useful to the batched
-			// applier, which observes them to align target tx
-			// boundaries to source tx boundaries.
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin:
+				inSourceTx = true
+				pendingRows = 0
+				continue
+			case ir.TxCommit:
+				if err := a.persistSourceTxCommit(ctx, streamID, c, pendingRows); err != nil {
+					return err
+				}
+				inSourceTx = false
+				pendingRows = 0
 				continue
 			}
 			applyStart := time.Now()
-			if err := a.applyOne(ctx, streamID, c); err != nil {
-				return err
+			if inSourceTx {
+				if err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */); err != nil {
+					return err
+				}
+				pendingRows += ir.RowsAppliedDelta(c)
+			} else {
+				if err := a.applyOne(ctx, streamID, c); err != nil {
+					return err
+				}
 			}
 			slog.DebugContext(
 				ctx, "applier: apply latency",
@@ -1305,6 +1333,34 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			return ctx.Err()
 		}
 	}
+}
+
+// persistSourceTxCommit writes the position a delivered [ir.TxCommit]
+// carries — the post-commit point in every source's position scheme —
+// together with the rows_applied delta accumulated across the transaction's
+// deferred-position rows (CDCPOS-2; see the Apply loop), then reports the
+// applied token to the slot-feedback tracker so PG→PG confirmed_flush
+// advances at commit granularity. It cannot ride applyOneImpl because
+// dispatch has no boundary arm (boundaries carry no SQL), and it must not
+// grow one: a position-only write is exactly what this is.
+func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID string, c ir.Change, rowsApplied int64) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx (commit position): %w", err))
+	}
+	token := c.Pos().Token
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
+	posCancel()
+	if err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
+	if err := a.commitWithTimeout(tx); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: commit (commit position): %w", err))
+	}
+	a.reportAppliedToken(ctx, token)
+	return nil
 }
 
 // applyOne dispatches a single change to its SQL form, runs the
