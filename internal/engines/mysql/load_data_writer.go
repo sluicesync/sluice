@@ -374,7 +374,17 @@ func (w *RowWriter) reportBulkWriteWarnings(ctx context.Context, conn *sql.Conn,
 	if err != nil {
 		return err
 	}
-	return w.decideBulkWriteWarnings(ctx, table, sw, sw.Visible)
+	// Decide on the UNCAPPED @@warning_count, not the SHOW WARNINGS row count:
+	// the server truncates that list at @@max_error_count, and a server tuned to
+	// 0 returns an empty list while @@warning_count stays accurate (COLD-1).
+	// Reading @@warning_count needs no privilege (SETTING max_error_count does,
+	// which is why this reads rather than pins the session variable). A read
+	// failure degrades to the visible count rather than failing a clean write.
+	count := sw.Visible
+	if total, terr := readTrueWarningCount(ctx, conn); terr == nil {
+		count = int(total)
+	}
+	return w.decideBulkWriteWarnings(ctx, table, sw, count)
 }
 
 // decideBulkWriteWarnings is the refuse-or-WARN policy over an already-read
@@ -453,20 +463,32 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	if err != nil {
 		return err
 	}
-	if sw.Visible == 0 {
+	// The SHOW WARNINGS row count cannot answer "were there any warnings?": the
+	// server truncates the list at @@max_error_count, and a server tuned to 0
+	// returns an empty list while @@warning_count stays accurate (COLD-1). Read
+	// the uncapped count (no privilege needed, unlike SETTING max_error_count)
+	// and gate on it. On a read failure, degrade to the visible count rather
+	// than failing a clean write.
+	total, terr := readTrueWarningCount(ctx, conn)
+	if terr != nil {
+		if sw.Visible == 0 {
+			return nil
+		}
+		return w.decideBulkWriteWarnings(ctx, table, sw, sw.Visible)
+	}
+	if total == 0 {
 		return nil
 	}
 	if !replay {
-		return w.decideBulkWriteWarnings(ctx, table, sw, sw.Visible)
+		return w.decideBulkWriteWarnings(ctx, table, sw, int(total))
 	}
-	total, err := readTrueWarningCount(ctx, conn)
-	if err != nil {
-		return fmt.Errorf(
-			"mysql: LOAD DATA into %q: the replayed segment produced warnings and the true warning count "+
-				"needed to prove they are only duplicate-key skips could not be read, so a silent value "+
-				"coercion could be hiding among them; refusing rather than tolerating them blind: %w",
-			table, err,
-		)
+	// Replay: the duplicate-key accounting needs to SEE the warning codes to
+	// classify each as a tolerable dup skip. If the visible list was truncated
+	// below the true count (a suppressed @@max_error_count), the hidden warnings
+	// cannot be classified, so a silent coercion could sit among them — decide
+	// on the true count (refuses under strict) rather than tolerating blind.
+	if int64(sw.Visible) < total {
+		return w.decideBulkWriteWarnings(ctx, table, sw, int(total))
 	}
 	if !replayWarningsAreOnlyDuplicates(segRows, inserted, total, sw.NonDup) {
 		return w.decideBulkWriteWarnings(ctx, table, sw, int(total))

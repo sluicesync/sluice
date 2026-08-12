@@ -149,15 +149,17 @@ func TestLoadDataWarningCountRefusesSilentClamp(t *testing.T) {
 }
 
 // TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp is the COLD-1 pin
-// (audit 2026-08-11). The silent-clamp refusal reads the SHOW WARNINGS row
-// count, which the server truncates at @@max_error_count; a server running
-// max_error_count=0 leaves @@warning_count accurate but SHOW WARNINGS empty, so
-// pre-fix the truncating LOAD DATA committed the clamped value and exited 0.
+// (audit 2026-08-11). The silent-clamp refusal historically read the SHOW
+// WARNINGS row count, which the server truncates at @@max_error_count; a server
+// running max_error_count=0 leaves @@warning_count accurate but SHOW WARNINGS
+// empty, so a truncating LOAD DATA committed the clamped value and exited 0.
 //
-// sluice now pins max_error_count=1024 on its OWN connections (cfg.Params), so
-// even with the SERVER GLOBAL set to 0 the warning list is not suppressed and
-// the refusal still fires. The mutation is removing that cfg.Params floor: the
-// sluice session then inherits GLOBAL=0 and this test's write lands silently.
+// The fix does NOT set max_error_count (SET requires SESSION_VARIABLES_ADMIN,
+// measured — it broke lower-privilege connects); it READS the uncapped
+// @@warning_count as the trigger. So with the SERVER GLOBAL at 0 the sluice
+// session inherits 0 (SHOW WARNINGS is empty), yet the refusal still fires off
+// @@warning_count. The mutation is reverting the trigger to the SHOW WARNINGS
+// row count: the write then lands silently.
 func TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
@@ -175,24 +177,16 @@ func TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
+	// `db` is the ADMIN pool: it flips the globals and does the DDL. SET GLOBAL
+	// does NOT change existing sessions, and the pool reuses connections, so the
+	// WRITE pool must be opened AFTER the globals change to inherit them.
 	if _, err := db.ExecContext(ctx, "SET GLOBAL local_infile = 1"); err != nil {
 		t.Skipf("LOAD DATA pin requires SET GLOBAL local_infile = 1; cannot grant: %v", err)
 	}
-	// Suppress the server's warning buffer globally — the documented bulk-load
-	// tuning this finding turns on. Restore it so the shared server is clean.
 	if _, err := db.ExecContext(ctx, "SET GLOBAL max_error_count = 0"); err != nil {
 		t.Skipf("COLD-1 pin requires SET GLOBAL max_error_count = 0; cannot grant: %v", err)
 	}
 	defer func() { _, _ = db.ExecContext(ctx, "SET GLOBAL max_error_count = 1024") }()
-	// Sanity: a session that did NOT get sluice's floor would read 0 here.
-	// sluice's own connection must read the pinned floor.
-	var sessionMEC int
-	if err := db.QueryRowContext(ctx, "SELECT @@SESSION.max_error_count").Scan(&sessionMEC); err != nil {
-		t.Fatalf("read session max_error_count: %v", err)
-	}
-	if sessionMEC == 0 {
-		t.Fatal("sluice connection inherited the server's max_error_count=0 — the cfg.Params floor is missing (COLD-1)")
-	}
 
 	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_mec_pin"); err != nil {
 		t.Fatalf("DROP: %v", err)
@@ -202,11 +196,31 @@ func TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp(t *testing.T) {
 	}
 	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_mec_pin") }()
 
+	// The WRITE pool, opened after GLOBAL max_error_count=0 so its fresh
+	// connections inherit it. sluice does NOT override max_error_count (SETTING
+	// it is privilege-gated), so these sessions run with the suppressed buffer —
+	// the exact hole condition, where SHOW WARNINGS is empty but @@warning_count
+	// is accurate.
+	wdb, err := openDB(ctx, cfg, nil)
+	if err != nil {
+		t.Fatalf("openDB (write pool): %v", err)
+	}
+	defer wdb.Close()
+
+	var sessionMEC int
+	if err := wdb.QueryRowContext(ctx, "SELECT @@SESSION.max_error_count").Scan(&sessionMEC); err != nil {
+		t.Fatalf("read session max_error_count: %v", err)
+	}
+	if sessionMEC != 0 {
+		t.Fatalf("write-pool session max_error_count = %d, want 0 — this test needs the suppressed-buffer condition "+
+			"(sluice must NOT set max_error_count, since SET requires SESSION_VARIABLES_ADMIN)", sessionMEC)
+	}
+
 	rowCh := make(chan ir.Row, 1)
 	rowCh <- ir.Row{"id": int64(1), "big": "999999999999999999999.99999"}
 	close(rowCh)
 
-	writer := &RowWriter{db: db}
+	writer := &RowWriter{db: wdb}
 	tbl := &ir.Table{
 		Name: "sluice_mec_pin",
 		Columns: []*ir.Column{
@@ -217,8 +231,9 @@ func TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp(t *testing.T) {
 	if err := writer.writeLoadData(ctx, tbl, rowCh); err == nil {
 		var got string
 		_ = db.QueryRowContext(ctx, "SELECT CAST(big AS CHAR) FROM sluice_mec_pin WHERE id=1").Scan(&got)
-		t.Fatalf("writeLoadData accepted an out-of-range NUMERIC silently under GLOBAL max_error_count=0; "+
-			"row landed with big=%q — the max_error_count floor regressed (COLD-1)", got)
+		t.Fatalf("writeLoadData accepted an out-of-range NUMERIC silently under a suppressed warning buffer "+
+			"(session max_error_count=0, SHOW WARNINGS empty); row landed with big=%q — the @@warning_count "+
+			"trigger regressed (COLD-1)", got)
 	}
 }
 
