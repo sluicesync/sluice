@@ -31,4 +31,4 @@ scoop update sluice
 go install sluicesync.dev/sluice/cmd/sluice@v0.121.0
 ```
 
-Container images: `ghcr.io/sluicesync/sluice:v0.121.0` (multi-arch).
+Container images: `ghcr.io/sluicesync/sluice:0.121.0` (multi-arch; the image tag carries no `v` prefix).
