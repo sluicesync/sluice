@@ -758,7 +758,17 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 		if err != nil {
 			return nil, fmt.Errorf("parse gtid set %q: %w", p.GTIDSet, err)
 		}
-		r.gtidSet = set
+		// CLONE before handing the set to the syncer: go-mysql's
+		// BinlogSyncer keeps the object it is given and mutates it from ITS
+		// goroutine (handleEventAndACK does its own AddGTID bookkeeping per
+		// GTID event), while sluice's fold mutates r.gtidSet from the pump
+		// goroutine — sharing one object is an unsynchronized concurrent
+		// map write on every GTID-mode stream (a latent race present since
+		// the reader shipped; first OBSERVED by the -race gate when the
+		// CDCPOS-1 XA test's dense group traffic widened the overlap
+		// window). Each side now does its own bookkeeping on its own copy;
+		// they start equal and sluice's positionFor reads only r.gtidSet.
+		r.gtidSet = set.Clone()
 		return r.syncer.StartSyncGTID(set)
 	case positionModeFilePos:
 		r.currentFile = p.File
