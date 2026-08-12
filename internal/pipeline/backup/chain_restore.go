@@ -508,6 +508,28 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []l
 	if schema == nil || len(schema.Sequences) == 0 {
 		return nil
 	}
+	// Bug 244 sibling: prune sequences owned by filter-excluded tables,
+	// mirroring [migcore.ApplyTableFilter]'s prune at the base full's
+	// restore. ReprimeSequences is create-if-missing, so an unfiltered
+	// tail would RESURRECT a sequence the full's restore deliberately
+	// dropped — dying on its `OWNED BY` against a never-created table, or
+	// creating an orphan the operator excluded. The prune is quiet (the
+	// full's restore already WARN-logged each drop, naming the owner);
+	// a fresh slice because the manifest schema must not be mutated.
+	seqs := schema.Sequences
+	if !r.Filter.IsEmpty() {
+		kept := make([]*ir.Sequence, 0, len(seqs))
+		for _, seq := range seqs {
+			if seq != nil && seq.OwnedByTable != "" && !r.Filter.Allows(seq.OwnedByTable) {
+				continue
+			}
+			kept = append(kept, seq)
+		}
+		seqs = kept
+		if len(seqs) == 0 {
+			return nil
+		}
+	}
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
 		return fmt.Errorf("open target schema writer: %w", err)
@@ -519,14 +541,14 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []l
 		return fmt.Errorf(
 			"target engine %q cannot re-prime standalone sequence %q (no sequence surface) — "+
 				"the restored sequence position would silently lag the applied rows",
-			r.Target.Name(), schema.Sequences[0].Name,
+			r.Target.Name(), seqs[0].Name,
 		)
 	}
-	if err := reprimer.ReprimeSequences(ctx, schema); err != nil {
+	if err := reprimer.ReprimeSequences(ctx, &ir.Schema{Tables: schema.Tables, Sequences: seqs}); err != nil {
 		return err
 	}
 	slog.InfoContext(ctx, "chain restore: standalone sequences re-primed from newest link schema",
-		slog.Int("sequences", len(schema.Sequences)))
+		slog.Int("sequences", len(seqs)))
 	return nil
 }
 
@@ -1188,30 +1210,60 @@ func (r *ChainRestore) applyIncremental(
 //     so the conservative thing is to keep the table and let the
 //     operator drop it manually after restore.
 func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.SegmentRecord) error {
-	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
-	if err != nil {
-		return fmt.Errorf("open schema writer: %w", err)
+	// Bug 244: honour the restore's table filter FIRST, the door the base
+	// full's restore already honours. Without this, an AlterTable delta on
+	// an excluded table died against the table the filter deliberately
+	// never created, and an AddTable delta resurrected a table the
+	// operator excluded (whose change events the stream now also drops).
+	deltas := link.Manifest.SchemaDelta
+	if !r.Filter.IsEmpty() {
+		kept := make([]*irbackup.SchemaDeltaEntry, 0, len(deltas))
+		for _, d := range deltas {
+			if r.Filter.Allows(d.Table) {
+				kept = append(kept, d)
+			}
+		}
+		if dropped := len(deltas) - len(kept); dropped > 0 {
+			slog.InfoContext(
+				ctx, "chain restore: table filter skipped schema deltas for excluded tables",
+				slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+				slog.Int("skipped", dropped),
+				slog.Int("kept", len(kept)),
+			)
+		}
+		deltas = kept
+		if len(deltas) == 0 {
+			return nil
+		}
 	}
-	defer migcore.CloseIf(sw)
 
-	// Bug 243, the delta door: delta tables are applied without table
-	// filtering, so a mangled recorded expression in an added/altered
-	// table refuses unconditionally here — pre-DDL, named — rather than
-	// dying in the target's parser mid-apply.
+	// Bug 243, the delta door — now filter-aware BY CONSTRUCTION, because
+	// it runs on the filtered delta set above: a mangled recorded
+	// expression in an added/altered table refuses here — pre-DDL, named —
+	// rather than dying in the target's parser mid-apply, and
+	// `--exclude-table=<affected>` releases the gate exactly as it does at
+	// the base full's restore door (a filter-blind gate would make the
+	// documented salvage impossible; Bug 244's lesson applied to the door).
 	var deltaProblems []string
-	for _, d := range link.Manifest.SchemaDelta {
+	for _, d := range deltas {
 		deltaProblems = append(deltaProblems, ir.TableExpressionLexProblems(d.After)...)
 	}
 	if err := refuseMalformedRecordedSchema("chain restore: schema delta", deltaProblems); err != nil {
 		return err
 	}
 
+	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
+	if err != nil {
+		return fmt.Errorf("open schema writer: %w", err)
+	}
+	defer migcore.CloseIf(sw)
+
 	// Bucket the deltas by kind for clear logging + clean strategy
 	// dispatch.
 	var (
 		adds, drops, alters int
 	)
-	for _, d := range link.Manifest.SchemaDelta {
+	for _, d := range deltas {
 		switch d.Kind {
 		case irbackup.SchemaDeltaAddTable:
 			adds++
@@ -1228,7 +1280,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	// failure modes section. The "column dropped + new column with same
 	// name" pattern across deltas in a single manifest indicates ambiguous
 	// intent; for v1, refuse rather than risk wrong-shape application.
-	if err := lineage.DetectAmbiguousDeltas(link.Manifest.SchemaDelta); err != nil {
+	if err := lineage.DetectAmbiguousDeltas(deltas); err != nil {
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
@@ -1240,7 +1292,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	// and call CreateTablesWithoutConstraints (idempotent).
 	if adds > 0 {
 		newTables := make([]*ir.Table, 0, adds)
-		for _, d := range link.Manifest.SchemaDelta {
+		for _, d := range deltas {
 			if d.Kind == irbackup.SchemaDeltaAddTable && d.After != nil {
 				newTables = append(newTables, d.After)
 			}
@@ -1268,7 +1320,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	// aspect-classified dispatch is what closes that class, not just
 	// that one shape.
 	if alters > 0 {
-		for _, d := range link.Manifest.SchemaDelta {
+		for _, d := range deltas {
 			if d.Kind != irbackup.SchemaDeltaAlterTable {
 				continue
 			}
@@ -1362,16 +1414,18 @@ func (r *ChainRestore) streamIncrementalChanges(
 		}
 	}()
 	// lastApplied tracks the position of the last position-bearing change
-	// emitted across every chunk — the input to the F1 tail-truncation
-	// backstop below. Confined to this producer goroutine.
+	// decoded across every chunk — the input to the F1 tail-truncation
+	// backstop below. Confined to this producer goroutine, as is the
+	// Bug 244 skipped-by-filter tally beside it.
 	var lastApplied ir.Position
+	skipped := make(map[string]int64)
 	for f := range fetchCh {
 		if f.err != nil {
 			// A SHA-256 mismatch (tampered/corrupt stored bytes) surfaces here
 			// before decryption → coded SLUICE-E-BACKUP-CHUNK-CORRUPT.
 			return lineage.CodeChunkHashError(fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err))
 		}
-		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out, &lastApplied); err != nil {
+		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out, &lastApplied, skipped); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -1379,6 +1433,20 @@ func (r *ChainRestore) streamIncrementalChanges(
 			slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
 			slog.Int("chunk", f.idx),
 			slog.Int64("changes", f.chunk.RowCount),
+		)
+	}
+	if len(skipped) > 0 {
+		var total int64
+		for _, n := range skipped {
+			total += n
+		}
+		// INFO, mirroring migcore's "table filter applied" line: the operator
+		// asked for the filter, so this is confirmation of scope, not a warning.
+		slog.InfoContext(
+			ctx, "chain restore: table filter dropped change events for excluded tables",
+			slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+			slog.Int64("changes", total),
+			slog.Int("tables", len(skipped)),
 		)
 	}
 	// F1 (SLUICE-E-BACKUP-INCOMPLETE): change-chunk tail-truncation backstop.
@@ -1505,6 +1573,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 	src io.ReadCloser,
 	out chan<- ir.Change,
 	lastApplied *ir.Position,
+	skipped map[string]int64,
 ) error {
 	cek, err := r.changeChunkCEK(chunk)
 	if err != nil {
@@ -1532,12 +1601,30 @@ func (r *ChainRestore) streamOneChangeChunk(
 			return fmt.Errorf("read change: %w", err)
 		}
 		// F1 backstop bookkeeping: remember the last POSITION-BEARING change
-		// we emit so [streamIncrementalChanges] can assert the replayed tail
+		// we DECODE so [streamIncrementalChanges] can assert the replayed tail
 		// reaches the manifest's EndPosition. Non-position-bearing changes
 		// (e.g. a bare TxBegin/TxCommit without a source position) don't
 		// advance it, mirroring the window writer's `lastPos` rule.
+		//
+		// This runs BEFORE the table-filter skip below, deliberately: the F1
+		// truncation assert grades the CHUNK STREAM (was every recorded event
+		// still present?), not the applied subset — the window's tail change
+		// may well belong to a filtered-out table, and skipping its position
+		// would make a legitimate filtered restore indistinguishable from a
+		// truncated chain (Bug 244's fix must not trade a crash for a false
+		// SLUICE-E-BACKUP-INCOMPLETE).
 		if p := change.Pos(); p.Engine != "" || p.Token != "" {
 			*lastApplied = p
+		}
+		// Bug 244: honour the restore's table filter, the door the base
+		// full's restore already honours. Without this, an excluded table's
+		// events reached the applier, which died loudly against the table
+		// the filter deliberately never created ("table X has no columns") —
+		// breaking `--exclude-table` as a salvage on any chain carrying an
+		// incremental.
+		if drop, tbl := filterDropsChange(r.Filter, change); drop {
+			skipped[tbl]++
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -1549,6 +1636,40 @@ func (r *ChainRestore) streamOneChangeChunk(
 	// A change-chunk SHA-256 mismatch surfaces at Close → coded
 	// SLUICE-E-BACKUP-CHUNK-CORRUPT (a non-hash Close error passes through).
 	return lineage.CodeChunkHashError(cr.Close())
+}
+
+// filterDropsChange reports whether the restore's table filter drops
+// this change, and the bare table name it keyed on — the same name
+// space [migcore.TableFilter] matched when the base full's schema went
+// through [migcore.ApplyTableFilter], so the two doors cannot disagree
+// about what "excluded" means (Bug 244).
+//
+// Only the table-scoped events are filterable: [ir.Insert], [ir.Update],
+// [ir.Delete], [ir.Truncate]. Transaction boundaries ([ir.TxBegin],
+// [ir.TxCommit]) carry no table and always pass — an emptied transaction
+// applies as a harmless begin/commit pair. [ir.SchemaSnapshot] also
+// deliberately passes unfiltered: its applier dispatch writes ONLY to
+// sluice_cdc_schema_history (stream state seeding a later `sync start`
+// resume, ADR-0049 Chunk D) and never touches the user table, so
+// filtering it would degrade resume metadata without protecting anything.
+func filterDropsChange(f migcore.TableFilter, c ir.Change) (drop bool, table string) {
+	if f.IsEmpty() {
+		return false, ""
+	}
+	var tbl string
+	switch e := c.(type) {
+	case ir.Insert:
+		tbl = e.Table
+	case ir.Update:
+		tbl = e.Table
+	case ir.Delete:
+		tbl = e.Table
+	case ir.Truncate:
+		tbl = e.Table
+	default:
+		return false, ""
+	}
+	return !f.Allows(tbl), tbl
 }
 
 // changeChunkCEK resolves the CEK for a change chunk: per-chain mode
