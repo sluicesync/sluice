@@ -205,6 +205,8 @@ If any of the six fails, fix the failure (typically: race conditions caught by `
 
 **Force-moving a tag creates a duplicate draft release.** GoReleaser doesn't update the existing draft when the tag's SHA changes — it creates a new one. After publishing, list `gh api repos/owner/repo/releases --jq '.[] | select(.tag_name=="vX.Y.Z")'` and delete any leftover `draft: true` entries via `gh api -X DELETE repos/owner/repo/releases/<id>`. Pre-tagging cleanup (deleting the existing draft before the force-push) prevents the dup; cleanup after is fine too.
 
+**Force-move + notes: a retag that adds a runtime-affecting fix owes the NOTES an entry before publish (2026-08-12).** The v0.123.0 retag's ErrTxDone stop-race fix shipped in the binaries but reached none of the three claim homes (CHANGELOG, archive, live body) — the "curated notes" gate passed because notes WERE curated, just for the pre-retag content, and only the post-publish learnings sweep caught the omission. When force-moving a tag onto new commits, re-open the notes against the NEW tag range before publishing.
+
 **Force-move + binaries:** each `release.yml` run builds the binaries at *that* tag-SHA, so after a force-move the draft you publish as "Latest" must be the one whose binaries reflect the SHA you intend to ship (especially when the force-move added a runtime-affecting change, not just test-only fixes). Verify via `gh release view vX.Y.Z --json assets` that the `apiUrl` paths reflect the draft you intend, then `gh api -X DELETE` the others and `gh release edit --draft=false` the right one.
 
 ### Concurrency chunks: the `-race` integration gate runs BEFORE the tag
