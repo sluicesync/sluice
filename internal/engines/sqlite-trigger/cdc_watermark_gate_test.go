@@ -49,7 +49,12 @@ func openWritable(t *testing.T, path string) *sql.DB {
 // its own full `busy_timeout` deadline, so exhausting the budget means the
 // connection was starved through N CONSECUTIVE deadlines -- which is not a
 // contention shape, it is a wedged database, and the test says so out loud.
-const busyRetryAttempts = 10
+// 40 attempts, not 10: the v0.122.0 tag run starved ONE writer's first row
+// through all 10 attempts on the loaded Windows runner (each attempt races a
+// winner's whole remaining batch, so consecutive losses compound), and the
+// only honest lever is more headroom — passing runs never feel it, and the
+// failure message still names exhaustion loudly.
+const busyRetryAttempts = 40
 
 // isSQLiteBusy reports whether err is SQLite's transient lock-contention
 // refusal -- the one class a writer is supposed to retry rather than surface.
@@ -94,9 +99,17 @@ func insertRetryingBusy(ctx context.Context, db *sql.DB, id int64, w int) (retri
 		if !isSQLiteBusy(err) {
 			return attempt, err
 		}
-		// A short pause before re-entering a fresh deadline, so a starved
-		// connection is not immediately re-queued behind the same winners.
-		time.Sleep(time.Duration(attempt+1) * time.Millisecond)
+		// A growing pause before re-entering a fresh deadline, so a starved
+		// connection is not immediately re-queued behind the same winners —
+		// capped at 250ms, roughly the scale of a winner draining a batch on
+		// a slow runner (the 1–10ms first cut re-queued the loser while the
+		// winner was still mid-batch, which is how the v0.122.0 tag run
+		// starved one row through ten consecutive deadlines).
+		pause := time.Duration(attempt+1) * 10 * time.Millisecond
+		if pause > 250*time.Millisecond {
+			pause = 250 * time.Millisecond
+		}
+		time.Sleep(pause)
 	}
 	return busyRetryAttempts, fmt.Errorf("still SQLITE_BUSY after %d attempts, each with its own 10s deadline: %w",
 		busyRetryAttempts, err)
