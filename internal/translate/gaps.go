@@ -91,6 +91,13 @@ type Gap struct {
 	// JSON keys.
 	Pattern string
 
+	// Infix marks an operator-form pattern (Bug 242: REGEXP/RLIKE as
+	// MariaDB's catalog spells them). Renderers use it to say "the
+	// infix REGEXP operator" instead of the call-form "REGEXP()" —
+	// parens on an operator misdescribe what the operator actually
+	// wrote (the v0.120.1 rendering nit).
+	Infix bool
+
 	// RuleNum is the [`translator-coverage.md`] catalog rule number
 	// (#11, #13, etc.) so operators can cross-reference the doc.
 	RuleNum int
@@ -245,14 +252,14 @@ var gapPatterns = []gapPattern{
 		name:     "REGEXP",
 		rule:     13,
 		severity: SeverityLoud,
-		note:     "PG has no infix REGEXP operator. Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU — lookaheads, named groups, and Unicode-property classes don't translate). Use --expr-override.",
+		note:     "MariaDB's catalog spells `c REGEXP '...'` infix (MySQL 8 renders it as the regexp_like() call). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU — lookaheads, named groups, and Unicode-property classes don't translate). Use --expr-override.",
 		infix:    true,
 	},
 	{
 		name:     "RLIKE",
 		rule:     13,
 		severity: SeverityLoud,
-		note:     "PG has no infix RLIKE operator. Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU). Use --expr-override.",
+		note:     "MariaDB accepts RLIKE as a synonym of its infix REGEXP (its catalog usually normalizes it to `regexp`; this spelling is kept for any that does not). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU). Use --expr-override.",
 		infix:    true,
 	},
 	{
@@ -362,7 +369,11 @@ func RefuseOnLoudGaps(
 		} else {
 			fmt.Fprintf(&b, "table %q column %q %s", g.Table, g.Column, g.Field)
 		}
-		fmt.Fprintf(&b, ": %s() has no portable PostgreSQL equivalent. %s", g.Pattern, g.Note)
+		if g.Infix {
+			fmt.Fprintf(&b, ": the infix %s operator has no PostgreSQL equivalent. %s", g.Pattern, g.Note)
+		} else {
+			fmt.Fprintf(&b, ": %s() has no portable PostgreSQL equivalent. %s", g.Pattern, g.Note)
+		}
 	}
 	return errors.New(b.String())
 }
@@ -399,6 +410,7 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 		out = append(out, Gap{
 			Expression: expr,
 			Pattern:    pat.name,
+			Infix:      pat.infix,
 			RuleNum:    pat.rule,
 			Severity:   pat.severity,
 			Note:       pat.note,

@@ -200,6 +200,10 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		return nil, fmt.Errorf("prune: lineage restorable_from_segment=%d out of range — corrupt lineage", cat.RestorableFromSegment)
 	}
 
+	// Bug 243 maintenance door: pruning a chain whose restore is already
+	// broken must not be silent (WARN, never a refusal).
+	warnIfChainRecordedSchemaMalformed(ctx, "prune", store, cat)
+
 	// ADR-0154 Q4: a signed chain must be re-signed after prune (positions
 	// renumber). Refuse loudly when we cannot — never leave a signed chain
 	// with an unsigned/stale-signature successor.

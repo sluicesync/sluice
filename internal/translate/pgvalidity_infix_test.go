@@ -91,6 +91,32 @@ func TestRefuseOnUntranslatableExprs_InfixRegexpNamesTheRemedy(t *testing.T) {
 	}
 }
 
+// TestRefuseOnLoudGaps_InfixRegexpRendering pins the message operators
+// actually SEE. Callers run RefuseOnLoudGaps BEFORE the general
+// backstop gate, so for the infix spellings the curated note here is
+// the rendered surface — the v0.120.1 release notes claimed the refusal
+// names the operator's MariaDB provenance while the shipped message
+// carried no such word (it lived only in the shadowed backstop's
+// what-switch, corrected in place 2026-08-11). This pin is what makes
+// that claim true and keeps it true, and it holds the infix rendering:
+// "the infix REGEXP operator", never call-parens on an operator.
+func TestRefuseOnLoudGaps_InfixRegexpRendering(t *testing.T) {
+	err := RefuseOnLoudGaps(
+		bug242Schema(`c regexp '^o''brien$'`), "mysql", "postgres", "migrate", nil,
+	)
+	if err == nil {
+		t.Fatal("want the curated pre-DDL refusal, got nil")
+	}
+	for _, want := range []string{"the infix REGEXP operator", "MariaDB", "~ 'pattern'", "--expr-override", "z_rx"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("rendered refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "REGEXP()") {
+		t.Errorf("call-parens rendered on an operator form:\n%s", err)
+	}
+}
+
 // TestDetectGaps_InfixOperatorAdvisory pins the schema-preview twin: the
 // advisory rides the SAME token scan as the refusal (one scanner, two
 // consumers), fires on the operator form, and stays silent for the word

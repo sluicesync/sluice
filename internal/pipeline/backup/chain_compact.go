@@ -402,6 +402,10 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		return nil, fmt.Errorf("backup compact: lineage restorable_from_segment=%d out of range — corrupt lineage", cat.RestorableFromSegment)
 	}
 
+	// Bug 243 maintenance door: compacting a chain whose restore is
+	// already broken must not be silent (WARN, never a refusal).
+	warnIfChainRecordedSchemaMalformed(ctx, "backup compact", store, cat)
+
 	eligible := cat.Segments[cat.RestorableFromSegment:]
 	if len(eligible) < 2 {
 		slog.InfoContext(ctx, "backup compact: nothing to compact (fewer than 2 retained segments)")
