@@ -60,6 +60,11 @@ type atomicityCase struct {
 	// batch size to drive it with (<=1 routes to the serial per-change path).
 	prepare   func(t *testing.T, ctx context.Context, dsn string) (*ChangeApplier, int)
 	wantSameT bool
+	// noBoundaries delivers the bare Insert with no TxBegin/TxCommit — the
+	// outside-any-source-transaction shape, whose per-change position write
+	// stays atomic with its data (CDCPOS-2 changed only the inside-a-
+	// transaction shape).
+	noBoundaries bool
 	// why documents a wantSameT=false cell — an architectural exemption,
 	// never a defect left unstated.
 	why string
@@ -89,7 +94,33 @@ type atomicityCase struct {
 func TestPositionAndDataLandInOneTransaction(t *testing.T) {
 	cases := []atomicityCase{
 		{
-			name: "serial per-change",
+			// CDCPOS-2 (audit 2026-08-11) deliberately RELAXED this cell: a
+			// row inside a source transaction applies WITHOUT its position,
+			// and the position lands in the TxCommit's own transaction —
+			// because atomically persisting a MID-source-transaction position
+			// was precisely the silent-skip mechanism (in file/pos mode the
+			// row's position points past its own transaction's tail). The
+			// direction that survives is the safe one: the position write
+			// runs strictly AFTER every row of the transaction committed, so
+			// position-ahead-of-data stays unreachable, and data-ahead-of-
+			// position resumes as an idempotent replay (ADR-0010). Pinned in
+			// the token dimension by TestApply_PerChangePositionDeferredToTxCommit.
+			name: "serial per-change, row inside a source transaction",
+			prepare: func(t *testing.T, ctx context.Context, dsn string) (*ChangeApplier, int) {
+				return openPipelinedApplier(t, ctx, dsn), 1
+			},
+			wantSameT: false,
+			why: "mid-source-transaction positions are not valid restart points (CDCPOS-2: the atomic per-row persist " +
+				"WAS the silent-skip mechanism); the position defers to the TxCommit's own transaction, strictly after " +
+				"the data, so only the safe data-ahead-of-position direction is reachable",
+		},
+		{
+			// The shape that KEEPS the ADR-0007 atomic contract: a change
+			// outside any source transaction (trigger-CDC sources emit these,
+			// as do DDL-anchored events) still lands data+position in one
+			// transaction.
+			name:         "serial per-change, row outside any source transaction",
+			noBoundaries: true,
 			prepare: func(t *testing.T, ctx context.Context, dsn string) (*ChangeApplier, int) {
 				return openPipelinedApplier(t, ctx, dsn), 1
 			},
@@ -144,14 +175,18 @@ func TestPositionAndDataLandInOneTransaction(t *testing.T) {
 
 			id := int64(i + 1)
 			tok := fmt.Sprintf(`{"slot":"sluice_slot","lsn":"0/%d00"}`, i+2)
+			insert := ir.Insert{
+				Position: ir.Position{Engine: engineNamePostgres, Token: tok},
+				Schema:   "public", Table: "atom",
+				Row: ir.Row{"id": id, "n": int64(7)},
+			}
 			events := []ir.Change{
 				ir.TxBegin{Position: ir.Position{Engine: engineNamePostgres, Token: tok}},
-				ir.Insert{
-					Position: ir.Position{Engine: engineNamePostgres, Token: tok},
-					Schema:   "public", Table: "atom",
-					Row: ir.Row{"id": id, "n": int64(7)},
-				},
+				insert,
 				ir.TxCommit{Position: ir.Position{Engine: engineNamePostgres, Token: tok}},
+			}
+			if tc.noBoundaries {
+				events = []ir.Change{insert}
 			}
 			ch := make(chan ir.Change, len(events))
 			for _, e := range events {
