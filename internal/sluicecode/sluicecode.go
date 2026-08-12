@@ -60,6 +60,7 @@ const (
 	CodeCDCGeneratedPrimaryKey   Code = "SLUICE-E-CDC-GENERATED-PRIMARY-KEY"
 	CodeCDCChangeLogIDReuse      Code = "SLUICE-E-CDC-CHANGELOG-ID-REUSE"
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
+	CodeCDCXAUnsupported         Code = "SLUICE-E-CDC-XA-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
 	// Roadmap item 109: the errno-3024 statement-time wall reaches the
@@ -460,6 +461,7 @@ var registry = map[Code]Info{
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
+	CodeCDCXAUnsupported:         {ClassRefusal, "a replicated table is written inside a MySQL XA (distributed) transaction, which sluice cannot faithfully replicate: the rows are invisible on the source until XA COMMIT, so a rollback would fabricate them on the target, and mid-body positions are not valid restart points"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeConstraintStatementTimeLimit: {ClassRuntime, "foreign-key ADD hit PlanetScale's statement-time limit (errno 3024) — ADD FOREIGN KEY validates every child row, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall; --resume re-hits the identical deterministic wall, so the converging remedy is --skip-foreign-keys (completes the migration, keeps each FK's backing index)"},

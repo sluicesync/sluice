@@ -25,6 +25,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netdeadline"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events the CDC channel
@@ -305,6 +306,20 @@ type CDCReader struct {
 	// from folding the staged GTID early and reintroducing the defect.
 	pendingGTID string
 	inSourceTx  bool
+
+	// inXA tracks whether the dispatcher is between an `XA START` and its
+	// `XA END` (audit 2026-08-11 CDCPOS-1). Rows inside that window belong
+	// to a distributed transaction sluice cannot faithfully replicate
+	// without buffering prepared transactions: the rows are not visible on
+	// the source until a LATER `XA COMMIT` group (so applying them at read
+	// time fabricates rows if the coordinator rolls back), and any position
+	// persisted mid-XA can skip the body's tail on a crash. An IN-SCOPE row
+	// inside the window refuses loudly (dispatchRows); out-of-scope XA
+	// traffic on a shared server streams past untouched, its body GTID
+	// folding one group late via [CDCReader.stageGTID] — the documented
+	// non-lossy degradation — instead of EARLY via the generic-DDL arm,
+	// which was the item-132 loss shape re-opened.
+	inXA bool
 
 	// serverUUID is the source instance's @@server_uuid, read once at
 	// stream start. Stamped into every file/pos position so a resume
@@ -1005,6 +1020,31 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			}
 			return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
 		}
+		// XA statements are NOT DDL and must not reach the generic arm below
+		// (audit 2026-08-11 CDCPOS-1): `XA START` is a QueryEvent that is not
+		// `BEGIN`, so it used to fall through and fold the body group's GTID
+		// EARLY — before any of the body's rows — re-opening the exact
+		// mid-transaction position shape item 132 closed. The verbs:
+		//
+		//   START/BEGIN  opens the refusal window (rows follow in THIS group;
+		//                an in-scope one refuses in dispatchRows) — no fold,
+		//                no schema-cache churn.
+		//   END          closes the window (the XA protocol permits no rows
+		//                after it) — still no fold; the body group's GTID
+		//                folds one group late via stageGTID, the documented
+		//                non-lossy degradation, or at the terminal verb below.
+		//   COMMIT/ROLLBACK/PREPARE  each is its own group's only statement
+		//                (MySQL logs PREPARE as XA_PREPARE_LOG_EVENT, which
+		//                the default arm already ignores; MariaDB spells it
+		//                as a QueryEvent) — keep the implicit-commit fold
+		//                semantics the generic arm would have applied, minus
+		//                the cache churn.
+		//
+		// An XA-prefixed statement with an unrecognised verb falls through to
+		// the generic arm — the conservative status quo, not a silent skip.
+		if handled, err := r.dispatchXAStatement(q); handled || err != nil {
+			return err
+		}
 		// Everything below is DDL (TRUNCATE included). DDL IMPLICIT-COMMITS,
 		// gets its own GTID group, and carries no XID — so fold here, or the
 		// group's GTID stays staged forever and every later position silently
@@ -1195,6 +1235,25 @@ func (r *CDCReader) dispatchRows(
 	if qn == "" {
 		// Out-of-scope schema; silently drop.
 		return nil
+	}
+	// CDCPOS-1 (audit 2026-08-11): an IN-SCOPE row inside an XA transaction
+	// refuses loudly. sluice applies rows at read time, but an XA body's
+	// rows are not visible on the source until a LATER `XA COMMIT` group —
+	// so a coordinator rollback would leave fabricated rows on the target
+	// forever, and a crash mid-body could skip its tail; neither can be
+	// closed without buffering prepared transactions like a real replica
+	// (demand-gated). Out-of-scope XA traffic never reaches this line (the
+	// scope drop above), so a filtered sync sharing a server with an
+	// XA-using application keeps working.
+	if r.inXA {
+		return sluicecode.Wrap(
+			sluicecode.CodeCDCXAUnsupported,
+			"keep XA (distributed) transactions off the replicated tables, or exclude those tables from the "+
+				"sync; faithful XA replication requires buffering prepared transactions and is demand-gated",
+			fmt.Errorf("mysql: cdc: table %s is written inside an XA transaction, which sluice cannot "+
+				"faithfully replicate: the rows are invisible on the source until XA COMMIT (a rollback would "+
+				"fabricate them on the target) and mid-body positions are not valid restart points", qn),
+		)
 	}
 
 	tbl, err := r.tableFor(ctx, qn)
@@ -1593,8 +1652,86 @@ func (r *CDCReader) stageGTID(gtid string) error {
 		return err
 	}
 	r.inSourceTx = false
+	// A new group also means any XA body group is over (the XA protocol
+	// permits no rows after XA END, and the body group ends at PREPARE) —
+	// clearing here keeps a malformed stream from wedging the refusal window
+	// open over innocent later transactions (CDCPOS-1).
+	r.inXA = false
 	r.pendingGTID = gtid
 	return nil
+}
+
+// dispatchXAStatement handles the XA statement family in a QueryEvent
+// (CDCPOS-1 — see the doc block at the dispatch call site for the verb
+// semantics). handled=false means the statement is not a recognised XA verb
+// and the caller's generic-DDL arm proceeds.
+func (r *CDCReader) dispatchXAStatement(q string) (handled bool, err error) {
+	verb, isXA := xaStatementVerb(q)
+	if !isXA {
+		return false, nil
+	}
+	switch verb {
+	case "START", "BEGIN":
+		r.inXA = true
+		return true, nil
+	case "END":
+		r.inXA = false
+		return true, nil
+	case "COMMIT", "ROLLBACK", "PREPARE":
+		if !r.inSourceTx {
+			if err := r.foldPendingGTID(); err != nil {
+				return true, err
+			}
+		}
+		r.inXA = false
+		return true, nil
+	}
+	return false, nil
+}
+
+// xaStatementVerb recognises the XA statement family in a QueryEvent's text
+// and returns the upper-cased verb ("START", "BEGIN", "END", "COMMIT",
+// "ROLLBACK", "PREPARE", ...). It matches only a leading `XA <verb>` — the
+// xid that follows is opaque and never inspected, and ordinary statements
+// (including ones mentioning XA inside identifiers or literals) cannot match
+// a leading keyword.
+func xaStatementVerb(q string) (verb string, isXA bool) {
+	rest, ok := cutKeywordPrefix(q, "XA")
+	if !ok {
+		return "", false
+	}
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			end++
+			continue
+		}
+		break
+	}
+	if end == 0 {
+		return "", false
+	}
+	return strings.ToUpper(rest[:end]), true
+}
+
+// cutKeywordPrefix strips a leading SQL keyword (case-insensitive,
+// whitespace-tolerant) and reports whether it was present as a whole word.
+func cutKeywordPrefix(q, kw string) (rest string, ok bool) {
+	s := strings.TrimLeft(q, " \t\r\n")
+	if len(s) < len(kw) || !strings.EqualFold(s[:len(kw)], kw) {
+		return "", false
+	}
+	rest = s[len(kw):]
+	if rest == "" {
+		return "", false
+	}
+	switch rest[0] {
+	case ' ', '\t', '\r', '\n':
+		return rest, true
+	}
+	return "", false
 }
 
 // foldPendingGTID moves the staged GTID into the running executed set. It is
