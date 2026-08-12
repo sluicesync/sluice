@@ -167,6 +167,67 @@ func TestCapture_FidelityMatrix(t *testing.T) {
 	}
 }
 
+// TestCapture_InvalidUTF8TextRefusesLoudly is the SQT-1 pin (audit
+// 2026-08-11): SQLite TEXT legally carries invalid UTF-8, the trigger captures
+// the bytes verbatim, and encoding/json.Unmarshal silently rewrote each
+// invalid byte to U+FFFD — so CDC delivered a DIFFERENT value than the
+// cold-start snapshot carried for the same logical row, at exit 0, in a form
+// (valid UTF-8) no target could refuse. The decode now refuses loudly at the
+// shared jsonString choke point. RED pre-fix: the stream delivered the row
+// with txt = "��a" and no error.
+//
+// The valid-text row ahead of the poison documents the batch-atomic refusal
+// semantics: poll builds its whole batch before emitting, so the refusal
+// withholds the faithful row TOO — and because the watermark only advances on
+// emit, a resume after the operator repairs the source re-reads and delivers
+// it. Halted, never skipped. (No-over-refusal on valid text is pinned by
+// TestCapture_FidelityMatrix and the jsonString unit controls.)
+func TestCapture_InvalidUTF8TextRefusesLoudly(t *testing.T) {
+	path := newSourceFile(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)`)
+	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	exec(t, path, `INSERT INTO t (id, txt) VALUES (1, 'héllo→世界')`)
+	// The audit's observed poison: raw x'FFFE61' as TEXT.
+	exec(t, path, `INSERT INTO t (id, txt) VALUES (2, CAST(x'FFFE61' AS TEXT))`)
+
+	r, err := openCDCReader(bg(), path)
+	if err != nil {
+		t.Fatalf("openCDCReader: %v", err)
+	}
+	defer func() { _ = r.(interface{ Close() error }).Close() }()
+
+	ctx, cancel := context.WithTimeout(bg(), 30*time.Second)
+	defer cancel()
+	ch, err := r.StreamChanges(ctx, pos0(t))
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	// The pump closes the channel when the poisoned row refuses, so a plain
+	// drain terminates (the ctx timeout bounds a regression where it doesn't).
+	var got []ir.Change
+	for ev := range ch {
+		got = append(got, ev)
+	}
+	// Batch-atomic: both rows sit in one poll batch, the poison refuses the
+	// batch before anything emits, and the un-advanced watermark makes the
+	// faithful row a resume's job — 0 events, never a mangled one.
+	if len(got) != 0 {
+		t.Fatalf("delivered %d events despite the refusal (first: %#v); the poisoned batch must be withheld atomically", len(got), got[0])
+	}
+
+	streamErr := r.(interface{ Err() error }).Err()
+	if streamErr == nil {
+		t.Fatal("stream ended with nil Err after an invalid-UTF-8 capture; want the loud SQT-1 refusal " +
+			"(pre-fix this delivered the row silently mangled to U+FFFD)")
+	}
+	for _, want := range []string{"not valid UTF-8", `"t"`, `"txt"`} {
+		if !strings.Contains(streamErr.Error(), want) {
+			t.Errorf("refusal should carry %s for the operator; got: %v", want, streamErr)
+		}
+	}
+}
+
 // TestCapture_OrderAndWatermark pins the poll loop's id-ordered I/U/D emission,
 // the before/after images, and the monotonic watermark advance.
 func TestCapture_OrderAndWatermark(t *testing.T) {
