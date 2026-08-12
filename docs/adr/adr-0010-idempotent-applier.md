@@ -6,7 +6,7 @@ Accepted. Implemented in `internal/engines/{mysql,postgres}/change_applier.go`.
 
 ## Context
 
-CDC resume works by replaying changes from the last persisted position. If a process crashes between a target data write and the position update commit (within the same transaction — see [ADR-0007](adr-0007-position-persistence.md)), both roll back and the change re-streams cleanly. But if the crash happens *after* both commit but *before* the source acknowledges the position advance, the change re-streams once more on restart.
+CDC resume works by replaying changes from the last persisted position. If a process crashes between a target data write and the position update commit (same transaction on the batched path; the per-change path defers mid-source-transaction positions to the TxCommit — see [ADR-0007](adr-0007-position-persistence.md) and its 2026-08-12 amendment), the persisted position never covers the un-applied change, and it re-streams cleanly. But if the crash happens *after* both commit but *before* the source acknowledges the position advance, the change re-streams once more on restart.
 
 The applier's behavior on that replay determines whether resume is safe. Three options:
 

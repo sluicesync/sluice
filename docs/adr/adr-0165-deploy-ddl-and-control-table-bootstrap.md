@@ -46,3 +46,7 @@ A new code rather than generalizing `SLUICE-E-INDEX-DIRECT-DDL-DISABLED`: that c
 - **deploy-ddl auto-bootstrapping the control tables itself (rejected).** A `--bootstrap-control-tables` convenience would couple the generic command to sluice's own schema and hide five production schema changes behind one flag; the printer keeps every shipped statement visible and operator-reviewed.
 - **Generalizing `SLUICE-E-INDEX-DIRECT-DDL-DISABLED` (rejected).** See §3.
 - **Multi-statement `--ddl` (deferred).** One statement per deploy request keeps the DR diff, the refusal echo, and the leftover-branch identity all trivially attributable; the bootstrap is five short commands. Revisit on demand.
+
+## Evolution note 2026-08-12
+
+The printed bootstrap set has grown since acceptance: `sluice_cdc_query_timeout_raise` (item 108 era) and `sluice_cdc_skipped_tables` (audit C-11, v0.123.0) joined, so `control-tables ddl` now prints SEVEN tables and the CDC applier's ensure set is five. The counts in the body above are the as-accepted history; the single-source property is what holds (the printer emits the same strings the Ensure paths execute, pinned by `cmd/sluice/deploy_ddl_test.go`), so the paste-per-statement bootstrap story is count-independent.

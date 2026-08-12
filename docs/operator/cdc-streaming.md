@@ -92,10 +92,15 @@ batch:
   widely-spaced transients.
 - **Idempotent by construction.** A retried Insert is absorbed by the
   PK-keyed UPSERT; a retried Update/Delete is a no-op against the
-  already-applied state (ADR-0010). Position and data are written in
-  the same target transaction, so a rolled-back attempt rolls back
-  both and the next attempt writes both atomically (ADR-0007). The
-  retry adds no new correctness requirement.
+  already-applied state (ADR-0010). On the batched path, position and
+  data are written in the same target transaction, so a rolled-back
+  attempt rolls back both. On the per-change path, rows inside a
+  source transaction commit position-free and the position lands with
+  the delivered TxCommit (ADR-0007's 2026-08-12 amendment) — the
+  invariant either way is directional: a persisted position never
+  covers un-applied data, and the reachable divergence
+  (data-ahead-of-position) replays idempotently on resume. The retry
+  adds no new correctness requirement.
 
 ## Observability
 

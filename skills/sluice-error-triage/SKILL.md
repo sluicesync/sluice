@@ -19,7 +19,7 @@ Any `sluice` invocation exited non-zero, printed a `SLUICE-E-*` code, or emitted
 
 1. **Branch on the exit code first** (`AGENTS.md` / `docs/operator/error-codes.md`):
    - **0** — success (`verify`/`diff`/`sync health`: success *and* clean). Nothing to triage.
-   - **1** — runtime failure, OR a `verify`/`diff`/`sync health` **drift/stale** result. A real failure to fix, or a genuine data/lag difference to report (hand a drift to `fidelity-verify`).
+   - **1** — runtime failure, OR a `verify`/`diff`/`sync health` **drift/stale** result, OR `sync health` reporting durably **skipped tables** (`skipped_tables_tripped` in the JSON — the target lacks a table the stream carries; `schema add-table` or an explicit filter resolves it, no threshold applies). A real failure to fix, or a genuine data/lag difference to report (hand a drift to `fidelity-verify`).
    - **2** — config error (`--config` unloadable/unparsable), or a read-side command that **could not run at all**.
    - **3** — **named refusal (a decision point).** sluice declined by policy and named the remedy — retrying unchanged fails identically. The remedy is often a **destructive** flag needing human approval. Do NOT retry; surface `error.hint` and stop.
    - **80** — kong usage/parse error (unknown flag, missing required arg). Fix the command line; no sluice code ran.
