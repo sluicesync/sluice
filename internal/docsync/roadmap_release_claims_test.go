@@ -331,6 +331,10 @@ func TestRoadmapStatusMarkerClassifierPinsHistoricalSpellings(t *testing.T) {
 		"✅ IMPLEMENTED (`SLUICE-E-BACKUP-CHAIN-UNREADABLE`); ships in the next release",
 		"✅ IMPLEMENTED (keep the root manifest + the shared readability gate); ships in the next release",
 		"✅ root-caused + FIXED, pending release",
+		// Item 156's spelling, which the regex missed for two releases while the
+		// item sat shipped-but-marked-unreleased (roadmap-staleness-checker #1/#2,
+		// audit 2026-08-11 M0). Verbatim pre-fix marker text.
+		"FIXED 2026-08-10 (awaiting release), together with Bug 237, which is the same shape with a different constraint source. NOT a concurrency chunk.",
 		// "SHIPPED" wording that means shipped-to-main, not released. The
 		// unreleased vocabulary has to win over the release verb here.
 		"✅ SHIPPED to `main` 2026-08-04 (`6ec63868`); CI green. Unreleased — rides the next tag.",
@@ -425,7 +429,7 @@ var (
 	// roadmap's whole git history rather than from the spellings anyone
 	// remembers. TestRoadmapStatusMarkerClassifierPinsHistoricalSpellings holds
 	// it to the real strings.
-	unreleasedVocabRe = regexp.MustCompile(`(?i)\bunreleased\b|\bpending release\b|\bnot yet released\b|\bships (?:in|after)\b|\brides the next tag\b|\bin the next release\b`)
+	unreleasedVocabRe = regexp.MustCompile(`(?i)\bunreleased\b|\bpending release\b|\bawaiting release\b|\bnot yet released\b|\bships (?:in|after)\b|\brides the next tag\b|\bin the next release\b`)
 
 	// Narrative uses of the same words, which assert nothing about the item's
 	// current state. Only ever consulted when a marker ALSO carries a released

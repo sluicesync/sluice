@@ -306,10 +306,13 @@ type Geometry struct {
 	// `geometry(POINTZ, 4326)` for elevation-aware coordinates. The
 	// IR carries the dimensional flags as two booleans rather than
 	// expanding [GeometrySubtype] into 28 entries; the writer
-	// reconstructs the suffix on emit (postgisSubtypeName). Engines
-	// that carry Z / M in the value bytes rather than the column type
-	// modifier (MySQL) ignore the flags — the WKB / EWKB framing
-	// preserves the dimensional coordinates regardless.
+	// reconstructs the suffix on emit (postgisSubtypeName). MySQL 8
+	// supports NO Z/M dimensional geometry at all: a Z/M-flagged
+	// column toward a MySQL-family target passes every preflight
+	// today and the copy aborts on the server's own error 1416
+	// naming nothing about dimensionality (audit 2026-08-11 SPAT-2,
+	// filed — the fix is a HasZ/HasM arm in unsupportablePGtoMySQL
+	// returning a named preflight reason).
 	HasZ bool
 	HasM bool
 }

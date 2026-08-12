@@ -30,9 +30,16 @@
 //
 //   - `postgres-trigger → mysql` / `postgres-trigger → planetscale` for
 //     bulk-copy + CDC. The cross-engine supportability gate treats a
-//     `postgres-trigger` source as a PG source (PostGIS Geometry,
-//     pg_trgm opclass indexes, EXCLUDE constraints refuse loudly the
-//     same as a `postgres` source).
+//     `postgres-trigger` source as a PG source (pg_trgm opclass
+//     indexes and EXCLUDE constraints refuse loudly the same as a
+//     `postgres` source). PostGIS Geometry does NOT refuse — stale
+//     claim corrected 2026-08-12: ADR-0035 (v0.28.0) made PG-source
+//     geometry carried, so cold copy rides the delegated `postgres`
+//     reader fine, but the trigger capture (`to_jsonb`) renders a
+//     geometry as a GeoJSON object the shared apply path cannot
+//     decode ([]byte expected), so the first spatial DML after cold
+//     start wedges the stream (audit 2026-08-11 SPAT-4, filed — the
+//     fix is an ST_AsEWKB capture or a setup-time preflight refusal).
 //   - The full §15 Bug-74 value-family matrix pinned cross-engine via a
 //     `postgres-trigger`-vs-`postgres` MySQL-target congruence test —
 //     the trigger reader's JSON-scalar value shapes (bytea `\x`-hex,
