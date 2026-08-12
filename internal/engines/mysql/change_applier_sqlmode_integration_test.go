@@ -210,6 +210,93 @@ func TestChangeApplier_RelaxedModeWarnsOnClamp_CoalescedBatch(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_MaxErrorCountZero_StillWarnsOnClamp is the COLD-1 pin for
+// the CDC-apply consumer — the third reader of SHOW WARNINGS, missed by the
+// v0.121.0 fix's "both write cores" sweep (found by the post-release learnings
+// sweep, 2026-08-12). A server running max_error_count=0 leaves @@warning_count
+// accurate but SHOW WARNINGS empty, so the apply-path Vector B WARN — already
+// the weakest signal on this surface, WARN-only under the explicit
+// --mysql-sql-mode=” opt-in — went completely silent. The fix reads the
+// uncapped @@warning_count as the trigger, exactly like the bulk cores. The
+// mutation is reverting the trigger to sw.Visible: the clamp then applies with
+// no WARN and this test goes red.
+func TestChangeApplier_MaxErrorCountZero_StillWarnsOnClamp(t *testing.T) {
+	dsn, cleanup := newSharedDB(t, "vectorb_apply_mec")
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	relaxSharedGlobalSQLMode(t, ctx, dsn)
+
+	// Suppress the warning buffer server-side. SET GLOBAL does not change
+	// existing sessions, so the applier below must open AFTER this to inherit
+	// the suppressed buffer (sluice never sets max_error_count itself — SETTING
+	// it requires SESSION_VARIABLES_ADMIN on 8.0).
+	admin, err := openDB(ctx, mustParseDSN(t, dsn), nil)
+	if err != nil {
+		t.Fatalf("admin openDB: %v", err)
+	}
+	defer admin.Close()
+	if _, err := admin.ExecContext(ctx, "SET GLOBAL max_error_count = 0"); err != nil {
+		t.Skipf("COLD-1 apply pin requires SET GLOBAL max_error_count = 0; cannot grant: %v", err)
+	}
+	defer func() { _, _ = admin.ExecContext(context.Background(), "SET GLOBAL max_error_count = 1024") }()
+
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE gauges (
+			id    INT     NOT NULL,
+			small TINYINT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`)
+
+	applier := openRelaxedApplier(t, ctx, dsn)
+
+	// Confirm the hole condition holds for sessions opened after the flip: a
+	// fresh connection inherits max_error_count=0, the same inheritance the
+	// applier's pool just got.
+	probe, err := openDB(ctx, mustParseDSN(t, dsn), nil)
+	if err != nil {
+		t.Fatalf("probe openDB: %v", err)
+	}
+	defer probe.Close()
+	var sessionMEC int
+	if err := probe.QueryRowContext(ctx, "SELECT @@SESSION.max_error_count").Scan(&sessionMEC); err != nil {
+		t.Fatalf("read session max_error_count: %v", err)
+	}
+	if sessionMEC != 0 {
+		t.Fatalf("fresh session max_error_count = %d, want 0 — the suppressed-buffer condition did not take", sessionMEC)
+	}
+
+	buf := captureSlog(t)
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{Schema: "vectorb_apply_mec", Table: "gauges", Row: ir.Row{"id": int64(1), "small": int64(5)}},
+		ir.Update{
+			Schema: "vectorb_apply_mec", Table: "gauges",
+			Before: ir.Row{"id": int64(1), "small": int64(5)},
+			After:  ir.Row{"id": int64(1), "small": int64(300)}, // 300 > TINYINT max 127 → server clamps
+		},
+	})
+
+	var got int
+	db, err := openDB(ctx, mustParseDSN(t, dsn), nil)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.QueryRowContext(ctx, "SELECT small FROM gauges WHERE id=1").Scan(&got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != 127 {
+		t.Skipf("server did not clamp 300→127 (got %d); GLOBAL sql_mode relax may not have taken on the pooled conn", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "gauges") || !strings.Contains(out, "SILENTLY coerced") {
+		t.Errorf("apply-path clamp WARN went silent under a suppressed warning buffer "+
+			"(session max_error_count=0, SHOW WARNINGS empty) — the @@warning_count trigger "+
+			"regressed (COLD-1, CDC-apply sibling):\n%s", out)
+	}
+}
+
 // TestChangeApplier_StrictModeErrorsOnOutOfRange_Control is the
 // strict-mode control: with the default strict session (nil sqlMode —
 // openDB injects STRICT_TRANS_TABLES regardless of the relaxed GLOBAL),

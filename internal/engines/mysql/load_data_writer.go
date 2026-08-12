@@ -352,6 +352,13 @@ func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (s
 	return sw, nil
 }
 
+// warningCountQuerier is the session surface [readTrueWarningCount] reads:
+// a pinned *sql.Conn (the bulk-write paths) or an open *sql.Tx (the CDC
+// apply path) — the same session-scoping requirement as [diagnosticQuerier].
+type warningCountQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // readTrueWarningCount reads @@warning_count — the number of warnings the
 // last statement produced, UNCAPPED, unlike the SHOW WARNINGS row count
 // which the server truncates at @@max_error_count. It must be read AFTER
@@ -361,9 +368,9 @@ func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (s
 // prepared-statement read of @@warning_count DOES clear the list — which is
 // why this is a no-argument query (go-sql-driver sends it as a plain
 // COM_QUERY) and why it runs second.
-func readTrueWarningCount(ctx context.Context, conn *sql.Conn) (int64, error) {
+func readTrueWarningCount(ctx context.Context, q warningCountQuerier) (int64, error) {
 	var n int64
-	if err := conn.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&n); err != nil {
+	if err := q.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&n); err != nil {
 		return 0, fmt.Errorf("mysql: read @@warning_count: %w", err)
 	}
 	return n, nil

@@ -1394,6 +1394,15 @@ func (a *ChangeApplier) reportApplyClampWarnings(ctx context.Context, tx *sql.Tx
 		return err
 	}
 	details, count := sw.Details, sw.Visible
+	// Gate on the UNCAPPED @@warning_count, not the visible row count: the
+	// server truncates SHOW WARNINGS at @@max_error_count, and a server tuned
+	// to 0 returns an empty list while @@warning_count stays accurate — which
+	// silenced this WARN entirely (COLD-1's third consumer; v0.121.0 fixed the
+	// two bulk write cores and missed this apply-path sibling). A read failure
+	// degrades to the visible count rather than failing the apply.
+	if total, terr := readTrueWarningCount(ctx, tx); terr == nil {
+		count = int(total)
+	}
 	if count == 0 {
 		return nil
 	}
