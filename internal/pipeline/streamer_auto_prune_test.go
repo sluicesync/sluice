@@ -385,13 +385,19 @@ func TestStartAutoPruneChangeLog_PrunesOnCadence(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.startAutoPruneChangeLog(ctx, "s1", applier)
-	// A few ticks worth of wall-clock; the exact count isn't asserted (timing),
-	// only that the cadence fired at least once with the right token/keep.
-	time.Sleep(40 * time.Millisecond)
+	// Poll for the first tick instead of sleeping one fixed window: the cadence
+	// is wall-clock, and a loaded runner's timer granularity starved a fixed
+	// 40ms sleep once (Windows leg, v0.121.0 tag run). Only "fired at least
+	// once with the right token/keep" is asserted; the deadline bounds failure,
+	// not pace.
+	deadline := time.Now().Add(10 * time.Second)
+	for pruner.numCalls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 
 	if pruner.numCalls() == 0 {
-		t.Fatal("pruner never called; want at least one prune on the cadence")
+		t.Fatal("pruner never called within 10s; want at least one prune on the cadence")
 	}
 	gotID, lastToken, lastKeep := pruner.lastCall()
 	if lastToken != `{"last_id":99}` || lastKeep != 10 {
