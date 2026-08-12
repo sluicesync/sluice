@@ -1157,7 +1157,10 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 		return err
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return fmt.Errorf("postgres: applier: WritePosition: commit: %w", err)
+		// Shutdown-race sibling (see applierErrorOrShutdown): the frontier
+		// checkpointer calls WritePosition under the stream ctx, so a stop
+		// cancelling mid-write reports ErrTxDone here too.
+		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: WritePosition: commit: %w", err))
 	}
 	return nil
 }
@@ -1380,13 +1383,27 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return applierErrorOrShutdown(ctx, err)
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: commit (commit position): %w", err))
+		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit (commit position): %w", err))
 	}
 	a.reportAppliedToken(ctx, token)
 	return nil
+}
+
+// applierErrorOrShutdown maps an apply-path failure to the stream's own
+// cancellation when the context is terminated — the MySQL applier's twin
+// (see its doc comment for the ErrTxDone shutdown race the v0.123.0 tag run
+// caught): database/sql auto-rolls-back a BeginTx(ctx) transaction on
+// cancel, so a stop landing between BeginTx and Commit reports ErrTxDone,
+// which the streamer's clean-stop check does not match. Nothing persisted
+// is the safe direction; the cancellation is the true cause.
+func applierErrorOrShutdown(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return classifyApplierError(err)
 }
 
 // applyOne dispatches a single change to its SQL form, runs the
@@ -1466,7 +1483,11 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
+		// Same shutdown-race mapping as persistSourceTxCommit (the sibling
+		// this window was enumerated from): a stop cancelling ctx rolls the
+		// tx back under us and Commit reports ErrTxDone; nothing persisted,
+		// resume re-delivers.
+		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
 	}
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has

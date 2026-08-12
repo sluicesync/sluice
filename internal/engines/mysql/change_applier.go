@@ -1032,7 +1032,10 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 		return err
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return fmt.Errorf("mysql: applier: WritePosition: commit: %w", err)
+		// Shutdown-race sibling (see applierErrorOrShutdown): the frontier
+		// checkpointer calls WritePosition under the stream ctx, so a stop
+		// cancelling mid-write reports ErrTxDone here too.
+		return applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: WritePosition: commit: %w", err))
 	}
 	return nil
 }
@@ -1243,7 +1246,11 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: commit: %w", err))
+		// Same shutdown-race mapping as persistSourceTxCommit (the sibling
+		// this window was enumerated from): a stop cancelling ctx rolls the
+		// tx back under us and Commit reports ErrTxDone; neither data nor
+		// position persisted, resume re-delivers.
+		return applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit: %w", err))
 	}
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has
@@ -1271,12 +1278,30 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return applierErrorOrShutdown(ctx, err)
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: commit (commit position): %w", err))
+		return applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit (commit position): %w", err))
 	}
 	return nil
+}
+
+// applierErrorOrShutdown maps an apply-path failure to the stream's own
+// cancellation when the context is terminated. database/sql auto-rolls-back
+// a BeginTx(ctx) transaction the moment ctx cancels, so a stop landing
+// between BeginTx and Commit surfaces as sql.ErrTxDone ("transaction has
+// already been committed or rolled back") — which the streamer's clean-stop
+// check (errors.Is Canceled/DeadlineExceeded) does not match, turning an
+// ordinary graceful stop into a reported apply failure. Caught by the
+// v0.123.0 tag run the first time the CDCPOS-2 commit-position write (which
+// runs at EVERY TxCommit boundary, unlike the rarely-raced data commits)
+// widened the window. Nothing persisted is the SAFE direction (resume
+// re-delivers), and the cancellation is the true cause — report it.
+func applierErrorOrShutdown(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return classifyApplierError(err)
 }
 
 // dispatch routes a single change to its SQL form on the open tx.
