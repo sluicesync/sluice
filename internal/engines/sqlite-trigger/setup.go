@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -153,6 +154,7 @@ func setup(ctx context.Context, b backend, opts SetupOptions) (*Plan, error) {
 		// Refusals block the run even on dry-run — the operator sees them first.
 		return plan, fmt.Errorf("sqlite-trigger: setup: %d table(s) refused (see plan.Refusals)", len(refusals))
 	}
+	warnReplaceCaptureBlindSpot(ctx, tables)
 
 	// The engine's own tables are created with CREATE TABLE IF NOT EXISTS, so a
 	// pre-existing table at one of those names would be ADOPTED rather than
@@ -361,6 +363,60 @@ func preflight(tables []*ir.Table) []TableRefusal {
 		}
 	}
 	return refusals
+}
+
+// warnReplaceCaptureBlindSpot emits one WARN per table whose non-PK UNIQUE
+// constraints expose the REPLACE capture blind spot (audit 2026-08-11 SQT-2).
+//
+// With `PRAGMA recursive_triggers` OFF — SQLite's default, and a PER-CONNECTION
+// setting of the APPLICATION's writing connections, which sluice cannot set on
+// their behalf — the rows that INSERT OR REPLACE / UPDATE OR REPLACE delete to
+// satisfy a non-PK UNIQUE conflict fire NO AFTER DELETE trigger, so no D event
+// is captured: the conflicting row vanishes from the source while the target
+// keeps it. Permanent divergence, exit 0. A PK-conflict REPLACE converges
+// anyway (the captured I upserts the same key on the target), so the blind
+// spot is exactly the non-PK UNIQUE class — which includes a column declared
+// UNIQUE inline (its auto-index reads back as a unique index) and a
+// `UNIQUE ... ON CONFLICT REPLACE` clause, under which a PLAIN INSERT takes
+// REPLACE semantics.
+//
+// A WARN and deliberately not a refusal: the table replicates perfectly under
+// every write that is not an OR-REPLACE across a UNIQUE conflict, and
+// `ON CONFLICT DO UPDATE` upserts never implicitly delete. The premise (no D
+// with the pragma off; D fires with it on) is pinned by
+// TestCapture_ReplaceImplicitDeleteBlindSpotPremise, so if SQLite ever changes
+// the behaviour the pin fires and this WARN + ADR-0135's limitation section
+// get revisited.
+//
+// SCOPE: an expression UNIQUE index whose CREATE SQL the schema reader cannot
+// parse is WARN-skipped from the resolved table and therefore invisible here;
+// the reader already warns that skip on its own.
+func warnReplaceCaptureBlindSpot(ctx context.Context, tables []*ir.Table) {
+	for _, t := range tables {
+		var uniques []string
+		for _, idx := range t.Indexes {
+			if idx.Unique {
+				uniques = append(uniques, idx.Name)
+			}
+		}
+		if len(uniques) == 0 {
+			continue
+		}
+		slog.WarnContext(
+			ctx,
+			"sqlite-trigger: REPLACE capture blind spot — this table has a non-PK UNIQUE constraint, and with "+
+				"PRAGMA recursive_triggers OFF (SQLite's default, per-connection on YOUR application's writers, "+
+				"outside sluice's control) the row an INSERT OR REPLACE / UPDATE OR REPLACE implicitly deletes to "+
+				"satisfy a UNIQUE conflict fires no DELETE trigger, is never captured, and stays on the target "+
+				"forever: the source and target diverge silently. A plain INSERT does the same under a "+
+				"UNIQUE ... ON CONFLICT REPLACE clause.",
+			slog.String("table", t.Name),
+			slog.String("unique_indexes", strings.Join(uniques, ", ")),
+			slog.String("hint", "either run every application connection that writes this table with "+
+				"PRAGMA recursive_triggers=ON, or write upserts as INSERT ... ON CONFLICT DO UPDATE (which never "+
+				"implicitly deletes) instead of OR REPLACE; see ADR-0135's limitations"),
+		)
+	}
 }
 
 // renderSetupDDL produces the ordered DDL that installs the engine. Order

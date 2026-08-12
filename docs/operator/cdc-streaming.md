@@ -250,6 +250,18 @@ that blocks logical replication ([ADR-0066](../adr/adr-0066-postgres-trigger-eng
   column added after setup (SQLite has no DDL triggers, so an added
   column is otherwise invisible to the capture path).
 
+**Known limitation — `OR REPLACE` across a UNIQUE conflict.** With SQLite's
+default `PRAGMA recursive_triggers` OFF (a per-connection setting of *your
+application's* writing connections), the row an `INSERT OR REPLACE` /
+`UPDATE OR REPLACE` implicitly deletes to satisfy a **non-PK UNIQUE**
+conflict fires no DELETE trigger, so that delete is never captured and the
+target keeps the row — a silent divergence. `trigger setup` WARNs on every
+table with a non-PK UNIQUE constraint. Mitigate by running writers with
+`PRAGMA recursive_triggers = ON`, or by writing upserts as
+`INSERT ... ON CONFLICT DO UPDATE` (which never implicitly deletes); on D1
+prefer the latter. Details in
+[ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md).
+
 `d1-trigger` polls D1's **primary** (strongly-consistent) query path, not
 a read replica, so commit order equals `id` order. Because every change
 appends a `sluice_change_log` row that is never auto-reaped, run

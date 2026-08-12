@@ -121,6 +121,30 @@ not JSON number), REAL is `%.17g` round-trip-exact, BLOBs come back from hex. Th
   gate MUST pass before any tag (push-first/tag-after; the project's concurrency-chunk
   rule).
 
+## Known capture blind spot: REPLACE's implicit deletes (documented 2026-08-12, audit SQT-2)
+
+With `PRAGMA recursive_triggers` OFF — SQLite's default, and a **per-connection setting of
+the application's own writing connections**, which sluice cannot set on their behalf — the
+rows that `INSERT OR REPLACE` / `UPDATE OR REPLACE` implicitly delete to satisfy a
+**non-PK UNIQUE** conflict fire no `AFTER DELETE` trigger. No D event is captured: the
+conflicting row vanishes from the source while the target keeps it, permanently, at exit 0.
+A PK-conflict REPLACE converges anyway (the captured I upserts the same key), so the blind
+spot is exactly the non-PK UNIQUE class — including a column declared `UNIQUE` inline and a
+`UNIQUE ... ON CONFLICT REPLACE` clause, under which a *plain* INSERT takes REPLACE
+semantics. The pgtrigger twin cannot have this class (PG row triggers always fire).
+
+Mitigations, in preference order: run every application connection that writes such a
+table with `PRAGMA recursive_triggers = ON` (the D then fires — proven, see the premise pin
+below), or write upserts as `INSERT ... ON CONFLICT DO UPDATE`, which never implicitly
+deletes. On `d1-trigger` the pragma remedy may not be settable per-connection through
+every client binding (UNMEASURED — D1's HTTP query API and Workers bindings manage their
+own connections), so prefer the `ON CONFLICT DO UPDATE` write shape there.
+
+`trigger setup` WARNs per affected table (`warnReplaceCaptureBlindSpot`), and both halves
+of the environmental premise — no D with the pragma off, D with it on — are pinned against
+the real engine by `TestCapture_ReplaceImplicitDeleteBlindSpotPremise`, so a SQLite/driver
+behaviour change fails the build rather than silently orphaning this section.
+
 ## Deferred (Phase 2 / follow-ups)
 
 - **D1 variant:** poll `sluice_change_log` over the D1 HTTP query API (the `d1` reader's
