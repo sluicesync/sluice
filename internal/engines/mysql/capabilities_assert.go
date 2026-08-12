@@ -130,6 +130,9 @@ var (
 	// VStream readers below carry it too (no-op there — VStream filters
 	// server-side — but pinned so the surface stays uniform across the flavor).
 	_ ir.FullBeforeImageSetter = (*CDCReader)(nil)
+	// Bug 246: the reader-side table-scope predicate the pipeline wires so
+	// the XA refusal honours the sync's --include/--exclude-table filter.
+	_ ir.CDCScopePredicateSetter = (*CDCReader)(nil)
 
 	// VStream (PlanetScale / Vitess flavor) types. The snapshot-rows
 	// reader's resume surfaces are the ADR-0072 crash-resume path —

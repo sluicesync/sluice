@@ -209,10 +209,41 @@ func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveA
 			break
 		}
 	}
-	if base.Allows(name) {
+	return tableAllowedWithLiveAdd(name, base, live)
+}
+
+// tableAllowedWithLiveAdd is the name-based core of the dispatch filter,
+// shared with the reader-side scope predicate (Bug 246) so the reader's
+// policy checks and the dispatch filter can never disagree about a table.
+func tableAllowedWithLiveAdd(unqualified string, base migcore.TableFilter, live *liveAddedFilter) bool {
+	if base.Allows(unqualified) {
 		return true
 	}
-	return live.Contains(name)
+	return live.Contains(unqualified)
+}
+
+// wireCDCScopePredicate hands a CDC reader the sync's EFFECTIVE table scope
+// (the operator filter merged with live-adds) via the optional
+// [ir.CDCScopePredicateSetter] surface, so reader-side POLICY checks — the
+// MySQL XA refusal — agree with the dispatch filter one stage downstream
+// (Bug 246: without this the refusal fired for tables the sync excludes, a
+// working configuration, and the tripped stream re-refused forever because
+// excluding the table changed nothing the reader could see). Wired at every
+// reader-open site — cold start, warm resume, and both multidb paths — the
+// same enumeration the poll-interval setter carries. The closure reads the
+// live-add set through an atomic pointer (nil until the apply sidecars
+// create it — correct, since no live-add can exist before they start), so
+// it is safe from the reader's pump goroutine. Type-assert/silent-ignore
+// like every optional reader surface: engines without reader-side policy
+// checks don't implement it.
+func (s *Streamer) wireCDCScopePredicate(r ir.CDCReader) {
+	setter, ok := r.(ir.CDCScopePredicateSetter)
+	if !ok {
+		return
+	}
+	setter.SetCDCScopePredicate(func(_, table string) bool {
+		return tableAllowedWithLiveAdd(table, s.Filter, s.liveFilterRef.Load())
+	})
 }
 
 // pollLiveAddedTables runs alongside [pollStopSignal] and refreshes the

@@ -1299,6 +1299,9 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
+	// Bug 246: hand the reader the effective table scope so reader-side
+	// policy checks (the MySQL XA refusal) honour the sync's filter.
+	s.wireCDCScopePredicate(stream.Changes)
 	// ADR-0091 F7a (cold-start mirror of warmResume): relax the reader's
 	// mid-stream schema-change gate when single-stream forwarding is active
 	// so the unambiguous shapes reach the forward intercept rather than

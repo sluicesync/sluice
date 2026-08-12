@@ -141,6 +141,56 @@ func TestXA_TerminalVerbsFoldOwnGroupAndReleaseTheWindow(t *testing.T) {
 	}
 }
 
+// TestXA_ScopePredicateExemptsFilteredTables is the Bug 246 pin: the XA
+// refusal must honour the sync's table filter. The v0.123.0 cycle found the
+// refusal firing for XA on tables the sync EXCLUDES — a configuration that
+// worked before the refusal existed — because the table filter lives one
+// stage downstream of the reader; and a tripped stream re-refused forever,
+// since excluding the table changed nothing the reader could see. With the
+// pipeline-supplied predicate excluding the table, the row must NOT refuse
+// and must EMIT (the downstream filter drops it like any other
+// excluded-table event); with the predicate including it, the refusal is
+// unchanged. The nil-predicate default (refuse everything in-schema) is
+// pinned by TestXA_InScopeRowRefusesLoudly above.
+func TestXA_ScopePredicateExemptsFilteredTables(t *testing.T) {
+	t.Run("excluded table streams past the refusal", func(t *testing.T) {
+		r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+		r.SetCDCScopePredicate(func(schema, table string) bool {
+			return schema != "app" || table != "users" // the sync excludes app.users
+		})
+		out := make(chan ir.Change, 8)
+
+		dispatchOne(t, r, mysqlGTIDEvent(t, 6), out, "GTID :6")
+		dispatchOne(t, r, queryEvent("XA START 'x1'"), out, "XA START")
+		if err := r.dispatch(context.Background(), insertRowEvent(1), out); err != nil {
+			t.Fatalf("XA row for a filter-EXCLUDED table refused (%v); the refusal must honour the sync's "+
+				"table filter (Bug 246) — pre-fix this broke a working filtered sync with no runnable remedy", err)
+		}
+		close(out)
+		n := 0
+		for range out {
+			n++
+		}
+		if n != 1 {
+			t.Fatalf("excluded-table XA row emitted %d changes; want 1 — the reader emits and the DOWNSTREAM "+
+				"filter drops, exactly like every other excluded-table event", n)
+		}
+	})
+	t.Run("included table still refuses", func(t *testing.T) {
+		r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+		r.SetCDCScopePredicate(func(string, string) bool { return true })
+		out := make(chan ir.Change, 8)
+
+		dispatchOne(t, r, mysqlGTIDEvent(t, 6), out, "GTID :6")
+		dispatchOne(t, r, queryEvent("XA START 'x1'"), out, "XA START")
+		err := r.dispatch(context.Background(), insertRowEvent(1), out)
+		ce, ok := sluicecode.FromError(err)
+		if err == nil || !ok || ce.Code != sluicecode.CodeCDCXAUnsupported {
+			t.Fatalf("an INCLUDED table's XA row must still refuse with the code; got: %v", err)
+		}
+	})
+}
+
 // TestXAStatementVerb pins the recogniser: leading-keyword only, case- and
 // whitespace-insensitive, xid opaque; ordinary statements can never match.
 func TestXAStatementVerb(t *testing.T) {

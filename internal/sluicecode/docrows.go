@@ -169,7 +169,7 @@ var docRows = map[Code]docRow{
 	},
 	"SLUICE-E-CDC-XA-UNSUPPORTED": {
 		Meaning: "A replicated table is written inside a MySQL XA (distributed) transaction. sluice applies CDC rows at read time, but an XA body's rows are not visible on the source until a LATER `XA COMMIT` — so applying them would fabricate rows on the target if the coordinator rolls back, and a position persisted mid-body is not a valid restart point (a crash could skip the body's tail). Faithful XA replication requires buffering prepared transactions the way a real replica does, which is demand-gated. XA transactions touching only NON-replicated tables stream past without this refusal, so a filtered sync sharing a server with an XA-using application keeps working.",
-		Remedy:  "Keep XA (distributed) transactions off the replicated tables, or exclude those tables from the sync (`--exclude-table`). If your application can use ordinary transactions for these tables, that also resolves it. If you need faithful XA replication, file the demand — the buffering design is known, unscheduled.",
+		Remedy:  "Keep XA (distributed) transactions off the replicated tables, or exclude those tables from the sync (`--exclude-table` — the refusal honours the filter). If the stream keeps refusing on resume, the XA body is already in its past: a re-snapshot (`sync start --restart-from-scratch`) moves past it. If your application can use ordinary transactions for these tables, that also resolves it. If you need faithful XA replication, file the demand — the buffering design is known, unscheduled.",
 	},
 	"SLUICE-E-COLDSTART-TARGET-NOT-EMPTY": {
 		Meaning: "Cold-start refused: a target table already contains data (usually a previous run died mid-copy).",

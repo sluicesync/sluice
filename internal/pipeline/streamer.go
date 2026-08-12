@@ -290,6 +290,12 @@ type Streamer struct {
 	// advances the position past the dropped ones.
 	Filter migcore.TableFilter
 
+	// liveFilterRef publishes the run's live-added-tables filter to the
+	// reader-side scope predicate (Bug 246; see wireCDCScopePredicate).
+	// Stored by phaseStartApplySidecars when the filter is created; nil
+	// before then, which the predicate treats as "no live-adds yet".
+	liveFilterRef atomic.Pointer[liveAddedFilter]
+
 	// ViewFilter selects which source views are created on the
 	// target during the cold-start phase. CDC events for views
 	// don't exist (views aren't replicated by either engine's CDC

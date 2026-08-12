@@ -919,6 +919,9 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// dispatch filter sees an empty live-added set forever, preserving
 	// pre-v0.27.0 behaviour.
 	liveFilter := &liveAddedFilter{}
+	// Publish to the reader-side scope predicate (Bug 246) so a live-added
+	// table's XA policy check agrees with the dispatch filter.
+	s.liveFilterRef.Store(liveFilter)
 	s.seedLiveAddedFilter(applyCtx, applier, streamID, liveFilter)
 	s.startLiveAddedTablesPoll(applyCtx, applier, streamID, liveFilter)
 

@@ -307,6 +307,17 @@ type CDCReader struct {
 	pendingGTID string
 	inSourceTx  bool
 
+	// scopeAllowed is the pipeline-supplied effective table scope
+	// (--include/--exclude-table merged with live-adds) — the optional
+	// [ir.CDCScopePredicateSetter] surface, consulted ONLY by reader-side
+	// policy checks (the XA refusal). nil means "no filter wired": every
+	// in-schema table is in scope, the conservative direction (Bug 246:
+	// without this the XA refusal fired for tables the sync excludes — a
+	// working configuration — because the table filter lives one stage
+	// downstream of the reader). Set before StreamChanges; read from the
+	// pump goroutine (the pipeline's closure is lock-free).
+	scopeAllowed func(schema, table string) bool
+
 	// inXA tracks whether the dispatcher is between an `XA START` and its
 	// `XA END` (audit 2026-08-11 CDCPOS-1). Rows inside that window belong
 	// to a distributed transaction sluice cannot faithfully replicate
@@ -1252,14 +1263,22 @@ func (r *CDCReader) dispatchRows(
 	// so a coordinator rollback would leave fabricated rows on the target
 	// forever, and a crash mid-body could skip its tail; neither can be
 	// closed without buffering prepared transactions like a real replica
-	// (demand-gated). Out-of-scope XA traffic never reaches this line (the
-	// scope drop above), so a filtered sync sharing a server with an
-	// XA-using application keeps working.
-	if r.inXA {
+	// (demand-gated). Out-of-scope traffic never trips it: a foreign SCHEMA
+	// is dropped above, and a TABLE the sync's filter excludes is exempted
+	// by the pipeline-supplied scope predicate (Bug 246 — the table filter
+	// lives one stage downstream, so without the predicate this refused
+	// filtered-out tables, a working configuration, and the tripped stream
+	// re-refused forever on the historical body because excluding the table
+	// changed nothing the reader could see). A predicate-exempted row still
+	// EMITS — the downstream filter drops it exactly as it drops every
+	// other excluded-table event.
+	if r.inXA && (r.scopeAllowed == nil || r.xaTableInScope(qn)) {
 		return sluicecode.Wrap(
 			sluicecode.CodeCDCXAUnsupported,
 			"keep XA (distributed) transactions off the replicated tables, or exclude those tables from the "+
-				"sync; faithful XA replication requires buffering prepared transactions and is demand-gated",
+				"sync (--exclude-table — the refusal honours the filter); if the stream keeps refusing on "+
+				"resume, the XA body is already in its past: a re-snapshot (`sync start --restart-from-scratch`) "+
+				"moves past it. Faithful XA replication requires buffering prepared transactions and is demand-gated",
 			fmt.Errorf("mysql: cdc: table %s is written inside an XA transaction, which sluice cannot "+
 				"faithfully replicate: the rows are invisible on the source until XA COMMIT (a rollback would "+
 				"fabricate them on the target) and mid-body positions are not valid restart points", qn),
@@ -1669,6 +1688,27 @@ func (r *CDCReader) stageGTID(gtid string) error {
 	r.inXA = false
 	r.pendingGTID = gtid
 	return nil
+}
+
+// SetCDCScopePredicate implements [ir.CDCScopePredicateSetter] (Bug 246):
+// the pipeline hands the reader its effective table scope so the XA refusal
+// agrees with the downstream dispatch filter. Must be called before
+// StreamChanges (the pipeline's setter block does); the predicate is read
+// from the pump goroutine and must be internally synchronized (the
+// pipeline's closure reads an atomic pointer).
+func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool) {
+	r.scopeAllowed = allowed
+}
+
+// xaTableInScope splits the table-map's qualified "schema.table" name and
+// consults the pipeline-supplied scope predicate. Callers guard on
+// r.scopeAllowed != nil.
+func (r *CDCReader) xaTableInScope(qn string) bool {
+	schema, table := qn, ""
+	if i := strings.IndexByte(qn, '.'); i >= 0 {
+		schema, table = qn[:i], qn[i+1:]
+	}
+	return r.scopeAllowed(schema, table)
 }
 
 // dispatchXAStatement handles the XA statement family in a QueryEvent

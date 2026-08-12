@@ -385,6 +385,8 @@ func (s *Streamer) coldStartMultiDatabase(
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
+	// Bug 246: reader-side scope predicate, multidb cold-start mirror.
+	s.wireCDCScopePredicate(stream.Changes)
 
 	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
@@ -527,6 +529,8 @@ func (s *Streamer) warmResumeMultiDatabase(
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
+	// Bug 246: reader-side scope predicate, multidb warm-resume mirror.
+	s.wireCDCScopePredicate(cdc)
 
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {

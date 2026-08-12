@@ -64,6 +64,8 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
+	// Bug 246: reader-side scope predicate, warm-resume mirror.
+	s.wireCDCScopePredicate(cdc)
 	// ADR-0091 F7a: when single-stream forwarding is active, tell the
 	// reader to relax its mid-stream schema-change gate so the unambiguous
 	// shapes reach the forward intercept as SchemaSnapshots instead of
