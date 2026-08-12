@@ -121,6 +121,21 @@ func TestCanonicalCheckExpr_TamperIsStillVisible(t *testing.T) {
 			`regexp_like(email,'^[a-z]+@example[.]com$')`,
 			`regexp_like(email,'[a-z]+@example[.]com$')`,
 		},
+		{
+			// DIFF-1: the pre-fix backslash-escape arm dropped the `\`, so a
+			// regex weakened from "digits required" to "any run of d's"
+			// canonicalized onto the original and reported IN SYNC.
+			"a regex backslash class weakened",
+			`(c ~ '^a\d+$')`,
+			`(c ~ '^ad+$')`,
+		},
+		{
+			// The emitted-check carrier of the same defect: a REGEXP_LIKE
+			// DOMAIN pattern tampered by removing a backslash class.
+			"an emitted REGEXP_LIKE pattern backslash removed",
+			`regexp_like(c,'^a\d+$')`,
+			`regexp_like(c,'^ad+$')`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if canonicalCheckExpr(tc.honest) == canonicalCheckExpr(tc.tampered) {
@@ -128,6 +143,29 @@ func TestCanonicalCheckExpr_TamperIsStillVisible(t *testing.T) {
 					"target in sync:\n  honest   %q\n  tampered %q", tc.honest, tc.tampered)
 			}
 		})
+	}
+}
+
+// TestSchemaDiff_BackslashWeakenedCheckIsReportedAsDrift is the DIFF-1
+// pin at the Schemas() level, where the finding OBSERVED the false
+// "in sync": a target whose same-named CHECK has been weakened by
+// removing a regex backslash class (`^a\d+$` "digits required" → `^ad+$`
+// "any run of d's") must report drift, not certify the weakened
+// constraint intact. Byte comparison fails on the tamper and the Bug-241
+// canonical fallback must NOT fold them equal.
+func TestSchemaDiff_BackslashWeakenedCheckIsReportedAsDrift(t *testing.T) {
+	table := func(expr string) *ir.Table {
+		return &ir.Table{
+			Name:             "t",
+			Columns:          []*ir.Column{{Name: "c", Type: ir.Text{Size: ir.TextRegular}}},
+			CheckConstraints: []*ir.CheckConstraint{{Name: "c_pat", Expr: expr}},
+		}
+	}
+	expected := &ir.Schema{Tables: []*ir.Table{table(`(c ~ '^a\d+$')`)}}
+	actual := &ir.Schema{Tables: []*ir.Table{table(`(c ~ '^ad+$')`)}}
+	if d := Schemas(expected, actual, Options{}); !d.HasChanges() {
+		t.Fatal("a target CHECK weakened by dropping a regex backslash class was reported IN SYNC — " +
+			"the drift-detection tool certified a weakened constraint intact (DIFF-1)")
 	}
 }
 
@@ -195,7 +233,15 @@ func TestCanonicalCheckExpr_LiteralScanning(t *testing.T) {
 		{"literal whitespace is preserved", `c IN ('a b')`, `c IN ('ab')`, false},
 		{"literal parens are preserved", `c IN ('(x)')`, `c IN ('x')`, false},
 		{"a cast-looking string inside a literal is preserved", `c IN ('a::text')`, `c IN ('a')`, false},
-		{"doubled and backslash quote escapes agree", `c IN ('o''brien')`, `c IN ('o\'brien')`, true},
+		{"an apostrophe (SQL-standard doubling) is kept in the value", `c IN ('o''brien')`, `c IN ('obrien')`, false},
+		// DIFF-1 (audit 2026-08-11): both diff inputs reach this pass in
+		// SQL-standard spelling (the IR keeps backslashes BARE and each
+		// engine re-escapes only at its own emit boundary — see
+		// mysql.escapeExprLiteralBackslashes), so a backslash is a VALUE
+		// character. Dropping it, as the pre-fix MySQL-escape arm did, made a
+		// weakened regex canonicalize onto the original.
+		{"a backslash is a literal value char, not an escape", `c ~ '^a\d+$'`, `c ~ '^ad+$'`, false},
+		{"a value ending in a backslash does not swallow the closing quote", `c = 'a\' and x > 1`, `c = 'b\' and x > 1`, false},
 		{"an unterminated literal does not swallow the rest", `c IN ('a`, `c IN ('b`, false},
 		{"keyword case outside literals folds", `c IN ('a')`, `c in ('a')`, true},
 	} {

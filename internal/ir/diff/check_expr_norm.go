@@ -132,8 +132,9 @@ func canonicalCheckExpr(expr string) string {
 // It runs on the RAW expression, BEFORE [foldOutsideLiterals], because
 // both folds need real token boundaries: whitespace removal glues
 // `... and char_length(` into `andchar_length(` and makes keyword
-// detection unsound. Literals are copied verbatim (both escape
-// conventions, via [rawLiteralEnd]) so nothing inside a value is folded.
+// detection unsound. Literals are copied verbatim (via [rawLiteralEnd],
+// whose only escape is the SQL-standard `”`) so nothing inside a value
+// is folded.
 func foldServerRenderings(expr string) string {
 	var sb strings.Builder
 	sb.Grow(len(expr))
@@ -219,14 +220,14 @@ func splitCastCall(expr string, i int) (inner string, next int, ok bool) {
 
 // rawLiteralEnd returns the index just past the single-quoted literal
 // starting at expr[i] — the scan twin of [decodeLiteral], for passes
-// that copy raw text instead of decoding it. Both escape conventions;
-// unterminated runs to end-of-string.
+// that copy raw text instead of decoding it. The only escape is the
+// SQL-standard doubled apostrophe (`”`); a backslash is an ORDINARY
+// value byte (see [decodeLiteral] for why). Unterminated runs to
+// end-of-string.
 func rawLiteralEnd(expr string, i int) int {
 	i++
 	for i < len(expr) {
 		switch {
-		case expr[i] == '\\' && i+1 < len(expr):
-			i += 2
 		case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
 			i += 2
 		case expr[i] == '\'':
@@ -320,11 +321,12 @@ func foldPGAnyArrayLists(s string) string {
 // everywhere EXCEPT inside a single-quoted literal, whose VALUE is
 // copied through unchanged (between [literalOpen] / [literalClose]).
 //
-// Literal scanning understands both escape conventions a CHECK
-// expression can arrive under: SQL's doubled-apostrophe form and
-// MySQL's backslash `\'`. Getting this wrong is not cosmetic — a mis-terminated
-// literal would fold the rest of the expression's case and could make a
-// tampered predicate canonicalize onto an honest one.
+// Literal scanning takes the value in the SQL-standard spelling both
+// diff inputs arrive under — apostrophes doubled (`”`), backslashes
+// literal (see [decodeLiteral]). Getting this wrong is not cosmetic — a
+// mis-terminated literal would fold the rest of the expression's case,
+// and dropping a backslash would make a tampered predicate canonicalize
+// onto an honest one (audit 2026-08-11, DIFF-1).
 func foldOutsideLiterals(expr string) string {
 	var sb strings.Builder
 	sb.Grow(len(expr))
@@ -359,11 +361,24 @@ func foldOutsideLiterals(expr string) string {
 // sentinel delimiters, and returns the index just past its closing
 // quote.
 //
-// Decoding rather than copying is what makes the two escape conventions
-// agree: an emitted literal that DOUBLES the apostrophe and a
-// MySQL-rendered one that writes `\'` carry
-// the same value and must canonicalize the same, or every regex DOMAIN
-// whose pattern contains an apostrophe reports phantom drift.
+// # Backslash is an ordinary value byte, not an escape (audit 2026-08-11, DIFF-1)
+//
+// Both diff inputs reach this pass in SQL-STANDARD spelling — apostrophes
+// doubled (`”`), everything else literal — so the only escape is `”`. The
+// MySQL reader's [mysql.renormalizeMySQLExpr] decodes the server's
+// C-style escaping and RE-EMITS each value with `”`-doubling only
+// (`strings.ReplaceAll(raw, "'", "”")`), leaving backslashes bare; PG's
+// `pg_get_constraintdef` is standard-conforming and does the same. So a
+// backslash inside a literal is a CHARACTER OF THE VALUE.
+//
+// The pre-fix code treated `\X` as a MySQL escape and dropped the
+// backslash. That made two genuinely different literals differing only by
+// an interior backslash — a weakened regex `'^a\d+$'` (digits required)
+// vs `'^ad+$'` (accepts `add`) — canonicalize EQUAL, so `schema diff`
+// certified a tampered/weakened CHECK as "in sync"; and it mis-scanned a
+// value ENDING in a backslash (`'a\'`), consuming the closing quote and
+// folding the following expression text into the value (the phantom-drift
+// mirror). Both directions are gone now that backslash is ordinary.
 //
 // An UNTERMINATED literal decodes to end-of-string and is still closed
 // with the sentinel: the expression is malformed, and the two sides then
@@ -374,12 +389,6 @@ func decodeLiteral(sb *strings.Builder, expr string, i int) int {
 	i++
 	for i < len(expr) {
 		switch {
-		case expr[i] == '\\' && i+1 < len(expr):
-			// MySQL escapes the quote as \' — the backslash is the
-			// escape, not a character of the value, so it is dropped and
-			// its target taken literally.
-			sb.WriteByte(expr[i+1])
-			i += 2
 		case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
 			sb.WriteByte('\'')
 			i += 2
