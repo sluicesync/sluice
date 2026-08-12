@@ -93,13 +93,22 @@ func isJSONNull(raw json.RawMessage) bool {
 // encoding/json.Unmarshal never errors on the two shapes it cannot represent
 // faithfully — it silently substitutes U+FFFD for each invalid-UTF-8 byte and
 // for each lone-surrogate \u escape. SQLite TEXT is byte-agnostic and legally
-// carries invalid UTF-8 (`CAST(x'FFFE61' AS TEXT)`), the trigger capture and
-// the D1 API pass those bytes through verbatim, and the cold-start snapshot
-// (direct rows.Scan) carries them faithfully — so the silent substitution here
-// made the SAME logical row diverge between the snapshot and CDC phases at
-// exit 0, with a mangled value no target could refuse (audit 2026-08-11
-// SQT-1, observed). Both vectors are refused loudly BEFORE Unmarshal; the
-// caller wraps the error with table/column/row context.
+// carries invalid UTF-8 (`CAST(x'FFFE61' AS TEXT)`), the local trigger
+// capture passes those bytes through verbatim (observed live by the audit),
+// and the cold-start snapshot (direct rows.Scan) carries them faithfully — so
+// the silent substitution here made the SAME logical row diverge between the
+// snapshot and CDC phases at exit 0, with a mangled value no target could
+// refuse (audit 2026-08-11 SQT-1). Both vectors are refused loudly BEFORE
+// Unmarshal; the caller wraps the error with table/column/row context.
+//
+// UNVERIFIED PREMISE (the D1 lane): whether Cloudflare's D1 /query API
+// returns invalid-UTF-8 TEXT bytes verbatim in its JSON response has NOT
+// been measured against real D1. If it does, this guard is the load-bearing
+// refusal there too; if D1 instead mangles server-side (V8 strings cannot
+// hold invalid UTF-8), the loss happens upstream of any client guard and
+// this refusal cannot fire for that vector on that lane — there is then no
+// independent expected value client-side. A live-D1 premise pin is filed in
+// docs/dev/audit-backlog.md (2026-08-12).
 func jsonString(raw json.RawMessage) (s string, ok bool, err error) {
 	if isJSONNull(raw) {
 		return "", false, nil

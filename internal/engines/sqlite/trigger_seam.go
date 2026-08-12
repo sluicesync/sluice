@@ -87,6 +87,20 @@ func ReconstructStorageValue(typeofText string, valueRaw json.RawMessage) (any, 
 	return d1StorageValue(typeofText, valueRaw)
 }
 
+// JSONStringValue is the exported handle to the GUARDED jsonString decode
+// (audit SQT-1): it refuses the two shapes encoding/json silently rewrites to
+// U+FFFD — raw invalid-UTF-8 bytes in the string token, and lone-surrogate
+// \u escapes — instead of delivering rewritten text. The d1-trigger CDC
+// transport extracts its change-log cells through this so the guard sits at
+// EVERY string extraction, not only the storage-value decode one layer down:
+// the before/after payloads it pulls are the captured row images, and a
+// mangle there would arrive at the (guarded) inner decode already valid
+// UTF-8 and pass — the exact one-layer-up sibling the pre-v0.122.0
+// value-fidelity review caught.
+func JSONStringValue(raw json.RawMessage) (s string, ok bool, err error) {
+	return jsonString(raw)
+}
+
 // CapturedCellDecoder decodes faithfully-captured (typeof, text/hex) cell pairs
 // for the sqlite-trigger CDC reader. It bundles the two reuse points the task
 // requires — the [ReconstructStorageValue] reconstruction AND the shared

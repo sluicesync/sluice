@@ -994,14 +994,16 @@ func (e *d1Executor) close() error { return nil }
 // d1CellString extracts a Go string from a JSON string cell. ok is false for a
 // JSON null/absent value (so the caller can distinguish absent from ""); a
 // non-string, non-null JSON value is an error.
+//
+// It delegates to the sqlite package's GUARDED extraction (audit SQT-1): the
+// before/after cells this transport pulls from the change log are the
+// captured row images, and an unguarded json.Unmarshal here silently
+// rewrote invalid UTF-8 to U+FFFD one layer ABOVE the guarded storage-value
+// decode — which then saw valid UTF-8 and passed the mangle. The catalog/
+// bookkeeping call sites (id/op/tbl/fingerprints/registry names) are ASCII
+// by construction and can never trip the guard.
 func d1CellString(raw json.RawMessage) (s string, ok bool, err error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return "", false, nil
-	}
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", false, err
-	}
-	return s, true, nil
+	return sqlite.JSONStringValue(raw)
 }
 
 // d1NullString maps a JSON string/null cell to a sql.NullString, matching the
