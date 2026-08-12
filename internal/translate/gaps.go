@@ -373,11 +373,12 @@ func RefuseOnLoudGaps(
 // dedupe for repeated calls in the same expression — operators
 // generally want the loud count anyway).
 //
-// The match is a word-boundary regex on the function-call shape
-// `\bNAME\s*\(`. Operator-form REGEXP (`x REGEXP 'pat'`) and RLIKE
-// are not detected — covering them would need a richer parser and
-// the function-form (REGEXP_LIKE) already surfaces 90% of the
-// regex divergence.
+// Call-form patterns match on the word-boundary regex `\bNAME\s*\(`;
+// operator-form patterns (`infix: true` — REGEXP and RLIKE, Bug 242)
+// match as bare word tokens through the same literal-aware scanner the
+// MySQL→PG refusal gate uses ([matchesInfixOperator]), so the advisory
+// and the refusal cannot disagree. (This doc previously claimed the
+// operator forms were "not detected"; Bug 242 is what that claim cost.)
 func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 	if expr == "" {
 		return nil
