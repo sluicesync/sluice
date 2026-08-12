@@ -81,9 +81,13 @@ func manifestRecordedSchemaProblems(m *irbackup.Manifest) []string {
 // and incremental manifests (Schema + SchemaDelta.After via
 // [manifestRecordedSchemaProblems]); retired segments sit outside the
 // restore path and are unscanned. A manifest this scan cannot read is
-// skipped without failing the maintenance op — the op reads the same
-// files on its own behalf moments later and fails loudly there, so the
-// skip cannot hide a read error.
+// skipped without failing the maintenance op. The skip suppresses at
+// most this ADVISORY, never a refusal: prune's own read of a restorable
+// incremental hard-fails on the same file, and an unreadable manifest
+// is refused loudly by restore/verify — but NOT every scanned manifest
+// is re-read by every op (prune does not read kept segment fulls), so
+// the skip is justified by the advisory's own stakes, not by a
+// guaranteed re-read.
 func warnIfChainRecordedSchemaMalformed(ctx context.Context, op string, store irbackup.Store, cat *lineage.Catalog) {
 	if cat == nil {
 		return

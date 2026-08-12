@@ -58,9 +58,9 @@ var manifestConsumerExempt = map[string]string{
 		"chain goes through checkChainReadable before the sources are deleted.",
 
 	"warnIfChainRecordedSchemaMalformed": "the Bug 243 maintenance-door WARN (compact/prune): reads each restorable manifest's " +
-		"recorded schema only to LEX it — applies nothing, decodes no chunks, and even skips a manifest it cannot " +
-		"read, because the maintenance op it advises reads the same files on its own behalf moments later under " +
-		"its own exemption's contract. Running restore's list here would turn an advisory into a refusal.",
+		"recorded schema only to LEX it — applies nothing, decodes no chunks, and skips a manifest it cannot read " +
+		"(the skip suppresses at most the advisory itself; an unreadable manifest is refused loudly by " +
+		"restore/verify, which hold the real gate). Running restore's list here would turn an advisory into a refusal.",
 
 	// --- chain maintenance (prune): drops the OLDEST end ---
 	"PruneChain": "prune reads manifests to decide which segments fall off the oldest end, and applies nothing. " +

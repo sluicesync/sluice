@@ -165,6 +165,36 @@ func TestApplyIncremental_FilterSkipsExcludedTableChanges_Bug244(t *testing.T) {
 			t.Errorf("applied = %d events; want all 8", len(eng.applied))
 		}
 	})
+
+	// The other half of the F1 × filter matrix (value-fidelity review,
+	// pre-v0.120.2): a GENUINELY truncated chain must still refuse WITH
+	// the filter active. Every pre-existing truncation pin runs
+	// unfiltered and the headline pin above runs filtered-and-complete,
+	// so a later "fix" that forges lastApplied/reachedEnd whenever the
+	// filter dropped events would pass them all — and a filtered restore
+	// of a tail-truncated chain would exit 0 with dropped events, the
+	// exact silent-loss class F1 exists to kill, on the DR path.
+	t.Run("filtered restore of a genuinely truncated chain still refuses", func(t *testing.T) {
+		store, err := blobcodec.NewLocalStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewLocalStore: %v", err)
+		}
+		link := b244SeedIncremental(t, store)
+		// EndPosition beyond anything the chunk stream carries — the
+		// truncated-chain shape, orthogonal to the filter.
+		link.Manifest.EndPosition = b244pos(8)
+		eng := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("mysql")}
+		applier, err := eng.OpenChangeApplier(ctx, "tgt")
+		if err != nil {
+			t.Fatalf("OpenChangeApplier: %v", err)
+		}
+		cr := &ChainRestore{Target: eng, TargetDSN: "tgt", Store: store, Filter: b244Filter(t, "dropme")}
+		err = cr.applyIncremental(ctx, link, applier, DefaultChainRestoreBatchSize)
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeBackupIncomplete {
+			t.Fatalf("err = %v; want %s — the filter must never absorb a real truncation", err, sluicecode.CodeBackupIncomplete)
+		}
+	})
 }
 
 // TestApplySchemaDeltas_FilterSkipsExcludedTable_Bug244 pins the delta
