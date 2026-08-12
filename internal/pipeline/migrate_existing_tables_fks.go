@@ -185,10 +185,16 @@ func (g *existingTablesGate) checkPreExistingForeignKeys(ctx context.Context, sc
 		return nil
 	}
 
+	// inScope and the catalog lookups all pass through the target's own
+	// table-name fold (audit 2026-08-11, PRF-2): actual is fold-keyed, and
+	// a foreign key read back from a folding target carries the target's
+	// (folded) parent spelling, so both the child lookup and the parent
+	// in-scope test must fold to meet the source-side names. A nil fold is
+	// identity, so a case-sensitive target is unchanged.
 	inScope := make(map[string]struct{}, len(schema.Tables))
 	for _, t := range schema.Tables {
 		if t != nil {
-			inScope[t.Name] = struct{}{}
+			inScope[g.foldKey(t.Name)] = struct{}{}
 		}
 	}
 
@@ -197,7 +203,7 @@ func (g *existingTablesGate) checkPreExistingForeignKeys(ctx context.Context, sc
 		if t == nil {
 			continue
 		}
-		act, exists := actual[t.Name]
+		act, exists := actual[g.foldKey(t.Name)]
 		if !exists || act == nil {
 			continue
 		}
@@ -212,7 +218,7 @@ func (g *existingTablesGate) checkPreExistingForeignKeys(ctx context.Context, sc
 			// counted as in-scope — the conservative direction (refuse),
 			// and the message names the constraint so the operator can see
 			// what was matched.
-			if _, parentInScope := inScope[fk.ReferencedTable]; parentInScope {
+			if _, parentInScope := inScope[g.foldKey(fk.ReferencedTable)]; parentInScope {
 				blocking = append(blocking, renderPreExistingFK(t.Name, fk))
 				continue
 			}

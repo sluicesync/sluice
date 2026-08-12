@@ -291,3 +291,28 @@ func TestFoldSQLiteIdentifierTouchesOnlyASCIIUpperCase(t *testing.T) {
 		}
 	}
 }
+
+// TestTargetTableNameFold_UsesSQLitesOwnFold pins that the pre-create shape
+// gate's fold surface (audit 2026-08-11, PRF-2) returns SQLite's OWN
+// identifier rule — folding ASCII case so `Orders` meets a pre-existing
+// `orders`, but NOT the non-ASCII case strings.ToLower would fold (the
+// item-150 over-refusal). A gate wired to ToLower instead would refuse legal
+// `Café`/`CAFÉ` pairs a real SQLite target keeps distinct.
+func TestTargetTableNameFold_UsesSQLitesOwnFold(t *testing.T) {
+	fold, err := Engine{}.TargetTableNameFold(context.Background(), "")
+	if err != nil {
+		t.Fatalf("TargetTableNameFold: %v", err)
+	}
+	if fold == nil {
+		t.Fatal("SQLite folds unconditionally; a nil (identity) fold would miss `Orders`/`orders`")
+	}
+	if got := fold("Orders"); got != "orders" {
+		t.Errorf("fold(%q) = %q; want the ASCII fold `orders` so the source table meets a stored `orders`", "Orders", got)
+	}
+	// The non-ASCII case must NOT fold: SQLite lowers the ASCII letters and
+	// leaves É byte-exact (`cafÉ_order`), where strings.ToLower would yield
+	// `café_order`. This is the item-150 regression guard.
+	if got := fold("CAFÉ_ORDER"); got != "cafÉ_order" {
+		t.Errorf("fold(%q) = %q; want SQLite's ASCII-only fold `cafÉ_order` (strings.ToLower would give `café_order` — Go's rule, not SQLite's)", "CAFÉ_ORDER", got)
+	}
+}

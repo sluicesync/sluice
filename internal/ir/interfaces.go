@@ -3680,6 +3680,47 @@ type TableNameFoldPreflighter interface {
 	PreflightTableNameFold(ctx context.Context, dsn string, s *Schema) error
 }
 
+// TargetTableNameFolder is the optional TARGET-engine surface that returns the
+// function the target compares TABLE identifiers under, resolving any live
+// server setting ONCE (audit 2026-08-11, PRF-2).
+//
+// # Why a THIRD fold surface, and what it does that the other two cannot
+//
+// [TableNameFoldPreflighter] answers "do two SOURCE tables fold onto one
+// name?" — source-against-source, deliberately never against the target
+// catalog (folding a `--resume` of `Orders` onto a target `orders` sluice's
+// own earlier run created would refuse a run for having worked). [NamespaceFolder]
+// folds one DATABASE name at a time for the multi-schema fan-out. Neither
+// lets the pre-create shape gate ask the question PRF-2 turns on: does this
+// source table fold onto a PRE-EXISTING, unrelated target table? That gate
+// reads the target catalog and shape-compares, so it CAN tell sluice's own
+// folded table (shapes match → skip the create, resume intact) from an
+// unrelated one (shapes differ → the existing shape-mismatch refusal) — but
+// only if it looks the catalog up under the target's fold. An exact,
+// case-sensitive lookup misses `Orders` against a stored `orders` entirely,
+// so `CREATE TABLE IF NOT EXISTS` silently no-ops and the copy lands the
+// source rows in the unrelated table (SQLite always folds; MySQL folds under
+// `lower_case_table_names != 0`).
+//
+// # Contract
+//
+// The returned fold is the TARGET's identifier-comparison rule, resolved with
+// one server read where the setting is a server property (MySQL's lct) and a
+// pure constant where it is an engine property (SQLite's ASCII fold). A nil
+// fold means IDENTITY — the target is case-sensitive and needs no folding, so
+// the caller compares byte-exactly (the same nil-is-identity convention the
+// namecollide package uses). dsn names the target server; its database
+// component is optional because a folding setting is global.
+//
+// The fold is the engine's own and is deliberately NOT shared across engines
+// — SQLite's is ASCII-only, MySQL's is the server's (non-ASCII case included),
+// Postgres has none and omits the method. Engines without the surface are
+// treated as identity; a read failure is the shape gate's documented
+// WARN-and-proceed fallback, never a new failure mode.
+type TargetTableNameFolder interface {
+	TargetTableNameFold(ctx context.Context, dsn string) (fold func(string) string, err error)
+}
+
 // ColumnTypeEmitPreflighter is the optional TARGET-engine surface that answers,
 // with no database connection and before any data moves, "can you render every
 // COLUMN TYPE in this schema?".

@@ -539,6 +539,23 @@ type recordingEngine struct {
 	// item 140's pre-existing-FK check reads
 	// BulkCopyBypassesForeignKeys through here).
 	caps ir.Capabilities
+	// tableNameFold / tableNameFoldErr script the optional
+	// [ir.TargetTableNameFolder] surface (audit 2026-08-11, PRF-2). Both nil
+	// is the default: TargetTableNameFold returns (nil, nil) — identity —
+	// so a target that declares neither behaves exactly as before, matching
+	// a case-sensitive engine. A test sets tableNameFold to a lowercaser to
+	// stand in for a folding target, or tableNameFoldErr to exercise the
+	// gate's WARN-and-fall-back-to-exact path.
+	tableNameFold    func(string) string
+	tableNameFoldErr error
+}
+
+// TargetTableNameFold implements [ir.TargetTableNameFolder] for the stub. A
+// recordingEngine that sets neither field is a case-sensitive target
+// (identity), so the pre-create gate stays byte-exact — the pre-PRF-2
+// behaviour every other test relies on.
+func (e *recordingEngine) TargetTableNameFold(_ context.Context, _ string) (func(string) string, error) {
+	return e.tableNameFold, e.tableNameFoldErr
 }
 
 func newRecordingEngine(name string) *recordingEngine {

@@ -92,9 +92,32 @@ type existingTablesGate struct {
 	// read (see readTargetTablesForShapeGate). Not exported and not
 	// safe to share: a gate value is constructed per run, used, and
 	// dropped.
+	//
+	// catalog is keyed by the TARGET's own identifier fold (foldFn) — a
+	// server-folding MySQL and SQLite key by their fold, everything else
+	// byte-exact — so a source table looked up through [existingTablesGate.foldKey]
+	// meets a pre-existing target table that differs only in case, instead
+	// of missing it and slipping the copy into it (audit 2026-08-11, PRF-2).
 	catalog     map[string]*ir.Table
 	catalogOK   bool
 	catalogRead bool
+
+	// foldFn is the target's TABLE-name comparison rule, resolved once with
+	// the catalog read; nil means identity (a case-sensitive target). Both
+	// the catalog keys above and every lookup into them pass through
+	// [existingTablesGate.foldKey], so the whole gate agrees on one fold.
+	foldFn func(string) string
+}
+
+// foldKey maps an identifier through the target's own table-name fold so a
+// lookup into the fold-keyed catalog compares the way the target compares. A
+// nil foldFn (a case-sensitive target, or a target with no fold surface) is
+// the identity, so non-folding targets stay byte-exact and unchanged.
+func (g *existingTablesGate) foldKey(name string) string {
+	if g.foldFn == nil {
+		return name
+	}
+	return g.foldFn(name)
 }
 
 // phasePlanExistingTables is the Migrator's thin delegate onto the
@@ -146,7 +169,7 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 	if !translate.HasStorageShapeMapping(g.Source.Name(), g.Target.Name()) {
 		var tolerated []string
 		for _, t := range schema.Tables {
-			if _, exists := actual[t.Name]; exists {
+			if _, exists := actual[g.foldKey(t.Name)]; exists {
 				tolerated = append(tolerated, t.Name)
 			}
 		}
@@ -200,7 +223,7 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 	skip := make(map[string]struct{})
 	var refusals []string
 	for _, t := range schema.Tables {
-		act, exists := actual[t.Name]
+		act, exists := actual[g.foldKey(t.Name)]
 		if !exists {
 			continue
 		}
@@ -216,6 +239,23 @@ func (g *existingTablesGate) plan(ctx context.Context, schema *ir.Schema) (*ir.S
 					slog.String("primary_key", pk))
 			}
 			skip[t.Name] = struct{}{}
+			if act.Name != t.Name {
+				// A fold-hit whose spellings DIFFER (audit 2026-08-11,
+				// PRF-2): the source table matched a pre-existing target
+				// table only under the server's identifier fold, so the copy
+				// will land these rows in a table with a different spelling.
+				// The shapes match, so this is exactly the resume/bootstrap
+				// case a folding MySQL produces (it stores sluice's own
+				// `Orders` as `orders`), which is why the run PROCEEDS rather
+				// than refusing — but a case-differing pre-existing table
+				// might instead be an unrelated one that folds onto this
+				// name, and merging into it must not be silent.
+				slog.WarnContext(ctx,
+					g.Mode+": source table folds onto a DIFFERENTLY-SPELLED pre-existing target table (the target folds identifier case) — the copy will land its rows in the existing table; if that table is unrelated rather than one an earlier sluice run created, --exclude-table this source table or rename it",
+					slog.String("source_table", t.Name),
+					slog.String("target_table", act.Name))
+				continue
+			}
 			slog.InfoContext(ctx,
 				g.Mode+": target table exists with matching column shape — skipping create",
 				slog.String("table", t.Name))
@@ -315,16 +355,41 @@ func (g *existingTablesGate) readTargetTablesUncached(ctx context.Context) (map[
 		warnFallback("read target schema", err)
 		return nil, false
 	}
+	g.foldFn = g.resolveTargetTableNameFold(ctx)
 	if actual == nil {
 		return nil, true
 	}
 	out := make(map[string]*ir.Table, len(actual.Tables))
 	for _, t := range actual.Tables {
 		if t != nil {
-			out[t.Name] = t
+			out[g.foldKey(t.Name)] = t
 		}
 	}
 	return out, true
+}
+
+// resolveTargetTableNameFold asks the target for the function it compares
+// TABLE identifiers under (audit 2026-08-11, PRF-2). A target without the
+// [ir.TargetTableNameFolder] surface, or one whose server does not fold,
+// returns nil — the identity — so the shape gate stays byte-exact on
+// case-sensitive targets exactly as before. A read failure is WARNed and
+// treated as identity: the gate must never invent a new failure mode, and
+// under-folding here degrades to the pre-fix exact-match behaviour rather
+// than blocking the run.
+func (g *existingTablesGate) resolveTargetTableNameFold(ctx context.Context) func(string) string {
+	folder, ok := g.Target.(ir.TargetTableNameFolder)
+	if !ok {
+		return nil
+	}
+	fold, err := folder.TargetTableNameFold(ctx, g.TargetDSN)
+	if err != nil {
+		slog.WarnContext(ctx,
+			g.Mode+": cannot read the target's identifier-fold setting — the pre-create shape gate falls back to a case-sensitive table match, so on a folding target a source table differing only in case from a pre-existing one may be tolerated without a shape compare; verify against `sluice schema preview` if in doubt",
+			slog.String("target_engine", g.Target.Name()),
+			slog.String("err", err.Error()))
+		return nil
+	}
+	return fold
 }
 
 // renderShapeMismatch renders one table's refusal fragment: the table

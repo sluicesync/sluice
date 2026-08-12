@@ -3,6 +3,18 @@
 
 package sqlite
 
+import (
+	"context"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// The SQLite engine answers the pre-create shape gate's "how do you compare
+// table names?" question (audit 2026-08-11, PRF-2). The pin is here, next to
+// the fold it returns, so a refactor that drops the method fails to compile
+// rather than silently reverting the gate to a case-sensitive lookup.
+var _ ir.TargetTableNameFolder = Engine{}
+
 // SQLite compares object names case-insensitively, and this file is the one
 // place that says what "case" means on this engine (roadmap item 150).
 //
@@ -72,4 +84,15 @@ func foldSQLiteIdentifier(name string) string {
 		return name
 	}
 	return string(folded)
+}
+
+// TargetTableNameFold implements [ir.TargetTableNameFolder]: SQLite folds
+// identifier ASCII case UNCONDITIONALLY (it is an engine property, not a
+// server setting), so the fold is always [foldSQLiteIdentifier] and dsn is
+// irrelevant. The pre-create shape gate uses it to look a source table up in
+// the target catalog under SQLite's own rule, so a source `Orders` meets a
+// pre-existing `orders` instead of slipping past `CREATE TABLE IF NOT EXISTS`
+// into it (audit 2026-08-11, PRF-2).
+func (Engine) TargetTableNameFold(_ context.Context, _ string) (func(string) string, error) {
+	return foldSQLiteIdentifier, nil
 }

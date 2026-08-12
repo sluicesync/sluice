@@ -674,6 +674,37 @@ func (e Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, er
 	return name, nil
 }
 
+// TargetTableNameFold implements [ir.TargetTableNameFolder]: it reports the
+// function this MySQL server compares TABLE identifiers under, reading
+// `lower_case_table_names` ONCE (memoized per server). lct != 0 ⇒ the server
+// folds and the fold is [foldMySQLIdentifier]; lct == 0 (the stock Linux
+// default) ⇒ names are case-sensitive and the fold is IDENTITY, returned as
+// nil so the caller compares byte-exactly.
+//
+// This is the TABLE axis of the same setting [Engine.FoldNamespace] reads for
+// the DATABASE axis. The pre-create shape gate uses the returned fold to look
+// a source table up in the target catalog under the server's own rule, so a
+// source `Orders` meets a pre-existing `orders` on a folding server instead of
+// slipping past `CREATE TABLE IF NOT EXISTS` into it (audit 2026-08-11, PRF-2).
+func (e Engine) TargetTableNameFold(ctx context.Context, dsn string) (func(string) string, error) {
+	lct, err := e.lowerCaseTableNames(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if lct != 0 {
+		return foldMySQLIdentifier, nil
+	}
+	return nil, nil
+}
+
+// The MySQL engine answers the pre-create shape gate's table-name-fold
+// question so a source table meets a pre-existing target table that differs
+// only in case on a folding server (audit 2026-08-11, PRF-2). The pin fails
+// the build if the method is dropped, rather than silently reverting the gate
+// to a case-sensitive lookup — the same guard [table_name_fold.go]'s
+// TableNameFoldPreflighter pin gives that axis.
+var _ ir.TargetTableNameFolder = Engine{}
+
 // DefaultExcludePatterns returns flavor-specific or DSN-derived
 // table patterns the orchestrator should merge into the operator's
 // exclude list (only when the operator hasn't supplied
