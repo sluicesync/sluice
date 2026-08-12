@@ -1176,6 +1176,14 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))
 		}
 	}
+	// Audit C-11: the stop/exit summary surfaces the durable
+	// unknown-target-table skip ledger, so a stream that ran while the
+	// target lacked a table never ends with a clean-looking exit.
+	// Fires on every non-error settle (graceful stop, Ctrl-C, clean
+	// close), reading through the outer ctx for the same reason as the
+	// stop-flag clear below. Failure-isolated — a summary read error
+	// must not fail an otherwise clean drain.
+	warnSkippedTablesOnSettle(ctx, applier, streamID)
 	// On a stop-signal-driven graceful drain, clear stop_requested_at
 	// so a CLI `sync stop --wait` polling for completion sees the
 	// cleared flag and returns success. Use the outer ctx because
@@ -1190,4 +1198,37 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 		}
 	}
 	return nil
+}
+
+// warnSkippedTablesOnSettle emits the audit-C-11 stop-summary WARN when
+// the settling stream's durable skip ledger is non-empty: one line
+// naming each skipped table, its cumulative count, and the remedy.
+// No-op (and silent) when the applier doesn't expose the ledger or the
+// stream has no skip rows; a read failure logs at DEBUG and never
+// affects the settle outcome.
+func warnSkippedTablesOnSettle(ctx context.Context, applier ir.ChangeApplier, streamID string) {
+	lister, ok := applier.(ir.SkippedTableLister)
+	if !ok {
+		return
+	}
+	records, err := lister.ListSkippedTables(ctx)
+	if err != nil {
+		slog.DebugContext(ctx, "skipped-tables summary read failed on settle",
+			slog.String("stream_id", streamID), slog.String("error", err.Error()))
+		return
+	}
+	for _, rec := range records {
+		if rec.StreamID != streamID || rec.SkipCount == 0 {
+			continue
+		}
+		slog.WarnContext(
+			ctx, "sync stream skipped CDC events for a table the target lacks (durably counted; `sluice sync health` trips while the count is nonzero)",
+			slog.String("stream_id", streamID),
+			slog.String("table", rec.Table),
+			slog.Int64("skipped_events", rec.SkipCount),
+			slog.String("first_skipped_position", rec.FirstPosition),
+			slog.String("last_skipped_position", rec.LastPosition),
+			slog.String("hint", ir.SkippedTableRemedy),
+		)
+	}
 }

@@ -115,6 +115,7 @@ var (
 	_ ir.ShardConsolidationLeaseLister  = (*ChangeApplier)(nil)
 	_ ir.ShardConsolidationLeaseStore   = (*ChangeApplier)(nil)
 	_ ir.ShardConsolidationProber       = (*ChangeApplier)(nil)
+	_ ir.SkippedTableLister             = (*ChangeApplier)(nil)
 	_ ir.SourceFingerprintRecorder      = (*ChangeApplier)(nil)
 	_ ir.StreamCleaner                  = (*ChangeApplier)(nil)
 	_ ir.StreamIDSetter                 = (*ChangeApplier)(nil)

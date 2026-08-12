@@ -182,6 +182,15 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 // replay. Unlike Postgres (which computes a conflict key during
 // dispatch), MySQL does not, so this runs a one-time information_schema
 // probe per table, cached.
+//
+// Named wart (audit C-11): a table the target LACKS also classifies
+// keyless here — the probe counts zero unique indexes without asking
+// whether the table exists — so its Insert takes the batch-of-1 path
+// and reaches the unknown-table skip in dispatch, possibly after one
+// misleading keyless WARN. That ordering is accepted: distinguishing
+// the two would cost an existence probe on every keyless-cache miss,
+// and the skip WARN + durable ledger that follow name the real
+// condition.
 func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
 	ins, ok := c.(ir.Insert)
 	if !ok {

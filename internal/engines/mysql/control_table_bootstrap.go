@@ -79,5 +79,6 @@ func (e Engine) ControlTableDDL() []ir.ControlTableStatement {
 		{Table: schemaHistoryTableName, DDL: schemaHistoryTableDDL("")},
 		{Table: shardConsolidationLeaseTableName, DDL: shardConsolidationLeaseTableDDL("")},
 		{Table: cdcQueryTimeoutRaiseTableName, DDL: cdcQueryTimeoutRaiseTableDDL("")},
+		{Table: skippedTablesTableName, DDL: skippedTablesTableDDL("")},
 	}
 }

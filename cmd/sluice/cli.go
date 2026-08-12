@@ -2607,10 +2607,51 @@ func (s *SyncStopCmd) Run(_ *Globals) error {
 	}
 	if !s.Wait {
 		fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; running process will drain and exit\n", s.StreamID)
+		printSkippedTablesSummary(ctx, applier, s.StreamID, os.Stdout)
 		return nil
 	}
 	fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; waiting for graceful drain (timeout %s)...\n", s.StreamID, s.Timeout)
-	return waitForStopComplete(ctx, applier, s.StreamID, s.Timeout)
+	err = waitForStopComplete(ctx, applier, s.StreamID, s.Timeout)
+	// Audit C-11: the stop summary surfaces the durable skip ledger —
+	// after the wait (or its timeout) so it reflects the drained
+	// stream's final counts.
+	printSkippedTablesSummary(ctx, applier, s.StreamID, os.Stdout)
+	return err
+}
+
+// printSkippedTablesSummary writes the audit-C-11 skip-ledger block for
+// one stream to the `sync stop` summary: each table the target lacked
+// while this stream carried changes for it, the cumulative skipped
+// count, and the remedy. Silent when the ledger is empty or the
+// applier doesn't expose it; a read failure prints a one-line notice
+// rather than failing the stop (the stop itself already succeeded).
+func printSkippedTablesSummary(ctx context.Context, applier ir.ChangeApplier, streamID string, out io.Writer) {
+	lister, ok := applier.(ir.SkippedTableLister)
+	if !ok {
+		return
+	}
+	records, err := lister.ListSkippedTables(ctx)
+	if err != nil {
+		fmt.Fprintf(out, "warning: could not read the skipped-tables ledger: %v\n", err)
+		return
+	}
+	printed := false
+	for _, rec := range records {
+		if rec.StreamID != streamID || rec.SkipCount == 0 {
+			continue
+		}
+		if !printed {
+			fmt.Fprintln(out, "this stream skipped CDC events for tables the target lacks (counted durably):")
+			printed = true
+		}
+		fmt.Fprintf(out, "  %s: %d skipped event(s), first position %s, last position %s\n",
+			rec.Table, rec.SkipCount,
+			truncatePositionToken(rec.FirstPosition, 40),
+			truncatePositionToken(rec.LastPosition, 40))
+	}
+	if printed {
+		fmt.Fprintf(out, "remedy: %s\n", ir.SkippedTableRemedy)
+	}
 }
 
 // stopFlagReader is the interface waitForStopComplete needs from the

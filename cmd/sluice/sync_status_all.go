@@ -24,9 +24,11 @@ func runStatusAllOnce(ctx context.Context, fleet *SyncFleetConfig, out io.Writer
 		return err
 	}
 	streams = filterStreams(streams, opts.StreamID)
-	// No consolidation leases in the fleet roll-up: leases are a
-	// per-target Shape-A surface, out of scope for the aggregate view.
-	return renderStatus(out, streams, nil, opts, time.Now())
+	// No consolidation leases and no C-11 skipped-table ledger in the
+	// fleet roll-up: both are per-target surfaces, out of scope for the
+	// aggregate view (same scope rule; the single-target `sync status`,
+	// the stop summary, and `sync health` carry the skip records).
+	return renderStatus(out, streams, nil, nil, opts, time.Now())
 }
 
 // runStatusAllWatch is the live-refresh fleet view. Mirrors

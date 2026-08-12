@@ -283,6 +283,14 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, ins.Table, err)
 	}
 	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, ins.Table)
+	if errors.Is(err, errUnknownTargetTable) {
+		// Audit C-11 defence-in-depth: a genuinely-missing table normally
+		// reaches the skip via applySerial → dispatch (the keyless probe
+		// classifies it keyless first), so this branch only fires on a
+		// cache-vs-catalog race — but the skip semantics must hold on
+		// every path that resolves table metadata.
+		return b.a.recordSkippedTable(ctx, streamID, "insert", schema, ins.Table, ins.Position.Token)
+	}
 	if err != nil {
 		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
 	}
@@ -343,6 +351,11 @@ func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir
 		return b.applySerial(ctx, streamID, c)
 	}
 	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, upd.Table)
+	if errors.Is(err, errUnknownTargetTable) {
+		// C-11 defence-in-depth; see dispatchInsert (a missing table
+		// normally routes via applySerial on the empty-PK check above).
+		return b.a.recordSkippedTable(ctx, streamID, "update", schema, upd.Table, upd.Position.Token)
+	}
 	if err != nil {
 		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, upd.Table, err)
 	}
@@ -393,6 +406,11 @@ func (b *mysqlBatchTx) dispatchDelete(ctx context.Context, streamID string, c ir
 		return b.applySerial(ctx, streamID, c)
 	}
 	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, del.Table)
+	if errors.Is(err, errUnknownTargetTable) {
+		// C-11 defence-in-depth; see dispatchInsert (a missing table
+		// normally routes via applySerial on the empty-PK check above).
+		return b.a.recordSkippedTable(ctx, streamID, "delete", schema, del.Table, del.Position.Token)
+	}
 	if err != nil {
 		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, del.Table, err)
 	}

@@ -54,6 +54,7 @@ func controlDDLs(t *testing.T) map[string]string {
 		shardConsolidationLeaseTableName: shardConsolidationLeaseTableDDL(""),
 		schemaHistoryTableName:           schemaHistoryTableDDL(""),
 		cdcQueryTimeoutRaiseTableName:    cdcQueryTimeoutRaiseTableDDL(""),
+		skippedTablesTableName:           skippedTablesTableDDL(""),
 		migrateStateTableName:            migrateStateHeaderDDL(),
 		migrateProgressTableName:         migrateProgressDDL(),
 		keysetTableName:                  keysetTableDDL(),

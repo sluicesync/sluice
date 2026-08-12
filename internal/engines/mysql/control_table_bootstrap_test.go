@@ -307,6 +307,7 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 		schemaHistoryTableName,
 		shardConsolidationLeaseTableName,
 		cdcQueryTimeoutRaiseTableName,
+		skippedTablesTableName,
 	}
 	if len(stmts) != len(wantTables) {
 		t.Fatalf("ControlTableDDL returned %d statements; want %d", len(stmts), len(wantTables))
@@ -337,6 +338,9 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 	}
 	if err := ensureCDCQueryTimeoutRaiseTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureCDCQueryTimeoutRaiseTable: %v", err)
+	}
+	if err := ensureSkippedTablesTable(ctx, db, ""); err != nil {
+		t.Fatalf("ensureSkippedTablesTable: %v", err)
 	}
 	if err := newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx); err != nil {
 		t.Fatalf("migrate-state EnsureControlTable: %v", err)

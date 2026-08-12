@@ -456,6 +456,14 @@ type ChangeApplier struct {
 	// resolve hits, NOT O(rows) or O(boundaries).
 	resolveCallsForTest atomic.Int64
 
+	// skipWarn tracks which unknown target tables have already had their
+	// once-per-applier-lifetime skip WARN (audit C-11). The durable
+	// per-event count lives in sluice_cdc_skipped_tables (see
+	// recordSkippedTable); this tracker only de-duplicates the log line.
+	// Internally locked — the ADR-0105 concurrent lanes reach the skip
+	// path from W goroutines.
+	skipWarn appliershared.SkipWarnTracker
+
 	// fkBypassOnce guards the one-time Bug-164 privilege probe; fkBypassOK
 	// caches whether the apply role may SET session_replication_role =
 	// replica (needs superuser / a role granted it). When true, every apply
@@ -928,7 +936,13 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 		if err := ensureSchemaHistoryTable(ctx, a.db, a.controlSchema); err != nil {
 			return err
 		}
-		return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlSchema)
+		if err := ensureShardConsolidationLeaseTable(ctx, a.db, a.controlSchema); err != nil {
+			return err
+		}
+		// Audit C-11: the unknown-target-table skip ledger. Additive; created
+		// empty and written only when a stream carries changes for a table
+		// the target lacks.
+		return ensureSkippedTablesTable(ctx, a.db, a.controlSchema)
 	})
 }
 
@@ -1042,6 +1056,18 @@ func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, err
 	// is nil-safe, so a successful list passes through unchanged.
 	streams, err := listStreams(ctx, a.db, a.controlSchema, engineNamePostgres)
 	return streams, classifyApplierError(err)
+}
+
+// ListSkippedTables implements [ir.SkippedTableLister] (audit C-11):
+// the durable unknown-target-table skip ledger, surfaced by `sync
+// status`, the `sync stop` summary, and `sync health` (a nonzero
+// skip count trips health). Tolerant of the table being absent (a
+// pre-upgrade or never-CDC'd target lists no skips).
+func (a *ChangeApplier) ListSkippedTables(ctx context.Context) ([]ir.SkippedTableRecord, error) {
+	// Same control-read transient classification as ListStreams;
+	// classifyApplierError is nil-safe.
+	records, err := listSkippedTables(ctx, a.db, a.controlSchema)
+	return records, classifyApplierError(err)
 }
 
 // RequestStop flips the stop flag on the named stream's row. The
@@ -1457,11 +1483,15 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 
 // errUnknownTable is the sentinel the colTypesFor lookup returns
 // when a CDC event references a table that doesn't exist on the
-// target. The applier skips such events with a warning rather than
-// erroring out (Bug 13 defence-in-depth — the primary fix is
-// scoping the publication to the source-side table list, but a
-// drifted publication or a manually-altered scope shouldn't crash
-// the whole stream).
+// target. The applier skips such events — WARN once per table, every
+// skip counted durably in sluice_cdc_skipped_tables (audit C-11; see
+// [ChangeApplier.recordSkippedTable]) — rather than erroring out
+// (Bug 13 defence-in-depth — the primary fix is scoping the
+// publication to the source-side table list, but a drifted
+// publication or a manually-altered scope shouldn't halt the whole
+// stream: the source still holds every skipped row, so the table is
+// recoverable with `schema add-table`, while a halt lags every table
+// and can outlive slot/binlog retention).
 var errUnknownTable = errors.New("postgres: applier: target table does not exist")
 
 // dispatch routes a single change to its SQL form on the open tx.
@@ -1513,8 +1543,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "insert", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -1532,8 +1561,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "update", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -1557,8 +1585,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "delete", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -1576,15 +1603,23 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 
 	case ir.Truncate:
 		schema := a.routedSchema(v.Schema)
+		// Resolve the table BEFORE executing, like every DML arm: a
+		// stale-publication TRUNCATE for a table the target lacks skips
+		// at metadata-resolution time. The pre-C-11 shape absorbed the
+		// exec-time 42P01 instead — which is unsound here, because the
+		// failed statement leaves the OPEN TX ABORTED and the position
+		// write that follows on the same tx then fails with 25P02, a
+		// poison-pill retry loop dressed up as a benign skip. An
+		// exec-time 42P01 (the probe-to-exec race) now surfaces loudly;
+		// the retry re-probes and converges to a clean skip.
+		if _, err := a.colTypesFor(ctx, schema, v.Table); err != nil {
+			if errors.Is(err, errUnknownTable) {
+				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+			}
+			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
 		stmt := buildTruncateSQL(schema, v.Table, v.Cascade, v.RestartIdentity)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
-			// Truncate of a missing table fails with "relation does
-			// not exist"; treat as a benign skip-with-warning so the
-			// stream survives a stale-publication TRUNCATE event.
-			if isMissingTableErr(err) {
-				logUnknownTable(ctx, "truncate", schema, v.Table)
-				return nil
-			}
 			return fmt.Errorf("postgres: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
@@ -1666,41 +1701,32 @@ func diagApplierInsertReceived(ctx context.Context, schema string, v ir.Insert) 
 	)
 }
 
-// logUnknownTable surfaces the skip-with-warning footprint for
-// events targeting a non-existent destination table. Operators
-// should see exactly one of these per unknown table per applier
-// lifetime (the column-type cache is populated on first miss with
-// the sentinel and skipped thereafter).
-func logUnknownTable(ctx context.Context, op, schema, table string) {
-	slog.WarnContext(
-		ctx, "postgres: applier: skipping CDC event for unknown target table",
-		slog.String("op", op),
-		slog.String("schema", schema),
-		slog.String("table", table),
-		slog.String("hint", "verify the publication is scoped to tables that exist on both source and target; re-run sluice migrate to add missing tables on the target"),
-	)
-}
-
-// isMissingTableErr reports whether err carries Postgres SQLSTATE 42P01
-// (undefined_table). The truncate dispatch uses it to recognise a
-// stale-publication TRUNCATE. It delegates to [isUndefinedTableErr], the
-// engine's one such classifier — which DOES take a dependency on pgconn's
-// error type, deliberately. (The previous doc here advertised the opposite,
-// "without taking a hard dependency on pgconn's error type", as a virtue; that
-// avoidance is precisely what forced the substring match below.)
+// recordSkippedTable is the audit-C-11 skip path: a CDC event targets
+// a table the destination lacks, so the applier drops it — WARN once
+// per table per applier lifetime (the durable count is what carries
+// the signal, not the log volume) — and counts it in the durable
+// sluice_cdc_skipped_tables ledger with the event's verbatim source
+// position token. Reached from EVERY apply path (serial dispatch, the
+// batched serial fallback, dispatchPipelined, and the ADR-0105
+// concurrent lanes, which all funnel through those two dispatchers).
 //
-// It used to match the substrings "42P01" OR "does not exist", which is the
-// audit-backlog C-1 defect in its most dangerous position: this site SWALLOWS
-// the error. "does not exist" is PostgreSQL's house phrasing for a family of
-// unrelated conditions, and the one that matters here is SQLSTATE 3D000 —
-// `FATAL: database "app" does not exist`, which a pooled *sql.DB can surface
-// from any statement after a re-dial. Under the old text match a TRUNCATE
-// against a vanished DATABASE was read as "the table is gone, skip it", logged
-// as a benign stale-publication event, and the stream continued as though the
-// truncate had happened. Two independent sweeps flagged this site on the same
-// day; it is the last one of its shape in this engine.
-func isMissingTableErr(err error) bool {
-	return isUndefinedTableErr(err)
+// The upsert runs on the primary pool OUTSIDE the apply tx — one
+// implementation for every path (the pipelined path has no *sql.Tx to
+// ride), durable even if the surrounding batch later rolls back (the
+// skip did happen; a retry re-skips and re-counts, so the ledger is
+// at-least-once). A failed upsert FAILS the apply loudly: the decision
+// requires skips to be durable and health-visible, never log-only, so
+// an unrecordable skip must not pass silently. classifyApplierError
+// keeps a transient control-write failure retriable.
+func (a *ChangeApplier) recordSkippedTable(ctx context.Context, streamID, op, schema, table, posToken string) error {
+	qn := schemaTableKey(schema, table)
+	if a.skipWarn.FirstSighting(qn) {
+		appliershared.WarnSkippedTable(ctx, "postgres", op, qn)
+	}
+	if err := upsertSkippedTable(ctx, a.db, a.controlSchema, streamID, qn, posToken); err != nil {
+		return classifyApplierError(err)
+	}
+	return nil
 }
 
 // logZeroRowsAffected emits a debug-level log line when a target Exec

@@ -136,6 +136,20 @@ or anyone who wants the strict fail-fast behaviour, can opt out with
 failover under throttler load can widen the envelope, e.g.
 `--apply-retry-attempts=20`.
 
+## Tables the target lacks: skip-and-count, never halt
+
+When the stream carries changes for a table the **target** doesn't have — a drifted publication scope, a table the operator dropped on the target, a keyspace-wide binlog stream whose target was migrated with `--include-table` — every engine's applier **skips those events** instead of halting the stream. The choice is deliberate, because the blast radius is inverted: the source still holds every skipped row, so a skipped table is always recoverable with `sluice schema add-table` (a fresh table snapshot), while a halted stream lags *every* table and — if the halt outlives binlog/slot retention — loses the resume position itself, converting one table's drift into a whole-database re-snapshot.
+
+A skip is never log-only:
+
+- The applier **WARNs once per table** (not once per event) with the remedy.
+- **Every skipped event is counted durably** in the per-target `sluice_cdc_skipped_tables` control table: one row per (stream, table) with the cumulative count and the first/last skipped source position tokens, surviving restarts.
+- `sluice sync status` renders the ledger (`SKIPPED TABLES` block; `skipped_tables` in `--format json`), the `sync stop` summary and the stream's exit log repeat it, and **`sluice sync health` exits 1 while any skip count is nonzero** — there is no threshold flag, because skipped tables only resolve through operator action.
+
+The remedy is always one of two explicit choices: re-attach the table with `sluice schema add-table` (fresh table snapshot — nothing was lost; the source still holds every row), or make the exclusion explicit with a table filter so the stream no longer carries the table at all.
+
+The skip resolves when the applier looks the table up (metadata resolution). A table that vanishes *mid-stream after rows were already applied to it* is a different condition and still fails loudly at execution time — destroying replicated state out from under a running stream deserves a halt, and on the batched apply paths a failed statement aborts the whole batch transaction anyway.
+
 ## Foreign keys during CDC apply
 
 A CDC change stream is **not foreign-key-dependency-ordered**, so the

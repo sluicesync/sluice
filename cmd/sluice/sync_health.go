@@ -85,6 +85,25 @@ type HealthResult struct {
 	// 0 a careless reader could mistake for "definitely no spill."
 	SpillTxns  *int64 `json:"spill_txns,omitempty"`
 	SpillBytes *int64 `json:"spill_bytes,omitempty"`
+
+	// Skipped-table ledger (audit C-11): the stream's durable
+	// unknown-target-table skip records. A nonzero total TRIPS the
+	// health check (exit 1) unconditionally — unlike the staleness
+	// gauges there is no threshold flag, because a skipped table is
+	// operator-induced drift that only add-table or an explicit filter
+	// resolves.
+	SkippedTables        []SkippedTableHealth `json:"skipped_tables,omitempty"`
+	SkippedEventsTotal   int64                `json:"skipped_events_total,omitempty"`
+	SkippedTablesTripped bool                 `json:"skipped_tables_tripped,omitempty"`
+}
+
+// SkippedTableHealth is one C-11 skip-ledger row in the health output.
+type SkippedTableHealth struct {
+	Table         string `json:"table"`
+	SkipCount     int64  `json:"skip_count"`
+	FirstPosition string `json:"first_position"`
+	LastPosition  string `json:"last_position"`
+	LastSkippedAt string `json:"last_skipped_at"`
 }
 
 // Run implements `sluice sync health`. Same boilerplate shape as
@@ -125,6 +144,20 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 
 	result := evaluateHealth(streams, s.StreamID, s.MaxStaleSeconds, time.Now())
 
+	// Audit C-11: fold the stream's durable unknown-target-table skip
+	// ledger into the health verdict — a nonzero count trips (exit 1).
+	// A ledger read failure is an operational error, same class as the
+	// stream-list read above: health must never report "no skips" it
+	// could not actually verify.
+	if lister, ok := applier.(ir.SkippedTableLister); ok {
+		records, err := lister.ListSkippedTables(ctx)
+		if err != nil {
+			runErr = err
+			return operationalError{err: fmt.Errorf("list skipped tables: %w", err)}
+		}
+		applySkippedTablesHealth(&result, records, s.StreamID)
+	}
+
 	// Optional source-side probe (v0.15.0, fixed in v0.15.1 / Bug 32).
 	// Only fires when the operator supplied both --source-driver AND
 	// --source. Errors here populate SourceProbeReason but don't fail
@@ -164,8 +197,52 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		return staleStreamError{streamID: s.StreamID, secondsAgo: result.SecondsSinceLastApply, threshold: s.MaxStaleSeconds}
 	case result.LagBytesStale:
 		return staleStreamError{streamID: s.StreamID, lagBytes: result.LagBytes, lagThreshold: s.MaxLagBytes}
+	case result.SkippedTablesTripped:
+		return skippedTablesError{streamID: s.StreamID, result: result}
 	}
 	return nil
+}
+
+// applySkippedTablesHealth folds the C-11 skip ledger into the health
+// result: the stream's rows, the total, and the trip flag (nonzero
+// total ⇒ tripped). Pure function — testable (and mutation-runnable)
+// without a live target.
+func applySkippedTablesHealth(r *HealthResult, records []ir.SkippedTableRecord, streamID string) {
+	for _, rec := range records {
+		if rec.StreamID != streamID || rec.SkipCount == 0 {
+			continue
+		}
+		r.SkippedTables = append(r.SkippedTables, SkippedTableHealth{
+			Table:         rec.Table,
+			SkipCount:     rec.SkipCount,
+			FirstPosition: rec.FirstPosition,
+			LastPosition:  rec.LastPosition,
+			LastSkippedAt: rec.LastSkippedAt.UTC().Format(time.RFC3339),
+		})
+		r.SkippedEventsTotal += rec.SkipCount
+	}
+	if r.SkippedEventsTotal > 0 {
+		r.SkippedTablesTripped = true
+	}
+}
+
+// skippedTablesError signals "the stream skipped CDC events for tables
+// the target lacks" with exit code 1 — the same alerting class as
+// staleStreamError, naming every table and the remedy.
+type skippedTablesError struct {
+	streamID string
+	result   HealthResult
+}
+
+func (skippedTablesError) ExitCode() int { return 1 }
+
+func (e skippedTablesError) Error() string {
+	tables := make([]string, 0, len(e.result.SkippedTables))
+	for _, t := range e.result.SkippedTables {
+		tables = append(tables, fmt.Sprintf("%s (%d)", t.Table, t.SkipCount))
+	}
+	return fmt.Sprintf("stream %q skipped %d CDC event(s) for table(s) the target lacks: %s — %s",
+		e.streamID, e.result.SkippedEventsTotal, strings.Join(tables, ", "), ir.SkippedTableRemedy)
 }
 
 // probeSource opens a SchemaReader on the source DSN, type-asserts
@@ -326,6 +403,8 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		state = fmt.Sprintf("STALE (last apply %ds ago, threshold %ds)", r.SecondsSinceLastApply, r.Threshold)
 	case r.LagBytesStale:
 		state = fmt.Sprintf("STALE (lag %d bytes, threshold %d)", r.LagBytes, r.LagThreshold)
+	case r.SkippedTablesTripped:
+		state = fmt.Sprintf("SKIPPING (%d event(s) skipped for %d table(s) the target lacks)", r.SkippedEventsTotal, len(r.SkippedTables))
 	}
 	if _, err := fmt.Fprintf(w,
 		"stream: %s\nfound: true\nstate: %s\nposition: %s\nupdated_at: %s\nseconds_since_last_apply: %d\n",
@@ -355,6 +434,18 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		}
 	} else if r.SourceProbeReason != "" {
 		if _, err := fmt.Fprintf(w, "source_probe: skipped (%s)\n", r.SourceProbeReason); err != nil {
+			return err
+		}
+	}
+	// Audit C-11: the skip-ledger block. Absent lines when the ledger
+	// is empty, matching the JSON omitempty shape.
+	for _, t := range r.SkippedTables {
+		if _, err := fmt.Fprintf(w, "skipped_table: %s count=%d last_skipped_at=%s\n", t.Table, t.SkipCount, t.LastSkippedAt); err != nil {
+			return err
+		}
+	}
+	if r.SkippedTablesTripped {
+		if _, err := fmt.Fprintf(w, "skipped_tables_remedy: %s\n", ir.SkippedTableRemedy); err != nil {
 			return err
 		}
 	}

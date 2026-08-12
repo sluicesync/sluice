@@ -332,6 +332,14 @@ type ChangeApplier struct {
 	// is one round-trip; hit is a map lookup.
 	colTypeCache map[string]map[string]*ir.Column
 
+	// skipWarn tracks which unknown target tables have already had their
+	// once-per-applier-lifetime skip WARN (audit C-11). The durable
+	// per-event count lives in sluice_cdc_skipped_tables (see
+	// recordSkippedTable); this tracker only de-duplicates the log line.
+	// Internally locked — the ADR-0104 concurrent lanes reach the skip
+	// path from W goroutines.
+	skipWarn appliershared.SkipWarnTracker
+
 	// maxBufferBytes is the soft byte-size cap on the in-flight
 	// batch's buffered change values during ApplyBatch. Implements
 	// [ir.MaxBufferBytesSetter] via [SetMaxBufferBytes]. Zero or
@@ -855,7 +863,13 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	// for the query-timeout raise, created here so it exists before the
 	// cold-start copy can raise. Additive; a no-op on a same-engine MySQL→MySQL
 	// sync that never raises (the table is created but never written).
-	return ensureCDCQueryTimeoutRaiseTable(ctx, a.db, a.controlKeyspace)
+	if err := ensureCDCQueryTimeoutRaiseTable(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
+	// Audit C-11: the unknown-target-table skip ledger. Additive; created
+	// empty and written only when a stream carries changes for a table
+	// the target lacks.
+	return ensureSkippedTablesTable(ctx, a.db, a.controlKeyspace)
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]
@@ -892,6 +906,15 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 // fresh target should see "no streams" rather than an error.
 func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, error) {
 	return listStreams(ctx, a.db, a.controlKeyspace, engineNameMySQL)
+}
+
+// ListSkippedTables implements [ir.SkippedTableLister] (audit C-11):
+// the durable unknown-target-table skip ledger, surfaced by `sync
+// status`, the `sync stop` summary, and `sync health` (a nonzero skip
+// count trips health). Tolerant of the table being absent (a
+// pre-upgrade or never-CDC'd target lists no skips).
+func (a *ChangeApplier) ListSkippedTables(ctx context.Context) ([]ir.SkippedTableRecord, error) {
+	return listSkippedTables(ctx, a.db, a.controlKeyspace)
 }
 
 // RequestStop flips the stop flag on the named stream's row. The
@@ -1285,6 +1308,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 			return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
+		if errors.Is(err, errUnknownTargetTable) {
+			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
+		}
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1300,6 +1326,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 	case ir.Update:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
+		if errors.Is(err, errUnknownTargetTable) {
+			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
+		}
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1326,6 +1355,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 	case ir.Delete:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
+		if errors.Is(err, errUnknownTargetTable) {
+			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
+		}
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1361,9 +1393,22 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 				slog.Bool("source_restart_identity", v.RestartIdentity),
 			)
 		}
-		stmt := buildTruncateSQL(a.routedSchema(v.Schema), v.Table)
+		// Audit C-11: resolve the table BEFORE executing, like the DML
+		// arms — a stale-scope TRUNCATE for a table the target lacks
+		// skips with the durable counter instead of halting the stream.
+		// An exec-time 1146 (the probe-to-exec race) stays loud; the
+		// retry re-probes and converges to a clean skip. Mirrors the
+		// Postgres truncate arm.
+		schema := a.routedSchema(v.Schema)
+		if _, err := a.colTypesFor(ctx, tx, schema, v.Table); err != nil {
+			if errors.Is(err, errUnknownTargetTable) {
+				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+			}
+			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt := buildTruncateSQL(schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
-			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", a.routedSchema(v.Schema), v.Table, err)
+			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
 
@@ -1534,6 +1579,61 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 	return pk, nil
 }
 
+// errUnknownTargetTable is the sentinel colTypesFor wraps when a CDC
+// event references a table that doesn't exist on the target. The
+// applier skips such events — WARN once per table, every skip counted
+// durably in sluice_cdc_skipped_tables (audit C-11; see
+// [ChangeApplier.recordSkippedTable]) — instead of halting: the source
+// still holds every skipped row, so the table is recoverable with
+// `schema add-table`, while a halted stream lags every table and can
+// outlive binlog retention, losing the position itself. Mirror of the
+// Postgres applier's errUnknownTable (this fix is what closed the
+// halt-vs-skip asymmetry between the two engines).
+var errUnknownTargetTable = errors.New("mysql: applier: target table does not exist")
+
+// targetTableExists reports whether schema.table exists on the target,
+// via information_schema.TABLES. It is the structural classifier
+// behind [errUnknownTargetTable] — consulted only on colTypesFor's
+// error path, so the steady state pays nothing.
+func targetTableExists(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
+	const q = `SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE table_schema = ? AND table_name = ?`
+	var n int
+	if err := db.QueryRowContext(ctx, q, schema, table).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// recordSkippedTable is the audit-C-11 skip path: a CDC event targets
+// a table the destination lacks, so the applier drops it — WARN once
+// per table per applier lifetime (the durable count carries the
+// signal, not the log volume) — and counts it in the durable
+// sluice_cdc_skipped_tables ledger with the event's verbatim source
+// position token. Reached from EVERY apply path: the serial dispatch
+// arms, the ADR-0139/0140 coalescing batch (whose per-kind dispatchers
+// either hit the same colTypesFor sentinel or funnel through
+// applySerial → dispatch), and the ADR-0104 concurrent lanes (which
+// drive the same coalescing dispatcher per lane).
+//
+// The upsert runs on the primary pool OUTSIDE the apply tx — one
+// implementation for every path, durable even if the surrounding batch
+// later rolls back (the skip did happen; a retry re-skips and
+// re-counts, so the ledger is at-least-once). A failed upsert FAILS
+// the apply loudly: skips must be durable and health-visible, never
+// log-only. classifyApplierError keeps a transient control-write
+// failure retriable.
+func (a *ChangeApplier) recordSkippedTable(ctx context.Context, streamID, op, schema, table, posToken string) error {
+	qn := qualifiedName(schema, table)
+	if a.skipWarn.FirstSighting(qn) {
+		appliershared.WarnSkippedTable(ctx, "mysql", op, qn)
+	}
+	if err := upsertSkippedTable(ctx, a.db, a.controlKeyspace, streamID, qn, posToken, a.upsert); err != nil {
+		return classifyApplierError(err)
+	}
+	return nil
+}
+
 // colTypesFor returns the cached column-name → IR type map for the
 // named table, loading it on the first sight of the table. The map
 // is consulted for every value the applier binds so prepareValue can
@@ -1561,6 +1661,14 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	// verbatim for the lookup; the routing decision lives in the caller.
 	tbl, err := loadTableSchema(ctx, a.db, schema, table, a.flavor)
 	if err != nil {
+		// Audit C-11: classify "the target lacks this table" STRUCTURALLY
+		// (an information_schema.TABLES existence probe — never the error
+		// text, the missing_table.go C-1 lesson) so dispatch can skip the
+		// event with the durable counter instead of halting the stream.
+		// A failed probe propagates the ORIGINAL error: refuse to guess.
+		if exists, exErr := targetTableExists(ctx, a.db, schema, table); exErr == nil && !exists {
+			return nil, fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
+		}
 		return nil, err
 	}
 	out := make(map[string]*ir.Column, len(tbl.Columns))

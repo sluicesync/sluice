@@ -57,7 +57,33 @@ func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, out io.Writer,
 			return fmt.Errorf("list shard consolidation leases: %w", err)
 		}
 	}
-	return renderStatus(out, streams, leases, opts, time.Now())
+	// Audit C-11: query the durable unknown-target-table skip ledger
+	// when the engine implements [ir.SkippedTableLister], filtered the
+	// same way as the streams. Empty ledger = no block (the common
+	// healthy shape).
+	var skips []ir.SkippedTableRecord
+	if lister, ok := applier.(ir.SkippedTableLister); ok {
+		skips, err = lister.ListSkippedTables(ctx)
+		if err != nil {
+			return fmt.Errorf("list skipped tables: %w", err)
+		}
+		skips = filterSkippedTables(skips, opts.StreamID)
+	}
+	return renderStatus(out, streams, leases, skips, opts, time.Now())
+}
+
+// filterSkippedTables mirrors filterStreams for the C-11 skip ledger.
+func filterSkippedTables(records []ir.SkippedTableRecord, streamID string) []ir.SkippedTableRecord {
+	if streamID == "" {
+		return records
+	}
+	out := records[:0]
+	for _, rec := range records {
+		if rec.StreamID == streamID {
+			out = append(out, rec)
+		}
+	}
+	return out
 }
 
 // runStatusWatch is the live-refresh path: re-query and re-render at
@@ -138,7 +164,7 @@ func filterStreams(streams []ir.StreamStatus, streamID string) []ir.StreamStatus
 // renderStatus dispatches by format. Single entry point so the watch
 // loop and the one-shot path share identical rendering logic; tests
 // drive it directly.
-func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, opts statusRenderOpts, now time.Time) error {
+func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, opts statusRenderOpts, now time.Time) error {
 	// Sort for stable output across runs. Most-recently-updated first
 	// matches the operator's interest ("what's been moving?").
 	sort.Slice(streams, func(i, j int) bool {
@@ -147,9 +173,9 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardCon
 
 	switch opts.Format {
 	case "", "text":
-		return renderStatusText(out, streams, leases, opts, now)
+		return renderStatusText(out, streams, leases, skips, opts, now)
 	case "json":
-		return renderStatusJSON(out, streams, leases, opts, now)
+		return renderStatusJSON(out, streams, leases, skips, opts, now)
 	default:
 		return fmt.Errorf("unknown --format %q (want text or json)", opts.Format)
 	}
@@ -158,9 +184,14 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardCon
 // renderStatusText is the human-readable tabwriter path. Keeps the
 // pre-refactor output shape exactly when --summary is off, so
 // existing scripts that parsed the text output still work.
-func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, opts statusRenderOpts, now time.Time) error {
+func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, opts statusRenderOpts, now time.Time) error {
 	if len(streams) == 0 {
-		return writeEmptyText(out, opts.StreamID)
+		if err := writeEmptyText(out, opts.StreamID); err != nil {
+			return err
+		}
+		// A cleared stream can leave its C-11 skip ledger behind; the
+		// ledger still renders so the drift stays visible.
+		return writeSkippedTablesText(out, skips)
 	}
 
 	if opts.Summary {
@@ -199,7 +230,41 @@ func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 			return err
 		}
 	}
-	return nil
+	return writeSkippedTablesText(out, skips)
+}
+
+// writeSkippedTablesText appends the audit-C-11 skip-ledger block:
+// one row per (stream, table) the target lacked while its stream
+// carried changes for it, plus the remedy. Silent when the ledger is
+// empty — the common healthy shape.
+func writeSkippedTablesText(out io.Writer, skips []ir.SkippedTableRecord) error {
+	if len(skips) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(out, "\nSKIPPED TABLES (target lacks them; every skipped event is counted durably):"); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "STREAM\tTABLE\tSKIPPED\tFIRST\tLAST"); err != nil {
+		return err
+	}
+	for _, rec := range skips {
+		if _, err := fmt.Fprintf(
+			tw, "%s\t%s\t%d\t%s\t%s\n",
+			rec.StreamID,
+			rec.Table,
+			rec.SkipCount,
+			rec.FirstSkippedAt.UTC().Format(time.RFC3339),
+			rec.LastSkippedAt.UTC().Format(time.RFC3339),
+		); err != nil {
+			return err
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(out, "remedy: %s\n", ir.SkippedTableRemedy)
+	return err
 }
 
 // classifyLeaseForJSON returns the textual state label for a lease
@@ -306,7 +371,7 @@ func agesSpan(streams []ir.StreamStatus, now time.Time) (oldest, newest time.Dur
 // "scriptable output should always include aggregates" is the more
 // useful default). Field names match Go's json:"" tag conventions
 // (snake_case for JSON) so jq pipes are predictable.
-func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, _ statusRenderOpts, now time.Time) error {
+func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, _ statusRenderOpts, now time.Time) error {
 	type jsonPosition struct {
 		Engine string `json:"engine"`
 		Token  string `json:"token"`
@@ -338,11 +403,24 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		AppliedSchemaVersion int64  `json:"applied_schema_version"`
 		AppliedAt            string `json:"applied_at,omitempty"`
 	}
+	// Audit C-11 — per-skipped-table block. Field names mirror the
+	// sluice_cdc_skipped_tables columns for jq predictability; the
+	// position tokens are the verbatim stored values.
+	type jsonSkippedTable struct {
+		StreamID       string `json:"stream_id"`
+		Table          string `json:"table"`
+		SkipCount      int64  `json:"skip_count"`
+		FirstPosition  string `json:"first_position"`
+		LastPosition   string `json:"last_position"`
+		FirstSkippedAt string `json:"first_skipped_at"`
+		LastSkippedAt  string `json:"last_skipped_at"`
+	}
 	type jsonDoc struct {
-		GeneratedAt time.Time    `json:"generated_at"`
-		Summary     jsonSummary  `json:"summary"`
-		Streams     []jsonStream `json:"streams"`
-		Leases      []jsonLease  `json:"consolidation_leases,omitempty"`
+		GeneratedAt time.Time          `json:"generated_at"`
+		Summary     jsonSummary        `json:"summary"`
+		Streams     []jsonStream       `json:"streams"`
+		Leases      []jsonLease        `json:"consolidation_leases,omitempty"`
+		Skipped     []jsonSkippedTable `json:"skipped_tables,omitempty"`
 	}
 
 	out2 := make([]jsonStream, 0, len(streams))
@@ -379,6 +457,18 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		}
 		leasesJSON = append(leasesJSON, entry)
 	}
+	skipsJSON := make([]jsonSkippedTable, 0, len(skips))
+	for _, rec := range skips {
+		skipsJSON = append(skipsJSON, jsonSkippedTable{
+			StreamID:       rec.StreamID,
+			Table:          rec.Table,
+			SkipCount:      rec.SkipCount,
+			FirstPosition:  rec.FirstPosition,
+			LastPosition:   rec.LastPosition,
+			FirstSkippedAt: rec.FirstSkippedAt.UTC().Format(time.RFC3339),
+			LastSkippedAt:  rec.LastSkippedAt.UTC().Format(time.RFC3339),
+		})
+	}
 	doc := jsonDoc{
 		GeneratedAt: now.UTC(),
 		Summary: jsonSummary{
@@ -388,6 +478,7 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		},
 		Streams: out2,
 		Leases:  leasesJSON,
+		Skipped: skipsJSON,
 	}
 
 	// Indent for human-skimmable scripted output. jq pipes don't care

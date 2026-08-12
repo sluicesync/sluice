@@ -29,6 +29,12 @@ const controlTableName = appliershared.ControlTableName
 // consolidated target table). See ensureShardConsolidationLeaseTable.
 const shardConsolidationLeaseTableName = appliershared.ShardConsolidationLeaseTableName
 
+// skippedTablesTableName is the audit-C-11 per-target control table
+// that holds the durable unknown-target-table skip ledger: one row per
+// (stream_id, table_name), counting every CDC event skipped because
+// the target lacks the table. See ensureSkippedTablesTable.
+const skippedTablesTableName = appliershared.SkippedTablesTableName
+
 // controlCfg is the ADR-0081 tier-c dialect seam for the shared
 // control-table CRUD in internal/appliershared: the engine-constant
 // leaves (error prefix, the Error-1146 missing-table classifier, the
@@ -375,6 +381,87 @@ func controlTableExists(ctx context.Context, db *sql.DB, controlKeyspace, table 
 		return false, fmt.Errorf("detect %s: %w", table, err)
 	}
 	return n > 0, nil
+}
+
+// ensureSkippedTablesTable creates the audit-C-11 skip ledger if it
+// doesn't exist. Idempotent; strictly additive. Detect-then-create
+// (roadmap item 66): a PlanetScale safe-migrations branch refuses
+// every direct DDL statement, so the exists-already path must issue no
+// DDL at all; a genuinely-needed CREATE that is refused classifies
+// into the coded bootstrap refusal naming the deploy-ddl channel. The
+// table is written only when a stream actually carries changes for a
+// table the target lacks, so on a healthy sync it is created empty
+// and never grows.
+func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	exists, err := controlTableExists(ctx, db, controlKeyspace, skippedTablesTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure skipped-tables table: %w", err)
+	}
+	if exists {
+		warnLegacyControlTableCollation(ctx, db, controlKeyspace, skippedTablesTableName, "stream_id", "table_name")
+		return nil
+	}
+	ddl := skippedTablesTableDDL(controlKeyspace)
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("mysql: ensure skipped-tables table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
+	}
+	return nil
+}
+
+// skippedTablesTableDDL renders the sluice_cdc_skipped_tables CREATE
+// statement — single-sourced for [ensureSkippedTablesTable] and the
+// bootstrap printer ([Engine.ControlTableDDL], ADR-0165).
+//
+// Column notes: (stream_id, table_name) follow the VARCHAR(255) +
+// utf8mb4_bin identifier-key convention (ADR-0007 width; the binary
+// collation keeps `Foo` and `foo` as two ledger rows — see the
+// controlIdentifierCollation block comment); first_position /
+// last_position are LONGTEXT because the engine-opaque position token
+// is a GTID/VGTID set that can exceed TEXT's 64 KB (the same reason
+// sluice_cdc_state.source_position is LONGTEXT, item 65a), stored
+// VERBATIM — a persisted round-trip surface, never parsed here.
+func skippedTablesTableDDL(controlKeyspace string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, skippedTablesTableName) + ` (
+	stream_id        VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	table_name       VARCHAR(255) ` + controlIdentifierCollateClause + ` NOT NULL,
+	skip_count       BIGINT       NOT NULL,
+	first_position   LONGTEXT     NOT NULL,
+	last_position    LONGTEXT     NOT NULL,
+	first_skipped_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	last_skipped_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (stream_id, table_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+}
+
+// upsertSkippedTable counts ONE skipped CDC event against the
+// (streamID, table) ledger row: first sight inserts the row with
+// count 1 and both positions at this event's token; every later skip
+// increments the count and advances last_position / last_skipped_at,
+// leaving the first_* columns as the original sighting. Runs on the
+// applier's primary pool (autocommit, outside the apply tx) so ONE
+// implementation serves every apply path — see
+// [ChangeApplier.recordSkippedTable] for the at-least-once contract.
+func upsertSkippedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, table, posToken string, upsert upsertSpelling) error {
+	ref := controlTableRef(controlKeyspace, skippedTablesTableName)
+	q := "INSERT INTO " + ref + " (stream_id, table_name, skip_count, first_position, last_position) " +
+		"VALUES (?, ?, 1, ?, ?)" +
+		upsert.clauseOpen() +
+		"skip_count = " + ref + ".skip_count + 1, " +
+		"last_position = " + upsert.newRowRef("last_position") + ", " +
+		"last_skipped_at = CURRENT_TIMESTAMP(6)"
+	if _, err := db.ExecContext(ctx, q, streamID, table, posToken, posToken); err != nil {
+		return fmt.Errorf("mysql: record skipped table %s: %w", table, err)
+	}
+	return nil
+}
+
+// listSkippedTables returns every row of the audit-C-11 skip ledger
+// via the shared scan (missing table tolerated as "no skips" — a
+// pre-upgrade or never-CDC'd target).
+func listSkippedTables(ctx context.Context, db *sql.DB, controlKeyspace string) ([]ir.SkippedTableRecord, error) {
+	q := "SELECT stream_id, table_name, skip_count, first_position, last_position, first_skipped_at, last_skipped_at FROM " +
+		controlTableRef(controlKeyspace, skippedTablesTableName) + " ORDER BY stream_id, table_name"
+	return appliershared.ListSkippedTables(ctx, db, controlCfg, q)
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of

@@ -276,8 +276,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "insert", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -293,8 +292,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "update", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -310,8 +308,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			logUnknownTable(ctx, "delete", schema, v.Table)
-			return nil
+			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
@@ -326,10 +323,20 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 	case ir.Truncate:
 		// A Truncate flushes as a 1-change batch (the shared loop returns
 		// immediately after dispatching it on the TransactionalDDL=true
-		// path), so a 1-statement pipelined batch is fine. The missing-table
-		// benign skip is detected at SendBatch result-read time (commit),
-		// the same place every other exec error surfaces; see flushAndCommit.
+		// path), so a 1-statement pipelined batch is fine. The C-11
+		// missing-table skip resolves HERE, at queue-build time, like the
+		// DML arms — the pre-C-11 shape absorbed the exec-time 42P01 at
+		// SendBatch result-read instead, which aborted the pipelined tx
+		// and made the position write queued behind it fail with 25P02 (a
+		// poison-pill retry dressed as a benign skip). An exec-time 42P01
+		// (probe-to-exec race) is loud; the retry converges to this skip.
 		schema := a.routedSchema(v.Schema)
+		if _, err := a.colTypesFor(ctx, schema, v.Table); err != nil {
+			if errors.Is(err, errUnknownTable) {
+				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+			}
+			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
 		stmt := buildTruncateSQL(schema, v.Table, v.Cascade, v.RestartIdentity)
 		b.queue(stmt, nil, queuedStmt{schema: schema, table: v.Table, kind: "truncate"})
 		return nil
@@ -394,9 +401,9 @@ func (a *ChangeApplier) writePositionPipelined(b *pgxBatchTx, streamID, token st
 // classifyApplierError), then commits the pgx.Tx under the Bug-56 commit
 // watchdog deadline. The pinned backend is released on every path.
 //
-// A Truncate of a missing table (SQLSTATE 42P01) is the one benign exec
-// outcome the serial path tolerates as a skip-with-warning; flushAndCommit
-// reproduces that here when the only queued data statement is a truncate.
+// Every exec error is loud; the C-11 unknown-table skip resolves at
+// queue-build time in dispatchPipelined, never here (see the Truncate
+// arm for why result-read absorption was unsound).
 func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
 	defer b.release()
 
@@ -423,8 +430,7 @@ func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
 // every queued result IN ORDER inside the per-exec watchdog so a stalled
 // flush is bounded the same way txExec bounds a serial exec. The first
 // per-statement error wins, is attributed to its queued change, and is
-// returned; a benign missing-table truncate is absorbed as a
-// skip-with-warning (matching the serial dispatch's tolerance).
+// returned.
 func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 	return appliershared.RunWithDeadline(a.execTimeout, func() error {
 		br := b.tx.SendBatch(b.ctx, b.batch)
@@ -434,10 +440,11 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 		for i := range b.stmts {
 			_, execErr := br.Exec()
 			if execErr != nil && firstErr == nil {
-				if b.stmts[i].kind == "truncate" && isMissingTableErr(execErr) {
-					logUnknownTable(b.ctx, "truncate", b.stmts[i].schema, b.stmts[i].table)
-					continue
-				}
+				// No missing-table absorption here: the C-11 skip resolves
+				// at queue-build time in dispatchPipelined (a failed
+				// statement leaves the pipelined tx aborted, so absorbing
+				// it would only convert the position write behind it into
+				// a 25P02). Every exec error is loud.
 				firstErr = a.attributeQueuedError(b.stmts[i], execErr)
 			}
 		}

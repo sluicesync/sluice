@@ -111,8 +111,13 @@ func TestControlTablesDDLCmd_DefaultEngineIsPlanetScale(t *testing.T) {
 }
 
 // TestControlTablesDDLCmd_PrintsBootstrapSet runs the real printer and
-// pins the six-table bootstrap set plus the deploy-ddl recipe line —
+// pins the seven-table bootstrap set plus the deploy-ddl recipe line —
 // stdout is pure SQL + `--` comments, pasteable per statement.
+//
+// The pipe is drained CONCURRENTLY with Run: the printed set outgrew
+// the OS pipe buffer when the C-11 skipped-tables ledger became the
+// seventh statement, and the old read-after-Run shape deadlocked (Run
+// blocked on a full pipe nobody was reading) — a hang, not a failure.
 func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 	c := parseInto(t, "control-tables", "ddl").ControlTables.DDL
 
@@ -120,16 +125,21 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	captured := make(chan string, 1)
+	go func() {
+		raw, readErr := io.ReadAll(r)
+		if readErr != nil {
+			captured <- "read captured stdout failed: " + readErr.Error()
+			return
+		}
+		captured <- string(raw)
+	}()
 	orig := os.Stdout
 	os.Stdout = w
 	runErr := c.Run()
 	os.Stdout = orig
 	_ = w.Close()
-	raw, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("read captured stdout: %v", err)
-	}
-	out := string(raw)
+	out := <-captured
 	if runErr != nil {
 		t.Fatalf("Run: %v", runErr)
 	}
@@ -142,13 +152,14 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 		"-- sluice_cdc_schema_history\n",
 		"-- sluice_shard_consolidation_lease\n",
 		"-- sluice_cdc_query_timeout_raise\n",
+		"-- sluice_cdc_skipped_tables\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 6 {
-		t.Errorf("CREATE statements = %d; want 6", got)
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 7 {
+		t.Errorf("CREATE statements = %d; want 7", got)
 	}
 	// Pasteable: every non-empty line is SQL or a -- comment.
 	for _, line := range strings.Split(out, "\n") {

@@ -29,6 +29,12 @@ const controlTableName = appliershared.ControlTableName
 // ensureShardConsolidationLeaseTable.
 const shardConsolidationLeaseTableName = appliershared.ShardConsolidationLeaseTableName
 
+// skippedTablesTableName is the audit-C-11 per-target control table
+// that holds the durable unknown-target-table skip ledger: one row per
+// (stream_id, table_name), counting every CDC event skipped because the
+// target lacks the table. See ensureSkippedTablesTable.
+const skippedTablesTableName = appliershared.SkippedTablesTableName
+
 // controlCfg is the ADR-0081 tier-c dialect seam for the shared
 // control-table CRUD in internal/appliershared: the engine-constant
 // leaves (error prefix, the 42P01 missing-relation classifier, the
@@ -158,6 +164,75 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 		return fmt.Errorf("postgres: ensure control table: add rows_applied: %w", err)
 	}
 	return nil
+}
+
+// skippedTablesTableRef is controlTableRef's counterpart for the
+// audit-C-11 skip ledger.
+func skippedTablesTableRef(schema string) string {
+	return quoteIdent(schema) + "." + quoteIdent(skippedTablesTableName)
+}
+
+// ensureSkippedTablesTable creates the audit-C-11 skip ledger in the
+// named schema if it doesn't exist. Idempotent; strictly additive — it
+// never touches sluice_cdc_state data. The table is written only when
+// a stream actually carries changes for a table the target lacks, so
+// on a healthy sync it is created empty and never grows.
+//
+// Column notes: (stream_id, table_name) mirror sluice_cdc_state's
+// VARCHAR(255) key-column convention (ADR-0007 — MySQL PK-width
+// compat keeps the two engines' ledgers structurally parallel);
+// first_position / last_position hold the engine-opaque source
+// position tokens VERBATIM (TEXT — a persisted round-trip surface,
+// never parsed on this path).
+func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) error {
+	ddl := `
+		CREATE TABLE IF NOT EXISTS ` + skippedTablesTableRef(schema) + ` (
+			stream_id        VARCHAR(255) NOT NULL,
+			table_name       VARCHAR(255) NOT NULL,
+			skip_count       BIGINT       NOT NULL,
+			first_position   TEXT         NOT NULL,
+			last_position    TEXT         NOT NULL,
+			first_skipped_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			last_skipped_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (stream_id, table_name)
+		)`
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("postgres: ensure skipped-tables table: %w", err)
+	}
+	return nil
+}
+
+// upsertSkippedTable counts ONE skipped CDC event against the
+// (streamID, table) ledger row: first sight inserts the row with
+// count 1 and both positions at this event's token; every later skip
+// increments the count and advances last_position / last_skipped_at,
+// leaving the first_* columns as the original sighting. Runs on the
+// applier's primary pool (autocommit, outside the apply tx) so ONE
+// implementation serves every apply path — serial, batched, pipelined,
+// and the ADR-0104/0105 concurrent lanes; the count is therefore
+// at-least-once across batch retries (documented on
+// [ir.SkippedTableRecord.SkipCount]).
+func upsertSkippedTable(ctx context.Context, db *sql.DB, schema, streamID, table, posToken string) error {
+	tableRef := skippedTablesTableRef(schema)
+	q := "INSERT INTO " + tableRef + " (stream_id, table_name, skip_count, first_position, last_position) " +
+		"VALUES ($1, $2, 1, $3, $3) " +
+		"ON CONFLICT (stream_id, table_name) DO UPDATE SET " +
+		"skip_count = " + tableRef + ".skip_count + 1, " +
+		"last_position = EXCLUDED.last_position, " +
+		"last_skipped_at = CURRENT_TIMESTAMP"
+	if _, err := db.ExecContext(ctx, q, streamID, table, posToken); err != nil {
+		return fmt.Errorf("postgres: record skipped table %s: %w", table, err)
+	}
+	return nil
+}
+
+// listSkippedTables returns every row of the audit-C-11 skip ledger
+// via the shared scan (missing table tolerated as "no skips" — a
+// pre-upgrade or never-CDC'd target).
+func listSkippedTables(ctx context.Context, db *sql.DB, schema string) ([]ir.SkippedTableRecord, error) {
+	q := "SELECT stream_id, table_name, skip_count, first_position, last_position, first_skipped_at, last_skipped_at FROM " +
+		skippedTablesTableRef(schema) + " ORDER BY stream_id, table_name"
+	return appliershared.ListSkippedTables(ctx, db, controlCfg, q)
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of
