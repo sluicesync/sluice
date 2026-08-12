@@ -203,7 +203,15 @@ silently dropping data (an `ADD COLUMN` whose values a stale trigger would never
 loudly at stream start** if any replicated table's live columns differ from what the
 triggers were built against (in either direction — add, drop, or rename — or a dropped
 table), naming the table and pointing you to re-run `trigger setup`. Until you re-setup
-after a schema change, the stream will not start (it never silently mis-captures). The
+after a schema change, the stream will not start (it never silently mis-captures). **OR-REPLACE writes across non-PK UNIQUE conflicts have a capture blind spot:** with
+SQLite's default `recursive_triggers=OFF` (per-connection, on *your application's*
+writers) the row an `INSERT OR REPLACE`/`UPDATE OR REPLACE` implicitly deletes is never
+captured, so the target keeps it — `trigger setup` WARNs per affected table; run writers
+with `recursive_triggers=ON` or use `ON CONFLICT DO UPDATE` upserts (preferred on D1).
+**Invalid-UTF-8 TEXT** is carried faithfully by the cold snapshot but refuses loudly on
+the trigger-CDC/D1 decode path (the stream halts with the watermark held, so nothing is
+skipped after you repair the value); store such bytes as BLOB, or repair them at source.
+The
 change-log, meta, and column-fingerprint tables are auto-skipped by the schema reader, so
 they are never themselves migrated or captured.
 

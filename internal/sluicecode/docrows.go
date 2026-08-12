@@ -324,8 +324,8 @@ var docRows = map[Code]docRow{
 		Remedy:  "Set the source's `bytea_output` back to the `hex` default (`ALTER DATABASE <db> SET bytea_output = 'hex'`) and re-run — sluice does not decode the `escape` rendering. If the source is already on `hex`, the value reached the decoder mangled: report it as a sluice bug, quoting the column named in the message.",
 	},
 	"SLUICE-E-VALUE-UNREPRESENTABLE": {
-		Meaning: "A value no target column type can represent — e.g. a `NaN`/±`Infinity` float from a PostgreSQL `double precision` source into a MySQL `FLOAT`/`DOUBLE` (MySQL has no NaN/Infinity). Refused before the driver sees it so it fails loudly instead of corrupting the value or retry-looping on the server's misleading error.",
-		Remedy:  "Filter or transform the source value (e.g. `NULLIF` / `CASE` on the source query).",
+		Meaning: "A value no target column type can represent — e.g. a `NaN`/±`Infinity` float from a PostgreSQL `double precision` source into a MySQL `FLOAT`/`DOUBLE` (MySQL has no NaN/Infinity). Since v0.122.0 it also fires for a geometry carrying NaN/Inf **coordinates** toward a MySQL-family target — including PostGIS `POINT EMPTY`, whose WKB representation IS a NaN/NaN point — and for structurally undecodable WKB: MySQL accepts the raw bytes silently and stores a value it cannot itself read back (`ST_AsText` NULL, error 3037 on access), so sluice refuses client-side before the wire. Refused before the driver sees it so it fails loudly instead of corrupting the value or retry-looping on the server's misleading error.",
+		Remedy:  "Filter or transform the source value (`NULLIF` / `CASE` for floats; for geometry, filter with `NOT ST_IsEmpty(col)` or repair/exclude the offending rows — `NULLIF` cannot express the `POINT EMPTY` case).",
 	},
 	"SLUICE-E-VALUE-ZERO-DATE": {
 		Meaning: "A MySQL zero/partial date (`0000-00-00 …`) has no valid calendar value the target can hold.",

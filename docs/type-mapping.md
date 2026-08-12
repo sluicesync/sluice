@@ -215,7 +215,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 | `T[]`                             | `Array{Element: ...}`                         | Recursive on element. |
 | `inet`, `cidr`                    | `Inet{}`, `Cidr{}`                            | |
 | `macaddr`, `macaddr8`             | `Macaddr{Width: 6}`, `Macaddr{Width: 8}`      | The width is what picks `MACADDR` vs `MACADDR8` on a PG target; a zero `Width` (a manifest written before v0.110.2) emits `MACADDR`. Note PG WIDENS a 6-byte value on input to a `macaddr8` column — `08:00:2b:01:02:03` is stored and delivered as `08:00:2b:ff:fe:01:02:03` — so a `--where` literal on such a column must use the widened spelling; sluice refuses the narrow one and names the form to write. |
-| `geometry`                        | `Geometry{Subtype: ...}`                      | PostGIS only. |
+| `geometry`                        | `Geometry{Subtype: ...}`                      | PostGIS only. Toward a MySQL-family target, a value with NaN/Inf coordinates — including `POINT EMPTY`, whose WKB IS a NaN/NaN point — refuses with `SLUICE-E-VALUE-UNREPRESENTABLE`; MySQL would otherwise store it silently as a value it cannot read back. |
 
 ### Writer policies
 
