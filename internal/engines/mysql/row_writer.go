@@ -977,6 +977,16 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	}
 	if geom, isGeom := t.(ir.Geometry); isGeom {
 		if b, ok := v.([]byte); ok {
+			// SPAT-1 (audit 2026-08-11): refuse NaN/Inf coordinates (incl.
+			// PostGIS POINT EMPTY, which IS a NaN/NaN point in WKB) before
+			// the wire — MySQL accepts the raw bytes silently and stores a
+			// poison value it cannot itself produce. This is the single
+			// choke point: both bulk cores and the CDC applier route
+			// geometry through prepareValue (LOAD DATA falls back to the
+			// batched core for geometry columns).
+			if err := refuseNonFiniteWKB(b, col); err != nil {
+				return nil, err
+			}
 			out := make([]byte, 4+len(b))
 			// Little-endian uint32 SRID prefix, matching MySQL's
 			// on-wire geometry layout.
