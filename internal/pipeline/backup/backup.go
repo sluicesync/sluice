@@ -431,6 +431,23 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
+	// 2.4. Bug 248: refuse before ANY write when the destination store
+	// folds letter case and the (filtered) table set carries names whose
+	// chunk paths would fold to one host path — serial mode silently
+	// self-clobbered a table's chunks at exit 0, parallel died on a
+	// spurious rename-lock. Runs on the filtered set so --exclude-table
+	// on one colliding twin is a working remedy. The store is probed
+	// only when a collision exists (see store_fold_gate.go).
+	{
+		names := make([]string, 0, len(schema.Tables))
+		for _, t := range schema.Tables {
+			names = append(names, chunkDirName(t))
+		}
+		if err := refuseStoreFoldCollision(ctx, b.Store, names, "backup"); err != nil {
+			return err
+		}
+	}
+
 	// 2.5. Schema-stability guard for anchored resume (task #42): the
 	// adopted anchor claims "kept chunks + CDC replay from the anchor
 	// converge to source state", which DDL between the two attempts
@@ -1496,14 +1513,13 @@ func (b *Backup) backupTable(
 // table within the backup store. Forward-slash separated, kept short
 // because the path lands in the manifest verbatim.
 func chunkFilePath(table *ir.Table, idx int) string {
-	name := table.Name
-	if table.Schema != "" {
-		// Schema-qualified tables get a `<schema>__<name>` directory
-		// to avoid collisions when two PG schemas have a same-named
-		// table. Underscore-double rather than slash because some
-		// object stores reserve specific path shapes.
-		name = table.Schema + "__" + table.Name
-	}
+	// Schema-qualified tables get a `<schema>__<name>` directory to
+	// avoid collisions when two PG schemas have a same-named table
+	// (underscore-double rather than slash because some object stores
+	// reserve specific path shapes). The name comes from chunkDirName —
+	// the SAME definition the Bug 248 store-fold gate scans, so the
+	// gate and the writer cannot drift on what the store sees.
+	name := chunkDirName(table)
 	return path.Join("chunks", name, fmt.Sprintf("%s-%d.jsonl.gz", name, idx))
 }
 

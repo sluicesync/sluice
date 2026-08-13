@@ -260,6 +260,24 @@ func (e *ParquetExport) Run(ctx context.Context) error {
 		)
 	}
 
+	// 3.5. Bug 248, the export sibling: parquet file names are flat and
+	//      table-derived, so `Orders.parquet` and `orders.parquet` fold
+	//      to ONE file on a case-folding output store — the later table
+	//      silently overwrites the earlier at exit 0. Same measured-probe
+	//      gate as `backup full` (see store_fold_gate.go), over the
+	//      names this export will actually write.
+	{
+		names := make([]string, 0, len(manifest.Schema.Tables))
+		for _, t := range manifest.Schema.Tables {
+			if t != nil {
+				names = append(names, parquetFileName(t.Schema, t.Name))
+			}
+		}
+		if err := refuseStoreFoldCollision(ctx, e.Output, names, "export-as-parquet"); err != nil {
+			return err
+		}
+	}
+
 	// 4. Encryption preflight on the selected full (each segment full
 	//    is its chain header) — mirrors Restore.preflightEncryption,
 	//    including the supplied-key-vs-plaintext-claim refusal.
