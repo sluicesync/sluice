@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.124.1] - 2026-08-13
+
+Patch: Bug 247 — the untranslatable-expression refusals recommended `--expr-override` at sites where the flag cannot run. Found by the v0.124.0 post-release regression cycle; loud, zero silent loss, refusal-side UX only.
+
+### Fixed
+
+**The MySQL-family→PG untranslatable-expression refusals now name a remedy that runs at the site they fire on (Bug 247).** `--expr-override` rewrites generated-column bodies only — `ApplyExpressionOverrides` errors on any other target — yet the curated gap refusals (v0.124.0's new operator-family messages and Bug 242's REGEXP/RLIKE advisories alike), the general backstop, and the `schema preview` advisories all said "use `--expr-override`" for CHECK-constraint and DEFAULT sites too, an unrunnable recovery hint in the Bug 245/246 class: following it produced "the column is not a generated column". Remedies are now a property of the site: generated columns keep `--expr-override`; CHECK and DEFAULT sites get `--exclude-table` or fix-the-expression-on-the-source, with an explicit "`--expr-override` does not apply" clause — the wording the extension-function gate has carried since ADR-0044 §2's post-implementation correction, which never got swept to these sibling gates. `schema preview` prints a per-gap remedy line and its JSON adds a `remedy` field (additive). Pinned per site in both directions — the four earlier rendering pins asserted the bare `--expr-override` substring, which the new denial clause also contains, so they could green either way; they now pin the recommendation/denial phrasing — with a premise pin binding the override's generated-only scope to the message design so a future scope widening flips the wording pins with it. Mutation-run on all four arms. The docs carried the root drift (the translator catalog's flag reference claimed the override rewrites "DEFAULT or GENERATED" expressions); corrected along with the catalog's workaround rows, production-readiness, and comparison.md, and v0.124.0's "every refusal carrying a runnable remedy" sentence was corrected in place, dated, in all three claim homes.
+
 ## [0.124.0] - 2026-08-13
 
 The 2026-08-13 audit burn-down arc: the restore-injection door closed on both lanes that could execute it, the MySQL-family→PG CHECK operator gate rebuilt from a fresh real-flavor measurement, the broker's destructive reset ordered after the chain's refusals, and six more audit items — spatial preflights, the schema-preview geography flatten note, the VStream buffer cap, notify-threshold validation, the trigger-lane UTF-8 recovery, and three false operator claims now held true by marker gates.
