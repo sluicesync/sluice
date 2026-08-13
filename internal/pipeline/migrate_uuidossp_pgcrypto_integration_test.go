@@ -238,7 +238,10 @@ func TestMigrate_PG_UUIDOSSP_TargetMissing_RefusedAtPreflight(t *testing.T) {
 
 // Scenario 3: flag ABSENT, source uses uuid_generate_v4() → refused
 // at schema-read with the actionable message (names the function, the
-// owning extension, --enable-pg-extension, --expr-override).
+// owning extension, --enable-pg-extension — and, this being a DEFAULT
+// site, explicitly says --expr-override does NOT apply rather than
+// recommending it; the bare "--expr-override" substring would match
+// either way, so the pin asserts the denial phrasing — Bug 247).
 func TestMigrate_PG_UUIDOSSP_FlagAbsent_RefusedAtSchemaRead(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresWithQuotedExtension(t, "uuid-ossp", false)
 	defer cleanup()
@@ -270,7 +273,7 @@ func TestMigrate_PG_UUIDOSSP_FlagAbsent_RefusedAtSchemaRead(t *testing.T) {
 	msg := err.Error()
 	for _, frag := range []string{
 		"uuid_generate_v4", "uuid-ossp",
-		"--enable-pg-extension uuid-ossp", "--expr-override",
+		"--enable-pg-extension uuid-ossp", "--expr-override does not apply",
 	} {
 		if !strings.Contains(msg, frag) {
 			t.Errorf("schema-read refusal missing %q; got: %s", frag, msg)

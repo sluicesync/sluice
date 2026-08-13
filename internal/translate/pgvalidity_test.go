@@ -392,3 +392,55 @@ func TestExtensionOwnedFunctions_NoCoreCollision(t *testing.T) {
 		t.Error("gen_random_uuid must be core, never pgcrypto-gated")
 	}
 }
+
+// TestRefuseOnUntranslatableExprs_SiteAwareRemedies pins the Bug 247
+// per-site branch of the general backstop's remedy: a GENERATED site
+// RECOMMENDS `--expr-override` (the override runs there — it rewrites
+// Column.GeneratedExpr), while a DEFAULT site denies it and offers
+// `--exclude-table` / fix-on-source instead, because
+// ApplyExpressionOverrides errors on any non-generated target (premise
+// pinned by TestGapRemedy_ExprOverridePremise). The CHECK arm is
+// pinned by every rendering test in pgvalidity_infix_test.go via
+// assertCheckSiteRemedy.
+func TestRefuseOnUntranslatableExprs_SiteAwareRemedies(t *testing.T) {
+	gen := &ir.Schema{Tables: []*ir.Table{{
+		Name: "g",
+		Columns: []*ir.Column{{
+			Name:                 "c",
+			Type:                 ir.Varchar{Length: 10},
+			GeneratedExpr:        "soundex(c)",
+			GeneratedExprDialect: "mysql",
+		}},
+	}}}
+	err := RefuseOnUntranslatableExprs(gen, "mysql", "postgres", "migrate", nil)
+	if err == nil {
+		t.Fatal("want the pre-DDL refusal for soundex() in a GENERATED body, got nil")
+	}
+	if !strings.Contains(err.Error(), "with `--expr-override`") {
+		t.Errorf("GENERATED-site refusal must recommend --expr-override (it runs there):\n%s", err)
+	}
+	if strings.Contains(err.Error(), "does not apply") {
+		t.Errorf("GENERATED-site refusal must not deny --expr-override:\n%s", err)
+	}
+
+	def := &ir.Schema{Tables: []*ir.Table{{
+		Name: "d",
+		Columns: []*ir.Column{{
+			Name:    "c",
+			Type:    ir.Varchar{Length: 10},
+			Default: ir.DefaultExpression{Expr: "soundex('x')", Dialect: "mysql"},
+		}},
+	}}}
+	err = RefuseOnUntranslatableExprs(def, "mysql", "postgres", "migrate", nil)
+	if err == nil {
+		t.Fatal("want the pre-DDL refusal for soundex() in a DEFAULT, got nil")
+	}
+	for _, want := range []string{"--exclude-table", "`--expr-override` does not apply", "DEFAULT"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("DEFAULT-site refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "with `--expr-override`") {
+		t.Errorf("DEFAULT-site refusal recommends --expr-override, which errors on a DEFAULT target (Bug 247):\n%s", err)
+	}
+}

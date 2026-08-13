@@ -23,6 +23,14 @@
 //     holds: an unrecognized non-portable construct surfaces as a
 //     CREATE TABLE rejection on the target, not a guess at translation.
 //
+// Scope note on the `--expr-override` escape hatch cited throughout the
+// per-rule comments below: ApplyExpressionOverrides rewrites GENERATED
+// COLUMN bodies only and errors on any other target (Bug 247). Where a
+// divergent construct sits in a CHECK constraint or DEFAULT, the
+// operator's escapes are `--exclude-table` or fixing the expression on
+// the source (re-creating it on the target in PG syntax) — the
+// translate-package refusal messages say so per site.
+//
 // v1 scope (MySQL → Postgres):
 //
 //   - CONCAT(a, b, ...) → (a || b || ...)
@@ -1860,8 +1868,9 @@ func rewriteHEX(expr string) string {
 // array; MySQL returns 0. For most DDL-body uses (ORDER BY proxies,
 // custom enum ranks) NULL ordering follows the same logical
 // direction as 0, but operators with a strict 0-vs-NULL distinction
-// in a CHECK constraint should use `--expr-override`. Documented as
-// a known sharp edge in the catalog.
+// need to adjust the expression (on the source for CHECK sites —
+// `--expr-override` rewrites only generated-column bodies). Documented
+// as a known sharp edge in the catalog.
 //
 // Requires at least one needle + one haystack value (≥ 2 args). Falls
 // through verbatim otherwise.
@@ -1995,8 +2004,10 @@ func rewriteDATEDIFF(expr string) string {
 // have a load-bearing catalog reason that stands — extension
 // boundary, NULL-semantics divergence, ICU-vs-POSIX regex flavour,
 // invalid-in-CHECK/GENERATED LATERAL, TZ-semantics fuzziness, or
-// no-portable-equivalent. All six have actionable --expr-override
-// workarounds.
+// no-portable-equivalent. All six have actionable workarounds:
+// --expr-override at generated-column sites; --exclude-table or
+// fix-on-source at CHECK/DEFAULT sites (Bug 247 — the override cannot
+// run there).
 // ============================================================
 
 // rewriteTIMESTAMPDIFF rewrites MySQL's `TIMESTAMPDIFF(unit, a, b)`

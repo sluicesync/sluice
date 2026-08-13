@@ -66,10 +66,15 @@ package translate
 //     `total > 0`).
 //   - The allowlist is conservative-inclusive of the full PG core
 //     builtin surface plus every form the translator emits.
-//   - `--expr-override` remains the per-expression escape hatch: the
-//     override retags the expression dialect off "mysql", and the
-//     scanner (like ScanMySQLToPGGaps) only inspects mysql-dialect
-//     expressions, so an overridden expression is never gated.
+//   - `--expr-override` remains the per-expression escape hatch FOR
+//     GENERATED COLUMNS ONLY: the override rewrites Column.GeneratedExpr
+//     and clears its dialect off "mysql", and the scanner (like
+//     ScanMySQLToPGGaps) only inspects mysql-dialect expressions, so an
+//     overridden generated expression is never gated.
+//     ApplyExpressionOverrides errors on any non-generated target
+//     (Bug 247), so CHECK/DEFAULT sites' escapes are `--exclude-table`
+//     or fixing the expression on the source — the refusal message
+//     branches per site accordingly.
 //
 // The curated ScanMySQLToPGGaps stays as the *specific actionable-hint*
 // layer (better, construct-specific messages for the known cases) on
@@ -87,7 +92,8 @@ import (
 
 // UntranslatableExpr is one detected untranslatable function-call site.
 // The fields locate the source precisely enough that the operator can
-// target it with `--expr-override`.
+// act on it (via `--expr-override` for generated columns, or the
+// site-aware escapes the refusal message names for CHECK/DEFAULT).
 type UntranslatableExpr struct {
 	// Table is the source-side table name.
 	Table string
@@ -220,7 +226,7 @@ func untranslatableFunctions(expr string, enabledExt map[string]bool) []string {
 	// rejects them (SQLSTATE 42704) mid-pipeline, a structural
 	// false-green. Surface them here as a synthetic "cast-as-unsigned"
 	// offending token so the gate refuses loudly and the operator gets
-	// the `--expr-override` remedy. Conservative: only the exact
+	// the site-aware remedy. Conservative: only the exact
 	// MySQL-only CAST target keywords trip this; a PG-valid
 	// `CAST(x AS numeric)` / `CAST(x AS bigint)` does not.
 	if tok := mysqlOnlyCastTarget(expr); tok != "" && !seen[tok] {
@@ -254,8 +260,8 @@ func untranslatableFunctions(expr string, enabledExt map[string]bool) []string {
 // word operators (bare after the read-boundary backtick strip; every
 // listed word is a MySQL reserved word, so such a column had to be
 // backtick-quoted at creation) would false-trip this; that is the loud
-// direction on a vanishingly rare name, and `--expr-override` is its
-// escape hatch.
+// direction on a vanishingly rare name, and `--expr-override` (generated
+// columns) / `--exclude-table` (any site) is its escape hatch.
 //
 // Deliberately only the MEASURED spellings (audit 2026-08-11 ARCH-1:
 // one CHECK per operator in the MySQL grammar's operator table, read
@@ -611,8 +617,12 @@ func isIdentStartByte(b byte) bool {
 // error when scanning schema for the given MySQL→PG pair surfaces one
 // or more function-call identifiers that are not provably PG-valid;
 // nil otherwise. The error names every offending site (table +
-// column/constraint + the offending function) and the `--expr-override`
-// remedy so the operator can act before any data or DDL moves.
+// column/constraint + the offending function) and a SITE-AWARE remedy
+// so the operator can act before any data or DDL moves: generated
+// columns get `--expr-override`; CHECK/DEFAULT sites get
+// `--exclude-table` / fix-on-source, because ApplyExpressionOverrides
+// rewrites only generated-column bodies and errors on anything else
+// (Bug 247 — recommending the flag there was an unrunnable hint).
 //
 // contextID is the caller's phase label ("schema preview" / "migrate")
 // so the same diagnostic reads correctly at either surface — the
@@ -682,12 +692,33 @@ func RefuseOnUntranslatableExprs(
 			what = u.Function + "(...) is not a PostgreSQL built-in and"
 		}
 		fmt.Fprintf(&b, ": %s sluice's "+
-			"MySQL→PostgreSQL translator does not rewrite it. Supply a "+
-			"PostgreSQL-valid form with `--expr-override` (or "+
-			"`--exclude-table %s` to skip the table), or enable the owning "+
+			"MySQL→PostgreSQL translator does not rewrite it. ", what)
+		// The remedy is site-aware (Bug 247): `--expr-override`
+		// rewrites only generated-column bodies
+		// (ApplyExpressionOverrides errors on any other target), so
+		// CHECK and DEFAULT sites get the escapes that actually run.
+		switch {
+		case u.Constraint != "":
+			fmt.Fprintf(&b, "Drop the CHECK constraint on the source and "+
+				"re-create it on the target in PostgreSQL syntax after the "+
+				"run, or skip the table with `--exclude-table %s` "+
+				"(`--expr-override` does not apply — it rewrites only "+
+				"generated-column bodies)", u.Table)
+		case u.Field == "DEFAULT":
+			fmt.Fprintf(&b, "Change or drop the DEFAULT on the source and "+
+				"re-add it on the target in PostgreSQL syntax after the "+
+				"run, or skip the table with `--exclude-table %s` "+
+				"(`--expr-override` does not apply — it rewrites only "+
+				"generated-column bodies)", u.Table)
+		default:
+			fmt.Fprintf(&b, "Supply a PostgreSQL-valid form with "+
+				"`--expr-override` (or `--exclude-table %s` to skip the "+
+				"table)", u.Table)
+		}
+		fmt.Fprintf(&b, ", or enable the owning "+
 			"extension with `--enable-pg-extension` if it is extension-provided. "+
 			"Source expression: %s",
-			what, u.Table, u.Expression)
+			u.Expression)
 	}
 	return errors.New(b.String())
 }

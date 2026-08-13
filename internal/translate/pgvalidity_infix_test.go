@@ -98,10 +98,33 @@ func TestScanUntranslatable_InfixRegexpOperator(t *testing.T) {
 	}
 }
 
+// assertCheckSiteRemedy asserts the Bug 247 site-aware remedy on a
+// CHECK-site refusal message: `--exclude-table` is recommended, the
+// message explicitly says `--expr-override` does not apply, and the
+// override is never RECOMMENDED ("with `--expr-override`" is the
+// recommendation phrasing both builders use for generated sites).
+// bug242Schema puts every expression in a CHECK constraint, so every
+// rendering pin in this file goes through this — the pre-Bug-247 pins
+// asserted the bare substring "--expr-override", which the
+// does-not-apply caveat also contains, so they would green either way.
+func assertCheckSiteRemedy(t *testing.T, msg string) {
+	t.Helper()
+	if !strings.Contains(msg, "--exclude-table") {
+		t.Errorf("CHECK-site refusal does not offer --exclude-table:\n%s", msg)
+	}
+	if !strings.Contains(msg, "`--expr-override` does not apply") {
+		t.Errorf("CHECK-site refusal does not state --expr-override is inapplicable (Bug 247):\n%s", msg)
+	}
+	if strings.Contains(msg, "with `--expr-override`") {
+		t.Errorf("CHECK-site refusal recommends --expr-override, which errors on a CHECK target (Bug 247):\n%s", msg)
+	}
+}
+
 // TestRefuseOnUntranslatableExprs_InfixRegexpNamesTheRemedy pins the
 // operator-facing refusal: the message must name the operator, the
-// MariaDB provenance, and the `~` equivalent — the catalog's complaint
-// was a raw SQLSTATE 42601 with none of those.
+// MariaDB provenance, the `~` equivalent, and (Bug 247) the CHECK-site
+// remedy — the catalog's complaint was a raw SQLSTATE 42601 with none
+// of those.
 func TestRefuseOnUntranslatableExprs_InfixRegexpNamesTheRemedy(t *testing.T) {
 	err := RefuseOnUntranslatableExprs(
 		bug242Schema(`c regexp '^o''brien$'`), "mysql", "postgres", "migrate", nil,
@@ -109,11 +132,12 @@ func TestRefuseOnUntranslatableExprs_InfixRegexpNamesTheRemedy(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the pre-DDL refusal, got nil — Bug 242's shape would die in PG's parser mid-pipeline")
 	}
-	for _, want := range []string{"REGEXP", "MariaDB", "~ 'pattern'", "--expr-override", "z_rx"} {
+	for _, want := range []string{"REGEXP", "MariaDB", "~ 'pattern'", "z_rx"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal does not mention %q:\n%s", want, err)
 		}
 	}
+	assertCheckSiteRemedy(t, err.Error())
 }
 
 // TestRefuseOnLoudGaps_InfixRegexpRendering pins the message operators
@@ -132,11 +156,12 @@ func TestRefuseOnLoudGaps_InfixRegexpRendering(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the curated pre-DDL refusal, got nil")
 	}
-	for _, want := range []string{"the infix REGEXP operator", "MariaDB", "~ 'pattern'", "--expr-override", "z_rx"} {
+	for _, want := range []string{"the infix REGEXP operator", "MariaDB", "~ 'pattern'", "z_rx"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("rendered refusal does not mention %q:\n%s", want, err)
 		}
 	}
+	assertCheckSiteRemedy(t, err.Error())
 	if strings.Contains(err.Error(), "REGEXP()") {
 		t.Errorf("call-parens rendered on an operator form:\n%s", err)
 	}
@@ -214,8 +239,8 @@ func TestDetectGaps_OperatorFamilyAdvisories(t *testing.T) {
 // TestRefuseOnLoudGaps_OperatorFamilyRendering pins the rendered refusal
 // for the ARCH-1 word operators and the prefix form: the message names
 // the operator form correctly ("the infix DIV operator" / "the prefix !
-// operator", never call-parens), the PG equivalent, and the
-// --expr-override remedy.
+// operator", never call-parens), the PG equivalent, and the CHECK-site
+// remedy (Bug 247).
 func TestRefuseOnLoudGaps_OperatorFamilyRendering(t *testing.T) {
 	err := RefuseOnLoudGaps(
 		bug242Schema(`c DIV 2 = 0`), "mysql", "postgres", "migrate", nil,
@@ -223,11 +248,12 @@ func TestRefuseOnLoudGaps_OperatorFamilyRendering(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the curated pre-DDL refusal for infix DIV, got nil — the rendering would die in PG's parser mid-pipeline")
 	}
-	for _, want := range []string{"the infix DIV operator", "div(a, b)", "--expr-override", "z_rx"} {
+	for _, want := range []string{"the infix DIV operator", "div(a, b)", "z_rx"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("DIV refusal does not mention %q:\n%s", want, err)
 		}
 	}
+	assertCheckSiteRemedy(t, err.Error())
 	if strings.Contains(err.Error(), "DIV()") {
 		t.Errorf("call-parens rendered on an operator form:\n%s", err)
 	}
@@ -238,11 +264,12 @@ func TestRefuseOnLoudGaps_OperatorFamilyRendering(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the curated pre-DDL refusal for prefix !, got nil")
 	}
-	for _, want := range []string{"the prefix ! operator", "NOT (...)", "--expr-override"} {
+	for _, want := range []string{"the prefix ! operator", "NOT (...)"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("prefix-! refusal does not mention %q:\n%s", want, err)
 		}
 	}
+	assertCheckSiteRemedy(t, err.Error())
 	if strings.Contains(err.Error(), "the infix ! operator") {
 		t.Errorf("a prefix operator rendered as infix (the v0.120.1 rendering nit, prefix edition):\n%s", err)
 	}
@@ -259,9 +286,9 @@ func TestRefuseOnUntranslatableExprs_ConstructArms(t *testing.T) {
 		expr  string
 		wants []string
 	}{
-		{"bare INTERVAL", `(d + interval 1 day) > d`, []string{"INTERVAL", "interval '1 day'", "--expr-override"}},
-		{"column-level COLLATE", `(c collate utf8mb4_bin) = 'x'`, []string{"COLLATE", "42704", "--expr-override"}},
-		{"MEMBER OF", `c member of (j)`, []string{"MEMBER OF", "jsonb", "--expr-override"}},
+		{"bare INTERVAL", `(d + interval 1 day) > d`, []string{"INTERVAL", "interval '1 day'"}},
+		{"column-level COLLATE", `(c collate utf8mb4_bin) = 'x'`, []string{"COLLATE", "42704"}},
+		{"MEMBER OF", `c member of (j)`, []string{"MEMBER OF", "jsonb"}},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -277,6 +304,7 @@ func TestRefuseOnUntranslatableExprs_ConstructArms(t *testing.T) {
 					t.Errorf("%s refusal does not mention %q:\n%s", tc.name, want, err)
 				}
 			}
+			assertCheckSiteRemedy(t, err.Error())
 		})
 	}
 }

@@ -228,6 +228,11 @@ type PreviewJSONTranslatorGap struct {
 	Severity   string `json:"severity"` // "loud" / "silent"
 	Expression string `json:"expression"`
 	Note       string `json:"note"`
+
+	// Remedy is the site-aware escape (Bug 247): `--expr-override`
+	// for GENERATED sites; `--exclude-table` / fix-on-source for
+	// CHECK and DEFAULT sites, where the override cannot run.
+	Remedy string `json:"remedy"`
 }
 
 // PreviewJSONTable is one table's worth of preview output.
@@ -814,6 +819,7 @@ func writeTranslatorGapsSection(sb *strings.Builder, gaps []translate.Gap) {
 		sb.WriteByte('\n')
 		fmt.Fprintf(sb, "--     expr: %s\n", g.Expression)
 		fmt.Fprintf(sb, "--     note: %s\n", g.Note)
+		fmt.Fprintf(sb, "--     remedy: %s\n", strings.TrimPrefix(g.Remedy(), "Remedy: "))
 	}
 	sb.WriteByte('\n')
 }
@@ -1217,6 +1223,7 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			Severity:   g.Severity.String(),
 			Expression: g.Expression,
 			Note:       g.Note,
+			Remedy:     g.Remedy(),
 		})
 	}
 	for _, n := range bundle.unsignedBigintNotices {

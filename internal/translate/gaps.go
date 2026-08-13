@@ -14,7 +14,9 @@ package translate
 // Each [Gap] names the table + column or constraint, the matched
 // pattern, the catalog rule number, severity (loud → PG parse-fail at
 // apply; silent → PG accepts but diverges in semantics), and an
-// operator-actionable `--expr-override` hint. The scanner runs only
+// operator-actionable, site-aware remedy ([Gap.Remedy] — Bug 247:
+// `--expr-override` is recommended only where it can run, i.e.
+// generated columns). The scanner runs only
 // on cross-engine MySQL → Postgres pairs; same-engine pairs and
 // PostgreSQL → MySQL migrations don't trip these patterns.
 
@@ -62,7 +64,8 @@ func (s Severity) String() string {
 
 // Gap is one detected translator-gap site. The fields are populated
 // to identify the source location precisely enough that the operator
-// can target it with `--expr-override`.
+// can act on it — via `--expr-override` for generated columns, or the
+// site-aware escapes [Gap.Remedy] names for CHECK/DEFAULT sites.
 type Gap struct {
 	// Table is the source-side table name the gap was detected in.
 	Table string
@@ -82,8 +85,9 @@ type Gap struct {
 	Field string
 
 	// Expression is the raw source-dialect expression text the
-	// scanner matched against. Operators paste this into
-	// `--expr-override` lookups; renderers include it verbatim.
+	// scanner matched against. Renderers include it verbatim so the
+	// operator sees exactly what tripped the gap (and, for generated
+	// columns, what to rewrite via `--expr-override`).
 	Expression string
 
 	// Pattern is the matched function name (e.g. "GREATEST",
@@ -111,10 +115,31 @@ type Gap struct {
 	// Severity is the surfaced-vs-silent classification.
 	Severity Severity
 
-	// Note is the human-readable advisory: what's wrong + what the
-	// `--expr-override` snippet to fix it looks like. Stable wording
-	// for renderers; ends without trailing newline.
+	// Note is the human-readable advisory: what's wrong + the closest
+	// PostgreSQL equivalent. Stable wording for renderers; ends
+	// without trailing newline. Deliberately remedy-free — renderers
+	// append [Gap.Remedy], which depends on the site (Field), not the
+	// pattern.
 	Note string
+}
+
+// Remedy returns the operator remedy for this gap's site. The remedy
+// is a property of WHERE the expression lives, not which pattern
+// matched: `--expr-override` rewrites only generated-column bodies
+// (ApplyExpressionOverrides — it errors on any other target), so
+// recommending it for a CHECK or DEFAULT site is an unrunnable hint
+// (Bug 247; the same generated-only scope ADR-0044 §2 corrected for
+// the extension-function gate). CHECK/DEFAULT sites get the escapes
+// that actually run.
+func (g Gap) Remedy() string {
+	switch g.Field {
+	case "CHECK":
+		return "Remedy: drop the CHECK constraint on the source and re-create it on the target in PostgreSQL syntax after the run, or skip the table with `--exclude-table` (`--expr-override` does not apply — it rewrites only generated-column bodies)."
+	case "DEFAULT":
+		return "Remedy: change or drop the DEFAULT on the source and re-add it on the target in PostgreSQL syntax after the run, or skip the table with `--exclude-table` (`--expr-override` does not apply — it rewrites only generated-column bodies)."
+	default: // "GENERATED"
+		return "Remedy: supply a PostgreSQL-valid body with `--expr-override`, or skip the table with `--exclude-table`."
+	}
 }
 
 // ScanMySQLToPGGaps walks every translator-applicable expression in
@@ -240,19 +265,19 @@ var gapPatterns = []gapPattern{
 		name:     "GREATEST",
 		rule:     11,
 		severity: SeveritySilent,
-		note:     "PG accepts GREATEST but ignores NULL args; MySQL returns NULL if any arg is NULL. Wrap with COALESCE on each side, or use --expr-override.",
+		note:     "PG accepts GREATEST but ignores NULL args; MySQL returns NULL if any arg is NULL. Wrap with COALESCE on each side to reproduce MySQL's semantics.",
 	},
 	{
 		name:     "LEAST",
 		rule:     11,
 		severity: SeveritySilent,
-		note:     "PG accepts LEAST but ignores NULL args; MySQL returns NULL if any arg is NULL. Wrap with COALESCE on each side, or use --expr-override.",
+		note:     "PG accepts LEAST but ignores NULL args; MySQL returns NULL if any arg is NULL. Wrap with COALESCE on each side to reproduce MySQL's semantics.",
 	},
 	{
 		name:     "REGEXP_LIKE",
 		rule:     13,
 		severity: SeveritySilent,
-		note:     "PG 15+ accepts regexp_like() but uses POSIX regex flavour; MySQL uses ICU. Lookaheads, named groups, and Unicode-property classes don't translate. Use --expr-override with `x ~ 'pattern'` for compatible patterns.",
+		note:     "PG 15+ accepts regexp_like() but uses POSIX regex flavour; MySQL uses ICU. Lookaheads, named groups, and Unicode-property classes don't translate. For compatible patterns the PostgreSQL form is `x ~ 'pattern'`.",
 	},
 	{
 		// Bug 242: MariaDB's information_schema renders `c REGEXP '...'`
@@ -263,14 +288,14 @@ var gapPatterns = []gapPattern{
 		name:     "REGEXP",
 		rule:     13,
 		severity: SeverityLoud,
-		note:     "MariaDB's catalog spells `c REGEXP '...'` infix (MySQL 8 renders it as the regexp_like() call). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU — lookaheads, named groups, and Unicode-property classes don't translate). Use --expr-override.",
+		note:     "MariaDB's catalog spells `c REGEXP '...'` infix (MySQL 8 renders it as the regexp_like() call). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU — lookaheads, named groups, and Unicode-property classes don't translate).",
 		infix:    true,
 	},
 	{
 		name:     "RLIKE",
 		rule:     13,
 		severity: SeverityLoud,
-		note:     "MariaDB accepts RLIKE as a synonym of its infix REGEXP (its catalog usually normalizes it to `regexp`; this spelling is kept for any that does not). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU). Use --expr-override.",
+		note:     "MariaDB accepts RLIKE as a synonym of its infix REGEXP (its catalog usually normalizes it to `regexp`; this spelling is kept for any that does not). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU).",
 		infix:    true,
 	},
 	{
@@ -284,41 +309,41 @@ var gapPatterns = []gapPattern{
 		name:     "DIV",
 		rule:     31,
 		severity: SeverityLoud,
-		note:     "MySQL's integer-division operator renders infix in both MySQL 8 and MariaDB catalogs, and PostgreSQL does not parse it. Equivalent: `div(a, b)` (integer quotient truncating toward zero, matching MySQL). Use --expr-override.",
+		note:     "MySQL's integer-division operator renders infix in both MySQL 8 and MariaDB catalogs, and PostgreSQL does not parse it. Equivalent: `div(a, b)` (integer quotient truncating toward zero, matching MySQL).",
 		infix:    true,
 	},
 	{
 		name:     "MOD",
 		rule:     31,
 		severity: SeverityLoud,
-		note:     "MariaDB's catalog renders BOTH `a MOD b` and `a % b` as infix `MOD` (MySQL 8 renders both as `%`, which PostgreSQL parses). Equivalent: `a % b` or `mod(a, b)`, both keeping MySQL's dividend-sign semantics. Use --expr-override.",
+		note:     "MariaDB's catalog renders BOTH `a MOD b` and `a % b` as infix `MOD` (MySQL 8 renders both as `%`, which PostgreSQL parses). Equivalent: `a % b` or `mod(a, b)`, both keeping MySQL's dividend-sign semantics.",
 		infix:    true,
 	},
 	{
 		name:     "XOR",
 		rule:     31,
 		severity: SeverityLoud,
-		note:     "Neither MySQL 8 nor MariaDB rewrites logical `XOR` in catalog renderings, and PostgreSQL has no XOR operator. For boolean operands `(x) <> (y)` is equivalent, including NULL propagation. Use --expr-override.",
+		note:     "Neither MySQL 8 nor MariaDB rewrites logical `XOR` in catalog renderings, and PostgreSQL has no XOR operator. For boolean operands `(x) <> (y)` is equivalent, including NULL propagation.",
 		infix:    true,
 	},
 	{
 		name:     "!",
 		rule:     31,
 		severity: SeverityLoud,
-		note:     "MariaDB's catalog preserves the prefix `!` (MySQL's high-precedence NOT; MySQL 8 rewrites it away), and PostgreSQL does not parse it. Equivalent: `NOT (...)`. Use --expr-override.",
+		note:     "MariaDB's catalog preserves the prefix `!` (MySQL's high-precedence NOT; MySQL 8 rewrites it away), and PostgreSQL does not parse it. Equivalent: `NOT (...)`.",
 		prefix:   true,
 	},
 	{
 		name:     "FIND_IN_SET",
 		rule:     21,
 		severity: SeverityLoud,
-		note:     "No portable PG equivalent in CHECK/GENERATED contexts. PG's `(needle = ANY(string_to_array(csv, ',')))` covers membership-only; the full position semantic needs a LATERAL subquery which is invalid in CHECK/GENERATED. Refactor to IN() or use --expr-override.",
+		note:     "No portable PG equivalent in CHECK/GENERATED contexts. PG's `(needle = ANY(string_to_array(csv, ',')))` covers membership-only; the full position semantic needs a LATERAL subquery which is invalid in CHECK/GENERATED. Refactor to IN().",
 	},
 	{
 		name:     "CONVERT_TZ",
 		rule:     23,
 		severity: SeverityLoud,
-		note:     "PG has no CONVERT_TZ function. Equivalent: `(ts AT TIME ZONE 'from' AT TIME ZONE 'to')`. Semantics depend on the column's timestamp-vs-timestamptz type; verify before using --expr-override.",
+		note:     "PG has no CONVERT_TZ function. Equivalent: `(ts AT TIME ZONE 'from' AT TIME ZONE 'to')`. Semantics depend on the column's timestamp-vs-timestamptz type; verify against it before adopting the equivalent.",
 	},
 	{
 		name:     "INET_ATON",
@@ -336,14 +361,14 @@ var gapPatterns = []gapPattern{
 		name:        "SHA1",
 		rule:        10,
 		severity:    SeverityLoud,
-		note:        "PG core has no sha1(). v0.38.0 ships SHA1 → encode(digest(x, 'sha1'), 'hex') GATED on `--enable-pg-extension pgcrypto`. Pass the flag (and ensure pgcrypto is installed on the target) for the auto-rewrite, or use --expr-override.",
+		note:        "PG core has no sha1(). v0.38.0 ships SHA1 → encode(digest(x, 'sha1'), 'hex') GATED on `--enable-pg-extension pgcrypto`. Pass the flag (and ensure pgcrypto is installed on the target) for the auto-rewrite.",
 		requiresExt: "pgcrypto",
 	},
 	{
 		name:        "SHA2",
 		rule:        10,
 		severity:    SeverityLoud,
-		note:        "PG core has no sha2(). v0.38.0 ships SHA2 → encode(digest(x, '<algo>'), 'hex') GATED on `--enable-pg-extension pgcrypto`. Pass the flag (and ensure pgcrypto is installed on the target) for the auto-rewrite, or use --expr-override.",
+		note:        "PG core has no sha2(). v0.38.0 ships SHA2 → encode(digest(x, '<algo>'), 'hex') GATED on `--enable-pg-extension pgcrypto`. Pass the flag (and ensure pgcrypto is installed on the target) for the auto-rewrite.",
 		requiresExt: "pgcrypto",
 	},
 }
@@ -423,6 +448,8 @@ func RefuseOnLoudGaps(
 		default:
 			fmt.Fprintf(&b, ": %s() has no portable PostgreSQL equivalent. %s", g.Pattern, g.Note)
 		}
+		b.WriteByte(' ')
+		b.WriteString(g.Remedy())
 	}
 	return errors.New(b.String())
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -480,18 +481,102 @@ func TestSeverity_String(t *testing.T) {
 	}
 }
 
-// TestScanMySQLToPGGaps_NoteWording sanity check: each pattern's
-// advisory note mentions either `--expr-override` or `--type-override`
-// or `--enable-pg-extension`, so operators always see an actionable
-// workaround.
+// TestScanMySQLToPGGaps_NoteWording pins the Bug 247 division of
+// labour: pattern-level notes carry the technical advisory (what
+// diverges, the PG equivalent) and NEVER recommend `--expr-override`
+// — whether that flag can run depends on the SITE (it rewrites only
+// generated-column bodies; ApplyExpressionOverrides errors on CHECK /
+// DEFAULT targets), and the site-aware [Gap.Remedy] is the one remedy
+// carrier. A note that recommends the flag re-creates the unrunnable
+// hint Bug 247 filed.
 func TestScanMySQLToPGGaps_NoteWording(t *testing.T) {
 	for _, pat := range gapPatterns {
-		hint := strings.Contains(pat.note, "--expr-override") ||
-			strings.Contains(pat.note, "--type-override") ||
-			strings.Contains(pat.note, "--enable-pg-extension")
-		if !hint {
-			t.Errorf("pattern %q note has no actionable workaround mention: %q",
+		if strings.Contains(pat.note, "--expr-override") {
+			t.Errorf("pattern %q note recommends --expr-override; remedies are site-aware and live in Gap.Remedy (Bug 247): %q",
 				pat.name, pat.note)
 		}
+	}
+}
+
+// TestGapRemedy_SiteAware pins the per-site remedy contract (Bug 247):
+// a GENERATED site recommends `--expr-override`; CHECK and DEFAULT
+// sites recommend `--exclude-table` + fix-on-source and explicitly say
+// the override does not apply — because ApplyExpressionOverrides
+// rewrites only generated-column bodies and errors on anything else
+// (that premise is pinned by TestGapRemedy_ExprOverridePremise below;
+// the two tests are deliberately adjacent so a future override-scope
+// widening flips both).
+func TestGapRemedy_SiteAware(t *testing.T) {
+	gen := Gap{Field: "GENERATED"}.Remedy()
+	if !strings.Contains(gen, "--expr-override") {
+		t.Errorf("GENERATED remedy must recommend --expr-override: %q", gen)
+	}
+	if strings.Contains(gen, "does not apply") {
+		t.Errorf("GENERATED remedy must not carry the does-not-apply caveat: %q", gen)
+	}
+	for _, field := range []string{"CHECK", "DEFAULT"} {
+		r := Gap{Field: field}.Remedy()
+		if !strings.Contains(r, "--exclude-table") {
+			t.Errorf("%s remedy must name --exclude-table: %q", field, r)
+		}
+		if !strings.Contains(r, "`--expr-override` does not apply") {
+			t.Errorf("%s remedy must state --expr-override does not apply: %q", field, r)
+		}
+		if !strings.Contains(r, "on the source") {
+			t.Errorf("%s remedy must offer the fix-on-source path: %q", field, r)
+		}
+	}
+}
+
+// TestGapRemedy_ExprOverridePremise binds the premise the site-aware
+// remedies rest on: ApplyExpressionOverrides really does refuse a
+// non-generated target. If overrides ever learn CHECK/DEFAULT sites,
+// this fails and the Remedy()/wrapper wording (and their pins above)
+// must be revisited together — without this pin the messages would
+// silently keep denying a flag that had started working.
+func TestGapRemedy_ExprOverridePremise(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "t",
+		Columns: []*ir.Column{{
+			Name: "plain",
+			Type: ir.Integer{Width: 32},
+		}},
+	}}}
+	_, err := ApplyExpressionOverrides(s, []config.ExpressionMapping{
+		{Table: "t", Column: "plain", Expression: "1"},
+	})
+	if err == nil {
+		t.Fatal("ApplyExpressionOverrides accepted a non-generated column; the Bug 247 site-aware remedy wording (Gap.Remedy, RefuseOnUntranslatableExprs) rests on it refusing — revisit both together")
+	}
+	if !strings.Contains(err.Error(), "not a generated column") {
+		t.Errorf("unexpected refusal shape: %v", err)
+	}
+}
+
+// TestRefuseOnLoudGaps_GeneratedSiteRemedy pins the curated refusal's
+// GENERATED-site rendering (Bug 247's positive direction): the message
+// recommends `--expr-override` — which genuinely runs for a generated
+// column — and carries no does-not-apply caveat. The CHECK-site
+// direction is pinned by the rendering tests in
+// pgvalidity_infix_test.go (assertCheckSiteRemedy).
+func TestRefuseOnLoudGaps_GeneratedSiteRemedy(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "g",
+		Columns: []*ir.Column{{
+			Name:                 "flag",
+			Type:                 ir.Integer{Width: 32},
+			GeneratedExpr:        "FIND_IN_SET(status, 'a,b')",
+			GeneratedExprDialect: "mysql",
+		}},
+	}}}
+	err := RefuseOnLoudGaps(s, "mysql", "postgres", "migrate", nil)
+	if err == nil {
+		t.Fatal("want the curated refusal for FIND_IN_SET in a GENERATED body, got nil")
+	}
+	if !strings.Contains(err.Error(), "--expr-override") {
+		t.Errorf("GENERATED-site refusal must recommend --expr-override:\n%s", err)
+	}
+	if strings.Contains(err.Error(), "does not apply") {
+		t.Errorf("GENERATED-site refusal must not deny --expr-override:\n%s", err)
 	}
 }

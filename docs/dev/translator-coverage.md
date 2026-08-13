@@ -387,7 +387,8 @@ excluded from the candidate list:
   `INET_NTOA`, full-text functions. Adding a rule that emits an
   extension-dependent expression violates the "contain Postgres
   complexity" tenet — the operator should opt in to the extension
-  and use `--expr-override`.
+  and use `--expr-override` (generated columns) or a source-side
+  rewrite (CHECK/DEFAULT sites).
 - **Compound INTERVAL units.** `INTERVAL '5 1' HOUR_MINUTE` and
   similar — MySQL accepts dozens of unit combinations; PG only
   accepts the singular forms. Translating the table of compound
@@ -436,7 +437,8 @@ The pattern is small and well-established. To add a new rule:
 6. **Run the pre-commit hook.** `gofumpt`, `go vet`,
    `golangci-lint run`, `go test ./...` — same gate that CI runs.
 7. **Leave the rule out** if any of the following apply, and instead
-   document the construct as `--expr-override`-territory:
+   document the construct as override/fix-on-source territory
+   (`--expr-override` runs only for generated columns — Bug 247):
    - The PG equivalent depends on an extension sluice doesn't
      install (`pgcrypto`, `uuid-ossp` on PG <13, full-text-search
      dictionaries).

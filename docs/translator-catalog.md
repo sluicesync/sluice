@@ -21,8 +21,13 @@ divergence (or where the divergence is documented + bounded).
 **Deferred rules** — sluice refuses loudly OR emits a structured
 WARN with an actionable hint. These are the rules where the
 surface looks similar across engines but the semantics diverge in
-ways an auto-rewrite would silently misrepresent. The
-`--expr-override` flag is the always-available escape hatch.
+ways an auto-rewrite would silently misrepresent. The escape hatch
+depends on where the expression lives: `--expr-override` for
+generated columns; for CHECK constraints and DEFAULTs — where the
+override cannot run (it rewrites only generated-column bodies and
+errors on anything else) — `--exclude-table` or fixing the
+expression on the source and re-creating it on the target in PG
+syntax (v0.124.1, Bug 247).
 
 The third invisible tier — **verbatim passthrough** — exists for
 shapes that translate exactly across engines (column references,
@@ -95,12 +100,12 @@ semantics. The full reasoning per rule lives at
 
 | Rule | Source | Why deferred | Workaround |
 |---|---|---|---|
-| **#11** `GREATEST` / `LEAST` | MySQL | PG accepts but ignores NULL args; MySQL returns NULL on any NULL arg. Silent semantic divergence. | Wrap with `COALESCE` per arg, or `--expr-override`. |
-| **#13** `REGEXP_LIKE` | PG 15+ | PG uses POSIX regex flavour; MySQL uses ICU. Lookaheads, named groups, Unicode property classes don't translate. | `--expr-override` with `x ~ 'pattern'` for compatible patterns. |
-| **#21** `FIND_IN_SET` | MySQL | Full position semantic needs a `LATERAL` subquery, which is invalid in CHECK/GENERATED contexts. PG's `(needle = ANY(string_to_array(csv, ',')))` covers membership-only. | Refactor to `IN()` or `--expr-override`. |
-| **#23** `CONVERT_TZ` | MySQL | PG's `AT TIME ZONE` semantics depend on timestamp-vs-timestamptz column type. Auto-rewrite would silently misbehave on the timestamp-without-tz case. | `--expr-override` after deciding the right `AT TIME ZONE` shape for your column. |
+| **#11** `GREATEST` / `LEAST` | MySQL | PG accepts but ignores NULL args; MySQL returns NULL on any NULL arg. Silent semantic divergence. | Wrap with `COALESCE` per arg — via `--expr-override` for a generated column, on the source otherwise. |
+| **#13** `REGEXP_LIKE` | PG 15+ | PG uses POSIX regex flavour; MySQL uses ICU. Lookaheads, named groups, Unicode property classes don't translate. | `x ~ 'pattern'` for compatible patterns — via `--expr-override` (generated columns) or a source-side rewrite. |
+| **#21** `FIND_IN_SET` | MySQL | Full position semantic needs a `LATERAL` subquery, which is invalid in CHECK/GENERATED contexts. PG's `(needle = ANY(string_to_array(csv, ',')))` covers membership-only. | Refactor to `IN()` — on the source for CHECK sites; `--expr-override` for generated columns. |
+| **#23** `CONVERT_TZ` | MySQL | PG's `AT TIME ZONE` semantics depend on timestamp-vs-timestamptz column type. Auto-rewrite would silently misbehave on the timestamp-without-tz case. | Decide the right `AT TIME ZONE` shape for your column, then `--expr-override` (generated columns) or a source-side rewrite. |
 | **#29** `INET_ATON` / `INET_NTOA` | MySQL | No portable PG equivalent in core; would need a custom `IMMUTABLE` function on every target. | Best path: change the column type to PG's native `inet` via `--type-override`. |
-| **#31** infix `DIV` / `MOD` / `XOR`, prefix `!` | MySQL 8 + MariaDB catalog renderings (v0.124.0) | PostgreSQL parses none of the four spellings, so they died in PG's parser mid-migrate; blind textual rewrites are unsafe (`XOR`'s numeric-truthiness semantics, `!`'s precedence). MariaDB renders infix `MOD` for BOTH `a MOD b` and `a % b` source spellings; MySQL 8 renders both as `%`, which PG parses. | The refusal names the equivalent per operator: `div(a, b)`; `a % b` / `mod(a, b)`; `(x) <> (y)` for boolean operands; `NOT (...)`. `--expr-override` per site. The general backstop also refuses bare `INTERVAL n unit` (PG spells it `interval '1 day'`), column-level `COLLATE` (MySQL collations don't exist on PG), and `MEMBER OF` (jsonb `?`/`@>` are the nearest equivalents). |
+| **#31** infix `DIV` / `MOD` / `XOR`, prefix `!` | MySQL 8 + MariaDB catalog renderings (v0.124.0) | PostgreSQL parses none of the four spellings, so they died in PG's parser mid-migrate; blind textual rewrites are unsafe (`XOR`'s numeric-truthiness semantics, `!`'s precedence). MariaDB renders infix `MOD` for BOTH `a MOD b` and `a % b` source spellings; MySQL 8 renders both as `%`, which PG parses. | The refusal names the equivalent per operator: `div(a, b)`; `a % b` / `mod(a, b)`; `(x) <> (y)` for boolean operands; `NOT (...)`. Escapes are per site: `--expr-override` for generated columns; `--exclude-table` or a source-side rewrite for CHECK/DEFAULT sites (the override cannot run there — Bug 247). The general backstop also refuses bare `INTERVAL n unit` (PG spells it `interval '1 day'`), column-level `COLLATE` (MySQL collations don't exist on PG), and `MEMBER OF` (jsonb `?`/`@>` are the nearest equivalents). |
 
 `internal/translate/gaps.go` also classifies each by severity:
 
@@ -112,7 +117,8 @@ semantics. The full reasoning per rule lives at
 - **SeveritySilent** — sluice WARNs at preview but doesn't refuse.
   Examples: `GREATEST`, `LEAST`, `REGEXP_LIKE`. The semantic divergence
   is real but bounded; operators with the affected shape see the WARN
-  and decide whether `--expr-override` is needed.
+  and decide whether an override (`--expr-override`, generated columns
+  only) or a source-side rewrite is needed.
 
 ## Escape hatches
 
@@ -128,9 +134,14 @@ naïve `integer`).
 
 ### `--expr-override TABLE.COL=<expression>`
 
-Rewrites a column's `DEFAULT` or `GENERATED` expression. Use when
-the auto-translator's choice doesn't match what you want. The
-override is per-column, applied at the emit boundary.
+Rewrites a **generated column's** expression body. Use when the
+auto-translator's choice doesn't match what you want. The override
+is per-column, applied at the emit boundary — and it applies to
+generated columns ONLY: targeting a non-generated column is an
+error, so `DEFAULT` expressions and `CHECK` constraints cannot be
+overridden. For those sites the escapes are `--exclude-table` or
+fixing the expression on the source (Bug 247 — earlier refusal
+messages wrongly recommended the override there).
 
 ### YAML `mappings:` + `expression_overrides:`
 
