@@ -80,7 +80,7 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 		if strings.TrimSpace(ddl) == "" {
 			return fmt.Errorf("d1 stage: no CREATE TABLE sql for %q (cannot stage faithfully)", t.Name)
 		}
-		if _, err := db.ExecContext(ctx, ddl); err != nil {
+		if err := execEmittedDDL(ctx, db, ddl); err != nil {
 			return fmt.Errorf("d1 stage: create table %q: %w", t.Name, err)
 		}
 	}
@@ -107,7 +107,7 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 			if strings.TrimSpace(ddl) == "" {
 				continue // auto-index recreated by the table DDL
 			}
-			if _, err := db.ExecContext(ctx, ddl); err != nil {
+			if err := execEmittedDDL(ctx, db, ddl); err != nil {
 				return fmt.Errorf("d1 stage: create index %q: %w", idx.Name, err)
 			}
 		}

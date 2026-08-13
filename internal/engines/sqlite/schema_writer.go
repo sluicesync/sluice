@@ -107,7 +107,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		if err != nil {
 			return err
 		}
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("sqlite: create table %q: %w", table.Name, err)
 		}
 	}
@@ -158,7 +158,7 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 			if err != nil {
 				return err
 			}
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 				return fmt.Errorf("sqlite: create index %q on %q: %w", idx.Name, table.Name, err)
 			}
 		}
@@ -175,7 +175,7 @@ func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error 
 	if table == nil {
 		return errors.New("sqlite: AnalyzeTable: table is nil")
 	}
-	if _, err := w.db.ExecContext(ctx, "ANALYZE "+quoteIdent(table.Name)); err != nil {
+	if err := execEmittedDDL(ctx, w.db, "ANALYZE "+quoteIdent(table.Name)); err != nil {
 		return fmt.Errorf("sqlite: analyze %q: %w", table.Name, err)
 	}
 	return nil
@@ -268,7 +268,7 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 				view.Name,
 			)
 		}
-		if _, err := w.db.ExecContext(ctx, emitCreateView(view)); err != nil {
+		if err := execEmittedDDL(ctx, w.db, emitCreateView(view)); err != nil {
 			return fmt.Errorf("sqlite: create view %q: %w", view.Name, err)
 		}
 	}
