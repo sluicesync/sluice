@@ -2676,6 +2676,18 @@ type vstreamSnapshotRows struct {
 // bound). Guarded by mu so a late call from the orchestrator races
 // cleanly with the already-running pump; the constructor seeds the
 // 64 MiB default so the bound holds even when this is never called.
+//
+// The CONCURRENT cross-table COPY gates its producers on the per-stream
+// sub-budgets (perStreamCap = maxBufferBytes / K, ADR-0099 §2), which
+// the pump derives ONCE when it starts — and the pipeline applies
+// `--max-buffer-bytes` through this setter AFTER the reader is open, so
+// the operator's cap used to update only the shared field the
+// concurrent producers never consult, leaving the sub-budgets at
+// default/K (audit 2026-08-11 VST-1 — "--max-buffer-bytes effectively
+// ignored on the concurrent COPY"). The setter now re-derives the
+// sub-budget with the pump's own formula whenever the concurrent budget
+// is armed; both call orders are correct (a setter that lands before
+// the pump's derivation feeds it via maxBufferBytes as before).
 func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
 	s := r.snap
 	s.mu.Lock()
@@ -2685,6 +2697,15 @@ func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
 		s.maxBufferBytes = 1 << 62
 	} else {
 		s.maxBufferBytes = bytes
+	}
+	if k := len(s.perStreamBytes); k > 0 {
+		// Same formula + floor as copyPumpAutoShardConcurrent: cap/K,
+		// never below one byte so a tiny cap degrades to
+		// one-row-at-a-time rather than wedging.
+		s.perStreamCap = s.maxBufferBytes / int64(k)
+		if s.perStreamCap < 1 {
+			s.perStreamCap = 1
+		}
 	}
 	if s.cond != nil {
 		s.cond.Broadcast()

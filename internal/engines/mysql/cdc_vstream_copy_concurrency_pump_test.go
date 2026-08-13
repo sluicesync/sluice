@@ -312,6 +312,65 @@ func TestVStreamConcurrent_BoundedMemory(t *testing.T) {
 	}
 }
 
+// TestVStreamConcurrent_SetMaxBufferBytesReachesPerStreamCap is the VST-1
+// pin (audit 2026-08-11): the concurrent COPY gates its producers on
+// perStreamCap = maxBufferBytes / K, derived once when the pump starts — and
+// the pipeline applies --max-buffer-bytes through ir.MaxBufferBytesSetter
+// AFTER the reader is open, so the operator's cap updated only the shared
+// field the concurrent producers never consult and the sub-budgets stayed at
+// default/K (64 MiB / K, whatever the operator asked for). The setter now
+// re-derives the sub-budget under the same lock with the pump's own formula.
+// The sibling TestVStreamConcurrent_BoundedMemory proves the sub-budget
+// mechanism bounds memory when the cap is right (its harness seeds the cap
+// PRE-pump, which is why it never caught this); this pin proves the
+// operator's post-open setter now feeds that mechanism — together they
+// compose into the end-to-end claim.
+func TestVStreamConcurrent_SetMaxBufferBytesReachesPerStreamCap(t *testing.T) {
+	s := newTestSnapshotStream()
+	r := &vstreamSnapshotRows{snap: s}
+
+	// The non-concurrent shape first: no per-stream budget armed, so the
+	// setter must touch only the shared cap (the sequential pump consults
+	// maxBufferBytes directly and was never affected by VST-1).
+	r.SetMaxBufferBytes(1 << 20)
+	if s.perStreamCap != 0 {
+		t.Fatalf("sequential path: perStreamCap = %d; want 0 (untouched)", s.perStreamCap)
+	}
+	if s.maxBufferBytes != 1<<20 {
+		t.Fatalf("sequential path: maxBufferBytes = %d; want %d", s.maxBufferBytes, 1<<20)
+	}
+
+	// Arm the concurrent budget exactly as copyPumpAutoShardConcurrent
+	// does (K=4 from the default), then apply the operator's cap the way
+	// the pipeline does — AFTER the pump derived the sub-budgets.
+	const k = 4
+	s.mu.Lock()
+	s.maxBufferBytes = defaultSnapshotMaxBufferBytes
+	s.perStreamBytes = make([]int64, k)
+	s.perStreamCap = s.maxBufferBytes / k
+	s.mu.Unlock()
+
+	r.SetMaxBufferBytes(1 << 20)
+	if want := int64(1<<20) / k; s.perStreamCap != want {
+		t.Fatalf("post-open setter: perStreamCap = %d; want %d — the operator's --max-buffer-bytes "+
+			"does not reach the sub-budgets the concurrent producers actually gate on (VST-1)",
+			s.perStreamCap, want)
+	}
+
+	// The no-cap arm scales the sub-budgets out of the way too.
+	r.SetMaxBufferBytes(0)
+	if want := int64(1<<62) / k; s.perStreamCap != want {
+		t.Fatalf("no-cap arm: perStreamCap = %d; want %d", s.perStreamCap, want)
+	}
+
+	// The floor: a cap smaller than K degrades to one-row-at-a-time per
+	// stream, never a zero budget that would wedge every producer.
+	r.SetMaxBufferBytes(2)
+	if s.perStreamCap != 1 {
+		t.Fatalf("floor arm: perStreamCap = %d; want 1", s.perStreamCap)
+	}
+}
+
 // TestVStreamConcurrent_StreamErrorAbortsLoudly pins ADR-0099 §6: any
 // stream's failure aborts the whole copy LOUDLY with no global position
 // advance. One table's script emits a ROW with no preceding FIELD (the
