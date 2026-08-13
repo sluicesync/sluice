@@ -187,25 +187,30 @@ const DefaultChainRestoreBatchSize = 100
 // length ceiling; this is a coherent phase, and it is the declaration
 // TestIndexEmitPreflightReachesEveryCopyEntryPoint rosters for this path.
 func (r *ChainRestore) refuseUnrepresentableTargetShape(ctx context.Context, schema *ir.Schema) error {
-	if err := migcore.PreflightTableEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+	// Bug 244 sibling (closed 2026-08-13): grade the FILTERED view — the
+	// same reasoning as the single-manifest twin, and the shallow copy
+	// matters here: this door receives the ROOT manifest's schema, which
+	// later segments re-read, so it must not be trimmed in place.
+	sv := filteredSchemaView(schema, r.Filter)
+	if err := migcore.PreflightTableEmit(ctx, r.Target, sv, "chain restore"); err != nil {
 		return err
 	}
-	if err := migcore.PreflightIndexEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+	if err := migcore.PreflightIndexEmit(ctx, r.Target, sv, "chain restore"); err != nil {
 		return err
 	}
-	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+	if err := migcore.PreflightViewEmit(ctx, r.Target, sv, "chain restore"); err != nil {
 		return err
 	}
 	// The COLUMN-TYPE member, on the ROOT manifest's schema — the shape the
 	// target tables are created from. Same pre-retarget note as its
 	// single-manifest twin: safe because the emit-lane retarget mirrors the
 	// MySQL emitter, pinned by TestPreflightColumnTypes_IsRetargetInvariant.
-	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, schema, "chain restore"); err != nil {
+	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, sv, "chain restore"); err != nil {
 		return err
 	}
 	// Item 149: the chain's table names may only collide once the TARGET
 	// server's fold is applied, which is not knowable from the manifest.
-	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, schema, "chain restore")
+	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, sv, "chain restore")
 }
 
 // Run executes the lineage-walk restore (ADR-0046 §3). Returns nil on

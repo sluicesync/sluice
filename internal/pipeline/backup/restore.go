@@ -456,16 +456,28 @@ func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, m *irbac
 		filteredSchemaLexProblems(m, schema, r.Filter)); err != nil {
 		return err
 	}
-	if err := refuseVerbatimManifestRestoreToNonPG(schema, r.Target); err != nil {
+	// Bug 244 sibling (backlog 2026-08-11, closed 2026-08-13): every gate
+	// below grades the FILTERED view, for the same reason the lex door
+	// above does — these preflights predict what the run will emit, the
+	// run emits the filtered schema (migcore.ApplyTableFilter, further
+	// down in Run), and `--exclude-table=<affected>` is the documented
+	// route around exactly the table whose shape the target cannot hold.
+	// A filter-blind gate refused the whole restore on an excluded
+	// table's unrepresentable index/column/name — defeating its own
+	// remedy, the Bug 244 shape one phase earlier. The fold preflight in
+	// particular must grade the KEPT set only: a fold collision with an
+	// excluded table is not a collision on the target.
+	sv := filteredSchemaView(schema, r.Filter)
+	if err := refuseVerbatimManifestRestoreToNonPG(sv, r.Target); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
-	if err := migcore.PreflightTableEmit(ctx, r.Target, schema, "restore"); err != nil {
+	if err := migcore.PreflightTableEmit(ctx, r.Target, sv, "restore"); err != nil {
 		return err
 	}
-	if err := migcore.PreflightIndexEmit(ctx, r.Target, schema, "restore"); err != nil {
+	if err := migcore.PreflightIndexEmit(ctx, r.Target, sv, "restore"); err != nil {
 		return err
 	}
-	if err := migcore.PreflightViewEmit(ctx, r.Target, schema, "restore"); err != nil {
+	if err := migcore.PreflightViewEmit(ctx, r.Target, sv, "restore"); err != nil {
 		return err
 	}
 	// The COLUMN-TYPE member. NOTE the schema it is handed: this phase runs on
@@ -475,13 +487,35 @@ func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, m *irbac
 	// auto-emit arms, so every type it would rewrite the emitter already
 	// accepts unrewritten — a premise pinned, rather than asserted, by
 	// TestPreflightColumnTypes_IsRetargetInvariant in internal/engines/mysql.
-	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, schema, "restore"); err != nil {
+	if err := migcore.PreflightColumnTypeEmit(ctx, r.Target, sv, "restore"); err != nil {
 		return err
 	}
 	// Item 149: the archive's own table names, against the fold of the server
 	// this restore is pointed at. A backup taken from a case-sensitive MySQL
 	// (or from Postgres) can hold a pair that only collides on the target.
-	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, schema, "restore")
+	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, sv, "restore")
+}
+
+// filteredSchemaView returns schema restricted to filter-allowed tables,
+// as a SHALLOW copy that never mutates the input — the chain-restore
+// door hands it the ROOT manifest's schema, which later segments
+// re-read (the "schema must not be mutated" contract at ChainRestore's
+// dispatch). An empty filter returns schema itself. Views and sequences
+// are deliberately untouched: the table filter is table-scoped, the
+// gates this feeds grade tables, and sequence pruning stays where the
+// real filter application does it ([migcore.ApplyTableFilter]).
+func filteredSchemaView(s *ir.Schema, filter migcore.TableFilter) *ir.Schema {
+	if s == nil || filter.IsEmpty() {
+		return s
+	}
+	out := *s
+	out.Tables = make([]*ir.Table, 0, len(s.Tables))
+	for _, t := range s.Tables {
+		if t != nil && filter.Allows(t.Name) {
+			out.Tables = append(out.Tables, t)
+		}
+	}
+	return &out
 }
 
 func (r *Restore) Run(ctx context.Context) error {
