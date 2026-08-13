@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -111,6 +112,123 @@ func countKnownRows(t *testing.T, ctx context.Context, dsn string) int {
 		t.Fatalf("count known: %v", err)
 	}
 	return n
+}
+
+// TestChangeApplier_SkippedTable_MariaDBValuesSpelling closes the C-11
+// value-fidelity residual (audit backlog 2026-08-12, item 1): the skip
+// ledger's upsert is flavor-dispatched — MySQL 8 takes the row-alias
+// spelling, MariaDB takes `VALUES(col)` — and every prior real-server
+// pin ran on MySQL 8, so the MariaDB arm's SQL had never executed
+// against the server that requires it (a failure would be a loud SQL
+// error on the first skip increment, mid-incident). This drives the
+// FULL applier on a real MariaDB — flavor selection included, per the
+// Bug 180 pin-through-the-layer lesson — through a first sighting
+// (INSERT arm) and a second skip (the ON DUPLICATE KEY UPDATE arm,
+// which is where the VALUES() spelling actually lives). One LTS image
+// suffices: the spelling is a grammar fact, not a per-line rendering
+// (the per-line matrices cover rendering-shape drift).
+func TestChangeApplier_SkippedTable_MariaDBValuesSpelling(t *testing.T) {
+	dsn := newMariaDB(t, mariadb114Image, "skip_mdb")
+
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE known (
+			id   BIGINT PRIMARY KEY,
+			body TEXT   NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`)
+	_ = captureSkipWarns(t)
+
+	eng := Engine{Flavor: FlavorMariaDB}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	pos := func(tok string) ir.Position { return ir.Position{Engine: "mysql", Token: tok} }
+	events := []ir.Change{
+		ir.TxBegin{Position: pos(`{"gtid":"begin"}`)},
+		ir.Insert{Schema: "skip_mdb", Table: "known", Row: ir.Row{"id": int64(1), "body": "kept"}, Position: pos(`{"gtid":"k1"}`)},
+		ir.Insert{Schema: "skip_mdb", Table: skipTableName, Row: ir.Row{"id": int64(1)}, Position: pos(skipTokFirst)},
+		ir.Delete{Schema: "skip_mdb", Table: skipTableName, Before: ir.Row{"id": int64(1)}, Position: pos(skipTokLast)},
+		ir.TxCommit{Position: pos(skipTokCommitTok)},
+	}
+	pumpChanges(t, ctx, applier, events)
+
+	// The known table's row landed (the data-path upsert spelling ran
+	// too) and the ledger carries insert-then-increment with verbatim
+	// tokens — the VALUES() arm executed against the server that
+	// requires it.
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM known").Scan(&n); err != nil {
+		t.Fatalf("count known: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("known rows = %d; want 1", n)
+	}
+	assertSkipRecord(t, listSkips(t, ctx, applier), "skip_mdb."+skipTableName, 2, skipTokFirst, skipTokLast)
+}
+
+// TestChangeApplier_SkippedTable_PositionTokenBeyond64KB closes the
+// C-11 value-fidelity residual item 2: first_position/last_position are
+// LONGTEXT by the item-65a precedent (a VGTID set can exceed TEXT's
+// 64 KB), but no pin had ever pushed a token past that boundary — a
+// silent truncation (or a strict-mode refusal) at 64 KB would have
+// looked exactly like coverage. A VGTID-shaped ~96 KB token rides one
+// skipped event through the full applier and must round-trip
+// byte-exact through the ledger.
+func TestChangeApplier_SkippedTable_PositionTokenBeyond64KB(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+	_ = captureSkipWarns(t)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// A VGTID-shaped token: many shard entries, ~96 KB total — well past
+	// TEXT's 64 KB cap, well under LONGTEXT's.
+	var b strings.Builder
+	b.WriteString(`{"shard_gtids":[`)
+	for i := 0; b.Len() < 96*1024; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"keyspace":"commerce","shard":"%04d-%04d","gtid":"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-%d"}`, i, i+1, 1000000+i)
+	}
+	b.WriteString(`]}`)
+	giant := b.String()
+
+	pos := func(tok string) ir.Position { return ir.Position{Engine: "mysql", Token: tok} }
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.TxBegin{Position: pos(`{"gtid":"begin"}`)},
+		ir.Insert{Schema: "target_db", Table: skipTableName, Row: ir.Row{"id": int64(1)}, Position: pos(giant)},
+		ir.TxCommit{Position: pos(skipTokCommitTok)},
+	})
+
+	assertSkipRecord(t, listSkips(t, ctx, applier), "target_db."+skipTableName, 1, giant, giant)
 }
 
 // TestChangeApplier_SkippedTable_PerChangeApply drives the serial
