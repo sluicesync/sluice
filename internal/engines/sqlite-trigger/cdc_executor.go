@@ -621,13 +621,21 @@ func (e *d1Executor) pollChangeLog(ctx context.Context, sinceID int64, batch int
 		if err != nil {
 			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode tbl: %w", id, err)
 		}
+		// The before/after cells ARE captured row images, so an SQT-1
+		// unrepresentable-text refusal here gets the Bug 245 trigger-lane
+		// recovery too. Whether this transport can actually surface the
+		// raw bytes is the unmeasured D1-verbatim premise (backlog
+		// 2026-08-12) — if D1 mangles server-side the guard cannot fire
+		// here; the extension is correct in either world.
 		before, err := d1NullString(row["before"])
 		if err != nil {
-			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode before: %w", id, err)
+			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode before: %w%s",
+				id, err, capturedImageRemedy(err, id))
 		}
 		after, err := d1NullString(row["after"])
 		if err != nil {
-			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode after: %w", id, err)
+			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode after: %w%s",
+				id, err, capturedImageRemedy(err, id))
 		}
 		capturedAt, err := d1NullString(row["captured_at"])
 		if err != nil {

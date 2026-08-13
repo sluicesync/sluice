@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -571,11 +572,38 @@ func (r *CDCReader) decodeImage(table, jsonText string, id int64) (ir.Row, error
 		}
 		v, err := r.dec.Decode(cell.T, cell.V, t)
 		if err != nil {
-			return nil, fmt.Errorf("sqlite-trigger: table %q column %q id=%d: %w", table, col, id, err)
+			return nil, fmt.Errorf("sqlite-trigger: table %q column %q id=%d: %w%s",
+				table, col, id, err, capturedImageRemedy(err, id))
 		}
 		row[col] = v
 	}
 	return row, nil
+}
+
+// capturedImageRemedy extends an SQT-1 unrepresentable-text refusal with
+// the trigger-lane recovery, or returns "" for every other error (Bug
+// 245, filed by the v0.122.0 regression cycle). The shared guard's own
+// remedy — "repair the value at the source" — is complete for the lanes
+// that READ live values (D1 row reads, D1 staging, catalog scalars, the
+// snapshot phase), and on THIS lane it cannot unblock the stream alone:
+// the poison also lives in the already-captured change-log image the
+// refusal's id names, and the repairing base-row UPDATE itself captures
+// a NEW change whose before-image carries the poison — so an operator
+// who followed the old hint exactly re-halted on every restart, and the
+// runnable recovery was undocumented. Pinned behaviourally by
+// TestCapture_InvalidUTF8_RepairAloneRehaltsUntilTeardown.
+func capturedImageRemedy(err error, id int64) string {
+	var ute *sqlite.UnrepresentableTextError
+	if !errors.As(err, &ute) {
+		return ""
+	}
+	return fmt.Sprintf(" — on the trigger-CDC lane repairing the source row alone will NOT unblock the "+
+		"stream: the value above is the already-captured image in row id=%d of %q, and the repairing "+
+		"UPDATE captures a new change whose before-image carries the same bytes. Recover with "+
+		"`sluice trigger teardown`, repair the source row, then `sluice trigger setup` and a fresh sync "+
+		"(or, advanced, scrub the affected before/after images in %q directly — SQLite's JSON functions "+
+		"cannot locate invalid UTF-8, so the scrub is byte-level, e.g. matching hex(before/after))",
+		id, ChangeLogTable, ChangeLogTable)
 }
 
 // commitTime parses the change-log captured_at into the [ir.Change] source-commit

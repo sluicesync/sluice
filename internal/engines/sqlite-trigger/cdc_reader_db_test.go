@@ -6,6 +6,9 @@ package sqlitetrigger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +16,7 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go driver; lets these run in the unit gate (no Docker)
 
+	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -179,9 +183,15 @@ func TestCapture_FidelityMatrix(t *testing.T) {
 // The valid-text row ahead of the poison documents the batch-atomic refusal
 // semantics: poll builds its whole batch before emitting, so the refusal
 // withholds the faithful row TOO — and because the watermark only advances on
-// emit, a resume after the operator repairs the source re-reads and delivers
-// it. Halted, never skipped. (No-over-refusal on valid text is pinned by
-// TestCapture_FidelityMatrix and the jsonString unit controls.)
+// emit, a resume after a FULL repair re-reads and delivers it. Halted, never
+// skipped. "Full" is load-bearing (Bug 245): repairing the SOURCE row alone
+// does not unblock this lane — the poison lives in the captured change-log
+// image too, and the repairing UPDATE captures a new poisoned before-image —
+// which is why the refusal now prints the trigger-lane recovery, asserted
+// below and pinned behaviourally by
+// TestCapture_InvalidUTF8_RepairAloneRehaltsUntilTeardown. (No-over-refusal on
+// valid text is pinned by TestCapture_FidelityMatrix and the jsonString unit
+// controls.)
 func TestCapture_InvalidUTF8TextRefusesLoudly(t *testing.T) {
 	path := newSourceFile(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)`)
 	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
@@ -221,10 +231,128 @@ func TestCapture_InvalidUTF8TextRefusesLoudly(t *testing.T) {
 		t.Fatal("stream ended with nil Err after an invalid-UTF-8 capture; want the loud SQT-1 refusal " +
 			"(pre-fix this delivered the row silently mangled to U+FFFD)")
 	}
-	for _, want := range []string{"not valid UTF-8", `"t"`, `"txt"`} {
+	// The Bug 245 half: the remedy must be RUNNABLE on this lane. "repair
+	// the value at the source" alone re-halts (the poison is also in the
+	// captured image, and the repairing UPDATE captures a new poisoned
+	// before-image), so the message must name the change-log store and
+	// the teardown recovery.
+	for _, want := range []string{
+		"not valid UTF-8", `"t"`, `"txt"`,
+		ChangeLogTable, "trigger teardown", "trigger setup",
+	} {
 		if !strings.Contains(streamErr.Error(), want) {
 			t.Errorf("refusal should carry %s for the operator; got: %v", want, streamErr)
 		}
+	}
+}
+
+// TestCapturedImageRemedy_OnlyForUnrepresentableText pins both directions of
+// the Bug 245 message extension: the trigger-lane recovery attaches to the
+// SQT-1 unrepresentable-text refusal (including wrapped, as decodeImage wraps
+// it) and to NOTHING else — an "integer text is not an int64" corruption error
+// carrying "run trigger teardown" would send an operator to tear down a
+// healthy capture set over an unrelated defect.
+func TestCapturedImageRemedy_OnlyForUnrepresentableText(t *testing.T) {
+	_, _, uteErr := sqlite.JSONStringValue(json.RawMessage([]byte{'"', 0xFF, 0xFE, 'a', '"'}))
+	if uteErr == nil {
+		t.Fatal("the guarded extraction accepted invalid UTF-8; the SQT-1 refusal is gone")
+	}
+	got := capturedImageRemedy(fmt.Errorf("wrapped: %w", uteErr), 7)
+	for _, want := range []string{"id=7", ChangeLogTable, "trigger teardown", "trigger setup"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("remedy for the SQT-1 refusal should carry %q; got: %q", want, got)
+		}
+	}
+	if got := capturedImageRemedy(errors.New("integer text \"x\" is not a valid int64"), 7); got != "" {
+		t.Errorf("remedy attached to a non-SQT-1 error (over-match): %q", got)
+	}
+}
+
+// TestCapture_InvalidUTF8_RepairAloneRehaltsUntilTeardown is Bug 245's
+// behavioural pin — it drives the recovery the refusal PRINTS and proves both
+// of its claims: (1) repairing the source row alone re-halts the stream on
+// restart (the repairing UPDATE captured a new change whose before-image
+// carries the poison, and the original poisoned row is still ahead of the
+// unmoved watermark), and (2) `trigger teardown` + repair + `trigger setup`
+// + a fresh stream runs clean. If the reader ever learns to re-resolve or
+// skip-with-audit a repaired event (the filing's other fix direction —
+// operator-gated, see the audit backlog), claim (1) flips and this pin is
+// the place that notices.
+func TestCapture_InvalidUTF8_RepairAloneRehaltsUntilTeardown(t *testing.T) {
+	path := newSourceFile(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)`)
+	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	exec(t, path, `INSERT INTO t (id, txt) VALUES (3, CAST(x'FFFE61' AS TEXT))`)
+
+	drainAndErr := func(step string) error {
+		t.Helper()
+		r, err := openCDCReader(bg(), path)
+		if err != nil {
+			t.Fatalf("%s: openCDCReader: %v", step, err)
+		}
+		defer func() { _ = r.(interface{ Close() error }).Close() }()
+		ctx, cancel := context.WithTimeout(bg(), 30*time.Second)
+		defer cancel()
+		ch, err := r.StreamChanges(ctx, pos0(t))
+		if err != nil {
+			t.Fatalf("%s: StreamChanges: %v", step, err)
+		}
+		n := 0
+		for range ch {
+			n++
+		}
+		serr := r.(interface{ Err() error }).Err()
+		if serr == nil && n == 0 {
+			t.Fatalf("%s: stream delivered nothing and reported no error", step)
+		}
+		return serr
+	}
+
+	// (1) The initial halt, and the re-halt after following the OLD hint
+	// exactly: repair the source row, restart.
+	if err := drainAndErr("initial poison"); err == nil {
+		t.Fatal("initial poisoned insert did not halt the stream")
+	}
+	exec(t, path, `UPDATE t SET txt = 'repaired' WHERE id = 3`)
+	rehalt := drainAndErr("after source-only repair")
+	if rehalt == nil {
+		t.Fatal("stream ran clean after a source-only repair — Bug 245's re-halt no longer reproduces, " +
+			"so the refusal's trigger-lane recovery text overstates the problem; re-derive both")
+	}
+	if !strings.Contains(rehalt.Error(), "trigger teardown") {
+		t.Errorf("the re-halt should still print the runnable recovery; got: %v", rehalt)
+	}
+
+	// (2) The printed recovery, run as printed: teardown (drops the
+	// poisoned change log), source already repaired, re-setup, fresh
+	// stream — subsequent changes flow clean.
+	if _, err := Teardown(bg(), path, TeardownOptions{}); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("re-Setup: %v", err)
+	}
+	exec(t, path, `UPDATE t SET txt = 'post-recovery' WHERE id = 3`)
+
+	r, err := openCDCReader(bg(), path)
+	if err != nil {
+		t.Fatalf("post-recovery openCDCReader: %v", err)
+	}
+	defer func() { _ = r.(interface{ Close() error }).Close() }()
+	changes := collect(t, r, pos0(t), 1)
+	if len(changes) != 1 {
+		t.Fatalf("post-recovery stream delivered %d changes; want 1", len(changes))
+	}
+	upd, ok := changes[0].(ir.Update)
+	if !ok {
+		t.Fatalf("post-recovery change = %#v; want ir.Update", changes[0])
+	}
+	if got := upd.After["txt"]; got != "post-recovery" {
+		t.Errorf("post-recovery After.txt = %#v; want %q", got, "post-recovery")
+	}
+	if serr := r.(interface{ Err() error }).Err(); serr != nil {
+		t.Errorf("post-recovery stream Err = %v; want nil (the printed recovery must actually run clean)", serr)
 	}
 }
 

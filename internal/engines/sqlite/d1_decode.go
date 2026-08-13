@@ -114,14 +114,14 @@ func jsonString(raw json.RawMessage) (s string, ok bool, err error) {
 		return "", false, nil
 	}
 	if !utf8.Valid(raw) {
-		return "", false, fmt.Errorf(
+		return "", false, unrepresentableTextErrorf(
 			"value is not valid UTF-8 (encoding/json would silently rewrite each invalid byte to U+FFFD, "+
 				"diverging from the bytes the snapshot phase carried); the source value is intact — store "+
 				"raw bytes as BLOB rather than TEXT, or repair the value at the source: %q", raw,
 		)
 	}
 	if off, found := loneSurrogateEscapeAt(raw); found {
-		return "", false, fmt.Errorf(
+		return "", false, unrepresentableTextErrorf(
 			"value carries a lone UTF-16 surrogate escape at byte %d (encoding/json would silently rewrite "+
 				"it to U+FFFD); the captured JSON is malformed — repair the value at the source: %q", off, raw,
 		)
@@ -130,6 +130,30 @@ func jsonString(raw json.RawMessage) (s string, ok bool, err error) {
 		return "", false, err
 	}
 	return s, true, nil
+}
+
+// UnrepresentableTextError is the SQT-1 refusal shape: a TEXT value
+// encoding/json cannot represent faithfully (invalid UTF-8 bytes, or a
+// lone UTF-16 surrogate escape). It is a TYPED error so consumers whose
+// transport STORES captured row images — the trigger-CDC change logs —
+// can recognise it and extend the remedy (Bug 245): for those lanes the
+// message's "repair the value at the source" is necessary but NOT
+// sufficient, because the poison also lives in the already-captured
+// images and the repairing UPDATE itself captures a new change whose
+// before-image carries the poison. For every value-READING consumer of
+// this guard (D1 live row reads, D1 staging, catalog scalars, the
+// snapshot phase) the printed remedy is complete as written, which is
+// why the extension lives at the trigger lane's wrap sites and not
+// here.
+type UnrepresentableTextError struct{ msg string }
+
+func (e *UnrepresentableTextError) Error() string { return e.msg }
+
+// unrepresentableTextErrorf builds an [UnrepresentableTextError] with
+// the refusal text the guards have always printed — the type is the
+// only addition.
+func unrepresentableTextErrorf(format string, args ...any) error {
+	return &UnrepresentableTextError{msg: fmt.Sprintf(format, args...)}
 }
 
 // loneSurrogateEscapeAt scans a JSON string token for a \uD800–\uDFFF escape

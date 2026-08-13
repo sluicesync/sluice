@@ -281,6 +281,23 @@ table with a non-PK UNIQUE constraint. Mitigate by running writers with
 prefer the latter. Details in
 [ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md).
 
+**Recovering from an invalid-UTF-8 / lone-surrogate halt.** The reader
+refuses loudly (batch withheld atomically, watermark unmoved — nothing is
+skipped or duplicated) when a captured TEXT value carries bytes JSON
+cannot represent faithfully, e.g. `CAST(x'FFFE61' AS TEXT)`. On this lane
+**repairing the source row alone does not unblock the stream**: the
+refusal's `id=N` names a row of `sluice_change_log` whose captured image
+already holds the poison, and the repairing `UPDATE` captures a *new*
+change whose before-image carries it again, so a restart halts again.
+The runnable recovery — which the refusal message also prints — is
+`sluice trigger teardown`, repair the source row, `sluice trigger setup`,
+then a fresh sync. (Advanced alternative: scrub the affected
+`before`/`after` images in `sluice_change_log` directly; SQLite's JSON
+functions cannot locate invalid UTF-8, so the scrub is byte-level, e.g.
+matching on `hex(before)`.) For the non-capturing consumers of the same
+guard — D1 live reads, catalog scalars, the snapshot phase — repairing
+the source value is sufficient as written. (Bug 245.)
+
 `d1-trigger` polls D1's **primary** (strongly-consistent) query path, not
 a read replica, so commit order equals `id` order. Because every change
 appends a `sluice_change_log` row that is never auto-reaped, run
