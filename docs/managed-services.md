@@ -423,7 +423,9 @@ sluice sync start \
   password via `SLUICE_NOTIFY_SMTP_PASSWORD` only). One SMTP sink covers
   every transactional provider (SendGrid/Mailgun/SES/Postmark) and
   self-hosted relays. Rules: `--notify-storage-util` / `-cpu-util` /
-  `-mem-util` (fractions 0–1), `--notify-lag-seconds`, and the
+  `-mem-util` (fractions 0–1; a value outside that range refuses at
+  start with the corrected value named — `85` meaning 85% would
+  otherwise arm a rule that can never fire), `--notify-lag-seconds`, and the
   rate-of-change `--notify-storage-growth-per-min` (all PlanetScale-telemetry-gated),
   plus three rules UNGATED from telemetry that need only a sink:
   `--notify-sync-lag-seconds` (sluice's own seconds-behind-source, any engine)

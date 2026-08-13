@@ -24,7 +24,7 @@ The user has multiple source→target sync streams and wants one supervised proc
 
 4. **Attach the terminal dashboard.** `sluice sync tui --connect :9300` (or a full `http://host:9300/api/fleet` URL) polls a running `sync run --dashboard-listen` server — works over an SSH tunnel to a remote fleet.
 
-5. **Monitor per leg (cron/agent-friendly).** Fleet roll-up: `sluice sync status --all --config syncs.yaml --format json` (one table across every configured target; `--watch 2s` to live-refresh, `--summary` for an aggregate header). Per-stream freshness with cron exit codes: `sluice sync health --format json --target-driver <drv> --target <dsn> --stream-id <id> [--max-stale-seconds N]` (exit 0 healthy / 1 breached-or-skipped-tables / 2 operational; a nonzero skipped-tables count trips 1 with no threshold — `schema add-table` or an explicit filter resolves it) — one call per leg you gate on.
+5. **Monitor per leg (cron/agent-friendly).** Fleet roll-up: `sluice sync status --all --config syncs.yaml --format json` (one table across every configured target; `--watch 2s` to live-refresh, `--summary` for an aggregate header). Per-stream freshness with cron exit codes: `sluice sync health --format json --target-driver <drv> --target <dsn> --stream-id <id> [--max-stale-seconds N]` (exit 0 healthy / 1 breached-or-skipped-tables / 2 operational; a nonzero skipped-tables count trips 1 with no threshold — `schema add-table` or an explicit filter resolves it; if the table exists but the apply role's privileges were revoked, restore the grant instead — the skip clears on the next change) — one call per leg you gate on.
 
 ## What you return
 - **Fleet composition:** N legs, each `stream-id` → source→target, and the restart policy in effect.

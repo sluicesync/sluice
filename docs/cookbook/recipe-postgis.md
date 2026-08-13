@@ -68,8 +68,14 @@ Bug 26 / Bug 27 / Bug 52 / Bug 53 closure cycle:
   `geometry_columns` view; the writer emits the dimensional
   variant.
 - **`geography(POINT, 4326)`** — the PG-only spheroid-aware type
-  round-trips PG → PG. Cross-engine to MySQL falls through to the
-  loud-refusal path (MySQL has no geography equivalent).
+  round-trips PG → PG. Cross-engine to MySQL, a 2D geography LANDS
+  as planar geometry with the value bytes and SRID carried
+  byte-exact (since v0.120.0), and `schema preview` surfaces the
+  semantic flatten as a translation note (v0.124.0): geography
+  computes distance/area/containment geodesically, MySQL geometry
+  computes them planar, so queries moved verbatim change meaning.
+  Z/M-flagged geography toward MySQL refuses at preflight (MySQL 8
+  has no Z/M geometry).
 - **GiST / SP-GiST / BRIN indexes** on geometry columns with
   PostGIS opclasses (e.g. `gist_geometry_ops_2d`,
   `spgist_geometry_ops_2d`, `brin_geometry_inclusion_ops_2d`)
