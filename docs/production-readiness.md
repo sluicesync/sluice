@@ -62,7 +62,13 @@ The marker above is not decoration: `TestTargetEngineListMatchesTheCode` derives
 
 ### Adjacent surfaces
 
-Encrypted logical backup chains (full + incremental) with restore, point-in-time chain replay, and a continuous broker work on every engine that migrates; `sluice backup export-as-parquet` transcodes any backup chain into Parquet for DuckDB / warehouse ingestion ([ADR-0164](adr/adr-0164-backup-export-as-parquet.md)). The online schema-change family (`backfill`, `expand-contract`, `deploy-ddl`) covers MySQL-family + Postgres in place ([schema-change-runbook](schema-change-runbook.md)).
+Encrypted logical backups with restore: `backup full`, restore, and point-in-time chain replay work on every engine that migrates — the restore side reads the stored chain and never touches the source. **Creating** the incremental side of a chain needs a **CDC-capable source**: `backup incremental` and the continuous `backup stream` producer capture the changes since the parent, and capturing changes is what CDC is, so both refuse a CDC-less source at validate. That is the engine set below (the CDC table's rows with a mechanism). `sluice backup export-as-parquet` transcodes any backup chain into Parquet for DuckDB / warehouse ingestion ([ADR-0164](adr/adr-0164-backup-export-as-parquet.md)).
+
+<!-- incremental-backup-engines: d1-trigger, mariadb, mysql, planetscale, postgres, postgres-trigger, sqlite-trigger, vitess -->
+
+The online schema-change family splits by engine: `backfill` covers MySQL-family + Postgres in place; `expand-contract` and `deploy-ddl` are **PlanetScale-only** — they drive PlanetScale deploy requests and refuse without a PlanetScale service token ([schema-change-runbook](schema-change-runbook.md) has the per-command table).
+
+<!-- planetscale-only-commands: deploy-ddl, expand-contract -->
 
 ## CDC modes per source engine
 

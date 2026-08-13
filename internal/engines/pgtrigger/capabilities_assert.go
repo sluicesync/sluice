@@ -3,7 +3,10 @@
 
 package pgtrigger
 
-import "sluicesync.dev/sluice/internal/ir"
+import (
+	"sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
+)
 
 // Compile-time declarations of the ir interfaces this engine's
 // concrete types intentionally implement.
@@ -39,4 +42,14 @@ var (
 	// still stop this engine from registering, making its stream invisible to
 	// a peer's pruner. Pin it.
 	_ ir.ChangeLogConsumerRegistry = (*CDCReader)(nil)
+	// Audit 2026-08-11 D-1: `migrate --where` works on this engine because
+	// [Engine.OpenRowReader] delegates to the composed postgres engine,
+	// whose reader implements the predicate pushdown. The pin lives HERE
+	// (asserting the DELEGATED type) so the docsync engine-list derivation
+	// attributes the capability to `postgres-trigger`, matching the
+	// runtime truth — verified behaviourally by
+	// TestPostgresTriggerRowReaderHonorsWhereFilters (internal/pipeline).
+	// This is a delegated-reader fact, not a widening of this engine's own
+	// surface; the narrowness note above is about the slot openers.
+	_ ir.RowFilterSetter = (*postgres.RowReader)(nil)
 )

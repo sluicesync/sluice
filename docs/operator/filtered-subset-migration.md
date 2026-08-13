@@ -54,7 +54,9 @@ Auto-including the FK-referenced parent rows for a filtered child set (the pg_du
 
 ## `sync --where` — continuous *filtered* replication
 
-**Which sources can run one — `mariadb`, `mysql`, `planetscale`, `postgres`, `vitess`.** Those are the five `--source-driver` values whose change stream can deliver full row before-images, which is what the row-move table below needs to evaluate the predicate. The SQLite, D1 and trigger-CDC engines cannot supply them and refuse at preflight with `SLUICE-E-WHERE-CDC-BEFORE-IMAGE` rather than filtering approximately. `migrate --where` is unaffected — a one-shot copy pushes the predicate into the source read and works on every engine that supports `migrate`.
+**Which sources can run one — `mariadb`, `mysql`, `planetscale`, `postgres`, `vitess`.** Those are the five `--source-driver` values whose change stream can deliver full row before-images, which is what the row-move table below needs to evaluate the predicate. The SQLite, D1 and trigger-CDC engines cannot supply them and refuse at preflight with `SLUICE-E-WHERE-CDC-BEFORE-IMAGE` rather than filtering approximately. `migrate --where` is a different, wider set: a one-shot copy pushes the predicate into the source read, which needs the engine's reader to implement the pushdown — the five above plus `postgres-trigger`, whose bulk-copy reader delegates to `postgres`. The flat-file (`csv`/`tsv`/`ndjson`), SQLite/D1, and mydumper readers migrate but refuse `--where` at preflight rather than silently copying every row.
+
+<!-- migrate-where-engines: mariadb, mysql, planetscale, postgres, postgres-trigger, vitess -->
 
 <!-- filtered-sync-engines: mariadb, mysql, planetscale, postgres, vitess -->
 
