@@ -86,3 +86,25 @@ func TestEscapeExprLiteralBackslashes_RoundTripsThroughTheReader(t *testing.T) {
 		t.Fatalf("I_S round trip = %q; want %q", got, portable)
 	}
 }
+
+// TestEscapeExprLiteralBackslashes_PreV0120DoubledRecordingReDoubles_Premise
+// binds the premise the backup recorded-schema gate's residue arm rests
+// on (internal/pipeline/backup, recordedByPreEscapeFixMySQLReader): a
+// pre-v0.120.0 chain records a literal backslash in MySQL's DOUBLED
+// spelling, and this emitter — correct for the bare IR contract — knows
+// nothing of eras, so the doubled recording re-doubles: `'a\d'` (one
+// intended backslash) emits as `'a\\d'`, which MySQL lexes to TWO.
+// The same-engine restore round trip silently gains a backslash, which
+// is what makes the gate's refusal TARGET-INDEPENDENT (the Bug 243
+// residue filing assumed a MySQL-target restore stays correct; this pin
+// is the corrected premise). If this emitter ever learns to detect and
+// de-double old spellings, this pin flips and the gate's era keying
+// must be revisited with it.
+func TestEscapeExprLiteralBackslashes_PreV0120DoubledRecordingReDoubles_Premise(t *testing.T) {
+	oldRecording := `code <> 'a\d'`
+	got := escapeExprLiteralBackslashes(oldRecording, true)
+	want := `code <> 'a\\d'`
+	if got != want {
+		t.Fatalf("doubled recording emitted %q; want %q — if the emitter now compensates for pre-v0.120.0 spellings, revisit the backup gate's residue arm (recordedByPreEscapeFixMySQLReader) in the same change", got, want)
+	}
+}

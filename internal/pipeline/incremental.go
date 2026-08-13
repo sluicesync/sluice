@@ -1763,7 +1763,7 @@ func warnIfParentChainUnrestorable(ctx context.Context, parent *irbackup.Manifes
 	if parent == nil {
 		return
 	}
-	problems := ir.SchemaExpressionLexProblems(parent.Schema)
+	problems := backup.ManifestRecordedSchemaProblems(parent)
 	if len(problems) == 0 {
 		return
 	}

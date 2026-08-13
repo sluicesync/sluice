@@ -1245,8 +1245,14 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	// the base full's restore door (a filter-blind gate would make the
 	// documented salvage impossible; Bug 244's lesson applied to the door).
 	var deltaProblems []string
+	backslashEra := recordedByPreEscapeFixMySQLReader(link.Manifest)
 	for _, d := range deltas {
 		deltaProblems = append(deltaProblems, ir.TableExpressionLexProblems(d.After)...)
+		if backslashEra {
+			for _, site := range ir.TableExpressionBackslashLiterals(d.After) {
+				deltaProblems = append(deltaProblems, describeDoubledBackslashProblem(link.Manifest, site))
+			}
+		}
 	}
 	if err := refuseMalformedRecordedSchema("chain restore: schema delta", deltaProblems); err != nil {
 		return err

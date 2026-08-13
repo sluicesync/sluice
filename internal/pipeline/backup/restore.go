@@ -436,20 +436,24 @@ func (r *Restore) newChainRestore() *ChainRestore {
 // about them; kept out of [Restore.Run] because that function is at its length
 // ceiling and this is a coherent phase to carve out rather than a way to hide
 // lines.
-func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, schema *ir.Schema) error {
+func (r *Restore) refuseUnrepresentableTargetShape(ctx context.Context, m *irbackup.Manifest, schema *ir.Schema) error {
 	// 1.42. Bug 243, FIRST of the schema refusals and deliberately
 	//       filter-aware: a recorded expression whose string literal never
 	//       closes (the pre-v0.120.0 apostrophe mangle) refuses here —
 	//       pre-DDL, with the affected table and field named — instead of
 	//       the target server's raw parse error after earlier tables had
-	//       already been created. It precedes the shape-versus-target
-	//       preflights because a recording that cannot be emitted as SQL
-	//       at all makes shape questions moot, and it honours the table
-	//       filter because `--exclude-table=<affected>` is the documented
-	//       remedy when the source no longer exists — a filter-blind gate
-	//       would make its own remedy impossible.
+	//       already been created. So does the residue arm: a pre-v0.120.0
+	//       MySQL-family recording whose literals carry MySQL's doubled
+	//       backslash spelling, structurally valid but silently WRONG on
+	//       every current target (the manifest keys the era — see
+	//       recordedByPreEscapeFixMySQLReader). It precedes the
+	//       shape-versus-target preflights because a recording that cannot
+	//       be emitted faithfully makes shape questions moot, and it
+	//       honours the table filter because `--exclude-table=<affected>`
+	//       is the documented remedy when the source no longer exists — a
+	//       filter-blind gate would make its own remedy impossible.
 	if err := refuseMalformedRecordedSchema("restore",
-		filteredSchemaLexProblems(schema, r.Filter)); err != nil {
+		filteredSchemaLexProblems(m, schema, r.Filter)); err != nil {
 		return err
 	}
 	if err := refuseVerbatimManifestRestoreToNonPG(schema, r.Target); err != nil {
@@ -545,7 +549,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// 1.4 + 1.42 + 1.47. The schema refusals — the Bug 243 recorded-
 	//      schema lex gate first, then the two shape-versus-target
 	//      preflights — see [Restore.refuseUnrepresentableTargetShape].
-	if err := r.refuseUnrepresentableTargetShape(ctx, manifest.Schema); err != nil {
+	if err := r.refuseUnrepresentableTargetShape(ctx, manifest, manifest.Schema); err != nil {
 		return err
 	}
 
@@ -1888,7 +1892,7 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// Chain-level and unfiltered, like the walkability check above:
 	// verify predicts the UNFILTERED restore.
 	for _, rec := range records {
-		if problems := manifestRecordedSchemaProblems(rec.Manifest); len(problems) > 0 {
+		if problems := ManifestRecordedSchemaProblems(rec.Manifest); len(problems) > 0 {
 			return verifyScanTally{}, refuseMalformedRecordedSchema(
 				fmt.Sprintf("verify: manifest %q", rec.Path), problems,
 			)

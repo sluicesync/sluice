@@ -29,13 +29,20 @@ import "fmt"
 // intent of, and the tenet answer is a loud refusal with the remedy (a
 // fresh full backup from the live source), never a guessed rewrite.
 //
-// The stated blind spot, because a gate must not read broader than it
-// is: a structurally VALID recording can still carry the WRONG value —
-// the same era's readers recorded literal backslashes in MySQL's doubled
-// spelling (`'a\\d'`), which lexes cleanly here and restores correctly
-// to MySQL but names a different predicate on a PostgreSQL target. That
-// class is not structurally detectable and is filed separately (the Bug
-// 243 backlog residue), not silently covered by this check.
+// The formerly-stated blind spot, now covered by its own arm: a
+// structurally VALID recording can still carry the WRONG value — the
+// same era's readers recorded literal backslashes in MySQL's doubled
+// spelling (`'a\\d'`), which lexes cleanly here but names a different
+// predicate on EVERY current target: PostgreSQL and SQLite read the
+// doubled form as two characters, and the post-v0.120.0 MySQL emit
+// boundary assumes the bare contract and re-doubles it
+// (escapeExprLiteralBackslashes), so even the same-engine round trip
+// silently gains a backslash. [TableExpressionBackslashLiterals] is the
+// detector for that arm; the backup gate fires it only for manifests a
+// pre-v0.120.0 MySQL-family reader recorded (the spelling is a property
+// of the recording era, which this package cannot see — the version/
+// engine keying lives in internal/pipeline/backup's recorded-schema
+// gate).
 
 // UnterminatedLiteralAt reports whether expr ends inside an open string
 // literal under the portable spelling (” doubling; backslash ordinary),
@@ -81,7 +88,7 @@ func TableExpressionLexProblems(t *Table) []string {
 		return nil
 	}
 	var out []string
-	add := func(what, expr string) {
+	forEachTableExpression(t, func(what, expr string) {
 		if expr == "" {
 			return
 		}
@@ -90,23 +97,36 @@ func TableExpressionLexProblems(t *Table) []string {
 				"table %q: %s: string literal opened at byte %d never closes: %q", t.Name, what, at, expr,
 			))
 		}
-	}
+	})
+	return out
+}
+
+// forEachTableExpression visits every expression-bearing field a
+// recorded table carries — CHECK constraints, generated-column bodies,
+// expression defaults, DOMAIN CHECK bodies, functional-index
+// expressions, and partial-index predicates. It is the ONE walk both
+// recorded-expression probes ([TableExpressionLexProblems],
+// [TableExpressionBackslashLiterals]) share, so the two can never
+// disagree about which positions a recorded schema can ask a restore to
+// emit — a new expression position added here reaches both probes or
+// neither.
+func forEachTableExpression(t *Table, visit func(what, expr string)) {
 	for _, chk := range t.CheckConstraints {
 		if chk != nil {
-			add(fmt.Sprintf("CHECK %q", chk.Name), chk.Expr)
+			visit(fmt.Sprintf("CHECK %q", chk.Name), chk.Expr)
 		}
 	}
 	for _, c := range t.Columns {
 		if c == nil {
 			continue
 		}
-		add(fmt.Sprintf("generated column %q", c.Name), c.GeneratedExpr)
+		visit(fmt.Sprintf("generated column %q", c.Name), c.GeneratedExpr)
 		if de, ok := c.Default.(DefaultExpression); ok {
-			add(fmt.Sprintf("column %q DEFAULT expression", c.Name), de.Expr)
+			visit(fmt.Sprintf("column %q DEFAULT expression", c.Name), de.Expr)
 		}
 		if dom, ok := c.Type.(Domain); ok {
 			for _, dc := range dom.Checks {
-				add(fmt.Sprintf("column %q DOMAIN %q CHECK %q", c.Name, dom.Name, dc.Name), dc.Body)
+				visit(fmt.Sprintf("column %q DOMAIN %q CHECK %q", c.Name, dom.Name, dc.Name), dc.Body)
 			}
 		}
 	}
@@ -115,11 +135,10 @@ func TableExpressionLexProblems(t *Table) []string {
 			continue
 		}
 		for _, ic := range idx.Columns {
-			add(fmt.Sprintf("index %q expression", idx.Name), ic.Expression)
+			visit(fmt.Sprintf("index %q expression", idx.Name), ic.Expression)
 		}
-		add(fmt.Sprintf("index %q predicate", idx.Name), idx.Predicate)
+		visit(fmt.Sprintf("index %q predicate", idx.Name), idx.Predicate)
 	}
-	return out
 }
 
 // SchemaExpressionLexProblems is [TableExpressionLexProblems] over every
@@ -133,4 +152,77 @@ func SchemaExpressionLexProblems(s *Schema) []string {
 		out = append(out, TableExpressionLexProblems(t)...)
 	}
 	return out
+}
+
+// TableExpressionBackslashLiterals reports every expression-bearing
+// field of a recorded table whose string literals contain a backslash —
+// the detector for the Bug 243 residue arm (see the file doc). It walks
+// the same positions as [TableExpressionLexProblems] with the same
+// portable-spelling literal scan (” doubling; backslash ordinary), and
+// is deliberately MECHANICAL: whether a backslash-bearing literal is a
+// problem depends on which reader era recorded it, and that keying
+// (manifest SluiceVersion + SourceEngine) belongs to the backup gate,
+// not here. Backslashes outside literals (e.g. in an identifier) do not
+// count.
+func TableExpressionBackslashLiterals(t *Table) []string {
+	if t == nil {
+		return nil
+	}
+	var out []string
+	add := func(what, expr string) {
+		if expr == "" || !literalCarriesBackslash(expr) {
+			return
+		}
+		out = append(out, fmt.Sprintf(
+			"table %q: %s: a string literal carries a backslash: %q", t.Name, what, expr,
+		))
+	}
+	forEachTableExpression(t, add)
+	return out
+}
+
+// SchemaExpressionBackslashLiterals is [TableExpressionBackslashLiterals]
+// over every table of a recorded schema. A nil schema contributes
+// nothing.
+func SchemaExpressionBackslashLiterals(s *Schema) []string {
+	if s == nil {
+		return nil
+	}
+	var out []string
+	for _, t := range s.Tables {
+		out = append(out, TableExpressionBackslashLiterals(t)...)
+	}
+	return out
+}
+
+// literalCarriesBackslash reports whether expr contains a backslash
+// INSIDE a single-quoted string literal under the portable spelling.
+// An unterminated literal counts too (everything after the opener is
+// literal text) — such an expression already fails
+// [UnterminatedLiteralAt], and this probe must not read narrower than
+// the text it scans.
+func literalCarriesBackslash(expr string) bool {
+	for i := 0; i < len(expr); {
+		if expr[i] != '\'' {
+			i++
+			continue
+		}
+		i++
+		for i < len(expr) {
+			switch {
+			case expr[i] == '\\':
+				return true
+			case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
+				i += 2
+				continue
+			case expr[i] == '\'':
+				i++
+			default:
+				i++
+				continue
+			}
+			break
+		}
+	}
+	return false
 }
