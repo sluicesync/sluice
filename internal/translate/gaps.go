@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate/exprident"
 )
 
 // Severity classifies how a detected gap will surface if the operator
@@ -255,6 +256,15 @@ type gapPattern struct {
 	// through the same literal-aware token scan as infix, rendered as
 	// "the prefix X operator".
 	prefix bool
+
+	// symbol marks a punctuation-operator pattern matched by an
+	// ADVISORY-ONLY literal-aware byte scan (ARCH-1 semantic residue,
+	// operator-approved 2026-08-13: `^`, `/`). Deliberately NOT routed
+	// through mysqlUntranslatableOperators: these operators PG parses
+	// fine — with different semantics — so they must never refuse
+	// (option (c) of the residue memo, rejected); they advise at
+	// SeveritySilent through the preview machinery only.
+	symbol bool
 }
 
 // gapPatterns is the registry of MySQL → PG translator gaps the
@@ -332,6 +342,30 @@ var gapPatterns = []gapPattern{
 		severity: SeverityLoud,
 		note:     "MariaDB's catalog preserves the prefix `!` (MySQL's high-precedence NOT; MySQL 8 rewrites it away), and PostgreSQL does not parse it. Equivalent: `NOT (...)`.",
 		prefix:   true,
+	},
+	{
+		// ARCH-1 semantic residue (operator-approved 2026-08-13): the
+		// operator PARSES on PG — as numeric power, not MySQL's bitwise
+		// XOR — so the CHECK applies with different semantics. Advisory,
+		// never a refusal.
+		name:     "^",
+		rule:     31,
+		severity: SeveritySilent,
+		note:     "MySQL's `^` is bitwise XOR; PostgreSQL parses `^` as numeric POWER, so the constraint applies with different semantics (it can silently under- or over-constrain). PostgreSQL's bitwise XOR is `#`, exact for integer operands.",
+		infix:    true,
+		symbol:   true,
+	},
+	{
+		// ARCH-1 semantic residue: integer division diverges. The token
+		// scan cannot see operand types, so this fires on EVERY
+		// division in a MySQL-dialect expression — the note says which
+		// case actually diverges.
+		name:     "/",
+		rule:     31,
+		severity: SeveritySilent,
+		note:     "MySQL `/` keeps fractions on integer operands (3/2 = 1.5); PostgreSQL truncates integer division (3/2 = 1), so a division-based constraint can apply with shifted strictness. Only integer-typed operands diverge — cast one operand (e.g. `a::numeric / b`) for MySQL's semantics. This advisory cannot see operand types and fires on every division.",
+		infix:    true,
+		symbol:   true,
 	},
 	{
 		name:     "FIND_IN_SET",
@@ -477,12 +511,24 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 			// Extension enabled → rewrite ships, skip the warning.
 			continue
 		}
-		if pat.infix || pat.prefix {
+		switch {
+		case pat.symbol:
+			// Advisory-only punctuation operators (ARCH-1 semantic
+			// residue): matched by a literal-aware byte scan, never by
+			// the refusal gate's token scanner — PG parses these, with
+			// different semantics, so they must advise without ever
+			// refusing.
+			if !symbolOperatorInExpr(expr, pat.name[0]) {
+				continue
+			}
+		case pat.infix || pat.prefix:
 			if !matchesOperatorToken(expr, pat.name, pat.prefix) {
 				continue
 			}
-		} else if !matchesFunctionCall(expr, pat.name) {
-			continue
+		default:
+			if !matchesFunctionCall(expr, pat.name) {
+				continue
+			}
 		}
 		out = append(out, Gap{
 			Expression: expr,
@@ -495,6 +541,30 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 		})
 	}
 	return out
+}
+
+// symbolOperatorInExpr reports whether the single-byte punctuation
+// operator op occurs in expr OUTSIDE string literals. The advisory-only
+// matcher for the ARCH-1 semantic-residue operators (`^`, `/`): a
+// literal-aware byte scan sharing the refusal scanner's literal-skip
+// helper, so a `'a^b'` string value never advises. It deliberately does
+// not skip backtick identifier spans — an identifier containing `^` or
+// `/` had to be backtick-quoted at creation and is vanishingly rare,
+// and the cost of a false match here is one SeveritySilent advisory
+// line, never a refusal.
+func symbolOperatorInExpr(expr string, op byte) bool {
+	for i := 0; i < len(expr); {
+		c := expr[i]
+		if c == '\'' {
+			i = exprident.ScanStringLiteral(expr, i)
+			continue
+		}
+		if c == op {
+			return true
+		}
+		i++
+	}
+	return false
 }
 
 // matchesFunctionCall returns true when expr contains a

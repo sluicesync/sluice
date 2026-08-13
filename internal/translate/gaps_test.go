@@ -580,3 +580,71 @@ func TestRefuseOnLoudGaps_GeneratedSiteRemedy(t *testing.T) {
 		t.Errorf("GENERATED-site refusal must not deny --expr-override:\n%s", err)
 	}
 }
+
+// TestDetectGaps_SemanticDivergenceAdvisories pins the ARCH-1
+// semantic-residue advisories (operator-approved 2026-08-13, option (b)
+// of workspace/queue-burn-memo-arch1-semantic-parity.md): `^`
+// (MySQL bitwise XOR, PG power) and `/` (integer-division truncation)
+// fire SeveritySilent advisories through the literal-aware symbol scan
+// — and NEVER refuse, in either gate, because PostgreSQL parses both
+// (option (c) of the memo, rejected; this test is that rejection's
+// pin).
+func TestDetectGaps_SemanticDivergenceAdvisories(t *testing.T) {
+	cases := []struct {
+		expr    string
+		pattern string
+		fires   bool
+	}{
+		{`a ^ 3 = 0`, "^", true},
+		{`(a ^ b) > 0`, "^", true},
+		{`c <> 'x^y'`, "^", false}, // inside a literal: data, not an operator
+		{`a / 2 = 0`, "/", true},
+		{`c <> 'a/b'`, "/", false},
+		{`a + b > 0`, "^", false},
+		{`a + b > 0`, "/", false},
+	}
+	for _, tc := range cases {
+		found := false
+		for _, g := range detectGaps(tc.expr, nil) {
+			if g.Pattern == tc.pattern {
+				found = true
+				if g.Severity != SeveritySilent {
+					t.Errorf("%q: %s severity = %v; want SeveritySilent (PG PARSES it — refusing is memo option (c), rejected)", tc.expr, tc.pattern, g.Severity)
+				}
+				if !g.Infix {
+					t.Errorf("%q: %s gap not marked Infix", tc.expr, tc.pattern)
+				}
+				if g.RuleNum != 31 {
+					t.Errorf("%q: %s rule = %d; want 31", tc.expr, tc.pattern, g.RuleNum)
+				}
+			}
+		}
+		if found != tc.fires {
+			t.Errorf("%q: %s advisory fired=%v; want %v", tc.expr, tc.pattern, found, tc.fires)
+		}
+	}
+}
+
+// TestSemanticDivergenceOperators_NeverRefuse pins the never-refuse
+// half on BOTH gates at schema level: a CHECK using `^` or `/` sails
+// through RefuseOnLoudGaps (SeveritySilent) AND the general backstop
+// (they are operators PG parses, not unknown function calls). If either
+// gate starts refusing these, the ARCH-1 memo's option (c) has been
+// implemented by accident.
+func TestSemanticDivergenceOperators_NeverRefuse(t *testing.T) {
+	for _, expr := range []string{`a ^ 3 = 0`, `a / 2 = 0`} {
+		s := &ir.Schema{Tables: []*ir.Table{{
+			Name:    "t",
+			Columns: []*ir.Column{{Name: "a", Type: ir.Integer{Width: 32}}},
+			CheckConstraints: []*ir.CheckConstraint{{
+				Name: "t_chk", Expr: expr, ExprDialect: "mysql",
+			}},
+		}}}
+		if err := RefuseOnLoudGaps(s, "mysql", "postgres", "migrate", nil); err != nil {
+			t.Errorf("RefuseOnLoudGaps refused %q: %v", expr, err)
+		}
+		if err := RefuseOnUntranslatableExprs(s, "mysql", "postgres", "migrate", nil); err != nil {
+			t.Errorf("general backstop refused %q: %v", expr, err)
+		}
+	}
+}

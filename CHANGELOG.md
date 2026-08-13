@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+**`schema preview` now advises on the CHECK operators PostgreSQL parses with different semantics: infix `^` and `/` (the ARCH-1 semantic residue, operator-approved option (b)).** MySQL's `^` is bitwise XOR; PostgreSQL parses the same spelling as numeric power — the constraint applies, with different meaning, silently under- or over-constraining (PG's exact spelling is `#`). MySQL's `/` keeps fractions on integer operands where PostgreSQL truncates, shifting a division-based constraint's strictness. Both now surface as SeveritySilent preview advisories through a literal-aware symbol scan that is deliberately separate from the refusal gates — these operators parse on the target, so they must never refuse, and that never-refuse property is pinned on both gates (the curated refusal and the general backstop) so the rejected refuse-them option cannot be implemented by accident. The `/` advisory cannot see operand types and fires on every division; its note says which case actually diverges. The jsonb-path argument question from the same filing stays open pending a nested-path measurement. Mutation-run both directions.
+
 ## [0.124.2] - 2026-08-13
 
 The post-v0.124.1 queue close-out: the last silent-loss filing in the audit backlog (a pre-v0.120.0 chain's backslash literals restoring silently wrong — found target-independent, wider than filed), the Bug 244 sibling (the restore emit preflights defeat their own `--exclude-table` remedy no more), and the SQT-1 D1 premise measured on real D1 and pinned by a new live-credential suite.

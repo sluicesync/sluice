@@ -115,10 +115,14 @@ semantics. The full reasoning per rule lives at
   backstop turned these from "late-migrate failure" into "early-preview
   refusal" (closes Bug 8's structural false-green).
 - **SeveritySilent** — sluice WARNs at preview but doesn't refuse.
-  Examples: `GREATEST`, `LEAST`, `REGEXP_LIKE`. The semantic divergence
-  is real but bounded; operators with the affected shape see the WARN
-  and decide whether an override (`--expr-override`, generated columns
-  only) or a source-side rewrite is needed.
+  Examples: `GREATEST`, `LEAST`, `REGEXP_LIKE`, and the
+  semantic-divergence operators infix `^` (MySQL bitwise XOR; PG parses
+  it as numeric power — PG's exact spelling is `#`) and `/` (integer
+  operands: MySQL keeps fractions, PG truncates; the advisory cannot
+  see operand types and fires on every division). The semantic
+  divergence is real but bounded; operators with the affected shape see
+  the WARN and decide whether an override (`--expr-override`, generated
+  columns only) or a source-side rewrite is needed.
 
 ## Escape hatches
 
