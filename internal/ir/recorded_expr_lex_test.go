@@ -100,7 +100,7 @@ func TestTableExpressionBackslashLiterals(t *testing.T) {
 		expr string
 		want bool
 	}{
-		{"doubled backslash in literal", `code <> 'a\d'`, true},
+		{"doubled backslash in literal (the Bug 243 residue artifact spelling)", `code <> 'a\\d'`, true},
 		{"single backslash in literal", `code <> 'a\d'`, true},
 		{"backslash outside any literal", `a\b > 0`, false},
 		{"no backslash at all", `code <> 'abc'`, false},

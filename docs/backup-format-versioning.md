@@ -16,7 +16,11 @@ Every backup chain root manifest carries a `FormatVersion` field:
 
 - **`FormatVersion=1`** — an "innocent" backup. The schema uses none
   of the gated security-or-correctness features. Any sluice version
-  from v0.16.x onward restores it.
+  from v0.16.x onward restores it — unless the recorded-schema gate
+  refuses the chain's *content* (`SLUICE-E-BACKUP-RECORDED-SCHEMA-MALFORMED`:
+  a pre-v0.120.0 MySQL-family recording whose expressions are mangled
+  or carry doubled-backslash literals); format version and recorded
+  content are independent gates.
 - **`FormatVersion=2`** — the schema contains at least one of:
   - Row-level security enabled on a table (`RLSEnabled`)
   - Row-level security forced (`RLSForced`)

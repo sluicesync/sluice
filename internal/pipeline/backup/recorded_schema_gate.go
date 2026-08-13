@@ -89,6 +89,14 @@ const recordedSchemaMalformedHint = "take a fresh `backup full` of the live sour
 // would refuse chains that dev builds write TODAY, and the printed
 // remedy (a fresh backup, which would also stamp "dev") could never
 // release it: an unrunnable remedy, the Bug 245/246/247 class.
+//
+// Second stated boundary: within the era the arm cannot distinguish a
+// doubled spelling from a genuinely-bare (already-correct) backslash —
+// e.g. a NO_BACKSLASH_ESCAPES-shaped source rendering — so a correct
+// old recording with a backslash literal refuses too. That is the loud
+// direction on a rare shape, with the same working remedies (fresh
+// backup, or --exclude-table), and preferable to guessing which
+// spelling the recording intended.
 func recordedByPreEscapeFixMySQLReader(m *irbackup.Manifest) bool {
 	if m == nil || !translate.IsMySQLFamily(m.SourceEngine) {
 		return false

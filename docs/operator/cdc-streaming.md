@@ -281,22 +281,34 @@ table with a non-PK UNIQUE constraint. Mitigate by running writers with
 prefer the latter. Details in
 [ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md).
 
-**Recovering from an invalid-UTF-8 / lone-surrogate halt.** The reader
-refuses loudly (batch withheld atomically, watermark unmoved — nothing is
-skipped or duplicated) when a captured TEXT value carries bytes JSON
-cannot represent faithfully, e.g. `CAST(x'FFFE61' AS TEXT)`. On this lane
-**repairing the source row alone does not unblock the stream**: the
-refusal's `id=N` names a row of `sluice_change_log` whose captured image
-already holds the poison, and the repairing `UPDATE` captures a *new*
-change whose before-image carries it again, so a restart halts again.
-The runnable recovery — which the refusal message also prints — is
-`sluice trigger teardown`, repair the source row, `sluice trigger setup`,
-then a fresh sync. (Advanced alternative: scrub the affected
-`before`/`after` images in `sluice_change_log` directly; SQLite's JSON
-functions cannot locate invalid UTF-8, so the scrub is byte-level, e.g.
-matching on `hex(before)`.) For the non-capturing consumers of the same
-guard — D1 live reads, catalog scalars, the snapshot phase — repairing
-the source value is sufficient as written. (Bug 245.)
+**Recovering from an invalid-UTF-8 / lone-surrogate halt (the local
+`sqlite-trigger` lane).** The reader refuses loudly (batch withheld
+atomically, watermark unmoved — nothing is skipped or duplicated) when a
+captured TEXT value carries bytes JSON cannot represent faithfully, e.g.
+`CAST(x'FFFE61' AS TEXT)`. On this lane **repairing the source row alone
+does not unblock the stream**: the refusal's `id=N` names a row of
+`sluice_change_log` whose captured image already holds the poison, and
+the repairing `UPDATE` captures a *new* change whose before-image
+carries it again, so a restart halts again. The runnable recovery —
+which the refusal message also prints — is `sluice trigger teardown`,
+repair the source row, `sluice trigger setup`, then a fresh sync.
+(Advanced alternative: scrub the affected `before`/`after` images in
+`sluice_change_log` directly; SQLite's JSON functions cannot locate
+invalid UTF-8, so the scrub is byte-level, e.g. matching on
+`hex(before)`.) For the local file's non-capturing consumers of the same
+guard — catalog scalars, the snapshot phase — repairing the source value
+is sufficient as written. (Bug 245.)
+
+**The `d1-trigger` and `d1` lanes never halt on invalid UTF-8 — the
+value arrives pre-mangled.** Measured on real D1 (2026-08-13): the
+`/query` API replaces invalid bytes with U+FFFD *server-side*, for
+direct reads and change-log images alike, so the invalid-UTF-8 arm of
+this guard cannot fire on live-D1 sources — there is no halt to recover
+from, and the substituted value is indistinguishable from a genuine
+U+FFFD. See the caveat in
+[the D1 import guide](sqlite-d1-import.md) for what is and is not
+recoverable. (The lone-surrogate arm on D1 is unmeasured; this
+paragraph scopes only the invalid-UTF-8 vector.)
 
 `d1-trigger` polls D1's **primary** (strongly-consistent) query path, not
 a read replica, so commit order equals `id` order. Because every change

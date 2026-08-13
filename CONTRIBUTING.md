@@ -51,6 +51,8 @@ The test suite is layered by infrastructure cost; each layer is opt-in via a bui
 - **PostGIS tests** (`integration && postgis` tag): adds the PostGIS image (~600 MB). The `PostGIS_`-named suites — MySQL↔PG geometry round-trips, the PG→PG geometry/geography/spatial-index passthrough, and the pipelined-apply geometry-equivalence pin — gated behind a separate tag so the default integration suite doesn't pull the heavier image (the exact suite list lives in the `integration-postgis` job comment in `ci.yml`).
 - **VStream tests** (`integration && vstream` tag): adds the `vitess/vttestserver:mysql80` image (~700 MB). The FlavorPlanetScale CDC + snapshot suite against a vanilla Vitess cluster — same image cost concern as PostGIS, hence the separate tag.
 - **PlanetScale verification tests** (`psverify` tag): hits a real PlanetScale account via env vars / a repo-root `PLANETSCALE_CREDENTIALS.env` file. Manual-trigger only via `.github/workflows/psverify.yml`; never runs on push. Use these to validate against actual product quirks the in-container tests can't reach.
+- **KMS verification tests** (`integration && kmsverify` tag): the backup-encryption KMS paths against LocalStack — run via `.github/workflows/extended-suites.yml`.
+- **D1 verification tests** (`d1verify` tag): live-Cloudflare premise pins against a throwaway real D1 database (`CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` in the environment; tests skip cleanly without them). Manual-run only — CI has no Cloudflare secret, so the tag is a documented exemption in `scripts/check-run-filter-coverage.sh`; `vet-tags` still type-checks it on every run.
 
 Same-engine tests are sanity. Cross-engine tests are validation. Add a cross-engine test before claiming a feature works end-to-end.
 

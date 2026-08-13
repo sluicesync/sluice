@@ -110,7 +110,9 @@ A TEXT value containing invalid UTF-8 (severed multi-byte sequences, raw high by
 ## Cloudflare D1, the lossless way: the live query-API reader (`--source-driver d1`)
 
 The `d1` source engine reads a **live** D1 database over D1's HTTP query API and is the
-**lossless** D1 import (ADR-0132 — BUILT). Unlike the export path, it reads each value via
+**lossless** D1 import for every value class the API can carry (ADR-0132 — BUILT; the one
+named exception is invalid-UTF-8 TEXT, which the API itself mangles — see the caveat
+directly above). Unlike the export path, it reads each value via
 `CAST(col AS TEXT)` + `typeof(col)`, so it recovers integers > 2^53 EXACTLY (the export and
 default-JSON paths round them, as the table above shows), distinguishes INTEGER from REAL,
 and decodes BLOBs from hex. Reads do not take D1 offline (only `export` does).
@@ -212,9 +214,12 @@ SQLite's default `recursive_triggers=OFF` (per-connection, on *your application'
 writers) the row an `INSERT OR REPLACE`/`UPDATE OR REPLACE` implicitly deletes is never
 captured, so the target keeps it — `trigger setup` WARNs per affected table; run writers
 with `recursive_triggers=ON` or use `ON CONFLICT DO UPDATE` upserts (preferred on D1).
-**Invalid-UTF-8 TEXT** is carried faithfully by the cold snapshot but refuses loudly on
-the trigger-CDC/D1 decode path (the stream halts with the watermark held, so nothing is
-skipped after you repair the value); store such bytes as BLOB, or repair them at source.
+**Invalid-UTF-8 TEXT** on a local file is carried faithfully by the cold snapshot but
+refuses loudly on the trigger-CDC decode path (the stream halts with the watermark held,
+so nothing is skipped; recovery per the Bug 245 runbook in
+[cdc-streaming.md](cdc-streaming.md)); store such bytes as BLOB, or repair them at source.
+On live D1 (`d1` / `d1-trigger`) this refusal cannot fire — the API mangles the value
+server-side before sluice sees it; see the invalid-UTF-8 caveat earlier in this page.
 The
 change-log, meta, and column-fingerprint tables are auto-skipped by the schema reader, so
 they are never themselves migrated or captured.

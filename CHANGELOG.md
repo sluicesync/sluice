@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.124.2] - 2026-08-13
+
+The post-v0.124.1 queue close-out: the last silent-loss filing in the audit backlog (a pre-v0.120.0 chain's backslash literals restoring silently wrong — found target-independent, wider than filed), the Bug 244 sibling (the restore emit preflights defeat their own `--exclude-table` remedy no more), and the SQT-1 D1 premise measured on real D1 and pinned by a new live-credential suite.
+
 ### Changed
 
 **The SQT-1 D1 premise is measured, and the answer is documented: D1 TEXT with invalid UTF-8 is unrescuable through the API.** The v0.122.0 invalid-UTF-8 guards carried an UNVERIFIED PREMISE marker for the D1 lane — whether Cloudflare's `/query` API returns invalid-UTF-8 TEXT bytes verbatim had never been measured. Measured on real D1 (a throwaway database, created and deleted in the run): storage holds the bytes intact, but the API replaces every invalid byte with U+FFFD server-side — on the `d1` query-API reader and the `d1-trigger` change-log poll alike (the capture trigger stores the raw bytes verbatim; the mangle happens at read-back) — so the client-side refusal cannot fire there and no client-side independent expected value exists. The new `d1verify` live-credential suite (mirroring psverify/kmsverify) pins all three facts with an anti-vacuity floor, so a Cloudflare serialization change flips the pin instead of silently changing the story; `docs/operator/sqlite-d1-import.md` gains the operator caveat (`hex(x)` server-side still exports the true bytes for manual recovery). The file-backed SQLite lanes are unaffected — the guards remain load-bearing there.
