@@ -63,6 +63,16 @@ const (
 	CodeCDCXAUnsupported         Code = "SLUICE-E-CDC-XA-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// Audit 2026-08-11 C1-1: sluice's emitters only ever produce ONE SQL
+	// statement, and the restore path inlines RECORDED expression bodies
+	// from a backup manifest verbatim into that DDL before running it
+	// through pgx's simple protocol (which executes multi-statement
+	// strings). A tampered manifest body that closed the surrounding
+	// syntax and appended `; DROP TABLE …; --` executed as the restore
+	// role at exit 0. The single-statement door refuses structurally
+	// multi-statement emitted DDL before the server sees it.
+	CodeDDLEmitMultiStatement Code = "SLUICE-E-DDL-EMIT-MULTI-STATEMENT"
+
 	// Roadmap item 109: the errno-3024 statement-time wall reaches the
 	// CONSTRAINTS phase, not just the index phase. A large post-copy
 	// `ALTER … ADD FOREIGN KEY` on a PlanetScale/Vitess target runs InnoDB's
@@ -463,6 +473,7 @@ var registry = map[Code]Info{
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeCDCXAUnsupported:         {ClassRefusal, "a replicated table is written inside a MySQL XA (distributed) transaction, which sluice cannot faithfully replicate: the rows are invisible on the source until XA COMMIT, so a rollback would fabricate them on the target, and mid-body positions are not valid restart points"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
+	CodeDDLEmitMultiStatement:    {ClassRefusal, "an emitted DDL string is structurally more than one statement — sluice's emitters only ever produce one, so recorded schema content (a backup manifest's expression bodies) is corrupt or tampered, and executing it would run the extra SQL as the connected role; refused before the server saw it"},
 
 	CodeConstraintStatementTimeLimit: {ClassRuntime, "foreign-key ADD hit PlanetScale's statement-time limit (errno 3024) — ADD FOREIGN KEY validates every child row, so on a large table it is heavier than an index build and cannot finish under the ~900 s wall; --resume re-hits the identical deterministic wall, so the converging remedy is --skip-foreign-keys (completes the migration, keeps each FK's backing index)"},
 

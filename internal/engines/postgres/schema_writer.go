@@ -267,7 +267,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			// DO-block guard (shared with the CDC forward path via
 			// guardedCreateEnumType) swallows duplicate_object.
 			stmt := guardedCreateEnumType(create)
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 				return fmt.Errorf("postgres: create enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
 		}
@@ -298,7 +298,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			if err != nil {
 				return fmt.Errorf("postgres: emit domain type for %s.%s: %w", table.Name, col.Name, err)
 			}
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 				return fmt.Errorf("postgres: create domain type for %s.%s: %w", table.Name, col.Name, err)
 			}
 		}
@@ -318,7 +318,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		if err != nil {
 			return err
 		}
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("postgres: create table %q: %w", table.Name, err)
 		}
 	}
@@ -338,7 +338,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	// safe.
 	for _, table := range orderedTables(s) {
 		for _, stmt := range emitCommentStatements(w.schema, table) {
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 				return fmt.Errorf("postgres: set comment on %q: %w", table.Name, err)
 			}
 		}
@@ -359,7 +359,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			return err
 		}
 		for _, stmt := range stmts {
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 				return fmt.Errorf("postgres: apply RLS on %q: %w", table.Name, err)
 			}
 		}
@@ -717,8 +717,7 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 // unwraps buildOneIndex's retryOnCatalogRace must fail a test). Production
 // always uses the real ExecContext.
 var indexStmtExec = func(ctx context.Context, conn *sql.Conn, stmt string) error {
-	_, err := conn.ExecContext(ctx, stmt)
-	return err
+	return execEmittedDDL(ctx, conn, stmt)
 }
 
 // tuneIndexBuildConn raises maintenance_work_mem + max_parallel_maintenance_workers
@@ -809,7 +808,7 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			if err != nil {
 				return err
 			}
-			_, execErr := w.db.ExecContext(ctx, stmt)
+			execErr := execEmittedDDL(ctx, w.db, stmt)
 			if execErr == nil {
 				continue
 			}
@@ -822,7 +821,7 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			// existing rows; the operator validates later after fixing
 			// the orphans (see Hint below).
 			notValidStmt := appendNotValid(stmt)
-			if _, retryErr := w.db.ExecContext(ctx, notValidStmt); retryErr != nil {
+			if retryErr := execEmittedDDL(ctx, w.db, notValidStmt); retryErr != nil {
 				return fmt.Errorf("postgres: add foreign key %q on %q (NOT VALID retry after %w): %w",
 					fk.Name, table.Name, execErr, retryErr)
 			}
@@ -899,7 +898,7 @@ func (w *SchemaWriter) createUniqueConstraints(ctx context.Context, table *ir.Ta
 		if err != nil {
 			return err
 		}
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("postgres: add unique constraint %q on %q: %w", idx.Name, table.Name, err)
 		}
 	}
@@ -1050,7 +1049,7 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if err != nil {
 			return err
 		}
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
 		}
 	}
@@ -1142,7 +1141,7 @@ func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error 
 		return errors.New("postgres: AnalyzeTable: table is nil")
 	}
 	qualified := w.qualifyTable(table)
-	if _, err := w.db.ExecContext(ctx, "ANALYZE "+qualified); err != nil {
+	if err := execEmittedDDL(ctx, w.db, "ANALYZE "+qualified); err != nil {
 		return fmt.Errorf("postgres: analyze %s: %w", qualified, err)
 	}
 	return nil
@@ -1195,7 +1194,7 @@ func (w *SchemaWriter) ensureSchema(ctx context.Context) error {
 		return nil
 	}
 	stmt := "CREATE SCHEMA IF NOT EXISTS " + quoteIdent(w.schema)
-	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 		return fmt.Errorf("postgres: ensure schema %q: %w", w.schema, err)
 	}
 	w.schemaEnsured = true
@@ -1557,7 +1556,7 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		warnDroppedForeignCollation(table, col.Name, col.Type)
 		qualified := w.qualifyTable(table)
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s", qualified, def)
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("alter add column %q on %s.%s: %w",
 				col.Name, table.Schema, table.Name, err)
 		}
@@ -1586,7 +1585,7 @@ func (w *SchemaWriter) AlterDropColumn(ctx context.Context, table *ir.Table, col
 	qualified := w.qualifyTable(table)
 	for _, col := range cols {
 		stmt := fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s", qualified, quoteIdent(col.Name))
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("alter drop column %q on %s.%s: %w",
 				col.Name, table.Schema, table.Name, err)
 		}
@@ -1599,7 +1598,7 @@ func (w *SchemaWriter) AlterDropColumn(ctx context.Context, table *ir.Table, col
 		// IF EXISTS keeps it idempotent. The guard is load-bearing: see
 		// [orphanedEnumTypeDrop].
 		if dropStmt, ok := w.orphanedEnumTypeDrop(table, col); ok {
-			if _, err := w.db.ExecContext(ctx, dropStmt); err != nil {
+			if err := execEmittedDDL(ctx, w.db, dropStmt); err != nil {
 				return fmt.Errorf("drop orphaned enum type for %s.%s.%s: %w",
 					w.schema, table.Name, col.Name, err)
 			}
@@ -1668,7 +1667,7 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 		// form. The first " INDEX " token is the keyword we want to
 		// follow with IF NOT EXISTS.
 		idempotent := strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
-		if _, err := w.db.ExecContext(ctx, idempotent); err != nil {
+		if err := execEmittedDDL(ctx, w.db, idempotent); err != nil {
 			return fmt.Errorf("create shape index %q on %s.%s: %w",
 				idx.Name, table.Schema, table.Name, err)
 		}
@@ -1694,7 +1693,7 @@ func (w *SchemaWriter) DropShapeIndex(ctx context.Context, table *ir.Table, inde
 		}
 		indexRef := quoteIdent(schemaName) + "." + quoteIdent(pgIndexName(table.Name, idx.Name))
 		stmt := "DROP INDEX IF EXISTS " + indexRef
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("drop shape index %q on %s.%s: %w",
 				idx.Name, table.Schema, table.Name, err)
 		}
@@ -1738,7 +1737,7 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	qualified := w.qualifyTable(table)
 	stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s",
 		qualified, quoteIdent(want.Name), typeStr)
-	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 		return fmt.Errorf("alter column type %q on %s.%s: %w",
 			want.Name, table.Schema, table.Name, err)
 	}
@@ -1768,7 +1767,7 @@ func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col 
 		return err
 	}
 	stmt := guardedCreateEnumType(create)
-	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 		return fmt.Errorf("ensure enum type for %s.%s.%s: %w", w.schema, table.Name, col.Name, err)
 	}
 	return nil
@@ -1805,7 +1804,7 @@ func (w *SchemaWriter) alterEnumAddValues(ctx context.Context, table *ir.Table, 
 	typeRef := quoteIdent(w.schema) + "." + quoteIdent(resolveEnumTypeName(enum, table.Name, want.Name))
 	for _, v := range enum.Values {
 		stmt := fmt.Sprintf("ALTER TYPE %s ADD VALUE IF NOT EXISTS %s", typeRef, quoteSQLString(v))
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("alter enum type %s add value %q on %s.%s: %w",
 				typeRef, v, table.Schema, table.Name, err)
 		}
@@ -1827,7 +1826,7 @@ func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Tab
 	}
 	stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s %s",
 		qualified, quoteIdent(want.Name), action)
-	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 		return fmt.Errorf("alter column nullability %q on %s.%s: %w",
 			want.Name, table.Schema, table.Name, err)
 	}
@@ -1886,7 +1885,7 @@ func (w *SchemaWriter) AlterRenameColumn(ctx context.Context, table *ir.Table, o
 	qualified := w.qualifyTable(table)
 	stmt := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
 		qualified, quoteIdent(oldName), quoteIdent(newName))
-	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 		return fmt.Errorf("alter rename column %s.%s.%s -> %s: %w",
 			schemaName, table.Name, oldName, newName, err)
 	}

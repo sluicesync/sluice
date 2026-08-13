@@ -61,7 +61,7 @@ func (w *SchemaWriter) AlterAddCheck(ctx context.Context, table *ir.Table, check
 		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)",
 			qualified, quoteIdent(chk.Name), exprText)
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("alter add check %q on %s.%s: %w",
 				chk.Name, table.Schema, table.Name, err)
 		}
@@ -83,7 +83,7 @@ func (w *SchemaWriter) AlterDropCheck(ctx context.Context, table *ir.Table, chec
 		}
 		stmt := fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s",
 			qualified, quoteIdent(chk.Name))
-		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
 			return fmt.Errorf("alter drop check %q on %s.%s: %w",
 				chk.Name, table.Schema, table.Name, err)
 		}
