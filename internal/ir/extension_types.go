@@ -308,11 +308,12 @@ type Geometry struct {
 	// expanding [GeometrySubtype] into 28 entries; the writer
 	// reconstructs the suffix on emit (postgisSubtypeName). MySQL 8
 	// supports NO Z/M dimensional geometry at all: a Z/M-flagged
-	// column toward a MySQL-family target passes every preflight
-	// today and the copy aborts on the server's own error 1416
-	// naming nothing about dimensionality (audit 2026-08-11 SPAT-2,
-	// filed — the fix is a HasZ/HasM arm in unsupportablePGtoMySQL
-	// returning a named preflight reason).
+	// column toward a MySQL-family target REFUSES at the shared
+	// pre-DDL preflight (migcore.unsupportablePGtoMySQL, audit
+	// 2026-08-11 SPAT-2; pinned by
+	// TestCheckCrossEngineSupportable_PGtoMySQL_ZMDimsRefuse) —
+	// before that arm the copy aborted mid-run on the server's own
+	// error 1416, which names nothing about dimensionality.
 	HasZ bool
 	HasM bool
 }

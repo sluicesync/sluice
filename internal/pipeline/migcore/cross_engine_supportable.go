@@ -307,6 +307,28 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 			"the lossless mapping is --type-override to decimal:precision=%d,scale=0 (the values are exact integers)",
 			v.Precision, v.Scale, v.Precision-v.Scale)
 	}
+	// Audit 2026-08-11 SPAT-2: MySQL 8 supports NO Z/M dimensional
+	// geometry at all. A Z/M-flagged column passed every preflight
+	// (the MySQL writer's emitColumnType silently drops the suffix, so
+	// the DDL creates a 2D column) and the copy then aborted MID-RUN on
+	// the server's own Error 1416, naming nothing about dimensionality.
+	// Plain 2D geometry — including geography, which flattens with its
+	// values and SRID intact — stays supportable (ADR-0035), which is
+	// why this arm keys on the dimensional flags and never on
+	// ir.Geometry itself (the PostGISAllowed regression guard pins that
+	// direction).
+	if v, ok := t.(ir.Geometry); ok && (v.HasZ || v.HasM) {
+		dims := "Z"
+		switch {
+		case v.HasZ && v.HasM:
+			dims = "ZM"
+		case v.HasM:
+			dims = "M"
+		}
+		return fmt.Sprintf("a PostGIS %s-dimensional type (%s) — MySQL supports 2D geometry only, so the copy "+
+			"would abort mid-run on the server's raw Error 1416; if losing the extra dimension is acceptable, "+
+			"ST_Force2D the column on the source first", dims, v.String())
+	}
 	return ""
 }
 

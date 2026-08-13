@@ -43,6 +43,48 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_PostGISAllowed(t *testing.T) {
 	}
 }
 
+// TestCheckCrossEngineSupportable_PGtoMySQL_ZMDimsRefuse is the SPAT-2 pin
+// (audit 2026-08-11): MySQL 8 supports no Z/M dimensional geometry, and a
+// Z/M-flagged column used to pass every preflight (emitColumnType silently
+// drops the suffix) and abort the copy MID-RUN on the server's raw Error
+// 1416, which names nothing about dimensionality. The refusal fires at the
+// shared pre-DDL chokepoint (migrate, restore, chain restore) and names the
+// dimension, the failure it prevents, and the ST_Force2D landing. The 2D
+// negative rides in PostGISAllowed above — this family matrix covers the
+// dimensional axis × {geometry, geography}.
+func TestCheckCrossEngineSupportable_PGtoMySQL_ZMDimsRefuse(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  ir.Geometry
+		dims string
+	}{
+		{"Z geometry", ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true}, "Z-dimensional"},
+		{"M geometry", ir.Geometry{Subtype: ir.GeometryLineString, SRID: 4326, HasM: true}, "M-dimensional"},
+		{"ZM geometry", ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true, HasM: true}, "ZM-dimensional"},
+		{"Z geography", ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true, HasZ: true}, "Z-dimensional"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			s := &ir.Schema{Tables: []*ir.Table{{
+				Name: "places",
+				Columns: []*ir.Column{
+					{Name: "loc", Type: tc.typ},
+				},
+			}}}
+			err := CheckCrossEngineSupportable(s, "postgres", "mysql", "migrate")
+			if err == nil {
+				t.Fatalf("%s passed the preflight — the copy would abort mid-run on MySQL's raw Error 1416", tc.name)
+			}
+			for _, want := range []string{tc.dims, "1416", "ST_Force2D", "--exclude-table", `"places"`, `"loc"`} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("%s refusal should carry %q; got: %v", tc.name, want, err)
+				}
+			}
+		})
+	}
+}
+
 func TestCheckCrossEngineSupportable_PGtoMySQL_PortableTypesOK(t *testing.T) {
 	s := &ir.Schema{Tables: []*ir.Table{{
 		Name: "users",
