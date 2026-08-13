@@ -339,6 +339,16 @@ clean PG equivalent.
 | Source | sqlglot `exp.Uuid → GEN_RANDOM_UUID()` in postgres generator |
 | Importance | Low-Medium — UUID DEFAULTs are common in modern schemas; sluice's MySQL reader may already canonicalize the column type to UUID, in which case no rewrite is needed |
 
+#### 31. Infix `DIV` / `MOD` / `XOR`, prefix `!` — refusal, no rewrite
+
+| Field | Value |
+| --- | --- |
+| MySQL | `a DIV 2`, `a MOD 3`, `x XOR y`, `!(x)` as catalogs render them (audit 2026-08-11 ARCH-1 measurement: `DIV` and `XOR` render infix on both MySQL 8 and every MariaDB LTS line; MariaDB renders `MOD` for both `a MOD b` and `a % b` source spellings and preserves prefix `!`; MySQL 8 renders `%` and rewrites `!` away) |
+| PG | `div(a, b)`; `a % b` / `mod(a, b)`; `(x) <> (y)` for boolean operands; `NOT (...)` |
+| Notes | PostgreSQL parses none of the four spellings, so without a gate they die in PG's parser mid-migrate (SQLSTATE 42601) after earlier tables were created — the exact Bug 242 shape on sibling operators. Like the infix REGEXP forms in #13, these are detected by the shared literal-aware token scan and refused loudly with the equivalent named; no silent rewrite (`XOR`'s numeric-truthiness semantics and `!`'s precedence make blind textual rewrites unsafe). The scanner skips call-shaped `div(`/`mod(` — those are PG-valid functions. The same measurement pass covers bare `INTERVAL n unit`, column-level `COLLATE`, and `MEMBER OF`, refused by the general backstop gate (they are grammar constructs, not operators with a curated advisory). |
+| Source | ARCH-1 operator-family CHECK matrix (`TestCheckOperatorFamilyMatrix_*` in `internal/pipeline`), which creates one CHECK per operator in the MySQL grammar's operator table on both real flavors and asserts every rendered token is translator-rewritten, PG-accepted, or gate-refused |
+| Importance | Medium — DIV/MOD appear in bucketing/partitioning CHECKs; the failure without the gate is a mid-migrate abort |
+
 ## Already covered
 
 The rules sluice already implements (CONCAT, JSON extract idioms,

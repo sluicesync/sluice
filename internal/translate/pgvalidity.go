@@ -226,14 +226,17 @@ func untranslatableFunctions(expr string, enabledExt map[string]bool) []string {
 	if tok := mysqlOnlyCastTarget(expr); tok != "" && !seen[tok] {
 		out = append(out, tok)
 	}
-	// Bug 242: MySQL-family INFIX operators PostgreSQL cannot parse.
-	// MySQL 8 normalizes `c REGEXP '...'` to the regexp_like() call the
-	// function scan above sees; MariaDB's information_schema renders the
-	// INFIX spelling — no call, no parens — so the operator sailed past
-	// this gate and died in PostgreSQL's parser (SQLSTATE 42601) after
-	// earlier tables had been created. Same class as the cast-target arm
-	// above: an untranslatable construct that is not function-shaped.
-	for _, tok := range mysqlInfixOperators(expr) {
+	// Bug 242 + audit 2026-08-11 ARCH-1: MySQL-family OPERATOR grammar
+	// PostgreSQL cannot parse. MySQL 8 normalizes `c REGEXP '...'` to the
+	// regexp_like() call the function scan above sees; MariaDB's
+	// information_schema renders the INFIX spelling — no call, no parens
+	// — so the operator sailed past this gate and died in PostgreSQL's
+	// parser (SQLSTATE 42601) after earlier tables had been created.
+	// Bug 242 closed that instance (REGEXP/RLIKE); ARCH-1 measured the
+	// full MySQL operator table on both real flavors and closed the
+	// class. Same family as the cast-target arm above: untranslatable
+	// constructs that are not function-shaped.
+	for _, tok := range mysqlUntranslatableOperators(expr) {
 		if !seen[tok] {
 			seen[tok] = true
 			out = append(out, tok)
@@ -242,32 +245,130 @@ func untranslatableFunctions(expr string, enabledExt map[string]bool) []string {
 	return out
 }
 
-// mysqlInfixOperators reports the MySQL-family infix operator tokens in
-// expr that PostgreSQL has no parse for, as synthetic `infix-<op>`
-// tokens (the cast-target arm's naming convention). String-literal-aware
-// — a literal containing the word `regexp` is data — and word-bounded,
-// so `regexp_like` (an identifier byte follows) never matches. A COLUMN
-// literally named `regexp`/`rlike` (bare after the read-boundary
-// backtick strip) would false-trip this; that is the loud direction on
-// a vanishingly rare name, and `--expr-override` is its escape hatch.
+// mysqlUntranslatableOperators reports the MySQL-family operator tokens
+// in expr that PostgreSQL cannot accept, as synthetic `infix-<op>` /
+// `prefix-<op>` / construct tokens (the cast-target arm's naming
+// convention). String-literal-aware — a literal containing the word
+// `regexp` is data — and word-bounded, so `regexp_like` (an identifier
+// byte follows) never matches. A COLUMN literally named for one of the
+// word operators (bare after the read-boundary backtick strip; every
+// listed word is a MySQL reserved word, so such a column had to be
+// backtick-quoted at creation) would false-trip this; that is the loud
+// direction on a vanishingly rare name, and `--expr-override` is its
+// escape hatch.
 //
-// Deliberately only the two MEASURED spellings: MariaDB renders infix
-// `REGEXP` (Bug 242's shape) and accepts `RLIKE` as its synonym. MySQL's
-// `SOUNDS LIKE` operator is NOT listed — no catalog rendering of it has
-// been measured, and this gate adds spellings from measurements, not
-// from the manual (if a catalog renders it infix, it dies at PG's
-// parser exactly as Bug 242 did, and the fix is one entry here plus its
-// measurement).
-func mysqlInfixOperators(expr string) []string {
+// Deliberately only the MEASURED spellings (audit 2026-08-11 ARCH-1:
+// one CHECK per operator in the MySQL grammar's operator table, read
+// back from information_schema on mysql:8.0/8.4 and mariadb
+// 10.11/11.4/11.8/12.3 — all internally consistent):
+//
+//   - `DIV` renders infix on BOTH flavors (`a DIV 2`).
+//   - `MOD` renders infix on MariaDB only — and MariaDB renders it for
+//     BOTH source spellings, `a MOD 3` and `a % 3`. MySQL 8 renders
+//     both as `%`, which PostgreSQL parses.
+//   - `XOR` renders infix on BOTH flavors (`a > 0 xor b > 0`).
+//   - prefix `!` survives only in MariaDB renderings (`!(a <=> 99)`;
+//     MySQL 8 rewrites it to not(...)). `!=` is NOT this operator —
+//     both catalogs render it `<>`, and the arm skips `!=` so a raw
+//     source spelling never false-trips.
+//   - `MEMBER OF` renders on MySQL 8 only (`a member of (j)`); MariaDB
+//     rejects the construct at CREATE. Matched as the two-token
+//     sequence — a bare column named `member` does not trip it (`of`
+//     is reserved).
+//   - bare `INTERVAL n unit` renders on BOTH flavors (`d + interval 1
+//     day`); PostgreSQL only parses the quoted `interval '1 day'`
+//     literal form. Occurrences inside date_add(...)/date_sub(...)
+//     are skipped — the translator provably rewrites those calls
+//     (including their INTERVAL argument), so flagging them would
+//     false-refuse a fully-translatable expression. A compound-unit
+//     date_add the translator passes through degrades to the late
+//     target-side failure, no worse than the status quo.
+//   - `COLLATE` renders on BOTH flavors (`c collate utf8mb4_bin`).
+//     PostgreSQL parses COLLATE but a MySQL collation name cannot
+//     exist there (SQLSTATE 42704 at CREATE) — and in a mysql-dialect
+//     expression the name is always a MySQL collation. Occurrences
+//     inside cast(...) are skipped: the PG writer's
+//     rewriteCASTCharCharset strips a cast type spec's CHARSET/COLLATE
+//     clause (a COLLATE elsewhere inside a cast's value expression
+//     degrades to the late target-side failure — conservative, since a
+//     refusal there would be a false positive on the common
+//     `cast(x as char(5) collate ...)` shape the translator handles).
+//
+// `SOUNDS LIKE` remains deliberately unlisted: both catalogs render it
+// through soundex() (MySQL 8 adds convert(... using utf8mb4)), and the
+// function allowlist already refuses soundex/convert, so no operator
+// spelling of it has been measured escaping. `BINARY c` needs no arm:
+// both catalogs render it as `cast(... as char charset binary)`, which
+// rewriteCASTCharCharset provably translates. This gate adds spellings
+// from measurements, not from the manual.
+//
+// The word operators DIV/MOD/XOR skip call-shaped occurrences (an
+// immediately following `(`, no space): `mod(a, 3)` / `div(a, b)` are
+// PG-valid FUNCTIONS the allowlist admits, and the measured infix
+// renderings always separate the operator from its operand. An exotic
+// `a MOD(3)` source spelling therefore degrades to the late failure,
+// which is the conservative direction (a false refusal of the valid
+// call form would not be).
+func mysqlUntranslatableOperators(expr string) []string {
 	var out []string
 	seen := map[string]bool{}
+	emit := func(tok string) {
+		if !seen[tok] {
+			seen[tok] = true
+			out = append(out, tok)
+		}
+	}
+	// Paren stack: each open paren records which translator-rewritten
+	// call it is the argument list of, so tokens the translator owns
+	// inside that call are not false-refused. intervalGuarded /
+	// castGuarded count live entries so "inside one" is O(1).
+	type parenGuard struct{ interval, cast bool }
+	var parens []parenGuard
+	intervalGuarded, castGuarded := 0, 0
+	var pending parenGuard
 	for i := 0; i < len(expr); {
 		c := expr[i]
-		if c == '\'' {
+		switch {
+		case c == '\'':
 			i = exprident.ScanStringLiteral(expr, i)
+			pending = parenGuard{}
 			continue
-		}
-		if !isIdentStartByte(c) {
+		case c == '(':
+			parens = append(parens, pending)
+			if pending.interval {
+				intervalGuarded++
+			}
+			if pending.cast {
+				castGuarded++
+			}
+			pending = parenGuard{}
+			i++
+			continue
+		case c == ')':
+			if n := len(parens); n > 0 {
+				if parens[n-1].interval {
+					intervalGuarded--
+				}
+				if parens[n-1].cast {
+					castGuarded--
+				}
+				parens = parens[:n-1]
+			}
+			i++
+			continue
+		case c == '!':
+			// `!=` is ordinary inequality (both catalogs render it `<>`,
+			// but a raw source spelling must not false-trip); a lone `!`
+			// is MySQL's high-precedence NOT, which PG does not parse.
+			if i+1 < len(expr) && expr[i+1] == '=' {
+				i += 2
+				continue
+			}
+			emit("prefix-!")
+			i++
+			continue
+		case !isIdentStartByte(c):
+			pending = parenGuard{}
 			i++
 			continue
 		}
@@ -276,21 +377,69 @@ func mysqlInfixOperators(expr string) []string {
 		for j < len(expr) && exprident.IsIdentifierByte(expr[j]) {
 			j++
 		}
-		switch strings.ToLower(expr[start:j]) {
+		word := strings.ToLower(expr[start:j])
+		callShaped := j < len(expr) && expr[j] == '('
+		pending = parenGuard{}
+		switch word {
 		case "regexp":
-			if !seen["infix-regexp"] {
-				seen["infix-regexp"] = true
-				out = append(out, "infix-regexp")
-			}
+			emit("infix-regexp")
 		case "rlike":
-			if !seen["infix-rlike"] {
-				seen["infix-rlike"] = true
-				out = append(out, "infix-rlike")
+			emit("infix-rlike")
+		case "div":
+			if !callShaped {
+				emit("infix-div")
+			}
+		case "mod":
+			if !callShaped {
+				emit("infix-mod")
+			}
+		case "xor":
+			if !callShaped {
+				emit("infix-xor")
+			}
+		case "member":
+			if nextWordIs(expr, j, "of") {
+				emit("infix-member-of")
+			}
+		case "interval":
+			if intervalGuarded == 0 {
+				emit("interval-bare")
+			}
+		case "collate":
+			if castGuarded == 0 {
+				emit("collate-mysql")
+			}
+		case "date_add", "date_sub":
+			// The translator provably rewrites these calls, INTERVAL
+			// argument included — mark the argument list so the
+			// interval arm does not false-refuse it.
+			if callShaped {
+				pending.interval = true
+			}
+		case "cast":
+			// rewriteCASTCharCharset strips CHARSET/COLLATE from a cast
+			// type spec — mark the argument list so the collate arm does
+			// not false-refuse the translated shape.
+			if callShaped {
+				pending.cast = true
 			}
 		}
 		i = j
 	}
 	return out
+}
+
+// nextWordIs reports whether the next identifier token at or after pos
+// (skipping only whitespace) is word (case-insensitive, word-bounded).
+func nextWordIs(expr string, pos int, word string) bool {
+	for pos < len(expr) && (expr[pos] == ' ' || expr[pos] == '\t' || expr[pos] == '\n' || expr[pos] == '\r') {
+		pos++
+	}
+	end := pos + len(word)
+	if end > len(expr) || !strings.EqualFold(expr[pos:end], word) {
+		return false
+	}
+	return end == len(expr) || !exprident.IsIdentifierByte(expr[end])
 }
 
 // mysqlOnlyCastTarget reports the MySQL-only CAST/CONVERT target-type
@@ -301,6 +450,13 @@ func mysqlInfixOperators(expr string) []string {
 // integer-cast keywords PG has no spelling for; PG-valid cast targets
 // (numeric, bigint, text, …) and any other token do not match, so a
 // valid `CAST(x AS numeric(20,0))` is never refused.
+//
+// `CAST(x AS CHAR [(N)] [CHARSET y] [COLLATE z])` — both flavors'
+// catalog rendering of the `BINARY` operator and charset casts — is
+// deliberately NOT flagged here: the PG writer's
+// rewriteCASTCharCharset provably rewrites the whole family to
+// `CAST(x AS VARCHAR(N)/TEXT)` (ADR-0016's cumulative scope), so it is
+// translator territory, verified by the ARCH-1 operator-family matrix.
 func mysqlOnlyCastTarget(expr string) string {
 	const kw = " AS "
 	for i := 0; i < len(expr); {
@@ -508,6 +664,20 @@ func RefuseOnUntranslatableExprs(
 			what = "the infix `REGEXP` operator (MariaDB's catalog spelling — MySQL 8 renders it as regexp_like()), which PostgreSQL does not parse — its equivalent is `x ~ 'pattern'`, minding the ICU-vs-POSIX regex flavour difference — and"
 		case "infix-rlike":
 			what = "the infix `RLIKE` operator, which PostgreSQL does not parse — its equivalent is `x ~ 'pattern'`, minding the ICU-vs-POSIX regex flavour difference — and"
+		case "infix-div":
+			what = "the infix `DIV` integer-division operator, which PostgreSQL does not parse — its equivalent is `div(a, b)` (integer quotient truncating toward zero, matching MySQL) — and"
+		case "infix-mod":
+			what = "the infix `MOD` operator (MariaDB's catalog spelling for both `a MOD b` and `a % b`; MySQL 8 renders both as `%`), which PostgreSQL does not parse — its equivalent is `a % b` or `mod(a, b)`, both keeping MySQL's dividend-sign semantics — and"
+		case "infix-xor":
+			what = "the infix `XOR` logical operator, which PostgreSQL does not parse — for boolean operands `(x) <> (y)` is equivalent, including NULL propagation — and"
+		case "prefix-!":
+			what = "the prefix `!` operator (MySQL's high-precedence NOT, preserved by MariaDB's catalog rendering), which PostgreSQL does not parse — its equivalent is `NOT (...)` — and"
+		case "infix-member-of":
+			what = "the `MEMBER OF` JSON operator, which PostgreSQL does not parse — jsonb's `?` (top-level string membership) or `@>` (containment) are the closest equivalents, minding their semantic differences — and"
+		case "interval-bare":
+			what = "MySQL's unquoted `INTERVAL n unit` grammar, which PostgreSQL does not parse — PostgreSQL spells the same literal `interval '1 day'` (quantity and unit inside one quoted string) — and"
+		case "collate-mysql":
+			what = "a `COLLATE` clause naming a MySQL collation, which PostgreSQL parses but rejects at CREATE (SQLSTATE 42704 — the collation does not exist there); supply a PostgreSQL collation, and"
 		default:
 			what = u.Function + "(...) is not a PostgreSQL built-in and"
 		}

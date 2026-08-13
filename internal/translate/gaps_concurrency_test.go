@@ -77,14 +77,14 @@ func TestGapMatchers_CoverTheRegistry(t *testing.T) {
 	}
 	callForm := 0
 	for _, pat := range gapPatterns {
-		if pat.infix {
-			// Bug 242: operator-form entries are matched by the shared
-			// token scan (matchesInfixOperator), never by a call-form
-			// regex — a table entry here would be dead weight that reads
-			// as coverage.
+		if pat.infix || pat.prefix {
+			// Bug 242 / ARCH-1: operator-form entries are matched by the
+			// shared token scan (matchesOperatorToken), never by a
+			// call-form regex — a table entry here would be dead weight
+			// that reads as coverage.
 			if _, ok := gapMatchers[pat.name]; ok {
-				t.Errorf("infix gapPatterns entry %q has a call-form matcher — the call regex can never "+
-					"match an infix operator, so this entry is vacuous and misleading", pat.name)
+				t.Errorf("operator-form gapPatterns entry %q has a call-form matcher — the call regex can "+
+					"never match an operator, so this entry is vacuous and misleading", pat.name)
 			}
 			continue
 		}

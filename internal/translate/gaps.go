@@ -92,11 +92,17 @@ type Gap struct {
 	Pattern string
 
 	// Infix marks an operator-form pattern (Bug 242: REGEXP/RLIKE as
-	// MariaDB's catalog spells them). Renderers use it to say "the
-	// infix REGEXP operator" instead of the call-form "REGEXP()" —
-	// parens on an operator misdescribe what the operator actually
-	// wrote (the v0.120.1 rendering nit).
+	// MariaDB's catalog spells them; ARCH-1 added DIV/MOD/XOR).
+	// Renderers use it to say "the infix REGEXP operator" instead of
+	// the call-form "REGEXP()" — parens on an operator misdescribe what
+	// the operator actually wrote (the v0.120.1 rendering nit).
 	Infix bool
+
+	// Prefix marks a prefix-operator pattern (ARCH-1: MariaDB's catalog
+	// preserves the high-precedence `!`). Same rendering contract as
+	// Infix — "the prefix ! operator", never call-parens, and never
+	// "infix" for an operator that stands before its operand.
+	Prefix bool
 
 	// RuleNum is the [`translator-coverage.md`] catalog rule number
 	// (#11, #13, etc.) so operators can cross-reference the doc.
@@ -219,6 +225,11 @@ type gapPattern struct {
 	// MariaDB's catalog renders `c REGEXP '...'` infix, which no call-form
 	// matcher can see.
 	infix bool
+
+	// prefix marks a PREFIX-operator pattern (ARCH-1: `!`): matched
+	// through the same literal-aware token scan as infix, rendered as
+	// "the prefix X operator".
+	prefix bool
 }
 
 // gapPatterns is the registry of MySQL → PG translator gaps the
@@ -261,6 +272,41 @@ var gapPatterns = []gapPattern{
 		severity: SeverityLoud,
 		note:     "MariaDB accepts RLIKE as a synonym of its infix REGEXP (its catalog usually normalizes it to `regexp`; this spelling is kept for any that does not). Equivalent: `x ~ 'pattern'` (POSIX flavour vs MySQL's ICU). Use --expr-override.",
 		infix:    true,
+	},
+	{
+		// ARCH-1 (audit 2026-08-11): Bug 242's gate listed the two
+		// REGEXP spellings and nothing else — the sibling word
+		// operators below rendered into catalogs on real flavors and
+		// died in PG's parser exactly the same way. Measured escape
+		// set: DIV renders infix on BOTH mysql:8.0/8.4 and every
+		// MariaDB LTS line; MOD and prefix-! render on MariaDB only;
+		// XOR renders on BOTH.
+		name:     "DIV",
+		rule:     31,
+		severity: SeverityLoud,
+		note:     "MySQL's integer-division operator renders infix in both MySQL 8 and MariaDB catalogs, and PostgreSQL does not parse it. Equivalent: `div(a, b)` (integer quotient truncating toward zero, matching MySQL). Use --expr-override.",
+		infix:    true,
+	},
+	{
+		name:     "MOD",
+		rule:     31,
+		severity: SeverityLoud,
+		note:     "MariaDB's catalog renders BOTH `a MOD b` and `a % b` as infix `MOD` (MySQL 8 renders both as `%`, which PostgreSQL parses). Equivalent: `a % b` or `mod(a, b)`, both keeping MySQL's dividend-sign semantics. Use --expr-override.",
+		infix:    true,
+	},
+	{
+		name:     "XOR",
+		rule:     31,
+		severity: SeverityLoud,
+		note:     "Neither MySQL 8 nor MariaDB rewrites logical `XOR` in catalog renderings, and PostgreSQL has no XOR operator. For boolean operands `(x) <> (y)` is equivalent, including NULL propagation. Use --expr-override.",
+		infix:    true,
+	},
+	{
+		name:     "!",
+		rule:     31,
+		severity: SeverityLoud,
+		note:     "MariaDB's catalog preserves the prefix `!` (MySQL's high-precedence NOT; MySQL 8 rewrites it away), and PostgreSQL does not parse it. Equivalent: `NOT (...)`. Use --expr-override.",
+		prefix:   true,
 	},
 	{
 		name:     "FIND_IN_SET",
@@ -369,9 +415,12 @@ func RefuseOnLoudGaps(
 		} else {
 			fmt.Fprintf(&b, "table %q column %q %s", g.Table, g.Column, g.Field)
 		}
-		if g.Infix {
+		switch {
+		case g.Infix:
 			fmt.Fprintf(&b, ": the infix %s operator has no PostgreSQL equivalent. %s", g.Pattern, g.Note)
-		} else {
+		case g.Prefix:
+			fmt.Fprintf(&b, ": the prefix %s operator has no PostgreSQL equivalent. %s", g.Pattern, g.Note)
+		default:
 			fmt.Fprintf(&b, ": %s() has no portable PostgreSQL equivalent. %s", g.Pattern, g.Note)
 		}
 	}
@@ -385,11 +434,12 @@ func RefuseOnLoudGaps(
 // generally want the loud count anyway).
 //
 // Call-form patterns match on the word-boundary regex `\bNAME\s*\(`;
-// operator-form patterns (`infix: true` — REGEXP and RLIKE, Bug 242)
-// match as bare word tokens through the same literal-aware scanner the
-// MySQL→PG refusal gate uses ([matchesInfixOperator]), so the advisory
-// and the refusal cannot disagree. (This doc previously claimed the
-// operator forms were "not detected"; Bug 242 is what that claim cost.)
+// operator-form patterns (`infix`/`prefix` — REGEXP/RLIKE from Bug 242,
+// DIV/MOD/XOR/! from ARCH-1) match as tokens through the same
+// literal-aware scanner the MySQL→PG refusal gate uses
+// ([matchesOperatorToken]), so the advisory and the refusal cannot
+// disagree. (This doc previously claimed the operator forms were "not
+// detected"; Bug 242 is what that claim cost.)
 func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 	if expr == "" {
 		return nil
@@ -400,8 +450,8 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 			// Extension enabled → rewrite ships, skip the warning.
 			continue
 		}
-		if pat.infix {
-			if !matchesInfixOperator(expr, pat.name) {
+		if pat.infix || pat.prefix {
+			if !matchesOperatorToken(expr, pat.name, pat.prefix) {
 				continue
 			}
 		} else if !matchesFunctionCall(expr, pat.name) {
@@ -411,6 +461,7 @@ func detectGaps(expr string, enabledExt map[string]bool) []Gap {
 			Expression: expr,
 			Pattern:    pat.name,
 			Infix:      pat.infix,
+			Prefix:     pat.prefix,
 			RuleNum:    pat.rule,
 			Severity:   pat.severity,
 			Note:       pat.note,
@@ -433,17 +484,21 @@ func matchesFunctionCall(expr, name string) bool {
 	return re.MatchString(expr)
 }
 
-// matchesInfixOperator is the operator-form twin of
-// [matchesFunctionCall] (Bug 242), and it deliberately rides the SAME
-// scanner the refusal gate uses ([mysqlInfixOperators]) — one
-// literal-aware, word-bounded token scan, two consumers, so the
-// advisory and the refusal can never disagree about what counts as the
-// operator. Unlike the call-form matcher it masks string literals: an
-// advisory firing on the word `regexp` inside a value would be noise
-// the loud gate never produces.
-func matchesInfixOperator(expr, name string) bool {
-	for _, tok := range mysqlInfixOperators(expr) {
-		if strings.EqualFold(tok, "infix-"+name) {
+// matchesOperatorToken is the operator-form twin of
+// [matchesFunctionCall] (Bug 242, extended by ARCH-1), and it
+// deliberately rides the SAME scanner the refusal gate uses
+// ([mysqlUntranslatableOperators]) — one literal-aware, word-bounded
+// token scan, two consumers, so the advisory and the refusal can never
+// disagree about what counts as the operator. Unlike the call-form
+// matcher it masks string literals: an advisory firing on the word
+// `regexp` inside a value would be noise the loud gate never produces.
+func matchesOperatorToken(expr, name string, prefix bool) bool {
+	want := "infix-" + name
+	if prefix {
+		want = "prefix-" + name
+	}
+	for _, tok := range mysqlUntranslatableOperators(expr) {
+		if strings.EqualFold(tok, want) {
 			return true
 		}
 	}
@@ -478,9 +533,9 @@ func matchesInfixOperator(expr, name string) bool {
 var gapMatchers = func() map[string]*regexp.Regexp {
 	m := make(map[string]*regexp.Regexp, len(gapPatterns))
 	for _, pat := range gapPatterns {
-		if pat.infix {
+		if pat.infix || pat.prefix {
 			// Operator-form patterns are matched by the shared token scan
-			// ([matchesInfixOperator]), never by a call-form regex.
+			// ([matchesOperatorToken]), never by a call-form regex.
 			continue
 		}
 		// `(?i)` makes the match case-insensitive; `\b` is a word boundary;
