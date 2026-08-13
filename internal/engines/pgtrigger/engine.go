@@ -32,14 +32,17 @@
 //     bulk-copy + CDC. The cross-engine supportability gate treats a
 //     `postgres-trigger` source as a PG source (pg_trgm opclass
 //     indexes and EXCLUDE constraints refuse loudly the same as a
-//     `postgres` source). PostGIS Geometry does NOT refuse — stale
-//     claim corrected 2026-08-12: ADR-0035 (v0.28.0) made PG-source
-//     geometry carried, so cold copy rides the delegated `postgres`
-//     reader fine, but the trigger capture (`to_jsonb`) renders a
-//     geometry as a GeoJSON object the shared apply path cannot
-//     decode ([]byte expected), so the first spatial DML after cold
-//     start wedges the stream (audit 2026-08-11 SPAT-4, filed — the
-//     fix is an ST_AsEWKB capture or a setup-time preflight refusal).
+//     `postgres` source). PostGIS geometry/geography: ADR-0035
+//     (v0.28.0) made PG-source geometry carried, so cold copy rides
+//     the delegated `postgres` reader fine — but the trigger capture
+//     (`to_jsonb`) renders a spatial value as a GeoJSON object the
+//     shared apply path cannot decode ([]byte expected), which used
+//     to wedge the stream at the first spatial DML after cold start.
+//     Setup now refuses spatial columns up front (audit 2026-08-11
+//     SPAT-4; reason `postgis-spatial-column`, §14 roster, pinned by
+//     TestSetup_PostGIS_RefusesSpatialColumns). The ST_AsEWKB capture
+//     that would CARRY spatial columns is the recorded alternative —
+//     see the SPAT-4 entry in docs/dev/audit-backlog.md.
 //   - The full §15 Bug-74 value-family matrix pinned cross-engine via a
 //     `postgres-trigger`-vs-`postgres` MySQL-target congruence test —
 //     the trigger reader's JSON-scalar value shapes (bytea `\x`-hex,

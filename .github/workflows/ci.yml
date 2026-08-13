@@ -504,7 +504,7 @@ jobs:
   # non-falsifiable by scripts/check-run-filter-coverage.sh in the Lint job —
   # is: every test in a `//go:build … postgis`-tagged file MUST have a
   # `PostGIS_` segment in its name AND live in a package this job's path
-  # list covers. The three suites today:
+  # list covers. The four suites today:
   #   - internal/pipeline/migrate_postgis_integration_test.go
   #       (TestMigrate_PostGIS_*  — MySQL↔PG geometry round-trips)
   #   - internal/pipeline/migrate_pg_postgis_passthrough_integration_test.go
@@ -513,6 +513,10 @@ jobs:
   #   - internal/engines/postgres/change_applier_pipelined_postgis_integration_test.go
   #       (TestPipelined_PostGIS_*  — ADR-0092 pipelined-vs-serial geometry
   #        equivalence pin; this is the guard for the geometry-codec work)
+  #   - internal/engines/pgtrigger/setup_spatial_postgis_integration_test.go
+  #       (TestSetup_PostGIS_*  — the SPAT-4 spatial-column setup refusal
+  #        against the real extension, incl. the DOMAIN-over-geometry
+  #        wrapping; the pgtrigger path entry below exists for this suite)
   # The narrower `TestMigrate_PostGIS_` filter used through v0.99.53 matched
   # ONLY the first suite — the passthrough (10 tests) and the engine-package
   # pipelined pin (1 test) compiled but never ran in CI. `PostGIS_` (trailing
@@ -553,7 +557,7 @@ jobs:
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
             ghcr.io/sluicesync/sluice-postgres:16-prebaked \
             ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
-      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m -run 'PostGIS_' ./internal/pipeline/... ./internal/engines/postgres/...
+      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m -run 'PostGIS_' ./internal/pipeline/... ./internal/engines/postgres/... ./internal/engines/pgtrigger/...
 
   # ----- Integration (vstream) -----
   # The PlanetScale/Vitess VStream path is exercised end-to-end against a

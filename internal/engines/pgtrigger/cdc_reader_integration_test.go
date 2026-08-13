@@ -379,6 +379,57 @@ func TestSetup_RefusesJSONArrayColumn(t *testing.T) {
 	}
 }
 
+// TestSetup_RefusesSpatialColumnShapes is the plain-PG half of the SPAT-4
+// refusal (audit 2026-08-11): the detection is NAME-keyed on pg_type.typname
+// ('geometry'/'geography' — the same key PostGIS's geometry_columns view
+// joins on and the postgres reader's udt_name dispatch uses), so it fires
+// without the extension installed. This leg runs in the ordinary
+// integration shard on a stand-in type NAMED geometry; the real-extension
+// premise leg (incl. the DOMAIN-over-geometry wrapping the
+// unrecognised-domain gate cannot catch) is
+// TestSetup_PostGIS_RefusesSpatialColumns in the PostGIS job.
+//
+// The stand-in refusing is itself the documented loud direction: a
+// composite value named geometry renders through to_jsonb as a JSON
+// object the apply path cannot decode either way.
+func TestSetup_RefusesSpatialColumnShapes(t *testing.T) {
+	dsn, cleanup := startPGForTrigger(t)
+	defer cleanup()
+
+	applyPGSQL(t, dsn, `
+		CREATE TYPE geometry AS (x float8, y float8);
+		CREATE TABLE sp  (id BIGINT PRIMARY KEY, g geometry);
+		CREATE TABLE spa (id BIGINT PRIMARY KEY, gs geometry[]);
+		CREATE TABLE ok2 (id BIGINT PRIMARY KEY, name TEXT);
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	for _, table := range []string{"sp", "spa"} {
+		plan, err := Setup(ctx, dsn, SetupOptions{Tables: []string{table}, Schema: "public"})
+		if err == nil {
+			t.Fatalf("Setup(%s): expected the postgis-spatial-column refusal; got nil err (plan=%+v)", table, plan)
+		}
+		var sawSpatial bool
+		for _, r := range plan.Refusals {
+			if r.Reason == "postgis-spatial-column" {
+				sawSpatial = true
+				if !contains(r.Hint, "--exclude-table") {
+					t.Errorf("Setup(%s): Refusal.Hint = %q; want contains '--exclude-table'", table, r.Hint)
+				}
+			}
+		}
+		if !sawSpatial {
+			t.Errorf("Setup(%s): Refusals = %+v; want a postgis-spatial-column refusal", table, plan.Refusals)
+		}
+	}
+
+	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"ok2"}, Schema: "public"}); err != nil {
+		t.Fatalf("Setup(ok2): an ordinary table must not be refused by the spatial gate: %v", err)
+	}
+}
+
 // TestSetup_DryRun_NoSideEffects asserts the dry-run path emits the
 // DDL without applying it. The change-log table must NOT exist after
 // the call.

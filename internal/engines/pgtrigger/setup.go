@@ -1109,6 +1109,26 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 				Hint:   "the trigger engine's to_jsonb capture cannot distinguish a JSON `null` element from a SQL NULL element, nor an array-valued element from a nested array dimension, in a json[]/jsonb[] column; remap the column with --type-override, take the whole table out of scope with --exclude-table (sluice has no column-scope filter — ADR-0177), or use the `postgres` engine (logical replication carries this family faithfully)",
 			})
 		}
+		// Audit 2026-08-11 SPAT-4. The delegated postgres reader CARRIES
+		// geometry/geography (ADR-0035), so cold copy works — but the
+		// trigger capture is to_jsonb, and PostGIS's registered jsonb
+		// cast renders a spatial value as a GeoJSON OBJECT: lossy in
+		// itself (GeoJSON cannot carry M coordinates or non-EPSG SRIDs)
+		// and undecodable by the shared apply path, which demands []byte
+		// for a Geometry column. Before this refusal, setup + cold copy
+		// succeeded and the FIRST spatial DML wedged the stream
+		// mid-incident. Refused here instead, where the operator can
+		// act. An ST_AsEWKB capture that would carry spatial columns is
+		// the recorded alternative (it needs schema-qualified PostGIS
+		// calls under the capture function's pinned search_path — see
+		// the SPAT-4 decision memo in the audit backlog).
+		if shape.hasSpatialColumn {
+			refusals = append(refusals, TableRefusal{
+				Schema: schema, Table: t,
+				Reason: "postgis-spatial-column",
+				Hint:   "the trigger engine's to_jsonb capture renders a PostGIS geometry/geography value as a GeoJSON object (lossy for M coordinates and non-EPSG SRIDs, and the apply path cannot decode it), so the first spatial change after cold start would wedge the stream; use the `postgres` engine (logical replication carries spatial values as EWKB faithfully), or take the whole table out of scope with --exclude-table (sluice has no column-scope filter — ADR-0177)",
+			})
+		}
 	}
 	return refusals, pkColsByTable, nil
 }
@@ -1124,6 +1144,7 @@ type tableShape struct {
 	hasGenerated          bool
 	hasUnrecognisedDomain bool
 	hasJSONArrayColumn    bool
+	hasSpatialColumn      bool
 }
 
 // loadTableShape returns the per-table flags the preflight classifies
@@ -1187,7 +1208,31 @@ SELECT
            AND a.attnum > 0 AND NOT a.attisdropped
            AND t.typcategory = 'A'                   -- an array type…
            AND et.typname IN ('json', 'jsonb')       -- …of json/jsonb: refuse (item 145)
-    ) AS has_json_array_column
+    ) AS has_json_array_column,
+    EXISTS (
+        SELECT 1
+          FROM pg_attribute a
+          JOIN pg_class      c ON c.oid = a.attrelid
+          JOIN pg_namespace  n ON n.oid = c.relnamespace
+          JOIN pg_type       t ON t.oid = a.atttypid
+          LEFT JOIN pg_type et ON et.oid = t.typelem      -- array element
+          LEFT JOIN pg_type bt ON bt.oid = t.typbasetype  -- domain base
+          LEFT JOIN pg_type bet ON bet.oid = bt.typelem   -- domain over array
+         WHERE c.relname = $2 AND n.nspname = $1
+           AND a.attnum > 0 AND NOT a.attisdropped
+           -- PostGIS spatial columns, at every wrapping the capture can
+           -- meet: direct, array element, domain base, domain-over-array
+           -- (audit 2026-08-11 SPAT-4). Name-keyed on typname, the same
+           -- key PostGIS's own geometry_columns view joins on and the
+           -- postgres reader's udt_name dispatch uses — a hand-rolled
+           -- type NAMED geometry also refuses, which is the loud
+           -- direction (to_jsonb renders any such value as a JSON
+           -- object the apply path cannot decode either way).
+           AND (t.typname   IN ('geometry', 'geography')
+             OR et.typname  IN ('geometry', 'geography')
+             OR bt.typname  IN ('geometry', 'geography')
+             OR bet.typname IN ('geometry', 'geography'))
+    ) AS has_spatial_column
 `
 	var (
 		shape          tableShape
@@ -1200,6 +1245,7 @@ SELECT
 		&shape.hasGenerated,
 		&shape.hasUnrecognisedDomain,
 		&shape.hasJSONArrayColumn,
+		&shape.hasSpatialColumn,
 	); err != nil {
 		return tableShape{}, err
 	}
