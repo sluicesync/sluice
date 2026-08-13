@@ -103,6 +103,10 @@ Also note (query API): `INTEGER 1` and `REAL 1.0` both serialize to bare `1`
   `typeof()`, so integers > 2^53 round-trip exactly. It is the *higher*-fidelity reader, not
   the lower-fidelity one the earlier draft assumed.
 
+## D1 TEXT with invalid UTF-8 is unrescuable through the API (empirically verified 2026-08-13)
+
+A TEXT value containing invalid UTF-8 (severed multi-byte sequences, raw high bytes — the shapes sluice's file-backed SQLite lanes refuse loudly per SQT-1) **cannot be read faithfully over D1's HTTP API at all**: D1 stores the bytes intact (`hex(x)` proves it), but the `/query` JSON response replaces every invalid byte with U+FFFD **server-side**, before any client can see the originals. This applies to both live-D1 lanes — the `d1` query-API reader and the `d1-trigger` change-log poll (the capture trigger stores the raw bytes verbatim; the mangle happens when the image is read back). sluice's invalid-UTF-8 refusal therefore cannot fire on D1 sources for this vector: the mangled value arrives as *valid* UTF-8 and is indistinguishable from a value that genuinely contained U+FFFD. If you suspect such values, `hex(x)` on candidate rows exports the true bytes server-side for manual recovery — or repair them at the source before migrating. (Measured on real D1 and pinned by the `d1verify` suite, `TestD1Verify_InvalidUTF8TextIsMangledServerSide`; if Cloudflare's serialization ever changes, that pin fails and this section gets rewritten.)
+
 ## Cloudflare D1, the lossless way: the live query-API reader (`--source-driver d1`)
 
 The `d1` source engine reads a **live** D1 database over D1's HTTP query API and is the

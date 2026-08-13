@@ -80,12 +80,18 @@ psverify;^TestPS;internal/planetscale/... internal/engines/mysql internal/engine
 #   - jsonbench     → local/on-demand serializer benchmark harness; no
 #                     workflow, no `-run` filter to escape.
 #   - compressbench → same, compression-algorithm harness.
+#   - d1verify      → live-Cloudflare-credential premise-verification
+#                     suite (CLOUDFLARE_API_TOKEN is machine-local; CI
+#                     has no such secret, so a workflow leg would only
+#                     ever skip). Run manually per the suite header
+#                     (internal/engines/sqlite/d1_invalid_utf8_verify_test.go);
+#                     vet-tags still type-checks it on every run.
 # `integration` itself is structurally exempt (hardcoded below, not
 # listed here): its packages are guarded by check-shard-coverage.sh and
 # the ci.yml pipeline shards' -run/-skip regexes are a complete
 # partition (the -skip shard catches every name the other two don't),
 # so no bare-integration test can escape by name.
-EXEMPT_TAGS='jsonbench compressbench'
+EXEMPT_TAGS='jsonbench compressbench d1verify'
 
 set -eu
 cd "$(dirname "$0")/.."

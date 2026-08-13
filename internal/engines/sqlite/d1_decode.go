@@ -101,14 +101,20 @@ func isJSONNull(raw json.RawMessage) bool {
 // refuse (audit 2026-08-11 SQT-1). Both vectors are refused loudly BEFORE
 // Unmarshal; the caller wraps the error with table/column/row context.
 //
-// UNVERIFIED PREMISE (the D1 lane): whether Cloudflare's D1 /query API
-// returns invalid-UTF-8 TEXT bytes verbatim in its JSON response has NOT
-// been measured against real D1. If it does, this guard is the load-bearing
-// refusal there too; if D1 instead mangles server-side (V8 strings cannot
-// hold invalid UTF-8), the loss happens upstream of any client guard and
-// this refusal cannot fire for that vector on that lane — there is then no
-// independent expected value client-side. A live-D1 premise pin is filed in
-// docs/dev/audit-backlog.md (2026-08-12).
+// MEASURED PREMISE (the D1 lane, real D1 2026-08-13 — pinned by
+// TestD1Verify_InvalidUTF8TextIsMangledServerSide, d1verify tag): D1
+// stores invalid-UTF-8 TEXT intact (hex() returns the original bytes),
+// but the /query API replaces every invalid byte with U+FFFD in the
+// JSON response, SERVER-SIDE — for direct reads and for trigger-lane
+// change-log images alike (the json_object capture stores the raw
+// bytes verbatim; the mangle happens at API read). So this guard
+// CANNOT fire for that vector on the D1 lanes: the mangled cell
+// arrives as valid UTF-8 and there is no independent expected value
+// client-side. The operator-facing consequence is documented in
+// docs/operator/sqlite-d1-import.md (the value is unrescuable as TEXT
+// through the API; hex(x) server-side still exports the true bytes).
+// On the file-backed SQLite lanes this guard IS load-bearing, exactly
+// as below.
 func jsonString(raw json.RawMessage) (s string, ok bool, err error) {
 	if isJSONNull(raw) {
 		return "", false, nil
