@@ -45,6 +45,15 @@ import (
 // and refusing would stop an operation an operator may still want — but
 // silently extending or maintaining an un-restorable chain is how
 // Bug 243 presented, so the warning names the code.
+//
+// The broker's `--reset-target-data` cold start is the FIFTH refusal
+// door, exported as [RefuseChainRecordedSchemaMalformed] (audit
+// 2026-08-11 BRK-1): it DROPS the target's tables off the cached
+// manifest BEFORE running ChainRestore, whose own doors would then
+// refuse the chain — converting a refusable chain into a destroyed
+// target. The broker runs the exported door over the whole chain's
+// manifests before its drop, on the same detector and renderer as
+// every other door.
 
 // recordedSchemaMalformedHint is the operator remedy, shared by every
 // door so one shape reports one (code, hint) pair.
@@ -120,6 +129,27 @@ func warnIfChainRecordedSchemaMalformed(ctx context.Context, op string, store ir
 			return
 		}
 	}
+}
+
+// RefuseChainRecordedSchemaMalformed is the pre-DDL door for callers
+// that take a DESTRUCTIVE step before [ChainRestore]'s own doors can
+// fire (audit 2026-08-11 BRK-1 — the Bug 243 sweep's missed fifth
+// door): the broker's --reset-target-data cold start drops the
+// target's tables off the cached manifest before ChainRestore.Run's
+// refusals run, so a chain the restore will refuse must refuse HERE
+// first, while the target still holds its data. It scans everything
+// the given manifests can ask a restore to emit — each full's schema
+// and each incremental's schema-delta tables — through the same
+// detector and renderer as every other door, so the doors cannot
+// disagree about what counts as malformed. Deliberately unfiltered:
+// this caller restores whole chains (its ChainRestore carries no
+// table filter), so there is no salvage subset to honour.
+func RefuseChainRecordedSchemaMalformed(mode string, manifests []*irbackup.Manifest) error {
+	problems := make([]string, 0, len(manifests))
+	for _, m := range manifests {
+		problems = append(problems, manifestRecordedSchemaProblems(m)...)
+	}
+	return refuseMalformedRecordedSchema(mode, problems)
 }
 
 // refuseMalformedRecordedSchema renders the coded refusal for a

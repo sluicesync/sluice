@@ -138,6 +138,49 @@ func TestRestoreRun_MalformedRecordedSchema_ExcludeTableIsAWorkingRemedy(t *test
 	}
 }
 
+// TestRefuseChainRecordedSchemaMalformed_BrokerDoor pins the exported
+// fifth door (audit 2026-08-11 BRK-1, consumed by the broker's
+// --reset-target-data cold start BEFORE its destructive drop): a clean
+// chain passes, a mangled full refuses with the shared code, and a
+// mangle arriving only via an incremental's schema delta refuses too —
+// the whole-chain scan, one detector, one renderer.
+func TestRefuseChainRecordedSchemaMalformed_BrokerDoor(t *testing.T) {
+	clean := bug243Manifest("full0001", &ir.Schema{Tables: []*ir.Table{
+		{Name: "plain", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
+	}})
+	if err := RefuseChainRecordedSchemaMalformed("broker", []*irbackup.Manifest{clean, nil}); err != nil {
+		t.Fatalf("clean chain refused: %v", err)
+	}
+
+	mangledFull := bug243Manifest("full0002", bug243Schema())
+	err := RefuseChainRecordedSchemaMalformed("broker", []*irbackup.Manifest{mangledFull})
+	if err == nil {
+		t.Fatal("mangled full passed the chain door — the broker would drop the target's tables and THEN refuse")
+	}
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupRecordedSchemaMalformed {
+		t.Fatalf("want %s, got %v", sluicecode.CodeBackupRecordedSchemaMalformed, err)
+	}
+
+	incr := bug243Manifest("incr0001", nil)
+	incr.Kind = irbackup.BackupKindIncremental
+	incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
+		Kind:  irbackup.SchemaDeltaAddTable,
+		Table: "ck2",
+		After: &ir.Table{
+			Name:             "ck2",
+			Columns:          []*ir.Column{{Name: "name", Type: ir.Varchar{Length: 40}}},
+			CheckConstraints: []*ir.CheckConstraint{{Name: "c", Expr: bug243MangledExpr}},
+		},
+	}}
+	err = RefuseChainRecordedSchemaMalformed("broker", []*irbackup.Manifest{clean, incr})
+	if err == nil {
+		t.Fatal("a mangle arriving only via a schema delta passed the chain door")
+	}
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupRecordedSchemaMalformed {
+		t.Fatalf("delta arm: want %s, got %v", sluicecode.CodeBackupRecordedSchemaMalformed, err)
+	}
+}
+
 // TestManifestRecordedSchemaProblems_CoversSchemaDeltas pins the delta
 // door's input: a mangled expression arriving via a SchemaDelta ADD (the
 // chain-evolution path, applied unfiltered at restore) is a problem too.

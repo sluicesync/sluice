@@ -755,6 +755,24 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	}
 	tailManifest := chain[len(chain)-1].Manifest
 
+	// Audit 2026-08-11 BRK-1: the Bug 243 door must fire BEFORE the
+	// Bug 40a drop below. ChainRestore.Run carries its own refusal for
+	// a malformed recorded schema — but by the time it runs, this cold
+	// start has already dropped the target's tables off the cached
+	// manifest, converting a chain the restore then REFUSES into a
+	// destroyed target. Same detector, same renderer, over the whole
+	// chain's manifests (every full schema + every delta a link would
+	// emit), while the target still holds its data.
+	manifests := make([]*irbackup.Manifest, 0, len(chain))
+	for _, link := range chain {
+		manifests = append(manifests, link.Manifest)
+	}
+	if err := backup.RefuseChainRecordedSchemaMalformed(
+		"broker: --reset-target-data cold start", manifests,
+	); err != nil {
+		return "", err
+	}
+
 	// Bug 40a fix: drop pre-existing target tables that match the
 	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
 	// EXISTS would otherwise no-op against stale-schema tables and
