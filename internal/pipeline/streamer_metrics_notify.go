@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -112,6 +113,43 @@ func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
 	)
 }
 
+// validateMetricsNotifyThresholds refuses out-of-range --notify-*
+// thresholds LOUDLY at startup (audit 2026-08-11 PROG-NOTIFY-1). The
+// utilisation thresholds and the storage-growth rate are FRACTIONS
+// (0–1; growth is fraction-of-capacity per minute), and a value above 1
+// used to arm a rule that could never fire: an operator typing
+// `--notify-storage-util 85` (meaning 85%) got a silent no-op alert —
+// the exact quiet failure an alert threshold exists to prevent.
+// Negative and NaN values are refused for every rule (0 remains the
+// documented "disabled"). Called from every entry that arms the rules:
+// [Streamer.validate], [RunMetricsWatch], and the fleet watcher — one
+// validator, three doors.
+func validateMetricsNotifyThresholds(storageUtil, cpuUtil, memUtil, lagSeconds, storageGrowthPerMin float64) error {
+	fractions := []struct {
+		flag string
+		v    float64
+	}{
+		{"--notify-storage-util", storageUtil},
+		{"--notify-cpu-util", cpuUtil},
+		{"--notify-mem-util", memUtil},
+		{"--notify-storage-growth-per-min", storageGrowthPerMin},
+	}
+	for _, f := range fractions {
+		if math.IsNaN(f.v) || f.v < 0 {
+			return fmt.Errorf("%s: %v is not a valid threshold (a fraction in 0–1; 0 disables)", f.flag, f.v)
+		}
+		if f.v > 1 {
+			return fmt.Errorf("%s: %v is out of range — the threshold is a FRACTION (0–1), so a rule armed at %v "+
+				"could never fire and the alert would be silently inert; if you meant %v%%, pass %v",
+				f.flag, f.v, f.v, f.v, f.v/100)
+		}
+	}
+	if math.IsNaN(lagSeconds) || lagSeconds < 0 {
+		return fmt.Errorf("--notify-lag-seconds: %v is not a valid threshold (seconds; 0 disables)", lagSeconds)
+	}
+	return nil
+}
+
 // buildMetricsNotifyRulesFrom is the engine-neutral rule assembler shared by
 // the sync-scoped alerter ([Streamer.buildMetricsNotifyRules]) and the
 // standalone `sluice metrics-watch` daemon ([RunMetricsWatch]). A threshold of
@@ -119,6 +157,8 @@ func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
 // opted in individually. Returns nil when no rule is active. Keeping this a
 // free function means both call sites share ONE definition of the rule set,
 // thresholds, levels, and titles — the daemon can never drift from the sync.
+// Range validation lives in [validateMetricsNotifyThresholds], run by every
+// entry BEFORE anything starts.
 func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, storageGrowthPerMin float64) []metricsNotifyRule {
 	var rules []metricsNotifyRule
 	add := func(metric notifyMetric, threshold float64, level notify.Level, title string, read func(ir.TargetHealthSnapshot) (float64, bool)) {

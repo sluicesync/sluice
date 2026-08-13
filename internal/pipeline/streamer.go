@@ -2183,6 +2183,15 @@ func (s *Streamer) validate() error {
 	if err := migcore.ValidateTargetSchema(s.Target, s.TargetSchema); err != nil {
 		return err
 	}
+	// PROG-NOTIFY-1: an out-of-range --notify-* fraction armed a rule
+	// that could never fire — refuse at sync start, not silently at
+	// every tick.
+	if err := validateMetricsNotifyThresholds(
+		s.NotifyStorageUtil, s.NotifyCPUUtil, s.NotifyMemUtil,
+		s.NotifyLagSeconds, s.NotifyStorageGrowthPerMin,
+	); err != nil {
+		return err
+	}
 	return validateEnabledPGExtensions(s.Source, s.Target, s.EnabledPGExtensions)
 }
 

@@ -146,6 +146,15 @@ type MetricsWatchConfig struct {
 // rules ⇒ watch-only; no sinks ⇒ rules are not evaluated; an unobserved or
 // stale sample ⇒ "no fresh sample", never a spurious alert).
 func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg MetricsWatchConfig) error {
+	// PROG-NOTIFY-1: refuse out-of-range thresholds before anything
+	// starts — validated HERE so both the single-database loop and the
+	// fleet dispatch below (which reuses the same cfg thresholds) are
+	// covered by one door.
+	if err := validateMetricsNotifyThresholds(
+		cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin,
+	); err != nil {
+		return err
+	}
 	if cfg.Fleet != nil {
 		// Org-wide mode (roadmap item 75b) — a distinct loop so the
 		// single-database path below stays byte-for-byte what it was.
