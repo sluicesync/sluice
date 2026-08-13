@@ -212,6 +212,29 @@ type noteEntry struct {
 // which is a coarser scope than a function and would have silently
 // shielded the next PG-sourced entry somebody adds here.
 var noteEntries = []noteEntry{
+	// PG geography → MySQL-family geometry (audit 2026-08-11 SPAT-3).
+	// The value bytes and the SRID carry byte-exact (the C-14 guard
+	// holds the SRID), so nothing refuses and nothing should — but the
+	// TYPE's computational model flattens: geography computes distance/
+	// area/containment geodesically (great-circle, meters), MySQL
+	// geometry computes them planar in coordinate units. Queries moved
+	// verbatim silently change meaning, which is exactly the class a
+	// translation note exists for. Keyed on the SOURCE column's
+	// IsGeography (only PG-family readers produce it) + a MySQL-family
+	// target; a PG→PG move keeps geography and renders identically, so
+	// the equal-rendering short-circuit suppresses it there without
+	// this predicate needing a source-engine list.
+	{
+		matches: func(src, _ *ir.Column, _, tgtEngine string) bool {
+			if !IsMySQLFamily(tgtEngine) {
+				return false
+			}
+			g, ok := ir.UnwrapDomain(src.Type).(ir.Geometry)
+			return ok && g.IsGeography
+		},
+		message: "geography (geodesic: distance/area/containment in meters on the spheroid) lands as planar geometry — values and SRID carry byte-exact, but spatial computations on the target use flat coordinate math",
+	},
+
 	// MySQL JSON → PG JSONB. JSONB is the canonical fast path on PG;
 	// the note exists to remind the operator they can downgrade to
 	// `json` (text) if they need key-order preservation. No advisory
@@ -451,6 +474,19 @@ func renderTypeForNote(t ir.Type, engine string) string {
 		}
 		return renderTypeForNote(v.Element, engine) + "[]"
 	case ir.Geometry:
+		// A PG-side geography renders as its own name so the flatten
+		// toward a MySQL-family target is VISIBLE to the note machinery:
+		// with both sides rendering "geometry", NotesFor's equal-rendering
+		// short-circuit suppressed every note and `schema preview`
+		// reported the flatten as "0 translations; 0 hints" (audit
+		// 2026-08-11 SPAT-3). Both PG-family engines render it
+		// (postgres-trigger delegates its schema read to the postgres
+		// reader, so it carries IsGeography identically); no MySQL-family
+		// engine has the type, so the target side keeps rendering
+		// "geometry" whatever the mapped IR carries.
+		if v.IsGeography && (engine == "postgres" || engine == "postgres-trigger") {
+			return "geography"
+		}
 		return "geometry"
 	case ir.Inet:
 		return "inet"

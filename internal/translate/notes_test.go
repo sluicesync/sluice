@@ -87,6 +87,49 @@ func TestNotesFor_NoTypeChange_NoNote(t *testing.T) {
 	}
 }
 
+// TestNotesFor_GeographyToMySQL_FlattenNote is the SPAT-3 pin (audit
+// 2026-08-11): a PG geography column toward a MySQL-family target lands as
+// planar geometry with the bytes and SRID intact — a semantic flatten
+// `schema preview` used to report as "0 translations; 0 hints", because both
+// sides rendered "geometry" and the equal-rendering short-circuit suppressed
+// the note. The rendering now says "geography" on the PG-family side and the
+// registry carries the geodesic→planar caveat.
+func TestNotesFor_GeographyToMySQL_FlattenNote(t *testing.T) {
+	src := col("loc", ir.Geometry{IsGeography: true, SRID: 4326})
+	tgt := col("loc", ir.Geometry{SRID: 4326})
+	for _, srcEngine := range []string{"postgres", "postgres-trigger"} {
+		got := NotesFor(src, tgt, srcEngine, "mysql")
+		if len(got) != 1 {
+			t.Fatalf("%s→mysql: expected 1 note; got %d (%#v)", srcEngine, len(got), got)
+		}
+		if got[0].SourceType != "geography" || got[0].TargetType != "geometry" {
+			t.Errorf("%s→mysql: rendering = %q → %q; want geography → geometry", srcEngine, got[0].SourceType, got[0].TargetType)
+		}
+		for _, want := range []string{"geodesic", "planar", "SRID carry byte-exact"} {
+			if !strings.Contains(got[0].Message, want) {
+				t.Errorf("%s→mysql: message = %q; want mention of %q", srcEngine, got[0].Message, want)
+			}
+		}
+	}
+}
+
+// TestNotesFor_GeographyToMySQL_Negatives pins the flatten note's scope in
+// the directions that must stay silent: a plain (non-geography) geometry
+// toward MySQL renders identically on both sides and emits nothing, and a
+// geography moving between the two PG-family engines keeps the type — the
+// equal-rendering short-circuit suppresses it with no source-engine list in
+// the predicate.
+func TestNotesFor_GeographyToMySQL_Negatives(t *testing.T) {
+	geom := col("shape", ir.Geometry{SRID: 4326})
+	if got := NotesFor(geom, geom, "postgres", "mysql"); got != nil {
+		t.Errorf("plain geometry → mysql: expected nil (identical rendering); got %#v", got)
+	}
+	geog := col("loc", ir.Geometry{IsGeography: true, SRID: 4326})
+	if got := NotesFor(geog, geog, "postgres", "postgres-trigger"); got != nil {
+		t.Errorf("geography → postgres-trigger keeps the type: expected nil; got %#v", got)
+	}
+}
+
 func TestHintsFor_PG_UUID_to_MySQL(t *testing.T) {
 	src := col("id", ir.UUID{})
 	tgt := col("id", ir.Char{Length: 36})
