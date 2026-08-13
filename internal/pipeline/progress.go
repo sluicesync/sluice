@@ -173,6 +173,12 @@ type progressTicker struct {
 	// row count so the orchestrator can report an accurate migration total.
 	runRows *atomic.Int64
 
+	// agg is the PER-TABLE aggregate shared by all of one table's chunk
+	// tickers (PROG-BAR-1); nil on the single-reader path. When set, the
+	// presentation sink and the ETA use its table-level (rows, total)
+	// pair instead of this ticker's chunk-local counters.
+	agg *tableProgressAgg
+
 	// total is the source-side row-count estimate for ETA calculation.
 	// Set via setTotalRows once the async COUNT(*) query (or
 	// pg_class.reltuples estimate) returns. Zero means "not yet
@@ -232,6 +238,7 @@ func newProgressTickerForChunk(ctx context.Context, interval time.Duration, tabl
 		logger:   slog.Default(),
 		sink:     progress.FromContext(ctx),
 		runRows:  runRowTotalFromContext(ctx),
+		agg:      tableAggFromContext(ctx),
 		done:     make(chan struct{}),
 	}
 	p.stall = newCopyStallWatchdog(ctx, table, chunk, "rows", p.rows.Load)
@@ -240,11 +247,14 @@ func newProgressTickerForChunk(ctx context.Context, interval time.Duration, tabl
 	return p
 }
 
-// inc is the per-row hook the row pipe calls. Cheap (a single atomic
-// add) so the orchestrator can call it on every row without measurable
+// inc is the per-row hook the row pipe calls. Cheap (atomic adds) so
+// the orchestrator can call it on every row without measurable
 // overhead.
 func (p *progressTicker) inc() {
 	p.rows.Add(1)
+	if p.agg != nil {
+		p.agg.rows.Add(1)
+	}
 }
 
 // addBytes records bytes seen for this row. Optional — engines that
@@ -292,6 +302,70 @@ func (p *progressTicker) setTotalRows(total int64) {
 		return
 	}
 	p.totalRows.Store(total)
+	if p.agg != nil {
+		// The count is whole-table (kickOffRowCount), so it IS the
+		// aggregate's total; every chunk's async count stores the same
+		// number.
+		p.agg.total.Store(total)
+	}
+}
+
+// tableProgressAgg is the PER-TABLE progress accumulator shared by all
+// of one table's chunk tickers (the PROG-BAR-1 fix, real-user report
+// 2026-08-13). Without it every chunk ticker reported ITS OWN rows
+// against the WHOLE table's total — so on a multi-million-row table
+// each chunk showed 0–1% forever, and the interactive bar (keyed by
+// table name) jumped between whichever chunk's ticker reported last.
+// The aggregate gives every ticker one table-level (rows, total) pair
+// to hand the sink; the per-chunk slog lines keep their per-chunk rows
+// (they carry the `chunk` attribute) and gain the table-level pair.
+type tableProgressAgg struct {
+	rows      atomic.Int64
+	total     atomic.Int64
+	startedAt atomic.Pointer[time.Time]
+}
+
+type tableProgressAggKey struct{}
+
+// withTableProgressAgg attaches the per-table aggregate to the context
+// the chunk fan-out hands its workers — the same context-carried shape
+// as the run-level rows accumulator (runRowTotalFromContext).
+func withTableProgressAgg(ctx context.Context, agg *tableProgressAgg) context.Context {
+	return context.WithValue(ctx, tableProgressAggKey{}, agg)
+}
+
+// tableAggFromContext resolves the per-table aggregate; nil on the
+// single-reader path, whose ticker-local counters are already
+// table-level.
+func tableAggFromContext(ctx context.Context) *tableProgressAgg {
+	agg, _ := ctx.Value(tableProgressAggKey{}).(*tableProgressAgg)
+	return agg
+}
+
+// primeRows seeds this ticker with rows already copied in a prior
+// attempt (chunk resume). The aggregate gets the same seed — a resumed
+// table's bar starts from the sum of every chunk's prior progress, not
+// from zero.
+func (p *progressTicker) primeRows(rowsCopied int64) {
+	if rowsCopied <= 0 {
+		return
+	}
+	p.rows.Store(rowsCopied)
+	if p.agg != nil {
+		p.agg.rows.Add(rowsCopied)
+	}
+}
+
+// tableLevelPair returns the (rows, total) pair the presentation sink
+// should render for this ticker's table: the shared aggregate's pair
+// when this is a chunk ticker, the ticker's own counters otherwise.
+// One method so the sink call and its pin cannot disagree about which
+// numbers are table-level.
+func (p *progressTicker) tableLevelPair(ownRows, ownTotal int64) (rows, total int64) {
+	if p.agg == nil {
+		return ownRows, ownTotal
+	}
+	return p.agg.rows.Load(), p.agg.total.Load()
 }
 
 // loop is the background goroutine. It wakes every interval, snapshots
@@ -326,6 +400,12 @@ func (p *progressTicker) loop(ctx context.Context) {
 			// but the future-proofing is one line.
 			start := lastTime
 			p.startedAt.CompareAndSwap(nil, &start)
+			if p.agg != nil {
+				// First chunk to move stamps the TABLE's start; the
+				// table-level ETA divides aggregate rows by time since
+				// the table (not this chunk) began moving.
+				p.agg.startedAt.CompareAndSwap(nil, &start)
+			}
 			bytes := p.bytes.Load()
 			elapsed := now.Sub(lastTime).Seconds()
 			rate := float64(0)
@@ -336,14 +416,25 @@ func (p *progressTicker) loop(ctx context.Context) {
 			}
 
 			total := p.totalRows.Load()
+			// PROG-BAR-1: ETA and the presentation sink use the
+			// TABLE-LEVEL pair. Pre-fix, a chunk ticker computed
+			// chunk-rows against the whole-table total — a mismatched
+			// pair that pinned the bar at 0–1% and inflated the ETA by
+			// the chunk count.
+			etaRows, etaTotal := p.tableLevelPair(rows, total)
+			startPtr := p.startedAt.Load()
+			if p.agg != nil {
+				if s := p.agg.startedAt.Load(); s != nil {
+					startPtr = s
+				}
+			}
 			etaSecs := int64(-1)
-			if total > 0 && total > rows && p.startedAt.Load() != nil {
-				started := *p.startedAt.Load()
-				totalElapsed := now.Sub(started).Seconds()
+			if etaTotal > 0 && etaTotal > etaRows && startPtr != nil {
+				totalElapsed := now.Sub(*startPtr).Seconds()
 				if totalElapsed > 0 {
-					avgRate := float64(rows) / totalElapsed
+					avgRate := float64(etaRows) / totalElapsed
 					if avgRate > 0 {
-						etaSecs = int64(float64(total-rows) / avgRate)
+						etaSecs = int64(float64(etaTotal-etaRows) / avgRate)
 					}
 				}
 			}
@@ -369,9 +460,18 @@ func (p *progressTicker) loop(ctx context.Context) {
 			if p.hasChunk {
 				attrs = append(attrs, slog.Int("chunk", p.chunk))
 			}
-			// ADR-0155: feed the interactive per-table bar. No-op on the
-			// LogSink; the rich slog line below stays byte-identical.
-			p.sink.TableProgress(p.table, rows, total)
+			if p.agg != nil {
+				// The table-level rows alongside the per-chunk rows, so
+				// a percent-deriving log consumer has a MATCHED pair
+				// (table_rows / total_rows) — `rows` alone is this
+				// chunk's share.
+				attrs = append(attrs, slog.Int64("table_rows", etaRows))
+			}
+			// ADR-0155: feed the interactive per-table bar with the
+			// table-level pair — every chunk ticker reports the same
+			// monotonic aggregate, so concurrent chunks can no longer
+			// clobber the bar with their chunk-local counts.
+			p.sink.TableProgress(p.table, etaRows, etaTotal)
 			p.logger.LogAttrs(ctx, slog.LevelInfo, "bulk copy progress", attrs...)
 			lastRows = rows
 			lastBytes = bytes

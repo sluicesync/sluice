@@ -670,6 +670,12 @@ func runChunks(
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
+	// PROG-BAR-1: one per-table progress aggregate shared by every
+	// chunk's ticker (resolved from this context in
+	// newProgressTickerForChunk), so the interactive bar and the ETA see
+	// table-level (rows, total) instead of each chunk's own count
+	// against the whole-table total.
+	gctx = withTableProgressAgg(gctx, &tableProgressAgg{})
 	for k := 0; k < len(chunks); k++ {
 		k := k
 		g.Go(func() error {
@@ -959,11 +965,15 @@ func copyChunk(
 		slog.Time("t_start", chunkStart))
 
 	pt := newProgressTickerForChunk(ctx, progressInterval, table.Name, chunkIndex)
-	pt.rows.Store(rowsCopied)
-	// Kick off an async row-count for this chunk's portion of the
-	// table so the periodic progress lines carry an ETA. The query
-	// runs on a separate connection (different *sql.DB pool) and
-	// returns when it returns; the chunk loop is not blocked.
+	pt.primeRows(rowsCopied)
+	// Kick off an async row-count so the periodic progress lines carry
+	// an ETA. NOTE: CountRows counts the WHOLE TABLE, not this chunk's
+	// portion (this comment used to claim otherwise — the false premise
+	// behind PROG-BAR-1's 0–1% bars); the count lands on the shared
+	// per-table aggregate via setTotalRows, which is exactly where a
+	// whole-table number belongs. The query runs on a separate
+	// connection (different *sql.DB pool) and returns when it returns;
+	// the chunk loop is not blocked.
 	kickOffRowCount(ctx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
