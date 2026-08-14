@@ -513,7 +513,14 @@ func (p *progressTicker) Stop(ctx context.Context, err error) {
 		// chunked table's per-chunk TableProgress calls overwrite by name).
 		if err == nil {
 			done := p.rows.Load()
-			p.sink.TableProgress(p.table, done, done)
+			// PROG-BAR-1 residue (the pre-v0.125.0 review's F2): a chunk
+			// ticker's clean Stop must render the TABLE-LEVEL pair like
+			// its ticking path — the chunk-local (done, done) snapped the
+			// bar to 100%-of-one-chunk and left the final state at the
+			// last chunk's count. runRows keeps the ticker-local count:
+			// the run total sums per ticker exactly once, by design.
+			barRows, barTotal := p.tableLevelPair(done, done)
+			p.sink.TableProgress(p.table, barRows, barTotal)
 			if p.runRows != nil {
 				p.runRows.Add(done)
 			}

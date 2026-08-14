@@ -121,3 +121,35 @@ func TestChunkTicker_SinkSeesTheAggregatePair(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestChunkTicker_StopRendersTheAggregatePair pins the F2 fix from the
+// pre-v0.125.0 review: a chunk ticker's clean Stop must hand the sink
+// the TABLE-LEVEL pair like its ticking path — pre-fix it emitted the
+// chunk-local (done, done), snapping the bar to 100%-of-one-chunk and
+// leaving the table's final bar at the last chunk's count.
+func TestChunkTicker_StopRendersTheAggregatePair(t *testing.T) {
+	sink := &tableBarRecordingSink{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agg := &tableProgressAgg{}
+	actx := withTableProgressAgg(progress.NewContext(ctx, sink), agg)
+
+	sibling := newProgressTickerForChunk(actx, time.Hour, "t", 1)
+	defer sibling.Stop(ctx, nil)
+	for i := 0; i < 40; i++ {
+		sibling.inc()
+	}
+	pt := newProgressTickerForChunk(actx, time.Hour, "t", 0)
+	pt.setTotalRows(100)
+	pt.inc()
+	pt.Stop(ctx, nil)
+
+	calls := sink.snapshot()
+	if len(calls) == 0 {
+		t.Fatal("Stop emitted no TableProgress call")
+	}
+	got := calls[len(calls)-1]
+	if got.done != 41 || got.total != 100 {
+		t.Fatalf("Stop rendered (%d, %d); want the table-level (41, 100) — the chunk-local pair snaps the bar to one chunk's 100%%", got.done, got.total)
+	}
+}

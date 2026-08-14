@@ -265,3 +265,45 @@ func mustListStore(t *testing.T, s *memStore) []string {
 	}
 	return paths
 }
+
+// TestParquetExportRun_StoreFoldCollision_ExcludeTwinReleases is the
+// export door's remedy-release pin — the mirror of the backup door's,
+// added by the pre-v0.125.0 value-fidelity review (F1): the gate must
+// scan the names the export will ACTUALLY write, i.e. run AFTER the
+// table filter, or `--exclude-table` — the refusal's own named remedy
+// — is inert on this door (the Bug 246 unrunnable-remedy shape). A
+// mutation moving the gate pre-filter fails exactly this test.
+func TestParquetExportRun_StoreFoldCollision_ExcludeTwinReleases(t *testing.T) {
+	ctx := context.Background()
+	src := newMemStore()
+	b := &Backup{Source: newBackupRecorderEngine("mysql", bug248Schema(), map[string][]ir.Row{}), SourceDSN: "src", Store: src}
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	excl, err := migcore.NewTableFilter(nil, []string{"Orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	folding := &foldingStore{memStore: newMemStore()}
+	if err := (&ParquetExport{Store: src, Output: folding, Filter: excl, SluiceVersion: "test"}).Run(ctx); err != nil {
+		t.Fatalf("--exclude-table=Orders must release the export door (the refusal names it as the remedy): %v", err)
+	}
+	// The kept twin's parquet landed (the folding fake lower-cases keys,
+	// so both twins fold to one name — the RELEASE plus this presence
+	// check is the meaningful pair; which twin's bytes are under the
+	// folded key is exactly what the gate exists to make unambiguous,
+	// and with one twin excluded it is).
+	paths, lerr := folding.List(ctx, "")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	var sawKept bool
+	for _, p := range paths {
+		if p == "orders.parquet" {
+			sawKept = true
+		}
+	}
+	if !sawKept {
+		t.Errorf("kept twin orders.parquet missing from the filtered export: %v", paths)
+	}
+}

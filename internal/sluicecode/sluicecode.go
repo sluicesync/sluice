@@ -518,7 +518,7 @@ var registry = map[Code]Info{
 	CodeValueByteaTextUnrecognized:     {ClassRefusal, "a PostgreSQL bytea value rendered as text sluice cannot read — not the `\\x`+even-hex form `bytea_output = hex` produces"},
 	CodeExprBackslashLiteral:           {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:           {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
-	CodeDriverHostMismatch:             {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
+	CodeDriverHostMismatch:             {ClassRefusal, "the driver cannot drive the server (a non-VStream flavor at a PlanetScale endpoint or Vitess-reporting server, or mariadb at a non-MariaDB server)"},
 	CodeIndexMissing:                   {ClassRefusal, "a secondary index the migration was expected to build is absent on the target — or, on Postgres, present under the expected name but NOT UNIQUE when a UNIQUE index was requested (the shape a silently-no-op'd colliding build leaves behind)"},
 	CodeVStreamFloatLossy:              {ClassRefusal, "--strict-float: a VStream-COPY FLOAT column cannot be re-read exactly on a backup or a sync cold-start (keyless / float-PK / over the backup row cap / no streamed row matched / contradicted by --no-float-exact-reread)"},
 	CodeBackupSignatureInvalid:         {ClassRefusal, "a signed backup manifest's detached signature failed verification (tampered / rolled-back / wrong key)"},
