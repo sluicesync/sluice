@@ -1142,3 +1142,198 @@ func tableLastPK(t *testing.T, shards []shardGtid, table string) (int64, bool) {
 	}
 	return 0, false
 }
+
+// TestVStream_CopyResume_DeleteInterleaved_Converges is the
+// delete-mid-interrupted-COPY convergence pin (2026-08-14 ingestr-survey
+// verification, item 8/5: their #901 hit exactly this class — a resume
+// from a mid-copy cursor that re-ran the snapshot and MISSED interleaved
+// deletes, silent loss). sluice's architecture avoids it by
+// construction — the checkpoint position carries BOTH the per-shard
+// TablePKs cursor (COPY continues, no re-scan) and the snapshot VGTID
+// (catch-up replays every post-checkpoint change) — but until this test
+// that was a reasoned claim with no gate.
+//
+// Shape: capture a mid-COPY checkpoint (cursor at id=K), close the
+// stream, then DELETE on the source one row ALREADY copied (id=1, its
+// delete must arrive via catch-up) and one row NOT yet copied
+// (id=totalRows, the resumed scan reads current data and never emits
+// it; its catch-up delete is a harmless no-op). Resume from the
+// checkpoint and fold the event stream over the already-copied prefix:
+// the folded state must converge EXACTLY to the source's final set —
+// both deletes take effect, nothing else missing, nothing resurrected.
+func TestVStream_CopyResume_DeleteInterleaved_Converges(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	const totalRows = 20000
+	const pad = "0123456789012345678901234567890123456789"
+	applyVTTestSQL(t, mysqlDSN, `
+		CREATE TABLE widgets (
+			id   BIGINT        NOT NULL AUTO_INCREMENT,
+			name VARCHAR(255)  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	var b strings.Builder
+	for i := 1; i <= totalRows; i++ {
+		if b.Len() == 0 {
+			b.WriteString("INSERT INTO widgets (name) VALUES ")
+		} else {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "('w%d-%s')", i, pad)
+		if i%500 == 0 {
+			applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+			b.Reset()
+		}
+	}
+	if b.Len() > 0 {
+		applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+	}
+	time.Sleep(3 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	rows := stream.Rows.(*vstreamSnapshotRows)
+	rows.snap.mu.Lock()
+	rows.snap.checkpointRows = 200
+	rows.snap.checkpointInterval = 50 * time.Millisecond
+	rows.snap.maxBufferBytes = 65536
+	rows.snap.mu.Unlock()
+
+	capturedCh := make(chan ir.Position, 64)
+	rows.SetCopyCheckpoint(func(_ context.Context, pos ir.Position) error {
+		select {
+		case capturedCh <- pos:
+		default:
+		}
+		return nil
+	})
+
+	widgetsTable := &ir.Table{
+		Name: "widgets",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
+		},
+	}
+	rowsCh, err := stream.Rows.ReadRows(ctx, widgetsTable)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	seen := 0
+	for range rowsCh {
+		seen++
+		rows.AdvanceDurableRows(1)
+	}
+	close(capturedCh)
+	var captured []ir.Position
+	for pos := range capturedCh {
+		captured = append(captured, pos)
+	}
+	if seen != totalRows {
+		t.Fatalf("drained %d COPY rows; want %d", seen, totalRows)
+	}
+
+	var (
+		checkpoint ir.Position
+		cursorLast int64 = -1
+	)
+	for _, pos := range captured {
+		decoded, ok, derr := decodeVStreamPos(pos)
+		if derr != nil || !ok {
+			t.Fatalf("checkpoint decode: ok=%v err=%v", ok, derr)
+		}
+		if last, found := widgetsLastPK(t, decoded); found {
+			checkpoint, cursorLast = pos, last
+			break
+		}
+	}
+	if cursorLast <= 1 || cursorLast >= totalRows {
+		t.Fatalf("no usable mid-COPY cursor (lastpk=%d); need 1 < lastpk < %d", cursorLast, totalRows)
+	}
+	_ = stream.Close()
+
+	// The interleaved deletes: one row already copied (id=1 — only its
+	// CATCH-UP delete can remove it from the folded state) and one not
+	// yet copied (id=totalRows — the resumed scan must not emit it).
+	applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("DELETE FROM widgets WHERE id IN (1, %d)", totalRows))
+
+	rdr, err := eng.OpenCDCReader(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenCDCReader (resume): %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer resumeCancel()
+	changes, err := rdr.StreamChanges(resumeCtx, checkpoint)
+	if err != nil {
+		t.Fatalf("StreamChanges (resume): %v", err)
+	}
+
+	// Fold the event stream over the already-copied prefix [1..cursorLast].
+	state := make(map[int64]bool, totalRows)
+	for id := int64(1); id <= cursorLast; id++ {
+		state[id] = true
+	}
+	converged := func() bool {
+		if len(state) != totalRows-2 || state[1] || state[int64(totalRows)] {
+			return false
+		}
+		return true
+	}
+	deadline := time.After(100 * time.Second)
+fold:
+	for !converged() {
+		select {
+		case ev, ok := <-changes:
+			if !ok {
+				break fold
+			}
+			switch e := ev.(type) {
+			case ir.Insert:
+				if id, ok := e.Row["id"].(int64); ok {
+					state[id] = true
+				}
+			case ir.Delete:
+				if id, ok := e.Before["id"].(int64); ok {
+					delete(state, id)
+				}
+			}
+		case <-deadline:
+			break fold
+		}
+	}
+	if !converged() {
+		missing, extra := 0, 0
+		for id := int64(2); id < int64(totalRows); id++ {
+			if !state[id] {
+				missing++
+			}
+		}
+		if state[1] {
+			extra++
+		}
+		if state[int64(totalRows)] {
+			extra++
+		}
+		t.Fatalf("folded state did NOT converge to the source's final set: size=%d want %d, deleted-row-1-still-present=%v, "+
+			"deleted-row-%d-present=%v, interior-missing=%d — the ingestr #901 class (a resume that misses interleaved deletes) "+
+			"or COPY loss across the seam",
+			len(state), totalRows-2, state[1], totalRows, state[int64(totalRows)], missing)
+	}
+}
