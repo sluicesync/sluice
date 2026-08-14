@@ -377,7 +377,23 @@ func TestMigrate_Corpus_Joomla_MySQLToPG_DryRun(t *testing.T) {
 	pgEng, _ := engines.Get("postgres")
 	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
 	if err := mig.Run(ctx2min(t)); err != nil {
-		t.Fatalf("Joomla MySQL→PG DryRun: schema read/plan failed: %v", truncErr(err))
+		// Joomla's #__menu carries `idx_client_id_parent_id_alias_language`
+		// with a 100-char index prefix on `alias`, and that key enforces
+		// uniqueness semantics PG cannot reproduce over the whole column —
+		// sluice's 0a33fd43 refusal (correct, protective: a whole-column PG
+		// key would silently ACCEPT rows the source forbids) fires here.
+		// Characterize it exactly like the PG→MySQL direction below; fail
+		// on any other shape. (TESTCI-1: this test predated the refusal
+		// and expected success — three weekly extended-suites runs carried
+		// the red before anything consumed the verdict.)
+		if !strings.Contains(err.Error(), "index prefix") {
+			t.Fatalf("Joomla MySQL→PG DryRun: UNEXPECTED failure shape — NEW finding: %v", truncErr(err))
+		}
+		t.Logf("Joomla MySQL→PG DryRun: CHARACTERIZED loud-refuse of a known "+
+			"unsupported cross-engine class (unique prefix index on #__menu; "+
+			"loud, not corruption — the refusal names the left(alias, 100) "+
+			"rewrite). err=%v", truncErr(err))
+		return
 	}
 	t.Log("Joomla MySQL→PG DryRun: real-CMS schema read + cross-engine plan OK")
 }
