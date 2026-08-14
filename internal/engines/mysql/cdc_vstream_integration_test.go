@@ -36,6 +36,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // startVTTestServer boots a vitess/vttestserver container with one
@@ -917,4 +918,38 @@ func drainVTTestChanges(
 		}
 	}
 	return got
+}
+
+// TestVStream_VanillaFlavorAgainstVitess_RefusesAtConnect is the
+// WIRING pin for the item-10 fingerprint arm (ingestr survey
+// 2026-08-14): a plain-mysql-flavor schema reader pointed at a real
+// vtgate (vttestserver's MySQL port reports "...-Vitess") must refuse
+// at connect with the driver-host-mismatch code — the alternative is
+// full scans under the OLTP workload, which silently truncate at the
+// row cap. The vitess flavor on the SAME DSN must open fine (no
+// over-refusal). The classifier itself is unit-pinned in
+// flavor_mariadb_test.go; this holds the checkServerFlavor wiring.
+func TestVStream_VanillaFlavorAgainstVitess_RefusesAtConnect(t *testing.T) {
+	mysqlDSN, _, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	vanilla := Engine{Flavor: FlavorVanilla}
+	sr, err := vanilla.OpenSchemaReader(ctx, mysqlDSN)
+	if err == nil {
+		closeIfCloser(sr)
+		t.Fatal("vanilla mysql flavor opened against a vtgate — full scans would run OLTP and silently truncate at the row cap")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeDriverHostMismatch {
+		t.Fatalf("want %s, got %v", sluicecode.CodeDriverHostMismatch, err)
+	}
+
+	vitess := Engine{Flavor: FlavorVitess}
+	sr, err = vitess.OpenSchemaReader(ctx, mysqlDSN)
+	if err != nil {
+		t.Fatalf("vitess flavor must open against the same vtgate: %v", err)
+	}
+	closeIfCloser(sr)
 }

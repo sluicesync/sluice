@@ -11,6 +11,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // NOTE: the former TestMariaDBPreflightCDCScope pinned the Phase-3
@@ -647,4 +648,35 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 			t.Errorf("mariadb batch upsert:\n got: %s\nwant: %s", got, want)
 		}
 	})
+}
+
+// TestRefuseVitessUnderNonVStreamFlavor pins the 2026-08-14 ingestr-
+// survey item-10 arm: a vanilla-flavor connection whose server
+// fingerprints as Vitess REFUSES with the driver-host-mismatch code
+// and the flavor steer — the downstream of proceeding is Vitess's
+// OLTP row-cap silently truncating full scans (olapFullScan is
+// VStream-flavor-gated). Plain MySQL/Percona/MariaDB versions must
+// not trip it (the MariaDB steer stays a WARN).
+func TestRefuseVitessUnderNonVStreamFlavor(t *testing.T) {
+	for _, v := range []string{"8.0.30-Vitess", "8.0.34-Vitess Version: 24.0.1", "5.7.9-vitess-19.0"} {
+		err := refuseVitessUnderNonVStreamFlavor(v)
+		if err == nil {
+			t.Fatalf("version %q did not refuse — a vanilla full scan against this server silently truncates at the OLTP row cap", v)
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeDriverHostMismatch {
+			t.Fatalf("version %q: want %s, got %v", v, sluicecode.CodeDriverHostMismatch, err)
+		}
+		if !strings.Contains(ce.Hint, "vitess") || !strings.Contains(ce.Hint, "planetscale") {
+			t.Errorf("version %q: hint does not steer to both VStream flavors: %s", v, ce.Hint)
+		}
+	}
+	for _, v := range []string{
+		"8.0.36", "8.0.36-0ubuntu0.22.04.1", "5.7.44-log",
+		"11.4.2-MariaDB-1:11.4.2+maria~ubu2204", "8.0.36-28 Percona Server",
+	} {
+		if err := refuseVitessUnderNonVStreamFlavor(v); err != nil {
+			t.Errorf("non-Vitess version %q refused: %v", v, err)
+		}
+	}
 }

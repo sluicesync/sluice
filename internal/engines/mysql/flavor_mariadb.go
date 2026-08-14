@@ -351,6 +351,19 @@ func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB) error {
 	err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
 	if e.Flavor != FlavorMariaDB {
 		if err == nil {
+			// Vitess/PlanetScale under a non-VStream flavor REFUSES
+			// rather than warns (contrast the MariaDB steer below):
+			// the vanilla flavor's full scans run without `set
+			// workload=olap` (olapFullScan is VStream-flavor-gated),
+			// and Vitess's default OLTP workload SILENTLY truncates
+			// result sets at its row cap — a silent-loss
+			// configuration, not a diagnostics nit. PS hosts are
+			// already refused at the DSN level (ValidateDSN); this
+			// arm closes the self-hosted-Vitess sibling the
+			// 2026-08-14 ingestr-survey verification found unprobed.
+			if rerr := refuseVitessUnderNonVStreamFlavor(version); rerr != nil {
+				return rerr
+			}
 			warnMariaDBUnderMySQLDriver(version)
 		}
 		return nil
@@ -382,6 +395,37 @@ func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB) error {
 		)
 	}
 	return nil
+}
+
+// isVitessServerVersion reports whether a VERSION() string fingerprints
+// a Vitess vtgate. Vitess reports its MySQL-compatible version with a
+// "-Vitess" suffix (e.g. "8.0.30-Vitess"), and hosted PlanetScale
+// reports the same way (measured fact from the 2026-08-14 ingestr
+// survey, item 10: PS is indistinguishable from Vitess in VERSION()).
+// A plain MySQL/Percona server never carries the word.
+func isVitessServerVersion(version string) bool {
+	return strings.Contains(strings.ToLower(version), "vitess")
+}
+
+// refuseVitessUnderNonVStreamFlavor renders the coded refusal for a
+// vanilla-flavor connection whose server fingerprints as Vitess. Pure
+// (unit-tested directly); nil for non-Vitess versions.
+func refuseVitessUnderNonVStreamFlavor(version string) error {
+	if !isVitessServerVersion(version) {
+		return nil
+	}
+	return sluicecode.Wrap(
+		sluicecode.CodeDriverHostMismatch,
+		"use --source-driver/--target-driver vitess (self-hosted) or planetscale for this server",
+		fmt.Errorf(
+			"mysql: the server reports version %q — a Vitess vtgate. The plain mysql flavor's full "+
+				"scans run under Vitess's default OLTP workload, which SILENTLY truncates large result "+
+				"sets at its row cap (the vitess/planetscale flavors run bulk reads with `set "+
+				"workload=olap` on a pinned connection to lift it), and its capability set skips the "+
+				"Vitess-specific handling. Refusing rather than risking a silently truncated copy",
+			version,
+		),
+	)
 }
 
 // warnMariaDBUnderMySQLDriver emits the steering WARN when a plain
