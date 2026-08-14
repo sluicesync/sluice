@@ -111,3 +111,79 @@ func TestVStream_RowReader_OLAPScopedToFullScan_Bug132(t *testing.T) {
 		t.Errorf("no-PK ReadRows returned %d rows; want %d (scoped-olap full scan must read all)", got, seeded)
 	}
 }
+
+// TestVStream_RowReader_FullScanCrossesOLTPRowCap is the CAP-CROSSING
+// gate the Bug 132 pin above deliberately lacked (its own doc said the
+// >100k lift was "validated at scale on the PlanetScale rig" — a live
+// characterization, not a gate; the 2026-08-14 ingestr-survey
+// verification called that out as a gate narrower than its name: with
+// the scoped `SET workload='olap'` deleted, the 50-row pin still
+// passes). This one seeds 100_001 rows — one past vtgate's default
+// OLTP result cap — through the same no-PK full-scan path and requires
+// every row back. Under the SET-deleted mutant, vtgate's OLTP workload
+// silently truncates the scan at the cap and this fails with exactly
+// one row missing: the silent-loss shape the scoped SET exists to
+// prevent, now impossible to reintroduce unnoticed.
+func TestVStream_RowReader_FullScanCrossesOLTPRowCap(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	applyVTTestSQL(t, mysqlDSN, `
+		CREATE TABLE cap_nopk (
+			n BIGINT NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	time.Sleep(3 * time.Second) // vtgate schema-tracker settle
+
+	const seeded = 100_001
+	const perStmt = 10_000
+	for base := 0; base < seeded; base += perStmt {
+		hi := base + perStmt
+		if hi > seeded {
+			hi = seeded
+		}
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO cap_nopk (n) VALUES ")
+		for i := base; i < hi; i++ {
+			if i > base {
+				sb.WriteByte(',')
+			}
+			sb.WriteByte('(')
+			sb.WriteString(strconv.Itoa(i))
+			sb.WriteByte(')')
+		}
+		applyVTTestSQL(t, mysqlDSN, sb.String())
+	}
+	time.Sleep(2 * time.Second)
+
+	sluiceDSN := mysqlDSN +
+		"&vstream_endpoint=" + grpcEndpoint +
+		"&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	rr, err := (Engine{Flavor: FlavorPlanetScale}).OpenRowReader(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenRowReader (planetscale): %v", err)
+	}
+	defer closeIfCloser(rr)
+
+	tbl := &ir.Table{
+		Name:    "cap_nopk",
+		Columns: []*ir.Column{{Name: "n", Type: ir.Integer{Width: 64}}},
+	}
+	ch, err := rr.ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows (no-PK full scan): %v", err)
+	}
+	got := 0
+	for range ch {
+		got++
+	}
+	if err := rr.(*RowReader).Err(); err != nil {
+		t.Fatalf("ReadRows stream error: %v", err)
+	}
+	if got != seeded {
+		t.Fatalf("full scan returned %d of %d rows — vtgate's OLTP cap truncated the scan SILENTLY (exit-0 shape); the scoped `SET workload='olap'` is not reaching the scan connection", got, seeded)
+	}
+}
