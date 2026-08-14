@@ -244,6 +244,34 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 			CONSTRAINT ck_v   CHECK (v > 0),
 			CONSTRAINT ck_len CHECK (char_length(s) > 2)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		-- DIFF-2 (measured 2026-08-14): the fold corpus — every portable
+		-- CHECK family the measurement pass found the two servers
+		-- re-render differently, in one table, migrated for real. The CLEAN
+		-- assertion below is the e2e half of the fold pins; the verbatim
+		-- measured rendering pairs live in the check_expr_norm unit matrix.
+		-- (12 constraints for 13 measured families: ceil and ceiling are one
+		-- arm here because MySQL renders BOTH spellings back as ceiling —
+		-- the spelling pair itself is pinned in the unit matrix.)
+		CREATE TABLE folded (
+			id INT NOT NULL PRIMARY KEY,
+			v  INT,
+			w  INT,
+			s  VARCHAR(20),
+			d  DECIMAL(10,2),
+			CONSTRAINT ck_f_modfn    CHECK (mod(v, 3) >= 0),
+			CONSTRAINT ck_f_between  CHECK (v BETWEEN 1 AND 10),
+			CONSTRAINT ck_f_not      CHECK (NOT (v = 5)),
+			CONSTRAINT ck_f_like     CHECK (s LIKE 'a%'),
+			CONSTRAINT ck_f_notlike  CHECK (s NOT LIKE 'z%'),
+			CONSTRAINT ck_f_substr   CHECK (substring(s, 1, 2) <> 'zz'),
+			CONSTRAINT ck_f_trim     CHECK (trim(s) = s),
+			CONSTRAINT ck_f_nullif   CHECK (nullif(v, -1) IS NOT NULL),
+			CONSTRAINT ck_f_round    CHECK (round(d) >= -100000),
+			CONSTRAINT ck_f_floor    CHECK (floor(d) >= -100000),
+			CONSTRAINT ck_f_ceil     CHECK (ceil(d) >= -100000),
+			CONSTRAINT ck_f_greatest CHECK (greatest(v, w) >= -100000)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`)
 
 	mysqlEng, ok := engines.Get("mysql")
@@ -286,6 +314,28 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 	td = findTableDiff(*diff, "plain")
 	if td == nil || len(td.IndexesMissing) != 1 || td.IndexesMissing[0] != "PRIMARY" {
 		t.Fatalf("expected PRIMARY in indexes_missing after DROP CONSTRAINT; got %+v", td)
+	}
+
+	// DIRTY (DIFF-2's guard direction, ×2): the fold set must not have
+	// widened the false-clean window into meaning. A BETWEEN bound
+	// widened on the target, and a LIKE pattern changed on the target,
+	// must each still report under the same constraint name.
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" DROP CONSTRAINT "ck_f_between"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" ADD CONSTRAINT "ck_f_between" CHECK (v >= 1 AND v <= 100)`)
+	diff = runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
+	td = findTableDiff(*diff, "folded")
+	if td == nil || len(td.ChecksMismatched) != 1 || td.ChecksMismatched[0].Name != "ck_f_between" {
+		t.Fatalf("a WIDENED between bound under the same name went unreported — the DIFF-2 between fold has over-folded: %+v", td)
+	}
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" DROP CONSTRAINT "ck_f_between"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" ADD CONSTRAINT "ck_f_between" CHECK (v >= 1 AND v <= 10)`)
+
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" DROP CONSTRAINT "ck_f_like"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" ADD CONSTRAINT "ck_f_like" CHECK (s LIKE 'b%')`)
+	diff = runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
+	td = findTableDiff(*diff, "folded")
+	if td == nil || len(td.ChecksMismatched) != 1 || td.ChecksMismatched[0].Name != "ck_f_like" {
+		t.Fatalf("a CHANGED like pattern under the same name went unreported — the DIFF-2 like fold has over-folded: %+v", td)
 	}
 }
 

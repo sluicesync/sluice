@@ -415,6 +415,163 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			`(v > 0)`,
 			false,
 		},
+
+		// The DIFF-2 fold matrix (measured 2026-08-14). Each "same:true"
+		// pair below is a VERBATIM (mysql-rendering, pg-rendering) pair
+		// captured from a real MySQL 8 and PostgreSQL 16 of one applied
+		// predicate — the measurement is the vector, not a hand guess.
+		{
+			"DIFF-2 mod: MySQL renders mod(a,b) as (a %% b), PG keeps the call",
+			`((v % 3) >= 0)`,
+			`(mod(v, 3) >= 0)`,
+			true,
+		},
+		{
+			"DIFF-2 between: PG expands to >= AND <=, MySQL preserves between",
+			`(v between 1 and 10)`,
+			`((v >= 1) AND (v <= 10))`,
+			true,
+		},
+		{
+			"DIFF-2 not-pushdown: MySQL simplifies NOT (v = 5) to (v <> 5)",
+			`(v <> 5)`,
+			`(NOT (v = 5))`,
+			true,
+		},
+		{
+			"DIFF-2 like: PG spells LIKE as ~~ with cast decoration",
+			`(s like 'a%')`,
+			`((s)::text ~~ 'a%'::text)`,
+			true,
+		},
+		{
+			"DIFF-2 not like: MySQL wraps prefix-not, PG spells !~~",
+			`(not((s like 'z%')))`,
+			`((s)::text !~~ 'z%'::text)`,
+			true,
+		},
+		{
+			"DIFF-2 substring: MySQL renders substr, PG a quoted \"substring\" call",
+			`(substr(s,1,2) <> 'zz')`,
+			`("substring"((s)::text, 1, 2) <> 'zz'::text)`,
+			true,
+		},
+		{
+			"DIFF-2 trim: PG renders TRIM(BOTH FROM x)",
+			`(trim(s) = s)`,
+			`(TRIM(BOTH FROM s) = (s)::text)`,
+			true,
+		},
+		{
+			"DIFF-2 nullif: PG quotes the negative literal, MySQL parenthesizes the sign",
+			`(nullif(v,-(1)) is not null)`,
+			`(NULLIF(v, '-1'::integer) IS NOT NULL)`,
+			true,
+		},
+		{
+			"DIFF-2 round: MySQL materializes the default scale as round(d,0)",
+			`(round(d,0) >= -(100000))`,
+			`(round(d) >= ('-100000'::integer)::numeric)`,
+			true,
+		},
+		{
+			"DIFF-2 floor: the quoted-negative-literal decoration alone",
+			`(floor(d) >= -(100000))`,
+			`(floor(d) >= ('-100000'::integer)::numeric)`,
+			true,
+		},
+		{
+			"DIFF-2 ceil: MySQL renders ceiling, PG keeps ceil",
+			`(ceiling(d) >= -(100000))`,
+			`(ceil(d) >= ('-100000'::integer)::numeric)`,
+			true,
+		},
+		{
+			"DIFF-2 greatest: the literal decoration on a preserved function",
+			`(greatest(v,w) >= -(100000))`,
+			`(GREATEST(v, w) >= '-100000'::integer)`,
+			true,
+		},
+
+		// Guard directions: each fold's MEANING axis still reports.
+		{
+			"DIFF-2 guard: a different mod divisor is still drift",
+			`((v % 3) >= 0)`,
+			`(mod(v, 4) >= 0)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: a widened between bound is still drift",
+			`(v between 1 and 10)`,
+			`((v >= 1) AND (v <= 100))`,
+			false,
+		},
+		{
+			"DIFF-2 guard: negated vs un-negated comparison is still drift",
+			`(v = 5)`,
+			`(NOT (v = 5))`,
+			false,
+		},
+		{
+			"DIFF-2 guard: a changed LIKE pattern is still drift",
+			`(s like 'a%')`,
+			`((s)::text ~~ 'b%'::text)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: LIKE vs NOT LIKE is still drift",
+			`(s like 'z%')`,
+			`((s)::text !~~ 'z%'::text)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: a NON-zero round scale is meaning and is preserved",
+			`(round(d,2) >= 0)`,
+			`(round(d) >= 0)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: different numeric literals do not collapse",
+			`(v >= -100000)`,
+			`(v >= '-100001'::integer)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: a NON-numeric string literal keeps its literal identity",
+			`(s <> 'abc')`,
+			`(s <> abc)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: not over a conjunction is NOT pushed down (and differs from the pushed form)",
+			`(not(v = 5 and w = 6))`,
+			`(v <> 5 and w <> 6)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: NOT BETWEEN is not rewritten as BETWEEN's expansion",
+			`(v not between 1 and 10)`,
+			`(v >= 1 and v <= 10)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: a compound BETWEEN operand is left verbatim, not misfolded",
+			`(v + w between 1 and 10)`,
+			`(w >= 1 and w <= 10)`,
+			false,
+		},
+		{
+			"DIFF-2 guard: ILIKE's ~~* spelling is NOT folded onto LIKE",
+			`(s like 'a%')`,
+			`((s)::text ~~* 'a%'::text)`,
+			false,
+		},
+		{
+			"DIFF-2 window, pinned as documentation: string-vs-number literal spelling collapses",
+			`(v = 123)`,
+			`(v = '123')`,
+			true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := canonicalCheckExpr(tc.a) == canonicalCheckExpr(tc.b); got != tc.same {

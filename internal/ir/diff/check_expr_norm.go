@@ -97,9 +97,148 @@ const (
 // Returns "" for an expression that is empty after folding, which the
 // caller treats as un-matchable rather than as matching another empty.
 func canonicalCheckExpr(expr string) string {
-	folded := foldOutsideLiterals(foldServerRenderings(expr))
+	folded := foldOutsideLiterals(foldServerRenderings(foldBetweenSimple(expr)))
 	folded = foldPGAnyArrayLists(folded)
 	return stripGrouping(folded)
+}
+
+// foldBetweenSimple rewrites `X BETWEEN A AND B` to `X >= A and X <= B`
+// — PostgreSQL's own DDL-time expansion of the form (DIFF-2, measured
+// 2026-08-14: `v BETWEEN 1 AND 10` reads back from PG as
+// `((v >= 1) AND (v <= 10))` while MySQL preserves `between`). The
+// rewrite is semantics-exact (BETWEEN is defined as that expansion), so
+// unlike the decoration folds it opens no false-clean window.
+//
+// It fires only on the SIMPLE shape — X a single identifier, A and B
+// each a signed number, a quoted literal, or an identifier — because
+// extracting a compound left operand needs precedence-aware parsing.
+// Anything else (compound operands, NOT BETWEEN, BETWEEN SYMMETRIC) is
+// left verbatim: the two sides then compare as different, the
+// spurious-DIFFERENCE direction, never a spurious match. It runs FIRST,
+// on the raw expression, so [foldServerRenderings]'s own token folds see
+// its output.
+func foldBetweenSimple(expr string) string {
+	var sb strings.Builder
+	sb.Grow(len(expr))
+	i := 0
+	for i < len(expr) {
+		c := expr[i]
+		switch {
+		case c == '\'':
+			end := rawLiteralEnd(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+		case isIdentByte(c) && (i == 0 || !isIdentByte(expr[i-1])):
+			j := skipIdent(expr, i)
+			if strings.EqualFold(expr[i:j], "between") {
+				if out, next, ok := rewriteBetween(sb.String(), expr, j); ok {
+					sb.Reset()
+					sb.WriteString(out)
+					i = next
+					continue
+				}
+			}
+			sb.WriteString(expr[i:j])
+			i = j
+		default:
+			sb.WriteByte(c)
+			i++
+		}
+	}
+	return sb.String()
+}
+
+// rewriteBetween attempts the simple-shape BETWEEN rewrite: written is
+// the output emitted so far (its trailing identifier is the left
+// operand), and j sits just past the `between` token. On success it
+// returns the full replacement output and the index just past B.
+func rewriteBetween(written, expr string, j int) (out string, next int, ok bool) {
+	// Left operand: the trailing identifier of what was already written,
+	// preceded by whitespace/boundary — and not a keyword (a `not`
+	// before BETWEEN means NOT BETWEEN, which is a different predicate).
+	end := len(written)
+	for end > 0 && (written[end-1] == ' ' || written[end-1] == '\t' || written[end-1] == '\n' || written[end-1] == '\r') {
+		end--
+	}
+	start := end
+	for start > 0 && isIdentByte(written[start-1]) {
+		start--
+	}
+	lhs := written[start:end]
+	if lhs == "" || isBoolKeyword(lhs) {
+		return "", 0, false
+	}
+	// The identifier must be the WHOLE left operand: if an operator
+	// precedes it (`v + w between …`), the operand is compound and the
+	// simple rewrite would bind only its last term — bail verbatim.
+	p := start
+	for p > 0 && (written[p-1] == ' ' || written[p-1] == '\t' || written[p-1] == '\n' || written[p-1] == '\r') {
+		p--
+	}
+	if p > 0 && strings.IndexByte("+-*/%<>=|&^~!.:", written[p-1]) >= 0 {
+		return "", 0, false
+	}
+	a, k, ok := simpleTermEnd(expr, skipSpaces(expr, j))
+	if !ok {
+		return "", 0, false
+	}
+	k = skipSpaces(expr, k)
+	m := skipIdent(expr, k)
+	if !strings.EqualFold(expr[k:m], "and") {
+		return "", 0, false
+	}
+	b, next, ok := simpleTermEnd(expr, skipSpaces(expr, m))
+	if !ok {
+		return "", 0, false
+	}
+	return written[:start] + lhs + " >= " + a + " and " + lhs + " <= " + b, next, true
+}
+
+// simpleTermEnd parses one simple BETWEEN bound starting at i: a signed
+// number, a single-quoted literal, or an identifier. Returns the raw
+// term text and the index just past it.
+func simpleTermEnd(expr string, i int) (term string, next int, ok bool) {
+	if i >= len(expr) {
+		return "", 0, false
+	}
+	start := i
+	if expr[i] == '-' || expr[i] == '+' {
+		i++
+	}
+	switch {
+	case i < len(expr) && expr[i] == '\'':
+		if i != start {
+			return "", 0, false // a signed string literal is not a shape we fold
+		}
+		return expr[start:rawLiteralEnd(expr, i)], rawLiteralEnd(expr, i), true
+	case i < len(expr) && isIdentByte(expr[i]):
+		j := skipIdent(expr, i)
+		tok := expr[i:j]
+		if isBoolKeyword(tok) {
+			return "", 0, false
+		}
+		// A call (identifier followed by an open paren) is compound.
+		if k := skipSpaces(expr, j); k < len(expr) && expr[k] == '(' {
+			return "", 0, false
+		}
+		// Allow a decimal tail on a number (`10.5`).
+		if j+1 < len(expr) && expr[j] == '.' && isIdentByte(expr[j+1]) {
+			j = skipIdent(expr, j+1)
+		}
+		return expr[start:j], j, true
+	default:
+		return "", 0, false
+	}
+}
+
+// isBoolKeyword reports whether tok is a boolean/structural keyword that
+// can never be a BETWEEN operand or bound.
+func isBoolKeyword(tok string) bool {
+	switch strings.ToLower(tok) {
+	case "and", "or", "not", "between", "in", "like", "is", "null", "when", "then", "else", "end", "case":
+		return true
+	}
+	return false
 }
 
 // foldServerRenderings folds the spellings the two servers give the SAME
@@ -117,17 +256,47 @@ func canonicalCheckExpr(expr string) string {
 //   - `char_length(` → `length(` — MySQL renders `length()` back as
 //     `char_length()`.
 //
+// The DIFF-2 measurement pass (2026-08-14) extended the fold set with
+// the rest of the measured phantom families — a 30-family portable
+// CHECK corpus applied identically to a real MySQL 8 and PostgreSQL 16,
+// 13 of which re-rendered differently. The additional folds, each
+// carrying its measured pair as a verbatim pin:
+//
+//   - `substring(` → `substr(` (MySQL renders substr; PG a quoted
+//     `"substring"` call) and `ceiling(` → `ceil(` (MySQL renders
+//     ceiling; PG keeps ceil) — spelling renames like char_length.
+//   - `trim(BOTH FROM x)` → `trim(x)` — PG's rendering of plain trim.
+//     LEADING/TRAILING/pad-character forms are unmeasured and verbatim.
+//   - `round(x, 0)` → `round(x)` — MySQL materializes the default
+//     scale. A non-zero scale is meaning and is preserved.
+//   - `mod(a, b)` → `(a % b)` — MySQL renders the call as the operator.
+//   - `~~` → `like`, `!~~` → `not like` — PG's operator spellings
+//     (`~~*`/`!~~*` ILIKE forms are unmeasured and verbatim), plus
+//     NOT-pushdown of a single parenthesized comparison
+//     (`not(v = 5)` → `v <> 5`), because MySQL's catalog SIMPLIFIES
+//     the negation while PG preserves it. CHECK-semantics exact (see
+//     [negatedComparison] on NULL). A NOT over a conjunction or
+//     anything but one comparison stays verbatim.
+//   - `X between A and B` → `X >= A and X <= B` for simple operands
+//     ([foldBetweenSimple], run first) — PG's own expansion.
+//   - a quoted NUMERIC literal unquotes (`'-100000'` ≡ `-100000`) —
+//     PG's rendering of negative literals; see [decodeLiteral].
+//
 // The deliberate cost, stated: two predicates differing ONLY in the cast
-// TYPE (`cast(0 as decimal)` vs `cast(0 as unsigned)`) or only in
-// length-function choice canonicalize equal, so a hand-edit of exactly
-// that much on a name-matched constraint reports clean. That window was
-// weighed in the Bug 241 memo and accepted (operator decision,
-// 2026-08-11): both sides of every migrate-created pair are renderings
-// of ONE source predicate, and every REAL drift the filing enumerates —
-// dropped names, widened ranges, changed members, changed columns —
-// changes more than the decoration. The fold is pinned in both
-// directions (phantom → clean; a genuinely-different predicate still
-// differs).
+// TYPE (`cast(0 as decimal)` vs `cast(0 as unsigned)`), only in
+// length/substr/ceil-function spelling, only in mod-vs-% spelling, only
+// in an explicit zero round scale, only in BETWEEN-vs-its-expansion, in
+// a pushed-down negation, or in string-vs-number literal spelling of
+// the same number, canonicalize equal — so a hand-edit of exactly that
+// much on a name-matched constraint reports clean. Every one of those
+// collapses is either semantics-exact (between, not-pushdown, mod,
+// round-scale-0) or the servers' own coercion semantics (numeric
+// literal spelling); the original Bug 241 window reasoning (operator
+// decision, 2026-08-11) covers the rest: both sides of every
+// migrate-created pair are renderings of ONE source predicate, and
+// every REAL drift changes more than the decoration. Each fold is
+// pinned in both directions (phantom → clean; a genuinely-different
+// predicate still differs).
 //
 // It runs on the RAW expression, BEFORE [foldOutsideLiterals], because
 // both folds need real token boundaries: whitespace removal glues
@@ -145,6 +314,15 @@ func foldServerRenderings(expr string) string {
 			end := rawLiteralEnd(expr, i)
 			sb.WriteString(expr[i:end])
 			i = end
+		case c == '!' && strings.HasPrefix(expr[i:], "!~~") && !strings.HasPrefix(expr[i:], "!~~*"):
+			// PG's operator spelling of NOT LIKE (DIFF-2). The `!~~*`
+			// (NOT ILIKE) guard: unmeasured, left verbatim.
+			sb.WriteString(" not like ")
+			i += 3
+		case c == '~' && strings.HasPrefix(expr[i:], "~~") && !strings.HasPrefix(expr[i:], "~~*"):
+			// PG's operator spelling of LIKE. `~~*` (ILIKE) unmeasured.
+			sb.WriteString(" like ")
+			i += 2
 		case isIdentByte(c) && (i == 0 || !isIdentByte(expr[i-1])):
 			j := skipIdent(expr, i)
 			switch {
@@ -162,6 +340,83 @@ func foldServerRenderings(expr string) string {
 					i = j
 					continue
 				}
+			case strings.EqualFold(expr[i:j], "substring"):
+				// MySQL renders substring() back as substr(); PG keeps
+				// (and double-quotes) "substring"(). Both fold to the
+				// substr spelling. The `(`-lookahead skips PG's closing
+				// identifier quote.
+				if callParenFollows(expr, j) {
+					sb.WriteString("substr")
+					i = j
+					continue
+				}
+			case strings.EqualFold(expr[i:j], "ceiling"):
+				// MySQL renders ceil() back as ceiling(); PG keeps ceil().
+				if callParenFollows(expr, j) {
+					sb.WriteString("ceil")
+					i = j
+					continue
+				}
+			case strings.EqualFold(expr[i:j], "trim"):
+				// PG renders trim(x) back as TRIM(BOTH FROM x). Only the
+				// argumentless BOTH FROM prefix is folded (measured);
+				// LEADING/TRAILING and pad-character forms stay verbatim.
+				if next, ok := trimBothFromArgStart(expr, j); ok {
+					sb.WriteString("trim(")
+					i = next
+					continue
+				}
+			case strings.EqualFold(expr[i:j], "round"):
+				// MySQL materializes round(x)'s default scale as
+				// round(x, 0); PG keeps round(x). Fold the explicit
+				// zero scale away. A non-zero scale is meaning, not
+				// decoration, and is preserved.
+				if inner, next, ok := callGroup(expr, j); ok {
+					if args := splitTopLevelArgs(inner); len(args) == 2 && strings.TrimSpace(args[1]) == "0" {
+						sb.WriteString("round(")
+						sb.WriteString(foldServerRenderings(args[0]))
+						sb.WriteString(")")
+						i = next
+						continue
+					}
+				}
+			case strings.EqualFold(expr[i:j], "mod"):
+				// MySQL renders mod(a, b) back as (a % b); PG keeps the
+				// call form. Both fold to the operator spelling.
+				if inner, next, ok := callGroup(expr, j); ok {
+					if args := splitTopLevelArgs(inner); len(args) == 2 {
+						sb.WriteString("(")
+						sb.WriteString(foldServerRenderings(args[0]))
+						sb.WriteString(" % ")
+						sb.WriteString(foldServerRenderings(args[1]))
+						sb.WriteString(")")
+						i = next
+						continue
+					}
+				}
+			case strings.EqualFold(expr[i:j], "not"):
+				// NOT-pushdown, for a single parenthesized comparison:
+				// MySQL's catalog SIMPLIFIES `NOT (v = 5)` to `(v <> 5)`
+				// and spells NOT LIKE as `not((x like p))`, while PG
+				// preserves `NOT (…)` / spells NOT LIKE `!~~` — so the
+				// negation must be normalized onto the comparison for
+				// the two renderings of one predicate to meet. Fires
+				// only when the group holds exactly one top-level
+				// comparison and no AND/OR; anything else stays
+				// verbatim (spurious-difference direction).
+				if inner, next, ok := callGroup(expr, j); ok {
+					if lhs, op, rhs, cok := singleComparison(foldServerRenderings(inner)); cok {
+						if neg, nok := negatedComparison(op); nok {
+							sb.WriteString(lhs)
+							sb.WriteString(" ")
+							sb.WriteString(neg)
+							sb.WriteString(" ")
+							sb.WriteString(rhs)
+							i = next
+							continue
+						}
+					}
+				}
 			}
 			sb.WriteString(expr[i:j])
 			i = j
@@ -171,6 +426,232 @@ func foldServerRenderings(expr string) string {
 		}
 	}
 	return sb.String()
+}
+
+// callParenFollows reports whether a call's opening paren follows the
+// identifier ending at j, allowing whitespace and a closing `"` (PG
+// double-quotes the "substring" identifier in its rendering).
+func callParenFollows(expr string, j int) bool {
+	k := skipSpaces(expr, j)
+	if k < len(expr) && expr[k] == '"' {
+		k = skipSpaces(expr, k+1)
+	}
+	return k < len(expr) && expr[k] == '('
+}
+
+// trimBothFromArgStart matches `( BOTH FROM ` just past a trim token and
+// returns the index of the argument that follows.
+func trimBothFromArgStart(expr string, j int) (next int, ok bool) {
+	k := skipSpaces(expr, j)
+	if k >= len(expr) || expr[k] != '(' {
+		return 0, false
+	}
+	k = skipSpaces(expr, k+1)
+	m := skipIdent(expr, k)
+	if !strings.EqualFold(expr[k:m], "both") {
+		return 0, false
+	}
+	m = skipSpaces(expr, m)
+	n := skipIdent(expr, m)
+	if !strings.EqualFold(expr[m:n], "from") {
+		return 0, false
+	}
+	return skipSpaces(expr, n), true
+}
+
+// callGroup parses a balanced `( … )` group starting at the first
+// non-space past i, returning the inner text and the index just past
+// the close. Literal-aware; an unbalanced group reports ok=false and
+// the caller copies verbatim.
+func callGroup(expr string, i int) (inner string, next int, ok bool) {
+	i = skipSpaces(expr, i)
+	if i >= len(expr) || expr[i] != '(' {
+		return "", 0, false
+	}
+	depth := 1
+	j := i + 1
+	for j < len(expr) {
+		switch expr[j] {
+		case '\'':
+			j = rawLiteralEnd(expr, j)
+		case '(':
+			depth++
+			j++
+		case ')':
+			depth--
+			if depth == 0 {
+				return expr[i+1 : j], j + 1, true
+			}
+			j++
+		default:
+			j++
+		}
+	}
+	return "", 0, false
+}
+
+// splitTopLevelArgs splits inner on depth-0 commas, literal-aware.
+func splitTopLevelArgs(inner string) []string {
+	var args []string
+	depth, start := 0, 0
+	for i := 0; i < len(inner); {
+		switch c := inner[i]; {
+		case c == '\'':
+			i = rawLiteralEnd(inner, i)
+		case c == '(' || c == '[':
+			depth++
+			i++
+		case c == ')' || c == ']':
+			depth--
+			i++
+		case c == ',' && depth == 0:
+			args = append(args, inner[start:i])
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	return append(args, inner[start:])
+}
+
+// singleComparison reports the one top-level comparison in inner —
+// (lhs, op, rhs) with op one of =, <>, <, <=, >, >=, like, notlike —
+// requiring exactly one comparison and no top-level AND/OR/NOT. A fully
+// paren-wrapped inner is unwrapped first (MySQL's NOT LIKE rendering
+// double-wraps: `not((x like p))`).
+func singleComparison(inner string) (lhs, op, rhs string, ok bool) {
+	inner = strings.TrimSpace(inner)
+	for {
+		if u, uok := unwrapOuterParens(inner); uok {
+			inner = strings.TrimSpace(u)
+			continue
+		}
+		break
+	}
+	opStart, opEnd := -1, -1
+	depth := 0
+	notStart := -1
+	for i := 0; i < len(inner); {
+		c := inner[i]
+		switch {
+		case c == '\'':
+			i = rawLiteralEnd(inner, i)
+		case c == '(' || c == '[':
+			depth++
+			i++
+		case c == ')' || c == ']':
+			depth--
+			i++
+		case depth == 0 && (c == '<' || c == '>' || c == '=' || c == '!'):
+			w := 1
+			if i+1 < len(inner) && (inner[i+1] == '=' || inner[i+1] == '>') {
+				w = 2
+			}
+			if c == '!' && w == 1 {
+				i++ // lone '!' — not a comparison we know
+				continue
+			}
+			if opStart >= 0 {
+				return "", "", "", false // second comparison
+			}
+			opStart, opEnd = i, i+w
+			op = inner[i : i+w]
+			i += w
+		case depth == 0 && isIdentByte(c) && (i == 0 || !isIdentByte(inner[i-1])):
+			j := skipIdent(inner, i)
+			switch strings.ToLower(inner[i:j]) {
+			case "and", "or":
+				return "", "", "", false
+			case "not":
+				notStart = i
+			case "like":
+				if opStart >= 0 {
+					return "", "", "", false
+				}
+				if notStart >= 0 {
+					// `x not like p` — lhs ends before the not token.
+					opStart = notStart
+					op = "notlike"
+				} else {
+					opStart = i
+					op = "like"
+				}
+				opEnd = j
+			}
+			i = j
+		default:
+			i++
+		}
+	}
+	if opStart < 0 {
+		return "", "", "", false
+	}
+	lhs, rhs = strings.TrimSpace(inner[:opStart]), strings.TrimSpace(inner[opEnd:])
+	if lhs == "" || rhs == "" {
+		return "", "", "", false
+	}
+	if op == "!=" {
+		op = "<>"
+	}
+	return lhs, op, rhs, true
+}
+
+// unwrapOuterParens removes one layer of parens when they span the
+// whole string as a single balanced group.
+func unwrapOuterParens(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '(' {
+		return s, false
+	}
+	depth := 0
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '\'':
+			i = rawLiteralEnd(s, i)
+		case '(':
+			depth++
+			i++
+		case ')':
+			depth--
+			if depth == 0 {
+				if i == len(s)-1 {
+					return s[1 : len(s)-1], true
+				}
+				return s, false
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return s, false
+}
+
+// negatedComparison maps a comparison operator to its negation, for the
+// NOT-pushdown fold. Comparisons involving NULL evaluate to UNKNOWN on
+// both sides of the rewrite identically (NOT UNKNOWN is UNKNOWN, and a
+// CHECK treats UNKNOWN as pass), so the pushdown is CHECK-semantics
+// exact.
+func negatedComparison(op string) (string, bool) {
+	switch op {
+	case "=":
+		return "<>", true
+	case "<>":
+		return "=", true
+	case "<":
+		return ">=", true
+	case "<=":
+		return ">", true
+	case ">":
+		return "<=", true
+	case ">=":
+		return "<", true
+	case "like":
+		return "not like", true
+	case "notlike":
+		return "like", true
+	}
+	return "", false
 }
 
 // splitCastCall parses `( X as T )` starting just past a `cast` token:
@@ -384,24 +865,83 @@ func foldOutsideLiterals(expr string) string {
 // with the sentinel: the expression is malformed, and the two sides then
 // compare as the different things they are rather than collapsing onto a
 // shared prefix.
+//
+// # Numeric-literal unquoting (DIFF-2, measured 2026-08-14)
+//
+// PostgreSQL renders a negative numeric literal QUOTED and cast —
+// `>= -100000` reads back as `>= '-100000'::integer` — while MySQL
+// renders `-(100000)`, whose parens and sign survive as plain tokens. So
+// a decoded value that is a bare number (optional sign, digits, optional
+// decimal tail) is emitted WITHOUT sentinels, making `'-100000'` and
+// `-100000` one token stream. The stated window: a predicate comparing
+// the STRING '123' against one comparing the NUMBER 123 canonicalizes
+// equal — in both engines the comparison coerces to the numeric
+// interpretation anyway, so the collapse tracks the servers' own
+// semantics. The fold is suppressed when the adjacent output byte is an
+// identifier byte (a MySQL hex literal `x'12'` must not merge into a
+// fictitious `x12` token) and for unterminated literals.
 func decodeLiteral(sb *strings.Builder, expr string, i int) int {
-	sb.WriteString(literalOpen)
+	var val strings.Builder
+	terminated := false
 	i++
 	for i < len(expr) {
-		switch {
-		case expr[i] == '\'' && i+1 < len(expr) && expr[i+1] == '\'':
-			sb.WriteByte('\'')
-			i += 2
-		case expr[i] == '\'':
-			sb.WriteString(literalClose)
-			return i + 1
-		default:
-			sb.WriteByte(expr[i])
+		if expr[i] == '\'' {
+			if i+1 < len(expr) && expr[i+1] == '\'' {
+				val.WriteByte('\'')
+				i += 2
+				continue
+			}
+			terminated = true
 			i++
+			break
 		}
+		val.WriteByte(expr[i])
+		i++
 	}
+	v := val.String()
+	prev := byte(0)
+	if s := sb.String(); s != "" {
+		prev = s[len(s)-1]
+	}
+	nextIsIdent := i < len(expr) && isIdentByte(expr[i])
+	if terminated && isBareNumericToken(v) && !isIdentByte(prev) && !nextIsIdent {
+		sb.WriteString(v)
+		return i
+	}
+	sb.WriteString(literalOpen)
+	sb.WriteString(v)
 	sb.WriteString(literalClose)
 	return i
+}
+
+// isBareNumericToken reports whether v is exactly an optionally-signed
+// integer or decimal — the only literal values the unquoting fold above
+// touches.
+func isBareNumericToken(v string) bool {
+	i := 0
+	if i < len(v) && (v[i] == '-' || v[i] == '+') {
+		i++
+	}
+	digits := 0
+	for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+		i++
+		digits++
+	}
+	if digits == 0 {
+		return false
+	}
+	if i < len(v) && v[i] == '.' {
+		i++
+		frac := 0
+		for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+			i++
+			frac++
+		}
+		if frac == 0 {
+			return false
+		}
+	}
+	return i == len(v)
 }
 
 // skipCast consumes a `::type` or `::type[]` suffix starting at the
