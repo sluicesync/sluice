@@ -150,6 +150,22 @@ func pgCheckConstraintExists(ctx context.Context, db sqlExecQueryer, schemaName,
 	return present, rows.Err()
 }
 
+// TranslateCheckExprFromDialect implements [ir.CheckExprDialectTranslator]:
+// the SAME MySQL→PG expression rewrite this writer applies at DDL-emit
+// time, exposed for `schema diff`'s expected-side comparison (the DIFF-2
+// translator-pair fix). Zero [ExprContext] deliberately — the
+// context-aware bool-idiom rewrites are gated on a non-empty BoolColumns
+// map and stay off here; every dialect rewrite the CHECK families need
+// (JSON operators, TO_CHAR, function renames) is context-free.
+// Best-effort per the interface contract: untranslatable constructs pass
+// through unchanged and the diff reports them exactly as before.
+func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool) {
+	if sourceDialect != translatableSourceDialect {
+		return "", false
+	}
+	return translateExprForPG(expr, ExprContext{}), true
+}
+
 // untranslatedMySQLToPGTokens lists tokens that, when they survive
 // into the POST-translation expression, signal a MySQL-only construct
 // PG cannot execute. A post-translation expression containing any of

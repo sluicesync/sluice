@@ -740,6 +740,28 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 			want: "ROUND(abs(delta)) <= 100",
 		},
 
+		// ---- LOG natural-vs-base-10 (the measured SILENT cell) ----
+		{
+			name: "single-arg LOG (MySQL natural log) renames to LN — PG's log() is base-10",
+			in:   "log(c + 1) >= 0",
+			want: "LN(c + 1) >= 0",
+		},
+		{
+			name: "two-arg LOG passes through — identical semantics where PG's numeric overload accepts it",
+			in:   "log(2, c + 1) >= 0",
+			want: "log(2, c + 1) >= 0",
+		},
+		{
+			name: "LOG10 is untouched — base-10 on both engines",
+			in:   "log10(c + 1) >= 0",
+			want: "log10(c + 1) >= 0",
+		},
+		{
+			name: "LN is untouched — already natural on both",
+			in:   "ln(c + 1) >= 0",
+			want: "ln(c + 1) >= 0",
+		},
+
 		// ---- CHAR_LENGTH / CHARACTER_LENGTH ----
 		{
 			name: "CHAR_LENGTH renames to LENGTH",

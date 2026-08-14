@@ -2,6 +2,16 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+**A MySQL `log(x)` CHECK no longer lands on PostgreSQL silently enforcing a different predicate.** The 2026-08-14 overload/semantics measurement found the matrix's one silent cell: MySQL's single-arg `LOG(x)` is the natural logarithm, PostgreSQL's `log(x)` is base-10 — and the untranslated expression *lands* (PG has the overload), so a migrated CHECK like `log(c) <= 5` bounded the column at e⁵ on the source and 10⁵ on the target, exit 0. The expression translator now renames single-arg `log` to `ln` (semantics-exact; PG's `ln` is MySQL's `log`), leaving the two-arg form untouched (identical semantics where PG's numeric-only overload accepts it, loud 42883 where not). Pinned unit-side and through the migrate-then-diff corpus.
+
+**`schema diff` no longer phantom-reports the translator-rewritten CHECK families (the DIFF-2 residue, closed as filed).** A MySQL `json_extract(j,'$.k')` lands on PostgreSQL as `(j -> 'k')` — correctly — and the diff then compared the source spelling against the target's read-back and reported drift on a target migrate itself created. The diff now renders the expected side through the target writer's *own* dialect translation (a new optional engine surface exposing exactly the rewrite migrate applied), so one mapping serves both consumers instead of the canonicalizer re-implementing the translator. All four rewritten families (`json_extract`, `json_unquote`→`->>`, `date_format`→`to_char`, `log`→`ln`) now diff clean after a real migrate, a changed predicate still reports through the translation, and a writer-less degraded diff keeps today's behavior (stated). Mutation-run in both directions.
+
+**A `power(x,y)` CHECK is no longer refused at preflight.** MySQL's catalog canonicalizes `POWER(x,y)` to `pow(x,y)`, and `pow` — PostgreSQL's core alias of `power` — was missing from the PG-validity allowlist, so a measured-valid constraint refused with "no provable PostgreSQL-valid form". Listed. The same measurement filed the remaining loud overload gaps (`round(x,2)`, `mod`, `format`, two-arg `log` on DOUBLE columns) with their remedy options — those still fail loudly at CREATE, unchanged.
+
 ## [0.126.1] - 2026-08-14
 
 ### Fixed

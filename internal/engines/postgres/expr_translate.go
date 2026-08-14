@@ -198,6 +198,7 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteSUBSTR(expr)
 	expr = rewriteMID(expr)
 	expr = rewriteROUNDDefaultScale(expr)
+	expr = rewriteLOGNatural(expr)
 	expr = rewriteNOWFamily(expr)
 	// v0.11.1 catalog batch — small additive rules. ISNULL runs
 	// before the bool-idiom pass so `COALESCE(ISNULL(x), 0)` flows
@@ -1217,6 +1218,25 @@ func rewriteROUNDDefaultScale(expr string) string {
 			return ""
 		}
 		return "ROUND(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteLOGNatural renames MySQL's single-arg `LOG(x)` — NATURAL
+// logarithm — to PG's `LN(x)`, because PG's `log(x)` is BASE-10. The
+// 2026-08-14 overload/semantics corpus measured this as the matrix's
+// one SILENT cell: the un-rewritten expression LANDS on PG (log(dp)
+// exists) and quietly enforces a different predicate — `log(c) <= 5`
+// bounds c at e^5 on the source and 10^5 on the target. Every sibling
+// spelling agrees cross-engine where it lands and fails loudly where
+// not (ln/log10 identical semantics; two-arg log(b,x) identical on
+// numeric, 42883 on double precision; log2 preflight-refused), so the
+// TWO-arg form deliberately passes through unchanged.
+func rewriteLOGNatural(expr string) string {
+	return rewriteFunctionCalls(expr, "LOG", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "LN(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 

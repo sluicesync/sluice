@@ -103,6 +103,11 @@ var pgValidFunctions = stringSet(
 	// ---- PG core numeric / math functions ----
 	"abs", "cbrt", "ceil", "ceiling", "degrees", "div", "exp", "factorial",
 	"floor", "gcd", "lcm", "ln", "log", "log10", "mod", "pi", "power",
+	// "pow" is PG core (the alias of power) AND the spelling MySQL's
+	// catalog canonicalizes POWER(x,y) to — its absence false-refused a
+	// measured-valid power() CHECK at preflight (the 2026-08-14
+	// overload corpus; the o_power/o_pow cells land once listed).
+	"pow",
 	"radians", "round", "scale", "sign", "sqrt", "trunc", "width_bucket",
 	"min_scale", "trim_scale", "random", "setseed",
 	"sin", "cos", "tan", "cot", "asin", "acos", "atan", "atan2",

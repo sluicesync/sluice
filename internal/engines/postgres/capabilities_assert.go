@@ -80,16 +80,17 @@ var (
 	// schema_reader_census_integration_test.go.
 
 	// SchemaWriter optional surfaces.
-	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)
-	_ ir.DDLPreviewer            = (*SchemaWriter)(nil)
-	_ ir.EmittedCheckPredictor   = (*SchemaWriter)(nil)
-	_ ir.DegradedFKAllower       = (*SchemaWriter)(nil)
-	_ ir.DegradedFKReporter      = (*SchemaWriter)(nil)
-	_ ir.FKOrphanClassifier      = (*SchemaWriter)(nil)
-	_ ir.ExtensionAware          = (*SchemaWriter)(nil)
-	_ ir.IncrementalIndexBuilder = (*SchemaWriter)(nil)
-	_ ir.IndexBuildBudgetSetter  = (*SchemaWriter)(nil)
-	_ ir.IndexBuildTuner         = (*SchemaWriter)(nil)
+	_ ir.CheckExprDialectTranslator = (*SchemaWriter)(nil)
+	_ ir.ColumnDDLPreviewer         = (*SchemaWriter)(nil)
+	_ ir.DDLPreviewer               = (*SchemaWriter)(nil)
+	_ ir.EmittedCheckPredictor      = (*SchemaWriter)(nil)
+	_ ir.DegradedFKAllower          = (*SchemaWriter)(nil)
+	_ ir.DegradedFKReporter         = (*SchemaWriter)(nil)
+	_ ir.FKOrphanClassifier         = (*SchemaWriter)(nil)
+	_ ir.ExtensionAware             = (*SchemaWriter)(nil)
+	_ ir.IncrementalIndexBuilder    = (*SchemaWriter)(nil)
+	_ ir.IndexBuildBudgetSetter     = (*SchemaWriter)(nil)
+	_ ir.IndexBuildTuner            = (*SchemaWriter)(nil)
 	// IndexVerifier is the post-index-phase loud-failure net. It is
 	// runtime-dispatched (pipeline.verifyBuiltIndexes type-asserts
 	// the writer), so an unpinned rename or receiver flip would leave

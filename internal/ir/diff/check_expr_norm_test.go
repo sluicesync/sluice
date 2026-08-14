@@ -4,6 +4,7 @@
 package diff
 
 import (
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -640,6 +641,67 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDiffChecks_TranslateExpectedHook pins the DIFF-2 translator-pair
+// machinery at the comparison layer: when Options carries the target's
+// dialect translation, a name-matched pair whose expected side is a
+// SOURCE-dialect spelling of what the target holds compares clean —
+// and a genuinely different predicate still reports THROUGH the
+// translation. The hook must also respect the ok=false arm (foreign
+// dialect → original text compares, today's behavior).
+func TestDiffChecks_TranslateExpectedHook(t *testing.T) {
+	table := func(expr, dialect string) *ir.Table {
+		return &ir.Table{
+			Name:    "m",
+			Columns: []*ir.Column{{Name: "j", Type: ir.JSON{}}},
+			CheckConstraints: []*ir.CheckConstraint{
+				{Name: "ck_j", Expr: expr, ExprDialect: dialect},
+			},
+		}
+	}
+	// A stand-in for the PG writer's rewrite, shaped like the real one:
+	// translates only the "mysql" dialect, rewriting the source spelling
+	// to the target's.
+	xlat := func(expr, dialect string) (string, bool) {
+		if dialect != "mysql" {
+			return "", false
+		}
+		return strings.ReplaceAll(expr, "json_extract(j, '$.k')", "(j -> 'k')"), true
+	}
+	opts := Options{TranslateExpectedCheckExpr: xlat}
+
+	t.Run("a translated pair compares clean", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(json_extract(j, '$.k') is not null)`, "mysql")}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`((j -> 'k'::text) IS NOT NULL)`, "")}}
+		if d := Schemas(expected, actual, opts); d.HasChanges() {
+			t.Fatalf("a translator-pair CHECK phantom-reported through the hook: %+v", d.TablesMismatched)
+		}
+	})
+	t.Run("a genuinely different predicate still reports through translation", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(json_extract(j, '$.k') is not null)`, "mysql")}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`((j -> 'OTHER'::text) IS NOT NULL)`, "")}}
+		td := findTable(t, Schemas(expected, actual, opts), "m")
+		if len(td.ChecksMismatched) != 1 {
+			t.Fatalf("a genuinely different predicate went unreported under the translate hook — over-folding: %+v", td)
+		}
+	})
+	t.Run("a foreign dialect declines and compares the original", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(json_extract(j, '$.k') is not null)`, "sqlite")}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`((j -> 'k'::text) IS NOT NULL)`, "")}}
+		td := findTable(t, Schemas(expected, actual, opts), "m")
+		if len(td.ChecksMismatched) != 1 {
+			t.Fatalf("an untranslated foreign-dialect pair compared clean — the ok=false arm is broken: %+v", td)
+		}
+	})
+	t.Run("nil hook preserves today's behavior", func(t *testing.T) {
+		expected := &ir.Schema{Tables: []*ir.Table{table(`(json_extract(j, '$.k') is not null)`, "mysql")}}
+		actual := &ir.Schema{Tables: []*ir.Table{table(`((j -> 'k'::text) IS NOT NULL)`, "")}}
+		td := findTable(t, Schemas(expected, actual, Options{}), "m")
+		if len(td.ChecksMismatched) != 1 {
+			t.Fatalf("the nil-hook degraded mode changed — expected the historical phantom report: %+v", td)
+		}
+	})
 }
 
 // TestDiffChecks_NameMatchedPairComparesCanonically is the Bug 241 pin at

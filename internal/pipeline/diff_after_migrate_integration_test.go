@@ -282,6 +282,26 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 			CONSTRAINT ck_f_ceil     CHECK (ceil(d) >= -100000),
 			CONSTRAINT ck_f_greatest CHECK (greatest(v, w) >= -100000)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		-- DIFF-2 translator pairs (the residue the fold deliberately did
+		-- not cover, closed by Options.TranslateExpectedCheckExpr): the
+		-- constructs the MySQL->PG expression translator REWRITES, so the
+		-- target catalog holds a different spelling than any fold could
+		-- reconcile. The diff now renders the expected side through the
+		-- writer's own translator; these must diff CLEAN after a real
+		-- migrate. ck_t_log is the 2026-08-14 overload corpus's one
+		-- SILENT cell (MySQL log = natural, PG log = base-10), landed
+		-- correctly as ln() by the same translator.
+		CREATE TABLE translated (
+			id INT NOT NULL PRIMARY KEY,
+			j  JSON,
+			dt DATETIME,
+			d2 DOUBLE,
+			CONSTRAINT ck_t_jext    CHECK (json_extract(j, '$.k') IS NOT NULL),
+			CONSTRAINT ck_t_junq    CHECK (json_unquote(json_extract(j, '$.k')) <> 'x'),
+			CONSTRAINT ck_t_datefmt CHECK (date_format(dt, '%Y') <> '1900'),
+			CONSTRAINT ck_t_log     CHECK (log(d2 + 100001) >= 0)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`)
 
 	mysqlEng, ok := engines.Get("mysql")
@@ -346,6 +366,19 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 	td = findTableDiff(*diff, "folded")
 	if td == nil || len(td.ChecksMismatched) != 1 || td.ChecksMismatched[0].Name != "ck_f_like" {
 		t.Fatalf("a CHANGED like pattern under the same name went unreported — the DIFF-2 like fold has over-folded: %+v", td)
+	}
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" DROP CONSTRAINT "ck_f_like"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "folded" ADD CONSTRAINT "ck_f_like" CHECK (s LIKE 'a%')`)
+
+	// DIRTY (translator-pair guard): the translate-expected hook must
+	// not certify a genuinely different predicate. A changed JSON path
+	// under the same name still reports through the translation.
+	applyPGDDL(t, pgTarget, `ALTER TABLE "translated" DROP CONSTRAINT "ck_t_jext"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "translated" ADD CONSTRAINT "ck_t_jext" CHECK ((j -> 'OTHER') IS NOT NULL)`)
+	diff = runDiffForDrift(ctx, t, "mysql", "postgres", mysqlSource, pgTarget)
+	td = findTableDiff(*diff, "translated")
+	if td == nil || len(td.ChecksMismatched) != 1 || td.ChecksMismatched[0].Name != "ck_t_jext" {
+		t.Fatalf("a CHANGED JSON path under the same name went unreported — the translate-expected hook has over-folded: %+v", td)
 	}
 }
 

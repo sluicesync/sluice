@@ -57,6 +57,30 @@ type DDLPreviewer interface {
 	PreviewDDL(ctx context.Context, s *Schema) ([]DDLStatement, error)
 }
 
+// CheckExprDialectTranslator is the optional SchemaWriter surface for
+// the target engine's OWN best-effort translation of a CHECK expression
+// written in another engine's dialect — the same rewrite the writer
+// applies at DDL-emit time, exposed so `schema diff` can compare like
+// against like (the DIFF-2 translator-pair residue): a MySQL
+// `json_extract(j,'$.k')` lands on PostgreSQL as `(j -> 'k')`, and a
+// diff comparing the SOURCE spelling against the target catalog's
+// read-back reported phantom drift on a target migrate itself created.
+// Translating the expected side with the writer's own translator keeps
+// ONE mapping with two consumers — the alternative, re-implementing the
+// rewrites inside the diff canonicalizer, is two implementations that
+// drift.
+//
+// TranslateCheckExprFromDialect returns (translated, true) when
+// sourceDialect is one the implementation translates, or ("", false)
+// otherwise — the caller then compares the original text (today's
+// behavior). Best-effort by contract: an untranslatable construct
+// returns the input text unchanged with ok=true, and the comparison
+// simply reports the mismatch it would have reported anyway. Never an
+// error: this surface renders for comparison, it does not gate.
+type CheckExprDialectTranslator interface {
+	TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool)
+}
+
 // ColumnDDLPreviewer is the optional engine surface for emitting a
 // single column's DDL fragment without writing it. Used by `sluice
 // schema diff` (ADR-0029) to render `ADD COLUMN` suggestions for

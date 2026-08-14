@@ -365,10 +365,22 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// [ir.Capabilities.PostgresBackend] rather than an engine name, so a
 	// future PG-family flavor inherits the comparison by declaration.
 	sameFamily := translate.SameStorageShapeFamily(d.Source.Name(), d.Target.Name())
+	// DIFF-2 translator pairs: when the target's schema writer exposes
+	// its own dialect translation (the same rewrite migrate applied),
+	// thread it into the CHECK comparison so a rewritten construct
+	// (json_extract → ->, date_format → to_char) compares as what the
+	// target actually holds. A writer-less degraded diff (sw == nil
+	// after an open refusal) leaves it nil — those pairs then
+	// phantom-report, the stated degraded mode.
+	var translateExpected func(expr, dialect string) (string, bool)
+	if xlat, ok := sw.(ir.CheckExprDialectTranslator); ok {
+		translateExpected = xlat.TranslateCheckExprFromDialect
+	}
 	diff := irdiff.Schemas(expected, actual, irdiff.Options{
 		IgnoreExtras:                     d.IgnoreExtras,
 		IgnoreCharsetCollation:           d.IgnoreCharsetCollation || !sameFamily,
 		TargetCannotHoldRowLevelSecurity: !d.Target.Capabilities().PostgresBackend,
+		TranslateExpectedCheckExpr:       translateExpected,
 	})
 
 	// ---- 4. Resolve missing-table DDL via the target engine's

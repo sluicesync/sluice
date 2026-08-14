@@ -478,6 +478,22 @@ type Options struct {
 	// dropped policy on a Postgres target still surfaces, because a
 	// Postgres target CAN hold them.
 	TargetCannotHoldRowLevelSecurity bool
+
+	// TranslateExpectedCheckExpr, when set, is applied to the EXPECTED
+	// side of a name-matched CHECK pair before comparison, passing that
+	// constraint's recorded [ir.CheckConstraint.ExprDialect] — the
+	// DIFF-2 translator-pair fix. The pipeline wires it to the TARGET
+	// engine's own [ir.CheckExprDialectTranslator] (the same rewrite the
+	// writer applied at migrate time), so a MySQL `json_extract(j,'$.k')`
+	// compares as the `(j -> 'k')` the target actually holds instead of
+	// phantom-reporting. ok=false means "dialect not translated" and the
+	// original text compares (today's behavior); nil disables entirely
+	// (unit tests, same-engine pairs, a degraded writer-less diff — the
+	// phantom returns there, which is the stated degraded mode). Applied
+	// on the name-matched path only: the emitted-match path's expected
+	// side is the TARGET writer's own prediction, already in target
+	// spelling.
+	TranslateExpectedCheckExpr func(expr, exprDialect string) (translated string, ok bool)
 }
 
 // Schemas computes the structural delta between expected and
@@ -769,6 +785,17 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 		act := actChecks[name]
 		expExpr := strings.TrimSpace(exp.Expr)
 		actExpr := strings.TrimSpace(act.Expr)
+		// DIFF-2 translator pairs: render the expected side through the
+		// TARGET's own dialect translation first, so a rewritten
+		// construct (json_extract → ->, date_format → to_char, log → ln)
+		// compares against what the writer actually emitted rather than
+		// phantom-reporting the source spelling. See
+		// [Options.TranslateExpectedCheckExpr].
+		if opts.TranslateExpectedCheckExpr != nil {
+			if translated, ok := opts.TranslateExpectedCheckExpr(expExpr, exp.ExprDialect); ok {
+				expExpr = strings.TrimSpace(translated)
+			}
+		}
 		if expExpr == actExpr {
 			continue
 		}
