@@ -133,6 +133,133 @@ func TestD1Verify_InvalidUTF8TextIsMangledServerSide(t *testing.T) {
 	}
 }
 
+// TestD1Verify_ExportDumpManglesInvalidUTF8Text pins the export half of
+// the same premise (measured 2026-08-14): the /export REST endpoint —
+// the endpoint `wrangler d1 export` drives — mangles invalid-UTF-8 TEXT
+// exactly like /query does, replacing each invalid byte with U+FFFD in
+// the generated .sql dump while `hex(x)` proves storage is intact. So
+// the export path is NOT an escape hatch for this vector (it IS one for
+// BLOBs, which the dump renders as x'..' literals): the only faithful
+// readout of such a value is a server-side `hex(x)`.
+//
+// If this pin fails, D1's export generator changed serialization —
+// rewrite the sqlite-d1-import.md invalid-UTF-8 section alongside it.
+func TestD1Verify_ExportDumpManglesInvalidUTF8Text(t *testing.T) {
+	token := os.Getenv("CLOUDFLARE_API_TOKEN")
+	account := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	if token == "" || account == "" {
+		t.Skip("CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set; d1verify needs live credentials")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	dbID := createThrowawayD1Database(ctx, t, account, token)
+	client, err := openD1Client("d1://" + account + "/" + dbID)
+	if err != nil {
+		t.Fatalf("openD1Client: %v", err)
+	}
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)`,
+		`INSERT INTO t(id, x) VALUES (1, CAST(x'FFFE61' AS TEXT))`,
+	} {
+		if _, err := client.queryRows(ctx, sql); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	// Anti-vacuity: the poison landed intact before we export.
+	rows, err := client.queryRows(ctx, `SELECT hex(x) AS hx FROM t WHERE id = 1`)
+	if err != nil {
+		t.Fatalf("hex select: %v", err)
+	}
+	if hx := string(rows[0]["hx"]); hx != `"FFFE61"` {
+		t.Fatalf("hex(x) = %s; want \"FFFE61\" — the poison did not land, the export below measures nothing", hx)
+	}
+
+	dump := exportD1Dump(ctx, t, account, dbID, token)
+	if !bytes.Contains(dump, []byte(`INSERT INTO "t"`)) {
+		t.Fatalf("dump carries no INSERT for t — export produced an unexpected shape:\n%s", dump)
+	}
+	if bytes.Contains(dump, []byte{0xFF, 0xFE}) {
+		t.Fatalf("dump carries the raw invalid bytes — D1's export generator now preserves invalid UTF-8; the sqlite-d1-import.md caveat overstates the loss, rewrite it with this pin")
+	}
+	if !bytes.Contains(dump, []byte("'��a'")) {
+		t.Fatalf("dump lacks the expected '\\uFFFD\\uFFFDa' literal — D1's export serialization of invalid-UTF-8 TEXT changed; revisit the sqlite-d1-import.md caveat. Dump:\n%s", dump)
+	}
+}
+
+// exportD1Dump drives the /export polling protocol (the same API
+// wrangler d1 export uses) to completion and returns the dump bytes.
+// The job can complete and evict between polls on a tiny database
+// ("Not currently exporting anything."); that quirk is handled by
+// restarting the export, which is idempotent for a quiesced DB.
+func exportD1Dump(ctx context.Context, t *testing.T, account, dbID, token string) []byte {
+	t.Helper()
+	url := "https://api.cloudflare.com/client/v4/accounts/" + account + "/d1/database/" + dbID + "/export"
+
+	type exportInner struct {
+		AtBookmark string `json:"at_bookmark"`
+		SignedURL  string `json:"signed_url"`
+		Error      string `json:"error"`
+		Result     *struct {
+			SignedURL string `json:"signed_url"`
+		} `json:"result"`
+	}
+	poll := func(body string) exportInner {
+		t.Helper()
+		raw, err := d1AdminRequest(ctx, http.MethodPost, url, token, body)
+		if err != nil {
+			t.Fatalf("export poll: %v", err)
+		}
+		var env struct {
+			Success bool        `json:"success"`
+			Result  exportInner `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &env); err != nil || !env.Success {
+			t.Fatalf("export poll response not usable (err=%v): %s", err, raw)
+		}
+		return env.Result
+	}
+
+	start := `{"output_format":"polling"}`
+	r := poll(start)
+	for i := 0; i < 60; i++ {
+		signed := r.SignedURL
+		if signed == "" && r.Result != nil {
+			signed = r.Result.SignedURL
+		}
+		if signed != "" {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, signed, nil)
+			if err != nil {
+				t.Fatalf("dump request: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("dump download: %v", err)
+			}
+			defer resp.Body.Close()
+			out := new(bytes.Buffer)
+			if _, err := out.ReadFrom(resp.Body); err != nil {
+				t.Fatalf("dump read: %v", err)
+			}
+			if resp.StatusCode/100 != 2 {
+				t.Fatalf("dump download: HTTP %d: %s", resp.StatusCode, out.String())
+			}
+			return out.Bytes()
+		}
+		switch {
+		case strings.Contains(r.Error, "Not currently exporting"):
+			r = poll(start)
+		case r.AtBookmark != "":
+			time.Sleep(2 * time.Second)
+			r = poll(`{"output_format":"polling","current_bookmark":"` + r.AtBookmark + `"}`)
+		default:
+			t.Fatalf("export poll made no progress: %+v", r)
+		}
+	}
+	t.Fatal("export never produced a signed URL within the poll budget")
+	return nil
+}
+
 // createThrowawayD1Database creates a uniquely-named D1 database via the
 // REST API and registers its deletion on test cleanup. A failed delete
 // is reported loudly (it costs nothing but clutters the account).
