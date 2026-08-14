@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**The multi-database fan-out's Vitess/PlanetScale refusal probes keyspace existence first, so its printed remedy actually runs (Bug 249, found by the v0.125.0 regression cycle).** v0.125.0's guard refused unconditionally — a fully pre-provisioned fan-out re-refused byte-identically, making "create the keyspace first" an unrunnable hint (the Bug 245/247 class, caught in a fix written the day before with that class explicitly in mind), and the refusal carried no error code. `EnsureDatabase` on a VStream flavor now probes `SHOW DATABASES` on a server-level connection first: an existing keyspace satisfies the ensure step and the fan-out proceeds; only a missing one refuses, as the new `SLUICE-E-SCHEMA-KEYSPACE-MISSING` with a remedy that genuinely releases the gate on re-run. Pinned against a real vtgate in both directions (existing → nil; missing → the coded refusal with both runnable remedies) and mutation-run (probe blinded → the exists arm reproduces the filing's shape).
+
 ## [0.125.0] - 2026-08-14
 
 The PlanetScale/Vitess hardening batch, driven by a licensed-safe survey of a fellow tool's engineering history and verified against sluice's own code and real clusters: two new connect-time refusals with silent-loss downstreams, three new real-vtgate gates (one mutation-proven locally, one that caught sluice's own test suite on its first CI run), the chunked-copy progress fix a real user reported, the Bug 248 store-fold silent-clobber refusal, quiet preview advisories for the semantic-divergence CHECK operators, the Go 1.26.6 stdlib security patches, and the three-weeks-of-unread-CI episode closed with a standing-red issue automation.

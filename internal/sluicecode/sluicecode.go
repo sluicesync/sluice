@@ -240,6 +240,15 @@ const (
 	// is what is broken.
 	CodeBackupRecordedSchemaMalformed Code = "SLUICE-E-BACKUP-RECORDED-SCHEMA-MALFORMED"
 
+	// CodeSchemaKeyspaceMissing is Bug 249's corrected refusal: the
+	// multi-database fan-out probed the Vitess/PlanetScale target and
+	// the keyspace does not exist — vtgate has no CREATE DATABASE, so
+	// sluice cannot create it, and the remedy (provision it on the
+	// platform, then re-run) genuinely releases the gate because the
+	// probe runs first. The first cut refused unconditionally, making
+	// its own remedy unrunnable (the Bug 245/247 class).
+	CodeSchemaKeyspaceMissing Code = "SLUICE-E-SCHEMA-KEYSPACE-MISSING"
+
 	// CodeBackupStoreNameCollision is the Bug 248 gate: the destination
 	// store folds letter case (measured by probe — Windows NTFS / macOS
 	// default filesystems for a local dir), and two or more table-derived
@@ -533,6 +542,7 @@ var registry = map[Code]Info{
 	CodeBackupChainConflict:            {ClassRefusal, "another writer advanced this backup chain mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — either the conditional catalog write refused rather than interleave, or this run's parent is no longer the chain's tip and committing it would fork the lineage; no catalog change was written"},
 	CodeBackupEncryptionMismatch:       {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
 	CodeBackupRecordedSchemaMalformed:  {ClassRefusal, "the chain's recorded schema carries an expression whose string literal never closes (a pre-v0.120.0 MySQL-family reader mangled apostrophe-carrying expressions at schema read), so the recorded DDL cannot be emitted as valid SQL — raised by backup verify and pre-DDL by restore/chain restore; Bug 243"},
+	CodeSchemaKeyspaceMissing:          {ClassRefusal, "the multi-database fan-out probed the Vitess/PlanetScale target and the keyspace does not exist — vtgate has no CREATE DATABASE, so provision it on the platform and re-run (the existence probe then passes), or use per-database explicit targets; Bug 249"},
 	CodeBackupStoreNameCollision:       {ClassRefusal, "the destination store folds letter case (measured by a two-object probe) and case-colliding table names would write to one folded path, silently overwriting one table's data at exit 0 — refused before any write at backup full / export-as-parquet; back up to a case-sensitive store, exclude one colliding table, or rename one source table; Bug 248"},
 	CodeBackupChainUnreadable:          {ClassRefusal, "backup compact / backup prune re-read the chain the way a restore would and could not: the chain does not walk, or its identity/key material (the chain-root manifest.json a passphrase chain's Argon2id salt is recorded on) is missing or inconsistent — refused BEFORE the destructive sweep with nothing deleted, or reported AFTER it so the run never exits 0 over a chain it just made unreadable"},
 

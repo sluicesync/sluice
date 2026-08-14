@@ -30,8 +30,11 @@ import (
 	"fmt"
 	"strings"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // ErrNotImplemented is returned by Engine methods whose underlying
@@ -570,25 +573,39 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 	if database == "" {
 		return errors.New("mysql: EnsureDatabase: database name is empty")
 	}
-	// Vitess/PlanetScale: vtgate does not support CREATE DATABASE —
-	// keyspaces are provisioned through the platform, not SQL (a
-	// measured fact from the 2026-08-14 ingestr survey, item 5). The
-	// multi-database fan-out's "vanilla-only" status was previously a
-	// COMMENT on deriveDatabaseDSN with nothing enforcing it; without
-	// this refusal a VStream-flavor fan-out died on a raw vtgate error
-	// mid-run instead of a preflight naming the fix.
-	if e.Flavor.usesVStream() {
-		return fmt.Errorf(
-			"mysql: EnsureDatabase(%q): the %s flavor cannot auto-create databases — vtgate does not "+
-				"support CREATE DATABASE (keyspaces are provisioned through the platform, not SQL). "+
-				"Create the keyspace/database on the target first, or use per-database explicit targets "+
-				"instead of the multi-database fan-out",
-			database, e.Flavor,
-		)
-	}
 	cfg, err := parseServerDSN(dsn)
 	if err != nil {
 		return err
+	}
+	// Vitess/PlanetScale: vtgate does not support CREATE DATABASE —
+	// keyspaces are provisioned through the platform, not SQL (a
+	// measured fact from the 2026-08-14 ingestr survey, item 5). The
+	// first cut of this guard refused UNCONDITIONALLY, which made its
+	// own printed remedy ("create the keyspace first") unrunnable — a
+	// pre-provisioned fan-out re-refused byte-identically (Bug 249,
+	// caught by the v0.125.0 regression cycle; the Bug 245/247 class
+	// again). So: PROBE first. An EXISTING keyspace satisfies "ensure"
+	// with nothing to create — the fan-out proceeds; only a missing one
+	// refuses, now with a code and a remedy that genuinely releases the
+	// gate on re-run.
+	if e.Flavor.usesVStream() {
+		exists, perr := serverDatabaseExists(ctx, e, cfg, database)
+		if perr != nil {
+			return fmt.Errorf("mysql: EnsureDatabase(%q): probe keyspaces on the %s target: %w", database, e.Flavor, perr)
+		}
+		if exists {
+			return nil
+		}
+		return sluicecode.Wrap(sluicecode.CodeSchemaKeyspaceMissing,
+			"provision the keyspace/database on the platform (vtgate has no CREATE DATABASE), then re-run — "+
+				"this probe passes once it exists; or use per-database explicit targets instead of the "+
+				"multi-database fan-out",
+			fmt.Errorf(
+				"mysql: EnsureDatabase(%q): the keyspace does not exist on the %s target, and sluice cannot "+
+					"create it — vtgate does not support CREATE DATABASE (keyspaces are provisioned through "+
+					"the platform, not SQL)",
+				database, e.Flavor,
+			))
 	}
 	// Connect at the server level — the target database may not exist
 	// yet, so a database-scoped DSN would fail to connect. (The
@@ -607,6 +624,37 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 		return fmt.Errorf("mysql: create database %q: %w", database, wrapDDLError(err))
 	}
 	return nil
+}
+
+// serverDatabaseExists reports whether database exists on the server
+// dsn points at, via a server-level connection and SHOW DATABASES
+// (which vtgate answers with the keyspace list). Exact-match on the
+// name — keyspace naming is operator-controlled and the fan-out
+// derives target names verbatim, so a fold here would claim an
+// existence the writes might not see.
+func serverDatabaseExists(ctx context.Context, e Engine, cfg *mysqldriver.Config, database string) (bool, error) {
+	cfg = cfg.Clone()
+	cfg.DBName = ""
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == database {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // foldMySQLIdentifier is sluice's imitation of the fold a MySQL server

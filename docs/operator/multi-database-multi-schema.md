@@ -94,9 +94,10 @@ sluice migrate ... --include-database 'tenant_*'
 When the **target is also MySQL** (the `mysql` or `mariadb` flavor), each
 source database is recreated as a target database via `CREATE DATABASE IF
 NOT EXISTS` — same names, no manual pre-creation. On `vitess`/`planetscale`
-targets the fan-out REFUSES instead (v0.125.0): vtgate has no
-`CREATE DATABASE` — keyspaces are provisioned through the platform — so
-pre-create them, or use per-database explicit targets.
+targets the fan-out probes first and REFUSES only what is missing
+(`SLUICE-E-SCHEMA-KEYSPACE-MISSING`): vtgate has no `CREATE DATABASE` —
+keyspaces are provisioned through the platform — so pre-create them (the
+fan-out proceeds once they exist), or use per-database explicit targets.
 
 ---
 

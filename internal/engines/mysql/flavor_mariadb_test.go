@@ -682,27 +682,26 @@ func TestRefuseVitessUnderNonVStreamFlavor(t *testing.T) {
 	}
 }
 
-// TestEnsureDatabase_VStreamFlavorsRefuse pins the ingestr-survey
-// item-5 guard: vtgate does not support CREATE DATABASE (keyspaces are
-// platform-provisioned), so EnsureDatabase on a VStream flavor refuses
-// BEFORE connecting — previously the multi-database fan-out's
-// "vanilla-only" status was an unenforced comment and a VStream-flavor
-// fan-out died on a raw vtgate error mid-run. The refusal is
-// flavor-gated: it fires before DSN parsing on vitess/planetscale
-// (proven with a garbage DSN — the error is the refusal, not a parse
-// failure), and the vanilla flavor still proceeds to DSN handling.
-func TestEnsureDatabase_VStreamFlavorsRefuse(t *testing.T) {
+// TestEnsureDatabase_VStreamFlavorsProbeFirst pins Bug 249's corrected
+// contract: on a VStream flavor, EnsureDatabase PROBES existence before
+// deciding — the v0.125.0 first cut refused unconditionally, which made
+// its own printed remedy ("create the keyspace first") unrunnable, the
+// Bug 245/247 class. With a garbage DSN, every flavor must now surface
+// the DSN/parse error (proving no flavor short-circuits to a refusal
+// before the probe path); the missing-keyspace refusal itself — with
+// its SLUICE-E-SCHEMA-KEYSPACE-MISSING code and the runnable
+// provision-then-re-run remedy — and the exists→nil release are pinned
+// against a real vtgate in the vstream integration suite
+// (TestVStream_EnsureDatabase_ProbeFirst).
+func TestEnsureDatabase_VStreamFlavorsProbeFirst(t *testing.T) {
 	ctx := context.Background()
-	for _, f := range []Flavor{FlavorVitess, FlavorPlanetScale} {
+	for _, f := range []Flavor{FlavorVitess, FlavorPlanetScale, FlavorVanilla} {
 		err := Engine{Flavor: f}.EnsureDatabase(ctx, "not-even-a-dsn", "db1")
-		if err == nil || !strings.Contains(err.Error(), "CREATE DATABASE") {
-			t.Fatalf("flavor %v: want the vtgate CREATE DATABASE refusal, got %v", f, err)
+		if err == nil {
+			t.Fatalf("flavor %v: garbage DSN must error", f)
 		}
-	}
-	// Vanilla proceeds past the flavor gate into DSN parsing (the
-	// garbage DSN errors there — proving the refusal did NOT fire).
-	err := Engine{Flavor: FlavorVanilla}.EnsureDatabase(ctx, "not-even-a-dsn", "db1")
-	if err == nil || strings.Contains(err.Error(), "CREATE DATABASE") {
-		t.Fatalf("vanilla flavor must reach DSN parsing, got %v", err)
+		if strings.Contains(err.Error(), "does not exist on the") || strings.Contains(err.Error(), "provisioned through the platform") {
+			t.Fatalf("flavor %v: the missing-keyspace refusal fired WITHOUT a probe (garbage DSN) — the unconditional-refusal shape Bug 249 filed: %v", f, err)
+		}
 	}
 }

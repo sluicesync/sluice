@@ -953,3 +953,35 @@ func TestVStream_VanillaFlavorAgainstVitess_RefusesAtConnect(t *testing.T) {
 	}
 	closeIfCloser(sr)
 }
+
+// TestVStream_EnsureDatabase_ProbeFirst pins Bug 249's corrected
+// contract against a real vtgate: an EXISTING keyspace satisfies the
+// ensure step (nil — the fan-out proceeds; the v0.125.0 first cut
+// refused even here, making its own "create it first" remedy
+// unrunnable), and a MISSING keyspace refuses with
+// SLUICE-E-SCHEMA-KEYSPACE-MISSING and the provision-then-re-run
+// remedy — which is now genuinely runnable, because the probe runs
+// first.
+func TestVStream_EnsureDatabase_ProbeFirst(t *testing.T) {
+	mysqlDSN, _, keyspace, cleanup := startVTTestServer(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	eng := Engine{Flavor: FlavorVitess}
+	if err := eng.EnsureDatabase(ctx, mysqlDSN, keyspace); err != nil {
+		t.Fatalf("EnsureDatabase on the EXISTING keyspace %q must be nil (the pre-provisioned fan-out proceeds): %v", keyspace, err)
+	}
+
+	err := eng.EnsureDatabase(ctx, mysqlDSN, "no_such_keyspace_bug249")
+	if err == nil {
+		t.Fatal("EnsureDatabase on a missing keyspace must refuse (vtgate has no CREATE DATABASE)")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeSchemaKeyspaceMissing {
+		t.Fatalf("want %s, got %v", sluicecode.CodeSchemaKeyspaceMissing, err)
+	}
+	if !strings.Contains(ce.Hint, "re-run") || !strings.Contains(ce.Hint, "per-database explicit targets") {
+		t.Errorf("hint must carry both runnable remedies: %s", ce.Hint)
+	}
+}
