@@ -966,10 +966,16 @@ func (b *IncrementalBackup) readSourceSchema(ctx context.Context) (*ir.Schema, e
 	// the gate-scope rule: toward a MySQL-family target,
 	// CheckCrossEngineDeltaSupportable's VerbatimType arm refuses at
 	// chain-restore PREFLIGHT; toward SQLite/D1 that gate early-returns
-	// nil (it is the pgToMySQL arm) and the door is the SQLite
-	// emitter's default-arm refusal on ir.VerbatimType — LOUD, but
-	// mid-restore, after earlier segments' data landed. Both directions
-	// pinned (TestCrossEngineDeltaSupportable_VerbatimMidChainDoors,
+	// nil (it is the pgToMySQL arm) and the named door is the SQLite
+	// emitter's default-arm refusal on ir.VerbatimType. The v0.126.1
+	// cycle MEASURED that emitter door as unreachable in practice:
+	// every drivable chain-restore-to-SQLite configuration is refused
+	// EARLIER, before any data lands (the chain applier gate — sqlite
+	// implements no ChangeApplier — owns chains with incrementals, and
+	// the single-manifest path carries no deltas), so the emitter
+	// refusal stands as defense in depth, not the operative door. Both
+	// directions pinned
+	// (TestCrossEngineDeltaSupportable_VerbatimMidChainDoors,
 	// TestEmitSQLiteType_RefusesVerbatim).
 	migcore.ApplyVerbatimExtensionPassthrough(sr, migcore.VerbatimBackupSourcePG(b.Source))
 	if b.scope != nil {
