@@ -248,13 +248,13 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
       # the run step can never drift apart.
       VSTREAM_PIPELINE_RUN: '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_|TestVindex)'
-      # The 40m -timeout / 45m job budget's documented basis (audit
+      # The 44m -timeout / 50m job budget's documented basis (audit
       # 2026-07-23 TEST-9): sized for exactly this many matching
       # top-level tests. The guard below fails on ANY drift — fewer
       # means a rename/removal silently emptied part of the filter
@@ -262,7 +262,7 @@ jobs:
       # joined the leg, so RE-DERIVE the budget (and this count) in the
       # same PR instead of letting the 19c J-TEST-3 compounding
       # continue.
-      VSTREAM_PIPELINE_EXPECTED_TESTS: "14"
+      VSTREAM_PIPELINE_EXPECTED_TESTS: "15"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6.5.0
@@ -280,7 +280,7 @@ jobs:
         run: |
           matched=$(go test -tags='integration vstream' -list "$VSTREAM_PIPELINE_RUN" ./internal/pipeline/ | grep -c '^Test' || true)
           if [ "$matched" -ne "$VSTREAM_PIPELINE_EXPECTED_TESTS" ]; then
-            echo "::error::vstream-pipeline: -run filter matches ${matched} tests, budget basis is ${VSTREAM_PIPELINE_EXPECTED_TESTS}. Fewer = a rename/removal silently emptied part of the filter; more = a new cluster-boot test joined the leg. Re-derive the 40m/45m budget AND update VSTREAM_PIPELINE_EXPECTED_TESTS in the same PR."
+            echo "::error::vstream-pipeline: -run filter matches ${matched} tests, budget basis is ${VSTREAM_PIPELINE_EXPECTED_TESTS}. Fewer = a rename/removal silently emptied part of the filter; more = a new cluster-boot test joined the leg. Re-derive the 44m/50m budget AND update VSTREAM_PIPELINE_EXPECTED_TESTS in the same PR."
             go test -tags='integration vstream' -list "$VSTREAM_PIPELINE_RUN" ./internal/pipeline/
             exit 1
           fi
@@ -292,7 +292,8 @@ jobs:
         run: |
           bash scripts/ci-ghcr-pull.sh \
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
-            ghcr.io/sluicesync/sluice-postgres:16-prebaked
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked \
+            ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
       # Via the GHCR mirror with docker.io fallback (task #36) — even
       # bounded-retry docker.io pulls have red-failed jobs on transient
       # "context deadline exceeded" (see the ci.yml vstream job note).
@@ -306,7 +307,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=40m \
+          go test -tags='integration vstream' -race -count=1 -timeout=44m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have
