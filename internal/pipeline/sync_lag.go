@@ -15,10 +15,12 @@ package pipeline
 // It is also distinct from `sluice_seconds_since_last_apply` (now − the
 // control row's UpdatedAt), which AGES on a quiet stream and exists to catch
 // a STUCK/not-applying stream. Sync lag, by contrast, is honest when idle:
-// once the applier has drained the available source changes it reports 0
-// (caught up), never a number that grows with wall-clock. The two are
-// complementary — alert on sync lag for "falling behind while flowing" and
-// on seconds-since-last-apply for "not applying at all".
+// once changes stop flowing for the caught-up window it reports UNKNOWN
+// (PROG-LAG-1 — this seam cannot tell a quiet source from a wedged
+// pipeline, so it claims neither), never a number that grows with
+// wall-clock and never a fabricated zero. The two are complementary —
+// alert on sync lag for "falling behind while flowing" and on
+// seconds-since-last-apply for "not applying at all".
 
 import (
 	"context"
@@ -31,20 +33,26 @@ import (
 )
 
 // syncLagCaughtUpAfter is how long the applier may go without applying a
-// source-timestamped change before the lag reading is reported as caught-up
-// (0). It exists ONLY to retire a STALE non-zero reading after the source
-// goes quiet: on a flowing-but-behind stream the reader keeps the apply
-// channel fed (the backlog drains continuously), so the gap between applied
-// changes stays small and a genuine lag is held through transient apply
-// hiccups; only a SUSTAINED absence of applied work flips the reading to
-// "caught up". It is sized well above the batch idle-flush (100ms) and the
-// telemetry poll cadence so a brief target stall does not falsely zero a
-// real lag, while a genuinely idle/caught-up source still settles to 0.
+// source-timestamped change before the lag reading is reported as UNKNOWN
+// (PROG-LAG-1, operator-approved 2026-08-14). It exists to retire a STALE
+// non-zero reading after changes stop flowing: on a flowing-but-behind
+// stream the reader keeps the apply channel fed (the backlog drains
+// continuously), so the gap between applied changes stays small and a
+// genuine lag is held through transient apply hiccups; only a SUSTAINED
+// absence of applied work retires the reading. It is sized well above the
+// batch idle-flush (100ms) and the telemetry poll cadence so a brief
+// target stall does not falsely retire a real lag.
 //
-// Caveat (documented, not a bug): a stream that is behind AND wedged (target
-// down, nothing flowing) flips to 0 here after the window — that "not
-// applying at all" failure mode is the job of `sluice_seconds_since_last_apply`
-// (which ages); sync lag answers only "falling behind while flowing".
+// Why UNKNOWN and not "caught up" (the pre-fix reading, `0, true`): this
+// seam cannot distinguish a QUIET source (genuinely caught up) from a
+// WEDGED pipeline (behind, target down, nothing flowing) — and reporting 0
+// for both meant a fired sync-lag alert CLEARED and re-armed on a stream
+// that was actually stuck (the PROG-LAG-1 filing). Unknown is the honest
+// reading (the *Known contract: unobserved, never a fabricated zero): the
+// metrics gauge goes unobserved, and the alerter neither fires nor
+// re-arms — a latched alert stays latched until changes flow again and
+// demonstrate low lag. The "not applying at all" failure mode remains
+// separately visible via `sluice_seconds_since_last_apply` (which ages).
 const syncLagCaughtUpAfter = 30 * time.Second
 
 // syncLagSource is the read side of the sync-lag signal consumed by the
@@ -113,7 +121,10 @@ func (t *syncLagTracker) SyncLagSeconds(now time.Time) (float64, bool) {
 		return 0, false // no source-timestamped change applied yet — unknown
 	}
 	if now.UnixNano()-obs > syncLagCaughtUpAfter.Nanoseconds() {
-		return 0, true // sustained idle ⇒ caught up
+		// Sustained idle ⇒ UNKNOWN, carrying the last frozen lag for
+		// context (PROG-LAG-1 — see syncLagCaughtUpAfter's doc for why
+		// this is not "caught up").
+		return float64(t.frozenLagNanos.Load()) / float64(time.Second), false
 	}
 	return float64(t.frozenLagNanos.Load()) / float64(time.Second), true
 }

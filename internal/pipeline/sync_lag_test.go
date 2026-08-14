@@ -48,21 +48,26 @@ func TestSyncLagTracker_FrozenLagDoesNotAge(t *testing.T) {
 	}
 }
 
-// TestSyncLagTracker_CaughtUpAfterIdle pins that a SUSTAINED absence of
-// applied work retires a stale non-zero reading to 0 (caught up) — the #1
-// false-alarm class the metric must avoid.
-func TestSyncLagTracker_CaughtUpAfterIdle(t *testing.T) {
+// TestSyncLagTracker_IdleReportsUnknown pins PROG-LAG-1's corrected
+// idle semantics (operator-approved 2026-08-14): a SUSTAINED absence of
+// applied work retires a stale reading to UNKNOWN — not to "0, caught
+// up", because this seam cannot distinguish a quiet source from a
+// wedged pipeline, and the pre-fix `0, true` cleared and re-armed a
+// fired sync-lag alert on a stream that was actually stuck. The last
+// frozen lag rides along as context; known=false is what keeps the
+// gauge honest (unobserved, never a fabricated zero) and the alert
+// latched.
+func TestSyncLagTracker_IdleReportsUnknown(t *testing.T) {
 	tr := newSyncLagTracker(0)
 	base := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
 	tr.observe(base.Add(-30*time.Second), base) // 30s behind when last applied
 
-	// Past the caught-up window with nothing flowing ⇒ 0, still known.
 	got, known := tr.SyncLagSeconds(base.Add(syncLagCaughtUpAfter + time.Second))
-	if !known {
-		t.Fatal("known=false past idle window; want known (caught up, not unknown)")
+	if known {
+		t.Fatalf("known=true past the idle window (lag=%v) — the pre-fix caught-up reading is back: a wedged stream's fired alert would clear and re-arm (PROG-LAG-1)", got)
 	}
-	if got != 0 {
-		t.Fatalf("lag = %v past idle window; want 0 (caught up)", got)
+	if got < 29.9 || got > 30.1 {
+		t.Fatalf("idle reading carries lag=%v; want the last frozen ~30s as context", got)
 	}
 }
 
