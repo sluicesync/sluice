@@ -951,6 +951,21 @@ func (b *IncrementalBackup) readSourceSchema(ctx context.Context) (*ir.Schema, e
 		return nil, fmt.Errorf("open schema reader: %w", err)
 	}
 	defer migcore.CloseIf(sr)
+	// ADR-0047 tier (b), the INCREMENTAL arm (Bug 251, found by the
+	// v0.126.0 regression cycle — the other half of the Bug 110 class):
+	// the full's read enables verbatim capture for a PG source
+	// (backup.go), so a chain whose SCOPE carries a verbatim-family
+	// column (tsvector, tsrange, xml, money, …) takes its full fine —
+	// and then every `backup incremental` failed this read with the
+	// engine's "unsupported data_type" refusal. Bug 110's scoping fixed
+	// the OUT-of-scope sibling only. Same capture-only posture as the
+	// full: the restore-time engine gates stay authoritative — a
+	// verbatim column arriving MID-CHAIN via a delta is refused toward
+	// a non-PG target by CheckCrossEngineDeltaSupportable's VerbatimType
+	// arm (the segment's VerbatimExtensionColumns marker derives from
+	// the FULL's schema only; stated, not silent — the delta gate is
+	// the door that covers the mid-chain arrival).
+	migcore.ApplyVerbatimExtensionPassthrough(sr, migcore.VerbatimBackupSourcePG(b.Source))
 	if b.scope != nil {
 		if scoper, ok := sr.(ir.TableScoper); ok {
 			scoper.SetTableScope(b.scope)
