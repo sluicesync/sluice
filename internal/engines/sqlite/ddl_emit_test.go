@@ -89,6 +89,19 @@ func TestEmitColumnTypeRefusals(t *testing.T) {
 	}
 }
 
+// TestEmitSQLiteType_RefusesVerbatim names the SQLite door for a
+// verbatim column arriving MID-CHAIN via a backup delta (Bug 251's
+// boundary, per the pre-v0.126.1 value-fidelity review): the
+// cross-engine delta gate does NOT apply toward SQLite (see migcore's
+// TestCrossEngineDeltaSupportable_VerbatimMidChainDoors), so this
+// refusal — loud, mid-restore — is the only thing between a PG chain's
+// tsvector delta and a silently-wrong column on a SQLite target.
+func TestEmitSQLiteType_RefusesVerbatim(t *testing.T) {
+	if _, err := emitColumnType(ir.VerbatimType{Definition: "tsvector"}); err == nil {
+		t.Fatal("emitColumnType(VerbatimType) err = nil; want the loud refusal — it is the ONLY door toward SQLite for a mid-chain verbatim delta")
+	}
+}
+
 // TestEmitTableDef pins the inline-everything CREATE TABLE: a single
 // INTEGER PK lands inline (rowid alias, no NOT NULL), CHECK + FK are
 // inline, and a composite PK uses a table-level clause (ADR-0134 §3).

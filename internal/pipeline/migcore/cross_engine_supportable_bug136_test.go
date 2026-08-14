@@ -103,6 +103,35 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_OverriddenTextIndexAllowed(t *tes
 // incremental schema-delta path (AddTable carrying a text-indexed
 // table) trips the same refusal — chain restore's cross-engine deltas
 // share the chokepoint.
+// TestCrossEngineDeltaSupportable_VerbatimMidChainDoors pins the
+// per-target DOORS for a verbatim column arriving mid-chain via a
+// delta (Bug 251's stated boundary, corrected by the pre-v0.126.1
+// value-fidelity review — the gate was cited broader than its reach):
+// toward a MySQL-family target the VerbatimType arm refuses at
+// chain-restore preflight; toward SQLite this gate DOES NOT APPLY
+// (it is the pgToMySQL arm — early-returns nil) and the door is the
+// SQLite emitter's own refusal (TestEmitSQLiteType_RefusesVerbatim,
+// in the sqlite package), which is loud but mid-restore. If the
+// sqlite arm here starts refusing, the boundary comment at
+// incremental.go's readSourceSchema needs rewriting — the asymmetry
+// is the documented fact.
+func TestCrossEngineDeltaSupportable_VerbatimMidChainDoors(t *testing.T) {
+	deltas := []*irbackup.SchemaDeltaEntry{{
+		Kind:  irbackup.SchemaDeltaAddTable,
+		Table: "docs",
+		After: &ir.Table{Name: "docs", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "tsv", Type: ir.VerbatimType{Definition: "tsvector"}},
+		}},
+	}}
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "bk-vb"); err == nil {
+		t.Fatal("toward MySQL: err = nil; want the VerbatimType preflight refusal")
+	}
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "sqlite", "bk-vb"); err != nil {
+		t.Fatalf("toward SQLite this gate is documented NOT to apply (the door is the sqlite emitter, later and loud); got %v", err)
+	}
+}
+
 func TestCheckCrossEngineDeltaSupportable_TextIndexRefuses(t *testing.T) {
 	deltas := []*irbackup.SchemaDeltaEntry{{
 		Kind:  irbackup.SchemaDeltaAddTable,

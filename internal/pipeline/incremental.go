@@ -959,12 +959,18 @@ func (b *IncrementalBackup) readSourceSchema(ctx context.Context) (*ir.Schema, e
 	// and then every `backup incremental` failed this read with the
 	// engine's "unsupported data_type" refusal. Bug 110's scoping fixed
 	// the OUT-of-scope sibling only. Same capture-only posture as the
-	// full: the restore-time engine gates stay authoritative — a
-	// verbatim column arriving MID-CHAIN via a delta is refused toward
-	// a non-PG target by CheckCrossEngineDeltaSupportable's VerbatimType
-	// arm (the segment's VerbatimExtensionColumns marker derives from
-	// the FULL's schema only; stated, not silent — the delta gate is
-	// the door that covers the mid-chain arrival).
+	// full: the restore-time engine gates stay authoritative. A
+	// verbatim column arriving MID-CHAIN via a delta (the segment's
+	// VerbatimExtensionColumns marker derives from the FULL's schema
+	// only) is doored per target, and the doors DIFFER — stated per
+	// the gate-scope rule: toward a MySQL-family target,
+	// CheckCrossEngineDeltaSupportable's VerbatimType arm refuses at
+	// chain-restore PREFLIGHT; toward SQLite/D1 that gate early-returns
+	// nil (it is the pgToMySQL arm) and the door is the SQLite
+	// emitter's default-arm refusal on ir.VerbatimType — LOUD, but
+	// mid-restore, after earlier segments' data landed. Both directions
+	// pinned (TestCrossEngineDeltaSupportable_VerbatimMidChainDoors,
+	// TestEmitSQLiteType_RefusesVerbatim).
 	migcore.ApplyVerbatimExtensionPassthrough(sr, migcore.VerbatimBackupSourcePG(b.Source))
 	if b.scope != nil {
 		if scoper, ok := sr.(ir.TableScoper); ok {

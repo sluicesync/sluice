@@ -543,6 +543,18 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			false,
 		},
 		{
+			"Bug 252 equality direction: the two-word cast is fully consumed (the boundary check's positive half)",
+			`(x::double precision > 0)`,
+			`(x > 0)`,
+			true,
+		},
+		{
+			"Bug 252 boundary: an ident byte after the type name falls back to single-word skipping",
+			`(x::double precisionx > 0)`,
+			`(x > 0)`,
+			false,
+		},
+		{
 			"DIFF-2 guard: different numeric literals do not collapse",
 			`(v >= -100000)`,
 			`(v >= '-100001'::integer)`,
