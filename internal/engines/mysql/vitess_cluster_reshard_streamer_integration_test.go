@@ -167,12 +167,18 @@ func TestVitessReshard_StreamerFollowsReshardEndToEnd(t *testing.T) {
 			case <-tick.C:
 				if _, e := db.ExecContext(writerCtx,
 					"INSERT INTO ledger (id, memo) VALUES (?, ?)", id, fmt.Sprintf("w-%d", id)); e != nil {
+					// AMBIGUOUS outcome: the error (a SwitchTraffic-window
+					// rejection OR a shutdown cancellation mid-flight) may
+					// follow a server-side commit — the row's presence
+					// decides, not the error (see rowExistsByID; the
+					// 2026-08-09 +1 sanity failure was this premise).
+					if rowExistsByID(db, "SELECT 1 FROM ledger WHERE id = ?", id) {
+						committed.add(id, fmt.Sprintf("w-%d", id))
+						id++
+					}
 					if errors.Is(e, context.Canceled) {
 						return
 					}
-					// Mid-SwitchTraffic write rejection: that id was NOT
-					// committed, so don't record it. Keep the same id and
-					// retry on the next tick.
 					continue
 				}
 				committed.add(id, fmt.Sprintf("w-%d", id))

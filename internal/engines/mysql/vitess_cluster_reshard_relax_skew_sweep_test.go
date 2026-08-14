@@ -1008,6 +1008,11 @@ func TestVitessReshard_RelaxSkewReshardMidStream(t *testing.T) {
 			case <-tick.C:
 				if _, e := db.ExecContext(writerCtx,
 					"INSERT INTO ledger (id, memo) VALUES (?, ?)", id, fmt.Sprintf("w-%d", id)); e != nil {
+					// AMBIGUOUS outcome — probe decides (rowExistsByID doc).
+					if rowExistsByID(db, "SELECT 1 FROM ledger WHERE id = ?", id) {
+						committed.add(id, fmt.Sprintf("w-%d", id))
+						id++
+					}
 					if errors.Is(e, context.Canceled) {
 						return
 					}

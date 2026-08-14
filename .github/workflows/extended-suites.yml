@@ -555,3 +555,38 @@ jobs:
         run: |
           go test -tags='integration ddlfixture' -count=1 -timeout=40m \
             -run '^TestDDLFixture' -v ./internal/translate/...
+
+  # TESTCI-1 (audit filing; built 2026-08-14): the weekly suites were
+  # RED for three-plus weeks and nothing consumed the verdict — the
+  # reds aged silently until a manual triage decomposed them. This job
+  # makes a scheduled red impossible to miss: it files ONE standing
+  # issue (or comments on the open one) naming the failed run, so the
+  # signal lands in the issue list instead of an unread Actions tab.
+  # The publish checklist's companion sentence lives in CLAUDE.md.
+  # Scheduled runs only — dispatch/triage runs are already being
+  # watched by whoever dispatched them.
+  report-red:
+    name: File/refresh the standing red issue (scheduled runs)
+    needs: [chaos, reshard, noblob, vstream-pipeline, corpus, kmsverify, crossversion, ddlfixture]
+    if: ${{ always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File or comment the standing issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="extended-suites: scheduled run is RED"
+          failed=""
+          for j in chaos:${{ needs.chaos.result }} reshard:${{ needs.reshard.result }} noblob:${{ needs.noblob.result }} vstream-pipeline:${{ needs['vstream-pipeline'].result }} corpus:${{ needs.corpus.result }} kmsverify:${{ needs.kmsverify.result }} crossversion:${{ needs.crossversion.result }} ddlfixture:${{ needs.ddlfixture.result }}; do
+            case "$j" in *:failure) failed="$failed ${j%%:*}";; esac
+          done
+          body="Scheduled extended-suites run failed on:${failed}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (commit ${{ github.sha }}). Triage per the TESTCI-1 protocol: pull each failed leg's assertion from --log-failed, three-phase real-vs-artifact, close this issue when the next scheduled run is green."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

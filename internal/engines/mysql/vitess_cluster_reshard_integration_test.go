@@ -894,8 +894,13 @@ func TestVitessReshard_ChaosExactlyOnce(t *testing.T) {
 				owner := fmt.Sprintf("w-%d", id)
 				if _, e := db.ExecContext(writerCtx,
 					"INSERT INTO account (id, owner) VALUES (?, ?)", id, owner); e != nil {
-					// Mid-SwitchTraffic vtgate can briefly reject writes;
-					// that id was NOT committed, so don't record it.
+					// AMBIGUOUS outcome: a SwitchTraffic-window rejection
+					// or shutdown cancellation may follow a server-side
+					// commit — probe decides (rowExistsByID doc).
+					if rowExistsByID(db, "SELECT 1 FROM account WHERE id = ?", id) {
+						committed.add(id, owner)
+						id++
+					}
 					if errors.Is(e, context.Canceled) {
 						return
 					}
@@ -1121,6 +1126,24 @@ func TestVitessReshard_ChaosExactlyOnce(t *testing.T) {
 
 // committedSet records ids the writer successfully COMMITTed to the
 // source (the oracle's ground truth for "what must appear").
+// rowExistsByID disambiguates an AMBIGUOUS write outcome: an INSERT
+// that errors client-side during the SwitchTraffic buffering window
+// (or is cancelled mid-flight at writer shutdown) can still have
+// COMMITTED server-side. The suites' writers used to treat every
+// insert error as "not committed, retry the same id" — a false premise
+// this suite measured on 2026-08-09 (TESTCI-1 triage): one ambiguous
+// commit left the source ledger +1 ahead of the recorded set (the
+// "source itself lost/gained rows" sanity failure), and the retried id
+// then duplicate-keys forever, freezing the writer. After ANY insert
+// error, the row's presence — probed on a fresh context so it works
+// during shutdown too — decides, not the error.
+func rowExistsByID(db *sql.DB, probeSQL string, id int64) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var one int
+	return db.QueryRowContext(ctx, probeSQL, id).Scan(&one) == nil
+}
+
 type committedSet struct {
 	mu sync.Mutex
 	m  map[int64]string
