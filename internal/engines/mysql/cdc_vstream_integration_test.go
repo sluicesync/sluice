@@ -985,3 +985,34 @@ func TestVStream_EnsureDatabase_ProbeFirst(t *testing.T) {
 		t.Errorf("hint must carry both runnable remedies: %s", ce.Hint)
 	}
 }
+
+// TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen pins the
+// 2026-08-14 measurement's fix: a SHARDED keyspace as write target
+// refuses at OpenSchemaWriter with SLUICE-E-SCHEMA-TARGET-KEYSPACE-
+// SHARDED, before any DDL — the measured alternative was CREATE TABLE
+// succeeding on every shard, Error 1173 at the first row write, and a
+// nondeterministic schema-tracker race as the surfaced error. The
+// unsharded direction (no over-refusal) is every other vstream test in
+// this file: they all open schema writers against the 1-shard
+// keyspace; the explicit pin here is the 2-shard refusal.
+func TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen(t *testing.T) {
+	mysqlDSN, _, keyspace, cleanup := startVTTestServerWithShards(t, 2)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sw, err := (Engine{Flavor: FlavorVitess}).OpenSchemaWriter(ctx, mysqlDSN)
+	if err == nil {
+		closeIfCloser(sw)
+		t.Fatalf("OpenSchemaWriter on the SHARDED keyspace %q succeeded — the measured late/dirty failure shape (CREATE on every shard, 1173 at first row) is back in reach", keyspace)
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeSchemaTargetKeyspaceSharded {
+		t.Fatalf("want %s, got %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
+	}
+	for _, want := range []string{"2 shards", "-80", "80-", "no vindex"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q:\n%v", want, err)
+		}
+	}
+}

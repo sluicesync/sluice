@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -122,6 +123,20 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	if err := e.checkServerFlavor(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// Sharded-target preflight (measured 2026-08-14, the ingestr-survey
+	// item-4 close-out): sluice's created tables carry no vindex, and on
+	// a SHARDED keyspace the failure is late, dirty, and nondeterministic
+	// — CREATE TABLE succeeds and materializes on EVERY shard, the
+	// vindex refusal (Error 1173) waits for the first row write, and the
+	// error the run actually surfaced was a vtgate schema-tracker race
+	// (Error 1105 "table not found" on a table just created). Refuse
+	// before any DDL instead, while the target is untouched.
+	if e.Flavor.usesVStream() {
+		if err := refuseShardedTargetKeyspace(ctx, cfg, cfg.DBName); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	// Thread the flavor so the overlapped index-build path (ADR-0080) can
 	// decline the overlap on PlanetScale/Vitess targets and fall back to
@@ -624,6 +639,52 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 		return fmt.Errorf("mysql: create database %q: %w", database, wrapDDLError(err))
 	}
 	return nil
+}
+
+// refuseShardedTargetKeyspace is the sharded-write-target door
+// (measured 2026-08-14 on a real 2-shard cluster; the pre-existing
+// comment claiming "fails LOUDLY at CREATE TABLE (VT09001)" was
+// falsified by that measurement — see the OpenSchemaWriter call site
+// for what actually happens). Every table sluice creates is
+// vindex-less, so a sharded keyspace can never receive them cleanly;
+// an UNSHARDED keyspace (one "-" shard) passes untouched. A probe
+// failure WARNs and proceeds rather than refusing — a transient
+// discovery error must not break a working unsharded target (the
+// ingestr review's probe-fails-silently sub-case: surfaced, not
+// swallowed at DEBUG) — the run then degrades to the measured late
+// failure, never to silent loss (no rows land on any shard).
+//
+// Stated boundary: this refuses sluice-created tables on sharded
+// keyspaces, which is every write shape sluice has today. A future
+// vschema-aware mode that creates tables WITH vindexes would lift the
+// door for its own writes.
+func refuseShardedTargetKeyspace(ctx context.Context, cfg *mysqldriver.Config, keyspace string) error {
+	if keyspace == "" {
+		return nil
+	}
+	shardMap, err := discoverAllShardsForKeyspace(ctx, cfg, keyspace)
+	if err != nil {
+		slog.WarnContext(ctx,
+			"mysql: sharded-target preflight could not enumerate shards; proceeding — a genuinely sharded "+
+				"keyspace will fail at the first row write (Error 1173) instead of this preflight",
+			slog.String("keyspace", keyspace),
+			slog.String("err", err.Error()))
+		return nil
+	}
+	shards := shardMap[keyspace]
+	if len(shards) <= 1 {
+		return nil
+	}
+	return sluicecode.Wrap(sluicecode.CodeSchemaTargetKeyspaceSharded,
+		"point the target at an UNSHARDED keyspace (create one on the platform), or design the vschema/vindexes "+
+			"platform-side and load through Vitess-native tooling — sluice's created tables carry no vindex",
+		fmt.Errorf(
+			"mysql: target keyspace %q is SHARDED (%d shards: %s), and sluice's created tables carry no vindex — "+
+				"CREATE TABLE would succeed and materialize the table on every shard, then the first row write "+
+				"fails (Error 1173: no primary vindex), leaving per-shard debris vtgate cannot route to. "+
+				"Refusing before any DDL, while the target is untouched",
+			keyspace, len(shards), strings.Join(shards, ", "),
+		))
 }
 
 // serverDatabaseExists reports whether database exists on the server

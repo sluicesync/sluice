@@ -81,10 +81,15 @@ func selectControlKeyspace(targetShardCount int, candidateKeyspaces []string, da
 //   - VStream target, flag unset → auto-detect (see [selectControlKeyspace]).
 //
 // A shard-discovery failure (endpoint isn't really Vitess, transient error) is
-// NOT fatal: it falls back to "" (unchanged behaviour) with a DEBUG log. A
-// genuinely sharded target then still fails LOUDLY at CREATE TABLE (VT09001)
-// rather than silently — the loud-failure tenet holds either way. The only
-// loud refusals here are the sharded-but-ambiguous cases surfaced by
+// NOT fatal: it falls back to "" (unchanged behaviour) with a DEBUG log.
+// (This comment used to claim a sharded target "still fails LOUDLY at CREATE
+// TABLE (VT09001)" — FALSIFIED by the 2026-08-14 measurement: CREATE TABLE
+// succeeds and materializes on every shard, the vindex refusal waits for the
+// first row write, and the surfaced error was a nondeterministic
+// schema-tracker race. The refusal that actually holds the tenet is the
+// schema-writer-open sharded-target preflight,
+// SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED — see refuseShardedTargetKeyspace.)
+// The only loud refusals here are the sharded-but-ambiguous cases surfaced by
 // selectControlKeyspace.
 func (e Engine) ResolveControlKeyspace(ctx context.Context, dsn, explicitFlag string) (string, error) {
 	if explicitFlag != "" {
