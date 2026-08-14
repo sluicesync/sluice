@@ -368,7 +368,17 @@ func writeRowsBatched(t *testing.T, ctx context.Context, dsn string, table *ir.T
 // readTableIR reads the named table's IR descriptor from the live schema.
 func readTableIR(t *testing.T, ctx context.Context, dsn, name string) *ir.Table {
 	t.Helper()
-	sr, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	return readTableIRFlavored(t, ctx, dsn, name, FlavorVanilla)
+}
+
+// readTableIRFlavored is readTableIR with an explicit flavor: the
+// vstream interpolation suite reads through a vtgate, where the
+// vanilla flavor now REFUSES at connect (the item-10 fingerprint arm —
+// its refusal firing on this helper's old vanilla open is what
+// surfaced the harness misconfiguration).
+func readTableIRFlavored(t *testing.T, ctx context.Context, dsn, name string, f Flavor) *ir.Table {
+	t.Helper()
+	sr, err := Engine{Flavor: f}.OpenSchemaReader(ctx, dsn)
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}

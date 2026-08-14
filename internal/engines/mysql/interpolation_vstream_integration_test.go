@@ -95,8 +95,8 @@ func TestVStream_InterpolationResidualFamilies_ByteExact(t *testing.T) {
 		nullRow(10),
 	}
 
-	tblCtl := readTableIR(t, ctx, base, "vsif_ctl")
-	tblItp := readTableIR(t, ctx, base, "vsif_itp")
+	tblCtl := readTableIRFlavored(t, ctx, base, "vsif_ctl", FlavorVitess)
+	tblItp := readTableIRFlavored(t, ctx, base, "vsif_itp", FlavorVitess)
 	if err := writeRowsBatched(t, ctx, ctlDSN, tblCtl, rows); err != nil {
 		t.Fatalf("vtgate binary-protocol control write: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestVStream_InterpolationResidualFamilies_ByteExact(t *testing.T) {
 	// the full-scan display-rounding fix) must PARSE and evaluate through
 	// vtgate too: a real full-scan read over the vtgate MySQL port must
 	// hand back the exact float32-widened doubles, −0 sign included.
-	rr, err := Engine{}.OpenRowReader(ctx, ctlDSN)
+	rr, err := Engine{Flavor: FlavorVitess}.OpenRowReader(ctx, ctlDSN)
 	if err != nil {
 		t.Fatalf("vtgate OpenRowReader: %v", err)
 	}
