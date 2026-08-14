@@ -213,6 +213,44 @@ func (r *ChainRestore) refuseUnrepresentableTargetShape(ctx context.Context, sch
 	return migcore.PreflightTableNameFold(ctx, r.Target, r.TargetDSN, sv, "chain restore")
 }
 
+// preflightCrossEngineSupportable is the Phase-5 cross-engine gate over
+// the root full's schema and every link's deltas — carved out of Run
+// (which is at its funlen ceiling) as a coherent phase, like
+// refuseUnrepresentableTargetShape before it. Filter-aware like the
+// single-manifest twin (the c943d7e7 lesson's last sibling, filed by
+// the pre-v0.125.0 value-fidelity review): a PG-only construct in an
+// excluded table or delta must not refuse the restore that excludes it
+// — the refusal's own message names `--exclude-table` as the remedy.
+func (r *ChainRestore) preflightCrossEngineSupportable(root lineage.SegmentRecord, links []lineage.SegmentRecord) error {
+	if err := migcore.CheckCrossEngineSupportable(
+		filteredSchemaView(root.Manifest.Schema, r.Filter),
+		root.Manifest.SourceEngine, r.Target.Name(),
+		fmt.Sprintf("chain restore: full %s", lineage.ManifestBackupID(root.Manifest)),
+	); err != nil {
+		return err
+	}
+	for _, link := range links[1:] {
+		deltas := link.Manifest.SchemaDelta
+		if !r.Filter.IsEmpty() {
+			kept := make([]*irbackup.SchemaDeltaEntry, 0, len(deltas))
+			for _, d := range deltas {
+				if d != nil && r.Filter.Allows(d.Table) {
+					kept = append(kept, d)
+				}
+			}
+			deltas = kept
+		}
+		if err := migcore.CheckCrossEngineDeltaSupportable(
+			deltas,
+			root.Manifest.SourceEngine, r.Target.Name(),
+			lineage.ManifestBackupID(link.Manifest),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Run executes the lineage-walk restore (ADR-0046 §3). Returns nil on
 // success.
 //
@@ -294,21 +332,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    schema + every link's delta for unsupportable types.
 	crossEngine := root.Manifest.SourceEngine != r.Target.Name() && root.Manifest.SourceEngine != ""
 	if crossEngine {
-		if err := migcore.CheckCrossEngineSupportable(
-			root.Manifest.Schema,
-			root.Manifest.SourceEngine, r.Target.Name(),
-			fmt.Sprintf("chain restore: full %s", lineage.ManifestBackupID(root.Manifest)),
-		); err != nil {
+		if err := r.preflightCrossEngineSupportable(root, links); err != nil {
 			return err
-		}
-		for _, link := range links[1:] {
-			if err := migcore.CheckCrossEngineDeltaSupportable(
-				link.Manifest.SchemaDelta,
-				root.Manifest.SourceEngine, r.Target.Name(),
-				lineage.ManifestBackupID(link.Manifest),
-			); err != nil {
-				return err
-			}
 		}
 		slog.InfoContext(
 			ctx, "chain restore: cross-engine mode",

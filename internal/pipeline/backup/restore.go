@@ -598,11 +598,16 @@ func (r *Restore) Run(ctx context.Context) error {
 	//       why nothing else caught it). Same recorded-SourceEngine vs
 	//       target-name dispatch as chain_restore.go step 2, gated
 	//       BEFORE the retarget so the refusal sees the source-true
-	//       schema, and BEFORE the table filter for path-consistency
-	//       with the chain (which also gates its root's full schema).
+	//       schema — and over the FILTERED view (the c943d7e7 lesson's
+	//       last sibling, filed by the pre-v0.125.0 value-fidelity
+	//       review): a PG-only construct in an EXCLUDED table must not
+	//       refuse the restore that excludes it, or the gate defeats
+	//       its own remedy. The chain path filters identically, so the
+	//       path-consistency this comment used to cite pre-filter now
+	//       holds post-filter.
 	if manifest.SourceEngine != "" && manifest.SourceEngine != r.Target.Name() {
 		if err := migcore.CheckCrossEngineSupportable(
-			manifest.Schema,
+			filteredSchemaView(manifest.Schema, r.Filter),
 			manifest.SourceEngine, r.Target.Name(),
 			fmt.Sprintf("restore: full %s", lineage.ManifestBackupID(manifest)),
 		); err != nil {

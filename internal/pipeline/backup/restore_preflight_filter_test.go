@@ -5,10 +5,14 @@ package backup
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -207,4 +211,81 @@ func TestFilteredSchemaView(t *testing.T) {
 	if filteredSchemaView(nil, excl) != nil {
 		t.Error("nil schema must stay nil")
 	}
+}
+
+// mysqlNamedRecordingEngine reports Name()="mysql" so the cross-engine
+// supportability gate's PG→MySQL arm engages (it dispatches on
+// IsMySQLFamilyEngine(target)).
+type mysqlNamedRecordingEngine struct{ *preflightRecordingEngine }
+
+func (mysqlNamedRecordingEngine) Name() string { return "mysql" }
+
+// TestRestoreRun_CrossEngineSupportable_HonoursTheTableFilter closes
+// the LAST sibling of the c943d7e7 filter-blind-door class (filed by
+// the pre-v0.125.0 value-fidelity review): the Bug 134 cross-engine
+// supportability gate graded the UNFILTERED manifest schema, so a
+// PG-only construct (here a Z-dimensional geometry, which the gate
+// refuses toward MySQL-family targets with the ST_Force2D remedy) in
+// an EXCLUDED table refused the whole cross-engine restore.
+// Unfiltered must refuse with that message; with the table excluded,
+// the run must get PAST the gate — proven by it reaching the stub
+// engine's deliberate OpenSchemaWriter panic, i.e. a later phase.
+func TestRestoreRun_CrossEngineSupportable_HonoursTheTableFilter(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func() (*Restore, *memStore) {
+		store := newMemStore()
+		schema := &ir.Schema{Tables: []*ir.Table{
+			{Name: "spatialz", Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "g", Type: ir.Geometry{HasZ: true}},
+			}},
+			{Name: "plain", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		}}
+		m := bug243Manifest("full0001", schema)
+		m.SourceEngine = "postgres"
+		m.BackupID = irbackup.ComputeBackupID(m)
+		if err := lineage.WriteManifest(ctx, store, m); err != nil {
+			t.Fatal(err)
+		}
+		_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, m, lineage.ManifestFileName, blobcodec.DefaultCodec)
+		return &Restore{
+			Store:     store,
+			Target:    mysqlNamedRecordingEngine{newPreflightRecordingEngine()},
+			TargetDSN: "dsn",
+		}, store
+	}
+
+	// Unfiltered: the cross-engine gate refuses on the Z geometry.
+	r, _ := seed()
+	err := runRecovering(r, ctx)
+	if err == nil || !strings.Contains(err.Error(), "ST_Force2D") {
+		t.Fatalf("unfiltered cross-engine restore did not raise the Z-geometry refusal: %v", err)
+	}
+
+	// Excluded: the gate releases — the run gets past it and reaches
+	// the stub's deliberate later-phase panic (surfaced as an error by
+	// runRecovering), which must NOT be the cross-engine refusal.
+	r, _ = seed()
+	excl, ferr := migcore.NewTableFilter(nil, []string{"spatialz"})
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	r.Filter = excl
+	err = runRecovering(r, ctx)
+	if err != nil && strings.Contains(err.Error(), "ST_Force2D") {
+		t.Fatalf("--exclude-table on the Z-geometry table still raises the cross-engine refusal — the gate defeats its own remedy: %v", err)
+	}
+}
+
+// runRecovering runs Restore.Run, converting the stub engine's
+// deliberate "called past the gate" panic into an error so tests can
+// assert WHICH phase a run reached.
+func runRecovering(r *Restore, ctx context.Context) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic (a later phase was reached): %v", p)
+		}
+	}()
+	return r.Run(ctx)
 }
