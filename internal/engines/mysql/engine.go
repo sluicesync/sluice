@@ -406,6 +406,24 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 	if err != nil {
 		return nil, err
 	}
+	// Sharded-target door, the state-store arm (Bug 250, found by the
+	// v0.126.0 regression cycle): the migrate pipeline opens THIS store
+	// (phase 1.75) BEFORE the schema writer, and loadOrInitState
+	// materializes `sluice_migrate_state` + progress tables — so with
+	// the door only on OpenSchemaWriter, a migrate at a sharded
+	// keyspace landed state tables on every shard and died on the
+	// raced Error 1105/1173 the v0.126.0 preflight claimed closed. The
+	// door guards every engine entry that materializes objects on the
+	// target keyspace; this was the missed sibling (OpenChangeApplier
+	// stays deliberately un-doored — resumed syncs on vschema'd
+	// keyspaces; the sync control tables route through the unsharded
+	// sidecar keyspace).
+	if e.Flavor.usesVStream() {
+		if err := refuseShardedTargetKeyspace(ctx, cfg, cfg.DBName); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	return newMigrationStateStore(db, e.Flavor.upsertSpelling()), nil
 }
 

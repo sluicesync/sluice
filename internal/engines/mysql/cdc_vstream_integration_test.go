@@ -27,6 +27,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -35,8 +36,14 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/sluicecode"
+
+	// Registers the sqlite engine + driver for the Bug 250 flow arm's
+	// cheap containerless source.
+	_ "sluicesync.dev/sluice/internal/engines/sqlite"
 )
 
 // startVTTestServer boots a vitess/vttestserver container with one
@@ -1014,5 +1021,85 @@ func TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal does not name %q:\n%v", want, err)
 		}
+	}
+
+	// Arm 2 — the STATE-STORE door (Bug 250, filed by the v0.126.0
+	// regression cycle): the migrate pipeline opens the migration-state
+	// store BEFORE the schema writer, so with the door only on
+	// OpenSchemaWriter a real migrate materialized sluice_migrate_state
+	// on every shard and died on the raced 1105/1173 — the exact shape
+	// the v0.126.0 preflight claimed closed. The store open must carry
+	// the same refusal.
+	ms, err := (Engine{Flavor: FlavorVitess}).OpenMigrationStateStore(ctx, mysqlDSN)
+	if err == nil {
+		closeIfCloser(ms)
+		t.Fatalf("OpenMigrationStateStore on the SHARDED keyspace %q succeeded — migrate's phase-1.75 bootstrap would materialize state tables on every shard (Bug 250)", keyspace)
+	}
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeSchemaTargetKeyspaceSharded {
+		t.Fatalf("state-store door: want %s, got %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
+	}
+
+	// Arm 3 — the FLOW (the Bug 250 lesson: the release pin drove the
+	// engine call only, and the flow reached the target through an
+	// earlier, un-doored entry). A REAL cross-engine Migrator at the
+	// sharded keyspace must surface the coded refusal AND leave the
+	// keyspace untouched — no sluice_% table may materialize on any
+	// shard. SQLite source: cheap, no extra container.
+	srcPath := filepath.Join(t.TempDir(), "src.db")
+	srcDB, err := sql.Open("sqlite", srcPath)
+	if err != nil {
+		t.Fatalf("open sqlite source: %v", err)
+	}
+	if _, err := srcDB.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
+		_ = srcDB.Close()
+		t.Fatalf("seed sqlite source: %v", err)
+	}
+	_ = srcDB.Close()
+	sqliteEng, ok2 := engines.Get("sqlite")
+	if !ok2 {
+		t.Fatal("sqlite engine not registered")
+	}
+	vitessEng, ok2 := engines.Get("vitess")
+	if !ok2 {
+		t.Fatal("vitess engine not registered")
+	}
+	mig := &pipeline.Migrator{
+		Source:      sqliteEng,
+		Target:      vitessEng,
+		SourceDSN:   srcPath,
+		TargetDSN:   mysqlDSN,
+		MigrationID: "bug250-sharded-flow",
+	}
+	err = mig.Run(ctx)
+	if err == nil {
+		t.Fatal("a real migrate into the SHARDED keyspace succeeded — the sharded-target door is not reachable from the migrate flow")
+	}
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeSchemaTargetKeyspaceSharded {
+		t.Fatalf("migrate flow: want %s surfaced through the pipeline's wrapping, got %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
+	}
+	// Anti-vacuity for the filing's exact defect: nothing materialized.
+	tdb, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatalf("open target for the leftovers check: %v", err)
+	}
+	defer func() { _ = tdb.Close() }()
+	rows, err := tdb.QueryContext(ctx, "SHOW TABLES LIKE 'sluice%'")
+	if err != nil {
+		t.Fatalf("SHOW TABLES: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var leftovers []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		leftovers = append(leftovers, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("the refused migrate left %v materialized on the sharded keyspace — the door fired AFTER a target write (the Bug 250 shape)", leftovers)
 	}
 }
