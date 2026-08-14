@@ -197,6 +197,7 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteLowerUpperLiteralCollation(expr)
 	expr = rewriteSUBSTR(expr)
 	expr = rewriteMID(expr)
+	expr = rewriteROUNDDefaultScale(expr)
 	expr = rewriteNOWFamily(expr)
 	// v0.11.1 catalog batch — small additive rules. ISNULL runs
 	// before the bool-idiom pass so `COALESCE(ISNULL(x), 0)` flows
@@ -1192,6 +1193,31 @@ func rewriteCHARLENGTH(expr string) string {
 	expr = rewriteFunctionCalls(expr, "CHAR_LENGTH", rename)
 	expr = rewriteFunctionCalls(expr, "CHARACTER_LENGTH", rename)
 	return expr
+}
+
+// rewriteROUNDDefaultScale strips the explicit ZERO scale MySQL's
+// catalog materializes onto ROUND (Bug 252, found by the v0.126.0
+// regression cycle): a user-written CHECK `round(x)` reads back from
+// information_schema as `round(x, 0)` (measured in the DIFF-2
+// rendering corpus, 2026-08-14) — and PostgreSQL's TWO-argument round
+// exists only for `numeric`, so the materialized form dies at CREATE
+// TABLE with 42883 ("function round(double precision, integer) does
+// not exist") on a DOUBLE/FLOAT column, after `schema preview`
+// rendered the doomed DDL without a word. `ROUND(x, 0)` ≡ `ROUND(x)`
+// on both engines for every argument type, so the strip is
+// semantics-exact and unconditional — it merely restores the
+// author's own spelling. A NON-zero scale is meaning and passes
+// through; a `round(dp, 2)` CHECK therefore still fails loudly at
+// CREATE on PG (numeric-only overload) — that wider overload-gap
+// surface is filed for measurement, not silently rewritten (a cast
+// would change the predicate's type arithmetic).
+func rewriteROUNDDefaultScale(expr string) string {
+	return rewriteFunctionCalls(expr, "ROUND", func(args []string) string {
+		if len(args) != 2 || strings.TrimSpace(args[1]) != "0" {
+			return ""
+		}
+		return "ROUND(" + strings.TrimSpace(args[0]) + ")"
+	})
 }
 
 // rewriteLCASE renames MySQL's `LCASE(x)` synonym to PG's `LOWER(x)`.

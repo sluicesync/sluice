@@ -718,6 +718,28 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 			want: "TO_TIMESTAMP(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint)",
 		},
 
+		// ---- ROUND default-scale strip (Bug 252) ----
+		{
+			name: "ROUND's materialized zero scale is stripped — MySQL's catalog adds it, PG's two-arg round is numeric-only",
+			in:   "round(price,0) >= 0",
+			want: "ROUND(price) >= 0",
+		},
+		{
+			name: "a NON-zero ROUND scale is meaning and passes through",
+			in:   "round(price,2) >= 0",
+			want: "round(price,2) >= 0",
+		},
+		{
+			name: "single-arg ROUND is untouched",
+			in:   "ROUND(price) >= 0",
+			want: "ROUND(price) >= 0",
+		},
+		{
+			name: "ROUND zero-scale strip recurses through a nested call",
+			in:   "round(abs(delta), 0) <= 100",
+			want: "ROUND(abs(delta)) <= 100",
+		},
+
 		// ---- CHAR_LENGTH / CHARACTER_LENGTH ----
 		{
 			name: "CHAR_LENGTH renames to LENGTH",

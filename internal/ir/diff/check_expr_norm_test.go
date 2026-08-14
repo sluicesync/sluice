@@ -531,6 +531,18 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			false,
 		},
 		{
+			"Bug 252 DOUBLE arm: PG spells the cast as two-word double precision",
+			`(round(d2,0) >= -(100000))`,
+			`(round(d2) >= ('-100000'::integer)::double precision)`,
+			true,
+		},
+		{
+			"Bug 252 guard: a column NAMED like a multi-word type is not swallowed",
+			`(x::int > double_precision)`,
+			`(x > 0)`,
+			false,
+		},
+		{
 			"DIFF-2 guard: different numeric literals do not collapse",
 			`(v >= -100000)`,
 			`(v >= '-100001'::integer)`,

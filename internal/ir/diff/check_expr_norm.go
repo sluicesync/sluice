@@ -987,11 +987,39 @@ func isBareNumericToken(v string) bool {
 	return i == len(v)
 }
 
+// pgMultiWordCastTypes are the SQL-standard multi-word type names PG's
+// deparser renders in a cast (`::double precision`, measured on the
+// Bug 252 corpus arm — a DOUBLE column's CHECK literal reads back as
+// `('-100000'::integer)::double precision`). Longest-first so
+// `timestamp without time zone` wins over a `time …` prefix. Only the
+// spellings PG's own deparse produces; a name here must be followed by
+// a non-identifier byte to match, so a column named `double_precision`
+// is untouched.
+var pgMultiWordCastTypes = []string{
+	"timestamp without time zone",
+	"timestamp with time zone",
+	"time without time zone",
+	"time with time zone",
+	"character varying",
+	"double precision",
+	"bit varying",
+}
+
 // skipCast consumes a `::type` or `::type[]` suffix starting at the
 // first colon, returning the index just past it. A lone `:` that is not
 // part of a cast is left for the caller (returning i+1 would silently
 // swallow it).
 func skipCast(expr string, i int) int {
+	for _, name := range pgMultiWordCastTypes {
+		end := i + 2 + len(name)
+		if end <= len(expr) && strings.EqualFold(expr[i+2:end], name) &&
+			(end == len(expr) || !isIdentByte(expr[end])) {
+			for end+1 < len(expr) && expr[end] == '[' && expr[end+1] == ']' {
+				end += 2
+			}
+			return end
+		}
+	}
 	j := skipIdent(expr, i+2)
 	if j == i+2 {
 		// `::` with no identifier after it — not a cast we recognise.

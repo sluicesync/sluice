@@ -253,12 +253,22 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 		-- (12 constraints for 13 measured families: ceil and ceiling are one
 		-- arm here because MySQL renders BOTH spellings back as ceiling —
 		-- the spelling pair itself is pinned in the unit matrix.)
+		-- ck_f_round_dbl is Bug 252's exact repro (v0.126.0 cycle): MySQL
+		-- materializes round(d2) as round(d2, 0), and PG's TWO-arg round
+		-- is numeric-only — so on the DOUBLE column the passed-through
+		-- CHECK died at CREATE TABLE (42883) while preview said nothing.
+		-- The translator now strips the materialized zero scale; this
+		-- arm pins the DOUBLE member of the class beside the DECIMAL
+		-- representative (the pin-the-class rule — the two columns hit
+		-- DIFFERENT PG overload sets on an identical sluice code path).
 		CREATE TABLE folded (
 			id INT NOT NULL PRIMARY KEY,
 			v  INT,
 			w  INT,
 			s  VARCHAR(20),
 			d  DECIMAL(10,2),
+			d2 DOUBLE,
+			CONSTRAINT ck_f_round_dbl CHECK (round(d2) >= -100000),
 			CONSTRAINT ck_f_modfn    CHECK (mod(v, 3) >= 0),
 			CONSTRAINT ck_f_between  CHECK (v BETWEEN 1 AND 10),
 			CONSTRAINT ck_f_not      CHECK (NOT (v = 5)),
