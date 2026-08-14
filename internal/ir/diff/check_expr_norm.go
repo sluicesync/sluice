@@ -178,6 +178,18 @@ func rewriteBetween(written, expr string, j int) (out string, next int, ok bool)
 	if p > 0 && strings.IndexByte("+-*/%<>=|&^~!.:", written[p-1]) >= 0 {
 		return "", 0, false
 	}
+	// A bare `not` before the operand is `not v between a and b` —
+	// NOT BETWEEN under MySQL precedence; expanding the BETWEEN alone
+	// would invert the meaning. Bail verbatim (the premise note in
+	// [foldServerRenderings]'s doc).
+	prevEnd := p
+	prevStart := prevEnd
+	for prevStart > 0 && isIdentByte(written[prevStart-1]) {
+		prevStart--
+	}
+	if strings.EqualFold(written[prevStart:prevEnd], "not") {
+		return "", 0, false
+	}
 	a, k, ok := simpleTermEnd(expr, skipSpaces(expr, j))
 	if !ok {
 		return "", 0, false
@@ -288,15 +300,29 @@ func isBoolKeyword(tok string) bool {
 // in an explicit zero round scale, only in BETWEEN-vs-its-expansion, in
 // a pushed-down negation, or in string-vs-number literal spelling of
 // the same number, canonicalize equal — so a hand-edit of exactly that
-// much on a name-matched constraint reports clean. Every one of those
-// collapses is either semantics-exact (between, not-pushdown, mod,
-// round-scale-0) or the servers' own coercion semantics (numeric
-// literal spelling); the original Bug 241 window reasoning (operator
-// decision, 2026-08-11) covers the rest: both sides of every
+// much on a name-matched constraint reports clean. The between /
+// not-pushdown / mod / round-scale-0 collapses are semantics-exact
+// GIVEN GROUPED OPERANDS (premise below); the numeric-literal collapse
+// is NOT semantics-exact in every typing context and is a stated
+// window (see [decodeLiteral]). The original Bug 241 window reasoning
+// (operator decision, 2026-08-11) covers the rest: both sides of every
 // migrate-created pair are renderings of ONE source predicate, and
 // every REAL drift changes more than the decoration. Each fold is
 // pinned in both directions (phantom → clean; a genuinely-different
 // predicate still differs).
+//
+// PREMISE, stated per the premise-naming rule: the structural rewrites
+// (NOT-pushdown, BETWEEN expansion) treat a textual group as the whole
+// parse operand, which on RAW, UNGROUPED input could misbind under
+// MySQL's low NOT/BETWEEN precedence (`not(v = 5) = w`,
+// `not v between 1 and 2`). Both diff inputs are catalog renderings
+// (MySQL information_schema, PG pg_get_constraintdef) or sluice's own
+// emitter, all of which fully parenthesize — and both rewrites also
+// carry a cheap syntactic bail for exactly those ungrouped shapes (a
+// comparison operator immediately after a pushed-down group; a bare
+// `not` before the BETWEEN operand), pinned, so a rendering violating
+// the premise degrades to verbatim (spurious difference), never to a
+// meaning-changed rewrite.
 //
 // It runs on the RAW expression, BEFORE [foldOutsideLiterals], because
 // both folds need real token boundaries: whitespace removal glues
@@ -404,7 +430,7 @@ func foldServerRenderings(expr string) string {
 				// only when the group holds exactly one top-level
 				// comparison and no AND/OR; anything else stays
 				// verbatim (spurious-difference direction).
-				if inner, next, ok := callGroup(expr, j); ok {
+				if inner, next, ok := callGroup(expr, j); ok && !comparisonFollows(expr, next) {
 					if lhs, op, rhs, cok := singleComparison(foldServerRenderings(inner)); cok {
 						if neg, nok := negatedComparison(op); nok {
 							sb.WriteString(lhs)
@@ -426,6 +452,16 @@ func foldServerRenderings(expr string) string {
 		}
 	}
 	return sb.String()
+}
+
+// comparisonFollows reports whether a comparison-operator byte is the
+// first non-space content at i — the ungrouped-precedence bail for the
+// NOT-pushdown fold: raw `not(v = 5) = w` parses as NOT((v=5)=w) under
+// MySQL precedence, so pushing the inner group down would change
+// meaning. See the premise note in [foldServerRenderings]'s doc.
+func comparisonFollows(expr string, i int) bool {
+	i = skipSpaces(expr, i)
+	return i < len(expr) && (expr[i] == '=' || expr[i] == '<' || expr[i] == '>' || expr[i] == '!')
 }
 
 // callParenFollows reports whether a call's opening paren follows the
@@ -875,9 +911,16 @@ func foldOutsideLiterals(expr string) string {
 // decimal tail) is emitted WITHOUT sentinels, making `'-100000'` and
 // `-100000` one token stream. The stated window: a predicate comparing
 // the STRING '123' against one comparing the NUMBER 123 canonicalizes
-// equal — in both engines the comparison coerces to the numeric
-// interpretation anyway, so the collapse tracks the servers' own
-// semantics. The fold is suppressed when the adjacent output byte is an
+// equal. That is NOT semantics-exact in every typing context — against
+// a numeric column both spellings coerce to one comparison, but
+// against a MySQL STRING column `s = '123'` compares as a string while
+// `s = 123` coerces `s` numerically (`'0123'` satisfies one and not
+// the other), and the column's type is unknowable at this layer. The
+// window is accepted on the Bug 241 reasoning (both sides of a
+// migrate-created pair render ONE predicate; only a hand-edit flipping
+// exactly the quoting hits it) and kept deliberately narrow: textual,
+// not numeric, normalization (`'0123'` ≠ `123`, `'1.0'` ≠ `1`). The
+// fold is suppressed when the adjacent output byte is an
 // identifier byte (a MySQL hex literal `x'12'` must not merge into a
 // fictitious `x12` token) and for unterminated literals.
 func decodeLiteral(sb *strings.Builder, expr string, i int) int {

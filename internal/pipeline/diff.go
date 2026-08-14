@@ -466,9 +466,15 @@ type diffRenderOpts struct {
 // the one the prediction exists to produce, so a lazy open would never
 // fire for it.
 //
-// Both engines' OpenSchemaWriter are side-effect-free (connect, plus a
-// version / PostGIS probe); this adds a connection to a command that
-// already opens two, and creates nothing.
+// Both engines' OpenSchemaWriter are side-effect-free against the
+// TARGET (connect, plus version / PostGIS / flavor probes); this adds a
+// connection to a command that already opens two, and creates nothing.
+// The open can still REFUSE — the MySQL writer doors a sharded
+// Vitess/PlanetScale keyspace (SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED)
+// and a flavor mismatch at open — which is why the caller treats a
+// failed open as degradation, not failure: the diff still runs, and
+// only the DDL-suggestion path (previewMissingDDL) surfaces the
+// refusal, exactly where the suggested DDL could not have run anyway.
 func (d *Differ) openTargetSchemaWriter(ctx context.Context) (ir.SchemaWriter, error) {
 	sw, err := d.Target.OpenSchemaWriter(ctx, d.TargetDSN)
 	if err != nil {

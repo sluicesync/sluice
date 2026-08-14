@@ -311,6 +311,25 @@ zero or several. Empty + unsharded/non-Vitess target = unchanged
 (bare table names in the default keyspace); inert on non-MySQL
 targets.
 
+Note the boundary this section lives inside: any run that would
+have sluice CREATE tables in a sharded keyspace (a `migrate`, a
+sync cold-start applying schema, a `restore`) refuses up front at
+schema-writer open with `SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED`
+— sluice-created tables carry no vindex, so nothing sluice writes
+there could route (measured: `CREATE TABLE` "succeeds" onto every
+shard and the failure arrives later, dirty and nondeterministic).
+An unsharded keyspace passes untouched, and a transient
+shard-discovery failure WARNs and proceeds. The scenario above
+therefore reaches a sharded DATA keyspace only with
+platform-created (vindexed) tables and `--schema-already-applied`,
+which skips the schema-writer open entirely. `schema diff` and
+`preview` open the same writer for their DDL suggestions: against
+a sharded keyspace, `preview` reports the same refusal the real
+migrate would hit, and `schema diff` degrades — the comparison
+still runs and reports, but missing-table DDL suggestions refuse
+with this code (the suggested `CREATE TABLE` genuinely could not
+run there).
+
 ### VStream DSN flags
 
 All optional, all default to PlanetScale-friendly behaviour. Ride

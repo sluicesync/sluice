@@ -27,6 +27,11 @@ type previewStubEngine struct {
 	emitErr  error
 	noWriter bool // when true, OpenSchemaWriter returns a writer without DDLPreviewer
 
+	// writerOpenErr, when set, makes OpenSchemaWriter FAIL with it —
+	// modeling an open-time refusal (the sharded-keyspace door, a
+	// flavor mismatch) for the diff degradation pin.
+	writerOpenErr error
+
 	// emitColDef, when set, is invoked by the writer's
 	// EmitColumnDef method (satisfying ir.ColumnDDLPreviewer) so
 	// diff tests can drive the per-column DDL rendering path
@@ -41,6 +46,9 @@ func (e *previewStubEngine) OpenSchemaReader(_ context.Context, _ string) (ir.Sc
 }
 
 func (e *previewStubEngine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, error) {
+	if e.writerOpenErr != nil {
+		return nil, e.writerOpenErr
+	}
 	if e.noWriter {
 		return &previewStubBareWriter{}, nil
 	}

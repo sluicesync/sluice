@@ -278,6 +278,59 @@ func TestRestoreRun_CrossEngineSupportable_HonoursTheTableFilter(t *testing.T) {
 	}
 }
 
+// TestChainRestorePreflight_CrossEngineSupportable_HonoursTheTableFilter
+// is the CHAIN twin of the Run-level pin above (the pre-v0.126.0
+// value-fidelity review's Finding 4 — the sibling-sweep applied to the
+// commit that closed "the last filter-blind sibling"): both arms of
+// [ChainRestore.preflightCrossEngineSupportable] — the root schema's
+// filtered view AND each link's per-delta Allows() filtering — must
+// refuse unfiltered and release under --exclude-table, in both
+// directions, on the exact carved-out function.
+func TestChainRestorePreflight_CrossEngineSupportable_HonoursTheTableFilter(t *testing.T) {
+	zTable := &ir.Table{Name: "spatialz", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "g", Type: ir.Geometry{HasZ: true}},
+	}}
+	plain := &ir.Table{Name: "plain", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+
+	record := func(schema *ir.Schema, deltas []*irbackup.SchemaDeltaEntry) lineage.SegmentRecord {
+		return lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{
+			Manifest: &irbackup.Manifest{SourceEngine: "postgres", Schema: schema, SchemaDelta: deltas},
+		}}
+	}
+	preflight := func(filter migcore.TableFilter, root lineage.SegmentRecord, links ...lineage.SegmentRecord) error {
+		r := &ChainRestore{Target: mysqlNamedRecordingEngine{newPreflightRecordingEngine()}, TargetDSN: "dsn", Filter: filter}
+		return r.preflightCrossEngineSupportable(root, append([]lineage.SegmentRecord{root}, links...))
+	}
+	excl, err := migcore.NewTableFilter(nil, []string{"spatialz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("root arm", func(t *testing.T) {
+		root := record(&ir.Schema{Tables: []*ir.Table{zTable, plain}}, nil)
+		if err := preflight(migcore.TableFilter{}, root); err == nil || !strings.Contains(err.Error(), "ST_Force2D") {
+			t.Fatalf("unfiltered chain root did not raise the Z-geometry refusal: %v", err)
+		}
+		if err := preflight(excl, root); err != nil {
+			t.Fatalf("--exclude-table on the root's Z-geometry table still refuses — the chain gate defeats its own remedy: %v", err)
+		}
+	})
+
+	t.Run("delta arm", func(t *testing.T) {
+		root := record(&ir.Schema{Tables: []*ir.Table{plain}}, nil)
+		link := record(nil, []*irbackup.SchemaDeltaEntry{{
+			Kind: irbackup.SchemaDeltaAddTable, Table: "spatialz", After: zTable,
+		}})
+		if err := preflight(migcore.TableFilter{}, root, link); err == nil || !strings.Contains(err.Error(), "ST_Force2D") {
+			t.Fatalf("unfiltered delta did not raise the Z-geometry refusal: %v", err)
+		}
+		if err := preflight(excl, root, link); err != nil {
+			t.Fatalf("--exclude-table on the delta's Z-geometry table still refuses — the per-delta filter is not engaging: %v", err)
+		}
+	})
+}
+
 // runRecovering runs Restore.Run, converting the stub engine's
 // deliberate "called past the gate" panic into an error so tests can
 // assert WHICH phase a run reached.

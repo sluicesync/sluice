@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 func diffSchemaPG() *ir.Schema {
@@ -53,6 +54,74 @@ func diffSchemaPGDrift() *ir.Schema {
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		},
 	}}
+}
+
+// TestDiffer_Run_WriterOpenRefusalDegrades pins the claim written into
+// managed-services.md and the v0.126.0 notes: when the target's
+// OpenSchemaWriter REFUSES at open (the sharded-keyspace door,
+// SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED — or any open-time refusal),
+// `schema diff` degrades rather than dying. The comparison still runs
+// and reports; only the missing-table/column DDL-suggestion path
+// surfaces the refusal, carrying its code — exactly where the
+// suggested DDL could not have run anyway.
+func TestDiffer_Run_WriterOpenRefusalDegrades(t *testing.T) {
+	refusal := sluicecode.Wrap(sluicecode.CodeSchemaTargetKeyspaceSharded,
+		"target an unsharded keyspace",
+		errors.New("mysql: target keyspace \"ks\" is sharded (2 shards)"))
+
+	base := func() *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{{
+			Name:    "users",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		}}}
+	}
+
+	run := func(t *testing.T, src, tgt *ir.Schema) (*irdiff.SchemaDiff, error) {
+		t.Helper()
+		var buf bytes.Buffer
+		d := &Differ{
+			Source:    &previewStubEngine{name: "mysql", schema: src},
+			Target:    &previewStubEngine{name: "mysql", schema: tgt, writerOpenErr: refusal},
+			SourceDSN: "src",
+			TargetDSN: "tgt",
+			Out:       &buf,
+		}
+		return d.Run(context.Background())
+	}
+
+	t.Run("a clean pair still diffs clean", func(t *testing.T) {
+		diff, err := run(t, base(), base())
+		if err != nil {
+			t.Fatalf("Run degraded into failure on a clean pair — the writer-open refusal has become fatal to a read-only diff: %v", err)
+		}
+		if diff.HasChanges() {
+			t.Fatalf("expected no drift; got %+v", diff)
+		}
+	})
+
+	t.Run("drift with nothing missing still reports", func(t *testing.T) {
+		tgt := base()
+		tgt.Tables[0].Columns[0].Type = ir.Varchar{Length: 20} // type change, not an absence
+		diff, err := run(t, base(), tgt)
+		if err != nil {
+			t.Fatalf("Run failed on reportable drift that needs no DDL suggestion: %v", err)
+		}
+		if !diff.HasChanges() {
+			t.Fatal("a genuine column-type drift went unreported under the degraded writer")
+		}
+	})
+
+	t.Run("missing-table suggestions surface the refusal, coded", func(t *testing.T) {
+		tgt := &ir.Schema{Tables: []*ir.Table{}} // users missing on target
+		_, err := run(t, base(), tgt)
+		if err == nil {
+			t.Fatal("expected the DDL-suggestion path to surface the writer-open refusal; got nil")
+		}
+		var coded *sluicecode.CodedError
+		if !errors.As(err, &coded) || coded.Code != sluicecode.CodeSchemaTargetKeyspaceSharded {
+			t.Fatalf("the surfaced error lost its code (want %s): %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
+		}
+	})
 }
 
 func TestDiffer_Run_NoDrift(t *testing.T) {

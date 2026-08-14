@@ -572,6 +572,42 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			`(v = '123')`,
 			true,
 		},
+		{
+			"DIFF-2 premise bail: a comparison after a not-group is ungrouped precedence, left verbatim",
+			`(not(v = 5) = w)`,
+			`((v <> 5) = w)`,
+			false,
+		},
+		{
+			"DIFF-2 premise bail: a bare not before BETWEEN is NOT BETWEEN, left verbatim",
+			`(not v between 1 and 2)`,
+			`(v >= 1 and v <= 2)`,
+			false,
+		},
+		{
+			"DIFF-2 unquote guard: a hex literal does not merge into a fictitious identifier",
+			`(v = x'12')`,
+			`(v = x12)`,
+			false,
+		},
+		{
+			"DIFF-2 unquote guard: a hex literal stays distinct from the quoted digits",
+			`(v = x'12')`,
+			`(v = '12')`,
+			false,
+		},
+		{
+			"DIFF-2 unquote narrowness: no numeric normalization, only spelling",
+			`(v = '0123')`,
+			`(v = 123)`,
+			false,
+		},
+		{
+			"DIFF-2 trim bail: LEADING FROM is unmeasured and stays distinct from plain trim",
+			`(TRIM(LEADING FROM s) = s)`,
+			`(trim(s) = s)`,
+			false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := canonicalCheckExpr(tc.a) == canonicalCheckExpr(tc.b); got != tc.same {
