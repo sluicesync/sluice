@@ -570,6 +570,22 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 	if database == "" {
 		return errors.New("mysql: EnsureDatabase: database name is empty")
 	}
+	// Vitess/PlanetScale: vtgate does not support CREATE DATABASE —
+	// keyspaces are provisioned through the platform, not SQL (a
+	// measured fact from the 2026-08-14 ingestr survey, item 5). The
+	// multi-database fan-out's "vanilla-only" status was previously a
+	// COMMENT on deriveDatabaseDSN with nothing enforcing it; without
+	// this refusal a VStream-flavor fan-out died on a raw vtgate error
+	// mid-run instead of a preflight naming the fix.
+	if e.Flavor.usesVStream() {
+		return fmt.Errorf(
+			"mysql: EnsureDatabase(%q): the %s flavor cannot auto-create databases — vtgate does not "+
+				"support CREATE DATABASE (keyspaces are provisioned through the platform, not SQL). "+
+				"Create the keyspace/database on the target first, or use per-database explicit targets "+
+				"instead of the multi-database fan-out",
+			database, e.Flavor,
+		)
+	}
 	cfg, err := parseServerDSN(dsn)
 	if err != nil {
 		return err

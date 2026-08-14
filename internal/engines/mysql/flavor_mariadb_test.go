@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"testing"
@@ -678,5 +679,30 @@ func TestRefuseVitessUnderNonVStreamFlavor(t *testing.T) {
 		if err := refuseVitessUnderNonVStreamFlavor(v); err != nil {
 			t.Errorf("non-Vitess version %q refused: %v", v, err)
 		}
+	}
+}
+
+// TestEnsureDatabase_VStreamFlavorsRefuse pins the ingestr-survey
+// item-5 guard: vtgate does not support CREATE DATABASE (keyspaces are
+// platform-provisioned), so EnsureDatabase on a VStream flavor refuses
+// BEFORE connecting — previously the multi-database fan-out's
+// "vanilla-only" status was an unenforced comment and a VStream-flavor
+// fan-out died on a raw vtgate error mid-run. The refusal is
+// flavor-gated: it fires before DSN parsing on vitess/planetscale
+// (proven with a garbage DSN — the error is the refusal, not a parse
+// failure), and the vanilla flavor still proceeds to DSN handling.
+func TestEnsureDatabase_VStreamFlavorsRefuse(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range []Flavor{FlavorVitess, FlavorPlanetScale} {
+		err := Engine{Flavor: f}.EnsureDatabase(ctx, "not-even-a-dsn", "db1")
+		if err == nil || !strings.Contains(err.Error(), "CREATE DATABASE") {
+			t.Fatalf("flavor %v: want the vtgate CREATE DATABASE refusal, got %v", f, err)
+		}
+	}
+	// Vanilla proceeds past the flavor gate into DSN parsing (the
+	// garbage DSN errors there — proving the refusal did NOT fire).
+	err := Engine{Flavor: FlavorVanilla}.EnsureDatabase(ctx, "not-even-a-dsn", "db1")
+	if err == nil || strings.Contains(err.Error(), "CREATE DATABASE") {
+		t.Fatalf("vanilla flavor must reach DSN parsing, got %v", err)
 	}
 }
