@@ -150,6 +150,20 @@ The same flavor handles three deployment shapes:
 | Self-hosted Vitess + TLS + auth | TLS | Basic | auto-discovered (or pin `vstream_shards`) |
 | Self-hosted Vitess plaintext (vttestserver, dev) | `?vstream_transport=plaintext` | `?vstream_auth=none` | usually `?vstream_shards=0` |
 
+**How the hosted-PlanetScale CDC connection actually works** (recorded
+2026-08-14, closing a question an external tool's engineering history
+raised — some clients need PlanetScale's separate psdbconnect API for
+external CDC): sluice dials vtgate's **VStream gRPC API directly**,
+through PlanetScale's edge gateway at the connect host on **:443**, TLS
+with per-RPC HTTP Basic credentials — no `vtgateconn.Dial` (whose
+registered dialer overrides caller TLS) and no psdbconnect. This exact
+path is verified live by the psverify suite against a real
+`*.psdb.cloud` branch (first run 2026-07-16, re-runnable on demand).
+The client's gRPC receive ceiling is 128 MiB by default (`?vstream_max_recv_bytes`
+to change it) — deliberately above both gRPC's 4 MiB stock default and
+Vitess's own 16 MiB tuning, because COPY-phase row batches routinely
+exceed both.
+
 Key constraints inherited from the Vitess platform:
 
 - No `LOAD DATA INFILE` (sluice uses batched inserts instead).

@@ -757,6 +757,12 @@ func vstreamDialOptions(cfg *gomysql.Config) ([]grpc.DialOption, string, error) 
 	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
 		grpc.MaxCallRecvMsgSize(maxMsg),
 	))
+	// DELIBERATE ABSENCE (2026-08-14 ingestr-survey verification, item
+	// 3): no gRPC-level keepalive params here. Stream health is handled
+	// at the application layer — cdc_vstream_liveness.go's liveness/
+	// progress/idle windows — which sees stalls a transport ping cannot
+	// (a healthy TCP connection carrying no events). Adding transport
+	// keepalives would duplicate that with a second, blunter timer.
 
 	switch transport {
 	case "", "tls":
