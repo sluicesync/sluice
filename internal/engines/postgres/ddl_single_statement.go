@@ -26,17 +26,35 @@ import (
 // tampering when it is ENABLED; this door holds regardless, on the
 // structural invariant the emitters already guarantee: one statement.
 //
-// The validator understands exactly the quoting the emitters produce —
-// standard single-quoted literals ('' doubling; the read boundary and
-// the 74299e34 escaping chunk guarantee no backslash-escape spellings
-// reach the IR), double-quoted identifiers ("" doubling), and
-// dollar-quoted bodies (the enum-guard DO $$ … $$ block carries
-// internal semicolons, and a hostile enum LABEL containing `$$` would
-// terminate that quoting early — which this validator then sees as a
-// top-level `;` and refuses). One optional trailing semicolon is
+// The validator understands the LEXICAL constructs PostgreSQL does, so
+// a top-level `;` cannot hide inside one of them: standard single-quoted
+// literals ('' doubling; the read boundary and the 74299e34 escaping
+// chunk guarantee no backslash-escape spellings reach the IR),
+// double-quoted identifiers ("" doubling), dollar-quoted bodies (the
+// enum-guard DO $$ … $$ block carries internal semicolons; a `$` that
+// merely CONTINUES an identifier — `col$q$` — is not a quote opener, per
+// PG's rule that a dollar-quote delimiter must not abut a preceding
+// identifier byte), `--` line comments, and `/* … */` block comments
+// (which NEST in PostgreSQL). One optional trailing semicolon is
 // allowed; anything after it, an unbalanced paren, or an unterminated
-// quote refuses with SLUICE-E-DDL-EMIT-MULTI-STATEMENT before the
-// statement reaches the server.
+// quote/comment refuses with SLUICE-E-DDL-EMIT-MULTI-STATEMENT before
+// the statement reaches the server.
+//
+// # Why comments and the dollar-adjacency guard are load-bearing (C-1)
+//
+// The 2026-08-14 audit OBSERVED, end-to-end against real PostgreSQL 16,
+// two bypasses of the original door: (a) it had no comment case, so an
+// apostrophe inside a `/* … */` / `-- …` comment opened a
+// validator-only string literal that scanned past an injected top-level
+// `;` the server then executed (`… /* ' */ ); DROP TABLE canary; -- '`);
+// (b) `dollarQuoteTagAt` treated any `$tag$` as an opener regardless of
+// the preceding byte, so `a$q$ … ; … $q$` looked dollar-quoted to the
+// validator (hiding the `;`) but is one identifier token to PG. Both
+// are closed here. The DERIVED gate — TestSingleStatementDoorMatchesPG,
+// which diffs the door's verdict against a real server for a corpus
+// spanning every PG lexical form — is what keeps the next unenumerated
+// construct from reopening the class; this hand lexer is pinned against
+// the server, never against the author's imagination.
 
 // assertSingleDDLStatement reports a non-nil error when stmt is not
 // structurally a single SQL statement under PostgreSQL quoting rules.
@@ -80,6 +98,14 @@ func assertSingleDDLStatement(stmt string) error {
 			}
 			i = j + 1
 		case '$':
+			// A '$' that continues an identifier (`col$q$`) is not a
+			// dollar-quote opener — PG lexes it as one identifier token
+			// (C-1 Family A). Only a '$' NOT abutting a preceding
+			// identifier byte can open a quote.
+			if i > 0 && isDollarBoundaryIdentByte(stmt[i-1]) {
+				i++
+				continue
+			}
 			tag, ok := dollarQuoteTagAt(stmt, i)
 			if !ok {
 				i++
@@ -90,6 +116,30 @@ func assertSingleDDLStatement(stmt string) error {
 				return fmt.Errorf("unterminated dollar-quoted body (%s) opened at byte %d", tag, i)
 			}
 			i += len(tag) + end + len(tag)
+		case '-':
+			// `-- …` line comment (C-1 Family B). A lone '-' (an
+			// operator) falls through to default.
+			if i+1 < n && stmt[i+1] == '-' {
+				j := i + 2
+				for j < n && stmt[j] != '\n' {
+					j++
+				}
+				i = j
+				continue
+			}
+			i++
+		case '/':
+			// `/* … */` block comment, which NESTS in PostgreSQL
+			// (C-1 Family B). A lone '/' (division) falls through.
+			if i+1 < n && stmt[i+1] == '*' {
+				end, ok := blockCommentEnd(stmt, i)
+				if !ok {
+					return fmt.Errorf("unterminated block comment opened at byte %d", i)
+				}
+				i = end
+				continue
+			}
+			i++
 		case '(':
 			depth++
 			i++
@@ -103,7 +153,7 @@ func assertSingleDDLStatement(stmt string) error {
 			if depth != 0 {
 				return fmt.Errorf("';' inside an unbalanced paren group at byte %d", i)
 			}
-			if rest := strings.TrimSpace(stmt[i+1:]); rest != "" {
+			if rest := trimSpaceAndComments(stmt[i+1:]); rest != "" {
 				return fmt.Errorf("';' at byte %d is followed by more SQL (%.40q…)", i, rest)
 			}
 			i = n
@@ -115,6 +165,73 @@ func assertSingleDDLStatement(stmt string) error {
 		return fmt.Errorf("%d unclosed '(' at end of statement", depth)
 	}
 	return nil
+}
+
+// isDollarBoundaryIdentByte reports whether c is a byte that, when it
+// immediately precedes a '$', makes that '$' a continuation of an
+// identifier rather than a dollar-quote opener (C-1 Family A). PG
+// identifier bytes are letters, digits, and '_'; '$' itself is
+// deliberately EXCLUDED so the untagged `$$` opener (preceded by its own
+// first '$' in the pair) is still recognised — the guard fires on the
+// FIRST '$' via the byte before the pair, not on the second.
+func isDollarBoundaryIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// blockCommentEnd returns the index just past the `*/` that closes the
+// block comment opening at stmt[i] (`/*`), honouring PostgreSQL's
+// NESTING rule (`/* a /* b */ c */` is one comment), or ok=false when
+// the comment is unterminated.
+func blockCommentEnd(stmt string, i int) (end int, ok bool) {
+	depth := 0
+	j := i
+	n := len(stmt)
+	for j+1 < n {
+		switch {
+		case stmt[j] == '/' && stmt[j+1] == '*':
+			depth++
+			j += 2
+		case stmt[j] == '*' && stmt[j+1] == '/':
+			depth--
+			j += 2
+			if depth == 0 {
+				return j, true
+			}
+		default:
+			j++
+		}
+	}
+	return 0, false
+}
+
+// trimSpaceAndComments strips leading whitespace and complete comments
+// from s so a trailing `; -- note` or `; /* note */` after the single
+// statement's terminating semicolon does not read as "more SQL". An
+// unterminated block comment in the tail is returned as-is (non-empty →
+// the caller refuses, the loud direction for a malformed tail).
+func trimSpaceAndComments(s string) string {
+	i := 0
+	n := len(s)
+	for i < n {
+		c := s[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			i++
+		case c == '-' && i+1 < n && s[i+1] == '-':
+			for i < n && s[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && s[i+1] == '*':
+			end, ok := blockCommentEnd(s, i)
+			if !ok {
+				return s[i:] // unterminated block comment — refuse upstream
+			}
+			i = end
+		default:
+			return s[i:]
+		}
+	}
+	return ""
 }
 
 // dollarQuoteTagAt reports the full `$tag$` opener starting at stmt[i]

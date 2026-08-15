@@ -53,6 +53,31 @@ func TestAssertSingleDDLStatement(t *testing.T) {
 			"a $$ inside an enum label terminates the DO-block quoting early",
 			guardedCreateEnumType(`CREATE TYPE "e" AS ENUM ('a$$', 'b'); DROP TABLE "canary";`),
 		},
+		// C-1 Family B (comment-smuggled injection): the ';DROP' is
+		// OUTSIDE the comment; the comment only carries an apostrophe
+		// that a comment-blind door misreads as a string opener. The
+		// server-differential oracle (TestSingleStatementDoorMatchesPG)
+		// proves these inject on a real PG 16.
+		{
+			"a block comment carrying an apostrophe hides a following top-level ;",
+			`ALTER TABLE "t" ADD CONSTRAINT "c" CHECK (true /* ' */ ); DROP TABLE "canary"; -- '`,
+		},
+		{
+			"a line comment carrying an apostrophe hides a following top-level ;",
+			"ALTER TABLE \"t\" ADD CONSTRAINT \"c\" CHECK (true -- '\n); DROP TABLE \"canary\"; -- '",
+		},
+		{
+			"a nested block comment (PG-nesting) still hides nothing after it",
+			`ALTER TABLE "t" ADD CONSTRAINT "c" CHECK (true /* a /* b */ c */ ); DROP TABLE "canary"`,
+		},
+		// C-1 Family A (dollar sign continuing an identifier): `col$q$`
+		// is one identifier token to PG, so the `;` between the `$q$`
+		// pair is top-level — not hidden inside a dollar-quoted body as
+		// a preceding-byte-blind door assumed.
+		{
+			"a $ continuing an identifier is not a dollar-quote opener; the ; is top-level",
+			`col$q$; DROP TABLE "canary"; $q$`,
+		},
 	}
 	for _, tc := range hostile {
 		if err := assertSingleDDLStatement(tc.stmt); err == nil {
