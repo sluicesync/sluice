@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 // TestParseDSN_NoDoubleInvalidPrefix is the GitHub #17 papercut
@@ -329,4 +331,34 @@ func TestDSNShapeHint_PlainPathNoHint(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHardenAgainstMultiStatement pins the H-3 fix (audit 2026-08-15):
+// sluice's MySQL immunity to the C1-1 restore-injection class must not
+// rest on the operator's DSN omitting `multiStatements=true`. openDB
+// forces MultiStatements=false on the connection cfg it actually opens,
+// so the go-sql-driver refuses any second statement (Error 1064) by
+// construction — the MySQL counterpart of the PostgreSQL door. The
+// paired integration test (connect_multistatement_integration_test.go)
+// proves the driver actually refuses; this pins the cfg mutation.
+func TestHardenAgainstMultiStatement(t *testing.T) {
+	// An operator DSN that DID set the flag: it must be cleared.
+	cfg, err := mysqldriver.ParseDSN("root@tcp(h:3306)/db?multiStatements=true")
+	if err != nil {
+		t.Fatalf("ParseDSN: %v", err)
+	}
+	if !cfg.MultiStatements {
+		t.Fatal("precondition: ParseDSN did not set MultiStatements from the DSN — the test would be vacuous")
+	}
+	hardenAgainstMultiStatement(cfg)
+	if cfg.MultiStatements {
+		t.Fatal("hardenAgainstMultiStatement left MultiStatements=true — a multi-statement injection could execute at restore")
+	}
+	// A DSN that did not set it stays off; nil is a no-op, not a panic.
+	plain, _ := mysqldriver.ParseDSN("root@tcp(h:3306)/db")
+	hardenAgainstMultiStatement(plain)
+	if plain.MultiStatements {
+		t.Fatal("MultiStatements became true on a plain DSN")
+	}
+	hardenAgainstMultiStatement(nil)
 }

@@ -764,6 +764,32 @@ func readerZeroDateMode(cfg *mysql.Config) (zeroDateMode, error) {
 // already extracted them before the gRPC dial; it never reaches openDB
 // except via discoverShards, which is a MySQL connection and correctly
 // wants them stripped).
+// hardenAgainstMultiStatement forces `MultiStatements=false` on the
+// connection config sluice actually opens (audit H-3, 2026-08-15). It is
+// the MySQL counterpart of the PostgreSQL single-statement door: every
+// DDL string sluice's emitters produce is ONE statement, and the restore
+// path inlines RECORDED expression bodies (CHECK constraints, generated
+// columns, defaults) verbatim into that DDL. go-sql-driver refuses a
+// multi-statement Exec UNLESS the DSN carries `multiStatements=true` —
+// which sluice never sets, but which the operator's target DSN can carry
+// and which sluice's cfg.Clone() otherwise preserves. That made MySQL's
+// injection immunity rest on an operator-controlled flag rather than on
+// enforcement: a tampered/corrupt manifest whose CHECK body appends
+// `; DROP TABLE …` would then execute as the restore role on a target
+// whose DSN happened to set the flag. Clearing it here — on the
+// vstream-stripped CLONE openDB already works with, so the caller's cfg
+// is untouched — makes the driver itself the door (Error 1064 on any
+// second statement), no hand lexer required. sluice has no code path that
+// needs multi-statement execution on its own connections (grep:
+// MultiStatements has zero non-test references), so this removes a live
+// injection surface and changes no working behaviour.
+func hardenAgainstMultiStatement(cfg *mysql.Config) {
+	if cfg == nil {
+		return
+	}
+	cfg.MultiStatements = false
+}
+
 func stripVStreamParams(cfg *mysql.Config) *mysql.Config {
 	if cfg == nil {
 		return nil
@@ -794,6 +820,7 @@ func stripVStreamParams(cfg *mysql.Config) *mysql.Config {
 // injection are leak-proof against future Open* paths.
 func openDB(ctx context.Context, cfg *mysql.Config, sqlMode *string) (*sql.DB, error) {
 	cfg = stripVStreamParams(cfg)
+	hardenAgainstMultiStatement(cfg)
 	injectSessionSQLMode(cfg, sqlMode)
 	connector, err := mysql.NewConnector(cfg)
 	if err != nil {
