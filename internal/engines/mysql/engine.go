@@ -124,20 +124,22 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 		_ = db.Close()
 		return nil, err
 	}
-	// Sharded-target preflight (measured 2026-08-14, the ingestr-survey
-	// item-4 close-out): sluice's created tables carry no vindex, and on
-	// a SHARDED keyspace the failure is late, dirty, and nondeterministic
-	// — CREATE TABLE succeeds and materializes on EVERY shard, the
-	// vindex refusal (Error 1173) waits for the first row write, and the
-	// error the run actually surfaced was a vtgate schema-tracker race
-	// (Error 1105 "table not found" on a table just created). Refuse
-	// before any DDL instead, while the target is untouched.
-	if e.Flavor.usesVStream() {
-		if err := refuseShardedTargetKeyspace(ctx, cfg, cfg.DBName); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-	}
+	// NOTE (H-2, 2026-08-14): the sharded-target door is NOT here. It used
+	// to fire at OpenSchemaWriter, but this method is opened by MANY paths
+	// that never create a table — the continuous-sync schema-forward writer
+	// (pipeline/schema_forward_engage.go, opened even on warm resume and
+	// with --schema-already-applied), cutover's sequence primer, shard-
+	// consolidation's DDL applier, `schema diff`, and `schema preview` — so
+	// the open-time door OVER-REFUSED sync into a pre-vindexed sharded
+	// keyspace, which the operator has confirmed is a supported flow. The
+	// actual hazard is sluice CREATING a new vindex-less table, so the door
+	// now lives at the true chokepoint: CreateTablesWithoutConstraints (see
+	// SchemaWriter.refuseShardedTargetNewTables). cfg is threaded onto the
+	// writer so that door can enumerate shards. The state-store door in
+	// OpenMigrationStateStore stays (Bug 250 — migrate's phase-1.75 state
+	// bootstrap creates the vindex-less sluice_migrate_state before any
+	// schema writer opens).
+	//
 	// Thread the flavor so the overlapped index-build path (ADR-0080) can
 	// decline the overlap on PlanetScale/Vitess targets and fall back to
 	// the post-copy whole-schema CreateIndexes. The emitter carries the
@@ -145,7 +147,7 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	// string literal this writer emits is escaped for the SAME sql_mode its
 	// connections run under, plus the flavor's cross-family collation
 	// remap (roadmap item 73: utf8mb4_0900_* ↔ utf8mb4_uca1400_*).
-	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor, emitter: newMySQLEmitterForFlavor(e.opts.sqlMode, e.Flavor)}
+	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor, cfg: cfg, emitter: newMySQLEmitterForFlavor(e.opts.sqlMode, e.Flavor)}
 	// Probe SELECT VERSION() once at open so the v0.97.0 inline-CHECK
 	// path knows whether the target is MySQL 8.0.16+. A probe failure
 	// is non-fatal: zero-value inlineCheckSupported (false) preserves
@@ -409,15 +411,16 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 	// Sharded-target door, the state-store arm (Bug 250, found by the
 	// v0.126.0 regression cycle): the migrate pipeline opens THIS store
 	// (phase 1.75) BEFORE the schema writer, and loadOrInitState
-	// materializes `sluice_migrate_state` + progress tables — so with
-	// the door only on OpenSchemaWriter, a migrate at a sharded
-	// keyspace landed state tables on every shard and died on the
-	// raced Error 1105/1173 the v0.126.0 preflight claimed closed. The
-	// door guards every engine entry that materializes objects on the
-	// target keyspace; this was the missed sibling (OpenChangeApplier
-	// stays deliberately un-doored — resumed syncs on vschema'd
-	// keyspaces; the sync control tables route through the unsharded
-	// sidecar keyspace).
+	// materializes `sluice_migrate_state` + progress tables — its own
+	// vindex-less tables — so this arm must refuse at OPEN, before that
+	// bootstrap lands per-shard debris. It stays unconditional even
+	// after the H-2 move of the SCHEMA-writer door to the create
+	// chokepoint (CreateTablesWithoutConstraints): the state store has
+	// no equivalent "the tables already exist" supported case — sluice
+	// always creates its own control tables — so probing existence here
+	// would buy nothing. OpenChangeApplier stays deliberately un-doored
+	// (resumed syncs on vschema'd keyspaces; the sync control tables
+	// route through the unsharded sidecar keyspace).
 	if e.Flavor.usesVStream() {
 		if err := refuseShardedTargetKeyspace(ctx, cfg, cfg.DBName); err != nil {
 			_ = db.Close()
@@ -660,17 +663,27 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 }
 
 // refuseShardedTargetKeyspace is the sharded-write-target door
-// (measured 2026-08-14 on a real 2-shard cluster; the pre-existing
-// comment claiming "fails LOUDLY at CREATE TABLE (VT09001)" was
-// falsified by that measurement — see the OpenSchemaWriter call site
-// for what actually happens). Every table sluice creates is
-// vindex-less, so a sharded keyspace can never receive them cleanly;
-// an UNSHARDED keyspace (one "-" shard) passes untouched. A probe
-// failure WARNs and proceeds rather than refusing — a transient
-// discovery error must not break a working unsharded target (the
-// ingestr review's probe-fails-silently sub-case: surfaced, not
-// swallowed at DEBUG) — the run then degrades to the measured late
-// failure, never to silent loss (no rows land on any shard).
+// (measured 2026-08-14 on a real 2-shard cluster). Every table sluice
+// creates is vindex-less, so a sharded keyspace can never receive them
+// cleanly — CREATE TABLE succeeds and materializes the table on every
+// shard, then the first row write fails Error 1173 (no primary vindex),
+// leaving per-shard debris vtgate cannot route to; an UNSHARDED keyspace
+// (one "-" shard) passes untouched. A probe failure WARNs and proceeds
+// rather than refusing — a transient discovery error must not break a
+// working unsharded target (the ingestr review's probe-fails-silently
+// sub-case: surfaced, not swallowed at DEBUG) — the run then degrades to
+// the measured late failure, never to silent loss (no rows land on any
+// shard).
+//
+// This helper backs the STATE-STORE arm ([Engine.OpenMigrationStateStore],
+// Bug 250): migrate's phase-1.75 bootstrap materializes the vindex-less
+// sluice_migrate_state table before any schema writer opens, so it needs
+// an unconditional refusal at open. The SCHEMA-writer arm no longer uses
+// it (H-2): OpenSchemaWriter is opened by many table-free paths, so its
+// door moved to the true create chokepoint — see
+// [SchemaWriter.refuseShardedTargetNewTables], which refuses only when a
+// table would actually be CREATED (a pre-vindexed keyspace whose tables
+// all already exist is the supported sync case and passes).
 //
 // Stated boundary: this refuses sluice-created tables on sharded
 // keyspaces, which is every write shape sluice has today. A future

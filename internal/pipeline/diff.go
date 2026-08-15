@@ -481,12 +481,17 @@ type diffRenderOpts struct {
 // Both engines' OpenSchemaWriter are side-effect-free against the
 // TARGET (connect, plus version / PostGIS / flavor probes); this adds a
 // connection to a command that already opens two, and creates nothing.
-// The open can still REFUSE — the MySQL writer doors a sharded
-// Vitess/PlanetScale keyspace (SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED)
-// and a flavor mismatch at open — which is why the caller treats a
-// failed open as degradation, not failure: the diff still runs, and
-// only the DDL-suggestion path (previewMissingDDL) surfaces the
-// refusal, exactly where the suggested DDL could not have run anyway.
+// The open can still REFUSE — the MySQL writer doors a flavor mismatch
+// at open (a mariadb-flavor DSN pointed at a non-MariaDB server, or a
+// plain-mysql target that fingerprints as MariaDB) — which is why the
+// caller treats a failed open as degradation, not failure: the diff
+// still runs, and only the DDL-suggestion path (previewMissingDDL)
+// surfaces the refusal, exactly where the suggested DDL could not have
+// run anyway. (A SHARDED Vitess/PlanetScale target no longer refuses
+// here: the sharded-target door moved to the create chokepoint,
+// CreateTablesWithoutConstraints, which `schema diff` never calls — H-2,
+// 2026-08-14. Diff is read-only, so this is correct: it inspects a
+// sharded target without over-refusing.)
 func (d *Differ) openTargetSchemaWriter(ctx context.Context) (ir.SchemaWriter, error) {
 	sw, err := d.Target.OpenSchemaWriter(ctx, d.TargetDSN)
 	if err != nil {

@@ -87,8 +87,11 @@ func selectControlKeyspace(targetShardCount int, candidateKeyspaces []string, da
 // succeeds and materializes on every shard, the vindex refusal waits for the
 // first row write, and the surfaced error was a nondeterministic
 // schema-tracker race. The refusal that actually holds the tenet is the
-// schema-writer-open sharded-target preflight,
-// SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED — see refuseShardedTargetKeyspace.)
+// sharded-target door, SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED — at the
+// CREATE chokepoint for the schema writer ([SchemaWriter.refuseShardedTargetNewTables],
+// H-2, which lets a pre-vindexed existing table through) and at
+// OpenMigrationStateStore for migrate's state bootstrap — see
+// refuseShardedTargetKeyspace.)
 // The only loud refusals here are the sharded-but-ambiguous cases surfaced by
 // selectControlKeyspace.
 func (e Engine) ResolveControlKeyspace(ctx context.Context, dsn, explicitFlag string) (string, error) {

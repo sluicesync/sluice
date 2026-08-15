@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -39,6 +41,15 @@ import (
 type SchemaWriter struct {
 	db     *sql.DB
 	schema string
+
+	// cfg is the parsed DSN this writer was opened with, threaded from
+	// [Engine.OpenSchemaWriter] so the sharded-target create door
+	// ([SchemaWriter.refuseShardedTargetNewTables], H-2) can enumerate the
+	// target keyspace's shards via [discoverAllShardsForKeyspace] (which
+	// needs the *mysqldriver.Config, not just the schema name). nil on a
+	// bare-struct test writer — the door treats nil as "cannot enumerate,
+	// proceed", the same WARN-and-proceed posture a discovery failure takes.
+	cfg *mysqldriver.Config
 
 	// emitter carries this writer's resolved DDL-emit policy — the sql_mode
 	// backslash-escaping rule for SQL string literals (task 2.5). Built once at
@@ -170,6 +181,9 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if err := w.refuseFoldedTableNames(ctx, s); err != nil {
 		return err
 	}
+	if err := w.refuseShardedTargetNewTables(ctx, s); err != nil {
+		return err
+	}
 	w.maybeWarnRLSDrop(ctx, s)
 	w.maybeWarnDomainCheckDrop(ctx, s)
 	for _, table := range orderedTables(s) {
@@ -209,6 +223,109 @@ func (w *SchemaWriter) refuseFoldedTableNames(ctx context.Context, s *ir.Schema)
 		return err
 	}
 	return validateMySQLTableNameFold(lct, s.Tables)
+}
+
+// refuseShardedTargetNewTables is the sharded-write-target door at its TRUE
+// chokepoint (H-2, 2026-08-14). It refuses only when sluice would CREATE a
+// new vindex-less table on a SHARDED Vitess/PlanetScale keyspace — the one
+// shape that fails late and dirty (CREATE TABLE succeeds on every shard, the
+// first row write fails Error 1173 for want of a primary vindex, and the
+// surfaced error is a nondeterministic vtgate schema-tracker race).
+//
+// It used to live at [Engine.OpenSchemaWriter], but that open is reached by
+// many table-FREE paths — the continuous-sync schema-forward writer (opened
+// even on warm resume and with --schema-already-applied), cutover's sequence
+// primer, shard-consolidation's DDL applier, `schema diff`, `schema preview`
+// — so the open-time door OVER-REFUSED sync into a pre-vindexed sharded
+// keyspace, an operator-confirmed supported flow. Moving it here covers every
+// create path uniformly (migrate's create phase, `add-table`, broker reset)
+// at the one method that emits CREATE TABLE, and lets the supported case
+// through: when every table in s ALREADY EXISTS on the target the operator
+// pre-created and vindexed them, so the emitter's CREATE TABLE IF NOT EXISTS
+// no-ops and sluice merely streams rows in.
+//
+// Postures, in order:
+//   - not a VStream flavor, or no parsed cfg (a bare-struct test writer):
+//     nothing to enumerate, proceed.
+//   - shard discovery fails: WARN and proceed (same posture as the
+//     state-store door — a transient discovery error must not break a
+//     working unsharded target; a genuinely sharded target then degrades to
+//     the measured late failure, never to silent loss).
+//   - <=1 shard (unsharded keyspace): proceed.
+//   - sharded AND >=1 table in s absent on the target: REFUSE, naming the
+//     shards and the specific new table(s).
+//   - sharded AND every table already present: proceed (the supported
+//     pre-vindexed case).
+//
+// A per-table existence probe that ITSELF errors is returned loudly rather
+// than swallowed: we have already confirmed the keyspace is sharded, so
+// "cannot tell whether this table exists" must not fall through to a
+// vindex-less CREATE — that is exactly the dirty failure this door exists to
+// prevent.
+func (w *SchemaWriter) refuseShardedTargetNewTables(ctx context.Context, s *ir.Schema) error {
+	if !w.flavor.usesVStream() || w.cfg == nil || w.schema == "" {
+		return nil
+	}
+	shardMap, err := discoverAllShardsForKeyspace(ctx, w.cfg, w.schema)
+	if err != nil {
+		slog.WarnContext(ctx,
+			"mysql: sharded-target create preflight could not enumerate shards; proceeding — a genuinely "+
+				"sharded keyspace will fail at the first row write (Error 1173) instead of this preflight",
+			slog.String("keyspace", w.schema),
+			slog.String("err", err.Error()))
+		return nil
+	}
+	shards := shardMap[w.schema]
+	if len(shards) <= 1 {
+		return nil
+	}
+	var newTables []string
+	for _, table := range orderedTables(s) {
+		exists, err := tableExists(ctx, w.db, w.schema, table.Name)
+		if err != nil {
+			return fmt.Errorf("mysql: sharded-target create preflight: probe %q on the sharded keyspace %q: %w",
+				table.Name, w.schema, err)
+		}
+		if !exists {
+			newTables = append(newTables, table.Name)
+		}
+	}
+	if len(newTables) == 0 {
+		// The supported case: the operator pre-created and vindexed every
+		// table; the CREATE TABLE IF NOT EXISTS phase no-ops and sluice
+		// streams rows into the existing, correctly-routed tables.
+		return nil
+	}
+	return sluicecode.Wrap(sluicecode.CodeSchemaTargetKeyspaceSharded,
+		"pre-create these tables on the platform WITH vindexes (then re-run — this door passes once they exist "+
+			"and route), point the target at an UNSHARDED keyspace, or load through Vitess-native tooling — "+
+			"sluice's created tables carry no vindex",
+		fmt.Errorf(
+			"mysql: target keyspace %q is SHARDED (%d shards: %s) and would receive %d NEW table(s) sluice "+
+				"cannot vindex (%s) — CREATE TABLE would succeed and materialize each on every shard, then the "+
+				"first row write fails (Error 1173: no primary vindex), leaving per-shard debris vtgate cannot "+
+				"route to. Refusing before any DDL, while the target is untouched. (Tables that already exist on "+
+				"the keyspace are accepted — pre-vindexed sync is supported.)",
+			w.schema, len(shards), strings.Join(shards, ", "), len(newTables), strings.Join(newTables, ", "),
+		))
+}
+
+// tableExists reports whether schema.table is present in the target's
+// information_schema.tables. Used by [SchemaWriter.refuseShardedTargetNewTables]
+// to tell a NEW table (which sluice would create vindex-less) from one the
+// operator pre-created and vindexed. Parameterized (not `SHOW TABLES LIKE`,
+// whose argument is a LIKE pattern that a table name with `_`/`%` would
+// mis-match); the same TABLE_SCHEMA/TABLE_NAME shape [columnExists] and the
+// concurrent-snapshot row estimator use, which vtgate routes on a sharded
+// keyspace.
+func tableExists(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.tables
+		WHERE table_schema = ? AND table_name = ?)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema, table).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // maybeWarnRLSDrop logs a single WARN per writer lifetime when the

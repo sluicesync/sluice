@@ -993,43 +993,101 @@ func TestVStream_EnsureDatabase_ProbeFirst(t *testing.T) {
 	}
 }
 
-// TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen pins the
-// 2026-08-14 measurement's fix: a SHARDED keyspace as write target
-// refuses at OpenSchemaWriter with SLUICE-E-SCHEMA-TARGET-KEYSPACE-
-// SHARDED, before any DDL — the measured alternative was CREATE TABLE
-// succeeding on every shard, Error 1173 at the first row write, and a
-// nondeterministic schema-tracker race as the surfaced error. The
-// unsharded direction (no over-refusal) is every other vstream test in
-// this file: they all open schema writers against the 1-shard
-// keyspace; the explicit pin here is the 2-shard refusal.
-func TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen(t *testing.T) {
+// TestVStream_ShardedTargetKeyspace_RefusesAtCreateNotOpen pins the H-2
+// fix (2026-08-14): the sharded-write-target door moved from
+// OpenSchemaWriter — which is opened by many TABLE-FREE paths (the
+// continuous-sync schema-forward writer even on warm resume /
+// --schema-already-applied, cutover, shard-consolidation, `schema
+// diff`, `schema preview`), so the open-time door OVER-REFUSED sync
+// into a pre-vindexed sharded keyspace — to the true create chokepoint
+// CreateTablesWithoutConstraints, which refuses ONLY when a NEW
+// vindex-less table would be created and lets a pre-existing
+// (operator-vindexed) table through.
+//
+// Arm 1 pins the regression fix: OpenSchemaWriter on the 2-shard
+// keyspace no longer refuses. Arm 2 pins the create-path refusal for a
+// NEW table. Arm 3 pins the supported case: a table that ALREADY EXISTS
+// on the sharded keyspace passes. Arms 4/5 pin that Bug 250 is not
+// reopened — the state-store door and a real migrate flow still refuse,
+// leaving no per-shard debris.
+//
+// The unsharded direction (no over-refusal, tables created) is every
+// other vstream test in this file: they all create tables against the
+// 1-shard keyspace.
+func TestVStream_ShardedTargetKeyspace_RefusesAtCreateNotOpen(t *testing.T) {
 	mysqlDSN, _, keyspace, cleanup := startVTTestServerWithShards(t, 2)
 	defer cleanup()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
+	// Arm 1 — the REGRESSION FIX: OpenSchemaWriter on the SHARDED
+	// keyspace must NOT refuse. The sync schema-forward path opens the
+	// writer to be READY to forward ALTERs (it never creates tables), so
+	// an open-time refusal broke continuous sync into a pre-vindexed
+	// sharded keyspace — the supported flow the operator confirmed.
 	sw, err := (Engine{Flavor: FlavorVitess}).OpenSchemaWriter(ctx, mysqlDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter on the SHARDED keyspace %q must NOT refuse (the H-2 regression: the sync schema-forward writer opens here without creating a table): %v", keyspace, err)
+	}
+	defer closeIfCloser(sw)
+
+	// Arm 2 — the CREATE-PATH refusal: CreateTablesWithoutConstraints of
+	// a NEW (absent) table on the sharded keyspace must refuse with the
+	// coded error, naming both the shards and the specific new table.
+	newSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "h2_new_tbl",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "v", Type: ir.Varchar{Length: 32}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+	err = sw.CreateTablesWithoutConstraints(ctx, newSchema)
 	if err == nil {
-		closeIfCloser(sw)
-		t.Fatalf("OpenSchemaWriter on the SHARDED keyspace %q succeeded — the measured late/dirty failure shape (CREATE on every shard, 1173 at first row) is back in reach", keyspace)
+		t.Fatalf("CreateTablesWithoutConstraints of a NEW table on the SHARDED keyspace %q succeeded — the measured late/dirty failure shape (CREATE on every shard, 1173 at first row) is back in reach", keyspace)
 	}
 	ce, ok := sluicecode.FromError(err)
 	if !ok || ce.Code != sluicecode.CodeSchemaTargetKeyspaceSharded {
 		t.Fatalf("want %s, got %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
 	}
-	for _, want := range []string{"2 shards", "-80", "80-", "no vindex"} {
+	for _, want := range []string{"2 shards", "-80", "80-", "vindex", "h2_new_tbl"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal does not name %q:\n%v", want, err)
 		}
 	}
 
-	// Arm 2 — the STATE-STORE door (Bug 250, filed by the v0.126.0
+	// Arm 3 — the SUPPORTED case: a table the operator PRE-CREATED (and,
+	// in production, vindexed) on the sharded keyspace must pass — the
+	// CREATE TABLE IF NOT EXISTS no-ops and sluice streams rows in. Raw
+	// DDL creates it (vtgate applies to every shard); then
+	// CreateTablesWithoutConstraints of that same table must NOT refuse.
+	rawDB, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatalf("open raw target: %v", err)
+	}
+	defer func() { _ = rawDB.Close() }()
+	if _, err := rawDB.ExecContext(ctx, "CREATE TABLE h2_existing_tbl (id BIGINT PRIMARY KEY, v VARCHAR(32))"); err != nil {
+		t.Fatalf("raw pre-create of the existing table on the sharded keyspace: %v", err)
+	}
+	existingSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "h2_existing_tbl",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "v", Type: ir.Varchar{Length: 32}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+	if err := sw.CreateTablesWithoutConstraints(ctx, existingSchema); err != nil {
+		t.Fatalf("CreateTablesWithoutConstraints of an ALREADY-EXISTING table on the sharded keyspace %q must pass (pre-vindexed sync is supported): %v", keyspace, err)
+	}
+
+	// Arm 4 — the STATE-STORE door (Bug 250, filed by the v0.126.0
 	// regression cycle): the migrate pipeline opens the migration-state
-	// store BEFORE the schema writer, so with the door only on
-	// OpenSchemaWriter a real migrate materialized sluice_migrate_state
-	// on every shard and died on the raced 1105/1173 — the exact shape
-	// the v0.126.0 preflight claimed closed. The store open must carry
-	// the same refusal.
+	// store BEFORE the schema writer, and it materializes the
+	// vindex-less sluice_migrate_state before any CREATE TABLE — so its
+	// door must refuse at OPEN and stays unconditional after the H-2
+	// move (the state store has no "the tables already exist" supported
+	// case: sluice always creates its own control tables).
 	ms, err := (Engine{Flavor: FlavorVitess}).OpenMigrationStateStore(ctx, mysqlDSN)
 	if err == nil {
 		closeIfCloser(ms)
@@ -1039,7 +1097,7 @@ func TestVStream_ShardedTargetKeyspace_RefusesAtSchemaWriterOpen(t *testing.T) {
 		t.Fatalf("state-store door: want %s, got %v", sluicecode.CodeSchemaTargetKeyspaceSharded, err)
 	}
 
-	// Arm 3 — the FLOW (the Bug 250 lesson: the release pin drove the
+	// Arm 5 — the FLOW (the Bug 250 lesson: the release pin drove the
 	// engine call only, and the flow reached the target through an
 	// earlier, un-doored entry). A REAL cross-engine Migrator at the
 	// sharded keyspace must surface the coded refusal AND leave the

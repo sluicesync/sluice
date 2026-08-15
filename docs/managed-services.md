@@ -311,24 +311,35 @@ zero or several. Empty + unsharded/non-Vitess target = unchanged
 (bare table names in the default keyspace); inert on non-MySQL
 targets.
 
-Note the boundary this section lives inside: any run that would
-have sluice CREATE tables in a sharded keyspace (a `migrate`, a
-sync cold-start applying schema, a `restore`) refuses up front at
-schema-writer open with `SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED`
-— sluice-created tables carry no vindex, so nothing sluice writes
-there could route (measured: `CREATE TABLE` "succeeds" onto every
-shard and the failure arrives later, dirty and nondeterministic).
-An unsharded keyspace passes untouched, and a transient
-shard-discovery failure WARNs and proceeds. The scenario above
-therefore reaches a sharded DATA keyspace only with
-platform-created (vindexed) tables and `--schema-already-applied`,
-which skips the schema-writer open entirely. `schema diff` and
-`preview` open the same writer for their DDL suggestions: against
-a sharded keyspace, `preview` reports the same refusal the real
-migrate would hit, and `schema diff` degrades — the comparison
-still runs and reports, but missing-table DDL suggestions refuse
-with this code (the suggested `CREATE TABLE` genuinely could not
-run there).
+Note the boundary this section lives inside: the hazard is sluice
+CREATING a new table in a sharded keyspace — a sluice-created
+table carries no vindex, so nothing sluice writes there could
+route (measured: `CREATE TABLE` "succeeds" onto every shard and
+the failure arrives later, dirty and nondeterministic). So any run
+that would create a NEW table on a sharded keyspace (a `migrate`,
+a sync cold-start applying schema, a `restore`, an `add-table`, a
+broker reset) refuses with `SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED`
+at the create step, before that `CREATE TABLE` runs; `migrate`
+also refuses earlier, when it opens its migration-state store,
+whose own control table is likewise vindex-less. The refusal names
+the shards and the specific new table(s). An unsharded keyspace
+passes untouched, and a transient shard-discovery failure WARNs
+and proceeds.
+
+Continuous **sync into a sharded DATA keyspace IS supported** when
+the operator has pre-created and vindexed the tables on the
+platform (with or without `--schema-already-applied`): the create
+step finds every table already present, no-ops its `CREATE TABLE
+IF NOT EXISTS`, and sluice streams rows into the correctly-routed
+tables. Only a table sluice would have to create anew is refused.
+(An earlier build refused such a sync up front at schema-writer
+open — the schema-forward path opens the writer even on warm
+resume — which over-refused this supported flow; the door now sits
+at the create step so opening a writer to forward an `ALTER`, or to
+stream into existing tables, is harmless.) `schema diff` and
+`preview` are read-only — they open the writer only to render DDL
+suggestions and never call the create path — so they inspect a
+sharded target without refusing.
 
 ### VStream DSN flags
 

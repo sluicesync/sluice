@@ -2,6 +2,12 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+**Continuous sync into a pre-vindexed sharded Vitess/PlanetScale keyspace is no longer over-refused (audit finding H-2).** v0.126.0's sharded-target door sat at `OpenSchemaWriter` — but that open is reached by many table-FREE paths, and critically by the continuous-sync schema-forward writer, which opens the target schema writer (to be ready to forward source `ALTER`s) even on warm resume and with `--schema-already-applied`. So a sync into a sharded keyspace whose tables the operator had already created and vindexed — an operator-confirmed supported flow — refused at stream start with `SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED`, a regression against a working configuration. The release notes' claim that this path "never opens the schema writer" was false. The actual hazard is sluice CREATING a new vindex-less table (whose rows cannot route, Error 1173), so the door moved to the true chokepoint, `CreateTablesWithoutConstraints`: on a sharded keyspace it now refuses only when at least one table in the schema does NOT already exist on the target — naming the shards and the specific new table(s) — and passes when every table already exists, letting the `CREATE TABLE IF NOT EXISTS` phase no-op and sluice stream rows into the correctly-routed tables. This one chokepoint covers migrate's create phase, `add-table`, and broker reset uniformly; a shard-discovery failure still WARNs and proceeds. The state-store door (Bug 250) stays at `OpenMigrationStateStore` unconditionally — migrate's phase-1.75 bootstrap creates its own vindex-less control table before any schema writer opens, and the state store has no "already exists" supported case. `schema diff` and `preview` are read-only and no longer refuse a sharded target at all. A new AST roster gate (`TestShardedTargetDoorRoster_EveryCallSiteClassified`) enumerates every pipeline `OpenSchemaWriter` and `CreateTablesWithoutConstraints` call site and fails the build on an unclassified new one, so the next call site cannot silently reopen the class. Pinned live on a real 2-shard cluster (open no longer refuses; a new table refuses; an already-existing table passes; the Bug 250 migrate flow still refuses with zero `sluice_%` tables materialized) and mutation-run.
+
 ## [0.126.2] - 2026-08-14
 
 ### Security
