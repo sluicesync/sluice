@@ -263,3 +263,66 @@ func TestChangeApplier_SkippedTable_BatchApply(t *testing.T) {
 		t.Fatalf("skip WARN fired %d times on the batched path; want exactly 1:\n%s", got, warns.String())
 	}
 }
+
+// TestChangeApplier_MissingSchema_HaltsNotSilentlySkips is the M-2 pin
+// (audit 2026-08-14), the PostgreSQL sibling of the MySQL missing-
+// database halt: an empty information_schema result is ambiguous — a
+// missing TABLE (the recoverable C-11 skip) vs a missing SCHEMA (a
+// routing fault). Pre-fix both classified as unknown-table, so a
+// misrouted namespace mapping skipped EVERY event and exited 0 with
+// positions advanced. The fix probes information_schema.schemata: a
+// present schema keeps the skip; a missing one HALTS. This routes a real
+// event to a non-existent target schema and asserts the apply refuses
+// loudly and records NO skip-ledger row for it.
+func TestChangeApplier_MissingSchema_HaltsNotSilentlySkips(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `CREATE TABLE known (id BIGINT PRIMARY KEY);`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	// Enable multi-database routing with a namespace rename mapping the
+	// source schema to a target schema that does NOT exist — the misrouted
+	// namespace-mapping shape M-2 is about.
+	router, ok := applier.(ir.MultiDatabaseRouter)
+	if !ok {
+		t.Fatal("applier does not implement ir.MultiDatabaseRouter")
+	}
+	router.SetMultiDatabaseRouting(true, func(string) string { return "ghost_schema_does_not_exist" })
+
+	ch := make(chan ir.Change, 1)
+	ch <- ir.Insert{
+		Schema: "app_eu", Table: "orders",
+		Row:      ir.Row{"id": int64(1)},
+		Position: ir.Position{Engine: "postgres", Token: `{"lsn":"0/16B2C00"}`},
+	}
+	close(ch)
+	applyErr := applier.Apply(ctx, testStreamID, ch)
+	if applyErr == nil {
+		t.Fatal("apply of an event routed to a NON-EXISTENT schema returned nil — the stream silently skipped it (M-2 silent-loss: a misrouted namespace mapping would drop every table at exit 0)")
+	}
+	if !strings.Contains(applyErr.Error(), "ghost_schema_does_not_exist") ||
+		!strings.Contains(applyErr.Error(), "does not exist") {
+		t.Fatalf("halt error should name the missing schema and say it does not exist; got: %v", applyErr)
+	}
+
+	for _, r := range listSkips(t, ctx, applier) {
+		if strings.Contains(r.Table, "orders") {
+			t.Fatalf("the missing-schema event was recorded as a recoverable skip (%q) — it is a routing fault, not add-table-able", r.Table)
+		}
+	}
+}

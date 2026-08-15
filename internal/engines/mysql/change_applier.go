@@ -1630,6 +1630,21 @@ func targetTableExists(ctx context.Context, db *sql.DB, schema, table string) (b
 	return n > 0, nil
 }
 
+// targetSchemaExists reports whether the named database exists on the
+// target — the M-2 disambiguator that tells an unknown-table SKIP (an
+// existing database missing one table, recoverable per C-11) from a
+// missing-DATABASE routing fault (which must halt, not silently skip
+// every table). information_schema.SCHEMATA is the catalog of databases
+// vtgate also answers on a keyspace target.
+func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, error) {
+	const q = `SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE schema_name = ?`
+	var n int
+	if err := db.QueryRowContext(ctx, q, schema).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // recordSkippedTable is the audit-C-11 skip path: a CDC event targets
 // a table the destination lacks, so the applier drops it — WARN once
 // per table per applier lifetime (the durable count carries the
@@ -1692,6 +1707,25 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 		// event with the durable counter instead of halting the stream.
 		// A failed probe propagates the ORIGINAL error: refuse to guess.
 		if exists, exErr := targetTableExists(ctx, a.db, schema, table); exErr == nil && !exists {
+			// M-2 (audit 2026-08-14): a missing information_schema row is
+			// ambiguous — the TABLE is absent, or the whole SCHEMA is. The
+			// second is a ROUTING FAULT (a nsRename mapping the source
+			// database to a target database that does not exist), and
+			// treating it as an unknown-table SKIP means every event for
+			// every table drops and the stream exits 0 with positions
+			// advanced — the loud halt C-11 replaced, turned silent. Probe
+			// the schema: only a present schema yields the skip; a missing
+			// one HALTS loudly (a probe error refuses to guess, keeping the
+			// original error).
+			if schemaOK, scErr := targetSchemaExists(ctx, a.db, schema); scErr == nil && !schemaOK {
+				return nil, fmt.Errorf(
+					"mysql: applier: target database %q does not exist — every event routed to it would be "+
+						"skipped, silently dropping the stream. This is a routing fault: create the target "+
+						"database, or fix the source→target database mapping (--target / nsRename). "+
+						"(A MISSING TABLE in an existing database is the recoverable C-11 skip; a missing "+
+						"DATABASE is not.) table %s.%s", schema, schema, table,
+				)
+			}
 			return nil, fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
 		}
 		return nil, err

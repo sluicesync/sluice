@@ -2007,13 +2007,43 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		return nil, err
 	}
 	if len(cols) == 0 {
-		// Empty information_schema result: the table doesn't exist
-		// on the destination. Wrap [errUnknownTable] so callers can
-		// branch on errors.Is and skip the event with a warning
-		// (Bug 13 defence-in-depth). See [ChangeApplier.dispatch].
+		// Empty information_schema result is AMBIGUOUS (M-2, audit
+		// 2026-08-14): the table is absent, or the whole SCHEMA is. A
+		// missing schema is a ROUTING FAULT (source→target namespace
+		// mapping pointing at a schema that does not exist) — skipping it
+		// as an unknown table drops every event for every table and the
+		// stream exits 0, the loud halt C-11 replaced turned silent.
+		// Probe the schema: present → the recoverable unknown-table skip;
+		// missing → HALT loudly (a probe error refuses to guess).
+		if schemaOK, scErr := targetSchemaExists(ctx, db, schema); scErr == nil && !schemaOK {
+			return nil, fmt.Errorf(
+				"postgres: applier: target schema %q does not exist — every event routed to it would be "+
+					"skipped, silently dropping the stream. This is a routing fault: create the target schema, "+
+					"or fix the source→target schema mapping (--target-schema / nsRename). (A MISSING TABLE in "+
+					"an existing schema is the recoverable C-11 skip; a missing SCHEMA is not.) table %s.%s",
+				schema, schema, table,
+			)
+		}
+		// Wrap [errUnknownTable] so callers can branch on errors.Is and
+		// skip the event with a warning (Bug 13 defence-in-depth). See
+		// [ChangeApplier.dispatch].
 		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
 	}
 	return cols, nil
+}
+
+// targetSchemaExists reports whether the named schema exists on the
+// target — the M-2 disambiguator that tells an unknown-table SKIP (an
+// existing schema missing one table, recoverable per C-11) from a
+// missing-SCHEMA routing fault (which must halt, not silently skip
+// every table).
+func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // loadGeometryColumnInfo loads per-column PostGIS subtype + SRID metadata
