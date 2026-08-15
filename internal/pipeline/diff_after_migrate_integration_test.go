@@ -755,3 +755,73 @@ func pgCheckConstraintNames(t *testing.T, ctx context.Context, dsn, table string
 	}
 	return out
 }
+
+// TestSchemaDiffAfterMigrate_Postgres_NotInGuttedConstraintReportsDrift
+// is the H-1 durable gate (audit 2026-08-14, silent-loss): PostgreSQL
+// renders `CHECK (i NOT IN (1,2))` as `CHECK ((NOT (i = ANY (ARRAY[1,
+// 2]))))`. Operator negation across the quantifier is INVALID — the
+// gutted target `CHECK (i <> ANY (ARRAY[1,2]))` ACCEPTS 1 and 2 where the
+// source REJECTS them — and a fold that pushed the NOT onto the operator
+// would canonicalize the two equal, so `schema diff` would certify a
+// materially different (data-admitting) CHECK as in sync. This grounds
+// the fix against real PG's own rendering: migrate a NOT IN constraint,
+// gut it on the target, and assert the diff REPORTS the mismatch.
+func TestSchemaDiffAfterMigrate_Postgres_NotInGuttedConstraintReportsDrift(t *testing.T) {
+	pgSource, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyPGDDL(t, pgSource, `
+		CREATE TABLE guarded (
+			id INT PRIMARY KEY,
+			i  INT,
+			CONSTRAINT ck_notin CHECK (i NOT IN (1, 2))
+		);
+	`)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	mig := &Migrator{Source: pgEng, Target: pgEng, SourceDSN: pgSource, TargetDSN: pgTarget}
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+
+	// CLEAN: the migrated NOT IN constraint diffs in sync against itself.
+	assertNoDrift(t, runDiffForDrift(ctx, t, "postgres", "postgres", pgSource, pgTarget))
+
+	// GUT IT: replace the target constraint with the operator-negated
+	// form that a quantifier-blind fold would have accepted. It admits
+	// i=1 and i=2 — the exact rows the source rejects — so the diff MUST
+	// report drift.
+	applyPGDDL(t, pgTarget, `ALTER TABLE "guarded" DROP CONSTRAINT "ck_notin"`)
+	applyPGDDL(t, pgTarget, `ALTER TABLE "guarded" ADD CONSTRAINT "ck_notin" CHECK (i <> ANY (ARRAY[1, 2]))`)
+	diff := runDiffForDrift(ctx, t, "postgres", "postgres", pgSource, pgTarget)
+	td := findTableDiff(*diff, "guarded")
+	if td == nil || (len(td.ChecksMismatched) == 0 && len(td.ChecksMissing) == 0 && len(td.ChecksExtra) == 0) {
+		t.Fatalf("a GUTTED NOT IN constraint (i <> ANY vs NOT (i = ANY)) reported IN SYNC — schema diff would certify a "+
+			"data-admitting CHECK as unchanged (H-1 silent-loss): %+v", td)
+	}
+	// Sanity: on real PG the gutted constraint genuinely admits i=1.
+	if _, err := execPGReturningErr(t, pgTarget, `INSERT INTO "guarded" (id, i) VALUES (100, 1)`); err != nil {
+		t.Fatalf("the gutted target constraint should ACCEPT i=1 (that is why it is a silent-loss); insert failed: %v", err)
+	}
+}
+
+// execPGReturningErr runs one statement and returns its error (nil on
+// success) without failing the test — for asserting a constraint's
+// accept/reject behaviour directly.
+func execPGReturningErr(t *testing.T, dsn, stmt string) (sql.Result, error) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return db.ExecContext(ctx, stmt)
+}

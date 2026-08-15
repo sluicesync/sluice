@@ -284,11 +284,13 @@ func isBoolKeyword(tok string) bool {
 //   - `mod(a, b)` → `(a % b)` — MySQL renders the call as the operator.
 //   - `~~` → `like`, `!~~` → `not like` — PG's operator spellings
 //     (`~~*`/`!~~*` ILIKE forms are unmeasured and verbatim), plus
-//     NOT-pushdown of a single parenthesized comparison
+//     NOT-pushdown of a single parenthesized SCALAR comparison
 //     (`not(v = 5)` → `v <> 5`), because MySQL's catalog SIMPLIFIES
-//     the negation while PG preserves it. CHECK-semantics exact (see
-//     [negatedComparison] on NULL). A NOT over a conjunction or
-//     anything but one comparison stays verbatim.
+//     the negation while PG preserves it. CHECK-semantics exact for a
+//     scalar comparison (see [negatedComparison] on NULL). A NOT over a
+//     conjunction, over a QUANTIFIED comparison (`NOT (x = ANY S)`,
+//     where operator negation is invalid — see [quantifiedComparison],
+//     audit H-1), or anything but one scalar comparison stays verbatim.
 //   - `X between A and B` → `X >= A and X <= B` for simple operands
 //     ([foldBetweenSimple], run first) — PG's own expansion.
 //   - a quoted NUMERIC literal unquotes (`'-100000'` ≡ `-100000`) —
@@ -431,7 +433,7 @@ func foldServerRenderings(expr string) string {
 				// comparison and no AND/OR; anything else stays
 				// verbatim (spurious-difference direction).
 				if inner, next, ok := callGroup(expr, j); ok && !comparisonFollows(expr, next) {
-					if lhs, op, rhs, cok := singleComparison(foldServerRenderings(inner)); cok {
+					if lhs, op, rhs, cok := singleComparison(foldServerRenderings(inner)); cok && !quantifiedComparison(lhs, rhs) {
 						if neg, nok := negatedComparison(op); nok {
 							sb.WriteString(lhs)
 							sb.WriteString(" ")
@@ -663,11 +665,44 @@ func unwrapOuterParens(s string) (string, bool) {
 	return s, false
 }
 
+// quantifiedComparison reports whether a comparison operand is a
+// QUANTIFIED expression — `ANY (…)`, `ALL (…)`, or `SOME (…)` — for
+// which the NOT-pushdown's operator negation is INVALID (audit H-1, the
+// bug this fold shipped with). Negating the operator across a quantifier
+// changes the quantifier: `NOT (x = ANY S) ≡ x <> ALL S`, NOT the
+// `x <> ANY S` the pushdown would produce — two materially different
+// predicates (`i NOT IN (1,2)` vs one that ACCEPTS 1 and 2) that would
+// otherwise canonicalize equal, so `schema diff` would certify a gutted
+// CHECK as in sync. When either operand leads with a quantifier keyword
+// the fold bails and the NOT stays verbatim (the spurious-difference
+// direction — loud, never a silent false match).
+//
+// PostgreSQL renders the quantifier on the RHS (`i = ANY (ARRAY[…])`);
+// the LHS is checked too for robustness. Word-boundary matched so a
+// column like `awesome` or `anything` is not mistaken for a quantifier.
+func quantifiedComparison(lhs, rhs string) bool {
+	return leadsWithQuantifier(rhs) || leadsWithQuantifier(lhs)
+}
+
+func leadsWithQuantifier(operand string) bool {
+	s := strings.TrimSpace(operand)
+	for _, q := range []string{"any", "all", "some"} {
+		if len(s) >= len(q) && strings.EqualFold(s[:len(q)], q) &&
+			(len(s) == len(q) || !isIdentByte(s[len(q)])) {
+			return true
+		}
+	}
+	return false
+}
+
 // negatedComparison maps a comparison operator to its negation, for the
 // NOT-pushdown fold. Comparisons involving NULL evaluate to UNKNOWN on
 // both sides of the rewrite identically (NOT UNKNOWN is UNKNOWN, and a
 // CHECK treats UNKNOWN as pass), so the pushdown is CHECK-semantics
-// exact.
+// exact — FOR A SCALAR comparison. Operator negation across a quantifier
+// is a DIFFERENT predicate (`NOT (x = ANY S) ≡ x <> ALL S`), so the
+// caller gates this on [quantifiedComparison] and never reaches here for
+// a quantified operand (audit H-1).
 func negatedComparison(op string) (string, bool) {
 	switch op {
 	case "=":

@@ -580,6 +580,31 @@ func TestCanonicalCheckExpr_ServerRenderingFolds(t *testing.T) {
 			false,
 		},
 		{
+			// H-1 (the bug this fold shipped with): PG renders
+			// `i NOT IN (1,2)` as `NOT (i = ANY (ARRAY[1,2]))`. Operator
+			// negation across the quantifier is INVALID — the gutted
+			// target `i <> ANY (ARRAY[1,2])` ACCEPTS 1 and 2 where the
+			// source REJECTS them. They must NOT canonicalize equal, or
+			// `schema diff` certifies a materially different CHECK as in
+			// sync (silent-loss). The pushdown bails on a quantified RHS.
+			"H-1 guard: NOT (x = ANY S) does NOT fold onto x <> ANY S (gutted-constraint false match)",
+			`(NOT (i = ANY (ARRAY[1, 2])))`,
+			`(i <> ANY (ARRAY[1, 2]))`,
+			false,
+		},
+		{
+			"H-1 guard: the ALL sibling is not operator-negated either",
+			`(NOT (i = ALL (ARRAY[1, 2])))`,
+			`(i <> ALL (ARRAY[1, 2]))`,
+			false,
+		},
+		{
+			"H-1: a column merely NAMED like a quantifier still folds (scalar comparison, word-boundary check)",
+			`(anyval <> 5)`,
+			`(NOT (anyval = 5))`,
+			true,
+		},
+		{
 			"DIFF-2 guard: a compound BETWEEN operand is left verbatim, not misfolded",
 			`(v + w between 1 and 10)`,
 			`(w >= 1 and w <= 10)`,
