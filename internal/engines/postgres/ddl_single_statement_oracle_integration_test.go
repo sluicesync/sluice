@@ -9,7 +9,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 )
@@ -92,12 +91,14 @@ func TestSingleStatementDoorMatchesPG(t *testing.T) {
 	// of this oracle read a false all-clear). Each row runs against a
 	// FRESH c1_probe so a prior row's added constraint can't collide,
 	// and the marker is dropped afterward.
-	probeMarker := func(candidate, markerName string) (injected bool, srvErr error) {
+	probeMarker := func(candidate, markerName string, cleanupExtra ...string) (injected bool, srvErr error) {
 		if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS c1_probe; CREATE TABLE c1_probe (id int)`); err != nil {
 			t.Fatalf("reset probe: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS `+markerName); err != nil {
-			t.Fatalf("pre-drop marker: %v", err)
+		for _, tbl := range append([]string{markerName}, cleanupExtra...) {
+			if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS `+tbl); err != nil {
+				t.Fatalf("pre-drop %s: %v", tbl, err)
+			}
 		}
 		_, srvErr = db.ExecContext(ctx, candidate)
 		var present bool
@@ -105,45 +106,81 @@ func TestSingleStatementDoorMatchesPG(t *testing.T) {
 			`SELECT to_regclass('public.'||$1) IS NOT NULL`, markerName).Scan(&present); qerr != nil {
 			t.Fatalf("marker probe: %v", qerr)
 		}
-		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS `+markerName)
+		for _, tbl := range append([]string{markerName}, cleanupExtra...) {
+			_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS `+tbl)
+		}
 		return present, srvErr
 	}
 
-	var genuineInjections int
-	for _, r := range corpus {
-		r := r
-		t.Run(r.name, func(t *testing.T) {
-			candidate := fmt.Sprintf("ALTER TABLE c1_probe ADD CONSTRAINT %s CHECK (%s)",
-				"ck_"+r.name, r.body)
-			doorErr := assertSingleDDLStatement(candidate)
-			injected, srvErr := probeMarker(candidate, marker(r.name))
+	// Two emission TEMPLATES, because the door protects both real restore
+	// emission shapes and the 2026-08-14 regression cycle found the live
+	// RCE rode the INLINE one, not the ALTER wrapper this oracle first
+	// used (the "gate must cover the real path, not a representative"
+	// discipline applied to the gate itself). The ALTER corpus bodies
+	// close ONE paren; the inline template wraps the body in
+	// `CREATE TABLE <t> (id int, CONSTRAINT ck CHECK (<body>))`, so its
+	// injecting body must close TWO and re-open to balance — the shape
+	// the cycle proved live. The door is template-agnostic (it scans the
+	// string), so the invariant holds for both; paren balance is the
+	// server's to judge.
+	type tmpl struct {
+		name  string
+		build func(rowName, body string) (candidate string, cleanupExtra []string)
+	}
+	inlineTable := func(rowName string) string { return "c1_inl_" + rowName }
+	templates := []tmpl{
+		{"alter", func(rowName, body string) (string, []string) {
+			return fmt.Sprintf("ALTER TABLE c1_probe ADD CONSTRAINT %s CHECK (%s)", "ck_"+rowName, body), nil
+		}},
+		{"inline", func(rowName, body string) (string, []string) {
+			t := inlineTable(rowName)
+			return fmt.Sprintf("CREATE TABLE %s (id int, CONSTRAINT %s CHECK (%s))", t, "ck_"+rowName, body), []string{t}
+		}},
+	}
+	// The inline template's own genuine-injection body (cycle-proven
+	// shape): close the CHECK paren and the CREATE-TABLE paren, inject,
+	// then a fresh valid CREATE to balance the trailing `)` the template
+	// appends. Added to the corpus flagged wantInject; it is a syntax
+	// error under the ALTER template (harmless — just does not inject
+	// there), and a live injection under the inline template.
+	inlineInj := "true)) /* ' */ ; CREATE TABLE " + marker("inline_twoparen") +
+		" (); /* ' */ CREATE TABLE " + inlineTable("inline_twoparen_pad") + " (y int CHECK (true"
+	corpus = append(corpus, row{"inline_twoparen", inlineInj, true})
 
-			if injected {
-				genuineInjections++
-			}
-			// THE INVARIANT: the door must never wave through a string
-			// whose injected statement the server actually ran.
-			if doorErr == nil && injected {
-				t.Fatalf("C-1 BYPASS: the door PASSED a string the server executed an injection for.\n"+
-					"  candidate: %q\n  server err: %v", candidate, srvErr)
-			}
-			// Diagnostic only: a door refusal on a server-safe string is
-			// over-refusal (loud, acceptable); log the shape so drift is
-			// visible.
-			if doorErr != nil && !injected && srvErr == nil {
-				t.Logf("over-refusal (safe direction): %q refused by door %v", candidate, doorErr)
-			}
-			if r.wantInject && !injected && srvErr != nil && !strings.Contains(r.name, "dollar") {
-				t.Logf("NOTE %s did not inject (server err: %v) — shape may be a syntax error, not a bypass", r.name, srvErr)
-			}
-		})
+	perTemplate := map[string]int{}
+	for _, tp := range templates {
+		for _, r := range corpus {
+			tp, r := tp, r
+			t.Run(tp.name+"/"+r.name, func(t *testing.T) {
+				candidate, cleanupExtra := tp.build(r.name, r.body)
+				doorErr := assertSingleDDLStatement(candidate)
+				injected, srvErr := probeMarker(candidate, marker(r.name),
+					append(cleanupExtra, inlineTable("inline_twoparen_pad"))...)
+
+				if injected {
+					perTemplate[tp.name]++
+				}
+				// THE INVARIANT: the door must never wave through a string
+				// whose injected statement the server actually ran.
+				if doorErr == nil && injected {
+					t.Fatalf("C-1 BYPASS (%s template): the door PASSED a string the server executed an injection for.\n"+
+						"  candidate: %q\n  server err: %v", tp.name, candidate, srvErr)
+				}
+				if doorErr != nil && !injected && srvErr == nil {
+					t.Logf("over-refusal (safe direction): %q refused by door %v", candidate, doorErr)
+				}
+			})
+		}
 	}
 
-	// Anti-vacuity: SOME corpus row must be a genuine injection, or the
-	// oracle proved nothing. (Measured on real PG 16; if this ever hits
-	// 0, the corpus went inert — a wider list with the same defect.)
-	if genuineInjections == 0 {
-		t.Fatal("anti-vacuity: NO corpus row injected on the real server — the oracle is inert, it did not test the door against a real bypass")
+	// Anti-vacuity, PER TEMPLATE: each real emission shape must have
+	// exercised the door against a genuine server-side injection, or that
+	// template's coverage is inert (a gate that does not cover the real
+	// path — the exact defect the 2026-08-14 audit's C-1 was).
+	for _, tp := range templates {
+		if perTemplate[tp.name] == 0 {
+			t.Fatalf("anti-vacuity: the %s template produced NO genuine server-side injection — its door coverage is inert", tp.name)
+		}
 	}
-	t.Logf("oracle: %d/%d corpus rows were genuine server-side injections, all blocked by the door", genuineInjections, len(corpus))
+	t.Logf("oracle: genuine server-side injections blocked by the door, per template: %v", perTemplate)
 }
