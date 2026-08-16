@@ -943,3 +943,44 @@ func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.Store, now tim
 		codecsPerSegment: []blobcodec.Codec{codecA, codecB},
 	})
 }
+
+// TestMergedSegmentFromGroup_UnionsVerbatimMarkers is the audit-M-3 pin:
+// a merge group whose NON-oldest source first declared a verbatim
+// extension column (the Bug 251 mid-chain verbatim-arrival shape) must
+// carry that column FORWARD on the merged segment, not silently drop it.
+// Dropping it would blind refuseVerbatimRestoreToNonPG (which sums each
+// segment's marker) and let a cross-engine restore of PG-only verbatim
+// columns proceed. The merged segment's data span covers every source's
+// incrementals, so the marker must be the UNION.
+func TestMergedSegmentFromGroup_UnionsVerbatimMarkers(t *testing.T) {
+	pos := func(tok string) ir.Position { return ir.Position{Engine: "postgres", Token: tok} }
+	capped := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	cat := &lineage.Catalog{
+		Segments: []lineage.Segment{
+			{ // oldest: NO verbatim columns
+				SegmentID: "seg-a", Dir: "seg-a", FullManifestPath: lineage.ManifestFileName,
+				StartPosition: pos("0/100"), EndPosition: pos("0/200"), CappedAt: &capped,
+			},
+			{ // middle (non-oldest): verbatim column ARRIVES here (Bug 251 shape)
+				SegmentID: "seg-b", Dir: "seg-b", FullManifestPath: lineage.ManifestFileName,
+				StartPosition: pos("0/200"), EndPosition: pos("0/300"), CappedAt: &capped,
+				VerbatimExtensionColumns: []string{"public.t.geom"},
+			},
+			{ // newest: a SECOND verbatim column
+				SegmentID: "seg-c", Dir: "seg-c", FullManifestPath: lineage.ManifestFileName,
+				StartPosition: pos("0/300"), EndPosition: pos("0/400"), CappedAt: &capped,
+				VerbatimExtensionColumns: []string{"public.t.tsv"},
+			},
+		},
+	}
+	pg := &plannedGroup{
+		span: []segMeta{{catIdx: 0}, {catIdx: 1}, {catIdx: 2}},
+		plan: CompactPlanGroup{MergedSegmentID: "seg-m", MergedSegmentDir: "seg-m"},
+	}
+	merged := mergedSegmentFromGroup(cat, pg, capped)
+	got := append([]string(nil), merged.VerbatimExtensionColumns...)
+	want := []string{"public.t.geom", "public.t.tsv"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("merged VerbatimExtensionColumns = %v; want the UNION %v — a non-oldest segment's verbatim marker was dropped (audit M-3)", got, want)
+	}
+}

@@ -1325,11 +1325,31 @@ func mergedSegmentFromGroup(cat *lineage.Catalog, pg *plannedGroup, now time.Tim
 		cappedAt = *newest.CappedAt
 	}
 
-	// VerbatimExtensionColumns: a merged segment's full IS the oldest
-	// source's full, so the marker carries over verbatim.
+	// VerbatimExtensionColumns: the UNION across every source segment, not
+	// just the oldest's full (audit M-3). The merged segment's data span is
+	// oldest.StartPosition..newest.EndPosition — it carries the incrementals
+	// of every source — so if a NEWER source's full first declared a
+	// verbatim extension column (the Bug 251 mid-chain verbatim-arrival
+	// shape, now reachable), that column's data lives in the merged
+	// segment's incrementals. Carrying only oldest's marker would drop it,
+	// and [refuseVerbatimRestoreToNonPG] — which sums each segment's marker
+	// — would then find nothing and let a cross-engine restore of PG-only
+	// verbatim columns proceed silently. The union keeps that loud gate
+	// whole. (Additive is safe: a column dropped mid-chain still has data in
+	// the earlier incrementals, so keeping it marked is correct too.)
+	verbatimSet := map[string]struct{}{}
+	for _, s := range pg.span {
+		for _, col := range cat.Segments[s.catIdx].VerbatimExtensionColumns {
+			verbatimSet[col] = struct{}{}
+		}
+	}
 	var verbatim []string
-	if len(oldest.VerbatimExtensionColumns) > 0 {
-		verbatim = append([]string(nil), oldest.VerbatimExtensionColumns...)
+	if len(verbatimSet) > 0 {
+		verbatim = make([]string, 0, len(verbatimSet))
+		for col := range verbatimSet {
+			verbatim = append(verbatim, col)
+		}
+		sort.Strings(verbatim)
 	}
 
 	return lineage.Segment{
