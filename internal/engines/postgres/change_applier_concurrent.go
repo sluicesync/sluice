@@ -482,6 +482,13 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // is classified exactly as the serial position write would be.
 func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error {
 	a := la.a
+	// H-4: the frontier checkpoint is the concurrent path's position-write
+	// boundary, so flush the coalesced skip ledger the W lanes accumulated
+	// here, BEFORE the merged position becomes durable. A flush failure aborts
+	// the checkpoint (loud); the lanes' work re-streams from the last frontier.
+	if err := a.flushSkippedTables(ctx); err != nil {
+		return err
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint begin: %w", err))
@@ -579,5 +586,11 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 		MaxBufferBytes:  byteCap,
 		IdleFlushPeriod: defaultIdleFlushPeriod,
 	}, adapter)
-	return orch.Run(ctx, changes)
+	if err := orch.Run(ctx, changes); err != nil {
+		return err
+	}
+	// H-4: clean-stop drain of any skips the lanes recorded after the last
+	// frontier checkpoint (the orchestrator drains all lanes before returning,
+	// so their skips are accumulated and awaiting a flush).
+	return a.flushSkippedTables(ctx)
 }

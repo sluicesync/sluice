@@ -458,11 +458,19 @@ type ChangeApplier struct {
 
 	// skipWarn tracks which unknown target tables have already had their
 	// once-per-applier-lifetime skip WARN (audit C-11). The durable
-	// per-event count lives in sluice_cdc_skipped_tables (see
-	// recordSkippedTable); this tracker only de-duplicates the log line.
-	// Internally locked — the ADR-0105 concurrent lanes reach the skip
-	// path from W goroutines.
+	// count lives in sluice_cdc_skipped_tables (see recordSkippedTable);
+	// this tracker only de-duplicates the log line. Internally locked —
+	// the ADR-0105 concurrent lanes reach the skip path from W goroutines.
 	skipWarn appliershared.SkipWarnTracker
+
+	// skipAccum coalesces the audit-C-11 skip ledger writes (audit H-4):
+	// recordSkippedTable accumulates in memory and flushSkippedTables drains
+	// it to one UPSERT per table at each POSITION-WRITE boundary, instead of
+	// the pre-H-4 per-event autocommit UPSERT that turned a bulk-load of an
+	// unknown table into a per-event-fsync crawl. Internally locked — the
+	// ADR-0105 concurrent lanes record from W goroutines while the coordinator
+	// flushes at the frontier checkpoint.
+	skipAccum appliershared.SkipLedgerAccumulator
 
 	// fkBypassOnce guards the one-time Bug-164 privilege probe; fkBypassOK
 	// caches whether the apply role may SET session_replication_role =
@@ -1326,7 +1334,11 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 		select {
 		case c, ok := <-changes:
 			if !ok {
-				return nil
+				// Clean stop: drain any skips accumulated since the last
+				// boundary (H-4) so `sync health` is current at stop — e.g. an
+				// incomplete source tx whose TxCommit never arrived, whose skips
+				// would otherwise wait for resume re-delivery.
+				return a.flushSkippedTables(ctx)
 			}
 			switch c.(type) {
 			case ir.TxBegin:
@@ -1373,6 +1385,13 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // dispatch has no boundary arm (boundaries carry no SQL), and it must not
 // grow one: a position-only write is exactly what this is.
 func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID string, c ir.Change, rowsApplied int64) error {
+	// H-4: flush the coalesced skip ledger BEFORE the TxCommit position write,
+	// so a flush failure leaves the position at the previous boundary and the
+	// whole source transaction re-delivers on resume (re-skip, re-count) rather
+	// than advancing past unrecorded skips.
+	if err := a.flushSkippedTables(ctx); err != nil {
+		return err
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx (commit position): %w", err))
@@ -1471,6 +1490,14 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	}
 	token := c.Pos().Token
 	if writePosition {
+		// H-4: flush the coalesced skip ledger before this change's position
+		// becomes durable (a skipped change dispatches to recordSkippedTable,
+		// which only accumulated). On failure roll the tx back so the change
+		// re-delivers and re-skips; on success the position may advance past it.
+		if err := a.flushSkippedTables(ctx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		posCtx, posCancel := a.execTimeoutCtx(ctx)
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
@@ -1725,26 +1752,45 @@ func diagApplierInsertReceived(ctx context.Context, schema string, v ir.Insert) 
 // recordSkippedTable is the audit-C-11 skip path: a CDC event targets
 // a table the destination lacks, so the applier drops it — WARN once
 // per table per applier lifetime (the durable count is what carries
-// the signal, not the log volume) — and counts it in the durable
+// the signal, not the log volume) — and accumulates it toward the durable
 // sluice_cdc_skipped_tables ledger with the event's verbatim source
 // position token. Reached from EVERY apply path (serial dispatch, the
 // batched serial fallback, dispatchPipelined, and the ADR-0105
 // concurrent lanes, which all funnel through those two dispatchers).
 //
-// The upsert runs on the primary pool OUTSIDE the apply tx — one
-// implementation for every path (the pipelined path has no *sql.Tx to
-// ride), durable even if the surrounding batch later rolls back (the
-// skip did happen; a retry re-skips and re-counts, so the ledger is
-// at-least-once). A failed upsert FAILS the apply loudly: the decision
-// requires skips to be durable and health-visible, never log-only, so
-// an unrecordable skip must not pass silently. classifyApplierError
-// keeps a transient control-write failure retriable.
+// H-4: the durable UPSERT is COALESCED — recordSkippedTable only warns
+// (once per table) and accumulates the skip in memory; flushSkippedTables
+// drains the accumulator to one UPSERT per table at the next position-write
+// boundary. This removes the per-event fsync that made a bulk-load of an
+// unknown table a permanent lag generator. recordSkippedTable can no longer
+// fail (no DB I/O), but keeps its error return so the dispatch arms'
+// `return a.recordSkippedTable(...)` call sites are unchanged; the loud
+// failure moves to flushSkippedTables.
 func (a *ChangeApplier) recordSkippedTable(ctx context.Context, streamID, op, schema, table, posToken string) error {
 	qn := schemaTableKey(schema, table)
 	if a.skipWarn.FirstSighting(qn) {
 		appliershared.WarnSkippedTable(ctx, "postgres", op, qn)
 	}
-	if err := upsertSkippedTable(ctx, a.db, a.controlSchema, streamID, qn, posToken); err != nil {
+	a.skipAccum.Record(streamID, qn, posToken)
+	return nil
+}
+
+// flushSkippedTables drains the coalesced skip accumulator (audit H-4) to
+// the durable ledger, one UPSERT per (stream, table). It is called at every
+// POSITION-WRITE boundary — the serial per-change / TxCommit writes, the
+// batch loop's position write, the concurrent frontier checkpoint, and the
+// clean-stop drain — always BEFORE the covering position becomes durable, so
+// a flush failure rolls the boundary back and the interrupted work
+// re-delivers on resume (never a position advanced past an unrecorded skip
+// with no way to re-count it). Empty accumulator is a mutex-only no-op — the
+// healthy-stream hot path. A failed UPSERT FAILS the apply loudly (skips must
+// stay durable + health-visible); classifyApplierError keeps a transient
+// control-write failure retriable.
+func (a *ChangeApplier) flushSkippedTables(ctx context.Context) error {
+	err := a.skipAccum.Flush(ctx, func(ctx context.Context, key appliershared.SkipLedgerKey, e appliershared.SkipLedgerEntry) error {
+		return upsertSkippedTable(ctx, a.db, a.controlSchema, key.StreamID, key.Table, e)
+	})
+	if err != nil {
 		return classifyApplierError(err)
 	}
 	return nil

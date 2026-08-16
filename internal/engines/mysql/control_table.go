@@ -433,23 +433,25 @@ func skippedTablesTableDDL(controlKeyspace string) string {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
 
-// upsertSkippedTable counts ONE skipped CDC event against the
-// (streamID, table) ledger row: first sight inserts the row with
-// count 1 and both positions at this event's token; every later skip
-// increments the count and advances last_position / last_skipped_at,
-// leaving the first_* columns as the original sighting. Runs on the
-// applier's primary pool (autocommit, outside the apply tx) so ONE
-// implementation serves every apply path — see
-// [ChangeApplier.recordSkippedTable] for the at-least-once contract.
-func upsertSkippedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, table, posToken string, upsert upsertSpelling) error {
+// upsertSkippedTable folds ONE COALESCED batch of skips (audit H-4) into
+// the (streamID, table) ledger row: first sight inserts the row with
+// e.Count and both positions from the accumulator; every later flush adds
+// e.Count and advances last_position / last_skipped_at, leaving the first_*
+// columns as the original sighting. Runs on the applier's primary pool
+// (autocommit, outside the apply tx) so ONE implementation serves every
+// apply path — see [ChangeApplier.flushSkippedTables] for the at-least-once
+// contract. The timestamps stay DB-generated (CURRENT_TIMESTAMP(6),
+// unchanged from the pre-H-4 per-event ledger) — the accumulator carries
+// counts and position tokens, not clocks.
+func upsertSkippedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, table string, e appliershared.SkipLedgerEntry, upsert upsertSpelling) error {
 	ref := controlTableRef(controlKeyspace, skippedTablesTableName)
 	q := "INSERT INTO " + ref + " (stream_id, table_name, skip_count, first_position, last_position) " +
-		"VALUES (?, ?, 1, ?, ?)" +
+		"VALUES (?, ?, ?, ?, ?)" +
 		upsert.clauseOpen() +
-		"skip_count = " + ref + ".skip_count + 1, " +
+		"skip_count = " + ref + ".skip_count + " + upsert.newRowRef("skip_count") + ", " +
 		"last_position = " + upsert.newRowRef("last_position") + ", " +
 		"last_skipped_at = CURRENT_TIMESTAMP(6)"
-	if _, err := db.ExecContext(ctx, q, streamID, table, posToken, posToken); err != nil {
+	if _, err := db.ExecContext(ctx, q, streamID, table, e.Count, e.FirstPos, e.LastPos); err != nil {
 		return fmt.Errorf("mysql: record skipped table %s: %w", table, err)
 	}
 	return nil

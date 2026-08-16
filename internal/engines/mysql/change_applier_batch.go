@@ -94,7 +94,13 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if a.applyConcurrency > 1 && a.pipelineCfg != nil {
 		return a.applyBatchConcurrent(ctx, streamID, changes, maxBatchSize, a.applyConcurrency)
 	}
-	return appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize)
+	if err := appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize); err != nil {
+		return err
+	}
+	// H-4: clean-stop drain of any skips left un-flushed since the last
+	// position-write boundary (a mid-source-tx batch at channel close withheld
+	// its position, so its WritePosition-boundary flush never ran).
+	return a.flushSkippedTables(ctx)
 }
 
 // applyOneBatch runs one batch-accumulation cycle of the shared loop.
@@ -155,7 +161,17 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
 		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string, rowsApplied int64) error {
-			return tx.(*mysqlBatchTx).writePosition(ctx, streamID, token, rowsApplied)
+			if err := tx.(*mysqlBatchTx).writePosition(ctx, streamID, token, rowsApplied); err != nil {
+				return err
+			}
+			// H-4: the shared loop calls WritePosition at exactly the
+			// position-write boundaries the coalesced skip ledger must flush on
+			// (commitBatch's !skipPosition path and writeBoundaryOnly), and
+			// NEVER on a mid-tx skipPosition flush where the position does not
+			// advance — so flushing here keeps `sync health` current at the same
+			// granularity the resume position advances at. A flush failure is
+			// returned so commitBatch rolls the batch back (loud, re-delivered).
+			return a.flushSkippedTables(ctx)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
 			return tx.(*mysqlBatchTx).commit()

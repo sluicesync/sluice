@@ -202,25 +202,26 @@ func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) er
 	return nil
 }
 
-// upsertSkippedTable counts ONE skipped CDC event against the
-// (streamID, table) ledger row: first sight inserts the row with
-// count 1 and both positions at this event's token; every later skip
-// increments the count and advances last_position / last_skipped_at,
-// leaving the first_* columns as the original sighting. Runs on the
-// applier's primary pool (autocommit, outside the apply tx) so ONE
-// implementation serves every apply path — serial, batched, pipelined,
-// and the ADR-0104/0105 concurrent lanes; the count is therefore
-// at-least-once across batch retries (documented on
-// [ir.SkippedTableRecord.SkipCount]).
-func upsertSkippedTable(ctx context.Context, db *sql.DB, schema, streamID, table, posToken string) error {
+// upsertSkippedTable folds ONE COALESCED batch of skips (audit H-4) into
+// the (streamID, table) ledger row: first sight inserts the row with
+// e.Count and both positions from the accumulator; every later flush adds
+// e.Count and advances last_position / last_skipped_at, leaving the first_*
+// columns as the original sighting. Runs on the applier's primary pool
+// (autocommit, outside the apply tx) so ONE implementation serves every
+// apply path — serial, batched, pipelined, and the ADR-0104/0105 concurrent
+// lanes; the count is at-least-once (documented on
+// [ir.SkippedTableRecord.SkipCount]). The timestamps stay DB-generated
+// (CURRENT_TIMESTAMP, unchanged from the pre-H-4 per-event ledger) — the
+// accumulator carries counts and position tokens, not clocks.
+func upsertSkippedTable(ctx context.Context, db *sql.DB, schema, streamID, table string, e appliershared.SkipLedgerEntry) error {
 	tableRef := skippedTablesTableRef(schema)
 	q := "INSERT INTO " + tableRef + " (stream_id, table_name, skip_count, first_position, last_position) " +
-		"VALUES ($1, $2, 1, $3, $3) " +
+		"VALUES ($1, $2, $3, $4, $5) " +
 		"ON CONFLICT (stream_id, table_name) DO UPDATE SET " +
-		"skip_count = " + tableRef + ".skip_count + 1, " +
+		"skip_count = " + tableRef + ".skip_count + EXCLUDED.skip_count, " +
 		"last_position = EXCLUDED.last_position, " +
 		"last_skipped_at = CURRENT_TIMESTAMP"
-	if _, err := db.ExecContext(ctx, q, streamID, table, posToken); err != nil {
+	if _, err := db.ExecContext(ctx, q, streamID, table, e.Count, e.FirstPos, e.LastPos); err != nil {
 		return fmt.Errorf("postgres: record skipped table %s: %w", table, err)
 	}
 	return nil

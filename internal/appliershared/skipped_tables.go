@@ -86,6 +86,102 @@ func WarnSkippedTable(ctx context.Context, engineName, op, qualifiedTable string
 	)
 }
 
+// SkipLedgerKey identifies one ledger row: the (stream, target-table)
+// pair the durable skip ledger is keyed on.
+type SkipLedgerKey struct {
+	StreamID string
+	Table    string
+}
+
+// SkipLedgerEntry is the coalesced state for one [SkipLedgerKey] between
+// flushes: how many events were skipped and the first / last source
+// position tokens seen. Merged into the ledger UPSERT as count += Count,
+// last_position = LastPos (first_position stays the original sighting).
+type SkipLedgerEntry struct {
+	Count    int64
+	FirstPos string
+	LastPos  string
+}
+
+// SkipLedgerAccumulator coalesces unknown-target-table skips (audit H-4)
+// so the durable ledger UPSERT runs at POSITION-WRITE boundaries instead
+// of once per skipped event. The pre-H-4 path did a bare autocommit UPSERT
+// (its own commit/fsync) per skipped event, so a new source table
+// bulk-loaded with millions of rows (whose CREATE was never forwarded, so
+// every event skips) turned the ordered apply into a per-event-fsync crawl
+// — measured ~70-85 events/s — during which every OTHER table's lag grew
+// unbounded and could outrun binlog/slot retention, losing the resume
+// position the skip existed to protect.
+//
+// The count is advisory / at-least-once (see [ir.SkippedTableRecord.SkipCount]
+// and [WarnSkippedTable]): it answers "did skips happen, and roughly how
+// many", not an exactly-once total. Coalescing preserves that contract —
+// callers flush BEFORE the covering position is durable, so a crash or a
+// failed flush re-delivers the interrupted work on resume and the lost
+// increments are re-accumulated and re-counted (never a silent DATA loss:
+// the skipped rows are on the source, recoverable via `schema add-table`).
+//
+// Concurrency: the ADR-0104/0105 concurrent apply lanes reach the skip path
+// from W goroutines (Record), while the coordinator flushes at the frontier
+// checkpoint (Flush). Both take the mutex; Flush swaps the map out under the
+// lock before its DB-bound work so a lane recording DURING a flush lands in
+// the next generation and is never lost. The zero value is ready to use.
+type SkipLedgerAccumulator struct {
+	mu      sync.Mutex
+	entries map[SkipLedgerKey]*SkipLedgerEntry
+}
+
+// Record folds one skipped event into the accumulator. No DB I/O — the
+// durable write is deferred to the next [SkipLedgerAccumulator.Flush] at a
+// position-write boundary. Safe for concurrent callers.
+func (a *SkipLedgerAccumulator) Record(streamID, table, posToken string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.entries == nil {
+		a.entries = map[SkipLedgerKey]*SkipLedgerEntry{}
+	}
+	key := SkipLedgerKey{StreamID: streamID, Table: table}
+	e := a.entries[key]
+	if e == nil {
+		e = &SkipLedgerEntry{FirstPos: posToken}
+		a.entries[key] = e
+	}
+	e.Count++
+	e.LastPos = posToken
+}
+
+// Flush drains every accumulated entry and calls upsert once per (stream,
+// table). It swaps the map out under the lock FIRST, then does the DB-bound
+// upserts unlocked, so concurrent Record calls during the flush accumulate
+// into a fresh generation rather than being lost or double-counted. An empty
+// accumulator is a no-op (one lock, zero DB I/O) — the healthy-stream hot
+// path pays only a mutex.
+//
+// On the first upsert error Flush returns immediately and DROPS the
+// not-yet-flushed entries rather than re-merging them: the count is
+// at-least-once and the caller flushes before the covering position is
+// durable, so the interrupted work re-delivers on resume and the dropped
+// increments are re-accumulated — re-merging would only inflate the
+// over-count. The caller wraps the returned error through its applier-error
+// classifier so a transient control-write failure stays retriable.
+func (a *SkipLedgerAccumulator) Flush(ctx context.Context, upsert func(ctx context.Context, key SkipLedgerKey, e SkipLedgerEntry) error) error {
+	a.mu.Lock()
+	if len(a.entries) == 0 {
+		a.mu.Unlock()
+		return nil
+	}
+	pending := a.entries
+	a.entries = nil
+	a.mu.Unlock()
+
+	for key, e := range pending {
+		if err := upsert(ctx, key, *e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ListSkippedTables runs the engine-built SELECT over the canonical
 // 7-column projection — stream_id, table_name, skip_count,
 // first_position, last_position, first_skipped_at, last_skipped_at —

@@ -264,6 +264,50 @@ func TestChangeApplier_SkippedTable_BatchApply(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_SkippedTable_CoalescedFlushOnStop is the audit-H-4 pin
+// (the PostgreSQL sibling of the MySQL test of the same name): skips are
+// COALESCED — accumulated in memory and flushed to the durable ledger as one
+// UPSERT per table at each position-write boundary (and on a clean stop)
+// instead of a per-event autocommit UPSERT that made a bulk-load of an
+// unknown table a permanent lag generator. This drives an INCOMPLETE source
+// transaction (TxBegin + several skips, then channel close with NO TxCommit):
+// those skips never reach a persistSourceTxCommit boundary, so the ONLY thing
+// that records them durably is the clean-stop drain (the flushSkippedTables
+// call on channel close). It is the mutation target: deleting the stop-drain
+// leaves the ledger empty and fails here.
+func TestChangeApplier_SkippedTable_CoalescedFlushOnStop(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `CREATE TABLE known (id BIGINT PRIMARY KEY)`)
+	_ = captureSkipWarns(t)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	pos := func(tok string) ir.Position { return ir.Position{Engine: "postgres", Token: tok} }
+	// An OPEN source transaction (no TxCommit) whose only rows are skips of a
+	// table the target lacks: the skips are deferred past their (never
+	// arriving) TxCommit boundary, so only the clean-stop drain records them.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.TxBegin{Position: pos(`{"lsn":"0/16B2C00"}`)},
+		ir.Insert{Schema: "public", Table: skipTableName, Row: ir.Row{"id": int64(1)}, Position: pos(skipTokFirst)},
+		ir.Insert{Schema: "public", Table: skipTableName, Row: ir.Row{"id": int64(2)}, Position: pos(skipTokMid)},
+		ir.Insert{Schema: "public", Table: skipTableName, Row: ir.Row{"id": int64(3)}, Position: pos(skipTokLast)},
+	})
+
+	assertSkipRecord(t, listSkips(t, ctx, applier), "public."+skipTableName, 3, skipTokFirst, skipTokLast)
+}
+
 // TestChangeApplier_MissingSchema_HaltsNotSilentlySkips is the M-2 pin
 // (audit 2026-08-14), the PostgreSQL sibling of the MySQL missing-
 // database halt: an empty information_schema result is ambiguous — a

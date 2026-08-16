@@ -44,6 +44,11 @@ type SkippedTableRecord struct {
 	// this (stream, table). At-least-once: a rolled-back batch that
 	// retries re-counts its skips, so the count answers "did skips
 	// happen, and roughly how many" — it is not an exactly-once ledger.
+	// The applier coalesces the durable writes (audit H-4): skips are
+	// accumulated in memory and flushed as one UPSERT per table at each
+	// position-write boundary, so the count advances at tx / batch /
+	// checkpoint granularity rather than per event — the at-least-once
+	// contract is unchanged.
 	SkipCount int64
 
 	// FirstPosition / LastPosition are the source position tokens of

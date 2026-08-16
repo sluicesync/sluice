@@ -106,7 +106,13 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if a.applyConcurrency > 1 && a.pipelineCfg != nil {
 		return a.applyBatchConcurrent(ctx, streamID, changes, maxBatchSize, a.applyConcurrency)
 	}
-	return appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize)
+	if err := appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize); err != nil {
+		return err
+	}
+	// H-4: clean-stop drain of any skips left un-flushed since the last
+	// position-write boundary (a mid-source-tx batch at channel close withheld
+	// its position, so its WritePosition-boundary flush never ran).
+	return a.flushSkippedTables(ctx)
 }
 
 // applyOneBatch runs one batch-accumulation cycle of the shared loop.
@@ -197,11 +203,24 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 				// Queue the position upsert onto the batch; it flushes with
 				// the data in Commit's single SendBatch (ADR-0092).
 				a.writePositionPipelined(b, streamID, token, rowsApplied)
-				return nil
+				// H-4: flush the coalesced skip ledger at this position-write
+				// boundary (see the *sql.Tx arm below for the rationale). The
+				// skip ledger rides the primary pool, not this pipelined batch,
+				// so it commits independently and a failure surfaces here.
+				return a.flushSkippedTables(ctx)
 			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
+			if err := writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied); err != nil {
+				return err
+			}
+			// H-4: the shared loop calls WritePosition at exactly the
+			// position-write boundaries the coalesced skip ledger must flush on
+			// (commitBatch's !skipPosition path and writeBoundaryOnly), and
+			// NEVER on a mid-tx skipPosition flush — so flushing here keeps
+			// `sync health` current at the granularity the resume position
+			// advances at. A flush failure rolls the batch back (loud).
+			return a.flushSkippedTables(ctx)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
 			if b, ok := tx.(*pgxBatchTx); ok {
