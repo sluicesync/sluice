@@ -217,6 +217,21 @@ while IFS=';' read -r mtag mpattern mscopes mlabel; do
 			if (line ~ /\\$/) { sub(/\\$/, "", line); acc = acc line " "; next }
 			acc = acc line
 			if (acc ~ /go test/ && acc ~ /-run \047/) { print acc; exit }
+			# H-6: a check-leg-nonvacuity.sh leg carries its tags and -run
+			# regex as POSITIONAL args, not flags. Synthesize an equivalent
+			# go-test command from the first two single-quoted args (tags, run)
+			# and the ./... scope tokens, so the exact -run and scope checks
+			# below apply to helper legs unchanged.
+			if (acc ~ /check-leg-nonvacuity\.sh/ && acc ~ /\047/) {
+				nq = split(acc, q, /\047/)
+				if (nq >= 4) {
+					scope = ""
+					mm = split(q[5], sc, /[ \t]+/)
+					for (i = 1; i <= mm; i++) if (sc[i] ~ /^\.\//) scope = scope sc[i] " "
+					printf "go test -tags=\047%s\047 -run \047%s\047 %s\n", q[2], q[4], scope
+					exit
+				}
+			}
 			acc = ""
 		}
 	' "$wfpath")

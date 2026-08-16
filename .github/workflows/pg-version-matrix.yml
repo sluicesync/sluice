@@ -154,6 +154,18 @@ jobs:
           TESTCONTAINERS_RYUK_DISABLED: "true"
           RUN_FILTER: ${{ github.event.inputs.run || '.' }}
         run: |
+          set -o pipefail
           go test -tags=integration -race -count=1 -timeout=35m \
-            -run "$RUN_FILTER" \
-            ./internal/engines/postgres/...
+            -run "$RUN_FILTER" -v \
+            ./internal/engines/postgres/... 2>&1 | tee pgmatrix.out
+          # H-6 non-vacuity guard for the dynamic-filter leg (audit T-5: this is
+          # the sole execution site of the generated-identity write-refusal
+          # boundary). Exact counts are impossible (RUN_FILTER defaults to '.'),
+          # and the full suite has legitimate conditional skips, so a single
+          # `>= 1` PASS assert is the achievable guard: a zero-match filter or a
+          # total container-boot failure (every test skipped) yields zero PASS.
+          passed=$(grep -c '^--- PASS: Test' pgmatrix.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::pg-matrix: -run '$RUN_FILTER' produced zero top-level PASS (no match, or every test skipped). See the run log."
+            exit 1
+          fi

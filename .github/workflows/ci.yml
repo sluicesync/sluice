@@ -765,6 +765,16 @@ jobs:
       - name: check scheduled-red consumers
         run: bash scripts/check-schedule-consumers.sh
 
+      # Vacuous-green leg coverage (audit H-6): every job in the scheduled
+      # correctness workflows that runs a build-tagged, -run-filtered `go test`
+      # must carry a non-vacuity signal (a check-leg-nonvacuity.sh call or a
+      # '--- PASS:' assertion). The per-leg guard was found on only 2 of 8
+      # extended-suites legs because nothing forced adoption; this meta-guard
+      # fails a bare leg here, in the required check, instead of letting it
+      # green vacuously in the weekly suites for weeks.
+      - name: check filtered-leg non-vacuity coverage
+        run: bash scripts/check-leg-nonvacuity-coverage.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the

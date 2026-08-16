@@ -148,9 +148,19 @@ jobs:
           VITESS_LITE_IMAGE: ${{ matrix.image }}
           RUN_FILTER: ${{ github.event.inputs.run || 'TestVitessCluster' }}
         run: |
+          set -o pipefail
           go test -tags='integration vitesscluster' -race -count=1 -timeout=60m \
             -run "$RUN_FILTER" \
-            -v ./internal/engines/mysql/...
+            -v ./internal/engines/mysql/... 2>&1 | tee cluster.out
+          # H-6 non-vacuity guard for the dynamic-filter leg: an exact count is
+          # impossible (RUN_FILTER is a dispatch input), but a single `>= 1`
+          # PASS assert closes both vacuous shapes at once — a zero-match filter
+          # and an all-tests-skipped cluster-boot failure each yield zero PASS.
+          passed=$(grep -c '^--- PASS: Test' cluster.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::vitess-matrix: -run '$RUN_FILTER' produced zero top-level PASS (no match, or every test skipped on cluster-boot). See the run log."
+            exit 1
+          fi
 
   # ----- filtered-tag-gate (release path) -----
   # F-T2 (audit 2026-07-18): the ADR-0174 filtered move-OUT correctness crux —

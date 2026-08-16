@@ -135,8 +135,14 @@ jobs:
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
         run: |
-          go test -tags='integration vitesscluster chaos' -race -count=1 -timeout=120m \
-            -run '^TestVitessChaos_' -v ./internal/engines/mysql/...
+          # H-6 non-vacuity guard: 5 selected, 4 PASS — the 5th
+          # (TestVitessChaos_RollingUpgrade_MidSync) is an unconditional
+          # roadmap-tracked quarantine t.Skip. A cluster-boot infra skip on any
+          # of the other 4 (the failure mode this leg exists to catch) drops the
+          # PASS count and fails loud instead of greening vacuously.
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration vitesscluster chaos' '^TestVitessChaos_' ./internal/engines/mysql/... 5 4 \
+            -race -timeout=120m
 
   # The reshard correctness test: proves the CDC reader follows a
   # VReplication reshard (shard split) without loss or duplication.
@@ -173,8 +179,9 @@ jobs:
 
       - name: Run the reshard suite
         run: |
-          go test -tags='integration vitessreshard' -race -count=1 -timeout=95m \
-            -run '^TestVitessReshard_' -v ./internal/engines/mysql/...
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration vitessreshard' '^TestVitessReshard_' ./internal/engines/mysql/... 9 9 \
+            -race -timeout=95m
 
   # The NOBLOB partial-row-image belt suite (item-74 / ADR-0172): boots the
   # full cluster with binlog_row_image=NOBLOB written into each tablet's
@@ -219,8 +226,9 @@ jobs:
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
         run: |
-          go test -tags='integration vitesscluster' -race -count=1 -timeout=40m \
-            -run '^TestVitessClusterNoBlob_' -v ./internal/engines/mysql/...
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration vitesscluster' '^TestVitessClusterNoBlob_' ./internal/engines/mysql/... 2 2 \
+            -race -timeout=40m
 
   # The PIPELINE-package vstream suite (Bug-132 chunked parity,
   # restart-mid-copy chaos, sharded-source + Bug-152 collision
@@ -373,8 +381,9 @@ jobs:
 
       - name: Run the corpus suite
         run: |
-          go test -tags=integration -race -count=1 -timeout=40m \
-            -run '^TestMigrate_Corpus_' -v ./internal/pipeline/
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration' '^TestMigrate_Corpus_' ./internal/pipeline/ 23 23 \
+            -race -timeout=40m
 
   # The AWS-KMS envelope-encryption suite (audit N-17c):
   # backup/restore against a real localstack KMS container + real PG —
@@ -422,8 +431,9 @@ jobs:
 
       - name: Run the KMS localstack suite
         run: |
-          go test -tags='integration kmsverify' -race -count=1 -timeout=25m \
-            -run '^TestBackup_KMS' -v ./internal/pipeline/
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration kmsverify' '^TestBackup_KMS' ./internal/pipeline/ 6 6 \
+            -race -timeout=25m
 
   # The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212,
   # and item 104 / Bug 216). Builds three released binaries from source in
@@ -553,8 +563,9 @@ jobs:
 
       - name: Run the DDL-fixture corpus
         run: |
-          go test -tags='integration ddlfixture' -count=1 -timeout=40m \
-            -run '^TestDDLFixture' -v ./internal/translate/...
+          bash scripts/check-leg-nonvacuity.sh \
+            'integration ddlfixture' '^TestDDLFixture' ./internal/translate/... 1 1 \
+            -timeout=40m
 
   # TESTCI-1's scheduled-red consumer was GENERALIZED out of this file
   # (audit H-5, 2026-08-15): it now lives in report-red.yml as a
