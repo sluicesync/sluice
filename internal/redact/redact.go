@@ -324,10 +324,23 @@ func needsSeed(s Strategy) bool {
 //
 // The format string is `streamID || "|" || table || "|" || column
 // || "|" || pkCol1 || "=" || canonicalize(pkVal1) || "|" || ...`.
-// The leading streamID + table + column ensure no two columns can
-// produce identical seeds even when their PK values match; the
-// trailing pkCol=val pairs guarantee per-row uniqueness within a
-// column.
+// The leading streamID + table + column separate columns; the
+// trailing pkCol=val pairs distinguish rows within a column.
+//
+// This is REPLAY-STABLE (the same row derives the same seed on every
+// read — the property ADR-0039 depends on for backup→restore and CDC
+// replay) but it is NOT injective, and the separators do not make it
+// so: a `|` or `=` carried INSIDE a PK value shifts the boundary, and
+// `%v` is type-blind (int64(1) and "1" render alike) — so two DISTINCT
+// rows CAN collide to one seed. The consequence is bounded and is NOT
+// data loss: a collision means two distinct rows share a redaction seed
+// and thus one redacted value — a redaction-uniqueness loss, never a
+// wrong value written to the wrong row (audit M-4's LOW sibling; its
+// injective HIGH sibling, floatPatchKey, IS length-prefixed + type-
+// tagged). The encoding is deliberately left as-is: length-prefixing it
+// would change every derived seed and break the cross-version
+// replay-stable contract above, a compat cost disproportionate to a
+// bounded uniqueness overstatement.
 func DeriveRowSeed(streamID, table, column string, pkColumns []string, pkValues []any) []byte {
 	h := sha256.New()
 	_, _ = h.Write([]byte(streamID))

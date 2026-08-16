@@ -474,8 +474,22 @@ func TestFloatPatchKey(t *testing.T) {
 	if k(ir.Row{"a": int64(1), "b": int64(2)}, "a", "b") == k(ir.Row{"a": int64(2), "b": int64(1)}, "a", "b") {
 		t.Error("order-swapped tuples must produce distinct keys")
 	}
-	// The NUL separator keeps "1","2" distinct from "12","".
+	// The length prefix keeps "1","2" distinct from "12","".
 	if k(ir.Row{"a": "1", "b": "2"}, "a", "b") == k(ir.Row{"a": "12", "b": ""}, "a", "b") {
-		t.Error("NUL separator must keep concatenation-ambiguous tuples distinct")
+		t.Error("length-prefixed key must keep concatenation-ambiguous tuples distinct")
+	}
+	// audit M-4, direction 1 — a NUL INSIDE a value (utf8mb4_bin admits it)
+	// shifts the boundary: ("x\x00","y") and ("x","\x00y") rendered
+	// IDENTICALLY under the old `%v`+bare-NUL join, merging two distinct
+	// rows' float-patch entries. The length prefix makes the boundary
+	// unambiguous.
+	if k(ir.Row{"a": "x\x00", "b": "y"}, "a", "b") == k(ir.Row{"a": "x", "b": "\x00y"}, "a", "b") {
+		t.Error("a NUL carried inside a PK value must not shift the component boundary (audit M-4)")
+	}
+	// audit M-4, direction 2 — type-blindness: int64(1) and "1" both render
+	// `1` under `%v`, so a row keyed on the integer and one keyed on the
+	// string PK collided. The `%T` tag splits them.
+	if k(ir.Row{"a": int64(1)}, "a") == k(ir.Row{"a": "1"}, "a") {
+		t.Error("int64(1) and \"1\" must produce distinct keys (type tag — audit M-4)")
 	}
 }

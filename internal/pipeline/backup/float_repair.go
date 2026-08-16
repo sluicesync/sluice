@@ -298,16 +298,26 @@ func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchT
 	return exact, false, nil
 }
 
-// floatPatchKey renders a collision-safe key from a row's PK values, in PK
-// column order. A NUL separator keeps distinct tuples distinct across the
-// string/int families a PK can mix.
+// floatPatchKey renders an INJECTIVE key from a row's PK values, in PK
+// column order, so that two DISTINCT rows can never share one `exact`
+// entry — a merge here would write one row's re-read float values into the
+// OTHER row's archived record, a silent wrong-value in a backup that
+// verifies green (audit M-4).
+//
+// The previous shape (`%v` joined with a bare NUL) was NOT collision-safe
+// in two directions: a boundary shift — ("a\x00","b") and ("a","\x00b")
+// render identically under a NUL-significant collation like utf8mb4_bin,
+// which MySQL VARCHAR admits — and type-blindness, e.g. int64(1) vs "1".
+// This reuses the package's own length-prefix + type-tag encoding (B-5's
+// pkValueKey / writeLengthPrefixed): `<len>\x1e<type>\x1f<value>` per
+// component makes every boundary unambiguous however the payload is
+// spelled, so the concatenation is injective. A type-tag split (the same
+// value decoding as []byte once and string once) errs toward LESS merging
+// — the safe direction, since it can only fail to patch, never mis-patch.
 func floatPatchKey(row ir.Row, pkCols []string) string {
 	var b strings.Builder
-	for i, c := range pkCols {
-		if i > 0 {
-			b.WriteByte(0)
-		}
-		fmt.Fprintf(&b, "%v", row[c])
+	for _, c := range pkCols {
+		writeLengthPrefixed(&b, fmt.Sprintf("%T\x1f%v", row[c], row[c]))
 	}
 	return b.String()
 }
