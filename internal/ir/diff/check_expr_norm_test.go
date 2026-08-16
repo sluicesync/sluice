@@ -96,6 +96,88 @@ func TestCanonicalCheckExpr_MeasuredEmittedPairs(t *testing.T) {
 	}
 }
 
+// TestCheckRenderingCorpus_NegationSiblings is the audit-M-1 gate: for
+// every folded CHECK family, its NEGATION sibling must have an explicit
+// disposition — FOLDED (the two engines' renderings of the same negated
+// predicate canonicalize equal, so `schema diff` does not phantom-report
+// drift on a target migrate itself created) or PHANTOM-EXEMPT with a
+// one-line reason (the drift is LOUD — a spurious "changed" report — never
+// a silent false-clean). Renderings measured on real MySQL 8.0 +
+// PostgreSQL 16 (workspace/m1-negation-fold-measurement.md); the mysql
+// side is post-SchemaReader (backticks stripped).
+//
+// The gate is self-correcting in both directions: a folded sibling that
+// stops folding fails, and an EXEMPT sibling that starts folding fails too
+// (its stale exemption must be removed). Each folded family also carries a
+// gutted-tamper row so the fold cannot over-suppress a real change (the
+// H-1 lesson — a fold that certifies a weakened constraint in sync is a
+// silent-loss). Anti-vacuity: at least one sibling folds.
+func TestCheckRenderingCorpus_NegationSiblings(t *testing.T) {
+	type sibling struct {
+		name         string
+		mysql, pg    string
+		exemptReason string // "" = MUST fold; non-empty = phantom-exempt (must NOT fold)
+	}
+	sibs := []sibling{
+		{
+			"x NOT IN (…)  [<> ALL ↔ NOT IN]",
+			"(i not in (1,2))", "(i <> ALL (ARRAY[1, 2]))", "",
+		},
+		{
+			"x NOT BETWEEN a AND b  [expansion]",
+			"(i not between 1 and 10)", "((i < 1) OR (i > 10))", "",
+		},
+		{
+			"NOT (x IN …)",
+			"(i not in (1,2))", "(NOT (i = ANY (ARRAY[1, 2])))",
+			"PG keeps the NOT-wrap over `= ANY`; collapsing NOT (x IN S) to x NOT IN S needs a post-AnyArray NOT-collapse pass — deferred. LOUD phantom drift on the unusual NOT(x IN) spelling, never a false-clean.",
+		},
+		{
+			"NOT (a OR b) — De Morgan",
+			"((i <> 1) and (i <> 2))", "(NOT ((i = 1) OR (i = 2)))",
+			"De Morgan expansion negates each leaf; a quantified leaf (= ANY) negates by quantifier flip (<> ALL) not operator flip — the H-1 hazard. Deferred rather than risk a silent miscanonicalization; LOUD phantom drift, not a false-clean.",
+		},
+		{
+			"NOT (a AND b) — De Morgan",
+			"((i <= 5) or (i >= 10))", "(NOT ((i > 5) AND (i < 10)))",
+			"as NOT(a OR b): the De Morgan leaf negation carries the H-1 quantified-comparison hazard. Deferred; LOUD phantom drift, not a false-clean.",
+		},
+	}
+	folded := 0
+	for _, s := range sibs {
+		a, b := canonicalCheckExpr(s.mysql), canonicalCheckExpr(s.pg)
+		eq := a == b && a != ""
+		if s.exemptReason == "" {
+			folded++
+			if !eq {
+				t.Errorf("%s: expected FOLDED but the two renderings differ, so `schema diff` phantom-reports drift:\n  mysql %q -> %q\n  pg    %q -> %q",
+					s.name, s.mysql, a, s.pg, b)
+			}
+		} else if eq {
+			t.Errorf("%s: marked PHANTOM-EXEMPT but it now folds (%q) — the fold was added; remove the stale exemption from this gate", s.name, a)
+		}
+	}
+	if folded == 0 {
+		t.Fatal("anti-vacuity: no negation sibling folds — the M-1 fold set is empty, the gate proves nothing")
+	}
+
+	// Over-suppression guard: a folded family must still surface a real
+	// tamper (a removed NOT, a changed member/bound, a quantifier swap).
+	for _, tc := range []struct{ name, honest, tampered string }{
+		{"NOT IN → IN (negation removed)", "(i not in (1,2))", "(i in (1,2))"},
+		{"NOT IN member added", "(i not in (1,2))", "(i not in (1,2,3))"},
+		{"<> ALL → <> ANY (quantifier tamper)", "(i <> ALL (ARRAY[1, 2]))", "(i <> ANY (ARRAY[1, 2]))"},
+		{"NOT BETWEEN → BETWEEN (negation removed)", "(i not between 1 and 10)", "(i between 1 and 10)"},
+		{"NOT BETWEEN bound widened", "(i not between 1 and 10)", "(i not between 1 and 20)"},
+		{"NOT BETWEEN column swapped", "(i not between 1 and 10)", "(j not between 1 and 10)"},
+	} {
+		if canonicalCheckExpr(tc.honest) == canonicalCheckExpr(tc.tampered) {
+			t.Errorf("%s: a real tamper canonicalized EQUAL — the fold over-suppresses and would certify a weakened constraint in sync (%q)",
+				tc.name, canonicalCheckExpr(tc.honest))
+		}
+	}
+}
+
 // TestCanonicalCheckExpr_TamperIsStillVisible is the over-suppression
 // half, and it is the half that decides whether this is a fix or a
 // blindfold. Each case is a change an operator could really make to a

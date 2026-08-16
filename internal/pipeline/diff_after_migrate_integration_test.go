@@ -271,6 +271,15 @@ func TestSchemaDiffAfterMigrate_MySQLToPostgres(t *testing.T) {
 			CONSTRAINT ck_f_round_dbl CHECK (round(d2) >= -100000),
 			CONSTRAINT ck_f_modfn    CHECK (mod(v, 3) >= 0),
 			CONSTRAINT ck_f_between  CHECK (v BETWEEN 1 AND 10),
+			-- M-1 (measured 2026-08-15): the NEGATION siblings of the fold
+			-- families that fold cleanly. MySQL stores "not in" / "not
+			-- between"; PG stores "<> ALL (ARRAY[...])" / "(v < 1) OR (v > 10)"
+			-- -- reconciled by foldPGArrayLists' ALL arm and rewriteBetween's
+			-- NOT-BETWEEN expansion. (The NOT(x IN) and De Morgan siblings are
+			-- phantom-exempt, so they are deliberately NOT in this CLEAN table;
+			-- their disposition is pinned in TestCheckRenderingCorpus_NegationSiblings.)
+			CONSTRAINT ck_f_notin     CHECK (v NOT IN (1, 2)),
+			CONSTRAINT ck_f_notbtwn  CHECK (v NOT BETWEEN 1 AND 10),
 			CONSTRAINT ck_f_not      CHECK (NOT (v = 5)),
 			CONSTRAINT ck_f_like     CHECK (s LIKE 'a%'),
 			CONSTRAINT ck_f_notlike  CHECK (s NOT LIKE 'z%'),

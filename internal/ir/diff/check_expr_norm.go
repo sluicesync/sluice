@@ -67,11 +67,19 @@ import (
 	"strings"
 )
 
-// pgAnyArrayMarker is PostgreSQL's canonical rendering of an `IN (…)`
-// list — `= ANY (ARRAY[…])` — in the compact lowercase form the fold
-// pass produces. [foldPGAnyArrayLists] folds each such term back to the
-// `IN (…)` form the emitter wrote.
-const pgAnyArrayMarker = "=any(array["
+// pgAnyArrayMarker / pgAllArrayMarker are PostgreSQL's canonical
+// renderings of `IN (…)` / `NOT IN (…)` — `= ANY (ARRAY[…])` /
+// `<> ALL (ARRAY[…])` — in the compact lowercase, whitespace-stripped
+// form the fold pass produces. [foldPGArrayLists] folds each back to the
+// `in(…)` / `not in(…)` form MySQL's catalog writes (`x <> ALL S` ≡
+// `x NOT IN S` for the NULL-free list a CHECK carries, so the `<> ALL`
+// fold is semantics-exact — audit M-1). The `notin(` replacement carries
+// no space because this pass runs after [foldOutsideLiterals] has already
+// stripped MySQL's `not in` to `notin`.
+const (
+	pgAnyArrayMarker = "=any(array["
+	pgAllArrayMarker = "<>all(array["
+)
 
 // Sentinel delimiters the fold pass wraps each DECODED literal value in.
 //
@@ -153,9 +161,10 @@ func foldBetweenSimple(expr string) string {
 // operand), and j sits just past the `between` token. On success it
 // returns the full replacement output and the index just past B.
 func rewriteBetween(written, expr string, j int) (out string, next int, ok bool) {
-	// Left operand: the trailing identifier of what was already written,
-	// preceded by whitespace/boundary — and not a keyword (a `not`
-	// before BETWEEN means NOT BETWEEN, which is a different predicate).
+	// The token immediately before `between` is either the left operand or
+	// `not` for the `<operand> NOT BETWEEN` shape MySQL's catalog writes —
+	// which PG stores pre-EXPANDED as `(x < a) OR (x > b)`, so the two
+	// renderings must meet on that expansion (audit M-1 row 6).
 	end := len(written)
 	for end > 0 && (written[end-1] == ' ' || written[end-1] == '\t' || written[end-1] == '\n' || written[end-1] == '\r') {
 		end--
@@ -165,6 +174,25 @@ func rewriteBetween(written, expr string, j int) (out string, next int, ok bool)
 		start--
 	}
 	lhs := written[start:end]
+
+	// `<operand> NOT BETWEEN`: consume the `not`, then the real operand is
+	// the identifier before it. (The `NOT <operand> BETWEEN` shape —
+	// not-FIRST — is a different predicate under MySQL precedence and is
+	// bailed below, unchanged.)
+	negated := false
+	if strings.EqualFold(lhs, "not") {
+		negated = true
+		q := start
+		for q > 0 && (written[q-1] == ' ' || written[q-1] == '\t' || written[q-1] == '\n' || written[q-1] == '\r') {
+			q--
+		}
+		end = q
+		start = end
+		for start > 0 && isIdentByte(written[start-1]) {
+			start--
+		}
+		lhs = written[start:end]
+	}
 	if lhs == "" || isBoolKeyword(lhs) {
 		return "", 0, false
 	}
@@ -202,6 +230,10 @@ func rewriteBetween(written, expr string, j int) (out string, next int, ok bool)
 	b, next, ok := simpleTermEnd(expr, skipSpaces(expr, m))
 	if !ok {
 		return "", 0, false
+	}
+	if negated {
+		// NOT BETWEEN a AND b ≡ x < a OR x > b — PG's own stored expansion.
+		return written[:start] + lhs + " < " + a + " or " + lhs + " > " + b, next, true
 	}
 	return written[:start] + lhs + " >= " + a + " and " + lhs + " <= " + b, next, true
 }
@@ -817,15 +849,28 @@ func skipSpaces(expr string, i int) int {
 // different things they are (a spurious DIFFERENCE at worst, never a
 // spurious match).
 func foldPGAnyArrayLists(s string) string {
+	// `= ANY` → `in(…)`, then `<> ALL` → `not in(…)`. The two markers do
+	// not overlap and neither pass creates the other's marker, so the
+	// sequential application is order-independent (audit M-1 row 4).
+	s = foldPGArrayMarker(s, pgAnyArrayMarker, "in(")
+	return foldPGArrayMarker(s, pgAllArrayMarker, "notin(")
+}
+
+// foldPGArrayMarker folds every `<marker>…])` term to `<replacement>…)`,
+// scanning for the BALANCED close rather than matching a regex (see the
+// [foldPGAnyArrayLists] doc for why the balanced scan and literal-sentinel
+// skip are load-bearing). marker is a compact `<op>(array[` prefix and
+// replacement the membership keyword it maps to (`in(` / `notin(`).
+func foldPGArrayMarker(s, marker, replacement string) string {
 	var sb strings.Builder
 	for {
-		i := strings.Index(s, pgAnyArrayMarker)
+		i := strings.Index(s, marker)
 		if i < 0 {
 			sb.WriteString(s)
 			return sb.String()
 		}
 		sb.WriteString(s[:i])
-		rest := s[i+len(pgAnyArrayMarker):]
+		rest := s[i+len(marker):]
 
 		depth := 0
 		end := -1 // index in rest of the depth-0 ']' whose next byte is ')'
@@ -857,11 +902,11 @@ func foldPGAnyArrayLists(s string) string {
 		if end < 0 {
 			// No balanced close: emit the marker verbatim and keep scanning
 			// after it so a later well-formed term still folds.
-			sb.WriteString(pgAnyArrayMarker)
+			sb.WriteString(marker)
 			s = rest
 			continue
 		}
-		sb.WriteString("in(")
+		sb.WriteString(replacement)
 		sb.WriteString(rest[:end])
 		sb.WriteString(")")
 		s = rest[end+2:]
