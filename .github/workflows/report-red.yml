@@ -1,0 +1,92 @@
+name: Report scheduled red
+
+# Audit H-5 (2026-08-15): TESTCI-1's original consumer lived INSIDE
+# extended-suites.yml and so covered exactly one of the repo's scheduled
+# workflows. A scheduled `pg-version-matrix` red on 2026-08-08 (run
+# 31250915964, the pinned non-canary postgres:18 leg — its own policy's
+# definition of a real regression) filed nothing and was caught only
+# because a human happened to be watching, the very mechanism TESTCI-1
+# declared insufficient. This workflow is the generalized consumer: it
+# fires via `workflow_run` after EVERY scheduled correctness workflow
+# completes and, for a scheduled run only, files or refreshes ONE
+# standing issue per source workflow when the run is not green — and
+# CLOSES that issue when the next scheduled run of the same workflow is
+# green (the heartbeat the single-workflow predecessor lacked).
+#
+# The set of workflows consumed here is held to the repo's actual
+# scheduled set by scripts/check-schedule-consumers.sh in the Lint job:
+# a new `schedule:` trigger that is neither listed below nor in the
+# guard's documented EXEMPT set fails CI. build-prebaked-images is the
+# one deliberate exemption (a transient image-build/registry failure
+# self-heals on the next schedule and is not a correctness gate) — its
+# reason lives in that guard.
+
+on:
+  workflow_run:
+    workflows:
+      - "Extended suites"
+      - "DuckDB parquet compat"
+      - "Fuzz roundtrip"
+      - "Postgres version matrix"
+      - "Vitess version matrix"
+    types: [completed]
+
+# Least privilege: this workflow only touches the issue tracker.
+permissions:
+  issues: write
+
+jobs:
+  report:
+    name: File / refresh / close the per-workflow standing red issue
+    # Scheduled runs only. A dispatch/triage run of one of these
+    # workflows is already being watched by whoever dispatched it, so
+    # filing an issue for it would be noise.
+    if: ${{ github.event.workflow_run.event == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: File / refresh / close the standing issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WF_URL: ${{ github.event.workflow_run.html_url }}
+          WF_SHA: ${{ github.event.workflow_run.head_sha }}
+          WF_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          title="scheduled workflow is RED: ${WF_NAME}"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number --jq '.[0].number' || true)
+
+          case "$WF_CONCLUSION" in
+            success)
+              # Heartbeat: the next green scheduled run closes the standing
+              # issue. Without this the issue lingers after the red is fixed
+              # and its next reuse is muted (the predecessor's T-3 blind spot).
+              if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+                  --body "Scheduled ${WF_NAME} is green again: ${WF_URL} (commit ${WF_SHA}). Closing."
+                gh issue close "$existing" --repo "$GITHUB_REPOSITORY"
+              fi
+              ;;
+            failure|cancelled|timed_out|startup_failure)
+              # Pull the failed leg names from the run so the body names WHAT
+              # broke, not just that the run did — the per-leg detail the
+              # in-workflow predecessor got from `needs.*.result`, restored
+              # generically for every consumed workflow via the jobs API.
+              failed=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$WF_RUN_ID/jobs" \
+                --jq '[.jobs[] | select(.conclusion=="failure") | .name] | join(", ")' 2>/dev/null || true)
+              [ -z "$failed" ] && failed="(no failed job names available — see the run)"
+              body="Scheduled ${WF_NAME} run concluded '${WF_CONCLUSION}'. Failed legs: ${failed}. Run: ${WF_URL} (commit ${WF_SHA}). Triage per the TESTCI-1 protocol: pull each failed leg's assertion, three-phase real-vs-artifact, and let the next green scheduled run auto-close this issue."
+              if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              ;;
+            *)
+              # neutral / skipped / action_required carry no red signal.
+              echo "conclusion '${WF_CONCLUSION}' is not a red signal; nothing to file."
+              ;;
+          esac

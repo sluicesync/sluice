@@ -756,6 +756,15 @@ jobs:
       - name: check skills CLI-surface coverage
         run: bash scripts/check-skills-flags.sh
 
+      # Scheduled-red consumer coverage (audit H-5): every workflow with a
+      # `schedule:` trigger must be consumed by report-red.yml (which files
+      # a standing issue on a scheduled red and closes it on the next green)
+      # or be explicitly exempt with a reason. A new scheduled workflow whose
+      # red nothing consumes — the TESTCI-1 failure mode, observed unfiled on
+      # the 2026-08-08 pg-version-matrix red — fails here.
+      - name: check scheduled-red consumers
+        run: bash scripts/check-schedule-consumers.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
