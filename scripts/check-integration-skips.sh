@@ -43,9 +43,15 @@
 #     TestStreamer_MultiSchema_SlotLossRefusesLoudly: conditional on
 #     runtime state that usually holds; skip = precondition unprovable,
 #     documented in the tests.
-#   - TestLoadData* / TestWriteBatched*: sql_mode/local_infile probe
-#     tests that skip when the container refuses the GLOBAL grant or the
-#     server doesn't exhibit the seeded clamp (data-dependent).
+#   - The five sql_mode/local_infile probe tests skip when the container
+#     refuses the GLOBAL grant or the server doesn't exhibit the seeded
+#     clamp (data-dependent); ReplayRefuses... skips when @@max_error_count
+#     won't sit below the segment row count; ThroughputCost skips under
+#     -short. These are ANCHORED to the exact test names (audit T-4): the
+#     former `^TestLoadData` / `^TestWriteBatched` prefixes exempted all 21
+#     tests in the family — including the resume/replay silent-loss pins
+#     (RidesATransient, KeylessRefuses, TerminalError, ...) that have NO
+#     skip route and MUST fail this guard if they ever vanish.
 #   - TestCDCReader_TimestampNonUTCHost: needs host tzdata for
 #     America/Los_Angeles.
 #   - TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity, the
@@ -67,8 +73,13 @@ ALLOWED_SKIPS='
 ^TestConnectionSlotClassifier_RealPG53300$
 ^TestStreamer_PG_StreamIDCollisionRefused$
 ^TestStreamer_MultiSchema_SlotLossRefusesLoudly$
-^TestLoadData
-^TestWriteBatched
+^TestLoadDataWarningCountRefusesSilentClamp$
+^TestLoadData_MaxErrorCountZero_StillRefusesSilentClamp$
+^TestLoadDataWarning_RelaxedModeWarnsNotRefuses$
+^TestWriteBatched_RelaxedModeWarnsOnClamp$
+^TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp$
+^TestLoadDataSegments_ReplayRefusesWhenACoercionHidesAmongTheDuplicates$
+^TestLoadDataSegments_ThroughputCost$
 ^TestCDCReader_TimestampNonUTCHost$
 ^TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity/.*publish_generated_columns
 '
