@@ -329,7 +329,38 @@ func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, er
 	if isNoSuchTableErr(err) {
 		return true, nil
 	}
+	// Bug 253: vtgate reports an absent table on a SHARDED keyspace with a
+	// GENERIC Error 1105 ("table %s not found" — a planner/vschema-resolution
+	// failure, ER_UNKNOWN_ERROR) rather than the 1109/1146 codes
+	// isNoSuchTableErr classifies. Classifying 1105 by code is unsafe (it means
+	// many things) and by text is the C-1 defect this file exists to avoid — so
+	// DISAMBIGUATE with the reliable information_schema existence probe (which
+	// vtgate answers correctly; only a DIRECT select of the missing table
+	// 1105s). If the table genuinely does not exist it is empty — nothing to
+	// clobber — and returning empty lets the cold-start / add-table flow reach
+	// the create-phase sharded-target door, which emits the shard-naming
+	// refusal (SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED) instead of surfacing the
+	// opaque 1105. If the table DOES exist, the probe was a real query failure —
+	// surface it. Gated on a non-empty schema so the existence probe has a
+	// keyspace/database to qualify (empty schema keeps the old surface).
+	if w.schema != "" {
+		exists, exErr := targetTableExists(ctx, w.db, w.schema, table.Name)
+		if emptyOnConfirmedAbsentTable(exists, exErr) {
+			return true, nil
+		}
+	}
 	return false, fmt.Errorf("mysql: probe %q for emptiness: %w", table.Name, err)
+}
+
+// emptyOnConfirmedAbsentTable reports whether an unclassified emptiness-probe
+// error should be treated as "table empty" on the strength of the reliable
+// information_schema existence check (Bug 253). ONLY a CONFIRMED-absent table
+// (the existence probe SUCCEEDED and found nothing) qualifies: an existence
+// probe that itself ERRORED must surface the original error, never guess
+// "absent" — the same refuse-to-guess safety as the SL-1 schema probe. Extracted
+// as a pure function so that safety property is unit-pinnable without a server.
+func emptyOnConfirmedAbsentTable(exists bool, existsErr error) bool {
+	return existsErr == nil && !exists
 }
 
 // HasNullShardColumn reports whether the named discriminator column
