@@ -1672,6 +1672,35 @@ func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, e
 	return n > 0, nil
 }
 
+// classifyMissingTargetMySQL decides how colTypesFor treats a table whose
+// information_schema lookup came back empty. The ambiguity is table-absent vs
+// whole-database-absent (M-2): a CONFIRMED-present schema yields the
+// recoverable [errUnknownTargetTable] skip; a CONFIRMED-absent schema is the
+// loud routing-fault halt. A schema-probe ERROR (scErr != nil) HALTS with the
+// probe error and is NEVER classified as the skip sentinel — doing so would
+// advance the stream position past the dropped event, a silent loss on a
+// transient deadline/reset (SL-1, audit 2026-08-17). Extracted as a pure
+// function so the probe-error branch is unit-pinnable without a real server.
+func classifyMissingTargetMySQL(schema, table string, schemaOK bool, scErr error) error {
+	if scErr != nil {
+		return fmt.Errorf(
+			"mysql: applier: could not determine whether target database %q exists "+
+				"(schema-existence probe failed) — refusing to classify %s.%s as a skippable "+
+				"missing table: %w", schema, schema, table, scErr,
+		)
+	}
+	if !schemaOK {
+		return fmt.Errorf(
+			"mysql: applier: target database %q does not exist — every event routed to it would be "+
+				"skipped, silently dropping the stream. This is a routing fault: create the target "+
+				"database, or fix the source→target database mapping (--target / nsRename). "+
+				"(A MISSING TABLE in an existing database is the recoverable C-11 skip; a missing "+
+				"DATABASE is not.) table %s.%s", schema, schema, table,
+		)
+	}
+	return fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
+}
+
 // recordSkippedTable is the audit-C-11 skip path: a CDC event targets
 // a table the destination lacks, so the applier drops it — WARN once
 // per table per applier lifetime (the durable count carries the
@@ -1761,19 +1790,9 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 			// treating it as an unknown-table SKIP means every event for
 			// every table drops and the stream exits 0 with positions
 			// advanced — the loud halt C-11 replaced, turned silent. Probe
-			// the schema: only a present schema yields the skip; a missing
-			// one HALTS loudly (a probe error refuses to guess, keeping the
-			// original error).
-			if schemaOK, scErr := targetSchemaExists(ctx, a.db, schema); scErr == nil && !schemaOK {
-				return nil, fmt.Errorf(
-					"mysql: applier: target database %q does not exist — every event routed to it would be "+
-						"skipped, silently dropping the stream. This is a routing fault: create the target "+
-						"database, or fix the source→target database mapping (--target / nsRename). "+
-						"(A MISSING TABLE in an existing database is the recoverable C-11 skip; a missing "+
-						"DATABASE is not.) table %s.%s", schema, schema, table,
-				)
-			}
-			return nil, fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
+			// the schema: only a CONFIRMED-present schema yields the skip.
+			schemaOK, scErr := targetSchemaExists(ctx, a.db, schema)
+			return nil, classifyMissingTargetMySQL(schema, table, schemaOK, scErr)
 		}
 		return nil, err
 	}

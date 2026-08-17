@@ -2059,21 +2059,13 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		// mapping pointing at a schema that does not exist) — skipping it
 		// as an unknown table drops every event for every table and the
 		// stream exits 0, the loud halt C-11 replaced turned silent.
-		// Probe the schema: present → the recoverable unknown-table skip;
-		// missing → HALT loudly (a probe error refuses to guess).
-		if schemaOK, scErr := targetSchemaExists(ctx, db, schema); scErr == nil && !schemaOK {
-			return nil, fmt.Errorf(
-				"postgres: applier: target schema %q does not exist — every event routed to it would be "+
-					"skipped, silently dropping the stream. This is a routing fault: create the target schema, "+
-					"or fix the source→target schema mapping (--target-schema / nsRename). (A MISSING TABLE in "+
-					"an existing schema is the recoverable C-11 skip; a missing SCHEMA is not.) table %s.%s",
-				schema, schema, table,
-			)
-		}
-		// Wrap [errUnknownTable] so callers can branch on errors.Is and
-		// skip the event with a warning (Bug 13 defence-in-depth). See
-		// [ChangeApplier.dispatch].
-		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
+		// SL-1 (audit 2026-08-17): a probe ERROR must refuse to guess.
+		// Classifying a transient deadline/reset as the skip sentinel would
+		// drop the event AND advance the position past it — a silent loss
+		// re-opening the exact window M-2 closed. Only a CONFIRMED-present
+		// schema yields the skip; a probe error HALTS with the probe error.
+		schemaOK, scErr := targetSchemaExists(ctx, db, schema)
+		return nil, classifyMissingTargetPostgres(schema, table, schemaOK, scErr)
 	}
 	return cols, nil
 }
@@ -2090,6 +2082,35 @@ func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, e
 		return false, err
 	}
 	return exists, nil
+}
+
+// classifyMissingTargetPostgres decides how loadColumnTypes treats a table
+// whose information_schema lookup came back empty. The ambiguity is
+// table-absent vs whole-schema-absent (M-2): a CONFIRMED-present schema yields
+// the recoverable [errUnknownTable] skip; a CONFIRMED-absent schema is the loud
+// routing-fault halt. A schema-probe ERROR (scErr != nil) HALTS with the probe
+// error and is NEVER classified as the skip sentinel — doing so would advance
+// the stream position past the dropped event, a silent loss on a transient
+// deadline/reset (SL-1, audit 2026-08-17). Pure function so the probe-error
+// branch is unit-pinnable without a real server.
+func classifyMissingTargetPostgres(schema, table string, schemaOK bool, scErr error) error {
+	if scErr != nil {
+		return fmt.Errorf(
+			"postgres: applier: could not determine whether target schema %q exists "+
+				"(schema-existence probe failed) — refusing to classify %s.%s as a skippable "+
+				"missing table: %w", schema, schema, table, scErr,
+		)
+	}
+	if !schemaOK {
+		return fmt.Errorf(
+			"postgres: applier: target schema %q does not exist — every event routed to it would be "+
+				"skipped, silently dropping the stream. This is a routing fault: create the target schema, "+
+				"or fix the source→target schema mapping (--target-schema / nsRename). (A MISSING TABLE in "+
+				"an existing schema is the recoverable C-11 skip; a missing SCHEMA is not.) table %s.%s",
+			schema, schema, table,
+		)
+	}
+	return fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
 }
 
 // loadGeometryColumnInfo loads per-column PostGIS subtype + SRID metadata
