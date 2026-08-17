@@ -87,6 +87,23 @@ if [ -n "$conflict_hits" ]; then
 	exit 1
 fi
 
+# ---- CI Lint-job parity: the artifact guards (audit T-7) ----
+# These run in CI's Lint job on EVERY push (not gated on staged Go files),
+# so the local gate must too — a workflow-YAML, skills-markdown, or
+# capability change that touches NO Go would otherwise pass the whole local
+# gate and fail only in CI, breaking the "pre-commit runs everything CI
+# runs" contract. Two of them (schedule-consumers, leg-nonvacuity-coverage)
+# inspect workflow YAML that a Go-only gate would never see, which is
+# exactly why they sit ABOVE the Go-staged early return. Invoked via `bash`
+# (not `sh`): leg-nonvacuity-coverage uses bash-only here-strings, and `sh`
+# is dash on Linux/macOS. All are sub-second grep/git-ls/awk.
+for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity; do
+	if ! bash "scripts/$g.sh"; then
+		red "pre-commit: $g failed (a CI Lint-job guard)."
+		exit 1
+	fi
+done
+
 # Only run Go checks if Go files are staged. Lets non-code commits
 # (docs, CI config, etc.) skip the slow steps. Everything ABOVE this line
 # is text-shaped and applies to every commit.

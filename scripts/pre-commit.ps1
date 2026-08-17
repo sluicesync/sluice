@@ -164,6 +164,20 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# ---- CI Lint-job parity: the remaining artifact guards (audit T-7) ----
+# CI's Lint job runs these on every push; the local gate omitted them, so a
+# workflow-YAML / skills-markdown / capability change touching NO Go passed
+# the whole local gate and failed only in CI. $shExe is Git-for-Windows'
+# bash (see the header), so the bash-only here-strings in
+# check-leg-nonvacuity-coverage run correctly.
+foreach ($g in @('check-skills-flags', 'check-schedule-consumers', 'check-leg-nonvacuity-coverage', 'check-dialect-translator-roster', 'check-local-gate-parity')) {
+    & $shExe "scripts/$g.sh"
+    if ($LASTEXITCODE -ne 0) {
+        Red "$g failed (a CI Lint-job guard)."
+        exit 1
+    }
+}
+
 # ---- go test (fast, no DB) ----
 # -race is preferred but requires cgo. On Windows without a C compiler
 # (the default for most Go installs) CGO_ENABLED=0, so -race won't

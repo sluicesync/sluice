@@ -784,6 +784,14 @@ jobs:
       - name: check dialect-translator roster
         run: bash scripts/check-dialect-translator-roster.sh
 
+      # Local-gate<->CI parity (audit T-7): every bare static guard in this
+      # Lint job must also run in both local pre-commit entry points, so a
+      # developer catches a violation before pushing. This guard ratchets the
+      # parity that drifted (check-skills-flags, then three newly-added guards,
+      # ran only in CI).
+      - name: check local-gate parity
+        run: bash scripts/check-local-gate-parity.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
