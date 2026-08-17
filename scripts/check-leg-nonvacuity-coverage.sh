@@ -22,6 +22,7 @@ FILES="
 .github/workflows/extended-suites.yml
 .github/workflows/vitess-version-matrix.yml
 .github/workflows/pg-version-matrix.yml
+.github/workflows/fuzz-roundtrip.yml
 "
 
 # Anti-vacuity floor: the total detected legs (raw filtered `go test` + helper

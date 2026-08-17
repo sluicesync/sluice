@@ -86,8 +86,17 @@ jobs:
           SLUICE_FUZZ_ITERS: ${{ github.event.inputs.iters || '200' }}
         run: |
           echo "fuzz: seed=$SLUICE_FUZZ_SEED iters/dir=$SLUICE_FUZZ_ITERS"
+          set -o pipefail
           go test -tags=integration -race -count=1 -timeout=290m \
-            -run '^TestMigrate_FuzzRoundtrip$' ./internal/pipeline/
+            -run '^TestMigrate_FuzzRoundtrip$' -v ./internal/pipeline/ 2>&1 | tee fuzz.out
+          # CI-1 (audit 2026-08-17) non-vacuity guard: `go test -run` exits 0
+          # when the anchored name matches nothing, so a rename of this
+          # scheduled silent-loss catcher would green on zero iterations.
+          # Assert the harness actually ran AND passed.
+          grep -q '^--- PASS: TestMigrate_FuzzRoundtrip' fuzz.out || {
+            echo "::error::fuzz-roundtrip: TestMigrate_FuzzRoundtrip did not run+PASS (vacuous green — a rename or skip). See the run log."
+            exit 1
+          }
 
       # Each failing case is dumped as a replayable fixture; keep them.
       - name: Upload failure fixtures
