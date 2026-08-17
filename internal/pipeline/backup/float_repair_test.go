@@ -151,6 +151,59 @@ func TestFloatExactPatchReader_PatchesRoundedFloats(t *testing.T) {
 	}
 }
 
+// TestFloatExactPatchReader_UnsignedPKCrossReaderTypesStillPatch is the
+// audit-M-4-review reader-level pin: the exact-scan RowReader and the COPY
+// (VStream) reader decode an UNSIGNED-integer PK column to different Go
+// types — int64 on the exact side, uint64 on the COPY side (the MySQL
+// autoincrement norm on a PlanetScale/Vitess source). The float-patch key
+// must still MATCH across that divergence or every unsigned-PK table loses
+// exact repair. The first M-4 cut's `%T` tag split them; this proves the
+// row patches exact.
+func TestFloatExactPatchReader_UnsignedPKCrossReaderTypesStillPatch(t *testing.T) {
+	table := &ir.Table{
+		Name: "metrics",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, Unsigned: true}},
+			{Name: "fl", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+		},
+		PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	// COPY side keys the PK as uint64 (VStream decode) and carries ROUNDED floats.
+	inner := &fakeInnerReader{rows: []ir.Row{
+		{"id": uint64(1), "fl": float64(8388610)},
+		{"id": uint64(2), "fl": float64(-123457)},
+	}}
+	// Exact side keys the SAME PK as int64 (RowReader decode) with the TRUE float32s.
+	src := exactSourceEngine{rows: []ir.Row{
+		{"id": int64(1), "fl": float64(float32(8388608))},
+		{"id": int64(2), "fl": float64(float32(-123456.789))},
+	}}
+
+	plan := planBackupFloatRepair(&ir.Schema{Tables: []*ir.Table{table}})
+	pr := newFloatExactPatchReader(inner, src, "dsn", plan, 0, false)
+	ch, err := pr.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	patched := 0
+	for row := range ch {
+		fl := row["fl"].(float64)
+		// Every row's exact float32 must have landed despite the int64/uint64
+		// key-type divergence between the two readers.
+		want := map[uint64]float64{1: float64(float32(8388608)), 2: float64(float32(-123456.789))}[row["id"].(uint64)]
+		if math.Float32bits(float32(fl)) != math.Float32bits(float32(want)) {
+			t.Errorf("id %v: fl = %v; want exact %v — the unsigned PK missed the exact map (int64 vs uint64 key split, audit M-4 review)", row["id"], fl, want)
+		}
+		patched++
+	}
+	if err := pr.Err(); err != nil {
+		t.Fatalf("patch reader Err: %v", err)
+	}
+	if patched != 2 {
+		t.Fatalf("streamed %d rows; want 2", patched)
+	}
+}
+
 // TestFloatExactPatchReader_NonPlanTablePassthrough pins that a table with
 // no repairable FLOAT column streams through the wrapper unchanged (the
 // inner reader is used directly, no exact scan).
@@ -486,10 +539,19 @@ func TestFloatPatchKey(t *testing.T) {
 	if k(ir.Row{"a": "x\x00", "b": "y"}, "a", "b") == k(ir.Row{"a": "x", "b": "\x00y"}, "a", "b") {
 		t.Error("a NUL carried inside a PK value must not shift the component boundary (audit M-4)")
 	}
-	// audit M-4, direction 2 — type-blindness: int64(1) and "1" both render
-	// `1` under `%v`, so a row keyed on the integer and one keyed on the
-	// string PK collided. The `%T` tag splits them.
-	if k(ir.Row{"a": int64(1)}, "a") == k(ir.Row{"a": "1"}, "a") {
-		t.Error("int64(1) and \"1\" must produce distinct keys (type tag — audit M-4)")
+	// audit M-4 REVIEW — the cross-reader match that MUST hold. floatPatchKey
+	// bridges two readers that decode the SAME unsigned-integer PK column to
+	// different Go types: the exact-scan RowReader yields int64, the VStream
+	// COPY decode yields uint64. `%v` renders both to "42" so the row patches;
+	// a `%T` type tag (the first M-4 cut) split them and missed the patch for
+	// every unsigned-integer PK — the MySQL autoincrement norm — a HIGH
+	// fidelity regression. These keys MUST be EQUAL.
+	if k(ir.Row{"a": int64(42)}, "a") != k(ir.Row{"a": uint64(42)}, "a") {
+		t.Error("int64(42) and uint64(42) must produce the SAME key — the exact-scan and VStream readers decode an unsigned PK to different Go types, and a type tag would miss the patch (audit M-4 review)")
+	}
+	// The same must hold for a BIGINT UNSIGNED >2⁶³ that decodes to a string
+	// on the exact side and uint64 on the VStream side.
+	if k(ir.Row{"a": "18446744073709551615"}, "a") != k(ir.Row{"a": uint64(18446744073709551615)}, "a") {
+		t.Error("a >2^63 unsigned PK (string vs uint64 across readers) must produce the SAME key (audit M-4 review)")
 	}
 }

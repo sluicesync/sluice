@@ -304,20 +304,33 @@ func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchT
 // OTHER row's archived record, a silent wrong-value in a backup that
 // verifies green (audit M-4).
 //
-// The previous shape (`%v` joined with a bare NUL) was NOT collision-safe
-// in two directions: a boundary shift — ("a\x00","b") and ("a","\x00b")
-// render identically under a NUL-significant collation like utf8mb4_bin,
-// which MySQL VARCHAR admits — and type-blindness, e.g. int64(1) vs "1".
-// This reuses the package's own length-prefix + type-tag encoding (B-5's
-// pkValueKey / writeLengthPrefixed): `<len>\x1e<type>\x1f<value>` per
-// component makes every boundary unambiguous however the payload is
-// spelled, so the concatenation is injective. A type-tag split (the same
-// value decoding as []byte once and string once) errs toward LESS merging
-// — the safe direction, since it can only fail to patch, never mis-patch.
+// The previous shape (`%v` joined with a bare NUL) was NOT collision-safe:
+// a boundary shift — ("a\x00","b") and ("a","\x00b") render identically
+// under a NUL-significant collation like utf8mb4_bin, which MySQL VARCHAR
+// admits — merged two distinct rows. `writeLengthPrefixed` fixes exactly
+// that: `<len>\x1e<value>` per component makes every boundary unambiguous
+// however the payload is spelled, so distinct composite PKs never collide.
+//
+// Deliberately NO `%T` type tag here — this is the ONE place it would be
+// WRONG. Unlike B-5's single-reader pkValueKey (both sides decode from the
+// same CDC event stream, so a type tag safely splits a []byte-vs-string
+// wobble), floatPatchKey bridges TWO readers: the exact-scan side is the
+// MySQL RowReader and the map-lookup side is the VStream COPY decode, and
+// they decode the SAME unsigned-integer PK column to DIFFERENT Go types —
+// the RowReader yields int64 (TINYINT..INT UNSIGNED, and BIGINT UNSIGNED
+// ≤2⁶³ on the binary protocol) while the VStream decode yields uint64, and
+// a BIGINT UNSIGNED >2⁶³ is int64-string on one side and uint64 on the
+// other. `%v` renders all of these to the same decimal text, so they MATCH
+// and the row is patched; a `%T` tag would split int64 from uint64 and miss
+// the patch for EVERY unsigned-integer PK — the MySQL autoincrement norm —
+// regressing exact repair to display-rounded (audit M-4 review). The
+// type-blindness a tag would otherwise guard (int64(1) vs "1") is
+// unreachable here: a PK column has one fixed schema type per reader, so no
+// two rows of one table present the same column as different families.
 func floatPatchKey(row ir.Row, pkCols []string) string {
 	var b strings.Builder
 	for _, c := range pkCols {
-		writeLengthPrefixed(&b, fmt.Sprintf("%T\x1f%v", row[c], row[c]))
+		writeLengthPrefixed(&b, fmt.Sprintf("%v", row[c]))
 	}
 	return b.String()
 }
