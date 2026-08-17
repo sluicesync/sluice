@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.127.1] - 2026-08-17
+
+A fast-follow patch closing the two Mediums and one Low that the post-v0.127.0 blind audit and regression cycle surfaced — every one a residual of v0.127.0's own audit-close fixes.
+
+### Fixed
+
+**A schema-existence probe error now halts instead of silently skipping every routed event (audit SL-1, silent-loss).** v0.127.0's M-2 fix turned a misrouted-namespace whole-stream drop into a loud halt by probing whether the target database/schema exists — but its condition halted only when the probe SUCCEEDED and found the schema absent. When the probe ITSELF errored (a transient deadline or connection reset on an overloaded or sharded target), the applier fell through to the unknown-table skip sentinel, dropping the event and advancing the stream position past it — a silent loss re-opening the exact window M-2 closed, on both the MySQL and PostgreSQL appliers, and contradicting the fix's own comment. The classification is now a pure helper on each engine: a probe error HALTS with the probe error and is never the skip sentinel; a confirmed-absent schema is the loud routing fault; only a confirmed-present schema yields the recoverable skip. Pinned by a four-branch unit test (the probe-error branch asserts the skip sentinel is never returned), mutation-verified red on both lanes.
+
+**The sharded-target refusal's shard-naming message is restored on the sync cold-start / `add-table` path (Bug 253).** v0.127.0's H-2 fix moved the sharded-target door later — behind the cold-start emptiness pre-flight probe — so adding a new (absent) table to a sharded Vitess/PlanetScale keyspace via sync cold-start or `schema add-table` refused with a generic vtgate `Error 1105 (table not found)` instead of the actionable `SLUICE-E-SCHEMA-TARGET-KEYSPACE-SHARDED` that names the shards and the specific new table(s). Loud and safe throughout (the table was never materialized, no data lost); the cost was operator guidance, and the release note's promise for this path went unmet. The emptiness probe now disambiguates an unclassified error via the reliable `information_schema` existence check — a confirmed-absent table defers to the create-phase door, which emits the coded refusal; a present table or an errored existence probe surfaces the original error. MySQL-flavor (Vitess/PlanetScale) targets only; the `migrate` path (whose state-store door fires earlier) was unaffected.
+
+### Changed
+
+**The vacuous-green guard now covers the fuzz-roundtrip workflow (audit CI-1).** H-6's meta-guard scanned three of the scheduled correctness workflows but omitted `fuzz-roundtrip.yml`, whose anchored `TestMigrate_FuzzRoundtrip` leg — the project's highest-value silent-loss catcher — could green on ZERO iterations if the test were renamed (`go test -run` exits 0 on no match). The leg now asserts it ran and passed, and the guard's scanned-file list covers it; mutation-verified.
+
+### Compatibility
+
+Drop-in from v0.127.0 — no schema/format/flag change. SL-1 and Bug 253 only alter behavior on error/edge paths (a probe error now halts loudly rather than skipping; an absent sharded-target table now gets the actionable refusal instead of an opaque `1105`).
+
 ## [0.127.0] - 2026-08-17
 
 This release closes the 2026-08-14 repository audit in its entirety — every finding across silent-loss/security, architecture, testing/CI, and performance is fixed and gated, which is why it is a minor bump.
