@@ -68,16 +68,22 @@ var (
 	_ ir.Verifier               = (*SchemaReader)(nil)
 
 	// SchemaWriter optional surfaces.
-	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)
-	_ ir.DDLPreviewer            = (*SchemaWriter)(nil)
-	_ ir.EmittedCheckPredictor   = (*SchemaWriter)(nil)
-	_ ir.IncrementalIndexBuilder = (*SchemaWriter)(nil)
-	_ ir.IndexBuildBudgetSetter  = (*SchemaWriter)(nil)
-	_ ir.SchemaDeltaApplier      = (*SchemaWriter)(nil)
-	_ ir.SequencePrimer          = (*SchemaWriter)(nil)
-	_ ir.ShapeDeltaApplier       = (*SchemaWriter)(nil)
-	_ ir.TableAnalyzer           = (*SchemaWriter)(nil)
-	_ ir.TableIndexedNotifier    = (*SchemaWriter)(nil)
+	// CheckExprDialectTranslator exposes the PG->MySQL CHECK-expr rewrite the
+	// DDL emitter already applies, so `schema diff` compares like-against-like
+	// on a PG-source migrate (audit M-5). A drift here silently reverts the
+	// MySQL-target diff to the untranslated comparison and re-opens the
+	// phantom-drift the exposure closed.
+	_ ir.CheckExprDialectTranslator = (*SchemaWriter)(nil)
+	_ ir.ColumnDDLPreviewer         = (*SchemaWriter)(nil)
+	_ ir.DDLPreviewer               = (*SchemaWriter)(nil)
+	_ ir.EmittedCheckPredictor      = (*SchemaWriter)(nil)
+	_ ir.IncrementalIndexBuilder    = (*SchemaWriter)(nil)
+	_ ir.IndexBuildBudgetSetter     = (*SchemaWriter)(nil)
+	_ ir.SchemaDeltaApplier         = (*SchemaWriter)(nil)
+	_ ir.SequencePrimer             = (*SchemaWriter)(nil)
+	_ ir.ShapeDeltaApplier          = (*SchemaWriter)(nil)
+	_ ir.TableAnalyzer              = (*SchemaWriter)(nil)
+	_ ir.TableIndexedNotifier       = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces.
 	_ ir.BatchedRowReader   = (*RowReader)(nil)

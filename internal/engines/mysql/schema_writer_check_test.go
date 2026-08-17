@@ -144,3 +144,42 @@ func TestMySQLCheckExprsEquivalent(t *testing.T) {
 		})
 	}
 }
+
+// TestSchemaWriter_TranslateCheckExprFromDialect is the audit-M-5 pin:
+// the MySQL SchemaWriter must expose the SAME PG->MySQL CHECK-expr rewrite
+// its DDL emitter applies, so `schema diff` compares like-against-like on a
+// PG-source migrate (the symmetric sibling of PostgreSQL's own exposure).
+// Before M-5 this method did not exist, so a PG-source CHECK reached the
+// MySQL-target diff untranslated and phantom-reported drift.
+func TestSchemaWriter_TranslateCheckExprFromDialect(t *testing.T) {
+	w := &SchemaWriter{}
+
+	// = ANY (ARRAY[...]) is PG's rendering of IN (...) — the translator
+	// folds it back to the MySQL IN form.
+	if got, ok := w.TranslateCheckExprFromDialect(`status = ANY (ARRAY['a'::text, 'b'::text])`, "postgres"); !ok ||
+		!strings.Contains(got, "IN (") || strings.Contains(got, "ANY") || strings.Contains(got, "ARRAY") {
+		t.Fatalf("PG = ANY(ARRAY[...]) did not translate to the MySQL IN form: (%q, %v)", got, ok)
+	}
+	// PG's `::type` cast syntax has no MySQL equivalent; the translator
+	// rewrites it to CAST(... AS ...) and no `::` survives.
+	if got, ok := w.TranslateCheckExprFromDialect("x::text = 'a'", "postgres"); !ok ||
+		!strings.Contains(strings.ToUpper(got), "CAST(") || strings.Contains(got, "::") {
+		t.Fatalf("PG cast did not translate to CAST(...): (%q, %v)", got, ok)
+	}
+	// A foreign source dialect must DECLINE (ok=false) so the diff compares
+	// the original text — the translator only speaks the one dialect its
+	// DDL emitter accepts.
+	if _, ok := w.TranslateCheckExprFromDialect("anything", "sqlite"); ok {
+		t.Fatal("a foreign dialect must decline (ok=false), not translate")
+	}
+	if _, ok := w.TranslateCheckExprFromDialect("anything", "mysql"); ok {
+		t.Fatal("the self dialect must decline (ok=false) — nothing to translate")
+	}
+	// An untranslatable PG-only construct (a POSIX regex `~`, which MySQL
+	// has no CHECK equivalent for) passes through UNCHANGED with ok=true —
+	// best-effort per the interface contract; the diff then reports the
+	// mismatch it would have reported anyway.
+	if got, ok := w.TranslateCheckExprFromDialect("x ~ 'foo'", "postgres"); !ok || !strings.Contains(got, "~") {
+		t.Fatalf("an untranslatable construct must pass through unchanged with ok=true: (%q, %v)", got, ok)
+	}
+}

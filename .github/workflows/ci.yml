@@ -775,6 +775,15 @@ jobs:
       - name: check filtered-leg non-vacuity coverage
         run: bash scripts/check-leg-nonvacuity-coverage.sh
 
+      # Cross-dialect CHECK-translator roster (audit M-5): every engine whose
+      # DDL emitter applies a translateExprFor* rewrite must ALSO expose it via
+      # ir.CheckExprDialectTranslator, or schema diff phantom-reports drift in
+      # that engine's target direction (MySQL shipped the translator but not the
+      # exposure). Derives its universe from the tree; a new translating engine
+      # that forgets the exposure fails here.
+      - name: check dialect-translator roster
+        run: bash scripts/check-dialect-translator-roster.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the

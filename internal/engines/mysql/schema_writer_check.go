@@ -124,6 +124,27 @@ func mysqlCheckConstraintExists(ctx context.Context, db *sql.DB, schema, tableNa
 	return present, nil
 }
 
+// TranslateCheckExprFromDialect implements [ir.CheckExprDialectTranslator]:
+// the SAME PG->MySQL expression rewrite this writer applies at DDL-emit
+// time ([translateExprForMySQL]), exposed for `schema diff`'s expected-side
+// comparison so a PG-source CHECK compared against the MySQL catalog's
+// read-back is translated to like-against-like instead of phantom-reporting
+// drift on a target migrate just created (audit M-5 — the MySQL-target
+// sibling of PostgreSQL's own translator exposure; both halves of the
+// symmetric MySQL<->PG dialect pair now expose the one mapping their DDL
+// emitters already apply). Best-effort per the interface contract: a
+// construct [translateExprForMySQL] cannot rewrite passes through unchanged
+// and the diff reports the mismatch it would have reported anyway.
+// Identifier requoting (the emit path's requoteMySQLReservedIdents) is
+// deliberately NOT applied here: the diff canonicalizer strips identifier
+// quoting, so the translator body alone is the correct comparison surface.
+func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool) {
+	if sourceDialect != translatableSourceDialect {
+		return "", false
+	}
+	return translateExprForMySQL(expr), true
+}
+
 // untranslatedPGToMySQLTokens lists tokens that survive
 // translateExprForMySQL passes unchanged when the source CHECK
 // expression uses PG-only constructs. A post-translation expression
