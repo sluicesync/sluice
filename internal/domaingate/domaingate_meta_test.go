@@ -44,12 +44,13 @@ func packageHasRawIRDispatch(t *testing.T, dir string) (sites []string, importsI
 			continue
 		}
 		for _, scope := range dispatchScopes(full) {
+			locals := localTypeSources(scope.node)
 			ast.Inspect(scope.node, func(n ast.Node) bool {
 				operand, ok := dispatchOperand(n)
 				if !ok {
 					return true
 				}
-				kind, ok := classifyOperand(operand)
+				kind, ok := classifyOperand(operand, locals)
 				if !ok || kind != operandRaw {
 					return true
 				}

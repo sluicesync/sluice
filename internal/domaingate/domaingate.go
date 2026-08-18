@@ -168,12 +168,13 @@ func Assert(t *testing.T, cfg Config) {
 			t.Fatalf("read %s: %v", path, rerr)
 		}
 		for _, scope := range dispatchScopes(f) {
+			locals := localTypeSources(scope.node)
 			ast.Inspect(scope.node, func(n ast.Node) bool {
 				operand, ok := dispatchOperand(n)
 				if !ok {
 					return true
 				}
-				kind, ok := classifyOperand(operand)
+				kind, ok := classifyOperand(operand, locals)
 				if !ok {
 					return true
 				}
@@ -331,7 +332,21 @@ const (
 // [operandUnwrapped] still counts toward the anti-vacuity floor, so the
 // floor measures "does this package still dispatch on column types"
 // rather than "does it still do so wrongly".
-func classifyOperand(operand ast.Expr) (string, bool) {
+//
+// locals maps single-assignment locals in the enclosing scope to their
+// source expression, so a dispatch routed through a local — the T-5 shape
+// `t := col.Type; switch t.(type)` — is graded by that source rather than
+// read as nothing (which silently dropped the site from both the finding
+// set AND the anti-vacuity floor). Pass a nil/empty map to grade only the
+// direct forms.
+func classifyOperand(operand ast.Expr, locals map[string]ast.Expr) (string, bool) {
+	return classifyOperandDepth(operand, locals, 0)
+}
+
+func classifyOperandDepth(operand ast.Expr, locals map[string]ast.Expr, depth int) (string, bool) {
+	if depth > 8 {
+		return "", false // a chain this deep is not a real dispatch-on-type
+	}
 	switch v := operand.(type) {
 	case *ast.SelectorExpr:
 		if typeFields[v.Sel.Name] {
@@ -345,8 +360,59 @@ func classifyOperand(operand ast.Expr) (string, bool) {
 		if sel.Sel.Name == unwrapFunc {
 			return operandUnwrapped, true
 		}
+	case *ast.Ident:
+		if src, ok := locals[v.Name]; ok {
+			return classifyOperandDepth(src, locals, depth+1)
+		}
 	}
 	return "", false
+}
+
+// localTypeSources maps each single-assignment local in a dispatch scope to
+// the expression it was assigned, so classifyOperand can follow a local back
+// to its source (T-5). A name assigned more than once ANYWHERE in the scope is
+// ambiguous — reassignment or block-shadowing — and is dropped, so following a
+// local can never invent a reading the code does not actually have. The scan
+// is function-level (Go's own scope granularity here), which is why the
+// once-only rule is the safety net rather than precise block scoping.
+func localTypeSources(scope ast.Node) map[string]ast.Expr {
+	count := map[string]int{}
+	source := map[string]ast.Expr{}
+	ast.Inspect(scope, func(n ast.Node) bool {
+		switch a := n.(type) {
+		case *ast.AssignStmt:
+			if len(a.Lhs) == 1 && len(a.Rhs) == 1 {
+				if id, ok := a.Lhs[0].(*ast.Ident); ok {
+					count[id.Name]++
+					source[id.Name] = a.Rhs[0]
+				}
+				return true
+			}
+			// A multi-value assignment (`a, b := …`) is never a single-source
+			// local; mark each lhs ambiguous so it can never be followed.
+			for _, l := range a.Lhs {
+				if id, ok := l.(*ast.Ident); ok {
+					count[id.Name] += 2
+				}
+			}
+		case *ast.ValueSpec:
+			if len(a.Names) == 1 && len(a.Values) == 1 {
+				count[a.Names[0].Name]++
+				source[a.Names[0].Name] = a.Values[0]
+				return true
+			}
+			for _, nm := range a.Names {
+				count[nm.Name] += 2
+			}
+		}
+		return true
+	})
+	for name, c := range count {
+		if c != 1 {
+			delete(source, name)
+		}
+	}
+	return source
 }
 
 // exprText renders an expression back to source for the key and the

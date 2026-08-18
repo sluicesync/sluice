@@ -69,4 +69,10 @@ var mysqlDomainDispatchExemptions = map[string]string{
 	"schema_reader.go:jsonValidCheckTarget:col.Type": "SOURCE-SIDE: this IS the MySQL catalog read that " +
 		"produces the IR; nothing upstream of it can have wrapped a type.",
 	"schema_reader.go:applyMariaDBGeometrySRID:col.Type": "SOURCE-SIDE: same MySQL catalog read.",
+	"row_writer.go:prepareValue:t": "DOMAIN-PEELED-FIRST (surfaced by T-5's local-variable following): " +
+		"prepareValue reads the declared type into `t := col.Type`, and its FIRST arm — `t.(ir.Domain)` at " +
+		"row_writer.go:858 — IS the transparency handler: it unwraps to the base type, synthesizes a " +
+		"base-typed column, and recurses. So every later raw arm on `t` (`t.(ir.Set)` at :867, …) is reached " +
+		"ONLY for a non-domain `t`; the raw read is correct by construction because the domain case is peeled " +
+		"off and re-entered with its base type before any of them run. Verifiable in-function, not a promise.",
 }
