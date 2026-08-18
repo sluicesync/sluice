@@ -119,7 +119,14 @@ func NewTableCodec(table *ir.Table) (*TableCodec, error) {
 		}
 		group[col.Name] = parquet.Optional(node)
 		c.columns = append(c.columns, columnCodec{name: col.Name, encode: enc})
-		switch t := col.Type.(type) {
+		// A-1 (Tier-3 audit): UNWRAP the Domain before dispatching on the base
+		// type. columnNode (which built the leaf node above) already unwraps,
+		// so a Domain-over-Geometry / -over-Enum exports its WKB / label leaf
+		// correctly — but this metadata switch saw the bare `ir.Domain`, matched
+		// no arm, and SILENTLY omitted the GeoParquet `crs` (projected metres
+		// presented as degrees) or the enum value list. Unwrap so the metadata
+		// tracks the leaf the node emits.
+		switch t := ir.UnwrapDomain(col.Type).(type) {
 		case ir.Enum:
 			enumValues[col.Name] = t.Values
 		case ir.Set:

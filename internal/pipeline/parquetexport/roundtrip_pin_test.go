@@ -739,6 +739,61 @@ func TestPin_EnumMetadata(t *testing.T) {
 	}
 }
 
+// TestPin_DomainWrappedMetadata is the audit-A-1 pin: the file-metadata switch
+// must UNWRAP an ir.Domain before dispatching on the base type. columnNode
+// unwraps and emits the correct leaf (WKB / enum label), but the metadata
+// switch saw the bare ir.Domain, matched no arm, and SILENTLY omitted the
+// GeoParquet crs / enum value list — an omitted crs presents projected metres
+// as degrees. The PG reader wraps translated base types in ir.Domain, so this
+// is reachable. Pins Domain-over-Enum and Domain-over-Geometry.
+func TestPin_DomainWrappedMetadata(t *testing.T) {
+	// Domain over Enum → MetaEnumValues must carry the label list.
+	codecEnum, err := NewTableCodec(oneColTable(ir.Domain{Name: "mood_dom", BaseType: ir.Enum{Values: []string{"happy", "sad"}}}))
+	if err != nil {
+		t.Fatalf("NewTableCodec (domain enum): %v", err)
+	}
+	var enumMeta map[string][]string
+	if err := json.Unmarshal([]byte(codecEnum.Metadata[MetaEnumValues]), &enumMeta); err != nil || len(enumMeta["v"]) != 2 {
+		t.Fatalf("A-1: domain-over-enum omitted MetaEnumValues: %q (%v)", codecEnum.Metadata[MetaEnumValues], err)
+	}
+
+	// Domain over Geometry(SRID 3857) → the geo block must carry the crs.
+	codecGeo, err := NewTableCodec(&ir.Table{Name: "t", Columns: []*ir.Column{
+		{Name: "dg", Type: ir.Domain{Name: "geom_dom", BaseType: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 3857}}, Nullable: true},
+	}})
+	if err != nil {
+		t.Fatalf("NewTableCodec (domain geometry): %v", err)
+	}
+	raw := codecGeo.Metadata[MetaGeo]
+	if raw == "" {
+		t.Fatal("A-1: domain-over-geometry produced NO geo metadata block — crs silently omitted")
+	}
+	var block struct {
+		Columns map[string]struct {
+			CRS json.RawMessage `json:"crs"`
+		} `json:"columns"`
+	}
+	if err := json.Unmarshal([]byte(raw), &block); err != nil {
+		t.Fatalf("geo metadata does not parse: %v\n%s", err, raw)
+	}
+	c, ok := block.Columns["dg"]
+	if !ok {
+		t.Fatalf("A-1: domain-over-geometry column absent from geo block: %s", raw)
+	}
+	if c.CRS == nil {
+		t.Fatalf("A-1: domain-over-geometry has NO crs key — projected metres would read as degrees (silent-loss): %s", raw)
+	}
+	var crs struct {
+		ID struct {
+			Authority string `json:"authority"`
+			Code      int    `json:"code"`
+		} `json:"id"`
+	}
+	if err := json.Unmarshal(c.CRS, &crs); err != nil || crs.ID.Authority != "EPSG" || crs.ID.Code != 3857 {
+		t.Fatalf("A-1: domain-over-geometry crs = %s (err %v); want EPSG:3857", c.CRS, err)
+	}
+}
+
 // TestPin_ArrayElementFamilies is the array-specific Bug-74 matrix:
 // each element FAMILY (native / string-leaf / temporal / decimal) ×
 // {1-D value, NULL element, empty, NULL array, multi-dim refusal}.

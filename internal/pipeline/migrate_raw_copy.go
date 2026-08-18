@@ -214,7 +214,15 @@ func identityProjection(table *ir.Table) bool {
 		return false
 	}
 	for _, c := range table.Columns {
-		switch c.Type.(type) {
+		// A-2 (Tier-3 audit): UNWRAP the Domain before testing the exclusion.
+		// A Domain over a wire-format-sensitive base (ExtensionType/hstore,
+		// Geometry, Bit, Array) must stay OFF the raw byte-pipe lane exactly as
+		// the bare type does — the bare `ir.Domain` matched no arm, so a
+		// domain-over-excluded-type silently rode the raw lane the exclusion
+		// exists to keep it off (a `--raw-copy-format binary` hazard on matching
+		// majors). The PG reader wraps translated base types in ir.Domain, so
+		// this is reachable.
+		switch ir.UnwrapDomain(c.Type).(type) {
 		case ir.ExtensionType, ir.VerbatimType, ir.Bit, ir.Geometry, ir.Array:
 			return false
 		}

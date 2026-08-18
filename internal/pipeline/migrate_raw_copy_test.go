@@ -342,6 +342,27 @@ func TestIdentityProjection(t *testing.T) {
 			table: &ir.Table{Name: "t", Columns: []*ir.Column{typed("arr", ir.Array{})}},
 			want:  false,
 		},
+		{
+			// A-2 (Tier-3 audit): a DOMAIN over an excluded wire-format-
+			// sensitive base must also be excluded — the bare Domain matched no
+			// arm and silently rode the raw byte-pipe lane the exclusion exists
+			// to keep it off.
+			name:  "domain over an excluded base (geometry) is excluded",
+			table: &ir.Table{Name: "t", Columns: []*ir.Column{typed("dg", ir.Domain{Name: "geo_dom", BaseType: ir.Geometry{}})}},
+			want:  false,
+		},
+		{
+			name:  "domain over an excluded base (extension) is excluded",
+			table: &ir.Table{Name: "t", Columns: []*ir.Column{typed("dv", ir.Domain{Name: "vec_dom", BaseType: ir.ExtensionType{Extension: "vector", Name: "vector"}})}},
+			want:  false,
+		},
+		{
+			// A domain over a PLAIN base stays identity (the exclusion is about
+			// wire-sensitive types, not the Domain wrapper itself).
+			name:  "domain over a plain base is still identity",
+			table: &ir.Table{Name: "t", Columns: []*ir.Column{typed("dp", ir.Domain{Name: "txt_dom", BaseType: ir.Varchar{Length: 20}})}},
+			want:  true,
+		},
 	}
 
 	for _, tc := range tests {
