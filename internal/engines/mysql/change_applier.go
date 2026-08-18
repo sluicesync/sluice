@@ -332,6 +332,22 @@ type ChangeApplier struct {
 	// is one round-trip; hit is a map lookup.
 	colTypeCache map[string]map[string]*ir.Column
 
+	// skipVerdictCache maps "schema.table" → the time a CONFIRMED
+	// unknown-target-table skip verdict was reached (audit P-1). It
+	// short-circuits colTypesFor's 3-probe catalog chain (columns query +
+	// TABLES + SCHEMATA) for a table already known-missing, so a bulk load
+	// into a never-forwarded table stops paying per-event catalog
+	// round-trips — the lag generator H-4's UPSERT-coalescing fix left
+	// behind (probes it never touched). ONLY the recoverable
+	// errUnknownTargetTable verdict is cached — never a probe error or a
+	// routing-fault halt, so M-2/SL-1's refuse-to-guess semantics still
+	// re-evaluate every time. The entry EXPIRES after skipVerdictTTL so a
+	// mid-stream `schema add-table` (which creates the table out-of-band and
+	// emits NO DDL event to this applier) is picked up within the TTL rather
+	// than skipped until restart; a same-stream DDL that creates the table
+	// also drops it via invalidateMetadataCaches.
+	skipVerdictCache map[string]time.Time
+
 	// skipWarn tracks which unknown target tables have already had their
 	// once-per-applier-lifetime skip WARN (audit C-11). The durable
 	// count lives in sluice_cdc_skipped_tables (see recordSkippedTable);
@@ -1643,6 +1659,13 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 // halt-vs-skip asymmetry between the two engines).
 var errUnknownTargetTable = errors.New("mysql: applier: target table does not exist")
 
+// skipVerdictTTL bounds how long colTypesFor trusts a cached
+// unknown-target-table skip verdict before re-probing (audit P-1). Short
+// enough that a mid-stream `schema add-table` recovery is picked up promptly;
+// long enough that a high-skip bulk load pays O(distinct-missing-tables per
+// TTL) catalog probes instead of O(events).
+var skipVerdictTTL = 30 * time.Second
+
 // targetTableExists reports whether schema.table exists on the target,
 // via information_schema.TABLES. It is the structural classifier
 // behind [errUnknownTargetTable] — consulted only on colTypesFor's
@@ -1766,6 +1789,12 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	if cached, ok := a.cachedColTypes(qn); ok {
 		return cached, nil
 	}
+	// P-1: a table CONFIRMED-missing within skipVerdictTTL short-circuits the
+	// 3-probe catalog chain below — the skip is still the skip, and re-running
+	// columns+TABLES+SCHEMATA per event is the crawl H-4 left behind.
+	if a.cachedSkipVerdict(qn) {
+		return nil, fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
+	}
 	// loadTableSchema queries information_schema directly; we use the
 	// applier's *sql.DB rather than the open tx because the lookup is
 	// effectively read-only metadata that is stable across the tx
@@ -1792,7 +1821,13 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 			// advanced — the loud halt C-11 replaced, turned silent. Probe
 			// the schema: only a CONFIRMED-present schema yields the skip.
 			schemaOK, scErr := targetSchemaExists(ctx, a.db, schema)
-			return nil, classifyMissingTargetMySQL(schema, table, schemaOK, scErr)
+			verdict := classifyMissingTargetMySQL(schema, table, schemaOK, scErr)
+			// P-1: cache ONLY the recoverable skip verdict — never a probe
+			// error or routing-fault halt (those must re-evaluate).
+			if errors.Is(verdict, errUnknownTargetTable) {
+				a.storeSkipVerdict(qn)
+			}
+			return nil, verdict
 		}
 		return nil, err
 	}

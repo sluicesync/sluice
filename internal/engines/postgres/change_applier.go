@@ -325,6 +325,20 @@ type ChangeApplier struct {
 	// lazily on the first sight of a table — same shape as pkCache.
 	colTypeCache map[string]map[string]*ir.Column
 
+	// skipVerdictCache maps "schema.table" → the time a CONFIRMED
+	// unknown-target-table skip verdict was reached (audit P-1). It
+	// short-circuits colTypesFor's catalog chain — which on PG is the
+	// heaviest of any engine (an enum-type sweep, the columns query, and
+	// both PostGIS view lookups) — for a table already known-missing, so a
+	// bulk load into a never-forwarded table stops paying those round-trips
+	// per event (the crawl H-4's UPSERT coalescing left behind). ONLY the
+	// recoverable errUnknownTable verdict is cached — never a probe error or
+	// routing-fault halt, so M-2/SL-1's refuse-to-guess still re-evaluates.
+	// Entries EXPIRE after skipVerdictTTL so a mid-stream `schema add-table`
+	// (out-of-band, no DDL event to this applier) is picked up within the
+	// TTL; a same-stream DDL also drops the entry via invalidateMetadataCaches.
+	skipVerdictCache map[string]time.Time
+
 	// schemaDirtyTables marks (routed) qualified table names that have
 	// crossed a forwarded schema boundary in THIS applier's lifetime
 	// (ADR-0091 F7a GAP #3). DML on a dirty table is executed with
@@ -1542,6 +1556,13 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 // and can outlive slot/binlog retention).
 var errUnknownTable = errors.New("postgres: applier: target table does not exist")
 
+// skipVerdictTTL bounds how long colTypesFor trusts a cached
+// unknown-target-table skip verdict before re-probing (audit P-1). Short
+// enough that a mid-stream `schema add-table` recovery is picked up promptly;
+// long enough that a high-skip bulk load pays O(distinct-missing-tables per
+// TTL) catalog probes instead of O(events).
+var skipVerdictTTL = 30 * time.Second
+
 // dispatch routes a single change to its SQL form on the open tx.
 //
 // Events targeting a table that doesn't exist on the destination
@@ -1854,8 +1875,19 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (
 	if cached, ok := a.cachedColTypes(qn); ok {
 		return cached, nil
 	}
+	// P-1: a table CONFIRMED-missing within skipVerdictTTL short-circuits
+	// loadColumnTypes' full catalog chain (enum sweep + columns + PostGIS
+	// views) — re-running it per event is the crawl H-4 left behind.
+	if a.cachedSkipVerdict(qn) {
+		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
+	}
 	out, err := loadColumnTypes(ctx, a.db, schema, table)
 	if err != nil {
+		// P-1: cache ONLY the recoverable skip verdict — never a probe error
+		// or routing-fault halt (those must re-evaluate every time).
+		if errors.Is(err, errUnknownTable) {
+			a.storeSkipVerdict(qn)
+		}
 		return nil, err
 	}
 	a.storeColTypes(qn, out)

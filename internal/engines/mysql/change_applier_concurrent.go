@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
@@ -69,6 +70,28 @@ func (a *ChangeApplier) storeColTypes(qn string, cols map[string]*ir.Column) {
 		a.colTypeCache = make(map[string]map[string]*ir.Column)
 	}
 	a.colTypeCache[qn] = cols
+}
+
+// cachedSkipVerdict reports whether qn has a CONFIRMED unknown-target-table
+// skip verdict still within skipVerdictTTL (audit P-1). A hit lets colTypesFor
+// skip the 3-probe catalog chain. RLock-guarded for the concurrent lanes.
+func (a *ChangeApplier) cachedSkipVerdict(qn string) bool {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	at, ok := a.skipVerdictCache[qn]
+	return ok && time.Since(at) < skipVerdictTTL
+}
+
+// storeSkipVerdict records that qn is CONFIRMED-missing as of now. Called ONLY
+// on the recoverable errUnknownTargetTable verdict (never a probe error /
+// routing fault), so the negative cache can never mask an M-2/SL-1 halt.
+func (a *ChangeApplier) storeSkipVerdict(qn string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.skipVerdictCache == nil {
+		a.skipVerdictCache = make(map[string]time.Time)
+	}
+	a.skipVerdictCache[qn] = time.Now()
 }
 
 func (a *ChangeApplier) cachedKeyless(qn string) (keyless, ok bool) {
@@ -171,6 +194,10 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	delete(a.colTypeCache, qn)
 	delete(a.pkCache, qn)
 	delete(a.nonPKUniqueCache, qn)
+	// P-1: a same-stream DDL that creates/alters the table drops its
+	// negative skip verdict too, so the table is picked up at the barrier
+	// rather than waiting out skipVerdictTTL.
+	delete(a.skipVerdictCache, qn)
 }
 
 // --- Concurrent apply: MySQL adapter for the laneapply seam (ADR-0105) ---
