@@ -62,6 +62,7 @@ package backup
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -238,6 +239,17 @@ type rowAccumulator struct {
 	// bytes is the running [estimateChangeBytes] total for events. Kept
 	// incrementally so the retention cap never has to re-walk the chain.
 	bytes int64
+
+	// elem is this accumulator's node in the compactor's insertion-order
+	// list ([smartCompactor.order]). Cached so a key can be removed from the
+	// order in O(1): the old order was a []string scanned+spliced linearly on
+	// every removal, which went quadratic on a rekey-dense chain because
+	// [smartCompactor.pkChangeBarrier] removes two keys per PK-changing UPDATE
+	// (audit P-2). It is set the moment the accumulator is linked
+	// ([smartCompactor.routeRowEvent]) and is never nil for a live
+	// accumulator; a flushed/evicted accumulator is dropped from the map, so a
+	// stale elem is never re-dereferenced.
+	elem *list.Element
 }
 
 // flush collapses the accumulator's events into 0, 1, or 2 net
@@ -484,9 +496,20 @@ type smartCompactor struct {
 
 	// accumulators is keyed by `schema.table.pkkey`. Insertion order
 	// is tracked via order so flushAll preserves a deterministic
-	// emit ordering (lower index = earlier-arriving row).
+	// emit ordering (front = earlier-arriving row).
+	//
+	// order is a doubly-linked list of the map keys (each element's Value is
+	// the `string` key), front = earliest-arriving. A list rather than a
+	// []string so a key can be removed in O(1) via its accumulator's cached
+	// [rowAccumulator.elem] — the []string form scanned+spliced linearly on
+	// every removal and went quadratic on a rekey-dense chain (audit P-2).
+	// Every consumer that walked the slice in insertion order now walks the
+	// list front→back, which preserves that order identically; the one
+	// consumer that needed a different order (the largest-first eviction pass
+	// in [smartCompactor.reserve]) already materialised a sorted copy and
+	// still does.
 	accumulators map[string]*rowAccumulator
-	order        []string
+	order        *list.List
 
 	// tablesWithoutPK collects schema.table refs the compactor
 	// encountered without a declared PK — events for these tables
@@ -638,7 +661,7 @@ func newSmartCompactor(pkStrategy PKStrategy, schema *ir.Schema) *smartCompactor
 		pkStrategy:       resolvePKStrategy(pkStrategy),
 		schema:           schema,
 		accumulators:     make(map[string]*rowAccumulator),
-		order:            nil,
+		order:            list.New(),
 		tablesWithoutPK:  make(map[string]struct{}),
 		tablesUnmatched:  make(map[string]struct{}),
 		pkLookup:         make(map[string]pkLookupResult),
@@ -1047,14 +1070,18 @@ func (s *smartCompactor) flushKeyEmitting(mapKey string) error {
 		return err
 	}
 	s.retainedBytes -= acc.bytes
-	delete(s.accumulators, mapKey)
-	for i, k := range s.order {
-		if k == mapKey {
-			s.order = append(s.order[:i], s.order[i+1:]...)
-			break
-		}
-	}
+	s.unlinkAccumulator(mapKey, acc)
 	return nil
+}
+
+// unlinkAccumulator drops one accumulator from BOTH the order list (O(1) via
+// its cached [rowAccumulator.elem]) and the accumulators map. It touches
+// neither retainedBytes nor the sink — the caller accounts for the bytes and
+// emits (or discards) the events. Centralised so the two twinned drops cannot
+// drift apart.
+func (s *smartCompactor) unlinkAccumulator(mapKey string, acc *rowAccumulator) {
+	s.order.Remove(acc.elem)
+	delete(s.accumulators, mapKey)
 }
 
 // routeRowEvent dispatches a row event to its per-PK accumulator,
@@ -1106,7 +1133,7 @@ func (s *smartCompactor) routeRowEvent(schema, table string, row ir.Row, e ir.Ch
 			pkKey:  key,
 		}
 		s.accumulators[mapKey] = acc
-		s.order = append(s.order, mapKey)
+		acc.elem = s.order.PushBack(mapKey)
 	}
 	acc.events = append(acc.events, e)
 	acc.bytes += sz
@@ -1167,31 +1194,43 @@ func (s *smartCompactor) reserve(incoming int64) error {
 	lowWater := s.maxRetainedBytes / 2
 	fits := func() bool { return s.retainedBytes+incoming <= lowWater }
 
-	// Pass 1: the free ones, oldest first.
-	survivors := s.order[:0]
-	for _, k := range s.order {
+	// Pass 1: the free ones, oldest first. Walk the order list front→back
+	// (insertion order), evicting single-event chains until we fit. evict
+	// unlinks the node itself, so capturing next BEFORE evicting is what keeps
+	// the walk valid across the removal. A multi-event chain encountered while
+	// still over the low-water mark is skipped (kept) and the walk continues —
+	// exactly the old []string pass, which appended such chains to survivors
+	// and moved on.
+	for e := s.order.Front(); e != nil; {
+		if fits() {
+			break
+		}
+		next := e.Next()
+		k := e.Value.(string)
 		acc := s.accumulators[k]
-		if !fits() && len(acc.events) == 1 {
+		if len(acc.events) == 1 {
 			if err := s.evict(k, acc); err != nil {
 				return err
 			}
-			continue
 		}
-		survivors = append(survivors, k)
+		e = next
 	}
-	s.order = survivors
 	if fits() {
 		return nil
 	}
 
-	// Pass 2: the largest of what is left. Sorting a copy keeps s.order's
-	// insertion ordering intact for the survivors, which flushAll relies on.
-	bySize := make([]string, len(s.order))
-	copy(bySize, s.order)
+	// Pass 2: the largest of what is left. Materialise the survivors into a
+	// slice, sort by size descending, and evict from the front until we fit.
+	// evict unlinks each node from the order list directly, so the survivors
+	// keep their insertion order in the list untouched — which flushAll relies
+	// on — without a separate survivors rebuild.
+	bySize := make([]string, 0, s.order.Len())
+	for e := s.order.Front(); e != nil; e = e.Next() {
+		bySize = append(bySize, e.Value.(string))
+	}
 	sort.SliceStable(bySize, func(i, j int) bool {
 		return s.accumulators[bySize[i]].bytes > s.accumulators[bySize[j]].bytes
 	})
-	evicted := make(map[string]struct{}, len(bySize))
 	for _, k := range bySize {
 		if fits() {
 			break
@@ -1199,23 +1238,16 @@ func (s *smartCompactor) reserve(incoming int64) error {
 		if err := s.evict(k, s.accumulators[k]); err != nil {
 			return err
 		}
-		evicted[k] = struct{}{}
 	}
-	if len(evicted) == 0 {
-		return nil
-	}
-	survivors = s.order[:0]
-	for _, k := range s.order {
-		if _, gone := evicted[k]; !gone {
-			survivors = append(survivors, k)
-		}
-	}
-	s.order = survivors
 	return nil
 }
 
-// evict drains one chain into the output stream and drops it. The caller is
-// responsible for removing k from s.order.
+// evict drains one chain into the output stream and drops it — from both the
+// accumulators map and the order list, in O(1), via [smartCompactor.unlinkAccumulator].
+// (It used to leave the order removal to the caller, back when order was a
+// []string that could only be pruned by a full rebuild; the linked-list order
+// makes a per-key unlink cheap, so evict owns it and both reserve passes are
+// free of survivor rebuilds.)
 //
 // The F3 position invariant this used to enforce with its own slice splice now
 // lives in [smartCompactor.pushCollapsed]'s one-slot lookahead, which covers
@@ -1226,7 +1258,7 @@ func (s *smartCompactor) evict(k string, acc *rowAccumulator) error {
 		return err
 	}
 	s.retainedBytes -= acc.bytes
-	delete(s.accumulators, k)
+	s.unlinkAccumulator(k, acc)
 	s.chainsEvicted++
 	return nil
 }
@@ -1247,16 +1279,16 @@ func (s *smartCompactor) flushTable(schema, table string) {
 	// match the wrong table's chains (or none).
 	tk := tableRoutingKey(schema, table)
 	prefix := tk + "\x01"
-	newOrder := s.order[:0]
-	for _, k := range s.order {
+	for e := s.order.Front(); e != nil; {
+		next := e.Next()
+		k := e.Value.(string)
 		if strings.HasPrefix(k, prefix) {
-			s.retainedBytes -= s.accumulators[k].bytes
-			delete(s.accumulators, k)
-			continue
+			acc := s.accumulators[k]
+			s.retainedBytes -= acc.bytes
+			s.unlinkAccumulator(k, acc)
 		}
-		newOrder = append(newOrder, k)
+		e = next
 	}
-	s.order = newOrder
 }
 
 // flushAll flushes every accumulator into the sink in insertion-order,
@@ -1267,14 +1299,14 @@ func (s *smartCompactor) flushTable(schema, table string) {
 // closing TxCommit stays held and lands after them — which is what used to be
 // spelled out as `flushCollapsedInsideClosingTx`'s pop-flush-reappend dance.
 func (s *smartCompactor) flushAll() error {
-	for _, k := range s.order {
-		acc := s.accumulators[k]
+	for e := s.order.Front(); e != nil; e = e.Next() {
+		acc := s.accumulators[e.Value.(string)]
 		if err := s.pushCollapsed(acc.flush()); err != nil {
 			return err
 		}
 	}
 	s.accumulators = make(map[string]*rowAccumulator)
-	s.order = nil
+	s.order = list.New()
 	s.retainedBytes = 0
 	return nil
 }
