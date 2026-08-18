@@ -612,7 +612,12 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 	case ir.TxBegin:
 		o.sawTxMarker = true
 		// Boundary marker, no lane work — mark committed so the contiguous
-		// frontier can advance past it once the tx's rows (lower seqs) land.
+		// frontier can advance past it as soon as this seq (and all lower) are
+		// committed. C-2 (Tier-3 audit): the tx's OWN rows carry HIGHER seqs and
+		// land AFTER this TxBegin (nextSeq increments per event); the correct
+		// "lower seqs are the tx's rows" reasoning belongs to TxCommit below,
+		// where the rows precede the commit — this parenthetical had them
+		// inverted.
 		o.frontier.MarkCommitted(seq)
 		return nil
 	case ir.TxCommit:
@@ -693,11 +698,29 @@ func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 // DIFFERENT-token successor arrives; on a quiet / low-volume stream no such
 // successor comes, so the last applied change's watermark would never persist
 // (Bug 159). The idle-checkpoint tick and clean end-of-stream call this to
-// record that trailing boundary. Safe because on a marker-LESS stream every
-// row carries a distinct, monotone position token (e.g. the pgtrigger
-// change-log id), so a settled prevSeq IS a resume-safe point — there is no
-// in-flight successor sharing its token. Idempotent via lastNotedSeq.
-// Coordinator-goroutine-only. No-op on a marker stream (prevSeq stays 0).
+// record that trailing boundary. The safety of recording a settled prevSeq as
+// a resume point differs by marker-less source, and C-1 (Tier-3 audit) found
+// this doc previously overstated it for VStream:
+//
+//   - pgtrigger: every row carries a DISTINCT, monotone position token (the
+//     change-log id), so a settled prevSeq IS a resume-safe point — no
+//     in-flight successor shares its token.
+//   - VStream: the VGTID is STABLE within a source transaction (see handle()'s
+//     doc and the prevSeq doc), so a settled prevSeq can sit MID-transaction on
+//     a shared token. That is still safe ONLY because of a load-bearing wire-
+//     ordering premise: the reader advances r.currentVgtid to the tx's VGTID
+//     only on the TRAILING VGTID event (`mysql/cdc_vstream.go:1383`), so rows
+//     carry the PRE-transaction VGTID and a resume from a mid-tx checkpoint
+//     REPLAYS the partially-applied tx idempotently rather than skipping its
+//     tail. **UNVERIFIED PREMISE:** no test binds "a VStream ROW event carries
+//     a VGTID excluding its own transaction"; if a reader refactor ever stamped
+//     rows from the trailing VGTID, a crash after an idle-tick checkpoint would
+//     resume PAST a partly-applied tx and silently drop its tail. Filed for an
+//     integration pin (docs/dev/audit-backlog.md → C-1); the concurrent path
+//     engages by default on PlanetScale (ADR-0106), so this is worth binding.
+//
+// Idempotent via lastNotedSeq. Coordinator-goroutine-only. No-op on a marker
+// stream (prevSeq stays 0).
 func (o *Orchestrator) flushPendingBoundary() {
 	if o.prevSeq != 0 && o.prevSeq > o.lastNotedSeq {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
