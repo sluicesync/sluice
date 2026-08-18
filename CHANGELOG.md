@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.128.3] - 2026-08-18
+
+A concurrency fix in the Vitess/PlanetScale VStream cold-start path: closing a snapshot stream now waits for its COPY pump goroutines to exit before tearing down the connection, closing a shutdown-time data race.
+
+### Fixed
+
+**Closing a VStream snapshot stream no longer races its COPY pump goroutines against the connection teardown (audit follow-up — the last open-finding on the pump-join roster).** `vstreamSnapshotStream.close()` cancelled the gRPC context, broadcast its condition variable, and closed the connection — but never waited for the COPY pump goroutines (and, on the concurrent auto-shard path, their per-shard sub-goroutines) to actually exit. A straggling pump could then touch the just-closed connection, an unsynchronised access the `-race` detector flags and a use-after-close in the worst ordering. `close()` now joins the pumps before closing the connection: it cancels the context, flips the pumps' terminal state under the lock and broadcasts (the load-bearing step — a pump parked in enqueue backpressure waits on the condition variable, which does not observe context cancellation, so it needs the explicit terminal-state flip to wake and exit rather than re-park), waits on a `WaitGroup` that tracks every COPY goroutine (outside the lock, so a pump blocked on the lock cannot deadlock the wait), and only then closes the connection. A clean end-of-COPY close stays a no-op that never overwrites the finished position. Pinned by three deterministic unit tests plus a real-vttestserver integration test that closes mid-copy 50 times over on both the single-stream and concurrent (2-shard) configurations; the shutdown data race itself is confirmed by the CI `-race` integration run. The pump-join roster's last deferred entry is now closed.
+
+### Compatibility
+
+Drop-in from v0.128.2 — no schema, format, or flag change. This only affects the shutdown ordering of a VStream (Vitess/PlanetScale) cold-start snapshot stream; steady-state copy and CDC behavior is unchanged. Anyone running migrate or sync from a Vitess/PlanetScale source benefits from the tightened shutdown, though the race window was narrow and shutdown-only.
+
 ## [0.128.2] - 2026-08-18
 
 Two more steps on the domain story plus an O(n²) removed from backup compaction: a domain over an ENUM now migrates to a Postgres target, and the rekey-dense-chain compaction path that could take tens of minutes of CPU now takes under a second.
