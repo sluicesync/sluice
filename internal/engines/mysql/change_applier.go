@@ -1703,8 +1703,14 @@ func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, e
 // probe error and is NEVER classified as the skip sentinel — doing so would
 // advance the stream position past the dropped event, a silent loss on a
 // transient deadline/reset (SL-1, audit 2026-08-17). Extracted as a pure
-// function so the probe-error branch is unit-pinnable without a real server.
-func classifyMissingTargetMySQL(schema, table string, schemaOK bool, scErr error) error {
+// function so every branch is unit-pinnable without a real server; the caller
+// supplies both probe results. tableExists is the errno-disambiguated verdict
+// (PG-1's MySQL sibling): MySQL's information_schema is ALSO privilege-filtered,
+// so a table the apply role cannot see returns zero rows exactly like a missing
+// one — a direct table access separates them by errno (1146 missing vs 1142
+// access-denied), and skipping an existing-but-forbidden table would advance
+// the position past its DML (silent loss; pre-C-11 the INSERT failed 1142).
+func classifyMissingTargetMySQL(schema, table string, schemaOK bool, scErr error, tableExists bool, tableErr error) error {
 	if scErr != nil {
 		return fmt.Errorf(
 			"mysql: applier: could not determine whether target database %q exists "+
@@ -1721,7 +1727,58 @@ func classifyMissingTargetMySQL(schema, table string, schemaOK bool, scErr error
 				"DATABASE is not.) table %s.%s", schema, schema, table,
 		)
 	}
+	if tableErr != nil {
+		return fmt.Errorf(
+			"mysql: applier: could not determine whether target table %s.%s exists "+
+				"(access probe failed) — refusing to classify it as a skippable missing table: %w",
+			schema, table, tableErr,
+		)
+	}
+	if tableExists {
+		// PG-1 sibling: the table EXISTS (the access probe hit 1142
+		// ER_TABLEACCESS_DENIED, or succeeded) but information_schema returned
+		// no columns — the apply role lacks privileges on it. Skipping would
+		// advance the position past DML for an existing table (silent loss).
+		return fmt.Errorf(
+			"mysql: applier: target table %s.%s EXISTS but is invisible to the apply role — "+
+				"information_schema returned no columns while a direct access shows the table, so the role "+
+				"lacks privileges on it. This is a PRIVILEGE fault, not a missing table: "+
+				"GRANT SELECT, INSERT, UPDATE, DELETE ON %s.%s TO the apply role "+
+				"(`schema add-table` will NOT help — the table already exists)",
+			schema, table, schema, table,
+		)
+	}
 	return fmt.Errorf("%w: %s.%s", errUnknownTargetTable, schema, table)
+}
+
+// targetTablePrivilegeProbe distinguishes a genuinely-missing target table from
+// one that EXISTS but is invisible to the apply role (PG-1's MySQL sibling).
+// Both return zero rows from the privilege-filtered information_schema, so a
+// DIRECT metadata access is the discriminator: errno 1146 (ER_NO_SUCH_TABLE) =
+// genuinely missing → the recoverable skip; 1142 (ER_TABLEACCESS_DENIED_ERROR)
+// = exists but forbidden → the loud privilege halt; a SUCCESS (a rare race
+// where access was just granted) is treated as exists → halt (retriable,
+// self-heals when the next probe sees the columns) rather than a silent skip;
+// any other error refuses to guess. Returns (tableExists, probeErr).
+func targetTablePrivilegeProbe(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
+	stmt := "SELECT 1 FROM " + quoteIdent(schema) + "." + quoteIdent(table) + " LIMIT 1"
+	var dummy int
+	err := db.QueryRowContext(ctx, stmt).Scan(&dummy)
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		// The query RAN (rows or an empty table) → accessible → exists (the
+		// rare just-granted race between the two probes).
+		return true, nil
+	}
+	var mErr *mysql.MySQLError
+	if errors.As(err, &mErr) {
+		switch mErr.Number {
+		case 1146: // ER_NO_SUCH_TABLE
+			return false, nil
+		case 1142: // ER_TABLEACCESS_DENIED_ERROR
+			return true, nil
+		}
+	}
+	return false, err // refuse to guess
 }
 
 // recordSkippedTable is the audit-C-11 skip path: a CDC event targets
@@ -1821,9 +1878,14 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 			// advanced — the loud halt C-11 replaced, turned silent. Probe
 			// the schema: only a CONFIRMED-present schema yields the skip.
 			schemaOK, scErr := targetSchemaExists(ctx, a.db, schema)
-			verdict := classifyMissingTargetMySQL(schema, table, schemaOK, scErr)
+			// PG-1 sibling: information_schema is privilege-filtered, so a
+			// table that EXISTS but the apply role can't see looks missing;
+			// the errno probe (1146 vs 1142) tells them apart before a skip.
+			tableExists, tblErr := targetTablePrivilegeProbe(ctx, a.db, schema, table)
+			verdict := classifyMissingTargetMySQL(schema, table, schemaOK, scErr, tableExists, tblErr)
 			// P-1: cache ONLY the recoverable skip verdict — never a probe
-			// error or routing-fault halt (those must re-evaluate).
+			// error, routing-fault halt, or privilege halt (those must
+			// re-evaluate).
 			if errors.Is(verdict, errUnknownTargetTable) {
 				a.storeSkipVerdict(qn)
 			}

@@ -2097,9 +2097,33 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		// re-opening the exact window M-2 closed. Only a CONFIRMED-present
 		// schema yields the skip; a probe error HALTS with the probe error.
 		schemaOK, scErr := targetSchemaExists(ctx, db, schema)
-		return nil, classifyMissingTargetPostgres(schema, table, schemaOK, scErr)
+		// PG-1 (Tier-3 audit 2026-08-17): information_schema.columns is
+		// PRIVILEGE-FILTERED, so a table that EXISTS but on which the apply
+		// role holds no grant returns zero rows — identical to a genuinely
+		// absent table. Classifying it as the C-11 skip advances the position
+		// past every DML for an existing table (silent loss; pre-C-11 the
+		// INSERT failed loudly with 42501). to_regclass consults pg_class and
+		// needs only schema USAGE (which the role has, or schemaOK would be
+		// false), NOT any table grant — so it SEES the privilege-invisible
+		// table and disambiguates.
+		tableInCatalog, catErr := targetTableInCatalog(ctx, db, schema, table)
+		return nil, classifyMissingTargetPostgres(schema, table, schemaOK, scErr, tableInCatalog, catErr)
 	}
 	return cols, nil
+}
+
+// targetTableInCatalog reports whether schema.table exists in the target's
+// catalog via to_regclass — which requires only USAGE on the schema, never a
+// privilege on the table itself, so it sees a table that the privilege-filtered
+// information_schema hides (PG-1). quote_ident builds a safe qualified name for
+// hostile identifiers. A NULL result means genuinely-absent.
+func targetTableInCatalog(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
+	const q = `SELECT to_regclass(quote_ident($1) || '.' || quote_ident($2)) IS NOT NULL`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema, table).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // targetSchemaExists reports whether the named schema exists on the
@@ -2117,15 +2141,16 @@ func targetSchemaExists(ctx context.Context, db *sql.DB, schema string) (bool, e
 }
 
 // classifyMissingTargetPostgres decides how loadColumnTypes treats a table
-// whose information_schema lookup came back empty. The ambiguity is
-// table-absent vs whole-schema-absent (M-2): a CONFIRMED-present schema yields
+// whose information_schema lookup came back empty. The ambiguity is three-way:
+// table-absent, whole-schema-absent (M-2), or table-EXISTS-but-privilege-
+// invisible (PG-1). A CONFIRMED-present schema + genuinely-absent table yields
 // the recoverable [errUnknownTable] skip; a CONFIRMED-absent schema is the loud
-// routing-fault halt. A schema-probe ERROR (scErr != nil) HALTS with the probe
-// error and is NEVER classified as the skip sentinel — doing so would advance
-// the stream position past the dropped event, a silent loss on a transient
-// deadline/reset (SL-1, audit 2026-08-17). Pure function so the probe-error
-// branch is unit-pinnable without a real server.
-func classifyMissingTargetPostgres(schema, table string, schemaOK bool, scErr error) error {
+// routing-fault halt; a table the catalog SEES but information_schema hid is the
+// loud privilege halt (never a skip — that would advance the position past DML
+// for an EXISTING table). Any probe ERROR (scErr / catErr) HALTS and is NEVER
+// the skip sentinel (SL-1). Pure function so every branch is unit-pinnable
+// without a real server; the caller supplies both probe results.
+func classifyMissingTargetPostgres(schema, table string, schemaOK bool, scErr error, tableInCatalog bool, catErr error) error {
 	if scErr != nil {
 		return fmt.Errorf(
 			"postgres: applier: could not determine whether target schema %q exists "+
@@ -2140,6 +2165,29 @@ func classifyMissingTargetPostgres(schema, table string, schemaOK bool, scErr er
 				"or fix the source→target schema mapping (--target-schema / nsRename). (A MISSING TABLE in "+
 				"an existing schema is the recoverable C-11 skip; a missing SCHEMA is not.) table %s.%s",
 			schema, schema, table,
+		)
+	}
+	if catErr != nil {
+		return fmt.Errorf(
+			"postgres: applier: could not determine whether target table %s.%s exists in the catalog "+
+				"(to_regclass probe failed) — refusing to classify it as a skippable missing table: %w",
+			schema, table, catErr,
+		)
+	}
+	if tableInCatalog {
+		// PG-1: the table EXISTS in pg_class but information_schema returned no
+		// columns — the apply role has schema USAGE but no privilege on the
+		// table. This is NOT a missing table, and skipping it advances the
+		// position past every DML for an existing table (pre-C-11 the INSERT
+		// failed loudly with 42501). Halt naming the privilege, not the
+		// unrunnable `schema add-table` remedy.
+		return fmt.Errorf(
+			"postgres: applier: target table %s.%s EXISTS but is invisible to the apply role — "+
+				"information_schema returned no columns while the catalog shows the table, so the role "+
+				"lacks privileges on it. This is a PRIVILEGE fault, not a missing table: "+
+				"GRANT SELECT, INSERT, UPDATE, DELETE ON %s.%s TO the apply role "+
+				"(`schema add-table` will NOT help — the table already exists)",
+			schema, table, schema, table,
 		)
 	}
 	return fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
