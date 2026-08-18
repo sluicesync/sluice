@@ -329,7 +329,10 @@ func tableHasTimetzColumn(table *ir.Table) bool {
 		if col == nil {
 			continue
 		}
-		if t, ok := col.Type.(ir.Time); ok && t.WithTimeZone {
+		// UnwrapDomain (Bug 233): a DOMAIN over timetz stores as timetz, for
+		// which pgx registers no codec by default — the same registration the
+		// bare column needs (catalog Bug 71).
+		if t, ok := ir.UnwrapDomain(col.Type).(ir.Time); ok && t.WithTimeZone {
 			return true
 		}
 	}

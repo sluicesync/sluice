@@ -49,15 +49,22 @@
 // a dispatch and no gate file is the finding, whether or not it is an
 // engine. Current instantiations:
 //
-//   - internal/engines/mysql   (TestDomainTransparency_MySQLDispatchRoster)
-//   - internal/engines/sqlite  (TestDomainTransparency_SQLiteDispatchRoster)
-//   - internal/translate       (TestDomainTransparency_TranslateDispatchRoster)
+//   - internal/engines/mysql    (TestDomainTransparency_MySQLDispatchRoster)
+//   - internal/engines/sqlite   (TestDomainTransparency_SQLiteDispatchRoster)
+//   - internal/engines/postgres (TestDomainTransparency_PostgresDispatchRoster)
+//   - internal/translate        (TestDomainTransparency_TranslateDispatchRoster)
 //
-// internal/engines/postgres is deliberately absent and this is the
-// reason rather than an oversight: PG is the engine that HAS domains, so
-// its writer creates the DOMAIN rather than downgrading to a base type,
-// and "what does this column land as" is answered by the wrapper itself.
-// The class is about targets that must flatten.
+// internal/engines/postgres was originally left out on the theory that PG
+// re-creates the DOMAIN rather than flattening it, so "what does this
+// column land as" is answered by the wrapper. Audit A-3 corrected that:
+// PG is the engine that PRODUCES ir.Domain, and its writer still has 34
+// column-type dispatch sites a Domain reaches — six of them (COPY-vs-INSERT
+// routing and per-conn codec registration) took the wrong physical path for
+// a domain-wrapped verbatim/interval/timetz/macaddr8[]/vector/hstore column.
+// So PG is gated like every other dispatcher; its roster is almost all
+// written exemptions precisely because most of its per-base-type dispatch is
+// correctly answered by emitting the domain BY NAME — but that is now a
+// checked claim, not an assumption.
 //
 // # What a passing run proves, stated so it cannot be read as broader
 //

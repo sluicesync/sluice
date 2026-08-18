@@ -741,7 +741,10 @@ func (w *RowWriter) copyFromOnSQLConn(
 // COPY path needs to register the per-conn pgtype codec.
 func tableHasPGVectorColumn(table *ir.Table) bool {
 	for _, col := range table.Columns {
-		ext, ok := col.Type.(ir.ExtensionType)
+		// UnwrapDomain (Bug 233): a PG DOMAIN over vector(N) stores and COPYs
+		// as its base extension type, so the per-conn codec must be registered
+		// exactly as it is for a bare vector column.
+		ext, ok := ir.UnwrapDomain(col.Type).(ir.ExtensionType)
 		if !ok {
 			continue
 		}
@@ -782,7 +785,9 @@ func registerPGVectorCodec(ctx context.Context, conn *pgx.Conn, db *sql.DB) erro
 // Mirrors [tableHasPGVectorColumn].
 func tableHasHstoreColumn(table *ir.Table) bool {
 	for _, col := range table.Columns {
-		ext, ok := col.Type.(ir.ExtensionType)
+		// UnwrapDomain (Bug 233): a DOMAIN over hstore COPYs as hstore, so the
+		// codec registration must fire the same as for a bare hstore column.
+		ext, ok := ir.UnwrapDomain(col.Type).(ir.ExtensionType)
 		if !ok {
 			continue
 		}
@@ -811,7 +816,11 @@ func tableHasVerbatimColumn(table *ir.Table) bool {
 		if col == nil {
 			continue
 		}
-		if _, ok := col.Type.(ir.VerbatimType); ok {
+		// UnwrapDomain (Bug 233): a DOMAIN over a verbatim type (money / xml /
+		// pg_lsn / a range) has no sluice-side wire codec any more than the bare
+		// type does, so it must take the same text-INSERT path — routing it
+		// through binary COPY would mis-encode the text-carried value.
+		if _, ok := ir.UnwrapDomain(col.Type).(ir.VerbatimType); ok {
 			return true
 		}
 	}
@@ -833,7 +842,10 @@ func tableHasIntervalColumn(table *ir.Table) bool {
 		if col == nil {
 			continue
 		}
-		if _, ok := col.Type.(ir.Interval); ok {
+		// UnwrapDomain (Bug 233): a DOMAIN over the MySQL-TIME→INTERVAL override
+		// carries the same bare textual duration and must take the text-INSERT
+		// path, not binary COPY.
+		if _, ok := ir.UnwrapDomain(col.Type).(ir.Interval); ok {
 			return true
 		}
 	}

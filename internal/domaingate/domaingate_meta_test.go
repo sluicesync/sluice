@@ -99,7 +99,6 @@ func packageHasGateFile(dir string) bool {
 // FAILS the meta-walker below, and a listed package that gains a gate (or stops
 // dispatching) must be REMOVED — so the roster shrinks as the debt is paid.
 var ungatedDispatchRoster = map[string]string{
-	"engines/postgres": "A-3 remediation PRIORITY: the direct sibling of the gated mysql engine, 34 raw column-type dispatch sites (ddl_emit/row_writer/schema_writer/…) that a PG-sourced Domain reaches — needs its own domaingate gate file.",
 	"engines/mydumper": "A-3 remediation: mydumper reader/parse dispatch on column type; needs a gate or a domain-safety audit.",
 	"ir/diff":          "A-3 remediation: schema-diff column-shape normalization dispatches on ir.Integer; a Domain-over-Integer misses the AutoIncrement normalization (comparison nuance).",
 	"pipeline":         "A-3 remediation: infer-types / redact-preflight / where-pushdown dispatch on column type; needs a gate or a domain-safety audit.",

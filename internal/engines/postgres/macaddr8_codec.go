@@ -53,7 +53,9 @@ func tableHasMacaddr8ArrayColumn(table *ir.Table) bool {
 		if col == nil {
 			continue
 		}
-		arr, ok := col.Type.(ir.Array)
+		// UnwrapDomain (Bug 233): a DOMAIN over macaddr8[] COPYs as the same
+		// array whose element codec stock pgx does not register (OID 775).
+		arr, ok := ir.UnwrapDomain(col.Type).(ir.Array)
 		if !ok {
 			continue
 		}
