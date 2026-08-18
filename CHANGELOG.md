@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.128.1] - 2026-08-18
+
+A fast-follow patch completing the domain-transparency work v0.128.0 began: continuous CDC sync from a Postgres domain-typed source now runs end-to-end. It also corrects a v0.128.0 claim — that release said domains were handled across "every path that dispatches on a column's type", but one path was missed, and this closes it.
+
+### Fixed
+
+**Continuous sync from a Postgres source with `CREATE DOMAIN` columns no longer halts at the first CDC change (Bug 254).** v0.128.0 made domains transparent across the migrate, apply, backup, predicate, and redaction paths — but the Postgres CDC source READER dispatches on the pgoutput wire OID, not on the schema-declared `ir.Column.Type` the audit's `domaingate` walker covers. A domain has a dynamic per-database OID that matched no builtin type, so a domain-typed table cold-copied correctly and then the stream halted on the first row change with `postgres: cdc: unsupported column type OID <n> (typmod -1)` — loud, no data loss, but a working continuous sync was impossible for any domain-using source (identical on v0.127.x; not a v0.128.0 regression, but v0.128.0's own fixes made the gap conspicuous by fixing every neighbouring path). The reader now resolves a domain's wire OID to its ultimate base type via `pg_type.typbasetype` — the wire-side analogue of the unwrap the schema reader already did — carrying the base type's modifier (a `DOMAIN … AS varchar(10)` column decodes as `varchar(10)`, not a length-defaulted fallback, since the modifier lives in the catalog while the wire reports the domain column's own typmod as -1), flattening domain-over-domain, and resolving domains over an enum or an array through the existing enum/array arms. The decoded value is the base type, never re-wrapped, matching what the applier resolves from the target's `information_schema`. Pinned by a real-Postgres CDC round-trip (cold-copy then INSERT/UPDATE/DELETE, source==target) over a `{int, varchar(10), uuid, enum, int[], domain-over-domain}` matrix, plus a unit pin on the resolver; mutation-verified that disabling the domain arm reproduces the halt.
+
+### Compatibility
+
+Drop-in from v0.128.0 — no schema, format, or flag change. This corrects the v0.128.0 notes' "every path" phrasing: that release handled the migrate and apply paths, and this completes the CDC source-read path. Anyone running — or intending to run — continuous CDC sync from a Postgres source that uses domain types wants this release; migrate-only users are unaffected either way.
+
 ## [0.128.0] - 2026-08-18
 
 This release ships the remediation of the 2026-08-17 Tier-3 blind audit (grade B+) in full, and it is a minor bump for the breadth: the dominant theme is making Postgres `CREATE DOMAIN` columns transparent everywhere they are handled — a domain is a constraint wrapper over a base type, and a dozen column-type dispatch sites across the migrate, sync, backup, predicate, and redaction surfaces read the raw declared type and so sent a domain-wrapped column down the wrong branch. Alongside it are three continuous-CDC correctness fixes and a per-event probe-crawl the cache now short-circuits.
