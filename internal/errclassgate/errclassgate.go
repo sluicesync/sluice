@@ -22,8 +22,16 @@
 // catalog queries). A gate that can only see the engine it was born in will
 // keep re-learning the same lesson one engine at a time.
 //
-// So the walker lives here and every engine instantiates it. Adding an engine
-// without a gate file is itself a finding.
+// So the walker lives here. Every engine with a resumable-CDC parking surface
+// instantiates it (mysql, postgres, pgtrigger, sqlite-trigger); the bulk-read
+// RowReaders that also park via setErr (mydumper, sqlite) are terminal-by-
+// default-correct — a migrate read fault aborts and re-runs, so the retriable
+// carve-out the class is about does not apply — and are exempted by name. That
+// distinction is not a comment anyone has to trust: TestEverySetErrPackageHasA
+// GateOrReason derives the set of setErr-parking packages from the AST and
+// fails unless each carries a gate file OR a rostered reason, so adding an
+// engine (or growing a new park surface) without one is a build failure, not a
+// finding someone has to notice.
 package errclassgate
 
 import (

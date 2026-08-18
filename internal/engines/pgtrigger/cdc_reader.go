@@ -299,10 +299,7 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			// §7 — refuse-loudly on observed DDL. The polling loop
 			// terminates; the operator runs the drained-model
 			// recovery (ADR-0054 hint).
-			r.setErr(fmt.Errorf(
-				"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
-				b.ddl,
-			))
+			r.setErr(refuseObservedDDL(b.ddl))
 			return
 		}
 		for _, ev := range b.events {
@@ -382,6 +379,19 @@ func classifyPollError(err error) error {
 		return triggercdc.AsTransient(wrapped)
 	}
 	return triggercdc.ClassifyTransient(wrapped)
+}
+
+// refuseObservedDDL is the §7 refuse-loudly terminal for observed source-side
+// DDL: the trigger engine cannot forward a schema change, so it stops the
+// stream and hands the operator the drained-model recovery. It is a
+// PURPOSE-BUILT terminal — the opposite of an accidentally-unclassified park —
+// which is why the seterr gate accepts it as-is: routing it through the
+// transient classifier would be strictly wrong (this must never retry).
+func refuseObservedDDL(ddl string) error {
+	return fmt.Errorf(
+		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+		ddl,
+	)
 }
 
 // pollQuery renders the one-poll fetch: the next batch WINDOW of the
