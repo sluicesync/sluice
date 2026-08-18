@@ -1,5 +1,7 @@
 # sluice v0.128.0
 
+> **Correction (added with v0.128.1).** The claim that domains are handled across *“every path that dispatches on a column's type”* was overstated: the Postgres CDC source **read** path still halted at the first change on a domain-typed table (continuous sync from a domain-using Postgres source did not work end-to-end here; migrate and apply were unaffected). Fixed in **v0.128.1**.
+
 **The Domain-transparency release — a Postgres `CREATE DOMAIN` column is now handled faithfully everywhere sluice dispatches on a column's type, plus three continuous-CDC correctness fixes.** This ships the remediation of the 2026-08-17 Tier-3 blind audit (grade B+) in full, and it is a minor bump for the breadth: a PostgreSQL domain is a named constraint wrapper over a base type, and roughly a dozen column-type dispatch sites across the migrate, sync, backup, predicate, and redaction surfaces read the raw declared type — matching `ir.Domain` against no branch and mishandling the column in ways from over-refusal to a silent-corruption hazard. Every such site now reads the storage (base) type, which is identity for a non-domain column, so nothing else changes. Alongside it: a privilege-hidden existing target table now halts instead of skipping, the `rows_applied` counter stops counting absent-target skips, and a per-event catalog-probe crawl is gone. **Drop-in upgrade from v0.127.x — no operator action required, no schema/format/flag change.**
 
 ## Fixed
