@@ -37,7 +37,7 @@ Verified against code, not the doc:
 1. **History payload serialization.** The IR's sealed `Type` /
    `DefaultValue` can't survive plain `encoding/json` — the only
    proven serializer is the backup tagged-union codec
-   (`internal/ir/backup.go:21-27`). *Recommendation: reuse it verbatim
+   (`internal/ir/schema_wire.go:554`). *Recommendation: reuse it verbatim
    as the `sluice_cdc_schema_history` payload format* (DP-2 already
    mandates history be part of that same envelope).
 2. **The reader does not carry a post-DDL `ir.Table` at the boundary
