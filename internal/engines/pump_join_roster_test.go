@@ -110,12 +110,17 @@ var pumpJoinRoster = map[string]pumpJoinEntry{
 			"stream goroutines' shared writes go through errMu / the cursor map's own lock.",
 	},
 	"mysql.vstreamSnapshotStream": {
-		openFinding,
-		"CONFIRMED same shape, NOT fixed: close() cancels the gRPC context, broadcasts cond and closes " +
-			"s.conn without joining the COPY pumps. It is not the one-line fix the CDC readers were — the " +
-			"pumps coordinate through a sync.Cond plus a copyComplete flag, so a join has to be placed " +
-			"inside that protocol and validated on a real Vitess cluster, which is a chunk of its own. " +
-			"Filed in docs/dev/audit-backlog.md under the 2026-08-08 invariant sweep.",
+		joinsItsGoroutine,
+		"copyWG via goPump/joinPumps, joined in close() AFTER cancel()+cancelCopyForShutdown() and BEFORE " +
+			"s.conn is closed — so no COPY pump can Recv on the stream or reconnectCopy re-open on the client " +
+			"after the conn is torn down. cancelCopyForShutdown flips the terminal state (err+copyComplete) so " +
+			"a pump parked in enqueue-backpressure cond.Wait (which ctx-cancel can't reach) wakes and returns " +
+			"instead of re-parking, which is what makes the join deadlock-free. Covers the top-level pump (one " +
+			"of copyPump / copyPumpAutoShard / copyPumpAutoShardConcurrent) plus the concurrent path's K " +
+			"sub-streams and waker. The post-COPY CDC pump (pump) is a separate lifecycle, out of this fix's " +
+			"scope (see joinPumps). Pinned by TestSnapshotStreamClose_JoinsCopyPump, " +
+			"TestSnapshotStreamClose_WakesBackpressuredCopyPump, and the real-cluster " +
+			"TestVStream_SnapshotCloseJoinsCopyPumpsMidCopy.",
 	},
 }
 

@@ -456,11 +456,11 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	snap.copyDone = make(chan struct{})
 	switch {
 	case concurrent:
-		go snap.copyPumpAutoShardConcurrent(streamCtx, streamCancel, stream, concurrentGroups)
+		snap.goPump(func() { snap.copyPumpAutoShardConcurrent(streamCtx, streamCancel, stream, concurrentGroups) })
 	case len(snap.copyTablesSeq) > 0:
-		go snap.copyPumpAutoShard(streamCtx, streamCancel, stream)
+		snap.goPump(func() { snap.copyPumpAutoShard(streamCtx, streamCancel, stream) })
 	default:
-		go snap.copyPump(streamCtx, streamCancel, stream)
+		snap.goPump(func() { snap.copyPump(streamCtx, streamCancel, stream) })
 	}
 
 	return stream, nil
@@ -936,6 +936,20 @@ type vstreamSnapshotStream struct {
 
 	mu  sync.Mutex
 	err error
+
+	// copyWG tracks EVERY COPY-phase goroutine so [close] can join them
+	// before it closes s.conn — the top-level COPY pump (one of copyPump /
+	// copyPumpAutoShard / copyPumpAutoShardConcurrent), and on the concurrent
+	// path the per-stream sub-goroutines plus the ctx-cancel waker. Without
+	// the join, close() cancelled the gRPC context and closed+niled s.conn
+	// while a straggling pump could still Recv on the stream or reconnectCopy
+	// re-open on the shared client — a use-after-close on s.conn the -race
+	// Integration gate grades (2026-08-08 sibling sweep; the COPY-phase
+	// analogue of vstreamCDCReader.pumpDone/startPump/joinPump). Every launch
+	// goes through [goPump]; close() waits via [joinPumps]. The post-COPY CDC
+	// pump ([pump]) is a SEPARATE lifecycle and is deliberately NOT tracked
+	// here (see [joinPumps]).
+	copyWG sync.WaitGroup
 }
 
 // posBreadcrumb pairs an encoded COPY-resume position with the
@@ -2609,15 +2623,92 @@ func (s *vstreamSnapshotStream) cancelGRPCStream() {
 	}
 }
 
-// close cancels the gRPC stream and closes the connection. Wired
-// into [ir.SnapshotStream.CloseFn]. Safe to call multiple times.
+// goPump launches fn as a tracked COPY-phase goroutine. Every top-level
+// COPY pump (copyPump / copyPumpAutoShard / copyPumpAutoShardConcurrent)
+// and the concurrent path's ctx-cancel waker go through here so [close]
+// can join ALL of them (copyWG) before it closes s.conn. Add(1) BEFORE the
+// go so the counter is never observed at zero between launch and the
+// goroutine starting — a Wait in a concurrently-arriving close() then
+// always sees a positive counter. (The concurrent path's K sub-goroutines
+// are the one exception: they also need a LOCAL wait for stitch-ordering,
+// so they Add to copyWG inline alongside that local wg — see
+// copyPumpAutoShardConcurrent.) This is the COPY-phase analogue of
+// vstreamCDCReader.startPump.
+func (s *vstreamSnapshotStream) goPump(fn func()) {
+	s.copyWG.Add(1)
+	go func() {
+		defer s.copyWG.Done()
+		fn()
+	}()
+}
+
+// joinPumps waits for every goroutine launched via goPump (and the
+// concurrent sub-goroutines it tracks) to exit. Called by [close] AFTER
+// cancel()+cancelCopyForShutdown() have made every COPY pump path observe
+// the shutdown, and BEFORE s.conn is closed, so no pump can Recv on the
+// stream or reconnect on the client after the conn is gone.
 //
-// Cancelling the gRPC context unblocks a COPY pump parked in Recv; it
-// then records the cancellation as a terminal error (failCopy), which
-// flips copyComplete and broadcasts cond — so a COPY pump parked in
-// enqueue backpressure or a ReadRows consumer parked waiting for more
-// rows both unwedge. We also broadcast here directly to cover the
-// window before the pump observes the cancellation.
+// Scope, stated so the name cannot be read as broader than the truth: this
+// joins the COPY-phase goroutines ONLY. The post-COPY CDC pump ([pump],
+// started by startPump/Reopen) is a SEPARATE lifecycle — it never runs
+// concurrently with the COPY pump (startPump joins copyDone first) and it
+// begins long after Open returns, so folding it into copyWG would risk an
+// Add-after-Wait race against a concurrent close(). Its own teardown races
+// are out of this fix's scope (the roster entry and the confirmed finding
+// are about the COPY pumps).
+//
+// Must NOT be called while holding s.mu: the pumps take s.mu, so waiting
+// under it would deadlock a pump blocked on the lock.
+func (s *vstreamSnapshotStream) joinPumps() {
+	s.copyWG.Wait()
+}
+
+// cancelCopyForShutdown trips the COPY pump's terminal state so a pump
+// parked in enqueue backpressure wakes and returns instead of re-parking.
+// The backpressure waits (enqueueRowLocked / enqueueConcurrentRowLocked)
+// block in s.cond.Wait(), which does NOT observe ctx — a bare Broadcast
+// wakes them but they re-check the SAME over-cap condition and Wait again,
+// so [close] must also flip the terminal state (err + copyComplete) they
+// break out on, not merely broadcast. This is what makes joinPumps safe:
+// without it, a close() that lands while a pump is backpressured would
+// hang on the join forever.
+//
+// Guarded on !copyComplete so a close() AFTER a healthy COPY_COMPLETED is a
+// no-op broadcast: it never overwrites the clean terminal state or the
+// finished Position. context.Canceled matches the error the copyPump's own
+// ctx.Done() arm records, so a concurrent ReadRows consumer sees a LOUD
+// cancellation rather than a silently-truncated clean close.
+func (s *vstreamSnapshotStream) cancelCopyForShutdown() {
+	s.mu.Lock()
+	if !s.copyComplete {
+		if s.err == nil {
+			s.err = context.Canceled
+		}
+		s.copyComplete = true
+	}
+	s.mu.Unlock()
+	s.broadcast()
+}
+
+// close cancels the gRPC stream, JOINS the COPY pumps, and closes the
+// connection. Wired into [ir.SnapshotStream.CloseFn]. Safe to call
+// multiple times.
+//
+// The join (joinPumps) is the 2026-08-08 sibling-sweep fix, the COPY-phase
+// counterpart of vstreamCDCReader.Close's pump join. Cancelling the gRPC
+// context alone was not enough: cancellation is asynchronous, so a close()
+// that closed+niled s.conn could race a straggling COPY pump still Recv'ing
+// on the stream or reconnectCopy re-opening on the shared client — a
+// use-after-close the -race Integration gate grades.
+//
+// Ordering matters and each step covers a distinct park:
+//  1. cancel() cancels streamCtx — unblocks a pump parked in Recv, in a
+//     select on ctx.Done, or in reconnectCopy's interruptible backoff.
+//  2. cancelCopyForShutdown() flips the terminal state — unblocks a pump
+//     parked in enqueue-backpressure cond.Wait, which ctx-cancel can't see.
+//  3. joinPumps() waits for every COPY goroutine to exit. NOT under mu (the
+//     pumps take mu), so a pump blocked on mu can't deadlock the wait.
+//  4. only now is it safe to close s.conn.
 func (s *vstreamSnapshotStream) close() error {
 	// Read+clear grpcCancel under mu — the liveness watchdog
 	// (cancelGRPCStream) reads it under the same lock, so an unguarded
@@ -2629,11 +2720,8 @@ func (s *vstreamSnapshotStream) close() error {
 	if cancel != nil {
 		cancel()
 	}
-	if s.cond != nil {
-		s.mu.Lock()
-		s.cond.Broadcast()
-		s.mu.Unlock()
-	}
+	s.cancelCopyForShutdown()
+	s.joinPumps()
 	if s.conn != nil {
 		err := s.conn.Close()
 		s.conn = nil

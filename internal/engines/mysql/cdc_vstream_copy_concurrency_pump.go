@@ -183,7 +183,7 @@ func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context,
 	// s.err. It exits without side effect on the normal-completion path
 	// (copyDone closes first; the re-check avoids retroactively failing an
 	// already-finished copy if cancel and completion race).
-	go func() {
+	s.goPump(func() {
 		select {
 		case <-s.copyDone:
 		case <-ctx.Done():
@@ -193,12 +193,21 @@ func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context,
 				s.failCopy(ctx.Err())
 			}
 		}
-	}()
+	})
 
+	// The K sub-goroutines are tracked TWICE: on the local wg (so this driver
+	// blocks until they finish before it stitches + writes the position) AND on
+	// the parent's copyWG (so [close] joins them before it tears down the shared
+	// conn — each sub-stream Recv's on the shared gRPC conn and reconnectStream
+	// re-opens on the shared client, so a straggler must not outlive close()).
+	// The local Add is what goPump can't express (it only knows copyWG), hence
+	// the inline dual Add/Done rather than routing these through goPump.
 	var wg sync.WaitGroup
 	for g := range seeds {
 		wg.Add(1)
+		s.copyWG.Add(1)
 		go func(cs *copyStream) {
+			defer s.copyWG.Done()
 			defer wg.Done()
 			if err := cs.run(ctx, cancel); err != nil {
 				// First error wins (failCopy), and cancel the shared copy
