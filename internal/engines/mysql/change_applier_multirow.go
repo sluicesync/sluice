@@ -254,7 +254,11 @@ func (a *ChangeApplier) beginCoalescingBatchTx(ctx context.Context) (appliershar
 //     PK-changing Update (would orphan the old-PK row), or a non-row event
 //     (Truncate / SchemaSnapshot / Tx*) — flushes both pending runs and applies
 //     serially via the existing per-change [ChangeApplier.dispatch].
-func (b *mysqlBatchTx) dispatch(ctx context.Context, streamID string, c ir.Change) error {
+//
+// The bool return is dispatch's skip signal (PG-2): true when the change was
+// dropped for an absent target table, threaded up to the shared batch loop so
+// a skipped row-DML change does not advance rows_applied.
+func (b *mysqlBatchTx) dispatch(ctx context.Context, streamID string, c ir.Change) (bool, error) {
 	switch v := c.(type) {
 	case ir.Insert:
 		return b.dispatchInsert(ctx, streamID, c, v)
@@ -273,14 +277,14 @@ func (b *mysqlBatchTx) dispatch(ctx context.Context, streamID string, c ir.Chang
 // serially when the table is truly keyless (ADR-0089: keyless inserts are not
 // idempotent, so they apply one-per-tx and are never coalesced — isKeylessInsert
 // emits the once-per-table WARN itself).
-func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir.Change, ins ir.Insert) error {
+func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir.Change, ins ir.Insert) (bool, error) {
 	if b.a.isKeylessInsert(ctx, c) {
 		return b.applySerial(ctx, streamID, c)
 	}
 	schema := b.a.routedSchema(ins.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, ins.Table)
 	if err != nil {
-		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, ins.Table, err)
+		return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, ins.Table, err)
 	}
 	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, ins.Table)
 	if errors.Is(err, errUnknownTargetTable) {
@@ -289,12 +293,12 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 		// classifies it keyless first), so this branch only fires on a
 		// cache-vs-catalog race — but the skip semantics must hold on
 		// every path that resolves table metadata.
-		return b.a.recordSkippedTable(ctx, streamID, "insert", schema, ins.Table, ins.Position.Token)
+		return true, b.a.recordSkippedTable(ctx, streamID, "insert", schema, ins.Table, ins.Position.Token)
 	}
 	if err != nil {
-		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
+		return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
 	}
-	return b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, ir.ApproximateChangeBytes(c))
+	return false, b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, ir.ApproximateChangeBytes(c))
 }
 
 // dispatchUpdate buffers a keyed, non-PK-changing Update with a COMPLETE
@@ -341,11 +345,11 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 // one round trip per UPDATE. That is the same rate the serial path always had,
 // and it is bounded to tables with out-of-line columns on a PG source (or a
 // target column the source lacks, per the paragraph above).
-func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir.Change, upd ir.Update) error {
+func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir.Change, upd ir.Update) (bool, error) {
 	schema := b.a.routedSchema(upd.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, upd.Table)
 	if err != nil {
-		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, upd.Table, err)
+		return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, upd.Table, err)
 	}
 	if len(pk) == 0 || upd.After == nil || len(upd.Before) == 0 || laneapply.PKChangedUpdate(upd, pk) {
 		return b.applySerial(ctx, streamID, c)
@@ -354,16 +358,16 @@ func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir
 	if errors.Is(err, errUnknownTargetTable) {
 		// C-11 defence-in-depth; see dispatchInsert (a missing table
 		// normally routes via applySerial on the empty-PK check above).
-		return b.a.recordSkippedTable(ctx, streamID, "update", schema, upd.Table, upd.Position.Token)
+		return true, b.a.recordSkippedTable(ctx, streamID, "update", schema, upd.Table, upd.Position.Token)
 	}
 	if err != nil {
-		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, upd.Table, err)
+		return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, upd.Table, err)
 	}
 	if missing := appliershared.MissingNonGeneratedColumns(upd.After, colTypes); len(missing) > 0 {
 		b.a.logPartialAfterImage(ctx, schema, upd.Table, missing)
 		return b.applySerial(ctx, streamID, c)
 	}
-	return b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, ir.ApproximateChangeBytes(c))
+	return false, b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, ir.ApproximateChangeBytes(c))
 }
 
 // logPartialAfterImage emits the once-per-table notice that a table's UPDATEs
@@ -395,11 +399,11 @@ func (a *ChangeApplier) logPartialAfterImage(ctx context.Context, schema, table 
 // values from the Before image), or applies it serially (full-before WHERE) when
 // the table has no PK or the Before image is missing a PK column — exactly the
 // cases for which a PK-keyed DELETE … IN cannot be built.
-func (b *mysqlBatchTx) dispatchDelete(ctx context.Context, streamID string, c ir.Change, del ir.Delete) error {
+func (b *mysqlBatchTx) dispatchDelete(ctx context.Context, streamID string, c ir.Change, del ir.Delete) (bool, error) {
 	schema := b.a.routedSchema(del.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, del.Table)
 	if err != nil {
-		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, del.Table, err)
+		return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, del.Table, err)
 	}
 	pkVals, ok := laneapply.PKValuesFromRow(c, pk)
 	if len(pk) == 0 || !ok {
@@ -409,20 +413,21 @@ func (b *mysqlBatchTx) dispatchDelete(ctx context.Context, streamID string, c ir
 	if errors.Is(err, errUnknownTargetTable) {
 		// C-11 defence-in-depth; see dispatchInsert (a missing table
 		// normally routes via applySerial on the empty-PK check above).
-		return b.a.recordSkippedTable(ctx, streamID, "delete", schema, del.Table, del.Position.Token)
+		return true, b.a.recordSkippedTable(ctx, streamID, "delete", schema, del.Table, del.Position.Token)
 	}
 	if err != nil {
-		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, del.Table, err)
+		return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, del.Table, err)
 	}
-	return b.appendDelete(ctx, schema, del.Table, pk, pkVals, colTypes, ir.ApproximateChangeBytes(c))
+	return false, b.appendDelete(ctx, schema, del.Table, pk, pkVals, colTypes, ir.ApproximateChangeBytes(c))
 }
 
 // applySerial flushes both pending runs (so prior coalesced data lands first,
 // preserving apply order) then applies one change single-row via the existing
-// per-change [ChangeApplier.dispatch] on the open tx.
-func (b *mysqlBatchTx) applySerial(ctx context.Context, streamID string, c ir.Change) error {
+// per-change [ChangeApplier.dispatch] on the open tx. It threads dispatch's
+// skip signal (PG-2) straight up.
+func (b *mysqlBatchTx) applySerial(ctx context.Context, streamID string, c ir.Change) (bool, error) {
 	if err := b.flushPending(ctx); err != nil {
-		return err
+		return false, err
 	}
 	return b.a.dispatch(ctx, b.tx, streamID, c)
 }

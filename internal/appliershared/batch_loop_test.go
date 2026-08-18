@@ -121,9 +121,9 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 			rec.add("begin")
 			return tx, nil
 		},
-		Dispatch: func(_ context.Context, _ BatchTx, _ string, c ir.Change) error {
+		Dispatch: func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
 			rec.add("dispatch:" + c.Pos().Token)
-			return nil
+			return false, nil
 		},
 		ApplyOne: func(_ context.Context, _ string, c ir.Change) error {
 			rec.add("applyOne:" + c.Pos().Token)
@@ -510,12 +510,12 @@ func TestRunOneBatch_DispatchErrorRollsBackAndClassifies(t *testing.T) {
 	rec := &recorder{}
 	cfg := testConfig(t, rec, false)
 	boom := errors.New("boom")
-	cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) error {
+	cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
 		if c.Pos().Token == "p2" {
-			return boom
+			return false, boom
 		}
 		rec.add("dispatch:" + c.Pos().Token)
-		return nil
+		return false, nil
 	}
 
 	ch := feed(false, insertAt("p1"), insertAt("p2"))
@@ -643,6 +643,60 @@ func TestRunBatchLoop_RowsApplied_PerFlushCountsDML(t *testing.T) {
 	}
 	if got := rec.totalRowsApplied(); got != 3 {
 		t.Fatalf("cumulative rows_applied = %d; want 3 (Truncate excluded)", got)
+	}
+}
+
+// TestRunBatchLoop_RowsApplied_SkippedDMLNotCounted is the PG-2 pin for the
+// shared batch loop (both engines' ApplyBatch path): a row-level DML change
+// whose target table is ABSENT dispatches to the C-11 skip (Dispatch reports
+// skipped=true) and writes zero rows, so it must NOT advance rows_applied even
+// though it is an Insert. Batch size 1 makes each flush's delta observable; the
+// middle insert is skipped, so its position write must carry 0.
+func TestRunBatchLoop_RowsApplied_SkippedDMLNotCounted(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, true) // TransactionalDDL=true (PG): each change flushes as its own batch at cap=1
+	// Report the middle change (token "p2") as skipped — the absent-target case.
+	cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
+		rec.add("dispatch:" + c.Pos().Token)
+		return c.Pos().Token == "p2", nil
+	}
+
+	ch := feed(true, insertAt("p1"), insertAt("p2"), insertAt("p3"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 1); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	// Three position writes; the skipped insert's carries 0.
+	if got, want := rec.rowsDeltas, []int64{1, 0, 1}; !equalInt64(got, want) {
+		t.Fatalf("per-flush rows deltas = %v; want %v (skipped insert counts 0)", got, want)
+	}
+	if got := rec.totalRowsApplied(); got != 2 {
+		t.Fatalf("cumulative rows_applied = %d; want 2 (skipped insert excluded — PG-2)", got)
+	}
+}
+
+// TestRunBatchLoop_RowsApplied_CheckpointOnly_SkipInTx pins the same PG-2
+// gating on the MySQL CheckpointOnlyAtTxBoundary path: a skipped DML change
+// inside a source transaction must not contribute to the accumulated delta the
+// TxCommit boundary write carries. One tx of three inserts with the middle one
+// skipped → the boundary increment is 2, not 3.
+func TestRunBatchLoop_RowsApplied_CheckpointOnly_SkipInTx(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.CheckpointOnlyAtTxBoundary = true
+	cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
+		rec.add("dispatch:" + c.Pos().Token)
+		return c.Pos().Token == "p2", nil
+	}
+
+	ch := feed(true, txBegin("tb"), insertAt("p1"), insertAt("p2"), insertAt("p3"), txCommit("tc"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 100); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	if got, want := rec.rowsDeltas, []int64{2}; !equalInt64(got, want) {
+		t.Fatalf("rows deltas = %v; want [2] (one skipped insert excluded from the boundary delta)", got)
+	}
+	if got := rec.totalRowsApplied(); got != 2 {
+		t.Fatalf("cumulative rows_applied = %d; want 2 (skipped insert excluded — PG-2)", got)
 	}
 }
 

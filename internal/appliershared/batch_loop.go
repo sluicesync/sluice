@@ -205,7 +205,16 @@ type BatchConfig struct {
 	// logging, and classification of a dispatch failure. The engine
 	// type-asserts the concrete tx (e.g. *sql.Tx or *pgxBatchTx) it
 	// returned from BeginTx.
-	Dispatch func(ctx context.Context, tx BatchTx, streamID string, c ir.Change) error
+	//
+	// skipped reports that the change was DROPPED rather than applied —
+	// its target table is absent on the destination, so dispatch routed it
+	// to the C-11 skip ledger and wrote zero rows (PG-2). The loop uses it
+	// to keep rowDML — the rows_applied increment — honest: a skipped
+	// Insert/Update/Delete must NOT advance the counter even though it is a
+	// row-level DML change, or a bulk load into a missing target reports
+	// phantom progress. A non-skip dispatch (applied, or a non-row event)
+	// returns false.
+	Dispatch func(ctx context.Context, tx BatchTx, streamID string, c ir.Change) (skipped bool, err error)
 
 	// ApplyOne is the engine's per-change apply path (own tx, position
 	// write included). The loop calls it only on the
@@ -366,6 +375,19 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	return runOneBatch(ctx, cfg, streamID, changes, maxBatchSize, &pending, &inSourceTx)
 }
 
+// appliedRowDML is a just-dispatched change's rows_applied contribution:
+// 1 for a row-level DML change that ACTUALLY applied, 0 for a non-row event
+// (Truncate / SchemaSnapshot / Tx*) OR for a row-DML change that was SKIPPED
+// because its target table was absent (PG-2 — a skip wrote zero rows, so it
+// must not advance the counter). Factored out of runOneBatch so both count
+// sites stay one expression and the loop stays under the gocyclo ceiling.
+func appliedRowDML(skipped bool, c ir.Change) int {
+	if skipped || !ir.IsRowDMLChange(c) {
+		return 0
+	}
+	return 1
+}
+
 // runOneBatch is the RunOneBatch body threaded with the cross-batch
 // rows_applied carry (pending); see [RunBatchLoop] for why the carry is
 // loop-owned.
@@ -461,7 +483,8 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		return 0, ir.Position{}, false, err
 	}
 
-	if err := cfg.Dispatch(ctx, tx, streamID, first); err != nil {
+	firstSkipped, err := cfg.Dispatch(ctx, tx, streamID, first)
+	if err != nil {
 		_ = tx.Rollback()
 		logBatchRollback(ctx, cfg.EngineName, streamID, 1, err)
 		return 0, ir.Position{}, false, cfg.Classify(err)
@@ -474,10 +497,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// row's cumulative rows_applied at the position write. A PG Truncate /
 	// SchemaSnapshot rides the batch tx and is counted in `n` (for logging)
 	// but NOT here, matching the [ir.StreamStatus.RowsApplied] semantics.
-	rowDML := 0
-	if ir.IsRowDMLChange(first) {
-		rowDML = 1
-	}
+	// A row-DML change SKIPPED for an absent target (firstSkipped) is
+	// likewise excluded — it wrote zero rows (PG-2). appliedRowDML owns both
+	// exclusions so this hot loop stays under the gocyclo ceiling.
+	rowDML := appliedRowDML(firstSkipped, first)
 
 	// TransactionalDDL=true (PG): a schema event was just dispatched
 	// onto `tx`. Flush it as a 1-change batch so the commitBatch
@@ -577,16 +600,17 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				return 0, ir.Position{}, false, cfg.Classify(fmt.Errorf("%s: applier: redact: %w", cfg.EngineName, err))
 			}
 			cfg.StampShard(c)
-			if err := cfg.Dispatch(ctx, tx, streamID, c); err != nil {
+			skipped, err := cfg.Dispatch(ctx, tx, streamID, c)
+			if err != nil {
 				_ = tx.Rollback()
 				logBatchRollback(ctx, cfg.EngineName, streamID, n+1, err)
 				return 0, ir.Position{}, false, cfg.Classify(err)
 			}
 			n++
 			lastPos = c.Pos()
-			if ir.IsRowDMLChange(c) {
-				rowDML++
-			}
+			// PG-2: a row-DML change skipped for an absent target wrote zero
+			// rows — count only actually-applied DML toward rows_applied.
+			rowDML += appliedRowDML(skipped, c)
 			batchBytes += ir.ApproximateChangeBytes(c)
 			// TransactionalDDL=true (PG): the schema event's write just
 			// landed on `tx`; flush now so the commitBatch position

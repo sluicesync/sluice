@@ -1369,10 +1369,16 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			}
 			applyStart := time.Now()
 			if inSourceTx {
-				if err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */); err != nil {
+				skipped, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */)
+				if err != nil {
 					return err
 				}
-				pendingRows += ir.RowsAppliedDelta(c)
+				// PG-2: a change skipped for an absent target wrote zero rows —
+				// don't accumulate it toward the deferred TxCommit rows_applied
+				// delta (the skip already lands durably in the skip ledger).
+				if !skipped {
+					pendingRows += ir.RowsAppliedDelta(c)
+				}
 			} else {
 				if err := a.applyOne(ctx, streamID, c); err != nil {
 					return err
@@ -1446,7 +1452,10 @@ func applierErrorOrShutdown(ctx context.Context, err error) error {
 // the [CDCReader]'s keepalive routine can advance
 // confirmed_flush_lsn past this change.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
-	return a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+	// The skip signal is consumed inside applyOneImpl's own position write
+	// here (writePosition=true), so this wrapper discards it.
+	_, err := a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+	return err
 }
 
 // applyBarrierNoPosition applies one barrier-path change (Truncate /
@@ -1463,7 +1472,11 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 // only the position write is omitted (the frontier checkpoint persists the
 // real resume LSN of the surrounding row events).
 func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
-	return a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+	// Position-free barrier apply: the concurrent orchestrator counts
+	// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), so the skip
+	// signal is not needed here.
+	_, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+	return err
 }
 
 // applyOneImpl is the shared per-change apply: redact → stamp → dispatch →
@@ -1471,10 +1484,10 @@ func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID str
 // gates the ADR-0007 position write: true for the serial per-change path
 // (position + data atomic); false for the concurrent barrier path (position
 // owned by the frontier checkpoint — see applyBarrierNoPosition).
-func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
+func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) (skipped bool, err error) {
 	// PII Phase 1.5: redact CDC row data before dispatch.
 	if err := a.redactChange(ctx, c); err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
+		return false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 	}
 	// ADR-0048 Shape A: stamp the operator-supplied discriminator
 	// (`--inject-shard-column NAME=VALUE`) onto every row-bearing
@@ -1483,24 +1496,28 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	a.stampShardChange(c)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
+		return false, classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
 	}
 	// F7: pin synchronous_commit on for the duration of this tx so a
 	// role/db-level default of `off` can't silently break ADR-0007's
 	// "position + data lands durably together" contract.
 	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return false, classifyApplierError(err)
 	}
 	// Bug 164: bypass target FK + user-trigger enforcement for this apply tx
 	// (a CDC stream is not FK-dependency-ordered). No-op without privilege.
 	if err := a.bypassForeignKeyEnforcement(ctx, tx); err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return false, classifyApplierError(err)
 	}
-	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
+	// dispatch reports skipped=true when the change targeted an absent table
+	// (C-11 skip) — it wrote zero rows, so it contributes 0 to rows_applied
+	// (PG-2) even though it may be a row-level DML change.
+	skipped, err = a.dispatch(ctx, tx, streamID, c)
+	if err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return false, classifyApplierError(err)
 	}
 	token := c.Pos().Token
 	if writePosition {
@@ -1510,17 +1527,23 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// re-delivers and re-skips; on success the position may advance past it.
 		if err := a.flushSkippedTables(ctx); err != nil {
 			_ = tx.Rollback()
-			return err
+			return false, err
 		}
 		posCtx, posCancel := a.execTimeoutCtx(ctx)
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
-		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
+		// row-level DML change and 0 for a Truncate / SchemaSnapshot — or for a
+		// change SKIPPED because its target table is absent (PG-2: a skip wrote
+		// no row, so it must not advance the counter).
+		delta := ir.RowsAppliedDelta(c)
+		if skipped {
+			delta = 0
+		}
+		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta)
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()
-			return classifyApplierError(err)
+			return false, classifyApplierError(err)
 		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
@@ -1528,7 +1551,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// this window was enumerated from): a stop cancelling ctx rolls the
 		// tx back under us and Commit reports ErrTxDone; nothing persisted,
 		// resume re-delivers.
-		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
+		return false, applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
 	}
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has
@@ -1540,7 +1563,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	if writePosition {
 		a.reportAppliedToken(ctx, token)
 	}
-	return nil
+	return skipped, nil
 }
 
 // errUnknownTable is the sentinel the colTypesFor lookup returns
@@ -1584,7 +1607,13 @@ var skipVerdictTTL = 30 * time.Second
 // [ir.ErrPositionInvalid] at resume time. Sourcing streamID from the
 // Apply arg (the same path writePositionTx already uses) closes the
 // footgun.
-func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error {
+//
+// It returns skipped=true when the change was DROPPED because its target
+// table is absent (the errUnknownTable C-11 skip) — the caller uses that to
+// keep rows_applied honest (a skipped row-DML change wrote zero rows and must
+// not advance the counter; PG-2). skipped=false covers an applied change and
+// any non-row event.
+func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) (skipped bool, err error) {
 	switch v := c.(type) {
 	case ir.Insert:
 		// ADR-0036 Phase A.3: applier-side capture probe. Logged at
@@ -1608,36 +1637,36 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// Before-image WHERE, not on this conflict key.
 		key, err := a.conflictKeyFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: conflict-key lookup for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: conflict-key lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
-			return fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
-		return nil
+		return false, nil
 
 	case ir.Update:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
 		// Update misses are tolerated (zero rows affected) for resume
 		// idempotency; the same caveat as MySQL applies — see the
@@ -1645,30 +1674,30 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// debug-log defence-in-depth.
 		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
-		return nil
+		return false, nil
 
 	case ir.Delete:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
 		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
-		return nil
+		return false, nil
 
 	case ir.Truncate:
 		schema := a.routedSchema(v.Schema)
@@ -1683,15 +1712,15 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// the retry re-probes and converges to a clean skip.
 		if _, err := a.colTypesFor(ctx, schema, v.Table); err != nil {
 			if errors.Is(err, errUnknownTable) {
-				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+				return true, a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
 			}
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt := buildTruncateSQL(schema, v.Table, v.Cascade, v.RestartIdentity)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
-			return fmt.Errorf("postgres: applier: truncate %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
-		return nil
+		return false, nil
 
 	case ir.SchemaSnapshot:
 		// ADR-0049 Chunk B3: persist the boundary's IR schema into
@@ -1712,14 +1741,14 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// (position write never lands) and the stream stops loudly
 		// (locked decision #4b: fatal, never logged-and-continued).
 		if v.IR == nil {
-			return errors.New("postgres: applier: schema snapshot has nil IR table")
+			return false, errors.New("postgres: applier: schema snapshot has nil IR table")
 		}
 		if err := writeSchemaVersion(ctx, tx, a.controlSchema, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
-			return fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
-		return nil
+		return false, nil
 	}
-	return fmt.Errorf("postgres: applier: unknown change type %T", c)
+	return false, fmt.Errorf("postgres: applier: unknown change type %T", c)
 }
 
 // diagApplierInsertReceived emits an ADR-0036 Phase A.3 DEBUG-level

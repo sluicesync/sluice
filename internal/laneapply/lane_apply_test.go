@@ -74,6 +74,7 @@ func (s *testSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change)
 func (s *testSeam) ClassifyError(err error) error                             { return classifyTest(err) }
 func (s *testSeam) WriteCheckpoint(context.Context, ir.Position, int64) error { return nil }
 func (s *testSeam) ApplyBarrierChange(context.Context, ir.Change) error       { return nil }
+func (s *testSeam) SkipsRowChange(context.Context, ir.Change) bool            { return false }
 
 // fakeLaneController is a deterministic [ir.BatchSizeController] stand-in for
 // the per-lane AIMD pins: NextBatchSize returns the current size; ObserveBatch
@@ -450,6 +451,7 @@ func (s *routingSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Chan
 func (s *routingSeam) ClassifyError(err error) error                             { return classifyTest(err) }
 func (s *routingSeam) WriteCheckpoint(context.Context, ir.Position, int64) error { return nil }
 func (s *routingSeam) ApplyBarrierChange(context.Context, ir.Change) error       { return nil }
+func (s *routingSeam) SkipsRowChange(context.Context, ir.Change) bool            { return false }
 
 // TestLaneApply_Run_TargetFailureNotMaskedAsCtxCancel is THE regression pin:
 // a lane whose target write fails (a non-retriable connection error here)

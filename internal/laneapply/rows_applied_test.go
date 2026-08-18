@@ -20,6 +20,11 @@ import (
 type countingSeam struct {
 	mu         sync.Mutex
 	rowsDeltas []int64
+	// missingTable, when non-empty, is a target table treated as ABSENT: a
+	// row-DML change to it reports SkipsRowChange=true (the C-11 skip), so the
+	// orchestrator must not count it toward rows_applied (PG-2). Empty (the
+	// zero value) means nothing is skipped, keeping the other tests unchanged.
+	missingTable string
 }
 
 func (s *countingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool, error) {
@@ -56,6 +61,14 @@ func (s *countingSeam) WriteCheckpoint(_ context.Context, _ ir.Position, rowsApp
 }
 
 func (s *countingSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
+
+func (s *countingSeam) SkipsRowChange(_ context.Context, c ir.Change) bool {
+	if s.missingTable == "" || !ir.IsRowDMLChange(c) {
+		return false
+	}
+	_, table := RowChangeSchemaTable(c)
+	return table == s.missingTable
+}
 
 func (s *countingSeam) total() int64 {
 	s.mu.Lock()
@@ -176,6 +189,54 @@ func TestOrchestrator_RowsApplied_MarkerlessStream(t *testing.T) {
 		if got := seam.total(); got != int64(len(changes)) {
 			t.Fatalf("lanes=%d: cumulative rows_applied = %d; want %d\ndeltas: %v",
 				lanes, got, len(changes), seam.rowsDeltas)
+		}
+	}
+}
+
+// TestOrchestrator_RowsApplied_SkippedTableNotCounted is the PG-2 pin for the
+// concurrent path: a row-level DML change whose target table is ABSENT (the
+// C-11 skip, surfaced by SkipsRowChange) writes zero rows and must NOT advance
+// rows_applied. Before the fix the orchestrator counted every Insert/Update/
+// Delete at route time regardless of the skip, so a bulk load into a missing
+// target climbed the counter with nothing applied (phantom progress). Here 4 of
+// the 7 DML changes target the absent table; rows_applied must equal 3.
+func TestOrchestrator_RowsApplied_SkippedTableNotCounted(t *testing.T) {
+	tok := func(n string) ir.Position { return ir.Position{Engine: "mysql", Token: n} }
+	insTbl := func(p, table, id string) ir.Change {
+		return ir.Insert{Position: tok(p), Schema: "ks", Table: table, Row: ir.Row{"id": id}}
+	}
+
+	// Two source transactions interleaving the present table "t" and the absent
+	// target "gone". Applied row-DML = 3 (the "t" rows); skipped = 4.
+	changes := []ir.Change{
+		ir.TxBegin{Position: tok("t1")},
+		insTbl("t1", "t", "1"),
+		insTbl("t1", "gone", "100"),
+		insTbl("t1", "t", "2"),
+		insTbl("t1", "gone", "101"),
+		insTbl("t1", "gone", "102"),
+		ir.TxCommit{Position: tok("t1c")},
+		ir.TxBegin{Position: tok("t2")},
+		insTbl("t2", "gone", "103"),
+		insTbl("t2", "t", "3"),
+		ir.TxCommit{Position: tok("t2c")},
+	}
+	const wantApplied = 3
+
+	for _, lanes := range []int{1, 2, 4} {
+		seam := &countingSeam{missingTable: "gone"}
+		orch := NewOrchestrator(Config{Lanes: lanes, MaxBatchSize: 4}, seam)
+		ch := make(chan ir.Change, len(changes))
+		for _, c := range changes {
+			ch <- c
+		}
+		close(ch)
+		if err := orch.Run(context.Background(), ch); err != nil {
+			t.Fatalf("lanes=%d: Run: %v", lanes, err)
+		}
+		if got := seam.total(); got != wantApplied {
+			t.Fatalf("lanes=%d: rows_applied = %d; want %d (skipped-table changes must not count — PG-2)\ndeltas: %v",
+				lanes, got, wantApplied, seam.rowsDeltas)
 		}
 	}
 }

@@ -186,6 +186,28 @@ type LaneApplier interface {
 	// method keeps the concurrent path's invalidation byte-identical to
 	// serial.
 	ApplyBarrierChange(ctx context.Context, c ir.Change) error
+
+	// SkipsRowChange reports whether a row-level DML change (Insert/Update/
+	// Delete) would be DROPPED at apply time because its target table is
+	// absent on the destination — the audit-C-11 errUnknownTable skip. The
+	// orchestrator consults it at ROUTE time so a skipped change does not
+	// advance rows_applied (PG-2): a skip writes zero rows, so counting it
+	// inflates the counter with phantom progress (a bulk load into a missing
+	// target would show rows_applied climbing with nothing applied). The true
+	// skip count already lives durably in sluice_cdc_skipped_tables; this
+	// keeps the rows_applied observability counter from double-telling it.
+	//
+	// It shares the SAME target-table metadata cache the lane/barrier dispatch
+	// skip consults, so the route-time verdict and the later apply-time skip
+	// agree in the steady state (the probe caches the verdict; dispatch reads
+	// it back). The only disagreement window is a metadata-cache TTL expiry
+	// that straddles one change's route→dispatch gap — sub-second, at most a
+	// handful of in-flight changes, and it perturbs ONLY this observability
+	// counter, never the resume position (the frontier owns that; see
+	// boundaryRowDML). Implementations MUST return false for a non-row change
+	// and for any probe error (fail toward counting; never abort the run from
+	// here — a genuine metadata error surfaces loudly on the apply path).
+	SkipsRowChange(ctx context.Context, c ir.Change) bool
 }
 
 // retriable reports whether the raw lane error is one the ADR-0038 streamer
@@ -637,7 +659,17 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		// the lane/barrier applies it). The counter is only realized at a
 		// durable checkpoint, so counting at route time can never over-count a
 		// change the target didn't commit.
-		o.cumRowDML++
+		//
+		// PG-2: EXCEPT a change whose target table is absent — it dispatches to
+		// recordSkippedTable, writes zero rows, and must NOT advance
+		// rows_applied even though it is an Insert/Update/Delete. SkipsRowChange
+		// consults the SAME metadata cache the lane/barrier apply-time skip
+		// uses, so the route-time verdict matches what dispatch will do (a
+		// bulk load into a missing target would otherwise climb rows_applied
+		// with nothing written).
+		if !o.la.SkipsRowChange(ctx, c) {
+			o.cumRowDML++
+		}
 		// Marker-less (VStream) only: the position-run heuristic. On a marker
 		// stream a row position is mid-transaction and must NOT be a boundary.
 		if !o.sawTxMarker {

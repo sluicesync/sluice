@@ -185,7 +185,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			a.warnPipelineFallbackOnce(ctx, err)
 			return a.beginSerialBatchTx(ctx)
 		},
-		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
+		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) (bool, error) {
 			if b, ok := tx.(*pgxBatchTx); ok {
 				return a.dispatchPipelined(ctx, b, streamID, c)
 			}

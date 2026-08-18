@@ -23,6 +23,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -351,7 +352,10 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("mysql: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		if err := btx.dispatch(ctx, la.streamID, c); err != nil {
+		// Skip signal ignored on the lane path: the orchestrator counts
+		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
+		// lane advances the frontier by every seq it drains regardless of skips.
+		if _, err := btx.dispatch(ctx, la.streamID, c); err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
@@ -439,6 +443,25 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 // table on first touch).
 func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
 	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
+}
+
+// SkipsRowChange reports whether a row-level DML change would be dropped at
+// apply time because its target table is absent (the C-11 errUnknownTargetTable
+// skip). The orchestrator consults it at route time so a skipped change does
+// not advance rows_applied (PG-2). It probes the SAME colTypesFor cache the
+// lane/barrier dispatch skip consults (colTypesFor ignores its tx arg — the
+// metadata read runs on the applier's *sql.DB — so a nil tx is correct here) —
+// populating it means the later dispatch of this very change reads the cached
+// verdict back and skips identically. Non-row changes and probe errors return
+// false (fail toward counting; a genuine metadata error still surfaces loudly
+// on the apply path).
+func (la *laneApplierAdapter) SkipsRowChange(ctx context.Context, c ir.Change) bool {
+	if !ir.IsRowDMLChange(c) {
+		return false
+	}
+	schema, table := laneapply.RowChangeSchemaTable(c)
+	_, err := la.a.colTypesFor(ctx, nil, la.a.routedSchema(schema), table)
+	return errors.Is(err, errUnknownTargetTable)
 }
 
 // applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,

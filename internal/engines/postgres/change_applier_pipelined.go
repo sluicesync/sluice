@@ -265,60 +265,60 @@ func (b *pgxBatchTx) queue(stmt string, args []any, ctxStmt queuedStmt) {
 // already runs in QueryExecModeDescribeExec, so SendBatch re-describes every
 // distinct statement fresh (binary, live-OID) and GAP #3 is subsumed (see
 // file header).
-func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, streamID string, c ir.Change) error {
+func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, streamID string, c ir.Change) (skipped bool, err error) {
 	switch v := c.(type) {
 	case ir.Insert:
 		schema := a.routedSchema(v.Schema)
 		diagApplierInsertReceived(ctx, schema, v)
 		key, err := a.conflictKeyForPipelined(ctx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: conflict-key lookup for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: conflict-key lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "insert"})
-		return nil
+		return false, nil
 
 	case ir.Update:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "update"})
-		return nil
+		return false, nil
 
 	case ir.Delete:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
-			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete"})
-		return nil
+		return false, nil
 
 	case ir.Truncate:
 		// A Truncate flushes as a 1-change batch (the shared loop returns
@@ -333,13 +333,13 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		schema := a.routedSchema(v.Schema)
 		if _, err := a.colTypesFor(ctx, schema, v.Table); err != nil {
 			if errors.Is(err, errUnknownTable) {
-				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+				return true, a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
 			}
-			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt := buildTruncateSQL(schema, v.Table, v.Cascade, v.RestartIdentity)
 		b.queue(stmt, nil, queuedStmt{schema: schema, table: v.Table, kind: "truncate"})
-		return nil
+		return false, nil
 
 	case ir.SchemaSnapshot:
 		// Persist the boundary's IR schema onto the SAME tx as the position
@@ -347,16 +347,16 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		// the history upsert onto the batch. A nil IR is a hard error,
 		// identical to the serial dispatch.
 		if v.IR == nil {
-			return errors.New("postgres: applier: schema snapshot has nil IR table")
+			return false, errors.New("postgres: applier: schema snapshot has nil IR table")
 		}
 		stmt, args, err := buildWriteSchemaVersionSQL(a.controlSchema, streamID, v.Schema, v.Table, v.Position, v.IR)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		b.queue(stmt, args, queuedStmt{schema: v.Schema, table: v.Table, kind: "schema-snapshot"})
-		return nil
+		return false, nil
 	}
-	return fmt.Errorf("postgres: applier: unknown change type %T", c)
+	return false, fmt.Errorf("postgres: applier: unknown change type %T", c)
 }
 
 // conflictKeyForPipelined resolves the Insert ON CONFLICT key for the

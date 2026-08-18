@@ -407,7 +407,10 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		if err := la.a.dispatchPipelined(ctx, b, la.streamID, c); err != nil {
+		// The skip signal is ignored on the lane path: the orchestrator counts
+		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
+		// lane advances the frontier by every seq it drains regardless of skips.
+		if _, err := la.a.dispatchPipelined(ctx, b, la.streamID, c); err != nil {
 			_ = b.Rollback()
 			return 0, err
 		}
@@ -472,7 +475,9 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		if err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
+		// Skip signal ignored on the lane path (see ApplyLaneBatch): rows_applied
+		// is counted at route time via SkipsRowChange (PG-2).
+		if _, err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
@@ -555,6 +560,23 @@ func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Chang
 	// concurrent path (writing the barrier's own metadata-anchored token —
 	// 0/0 for a first-touch SchemaSnapshot — would regress it; Bug 158).
 	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
+}
+
+// SkipsRowChange reports whether a row-level DML change would be dropped at
+// apply time because its target table is absent (the C-11 errUnknownTable
+// skip). The orchestrator consults it at route time so a skipped change does
+// not advance rows_applied (PG-2). It probes the SAME colTypesFor cache the
+// lane/barrier dispatch skip consults — populating it here means the later
+// dispatch of this very change reads the cached verdict back and skips
+// identically. Non-row changes and probe errors return false (fail toward
+// counting; a genuine metadata error still surfaces loudly on the apply path).
+func (la *laneApplierAdapter) SkipsRowChange(ctx context.Context, c ir.Change) bool {
+	if !ir.IsRowDMLChange(c) {
+		return false
+	}
+	schema, table := laneapply.RowChangeSchemaTable(c)
+	_, err := la.a.colTypesFor(ctx, la.a.routedSchema(schema), table)
+	return errors.Is(err, errUnknownTable)
 }
 
 // applyBatchConcurrent is the ADR-0105 concurrent key-hash apply entry,

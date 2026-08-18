@@ -106,6 +106,9 @@ func (s *scopedSeam) ApplyBarrierChange(context.Context, ir.Change) error {
 	return nil
 }
 
+// SkipsRowChange: this stub applies every table, so nothing is ever skipped.
+func (s *scopedSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
+
 // TestRouteRow_HonoursTableScope drives the whole orchestrator with a seam
 // that reports RouteScopeTable and asserts every change landed on ONE lane, in
 // source order. The router pin above proves LaneForRoute hashes correctly; this

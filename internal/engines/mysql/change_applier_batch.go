@@ -153,7 +153,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// CheckpointOnly path). Value encoding is byte-identical to the serial
 		// single-row path (same prepareApplierValue → `?` binding).
 		BeginTx: a.beginCoalescingBatchTx,
-		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
+		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) (bool, error) {
 			return tx.(*mysqlBatchTx).dispatch(ctx, streamID, c)
 		},
 		ApplyOne:   a.applyOne,

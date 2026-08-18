@@ -55,6 +55,9 @@ func (s *recordingSeam) ApplyBarrierChange(_ context.Context, c ir.Change) error
 	return nil
 }
 
+// SkipsRowChange: this stub applies every table, so nothing is ever skipped.
+func (s *recordingSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
+
 func (s *recordingSeam) lastCheckpoint() (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

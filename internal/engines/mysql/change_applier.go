@@ -1136,10 +1136,16 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			}
 			applyStart := time.Now()
 			if inSourceTx {
-				if err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */); err != nil {
+				skipped, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */)
+				if err != nil {
 					return err
 				}
-				pendingRows += ir.RowsAppliedDelta(c)
+				// PG-2: a change skipped for an absent target wrote zero rows —
+				// don't accumulate it toward the deferred TxCommit rows_applied
+				// delta (the skip already lands durably in the skip ledger).
+				if !skipped {
+					pendingRows += ir.RowsAppliedDelta(c)
+				}
 			} else {
 				if err := a.applyOne(ctx, streamID, c); err != nil {
 					return err
@@ -1165,7 +1171,10 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // retry policy (ADR-0038) can recognise transient Vitess / MySQL
 // errors and back off rather than exit the stream.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
-	return a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+	// The skip signal is consumed inside applyOneImpl's own position write
+	// here (writePosition=true), so this wrapper discards it.
+	_, err := a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+	return err
 }
 
 // applyBarrierNoPosition applies one barrier-path change (Truncate /
@@ -1180,7 +1189,11 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 // schema-history row and gets no atomicity at all on MySQL, for the reason
 // [ChangeApplier.applyOneImpl]'s implicit-commit paragraph gives.
 func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
-	return a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+	// Position-free barrier apply: the concurrent orchestrator counts
+	// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), so the skip
+	// signal is not needed here.
+	_, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+	return err
 }
 
 // applyOneImpl is the shared per-change apply: redact → stamp → dispatch →
@@ -1225,13 +1238,13 @@ func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID str
 // every schema event (Truncate AND SchemaSnapshot — see
 // appliershared.isSchemaEvent) here, alone, so a DDL implicit commit can
 // never destroy a batch tx carrying other rows.
-func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
+func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) (skipped bool, err error) {
 	// PII Phase 1.5: redact CDC row data before dispatch when the
 	// operator has configured rules. nil/empty redactor is a no-op
 	// fast path; the apply hot path stays free when no redaction is
 	// configured.
 	if err := a.redactChange(ctx, c); err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
+		return false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 	}
 	// ADR-0048 Shape A: stamp the operator-supplied discriminator
 	// (`--inject-shard-column NAME=VALUE`) onto every row-bearing
@@ -1240,7 +1253,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	a.stampShardChange(c)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))
+		return false, classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))
 	}
 	// ADR-0049 Chunk B1/B2: a SchemaSnapshot persists the boundary's
 	// IR schema into sluice_cdc_schema_history. Locked decision #4a:
@@ -1257,9 +1270,13 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// logged-and-continued). On the position-free barrier path the
 	// history-version write is still atomic with its data; the position
 	// is persisted separately by the frontier checkpoint.
-	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
+	// dispatch reports skipped=true when the change targeted an absent table
+	// (C-11 skip) — it wrote zero rows, so it contributes 0 to rows_applied
+	// (PG-2) even though it may be a row-level DML change.
+	skipped, err = a.dispatch(ctx, tx, streamID, c)
+	if err != nil {
 		_ = tx.Rollback()
-		return classifyApplierError(err)
+		return false, classifyApplierError(err)
 	}
 	if writePosition {
 		// H-4: flush the coalesced skip ledger before this change's position
@@ -1268,17 +1285,23 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// re-delivers and re-skips; on success the position may advance past it.
 		if err := a.flushSkippedTables(ctx); err != nil {
 			_ = tx.Rollback()
-			return err
+			return false, err
 		}
 		posCtx, posCancel := a.execTimeoutCtx(ctx)
 		// Serial per-change apply: this change is durable in the same tx as
 		// its position, so it contributes 1 to rows_applied when it is a
-		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
-		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c), a.upsert)
+		// row-level DML change and 0 for a Truncate / SchemaSnapshot — or for a
+		// change SKIPPED because its target table is absent (PG-2: a skip wrote
+		// no row, so it must not advance the counter).
+		delta := ir.RowsAppliedDelta(c)
+		if skipped {
+			delta = 0
+		}
+		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta, a.upsert)
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()
-			return classifyApplierError(err)
+			return false, classifyApplierError(err)
 		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
@@ -1286,7 +1309,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// this window was enumerated from): a stop cancelling ctx rolls the
 		// tx back under us and Commit reports ErrTxDone; neither data nor
 		// position persisted, resume re-delivers.
-		return applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit: %w", err))
+		return false, applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit: %w", err))
 	}
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has
@@ -1295,7 +1318,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
 		a.cacheActiveSchemaAfterCommit(snap)
 	}
-	return nil
+	return skipped, nil
 }
 
 // persistSourceTxCommit writes the position a delivered [ir.TxCommit]
@@ -1361,7 +1384,13 @@ func applierErrorOrShutdown(ctx context.Context, err error) error {
 // [ir.ErrPositionInvalid] at resume time. Sourcing streamID from the
 // Apply arg (the same path writePositionTx already uses) closes the
 // footgun.
-func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error {
+//
+// It returns skipped=true when the change was DROPPED because its target table
+// is absent (the errUnknownTargetTable C-11 skip) — the caller uses that to
+// keep rows_applied honest (a skipped row-DML change wrote zero rows and must
+// not advance the counter; PG-2). skipped=false covers an applied change and
+// any non-row event.
+func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) (skipped bool, err error) {
 	switch v := c.(type) {
 	case ir.Insert:
 		// ADR-0074 Phase 1b: routedSchema is the bound database in
@@ -1373,36 +1402,36 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		schema := a.routedSchema(v.Schema)
 		pk, err := a.pkFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if errors.Is(err, errUnknownTargetTable) {
-			return a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "insert", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes, a.upsert)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
-			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
-		return a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
+		return false, a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
 
 	case ir.Update:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if errors.Is(err, errUnknownTargetTable) {
-			return a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "update", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
 		// Update misses are tolerated (zero rows affected). On resume
 		// we may replay an Update whose target row was already
@@ -1412,34 +1441,34 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// the divergence has at least one observable footprint.
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: update %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: update %s.%s: %w", schema, v.Table, err)
 		}
 		// logZeroRowsAffected reads the driver-cached rows-affected count
 		// (no SQL round-trip), so the diagnostics area is still the
 		// UPDATE's when the Vector B probe below reads it.
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
-		return a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
+		return false, a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
 
 	case ir.Delete:
 		schema := a.routedSchema(v.Schema)
 		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if errors.Is(err, errUnknownTargetTable) {
-			return a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
+			return true, a.recordSkippedTable(ctx, streamID, "delete", schema, v.Table, v.Position.Token)
 		}
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: build delete for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
 		// Delete misses are tolerated for the same reason as Update.
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
-		return nil
+		return false, nil
 
 	case ir.Truncate:
 		// Bug 98 (v0.92.0): the source's pgoutput TruncateMessage may
@@ -1470,15 +1499,15 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		schema := a.routedSchema(v.Schema)
 		if _, err := a.colTypesFor(ctx, tx, schema, v.Table); err != nil {
 			if errors.Is(err, errUnknownTargetTable) {
-				return a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
+				return true, a.recordSkippedTable(ctx, streamID, "truncate", schema, v.Table, v.Position.Token)
 			}
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt := buildTruncateSQL(schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
-			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
-		return nil
+		return false, nil
 
 	case ir.SchemaSnapshot:
 		// ADR-0049 Chunk B: persist the boundary's IR schema into
@@ -1501,14 +1530,14 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// a lost version silently degrades every future resume
 		// across this boundary).
 		if v.IR == nil {
-			return errors.New("mysql: applier: schema snapshot has nil IR table")
+			return false, errors.New("mysql: applier: schema snapshot has nil IR table")
 		}
 		if err := writeSchemaVersion(ctx, tx, a.controlKeyspace, streamID, v.Schema, v.Table, v.Position, v.IR, a.upsert); err != nil {
-			return fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+			return false, fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
-		return nil
+		return false, nil
 	}
-	return fmt.Errorf("mysql: applier: unknown change type %T", c)
+	return false, fmt.Errorf("mysql: applier: unknown change type %T", c)
 }
 
 // reportApplyClampWarnings closes the Vector B silent-clamp gap on the
