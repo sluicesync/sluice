@@ -43,12 +43,18 @@ package ir
 //
 // For any non-[Domain] type it is the identity. For a [Domain] it is
 // the base type, and it unwraps repeatedly so a domain over a domain
-// resolves in one call. (Postgres's own `information_schema` already
-// reports the ultimate base type for a nested domain, so the IR a live
-// PG source produces carries at most one wrapper — but the manifest
-// wire round-trips `Domain.BaseType` recursively, and the loop costs
-// nothing.) The loop cannot spin: [Domain] holds its base as an
-// interface VALUE, so a self-referential domain is not constructible.
+// resolves in one call. (Postgres's own `information_schema` reports
+// only the IMMEDIATE base of a domain column — one level — NOT the
+// ultimate base of a nested domain; verified by the Bug 255 mutation
+// run. So the PG schema reader cannot model a `CREATE DOMAIN d2 AS d1`
+// nested domain from `information_schema` alone and refuses it loudly by
+// name rather than producing a partial wrapper. The repeated unwrap here
+// still earns its keep on two paths that CAN carry a genuinely nested
+// `Domain.BaseType`: the manifest wire, which round-trips it recursively,
+// and the PG CDC reader's `resolveDomainBase`, which walks `pg_type.
+// typbasetype` N levels off the wire.) The loop cannot spin: [Domain]
+// holds its base as an interface VALUE, so a self-referential domain is
+// not constructible.
 //
 // A [Domain] with a nil BaseType is MALFORMED, and this returns the
 // Domain unchanged rather than nil. That is deliberate: every existing
