@@ -53,8 +53,14 @@ for f in $FILES; do
 	records=$(awk '
 		function flush() {
 			if (job == "") return
-			hasleg  = (blob ~ /go test[^\n]*integration[^\n]*-run/) ? 1 : 0
-			hasguard = (blob ~ /--- PASS:/ || blob ~ /check-leg-nonvacuity\.sh/) ? 1 : 0
+			# hasleg: a build-tagged, -run-filtered go test on one joined line,
+			# in EITHER tag/-run order (audit T-4 — the old form required
+			# `integration` to precede `-run`, so a reordered leg dropped out).
+			hasleg  = ((blob ~ /go test[^\n]*integration[^\n]*-run/) || (blob ~ /go test[^\n]*-run[^\n]*integration/)) ? 1 : 0
+			# hasguard: the real assertion, not a bare `--- PASS:` substring that
+			# a copied yaml COMMENT would satisfy (audit T-4). A genuine
+			# non-vacuity assert either greps for `--- PASS` or calls the helper.
+			hasguard = ((blob ~ /grep[^\n]*--- PASS/) || (blob ~ /check-leg-nonvacuity\.sh/)) ? 1 : 0
 			ishelper = (blob ~ /check-leg-nonvacuity\.sh/) ? 1 : 0
 			printf "%s\t%d\t%d\t%d\n", job, hasleg, hasguard, ishelper
 		}
