@@ -99,15 +99,15 @@ func packageHasGateFile(dir string) bool {
 // reason"): a NEW dispatching package that is neither gated nor listed here
 // FAILS the meta-walker below, and a listed package that gains a gate (or stops
 // dispatching) must be REMOVED — so the roster shrinks as the debt is paid.
-var ungatedDispatchRoster = map[string]string{
-	"engines/mydumper": "A-3 remediation: mydumper reader/parse dispatch on column type; needs a gate or a domain-safety audit.",
-	"ir/diff":          "A-3 remediation: schema-diff column-shape normalization dispatches on ir.Integer; a Domain-over-Integer misses the AutoIncrement normalization (comparison nuance).",
-	"pipeline":         "A-3 remediation: infer-types / redact-preflight / where-pushdown dispatch on column type; needs a gate or a domain-safety audit.",
-	"pipeline/backup":  "A-3 remediation: chain-restore column-type dispatch; needs a gate or a domain-safety audit.",
-	"pipeline/lineage": "A-3 remediation: verbatim-column detection dispatches on ir.VerbatimType; a Domain-over-VerbatimType would be missed.",
-	"pipeline/migcore": "A-3 remediation: chunk-strategy + float-repair dispatch on ir.Integer; a Domain-over-Integer PK falls to keyset (perf, not correctness).",
-	"rowpredicate":     "A-3 remediation: predicate rendering dispatches on column type; needs a gate or a domain-safety audit.",
-}
+//
+// The seven audit-A-3 packages (engines/mydumper, ir/diff, pipeline,
+// pipeline/backup, pipeline/lineage, pipeline/migcore, rowpredicate) each grew
+// their own domaingate gate file and were removed from this roster; two of them
+// (pipeline/lineage's verbatim marker, rowpredicate's `--where` fidelity switch)
+// and one pipeline site (redact_preflight's mask:uuid) carried real Bug 233
+// instances now fixed and pinned. The roster is currently empty: every
+// raw-IR-dispatching package under internal/ has a gate.
+var ungatedDispatchRoster = map[string]string{}
 
 // TestDomainGateMetaWalker_EveryDispatcherGatedOrRostered is the A-3 gate: every
 // package under internal/ that imports ir and dispatches on a RAW column type

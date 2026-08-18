@@ -205,7 +205,13 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 			if col == nil {
 				continue
 			}
-			if _, isUUID := col.Type.(ir.UUID); !isUUID {
+			// Bug 233: a Postgres source can carry a DOMAIN over uuid, whose
+			// STORAGE is uuid — the target's uuid column still refuses the
+			// non-hex 'X' bytes mask:uuid produces, so the preflight WARN must
+			// fire for it too. Read the storage type (UnwrapDomain is identity
+			// for non-domains) so a domain-over-uuid column is warned like a bare
+			// uuid column, before the mid-bulk-copy refusal rather than after.
+			if _, isUUID := ir.UnwrapDomain(col.Type).(ir.UUID); !isUUID {
 				continue
 			}
 			typeProblems = append(typeProblems, fmt.Sprintf(
@@ -240,7 +246,12 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 				if col == nil {
 					continue // selector-unresolved already caught above
 				}
-				intT, isInt := col.Type.(ir.Integer)
+				// Bug 233: read the STORAGE type — a DOMAIN-over-integer stores
+				// as its base integer, so the overflow check must use the base
+				// width; without the unwrap a domain-over-int column skips this
+				// preflight and re-opens the Bug-105 silent-clamp PII window for
+				// it. UnwrapDomain is identity for non-domains.
+				intT, isInt := ir.UnwrapDomain(col.Type).(ir.Integer)
 				if !isInt {
 					continue // non-integer column — let DB enforce type compatibility
 				}

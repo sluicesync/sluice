@@ -374,7 +374,12 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 		// thing the type switch would contribute is the isCidr bit, which is
 		// read straight off the column here.
 		if info.Identifier == identifierNetwork {
-			_, isCidr := c.Type.(ir.Cidr)
+			// Read the STORAGE type (Bug 233): a DOMAIN over cidr reaches
+			// identifierNetwork through columnInfoFor's unwrapped switch, so the
+			// isCidr bit that selects cidr-vs-inet rendering must unwrap too, or a
+			// domain-over-cidr column would render as inet. UnwrapDomain is
+			// identity for non-domains.
+			_, isCidr := ir.UnwrapDomain(c.Type).(ir.Cidr)
 			info.NetworkRendering = netRendering(isCidr)
 		}
 		// Set OUTSIDE columnInfoFor's type switch: whether a column is
@@ -387,7 +392,13 @@ func ColumnInfosFromIR(resolver ir.CollationResolver, cols []*ir.Column, strict 
 }
 
 func columnInfoFor(resolver ir.CollationResolver, c *ir.Column, strict bool, temporal ir.TemporalLiteralSemantics) ColumnInfo {
-	switch t := c.Type.(type) {
+	// Read the STORAGE type (Bug 233): a Postgres DOMAIN is a constraint
+	// wrapper, not a storage one, so its `=` semantics are exactly the base
+	// type's. Without the unwrap a domain-over-<anything> column matches no arm
+	// and falls to the default FamilyUnsupported, which REFUSES an otherwise
+	// faithfully-evaluable `--where` predicate (e.g. `price = 10` on a
+	// domain-over-numeric column). UnwrapDomain is identity for non-domains.
+	switch t := ir.UnwrapDomain(c.Type).(type) {
 	case ir.Integer, ir.Decimal:
 		return ColumnInfo{Family: FamilyNumeric}
 	case ir.Float:

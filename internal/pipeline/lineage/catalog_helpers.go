@@ -43,7 +43,13 @@ func VerbatimExtensionColumnsIn(s *ir.Schema) []string {
 			if col == nil {
 				continue
 			}
-			if _, ok := col.Type.(ir.VerbatimType); !ok {
+			// Bug 233: a Postgres source can carry a DOMAIN over a verbatim
+			// (extension) base type, and the restore-time refuseVerbatim* gate
+			// must still fire for it — the column's STORAGE is the verbatim base,
+			// which the restore target needs the extension for. Read the storage
+			// type so a domain-over-verbatim column records the marker like a bare
+			// verbatim column does (UnwrapDomain is identity for non-domains).
+			if _, ok := ir.UnwrapDomain(col.Type).(ir.VerbatimType); !ok {
 				continue
 			}
 			ref := tbl.Name + "." + col.Name
