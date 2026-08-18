@@ -557,7 +557,21 @@ jobs:
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
             ghcr.io/sluicesync/sluice-postgres:16-prebaked \
             ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
-      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m -run 'PostGIS_' ./internal/pipeline/... ./internal/engines/postgres/... ./internal/engines/pgtrigger/...
+      - name: Run PostGIS integration suite (with non-vacuity guard)
+        run: |
+          set -o pipefail
+          go test -tags="integration postgis" -race -count=1 -timeout=25m -v -run 'PostGIS_' \
+            ./internal/pipeline/... ./internal/engines/postgres/... ./internal/engines/pgtrigger/... 2>&1 | tee postgis.out
+          # audit T-2: this is a REQUIRED check, but a bare `go test` exits 0
+          # when every geometry-codec pin t.Skip's on a dead docker daemon
+          # (the TEST-7 mode ci.yml's own comments name) — a vacuous green
+          # would let a geometry silent-loss regression merge behind branch
+          # protection. Assert real work ran+passed.
+          passed=$(grep -c '^--- PASS: Test' postgis.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::Integration (PostGIS): zero top-level tests PASSed — the suite skipped or didn't run (vacuous green on a required check). See the run log."
+            exit 1
+          fi
 
   # ----- Integration (vstream) -----
   # The PlanetScale/Vitess VStream path is exercised end-to-end against a
@@ -629,7 +643,19 @@ jobs:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci-mirror-pull.sh vitess/vttestserver:mysql80
-      - run: go test -tags="integration vstream" -race -count=1 -timeout=30m -run 'TestVStream_' ./internal/engines/mysql/...
+      - name: Run VStream integration suite (with non-vacuity guard)
+        run: |
+          set -o pipefail
+          go test -tags="integration vstream" -race -count=1 -timeout=30m -v -run 'TestVStream_' \
+            ./internal/engines/mysql/... 2>&1 | tee vstream.out
+          # audit T-2: required check — a dead vttestserver/docker daemon
+          # skips every TestVStream_* and exits 0, greening the check behind
+          # branch protection. Assert real work ran+passed.
+          passed=$(grep -c '^--- PASS: Test' vstream.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::Integration (vstream): zero top-level tests PASSed — the suite skipped or didn't run (vacuous green on a required check). See the run log."
+            exit 1
+          fi
 
   # ----- Integration (MariaDB preview) -----
   # INFORMATIONAL, NON-REQUIRED canary (roadmap item 73 matrix expansion):
@@ -678,7 +704,18 @@ jobs:
             echo "pull attempt $i failed; retrying in $((i * 10))s"
             sleep $((i * 10))
           done
-      - run: go test -tags="integration mariadbpreview" -race -count=1 -timeout=15m -run '^TestMariaDB_Preview_' ./internal/engines/mysql/...
+      - name: Run MariaDB-preview canary (with non-vacuity guard)
+        run: |
+          set -o pipefail
+          go test -tags="integration mariadbpreview" -race -count=1 -timeout=15m -v -run '^TestMariaDB_Preview_' \
+            ./internal/engines/mysql/... 2>&1 | tee mariadbpreview.out
+          # audit T-2 class: even a non-required canary is worthless if it
+          # silently runs nothing; assert it actually exercised the preview.
+          passed=$(grep -c '^--- PASS: Test' mariadbpreview.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::Integration (MariaDB preview): zero top-level tests PASSed — the canary skipped or didn't run (vacuous green). See the run log."
+            exit 1
+          fi
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the

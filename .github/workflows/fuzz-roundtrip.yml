@@ -131,9 +131,23 @@ jobs:
       - name: Fuzz encode differential
         env:
           FUZZTIME: ${{ github.event.inputs.codecFuzztime || '20m' }}
+          # audit T-1: the FuzzFastRow* targets moved to internal/pipeline/
+          # blobcodec (e051de13) but this leg still fuzzed the non-recursive
+          # ./internal/pipeline/, where `go test -fuzz` matched ZERO targets,
+          # warned, and exited 0 — the codec differential fuzz was inert for
+          # weeks. Point it at the package that holds them.
+          PKG: ./internal/pipeline/blobcodec/
         run: |
+          set -o pipefail
+          # Target-exists guard: `go test -fuzz` greens on a no-match, so a
+          # future move would silently re-inert this. Assert the target is
+          # actually present before spending fuzztime on it.
+          go test -list '^FuzzFastRowEncodeDifferential$' "$PKG" | grep -q '^FuzzFastRowEncodeDifferential$' || {
+            echo "::error::fuzz: FuzzFastRowEncodeDifferential not found in $PKG — target moved/renamed; the fuzz leg would run empty (audit T-1)."
+            exit 1
+          }
           go test -run NoMatch -fuzz '^FuzzFastRowEncodeDifferential$' \
-            -fuzztime "$FUZZTIME" ./internal/pipeline/
+            -fuzztime "$FUZZTIME" "$PKG"
 
       - name: Fuzz decode differential
         # Run even if the encode fuzzer found something — the two
@@ -141,14 +155,20 @@ jobs:
         if: success() || failure()
         env:
           FUZZTIME: ${{ github.event.inputs.codecFuzztime || '20m' }}
+          PKG: ./internal/pipeline/blobcodec/
         run: |
+          set -o pipefail
+          go test -list '^FuzzFastRowDecodeDifferential$' "$PKG" | grep -q '^FuzzFastRowDecodeDifferential$' || {
+            echo "::error::fuzz: FuzzFastRowDecodeDifferential not found in $PKG — target moved/renamed (audit T-1)."
+            exit 1
+          }
           go test -run NoMatch -fuzz '^FuzzFastRowDecodeDifferential$' \
-            -fuzztime "$FUZZTIME" ./internal/pipeline/
+            -fuzztime "$FUZZTIME" "$PKG"
 
       - name: Upload crasher corpus
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: codec-fuzz-crashers-${{ github.run_id }}
-          path: internal/pipeline/testdata/fuzz/
+          path: internal/pipeline/blobcodec/testdata/fuzz/
           if-no-files-found: ignore

@@ -10,6 +10,14 @@
 # `--- PASS:` assertion (the inline shape). A future bare leg fails HERE, in
 # the required Lint check, instead of greening vacuously for weeks.
 #
+# ci.yml is in scope too (audit T-2): its REQUIRED `Integration (PostGIS)` /
+# `Integration (vstream)` legs ran bare `go test` with no assertion, so a dead
+# docker daemon would skip every geometry/vstream pin and green a REQUIRED
+# check behind branch protection — worse than a scheduled vacuous-green. The
+# 5-shard matrix leg is NOT flagged here because its `-run` lives in
+# `matrix.shard.goflags` (no literal `-run` on the go-test line); its
+# non-vacuity is `check-integration-skips.sh`, a different mechanism.
+#
 # Detection is deliberately coarse-at-block-granularity but continuation-aware:
 # it collapses backslash-continued lines so `go test … -run …` reads as one
 # line, then a job "runs a filtered integration leg" iff that joined line
@@ -23,6 +31,7 @@ FILES="
 .github/workflows/vitess-version-matrix.yml
 .github/workflows/pg-version-matrix.yml
 .github/workflows/fuzz-roundtrip.yml
+.github/workflows/ci.yml
 "
 
 # Anti-vacuity floor: the total detected legs (raw filtered `go test` + helper
