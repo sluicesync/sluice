@@ -168,7 +168,7 @@ jobs:
       #     --repo sluicesync/sluice
       # ----------------------------------------------------------------------
       - name: Attest build provenance (release assets)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -237,21 +237,21 @@ jobs:
       # API either way; the referrer is what non-gh tooling (cosign, oras) can
       # find.
       - name: Attest build provenance (GHCR image, multi-arch index)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/sluicesync/sluice
           subject-digest: ${{ steps.image.outputs.index }}
           push-to-registry: true
 
       - name: Attest build provenance (GHCR image, linux/amd64)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/sluicesync/sluice
           subject-digest: ${{ steps.image.outputs.amd64 }}
           push-to-registry: true
 
       - name: Attest build provenance (GHCR image, linux/arm64)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/sluicesync/sluice
           subject-digest: ${{ steps.image.outputs.arm64 }}
