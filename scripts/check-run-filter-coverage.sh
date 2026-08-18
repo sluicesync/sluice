@@ -250,10 +250,19 @@ while IFS=';' read -r mtag mpattern mscopes mlabel; do
 
 	if [ -z "$gotest" ]; then
 		if [ -n "$weak_reason" ]; then
-			# Weak fallback: the manifest pattern must at least still appear
-			# somewhere in the workflow file.
-			if ! grep -qF -- "$mpattern" "$wfpath"; then
-				echo "::error::MANIFEST regex '$mpattern' (axis $mtag) does not appear anywhere in $wfpath — the workflow's -run filter drifted from the manifest (or vice versa); update them TOGETHER"
+			# Weak fallback: the manifest pattern must still appear in the
+			# workflow — but QUOTED ('PATTERN'), not as a bare substring (T-6,
+			# Tier-3 audit). The old bare `grep -qF "$mpattern"` was fooled two
+			# ways: narrowing the cluster default `'TestVitessCluster'` to
+			# `'TestVitessCluster_Bug27'` still contains the substring (dropping
+			# the OnlineDDL pair silently), and `TestVitessCluster` also appears
+			# unquoted inside the filtered-tag-gate's `TestVitessClusterFilteredSync`.
+			# Requiring the single-quoted whole value bounds both: both weak legs
+			# define their pattern as `'<pattern>'` (the cluster `|| '…'` default
+			# and the VSTREAM_PIPELINE_RUN env), so a narrowed or substring-only
+			# match no longer satisfies it.
+			if ! grep -qF -- "'$mpattern'" "$wfpath"; then
+				echo "::error::MANIFEST regex '$mpattern' (axis $mtag) does not appear QUOTED as '$mpattern' in $wfpath — the workflow's -run filter drifted from the manifest (a narrowing to a longer pattern no longer passes on a bare substring); update them TOGETHER"
 				status=1
 			fi
 			echo "check-run-filter-coverage: NOTE leg '$mlabel' is substring-checked only — $weak_reason"

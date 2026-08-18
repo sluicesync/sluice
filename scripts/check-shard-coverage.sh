@@ -261,6 +261,23 @@ done
 skip_pkgs=$(grep -B1 'goflags: "-skip' "$ci_workflow" | grep -oE '\./internal/[a-zA-Z0-9_/.-]+' | sort -u)
 run_pkglists=$(grep -B1 'goflags: "-run' "$ci_workflow" | grep 'packages:')
 
+# T-3 anti-vacuity floor (Tier-3 audit): the extraction above relies on
+# `packages:` sitting one line before `goflags:` (grep -B1). A semantically-
+# identical key reorder breaks that adjacency, `skip_pkgs` comes back empty,
+# and the `[ -n "$skip_pkgs" ]` guard below then SILENTLY skips this whole
+# sub-check — the exact hole it was built to close. Detect the -skip shard's
+# existence INDEPENDENTLY (a bare grep, no adjacency), and if it exists but the
+# extraction found nothing, fail loudly rather than pass vacuously. Same for the
+# -run side.
+if grep -q 'goflags: "-skip' "$ci_workflow" && [ -z "$skip_pkgs" ]; then
+	echo "::error::check-shard-coverage TEST-1: the workflow HAS a -skip shard but skip_pkgs extraction returned EMPTY — the packages:/goflags: adjacency broke (a key reorder?). Fix the extraction; do not let this sub-check silently pass."
+	status=1
+fi
+if grep -q 'goflags: "-run' "$ci_workflow" && [ -z "$run_pkglists" ]; then
+	echo "::error::check-shard-coverage TEST-1: the workflow HAS a -run shard but run_pkglists extraction returned EMPTY — the packages:/goflags: adjacency broke. Fix the extraction."
+	status=1
+fi
+
 if [ -n "$skip_pkgs" ] && [ -n "$run_pkglists" ]; then
 	while IFS= read -r pkg; do
 		[ -z "$pkg" ] && continue
