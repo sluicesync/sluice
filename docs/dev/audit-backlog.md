@@ -13,6 +13,17 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Scope rule:** anything with a confirmed silent-loss consequence becomes a numbered roadmap item, not a line in this file. This is for the tier below that.
 
+## Open — 2026-08-17 Tier-3 audit (Fable, v0.112.0..v0.127.1)
+
+### A-3 remediation — per-package domaingate gate files (the meta-walker's ungatedDispatchRoster)
+
+The Tier-3 audit's A-3 meta-walker (`internal/domaingate/domaingate_meta_test.go`, `TestDomainGateMetaWalker_EveryDispatcherGatedOrRostered`) now enforces that every package under `internal/` dispatching on a RAW `ir` column type has either its own `domaingate.Assert` gate file OR a written reason in `ungatedDispatchRoster`. The roster records **8 packages with un-gated column-type dispatch** — un-audited domain-transparency surface, some carrying latent A-1/A-2-shaped hazards. Building a real gate for each (verifying each site handles `ir.Domain`, exempting the safe ones) is the tracked remediation, in priority order:
+
+1. **`engines/postgres` (PRIORITY, 34 sites).** The direct sibling of the already-gated `engines/mysql`, and the engine whose reader PRODUCES `ir.Domain` — so its DDL emitter / row writer / schema writer are the likeliest place a real Domain bug lives (e.g. `schema_writer.go`'s `col.Type.(ir.Enum)` would skip enum-type creation for a Domain-over-Enum, the A-1 shape). Add a `domaingate.Assert` gate mirroring `mysql/domain_gate_test.go`, classifying all 34 sites (UnwrapDomain the buggy ones, exempt the safe ones with reasons).
+2. `engines/mydumper`, `ir/diff`, `pipeline`, `pipeline/backup`, `pipeline/lineage`, `pipeline/migcore`, `rowpredicate` — each has 1–6 raw dispatch sites; audit each for domain-safety and gate or fix. `pipeline/lineage`'s `col.Type.(ir.VerbatimType)` (a Domain-over-Verbatim would be missed) and `ir/diff`'s AutoIncrement normalization are the ones most worth an early look.
+
+As each package is gated (or its dispatches unwrapped), remove its `ungatedDispatchRoster` entry — the meta-walker fails on a stale entry, so the roster is self-pruning and the debt is visible and counted.
+
 ## Open — 2026-08-05 audit
 
 Full report: `workspace/repo-audit-2026-08-05.md` (untracked — which is why its §4 queue is enumerated below rather than counted). Grade B+. The two remaining CRITICALs were filed as roadmap items **131** (lane routing / secondary unique) and **132** (GTID mid-tx checkpoint), both shipped v0.113.0; the third, A-3, plus B-5 were folded into the item-127 compaction arc. Two HIGHs were filed alongside them: **133** (`--where` inet family) and **134** (SQLite index-name scoping), both shipped v0.114.0.
