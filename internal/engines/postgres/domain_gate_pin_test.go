@@ -57,24 +57,57 @@ func TestPin_DomainWrapped_PhysicalWritePath(t *testing.T) {
 	}
 }
 
-// TestPin_DomainOverEnum_RefusedAtEmit pins the LOUD REFUSAL that the enum-type
-// lifecycle exemptions in the roster lean on: a domain-over-enum cannot be
-// emitted, because emitColumnType has no standalone spelling for an enum base
-// (it needs emitColumnDef's table+column context). This is the premise that
-// makes schema_writer's enum-type-creation/preview/drop/ensure sites safe as
-// raw dispatches — if this refusal ever stops firing (e.g. emitColumnType gains
-// an enum arm), those exemptions must be revisited, and this pin forces that.
-func TestPin_DomainOverEnum_RefusedAtEmit(t *testing.T) {
-	_, err := emitCreateDomainType(
+// TestPin_DomainOverEnum_EmitsNamedEnumType pins Bug 255's HALF 1: a
+// domain-over-enum is EMITTED (no longer refused). emitCreateDomainType renders
+// the CREATE DOMAIN referencing the enum by its schema-qualified NAME — the
+// same NAMED type the writer's Phase 1a' creates first — because a PG enum is a
+// named type and a CREATE DOMAIN carries no column context to synthesize one
+// from. Reverting emitCreateDomainType to route the enum base through
+// emitColumnType (whose ir.Enum arm refuses) reddens this pin.
+func TestPin_DomainOverEnum_EmitsNamedEnumType(t *testing.T) {
+	// PG source: the enum carries its original type name; the domain
+	// references it verbatim.
+	ddl, err := emitCreateDomainType(
+		ir.Domain{Name: "d_mood", BaseType: ir.Enum{TypeName: "mood", Values: []string{"happy", "sad"}}},
+		"public",
+		emitOpts{},
+	)
+	if err != nil {
+		t.Fatalf("emitCreateDomainType refused a domain-over-enum (Bug 255 HALF 1 regressed): %v", err)
+	}
+	if want := `CREATE DOMAIN "public"."d_mood" AS "public"."mood"`; !strings.Contains(ddl, want) {
+		t.Errorf("CREATE DOMAIN does not reference the enum by its schema-qualified name.\n got: %s\nwant substring: %s", ddl, want)
+	}
+
+	// The paired CREATE TYPE the writer emits before the CREATE DOMAIN, named
+	// from the same resolver, preserves enum value ORDER.
+	create, err := emitCreateEnumTypeNamed(
+		ir.Enum{TypeName: "mood", Values: []string{"happy", "sad"}},
+		"public",
+		resolveDomainEnumTypeName(ir.Enum{TypeName: "mood"}, "d_mood"),
+		"domain d_mood",
+	)
+	if err != nil {
+		t.Fatalf("emitCreateEnumTypeNamed for the domain enum base failed: %v", err)
+	}
+	if want := `CREATE TYPE "public"."mood" AS ENUM ('happy', 'sad')`; !strings.Contains(create, want) {
+		t.Errorf("enum-type create for the domain base is wrong.\n got: %s\nwant substring: %s", create, want)
+	}
+
+	// Anonymous enum base (empty TypeName): the type name is synthesized
+	// deterministically from the DOMAIN, and CREATE DOMAIN + CREATE TYPE agree.
+	if got := resolveDomainEnumTypeName(ir.Enum{}, "d_mood"); got != "d_mood_enum" {
+		t.Errorf("anonymous-enum-base domain type name = %q; want %q", got, "d_mood_enum")
+	}
+	ddl2, err := emitCreateDomainType(
 		ir.Domain{Name: "d_mood", BaseType: ir.Enum{Values: []string{"happy", "sad"}}},
 		"public",
 		emitOpts{},
 	)
-	if err == nil {
-		t.Fatalf("emitCreateDomainType accepted a domain-over-enum; the enum-lifecycle exemptions in " +
-			"postgresDomainDispatchExemptions assume it is refused loudly — revisit them")
+	if err != nil {
+		t.Fatalf("emitCreateDomainType refused an anonymous-enum-base domain: %v", err)
 	}
-	if !strings.Contains(err.Error(), "d_mood") {
-		t.Errorf("domain-over-enum refusal does not name the domain (%q); a loud refusal must name the row", err)
+	if want := `AS "public"."d_mood_enum"`; !strings.Contains(ddl2, want) {
+		t.Errorf("anonymous-enum-base CREATE DOMAIN does not reference the synthesized name.\n got: %s\nwant substring: %s", ddl2, want)
 	}
 }

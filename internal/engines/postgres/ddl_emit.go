@@ -1029,6 +1029,23 @@ func resolveEnumTypeName(enum ir.Enum, tableName, columnName string) string {
 	return enumTypeName(tableName, columnName)
 }
 
+// resolveDomainEnumTypeName returns the Postgres enum type name for the ENUM
+// base of a domain-over-enum (Bug 255). A same-engine PG source carries the
+// enum's original type name on [ir.Enum.TypeName] (the common case — the DOMAIN
+// and its enum are both operator-declared on the source), so preserving it
+// keeps the `CREATE DOMAIN ... AS <enum>` referencing the exact type any app
+// code and sibling columns reference. When TypeName is empty, synthesize a
+// deterministic name from the DOMAIN identifier so the CREATE TYPE and the
+// CREATE DOMAIN reference agree. Empty TypeName is defensive only: a domain
+// over an anonymous enum cannot arise from a MySQL source (MySQL has no
+// domains), and a PG source always names its enum types.
+func resolveDomainEnumTypeName(enum ir.Enum, domainName string) string {
+	if enum.TypeName != "" {
+		return enum.TypeName
+	}
+	return domainName + "_enum"
+}
+
 // qualifiedEnumTypeRef returns the schema-qualified enum type
 // reference for use as a column type ident or `::cast` suffix.
 //
@@ -1266,16 +1283,42 @@ func validatePGIndexNamespace(tables []*ir.Table) error {
 // preserved verbatim — PG evaluates them in catalog order, which is
 // the source's declaration order after read-back.
 //
-// Returns a non-nil error when the base type can't be rendered
-// (e.g. a nested DOMAIN whose base is itself a USER-DEFINED type
-// the IR doesn't model — exceedingly rare in practice).
+// The base may be a scalar, an array, or (Bug 255) an ENUM — an enum
+// base renders as the schema-qualified NAMED enum type the writer's
+// Phase 1a' creates just before this CREATE DOMAIN. Returns a non-nil
+// error when the base type can't be rendered (a nested DOMAIN never
+// reaches here: the schema reader refuses domain-over-domain by name
+// before any DDL emits — Bug 255 HALF 2, deferred).
 func emitCreateDomainType(d ir.Domain, schema string, opts emitOpts) (string, error) {
 	if d.BaseType == nil {
 		return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q has nil BaseType", d.Name)
 	}
-	baseDDL, err := emitColumnType(d.BaseType, opts)
-	if err != nil {
-		return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q base type: %w", d.Name, err)
+	var baseDDL string
+	if enum, isEnum := d.BaseType.(ir.Enum); isEnum {
+		// Bug 255: a domain over an ENUM references a NAMED type, not an
+		// inline type spelling. emitColumnType's ir.Enum arm deliberately
+		// refuses ("requires column context") because the per-column enum
+		// path names the type from table+column — but a CREATE DOMAIN has
+		// no column. The enum type is instead named from the DOMAIN, and
+		// the writer's Phase 1a' emits its CREATE TYPE before this CREATE
+		// DOMAIN; here we render the schema-qualified reference to it. The
+		// qualifier matches what Phase 1a' creates (both use `schema`), so
+		// the two agree independent of opts.TargetSchema.
+		typeName := resolveDomainEnumTypeName(enum, d.Name)
+		if err := validatePGIdentifier("enum type", typeName, typeName, "domain "+d.Name); err != nil {
+			return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q base type: %w", d.Name, err)
+		}
+		if schema == "" {
+			baseDDL = quoteIdent(typeName)
+		} else {
+			baseDDL = quoteIdent(schema) + "." + quoteIdent(typeName)
+		}
+	} else {
+		var err error
+		baseDDL, err = emitColumnType(d.BaseType, opts)
+		if err != nil {
+			return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q base type: %w", d.Name, err)
+		}
 	}
 	out := fmt.Sprintf(
 		"CREATE DOMAIN %s.%s AS %s",
@@ -1309,7 +1352,19 @@ func emitCreateDomainType(d ir.Domain, schema string, opts emitOpts) (string, er
 // lists overlap, lands wrong values with no error at all).
 func emitCreateEnumType(enum ir.Enum, schema, tableName, columnName string) (string, error) {
 	typeName := resolveEnumTypeName(enum, tableName, columnName)
-	if err := validatePGIdentifier("enum type", typeName, typeName, tableName+"."+columnName); err != nil {
+	return emitCreateEnumTypeNamed(enum, schema, typeName, tableName+"."+columnName)
+}
+
+// emitCreateEnumTypeNamed is the name-agnostic core of [emitCreateEnumType]:
+// it renders `CREATE TYPE <schema>.<typeName> AS ENUM (...)` for an already-
+// resolved type name. The enum-COLUMN path resolves that name from the
+// table+column pair ([resolveEnumTypeName]); the domain-over-enum path (Bug
+// 255) resolves it from the DOMAIN ([resolveDomainEnumTypeName]) because a
+// `CREATE DOMAIN d AS <enum>` carries no column context — the enum is a NAMED
+// type that must exist before the CREATE DOMAIN references it. owner names the
+// column/domain solely for the identifier-length validation error.
+func emitCreateEnumTypeNamed(enum ir.Enum, schema, typeName, owner string) (string, error) {
+	if err := validatePGIdentifier("enum type", typeName, typeName, owner); err != nil {
 		return "", err
 	}
 	parts := make([]string, len(enum.Values))

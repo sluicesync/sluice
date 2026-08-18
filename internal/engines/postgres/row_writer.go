@@ -300,6 +300,29 @@ func (w *RowWriter) DropSchemaTypes(ctx context.Context, schema *ir.Schema) erro
 			continue
 		}
 		for _, col := range table.Columns {
+			// Bug 255: a domain over an enum base gets its enum TYPE created
+			// by cold-start's Phase 1a' (schema_writer), named from the
+			// DOMAIN. Mirror that create here so --reset-target-data drops it
+			// too; DROP TYPE ... CASCADE also removes the dependent CREATE
+			// DOMAIN, so the reset leaves neither behind. (A scalar-base
+			// domain leaves its CREATE DOMAIN — a pre-existing Bug-113-era
+			// reset gap, out of scope here.)
+			if dom, ok := ir.DomainOf(col); ok {
+				enum, isEnum := dom.BaseType.(ir.Enum)
+				if !isEnum {
+					continue
+				}
+				typeName := resolveDomainEnumTypeName(enum, dom.Name)
+				if _, done := dropped[typeName]; done {
+					continue
+				}
+				dropped[typeName] = struct{}{}
+				stmt := "DROP TYPE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(typeName) + " CASCADE"
+				if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("postgres: drop enum type for domain %s: %w", dom.Name, err)
+				}
+				continue
+			}
 			enum, isEnum := col.Type.(ir.Enum)
 			if !isEnum || col.IsGenerated() {
 				continue

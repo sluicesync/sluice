@@ -294,6 +294,29 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 				continue
 			}
 			createdDomainTypes[dom.Name] = struct{}{}
+			// Bug 255: a domain over an ENUM base needs its enum NAMED
+			// type created before the CREATE DOMAIN references it. Phase
+			// 1a (above) only sees columns whose type is DIRECTLY ir.Enum,
+			// so a domain-wrapped enum is never created there. Emit it
+			// here, deduped against the SAME createdEnumTypes registry so
+			// a schema carrying both a plain enum column and a domain over
+			// that same enum type creates it exactly once; guardedCreate-
+			// EnumType makes the CREATE TYPE idempotent regardless, so a
+			// restarted cold-start re-runs clean. Ordering holds: this
+			// runs inside Phase 1a', which precedes Phase 1b (tables).
+			if enum, isEnum := dom.BaseType.(ir.Enum); isEnum {
+				enumName := resolveDomainEnumTypeName(enum, dom.Name)
+				if _, done := createdEnumTypes[enumName]; !done {
+					createdEnumTypes[enumName] = struct{}{}
+					create, err := emitCreateEnumTypeNamed(enum, w.schema, enumName, "domain "+dom.Name)
+					if err != nil {
+						return fmt.Errorf("postgres: emit enum type for domain %s: %w", dom.Name, err)
+					}
+					if err := execEmittedDDL(ctx, w.db, guardedCreateEnumType(create)); err != nil {
+						return fmt.Errorf("postgres: create enum type for domain %s: %w", dom.Name, err)
+					}
+				}
+			}
 			stmt, err := emitCreateDomainType(dom, w.schema, opts)
 			if err != nil {
 				return fmt.Errorf("postgres: emit domain type for %s.%s: %w", table.Name, col.Name, err)

@@ -1267,6 +1267,31 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 		if meta.DomainName == "" {
 			meta.DomainName = udtName
 		}
+		// Bug 255 HALF 2 (nested domain — DEFERRED, loud refusal).
+		// information_schema.columns / the pg_type join unwrap a domain
+		// column exactly ONE level, so udtName here is the IMMEDIATE base
+		// type. When that immediate base is itself a domain (it appears in
+		// domainChecks, which is keyed over every typtype='d' in the
+		// schema), the column is a domain-over-domain. The IR models a
+		// single domain level, so translateType below would otherwise
+		// fall through to the generic "user-defined type not supported"
+		// refusal naming the INNER domain, which misdirects the operator.
+		// Refuse specifically instead. The fix shape (deferred): walk
+		// pg_type.typbasetype to the ultimate concrete base (as
+		// resolveDomainBase already does for the CDC wire path) and either
+		// model a genuinely nested ir.Domain or flatten the CHECK union —
+		// both need per-level base-type metadata the one-level unwrap does
+		// not supply, so it is not a clean extension of this reader today.
+		if _, baseIsDomain := domainChecks[udtName]; baseIsDomain {
+			return nil, fmt.Errorf(
+				"postgres: column %q: nested domain %q over domain %q is not "+
+					"supported (a domain whose base type is itself a domain; "+
+					"sluice models a single domain level). Flatten the domain "+
+					"chain on the source, or exclude the table with "+
+					"--exclude-table to proceed (Bug 255)",
+				colName, meta.DomainName, udtName,
+			)
+		}
 	}
 
 	// Resolve enum values for USER-DEFINED columns.

@@ -146,28 +146,35 @@ var postgresDomainDispatchExemptions = map[string]string{
 		"(never identity-typed) does not carry. emitColumnType renders a domain BY NAME, which is itself a valid " +
 		"PG CAST target (`$N::domainname`), so the repair-table placeholder cast is correct without unwrapping.",
 
-	// ---- ENUM-TYPE LIFECYCLE: domain-over-enum is LOUD-REFUSED at emit ----
+	// ---- ENUM-TYPE LIFECYCLE: domain-over-enum is created via the DOMAIN (Bug 255) ----
 	"schema_writer.go:CreateTablesWithoutConstraints:col.Type": "TWO SITES, one key (same function+operand): " +
 		"(a) Phase 1a' dispatches on ir.Domain DELIBERATELY to emit CREATE DOMAIN — that IS the domain-handling " +
-		"site, the wrapper read is the point. (b) Phase 1a creates the standalone enum TYPE for a TOP-LEVEL " +
-		"ir.Enum column. A domain-over-enum is refused LOUDLY at emitCreateDomainType (emitColumnType cannot " +
-		"render an enum base without column context), pinned by TestPin_DomainOverEnum_RefusedAtEmit, so " +
-		"unwrapping (a) to pre-create the enum type would only orphan a type just before that refusal. Full " +
-		"domain-over-enum support is a deferred feature, not a silent-loss hole.",
-	"schema_writer.go:previewEnumTypes:col.Type": "LOUD-REFUSED: the dry-run mirror of CreateTablesWithoutConstraints " +
-		"Phase 1a; a domain-over-enum is refused at emitCreateDomainType (pinned), so previewing the enum type for " +
-		"it would be dead work ahead of that refusal.",
-	"schema_writer.go:ensureEnumType:col.Type": "LOUD-REFUSED: the forward ADD-COLUMN/ALTER path's enum-type " +
-		"ensure, mirroring cold-start; a domain-over-enum is refused at emitCreateDomainType (pinned), so this is " +
-		"never the site that silently mishandles it.",
+		"site, the wrapper read is the point (and, Bug 255, when the domain's BaseType is ir.Enum, Phase 1a' " +
+		"pre-creates the enum TYPE named from the DOMAIN before the CREATE DOMAIN references it — that create " +
+		"dispatches on dom.BaseType, not col.Type, so it is outside this gate's graded operand). (b) Phase 1a " +
+		"creates the standalone enum TYPE for a TOP-LEVEL ir.Enum column; a domain-over-enum's col.Type is " +
+		"ir.Domain (not ir.Enum), so it is correctly skipped here and handled by (a) instead.",
+	"schema_writer.go:previewEnumTypes:col.Type": "TOP-LEVEL-ENUM-ONLY: this previews the CREATE TYPE for a " +
+		"column whose DIRECT type is ir.Enum; a domain-over-enum's col.Type is ir.Domain and is skipped. " +
+		"PreviewDDL emits no CREATE DOMAIN phase at all (a pre-existing preview-completeness gap for the whole " +
+		"domain feature, NOT silent loss — the apply path creates the type + domain correctly), so skipping the " +
+		"domain-over-enum enum type here keeps preview in step with what it does render.",
+	"schema_writer.go:ensureEnumType:col.Type": "TOP-LEVEL-ENUM-ONLY: the forward ADD-COLUMN/ALTER path's " +
+		"enum-type ensure fires only for a column whose DIRECT type is ir.Enum. A forwarded ADD COLUMN of a " +
+		"DOMAIN column renders BY NAME via emitColumnDef and needs the DOMAIN (and, for an enum base, its enum " +
+		"type) to pre-exist on the target; the forward path creates neither — a pre-existing limitation shared " +
+		"by every domain base kind (Bug 255 note) whose absence fails LOUDLY at ADD COLUMN with 42704, not " +
+		"silently. So this site correctly skips domains.",
 	"schema_writer.go:orphanedEnumTypeDrop:col.Type": "INERT: this drops ONLY MySQL-synthesized (TypeName=='') " +
 		"enum types on column drop; a domain-over-enum is PG-sourced, whose ir.Enum carries TypeName!='' and is " +
 		"NEVER auto-dropped by policy (catalog Bug 19c). So even unwrapped the guard returns false — unwrapping " +
 		"is inert.",
-	"row_writer.go:DropSchemaTypes:col.Type": "LOCKSTEP/LOUD-REFUSED: the reset-time drop mirrors " +
-		"CreateTablesWithoutConstraints' enum-type CREATE exactly; a domain-over-enum's enum type is never " +
-		"created (refused at emitCreateDomainType, pinned), so there is nothing to drop, and this must stay in " +
-		"lockstep with the create side.",
+	"row_writer.go:DropSchemaTypes:col.Type": "LOCKSTEP + DELIBERATE-WRAPPER-READ: the reset-time drop mirrors " +
+		"CreateTablesWithoutConstraints' enum-type CREATE. Bug 255 gave Phase 1a' a domain-over-enum enum-TYPE " +
+		"create, so this function now ALSO drops that type (via ir.DomainOf(col) → dom.BaseType.(ir.Enum), " +
+		"CASCADE removing the dependent domain); the raw col.Type.(ir.Enum) arm keyed here handles TOP-LEVEL " +
+		"enum columns and correctly skips domains (they take the DomainOf branch). Stays in lockstep with the " +
+		"create side.",
 	"schema_writer.go:AlterColumnType:want.Type": "CROSS-ENGINE-ORIGIN: this routes a MySQL `MODIFY col ENUM(...)` " +
 		"add-value ALTER to ALTER TYPE … ADD VALUE (Bug 145); MySQL has no DOMAIN. A PG→PG shape-delta that " +
 		"changes a domain column's type flows through emitColumnType (by NAME); an enum-value addition under a " +
