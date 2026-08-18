@@ -73,7 +73,7 @@ func TestCheckGeometryRowSRID_KnownVersusUnknownColumn(t *testing.T) {
 // decides.
 func TestBuildRelationCacheEntry_GeometryStartsUnknown(t *testing.T) {
 	const geomOID = 18000
-	entry, err := buildRelationCacheEntry(relationMessageWithGeometry(geomOID), geomOID, nil)
+	entry, err := buildRelationCacheEntry(relationMessageWithGeometry(geomOID), geomOID, nil, nil)
 	if err != nil {
 		t.Fatalf("buildRelationCacheEntry: %v", err)
 	}

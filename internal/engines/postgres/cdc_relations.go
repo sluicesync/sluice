@@ -505,6 +505,96 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	return nil, fmt.Errorf("postgres: cdc: unsupported column type OID %d (typmod %d)", oid, typmod)
 }
 
+// domainBase records a DOMAIN type's immediate base type OID and the type
+// modifier the domain applies to that base — pg_type.typbasetype and
+// pg_type.typtypmod. It is what [resolveDomainBase] walks to unwrap a domain to
+// its ultimate concrete base (Bug 254).
+//
+// The distinction that makes the catalog lookup mandatory: `CREATE DOMAIN d AS
+// varchar(10)` stores the varchar(10) typmod HERE (baseTypmod), while the
+// pgoutput RelationMessage reports the domain COLUMN's own typmod as -1. So the
+// base length/precision can only be recovered from pg_type, never off the wire.
+type domainBase struct {
+	baseOID    uint32
+	baseTypmod int32
+}
+
+// resolveDomainBase unwraps a domain OID to its ultimate NON-domain base type,
+// returning the base OID and the effective type modifier to resolve it with. ok
+// is false when oid is not a domain (not present in domainBases).
+//
+// domain-over-domain is flattened by walking the chain. PostgreSQL forbids
+// attaching a type modifier when a domain's base is itself a domain, so only the
+// innermost domain (the one sitting directly on the concrete base) carries a
+// non -1 typtypmod; the walk keeps the last non -1 modifier it sees, which is
+// that innermost one. The iteration is bounded by the map size as a defence
+// against a pathological catalog cycle (impossible in a valid pg_type).
+func resolveDomainBase(oid uint32, domainBases map[uint32]domainBase) (baseOID uint32, baseTypmod int32, ok bool) {
+	if _, isDomain := domainBases[oid]; !isDomain {
+		return 0, 0, false
+	}
+	baseTypmod = int32(-1)
+	cur := oid
+	for i := 0; i <= len(domainBases); i++ {
+		d, isDomain := domainBases[cur]
+		if !isDomain {
+			return cur, baseTypmod, true
+		}
+		if d.baseTypmod != -1 {
+			baseTypmod = d.baseTypmod
+		}
+		cur = d.baseOID
+	}
+	// Cycle guard tripped (never in a valid catalog): stop at the last base.
+	return cur, baseTypmod, true
+}
+
+// resolveWireColumnType maps a pgoutput column's wire OID + typmod to an IR
+// type, applying the same dynamic-OID fallbacks buildRelationCacheEntry needs:
+// PostGIS geometry, user-defined enums, and — Bug 254 — DOMAINs. The static
+// [oidToType] table is tried first; only when it declines (a dynamic OID) do the
+// fallbacks run.
+//
+// A DOMAIN is unwrapped to its ultimate base type ([resolveDomainBase]) and THAT
+// is resolved recursively, so domain-over-varchar(10) decodes as varchar(10),
+// domain-over-enum resolves through the enum arm, domain-over-int[] through the
+// array arm, and so on. The result is deliberately NOT wrapped in ir.Domain: the
+// applier resolves TARGET column types from the target's information_schema,
+// which unwraps a domain to its base, so the CDC-decoded value must be the base
+// type to match — and the wire bytes are already in the base type's
+// representation. Producing the base type also keeps this reader in lockstep
+// with the schema reader, which likewise resolves a domain column's BASE type
+// off information_schema (Bug 113 wraps ir.Domain only around the SCHEMA the
+// writer re-creates, never the value path). This is the wire-OID sibling of the
+// Bug 233 ir.Domain-transparency class.
+//
+// The recursion terminates because resolveDomainBase always returns a
+// non-domain base OID, so the recursive call's domain lookup misses.
+func resolveWireColumnType(oid uint32, typmod int32, geomOID uint32, enumOIDs map[uint32]bool, domainBases map[uint32]domainBase) (ir.Type, error) {
+	t, err := oidToType(oid, typmod)
+	if err == nil {
+		return t, nil
+	}
+	switch {
+	case geomOID != 0 && oid == geomOID:
+		// SRID starts UNKNOWN, not 0. pgoutput carries no SRID, and 0 is a real
+		// declared value (an unconstrained column), so a bare ir.Geometry{}
+		// would assert "this column declares 0" about something never read —
+		// which refuses every row of a geometry(Point,4326) column.
+		// [CDCReader.resolveGeometryColumnSRIDs] fills in the catalog's answer
+		// right after the relation cache entry is built.
+		return ir.Geometry{SRID: ir.GeometrySRIDUnknown}, nil
+	case enumOIDs[oid]:
+		return ir.Enum{}, nil
+	}
+	if baseOID, baseTypmod, isDomain := resolveDomainBase(oid, domainBases); isDomain {
+		return resolveWireColumnType(baseOID, baseTypmod, geomOID, enumOIDs, domainBases)
+	}
+	// Not a builtin, not geometry, not an enum, not a domain — the loud
+	// unknown-OID refusal (the original oidToType error, which names the OID).
+	return nil, err
+}
+
 // macaddr8ArrayOID is PG's `_macaddr8` array type OID. pgx's pgtype exposes
 // Macaddr8OID (774, the scalar) but not the array constant; 775 is the stable
 // pg_catalog OID for `_macaddr8` specifically. (Array OIDs are NOT generally

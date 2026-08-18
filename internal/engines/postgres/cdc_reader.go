@@ -102,6 +102,23 @@ type CDCReader struct {
 	// their array OID is neither in pgArrayElementOID nor typtype='e'.
 	enumOIDs map[uint32]bool
 
+	// domainBases maps each of the source's user-defined DOMAIN type OIDs
+	// (pg_type.typtype='d') to its immediate base type OID + type modifier
+	// (typbasetype / typtypmod), resolved from pg_type (Bug 254). Like enumOIDs
+	// these are DYNAMIC (assigned at CREATE DOMAIN time) and a database can hold
+	// many, so they can't live in the static [oidToType] table.
+	// [buildRelationCacheEntry] (via [resolveWireColumnType] → [resolveDomainBase])
+	// unwraps a domain column to its ultimate base type and resolves THAT — so
+	// domain-over-varchar(10) decodes as varchar(10), domain-over-enum through
+	// the enum path, domain-over-int[] through the array path. The result is NOT
+	// wrapped in ir.Domain: the applier reads TARGET column types from
+	// information_schema, which unwraps domain→base, so the CDC-decoded value
+	// must be the base type to match. Resolved per-RelationMessage via
+	// [ensureDomainBaseOIDs] (off the per-row path, alongside the enum lookup)
+	// and cached cumulatively; a DDL that redefines a domain mid-stream is out of
+	// scope (same posture as the enum cache). nil until first lookup.
+	domainBases map[uint32]domainBase
+
 	// schema is the Postgres namespace the reader is bound to.
 	// Events for other schemas are dropped during dispatch.
 	schema string
@@ -1065,13 +1082,10 @@ func (r *CDCReader) dispatchWAL(
 
 	switch m := logical.(type) {
 	case *pglogrepl.RelationMessageV2:
-		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
+		if err := r.ensureRelationTypeOIDs(ctx, m.Columns); err != nil {
 			return err
 		}
-		if err := r.ensureEnumTypeOIDs(ctx, m.Columns); err != nil {
-			return err
-		}
-		entry, err := buildRelationCacheEntry(m.RelationMessage, r.geometryOID, r.enumOIDs)
+		entry, err := buildRelationCacheEntry(m.RelationMessage, r.geometryOID, r.enumOIDs, r.domainBases)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -1105,13 +1119,10 @@ func (r *CDCReader) dispatchWAL(
 		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
 
 	case *pglogrepl.RelationMessage:
-		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
+		if err := r.ensureRelationTypeOIDs(ctx, m.Columns); err != nil {
 			return err
 		}
-		if err := r.ensureEnumTypeOIDs(ctx, m.Columns); err != nil {
-			return err
-		}
-		entry, err := buildRelationCacheEntry(*m, r.geometryOID, r.enumOIDs)
+		entry, err := buildRelationCacheEntry(*m, r.geometryOID, r.enumOIDs, r.domainBases)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -1918,6 +1929,22 @@ func (r *CDCReader) maybeSnapshotSchema(
 	return nil
 }
 
+// ensureRelationTypeOIDs resolves the dynamic-OID metadata a RelationMessage's
+// columns may need before [buildRelationCacheEntry] projects them — the PostGIS
+// geometry OID ([ensureExtensionTypeOIDs]), the user-defined enum OID set
+// ([ensureEnumTypeOIDs]), and the domain base-OID map ([ensureDomainBaseOIDs]).
+// Called once per RelationMessage (off the per-row path) from both the V1 and V2
+// dispatch arms, so the three lookups stay in lockstep across them.
+func (r *CDCReader) ensureRelationTypeOIDs(ctx context.Context, cols []*pglogrepl.RelationMessageColumn) error {
+	if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
+		return err
+	}
+	if err := r.ensureEnumTypeOIDs(ctx, cols); err != nil {
+		return err
+	}
+	return r.ensureDomainBaseOIDs(ctx, cols)
+}
+
 // ensureExtensionTypeOIDs resolves the source's runtime PostGIS `geometry`
 // type OID ONCE and caches it on the reader (Bug 147). The OID is dynamic
 // (assigned at CREATE EXTENSION time), so the static [oidToType] table can't
@@ -2009,10 +2036,74 @@ func (r *CDCReader) ensureEnumTypeOIDs(ctx context.Context, cols []*pglogrepl.Re
 	return nil
 }
 
+// ensureDomainBaseOIDs records, for each of a RelationMessage's user-defined
+// DOMAIN type OIDs (pg_type.typtype='d'), the immediate base type OID + type
+// modifier on r.domainBases, so [buildRelationCacheEntry] (via
+// [resolveWireColumnType] → [resolveDomainBase]) can unwrap a domain column to
+// its ultimate base type instead of loud-refusing its dynamic OID (Bug 254 —
+// same class as the Bug 151 enum / Bug 147 geometry oidToType gaps). Domain OIDs
+// are dynamic (assigned at CREATE DOMAIN time) and a database can hold many, so
+// they can't live in the static [oidToType] table.
+//
+// It mirrors [ensureEnumTypeOIDs]: it queries only when the relation carries a
+// user-OID (>= firstUserOID) that is neither a known enum nor an already-resolved
+// domain, so an all-builtin (or already-classified) table costs no round-trip;
+// when it does query it resolves EVERY domain's base in one shot (chains and all,
+// so domain-over-domain flattens in [resolveDomainBase] with no extra query). It
+// is re-checked per RelationMessage (off the per-row path), which also lets a
+// mid-stream CREATE DOMAIN + ADD COLUMN (ADR-0091 forward) be picked up. A nil
+// r.db (hand-built unit reader) is a no-op.
+//
+// The enum check in the needsLookup guard keeps a pure-enum table from ever
+// triggering the domain query. A DOMAIN column does re-fire [ensureEnumTypeOIDs]'s
+// own enum query on each of its (rare) RelationMessages — the domain OID never
+// enters enumOIDs — but that is one cheap query on a first-touch/schema-change
+// path, not the per-row path, and matches the enum resolver's own documented
+// re-fire posture.
+func (r *CDCReader) ensureDomainBaseOIDs(ctx context.Context, cols []*pglogrepl.RelationMessageColumn) error {
+	if r.db == nil {
+		return nil
+	}
+	needsLookup := false
+	for _, c := range cols {
+		if c == nil || c.DataType < firstUserOID || r.enumOIDs[c.DataType] {
+			continue
+		}
+		if _, known := r.domainBases[c.DataType]; !known {
+			needsLookup = true
+			break
+		}
+	}
+	if !needsLookup {
+		return nil
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT oid, typbasetype, typtypmod FROM pg_type WHERE typtype = 'd'`)
+	if err != nil {
+		return fmt.Errorf("postgres: cdc: resolve domain type OIDs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if r.domainBases == nil {
+		r.domainBases = make(map[uint32]domainBase)
+	}
+	for rows.Next() {
+		var oid, baseOID uint32
+		var baseTypmod int32
+		if err := rows.Scan(&oid, &baseOID, &baseTypmod); err != nil {
+			return fmt.Errorf("postgres: cdc: scan domain type OID: %w", err)
+		}
+		r.domainBases[oid] = domainBase{baseOID: baseOID, baseTypmod: baseTypmod}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: cdc: iterate domain type OIDs: %w", err)
+	}
+	return nil
+}
+
 // buildRelationCacheEntry projects a [pglogrepl.RelationMessage] into
 // the IR-typed cache entry. Errors when the relation contains a
-// column whose OID isn't in the static OID-to-IR table — that's the
-// loud-failure surface for unknown / custom types.
+// column whose OID isn't in the static OID-to-IR table and isn't one of
+// the dynamic-OID families resolved below — that's the loud-failure
+// surface for unknown / custom types.
 //
 // geomOID is the source's runtime PostGIS geometry type OID (0 when PostGIS
 // is absent or unresolved). It is DYNAMIC, so it can't live in the static
@@ -2029,25 +2120,19 @@ func (r *CDCReader) ensureEnumTypeOIDs(ctx context.Context, cols []*pglogrepl.Re
 // static lookup declines — the value decodes as its text label (value_decode's
 // ir.Enum arm), and the wire carries no type name / value list, so those are
 // left empty and recovered from the seed side via NormalizeForCDCComparison.
-func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOIDs map[uint32]bool) (*relationCacheEntry, error) {
+//
+// domainBases maps the source's user-defined DOMAIN type OIDs to their base
+// (Bug 254, resolved by [ensureDomainBaseOIDs]). A domain column is unwrapped to
+// its ultimate base type and resolved as THAT — see [resolveWireColumnType] for
+// why the result is the base type and never an ir.Domain wrapper. All three
+// dynamic-OID fallbacks live in [resolveWireColumnType]; this function is the
+// per-column loop over it.
+func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOIDs map[uint32]bool, domainBases map[uint32]domainBase) (*relationCacheEntry, error) {
 	cols := make([]relationColumn, 0, len(m.Columns))
 	for _, c := range m.Columns {
-		t, err := oidToType(c.DataType, c.TypeModifier)
+		t, err := resolveWireColumnType(c.DataType, c.TypeModifier, geomOID, enumOIDs, domainBases)
 		if err != nil {
-			switch {
-			case geomOID != 0 && c.DataType == geomOID:
-				// SRID starts UNKNOWN, not 0. pgoutput carries no SRID, and 0
-				// is a real declared value (an unconstrained column), so a
-				// bare ir.Geometry{} would assert "this column declares 0"
-				// about something never read — which refuses every row of a
-				// geometry(Point,4326) column. [CDCReader.resolveGeometryColumnSRIDs]
-				// fills in the catalog's answer right after this returns.
-				t = ir.Geometry{SRID: ir.GeometrySRIDUnknown}
-			case enumOIDs[c.DataType]:
-				t = ir.Enum{}
-			default:
-				return nil, fmt.Errorf("column %q: %w", c.Name, err)
-			}
+			return nil, fmt.Errorf("column %q: %w", c.Name, err)
 		}
 		cols = append(cols, relationColumn{
 			Name:      c.Name,

@@ -454,7 +454,7 @@ func TestBuildRelationCacheEntry(t *testing.T) {
 			{Flags: 0, Name: "email", DataType: pgtype.VarcharOID, TypeModifier: 259},
 		},
 	}
-	got, err := buildRelationCacheEntry(rel, 0, nil)
+	got, err := buildRelationCacheEntry(rel, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("buildRelationCacheEntry: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestBuildRelationCacheEntryUnknownColumnType(t *testing.T) {
 			{Name: "x", DataType: 99999, TypeModifier: -1},
 		},
 	}
-	if _, err := buildRelationCacheEntry(rel, 0, nil); err == nil {
+	if _, err := buildRelationCacheEntry(rel, 0, nil, nil); err == nil {
 		t.Fatal("expected error for unknown column type OID")
 	}
 }
@@ -511,12 +511,12 @@ func TestBuildRelationCacheEntry_EnumOID_Bug151(t *testing.T) {
 	}
 
 	// Without the enum OID in the set, the dynamic OID is unknown → refuse.
-	if _, err := buildRelationCacheEntry(rel, 0, nil); err == nil {
+	if _, err := buildRelationCacheEntry(rel, 0, nil, nil); err == nil {
 		t.Fatal("expected refusal for an unresolved enum OID")
 	}
 
 	// With it resolved, the column maps to a bare ir.Enum{}.
-	got, err := buildRelationCacheEntry(rel, 0, map[uint32]bool{enumOID: true})
+	got, err := buildRelationCacheEntry(rel, 0, map[uint32]bool{enumOID: true}, nil)
 	if err != nil {
 		t.Fatalf("buildRelationCacheEntry with enum OID: %v", err)
 	}
@@ -526,6 +526,111 @@ func TestBuildRelationCacheEntry_EnumOID_Bug151(t *testing.T) {
 	}
 	if enum.TypeName != "" || len(enum.Values) != 0 {
 		t.Errorf("enum projection = %#v; want bare ir.Enum{} (wire carries no name/values)", enum)
+	}
+}
+
+// Bug 254: a column whose dynamic OID is a user-defined DOMAIN (typtype='d',
+// resolved into the domainBases map) is UNWRAPPED to its ultimate base type —
+// so the CDC value decodes as the base type the applier (which reads the
+// TARGET's information_schema, unwrapping domain→base) expects. This is the
+// wire-OID sibling of the Bug 233 ir.Domain-transparency class. The result is
+// NEVER an ir.Domain wrapper; it is the base ir type, carrying the BASE typmod
+// recovered from pg_type (e.g. domain-over-varchar(10) → ir.Varchar{Length:10}).
+func TestBuildRelationCacheEntry_DomainOID_Bug254(t *testing.T) {
+	// Dynamic domain OIDs (>= firstUserOID) and a dynamic enum OID.
+	const (
+		domInt    uint32 = 16500 // CREATE DOMAIN AS integer
+		domVarch  uint32 = 16501 // CREATE DOMAIN AS varchar(10)
+		domUUID   uint32 = 16502 // CREATE DOMAIN AS uuid
+		domEnum   uint32 = 16503 // CREATE DOMAIN AS <enum>
+		domArr    uint32 = 16504 // CREATE DOMAIN AS int[]
+		domOverD  uint32 = 16505 // CREATE DOMAIN AS domVarch (domain-over-domain)
+		theEnum   uint32 = 16490 // the enum type domEnum wraps
+		varchar10 int32  = 14    // varchar(10) typmod = 10 + 4
+	)
+	domainBases := map[uint32]domainBase{
+		domInt:   {baseOID: pgtype.Int4OID, baseTypmod: -1},
+		domVarch: {baseOID: pgtype.VarcharOID, baseTypmod: varchar10},
+		domUUID:  {baseOID: pgtype.UUIDOID, baseTypmod: -1},
+		domEnum:  {baseOID: theEnum, baseTypmod: -1},
+		domArr:   {baseOID: pgtype.Int4ArrayOID, baseTypmod: -1},
+		domOverD: {baseOID: domVarch, baseTypmod: -1}, // outer adds no modifier
+	}
+	enumOIDs := map[uint32]bool{theEnum: true}
+
+	// resolveDomainBase pins: the chain flattens and carries the innermost
+	// (base) typmod, including domain-over-domain.
+	baseCases := []struct {
+		name       string
+		oid        uint32
+		wantBase   uint32
+		wantTypmod int32
+	}{
+		{"domain-over-int", domInt, pgtype.Int4OID, -1},
+		{"domain-over-varchar(10)", domVarch, pgtype.VarcharOID, varchar10},
+		{"domain-over-domain-over-varchar(10)", domOverD, pgtype.VarcharOID, varchar10},
+	}
+	for _, bc := range baseCases {
+		bc := bc
+		t.Run("resolveDomainBase/"+bc.name, func(t *testing.T) {
+			gotBase, gotTypmod, ok := resolveDomainBase(bc.oid, domainBases)
+			if !ok {
+				t.Fatalf("resolveDomainBase(%d) ok=false; want a domain", bc.oid)
+			}
+			if gotBase != bc.wantBase || gotTypmod != bc.wantTypmod {
+				t.Errorf("resolveDomainBase(%d) = (%d, %d); want (%d, %d)",
+					bc.oid, gotBase, gotTypmod, bc.wantBase, bc.wantTypmod)
+			}
+		})
+	}
+	if _, _, ok := resolveDomainBase(pgtype.Int4OID, domainBases); ok {
+		t.Error("resolveDomainBase on a non-domain OID returned ok=true")
+	}
+
+	rel := pglogrepl.RelationMessage{
+		Namespace:    "public",
+		RelationName: "widgets",
+		ColumnNum:    6,
+		Columns: []*pglogrepl.RelationMessageColumn{
+			// A domain COLUMN's own typmod is always -1 on the wire; the base
+			// typmod is what must be recovered from the catalog (domainBases).
+			{Flags: 1, Name: "di", DataType: domInt, TypeModifier: -1},
+			{Flags: 0, Name: "dv", DataType: domVarch, TypeModifier: -1},
+			{Flags: 0, Name: "du", DataType: domUUID, TypeModifier: -1},
+			{Flags: 0, Name: "de", DataType: domEnum, TypeModifier: -1},
+			{Flags: 0, Name: "da", DataType: domArr, TypeModifier: -1},
+			{Flags: 0, Name: "dd", DataType: domOverD, TypeModifier: -1},
+		},
+	}
+
+	// Without the domain map, every domain OID is an unknown dynamic OID → refuse.
+	if _, err := buildRelationCacheEntry(rel, 0, enumOIDs, nil); err == nil {
+		t.Fatal("expected refusal for unresolved domain OIDs")
+	}
+
+	got, err := buildRelationCacheEntry(rel, 0, enumOIDs, domainBases)
+	if err != nil {
+		t.Fatalf("buildRelationCacheEntry with domain bases: %v", err)
+	}
+	want := map[string]ir.Type{
+		"di": ir.Integer{Width: 32},
+		"dv": ir.Varchar{Length: 10}, // base typmod carried, not defaulted
+		"du": ir.UUID{},
+		"de": ir.Enum{}, // domain-over-enum resolves through the enum arm
+		"da": ir.Array{Element: ir.Integer{Width: 32}},
+		"dd": ir.Varchar{Length: 10}, // domain-over-domain flattens to the base
+	}
+	for _, c := range got.Columns {
+		w, ok := want[c.Name]
+		if !ok {
+			t.Fatalf("unexpected column %q", c.Name)
+		}
+		if !reflect.DeepEqual(c.Type, w) {
+			t.Errorf("col %q Type = %#v; want %#v (must be the BASE type, never ir.Domain)", c.Name, c.Type, w)
+		}
+		if _, isDomain := c.Type.(ir.Domain); isDomain {
+			t.Errorf("col %q resolved to ir.Domain; the CDC wire projection must produce the base type", c.Name)
+		}
 	}
 }
 
