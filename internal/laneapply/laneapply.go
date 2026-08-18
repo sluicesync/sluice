@@ -712,12 +712,16 @@ func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 //     only on the TRAILING VGTID event (`mysql/cdc_vstream.go:1383`), so rows
 //     carry the PRE-transaction VGTID and a resume from a mid-tx checkpoint
 //     REPLAYS the partially-applied tx idempotently rather than skipping its
-//     tail. **UNVERIFIED PREMISE:** no test binds "a VStream ROW event carries
-//     a VGTID excluding its own transaction"; if a reader refactor ever stamped
-//     rows from the trailing VGTID, a crash after an idle-tick checkpoint would
-//     resume PAST a partly-applied tx and silently drop its tail. Filed for an
-//     integration pin (docs/dev/audit-backlog.md → C-1); the concurrent path
-//     engages by default on PlanetScale (ADR-0106), so this is worth binding.
+//     tail. This premise is now BOUND (audit backlog C-1) by
+//     TestVStream_MidTxCheckpointReplaysNotSkips (internal/engines/mysql,
+//     `//go:build integration && vstream`): against a real vttestserver it
+//     asserts a 3-row tx's rows all carry one token DISTINCT from a later tx's
+//     (so a row's position excludes its own tx), and that reopening the stream
+//     FROM a mid-tx row position replays the whole tx rather than skipping it.
+//     If a reader refactor ever stamped rows from the trailing VGTID — a crash
+//     after an idle-tick checkpoint would then resume PAST a partly-applied tx
+//     and silently drop its tail — that test fails. The concurrent path engages
+//     by default on PlanetScale (ADR-0106), which is why it is worth the pin.
 //
 // Idempotent via lastNotedSeq. Coordinator-goroutine-only. No-op on a marker
 // stream (prevSeq stays 0).
