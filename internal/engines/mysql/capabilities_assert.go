@@ -58,14 +58,20 @@ var (
 
 	// SchemaReader optional surfaces.
 	_ irbackup.PositionCapturer = (*SchemaReader)(nil)
-	_ ir.DiagnoseProber         = (*SchemaReader)(nil)
-	_ ir.HealthReporter         = (*SchemaReader)(nil)
-	_ ir.HeartbeatWriter        = (*SchemaReader)(nil)
-	_ ir.MultiDatabaseScoper    = (*SchemaReader)(nil)
-	_ ir.RowFilterSetter        = (*SchemaReader)(nil)
-	_ ir.SampleVerifier         = (*SchemaReader)(nil)
-	_ ir.SequenceStateReader    = (*SchemaReader)(nil)
-	_ ir.Verifier               = (*SchemaReader)(nil)
+	// BoolRangePreflighter is the pre-copy fail-fast for a TINYINT(1) column
+	// holding a value outside {0,1} (the SLUICE-E-VALUE-TINYINT1-RANGE class).
+	// A method-set drift here silently drops the fail-fast — the decode-time
+	// guard still refuses, but the operator loses the seconds-long planning-time
+	// refusal and only learns partway through a large copy.
+	_ ir.BoolRangePreflighter = (*SchemaReader)(nil)
+	_ ir.DiagnoseProber       = (*SchemaReader)(nil)
+	_ ir.HealthReporter       = (*SchemaReader)(nil)
+	_ ir.HeartbeatWriter      = (*SchemaReader)(nil)
+	_ ir.MultiDatabaseScoper  = (*SchemaReader)(nil)
+	_ ir.RowFilterSetter      = (*SchemaReader)(nil)
+	_ ir.SampleVerifier       = (*SchemaReader)(nil)
+	_ ir.SequenceStateReader  = (*SchemaReader)(nil)
+	_ ir.Verifier             = (*SchemaReader)(nil)
 
 	// SchemaWriter optional surfaces.
 	// CheckExprDialectTranslator exposes the PG->MySQL CHECK-expr rewrite the

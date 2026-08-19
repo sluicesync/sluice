@@ -647,6 +647,34 @@ type TableByteSizeEstimator interface {
 	EstimateTableBytes(ctx context.Context, table *Table) (int64, error)
 }
 
+// BoolRangePreflighter is the OPTIONAL surface a SOURCE [SchemaReader] can
+// implement to fail FAST — before any data moves — when a column the engine
+// maps to [Boolean] from a lossy source representation holds values outside
+// {0,1}. The reachable case is MySQL's TINYINT(1): its `(1)` is only a display
+// width, so a legacy column used as a small integer can hold 2 / 5 / 127 / -1,
+// which the boolean mapping would collapse to true and lose (see
+// SLUICE-E-VALUE-TINYINT1-RANGE).
+//
+// The per-read-path decode-time refusal is the CORRECTNESS floor — it
+// guarantees no collapsed value is ever written. This surface is a fail-FAST
+// LAYER on top of it: it lets a large multi-table copy refuse at planning time
+// (a short-circuiting `... WHERE col NOT IN (0,1) LIMIT 1` returns immediately
+// when bad data exists) rather than partway through, after hours of copying.
+//
+// It is deliberately BEST-EFFORT. A genuine out-of-range value IS a coded
+// refusal (naming the table + column) before the copy. But a check the engine
+// cannot COMPLETE — a full scan of a genuinely-clean huge table that times out,
+// or hits PlanetScale's ~900 s statement wall — is a WARN, never a refusal, so
+// the preflight itself never blocks a legitimate migration; the decode-time
+// guard still catches anything the preflight could not confirm. Returning nil
+// means "no out-of-range value found (or could not complete — already WARNed)".
+//
+// schema is the in-scope schema (already filtered by --include/--exclude-table);
+// implementations MUST only probe tables it names.
+type BoolRangePreflighter interface {
+	PreflightBoolRanges(ctx context.Context, schema *Schema) error
+}
+
 // ExactCountEstimateOptIn is the optional surface a snapshot-pinned
 // [RowCountEstimator] reader can implement to let an orchestrator OPT
 // the reader into resolving the never-ANALYZEd catalog-estimate

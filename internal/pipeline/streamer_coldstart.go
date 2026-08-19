@@ -173,6 +173,15 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err := migcore.PreflightColumnTypeEmit(ctx, s.Target, schema, "sync cold-start"); err != nil {
 		return nil, stop, err
 	}
+	// Pre-copy TINYINT(1)-range fail-fast (best-effort; SOURCE-side). The sync
+	// cold-start half of the SLUICE-E-VALUE-TINYINT1-RANGE parity: a source
+	// TINYINT(1) column holding a value outside {0,1} refuses HERE — before the
+	// snapshot stream opens, so no slot is left to abandon — rather than partway
+	// through the copy. The per-row decode guard remains the correctness floor;
+	// a probe this cannot complete WARNs and proceeds.
+	if err := migcore.PreflightSourceBoolRanges(ctx, s.Source, s.SourceDSN, schema); err != nil {
+		return nil, stop, err
+	}
 
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from

@@ -779,6 +779,19 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 	resuming := m.Resume && rc.enabled
 
+	// Pre-copy TINYINT(1)-range fail-fast (best-effort; source-side). MySQL maps
+	// TINYINT(1) to boolean, but its display width hides the full 8-bit range —
+	// a legacy column used as a small integer holding values outside {0,1} would
+	// be collapsed to true and lost. The per-row decode guard is the correctness
+	// floor; this refuses at planning time (a short-circuiting probe) so a large
+	// copy fails in seconds instead of partway through. Runs after the DryRun
+	// return (it issues real source queries) and after the already-complete
+	// --resume short-circuit; skipped for engines that don't implement it, and a
+	// probe it cannot complete WARNs and proceeds under the decode-time guard.
+	if err := migcore.PreflightSourceBoolRanges(ctx, m.Source, m.SourceDSN, schema); err != nil {
+		return err
+	}
+
 	// ADR-0182: before anything touches the target, revert a PlanetScale
 	// query-timeout raise a prior crashed run left dangling in migrate-state.
 	// Runs before the reset path (phaseGateColdStart) clears the state row,

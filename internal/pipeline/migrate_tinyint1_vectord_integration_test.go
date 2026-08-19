@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -38,12 +39,14 @@ const vectorDSeedDDL = `
 		(5, -1);
 `
 
-// TestMigrate_TinyInt1OutOfRange_VectorD_DefaultWarnsAndCollapses pins the
-// DEFAULT behavior: MySQL TINYINT(1) maps to boolean per the documented
-// convention, so non-{0,1} values are collapsed to true — but the read path
-// now WARNs loudly (naming the column + the --type-override remedy) instead of
-// doing it silently. MySQL→Postgres.
-func TestMigrate_TinyInt1OutOfRange_VectorD_DefaultWarnsAndCollapses(t *testing.T) {
+// TestMigrate_TinyInt1OutOfRange_VectorD_DefaultRefuses pins the DEFAULT
+// behavior: MySQL TINYINT(1) maps to boolean per the documented convention, so
+// a value outside {0,1} would collapse to true and lose the integer. sluice now
+// REFUSES loudly (coded SLUICE-E-VALUE-TINYINT1-RANGE, naming the column + the
+// remedy) instead of carrying the collapsed bool. The source-side preflight
+// fires the refusal BEFORE any target table is created — so this also asserts
+// the target is untouched. MySQL→Postgres.
+func TestMigrate_TinyInt1OutOfRange_VectorD_DefaultRefuses(t *testing.T) {
 	mysqlSource, _, mysqlCleanup := startMySQL(t)
 	defer mysqlCleanup()
 	_, pgTarget, pgCleanup := startPostgres(t)
@@ -60,8 +63,6 @@ func TestMigrate_TinyInt1OutOfRange_VectorD_DefaultWarnsAndCollapses(t *testing.
 		t.Fatal("postgres engine not registered")
 	}
 
-	logs := captureSlog(t)
-
 	mig := &Migrator{
 		Source:    mysqlEng,
 		Target:    pgEng,
@@ -70,60 +71,36 @@ func TestMigrate_TinyInt1OutOfRange_VectorD_DefaultWarnsAndCollapses(t *testing.
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := mig.Run(ctx); err != nil {
-		t.Fatalf("Migrator.Run (default): %v", err)
+
+	err := mig.Run(ctx)
+	if err == nil {
+		t.Fatal("Migrator.Run: want a refusal on an out-of-range TINYINT(1) value, got nil")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeValueTinyint1Range {
+		t.Fatalf("want CodeValueTinyint1Range; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "flags.flag") {
+		t.Errorf("refusal should name flags.flag; got: %v", err)
+	}
+	if !strings.Contains(ce.Hint, "flags") || !strings.Contains(ce.Hint, "SMALLINT") {
+		t.Errorf("refusal hint should carry the source-type-change remedy; got: %q", ce.Hint)
 	}
 
-	// The WARN must have fired, naming the column and pointing at the remedy.
-	out := logs.String()
-	if !strings.Contains(out, "column=flags.flag") {
-		t.Errorf("no Vector D WARN naming flags.flag; got:\n%s", out)
-	}
-	if !strings.Contains(out, "--type-override flags.flag=smallint") {
-		t.Errorf("WARN did not point at the --type-override remedy; got:\n%s", out)
-	}
-
+	// The preflight refuses before any target DDL — the `flags` table must not
+	// exist on the target.
 	db, err := sql.Open("pgx", pgTarget)
 	if err != nil {
 		t.Fatalf("open target: %v", err)
 	}
 	defer func() { _ = db.Close() }()
-
-	// Target column is boolean (the default mapping)...
-	var dataType string
+	var n int
 	if err := db.QueryRowContext(ctx,
-		"SELECT data_type FROM information_schema.columns WHERE table_name='flags' AND column_name='flag'").
-		Scan(&dataType); err != nil {
-		t.Fatalf("read target column type: %v", err)
+		"SELECT count(*) FROM information_schema.tables WHERE table_name='flags'").Scan(&n); err != nil {
+		t.Fatalf("probe target for flags table: %v", err)
 	}
-	if dataType != "boolean" {
-		t.Errorf("target flags.flag data_type = %q; want boolean (default mapping)", dataType)
-	}
-
-	// ...and every non-zero value collapsed to true (the documented, now-loud
-	// lossy behavior): id 1 (0) -> false; ids 2/3/4/5 (1/2/127/-1) -> true.
-	want := map[int]bool{1: false, 2: true, 3: true, 4: true, 5: true}
-	rows, err := db.QueryContext(ctx, "SELECT id, flag FROM flags ORDER BY id")
-	if err != nil {
-		t.Fatalf("query target: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
-	got := map[int]bool{}
-	for rows.Next() {
-		var id int
-		var b bool
-		if err := rows.Scan(&id, &b); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		got[id] = b
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-	for id, w := range want {
-		if got[id] != w {
-			t.Errorf("flags id=%d: target flag = %v; want %v", id, got[id], w)
-		}
+	if n != 0 {
+		t.Errorf("target has a `flags` table (%d); the refusal should fire before any target DDL", n)
 	}
 }
 
