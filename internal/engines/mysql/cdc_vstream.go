@@ -1999,11 +1999,13 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		if err != nil {
 			return copyBytes(raw)
 		}
-		// TINYINT(1) is MySQL's canonical bool. Detect via the
-		// column_type string ("tinyint(1)" or "tinyint(1) unsigned");
-		// the proto Type alone collapses TINYINT and TINYINT(1) into
-		// INT8 / UINT8, so we'd lose the distinction without this.
-		if isMySQLBoolColumnType(field.GetColumnType()) {
+		// A SIGNED, non-auto-increment TINYINT(1) is MySQL's canonical bool
+		// (the proto Type alone collapses TINYINT and TINYINT(1) into INT8, so
+		// the column_type string is the only place the width-1 distinction
+		// survives). vstreamTinyint1IsBool defers to translateType's rule, so an
+		// auto-increment tinyint(1) — an ir.Integer to the schema — decodes as
+		// its number here, not a collapsed bool.
+		if vstreamTinyint1IsBool(field) {
 			return n != 0
 		}
 		return n
@@ -2018,10 +2020,10 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		if err != nil {
 			return copyBytes(raw)
 		}
-		// TINYINT(1) UNSIGNED is also a bool by MySQL convention.
-		if isMySQLBoolColumnType(field.GetColumnType()) {
-			return n != 0
-		}
+		// An UNSIGNED tinyint(1) is an ir.Integer to translateType, NOT a bool —
+		// so it decodes as its number, matching the schema. (The old arm here
+		// collapsed unsigned tinyint(1) to a bool, disagreeing with the schema
+		// and, post-v0.130, false-refusing legitimate integer columns.)
 		return n
 	case query.Type_UINT16, query.Type_UINT24, query.Type_UINT32, query.Type_UINT64:
 		n, err := v.ToUint64()
@@ -2174,18 +2176,20 @@ func vstreamBitWidth(field *query.Field, raw []byte) int {
 	return len(raw) * 8
 }
 
-// isMySQLBoolColumnType returns true when the field's MySQL
-// column_type string identifies TINYINT(1) (the canonical MySQL
-// bool). Both signed and unsigned variants are accepted.
-//
-// VStream's FieldEvent populates ColumnType with the source's DDL
-// string ("tinyint(1)", "tinyint(1) unsigned", "tinyint", etc.).
-// Vitess's proto Type alone collapses TINYINT and TINYINT(1) into
-// INT8/UINT8, so the column_type string is the only place the
-// display-width-1 distinction survives over the wire.
-func isMySQLBoolColumnType(columnType string) bool {
-	s := strings.ToLower(columnType)
-	return strings.HasPrefix(s, "tinyint(1)")
+// vstreamTinyint1IsBool reports whether a VStream field is a TINYINT(1) that
+// maps to ir.Boolean — display width 1, SIGNED, non-auto-increment — by
+// deferring to the SAME [tinyint1IsBool] authority translateType uses. VStream's
+// FieldEvent carries the source column_type ("tinyint(1)", "tinyint(1) unsigned
+// zerofill", "tinyint", …) — unsigned is read from it — and the AUTO_INCREMENT
+// flag rides query.Field.Flags. Consulting both is what keeps the value decode
+// in step with the schema (types.go): an unsigned or auto-increment tinyint(1)
+// is an integer, not a bool, so it must decode as its number rather than being
+// collapsed (and then, post-v0.130, false-refused by the range guard).
+func vstreamTinyint1IsBool(field *query.Field) bool {
+	ct := field.GetColumnType()
+	unsigned := strings.Contains(strings.ToLower(ct), "unsigned")
+	autoInc := field.GetFlags()&mysqlFlagAutoIncrement != 0
+	return tinyint1IsBool(ct, unsigned, autoInc)
 }
 
 // parseVStreamDateTime parses a DATE / DATETIME / TIMESTAMP cell

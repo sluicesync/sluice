@@ -81,8 +81,10 @@ func translateType(c columnMeta) (ir.Type, error) {
 
 	case "tinyint":
 		// tinyint(1) is the conventional MySQL boolean. Other display
-		// widths are 8-bit signed/unsigned integers.
-		if displayWidth(c.ColumnType) == 1 && !unsigned && !autoIncrement {
+		// widths — and unsigned / auto-increment tinyint(1) — are 8-bit
+		// integers. tinyint1IsBool is the SINGLE authority (shared with the
+		// VStream cell decoder) so schema and value can never disagree.
+		if tinyint1IsBool(c.ColumnType, unsigned, autoIncrement) {
 			return ir.Boolean{}, nil
 		}
 		return ir.Integer{Width: 8, Unsigned: unsigned, AutoIncrement: autoIncrement}, nil
@@ -265,6 +267,21 @@ func geometryTypeFor(dataType string, srid int) (ir.Geometry, bool) {
 		return ir.Geometry{}, false
 	}
 	return ir.Geometry{Subtype: sub, SRID: srid}, true
+}
+
+// tinyint1IsBool reports whether a TINYINT-family column is MySQL's conventional
+// boolean: display width 1, SIGNED, and non-auto-increment. It is the SINGLE
+// authority both [translateType] (the schema mapping) and the VStream cell
+// decoder ([vstreamTinyint1IsBool]) consult, so the two can never disagree on
+// whether a tinyint(1) is a bool. That divergence was a real defect: an unsigned
+// or auto-increment tinyint(1) — an ir.Integer to translateType — was decoded as
+// a bool on the VStream lane (silently collapsing values ≥2 to true on a
+// MySQL-family target), and after v0.130's range guard landed it was
+// false-refused instead. A MySQL auto-increment tinyint(1) keeps its
+// `tinyint(1)` spelling on the wire (unsigned zerofill too), so both exclusions
+// are reachable in practice.
+func tinyint1IsBool(columnType string, unsigned, autoIncrement bool) bool {
+	return displayWidth(columnType) == 1 && !unsigned && !autoIncrement
 }
 
 // displayWidth extracts the display width N from a column_type of the

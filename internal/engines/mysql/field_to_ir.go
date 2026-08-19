@@ -38,7 +38,7 @@ import (
 // built from in-stream metadata, never re-introspection (#2). They do
 // NOT specify the behaviour when the in-stream metadata is *absent*
 // (empty ColumnType). Real Vitess populates ColumnType (decodeVStream
-// cell + isMySQLBoolColumnType already depend on it), so this path is
+// cell + vstreamTinyint1IsBool already depend on it), so this path is
 // not expected in production; the degrade-to-cold-start choice keeps
 // the loud floor intact while not regressing availability on a
 // minimal/edge FIELD shape. The alternative — hard-fail the stream —

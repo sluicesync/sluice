@@ -550,7 +550,9 @@ func TestDecodeVStreamCell(t *testing.T) {
 		// ---- Booleans (TINYINT(1)) ----
 		{"tinyint(1) → bool true", query.Type_INT8, "tinyint(1)", "1", true},
 		{"tinyint(1) → bool false", query.Type_INT8, "tinyint(1)", "0", false},
-		{"tinyint(1) unsigned → bool", query.Type_UINT8, "tinyint(1) unsigned", "1", true},
+		// UNSIGNED tinyint(1) is an ir.Integer to translateType, so it decodes
+		// as its number here (the old code wrongly collapsed it to a bool).
+		{"tinyint(1) unsigned → uint64 integer", query.Type_UINT8, "tinyint(1) unsigned", "5", uint64(5)},
 		// Plain TINYINT (no display width) stays int64.
 		{"tinyint plain → int64", query.Type_INT8, "tinyint", "127", int64(127)},
 
@@ -862,29 +864,56 @@ func TestDecodeVStreamCellGeometry(t *testing.T) {
 	})
 }
 
-// TestIsMySQLBoolColumnType covers the small parser used to detect
-// TINYINT(1) from a Vitess FieldEvent's column_type string.
-func TestIsMySQLBoolColumnType(t *testing.T) {
+// TestVStreamTinyint1BoolMatchesSchema is the family-matrix gate for the
+// VStream tinyint(1) bool decision (audit 2026-08-19). The value decoder's
+// "is this a bool" verdict MUST agree with the schema mapping (translateType)
+// for every {signed/unsigned, auto-increment, zerofill, width} shape — the two
+// used to disagree (the decoder accepted `tinyint(1) unsigned` and ignored
+// AUTO_INCREMENT), which silently collapsed an auto-increment tinyint(1) PK's
+// values ≥2 to true on the VStream lane and, after v0.130's range guard,
+// false-refused those legitimate integer columns. Both sides now defer to
+// tinyint1IsBool; this pins that they can't drift again.
+func TestVStreamTinyint1BoolMatchesSchema(t *testing.T) {
+	autoInc := uint32(mysqlFlagAutoIncrement)
 	cases := []struct {
-		in   string
-		want bool
+		name       string
+		columnType string
+		flags      uint32
+		wantBool   bool
 	}{
-		{"tinyint(1)", true},
-		{"tinyint(1) unsigned", true},
-		{"TINYINT(1)", true},          // case-insensitive
-		{"TINYINT(1) UNSIGNED", true}, // ditto
-		{"tinyint", false},
-		{"tinyint(2)", false},
-		{"tinyint(4)", false},
-		{"int", false},
-		{"varchar(255)", false},
-		{"", false},
+		{"signed tinyint(1)", "tinyint(1)", 0, true},
+		{"signed tinyint(1) uppercase", "TINYINT(1)", 0, true},
+		{"tinyint(1) unsigned", "tinyint(1) unsigned", 0, false},
+		{"tinyint(1) unsigned zerofill", "tinyint(1) unsigned zerofill", 0, false},
+		{"auto-increment tinyint(1)", "tinyint(1)", autoInc, false},
+		{"auto-increment tinyint(1) unsigned", "tinyint(1) unsigned", autoInc, false},
+		{"tinyint no width", "tinyint", 0, false},
+		{"tinyint(2)", "tinyint(2)", 0, false},
+		{"tinyint(4)", "tinyint(4)", 0, false},
 	}
 	for _, c := range cases {
 		c := c
-		t.Run(c.in, func(t *testing.T) {
-			if got := isMySQLBoolColumnType(c.in); got != c.want {
-				t.Errorf("got %v; want %v", got, c.want)
+		t.Run(c.name, func(t *testing.T) {
+			field := &query.Field{ColumnType: c.columnType, Flags: c.flags}
+
+			gotDecode := vstreamTinyint1IsBool(field)
+			if gotDecode != c.wantBool {
+				t.Errorf("vstreamTinyint1IsBool(%q, flags=%d) = %v; want %v", c.columnType, c.flags, gotDecode, c.wantBool)
+			}
+
+			// The anti-drift core: the schema mapping MUST reach the same verdict.
+			meta, err := columnMetaFromField(field)
+			if err != nil {
+				t.Fatalf("columnMetaFromField: %v", err)
+			}
+			typ, err := translateType(meta)
+			if err != nil {
+				t.Fatalf("translateType: %v", err)
+			}
+			_, schemaBool := typ.(ir.Boolean)
+			if schemaBool != gotDecode {
+				t.Errorf("schema/decode DISAGREE for %q (flags=%d): translateType bool=%v, decode bool=%v",
+					c.columnType, c.flags, schemaBool, gotDecode)
 			}
 		})
 	}
