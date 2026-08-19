@@ -62,7 +62,7 @@ func (c bprConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue
 		}
 		return &strPairRows{pairs: pairs}, nil
 
-	case strings.HasPrefix(strings.TrimSpace(q), "SELECT 1 FROM"): // combined probe
+	case strings.Contains(q, "SELECT /*+ MAX_EXECUTION_TIME") && strings.Contains(q, " 1 FROM "): // combined probe
 		tbl := c.tableInQuery(q)
 		if c.s.errFor[tbl] {
 			return nil, errors.New("probe did not complete")
