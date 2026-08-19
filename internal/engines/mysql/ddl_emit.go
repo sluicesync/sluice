@@ -1837,6 +1837,41 @@ func emitCreateIndexesCombined(tableName string, idxs []*ir.Index, backslashEsca
 	return stmts, nil
 }
 
+// emitCreateIndexesPerIndex renders ONE standalone `ALTER TABLE t <clause>;`
+// per index (ADR-0184) — the deliberate opposite of [emitCreateIndexesCombined]'s
+// single-scan collapse. It exists for the large-table Vitess/PlanetScale case
+// where the combined ALTER's ONE statement blows past the ~900 s statement-time
+// wall (errno 3024): splitting into one ALTER per index keeps every statement
+// bounded (roughly 1/N of the combined time) and — because each index is its
+// own statement — individually resumable, at the cost of extra table scans on a
+// memory-non-resident table. FULLTEXT/SPATIAL already stand alone in the
+// combined path too, so here every kind simply gets its own statement.
+//
+// It shares [emitCreateIndexesCombined]'s per-clause machinery and contract:
+// the same SQLite-source non-portable-index WARN-skip, the same
+// [emitAddIndexClause] chokepoint (predicate check, prefix/USING rendering),
+// and the same incoming-order preservation. idxs must already be filtered
+// (skip set applied, no PRIMARY, no already-existing index) by the caller — so
+// on a --resume the caller passes only the still-missing indexes and this emits
+// exactly one bounded ALTER per remaining index, never re-touching a present one.
+func emitCreateIndexesPerIndex(tableName string, idxs []*ir.Index, backslashEscapes bool) ([]string, error) {
+	stmts := make([]string, 0, len(idxs))
+	for _, idx := range idxs {
+		// SQLite source (ADR-0133 follow-up): WARN-skip a non-portable
+		// expression index, identically to the combined path.
+		if offending, portable := sqliteIndexPortableMySQL(idx); !portable {
+			warnSkipSQLiteIndex(tableName, idx, offending)
+			continue
+		}
+		clause, err := emitAddIndexClause(idx, backslashEscapes)
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, "ALTER TABLE "+quoteIdent(tableName)+" "+clause+";")
+	}
+	return stmts, nil
+}
+
 // emitAddForeignKey renders an ALTER TABLE ... ADD CONSTRAINT
 // statement for a foreign key on the given child table.
 func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (string, error) {

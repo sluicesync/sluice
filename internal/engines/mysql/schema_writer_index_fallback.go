@@ -246,13 +246,26 @@ func (w *SchemaWriter) routeIndexJobToFallback(ctx context.Context, job indexBui
 // OPTIMIZATION only — any failure (or a NULL/absent row) reports
 // not-huge and the normal direct attempt proceeds.
 func (w *SchemaWriter) indexFallbackTableClearlyHuge(ctx context.Context, table string) bool {
+	return w.tableDataLengthBytes(ctx, table) >= indexFallbackHugeTableBytes
+}
+
+// tableDataLengthBytes reads a table's information_schema DATA_LENGTH — the
+// one cheap one-row read shared by the ADR-0148 huge-table fallback pre-probe
+// ([indexFallbackTableClearlyHuge]) and the ADR-0184 per-index-split trigger
+// ([SchemaWriter.emitIndexBuildStatements]). It is advisory only: a failed
+// query or a NULL/absent row reports 0, never an error — each caller then
+// compares against its own threshold and falls to its safe default (the direct
+// combined build). Reads on the pooled w.db, so it is valid on every build
+// path (whole-schema and the per-worker/overlap paths that execute on a
+// dedicated conn).
+func (w *SchemaWriter) tableDataLengthBytes(ctx context.Context, table string) int64 {
 	const q = `SELECT COALESCE(DATA_LENGTH, 0) FROM information_schema.TABLES
 		WHERE table_schema = ? AND table_name = ?`
 	var n int64
 	if err := w.db.QueryRowContext(ctx, q, w.schema, table).Scan(&n); err != nil {
-		slog.DebugContext(ctx, "mysql: index-fallback DATA_LENGTH probe failed; proceeding with the direct build",
+		slog.DebugContext(ctx, "mysql: DATA_LENGTH probe failed; proceeding with the default combined index build",
 			slog.String("table", table), slog.String("err", err.Error()))
-		return false
+		return 0
 	}
-	return n >= indexFallbackHugeTableBytes
+	return n
 }

@@ -657,11 +657,14 @@ type dbExecer interface {
 
 // buildTableIndexes builds all of one table's eligible secondary indexes
 // (ADR-0080 follow-up). It probes the table's indexes, drops the ones that
-// already exist, then emits the minimum set of ALTER statements via
-// [emitCreateIndexesCombined] — combinable BTREE/UNIQUE indexes share one
-// ALTER (a single InnoDB scan), FULLTEXT and SPATIAL each get their own — and
-// executes them on execer. Shared verbatim by the serial whole-schema path and
-// the overlapped per-table workers.
+// already exist, then emits the ALTER statements via
+// [SchemaWriter.emitIndexBuildStatements] — by default the ADR-0080 combined
+// ALTER (combinable BTREE/UNIQUE indexes share one InnoDB scan, FULLTEXT and
+// SPATIAL each their own), or, on a large table on a statement-time-limited
+// VStream target, the ADR-0184 one-ALTER-per-index split — and executes them on
+// execer. This is the single chokepoint every direct deferred build funnels
+// through: shared verbatim by the serial whole-schema path and the overlapped
+// per-table workers, so the split reaches all of them uniformly.
 //
 // Idempotent resume (Bug 131): a prior run that already created some of these
 // indexes — a resume re-entering phase=indexes after a table-scope change, a
@@ -698,7 +701,13 @@ func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, j
 	if len(pending) == 0 {
 		return nil
 	}
-	stmts, err := emitCreateIndexesCombined(job.tableName, pending, w.emitter.backslashEscapes)
+	// ADR-0080 combined ALTER by default; ADR-0184 splits it into one ALTER
+	// per index on a large table on a statement-time-limited (VStream) target.
+	// The decision — and the DATA_LENGTH probe it needs — lives in
+	// emitIndexBuildStatements so BOTH the combined and split shapes emit only
+	// the still-`pending` indexes, keeping the idempotent-resume skip intact on
+	// either path.
+	stmts, err := w.emitIndexBuildStatements(ctx, job.tableName, pending)
 	if err != nil {
 		return err
 	}
