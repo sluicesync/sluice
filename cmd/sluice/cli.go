@@ -552,12 +552,12 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	// ADR-0182 (item 110): compose the opt-in query-timeout raise controller
 	// (also available for the crash-recovery auto-revert). A flag set without
 	// a planetscale target / credentials is a loud refusal.
-	queryTimeoutController, err := m.planetScaleQueryTimeoutController()
-	if err != nil {
+	if mig.QueryTimeoutController, err = m.planetScaleQueryTimeoutController(); err != nil {
 		return err
 	}
 	mig.RaiseQueryTimeout = m.PlanetScaleRaiseQueryTimeout
-	mig.QueryTimeoutController = queryTimeoutController
+	// PlanetScale FK preflight probe; nil (no token) ⇒ the pipeline's WARN path.
+	mig.FKEnablementChecker = m.planetScaleForeignKeyChecker()
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
 		keysetSource = cfg.KeysetSource

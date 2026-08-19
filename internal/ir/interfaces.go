@@ -2413,6 +2413,39 @@ type QueryTimeoutController interface {
 	Revert(ctx context.Context, previous string) error
 }
 
+// PlanetScaleForeignKeyStatus is the pair of control-plane settings the
+// migrate/sync foreign-key preflight reads off a PlanetScale target to decide
+// whether the FKs a run will create can actually land.
+//
+//   - ForeignKeysEnabled is the read-back of `allow_foreign_key_constraints`.
+//     While false the platform rejects every `ADD FOREIGN KEY` outright.
+//   - SafeMigrations is the branch's safe-migrations toggle. While true the
+//     branch blocks DIRECT DDL (errno 1105) — and sluice's FK add (including
+//     the item-109 metadata-only escape, which is itself a direct
+//     `ALTER … ADD FOREIGN KEY` under `foreign_key_checks=0`) is direct DDL,
+//     with NO deploy-request fallback for FK constraints. So safe-migrations
+//     ON means the FK phase fails after the copy even when FK support is
+//     enabled.
+type PlanetScaleForeignKeyStatus struct {
+	ForeignKeysEnabled bool
+	SafeMigrations     bool
+}
+
+// PlanetScaleForeignKeyChecker is the OPTIONAL control-plane probe the CLI
+// injects so the engine-neutral pipeline can learn, BEFORE the copy, whether a
+// PlanetScale target's foreign-key-support + safe-migrations settings let the
+// foreign keys a run will create actually land. The pipeline never imports the
+// PlanetScale API; the HOW (org/database/branch resolution, the two GETs) lives
+// behind this interface. nil (every non-CLI construction, and any run whose
+// service-token credentials don't resolve) disables the probe — the preflight
+// then downgrades from a confirmable refusal to a WARN that still fires.
+type PlanetScaleForeignKeyChecker interface {
+	// ForeignKeyStatus reads the target database's foreign-key support and the
+	// target branch's safe-migrations flag. A transport/API error is returned
+	// (the preflight treats it as advisory-degrade: WARN and proceed).
+	ForeignKeyStatus(ctx context.Context) (PlanetScaleForeignKeyStatus, error)
+}
+
 // QueryTimeoutRaiseRecorder is the OPTIONAL surface that persists the
 // crash-recovery record for the ADR-0182 query-timeout raise: "we raised the
 // keyspace timeout; the value to restore is <previous>". Only the MySQL engine

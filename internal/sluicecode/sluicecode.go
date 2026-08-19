@@ -359,8 +359,22 @@ const (
 
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
-	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
-	CodePSDirectDDLBlocked       Code = "SLUICE-E-PS-DIRECT-DDL-BLOCKED"
+
+	// CodePSForeignKeysNotEnabled is the FK-support preflight's loud refusal:
+	// the PlanetScale target's `allow_foreign_key_constraints` is confirmably
+	// OFF (read back as foreign_keys_enabled=false) AND the source schema
+	// carries foreign keys the run would add after the copy. With it off the
+	// platform rejects every `ADD FOREIGN KEY` outright, so the run would fail
+	// at the constraints phase — after the whole copy — and `--resume` re-hits
+	// the identical wall. Refused BEFORE the copy so a seconds-long fix (enable
+	// FK support, or re-run with `--skip-foreign-keys`) replaces an
+	// hours-then-fail. The lower-confidence risks (FK support ON but the branch
+	// has safe migrations ON, which blocks the direct DDL the FK add uses, and
+	// there is no deploy-request fallback for FK constraints) are a WARN, never
+	// this refusal — sluice does not refuse a config that might work.
+	CodePSForeignKeysNotEnabled Code = "SLUICE-E-PS-FK-NOT-ENABLED"
+	CodePSBranchStaleBase       Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
+	CodePSDirectDDLBlocked      Code = "SLUICE-E-PS-DIRECT-DDL-BLOCKED"
 
 	// CodePSDeployRequestIncomplete is the NON-failure sibling of
 	// CodePSDeployRequestFailed: a PlanetScale deploy request sluice was
@@ -579,6 +593,8 @@ var registry = map[Code]Info{
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 
 	CodeTargetPreexistingForeignKey: {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
+
+	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
 
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state, was closed without deploying, computed an empty diff, or computed a diff outside the leg's intended blast radius — the message carries the DR number, state, and URL. A deploy sluice merely stopped WAITING on is the separate SLUICE-E-PS-DEPLOY-REQUEST-INCOMPLETE"},

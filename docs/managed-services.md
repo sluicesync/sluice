@@ -221,6 +221,29 @@ FKs are managed out-of-band. Mutually exclusive with
 the other creates FKs and tolerates dirty rows by retrying as
 `NOT VALID` — PG-target only).
 
+**Pre-copy foreign-key preflight.** Because the constraint phase is
+the LAST phase, an FK problem on a PlanetScale target used to surface
+only at the very end — after the whole copy. `migrate` now runs a
+foreign-key preflight BEFORE the copy whenever the target is
+PlanetScale and the source carries at least one FK (and
+`--skip-foreign-keys` is not set). When a PlanetScale service token is
+supplied (`--planetscale-org` + `PLANETSCALE_SERVICE_TOKEN_ID` /
+`PLANETSCALE_SERVICE_TOKEN`) it reads the target's settings up front:
+if foreign-key support is confirmably **off**
+(`allow_foreign_key_constraints` false), it refuses loudly with
+`SLUICE-E-PS-FK-NOT-ENABLED` — a seconds-long fix (enable FK support,
+or re-run with `--skip-foreign-keys`) instead of an hours-then-fail;
+if FK support is on but the branch has **safe migrations** on (which
+blocks the direct DDL sluice's FK add uses — errno 1105 — and there is
+no deploy-request fallback for FK constraints), it **warns** before the
+copy rather than refusing (the run might still be small enough, or you
+may disable safe migrations for the window). Without a service token it
+cannot verify the settings, so it emits the same warning advisory
+instead of guessing. It never changes FK behaviour — the metadata-only
+add, the orphan scan, and the statement-time-wall handling are
+unchanged; this is pre-copy visibility plus the one confirmable
+refusal.
+
 ### FLOAT precision on VStream sources: exact by default (`--strict-float` / `--no-float-exact-reread`)
 
 A VStream cold-start COPY streams over vttablet's rowstreamer, whose

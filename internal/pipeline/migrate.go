@@ -51,6 +51,13 @@ import (
 // without spamming aggregators on a many-table migration.
 const progressInterval = 2 * time.Second
 
+// enginePlanetScale is the registered engine name of the PlanetScale MySQL
+// flavor (mysql.FlavorPlanetScale.String()). The PlanetScale foreign-key
+// preflight is PlanetScale-specific — foreign_keys_enabled / safe_migrations
+// are its control-plane settings — so it keys off this name; self-hosted Vitess
+// and vanilla MySQL have no such control plane.
+const enginePlanetScale = "planetscale"
+
 // Migrator runs a single simple-mode migration from Source/SourceDSN to
 // Target/TargetDSN. Construct the value, then call Run with a context.
 //
@@ -567,6 +574,18 @@ type Migrator struct {
 	// caller, and any run whose credentials don't resolve) disables both.
 	QueryTimeoutController ir.QueryTimeoutController
 
+	// FKEnablementChecker is the optional PlanetScale control-plane probe that
+	// reads the target's foreign-key-support + safe-migrations settings, so the
+	// pre-copy FK preflight can WARN (or, when FK support is confirmably off,
+	// REFUSE) before hours of copying — the field-report gotcha that surfaced at
+	// the END of a migration. Composed by the CLI when the target is planetscale
+	// and a service token resolves; nil (every programmatic / test caller, and
+	// any run without a token) downgrades the preflight from a confirmable
+	// refusal to a WARN that still fires. It NEVER changes FK behaviour — the
+	// metadata-only add, orphan scan and walls are unchanged; this is pre-copy
+	// visibility plus one early refusal.
+	FKEnablementChecker ir.PlanetScaleForeignKeyChecker
+
 	// Progress is the optional TTY-aware presentation sink (ADR-0155).
 	// When nil (the zero value — every test, library embedder, broker /
 	// fleet path, and the sync cold-start), the orchestrator falls back
@@ -717,6 +736,23 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 	m.RowFilters = canonFilters
 
+	// PlanetScale foreign-key preflight (field report: FK gotcha surfaced at the
+	// END of a migration). Runs HERE — before the DryRun branch and long before
+	// any copy — so a confirmable FK-support-disabled target is a seconds-long
+	// refusal, not an hours-then-fail, and a dry run surfaces the same advisory.
+	// Keyed off existing state only (planetscale target + the source's FK count +
+	// --skip-foreign-keys + the injected checker); it never changes FK behaviour.
+	// The returned status feeds the plan report below.
+	fkStatus, err := migcore.PreflightPlanetScaleForeignKeys(ctx, migcore.PlanetScaleFKPreflightInput{
+		TargetIsPlanetScale: m.Target.Name() == enginePlanetScale,
+		SkipForeignKeys:     m.SkipForeignKeys,
+		ForeignKeyCount:     migcore.CountForeignKeys(schema),
+		Checker:             m.FKEnablementChecker,
+	})
+	if err != nil {
+		return err
+	}
+
 	if m.DryRun {
 		plan := m.buildDryRunPlan(ctx, schema)
 		if m.PlanSink != nil {
@@ -837,6 +873,13 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	if err := migcore.ApplyRowFilters(rr, m.RowFilters, m.Source.Name()); err != nil {
 		return err
 	}
+
+	// Migration plan / gotcha report (Feature 2): a concise, once-emitted
+	// summary printed BEFORE the copy so the operator sees the plan and the
+	// PlanetScale gotchas at a glance. Fired here (reader open ⇒ the largest
+	// table's row estimate is available) but still long before any data moves.
+	// Silent on a small, un-noteworthy run — see LogMigrationPlanSummary.
+	m.logMigrationPlanSummary(ctx, rr, schema, fkStatus)
 
 	// Resume / reset / populated-target gate: --resume rides
 	// TableProgress; --reset-target-data clears the target first;
