@@ -384,7 +384,6 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
 		fields:               make(map[string][]*query.Field),
 		rowBuffer:            make(map[string][]ir.Row),
-		boolWarn:             newBoolRangeWarner(),
 		copyCompletedShards:  make(map[string]bool),
 		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
 		checkpointRows:       defaultCopyCheckpointRows,
@@ -592,12 +591,6 @@ type vstreamSnapshotStream struct {
 	// (--zero-date); set in the constructor so the COPY cold-copy honors the
 	// same per-sync policy as the steady-state VStream CDC reader.
 	zeroDate zeroDateMode
-
-	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
-	// WARN (Vector D) for the VStream cold-start COPY + its CDC catch-up.
-	// Set in the constructor; nil-safe (test literals leave it nil and
-	// observeNamed no-ops).
-	boolWarn *boolRangeWarner
 
 	// client is the typed Vitess gRPC client. Held so the COPY pump can
 	// re-open the VStream IN PLACE on a retriable Recv error (ADR-0072
@@ -1968,7 +1961,7 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn, s.zeroDate)
+		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {
 			return err
 		}
@@ -2462,11 +2455,11 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 		if err := refuseVStreamPartialRowImage(rc, fields, rev.GetKeyspace(), tableName); err != nil {
 			return err
 		}
-		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn, s.zeroDate)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.zeroDate)
 		if err != nil {
 			return err
 		}
-		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn, s.zeroDate)
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {
 			return err
 		}

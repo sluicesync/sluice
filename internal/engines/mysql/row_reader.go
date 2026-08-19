@@ -203,12 +203,6 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 		scanPtrs[i] = &scanBuf[i]
 	}
 
-	// One-time-per-column WARN when a TINYINT(1)/ir.Boolean cell carries a
-	// value outside {0,1} (Vector D): the value is still carried as a bool
-	// per MySQL convention, but the operator is told so they can preserve
-	// the integer with --type-override. Scoped to this scan.
-	boolWarn := newBoolRangeWarner()
-
 	for rows.Next() {
 		if err := rows.Scan(scanPtrs...); err != nil {
 			r.setErr(fmt.Errorf("mysql: scan: %w", err))
@@ -228,8 +222,15 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 				r.setErr(fmt.Errorf("mysql: column %q: %w", col.Name, err))
 				return
 			}
+			// A TINYINT(1)/ir.Boolean cell holding a value outside {0,1}
+			// would be silently collapsed to true (losing the integer) —
+			// refuse loudly before this row is written, pointing at the
+			// --type-override remedy (SLUICE-E-VALUE-TINYINT1-RANGE).
 			if _, isBool := col.Type.(ir.Boolean); isBool {
-				boolWarn.observe(table.Name, col, scanBuf[i])
+				if rerr := checkTinyBoolRange(table.Name, col.Name, scanBuf[i]); rerr != nil {
+					r.setErr(rerr)
+					return
+				}
 			}
 			row[col.Name] = v
 		}

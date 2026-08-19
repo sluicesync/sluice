@@ -198,7 +198,8 @@ func decodeBoolean(raw any) (any, error) {
 // to be collapsed to a Go bool for a TINYINT(1)/ir.Boolean column — holds an
 // integer other than 0 or 1. MySQL's boolean convention maps every non-zero
 // value to true, so 2 / 127 / -1 / -128 lose their real value (Vector D);
-// the reader uses this to WARN loudly without changing the carried value.
+// [checkTinyBoolRange] uses this to REFUSE loudly rather than carry the
+// collapsed bool.
 //
 // Only integer-family sources can be out of range. bool, BIT(1) bytes, and
 // string sources are inherently boolean (decodeBoolean already canonicalises
@@ -246,6 +247,45 @@ func tinyBoolOutOfRange(raw any) (n int64, oob bool) {
 		return 0, false
 	}
 	return i, true
+}
+
+// checkTinyBoolRange refuses when a MySQL TINYINT(1) column — which sluice
+// maps to ir.Boolean per MySQL's own BOOL/BOOLEAN convention — holds a value
+// outside {0,1}. A TINYINT(1) stores the full signed 8-bit range (the (1) is
+// only a display width), so a legacy column used as a small integer can hold
+// 2 / 5 / 127 / -1, which the boolean collapse in decodeBoolean would silently
+// rewrite to true, losing the integer. A field report hit exactly that as
+// silent data loss on a column holding 0..6, so this is a hard refusal, not a
+// warning: it halts the read at the FIRST offending value — before that row is
+// written — on every read path (bulk copy, binlog CDC, VStream CDC). Rows
+// already copied held only genuine 0/1 and are correct.
+//
+// table/colName name the column for the SLUICE-E-VALUE-TINYINT1-RANGE remedy.
+// The remedy leads with the universal fix — change the source column's type
+// away from TINYINT(1) (e.g. to SMALLINT) — because that is the only fix that
+// works on EVERY read path: the VStream (PlanetScale/Vitess) decoder keys the
+// boolean decision off the replication wire's own column_type, so a sluice-side
+// `--type-override` cannot un-boolean it there (it only re-types the bulk-copy /
+// binlog paths, which decode off the IR schema). raw is the pre-decode integer
+// cell; a non-integer raw (bool / BIT(1) bytes / string) is inherently boolean
+// and never out of range, so an unconditional call is safe — but callers should
+// still gate on the column actually being ir.Boolean. Returns nil for an
+// in-range or non-integer value.
+func checkTinyBoolRange(table, colName string, raw any) error {
+	n, oob := tinyBoolOutOfRange(raw)
+	if !oob {
+		return nil
+	}
+	col := table + "." + colName
+	return sluicecode.Wrap(
+		sluicecode.CodeValueTinyint1Range,
+		"change the source column's type away from TINYINT(1) (e.g. ALTER TABLE ... MODIFY "+colName+
+			" SMALLINT) — this works on every source; on a non-Vitess MySQL source a bulk migrate can instead "+
+			"use --type-override "+col+"=smallint",
+		fmt.Errorf("mysql: column %q is a TINYINT(1), which sluice maps to boolean per MySQL convention, "+
+			"but it holds %d, outside {0,1}; carrying it as a boolean would collapse the value to true and "+
+			"silently lose the integer", col, n),
+	)
 }
 
 // decodeInteger normalises the various integer widths a MySQL row

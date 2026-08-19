@@ -18,6 +18,7 @@ import (
 	"vitess.io/vitess/go/vt/proto/topodata"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestVStreamReader_BasicEventDispatch drives the dispatcher with
@@ -833,7 +834,7 @@ func TestDecodeVStreamCellGeometry(t *testing.T) {
 			{Name: "geom", Type: query.Type_GEOMETRY, ColumnType: "point"},
 		}
 		row := &query.Row{Lengths: []int64{1, 3}, Values: []byte("1abc")}
-		_, _, err := decodeVStreamRow(row, fields, "places", newBoolRangeWarner(), zeroDateInherit)
+		_, _, err := decodeVStreamRow(row, fields, "places", zeroDateInherit)
 		if err == nil {
 			t.Fatal("decodeVStreamRow err = nil; want a loud refusal for the short geometry cell")
 		}
@@ -2025,45 +2026,35 @@ func minimalConfig(addr string, params map[string]string) (*gomysql.Config, erro
 // a bool (per convention) but emits the one-time-per-column WARN naming the
 // column + the --type-override remedy. VStream cells are text-encoded, so the
 // detection re-parses the literal to recover the real integer.
-func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
-	buf := captureSlog(t)
+func TestDecodeVStreamRow_TinyInt1OutOfRangeRefuses(t *testing.T) {
 	fields := []*query.Field{
 		{Name: "id", Type: query.Type_INT64, ColumnType: "bigint"},
 		{Name: "active", Type: query.Type_INT8, ColumnType: "tinyint(1)"},
 	}
-	warner := newBoolRangeWarner()
 
-	// id=1, active=2 (out of range) -> active decodes true, warns once.
-	out, ok, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner, zeroDateInherit)
-	if err != nil {
-		t.Fatalf("decodeVStreamRow: %v", err)
+	// id=1, active=2 (out of range) -> refuses, coded, names column + remedy.
+	_, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", zeroDateInherit)
+	if err == nil {
+		t.Fatal("decodeVStreamRow(active=2): want a refusal, got nil")
 	}
-	if !ok {
-		t.Fatal("decodeVStreamRow ok=false")
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeValueTinyint1Range {
+		t.Fatalf("want CodeValueTinyint1Range; got ok=%v err=%v", ok, err)
 	}
-	if out["active"] != true {
-		t.Errorf("active = %#v; want true (non-zero -> true)", out["active"])
+	if !strings.Contains(err.Error(), `"users.active"`) {
+		t.Errorf("refusal should name the column; err=%q", err.Error())
 	}
-	// id=3, active=127 -> still out of range, must NOT warn again.
-	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner, zeroDateInherit); err != nil {
-		t.Fatalf("decodeVStreamRow: %v", err)
-	}
-
-	o := buf.String()
-	if c := strings.Count(o, "column=users.active"); c != 1 {
-		t.Errorf("users.active warned %d times; want exactly 1\n%s", c, o)
-	}
-	if !strings.Contains(o, "--type-override users.active=smallint") {
-		t.Errorf("WARN missing the --type-override hint:\n%s", o)
+	if !strings.Contains(ce.Hint, "--type-override users.active=smallint") {
+		t.Errorf("refusal hint missing the --type-override remedy; hint=%q", ce.Hint)
 	}
 
-	// In-range bool (0/1) never warns.
-	buf.Reset()
-	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner(), zeroDateInherit); err != nil {
-		t.Fatalf("decodeVStreamRow: %v", err)
+	// In-range bool (0/1) decodes to bool without refusing.
+	out, ok2, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", zeroDateInherit)
+	if err != nil || !ok2 {
+		t.Fatalf("decodeVStreamRow (in-range) = (ok=%v, err=%v); want (true, nil)", ok2, err)
 	}
-	if strings.Contains(buf.String(), "users.active") {
-		t.Errorf("in-range value warned:\n%s", buf.String())
+	if out["active"] != false {
+		t.Errorf("active = %#v; want false (0 -> false)", out["active"])
 	}
 }
 
@@ -2090,7 +2081,7 @@ func TestDecodeVStreamRow_MalformedEventRefusesLoudly(t *testing.T) {
 
 	t.Run("length_count_mismatch", func(t *testing.T) {
 		row := &query.Row{Lengths: []int64{1}, Values: []byte("1")} // 1 length, 2 fields
-		out, ok, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		out, ok, err := decodeVStreamRow(row, fields, "users", zeroDateInherit)
 		if err == nil {
 			t.Fatalf("decodeVStreamRow = (%#v, %v, nil); want a loud refusal — an empty row with ok=true silently NULLs every column downstream", out, ok)
 		}
@@ -2105,7 +2096,7 @@ func TestDecodeVStreamRow_MalformedEventRefusesLoudly(t *testing.T) {
 		// Lengths claim 1+5 bytes; Values holds 3. Pre-fix this panicked on
 		// the slice expression rather than erroring the stream.
 		row := &query.Row{Lengths: []int64{1, 5}, Values: []byte("1ab")}
-		_, _, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		_, _, err := decodeVStreamRow(row, fields, "users", zeroDateInherit)
 		if err == nil {
 			t.Fatal("decodeVStreamRow accepted a Values buffer shorter than its own Lengths claim")
 		}
@@ -2117,7 +2108,7 @@ func TestDecodeVStreamRow_MalformedEventRefusesLoudly(t *testing.T) {
 	})
 
 	t.Run("nil_row_still_ok_false", func(t *testing.T) {
-		out, ok, err := decodeVStreamRow(nil, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		out, ok, err := decodeVStreamRow(nil, fields, "users", zeroDateInherit)
 		if err != nil || ok || out != nil {
 			t.Fatalf("decodeVStreamRow(nil) = (%#v, %v, %v); want (nil, false, nil) — the absent half of an Insert/Delete is not malformed", out, ok, err)
 		}
@@ -2125,7 +2116,7 @@ func TestDecodeVStreamRow_MalformedEventRefusesLoudly(t *testing.T) {
 
 	t.Run("well_formed_row_unaffected", func(t *testing.T) {
 		row := &query.Row{Lengths: []int64{1, 3}, Values: []byte("1bob")}
-		out, ok, err := decodeVStreamRow(row, fields, "users", newBoolRangeWarner(), zeroDateInherit)
+		out, ok, err := decodeVStreamRow(row, fields, "users", zeroDateInherit)
 		if err != nil || !ok {
 			t.Fatalf("decodeVStreamRow well-formed = (ok=%v, err=%v); want (true, nil)", ok, err)
 		}
@@ -2186,7 +2177,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	}
 
 	t.Run("error refuses loudly", func(t *testing.T) {
-		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateRefuse)
+		_, _, err := decodeVStreamRow(rowZero(), fields, "events", zeroDateRefuse)
 		if err == nil {
 			t.Fatal("err = nil; want a zero-date refusal")
 		}
@@ -2196,7 +2187,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	})
 
 	t.Run("null carries nil", func(t *testing.T) {
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateAsNull)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", zeroDateAsNull)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under null policy", err)
 		}
@@ -2206,7 +2197,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	})
 
 	t.Run("epoch substitutes floor", func(t *testing.T) {
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateAsEpoch)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", zeroDateAsEpoch)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under epoch policy", err)
 		}
@@ -2224,7 +2215,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 			{Name: "d", Type: query.Type_DATE, ColumnType: "date", Flags: mysqlNotNullFlag},
 		}
 		nnRow := &query.Row{Lengths: []int64{10}, Values: []byte("0000-00-00")}
-		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner(), zeroDateAsNull)
+		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", zeroDateAsNull)
 		if err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal under --zero-date=null")
 		}

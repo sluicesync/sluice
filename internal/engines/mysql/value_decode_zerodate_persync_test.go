@@ -130,14 +130,14 @@ func TestZeroDatePerSync_VStreamMatrix(t *testing.T) {
 				}
 
 				// refuse → loud, naming the column.
-				if _, _, err := decodeVStreamRow(mkRow(shape), nullableFields, "t", newBoolRangeWarner(), zeroDateRefuse); err == nil {
+				if _, _, err := decodeVStreamRow(mkRow(shape), nullableFields, "t", zeroDateRefuse); err == nil {
 					t.Errorf("refuse: err = nil; want a loud refusal")
 				} else if !strings.Contains(err.Error(), `"d"`) {
 					t.Errorf("refuse: err = %q; want it to name column d", err)
 				}
 
 				// null on nullable → SQL NULL.
-				out, _, err := decodeVStreamRow(mkRow(shape), nullableFields, "t", newBoolRangeWarner(), zeroDateAsNull)
+				out, _, err := decodeVStreamRow(mkRow(shape), nullableFields, "t", zeroDateAsNull)
 				if err != nil {
 					t.Errorf("null on nullable: err = %v; want nil", err)
 				} else if out["d"] != nil {
@@ -145,14 +145,14 @@ func TestZeroDatePerSync_VStreamMatrix(t *testing.T) {
 				}
 
 				// null on NOT NULL → loud refusal.
-				if _, _, err := decodeVStreamRow(mkRow(shape), notNullFields, "t", newBoolRangeWarner(), zeroDateAsNull); err == nil {
+				if _, _, err := decodeVStreamRow(mkRow(shape), notNullFields, "t", zeroDateAsNull); err == nil {
 					t.Errorf("null on NOT NULL: err = nil; want a loud refusal")
 				} else if !strings.Contains(err.Error(), "NOT NULL") {
 					t.Errorf("null on NOT NULL: err = %q; want it to name the NOT NULL conflict", err)
 				}
 
 				// epoch → representable floor.
-				out, _, err = decodeVStreamRow(mkRow(shape), notNullFields, "t", newBoolRangeWarner(), zeroDateAsEpoch)
+				out, _, err = decodeVStreamRow(mkRow(shape), notNullFields, "t", zeroDateAsEpoch)
 				if err != nil {
 					t.Errorf("epoch: err = %v; want nil", err)
 				} else if got, ok := out["d"].(time.Time); !ok || !got.Equal(zeroDateEpochValue) {

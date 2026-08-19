@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestCDCReader_DatabaseInScope pins the ADR-0074 Phase 1b reader-scope
@@ -357,7 +358,7 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 	raw := []any{int64(7), []byte("alice@example.com"), int64(1)}
 
-	row, err := decodeBinlogRow(raw, cols, nil, FlavorVanilla, "users", nil, zeroDateInherit)
+	row, err := decodeBinlogRow(raw, cols, nil, FlavorVanilla, "users", zeroDateInherit)
 	if err != nil {
 		t.Fatalf("decodeBinlogRow: %v", err)
 	}
@@ -372,43 +373,38 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 }
 
-// TestDecodeBinlogRow_TinyInt1OutOfRangeWarns pins the Vector D CDC-tail
-// wiring: a TINYINT(1)/ir.Boolean column carrying a value outside {0,1} on
-// the binlog path is still decoded to a bool (per convention) but emits the
-// one-time-per-column WARN naming the column + the --type-override remedy.
-func TestDecodeBinlogRow_TinyInt1OutOfRangeWarns(t *testing.T) {
-	buf := captureSlog(t)
+// TestDecodeBinlogRow_TinyInt1OutOfRangeRefuses pins the Vector D CDC-tail
+// wiring: a TINYINT(1)/ir.Boolean column carrying a value outside {0,1} on the
+// binlog path REFUSES loudly (coded SLUICE-E-VALUE-TINYINT1-RANGE, naming the
+// column + the --type-override remedy) rather than silently collapsing it to a
+// bool and losing the integer. In-range 0/1 still decodes to bool.
+func TestDecodeBinlogRow_TinyInt1OutOfRangeRefuses(t *testing.T) {
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 		{Name: "active", Type: ir.Boolean{}},
 	}
-	warner := newBoolRangeWarner()
-	// active=2 (out of range) -> still decodes to true, but warns.
-	row, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "users", warner, zeroDateInherit)
+	// active=2 (out of range) -> refuses, coded, names the column + remedy.
+	_, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "users", zeroDateInherit)
+	if err == nil {
+		t.Fatal("decodeBinlogRow(active=2): want a refusal, got nil")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeValueTinyint1Range {
+		t.Fatalf("want CodeValueTinyint1Range; got ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(err.Error(), `"users.active"`) {
+		t.Errorf("refusal should name the column; err=%q", err.Error())
+	}
+	if !strings.Contains(ce.Hint, "--type-override users.active=smallint") {
+		t.Errorf("refusal hint missing the --type-override remedy; hint=%q", ce.Hint)
+	}
+	// An in-range bool column decodes to bool without refusing.
+	row, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, nil, FlavorVanilla, "users", zeroDateInherit)
 	if err != nil {
-		t.Fatalf("decodeBinlogRow: %v", err)
-	}
-	if row["active"] != true {
-		t.Errorf("active = %#v; want true (convention: non-zero -> true)", row["active"])
-	}
-	// A second out-of-range row must NOT warn again (once per column).
-	if _, err := decodeBinlogRow([]any{int64(2), int64(127)}, cols, nil, FlavorVanilla, "users", warner, zeroDateInherit); err != nil {
-		t.Fatalf("decodeBinlogRow (2nd): %v", err)
-	}
-	out := buf.String()
-	if got := strings.Count(out, "column=users.active"); got != 1 {
-		t.Errorf("users.active warned %d times; want exactly 1\n%s", got, out)
-	}
-	if !strings.Contains(out, "--type-override users.active=smallint") {
-		t.Errorf("WARN missing the --type-override hint:\n%s", out)
-	}
-	// An in-range bool column never warns.
-	buf.Reset()
-	if _, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, nil, FlavorVanilla, "users", newBoolRangeWarner(), zeroDateInherit); err != nil {
 		t.Fatalf("decodeBinlogRow (in-range): %v", err)
 	}
-	if strings.Contains(buf.String(), "users.active") {
-		t.Errorf("in-range value warned:\n%s", buf.String())
+	if row["active"] != true {
+		t.Errorf("active = %#v; want true", row["active"])
 	}
 }
 
@@ -416,7 +412,7 @@ func TestDecodeBinlogRowColumnCountMismatch(t *testing.T) {
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}
-	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "t", nil, zeroDateInherit); err == nil {
+	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "t", zeroDateInherit); err == nil {
 		t.Error("expected error for column count mismatch")
 	}
 }

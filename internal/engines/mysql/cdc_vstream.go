@@ -90,15 +90,6 @@ type vstreamCDCReader struct {
 	// pre-ADR-0127 global-only behavior.
 	zeroDate zeroDateMode
 
-	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
-	// WARN (Vector D) for the VStream decode path, mirroring the binlog
-	// reader and the bulk-copy reader. Lazily created on the
-	// single-goroutine dispatch path; nil until then. A non-{0,1} value
-	// in a TINYINT(1) column is still carried as a bool per MySQL
-	// convention, but the operator is told (and pointed at
-	// --type-override) rather than it being silent.
-	boolWarn *boolRangeWarner
-
 	// shards is the shard layout the stream subscribes to. Empty
 	// means "discover via SHOW VITESS_SHARDS at open time"; a
 	// concrete slice (e.g. ["-"] for unsharded) skips the lookup.
@@ -175,10 +166,9 @@ type vstreamCDCReader struct {
 
 	// shardProgress is the per-shard progress watchdog, owned by [pump] for
 	// the stream's life and accessed ONLY from the single-goroutine dispatch
-	// path (set at pump start, cleared at pump exit) — the same
-	// single-goroutine discipline as boolWarn. nil when not pumping or when
-	// the WARN is disabled (shardStallWarnWindow<=0); every watchdog method
-	// is nil-safe.
+	// path (set at pump start, cleared at pump exit). nil when not pumping
+	// or when the WARN is disabled (shardStallWarnWindow<=0); every watchdog
+	// method is nil-safe.
 	shardProgress *shardProgressWatchdog
 
 	// conn is the underlying gRPC client connection. Held for the
@@ -1660,10 +1650,6 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
-	if r.boolWarn == nil { // single-goroutine dispatch — no lock needed
-		r.boolWarn = newBoolRangeWarner()
-	}
-
 	// Source commit timestamp for the sync-lag metric (roadmap item 45).
 	// A VStream VEvent's Timestamp is the originating transaction's commit
 	// instant in UTC seconds; on a multi-shard stream each shard's events
@@ -1680,11 +1666,11 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 		if err := refuseVStreamPartialRowImage(rc, fields, rev.GetKeyspace(), tableName); err != nil {
 			return err
 		}
-		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn, r.zeroDate)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.zeroDate)
 		if err != nil {
 			return err
 		}
-		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn, r.zeroDate)
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.zeroDate)
 		if err != nil {
 			return err
 		}
@@ -1809,7 +1795,7 @@ func vgtidToShardGtidSlice(vg *binlogdata.VGtid) ([]shardGtid, error) {
 // docs/value-types.md, so cross-engine MySQL→PG paths behave
 // identically whether changes flow through the binlog reader or
 // the VStream reader.
-func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, bool, error) {
+func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, zeroDate zeroDateMode) (ir.Row, bool, error) {
 	if row == nil {
 		return nil, false, nil
 	}
@@ -1879,15 +1865,18 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		if gf, isFraming := v.(*vstreamGeometryFramingError); isFraming {
 			return nil, false, fmt.Errorf("mysql/vstream: table %q column %q: %w", tableName, f.GetName(), gf.err())
 		}
-		// Vector D: a TINYINT(1) value outside {0,1} is collapsed to a
-		// bool here too (same MySQL convention as the binlog / bulk-copy
-		// paths). VStream cells are text-encoded, so parse the literal
-		// to recover the real integer and WARN once per column. Gated on
-		// the decoded value actually being a bool so only true
-		// TINYINT(1)/BIT(1)-shaped columns are probed.
+		// Vector D: a TINYINT(1) value outside {0,1} would be collapsed to
+		// a bool here too (same MySQL convention as the binlog / bulk-copy
+		// paths). VStream cells are text-encoded, so parse the literal to
+		// recover the real integer and REFUSE loudly rather than silently
+		// lose it (SLUICE-E-VALUE-TINYINT1-RANGE). Gated on the decoded
+		// value actually being a bool so only true TINYINT(1)/BIT(1)-shaped
+		// columns are probed.
 		if _, isBool := v.(bool); isBool {
 			if n, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
-				warner.observeNamed(tableName, f.GetName(), n)
+				if rerr := checkTinyBoolRange(tableName, f.GetName(), n); rerr != nil {
+					return nil, false, rerr
+				}
 			}
 		}
 		out[f.GetName()] = v

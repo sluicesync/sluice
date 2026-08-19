@@ -117,15 +117,6 @@ type CDCReader struct {
 	// pre-ADR-0127 global-only behavior.
 	zeroDate zeroDateMode
 
-	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
-	// WARN (Vector D) for the binlog decode path, mirroring the
-	// bulk-copy reader. Lazily created on the (single-goroutine) pump in
-	// dispatchRows; nil until then. A non-{0,1} value in a TINYINT(1)
-	// column is still carried as a bool per MySQL convention, but the
-	// operator is told (and pointed at --type-override) rather than it
-	// being silent on the steady-state CDC tail.
-	boolWarn *boolRangeWarner
-
 	// cdcDBInScope is the ADR-0074 Phase 1b multi-database event-allow
 	// predicate, set by [SetCDCDatabaseScope]. When non-nil the reader
 	// streams the server-wide binlog scoped to the SELECTED database set
@@ -1302,10 +1293,6 @@ func (r *CDCReader) dispatchRows(
 		return err
 	}
 
-	if r.boolWarn == nil { // single-goroutine pump — no lock needed
-		r.boolWarn = newBoolRangeWarner()
-	}
-
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
 	// the first row event per table forces tableFor to rebuild the
 	// *tableSchema. Snapshot that rebuilt schema HERE — strictly
@@ -1341,7 +1328,7 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
 				return err
 			}
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -1384,11 +1371,11 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
 				return err
 			}
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -1458,7 +1445,7 @@ func (r *CDCReader) dispatchRows(
 					return err
 				}
 			}
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.boolWarn, r.zeroDate)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -2633,7 +2620,7 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, error) {
+func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
@@ -2668,9 +2655,12 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, 
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)
 		}
 		if _, isBool := col.Type.(ir.Boolean); isBool {
-			// Vector D: a TINYINT(1) value outside {0,1} is collapsed to
-			// a bool here too — warn once per column on the CDC tail.
-			warner.observe(tableName, col, raw[i])
+			// Vector D: a TINYINT(1) value outside {0,1} would be collapsed
+			// to a bool here too — refuse loudly on the CDC tail rather than
+			// silently lose the integer (SLUICE-E-VALUE-TINYINT1-RANGE).
+			if rerr := checkTinyBoolRange(tableName, col.Name, raw[i]); rerr != nil {
+				return nil, rerr
+			}
 		}
 		row[col.Name] = v
 	}

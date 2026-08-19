@@ -325,8 +325,7 @@ func TestVStreamPartialRowImage_ColdStartDispatch(t *testing.T) {
 	// currentVgtid empty -> positionFor() returns a zero position cleanly,
 	// so the belt (which runs after the position resolve) is reachable.
 	s := &vstreamSnapshotStream{
-		fields:   map[string][]*query.Field{fieldCacheKey("-", "users"): fields},
-		boolWarn: newBoolRangeWarner(),
+		fields: map[string][]*query.Field{fieldCacheKey("-", "users"): fields},
 	}
 	partial := &binlogdata.VEvent{
 		Type: binlogdata.VEventType_ROW,

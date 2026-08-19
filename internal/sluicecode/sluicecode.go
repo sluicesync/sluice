@@ -205,6 +205,14 @@ const (
 	CodeValueUnrepresentable Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
 	CodeValueRaggedArray     Code = "SLUICE-E-VALUE-RAGGED-ARRAY"
 
+	// A MySQL TINYINT(1) column (mapped to boolean per MySQL's own
+	// BOOL/BOOLEAN convention) holds a value outside {0,1}, which the
+	// boolean collapse would silently rewrite to true — losing the
+	// integer. Earlier releases only WARNed and carried the collapsed
+	// bool; a field report hit that as silent data loss on a legacy
+	// TINYINT(1) column used as a small integer (values 0..6).
+	CodeValueTinyint1Range Code = "SLUICE-E-VALUE-TINYINT1-RANGE"
+
 	// A PostgreSQL `bytea` value arrived as a TEXT rendering sluice
 	// cannot read — not the `\x`+even-hex form `bytea_output = hex`
 	// produces. Item 135: the decoder used to fall through to a
@@ -548,6 +556,7 @@ var registry = map[Code]Info{
 	CodeValueNULByte:                   {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeValueUnrepresentable:           {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},
 	CodeValueRaggedArray:               {ClassRefusal, "a non-rectangular (jagged) array value bound for a PostgreSQL array column — PG arrays are rectangular by definition, so there is no faithful target value"},
+	CodeValueTinyint1Range:             {ClassRefusal, "a MySQL TINYINT(1) column (mapped to boolean) holds a value outside {0,1}, which the boolean collapse would silently rewrite to true — losing the integer; change the source column's type away from TINYINT(1) (e.g. to SMALLINT), or on a non-Vitess MySQL bulk migrate use --type-override <table>.<col>=smallint"},
 	CodeValueByteaTextUnrecognized:     {ClassRefusal, "a PostgreSQL bytea value rendered as text sluice cannot read — not the `\\x`+even-hex form `bytea_output = hex` produces"},
 	CodeExprBackslashLiteral:           {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:           {ClassRefusal, "destructive operation requires explicit --yes confirmation"},

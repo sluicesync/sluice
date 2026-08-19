@@ -37,6 +37,7 @@ func TestSetErrSitesClassify(t *testing.T) {
 			"cdc_snapshot_concurrent_resume.go:ctx.Err()":                     "the caller's own cancellation, never a source fault",
 			"row_reader.go:ctx.Err()":                                         "the caller's own cancellation, never a source fault",
 			`row_reader.go:fmt.Errorf("mysql: column %q: %w", col.Name, err)`: "a value decode / zero-date-policy fault is a data-fidelity error: no retry can change the bytes, and classifying it risks routing corruption to a retry loop",
+			"row_reader.go:rerr":                                              "the TINYINT(1)-out-of-range refusal (SLUICE-E-VALUE-TINYINT1-RANGE) is the same data-fidelity class as the decode-fault sibling above: no retry can bring the value into {0,1}, so it is terminal by construction — classifying a coded refusal would risk routing it into a retry loop",
 			// SETTLED (roadmap item 83) by killing a real connection mid-stream
 			// in TestRowReader_MidStreamConnectionDrop_IsClassifiedRetriable:
 			// the drop surfaces at the SIBLING rows.Err() exit, which IS
