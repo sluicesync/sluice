@@ -42,9 +42,9 @@ func execsOf(rec *fbRecorder) []string {
 
 // TestShouldSplitIndexBuildPerIndex pins the PURE ADR-0184 decision across the
 // flavor × size family matrix: the split fires iff the flavor is VStream
-// (PlanetScale/Vitess) AND DATA_LENGTH is at or above the threshold. Every
-// other cell keeps the ADR-0080 combined ALTER. Anti-vacuity: the matrix
-// carries at least one true and one false expectation.
+// (PlanetScale/Vitess) AND the SOURCE-derived byte size is at or above the
+// threshold. Every other cell keeps the ADR-0080 combined ALTER. Anti-vacuity:
+// the matrix carries at least one true and one false expectation.
 func TestShouldSplitIndexBuildPerIndex(t *testing.T) {
 	const thr = indexSplitPerIndexTableBytes
 	cases := []struct {
@@ -62,7 +62,7 @@ func TestShouldSplitIndexBuildPerIndex(t *testing.T) {
 		{"vitess + small", FlavorVitess, thr - 1, false},
 		{"vitess + at threshold", FlavorVitess, thr, true},
 		{"vitess + huge", FlavorVitess, thr * 4, true},
-		{"planetscale + zero (probe unavailable)", FlavorPlanetScale, 0, false},
+		{"planetscale + zero (no source estimate)", FlavorPlanetScale, 0, false},
 	}
 	var sawTrue, sawFalse bool
 	for _, c := range cases {
@@ -190,8 +190,9 @@ func TestEmitCreateIndexesPerIndex(t *testing.T) {
 
 // newSplitWriter builds a SchemaWriter over the fake MySQL for a chosen
 // flavor. No fallback is injected, so buildTableIndexes runs the DIRECT path
-// (the ADR-0184 decision), and the DATA_LENGTH probe is answered from
-// rec.dataLength.
+// (the ADR-0184 decision). The split decision reads the SOURCE-size hint the
+// caller threads via w.SetIndexSplitSizeHint — NOT rec.dataLength (the target
+// probe), which the split deliberately no longer consults.
 func newSplitWriter(t *testing.T, rec *fbRecorder, flavor Flavor) *SchemaWriter {
 	t.Helper()
 	if rec.failContains == nil {
@@ -213,8 +214,10 @@ func newSplitWriter(t *testing.T, rec *fbRecorder, flavor Flavor) *SchemaWriter 
 // TestBuildTableIndexes_SplitEngagesEndToEnd drives the real buildTableIndexes
 // chokepoint (via CreateIndexes — the whole-schema migrate/sync-cold-start
 // entry point) against the fake MySQL and asserts the emitted ALTERs by shape
-// for the flavor × size matrix. Three BTREE indexes make combined (1 ALTER,
-// commas) and per-index (3 ALTERs, no commas) unambiguously distinguishable.
+// for the flavor × size matrix. The size is the SOURCE hint (SetIndexSplitSizeHint),
+// mirroring the orchestrator's plumbing. Three BTREE indexes make combined
+// (1 ALTER, commas) and per-index (3 ALTERs, no commas) unambiguously
+// distinguishable.
 func TestBuildTableIndexes_SplitEngagesEndToEnd(t *testing.T) {
 	const thr = indexSplitPerIndexTableBytes
 	schema := func() *ir.Schema {
@@ -234,8 +237,9 @@ func TestBuildTableIndexes_SplitEngagesEndToEnd(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rec := &fbRecorder{dataLength: map[string]int64{"orders": c.bytes}}
+			rec := &fbRecorder{}
 			w := newSplitWriter(t, rec, c.flavor)
+			w.SetIndexSplitSizeHint(map[string]int64{"orders": c.bytes})
 			if err := w.CreateIndexes(context.Background(), schema()); err != nil {
 				t.Fatalf("CreateIndexes = %v; want nil", err)
 			}
@@ -268,10 +272,10 @@ func TestBuildTableIndexes_SplitEngagesEndToEnd(t *testing.T) {
 // through the real detect-then-skip probe + emitIndexBuildStatements.
 func TestBuildTableIndexes_SplitResumeSkipsPresent(t *testing.T) {
 	rec := &fbRecorder{
-		dataLength:  map[string]int64{"orders": indexSplitPerIndexTableBytes * 2},
 		preExisting: map[string]bool{"idx_a": true, "idx_b": true},
 	}
 	w := newSplitWriter(t, rec, FlavorPlanetScale)
+	w.SetIndexSplitSizeHint(map[string]int64{"orders": indexSplitPerIndexTableBytes * 2})
 
 	schema := fbSchemaOneTable(fbBTreeIdx("idx_a", "id"), fbBTreeIdx("idx_b", "val"), fbBTreeIdx("idx_c", "body"))
 	if err := w.CreateIndexes(context.Background(), schema); err != nil {
@@ -297,8 +301,9 @@ func TestBuildTableIndexes_SplitResumeSkipsPresent(t *testing.T) {
 // CreateIndexes path. (The vanilla concurrent-overlap workers reach the same
 // chokepoint but never split, being non-VStream, which is correct.)
 func TestBuildTableIndexes_SplitReachesVStreamSerialOverlap(t *testing.T) {
-	rec := &fbRecorder{dataLength: map[string]int64{"orders": indexSplitPerIndexTableBytes}}
+	rec := &fbRecorder{}
 	w := newSplitWriter(t, rec, FlavorPlanetScale)
+	w.SetIndexSplitSizeHint(map[string]int64{"orders": indexSplitPerIndexTableBytes})
 
 	schema := fbSchemaOneTable(fbBTreeIdx("idx_a", "id"), fbBTreeIdx("idx_b", "val"))
 	ch := make(chan *ir.Table, 1)
@@ -316,6 +321,62 @@ func TestBuildTableIndexes_SplitReachesVStreamSerialOverlap(t *testing.T) {
 			t.Errorf("VStream serial overlap emitted a combined ALTER, split did not reach it: %q", s)
 		}
 	}
+}
+
+// TestBuildTableIndexes_SplitUsesSourceHintNotTargetStats is the pin for the
+// PlanetScale-leg bug this fix closes: the split decision must key off the
+// SOURCE-size hint and NEVER off the freshly-copied target's post-copy
+// DATA_LENGTH. On PlanetScale a just-bulk-copied 36 MB table reported
+// DATA_LENGTH 16 KB, so the old target probe never crossed the 8 GiB floor and
+// the split stayed inert on the one platform it exists for.
+//
+// The exact PlanetScale shape: SOURCE large, TARGET reports tiny. rec.dataLength
+// carries the stale 16 KB the target would report; the source hint carries the
+// real size. The split MUST still fire — proving the target stats are not
+// consulted. The converse sub-case (no source hint while the target reports
+// HUGE) MUST NOT split, proving a large target's stats can never trigger it.
+func TestBuildTableIndexes_SplitUsesSourceHintNotTargetStats(t *testing.T) {
+	const staleTargetBytes = 16 << 10 // 16 KB — the value real PlanetScale reported for a 36 MB table
+	newSchema := func() *ir.Schema {
+		return fbSchemaOneTable(fbBTreeIdx("idx_a", "id"), fbBTreeIdx("idx_b", "val"), fbBTreeIdx("idx_c", "body"))
+	}
+
+	t.Run("source large + target reports tiny still splits", func(t *testing.T) {
+		// Target's stale post-copy DATA_LENGTH is far below the floor; source is above it.
+		rec := &fbRecorder{dataLength: map[string]int64{"orders": staleTargetBytes}}
+		w := newSplitWriter(t, rec, FlavorPlanetScale)
+		w.SetIndexSplitSizeHint(map[string]int64{"orders": indexSplitPerIndexTableBytes * 2})
+		if err := w.CreateIndexes(context.Background(), newSchema()); err != nil {
+			t.Fatalf("CreateIndexes = %v; want nil", err)
+		}
+		got := execsOf(rec)
+		if len(got) != 3 {
+			t.Fatalf("executed %d ALTER(s) %q; want 3 (per-index split from the SOURCE size, ignoring the stale target)", len(got), got)
+		}
+		for _, s := range got {
+			if strings.Contains(s, ", ADD") {
+				t.Errorf("emitted a combined ALTER — the split read the stale target stats instead of the source hint: %q", s)
+			}
+		}
+	})
+
+	t.Run("no source hint + target reports huge stays combined", func(t *testing.T) {
+		// A huge target DATA_LENGTH must NOT trigger the split when the source
+		// gave no estimate — the split may only ever key off the source.
+		rec := &fbRecorder{dataLength: map[string]int64{"orders": indexSplitPerIndexTableBytes * 8}}
+		w := newSplitWriter(t, rec, FlavorPlanetScale)
+		// Deliberately no SetIndexSplitSizeHint.
+		if err := w.CreateIndexes(context.Background(), newSchema()); err != nil {
+			t.Fatalf("CreateIndexes = %v; want nil", err)
+		}
+		got := execsOf(rec)
+		if len(got) != 1 {
+			t.Fatalf("executed %d ALTER(s) %q; want exactly 1 combined ALTER (a huge target must not trigger the split)", len(got), got)
+		}
+		if !strings.Contains(got[0], ", ADD") {
+			t.Errorf("want a single combined ALTER; got %q", got[0])
+		}
+	})
 }
 
 // equalStmts compares two statement slices order-sensitively.

@@ -1297,6 +1297,15 @@ func runBulkCopyWithOpts(
 	// Item 146: bind the run's grow gate as the copy watchdog's quiesce
 	// source before any ticker is constructed downstream.
 	ctx = withCopyQuiesceSource(ctx, opts.GrowGate)
+	// ADR-0184 (PlanetScale leg) sibling: the serial / multi-database sync
+	// cold-start builds its deferred indexes via the shared
+	// buildTableIndexes chokepoint too (CreateIndexes below), so thread the
+	// same source-size hint here. A no-op unless the target wants it and the
+	// source reader can estimate bytes — this path's reader is the pinned
+	// snapshot stream, which yields none, so it keeps the safe combined ALTER
+	// today; wiring it keeps the chokepoint uniform so a future non-pinned
+	// reader on this path benefits automatically.
+	migcore.ApplyIndexSplitSizeHint(ctx, sw, rows, schema)
 	if !opts.SkipSchemaApply {
 		// The CREATE phase consumes the ADR-0166 create subset when the
 		// pre-create shape gate ran (sync cold-start); nil keeps the full
@@ -1693,6 +1702,16 @@ func runBulkCopyPhases(
 		parallel.copyGate = migcore.NewCopyParallelismGate(budget, migcore.DefaultCopyBackoffPolicy)
 		parallel.copyBudget = budget
 	}
+
+	// ADR-0184 (PlanetScale leg): thread the per-table SOURCE byte sizes to the
+	// target BEFORE any index phase, so the large-table per-index ALTER split
+	// sizes off the accurate source rather than the freshly-copied target's
+	// stale post-copy stats (a 36 MB PlanetScale table reported 16 KB). No-op
+	// unless the target writer wants the hint AND the source reader can estimate
+	// bytes — a snapshot-pinned reader yields none, keeping the safe combined
+	// ALTER. Reaches migrate and the fast-parallel sync cold-start (both call
+	// runBulkCopyPhases); the serial cold-start wires it at runBulkCopyWithOpts.
+	migcore.ApplyIndexSplitSizeHint(ctx, sw, rows, schema)
 
 	// Phase 1: tables. createSchema is the ADR-0166 create subset —
 	// the full schema minus tables the pre-create gate proved already

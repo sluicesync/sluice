@@ -133,6 +133,61 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 	return count, nil
 }
 
+// EstimateTableBytes implements [ir.TableByteSizeEstimator]. It returns the
+// SOURCE table's on-disk byte size via information_schema.tables.DATA_LENGTH —
+// the source analogue of the target-side DATA_LENGTH probe
+// ([SchemaWriter.tableDataLengthBytes]), read from the SOURCE so a size gate
+// keys off the accurate long-lived source rather than a freshly-copied
+// PlanetScale/Vitess target whose post-copy stats are stale (a measured 36 MB
+// table reported 16 KB). The ADR-0184 per-index ALTER split consumes it.
+//
+// It mirrors [RowReader.CountRows]'s posture exactly: (0, nil) for a
+// snapshot-pinned reader (closer == nil — a concurrent catalog query would
+// conflict with the in-flight stream on the single pinned connection) and for a
+// reader with no schema name (information_schema needs the database to
+// disambiguate same-named tables). The value is an advisory estimate; a
+// NULL/absent DATA_LENGTH reports 0.
+func (r *RowReader) EstimateTableBytes(ctx context.Context, table *ir.Table) (int64, error) {
+	if table == nil {
+		return 0, errors.New("mysql: EstimateTableBytes: table is nil")
+	}
+	if r.closer == nil {
+		// Snapshot-pinned reader; a concurrent query would conflict with the
+		// in-flight stream on the pinned connection.
+		return 0, nil
+	}
+	schema := r.schema
+	if schema == "" {
+		return 0, nil
+	}
+	q := `SELECT COALESCE(DATA_LENGTH, 0)
+	      FROM information_schema.tables
+	      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
+	rows, err := r.q.QueryContext(ctx, q, schema, table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
+	if err != nil {
+		return 0, fmt.Errorf("mysql: EstimateTableBytes query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if rerr := rows.Err(); rerr != nil {
+			return 0, fmt.Errorf("mysql: EstimateTableBytes rows: %w", rerr)
+		}
+		return 0, nil
+	}
+	var n int64
+	if scanErr := rows.Scan(&n); scanErr != nil {
+		return 0, fmt.Errorf("mysql: EstimateTableBytes scan: %w", scanErr)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return 0, fmt.Errorf("mysql: EstimateTableBytes rows: %w", rerr)
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n, nil
+}
+
 // SampleKeysetBoundaries implements [ir.KeysetSampler] (ADR-0096). It
 // returns n-1 interior boundary tuples that split the table into n
 // approximately equal ROW-COUNT slices ordered by the PK columns, for a

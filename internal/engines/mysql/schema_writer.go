@@ -88,6 +88,19 @@ type SchemaWriter struct {
 	// any build worker goroutine.
 	tableIndexedCallback func(table *ir.Table)
 
+	// indexSplitSourceBytes carries the per-table SOURCE byte-size estimates
+	// the migrate / sync-cold-start orchestrator derived (from a source
+	// [ir.TableByteSizeEstimator]) before the index phase, threaded via
+	// [SetIndexSplitSizeHint] ([ir.IndexSplitSizeHintSetter]). The ADR-0184
+	// per-index ALTER split keys its large-table decision off THIS
+	// source-derived size, NOT a probe of the freshly-copied target — whose
+	// information_schema DATA_LENGTH is stale/uninitialized right after the bulk
+	// copy on PlanetScale/Vitess (a 36 MB table reported 16 KB), which left the
+	// split disengaged on the one platform it exists for. Keyed by
+	// ir.Table.Name; nil/absent ⇒ no source estimate ⇒ no split (the safe
+	// combined ALTER). See schema_writer_index_split.go.
+	indexSplitSourceBytes map[string]int64
+
 	// indexBuildFallback is the optional out-of-band index-build channel
 	// (ADR-0148: the PlanetScale deploy-request fallback for the errno-3024
 	// statement-time wall / errno-1105 safe-migrations direct-DDL block),

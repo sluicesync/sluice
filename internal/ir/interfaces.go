@@ -625,6 +625,28 @@ type RowCountEstimator interface {
 	EstimateRowCount(ctx context.Context, table *Table) (int64, error)
 }
 
+// TableByteSizeEstimator is the OPTIONAL surface a SOURCE [RowReader] can
+// implement to supply a per-table on-disk byte-size estimate (MySQL's
+// information_schema.tables.DATA_LENGTH, and its per-engine equivalents).
+//
+// It exists for size gates that must read the SOURCE rather than the
+// freshly-copied TARGET. Right after a bulk copy, a PlanetScale/Vitess target
+// table's information_schema stats are stale/uninitialized — a measured 36 MB
+// table reported DATA_LENGTH 16 KB — so a gate probing the target under-reads
+// and never fires. The long-lived SOURCE table has accurate stats (ADR-0184's
+// PlanetScale leg: the per-index ALTER split now sizes off this, not the
+// target's post-copy DATA_LENGTH). It is the byte-valued sibling of
+// [RowCountEstimator].
+//
+// Returning (0, nil) means "no estimate available" — a snapshot-pinned reader
+// that cannot safely run a concurrent catalog query, or a source engine that
+// does not track byte size. Callers MUST treat 0 as "unknown" and fall back to
+// their safe default, never as "empty". Errors are advisory (non-fatal); the
+// caller skips the table rather than aborting.
+type TableByteSizeEstimator interface {
+	EstimateTableBytes(ctx context.Context, table *Table) (int64, error)
+}
+
 // ExactCountEstimateOptIn is the optional surface a snapshot-pinned
 // [RowCountEstimator] reader can implement to let an orchestrator OPT
 // the reader into resolving the never-ANALYZEd catalog-estimate
@@ -2380,6 +2402,26 @@ var ErrIndexBuildFallbackUnavailable = errors.New("index-build fallback unavaila
 // only current consumer); PG has no statement-time-wall class to route.
 type IndexBuildFallbackSetter interface {
 	SetIndexBuildFallback(f IndexBuildFallback)
+}
+
+// IndexSplitSizeHintSetter is the OPTIONAL setter the orchestrator uses to
+// hand a target [SchemaWriter] the per-table SOURCE byte-size estimates it
+// derived (via a source [TableByteSizeEstimator]) BEFORE the index phase runs.
+//
+// A writer whose large-table index-build decision would otherwise probe the
+// freshly-copied TARGET uses these source-derived sizes instead — the
+// PlanetScale-leg fix for ADR-0184's per-index ALTER split: a just-bulk-copied
+// PlanetScale/Vitess table's information_schema DATA_LENGTH is stale (a 36 MB
+// table reported 16 KB), so the target probe never fired the split on the one
+// platform it exists for. The map is keyed by [Table.Name]; an absent/zero
+// entry means "no source estimate for that table" and the writer keeps its
+// safe default (the combined ALTER). A nil/empty map is a no-op — the writer's
+// behaviour is byte-identical to before the hint existed.
+//
+// MySQL implements it (the VStream flavors are the only consumers of the
+// split); engines without a statement-time wall skip cleanly.
+type IndexSplitSizeHintSetter interface {
+	SetIndexSplitSizeHint(sourceBytesByTable map[string]int64)
 }
 
 // QueryTimeoutController is the OPTIONAL control-plane object the CLI

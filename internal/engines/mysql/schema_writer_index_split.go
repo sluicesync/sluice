@@ -45,10 +45,20 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// indexSplitPerIndexTableBytes is the information_schema DATA_LENGTH floor at
-// or above which the deferred index build on a VStream (PlanetScale/Vitess)
-// target is SPLIT into one ALTER per index (ADR-0184) instead of the ADR-0080
-// combined ALTER.
+// indexSplitPerIndexTableBytes is the SOURCE-table byte floor at or above
+// which the deferred index build on a VStream (PlanetScale/Vitess) target is
+// SPLIT into one ALTER per index (ADR-0184) instead of the ADR-0080 combined
+// ALTER.
+//
+// The size is read from the SOURCE (information_schema DATA_LENGTH of the
+// long-lived source table, threaded in via [SchemaWriter.SetIndexSplitSizeHint]
+// — [ir.IndexSplitSizeHintSetter]), NOT from a probe of the freshly-copied
+// target. The PlanetScale leg of the ADR-0184 experiment found a target's
+// post-copy information_schema stats are stale/uninitialized — a 36 MB table
+// measured DATA_LENGTH 16 KB — so the target probe never crossed this floor and
+// the split stayed inert on the one platform it exists for. Byte semantics (and
+// this exact 8 GiB tuning) are preserved by keeping the threshold in bytes and
+// only moving the DATA SOURCE from stale-target to accurate-source.
 //
 // It is deliberately FAR below [indexFallbackHugeTableBytes] (64 GiB): that
 // constant guards the ADR-0148 FK-metadata deploy-request shortcut and is
@@ -75,30 +85,50 @@ const indexSplitPerIndexTableBytes = 8 << 30 // 8 GiB
 // shouldSplitIndexBuildPerIndex is the PURE ADR-0184 decision: split the
 // deferred index build into one ALTER per index (true) instead of the ADR-0080
 // combined ALTER (false). It splits ONLY when BOTH hold: the target is a
-// statement-time-limited VStream flavor (PlanetScale/Vitess), AND the table's
-// DATA_LENGTH is at or above [indexSplitPerIndexTableBytes]. No DB access and
-// no side effects, so the flavor×size matrix is unit-testable without a
-// container.
-func shouldSplitIndexBuildPerIndex(flavor Flavor, dataLengthBytes int64) bool {
-	return flavor.usesVStream() && dataLengthBytes >= indexSplitPerIndexTableBytes
+// statement-time-limited VStream flavor (PlanetScale/Vitess), AND the SOURCE
+// table's byte size is at or above [indexSplitPerIndexTableBytes]. sourceBytes
+// is the source-derived estimate (never a probe of the freshly-copied target —
+// see [indexSplitPerIndexTableBytes]); 0 means "no source estimate" and never
+// splits. No DB access and no side effects, so the flavor×size matrix is
+// unit-testable without a container.
+func shouldSplitIndexBuildPerIndex(flavor Flavor, sourceBytes int64) bool {
+	return flavor.usesVStream() && sourceBytes >= indexSplitPerIndexTableBytes
 }
 
 // buildIndexStatementsFor is the PURE emission dispatcher behind
-// [SchemaWriter.emitIndexBuildStatements]: given the flavor, the probed
-// DATA_LENGTH and the (already-filtered) pending indexes, it returns the
+// [SchemaWriter.emitIndexBuildStatements]: given the flavor, the SOURCE-derived
+// byte size and the (already-filtered) pending indexes, it returns the
 // statements to execute and whether it took the ADR-0184 per-index split. The
 // split branch emits via [emitCreateIndexesPerIndex]; the default via
 // [emitCreateIndexesCombined]. Kept side-effect-free (no DB, no logging) so a
 // unit test can pin, for every flavor×size cell, BOTH the split decision AND
 // the emitted shape without a container.
-func buildIndexStatementsFor(flavor Flavor, dataLengthBytes int64, tableName string, pending []*ir.Index, backslashEscapes bool) (stmts []string, split bool, err error) {
-	if shouldSplitIndexBuildPerIndex(flavor, dataLengthBytes) {
+func buildIndexStatementsFor(flavor Flavor, sourceBytes int64, tableName string, pending []*ir.Index, backslashEscapes bool) (stmts []string, split bool, err error) {
+	if shouldSplitIndexBuildPerIndex(flavor, sourceBytes) {
 		s, err := emitCreateIndexesPerIndex(tableName, pending, backslashEscapes)
 		return s, true, err
 	}
 	s, err := emitCreateIndexesCombined(tableName, pending, backslashEscapes)
 	return s, false, err
 }
+
+// SetIndexSplitSizeHint implements [ir.IndexSplitSizeHintSetter] (ADR-0184
+// PlanetScale leg). The migrate / sync-cold-start orchestrator threads the
+// per-table SOURCE byte sizes here BEFORE the index phase, so the per-index
+// ALTER split decides "large enough to risk the wall" from the accurate
+// long-lived source rather than the freshly-copied target's stale post-copy
+// information_schema stats — the bug that left the split inert on PlanetScale
+// (a 36 MB table reported 16 KB). Keyed by [ir.Table.Name]. A nil/empty map is
+// a no-op: the split then never engages and the safe ADR-0080 combined ALTER is
+// emitted, so any un-plumbed path (e.g. `backup restore`, whose source is an
+// archive without live stats) is byte-identical to before.
+func (w *SchemaWriter) SetIndexSplitSizeHint(sourceBytesByTable map[string]int64) {
+	w.indexSplitSourceBytes = sourceBytesByTable
+}
+
+// Compile-time proof the SchemaWriter accepts the source-size hint so the
+// ADR-0184 split gates on the source, not the freshly-copied target.
+var _ ir.IndexSplitSizeHintSetter = (*SchemaWriter)(nil)
 
 // emitIndexBuildStatements renders the ALTER statements one table's pending
 // (already skip-filtered, PRIMARY-free, already-existing-index-excluded)
@@ -107,15 +137,21 @@ func buildIndexStatementsFor(flavor Flavor, dataLengthBytes int64, tableName str
 // [SchemaWriter.buildTableIndexes] — the chokepoint every direct deferred build
 // funnels through.
 //
-// The DATA_LENGTH probe runs ONLY on a VStream flavor (the only target the
-// split can engage on), so a non-Vitess target never pays the extra
-// information_schema read and its emission is byte-identical to before.
+// The split sizes off the SOURCE estimate the orchestrator threaded in
+// ([SetIndexSplitSizeHint]), NOT a probe of the freshly-copied target: a
+// just-bulk-copied PlanetScale/Vitess table's information_schema DATA_LENGTH is
+// stale/uninitialized (a 36 MB table measured 16 KB), so the old target probe
+// under-read and the split never engaged where it is needed. The hint is
+// consulted ONLY on a VStream flavor (the only target the split can engage on),
+// so a non-Vitess target's emission is byte-identical to before; an absent hint
+// (nil map, or no entry for this table) reads 0 → no split → the safe combined
+// ALTER.
 func (w *SchemaWriter) emitIndexBuildStatements(ctx context.Context, tableName string, pending []*ir.Index) ([]string, error) {
-	var dataLen int64
+	var sourceBytes int64
 	if w.flavor.usesVStream() {
-		dataLen = w.tableDataLengthBytes(ctx, tableName)
+		sourceBytes = w.indexSplitSourceBytes[tableName]
 	}
-	stmts, split, err := buildIndexStatementsFor(w.flavor, dataLen, tableName, pending, w.emitter.backslashEscapes)
+	stmts, split, err := buildIndexStatementsFor(w.flavor, sourceBytes, tableName, pending, w.emitter.backslashEscapes)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +162,7 @@ func (w *SchemaWriter) emitIndexBuildStatements(ctx context.Context, tableName s
 				"and individually resumable (ADR-0184)",
 			slog.String("table", tableName),
 			slog.Int("index_count", len(pending)),
-			slog.Int64("data_length_bytes", dataLen),
+			slog.Int64("source_data_length_bytes", sourceBytes),
 			slog.Int64("split_threshold_bytes", indexSplitPerIndexTableBytes))
 	}
 	return stmts, nil

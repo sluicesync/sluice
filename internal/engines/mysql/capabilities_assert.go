@@ -86,11 +86,12 @@ var (
 	_ ir.TableIndexedNotifier       = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces.
-	_ ir.BatchedRowReader   = (*RowReader)(nil)
-	_ ir.KeysetSampler      = (*RowReader)(nil)
-	_ ir.RangeBoundsQuerier = (*RowReader)(nil)
-	_ ir.RowCounter         = (*RowReader)(nil)
-	_ ir.RowFilterSetter    = (*RowReader)(nil)
+	_ ir.BatchedRowReader       = (*RowReader)(nil)
+	_ ir.KeysetSampler          = (*RowReader)(nil)
+	_ ir.RangeBoundsQuerier     = (*RowReader)(nil)
+	_ ir.RowCounter             = (*RowReader)(nil)
+	_ ir.RowFilterSetter        = (*RowReader)(nil)
+	_ ir.TableByteSizeEstimator = (*RowReader)(nil)
 
 	// RowWriter optional surfaces.
 	_ ir.BulkTableDropper            = (*RowWriter)(nil)

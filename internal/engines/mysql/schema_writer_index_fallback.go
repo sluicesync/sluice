@@ -60,6 +60,17 @@ import (
 // safe-migrations branch the probe saves almost nothing (the direct
 // attempt fails instantly with 1105, no burn) — its value is confined to
 // the transitional states where direct DDL still executes.
+//
+// FOLLOW-UP (ADR-0184 PlanetScale leg, 2026-08-18): this probe reads the
+// freshly-copied TARGET's DATA_LENGTH ([indexFallbackTableClearlyHuge] →
+// [SchemaWriter.tableDataLengthBytes]), which shares the stale-post-copy-stats
+// weakness the ADR-0184 index-split just fixed — a PlanetScale/Vitess table's
+// information_schema stats are stale/uninitialized right after the bulk copy (a
+// 36 MB table measured 16 KB), so this "clearly huge" pre-route can under-read
+// and skip the optimization. It is NOT fixed here (a separate concern from the
+// split, and a mis-route only costs the doomed direct attempt, not correctness);
+// the clean fix is to feed it the same source-size hint the split now uses.
+// Filed as a follow-up rather than widened in this change.
 const indexFallbackHugeTableBytes = 64 << 30 // 64 GiB
 
 // SetIndexBuildFallback implements [ir.IndexBuildFallbackSetter]: the
@@ -250,14 +261,17 @@ func (w *SchemaWriter) indexFallbackTableClearlyHuge(ctx context.Context, table 
 }
 
 // tableDataLengthBytes reads a table's information_schema DATA_LENGTH — the
-// one cheap one-row read shared by the ADR-0148 huge-table fallback pre-probe
-// ([indexFallbackTableClearlyHuge]) and the ADR-0184 per-index-split trigger
-// ([SchemaWriter.emitIndexBuildStatements]). It is advisory only: a failed
-// query or a NULL/absent row reports 0, never an error — each caller then
-// compares against its own threshold and falls to its safe default (the direct
-// combined build). Reads on the pooled w.db, so it is valid on every build
-// path (whole-schema and the per-worker/overlap paths that execute on a
-// dedicated conn).
+// one cheap one-row read behind the ADR-0148 huge-table fallback pre-probe
+// ([indexFallbackTableClearlyHuge]). It is advisory only: a failed query or a
+// NULL/absent row reports 0, never an error — the caller compares against its
+// threshold and falls to its safe default (the direct combined build). Reads on
+// the pooled w.db, so it is valid on every build path (whole-schema and the
+// per-worker/overlap paths that execute on a dedicated conn).
+//
+// It reads the TARGET. The ADR-0184 per-index split deliberately does NOT use
+// this — a freshly-copied PlanetScale/Vitess target reports stale DATA_LENGTH
+// (see the follow-up note on [indexFallbackHugeTableBytes]); the split sizes off
+// the SOURCE hint ([SchemaWriter.SetIndexSplitSizeHint]) instead.
 func (w *SchemaWriter) tableDataLengthBytes(ctx context.Context, table string) int64 {
 	const q = `SELECT COALESCE(DATA_LENGTH, 0) FROM information_schema.TABLES
 		WHERE table_schema = ? AND table_name = ?`
