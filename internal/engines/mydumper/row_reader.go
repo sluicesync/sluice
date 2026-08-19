@@ -199,7 +199,7 @@ func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Tabl
 			}
 			row := make(ir.Row, len(targets))
 			for i, col := range targets {
-				v, err := literalToRowValue(vals[i], col)
+				v, err := literalToRowValue(vals[i], col, table.Name)
 				if err != nil {
 					return fmt.Errorf("mydumper: %s: table %s: %w", filepath.Base(path), table.Name, err)
 				}

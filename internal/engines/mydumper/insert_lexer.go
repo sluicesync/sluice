@@ -422,13 +422,26 @@ func bitsToBytes(digits string) ([]byte, error) {
 // path share one decode contract (docs/value-types.md). Any literal-kind ×
 // type pairing outside the matrix below is a loud error naming the column
 // and kinds — never a guessed coercion.
-func literalToRowValue(lit literal, col *ir.Column) (any, error) {
+func literalToRowValue(lit literal, col *ir.Column, tableName string) (any, error) {
 	if lit.kind == litNull {
 		return nil, nil
 	}
 	raw, err := literalToDriverShape(lit, col.Type)
 	if err != nil {
 		return nil, fmt.Errorf("column %q: %w", col.Name, err)
+	}
+	// The flat-file (mydumper) source is the FOURTH MySQL read path, alongside
+	// the bulk-copy scan, the binlog CDC decoder and the VStream CDC path: a
+	// TINYINT(1) cell holding a value outside {0,1} would be collapsed to a bool
+	// by DecodeRowValue and lose the integer. Refuse loudly, exactly as the live
+	// readers do (SLUICE-E-VALUE-TINYINT1-RANGE), before the collapse. raw is the
+	// pre-decode int64 for a boolean-int literal. There is no live table to
+	// preflight here, so this decode-time guard is the whole coverage for the
+	// dump path — which is correct: the "table" is the dump file.
+	if _, isBool := ir.UnwrapDomain(col.Type).(ir.Boolean); isBool {
+		if rerr := mysql.CheckTinyBoolRange(tableName, col.Name, raw); rerr != nil {
+			return nil, rerr
+		}
 	}
 	v, err := mysql.DecodeRowValue(raw, col.Type)
 	if err != nil {

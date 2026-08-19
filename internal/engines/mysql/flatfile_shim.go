@@ -42,6 +42,17 @@ func DecodeRowValue(raw any, t ir.Type) (any, error) {
 	return decodeValue(raw, t)
 }
 
+// CheckTinyBoolRange is the exported face of the TINYINT(1)-out-of-range guard
+// ([checkTinyBoolRange]) for the flat-file (mydumper) read path, which decodes
+// through [DecodeRowValue] rather than the live readers and so needs the same
+// refusal wired in explicitly. A TINYINT(1)/ir.Boolean cell holding a value
+// outside {0,1} returns the coded SLUICE-E-VALUE-TINYINT1-RANGE refusal naming
+// table.colName; in-range 0/1 and non-integer raws return nil. Callers gate on
+// the column being ir.Boolean, as the live readers do.
+func CheckTinyBoolRange(table, colName string, raw any) error {
+	return checkTinyBoolRange(table, colName, raw)
+}
+
 // ScanQuotedString decodes the MySQL single-quoted string literal at the
 // start of s (s[0] must be the opening quote) and reports the index of the
 // first byte past the closing delimiter — the exported face of

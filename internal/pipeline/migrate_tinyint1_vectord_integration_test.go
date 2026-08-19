@@ -157,6 +157,84 @@ func TestMigrate_TinyInt1OutOfRange_VectorD_IntegerOverridePreserves(t *testing.
 		assertIntColumn(t, ctx, db, wantVals)
 	})
 
+	t.Run("MySQL_to_PG_mixed_table_override_only_the_int_column", func(t *testing.T) {
+		// GAP #1 regression: a table with a REAL bool column (keep_flag, 0/1)
+		// AND an int-used TINYINT(1) column (status, 0..6) that the operator
+		// overrides to smallint. The fail-fast preflight must probe ONLY the
+		// still-boolean keep_flag (clean) and NOT refuse on the overridden
+		// status — otherwise it defeats the exact remedy the refusal recommends.
+		mysqlSource, _, mysqlCleanup := startMySQL(t)
+		defer mysqlCleanup()
+		_, pgTarget, pgCleanup := startPostgres(t)
+		defer pgCleanup()
+		applyMySQLDDL(t, mysqlSource, `
+			CREATE TABLE mixed (
+				id        INT PRIMARY KEY,
+				keep_flag TINYINT(1) NOT NULL,
+				status    TINYINT(1) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			INSERT INTO mixed (id, keep_flag, status) VALUES
+				(1, 0, 0), (2, 1, 3), (3, 1, 6), (4, 0, 2);`)
+
+		mig := &Migrator{
+			Source: mysqlEng, Target: pgEng,
+			SourceDSN: mysqlSource, TargetDSN: pgTarget,
+			Mappings: []config.Mapping{{Table: "mixed", Column: "status", TargetType: "smallint"}},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := mig.Run(ctx); err != nil {
+			t.Fatalf("Migrator.Run (mixed, status overridden): want success, got %v", err)
+		}
+
+		db, err := sql.Open("pgx", pgTarget)
+		if err != nil {
+			t.Fatalf("open target: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		// keep_flag lands as boolean (0/1 collapse is correct here); status
+		// lands as smallint with the real integers preserved.
+		var keepType, statusType string
+		if err := db.QueryRowContext(ctx,
+			"SELECT data_type FROM information_schema.columns WHERE table_name='mixed' AND column_name='keep_flag'").Scan(&keepType); err != nil {
+			t.Fatalf("read keep_flag type: %v", err)
+		}
+		if err := db.QueryRowContext(ctx,
+			"SELECT data_type FROM information_schema.columns WHERE table_name='mixed' AND column_name='status'").Scan(&statusType); err != nil {
+			t.Fatalf("read status type: %v", err)
+		}
+		if keepType != "boolean" {
+			t.Errorf("keep_flag data_type = %q; want boolean", keepType)
+		}
+		if statusType != "smallint" {
+			t.Errorf("status data_type = %q; want smallint (override)", statusType)
+		}
+		wantStatus := map[int]int64{1: 0, 2: 3, 3: 6, 4: 2}
+		rows, err := db.QueryContext(ctx, "SELECT id, status FROM mixed ORDER BY id")
+		if err != nil {
+			t.Fatalf("query target: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+		got := map[int]int64{}
+		for rows.Next() {
+			var id int
+			var s int64
+			if err := rows.Scan(&id, &s); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			got[id] = s
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		for id, w := range wantStatus {
+			if got[id] != w {
+				t.Errorf("mixed id=%d: status = %d; want %d (integer preserved, not collapsed)", id, got[id], w)
+			}
+		}
+	})
+
 	t.Run("MySQL_to_MySQL_smallint", func(t *testing.T) {
 		mysqlSource, mysqlTarget, mysqlCleanup := startMySQL(t)
 		defer mysqlCleanup()

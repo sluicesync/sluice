@@ -67,9 +67,16 @@ func (c bprConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue
 		if c.s.errFor[tbl] {
 			return nil, errors.New("probe did not complete")
 		}
+		// Match only if a BAD column is actually IN this probe's WHERE — so a
+		// bad column the preflight correctly excluded (overridden away) does not
+		// spuriously trip the combined probe (GAP #1 regression guard).
 		for key := range c.s.bad {
-			if strings.HasPrefix(key, tbl+".") {
-				return &boolRow{val: 1}, nil // a row matched
+			if !strings.HasPrefix(key, tbl+".") {
+				continue
+			}
+			col := strings.TrimPrefix(key, tbl+".")
+			if strings.Contains(q, "`"+col+"`") {
+				return &boolRow{val: 1}, nil // a row matched on a probed column
 			}
 		}
 		return &boolRow{done: true}, nil // no rows
@@ -188,6 +195,30 @@ func TestPreflightBoolRanges(t *testing.T) {
 		})
 		if err := r.PreflightBoolRanges(ctx, bprSchema("packs")); err != nil {
 			t.Fatalf("out-of-scope table must not be probed; got %v", err)
+		}
+	})
+
+	t.Run("an overridden TINYINT(1) column (now ir.Integer) is NOT probed (GAP #1)", func(t *testing.T) {
+		// A table with a real bool (is_active, clean 0/1) + a column used as a
+		// small int (status, holds 6) that the operator overrode to smallint.
+		// The passed (post-ApplyMappings) schema has status as ir.Integer; the
+		// raw catalog (fake `tiny`) still reports both as tinyint(1). The
+		// preflight must probe ONLY is_active and NOT refuse on status —
+		// otherwise it defeats the exact remedy the error recommends.
+		r := newBPRReader(t, &bprScript{
+			tiny: map[string][]string{"packs": {"is_active", "status"}},
+			bad:  map[string]int64{"packs.status": 6},
+		})
+		schema := &ir.Schema{Tables: []*ir.Table{{
+			Name: "packs",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "is_active", Type: ir.Boolean{}},
+				{Name: "status", Type: ir.Integer{Width: 16}}, // overridden away from bool
+			},
+		}}}
+		if err := r.PreflightBoolRanges(ctx, schema); err != nil {
+			t.Fatalf("overridden column must not be probed/refused; got %v", err)
 		}
 	})
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestLiteralToRowValue_FamilyMatrix is the Bug-74 pin for the dump value
@@ -145,7 +146,7 @@ func TestLiteralToRowValue_FamilyMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			col := &ir.Column{Name: "c", Type: tc.typ, Nullable: true}
-			got, err := literalToRowValue(tc.lit, col)
+			got, err := literalToRowValue(tc.lit, col, "t")
 			if err != nil {
 				t.Fatalf("literalToRowValue: %v", err)
 			}
@@ -153,6 +154,38 @@ func TestLiteralToRowValue_FamilyMatrix(t *testing.T) {
 				t.Fatalf("got %#v (%T); want %#v (%T)", got, got, tc.want, tc.want)
 			}
 		})
+	}
+}
+
+// TestLiteralToRowValue_TinyInt1OutOfRangeRefuses pins the FOURTH MySQL read
+// path — the mydumper flat-file source. A TINYINT(1)/ir.Boolean literal outside
+// {0,1} must refuse with the coded SLUICE-E-VALUE-TINYINT1-RANGE (naming
+// table.column), exactly as the live bulk-copy / binlog / VStream readers do,
+// rather than silently collapsing to a bool and losing the integer. In-range
+// 0/1 still decodes to a bool.
+func TestLiteralToRowValue_TinyInt1OutOfRangeRefuses(t *testing.T) {
+	col := &ir.Column{Name: "flag", Type: ir.Boolean{}}
+
+	_, err := literalToRowValue(literal{kind: litNumber, text: "2"}, col, "flags")
+	if err == nil {
+		t.Fatal("literalToRowValue(bool, 2): want a refusal, got nil")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeValueTinyint1Range {
+		t.Fatalf("want CodeValueTinyint1Range; got ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(err.Error(), "flags.flag") {
+		t.Errorf("refusal should name flags.flag; got %v", err)
+	}
+
+	for lit, want := range map[string]bool{"0": false, "1": true} {
+		v, err := literalToRowValue(literal{kind: litNumber, text: lit}, col, "flags")
+		if err != nil {
+			t.Fatalf("literalToRowValue(bool, %s): %v", lit, err)
+		}
+		if v != want {
+			t.Errorf("literalToRowValue(bool, %s) = %#v; want %v", lit, v, want)
+		}
 	}
 }
 
@@ -209,7 +242,7 @@ func TestLiteralToRowValue_Refusals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			col := &ir.Column{Name: "c", Type: tc.typ, Nullable: true}
-			if _, err := literalToRowValue(tc.lit, col); err == nil {
+			if _, err := literalToRowValue(tc.lit, col, "t"); err == nil {
 				t.Fatalf("want a loud refusal for %s literal on %T; got nil error", tc.lit.kind, tc.typ)
 			}
 		})
@@ -471,7 +504,7 @@ func tryLexRows(stmt string, table *ir.Table) ([]ir.Row, error) {
 		}
 		row := make(ir.Row, len(targets))
 		for i, col := range targets {
-			v, err := literalToRowValue(vals[i], col)
+			v, err := literalToRowValue(vals[i], col, "t")
 			if err != nil {
 				return nil, err
 			}

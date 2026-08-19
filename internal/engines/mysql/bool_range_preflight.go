@@ -59,20 +59,25 @@ func (r *SchemaReader) PreflightBoolRanges(ctx context.Context, schema *ir.Schem
 		return nil
 	}
 
-	// Cheap pre-filter: which in-scope tables even carry an ir.Boolean column?
-	// Dispatch on the STORAGE type (ir.UnwrapDomain) not the declared type, per
-	// the Bug 233 domain-transparency discipline — identity for a MySQL source
-	// (no PG domains reach here) but it keeps this on the guarded path.
-	inScope := make(map[string]struct{})
+	// Per-table set of columns that are STILL ir.Boolean in the (post-override)
+	// schema. This is the load-bearing filter: --type-override runs BEFORE this
+	// preflight (ApplyMappings, migrate.go), so a TINYINT(1) column the operator
+	// re-typed to an integer is ir.Integer here and MUST NOT be probed — probing
+	// it would refuse the exact remedy the refusal recommends. Dispatch on the
+	// STORAGE type (ir.UnwrapDomain) per the Bug 233 domain-transparency rule
+	// (identity for a MySQL source, but it keeps this on the guarded path).
+	boolCols := make(map[string]map[string]struct{})
 	for _, t := range schema.Tables {
 		for _, c := range t.Columns {
 			if _, isBool := ir.UnwrapDomain(c.Type).(ir.Boolean); isBool {
-				inScope[t.Name] = struct{}{}
-				break
+				if boolCols[t.Name] == nil {
+					boolCols[t.Name] = make(map[string]struct{})
+				}
+				boolCols[t.Name][c.Name] = struct{}{}
 			}
 		}
 	}
-	if len(inScope) == 0 {
+	if len(boolCols) == 0 {
 		return nil
 	}
 
@@ -89,10 +94,18 @@ func (r *SchemaReader) PreflightBoolRanges(ctx context.Context, schema *ir.Schem
 	}
 
 	for _, t := range schema.Tables { // iterate in schema order for a stable probe sequence
-		if _, ok := inScope[t.Name]; !ok {
+		stillBool := boolCols[t.Name]
+		if len(stillBool) == 0 {
 			continue
 		}
-		cols := byTable[t.Name]
+		// Probe only the raw TINYINT(1) columns that are STILL ir.Boolean —
+		// i.e. not overridden to an integer (GAP #1) and not BIT(1)-sourced.
+		var cols []string
+		for _, c := range byTable[t.Name] {
+			if _, ok := stillBool[c]; ok {
+				cols = append(cols, c)
+			}
+		}
 		if len(cols) == 0 {
 			continue
 		}
