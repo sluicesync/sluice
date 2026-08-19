@@ -2188,12 +2188,27 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 			HeartbeatInterval: 5,
 		},
 	}
-	grpcStream, err := s.client.VStream(ctx, req)
+	// Fresh Background-derived streamCtx + cancel (like the COPY streams and
+	// reconnectCopy), stored as s.grpcCancel — so the liveness watchdog's
+	// cancelGRPCStream and CloseFn actually cancel THIS CDC tail. Binding the
+	// tail to the caller's ctx while leaving s.grpcCancel pointed at the finished
+	// COPY stream was the audit-2026-08-19 wedge: a fired watchdog cancelled the
+	// dead COPY context and the tail's Recv parked forever, freezing the sync on
+	// the default auto-shard cold-start after a tablet failover. The three other
+	// stream-open sites (Open, reconnectCopy) keep this convention; this one had
+	// skipped it.
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	grpcStream, err := s.client.VStream(streamCtx, req)
 	if err != nil {
+		streamCancel()
 		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: open stream: %w", err)
 	}
 	s.mu.Lock()
+	if s.grpcCancel != nil {
+		s.grpcCancel() // free the finished COPY stream's context
+	}
 	s.grpcStream = grpcStream
+	s.grpcCancel = streamCancel
 	clear(s.fields) // the keyspace-wide stream re-emits FIELD per table
 	s.mu.Unlock()
 	slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard CDC handoff (keyspace-wide tail from stitched position)",
