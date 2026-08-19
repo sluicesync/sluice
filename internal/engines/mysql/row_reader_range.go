@@ -133,6 +133,28 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 	return count, nil
 }
 
+// EstimateRowCount implements [ir.RowCountEstimator]. For MySQL the count
+// and the estimate are the SAME information_schema.tables.TABLE_ROWS read —
+// InnoDB maintains it as a lazy approximation (MyISAM keeps it exact), so
+// [RowReader.CountRows] is ALREADY an estimate, and this method simply shares
+// its implementation. (Contrast Postgres, where CountRows is an exact COUNT(*)
+// and the estimator reads pg_class.reltuples — there the two genuinely differ.)
+//
+// It exists as its own surface because the consumers that type-assert
+// [ir.RowCountEstimator] — the pre-copy plan/gotcha report's largest-table
+// lookup and the ADR-0182 query-timeout-raise size gate — do NOT fall back to
+// [ir.RowCounter] (a plain COUNT(*) pre-migrate is exactly the full scan the
+// estimator surface exists to avoid on the other engines). Without this method
+// a MySQL source — including `--source-driver=planetscale`, which shares this
+// reader — was silently invisible to both, so a PlanetScale→PlanetScale region
+// move (the very case v0.129.0's report targets) named no largest table and the
+// PlanetScale nudge never fired (Bug 256). The parallel-copy chunk DECISION is
+// unaffected: [migcore.ApproximateRowCount] already preferred CountRows for
+// MySQL, and this returns the identical value.
+func (r *RowReader) EstimateRowCount(ctx context.Context, table *ir.Table) (int64, error) {
+	return r.CountRows(ctx, table)
+}
+
 // EstimateTableBytes implements [ir.TableByteSizeEstimator]. It returns the
 // SOURCE table's on-disk byte size via information_schema.tables.DATA_LENGTH —
 // the source analogue of the target-side DATA_LENGTH probe

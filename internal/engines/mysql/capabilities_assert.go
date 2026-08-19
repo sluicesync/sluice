@@ -86,10 +86,16 @@ var (
 	_ ir.TableIndexedNotifier       = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces.
-	_ ir.BatchedRowReader       = (*RowReader)(nil)
-	_ ir.KeysetSampler          = (*RowReader)(nil)
-	_ ir.RangeBoundsQuerier     = (*RowReader)(nil)
-	_ ir.RowCounter             = (*RowReader)(nil)
+	_ ir.BatchedRowReader   = (*RowReader)(nil)
+	_ ir.KeysetSampler      = (*RowReader)(nil)
+	_ ir.RangeBoundsQuerier = (*RowReader)(nil)
+	_ ir.RowCounter         = (*RowReader)(nil)
+	// RowCountEstimator: the plan/gotcha report + the ADR-0182 query-timeout
+	// size gate type-assert THIS surface with no RowCounter fallback, so its
+	// absence silently blinded them to a MySQL source (Bug 256). For MySQL the
+	// estimate IS the TABLE_ROWS count, so it shares CountRows — but the pin
+	// must stay so a method-set drift can't re-open the blind spot.
+	_ ir.RowCountEstimator      = (*RowReader)(nil)
 	_ ir.RowFilterSetter        = (*RowReader)(nil)
 	_ ir.TableByteSizeEstimator = (*RowReader)(nil)
 

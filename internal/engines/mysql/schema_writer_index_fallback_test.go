@@ -46,6 +46,9 @@ type fbRecorder struct {
 	// dataLength answers the information_schema DATA_LENGTH probe, keyed
 	// by table name.
 	dataLength map[string]int64
+	// tableRows answers the information_schema TABLE_ROWS probe (CountRows /
+	// EstimateRowCount), keyed by table name.
+	tableRows map[string]int64
 }
 
 func (r *fbRecorder) recordExec(q string) (fail error) {
@@ -87,6 +90,12 @@ func (r *fbRecorder) tableBytes(table string) int64 {
 	return r.dataLength[table]
 }
 
+func (r *fbRecorder) rowCount(table string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tableRows[table]
+}
+
 type fbDriver struct{ rec *fbRecorder }
 
 func (d fbDriver) Open(string) (driver.Conn, error) { return fbConn(d), nil }
@@ -117,6 +126,13 @@ func (c fbConn) QueryContext(_ context.Context, query string, args []driver.Name
 			table, _ = args[1].Value.(string)
 		}
 		return &boolRow{val: c.rec.tableBytes(table)}, nil
+	}
+	if strings.Contains(query, "TABLE_ROWS") {
+		table := ""
+		if len(args) >= 2 {
+			table, _ = args[1].Value.(string)
+		}
+		return &boolRow{val: c.rec.rowCount(table)}, nil
 	}
 	if nTables, nNames, ok := batchedProbeShape(query); ok {
 		argStr := func(i int) string {
