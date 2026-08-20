@@ -54,7 +54,7 @@ const boolRangePreflightBudgetMS = 2000
 // decode-time guard still catches anything it could not confirm. Everything runs
 // on the reader's own *sql.DB, which is live on every flavor (it is how the
 // schema was read), PlanetScale/Vitess via vtgate included.
-func (r *SchemaReader) PreflightBoolRanges(ctx context.Context, schema *ir.Schema) error {
+func (r *SchemaReader) PreflightBoolRanges(ctx context.Context, schema *ir.Schema, rowFilters map[string]string) error {
 	if r.db == nil || r.schema == "" || schema == nil {
 		return nil
 	}
@@ -109,11 +109,26 @@ func (r *SchemaReader) PreflightBoolRanges(ctx context.Context, schema *ir.Schem
 		if len(cols) == 0 {
 			continue
 		}
-		if err := r.preflightTableBoolRanges(ctx, t.Name, cols); err != nil {
+		if err := r.preflightTableBoolRanges(ctx, t.Name, cols, rowFilters[t.Name]); err != nil {
 			return err // coded refusal — an out-of-range value was confirmed
 		}
 	}
 	return nil
+}
+
+// andBoolRangeFilter prepends the operator's `--where` predicate (already
+// validated + intended to be passed to the source verbatim, ADR-0173) to a
+// range predicate, so the probe only ever considers rows the copy would move.
+// The range predicate is wrapped in its own parens because for the COMBINED
+// probe it is an OR of per-column checks: `(filter) AND col1 NOT IN (0,1) OR
+// col2 …` would bind AND tighter than OR and silently apply the filter to only
+// the first column. An empty filter returns the predicate byte-for-byte
+// unchanged, so the common unfiltered path is identical to before F-1.
+func andBoolRangeFilter(filter, rangePred string) string {
+	if strings.TrimSpace(filter) == "" {
+		return rangePred
+	}
+	return "(" + filter + ") AND (" + rangePred + ")"
 }
 
 // tinyint1Columns returns the signed, non-auto-increment TINYINT(1) columns per
@@ -149,7 +164,7 @@ func (r *SchemaReader) tinyint1Columns(ctx context.Context) (map[string][]string
 // out-of-range value with a single short-circuiting query; on a hit it
 // pinpoints the culprit column + an example value and returns the coded
 // refusal. A probe that cannot complete WARNs and returns nil (best-effort).
-func (r *SchemaReader) preflightTableBoolRanges(ctx context.Context, table string, cols []string) error {
+func (r *SchemaReader) preflightTableBoolRanges(ctx context.Context, table string, cols []string, rowFilter string) error {
 	tableRef := quoteIdent(r.schema) + "." + quoteIdent(table)
 	preds := make([]string, len(cols))
 	for i, c := range cols {
@@ -158,9 +173,10 @@ func (r *SchemaReader) preflightTableBoolRanges(ctx context.Context, table strin
 	// The MAX_EXECUTION_TIME hint caps the scan so a clean, unindexed column on
 	// a huge table can't make the operator wait — it times out into the WARN
 	// path below rather than full-scanning. A misused column's out-of-range
-	// values are found long before the cap.
+	// values are found long before the cap. The `--where` filter (if any) is
+	// ANDed in so the probe never refuses on a row the copy would not move (F-1).
 	combined := fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ 1 FROM %s WHERE %s LIMIT 1",
-		boolRangePreflightBudgetMS, tableRef, strings.Join(preds, " OR "))
+		boolRangePreflightBudgetMS, tableRef, andBoolRangeFilter(rowFilter, strings.Join(preds, " OR ")))
 
 	var probe int
 	switch err := r.db.QueryRowContext(ctx, combined).Scan(&probe); {
@@ -180,8 +196,8 @@ func (r *SchemaReader) preflightTableBoolRanges(ctx context.Context, table strin
 	// queries; each pinpoint short-circuits because the bad data is present.
 	for _, c := range cols {
 		var v sql.NullInt64
-		q := fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ %s FROM %s WHERE %s NOT IN (0,1) LIMIT 1",
-			boolRangePreflightBudgetMS, quoteIdent(c), tableRef, quoteIdent(c))
+		q := fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ %s FROM %s WHERE %s LIMIT 1",
+			boolRangePreflightBudgetMS, quoteIdent(c), tableRef, andBoolRangeFilter(rowFilter, quoteIdent(c)+" NOT IN (0,1)"))
 		switch err := r.db.QueryRowContext(ctx, q).Scan(&v); {
 		case errors.Is(err, sql.ErrNoRows):
 			continue

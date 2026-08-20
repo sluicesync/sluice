@@ -26,6 +26,14 @@ type bprScript struct {
 	bad     map[string]int64
 	errFor  map[string]bool
 	tinyErr bool
+
+	// filterHidesBad models the DATABASE applying the operator's `--where`: when
+	// true, any probe whose SQL carries a filter (an ` AND (` after a leading
+	// `(`) returns NO rows even though bad data exists — the F-1 case where the
+	// filter excludes every out-of-range row. capturedProbes records the combined
+	// probe SQL so a test can assert the filter was actually ANDed in.
+	filterHidesBad bool
+	capturedProbes []string
 }
 
 type bprDriver struct{ s *bprScript }
@@ -64,8 +72,16 @@ func (c bprConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue
 
 	case strings.Contains(q, "SELECT /*+ MAX_EXECUTION_TIME") && strings.Contains(q, " 1 FROM "): // combined probe
 		tbl := c.tableInQuery(q)
+		c.s.capturedProbes = append(c.s.capturedProbes, q)
 		if c.s.errFor[tbl] {
 			return nil, errors.New("probe did not complete")
+		}
+		// A `--where` filter (rendered by andBoolRangeFilter as `(filter) AND
+		// (...)`) that excludes the bad rows: the DATABASE returns no rows even
+		// though bad data exists (F-1). Detected by the ") AND (" the wrapper
+		// introduces — the unfiltered predicate never contains it.
+		if c.s.filterHidesBad && strings.Contains(q, ") AND (") {
+			return &boolRow{done: true}, nil
 		}
 		// Match only if a BAD column is actually IN this probe's WHERE — so a
 		// bad column the preflight correctly excluded (overridden away) does not
@@ -148,7 +164,7 @@ func TestPreflightBoolRanges(t *testing.T) {
 			tiny: map[string][]string{"packs": {"is_active"}},
 			bad:  map[string]int64{"packs.is_active": 6},
 		})
-		err := r.PreflightBoolRanges(ctx, bprSchema("packs"))
+		err := r.PreflightBoolRanges(ctx, bprSchema("packs"), nil)
 		if err == nil {
 			t.Fatal("want a refusal for an out-of-range TINYINT(1) value, got nil")
 		}
@@ -163,7 +179,7 @@ func TestPreflightBoolRanges(t *testing.T) {
 
 	t.Run("all in-range returns nil", func(t *testing.T) {
 		r := newBPRReader(t, &bprScript{tiny: map[string][]string{"packs": {"is_active"}}})
-		if err := r.PreflightBoolRanges(ctx, bprSchema("packs")); err != nil {
+		if err := r.PreflightBoolRanges(ctx, bprSchema("packs"), nil); err != nil {
 			t.Fatalf("clean table: want nil, got %v", err)
 		}
 	})
@@ -174,14 +190,14 @@ func TestPreflightBoolRanges(t *testing.T) {
 			bad:    map[string]int64{"packs.is_active": 6}, // bad data exists...
 			errFor: map[string]bool{"packs": true},         // ...but the probe can't complete
 		})
-		if err := r.PreflightBoolRanges(ctx, bprSchema("packs")); err != nil {
+		if err := r.PreflightBoolRanges(ctx, bprSchema("packs"), nil); err != nil {
 			t.Fatalf("probe error must degrade to nil (decode-time guard is the floor), got %v", err)
 		}
 	})
 
 	t.Run("best-effort: enumeration error degrades to nil", func(t *testing.T) {
 		r := newBPRReader(t, &bprScript{tinyErr: true})
-		if err := r.PreflightBoolRanges(ctx, bprSchema("packs")); err != nil {
+		if err := r.PreflightBoolRanges(ctx, bprSchema("packs"), nil); err != nil {
 			t.Fatalf("enumeration error must degrade to nil, got %v", err)
 		}
 	})
@@ -193,7 +209,7 @@ func TestPreflightBoolRanges(t *testing.T) {
 			tiny: map[string][]string{"secret": {"is_active"}},
 			bad:  map[string]int64{"secret.is_active": 6},
 		})
-		if err := r.PreflightBoolRanges(ctx, bprSchema("packs")); err != nil {
+		if err := r.PreflightBoolRanges(ctx, bprSchema("packs"), nil); err != nil {
 			t.Fatalf("out-of-scope table must not be probed; got %v", err)
 		}
 	})
@@ -217,7 +233,7 @@ func TestPreflightBoolRanges(t *testing.T) {
 				{Name: "status", Type: ir.Integer{Width: 16}}, // overridden away from bool
 			},
 		}}}
-		if err := r.PreflightBoolRanges(ctx, schema); err != nil {
+		if err := r.PreflightBoolRanges(ctx, schema, nil); err != nil {
 			t.Fatalf("overridden column must not be probed/refused; got %v", err)
 		}
 	})
@@ -228,8 +244,77 @@ func TestPreflightBoolRanges(t *testing.T) {
 			Name:    "packs",
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		}}}
-		if err := r.PreflightBoolRanges(ctx, plain); err != nil {
+		if err := r.PreflightBoolRanges(ctx, plain, nil); err != nil {
 			t.Fatalf("no-bool-column schema: want nil, got %v", err)
 		}
 	})
+
+	t.Run("a --where that excludes the bad rows is ANDed in and does NOT refuse (F-1)", func(t *testing.T) {
+		// Bad data exists, but the operator's --where excludes it (modelled by
+		// filterHidesBad). The preflight must NOT refuse on rows the copy would
+		// never move — the Bug 246 filter-blind-refusal shape.
+		s := &bprScript{
+			tiny:           map[string][]string{"packs": {"is_active"}},
+			bad:            map[string]int64{"packs.is_active": 6},
+			filterHidesBad: true,
+		}
+		r := newBPRReader(t, s)
+		filters := map[string]string{"packs": "region = 'us-east'"}
+		if err := r.PreflightBoolRanges(ctx, bprSchema("packs"), filters); err != nil {
+			t.Fatalf("a --where excluding the bad rows must not refuse; got %v", err)
+		}
+		// And prove the filter was actually threaded into the probe SQL (not
+		// silently dropped, which would re-open the refusal).
+		if len(s.capturedProbes) == 0 {
+			t.Fatal("no combined probe was captured")
+		}
+		if !strings.Contains(s.capturedProbes[0], "region = 'us-east'") ||
+			!strings.Contains(s.capturedProbes[0], ") AND (") {
+			t.Errorf("the --where predicate was not ANDed into the probe; got %q", s.capturedProbes[0])
+		}
+	})
+
+	t.Run("a --where that does NOT exclude the bad rows still refuses", func(t *testing.T) {
+		// The filter is threaded, but the bad rows remain in scope
+		// (filterHidesBad false): a real in-scope violation must still refuse —
+		// the filter must not suppress a genuine loss.
+		s := &bprScript{
+			tiny: map[string][]string{"packs": {"is_active"}},
+			bad:  map[string]int64{"packs.is_active": 6},
+		}
+		r := newBPRReader(t, s)
+		filters := map[string]string{"packs": "region = 'us-east'"}
+		err := r.PreflightBoolRanges(ctx, bprSchema("packs"), filters)
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeValueTinyint1Range {
+			t.Fatalf("an in-scope out-of-range value must still refuse; got ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestAndBoolRangeFilter pins the exact SQL andBoolRangeFilter builds — most
+// importantly that an OR-group range predicate is wrapped in its own parens when
+// a filter is present, so operator precedence (AND over OR) cannot silently
+// apply the --where to only the first column, and that an empty filter leaves
+// the predicate byte-for-byte unchanged (the unfiltered path is untouched).
+func TestAndBoolRangeFilter(t *testing.T) {
+	const orGroup = "`a` NOT IN (0,1) OR `b` NOT IN (0,1)"
+	const single = "`a` NOT IN (0,1)"
+	cases := []struct {
+		name   string
+		filter string
+		pred   string
+		want   string
+	}{
+		{"empty filter leaves an OR-group unchanged", "", orGroup, orGroup},
+		{"empty filter leaves a single predicate unchanged", "  ", single, single},
+		{"a filter parenthesizes the whole OR-group", "region = 'x'", orGroup, "(region = 'x') AND (`a` NOT IN (0,1) OR `b` NOT IN (0,1))"},
+		{"a filter ANDs a single predicate", "region = 'x'", single, "(region = 'x') AND (`a` NOT IN (0,1))"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := andBoolRangeFilter(tc.filter, tc.pred); got != tc.want {
+				t.Errorf("andBoolRangeFilter(%q, %q) = %q; want %q", tc.filter, tc.pred, got, tc.want)
+			}
+		})
+	}
 }

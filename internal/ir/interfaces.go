@@ -671,8 +671,19 @@ type TableByteSizeEstimator interface {
 //
 // schema is the in-scope schema (already filtered by --include/--exclude-table);
 // implementations MUST only probe tables it names.
+//
+// rowFilters is the operator's per-table `--where` predicate map (source-table-
+// name keyed, canonicalized to the schema's casing — the SAME map the cold-start
+// copy honors). An implementation MUST AND the matching predicate into its probe
+// so a row the copy will NEVER move cannot trigger a refusal: a one-shot
+// `migrate --where` (or a sync cold-start) whose filter excludes every
+// out-of-range row must not be hard-refused on rows outside its scope (audit
+// F-1, the Bug 246 filter-blind-refusal shape). An empty/nil map probes every
+// row, as before. The decode-time guard still covers any CDC-time row a
+// continuous sync later applies, so scoping the preflight to the copied set
+// loses no correctness.
 type BoolRangePreflighter interface {
-	PreflightBoolRanges(ctx context.Context, schema *Schema) error
+	PreflightBoolRanges(ctx context.Context, schema *Schema, rowFilters map[string]string) error
 }
 
 // ExactCountEstimateOptIn is the optional surface a snapshot-pinned

@@ -179,7 +179,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// snapshot stream opens, so no slot is left to abandon — rather than partway
 	// through the copy. The per-row decode guard remains the correctness floor;
 	// a probe this cannot complete WARNs and proceeds.
-	if err := migcore.PreflightSourceBoolRanges(ctx, s.Source, s.SourceDSN, schema); err != nil {
+	if err := migcore.PreflightSourceBoolRanges(ctx, s.Source, s.SourceDSN, schema, s.RowFilters); err != nil {
 		return nil, stop, err
 	}
 

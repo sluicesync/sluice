@@ -788,7 +788,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// return (it issues real source queries) and after the already-complete
 	// --resume short-circuit; skipped for engines that don't implement it, and a
 	// probe it cannot complete WARNs and proceeds under the decode-time guard.
-	if err := migcore.PreflightSourceBoolRanges(ctx, m.Source, m.SourceDSN, schema); err != nil {
+	if err := migcore.PreflightSourceBoolRanges(ctx, m.Source, m.SourceDSN, schema, m.RowFilters); err != nil {
 		return err
 	}
 

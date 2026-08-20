@@ -31,7 +31,7 @@ import (
 //     table that times out or hits a statement-time wall) WARNs and returns nil.
 //
 // Only a genuinely out-of-range value returns the coded refusal.
-func PreflightSourceBoolRanges(ctx context.Context, source ir.Engine, sourceDSN string, schema *ir.Schema) error {
+func PreflightSourceBoolRanges(ctx context.Context, source ir.Engine, sourceDSN string, schema *ir.Schema, rowFilters map[string]string) error {
 	if schema == nil {
 		return nil
 	}
@@ -45,5 +45,8 @@ func PreflightSourceBoolRanges(ctx context.Context, source ir.Engine, sourceDSN 
 	if !ok {
 		return nil
 	}
-	return pf.PreflightBoolRanges(ctx, schema)
+	// rowFilters (the operator's per-table --where) is threaded so the probe
+	// never refuses on a row the copy would not move (F-1). Same map the
+	// cold-start copy honors; nil/empty probes every row.
+	return pf.PreflightBoolRanges(ctx, schema, rowFilters)
 }
