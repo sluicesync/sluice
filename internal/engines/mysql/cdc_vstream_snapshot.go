@@ -870,6 +870,21 @@ type vstreamSnapshotStream struct {
 	grpcStream vtgateservice.Vitess_VStreamClient
 	grpcCancel context.CancelFunc // cancels the gRPC stream context
 
+	// cdcPumpDone / cdcPumpCancel track the SINGLE post-COPY CDC pump so
+	// [close] can join it (audit-2026-08-19 pump-join roster — the 4th
+	// implementor, after PG / standalone-VStream / sqlite-trigger / binlog).
+	// cdcPumpCancel cancels a context DERIVED from the caller's ctx: unlike
+	// the COPY pumps, the CDC pump's out-channel backpressure (send()) selects
+	// on the pump's own ctx, NOT on grpcCancel's streamCtx — so cancelling
+	// grpcCancel alone (which only unblocks a Recv) cannot free a pump parked
+	// on a full out channel. close() cancels BOTH: grpcCancel (Recv) and this
+	// (send + the top-of-loop ctx check). Guarded by mu; on a reshard reopen
+	// the previous pump has already exited (the orchestrator observed its
+	// terminal Err before calling reopenAfterReshard), so replacing these is
+	// safe. Both nil until the first StreamChanges.
+	cdcPumpDone   chan struct{}
+	cdcPumpCancel context.CancelFunc
+
 	// pumpStarted prevents StreamChanges from being called twice on
 	// the same SnapshotStream (the underlying gRPC stream has linear
 	// state — two concurrent pumps would race on r.fields and the
@@ -1653,7 +1668,7 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 		slog.Int("new_shards", len(newShards)))
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go s.pump(ctx, out)
+	s.launchCDCPump(ctx, out)
 	return out, nil
 }
 
@@ -2138,7 +2153,7 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go s.pump(ctx, out)
+	s.launchCDCPump(ctx, out)
 	return out, nil
 }
 
@@ -2657,18 +2672,58 @@ func (s *vstreamSnapshotStream) goPump(fn func()) {
 // stream or reconnect on the client after the conn is gone.
 //
 // Scope, stated so the name cannot be read as broader than the truth: this
-// joins the COPY-phase goroutines ONLY. The post-COPY CDC pump ([pump],
-// started by startPump/Reopen) is a SEPARATE lifecycle — it never runs
-// concurrently with the COPY pump (startPump joins copyDone first) and it
-// begins long after Open returns, so folding it into copyWG would risk an
-// Add-after-Wait race against a concurrent close(). Its own teardown races
-// are out of this fix's scope (the roster entry and the confirmed finding
-// are about the COPY pumps).
+// joins the COPY-phase goroutines ONLY. The post-COPY CDC pump ([pump]) is a
+// SEPARATE lifecycle — it never runs concurrently with the COPY pump
+// (startPump joins copyDone first) and begins long after Open returns, so
+// folding it into copyWG would risk an Add-after-Wait race against a
+// concurrent close(). It is joined SEPARATELY by [joinCDCPump] (audit-2026-08-19
+// pump-join roster closure), which close() calls after this.
 //
 // Must NOT be called while holding s.mu: the pumps take s.mu, so waiting
 // under it would deadlock a pump blocked on the lock.
 func (s *vstreamSnapshotStream) joinPumps() {
 	s.copyWG.Wait()
+}
+
+// launchCDCPump starts the single post-COPY CDC pump on a cancellable context
+// DERIVED from ctx, tracked (cdcPumpDone/cdcPumpCancel, under mu) so close()
+// can cancel and join it. Deriving from ctx keeps caller cancellation
+// propagating exactly as before while giving close() a handle that also
+// unblocks a pump parked on a full out channel (send() selects on the pump's
+// ctx). Called by startPump and reopenAfterReshard; on the reshard path the
+// previous pump has already exited, so replacing the handles orphans nothing.
+func (s *vstreamSnapshotStream) launchCDCPump(ctx context.Context, out chan ir.Change) {
+	pumpCtx, pumpCancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.cdcPumpDone = done
+	s.cdcPumpCancel = pumpCancel
+	s.mu.Unlock()
+	go func() {
+		defer close(done)
+		s.pump(pumpCtx, out)
+	}()
+}
+
+// joinCDCPump cancels the post-COPY CDC pump's derived context and waits for
+// it to exit — the pump-join roster's 4th implementor. A no-op before the
+// first StreamChanges and on a second call (cdcPumpDone is read once and left
+// in place; the pump's channel stays closed, so a repeat wait returns at
+// once), which keeps close() idempotent. close() has already cancelled
+// grpcCancel (unblocking a Recv-parked pump) before this runs; cancelling the
+// derived ctx here unblocks a send-parked or top-of-loop pump. Like joinPumps,
+// it must NOT be called while holding s.mu (the pump takes mu).
+func (s *vstreamSnapshotStream) joinCDCPump() {
+	s.mu.Lock()
+	done := s.cdcPumpDone
+	cancel := s.cdcPumpCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 // cancelCopyForShutdown trips the COPY pump's terminal state so a pump
@@ -2698,9 +2753,9 @@ func (s *vstreamSnapshotStream) cancelCopyForShutdown() {
 	s.broadcast()
 }
 
-// close cancels the gRPC stream, JOINS the COPY pumps, and closes the
-// connection. Wired into [ir.SnapshotStream.CloseFn]. Safe to call
-// multiple times.
+// close cancels the gRPC stream, JOINS the COPY pumps AND the post-COPY CDC
+// pump, and closes the connection. Wired into [ir.SnapshotStream.CloseFn].
+// Safe to call multiple times.
 //
 // The join (joinPumps) is the 2026-08-08 sibling-sweep fix, the COPY-phase
 // counterpart of vstreamCDCReader.Close's pump join. Cancelling the gRPC
@@ -2716,7 +2771,10 @@ func (s *vstreamSnapshotStream) cancelCopyForShutdown() {
 //     parked in enqueue-backpressure cond.Wait, which ctx-cancel can't see.
 //  3. joinPumps() waits for every COPY goroutine to exit. NOT under mu (the
 //     pumps take mu), so a pump blocked on mu can't deadlock the wait.
-//  4. only now is it safe to close s.conn.
+//  4. joinCDCPump() cancels the post-COPY CDC pump's derived ctx (freeing a
+//     send-parked pump that step 1's Recv-cancel cannot reach) and waits for
+//     it to exit. Also not under mu.
+//  5. only now is it safe to close s.conn.
 func (s *vstreamSnapshotStream) close() error {
 	// Read+clear grpcCancel under mu — the liveness watchdog
 	// (cancelGRPCStream) reads it under the same lock, so an unguarded
@@ -2730,6 +2788,7 @@ func (s *vstreamSnapshotStream) close() error {
 	}
 	s.cancelCopyForShutdown()
 	s.joinPumps()
+	s.joinCDCPump()
 	if s.conn != nil {
 		err := s.conn.Close()
 		s.conn = nil
