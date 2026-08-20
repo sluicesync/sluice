@@ -19,6 +19,18 @@ import (
 // shared-copy-phase parity: a refusal that fires before any data moves on one
 // must fire before any data moves on the other).
 //
+// DELIBERATELY NOT run by `backup full` (operator decision, 2026-08-20). Backup
+// CAPTURE is already protected: it reads the source through the same
+// OpenRowReader these entry points use, so the per-read-path decode guard
+// (checkTinyBoolRange) refuses an out-of-range value at the offending row and no
+// collapsed value ever enters a backup. Adding this fail-fast probe to backup
+// would make a REGULARLY-run backup pay the per-table scan cost on every run for
+// a fail-fast benefit the decode floor already delivers correctness-wise — a bad
+// trade for the one entry point that is meant to run on a schedule. So backup is
+// an intentional exception to the migrate/sync parity here, not an oversight;
+// revisit only if a user reports the late (rather than upfront) refusal on a
+// large backup is a real problem.
+//
 // It is a fail-FAST LAYER, not the guarantee: the per-read-path decode-time
 // refusal is the correctness floor. Accordingly this is deliberately forgiving
 // of everything except a confirmed out-of-range value:
