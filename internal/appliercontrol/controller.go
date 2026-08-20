@@ -329,11 +329,13 @@ func (c *Controller) ObserveBatch(ctx context.Context, latency time.Duration, ro
 	// down). The OnShrink hook then persists the smaller size across
 	// the ADR-0038 streamer-level retry so the next attempt re-applies
 	// at the shrunk size and converges, instead of dying at the
-	// ceiling. The tx-killer timestamp still feeds the retry-rate
-	// accumulator below so a slow trickle of mixed transients is
-	// accounted, but the immediate MD here is what makes convergence
-	// happen. Checked BEFORE the generic accumulator so the first
-	// tx-killer abort shrinks without waiting for a fourth.
+	// ceiling. This path RETURNS after the shrink — it does NOT fall through
+	// to the retry-rate accumulator below (an earlier comment claimed the
+	// tx-killer timestamp "still feeds the accumulator"; the return makes that
+	// false, and it never mattered because a tx-killer abort is fatal to the
+	// runOnce attempt, so such aborts never accumulate before the run dies).
+	// Checked BEFORE the generic accumulator so the first tx-killer abort
+	// shrinks without waiting for a fourth.
 	if err != nil && isTxKilledError(err) {
 		c.multiplicativeDecreaseLocked(ctx, "transaction-killer", prevSize)
 		return

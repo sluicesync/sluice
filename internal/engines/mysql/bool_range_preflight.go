@@ -22,6 +22,15 @@ import (
 // the decode-time guard remains the correctness floor when it does. 2 s lets a
 // moderately large clean table finish and confirm itself clean while flatly
 // capping the pathological case.
+//
+// INERT on MariaDB and MySQL < 5.7.7: the optimizer-hint form
+// `/*+ MAX_EXECUTION_TIME(N) */` is a no-op there (MariaDB spells the bound as
+// the `max_statement_time` session var / `MAX_STATEMENT_TIME=N` clause, in
+// SECONDS, not the hint), so on those servers a clean, unindexed TINYINT(1)
+// column on a huge table full-scans UNBOUNDED at preflight. Perf/wait only —
+// the per-read-path decode guard is the correctness floor regardless — so it is
+// left as a documented gap rather than special-cased; a misused column is still
+// found in milliseconds. (audit-2026-08-19 LOW.)
 const boolRangePreflightBudgetMS = 2000
 
 // PreflightBoolRanges implements [ir.BoolRangePreflighter]. Before any data
