@@ -158,15 +158,22 @@ type CLI struct {
 	// supplied via kong.Vars{"version": ...} in main().
 	Version kong.VersionFlag `help:"Print version and exit." short:"V"`
 
-	Engines  EnginesCmd  `cmd:"" help:"List registered database engines."`
-	Migrate  MigrateCmd  `cmd:"" help:"Run a one-time schema + data migration (simple mode)."`
-	Sync     SyncCmd     `cmd:"" help:"Manage continuous-sync streams."`
-	Slot     SlotCmd     `cmd:"" help:"Manage source-side replication slots (Postgres)."`
-	Schema   SchemaCmd   `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
-	Verify   VerifyCmd   `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
-	Backup   BackupCmd   `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
-	Restore  RestoreCmd  `cmd:"" help:"Restore a logical backup into a target database."`
-	Backfill BackfillCmd `cmd:"" help:"Backfill/transform a column in place — same-database, keyset-chunked, resumable, online-safe UPDATE (the expand-contract 'migrate' step; ADR-0159)."`
+	// --skill prints an installable agent skill file (the embedded AGENTS.md
+	// with YAML frontmatter) and exits, so an agent can cold-start on how to
+	// drive sluice without the repo or the docs site. `sluice agent-guide`
+	// prints the bare guide; `agent-guide --skill` matches this flag.
+	Skill skillFlag `help:"Print an installable agent skill file (YAML frontmatter + the AGENTS.md agent guide) and exit — drop it into a skills directory for trigger-based loading."`
+
+	Engines    EnginesCmd    `cmd:"" help:"List registered database engines."`
+	AgentGuide AgentGuideCmd `cmd:"" name:"agent-guide" help:"Print sluice's AI-agent operating guide (AGENTS.md); --skill emits it as an installable skill file."`
+	Migrate    MigrateCmd    `cmd:"" help:"Run a one-time schema + data migration (simple mode)."`
+	Sync       SyncCmd       `cmd:"" help:"Manage continuous-sync streams."`
+	Slot       SlotCmd       `cmd:"" help:"Manage source-side replication slots (Postgres)."`
+	Schema     SchemaCmd     `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
+	Verify     VerifyCmd     `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
+	Backup     BackupCmd     `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
+	Restore    RestoreCmd    `cmd:"" help:"Restore a logical backup into a target database."`
+	Backfill   BackfillCmd   `cmd:"" help:"Backfill/transform a column in place — same-database, keyset-chunked, resumable, online-safe UPDATE (the expand-contract 'migrate' step; ADR-0159)."`
 
 	ExpandContract ExpandContractCmd `cmd:"" name:"expand-contract" help:"Drive the full expand→migrate→contract pattern on a PlanetScale database: deploy-request the ADD COLUMN, run the backfill, verify, and (with --yes) deploy-request the DROP COLUMN (ADR-0162)."`
 	DeployDDL      DeployDDLCmd      `cmd:"" name:"deploy-ddl" help:"Ship ONE verbatim DDL statement to a PlanetScale production branch safely: dev branch (stale-base freshness gate), apply, deploy request, deploy, finalize, cleanup (ADR-0165)."`

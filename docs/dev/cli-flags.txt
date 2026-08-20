@@ -15,6 +15,7 @@
 --mysql-sql-mode
 --no-progress
 --pprof-listen
+--skill
 --sqlite-date-encoding
 --stage-dir
 --version
