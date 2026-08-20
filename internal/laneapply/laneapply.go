@@ -317,6 +317,17 @@ type Config struct {
 	// so a quiet lane still drains within the grace. 0 falls back to
 	// defaultIdleFlushPeriod.
 	IdleFlushPeriod time.Duration
+
+	// LookAheadCap bounds how far the coordinator may run AHEAD of the durable
+	// frontier: the router blocks before dispatching a change whose sequence is
+	// more than LookAheadCap past the frontier. This caps Frontier.pending +
+	// txBoundaries under the stalled-lane pathology (a hot table pinned to one
+	// lane via RouteScopeTable stalls while other lanes keep committing —
+	// per-lane channel backpressure does NOT bound the global pending set there).
+	// 0 falls back to defaultFrontierLookAheadCap; it is a safety bound, not a
+	// tuning knob — the default has ample headroom so a healthy stream never
+	// blocks here (a small value is for tests).
+	LookAheadCap int
 }
 
 // defaultMaxBufferBytes is the fallback soft per-batch byte cap when the
@@ -330,6 +341,14 @@ const defaultMaxBufferBytes int64 = 64 << 20 // 64 MiB
 // leaves IdleFlushPeriod zero. Matches appliershared.DefaultIdleFlushPeriod;
 // engines pass their own value through Config.
 const defaultIdleFlushPeriod = 100 * time.Millisecond
+
+// defaultFrontierLookAheadCap bounds how far the coordinator runs ahead of the
+// durable frontier (see [Config.LookAheadCap]). ~1M in-flight sequences: a
+// healthy stream keeps the frontier within lanes×buffer of the router, far
+// under this, so it never throttles legitimate throughput — it only bites the
+// stalled-lane pathology, converting an UNBOUNDED pending set (10M+ entries,
+// hundreds of MB–GB over a long storm) into a bounded one (~tens of MB).
+const defaultFrontierLookAheadCap = 1 << 20 // 1,048,576
 
 // Orchestrator is the ADR-0104/ADR-0105 key-hash concurrent apply
 // coordinator. The single coordinator goroutine (the one running [Run])
@@ -347,6 +366,7 @@ type Orchestrator struct {
 	lanes        int
 	byteCap      int64
 	idlePeriod   time.Duration
+	lookAheadCap uint64 // coordinator-side frontier look-ahead bound (Config.LookAheadCap)
 
 	router   *Router
 	frontier *Frontier
@@ -459,12 +479,17 @@ func NewOrchestrator(cfg Config, la LaneApplier) *Orchestrator {
 	if idlePeriod <= 0 {
 		idlePeriod = defaultIdleFlushPeriod
 	}
+	lookAheadCap := cfg.LookAheadCap
+	if lookAheadCap <= 0 {
+		lookAheadCap = defaultFrontierLookAheadCap
+	}
 	o := &Orchestrator{
 		la:              la,
 		maxBatchSize:    maxBatchSize,
 		lanes:           lanes,
 		byteCap:         byteCap,
 		idlePeriod:      idlePeriod,
+		lookAheadCap:    uint64(lookAheadCap),
 		router:          NewRouter(lanes),
 		frontier:        NewFrontier(),
 		laneIn:          make([]chan LaneChange, lanes),
@@ -774,6 +799,20 @@ func (o *Orchestrator) flushPendingBoundary() {
 // [RouteScope] decides whether the hash covers the row or the whole table
 // (item 131) — resolved in exactly one place, [Router.LaneForRoute].
 func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) error {
+	// Look-ahead cap (audit-2026-08-19): block before running more than
+	// lookAheadCap ahead of the durable frontier, so Frontier.pending +
+	// txBoundaries stay bounded when one lane stalls while others commit ahead
+	// (per-lane channel backpressure alone does not bound the global pending
+	// set — the RouteScopeTable hot-table-pinned-to-one-lane pathology). No
+	// deadlock: the frontier advances from the LOWER-seq changes already routed
+	// into the lanes, independent of this wait; a permanently-stuck lane wedges
+	// the apply regardless. The barrier path's full drain (WaitForFrontier
+	// seq-1) is a stricter special case of the same wait.
+	if seq > o.lookAheadCap {
+		if err := o.frontier.WaitForFrontier(ctx, seq-o.lookAheadCap); err != nil {
+			return err
+		}
+	}
 	route, ok, err := o.la.RouteForChange(ctx, c)
 	if err != nil {
 		return err

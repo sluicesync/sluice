@@ -17,8 +17,16 @@ import (
 // each change is routed to exactly one lane and a lane commits its changes
 // in increasing sequence order, "all ≤ S committed" is exactly the
 // out-of-order-completion → contiguous-prefix problem, solved here with a
-// pending-set + advancing watermark (memory bounded by the in-flight
-// window, since lane backpressure prevents unbounded look-ahead).
+// pending-set + advancing watermark.
+//
+// The pending-set size is bounded by the COORDINATOR's look-ahead cap
+// ([Config.LookAheadCap], enforced in [Orchestrator.routeRow]), NOT by lane
+// backpressure alone: per-lane channel backpressure only throttles the ONE
+// stalled lane, so a hot table pinned to a single lane (RouteScopeTable) that
+// stalls while other lanes keep committing would otherwise grow `pending` +
+// `txBoundaries` at stream-rate × stall-duration without bound. The cap makes
+// the router wait for the frontier to advance before running more than
+// LookAheadCap ahead, so `pending` holds at most LookAheadCap entries.
 //
 // Separately it records source-transaction boundary positions (the position
 // captured at each TxCommit). CheckpointPosition returns the position of the
