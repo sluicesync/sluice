@@ -838,14 +838,25 @@ jobs:
           # @v7) defaulted goinstall to the v1 module path, which
           # silently installed v1.64.8 even when "version: latest" was
           # set; @v8+ uses the v2 module path correctly.
-          version: latest
+          # PINNED, not `latest`. golangci-lint v2.13.0 (published
+          # 2026-08-19T23:29Z) hangs in the package-LOAD phase on this
+          # repo — it ignores `--timeout=5m` (which bounds only the lint
+          # phase, not loading) and runs until the job's 25m ceiling
+          # force-cancels it, so the Lint check never reports. v2.12.2 is
+          # the last known-good release (verified: 57s, 0 issues,
+          # full-repo). Floating `latest` let a bad upstream release
+          # silently break CI, the same non-determinism the SHA-pinned
+          # actions elsewhere avoid — so pin here too and bump
+          # deliberately once a fixed release is verified.
+          version: v2.12.2
           # install-mode: goinstall compiles golangci-lint from source
           # using the Go toolchain we just installed, so the linter's
           # embedded type-checker matches the Go version declared in
-          # go.mod. Prebuilt v2 binaries lag the latest Go release;
-          # without this, packages that require Go 1.26 features (like
-          # the stdlib's chacha20poly1305 fips140only_go1.26.go file)
-          # fail to typecheck during lint.
+          # go.mod (the pinned version is still built with CI's Go).
+          # Prebuilt v2 binaries lag the latest Go release; without this,
+          # packages that require Go 1.26 features (like the stdlib's
+          # chacha20poly1305 fips140only_go1.26.go file) fail to
+          # typecheck during lint.
           install-mode: goinstall
           # Fail the job on any issue. Combined with branch protection
           # this means you can't merge until lint is clean.
