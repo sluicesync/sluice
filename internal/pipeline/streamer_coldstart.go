@@ -183,6 +183,26 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// PlanetScale foreign-key preflight — the sync cold-start half of the same
+	// copy-phase parity (migrate runs it at migrate.go's pre-copy block). The
+	// cold-start creates FK constraints AFTER the copy (the CreateConstraints
+	// phase below), so a confirmable FK-support-disabled PlanetScale target would
+	// burn the WHOLE cold-start copy and wall at constraints — the exact v0.129.0
+	// `sync start`-into-a-fresh-PlanetScale-DB ordeal. Refuse HERE, before the
+	// snapshot stream opens (no slot to abandon), keyed only off existing state
+	// (planetscale target + the source's FK count + --skip-foreign-keys + the
+	// injected checker). The returned status feeds the plan report below; a
+	// confirmable-disabled target returns the coded refusal instead.
+	fkStatus, err := migcore.PreflightPlanetScaleForeignKeys(ctx, migcore.PlanetScaleFKPreflightInput{
+		TargetIsPlanetScale: s.Target.Name() == enginePlanetScale,
+		SkipForeignKeys:     s.SkipForeignKeys,
+		ForeignKeyCount:     migcore.CountForeignKeys(schema),
+		Checker:             s.FKEnablementChecker,
+	})
+	if err != nil {
+		return nil, stop, err
+	}
+
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from
 	// the beginning otherwise.
@@ -281,6 +301,14 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if revertQueryTimeout != nil {
 		defer revertQueryTimeout()
 	}
+
+	// Migration plan / gotcha report — the sync cold-start half of Feature 2.
+	// A concise, once-emitted summary printed BEFORE the copy so the operator
+	// sees the plan and the PlanetScale gotchas at a glance (silent on a small,
+	// un-noteworthy run — see migcore.LogMigrationPlanSummary). Fired here, after
+	// the snapshot stream is open (so its reader is available for the
+	// largest-table estimate, matching migrate) but before any row moves.
+	s.logColdStartPlanSummary(ctx, stream.Rows, schema, fkStatus)
 
 	// Bulk-copy: the ADR-0079 FAST parallel path when eligible, the
 	// serial path otherwise. Releases the writers and the snapshot

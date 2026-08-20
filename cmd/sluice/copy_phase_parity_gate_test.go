@@ -297,6 +297,11 @@ var sharedPhaseFields = map[string][]string{
 		"UpfrontIndexes",
 		"AnalyzeAfter",
 		"RaiseQueryTimeout",
+		// The PlanetScale FK PREFLIGHT (not a flag — a control-plane probe): it
+		// guards the shared post-copy CreateConstraints phase, so both entry
+		// points must run it or the one that skips it burns the whole copy then
+		// walls at constraints (audit-2026-08-19 HIGH; the v0.129.0 field report).
+		"FKEnablementChecker",
 	},
 	"Streamer": {
 		"IndexBuildFallback",
@@ -307,6 +312,7 @@ var sharedPhaseFields = map[string][]string{
 		"UpfrontIndexes",
 		"AnalyzeAfter",
 		"RaiseQueryTimeout",
+		"FKEnablementChecker",
 		// Not a copy-phase field, but the one whose single-site assignment
 		// was the v0.99.51 trap this gate was built to catch. It governs the
 		// DDL posture of a shared phase, which is the same contract.

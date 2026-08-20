@@ -2290,6 +2290,10 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	}
 	streamer.RaiseQueryTimeout = s.PlanetScaleRaiseQueryTimeout
 	streamer.QueryTimeoutController = queryTimeoutController
+	// PlanetScale FK preflight probe (the sync cold-start half of copy-phase
+	// parity); nil (no token) ⇒ the pipeline's WARN path. Mirrors migrate's
+	// mig.FKEnablementChecker assignment.
+	streamer.FKEnablementChecker = s.planetScaleForeignKeyChecker()
 	// ADR-0056 auto-on-crash hook (opt-in). When
 	// --diagnose-on-crash-dir is set, the hook writes a bundle to the
 	// directory if Run returns an error. The hook NEVER masks the

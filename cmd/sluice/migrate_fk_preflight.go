@@ -62,3 +62,19 @@ func (m *MigrateCmd) planetScaleForeignKeyChecker() ir.PlanetScaleForeignKeyChec
 		token:        m.PlanetScaleServiceToken,
 	})
 }
+
+// planetScaleForeignKeyChecker composes the `sync start` FK-preflight probe from
+// the SAME shared PlanetScale flags its index fallback uses — the sync
+// cold-start half of the copy-phase parity (the constraints phase it guards is
+// shared). Never an error; nil (unresolved credentials) is the WARN path.
+func (s *SyncStartCmd) planetScaleForeignKeyChecker() ir.PlanetScaleForeignKeyChecker {
+	return composePlanetScaleForeignKeyChecker(indexFallbackParams{
+		targetDriver: s.TargetDriver,
+		targetDSN:    s.Target,
+		org:          s.PlanetScaleOrg,
+		database:     s.PlanetScaleDatabase,
+		branch:       s.PlanetScaleBranch,
+		tokenID:      s.PlanetScaleServiceTokenID,
+		token:        s.PlanetScaleServiceToken,
+	})
+}

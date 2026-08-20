@@ -65,3 +65,58 @@ func TestForeignKeyChecker_ComposeMatrix(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncForeignKeyChecker_ComposeMatrix is the sync cold-start half of the
+// copy-phase parity: the SAME composition, pinned through BOTH sync
+// construction paths — `sync start` (SyncStartCmd.planetScaleForeignKeyChecker)
+// and the fleet SyncSpec (SyncSpec.resolveForeignKeyChecker). A gap here is the
+// v0.129.0 field report: `sync start` into a fresh FK-disabled PlanetScale DB
+// burns the whole cold-start copy then walls at constraints. Same Bug-180
+// through-the-CLI-plumbing discipline as the migrate matrix above.
+func TestSyncForeignKeyChecker_ComposeMatrix(t *testing.T) {
+	cases := []struct {
+		name     string
+		driver   string
+		org      string
+		tokenID  string
+		token    string
+		db       string
+		wantChkr bool
+		wantDB   string
+	}{
+		{"fully credentialled derives database from target DSN", "planetscale", "acme", "tokid", "toksecret", "", true, "shopdb"},
+		{"explicit database wins over the DSN", "planetscale", "acme", "tokid", "toksecret", "other", true, "other"},
+		{"non-planetscale target composes nothing", "mysql", "acme", "tokid", "toksecret", "", false, ""},
+		{"no org composes nothing", "planetscale", "", "tokid", "toksecret", "", false, ""},
+		{"missing token secret composes nothing (WARN path)", "planetscale", "acme", "tokid", "", "", false, ""},
+	}
+	const targetDSN = "user:pw@tcp(host.psdb.cloud:3306)/shopdb?tls=true"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := &SyncStartCmd{
+				TargetDriver: tc.driver, Target: targetDSN, PlanetScaleOrg: tc.org,
+				PlanetScaleBranch: "main", PlanetScaleDatabase: tc.db,
+				PlanetScaleServiceTokenID: tc.tokenID, PlanetScaleServiceToken: tc.token,
+			}
+			spec := &SyncSpec{
+				TargetDriver: tc.driver, Target: targetDSN, PlanetScaleOrg: tc.org,
+				PlanetScaleBranch: "main", PlanetScaleDatabase: tc.db,
+				PlanetScaleServiceTokenID: tc.tokenID, PlanetScaleServiceToken: tc.token,
+			}
+			for who, chkr := range map[string]any{
+				"sync start": start.planetScaleForeignKeyChecker(),
+				"fleet spec": spec.resolveForeignKeyChecker(),
+			} {
+				c, ok := chkr.(*fkcheck.Checker)
+				switch {
+				case !tc.wantChkr && ok:
+					t.Errorf("%s: checker = %#v; want nil", who, c)
+				case tc.wantChkr && !ok:
+					t.Errorf("%s: checker = %T; want *fkcheck.Checker", who, chkr)
+				case tc.wantChkr && ok && (c.Org != "acme" || c.Database != tc.wantDB):
+					t.Errorf("%s: checker org/db = %s/%s; want acme/%s", who, c.Org, c.Database, tc.wantDB)
+				}
+			}
+		})
+	}
+}

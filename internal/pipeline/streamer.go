@@ -717,6 +717,21 @@ type Streamer struct {
 	// resolve) disables both.
 	QueryTimeoutController ir.QueryTimeoutController
 
+	// FKEnablementChecker mirrors [Migrator.FKEnablementChecker]: the optional
+	// PlanetScale control-plane probe the cold-start FK preflight
+	// ([migcore.PreflightPlanetScaleForeignKeys]) consults to REFUSE up front on
+	// a confirmable FK-support-disabled target — instead of burning the whole
+	// cold-start copy and walling at the constraints phase (the v0.129.0 field
+	// report, which hit `sync start` into a fresh PlanetScale DB). The
+	// constraints phase is shared by migrate and sync cold-start, so the
+	// preflight that guards it is too (copy-phase parity —
+	// TestSharedPhaseFieldAssignmentParity holds both construction sites to
+	// assigning this). Composed by the CLI (which knows the target is PlanetScale
+	// and holds the credentials); nil (no service token, and every programmatic /
+	// fleet caller whose credentials don't resolve) downgrades the preflight to
+	// the WARN-it-cannot-confirm path, never a refusal.
+	FKEnablementChecker ir.PlanetScaleForeignKeyChecker
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a

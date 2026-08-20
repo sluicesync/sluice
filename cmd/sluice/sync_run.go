@@ -605,6 +605,25 @@ func (s *SyncSpec) resolveIndexFallback() ir.IndexBuildFallback {
 	})
 }
 
+// resolveForeignKeyChecker composes the fleet sync's PlanetScale FK-preflight
+// probe from the same shared flags (service-token pair resolved env-first),
+// mirroring [SyncSpec.resolveIndexFallback]. nil = the WARN path (no confirmable
+// refusal), the byte-identical default for every non-armed sync. Wired into the
+// built Streamer so the fleet path runs the same pre-copy FK refusal as
+// `sync start` and `migrate` (copy-phase parity).
+func (s *SyncSpec) resolveForeignKeyChecker() ir.PlanetScaleForeignKeyChecker {
+	tokenID, token := s.resolveServiceToken()
+	return composePlanetScaleForeignKeyChecker(indexFallbackParams{
+		targetDriver: s.TargetDriver,
+		targetDSN:    s.Target,
+		org:          s.PlanetScaleOrg,
+		database:     s.PlanetScaleDatabase,
+		branch:       s.PlanetScaleBranch,
+		tokenID:      tokenID,
+		token:        token,
+	})
+}
+
 // isFallbackOnlyArming reports whether planetscale-org on this sync expresses
 // ADR-0148 index-fallback intent rather than ADR-0126 telemetry intent — the
 // fleet mirror of [telemetryParamsSharedOrg]'s keying (audit MED-A1 gap #12):
@@ -986,6 +1005,16 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		// planetscale target + org + the service-token pair (env-first) — the
 		// byte-identical default for every non-armed sync.
 		IndexBuildFallback: spec.resolveIndexFallback(),
+
+		// The PlanetScale FK preflight (the sync cold-start half of copy-phase
+		// parity): the same pre-copy confirmable refusal migrate + `sync start`
+		// run, so the fleet path also refuses a fresh FK-support-disabled
+		// PlanetScale target BEFORE burning the cold-start copy. nil = WARN path.
+		// The PlanetScale FK preflight (the sync cold-start half of copy-phase
+		// parity): the same pre-copy confirmable refusal migrate + `sync start`
+		// run, so the fleet path also refuses a fresh FK-support-disabled
+		// PlanetScale target BEFORE burning the cold-start copy. nil = WARN path.
+		FKEnablementChecker: spec.resolveForeignKeyChecker(),
 
 		InjectShardColumn:    shardSpec,
 		AllowCrossShardMerge: spec.AllowCrossShardMerge,

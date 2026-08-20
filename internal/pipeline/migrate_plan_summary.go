@@ -13,8 +13,9 @@ import (
 
 // logMigrationPlanSummary gathers the primitives the plan/gotcha report needs
 // and hands them to [migcore.LogMigrationPlanSummary]. The presentation +
-// gating live in migcore (shared with the sync cold-start, should it adopt the
-// report); this method is only the gather, using the already-open source reader
+// gating live in migcore, shared with the sync cold-start (which adopts the
+// report via [Streamer.logColdStartPlanSummary]); this method is only the
+// gather, using the already-open source reader
 // for the largest-table estimate so no extra probe pass is added to a run that
 // would not otherwise estimate. fkStatus is the verdict the earlier FK preflight
 // returned.
@@ -32,6 +33,32 @@ func (m *Migrator) logMigrationPlanSummary(ctx context.Context, rr ir.RowReader,
 		LargestTableKnown:   known,
 		UpfrontIndexes:      m.UpfrontIndexes,
 		RaiseQueryTimeout:   m.RaiseQueryTimeout,
+	})
+}
+
+// logColdStartPlanSummary is the sync cold-start counterpart of
+// [Migrator.logMigrationPlanSummary] — the same gather + hand-off to the shared
+// [migcore.LogMigrationPlanSummary], reading the Streamer's own flags. The
+// Command noun is "sync cold-start" so the report reads naturally on this entry
+// point; fkStatus is the verdict the cold-start FK preflight returned. The
+// reader is the just-opened snapshot stream: it does not implement
+// [ir.RowCountEstimator] today (a pinned snapshot / VStream tail yields no
+// estimate), so LargestTableKnown degrades to false and the report is
+// counts-only — the PlanetScale FK/gotcha lines still fire, which is the value.
+func (s *Streamer) logColdStartPlanSummary(ctx context.Context, rr ir.RowReader, schema *ir.Schema, fkStatus migcore.PlanetScaleFKStatus) {
+	largestTable, largestRows, known := largestEstimatedTable(ctx, rr, schema)
+	migcore.LogMigrationPlanSummary(ctx, migcore.MigrationPlanSummary{
+		Command:             "sync cold-start",
+		TargetEngine:        s.Target.Name(),
+		TargetIsPlanetScale: s.Target.Name() == enginePlanetScale,
+		TableCount:          len(schema.Tables),
+		ForeignKeyCount:     migcore.CountForeignKeys(schema),
+		FKStatus:            fkStatus,
+		LargestTable:        largestTable,
+		LargestTableRows:    largestRows,
+		LargestTableKnown:   known,
+		UpfrontIndexes:      s.UpfrontIndexes,
+		RaiseQueryTimeout:   s.RaiseQueryTimeout,
 	})
 }
 
