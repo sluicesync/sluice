@@ -64,7 +64,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -412,12 +411,14 @@ func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
 		return classifyApplierError(execErr)
 	}
 
-	// Commit under the same per-exec watchdog the serial path uses (Bug 56
-	// / v0.52.1): a half-closed destination connection can otherwise stall
-	// the apply goroutine inside the commit's TLS write.
-	commitErr := appliershared.RunWithDeadline(a.execTimeout, func() error {
-		return b.tx.Commit(b.ctx)
-	})
+	// Commit under the per-exec deadline (Bug 56 / v0.52.1: a half-closed
+	// destination stalls the commit's TLS write). Same ctx-deadline mechanism
+	// as sendBatchUnderDeadline — pgx cancels + closes the conn on timeout,
+	// leaving no orphan to race the deferred release below (audit-2026-08-19
+	// Option B).
+	ctx, cancel := a.execTimeoutCtx(b.ctx)
+	commitErr := b.tx.Commit(ctx)
+	cancel()
 	if commitErr != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", commitErr))
 	}
@@ -432,27 +433,36 @@ func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
 // per-statement error wins, is attributed to its queued change, and is
 // returned.
 func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
-	return appliershared.RunWithDeadline(a.execTimeout, func() error {
-		br := b.tx.SendBatch(b.ctx, b.batch)
-		// br.Exec must be called once per queued statement to drain the
-		// pipeline; the server executed them in queue order.
-		var firstErr error
-		for i := range b.stmts {
-			_, execErr := br.Exec()
-			if execErr != nil && firstErr == nil {
-				// No missing-table absorption here: the C-11 skip resolves
-				// at queue-build time in dispatchPipelined (a failed
-				// statement leaves the pipelined tx aborted, so absorbing
-				// it would only convert the position write behind it into
-				// a 25P02). Every exec error is loud.
-				firstErr = a.attributeQueuedError(b.stmts[i], execErr)
-			}
+	// Bound the flush by the CONTEXT the pgx op already accepts, not by
+	// RunWithDeadline's timer+orphan (audit-2026-08-19 Option B). SendBatch and
+	// its br.Exec() result drain both ride this ctx, so a per-exec timeout
+	// cancels the in-flight op and lets pgx's ctx-watcher close the underlying
+	// conn — no orphaned goroutine is left racing the caller's Rollback/release
+	// on the raw *pgx.Conn (the serial path can't do this because
+	// *sql.Tx.Commit takes no ctx; this pipelined path is the twin of the
+	// serial txExec's ExecContext(ctx)). classifyApplierError already maps the
+	// resulting context.DeadlineExceeded to retriable.
+	ctx, cancel := a.execTimeoutCtx(b.ctx)
+	defer cancel()
+	br := b.tx.SendBatch(ctx, b.batch)
+	// br.Exec must be called once per queued statement to drain the
+	// pipeline; the server executed them in queue order.
+	var firstErr error
+	for i := range b.stmts {
+		_, execErr := br.Exec()
+		if execErr != nil && firstErr == nil {
+			// No missing-table absorption here: the C-11 skip resolves
+			// at queue-build time in dispatchPipelined (a failed
+			// statement leaves the pipelined tx aborted, so absorbing
+			// it would only convert the position write behind it into
+			// a 25P02). Every exec error is loud.
+			firstErr = a.attributeQueuedError(b.stmts[i], execErr)
 		}
-		if closeErr := br.Close(); closeErr != nil && firstErr == nil {
-			firstErr = fmt.Errorf("postgres: applier: pipelined batch close: %w", closeErr)
-		}
-		return firstErr
-	})
+	}
+	if closeErr := br.Close(); closeErr != nil && firstErr == nil {
+		firstErr = fmt.Errorf("postgres: applier: pipelined batch close: %w", closeErr)
+	}
+	return firstErr
 }
 
 // attributeQueuedError wraps a per-statement execution error with the same
