@@ -160,6 +160,17 @@ linters:
         linters:
           - funlen
           - gocyclo
+      # SA5011 (possible nil dereference) in TEST files: staticcheck does not
+      # model t.Fatal as terminating, so the standard `if x == nil { t.Fatal }`
+      # guard-then-dereference pattern looks reachable and false-positives. The
+      # failure is intermittent + toolchain-version-dependent (planetscale/cli
+      # #1363 hit it on some golangci builds and not others; sluice is clean on
+      # the pinned v2.12.2 today), so this is a PREVENTIVE exclusion scoped to
+      # SA5011-in-tests only — the check stays fully live in non-test code.
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: "SA5011"
 
 formatters:
   # gofumpt + goimports were linters in v1; v2 separates formatters
