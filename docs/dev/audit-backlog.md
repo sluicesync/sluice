@@ -35,6 +35,10 @@ Grade A−; 18/20 prior Tier-3 items fixed, 0 regressed, KMS charter closed. Thr
 
 - **SDL-2 (WATCH, carried) —** `cdc_table_map_guard.go` table-map ENUM-reorder/rename window; needs `binlog_row_metadata=FULL`. No delta regression; unchanged from prior audits.
 
+### PREM-VSTREAM-AUTOINC (WATCH) — the VStream flag-512 forwarding premise is now a VALUE-path premise, unverified (v0.130.1 value-fidelity follow-up)
+
+`internal/engines/mysql/field_to_ir.go` — the HIGH #1 fix keeps an auto-increment `tinyint(1)` an integer on the VStream path by reading MySQL's `AUTO_INCREMENT_FLAG` (bit 512) off `query.Field.Flags`. That Vitess forwards flag 512 on the VStream wire is asserted in a comment, not ground-truthed — `field_to_ir_test.go` sets the flag synthetically, and the self-consistent gate `TestVStreamTinyint1BoolMatchesSchema` cannot catch a missing wire flag (both sides read the same `field`). The value-fidelity review of the v0.130.1 delta flagged that this delta newly makes the *value decode* depend on the premise (before, only schema mapping did). **SOFT, not silent-loss:** if the flag were absent, an auto-inc `tinyint(1)` ≥2 would decode to bool on both paths and the decode-time guard would REFUSE it loudly (`SLUICE-E-VALUE-TINYINT1-RANGE`) — a false-refuse, never a silent collapse. Marked **UNVERIFIED PREMISE** at the code site. **Fix shape (S):** one real-cluster/vttestserver pin carrying an auto-increment `tinyint(1)` PK through the live VStream lane and asserting it arrives as an integer (not refused, not collapsed) — the only check that grounds the auto-inc arm against reality rather than against itself.
+
 ## Open — 2026-08-17 Tier-3 audit (Fable, v0.112.0..v0.127.1)
 
 ### Next light-area promotion (Tier-3 §0) — KMS provider adapters against a real KMS
