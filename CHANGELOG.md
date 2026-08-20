@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.131.0] - 2026-08-20
+
+A small feature release. sluice can now hand an AI agent its own operating guide as an installable skill file, so an agent can cold-start on how to drive sluice without the repo or the docs site. Plus a CI-hygiene guard and a documented design decision. Drop-in from v0.130.2 — no schema, format, or existing-flag change.
+
+### Added
+
+**`sluice --skill` and `sluice agent-guide` — the built-in agent guide, as an installable skill file.** sluice ships an operator-facing `AGENTS.md` — the command taxonomy (read-only vs state-changing vs production-mutating vs destructive), the standard migrate/sync/verify workflow, and the flags that require explicit human approval. It is now embedded in the binary and printable two ways: `sluice agent-guide` prints the bare guide, and `sluice --skill` (a global flag) prints it as an **installable agent skill file** — YAML frontmatter (name + description, for trigger-based loading) followed by the full guide. Write that into a skills directory and a skill-aware assistant (Claude Code, Cursor, or anything following the open agent-skills convention) can drive the `sluice` CLI without needing the repository or the docs site. `sluice agent-guide --skill` is identical to `sluice --skill`. The output is a raw dump, deliberately not routed through any `--format` envelope, so it is always the file itself. The embedded copy is byte-identical to the repo's `AGENTS.md`, held to it by a build-time gate.
+
+### Fixed
+
+**CI hygiene: staticcheck's SA5011 no longer risks an intermittent false failure in test files.** staticcheck does not model `t.Fatal` as terminating, so the standard `if x == nil { t.Fatal(...) }` guard-then-dereference pattern that fills the test suite can look like a possible nil dereference — an intermittent, golangci-version-dependent lint failure other Go projects have hit. This is a preventive exclusion scoped to SA5011 in `_test.go` files only; the check stays fully live in non-test code. (sluice was clean on the pinned golangci-lint v2.12.2; this guards against a future toolchain bump reintroducing it, the same class of surprise the version pin already guards.)
+
+### Compatibility
+
+Drop-in from v0.130.2 — no schema, format, or error-code change, and no change to any existing flag or command. The new `agent-guide` command and `--skill` flag are purely additive and opt-in; a migrate or sync that worked before is byte-identical after. Internally, the backup path's deliberate exemption from the TINYINT(1) fail-fast preflight is now recorded at the code site (backup capture is still fully guarded by the per-read-path decode floor; the exemption avoids charging a scheduled/regularly-run backup the per-table probe cost on every run).
+
 ## [0.130.2] - 2026-08-20
 
 An audit-hardening patch. A fresh independent audit of the v0.130.x line found three internal concurrency / resource-lifecycle weaknesses and a handful of smaller ones. None is a data-loss or a user-hit failure — they are robustness fixes for teardown, memory bounds, and connection lifecycle that the audit surfaced before anyone ran into them. No new flags, no format change; a migrate or sync that worked on v0.130.1 still works, byte-for-byte (the value paths are untouched).
