@@ -616,6 +616,23 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// (audit B-9 / errKeylessAmbiguousReplay), which is what keeps
 				// this arm's "PROVES" honest: by the time isRetry is true, the
 				// table is known to carry a PK or a NOT NULL UNIQUE index.
+				//
+				// UNVERIFIED PREMISE (audit-2026-08-19 SDL-1, reconciler WATCH):
+				// the "either fully rolled back OR committed-but-ack-lost"
+				// dichotomy — and therefore "a 1062 on the retry PROVES those
+				// exact rows are durable" — assumes an ATOMIC multi-row INSERT,
+				// i.e. a TRANSACTIONAL storage engine (InnoDB). On a
+				// NON-transactional target table (MyISAM), a batch INSERT is not
+				// atomic: an interrupted attempt can leave a PREFIX of the batch
+				// committed, so the retry's 1062 on the first already-landed row
+				// proves only that row is durable, not the whole batch — the
+				// suffix past the first collision is silently skipped (the INSERT
+				// aborts at the dup, and this arm returns nil). This is NOT
+				// ENGINE-scoped and there is no preflight refusing a MyISAM
+				// target for cold copy, so the premise is unchecked. Not a delta
+				// regression (the WART predates this); tracked in
+				// docs/dev/audit-backlog.md → "Invariant sweep" for an
+				// ENGINE-scoped guard or a cold-copy MyISAM-target preflight.
 				if isRetry && isMySQLDupKey(err) {
 					slog.WarnContext(
 						ctx, "mysql: cold-copy plain INSERT retry collided with a duplicate key (Error 1062); "+
