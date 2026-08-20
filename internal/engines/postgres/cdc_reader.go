@@ -1045,6 +1045,17 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 			// raw, was TERMINAL on exactly the shape nettransient exists to
 			// ride out.
 			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
+				// A cancelled dispatch is the teardown, not a fault — the
+				// ctx-guard the MySQL binlog sibling already carries (cdc_reader.go
+				// dispatch site). dispatchWAL runs LIVE catalog queries and the
+				// out-send parks on ctx.Done, so a deliberate Close reaches here
+				// with a context error dressed up as whatever the driver said;
+				// recording it would let the stop surface through Err() as the
+				// stream's terminating (and classifyReaderError-retriable) failure.
+				// The reason we are stopping must not become the failure we report.
+				if ctx.Err() != nil {
+					return
+				}
 				r.setErr(classifyReaderError(err))
 				return
 			}

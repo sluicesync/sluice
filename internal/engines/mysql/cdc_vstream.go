@@ -238,10 +238,17 @@ type vstreamCDCReader struct {
 	// every ir.Change.
 	currentVgtid []shardGtid
 
-	// mu guards err. The streaming goroutine writes; callers read
-	// via Err after the channel closes.
+	// mu guards err and streamStarted. The streaming goroutine writes err;
+	// callers read via Err after the channel closes.
 	mu  sync.Mutex
 	err error
+
+	// streamStarted is set by the FIRST StreamChanges and blocks a second
+	// call (the underlying gRPC stream has linear state — two concurrent pumps
+	// would race on r.fields and the stream's Recv). Mirrors the snapshot
+	// stream's pumpStarted guard. Reopen relaunches the pump directly (not via
+	// StreamChanges), so it is unaffected by this flag.
+	streamStarted bool
 }
 
 // vstreamChannelBuffer matches the binlog reader's
@@ -919,6 +926,21 @@ func (r *vstreamCDCReader) Err() error {
 //     beforehand.
 //   - Decoded shardGtid slice: resume from the persisted position.
 func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan ir.Change, error) {
+	// In-progress guard + fresh-start error reset (audit-2026-08-19 LOW; the
+	// standalone counterpart of the snapshot stream's pumpStarted guard and the
+	// Reopen path's r.err reset). A second StreamChanges would overwrite
+	// streamerCancel/pumpDone and leak the first pump, and a stale r.err from a
+	// prior stream would make Err() report a spent failure; both are refused /
+	// cleared here under mu.
+	r.mu.Lock()
+	if r.streamStarted {
+		r.mu.Unlock()
+		return nil, errors.New("mysql/vstream: StreamChanges already called")
+	}
+	r.streamStarted = true
+	r.err = nil
+	r.mu.Unlock()
+
 	// Shard discovery is deferred from reader construction to stream open:
 	// building the reader stays connection-free (a warm-resume path may
 	// construct a reader it never streams, and the shape guard
