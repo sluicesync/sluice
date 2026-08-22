@@ -2099,21 +2099,23 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// Fixed-width BINARY(N): re-pad a short payload to the declared
 		// width, closing the VStream sibling of the binlog-lane
 		// pad-strip fix (adversarial-corpus finding, 2026-08-22 — the
-		// binlog ROW image strips a BINARY column's trailing 0x00
-		// padding; whether Vitess's rowstreamer re-pads before the wire
-		// is unverified locally, so this is deliberately safe under
-		// BOTH behaviors: it pads ONLY when len(raw) < N and is a
-		// no-op when the full width arrives). The column's semantic
-		// value is always exactly N bytes — MySQL right-pads at INSERT
-		// — so the re-pad is faithful reconstruction, never a guess.
-		// Width comes from the FIELD event's column_type DDL string via
-		// the same authority pattern as vstreamBitWidth; when the
-		// column_type is absent/garbled (the
+		// vanilla binlog ROW image strips a BINARY column's trailing
+		// 0x00 padding). CONFIRMED 2026-08-22 against a real PlanetScale
+		// VStream (MySQL→PG): Vitess's rowstreamer delivers the FULL
+		// N-byte width on BOTH the COPY and the CDC/binlog legs — a
+		// trailing-zeros BINARY(8) landed byte-exact WITH and WITHOUT
+		// this guard — so unlike the vanilla binlog lane, VStream does
+		// NOT strip. This guard is therefore a defensive no-op today: it
+		// pads ONLY when len(raw) < N (which VStream never delivers) and
+		// is retained against a future Vitess behavior change. The
+		// column's semantic value is always exactly N bytes — MySQL
+		// right-pads at INSERT — so the re-pad is faithful
+		// reconstruction, never a guess. Width comes from the FIELD
+		// event's column_type DDL string via the same authority pattern
+		// as vstreamBitWidth; when the column_type is absent/garbled (the
 		// errFieldMetadataUnavailable shape) the payload passes through
 		// unpadded — identical to the pre-fix behavior, never worse.
-		// To be confirmed against a real Vitess VStream on the
-		// PlanetScale/cluster follow-on; unit-pinned by
-		// TestDecodeVStreamCell_BinaryPadStripReconstructed.
+		// Unit-pinned by TestDecodeVStreamCell_BinaryPadStripReconstructed.
 		b := copyBytes(raw)
 		if n := vstreamBinaryWidth(field); n > 0 && len(b) < n {
 			padded := make([]byte, n)
