@@ -259,6 +259,20 @@ func advCorpusPGToMySQL() []advCell {
 			family: "array", col: "arr_empty", ddl: "INT[] NOT NULL", lit: "'{}'",
 			probe: "CAST(JSON_LENGTH(%s) AS CHAR)", want: "0",
 		},
+		// Temporal element family (the Bug-74 matrix is native/string/
+		// temporal × shapes; timestamps ride a different PG text codec
+		// than ints/numerics even when sluice's own path is shared).
+		// Timestamp elements render RFC3339-with-Z inside the JSON form
+		// (observed on the real pipe, identical across the cold-copy,
+		// CDC, and backup lanes — the Z is the ir.DateTime UTC transport
+		// convention, and lane-consistency is the property this cell
+		// pins; the wall-time digits are byte-exact).
+		{
+			family: "array", col: "arr_ts", ddl: "TIMESTAMP(0)[] NOT NULL",
+			lit:   "ARRAY['2026-03-08 02:30:00'::timestamp(0), '1000-01-01 00:00:00'::timestamp(0)]",
+			probe: "CONCAT(JSON_LENGTH(%s),'#',JSON_UNQUOTE(JSON_EXTRACT(%s,'$[0]')),'#',JSON_UNQUOTE(JSON_EXTRACT(%s,'$[1]')))",
+			want:  "2#2026-03-08T02:30:00Z#1000-01-01T00:00:00Z",
+		},
 		// Elements that stress the array-literal lexer: commas, double
 		// quotes, braces, emoji.
 		{
