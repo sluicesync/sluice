@@ -126,6 +126,13 @@ type SkipLedgerEntry struct {
 // checkpoint (Flush). Both take the mutex; Flush swaps the map out under the
 // lock before its DB-bound work so a lane recording DURING a flush lands in
 // the next generation and is never lost. The zero value is ready to use.
+//
+// "Callers flush at every position-write boundary" is held mechanically by
+// TestPositionWritersFlushTheSkipLedger (internal/engines): a fail-by-default
+// roster over every writePositionTx/writePositionPipelined caller in both
+// engine packages, each graded flushes-or-exempt-with-a-reason (invariant
+// sweep 2026-08-22). A new position-write path fails that gate until it is
+// classified.
 type SkipLedgerAccumulator struct {
 	mu      sync.Mutex
 	entries map[SkipLedgerKey]*SkipLedgerEntry
