@@ -848,7 +848,13 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	// string literal so the driver never sees the time.Time — the same
 	// string-encoding dodge as the negative-zero wart below. Ground-
 	// truthed on mysql:8.0: full-strict mode stores '0001-01-01' /
-	// '0001-01-01 00:00:00' faithfully. Every MySQL write lane funnels
+	// '0001-01-01 00:00:00' faithfully into DATE and DATETIME columns.
+	// A TIMESTAMP target still refuses (its floor is 1970-01-01
+	// 00:00:01) — but it now refuses naming the TRUE value instead of
+	// a '0000-00-00' the source never held, and that loud refusal is
+	// the honest outcome for a value TIMESTAMP genuinely cannot hold
+	// (pinned by the corpus's timestamptz_year1_to_timestamp refusal
+	// cell). Every MySQL write lane funnels
 	// through here (row_writer batched INSERT, change_applier CDC apply,
 	// load_data_writer — see the sibling enumeration in the commit).
 	if tt, ok := v.(time.Time); ok && tt.IsZero() {

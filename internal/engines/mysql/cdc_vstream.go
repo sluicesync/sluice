@@ -2093,9 +2093,34 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// same string shape; matching here keeps cross-engine
 		// time-only columns consistent.
 		return v.ToString()
-	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY,
-		query.Type_BINARY:
+	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY:
 		return copyBytes(raw)
+	case query.Type_BINARY:
+		// Fixed-width BINARY(N): re-pad a short payload to the declared
+		// width, closing the VStream sibling of the binlog-lane
+		// pad-strip fix (adversarial-corpus finding, 2026-08-22 — the
+		// binlog ROW image strips a BINARY column's trailing 0x00
+		// padding; whether Vitess's rowstreamer re-pads before the wire
+		// is unverified locally, so this is deliberately safe under
+		// BOTH behaviors: it pads ONLY when len(raw) < N and is a
+		// no-op when the full width arrives). The column's semantic
+		// value is always exactly N bytes — MySQL right-pads at INSERT
+		// — so the re-pad is faithful reconstruction, never a guess.
+		// Width comes from the FIELD event's column_type DDL string via
+		// the same authority pattern as vstreamBitWidth; when the
+		// column_type is absent/garbled (the
+		// errFieldMetadataUnavailable shape) the payload passes through
+		// unpadded — identical to the pre-fix behavior, never worse.
+		// To be confirmed against a real Vitess VStream on the
+		// PlanetScale/cluster follow-on; unit-pinned by
+		// TestDecodeVStreamCell_BinaryPadStripReconstructed.
+		b := copyBytes(raw)
+		if n := vstreamBinaryWidth(field); n > 0 && len(b) < n {
+			padded := make([]byte, n)
+			copy(padded, b)
+			return padded
+		}
+		return b
 	case query.Type_BIT:
 		// catalog Bug 75: BIT(N) arrives on the wire as ceil(N/8)
 		// big-endian, right-justified bytes. Every OTHER MySQL path
@@ -2188,6 +2213,26 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 // `bit(n)` target refuses loudly on length — never a silent truncation,
 // which is what taking bitWidth's 1-for-unparseable default would have
 // been for a BIT(17) cell.
+// vstreamBinaryWidth resolves the declared byte width N for a fixed
+// BINARY(N) cell from the FIELD event's column_type DDL string —
+// mirroring [vstreamBitWidth]'s authority pattern (the proto Type alone
+// cannot carry N; the column_type string is the only place the width
+// survives). A bare `binary` declaration is BINARY(1), MySQL's
+// documented default. Returns 0 — "don't pad" — when the field's
+// column_type is absent, garbled, or names some other type: the value
+// then passes through exactly as it did before the pad existed, so a
+// metadata gap can never make this path WORSE than the prior behavior.
+func vstreamBinaryWidth(field *query.Field) int {
+	ct := strings.ToLower(strings.TrimSpace(field.GetColumnType()))
+	if leadingTypeWord(ct) != "binary" {
+		return 0
+	}
+	if w := displayWidth(ct); w > 0 {
+		return w
+	}
+	return 1
+}
+
 func vstreamBitWidth(field *query.Field, raw []byte) int {
 	ct := strings.ToLower(strings.TrimSpace(field.GetColumnType()))
 	if leadingTypeWord(ct) == "bit" {

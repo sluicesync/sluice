@@ -437,6 +437,20 @@ func TestMigrate_AdversarialCorpusRefusals_PostgresToMySQL(t *testing.T) {
 		// (The '0001-01-01' zero-time boundary graduated to the main
 		// corpus — d_year1 / ts_year1 — once the prepareValue string-
 		// encoding fix made it land faithfully.)
+		// The zero-instant toward a TIMESTAMP target: PG timestamptz
+		// '0001-01-01 00:00:00+00' decodes to Go's zero time.Time, and
+		// after the prepareValue string-encoding fix the writer sends
+		// the TRUE literal '0001-01-01 00:00:00' — which MySQL
+		// TIMESTAMP (floor 1970-01-01 00:00:01) genuinely cannot hold.
+		// The honest outcome is a loud strict-mode refusal naming that
+		// value; a silent coerce (or the pre-fix '0000-00-00' rewrite)
+		// is the failure this cell exists to catch.
+		{
+			name: "timestamptz_year1_to_timestamp", table: "r_year1tstz",
+			seed: `CREATE TABLE r_year1tstz (id INT PRIMARY KEY, v TIMESTAMPTZ NOT NULL);
+			       INSERT INTO r_year1tstz VALUES (1, '0001-01-01 00:00:00+00');`,
+			alt: []string{"0001-01-01", "timestamp", "range"},
+		},
 		{
 			name: "timestamptz_pre_epoch", table: "r_preepoch",
 			seed: `CREATE TABLE r_preepoch (id INT PRIMARY KEY, v TIMESTAMPTZ NOT NULL);

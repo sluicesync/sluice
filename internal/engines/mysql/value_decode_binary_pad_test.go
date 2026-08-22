@@ -39,6 +39,32 @@ func TestDecodeValue_BinaryPadStripReconstructed(t *testing.T) {
 			t.Errorf("decodeValue(BINARY(4), string) = %x; want %x", got, want)
 		}
 	})
+	t.Run("all-padding value stripped to empty re-pads to N zeros", func(t *testing.T) {
+		// The all-zeros BINARY(N) value is entirely padding, so the
+		// binlog strips every byte. An empty-but-non-nil value must
+		// re-pad to N zeros; only a genuine SQL NULL (raw == nil,
+		// handled before this arm) may produce nil. The empty-vs-nil
+		// question for the actual go-mysql wire is answered empirically
+		// by the corpus cell bin_zeros on the CDC round.
+		got, err := decodeValue([]byte{}, ir.Binary{Length: 8})
+		if err != nil {
+			t.Fatalf("decodeValue: %v", err)
+		}
+		want := make([]byte, 8)
+		if !bytes.Equal(got.([]byte), want) {
+			t.Errorf("decodeValue(BINARY(8), empty) = %x; want %x (all-zeros value, not NULL)", got, want)
+		}
+	})
+	t.Run("embedded NUL preserved, only the tail padded", func(t *testing.T) {
+		got, err := decodeValue([]byte{0xDE, 0x00, 0xAD}, ir.Binary{Length: 8})
+		if err != nil {
+			t.Fatalf("decodeValue: %v", err)
+		}
+		want := []byte{0xDE, 0x00, 0xAD, 0, 0, 0, 0, 0}
+		if !bytes.Equal(got.([]byte), want) {
+			t.Errorf("decodeValue(BINARY(8), de00ad) = %x; want %x", got, want)
+		}
+	})
 	t.Run("full-width binary passes through unchanged", func(t *testing.T) {
 		full := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 		got, err := decodeValue(full, ir.Binary{Length: 8})

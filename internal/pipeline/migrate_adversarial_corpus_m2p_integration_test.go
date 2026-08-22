@@ -255,6 +255,21 @@ func advCorpusMySQLToPG() []advCell {
 			family: "binary", col: "bin_pad", ddl: "BINARY(8) NOT NULL", lit: "X'DEAD'",
 			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "dead000000000000#8",
 		},
+		// The all-zeros fixed BINARY value is ENTIRELY padding — the
+		// binlog strips every byte, so this cell distinguishes
+		// empty-value-repadded-to-N-zeros (correct) from a silent
+		// NULL (the empty-vs-nil decode edge). The probe's non-NULL
+		// assertion is the belt; the hex compare is the braces.
+		{
+			family: "binary", col: "bin_zeros", ddl: "BINARY(8) NOT NULL", lit: "X'0000000000000000'",
+			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "0000000000000000#8",
+		},
+		// Embedded NUL mid-value + stripped tail: only the TRAILING
+		// padding may be reconstructed; the interior NUL is data.
+		{
+			family: "binary", col: "bin_midnul", ddl: "BINARY(8) NOT NULL", lit: "X'DE00AD'",
+			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "de00ad0000000000#8",
+		},
 		{
 			family: "binary", col: "blob_ff", ddl: "BLOB NULL", lit: "NULL", seedVal: ffBlob,
 			probe: "md5(%s) || '#' || octet_length(%s)::text", want: advMD5(ffBlob) + "#256",
