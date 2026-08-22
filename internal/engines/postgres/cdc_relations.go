@@ -419,6 +419,26 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	case pgtype.ByteaOID:
 		return ir.Blob{Size: ir.BlobLong}, nil
 
+	// ---- Bit strings ----
+	// Registry-parity with the schema reader's "bit"/"bit varying" arm
+	// (types.go) — the Bug 97 dual-registry-drift shape, refound by the
+	// adversarial corpus (2026-08-22): a bit(n) column migrated and
+	// cold-started fine, then the FIRST DML crashed the sync stream
+	// with "unsupported column type OID 1560". Bit typmods carry the
+	// raw declared length with NO +4 offset (ground-truthed: bit(8)
+	// arrives with typmod 8; the schema reader documents the same for
+	// atttypmod). An unmodified declaration (-1) collapses to bit(1) —
+	// PG's default — mirroring the schema reader. The value side needs
+	// nothing new: pgoutput carries bit/varbit as the canonical
+	// '0'/'1' text, which IS the ir.Bit contract form (decodeValue's
+	// ir.Bit arm).
+	case pgtype.BitOID, pgtype.VarbitOID:
+		n := int(typmod)
+		if n < 1 {
+			n = 1
+		}
+		return ir.Bit{Length: n, Varying: oid == pgtype.VarbitOID}, nil
+
 	// ---- Temporal ----
 	case pgtype.DateOID:
 		return ir.Date{}, nil

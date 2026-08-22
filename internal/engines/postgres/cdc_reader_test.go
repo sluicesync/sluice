@@ -278,6 +278,12 @@ func TestOIDToType(t *testing.T) {
 		{"varchar(unbounded)", pgtype.VarcharOID, -1, ir.Text{Size: ir.TextLong}},
 		{"bpchar(10)", pgtype.BPCharOID, 14, ir.Char{Length: 10}},
 		{"bytea", pgtype.ByteaOID, -1, ir.Blob{Size: ir.BlobLong}},
+		// Registry-parity for bit strings (adversarial-corpus catch,
+		// 2026-08-22): bit typmods carry the RAW length, no +4 offset.
+		{"bit(8)", pgtype.BitOID, 8, ir.Bit{Length: 8}},
+		{"bit(default)", pgtype.BitOID, -1, ir.Bit{Length: 1}},
+		{"varbit(12)", pgtype.VarbitOID, 12, ir.Bit{Length: 12, Varying: true}},
+		{"varbit(unbounded)", pgtype.VarbitOID, -1, ir.Bit{Length: 1, Varying: true}},
 		{"date", pgtype.DateOID, -1, ir.Date{}},
 		{"timestamp(0)", pgtype.TimestampOID, 0, ir.DateTime{Precision: 0}},
 		{"timestamp(6)", pgtype.TimestampOID, 6, ir.DateTime{Precision: 6}},
