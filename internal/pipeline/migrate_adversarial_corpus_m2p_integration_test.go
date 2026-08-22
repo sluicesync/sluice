@@ -310,7 +310,10 @@ func TestMigrate_AdversarialCorpusRefusals_MySQLToPostgres(t *testing.T) {
 			table: "r_u64",
 			seed: `CREATE TABLE r_u64 (id INT PRIMARY KEY, v BIGINT UNSIGNED NOT NULL);
 			       INSERT INTO r_u64 VALUES (1, 18446744073709551615);`,
-			alt: []string{"decimal(20,0)", "unsigned", "uint64"},
+			// The COPY-encode refusal names the exact value and the
+			// int64 ceiling; the decimal(20,0) override guidance is
+			// printed as a schema-preflight NOTICE alongside it.
+			alt: []string{"maximum value for int64", "18446744073709551615", "decimal(20,0)"},
 		},
 		{
 			name:  "zero_date_default_policy",
@@ -352,6 +355,10 @@ func TestMigrate_AdversarialCorpusRefusals_MySQLToPostgres(t *testing.T) {
 				Source: mysqlEng, Target: pgEng,
 				SourceDSN: mysqlSource, TargetDSN: pgTarget,
 				Filter: filter,
+				// Distinct per cell: a refusal records a partial-
+				// migration ledger row on the target, and the next
+				// cell's run would otherwise be told to --resume it.
+				MigrationID: "adv-refusal-" + rc.table,
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
@@ -403,7 +410,8 @@ func TestMigrate_AdversarialCorpusRefusals_MySQLToPostgres(t *testing.T) {
 		mig := &Migrator{
 			Source: epochEng, Target: pgEng,
 			SourceDSN: mysqlSource, TargetDSN: pgTarget,
-			Filter: filter,
+			Filter:      filter,
+			MigrationID: "adv-refusal-zerodate-epoch",
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()

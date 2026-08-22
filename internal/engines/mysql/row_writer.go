@@ -835,6 +835,33 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
+	// The go-sql-driver zero-time rewrite (adversarial-corpus finding,
+	// 2026-08-22). Go's zero time.Time is a REAL value in the IR — PG
+	// DATE '0001-01-01' / timestamp '0001-01-01 00:00:00' decode to
+	// exactly time.Time{} — but go-sql-driver/mysql serializes any
+	// IsZero() time as the MySQL zero sentinel '0000-00-00' on BOTH
+	// statement protocols. Under the injected-strict writer session that
+	// surfaces as a false refusal of a value MySQL stores fine (Error
+	// 1292 naming '0000-00-00', a value the source never held); under an
+	// operator-relaxed --mysql-sql-mode it would land the zero sentinel
+	// SILENTLY — a value alteration. Encode the value as its explicit
+	// string literal so the driver never sees the time.Time — the same
+	// string-encoding dodge as the negative-zero wart below. Ground-
+	// truthed on mysql:8.0: full-strict mode stores '0001-01-01' /
+	// '0001-01-01 00:00:00' faithfully. Every MySQL write lane funnels
+	// through here (row_writer batched INSERT, change_applier CDC apply,
+	// load_data_writer — see the sibling enumeration in the commit).
+	if tt, ok := v.(time.Time); ok && tt.IsZero() {
+		if col != nil {
+			if _, isDate := ir.UnwrapDomain(col.Type).(ir.Date); isDate {
+				return "0001-01-01", nil
+			}
+		}
+		// DATETIME/TIMESTAMP form; MySQL also accepts it into a DATE
+		// column (truncating the zero time-of-day) on the type-free
+		// nil-descriptor path.
+		return "0001-01-01 00:00:00", nil
+	}
 	if col == nil {
 		// Type-free negative-zero encoding for the nil-descriptor path
 		// (the applier's cache-miss/unknown-column branches): without the

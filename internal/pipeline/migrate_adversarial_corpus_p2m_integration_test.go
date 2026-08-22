@@ -104,6 +104,19 @@ func advCorpusPGToMySQL() []advCell {
 			probe: "CAST(%s AS CHAR)", want: "2026-03-08 02:30:00.123456"},
 		{family: "temporal", col: "d_floor", ddl: "DATE NOT NULL", lit: "'1000-01-01'",
 			probe: "CAST(%s AS CHAR)", want: "1000-01-01"},
+		// Go's zero time.Time IS these two values (PG DATE '0001-01-01'
+		// / timestamp '0001-01-01 00:00:00' decode to exactly
+		// time.Time{}), and go-sql-driver serializes any IsZero() time
+		// as MySQL's '0000-00-00' sentinel — the corpus's first
+		// production catch (2026-08-22): a false refusal under the
+		// strict writer session, a SILENT rewrite under a relaxed
+		// --mysql-sql-mode. prepareValue now string-encodes the zero
+		// instant; these cells pin the faithful landing end-to-end on
+		// the cold-copy, CDC, and backup rounds.
+		{family: "temporal", col: "d_year1", ddl: "DATE NOT NULL", lit: "'0001-01-01'",
+			probe: "CAST(%s AS CHAR)", want: "0001-01-01"},
+		{family: "temporal", col: "ts_year1", ddl: "TIMESTAMP(0) NOT NULL", lit: "'0001-01-01 00:00:00'",
+			probe: "CAST(%s AS CHAR)", want: "0001-01-01 00:00:00"},
 		{family: "temporal", col: "d_max", ddl: "DATE NOT NULL", lit: "'9999-12-31'",
 			probe: "CAST(%s AS CHAR)", want: "9999-12-31"},
 		{family: "temporal", col: "t_frac", ddl: "TIME(6) NOT NULL", lit: "'23:59:59.999999'",
@@ -319,15 +332,11 @@ func TestMigrate_AdversarialCorpusRefusals_PostgresToMySQL(t *testing.T) {
 			       INSERT INTO r_interval VALUES (1, INTERVAL '1 day 02:03:04');`,
 			alt: []string{"interval", "no mysql equivalent", "duration"},
 		},
-		// Boundary cells: refusing loudly OR landing byte-faithfully
+		// Boundary cell: refusing loudly OR landing byte-faithfully
 		// are both acceptable; clamping/wrapping is the headline.
-		{
-			name: "date_below_mysql_floor", table: "r_lowdate",
-			seed: `CREATE TABLE r_lowdate (id INT PRIMARY KEY, v DATE NOT NULL);
-			       INSERT INTO r_lowdate VALUES (1, '0001-01-01');`,
-			alt:         []string{"0001-01-01", "date", "range"},
-			faithfulCol: "v", faithfulWant: "0001-01-01",
-		},
+		// (The '0001-01-01' zero-time boundary graduated to the main
+		// corpus — d_year1 / ts_year1 — once the prepareValue string-
+		// encoding fix made it land faithfully.)
 		{
 			name: "timestamptz_pre_epoch", table: "r_preepoch",
 			seed: `CREATE TABLE r_preepoch (id INT PRIMARY KEY, v TIMESTAMPTZ NOT NULL);
@@ -353,6 +362,8 @@ func TestMigrate_AdversarialCorpusRefusals_PostgresToMySQL(t *testing.T) {
 				Source: pgEng, Target: mysqlEng,
 				SourceDSN: pgSource, TargetDSN: mysqlTarget,
 				Filter: filter,
+				// Distinct per cell — see the M2P refusal harness note.
+				MigrationID: "adv-refusal-" + rc.table,
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
