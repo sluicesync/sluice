@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.131.1] - 2026-08-22
+
+A correctness patch that fixes a **silent CDC data-loss** — plus a sync-killer and a false refusal — found by a new adversarial value-fidelity corpus. Drop-in from v0.131.0: no schema, format, or flag change; these are pure fixes on the MySQL/Postgres CDC value paths. If you run MySQL ↔ Postgres continuous sync, upgrade — especially if any table has a `BINARY` column.
+
+### Fixed
+
+**Silent CDC data-loss: a MySQL fixed-width `BINARY(N)` column had its trailing `0x00` padding stripped on the binlog CDC lane.** MySQL stores `BINARY(N)` right-padded to exactly N bytes, but the binlog ROW image delivers the value with trailing NULs stripped — so on a MySQL→Postgres continuous sync a value like `BINARY(8)` `0xDEAD000000000000` landed on the target as **2 bytes** via a CDC change while the initial snapshot landed all **8**, an exit-0 divergence between the two legs that no error surfaced. The decoder now re-pads a fixed `BINARY` value back to its declared width — faithful reconstruction, since the column's semantic value is always exactly N bytes. Scope: the vanilla-MySQL binlog CDC lane; the cold-copy and flat-file paths already carried the full width and are unchanged. A defensive guard was also added to the VStream (PlanetScale/Vitess) lane, but an end-to-end test against a real PlanetScale cluster confirmed Vitess delivers full-width `BINARY` on both its snapshot and CDC legs and never had the strip — so that guard is a no-op retained only against a future Vitess change.
+
+**A Postgres `'0001-01-01'` date was silently rewritten to MySQL's `'0000-00-00'` sentinel.** On Postgres→MySQL, a `DATE` or `timestamp` of `'0001-01-01 00:00:00'` (Go's zero `time.Time`) was serialized by the MySQL driver as the invalid `'0000-00-00'` zero-date — surfacing as a false refusal under strict `sql_mode` (the error named a value the source never held) or, under an operator-relaxed `--mysql-sql-mode`, a silent rewrite of the stored value. The value is now string-encoded so the driver never mangles it, ground-truthed against a real MySQL that stores year-1 dates faithfully. Genuine MySQL `0000-00-00` zero-dates are unaffected — they continue to be handled by the existing zero-date policy (`--zero-date` / `SLUICE-E-VALUE-ZERO-DATE`).
+
+**Postgres `bit` / `bit varying` columns killed the sync stream on the first change.** A `bit(n)` column migrated and cold-started cleanly, but the first CDC change tore the stream down with `unsupported column type OID 1560` — the Postgres CDC relation decoder lacked the bit-string arm the schema reader already carried (a dual-registry drift). The CDC decoder now maps `bit`/`varbit`, so a `bit` column syncs continuously like any other.
+
+### Added
+
+**An adversarial value-fidelity corpus now runs on every PR.** A durable cross-engine integration test that pushes the worst-case value of every type family — invalid-UTF8-adjacent text, `NaN`/±`Inf`/`-0.0`, unsigned ints near 2⁶⁴, MySQL `TIME` durations, zero-dates, out-of-range `TINYINT(1)`, multi-dim / NULL / ragged arrays, NUL-byte and padded `BINARY` blobs, geometry SRID, collation and PAD-SPACE edges — through migrate, CDC sync, and backup/restore in both directions, ground-truthed byte-exact against the **real target** (not sluice's own encoder). It is the asset that found the three fixes above; it now guards the value paths on every change.
+
+### Compatibility
+
+Drop-in from v0.131.0 — no schema, format, error-code, flag, or command change. All three fixes are pure correctness on the MySQL/Postgres CDC value-decode paths; a sync that was *not* hitting one of these shapes is byte-identical after the upgrade, and one that *was* now carries the value faithfully (or, for the zero-date case, refuses honestly instead of rewriting).
+
+**Who needs this:** anyone running **MySQL ↔ Postgres continuous sync (CDC)**. The `BINARY(N)` fix is a genuine silent-data-loss repair — if any synced table has a fixed-width `BINARY` column, upgrade. The `bit`/`varbit` fix unblocks sync for tables with bit-string columns; the zero-date fix matters for sources holding year-1 dates.
+
 ## [0.131.0] - 2026-08-20
 
 A small feature release. sluice can now hand an AI agent its own operating guide as an installable skill file, so an agent can cold-start on how to drive sluice without the repo or the docs site. Plus a CI-hygiene guard and a documented design decision. Drop-in from v0.130.2 — no schema, format, or existing-flag change.
