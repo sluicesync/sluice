@@ -83,7 +83,10 @@ func advCorpusMySQLToPG() []advCell {
 
 		// ---- float (bit-exact via PG float8send/float4send; the
 		// expected bits come from Go's parse of the same literal) ----
-		{family: "float", col: "f8_negzero", ddl: "DOUBLE NOT NULL", lit: "-0.0",
+		// NOTE the -0.0e0 float literal: MySQL types a bare -0.0 as
+		// DECIMAL, which has no signed zero, so the SOURCE would hold
+		// +0.0 before sluice ever read it (ground-truthed on mysql:8.0).
+		{family: "float", col: "f8_negzero", ddl: "DOUBLE NOT NULL", lit: "-0.0e0",
 			probe: "encode(float8send(%s),'hex')", want: "8000000000000000"},
 		{family: "float", col: "f8_17sig", ddl: "DOUBLE NOT NULL", lit: "0.1234567890123456789",
 			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("0.1234567890123456789")},
@@ -473,21 +476,13 @@ func TestMigrate_AdversarialCorpusBackupRound_MySQLToPostgres(t *testing.T) {
 func advAssertRefusal(t *testing.T, err error, code sluicecode.Code, alt []string) {
 	t.Helper()
 	if code != "" {
+		// Walk the whole unwrap chain: an outer wrapper (e.g. the
+		// bulk-copy table-failed code) may enclose the value refusal,
+		// and errors.As alone would stop at the first CodedError.
 		for e := err; e != nil; e = errors.Unwrap(e) {
-			var ce *sluicecode.CodedError
-			if errors.As(e, &ce) {
-				if ce.Code == code {
-					return
-				}
-				// Keep walking: an outer wrapper (e.g. the bulk-copy
-				// table-failed code) may enclose the value refusal.
-				e = ce.Err
-				if e == nil {
-					break
-				}
-				continue
+			if ce, ok := e.(*sluicecode.CodedError); ok && ce.Code == code {
+				return
 			}
-			break
 		}
 		// Fall back to the code string appearing in text.
 		if strings.Contains(err.Error(), string(code)) {

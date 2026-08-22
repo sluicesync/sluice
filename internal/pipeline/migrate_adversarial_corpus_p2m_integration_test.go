@@ -109,8 +109,11 @@ func advCorpusPGToMySQL() []advCell {
 		{family: "temporal", col: "t_frac", ddl: "TIME(6) NOT NULL", lit: "'23:59:59.999999'",
 			probe: "CAST(%s AS CHAR)", want: "23:59:59.999999"},
 		// PG allows the 24:00:00 midnight-of-next-day literal; MySQL
-		// TIME holds it as a duration — faithful either way.
-		{family: "temporal", col: "t_24", ddl: "TIME NOT NULL", lit: "'24:00:00'",
+		// TIME holds it as a duration — faithful either way. TIME(0)
+		// so the target renders without a fractional tail (an
+		// unspecified-precision PG time maps to MySQL TIME(6), whose
+		// '.000000' rendering is declared scale, not alteration).
+		{family: "temporal", col: "t_24", ddl: "TIME(0) NOT NULL", lit: "'24:00:00'",
 			probe: "CAST(%s AS CHAR)", want: "24:00:00"},
 
 		// ---- boolean ----

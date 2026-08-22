@@ -315,16 +315,18 @@ func advRunVerify(t *testing.T, v *Verifier) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	for _, depth := range []VerifyDepth{VerifyDepthCount, VerifyDepthSample} {
-		v.Depth = depth
-		v.Out = io.Discard
-		res, err := v.Run(ctx)
-		if err != nil {
-			t.Fatalf("verify --depth %s: %v", depth, err)
-		}
-		if res.HasMismatch() || res.HasUnverified() {
-			t.Errorf("verify --depth %s reports mismatch/unverified: %+v", depth, res.Summary)
-		}
+	// Depth count only: cross-engine sample verify is refused loudly by
+	// design ("depth=sample requires same source and target engine"),
+	// and every corpus run here is cross-engine. The independent
+	// per-cell evidence lives in the direct-SQL probes, not here.
+	v.Depth = VerifyDepthCount
+	v.Out = io.Discard
+	res, err := v.Run(ctx)
+	if err != nil {
+		t.Fatalf("verify --depth count: %v", err)
+	}
+	if res.HasMismatch() || res.HasUnverified() {
+		t.Errorf("verify --depth count reports mismatch/unverified: %+v", res.Summary)
 	}
 }
 
