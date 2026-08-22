@@ -41,7 +41,7 @@ const (
 // at build time.
 func advCorpusMySQLToPG() []advCell {
 	bigText := strings.Repeat("héllo wörld 🦀 snøw ", 1500) // ~40KB of multi-byte UTF-8
-	bigBlob := advBlobPattern(2 << 20)                      // 2 MiB, NUL + 0xFF runs
+	bigBlob := advBlobPattern(2 << 20)                     // 2 MiB, NUL + 0xFF runs
 	ffBlob := make([]byte, 256)
 	for i := range ffBlob {
 		ffBlob[i] = 0xFF
@@ -50,54 +50,84 @@ func advCorpusMySQLToPG() []advCell {
 
 	return []advCell{
 		// ---- text ----
-		{family: "text", col: "t_emoji", ddl: "VARCHAR(191) NOT NULL", lit: "'crab 🦀 café ✅'",
-			probe: "%s", want: "crab 🦀 café ✅"},
+		{
+			family: "text", col: "t_emoji", ddl: "VARCHAR(191) NOT NULL", lit: "'crab 🦀 café ✅'",
+			probe: "%s", want: "crab 🦀 café ✅",
+		},
 		// Decomposed combining diaeresis (e + U+0308), 6 bytes — must
 		// NOT be unicode-normalized to the 5-byte composed form.
-		{family: "text", col: "t_combining", ddl: "VARCHAR(64) NOT NULL", lit: "'noe\u0308l'",
-			probe: "%s || '#' || octet_length(%s)::text", want: "noe\u0308l#6"},
-		{family: "text", col: "t_trailing", ddl: "VARCHAR(32) NOT NULL", lit: "'pad   '",
-			probe: "'[' || %s || ']#' || length(%s)::text", want: "[pad   ]#6"},
+		{
+			family: "text", col: "t_combining", ddl: "VARCHAR(64) NOT NULL", lit: "'noe\u0308l'",
+			probe: "%s || '#' || octet_length(%s)::text", want: "noe\u0308l#6",
+		},
+		{
+			family: "text", col: "t_trailing", ddl: "VARCHAR(32) NOT NULL", lit: "'pad   '",
+			probe: "'[' || %s || ']#' || length(%s)::text", want: "[pad   ]#6",
+		},
 		// ZWJ family sequence: 4 emoji joined by 3 U+200D = 25 bytes.
-		{family: "text", col: "t_zwj", ddl: "VARCHAR(64) NOT NULL", lit: "'👨\u200d👩\u200d👧\u200d👦'",
-			probe: "octet_length(%s)::text || '#' || %s", want: "25#👨\u200d👩\u200d👧\u200d👦"},
-		{family: "text", col: "t_case", ddl: "VARCHAR(32) NOT NULL", lit: "'Straße'",
-			probe: "%s", want: "Straße"},
-		{family: "text", col: "t_big", ddl: "MEDIUMTEXT NULL", lit: "NULL", seedVal: bigText,
+		{
+			family: "text", col: "t_zwj", ddl: "VARCHAR(64) NOT NULL", lit: "'👨\u200d👩\u200d👧\u200d👦'",
+			probe: "octet_length(%s)::text || '#' || %s", want: "25#👨\u200d👩\u200d👧\u200d👦",
+		},
+		{
+			family: "text", col: "t_case", ddl: "VARCHAR(32) NOT NULL", lit: "'Straße'",
+			probe: "%s", want: "Straße",
+		},
+		{
+			family: "text", col: "t_big", ddl: "MEDIUMTEXT NULL", lit: "NULL", seedVal: bigText,
 			probe: "md5(%s) || '#' || octet_length(%s)::text",
-			want:  advMD5([]byte(bigText)) + "#" + advItoa(len(bigText))},
+			want:  advMD5([]byte(bigText)) + "#" + advItoa(len(bigText)),
+		},
 
 		// ---- decimal ----
-		{family: "decimal", col: "dec_max", ddl: "DECIMAL(65,30) NOT NULL",
+		{
+			family: "decimal", col: "dec_max", ddl: "DECIMAL(65,30) NOT NULL",
 			lit:   "'99999999999999999999999999999999999.999999999999999999999999999999'",
-			probe: "%s::text", want: "99999999999999999999999999999999999.999999999999999999999999999999"},
-		{family: "decimal", col: "dec_negmax", ddl: "DECIMAL(65,30) NOT NULL",
+			probe: "%s::text", want: "99999999999999999999999999999999999.999999999999999999999999999999",
+		},
+		{
+			family: "decimal", col: "dec_negmax", ddl: "DECIMAL(65,30) NOT NULL",
 			lit:   "'-12345678901234567890123456789012345.123456789012345678901234567890'",
-			probe: "%s::text", want: "-12345678901234567890123456789012345.123456789012345678901234567890"},
+			probe: "%s::text", want: "-12345678901234567890123456789012345.123456789012345678901234567890",
+		},
 		// "10" vs "9": bytewise order ≠ numeric order — the pair that
 		// catches a codec quietly comparing/serializing digits as text.
 		{family: "decimal", col: "dec_ten", ddl: "DECIMAL(2,0) NOT NULL", lit: "10", probe: "%s::text", want: "10"},
 		{family: "decimal", col: "dec_nine", ddl: "DECIMAL(2,0) NOT NULL", lit: "9", probe: "%s::text", want: "9"},
-		{family: "decimal", col: "dec_frac", ddl: "DECIMAL(10,5) NOT NULL", lit: "'-0.00001'",
-			probe: "%s::text", want: "-0.00001"},
+		{
+			family: "decimal", col: "dec_frac", ddl: "DECIMAL(10,5) NOT NULL", lit: "'-0.00001'",
+			probe: "%s::text", want: "-0.00001",
+		},
 
 		// ---- float (bit-exact via PG float8send/float4send; the
 		// expected bits come from Go's parse of the same literal) ----
 		// NOTE the -0.0e0 float literal: MySQL types a bare -0.0 as
 		// DECIMAL, which has no signed zero, so the SOURCE would hold
 		// +0.0 before sluice ever read it (ground-truthed on mysql:8.0).
-		{family: "float", col: "f8_negzero", ddl: "DOUBLE NOT NULL", lit: "-0.0e0",
-			probe: "encode(float8send(%s),'hex')", want: "8000000000000000"},
-		{family: "float", col: "f8_17sig", ddl: "DOUBLE NOT NULL", lit: "0.1234567890123456789",
-			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("0.1234567890123456789")},
-		{family: "float", col: "f8_max", ddl: "DOUBLE NOT NULL", lit: "1.7976931348623157e308",
-			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("1.7976931348623157e308")},
-		{family: "float", col: "f8_minnormal", ddl: "DOUBLE NOT NULL", lit: "2.2250738585072014e-308",
-			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("2.2250738585072014e-308")},
-		{family: "float", col: "f8_subnormal", ddl: "DOUBLE NOT NULL", lit: "5e-324",
-			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("5e-324")},
-		{family: "float", col: "f4_pi", ddl: "FLOAT NOT NULL", lit: "3.14159",
-			probe: "encode(float4send(%s),'hex')", want: advFloat32Bits("3.14159")},
+		{
+			family: "float", col: "f8_negzero", ddl: "DOUBLE NOT NULL", lit: "-0.0e0",
+			probe: "encode(float8send(%s),'hex')", want: "8000000000000000",
+		},
+		{
+			family: "float", col: "f8_17sig", ddl: "DOUBLE NOT NULL", lit: "0.1234567890123456789",
+			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("0.1234567890123456789"),
+		},
+		{
+			family: "float", col: "f8_max", ddl: "DOUBLE NOT NULL", lit: "1.7976931348623157e308",
+			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("1.7976931348623157e308"),
+		},
+		{
+			family: "float", col: "f8_minnormal", ddl: "DOUBLE NOT NULL", lit: "2.2250738585072014e-308",
+			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("2.2250738585072014e-308"),
+		},
+		{
+			family: "float", col: "f8_subnormal", ddl: "DOUBLE NOT NULL", lit: "5e-324",
+			probe: "encode(float8send(%s),'hex')", want: advFloat64Bits("5e-324"),
+		},
+		{
+			family: "float", col: "f4_pi", ddl: "FLOAT NOT NULL", lit: "3.14159",
+			probe: "encode(float4send(%s),'hex')", want: advFloat32Bits("3.14159"),
+		},
 
 		// ---- integer ----
 		{family: "integer", col: "i8_min", ddl: "TINYINT NOT NULL", lit: "-128", probe: "%s::text", want: "-128"},
@@ -113,32 +143,48 @@ func advCorpusMySQLToPG() []advCell {
 		{family: "integer", col: "u32_max", ddl: "INT UNSIGNED NOT NULL", lit: "4294967295", probe: "%s::text", want: "4294967295"},
 		// The unsigned-64 ceiling that still fits int64 — clean cell;
 		// the above-ceiling refusal lives in the refusal matrix.
-		{family: "integer", col: "u64_atcap", ddl: "BIGINT UNSIGNED NOT NULL", lit: "9223372036854775807",
-			probe: "%s::text", want: "9223372036854775807"},
+		{
+			family: "integer", col: "u64_atcap", ddl: "BIGINT UNSIGNED NOT NULL", lit: "9223372036854775807",
+			probe: "%s::text", want: "9223372036854775807",
+		},
 		// ZEROFILL is display-only; the VALUE must land as 42, never
 		// the zero-padded rendering.
-		{family: "integer", col: "u_zerofill", ddl: "INT(8) UNSIGNED ZEROFILL NOT NULL", lit: "42",
-			probe: "%s::text", want: "42"},
+		{
+			family: "integer", col: "u_zerofill", ddl: "INT(8) UNSIGNED ZEROFILL NOT NULL", lit: "42",
+			probe: "%s::text", want: "42",
+		},
 		{family: "integer", col: "y_max", ddl: "YEAR NOT NULL", lit: "2155", probe: "%s::text", want: "2155"},
 
 		// ---- temporal (seeded under session time_zone='+00:00') ----
-		{family: "temporal", col: "dt_frac", ddl: "DATETIME(6) NOT NULL", lit: "'2026-03-08 02:30:00.123456'",
-			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", want: "2026-03-08 02:30:00.123456"},
-		{family: "temporal", col: "dt_min", ddl: "DATETIME NOT NULL", lit: "'1000-01-01 00:00:00'",
-			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS')", want: "1000-01-01 00:00:00"},
-		{family: "temporal", col: "dt_max", ddl: "DATETIME(6) NOT NULL", lit: "'9999-12-31 23:59:59.999999'",
-			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", want: "9999-12-31 23:59:59.999999"},
+		{
+			family: "temporal", col: "dt_frac", ddl: "DATETIME(6) NOT NULL", lit: "'2026-03-08 02:30:00.123456'",
+			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", want: "2026-03-08 02:30:00.123456",
+		},
+		{
+			family: "temporal", col: "dt_min", ddl: "DATETIME NOT NULL", lit: "'1000-01-01 00:00:00'",
+			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS')", want: "1000-01-01 00:00:00",
+		},
+		{
+			family: "temporal", col: "dt_max", ddl: "DATETIME(6) NOT NULL", lit: "'9999-12-31 23:59:59.999999'",
+			probe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", want: "9999-12-31 23:59:59.999999",
+		},
 		// The 2026 US spring-forward instant (10:30 UTC = inside the
 		// 02:00–03:00 America/Los_Angeles local-time gap).
-		{family: "temporal", col: "ts_dst", ddl: "TIMESTAMP(6) NOT NULL", lit: "'2026-03-08 10:30:00.123456'",
-			probe: "to_char(%s AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS.US')", want: "2026-03-08 10:30:00.123456"},
+		{
+			family: "temporal", col: "ts_dst", ddl: "TIMESTAMP(6) NOT NULL", lit: "'2026-03-08 10:30:00.123456'",
+			probe: "to_char(%s AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS.US')", want: "2026-03-08 10:30:00.123456",
+		},
 		// MySQL TIMESTAMP's floor instant.
-		{family: "temporal", col: "ts_floor", ddl: "TIMESTAMP NOT NULL", lit: "'1970-01-01 00:00:01'",
-			probe: "to_char(%s AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')", want: "1970-01-01 00:00:01"},
+		{
+			family: "temporal", col: "ts_floor", ddl: "TIMESTAMP NOT NULL", lit: "'1970-01-01 00:00:01'",
+			probe: "to_char(%s AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')", want: "1970-01-01 00:00:01",
+		},
 		{family: "temporal", col: "d_min", ddl: "DATE NOT NULL", lit: "'1000-01-01'", probe: "%s::text", want: "1000-01-01"},
 		{family: "temporal", col: "d_max", ddl: "DATE NOT NULL", lit: "'9999-12-31'", probe: "%s::text", want: "9999-12-31"},
-		{family: "temporal", col: "t_frac", ddl: "TIME(6) NOT NULL", lit: "'23:59:59.999999'",
-			probe: "%s::text", want: "23:59:59.999999"},
+		{
+			family: "temporal", col: "t_frac", ddl: "TIME(6) NOT NULL", lit: "'23:59:59.999999'",
+			probe: "%s::text", want: "23:59:59.999999",
+		},
 
 		// ---- boolean (TINYINT(1) / BIT(1) conventions) ----
 		{family: "boolean", col: "b_true", ddl: "TINYINT(1) NOT NULL", lit: "1", probe: "%s::text", want: "true"},
@@ -147,48 +193,76 @@ func advCorpusMySQLToPG() []advCell {
 
 		// ---- bit strings ----
 		{family: "bit", col: "bit8", ddl: "BIT(8) NOT NULL", lit: "b'00001010'", probe: "%s::text", want: "00001010"},
-		{family: "bit", col: "bit64", ddl: "BIT(64) NOT NULL", lit: "b'" + strings.Repeat("1", 64) + "'",
-			probe: "%s::text", want: strings.Repeat("1", 64)},
+		{
+			family: "bit", col: "bit64", ddl: "BIT(64) NOT NULL", lit: "b'" + strings.Repeat("1", 64) + "'",
+			probe: "%s::text", want: strings.Repeat("1", 64),
+		},
 
 		// ---- enum / set ----
-		{family: "enumset", col: "e_first", ddl: "ENUM('alpha','beta','gamma') NOT NULL", lit: "'alpha'",
-			probe: "%s::text", want: "alpha"},
-		{family: "enumset", col: "e_last", ddl: "ENUM('alpha','beta','gamma') NOT NULL", lit: "'gamma'",
-			probe: "%s::text", want: "gamma"},
+		{
+			family: "enumset", col: "e_first", ddl: "ENUM('alpha','beta','gamma') NOT NULL", lit: "'alpha'",
+			probe: "%s::text", want: "alpha",
+		},
+		{
+			family: "enumset", col: "e_last", ddl: "ENUM('alpha','beta','gamma') NOT NULL", lit: "'gamma'",
+			probe: "%s::text", want: "gamma",
+		},
 		// Inserted out of declaration order; MySQL normalizes SET
 		// storage to declaration order — 'a,b,c' is the source truth.
-		{family: "enumset", col: "s_all", ddl: "SET('a','b','c') NOT NULL", lit: "'c,a,b'",
-			probe: "%s::text", want: "{a,b,c}"},
-		{family: "enumset", col: "s_empty", ddl: "SET('a','b','c') NOT NULL", lit: "''",
-			probe: "%s::text", want: "{}"},
+		{
+			family: "enumset", col: "s_all", ddl: "SET('a','b','c') NOT NULL", lit: "'c,a,b'",
+			probe: "%s::text", want: "{a,b,c}",
+		},
+		{
+			family: "enumset", col: "s_empty", ddl: "SET('a','b','c') NOT NULL", lit: "''",
+			probe: "%s::text", want: "{}",
+		},
 
 		// ---- json ----
-		{family: "json", col: "j_unicode", ddl: "JSON NOT NULL", lit: `'{"ké":"vé","emoji":"🦀"}'`,
-			probe: "(%s->>'ké') || '#' || (%s->>'emoji')", want: "vé#🦀"},
+		{
+			family: "json", col: "j_unicode", ddl: "JSON NOT NULL", lit: `'{"ké":"vé","emoji":"🦀"}'`,
+			probe: "(%s->>'ké') || '#' || (%s->>'emoji')", want: "vé#🦀",
+		},
 		// 2^53+1: JSON codecs that route numbers through float64
 		// silently land …992. The exact digits are the assertion.
-		{family: "json", col: "j_bigint", ddl: "JSON NOT NULL", lit: `'{"n":9007199254740993}'`,
-			probe: "%s->>'n'", want: "9007199254740993"},
-		{family: "json", col: "j_deep", ddl: "JSON NOT NULL", lit: "'" + deepDoc + "'",
-			probe: "%s #>> '" + deepPGPath + "'", want: "1"},
+		{
+			family: "json", col: "j_bigint", ddl: "JSON NOT NULL", lit: `'{"n":9007199254740993}'`,
+			probe: "%s->>'n'", want: "9007199254740993",
+		},
+		{
+			family: "json", col: "j_deep", ddl: "JSON NOT NULL", lit: "'" + deepDoc + "'",
+			probe: "%s #>> '" + deepPGPath + "'", want: "1",
+		},
 		// MySQL 8.0 normalizes duplicate keys last-wins at INSERT; the
 		// source truth is 2 and must stay 2.
-		{family: "json", col: "j_dup", ddl: "JSON NOT NULL", lit: `'{"k":1,"k":2}'`,
-			probe: "%s->>'k'", want: "2"},
-		{family: "json", col: "j_frac", ddl: "JSON NOT NULL", lit: `'{"x":0.30000000000000004}'`,
-			probe: "%s->>'x'", want: "0.30000000000000004"},
+		{
+			family: "json", col: "j_dup", ddl: "JSON NOT NULL", lit: `'{"k":1,"k":2}'`,
+			probe: "%s->>'k'", want: "2",
+		},
+		{
+			family: "json", col: "j_frac", ddl: "JSON NOT NULL", lit: `'{"x":0.30000000000000004}'`,
+			probe: "%s->>'x'", want: "0.30000000000000004",
+		},
 
 		// ---- binary ----
-		{family: "binary", col: "vb_nul", ddl: "VARBINARY(16) NOT NULL", lit: "X'00FF7F00'",
-			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "00ff7f00#4"},
+		{
+			family: "binary", col: "vb_nul", ddl: "VARBINARY(16) NOT NULL", lit: "X'00FF7F00'",
+			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "00ff7f00#4",
+		},
 		// BINARY(8) zero-pads at the SOURCE; the padded form is the
 		// faithful value.
-		{family: "binary", col: "bin_pad", ddl: "BINARY(8) NOT NULL", lit: "X'DEAD'",
-			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "dead000000000000#8"},
-		{family: "binary", col: "blob_ff", ddl: "BLOB NULL", lit: "NULL", seedVal: ffBlob,
-			probe: "md5(%s) || '#' || octet_length(%s)::text", want: advMD5(ffBlob) + "#256"},
-		{family: "binary", col: "blob_big", ddl: "MEDIUMBLOB NULL", lit: "NULL", seedVal: bigBlob,
-			probe: "md5(%s) || '#' || octet_length(%s)::text", want: advMD5(bigBlob) + "#" + advItoa(len(bigBlob))},
+		{
+			family: "binary", col: "bin_pad", ddl: "BINARY(8) NOT NULL", lit: "X'DEAD'",
+			probe: "encode(%s,'hex') || '#' || octet_length(%s)::text", want: "dead000000000000#8",
+		},
+		{
+			family: "binary", col: "blob_ff", ddl: "BLOB NULL", lit: "NULL", seedVal: ffBlob,
+			probe: "md5(%s) || '#' || octet_length(%s)::text", want: advMD5(ffBlob) + "#256",
+		},
+		{
+			family: "binary", col: "blob_big", ddl: "MEDIUMBLOB NULL", lit: "NULL", seedVal: bigBlob,
+			probe: "md5(%s) || '#' || octet_length(%s)::text", want: advMD5(bigBlob) + "#" + advItoa(len(bigBlob)),
+		},
 	}
 }
 

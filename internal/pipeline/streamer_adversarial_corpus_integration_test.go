@@ -19,6 +19,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,18 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
+
+// advStreamerExit reports (non-blockingly) whether Streamer.Run has
+// already returned, and with what — a wait timeout with a dead
+// streamer should say WHY the streamer died, not just "never landed".
+func advStreamerExit(runErr <-chan error) string {
+	select {
+	case err := <-runErr:
+		return fmt.Sprintf(" — Streamer.Run has EXITED: %v", err)
+	default:
+		return " (streamer still running)"
+	}
+}
 
 // advCDCSplit partitions a corpus into the CDC-riding cells and the
 // skipped ones. Every skip must carry a named reason; more than three
@@ -79,7 +92,7 @@ func TestStreamer_AdversarialCorpusCDC_MySQLToPostgres(t *testing.T) {
 
 	// Snapshot leg: row 1 lands via bulk copy.
 	if !advWaitRowVisible(t, "pgx", pgTargetDSN, "adv_corpus", 1, 120*time.Second) {
-		t.Fatal("snapshot leg: corpus row 1 never landed on the PG target")
+		t.Fatalf("snapshot leg: corpus row 1 never landed on the PG target%s", advStreamerExit(runErr))
 	}
 	t.Run("snapshot_leg", func(t *testing.T) {
 		conn := advOpenConn(t, "pgx", pgTargetDSN)
@@ -90,14 +103,14 @@ func TestStreamer_AdversarialCorpusCDC_MySQLToPostgres(t *testing.T) {
 	// arrive as a follow-up CDC UPDATE; wait for them to settle).
 	advInsertMySQLCorpusRow(t, mysqlSourceDSN, "adv_corpus", cells, 2)
 	if !advWaitRowVisible(t, "pgx", pgTargetDSN, "adv_corpus", 2, 60*time.Second) {
-		t.Fatal("CDC INSERT leg: corpus row 2 never landed on the PG target")
+		t.Fatalf("CDC INSERT leg: corpus row 2 never landed on the PG target%s", advStreamerExit(runErr))
 	}
 	for _, c := range cdcCells {
 		if c.seedVal == nil {
 			continue
 		}
 		if !advWaitCellEquals(t, "pgx", pgTargetDSN, "adv_corpus", c, 2, nil, 60*time.Second) {
-			t.Fatalf("CDC UPDATE (seed param) for %s never settled on row 2", c.col)
+			t.Fatalf("CDC UPDATE (seed param) for %s never settled on row 2%s", c.col, advStreamerExit(runErr))
 		}
 	}
 	t.Run("cdc_insert_leg", func(t *testing.T) {
@@ -109,10 +122,14 @@ func TestStreamer_AdversarialCorpusCDC_MySQLToPostgres(t *testing.T) {
 	// values and confirm the after-image decode lands each byte-exact.
 	updates := []advCell{
 		{family: "text", col: "t_emoji", probe: "%s", want: "moved 🦞 Ωmega"},
-		{family: "decimal", col: "dec_max", probe: "%s::text",
-			want: "0.000000000000000000000000000001"},
-		{family: "float", col: "f8_17sig", probe: "encode(float8send(%s),'hex')",
-			want: advFloat64Bits("0.9876543210987654321")},
+		{
+			family: "decimal", col: "dec_max", probe: "%s::text",
+			want: "0.000000000000000000000000000001",
+		},
+		{
+			family: "float", col: "f8_17sig", probe: "encode(float8send(%s),'hex')",
+			want: advFloat64Bits("0.9876543210987654321"),
+		},
 		{family: "json", col: "j_bigint", probe: "%s->>'n'", want: "9007199254740995"},
 	}
 	applyMySQLDDL(t, mysqlSourceDSN, `SET SESSION time_zone = '+00:00';
@@ -168,7 +185,7 @@ func TestStreamer_AdversarialCorpusCDC_PostgresToMySQL(t *testing.T) {
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
 	if !advWaitRowVisible(t, "mysql", mysqlTargetDSN, "adv_corpus", 1, 120*time.Second) {
-		t.Fatal("snapshot leg: corpus row 1 never landed on the MySQL target")
+		t.Fatalf("snapshot leg: corpus row 1 never landed on the MySQL target%s", advStreamerExit(runErr))
 	}
 	t.Run("snapshot_leg", func(t *testing.T) {
 		conn := advOpenConn(t, "mysql", mysqlTargetDSN, advMySQLUTCSession...)
@@ -177,14 +194,14 @@ func TestStreamer_AdversarialCorpusCDC_PostgresToMySQL(t *testing.T) {
 
 	advInsertPGCorpusRow(t, pgSourceDSN, "adv_corpus", cells, 2)
 	if !advWaitRowVisible(t, "mysql", mysqlTargetDSN, "adv_corpus", 2, 60*time.Second) {
-		t.Fatal("CDC INSERT leg: corpus row 2 never landed on the MySQL target")
+		t.Fatalf("CDC INSERT leg: corpus row 2 never landed on the MySQL target%s", advStreamerExit(runErr))
 	}
 	for _, c := range cdcCells {
 		if c.seedVal == nil {
 			continue
 		}
 		if !advWaitCellEquals(t, "mysql", mysqlTargetDSN, "adv_corpus", c, 2, advMySQLUTCSession, 60*time.Second) {
-			t.Fatalf("CDC UPDATE (seed param) for %s never settled on row 2", c.col)
+			t.Fatalf("CDC UPDATE (seed param) for %s never settled on row 2%s", c.col, advStreamerExit(runErr))
 		}
 	}
 	t.Run("cdc_insert_leg", func(t *testing.T) {
@@ -197,9 +214,11 @@ func TestStreamer_AdversarialCorpusCDC_PostgresToMySQL(t *testing.T) {
 	updates := []advCell{
 		{family: "text", col: "t_emoji", probe: "%s", want: "moved 🦞 Ωmega"},
 		{family: "json", col: "jb_bigint", probe: "JSON_EXTRACT(%s,'$.n')", want: "9007199254740995"},
-		{family: "array", col: "arr_num_2d",
+		{
+			family: "array", col: "arr_num_2d",
 			probe: "CONCAT(JSON_LENGTH(%s),'#',JSON_LENGTH(%s,'$[0]'),'#',JSON_UNQUOTE(JSON_EXTRACT(%s,'$[1][0]')))",
-			want:  "2#2#7.125"},
+			want:  "2#2#7.125",
+		},
 	}
 	applyPGDDL(t, pgSourceDSN, `UPDATE adv_corpus SET
 			t_emoji = 'moved 🦞 Ωmega',

@@ -40,7 +40,32 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeFloat(raw)
 	case ir.Char, ir.Varchar, ir.Text:
 		return decodeString(raw)
-	case ir.Binary, ir.Varbinary, ir.Blob:
+	case ir.Binary:
+		// Fixed-width BINARY(N): the binlog ROW image stores the value
+		// with its trailing 0x00 padding STRIPPED (MYSQL_TYPE_STRING is
+		// length-prefixed on the wire), so the CDC lane would deliver
+		// fewer than N bytes for any value with trailing NULs — a
+		// silent per-lane divergence from bulk copy, where the driver
+		// returns the full server-padded N bytes (adversarial-corpus
+		// finding, 2026-08-22: BINARY(8) 0xDEAD000000000000 landed as 2
+		// bytes via CDC, 8 via snapshot). The column's SEMANTIC value
+		// is always exactly N bytes — MySQL right-pads with 0x00 at
+		// INSERT — so re-padding to the declared width is faithful
+		// reconstruction, never a guess (the same re-pad Debezium
+		// applies to BINARY columns for the same reason). No-op for the
+		// bulk-copy and flat-file lanes, whose values already carry the
+		// full width.
+		b, err := decodeBytes(raw)
+		if err != nil {
+			return nil, err
+		}
+		if bb, ok := b.([]byte); ok && v.Length > 0 && len(bb) < v.Length {
+			padded := make([]byte, v.Length)
+			copy(padded, bb)
+			return padded, nil
+		}
+		return b, nil
+	case ir.Varbinary, ir.Blob:
 		return decodeBytes(raw)
 	case ir.Bit:
 		// catalog Bug 75: MySQL's driver hands BIT(N) back as a byte
