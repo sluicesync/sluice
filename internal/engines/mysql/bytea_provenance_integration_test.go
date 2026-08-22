@@ -119,6 +119,16 @@ var byteaProvIntegrationCases = []byteaProvIntegrationCase{
 	{name: `collision \xdead`, in: `\xdead`, wantNativeHex: "DEAD"},
 	{name: `collision bare \x`, in: `\x`, wantNativeHex: ""},
 	{name: `collision \xdeadbeef`, in: `\xdeadbeef`, wantNativeHex: "DEADBEEF"},
+	// Uppercase and mixed-case hex (audit B-2d): PG's own emitters render
+	// lowercase, but PG *accepts* uppercase bytea input, so an upstream
+	// producer or a hand-written trigger can legitimately hand this lane
+	// `\xDEAD` — the Postgres matrix has this cell and MySQL did not. On
+	// the natively-binary reading it must decode to the same two bytes as
+	// `\xdead`; on the overridden reading its verbatim bytes DIFFER from
+	// the lowercase spelling's, which is what makes it a distinct cell
+	// rather than a re-run.
+	{name: `collision uppercase \xDEAD`, in: `\xDEAD`, wantNativeHex: "DEAD"},
+	{name: `collision mixed-case \xDeAd`, in: `\xDeAd`, wantNativeHex: "DEAD"},
 	{name: "genuinely hex-encoded", in: `\x00ff1080`, wantNativeHex: "00FF1080"},
 	{name: "hex with embedded NUL", in: `\x610062`, wantNativeHex: "610062"},
 	// `\x`-prefixed but unparseable: a rendering ATTEMPT with no faithful
@@ -477,10 +487,41 @@ func byteaProvApply(t *testing.T, ctx context.Context, dsn string, table *ir.Tab
 	return applier.Apply(ctx, "bytea-prov-stream", ch)
 }
 
+// assertByteaProvCaseFloor is the anti-vacuity floor for the value-shape
+// axis (audit B-2d). It derives the inventory from the case table's own
+// values — a lowercase `\x`-hex collision, an UPPERCASE one, and a total
+// count — so a simplification that drops the uppercase cell (the exact
+// cell B-2d found missing) fails loudly instead of shrinking coverage.
+func assertByteaProvCaseFloor(t *testing.T) {
+	t.Helper()
+	if got := len(byteaProvWriteCores()); got < 3 {
+		t.Fatalf("write-core roster has %d cores; want >= 3 (batched / LOAD DATA / applier)", got)
+	}
+	if got, min := len(byteaProvIntegrationCases), 12; got < min {
+		t.Fatalf("case table has %d shapes; want >= %d — the matrix has gone vacuous", got, min)
+	}
+	var lower, upper bool
+	for _, c := range byteaProvIntegrationCases {
+		if c.wantRefusal || !strings.HasPrefix(c.in, `\x`) || len(c.in) == 2 {
+			continue
+		}
+		body := c.in[2:]
+		if body == strings.ToLower(body) {
+			lower = true
+		} else {
+			upper = true
+		}
+	}
+	if !lower || !upper {
+		t.Fatalf("collision-cell floor: lowercase=%v uppercase=%v — both hex spellings must be present (audit B-2d)", lower, upper)
+	}
+}
+
 // TestByteaProvenance_MySQLWriteCores is the matrix: three write cores ×
 // two column provenances × the value shapes, ground-truthed with
 // OCTET_LENGTH().
 func TestByteaProvenance_MySQLWriteCores(t *testing.T) {
+	assertByteaProvCaseFloor(t)
 	for _, core := range byteaProvWriteCores() {
 		core := core
 		t.Run(core.name, func(t *testing.T) {

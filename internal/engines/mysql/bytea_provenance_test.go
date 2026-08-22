@@ -63,6 +63,22 @@ var byteaShapes = []byteaShape{
 		in:         `\xdeadbeef`,
 		wantNative: []byte{0xde, 0xad, 0xbe, 0xef},
 	},
+	// Uppercase / mixed-case hex (audit B-2d): PG accepts uppercase bytea
+	// input even though its own emitters render lowercase, so this lane
+	// can be handed `\xDEAD` by an upstream producer. Natively-binary it
+	// decodes to the same bytes as the lowercase spelling; overridden it
+	// is a DIFFERENT verbatim value, which the shared overridden-lane
+	// assertion covers per shape.
+	{
+		name:       `collision: uppercase \xDEAD`,
+		in:         `\xDEAD`,
+		wantNative: []byte{0xde, 0xad},
+	},
+	{
+		name:       `collision: mixed-case \xDeAd`,
+		in:         `\xDeAd`,
+		wantNative: []byte{0xde, 0xad},
+	},
 	{
 		name:       "genuinely hex-encoded, no collision",
 		in:         `\x00ff1080`,
