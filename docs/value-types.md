@@ -36,6 +36,7 @@ Nullability itself is a property of the IR `Column` (`Column.Nullable`), not of 
 | `Float` (single or double) | `float64` | Single-precision values are widened to `float64` — no information loss in this direction. |
 | `Char`, `Varchar`, `Text` | `string` | Charset / collation are properties of the column, not the value. The bytes are interpreted in that charset to produce the Go string (engine readers handle the conversion). |
 | `Binary`, `Varbinary`, `Blob` | `[]byte` | See [memory ownership](#memory-ownership-of-byte-slices) below. |
+| `Bit` | `string` | Fixed-width `'0'`/`'1'` bit-string (e.g. `"00001010"` for a `BIT(8)` value of 10). MySQL `BIT` and PG `bit(n)`/`varbit` both land in this canonical form; its bytewise order reproduces the server's `ORDER BY`, which the keyset-chunk clip fallback (`migcore.fallbackClipOrderUnsafeColumn`) relies on. |
 | `Date` | `time.Time` | Time portion is `00:00:00`, location is `UTC`. |
 | `Time` | `string` | A textual representation such as `"08:30:00"` or `"08:30:00.123456"`. Go's `time.Duration` is *not* used because some SQL `TIME` values fall outside its valid range. |
 | `DateTime` | `time.Time` | Location is `UTC` for transport. The semantics of "no time zone" are recorded on `Column.Type`, not on the value. |

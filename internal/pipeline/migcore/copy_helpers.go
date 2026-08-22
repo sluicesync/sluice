@@ -132,12 +132,16 @@ func TableNamesForPublication(schema *ir.Schema) []string {
 // requiring BoundedBatchedRowReader for the keyset strategy — and, since
 // the 2026-08-22 invariant sweep, by the completeness guard HERE: a
 // fallback read whose upper bound would clip an order-divergent PK family
-// REFUSES loudly instead of silently mis-clipping. The planners keep the
-// refusal unreachable today (only a single-Integer MIN/MAX table can
-// reach the fallback); the guard is what makes "the fallback never
-// silently drops a boundary-straddling collated row" true AT THE
-// CHOKEPOINT rather than by two hand-copies of a planner rule agreeing.
-// Pinned by TestReadChunkBatch_FallbackRefusesOrderDivergentPK.
+// REFUSES loudly instead of silently mis-clipping. No shipping engine
+// reaches this fallback at all: pg, mysql and sqlite all implement
+// BoundedBatchedRowReader, so the type assertion below takes the SQL-side
+// branch for EVERY real run regardless of PK family. The guard is pure
+// defense-in-depth for a future reader lacking the bounded surface (or a
+// test fake), making "the fallback never silently drops a boundary-
+// straddling collated row" true AT THE CHOKEPOINT rather than by two
+// hand-copies of a planner rule agreeing.
+// Pinned by TestReadChunkBatch_FallbackRefusesOrderDivergentPK and, for
+// the full family universe, TestFallbackClipOrder_ClassifiesEveryIRType.
 func ReadChunkBatch(
 	ctx context.Context,
 	br ir.BatchedRowReader,
@@ -192,8 +196,12 @@ func ReadChunkBatch(
 //     uses.
 //   - ir.Binary / ir.Varbinary / ir.Blob — bytewise on both sides (SQL
 //     binary collation).
-//   - ir.Bit — the IR-canonical fixed-width '0'/'1' string for the column;
-//     bytewise equals numeric at equal width.
+//   - ir.Bit — the IR-canonical '0'/'1' bit-string. MySQL BIT is numeric
+//     fixed-width, where bytewise on equal-width '0'/'1' reproduces numeric
+//     order; PG bit(n)/varbit orders LEXICOGRAPHICALLY on the bit-string
+//     (widths can differ within a varbit column, so "numeric at equal
+//     width" is NOT the reason it is safe), which bytewise '0'/'1' also
+//     reproduces. Either way the byte order matches the server's ORDER BY.
 //
 // Everything else is UNSAFE by default — notably Char/Varchar/Text (server
 // collation vs bytes), Decimal (numeric vs decimal-text bytes: "10" < "9"
