@@ -125,11 +125,19 @@ func TableNamesForPublication(schema *ir.Schema) []string {
 //
 // The Go-side bytewise [filterByUpperBound] is the FALLBACK for a reader
 // that lacks the bounded surface. It is correct only for families whose
-// byte order matches the collation order (integer, temporal, PG-native
-// uuid/bytea); string/decimal keyset tables are kept off this path by
-// shouldParallelChunk, which requires BoundedBatchedRowReader for the
-// keyset strategy. The fallback never runs for those families, so it can
-// never silently drop a boundary-straddling collated row.
+// [comparePKValue] order provably matches the server's ORDER BY order
+// (integer, temporal-as-time.Time, uuid/binary, bit); string/decimal
+// keyset tables are kept off this path by TWO planner gates —
+// shouldParallelChunk (migrate) and planBackupTableChunks (backup), each
+// requiring BoundedBatchedRowReader for the keyset strategy — and, since
+// the 2026-08-22 invariant sweep, by the completeness guard HERE: a
+// fallback read whose upper bound would clip an order-divergent PK family
+// REFUSES loudly instead of silently mis-clipping. The planners keep the
+// refusal unreachable today (only a single-Integer MIN/MAX table can
+// reach the fallback); the guard is what makes "the fallback never
+// silently drops a boundary-straddling collated row" true AT THE
+// CHOKEPOINT rather than by two hand-copies of a planner rule agreeing.
+// Pinned by TestReadChunkBatch_FallbackRefusesOrderDivergentPK.
 func ReadChunkBatch(
 	ctx context.Context,
 	br ir.BatchedRowReader,
@@ -144,11 +152,71 @@ func ReadChunkBatch(
 		// no upper predicate, identical to ReadRowsBatch.
 		return bb.ReadRowsBatchBounded(ctx, table, cursor, upperPK, limit)
 	}
+	if upperPK != nil {
+		// The Go-side clip is about to decide which boundary rows belong to
+		// this chunk. That decision is only exactly-once when comparePKValue's
+		// order matches the server's; for a family where it can diverge
+		// (collated strings, decimal-as-text, float, MySQL TIME text, enum
+		// ordinals) refuse rather than mis-clip — a caller reaching this
+		// branch with such a PK has bypassed the planner gates.
+		if col, typ := fallbackClipOrderUnsafeColumn(table, pkCols); col != "" {
+			return nil, fmt.Errorf(
+				"pipeline: ReadChunkBatch: table %q: reader %T does not implement BoundedBatchedRowReader and the "+
+					"Go-side upper-bound clip cannot honour the server's ORDER BY for primary-key column %q (%s) — its "+
+					"server order (collation/numeric) can diverge from the bytewise fallback, which would silently drop "+
+					"or double-copy boundary rows (ADR-0096). The chunk planners route such tables to a bounded reader "+
+					"or the single-reader path; refusing rather than mis-clipping", table.Name, br, col, typ,
+			)
+		}
+	}
 	rowsCh, err := br.ReadRowsBatch(ctx, table, cursor, limit)
 	if err != nil {
 		return nil, err
 	}
 	return filterByUpperBound(ctx, rowsCh, pkCols, upperPK), nil
+}
+
+// fallbackClipOrderUnsafeColumn returns the first PK column (and its type)
+// whose family's server ORDER BY can diverge from [comparePKValue]'s Go-side
+// order, or ("", nil) when every PK column is clip-safe.
+//
+// The ALLOW list is derived from comparePKValue's three arms and must only
+// ever contain a family for which the agreement is an argument, not a hope:
+//
+//   - ir.Integer / ir.Boolean — numeric compare on both sides.
+//   - ir.Date / ir.DateTime / ir.Timestamp — decoded to time.Time,
+//     compared chronologically; the server's temporal ORDER BY is
+//     chronological.
+//   - ir.UUID — the decoded value is the canonical lowercase-hex string,
+//     whose bytewise order preserves the 16-byte order PG's uuid ORDER BY
+//     uses.
+//   - ir.Binary / ir.Varbinary / ir.Blob — bytewise on both sides (SQL
+//     binary collation).
+//   - ir.Bit — the IR-canonical fixed-width '0'/'1' string for the column;
+//     bytewise equals numeric at equal width.
+//
+// Everything else is UNSAFE by default — notably Char/Varchar/Text (server
+// collation vs bytes), Decimal (numeric vs decimal-text bytes: "10" < "9"
+// bytewise), Float (fmt-text bytes: "-2" > "-1" bytewise), ir.Time (MySQL
+// TIME text admits 3-digit and negative hours), and Enum (server orders by
+// ordinal, Go compares the label). A PK column missing from the table's
+// column list is also unsafe: refusing a shape we cannot grade beats
+// guessing (the same posture as the planners' orderability gate).
+func fallbackClipOrderUnsafeColumn(table *ir.Table, pkCols []string) (string, ir.Type) {
+	for _, name := range pkCols {
+		col := LookupColumn(table, name)
+		if col == nil {
+			return name, nil
+		}
+		switch ir.UnwrapDomain(col.Type).(type) {
+		case ir.Integer, ir.Boolean, ir.Date, ir.DateTime, ir.Timestamp,
+			ir.UUID, ir.Binary, ir.Varbinary, ir.Blob, ir.Bit:
+			// clip-safe
+		default:
+			return name, ir.UnwrapDomain(col.Type)
+		}
+	}
+	return "", nil
 }
 
 // filterByUpperBound wraps a row channel with a goroutine that drops
