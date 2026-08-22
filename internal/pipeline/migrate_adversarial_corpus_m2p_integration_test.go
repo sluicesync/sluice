@@ -562,7 +562,11 @@ func advAssertRefusal(t *testing.T, err error, code sluicecode.Code, alt []strin
 		// bulk-copy table-failed code) may enclose the value refusal,
 		// and errors.As alone would stop at the first CodedError.
 		for e := err; e != nil; e = errors.Unwrap(e) {
-			if ce, ok := e.(*sluicecode.CodedError); ok && ce.Code == code {
+			// Deliberate per-level assertion, not errors.As: the chain
+			// can hold MULTIPLE CodedErrors (an outer bulk-copy wrapper
+			// around the value refusal) and errors.As stops at the
+			// first, which would hide the inner code.
+			if ce, ok := e.(*sluicecode.CodedError); ok && ce.Code == code { //nolint:errorlint // see comment above
 				return
 			}
 		}

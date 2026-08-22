@@ -198,6 +198,8 @@ func advCompare(mode advCmp, got, want string) bool {
 		g, gerr := strconv.ParseFloat(got, 32)
 		w, werr := strconv.ParseFloat(want, 32)
 		return gerr == nil && werr == nil && math.Float32bits(float32(g)) == math.Float32bits(float32(w))
+	case advCmpText:
+		return got == want
 	default:
 		return got == want
 	}
