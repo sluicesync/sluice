@@ -327,6 +327,14 @@ func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchT
 // type-blindness a tag would otherwise guard (int64(1) vs "1") is
 // unreachable here: a PK column has one fixed schema type per reader, so no
 // two rows of one table present the same column as different families.
+//
+// The cross-READER half of that argument — that decodeValue and
+// decodeVStreamCell render `%v`-equal Go values for EVERY PK family, not
+// just the unsigned-integer cell pinned above — is held by
+// TestFloatPatchKeyFamilies_ReadersRenderEqualGoValues
+// (internal/engines/mysql), added by the 2026-08-22 invariant sweep. A
+// family divergence here is a total per-table patch miss, which the SL-F2
+// zero-patched tripwire below only WARNs about by default.
 func floatPatchKey(row ir.Row, pkCols []string) string {
 	var b strings.Builder
 	for _, c := range pkCols {
