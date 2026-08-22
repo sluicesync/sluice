@@ -84,9 +84,15 @@ var byteaProvCases = []byteaProvCase{
 		arr:  `ARRAY[convert_to('\xdead','UTF8'), NULL, ''::bytea]`,
 	},
 	{
+		// The arr here is the 3-D cell audit B-2d named as absent: Bug 74's
+		// numeric[][] flatten was invisible at 1-D, and a codec that
+		// preserves one nesting level can still lose the second. It also
+		// carries a NULL element and an uppercase-collision leaf, so the
+		// multi-dim path is graded on the same ambiguities as the scalars.
 		name: `collision: uppercase \xDEAD as 6 bytes`,
 		sql:  `convert_to('\xDEAD','UTF8')`,
-		arr:  `NULL`,
+		arr: `ARRAY[ARRAY[ARRAY[convert_to('\xDEAD','UTF8'), '\xbeef'::bytea], ARRAY[NULL::bytea, ''::bytea]],` +
+			` ARRAY[ARRAY['\x00'::bytea, '\xff01'::bytea], ARRAY['\xdead'::bytea, '\x00ff'::bytea]]]`,
 	},
 	{
 		name: `control: invalid hex \xzz (4 bytes) — right answer pre-fix too`,
@@ -99,9 +105,13 @@ var byteaProvCases = []byteaProvCase{
 		arr:  `NULL`,
 	},
 	{
+		// 2-D with a NULL element — case 2's 2-D array is all non-NULL, and
+		// a NULL inside a nested dimension takes a different token path in
+		// both pgx's array text and the pgoutput literal than a NULL in a
+		// 1-D array (case 3).
 		name: "genuine binary",
 		sql:  `'\x00ff1080'::bytea`,
-		arr:  `NULL`,
+		arr:  `ARRAY[ARRAY['\x00ff'::bytea, NULL], ARRAY[''::bytea, '\xdead'::bytea]]`,
 	},
 	{
 		name: "empty",
@@ -345,6 +355,45 @@ func assertByteaRowsMatchServer(t *testing.T, lane string, rows []ir.Row, want m
 	}
 }
 
+// assertByteaArrayShapeFloor is the anti-vacuity floor for the bytea[]
+// half of the matrix (audit B-2d). It derives the shape inventory from
+// the SERVER's own answers — never from the case table, which is what it
+// is checking — and fails loudly if any required shape stopped being
+// seeded: someone simplifying byteaProvCases must not be able to quietly
+// turn the multi-dim / NULL-element / empty cells vacuous while every
+// remaining assertion stays green.
+func assertByteaArrayShapeFloor(t *testing.T, want map[int64]byteaGroundTruth) {
+	t.Helper()
+	var d1, d2, d3, nullElem, empty, nilArr bool
+	for _, gt := range want {
+		if gt.arrNil {
+			nilArr = true
+			continue
+		}
+		switch strings.Count(gt.arrDims, "[") {
+		case 1:
+			d1 = true
+		case 2:
+			d2 = true
+		case 3:
+			d3 = true
+		case 0:
+			// array_dims is NULL for an empty array; arrNil already
+			// separated the NULL-array case above.
+			empty = true
+		}
+		for _, e := range gt.arrElems {
+			if e == "<NULL>" {
+				nullElem = true
+			}
+		}
+	}
+	if !d1 || !d2 || !d3 || !nullElem || !empty || !nilArr {
+		t.Fatalf("bytea[] shape floor (audit B-2d): 1-D=%v 2-D=%v 3-D=%v NULL-element=%v empty=%v NULL-array=%v — "+
+			"every shape must be seeded or the matrix has gone vacuous", d1, d2, d3, nullElem, empty, nilArr)
+	}
+}
+
 // TestPremise_ByteaScanShapes is the premise-naming step for item 135.
 //
 // The fix's safety argument cites two facts about pgx's `*any` scan, and
@@ -433,11 +482,224 @@ func TestPremise_ByteaScanShapes(t *testing.T) {
 	}
 }
 
+// TestByteaProvenance_ExecModeShapeMatrix closes audit B-2d's Postgres
+// half: bytea[] × pgx exec mode was pinned only on the 1-D, two-element,
+// non-NULL shape (TestPremise_ByteaScanShapes binds THAT literal on
+// purpose and keeps it), and Bug 74 originated in a driver-side
+// difference — pgtype.Array[*string] flattening numeric[][] to 1-D —
+// that no sluice code path could see. Exec mode × shape is therefore the
+// cell that matters: the driver's decode route is chosen per mode and
+// per target OID, so a green 1-D cell says nothing about 2-D, 3-D,
+// NULL-element or empty deliveries.
+//
+// Each cell scans the array into *any in one exec mode, asserts the
+// premise shape (a STRING in PG array-text form — the fact the array
+// lane's scan-path hex-decode rests on), routes it through the REAL
+// decoder (decodeValueFromBinary with ir.Array{Element: ir.Blob{}} —
+// the same call the RowReader makes), and compares dimensionality and
+// per-element bytes against the server's own array_dims/encode answers.
+// A flatten, a dropped or mangled element, or a mode-dependent delivery
+// change all fail here by name.
+//
+// The independent expected value (the 2026-08-01 rule) is again the
+// server's array_dims + per-element encode(e,'hex'), read back through
+// plain text columns that never reach decodeBytea.
+func TestByteaProvenance_ExecModeShapeMatrix(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+
+	// The shape axis. NULL-element cells put the NULL both in a flat
+	// array and inside a nested dimension (different token paths in the
+	// array text); the NULL-array row is the control that separates "no
+	// array" from "an array with nothing in it".
+	shapes := []struct {
+		name string
+		sql  string
+	}{
+		{"1-D", `ARRAY[convert_to('\xdead','UTF8'), ''::bytea, '\x00ff'::bytea]`},
+		{"2-D", `ARRAY[ARRAY[convert_to('\xdead','UTF8'), '\xbeef'::bytea], ARRAY[''::bytea, '\x00'::bytea]]`},
+		{
+			"3-D",
+			`ARRAY[ARRAY[ARRAY['\xde'::bytea, convert_to('\x','UTF8')], ARRAY[NULL::bytea, ''::bytea]],` +
+				` ARRAY[ARRAY['\x00ff'::bytea, '\xad'::bytea], ARRAY[convert_to('\xDEAD','UTF8'), '\xff'::bytea]]]`,
+		},
+		{"NULL-element", `ARRAY[convert_to('\xdead','UTF8'), NULL, ''::bytea]`},
+		{"2-D-NULL-element", `ARRAY[ARRAY['\xdead'::bytea, NULL], ARRAY[NULL::bytea, '\x00'::bytea]]`},
+		{"empty", `ARRAY[]::bytea[]`},
+		{"NULL-array", `NULL`},
+	}
+
+	applyDDL(t, dsn, `CREATE TABLE bytea_mode (id BIGINT PRIMARY KEY, ba bytea[]);`)
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO bytea_mode (id, ba) VALUES\n")
+	for i, sh := range shapes {
+		if i > 0 {
+			sb.WriteString(",\n")
+		}
+		fmt.Fprintf(&sb, "\t(%d, %s)", i+1, sh.sql)
+	}
+	sb.WriteString(";")
+	applyDDL(t, dsn, sb.String())
+
+	want := readByteaModeGroundTruth(t, dsn, len(shapes))
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	modes := []struct {
+		name string
+		mode pgx.QueryExecMode
+	}{
+		{"cache_statement", pgx.QueryExecModeCacheStatement},
+		{"cache_describe", pgx.QueryExecModeCacheDescribe},
+		{"describe_exec", pgx.QueryExecModeDescribeExec},
+		{"exec", pgx.QueryExecModeExec},
+		{"simple_protocol", pgx.QueryExecModeSimpleProtocol},
+	}
+
+	cells := 0
+	for _, m := range modes {
+		m := m
+		for i, sh := range shapes {
+			i, sh := i, sh
+			t.Run(m.name+"/"+sh.name, func(t *testing.T) {
+				id := int64(i + 1)
+				gt, known := want[id]
+				if !known {
+					t.Fatalf("no ground truth for id %d", id)
+				}
+
+				// The id is interpolated rather than bound on purpose: the
+				// axis under test is the exec mode's decode route, and
+				// binding a parameter changes what simple_protocol does
+				// with the STATEMENT, which is not the thing being graded.
+				var raw any
+				if err := db.QueryRowContext(
+					ctx, fmt.Sprintf(`SELECT ba FROM bytea_mode WHERE id = %d`, id), m.mode,
+				).Scan(&raw); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+
+				label := fmt.Sprintf("%s/%s", m.name, sh.name)
+				if raw == nil {
+					if !gt.isNil {
+						t.Fatalf("%s: scanned NULL; server holds dims %q elems %v", label, gt.dims, gt.elems)
+					}
+					cells++
+					return
+				}
+				if gt.isNil {
+					t.Fatalf("%s: scanned %#v; server holds NULL", label, raw)
+				}
+
+				// Premise extension: the array-text-string delivery that
+				// TestPremise_ByteaScanShapes pins for the 1-D shape must
+				// hold for EVERY shape in EVERY mode — it is what makes
+				// the scan-path hex-decode sound.
+				if _, ok := raw.(string); !ok {
+					t.Fatalf("%s: bytea[] scanned as %T; the scan lane's premise is a string in PG array-text form", label, raw)
+				}
+
+				decoded, err := decodeValueFromBinary(raw, ir.Array{Element: ir.Blob{Size: ir.BlobLong}})
+				if err != nil {
+					t.Fatalf("%s: decode: %v", label, err)
+				}
+				var flat []string
+				flattenByteaArray(t, label, decoded, &flat)
+				if strings.Join(flat, ",") != strings.Join(gt.elems, ",") {
+					t.Errorf("%s: elements = %v; server holds %v", label, flat, gt.elems)
+				}
+				if got := decodedArrayDims(decoded); got != gt.dims {
+					t.Errorf("%s: dims = %q; server's array_dims is %q — a dimensionality change is exactly Bug 74's shape",
+						label, got, gt.dims)
+				}
+				cells++
+			})
+		}
+	}
+
+	// Anti-vacuity floor: 5 modes × 7 shapes. A refactor that quietly
+	// drops shapes or modes must fail here rather than shrink coverage.
+	if min := 30; cells < min {
+		t.Fatalf("exec-mode × shape matrix exercised %d cells; want >= %d — the matrix has gone vacuous", cells, min)
+	}
+}
+
+// byteaArrayShapeTruth is the server's own answer for one bytea_mode row.
+type byteaArrayShapeTruth struct {
+	dims  string   // PG array_dims; "" for empty and NULL
+	elems []string // row-major element hex; "<NULL>" for a NULL element
+	isNil bool
+}
+
+// readByteaModeGroundTruth reads the exec-mode matrix's independent
+// expected values, the same way readByteaGroundTruth does for the main
+// fixture: through text/int columns that never reach decodeBytea.
+func readByteaModeGroundTruth(t *testing.T, dsn string, wantRows int) map[int64]byteaArrayShapeTruth {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `
+		SELECT id,
+		       ba IS NULL,
+		       array_dims(ba),
+		       (SELECT string_agg(coalesce(encode(e,'hex'),'<NULL>'), ',' ORDER BY o)
+		          FROM unnest(ba) WITH ORDINALITY AS u(e,o))
+		FROM bytea_mode
+		ORDER BY id`)
+	if err != nil {
+		t.Fatalf("ground-truth query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[int64]byteaArrayShapeTruth{}
+	for rows.Next() {
+		var (
+			id     int64
+			baNull bool
+			dims   sql.NullString
+			elems  sql.NullString
+			gt     byteaArrayShapeTruth
+		)
+		if err := rows.Scan(&id, &baNull, &dims, &elems); err != nil {
+			t.Fatalf("ground-truth scan: %v", err)
+		}
+		gt.isNil = baNull
+		gt.dims = dims.String
+		if elems.Valid && elems.String != "" {
+			gt.elems = strings.Split(elems.String, ",")
+		} else {
+			gt.elems = []string{}
+		}
+		out[id] = gt
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("ground-truth iterate: %v", err)
+	}
+	if len(out) != wantRows {
+		t.Fatalf("ground truth has %d rows; want %d", len(out), wantRows)
+	}
+	return out
+}
+
 // TestByteaProvenance_ScanLanes is the scan half of the item-135 matrix:
 // provenance rows scan-scalar (ReadRows) and chunked scan
 // (ReadRowsBatch / ReadRowsBatchBounded — the door the orchestrator's
 // within-table chunking uses) × every value shape, plus the bytea[]
-// shapes 1-D / 2-D / NULL-element / empty / NULL.
+// shapes 1-D / 2-D / 3-D / NULL-element (1-D and nested) / empty / NULL,
+// held to a floor by assertByteaArrayShapeFloor.
 //
 // Scope, stated rather than implied: BOTH scan doors funnel through the
 // single RowReader.stream, so this covers every non-raw-COPY scan path
@@ -460,6 +722,7 @@ func TestByteaProvenance_ScanLanes(t *testing.T) {
 	applyDDL(t, dsn, byteaProvDDL)
 	applyDDL(t, dsn, byteaProvInsert())
 	want := readByteaGroundTruth(t, dsn)
+	assertByteaArrayShapeFloor(t, want)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -551,6 +814,7 @@ func TestByteaProvenance_CDCTuple(t *testing.T) {
 
 	applyPGSQL(t, dsn, byteaProvInsert())
 	want := readByteaGroundTruth(t, dsn)
+	assertByteaArrayShapeFloor(t, want)
 
 	got := drainChanges(t, ctx, changes, len(byteaProvCases), 60*time.Second)
 	if len(got) != len(byteaProvCases) {
