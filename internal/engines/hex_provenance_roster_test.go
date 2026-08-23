@@ -35,32 +35,32 @@
 //     deliberate exclusions, not oversights: none of them is a place
 //     where a stored value's reading is in question.
 //
-// # Two ways this roster is NARROWER than its name, neither a defect
-// today (2026-08-07 review)
+// # Two ways this roster USED to be narrower than its name, both closed
+// (audit backlog B-2e, closed 2026-08-22; originally stated here rather
+// than left implied, because a gate whose coverage is narrower than its
+// name is worse than no gate)
 //
-// Stated here rather than left implied, because a gate whose coverage is
-// narrower than its name is worse than no gate — it stops the next
-// reader from looking:
-//
-//   - It is FUNCTION-keyed with first-occurrence dedup (see
-//     findHexDecodeSites). A SECOND hex-decode added inside an
-//     already-blessed function is auto-blessed by the entry that covers
-//     the first — the roster records one verdict per function, and the
-//     new site inherits it whether or not the verdict applies. Checked
-//     rather than assumed: every rostered function today contains
-//     exactly ONE matched call (mydumper's two live in separate
-//     functions — scanBareHexValue and scanQuotedHexValue — and the
-//     `hex.DecodedLen` next to decodeGeometryHexOrRaw's `hex.Decode` is
-//     deliberately not a matched form).
-//   - [isHexDecodeCall] requires the selector base to be the literal
+//   - It was FUNCTION-keyed with first-occurrence dedup, so a SECOND
+//     hex-decode added inside an already-blessed function was
+//     auto-blessed by the entry covering the first. Now every matched
+//     CALL is recorded: a function with one call keys as before
+//     ("pkg.func"), and a function with N>1 calls keys each site
+//     independently as "pkg.func#1".."pkg.func#N" (source order across
+//     the package's files, which [filepath.WalkDir] visits
+//     lexically) — so adding a second decode to a blessed function
+//     produces an unrostered "#2" key AND makes the un-suffixed entry
+//     stale, failing in both directions. Reordering or same-named
+//     methods on different receivers renumber and force a re-grade,
+//     which is the safe direction. Pinned by
+//     [TestFindHexDecodeSites_WalkerCapabilities].
+//   - [isHexDecodeCall] required the selector base to be the literal
 //     identifier `hex`, so an aliased import (`import ehex
-//     "encoding/hex"`) evades the walk entirely. The
-//     [hexDecodeSiteFloor] catches a wholesale break, not one aliased
-//     site. No engine package aliases the import today.
-//
-// Both are fixable — key by position instead of function, and resolve
-// the import name per file — and neither was worth doing on a
-// release-blocking pass. Filed in docs/dev/audit-backlog.md.
+//     "encoding/hex"`) evaded the walk entirely. The import name is now
+//     resolved PER FILE from the file's own import of "encoding/hex"
+//     (and only that import — a foreign package aliased AS `hex` no
+//     longer matches), and a dot-import of encoding/hex fails the walk
+//     loudly instead of silently hiding every bare Decode call. Also
+//     pinned by [TestFindHexDecodeSites_WalkerCapabilities].
 //
 // A site's verdict is one of three, and each names the thing that DECIDES
 // the reading — never the content:
@@ -79,6 +79,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -251,13 +252,24 @@ func TestHexDecodeSitesAreProvenanceDecided(t *testing.T) {
 	}
 }
 
-// findHexDecodeSites walks root for non-test Go sources and returns
-// "<package dir>.<enclosing func>" → "file:line" for every call to
-// hex.Decode / hex.DecodeString / decodeHexByteaText.
+// findHexDecodeSites walks root for non-test Go sources and returns one
+// key per CALL SITE of hex.Decode / hex.DecodeString /
+// decodeHexByteaText: "<package dir>.<enclosing func>" when the
+// function contains exactly one matched call, and
+// "<package dir>.<enclosing func>#N" (1-based, source order) when it
+// contains more — so every site is graded independently and a second
+// decode added to a blessed function cannot inherit its verdict
+// (audit backlog B-2e).
 //
 // Keyed by the DIRECTORY name rather than the package clause so the
 // `-trigger` engines (whose package names differ from their dirs) key
 // readably; every engine lives in its own directory.
+//
+// The `hex` selector is resolved against each FILE's own import of
+// "encoding/hex" — default name or alias — so an aliased import cannot
+// evade the walk, and an unrelated package imported AS `hex` does not
+// false-match. A dot-import of encoding/hex is refused loudly: it makes
+// every Decode call a bare identifier this walk cannot attribute.
 func findHexDecodeSites(root string) (map[string]string, error) {
 	out := map[string]string{}
 	fset := token.NewFileSet()
@@ -273,27 +285,38 @@ func findHexDecodeSites(root string) (map[string]string, error) {
 		if perr != nil {
 			return fmt.Errorf("parse %s: %w", path, perr)
 		}
+		hexName, dotImported := localHexImportName(file)
+		if dotImported {
+			return fmt.Errorf(
+				"%s dot-imports encoding/hex, which turns every Decode call into a bare identifier "+
+					"this provenance walk cannot attribute — use a named import", path)
+		}
 		pkgDir := filepath.Base(filepath.Dir(path))
 		ast.Inspect(file, func(n ast.Node) bool {
 			fn, ok := n.(*ast.FuncDecl)
 			if !ok {
 				return true
 			}
+			var positions []token.Position
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				call, ok := inner.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				if !isHexDecodeCall(call.Fun) {
+				if !isHexDecodeCall(call.Fun, hexName) {
 					return true
 				}
-				key := pkgDir + "." + fn.Name.Name
-				if _, seen := out[key]; !seen {
-					pos := fset.Position(call.Pos())
-					out[key] = fmt.Sprintf("%s:%d", filepath.ToSlash(path), pos.Line)
-				}
+				positions = append(positions, fset.Position(call.Pos()))
 				return true
 			})
+			base := pkgDir + "." + fn.Name.Name
+			for i, pos := range positions {
+				key := base
+				if len(positions) > 1 {
+					key = fmt.Sprintf("%s#%d", base, i+1)
+				}
+				out[key] = fmt.Sprintf("%s:%d", filepath.ToSlash(path), pos.Line)
+			}
 			return true
 		})
 		return nil
@@ -301,16 +324,41 @@ func findHexDecodeSites(root string) (map[string]string, error) {
 	return out, err
 }
 
+// localHexImportName returns the identifier "encoding/hex" is bound to
+// in this file ("" when the file does not import it) and whether it is
+// dot-imported. The blank import (`_`) returns "" like a missing import:
+// it binds no identifier a call could go through.
+func localHexImportName(file *ast.File) (name string, dotImported bool) {
+	for _, imp := range file.Imports {
+		if imp.Path == nil || imp.Path.Value != `"encoding/hex"` {
+			continue
+		}
+		if imp.Name == nil {
+			return "hex", false
+		}
+		switch imp.Name.Name {
+		case ".":
+			return "", true
+		case "_":
+			return "", false
+		default:
+			return imp.Name.Name, false
+		}
+	}
+	return "", false
+}
+
 // isHexDecodeCall reports whether the call target is one of the three
-// forms that turn hex text into bytes. hex.EncodeToString and
-// hex.DecodedLen are deliberately NOT matched — encoding is never
-// ambiguous, and DecodedLen only sizes a buffer for a Decode that is
-// itself matched.
-func isHexDecodeCall(fun ast.Expr) bool {
+// forms that turn hex text into bytes, with hexName the file-local name
+// of the encoding/hex import ("" when the file does not import it).
+// hex.EncodeToString and hex.DecodedLen are deliberately NOT matched —
+// encoding is never ambiguous, and DecodedLen only sizes a buffer for a
+// Decode that is itself matched.
+func isHexDecodeCall(fun ast.Expr, hexName string) bool {
 	switch f := fun.(type) {
 	case *ast.SelectorExpr:
 		pkg, ok := f.X.(*ast.Ident)
-		if !ok || pkg.Name != "hex" {
+		if !ok || hexName == "" || pkg.Name != hexName {
 			return false
 		}
 		return f.Sel.Name == "Decode" || f.Sel.Name == "DecodeString"
@@ -318,6 +366,139 @@ func isHexDecodeCall(fun ast.Expr) bool {
 		return f.Name == "decodeHexByteaText"
 	}
 	return false
+}
+
+// TestFindHexDecodeSites_WalkerCapabilities pins the two B-2e holes
+// closed against synthetic sources, so the closures cannot regress
+// silently even between mutation runs:
+//
+//   - an ALIASED encoding/hex import is walked (and a foreign package
+//     merely NAMED hex is not),
+//   - a SECOND decode inside one function gets its own key instead of
+//     inheriting the first's blessing,
+//   - a dot-import of encoding/hex fails the walk loudly,
+//   - and the encode-side forms stay unmatched.
+func TestFindHexDecodeSites_WalkerCapabilities(t *testing.T) {
+	writeSrc := func(t *testing.T, dir, name, src string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("aliased import is walked", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import ehex "encoding/hex"
+
+func decodeAliased(s string) ([]byte, error) { return ehex.DecodeString(s) }
+`)
+		found, err := findHexDecodeSites(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := found["enginex.decodeAliased"]; !ok {
+			t.Fatalf("aliased-import hex.DecodeString was NOT found — the B-2e alias hole is open again. Found: %v", sortedKeys(found))
+		}
+	})
+
+	t.Run("foreign package named hex does not false-match", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import hex "example.com/nothex"
+
+func notADecode(s string) ([]byte, error) { return hex.DecodeString(s) }
+`)
+		found, err := findHexDecodeSites(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(found) != 0 {
+			t.Fatalf("a foreign package aliased AS hex was matched: %v", sortedKeys(found))
+		}
+	})
+
+	t.Run("second decode in one function keys independently", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import "encoding/hex"
+
+func decodeTwice(a, b string) ([]byte, []byte) {
+	x, _ := hex.DecodeString(a)
+	y, _ := hex.DecodeString(b)
+	return x, y
+}
+`)
+		found, err := findHexDecodeSites(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := found["enginex.decodeTwice#1"]; !ok {
+			t.Fatalf("first call of a two-call function not keyed #1. Found: %v", sortedKeys(found))
+		}
+		if _, ok := found["enginex.decodeTwice#2"]; !ok {
+			t.Fatalf("SECOND call of a two-call function has no key of its own — the B-2e dedup hole is open again. Found: %v", sortedKeys(found))
+		}
+		if _, ok := found["enginex.decodeTwice"]; ok {
+			t.Fatalf("a two-call function still carries the un-suffixed key, which a stale single-verdict entry could bless. Found: %v", sortedKeys(found))
+		}
+		if found["enginex.decodeTwice#1"] == found["enginex.decodeTwice#2"] {
+			t.Fatalf("both ordinals point at the same position %q", found["enginex.decodeTwice#1"])
+		}
+	})
+
+	t.Run("single call keeps the un-suffixed key", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import "encoding/hex"
+
+func decodeOnce(s string) ([]byte, error) { return hex.DecodeString(s) }
+`)
+		found, err := findHexDecodeSites(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := found["enginex.decodeOnce"]; !ok {
+			t.Fatalf("single-call function no longer keys as pkg.func — every existing roster entry would go stale. Found: %v", sortedKeys(found))
+		}
+	})
+
+	t.Run("dot-import fails loudly", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import . "encoding/hex"
+
+func decodeDotted(s string) ([]byte, error) { return DecodeString(s) }
+`)
+		if _, err := findHexDecodeSites(root); err == nil {
+			t.Fatal("a dot-import of encoding/hex walked clean — its bare Decode calls are invisible to this gate and it must refuse instead")
+		}
+	})
+
+	t.Run("encode-side forms stay unmatched", func(t *testing.T) {
+		root := t.TempDir()
+		writeSrc(t, filepath.Join(root, "enginex"), "a.go", `package enginex
+
+import "encoding/hex"
+
+func encodeOnly(b []byte) (string, int) { return hex.EncodeToString(b), hex.DecodedLen(4) }
+`)
+		found, err := findHexDecodeSites(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(found) != 0 {
+			t.Fatalf("an encode-side form was matched: %v", sortedKeys(found))
+		}
+	})
 }
 
 func sortedKeys(m map[string]string) []string {
