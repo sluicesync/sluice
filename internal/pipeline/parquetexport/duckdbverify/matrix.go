@@ -10,13 +10,22 @@ package main
 // discipline: every family the codec dispatches on, every shape
 // variant), re-checked here against an EXTERNAL reader: native
 // (bool / signed / unsigned-max / float bit-shapes incl. -0.0 signbit,
-// NaN, ±Inf, denormal), string leaves (incl. empty-vs-NULL), temporals
-// (DATE incl. year 1, µs timestamps naive + tz, time-of-day), all
-// three DECIMAL physical tiers + the string fallback, JSON (incl. the
-// present-"null"-body-vs-SQL-NULL distinction), bytes/WKB, and lists
-// (SET + every array element family), plus the structural contracts:
-// multi-chunk → row-group placement, footer kv metadata, and DuckDB's
-// decoded column types.
+// NaN, ±Inf, denormal), string leaves (incl. empty-vs-NULL, PAD-SPACE
+// trailing spaces, an embedded NUL byte, and a decomposed combining
+// sequence that must not normalize), temporals (DATE incl. year 1, µs
+// timestamps naive + tz, time-of-day), all three DECIMAL physical
+// tiers + the string fallback, JSON (incl. the
+// present-"null"-body-vs-SQL-NULL distinction and a >2^53 integer
+// body), bytes (incl. a trailing 0x00) / WKB, and lists (SET + every
+// array element leaf the codec can nest: signed/unsigned int, float,
+// text, all three decimal tiers, tz + naive timestamps, date,
+// time-of-day, bool, bytes, JSON — each × {values incl. NULL element,
+// empty list, NULL list}), plus the structural contracts: multi-chunk
+// → row-group placement, footer kv metadata, and DuckDB's decoded
+// column + list-element types. (Multi-dimensional array values cannot
+// appear here: the encoder REFUSES them loudly before any file exists
+// — pinned per element family in roundtrip_pin_test.go's
+// TestPin_ArrayElementFamilies.)
 //
 // Expected values are DERIVED BY HAND from the Parquet spec + DuckDB's
 // documented renderings (ground-truthed once against DuckDB v1.5.4),
@@ -24,6 +33,7 @@ package main
 // re-introduce exactly the self-consistency this gate exists to break.
 
 import (
+	"encoding/json"
 	"math"
 	"time"
 
@@ -195,6 +205,16 @@ func strsSpec() tableSpec {
 			"cid": nil, "mac": nil, "en": nil, "bt": nil, "itv": nil, "ttz": nil,
 			"ext": nil, "dom": nil,
 		},
+		{
+			// The adversarial-text row: CHAR with trailing spaces (the
+			// PAD-SPACE edge — the padding is data and must survive
+			// verbatim), a 4-byte astral emoji + a DECOMPOSED combining
+			// sequence (must not be unicode-normalized), and an embedded
+			// NUL byte (MySQL text allows U+0000; the byte is data).
+			"id": int64(4), "ch": "ab  ", "vc": "\U0001F980é", "txt": "a\x00b",
+			"uid": nil, "ine": nil, "cid": nil, "mac": nil, "en": nil,
+			"bt": nil, "itv": nil, "ttz": nil, "ext": nil, "dom": nil,
+		},
 	}
 	return tableSpec{name: "strs", table: table, chunks: [][]ir.Row{rows}}
 }
@@ -223,17 +243,29 @@ func strsChecks() []check {
 					"cid": nil, "mac": nil, "en": nil, "bt": nil, "itv": nil, "ttz": nil,
 					"ext": nil, "dom": nil,
 				},
+				{
+					"id": 4, "ch": "ab  ", "vc": "\U0001F980é", "txt": "a\x00b",
+					"uid": nil, "ine": nil, "cid": nil, "mac": nil, "en": nil,
+					"bt": nil, "itv": nil, "ttz": nil, "ext": nil, "dom": nil,
+				},
 			},
 		},
 		{
 			// Empty string vs NULL, asserted structurally rather than
-			// through JSON rendering alone.
-			Name:  "strs/empty-vs-null",
-			Query: `SELECT id, txt IS NULL AS is_null, length(txt) AS len FROM read_parquet('strs.parquet') ORDER BY id;`,
+			// through JSON rendering alone. Row 4 additionally pins the
+			// adversarial-text bytes structurally: the trailing-space CHAR
+			// keeps its padding (octet_length 4), the decomposed 🦀e+U+0301
+			// sequence keeps all 7 bytes (no unicode normalization), and
+			// the NUL-bearing txt keeps its 3 bytes (no C-string
+			// truncation at the NUL).
+			Name: "strs/empty-vs-null",
+			Query: `SELECT id, txt IS NULL AS is_null, strlen(txt) AS len, strlen(ch) AS ch_len, ` +
+				`strlen(vc) AS vc_len FROM read_parquet('strs.parquet') ORDER BY id;`,
 			Want: []map[string]any{
-				{"id": 1, "is_null": false, "len": 4},
-				{"id": 2, "is_null": false, "len": 0},
-				{"id": 3, "is_null": true, "len": nil},
+				{"id": 1, "is_null": false, "len": 4, "ch_len": 3, "vc_len": 16},
+				{"id": 2, "is_null": false, "len": 0, "ch_len": 2, "vc_len": 5},
+				{"id": 3, "is_null": true, "len": nil, "ch_len": nil, "vc_len": nil},
+				{"id": 4, "is_null": false, "len": 3, "ch_len": 4, "vc_len": 7},
 			},
 		},
 		{
@@ -401,6 +433,11 @@ func jsonbSpec() tableSpec {
 		// SQL NULL — the distinction must survive an external reader.
 		{"id": int64(3), "j": []byte("null"), "bl": nil, "geo": nil},
 		{"id": int64(4), "j": nil, "bl": nil, "geo": nil},
+		// 2^53+1 inside a JSON body: any reader stage that routes JSON
+		// numbers through float64 lands …992 — the exact digits are the
+		// assertion. The blob's TRAILING 0x00 is the pad-strip class:
+		// trailing NULs are data and must survive byte-exact.
+		{"id": int64(5), "j": []byte(`{"n": 9007199254740993}`), "bl": []byte{0x01, 0x00, 0x00}, "geo": nil},
 	}
 	return tableSpec{name: "jsonb", table: table, chunks: [][]ir.Row{rows}}
 }
@@ -419,6 +456,7 @@ func jsonbChecks() []check {
 				{"id": 2, "j": `"str"`, "j_null": false, "bl": "", "bl_null": false, "geo": nil},
 				{"id": 3, "j": "null", "j_null": false, "bl": nil, "bl_null": true, "geo": nil},
 				{"id": 4, "j": nil, "j_null": true, "bl": nil, "bl_null": true, "geo": nil},
+				{"id": 5, "j": `{"n": 9007199254740993}`, "j_null": false, "bl": "010000", "bl_null": false, "geo": nil},
 			},
 		},
 		{
@@ -445,10 +483,15 @@ func listsSpec() tableSpec {
 		col("af", ir.Array{Element: ir.Float{Precision: ir.FloatDouble}}),
 		col("atext", ir.Array{Element: ir.Text{}}),
 		col("ad", ir.Array{Element: ir.Decimal{Precision: 9, Scale: 2}}),
+		col("ad18", ir.Array{Element: ir.Decimal{Precision: 18, Scale: 6}}),
 		col("ad38", ir.Array{Element: ir.Decimal{Precision: 38, Scale: 10}}),
 		col("atz", ir.Array{Element: ir.Timestamp{Precision: 6, WithTimeZone: true}}),
+		col("ats", ir.Array{Element: ir.DateTime{Precision: 6}}),
 		col("adate", ir.Array{Element: ir.Date{}}),
 		col("atod", ir.Array{Element: ir.Time{Precision: 6}}),
+		col("ab", ir.Array{Element: ir.Boolean{}}),
+		col("abl", ir.Array{Element: ir.Blob{}}),
+		col("aj", ir.Array{Element: ir.JSON{}}),
 	}}
 	rows := []ir.Row{
 		{
@@ -459,19 +502,26 @@ func listsSpec() tableSpec {
 			"af":    []any{1.5, nil, math.Inf(1)},
 			"atext": []any{"a", nil, ""},
 			"ad":    []any{"1.23", nil, "-0.01"},
+			"ad18":  []any{"999999999999.999999", nil, "-0.000001"},
 			"ad38":  []any{"1.2345678901", nil},
 			"atz":   []any{time.Date(2026, 7, 15, 1, 2, 3, 4000, time.UTC), nil},
+			"ats":   []any{time.Date(1899, 12, 31, 23, 59, 59, 999999000, time.UTC), nil},
 			"adate": []any{date(1969, 12, 31), nil},
 			"atod":  []any{"08:00:00.25", nil},
+			"ab":    []any{true, nil, false},
+			"abl":   []any{[]byte{0x01, 0x00}, nil, []byte{}},
+			"aj":    []any{[]byte(`{"a": 1}`), nil},
 		},
 		{
 			// Empty lists are PRESENT empties, distinct from NULL lists.
 			"id": int64(2), "st": []string{}, "ai": []any{}, "au": []any{}, "af": []any{},
-			"atext": []any{}, "ad": []any{}, "ad38": []any{}, "atz": []any{}, "adate": []any{}, "atod": []any{},
+			"atext": []any{}, "ad": []any{}, "ad18": []any{}, "ad38": []any{}, "atz": []any{}, "ats": []any{},
+			"adate": []any{}, "atod": []any{}, "ab": []any{}, "abl": []any{}, "aj": []any{},
 		},
 		{
 			"id": int64(3), "st": nil, "ai": nil, "au": nil, "af": nil,
-			"atext": nil, "ad": nil, "ad38": nil, "atz": nil, "adate": nil, "atod": nil,
+			"atext": nil, "ad": nil, "ad18": nil, "ad38": nil, "atz": nil, "ats": nil,
+			"adate": nil, "atod": nil, "ab": nil, "abl": nil, "aj": nil,
 		},
 	}
 	return tableSpec{name: "lists", table: table, chunks: [][]ir.Row{rows}}
@@ -481,11 +531,17 @@ func listsChecks() []check {
 	// Float elements go through the same bit-exact printf projection as
 	// native/values (to_json of ±Inf is not JSON, so project first).
 	const afProj = `to_json(list_transform(af, lambda f: CASE WHEN f IS NULL THEN NULL WHEN isnan(f) THEN 'NaN' WHEN isinf(f) AND f > 0 THEN 'Inf' WHEN isinf(f) THEN '-Inf' ELSE printf('%.17e', f) END))`
+	// BLOB elements are projected to per-element hex so the byte content
+	// (incl. a TRAILING 0x00 and the empty-vs-NULL element distinction)
+	// compares exactly through the JSON transport.
+	const ablProj = `to_json(list_transform(abl, lambda b: CASE WHEN b IS NULL THEN NULL ELSE hex(b) END))`
 	return []check{
 		{
 			Name: "lists/values",
 			Query: `SELECT id, to_json(st) AS st, to_json(ai) AS ai, to_json(au) AS au, ` + afProj + ` AS af, ` +
-				`to_json(atext) AS atext, to_json(ad) AS ad, to_json(ad38) AS ad38, to_json(atz) AS atz, to_json(adate) AS adate, to_json(atod) AS atod ` +
+				`to_json(atext) AS atext, to_json(ad) AS ad, to_json(ad18) AS ad18, to_json(ad38) AS ad38, ` +
+				`to_json(atz) AS atz, to_json(ats) AS ats, to_json(adate) AS adate, to_json(atod) AS atod, ` +
+				`to_json(ab) AS ab, ` + ablProj + ` AS abl, to_json(aj) AS aj ` +
 				`FROM read_parquet('lists.parquet') ORDER BY id;`,
 			Want: []map[string]any{
 				{
@@ -496,20 +552,44 @@ func listsChecks() []check {
 					"af":    []any{"1.50000000000000000e+00", nil, "Inf"},
 					"atext": []any{"a", nil, ""},
 					"ad":    []any{1.23, nil, -0.01},
+					"ad18":  []any{json.Number("999999999999.999999"), nil, json.Number("-0.000001")},
 					"ad38":  []any{1.2345678901, nil},
 					"atz":   []any{"2026-07-15 01:02:03.000004+00", nil},
+					"ats":   []any{"1899-12-31 23:59:59.999999", nil},
 					"adate": []any{"1969-12-31", nil},
 					"atod":  []any{"08:00:00.25", nil},
+					"ab":    []any{true, nil, false},
+					"abl":   []any{"0100", nil, ""},
+					"aj":    []any{map[string]any{"a": 1}, nil},
 				},
 				{
 					"id": 2, "st": []any{}, "ai": []any{}, "au": []any{}, "af": []any{},
-					"atext": []any{}, "ad": []any{}, "ad38": []any{}, "atz": []any{}, "adate": []any{}, "atod": []any{},
+					"atext": []any{}, "ad": []any{}, "ad18": []any{}, "ad38": []any{}, "atz": []any{},
+					"ats": []any{}, "adate": []any{}, "atod": []any{}, "ab": []any{}, "abl": []any{}, "aj": []any{},
 				},
 				{
 					"id": 3, "st": nil, "ai": nil, "au": nil, "af": nil,
-					"atext": nil, "ad": nil, "ad38": nil, "atz": nil, "adate": nil, "atod": nil,
+					"atext": nil, "ad": nil, "ad18": nil, "ad38": nil, "atz": nil,
+					"ats": nil, "adate": nil, "atod": nil, "ab": nil, "abl": nil, "aj": nil,
 				},
 			},
+		},
+		{
+			// Every array element leaf must decode as the RIGHT DuckDB
+			// list type — UBIGINT[] and DECIMAL(p,s)[] are the load-bearing
+			// annotations (a dropped UINT_64/DECIMAL annotation would
+			// silently reinterpret the raw physical values).
+			Name: "lists/element-types",
+			Query: `SELECT typeof(st) AS st, typeof(ai) AS ai, typeof(au) AS au, typeof(af) AS af, ` +
+				`typeof(atext) AS atext, typeof(ad) AS ad, typeof(ad18) AS ad18, typeof(ad38) AS ad38, ` +
+				`typeof(atz) AS atz, typeof(ats) AS ats, typeof(adate) AS adate, typeof(atod) AS atod, ` +
+				`typeof(ab) AS ab, typeof(abl) AS abl, typeof(aj) AS aj FROM read_parquet('lists.parquet') LIMIT 1;`,
+			Want: []map[string]any{{
+				"st": "VARCHAR[]", "ai": "BIGINT[]", "au": "UBIGINT[]", "af": "DOUBLE[]",
+				"atext": "VARCHAR[]", "ad": "DECIMAL(9,2)[]", "ad18": "DECIMAL(18,6)[]", "ad38": "DECIMAL(38,10)[]",
+				"atz": "TIMESTAMP WITH TIME ZONE[]", "ats": "TIMESTAMP[]", "adate": "DATE[]", "atod": "TIME[]",
+				"ab": "BOOLEAN[]", "abl": "BLOB[]", "aj": "JSON[]",
+			}},
 		},
 		{
 			Name:  "lists/kv-set-values",
