@@ -778,7 +778,8 @@ func TestRunBatchLoop_RowsApplied_CheckpointOnly_CarrySurvivesSchemaEventInterlu
 	cfg := testConfig(t, rec, false) // TransactionalDDL=false: schema events go through ApplyOne
 	cfg.CheckpointOnlyAtTxBoundary = true
 
-	ch := feed(true,
+	ch := feed(
+		true,
 		txBegin("tb"), insertAt("p1"), insertAt("p2"),
 		truncateAt("ddl"), // mid-tx schema event → flush-then-ApplyOne
 		txCommit("tc"),

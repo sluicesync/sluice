@@ -260,7 +260,8 @@ func verifyChunksPresent(ctx context.Context, root irbackup.Store, links []linea
 			}
 			return fmt.Errorf(
 				"%s: %s readability check: chunk file %q (segment %s, manifest %q) is MISSING from the backup store — the chain's manifests read but a restore would fail at this chunk; every file a surviving manifest references must outlive the maintenance sweep",
-				op, stage, file, segDir, link.Path)
+				op, stage, file, segDir, link.Path,
+			)
 		}
 		for _, tm := range link.Manifest.Tables {
 			for _, ch := range tm.Chunks {
