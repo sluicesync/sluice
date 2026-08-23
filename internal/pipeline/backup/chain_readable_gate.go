@@ -49,12 +49,24 @@ import (
 //     difference between an operator who knows their DR archive is broken
 //     and one who finds out at restore time.
 //
-// The gate is deliberately CHEAP: it re-walks the lineage and re-resolves
-// the chain's identity + key material. It does not decrypt chunks or
-// replay changes — a full `verify` inline would make every compact run
-// pay a whole-chain read, and the class this exists to catch (an identity
-// artifact swept out from under the read path) is entirely visible at the
-// header level. `sluice backup verify` remains the deep check.
+// The gate is deliberately CHEAP: it re-walks the lineage, re-resolves
+// the chain's identity + key material, and STATS every chunk file the
+// surviving manifests reference ([verifyChunksPresent] — one Exists per
+// chunk, no reads). It does not decrypt chunks, verify hashes, or replay
+// changes — a full `verify` inline would make every compact run pay a
+// whole-chain read; `sluice backup verify` remains the deep check.
+//
+// The presence leg exists because of what the identity legs honestly
+// could not see (2026-08-22 invariant sweep): the cmd-layer claim "a run
+// can never report success over a chain it just made unreadable" rested
+// on the DELETE-SET GEOMETRY — retired-prefix sweeps can't touch a
+// survivor's files — with nothing binding it. A future sweep bug that
+// eats a survivor's chunk was invisible to a header-level gate, so the
+// "never" was one refactor away from false. Statting the referenced
+// files converts that geometry argument into a checked property, at
+// maintenance-op frequency and O(chunks) stat cost. What remains out of
+// scope, deliberately: chunk CONTENT (bit rot, truncation, a wrong key
+// on per-chunk mode) — that is `backup verify --depth` territory.
 
 // verifyChainReadable re-reads the chain described by cat the way a
 // RESTORE would and refuses — under one stable, machine-matchable code —
@@ -115,6 +127,14 @@ func checkChainReadable(
 		// Never let the gate pass vacuously: an empty walk means there is
 		// nothing to have proven readable.
 		return fmt.Errorf("%s: %s %w", op, stage, errNoChainToVerify)
+	}
+
+	// 1b. Chunk presence: every chunk file the surviving manifests
+	//    reference must still exist. The walk above reads only MANIFESTS,
+	//    so on its own it passes a chain whose data files a buggy sweep
+	//    has eaten — see the header for why this leg was added.
+	if err := verifyChunksPresent(ctx, store, links, op, stage); err != nil {
+		return err
 	}
 
 	// 2. The chain's identity. Restore reads it from the lineage ROOT by
@@ -208,6 +228,54 @@ func verifyEncryptedChainIdentity(
 	if _, err := lineage.UnwrapChainCEK(env, enc.WrappedCEK, first); err != nil {
 		return fmt.Errorf("%s: %s readability check: the chain's key does not unwrap (%s): %w",
 			op, stage, lineage.CEKUnwrapHint, err)
+	}
+	return nil
+}
+
+// verifyChunksPresent stats every chunk file the chain's manifests
+// reference — table chunks and incremental change-chunks — through the
+// same per-segment prefixed store the restore path resolves them with
+// (paths in a manifest are relative to its SEGMENT's dir). One
+// [irbackup.Store.Exists] per chunk; nothing is read.
+//
+// A manifest can legitimately reference zero chunks (empty tables), so
+// there is no per-link floor; the caller's len(links)==0 refusal remains
+// the gate's anti-vacuity floor, and every listed chunk was uploaded
+// BEFORE the committer listed it, so "listed ⇒ once existed" holds even
+// for a Partial entry.
+func verifyChunksPresent(ctx context.Context, root irbackup.Store, links []lineage.SegmentRecord, op, stage string) error {
+	for i := range links {
+		link := &links[i]
+		ss := root
+		segDir := "(chain root)"
+		if link.Segment != nil {
+			ss = link.Segment.Store(root)
+			if link.Segment.Dir != "" {
+				segDir = link.Segment.Dir
+			}
+		}
+		refuse := func(file string, err error) error {
+			if err != nil {
+				return fmt.Errorf("%s: %s readability check: probe chunk %q (segment %s): %w", op, stage, file, segDir, err)
+			}
+			return fmt.Errorf(
+				"%s: %s readability check: chunk file %q (segment %s, manifest %q) is MISSING from the backup store — the chain's manifests read but a restore would fail at this chunk; every file a surviving manifest references must outlive the maintenance sweep",
+				op, stage, file, segDir, link.Path)
+		}
+		for _, tm := range link.Manifest.Tables {
+			for _, ch := range tm.Chunks {
+				ok, err := ss.Exists(ctx, ch.File)
+				if err != nil || !ok {
+					return refuse(ch.File, err)
+				}
+			}
+		}
+		for _, ch := range link.Manifest.ChangeChunks {
+			ok, err := ss.Exists(ctx, ch.File)
+			if err != nil || !ok {
+				return refuse(ch.File, err)
+			}
+		}
 	}
 	return nil
 }

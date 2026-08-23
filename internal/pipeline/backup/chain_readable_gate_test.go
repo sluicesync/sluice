@@ -213,6 +213,50 @@ func TestVerifyChainReadable_PlaintextChain_MissingRoot_Allowed(t *testing.T) {
 	}
 }
 
+// TestVerifyChainReadable_MissingSurvivorChunk_Refuses pins the presence
+// leg (2026-08-22 invariant sweep): the structural walk reads only
+// MANIFESTS, so before this leg existed the gate passed a chain whose
+// DATA files a buggy sweep had eaten — the cmd-layer "never report
+// success over a chain it just made unreadable" rested on delete-set
+// geometry with nothing checking it. Both segment shapes are covered:
+// a chunk under a rotation segment's sub-dir (resolved through the
+// segment's prefixed store, exactly as restore resolves it) and a chunk
+// at the chain root (Dir == ""). The intact-chain PASS control is the
+// existing gate tests above, which run this leg against the seeded
+// chunk files on every call — so an over-refusing mutant fails those,
+// and a leg-skipping mutant fails this (both directions mutation-run).
+func TestVerifyChainReadable_MissingSurvivorChunk_Refuses(t *testing.T) {
+	for name, victim := range map[string]string{
+		"segment-subdir chunk": "seg-1/chunks/_changes/seg1-incr1.jsonl.gz",
+		"chain-root chunk":     "chunks/_changes/seg0-incr2.jsonl.gz",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newMemStore()
+			now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+			seedTwoSegmentLineage(t, store, now, time.Hour)
+			cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
+			if err != nil || !ok {
+				t.Fatalf("LoadLineageCatalog: ok=%v err=%v", ok, err)
+			}
+			// Control first: the intact chain passes, so the refusal below is
+			// attributable to the deleted chunk and nothing else.
+			if err := verifyChainReadable(context.Background(), store, cat, nil, "backup prune", "test"); err != nil {
+				t.Fatalf("gate refused an INTACT chain: %v", err)
+			}
+			if err := store.Delete(context.Background(), victim); err != nil {
+				t.Fatalf("delete victim chunk: %v", err)
+			}
+			err = verifyChainReadable(context.Background(), store, cat, nil, "backup prune", "test")
+			if err == nil {
+				t.Fatal("gate PASSED a chain missing a survivor's chunk file; a restore of that chain fails at the chunk")
+			}
+			if !strings.Contains(err.Error(), "MISSING") || !strings.Contains(err.Error(), "jsonl.gz") {
+				t.Errorf("err = %q; want the missing-chunk refusal naming the file", err)
+			}
+		})
+	}
+}
+
 // TestVerifyChainReadable_DivergentRootSalt_Refuses pins the subtler
 // unrestorable shape the identity check covers: the root manifest is
 // present but records DIFFERENT key-derivation material than the chain's

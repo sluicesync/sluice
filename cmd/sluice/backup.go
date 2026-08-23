@@ -1544,7 +1544,11 @@ func boolYesNoCLI(b bool) string {
 //   - Prune PROVES the chain still reads, twice — before the catalog
 //     commit (a refusal there has deleted nothing) and after the delete
 //     pass (so a run can never report success over a chain it just made
-//     unreadable). Both refuse under `SLUICE-E-BACKUP-CHAIN-UNREADABLE`,
+//     unreadable). "Reads" here means: the lineage walks, the chain's
+//     identity/key material resolves, and every chunk file the surviving
+//     manifests reference is still PRESENT (statted, not read) — chunk
+//     CONTENT depth stays `backup verify`'s job. Both legs refuse under
+//     `SLUICE-E-BACKUP-CHAIN-UNREADABLE`,
 //     exit 3. Pass `--encrypt` + key material to upgrade the check from
 //     "the identity survived" to "the chain's key still unwraps".
 //   - Retention is SEGMENT-granular, and the flags are rounded UP to the
