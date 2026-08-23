@@ -21,9 +21,13 @@
 package pgtrigger
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -340,6 +344,111 @@ func TestCDCReader_GapFreedom_SkipsAnAbortedHole(t *testing.T) {
 	applyPGSQL(t, dsn, `INSERT INTO aborted_hole (id, label) VALUES (3, 'after')`)
 
 	assertSameSet(t, collectLabels(t, out, 1), []string{"after"})
+}
+
+// syncLogBuffer is a mutex-guarded log sink: the pump goroutine writes
+// WARN lines while the test goroutine reads them, so a bare bytes.Buffer
+// would be a -race finding in the test itself.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// waitForLog polls the captured logs until marker appears or the
+// deadline passes.
+func waitForLog(t *testing.T, logs *syncLogBuffer, marker string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), marker) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("log marker %q did not appear within %v; captured logs:\n%s", marker, d, logs.String())
+}
+
+// TestCDCReader_CeilingStall_WarnsWhileHeldAndResumes pins the ceiling
+// stall arm end to end (batch C, 2026-08-23 — the observability gap the
+// 2026-08-22 sweep filed at settledCeilingSQL): a long-open write
+// transaction ANYWHERE on the source (it never touches a captured table;
+// it only needs an assigned xid) pins pg_snapshot_xmin, so a committed
+// capture is prefix-cut out of every poll window. Three cells, in order:
+//
+//  1. idle-under-a-pinned-xmin does NOT warn (the probe runs, finds zero
+//     held rows, stays silent — the over-warn direction);
+//  2. a held committed row DOES warn, naming the held count, while the
+//     stream correctly emits nothing (over-holding is the safe arm);
+//  3. the pinning transaction settles and the held change arrives — the
+//     stall was a stall, never a loss.
+func TestCDCReader_CeilingStall_WarnsWhileHeldAndResumes(t *testing.T) {
+	dsn, cleanup := startPGForTrigger(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	setupCaptureTable(t, ctx, dsn, "ceiling_stall")
+
+	logs := &syncLogBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	e := Engine{}
+	reader, err := e.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	cr := reader.(*CDCReader)
+	cr.SetPollInterval(gapFreePollInterval)
+	cr.stallWarnEvery = 500 * time.Millisecond
+	t.Cleanup(func() { _ = cr.Close() })
+	out, err := cr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	const warnMarker = "held back by the settled ceiling"
+
+	// The pinning transaction: an assigned xid, no captured-table write.
+	pinner := beginSession(t, ctx, dsn)
+	assignXID(t, ctx, pinner, "pinner")
+
+	// Cell 1 — idle under the pinned xmin. Several probe cadences pass;
+	// nothing is held, so nothing may be warned.
+	time.Sleep(3 * cr.stallWarnEvery)
+	if s := logs.String(); strings.Contains(s, warnMarker) {
+		t.Fatalf("ceiling WARN fired on a genuinely idle stream (zero held rows):\n%s", s)
+	}
+
+	// Cell 2 — a committed capture under the pinned xmin: held by the
+	// ceiling (correct), and now also NAMED by the stall WARN.
+	applyPGSQL(t, dsn, `INSERT INTO ceiling_stall (id, label) VALUES (1, 'held-by-ceiling')`)
+	expectNoEvents(t, out, 2*time.Second)
+	waitForLog(t, logs, warnMarker, 5*time.Second)
+	if s := logs.String(); !strings.Contains(s, `"held_rows":1`) {
+		t.Errorf("ceiling WARN does not name the held-row count:\n%s", s)
+	}
+
+	// Cell 3 — the pinner settles; the held change arrives. A stall,
+	// never a loss.
+	if err := pinner.Commit(); err != nil {
+		t.Fatalf("commit pinner: %v", err)
+	}
+	assertSameSet(t, collectLabels(t, out, 1), []string{"held-by-ceiling"})
 }
 
 // The CACHE 1 preflight pin used to live here as

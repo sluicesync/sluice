@@ -52,6 +52,67 @@ func TestSettledCeilingSQL_ComparesInXID8Domain(t *testing.T) {
 	}
 }
 
+// TestCeilingStallProbe_SharesTheCeilingPredicate is the stall arm's
+// anti-drift pin, same class as TestPollAndAnchorShareTheSettledCeiling:
+// the probe that tells the operator "rows are held back" and the ceiling
+// that holds them back must render the SAME not-settled predicate, or
+// the probe can report idle while the ceiling holds rows — the silent
+// STALL one layer up from the silent gap the ceiling pin guards.
+func TestCeilingStallProbe_SharesTheCeilingPredicate(t *testing.T) {
+	if !strings.Contains(settledCeilingSQL("cl"), notSettledPredicate) {
+		t.Errorf("settled ceiling no longer renders the shared not-settled predicate:\n%s", settledCeilingSQL("cl"))
+	}
+	probe := ceilingStallProbeSQL(`"public"."sluice_change_log"`)
+	if !strings.Contains(probe, notSettledPredicate) {
+		t.Errorf("ceiling-stall probe no longer renders the shared not-settled predicate:\n%s", probe)
+	}
+	if !strings.Contains(probe, "id > $1") {
+		t.Errorf("ceiling-stall probe lost its above-the-watermark bound:\n%s", probe)
+	}
+	if !strings.Contains(probe, "COUNT(*)") || !strings.Contains(probe, "COALESCE(MIN(id), 0)") {
+		t.Errorf("ceiling-stall probe lost its held-count/first-held shape:\n%s", probe)
+	}
+}
+
+// TestCeilingStallGuard_ProbePacing pins the off-the-hot-path contract:
+// no probe before a full cadence of zero progress, at most one probe per
+// cadence while stalled, and any progress resets both clocks. The probe
+// cadence IS the WARN cadence — there is no separate warn pacing to
+// drift from it.
+func TestCeilingStallGuard_ProbePacing(t *testing.T) {
+	base := time.Now()
+	g := ceilingStallGuard{warnEvery: time.Minute}
+	g.noteProgress(base)
+	if g.probeDue(base.Add(30 * time.Second)) {
+		t.Error("probe due before a full cadence of no progress")
+	}
+	if !g.probeDue(base.Add(time.Minute)) {
+		t.Error("probe not due after a full cadence of no progress")
+	}
+	g.lastProbe = base.Add(time.Minute)
+	if g.probeDue(base.Add(90 * time.Second)) {
+		t.Error("second probe due within a cadence of the first — the probe must stay at WARN cadence, not per poll")
+	}
+	if !g.probeDue(base.Add(2 * time.Minute)) {
+		t.Error("probe not due a full cadence after the previous probe")
+	}
+	g.noteProgress(base.Add(2 * time.Minute))
+	if g.probeDue(base.Add(2*time.Minute + 30*time.Second)) {
+		t.Error("probe due right after progress resumed")
+	}
+	if !g.probeDue(base.Add(3 * time.Minute)) {
+		t.Error("probe not due a full cadence after the last progress")
+	}
+
+	// Defensive: a guard whose progress clock was never initialised does
+	// not probe. The pump always calls noteProgress at start, so a zero
+	// lastProgress means a construction path this guard does not know.
+	z := ceilingStallGuard{warnEvery: time.Minute}
+	if z.probeDue(base.Add(time.Hour)) {
+		t.Error("a guard with no progress baseline must not probe")
+	}
+}
+
 // TestHoleGuard_NeverSkipsWithoutAProof is the load-bearing negative
 // pin: every state EXCEPT "armed, settled, and the hole inside the
 // proven range" must refuse to skip. Skipping a hole whose allocating

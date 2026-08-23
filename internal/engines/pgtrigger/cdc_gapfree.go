@@ -145,26 +145,84 @@ const holeProofPolls = 2
 // SCOPE of the stall WARN, stated so [changeLogHoleWarnEvery]'s rationale
 // cannot be read as broader than the code (2026-08-22 invariant sweep):
 // the "blocked at a hole" WARN reaches ONLY the hole arm. A stall induced
-// by THIS ceiling has no WARN — a long-open WRITE transaction anywhere on
-// the source (any table, captured or not; it only needs an assigned xid)
-// pins pg_snapshot_xmin, the ceiling prefix-cuts every committed row with
+// by THIS ceiling is named by its own arm — [ceilingStallGuard] (batch C,
+// 2026-08-23): a long-open WRITE transaction anywhere on the source (any
+// table, captured or not; it only needs an assigned xid) pins
+// pg_snapshot_xmin, the ceiling prefix-cuts every committed row with
 // txid ≥ xmin out of the window, the poll returns zero rows, and the pump
 // takes the no-hole path (holes.clear(), no warnStuck). Correctness
 // holds — over-holding is always safe, and consumption resumes when the
-// transaction settles — but the operator sees a healthy-idle stream while
-// sync lag grows, exactly the silent-STALL shape the hole WARN was built
-// to name. Fix shape (filed, not built): when the stream has produced
-// nothing for ≥ changeLogHoleWarnEvery, one cheap probe
-// (`SELECT MAX(id) FROM <log> WHERE id > $lastSeen`) distinguishes
-// "idle" from "held back by the ceiling", and the latter WARNs, paced,
-// naming pg_stat_activity as the remedy — off the hot path because it
-// runs at WARN cadence, not per poll.
+// transaction settles — but before the guard existed the operator saw a
+// healthy-idle stream while sync lag grew, exactly the silent-STALL shape
+// the hole WARN was built to name. The guard probes with
+// [ceilingStallProbeSQL] — the SAME not-settled predicate as this
+// ceiling, so the two cannot drift ([notSettledPredicate], pinned by
+// TestCeilingStallProbe_SharesTheCeilingPredicate) — at WARN cadence, not
+// per poll, only after the stream has produced nothing for a full cadence.
+// End-to-end: TestCDCReader_CeilingStall_WarnsWhileHeldAndResumes.
 func settledCeilingSQL(rel string) string {
 	return "COALESCE(\n" +
 		"    (SELECT MIN(id) - 1 FROM " + rel + "\n" +
-		"      WHERE txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),\n" +
+		"      WHERE " + notSettledPredicate + "),\n" +
 		"    (SELECT COALESCE(MAX(id), 0) FROM " + rel + ")\n" +
 		"  )"
+}
+
+// notSettledPredicate is the ceiling's held-row test: the row is visible
+// (committed — MVCC hides uncommitted rows from both the poll and the
+// probe) but its allocating transaction is not provably settled before
+// the current snapshot. It is a single shared constant because TWO
+// consumers must agree on it byte-for-byte: [settledCeilingSQL] uses it
+// to hold rows back, and [ceilingStallProbeSQL] uses it to tell the
+// operator that rows ARE being held back. Two hand-written copies of
+// this predicate drifting apart is exactly the anchor-vs-poll drift this
+// file's header records; the probe reporting "idle" while the ceiling
+// holds rows would be the same shape one layer up.
+const notSettledPredicate = "txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
+
+// ceilingStallProbeSQL renders the held-row probe the stall guard runs
+// when the stream has been unproductive for a full WARN cadence: how
+// many VISIBLE change-log rows above the watermark the settled ceiling
+// is currently holding back, the first such id, and the pinned xmin
+// (for the log line). Zero held rows means the stream is genuinely
+// idle; a non-zero count is a ceiling stall — committed changes exist
+// that no poll will return until the pinning transaction settles.
+func ceilingStallProbeSQL(tableRef string) string {
+	return "SELECT COUNT(*), COALESCE(MIN(id), 0), pg_snapshot_xmin(pg_current_snapshot())::text::bigint\n" +
+		"  FROM " + tableRef + "\n" +
+		" WHERE id > $1 AND " + notSettledPredicate
+}
+
+// ceilingStallGuard names the OTHER stall — the one [holeGuard.warnStuck]
+// cannot see. A hole stall has visible rows above a missing id; a
+// CEILING stall has zero visible rows at all (the prefix cut removes the
+// whole window), so from the pump's point of view it is byte-identical
+// to a healthy idle source. The guard's job is to make that
+// distinction observable without touching the hot path: it acts only
+// after warnEvery of no progress, and then at most once per warnEvery.
+// Owned by the single pump goroutine; no locking.
+type ceilingStallGuard struct {
+	warnEvery    time.Duration // pacing; changeLogHoleWarnEvery unless a test tightens it
+	lastProgress time.Time     // last time the pump consumed events or advanced the watermark
+	lastProbe    time.Time     // last probe issued (pacing the probe IS pacing the WARN)
+}
+
+// noteProgress records that the stream moved: events were emitted or the
+// watermark advanced (including a proven hole skip). Progress resets the
+// probe pacing so the next stall is timed from scratch.
+func (g *ceilingStallGuard) noteProgress(now time.Time) {
+	g.lastProgress = now
+	g.lastProbe = time.Time{}
+}
+
+// probeDue reports whether the guard should spend a probe now: a full
+// cadence of no progress, and a full cadence since the last probe. The
+// probe cadence bounds the WARN cadence, and both are off the hot path.
+func (g *ceilingStallGuard) probeDue(now time.Time) bool {
+	if g.lastProgress.IsZero() || now.Sub(g.lastProgress) < g.warnEvery {
+		return false
+	}
+	return g.lastProbe.IsZero() || now.Sub(g.lastProbe) >= g.warnEvery
 }
 
 // holeGuard turns "id h is missing from this poll's snapshot" into one

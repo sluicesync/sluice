@@ -42,6 +42,12 @@ type CDCReader struct {
 	pollInterval time.Duration
 	batchSize    int
 
+	// stallWarnEvery paces the ceiling-stall probe + WARN
+	// ([ceilingStallGuard]); zero means [changeLogHoleWarnEvery].
+	// Settable only by tests (a tight cadence keeps the integration pin
+	// fast); operators get the default, which matches the hole WARN.
+	stallWarnEvery time.Duration
+
 	// pumpCancel cancels the polling goroutine when Close is called, and
 	// pumpDone is closed by that goroutine as it exits.
 	//
@@ -263,7 +269,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Change) {
 	lastSeen := startID
 	var holes holeGuard
-	timer := time.NewTimer(0) // fire immediately on first iteration
+	stall := ceilingStallGuard{warnEvery: r.stallWarnEvery}
+	if stall.warnEvery <= 0 {
+		stall.warnEvery = changeLogHoleWarnEvery
+	}
+	stall.noteProgress(time.Now()) // a stream is not stalled at birth
+	timer := time.NewTimer(0)      // fire immediately on first iteration
 	defer timer.Stop()
 	for {
 		select {
@@ -312,14 +323,27 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		if b.lastID > lastSeen {
 			lastSeen = b.lastID
 		}
+		if len(b.events) > 0 {
+			stall.noteProgress(time.Now())
+		}
 		if b.holeAt > 0 {
 			if next, ok := r.resolveHole(ctx, &holes, b); ok {
 				lastSeen = next
+				stall.noteProgress(time.Now())
 				timer.Reset(0)
 				continue
 			}
 		} else {
 			holes.clear()
+			if len(b.events) == 0 {
+				// A zero-event, zero-hole poll is either a healthy idle
+				// source or a CEILING stall, and the pump cannot tell the
+				// two apart from the poll alone (the prefix cut removes
+				// the whole window, so nothing comes back to look at).
+				// The stall guard probes — at WARN cadence, never per
+				// poll — and names the held rows when there are any.
+				r.maybeWarnCeilingStall(ctx, &stall, lastSeen)
+			}
 		}
 		// Adaptive cadence: a full batch means the source is busy;
 		// fire the next poll immediately so back-pressure has the
@@ -365,6 +389,41 @@ func (r *CDCReader) resolveHole(ctx context.Context, holes *holeGuard, b pollBat
 	}
 	holes.warnStuck(ctx, now)
 	return 0, false
+}
+
+// maybeWarnCeilingStall runs one round of the ceiling-stall protocol for
+// a poll that returned nothing (no events, no hole): if the stream has
+// been unproductive for a full WARN cadence, probe whether the settled
+// ceiling is holding VISIBLE committed rows back ([ceilingStallProbeSQL])
+// and WARN when it is. Zero held rows is a genuinely idle source and
+// stays silent — the probe result, not the silence, is what separates
+// the two (see [settledCeilingSQL]'s SCOPE note for the stall shape this
+// closes). A probe failure is DEBUG-logged and non-fatal: observability
+// must never break the stream it observes.
+func (r *CDCReader) maybeWarnCeilingStall(ctx context.Context, stall *ceilingStallGuard, lastSeen int64) {
+	now := time.Now()
+	if !stall.probeDue(now) {
+		return
+	}
+	stall.lastProbe = now
+	tableRef := quoteIdent(r.schema) + "." + quoteIdent(ChangeLogTable)
+	var held, firstHeld, xmin int64
+	if err := r.db.QueryRowContext(ctx, ceilingStallProbeSQL(tableRef), lastSeen).Scan(&held, &firstHeld, &xmin); err != nil {
+		slog.DebugContext(ctx, "pgtrigger: ceiling-stall probe failed (non-fatal; the stream keeps polling)",
+			slog.Any("err", err))
+		return
+	}
+	if held == 0 {
+		return // genuinely idle — nothing committed is being held back
+	}
+	slog.WarnContext(
+		ctx, "pgtrigger: CDC stream is held back by the settled ceiling (gap-freedom): committed change-log rows are pinned behind a long-open source transaction, so polls return nothing while sync lag grows; the stream is correct and resumes on its own when that transaction commits or aborts",
+		slog.Int64("held_rows", held),
+		slog.Int64("first_held_id", firstHeld),
+		slog.Int64("snapshot_xmin", xmin),
+		slog.Duration("stalled_for", now.Sub(stall.lastProgress).Round(time.Second)),
+		slog.String("hint", "find the long-running writer: SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start"),
+	)
 }
 
 // classifyPollError wraps a change-log poll failure for the pipeline retry
