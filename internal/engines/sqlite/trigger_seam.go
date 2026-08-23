@@ -66,23 +66,32 @@ func CapturedTypeofExpr(colExpr string) string {
 //	                                 NULL stays NULL
 //
 // The REAL arm's history is a corrected premise (found by the 2026-08-22
-// adversarial-corpus sweep). The original `format('%.17g', c)` relied on the
-// C-printf guarantee that 17 significant digits round-trip an IEEE-754 double —
-// which stopped being what format() computes when SQLite 3.43 rewrote its float
-// rendering: on 3.43+ a plain `%.Ng` renders a value-based short form at ANY
-// requested N (`0.30000000000000004` renders as "0.3", `0.1234567890123456789`
-// as the 16-digit "0.1234567890123457" — a different double), so every REAL
-// captured or projected through it silently lost low bits at exit 0. MEASURED
-// on modernc's SQLite 3.53.3 (2295 of 5007 swept doubles fail to round-trip
-// through `%.17g`/`%.20g`/`%.25g` alike) and on real Cloudflare D1 (the same
-// 16-digit render, d1verify 2026-08-22). The fix is SQLite's alternate-form-2
-// flag: `%!.20g` — documented and measured (0 misses over the same sweep) to
-// increase the precision until the rendering is LOSSLESS on 3.43+. On older
-// SQLite (3.38–3.42, possible for the app library firing a local capture
-// trigger) the `!` flag is parsed and ignored for floats, leaving `%.20g` —
-// three more digits than the previous expression on the same pre-3.43
-// renderer, so never worse than what shipped before (UNVERIFIED PREMISE for
-// pre-3.43 app libraries only; sluice's own connections and D1 are measured).
+// adversarial-corpus sweep; mechanism re-verified by direct experiment on
+// bundled SQLite 3.53.3, 2026-08-23). The original `format('%.17g', c)` relied
+// on the C-printf guarantee that 17 significant digits round-trip an IEEE-754
+// double — but SQLite's printf is NOT C's printf: its `%g`/`%.Ng` conversion
+// CAPS output at 16 significant digits (raised to 26 only by the `!`
+// alternate-form-2 flag), so `%.17g` silently clamps to 16 — and 16 digits do
+// not round-trip every binary-64 (17 are needed in the worst case). Precision
+// IS honoured below the cap and clamped at it: `%.15g`→15 digits, but
+// `%.16g`/`%.17g`/`%.20g`/`%.25g` ALL emit the same 16-digit render
+// (`0.30000000000000004`→"0.3"; `0.12345678901234568`→"0.1234567890123457", a
+// different double), so every REAL captured or projected through `%.17g`
+// silently lost low bits at exit 0. This is NOT a SQLite 3.43 change — the
+// 3.43.0 release notes carry no such printf rewrite (their only float change
+// is to the `decimal` extension); the 16-digit cap is longstanding printf
+// behaviour, so `%.17g` was never lossless here — the pre-corpus test passed
+// only because its seed (π) round-trips at ≤16 digits. MEASURED on modernc's
+// SQLite 3.53.3 (2295 of 5007 swept doubles fail through `%.17g`/`%.20g`/
+// `%.25g` ALIKE — the 16-cap signature, not a variable shortest-form) and on
+// real Cloudflare D1 (same 16-digit render, d1verify 2026-08-22). The fix is
+// the alternate-form-2 flag `%!.20g`, which lifts the cap so 17+ digits emit —
+// LOSSLESS (0 misses over the same sweep) on modernc 3.53.3 and real D1.
+// UNVERIFIED PREMISE (third-party SQLite predating the `!` flag, e.g. an app
+// library firing a local capture trigger): if `!` is absent/ignored there,
+// `%!.20g` ALSO clamps to 16 and the fix is INEFFECTIVE — not merely
+// "degraded". sluice's own connections and D1 are measured; older third-party
+// SQLite is not.
 // TestCapturedValueExpr_RealRenderRoundTripsExactly is the per-PR gate on the
 // bundled SQLite; the d1verify adversarial matrix is the live-D1 pin.
 //

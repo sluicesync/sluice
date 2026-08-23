@@ -50,15 +50,23 @@ inheriting their refuse-not-coerce loud-failure contract. Big integers are exact
 not JSON number), REAL is `%.17g` round-trip-exact, BLOBs come back from hex. This reuses
 `d1_decode.go`'s reconstruction, keeping one faithful-capture implementation.
 
-> **Correction (2026-08-22):** the REAL arm is now `format('%!.20g', col)`. The
-> `%.17g` above relied on the C-printf 17-significant-digit round-trip guarantee,
-> which SQLite 3.43's rewritten float rendering no longer honors — a plain `%.Ng`
-> renders `0.30000000000000004` as `"0.3"` at any N, so REAL captures were silently
-> lossy (and a max-double REAL rendered as an out-of-range string that killed the
-> stream). The `!` alternate-form-2 flag raises the precision until the render is
-> lossless (measured: 0 misses over a 5k-double sweep on modernc 3.53.3 and on real
-> D1). `TestCapturedValueExpr_RealRenderRoundTripsExactly` is the per-PR gate; the
-> CDC reader's capture-shape door refuses installs still carrying the old body.
+> **Correction (2026-08-22; mechanism re-verified by experiment 2026-08-23):** the
+> REAL arm is now `format('%!.20g', col)`. The `%.17g` above relied on the C-printf
+> 17-significant-digit round-trip guarantee — but SQLite's printf is not C's printf:
+> its `%g`/`%.Ng` conversion CAPS output at 16 significant digits (raised to 26 only
+> by the `!` alternate-form-2 flag), and 16 digits do not round-trip every binary-64
+> (17 are needed). So `%.17g` silently clamps to 16 (`%.16g`/`%.17g`/`%.20g`/`%.25g`
+> all emit the same 16-digit render; `0.30000000000000004`→`"0.3"`), making REAL
+> captures silently lossy — and a max-double REAL rendered as an out-of-range string
+> that killed the stream. This is **not** a SQLite 3.43 change (the 3.43.0 notes carry
+> no printf float rewrite — only a `decimal`-extension change); the 16-digit cap is
+> longstanding, so `%.17g` was never lossless here (the π-seeded pre-corpus test
+> passed only because π round-trips at ≤16 digits). The `!` flag lifts the cap so 17+
+> digits emit (measured: 0 misses over a 5k-double sweep on modernc 3.53.3 and on real
+> D1). `TestCapturedValueExpr_RealRenderRoundTripsExactly` is the per-PR gate; the CDC
+> reader's capture-shape door refuses installs still carrying the old body. **Open
+> premise:** on a third-party SQLite predating the `!` flag, `%!.20g` would also clamp
+> to 16 and the fix would be ineffective — unverified for pre-`!` app-library SQLite.
 
 ## Decision
 
