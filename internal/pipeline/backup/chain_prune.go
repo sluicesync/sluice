@@ -243,7 +243,13 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	switch {
 	case opts.KeepIncrementals > 0:
 		if opts.KeepIncrementals >= len(flat) {
-			return r0(cat, store, ctx, "nothing to prune (keep >= incremental count)")
+			// No-op door 1 of 2 (the other is the keep-duration r0 below; the
+			// dry-run return is exempt — read-only by contract). A crashed
+			// prune — catalog committed, resignIfSigned never ran — re-run
+			// with the key lands on an already-pruned chain and returns here;
+			// heal the stale signatures so the published "re-run the
+			// maintenance step" remedy is true (see healStaleLineageSignatures).
+			return pruneNoOpReturn(ctx, store, cat, opts, "nothing to prune (keep >= incremental count)")
 		}
 		dropN = len(flat) - opts.KeepIncrementals
 	case opts.KeepDuration > 0:
@@ -256,7 +262,8 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 			break
 		}
 		if dropN == 0 {
-			return r0(cat, store, ctx, "nothing to prune (all incrementals newer than keep-duration)")
+			// No-op door 2 of 2 — see the keep-count r0 above.
+			return pruneNoOpReturn(ctx, store, cat, opts, "nothing to prune (all incrementals newer than keep-duration)")
 		}
 	}
 
@@ -786,6 +793,17 @@ func pruneFloorLeadingIncrementals(ctx context.Context, floor *lineage.Segment, 
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// pruneNoOpReturn finishes a PruneChain run through one of its r0 no-op
+// doors: heal any stale signatures the resignIfSigned crash window left
+// behind ([healStaleLineageSignatures] — the doors are exactly where a
+// crashed run's re-run lands), then report the full kept set via [r0].
+func pruneNoOpReturn(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, opts PruneOpts, why string) (*PruneResult, error) {
+	if err := healStaleLineageSignatures(ctx, store, cat, "prune", opts.DryRun, opts.Signer); err != nil {
+		return nil, err
+	}
+	return r0(cat, store, ctx, why)
 }
 
 // r0 is the "nothing to prune" early return: report the full kept set

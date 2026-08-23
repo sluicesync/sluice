@@ -408,8 +408,16 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 
 	eligible := cat.Segments[cat.RestorableFromSegment:]
 	if len(eligible) < 2 {
-		slog.InfoContext(ctx, "backup compact: nothing to compact (fewer than 2 retained segments)")
-		return &CompactResult{}, nil
+		// No-op door 1 of 2 (the other is the no-merge-groups return below;
+		// the dry-run return is exempt — read-only by contract). A signed
+		// chain reaching a no-op door with the key supplied still gets its
+		// signatures verified-and-healed: this is the MOST likely post-crash
+		// re-run shape — a compact that merged everything into one segment
+		// and died before resignIfSigned lands exactly here — and before the
+		// heal existed the published "re-run the maintenance step" remedy
+		// returned without touching the stale signatures.
+		return compactNoOpReturn(ctx, store, cat, opts, &CompactResult{},
+			"backup compact: nothing to compact (fewer than 2 retained segments)")
 	}
 
 	// ADR-0154 Q4: never emit an unsigned merged successor to a signed
@@ -540,8 +548,10 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	}
 
 	if res.GroupsMerged == 0 {
-		slog.InfoContext(ctx, "backup compact: no size-≥-2 merge groups found within --merge-window; nothing to do")
-		return res, nil
+		// No-op door 2 of 2 — see the fewer-than-2-segments door above for
+		// why a no-op run still heals stale signatures.
+		return compactNoOpReturn(ctx, store, cat, opts, res,
+			"backup compact: no size-≥-2 merge groups found within --merge-window; nothing to do")
 	}
 
 	// First-pass cleanup: any leftover `.compact-staging-*` dirs from
@@ -685,6 +695,18 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		)
 	}
 	slog.InfoContext(ctx, "backup compact: lineage compacted", logArgs...)
+	return res, nil
+}
+
+// compactNoOpReturn finishes a CompactChain run through one of its no-op
+// doors: heal any stale signatures the resignIfSigned crash window left
+// behind ([healStaleLineageSignatures] — the doors are exactly where a
+// crashed run's re-run lands), then log the no-op and return res unchanged.
+func compactNoOpReturn(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, opts CompactOpts, res *CompactResult, msg string) (*CompactResult, error) {
+	if err := healStaleLineageSignatures(ctx, store, cat, "backup compact", opts.DryRun, opts.Signer); err != nil {
+		return nil, err
+	}
+	slog.InfoContext(ctx, msg)
 	return res, nil
 }
 

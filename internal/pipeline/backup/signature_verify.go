@@ -410,6 +410,67 @@ func resignIfSigned(ctx context.Context, store irbackup.Store, signed bool, sign
 	return lineage.ResignLineage(ctx, store, signer)
 }
 
+// healStaleLineageSignatures is the NO-OP-path companion to [resignIfSigned]
+// (batch C, 2026-08-23 — the resignIfSigned crash window). Compact and prune
+// both commit their catalog restructure FIRST and re-sign SECOND, so a crash
+// between the two leaves a restructured chain under stale signatures — which
+// then surfaces at verify as SIGNATURE-INVALID ("signed link count N !=
+// actual M"), whose remedy text accuses tamper, while the MISSING-signature
+// remedy says "re-run the maintenance step with the chain's key material".
+// Before this helper existed that remedy was FALSE for the crash case: the
+// re-run found nothing left to restructure and returned through a no-op door
+// (compact's fewer-than-2-segments / no-merge-groups returns, prune's r0
+// returns) BEFORE its resignIfSigned call, leaving the stale signatures in
+// place forever. This helper runs at exactly those doors: verify the lineage
+// signature against the CURRENT catalog and, only when it does not verify,
+// re-sign the whole survivor set — loudly, via WARN, so the heal is never
+// silent.
+//
+// Deliberate boundaries, each with its reason:
+//
+//   - dryRun or a nil signer → do nothing (a dry-run must not write, and
+//     without key material we can neither verify nor sign — the keyless
+//     no-op run keeps today's exit-0 behavior; the operator following the
+//     published remedy supplies the key on the re-run, which is when the
+//     heal fires).
+//   - An unsigned chain → do nothing (nothing to heal).
+//   - A VERIFYING signature → do nothing (routine no-op maintenance on a
+//     healthy signed chain must not churn .sig objects).
+//   - Re-sign authority is key possession, exactly as on the restructure
+//     path: a compact/prune that DOES restructure already re-signs whatever
+//     the store contains without pre-verifying, so healing on the no-op path
+//     grants no authority the maintenance verb did not already have. The
+//     WARN names the key id so a heal that re-keyed a chain is visible.
+//   - The heal re-signs; it does NOT sweep. A crash that also skipped the
+//     post-resign orphan sweep leaves uncatalogued files on disk — a
+//     disk-leak-only concern tracked separately (the compact orphan-GC
+//     backlog entry, which needs the concurrent-writer design call).
+func healStaleLineageSignatures(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, op string, dryRun bool, signer *lineage.Signer) error {
+	if dryRun || signer == nil {
+		return nil
+	}
+	signed, err := lineage.ChainIsSigned(ctx, store)
+	if err != nil {
+		return fmt.Errorf("%s: probe signed chain: %w", op, err)
+	}
+	if !signed {
+		return nil
+	}
+	verr := lineage.VerifyLineage(ctx, store, cat, signer)
+	if verr == nil {
+		return nil
+	}
+	slog.WarnContext(
+		ctx, op+": the lineage signature does not verify on a no-op maintenance run — re-signing the chain in place. This is the expected recovery for a maintenance run that crashed between its catalog commit and its re-sign; if this chain should NOT have needed healing, treat the signature failure below as suspect before trusting the restored signatures",
+		slog.String("verify_failure", verr.Error()),
+		slog.String("signing_key_id", signer.KeyID),
+	)
+	if err := lineage.ResignLineage(ctx, store, signer); err != nil {
+		return fmt.Errorf("%s: re-sign stale-signed chain: %w", op, err)
+	}
+	return nil
+}
+
 // unverifiableSignedArtifact reports a signed artifact that cannot be
 // verified, distinguishing the two reasons it can happen — which the single
 // message it replaces did not (audit 2026-08-01 Sec2).
