@@ -289,7 +289,8 @@ func findHexDecodeSites(root string) (map[string]string, error) {
 		if dotImported {
 			return fmt.Errorf(
 				"%s dot-imports encoding/hex, which turns every Decode call into a bare identifier "+
-					"this provenance walk cannot attribute — use a named import", path)
+					"this provenance walk cannot attribute — use a named import", path,
+			)
 		}
 		pkgDir := filepath.Base(filepath.Dir(path))
 		ast.Inspect(file, func(n ast.Node) bool {

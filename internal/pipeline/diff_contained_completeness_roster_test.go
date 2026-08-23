@@ -222,46 +222,59 @@ func fkProbe(fd irdiff.ForeignKeyDiff, wantTexts ...string) containedDiffProbe {
 var foreignKeyDiffFieldProbes = map[string]containedDiffProbe{
 	"ExpectedReference": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedReference: "(user_id) -> accounts(id)", ActualReference: "(user_id) -> users(id)"},
-		"source (user_id) -> accounts(id)"),
+		"source (user_id) -> accounts(id)",
+	),
 	"ActualReference": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedReference: "(user_id) -> accounts(id)", ActualReference: "(user_id) -> users(id)"},
-		"target (user_id) -> users(id)"),
+		"target (user_id) -> users(id)",
+	),
 	"ExpectedOnDelete": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedOnDelete: "RESTRICT", ActualOnDelete: "CASCADE"},
-		"on delete:    source RESTRICT"),
+		"on delete:    source RESTRICT",
+	),
 	"ActualOnDelete": fkProbe(
 		// The pair span, not a bare "target CASCADE": the consequence prose
 		// ("the target CASCADEs where…") contains that substring, and a
 		// mutation run proved a bare match let a dropped value line pass.
 		irdiff.ForeignKeyDiff{ExpectedOnDelete: "RESTRICT", ActualOnDelete: "CASCADE"},
-		"source RESTRICT   target CASCADE", "SILENTLY DESTROYS"),
+		"source RESTRICT   target CASCADE", "SILENTLY DESTROYS",
+	),
 	"ExpectedOnUpdate": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedOnUpdate: "SET NULL", ActualOnUpdate: "NO ACTION"},
-		"on update:    source SET NULL"),
+		"on update:    source SET NULL",
+	),
 	"ActualOnUpdate": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedOnUpdate: "SET NULL", ActualOnUpdate: "NO ACTION"},
-		"target NO ACTION"),
+		"target NO ACTION",
+	),
 	"ExpectedMatch": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedMatch: "FULL", ActualMatch: "SIMPLE"},
-		"match:        source FULL", "PARTIALLY-NULL COMPOSITE KEYS"),
+		"match:        source FULL", "PARTIALLY-NULL COMPOSITE KEYS",
+	),
 	"ActualMatch": fkProbe(
 		irdiff.ForeignKeyDiff{ExpectedMatch: "FULL", ActualMatch: "SIMPLE"},
-		"target SIMPLE"),
+		"target SIMPLE",
+	),
 	"DeferrabilityMismatched": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true},
-		"deferrable:"),
+		"deferrable:",
+	),
 	"ExpectedDeferrable": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true, ExpectedDeferrable: true},
-		"source true (initially deferred false)", "REJECTS A TRANSACTION ORDERING"),
+		"source true (initially deferred false)", "REJECTS A TRANSACTION ORDERING",
+	),
 	"ExpectedInitiallyDeferred": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true, ExpectedDeferrable: true, ExpectedInitiallyDeferred: true},
-		"source true (initially deferred true)"),
+		"source true (initially deferred true)",
+	),
 	"ActualDeferrable": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true, ActualDeferrable: true},
-		"target true (initially deferred false)"),
+		"target true (initially deferred false)",
+	),
 	"ActualInitiallyDeferred": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true, ActualDeferrable: true, ActualInitiallyDeferred: true},
-		"target true (initially deferred true)"),
+		"target true (initially deferred true)",
+	),
 }
 
 // ---- irdiff.PolicyDiff ----
@@ -279,37 +292,48 @@ func policyProbe(pd irdiff.PolicyDiff, wantTexts ...string) containedDiffProbe {
 var policyDiffFieldProbes = map[string]containedDiffProbe{
 	"ExpectedCommand": policyProbe(
 		irdiff.PolicyDiff{ExpectedCommand: "ALL", ActualCommand: "SELECT"},
-		"command:    source ALL"),
+		"command:    source ALL",
+	),
 	"ActualCommand": policyProbe(
 		irdiff.PolicyDiff{ExpectedCommand: "ALL", ActualCommand: "SELECT"},
-		"target SELECT", "run UNFILTERED"),
+		"target SELECT", "run UNFILTERED",
+	),
 	"PermissiveMismatched": policyProbe(
 		irdiff.PolicyDiff{PermissiveMismatched: true},
-		"permissive:"),
+		"permissive:",
+	),
 	"ExpectedPermissive": policyProbe(
 		irdiff.PolicyDiff{PermissiveMismatched: true, ExpectedPermissive: true},
-		"permissive: source true"),
+		"permissive: source true",
+	),
 	"ActualPermissive": policyProbe(
 		irdiff.PolicyDiff{PermissiveMismatched: true, ActualPermissive: true},
-		"permissive: source false   target true", "ADMITS ROWS THE SOURCE HIDES"),
+		"permissive: source false   target true", "ADMITS ROWS THE SOURCE HIDES",
+	),
 	"ExpectedRoles": policyProbe(
 		irdiff.PolicyDiff{ExpectedRoles: "app, reader", ActualRoles: "app"},
-		"roles:      source app, reader"),
+		"roles:      source app, reader",
+	),
 	"ActualRoles": policyProbe(
 		irdiff.PolicyDiff{ExpectedRoles: "app, reader", ActualRoles: "app"},
-		"target app"),
+		"target app",
+	),
 	"ExpectedUsing": policyProbe(
 		irdiff.PolicyDiff{ExpectedUsing: "tenant_id = 1"},
-		`using:      source "tenant_id = 1"`, "RETURNS EVERY ROW"),
+		`using:      source "tenant_id = 1"`, "RETURNS EVERY ROW",
+	),
 	"ActualUsing": policyProbe(
 		irdiff.PolicyDiff{ActualUsing: "true"},
-		`target "true"`),
+		`target "true"`,
+	),
 	"ExpectedCheck": policyProbe(
 		irdiff.PolicyDiff{ExpectedCheck: "tenant_id = 2"},
-		`with check: source "tenant_id = 2"`, "ACCEPTS WRITES"),
+		`with check: source "tenant_id = 2"`, "ACCEPTS WRITES",
+	),
 	"ActualCheck": policyProbe(
 		irdiff.PolicyDiff{ActualCheck: "tenant_id = 3"},
-		`target "tenant_id = 3"`),
+		`target "tenant_id = 3"`,
+	),
 }
 
 // ---- irdiff.SequenceDiff ----
@@ -327,55 +351,72 @@ func seqProbe(sd irdiff.SequenceDiff, wantTexts ...string) containedDiffProbe {
 var sequenceDiffFieldProbes = map[string]containedDiffProbe{
 	"ExpectedDataType": seqProbe(
 		irdiff.SequenceDiff{ExpectedDataType: "bigint", ActualDataType: "integer"},
-		"data type", "source bigint"),
+		"data type", "source bigint",
+	),
 	"ActualDataType": seqProbe(
 		irdiff.SequenceDiff{ExpectedDataType: "bigint", ActualDataType: "integer"},
-		"target integer"),
+		"target integer",
+	),
 	"ExpectedStart": seqProbe(
 		irdiff.SequenceDiff{ExpectedStart: "1000", ActualStart: "2000"},
-		"start:", "source 1000"),
+		"start:", "source 1000",
+	),
 	"ActualStart": seqProbe(
 		irdiff.SequenceDiff{ExpectedStart: "1000", ActualStart: "2000"},
-		"target 2000"),
+		"target 2000",
+	),
 	"ExpectedIncrement": seqProbe(
 		irdiff.SequenceDiff{ExpectedIncrement: "5", ActualIncrement: "9"},
-		"increment:", "source 5"),
+		"increment:", "source 5",
+	),
 	"ActualIncrement": seqProbe(
 		irdiff.SequenceDiff{ExpectedIncrement: "5", ActualIncrement: "9"},
-		"target 9"),
+		"target 9",
+	),
 	"ExpectedMinValue": seqProbe(
 		irdiff.SequenceDiff{ExpectedMinValue: "1", ActualMinValue: "3"},
-		"min value:", "source 1"),
+		"min value:", "source 1",
+	),
 	"ActualMinValue": seqProbe(
 		irdiff.SequenceDiff{ExpectedMinValue: "1", ActualMinValue: "3"},
-		"target 3"),
+		"target 3",
+	),
 	"ExpectedMaxValue": seqProbe(
 		irdiff.SequenceDiff{ExpectedMaxValue: "4096", ActualMaxValue: "8192"},
-		"max value:", "source 4096"),
+		"max value:", "source 4096",
+	),
 	"ActualMaxValue": seqProbe(
 		irdiff.SequenceDiff{ExpectedMaxValue: "4096", ActualMaxValue: "8192"},
-		"target 8192"),
+		"target 8192",
+	),
 	"ExpectedCache": seqProbe(
 		irdiff.SequenceDiff{ExpectedCache: "1", ActualCache: "50"},
-		"cache:", "source 1"),
+		"cache:", "source 1",
+	),
 	"ActualCache": seqProbe(
 		irdiff.SequenceDiff{ExpectedCache: "1", ActualCache: "50"},
-		"target 50"),
+		"target 50",
+	),
 	"CycleMismatched": seqProbe(
 		irdiff.SequenceDiff{CycleMismatched: true},
-		"cycle:"),
+		"cycle:",
+	),
 	"ExpectedCycle": seqProbe(
 		irdiff.SequenceDiff{CycleMismatched: true, ExpectedCycle: true},
-		"cycle:", "source true"),
+		"cycle:", "source true",
+	),
 	"ActualCycle": seqProbe(
 		irdiff.SequenceDiff{CycleMismatched: true, ActualCycle: true},
-		"target true", "WRAPS AND RE-ISSUES VALUES"),
+		"target true", "WRAPS AND RE-ISSUES VALUES",
+	),
 	"ExpectedOwnedBy": seqProbe(
 		irdiff.SequenceDiff{ExpectedOwnedBy: "orders.id", ActualOwnedBy: "<none>"},
-		"owned by", "source orders.id"),
+		"owned by", "source orders.id",
+	),
 	"ActualOwnedBy": seqProbe(
 		irdiff.SequenceDiff{ExpectedOwnedBy: "orders.id", ActualOwnedBy: "<none>"},
-		"target <none>"),
+		"target <none>",
+	),
 }
 
 // nameIdentityExempt is the shared exemption for each nested struct's
@@ -398,16 +439,36 @@ var containedDiffRosters = []struct {
 	probeName string
 	count     func(DiffJSONCounts) int
 }{
-	{reflect.TypeOf(irdiff.ColumnDiff{}), columnDiffFieldProbes, map[string]string{"Name": nameIdentityExempt}, 13, "amount",
-		func(c DiffJSONCounts) int { return c.ColumnsMismatched }},
-	{reflect.TypeOf(irdiff.IndexDiff{}), indexDiffFieldProbes, map[string]string{"Name": nameIdentityExempt}, 7, "uq_email",
-		func(c DiffJSONCounts) int { return c.IndexesMismatched }},
-	{reflect.TypeOf(irdiff.ForeignKeyDiff{}), foreignKeyDiffFieldProbes, map[string]string{"Name": nameIdentityExempt}, 13, "fk_orders_user",
-		func(c DiffJSONCounts) int { return c.ForeignKeysMismatched }},
-	{reflect.TypeOf(irdiff.PolicyDiff{}), policyDiffFieldProbes, map[string]string{"Name": nameIdentityExempt}, 11, "tenant_isolation",
-		func(c DiffJSONCounts) int { return c.PoliciesMismatched }},
-	{reflect.TypeOf(irdiff.SequenceDiff{}), sequenceDiffFieldProbes, map[string]string{"Name": nameIdentityExempt}, 17, "order_number_seq",
-		func(c DiffJSONCounts) int { return c.SequencesMismatched }},
+	{
+		reflect.TypeOf(irdiff.ColumnDiff{}), columnDiffFieldProbes,
+		map[string]string{"Name": nameIdentityExempt},
+		13, "amount",
+		func(c DiffJSONCounts) int { return c.ColumnsMismatched },
+	},
+	{
+		reflect.TypeOf(irdiff.IndexDiff{}), indexDiffFieldProbes,
+		map[string]string{"Name": nameIdentityExempt},
+		7, "uq_email",
+		func(c DiffJSONCounts) int { return c.IndexesMismatched },
+	},
+	{
+		reflect.TypeOf(irdiff.ForeignKeyDiff{}), foreignKeyDiffFieldProbes,
+		map[string]string{"Name": nameIdentityExempt},
+		13, "fk_orders_user",
+		func(c DiffJSONCounts) int { return c.ForeignKeysMismatched },
+	},
+	{
+		reflect.TypeOf(irdiff.PolicyDiff{}), policyDiffFieldProbes,
+		map[string]string{"Name": nameIdentityExempt},
+		11, "tenant_isolation",
+		func(c DiffJSONCounts) int { return c.PoliciesMismatched },
+	},
+	{
+		reflect.TypeOf(irdiff.SequenceDiff{}), sequenceDiffFieldProbes,
+		map[string]string{"Name": nameIdentityExempt},
+		17, "order_number_seq",
+		func(c DiffJSONCounts) int { return c.SequencesMismatched },
+	},
 }
 
 // TestContainedDiffSurfaceRosterEveryNestedFieldIsRendered is the G-6
