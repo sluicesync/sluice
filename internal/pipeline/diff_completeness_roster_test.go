@@ -29,9 +29,11 @@ package pipeline
 // NOT walk the nested per-object diff structs ([irdiff.ColumnDiff],
 // [irdiff.IndexDiff], [irdiff.ForeignKeyDiff], [irdiff.PolicyDiff],
 // [irdiff.SequenceDiff]) — a probe here proves the SECTION exists, not
-// that every attribute within it renders. It also does not check the JSON
-// body, which embeds SchemaDiff wholesale and therefore cannot omit a
-// field the way the hand-written counts and renderer can.
+// that every attribute within it renders. Those are
+// [TestContainedDiffSurfaceRosterEveryNestedFieldIsRendered] (this
+// package; built 2026-08-22, the G-6 follow-on). It also does not check
+// the JSON body, which embeds SchemaDiff wholesale and therefore cannot
+// omit a field the way the hand-written counts and renderer can.
 
 import (
 	"reflect"

@@ -28,10 +28,11 @@ package diff
 // walk [ir.Column], [ir.Index], [ir.ForeignKey], [ir.Policy] or
 // [ir.Sequence]: a probe here proves the diff reaches the CONTAINER (a
 // column-type change surfaces, so Columns is compared), and says nothing
-// about whether every field of the contained struct is. Those are their
-// own rosters and are not built yet — stated here rather than implied,
-// because a gate whose coverage is narrower than its name is worse than
-// no gate.
+// about whether every field of the contained struct is. Those rosters
+// are [TestContainedIRCompletenessRosterEveryFieldComparedOrExempt]
+// (this package; built 2026-08-22, the G-6 follow-on), which also walks
+// [ir.IndexColumn] and binds each probe to the nested diff field its
+// own comparator populates.
 //
 // # Why each probe names its expected summary text
 //
