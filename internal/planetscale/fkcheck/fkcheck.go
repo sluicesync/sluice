@@ -33,6 +33,13 @@ type Checker struct {
 
 	// Org, Database, Branch identify the target. Branch defaults to "main"
 	// (the production branch), mirroring the querytimeout.Raiser.
+	//
+	// PREMISE, shared with that Raiser (2026-08-22 invariant sweep):
+	// safe_migrations is BRANCH-scoped, and nothing derives the branch from
+	// the target DSN — an operator writing into a non-default branch without
+	// passing --planetscale-branch gets main's safe-migrations verdict, so
+	// the WARN/all-clear may describe the wrong branch. foreign_keys_enabled
+	// is DATABASE-scoped, so the preflight's only REFUSAL is immune to this.
 	Org      string
 	Database string
 	Branch   string

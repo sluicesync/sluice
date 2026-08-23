@@ -141,6 +141,24 @@ const holeProofPolls = 2
 // regression shipped once (live-confirmed on a pg_resetwal-epoch-bumped
 // PG 16, 2026-07-08). Pinned by TestSettledCeilingSQL_ComparesInXID8Domain
 // and TestCDCReader_XIDEpochBump.
+//
+// SCOPE of the stall WARN, stated so [changeLogHoleWarnEvery]'s rationale
+// cannot be read as broader than the code (2026-08-22 invariant sweep):
+// the "blocked at a hole" WARN reaches ONLY the hole arm. A stall induced
+// by THIS ceiling has no WARN — a long-open WRITE transaction anywhere on
+// the source (any table, captured or not; it only needs an assigned xid)
+// pins pg_snapshot_xmin, the ceiling prefix-cuts every committed row with
+// txid ≥ xmin out of the window, the poll returns zero rows, and the pump
+// takes the no-hole path (holes.clear(), no warnStuck). Correctness
+// holds — over-holding is always safe, and consumption resumes when the
+// transaction settles — but the operator sees a healthy-idle stream while
+// sync lag grows, exactly the silent-STALL shape the hole WARN was built
+// to name. Fix shape (filed, not built): when the stream has produced
+// nothing for ≥ changeLogHoleWarnEvery, one cheap probe
+// (`SELECT MAX(id) FROM <log> WHERE id > $lastSeen`) distinguishes
+// "idle" from "held back by the ceiling", and the latter WARNs, paced,
+// naming pg_stat_activity as the remedy — off the hot path because it
+// runs at WARN cadence, not per poll.
 func settledCeilingSQL(rel string) string {
 	return "COALESCE(\n" +
 		"    (SELECT MIN(id) - 1 FROM " + rel + "\n" +

@@ -756,6 +756,51 @@ func TestRunBatchLoop_RowsApplied_CheckpointOnly_BoundaryInBatch(t *testing.T) {
 	}
 }
 
+// TestRunBatchLoop_RowsApplied_CheckpointOnly_CarrySurvivesSchemaEventInterlude
+// pins the one carry arm the suite above did not reach (2026-08-22 invariant
+// sweep): on the TransactionalDDL=false (MySQL-target) path, a schema event
+// arriving MID-SOURCE-TRANSACTION (a PG source's transactional Truncate — a
+// MySQL source's DDL implicit-commits and can never land here) first flushes
+// the in-flight batch. Under CheckpointOnlyAtTxBoundary that flush is mid-tx,
+// so it must SKIP the position write and defer its DML into the carry; the
+// event then applies alone via ApplyOne (whose own mid-tx position story is
+// pinned per-engine by TestApply_PerChangePositionDeferredToTxCommit), and the
+// carried DML must land in the NEXT boundary write — neither dropped by the
+// interlude nor written at the schema-event flush.
+//
+// The delta assertion is exact: ONE position write, at the boundary token,
+// carrying both pre-DDL rows. A mutant that passes atBoundary=true at the
+// schema-event flush (persisting a mid-tx position, the audit-2026-08-01 S3
+// hazard) produces deltas [2 0]; a mutant that zeroes the carry across the
+// interlude produces [0]. Both directions were mutation-run.
+func TestRunBatchLoop_RowsApplied_CheckpointOnly_CarrySurvivesSchemaEventInterlude(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false) // TransactionalDDL=false: schema events go through ApplyOne
+	cfg.CheckpointOnlyAtTxBoundary = true
+
+	ch := feed(true,
+		txBegin("tb"), insertAt("p1"), insertAt("p2"),
+		truncateAt("ddl"), // mid-tx schema event → flush-then-ApplyOne
+		txCommit("tc"),
+	)
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 100); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	// The pre-DDL flush must not write a position (mid-tx skip); the DDL applies
+	// via ApplyOne; the boundary write carries the deferred 2.
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "dispatch:p2", "commit", // mid-tx flush: data only, carry=2
+		"applyOne:ddl",                        // the interlude
+		"begin", "writePosition:tc", "commit", // boundary: dedicated position-only tx
+	})
+	if got, want := rec.rowsDeltas, []int64{2}; !equalInt64(got, want) {
+		t.Fatalf("rows deltas = %v; want [2] (carry survives the ApplyOne interlude, lands once at the boundary)", got)
+	}
+	if got := rec.totalRowsApplied(); got != 2 {
+		t.Fatalf("cumulative rows_applied = %d; want 2", got)
+	}
+}
+
 func equalInt64(a, b []int64) bool {
 	if len(a) != len(b) {
 		return false

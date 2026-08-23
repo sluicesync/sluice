@@ -35,6 +35,17 @@ package migcore
 // The rule (coordinator, and the loud-failure tenet): refuse only what is
 // CONFIRMABLE (FK disabled); everything else is a WARN that still fires before
 // the copy. Never refuse a config that might work.
+//
+// Grounding for the "--skip-foreign-keys keeps each FK's referencing columns
+// indexed" claim this file's remedies repeat (2026-08-22 invariant sweep; the
+// engine-set-claim rule): the guarantee is SLUICE'S OWN, not a source-engine
+// fact. pipeline.applySkipForeignKeys (skip_foreign_keys.go, shared by migrate
+// AND sync cold-start) synthesizes a backing index on any FK's referencing
+// column tuple no copied index already covers as a left-prefix, precisely
+// because a PG source never auto-indexed them and a naive skip on a MySQL
+// target would leave them bare. Pinned by internal/pipeline's
+// skip_foreign_keys_test.go family matrix. If that synthesis is ever narrowed,
+// these three remedy strings (and internal/sluicecode's siblings) overclaim.
 
 import (
 	"context"

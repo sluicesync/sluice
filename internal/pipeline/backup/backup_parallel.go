@@ -371,6 +371,20 @@ func (b *Backup) backupTableRanges(
 // copyChunk uses — SQL-side upper bound via [ir.BoundedBatchedRowReader]
 // where implemented, so the range partition is collation-correct and
 // exactly-once by construction (ADR-0096).
+//
+// The end-of-range inference below (a short or empty page ⇒ the range is
+// exhausted) rests on the [ir.BatchedRowReader] contract's full-page
+// clause — "the channel closes when limit is reached or no more matching
+// rows exist" — i.e. a reader may return fewer than limit rows ONLY at
+// end of data. All three shipping implementations satisfy it by
+// construction (one SQL statement with LIMIT; the `--where` predicate is
+// a conjunct INSIDE that statement's WHERE, so nothing is dropped
+// client-side after the LIMIT). A future reader that short-pages for any
+// other reason (byte caps, client-side filtering) would silently
+// truncate every range here AND in migrate's copyChunk — honour the
+// contract or don't implement the surface. (2026-08-22 invariant sweep:
+// premise named; the abort-vs-EOF ambiguity is already closed by the
+// Bug 68 stream-error gate + the ctx.Err() check below.)
 func (b *Backup) backupRange(
 	ctx context.Context,
 	rr ir.RowReader,

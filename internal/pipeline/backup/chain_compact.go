@@ -1139,8 +1139,20 @@ func copyFile(ctx context.Context, src, dst irbackup.Store, srcPath, dstPath str
 // copy-then-delete. The rename is NOT the commit boundary (that's the
 // lineage.json swap upstream); a crash mid-rename leaves final
 // partially populated and the catalog still pointing at the sources,
-// so the next compact run's stale-staging-dir cleanup + catalog-
-// driven sweep cleans both.
+// so the chain stays exactly as restorable as before the run.
+//
+// (An earlier version of this comment said "the next compact run's
+// stale-staging-dir cleanup + catalog-driven sweep cleans both" — the
+// second half was never true: [cleanupStagingDirs] sweeps only
+// `.compact-staging-*` paths, and nothing GCs a FINAL-named
+// `seg-merged-<id>` dir the crashed run had already renamed into but
+// never committed. Such a dir is permanent orphan garbage — harmless to
+// correctness, since every reader resolves segments through the catalog
+// and a fresh run mints a new random group id, but it does leak disk.
+// A catalog-driven orphan GC for unreferenced seg-merged dirs is filed,
+// not built; it must reckon with a CONCURRENT compact's staged-but-not-
+// yet-swapped dirs, the same hazard cleanupStagingDirs already carries.
+// 2026-08-22 invariant sweep.)
 func renameStagingToFinal(ctx context.Context, store irbackup.Store, stagingDir, finalDir string) error {
 	paths, err := store.List(ctx, stagingDir+"/")
 	if err != nil {

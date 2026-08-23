@@ -311,7 +311,13 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 	// advances together with the position (ADR-0007). On the PG path
 	// (CheckpointOnlyAtTxBoundary=false) it stays 0 — every flush writes
 	// the position and consumes its own batch's DML immediately. Owned
-	// here so it survives across RunOneBatch calls within one ApplyBatch.
+	// here so it survives across RunOneBatch calls within one ApplyBatch —
+	// and DIES with this loop on any error, which is load-bearing for the
+	// accounting identity (2026-08-22 invariant sweep): a retry re-enters
+	// via a fresh ApplyBatch and replays from the PERSISTED position, so
+	// the replayed window is re-counted from zero. A carry that outlived
+	// the loop into a retry would double-count every mid-tx-flushed row
+	// the failed attempt had already accumulated.
 	var pendingRowsApplied int64
 	// inSourceTx tracks whether the stream is currently between a TxBegin and
 	// its TxCommit, so CheckpointOnlyAtTxBoundary can withhold the position
