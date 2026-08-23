@@ -137,7 +137,7 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: cdc: resolve date encoding: %w", err)
 	}
-	colTypes, liveFingerprints, err := loadColumnTypes(ctx, b.coldStart, b.dsn)
+	colTypes, liveFingerprints, liveColumns, err := loadColumnTypes(ctx, b.coldStart, b.dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +158,20 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 	// triggers capturing a stale column set — and an ADD COLUMN would SILENTLY
 	// drop the new column from the stream. The startup fingerprint check catches
 	// BOTH directions before any data moves.
-	if err := verifyNoSchemaDrift(ctx, exec, liveFingerprints); err != nil {
+	fps, err := verifyNoSchemaDrift(ctx, exec, liveFingerprints)
+	if err != nil {
+		_ = exec.close()
+		return nil, err
+	}
+	// Refuse loudly when an installed capture trigger's body is not what THIS
+	// binary's setup renders (the capture-shape door). This is what makes a
+	// stale install LOUD after a capture-encoding fix: v0.99.148..v0.131.x
+	// triggers render REAL values through format('%.17g'), which SQLite ≥ 3.43
+	// makes silently lossy (see sqlite.CapturedValueExpr) — and it equally
+	// catches a manually DROPPED or edited capture trigger, which would
+	// otherwise mis-capture with no signal at all. Runs after the fingerprint
+	// check, so the live column set provably reproduces the setup-time render.
+	if err := verifyCaptureTriggerShape(ctx, exec, b.driver, fps, liveColumns); err != nil {
 		_ = exec.close()
 		return nil, err
 	}
@@ -195,30 +208,36 @@ func changeLogAbsentErr(driver string) error {
 
 // loadColumnTypes reads the schema once (via the cold-start engine's schema
 // reader, so types + the captured column set match the cold-start reader exactly)
-// and builds (1) table → column → IR type for per-cell decode and (2) table →
-// captured-column FINGERPRINT for the startup drift check. The change-log/meta/
-// columns tables are already skipped by that reader (ADR-0135).
-func loadColumnTypes(ctx context.Context, coldStart ir.Engine, dsn string) (colTypes map[string]map[string]ir.Type, fingerprints map[string]string, err error) {
+// and builds (1) table → column → IR type for per-cell decode, (2) table →
+// captured-column FINGERPRINT for the startup drift check, and (3) table →
+// ORDERED non-generated column list for the capture-shape door (the same list
+// the fingerprint canonicalises, kept ordered so the expected trigger body can
+// be re-rendered exactly). The change-log/meta/columns tables are already
+// skipped by that reader (ADR-0135).
+func loadColumnTypes(ctx context.Context, coldStart ir.Engine, dsn string) (colTypes map[string]map[string]ir.Type, fingerprints map[string]string, columns map[string][]string, err error) {
 	sr, err := coldStart.OpenSchemaReader(ctx, dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sqlite-trigger: cdc: open schema reader: %w", err)
+		return nil, nil, nil, fmt.Errorf("sqlite-trigger: cdc: open schema reader: %w", err)
 	}
 	defer func() { _ = closeReader(sr) }()
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sqlite-trigger: cdc: read schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("sqlite-trigger: cdc: read schema: %w", err)
 	}
 	colTypes = make(map[string]map[string]ir.Type, len(schema.Tables))
 	fingerprints = make(map[string]string, len(schema.Tables))
+	columns = make(map[string][]string, len(schema.Tables))
 	for _, t := range schema.Tables {
 		cols := make(map[string]ir.Type, len(t.Columns))
 		for _, c := range t.Columns {
 			cols[c.Name] = c.Type
 		}
 		colTypes[t.Name] = cols
-		fingerprints[t.Name] = columnFingerprint(nonGeneratedColumnNames(t))
+		nonGen := nonGeneratedColumnNames(t)
+		fingerprints[t.Name] = columnFingerprint(nonGen)
+		columns[t.Name] = nonGen
 	}
-	return colTypes, fingerprints, nil
+	return colTypes, fingerprints, columns, nil
 }
 
 // verifyNoSchemaDrift compares the captured-column fingerprint recorded at
@@ -229,13 +248,15 @@ func loadColumnTypes(ctx context.Context, coldStart ir.Engine, dsn string) (colT
 // decode check never fires), but the new column's values would vanish from the
 // stream — caught here at stream start instead. A DROP/RENAME (live set differs)
 // and a dropped table (live fingerprint absent) are caught the same way.
-func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints map[string]string) error {
+// Returns the recorded fingerprints (the replicated-table roster) so the
+// capture-shape door that runs next grades exactly the same set.
+func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints map[string]string) ([]fingerprintRow, error) {
 	fps, err := exec.readFingerprints(ctx)
 	if err != nil {
 		// The columns table is created alongside the change-log (and dropped with
 		// it), so "change-log exists ⟹ columns exists". A missing/erroring table
 		// here is an inconsistent half-install — refuse rather than skip the guard.
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"sqlite-trigger: cannot read the captured-column fingerprint table %s (%w); "+
 				"the trigger install looks inconsistent — re-run `sluice trigger setup`",
 			ChangeLogColumnsTable, err,
@@ -244,17 +265,61 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 	for _, fp := range fps {
 		live, ok := liveFingerprints[fp.tbl]
 		if !ok {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q has capture triggers installed but no longer exists in the source schema; "+
 					"re-run `sluice trigger setup` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
 			)
 		}
 		if live != fp.columns {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q schema has drifted since `trigger setup` (captured columns %s, live columns %s); "+
 					"the stale triggers would mis-capture (an ADD COLUMN would be SILENTLY dropped) — "+
 					"re-run `sluice trigger setup` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
 			)
+		}
+	}
+	return fps, nil
+}
+
+// verifyCaptureTriggerShape is the capture-shape door: for every replicated
+// table (the fingerprint roster) it compares each INSTALLED capture trigger's
+// CREATE statement (sqlite_master, verbatim) against the statement THIS
+// binary's setup renders for the live column set ([captureTriggerCreateSQL]).
+// A missing trigger (manually dropped — its operation would silently vanish
+// from the stream) or a differing body (installed by an older sluice — most
+// urgently the pre-fix format('%.17g') REAL capture that SQLite ≥ 3.43 makes
+// silently lossy — or hand-edited) refuses loudly with the runnable remedy.
+// Re-running `trigger setup` DROP+CREATEs the triggers and preserves the
+// change-log, its watermark, and the consumer registry.
+func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string, fps []fingerprintRow, liveColumns map[string][]string) error {
+	installed, err := exec.captureTriggerSQL(ctx)
+	if err != nil {
+		return fmt.Errorf("sqlite-trigger: cannot read the installed capture triggers (%w); "+
+			"refusing to stream without verifying the capture shape", err)
+	}
+	for _, fp := range fps {
+		expected := captureTriggerCreateSQL(fp.tbl, liveColumns[fp.tbl])
+		for _, op := range triggerOps {
+			name := triggerName(fp.tbl, op.suffix)
+			got, ok := installed[name]
+			if !ok {
+				return fmt.Errorf(
+					"sqlite-trigger: table %q capture trigger %q is MISSING from the source — its %s changes are not "+
+						"being captured at all (silently absent from the stream); re-run `sluice trigger setup "+
+						"--source-driver %s` to reinstall (the change-log and resume watermark are preserved)",
+					fp.tbl, name, op.event, driver,
+				)
+			}
+			if got != expected[name] {
+				return fmt.Errorf(
+					"sqlite-trigger: table %q capture trigger %q does not match what this sluice installs — it was "+
+						"installed by an older sluice or edited. Older installs capture REAL values through "+
+						"format('%%.17g'), which SQLite 3.43+ renders LOSSILY (silently altered floats); re-run "+
+						"`sluice trigger setup --source-driver %s` to reinstall the triggers "+
+						"(the change-log and resume watermark are preserved)",
+					fp.tbl, name, driver,
+				)
+			}
 		}
 	}
 	return nil

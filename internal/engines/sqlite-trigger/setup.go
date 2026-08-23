@@ -492,9 +492,7 @@ func renderSetupDDL(tables []*ir.Table) []string {
 // the captured image if the column set changed since the last setup.
 func renderTableTriggers(t *ir.Table) []string {
 	cols := nonGeneratedColumnNames(t)
-	afterImg := captureImageExpr("NEW", cols)
-	beforeImg := captureImageExpr("OLD", cols)
-	fqTable := quoteIdent(t.Name)
+	creates := captureTriggerCreateSQL(t.Name, cols)
 
 	out := make([]string, 0, 2*len(triggerOps)+1)
 	// Record the EXACT captured column set this trigger set is built against, so
@@ -506,7 +504,31 @@ func renderTableTriggers(t *ir.Table) []string {
 		quoteIdent(ChangeLogColumnsTable), quoteSQLString(t.Name), quoteSQLString(columnFingerprint(cols)),
 	))
 	for _, op := range triggerOps {
-		name := quoteIdent(triggerName(t.Name, op.suffix))
+		name := triggerName(t.Name, op.suffix)
+		out = append(out, "DROP TRIGGER IF EXISTS "+quoteIdent(name), creates[name])
+	}
+	return out
+}
+
+// captureTriggerCreateSQL renders the EXACT CREATE TRIGGER statement text for
+// each of a table's three capture triggers, keyed by trigger name. It is the
+// single renderer behind [renderTableTriggers] AND the CDC reader's
+// capture-shape door ([verifyCaptureTriggerShape]): sqlite_master stores a
+// trigger's CREATE statement verbatim, so "installed trigger == what THIS
+// binary would install" is a byte-comparison against this output — which is
+// how a stale install (an older sluice's lossy REAL capture, a manually
+// edited body) or a silently DROPPED capture trigger is refused at stream
+// start instead of mis-capturing quietly. cols is the ordered non-generated
+// column list ([nonGeneratedColumnNames]) — the same list the fingerprint
+// pins, so after the drift check passes the live schema reproduces the
+// setup-time rendering exactly.
+func captureTriggerCreateSQL(table string, cols []string) map[string]string {
+	afterImg := captureImageExpr("NEW", cols)
+	beforeImg := captureImageExpr("OLD", cols)
+	fqTable := quoteIdent(table)
+	out := make(map[string]string, len(triggerOps))
+	for _, op := range triggerOps {
+		name := triggerName(table, op.suffix)
 		before, after := "NULL", "NULL"
 		switch op.opCode {
 		case "I":
@@ -516,16 +538,12 @@ func renderTableTriggers(t *ir.Table) []string {
 		case "D":
 			before = beforeImg
 		}
-		out = append(
-			out,
-			"DROP TRIGGER IF EXISTS "+name,
-			fmt.Sprintf(
-				"CREATE TRIGGER %s AFTER %s ON %s FOR EACH ROW\nBEGIN\n"+
-					"  INSERT INTO %s (op, tbl, before, after)\n  VALUES (%s, %s, %s, %s);\nEND",
-				name, op.event, fqTable,
-				quoteIdent(ChangeLogTable),
-				quoteSQLString(op.opCode), quoteSQLString(t.Name), before, after,
-			),
+		out[name] = fmt.Sprintf(
+			"CREATE TRIGGER %s AFTER %s ON %s FOR EACH ROW\nBEGIN\n"+
+				"  INSERT INTO %s (op, tbl, before, after)\n  VALUES (%s, %s, %s, %s);\nEND",
+			quoteIdent(name), op.event, fqTable,
+			quoteIdent(ChangeLogTable),
+			quoteSQLString(op.opCode), quoteSQLString(table), before, after,
 		)
 	}
 	return out

@@ -191,6 +191,10 @@ func (s *spyExecutor) pollChangeLog(context.Context, int64, int) ([]rawChangeRow
 
 func (s *spyExecutor) readFingerprints(context.Context) ([]fingerprintRow, error) { return nil, nil }
 
+func (s *spyExecutor) captureTriggerSQL(context.Context) (map[string]string, error) {
+	return nil, nil // no replicated tables in the spy's fingerprint roster → door passes vacuously
+}
+
 func (s *spyExecutor) changeLogExists(context.Context) (bool, error) { return true, nil }
 
 // tableColumns answers with the healthy floor for whichever engine-internal

@@ -46,7 +46,10 @@ func TestRenderTableTriggers_FaithfulCaptureBody(t *testing.T) {
 		`CREATE TRIGGER "sluice_capture_events_del" AFTER DELETE ON "events"`,
 		`DROP TRIGGER IF EXISTS "sluice_capture_events_ins"`,
 		// Faithful encoding for the id column (INSERT after-image, NEW row).
-		`json_object('t', typeof(NEW."id"), 'v', CASE typeof(NEW."id") WHEN 'blob' THEN hex(NEW."id") WHEN 'real' THEN format('%.17g', NEW."id") ELSE CAST(NEW."id" AS TEXT) END)`,
+		// The REAL arm is format('%!.20g') — the `!` lossless flag; the old
+		// plain %.17g is silently lossy on SQLite ≥ 3.43 (see
+		// sqlite.CapturedValueExpr and its round-trip gate).
+		`json_object('t', typeof(NEW."id"), 'v', CASE typeof(NEW."id") WHEN 'blob' THEN hex(NEW."id") WHEN 'real' THEN format('%!.20g', NEW."id") ELSE CAST(NEW."id" AS TEXT) END)`,
 		// Faithful encoding for the payload (blob) column on the OLD row (DELETE).
 		`json_object('t', typeof(OLD."payload"), 'v', CASE typeof(OLD."payload") WHEN 'blob' THEN hex(OLD."payload")`,
 		// Op codes.

@@ -65,6 +65,11 @@ type mockD1 struct {
 	schemaVer int
 	consumers []triggercdc.Consumer
 
+	// staleCaptureBodies makes the mock answer the capture-shape door with
+	// pre-fix trigger bodies (REAL arm rendered via the lossy %.17g), so a
+	// test can pin the door's stale-install refusal on the D1 transport.
+	staleCaptureBodies bool
+
 	ddl          []string        // captured non-SELECT statements (setup/teardown DDL)
 	pollSQL      []string        // captured poll SELECTs
 	pollArgs     []string        // the watermark param of each poll
@@ -196,6 +201,27 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 			return http.StatusOK, d1OK([]map[string]any{{"name": sqlite.ChangeLogTable}})
 		}
 		return http.StatusOK, d1OK(nil)
+	// The capture-shape door's read: installed trigger CREATE text. Answer
+	// with EXACTLY what setup would install for the fingerprinted tables
+	// (rendered by the production captureTriggerCreateSQL, so the mock can
+	// never drift from the door's expectation) — unless a test models a
+	// stale install via staleCaptureBodies, which rewrites the REAL arm to
+	// the pre-fix lossy %.17g rendering.
+	case strings.Contains(sql, "SELECT name, sql FROM sqlite_master"):
+		var rows []map[string]any
+		for _, fp := range m.fingerprints {
+			var cols []string
+			if err := json.Unmarshal([]byte(fp[1]), &cols); err != nil {
+				t.Fatalf("mock D1: fingerprint columns %q not a JSON array: %v", fp[1], err)
+			}
+			for name, createSQL := range captureTriggerCreateSQL(fp[0], cols) {
+				if m.staleCaptureBodies {
+					createSQL = strings.ReplaceAll(createSQL, "%!.20g", "%.17g")
+				}
+				rows = append(rows, map[string]any{"name": name, "sql": createSQL})
+			}
+		}
+		return http.StatusOK, d1OK(rows)
 	case strings.Contains(sql, "type = 'trigger'"):
 		return http.StatusOK, d1OK(nil) // teardown discovery; unused here
 	default:
@@ -635,6 +661,38 @@ func TestD1Capture_RefusesSchemaDrift(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "drift") || !strings.Contains(err.Error(), "trigger setup") {
 		t.Errorf("drift refusal should name the drift + recovery action; got: %v", err)
+	}
+}
+
+// TestD1CDC_StaleCaptureBodyRefused pins the capture-shape door on the D1
+// transport: an install whose trigger bodies still carry the pre-fix lossy
+// REAL rendering (format('%.17g') — silently altered floats on SQLite ≥ 3.43)
+// refuses at open with the re-setup remedy. The local-lane twin (plus the
+// dropped-trigger arm and the positive arm) lives in
+// cdc_capture_shape_test.go.
+func TestD1CDC_StaleCaptureBodyRefused(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{}},
+			{Name: "v", Type: ir.Text{}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	m := &mockD1{
+		exists:             true,
+		fingerprints:       [][2]string{{"t", columnFingerprint([]string{"id", "v"})}},
+		staleCaptureBodies: true,
+	}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+
+	_, err := openCDCReaderBackend(bg(), b)
+	if err == nil {
+		t.Fatal("openCDCReaderBackend accepted stale (lossy 17g-rendered) capture bodies over the D1 transport")
+	}
+	if !strings.Contains(err.Error(), "older sluice") || !strings.Contains(err.Error(), "trigger setup") {
+		t.Errorf("stale-body refusal should name the cause + recovery; got: %v", err)
 	}
 }
 

@@ -419,8 +419,9 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 	for i, c := range table.Columns {
 		q := quoteIdent(c.Name)
 		// typeof → the actual storage class (integer/real/text/blob/null);
-		// value → EXACT text per storage class (blob→hex, real→%.17g, else
-		// CAST AS TEXT). The (typeof, value) pair is built by the SHARED
+		// value → EXACT text per storage class (blob→hex, real→the lossless
+		// format('%!.20g') render, else CAST AS TEXT). The (typeof, value)
+		// pair is built by the SHARED
 		// [CapturedTypeofExpr] / [CapturedValueExpr] so this reader projection
 		// and the sqlite-trigger capture trigger body (ADR-0135) can never drift
 		// on the encoding — see CapturedValueExpr for the per-class rationale.

@@ -50,6 +50,16 @@ inheriting their refuse-not-coerce loud-failure contract. Big integers are exact
 not JSON number), REAL is `%.17g` round-trip-exact, BLOBs come back from hex. This reuses
 `d1_decode.go`'s reconstruction, keeping one faithful-capture implementation.
 
+> **Correction (2026-08-22):** the REAL arm is now `format('%!.20g', col)`. The
+> `%.17g` above relied on the C-printf 17-significant-digit round-trip guarantee,
+> which SQLite 3.43's rewritten float rendering no longer honors — a plain `%.Ng`
+> renders `0.30000000000000004` as `"0.3"` at any N, so REAL captures were silently
+> lossy (and a max-double REAL rendered as an out-of-range string that killed the
+> stream). The `!` alternate-form-2 flag raises the precision until the render is
+> lossless (measured: 0 misses over a 5k-double sweep on modernc 3.53.3 and on real
+> D1). `TestCapturedValueExpr_RealRenderRoundTripsExactly` is the per-PR gate; the
+> CDC reader's capture-shape door refuses installs still carrying the old body.
+
 ## Decision
 
 1. **New engine `internal/engines/sqlite-trigger`**, registered as `sqlite-trigger`,

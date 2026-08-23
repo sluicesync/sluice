@@ -60,18 +60,44 @@ func CapturedTypeofExpr(colExpr string) string {
 // (typeof, text/hex) contract requires (ADR-0132 §4 / ADR-0135 §crux):
 //
 //	blob → hex(c)                  — recovered with hex.DecodeString
-//	real → format('%.17g', c)      — 17 sig-digits = IEEE-754 round-trip exact
+//	real → format('%!.20g', c)     — see below; the `!` flag is load-bearing
 //	else → CAST(c AS TEXT)         — integers carry EXACT decimal text (> 2^53
 //	                                 included, where a bare JSON number rounds);
 //	                                 NULL stays NULL
 //
+// The REAL arm's history is a corrected premise (found by the 2026-08-22
+// adversarial-corpus sweep). The original `format('%.17g', c)` relied on the
+// C-printf guarantee that 17 significant digits round-trip an IEEE-754 double —
+// which stopped being what format() computes when SQLite 3.43 rewrote its float
+// rendering: on 3.43+ a plain `%.Ng` renders a value-based short form at ANY
+// requested N (`0.30000000000000004` renders as "0.3", `0.1234567890123456789`
+// as the 16-digit "0.1234567890123457" — a different double), so every REAL
+// captured or projected through it silently lost low bits at exit 0. MEASURED
+// on modernc's SQLite 3.53.3 (2295 of 5007 swept doubles fail to round-trip
+// through `%.17g`/`%.20g`/`%.25g` alike) and on real Cloudflare D1 (the same
+// 16-digit render, d1verify 2026-08-22). The fix is SQLite's alternate-form-2
+// flag: `%!.20g` — documented and measured (0 misses over the same sweep) to
+// increase the precision until the rendering is LOSSLESS on 3.43+. On older
+// SQLite (3.38–3.42, possible for the app library firing a local capture
+// trigger) the `!` flag is parsed and ignored for floats, leaving `%.20g` —
+// three more digits than the previous expression on the same pre-3.43
+// renderer, so never worse than what shipped before (UNVERIFIED PREMISE for
+// pre-3.43 app libraries only; sluice's own connections and D1 are measured).
+// TestCapturedValueExpr_RealRenderRoundTripsExactly is the per-PR gate on the
+// bundled SQLite; the d1verify adversarial matrix is the live-D1 pin.
+//
 // It is the SINGLE definition of the faithful encoding, shared by the file/D1
-// reader projection ([buildD1Projection]) and the sqlite-trigger capture trigger
-// body, so capture and read can never drift. colExpr is the already-quoted
-// column reference.
+// reader projection ([buildD1Projection], which the --stage-local staging copy
+// also rides) and the sqlite-trigger / d1-trigger capture trigger body, so
+// capture and read can never drift. colExpr is the already-quoted column
+// reference. NOTE: capture triggers INSTALLED by an older sluice keep the old
+// lossy expression until `trigger setup` is re-run — the CDC reader refuses at
+// stream start when an installed capture trigger body does not match this
+// expression (the sqlite-trigger capture-shape door), so that stale-install
+// case is loud, never silent.
 func CapturedValueExpr(colExpr string) string {
 	return "CASE typeof(" + colExpr + ") WHEN 'blob' THEN hex(" + colExpr +
-		") WHEN 'real' THEN format('%.17g', " + colExpr + ") ELSE CAST(" + colExpr + " AS TEXT) END"
+		") WHEN 'real' THEN format('%!.20g', " + colExpr + ") ELSE CAST(" + colExpr + " AS TEXT) END"
 }
 
 // ReconstructStorageValue reconstructs the SAME Go storage-class value the

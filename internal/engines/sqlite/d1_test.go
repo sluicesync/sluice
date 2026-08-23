@@ -898,17 +898,27 @@ func TestD1Engine_OpenMissingToken(t *testing.T) {
 	}
 }
 
-// ---- BLOCK 1: REAL precision (%.17g round-trip) ---------------------------
+// ---- BLOCK 1: REAL precision (lossless-render round-trip) -----------------
 
-// TestD1RealPrecision_Pure pins that a REAL rendered at 17 significant digits
-// (the IEEE-754 round-trip guarantee, which the projection now uses instead of
-// CAST-AS-TEXT) decodes back to the EXACT float64 — for ir.Float and for
-// ir.Decimal's real branch. Without %.17g a low-digit render would silently lose
-// the low bits.
+// TestD1RealPrecision_Pure pins that a REAL delivered as round-trip-exact
+// decimal text decodes back to the EXACT float64 — for ir.Float and for
+// ir.Decimal's real branch. The wire text here is Go's shortest round-trip
+// rendering, which is exact BY CONSTRUCTION — deliberately so: this test pins
+// the CLIENT decode half only. Whether the SERVER-side render (SQLite's
+// format('%!.20g', …) in [CapturedValueExpr]) is itself round-trip exact is
+// pinned separately by TestCapturedValueExpr_RealRenderRoundTripsExactly
+// against the real SQLite — the earlier version of this test mirrored the
+// server expression with Go's own fmt.Sprintf("%.17g"), a self-referential
+// fixture that stayed green while SQLite 3.43+ made the real format() lossy.
 func TestD1RealPrecision_Pure(t *testing.T) {
-	vals := []float64{math.Pi, 0.1, 1.0 / 3.0, 1.0, 1234567890123456.7, math.SmallestNonzeroFloat64, math.MaxFloat64}
+	vals := []float64{
+		math.Pi, 0.1, 1.0 / 3.0, 1.0, 1234567890123456.7,
+		math.SmallestNonzeroFloat64, math.MaxFloat64,
+		0.30000000000000004,   // the value SQLite's plain %.Ng renders as "0.3"
+		0.1234567890123456789, // rendered 16-digit (a different double) by %.17g
+	}
 	for _, want := range vals {
-		text := fmt.Sprintf("%.17g", want) // mirrors SQLite format('%.17g', x)
+		text := strconv.FormatFloat(want, 'g', -1, 64)
 		raw := json.RawMessage(`"` + text + `"`)
 
 		got, err := d1StorageValue("real", raw)
@@ -939,17 +949,20 @@ func TestD1RealPrecision_Pure(t *testing.T) {
 	}
 }
 
-// TestD1Format17g_RealDriver is the SQLite ground truth for BLOCK 1: it confirms
-// that the real engine D1 runs (modernc = the same SQLite) actually supports
-// `format('%.17g', x)` AND that its output round-trips a double exactly — so the
-// projection's dependence shifts from D1's default formatter to the IEEE-754
-// guarantee. It runs the reader's EXACT generated projection over a real table
-// and decodes via the production d1StorageValue.
-func TestD1Format17g_RealDriver(t *testing.T) {
+// TestD1CaptureRender_RealDriver is the SQLite ground truth for BLOCK 1: it
+// runs the reader's EXACT generated projection (the [CapturedValueExpr]
+// encoding) over a real table and decodes via the production d1StorageValue.
+// The REAL seed is 0.30000000000000004 ON PURPOSE — the value the pre-fix
+// format('%.17g') projection rendered as "0.3" on SQLite ≥ 3.43 (a silently
+// different double); this test's predecessor seeded π, whose render happened
+// to round-trip, and stayed green across that regression (the
+// pin-the-representative trap). The full sweep gate is
+// TestCapturedValueExpr_RealRenderRoundTripsExactly.
+func TestD1CaptureRender_RealDriver(t *testing.T) {
 	path := seedDB(
 		t,
 		`CREATE TABLE t (id INTEGER PRIMARY KEY, f REAL, big INTEGER, b BLOB)`,
-		`INSERT INTO t (id, f, big, b) VALUES (9007199254740993, 3.141592653589793, 9223372036854775807, x'cafe00ff')`,
+		`INSERT INTO t (id, f, big, b) VALUES (9007199254740993, 0.30000000000000004, 9223372036854775807, x'cafe00ff')`,
 	)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -1015,8 +1028,9 @@ func TestD1Format17g_RealDriver(t *testing.T) {
 		return out
 	}
 
-	if got := decode(1, table.Columns[1]); got != 3.141592653589793 {
-		t.Errorf("REAL via real driver = %v; want exact math.Pi-ish 3.141592653589793", got)
+	if got := decode(1, table.Columns[1]); got != 0.30000000000000004 {
+		t.Errorf("SILENT FLOAT ALTERATION: REAL via real driver = %v; want the exact double of 0.30000000000000004 "+
+			"(a plain %%.Ng render delivers 0.3)", got)
 	}
 	if got := decode(2, table.Columns[2]); got != int64(9223372036854775807) {
 		t.Errorf("big INTEGER via real driver = %v; want exact max int64", got)

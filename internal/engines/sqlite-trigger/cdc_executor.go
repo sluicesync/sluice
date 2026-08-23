@@ -51,6 +51,14 @@ type executor interface {
 	// own change log from a user table that happens to carry the name, because
 	// a legitimate re-`setup` finds the table there every time.
 	tableColumns(ctx context.Context, table string) ([]string, error)
+	// captureTriggerSQL returns the INSTALLED CREATE-statement text of every
+	// sluice capture trigger (sqlite_master.sql), keyed by trigger name. The
+	// CDC reader's capture-shape door compares it against what THIS binary's
+	// setup would install ([captureTriggerCreateSQL]) so a stale install —
+	// notably one whose REAL capture still uses the pre-fix lossy
+	// format('%.17g') rendering — or a dropped/edited capture trigger refuses
+	// loudly at stream start instead of mis-capturing silently.
+	captureTriggerSQL(ctx context.Context) (map[string]string, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
 	// changeLogAllocation reports the change log's id-allocation state — the
 	// floor below which it can never issue a new id, and whether the table is
@@ -231,6 +239,13 @@ const (
 	changeLogSeqSQL = `SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ?), 0) AS seq`
 	// discoverTriggersSQL lists every sluice-installed capture trigger.
 	discoverTriggersSQL = `SELECT name FROM sqlite_master WHERE type = 'trigger' ` +
+		`AND name LIKE 'sluice\_capture\_%' ESCAPE '\' ORDER BY name`
+	// captureTriggerSQLQuery reads each installed capture trigger's verbatim
+	// CREATE statement for the capture-shape door. The projection spelling
+	// (`SELECT name, sql`) is distinct from the change-log allocation probe's
+	// `SELECT sql FROM sqlite_master` on purpose — the D1 test mock dispatches
+	// on those substrings.
+	captureTriggerSQLQuery = `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ` +
 		`AND name LIKE 'sluice\_capture\_%' ESCAPE '\' ORDER BY name`
 	// readFingerprintsSQL reads the per-table captured-column fingerprints.
 	readFingerprintsSQL = `SELECT tbl, columns FROM "` + ChangeLogColumnsTable + `" ORDER BY tbl`
@@ -440,6 +455,26 @@ func (e *localExecutor) discoverTriggers(ctx context.Context) ([]string, error) 
 			return nil, err
 		}
 		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+func (e *localExecutor) captureTriggerSQL(ctx context.Context) (map[string]string, error) {
+	rows, err := e.db.QueryContext(ctx, captureTriggerSQLQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var name string
+		var createSQL sql.NullString
+		if err := rows.Scan(&name, &createSQL); err != nil {
+			return nil, err
+		}
+		if createSQL.Valid {
+			out[name] = createSQL.String
+		}
 	}
 	return out, rows.Err()
 }
@@ -790,6 +825,31 @@ func (e *d1Executor) discoverTriggers(ctx context.Context) ([]string, error) {
 		}
 		if ok {
 			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+func (e *d1Executor) captureTriggerSQL(ctx context.Context) (map[string]string, error) {
+	rows, err := e.conn.Query(ctx, captureTriggerSQLQuery)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, row := range rows {
+		name, ok, err := d1CellString(row["name"])
+		if err != nil || !ok {
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		createSQL, ok, err := d1CellString(row["sql"])
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[name] = createSQL
 		}
 	}
 	return out, nil

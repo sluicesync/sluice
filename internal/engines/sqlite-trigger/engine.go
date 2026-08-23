@@ -23,7 +23,8 @@
 // is captured as a `(typeof, text/hex)` pair using the SAME proven encoding as
 // the file/D1 reader (`sqlite.CapturedValueExpr`): `typeof(col)` for the storage
 // class and `CASE typeof(col) WHEN 'blob' THEN hex(col) WHEN 'real' THEN
-// format('%.17g', col) ELSE CAST(col AS TEXT) END` for the value. The CDC reader
+// format('%!.20g', col) ELSE CAST(col AS TEXT) END` for the value (the `!`
+// lossless-precision flag is load-bearing — see CapturedValueExpr). The CDC reader
 // reconstructs the exact int64/float64/text/[]byte via `sqlite`'s shared
 // [sqlite.CapturedCellDecoder] (reconstruction + the storage-class-faithful
 // `decodeCell` + the ADR-0129 date/bool policy) — ONE faithful-decode
