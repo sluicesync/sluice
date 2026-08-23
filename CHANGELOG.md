@@ -26,7 +26,7 @@ Internal hardening (no user-facing effect): the adversarial value-fidelity corpu
 
 ### Compatibility
 
-Drop-in from v0.131.2 — no schema, format, error-code, flag, or command change. The backup signature heal only re-signs a chain that fails verification and only when key material is supplied (a keyless no-op run stays exit-0 and unhealed). The Postgres estimator is advisory and falls back to the prior behaviour on an unknown size. The pgtrigger change adds a log line.
+Drop-in from v0.131.2 — no schema, format, error-code, flag, or command change. The backup signature heal only re-signs a chain that fails verification and only when key material is supplied — and a keyless CLI run against a signed chain is refused earlier with `SLUICE-E-BACKUP-SIGNATURE-MISSING`, so it never silently leaves stale signatures (only an unsigned chain's keyless no-op simply exits 0). The Postgres estimator is advisory and falls back to the prior behaviour on an unknown size. The pgtrigger change adds a log line.
 
 **Who needs this:** anyone running **large Postgres→PlanetScale/Vitess migrations** (the index-split now engages) or **signed encrypted backup chains through `compact`/`prune`** (a crash-stale signature now heals on re-run). Everyone else: no action.
 
