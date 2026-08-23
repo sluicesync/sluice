@@ -30,7 +30,16 @@ import (
 //
 // The client evaluator compares the literal against the DECODED value, which
 // is always canonical (decodeUUID lowercases and hyphenates, decodeNetwork
-// goes through netip, decodeMacaddr through net.HardwareAddr). So a
+// goes through netip, decodeMacaddr through net.HardwareAddr). Each member of
+// that parenthetical is a premise about the ENGINES' decoders, and each is
+// bound to a real server by a named test rather than by this sentence:
+// network/MAC by the S2/C1 pins (postgres network_rendering / macaddr_width
+// integration tests), temporal by temporal_realdb_integration_test.go, and
+// UUID — the member that until the 2026-08-22 sweep had only
+// self-referential unit pins — by
+// TestUUIDCanonicalForm_BothLegsDeliverTheEvaluatorsForm
+// (internal/engines/postgres), which drives both real legs' decodes through
+// the REAL resolver+compiler+Eval. So a
 // non-canonical literal compiles, the cold-start snapshot copies the row (that
 // leg is server-evaluated), and then the CDC leg scores every change to that
 // row as "not in scope" and drops it. The target row goes permanently stale at
