@@ -169,6 +169,63 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 	return count, nil
 }
 
+// EstimateTableBytes implements [ir.TableByteSizeEstimator] (ADR-0184
+// PlanetScale leg — the batch-C 2026-08-23 source-engine sibling closure).
+// It returns the SOURCE table's on-disk byte size via pg_table_size (heap +
+// TOAST, excluding indexes — the closest Postgres analogue of the MySQL
+// DATA_LENGTH the 8 GiB split threshold was tuned against). Consumed by
+// migcore.ApplyIndexSplitSizeHint so a Postgres→PlanetScale/Vitess migrate
+// sizes the per-index ALTER split off the accurate long-lived SOURCE rather
+// than the freshly-copied target's stale post-copy stats; before this
+// existed, the split was inert on every Postgres-source path and a large
+// PG→PlanetScale table's combined index ALTER still hit the ~900 s wall —
+// the exact incident shape ADR-0184 came from, one source engine over.
+//
+// It mirrors [RowReader.CountRows]'s pinned posture: (0, nil) on a
+// snapshot-pinned reader (closer == nil OR snapshotPinned — a catalog query
+// would conflict with the in-flight stream on the one pinned conn), which
+// keeps the writer's safe combined ALTER. The value is an advisory
+// estimate; 0 always means "unknown", never "empty".
+func (r *RowReader) EstimateTableBytes(ctx context.Context, table *ir.Table) (int64, error) {
+	if table == nil {
+		return 0, errors.New("postgres: EstimateTableBytes: table is nil")
+	}
+	if r.closer == nil || r.snapshotPinned {
+		return 0, nil
+	}
+	schema, err := r.effectiveSchema(table)
+	if err != nil {
+		return 0, err
+	}
+	q := `SELECT COALESCE((SELECT pg_table_size(c.oid)
+	                       FROM pg_class c
+	                       JOIN pg_namespace n ON n.oid = c.relnamespace
+	                       WHERE n.nspname = $1 AND c.relname = $2), 0)`
+	rows, err := r.q.QueryContext(ctx, q, schema, table.Name) //nolint:rowserrcheck,sqlclosecheck // handled below
+	if err != nil {
+		return 0, fmt.Errorf("postgres: EstimateTableBytes query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if rerr := rows.Err(); rerr != nil {
+			return 0, fmt.Errorf("postgres: EstimateTableBytes rows: %w", rerr)
+		}
+		return 0, nil
+	}
+	var n int64
+	if scanErr := rows.Scan(&n); scanErr != nil {
+		return 0, fmt.Errorf("postgres: EstimateTableBytes scan: %w", scanErr)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return 0, fmt.Errorf("postgres: EstimateTableBytes rows: %w", rerr)
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n, nil
+}
+
 // EstimateRowCount implements [ir.RowCountEstimator]: the pre-stream,
 // chunk-DECISION-only row-count estimate (NEVER the ETA path — see
 // [RowReader.CountRows]). It returns the table's pg_class.reltuples

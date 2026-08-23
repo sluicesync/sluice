@@ -107,15 +107,16 @@ var (
 
 	// RowReader optional surfaces (RawCopy* is the ADR-0043 raw-COPY
 	// fast path; RowCountEstimator drives the parallel-copy split).
-	_ ir.BatchedRowReader     = (*RowReader)(nil)
-	_ ir.KeysetSampler        = (*RowReader)(nil)
-	_ ir.RangeBoundsQuerier   = (*RowReader)(nil)
-	_ ir.RawCopyExporter      = (*RowReader)(nil)
-	_ ir.RawCopyVersionProber = (*RowReader)(nil)
-	_ ir.RowCountEstimator    = (*RowReader)(nil)
-	_ ir.RowCounter           = (*RowReader)(nil)
-	_ ir.RowFilterSetter      = (*RowReader)(nil)
-	_ ir.SchemaSetter         = (*RowReader)(nil)
+	_ ir.BatchedRowReader       = (*RowReader)(nil)
+	_ ir.KeysetSampler          = (*RowReader)(nil)
+	_ ir.RangeBoundsQuerier     = (*RowReader)(nil)
+	_ ir.RawCopyExporter        = (*RowReader)(nil)
+	_ ir.RawCopyVersionProber   = (*RowReader)(nil)
+	_ ir.RowCountEstimator      = (*RowReader)(nil)
+	_ ir.RowCounter             = (*RowReader)(nil)
+	_ ir.RowFilterSetter        = (*RowReader)(nil)
+	_ ir.SchemaSetter           = (*RowReader)(nil)
+	_ ir.TableByteSizeEstimator = (*RowReader)(nil)
 
 	// RowWriter optional surfaces.
 	_ ir.BulkTableDropper            = (*RowWriter)(nil)
