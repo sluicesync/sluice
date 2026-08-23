@@ -26,6 +26,9 @@
 package docsync
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -183,6 +186,191 @@ func TestDocCodePointers_ExistAndLineInRange(t *testing.T) {
 			t.Errorf("%s cites `%s:%d`, but that file does not exist", b.from, b.path, b.line)
 		} else {
 			t.Errorf("%s cites `%s:%d`, but that file has only %d lines — the citation drifted", b.from, b.path, b.line, b.max)
+		}
+	}
+}
+
+// docSymbolRe matches a backtick-quoted `pkg.Symbol` span (optionally
+// spelled with a call suffix: `pkg.Symbol()` / `pkg.Symbol(...)`) — the
+// shape a doc cites a Go identifier by. The qualifier is required to be
+// lower-case (a package name), the symbol to be an identifier.
+var docSymbolRe = regexp.MustCompile("`([a-z][a-zA-Z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)(?:\\(\\)|\\(\\.\\.\\.\\))?`")
+
+// docSymbolFileExtTokens are "symbol" parts that mean the span is a
+// FILENAME (`stream.go`, `chain.json`), not an identifier. Skipped, not
+// graded — file existence is the first gate's job.
+var docSymbolFileExtTokens = map[string]bool{
+	"go": true, "md": true, "json": true, "yaml": true, "yml": true, "sh": true,
+	"ps1": true, "sql": true, "txt": true, "tmpl": true, "conf": true, "env": true,
+	"exe": true, "mjs": true, "js": true, "html": true, "css": true, "toml": true,
+	"lock": true, "sum": true, "mod": true, "ico": true, "svg": true, "png": true,
+}
+
+// docSymbolExempt lists graded spans that are deliberately allowed to
+// resolve to nothing, each with the reason. An entry no doc uses any
+// more fails the test — a stale blessing is how a roster starts
+// covering less than its name implies.
+var docSymbolExempt = map[string]string{
+	"backup.SourceEngineCommitsAfterRows": "cited AS the phantom: this is the symbol that never existed, named in the G-13 " +
+		"filing (and its closure note) precisely because a doc once cited it as real — the citation is the history of this " +
+		"gate, not a claim about the code",
+}
+
+// TestDocSymbolPointers_ResolveAgainstTheirPackage is the G-13 sibling
+// (filed alongside the `path:line` gate above; built 2026-08-22): a doc
+// sentence citing `pkg.Symbol` is a claim that the symbol exists, and
+// nothing checked it — which is how the phantom
+// `backup.SourceEngineCommitsAfterRows` survived in three docs.
+//
+// # What it reaches, stated rather than implied
+//
+// It grades backtick-quoted `pkg.Symbol` spans in the CLAIM-surface
+// docs: docs/dev/*.md EXCLUDING roadmap.md and item49-phase3-prep.md,
+// and excluding the docs/dev/design/ and docs/dev/notes/ trees — those
+// are planning surfaces whose house convention deliberately names
+// PROPOSED symbols (a roadmap entry doubles as a self-contained prompt),
+// so "does not exist yet" is their normal state, not drift. A span is
+// graded only when its qualifier matches an internal package DIRECTORY
+// basename; same-basename packages (ir/backup vs pipeline/backup) are
+// unioned. NOT graded, deliberately: Type.Field and receiver refs
+// (`Streamer.FKEnablementChecker`, `col.Type` — the qualifier is not a
+// package dir), stdlib refs (`strings.ToLower`), import-alias refs
+// (`irdiff.TableDiff` — aliases are per-file, not derivable from a doc),
+// and snake_case all-lowercase symbols (`mysql.general_log` — a
+// DATABASE object citation; Go top-level decls here are camel-case).
+// Resolution accepts any top-level decl name in the package, exported
+// or not, including test files — docs legitimately cite unexported
+// helpers and gate tests.
+//
+// The symbol is resolved by NAME only — no type checking, for the same
+// reason the line gate does not assert the symbol at the line: existence
+// catches the deletion/rename case, which is what actually happens.
+func TestDocSymbolPointers_ResolveAgainstTheirPackage(t *testing.T) {
+	repoRoot := filepath.Join("..", "..")
+
+	// Build the resolution universe: package dir basename → the set of
+	// top-level decl names across every .go file in every directory with
+	// that basename.
+	decls := map[string]map[string]bool{}
+	fset := token.NewFileSet()
+	err := filepath.Walk(filepath.Join(repoRoot, "internal"), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		dir := filepath.Base(filepath.Dir(path))
+		if dir == "internal" || dir == "testdata" {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			// A file the parser cannot read contributes nothing; the build
+			// would be broken anyway, and skipping keeps this walk total.
+			return nil //nolint:nilerr // deliberate: see comment above
+		}
+		set := decls[dir]
+		if set == nil {
+			set = map[string]bool{}
+			decls[dir] = set
+		}
+		for _, d := range f.Decls {
+			switch dd := d.(type) {
+			case *ast.FuncDecl:
+				set[dd.Name.Name] = true
+			case *ast.GenDecl:
+				for _, spec := range dd.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						set[s.Name.Name] = true
+					case *ast.ValueSpec:
+						for _, n := range s.Names {
+							set[n.Name] = true
+						}
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal/: %v", err)
+	}
+	if len(decls) < 30 {
+		t.Fatalf("resolution universe holds only %d package basenames; expected at least 30 — the universe builder broke, "+
+			"and every graded span would false-fail against it", len(decls))
+	}
+
+	type badRef struct{ from, span string }
+	var (
+		graded      int
+		docs        = map[string]bool{}
+		bad         []badRef
+		exemptInUse = map[string]bool{}
+	)
+
+	err = filepath.Walk(filepath.Join(repoRoot, "docs", "dev"), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if info.Name() == "design" || info.Name() == "notes" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		base := filepath.Base(path)
+		if !strings.HasSuffix(base, ".md") || base == "roadmap.md" || base == "item49-phase3-prep.md" {
+			return nil
+		}
+		b, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		rel, _ := filepath.Rel(repoRoot, path)
+		for _, m := range docSymbolRe.FindAllStringSubmatch(string(b), -1) {
+			pkg, sym := m[1], m[2]
+			if docSymbolFileExtTokens[sym] {
+				continue // a filename, not an identifier
+			}
+			if strings.Contains(sym, "_") && strings.ToLower(sym) == sym {
+				continue // a database object (mysql.general_log), not a Go symbol
+			}
+			set, known := decls[pkg]
+			if !known {
+				continue // qualifier is not an internal package dir — out of scope, see the doc comment
+			}
+			graded++
+			docs[path] = true
+			span := pkg + "." + sym
+			if set[sym] {
+				continue
+			}
+			if _, exempt := docSymbolExempt[span]; exempt {
+				exemptInUse[span] = true
+				continue
+			}
+			bad = append(bad, badRef{from: filepath.ToSlash(rel), span: span})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk docs/dev: %v", err)
+	}
+
+	// Anti-vacuity: audit-backlog.md and perf-parity-matrix.md alone carry
+	// dozens of these today.
+	if graded < 40 || len(docs) < 2 {
+		t.Fatalf("graded only %d `pkg.Symbol` spans across %d docs (floor: >=40 spans, >=2 docs) — the matcher or the "+
+			"universe no longer reflects how docs/dev cite identifiers; fix the walker, not the floor", graded, len(docs))
+	}
+
+	for _, b := range bad {
+		t.Errorf("%s cites `%s`, which no internal package of that name declares — the symbol was renamed, moved out of "+
+			"the package, or never existed (the backup.SourceEngineCommitsAfterRows shape). Update the citation, or add a "+
+			"docSymbolExempt entry with the reason if the doc cites it deliberately.", b.from, b.span)
+	}
+	for span := range docSymbolExempt {
+		if !exemptInUse[span] {
+			t.Errorf("docSymbolExempt lists %q but no graded doc span needs it any more — remove the entry", span)
 		}
 	}
 }
