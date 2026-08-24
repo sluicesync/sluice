@@ -315,19 +315,29 @@ func int64p(v int64) *int64 { return &v }
 // bit (512). Vitess forwards source column flags on
 // query.Field.Flags unchanged.
 //
-// UNVERIFIED PREMISE (audit-2026-08-19 value-fidelity follow-up): that
-// Vitess actually forwards flag 512 on the VStream wire is asserted here,
-// not ground-truthed by a real-cluster test — field_to_ir_test.go sets the
-// flag synthetically. Since v0.130.1, the VStream *value decode*'s bool
-// decision depends on it (tinyint1IsBool reads this flag to keep an
-// auto-increment tinyint(1) an integer, not a bool), so this is now a
-// value-path premise, not only a schema one. It is a SOFT dependency: if the
-// flag were absent on the wire, an auto-increment tinyint(1) holding a value
-// ≥2 would decode to bool on BOTH the schema and value paths (self-consistent)
-// and the decode-time range guard would then REFUSE it loudly
-// (SLUICE-E-VALUE-TINYINT1-RANGE) — a false-refuse, never a silent collapse.
-// The self-consistent gate TestVStreamTinyint1BoolMatchesSchema cannot catch
-// this (both sides read the same field); the cheap ground-truth is one
-// real-cluster pin carrying an auto-increment tinyint(1) PK through the live
-// VStream lane as an integer. Filed in docs/dev/audit-backlog.md.
+// What IS bound in-code (2026-08-23, the premise-check pass): this constant
+// and its consumption are held to the CARRIER'S OWN vocabulary by
+// TestMySQLFlagAutoIncrementBoundToVitessCarrier — sluice's 512 must equal
+// the vendored querypb.MySqlFlag_AUTO_INCREMENT_FLAG, and a field flagged
+// with that enum value must flip [vstreamTinyint1IsBool] through the real
+// classifier. That closes the two-facts-pinned-argument-unpinned gap between
+// "sluice reads bit 512" and "the carrier defines AUTO_INCREMENT as 512".
+//
+// UNVERIFIED PREMISE, the remaining half (audit-2026-08-19 value-fidelity
+// follow-up): that a live vtgate actually POPULATES this flag on the VStream
+// wire for an auto-increment column is not ground-truthed by any test here —
+// field_to_ir_test.go and the binding test set the flag synthetically. Since
+// v0.130.1, the VStream *value decode*'s bool decision depends on it
+// (tinyint1IsBool reads this flag to keep an auto-increment tinyint(1) an
+// integer, not a bool), so this is a value-path premise, not only a schema
+// one. It is a SOFT dependency: if the flag were absent on the wire, an
+// auto-increment tinyint(1) holding a value ≥2 would decode to bool on BOTH
+// the schema and value paths (self-consistent) and the decode-time range
+// guard would then REFUSE it loudly (SLUICE-E-VALUE-TINYINT1-RANGE) — a
+// false-refuse, never a silent collapse. The self-consistent gate
+// TestVStreamTinyint1BoolMatchesSchema cannot catch a missing wire flag
+// (both sides read the same field); the ground-truth that would close it is
+// one real-cluster/vttestserver pin carrying an auto-increment tinyint(1) PK
+// through the live VStream lane as an integer. Filed in
+// docs/dev/audit-backlog.md (PREM-VSTREAM-AUTOINC).
 const mysqlFlagAutoIncrement = 512
