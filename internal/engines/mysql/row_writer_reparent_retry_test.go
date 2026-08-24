@@ -52,6 +52,14 @@ type flushScript struct {
 	// nothing retried.
 	openErrs []error
 
+	// targetEngine scripts the information_schema.TABLES ENGINE answer the
+	// SDL-1 transactional-tolerance probe reads on the tolerate-1062-on-retry
+	// arm; "" answers InnoDB (the healthy default every pre-existing test
+	// assumes). engineProbeErr makes the probe query itself fail, for the
+	// fail-closed cell.
+	targetEngine   string
+	engineProbeErr error
+
 	execCalls atomic.Int64 // total INSERT ExecContext calls
 	opens     atomic.Int64 // total driver.Open calls (distinct conns)
 }
@@ -96,12 +104,23 @@ func (c scriptConn) ExecContext(_ context.Context, query string, _ []driver.Name
 	return driver.RowsAffected(0), nil
 }
 
-// QueryContext serves SHOW WARNINGS as an empty result set (clean flush)
-// and `SELECT @@local_infile` as enabled, so the LOAD DATA core reaches its
-// statement instead of falling back to the batched writer.
-func (scriptConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+// QueryContext serves SHOW WARNINGS as an empty result set (clean flush),
+// `SELECT @@local_infile` as enabled (so the LOAD DATA core reaches its
+// statement instead of falling back to the batched writer), and the SDL-1
+// transactional-tolerance engine probe per the script (InnoDB by default).
+func (c scriptConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	if strings.Contains(query, "@@local_infile") {
 		return &singleValueRows{col: "@@local_infile", val: "1"}, nil
+	}
+	if strings.Contains(query, "information_schema.TABLES") {
+		if c.script.engineProbeErr != nil {
+			return nil, c.script.engineProbeErr
+		}
+		eng := c.script.targetEngine
+		if eng == "" {
+			eng = "InnoDB"
+		}
+		return &singleValueRows{col: "ENGINE", val: eng}, nil
 	}
 	return &emptyWarningsRows{}, nil
 }
@@ -269,6 +288,62 @@ func TestColdCopyReparentRetry_PlainTolerates1062OnRetry(t *testing.T) {
 	}
 	if got := script.execCalls.Load(); got != 2 {
 		t.Errorf("INSERT exec calls = %d; want 2 (transient then tolerated 1062)", got)
+	}
+}
+
+// TestColdCopyReparentRetry_Retry1062NonTransactionalEngineRefuses pins the
+// SDL-1 premise check: the tolerate-1062-on-retry argument rests on the batch
+// INSERT being ATOMIC, which only a transactional storage engine provides. On
+// a MyISAM target table an interrupted attempt can commit a PREFIX of the
+// batch, so the retry's collision proves nothing about the suffix — the
+// tolerance must be WITHHELD loudly instead of silently dropping rows.
+func TestColdCopyReparentRetry_Retry1062NonTransactionalEngineRefuses(t *testing.T) {
+	withFastReparentBackoff(t, 12)
+	script := &flushScript{
+		execErrs: []error{
+			vttabletUnavailable(),
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '0' for key 't_pin.PRIMARY'"},
+		},
+		targetEngine: "MyISAM",
+	}
+	db := newScriptDB(t, script)
+	w := &RowWriter{db: db, bulkLoad: ir.BulkLoadBatchedInsert}
+
+	err := w.WriteRows(context.Background(), pinReparentTable(), feedReparentRows(3))
+	if err == nil {
+		t.Fatal("retry-1062 on a MyISAM target must REFUSE (the batch may be a committed prefix); got nil — " +
+			"the tolerance would silently drop the suffix")
+	}
+	if !strings.Contains(err.Error(), "MyISAM") || !strings.Contains(err.Error(), "PREFIX") {
+		t.Errorf("refusal should name the engine and the committed-prefix hazard; got: %v", err)
+	}
+	if got := script.execCalls.Load(); got != 2 {
+		t.Errorf("INSERT exec calls = %d; want 2 (transient, then the refused collision — no further retries)", got)
+	}
+}
+
+// TestColdCopyReparentRetry_Retry1062EngineProbeErrorFailsClosed pins the
+// fail-closed posture: when the SDL-1 engine probe itself cannot run, the
+// tolerance is withheld (loud failure) rather than granted on an unverified
+// premise.
+func TestColdCopyReparentRetry_Retry1062EngineProbeErrorFailsClosed(t *testing.T) {
+	withFastReparentBackoff(t, 12)
+	script := &flushScript{
+		execErrs: []error{
+			vttabletUnavailable(),
+			&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '0' for key 't_pin.PRIMARY'"},
+		},
+		engineProbeErr: errors.New("information_schema access denied"),
+	}
+	db := newScriptDB(t, script)
+	w := &RowWriter{db: db, bulkLoad: ir.BulkLoadBatchedInsert}
+
+	err := w.WriteRows(context.Background(), pinReparentTable(), feedReparentRows(3))
+	if err == nil {
+		t.Fatal("an unrunnable engine probe must FAIL CLOSED (withhold the tolerance); got nil")
+	}
+	if !strings.Contains(err.Error(), "storage engine") || !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("fail-closed refusal should name the probe and wrap its cause; got: %v", err)
 	}
 }
 

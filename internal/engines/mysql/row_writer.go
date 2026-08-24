@@ -617,7 +617,7 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// this arm's "PROVES" honest: by the time isRetry is true, the
 				// table is known to carry a PK or a NOT NULL UNIQUE index.
 				//
-				// UNVERIFIED PREMISE (audit-2026-08-19 SDL-1, reconciler WATCH):
+				// PREMISE, NOW CHECKED (audit-2026-08-19 SDL-1; was UNVERIFIED):
 				// the "either fully rolled back OR committed-but-ack-lost"
 				// dichotomy — and therefore "a 1062 on the retry PROVES those
 				// exact rows are durable" — assumes an ATOMIC multi-row INSERT,
@@ -626,14 +626,23 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// atomic: an interrupted attempt can leave a PREFIX of the batch
 				// committed, so the retry's 1062 on the first already-landed row
 				// proves only that row is durable, not the whole batch — the
-				// suffix past the first collision is silently skipped (the INSERT
-				// aborts at the dup, and this arm returns nil). This is NOT
-				// ENGINE-scoped and there is no preflight refusing a MyISAM
-				// target for cold copy, so the premise is unchecked. Not a delta
-				// regression (the WART predates this); tracked in
-				// docs/dev/audit-backlog.md → "Invariant sweep" for an
-				// ENGINE-scoped guard or a cold-copy MyISAM-target preflight.
+				// suffix past the first collision would be silently skipped (the
+				// INSERT aborts at the dup, and this arm returns nil). So the
+				// tolerance is now ENGINE-scoped exactly where the premise is
+				// load-bearing: [verifyTransactionalTolerance] reads the target
+				// table's storage engine on this rare arm (never on the hot
+				// path) and withholds the tolerance — loudly, with the partial-
+				// prefix explanation — unless the engine is known-transactional.
+				// Fail closed: an unreadable/unknown engine also refuses, since
+				// tolerating without the premise verified is exactly the silent
+				// suffix loss SDL-1 filed. Deliberately NOT a cold-copy preflight
+				// refusing MyISAM targets outright: a MyISAM copy that never
+				// hits a retry-collision is correct, and refusing it would fire
+				// on a working configuration.
 				if isRetry && isMySQLDupKey(err) {
+					if engErr := verifyTransactionalTolerance(ctx, c, table.Name); engErr != nil {
+						return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), engErr)
+					}
 					slog.WarnContext(
 						ctx, "mysql: cold-copy plain INSERT retry collided with a duplicate key (Error 1062); "+
 							"the prior attempt committed but lost its ack across the transient — the rows already landed, "+
@@ -686,6 +695,52 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 			return ctx.Err()
 		}
 	}
+}
+
+// verifyTransactionalTolerance is the SDL-1 premise check for the ADR-0108
+// tolerate-1062-on-retry wart: it reads the target table's storage engine and
+// returns nil only when the engine is known to make a multi-row INSERT atomic
+// (InnoDB — the engine every supported target platform uses), which is the
+// fact the wart's "a retry 1062 PROVES the batch is durable" argument rests
+// on. Anything else refuses: on a non-transactional engine (MyISAM) an
+// interrupted attempt can commit a PREFIX of the batch, so tolerating the
+// collision would silently drop the suffix at exit 0. Fail-closed on an
+// unreadable or unknown engine for the same reason the LOAD DATA replay
+// accounting is conservative ([replayWarningsAreOnlyDuplicates]): a false
+// refusal costs a restart; a false tolerance costs silently lost rows. Runs
+// ONLY on the rare retry-collision arm, never on the hot path, so the probe
+// adds no per-flush cost.
+//
+// Sibling roster for the tolerance premise (the sibling-sweep rule): this
+// guard covers [writeBatchedConn], the only site that tolerates a 1062
+// (isMySQLDupKey has exactly one call site). [writeBatchedIdempotentConn] is
+// exempt — its UPSERT converges row-wise on a prefix-committed batch, no
+// tolerance exists there. The LOAD DATA core is exempt — its IGNORE + replay
+// accounting is row-wise and its doc states convergence for the
+// committed-prefix case explicitly. Keyless tables are refused upstream
+// ([errKeylessAmbiguousReplay]) before any tolerance can fire.
+func verifyTransactionalTolerance(ctx context.Context, c *sql.Conn, tableName string) error {
+	var engine sql.NullString
+	if err := c.QueryRowContext(ctx,
+		"SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+		tableName).Scan(&engine); err != nil {
+		return fmt.Errorf("retry collided with a duplicate key (Error 1062), but the target table's storage engine "+
+			"could not be read (%w) — the collision proves the batch durable only on a transactional engine, so "+
+			"refusing rather than assuming; re-run the copy against a clean target, or use an idempotent write mode",
+			err)
+	}
+	if !engine.Valid || !strings.EqualFold(engine.String, "InnoDB") {
+		got := "NULL"
+		if engine.Valid {
+			got = engine.String
+		}
+		return fmt.Errorf("retry collided with a duplicate key (Error 1062), but the target table's storage engine "+
+			"is %s, not InnoDB: a multi-row INSERT is not atomic on a non-transactional engine, so the interrupted "+
+			"first attempt may have committed only a PREFIX of this batch and the collision proves nothing about "+
+			"the rest — tolerating it could silently drop rows (ADR-0108 / audit SDL-1); re-run the copy against "+
+			"a clean InnoDB target, or use an idempotent write mode", got)
+	}
+	return nil
 }
 
 // Warning-check sampling schedule for the batched-INSERT bulk path
