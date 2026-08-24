@@ -151,24 +151,32 @@ func TestMigrate_VStreamShardedSource_SrcEqualsDst(t *testing.T) {
 
 			// A STATIC-sharded cold migrate is pure SQL over vtgate's
 			// MySQL frontend: schema read + scatter bulk-copy +
-			// indexes + constraints. The planetscale engine only
-			// branches to VStream for OpenCDCReader/OpenSnapshotStream
+			// indexes + constraints. The VStream flavors only branch
+			// to VStream for OpenCDCReader/OpenSnapshotStream
 			// (engine.go) — OpenRowReader/OpenSchemaReader are plain
-			// SQL for both flavors. So the source DSN here is the
-			// PLAIN vtgate MySQL DSN with NO vstream_* params: those
-			// params are only meaningful to the CDC/snapshot path and,
-			// if present, go-sql-driver would emit them as a bogus
+			// SQL. So the source DSN here is the PLAIN vtgate MySQL DSN
+			// with NO vstream_* params: those params are only
+			// meaningful to the CDC/snapshot path and, if present,
+			// go-sql-driver would emit them as a bogus
 			// `SET vstream_endpoint=host:port` that vtgate's parser
 			// rejects (ground-truthed, Track-1a). grpcEndpoint is
 			// unused for the static-sharded cold path; the heavy
 			// reshard tag covers the VStream path end-to-end.
 			//
-			// Both flavors read identically here; use the vanilla
-			// mysql engine (the scatter behaviour under test is
-			// vtgate's, exercised the same way regardless of flavor).
-			srcEng, ok := engines.Get("mysql")
+			// The source is the `vitess` (self-hosted VStream) flavor,
+			// NOT vanilla `mysql`: since ingestr-survey item 10
+			// (910c9a69) the vanilla flavor REFUSES a connection whose
+			// server fingerprints as a Vitess vtgate ("...-Vitess" in
+			// VERSION()) — its full scans run without `set
+			// workload=olap`, so Vitess's default OLTP workload would
+			// SILENTLY truncate a large scatter read. vtgate reports
+			// "-Vitess", so vanilla refuses at OpenSchemaReader here;
+			// the vitess flavor lifts the cap with workload=olap on a
+			// pinned connection and is the correct driver for a
+			// self-hosted vtgate (the refusal's own steer names it).
+			srcEng, ok := engines.Get("vitess")
 			if !ok {
-				t.Fatal("source engine \"mysql\" not registered")
+				t.Fatal("source engine \"vitess\" not registered")
 			}
 			tgtEng, ok := engines.Get(tc.targetEng)
 			if !ok {
