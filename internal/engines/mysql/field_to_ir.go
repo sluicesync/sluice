@@ -323,21 +323,26 @@ func int64p(v int64) *int64 { return &v }
 // classifier. That closes the two-facts-pinned-argument-unpinned gap between
 // "sluice reads bit 512" and "the carrier defines AUTO_INCREMENT as 512".
 //
-// UNVERIFIED PREMISE, the remaining half (audit-2026-08-19 value-fidelity
-// follow-up): that a live vtgate actually POPULATES this flag on the VStream
-// wire for an auto-increment column is not ground-truthed by any test here —
-// field_to_ir_test.go and the binding test set the flag synthetically. Since
-// v0.130.1, the VStream *value decode*'s bool decision depends on it
-// (tinyint1IsBool reads this flag to keep an auto-increment tinyint(1) an
-// integer, not a bool), so this is a value-path premise, not only a schema
-// one. It is a SOFT dependency: if the flag were absent on the wire, an
-// auto-increment tinyint(1) holding a value ≥2 would decode to bool on BOTH
-// the schema and value paths (self-consistent) and the decode-time range
-// guard would then REFUSE it loudly (SLUICE-E-VALUE-TINYINT1-RANGE) — a
-// false-refuse, never a silent collapse. The self-consistent gate
-// TestVStreamTinyint1BoolMatchesSchema cannot catch a missing wire flag
-// (both sides read the same field); the ground-truth that would close it is
-// one real-cluster/vttestserver pin carrying an auto-increment tinyint(1) PK
-// through the live VStream lane as an integer. Filed in
-// docs/dev/audit-backlog.md (PREM-VSTREAM-AUTOINC).
+// CONFIRMED live (2026-08-24, PREM-VSTREAM-AUTOINC closed) by
+// TestVitessClusterAutoIncTinyint1PreservesInteger: the remaining half of the
+// premise — that a live vtgate actually POPULATES this flag on the VStream
+// wire for an auto-increment column — was ground-truthed against a REAL
+// multi-process Vitess-24 cluster. The FIELD event's Flags carried bit 512 set
+// (observed 49667, bit512=true) for an AUTO_INCREMENT tinyint(1) PK and unset
+// (32769, bit512=false) for a plain tinyint(1) in the same table, so the
+// auto-inc PK round-trips as an INTEGER (values 2,3 preserved through both the
+// cold-start COPY and CDC) while the plain column classifies as bool. The pin
+// is DISPOSITIVE by construction: since v0.130.1 the VStream value decode's
+// bool decision depends on this flag (tinyint1IsBool reads it to keep an
+// auto-increment tinyint(1) an integer, not a bool), and it is a SOFT
+// dependency — had the flag been absent, the auto-inc PK (values ≥2) would
+// have decoded to bool and the decode-time range guard would have REFUSED it
+// loudly (SLUICE-E-VALUE-TINYINT1-RANGE), a false-refuse and never a silent
+// collapse. So the test's green (integers preserved, no refusal), guarded by
+// the plain-column bool control that makes it non-vacuous, could only hold if
+// vtgate populates the flag. The self-consistent gate
+// TestVStreamTinyint1BoolMatchesSchema still cannot catch a missing wire flag
+// (both sides read the same field); the live cluster pin is what closes that.
+// (Formerly filed UNVERIFIED PREMISE in docs/dev/audit-backlog.md as
+// PREM-VSTREAM-AUTOINC.)
 const mysqlFlagAutoIncrement = 512
