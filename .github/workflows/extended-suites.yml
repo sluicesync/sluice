@@ -431,8 +431,14 @@ jobs:
 
       - name: Run the KMS localstack suite
         run: |
+          # 6 selected, 5 PASS — the 6th (TestBackup_KMSEncryption_AccessDenied)
+          # is an unconditional t.Skip: localstack community edition does not
+          # enforce IAM, so the AccessDenied translation branch is unit-pinned
+          # in internal/crypto/aws_kms_test.go instead (see the leg header). A
+          # provider-health skip on any of the other 5 (the failure mode this
+          # guard exists to catch) drops the PASS count below 5 and fails loud.
           bash scripts/check-leg-nonvacuity.sh \
-            'integration kmsverify' '^TestBackup_KMS' ./internal/pipeline/ 6 6 \
+            'integration kmsverify' '^TestBackup_KMS' ./internal/pipeline/ 6 5 \
             -race -timeout=25m
 
   # The CROSS-VERSION backup-compatibility gate (roadmap item 90 / Bug 212,
