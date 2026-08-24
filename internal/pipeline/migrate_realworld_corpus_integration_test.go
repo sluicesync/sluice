@@ -175,7 +175,11 @@ func TestMigrate_Corpus_Chinook_PGToMySQL_DryRun(t *testing.T) {
 // cross-engine-clean — the point is to find where sluice strains).
 func TestMigrate_Corpus_GitLab_PG_Characterize(t *testing.T) {
 	ddl := readCorpus(t, "gitlab_structure.pg.sql")
-	src, _, cleanup := startPostgres(t)
+	// startPostgresBigSchema (not startPostgres): the whole structure.sql
+	// applies as one implicit transaction, so a default max_locks_per_
+	// transaction overflows on GitLab's ~1444 tables ("out of shared
+	// memory", 0 tables loaded, non-vacuity guard trips). See the helper.
+	src, _, cleanup := startPostgresBigSchema(t)
 	defer cleanup()
 	_, tgt, myCleanup := startMySQL(t)
 	defer myCleanup()
@@ -221,7 +225,11 @@ func TestMigrate_Corpus_GitLab_PG_Characterize(t *testing.T) {
 // engaged for PG→PG migrate), which is exactly the finding we'd want.
 func TestMigrate_Corpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
 	ddl := readCorpus(t, "gitlab_structure.pg.sql")
-	src, tgt, cleanup := startPostgres(t) // src = load GitLab; tgt = PG→PG target
+	// startPostgresBigSchema (not startPostgres): GitLab's ~1444-table
+	// structure.sql applies as one implicit transaction and overflows a
+	// default max_locks_per_transaction. See the helper + the Characterize
+	// leg above.
+	src, tgt, cleanup := startPostgresBigSchema(t) // src = load GitLab; tgt = PG→PG target
 	defer cleanup()
 
 	if err := applyPGDDLBestEffort(src, ddl); err != nil {

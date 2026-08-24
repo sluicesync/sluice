@@ -93,6 +93,74 @@ func startPostgres(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	return srcConn, tgtConn, terminate
 }
 
+// startPostgresBigSchema is startPostgres with a raised
+// max_locks_per_transaction. It exists for the real-world-corpus GitLab
+// leg: applyPGDDLBestEffort sends the whole ~1444-table structure.sql as
+// ONE db.Exec, which Postgres runs as a single implicit transaction, so
+// every table/index/partition lock accumulates in that one transaction.
+// Against a default PG16 (max_locks_per_transaction=64) the lock table
+// overflows and the apply dies with "out of shared memory (SQLSTATE
+// 53200) / You might need to increase max_locks_per_transaction", landing
+// zero tables and tripping the corpus leg's non-vacuity guard. The corpus
+// is fetched live, so its table count only grows; 2048 gives ample
+// headroom (lock slots = max_locks_per_transaction × (max_connections +
+// max_prepared_transactions)). max_locks_per_transaction is a
+// postmaster-level GUC, so it must be set at container start, not per
+// session — same WithCmd pattern as the small-max_connections legs.
+func startPostgresBigSchema(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
+	t.Helper()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	container, err := pgtc.Run(
+		ctx,
+		pgPrebakedImage,
+		pgtc.WithDatabase("source_db"),
+		pgtc.WithUsername("test"),
+		pgtc.WithPassword("test"),
+		pgtc.BasicWaitStrategies(),
+		pgPrebakedWaitStrategy(),
+		testcontainers.WithCmd("postgres", "-c", "max_locks_per_transaction=2048"),
+	)
+	if err != nil {
+		t.Fatalf("start container: %v", err)
+	}
+
+	terminate := func() {
+		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
+		defer c()
+		_ = container.Terminate(shutdown)
+	}
+
+	srcConn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		terminate()
+		t.Fatalf("connection string: %v", err)
+	}
+
+	db, err := sql.Open("pgx", srcConn)
+	if err != nil {
+		terminate()
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE target_db"); err != nil {
+		terminate()
+		t.Fatalf("create target_db: %v", err)
+	}
+
+	tgtConn, err := buildPGDSN(srcConn, "target_db")
+	if err != nil {
+		terminate()
+		t.Fatalf("build target DSN: %v", err)
+	}
+
+	return srcConn, tgtConn, terminate
+}
+
 // buildPGDSN replaces the database name in a Postgres URI DSN. The
 // pgtc container hands us a URI of the form
 // `postgres://user:pass@host:port/dbname?params`, so net/url is the
