@@ -60,10 +60,11 @@ import (
 //
 // It does NOT grade `OpenChangeApplier`, because that is a genuinely different
 // question — CDC apply. `sqlite` is a migrate target and refuses
-// `OpenChangeApplier`; production-readiness.md's "CDC apply targets are
-// MySQL-family and Postgres" is therefore a SEPARATE claim, and it is still
-// prose bound to nothing. Naming that here rather than leaving it implied: a
-// gate whose coverage is narrower than its name reads as covering the sibling.
+// `OpenChangeApplier`; production-readiness.md's "CDC apply targets" sentence
+// is therefore a SEPARATE claim, held by its own gate
+// ([TestCDCApplyTargetListMatchesTheCode], the `cdc-apply-targets` marker).
+// Naming that here rather than leaving it implied: a gate whose coverage is
+// narrower than its name reads as covering the sibling.
 //
 // # Which DOCUMENTS it reaches — one, and the claim is spread wider than that
 //

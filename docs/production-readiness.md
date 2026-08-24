@@ -88,7 +88,11 @@ Continuous sync (`sluice sync start`) needs a change stream from the source. Whi
 
 The marker above is not decoration: `TestCDCModeTableMatchesTheRegistry` derives this pairing from the engine registry's own capability declarations and fails the build if the table drifts. It exists because "which engines does this CDC change affect" is a sentence this project has gotten wrong four releases running — most recently a fix to the **binlog** reader described as reaching PlanetScale and Vitess, which stream through VStream and were never on that path. If you are writing release notes about a CDC-path change, take the engine list from this table rather than from the shape of the fix.
 
-CDC **apply** targets are MySQL-family and Postgres (concurrent key-hash apply on both). SQLite is a migrate-only target. The operator guide for running CDC day-to-day is [operator/cdc-streaming](operator/cdc-streaming.md).
+CDC **apply** targets — the engines a continuous `sync` can point `--target-driver` at past the cold copy — are the MySQL family (`mysql`, `mariadb`, `planetscale`, `vitess`) and the Postgres pair (`postgres`, plus `postgres-trigger`, whose apply side is the vanilla Postgres engine's), with concurrent key-hash apply on both families. `sqlite` is a migrate-only target: it takes a cold copy but refuses the change stream. The operator guide for running CDC day-to-day is [operator/cdc-streaming](operator/cdc-streaming.md).
+
+<!-- cdc-apply-targets: mariadb, mysql, planetscale, postgres, postgres-trigger, vitess -->
+
+The marker above is not decoration: `TestCDCApplyTargetListMatchesTheCode` derives the set twice — from the shape of each engine's `OpenChangeApplier` in the source, and by calling that door and reading the error — and fails the build if either half disagrees with this list. It closes the gap the target-engines gate states at its own definition: that gate grades the cold-copy writer doors only, so this sentence was prose bound to nothing.
 
 ## Known limitations
 
