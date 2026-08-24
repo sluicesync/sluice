@@ -70,6 +70,12 @@ type mockD1 struct {
 	// test can pin the door's stale-install refusal on the D1 transport.
 	staleCaptureBodies bool
 
+	// lossyRenderProbe makes the mock answer the render-fidelity door's probe
+	// with the 16-digit clamp ("0.3") — modelling a D1-side SQLite that
+	// ignores the `!` precision flag — so a test can pin that door's refusal
+	// on the D1 transport. Default (false) answers losslessly.
+	lossyRenderProbe bool
+
 	ddl          []string        // captured non-SELECT statements (setup/teardown DDL)
 	pollSQL      []string        // captured poll SELECTs
 	pollArgs     []string        // the watermark param of each poll
@@ -112,6 +118,15 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 	switch {
 	case sql == "SELECT 1":
 		return http.StatusOK, d1OK(nil)
+	// The render-fidelity door's probe (the production CapturedValueExpr over
+	// a 17-digit literal). Lossless by default; lossyRenderProbe models an
+	// engine that ignores the `!` flag and clamps to 16 significant digits.
+	case strings.Contains(sql, "CASE typeof("):
+		render := "0.300000000000000044"
+		if m.lossyRenderProbe {
+			render = "0.3"
+		}
+		return http.StatusOK, d1OK([]map[string]any{{"p": render}})
 	// Item 115: the consumer registry. Dispatched before the generic
 	// branches — its projection carries no COUNT/MIN(id) marker, and the
 	// registry read must not fall through to the poll branch.
@@ -693,6 +708,39 @@ func TestD1CDC_StaleCaptureBodyRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "older sluice") || !strings.Contains(err.Error(), "trigger setup") {
 		t.Errorf("stale-body refusal should name the cause + recovery; got: %v", err)
+	}
+}
+
+// TestD1CDC_LossyRenderProbeRefused pins the render-fidelity door end to end
+// on the D1 transport: a D1-side engine whose format('%!.20g') render clamps
+// to 16 significant digits (an engine ignoring the `!` flag — the environmental
+// premise the REAL capture rests on) refuses at open instead of streaming
+// silently altered floats. The door's unit matrix (accept / clamp / probe
+// error) lives in cdc_render_probe_test.go; the local lane exercises the probe
+// against real modernc in every openCDCReader test.
+func TestD1CDC_LossyRenderProbeRefused(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{}},
+			{Name: "v", Type: ir.Text{}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	m := &mockD1{
+		exists:           true,
+		fingerprints:     [][2]string{{"t", columnFingerprint([]string{"id", "v"})}},
+		lossyRenderProbe: true,
+	}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+
+	_, err := openCDCReaderBackend(bg(), b)
+	if err == nil {
+		t.Fatal("openCDCReaderBackend accepted a D1 engine whose REAL render clamps to 16 digits")
+	}
+	if !strings.Contains(err.Error(), "alternate-form-2") || !strings.Contains(err.Error(), "LOSSILY") {
+		t.Errorf("render-fidelity refusal should name the `!` flag premise; got: %v", err)
 	}
 }
 

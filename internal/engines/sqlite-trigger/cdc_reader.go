@@ -166,12 +166,25 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 	// Refuse loudly when an installed capture trigger's body is not what THIS
 	// binary's setup renders (the capture-shape door). This is what makes a
 	// stale install LOUD after a capture-encoding fix: v0.99.148..v0.131.x
-	// triggers render REAL values through format('%.17g'), which SQLite ≥ 3.43
-	// makes silently lossy (see sqlite.CapturedValueExpr) — and it equally
+	// triggers render REAL values through format('%.17g'), which SQLite's
+	// 16-significant-digit printf cap makes silently lossy (see
+	// sqlite.CapturedValueExpr) — and it equally
 	// catches a manually DROPPED or edited capture trigger, which would
 	// otherwise mis-capture with no signal at all. Runs after the fingerprint
 	// check, so the live column set provably reproduces the setup-time render.
 	if err := verifyCaptureTriggerShape(ctx, exec, b.driver, fps, liveColumns); err != nil {
+		_ = exec.close()
+		return nil, err
+	}
+	// Refuse loudly when the CONNECTED engine renders REALs lossily (the
+	// render-fidelity door). The capture expression's losslessness rests on
+	// SQLite honouring the `!` alternate-form-2 flag — an environmental fact,
+	// so it is probed rather than assumed (the CLAUDE.md premise-naming rule).
+	// Both CDC doors funnel through here (OpenCDCReader and OpenSnapshotStream
+	// both construct the reader via this function), so every stream start pays
+	// the one-row probe; `trigger setup` is deliberately unprobed — no stream
+	// can start without passing this chokepoint.
+	if err := verifyRealRenderHonoured(ctx, exec); err != nil {
 		_ = exec.close()
 		return nil, err
 	}
@@ -287,8 +300,9 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 // binary's setup renders for the live column set ([captureTriggerCreateSQL]).
 // A missing trigger (manually dropped — its operation would silently vanish
 // from the stream) or a differing body (installed by an older sluice — most
-// urgently the pre-fix format('%.17g') REAL capture that SQLite ≥ 3.43 makes
-// silently lossy — or hand-edited) refuses loudly with the runnable remedy.
+// urgently the pre-fix format('%.17g') REAL capture that SQLite's 16-digit
+// printf cap makes silently lossy — or hand-edited) refuses loudly with the
+// runnable remedy.
 // Re-running `trigger setup` DROP+CREATEs the triggers and preserves the
 // change-log, its watermark, and the consumer registry.
 func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string, fps []fingerprintRow, liveColumns map[string][]string) error {
@@ -314,7 +328,8 @@ func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string
 				return fmt.Errorf(
 					"sqlite-trigger: table %q capture trigger %q does not match what this sluice installs — it was "+
 						"installed by an older sluice or edited. Older installs capture REAL values through "+
-						"format('%%.17g'), which SQLite 3.43+ renders LOSSILY (silently altered floats); re-run "+
+						"format('%%.17g'), which SQLite renders LOSSILY (its printf caps floats at 16 significant "+
+						"digits without the `!` flag — silently altered floats); re-run "+
 						"`sluice trigger setup --source-driver %s` to reinstall the triggers "+
 						"(the change-log and resume watermark are preserved)",
 					fp.tbl, name, driver,
@@ -323,6 +338,30 @@ func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string
 		}
 	}
 	return nil
+}
+
+// renderProber is the one-method slice of [executor] the render-fidelity door
+// needs — narrow so the door's unit pins run on a three-line stub instead of a
+// full executor implementation.
+type renderProber interface {
+	realRenderProbe(ctx context.Context) (string, error)
+}
+
+// verifyRealRenderHonoured is the render-fidelity door: it runs the production
+// REAL capture expression over a 17-significant-digit double on the CONNECTED
+// engine ([sqlite.RealRenderProbeSQL]) and refuses loudly unless the render
+// parses back bit-exact ([sqlite.VerifyRealRenderProbe]) — the shape a SQLite
+// ignoring the `!` precision flag produces is the 16-digit clamp, under which
+// every captured REAL would be silently altered at exit 0. A probe that cannot
+// run at all also refuses (fail closed): streaming without the premise
+// verified is exactly what this door exists to prevent.
+func verifyRealRenderHonoured(ctx context.Context, p renderProber) error {
+	rendered, err := p.realRenderProbe(ctx)
+	if err != nil {
+		return fmt.Errorf("sqlite-trigger: cannot probe the source's REAL render fidelity (%w); "+
+			"refusing to stream without verifying the format('%%!.20g') capture render", err)
+	}
+	return sqlite.VerifyRealRenderProbe(rendered)
 }
 
 // SetPollInterval overrides the default 1s poll cadence. Idempotent; must be

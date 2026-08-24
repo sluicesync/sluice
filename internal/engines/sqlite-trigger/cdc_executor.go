@@ -59,6 +59,15 @@ type executor interface {
 	// format('%.17g') rendering — or a dropped/edited capture trigger refuses
 	// loudly at stream start instead of mis-capturing silently.
 	captureTriggerSQL(ctx context.Context) (map[string]string, error)
+	// realRenderProbe runs [sqlite.RealRenderProbeSQL] on the connected engine
+	// and returns the rendered text. The CDC-open render-fidelity door
+	// ([verifyRealRenderHonoured]) grades it, so a SQLite that ignores the `!`
+	// alternate-form-2 precision flag — where the capture expression would
+	// silently clamp every REAL to 16 digits — refuses at stream start instead
+	// of streaming altered floats. On the D1 transport this probes the SAME
+	// engine that fires the triggers; on the local transport it probes the
+	// poller's own connection (see sqlite.CapturedValueExpr for the residual).
+	realRenderProbe(ctx context.Context) (string, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
 	// changeLogAllocation reports the change log's id-allocation state — the
 	// floor below which it can never issue a new id, and whether the table is
@@ -479,6 +488,14 @@ func (e *localExecutor) captureTriggerSQL(ctx context.Context) (map[string]strin
 	return out, rows.Err()
 }
 
+func (e *localExecutor) realRenderProbe(ctx context.Context) (string, error) {
+	var rendered string
+	if err := e.db.QueryRowContext(ctx, sqlite.RealRenderProbeSQL()).Scan(&rendered); err != nil {
+		return "", err
+	}
+	return rendered, nil
+}
+
 // localPruneBatchSize bounds one local-file prune DELETE (P-1). SQLite is
 // single-writer: the SOURCE APPLICATION's writes stall for the duration of any
 // DELETE we run, so a monolithic backlog DELETE would hold its writer hostage.
@@ -853,6 +870,24 @@ func (e *d1Executor) captureTriggerSQL(ctx context.Context) (map[string]string, 
 		}
 	}
 	return out, nil
+}
+
+func (e *d1Executor) realRenderProbe(ctx context.Context) (string, error) {
+	rows, err := e.conn.Query(ctx, sqlite.RealRenderProbeSQL())
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", errors.New("d1-trigger: the REAL render probe returned no rows")
+	}
+	rendered, ok, err := d1CellString(rows[0]["p"])
+	if err != nil {
+		return "", fmt.Errorf("d1-trigger: decode the REAL render probe: %w", err)
+	}
+	if !ok {
+		return "", errors.New("d1-trigger: the REAL render probe returned NULL")
+	}
+	return rendered, nil
 }
 
 // d1PruneBatchSize bounds one D1 prune DELETE (P-1). D1 enforces a per-query

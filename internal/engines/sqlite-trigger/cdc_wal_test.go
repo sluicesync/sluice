@@ -197,6 +197,13 @@ func (s *spyExecutor) captureTriggerSQL(context.Context) (map[string]string, err
 
 func (s *spyExecutor) changeLogExists(context.Context) (bool, error) { return true, nil }
 
+// realRenderProbe answers with a lossless render so a future edit that routes
+// these WAL tests through the render-fidelity door doesn't read the spy as a
+// clamping engine.
+func (s *spyExecutor) realRenderProbe(context.Context) (string, error) {
+	return "0.300000000000000044", nil
+}
+
 // tableColumns answers with the healthy floor for whichever engine-internal
 // table is asked about, so a future edit that routes these WAL tests through
 // setup's shape probe doesn't read the spy as a foreign table.

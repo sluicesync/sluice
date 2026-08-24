@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -87,13 +88,31 @@ func CapturedTypeofExpr(colExpr string) string {
 // real Cloudflare D1 (same 16-digit render, d1verify 2026-08-22). The fix is
 // the alternate-form-2 flag `%!.20g`, which lifts the cap so 17+ digits emit —
 // LOSSLESS (0 misses over the same sweep) on modernc 3.53.3 and real D1.
-// UNVERIFIED PREMISE (third-party SQLite predating the `!` flag, e.g. an app
-// library firing a local capture trigger): if `!` is absent/ignored there,
-// `%!.20g` ALSO clamps to 16 and the fix is INEFFECTIVE — not merely
-// "degraded". sluice's own connections and D1 are measured; older third-party
-// SQLite is not.
+// PREMISE, NOW PROBED AT RUNTIME (previously UNVERIFIED; the CLAUDE.md
+// premise-naming rule): on a SQLite that does not honour `!`, `%!.20g` would
+// ALSO clamp to 16 digits and the fix would be INEFFECTIVE — not merely
+// "degraded". History bounds how real that world is (researched 2026-08-23):
+// the `!` 16→26 lift is ancient printf.c behaviour (`nsd = 16 +
+// flag_altform2*10` appears in pre-3.8-era printf.c), predating the SQL-level
+// printf() function itself (3.8.3, 2014-02-03) and the format() name (3.38.0,
+// 2022-02-22) — so no known SQLite RELEASE carries format()/printf() without
+// honouring `!`, and a library too old to HAVE the function fails the app's
+// own write loudly ("no such function" aborts the triggering statement),
+// never a silent clamp. Because "no known release" is a fact about builds
+// sluice cannot enumerate (forks, shims, custom builds), the trigger-CDC
+// readers PROBE it at every stream open: [RealRenderProbeSQL] runs this exact
+// expression over a 17-digit double on the CONNECTED engine and
+// [VerifyRealRenderProbe] refuses loudly unless it round-trips (the
+// sqlite-trigger/d1-trigger render-fidelity door). On D1 the probed engine IS
+// the engine that fires the triggers, which closes the premise there at
+// runtime; on a local file the probe grades sluice's own poller connection
+// (modernc), and the one residual stays named: a THIRD-PARTY app library
+// firing a local capture trigger renders with ITS printf, which no probe from
+// this process can reach — bounded by the loud-failure shapes above.
 // TestCapturedValueExpr_RealRenderRoundTripsExactly is the per-PR gate on the
-// bundled SQLite; the d1verify adversarial matrix is the live-D1 pin.
+// bundled SQLite; the d1verify adversarial matrix is the live-D1 pin;
+// TestRealRenderProbe_GradesTheConnectedEngine pins the probe's both
+// directions.
 //
 // It is the SINGLE definition of the faithful encoding, shared by the file/D1
 // reader projection ([buildD1Projection], which the --stage-local staging copy
@@ -107,6 +126,46 @@ func CapturedTypeofExpr(colExpr string) string {
 func CapturedValueExpr(colExpr string) string {
 	return "CASE typeof(" + colExpr + ") WHEN 'blob' THEN hex(" + colExpr +
 		") WHEN 'real' THEN format('%!.20g', " + colExpr + ") ELSE CAST(" + colExpr + " AS TEXT) END"
+}
+
+// realRenderProbeValue is a double whose exact decimal round-trip needs 17
+// significant digits: SQLite's 16-digit printf cap renders it "0.3", which
+// parses to a DIFFERENT double, so a single render distinguishes a
+// `!`-honouring SQLite from one that silently clamps. On an honouring engine
+// the render is "0.300000000000000044" (`%!.20g` emits up to 20 significant
+// digits of the closest binary-64), which parses back bit-exact.
+const (
+	realRenderProbeValue   = 0.30000000000000004
+	realRenderProbeLiteral = "0.30000000000000004"
+)
+
+// RealRenderProbeSQL returns the one-row probe grading whether the CONNECTED
+// SQLite honours the `!` alternate-form-2 precision flag — the environmental
+// premise [CapturedValueExpr]'s REAL arm rests on. It runs the PRODUCTION
+// capture expression over [realRenderProbeLiteral] (typeof of the literal is
+// 'real', so the probe exercises exactly the arm the capture triggers and the
+// D1 projection use), aliased `p`. Grade the render with
+// [VerifyRealRenderProbe].
+func RealRenderProbeSQL() string {
+	return "SELECT " + CapturedValueExpr(realRenderProbeLiteral) + " AS p"
+}
+
+// VerifyRealRenderProbe grades one [RealRenderProbeSQL] render: nil iff the
+// text parses back to the exact probe double. The 16-digit clamp ("0.3" — a
+// SQLite ignoring the `!` flag) fails, which is the loud refusal that stands
+// in for silently altering every captured REAL at exit 0.
+func VerifyRealRenderProbe(rendered string) error {
+	parsed, err := strconv.ParseFloat(rendered, 64)
+	if err != nil || parsed != realRenderProbeValue {
+		return fmt.Errorf(
+			"sqlite: the connected SQLite renders REAL capture values LOSSILY: format('%%!.20g', %s) came back %q, "+
+				"which does not parse back to the same double — this engine ignores the `!` alternate-form-2 "+
+				"precision flag, so every captured REAL would be silently altered; use a SQLite build that honours "+
+				"it (every known release carrying the format()/printf() SQL function does)",
+			realRenderProbeLiteral, rendered,
+		)
+	}
+	return nil
 }
 
 // ReconstructStorageValue reconstructs the SAME Go storage-class value the
