@@ -374,6 +374,39 @@ func TestClassifyReaderError_ReshardPrimaryUnroutable(t *testing.T) {
 	}
 }
 
+// TestIsReshardPrimaryWindowError pins the routing marker (item 72(b)): the
+// reshard-follow reopen reads [isReshardPrimaryWindowError] to keep the recovery
+// on the PRIMARY-pinned reshard tail ([reopenReshardWindow]) instead of escaping
+// to the REPLICA-defaulting warm-resume. So the classified post-SwitchTraffic
+// window error MUST carry the marker, and no OTHER retriable shape may — a
+// generic GOAWAY / Unavailable blip must settle → warm-resume as before, not be
+// mistaken for the reshard window.
+func TestIsReshardPrimaryWindowError(t *testing.T) {
+	windowRaw := status.Error(codes.NotFound,
+		`failed to get tablet connection to zone1-0000000201: target: commerce.80-.primary: tablet uid:201 is either down or nonexistent`)
+	window := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", windowRaw))
+	if !isReshardPrimaryWindowError(window) {
+		t.Errorf("classified post-SwitchTraffic window error is not recognized by isReshardPrimaryWindowError; the reshard-window recovery would never engage")
+	}
+
+	// A different retriable shape (an Unavailable transient) is retriable but is
+	// NOT the reshard window — it must settle to the generic warm-resume.
+	otherRaw := status.Error(codes.Unavailable, "connection reset by peer")
+	other := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", otherRaw))
+	var re ir.RetriableError
+	if !errors.As(other, &re) {
+		t.Fatalf("precondition: Unavailable should classify retriable")
+	}
+	if isReshardPrimaryWindowError(other) {
+		t.Errorf("a generic Unavailable transient was mis-tagged as the reshard primary-routable window")
+	}
+
+	// A plain (non-retriable, non-window) error carries no marker.
+	if isReshardPrimaryWindowError(errors.New("some terminal error")) {
+		t.Errorf("a plain error was mis-tagged as the reshard primary-routable window")
+	}
+}
+
 // A VStream teardown on an operator `sync stop` (or Ctrl-C / outer-ctx cancel)
 // surfaces from Recv as a gRPC Canceled / DeadlineExceeded status. The reader
 // classifier normalizes those to the standard context sentinels so the

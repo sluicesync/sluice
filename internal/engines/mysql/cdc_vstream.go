@@ -1238,6 +1238,30 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 	}, nil
 }
 
+// buildReshardReopenRequest is [buildVStreamRequest] with the tablet type
+// forced to PRIMARY for a reshard-follow reopen (item 72(b)). A reshard reopen
+// resumes the CDC tail on the freshly-created shards the instant SwitchTraffic
+// completes; those shards' REPLICA tablets are still initializing/catching up
+// their new binlog stream in that window, so tailing them risks a lagging or
+// not-yet-routable position. The authoritative PRIMARY carries the up-to-date
+// binlog and becomes routable a beat after SwitchTraffic returns, so the reopen
+// pins PRIMARY — matching the cold-start snapshot CDC path
+// ([vstreamSnapshotStream.reopenAfterReshard], which already pins PRIMARY).
+//
+// This is scoped to the RESHARD REOPEN only: the steady-state CDC tail
+// ([buildVStreamRequest] from [StreamChanges]) keeps the ADR-0072 REPLICA
+// default (offload the primary; GTID-consistent on a settled replica). Kept as
+// a named helper so [TestBuildReshardReopenRequest_PinsPrimary] pins the
+// PRIMARY choice without needing a live vtgate.
+func (r *vstreamCDCReader) buildReshardReopenRequest(start []shardGtid) (*vtgate.VStreamRequest, error) {
+	req, err := r.buildVStreamRequest(start)
+	if err != nil {
+		return nil, err
+	}
+	req.TabletType = topodata.TabletType_PRIMARY
+	return req, nil
+}
+
 // pump owns out and closes it before returning. Errors from the
 // gRPC stream get stored via setErr; clean ctx-cancellation just
 // closes the channel with no error.
@@ -2473,7 +2497,7 @@ func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedE
 		return nil, err
 	}
 
-	req, err := r.buildVStreamRequest(r.currentVgtid)
+	req, err := r.buildReshardReopenRequest(r.currentVgtid)
 	if err != nil {
 		return nil, err
 	}

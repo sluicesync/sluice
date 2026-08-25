@@ -80,6 +80,14 @@ type retriableMySQLError struct {
 	hint                time.Duration
 	txKilled            bool
 	idleProgressTimeout bool
+	// reshardPrimaryWindow marks the transient post-SwitchTraffic
+	// "resharded shard's PRIMARY not routable yet" shape (item 72(b)).
+	// The reshard-follow reopen reads this to keep the recovery pinned to
+	// PRIMARY (reopening the reshard tail in-place) instead of letting the
+	// generic ADR-0038 warm-resume take over — which would drop to the
+	// ADR-0072 REPLICA default and bounce onto the freshly-resharded
+	// shard's not-yet-settled replica. See reopenReshardWindow.
+	reshardPrimaryWindow bool
 }
 
 func (e *retriableMySQLError) Error() string               { return e.err.Error() }
@@ -88,6 +96,15 @@ func (e *retriableMySQLError) Retriable() bool             { return true }
 func (e *retriableMySQLError) RetryHint() time.Duration    { return e.hint }
 func (e *retriableMySQLError) TransactionKilled() bool     { return e.txKilled }
 func (e *retriableMySQLError) IsIdleProgressTimeout() bool { return e.idleProgressTimeout }
+
+// isReshardPrimaryWindowError reports whether err is (or wraps) the transient
+// post-SwitchTraffic primary-routable-window retriable shape (item 72(b)). The
+// reshard-follow reopen uses it to keep the recovery on the PRIMARY-pinned
+// reshard tail rather than escaping to the REPLICA-defaulting warm-resume.
+func isReshardPrimaryWindowError(err error) bool {
+	var re *retriableMySQLError
+	return errors.As(err, &re) && re.reshardPrimaryWindow
+}
 
 // isMySQLDeadlock reports whether err is (or wraps) an InnoDB deadlock —
 // MySQL error 1213 / SQLSTATE 40001. The deadlock victim's transaction is

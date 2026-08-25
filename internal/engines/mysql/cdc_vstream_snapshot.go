@@ -803,6 +803,21 @@ type vstreamSnapshotStream struct {
 	// transaction's VGTID event. Guarded by mu.
 	currentVgtid []shardGtid
 
+	// reshardFollowed records that this stream has performed at least one
+	// reshard-follow reopen ([reopenAfterReshard]). It gates the transient
+	// post-SwitchTraffic primary-routable-window recovery
+	// ([reopenReshardWindow]) so an unrelated NotFound in a non-reshard sync
+	// can never be mistaken for the window. Guarded by mu.
+	reshardFollowed bool
+
+	// reshardWindowRetries counts CONSECUTIVE in-place PRIMARY reopens ridden
+	// out on the post-SwitchTraffic primary-routable window (item 72(b)),
+	// bounding them at [maxReshardWindowRetries]. Reset to zero on a fresh
+	// reshard journal and whenever the reopened stream proves a serving tablet
+	// (a real event observed), so it only ever counts a stuck window. Guarded
+	// by mu.
+	reshardWindowRetries int
+
 	// rowBuffer holds the not-yet-consumed COPY-phase rows keyed by
 	// unqualified table name — a per-table FIFO queue the pump appends
 	// to and [vstreamSnapshotRows.ReadRows] drains AS rows arrive
@@ -1624,27 +1639,9 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	// the position bookkeeping never has two streams against one keyspace.
 	s.cancelGRPCStream()
 
-	protoShardGtids, err := toProtoShardGtids(resh.NewShards)
+	grpcStream, streamCancel, err := s.openReshardCDCStream(resh.NewShards)
 	if err != nil {
-		return nil, fmt.Errorf("mysql/vstream: snapshot: reopen: build resume position: %w", err)
-	}
-	req := &vtgate.VStreamRequest{
-		TabletType: topodata.TabletType_PRIMARY,
-		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
-		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
-			StopOnReshard:     true,
-			HeartbeatInterval: 5,
-		},
-	}
-
-	// Fresh streamCtx so CloseFn ([close]) can still cancel the new stream.
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	grpcStream, err := s.client.VStream(streamCtx, req)
-	if err != nil {
-		streamCancel()
-		return nil, fmt.Errorf("mysql/vstream: snapshot: reopen: open stream: %w", err)
+		return nil, err
 	}
 
 	newShards := make([]string, 0, len(resh.NewShards))
@@ -1658,7 +1655,9 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	s.err = nil // observed via Err(); clearing avoids masking a future failure
 	s.shards = newShards
 	s.currentVgtid = newVgtid
-	clear(s.fields) // post-reshard tablets re-emit FIELD events
+	s.reshardFollowed = true   // arms the primary-routable-window recovery
+	s.reshardWindowRetries = 0 // fresh journal ⇒ fresh window budget
+	clear(s.fields)            // post-reshard tablets re-emit FIELD events
 	s.grpcStream = grpcStream
 	s.grpcCancel = streamCancel
 	s.mu.Unlock()
@@ -1670,6 +1669,128 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	out := make(chan ir.Change, vstreamChannelBuffer)
 	s.launchCDCPump(ctx, out)
 	return out, nil
+}
+
+// openReshardCDCStream builds and opens the PRIMARY-pinned CDC VStream for a
+// reshard reopen, seeded from the given per-shard resume position. Shared by
+// [reopenAfterReshard] (seeded from the journal's new shards) and
+// [reopenReshardWindow] (seeded from the current position while riding out the
+// post-SwitchTraffic primary-routable window). PRIMARY is deliberate: the
+// freshly-resharded shards' REPLICA tablets are not yet safe to tail in this
+// window (see [vstreamCDCReader.buildReshardReopenRequest]); the authoritative
+// primary carries the up-to-date binlog and becomes routable a beat after
+// SwitchTraffic returns. Returns a fresh Background-derived streamCtx cancel the
+// caller stores as s.grpcCancel so [close] tears the new stream down.
+func (s *vstreamSnapshotStream) openReshardCDCStream(position []shardGtid) (vtgateservice.Vitess_VStreamClient, context.CancelFunc, error) {
+	protoShardGtids, err := toProtoShardGtids(position)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mysql/vstream: snapshot: reopen: build resume position: %w", err)
+	}
+	req := &vtgate.VStreamRequest{
+		TabletType: topodata.TabletType_PRIMARY,
+		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
+		Flags: &vtgate.VStreamFlags{
+			MinimizeSkew:      true,
+			StopOnReshard:     true,
+			HeartbeatInterval: 5,
+		},
+	}
+	// Fresh streamCtx so CloseFn ([close]) can still cancel the new stream.
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	grpcStream, err := s.client.VStream(streamCtx, req)
+	if err != nil {
+		streamCancel()
+		return nil, nil, fmt.Errorf("mysql/vstream: snapshot: reopen: open stream: %w", err)
+	}
+	return grpcStream, streamCancel, nil
+}
+
+// maxReshardWindowRetries bounds the in-place PRIMARY reopens ridden out on the
+// transient post-SwitchTraffic primary-routable window (item 72(b)). The window
+// is a beat (resharded primaries become routable shortly after SwitchTraffic
+// returns), so a modest budget with backoff comfortably covers it while still
+// exhausting loudly — falling back to the normal settle → warm-resume path — if
+// the primary is genuinely and durably gone rather than merely settling.
+const maxReshardWindowRetries = 15
+
+// reopenReshardWindow rides out the transient post-SwitchTraffic
+// primary-routable window IN-PLACE on the PRIMARY-pinned reshard tail (item
+// 72(b)). It is called from [vstreamSnapshotChanges.ReopenAfterReshard] when a
+// reopened reshard tail's first Recv raced the window (Err() carries the
+// [isReshardPrimaryWindowError] retriable shape) rather than surfacing a fresh
+// reshard journal. Without it the recovery would fall through to the generic
+// ADR-0038 warm-resume, which opens a standalone reader that targets the
+// ADR-0072 REPLICA default and bounces onto the freshly-resharded shard's
+// not-yet-settled replica — the loop that could never converge (item 72(b)
+// ground truth: extended-suites run 32804472095, attempts 2–3 hit uid 251, the
+// replica).
+//
+// Bounded by [maxReshardWindowRetries] with a capped backoff; on exhaustion it
+// returns ok=false so the caller settles the (still-retriable) error normally —
+// by then the window is long over and the standalone warm-resume is the correct
+// last resort. The window counter resets on a serving event (see [pump]) so it
+// only ever counts a stuck window, never a healthy long-lived stream that much
+// later hits an unrelated blip.
+func (s *vstreamSnapshotStream) reopenReshardWindow(ctx context.Context) (changes <-chan ir.Change, ok bool, err error) {
+	s.mu.Lock()
+	s.reshardWindowRetries++
+	attempt := s.reshardWindowRetries
+	position := make([]shardGtid, len(s.currentVgtid))
+	copy(position, s.currentVgtid)
+	s.mu.Unlock()
+
+	if attempt > maxReshardWindowRetries {
+		// Budget exhausted: let the normal settle → warm-resume path take over.
+		return nil, false, nil
+	}
+
+	backoff := reshardWindowBackoff(attempt)
+	select {
+	case <-time.After(backoff):
+	case <-ctx.Done():
+		return nil, true, ctx.Err()
+	}
+
+	s.cancelGRPCStream()
+	grpcStream, streamCancel, err := s.openReshardCDCStream(position)
+	if err != nil {
+		return nil, true, err
+	}
+
+	s.mu.Lock()
+	s.err = nil // clear the ridden-out window error; a fresh failure re-sets it
+	clear(s.fields)
+	s.grpcStream = grpcStream
+	s.grpcCancel = streamCancel
+	s.mu.Unlock()
+
+	slog.InfoContext(ctx, "mysql/vstream: snapshot: riding out the post-SwitchTraffic primary-routable window (PRIMARY reopen)",
+		slog.String("keyspace", s.keyspace),
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", maxReshardWindowRetries),
+		slog.Duration("backoff", backoff))
+
+	out := make(chan ir.Change, vstreamChannelBuffer)
+	s.launchCDCPump(ctx, out)
+	return out, true, nil
+}
+
+// reshardWindowBackoff is the capped per-attempt backoff for the
+// primary-routable-window recovery: 250ms, 500ms, 1s, then 1s. Short so the
+// tail reconnects promptly once the primary settles; capped so the total budget
+// stays a handful of seconds.
+func reshardWindowBackoff(attempt int) time.Duration {
+	const base = 250 * time.Millisecond
+	const ceiling = time.Second
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := base << (attempt - 1)
+	if d > ceiling || d <= 0 {
+		d = ceiling
+	}
+	return d
 }
 
 // maybeCheckpoint persists the current COPY cursor to the durable
@@ -2287,7 +2408,17 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 		// Feed the watchdog: a non-heartbeat event clears Phase 1; any
 		// event re-arms the Phase-2 progress deadline (ADR-0073 (b2)+(F3)).
 		if evs := resp.GetEvents(); len(evs) > 0 {
-			live.observe(eventsProveLiveness(evs))
+			serving := eventsProveLiveness(evs)
+			live.observe(serving)
+			// A serving event proves the reopened PRIMARY tail settled, so the
+			// primary-routable-window budget (item 72(b)) has done its job —
+			// reset it so a much-later unrelated blip on this long-lived stream
+			// starts from a full budget rather than a near-exhausted one.
+			if serving {
+				s.mu.Lock()
+				s.reshardWindowRetries = 0
+				s.mu.Unlock()
+			}
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := s.dispatchCDCEvent(ctx, ev, out); err != nil {
@@ -3247,15 +3378,36 @@ func (c *vstreamSnapshotChanges) Err() error { return c.snap.Err() }
 // against the new layout via [vstreamSnapshotStream.reopenAfterReshard],
 // else reports ok=false so the caller settles the error normally.
 func (c *vstreamSnapshotChanges) ReopenAfterReshard(ctx context.Context) (changes <-chan ir.Change, wasReshard bool, err error) {
+	cachedErr := c.snap.Err()
 	var resh *ShardLayoutChangedError
-	if !errors.As(c.snap.Err(), &resh) {
-		return nil, false, nil
+	if errors.As(cachedErr, &resh) {
+		ch, rerr := c.snap.reopenAfterReshard(ctx, resh)
+		if rerr != nil {
+			return nil, true, rerr
+		}
+		return ch, true, nil
 	}
-	ch, rerr := c.snap.reopenAfterReshard(ctx, resh)
-	if rerr != nil {
-		return nil, true, rerr
+	// Item 72(b): the reopened reshard tail's first Recv raced the transient
+	// post-SwitchTraffic primary-routable window (Err() carries the retriable
+	// window shape). Keep the recovery pinned to the PRIMARY reshard tail
+	// in-place — do NOT fall through to the generic ADR-0038 warm-resume, which
+	// would open a standalone reader on the ADR-0072 REPLICA default and bounce
+	// onto the freshly-resharded shard's not-yet-settled replica.
+	c.snap.mu.Lock()
+	followed := c.snap.reshardFollowed
+	c.snap.mu.Unlock()
+	if followed && isReshardPrimaryWindowError(cachedErr) {
+		ch, ok, rerr := c.snap.reopenReshardWindow(ctx)
+		if !ok {
+			// Budget exhausted (or not the window after all): settle normally.
+			return nil, false, nil
+		}
+		if rerr != nil {
+			return nil, true, rerr
+		}
+		return ch, true, nil
 	}
-	return ch, true, nil
+	return nil, false, nil
 }
 
 // shardScopeKey is the key shape used in

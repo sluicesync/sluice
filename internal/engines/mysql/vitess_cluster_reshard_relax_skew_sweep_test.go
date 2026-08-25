@@ -930,13 +930,28 @@ func orderedNames(scenarios []sweepScenario) []string {
 // widened the window enough to make it deterministic here, which is why THIS test
 // carries the belt: it is the reproduction, un-quarantined.
 //
-// THE FIX (reader_errors.go isReshardPrimaryUnroutableError): a narrow retriable
-// carve-out in classifyReaderError for the transient "tablet ... is either down or
-// nonexistent" NotFound — matching the existing GOAWAY / abnormal-close /
-// schema-resolution transients — so reopenAfterReshard's tail reconnects through
-// the window in-process instead of exiting. codes.NotFound stays TERMINAL for
+// THE FIX has two parts. (1) reader_errors.go isReshardPrimaryUnroutableError: a
+// narrow retriable carve-out in classifyReaderError for the transient "tablet ...
+// is either down or nonexistent" NotFound — matching the existing GOAWAY /
+// abnormal-close / schema-resolution transients. codes.NotFound stays TERMINAL for
 // every other shape (bogus keyspace/shard, real missing table); the narrowness is
 // pinned by TestClassifyReaderError_ReshardPrimaryUnroutable.
+//
+// (2) The recovery is kept PINNED TO PRIMARY. The carve-out alone did NOT
+// converge (extended-suites run 32804472095: attempt 1 hit the PRIMARY uid 201,
+// then attempts 2-3 bounced to the REPLICA uid 251 — the toxiproxy-latency'd
+// tablet — and never settled). Ground truth: reopenAfterReshard DOES pin PRIMARY,
+// but its transient first-Recv failure escaped to the generic ADR-0038 warm-resume,
+// which opens a STANDALONE reader that targets the ADR-0072 REPLICA default. So the
+// snapshot reshard-follow now rides the window out IN-PLACE on the PRIMARY tail
+// (cdc_vstream_snapshot.go reopenReshardWindow, driven from
+// vstreamSnapshotChanges.ReopenAfterReshard via the isReshardPrimaryWindowError
+// marker), bounded by maxReshardWindowRetries with backoff. With retries hitting
+// only uid 201 — routable a beat after SwitchTraffic — the tail reconnects and this
+// test converges. The sibling standalone reshard reopen (vstreamCDCReader.Reopen)
+// gets the same PRIMARY pinning (buildReshardReopenRequest), pinned by
+// TestBuildReshardReopenRequest_PinsPrimary. The steady-state CDC tail keeps the
+// ADR-0072 REPLICA default (this test's own latency injection depends on it).
 
 // TestVitessReshard_RelaxSkewReshardMidStream is the ADR-0120 safety edge case
 // the prior A/Bs skipped: a production pipeline.Streamer (planetscale -> mysql,
