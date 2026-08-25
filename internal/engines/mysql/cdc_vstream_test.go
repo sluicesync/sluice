@@ -1409,6 +1409,54 @@ func TestBuildVStreamRequest_TabletTypeSelection(t *testing.T) {
 	}
 }
 
+// TestBuildReshardReopenRequest_PinsPrimary pins the item 72(b) sibling fix:
+// the standalone reader's RESHARD reopen ([vstreamCDCReader.Reopen] via
+// [buildReshardReopenRequest]) targets PRIMARY regardless of the configured
+// steady-state tablet type, because the freshly-resharded shards' replicas are
+// not yet safe to tail in the post-SwitchTraffic window (mirrors the cold-start
+// [reopenAfterReshard], which already pins PRIMARY). The STEADY-STATE tail
+// ([buildVStreamRequest]) must keep the ADR-0072 REPLICA default — pinned in
+// the same test so a future change can't collapse the two.
+func TestBuildReshardReopenRequest_PinsPrimary(t *testing.T) {
+	// A pure CDC-tail position (no TablePKs cursor) — the shape a reshard
+	// reopen resumes from, and the shape that otherwise defaults to REPLICA.
+	start := []shardGtid{{Keyspace: "commerce", Shard: "80-", Gtid: "MySQL56/abcd:1-84"}}
+
+	for _, configured := range []topodata.TabletType{
+		topodata.TabletType_REPLICA,
+		topodata.TabletType_RDONLY,
+		topodata.TabletType_PRIMARY,
+		topodata.TabletType_UNKNOWN,
+	} {
+		r := &vstreamCDCReader{keyspace: "commerce", shards: []string{"80-"}, tabletType: configured}
+
+		// Steady-state tail keeps the configured/default type (REPLICA for the
+		// zero value) — the reshard reopen must NOT change that path.
+		tail, err := r.buildVStreamRequest(start)
+		if err != nil {
+			t.Fatalf("buildVStreamRequest(configured=%v): %v", configured, err)
+		}
+		wantTail := configured
+		if wantTail == topodata.TabletType_UNKNOWN {
+			wantTail = topodata.TabletType_REPLICA
+		}
+		if tail.GetTabletType() != wantTail {
+			t.Errorf("steady-state tail TabletType (configured=%v) = %v; want %v (ADR-0072 default preserved)",
+				configured, tail.GetTabletType(), wantTail)
+		}
+
+		// Reshard reopen forces PRIMARY for every configured type.
+		reopen, err := r.buildReshardReopenRequest(start)
+		if err != nil {
+			t.Fatalf("buildReshardReopenRequest(configured=%v): %v", configured, err)
+		}
+		if reopen.GetTabletType() != topodata.TabletType_PRIMARY {
+			t.Errorf("reshard reopen TabletType (configured=%v) = %v; want PRIMARY (item 72(b): a resharded shard's replica is not yet safe to tail)",
+				configured, reopen.GetTabletType())
+		}
+	}
+}
+
 // TestEventsProveLiveness pins the heartbeat-vs-serving discriminator
 // (ADR-0073 (b2) Phase-A ground truth): a HEARTBEAT-only batch does NOT
 // prove a serving tablet (vtgate heartbeats even on the no-tablet wedge),

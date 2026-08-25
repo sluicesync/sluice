@@ -261,11 +261,14 @@ func classifyReaderError(err error) error {
 		// not terminal, and BOUNDED: if the tablet were permanently gone the
 		// ADR-0038 reconnect budget still exhausts loudly rather than looping.
 		if isReshardPrimaryUnroutableError(st) {
-			return &retriableMySQLError{err: fmt.Errorf(
-				"source vstream reopen after a reshard hit a tablet that is transiently unroutable "+
-					"(a resharded shard's PRIMARY becomes routable a beat after SwitchTraffic returns — the "+
-					"documented post-SwitchTraffic window); reconnecting from the last position to ride it out: %w", err,
-			)}
+			return &retriableMySQLError{
+				reshardPrimaryWindow: true,
+				err: fmt.Errorf(
+					"source vstream reopen after a reshard hit a tablet that is transiently unroutable "+
+						"(a resharded shard's PRIMARY becomes routable a beat after SwitchTraffic returns — the "+
+						"documented post-SwitchTraffic window); reconnecting from the last position to ride it out: %w", err,
+				),
+			}
 		}
 	}
 	return classifyApplierError(err)
