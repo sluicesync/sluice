@@ -242,6 +242,31 @@ func classifyReaderError(err error) error {
 		if isGRPCAbnormalStreamCloseError(st) {
 			return &retriableMySQLError{err: err}
 		}
+		// Post-SwitchTraffic primary-routable window (roadmap item 72(b),
+		// observed live on the extended-suites reshard leg). When the Streamer
+		// FOLLOWS a 1->2 reshard, reopenAfterReshard rebuilds the CDC tail
+		// against the new layout and its FIRST Recv can race the documented
+		// window in which the resharded shard's PRIMARY is not yet routable —
+		// vtgate answers with codes.NotFound and the wording `tablet uid:N is
+		// either down or nonexistent`. The primaries become routable a beat
+		// AFTER SwitchTraffic's RPC returns (see waitReshardPrimariesRoutable),
+		// so this is transient: a reconnect from the persisted position lands
+		// on the now-serving PRIMARY.
+		//
+		// codes.NotFound stays TERMINAL wholesale (see isRetriableGRPCCode and
+		// the switch above deliberately NOT listing it) — a genuinely bogus
+		// keyspace/shard or a real missing table must fail loudly, not spin.
+		// Only the SPECIFIC tablet-unroutable wording is carved out, so a
+		// keyspace-not-found / table-not-found NotFound is unaffected. Retriable,
+		// not terminal, and BOUNDED: if the tablet were permanently gone the
+		// ADR-0038 reconnect budget still exhausts loudly rather than looping.
+		if isReshardPrimaryUnroutableError(st) {
+			return &retriableMySQLError{err: fmt.Errorf(
+				"source vstream reopen after a reshard hit a tablet that is transiently unroutable "+
+					"(a resharded shard's PRIMARY becomes routable a beat after SwitchTraffic returns — the "+
+					"documented post-SwitchTraffic window); reconnecting from the last position to ride it out: %w", err,
+			)}
+		}
 	}
 	return classifyApplierError(err)
 }
@@ -284,6 +309,44 @@ func isGRPCAbnormalStreamCloseError(st *status.Status) bool {
 	return strings.Contains(msg, "server closed the stream without sending trailers") ||
 		strings.Contains(msg, "unexpected eof") ||
 		strings.Contains(msg, "stream terminated by rst_stream")
+}
+
+// isReshardPrimaryUnroutableError reports whether a gRPC status is the
+// TRANSIENT "the resharded shard's PRIMARY is not routable yet" shape that
+// reopenAfterReshard's first Recv can hit in the documented post-SwitchTraffic
+// window. vtgate surfaces it as codes.NotFound with the tablet-health wording:
+//
+//	failed to get tablet connection to zone1-0000000201: target:
+//	commerce.80-.primary: tablet uid:201 is either down or nonexistent
+//
+// # Why the wording, not the code
+//
+// codes.NotFound is overloaded and stays TERMINAL wholesale (see
+// [isRetriableGRPCCode], which deliberately excludes it): a bogus keyspace, a
+// dropped shard, or a real missing table are all NotFound and MUST fail loudly
+// rather than spin. Only the tablet-routability flavour is transient, and it is
+// discriminated by the vtgate-authored phrase `is either down or nonexistent`
+// (paired with `tablet`, the two-fragment discipline this file uses elsewhere).
+// A keyspace-not-found / table-not-found NotFound carries neither fragment and
+// stays terminal.
+//
+// Retries are BOUNDED by the ADR-0038 reconnect budget, so a tablet that is
+// permanently gone (not merely settling) still exhausts loudly rather than
+// looping forever — the same safety the schema-resolution and abnormal-close
+// arms rely on.
+//
+// Kept as a named helper (not inlined) so
+// [TestClassifyReaderError_ReshardPrimaryUnroutable] pins the exact wording set
+// AND the narrowness (a broadening to all-NotFound reddens the terminal cases);
+// a vtgate rewording then fails the pin rather than silently reverting the
+// reshard-follow reopen to a fatal exit on the routability window.
+func isReshardPrimaryUnroutableError(st *status.Status) bool {
+	if st.Code() != codes.NotFound {
+		return false
+	}
+	msg := strings.ToLower(st.Message())
+	return strings.Contains(msg, "tablet") &&
+		strings.Contains(msg, "is either down or nonexistent")
 }
 
 // isVStreamSchemaResolutionError reports whether err is the source

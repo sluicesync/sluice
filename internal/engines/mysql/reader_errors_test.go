@@ -311,6 +311,69 @@ func TestClassifyReaderError_GRPCAbnormalStreamClose(t *testing.T) {
 	}
 }
 
+// TestClassifyReaderError_ReshardPrimaryUnroutable pins the roadmap item 72(b)
+// carve-out: when the Streamer FOLLOWS a 1->2 reshard, reopenAfterReshard's
+// first Recv can race the documented post-SwitchTraffic window in which the
+// resharded shard's PRIMARY is not yet routable — vtgate answers codes.NotFound
+// with `tablet uid:N is either down or nonexistent`. That specific shape is
+// TRANSIENT (a reconnect lands on the now-serving primary) and must be
+// retriable, while codes.NotFound stays TERMINAL wholesale for every other
+// flavour.
+//
+// NARROWNESS is the load-bearing property, so it is pinned explicitly: a bogus
+// keyspace, a dropped shard, and a real missing table are all codes.NotFound and
+// MUST stay terminal. If the carve-out were broadened to all-NotFound (drop the
+// wording check in isReshardPrimaryUnroutableError), the three terminal cases
+// below flip to retriable and this test reddens — that is the mutation check.
+func TestClassifyReaderError_ReshardPrimaryUnroutable(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      codes.Code
+		msg       string
+		retriable bool
+	}{
+		// The transient reshard-reopen window (ground truth: extended-suites
+		// runs 32633905540 / 32791797825).
+		{
+			"NotFound + tablet-unroutable (post-SwitchTraffic window)",
+			codes.NotFound,
+			`error starting stream from shard GTID shard:"80-" gtid:"MySQL56/...:1-84": failed to get tablet connection to zone1-0000000201: target: commerce.80-.primary: tablet uid:201 is either down or nonexistent`,
+			true,
+		},
+		// Every OTHER NotFound stays terminal — the operator's target is wrong
+		// and retrying would mask it. These are the narrowness pins.
+		{"NotFound + bogus keyspace stays TERMINAL", codes.NotFound, "keyspace commerce not found in vschema", false},
+		{"NotFound + dropped shard stays TERMINAL", codes.NotFound, `shard commerce/40-80 not found`, false},
+		{"NotFound + missing table stays TERMINAL", codes.NotFound, `table "ledger" not found in schema`, false},
+		{"NotFound + generic connection text stays TERMINAL", codes.NotFound, "connector reset by peer", false},
+		// The wording alone under a NON-NotFound code is not matched by THIS
+		// helper (an Unavailable carrying the same text is retriable anyway via
+		// isRetriableGRPCCode, so a non-NotFound + wording case is asserted
+		// against the FailedPrecondition terminal code to keep the pin clean).
+		{"FailedPrecondition + tablet-unroutable text stays TERMINAL", codes.FailedPrecondition, "tablet uid:201 is either down or nonexistent", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// Wrap exactly as reopenAfterReshard's Recv does
+			// (cdc_vstream_snapshot.go: "mysql/vstream: snapshot: cdc recv: %w").
+			raw := status.Error(c.code, c.msg)
+			wrapped := fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", raw)
+
+			got := classifyReaderError(wrapped)
+			var re ir.RetriableError
+			gotRetriable := errors.As(got, &re)
+			if gotRetriable != c.retriable {
+				t.Errorf("classifyReaderError(grpc %s %q) retriable=%v, want %v", c.code, c.msg, gotRetriable, c.retriable)
+			}
+			// The underlying status must stay reachable for diagnostics.
+			if st, ok := status.FromError(got); !ok || st.Code() != c.code {
+				t.Errorf("classifyReaderError lost the underlying status (ok=%v code=%v)", ok, st.Code())
+			}
+		})
+	}
+}
+
 // A VStream teardown on an operator `sync stop` (or Ctrl-C / outer-ctx cancel)
 // surfaces from Recv as a gRPC Canceled / DeadlineExceeded status. The reader
 // classifier normalizes those to the standard context sentinels so the
