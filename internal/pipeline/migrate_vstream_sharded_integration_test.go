@@ -188,6 +188,20 @@ func TestMigrate_VStreamShardedSource_SrcEqualsDst(t *testing.T) {
 				Target:    tgtEng,
 				SourceDSN: mysqlDSN,
 				TargetDSN: targetDSN,
+				// The seed keys are GLOBALLY UNIQUE across both shards —
+				// customer_id runs 1..24 and order_id runs 9000.. as a
+				// single monotonic sequence, so the hash vindex only
+				// DISTRIBUTES them; no key value appears on more than one
+				// shard. That is precisely the Bug 152 preflight's
+				// opt-out condition (option (b): "the key is globally
+				// unique across shards"), so no cross-shard row can
+				// silently overwrite another when vtgate merges the two
+				// shards into the single target table. --inject-shard-column
+				// (option (a)) is the WRONG choice here: it would add a
+				// discriminator column + composite PK to the target,
+				// diverging the target schema from the source and defeating
+				// this test's src==dst intent.
+				AllowCrossShardMerge: true,
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()

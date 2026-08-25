@@ -404,8 +404,18 @@ jobs:
 
       - name: Run the corpus suite
         run: |
+          # 23 selected, 17 PASS — the 6 TestMigrate_Corpus_*_Congruence_*
+          # subtests are unconditional t.Skips: the upstream-pair congruence
+          # oracle was RETIRED (65d93b63) because the pairs diverge by
+          # authoring convention not sluice error, a committed golden is
+          # licensing-blocked (Apache vs GPL), and cross-engine translation
+          # is already covered by migrate_cross_integration_test.go + the
+          # DumpParity corpus. Rationale lives in
+          # migrate_realworld_corpus_congruence_integration_test.go's file
+          # doc. The DBs themselves still run in the migrate/DryRun +
+          # DumpParity legs (the 17 that PASS).
           bash scripts/check-leg-nonvacuity.sh \
-            'integration' '^TestMigrate_Corpus_' ./internal/pipeline/ 23 23 \
+            'integration' '^TestMigrate_Corpus_' ./internal/pipeline/ 23 17 \
             -race -timeout=40m
 
   # The AWS-KMS envelope-encryption suite (audit N-17c):
