@@ -139,10 +139,22 @@ jobs:
           PKG: ./internal/pipeline/blobcodec/
         run: |
           set -o pipefail
-          # Target-exists guard: `go test -fuzz` greens on a no-match, so a
-          # future move would silently re-inert this. Assert the target is
-          # actually present before spending fuzztime on it.
-          go test -list '^FuzzFastRowEncodeDifferential$' "$PKG" | grep -q '^FuzzFastRowEncodeDifferential$' || {
+          # Target-exists guard (audit T-1, anti-vacuous-green): `go test
+          # -fuzz` greens on a zero-match, so a rename/move of this target
+          # would silently re-inert the fuzz. Assert the target is present
+          # before spending fuzztime on it.
+          #
+          # Capture the listing, THEN match it — do NOT `go test -list … |
+          # grep -q …`. `go test -list` prints the matching name AND a
+          # trailing `ok <pkg> <time>` line; `grep -q` exits on the first
+          # match and closes the pipe, so on Linux `go test` is killed by
+          # SIGPIPE writing that trailer and, under `set -o pipefail`, the
+          # pipeline reports failure — a false "target not found" that fired
+          # only in CI (Linux), never locally (Windows has no SIGPIPE kill).
+          # That was the standing red on this leg; the herestring match has
+          # no live-process pipe to break.
+          listing="$(go test -list '^FuzzFastRowEncodeDifferential$' "$PKG")"
+          grep -qx 'FuzzFastRowEncodeDifferential' <<<"$listing" || {
             echo "::error::fuzz: FuzzFastRowEncodeDifferential not found in $PKG — target moved/renamed; the fuzz leg would run empty (audit T-1)."
             exit 1
           }
@@ -158,7 +170,11 @@ jobs:
           PKG: ./internal/pipeline/blobcodec/
         run: |
           set -o pipefail
-          go test -list '^FuzzFastRowDecodeDifferential$' "$PKG" | grep -q '^FuzzFastRowDecodeDifferential$' || {
+          # Capture-then-match, not `… | grep -q` — see the encode leg's
+          # comment: the pipe form false-fails on Linux via SIGPIPE on
+          # `go test -list`'s trailing `ok` line under `set -o pipefail`.
+          listing="$(go test -list '^FuzzFastRowDecodeDifferential$' "$PKG")"
+          grep -qx 'FuzzFastRowDecodeDifferential' <<<"$listing" || {
             echo "::error::fuzz: FuzzFastRowDecodeDifferential not found in $PKG — target moved/renamed (audit T-1)."
             exit 1
           }
