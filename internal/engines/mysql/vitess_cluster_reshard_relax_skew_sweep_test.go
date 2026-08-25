@@ -906,54 +906,37 @@ func orderedNames(scenarios []sweepScenario) []string {
 	return out
 }
 
-// skipReshardMidStreamPrimaryWindowQuarantine quarantines
-// TestVitessReshard_RelaxSkewReshardMidStream. This is a SEPARATE quarantine
-// from skipReshardSkewABQuarantine (the 4 A/B *skew* tests) with a DISTINCT
-// root cause — do not merge them.
-//
-// GROUND TRUTH (Extended-suites runs 32633905540 / 32791797825, both fresh
-// `ghcr.io/sluicesync/sluice-vitess:latest`): the Streamer DOES follow the
-// 1->2 reshard onto the new layout [-80 80-] (logs `reopen=1`,
-// reopenAfterReshard rebuilt the CDC stream against the new shards), then exits
-// on the reopened stream's first Recv:
+// Roadmap item 72(b), FIXED (was skipReshardMidStreamPrimaryWindowQuarantine,
+// removed with the fix). GROUND TRUTH that motivated it (Extended-suites runs
+// 32633905540 / 32791797825, both fresh `ghcr.io/sluicesync/sluice-vitess:latest`):
+// the Streamer DOES follow the 1->2 reshard onto the new layout [-80 80-] (logs
+// `reopen=1`, reopenAfterReshard rebuilt the CDC stream against the new shards),
+// then exited on the reopened stream's first Recv:
 //
 //	cdc recv: rpc NotFound: error starting stream from shard GTID shard:"80-"
 //	gtid:"...:1-84": failed to get tablet connection to zone1-0000000201:
 //	target: commerce.80-.primary: tablet uid:201 is either down or nonexistent
 //
-// uid 201 is the NEW 80- shard's PRIMARY (uid 251 is its toxiproxy-latency'd
-// replica). This is the DOCUMENTED post-SwitchTraffic "no healthy tablet for
-// PRIMARY" window (see waitReshardPrimariesRoutable + commit 0359beb9): the
-// resharded shard primaries become routable a beat AFTER SwitchTraffic's RPC
-// returns. reopenAfterReshard (cdc_vstream_snapshot.go) rebuilds the tail
-// against TabletType_PRIMARY, and classifyReaderError keeps codes.NotFound
-// TERMINAL by design, so the reopen's first Recv races that window and exits.
+// uid 201 is the NEW 80- shard's PRIMARY. This is the DOCUMENTED post-SwitchTraffic
+// "no healthy tablet for PRIMARY" window (see waitReshardPrimariesRoutable +
+// commit 0359beb9): resharded primaries become routable a beat AFTER SwitchTraffic
+// returns. reopenAfterReshard (cdc_vstream_snapshot.go) rebuilds the tail against
+// TabletType_PRIMARY; classifyReaderError USED TO keep codes.NotFound TERMINAL
+// wholesale, so the reopen's first Recv raced that window and exited. It was NOT
+// silent loss — the sibling TestVitessReshard_StreamerFollowsReshardEndToEnd (same
+// reopen-to-PRIMARY, no toxiproxy) passed green in the same run — but under a real
+// reshard with slow primary-routability the stream dropped and needed a manual
+// restart. The +250ms toxiproxy latency on 80-'s replica plus the fresh base image
+// widened the window enough to make it deterministic here, which is why THIS test
+// carries the belt: it is the reproduction, un-quarantined.
 //
-// It is NOT the drained-shard skew-measurement incompatibility the A/B
-// quarantine covers, and NOT silent loss — the sibling
-// TestVitessReshard_StreamerFollowsReshardEndToEnd (same reopen-to-PRIMARY,
-// NO toxiproxy) reopens and passes green in the same run. The +250ms toxiproxy
-// latency on 80-'s replica widens vtgate's healthcheck settling for the 80-
-// shard, and the fresh sluice-vitess:latest base image (republished by the
-// Sunday 06:00 prebake before the 10:00 extended-suites schedule) widened it
-// further — turning the harness-timing flake the roadmap already tracks
-// (item 72(b): "cluster-TIMING-flaky … new-tablet-not-serving") DETERMINISTIC.
-//
-// The 4 A/B siblings close their window with a test-side
-// waitReshardPrimariesRoutable gate BEFORE opening a reader; this test CANNOT,
-// because its reopen is driven automatically by the Streamer following the
-// journal — no test-side wait can precede it. Closing it for real needs a
-// PRODUCT change: reopenAfterReshard's tail must ride out the transient
-// "tablet is either down or nonexistent" NotFound (a narrow retriable carve-out
-// in classifyReaderError, matching the existing GOAWAY / abnormal-close /
-// schema-resolution transients), so the reopen reconnects through the window
-// in-process instead of exiting. That changes production CDC error
-// classification, so it is ESCALATED for main-session review rather than
-// autopatched here. QUARANTINED until it lands; see roadmap item 72(b).
-func skipReshardMidStreamPrimaryWindowQuarantine(t *testing.T) {
-	t.Helper()
-	t.Skip("QUARANTINED: reopen-after-reshard races the documented post-SwitchTraffic primary-routable window (new 80- PRIMARY uid 201 transiently 'down or nonexistent'); image-widened to deterministic. NOT the drained-shard A/B skew issue, NOT silent loss (sibling StreamerFollowsReshardEndToEnd passes). Needs a product-side reopen transient-tolerance fix (ESCALATED, not autopatched); see roadmap item 72(b).")
-}
+// THE FIX (reader_errors.go isReshardPrimaryUnroutableError): a narrow retriable
+// carve-out in classifyReaderError for the transient "tablet ... is either down or
+// nonexistent" NotFound — matching the existing GOAWAY / abnormal-close /
+// schema-resolution transients — so reopenAfterReshard's tail reconnects through
+// the window in-process instead of exiting. codes.NotFound stays TERMINAL for
+// every other shape (bogus keyspace/shard, real missing table); the narrowness is
+// pinned by TestClassifyReaderError_ReshardPrimaryUnroutable.
 
 // TestVitessReshard_RelaxSkewReshardMidStream is the ADR-0120 safety edge case
 // the prior A/Bs skipped: a production pipeline.Streamer (planetscale -> mysql,
@@ -964,8 +947,6 @@ func skipReshardMidStreamPrimaryWindowQuarantine(t *testing.T) {
 // the streamer FOLLOWS the reshard (no terminal ShardLayoutChangedError) AND
 // src == dst exactly-once after drain (0 gap / dup / mismatch).
 func TestVitessReshard_RelaxSkewReshardMidStream(t *testing.T) {
-	skipReshardMidStreamPrimaryWindowQuarantine(t)
-
 	c := startVitessReshardCluster(t, "-")
 	defer c.terminate()
 
