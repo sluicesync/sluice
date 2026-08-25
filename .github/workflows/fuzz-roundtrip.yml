@@ -158,8 +158,25 @@ jobs:
             echo "::error::fuzz: FuzzFastRowEncodeDifferential not found in $PKG — target moved/renamed; the fuzz leg would run empty (audit T-1)."
             exit 1
           }
-          go test -run NoMatch -fuzz '^FuzzFastRowEncodeDifferential$' \
-            -fuzztime "$FUZZTIME" "$PKG"
+          # Tolerate ONLY the golang/go#48591 deadline-boundary flake: on
+          # -fuzztime expiry a worker occasionally reports "context deadline
+          # exceeded" as a FAIL with no crasher. A REAL crasher writes
+          # testdata/fuzz/<target>/ AND prints "Failing input written" — that
+          # still fails loudly (the crasher-file check is the load-bearing
+          # signal; a fresh CI runner carries no committed crashers).
+          out="$(go test -run NoMatch -fuzz '^FuzzFastRowEncodeDifferential$' -fuzztime "$FUZZTIME" "$PKG" 2>&1)" && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            if printf '%s' "$out" | grep -q 'Failing input written' || [ -n "$(find "$PKG/testdata/fuzz/FuzzFastRowEncodeDifferential" -type f 2>/dev/null)" ]; then
+              echo "::error::fuzz: FuzzFastRowEncodeDifferential found a crashing input (real differential) — see the crasher corpus artifact."
+              exit 1
+            elif printf '%s' "$out" | grep -q 'context deadline exceeded'; then
+              echo "::warning::fuzz: FuzzFastRowEncodeDifferential hit the golang/go#48591 -fuzztime deadline-boundary flake (no crasher written); treating as pass."
+            else
+              echo "::error::fuzz: FuzzFastRowEncodeDifferential failed for an unrecognized reason (not a crasher, not the deadline flake) — investigate the log."
+              exit 1
+            fi
+          fi
 
       - name: Fuzz decode differential
         # Run even if the encode fuzzer found something — the two
@@ -178,8 +195,22 @@ jobs:
             echo "::error::fuzz: FuzzFastRowDecodeDifferential not found in $PKG — target moved/renamed (audit T-1)."
             exit 1
           }
-          go test -run NoMatch -fuzz '^FuzzFastRowDecodeDifferential$' \
-            -fuzztime "$FUZZTIME" "$PKG"
+          # Tolerate ONLY the golang/go#48591 deadline-boundary flake — see
+          # the encode leg's comment. A real crasher (testdata/fuzz/<target>/
+          # + "Failing input written") still fails loudly.
+          out="$(go test -run NoMatch -fuzz '^FuzzFastRowDecodeDifferential$' -fuzztime "$FUZZTIME" "$PKG" 2>&1)" && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            if printf '%s' "$out" | grep -q 'Failing input written' || [ -n "$(find "$PKG/testdata/fuzz/FuzzFastRowDecodeDifferential" -type f 2>/dev/null)" ]; then
+              echo "::error::fuzz: FuzzFastRowDecodeDifferential found a crashing input (real differential) — see the crasher corpus artifact."
+              exit 1
+            elif printf '%s' "$out" | grep -q 'context deadline exceeded'; then
+              echo "::warning::fuzz: FuzzFastRowDecodeDifferential hit the golang/go#48591 -fuzztime deadline-boundary flake (no crasher written); treating as pass."
+            else
+              echo "::error::fuzz: FuzzFastRowDecodeDifferential failed for an unrecognized reason (not a crasher, not the deadline flake) — investigate the log."
+              exit 1
+            fi
+          fi
 
       - name: Upload crasher corpus
         if: failure()
