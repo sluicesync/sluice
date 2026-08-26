@@ -316,14 +316,14 @@ func (e Engine) OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string,
 	slog.InfoContext(ctx, "mysql: opening single spanning consistent snapshot across selected databases",
 		slog.Int("database_count", len(databases)),
 		slog.Any("databases", databases))
-	return e.openBinlogSnapshotStreamShared(ctx, dsn, true)
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, true, databases)
 }
 
 // openBinlogSnapshotStream is the FlavorVanilla path of
 // [Engine.OpenSnapshotStream]. Lifted out of OpenSnapshotStream so
 // the flavor dispatch stays readable.
 func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
-	return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
 }
 
 // openBinlogSnapshotStreamShared is the shared body of the
@@ -343,7 +343,11 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 // lifecycle — is identical. That identity is the point: the
 // multi-database snapshot is the SAME single-transaction / single-position
 // capture, just spanning N databases.
-func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, multiDatabase bool) (*ir.SnapshotStream, error) {
+// databases is the multi-database selected set (nil in single-database
+// mode, where the DSN's database is the whole scope); it feeds the G6
+// binlog-filter preflight and the paired CDC reader's concrete scope
+// list.
+func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, multiDatabase bool, databases []string) (*ir.SnapshotStream, error) {
 	parse := parseDSN
 	if multiDatabase {
 		// Multi-database mode: the source DSN is a server connection
@@ -376,19 +380,14 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		return nil, err
 	}
 
-	// Bug 193 preflight: a snapshot stream exists to hand off to CDC,
-	// so refuse a partial binlog_row_image source HERE — before the
-	// FTWRL/consistent-snapshot dance and the (potentially hours-long)
-	// bulk copy — rather than at the post-copy StreamChanges chokepoint.
-	// See cdc_row_image_preflight.go.
-	if err := preflightBinlogRowImage(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	// Roadmap 68e: refuse a STATEMENT/MIXED-format source here too, so a
-	// cold start refuses BEFORE the bulk copy rather than streaming a
-	// silently-empty CDC tail after it. See cdc_binlog_format_preflight.go.
-	if err := preflightBinlogFormat(ctx, db); err != nil {
+	// The binlog CDC-open preflight set (row image / format / replica
+	// source / db filters): a snapshot stream exists to hand off to CDC,
+	// so refuse an unstreamable source HERE — before the FTWRL/
+	// consistent-snapshot dance and the (potentially hours-long) bulk
+	// copy — rather than at the post-copy StreamChanges chokepoint.
+	// Single-database scope is the DSN's database; multi-database scope
+	// is the selected set. See cdc_open_preflights.go.
+	if err := preflightBinlogCDCOpen(ctx, db, snapshotFilterScope(multiDatabase, cfg.DBName, databases)); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -565,6 +564,12 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: build cdc reader: %w", err)
+	}
+	// Thread the concrete multi-database set onto the paired reader so
+	// its own StreamChanges preflight (G6 do-db arm) has it even before
+	// the orchestrator's SetCDCDatabaseList call at CDC wiring.
+	if cr, ok := cdcReader.(*CDCReader); ok && multiDatabase {
+		cr.SetCDCDatabaseList(databases)
 	}
 
 	position, err := encodeBinlogPos(binlogPos{

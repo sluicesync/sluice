@@ -147,7 +147,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		// degenerate call collapses to the serial path (byte-identical,
 		// the zero-value-safe floor) rather than opening a 1-reader
 		// "concurrent" copy.
-		return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
+		return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
 	}
 
 	// ADR-0153 read-fidelity exemption: snapshot ROW-DATA reads keep the
@@ -176,17 +176,13 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return nil, err
 	}
 
-	// Bug 193 preflight: refuse a partial binlog_row_image source before
-	// the FTWRL window and the bulk copy (same rationale as the serial
-	// opener in cdc_snapshot.go). See cdc_row_image_preflight.go.
-	if err := preflightBinlogRowImage(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	// Roadmap 68e: refuse a STATEMENT/MIXED-format source before the
-	// FTWRL window and the bulk copy (same rationale as the serial
-	// opener in cdc_snapshot.go). See cdc_binlog_format_preflight.go.
-	if err := preflightBinlogFormat(ctx, db); err != nil {
+	// The binlog CDC-open preflight set (row image / format / replica
+	// source / db filters), before the FTWRL window and the bulk copy
+	// (same rationale as the serial opener in cdc_snapshot.go). This
+	// opener is single-database by construction (strict parseDSN above),
+	// so the DSN's database is the whole scope. See
+	// cdc_open_preflights.go.
+	if err := preflightBinlogCDCOpen(ctx, db, binlogFilterScope{databases: []string{cfg.DBName}}); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -217,7 +213,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 				slog.Int("requested_parallelism", n),
 				slog.String("error", err.Error()))
 			_ = db.Close()
-			return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
+			return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
 		}
 		_ = db.Close()
 		return nil, err

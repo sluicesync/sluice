@@ -129,6 +129,16 @@ type CDCReader struct {
 	// only `schema` is in scope. Consulted only on the pump goroutine.
 	cdcDBInScope func(database string) bool
 
+	// cdcDBList is the CONCRETE multi-database selected set, supplied by
+	// [SetCDCDatabaseList] alongside the cdcDBInScope predicate (or at
+	// snapshot construction on the cold-start path). It exists for one
+	// consumer: the G6 binlog-filter preflight's --binlog-do-db arm,
+	// which must prove the synced set is a SUBSET of the server's
+	// do-list — unprovable from a predicate alone (the preflight fails
+	// closed without it). Nil in single-database mode, where the bound
+	// `schema` is the whole set. Never consulted on the pump.
+	cdcDBList []string
+
 	// host and port are extracted from the DSN at construction time
 	// and used to configure the binlog syncer's connection. Stored
 	// separately because the syncer takes them as discrete fields
@@ -406,6 +416,20 @@ func (r *CDCReader) SetCDCDatabaseScope(inScope func(database string) bool) {
 	r.cdcDBInScope = inScope
 }
 
+// SetCDCDatabaseList implements [ir.CDCDatabaseListSetter]: it records
+// the CONCRETE selected database set the cdcDBInScope predicate was
+// built from, so the G6 binlog-filter preflight can prove the synced
+// set sits inside a server-side --binlog-do-db list (a subset relation
+// a predicate cannot answer; the preflight fails closed without it).
+// Must be called before [StreamChanges]; single-database readers never
+// need it (the bound schema is the whole set).
+func (r *CDCReader) SetCDCDatabaseList(databases []string) {
+	if len(databases) == 0 {
+		return
+	}
+	r.cdcDBList = append([]string(nil), databases...)
+}
+
 // SetSchemaForward enables ADR-0091 F7a single-stream schema-change
 // forwarding for this reader. GAP #2 (this method): when true,
 // maybeSnapshotSchemaB1 ALSO emits an ir.SchemaSnapshot on a per-column
@@ -465,6 +489,19 @@ func (r *CDCReader) databaseInScope(database string) bool {
 		return r.cdcDBInScope(database)
 	}
 	return database == r.schema
+}
+
+// binlogFilterScope names this stream's synced databases for the G6
+// binlog-filter preflight: the bound schema in single-database mode,
+// the [SetCDCDatabaseList] set in multi-database mode, with the
+// event-allow predicate alongside either way (it is what the ignore-db
+// arm tests server-listed names against).
+func (r *CDCReader) binlogFilterScope() binlogFilterScope {
+	scope := binlogFilterScope{databases: r.cdcDBList, inScope: r.databaseInScope}
+	if r.cdcDBInScope == nil && r.schema != "" {
+		scope.databases = []string{r.schema}
+	}
+	return scope
 }
 
 // Close stops the pump goroutine, JOINS it, and only then closes the
@@ -578,23 +615,17 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		}
 	}
 
-	// Bug 193 preflight: refuse partial binlog row images (MINIMAL /
-	// NOBLOB) before touching positions. Every CDC start — sync
-	// cold-start handoff, warm resume, backup incremental — flows
-	// through here, so this is the single chokepoint guaranteeing a
-	// stream never runs against a source whose UPDATE images sluice
-	// cannot apply faithfully. (The snapshot openers ALSO preflight, so
-	// a cold start refuses before the bulk copy rather than after it.)
-	// See cdc_row_image_preflight.go for the full mechanism.
-	if err := preflightBinlogRowImage(ctx, r.db); err != nil {
-		return nil, err
-	}
-	// Roadmap 68e preflight: refuse a STATEMENT/MIXED-format source —
-	// its DML arrives as SQL text the dispatcher cannot apply, a
-	// silently-EMPTY stream (Phase-A ground truth 2026-07-23). Runs at
-	// the same chokepoint, and thus the same start surfaces, as the
-	// row-image gate above. See cdc_binlog_format_preflight.go.
-	if err := preflightBinlogFormat(ctx, r.db); err != nil {
+	// The binlog CDC-open preflight set (row image / format / replica
+	// source / db filters) runs before touching positions. Every CDC
+	// start — sync cold-start handoff, warm resume, backup incremental —
+	// flows through here, so this is the chokepoint guaranteeing a
+	// stream never runs against a source whose changes sluice cannot
+	// apply faithfully (or that omits them from the binlog entirely);
+	// re-running at every (re)open also covers startup-option changes
+	// across a mysqld restart mid-sync. (The snapshot openers run the
+	// SAME set, so a cold start refuses before the bulk copy rather
+	// than after it.) See cdc_open_preflights.go.
+	if err := preflightBinlogCDCOpen(ctx, r.db, r.binlogFilterScope()); err != nil {
 		return nil, err
 	}
 
@@ -1054,7 +1085,18 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		//
 		// An XA-prefixed statement with an unrecognised verb falls through to
 		// the generic arm — the conservative status quo, not a silent skip.
-		if handled, err := r.dispatchXAStatement(q); handled || err != nil {
+		// dispatchStatementGuards folds two checks into this one branch:
+		// the XA verb dispatch just described, and the M2 STATEMENT-DML tripwire
+		// (critic P2) — a row-DML verb in query text is proof of a
+		// statement-logged write (a SUPER session's binlog_format
+		// override, or a pre-ROW-flip segment on resume) that the
+		// generic arm below would silently drop. Scope-gated like the
+		// generic arm's cache clear: an out-of-scope session's statement
+		// DML falls through to the fold (its GTID group must still fold)
+		// and is dropped by the scope gate exactly as its row-format
+		// siblings are. See cdc_statement_dml.go for the false-positive
+		// analysis and the stated residue.
+		if handled, err := r.dispatchStatementGuards(q, string(e.Schema)); handled || err != nil {
 			return err
 		}
 		// Everything below is DDL (TRUNCATE included). DDL IMPLICIT-COMMITS,

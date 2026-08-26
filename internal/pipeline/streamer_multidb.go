@@ -356,6 +356,13 @@ func (s *Streamer) coldStartMultiDatabase(
 	//     events outside the set.
 	if scoper, ok := stream.Changes.(ir.CDCDatabaseScoper); ok {
 		scoper.SetCDCDatabaseScope(inScope)
+		// Best-effort companion (ir.CDCDatabaseListSetter): the concrete
+		// selected set, so the reader's binlog-filter preflight can prove
+		// the scope sits inside a server-side --binlog-do-db allow-list —
+		// the predicate alone cannot answer that subset question.
+		if lister, ok := stream.Changes.(ir.CDCDatabaseListSetter); ok {
+			lister.SetCDCDatabaseList(selected)
+		}
 	} else {
 		closeStream()
 		return nil, stop, fmt.Errorf(
@@ -513,6 +520,12 @@ func (s *Streamer) warmResumeMultiDatabase(
 	// selected database's changes.
 	if scoper, ok := cdc.(ir.CDCDatabaseScoper); ok {
 		scoper.SetCDCDatabaseScope(inScope)
+		// Best-effort companion (ir.CDCDatabaseListSetter) — same rationale
+		// as the cold-start wiring: the concrete set lets the reader's
+		// binlog-filter preflight prove scope ⊆ --binlog-do-db.
+		if lister, ok := cdc.(ir.CDCDatabaseListSetter); ok {
+			lister.SetCDCDatabaseList(selected)
+		}
 	} else {
 		closeReader()
 		return nil, stop, fmt.Errorf(

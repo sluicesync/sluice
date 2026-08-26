@@ -490,6 +490,34 @@ const (
 	// same decodes old values against the new types, right count and wrong
 	// meaning (audit CDC-4).
 	CodeCDCSchemaReplayMismatch Code = "SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH"
+
+	// M2 capture-completeness sweep G5 (2026-08-26): the binlog CDC source
+	// is itself a replica whose own binlog omits replicated writes
+	// (log_replica_updates=OFF). Observed on a real linked pair: replicated
+	// rows are SQL-visible (cold copy sees them) while the replica's binlog
+	// stays untouched — the live tail is quietly empty for all replicated
+	// traffic, and on GTID resume the advanced gtid_purged forces a
+	// perpetual resnapshot churn. The MySQL twin of CodeCDCStandbySource.
+	CodeCDCReplicaNoLogUpdates Code = "SLUICE-E-CDC-REPLICA-NO-LOG-UPDATES"
+
+	// M2 capture-completeness sweep G6 (2026-08-26): the source mysqld was
+	// started with --binlog-ignore-db / --binlog-do-db filters that exclude
+	// a synced database from the binlog entirely — writes are applied and
+	// SQL-visible but never logged, so the CDC tail is silently empty for
+	// that database while the stream stays green. The filters are startup
+	// options (not runtime-settable), so the start-time preflight is
+	// authoritative for the life of the server process.
+	CodeCDCBinlogDBFiltered Code = "SLUICE-E-CDC-BINLOG-DB-FILTERED"
+
+	// M2 capture-completeness sweep, critic P2 (2026-08-26): a row-DML
+	// statement (INSERT/UPDATE/DELETE/REPLACE) arrived as binlog QUERY-event
+	// TEXT mid-stream. Under ROW logging DML never legitimately arrives as
+	// query text, so this is proof a writing session overrode binlog_format
+	// to STATEMENT/MIXED (a SUPER-only session override that slips the
+	// GLOBAL preflight, CodeCDCBinlogFormatNotRow's documented residue) —
+	// previously the statement fell into the generic-DDL arm and was
+	// silently dropped. The dispatch-time belt refuses it instead.
+	CodeCDCStatementDML Code = "SLUICE-E-CDC-STATEMENT-DML"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -639,6 +667,10 @@ var registry = map[Code]Info{
 
 	CodeCopyRetryAmbiguousKeyless: {ClassRefusal, "a cold copy hit a transient target error mid-batch on a table with no PRIMARY KEY and no NOT NULL UNIQUE index, and refused to re-send those rows: an attempt that committed but lost its acknowledgement is indistinguishable from one that rolled back, and with no unique key there is nothing that would make the second write fail — so the retry that rides a PlanetScale reparent or a storage-grow window on every other table would silently duplicate this one"},
 	CodeCDCSchemaReplayMismatch:   {ClassRefusal, "a MySQL binlog row event's TABLE_MAP column-type vector disagrees with the table's current information_schema shape — the event was recorded under a DIFFERENT schema than the one it is about to be decoded against, which for a same-column-count DDL (a type change) would remap every replayed value silently; refused rather than decoded"},
+
+	CodeCDCReplicaNoLogUpdates: {ClassRefusal, "binlog CDC refused at start: the source is itself a replica with log_replica_updates=OFF, so writes replicated from its primary never enter THIS server's binlog — the CDC tail would be silently empty for all replicated traffic while local writes keep it looking alive; point the sync at the primary, or restart mysqld with log_replica_updates=ON (the variable is read-only at runtime)"},
+	CodeCDCBinlogDBFiltered:    {ClassRefusal, "binlog CDC refused at start: the source's --binlog-ignore-db / --binlog-do-db startup filters exclude a synced database from the binlog, so its writes are applied but never logged — the CDC tail would be silently empty for that database; remove the filter flags and restart mysqld (they are not settable at runtime), or take the database out of the sync's scope"},
+	CodeCDCStatementDML:        {ClassRefusal, "binlog CDC stopped mid-stream: a row-DML statement (INSERT/UPDATE/DELETE/REPLACE) arrived as QUERY-event text, which under ROW logging is proof a writing session overrode binlog_format to STATEMENT/MIXED — sluice deliberately never executes replayed SQL text, so these writes cannot be applied; fix the offending session, ensure @@GLOBAL.binlog_format=ROW with no session overrides, then start the sync fresh (the statement-logged writes are only recoverable by re-snapshot)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

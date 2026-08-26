@@ -40,12 +40,15 @@ import (
 // row-image preflight: each session copies its binlog_format from the
 // global at connect, so the global governs what new transactions write.
 // A session-level STATEMENT override on an individual writer (SUPER
-// only) slips past this gate — those statements arrive as QueryEvents
-// the dispatcher treats as DDL and does not apply. A real replica
-// would EXECUTE the SQL text; sluice deliberately never does (replaying
-// arbitrary SQL against a possibly-different-engine target is not
-// faithful CDC), so that residue stays a documented limit rather than
-// a dispatch-time belt.
+// only) slips past this gate — those statements arrive as QueryEvents.
+// A real replica would EXECUTE the SQL text; sluice deliberately never
+// does (replaying arbitrary SQL against a possibly-different-engine
+// target is not faithful CDC). Since the M2 sweep (2026-08-26) that
+// residue IS belted at dispatch: a row-DML verb in query text stops the
+// stream with a coded refusal instead of the old silent generic-DDL
+// drop — see cdc_statement_dml.go for the belt, its scope gating, and
+// what narrower residue remains (statement-format LOAD DATA,
+// versioned-comment-wrapped DML).
 
 // binlogFormatRemedyHint is the machine-readable remedy carried on the
 // coded refusal, mirroring the prose in the error message.

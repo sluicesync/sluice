@@ -141,6 +141,11 @@ var (
 
 	// Binlog CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)
+	// M2 G6: the concrete selected-database list companion — the binlog
+	// filter preflight's --binlog-do-db arm fails CLOSED without it, so a
+	// signature drift here would flip every multi-database warm resume on
+	// a do-filtered server from a precise verdict to a blanket refusal.
+	_ ir.CDCDatabaseListSetter = (*CDCReader)(nil)
 	// FullBeforeImageSetter backs `sync --where` (ADR-0173 Phase 2): the
 	// pipeline type-asserts the binlog reader onto it to request un-narrowed
 	// before-images for filtered tables. A rename / re-signature would compile

@@ -2814,6 +2814,21 @@ type CDCDatabaseScoper interface {
 	SetCDCDatabaseScope(inScope func(database string) bool)
 }
 
+// CDCDatabaseListSetter is the OPTIONAL companion to [CDCDatabaseScoper]:
+// it hands the reader the CONCRETE selected database list the scope
+// predicate was built from. It exists because some engine preflights
+// must compare the sync's scope against a server-side allow-list — the
+// MySQL binlog reader's --binlog-do-db filter check needs to prove the
+// synced set is a SUBSET of the server's do-list, a relation a predicate
+// cannot answer (the reader fails closed rather than guessing when the
+// list is absent and such a filter is present). The orchestrator calls
+// it best-effort wherever it calls SetCDCDatabaseScope; engines without
+// the surface simply aren't asked. Set before StreamChanges; never
+// consulted on the pump.
+type CDCDatabaseListSetter interface {
+	SetCDCDatabaseList(databases []string)
+}
+
 // MultiDatabaseRouter is the OPTIONAL surface a [ChangeApplier]
 // implements to enable per-change target-namespace routing for a
 // multi-database fan-out CDC run (ADR-0074 Phase 1b). The applier stays
