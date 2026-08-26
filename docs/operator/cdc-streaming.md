@@ -330,6 +330,8 @@ The `postgres-trigger` engine's capture triggers are plain `CREATE TRIGGER`, so 
 
 sluice deliberately does **not** install `ENABLE ALWAYS` triggers (which would fire under replica role too): on relay and bidirectional topologies they would also capture sluice's own applied rows — an echo loop. That full fix needs its own ADR (echo suppression / origin tagging) and is tracked separately.
 
+Separately, every `postgres-trigger` stream open now verifies the installed capture artifacts themselves (the same capture-shape door the `sqlite-trigger`/`d1-trigger` engines got in v0.131.2): a manually dropped or `DISABLE TRIGGER`-d capture trigger, a trigger set `ENABLE REPLICA`, a trigger rewired to a foreign function, or a dropped/disabled `sluice_capture_ddl_trg` event trigger **refuses loudly at open** — re-running `sluice trigger setup` reinstalls everything and preserves the change-log and resume watermark. Without the door, a dropped trigger is invisible to both drift tiers (the DDL event trigger only watches table/index DDL; the polled fingerprint only watches columns) and every subsequent change on that table would be silently uncaptured.
+
 ## Re-copying onto a target that already holds data
 
 `sync start --restart-from-scratch` and the automatic re-snapshot (which fires

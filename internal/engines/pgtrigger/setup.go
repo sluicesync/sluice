@@ -29,6 +29,13 @@ const (
 	CapturePrefixRow   = "sluice_capture_" // for per-table CREATE TRIGGER names
 	CaptureTriggerRow  = "sluice_capture"  // per-table row-trigger name
 	CaptureTriggerDDL  = "sluice_capture_ddl_trg"
+	// CaptureTriggerTruncate / CaptureFunctionTruncate are the per-table
+	// TRUNCATE companion trigger and its FOR EACH STATEMENT function.
+	// Named (rather than the literals renderSetupDDL used to repeat) so
+	// the capture-shape door (cdc_capture_shape.go) grades against the
+	// same identifiers setup installs.
+	CaptureTriggerTruncate  = "sluice_capture_truncate"
+	CaptureFunctionTruncate = "sluice_capture_truncate_fn"
 	// ChangeLogSchemaVer is the schema-version pin recorded in the meta
 	// table. v1 was the original change-log + meta pair; v2 (roadmap item
 	// 115) adds [ChangeLogConsumersTable], the source-side registry the
@@ -679,12 +686,12 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 				quoteSQLString(pkColsJSON(t.PKCols)),
 			),
 			// TRUNCATE trigger.
-			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent("sluice_capture_truncate"), fqTable),
+			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(CaptureTriggerTruncate), fqTable),
 			fmt.Sprintf(
 				"CREATE TRIGGER %s AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION %s()",
-				quoteIdent("sluice_capture_truncate"),
+				quoteIdent(CaptureTriggerTruncate),
 				fqTable,
-				tableRef("sluice_capture_truncate_fn"),
+				tableRef(CaptureFunctionTruncate),
 			),
 		)
 	}
@@ -713,7 +720,7 @@ func rowFunctionRef(schema string) string {
 }
 
 func truncateFnRef(schema string) string {
-	return quoteIdent(schema) + "." + quoteIdent("sluice_capture_truncate_fn")
+	return quoteIdent(schema) + "." + quoteIdent(CaptureFunctionTruncate)
 }
 
 func ddlFnRef(schema string) string {
@@ -1025,7 +1032,7 @@ func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
 		out = append(
 			out,
 			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(CaptureTriggerRow), fqTable),
-			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent("sluice_capture_truncate"), fqTable),
+			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(CaptureTriggerTruncate), fqTable),
 		)
 	}
 	out = append(

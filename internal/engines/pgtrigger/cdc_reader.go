@@ -132,6 +132,15 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 		_ = db.Close()
 		return nil, err
 	}
+	// The capture-shape door (audit 2026-08-26 F2): refuse loudly when an
+	// installed capture trigger is missing/disabled/rewired or the DDL
+	// event trigger was dropped — a DROP TRIGGER is invisible to both
+	// drift tiers, and every subsequent DML would be silently uncaptured.
+	// Runs at every CDC open; both stream-open paths funnel through here.
+	if err := verifyCaptureTriggerShape(ctx, db, cfg.schema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// WARN (never refuse) on the replica-role capture-blindness shapes —
 	// a subscriber source or an all-sluice relay writes rows the plain
 	// capture triggers cannot see (audit 2026-08-26 F1; the full
