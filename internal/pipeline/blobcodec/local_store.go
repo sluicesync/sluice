@@ -79,10 +79,20 @@ func (s *LocalStore) Root() string { return s.root }
 // to the store root; intermediate directories are created as needed.
 // Existing content at the path is overwritten.
 //
-// Implementation note: writes go to a `.tmp` sibling first and are
-// renamed in to avoid leaving partial files on disk if the process
-// dies mid-write. Same atomic-write trick the schema-preview /
-// verify output paths use.
+// Implementation note: writes go to a UNIQUELY-NAMED `.tmp.*` sibling
+// first and are renamed in, so a process dying mid-write leaves no
+// partial file at the final path. The tmp name is unique PER CALL
+// (os.CreateTemp), not the fixed `abs + ".tmp"` it once was: with a
+// shared tmp name, two concurrent Puts to the same key opened the SAME
+// temp file with independent fd offsets — one writer's O_TRUNC plus the
+// other's later chunks landing at its stale offset produced a TORN file
+// (complete JSON + trailing garbage) that the rename then installed.
+// Observed live as `decode "lineage.json": invalid character '}' after
+// top-level value` when two simultaneous incremental extenders raced
+// through the ADR-0160 claim→Put residual window (CI run 33000462974,
+// caught by TestIncrementalBackup_SimultaneousExtenders_NeverForkTheChain).
+// With unique tmp names each rename atomically installs one writer's
+// COMPLETE bytes — last rename wins, never a blend.
 func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -94,13 +104,14 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
-	tmp := abs + ".tmp"
-	// 0600, not os.Create's 0644 — chunk contents are row data; see
-	// the NewLocalStore doc comment.
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	// os.CreateTemp opens O_EXCL with 0600 perms — unique per call (the
+	// concurrency requirement above) and never world-readable (chunk
+	// contents are row data; see the NewLocalStore doc comment).
+	f, err := os.CreateTemp(filepath.Dir(abs), filepath.Base(abs)+".tmp.*")
 	if err != nil {
-		return fmt.Errorf("local store: create %q: %w", tmp, err)
+		return fmt.Errorf("local store: create temp for %q: %w", path, err)
 	}
+	tmp := f.Name()
 	if _, err := io.Copy(f, r); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
