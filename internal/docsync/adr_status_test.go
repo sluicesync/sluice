@@ -237,6 +237,58 @@ func TestADRIndexStatusParity(t *testing.T) {
 	}
 }
 
+// adrIndexExemptFiles lists ADR-numbered files that DELIBERATELY have no
+// docs/adr/README.md index row, each with a written reason. Everything else
+// under docs/adr/adr-*.md must have a row.
+var adrIndexExemptFiles = map[string]string{
+	"adr-0107-impl-plan.md": "companion implementation-plan appendix, linked from adr-0107-planetscale-metrics-integration.md's body; deliberately not a decision row",
+}
+
+// TestADRIndexFileCompleteness is the files→index direction that
+// TestADRIndexStatusParity (index-rows→files only) never walks — which is
+// exactly how ADR-0184 shipped with no index row and stayed invisible in the
+// browsable index until the 2026-08-26 audit found it. Every adr-*.md file
+// must appear as a README.md table-row link target, or carry an
+// adrIndexExemptFiles reason. The floors are anti-vacuity: 187 files / 185
+// distinct row targets today, and both only ever rise.
+func TestADRIndexFileCompleteness(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join(adrDir(t), "adr-*.md"))
+	if err != nil || len(files) < 150 {
+		t.Fatalf("globbed %d ADR files (err %v) — discovery broke; fix it before trusting this gate", len(files), err)
+	}
+	raw, err := os.ReadFile(filepath.Join(adrDir(t), "README.md"))
+	if err != nil {
+		t.Fatalf("read ADR index: %v", err)
+	}
+	// Unlike indexStatuses' parser this reads the link TARGET from every
+	// table row, status-bearing or not — completeness must see them all.
+	linkRe := regexp.MustCompile(`^\| \[[0-9a-z]+\]\(([^)]+)\)`)
+	indexed := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if m := linkRe.FindStringSubmatch(line); m != nil {
+			indexed[m[1]] = true
+		}
+	}
+	if len(indexed) < 150 {
+		t.Fatalf("parsed only %d index-row link targets — the README table shape changed; fix the parser before trusting this gate", len(indexed))
+	}
+	for _, path := range files {
+		name := filepath.Base(path)
+		if indexed[name] || adrIndexExemptFiles[name] != "" {
+			continue
+		}
+		t.Errorf("%s has no docs/adr/README.md index row — add the row (or an adrIndexExemptFiles entry with a reason). A file without a row is invisible in the browsable index (the ADR-0184 shape, audit 2026-08-26)", name)
+	}
+	for name, reason := range adrIndexExemptFiles {
+		if _, err := os.Stat(filepath.Join(adrDir(t), name)); err != nil {
+			t.Errorf("adrIndexExemptFiles entry %q (%s) matches no file — stale exemption; remove it", name, reason)
+		}
+		if indexed[name] {
+			t.Errorf("%s is both exempt and indexed — the exemption is stale; remove it", name)
+		}
+	}
+}
+
 // TestADRStatusSelfContradiction pins the DOC-5 self-contradiction
 // class: a file whose Status header says Accepted/Implemented while its
 // body still asserts the decision "stays Proposed" (ADR-0176 line 20
