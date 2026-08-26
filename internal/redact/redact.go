@@ -52,6 +52,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -269,9 +270,10 @@ func (r *Registry) ApplyRow(schema, table string, pkColumns []string, row ir.Row
 				return fmt.Errorf("redact %s.%s.%s via %s: randomize strategies require a primary key on the table (no PK columns available at apply time); use hash:sha256, mask:*, or static: instead",
 					schema, table, name, strategy.Name())
 			}
-			pkValues := make([]any, len(pkColumns))
-			for i, c := range pkColumns {
-				pkValues[i] = row[c]
+			pkValues, err := PKValuesFromRow(row, pkColumns)
+			if err != nil {
+				return fmt.Errorf("redact %s.%s.%s via %s: %w",
+					schema, table, name, strategy.Name(), err)
 			}
 			seed = DeriveRowSeed(streamID, table, name, pkColumns, pkValues)
 		}
@@ -360,6 +362,74 @@ func DeriveRowSeed(streamID, table, column string, pkColumns []string, pkValues 
 	}
 	sum := h.Sum(nil)
 	return sum
+}
+
+// ErrPKColumnMissing is the sentinel cause for a randomize:* seed
+// derivation whose primary-key column matches no key of the row map.
+// Surfaced via errors.Is; the message names the column and the row's
+// actual keys so the operator can see the divergence directly.
+var ErrPKColumnMissing = errors.New("redact: randomize primary-key column is not present in the row")
+
+// PKValuesFromRow extracts the primary-key values for a randomize:* seed
+// from row, in pkColumns order. It is the ONLY sanctioned extraction
+// path (audit 2026-08-26 R-1) — both seed-derivation sites,
+// [Registry.ApplyRow] and pipeline/migcore's RedactRow, go through here.
+//
+// Lookup is exact-spelling first, then case-insensitive fallback: on the
+// CDC apply path pkColumns carries the TARGET catalog's spelling while
+// row keys carry the SOURCE's, and this package's posture is already
+// case-insensitive matching (registry keys are case-folded — see the
+// package comment). The fallback value is the same value the exact key
+// would have carried, and the seed's column-NAME component uses the
+// pkColumns spelling either way, so both spellings derive the identical
+// seed.
+//
+// A PK column matching NO row key refuses loudly (wrapping
+// [ErrPKColumnMissing]). Pre-fix this indexed the map blind: a case
+// divergence made every row's seed derive from nil, so the whole table
+// got ONE identical "randomized" value at exit 0 — a real PK value can
+// never be absent, so the loud check costs nothing on working
+// configurations. A PK column matching MORE THAN ONE row key
+// case-insensitively (with no exact match) also refuses: a replay-stable
+// seed cannot pick between them arbitrarily.
+func PKValuesFromRow(row ir.Row, pkColumns []string) ([]any, error) {
+	vals := make([]any, len(pkColumns))
+	for i, c := range pkColumns {
+		v, ok := row[c]
+		if !ok {
+			matches := 0
+			for k, kv := range row {
+				if strings.EqualFold(k, c) {
+					v = kv
+					matches++
+				}
+			}
+			switch {
+			case matches == 1:
+				ok = true
+			case matches > 1:
+				return nil, fmt.Errorf("%w: primary-key column %q matches %d row columns case-insensitively (row columns: %s) — a replay-stable seed cannot pick one arbitrarily",
+					ErrPKColumnMissing, c, matches, strings.Join(rowColumnNames(row), ", "))
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: primary-key column %q is not a key of the row map (row columns: %s); deriving the seed from a missing key would give every row one identical \"randomized\" value",
+				ErrPKColumnMissing, c, strings.Join(rowColumnNames(row), ", "))
+		}
+		vals[i] = v
+	}
+	return vals, nil
+}
+
+// rowColumnNames returns the row's column names in sorted order, for
+// deterministic error text.
+func rowColumnNames(row ir.Row) []string {
+	names := make([]string, 0, len(row))
+	for k := range row {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // ErrRandomizeRequiresPK is the sentinel cause for the randomize:*

@@ -54,7 +54,11 @@ func RedactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*i
 			continue
 		}
 		val := row[col.Name]
-		seed := deriveSeedIfNeeded(strategy, table, col.Name, row, pkColumns, streamID)
+		seed, err := deriveSeedIfNeeded(strategy, table, col.Name, row, pkColumns, streamID)
+		if err != nil {
+			return fmt.Errorf("pipeline: redact %s.%s.%s via %s: %w",
+				schema, table, col.Name, strategy.Name(), err)
+		}
 		newVal, err := strategy.Redact(col, val, seed)
 		if err != nil {
 			return fmt.Errorf("pipeline: redact %s.%s.%s via %s: %w",
@@ -75,21 +79,28 @@ func RedactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*i
 // "PK required" refusal with full operator detail (column name +
 // strategy name). Preflight should have caught the no-PK case
 // before this runs.
-func deriveSeedIfNeeded(strategy redact.Strategy, table, column string, row ir.Row, pkColumns []string, streamID string) []byte {
+//
+// PK values come from [redact.PKValuesFromRow] (audit 2026-08-26 R-1):
+// exact-spelling lookup with a case-insensitive fallback, refusing
+// loudly when a PK column matches no row key. Pre-fix this site indexed
+// row[c] blind — a source-vs-target case divergence silently seeded
+// every row from nil, giving the whole table one identical "randomized"
+// value at exit 0.
+func deriveSeedIfNeeded(strategy redact.Strategy, table, column string, row ir.Row, pkColumns []string, streamID string) ([]byte, error) {
 	if strategy == nil {
-		return nil
+		return nil, nil
 	}
 	if !strings.HasPrefix(strategy.Name(), "randomize:") {
-		return nil
+		return nil, nil
 	}
 	if len(pkColumns) == 0 {
-		return nil
+		return nil, nil
 	}
-	pkValues := make([]any, len(pkColumns))
-	for i, c := range pkColumns {
-		pkValues[i] = row[c]
+	pkValues, err := redact.PKValuesFromRow(row, pkColumns)
+	if err != nil {
+		return nil, err
 	}
-	return redact.DeriveRowSeed(streamID, table, column, pkColumns, pkValues)
+	return redact.DeriveRowSeed(streamID, table, column, pkColumns, pkValues), nil
 }
 
 // TablePKColumns returns the PK column names of table in declaration

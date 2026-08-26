@@ -102,18 +102,33 @@ func (r RandomizeInt) Redact(col *ir.Column, val any, seed []byte) (any, error) 
 		}
 	}
 	rng := newSeededRand(seed)
-	span := r.Max - r.Min + 1 // inclusive range
-	if span <= 0 {
-		// Min == Max → span == 1
-		return r.Min, nil
+	// The span is computed in UNSIGNED arithmetic because the WIDTH of an
+	// int64 range does not fit in int64: `randomize:int:0,MaxInt64` (a
+	// plausible "any positive" spelling, parseable at the CLI since
+	// min <= max) has width 2^63. The previous int64 `Max - Min + 1`
+	// wrapped that negative, and a `span <= 0` branch then treated it as
+	// the Min==Max case — returning the CONSTANT Min for every row at
+	// exit 0 (audit 2026-08-26 R-2; the range sits inside BIGINT, so the
+	// Bug-105 preflight cannot catch it, and the old comment's uint64
+	// cast guarded dead code the wrap never reached).
+	//
+	// uint64(Max) - uint64(Min) is the exact two's-complement width for
+	// any Min <= Max (the CLI/YAML parsers and the Min > Max guard above
+	// enforce the ordering); +1 makes the range inclusive. Min == Max
+	// yields uspan == 1 → Uint64N(1) == 0 → Min, and every previously
+	// working range draws the identical Uint64N(width) as before, so
+	// replay-stable outputs are unchanged (ADR-0039).
+	uspan := uint64(r.Max) - uint64(r.Min) + 1
+	if uspan == 0 {
+		// Width 2^64 — the full int64 domain (MinInt64..MaxInt64) — is the
+		// one width uint64 cannot hold. Every draw is in range by
+		// definition; no bounding needed.
+		return int64(rng.Uint64()), nil
 	}
-	// rand.Int64N requires a positive bound; cast through uint64 to
-	// dodge the case where Max-Min+1 overflows signed int64 (e.g.
-	// Min=math.MinInt64, Max=math.MaxInt64). Practical operator inputs
-	// stay well clear of that range but the math is cheap.
-	uspan := uint64(span)
-	out := r.Min + int64(rng.Uint64N(uspan))
-	return out, nil
+	// Wrapping int64 addition makes this exact even when the intermediate
+	// exceeds MaxInt64: the delta is < uspan, so the mathematical result
+	// lies in [Min, Max] and two's-complement wraparound lands on it.
+	return r.Min + int64(rng.Uint64N(uspan)), nil
 }
 
 // RandomizeEmail generates `<rand-local>@<rand-domain>.test` where
