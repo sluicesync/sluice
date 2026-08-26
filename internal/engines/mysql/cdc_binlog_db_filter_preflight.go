@@ -70,6 +70,15 @@ import (
 type binlogFilterScope struct {
 	databases []string
 	inScope   func(database string) bool
+
+	// tableAllowed is the stream's effective TABLE scope when one
+	// exists (Bug 246: the reader's pipeline-supplied scope predicate;
+	// the snapshot openers' table allowlist) — consulted only by the
+	// G9 FK referential-action census, which must stay silent for a
+	// cascade-carrying table the sync filters out. nil means every
+	// table in the scoped databases is in scope. The G6 refusal never
+	// reads it (server-side binlog filters are database-grained).
+	tableAllowed func(schema, table string) bool
 }
 
 // admits reports whether db is part of the sync's scope, by concrete

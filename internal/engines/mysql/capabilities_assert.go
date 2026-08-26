@@ -155,7 +155,9 @@ var (
 	// server-side — but pinned so the surface stays uniform across the flavor).
 	_ ir.FullBeforeImageSetter = (*CDCReader)(nil)
 	// Bug 246: the reader-side table-scope predicate the pipeline wires so
-	// the XA refusal honours the sync's --include/--exclude-table filter.
+	// the XA refusal honours the sync's --include/--exclude-table filter
+	// (the G9 FK-action census scopes by the same predicate, via
+	// binlogFilterScope.tableAllowed).
 	_ ir.CDCScopePredicateSetter = (*CDCReader)(nil)
 
 	// VStream (PlanetScale / Vitess flavor) types. The snapshot-rows

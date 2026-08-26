@@ -132,6 +132,18 @@ func createLogicalReplicationSlot(
 		return "", "", err
 	}
 
+	// P3 residual (capture-completeness matrix, pgoutput 2PC row): a
+	// pending prepared transaction BLOCKS the CREATE_REPLICATION_SLOT
+	// below with no message; WARN first so the stall is legible.
+	// This function is the single slot-creation chokepoint, so the WARN
+	// reaches every creating caller — the enumeration: the snapshot+CDC
+	// cold start (cdc_snapshot.go OpenSnapshotStream), the from-now CDC
+	// open's create-if-absent arm (cdc_reader.go resolveStartPosition),
+	// and the backup anchor slot (backup_snapshot.go). Resume paths
+	// reuse an existing slot, never reach here, and cannot block this
+	// way.
+	warnPreparedTransactions(ctx, db, slotName)
+
 	if version >= pgVersionFailoverSupport {
 		consistentPoint, snapshotName, err = createSlotRawProtocol(ctx, replConn, slotName, opts)
 		// A pooler (Supavisor/pgbouncer) strips replication=database, so

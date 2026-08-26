@@ -495,9 +495,12 @@ func (r *CDCReader) databaseInScope(database string) bool {
 // binlog-filter preflight: the bound schema in single-database mode,
 // the [SetCDCDatabaseList] set in multi-database mode, with the
 // event-allow predicate alongside either way (it is what the ignore-db
-// arm tests server-listed names against).
+// arm tests server-listed names against). The pipeline-supplied table
+// scope predicate (Bug 246, [SetCDCScopePredicate]) rides along for
+// the G9 FK-action census — nil when the pipeline set none, meaning
+// every table in the scoped databases.
 func (r *CDCReader) binlogFilterScope() binlogFilterScope {
-	scope := binlogFilterScope{databases: r.cdcDBList, inScope: r.databaseInScope}
+	scope := binlogFilterScope{databases: r.cdcDBList, inScope: r.databaseInScope, tableAllowed: r.scopeAllowed}
 	if r.cdcDBInScope == nil && r.schema != "" {
 		scope.databases = []string{r.schema}
 	}

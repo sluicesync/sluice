@@ -207,6 +207,16 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, err
 	}
+
+	// G9 FK referential-action capture WARN (capture-completeness matrix
+	// §vstream) — the snapshot side of the vstream lane, scoped to the
+	// caller's table allowlist so a filtered sync's excluded
+	// cascade-carrying table stays silent (Bug 246). Every vstream
+	// snapshot opener — fresh cold start, filtered, COPY resume, backup —
+	// funnels through this seedable core, so this one call covers them
+	// all; roster-bound by TestFKReferentialActionWarnRoster_BothLanes.
+	// WARN-only, never fails the open; see cdc_fk_actions_preflight.go.
+	warnVStreamFKReferentialActions(ctx, cfg, keyspace, tables)
 	tuning, err := e.resolveVStreamSnapshotTuning(cfg)
 	if err != nil {
 		_ = conn.Close()

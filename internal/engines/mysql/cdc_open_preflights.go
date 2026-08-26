@@ -14,23 +14,29 @@ import "context"
 // also refuses any OTHER function calling an individual preflight
 // directly). The set, in order:
 //
-//	preflightBinlogRowImage   Bug 193   partial row images / PARTIAL_JSON
-//	preflightBinlogFormat     item 68e  STATEMENT/MIXED binlog_format
-//	preflightReplicaSource    M2 G5     replica source, log_replica_updates=OFF
-//	preflightBinlogDBFilter   M2 G6     --binlog-ignore-db / --binlog-do-db
+//	preflightBinlogRowImage         Bug 193   partial row images / PARTIAL_JSON
+//	preflightBinlogFormat           item 68e  STATEMENT/MIXED binlog_format
+//	preflightReplicaSource          M2 G5     replica source, log_replica_updates=OFF
+//	preflightBinlogDBFilter         M2 G6     --binlog-ignore-db / --binlog-do-db
+//	preflightFKReferentialActions   M2 G9     FK referential-action capture WARN
 //
-// scope names the databases the stream will read (the G6 refusal is
-// scope-limited per the Bug 246 discipline); see each preflight's own
-// file for its mechanism and ground truth. Bulk-only runs (migrate,
-// backup full) never read the binlog and are deliberately not gated.
+// scope names the databases (and, when known, the table filter) the
+// stream will read — the G6 refusal and the G9 census are scope-limited
+// per the Bug 246 discipline; see each preflight's own file for its
+// mechanism and ground truth. The G9 member is WARN-only and runs
+// LAST, after every refusal, so a refused open never also warns.
+// Bulk-only runs (migrate, backup full) never read the binlog and are
+// deliberately not gated.
 // snapshotFilterScope names a snapshot opener's synced databases for
-// the G6 filter preflight: the DSN's database in single-database mode,
-// the selected set in multi-database mode.
-func snapshotFilterScope(multiDatabase bool, dbName string, databases []string) binlogFilterScope {
+// the G6 filter preflight — the DSN's database in single-database mode,
+// the selected set in multi-database mode — plus the opener's table
+// allowlist (nil = whole database) for the G9 census.
+func snapshotFilterScope(multiDatabase bool, dbName string, databases, tables []string) binlogFilterScope {
+	scope := binlogFilterScope{databases: databases, tableAllowed: tableAllowlist(tables)}
 	if !multiDatabase {
-		return binlogFilterScope{databases: []string{dbName}}
+		scope.databases = []string{dbName}
 	}
-	return binlogFilterScope{databases: databases}
+	return scope
 }
 
 func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilterScope) error {
@@ -43,5 +49,9 @@ func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilte
 	if err := preflightReplicaSource(ctx, db); err != nil {
 		return err
 	}
-	return preflightBinlogDBFilter(ctx, db, scope)
+	if err := preflightBinlogDBFilter(ctx, db, scope); err != nil {
+		return err
+	}
+	preflightFKReferentialActions(ctx, db, scope)
+	return nil
 }

@@ -146,8 +146,9 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		// Defensive: the caller gates on n > 1 && len(tables) > 1. A
 		// degenerate call collapses to the serial path (byte-identical,
 		// the zero-value-safe floor) rather than opening a 1-reader
-		// "concurrent" copy.
-		return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
+		// "concurrent" copy. The table scope rides along for the G9
+		// FK-action census.
+		return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil, tables)
 	}
 
 	// ADR-0153 read-fidelity exemption: snapshot ROW-DATA reads keep the
@@ -182,7 +183,10 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// opener is single-database by construction (strict parseDSN above),
 	// so the DSN's database is the whole scope. See
 	// cdc_open_preflights.go.
-	if err := preflightBinlogCDCOpen(ctx, db, binlogFilterScope{databases: []string{cfg.DBName}}); err != nil {
+	if err := preflightBinlogCDCOpen(ctx, db, binlogFilterScope{
+		databases:    []string{cfg.DBName},
+		tableAllowed: tableAllowlist(tables),
+	}); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -213,7 +217,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 				slog.Int("requested_parallelism", n),
 				slog.String("error", err.Error()))
 			_ = db.Close()
-			return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
+			return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil, tables)
 		}
 		_ = db.Close()
 		return nil, err

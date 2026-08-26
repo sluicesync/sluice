@@ -955,6 +955,17 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 		}
 		r.shards = shards
 	}
+
+	// G9 FK referential-action capture WARN (capture-completeness matrix
+	// §vstream): the vstreamer re-serves the tablet mysqld's binlog,
+	// where cascaded child changes are absent — identical mechanism to
+	// the binlog lane, wired at both lanes' open chokepoints and bound by
+	// TestFKReferentialActionWarnRoster_BothLanes. The standalone reader
+	// carries no table scope (its VStream filter is keyspace-wide), so
+	// the census covers the whole keyspace. WARN-only, never fails the
+	// open; see cdc_fk_actions_preflight.go.
+	warnVStreamFKReferentialActions(ctx, r.cfg, r.keyspace, nil)
+
 	startPos, err := r.resolveStartPosition(from)
 	if err != nil {
 		return nil, err

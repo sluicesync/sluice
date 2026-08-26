@@ -90,7 +90,7 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 	if n := resolveCopyTableParallelism(rawN, len(tables)); n > 1 && len(tables) > 1 {
 		return e.openBinlogSnapshotStreamConcurrent(ctx, dsn, n, tables)
 	}
-	return e.openBinlogSnapshotStream(ctx, dsn)
+	return e.openBinlogSnapshotStreamScoped(ctx, dsn, tables)
 }
 
 // OpenSnapshotStreamFromPosition resumes an INTERRUPTED cold-start COPY
@@ -316,14 +316,25 @@ func (e Engine) OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string,
 	slog.InfoContext(ctx, "mysql: opening single spanning consistent snapshot across selected databases",
 		slog.Int("database_count", len(databases)),
 		slog.Any("databases", databases))
-	return e.openBinlogSnapshotStreamShared(ctx, dsn, true, databases)
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, true, databases, nil)
 }
 
 // openBinlogSnapshotStream is the FlavorVanilla path of
 // [Engine.OpenSnapshotStream]. Lifted out of OpenSnapshotStream so
 // the flavor dispatch stays readable.
 func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
-	return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil)
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil, nil)
+}
+
+// openBinlogSnapshotStreamScoped is openBinlogSnapshotStream carrying
+// the caller's table allowlist, so the serial single-stream path of
+// [Engine.OpenSnapshotStreamForTables] keeps its table scope for the
+// G9 FK-action census (Bug 246: a filtered sync's excluded
+// cascade-carrying table must stay silent). The scope is
+// census/preflight-only — the serial snapshot RowReader already reads
+// per-table and never over-streams.
+func (e Engine) openBinlogSnapshotStreamScoped(ctx context.Context, dsn string, tables []string) (*ir.SnapshotStream, error) {
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, false, nil, tables)
 }
 
 // openBinlogSnapshotStreamShared is the shared body of the
@@ -346,8 +357,9 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 // databases is the multi-database selected set (nil in single-database
 // mode, where the DSN's database is the whole scope); it feeds the G6
 // binlog-filter preflight and the paired CDC reader's concrete scope
-// list.
-func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, multiDatabase bool, databases []string) (*ir.SnapshotStream, error) {
+// list. tables is the caller's table allowlist when one exists
+// (nil = every table); it scopes only the G9 FK-action census.
+func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, multiDatabase bool, databases, tables []string) (*ir.SnapshotStream, error) {
 	parse := parseDSN
 	if multiDatabase {
 		// Multi-database mode: the source DSN is a server connection
@@ -387,7 +399,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// copy — rather than at the post-copy StreamChanges chokepoint.
 	// Single-database scope is the DSN's database; multi-database scope
 	// is the selected set. See cdc_open_preflights.go.
-	if err := preflightBinlogCDCOpen(ctx, db, snapshotFilterScope(multiDatabase, cfg.DBName, databases)); err != nil {
+	if err := preflightBinlogCDCOpen(ctx, db, snapshotFilterScope(multiDatabase, cfg.DBName, databases, tables)); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

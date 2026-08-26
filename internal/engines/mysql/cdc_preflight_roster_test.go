@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The CDC-open preflight roster (M2 capture-completeness remediation,
-// 2026-08-26). Four preflights guard every binlog CDC open, bundled in
+// 2026-08-26). Five preflights guard every binlog CDC open, bundled in
 // ONE combined opener so no path can adopt a subset:
 //
-//	preflightBinlogRowImage   Bug 193   partial row images
-//	preflightBinlogFormat     item 68e  STATEMENT/MIXED format
-//	preflightReplicaSource    M2 G5     replica source, log_replica_updates=OFF
-//	preflightBinlogDBFilter   M2 G6     --binlog-ignore-db / --binlog-do-db
+//	preflightBinlogRowImage         Bug 193   partial row images
+//	preflightBinlogFormat           item 68e  STATEMENT/MIXED format
+//	preflightReplicaSource          M2 G5     replica source, log_replica_updates=OFF
+//	preflightBinlogDBFilter         M2 G6     --binlog-ignore-db / --binlog-do-db
+//	preflightFKReferentialActions   M2 G9     FK referential-action capture WARN
 //
 // The historical failure shape this gate closes is the moved/narrowed
 // door: a preflight added at one chokepoint and not its siblings (the
@@ -17,7 +18,7 @@
 // drifted). Three assertions, all derived from the source rather than
 // promised:
 //
-//  1. the combined opener [preflightBinlogCDCOpen] calls ALL four
+//  1. the combined opener [preflightBinlogCDCOpen] calls ALL five
 //     preflights — dropping one from it un-gates every chokepoint at
 //     once, and this is the line that reddens;
 //  2. the three known chokepoints all call the combined opener — a
@@ -29,8 +30,10 @@
 // WHAT THIS GATE REACHES, stated so the name cannot be read as broader
 // than the truth: functions in internal/engines/mysql and their calls
 // to the named preflight identifiers. It does NOT reach the VStream
-// lane (vtgate owns the row-event contract; no binlog preflights exist
-// there to roster) or the bulk-only backup-full openers (deliberately
+// lane (vtgate owns the row-event contract; the one preflight whose
+// class DOES span both lanes — the G9 FK-action WARN — has its own
+// cross-lane roster, TestFKReferentialActionWarnRoster_BothLanes) or
+// the bulk-only backup-full openers (deliberately
 // ungated — they never read the binlog; the chain's first incremental
 // runs StreamChanges and is gated there). A brand-new CDC-open path
 // that calls NO preflight at all is out of reach too — catching that
@@ -62,6 +65,7 @@ var cdcOpenPreflights = []string{
 	"preflightBinlogFormat",
 	"preflightReplicaSource",
 	"preflightBinlogDBFilter",
+	"preflightFKReferentialActions",
 }
 
 // knownChokepoints are the three binlog CDC-open sites. The walker must
