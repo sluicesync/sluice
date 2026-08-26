@@ -154,9 +154,11 @@ semantics. The pgtrigger twin cannot have this class (PG row triggers always fir
 Mitigations, in preference order: run every application connection that writes such a
 table with `PRAGMA recursive_triggers = ON` (the D then fires — proven, see the premise pin
 below), or write upserts as `INSERT ... ON CONFLICT DO UPDATE`, which never implicitly
-deletes. On `d1-trigger` the pragma remedy may not be settable per-connection through
-every client binding (UNMEASURED — D1's HTTP query API and Workers bindings manage their
-own connections), so prefer the `ON CONFLICT DO UPDATE` write shape there.
+deletes. On `d1-trigger` the pragma itself is on D1's pragma allowlist, but whether a
+`PRAGMA recursive_triggers = ON` PERSISTS across D1's stateless HTTP/Workers-bindings
+transport is UNMEASURED — each request may execute on a fresh connection the client
+binding manages, so a per-connection setting has no guaranteed lifetime there. Prefer
+the `ON CONFLICT DO UPDATE` write shape on D1.
 
 `trigger setup` WARNs per affected table (`warnReplaceCaptureBlindSpot`), and both halves
 of the environmental premise — no D with the pragma off, D with it on — are pinned against
