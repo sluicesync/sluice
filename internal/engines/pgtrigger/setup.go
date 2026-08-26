@@ -268,6 +268,15 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		)
 	}
 
+	// WARN (never refuse) when the source's writes can arrive under
+	// session_replication_role=replica — a logical-replication subscriber
+	// source or an all-sluice relay — which the plain capture triggers
+	// installed below do NOT fire for (audit 2026-08-26 F1; see
+	// preflight_replica_role.go for the shapes and why the ENABLE ALWAYS
+	// full fix is deferred to an ADR). Fires on dry-run too: the operator
+	// should see the risk while planning, not after installing.
+	warnReplicaRoleCaptureBlindness(ctx, db, opts.Schema)
+
 	// §14 per-table preflight: no-PK, UNLOGGED, generated columns,
 	// custom domain-over-UDT. Also loads each table's PK column list —
 	// renderSetupDDL bakes it into the capture trigger's TG_ARGV (N-16).

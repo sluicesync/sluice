@@ -319,6 +319,17 @@ only rows strictly below the target's durable applied watermark (see
 full operator walkthrough, including teardown, is in
 [sqlite-d1-import.md](sqlite-d1-import.md).
 
+## `postgres-trigger` sources: replica-role writes are not captured
+
+The `postgres-trigger` engine's capture triggers are plain `CREATE TRIGGER`, so Postgres fires them for **origin** writes only: any DML executed under `session_replication_role = 'replica'` bypasses them entirely. Two real configurations write under replica role, and on both the sync **exits 0 with rows silently missing from the target**:
+
+- **The source is itself a logical-replication subscriber.** A native `CREATE SUBSCRIPTION` apply worker runs under replica role, so every row a subscription applies to a subscribed table is invisible to the capture triggers. Only rows written directly on the source database are captured. This pairing is natural on exactly the managed tiers the trigger engine targets (slot-blocked databases that *receive* logical replication but cannot *serve* it), which is why it deserves this callout.
+- **The all-sluice relay (A→B→C).** sluice's own Postgres change applier sets `SET LOCAL session_replication_role = replica` on every apply transaction when the apply role is privileged (see [Foreign keys during CDC apply](#foreign-keys-during-cdc-apply)). So if database B is the target of an A→B sluice sync and simultaneously the `postgres-trigger` source of a B→C sync, the B→C capture sees **nothing** the A→B sync applies. The failure is shaped to pass testing: an unprivileged dev applier's rows *are* captured (the privilege probe fails and the bypass is skipped), while the privileged production applier's are not.
+
+`sluice trigger setup` and every stream open probe for both shapes — `pg_subscription` rows for the subscriber shape, sluice's own `sluice_cdc_state` apply bookkeeping for the relay shape — and emit a loud `SILENT-CAPTURE-GAP RISK` WARN naming the loss scenario. It is a WARN rather than a refusal because both shapes can be intentional and safe (a subscription feeding tables outside the replication set; a decommissioned relay's leftover control table). If the WARN fires on your topology, sync from the origin database directly, keep subscribed tables out of the replication set, or stop the upstream sync before trusting the capture.
+
+sluice deliberately does **not** install `ENABLE ALWAYS` triggers (which would fire under replica role too): on relay and bidirectional topologies they would also capture sluice's own applied rows — an echo loop. That full fix needs its own ADR (echo suppression / origin tagging) and is tracked separately.
+
 ## Re-copying onto a target that already holds data
 
 `sync start --restart-from-scratch` and the automatic re-snapshot (which fires

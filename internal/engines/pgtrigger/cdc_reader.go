@@ -132,6 +132,13 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 		_ = db.Close()
 		return nil, err
 	}
+	// WARN (never refuse) on the replica-role capture-blindness shapes —
+	// a subscriber source or an all-sluice relay writes rows the plain
+	// capture triggers cannot see (audit 2026-08-26 F1; the full
+	// ENABLE ALWAYS fix needs an ADR). Fires here so BOTH stream-open
+	// paths get it: OpenCDCReader and OpenSnapshotStream construct the
+	// poller through this function.
+	warnReplicaRoleCaptureBlindness(ctx, db, cfg.schema)
 	return &CDCReader{
 		db:           db,
 		schema:       cfg.schema,
