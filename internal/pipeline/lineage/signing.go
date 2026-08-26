@@ -669,6 +669,15 @@ func ChainSignatureScheme(ctx context.Context, store irbackup.Store) (scheme str
 	return effectiveManifestScheme(sig.CanonVersion, sig.Scheme), true, nil
 }
 
+// ReadLineageSig reads and decodes lineage.json.sig. present is false
+// (nil error) when the object is absent. Exported for the maintenance
+// heal's wrong-key guard (audit 2026-08-26 SEC-1): the recorded KeyID is
+// the independent expected value the heal compares the supplied key's
+// fingerprint against before it will re-sign anything.
+func ReadLineageSig(ctx context.Context, store irbackup.Store) (sig *irbackup.ManifestSignature, present bool, err error) {
+	return readLineageSig(ctx, store)
+}
+
 // readLineageSig reads and decodes lineage.json.sig. present is false
 // (nil error) when the object is absent.
 func readLineageSig(ctx context.Context, store irbackup.Store) (sig *irbackup.ManifestSignature, present bool, err error) {

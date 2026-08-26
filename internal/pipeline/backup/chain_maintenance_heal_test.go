@@ -24,6 +24,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // sigCountingStore wraps a Store and counts Puts of detached `.sig`
@@ -273,5 +274,98 @@ func TestMaintenanceNoOp_HealBoundaries(t *testing.T) {
 			t.Fatalf("no-op prune of a HEALTHY signed chain wrote %d .sig object(s); want 0 (the heal must verify before it re-signs)", cs.sigPuts)
 		}
 		requireLineageHealed(t, store, env, signer)
+	})
+}
+
+// wrongKeySigner builds a signing-capable HMAC-off-KEK signer from a KEK
+// that is NOT buildSignedChain's — the "mistyped --encrypt passphrase"
+// shape. A different KEK derives a different manifest-HMAC key, so its
+// KeyID fingerprint differs from the chain's recorded one.
+func wrongKeySigner(t *testing.T) *lineage.Signer {
+	t.Helper()
+	kek := make([]byte, crypto.KEKLen)
+	for i := range kek {
+		kek[i] = 0xa7 // buildSignedChain uses 0x5a
+	}
+	return mustSigner(t, sigFakeEnv{kek: kek})
+}
+
+// requireWrongKeyHealRefusal asserts the SEC-1 refusal shape: a loud,
+// coded error naming the key mismatch — never a silent re-sign.
+func requireWrongKeyHealRefusal(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("no-op maintenance with the WRONG key succeeded; want the wrong-key heal refusal (a silent success here is exactly the SEC-1 re-key footgun)")
+	}
+	if !strings.Contains(err.Error(), "not this chain's signing key") {
+		t.Fatalf("refusal does not name the key mismatch: %v", err)
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeBackupEncryptionMismatch {
+		t.Fatalf("want %s coded refusal; got %v", sluicecode.CodeBackupEncryptionMismatch, err)
+	}
+}
+
+// TestMaintenanceNoOp_HealRefusesWrongKey is the SEC-1 cell the heal test
+// family lacked (audit 2026-08-26): the heal must distinguish
+// crash-stale-same-key (recorded KeyID == supplied KeyID → heals; pinned
+// by TestMaintenanceNoOp_HealsStaleLineageSignatures above) from
+// wrong-key (fingerprints differ → refuses, zero .sig writes). Pre-fix, a
+// mistyped --encrypt passphrase on a no-op compact of a healthy signed
+// chain silently re-keyed every .sig at exit 0, after which the chain
+// reported SIGNATURE-INVALID under the CORRECT passphrase.
+//
+// The guard lives in healStaleLineageSignatures itself — the single
+// chokepoint every no-op door (compact ×2 via compactNoOpReturn, prune ×2
+// via pruneNoOpReturn) funnels through — so one door per maintenance verb
+// exercises every door's path through the guard.
+func TestMaintenanceNoOp_HealRefusesWrongKey(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("compact no-op, healthy chain: refuses, zero .sig writes, chain intact under the correct key", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		correct := mustSigner(t, env)
+
+		cs := &sigCountingStore{Store: store}
+		_, err := CompactChain(ctx, cs, CompactOpts{MergeWindow: time.Hour, Signer: wrongKeySigner(t)})
+		requireWrongKeyHealRefusal(t, err)
+		if cs.sigPuts != 0 {
+			t.Fatalf("wrong-key run wrote %d .sig object(s); want 0 (the refusal must precede any re-sign)", cs.sigPuts)
+		}
+		requireLineageHealed(t, store, env, correct) // nothing was re-keyed
+	})
+
+	t.Run("prune no-op, healthy chain: refuses, zero .sig writes, chain intact under the correct key", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		correct := mustSigner(t, env)
+
+		cs := &sigCountingStore{Store: store}
+		_, err := PruneChain(ctx, cs, PruneOpts{KeepIncrementals: 5, Signer: wrongKeySigner(t)})
+		requireWrongKeyHealRefusal(t, err)
+		if cs.sigPuts != 0 {
+			t.Fatalf("wrong-key run wrote %d .sig object(s); want 0 (the refusal must precede any re-sign)", cs.sigPuts)
+		}
+		requireLineageHealed(t, store, env, correct)
+	})
+
+	t.Run("crash-stale chain + wrong key: still refuses (stale is not this key's to heal)", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		correct := mustSigner(t, env)
+		staleifyCatalog(t, store)
+		requireLineageSigStale(t, store, correct)
+
+		cs := &sigCountingStore{Store: store}
+		_, err := CompactChain(ctx, cs, CompactOpts{MergeWindow: time.Hour, Signer: wrongKeySigner(t)})
+		requireWrongKeyHealRefusal(t, err)
+		if cs.sigPuts != 0 {
+			t.Fatalf("wrong-key run wrote %d .sig object(s); want 0", cs.sigPuts)
+		}
+		// Still crash-stale — and still healable by the CORRECT key,
+		// exactly as the published remedy prescribes.
+		requireLineageSigStale(t, store, correct)
+		if _, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour, Signer: correct}); err != nil {
+			t.Fatalf("correct-key heal after the wrong-key refusal: %v", err)
+		}
+		requireLineageHealed(t, store, env, correct)
 	})
 }

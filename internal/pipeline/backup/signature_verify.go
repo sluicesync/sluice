@@ -35,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // verifyMaterial carries the ADR-0154 verify-key sources — the encryption
@@ -436,11 +437,17 @@ func resignIfSigned(ctx context.Context, store irbackup.Store, signed bool, sign
 //   - An unsigned chain → do nothing (nothing to heal).
 //   - A VERIFYING signature → do nothing (routine no-op maintenance on a
 //     healthy signed chain must not churn .sig objects).
-//   - Re-sign authority is key possession, exactly as on the restructure
-//     path: a compact/prune that DOES restructure already re-signs whatever
-//     the store contains without pre-verifying, so healing on the no-op path
-//     grants no authority the maintenance verb did not already have. The
-//     WARN names the key id so a heal that re-keyed a chain is visible.
+//   - A non-verifying signature recorded under a DIFFERENT key fingerprint
+//     than the supplied signer's → REFUSE loudly, never re-sign (audit
+//     2026-08-26 SEC-1). "Key possession authorizes the re-sign" is only
+//     true on the restructure path, whose pre-swap gate unwraps the chain
+//     CEK first and so validates the passphrase before any resign; the
+//     no-op doors return before any such gate. Without this guard, a
+//     mistyped --encrypt on a no-op run of a healthy signed chain would
+//     silently re-key every .sig at exit 0 — after which the chain reports
+//     SIGNATURE-INVALID under the CORRECT key. The recorded KeyID is the
+//     independent expected value that distinguishes crash-stale-same-key
+//     (heals) from wrong-key (refuses).
 //   - The heal re-signs; it does NOT sweep. A crash that also skipped the
 //     post-resign orphan sweep leaves uncatalogued files on disk — a
 //     disk-leak-only concern tracked separately (the compact orphan-GC
@@ -459,6 +466,34 @@ func healStaleLineageSignatures(ctx context.Context, store irbackup.Store, cat *
 	verr := lineage.VerifyLineage(ctx, store, cat, signer)
 	if verr == nil {
 		return nil
+	}
+	// Wrong-key guard (audit 2026-08-26 SEC-1): VerifyLineage fails for two
+	// very different reasons and only one of them is healable. Crash-stale
+	// (the catalog was restructured, the re-sign never ran) leaves the
+	// recorded signature made by the SAME key the operator supplies on the
+	// remedy re-run — the key does not change across a crash. Wrong-key (a
+	// mistyped --encrypt, another chain's key) records a DIFFERENT
+	// fingerprint, and re-signing under it would re-key the chain. Every
+	// signer kind records a KeyID in the detached signature (HMAC-off-KEK:
+	// the fingerprint of the derived HMAC key, so a different passphrase
+	// yields a different id; Ed25519: a hash of the public key; KMS: the
+	// adapter's key id). If either fingerprint is absent — an
+	// unknown/legacy writer, or the .sig vanished after the signed probe —
+	// same-key cannot be established and the heal fails CLOSED: refusing a
+	// heal is recoverable, re-keying a chain is not.
+	recordedSig, present, err := lineage.ReadLineageSig(ctx, store)
+	if err != nil {
+		return fmt.Errorf("%s: read recorded lineage signature for the heal's key check: %w", op, err)
+	}
+	recordedKeyID := ""
+	if present {
+		recordedKeyID = recordedSig.KeyID
+	}
+	if recordedKeyID == "" || signer.KeyID == "" || recordedKeyID != signer.KeyID {
+		return sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"re-run with the chain's signing key material, or use `backup verify` to inspect the chain's signatures",
+			fmt.Errorf("%s: the lineage signature does not verify AND was not recorded by the supplied key (recorded key_id %q, supplied key_id %q) — the supplied key is not this chain's signing key, so this is not the crash-stale state the no-op heal exists for; refusing to re-sign, because re-signing would silently re-key every signature and leave the chain SIGNATURE-INVALID under the correct key: %w",
+				op, recordedKeyID, signer.KeyID, verr))
 	}
 	slog.WarnContext(
 		ctx, op+": the lineage signature does not verify on a no-op maintenance run — re-signing the chain in place. This is the expected recovery for a maintenance run that crashed between its catalog commit and its re-sign; if this chain should NOT have needed healing, treat the signature failure below as suspect before trusting the restored signatures",
