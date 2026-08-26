@@ -179,10 +179,12 @@ jobs:
       # is sensitive to that image's vttablet/vtgate healthcheck timing — a
       # fresh image widened it enough to make
       # TestVitessReshard_RelaxSkewReshardMidStream deterministically red on the
-      # reopen's first Recv. That is now handled in-process by the item 72(b) fix
-      # (a narrow retriable carve-out in classifyReaderError for the transient
-      # "tablet is either down or nonexistent" NotFound), so the test rides out
-      # the window and is no longer quarantined (see the run step's count).
+      # reopen's first Recv. The item 72(b) fix (a narrow retriable carve-out in
+      # classifyReaderError + the reshard-reopen PRIMARY-pin) landed in v0.131.4
+      # and demonstrably works (run 32874285337: all retries hit the PRIMARY),
+      # but the fresh image widened the PRIMARY's healthcheck-settling window
+      # past the ride-out budget, so the test REMAINS QUARANTINED (see the run
+      # step's count + roadmap 72(b)) until the image window is fixed.
       - name: Pull the GHCR :latest mirror and retag as vitess/lite:latest
         env:
           GHCR_USER: ${{ github.actor }}

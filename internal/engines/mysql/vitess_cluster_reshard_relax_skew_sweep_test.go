@@ -906,8 +906,11 @@ func orderedNames(scenarios []sweepScenario) []string {
 	return out
 }
 
-// Roadmap item 72(b), FIXED (was skipReshardMidStreamPrimaryWindowQuarantine,
-// removed with the fix). GROUND TRUTH that motivated it (Extended-suites runs
+// Roadmap item 72(b): the sluice-side fix LANDED v0.131.4 and is unit-pinned,
+// but this stress test is RE-QUARANTINED (see the t.Skip in the test body) —
+// the fresh sluice-vitess:latest image widened the post-SwitchTraffic PRIMARY
+// settling window past the ride-out budget (an INFRA residual, not sluice).
+// GROUND TRUTH that motivated the fix (Extended-suites runs
 // 32633905540 / 32791797825, both fresh `ghcr.io/sluicesync/sluice-vitess:latest`):
 // the Streamer DOES follow the 1->2 reshard onto the new layout [-80 80-] (logs
 // `reopen=1`, reopenAfterReshard rebuilt the CDC stream against the new shards),
@@ -928,7 +931,8 @@ func orderedNames(scenarios []sweepScenario) []string {
 // reshard with slow primary-routability the stream dropped and needed a manual
 // restart. The +250ms toxiproxy latency on 80-'s replica plus the fresh base image
 // widened the window enough to make it deterministic here, which is why THIS test
-// carries the belt: it is the reproduction, un-quarantined.
+// carries the belt: it is the reproduction (currently quarantined per the note
+// in the test body — the image window outlasts the ride-out budget).
 //
 // THE FIX has two parts. (1) reader_errors.go isReshardPrimaryUnroutableError: a
 // narrow retriable carve-out in classifyReaderError for the transient "tablet ...
@@ -969,7 +973,8 @@ func TestVitessReshard_RelaxSkewReshardMidStream(t *testing.T) {
 	// reshard-follow reopen to PRIMARY ([buildReshardReopenRequest] — closing the
 	// sibling gap vs the cold-start path, which already pinned PRIMARY). A REAL
 	// reshard (new PRIMARY routable in ~1-2s) now reconnects within the
-	// 8-attempt/~24s budget. This STRESS test still fails, but for an INFRA
+	// in-process ride-out budget (maxReshardWindowRetries = 15, 1s-capped
+	// backoff). This STRESS test still fails, but for an INFRA
 	// reason: on the freshly-prebaked ghcr.io/sluicesync/sluice-vitess:latest the
 	// NEW shard's PRIMARY (uid 201) stays "down or nonexistent" for >24s
 	// post-SwitchTraffic — the image widened the vttablet/vtgate healthcheck

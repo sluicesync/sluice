@@ -14,7 +14,12 @@ Install both Go-based tools with `go install`:
 
 ```bash
 go install mvdan.cc/gofumpt@latest
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+# PINNED to match CI's Lint job (.github/workflows/ci.yml) — do NOT use @latest:
+# golangci-lint v2.13.0 hangs indefinitely in the package-load phase on this
+# repo (it ignores --timeout, which bounds only the lint phase), so a fresh
+# clone on @latest gets a hanging pre-commit hook. Bump deliberately, in
+# lockstep with the CI pin, once a fixed release is verified.
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 ```
 
 (Note the `/v2/` in the lint path — the project's `.golangci.yml` is v2-schema, and the un-suffixed module path silently installs v1, which rejects the config. CI installs it the same way.)
