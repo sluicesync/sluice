@@ -2366,17 +2366,35 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 // live), but a post-failover dead-Recv is the same silent-hang hazard, so
 // the guard stays. On timeout it records a loud error and cancels the gRPC
 // stream so the parked Recv unblocks.
-func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) {
+//
+// streamCancel is the cancel of THE STREAM THIS PUMP WAS LAUNCHED FOR,
+// captured by [launchCDCPump] at launch time — the same captured-per-stream
+// convention the COPY pumps and the standalone reader's watchdog callbacks
+// follow (copyPump / pumpOneTableCopy / pumpTable / vstreamCDCReader.pump all
+// close over their own stream's cancel). Reading the DYNAMIC s.grpcCancel at
+// fire time instead was the audit 2026-08-26 C-1 ordering race: a stale timer
+// fire racing a reshard reopen would cancel the freshly-installed stream, whose
+// pump then reads a Canceled Recv as a clean stop — with first-wins setErr and
+// the reopen's err-clear, a continuous sync could exit 0 mid-stream.
+func (s *vstreamSnapshotStream) pump(ctx context.Context, streamCancel context.CancelFunc, out chan<- ir.Change) {
 	defer close(out)
+
+	// Nil-safe wrapper: a unit-constructed stream may launch a pump with no
+	// grpcCancel installed; production launch sites always install one first.
+	cancelArmedStream := func() {
+		if streamCancel != nil {
+			streamCancel()
+		}
+	}
 
 	live := startVStreamLiveness(ctx, s.livenessWindow, s.progressWindow, s.idleWarnWindow,
 		func() {
 			s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
-			s.cancelGRPCStream()
+			cancelArmedStream()
 		},
 		func() {
 			s.setErr(vstreamProgressTimeoutError(s.progressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
-			s.cancelGRPCStream()
+			cancelArmedStream()
 		},
 		func() {
 			// SOFT idle-WARN (item 19(a)): heartbeats flowing but no change
@@ -2762,12 +2780,15 @@ func (s *vstreamSnapshotStream) Err() error {
 	return s.err
 }
 
-// cancelGRPCStream cancels the gRPC stream context so a parked Recv
-// unblocks, WITHOUT closing the connection. Used by the liveness watchdog
-// to tear down a dead/silent stream after recording its loud error.
-// Reads s.grpcCancel under mu (close also writes it) and invokes it
-// without niling — context.CancelFunc is idempotent, so a concurrent
-// close() calling it again is harmless.
+// cancelGRPCStream cancels the CURRENT gRPC stream context so a parked Recv
+// unblocks, WITHOUT closing the connection. Used by the reshard reopen paths
+// ([reopenAfterReshard], [reopenReshardWindow]) to tear down the stream being
+// replaced. Deliberately NOT used by the CDC pump's watchdog callbacks any
+// more: those cancel the per-stream cancel captured at launch, because the
+// dynamic read here can land on a stream installed AFTER the fire committed
+// (audit 2026-08-26 C-1). Reads s.grpcCancel under mu (close also writes it)
+// and invokes it without niling — context.CancelFunc is idempotent, so a
+// concurrent close() calling it again is harmless.
 func (s *vstreamSnapshotStream) cancelGRPCStream() {
 	s.mu.Lock()
 	cancel := s.grpcCancel
@@ -2821,18 +2842,25 @@ func (s *vstreamSnapshotStream) joinPumps() {
 // can cancel and join it. Deriving from ctx keeps caller cancellation
 // propagating exactly as before while giving close() a handle that also
 // unblocks a pump parked on a full out channel (send() selects on the pump's
-// ctx). Called by startPump and reopenAfterReshard; on the reshard path the
-// previous pump has already exited, so replacing the handles orphans nothing.
+// ctx). Called by startPump, reopenAfterReshard, and reopenReshardWindow; on
+// the reshard paths the previous pump has already exited, so replacing the
+// handles orphans nothing.
+//
+// The CURRENT s.grpcCancel is captured here — every launch site installs its
+// stream's cancel before calling this — and handed to the pump so its
+// watchdog callbacks cancel the stream they were armed for, never whatever
+// s.grpcCancel points at by fire time (audit 2026-08-26 C-1; see [pump]).
 func (s *vstreamSnapshotStream) launchCDCPump(ctx context.Context, out chan ir.Change) {
 	pumpCtx, pumpCancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	s.mu.Lock()
 	s.cdcPumpDone = done
 	s.cdcPumpCancel = pumpCancel
+	streamCancel := s.grpcCancel
 	s.mu.Unlock()
 	go func() {
 		defer close(done)
-		s.pump(pumpCtx, out)
+		s.pump(pumpCtx, streamCancel, out)
 	}()
 }
 

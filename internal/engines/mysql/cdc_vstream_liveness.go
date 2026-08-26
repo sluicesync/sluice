@@ -224,6 +224,13 @@ type vstreamLiveness struct {
 	// exit. A nil-safe sentinel: a disabled watchdog (phase1Window<=0)
 	// leaves events/done nil and observe/stop short-circuit.
 	done chan struct{}
+
+	// finished is closed by the watchdog goroutine as it exits; [stop] JOINS
+	// on it so a timer fire the goroutine has already committed to cannot run
+	// its callback after stop returns (audit 2026-08-26 C-1: a stale Phase-2
+	// fire racing a reshard reopen could otherwise cancel the FRESH reopened
+	// stream arbitrarily late). nil when the watchdog is disabled.
+	finished chan struct{}
 }
 
 // livenessTimer abstracts the watchdog goroutine's single timer so unit
@@ -292,7 +299,11 @@ func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Wind
 	// number of them, and the watchdog drains one per loop iteration.
 	l.events = make(chan bool, 1)
 	l.done = make(chan struct{})
-	go l.run(ctx, phase1Window, phase2Window, softWindow, onPhase1Timeout, onPhase2Timeout, onSoftIdle, newTimer)
+	l.finished = make(chan struct{})
+	go func() {
+		defer close(l.finished)
+		l.run(ctx, phase1Window, phase2Window, softWindow, onPhase1Timeout, onPhase2Timeout, onSoftIdle, newTimer)
+	}()
 	return l
 }
 
@@ -483,18 +494,28 @@ func (l *vstreamLiveness) observe(provesServing bool) {
 
 // stop tears the watchdog goroutine down on pump teardown so it exits
 // even if no timeout ever fired (the onTimeout path already ran, or the
-// pump is shutting down cleanly). Idempotent and safe to call on a
-// disabled watchdog.
+// pump is shutting down cleanly), and JOINS it — stop returns only after
+// the goroutine has exited, matching the pump-join convention every other
+// goroutine in this file's callers follows (joinPumps / joinCDCPump /
+// joinPump). The join is what closes the audit 2026-08-26 C-1 ordering
+// race: without it, a timer fire the goroutine had already committed to
+// could run its callback (setErr + stream cancel) arbitrarily AFTER the
+// pump exited — late enough to race a reshard reopen and cancel the fresh
+// stream. The callbacks never block on the pump (setErr/failCopy take mu
+// briefly; the cancels are context.CancelFuncs), so the join cannot
+// deadlock. Idempotent and safe to call on a disabled watchdog.
 func (l *vstreamLiveness) stop() {
 	if l.done == nil {
 		return // disabled watchdog
 	}
 	select {
 	case <-l.done:
-		// Already stopped.
+		// Already stopped; still join below (a prior stop may be racing the
+		// goroutine's exit, and every stop must uphold the joined contract).
 	default:
 		close(l.done)
 	}
+	<-l.finished
 }
 
 // vstreamLivenessTimeoutError builds the loud, actionable error the
