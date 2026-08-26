@@ -282,6 +282,135 @@ func TestStreamer_SchemaForward_AlterType_Cross_MySQLToPG(t *testing.T) {
 	}
 }
 
+// TestStreamer_SchemaForward_AlterType_TypmodOnly_PG pins the G3 typmod
+// half of the table-rewrite class (capture-completeness sweep 2026-08-26)
+// end-to-end, and specifically the CONVERGENCE claim: a typmod-only
+// `ALTER COLUMN TYPE numeric(10,4) → numeric(10,1)` REWRITES every stored
+// source value (12.3456 → 12.3, 99.9999 → 100.0 — PG's deterministic
+// round-half-up cast) while logically decoding ZERO messages for the
+// rewrite; the post-rewrite RelationMessage's new typmod is the only wire
+// artifact. Under the ADR-0091 forward default the boundary must forward
+// the same USING-less ALTER to the target, whose own rewrite applies the
+// IDENTICAL deterministic cast to equal inputs — so the pre-rewrite
+// target rows CONVERGE with the source's rewritten values. This is the
+// one shape where forwarding genuinely heals the rewrite blindness; the
+// same-type same-typmod `USING <expr>` sibling has no wire artifact at
+// all and stays a documented gap (matrix + ADR-0091).
+//
+// Uses the same prime-then-mutate pattern as the tests above (ALTER TYPE
+// is seed-guarded at the first post-cold-start boundary, ADR-0091 §5b).
+func TestStreamer_SchemaForward_AlterType_TypmodOnly_PG(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE ledger (
+			id INT PRIMARY KEY,
+			amt NUMERIC(10,4)
+		);
+		ALTER TABLE ledger REPLICA IDENTITY FULL;
+		INSERT INTO ledger (id, amt) VALUES (1, 12.3456), (2, 99.9999);
+	`)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	streamer := &Streamer{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "test-fwd-altertype-typmod-pg",
+	}
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	if !waitForPGRowCount(t, targetDSN, "ledger", 2, 30*time.Second) {
+		t.Fatalf("phase A: bulk-copy never landed seed rows")
+	}
+
+	tgtDB, err := sql.Open("pgx", targetDSN)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+
+	// PRIME: flip seed→CDC (a mutating shape at the first boundary is
+	// seed-guarded; the ADD COLUMN boundary is the standard unlock).
+	applyPGDDL(t, sourceDSN, `
+		ALTER TABLE ledger ADD COLUMN _prime_col INT;
+		INSERT INTO ledger (id, amt, _prime_col) VALUES (100, 1.0, 1);
+	`)
+	if !waitForPGColumn(t, tgtDB, "ledger", "_prime_col", true, 60*time.Second) {
+		t.Fatalf("prime: _prime_col never appeared on target — seed→CDC boundary not processed")
+	}
+
+	// The typmod-only shrink: same OID (numeric), new modifier. Every
+	// stored source value is rewritten (rounded) with zero decoded
+	// messages; the follow-on INSERT surfaces the new RelationMessage.
+	applyPGDDL(t, sourceDSN, `
+		ALTER TABLE ledger ALTER COLUMN amt TYPE NUMERIC(10,1);
+		INSERT INTO ledger (id, amt) VALUES (3, 5.5);
+	`)
+
+	if !waitForPGRowID(t, tgtDB, "ledger", 3, 60*time.Second) {
+		t.Fatalf("phase B: post-ALTER row never landed — typmod-only ALTER TYPE forwarding broken")
+	}
+
+	// The target column's declared scale must have followed the source's.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var precision, scale int
+		err := tgtDB.QueryRow(
+			`SELECT numeric_precision, numeric_scale FROM information_schema.columns
+			  WHERE table_name = 'ledger' AND column_name = 'amt'`,
+		).Scan(&precision, &scale)
+		if err == nil && precision == 10 && scale == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("target ledger.amt = numeric(%d,%d), err=%v; want numeric(10,1) — the typmod-only ALTER did not forward", precision, scale, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// CONVERGENCE: the pre-rewrite rows must hold the SAME post-cast
+	// values on both sides — the source's own rewrite and the target's
+	// forwarded rewrite applied the identical deterministic cast.
+	assertLedgerAmtText(t, tgtDB, map[int]string{1: "12.3", 2: "100.0", 3: "5.5"})
+
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// assertLedgerAmtText compares ledger.amt::text per id against want —
+// text form so the numeric scale (12.3, not 12.3000) is part of the
+// assertion.
+func assertLedgerAmtText(t *testing.T, db *sql.DB, want map[int]string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for id, wantText := range want {
+		var got string
+		if err := db.QueryRowContext(ctx, "SELECT amt::text FROM ledger WHERE id=$1", id).Scan(&got); err != nil {
+			t.Fatalf("scan amt id=%d: %v", id, err)
+		}
+		if got != wantText {
+			t.Errorf("ledger.amt for id=%d = %q; want %q (pre-rewrite target rows did not converge with the source's typmod rewrite)", id, got, wantText)
+		}
+	}
+}
+
 func assertPGCounter(t *testing.T, db *sql.DB, id int, want int64) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

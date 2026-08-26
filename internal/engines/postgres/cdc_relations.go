@@ -205,6 +205,35 @@ func classifyRelationChange(prev, current *relationCacheEntry) relationChange {
 					col.Name, col.OID, nc.OID, i),
 			}
 		}
+		// Same OID, different typmod IS an ALTER COLUMN TYPE (capture-
+		// completeness G3, 2026-08-26): numeric(10,4)→numeric(10,1),
+		// varchar(20)→varchar(10), timestamp(6)→timestamp(3), bit(8)→bit(4)
+		// all keep the OID and change only the modifier — and the shrink
+		// members REWRITE every stored value (numeric rounds, varchar
+		// refuses-or-truncates on cast) with ZERO decoded messages for the
+		// rewrite, because PG never logically decodes table-rewrite
+		// contents. The post-rewrite RelationMessage's new typmod is the
+		// ONLY wire artifact, so ignoring it classified the shape as None
+		// and bypassed every schema-change door: silent value divergence
+		// under refuse mode, and under forward mode the boundary still
+		// reached the intercept via the SchemaSignature delta but the
+		// reader-side refuse gate never fired. With this compare the shape
+		// rides the standard AlterColumnType policy: refuse loudly under
+		// --schema-changes=refuse, forward under the default (the
+		// forwarded USING-less ALTER applies the same deterministic cast
+		// the source's own USING-less rewrite did, so pre-rewrite target
+		// rows CONVERGE). A same-type ALTER whose typmod is also unchanged
+		// (`USING v*10`) stays undetectable — the wire is content-identical
+		// — and is documented as such in the capture-completeness matrix
+		// and ADR-0091. pgoutput reconnect re-sends carry identical
+		// typmods, so this cannot false-fire (pinned).
+		if col.TypeMod != nc.TypeMod {
+			return relationChange{
+				Kind: relationChangeAlterColumnType,
+				Description: fmt.Sprintf("ALTER COLUMN TYPE %s (type OID %d unchanged, typmod %d → %d, ordinal %d)",
+					col.Name, col.OID, col.TypeMod, nc.TypeMod, i),
+			}
+		}
 	}
 	// Existing columns identical; either no change or new columns
 	// appended (ADD COLUMN). Both pass.

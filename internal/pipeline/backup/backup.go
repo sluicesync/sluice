@@ -1122,12 +1122,16 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 // temporary-anchor shape so the adopted slot is never re-created — and
 // never dropped by this run's failure path.
 func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool, requestedReaders int) (snap *irbackup.Snapshot, implemented bool, err error) {
+	tables := migcore.TableNamesForPublication(schema)
 	opts := irbackup.SnapshotOptions{
 		SlotName:          b.SlotName,
 		PersistChainSlot:  persistChainSlot,
 		ReaderParallelism: requestedReaders,
+		// The post-filter sweep set, so engine-side scope-sensitive
+		// preflights (PG's --chain-slot UNLOGGED census, G2) honour the
+		// backup's table filter rather than refusing on an excluded table.
+		InScopeTables: tables,
 	}
-	tables := migcore.TableNamesForPublication(schema)
 	if len(tables) > 0 {
 		if scoped, ok := b.Source.(irbackup.TableScopedBackupSnapshotOpener); ok {
 			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, opts, tables)

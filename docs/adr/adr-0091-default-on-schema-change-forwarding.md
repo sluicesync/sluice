@@ -435,6 +435,40 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
   retryable after manual reconciliation.
 - **RENAME still needs the drained model** until F7b (PG) / forever
   (MySQL).
+- **Table-rewrite VALUE changes are never streamed (impl note,
+  capture-completeness G3, 2026-08-26).** PostgreSQL does not logically
+  decode the contents of an `ALTER COLUMN TYPE` table rewrite — the
+  rewritten rows produce ZERO pgoutput messages (observed on the wire).
+  What forwarding can and cannot do about that, by shape:
+  - *Typmod-only ALTER (e.g. `numeric(10,4)→(10,1)`, `varchar(n)`
+    shrink):* detected — `classifyRelationChange` compares
+    `TypeMod` as well as name/OID, so the shape rides this ADR's
+    standard door. Under `forward` (the default) the target receives
+    the same USING-less ALTER and its own rewrite applies the
+    identical deterministic cast, so pre-rewrite target rows
+    **converge** with the source's rewritten values (integration-pinned:
+    `TestStreamer_SchemaForward_AlterType_TypmodOnly_PG`). Under
+    `refuse` it refuses loudly — pre-fix, refuse mode had NO door for
+    this shape and diverged silently.
+  - *Same-type, same-typmod `ALTER … USING <expr>`:* **undetectable,
+    permanently** — the post-rewrite RelationMessage is byte-identical
+    to the pre-rewrite one and no catalog artifact survives; the source
+    values changed and nothing streams. Use the drained model for any
+    value-rewriting ALTER.
+  - *Cross-type ALTER with a value-changing `USING`:* detected and
+    forwarded, but §5's apply deliberately emits **no USING clause**,
+    so the target applies the default cast — a value-changing source
+    expression diverges on pre-existing rows. Same drained-model
+    guidance.
+  - *Temporal caveat:* the Bug 84/86 comparison lens collapses
+    timestamp/time `bare ≡ (0) ≡ (6)` into one class, so an ALTER
+    between those class members is refused under `refuse` (the reader
+    compares raw typmods) but NOT forwarded under `forward` (the
+    intercept's normalized diff sees no delta) — the documented
+    normalizer false-negative (`cdc_normalize.go`).
+  The `pg_class.relfilenode` rewrite-detection WARN (a rewrite
+  allocates a new relfilenode; so do VACUUM FULL/CLUSTER, hence WARN
+  not refuse) is a filed follow-up, not built.
 
 ### Neutral
 

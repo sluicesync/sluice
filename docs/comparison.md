@@ -113,7 +113,7 @@ For **measured initial-copy throughput head-to-heads**, see [`docs/comparison-pg
 
 ## Slot-less CDC for locked-down Postgres
 
-**Capability claim.** The `postgres-trigger` engine (`--source-driver=postgres-trigger`) captures changes via triggers + a change-log table instead of a logical-replication slot, so sluice can stream CDC from managed Postgres that doesn't grant `REPLICATION` or expose logical decoding (Heroku Postgres is the canonical case). `sluice trigger setup` installs the source-side state; `--allow-polled-fingerprint` covers DDL detection on a non-superuser role. See the slot-less recipe in [`docs/cookbook/`](cookbook/).
+**Capability claim.** The `postgres-trigger` engine (`--source-driver=postgres-trigger`) captures changes via triggers + a change-log table instead of a logical-replication slot, so sluice can stream CDC from managed Postgres that doesn't grant `REPLICATION` or expose logical decoding (Heroku Postgres is the canonical case). `sluice trigger setup` installs the source-side state; on a non-superuser role that cannot create event triggers, `--allow-polled-fingerprint` lets setup proceed WITHOUT DDL detection (the fingerprint loop is not yet implemented — apply schema changes with the drained model there; every sync start logs a `DDL-DETECTION-ABSENT` warning). See the slot-less recipe in [`docs/cookbook/`](cookbook/).
 
 **Why this matters.** Slot-based CDC is the default everywhere, but a whole tier of managed Postgres simply won't let a customer create a slot. Without a trigger fallback the answer is "you can't replicate continuously from that source" — exactly the gap operators hit on Heroku.
 

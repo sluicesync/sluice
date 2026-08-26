@@ -92,9 +92,16 @@ measured head-to-head, and the full
 [Managed Postgres (slot-less)](https://sluicesync.com/docs/managed-postgres-slotless/)
 guide for the complete setup → run → teardown walkthrough. On Heroku
 specifically, the connecting role can't `CREATE EVENT TRIGGER`, so
-opt into the polled schema-fingerprint fallback for DDL detection
-with `--allow-polled-fingerprint` (the command refuses loudly
-without it, so the weaker DDL-detection mode is an explicit choice):
+setup needs `--allow-polled-fingerprint` — but be clear about what
+that tier is: it has **no DDL detection at all** (the polled
+schema-fingerprint loop the flag is named for is not yet
+implemented). Any schema change on the source — `ALTER TABLE`,
+`DROP COLUMN`, a type change — is invisible to capture on this
+tier, so apply DDL with the drained model (`sluice sync stop
+--wait`, apply the change on source and target, re-run `sluice
+trigger setup`, then `sluice sync start`); every sync start logs a
+`DDL-DETECTION-ABSENT` warning as a reminder. The command refuses
+loudly without the flag, so running blind is an explicit choice:
 
 ```sh
 # Slot-less CDC sync on Heroku:

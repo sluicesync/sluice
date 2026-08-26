@@ -207,6 +207,16 @@ func (s *Streamer) coldStartMultiDatabase(
 		slog.Any("databases", selected),
 	)
 
+	// ---- 1.4. UNLOGGED-table census (G2): refuse BEFORE anything is
+	// created on either side — the spanning snapshot opener (step 3)
+	// creates the FOR ALL TABLES publication that silently excludes
+	// unlogged tables, and the per-database copy would include them, so
+	// each would freeze at its cold-copy snapshot forever at exit 0.
+	// Filter-aware (an --exclude-table'd unlogged table passes). ----
+	if err := s.preflightSpanningUnloggedTables(ctx, selected); err != nil {
+		return nil, stop, err
+	}
+
 	// ---- 1.5. A target that cannot namespace at all is refused before the
 	// spanning snapshot is taken (roadmap item 148, route 2 — the `migrate`
 	// sibling in runMultiDatabase). The `else` arm in
@@ -476,6 +486,16 @@ func (s *Streamer) warmResumeMultiDatabase(
 		slog.Any("databases", selected),
 		slog.String("position_token", persisted.Token),
 	)
+
+	// UNLOGGED-table census at the warm-resume open too (G2): `ALTER
+	// TABLE … SET UNLOGGED` succeeds mid-sync under the spanning FOR ALL
+	// TABLES publication and silently drops the table from it (observed
+	// on PG 16), so the cold-start census alone leaves every later open
+	// blind to the flip. A flip DURING a live window is still
+	// undetectable until this next open — the documented residual.
+	if err := s.preflightSpanningUnloggedTables(ctx, selected); err != nil {
+		return nil, stop, err
+	}
 
 	// Open the bare server-wide CDC reader (no snapshot, no copy).
 	cdc, err := opener.OpenServerCDCReader(ctx, s.SourceDSN)

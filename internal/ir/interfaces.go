@@ -2901,6 +2901,42 @@ type MultiDatabaseSnapshotOpener interface {
 	OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, databases []string) (*SnapshotStream, error)
 }
 
+// UnloggedCapturePreflighter is the OPTIONAL engine surface for the
+// spanning-sync UNLOGGED-table census (capture-completeness G2,
+// 2026-08-26). A Postgres FOR ALL TABLES publication — the shape a
+// multi-schema spanning sync must use, because a logical slot is
+// database-wide — SILENTLY EXCLUDES unlogged tables: no error, no
+// notice, the table simply never appears in pg_publication_tables.
+// The cold copy's census (information_schema BASE TABLE) INCLUDES
+// them, so without this preflight the target receives the table's
+// initial rows and then freezes at the snapshot forever while the
+// stream stays green — a pure silent divergence, permanent once later
+// logged transactions advance the resume position past the unlogged
+// writes' LSNs. (The single-schema scoped lane cannot reach this
+// state: `CREATE/ALTER PUBLICATION … FOR TABLE <unlogged>` is refused
+// by Postgres itself, and sluice codes that refusal in
+// ensurePublication.)
+//
+// The orchestrator calls this at BOTH spanning stream-open chokepoints
+// — cold start (before the spanning snapshot opens, so the refusal
+// lands before any slot/publication is created) and warm resume
+// (before the server-wide CDC reader opens, because `ALTER TABLE … SET
+// LOGGED→UNLOGGED` SUCCEEDS mid-sync under FOR ALL TABLES and silently
+// drops the table from the publication; observed on PG 16). A flip
+// DURING a live streaming window remains undetectable until the next
+// open — that residual is documented in
+// docs/dev/capture-completeness-matrix.md.
+//
+// allowed is the sync's effective table-scope predicate (the Bug 246
+// discipline: a table the operator already excluded via
+// --exclude-table must not trip the door). Implementations skip any
+// unlogged table for which allowed(schema, table) is false; a nil
+// allowed means everything is in scope. Engines without an
+// unlogged-table concept simply omit the surface.
+type UnloggedCapturePreflighter interface {
+	PreflightSpanningUnloggedTables(ctx context.Context, dsn string, schemas []string, allowed func(schema, table string) bool) error
+}
+
 // ServerCDCReaderOpener is the OPTIONAL engine surface for opening a
 // SERVER-WIDE CDC reader against a database-optional DSN — the
 // snapshot-less counterpart of [MultiDatabaseSnapshotOpener] that a

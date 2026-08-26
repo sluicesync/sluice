@@ -89,6 +89,30 @@ import (
 // filters are dropped and the emitted DDL is byte-identical to today
 // (silently-safe: the client-side evaluator remains the filter).
 func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string, excludeSlot string, filters map[string]string) error {
+	// UNLOGGED census over the explicit scope (capture-completeness G2,
+	// Door 3 — roster on refuseUnloggedTables): Postgres itself refuses
+	// `FOR TABLE <unlogged>` at CREATE/ALTER time, so this preflight can
+	// never refuse a configuration PG would have accepted — it only
+	// upgrades the raw server error to the coded, pre-DDL refusal that
+	// names the tables and the remedies. The caller's table list is the
+	// sync's POST-FILTER scope (Bug 13/ADR-0021), so an operator's
+	// --exclude-table is honoured by construction (Bug 246 discipline).
+	// The nil-tables arm is deliberately NOT censused here — see the
+	// roster's uncovered list (the CDC reader's warm-resume ensure
+	// reaches it, where an unscoped census could false-refuse).
+	if len(tables) > 0 {
+		census, err := unloggedTablesInSchemas(ctx, db, []string{schema}, tables)
+		if err != nil {
+			return err
+		}
+		if len(census) > 0 {
+			return refuseUnloggedTables(
+				"sync publication scope",
+				"Postgres refuses to add an unlogged table to a publication, so the stream cannot include them",
+				census,
+			)
+		}
+	}
 	var exists, allTables bool
 	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
 		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"

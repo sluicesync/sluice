@@ -225,6 +225,18 @@ type SnapshotOptions struct {
 	// nil/0 (and 1) preserve today's single-reader behaviour on every
 	// engine — the field is purely additive.
 	ReaderParallelism int
+
+	// InScopeTables is the backup's POST-FILTER table set (bare names) —
+	// what the orchestrator's sweep will actually read. Engines use it to
+	// scope preflights that must honour the operator's table filter
+	// (capture-completeness G2: Postgres's --chain-slot UNLOGGED-table
+	// census must not refuse a table the operator already excluded — the
+	// Bug 246 discipline). nil means "the whole schema is in scope",
+	// which is exactly the unfiltered default; engines without such
+	// preflights ignore the field. This is scope METADATA only — it does
+	// not restrict what the snapshot itself can read (that is
+	// [TableScopedBackupSnapshotOpener]'s job).
+	InScopeTables []string
 }
 
 // AnchorSweeper is the OPTIONAL engine surface the full-backup

@@ -16,6 +16,21 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
+// ensureChainSlotPublication is the --chain-slot publication step: the
+// G2 Door-4 UNLOGGED census first (capture-completeness 2026-08-26 —
+// rationale + door roster on [refuseUnloggedTables] /
+// [preflightChainSlotUnlogged]), then the FOR ALL TABLES ensure the
+// chain's incrementals decode through.
+func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, schema string, inScopeTables []string) error {
+	if err := preflightChainSlotUnlogged(ctx, db, schema, inScopeTables); err != nil {
+		return err
+	}
+	if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
+		return classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
+	}
+	return nil
+}
+
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary
 // slot is named with. Each call appends a Unix-nanosecond timestamp so
 // concurrent backups against the same source don't fight for the same
@@ -141,9 +156,9 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	// in the 2026-06-10 backup benchmark). FOR ALL TABLES matches the
 	// CDC reader's own no-scope ensure and is superset-safe.
 	if opts.PersistChainSlot {
-		if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
+		if err := e.ensureChainSlotPublication(ctx, db, cfg.schema, opts.InScopeTables); err != nil {
 			_ = db.Close()
-			return nil, classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
+			return nil, err
 		}
 	}
 

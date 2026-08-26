@@ -47,11 +47,19 @@ var (
 
 // pgtriggerSetupMode names the DDL-detection mode a `trigger setup` plan
 // landed in, shared by the stdout applied-line and the pretty summary panel.
+//
+// Claim-surface honesty (capture-completeness G1): the --allow-polled-
+// fingerprint tier's promised fingerprint loop is NOT yet implemented, so
+// that tier has NO DDL detection — the old "polled-fingerprint-only"
+// string described a loop that does not exist, and the default tier's
+// "polling" meant change-log polling but read like fingerprint polling.
+// Say what each tier actually does; the CDC open emits the matching
+// DDL-DETECTION-ABSENT warning on the polled tier.
 func pgtriggerSetupMode(plan *pgtrigger.Plan) string {
 	if !plan.EventTriggerSupported {
-		return "polled-fingerprint-only"
+		return "NONE (the polled-fingerprint loop is not yet implemented — source DDL is invisible to capture; re-run `sluice trigger setup` after any schema change)"
 	}
-	return "event-trigger + polling"
+	return "event trigger (change-log polling carries the data; DDL arrives as a loud refusal)"
 }
 
 // triggerDrivers is the set of trigger-CDC source engines the `sluice trigger`
@@ -96,7 +104,7 @@ type TriggerSetupCmd struct {
 	Schema       string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public'). Ignored for sqlite-trigger / d1-trigger (flat namespace)." placeholder:"NAME"`
 	DryRun       bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
 
-	AllowPolledFingerprint bool `help:"Opt in to the polled schema-fingerprint fallback (§7) on tiers that deny event-trigger creation. Default off: the engine refuses-loudly on such tiers so the operator explicitly acknowledges the weaker DDL-detection mode."`
+	AllowPolledFingerprint bool `help:"Opt in to installing WITHOUT DDL detection on tiers that deny event-trigger creation (Heroku Essential). The polled schema-fingerprint loop this flag is named for is NOT yet implemented, so on this tier ANY source schema change is invisible to capture — apply DDL with the drained model (sync stop --wait, apply on both sides, re-run trigger setup) and expect a DDL-DETECTION-ABSENT warning at every sync start. Default off: the engine refuses-loudly on such tiers so the absence of DDL detection is an explicit choice."`
 
 	CapturePayload string `help:"How much of each changed row the capture trigger writes to sluice_change_log (ADR-0068). 'full' (default) writes the full before- and after-image on every UPDATE — byte-identical to prior releases, keeps a full-before-image apply WHERE. 'changed' trims the UPDATE after-image to PK + changed columns while keeping the full before-image (so the apply WHERE still does optimistic divergence detection). 'minimal' also trims the before-image to the PK, so the apply WHERE becomes a PK match (last-write-wins; safe for one-way CDC with no concurrent target writers) — reaches toward ~2x source-write overhead. INSERT is unchanged in all modes." enum:"full,changed,minimal" default:"full"`
 }

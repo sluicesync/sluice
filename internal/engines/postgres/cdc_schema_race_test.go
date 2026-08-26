@@ -342,6 +342,112 @@ func TestCheckSchemaRace_ForwardMode(t *testing.T) {
 	})
 }
 
+// TestClassifyRelationChange_TypmodFamilies pins the G3 typmod half of
+// the table-rewrite class (capture-completeness sweep 2026-08-26): a
+// same-OID RelationMessage whose only delta is the type MODIFIER is an
+// ALTER COLUMN TYPE — the shrink members rewrite every stored value
+// (numeric(10,4)→(10,1) ROUNDS; observed on the wire with zero decoded
+// messages for the rewrite) and the new typmod is the only artifact
+// sluice ever sees. Per the Bug 74 discipline the pin covers EVERY
+// typmod-carrying family the OID mapper decodes — numeric(p,s),
+// varchar(n), timestamp(p) (temporal), bit(n) — × {shrink, widen,
+// identical}, not one representative: each family has its own typmod
+// ENCODING (numeric packs (p<<16|s)+4, varchar stores n+4, temporal and
+// bit store the raw value), so a green pin on one encoding proves
+// nothing about the others.
+//
+// Both directions are pinned: shrink AND widen classify (widen is
+// catalog-only on the source — no rewrite — but forwarding it keeps the
+// target's declared type converged, and refuse-mode operators asked for
+// loud-on-any-DDL), while an IDENTICAL re-send (pgoutput reconnect /
+// first-touch) must stay None — the no-false-fire floor.
+func TestClassifyRelationChange_TypmodFamilies(t *testing.T) {
+	// Per-family typmod encodings, spelled out rather than helper-derived
+	// so a bug in the production decode helpers cannot leak into the pin.
+	numericTM := func(p, s int32) int32 { return ((p << 16) | s) + 4 } // numeric(p,s)
+	varcharTM := func(n int32) int32 { return n + 4 }                  // varchar(n)
+
+	families := []struct {
+		name              string
+		oid               uint32
+		from, to, widened int32
+	}{
+		{"numeric(p,s) scale shrink", 1700, numericTM(10, 4), numericTM(10, 1), numericTM(12, 6)},
+		{"varchar(n) shrink", 1043, varcharTM(20), varcharTM(10), varcharTM(40)},
+		{"timestamp(p) precision shrink", 1114, 6, 3, -1},
+		{"bit(n) shrink", 1560, 8, 4, 16},
+	}
+
+	entry := func(oid uint32, tm int32) *relationCacheEntry {
+		return &relationCacheEntry{
+			Schema: "public", Name: "t",
+			Columns: []relationColumn{
+				{Name: "id", OID: 23},
+				{Name: "v", OID: oid, TypeMod: tm},
+			},
+		}
+	}
+
+	for _, f := range families {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			shrink := classifyRelationChange(entry(f.oid, f.from), entry(f.oid, f.to))
+			if shrink.Kind != relationChangeAlterColumnType {
+				t.Errorf("shrink typmod %d → %d classified %v; want AlterColumnType — the value-rewriting shape would bypass every schema-change door",
+					f.from, f.to, shrink.Kind)
+			}
+			if shrink.Kind == relationChangeAlterColumnType && !strings.Contains(shrink.Description, "typmod") {
+				t.Errorf("shrink description %q does not name the typmod delta", shrink.Description)
+			}
+			widen := classifyRelationChange(entry(f.oid, f.from), entry(f.oid, f.widened))
+			if widen.Kind != relationChangeAlterColumnType {
+				t.Errorf("widen typmod %d → %d classified %v; want AlterColumnType", f.from, f.widened, widen.Kind)
+			}
+			resend := classifyRelationChange(entry(f.oid, f.from), entry(f.oid, f.from))
+			if resend.Kind != relationChangeNone {
+				t.Errorf("identical typmod re-send classified %v; want None (pgoutput reconnect must not false-fire)", resend.Kind)
+			}
+		})
+	}
+}
+
+// TestCheckSchemaRace_TypmodOnlyChange pins the G3 shape at the policy
+// layer, both modes: refuse mode refuses loudly (the door the typmod
+// blindness bypassed), forward mode passes the reader gate so the
+// boundary reaches the ADR-0091 forward intercept (which applies the
+// same USING-less ALTER on the target — convergence pinned end-to-end by
+// TestStreamer_SchemaForward_AlterType_TypmodOnly_PG).
+func TestCheckSchemaRace_TypmodOnlyChange(t *testing.T) {
+	prev := &relationCacheEntry{
+		Schema: "public", Name: "n",
+		Columns: []relationColumn{
+			{Name: "id", OID: 23},
+			{Name: "amt", OID: 1700, TypeMod: ((10 << 16) | 4) + 4}, // numeric(10,4)
+		},
+	}
+	curr := &relationCacheEntry{
+		Schema: "public", Name: "n",
+		Columns: []relationColumn{
+			{Name: "id", OID: 23},
+			{Name: "amt", OID: 1700, TypeMod: ((10 << 16) | 1) + 4}, // numeric(10,1)
+		},
+	}
+	relations := map[uint32]*relationCacheEntry{16400: prev}
+
+	err := checkSchemaRace(relations, 16400, curr, false)
+	if err == nil {
+		t.Fatal("typmod-only ALTER must refuse under --schema-changes=refuse (it rewrote every stored value on the source)")
+	}
+	for _, want := range []string{"ALTER COLUMN TYPE amt", "typmod", "sync stop --wait"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q; got: %v", want, err)
+		}
+	}
+	if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+		t.Errorf("typmod-only ALTER must pass the reader gate under forward mode (the intercept forwards it); got: %v", err)
+	}
+}
+
 // _ ensures the ir import stays meaningful in this file even if a
 // future cleanup removes the only consumer.
 var _ ir.Type = (ir.Integer{})

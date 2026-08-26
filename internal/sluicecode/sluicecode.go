@@ -124,6 +124,17 @@ const (
 	// while pgoutput emits nothing for its tables).
 	CodeCDCPublicationScopeConflict Code = "SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT"
 
+	// Capture-completeness G2 (2026-08-26): a Postgres CDC scope includes
+	// an UNLOGGED table. Unlogged writes produce no WAL, so no logical
+	// replication shape can ever stream them — and the two publication
+	// forms fail differently: FOR TABLE is refused by Postgres itself
+	// (this code makes that refusal coded and pre-DDL), while FOR ALL
+	// TABLES (the multi-schema spanning sync and backup full --chain-slot
+	// shape) SILENTLY EXCLUDES the table with no error, so the cold copy
+	// (or full backup) would carry its rows and the stream (or chain)
+	// would freeze it at the snapshot forever, at exit 0.
+	CodeCDCUnloggedTable Code = "SLUICE-E-CDC-UNLOGGED-TABLE"
+
 	// audit 2026-07-23 D0-9: an operator-supplied --publication-name
 	// outside [a-z0-9_] / over 63 bytes is refused at resolve time —
 	// sluice's quoted CREATE PUBLICATION preserves case while
@@ -532,6 +543,7 @@ var registry = map[Code]Info{
 
 	CodeCDCPublicationScopeConflict: {ClassRefusal, "cold start refused: rescoping the Postgres publication would REMOVE tables another sluice replication slot (active or inactive) holds a claim on, silently de-scoping that stream — give each stream its own --publication-name, drain the other stream first, or drop its slot if the stream is truly abandoned"},
 	CodeCDCReplicationHeadroom:      {ClassRefusal, "cold start refused: the source has no replication headroom for this stream's new slot/WAL sender (max_replication_slots or max_wal_senders exhausted) — free a leftover slot (`sluice slot list`, `sync decommission`, `slot drop`) or raise the ceiling; warm resume reuses its existing slot and never trips this"},
+	CodeCDCUnloggedTable:            {ClassRefusal, "a Postgres CDC scope includes an UNLOGGED table, whose writes produce no WAL and can never be streamed — under a FOR ALL TABLES publication (multi-schema spanning sync, backup full --chain-slot) Postgres would silently exclude it while the cold copy/full backup includes it, freezing the table at the snapshot forever at exit 0; exclude it via --exclude-table or convert it with ALTER TABLE … SET LOGGED"},
 	CodeCDCPublicationNameInvalid:   {ClassRefusal, "sync start refused: the --publication-name is not a safe Postgres replication identifier ([a-z0-9_], max 63 bytes) — CREATE PUBLICATION preserves a quoted mixed-case/over-length spelling while START_REPLICATION downcases (and CREATE truncates) it, so the stream would create one publication and stream from another: green through the whole bulk copy, then 42704 at the first change (or silently idle); use lowercase [a-z0-9_]"},
 
 	CodeCDCChangeLogIDReuse:             {ClassRefusal, "the sqlite-trigger / d1-trigger change log can allocate an id at or below the stream's resume watermark — the id column is not AUTOINCREMENT, or sqlite_sequence was lowered — under which a captured change is never emitted by the `id > watermark` poll"},

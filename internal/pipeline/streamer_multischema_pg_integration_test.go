@@ -38,6 +38,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -674,4 +676,103 @@ func dropSluiceSlots(t *testing.T, dsn string) int {
 		}
 	}
 	return len(names)
+}
+
+// TestStreamer_MultiSchema_UnloggedTableRefused is the end-to-end pin for
+// the G2 census (capture-completeness sweep 2026-08-26): a multi-schema
+// spanning sync whose scope contains an UNLOGGED table must refuse with
+// the coded SLUICE-E-CDC-UNLOGGED-TABLE error BEFORE anything is created
+// on either side — the spanning FOR ALL TABLES publication would silently
+// exclude the table while the cold copy includes it, freezing it at the
+// snapshot forever at exit 0 (observed end-to-end on PG 16 by the sweep).
+// The second half pins the Bug 246 direction: excluding the table via the
+// table filter clears the door and the sync cold-starts normally.
+func TestStreamer_MultiSchema_UnloggedTableRefused(t *testing.T) {
+	pgSource, pgTarget, cleanup := startPostgresLogicalMultiSchema(t)
+	defer cleanup()
+
+	applyPGDDL(t, pgSource, `
+		CREATE SCHEMA sales;
+		CREATE SCHEMA billing;
+		CREATE TABLE sales.widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		CREATE UNLOGGED TABLE billing.u_scratch (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		INSERT INTO sales.widgets (id, name) VALUES (1, 'a-one');
+		INSERT INTO billing.u_scratch (id, name) VALUES (1, 'ephemeral');
+	`)
+
+	pgEng, _ := engines.Get("postgres")
+
+	t.Run("in-scope unlogged table refuses, coded, before any source object exists", func(t *testing.T) {
+		s := &Streamer{
+			Source:         pgEng,
+			Target:         pgEng,
+			SourceDSN:      pgSource,
+			TargetDSN:      pgTarget,
+			StreamID:       "multischema-unlogged-refuse",
+			DatabaseFilter: DatabaseFilter{Include: []string{"sales", "billing"}},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		err := s.Run(ctx)
+		if err == nil {
+			t.Fatal("spanning sync over an unlogged table returned nil; want the coded refusal")
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCDCUnloggedTable {
+			t.Fatalf("want %s; got coded=%v err=%v", sluicecode.CodeCDCUnloggedTable, ok, err)
+		}
+		if !strings.Contains(err.Error(), "billing.u_scratch") {
+			t.Errorf("refusal does not name billing.u_scratch: %v", err)
+		}
+		// Pre-creation: no publication and no slot may exist on the source.
+		srcDB, err2 := sql.Open("pgx", pgSource)
+		if err2 != nil {
+			t.Fatalf("open source: %v", err2)
+		}
+		defer func() { _ = srcDB.Close() }()
+		var pubs, slots int
+		if err := srcDB.QueryRowContext(ctx, "SELECT count(*) FROM pg_publication WHERE pubname LIKE 'sluice%'").Scan(&pubs); err != nil {
+			t.Fatalf("count publications: %v", err)
+		}
+		if err := srcDB.QueryRowContext(ctx, "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'sluice%'").Scan(&slots); err != nil {
+			t.Fatalf("count slots: %v", err)
+		}
+		if pubs != 0 || slots != 0 {
+			t.Errorf("refusal left source objects behind (publications=%d slots=%d); the census must fire before anything is created", pubs, slots)
+		}
+	})
+
+	t.Run("excluding the unlogged table clears the door (Bug 246)", func(t *testing.T) {
+		filter, err := migcore.NewTableFilter(nil, []string{"u_scratch"})
+		if err != nil {
+			t.Fatalf("NewTableFilter: %v", err)
+		}
+		s := &Streamer{
+			Source:         pgEng,
+			Target:         pgEng,
+			SourceDSN:      pgSource,
+			TargetDSN:      pgTarget,
+			StreamID:       "multischema-unlogged-excluded",
+			DatabaseFilter: DatabaseFilter{Include: []string{"sales", "billing"}},
+			Filter:         filter,
+		}
+		streamCtx, streamCancel := context.WithCancel(context.Background())
+		runErr := make(chan error, 1)
+		go func() { runErr <- s.Run(streamCtx) }()
+
+		if !waitForPGSchemaCount(t, pgTarget, "sales", "widgets", 1, 60*time.Second) {
+			streamCancel()
+			<-runErr
+			t.Fatal("cold start with the unlogged table excluded never copied sales.widgets — the census refused a table the operator excluded")
+		}
+		streamCancel()
+		select {
+		case <-runErr:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Streamer.Run did not return after cancel")
+		}
+		if n := dropSluiceSlots(t, pgSource); n == 0 {
+			t.Log("no sluice slots left to drop (already released)")
+		}
+	})
 }

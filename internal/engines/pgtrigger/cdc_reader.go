@@ -148,6 +148,11 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// paths get it: OpenCDCReader and OpenSnapshotStream construct the
 	// poller through this function.
 	warnReplicaRoleCaptureBlindness(ctx, db, cfg.schema)
+	// WARN (never refuse) when the install is on the polled-fingerprint
+	// tier, whose promised DDL-detection loop was never implemented —
+	// source DDL is invisible to capture there (capture-completeness G1;
+	// same both-open-paths chokepoint rationale as the F1 WARN above).
+	warnDDLDetectionAbsent(ctx, db, cfg.schema)
 	return &CDCReader{
 		db:           db,
 		schema:       cfg.schema,

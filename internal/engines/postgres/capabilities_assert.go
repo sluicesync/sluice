@@ -47,6 +47,7 @@ var (
 	_ ir.SourceHostAdvisor              = Engine{}
 	_ ir.TargetConnectionBudgetProber   = Engine{}
 	_ ir.TargetStaleBackendReaper       = Engine{}
+	_ ir.UnloggedCapturePreflighter     = Engine{}
 
 	// SchemaReader optional surfaces.
 	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)

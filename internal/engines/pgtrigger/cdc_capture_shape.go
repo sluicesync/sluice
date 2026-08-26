@@ -16,9 +16,10 @@ import (
 // than the door CLASS. The defect it closes: a `DROP TRIGGER sluice_capture`
 // (or DISABLE TRIGGER, or a rewire to a foreign function) is invisible to
 // both of the engine's drift tiers — the event-trigger tag filter only
-// watches ALTER/CREATE/DROP TABLE + INDEX, and the polled column fingerprint
-// only watches columns — so every subsequent DML on that table is silently
-// uncaptured at exit 0. `DROP EVENT TRIGGER sluice_capture_ddl_trg`
+// watches ALTER/CREATE/DROP TABLE + INDEX, and the polled-fingerprint tier
+// watches NOTHING (its loop was never implemented — see
+// preflight_ddl_detection.go, capture-completeness G1) — so every subsequent
+// DML on that table is silently uncaptured at exit 0. `DROP EVENT TRIGGER sluice_capture_ddl_trg`
 // compounds it by also blinding the DDL tier itself. This door refuses
 // loudly at stream open, before any data moves, with a `sluice trigger
 // setup` re-run as the remedy.
