@@ -64,8 +64,15 @@ const captureGapRiskMarker = "SILENT-CAPTURE-GAP RISK"
 // [Engine.OpenCDCReader] (warm resume) and [Engine.OpenSnapshotStream]
 // (cold start) construct the poller through it.
 func warnReplicaRoleCaptureBlindness(ctx context.Context, db *sql.DB, schema string) {
-	warnLogicalSubscriberShape(ctx, db)
-	warnSluiceRelayShape(ctx, db, schema)
+	// Bounded so a WARN-only detector can never wedge the open it exists
+	// to protect: the relay probe reads a USER table a queued ACCESS
+	// EXCLUSIVE can park indefinitely (audit 2026-08-27 A5; rationale on
+	// [openProbeTimeout]). On expiry each probe's error arm fires its
+	// "cannot rule the risk out" WARN — the degrade, not a silent skip.
+	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	warnLogicalSubscriberShape(pctx, db)
+	warnSluiceRelayShape(pctx, db, schema)
 }
 
 // warnLogicalSubscriberShape WARNs when the current database has

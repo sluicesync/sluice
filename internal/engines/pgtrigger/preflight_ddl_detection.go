@@ -51,7 +51,12 @@ const ddlDetectionAbsentMarker = "DDL-DETECTION-ABSENT"
 // CLI's mode string now reports "NONE" for this tier, so the operator
 // hears it at install time too.
 func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
-	ddlFnPresent, _, err := loadDDLCaptureState(ctx, db, schema)
+	// Bounded (audit 2026-08-27 A5; rationale on [openProbeTimeout]): on
+	// expiry the error arm below fires the "could not rule it out" WARN —
+	// the degrade, not a silent skip.
+	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	ddlFnPresent, _, err := loadDDLCaptureState(pctx, db, schema)
 	if err != nil {
 		slog.WarnContext(ctx,
 			"pgtrigger: "+ddlDetectionAbsentMarker+": cannot read the DDL capture state to establish whether this install has DDL detection; "+

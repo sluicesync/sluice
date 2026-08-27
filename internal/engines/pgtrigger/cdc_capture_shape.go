@@ -83,19 +83,39 @@ type eventTriggerState struct {
 }
 
 // verifyCaptureTriggerShape is the door's entry point: load the installed
-// state, grade it. Fail-closed on any catalog read error.
+// state, grade it. Fail-closed on any catalog read error — including a
+// probe TIMEOUT (audit 2026-08-27 A5; rationale on [openProbeTimeout]): a
+// hung shape check must not silently pass, so an expired probe deadline
+// refuses with its own message rather than degrading to a WARN the way
+// the two WARN-only probes do.
 func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string) error {
-	installed, err := loadInstalledCaptureTriggers(ctx, db, schema)
+	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	installed, err := loadInstalledCaptureTriggers(pctx, db, schema)
 	if err != nil {
-		return fmt.Errorf("pgtrigger: cannot read the installed capture triggers (%w); "+
-			"refusing to stream without verifying the capture shape", err)
+		return captureShapeProbeError(ctx, pctx, "installed capture triggers", err)
 	}
-	ddlFnPresent, evt, err := loadDDLCaptureState(ctx, db, schema)
+	ddlFnPresent, evt, err := loadDDLCaptureState(pctx, db, schema)
 	if err != nil {
-		return fmt.Errorf("pgtrigger: cannot read the DDL capture event-trigger state (%w); "+
-			"refusing to stream without verifying the capture shape", err)
+		return captureShapeProbeError(ctx, pctx, "DDL capture event-trigger state", err)
 	}
 	return gradeCaptureShape(schema, installed, ddlFnPresent, evt)
+}
+
+// captureShapeProbeError shapes the door's fail-closed refusal for a
+// probe error, distinguishing the probe deadline expiring (pctx dead,
+// caller ctx alive — the driver may surface that as a wrapped ctx error
+// OR as PG's 57014 cancel, so the ctx states are the reliable signal)
+// from an ordinary read failure or a caller-side cancellation.
+func captureShapeProbeError(ctx, pctx context.Context, what string, err error) error {
+	if pctx.Err() != nil && ctx.Err() == nil {
+		return fmt.Errorf("pgtrigger: reading the %s timed out after %s (%w) — the source may be wedged behind a "+
+			"queued lock or a dead connection; a hung shape check must NOT silently pass, so this open refuses rather "+
+			"than streaming with an unverified capture shape. Clear the blocking and re-run",
+			what, openProbeTimeout, err)
+	}
+	return fmt.Errorf("pgtrigger: cannot read the %s (%w); refusing to stream without verifying the capture shape",
+		what, err)
 }
 
 // loadInstalledCaptureTriggers reads every sluice-named capture trigger in

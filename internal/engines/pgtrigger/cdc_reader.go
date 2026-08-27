@@ -786,6 +786,10 @@ func decodeDDLTag(s string) string {
 // 42P01); the helper returns ok=false rather than the error so the
 // caller can surface a polished refusal.
 func changeLogTableExists(ctx context.Context, db *sql.DB, schema string) (bool, error) {
+	// Bounded open-path probe (audit 2026-08-27 A5; rationale on
+	// [openProbeTimeout]); fail-closed — every caller refuses on error.
+	ctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
 	const q = `
 SELECT EXISTS (
     SELECT 1

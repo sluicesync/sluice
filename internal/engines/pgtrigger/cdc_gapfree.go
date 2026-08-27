@@ -381,6 +381,10 @@ SELECT q.seq, s.seqcache, s.seqmin, s.seqincrement, s.seqcycle
 // SQLite's own rowid/AUTOINCREMENT machinery, which has no pg_sequence
 // row to read and needs its own separate argument.
 func verifyChangeLogSequence(ctx context.Context, db *sql.DB, schema string) error {
+	// Bounded open-path probe (audit 2026-08-27 A5; rationale on
+	// [openProbeTimeout]); fail-closed — both callers refuse on error.
+	ctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
 	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
 	var (
 		seqName   sql.NullString
