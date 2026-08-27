@@ -617,8 +617,9 @@ func purgeAllButLatestBinlogMariaDB(t *testing.T, dsn string) {
 
 // newMariaDBDedicatedForCDC boots a MariaDB container of its OWN (not the
 // shared one) with binlog enabled, for tests that mutate global binlog
-// state (PURGE BINARY LOGS). Returns a DSN + terminate cleanup.
-func newMariaDBDedicatedForCDC(t *testing.T, image string) (dsn string, cleanup func()) {
+// state (PURGE BINARY LOGS, SET GLOBAL log_bin_compress). extraCmd
+// appends additional mariadbd flags. Returns a DSN + terminate cleanup.
+func newMariaDBDedicatedForCDC(t *testing.T, image string, extraCmd ...string) (dsn string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -630,12 +631,12 @@ func newMariaDBDedicatedForCDC(t *testing.T, image string) (dsn string, cleanup 
 			"MARIADB_ROOT_PASSWORD": "rootpw",
 			"MARIADB_DATABASE":      "cdc_src",
 		},
-		Cmd: []string{
+		Cmd: append([]string{
 			"--server-id=1",
 			"--log-bin=mysqld-bin",
 			"--binlog-format=ROW",
 			"--binlog-row-image=FULL",
-		},
+		}, extraCmd...),
 		ExposedPorts: []string{"3306/tcp"},
 		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:rootpw@tcp(%s:%s)/cdc_src", host, port.Port())

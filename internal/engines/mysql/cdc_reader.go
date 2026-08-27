@@ -1542,9 +1542,28 @@ func (r *CDCReader) dispatchRows(
 				fmt.Sprintf("a PARTIAL_UPDATE_ROWS_EVENT for %s.%s reached the stream", tbl.Schema, tbl.Name),
 			)
 		}
-		// Other rows-flavoured events (MariaDB compressed variants)
-		// aren't in v1 scope. Surface as debug-only by virtue of
-		// falling through with no emission.
+		// M2 G8 belt: MariaDB compressed row events (log_bin_compress=ON;
+		// any row image ≥ log_bin_compress_min_len, 256 B default). The
+		// preflight refuses the variable at CDC open, but it is GLOBAL-only
+		// AND DYNAMIC — a mid-stream SET GLOBAL, or a resume replaying
+		// segments recorded while it was ON, still delivers these events —
+		// so this belt is the load-bearing half. The types exist only when
+		// compression produced them: zero false refusals (and an
+		// out-of-scope table's compressed event is dropped by the qn==""
+		// check above, like every other row event — Bug 246 discipline).
+		// Silently returning nil here (the pre-G8 behaviour) dropped every
+		// such row while the GTID/XID fold advanced the resume position
+		// past the loss — size-conditional silent row loss (small rows
+		// kept, ≥256 B rows gone), all three DML verbs. See
+		// cdc_binlog_compress_preflight.go for the ground truth.
+		switch hdr.EventType {
+		case replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1,
+			replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
+			return compressedRowsBeltError(hdr.EventType, tbl.Schema, tbl.Name)
+		}
+		// Other rows-flavoured events aren't in v1 scope. Surface as
+		// debug-only by virtue of falling through with no emission.
 		return nil
 	}
 	return nil

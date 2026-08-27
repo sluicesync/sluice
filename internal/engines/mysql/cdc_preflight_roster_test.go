@@ -8,6 +8,7 @@
 //	preflightBinlogRowImage         Bug 193   partial row images
 //	preflightBinlogFormat           item 68e  STATEMENT/MIXED format
 //	preflightReplicaSource          M2 G5     replica source, log_replica_updates=OFF
+//	preflightBinlogCompress         M2 G8     MariaDB log_bin_compress=ON
 //	preflightBinlogDBFilter         M2 G6     --binlog-ignore-db / --binlog-do-db
 //	preflightFKReferentialActions   M2 G9     FK referential-action capture WARN
 //
@@ -64,6 +65,7 @@ var cdcOpenPreflights = []string{
 	"preflightBinlogRowImage",
 	"preflightBinlogFormat",
 	"preflightReplicaSource",
+	"preflightBinlogCompress",
 	"preflightBinlogDBFilter",
 	"preflightFKReferentialActions",
 }

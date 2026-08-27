@@ -518,6 +518,17 @@ const (
 	// previously the statement fell into the generic-DDL arm and was
 	// silently dropped. The dispatch-time belt refuses it instead.
 	CodeCDCStatementDML Code = "SLUICE-E-CDC-STATEMENT-DML"
+
+	// M2 capture-completeness sweep G8 (2026-08-26): the MariaDB source
+	// writes COMPRESSED binlog row events (log_bin_compress=ON) — every
+	// row image ≥ log_bin_compress_min_len (256 B default), all three DML
+	// verbs — which sluice does not decode. Before this door they fell
+	// into dispatchRows' default arm and were silently dropped while the
+	// GTID/XID fold advanced the resume position past the loss. Refused
+	// at CDC open (preflight) AND at dispatch: the variable is GLOBAL-only
+	// but DYNAMIC, and old segments replay compressed events after it is
+	// turned off, so the dispatch belt is the load-bearing half.
+	CodeCDCBinlogCompressed Code = "SLUICE-E-CDC-BINLOG-COMPRESSED"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -669,6 +680,7 @@ var registry = map[Code]Info{
 	CodeCDCSchemaReplayMismatch:   {ClassRefusal, "a MySQL binlog row event's TABLE_MAP column-type vector disagrees with the table's current information_schema shape — the event was recorded under a DIFFERENT schema than the one it is about to be decoded against, which for a same-column-count DDL (a type change) would remap every replayed value silently; refused rather than decoded"},
 
 	CodeCDCReplicaNoLogUpdates: {ClassRefusal, "binlog CDC refused at start: the source is itself a replica with log_replica_updates=OFF, so writes replicated from its primary never enter THIS server's binlog — the CDC tail would be silently empty for all replicated traffic while local writes keep it looking alive; point the sync at the primary, or restart mysqld with log_replica_updates=ON (the variable is read-only at runtime)"},
+	CodeCDCBinlogCompressed:    {ClassRefusal, "binlog CDC refused: the MariaDB source writes compressed binlog row events (log_bin_compress=ON), which sluice does not decode — every row image ≥ log_bin_compress_min_len (256 B default) would be silently dropped across all three DML verbs while the resume position advances past the loss; SET GLOBAL log_bin_compress=OFF, rotate past the already-compressed segments (FLUSH BINARY LOGS, or wait out retention), then restart the sync from a fresh position"},
 	CodeCDCBinlogDBFiltered:    {ClassRefusal, "binlog CDC refused at start: the source's --binlog-ignore-db / --binlog-do-db startup filters exclude a synced database from the binlog, so its writes are applied but never logged — the CDC tail would be silently empty for that database; remove the filter flags and restart mysqld (they are not settable at runtime), or take the database out of the sync's scope"},
 	CodeCDCStatementDML:        {ClassRefusal, "binlog CDC stopped mid-stream: a row-DML statement (INSERT/UPDATE/DELETE/REPLACE) arrived as QUERY-event text, which under ROW logging is proof a writing session overrode binlog_format to STATEMENT/MIXED — sluice deliberately never executes replayed SQL text, so these writes cannot be applied; fix the offending session, ensure @@GLOBAL.binlog_format=ROW with no session overrides, then start the sync fresh (the statement-logged writes are only recoverable by re-snapshot)"},
 }
