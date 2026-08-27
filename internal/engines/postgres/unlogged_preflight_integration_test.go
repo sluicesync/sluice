@@ -19,7 +19,9 @@
 //  4. Door B: OpenBackupSnapshot --chain-slot, scoped by
 //     opts.InScopeTables, and NOT censused on the default
 //     temporary-anchor shape (a one-shot full backup of an unlogged
-//     table is fine — its rows are swept once, no chain).
+//     table is fine — its rows are swept once, no chain),
+//  5. Door 5 (audit 2026-08-27 A7): PreflightAddTableUnlogged, the
+//     `schema add-table` registration census.
 package postgres
 
 import (
@@ -122,6 +124,21 @@ func TestUnloggedCensus_AndPublicationDoors(t *testing.T) {
 			t.Fatalf("EnsurePublication (logged only): %v", err)
 		}
 		applyPGSnap(t, dsn, "DROP PUBLICATION IF EXISTS "+quoteIdent(eng.publicationName()))
+	})
+
+	t.Run("Door 5 (add-table registration): one-table census refuses the unlogged table, passes the logged one", func(t *testing.T) {
+		// Audit 2026-08-27 A7: `sluice schema add-table` must refuse an
+		// UNLOGGED table at registration (it would backfill once and
+		// freeze forever). Both directions, plus the not-found pass (the
+		// orchestrator's own refusal owns that case).
+		err := eng.PreflightAddTableUnlogged(ctx, dsn, "u_scratch")
+		requireUnloggedRefusal(t, err, "public.u_scratch")
+		if err := eng.PreflightAddTableUnlogged(ctx, dsn, "t_logged"); err != nil {
+			t.Fatalf("add-table census must pass a logged table; got %v", err)
+		}
+		if err := eng.PreflightAddTableUnlogged(ctx, dsn, "no_such_table"); err != nil {
+			t.Fatalf("add-table census must pass a table it cannot find; got %v", err)
+		}
 	})
 
 	t.Run("Door A engine half: spanning census refuses across schemas, honours the exclusion predicate", func(t *testing.T) {

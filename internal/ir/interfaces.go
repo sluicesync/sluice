@@ -2948,8 +2948,20 @@ type MultiDatabaseSnapshotOpener interface {
 // unlogged table for which allowed(schema, table) is false; a nil
 // allowed means everything is in scope. Engines without an
 // unlogged-table concept simply omit the surface.
+//
+// PreflightAddTableUnlogged is the `sluice schema add-table`
+// registration door (audit 2026-08-27 A7): a one-table census against
+// the DSN's schema, refusing with the same coded error when the named
+// table is UNLOGGED. It exists because add-table brings a table into a
+// LIVE stream's scope without re-running the spanning census — an
+// unlogged table registered that way would backfill its rows once and
+// then freeze forever at exit 0 (no publication form can ever stream
+// it), and the spanning census predicate excludes live-added tables by
+// construction. A table absent from the schema passes (the
+// orchestrator's own not-found refusal owns that case).
 type UnloggedCapturePreflighter interface {
 	PreflightSpanningUnloggedTables(ctx context.Context, dsn string, schemas []string, allowed func(schema, table string) bool) error
+	PreflightAddTableUnlogged(ctx context.Context, dsn, table string) error
 }
 
 // ServerCDCReaderOpener is the OPTIONAL engine surface for opening a

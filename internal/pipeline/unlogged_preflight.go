@@ -42,3 +42,25 @@ func (s *Streamer) preflightSpanningUnloggedTables(ctx context.Context, schemas 
 		return s.Filter.Allows(table)
 	})
 }
+
+// preflightUnloggedAddTable is the `schema add-table` REGISTRATION door
+// of the same census (audit 2026-08-27 A7). The spanning census above
+// cannot cover a live-added table by construction — its predicate is the
+// sync's BASE filter, and the effective scope a live add extends is base
+// ∪ live-added (streamer_filter_flip.go) — so an UNLOGGED table
+// registered mid-stream would backfill its rows once and then freeze
+// forever at exit 0, the exact shape G2 refuses at stream open. Refusing
+// at registration closes the gap at its source: the table never enters
+// any live-add set, so no census predicate downstream has to see it.
+//
+// Runs before ANY side effect of [AddTable.Run] — target DDL, publication
+// extend, snapshot — and before the dry-run report, so the plan surfaces
+// the refusal too. Sources without the surface (MySQL family — no
+// unlogged concept) skip silently, mirroring the spanning door.
+func (a *AddTable) preflightUnloggedAddTable(ctx context.Context) error {
+	pf, ok := a.Source.(ir.UnloggedCapturePreflighter)
+	if !ok {
+		return nil
+	}
+	return pf.PreflightAddTableUnlogged(ctx, a.SourceDSN, a.TableName)
+}

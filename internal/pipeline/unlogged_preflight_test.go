@@ -34,7 +34,9 @@ type unloggedPreflightStub struct {
 	preflightErr     error
 	gotSchemas       []string
 	gotAllowed       func(schema, table string) bool
+	gotAddTable      string
 	preflightCalls   int
+	addTableCalls    int
 	coldOpenerCalls  int
 	serverCDCCalls   int
 	listedDatabases  []string
@@ -49,6 +51,12 @@ func (s *unloggedPreflightStub) PreflightSpanningUnloggedTables(_ context.Contex
 	s.preflightCalls++
 	s.gotSchemas = schemas
 	s.gotAllowed = allowed
+	return s.preflightErr
+}
+
+func (s *unloggedPreflightStub) PreflightAddTableUnlogged(_ context.Context, _, table string) error {
+	s.addTableCalls++
+	s.gotAddTable = table
 	return s.preflightErr
 }
 
@@ -71,6 +79,93 @@ var (
 	_ ir.ServerCDCReaderOpener       = (*unloggedPreflightStub)(nil)
 	_ ir.DatabaseLister              = (*unloggedPreflightStub)(nil)
 )
+
+// addTableUnloggedSource is the add-table door's source stub: the usual
+// add-table recording source plus the [ir.UnloggedCapturePreflighter]
+// surface, recording what the registration door asked.
+type addTableUnloggedSource struct {
+	*addTableSourceEngine
+
+	unloggedErr   error
+	gotTable      string
+	preflightRuns int
+}
+
+func (e *addTableUnloggedSource) PreflightSpanningUnloggedTables(context.Context, string, []string, func(schema, table string) bool) error {
+	return nil
+}
+
+func (e *addTableUnloggedSource) PreflightAddTableUnlogged(_ context.Context, _, table string) error {
+	e.preflightRuns++
+	e.gotTable = table
+	return e.unloggedErr
+}
+
+var _ ir.UnloggedCapturePreflighter = (*addTableUnloggedSource)(nil)
+
+// TestAddTable_UnloggedCensusRefusesBeforeAnySideEffect pins the
+// registration door (audit 2026-08-27 A7): the census refusal surfaces
+// BEFORE the dry-run/snapshot/target-writer phases — an unlogged table
+// must never be registered onto a live stream (it would backfill once
+// and freeze forever), and the refusal must land before anything was
+// created on either side. Both directions: the refusal cell here, the
+// pass cell in TestAddTable_UnloggedCensusPassesALoggedTable.
+func TestAddTable_UnloggedCensusRefusesBeforeAnySideEffect(t *testing.T) {
+	refusal := errors.New("unlogged add-table refusal")
+	src := &addTableUnloggedSource{addTableSourceEngine: newAddTableSourceEngine("source"), unloggedErr: refusal}
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "u_scratch", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "u_scratch",
+	}
+	if err := a.Run(context.Background()); !errors.Is(err, refusal) {
+		t.Fatalf("Run err = %v; want the unlogged census refusal", err)
+	}
+	if src.preflightRuns != 1 || src.gotTable != "u_scratch" {
+		t.Errorf("census runs = %d (table %q); want 1 run naming u_scratch", src.preflightRuns, src.gotTable)
+	}
+	if src.snapshotCalls != 0 {
+		t.Errorf("snapshot opened %d time(s) after the census refused; the refusal must land before any side effect", src.snapshotCalls)
+	}
+	if tgt.openSchemaWriterCalls != 0 || tgt.openRowWriterCalls != 0 {
+		t.Errorf("target writers opened (sw=%d, rw=%d) after the census refused; want 0/0",
+			tgt.openSchemaWriterCalls, tgt.openRowWriterCalls)
+	}
+}
+
+// TestAddTable_UnloggedCensusPassesALoggedTable pins the door's pass
+// direction: a source whose census finds nothing proceeds through the
+// normal add-table flow (a door with only its refusal pinned can
+// silently widen).
+func TestAddTable_UnloggedCensusPassesALoggedTable(t *testing.T) {
+	src := &addTableUnloggedSource{addTableSourceEngine: newAddTableSourceEngine("source")}
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if src.preflightRuns != 1 {
+		t.Errorf("census runs = %d; want 1 (the pass direction must still consult the door)", src.preflightRuns)
+	}
+	if src.snapshotCalls != 1 {
+		t.Errorf("snapshot opens = %d; want 1 (the pass direction must proceed)", src.snapshotCalls)
+	}
+}
 
 // TestPreflightSpanningUnloggedTables_PredicateCarriesTableFilter pins
 // the Bug 246 half: the predicate handed to the engine is the sync's

@@ -119,6 +119,23 @@ func tableListOrNull(tables []string) any {
 //   - backup full --chain-slot: [Engine.OpenBackupSnapshot] under
 //     opts.PersistChainSlot, before its ensureAllTablesPublication;
 //     scoped by opts.InScopeTables (the backup's post-filter table set).
+//   - `sluice schema add-table` REGISTRATION (audit 2026-08-27 A7):
+//     pipeline AddTable.Run → [Engine.PreflightAddTableUnlogged], a
+//     one-table census before any target-side DDL or publication change,
+//     on every add-table mode (drained, --no-drain live, dry-run). This
+//     door exists because add-table extends a LIVE stream's scope
+//     without re-running the spanning census, and the spanning census
+//     predicate cannot see live-added tables; it also upgrades the
+//     scoped lane's raw PG `cannot add relation` (which would otherwise
+//     land only at ALTER PUBLICATION time, after the target table was
+//     created) to the coded pre-DDL form. On the spanning lane the only
+//     prior guard was incidental: addTablesToPublication refuses ANY
+//     add against FOR ALL TABLES with "the new table is already
+//     implicitly in scope" — a message that is FALSE for an unlogged
+//     table (the publication silently excludes it), and a refusal that
+//     lands after the target table exists; if that refusal is ever
+//     relaxed to a no-op, this census is what stands between the
+//     operator and the backfill-then-freeze shape.
 //
 // NOT covered, stated per the gate-scope rule:
 //
@@ -221,5 +238,39 @@ func (e Engine) PreflightSpanningUnloggedTables(ctx context.Context, dsn string,
 		"multi-schema spanning sync",
 		"the FOR ALL TABLES publication this spanning sync streams through silently EXCLUDES them (no error, no notice) while the cold copy includes them, so the target would freeze each at its snapshot forever at exit 0",
 		inScope,
+	)
+}
+
+// PreflightAddTableUnlogged implements the add-table half of
+// [ir.UnloggedCapturePreflighter] (door roster on
+// [refuseUnloggedTables]): a one-table census at the `sluice schema
+// add-table` registration path, against the DSN's schema. No table
+// scope predicate is needed — the operator named exactly this table, so
+// there is nothing to exclude (the Bug 246 concern cannot arise). A
+// table the census does not find passes: the orchestrator's own
+// not-found refusal owns that case with a better message.
+func (e Engine) PreflightAddTableUnlogged(ctx context.Context, dsn, table string) error {
+	cfg, err := e.parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	census, err := unloggedTablesInSchemas(ctx, db, []string{cfg.schema}, []string{table})
+	if err != nil {
+		// Fail CLOSED, like the spanning door: an unverified census must
+		// not register the table (the SL-1 probe-error discipline).
+		return err
+	}
+	if len(census) == 0 {
+		return nil
+	}
+	return refuseUnloggedTables(
+		"schema add-table",
+		"no publication form can ever stream an unlogged table's changes (it writes no WAL), so registering it on a live stream would bulk-copy its rows once and then freeze it at that snapshot forever at exit 0",
+		census,
 	)
 }

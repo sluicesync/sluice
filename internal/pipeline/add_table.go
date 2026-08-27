@@ -330,6 +330,15 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
+	// UNLOGGED-table registration door (audit 2026-08-27 A7; see
+	// preflightUnloggedAddTable). Must run before the dry-run report and
+	// before any target DDL / publication change: an unlogged table can
+	// never be streamed, so registering it on a live stream is the
+	// backfill-then-freeze shape the G2 census refuses at stream open.
+	if err := a.preflightUnloggedAddTable(ctx); err != nil {
+		return err
+	}
+
 	// Apply per-column type / expression overrides (CLI parity with
 	// migrate / sync-start).
 	scoped, err = translate.ApplyMappings(scoped, a.Mappings)
