@@ -1360,10 +1360,29 @@ func (r *CDCReader) dispatchRows(
 	// UTC seconds; carry it on every row event.
 	commitTime := binlogEventCommitTime(hdr)
 
+	// The MARIADB_*_ROWS_COMPRESSED_EVENT_V1 labels below are M2 G8
+	// (2026-08-26): with log_bin_compress=ON a MariaDB source writes any
+	// row image ≥ log_bin_compress_min_len (256 B default) as a
+	// compressed row event — all three DML verbs (a big row's DELETE
+	// compresses via its before-image). go-mysql decompresses the body
+	// in RowsEvent.DecodeData (mysql.DecompressMariadbData) BEFORE any
+	// column is decoded and maps the compressed types to the same
+	// row-image kinds as their uncompressed twins, so by the time an
+	// event reaches this switch its Rows are shape-identical to the
+	// plain v1 events — the arms below apply unchanged (belts, PK
+	// narrowing, decode, all of it). Before these labels existed the
+	// three types fell into the default arm's silent `return nil` while
+	// the GTID/XID fold advanced the resume position past the loss:
+	// size-conditional silent row loss, CRITICAL. Family × verb matrix
+	// pinned against a real compressing MariaDB in
+	// TestMariaDB_CDCReader_LogBinCompress_FamilyMatrix; compressed ≡
+	// uncompressed dispatch pinned in
+	// TestDispatchRows_MariaDBCompressedRowEvents_CapturedIdentically.
 	switch hdr.EventType {
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
-		replication.WRITE_ROWS_EVENTv2:
+		replication.WRITE_ROWS_EVENTv2,
+		replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
 		for i, raw := range ev.Rows {
 			// Bug 193 belt: a write image that omitted a non-generated
 			// column (a partial binlog_row_image slipping past the
@@ -1389,7 +1408,8 @@ func (r *CDCReader) dispatchRows(
 		}
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
-		replication.UPDATE_ROWS_EVENTv2:
+		replication.UPDATE_ROWS_EVENTv2,
+		replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
 		// MySQL emits update rows as alternating before/after pairs.
 		// Defensive: if the count is odd, surface the malformed event
 		// rather than silently dropping the trailing image.
@@ -1468,7 +1488,8 @@ func (r *CDCReader) dispatchRows(
 		}
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
-		replication.DELETE_ROWS_EVENTv2:
+		replication.DELETE_ROWS_EVENTv2,
+		replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
 		for i, raw := range ev.Rows {
 			// Bug 193 belt, PK-less tables ONLY. With a real PK the
 			// narrowing below makes partial images correct by
@@ -1542,28 +1563,10 @@ func (r *CDCReader) dispatchRows(
 				fmt.Sprintf("a PARTIAL_UPDATE_ROWS_EVENT for %s.%s reached the stream", tbl.Schema, tbl.Name),
 			)
 		}
-		// M2 G8 belt: MariaDB compressed row events (log_bin_compress=ON;
-		// any row image ≥ log_bin_compress_min_len, 256 B default). The
-		// preflight refuses the variable at CDC open, but it is GLOBAL-only
-		// AND DYNAMIC — a mid-stream SET GLOBAL, or a resume replaying
-		// segments recorded while it was ON, still delivers these events —
-		// so this belt is the load-bearing half. The types exist only when
-		// compression produced them: zero false refusals (and an
-		// out-of-scope table's compressed event is dropped by the qn==""
-		// check above, like every other row event — Bug 246 discipline).
-		// Silently returning nil here (the pre-G8 behaviour) dropped every
-		// such row while the GTID/XID fold advanced the resume position
-		// past the loss — size-conditional silent row loss (small rows
-		// kept, ≥256 B rows gone), all three DML verbs. See
-		// cdc_binlog_compress_preflight.go for the ground truth.
-		switch hdr.EventType {
-		case replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
-			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1,
-			replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
-			return compressedRowsBeltError(hdr.EventType, tbl.Schema, tbl.Name)
-		}
 		// Other rows-flavoured events aren't in v1 scope. Surface as
 		// debug-only by virtue of falling through with no emission.
+		// (The MariaDB compressed variants are NOT in this bucket — they
+		// are captured by the case arms above, M2 G8.)
 		return nil
 	}
 	return nil

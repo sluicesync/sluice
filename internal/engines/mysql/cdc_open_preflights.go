@@ -17,7 +17,6 @@ import "context"
 //	preflightBinlogRowImage         Bug 193   partial row images / PARTIAL_JSON
 //	preflightBinlogFormat           item 68e  STATEMENT/MIXED binlog_format
 //	preflightReplicaSource          M2 G5     replica source, log_replica_updates=OFF
-//	preflightBinlogCompress         M2 G8     MariaDB log_bin_compress=ON
 //	preflightBinlogDBFilter         M2 G6     --binlog-ignore-db / --binlog-do-db
 //	preflightFKReferentialActions   M2 G9     FK referential-action capture WARN
 //
@@ -48,9 +47,6 @@ func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilte
 		return err
 	}
 	if err := preflightReplicaSource(ctx, db); err != nil {
-		return err
-	}
-	if err := preflightBinlogCompress(ctx, db); err != nil {
 		return err
 	}
 	if err := preflightBinlogDBFilter(ctx, db, scope); err != nil {
