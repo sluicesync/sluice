@@ -217,7 +217,11 @@ func warnFKReferentialActions(ctx context.Context, q dbQuerier, scope binlogFilt
 
 	var findings []fkActionFinding
 	for _, db := range scope.databases {
-		rows, err := q.QueryContext(pctx, fkActionCensusQuery, db)
+		// rows crosses into appendFKActionFindings, which closes it and
+		// checks rows.Err on every path; the linter cannot track that
+		// through the call boundary (same posture as the streaming
+		// readers' suppressions).
+		rows, err := q.QueryContext(pctx, fkActionCensusQuery, db) //nolint:rowserrcheck
 		if err != nil {
 			slog.WarnContext(ctx, lane+": "+fkReferentialActionMarker+": could not census FK referential "+
 				"actions from information_schema; if any in-scope table's FK declares ON DELETE/UPDATE "+
