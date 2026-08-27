@@ -123,7 +123,7 @@ func AppendHealRecord(ctx context.Context, store irbackup.Store, rec HealRecord)
 	if err != nil {
 		return fmt.Errorf("marshal heal record: %w", err)
 	}
-	var existing []byte
+	body := make([]byte, 0, len(line)+1)
 	exists, err := store.Exists(ctx, MaintenanceHealLogFileName)
 	if err != nil {
 		return fmt.Errorf("inspect %q: %w", MaintenanceHealLogFileName, err)
@@ -133,13 +133,14 @@ func AppendHealRecord(ctx context.Context, store irbackup.Store, rec HealRecord)
 		if err != nil {
 			return fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
 		}
-		existing, err = io.ReadAll(rc)
+		body, err = io.ReadAll(rc)
 		_ = rc.Close()
 		if err != nil {
 			return fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
 		}
 	}
-	body := append(existing, append(line, '\n')...)
+	body = append(body, line...)
+	body = append(body, '\n')
 	if err := store.Put(ctx, MaintenanceHealLogFileName, bytes.NewReader(body)); err != nil {
 		return fmt.Errorf("append %q: %w", MaintenanceHealLogFileName, err)
 	}

@@ -14,6 +14,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"strings"
@@ -447,12 +448,12 @@ func TestMaintenanceHeal_PreservesForensicEvidence(t *testing.T) {
 	if len(preserved) != 1 {
 		t.Fatalf("preserved pre-heal signatures = %v; want exactly 1", preserved)
 	}
-	if got := storeReadAll(t, store, preserved[0]); string(got) != string(preHealSig) {
+	if got := storeReadAll(t, store, preserved[0]); !bytes.Equal(got, preHealSig) {
 		t.Errorf("preserved pre-heal signature bytes differ from the actual pre-heal lineage.json.sig — the evidence must survive VERBATIM")
 	}
 	// The heal must have actually replaced the live signature (the
 	// preserved copy is evidence, not the current state).
-	if live := storeReadAll(t, store, lineage.LineageSigFileName); string(live) == string(preHealSig) {
+	if live := storeReadAll(t, store, lineage.LineageSigFileName); bytes.Equal(live, preHealSig) {
 		t.Error("live lineage.json.sig is byte-identical to the pre-heal one — the heal did not re-sign")
 	}
 
