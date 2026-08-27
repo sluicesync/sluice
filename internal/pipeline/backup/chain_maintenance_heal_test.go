@@ -348,6 +348,13 @@ func TestMaintenanceNoOp_HealRefusesWrongKey(t *testing.T) {
 		requireLineageHealed(t, store, env, correct)
 	})
 
+	t.Run("wrong key leaves no heal evidence artifacts (nothing healed)", func(t *testing.T) {
+		store, _, _ := buildSignedChain(t)
+		_, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour, Signer: wrongKeySigner(t)})
+		requireWrongKeyHealRefusal(t, err)
+		requireNoHealEvidence(t, store)
+	})
+
 	t.Run("crash-stale chain + wrong key: still refuses (stale is not this key's to heal)", func(t *testing.T) {
 		store, env, _ := buildSignedChain(t)
 		correct := mustSigner(t, env)
@@ -367,5 +374,216 @@ func TestMaintenanceNoOp_HealRefusesWrongKey(t *testing.T) {
 			t.Fatalf("correct-key heal after the wrong-key refusal: %v", err)
 		}
 		requireLineageHealed(t, store, env, correct)
+	})
+}
+
+// storeReadAll reads a store object's raw bytes.
+func storeReadAll(t *testing.T, store irbackup.Store, path string) []byte {
+	t.Helper()
+	rc, err := store.Get(context.Background(), path)
+	if err != nil {
+		t.Fatalf("get %q: %v", path, err)
+	}
+	defer func() { _ = rc.Close() }()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read %q: %v", path, err)
+	}
+	return body
+}
+
+// preservedSigPaths lists the pre-heal preserved lineage.json.sig copies.
+func preservedSigPaths(t *testing.T, store irbackup.Store) []string {
+	t.Helper()
+	paths, err := store.List(context.Background(), lineage.PreHealLineageSigPrefix)
+	if err != nil {
+		t.Fatalf("list pre-heal sigs: %v", err)
+	}
+	return paths
+}
+
+// requireNoHealEvidence asserts neither heal artifact exists — the
+// boundary paths (keyless, dry-run, healthy, wrong-key) must not write
+// evidence for a heal that never ran.
+func requireNoHealEvidence(t *testing.T, store irbackup.Store) {
+	t.Helper()
+	if paths := preservedSigPaths(t, store); len(paths) != 0 {
+		t.Fatalf("found %d preserved pre-heal signature(s) %v; want none (no heal ran)", len(paths), paths)
+	}
+	recs, err := lineage.ReadHealRecords(context.Background(), store)
+	if err != nil {
+		t.Fatalf("read heal records: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("found %d heal record(s); want none (no heal ran)", len(recs))
+	}
+}
+
+// TestMaintenanceHeal_PreservesForensicEvidence is the audit 2026-08-27 A3
+// pin: a same-key heal must not DESTROY the evidence of what it healed.
+// Before this, ResignLineage overwrote the non-verifying lineage.json.sig
+// (the only artifact distinguishing crash-stale from
+// tampered-with-sigs-left-in-place) and the transient WARN was the sole
+// record — after the heal, `backup verify` reported all-valid forever.
+// Now the heal preserves the pre-heal signature verbatim
+// (lineage.json.sig.pre-heal-<ts>) and appends a durable
+// maintenance-heal.log record BEFORE re-signing, and both survive
+// repeated heals (append, never overwrite).
+func TestMaintenanceHeal_PreservesForensicEvidence(t *testing.T) {
+	ctx := context.Background()
+
+	store, env, _ := buildSignedChain(t)
+	signer := mustSigner(t, env)
+	staleifyCatalog(t, store)
+	requireLineageSigStale(t, store, signer)
+	preHealSig := storeReadAll(t, store, lineage.LineageSigFileName)
+
+	if _, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour, Signer: signer}); err != nil {
+		t.Fatalf("CompactChain heal run: %v", err)
+	}
+	requireLineageHealed(t, store, env, signer)
+
+	preserved := preservedSigPaths(t, store)
+	if len(preserved) != 1 {
+		t.Fatalf("preserved pre-heal signatures = %v; want exactly 1", preserved)
+	}
+	if got := storeReadAll(t, store, preserved[0]); string(got) != string(preHealSig) {
+		t.Errorf("preserved pre-heal signature bytes differ from the actual pre-heal lineage.json.sig — the evidence must survive VERBATIM")
+	}
+	// The heal must have actually replaced the live signature (the
+	// preserved copy is evidence, not the current state).
+	if live := storeReadAll(t, store, lineage.LineageSigFileName); string(live) == string(preHealSig) {
+		t.Error("live lineage.json.sig is byte-identical to the pre-heal one — the heal did not re-sign")
+	}
+
+	recs, err := lineage.ReadHealRecords(ctx, store)
+	if err != nil {
+		t.Fatalf("read heal records: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("heal records = %d; want exactly 1", len(recs))
+	}
+	rec := recs[0]
+	if rec.Operation != "backup compact" {
+		t.Errorf("record.Operation = %q; want %q", rec.Operation, "backup compact")
+	}
+	if rec.KeyID != signer.KeyID {
+		t.Errorf("record.KeyID = %q; want the signing key's %q", rec.KeyID, signer.KeyID)
+	}
+	if rec.VerifyFailure == "" {
+		t.Error("record.VerifyFailure is empty; want the verification error that triggered the heal")
+	}
+	if rec.PreservedSig != preserved[0] {
+		t.Errorf("record.PreservedSig = %q; want the preserved copy's path %q", rec.PreservedSig, preserved[0])
+	}
+	if rec.HealedAt.IsZero() {
+		t.Error("record.HealedAt is zero")
+	}
+
+	// SECOND heal (this time through a prune door): the log APPENDS and a
+	// second preserved copy lands — repeated heals never overwrite prior
+	// evidence. The first staleify consumed the chain's only catalogued
+	// incremental, so re-grow the chain before staleifying again.
+	addSignedIncremental(t, store, signer, "incr0002", "full0001", "manifests/incr-0002.json")
+	staleifyCatalog(t, store)
+	requireLineageSigStale(t, store, signer)
+	if _, err := PruneChain(ctx, store, PruneOpts{KeepIncrementals: 5, Signer: signer}); err != nil {
+		t.Fatalf("PruneChain second heal run: %v", err)
+	}
+	if got := preservedSigPaths(t, store); len(got) != 2 {
+		t.Fatalf("preserved pre-heal signatures after second heal = %v; want 2", got)
+	}
+	recs, err = lineage.ReadHealRecords(ctx, store)
+	if err != nil {
+		t.Fatalf("read heal records after second heal: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("heal records after second heal = %d; want 2 (append, never overwrite)", len(recs))
+	}
+	if recs[1].Operation != "prune" {
+		t.Errorf("second record.Operation = %q; want %q", recs[1].Operation, "prune")
+	}
+}
+
+// TestMaintenanceHeal_BoundariesLeaveNoEvidence pins that the three no-heal
+// boundaries (keyless, dry-run, healthy chain) write neither evidence
+// artifact — a heal record asserting a heal that never ran would be its own
+// kind of false evidence.
+func TestMaintenanceHeal_BoundariesLeaveNoEvidence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("keyless stale run", func(t *testing.T) {
+		store, _, _ := buildSignedChain(t)
+		staleifyCatalog(t, store)
+		if _, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour}); err != nil {
+			t.Fatalf("keyless CompactChain: %v", err)
+		}
+		requireNoHealEvidence(t, store)
+	})
+
+	t.Run("dry-run stale run with the key", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		staleifyCatalog(t, store)
+		if _, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour, DryRun: true, Signer: mustSigner(t, env)}); err != nil {
+			t.Fatalf("dry-run CompactChain: %v", err)
+		}
+		requireNoHealEvidence(t, store)
+	})
+
+	t.Run("healthy chain no-op run", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		if _, err := PruneChain(ctx, store, PruneOpts{KeepIncrementals: 5, Signer: mustSigner(t, env)}); err != nil {
+			t.Fatalf("healthy PruneChain: %v", err)
+		}
+		requireNoHealEvidence(t, store)
+	})
+}
+
+// TestBackupVerify_SurfacesMaintenanceHeals pins the verify-side half of
+// A3: after a heal, every signature legitimately verifies, so `backup
+// verify`'s heal-provenance line is the ONLY signal that the signatures
+// were regenerated. Informational, never a failure — and absent on a
+// never-healed chain.
+func TestBackupVerify_SurfacesMaintenanceHeals(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("healed chain: informational line, zero failures", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		signer := mustSigner(t, env)
+		staleifyCatalog(t, store)
+		if _, err := CompactChain(ctx, store, CompactOpts{MergeWindow: time.Hour, Signer: signer}); err != nil {
+			t.Fatalf("CompactChain heal run: %v", err)
+		}
+		records, err := lineage.ListAllSegmentManifests(ctx, store)
+		if err != nil {
+			t.Fatalf("list manifests: %v", err)
+		}
+
+		buf := captureMaintenanceSlog(t)
+		failed := verifyBackupSignatures(ctx, store, records, VerifyOptions{Envelope: env})
+		if failed != 0 {
+			t.Fatalf("verifyBackupSignatures on a healed chain = %d failure(s); want 0 (the heal record is informational)\nlog:\n%s", failed, buf.String())
+		}
+		out := buf.String()
+		for _, want := range []string{"regenerated by a no-op maintenance heal", "backup compact", "pre-heal"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("verify output missing %q — the heal record's presence was not surfaced\nlog:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("never-healed chain: no heal line", func(t *testing.T) {
+		store, env, _ := buildSignedChain(t)
+		records, err := lineage.ListAllSegmentManifests(ctx, store)
+		if err != nil {
+			t.Fatalf("list manifests: %v", err)
+		}
+		buf := captureMaintenanceSlog(t)
+		if failed := verifyBackupSignatures(ctx, store, records, VerifyOptions{Envelope: env}); failed != 0 {
+			t.Fatalf("verifyBackupSignatures on a healthy chain = %d failure(s); want 0", failed)
+		}
+		if strings.Contains(buf.String(), "maintenance heal") {
+			t.Errorf("verify output claims a maintenance heal on a never-healed chain:\n%s", buf.String())
+		}
 	})
 }
