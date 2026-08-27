@@ -508,13 +508,36 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		if err == nil {
 			t.Fatal("projection-invisible ALTER passed under forward mode; want the TYPMOD-PROJECTION-GATE refusal (a pass here is the A2 silent-divergence shape)")
 		}
-		for _, want := range []string{"cannot be forwarded", "%q-col%", "sync stop --wait"} {
+		for _, want := range []string{"cannot be forwarded", "%q-col%", "sync stop --wait", "silently diverge"} {
 			if want == "%q-col%" {
 				want = `column "` + col + `"`
 			}
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("refusal missing %q; got: %v", want, err)
 			}
+		}
+		// The rewrite shapes must never carry the lossless text — claiming
+		// no rewrite happened when one did is the un-honest direction.
+		if strings.Contains(err.Error(), "no table rewrite occurred") {
+			t.Errorf("rewrite-shape refusal carries the lossless no-rewrite text; got: %v", err)
+		}
+	}
+	// requireLosslessRefusal: the A2-VARCHAR-TEXT-MSG honest variant — the
+	// two catalog-only no-rewrite shapes still REFUSE (behavior identical to
+	// the rewrite shapes), but the text says no rewrite occurred instead of
+	// asserting a divergence that never happened.
+	requireLosslessRefusal := func(t *testing.T, err error, col string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("lossless projection-invisible ALTER passed under forward mode; want the TYPMOD-PROJECTION-GATE refusal (the message changed, the verdict must not)")
+		}
+		for _, want := range []string{"cannot be forwarded", `column "` + col + `"`, "no table rewrite occurred", "drained model", "sync stop --wait"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("lossless refusal missing %q; got: %v", want, err)
+			}
+		}
+		if strings.Contains(err.Error(), "silently diverge") {
+			t.Errorf("lossless refusal carries the divergence text, which is factually wrong for this shape; got: %v", err)
 		}
 	}
 
@@ -598,6 +621,68 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
 		relations := map[uint32]*relationCacheEntry{16400: prev}
 		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+	})
+
+	t.Run("unbounded varchar→text OID swap refuses with the honest no-rewrite message", func(t *testing.T) {
+		// Both sides project ir.Text{TextLong} and PG performs no rewrite
+		// (binary-coercible), so the divergence text would be factually
+		// wrong — the A2-VARCHAR-TEXT-MSG decision. Still REFUSES under
+		// both modes; only the message differs.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1043, -1)) // unbounded varchar
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 25, -1))   // text
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireLosslessRefusal(t, checkSchemaRace(relations, 16400, curr, true), "v")
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("unbounded varchar→text must refuse under refuse mode too")
+		}
+	})
+
+	t.Run("text→unbounded varchar OID swap refuses with the honest no-rewrite message", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 25, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1043, -1))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireLosslessRefusal(t, checkSchemaRace(relations, 16400, curr, true), "v")
+	})
+
+	t.Run("interval same-range precision WIDENING refuses with the honest no-rewrite message", func(t *testing.T) {
+		// interval(3) → interval(6), full range on both sides: every
+		// stored value already fits, PG rewrites nothing.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(3)))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireLosslessRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("interval(3)→bare interval widens to full precision and gets the honest message", func(t *testing.T) {
+		// typmod -1 is the unrestricted declaration (full range, full
+		// precision), so this is a widening — the -1 normalization cell.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(3)))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, -1))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireLosslessRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("interval RANGE-bits change keeps the divergence message even with precision widened", func(t *testing.T) {
+		// The lossless predicate is directional AND range-pinned: a field
+		// restriction change (e.g. DAY TO SECOND → full range) is not one
+		// of the two decided no-rewrite shapes, so it stays on the safe
+		// over-claiming divergence text.
+		dayToSecond := int32((0x0010|0x0008|0x0004|0x0002)<<16) | 3 // some non-full range bits, precision 3
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, dayToSecond))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("mixed lossless + rewrite delta keeps the divergence message", func(t *testing.T) {
+		// One RelationMessage carrying a lossless varchar⇄text swap AND an
+		// interval precision shrink: the rewrite column wins the message —
+		// softening the warning because a sibling column was lossless
+		// would hide the real divergence.
+		prev := table(typedCol(t, "v", 1043, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		curr := table(typedCol(t, "v", 25, -1), typedCol(t, "iv", 1186, intervalTM(3)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
 	})
 
 	t.Run("temporal collapse-class ALTER (bare→(6)) still forwards", func(t *testing.T) {

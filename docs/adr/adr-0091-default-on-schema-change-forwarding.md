@@ -481,6 +481,31 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     scalar roster + the derived array roster) either moves the
     projected signature or sits on this documented refuse list, and
     that the reader actually refuses the listed members under forward.
+    *Message honesty (A2-VARCHAR-TEXT-MSG, operator decision
+    2026-08-27):* two members of this class are catalog-only — the
+    **unbounded `varchar⇄text` OID swap** (both project
+    `ir.Text{TextLong}`; PG treats the pair as binary-coercible, no
+    rewrite) and **interval same-range precision WIDENING** (existing
+    values fit; no rewrite) — so the silent-divergence sentence is
+    factually wrong for them. The refusal is shape-aware: those two
+    shapes get an honest "no table rewrite occurred on the source; the
+    change is projection-invisible — apply the same ALTER on the
+    target via the drained model" text, every other member keeps the
+    divergence text, and the verdict is identical for all (pinned both
+    ways by `TestCheckSchemaRace_UnforwardableTypmod`). Ground truth:
+    bounded `varchar(n)→text` moves the projection and already
+    forwards — only the exotic unbounded shape reaches the gate.
+    *Demand-gated allowlist sketch (NOT built — build only if an
+    operator hits the refusal):* the two lossless shapes could
+    pass-without-forward — values are byte-identical on both sides and
+    the target catalog simply keeps its old, projection-equivalent
+    type (its `text` vs the source's new unbounded `varchar`, or its
+    `interval(3)` vs the source's widened `interval(6)`), so no target
+    DDL is needed for value fidelity; the residue is a declared-type
+    cosmetic drift the operator reconciles at leisure. The predicate
+    would be exactly `losslessNoRewriteDelta` (directional interval
+    widening on identical range bits; unbounded-varchar⇄text swap),
+    which already exists as the message selector.
   - *Same-type, same-typmod `ALTER … USING <expr>`:* **undetectable,
     permanently** — the post-rewrite RelationMessage is byte-identical
     to the pre-rewrite one and no catalog artifact survives; the source

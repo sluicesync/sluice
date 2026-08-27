@@ -329,10 +329,23 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	// only the DROP, and the surviving column's rewrite diverged silently.
 	// The name-keyed scan below is what makes the DROP shape safe to gate:
 	// an ordinal scan misaligns after a middle-column drop.
+	// The refusal text is SHAPE-AWARE (A2-VARCHAR-TEXT-MSG, 2026-08-27):
+	// the gate also catches two catalog-only shapes PG applies without a
+	// table rewrite, and telling their operator "rows silently diverged"
+	// would be factually wrong — those get the honest no-rewrite message.
+	// Refuse/pass behavior is identical for every shape; only the text
+	// differs (pinned both ways by TestCheckSchemaRace_UnforwardableTypmod).
 	if forwarded && (change.Kind == relationChangeAlterColumnType || change.Kind == relationChangeDropColumn) {
-		if col, unforwardable := unforwardableTypmodColumn(relations[relationID], current); unforwardable {
+		switch col, shape := unforwardableTypmodColumn(relations[relationID], current); shape {
+		case unforwardableLosslessNoRewrite:
+			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta, and no table rewrite occurred on the source (unbounded varchar⇄text is binary-coercible; an interval precision widening leaves every stored value untouched): the change is projection-invisible, so --schema-changes=forward would emit no schema boundary — apply the same ALTER on the target via the drained model. %s",
+				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
+		case unforwardableRewrite:
 			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta (interval precision/field restrictions and array-element modifiers do not survive the wire projection), so --schema-changes=forward would emit no schema boundary and the source's table rewrite would silently diverge pre-existing target rows. %s",
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
+		case forwardableShape:
+			// No projection-invisible column; fall through to the normal
+			// forward path.
 		}
 	}
 	if change.Description != "" && !forwarded {
@@ -359,10 +372,37 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	return nil
 }
 
+// unforwardableShape classifies a TYPMOD-PROJECTION-GATE hit so the refusal
+// can be honest about what happened on the source (A2-VARCHAR-TEXT-MSG,
+// operator decision 2026-08-27). Most projection-invisible deltas are table
+// REWRITES whose stored values silently diverged; two are catalog-only
+// no-rewrite shapes (see [losslessNoRewriteDelta]). Both refuse identically —
+// the shape drives the MESSAGE, never the verdict. The demand-gated
+// pass-without-forward allowlist for the lossless shapes is sketched in
+// ADR-0091's impl notes; build it only if an operator hits this refusal.
+type unforwardableShape int
+
+const (
+	// forwardableShape: no projection-invisible changed column found; the
+	// delta forwards as usual.
+	forwardableShape unforwardableShape = iota
+	// unforwardableRewrite: the source rewrote stored values with zero
+	// decoded messages — the silent-divergence refusal text.
+	unforwardableRewrite
+	// unforwardableLosslessNoRewrite: a catalog-only delta; PG performed
+	// no rewrite and stored values are untouched — the honest
+	// no-rewrite refusal text.
+	unforwardableLosslessNoRewrite
+)
+
 // unforwardableTypmodColumn scans an AlterColumnType-classified prev/current
 // pair for a changed column whose PROJECTED IR type did not move — the
 // TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2). It returns the
-// first such column's name.
+// name of a projection-invisible column and its [unforwardableShape]; a
+// rewrite-shape hit wins over a lossless one (a single delta can carry both,
+// and the divergence warning is the one that must never be softened), so the
+// lossless shape is only reported when EVERY projection-invisible column in
+// the delta is lossless.
 //
 // The compare is per-COLUMN, not the whole-table [ir.SchemaSignatureOf]
 // equality the audit sketched: a single `ALTER TABLE` can carry a
@@ -391,7 +431,7 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 // type on a changed column compares equal and refuses — the safe direction
 // (production entries always carry a resolved type; buildRelationCacheEntry
 // errors on unresolvable OIDs).
-func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, bool) {
+func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, unforwardableShape) {
 	// NAME-keyed, not ordinal-keyed (VF review 2026-08-27): the gate also
 	// runs for the DropColumn classification, where a middle-column drop
 	// shifts every later ordinal — an ordinal scan would pair shifted
@@ -403,6 +443,7 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, bool)
 	for _, pc := range prev.Columns {
 		prevByName[pc.Name] = pc
 	}
+	var losslessCol string
 	for _, cc := range current.Columns {
 		pc, ok := prevByName[cc.Name]
 		if !ok {
@@ -411,11 +452,85 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, bool)
 		if pc.OID == cc.OID && pc.TypeMod == cc.TypeMod {
 			continue
 		}
-		if reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
-			return cc.Name, true
+		if !reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
+			continue
 		}
+		if losslessNoRewriteDelta(pc, cc) {
+			if losslessCol == "" {
+				losslessCol = cc.Name
+			}
+			continue
+		}
+		return cc.Name, unforwardableRewrite
 	}
-	return "", false
+	if losslessCol != "" {
+		return losslessCol, unforwardableLosslessNoRewrite
+	}
+	return "", forwardableShape
+}
+
+// losslessNoRewriteDelta reports whether a changed projection-invisible
+// column pair is one of the two shapes PostgreSQL applies WITHOUT a table
+// rewrite, so the TYPMOD-PROJECTION-GATE refusal can be honest about it
+// (A2-VARCHAR-TEXT-MSG). Deliberately narrow and directional: anything it
+// does not recognize keeps the silent-divergence message — over-claiming a
+// rewrite costs a needless operator audit, while under-claiming one costs
+// trust in real divergence, so unknown shapes err toward the former.
+//
+// Shape 1 — unbounded varchar⇄text OID swap. Both sides project
+// ir.Text{TextLong} (the only reason the gate fired at all: a bounded
+// varchar(n) projects ir.Varchar{n}, moves the signature, and forwards
+// normally — the A2 decision's recorded ground truth), and PG treats
+// varchar⇄text as binary-coercible, so the ALTER touches only the catalog.
+// The unbounded-typmod check is kept explicit as defence against the
+// projection changing out from under this predicate.
+//
+// Shape 2 — interval precision WIDENING with the same range bits. Same
+// range + non-decreasing precision means every stored value already fits
+// the new declaration; PG changes the catalog and rewrites nothing. A
+// precision shrink, or ANY range-bits change, stays on the rewrite message.
+func losslessNoRewriteDelta(pc, cc relationColumn) bool {
+	if isUnboundedVarcharTextSwap(pc, cc) {
+		return true
+	}
+	if pc.OID == pgtype.IntervalOID && cc.OID == pgtype.IntervalOID {
+		prevRange, prevPrec := intervalTypmod(pc.TypeMod)
+		currRange, currPrec := intervalTypmod(cc.TypeMod)
+		return prevRange == currRange && currPrec >= prevPrec
+	}
+	return false
+}
+
+// isUnboundedVarcharTextSwap reports an OID swap between text and an
+// UNBOUNDED varchar, in either direction — losslessNoRewriteDelta's shape 1.
+func isUnboundedVarcharTextSwap(pc, cc relationColumn) bool {
+	switch {
+	case pc.OID == pgtype.VarcharOID && cc.OID == pgtype.TextOID:
+		return charTypmod(pc.TypeMod) == 0
+	case pc.OID == pgtype.TextOID && cc.OID == pgtype.VarcharOID:
+		return charTypmod(cc.TypeMod) == 0
+	}
+	return false
+}
+
+// intervalFullRange / intervalFullPrecision are PG's INTERVAL_FULL_RANGE /
+// INTERVAL_FULL_PRECISION (utils/timestamp.h) — the range mask and precision
+// an unrestricted `interval` declaration (typmod -1) carries implicitly.
+const (
+	intervalFullRange     = 0x7FFF
+	intervalFullPrecision = 0xFFFF
+)
+
+// intervalTypmod decodes the (range, precision) pair from an interval typmod.
+// The packing is (range << 16) | precision (intervaltypmodin — no +4 offset,
+// unlike the character types); -1 is the bare unrestricted declaration and
+// normalizes to (full range, full precision), so the widening predicate sees
+// `interval(3) → interval` as precision 3 → full — a widening.
+func intervalTypmod(typmod int32) (rangeBits, precision int32) {
+	if typmod < 0 {
+		return intervalFullRange, intervalFullPrecision
+	}
+	return (typmod >> 16) & intervalFullRange, typmod & intervalFullPrecision
 }
 
 // schemaRaceRecoveryHint is the operator-actionable recovery text the
