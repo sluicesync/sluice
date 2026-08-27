@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Unit pins for the capture-shape door's grading half
-// ([gradeCaptureShape], audit 2026-08-26 F2). Every defect class the door
-// names gets a cell, plus the two accept cells (healthy install; the
-// polled-fingerprint exemption) so the door cannot drift into
-// false-refusing a legitimate source. The catalog-reading half and the
-// end-to-end refusals run against real PG in
-// cdc_capture_shape_integration_test.go.
+// ([gradeCaptureShape], audit 2026-08-26 F2; posture match ADR-0185).
+// Every defect class the door names gets a cell, plus the accept cells
+// (healthy install under BOTH postures; the polled-fingerprint exemption)
+// so the door cannot drift into false-refusing a legitimate source. The
+// posture-mismatch cells pin BOTH directions — 'A' where origin-only was
+// recorded and 'O' where the --capture-replicated-writes opt-in was — on
+// each trigger of the pair. The catalog-reading half and the end-to-end
+// refusals run against real PG in cdc_capture_shape_integration_test.go
+// and capture_replicated_integration_test.go.
 
 package pgtrigger
 
@@ -16,11 +19,21 @@ import (
 	"testing"
 )
 
-// healthyTriggers returns a correctly-installed pair for one table.
+// healthyTriggers returns a correctly-installed plain-posture pair for
+// one table.
 func healthyTriggers(table string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
 		{table: table, name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 		{table: table, name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+	}
+}
+
+// alwaysTriggers returns a correctly-installed --capture-replicated-writes
+// (ENABLE ALWAYS) pair for one table.
+func alwaysTriggers(table string) []installedCaptureTrigger {
+	return []installedCaptureTrigger{
+		{table: table, name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 	}
 }
 
@@ -30,11 +43,12 @@ var healthyEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunct
 
 func TestGradeCaptureShape(t *testing.T) {
 	cases := []struct {
-		name         string
-		installed    []installedCaptureTrigger
-		ddlFnPresent bool
-		evt          eventTriggerState
-		wantErr      []string // all must appear; empty = accept
+		name              string
+		installed         []installedCaptureTrigger
+		ddlFnPresent      bool
+		evt               eventTriggerState
+		captureReplicated bool     // the recorded ADR-0185 posture
+		wantErr           []string // all must appear; empty = accept
 	}{
 		{
 			name:         "healthy full install accepts",
@@ -50,13 +64,64 @@ func TestGradeCaptureShape(t *testing.T) {
 			// --allow-polled-fingerprint source.
 		},
 		{
-			name: "ENABLE ALWAYS accepts (strictly-more capture)",
-			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
-			},
+			name:              "healthy ENABLE ALWAYS install accepts under the opt-in posture",
+			installed:         alwaysTriggers("t"),
+			ddlFnPresent:      true,
+			evt:               healthyEvt,
+			captureReplicated: true,
+		},
+		{
+			// Pre-ADR-0185 the door accepted 'A' blindly as "strictly-more
+			// capture"; the posture match narrows that — hand-flipped
+			// ENABLE ALWAYS captures replica-role writes without the
+			// echo-loop vetting.
+			name:         "ENABLE ALWAYS under a recorded origin-only posture refuses (hand-flipped drift)",
+			installed:    alwaysTriggers("t"),
 			ddlFnPresent: true,
 			evt:          healthyEvt,
+			wantErr:      []string{"ENABLE ALWAYS", "ORIGIN-ONLY", "--capture-replicated-writes"},
+		},
+		{
+			name: "plain row trigger under the opt-in posture refuses (replicated writes silently uncaptured)",
+			installed: []installedCaptureTrigger{
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+			},
+			ddlFnPresent:      true,
+			evt:               healthyEvt,
+			captureReplicated: true,
+			wantErr:           []string{CaptureTriggerRow, "--capture-replicated-writes", "NOT being captured"},
+		},
+		{
+			name: "plain truncate trigger under the opt-in posture refuses too (both members graded)",
+			installed: []installedCaptureTrigger{
+				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+			},
+			ddlFnPresent:      true,
+			evt:               healthyEvt,
+			captureReplicated: true,
+			wantErr:           []string{CaptureTriggerTruncate, "--capture-replicated-writes", "TRUNCATE"},
+		},
+		{
+			name: "disabled trigger still refuses under the opt-in posture",
+			installed: []installedCaptureTrigger{
+				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+			},
+			ddlFnPresent:      true,
+			evt:               healthyEvt,
+			captureReplicated: true,
+			wantErr:           []string{"DISABLED"},
+		},
+		{
+			// The opt-in never alters the event trigger's enablement, so
+			// evtenabled 'A' stays accepted under either posture (the
+			// door's evt scope note).
+			name:         "event trigger ENABLE ALWAYS accepts under the plain posture",
+			installed:    healthyTriggers("t"),
+			ddlFnPresent: true,
+			evt:          eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL},
 		},
 		{
 			name:    "zero triggers anywhere refuses (the dropped-everything floor)",
@@ -132,7 +197,7 @@ func TestGradeCaptureShape(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := gradeCaptureShape("public", tc.installed, tc.ddlFnPresent, tc.evt)
+			err := gradeCaptureShape("public", tc.installed, tc.ddlFnPresent, tc.evt, tc.captureReplicated)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("want accept, got refusal: %v", err)

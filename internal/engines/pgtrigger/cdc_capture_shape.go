@@ -28,8 +28,17 @@ import (
 //
 //   - Every table where AT LEAST ONE sluice capture trigger still exists:
 //     a missing partner (DROP TRIGGER leaves the pair broken), a disabled or
-//     replica-only trigger, a wrong bound function, and a wrong trigger
-//     shape (tgtype) all refuse.
+//     replica-only trigger, a wrong bound function, a wrong trigger shape
+//     (tgtype), and — since ADR-0185 — an enablement POSTURE that does not
+//     match the installed intent all refuse. Setup records whether the
+//     install opted into replicated-write capture (the meta table's
+//     capture_replicated_writes, read by [readCaptureReplicatedWritesPosture]);
+//     the door demands tgenabled 'A' (ENABLE ALWAYS) under the opt-in and
+//     'O' (plain) without it, in BOTH directions: opt-in-recorded-but-plain
+//     silently loses every replicated write (the exact class the opt-in
+//     closes), and plain-recorded-but-ALWAYS is someone hand-flipping
+//     enablement into capturing replica-role writes without the echo-loop
+//     vetting — hand-flipped drift is exactly what this door exists for.
 //   - The dropped-EVERYTHING case, via the zero-trigger floor: a change-log
 //     table with no capture trigger anywhere in the schema refuses.
 //   - The event-trigger tier, via independent evidence: setup creates the
@@ -83,12 +92,13 @@ type eventTriggerState struct {
 }
 
 // verifyCaptureTriggerShape is the door's entry point: load the installed
-// state, grade it. Fail-closed on any catalog read error — including a
-// probe TIMEOUT (audit 2026-08-27 A5; rationale on [openProbeTimeout]): a
-// hung shape check must not silently pass, so an expired probe deadline
-// refuses with its own message rather than degrading to a WARN the way
-// the two WARN-only probes do.
-func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string) error {
+// state, grade it against the recorded posture (captureReplicated — the
+// ADR-0185 opt-in, read from the meta table by the caller). Fail-closed on
+// any catalog read error — including a probe TIMEOUT (audit 2026-08-27 A5;
+// rationale on [openProbeTimeout]): a hung shape check must not silently
+// pass, so an expired probe deadline refuses with its own message rather
+// than degrading to a WARN the way the WARN-only probes do.
+func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, captureReplicated bool) error {
 	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
 	defer cancel()
 	installed, err := loadInstalledCaptureTriggers(pctx, db, schema)
@@ -99,7 +109,7 @@ func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string) e
 	if err != nil {
 		return captureShapeProbeError(ctx, pctx, "DDL capture event-trigger state", err)
 	}
-	return gradeCaptureShape(schema, installed, ddlFnPresent, evt)
+	return gradeCaptureShape(schema, installed, ddlFnPresent, evt, captureReplicated)
 }
 
 // captureShapeProbeError shapes the door's fail-closed refusal for a
@@ -182,11 +192,19 @@ SELECT e.evtenabled::text, p.proname
 
 // gradeCaptureShape is the pure grading half (unit-pinned without a
 // database). It refuses on the FIRST defect so the operator sees one
-// actionable message; re-running `sluice trigger setup` repairs every
-// defect class at once (DROP IF EXISTS + CREATE per trigger, CREATE OR
-// REPLACE per function), preserving the change-log, its watermark, and the
-// consumer registry.
-func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddlFnPresent bool, evt eventTriggerState) error {
+// actionable message; re-running `sluice trigger setup` (with the flags
+// matching the intent) repairs every defect class at once (DROP IF EXISTS
+// + CREATE + the ENABLE ALWAYS ALTERs per trigger, CREATE OR REPLACE per
+// function, the posture upsert), preserving the change-log, its watermark,
+// and the consumer registry.
+//
+// captureReplicated is the RECORDED intent; the posture match it drives
+// covers the two per-table triggers only. The DDL event trigger is graded
+// as before (evtenabled 'O' or 'A' both accept): the opt-in never alters
+// its enablement — logical replication does not replicate DDL, so there is
+// no replicated-writes analogue for the event-trigger tier — and 'A' there
+// changes nothing the tag filter would see differently.
+func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddlFnPresent bool, evt eventTriggerState, captureReplicated bool) error {
 	byTable := map[string]map[string]installedCaptureTrigger{}
 	for _, it := range installed {
 		m := byTable[it.table]
@@ -239,24 +257,46 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddlFn
 					tbl, want.name, want.events,
 				)
 			}
-			// 'O' (origin, what plain CREATE TRIGGER yields) is the installed
-			// shape; 'A' (ENABLE ALWAYS) is accepted as strictly-more capture
-			// (it additionally fires under replica role — see
-			// preflight_replica_role.go for why setup does not install it).
-			// 'D' captures nothing; 'R' fires ONLY under replica role, i.e.
-			// for none of this database's own writes. Both are silent loss.
+			// The expected enablement is the RECORDED posture (ADR-0185):
+			// 'O' (origin-only, plain CREATE TRIGGER) for a default
+			// install, 'A' (ENABLE ALWAYS — additionally fires under
+			// replica role) under --capture-replicated-writes. 'D'
+			// captures nothing; 'R' fires ONLY under replica role, i.e.
+			// for none of this database's own writes — both are silent
+			// loss under either posture. A posture MISMATCH ('A' where
+			// 'O' was recorded, or 'O' where 'A' was) refuses in both
+			// directions: the door's whole point is hand-flipped drift.
+			wantEnabled := "O"
+			if captureReplicated {
+				wantEnabled = "A"
+			}
 			switch got.enabled {
-			case "O", "A":
+			case wantEnabled:
 			case "D":
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is DISABLED (ALTER TABLE ... DISABLE TRIGGER) — its %s changes are not being "+
 						"captured (silently absent from the stream); re-enable it (ALTER TABLE %q ENABLE TRIGGER %q) or re-run `sluice trigger setup` to reinstall",
 					tbl, want.name, want.events, tbl, want.name,
 				)
-			default: // "R"
+			case "R":
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is set ENABLE REPLICA — it fires ONLY under session_replication_role=replica, "+
 						"so none of this database's own %s changes are captured (silently absent from the stream); re-run `sluice trigger setup` to reinstall",
+					tbl, want.name, want.events,
+				)
+			case "A": // reachable only when the recorded posture is origin-only
+				return fmt.Errorf(
+					"pgtrigger: table %q capture trigger %q is set ENABLE ALWAYS but this install recorded ORIGIN-ONLY capture — the trigger's "+
+						"enablement was flipped by hand, so replica-role (replicated/applied) %s writes are being captured WITHOUT the echo-loop vetting "+
+						"the --capture-replicated-writes opt-in runs (ADR-0185); re-run `sluice trigger setup` to restore origin-only capture, or re-run it "+
+						"with --capture-replicated-writes to make replicated-write capture the recorded, vetted intent",
+					tbl, want.name, want.events,
+				)
+			default: // got.enabled == "O" while the recorded posture is ENABLE ALWAYS
+				return fmt.Errorf(
+					"pgtrigger: table %q capture trigger %q is plain ENABLE (origin-only) but this install recorded --capture-replicated-writes — "+
+						"replica-role (replicated/applied) %s writes are NOT being captured (silently absent from the stream — the exact loss the opt-in "+
+						"exists to close; ADR-0185); re-run `sluice trigger setup --capture-replicated-writes` to restore the ENABLE ALWAYS triggers",
 					tbl, want.name, want.events,
 				)
 			}

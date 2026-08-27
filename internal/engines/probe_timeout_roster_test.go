@@ -54,10 +54,11 @@ import (
 // change stops it seeing the probes it grades today.
 //
 // Mutation-verified in both directions (2026-08-27): removing the
-// context.WithTimeout derivation from pgtrigger's
-// warnReplicaRoleCaptureBlindness fails its roster line; pointing a
-// chokepoint entry at a nonexistent function fails the staleness guard;
-// the floors fail if a package's derived probe set shrinks.
+// context.WithTimeout derivation from pgtrigger's replica-role capture
+// dispatch (checkReplicaRoleCaptureShapes, né warnReplicaRoleCaptureBlindness)
+// fails its roster line; pointing a chokepoint entry at a nonexistent
+// function fails the staleness guard; the floors fail if a package's
+// derived probe set shrinks.
 var probeTimeoutRoster = []struct {
 	pkg         string   // directory under internal/engines/
 	chokepoints []string // functions whose probe callees form the universe
@@ -86,9 +87,10 @@ var probeTimeoutRoster = []struct {
 		pkg:         "pgtrigger",
 		chokepoints: []string{"openCDCReader"},
 		dbishTypes:  []string{"sql.DB"},
-		// change-log existence, sequence grade, capture-shape door,
-		// replica-role WARN bundle, DDL-detection WARN.
-		floor: 5,
+		// change-log existence, sequence grade, capture-posture read,
+		// capture-shape door, replica-role shape dispatch (WARN/echo-
+		// refusal), DDL-detection WARN.
+		floor: 6,
 	},
 }
 

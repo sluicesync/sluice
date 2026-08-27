@@ -26,7 +26,7 @@ func TestRenderSetupDDL_NoChangeLogIndexes(t *testing.T) {
 	stmts := renderSetupDDL(
 		"public",
 		[]tableTriggerSpec{{Name: "orders", PKCols: []string{"id"}}},
-		true, CapturePayloadFull,
+		true, CapturePayloadFull, false,
 	)
 	for _, s := range stmts {
 		// Prefix match, not Contains: the DDL event trigger's TAG list
@@ -60,7 +60,7 @@ func TestRenderSetupDDL_BakedPKArgs(t *testing.T) {
 			{Name: "line_items", PKCols: []string{"tenant_id", "order_id"}},
 			{Name: "weird", PKCols: []string{`na"me`, "o'clock"}},
 		},
-		false, CapturePayloadFull,
+		false, CapturePayloadFull, false,
 	)
 	joined := strings.Join(stmts, "\n")
 	for _, want := range []string{

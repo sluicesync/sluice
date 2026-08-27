@@ -41,8 +41,8 @@ const ddlDetectionAbsentMarker = "DDL-DETECTION-ABSENT"
 // keys its event-trigger-tier exemption on ([loadDDLCaptureState]'s
 // ddlFnPresent). It never fails the caller, but a probe ERROR also WARNs
 // ("cannot rule the blindness out") rather than silently skipping — the
-// SL-1 probe-error discipline, mirroring
-// [warnReplicaRoleCaptureBlindness] one call above.
+// SL-1 probe-error discipline, mirroring the
+// plain-posture arm of [checkReplicaRoleCaptureShapes] one call above.
 //
 // Caller (the sibling-sweep list for this door): [openCDCReader] — the
 // shared chokepoint of BOTH stream-open paths ([Engine.OpenCDCReader]

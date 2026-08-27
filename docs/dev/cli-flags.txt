@@ -704,6 +704,7 @@ trigger prune --target-driver
 trigger prune --vacuum
 trigger setup --allow-polled-fingerprint
 trigger setup --capture-payload
+trigger setup --capture-replicated-writes
 trigger setup --dry-run
 trigger setup --dsn
 trigger setup --schema

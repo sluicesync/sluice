@@ -132,22 +132,38 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 		_ = db.Close()
 		return nil, err
 	}
-	// The capture-shape door (audit 2026-08-26 F2): refuse loudly when an
-	// installed capture trigger is missing/disabled/rewired or the DDL
-	// event trigger was dropped — a DROP TRIGGER is invisible to both
-	// drift tiers, and every subsequent DML would be silently uncaptured.
-	// Runs at every CDC open; both stream-open paths funnel through here.
-	if err := verifyCaptureTriggerShape(ctx, db, cfg.schema); err != nil {
+	// The recorded capture posture (ADR-0185): whether setup installed
+	// plain (origin-only) triggers or the --capture-replicated-writes
+	// ENABLE ALWAYS triggers. Fail-closed — the posture drives the two
+	// doors below, so streaming without it would grade against a guess.
+	captureReplicated, err := readCaptureReplicatedWritesPosture(ctx, db, cfg.schema)
+	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	// WARN (never refuse) on the replica-role capture-blindness shapes —
-	// a subscriber source or an all-sluice relay writes rows the plain
-	// capture triggers cannot see (audit 2026-08-26 F1; the full
-	// ENABLE ALWAYS fix needs an ADR). Fires here so BOTH stream-open
-	// paths get it: OpenCDCReader and OpenSnapshotStream construct the
-	// poller through this function.
-	warnReplicaRoleCaptureBlindness(ctx, db, cfg.schema)
+	// The capture-shape door (audit 2026-08-26 F2): refuse loudly when an
+	// installed capture trigger is missing/disabled/rewired, its
+	// enablement no longer matches the recorded posture (ADR-0185), or
+	// the DDL event trigger was dropped — a DROP TRIGGER is invisible to
+	// both drift tiers, and every subsequent DML would be silently
+	// uncaptured. Runs at every CDC open; both stream-open paths funnel
+	// through here.
+	if err := verifyCaptureTriggerShape(ctx, db, cfg.schema, captureReplicated); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// The replica-role capture shapes (audit 2026-08-26 F1, ADR-0185).
+	// Plain posture: WARN (never refuse) — a subscriber source or an
+	// all-sluice relay writes rows the plain capture triggers cannot see.
+	// Opt-in posture: the subscriber shape is supported (no WARN) and the
+	// relay shape REFUSES (SLUICE-E-CDC-TRIGGER-ECHO-LOOP) — capturing
+	// another sluice sync's applied rows is an echo loop. Fires here so
+	// BOTH stream-open paths get it: OpenCDCReader and OpenSnapshotStream
+	// construct the poller through this function.
+	if err := checkReplicaRoleCaptureShapes(ctx, db, cfg.schema, captureReplicated); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// WARN (never refuse) when the install is on the polled-fingerprint
 	// tier, whose promised DDL-detection loop was never implemented —
 	// source DDL is invisible to capture there (capture-completeness G1;

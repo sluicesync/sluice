@@ -69,8 +69,9 @@ func pgtriggerSetupMode(plan *pgtrigger.Plan) string {
 // the file path); "d1-trigger" (ADR-0136) installs the SAME state on a live
 // Cloudflare D1 database over the HTTP query API (the --dsn is the d1:// form;
 // the token is env-only, CLOUDFLARE_API_TOKEN). The PG-only flags (--schema,
-// --allow-polled-fingerprint, --capture-payload) do not apply to the SQLite/D1
-// engines and are ignored there.
+// --allow-polled-fingerprint, --capture-payload, --capture-replicated-writes)
+// do not apply to the SQLite/D1 engines and are ignored there — SQLite has no
+// replication-role concept, so its triggers fire for every write already.
 const (
 	triggerDriverPostgres = pgtrigger.EngineName       // "postgres-trigger"
 	triggerDriverSQLite   = sqlitetrigger.EngineName   // "sqlite-trigger"
@@ -106,6 +107,8 @@ type TriggerSetupCmd struct {
 
 	AllowPolledFingerprint bool `help:"Opt in to installing WITHOUT DDL detection on tiers that deny event-trigger creation (Heroku Essential). The polled schema-fingerprint loop this flag is named for is NOT yet implemented, so on this tier ANY source schema change is invisible to capture — apply DDL with the drained model (sync stop --wait, apply on both sides, re-run trigger setup) and expect a DDL-DETECTION-ABSENT warning at every sync start. Default off: the engine refuses-loudly on such tiers so the absence of DDL detection is an explicit choice."`
 
+	CaptureReplicatedWrites bool `help:"Install the per-table capture triggers ENABLE ALWAYS so writes applied under session_replication_role=replica ARE captured — the native logical-replication SUBSCRIBER scenario (locked-down primary → native subscriber → sluice trigger-capture → elsewhere; ADR-0185). Default off: plain triggers capture origin writes only, and the replica-role shapes warn. Refused (SLUICE-E-CDC-TRIGGER-ECHO-LOOP) when the source also carries sluice's own apply bookkeeping (sluice_cdc_state) — ENABLE ALWAYS triggers would re-capture another sluice sync's applied rows, an echo loop. postgres-trigger only; re-running setup without the flag reverts to plain triggers."`
+
 	CapturePayload string `help:"How much of each changed row the capture trigger writes to sluice_change_log (ADR-0068). 'full' (default) writes the full before- and after-image on every UPDATE — byte-identical to prior releases, keeps a full-before-image apply WHERE. 'changed' trims the UPDATE after-image to PK + changed columns while keeping the full before-image (so the apply WHERE still does optimistic divergence detection). 'minimal' also trims the before-image to the PK, so the apply WHERE becomes a PK match (last-write-wins; safe for one-way CDC with no concurrent target writers) — reaches toward ~2x source-write overhead. INSERT is unchanged in all modes." enum:"full,changed,minimal" default:"full"`
 }
 
@@ -140,11 +143,12 @@ func (c *TriggerSetupCmd) Run(g *Globals) error {
 			sink.PhaseStarted(triggerPhaseInstall)
 			var e error
 			plan, e = pgtrigger.Setup(runCtx, c.DSN, pgtrigger.SetupOptions{
-				Tables:                 c.Tables,
-				Schema:                 c.Schema,
-				DryRun:                 c.DryRun,
-				AllowPolledFingerprint: c.AllowPolledFingerprint,
-				CapturePayload:         pgtrigger.CapturePayload(c.CapturePayload),
+				Tables:                  c.Tables,
+				Schema:                  c.Schema,
+				DryRun:                  c.DryRun,
+				AllowPolledFingerprint:  c.AllowPolledFingerprint,
+				CapturePayload:          pgtrigger.CapturePayload(c.CapturePayload),
+				CaptureReplicatedWrites: c.CaptureReplicatedWrites,
 			})
 			if (plan != nil && len(plan.Refusals) > 0) || e != nil {
 				return e

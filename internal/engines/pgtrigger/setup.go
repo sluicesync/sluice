@@ -39,10 +39,26 @@ const (
 	// ChangeLogSchemaVer is the schema-version pin recorded in the meta
 	// table. v1 was the original change-log + meta pair; v2 (roadmap item
 	// 115) adds [ChangeLogConsumersTable], the source-side registry the
-	// auto-prune cuts against. Setup is idempotent, so re-running it against
-	// a v1 install IS the migration: the CREATE TABLE IF NOT EXISTS adds the
-	// registry and the meta upsert lifts the version.
-	ChangeLogSchemaVer = 2
+	// auto-prune cuts against; v3 (ADR-0185) adds the meta table's
+	// capture_replicated_writes posture column. Setup is idempotent, so
+	// re-running it against an older install IS the migration: the CREATE
+	// TABLE IF NOT EXISTS adds the registry, the ADD COLUMN IF NOT EXISTS
+	// adds the posture column, and the meta upsert lifts the version. No
+	// reader gates on v3 — the posture read tolerates the column's absence
+	// (readCaptureReplicatedWritesPosture) — so the lift is bookkeeping
+	// that makes an install's vintage readable, not a door.
+	ChangeLogSchemaVer = 3
+
+	// metaCaptureReplicatedCol is the meta-table column recording whether
+	// this install's capture triggers are meant to be ENABLE ALWAYS
+	// (`trigger setup --capture-replicated-writes`, ADR-0185). Written by
+	// the setup upsert; read at every CDC open, where it selects the F2
+	// door's expected tgenabled ('A' vs 'O') and arms the echo-loop
+	// refusal. Deliberately NOT in [internalTableColumnFloor]: pre-v3
+	// installs lack it, the ADD COLUMN IF NOT EXISTS in renderSetupDDL is
+	// the migration, and the posture read defaults an absent column to
+	// false (origin-only), which is exactly what a pre-v3 install is.
+	metaCaptureReplicatedCol = "capture_replicated_writes"
 )
 
 // CapturePayload selects how much of each changed row the capture
@@ -130,6 +146,18 @@ type SetupOptions struct {
 	// of the installed trigger body only — the reader and applier are
 	// unaffected.
 	CapturePayload CapturePayload
+
+	// CaptureReplicatedWrites installs the per-table capture triggers
+	// (row AND truncate) ENABLE ALWAYS so they fire for DML applied
+	// under session_replication_role=replica too — a source that is a
+	// native logical-replication SUBSCRIBER, whose apply workers the
+	// plain triggers are blind to (ADR-0185; audit 2026-08-26 F1). The
+	// zero value keeps today's plain triggers (origin-only capture +
+	// the replica-role WARN). Setup REFUSES this opt-in when the source
+	// carries sluice's own apply bookkeeping (the echo-loop shape —
+	// see checkReplicaRoleCaptureShapes), and the recorded posture is
+	// re-verified against the installed triggers at every CDC open.
+	CaptureReplicatedWrites bool
 }
 
 // Plan is the result of a dry-run [Setup]. Holds the DDL statements
@@ -275,14 +303,19 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		)
 	}
 
-	// WARN (never refuse) when the source's writes can arrive under
-	// session_replication_role=replica — a logical-replication subscriber
-	// source or an all-sluice relay — which the plain capture triggers
-	// installed below do NOT fire for (audit 2026-08-26 F1; see
-	// preflight_replica_role.go for the shapes and why the ENABLE ALWAYS
-	// full fix is deferred to an ADR). Fires on dry-run too: the operator
-	// should see the risk while planning, not after installing.
-	warnReplicaRoleCaptureBlindness(ctx, db, opts.Schema)
+	// The replica-role capture shapes (audit 2026-08-26 F1, ADR-0185).
+	// Default posture: WARN (never refuse) when the source's writes can
+	// arrive under session_replication_role=replica — a logical-replication
+	// subscriber source or an all-sluice relay — which the plain capture
+	// triggers installed below do NOT fire for. Under
+	// --capture-replicated-writes the subscriber shape is the SUPPORTED
+	// case (the ENABLE ALWAYS triggers capture it) and the relay shape is
+	// REFUSED instead (the echo loop; SLUICE-E-CDC-TRIGGER-ECHO-LOOP).
+	// Runs on dry-run too: the operator should see the risk — or the
+	// refusal — while planning, not after installing.
+	if err := checkReplicaRoleCaptureShapes(ctx, db, opts.Schema, opts.CaptureReplicatedWrites); err != nil {
+		return nil, err
+	}
 
 	// §14 per-table preflight: no-PK, UNLOGGED, generated columns,
 	// custom domain-over-UDT. Also loads each table's PK column list —
@@ -327,7 +360,7 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	for i, t := range opts.Tables {
 		specs[i] = tableTriggerSpec{Name: t, PKCols: pkColsByTable[t]}
 	}
-	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload)
+	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload, opts.CaptureReplicatedWrites)
 
 	if len(refusals) > 0 {
 		// Refusals block the run even on dry-run — the operator
@@ -451,13 +484,17 @@ func filterEngineInternalTables(tables []string) (kept, excluded []string) {
 // have set up, so the expected set must be what the oldest shipped installer
 // wrote. Ground-truthed from the DDL's own history (`git log -p` over this
 // file): no column of these three tables has ever been renamed or removed — the
-// only schema evolution has been a whole NEW table (the consumer registry at
-// schema_version 2), and an absent table is created rather than graded. So the
-// floor and the rendered DDL agree exactly today, which is what
-// [TestInternalTableColumnFloorMatchesTheRenderedDDL] pins; a future release
-// that ADDS a column must not add it here unless it also migrates existing
-// installs, and that gate forces the decision rather than letting an upgrade
-// start refusing every source it used to accept.
+// schema evolutions have been a whole NEW table (the consumer registry at
+// schema_version 2) and an ADDED meta column ([metaCaptureReplicatedCol],
+// schema_version 3, ADR-0185) that is deliberately NOT in this floor: pre-v3
+// installs lack it, setup's ADD COLUMN IF NOT EXISTS is the migration, and the
+// posture read treats absence as false. An absent table is created rather than
+// graded. So the floor and the rendered CREATE TABLE bodies agree exactly
+// today, which is what [TestInternalTableColumnFloorMatchesTheRenderedDDL]
+// pins; a future release that ADDS a column to a CREATE body must not add it
+// here unless it also migrates existing installs, and that gate forces the
+// decision rather than letting an upgrade start refusing every source it used
+// to accept.
 //
 // # Why column NAMES and not the indexes
 //
@@ -601,7 +638,16 @@ func pkColsJSON(cols []string) string {
 //
 // The trigger DDL is not a member of the class: it emits
 // `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is loud.
-func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload) []string {
+//
+// captureReplicated (ADR-0185) adds, per table, an
+// `ALTER TABLE … ENABLE ALWAYS TRIGGER` for the row and truncate triggers
+// — PostgreSQL has no ENABLE ALWAYS clause on CREATE TRIGGER, so the
+// posture is a separate ALTER after each create — and records the posture
+// in the meta upsert so every CDC open can grade the installed enablement
+// against the recorded intent (the F2 door's posture match). A re-run
+// WITHOUT the flag converges an opt-in install back to plain: the
+// DROP + CREATE yields fresh 'O' triggers and the upsert records false.
+func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
@@ -638,6 +684,14 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
     installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT sluice_change_log_meta_singleton CHECK (singleton_pk = TRUE)
 )`,
+		// The v3 capture-posture column (ADR-0185), added by ALTER rather
+		// than in the CREATE body above so ONE statement migrates every
+		// install — a fresh create and a pre-v3 re-run alike — and the
+		// column-floor gate's CREATE-derived roster (setup_adoption_test)
+		// keeps grading pre-v3 installs against the columns they actually
+		// have. Readers default an absent column to false, so an install
+		// that never re-runs setup keeps its origin-only posture.
+		"ALTER TABLE " + tableRef(ChangeLogMetaTable) + " ADD COLUMN IF NOT EXISTS " + metaCaptureReplicatedCol + " BOOLEAN NOT NULL DEFAULT FALSE",
 		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
 		// trigger-CDC stream reading this database records its own
 		// durably-applied frontier here and the auto-prune cuts at the MIN
@@ -652,8 +706,9 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 )`,
 
 		fmt.Sprintf(
-			"INSERT INTO %s (singleton_pk, schema_version) VALUES (TRUE, %d) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version",
-			tableRef(ChangeLogMetaTable), ChangeLogSchemaVer,
+			"INSERT INTO %s (singleton_pk, schema_version, %s) VALUES (TRUE, %d, %t) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version, %s = EXCLUDED.%s",
+			tableRef(ChangeLogMetaTable), metaCaptureReplicatedCol, ChangeLogSchemaVer, captureReplicated,
+			metaCaptureReplicatedCol, metaCaptureReplicatedCol,
 		),
 
 		// Row-event capture function. TG_ARGV[0] carries the table's
@@ -694,6 +749,17 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 				tableRef(CaptureFunctionTruncate),
 			),
 		)
+		if captureReplicated {
+			// ADR-0185: fire under session_replication_role=replica too
+			// (native subscription apply workers, privileged appliers).
+			// Both members of the pair, so replicated TRUNCATE is graded
+			// the same as replicated DML.
+			out = append(
+				out,
+				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerRow)),
+				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerTruncate)),
+			)
+		}
 	}
 
 	if canEventTrigger {

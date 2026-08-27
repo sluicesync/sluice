@@ -518,6 +518,20 @@ const (
 	// previously the statement fell into the generic-DDL arm and was
 	// silently dropped. The dispatch-time belt refuses it instead.
 	CodeCDCStatementDML Code = "SLUICE-E-CDC-STATEMENT-DML"
+
+	// ADR-0185: `trigger setup --capture-replicated-writes` installs the
+	// pgtrigger capture triggers ENABLE ALWAYS so DML applied under
+	// session_replication_role=replica (native logical-replication apply
+	// workers; privileged appliers) IS captured — the supported scenario
+	// being a source that is itself a native subscriber. That posture is
+	// refused, at setup and at every CDC open, when the source ALSO
+	// carries sluice's own apply bookkeeping (sluice_cdc_state): another
+	// sluice sync applies INTO this database, so ALWAYS triggers would
+	// re-capture its applied rows and forward them as new changes — an
+	// echo loop (unbounded re-application in a cyclic topology,
+	// duplicated fan-out otherwise). Without the opt-in the same relay
+	// shape stays the SILENT-CAPTURE-GAP WARN, never this refusal.
+	CodeCDCTriggerEchoLoop Code = "SLUICE-E-CDC-TRIGGER-ECHO-LOOP"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -671,6 +685,8 @@ var registry = map[Code]Info{
 	CodeCDCReplicaNoLogUpdates: {ClassRefusal, "binlog CDC refused at start: the source is itself a replica with log_replica_updates=OFF, so writes replicated from its primary never enter THIS server's binlog — the CDC tail would be silently empty for all replicated traffic while local writes keep it looking alive; point the sync at the primary, or restart mysqld with log_replica_updates=ON (the variable is read-only at runtime)"},
 	CodeCDCBinlogDBFiltered:    {ClassRefusal, "binlog CDC refused at start: the source's --binlog-ignore-db / --binlog-do-db startup filters exclude a synced database from the binlog, so its writes are applied but never logged — the CDC tail would be silently empty for that database; remove the filter flags and restart mysqld (they are not settable at runtime), or take the database out of the sync's scope"},
 	CodeCDCStatementDML:        {ClassRefusal, "binlog CDC stopped mid-stream: a row-DML statement (INSERT/UPDATE/DELETE/REPLACE) arrived as QUERY-event text, which under ROW logging is proof a writing session overrode binlog_format to STATEMENT/MIXED — sluice deliberately never executes replayed SQL text, so these writes cannot be applied; fix the offending session, ensure @@GLOBAL.binlog_format=ROW with no session overrides, then start the sync fresh (the statement-logged writes are only recoverable by re-snapshot)"},
+
+	CodeCDCTriggerEchoLoop: {ClassRefusal, "replicated-write capture (trigger setup --capture-replicated-writes) refused, at setup and at every CDC open: the pgtrigger source carries sluice's own apply bookkeeping (sluice_cdc_state), so another sluice sync applies into this database and the ENABLE ALWAYS capture triggers would re-capture its applied rows as new changes — an echo loop; capture from the origin database instead, or decommission the upstream sync (and drop its control table), or install without the flag (origin-only capture + the replica-role WARN)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a
