@@ -213,9 +213,9 @@ func statementDMLError(verb, schema, query string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCStatementDML,
 		"find and clear the writing session's binlog_format override (performance_schema."+
-			"variables_by_thread WHERE VARIABLE_NAME='binlog_format'; requires performance_schema=ON — "+
-			"MariaDB defaults it OFF, so there find the writer via SHOW PROCESSLIST and interrogate "+
-			"candidate sessions), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh "+
+			"variables_by_thread WHERE VARIABLE_NAME='binlog_format'; MySQL-only: requires performance_schema=ON, and "+
+			"MariaDB lacks the variables_by_thread table entirely, so on MariaDB find the writer via "+
+			"SHOW PROCESSLIST and interrogate candidate sessions), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh "+
 			"(--restart-from-scratch) — the statement-logged writes are only recoverable by re-snapshot",
 		fmt.Errorf(
 			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s (%d bytes, sha256 %s, "+
