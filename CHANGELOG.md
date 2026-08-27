@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.133.0] - 2026-08-27
+
+Trigger-CDC can now capture replicated writes: `sluice trigger setup --capture-replicated-writes` (ADR-0185) makes the `postgres-trigger` engine capture DML applied under `session_replication_role = 'replica'`, turning the locked-down-primary → native-subscriber → sluice fan-out into a supported topology, with the echo-loop hazard refused loudly. Plus the honest lossless-shape refusal message, forensic hardening, and the notes-claims publish gate. Drop-in from v0.132.2.
+
+### Added
+
+**`trigger setup --capture-replicated-writes` (ADR-0185).** Installs every capture trigger pair `ENABLE ALWAYS`, so writes applied by native logical-replication apply workers — and by privileged replication tools — are captured instead of silently skipped. Ground-truthed on a real publisher→subscriber pair: replicated INSERT/UPDATE/DELETE **and TRUNCATE** all reach the change log (observed, not assumed). Capturing replicated writes on a database a sluice sync is itself applying into would loop the captured echoes, so that combination refuses loudly with the new **`SLUICE-E-CDC-TRIGGER-ECHO-LOOP`** — keyed on the upstream control table's existence, not its liveness (a paused upstream resumes into the loop). The chosen posture is recorded in the install's meta table; the capture-shape door verifies trigger enablement matches it in both directions, so a hand-flipped trigger is a loud refusal with `trigger setup` as the repair. Plain installs are unchanged and the existing capture-gap WARN now steers to the flag; re-running setup without the flag deliberately reverts to origin-only. Upgrade-in-place is pinned: pre-existing installs (no posture column) open unchanged as origin-only, driven against a genuine pre-upgrade table shape in the pre-tag value-fidelity review, with an integration pin that fails with the exact `42703` false-refuse if the tolerant read is ever simplified away.
+
+### Fixed
+
+**The unforwardable-type-change refusal is honest about lossless shapes.** Unbounded `varchar ⇄ text` swaps and interval precision widening perform no table rewrite, but v0.132.1's (correct) refusal claimed a silent divergence that never happened; those shapes now get an honest message — no rewrite occurred, the change simply cannot be forwarded, apply it on the target via the drained model. Refuse/pass behavior unchanged for every shape (pinned both directions); a pass-without-forward allowlist is sketched in ADR-0091 as demand-gated. The common `varchar(n) → text` migration was never affected.
+
+**Signature-heal log hardening**: a torn prior write cannot fuse two records; a pathologically long verify-failure line reads back (1 MiB cap, loud refusal past it, never a skip).
+
+### Internal
+
+The notes-claims-vs-tag-tree gate (`scripts/check-notes-claims.sh`, publish sub-check 4b — the v0.132.1 incident's mechanical ratchet, self-tested both directions and run against these notes); the pgtrigger probe-timeout roster covers the new posture probe; the perf-parity matrix gains the ADR-0184 estimator row; the pre-commit hooks warn on golangci-lint version drift from CI's pin; the C-2 and A2 design decisions recorded.
+
+### Compatibility
+
+Drop-in from v0.132.2 — no schema, format, or existing-flag change; the new flag is opt-in and the new error code fires only under it on a loop-risk topology. Existing pgtrigger installs are untouched.
+
 ## [0.132.2] - 2026-08-27
 
 The correction release: four items the v0.132.1 notes described missed that tag — a landing step ran against the wrong working tree, caught by the post-publish learnings sweep's tag-tree ground-truthing — and ship here, verified present at this tag. No other changes.
