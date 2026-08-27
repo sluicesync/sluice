@@ -261,12 +261,20 @@ func TestCheckSchemaRace_ForwardMode(t *testing.T) {
 	})
 
 	t.Run("ALTER COLUMN TYPE passes under forward", func(t *testing.T) {
-		relations := map[uint32]*relationCacheEntry{16400: base()}
+		// Production-shaped entries carry RESOLVED IR types (the
+		// TYPMOD-PROJECTION-GATE compares projections, and two nil types
+		// compare equal — the safe-but-wrong-shape fixture would refuse).
+		prev := base()
+		prev.Columns = []relationColumn{
+			typedCol(t, "id", 23, -1),
+			typedCol(t, "email", 25, -1), // text
+		}
+		relations := map[uint32]*relationCacheEntry{16400: prev}
 		current := &relationCacheEntry{
 			Schema: "public", Name: "users",
 			Columns: []relationColumn{
-				{Name: "id", OID: 23},
-				{Name: "email", OID: 1043}, // varchar (was text=25)
+				typedCol(t, "id", 23, -1),
+				typedCol(t, "email", 1043, 255+4), // varchar(255) (was text=25)
 			},
 		}
 		if err := checkSchemaRace(relations, 16400, current, true); err != nil {
@@ -376,15 +384,18 @@ func TestClassifyRelationChange_TypmodFamilies(t *testing.T) {
 		{"varchar(n) shrink", 1043, varcharTM(20), varcharTM(10), varcharTM(40)},
 		{"timestamp(p) precision shrink", 1114, 6, 3, -1},
 		{"bit(n) shrink", 1560, 8, 4, 16},
-		// The two detected-but-not-forwarded members (VF review
-		// 2026-08-26; ADR-0091 impl note): the raw compare fires — so
-		// refuse mode is loud, which is what these cells pin — but the
-		// projected IR drops these typmods (interval → empty
-		// ir.Interval{}; array elements resolve with typmod -1), so
-		// under forward mode no boundary is emitted and the rewrite is
-		// NOT forwarded. Documented residual, not convergence.
-		{"interval(p) precision shrink (refuse-only reach)", 1187, 6, 3, -1},
-		{"numeric[] element scale shrink (refuse-only reach)", 1231, numericTM(10, 4), numericTM(10, 1), numericTM(12, 6)},
+		// The two projection-invisible members (VF review 2026-08-26;
+		// ADR-0091 impl note): the raw compare fires — so refuse mode is
+		// loud, which is what these cells pin — but the projected IR
+		// drops these typmods (interval → empty ir.Interval{}; array
+		// elements resolve with typmod -1), so the forward intercept
+		// could never see them. Since audit 2026-08-27 A2 they refuse
+		// loudly under forward mode too (the TYPMOD-PROJECTION-GATE in
+		// checkSchemaRace; policy pinned by
+		// TestCheckSchemaRace_UnforwardableTypmod, enumeration by
+		// TestTypmodProjectionGate_EveryTypmodFamily).
+		{"interval(p) precision shrink (refuses under both modes)", 1186, 6, 3, -1},
+		{"numeric[] element scale shrink (refuses under both modes)", 1231, numericTM(10, 4), numericTM(10, 1), numericTM(12, 6)},
 	}
 
 	entry := func(oid uint32, tm int32) *relationCacheEntry {
@@ -420,6 +431,20 @@ func TestClassifyRelationChange_TypmodFamilies(t *testing.T) {
 	}
 }
 
+// typedCol builds a production-shaped relationColumn: the IR type is
+// resolved through the REAL wire mapper (oidToType), exactly as
+// buildRelationCacheEntry does, so fixtures cannot drift from what the
+// projection-comparing paths (TYPMOD-PROJECTION-GATE, maybeSnapshotSchema)
+// would see on a live stream.
+func typedCol(t *testing.T, name string, oid uint32, typmod int32) relationColumn {
+	t.Helper()
+	typ, err := oidToType(oid, typmod)
+	if err != nil {
+		t.Fatalf("oidToType(%d, %d): %v", oid, typmod, err)
+	}
+	return relationColumn{Name: name, OID: oid, TypeMod: typmod, Type: typ}
+}
+
 // TestCheckSchemaRace_TypmodOnlyChange pins the G3 shape at the policy
 // layer, both modes: refuse mode refuses loudly (the door the typmod
 // blindness bypassed), forward mode passes the reader gate so the
@@ -430,15 +455,15 @@ func TestCheckSchemaRace_TypmodOnlyChange(t *testing.T) {
 	prev := &relationCacheEntry{
 		Schema: "public", Name: "n",
 		Columns: []relationColumn{
-			{Name: "id", OID: 23},
-			{Name: "amt", OID: 1700, TypeMod: ((10 << 16) | 4) + 4}, // numeric(10,4)
+			typedCol(t, "id", 23, -1),
+			typedCol(t, "amt", 1700, ((10<<16)|4)+4), // numeric(10,4)
 		},
 	}
 	curr := &relationCacheEntry{
 		Schema: "public", Name: "n",
 		Columns: []relationColumn{
-			{Name: "id", OID: 23},
-			{Name: "amt", OID: 1700, TypeMod: ((10 << 16) | 1) + 4}, // numeric(10,1)
+			typedCol(t, "id", 23, -1),
+			typedCol(t, "amt", 1700, ((10<<16)|1)+4), // numeric(10,1)
 		},
 	}
 	relations := map[uint32]*relationCacheEntry{16400: prev}
@@ -455,6 +480,99 @@ func TestCheckSchemaRace_TypmodOnlyChange(t *testing.T) {
 	if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
 		t.Errorf("typmod-only ALTER must pass the reader gate under forward mode (the intercept forwards it); got: %v", err)
 	}
+}
+
+// TestCheckSchemaRace_UnforwardableTypmod pins the TYPMOD-PROJECTION-GATE
+// policy (audit 2026-08-27 A2): an ALTER COLUMN TYPE the classifier caught
+// whose PROJECTED IR type is unchanged refuses loudly under BOTH modes —
+// under forward, maybeSnapshotSchema could never emit a boundary for it
+// (the projected signature is unmoved), so "pass to the intercept" would
+// mean no ALTER, no WARN, and silent divergence of pre-existing target
+// rows while the source's rewrite rounds every stored value.
+//
+// The no-false-fire floor rides two facts, both pinned: an identical
+// pgoutput re-send classifies None (TestClassifyRelationChange_TypmodFamilies'
+// resend cells) so the gate is unreachable for it, and a delta that DOES
+// move the projection (numeric/varchar/temporal-precision members —
+// including the value-identical bare→(6) collapse-class ALTER, which moves
+// the RAW projection) keeps forwarding exactly as before.
+func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
+	numericTM := func(p, s int32) int32 { return ((p << 16) | s) + 4 }
+	intervalTM := func(p int32) int32 { return (0x7FFF << 16) | p } // full-range interval(p)
+
+	table := func(cols ...relationColumn) *relationCacheEntry {
+		return &relationCacheEntry{Schema: "public", Name: "t", Columns: cols}
+	}
+	requireUnforwardableRefusal := func(t *testing.T, err error, col string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("projection-invisible ALTER passed under forward mode; want the TYPMOD-PROJECTION-GATE refusal (a pass here is the A2 silent-divergence shape)")
+		}
+		for _, want := range []string{"cannot be forwarded", "%q-col%", "sync stop --wait"} {
+			if want == "%q-col%" {
+				want = `column "` + col + `"`
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal missing %q; got: %v", want, err)
+			}
+		}
+	}
+
+	t.Run("interval(p) precision shrink refuses under forward", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(3)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("interval typmod shrink must refuse under refuse mode too")
+		}
+	})
+
+	t.Run("numeric[] element scale shrink refuses under forward", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "amts", 1231, numericTM(10, 4)))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "amts", 1231, numericTM(10, 1)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "amts")
+	})
+
+	t.Run("mixed statement: a moved column does not rescue an unmoved one", func(t *testing.T) {
+		// One ALTER TABLE, two sub-ALTERs, one RelationMessage: the numeric
+		// scale change moves the TABLE signature (a boundary would be
+		// emitted), but the interval column's rewrite would still never be
+		// forwarded — the per-column gate must refuse, which is why the
+		// predicate is per-column rather than the whole-table signature
+		// equality the audit sketched.
+		prev := table(typedCol(t, "amt", 1700, numericTM(10, 4)), typedCol(t, "iv", 1186, intervalTM(6)))
+		curr := table(typedCol(t, "amt", 1700, numericTM(10, 1)), typedCol(t, "iv", 1186, intervalTM(3)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("projection-identical OID swap (time→timetz) refuses under forward", func(t *testing.T) {
+		// Not a typmod delta but the same class: both OIDs project to
+		// ir.Time{...}, so the signature cannot move and the forward
+		// intercept could never see the change (the TIMETZ-PROJECTION
+		// filing's forward half).
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+	})
+
+	t.Run("temporal collapse-class ALTER (bare→(6)) still forwards", func(t *testing.T) {
+		// bare and (6) are value-identical on PG, and the RAW projection
+		// moves (PrecisionUnspecified flips), so a boundary IS emitted and
+		// the gate must not fire — the intended treatment for the
+		// collapse-class members: their forwarding posture stays the
+		// documented normalizer false-negative downstream, never a reader
+		// refusal.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1114, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1114, 6))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("collapse-class bare→(6) must pass under forward (raw projection moves, boundary emits); got: %v", err)
+		}
+	})
 }
 
 // _ ensures the ir import stays meaningful in this file even if a

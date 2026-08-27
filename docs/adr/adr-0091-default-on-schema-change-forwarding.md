@@ -454,22 +454,33 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     the compare is on the raw wire typmod, projection-independent —
     and pre-fix, refuse mode had NO door for this shape and diverged
     silently.
-  - *Detected-but-not-forwarded class (VF review 2026-08-26): a typmod
-    delta visible to the raw compare but INVISIBLE to the projected
-    IR.* For these members the raw compare classifies `AlterColumnType`
-    (so `refuse` is loud), but the projected schema signature does not
-    move, so under `forward` no boundary is emitted, no ALTER is
-    forwarded, and the source's rewrite silently diverges pre-existing
-    target rows — exactly the temporal-caveat shape below. Enumerated
+  - *Detected-but-unforwardable class (VF review 2026-08-26; refusal
+    shipped, audit 2026-08-27 A2): a typmod delta visible to the raw
+    compare but INVISIBLE to the projected IR.* For these members the
+    raw compare classifies `AlterColumnType`, but the projected schema
+    signature does not move, so `forward` could never emit a boundary
+    or forward an ALTER for them. They now **refuse loudly under BOTH
+    modes** — the reader's TYPMOD-PROJECTION-GATE
+    (`unforwardableTypmodColumn` in `checkSchemaRace`, per changed
+    COLUMN so a mixed multi-column ALTER cannot ride a sibling's moved
+    signature) fires the standard drained-model refusal instead of
+    silently diverging pre-existing target rows at exit 0. Enumerated
     members: **`interval(p)` / interval field restrictions** (projects
     to the empty `ir.Interval{}`; `ALTER … TYPE interval(3)` rounds
-    every stored fractional second with zero decoded messages) and
+    every stored fractional second with zero decoded messages),
     **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
     rounds every element; the element resolves with typmod −1 by
-    design). Use the drained model for those ALTERs, as for any
-    value-rewriting DDL. The class-enumeration gate (each
-    typmod-consuming family in `oidToType` either moves the projected
-    signature or sits on this documented list) is a filed follow-up.
+    design), and **projection-identical OID swaps** (`time ↔ timetz`,
+    which share one IR family). The temporal-collapse members below
+    are NOT in this class — their raw projection moves, so they emit a
+    boundary and keep the normalizer posture described in the caveat.
+    Use the drained model for these ALTERs, as the refusal instructs.
+    The class-enumeration gate is BUILT:
+    `TestTypmodProjectionGate_EveryTypmodFamily` asserts every
+    typmod-consuming family in `oidToType` (pg_type.typmodin-derived
+    scalar roster + the derived array roster) either moves the
+    projected signature or sits on this documented refuse list, and
+    that the reader actually refuses the listed members under forward.
   - *Same-type, same-typmod `ALTER … USING <expr>`:* **undetectable,
     permanently** — the post-rewrite RelationMessage is byte-identical
     to the pre-rewrite one and no catalog artifact survives; the source

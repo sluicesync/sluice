@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -257,6 +258,13 @@ func classifyRelationChange(prev, current *relationCacheEntry) relationChange {
 // refused, just one layer down with a better diagnostic. RENAME TABLE
 // (and the DROP+CREATE-same-name case handled separately in
 // checkSchemaRace) is never forwardable — it stays a loud reader refusal.
+//
+// An ALTER COLUMN TYPE whose projected IR type does not move is an
+// exception applied by checkSchemaRace itself (the TYPMOD-PROJECTION-GATE,
+// audit 2026-08-27 A2): the forward intercept can only ever see a change
+// that moves the projected signature, so a projection-invisible delta
+// refuses loudly there instead of passing here. See
+// [unforwardableTypmodColumn].
 func (k relationChangeKind) passesUnderSchemaForward() bool {
 	switch k {
 	case relationChangeDropColumn,
@@ -302,6 +310,21 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	// SchemaSnapshot path; everything else (and everything under refuse
 	// mode) is a loud reader refusal.
 	forwarded := schemaForward && change.Kind.passesUnderSchemaForward()
+	// TYPMOD-PROJECTION-GATE (audit 2026-08-27 A2): an ALTER COLUMN TYPE the
+	// classifier caught but whose PROJECTED IR type is unchanged can never be
+	// forwarded — [CDCReader.maybeSnapshotSchema] emits a boundary iff the
+	// projected signature moved, so forward mode would emit no boundary, no
+	// ALTER, no WARN, while the source's table rewrite (interval(6)→(3) rounds
+	// every fractional second; numeric(10,4)[]→(10,1)[] rounds every element)
+	// silently diverges pre-existing target rows at exit 0. Detected-but-
+	// unforwardable is exactly the refuse-mode situation, so refuse loudly with
+	// the same drained-model remedy instead of waving it through.
+	if forwarded && change.Kind == relationChangeAlterColumnType {
+		if col, unforwardable := unforwardableTypmodColumn(relations[relationID], current); unforwardable {
+			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta (interval precision/field restrictions and array-element modifiers do not survive the wire projection), so --schema-changes=forward would emit no schema boundary and the source's table rewrite would silently diverge pre-existing target rows. %s",
+				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
+		}
+	}
 	if change.Description != "" && !forwarded {
 		return fmt.Errorf("postgres: cdc: incompatible schema change mid-stream on %s.%s (OID %d): %s. %s",
 			current.Schema, current.Name, relationID, change.Description, schemaRaceRecoveryHint)
@@ -324,6 +347,55 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 		}
 	}
 	return nil
+}
+
+// unforwardableTypmodColumn scans an AlterColumnType-classified prev/current
+// pair for a changed column whose PROJECTED IR type did not move — the
+// TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2). It returns the
+// first such column's name.
+//
+// The compare is per-COLUMN, not the whole-table [ir.SchemaSignatureOf]
+// equality the audit sketched: a single `ALTER TABLE` can carry a
+// signature-moving sub-ALTER (numeric scale) AND an unforwardable one
+// (interval precision) in one statement / one RelationMessage, and the
+// table-level compare would see the moved signature, forward the boundary,
+// and let the interval rewrite diverge — the sketch's own sibling gap. A
+// column is "changed" when its wire OID or typmod differs; its projection is
+// compared through the same [containSRIDSentinel] lens [projectRelation]
+// applies, so this predicate is exactly "would [CDCReader.maybeSnapshotSchema]
+// see this column move".
+//
+// Deliberately the RAW projected type, never the [normalizeTypeForCDCComparison]
+// lens: the temporal-collapse members (bare ≡ (0) ≡ (6)) DO move the raw
+// projection (Precision/PrecisionUnspecified differ), so they emit a boundary
+// and keep their documented downstream posture (the normalizer false-negative,
+// cdc_normalize.go) — keying on the normalized form would false-refuse the
+// value-identical bare→(6) ALTER.
+//
+// False-fire analysis (pinned by TestClassifyRelationChange_TypmodFamilies'
+// identical-resend cells): this only runs when the classifier fired
+// AlterColumnType, which requires an OID or typmod delta at some ordinal — a
+// pgoutput reconnect/first-touch re-send is field-identical, classifies None,
+// and never reaches it. Ordinals whose NAME differs are skipped (rename
+// business — the intercept's ADR-0091 §3 refusal owns those). A nil projected
+// type on a changed column compares equal and refuses — the safe direction
+// (production entries always carry a resolved type; buildRelationCacheEntry
+// errors on unresolvable OIDs).
+func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, bool) {
+	n := min(len(prev.Columns), len(current.Columns))
+	for i := 0; i < n; i++ {
+		pc, cc := prev.Columns[i], current.Columns[i]
+		if pc.Name != cc.Name {
+			continue
+		}
+		if pc.OID == cc.OID && pc.TypeMod == cc.TypeMod {
+			continue
+		}
+		if reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
+			return pc.Name, true
+		}
+	}
+	return "", false
 }
 
 // schemaRaceRecoveryHint is the operator-actionable recovery text the
