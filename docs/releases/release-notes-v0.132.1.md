@@ -1,5 +1,7 @@
 # sluice v0.132.1
 
+> **Correction (2026-08-27):** four items originally described in these notes MISSED this tag — a landing step ran against the wrong working tree — and shipped in **v0.132.2** instead: the pgtrigger probe-timeout bounds, the `schema add-table` UNLOGGED census, the G2 environmental-premise pins, and the STATEMENT-DML lead's `=`-cut for unquoted numeric literals (this tag carries the quote/paren cut). Everything else below is in this tag as described. The omission was caught by the post-publish learnings sweep's tag-tree ground-truthing.
+
 **The audit fast-follow: the fresh post-v0.132.0 blind audit found the new replica-source door was itself narrower than its name — blind to MariaDB named-connection (multi-source) replicas — and this patch closes that plus eight hardening findings from the same pass.** Drop-in from v0.132.0 — no schema, format, flag, or command change; no new error codes.
 
 ## Fixed

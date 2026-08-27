@@ -4,7 +4,29 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.132.2] - 2026-08-27
+
+The correction release: four items the v0.132.1 notes described missed that tag — a landing step ran against the wrong working tree, caught by the post-publish learnings sweep's tag-tree ground-truthing — and ship here, verified present at this tag. No other changes.
+
+### Fixed
+
+**Every pgtrigger open-path probe is bounded at 15s** (audit A5). The relay-shape probe read a lockable user table, so a queued `ALTER`/`VACUUM FULL` behind a long transaction could park every CDC open indefinitely; all five open-path probes now derive bounded contexts — WARN-probes degrade to their probe-error WARN on timeout, the fail-closed capture-shape door refuses with a timeout-specific message — and a cross-engine AST roster gate asserts every CDC-open probe in all three engines derives a timeout.
+
+**`schema add-table` refuses an UNLOGGED table before any side effect** (audit A7) — previously blocked late with a misleading message after creating the target table. The registration path now runs the coded `SLUICE-E-CDC-UNLOGGED-TABLE` census before the dry-run report, target DDL, or snapshot.
+
+**The `SLUICE-E-CDC-STATEMENT-DML` lead also cuts at `=`** (the A4 tightening): the quote/paren-only cut shipped in v0.132.1 let unquoted numeric literals (`SET ssn=078051120`) survive inside the cap; string AND numeric values now never reach the error.
+
+### Internal
+
+G2's two environmental premises (FOR ALL TABLES silently excludes unlogged tables; `SET UNLOGGED` succeeds under it but is refused for scoped membership) pinned against real Postgres, riding the version matrix (audit A8). Process: the landing-verification gap that caused the miss is filed with a gate proposal (notes-claims-vs-tag-tree check) in the backlog.
+
+### Compatibility
+
+Drop-in from v0.132.1; no schema, format, flag, or command change; no new error codes.
+
 ## [0.132.1] - 2026-08-27
+
+**Correction (2026-08-27):** four items originally described in these notes MISSED this tag — a landing step ran against the wrong working tree — and shipped in **v0.132.2** instead: the pgtrigger probe-timeout bounds, the `schema add-table` UNLOGGED census, the G2 environmental-premise pins, and the STATEMENT-DML lead's `=`-cut for unquoted numeric literals (this tag carries the quote/paren cut). Everything else below is in this tag as described. The omission was caught by the post-publish learnings sweep's tag-tree ground-truthing.
 
 The audit fast-follow. The fresh post-v0.132.0 blind audit (grade A−, scorecard 12 FIXED / 1 PARTIAL / 5 OPEN / 0 REGRESSED on the prior pass) found the new replica-source door was itself narrower than its name, plus eight hardening findings — all remediated here. Drop-in from v0.132.0; no schema, format, flag, or command change; no new error codes.
 
