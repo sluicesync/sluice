@@ -122,10 +122,11 @@ func TestStatementDMLError(t *testing.T) {
 func TestStatementDMLLead(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct{ in, want string }{
-		"paren_first":        {"INSERT INTO t VALUES (1,'x')", "INSERT INTO t VALUES…"},
-		"single_quote_first": {"UPDATE t SET v = 'secret' WHERE id = 9", "UPDATE t SET v =…"},
-		"double_quote_first": {`DELETE FROM t WHERE v = "secret"`, "DELETE FROM t WHERE v =…"},
-		"no_literals":        {"DELETE FROM t WHERE id = id2", "DELETE FROM t WHERE id = id2"},
+		"paren_first":            {"INSERT INTO t VALUES (1,'x')", "INSERT INTO t VALUES…"},
+		"single_quote_first":     {"UPDATE t SET v = 'secret' WHERE id = 9", "UPDATE t SET v…"},
+		"double_quote_first":     {`DELETE FROM t WHERE v = "secret"`, "DELETE FROM t WHERE v…"},
+		"no_assignments":         {"DELETE FROM t WHERE id IS NULL", "DELETE FROM t WHERE id IS NULL"},
+		"numeric_literal_eq_cut": {"UPDATE t SET ssn=078051120", "UPDATE t SET ssn…"},
 		"cap": {
 			"UPDATE " + strings.Repeat("very_long_table_name_", 10) + " SET a = b",
 			"UPDATE " + strings.Repeat("very_long_table_name_", 10)[:statementDMLEchoCap-len("UPDATE ")] + "…",
