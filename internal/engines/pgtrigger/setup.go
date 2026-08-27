@@ -59,6 +59,22 @@ const (
 	// the migration, and the posture read defaults an absent column to
 	// false (origin-only), which is exactly what a pre-v3 install is.
 	metaCaptureReplicatedCol = "capture_replicated_writes"
+
+	// setupSessionGUC is the session-scoped marker Setup's own session sets
+	// (`SET sluice.setup_in_progress = 'on'` — the plan's first statement)
+	// and the DDL capture function returns early on (Bug 257). Without it,
+	// every `trigger setup` RE-RUN over an existing event-trigger install
+	// records sluice's OWN idempotent DDL — the ADR-0185 meta ADD COLUMN
+	// migration fires ddl_command_end even as an IF-NOT-EXISTS no-op, and
+	// the opt-in's ENABLE ALWAYS ALTERs carry the ALTER TABLE tag — as
+	// op='X' rows, so the next warm resume refuses "observed source-side
+	// DDL" and steers a full re-copy for statements no operator ran.
+	// Session-scoped (not a relation exemption) so it suppresses exactly
+	// sluice's own setup session for exactly as long as it runs: any
+	// current or future setup-emitted DDL is covered, while operator DDL —
+	// including DDL against sluice's own tables from any other session —
+	// keeps recording.
+	setupSessionGUC = "sluice.setup_in_progress"
 )
 
 // CapturePayload selects how much of each changed row the capture
@@ -371,8 +387,20 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return plan, nil
 	}
 
+	// Every statement rides ONE session: the plan's first statement sets
+	// [setupSessionGUC] (session-scoped, Bug 257), and a pooled
+	// db.ExecContext may hop connections between statements — which would
+	// silently drop the suppression and re-open exactly the self-recorded
+	// op='X' poisoning the GUC exists to prevent. An operator applying a
+	// dry-run plan by hand through psql gets the same property for free
+	// (one psql session).
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return plan, fmt.Errorf("pgtrigger: setup: acquire session: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
 	for _, stmt := range plan.Statements {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return plan, fmt.Errorf("pgtrigger: setup: exec %q: %w", firstLine(stmt), err)
 		}
 	}
@@ -647,12 +675,34 @@ func pkColsJSON(cols []string) string {
 // against the recorded intent (the F2 door's posture match). A re-run
 // WITHOUT the flag converges an opt-in install back to plain: the
 // DROP + CREATE yields fresh 'O' triggers and the upsert records false.
+//
+// The plan is bracketed by SET/RESET of [setupSessionGUC] (Bug 257) so a
+// re-run's own DDL is never recorded as op='X' by the install's already-
+// present event trigger; the whole plan must therefore execute on ONE
+// session (Setup pins a connection, and an operator applying a dry-run
+// plan by hand gets it from psql's single session). On an install whose
+// capture-DDL function predates the suppression check, the GUC alone is
+// not enough — the OLD function body ignores it — so the CREATE OR
+// REPLACE of that function is the plan's FIRST DDL statement, ahead of
+// every statement the event trigger's TAG filter watches.
 func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
-	out := []string{
-		"CREATE TABLE IF NOT EXISTS " + tableRef(ChangeLogTable) + ` (
+	out := []string{"SET " + setupSessionGUC + " = 'on'"}
+	if canEventTrigger {
+		// Re-created FIRST, before any TAG-watched statement (Bug 257): a
+		// re-setup over an install whose function body predates the
+		// suppression check must replace that body before the first
+		// statement the old body would record (the meta ADD COLUMN below).
+		// Safe on a fresh install too — plpgsql bodies are only
+		// syntax-checked at CREATE time, so the reference to the
+		// not-yet-created change-log table resolves at first execution.
+		out = append(out, renderCaptureDDLFunction(schema, tableRef(ChangeLogTable)))
+	}
+	out = append(
+		out,
+		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogTable)+` (
     id            BIGSERIAL PRIMARY KEY,
     txid          BIGINT NOT NULL,
     committed_at  TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
@@ -675,10 +725,10 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// operator pays IOPS. The idempotent DROPs converge any
 		// pre-existing install to the lean shape; on a fresh install
 		// they are no-ops.
-		"DROP INDEX IF EXISTS " + tableRef("sluice_change_log_id_idx"),
-		"DROP INDEX IF EXISTS " + tableRef("sluice_change_log_table_idx"),
+		"DROP INDEX IF EXISTS "+tableRef("sluice_change_log_id_idx"),
+		"DROP INDEX IF EXISTS "+tableRef("sluice_change_log_table_idx"),
 
-		"CREATE TABLE IF NOT EXISTS " + tableRef(ChangeLogMetaTable) + ` (
+		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogMetaTable)+` (
     singleton_pk   BOOLEAN PRIMARY KEY DEFAULT TRUE,
     schema_version INT NOT NULL,
     installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -691,7 +741,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// keeps grading pre-v3 installs against the columns they actually
 		// have. Readers default an absent column to false, so an install
 		// that never re-runs setup keeps its origin-only posture.
-		"ALTER TABLE " + tableRef(ChangeLogMetaTable) + " ADD COLUMN IF NOT EXISTS " + metaCaptureReplicatedCol + " BOOLEAN NOT NULL DEFAULT FALSE",
+		"ALTER TABLE "+tableRef(ChangeLogMetaTable)+" ADD COLUMN IF NOT EXISTS "+metaCaptureReplicatedCol+" BOOLEAN NOT NULL DEFAULT FALSE",
 		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
 		// trigger-CDC stream reading this database records its own
 		// durably-applied frontier here and the auto-prune cuts at the MIN
@@ -699,7 +749,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// reaped. Created before the meta upsert below lifts
 		// schema_version to 2, so the version can never claim a registry
 		// that isn't there.
-		"CREATE TABLE IF NOT EXISTS " + tableRef(ChangeLogConsumersTable) + ` (
+		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogConsumersTable)+` (
     consumer_id  TEXT PRIMARY KEY,
     applied_id   BIGINT NOT NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -721,7 +771,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// TRUNCATE companion — separate function because TRUNCATE
 		// triggers are FOR EACH STATEMENT, not FOR EACH ROW.
 		renderCaptureTruncateFunction(schema, tableRef(ChangeLogTable)),
-	}
+	)
 
 	for _, t := range tables {
 		// Drop any pre-existing trigger with the canonical name so
@@ -763,9 +813,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 	}
 
 	if canEventTrigger {
+		// The DDL capture FUNCTION is the plan's first DDL statement (see
+		// the Bug 257 ordering note above); only the event trigger itself
+		// is (re)created here.
 		out = append(
 			out,
-			renderCaptureDDLFunction(schema, tableRef(ChangeLogTable)),
 			"DROP EVENT TRIGGER IF EXISTS "+quoteIdent(CaptureTriggerDDL),
 			fmt.Sprintf(
 				"CREATE EVENT TRIGGER %s ON ddl_command_end WHEN TAG IN ('ALTER TABLE','CREATE TABLE','DROP TABLE','CREATE INDEX','DROP INDEX') EXECUTE FUNCTION %s()",
@@ -775,6 +827,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		)
 	}
 
+	out = append(out, "RESET "+setupSessionGUC)
 	return out
 }
 
@@ -1032,6 +1085,23 @@ END
 $sluice$;`
 }
 
+// captureDDLSuppressionCheck is the Bug 257 early-return the DDL capture
+// function opens with: when the firing session is sluice's own `trigger
+// setup` (marked by [setupSessionGUC]), record nothing. current_setting's
+// missing_ok form yields NULL for a never-set GUC, and `NULL = 'on'` is
+// not true, so every other session — operator DDL included — records
+// exactly as before. A named const (rather than inline body text) so the
+// integration pin can reconstruct the PRE-fix function body by stripping
+// exactly this block, exercising the old-install re-setup ordering.
+const captureDDLSuppressionCheck = `    -- Bug 257: sluice's own setup session emits idempotent DDL (the meta
+    -- ADD COLUMN migration, the opt-in's trigger-enablement ALTERs) on
+    -- every re-run; recording it as op='X' would make the next warm
+    -- resume refuse sluice's own statements as operator DDL.
+    IF current_setting('` + setupSessionGUC + `', true) = 'on' THEN
+        RETURN;
+    END IF;
+`
+
 // renderCaptureDDLFunction returns the CREATE OR REPLACE FUNCTION
 // statement for the DDL event-trigger handler. ADR-0066 §7. The
 // event trigger emits a marker row with op='X' for every recognised
@@ -1055,7 +1125,7 @@ AS $sluice$
 DECLARE
     r RECORD;
 BEGIN
-    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+` + captureDDLSuppressionCheck + `    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;
         END IF;
