@@ -169,19 +169,20 @@ func (r *CDCReader) dispatchStatementGuards(q, schema string) (handled bool, err
 const statementDMLEchoCap = 80
 
 // statementDMLLead returns the diagnostic prefix of a row-DML
-// statement, cut BEFORE the first string-literal quote or opening
-// paren — whichever comes first — and capped at statementDMLEchoCap
-// bytes. The verb and table name (which precede the first paren or
-// literal in every DML shape) are diagnostic; the VALUES are not, and
-// must never reach the error (audit 2026-08-27 A4: the binlog text
-// carries row values — PII that would bypass --redact by riding the
-// refusal into logs and reports). Numeric literals after SET/WHERE can
-// survive the cut only within the byte cap; the cap is why it is 80,
-// not the old 160.
+// statement, cut BEFORE the first string-literal quote, opening paren,
+// or `=` — whichever comes first — and capped at statementDMLEchoCap
+// bytes. The verb, table name, and leading column name (which precede
+// the first paren, literal, or assignment in every DML shape) are
+// diagnostic; the VALUES are not, and must never reach the error
+// (audit 2026-08-27 A4: the binlog text carries row values — PII that
+// would bypass --redact by riding the refusal into logs and reports).
+// The `=` cut is what keeps UNQUOTED numeric literals (`SET
+// ssn=078051120`) out too — a quote/paren-only cut let them survive
+// within the cap.
 func statementDMLLead(query string) string {
 	cut := len(query)
 	for i := 0; i < len(query); i++ {
-		if c := query[i]; c == '\'' || c == '"' || c == '(' {
+		if c := query[i]; c == '\'' || c == '"' || c == '(' || c == '=' {
 			cut = i
 			break
 		}
