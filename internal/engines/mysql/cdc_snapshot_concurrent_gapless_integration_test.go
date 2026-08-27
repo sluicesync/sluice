@@ -124,7 +124,18 @@ func TestConcurrentSnapshotCapturesPositionUnderTheLock(t *testing.T) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	type marks struct{ lock, pos, unlock int }
+	// A thread may issue SEVERAL position-shaped statements: the CDC-open
+	// preflight bundle (capture-completeness G6) legitimately scans
+	// SHOW MASTER/BINARY LOG STATUS for the binlog filter columns BEFORE
+	// the freeze window opens. Those reads are not the anchor. The pin's
+	// claim is that the ANCHOR read — some position read strictly between
+	// FLUSH TABLES WITH READ LOCK and UNLOCK TABLES — exists on the
+	// coordinator connection, so we record every position read and assert
+	// on the in-window set rather than the first occurrence.
+	type marks struct {
+		lock, unlock int
+		pos          []int
+	}
 	perThread := map[int64]*marks{}
 	var (
 		stmts = 0
@@ -143,7 +154,7 @@ func TestConcurrentSnapshotCapturesPositionUnderTheLock(t *testing.T) {
 		seq++
 		m, ok := perThread[tid]
 		if !ok {
-			m = &marks{lock: -1, pos: -1, unlock: -1}
+			m = &marks{lock: -1, unlock: -1}
 			perThread[tid] = m
 		}
 		switch {
@@ -156,9 +167,7 @@ func TestConcurrentSnapshotCapturesPositionUnderTheLock(t *testing.T) {
 				m.unlock = seq
 			}
 		case upper(arg, "BINARY LOG STATUS"), upper(arg, "MASTER STATUS"), upper(arg, "BINLOG STATUS"):
-			if m.pos < 0 {
-				m.pos = seq
-			}
+			m.pos = append(m.pos, seq)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -168,26 +177,37 @@ func TestConcurrentSnapshotCapturesPositionUnderTheLock(t *testing.T) {
 		t.Fatal("general_log captured no statements — the log is not recording, so this gate is vacuous")
 	}
 
-	// Exactly one connection should carry all three marks: the coordinator.
+	// Exactly one connection should carry the whole freeze window — the
+	// coordinator — and it must have an ANCHOR read strictly inside
+	// lock..unlock. Position reads outside the window (the preflight
+	// bundle's filter-column scan) are tolerated on the coordinator but
+	// never count as the anchor: if the anchor read migrated outside the
+	// freeze window, the in-window set is empty and this fails.
 	coordinators := 0
 	for tid, m := range perThread {
-		if m.lock < 0 && m.pos < 0 && m.unlock < 0 {
+		if m.lock < 0 && m.unlock < 0 && len(m.pos) == 0 {
 			continue
 		}
-		if m.lock < 0 || m.pos < 0 || m.unlock < 0 {
-			t.Errorf("thread %d carries only part of the freeze window (lock=%d, position=%d, unlock=%d); the "+
+		if m.lock < 0 || m.unlock < 0 || len(m.pos) == 0 {
+			t.Errorf("thread %d carries only part of the freeze window (lock=%d, position reads=%v, unlock=%d); the "+
 				"lock, the anchor read and the unlock must all be on the coordinator connection — a position "+
 				"read on a DIFFERENT connection is not covered by this connection's lock",
 				tid, m.lock, m.pos, m.unlock)
 			continue
 		}
 		coordinators++
-		if !(m.lock < m.pos && m.pos < m.unlock) {
-			t.Errorf("thread %d executed the freeze window out of order (FLUSH TABLES WITH READ LOCK at %d, "+
-				"position read at %d, UNLOCK TABLES at %d; want lock < position < unlock). Outside the freeze, a "+
-				"commit landing between the readers' views and the recorded position is above the views and "+
-				"below the position, so it is in NEITHER the cold copy nor the CDC tail — the silent-loss case "+
-				"ADR-0101 §3 says cannot happen by construction",
+		inWindow := 0
+		for _, p := range m.pos {
+			if m.lock < p && p < m.unlock {
+				inWindow++
+			}
+		}
+		if inWindow == 0 {
+			t.Errorf("thread %d has NO position read inside the freeze window (FLUSH TABLES WITH READ LOCK at %d, "+
+				"position reads at %v, UNLOCK TABLES at %d; want an anchor read with lock < read < unlock). Outside "+
+				"the freeze, a commit landing between the readers' views and the recorded position is above the "+
+				"views and below the position, so it is in NEITHER the cold copy nor the CDC tail — the silent-loss "+
+				"case ADR-0101 §3 says cannot happen by construction",
 				tid, m.lock, m.pos, m.unlock)
 		}
 	}
