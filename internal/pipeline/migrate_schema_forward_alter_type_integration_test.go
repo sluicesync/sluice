@@ -393,6 +393,138 @@ func TestStreamer_SchemaForward_AlterType_TypmodOnly_PG(t *testing.T) {
 	}
 }
 
+// TestStreamer_SchemaForward_AlterType_VarcharShrink_PG is the second
+// forward-convergence COMPOSITION family (audit 2026-08-27 A9): the
+// capture-completeness matrix claims typmod forward convergence for the
+// IR-carrying families (plural), but until this test only numeric's
+// composition was pinned end-to-end — the forward-apply path renders
+// per-family DDL from per-family typmod projections (the Bug 74
+// family-dispatched shape: varchar packs n+4 where numeric packs
+// (p<<16|s)+4, and the emitted ALTER renders `varchar(10)` from
+// ir.Varchar{Length}, a different projection+render arm than numeric's).
+// A varchar(20)→varchar(10) shrink rewrites the table on the source (PG
+// re-checks every value against the new length; values that fit pass
+// unchanged) with zero decoded messages; the forwarded USING-less ALTER
+// must shrink the target's DECLARED type to match, and the pre-shrink
+// rows must remain intact on both sides. interval/array — the families
+// whose typmod never reaches the projection — are pinned separately as
+// refusals (TestTypmodProjectionGate_EveryTypmodFamily, the A2 gate).
+//
+// Same prime-then-mutate pattern as the tests above (ALTER TYPE is
+// seed-guarded at the first post-cold-start boundary, ADR-0091 §5b).
+func TestStreamer_SchemaForward_AlterType_VarcharShrink_PG(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE tags (
+			id INT PRIMARY KEY,
+			label VARCHAR(20)
+		);
+		ALTER TABLE tags REPLICA IDENTITY FULL;
+		INSERT INTO tags (id, label) VALUES (1, 'alpha'), (2, 'beta-tag');
+	`)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	streamer := &Streamer{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "test-fwd-altertype-varchar-pg",
+	}
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	if !waitForPGRowCount(t, targetDSN, "tags", 2, 30*time.Second) {
+		t.Fatalf("phase A: bulk-copy never landed seed rows")
+	}
+
+	tgtDB, err := sql.Open("pgx", targetDSN)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+
+	// PRIME: flip seed→CDC (a mutating shape at the first boundary is
+	// seed-guarded; the ADD COLUMN boundary is the standard unlock).
+	applyPGDDL(t, sourceDSN, `
+		ALTER TABLE tags ADD COLUMN _prime_col INT;
+		INSERT INTO tags (id, label, _prime_col) VALUES (100, 'prime', 1);
+	`)
+	if !waitForPGColumn(t, tgtDB, "tags", "_prime_col", true, 60*time.Second) {
+		t.Fatalf("prime: _prime_col never appeared on target — seed→CDC boundary not processed")
+	}
+
+	// The varchar typmod-only shrink: same OID (1043), new modifier. Every
+	// stored value fits varchar(10), so the source rewrite succeeds; the
+	// follow-on INSERT surfaces the new RelationMessage.
+	applyPGDDL(t, sourceDSN, `
+		ALTER TABLE tags ALTER COLUMN label TYPE VARCHAR(10);
+		INSERT INTO tags (id, label) VALUES (3, 'gamma');
+	`)
+
+	if !waitForPGRowID(t, tgtDB, "tags", 3, 60*time.Second) {
+		t.Fatalf("phase B: post-ALTER row never landed — varchar typmod-only ALTER TYPE forwarding broken")
+	}
+
+	// The target column's DECLARED length must have followed the source's —
+	// the composition half: the forwarded ALTER rendered varchar(10) from
+	// the varchar projection arm, not merely "a row landed".
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var maxLen int
+		err := tgtDB.QueryRow(
+			`SELECT character_maximum_length FROM information_schema.columns
+			  WHERE table_name = 'tags' AND column_name = 'label'`,
+		).Scan(&maxLen)
+		if err == nil && maxLen == 10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("target tags.label character_maximum_length = %d, err=%v; want 10 — the varchar typmod-only ALTER did not forward", maxLen, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// CONVERGENCE: pre-shrink rows hold identical values on both sides
+	// (the shrink's re-check passes fitting values through unchanged —
+	// loud on the source if any value did not fit, never a silent
+	// truncation).
+	assertTagsLabel(t, tgtDB, map[int]string{1: "alpha", 2: "beta-tag", 3: "gamma"})
+
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// assertTagsLabel compares tags.label per id against want.
+func assertTagsLabel(t *testing.T, db *sql.DB, want map[int]string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for id, wantLabel := range want {
+		var got string
+		if err := db.QueryRowContext(ctx, "SELECT label FROM tags WHERE id=$1", id).Scan(&got); err != nil {
+			t.Fatalf("scan label id=%d: %v", id, err)
+		}
+		if got != wantLabel {
+			t.Errorf("tags.label for id=%d = %q; want %q (pre-shrink target rows did not survive the forwarded varchar shrink)", id, got, wantLabel)
+		}
+	}
+}
+
 // assertLedgerAmtText compares ledger.amt::text per id against want —
 // text form so the numeric scale (12.3, not 12.3000) is part of the
 // assertion.
