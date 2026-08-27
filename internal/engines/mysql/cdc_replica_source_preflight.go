@@ -41,7 +41,14 @@ import (
 // standby door (CodeCDCStandbySource, pg_is_in_recovery()).
 //
 // Spellings: SHOW REPLICA STATUS is MySQL 8.0.22+ / MariaDB 10.5.1+;
-// SHOW SLAVE STATUS is the fallback for older servers. The variable is
+// SHOW SLAVE STATUS is the fallback for older servers. On MariaDB the
+// bare forms list ONLY the default connection — a `CHANGE MASTER
+// 'name' TO …` named multi-source connection returns ZERO rows there
+// (observed on mariadb:11.4, audit 2026-08-27 A1), so the probe also
+// runs the MariaDB-only SHOW ALL REPLICAS STATUS / SHOW ALL SLAVES
+// STATUS spellings; see sourceIsConfiguredReplica for the posture that
+// keeps MySQL's syntax error on the ALL forms from degrading the door.
+// The variable is
 // read as @@GLOBAL.log_replica_updates first (MySQL 8.0.26+; the only
 // spelling guaranteed on a future MySQL that drops the alias) falling
 // back to @@GLOBAL.log_slave_updates (readable on BOTH mysql:8.0 and
@@ -93,7 +100,8 @@ func preflightReplicaSource(ctx context.Context, q dbQuerier) error {
 		// Privilege-gated probe: WARN and pass, never refuse a working
 		// configuration on a failed read (see file comment). The gap this
 		// leaves open is stated rather than implied.
-		slog.WarnContext(ctx, "mysql: cdc: could not read SHOW REPLICA STATUS (nor SHOW SLAVE STATUS); "+
+		slog.WarnContext(ctx, "mysql: cdc: could not read SHOW REPLICA STATUS in any spelling "+
+			"(SLAVE fallback and MariaDB ALL forms included); "+
 			"the replica-source preflight is degraded — if this source is itself a replica with "+
 			"log_replica_updates=OFF, replicated writes are absent from its binlog and the CDC tail "+
 			"would be silently empty for them. Grant REPLICATION CLIENT (MariaDB 10.5+: REPLICA MONITOR) "+
@@ -142,20 +150,59 @@ func preflightReplicaSource(ctx context.Context, q dbQuerier) error {
 }
 
 // sourceIsConfiguredReplica reports whether the server has at least one
-// configured replication channel — SHOW REPLICA STATUS (SHOW SLAVE
-// STATUS on pre-8.0.22 / pre-10.5.1 servers) returns one row per
-// channel and an empty set on a non-replica. A configured-but-stopped
-// channel counts: the blindness begins the moment its threads start,
-// and a channel's presence is the operator's stated intent.
+// configured replication channel. Two spelling families are probed,
+// because they see DIFFERENT channel sets:
+//
+//   - SHOW REPLICA STATUS (SHOW SLAVE STATUS on pre-8.0.22 /
+//     pre-10.5.1 servers): on MySQL one row per channel, FOR CHANNEL
+//     multi-source included; on MariaDB only the DEFAULT connection —
+//     a `CHANGE MASTER 'name' TO …` named connection returns ZERO
+//     rows here (observed on mariadb:11.4, audit 2026-08-27 A1),
+//     exactly the multi-source replica the G5 door exists to catch.
+//   - SHOW ALL REPLICAS STATUS (SHOW ALL SLAVES STATUS on
+//     pre-10.5.1): MariaDB-only syntax listing EVERY connection,
+//     named ones included. MySQL rejects both with a 1064 syntax
+//     error.
+//
+// Posture, deliberately: the ALL forms are probed unconditionally (the
+// preflight holds only a connection, not a flavor), and an ALL-form
+// error after a bare form SUCCEEDED is tolerated WITHOUT degrading the
+// door — on every server where the ALL syntax exists (MariaDB) it is
+// readable under the same privilege as the bare form, so bare-success
+// + ALL-error identifies a MySQL, whose bare form already enumerates
+// every channel: there is no blind spot to WARN about. Only when NO
+// spelling succeeds does the caller take the privilege-blocked
+// WARN-and-pass posture. A configured-but-stopped channel counts: the
+// blindness begins the moment its threads start, and a channel's
+// presence is the operator's stated intent.
 func sourceIsConfiguredReplica(ctx context.Context, q dbQuerier) (bool, error) {
 	var lastErr error
+	bareSucceeded := false
 	for _, stmt := range []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"} {
 		has, err := queryReturnsRows(ctx, q, stmt)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		if has {
+			return true, nil
+		}
+		bareSucceeded = true
+		break
+	}
+	for _, stmt := range []string{"SHOW ALL REPLICAS STATUS", "SHOW ALL SLAVES STATUS"} {
+		has, err := queryReturnsRows(ctx, q, stmt)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 		return has, nil
+	}
+	if bareSucceeded {
+		// Neither ALL spelling exists (MySQL's 1064): the bare probe's
+		// channel view was already complete there, so its zero-row answer
+		// stands, undegraded (see the posture note above).
+		return false, nil
 	}
 	return false, lastErr
 }

@@ -24,8 +24,17 @@ import (
 //	status: replica          SHOW REPLICA STATUS returns one row
 //	        replica_slaveonly  SHOW REPLICA STATUS errors (old server);
 //	                           SHOW SLAVE STATUS returns one row
-//	        none             SHOW REPLICA STATUS returns zero rows
-//	        err              both spellings error (privilege sim)
+//	        none             SHOW REPLICA STATUS returns zero rows;
+//	                         ALL forms error 1064 (the MySQL shape)
+//	        maria_none       bare + ALL REPLICAS forms both zero rows
+//	        maria_named      SHOW REPLICA STATUS returns ZERO rows;
+//	                         SHOW ALL REPLICAS STATUS returns one row
+//	                         (a CHANGE MASTER 'name' TO named
+//	                         connection — audit 2026-08-27 A1)
+//	        maria_named_old  bare REPLICA + ALL REPLICAS error (old
+//	                         MariaDB); SHOW SLAVE STATUS zero rows;
+//	                         SHOW ALL SLAVES STATUS returns one row
+//	        err              all four spellings error (privilege sim)
 //	lru:    on / off         @@GLOBAL.log_replica_updates = 1 / 0
 //	        maria_on/maria_off  log_replica_updates errors 1193 (MariaDB);
 //	                            log_slave_updates = 1 / 0
@@ -62,7 +71,7 @@ func (c *replicaSourceConn) QueryContext(_ context.Context, query string, _ []dr
 		switch c.status {
 		case "replica":
 			return &replicaStatusRows{rows: 1}, nil
-		case "none":
+		case "none", "maria_none", "maria_named":
 			return &replicaStatusRows{rows: 0}, nil
 		default:
 			return nil, errors.New("access denied; you need (at least one of) the REPLICA MONITOR privilege(s)")
@@ -71,8 +80,28 @@ func (c *replicaSourceConn) QueryContext(_ context.Context, query string, _ []dr
 		switch c.status {
 		case "replica_slaveonly":
 			return &replicaStatusRows{rows: 1}, nil
+		case "maria_named_old":
+			return &replicaStatusRows{rows: 0}, nil
 		default:
 			return nil, errors.New("access denied; you need (at least one of) the SUPER, REPLICATION CLIENT privilege(s)")
+		}
+	case "SHOW ALL REPLICAS STATUS":
+		switch c.status {
+		case "maria_none":
+			return &replicaStatusRows{rows: 0}, nil
+		case "maria_named":
+			return &replicaStatusRows{rows: 1}, nil
+		default:
+			// MySQL (and pre-10.5.1 MariaDB): the ALL REPLICAS syntax
+			// does not exist.
+			return nil, errors.New("You have an error in your SQL syntax; check the manual ... near 'ALL REPLICAS STATUS'")
+		}
+	case "SHOW ALL SLAVES STATUS":
+		switch c.status {
+		case "maria_named_old":
+			return &replicaStatusRows{rows: 1}, nil
+		default:
+			return nil, errors.New("You have an error in your SQL syntax; check the manual ... near 'ALL SLAVES STATUS'")
 		}
 	case "SELECT @@GLOBAL.log_replica_updates":
 		switch c.lru {
@@ -131,15 +160,19 @@ func newReplicaSourceDB(t *testing.T, scenario string) *sql.DB {
 // TestPreflightReplicaSource pins the G5 door in BOTH directions: the
 // refusal fires only on the CONJUNCTION (configured replica AND log
 // updates off), on both variable spellings (MySQL log_replica_updates,
-// MariaDB's log_slave_updates-only) and both status spellings
-// (SHOW REPLICA STATUS, the SHOW SLAVE STATUS fallback).
+// MariaDB's log_slave_updates-only) and all four status spellings
+// (SHOW REPLICA STATUS, the SHOW SLAVE STATUS fallback, and MariaDB's
+// SHOW ALL REPLICAS/SLAVES STATUS — the only view that lists a
+// `CHANGE MASTER 'name' TO …` named connection; audit 2026-08-27 A1).
 func TestPreflightReplicaSource(t *testing.T) {
 	t.Parallel()
 
 	pass := map[string]string{
-		"not_a_replica_lru_off":      "status=none;lru=off", // MariaDB default posture: OFF but not a replica
+		"not_a_replica_lru_off":      "status=none;lru=off", // MySQL shape: bare empty, ALL forms 1064 — tolerated, no refusal
+		"mariadb_not_a_replica":      "status=maria_none;lru=maria_off",
 		"replica_with_log_updates":   "status=replica;lru=on",
 		"mariadb_replica_updates_on": "status=replica;lru=maria_on",
+		"mariadb_named_conn_lru_on":  "status=maria_named;lru=maria_on",
 	}
 	for name, scenario := range pass {
 		if err := preflightReplicaSource(context.Background(), newReplicaSourceDB(t, scenario)); err != nil {
@@ -154,6 +187,10 @@ func TestPreflightReplicaSource(t *testing.T) {
 		"mysql_replica_off":       {"status=replica;lru=off", "log_replica_updates"},
 		"mariadb_replica_off":     {"status=replica;lru=maria_off", "log_slave_updates"},
 		"old_server_slave_status": {"status=replica_slaveonly;lru=maria_off", "log_slave_updates"},
+		// The A1 shape: a named connection invisible to the bare
+		// spellings, caught only by the ALL forms.
+		"mariadb_named_conn_off":     {"status=maria_named;lru=maria_off", "log_slave_updates"},
+		"mariadb_named_conn_old_off": {"status=maria_named_old;lru=maria_off", "log_slave_updates"},
 	}
 	for name, tc := range refuse {
 		err := preflightReplicaSource(context.Background(), newReplicaSourceDB(t, tc.scenario))
@@ -178,6 +215,24 @@ func TestPreflightReplicaSource(t *testing.T) {
 				t.Errorf("%s: message+hint missing %q; got: %v (hint %q)", name, phrase, err, ce.Hint)
 			}
 		}
+	}
+}
+
+// TestSourceIsConfiguredReplica_MySQLAllFormsErrorTolerated pins the
+// A1 posture at the probe itself: a MySQL rejecting the MariaDB-only
+// ALL spellings with a syntax error, after a bare spelling SUCCEEDED
+// with zero rows, is (false, nil) — not an error, which would degrade
+// the door into the privilege-blocked WARN-and-pass posture on every
+// healthy MySQL source. The bare form is channel-complete on MySQL, so
+// there is no blind spot to warn about.
+func TestSourceIsConfiguredReplica_MySQLAllFormsErrorTolerated(t *testing.T) {
+	t.Parallel()
+	isReplica, err := sourceIsConfiguredReplica(context.Background(), newReplicaSourceDB(t, "status=none;lru=off"))
+	if err != nil {
+		t.Fatalf("MySQL shape (bare empty, ALL forms 1064) returned err = %v; want nil (the syntax error must not degrade the door)", err)
+	}
+	if isReplica {
+		t.Fatal("MySQL shape reported the server as a replica; want false")
 	}
 }
 
