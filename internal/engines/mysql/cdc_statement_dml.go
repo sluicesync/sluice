@@ -4,6 +4,8 @@
 package mysql
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -162,15 +164,47 @@ func (r *CDCReader) dispatchStatementGuards(q, schema string) (handled bool, err
 	return false, statementDMLError(verb, schema, q)
 }
 
+// statementDMLEchoCap bounds the sanitized leading text carried on the
+// refusal.
+const statementDMLEchoCap = 80
+
+// statementDMLLead returns the diagnostic prefix of a row-DML
+// statement, cut BEFORE the first string-literal quote or opening
+// paren — whichever comes first — and capped at statementDMLEchoCap
+// bytes. The verb and table name (which precede the first paren or
+// literal in every DML shape) are diagnostic; the VALUES are not, and
+// must never reach the error (audit 2026-08-27 A4: the binlog text
+// carries row values — PII that would bypass --redact by riding the
+// refusal into logs and reports). Numeric literals after SET/WHERE can
+// survive the cut only within the byte cap; the cap is why it is 80,
+// not the old 160.
+func statementDMLLead(query string) string {
+	cut := len(query)
+	for i := 0; i < len(query); i++ {
+		if c := query[i]; c == '\'' || c == '"' || c == '(' {
+			cut = i
+			break
+		}
+	}
+	lead := strings.TrimRight(query[:cut], " \t\r\n")
+	if len(lead) > statementDMLEchoCap {
+		lead = lead[:statementDMLEchoCap]
+	}
+	if len(lead) < len(query) {
+		lead += "…"
+	}
+	return lead
+}
+
 // statementDMLError builds the coded, stream-fatal refusal for a
 // row-DML statement arriving as query text. schema is the QueryEvent's
-// session default database ("" when none was selected).
+// session default database ("" when none was selected). The statement
+// itself is identified by verb + byte length + a sha256 prefix of the
+// full text (enough for the operator to correlate with their own query
+// log) plus the sanitized lead from [statementDMLLead] — never the
+// payload.
 func statementDMLError(verb, schema, query string) error {
-	const maxEcho = 160
-	echo := query
-	if len(echo) > maxEcho {
-		echo = echo[:maxEcho] + "…"
-	}
+	digest := sha256.Sum256([]byte(query))
 	where := "with no default database selected"
 	if schema != "" {
 		where = fmt.Sprintf("(session default database %q)", schema)
@@ -178,19 +212,22 @@ func statementDMLError(verb, schema, query string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCStatementDML,
 		"find and clear the writing session's binlog_format override (performance_schema."+
-			"variables_by_thread WHERE VARIABLE_NAME='binlog_format'), ensure @@GLOBAL.binlog_format=ROW, "+
-			"then start the sync fresh (--restart-from-scratch) — the statement-logged writes are only "+
-			"recoverable by re-snapshot",
+			"variables_by_thread WHERE VARIABLE_NAME='binlog_format'; requires performance_schema=ON — "+
+			"MariaDB defaults it OFF, so there find the writer via SHOW PROCESSLIST and interrogate "+
+			"candidate sessions), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh "+
+			"(--restart-from-scratch) — the statement-logged writes are only recoverable by re-snapshot",
 		fmt.Errorf(
-			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s: %q — under ROW logging DML "+
-				"is written as row events, so statement text here is proof a writing session overrode "+
-				"binlog_format to STATEMENT/MIXED (or this resume is replaying a segment recorded before the "+
-				"global was set to ROW). sluice deliberately never executes replayed SQL text against the "+
-				"target, so this write CANNOT be applied — stopping loudly instead of silently dropping it. "+
-				"Clear the session override (or fix the old segment by starting past it), ensure "+
-				"@@GLOBAL.binlog_format=ROW, then start the sync fresh: a resume would deterministically "+
-				"re-refuse at this same event, and only a fresh snapshot recopies the statement-logged writes",
-			verb, where, echo,
+			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s (%d bytes, sha256 %s, "+
+				"leading text %q; values withheld — correlate via the digest against your own query log) — "+
+				"under ROW logging DML is written as row events, so statement text here is proof a writing "+
+				"session overrode binlog_format to STATEMENT/MIXED (or this resume is replaying a segment "+
+				"recorded before the global was set to ROW). sluice deliberately never executes replayed SQL "+
+				"text against the target, so this write CANNOT be applied — stopping loudly instead of "+
+				"silently dropping it. Clear the session override (or fix the old segment by starting past "+
+				"it), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh: a resume would "+
+				"deterministically re-refuse at this same event, and only a fresh snapshot recopies the "+
+				"statement-logged writes",
+			verb, where, len(query), hex.EncodeToString(digest[:4]), statementDMLLead(query),
 		),
 	)
 }

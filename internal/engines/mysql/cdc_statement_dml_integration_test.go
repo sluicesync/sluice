@@ -18,6 +18,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,12 @@ func TestCDCReader_StatementDMLTripwire(t *testing.T) {
 					ce, ok := sluicecode.FromError(err)
 					if !ok || ce.Code != sluicecode.CodeCDCStatementDML {
 						t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCStatementDML, err, err)
+					}
+					// Audit 2026-08-27 A4: the refusal must not echo the
+					// statement's payload — the row values would bypass
+					// --redact by riding the error into logs.
+					if strings.Contains(err.Error(), "stealthy") || strings.Contains(ce.Hint, "stealthy") {
+						t.Fatalf("refusal leaked the statement's row values: %v", err)
 					}
 					return
 				}

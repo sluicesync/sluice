@@ -74,26 +74,67 @@ func TestStatementDMLVerb(t *testing.T) {
 }
 
 // TestStatementDMLError pins the refusal's shape: the code, the verb,
-// the scope note, and the long-query truncation.
+// the scope note, the correlation digest, and — audit 2026-08-27 A4 —
+// that the statement's PAYLOAD never reaches the error: the binlog
+// text carries row values (PII) that would bypass --redact by riding
+// the refusal into logs and reports.
 func TestStatementDMLError(t *testing.T) {
 	t.Parallel()
-	long := "INSERT INTO t VALUES " + strings.Repeat("(1),", 200)
+	long := "INSERT INTO t VALUES ('alice@example.com','555-0100')" + strings.Repeat(",(1)", 200)
 	err := statementDMLError("INSERT", "app", long)
 	ce, ok := sluicecode.FromError(err)
 	if !ok || ce.Code != sluicecode.CodeCDCStatementDML {
 		t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCStatementDML, err, err)
 	}
 	msg := err.Error()
-	for _, phrase := range []string{"INSERT", `"app"`, "…", "binlog_format", "silently dropping"} {
+	for _, phrase := range []string{
+		"INSERT", `"app"`, "…", "binlog_format", "silently dropping",
+		"INSERT INTO t VALUES", // the sanitized lead: verb + table stay diagnostic
+		"sha256",               // the correlation digest is named
+	} {
 		if !strings.Contains(msg, phrase) {
 			t.Errorf("message missing %q; got: %v", phrase, msg)
 		}
 	}
+	// The payload must be withheld: no string-literal content, no
+	// VALUES tuple, in either the message or the hint. (A bare `'`
+	// probe would false-positive on the hint's own SQL, so the pins are
+	// the quoted fragments themselves.)
+	for _, leaked := range []string{"alice@example.com", "555-0100", "'alice", "(1)"} {
+		if strings.Contains(msg, leaked) || strings.Contains(ce.Hint, leaked) {
+			t.Errorf("refusal leaked payload fragment %q: %v (hint %q)", leaked, msg, ce.Hint)
+		}
+	}
 	if len(msg) > 1200 {
-		t.Errorf("message did not truncate the echoed query: %d bytes", len(msg))
+		t.Errorf("message did not bound the echoed lead: %d bytes", len(msg))
 	}
 	if ce.Hint == "" || !strings.Contains(ce.Hint, "variables_by_thread") {
 		t.Errorf("hint = %q; want the session-hunt remedy", ce.Hint)
+	}
+	if !strings.Contains(ce.Hint, "performance_schema=ON") || !strings.Contains(ce.Hint, "SHOW PROCESSLIST") {
+		t.Errorf("hint = %q; want the performance_schema precondition + the MariaDB fallback (audit 2026-08-27 A6)", ce.Hint)
+	}
+}
+
+// TestStatementDMLLead pins the sanitizer's cut rule in both
+// directions: cut before the first string-literal quote or paren
+// (whichever comes first), keep the verb + table, cap the length.
+func TestStatementDMLLead(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct{ in, want string }{
+		"paren_first":        {"INSERT INTO t VALUES (1,'x')", "INSERT INTO t VALUES…"},
+		"single_quote_first": {"UPDATE t SET v = 'secret' WHERE id = 9", "UPDATE t SET v =…"},
+		"double_quote_first": {`DELETE FROM t WHERE v = "secret"`, "DELETE FROM t WHERE v =…"},
+		"no_literals":        {"DELETE FROM t WHERE id = id2", "DELETE FROM t WHERE id = id2"},
+		"cap": {
+			"UPDATE " + strings.Repeat("very_long_table_name_", 10) + " SET a = b",
+			"UPDATE " + strings.Repeat("very_long_table_name_", 10)[:statementDMLEchoCap-len("UPDATE ")] + "…",
+		},
+	}
+	for name, tc := range cases {
+		if got := statementDMLLead(tc.in); got != tc.want {
+			t.Errorf("%s: statementDMLLead(%q) = %q; want %q", name, tc.in, got, tc.want)
+		}
 	}
 }
 
