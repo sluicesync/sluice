@@ -192,6 +192,19 @@ fi
 # Soft-skip when golangci-lint isn't installed (developer convenience)
 # rather than hard-block — CI is the source of truth.
 if command -v golangci-lint >/dev/null 2>&1; then
+	# Version guard — WARN, never fail (M-1, audit 2026-08-26): CI pins
+	# golangci-lint because v2.13.0 hangs indefinitely in its package-load
+	# phase (ci.yml's pin comment; docs/dev/development.md), and a locally
+	# different version can hang here or report different findings than
+	# CI. Derived from ci.yml's `version:` line so the guard cannot drift
+	# from the pin it cites; if extraction fails, stay silent — CI is the
+	# source of truth.
+	pinned=$(sed -n 's/^[[:space:]]*version:[[:space:]]*\(v[0-9][0-9.]*\)[[:space:]]*$/\1/p' .github/workflows/ci.yml | head -n 1)
+	installed="v$(golangci-lint version --short 2>/dev/null || true)"
+	if [ -n "$pinned" ] && [ "$installed" != "$pinned" ]; then
+		printf "\033[33m%s\033[0m\n" "pre-commit: WARNING: golangci-lint $installed does not match CI's pinned $pinned (v2.13.0 hangs)."
+		echo "Align with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$pinned"
+	fi
 	if ! golangci-lint run; then
 		# A stale analysis cache reports PHANTOM issues after a sibling
 		# git worktree is removed (typecheck/unused findings pointing at

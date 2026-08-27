@@ -206,6 +206,20 @@ if ($LASTEXITCODE -ne 0) {
 # rather than hard-block — the CI job is still the source of truth.
 $lint = Get-Command golangci-lint -ErrorAction SilentlyContinue
 if ($lint) {
+    # Version guard — WARN, never fail (M-1, audit 2026-08-26): CI pins
+    # golangci-lint because v2.13.0 hangs indefinitely in its package-load
+    # phase (ci.yml's pin comment; docs/dev/development.md), and a locally
+    # different version can hang here or report different findings than CI.
+    # Derived from ci.yml's `version:` line so the guard cannot drift from
+    # the pin it cites; if extraction fails, stay silent — CI is the source
+    # of truth.
+    $pinned = (Select-String -Path '.github/workflows/ci.yml' -Pattern '^\s*version:\s*(v[0-9][0-9.]*)\s*$' |
+        Select-Object -First 1).Matches.Groups[1].Value
+    $installed = 'v' + ((& golangci-lint version --short 2>$null) | Out-String).Trim()
+    if ($pinned -and ($installed -ne $pinned)) {
+        Write-Host "pre-commit: WARNING: golangci-lint $installed does not match CI's pinned $pinned (v2.13.0 hangs)." -ForegroundColor Yellow
+        Write-Host "Align with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$pinned"
+    }
     & golangci-lint run
     if ($LASTEXITCODE -ne 0) {
         # A stale analysis cache reports PHANTOM issues after a sibling
