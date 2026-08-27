@@ -19,7 +19,10 @@ import (
 // OPPOSITE ways. A scoped `FOR TABLE` publication is refused by Postgres
 // itself ("cannot add relation … to publication / This operation is not
 // supported for unlogged tables" — observed on PG 16 for both CREATE and
-// ALTER … ADD). A `FOR ALL TABLES` publication — the multi-schema
+// ALTER … ADD; pinned, with the silent FOR-ALL-TABLES exclusion below,
+// by TestUnloggedCensus_AndPublicationDoors's environmental-premise
+// subtest, which rides the pg-version-matrix). A `FOR ALL TABLES`
+// publication — the multi-schema
 // spanning-sync shape (ADR-0075: a logical slot is database-wide) and the
 // `backup full --chain-slot` shape — SILENTLY EXCLUDES the table: no error, no
 // notice, it simply never appears in pg_publication_tables. The cold copy
@@ -107,8 +110,9 @@ func tableListOrNull(tables []string) any {
 //     the same preflight, before the server-wide CDC reader opens —
 //     because `ALTER TABLE … SET UNLOGGED` SUCCEEDS mid-sync under FOR
 //     ALL TABLES (PG only blocks the flip for scoped FOR TABLE
-//     membership; observed on PG 16) and silently drops the table from
-//     the publication. A flip DURING a live window stays undetectable
+//     membership; observed on PG 16, pinned by
+//     TestUnloggedCensus_AndPublicationDoors's environmental-premise
+//     subtest) and silently drops the table from the publication. A flip DURING a live window stays undetectable
 //     until the next open (documented residual, capture-completeness
 //     matrix).
 //   - Single-schema sync (scoped FOR TABLE): [ensurePublication] runs the

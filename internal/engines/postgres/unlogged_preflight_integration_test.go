@@ -22,6 +22,11 @@
 //     table is fine — its rows are swept once, no chain),
 //  5. Door 5 (audit 2026-08-27 A7): PreflightAddTableUnlogged, the
 //     `schema add-table` registration census.
+//
+// The two ENVIRONMENTAL PREMISES the door placement rests on (audit
+// 2026-08-27 A8) are pinned directly against the server at the end of
+// TestUnloggedCensus_AndPublicationDoors, so they ride the
+// pg-version-matrix and a PG semantic change fails loudly here.
 package postgres
 
 import (
@@ -149,6 +154,74 @@ func TestUnloggedCensus_AndPublicationDoors(t *testing.T) {
 		excluded := func(_, table string) bool { return table != "u_scratch" && table != "u_other" }
 		if err := eng.PreflightSpanningUnloggedTables(ctx, dsn, []string{"public", "s2"}, excluded); err != nil {
 			t.Fatalf("spanning census with both unlogged tables excluded must pass; got %v", err)
+		}
+	})
+
+	// ENVIRONMENTAL PREMISES (audit 2026-08-27 A8, per the premise-naming
+	// rule): the whole G2 door placement rests on two facts about
+	// Postgres itself, previously observed once and cited in comments
+	// with no named test. Pinned here so they ride the pg-version-matrix
+	// and a future PG semantic change fails THIS test loudly instead of
+	// turning a door into a false refusal (or a silent gap) mid-incident:
+	//
+	//	(a) a FOR ALL TABLES publication SILENTLY EXCLUDES an unlogged
+	//	    table from pg_publication_tables — the reason the spanning
+	//	    census (Door A) exists at all; its scoped-refusal half —
+	//	    ALTER PUBLICATION ... ADD TABLE <unlogged> is refused by PG —
+	//	    is the sole ground for Door 3's "can never refuse a
+	//	    configuration PG would have accepted" claim;
+	//	(b) ALTER TABLE ... SET UNLOGGED SUCCEEDS under FOR ALL TABLES
+	//	    but is REFUSED for scoped FOR TABLE membership — the succeeds
+	//	    half is the sole justification for the WARM-RESUME door, and
+	//	    the refused half is why the scoped lane needs no such door.
+	t.Run("G2 environmental premises hold on this server", func(t *testing.T) {
+		applyPGSnap(t, dsn, "CREATE PUBLICATION premise_all FOR ALL TABLES")
+		defer applyPGSnap(t, dsn, "DROP PUBLICATION IF EXISTS premise_all")
+
+		// (a) silent exclusion — with the logged table as the anti-vacuity
+		// control proving pg_publication_tables is being populated at all.
+		inPub := func(schema, table string) bool {
+			t.Helper()
+			var in bool
+			if err := db.QueryRowContext(ctx,
+				"SELECT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'premise_all' AND schemaname = $1 AND tablename = $2)",
+				schema, table).Scan(&in); err != nil {
+				t.Fatalf("read pg_publication_tables: %v", err)
+			}
+			return in
+		}
+		if !inPub("public", "t_logged") {
+			t.Fatal("premise (a) control failed: the logged table is not in pg_publication_tables under FOR ALL TABLES — the probe is broken, not the premise")
+		}
+		if inPub("public", "u_scratch") {
+			t.Fatal("premise (a) FAILED: this PG includes an unlogged table in a FOR ALL TABLES publication's pg_publication_tables — the silent-exclusion fact the spanning census (Door A) rests on no longer holds; re-derive the G2 door placement")
+		}
+
+		// (b), spanning half: the flip SUCCEEDS under FOR ALL TABLES —
+		// why the census must re-run at every stream open, not just cold
+		// start.
+		if _, err := db.ExecContext(ctx, "ALTER TABLE t_logged SET UNLOGGED"); err != nil {
+			t.Fatalf("premise (b) FAILED: SET UNLOGGED under FOR ALL TABLES was refused (%v) — PG now blocks the mid-life flip, so the warm-resume census may be redundant; re-derive the G2 door placement", err)
+		}
+		if _, err := db.ExecContext(ctx, "ALTER TABLE t_logged SET LOGGED"); err != nil {
+			t.Fatalf("restore t_logged to LOGGED: %v", err)
+		}
+		applyPGSnap(t, dsn, "DROP PUBLICATION premise_all")
+
+		// (b), scoped half + (a)'s scoped-refusal half, against a scoped
+		// FOR TABLE publication.
+		applyPGSnap(t, dsn, "CREATE PUBLICATION premise_scoped FOR TABLE t_logged")
+		defer applyPGSnap(t, dsn, "DROP PUBLICATION IF EXISTS premise_scoped")
+		if _, err := db.ExecContext(ctx, "ALTER TABLE t_logged SET UNLOGGED"); err == nil {
+			if _, rerr := db.ExecContext(ctx, "ALTER TABLE t_logged SET LOGGED"); rerr != nil {
+				t.Errorf("restore t_logged to LOGGED: %v", rerr)
+			}
+			t.Fatal("premise (b) FAILED: SET UNLOGGED succeeded on a scoped FOR TABLE publication member — PG no longer blocks the scoped flip, so the scoped lane now needs its own mid-life door; re-derive the G2 door placement")
+		}
+		if _, err := db.ExecContext(ctx, "ALTER PUBLICATION premise_scoped ADD TABLE u_scratch"); err == nil {
+			t.Fatal("premise (a) FAILED: ALTER PUBLICATION ... ADD TABLE accepted an unlogged table — Door 3's 'can never refuse a configuration PG would have accepted' claim no longer holds; re-derive the G2 door placement")
+		} else if !strings.Contains(err.Error(), "cannot add relation") {
+			t.Fatalf("scoped ADD TABLE of the unlogged table failed for an unexpected reason: %v", err)
 		}
 	})
 }
