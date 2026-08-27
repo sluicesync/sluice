@@ -495,3 +495,35 @@ func TestCaptureReplicatedWrites_NativeSubscriptionRig(t *testing.T) {
 	applyPGSQL(t, subDSN, `ALTER SUBSCRIPTION crw_sub SET (slot_name = NONE)`)
 	applyPGSQL(t, subDSN, `DROP SUBSCRIPTION crw_sub`)
 }
+
+// TestCaptureReplicatedWrites_PreV3MetaOpensWithoutResetup pins the
+// tolerant read the VF review (2026-08-27) flagged as a written
+// invariant nobody checks: the upgrade-in-place path — a NEW binary
+// opening an EXISTING pre-v3 install whose meta table has no
+// capture_replicated_writes column, WITHOUT a setup re-run — must open
+// clean as origin-only (the to_jsonb projection at
+// readCaptureReplicatedWritesPosture). If someone "simplifies" the
+// query to a direct column reference, every pre-v3 install would
+// false-refuse at open with 42703, and this test is what reddens.
+func TestCaptureReplicatedWrites_PreV3MetaOpensWithoutResetup(t *testing.T) {
+	dsn, cleanup := startPGForTrigger(t)
+	defer cleanup()
+
+	applyPGSQL(t, dsn, `CREATE TABLE crw_v2 (id BIGINT PRIMARY KEY, note TEXT)`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"crw_v2"}}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// Reconstruct the exact v2 on-disk shape a pre-ADR-0185 binary left
+	// behind: no posture column, schema_version 2.
+	applyPGSQL(t, dsn, `ALTER TABLE sluice_change_log_meta DROP COLUMN capture_replicated_writes`)
+	applyPGSQL(t, dsn, `UPDATE sluice_change_log_meta SET schema_version = 2`)
+
+	r, err := openCDCReader(ctx, dsn, "")
+	if err != nil {
+		t.Fatalf("CDC open refused on a genuine v2-shaped meta (the upgrade-in-place path): %v", err)
+	}
+	_ = r.(*CDCReader).Close()
+}
