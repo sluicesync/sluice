@@ -443,13 +443,33 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
   - *Typmod-only ALTER (e.g. `numeric(10,4)→(10,1)`, `varchar(n)`
     shrink):* detected — `classifyRelationChange` compares
     `TypeMod` as well as name/OID, so the shape rides this ADR's
-    standard door. Under `forward` (the default) the target receives
-    the same USING-less ALTER and its own rewrite applies the
-    identical deterministic cast, so pre-rewrite target rows
-    **converge** with the source's rewritten values (integration-pinned:
-    `TestStreamer_SchemaForward_AlterType_TypmodOnly_PG`). Under
-    `refuse` it refuses loudly — pre-fix, refuse mode had NO door for
-    this shape and diverged silently.
+    standard door. Under `forward` (the default), **for families whose
+    projected IR carries the modifier** (numeric, varchar/char,
+    timestamp/time precision outside the temporal-collapse class below,
+    bit), the target receives the same USING-less ALTER and its own
+    rewrite applies the identical deterministic cast, so pre-rewrite
+    target rows **converge** with the source's rewritten values
+    (integration-pinned: `TestStreamer_SchemaForward_AlterType_TypmodOnly_PG`).
+    Under `refuse` it refuses loudly for EVERY typmod-carrying family —
+    the compare is on the raw wire typmod, projection-independent —
+    and pre-fix, refuse mode had NO door for this shape and diverged
+    silently.
+  - *Detected-but-not-forwarded class (VF review 2026-08-26): a typmod
+    delta visible to the raw compare but INVISIBLE to the projected
+    IR.* For these members the raw compare classifies `AlterColumnType`
+    (so `refuse` is loud), but the projected schema signature does not
+    move, so under `forward` no boundary is emitted, no ALTER is
+    forwarded, and the source's rewrite silently diverges pre-existing
+    target rows — exactly the temporal-caveat shape below. Enumerated
+    members: **`interval(p)` / interval field restrictions** (projects
+    to the empty `ir.Interval{}`; `ALTER … TYPE interval(3)` rounds
+    every stored fractional second with zero decoded messages) and
+    **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
+    rounds every element; the element resolves with typmod −1 by
+    design). Use the drained model for those ALTERs, as for any
+    value-rewriting DDL. The class-enumeration gate (each
+    typmod-consuming family in `oidToType` either moves the projected
+    signature or sits on this documented list) is a filed follow-up.
   - *Same-type, same-typmod `ALTER … USING <expr>`:* **undetectable,
     permanently** — the post-rewrite RelationMessage is byte-identical
     to the pre-rewrite one and no catalog artifact survives; the source

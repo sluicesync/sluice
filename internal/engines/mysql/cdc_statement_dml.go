@@ -46,10 +46,16 @@ import (
 //
 // Known residue, stated not implied: statement-format LOAD DATA
 // arrives as Begin/Execute_load_query events (a different event type
-// the dispatcher's default arm ignores), and a DML wrapped entirely in
-// a /*!vvvvv … */ versioned comment lexes as a comment here — both
-// remain the documented session-override residue, now narrowed to
-// those two shapes. The belt is scope-gated like the generic arm's
+// the dispatcher's default arm ignores); a DML wrapped entirely in
+// a /*!vvvvv … */ versioned comment lexes as a comment here; and
+// CTE-DML (`WITH x AS (…) UPDATE/DELETE …`, MySQL 8.0 / MariaDB
+// 10.2+) lexes first-token WITH, which this belt does not enumerate —
+// a WITH-prefixed statement in a ROW-mode binlog is almost certainly
+// statement-format CTE-DML (SELECTs are never binlogged), so adding
+// WITH to the verb set is a filed follow-up (VF review 2026-08-26)
+// rather than an unreviewed pre-tag behavior change. All three remain
+// the documented session-override residue, now narrowed to those
+// shapes. The belt is scope-gated like the generic arm's
 // cache clear (Bug 246: a statement-format writer on an UNRELATED
 // database must not kill the sync); the trade is that a statement
 // whose session default database is out of scope but which writes into

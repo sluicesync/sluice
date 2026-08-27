@@ -376,6 +376,15 @@ func TestClassifyRelationChange_TypmodFamilies(t *testing.T) {
 		{"varchar(n) shrink", 1043, varcharTM(20), varcharTM(10), varcharTM(40)},
 		{"timestamp(p) precision shrink", 1114, 6, 3, -1},
 		{"bit(n) shrink", 1560, 8, 4, 16},
+		// The two detected-but-not-forwarded members (VF review
+		// 2026-08-26; ADR-0091 impl note): the raw compare fires — so
+		// refuse mode is loud, which is what these cells pin — but the
+		// projected IR drops these typmods (interval → empty
+		// ir.Interval{}; array elements resolve with typmod -1), so
+		// under forward mode no boundary is emitted and the rewrite is
+		// NOT forwarded. Documented residual, not convergence.
+		{"interval(p) precision shrink (refuse-only reach)", 1187, 6, 3, -1},
+		{"numeric[] element scale shrink (refuse-only reach)", 1231, numericTM(10, 4), numericTM(10, 1), numericTM(12, 6)},
 	}
 
 	entry := func(oid uint32, tm int32) *relationCacheEntry {
