@@ -27,10 +27,16 @@ package lineage
 // crash-recovery, and the record exists precisely so an operator can
 // decide whether the heal was one of those.
 //
-// The append is read-modify-write ([irbackup.Store] has no append
-// primitive). Maintenance runs are the only writer and hold the chain
-// maintenance flow single-threaded, so lost-update is not a live
-// concern; a torn write is loud at read time (the JSONL parse refuses).
+// The append is read-modify-write. The optional [irbackup.Appender]
+// capability exists (LocalStore implements it; the progress sidecar uses
+// it) but is deliberately not taken here: heals are rare — a chain sees
+// 0–1 records ever — the log must behave identically on cloud stores
+// that lack the capability, and one code path is easier to keep
+// evidence-correct than two (A3-APPENDER-COMMENT, 2026-08-27; the prior
+// wording claimed no append primitive existed, which was stale).
+// Maintenance runs are the only writer and hold the chain maintenance
+// flow single-threaded, so lost-update is not a live concern; a torn
+// write is loud at read time (the JSONL parse refuses).
 
 import (
 	"bufio"
@@ -51,6 +57,10 @@ const MaintenanceHealLogFileName = "maintenance-heal.log"
 // PreHealLineageSigPrefix prefixes the preserved pre-heal copies of
 // lineage.json.sig. The suffix is the heal's UnixNano timestamp.
 const PreHealLineageSigPrefix = LineageSigFileName + ".pre-heal-"
+
+// healLogMaxLineBytes is [ReadHealRecords]' per-line ceiling (1 MiB —
+// see the posture note at the Scanner). A line past it refuses loudly.
+const healLogMaxLineBytes = 1 << 20
 
 // HealRecord is one durable maintenance-heal entry. Append-only,
 // forward-compatible (readers ignore unknown fields).
@@ -144,6 +154,14 @@ func AppendHealRecord(ctx context.Context, store irbackup.Store, rec HealRecord)
 			return fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
 		}
 	}
+	// Belt (A3-APPEND-NEWLINE-GUARD): a prior body whose tail lost its
+	// newline — unreachable under this function's own writes, every append
+	// ends in '\n' via one atomic Put — must not have the new record glued
+	// onto its last line, which would corrupt BOTH records where a
+	// separator keeps any tear loud and local at read time.
+	if len(body) > 0 && body[len(body)-1] != '\n' {
+		body = append(body, '\n')
+	}
 	body = append(body, line...)
 	body = append(body, '\n')
 	if err := store.Put(ctx, MaintenanceHealLogFileName, bytes.NewReader(body)); err != nil {
@@ -171,6 +189,15 @@ func ReadHealRecords(ctx context.Context, store irbackup.Store) ([]HealRecord, e
 	defer func() { _ = rc.Close() }()
 	var recs []HealRecord
 	sc := bufio.NewScanner(rc)
+	// A VerifyFailure carries arbitrary error text, and bufio.Scanner's
+	// default 64 KiB line cap would make a log holding one long failure
+	// unreadable FOREVER — ErrTooLong on every read (A3-SCANNER-CAP).
+	// Raise the cap to 1 MiB. POSTURE: a line past 1 MiB still refuses
+	// loudly via sc.Err() below rather than being skipped — the log is
+	// evidence, and 1 MiB is orders of magnitude beyond any real verify
+	// failure, so hitting the cap means something is wrong enough to stop
+	// for. Pinned both ways by TestReadHealRecords_LongLines.
+	sc.Buffer(make([]byte, 0, 64*1024), healLogMaxLineBytes)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
