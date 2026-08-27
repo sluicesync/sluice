@@ -4,6 +4,32 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.132.1] - 2026-08-27
+
+The audit fast-follow. The fresh post-v0.132.0 blind audit (grade A−, scorecard 12 FIXED / 1 PARTIAL / 5 OPEN / 0 REGRESSED on the prior pass) found the new replica-source door was itself narrower than its name, plus eight hardening findings — all remediated here. Drop-in from v0.132.0; no schema, format, flag, or command change; no new error codes.
+
+### Fixed
+
+**The `SLUICE-E-CDC-REPLICA-NO-LOG-UPDATES` door now sees MariaDB named-connection replicas.** The v0.132.0 probe used only bare `SHOW REPLICA STATUS`, which returns zero rows for a `CHANGE MASTER 'name' TO …` named connection — the standard MariaDB multi-source idiom (observed live twice on real MariaDB 11.4) — and MariaDB defaults `log_slave_updates=0`, so the exact silent-loss configuration the door refuses walked through it. The probe now also runs `SHOW ALL REPLICAS/SLAVES STATUS`, with the toleration of MySQL's syntax error on the ALL forms pinned so it can never degrade the door (bare-success + ALL-error identifies a channel-complete MySQL). Real named-connection MariaDB pin with an anti-vacuity floor.
+
+**Unforwardable `ALTER COLUMN TYPE` shapes refuse loudly under the DEFAULT `--schema-changes=forward`.** `interval(p)` and array-element typmod rewrites (which rewrite stored values with nothing decoded on the wire) classified as changes while projecting to an unchanged internal type, so default forward mode emitted no boundary and silently diverged — only refuse mode was loud. The reader now refuses any detected type change whose changed column's projected type is unchanged (per-column, so mixed statements can't slip through), also catching projection-identical swaps like `time↔timetz`. A catalog-derived enumeration gate closes the class: every typmod-carrying family either moves the projection or sits on the documented refuse list. Legitimate forwarding pinned unaffected (identical re-sends, temporal-precision ALTERs, numeric + varchar shrink convergence end-to-end). A pre-tag value-fidelity review then found (and this release also closes) the gate's own sibling gap: a DROP COLUMN combined with a projection-invisible ALTER in one relation delta classified as the drop alone and bypassed the gate — it now runs for the drop shape too, with a name-keyed column compare so a middle-column drop's ordinal shift cannot hide the surviving column's change (pinned tail-drop, middle-drop, and plain-drop-still-forwards cells, mutation-verified).
+
+**The signature heal preserves forensic evidence and leaves a durable record.** Before re-signing, the non-verifying signature is preserved verbatim (`lineage.json.sig.pre-heal-<ts>`) and a JSONL record appends to `maintenance-heal.log` (timestamp, operation, key id, verify failure); `backup verify` surfaces heal records as informational lines. Previously the heal destroyed the only evidence of tampering/corruption and its WARN was the sole trace.
+
+**The `SLUICE-E-CDC-STATEMENT-DML` refusal no longer echoes statement payloads.** Binlog statement text carries row values — PII that rode the refusal into logs, bypassing `--redact`. The refusal now carries verb + length + digest + a lead cut before the first quote, paren, or `=`, so string and unquoted-numeric values never reach the error; a sibling sweep verified every other new refusal/WARN renders schema-level metadata only.
+
+**Every pgtrigger open-path probe is bounded at 15s.** The relay-shape probe read a lockable user table and could park every CDC open behind a lock queue indefinitely; all five probes (the audit named three; the sibling sweep found two more) now derive bounded contexts — WARN-probes degrade to their probe-error WARN, the fail-closed capture-shape door refuses with a timeout-specific message — and a cross-engine AST roster gate asserts every CDC-open probe in all three engines derives a timeout.
+
+**`schema add-table` refuses an UNLOGGED table before any side effect** (previously blocked late with a misleading message after creating the target table; the frozen-table hazard was real if that incidental block ever relaxed). Same coded census, before the dry-run report.
+
+### Internal
+
+The STATEMENT-DML/`sql_log_bin` remedy SQL states its `performance_schema=ON` precondition (MariaDB defaults OFF — the documented query hard-errored there, observed); G2's two environmental premises pinned against real Postgres (ride the version matrix); a latent interval-OID test-fixture bug fixed by the enumeration gate's development.
+
+### Compatibility
+
+Drop-in from v0.132.0. Two refusals reach configurations they previously missed — a MariaDB named-connection replica source (previously silently lossy) and array/interval typmod ALTERs under default forward mode (previously silent divergence) — in both cases the refusal names a loss that was already happening. Operators on either configuration should `sluice verify` and resnapshot affected tables after upgrading.
+
 ## [0.132.0] - 2026-08-26
 
 The M2 capture-completeness release. A systematic per-lane sweep of "which write classes are invisible to each CDC capture mechanism" (`docs/dev/capture-completeness-matrix.md` — 45 cells, ground-truthed on real engines) found nine verified gaps, all remediated here. The headline is CRITICAL: **MariaDB `log_bin_compress=ON` sources silently dropped every row event ≥ 256 bytes from CDC and backup incrementals on every prior release** — now fully captured. Plus four new coded refusals on configurations that silently lose writes, a Postgres typmod-rewrite detection fix, three new detector WARNs, and honest documentation of the two provably-undetectable cells. Drop-in from v0.131.5 — no schema, format, flag, or command change.

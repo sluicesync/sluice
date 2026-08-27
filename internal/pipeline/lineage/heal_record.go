@@ -68,7 +68,12 @@ type HealRecord struct {
 	KeyID string `json:"key_id"`
 
 	// VerifyFailure is the verification error that triggered the heal —
-	// the one-shot WARN's payload, made durable.
+	// the one-shot WARN's payload, made durable. Error text can carry
+	// arbitrary bytes (a tampered .sig's fields leak into the message),
+	// and encoding/json silently replaces invalid UTF-8 with U+FFFD —
+	// acceptable HERE because this record is descriptive provenance; the
+	// BYTE-VERBATIM forensic evidence is the preserved pre-heal .sig
+	// copy, never this log (VF review 2026-08-27).
 	VerifyFailure string `json:"verify_failure"`
 
 	// PreservedSig is the store path of the preserved pre-heal

@@ -319,7 +319,17 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	// silently diverges pre-existing target rows at exit 0. Detected-but-
 	// unforwardable is exactly the refuse-mode situation, so refuse loudly with
 	// the same drained-model remedy instead of waving it through.
-	if forwarded && change.Kind == relationChangeAlterColumnType {
+	// The gate runs for DROP COLUMN too (VF review 2026-08-27): the
+	// classifier early-returns DropColumn on a shorter column list BEFORE
+	// its per-ordinal typmod loop, so a single relation delta carrying
+	// BOTH a drop and a projection-invisible ALTER (one statement, one
+	// transaction, or merely DML-quiet back-to-back DDL — pgoutput emits
+	// one RelationMessage reflecting final state) classified as DropColumn
+	// alone; the DROP moves the projected signature, the boundary forwards
+	// only the DROP, and the surviving column's rewrite diverged silently.
+	// The name-keyed scan below is what makes the DROP shape safe to gate:
+	// an ordinal scan misaligns after a middle-column drop.
+	if forwarded && (change.Kind == relationChangeAlterColumnType || change.Kind == relationChangeDropColumn) {
 		if col, unforwardable := unforwardableTypmodColumn(relations[relationID], current); unforwardable {
 			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta (interval precision/field restrictions and array-element modifiers do not survive the wire projection), so --schema-changes=forward would emit no schema boundary and the source's table rewrite would silently diverge pre-existing target rows. %s",
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
@@ -382,17 +392,27 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 // (production entries always carry a resolved type; buildRelationCacheEntry
 // errors on unresolvable OIDs).
 func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, bool) {
-	n := min(len(prev.Columns), len(current.Columns))
-	for i := 0; i < n; i++ {
-		pc, cc := prev.Columns[i], current.Columns[i]
-		if pc.Name != cc.Name {
+	// NAME-keyed, not ordinal-keyed (VF review 2026-08-27): the gate also
+	// runs for the DropColumn classification, where a middle-column drop
+	// shifts every later ordinal — an ordinal scan would pair shifted
+	// columns, hit the name-mismatch skip, and find nothing. Column names
+	// are unique within a PG relation, so the name key is total; a column
+	// absent from prev (ADD) or renamed (name not found) is skipped —
+	// rename shapes are owned by the intercept's ADR-0091 §3 refusal.
+	prevByName := make(map[string]relationColumn, len(prev.Columns))
+	for _, pc := range prev.Columns {
+		prevByName[pc.Name] = pc
+	}
+	for _, cc := range current.Columns {
+		pc, ok := prevByName[cc.Name]
+		if !ok {
 			continue
 		}
 		if pc.OID == cc.OID && pc.TypeMod == cc.TypeMod {
 			continue
 		}
 		if reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
-			return pc.Name, true
+			return cc.Name, true
 		}
 	}
 	return "", false

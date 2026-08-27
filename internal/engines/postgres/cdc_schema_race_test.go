@@ -548,6 +548,47 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
 	})
 
+	t.Run("tail DROP + interval shrink in one delta refuses under forward (VF 2026-08-27)", func(t *testing.T) {
+		// The classifier early-returns DropColumn on the shorter list
+		// BEFORE its typmod loop, so this combined delta never classifies
+		// AlterColumnType — the gate must therefore also run for the
+		// DropColumn shape, or the surviving column's rewrite forwards as
+		// nothing and diverges silently (the VF review's sibling gap).
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)), typedCol(t, "x", 25, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(3)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("middle DROP + interval shrink refuses under forward (ordinal shift)", func(t *testing.T) {
+		// A middle-column drop shifts every later ordinal, which is why
+		// the predicate is NAME-keyed: an ordinal scan would pair "x"
+		// against "iv", hit the name-mismatch skip, and find nothing.
+		prev := table(typedCol(t, "x", 25, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		curr := table(typedCol(t, "iv", 1186, intervalTM(3)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "iv")
+	})
+
+	t.Run("middle DROP + numeric[] element shrink refuses under forward", func(t *testing.T) {
+		prev := table(typedCol(t, "x", 25, -1), typedCol(t, "amts", 1231, numericTM(10, 4)))
+		curr := table(typedCol(t, "amts", 1231, numericTM(10, 1)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "amts")
+	})
+
+	t.Run("plain DROP COLUMN with no surviving-column delta still forwards", func(t *testing.T) {
+		// The no-false-fire floor for the DropColumn arm: a drop whose
+		// surviving columns are field-identical must keep forwarding
+		// (checkSchemaRace nil under forward mode).
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)), typedCol(t, "x", 25, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "iv", 1186, intervalTM(6)))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("plain tail DROP with unchanged survivors must forward; got: %v", err)
+		}
+	})
+
 	t.Run("projection-identical OID swap (time→timetz) refuses under forward", func(t *testing.T) {
 		// Not a typmod delta but the same class: both OIDs project to
 		// ir.Time{...}, so the signature cannot move and the forward

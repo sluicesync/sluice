@@ -588,3 +588,30 @@ func TestBackupVerify_SurfacesMaintenanceHeals(t *testing.T) {
 		}
 	})
 }
+
+// TestMaintenanceHeal_MalformedLogRefusesLoudly pins ReadHealRecords'
+// refuse-loudly contract (VF review 2026-08-27): a torn or garbage line
+// in maintenance-heal.log must surface as the "heal provenance unknown"
+// WARN in backup verify — never a silent partial read.
+func TestMaintenanceHeal_MalformedLogRefusesLoudly(t *testing.T) {
+	ctx := context.Background()
+	store, env, _ := buildSignedChain(t)
+	if err := store.Put(ctx, lineage.MaintenanceHealLogFileName,
+		strings.NewReader("{\"healed_at\":\"2026-08-27T00:00:00Z\"\nnot json at all\xff")); err != nil {
+		t.Fatalf("plant malformed heal log: %v", err)
+	}
+	if _, err := lineage.ReadHealRecords(ctx, store); err == nil {
+		t.Fatal("ReadHealRecords accepted a malformed log; want a loud decode error")
+	}
+	records, err := lineage.ListAllSegmentManifests(ctx, store)
+	if err != nil {
+		t.Fatalf("list manifests: %v", err)
+	}
+	buf := captureMaintenanceSlog(t)
+	if failed := verifyBackupSignatures(ctx, store, records, VerifyOptions{Envelope: env}); failed != 0 {
+		t.Fatalf("verifyBackupSignatures = %d failure(s); want 0 (the heal log is informational)", failed)
+	}
+	if !strings.Contains(buf.String(), "heal provenance unknown") {
+		t.Errorf("verify output missing the 'heal provenance unknown' WARN on a malformed heal log:\n%s", buf.String())
+	}
+}
