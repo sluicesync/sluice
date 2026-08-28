@@ -13,7 +13,12 @@
 // see — the vstream lane — plus the shared-census binding.
 //
 // WHAT THIS GATE REACHES, stated: functions in internal/engines/mysql
-// and their calls to the named identifiers. The two vstream chokepoints
+// and their calls to — or in-body alias references of — the named
+// identifiers (an aliased invocation of a chokepoint's WARN call would
+// red the presence assertion anyway, but an alias of the shared CENSUS
+// elsewhere would create an ungraded invocation path; both are refused
+// at the reference, with TestRosterAliasDetection_SelfTest as the
+// detection's anti-vacuity floor). The two vstream chokepoints
 // it pins are [vstreamCDCReader.StreamChanges] (the standalone CDC
 // open) and [Engine.openVStreamSnapshotStreamFrom] (the seedable core
 // every vstream snapshot opener — fresh, filtered, COPY-resume,
@@ -61,6 +66,7 @@ func TestFKReferentialActionWarnRoster_BothLanes(t *testing.T) {
 		t.Fatalf("read package dir: %v", err)
 	}
 
+	watched := map[string]bool{fkCensusCore: true, fkVStreamWrapper: true, "preflightFKReferentialActions": true}
 	calls := map[string]map[string]bool{} // qualified func name -> called idents
 	for _, e := range entries {
 		name := e.Name()
@@ -86,6 +92,14 @@ func TestFKReferentialActionWarnRoster_BothLanes(t *testing.T) {
 				return true
 			})
 			calls[qualifiedFuncName(fn)] = c
+			// Alias-evasion guard (shared helper + self-test in
+			// cdc_preflight_roster_test.go): a rostered identifier
+			// referenced outside a direct call is an invocation path this
+			// gate cannot grade.
+			for _, aliased := range nonCallRefIdents(fn, watched) {
+				t.Errorf("%s references %s outside a direct call — an aliased invocation is invisible to this "+
+					"roster's call-site walker; call it directly", qualifiedFuncName(fn), aliased)
+			}
 		}
 	}
 	if len(calls) == 0 {

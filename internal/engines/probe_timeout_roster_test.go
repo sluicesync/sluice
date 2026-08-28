@@ -45,12 +45,18 @@ import (
 //
 // WHAT THIS GATE REACHES, stated so the name cannot be read as broader
 // than the truth: probes invoked BY NAME from the configured chokepoints
-// in mysql, postgres, and pgtrigger. It does not reach probes called
-// through method values or aliases, chokepoints not configured here (a
-// brand-new open path owes this list its chokepoint), the sqlite/D1
-// engines (request/response transports with per-call HTTP deadlines; no
-// lock-queue analogue), or general catalog helpers that are not probes at
-// a chokepoint. The anti-vacuity floors below fail the gate if a walker
+// in mysql, postgres, and pgtrigger. A probe invoked through an ALIAS in a
+// chokepoint body would never enter the derived universe, so the walker
+// additionally refuses any chokepoint-body reference to a probe-shaped
+// package function (ctx+db params) outside a direct call — self-tested by
+// TestProbeAliasDetection_SelfTest (the alias-evasion LOW, 2026-08-27).
+// Honest residual, still out of reach: a probe function value smuggled
+// through a struct field or factory return, probes aliased in NON-chokepoint
+// functions and passed in, chokepoints not configured here (a brand-new open
+// path owes this list its chokepoint), the sqlite/D1 engines
+// (request/response transports with per-call HTTP deadlines; no lock-queue
+// analogue), and general catalog helpers that are not probes at a
+// chokepoint. The anti-vacuity floors below fail the gate if a walker
 // change stops it seeing the probes it grades today.
 //
 // Mutation-verified in both directions (2026-08-27): removing the
@@ -105,6 +111,15 @@ func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 			t.Fatalf("%s: parsed no functions — the walker cannot see the package it grades", entry.pkg)
 		}
 
+		// Every probe-shaped package function (ctx+db params) — the set an
+		// alias in a chokepoint body could smuggle past the derivation.
+		probeShaped := map[string]bool{}
+		for name, fn := range fns {
+			if takesContextAndDB(fn, entry.dbishTypes) {
+				probeShaped[name] = true
+			}
+		}
+
 		probes := map[string]bool{}
 		for _, choke := range entry.chokepoints {
 			fn, ok := fns[choke]
@@ -121,6 +136,16 @@ func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 				if takesContextAndDB(target, entry.dbishTypes) {
 					probes[callee] = true
 				}
+			}
+			// Alias-evasion guard: a probe referenced in the chokepoint
+			// body outside a direct call (assignment, argument,
+			// &-reference) would be invoked without ever entering the
+			// derived universe above — refuse the reference itself.
+			for _, aliased := range nonCallFuncRefs(fn, probeShaped) {
+				t.Errorf("%s: chokepoint %s references probe-shaped function %s outside a direct call — an "+
+					"aliased probe invocation never enters this gate's derived universe, so its timeout would be "+
+					"ungraded; call the probe directly (or extend the walker if a function value is genuinely needed)",
+					entry.pkg, choke, aliased)
 			}
 		}
 		if len(probes) < entry.floor {
@@ -184,6 +209,67 @@ func parsePackageFuncs(t *testing.T, pkg string) map[string]*ast.FuncDecl {
 		}
 	}
 	return fns
+}
+
+// nonCallFuncRefs returns every occurrence of a watched name in fn's body
+// that is NOT the function position of a direct call — the alias shapes
+// (`p := probeX; p(ctx, db)`, a probe passed as an argument, &probeX)
+// through which a probe could run without entering the derived universe.
+// Self-tested by TestProbeAliasDetection_SelfTest. The mysql package's
+// roster gates carry the same helper (nonCallRefIdents); duplicated here
+// because the packages cannot share test code.
+func nonCallFuncRefs(fn *ast.FuncDecl, watched map[string]bool) []string {
+	callFuns := map[*ast.Ident]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok {
+				callFuns[id] = true
+			}
+		}
+		return true
+	})
+	var out []string
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && watched[id.Name] && !callFuns[id] {
+			out = append(out, id.Name)
+		}
+		return true
+	})
+	return out
+}
+
+// TestProbeAliasDetection_SelfTest is the anti-vacuity floor for the alias
+// detection above: a planted alias in a parsed fixture MUST be flagged and a
+// direct call MUST NOT be, so a walker change cannot quietly stop seeing the
+// evasion shape.
+func TestProbeAliasDetection_SelfTest(t *testing.T) {
+	t.Parallel()
+	const fixture = `package p
+
+func direct() { probeX() }
+
+func evade() {
+	p := probeX
+	p()
+}
+`
+	f, err := parser.ParseFile(token.NewFileSet(), "fixture.go", fixture, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	watched := map[string]bool{"probeX": true}
+	byName := map[string]*ast.FuncDecl{}
+	for _, d := range f.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok {
+			byName[fn.Name.Name] = fn
+		}
+	}
+	if refs := nonCallFuncRefs(byName["direct"], watched); len(refs) != 0 {
+		t.Errorf("direct call flagged as alias reference: %v — the detection over-fires and would refuse legitimate chokepoint code", refs)
+	}
+	if refs := nonCallFuncRefs(byName["evade"], watched); len(refs) != 1 {
+		t.Errorf("planted alias produced %d finding(s), want 1 — the alias detection went vacuous and the probe gate is evadable again", len(refs))
+	}
 }
 
 // directCallees returns the names of package-local functions fn calls by
