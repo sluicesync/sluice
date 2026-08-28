@@ -250,9 +250,17 @@ func scanBinlogDBFilterRow(rows *sql.Rows) (doList, ignoreList []string, ok bool
 
 // splitDBList splits the server's comma-separated filter rendering.
 // Multiple --binlog-do-db flags render comma-separated; a database name
-// CONTAINING a comma is pathological and splits wrong here — the
-// conservative failure direction (an over-split fragment can only
-// over-refuse, never silently pass a filtered database).
+// CONTAINING a comma is pathological and splits wrong here, and the
+// failure direction is ASYMMETRIC per arm (the honest statement — the
+// earlier "can only over-refuse" claim was false for the ignore arm):
+// on the DO arm a synced comma-carrying name never matches its own
+// over-split fragments, so the check over-refuses (safe); on the IGNORE
+// arm the same mismatch means a genuinely FILTERED comma-carrying synced
+// database fails to match any fragment and the preflight passes — the
+// under-refusal direction. Accepted as-is: a comma in a database name
+// requires backtick quoting to even create, the server's own rendering
+// is ambiguous for it (no escaping), and no parse of the joined string
+// can recover the boundary.
 func splitDBList(s string) []string {
 	if strings.TrimSpace(s) == "" {
 		return nil

@@ -168,6 +168,16 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// tier, whose promised DDL-detection loop was never implemented —
 	// source DDL is invisible to capture there (capture-completeness G1;
 	// same both-open-paths chokepoint rationale as the F1 WARN above).
+	//
+	// DELIBERATE second loadDDLCaptureState read per open (the filed
+	// "double DDL-state read" LOW, resolved leave-with-reason 2026-08-28):
+	// the capture-shape door above already read the same state, but
+	// sharing that read would thread door state across the boundary and
+	// collapse two deliberately different postures — the door FAILS CLOSED
+	// on a probe error while this WARN degrades to its "could not rule it
+	// out" arm — and each probe derives its own bounded context per the A5
+	// convention (TestOpenPathProbesDeriveBoundedContexts). Cost: one
+	// EXISTS + one single-row catalog read per stream open.
 	warnDDLDetectionAbsent(ctx, db, cfg.schema)
 	return &CDCReader{
 		db:           db,

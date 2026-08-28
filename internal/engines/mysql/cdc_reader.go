@@ -2334,8 +2334,7 @@ func coldStartGTIDSetFor(ctx context.Context, q rowQuerier, flavor Flavor) (stri
 }
 
 // masterStatusSpellings is the ordered fallback list of "where is the
-// binlog tip?" statements across the MySQL and MariaDB families. Ordered
-// so no currently-supported server pays a wasted round-trip:
+// binlog tip?" statements across the MySQL and MariaDB families:
 //
 //	SHOW BINARY LOG STATUS  — MySQL 8.4+ (renamed from SHOW MASTER STATUS)
 //	SHOW MASTER STATUS      — MySQL 8.0, MariaDB 10.11 / 11.4 (all accept it)
@@ -2343,9 +2342,18 @@ func coldStartGTIDSetFor(ctx context.Context, q rowQuerier, flavor Flavor) (stri
 //
 // Ground-truthed live (ADR-0170): MariaDB 10.11 and 11.4 accept BOTH
 // SHOW MASTER STATUS and SHOW BINLOG STATUS but REJECT SHOW BINARY LOG
-// STATUS (error 1064); MySQL rejects SHOW BINLOG STATUS. So on every
-// current server the second entry hits, and the SHOW BINLOG STATUS entry
-// is purely forward-compat for MariaDB 12.
+// STATUS (error 1064); MySQL rejects SHOW BINLOG STATUS. The SHOW BINLOG
+// STATUS entry is purely forward-compat for MariaDB 12.
+//
+// Cost, stated honestly (this comment once claimed "no currently-supported
+// server pays a wasted round-trip", which its own ground truth contradicts):
+// MySQL 8.4+ hits the first entry; MySQL 8.0 and every MariaDB pay ONE
+// failed probe (the 8.4 spelling errors 1064) before the second entry hits;
+// a future MariaDB 12 would pay two. And each CDC open pays the failed
+// probes TWICE — [readBinlogDBFilters] (the G6 filter preflight) walks this
+// same list independently of the position scan. A syntax-error round-trip
+// is microseconds against a stream open; per-server spelling caching is not
+// worth the state, but the count should not be misstated.
 var masterStatusSpellings = []string{"SHOW BINARY LOG STATUS", "SHOW MASTER STATUS", "SHOW BINLOG STATUS"}
 
 // masterStatus returns the source's current binlog file + position.
