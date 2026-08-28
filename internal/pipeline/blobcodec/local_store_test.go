@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalStore_PutGet(t *testing.T) {
@@ -128,6 +129,97 @@ func TestLocalStore_List(t *testing.T) {
 	all, _ := s.List(context.Background(), "")
 	if len(all) != len(files) {
 		t.Errorf("List(\"\") returned %d; want %d", len(all), len(files))
+	}
+}
+
+// TestLocalStore_CrashOrphanedTemps pins the crash-orphan `.tmp.*`
+// handling (two audits filed the accumulation): an orphaned Put temp is
+// invisible to List, is swept by the next same-key write once STALE, and a
+// FRESH temp — a live concurrent writer's — is never swept (the age
+// guard). isPutTempName's shape-tightness is pinned too, so a legitimate
+// object that merely contains ".tmp." cannot be swallowed by the filter.
+func TestLocalStore_CrashOrphanedTemps(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	if err := s.Put(ctx, "chain/lineage.json", bytes.NewReader([]byte("v1"))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// A crash orphan: exactly os.CreateTemp's naming, written directly (no
+	// Put ever renames it in).
+	orphan := filepath.Join(dir, "chain", "lineage.json.tmp.123456789")
+	if err := os.WriteFile(orphan, []byte("torn"), 0o600); err != nil {
+		t.Fatalf("plant orphan: %v", err)
+	}
+
+	// Invisible to List — a temp is never a legitimate object.
+	got, err := s.List(ctx, "chain/")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !equalStrSlices(got, []string{"chain/lineage.json"}) {
+		t.Errorf("List = %v; want the object only (the orphan must be filtered)", got)
+	}
+
+	// FRESH orphan (mtime = now): the next same-key Put must NOT sweep it —
+	// it could be a live concurrent writer's in-flight temp.
+	if err := s.Put(ctx, "chain/lineage.json", bytes.NewReader([]byte("v2"))); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("fresh temp swept by Put (age guard broken): %v", err)
+	}
+
+	// STALE orphan (mtime aged past the sweep window): the next same-key
+	// Put reclaims it.
+	old := time.Now().Add(-2 * localStoreTempSweepAge)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatalf("age orphan: %v", err)
+	}
+	if err := s.Put(ctx, "chain/lineage.json", bytes.NewReader([]byte("v3"))); err != nil {
+		t.Fatalf("Put v3: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("stale orphan survived the same-key Put sweep: err=%v", err)
+	}
+
+	// PutIfAbsent sweeps too (a crashed Put of the same key may have left
+	// the orphan; PutIfAbsent is that key's next write).
+	orphan2 := filepath.Join(dir, "chain", "claim.json.tmp.42")
+	if err := os.WriteFile(orphan2, []byte("torn"), 0o600); err != nil {
+		t.Fatalf("plant orphan2: %v", err)
+	}
+	if err := os.Chtimes(orphan2, old, old); err != nil {
+		t.Fatalf("age orphan2: %v", err)
+	}
+	if err := s.PutIfAbsent(ctx, "chain/claim.json", bytes.NewReader([]byte("claimed"))); err != nil {
+		t.Fatalf("PutIfAbsent: %v", err)
+	}
+	if _, err := os.Stat(orphan2); !os.IsNotExist(err) {
+		t.Errorf("stale orphan survived the PutIfAbsent sweep: err=%v", err)
+	}
+
+	// The name filter is tight to CreateTemp's pattern: these are
+	// legitimate objects and MUST list. (A trailing-dot name like
+	// "archive.tmp." — empty suffix, also legit per the filter — cannot be
+	// pinned portably: Windows strips trailing dots at the filesystem.)
+	for _, legit := range []string{"chain/report.tmp.notes", "chain/data.tmp.1x", "chain/backup.tmp.9a"} {
+		if err := s.Put(ctx, legit, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatalf("Put %s: %v", legit, err)
+		}
+	}
+	all, err := s.List(ctx, "chain/")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	sort.Strings(all)
+	want := []string{"chain/backup.tmp.9a", "chain/claim.json", "chain/data.tmp.1x", "chain/lineage.json", "chain/report.tmp.notes"}
+	if !equalStrSlices(all, want) {
+		t.Errorf("List = %v; want %v (a legitimate name containing .tmp. must not be swallowed)", all, want)
 	}
 }
 

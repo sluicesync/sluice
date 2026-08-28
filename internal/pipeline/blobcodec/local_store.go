@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
@@ -38,10 +39,12 @@ import (
 // LocalStore is the local-filesystem implementation of
 // [irbackup.Store]. Construct with [NewLocalStore].
 //
-// Concurrent Put / Get on the same path is unsafe (the underlying
-// `os.Create` truncates); Phase 1 backup orchestrator is sequential
-// per table so this isn't a concern. Phase 2 / parallel backup will
-// need to coordinate at a higher layer.
+// Concurrent Puts to the same path are safe: each writes a
+// uniquely-named temp file and renames it in, so the last COMPLETE
+// rename wins (see Put's implementation note — the fixed-name temp
+// this doc once warned about was the PUT-TMP-RACE torn-file bug,
+// fixed 2026-08-26). A Get racing a Put observes either the old or
+// the new complete bytes, never a blend.
 type LocalStore struct {
 	root string
 }
@@ -104,6 +107,13 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
+	// A crash between CreateTemp and the rename orphans the unique temp
+	// file forever (nothing else ever names it). Sweep STALE same-key
+	// temps opportunistically on the next write of that key — bounded to
+	// this key's siblings, best-effort (a sweep failure never fails the
+	// write), and age-guarded so a live concurrent writer's fresh temp is
+	// never removed.
+	s.sweepStaleTemps(abs)
 	// os.CreateTemp opens O_EXCL with 0600 perms — unique per call (the
 	// concurrency requirement above) and never world-readable (chunk
 	// contents are row data; see the NewLocalStore doc comment).
@@ -194,6 +204,10 @@ func (s *LocalStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
+	// Same crash-orphan sweep as Put: PutIfAbsent writes no temp file
+	// itself, but a crashed PUT of the same key may have left one, and
+	// this is the next write of that key.
+	s.sweepStaleTemps(abs)
 	// 0600 like Put — see the NewLocalStore doc comment.
 	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -239,6 +253,14 @@ func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error
 // at the store's root and returns every regular file whose path
 // (forward-slash separated, relative to root) starts with prefix.
 //
+// In-flight and crash-orphaned Put temp files ([isPutTempName]) are
+// filtered out: they are never legitimate objects — the naming is
+// Put's own os.CreateTemp pattern — and before this filter a crash
+// mid-Put left a phantom entry in every subsequent listing forever
+// (surfacing in verify sweeps and consumer walks). The files
+// themselves are reclaimed by [LocalStore.sweepStaleTemps] on the next
+// same-key write.
+//
 // Order is filesystem-dependent (filepath.Walk visits in lexical
 // order, which is good enough for "find every chunk under prefix"
 // queries; callers that need a stable order sort).
@@ -252,6 +274,9 @@ func (s *LocalStore) List(ctx context.Context, prefix string) ([]string, error) 
 			return walkErr
 		}
 		if d.IsDir() {
+			return nil
+		}
+		if isPutTempName(d.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(s.root, path)
@@ -317,6 +342,62 @@ func (s *LocalStore) Delete(ctx context.Context, path string) error {
 		return fmt.Errorf("local store: delete %q: %w", path, err)
 	}
 	return nil
+}
+
+// localStoreTempSweepAge is how old a same-key `.tmp.*` sibling must be
+// before [LocalStore.sweepStaleTemps] reclaims it. Any live writer's temp
+// is seconds old (Put streams one object and renames); an hour-old temp is
+// a crash orphan. Generous on purpose — the cost of waiting is a little
+// disk, the cost of guessing low is deleting a slow concurrent writer's
+// in-flight bytes out from under it (that writer's rename would then fail
+// loudly, not corrupt — but there is no reason to cause it).
+const localStoreTempSweepAge = time.Hour
+
+// isPutTempName reports whether a file NAME (no directory) matches Put's
+// os.CreateTemp pattern — `<base>.tmp.<digits>` — and is therefore an
+// in-flight or crash-orphaned temp file, never a legitimate object. Tight
+// to CreateTemp's own suffix shape (a non-empty all-digit tail) so an
+// operator file that merely contains ".tmp." elsewhere is not swallowed.
+func isPutTempName(name string) bool {
+	i := strings.LastIndex(name, ".tmp.")
+	if i < 0 {
+		return false
+	}
+	tail := name[i+len(".tmp."):]
+	if tail == "" {
+		return false
+	}
+	for _, c := range tail {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepStaleTemps best-effort removes crash-orphaned Put temp files for
+// ONE key: `<abs>.tmp.<digits>` siblings older than
+// [localStoreTempSweepAge]. Called by Put and PutIfAbsent before writing
+// that key — the only moment such orphans are cheaply discoverable without
+// a store-wide walk. Errors are deliberately swallowed: reclaiming an
+// orphan must never fail or slow the write that triggered it, and an
+// orphan that survives a failed sweep is retried on the key's next write.
+func (s *LocalStore) sweepStaleTemps(abs string) {
+	matches, err := filepath.Glob(abs + ".tmp.*")
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-localStoreTempSweepAge)
+	for _, m := range matches {
+		if !isPutTempName(filepath.Base(m)) {
+			continue
+		}
+		info, err := os.Stat(m)
+		if err != nil || info.IsDir() || info.ModTime().After(cutoff) {
+			continue // fresh (a live writer's), vanished, or not a file
+		}
+		_ = os.Remove(m)
+	}
 }
 
 // absPath resolves a forward-slash relative path against the store's
