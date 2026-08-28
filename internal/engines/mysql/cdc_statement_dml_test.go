@@ -33,6 +33,13 @@ func TestStatementDMLVerb(t *testing.T) {
 		"line_comment":     "-- generated\nDELETE FROM t",
 		"hash_comment":     "# generated\nREPLACE INTO t VALUES (1)",
 		"delete_from_h":    "DELETE FROM history WHERE id = 1", // HISTORY exemption must key on the token, not a prefix of the table name
+		// CTE-DML (STATEMENT-DML-WITH): a WITH-prefixed QueryEvent under
+		// ROW logging can only be statement-format CTE UPDATE/DELETE —
+		// WITH…SELECT is never binlogged, so first-token WITH trips.
+		"cte_update":           "WITH x AS (SELECT id FROM t WHERE flag) UPDATE t SET v = 1 WHERE id IN (SELECT id FROM x)",
+		"cte_delete_lowercase": "with x as (select id from t) delete from t where id in (select id from x)",
+		"cte_recursive":        "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT n+1 FROM x) DELETE FROM t WHERE id IN (SELECT n FROM x)",
+		"cte_comment":          "/* app */ WITH x AS (SELECT id FROM t) UPDATE t SET v = 2",
 	}
 	for name, q := range trips {
 		verb, ok := statementDMLVerb(q)
@@ -114,6 +121,14 @@ func TestStatementDMLError(t *testing.T) {
 	if !strings.Contains(ce.Hint, "performance_schema=ON") || !strings.Contains(ce.Hint, "SHOW PROCESSLIST") {
 		t.Errorf("hint = %q; want the performance_schema precondition + the MariaDB fallback (audit 2026-08-27 A6)", ce.Hint)
 	}
+
+	// The WITH verb names its class: "a WITH statement" alone would leave
+	// the operator guessing what a read-only-looking keyword is doing in
+	// a refusal about DML.
+	withMsg := statementDMLError("WITH", "app", "WITH x AS (SELECT id FROM t) UPDATE t SET v = 1").Error()
+	if !strings.Contains(withMsg, "CTE-DML") {
+		t.Errorf("WITH refusal does not name CTE-DML; got: %v", withMsg)
+	}
 }
 
 // TestStatementDMLLead pins the sanitizer's cut rule in both
@@ -177,6 +192,19 @@ func TestDispatch_StatementDMLTripwire(t *testing.T) {
 		err := r.dispatch(ctx, queryEv("", "UPDATE app.t SET x = 1"), out)
 		if err == nil {
 			t.Fatal("dispatch of no-default-db statement DML = nil; want the coded refusal (empty schema is in scope, matching the generic arm)")
+		}
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeCDCStatementDML {
+			t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCStatementDML, err, err)
+		}
+	})
+
+	t.Run("in_scope_cte_dml_refuses", func(t *testing.T) {
+		t.Parallel()
+		r := newStagingReader(t, FlavorVanilla, "6a3175a8-0000-0000-0000-000000000000:1-4")
+		out := make(chan ir.Change, 4)
+		err := r.dispatch(ctx, queryEv("app", "WITH x AS (SELECT id FROM t) UPDATE t SET v = 1 WHERE id IN (SELECT id FROM x)"), out)
+		if err == nil {
+			t.Fatal("dispatch of in-scope statement CTE-DML = nil; want the coded refusal (STATEMENT-DML-WITH)")
 		}
 		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeCDCStatementDML {
 			t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCStatementDML, err, err)

@@ -46,18 +46,21 @@ import (
 //     server may legitimately write as a statement; the second-token
 //     exemption below keeps it on the generic-DDL path.
 //
+//   - WITH (CTE-DML, MySQL 8.0 / MariaDB 10.2+) IS enumerated
+//     (STATEMENT-DML-WITH, the VF-review 2026-08-26 follow-up): WITH
+//     can only prefix SELECT / UPDATE / DELETE, a WITH…SELECT performs
+//     no writes and is never binlogged under ANY format, and under ROW
+//     logging CTE UPDATE/DELETE ride row events — so a WITH-prefixed
+//     QueryEvent is proof of statement-format CTE-DML. WITH RECURSIVE
+//     lexes the same first token and needs no second-token handling.
+//
 // Known residue, stated not implied: statement-format LOAD DATA
 // arrives as Begin/Execute_load_query events (a different event type
-// the dispatcher's default arm ignores); a DML wrapped entirely in
-// a /*!vvvvv … */ versioned comment lexes as a comment here; and
-// CTE-DML (`WITH x AS (…) UPDATE/DELETE …`, MySQL 8.0 / MariaDB
-// 10.2+) lexes first-token WITH, which this belt does not enumerate —
-// a WITH-prefixed statement in a ROW-mode binlog is almost certainly
-// statement-format CTE-DML (SELECTs are never binlogged), so adding
-// WITH to the verb set is a filed follow-up (VF review 2026-08-26)
-// rather than an unreviewed pre-tag behavior change. All three remain
-// the documented session-override residue, now narrowed to those
-// shapes. The belt is scope-gated like the generic arm's
+// the dispatcher's default arm ignores), and a DML wrapped entirely in
+// a /*!vvvvv … */ versioned comment lexes as a comment here. Both
+// remain the documented session-override residue, now narrowed to
+// those shapes (CTE-DML moved from residue to the verb set above).
+// The belt is scope-gated like the generic arm's
 // cache clear (Bug 246: a statement-format writer on an UNRELATED
 // database must not kill the sync); the trade is that a statement
 // whose session default database is out of scope but which writes into
@@ -65,12 +68,16 @@ import (
 // of the same residue.
 
 // statementDMLVerbs are the row-DML leading keywords that cannot arrive
-// as query text under ROW logging.
+// as query text under ROW logging. WITH is the CTE-DML entry (see the
+// file comment's false-positive analysis: a WITH-prefixed QueryEvent can
+// only be statement-format CTE UPDATE/DELETE — WITH…SELECT is never
+// binlogged, and DDL never begins with WITH).
 var statementDMLVerbs = map[string]bool{
 	"INSERT":  true,
 	"UPDATE":  true,
 	"DELETE":  true,
 	"REPLACE": true,
+	"WITH":    true,
 }
 
 // statementDMLVerb returns the leading SQL keyword of query (after
@@ -205,6 +212,11 @@ func statementDMLLead(query string) string {
 // log) plus the sanitized lead from [statementDMLLead] — never the
 // payload.
 func statementDMLError(verb, schema, query string) error {
+	if verb == "WITH" {
+		// Name the class, not just the token: the WITH entry exists for
+		// statement-format CTE-DML (file comment).
+		verb = "WITH-prefixed (CTE-DML)"
+	}
 	digest := sha256.Sum256([]byte(query))
 	where := "with no default database selected"
 	if schema != "" {
