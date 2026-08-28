@@ -470,18 +470,34 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     every stored fractional second with zero decoded messages),
     **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
     rounds every element; the element resolves with typmod −1 by
-    design), and **the `time ↔ timetz` OID swap** — originally caught
-    here as projection-identical (both arms shared a flag-less
-    `ir.Time`); since the TIMETZ-PROJECTION fix (2026-08-28) the timetz
-    projection carries `WithTimeZone:true`, so the swap MOVES its
-    signature and is kept on the refuse list for its own reason
-    (`unforwardableSessionTZCast`): the source's rewrite cast every
-    stored value against the SOURCE session's TimeZone, and a
-    forwarded ALTER would re-cast the target's pre-existing rows
-    against the TARGET session's TimeZone — differing settings diverge
-    silently. (Known pre-existing sibling, filed not fixed: the
-    `timestamp ⇄ timestamptz` swap has always moved its projection and
-    forwards today with the same session-TZ-dependent recast hazard.)
+    design), and **the session-TZ cast swaps — `time ↔ timetz` and
+    `timestamp ↔ timestamptz`, either direction**
+    (`unforwardableSessionTZCast`). Both swaps MOVE their projected
+    signatures (`time ↔ timetz` since the TIMETZ-PROJECTION fix,
+    2026-08-28, which caught it as projection-identical before that;
+    the timestamp pair always has — `ir.DateTime` vs `ir.Timestamp`),
+    so the intercept COULD see them, but they refuse for their own
+    reason: the source's ALTER resolved every stored value against the
+    SOURCE session's TimeZone, and a forwarded ALTER would re-cast the
+    target's pre-existing rows against the TARGET session's TimeZone —
+    differing settings diverge silently. The timestamp pair FORWARDED
+    until the TIMESTAMPTZ-SWAP-FORWARD operator decision (2026-08-28)
+    aligned it with its sibling — a deliberate behavior change: the
+    convergence-when-both-session-TZs-happen-to-match case is given up
+    to refuse the silent-divergence case, consistent posture across
+    the class. Impl note on the hazard's reach: the wire does not
+    carry the source ALTER session's TimeZone, and sluice's PG applier
+    sessions do not pin one (`afterConnectSessionPins` pins
+    `extra_float_digits` and `bytea_output` only — grep-verified, no
+    `SET TIME ZONE` anywhere in the engine) — a target-side pin would
+    only narrow the hazard (making the target's cast deterministic),
+    never close it, because the source setting stays unknowable.
+    Class siblings enumerated, filed not fixed (audit backlog
+    2026-08-28): the ARRAY variants (`time[] ↔ timetz[]`,
+    `timestamp[] ↔ timestamptz[]`) forward today with the same
+    per-element hazard, and MySQL's `timestamp ↔ datetime` MODIFY is
+    the other lane's analogue — both outside this decision's
+    scalar-PG scope.
     The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.

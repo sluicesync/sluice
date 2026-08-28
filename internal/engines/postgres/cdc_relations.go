@@ -333,13 +333,13 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	// the gate also catches two catalog-only shapes PG applies without a
 	// table rewrite, and telling their operator "rows silently diverged"
 	// would be factually wrong — those get the honest no-rewrite message.
-	// The time⇄timetz swap gets its own message too: since the
-	// TIMETZ-PROJECTION fix its projection MOVES, and it refuses for the
-	// session-TZ-cast reason instead ([unforwardableSessionTZCast]).
+	// The session-TZ cast swaps (time⇄timetz, timestamp⇄timestamptz) get
+	// their own message too: their projections MOVE, and they refuse for
+	// the session-TZ-cast reason instead ([unforwardableSessionTZCast]).
 	// Refuse/pass behavior is identical for every shape; only the text
 	// differs (pinned both ways by TestCheckSchemaRace_UnforwardableTypmod).
 	if forwarded && (change.Kind == relationChangeAlterColumnType || change.Kind == relationChangeDropColumn) {
-		switch col, shape := unforwardableTypmodColumn(relations[relationID], current); shape {
+		switch col, shape, tzPair := unforwardableTypmodColumn(relations[relationID], current); shape {
 		case unforwardableLosslessNoRewrite:
 			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta, and no table rewrite occurred on the source (unbounded varchar⇄text is binary-coercible; an interval precision widening leaves every stored value untouched): the change is projection-invisible, so --schema-changes=forward would emit no schema boundary — apply the same ALTER on the target via the drained model. %s",
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
@@ -347,8 +347,8 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta (interval precision/field restrictions and array-element modifiers do not survive the wire projection), so --schema-changes=forward would emit no schema boundary and the source's table rewrite would silently diverge pre-existing target rows. %s",
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
 		case unforwardableSessionTZCast:
-			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q changed between time and timetz: the source's table rewrite resolved every stored value against the SOURCE session's TimeZone, and a forwarded ALTER would re-cast the target's pre-existing rows against the TARGET session's TimeZone — when the two settings differ the casts silently disagree, so this swap refuses under forward mode. Apply the same ALTER on the target via the drained model. %s",
-				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
+			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q changed between %s: the source's ALTER resolved every stored value against the SOURCE session's TimeZone, and a forwarded ALTER would re-cast the target's pre-existing rows against the TARGET session's TimeZone — when the two settings differ the casts silently disagree, so this swap refuses under forward mode. Apply the same ALTER on the target via the drained model. %s",
+				current.Schema, current.Name, relationID, change.Description, col, tzPair, schemaRaceRecoveryHint)
 		case forwardableShape:
 			// No projection-invisible column; fall through to the normal
 			// forward path.
@@ -399,33 +399,47 @@ const (
 	// no rewrite and stored values are untouched — the honest
 	// no-rewrite refusal text.
 	unforwardableLosslessNoRewrite
-	// unforwardableSessionTZCast: a time⇄timetz OID swap. Since the
-	// TIMETZ-PROJECTION fix the swap MOVES the projected signature
-	// (timetz now projects WithTimeZone:true), so the forward intercept
-	// could see it — but the source's rewrite resolved every stored
-	// value against the SOURCE session's TimeZone at ALTER time, and a
-	// forwarded ALTER would re-cast the target's pre-existing rows
-	// against the TARGET session's TimeZone; when the two settings
-	// differ the casts silently disagree at exit 0. The swap therefore
-	// keeps the loud refusal it has had since the A2 gate (where it was
-	// caught as projection-identical), now for the honest reason.
-	// KNOWN pre-existing sibling, filed not fixed here: the
-	// timestamp⇄timestamptz swap has always moved its projection (the
-	// Go types differ) and forwards today with the same
-	// session-TZ-dependent recast hazard (audit backlog 2026-08-28).
+	// unforwardableSessionTZCast: an OID swap between a temporal type and
+	// its with-time-zone sibling — time⇄timetz or timestamp⇄timestamptz,
+	// either direction. Both swaps MOVE the projected signature (timetz
+	// projects WithTimeZone:true since the TIMETZ-PROJECTION fix; the
+	// timestamp pair projects distinct Go types and always has), so the
+	// forward intercept could see them — but the source's ALTER resolved
+	// every stored value against the SOURCE session's TimeZone (a table
+	// rewrite, except the timestamp pair's PG≥12 no-rewrite fast path
+	// when that session's TimeZone is UTC — same session-TZ-defined
+	// semantics either way), and a forwarded ALTER would re-cast the
+	// target's pre-existing rows against the TARGET session's TimeZone;
+	// when the two settings differ the casts silently disagree at exit 0.
+	// The wire does not carry the source ALTER session's TimeZone, and
+	// sluice's own applier sessions do not pin one
+	// ([afterConnectSessionPins] pins extra_float_digits and bytea_output
+	// only) — nor could a target-side pin close the hazard, since the
+	// source setting stays unknowable. time⇄timetz has refused since the
+	// A2 gate (where it was caught as projection-identical);
+	// timestamp⇄timestamptz forwarded until the TIMESTAMPTZ-SWAP-FORWARD
+	// operator decision (2026-08-28) aligned it — a deliberate behavior
+	// change trading convergence-when-TZs-happen-to-match for refusing
+	// the silent-divergence case.
+	// Class siblings enumerated, filed not fixed here (audit backlog
+	// 2026-08-28): the ARRAY variants (time[]⇄timetz[],
+	// timestamp[]⇄timestamptz[]) forward today with the same per-element
+	// hazard, and MySQL's timestamp⇄datetime MODIFY is the other lane's
+	// analogue — both outside this decision's scalar-PG scope.
 	unforwardableSessionTZCast
 )
 
 // unforwardableTypmodColumn scans an AlterColumnType-classified prev/current
 // pair for a changed column whose PROJECTED IR type did not move — the
-// TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2) — plus the one
-// projection-MOVING shape that still refuses, the time⇄timetz swap
+// TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2) — plus the
+// projection-MOVING shapes that still refuse, the session-TZ cast swaps
 // ([unforwardableSessionTZCast]). It returns the name of an unforwardable
-// column and its [unforwardableShape]; a swap hit returns immediately, and a
-// rewrite-shape hit wins over a lossless one (a single delta can carry both,
-// and the divergence warning is the one that must never be softened), so the
-// lossless shape is only reported when EVERY projection-invisible column in
-// the delta is lossless.
+// column and its [unforwardableShape] (tzPair names the swapped pair for the
+// refusal text, "" for every other shape); a swap hit returns immediately,
+// and a rewrite-shape hit wins over a lossless one (a single delta can carry
+// both, and the divergence warning is the one that must never be softened),
+// so the lossless shape is only reported when EVERY projection-invisible
+// column in the delta is lossless.
 //
 // The compare is per-COLUMN, not the whole-table [ir.SchemaSignatureOf]
 // equality the audit sketched: a single `ALTER TABLE` can carry a
@@ -454,7 +468,7 @@ const (
 // type on a changed column compares equal and refuses — the safe direction
 // (production entries always carry a resolved type; buildRelationCacheEntry
 // errors on unresolvable OIDs).
-func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, unforwardableShape) {
+func unforwardableTypmodColumn(prev, current *relationCacheEntry) (col string, shape unforwardableShape, tzPair string) {
 	// NAME-keyed, not ordinal-keyed (VF review 2026-08-27): the gate also
 	// runs for the DropColumn classification, where a middle-column drop
 	// shifts every later ordinal — an ordinal scan would pair shifted
@@ -475,11 +489,11 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, unfor
 		if pc.OID == cc.OID && pc.TypeMod == cc.TypeMod {
 			continue
 		}
-		// The time⇄timetz swap is checked BEFORE the projection-moved
-		// skip: its projection moves (post TIMETZ-PROJECTION), but the
-		// swap must keep refusing — see [unforwardableSessionTZCast].
-		if isTimeTimetzSwap(pc, cc) {
-			return cc.Name, unforwardableSessionTZCast
+		// The session-TZ cast swaps are checked BEFORE the projection-
+		// moved skip: their projections move, but the swaps must keep
+		// refusing — see [unforwardableSessionTZCast].
+		if pair, ok := sessionTZSwapPair(pc, cc); ok {
+			return cc.Name, unforwardableSessionTZCast, pair
 		}
 		if !reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
 			continue
@@ -490,12 +504,12 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, unfor
 			}
 			continue
 		}
-		return cc.Name, unforwardableRewrite
+		return cc.Name, unforwardableRewrite, ""
 	}
 	if losslessCol != "" {
-		return losslessCol, unforwardableLosslessNoRewrite
+		return losslessCol, unforwardableLosslessNoRewrite, ""
 	}
-	return "", forwardableShape
+	return "", forwardableShape, ""
 }
 
 // losslessNoRewriteDelta reports whether a changed projection-invisible
@@ -530,11 +544,24 @@ func losslessNoRewriteDelta(pc, cc relationColumn) bool {
 	return false
 }
 
-// isTimeTimetzSwap reports an OID swap between time and timetz, in either
-// direction — the [unforwardableSessionTZCast] shape.
-func isTimeTimetzSwap(pc, cc relationColumn) bool {
-	return (pc.OID == pgtype.TimeOID && cc.OID == pgtype.TimetzOID) ||
-		(pc.OID == pgtype.TimetzOID && cc.OID == pgtype.TimeOID)
+// sessionTZSwapPair reports an OID swap between a temporal type and its
+// with-time-zone sibling, in either direction — the
+// [unforwardableSessionTZCast] shape — naming the pair for the refusal
+// text. Scalar OIDs only, deliberately: the array variants are filed, not
+// fixed (see the shape const). Each arm requires BOTH OIDs of a distinct
+// pair, so a same-OID typmod delta (timestamp(6)→timestamp(3)) can never
+// match — the precision-forward floor
+// (TestTypmodProjectionGate_EveryTypmodFamily) pins that.
+func sessionTZSwapPair(pc, cc relationColumn) (string, bool) {
+	switch {
+	case (pc.OID == pgtype.TimeOID && cc.OID == pgtype.TimetzOID) ||
+		(pc.OID == pgtype.TimetzOID && cc.OID == pgtype.TimeOID):
+		return "time and timetz", true
+	case (pc.OID == pgtype.TimestampOID && cc.OID == pgtype.TimestamptzOID) ||
+		(pc.OID == pgtype.TimestamptzOID && cc.OID == pgtype.TimestampOID):
+		return "timestamp and timestamptz", true
+	}
+	return "", false
 }
 
 // isUnboundedVarcharTextSwap reports an OID swap between text and an

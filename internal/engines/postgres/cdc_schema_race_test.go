@@ -612,17 +612,18 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		}
 	})
 
-	// requireSessionTZRefusal: the time⇄timetz swap keeps refusing after the
-	// TIMETZ-PROJECTION fix, but for its own reason — the projection now
-	// MOVES (timetz projects WithTimeZone:true), so the old "the intercept
-	// could never see it" text would be false; the honest refusal names the
-	// session-TZ-dependent recast instead.
-	requireSessionTZRefusal := func(t *testing.T, err error, col string) {
+	// requireSessionTZRefusal: the session-TZ cast swaps keep refusing even
+	// though their projections MOVE (timetz projects WithTimeZone:true since
+	// the TIMETZ-PROJECTION fix; the timestamp pair always projected
+	// distinct types), so the old "the intercept could never see it" text
+	// would be false; the honest refusal names the session-TZ-dependent
+	// recast and the swapped pair instead.
+	requireSessionTZRefusal := func(t *testing.T, err error, col, pair string) {
 		t.Helper()
 		if err == nil {
-			t.Fatal("time⇄timetz OID swap passed under forward mode; want the session-TZ-cast refusal (a forwarded ALTER would re-cast pre-existing target rows against the TARGET session's TimeZone)")
+			t.Fatalf("%s OID swap passed under forward mode; want the session-TZ-cast refusal (a forwarded ALTER would re-cast pre-existing target rows against the TARGET session's TimeZone)", pair)
 		}
-		for _, want := range []string{"cannot be forwarded", `column "` + col + `"`, "between time and timetz", "TimeZone", "drained model", "sync stop --wait"} {
+		for _, want := range []string{"cannot be forwarded", `column "` + col + `"`, "between " + pair, "TimeZone", "drained model", "sync stop --wait"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("session-TZ refusal missing %q; got: %v", want, err)
 			}
@@ -633,7 +634,7 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
 		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
 		relations := map[uint32]*relationCacheEntry{16400: prev}
-		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm", "time and timetz")
 		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
 			t.Error("time→timetz swap must refuse under refuse mode too")
 		}
@@ -643,7 +644,48 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
 		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
 		relations := map[uint32]*relationCacheEntry{16400: prev}
-		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm", "time and timetz")
+	})
+
+	t.Run("timestamp→timestamptz OID swap refuses under forward (TIMESTAMPTZ-SWAP-FORWARD)", func(t *testing.T) {
+		// The operator-decided sibling closure (2026-08-28): this swap
+		// FORWARDED before the decision — its projection has always moved
+		// (ir.DateTime vs ir.Timestamp) — but the forwarded ALTER's cast
+		// is session-TZ-dependent exactly like time⇄timetz, so it now
+		// refuses under both modes, deliberately.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1114, 3))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1184, 3))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "ts", "timestamp and timestamptz")
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("timestamp→timestamptz swap must refuse under refuse mode too")
+		}
+	})
+
+	t.Run("timestamptz→timestamp OID swap refuses under forward (both directions)", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1184, 3))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", 1114, 3))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "ts", "timestamp and timestamptz")
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("timestamptz→timestamp swap must refuse under refuse mode too")
+		}
+	})
+
+	t.Run("timestamp/timestamptz precision-only ALTER on an unchanged OID still forwards", func(t *testing.T) {
+		// The NO-FALSE-FIRE floor for the new arm: the swap predicate
+		// requires both OIDs of a distinct pair, so a precision change
+		// that keeps the OID must keep forwarding (its projection moves,
+		// a boundary emits, and the target converges — the G3 posture).
+		// An over-broadened predicate (any temporal OID) fails here.
+		for _, oid := range []uint32{1114, 1184} {
+			prev := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", oid, 6))
+			curr := table(typedCol(t, "id", 23, -1), typedCol(t, "ts", oid, 3))
+			relations := map[uint32]*relationCacheEntry{16400: prev}
+			if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+				t.Errorf("OID %d precision-only 6→3 must pass under forward mode; got: %v", oid, err)
+			}
+		}
 	})
 
 	t.Run("unbounded varchar→text OID swap refuses with the honest no-rewrite message", func(t *testing.T) {
