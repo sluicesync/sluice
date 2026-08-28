@@ -285,6 +285,13 @@ func TestOIDToType(t *testing.T) {
 		{"varbit(12)", pgtype.VarbitOID, 12, ir.Bit{Length: 12, Varying: true}},
 		{"varbit(unbounded)", pgtype.VarbitOID, -1, ir.Bit{Length: 1, Varying: true}},
 		{"date", pgtype.DateOID, -1, ir.Date{}},
+		// time vs timetz exact shapes (TIMETZ-PROJECTION): the timetz arm
+		// carries WithTimeZone in registry-parity with the schema reader;
+		// the plain-time arm must NOT grow the flag.
+		{"time(3)", pgtype.TimeOID, 3, ir.Time{Precision: 3}},
+		{"time(bare)", pgtype.TimeOID, -1, ir.Time{PrecisionUnspecified: true}},
+		{"timetz(3)", pgtype.TimetzOID, 3, ir.Time{Precision: 3, WithTimeZone: true}},
+		{"timetz(bare)", pgtype.TimetzOID, -1, ir.Time{WithTimeZone: true, PrecisionUnspecified: true}},
 		{"timestamp(0)", pgtype.TimestampOID, 0, ir.DateTime{Precision: 0}},
 		{"timestamp(6)", pgtype.TimestampOID, 6, ir.DateTime{Precision: 6}},
 		{"timestamptz(3)", pgtype.TimestamptzOID, 3, ir.Timestamp{Precision: 3, WithTimeZone: true}},

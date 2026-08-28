@@ -470,8 +470,19 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     every stored fractional second with zero decoded messages),
     **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
     rounds every element; the element resolves with typmod −1 by
-    design), and **projection-identical OID swaps** (`time ↔ timetz`,
-    which share one IR family). The temporal-collapse members below
+    design), and **the `time ↔ timetz` OID swap** — originally caught
+    here as projection-identical (both arms shared a flag-less
+    `ir.Time`); since the TIMETZ-PROJECTION fix (2026-08-28) the timetz
+    projection carries `WithTimeZone:true`, so the swap MOVES its
+    signature and is kept on the refuse list for its own reason
+    (`unforwardableSessionTZCast`): the source's rewrite cast every
+    stored value against the SOURCE session's TimeZone, and a
+    forwarded ALTER would re-cast the target's pre-existing rows
+    against the TARGET session's TimeZone — differing settings diverge
+    silently. (Known pre-existing sibling, filed not fixed: the
+    `timestamp ⇄ timestamptz` swap has always moved its projection and
+    forwards today with the same session-TZ-dependent recast hazard.)
+    The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.
     Use the drained model for these ALTERs, as the refusal instructs.

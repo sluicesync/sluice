@@ -333,6 +333,9 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 	// the gate also catches two catalog-only shapes PG applies without a
 	// table rewrite, and telling their operator "rows silently diverged"
 	// would be factually wrong — those get the honest no-rewrite message.
+	// The time⇄timetz swap gets its own message too: since the
+	// TIMETZ-PROJECTION fix its projection MOVES, and it refuses for the
+	// session-TZ-cast reason instead ([unforwardableSessionTZCast]).
 	// Refuse/pass behavior is identical for every shape; only the text
 	// differs (pinned both ways by TestCheckSchemaRace_UnforwardableTypmod).
 	if forwarded && (change.Kind == relationChangeAlterColumnType || change.Kind == relationChangeDropColumn) {
@@ -342,6 +345,9 @@ func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
 		case unforwardableRewrite:
 			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q's projected IR type is unchanged by this delta (interval precision/field restrictions and array-element modifiers do not survive the wire projection), so --schema-changes=forward would emit no schema boundary and the source's table rewrite would silently diverge pre-existing target rows. %s",
+				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
+		case unforwardableSessionTZCast:
+			return fmt.Errorf("postgres: cdc: schema change mid-stream on %s.%s (OID %d) is detected but cannot be forwarded: %s — column %q changed between time and timetz: the source's table rewrite resolved every stored value against the SOURCE session's TimeZone, and a forwarded ALTER would re-cast the target's pre-existing rows against the TARGET session's TimeZone — when the two settings differ the casts silently disagree, so this swap refuses under forward mode. Apply the same ALTER on the target via the drained model. %s",
 				current.Schema, current.Name, relationID, change.Description, col, schemaRaceRecoveryHint)
 		case forwardableShape:
 			// No projection-invisible column; fall through to the normal
@@ -393,12 +399,29 @@ const (
 	// no rewrite and stored values are untouched — the honest
 	// no-rewrite refusal text.
 	unforwardableLosslessNoRewrite
+	// unforwardableSessionTZCast: a time⇄timetz OID swap. Since the
+	// TIMETZ-PROJECTION fix the swap MOVES the projected signature
+	// (timetz now projects WithTimeZone:true), so the forward intercept
+	// could see it — but the source's rewrite resolved every stored
+	// value against the SOURCE session's TimeZone at ALTER time, and a
+	// forwarded ALTER would re-cast the target's pre-existing rows
+	// against the TARGET session's TimeZone; when the two settings
+	// differ the casts silently disagree at exit 0. The swap therefore
+	// keeps the loud refusal it has had since the A2 gate (where it was
+	// caught as projection-identical), now for the honest reason.
+	// KNOWN pre-existing sibling, filed not fixed here: the
+	// timestamp⇄timestamptz swap has always moved its projection (the
+	// Go types differ) and forwards today with the same
+	// session-TZ-dependent recast hazard (audit backlog 2026-08-28).
+	unforwardableSessionTZCast
 )
 
 // unforwardableTypmodColumn scans an AlterColumnType-classified prev/current
 // pair for a changed column whose PROJECTED IR type did not move — the
-// TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2). It returns the
-// name of a projection-invisible column and its [unforwardableShape]; a
+// TYPMOD-PROJECTION-GATE predicate (audit 2026-08-27 A2) — plus the one
+// projection-MOVING shape that still refuses, the time⇄timetz swap
+// ([unforwardableSessionTZCast]). It returns the name of an unforwardable
+// column and its [unforwardableShape]; a swap hit returns immediately, and a
 // rewrite-shape hit wins over a lossless one (a single delta can carry both,
 // and the divergence warning is the one that must never be softened), so the
 // lossless shape is only reported when EVERY projection-invisible column in
@@ -452,6 +475,12 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (string, unfor
 		if pc.OID == cc.OID && pc.TypeMod == cc.TypeMod {
 			continue
 		}
+		// The time⇄timetz swap is checked BEFORE the projection-moved
+		// skip: its projection moves (post TIMETZ-PROJECTION), but the
+		// swap must keep refusing — see [unforwardableSessionTZCast].
+		if isTimeTimetzSwap(pc, cc) {
+			return cc.Name, unforwardableSessionTZCast
+		}
 		if !reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
 			continue
 		}
@@ -499,6 +528,13 @@ func losslessNoRewriteDelta(pc, cc relationColumn) bool {
 		return prevRange == currRange && currPrec >= prevPrec
 	}
 	return false
+}
+
+// isTimeTimetzSwap reports an OID swap between time and timetz, in either
+// direction — the [unforwardableSessionTZCast] shape.
+func isTimeTimetzSwap(pc, cc relationColumn) bool {
+	return (pc.OID == pgtype.TimeOID && cc.OID == pgtype.TimetzOID) ||
+		(pc.OID == pgtype.TimetzOID && cc.OID == pgtype.TimeOID)
 }
 
 // isUnboundedVarcharTextSwap reports an OID swap between text and an
@@ -683,9 +719,20 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 		// ir.Time (a time-of-day). Keeps PG → PG CDC of an interval
 		// column working symmetrically with the schema-read path.
 		return ir.Interval{}, nil
-	case pgtype.TimeOID, pgtype.TimetzOID:
+	case pgtype.TimeOID:
 		p, unspec := temporalTypmod(typmod)
 		return ir.Time{Precision: p, PrecisionUnspecified: unspec}, nil
+	case pgtype.TimetzOID:
+		// WithTimeZone in registry-parity with the schema reader's
+		// "time with time zone" arm (TIMETZ-PROJECTION, audit 2026-08-26
+		// A-1's first catch): the two arms shared a flag-less ir.Time,
+		// so a CDC-projected snapshot of a timetz column phantom-altered
+		// against the cold-start seed at every classifier boundary, and
+		// a projection-driven DDL emission would have rendered plain
+		// TIME. Value fidelity was never affected (decodeValue carries
+		// time-of-day as text verbatim, offset included).
+		p, unspec := temporalTypmod(typmod)
+		return ir.Time{Precision: p, WithTimeZone: true, PrecisionUnspecified: unspec}, nil
 	case pgtype.TimestampOID:
 		p, unspec := temporalTypmod(typmod)
 		return ir.DateTime{Precision: p, PrecisionUnspecified: unspec}, nil

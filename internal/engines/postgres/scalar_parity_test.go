@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // The Postgres engine carries TWO parallel scalar type registries: the schema
@@ -237,6 +239,23 @@ func TestScalarTypeRegistryParity(t *testing.T) {
 			}
 			if reflect.TypeOf(st) != reflect.TypeOf(ct) {
 				t.Errorf("family split: schema reader resolves %q to %T, CDC resolves %s to %T — the two registries disagree on this family's IR shape", row.dataType, st, row.oidName, ct)
+			}
+			// Zone-flag parity (TIMETZ-PROJECTION, this gate's first
+			// catch): ir.Time and ir.Timestamp each cover a tz-less and a
+			// tz-carrying family behind ONE Go type, so the TypeOf compare
+			// above cannot see a WithTimeZone split — which is exactly how
+			// the CDC side carried timetz flag-less while the schema reader
+			// set the flag (phantom classifier alters; a projection-driven
+			// DDL emission would render plain TIME).
+			switch sv := st.(type) {
+			case ir.Time:
+				if cv, ok := ct.(ir.Time); ok && sv.WithTimeZone != cv.WithTimeZone {
+					t.Errorf("zone-flag split: schema reader resolves %q with WithTimeZone=%v, CDC resolves %s with WithTimeZone=%v", row.dataType, sv.WithTimeZone, row.oidName, cv.WithTimeZone)
+				}
+			case ir.Timestamp:
+				if cv, ok := ct.(ir.Timestamp); ok && sv.WithTimeZone != cv.WithTimeZone {
+					t.Errorf("zone-flag split: schema reader resolves %q with WithTimeZone=%v, CDC resolves %s with WithTimeZone=%v", row.dataType, sv.WithTimeZone, row.oidName, cv.WithTimeZone)
+				}
 			}
 		})
 	}

@@ -24,11 +24,13 @@
 //     builtinArrayElement (resolved through translateType). Deriving from
 //     one would have been a gate narrower than its name, and provably so:
 //     the first draft used the CDC door alone and MISSED timetz entirely,
-//     because that door resolves `timetz` to ir.Time with WithTimeZone
-//     unset (cdc_relations.go's `case pgtype.TimeOID, pgtype.TimetzOID`)
-//     while the schema-read door sets the flag. TestOIDToType_ArrayParity
-//     holds the two doors to the same FAMILY set; it says nothing about
-//     the resolved ir.Type, which is what the writer dispatches on.
+//     because that door then resolved `timetz` to ir.Time with
+//     WithTimeZone unset while the schema-read door set the flag (the
+//     divergence the TIMETZ-PROJECTION fix later closed — both doors now
+//     set it; the scalar-parity gate's zone-flag leg holds them there).
+//     TestOIDToType_ArrayParity holds the two doors to the same FAMILY
+//     set; it says nothing about the resolved ir.Type, which is what the
+//     writer dispatches on.
 //   - The CHECK is a DISPATCH probe: convertArray with an EMPTY array,
 //     which reaches the type switch and nothing else. It proves the arm
 //     EXISTS. It proves nothing about leaf fidelity, dimensions, or NULL
@@ -64,13 +66,11 @@ var pgUnwritableArrayElement = map[string]string{
 		"There is no faithful binary leaf: the per-conn scalar timetz codec is not registered for the " +
 		"_timetz array OID, and pgx's built-in Time codec drops the zone, so the only alternatives to " +
 		"refusing are flattening or corrupting. Remedy in the refusal text: migrate the column as a " +
-		"scalar timetz, or exclude the table. NOTE the door divergence this roster surfaced: only the " +
-		"SCHEMA-READ door produces this type. The pgoutput door resolves timetz to ir.Time with the flag " +
-		"UNSET, so a timetz[] arriving over CDC takes the plain time[] arm and refuses further down, at " +
-		"timeOfDayMicros, with `malformed time-of-day \"12:34:56+02\"` instead of the arm's own message. " +
-		"Still LOUD (verified: every offset spelling, +hh, -hh:mm and Z, fails the parse), so this is a " +
-		"message-quality divergence and not a fidelity one — but it is a real divergence between the two " +
-		"doors' resolved ir.Type, which TestOIDToType_ArrayParity cannot see because it compares FAMILIES.",
+		"scalar timetz, or exclude the table. Door history: this roster surfaced a resolved-type divergence " +
+		"(the pgoutput door once resolved timetz with the flag UNSET, so a CDC timetz[] took the plain " +
+		"time[] arm and refused further down at timeOfDayMicros — loud, but with the wrong message); the " +
+		"TIMETZ-PROJECTION fix aligned the doors, so BOTH now produce this type and a CDC timetz[] hits " +
+		"this arm's own refusal.",
 }
 
 // TestEveryDecodableArrayElementIsWritable is the divergence map.

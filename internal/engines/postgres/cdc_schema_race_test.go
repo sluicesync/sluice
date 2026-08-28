@@ -612,15 +612,38 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		}
 	})
 
-	t.Run("projection-identical OID swap (time→timetz) refuses under forward", func(t *testing.T) {
-		// Not a typmod delta but the same class: both OIDs project to
-		// ir.Time{...}, so the signature cannot move and the forward
-		// intercept could never see the change (the TIMETZ-PROJECTION
-		// filing's forward half).
+	// requireSessionTZRefusal: the time⇄timetz swap keeps refusing after the
+	// TIMETZ-PROJECTION fix, but for its own reason — the projection now
+	// MOVES (timetz projects WithTimeZone:true), so the old "the intercept
+	// could never see it" text would be false; the honest refusal names the
+	// session-TZ-dependent recast instead.
+	requireSessionTZRefusal := func(t *testing.T, err error, col string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("time⇄timetz OID swap passed under forward mode; want the session-TZ-cast refusal (a forwarded ALTER would re-cast pre-existing target rows against the TARGET session's TimeZone)")
+		}
+		for _, want := range []string{"cannot be forwarded", `column "` + col + `"`, "between time and timetz", "TimeZone", "drained model", "sync stop --wait"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("session-TZ refusal missing %q; got: %v", want, err)
+			}
+		}
+	}
+
+	t.Run("time→timetz OID swap refuses under forward (session-TZ cast)", func(t *testing.T) {
 		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
 		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
 		relations := map[uint32]*relationCacheEntry{16400: prev}
-		requireUnforwardableRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("time→timetz swap must refuse under refuse mode too")
+		}
+	})
+
+	t.Run("timetz→time OID swap refuses under forward (both directions)", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm")
 	})
 
 	t.Run("unbounded varchar→text OID swap refuses with the honest no-rewrite message", func(t *testing.T) {
