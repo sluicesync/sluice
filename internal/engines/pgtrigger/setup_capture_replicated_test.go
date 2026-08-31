@@ -12,6 +12,7 @@
 package pgtrigger
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -45,10 +46,13 @@ func TestRenderSetupDDL_CaptureReplicatedWrites(t *testing.T) {
 	})
 
 	t.Run("meta upsert records the posture, both values", func(t *testing.T) {
-		if !strings.Contains(optIn, metaCaptureReplicatedCol+") VALUES (TRUE, 3, true)") {
+		// The schema version comes from the constant, not a literal: it moves
+		// (v3 → v4 for the SEC-2 evidence columns) and this pin is about the
+		// posture, not the version.
+		if want := fmt.Sprintf("%s) VALUES (TRUE, %d, true)", metaCaptureReplicatedCol, ChangeLogSchemaVer); !strings.Contains(optIn, want) {
 			t.Errorf("opt-in render's meta upsert does not record capture_replicated_writes=true — the CDC open would grade the 'A' triggers against a recorded false and refuse every open")
 		}
-		if !strings.Contains(plain, metaCaptureReplicatedCol+") VALUES (TRUE, 3, false)") {
+		if want := fmt.Sprintf("%s) VALUES (TRUE, %d, false)", metaCaptureReplicatedCol, ChangeLogSchemaVer); !strings.Contains(plain, want) {
 			t.Errorf("plain render's meta upsert does not record capture_replicated_writes=false — a plain re-run of an opt-in install would leave the stale true recorded")
 		}
 	})

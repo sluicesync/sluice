@@ -42,7 +42,7 @@ import (
 // a post-change value dressed up as one.
 func preFixCaptureDDLFunction(t *testing.T, schema, changeLogTableRef string) string {
 	t.Helper()
-	fn := renderCaptureDDLFunction(schema, changeLogTableRef)
+	fn := renderCaptureDDLFunction(schema, changeLogTableRef, quoteIdent(schema)+"."+quoteIdent(ChangeLogMetaTable))
 	stripped := strings.Replace(fn, "\nSET search_path = pg_catalog, pg_temp", "", 1)
 	if stripped == fn {
 		t.Fatalf("pre-fix fixture: the search_path clause was not found to strip — the reversal no longer "+
@@ -63,7 +63,7 @@ func preFixCaptureDDLFunction(t *testing.T, schema, changeLogTableRef string) st
 // siblings rested on for their whole shipped life.
 func pinnedButUnqualifiedDDLFunction(t *testing.T, schema, changeLogTableRef string) string {
 	t.Helper()
-	fn := renderCaptureDDLFunction(schema, changeLogTableRef)
+	fn := renderCaptureDDLFunction(schema, changeLogTableRef, quoteIdent(schema)+"."+quoteIdent(ChangeLogMetaTable))
 	out := strings.ReplaceAll(fn, "pg_catalog.", "")
 	// The SET clause itself spells `pg_catalog,` (comma, not dot), so it
 	// survives the strip; assert that rather than trusting it.
@@ -238,7 +238,7 @@ $shadow$;`
 	})
 
 	t.Run("SHIPPED shape: the shadow does NOT fire, and capture still works", func(t *testing.T) {
-		installFn(t, renderCaptureDDLFunction("public", changeLogRef))
+		installFn(t, renderCaptureDDLFunction("public", changeLogRef, `"public"."`+ChangeLogMetaTable+`"`))
 		resetObservations(t)
 
 		fireDDL(t, "post_fix_tbl", "lowpriv")

@@ -36,7 +36,7 @@ func TestEverySecurityDefinerFunctionPinsSearchPath(t *testing.T) {
 	t.Parallel()
 	const ref = `"public"."sluice_change_log"`
 	emitted := map[string]string{
-		"capture DDL":      renderCaptureDDLFunction("public", ref),
+		"capture DDL":      renderCaptureDDLFunction("public", ref, `"public"."sluice_change_log_meta"`),
 		"capture truncate": renderCaptureTruncateFunction("public", ref),
 	}
 	for _, mode := range []CapturePayload{CapturePayloadFull, CapturePayloadChanged, CapturePayloadMinimal} {
@@ -63,7 +63,7 @@ func TestEverySecurityDefinerFunctionPinsSearchPath(t *testing.T) {
 // user-defined function) and is deliberately left bare.
 func TestCaptureDDLFunction_QualifiesEveryCall(t *testing.T) {
 	t.Parallel()
-	ddl := renderCaptureDDLFunction("public", `"public"."sluice_change_log"`)
+	ddl := renderCaptureDDLFunction("public", `"public"."sluice_change_log"`, `"public"."sluice_change_log_meta"`)
 	for _, fn := range []string{
 		"pg_event_trigger_ddl_commands",
 		"pg_current_xact_id",

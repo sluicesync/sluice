@@ -141,22 +141,31 @@ func TestSetup_ReRunOverStreamedInstall_WritesNoSelfDDL(t *testing.T) {
 		// body without the suppression check, derived by stripping exactly
 		// the block the fix added — with the strip VERIFIED (a strip whose
 		// marker stopped matching would silently test the fixed body).
-		newFn := renderCaptureDDLFunction("public", `"public"."`+ChangeLogTable+`"`)
-		oldFn := strings.Replace(newFn, captureDDLSuppressionCheck, "", 1)
+		metaRef := `"public"."` + ChangeLogMetaTable + `"`
+		newFn := renderCaptureDDLFunction("public", `"public"."`+ChangeLogTable+`"`, metaRef)
+		oldFn := strings.Replace(newFn, captureDDLSuppressionCheck(metaRef), "", 1)
 		if oldFn == newFn || strings.Contains(oldFn, setupSessionGUC) {
 			t.Fatalf("failed to reconstruct the pre-fix function body (suppression block not stripped)")
 		}
-		// The v0.132.2 meta shape: no posture column, schema_version 2 —
-		// which also makes the coming re-setup's ADD COLUMN IF NOT EXISTS
-		// a REAL column addition, the loudest recordable shape. Staged on
-		// ONE suppressed session (the still-installed FIXED function
-		// honors the GUC) so the staging itself writes no X rows — a
-		// DELETE cleanup here would punch a hole in the change-log id run
-		// and trip the gap-freedom guard on the next resume. The old
-		// function body lands LAST, once the recordable staging is done.
+		// The v0.132.2 meta shape: no posture column, no v4 evidence
+		// columns, schema_version 2 — which also makes the coming
+		// re-setup's ADD COLUMN IF NOT EXISTS statements REAL column
+		// additions, the loudest recordable shape. Staged on ONE session
+		// through the BOOTSTRAP arm: the plain UPDATE that NULLs
+		// setup_nonce is not DDL (records nothing) and re-opens exactly
+		// the pre-v4 window, so the marker plus session_user=current_user
+		// suppresses the staging DDL. A DELETE cleanup here would instead
+		// punch a hole in the change-log id run and trip the gap-freedom
+		// guard on the next resume. The old function body lands LAST, once
+		// the recordable staging is done.
 		applyPGSQL(t, dsn, `
-			SET `+setupSessionGUC+` = 'on';
+			UPDATE sluice_change_log_meta SET `+metaSetupNonceCol+` = NULL;
+			SET `+setupSessionGUC+` = '`+setupBootstrapMarker+`';
 			ALTER TABLE sluice_change_log_meta DROP COLUMN capture_replicated_writes;
+			ALTER TABLE sluice_change_log_meta
+			    DROP COLUMN `+metaSetupPIDCol+`,
+			    DROP COLUMN `+metaSetupNonceCol+`,
+			    DROP COLUMN `+metaSetupAtCol+`;
 			UPDATE sluice_change_log_meta SET schema_version = 2;
 		`)
 		applyPGSQL(t, dsn, oldFn) // CREATE FUNCTION's tag is unwatched — records nothing

@@ -40,14 +40,18 @@ const (
 	// table. v1 was the original change-log + meta pair; v2 (roadmap item
 	// 115) adds [ChangeLogConsumersTable], the source-side registry the
 	// auto-prune cuts against; v3 (ADR-0185) adds the meta table's
-	// capture_replicated_writes posture column. Setup is idempotent, so
-	// re-running it against an older install IS the migration: the CREATE
-	// TABLE IF NOT EXISTS adds the registry, the ADD COLUMN IF NOT EXISTS
-	// adds the posture column, and the meta upsert lifts the version. No
-	// reader gates on v3 — the posture read tolerates the column's absence
-	// (readCaptureReplicatedWritesPosture) — so the lift is bookkeeping
-	// that makes an install's vintage readable, not a door.
-	ChangeLogSchemaVer = 3
+	// capture_replicated_writes posture column; v4 (audit 2026-08-31 SEC-2)
+	// adds the three setup-evidence columns the DDL suppression is bound to
+	// ([metaSetupPIDCol] / [metaSetupNonceCol] / [metaSetupAtCol]). Setup is
+	// idempotent, so re-running it against an older install IS the
+	// migration: the CREATE TABLE IF NOT EXISTS adds the registry, the ADD
+	// COLUMN IF NOT EXISTS statements add the posture and evidence columns,
+	// and the meta upsert lifts the version. No reader gates on v3 or v4 —
+	// the posture read tolerates the column's absence
+	// (readCaptureReplicatedWritesPosture) and the capture function's
+	// evidence read tolerates it too (the bootstrap arm) — so the lift is
+	// bookkeeping that makes an install's vintage readable, not a door.
+	ChangeLogSchemaVer = 4
 
 	// metaCaptureReplicatedCol is the meta-table column recording whether
 	// this install's capture triggers are meant to be ENABLE ALWAYS
@@ -60,21 +64,83 @@ const (
 	// false (origin-only), which is exactly what a pre-v3 install is.
 	metaCaptureReplicatedCol = "capture_replicated_writes"
 
-	// setupSessionGUC is the session-scoped marker Setup's own session sets
-	// (`SET sluice.setup_in_progress = 'on'` — the plan's first statement)
+	// setupSessionGUC is the transaction-scoped marker Setup's own plan sets
 	// and the DDL capture function returns early on (Bug 257). Without it,
 	// every `trigger setup` RE-RUN over an existing event-trigger install
 	// records sluice's OWN idempotent DDL — the ADR-0185 meta ADD COLUMN
-	// migration fires ddl_command_end even as an IF-NOT-EXISTS no-op, and
-	// the opt-in's ENABLE ALWAYS ALTERs carry the ALTER TABLE tag — as
-	// op='X' rows, so the next warm resume refuses "observed source-side
-	// DDL" and steers a full re-copy for statements no operator ran.
-	// Session-scoped (not a relation exemption) so it suppresses exactly
-	// sluice's own setup session for exactly as long as it runs: any
-	// current or future setup-emitted DDL is covered, while operator DDL —
-	// including DDL against sluice's own tables from any other session —
-	// keeps recording.
+	// migration fires ddl_command_end even as an IF-NOT-EXISTS no-op
+	// (ground-truthed on PG 16.14: a no-op ADD COLUMN IF NOT EXISTS yields
+	// one pg_event_trigger_ddl_commands() row; a no-op CREATE TABLE IF NOT
+	// EXISTS and a no-op DROP INDEX IF EXISTS yield none), and the opt-in's
+	// ENABLE ALWAYS ALTERs carry the ALTER TABLE tag — as op='X' rows, so
+	// the next warm resume refuses "observed source-side DDL" and steers a
+	// full re-copy for statements no operator ran.
+	//
+	// # The GUC is a PRIVILEGE BOUNDARY, not an annoyance filter (SEC-2)
+	//
+	// PostgreSQL puts no privilege on `SET`ting a dotted placeholder GUC, so
+	// v0.133.1's `current_setting(...) = 'on'` check handed every writer on
+	// the source an off-switch for the ONLY DDL-detection tier this engine
+	// has (the polled-fingerprint fallback was never implemented — see
+	// preflight_ddl_detection.go). Observed on PG 16.14: an unprivileged
+	// role SET the GUC, ran ADD COLUMN / DROP COLUMN / CREATE INDEX, and
+	// recorded ZERO op='X' rows while identical control ALTERs before and
+	// after recorded normally. The suppression is therefore bound to
+	// evidence an ordinary writer cannot produce — see
+	// [captureDDLSuppressionCheck] for the two arms and their reasoning.
+	//
+	// Transaction-scoped rather than session-scoped (audit C-1): the plan
+	// opens with BEGIN, sets the marker with SET LOCAL, and closes with
+	// COMMIT, so PostgreSQL reverts the marker at BOTH commit and rollback.
+	// The off-state is structural instead of a trailing `RESET` statement
+	// that a mid-plan error, a cancel, or an operator abandoning a
+	// hand-pasted plan never reaches.
 	setupSessionGUC = "sluice.setup_in_progress"
+
+	// setupBootstrapMarker is the [setupSessionGUC] value the plan's SET
+	// LOCAL installs before it can arm the real evidence, and the only
+	// value the bootstrap arm of [captureDDLSuppressionCheck] accepts. It
+	// is deliberately the SAME literal v0.133.1–v0.134.x used, because on
+	// the first re-setup over such an install the OLD function body — which
+	// grades this literal and nothing else — is what covers the plan's meta
+	// migration until the new body is armed.
+	setupBootstrapMarker = "on"
+
+	// metaSetupPIDCol / metaSetupNonceCol / metaSetupAtCol are the v4
+	// setup-evidence columns (SEC-2). Setup ARMS them inside its own
+	// transaction (`pg_backend_pid()` of the executing session + a fresh
+	// gen_random_uuid() + clock_timestamp()) and DISARMS them before COMMIT;
+	// the capture function suppresses only for a firing backend whose PID,
+	// marker value and freshness all match the armed row. An ordinary
+	// writer cannot forge any of the three: setup renders no GRANTs, so the
+	// meta table is owner-only (observed: `permission denied for table` on
+	// both SELECT and UPDATE as an unprivileged role), and no role can
+	// choose its own backend PID.
+	//
+	// Deliberately NOT in [internalTableColumnFloor], for the same reason
+	// [metaCaptureReplicatedCol] is not: pre-v4 installs lack them, the ADD
+	// COLUMN IF NOT EXISTS in renderSetupDDL is the migration, and the
+	// capture function's evidence read tolerates their absence.
+	metaSetupPIDCol   = "setup_backend_pid"
+	metaSetupNonceCol = "setup_nonce"
+	metaSetupAtCol    = "setup_at"
+
+	// setupEvidenceFreshness bounds how long an ARMED evidence row can
+	// authorize suppression. The arm/disarm pair lives inside the plan's own
+	// transaction, so a completed plan leaves the row disarmed and an
+	// aborted one rolls the arm back — which is what actually bounds PID
+	// reuse. This window is the belt for the one residue an operator can
+	// still produce by hand: pasting the plan into psql and typing their own
+	// COMMIT after the arm but before the disarm. An hour is far longer than
+	// any real setup and far shorter than "until the next reboot".
+	setupEvidenceFreshness = "1 hour"
+
+	// setupDisarmedNonce is what the disarm writes into [metaSetupNonceCol].
+	// It must be non-NULL and match no marker: NULL is reserved as the
+	// "these columns exist but were never armed" signal that opens the
+	// bootstrap arm, and that signal has to be unreachable once any v4-aware
+	// setup has completed.
+	setupDisarmedNonce = ""
 )
 
 // CapturePayload selects how much of each changed row the capture
@@ -387,13 +453,15 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return plan, nil
 	}
 
-	// Every statement rides ONE session: the plan's first statement sets
-	// [setupSessionGUC] (session-scoped, Bug 257), and a pooled
-	// db.ExecContext may hop connections between statements — which would
-	// silently drop the suppression and re-open exactly the self-recorded
-	// op='X' poisoning the GUC exists to prevent. An operator applying a
-	// dry-run plan by hand through psql gets the same property for free
-	// (one psql session).
+	// Every statement rides ONE session: the plan is a single transaction
+	// whose BEGIN/COMMIT are statements 0 and N, it sets [setupSessionGUC]
+	// with SET LOCAL, and it arms the suppression evidence against this
+	// backend's PID — all three of which a pooled db.ExecContext could
+	// silently break by hopping connections between statements, re-opening
+	// exactly the self-recorded op='X' poisoning the marker exists to
+	// prevent (Bug 257). Running the plan VERBATIM is deliberate: what
+	// `--dry-run` prints is exactly what an apply executes, so an operator
+	// applying it by hand through psql gets the same property.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return plan, fmt.Errorf("pgtrigger: setup: acquire session: %w", err)
@@ -401,6 +469,14 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	defer func() { _ = conn.Close() }()
 	for _, stmt := range plan.Statements {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			// Roll back explicitly rather than relying on the pooled
+			// connection being discarded (audit C-1 / reconciler item 2):
+			// pgx-stdlib's ResetSession is a liveness check only, so a
+			// pinned connection returned mid-transaction would carry both
+			// the aborted transaction and the SET LOCAL marker into its
+			// next acquisition. WithoutCancel so a cancelled ctx still
+			// gets the rollback out.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 			return plan, fmt.Errorf("pgtrigger: setup: exec %q: %w", firstLine(stmt), err)
 		}
 	}
@@ -676,20 +752,47 @@ func pkColsJSON(cols []string) string {
 // WITHOUT the flag converges an opt-in install back to plain: the
 // DROP + CREATE yields fresh 'O' triggers and the upsert records false.
 //
-// The plan is bracketed by SET/RESET of [setupSessionGUC] (Bug 257) so a
-// re-run's own DDL is never recorded as op='X' by the install's already-
-// present event trigger; the whole plan must therefore execute on ONE
-// session (Setup pins a connection, and an operator applying a dry-run
-// plan by hand gets it from psql's single session). On an install whose
-// capture-DDL function predates the suppression check, the GUC alone is
-// not enough — the OLD function body ignores it — so the CREATE OR
-// REPLACE of that function is the plan's FIRST DDL statement, ahead of
-// every statement the event trigger's TAG filter watches.
+// # The plan is ONE transaction (Bug 257 + audit SEC-2 / C-1)
+//
+// It opens with BEGIN, sets [setupSessionGUC] with SET LOCAL, arms the
+// suppression evidence in the meta table, and closes by disarming that
+// evidence and COMMITting — so a re-run's own DDL is never recorded as
+// op='X' by the install's already-present event trigger, and PostgreSQL
+// reverts BOTH the marker and (on abort) the armed evidence at the end of
+// the transaction. Before v0.135 the off-state rode a trailing `RESET`
+// statement, which a mid-plan error, a cancel, or an operator abandoning a
+// hand-pasted plan simply never reached — leaving the suppression on for
+// the rest of that psql session and silently swallowing their OPERATOR DDL
+// (audit C-1, observed). Every statement here is transaction-safe: PG DDL
+// is transactional, `CREATE EVENT TRIGGER` included (verified), and the
+// plan emits no CONCURRENTLY.
+//
+// Ordering is load-bearing in three places:
+//
+//   - The capture-DDL function's CREATE OR REPLACE is the plan's FIRST
+//     statement, ahead of every statement the event trigger's TAG filter
+//     watches (Bug 257): on the first re-setup over an install whose body
+//     predates the suppression check, the old body ignores the marker and
+//     must be replaced before the meta ALTER it would record. CREATE
+//     FUNCTION is not a watched tag, so this statement records nothing at
+//     any install vintage.
+//   - The evidence ARM runs twice. The early arm covers a v4 install's
+//     re-run, whose meta ADD COLUMN IF NOT EXISTS no-ops still fire
+//     ddl_command_end; it is a no-op itself on a pre-v4 install (the
+//     columns do not exist yet), where the bootstrap arm carries the
+//     window instead. The second arm, after the meta migration, is strict
+//     on every install vintage — everything from there on is covered by
+//     the unforgeable evidence rather than by the bootstrap literal.
+//   - The consumer registry is still created before the meta upsert lifts
+//     schema_version, so the version can never claim a registry that isn't
+//     there. (The transaction now makes that atomic as well, but the
+//     ordering is kept: a hand-applied plan can be stopped anywhere.)
 func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
-	out := []string{"SET " + setupSessionGUC + " = 'on'"}
+	metaRef := tableRef(ChangeLogMetaTable)
+	out := []string{"BEGIN"}
 	if canEventTrigger {
 		// Re-created FIRST, before any TAG-watched statement (Bug 257): a
 		// re-setup over an install whose function body predates the
@@ -698,10 +801,58 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// Safe on a fresh install too — plpgsql bodies are only
 		// syntax-checked at CREATE time, so the reference to the
 		// not-yet-created change-log table resolves at first execution.
-		out = append(out, renderCaptureDDLFunction(schema, tableRef(ChangeLogTable)))
+		out = append(out, renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef))
 	}
 	out = append(
 		out,
+		"SET LOCAL "+setupSessionGUC+" = "+quoteSQLString(setupBootstrapMarker),
+		renderArmSetupEvidence(metaRef),
+
+		"CREATE TABLE IF NOT EXISTS "+metaRef+` (
+    singleton_pk   BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    schema_version INT NOT NULL,
+    installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT sluice_change_log_meta_singleton CHECK (singleton_pk = TRUE)
+)`,
+		// The v3 capture-posture column (ADR-0185), added by ALTER rather
+		// than in the CREATE body above so ONE statement migrates every
+		// install — a fresh create and a pre-v3 re-run alike — and the
+		// column-floor gate's CREATE-derived roster (setup_adoption_test)
+		// keeps grading pre-v3 installs against the columns they actually
+		// have. Readers default an absent column to false, so an install
+		// that never re-runs setup keeps its origin-only posture.
+		"ALTER TABLE "+metaRef+" ADD COLUMN IF NOT EXISTS "+metaCaptureReplicatedCol+" BOOLEAN NOT NULL DEFAULT FALSE",
+		// The v4 setup-evidence columns (SEC-2), by the same argument. One
+		// statement so a pre-v4 install fires ddl_command_end once, inside
+		// the bootstrap arm's window, rather than three times.
+		fmt.Sprintf(
+			"ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s INT, ADD COLUMN IF NOT EXISTS %s TEXT, ADD COLUMN IF NOT EXISTS %s TIMESTAMPTZ",
+			metaRef, metaSetupPIDCol, metaSetupNonceCol, metaSetupAtCol,
+		),
+		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
+		// trigger-CDC stream reading this database records its own
+		// durably-applied frontier here and the auto-prune cuts at the MIN
+		// across all of them, so a slower peer's unread rows are never
+		// reaped. Created before the meta upsert below lifts
+		// schema_version to 2, so the version can never claim a registry
+		// that isn't there.
+		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogConsumersTable)+` (
+    consumer_id  TEXT PRIMARY KEY,
+    applied_id   BIGINT NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+)`,
+
+		fmt.Sprintf(
+			"INSERT INTO %s (singleton_pk, schema_version, %s) VALUES (TRUE, %d, %t) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version, %s = EXCLUDED.%s",
+			metaRef, metaCaptureReplicatedCol, ChangeLogSchemaVer, captureReplicated,
+			metaCaptureReplicatedCol, metaCaptureReplicatedCol,
+		),
+
+		// The meta table, its evidence columns and its singleton row all
+		// exist now, so this arm is STRICT on every install vintage — the
+		// bootstrap literal stops carrying the plan here.
+		renderArmSetupEvidence(metaRef),
+
 		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogTable)+` (
     id            BIGSERIAL PRIMARY KEY,
     txid          BIGINT NOT NULL,
@@ -727,39 +878,6 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// they are no-ops.
 		"DROP INDEX IF EXISTS "+tableRef("sluice_change_log_id_idx"),
 		"DROP INDEX IF EXISTS "+tableRef("sluice_change_log_table_idx"),
-
-		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogMetaTable)+` (
-    singleton_pk   BOOLEAN PRIMARY KEY DEFAULT TRUE,
-    schema_version INT NOT NULL,
-    installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT sluice_change_log_meta_singleton CHECK (singleton_pk = TRUE)
-)`,
-		// The v3 capture-posture column (ADR-0185), added by ALTER rather
-		// than in the CREATE body above so ONE statement migrates every
-		// install — a fresh create and a pre-v3 re-run alike — and the
-		// column-floor gate's CREATE-derived roster (setup_adoption_test)
-		// keeps grading pre-v3 installs against the columns they actually
-		// have. Readers default an absent column to false, so an install
-		// that never re-runs setup keeps its origin-only posture.
-		"ALTER TABLE "+tableRef(ChangeLogMetaTable)+" ADD COLUMN IF NOT EXISTS "+metaCaptureReplicatedCol+" BOOLEAN NOT NULL DEFAULT FALSE",
-		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
-		// trigger-CDC stream reading this database records its own
-		// durably-applied frontier here and the auto-prune cuts at the MIN
-		// across all of them, so a slower peer's unread rows are never
-		// reaped. Created before the meta upsert below lifts
-		// schema_version to 2, so the version can never claim a registry
-		// that isn't there.
-		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogConsumersTable)+` (
-    consumer_id  TEXT PRIMARY KEY,
-    applied_id   BIGINT NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-)`,
-
-		fmt.Sprintf(
-			"INSERT INTO %s (singleton_pk, schema_version, %s) VALUES (TRUE, %d, %t) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version, %s = EXCLUDED.%s",
-			tableRef(ChangeLogMetaTable), metaCaptureReplicatedCol, ChangeLogSchemaVer, captureReplicated,
-			metaCaptureReplicatedCol, metaCaptureReplicatedCol,
-		),
 
 		// Row-event capture function. TG_ARGV[0] carries the table's
 		// PK column list, baked in per-trigger below (N-16);
@@ -827,8 +945,70 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		)
 	}
 
-	out = append(out, "RESET "+setupSessionGUC)
+	out = append(out, renderDisarmSetupEvidence(metaRef), "COMMIT")
 	return out
+}
+
+// renderArmSetupEvidence renders the statement that ARMS the DDL-suppression
+// evidence for the executing session and adopts the resulting nonce as the
+// [setupSessionGUC] value (SEC-2).
+//
+// Everything it records is evaluated IN THE EXECUTING SESSION —
+// `pg_backend_pid()`, `gen_random_uuid()` (core since PG 13, the engine's
+// floor), `clock_timestamp()` — never baked in at render time. That is what
+// keeps a hand-applied `--dry-run` plan working: the operator's own psql
+// backend arms its own PID, and the privilege boundary is the UPDATE on the
+// meta table (which setup grants to nobody), not knowledge of a secret in
+// the plan text.
+//
+// `set_config(..., is_local => true)` is the function spelling of SET LOCAL:
+// verified on PG 16.14 that a set_config issued inside a DO block persists to
+// the end of the transaction and is reverted at COMMIT, which is exactly the
+// scoping audit C-1 asks for.
+//
+// The exception handler is what makes the statement safe to emit BEFORE the
+// meta migration: on a fresh install the table does not exist yet, and on a
+// pre-v4 install the columns do not — in both cases the plan's own migration
+// follows and the second arm is the strict one. Failing to arm leaves the
+// bootstrap marker in place, which is the conservative direction (it demands
+// session_user evidence instead of nonce evidence; it never widens anything).
+func renderArmSetupEvidence(metaTableRef string) string {
+	return `DO $sluice$
+DECLARE
+    v_nonce TEXT;
+BEGIN
+    -- Arm the DDL-suppression evidence for THIS backend (audit SEC-2). The
+    -- meta table is owner-only, so no ordinary writer can produce this row.
+    UPDATE ` + metaTableRef + `
+       SET ` + metaSetupPIDCol + `   = pg_catalog.pg_backend_pid(),
+           ` + metaSetupNonceCol + ` = pg_catalog.gen_random_uuid()::text,
+           ` + metaSetupAtCol + `    = pg_catalog.clock_timestamp()
+     WHERE singleton_pk
+ RETURNING ` + metaSetupNonceCol + ` INTO v_nonce;
+    IF v_nonce IS NOT NULL THEN
+        PERFORM pg_catalog.set_config('` + setupSessionGUC + `', v_nonce, true);
+    END IF;
+EXCEPTION
+    WHEN undefined_table OR undefined_column THEN
+        -- Fresh install, or a pre-v4 install this plan is about to migrate.
+        -- The bootstrap marker set above covers the window; the plan arms
+        -- again once the columns and the singleton row exist.
+        NULL;
+END
+$sluice$`
+}
+
+// renderDisarmSetupEvidence renders the plan's last statement before COMMIT:
+// it clears the armed evidence so nothing outside this transaction can ever
+// present it. [setupDisarmedNonce] (not NULL) is written deliberately — NULL
+// is the "never armed" signal that opens the bootstrap arm, and that arm must
+// be unreachable once a v4-aware setup has completed. A plan that ABORTS
+// instead needs no disarm: the rollback takes the arm with it.
+func renderDisarmSetupEvidence(metaTableRef string) string {
+	return fmt.Sprintf(
+		"UPDATE %s SET %s = NULL, %s = %s, %s = NULL WHERE singleton_pk",
+		metaTableRef, metaSetupPIDCol, metaSetupNonceCol, quoteSQLString(setupDisarmedNonce), metaSetupAtCol,
+	)
 }
 
 // rowFunctionRef / truncateFunctionRef / ddlFunctionRef are
@@ -1101,21 +1281,92 @@ $sluice$;`
 }
 
 // captureDDLSuppressionCheck is the Bug 257 early-return the DDL capture
-// function opens with: when the firing session is sluice's own `trigger
-// setup` (marked by [setupSessionGUC]), record nothing. current_setting's
-// missing_ok form yields NULL for a never-set GUC, and `NULL = 'on'` is
-// not true, so every other session — operator DDL included — records
-// exactly as before. A named const (rather than inline body text) so the
-// integration pin can reconstruct the PRE-fix function body by stripping
-// exactly this block, exercising the old-install re-setup ordering.
-const captureDDLSuppressionCheck = `    -- Bug 257: sluice's own setup session emits idempotent DDL (the meta
-    -- ADD COLUMN migration, the opt-in's trigger-enablement ALTERs) on
-    -- every re-run; recording it as op='X' would make the next warm
-    -- resume refuse sluice's own statements as operator DDL.
-    IF pg_catalog.current_setting('` + setupSessionGUC + `', true) = 'on' THEN
-        RETURN;
+// function opens with: when the firing backend is sluice's own `trigger
+// setup` transaction, record nothing. A function (rather than inline body
+// text) so the integration pin can reconstruct the PRE-fix function body by
+// stripping exactly this block, exercising the old-install re-setup
+// ordering; metaTableRef is pre-quoted and schema-qualified by the caller,
+// because the function's pinned `search_path = pg_catalog, pg_temp` (SEC-1)
+// reaches no user schema.
+//
+// # Two arms, and why the marker alone is not one of them
+//
+// v0.133.1 graded `current_setting(guc, true) = 'on'` and nothing else.
+// PostgreSQL lets ANY session SET a dotted placeholder GUC, so that was an
+// off-switch for the only DDL-detection tier this engine has (SEC-2,
+// observed on PG 16.14). Both arms below therefore require evidence the
+// firing session cannot manufacture:
+//
+//   - STRICT arm — the meta row is ARMED for exactly this backend: the
+//     marker equals a random nonce Setup wrote, `pg_backend_pid()` equals
+//     the PID Setup recorded, and the arm is fresher than
+//     [setupEvidenceFreshness]. Writing that row needs UPDATE on a table
+//     setup grants to nobody, and no role can choose its own backend PID.
+//     This is the steady-state arm; every statement of a v4-install re-run
+//     takes it.
+//
+//   - BOOTSTRAP arm — the evidence columns are absent (a pre-v4 install)
+//     or present-but-never-armed (the instant between this plan's own ADD
+//     COLUMN and its arm), the marker is [setupBootstrapMarker], AND the
+//     firing session is authenticated as the install's own role. Inside a
+//     SECURITY DEFINER body `current_user` is the owner while
+//     `session_user` stays the caller's authenticated role (ground-truthed
+//     on PG 16.14: `session_user=app current_user=postgres`), and changing
+//     `session_user` needs SET SESSION AUTHORIZATION, i.e. superuser — so
+//     an ordinary writer fails this arm too. Its window is the plan's own
+//     transaction: the disarm writes [setupDisarmedNonce] rather than NULL
+//     precisely so this arm cannot be re-entered afterwards.
+//
+// `session_user` / `current_user` are SQL keywords, not schema-resolved
+// functions, so they are not shadowable (same reasoning as the COALESCE
+// note in [renderCaptureDDLFunction]).
+//
+// # Fail-safe direction: an unreadable evidence read RECORDS
+//
+// Suppression is the privilege, so failing closed means capturing.
+// `SELECT ... INTO` over zero rows leaves the flag NULL (not false) and
+// `IF v_suppress IS TRUE` rejects NULL; an unexpected error on the read
+// sets it FALSE explicitly. The only exception routed to the bootstrap arm
+// is undefined_table / undefined_column, which is the pre-v4 shape and
+// still demands the session_user evidence.
+func captureDDLSuppressionCheck(metaTableRef string) string {
+	return `    -- Bug 257: sluice's own setup transaction emits idempotent DDL (the
+    -- meta ADD COLUMN migrations, the opt-in's trigger-enablement ALTERs)
+    -- on every re-run; recording it as op='X' would make the next warm
+    -- resume refuse sluice's own statements as operator DDL. Audit SEC-2:
+    -- the marker alone is settable by ANY session, so suppression is bound
+    -- to evidence an ordinary writer cannot produce.
+    v_marker := pg_catalog.current_setting('` + setupSessionGUC + `', true);
+    IF v_marker IS NOT NULL THEN
+        BEGIN
+            -- STRICT arm: this backend holds the armed evidence.
+            SELECT TRUE INTO v_suppress
+              FROM ` + metaTableRef + ` m
+             WHERE m.singleton_pk
+               AND m.` + metaSetupPIDCol + ` = pg_catalog.pg_backend_pid()
+               AND m.` + metaSetupNonceCol + ` = v_marker
+               AND m.` + metaSetupAtCol + ` > pg_catalog.clock_timestamp() - '` + setupEvidenceFreshness + `'::interval;
+            IF v_suppress IS NOT TRUE THEN
+                -- BOOTSTRAP arm: the columns exist but were never armed —
+                -- reachable only inside the plan that adds them.
+                SELECT (v_marker = '` + setupBootstrapMarker + `' AND session_user = current_user) INTO v_suppress
+                  FROM ` + metaTableRef + ` m
+                 WHERE m.singleton_pk AND m.` + metaSetupNonceCol + ` IS NULL;
+            END IF;
+        EXCEPTION
+            WHEN undefined_table OR undefined_column THEN
+                -- Pre-v4 install: the evidence columns arrive later in this
+                -- same plan. Same bootstrap evidence, no row to read.
+                v_suppress := (v_marker = '` + setupBootstrapMarker + `' AND session_user = current_user);
+            WHEN OTHERS THEN
+                v_suppress := FALSE;  -- fail-safe: an unreadable evidence read RECORDS
+        END;
+        IF v_suppress IS TRUE THEN
+            RETURN;
+        END IF;
     END IF;
 `
+}
 
 // renderCaptureDDLFunction returns the CREATE OR REPLACE FUNCTION
 // statement for the DDL event-trigger handler. ADR-0066 §7. The
@@ -1167,7 +1418,11 @@ const captureDDLSuppressionCheck = `    -- Bug 257: sluice's own setup session e
 // `sluice trigger setup` re-run replaces it (CREATE OR REPLACE resets
 // proconfig). [warnInsecureCaptureFunctions] detects that shape at
 // every CDC open and WARNs with the remedy.
-func renderCaptureDDLFunction(schema, changeLogTableRef string) string {
+//
+// metaTableRef is the pre-quoted, schema-qualified meta table the
+// suppression check reads its evidence from (SEC-2) — see
+// [captureDDLSuppressionCheck].
+func renderCaptureDDLFunction(schema, changeLogTableRef, metaTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + ddlFnRef(schema) + `()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -1175,9 +1430,11 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $sluice$
 DECLARE
-    r RECORD;
+    r          RECORD;
+    v_marker   TEXT;
+    v_suppress BOOLEAN;
 BEGIN
-` + captureDDLSuppressionCheck + `    FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
+` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;
         END IF;

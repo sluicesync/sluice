@@ -297,7 +297,7 @@ func TestRenderTeardownDDL_KeepData(t *testing.T) {
 // blocks ALL DDL on the source with no operator-visible recovery
 // path).
 func TestRenderCaptureDDLFunction_OrphanedTriggerRecoveryMessage(t *testing.T) {
-	ddl := renderCaptureDDLFunction("public", `"public"."sluice_change_log"`)
+	ddl := renderCaptureDDLFunction("public", `"public"."sluice_change_log"`, `"public"."sluice_change_log_meta"`)
 
 	// The EXCEPTION handler must be present in the function body.
 	for _, want := range []string{
