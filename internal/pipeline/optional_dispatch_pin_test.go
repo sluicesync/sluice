@@ -50,6 +50,7 @@ import (
 	"strings"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/engines/postgres"
 )
 
@@ -68,6 +69,16 @@ var (
 	_ rlsPreflightProber          = (*postgres.SchemaReader)(nil)
 	_ xidWraparoundProber         = (*postgres.SchemaReader)(nil)
 	_ replicationCapabilityProber = (*postgres.SchemaReader)(nil)
+
+	// The session-GUC cast refusal's arming surface (audit 2026-08-31
+	// SL-2). Pinned rather than frozen because it guards a REFUSAL, same as
+	// the probers above: if the assertion quietly stops matching, a MySQL
+	// TIMESTAMP⇄DATETIME MODIFY forwards and every pre-existing target row
+	// of that column silently diverges. Only the exported binlog reader is
+	// reachable from here; the two VStream lanes are pinned in-package
+	// (mysql.schemaDeltaTargetApplySetter) because their types are
+	// unexported.
+	_ schemaDeltaTargetApplySetter = (*mysql.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

@@ -77,6 +77,12 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if setter, ok := cdc.(schemaForwardModeSetter); ok {
 		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
 	}
+	// SL-2 (audit 2026-08-31), warm-resume mirror: arm the reader's
+	// session-GUC cast refusal whenever ANY path re-applies an observed
+	// delta to the target (the intercept OR Shape A's boundary router).
+	if setter, ok := cdc.(schemaDeltaTargetApplySetter); ok {
+		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
+	}
 	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
 	// tables (row-move eval needs every OLD column); refuses if unsupported.
 	if err := s.applyFullBeforeImageTables(cdc); err != nil {

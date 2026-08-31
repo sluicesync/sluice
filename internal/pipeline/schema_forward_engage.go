@@ -51,6 +51,26 @@ func (s *Streamer) singleStreamSchemaForwardActive() bool {
 		!s.multiDatabaseMode()
 }
 
+// schemaDeltaAppliesToTarget reports whether ANY path re-applies an
+// observed schema delta to the target — the UNION of the two, which is the
+// condition a reader-side value-semantics refusal must key on
+// ([schemaDeltaTargetApplySetter], SL-2):
+//
+//   - the ADR-0091 single-stream intercept ([singleStreamSchemaForwardActive]),
+//   - ADR-0054's Shape A boundary router, which routes every recognized
+//     shape (ALTER COLUMN TYPE included) through applyShapeDelta
+//     regardless of --schema-changes, and engages on
+//     --inject-shard-column unless --no-coordinate-live-ddl opts out.
+//
+// Deliberately derived from CONFIG, not from `s.boundaryRouter != nil`:
+// the setter runs on the cold-start / warm-resume path and reading a field
+// another phase populates would make the arming order-dependent, which is
+// how a refusal quietly stops arming.
+func (s *Streamer) schemaDeltaAppliesToTarget() bool {
+	shapeAActive := s.InjectShardColumn.Engaged() && !s.NoCoordinateLiveDDL
+	return s.singleStreamSchemaForwardActive() || shapeAActive
+}
+
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
 // intercept uses for ALTER TABLE … ADD COLUMN, and (when backfill is
 // requested) the source RowReader for the bounded backfill SELECT.

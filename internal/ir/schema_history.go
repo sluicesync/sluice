@@ -123,6 +123,27 @@ func (s SchemaSignature) Equal(other SchemaSignature) bool {
 	return true
 }
 
+// ColumnTypes returns the signature's per-column IR types keyed by
+// column name. It exists so a CDC reader can compare a rebuilt table
+// against the LAST SNAPSHOTTED one per column without keeping a second
+// copy of that table alive: [SchemaSignature] is already the reader's
+// per-table memo, and the MySQL lanes' session-`time_zone` cast refusal
+// (mysql.unforwardableSessionTZColumn) needs exactly the prev type of a
+// named column, nothing more.
+//
+// The returned map is a fresh copy; mutating it does not touch the
+// signature. Column names are unique within a table on every engine
+// sluice reads, so the keying is total; a nil/zero signature yields an
+// empty map (the caller's "no prior knowledge" case, which must not be
+// mistaken for "nothing changed").
+func (s SchemaSignature) ColumnTypes() map[string]Type {
+	out := make(map[string]Type, len(s.names))
+	for i, name := range s.names {
+		out[name] = s.types[i]
+	}
+	return out
+}
+
 // RetainedSchemaVersion is one persisted schema-history row as loaded
 // from the engine's sluice_cdc_schema_history control table: the
 // boundary's source position (engine-opaque token) and the IR table

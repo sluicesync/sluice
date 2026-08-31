@@ -807,6 +807,16 @@ type vstreamSnapshotStream struct {
 	// contract.)
 	snapshotSig map[string]ir.SchemaSignature
 
+	// schemaDeltaAppliesToTarget arms the session-`time_zone` cast refusal
+	// on this lane (SL-2; see cdc_session_tz_cast.go). Third of the MySQL
+	// engine's three ir.SchemaSnapshot emitters — the cold-start snapshot
+	// stream's CDC phase — and it feeds the same two forward paths the
+	// other two do. Written by
+	// [vstreamSnapshotChanges.SetSchemaDeltaAppliesToTarget] before the CDC
+	// pump starts; read only on that pump goroutine (same single-writer
+	// contract as snapshotSig above).
+	schemaDeltaAppliesToTarget bool
+
 	// currentVgtid is the latest VGTID observed on the stream. When the
 	// COPY pump reaches the global COPY_COMPLETED, this is the snapshot-
 	// consistent position; during the CDC phase it advances with each
@@ -2582,10 +2592,19 @@ func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *
 	}
 	cacheKey := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 	sig := ir.SchemaSignatureOf(tbl)
-	if prev, ok := s.snapshotSig[cacheKey]; ok && prev.Equal(sig) {
+	prev, hadPrev := s.snapshotSig[cacheKey]
+	if hadPrev && prev.Equal(sig) {
 		// No-op FIELD re-emit (restart / first-touch / reconnect with no
 		// DDL): not a true delta — do NOT write a new version.
 		return nil
+	}
+	// SL-2 (audit 2026-08-31): the session-`time_zone` cast refusal, third
+	// and last of this engine's SchemaSnapshot emitters. Same predicate and
+	// same position in the flow as the standalone reader's.
+	if s.schemaDeltaAppliesToTarget && hadPrev {
+		if col, pair, found := unforwardableSessionTZColumn(prev, tbl); found {
+			return sessionTZCastRefusal(keyspace, table, col, pair)
+		}
 	}
 
 	pos, err := s.positionFor()
@@ -3389,6 +3408,15 @@ func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Posi
 // ([whereCDCFilter.route]). Accepting tables here is enough to satisfy the
 // gate; the set itself needs no storage.
 func (c *vstreamSnapshotChanges) SetFullBeforeImageTables(map[string]bool) {}
+
+// SetSchemaDeltaAppliesToTarget arms the session-`time_zone` cast refusal
+// on the cold-start CDC half (SL-2) — the third of the MySQL engine's
+// three ir.SchemaSnapshot emitters. Same contract as its two siblings:
+// called before StreamChanges starts the CDC pump, read only on that pump.
+// Implements pipeline.schemaDeltaTargetApplySetter.
+func (c *vstreamSnapshotChanges) SetSchemaDeltaAppliesToTarget(enabled bool) {
+	c.snap.schemaDeltaAppliesToTarget = enabled
+}
 
 // Close is provided so the snapshot's CDC half implements the same
 // io.Closer-shaped optional interface the standalone CDC reader does

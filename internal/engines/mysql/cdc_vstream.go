@@ -232,6 +232,15 @@ type vstreamCDCReader struct {
 	// always a true delta.
 	snapshotSig map[string]ir.SchemaSignature
 
+	// schemaDeltaAppliesToTarget arms the session-`time_zone` cast refusal
+	// on this lane (SL-2; see cdc_session_tz_cast.go). The VStream reader
+	// is a Shape A source as well as an ADR-0091 single-stream one, and
+	// both re-apply an observed ALTER COLUMN TYPE to the target, so both
+	// set it. Zero value false = no forward path, no refusal. Set by
+	// [vstreamCDCReader.SetSchemaDeltaAppliesToTarget] before
+	// StreamChanges; read only on the pump goroutine.
+	schemaDeltaAppliesToTarget bool
+
 	// currentVgtid is the latest position the reader has observed.
 	// VStream emits a VGTID after each transaction; we update this
 	// then promote it to the candidate position emitted alongside
@@ -872,6 +881,17 @@ func (r *vstreamCDCReader) setErr(err error) {
 // pipeline's route() refusal on a before-image missing a predicate-referenced
 // column. Accepting the set is enough; it needs no storage.
 func (r *vstreamCDCReader) SetFullBeforeImageTables(map[string]bool) {}
+
+// SetSchemaDeltaAppliesToTarget arms the session-`time_zone` cast refusal
+// on the VStream lane — the sibling of [CDCReader.SetSchemaDeltaAppliesToTarget],
+// wired for the same two reasons: this reader feeds the ADR-0091
+// single-stream intercept AND Shape A's boundary router, and both re-apply
+// an observed ALTER COLUMN TYPE to the target. Must be called before
+// StreamChanges; read on the pump goroutine. Implements
+// pipeline.schemaDeltaTargetApplySetter.
+func (r *vstreamCDCReader) SetSchemaDeltaAppliesToTarget(enabled bool) {
+	r.schemaDeltaAppliesToTarget = enabled
+}
 
 // SetServerSideRowFilters implements [ir.ServerSideCDCFilterSetter]: it records
 // the operator's `--where` predicates so a WARM RESUME pushes them into the
@@ -1652,10 +1672,20 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 
 	cacheKey := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 	sig := ir.SchemaSignatureOf(tbl)
-	if prev, ok := r.snapshotSig[cacheKey]; ok && prev.Equal(sig) {
+	prev, hadPrev := r.snapshotSig[cacheKey]
+	if hadPrev && prev.Equal(sig) {
 		// No-op FIELD re-emit (restart / first-touch / reconnect with
 		// no DDL): not a true delta — do NOT write a new version.
 		return nil
+	}
+	// SL-2 (audit 2026-08-31): the MySQL lane's session-`time_zone` cast
+	// refusal, VStream sibling of the binlog reader's. Same predicate, same
+	// place in the flow — before the boundary is emitted, so neither the
+	// ADR-0091 intercept nor Shape A's boundary router can act on it.
+	if r.schemaDeltaAppliesToTarget && hadPrev {
+		if col, pair, found := unforwardableSessionTZColumn(prev, tbl); found {
+			return sessionTZCastRefusal(keyspace, table, col, pair)
+		}
 	}
 
 	pos, err := r.positionFor()

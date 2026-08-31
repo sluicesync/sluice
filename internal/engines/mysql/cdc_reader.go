@@ -262,6 +262,22 @@ type CDCReader struct {
 	// the pump goroutine.
 	schemaForward bool
 
+	// schemaDeltaAppliesToTarget arms the session-`time_zone` cast refusal
+	// (SL-2; see cdc_session_tz_cast.go). It is DELIBERATELY a second flag
+	// rather than a reuse of schemaForward, because the two answer
+	// different questions and the wider one is the one a value-semantics
+	// refusal must key on: schemaForward means "the single-stream ADR-0091
+	// intercept is live", which is FALSE under Shape A
+	// (--inject-shard-column) — and Shape A's boundary router forwards
+	// ALTER COLUMN TYPE regardless of --schema-changes. Keying the refusal
+	// on schemaForward would therefore have reproduced the exact
+	// narrower-than-its-name defect the SL-2 filing is about. Set by
+	// [CDCReader.SetSchemaDeltaAppliesToTarget] before StreamChanges; read
+	// only on the pump goroutine. Zero value false = "nothing re-applies
+	// these deltas to a target", the safe default for every non-streamer
+	// construction (backup position capture, tests, tooling).
+	schemaDeltaAppliesToTarget bool
+
 	// fullBeforeImageTables is the ADR-0173 Phase 2 opt-out from the
 	// before-image PK-narrowing (Bug 88) for tables a continuous filtered
 	// sync (`--where`) filters: the client-side row-move evaluation needs
@@ -447,6 +463,20 @@ func (r *CDCReader) SetCDCDatabaseList(databases []string) {
 // goroutine. Implements pipeline.schemaForwardModeSetter.
 func (r *CDCReader) SetSchemaForward(enabled bool) {
 	r.schemaForward = enabled
+}
+
+// SetSchemaDeltaAppliesToTarget tells the reader that some path re-applies
+// observed schema deltas to the target — the ADR-0091 single-stream
+// intercept OR ADR-0054's Shape A boundary router — which arms the
+// session-`time_zone` cast refusal (SL-2; see cdc_session_tz_cast.go).
+//
+// It is separate from [CDCReader.SetSchemaForward] on purpose: that one
+// answers "is the single-stream intercept live", which is false under
+// Shape A even though Shape A forwards ALTER COLUMN TYPE unconditionally.
+// Must be called before [StreamChanges]; read on the pump goroutine.
+// Implements pipeline.schemaDeltaTargetApplySetter.
+func (r *CDCReader) SetSchemaDeltaAppliesToTarget(enabled bool) {
+	r.schemaDeltaAppliesToTarget = enabled
 }
 
 // SetFullBeforeImageTables records the tables for which the reader must
@@ -1647,6 +1677,21 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	sig := ir.SchemaSignatureOf(irTbl)
 	sigPrev, hadSig := r.snapshotSig[qn]
 	sigDelta := !hadSig || !sigPrev.Equal(sig)
+
+	// SL-2 (audit 2026-08-31): a TIMESTAMP⇄DATETIME MODIFY re-zones every
+	// stored value against the EXECUTING session's time_zone, so forwarding
+	// it silently diverges the target's pre-existing rows. Refuse loudly
+	// BEFORE the boundary is emitted, so neither forward path sees it and
+	// no schema-history version is written for a schema sluice refuses to
+	// follow — the same posture as the PG reader's checkSchemaRace arm.
+	// Gated on hadSig: with no prior snapshot there is no prev type to have
+	// swapped away from, and that is also exactly the boundary the
+	// intercept treats as a cache prime / seed-guarded no-op.
+	if r.schemaDeltaAppliesToTarget && hadSig && sigDelta {
+		if col, pair, found := unforwardableSessionTZColumn(sigPrev, irTbl); found {
+			return sessionTZCastRefusal(tbl.Schema, tbl.Name, col, pair)
+		}
+	}
 
 	// ADR-0091 F7a GAP #2: a per-column NULLABILITY change does NOT move
 	// ir.SchemaSignatureOf (name + ordered type — the ADR-0049 decode

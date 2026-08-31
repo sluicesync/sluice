@@ -114,13 +114,43 @@ type pollIntervalSetter interface {
 // RENAME TABLE / DROP+CREATE / RENAME COLUMN stay refused at the reader.
 //
 // MySQL's binlog reader re-reads information_schema on a DDL boundary and
-// never gated destructive column shapes, so it does not implement this —
-// the type-assertion silently no-ops. The streamer calls SetSchemaForward
-// once per stream, between [ir.CDCReader] open and
+// never gated destructive column shapes, so it implements this only for
+// the narrower GAP #2 nullability boundary; the VStream readers do not
+// implement it at all and the type-assertion silently no-ops. The streamer
+// calls SetSchemaForward once per stream, between [ir.CDCReader] open and
 // [ir.CDCReader.StreamChanges], so the reader captures the mode before the
 // first RelationMessage is parsed.
 type schemaForwardModeSetter interface {
 	SetSchemaForward(enabled bool)
+}
+
+// schemaDeltaTargetApplySetter is the optional CDC-reader-side surface for
+// a reader that must REFUSE a schema delta whose target-side re-application
+// would silently change stored values — the session-GUC cast class (a
+// MySQL `TIMESTAMP`⇄`DATETIME` MODIFY, a PG `timestamp`⇄`timestamptz`
+// swap: both resolved by the EXECUTING session's zone setting, which no
+// wire carries).
+//
+// It is deliberately NOT [schemaForwardModeSetter], and the difference is
+// load-bearing in both scope and direction. That one RELAXES a reader gate
+// and is true only for the ADR-0091 SINGLE-STREAM intercept
+// ([Streamer.singleStreamSchemaForwardActive], which excludes Shape A and
+// multi-database mode). This one ARMS a refusal, so it must be true for
+// EVERY path that re-applies an observed delta to the target — including
+// ADR-0054's Shape A boundary router, which forwards ALTER COLUMN TYPE
+// regardless of `--schema-changes`. Keying the refusal on the narrower
+// flag would leave Shape A uncovered, which is the exact
+// narrower-than-its-name shape the class exists to close.
+//
+// Implemented by all three MySQL CDC lanes (binlog reader, VStream
+// standalone reader, VStream snapshot-stream CDC half). Postgres does not
+// implement it and needs no equivalent: its own mid-stream gate refuses
+// every ALTER COLUMN TYPE when [schemaForwardModeSetter] is false, so the
+// Shape A hole cannot exist there — see checkSchemaRace's
+// `unforwardableSessionTZCast` arm. The roster that keeps this honest per
+// lane is TestSessionGUCCastRoster_EveryCDCLane (internal/docsync).
+type schemaDeltaTargetApplySetter interface {
+	SetSchemaDeltaAppliesToTarget(enabled bool)
 }
 
 // targetSchemaSetter is the optional applier-side surface for

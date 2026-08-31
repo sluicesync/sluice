@@ -1350,6 +1350,13 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if setter, ok := stream.Changes.(schemaForwardModeSetter); ok {
 		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
 	}
+	// SL-2 (audit 2026-08-31): arm the reader's session-GUC cast refusal
+	// whenever ANY path re-applies an observed delta to the target — the
+	// intercept above OR Shape A's boundary router. Wider than the setter
+	// above on purpose; see [schemaDeltaTargetApplySetter].
+	if setter, ok := stream.Changes.(schemaDeltaTargetApplySetter); ok {
+		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
+	}
 
 	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
 	// tables so the CDC-leg row-move eval can read every OLD column (refuses
