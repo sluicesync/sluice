@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -141,5 +142,190 @@ func TestTypmodProjectionGate_EveryTypmodFamily(t *testing.T) {
 				t.Errorf("family OID %d moves its projection and must forward; checkSchemaRace refused: %v", oid, err)
 			}
 		})
+	}
+}
+
+// TestSessionTZSwapGate_EveryZoneSiblingPair is the SWAP axis the
+// TYPMOD-PROJECTION-GATE above deliberately does not carry: that gate
+// enumerates typmod deltas WITHIN one OID, and the OID-SWAP class sat next
+// to it unrostered — which is how `time[]`⇄`timetz[]` lost its refusal
+// inside the v0.134.0 delta with nothing going red (audit 2026-08-31 SL-3).
+//
+// The universe is derived from the PROJECTIONS, not from
+// [sessionTZSwapPair]: two OIDs are a session-TZ swap pair iff their
+// projected IR types describe the same temporal family and disagree on
+// whether the value carries a zone. That derivation is independent of the
+// predicate under test — a pair the predicate forgot still appears here —
+// which is the point. Deriving the universe from the predicate would make
+// the gate self-referential (the frozen-golden defect).
+//
+// Scope, stated so it cannot be read as broader: this reaches the PG
+// pgoutput lane only. The MySQL binlog / VStream lanes declare their own
+// pairs and are covered by TestSessionGUCCastRoster_EveryCDCLane
+// (internal/docsync) plus mysql's own TestSessionTZSwapPair cells.
+//
+// Both directions are load-bearing under mutation: drop an array OID from
+// the predicate's unwrap and the array cells redden; broaden the predicate
+// to "any two temporal OIDs" and the not-a-pair half reddens.
+func TestSessionTZSwapGate_EveryZoneSiblingPair(t *testing.T) {
+	// Scalar universe: PG's temporal built-ins inside oidToType's domain,
+	// listed from pg_catalog (date / time / timetz / timestamp /
+	// timestamptz / interval) rather than derived from the projection, so a
+	// projection that stopped resolving one of them shows up as a failure
+	// here instead of silently shrinking the universe.
+	scalars := []uint32{
+		pgtype.DateOID, pgtype.TimeOID, pgtype.TimetzOID,
+		pgtype.TimestampOID, pgtype.TimestamptzOID, pgtype.IntervalOID,
+	}
+	if len(scalars) != 6 {
+		t.Fatalf("temporal scalar universe holds %d OIDs; want PG's six", len(scalars))
+	}
+	inScalars := make(map[uint32]bool, len(scalars))
+	for _, oid := range scalars {
+		inScalars[oid] = true
+	}
+	// Array half derived mechanically from the production element map — the
+	// same source sessionTZSwapPair unwraps through, so a family added
+	// there joins this roster automatically.
+	universe := append([]uint32(nil), scalars...)
+	for arrOID, elemOID := range pgArrayElementOID {
+		if inScalars[elemOID] {
+			universe = append(universe, arrOID)
+		}
+	}
+	if len(universe) < 10 {
+		t.Fatalf("temporal universe holds %d OIDs (%v); floor 10 (six scalars + at least the four temporal arrays) — the derivation went vacuous",
+			len(universe), universe)
+	}
+
+	type zoneClassResult struct {
+		family string
+		zoned  bool
+		ok     bool
+	}
+	// zoneClass renders a projected IR type as (family, carries-a-zone).
+	// ok=false for anything outside the temporal families this class covers.
+	var zoneClass func(ir.Type) zoneClassResult
+	zoneClass = func(typ ir.Type) zoneClassResult {
+		switch v := typ.(type) {
+		case ir.Date:
+			return zoneClassResult{family: "date", ok: true}
+		case ir.Interval:
+			return zoneClassResult{family: "interval", ok: true}
+		case ir.Time:
+			return zoneClassResult{family: "time-of-day", zoned: v.WithTimeZone, ok: true}
+		case ir.DateTime:
+			return zoneClassResult{family: "timestamp", ok: true}
+		case ir.Timestamp:
+			return zoneClassResult{family: "timestamp", zoned: v.WithTimeZone, ok: true}
+		case ir.Array:
+			inner := zoneClass(v.Element)
+			inner.family += "[]"
+			return inner
+		}
+		return zoneClassResult{}
+	}
+
+	classOf := make(map[uint32]zoneClassResult, len(universe))
+	for _, oid := range universe {
+		typ, err := oidToType(oid, -1)
+		if err != nil {
+			t.Fatalf("oidToType(%d, -1): %v", oid, err)
+		}
+		class := zoneClass(typ)
+		if !class.ok {
+			t.Fatalf("OID %d projects %T, which zoneClass does not recognise — a temporal family reached oidToType without anyone deciding whether it carries a zone, and that decision is exactly what the swap refusal keys on", oid, typ)
+		}
+		classOf[oid] = class
+	}
+
+	// The derived pair set: same family, disagreeing on the zone.
+	wantSwap := map[[2]uint32]bool{}
+	for _, a := range universe {
+		for _, b := range universe {
+			if a == b {
+				continue
+			}
+			if classOf[a].family == classOf[b].family && classOf[a].zoned != classOf[b].zoned {
+				wantSwap[[2]uint32{a, b}] = true
+			}
+		}
+	}
+	// Anti-vacuity floor: four unordered pairs — time/timetz,
+	// timestamp/timestamptz, each scalar and array — so eight ordered.
+	if len(wantSwap) != 8 {
+		t.Fatalf("derived %d ordered zone-sibling pairs; want 8 (time⇄timetz, timestamp⇄timestamptz, each scalar and array)", len(wantSwap))
+	}
+
+	for _, a := range universe {
+		for _, b := range universe {
+			if a == b {
+				continue
+			}
+			pair, matched := sessionTZSwapPair(
+				relationColumn{Name: "v", OID: a, TypeMod: -1},
+				relationColumn{Name: "v", OID: b, TypeMod: -1},
+			)
+			want := wantSwap[[2]uint32{a, b}]
+			switch {
+			case want && !matched:
+				t.Errorf("OID %d→%d is a zone-sibling swap (%s, zoned %v→%v) but sessionTZSwapPair does not match it — the SOURCE ALTER's session TimeZone decided the cast and a forwarded ALTER re-casts pre-existing target rows against the TARGET's",
+					a, b, classOf[a].family, classOf[a].zoned, classOf[b].zoned)
+			case !want && matched:
+				t.Errorf("OID %d→%d is NOT a zone-sibling swap (%s/%v → %s/%v) but sessionTZSwapPair matched it as %q — the predicate is broader than the class and would false-refuse a forwardable ALTER",
+					a, b, classOf[a].family, classOf[a].zoned, classOf[b].family, classOf[b].zoned, pair)
+			case want && pair == "":
+				t.Errorf("OID %d→%d matched with an empty pair name; the refusal text names the pair", a, b)
+			}
+
+			// Behavioural half: matching is only worth something if the
+			// reader actually refuses, under BOTH modes.
+			if !want {
+				continue
+			}
+			prev := &relationCacheEntry{Schema: "public", Name: "t", Columns: []relationColumn{typedCol(t, "v", a, -1)}}
+			curr := &relationCacheEntry{Schema: "public", Name: "t", Columns: []relationColumn{typedCol(t, "v", b, -1)}}
+			relations := map[uint32]*relationCacheEntry{16400: prev}
+			for _, forward := range []bool{true, false} {
+				err := checkSchemaRace(relations, 16400, curr, forward)
+				if err == nil {
+					t.Errorf("OID %d→%d (%s) passed checkSchemaRace with forward=%v; the session-TZ swap must refuse under both modes", a, b, pair, forward)
+					continue
+				}
+				if forward && !strings.Contains(err.Error(), "TimeZone") {
+					t.Errorf("OID %d→%d refused without naming the TimeZone mechanism: %v", a, b, err)
+				}
+			}
+		}
+	}
+}
+
+// TestSessionTZSwapPair_ArrayOIDsGroundTruthed pins the four array OIDs the
+// unwrap depends on against pg_catalog's published values. They are not
+// derivable (an array OID is NOT element+1 — macaddr is 829 while _macaddr
+// is 1040), and the whole array arm goes silently inert if
+// pgArrayElementOID ever maps one of them to the wrong element. The
+// live-server counterpart is
+// TestCDCSchemaForward_SessionTZArraySwapRefuses_PG (integration), which
+// reads these same four OIDs out of a real pg_type.
+func TestSessionTZSwapPair_ArrayOIDsGroundTruthed(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		arrOID      uint32
+		wantElemOID uint32
+	}{
+		{"_time", 1183, pgtype.TimeOID},
+		{"_timetz", 1270, pgtype.TimetzOID},
+		{"_timestamp", 1115, pgtype.TimestampOID},
+		{"_timestamptz", 1185, pgtype.TimestamptzOID},
+	} {
+		elem, ok := pgArrayElementOID[tc.arrOID]
+		if !ok {
+			t.Errorf("pgArrayElementOID has no entry for %s (OID %d) — the array session-TZ arm is inert for it", tc.name, tc.arrOID)
+			continue
+		}
+		if elem != tc.wantElemOID {
+			t.Errorf("pgArrayElementOID[%s=%d] = %d; want %d", tc.name, tc.arrOID, elem, tc.wantElemOID)
+		}
 	}
 }

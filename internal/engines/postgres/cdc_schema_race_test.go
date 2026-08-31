@@ -672,6 +672,78 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		}
 	})
 
+	t.Run("array session-TZ swaps refuse under forward, every pair × direction (SL-3)", func(t *testing.T) {
+		// The RESTORATION cell (audit 2026-08-31 SL-3). `time[]`⇄`timetz[]`
+		// refused from the A2 gate as projection-IDENTICAL until the
+		// TIMETZ-PROJECTION fix (f1b7f7cb) made the two projections differ
+		// — at which point the projection-equality gate stopped firing and
+		// the swap FORWARDED with its per-element hazard intact.
+		// `timestamp[]`⇄`timestamptz[]` forwarded throughout. Pinned by
+		// PAIR now, so no future projection change can re-open either.
+		//
+		// Class-not-representative: all four array OIDs, both directions —
+		// the one-representative version of this test is exactly what
+		// missed the leak, since `timestamp[]` and `time[]` reached the
+		// gate by different routes (differing vs identical projections).
+		for _, tc := range []struct {
+			name     string
+			from, to uint32
+			pair     string
+		}{
+			{"_time→_timetz", 1183, 1270, "time[] and timetz[]"},
+			{"_timetz→_time", 1270, 1183, "time[] and timetz[]"},
+			{"_timestamp→_timestamptz", 1115, 1185, "timestamp[] and timestamptz[]"},
+			{"_timestamptz→_timestamp", 1185, 1115, "timestamp[] and timestamptz[]"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				prev := table(typedCol(t, "id", 23, -1), typedCol(t, "slots", tc.from, -1))
+				curr := table(typedCol(t, "id", 23, -1), typedCol(t, "slots", tc.to, -1))
+				relations := map[uint32]*relationCacheEntry{16400: prev}
+				requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "slots", tc.pair)
+				if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+					t.Errorf("%s must refuse under refuse mode too", tc.name)
+				}
+			})
+		}
+	})
+
+	t.Run("a non-TZ array OID swap still forwards (the unwrap did not broaden to every array)", func(t *testing.T) {
+		// The no-false-fire floor for the array unwrap: `_int4`→`_int8`
+		// moves its projection and carries no session-GUC-resolved cast,
+		// so it must keep reaching the intercept. An unwrap that matched
+		// "both sides are arrays" instead of "both elements are one
+		// zone-sibling pair" fails here.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "ns", 1007, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "ns", 1016, -1))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("_int4[]→_int8[] must forward; got: %v", err)
+		}
+	})
+
+	t.Run("a cross-family array swap still forwards (time[]→timestamp[] is not a zone-sibling pair)", func(t *testing.T) {
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1183, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1115, -1))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("_time[]→_timestamp[] must forward; got: %v", err)
+		}
+	})
+
+	t.Run("a scalar↔array dimension change is not a swap (documented, and it forwards)", func(t *testing.T) {
+		// `time` → `timetz[]` is not the same value re-cast in place; PG
+		// needs an explicit USING to express it at all, so a forwarded
+		// bare ALTER fails loudly on the target rather than diverging.
+		// Pinned so the deliberate asymmetry in sessionTZSwapPair's
+		// prevIsArray != currIsArray arm is not read as an oversight.
+		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1083, -1))
+		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "v", 1270, -1))
+		relations := map[uint32]*relationCacheEntry{16400: prev}
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("time→timetz[] must not take the session-TZ arm; got: %v", err)
+		}
+	})
+
 	t.Run("timestamp/timestamptz precision-only ALTER on an unchanged OID still forwards", func(t *testing.T) {
 		// The NO-FALSE-FIRE floor for the new arm: the swap predicate
 		// requires both OIDs of a distinct pair, so a precision change

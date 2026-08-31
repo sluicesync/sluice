@@ -401,7 +401,9 @@ const (
 	unforwardableLosslessNoRewrite
 	// unforwardableSessionTZCast: an OID swap between a temporal type and
 	// its with-time-zone sibling — time⇄timetz or timestamp⇄timestamptz,
-	// either direction. Both swaps MOVE the projected signature (timetz
+	// either direction, scalar OR array (time[]⇄timetz[],
+	// timestamp[]⇄timestamptz[] carry the identical per-ELEMENT hazard).
+	// Both swaps MOVE the projected signature (timetz
 	// projects WithTimeZone:true since the TIMETZ-PROJECTION fix; the
 	// timestamp pair projects distinct Go types and always has), so the
 	// forward intercept could see them — but the source's ALTER resolved
@@ -421,11 +423,26 @@ const (
 	// operator decision (2026-08-28) aligned it — a deliberate behavior
 	// change trading convergence-when-TZs-happen-to-match for refusing
 	// the silent-divergence case.
-	// Class siblings enumerated, filed not fixed here (audit backlog
-	// 2026-08-28): the ARRAY variants (time[]⇄timetz[],
-	// timestamp[]⇄timestamptz[]) forward today with the same per-element
-	// hazard, and MySQL's timestamp⇄datetime MODIFY is the other lane's
-	// analogue — both outside this decision's scalar-PG scope.
+	//
+	// The ARRAY variants are covered by the same predicate as of the
+	// 2026-08-31 audit's SL-3 (see [sessionTZSwapPair]'s element unwrap).
+	// They are a RESTORATION, not a new refusal: `time[]`⇄`timetz[]`
+	// refused from the A2 gate (v0.132.1) — as projection-IDENTICAL, both
+	// sides resolving their element at typmod −1 to a flag-less ir.Time —
+	// until the TIMETZ-PROJECTION fix (f1b7f7cb, v0.134.0) gave the timetz
+	// arm WithTimeZone. That made the two projections DIFFER, so the
+	// projection-equality gate stopped firing and the swap forwarded from
+	// v0.134.0 with its hazard intact. Keying on the PAIR rather than on
+	// projection equality is what makes the class stable under any future
+	// projection change. (`timestamp[]`⇄`timestamptz[]` had forwarded
+	// throughout — those projections always differed.)
+	//
+	// Class sibling in the other lane: MySQL's `timestamp`⇄`datetime`
+	// MODIFY, whose cast is resolved by the executing session's
+	// `time_zone` for exactly the same reason. Fixed in the MySQL
+	// engine's own boundary path (see [mysql.sessionTZSwapPair]); the
+	// cross-lane roster is TestSessionGUCCastRoster_EveryCDCLane in
+	// internal/docsync.
 	unforwardableSessionTZCast
 )
 
@@ -547,19 +564,43 @@ func losslessNoRewriteDelta(pc, cc relationColumn) bool {
 // sessionTZSwapPair reports an OID swap between a temporal type and its
 // with-time-zone sibling, in either direction — the
 // [unforwardableSessionTZCast] shape — naming the pair for the refusal
-// text. Scalar OIDs only, deliberately: the array variants are filed, not
-// fixed (see the shape const). Each arm requires BOTH OIDs of a distinct
-// pair, so a same-OID typmod delta (timestamp(6)→timestamp(3)) can never
-// match — the precision-forward floor
-// (TestTypmodProjectionGate_EveryTypmodFamily) pins that.
+// text. Each arm requires BOTH OIDs of a distinct pair, so a same-OID
+// typmod delta (timestamp(6)→timestamp(3)) can never match — the
+// precision-forward floor (TestTypmodProjectionGate_EveryTypmodFamily)
+// pins that.
+//
+// ARRAYS are matched by unwrapping BOTH sides through the production
+// [pgArrayElementOID] map and running the scalar arms on the element
+// OIDs (SL-3, 2026-08-31). Derived rather than four more literal array
+// OIDs so a zone-aware element family added to that map is covered the
+// moment its mapping lands — and so the array cell can never drift out
+// of step with the scalar one it mirrors. `_time`/`_timetz`/`_timestamp`/
+// `_timestamptz` (1183/1270/1115/1185) reach the arms this way;
+// TestSessionTZSwapPair_ArrayOIDsGroundTruthed pins those four OIDs
+// against a real pg_type, and the integration pin walks the same four
+// through a live RelationMessage.
+//
+// A scalar↔array dimension change (`time` → `timetz[]`) is deliberately
+// NOT a swap: it is not the same value re-cast in place, PG needs an
+// explicit USING to express it at all, and a forwarded bare ALTER fails
+// loudly on the target rather than diverging silently.
 func sessionTZSwapPair(pc, cc relationColumn) (string, bool) {
+	prevOID, currOID, suffix := pc.OID, cc.OID, ""
+	prevElem, prevIsArray := pgArrayElementOID[prevOID]
+	currElem, currIsArray := pgArrayElementOID[currOID]
 	switch {
-	case (pc.OID == pgtype.TimeOID && cc.OID == pgtype.TimetzOID) ||
-		(pc.OID == pgtype.TimetzOID && cc.OID == pgtype.TimeOID):
-		return "time and timetz", true
-	case (pc.OID == pgtype.TimestampOID && cc.OID == pgtype.TimestamptzOID) ||
-		(pc.OID == pgtype.TimestamptzOID && cc.OID == pgtype.TimestampOID):
-		return "timestamp and timestamptz", true
+	case prevIsArray && currIsArray:
+		prevOID, currOID, suffix = prevElem, currElem, "[]"
+	case prevIsArray != currIsArray:
+		return "", false
+	}
+	switch {
+	case (prevOID == pgtype.TimeOID && currOID == pgtype.TimetzOID) ||
+		(prevOID == pgtype.TimetzOID && currOID == pgtype.TimeOID):
+		return "time" + suffix + " and timetz" + suffix, true
+	case (prevOID == pgtype.TimestampOID && currOID == pgtype.TimestamptzOID) ||
+		(prevOID == pgtype.TimestamptzOID && currOID == pgtype.TimestampOID):
+		return "timestamp" + suffix + " and timestamptz" + suffix, true
 	}
 	return "", false
 }
