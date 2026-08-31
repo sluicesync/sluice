@@ -337,6 +337,18 @@ For the subscriber shape there is a supported opt-in: re-run `sluice trigger set
 
 Separately, every `postgres-trigger` stream open now verifies the installed capture artifacts themselves (the same capture-shape door the `sqlite-trigger`/`d1-trigger` engines got in v0.131.2): a manually dropped or `DISABLE TRIGGER`-d capture trigger, a trigger set `ENABLE REPLICA`, a trigger rewired to a foreign function, or a dropped/disabled `sluice_capture_ddl_trg` event trigger **refuses loudly at open** — re-running `sluice trigger setup` reinstalls everything and preserves the change-log and resume watermark. Without the door, a dropped trigger is invisible to both drift tiers (the DDL event trigger only watches table/index DDL; the `--allow-polled-fingerprint` tier watches nothing — its fingerprint loop is not yet implemented, and every stream open on that tier logs a `DDL-DETECTION-ABSENT` warning) and every subsequent change on that table would be silently uncaptured.
 
+### Security: re-run `trigger setup` after upgrading past v0.134.0
+
+Releases v0.85.0 through v0.134.0 installed the DDL capture function (`sluice_capture_ddl`) as `SECURITY DEFINER` **without** a pinned `search_path`. `CREATE EVENT TRIGGER` requires superuser, so that function is owned by one, and an unpinned definer resolves the built-ins it calls against the search_path of whichever session fires it — which is any user's DDL session. An unprivileged user who can create a function in a schema their search_path reaches (the default `PUBLIC` grant on `public` before PG 15, or any schema they own) could shadow one of those built-ins and have it execute with superuser privileges by running a single `CREATE TABLE`. This was reproduced end to end on PG 16.
+
+The renderer is fixed, but **upgrading the sluice binary does not repair a database that already has the function installed** — only re-running setup does, because `CREATE OR REPLACE FUNCTION` is what rewrites the function's settings:
+
+```
+sluice trigger setup --dsn=<source-dsn> --tables=<same tables as before>
+```
+
+Add `--capture-replicated-writes` if that is your recorded posture. The re-run preserves the change log, its resume watermark and the consumer registry, so a running sync resumes where it left off; do it at your next convenient window. Until then every `postgres-trigger` stream open logs an `INSECURE-CAPTURE-FUNCTION` warning naming the affected function and this remedy. It is a warning rather than a refusal deliberately: the same check runs on every warm resume, so refusing would turn a binary upgrade into an outage on every running sync. Sources on the `--allow-polled-fingerprint` tier never had the DDL capture function installed and are not affected.
+
 ## MySQL binlog sources: writes that never enter the binlog
 
 sluice's MySQL/MariaDB CDC **is** the binlog — a write the server never logs cannot reach the target, and nothing errors, because there is no event to mis-handle. Most members of this class are refused loudly at CDC start: `binlog_format` ≠ ROW and partial row images (`SLUICE-E-CDC-BINLOG-FORMAT-NOT-ROW`, `SLUICE-E-CDC-ROW-IMAGE-PARTIAL`), a source that is itself a replica with `log_replica_updates=OFF` (`SLUICE-E-CDC-REPLICA-NO-LOG-UPDATES`), server-side `--binlog-ignore-db`/`--binlog-do-db` filters covering a synced database (`SLUICE-E-CDC-BINLOG-DB-FILTERED`), and a session-level `binlog_format=STATEMENT` override's DML is stopped mid-stream by a dispatch belt (`SLUICE-E-CDC-STATEMENT-DML`). Two shapes remain that sluice **cannot detect at all**, and they are documented here rather than implied covered:

@@ -19,6 +19,7 @@ the same shape every other engine uses).
 
 ### Implementation notes (drift from this spec)
 
+- **§7's DDL capture function shipped SECURITY DEFINER with NO `SET search_path` — a privilege escalation, fixed 2026-08-31 (SEC-1).** This ADR's §7 sketch (and every release from v0.85.0 through v0.134.0) declared `sluice_capture_ddl()` `SECURITY DEFINER` and stopped there, while §3's row and TRUNCATE capture functions have carried `SET search_path = pg_catalog, pg_temp` since the engine's first commit. `CREATE EVENT TRIGGER` requires superuser, so this function is necessarily owned by one — and an unpinned definer resolves unqualified names against the search_path of the session that FIRES it, which is any user's DDL session. `jsonb_build_object`'s built-in signature is `VARIADIC "any"`, which scores ZERO exact argument-type matches in PostgreSQL's function-resolution ranking; an attacker-created `jsonb_build_object(text,text,text,text)` in a schema they can write scores two, and **a better match beats schema order, including pg_catalog's implicit first position**. Reproduced end-to-end on real PG 16: an ordinary LOGIN role with CREATE on its own schema planted the overload, ran one `CREATE TABLE`, and its body executed as the function's superuser owner — `ALTER ROLE lowpriv SUPERUSER` succeeded from inside the event trigger. The fix is both belts, deliberately, so neither is solely load-bearing: the `SET search_path = pg_catalog, pg_temp` clause AND full `pg_catalog.` qualification of every call in all three capture functions' bodies (`COALESCE` is a reserved keyword and stays bare; the `->` operator stays bare with a comment — `OPERATOR(pg_catalog.->)` is the only qualified spelling and the pin covers it). **Upgrade path:** the fix reaches a database only when `sluice trigger setup` re-runs there (`CREATE OR REPLACE FUNCTION` rewrites `proconfig`); upgrading the binary alone leaves the vulnerable function installed, so `warnInsecureCaptureFunctions` reads `pg_proc.proconfig` at every CDC open and WARNs (`INSECURE-CAPTURE-FUNCTION`) naming the re-run — a WARN rather than a refusal because the same door runs on every warm resume and refusing would convert a binary upgrade into an outage on every running sync. Pinned by `TestDDLCaptureFunctionSearchPath_ShadowedBuiltin` (the exploitation proof, pre-fix fires / post-fix does not), `TestInsecureCaptureFunctionWarn_AtCDCOpen` (both directions plus "the named remedy actually clears it"), `TestEverySecurityDefinerFunctionPinsSearchPath` + `TestCaptureDDLFunction_QualifiesEveryCall` (unit), and the repo-wide AST roster `TestNoUnpinnedSecurityDefinerEmitters`. **Checked premise:** the same test plants the overload in `pg_temp` against a pinned-but-unqualified body and asserts it does NOT win — PostgreSQL resolves function names only in real schemas, never the temporary one — which is what makes "the two siblings were never exposed" a verified statement rather than a comfortable one.
 - **The event-trigger capability probe is attempt-based; `pg_create_event_trigger` does not exist (RDS validation F2, 2026-07-16).** This ADR's §7/§14 sketches gate the event-trigger tier on "superuser OR `pg_create_event_trigger` membership (PG 14+)" — but no such predefined role exists in ANY stock PostgreSQL release (the only `pg_create*` role is `pg_create_subscription`), so the shipped membership check read as superuser-only everywhere and falsely refused the AWS RDS master user, which CAN create event triggers via `rds_superuser`. The shipped probe now ATTEMPTS `CREATE EVENT TRIGGER` (plus its probe function) inside a transaction that is always rolled back — side-effect-free on both answers, and immune to provider-patched permission models — mapping SQLSTATE 42501 to the §7 polled-fingerprint fallback signal. Pinned by `TestEventTriggerProbe_SuperuserCan` / `TestEventTriggerProbe_NonSuperuserCannot` / `TestSetup_NonSuperuserRefusesWithPolledFingerprintHint`.
 - **§4's deferred-re-parse rule now applies to array ELEMENT leaves too, recursively (RDS validation F3, 2026-07-16).** v1 normalized only top-level scalar `json.Number` leaves; array elements reached the target writer raw (`json.Number`, and the to_jsonb strings `"Infinity"`/`"-Infinity"`/`"NaN"` for non-finite floats), crash-looping the stream on the first array-bearing UPDATE/DELETE payload. The decoder now applies the same loss-free-only rule at every array nesting depth (integers → int64; non-integer numerics stay `json.Number`), and the postgres writer's per-family array leaf converters re-parse the payload shapes type-aware (json.Number/int64/non-finite spellings for floats, digit-lossless json.Number for numerics, ISO-8601 strings for temporals) — the "Infinity"-in-`text[]` ambiguity is exactly why the mapping cannot live in the type-blind decode layer. Pinned by the full family × shape × op matrix in `TestCDCApply_ArrayElementFamilies`.
 - **Float negative zero is normalized to +0 by the §3 capture format itself (named wart, 2026-07-16).** `to_jsonb()` stores numbers as `numeric`, which has no signed zero — ground-truthed on PG 16: `to_jsonb('-0'::float8)` → `0`, while the SQL read path's `float8out` → `'-0'`. So cold-copy and the slot-based engine carry the sign faithfully; a `-0` written during trigger CDC lands as `+0` on the target, and no decode/apply-layer fix can recover it (the information is destroyed inside the source-side trigger). Documented in engine.go; pinned by `TestCDCApply_FloatNegativeZeroCaptureNormalization`. A capture-side fix would require rendering float columns via `float8out` text instead of jsonb numbers — a §3 format change deferred until demanded.
@@ -474,22 +475,23 @@ CREATE OR REPLACE FUNCTION sluice_capture_ddl()
 RETURNS event_trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp   -- SEC-1: load-bearing, see below
 AS $$
 DECLARE
     r RECORD;
 BEGIN
-    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+    FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
         IF r.schema_name IS NULL OR r.object_identity IS NULL THEN
             CONTINUE;
         END IF;
         INSERT INTO sluice_change_log
             (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
         VALUES
-            (pg_current_xact_id()::text::bigint,
+            (pg_catalog.pg_current_xact_id()::text::bigint,
              COALESCE(r.schema_name, 'public'),
              COALESCE(r.object_identity, 'unknown'),
              'X',  -- DDL marker
-             jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
+             pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
              NULL,
              NULL);
     END LOOP;

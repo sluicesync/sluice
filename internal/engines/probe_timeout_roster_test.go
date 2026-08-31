@@ -95,8 +95,8 @@ var probeTimeoutRoster = []struct {
 		dbishTypes:  []string{"sql.DB"},
 		// change-log existence, sequence grade, capture-posture read,
 		// capture-shape door, replica-role shape dispatch (WARN/echo-
-		// refusal), DDL-detection WARN.
-		floor: 6,
+		// refusal), DDL-detection WARN, insecure-definer WARN (SEC-1).
+		floor: 7,
 	},
 }
 

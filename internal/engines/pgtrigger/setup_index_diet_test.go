@@ -117,14 +117,14 @@ func TestRenderCaptureRowFunction_BakedPKList(t *testing.T) {
 
 			for _, want := range []string{
 				// The baked-list parse.
-				"v_pk_cols := ARRAY(SELECT jsonb_array_elements_text(TG_ARGV[0]::jsonb))",
+				"v_pk_cols := ARRAY(SELECT pg_catalog.jsonb_array_elements_text(TG_ARGV[0]::jsonb))",
 				// Guard 1: manually-attached trigger with no baked list.
 				"carries no baked PK column list (TG_ARGV[0])",
 				// Guard 2: empty list (the §14 no-PK refusal, defensively).
 				"has no PRIMARY KEY; refuse-loudly per ADR-0066 §14",
 				// Guard 3: stale bake after a post-setup PK ALTER.
 				"no longer matches the row image",
-				"(SELECT count(*) FROM jsonb_object_keys(v_pk)) <> cardinality(v_pk_cols)",
+				"(SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(v_pk)) <> pg_catalog.cardinality(v_pk_cols)",
 			} {
 				if !strings.Contains(ddl, want) {
 					t.Errorf("capture function (mode %s) missing %q", mode, want)

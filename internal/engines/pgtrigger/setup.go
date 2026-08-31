@@ -873,6 +873,12 @@ func renderCaptureRowFunction(schema, changeLogTableRef string, payload CaptureP
 	// the function body programmatically. SECURITY DEFINER lets a
 	// non-table-owning role drive the engine as long as the
 	// function-owning role has INSERT on sluice_change_log.
+	// Every built-in call is pg_catalog-qualified: this function has
+	// carried the SET search_path pin since the engine's first commit
+	// (so it was never the SEC-1 shape [renderCaptureDDLFunction] was),
+	// but a SECURITY DEFINER body should not rest on the pin alone —
+	// see that function's SEC-1 block for the resolution rule that
+	// makes an unpinned definer exploitable.
 	// SET extra_float_digits = 3 (Bug 194's trigger-capture face): the
 	// capture format is to_jsonb(), and PG converts float4/float8 into a
 	// jsonb numeric THROUGH the type's text output function — which
@@ -926,9 +932,9 @@ BEGIN
         RAISE EXCEPTION 'sluice_capture_change: trigger on %.% carries no baked PK column list (TG_ARGV[0]); re-run sluice trigger setup to reinstall the trigger',
             TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
-    v_pk_cols := ARRAY(SELECT jsonb_array_elements_text(TG_ARGV[0]::jsonb));
+    v_pk_cols := ARRAY(SELECT pg_catalog.jsonb_array_elements_text(TG_ARGV[0]::jsonb));
 
-    IF cardinality(v_pk_cols) = 0 THEN
+    IF pg_catalog.cardinality(v_pk_cols) = 0 THEN
         -- No PK on the source table. The setup preflight refuses this
         -- shape (§14) and only ever renders an empty list into a
         -- dry-run plan it refuses to apply, but a defensive guard here
@@ -942,9 +948,9 @@ BEGIN
         -- INSERT is identical in all three modes: the after image is
         -- all-new data, so there is nothing to trim (ADR-0068).
         v_op     := 'I';
-        v_after  := to_jsonb(NEW);
+        v_after  := pg_catalog.to_jsonb(NEW);
         v_before := NULL;
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
 ` + captureUpdateDeleteBlock(payload) + `    ELSE
         RAISE EXCEPTION 'sluice_capture_change: unexpected TG_OP %', TG_OP;
     END IF;
@@ -960,7 +966,7 @@ BEGIN
     -- polled-fingerprint tier and for manual trigger surgery, where a
     -- stale list would otherwise capture rows keyed on the wrong
     -- columns. Recovery is a setup re-run, which re-bakes TG_ARGV.
-    IF v_pk IS NULL OR (SELECT count(*) FROM jsonb_object_keys(v_pk)) <> cardinality(v_pk_cols) THEN
+    IF v_pk IS NULL OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(v_pk)) <> pg_catalog.cardinality(v_pk_cols) THEN
         RAISE EXCEPTION 'sluice_capture_change: baked PK column list % no longer matches the row image of %.% (PRIMARY KEY altered after setup?); re-run sluice trigger setup to re-bake the capture trigger',
             v_pk_cols, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
@@ -968,7 +974,7 @@ BEGIN
     INSERT INTO ` + changeLogTableRef + `
         (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
     VALUES
-        (pg_current_xact_id()::text::bigint,
+        (pg_catalog.pg_current_xact_id()::text::bigint,
          TG_TABLE_SCHEMA,
          TG_TABLE_NAME,
          v_op,
@@ -1003,9 +1009,13 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 	// Shared changed-set computation for the UPDATE after image
 	// (changed + minimal). PK union + IS DISTINCT FROM diff (NULL-safe,
 	// type-exact on jsonb).
+	// The `->` operator is left unqualified: OPERATOR(pg_catalog.->) is
+	// the only qualified spelling and it makes the body unreadable, and
+	// the function's own SET search_path pin already excludes every
+	// attacker-writable schema from operator resolution.
 	const changedAfter = `        v_after  := (
-            SELECT jsonb_object_agg(n.key, n.value)
-            FROM jsonb_each(v_new_json) n
+            SELECT pg_catalog.jsonb_object_agg(n.key, n.value)
+            FROM pg_catalog.jsonb_each(v_new_json) n
             WHERE n.key = ANY(v_pk_cols)
                OR (v_old_json -> n.key) IS DISTINCT FROM n.value
         );`
@@ -1014,46 +1024,46 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 	case CapturePayloadChanged:
 		return `    ELSIF TG_OP = 'UPDATE' THEN
         v_op       := 'U';
-        v_new_json := to_jsonb(NEW);
-        v_old_json := to_jsonb(OLD);
+        v_new_json := pg_catalog.to_jsonb(NEW);
+        v_old_json := pg_catalog.to_jsonb(OLD);
         v_before   := v_old_json;  -- full before-image (divergence WHERE)
 ` + changedAfter + `
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
-        v_before := to_jsonb(OLD);
+        v_before := pg_catalog.to_jsonb(OLD);
         v_after  := NULL;
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
 `
 	case CapturePayloadMinimal:
 		return `    ELSIF TG_OP = 'UPDATE' THEN
         v_op       := 'U';
-        v_new_json := to_jsonb(NEW);
-        v_old_json := to_jsonb(OLD);
-        v_pk       := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
+        v_new_json := pg_catalog.to_jsonb(NEW);
+        v_old_json := pg_catalog.to_jsonb(OLD);
+        v_pk       := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
         -- before drives the apply WHERE, which must locate the row by its
         -- identity BEFORE the change. Use the OLD PK (not v_pk, which is the
         -- NEW PK) so a PK-changing UPDATE still finds the existing target
         -- row; pk_jsonb stays the NEW PK (metadata, consistent w/ full/changed).
-        v_before   := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_old_json) WHERE key = ANY(v_pk_cols));  -- OLD PK (PK-scoped WHERE)
+        v_before   := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_old_json) WHERE key = ANY(v_pk_cols));  -- OLD PK (PK-scoped WHERE)
 ` + changedAfter + `
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(pg_catalog.to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));
         v_before := v_pk;  -- PK only (OLD PK — DELETE WHERE targets the existing row)
         v_after  := NULL;
 `
 	default: // CapturePayloadFull
 		return `    ELSIF TG_OP = 'UPDATE' THEN
         v_op     := 'U';
-        v_before := to_jsonb(OLD);
-        v_after  := to_jsonb(NEW);
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
+        v_before := pg_catalog.to_jsonb(OLD);
+        v_after  := pg_catalog.to_jsonb(NEW);
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
-        v_before := to_jsonb(OLD);
+        v_before := pg_catalog.to_jsonb(OLD);
         v_after  := NULL;
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
 `
 	}
 }
@@ -1062,6 +1072,11 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 // FUNCTION statement for the TRUNCATE companion. ADR-0066 §3 — the
 // row function can't double-up because TRUNCATE triggers are FOR
 // EACH STATEMENT, not FOR EACH ROW (no OLD/NEW).
+//
+// The search_path pin has been here since the engine's first commit
+// (unlike [renderCaptureDDLFunction]'s — SEC-1); the pg_catalog
+// qualification of the body's one call is the belt added alongside
+// that fix, so no member of the trio relies on the pin alone.
 func renderCaptureTruncateFunction(schema, changeLogTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + truncateFnRef(schema) + `()
 RETURNS TRIGGER
@@ -1073,7 +1088,7 @@ BEGIN
     INSERT INTO ` + changeLogTableRef + `
         (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
     VALUES
-        (pg_current_xact_id()::text::bigint,
+        (pg_catalog.pg_current_xact_id()::text::bigint,
          TG_TABLE_SCHEMA,
          TG_TABLE_NAME,
          'T',
@@ -1097,7 +1112,7 @@ const captureDDLSuppressionCheck = `    -- Bug 257: sluice's own setup session e
     -- ADD COLUMN migration, the opt-in's trigger-enablement ALTERs) on
     -- every re-run; recording it as op='X' would make the next warm
     -- resume refuse sluice's own statements as operator DDL.
-    IF current_setting('` + setupSessionGUC + `', true) = 'on' THEN
+    IF pg_catalog.current_setting('` + setupSessionGUC + `', true) = 'on' THEN
         RETURN;
     END IF;
 `
@@ -1116,16 +1131,53 @@ const captureDDLSuppressionCheck = `    -- Bug 257: sluice's own setup session e
 // the source was blocked with the raw PG error, leaving the operator
 // to grep for the right recovery command — that's a catastrophic
 // blast-radius for what should be a five-second operator fix.
+//
+// # SEC-1 (audit 2026-08-31): SET search_path is load-bearing HERE, not cosmetic
+//
+// This function is necessarily owned by a SUPERUSER — `CREATE EVENT
+// TRIGGER` requires superuser, so `trigger setup` installs it as one —
+// and `SECURITY DEFINER` means its body runs with that superuser's
+// privileges. From v0.85.0 through v0.134.0 it shipped WITHOUT the
+// search_path pin its two siblings ([renderCaptureRowFunction],
+// [renderCaptureTruncateFunction]) have carried since the engine's
+// first commit, so the body resolved unqualified names against the
+// FIRING session's search_path — and the firing session belongs to
+// whoever ran the DDL, i.e. to any unprivileged user of the database.
+//
+// `jsonb_build_object`'s built-in signature is `VARIADIC "any"`, which
+// scores ZERO exact argument-type matches in PostgreSQL's function
+// resolution. An attacker-created exact-typed overload
+// (`jsonb_build_object(text,text,text,text)`) in any schema their
+// search_path reaches scores two, and **a better match beats schema
+// order** — including pg_catalog's implicit first position — so the
+// attacker's function wins resolution and executes as the superuser
+// owner. One `CREATE TABLE` by that user is then arbitrary superuser
+// code execution. Reproduced end-to-end on real PG by
+// TestDDLCaptureFunctionSearchPath_ShadowedBuiltin.
+//
+// The fix is both halves, deliberately: the `SET search_path =
+// pg_catalog, pg_temp` clause (the PostgreSQL-documented secure
+// arrangement, matching the siblings' shape exactly) AND full
+// pg_catalog qualification of every call in the body, so neither
+// alone is load-bearing. COALESCE is a reserved keyword, not a
+// shadowable function; the change-log INSERT target arrives
+// pre-qualified via changeLogTableRef.
+//
+// Existing installs keep the vulnerable function until a
+// `sluice trigger setup` re-run replaces it (CREATE OR REPLACE resets
+// proconfig). [warnInsecureCaptureFunctions] detects that shape at
+// every CDC open and WARNs with the remedy.
 func renderCaptureDDLFunction(schema, changeLogTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + ddlFnRef(schema) + `()
 RETURNS event_trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $sluice$
 DECLARE
     r RECORD;
 BEGIN
-` + captureDDLSuppressionCheck + `    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+` + captureDDLSuppressionCheck + `    FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;
         END IF;
@@ -1133,11 +1185,11 @@ BEGIN
             INSERT INTO ` + changeLogTableRef + `
                 (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
             VALUES
-                (pg_current_xact_id()::text::bigint,
+                (pg_catalog.pg_current_xact_id()::text::bigint,
                  COALESCE(r.schema_name, 'public'),
                  COALESCE(r.object_identity, 'unknown'),
                  'X',
-                 jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
+                 pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
                  NULL,
                  NULL);
         EXCEPTION

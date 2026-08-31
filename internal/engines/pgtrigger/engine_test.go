@@ -363,10 +363,10 @@ func TestCaptureRowFunction_Full(t *testing.T) {
 	ddl := captureRowFn(CapturePayloadFull)
 
 	// UPDATE: full before AND full after.
-	if !strings.Contains(ddl, "v_before := to_jsonb(OLD)") {
+	if !strings.Contains(ddl, "v_before := pg_catalog.to_jsonb(OLD)") {
 		t.Errorf("full mode: UPDATE before should be to_jsonb(OLD); ddl=\n%s", ddl)
 	}
-	if !strings.Contains(ddl, "v_after  := to_jsonb(NEW)") {
+	if !strings.Contains(ddl, "v_after  := pg_catalog.to_jsonb(NEW)") {
 		t.Errorf("full mode: UPDATE after should be to_jsonb(NEW)")
 	}
 	// No changed-set diff in full mode.
@@ -389,8 +389,8 @@ func TestCaptureRowFunction_Changed(t *testing.T) {
 	// referencing the cached v_new_json / v_old_json vars (NOT recomputing
 	// to_jsonb each iteration — see TestCaptureRowFunction_CachesToJsonb).
 	for _, want := range []string{
-		"jsonb_object_agg(n.key, n.value)",
-		"jsonb_each(v_new_json) n",
+		"pg_catalog.jsonb_object_agg(n.key, n.value)",
+		"pg_catalog.jsonb_each(v_new_json) n",
 		"(v_old_json -> n.key) IS DISTINCT FROM n.value",
 		"n.key = ANY(v_pk_cols)", // PK union
 	} {
@@ -422,7 +422,7 @@ func TestCaptureRowFunction_Minimal(t *testing.T) {
 	// the OLD-PK projection (a PK-changing UPDATE must still locate the
 	// target by its OLD PK — using the NEW PK would silently lose the
 	// update); DELETE before is v_pk (also the OLD PK).
-	if !strings.Contains(ddl, "v_before   := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_old_json) WHERE key = ANY(v_pk_cols))") {
+	if !strings.Contains(ddl, "v_before   := (SELECT pg_catalog.jsonb_object_agg(key, value) FROM pg_catalog.jsonb_each(v_old_json) WHERE key = ANY(v_pk_cols))") {
 		t.Errorf("minimal mode: UPDATE before must be the OLD-PK projection of cached v_old_json (PK-changing-UPDATE correctness); ddl=\n%s", ddl)
 	}
 	if n := strings.Count(ddl, "v_before := v_pk"); n != 1 {
@@ -432,9 +432,9 @@ func TestCaptureRowFunction_Minimal(t *testing.T) {
 	// the `changed`/`full` shape, defeating the source-write saving).
 	// Note: the OLD-PK *projection* references to_jsonb(OLD) inside a
 	// jsonb_each(...) — that is fine; what must be absent is the whole-row
-	// assignment `v_before := to_jsonb(OLD);`.
-	if strings.Contains(ddl, "v_before := to_jsonb(OLD);") {
-		t.Errorf("minimal mode: before must be PK-only, never the full-row `v_before := to_jsonb(OLD);`")
+	// assignment `v_before := pg_catalog.to_jsonb(OLD);`.
+	if strings.Contains(ddl, "v_before := pg_catalog.to_jsonb(OLD);") {
+		t.Errorf("minimal mode: before must be PK-only, never the full-row `v_before := pg_catalog.to_jsonb(OLD);`")
 	}
 }
 
@@ -460,11 +460,11 @@ func TestCaptureRowFunction_CachesToJsonb(t *testing.T) {
 		{CapturePayloadMinimal, true},
 	} {
 		ddl := captureRowFn(c.mode)
-		gotNew := strings.Count(ddl, "v_new_json := to_jsonb(NEW);")
-		gotOld := strings.Count(ddl, "v_old_json := to_jsonb(OLD);")
+		gotNew := strings.Count(ddl, "v_new_json := pg_catalog.to_jsonb(NEW);")
+		gotOld := strings.Count(ddl, "v_old_json := pg_catalog.to_jsonb(OLD);")
 		if c.wantCache {
 			if gotNew != 1 || gotOld != 1 {
-				t.Errorf("%s mode: want exactly one `v_new_json := to_jsonb(NEW);` and one `v_old_json := to_jsonb(OLD);` (cached once per row); got new=%d old=%d; ddl=\n%s",
+				t.Errorf("%s mode: want exactly one `v_new_json := pg_catalog.to_jsonb(NEW);` and one `v_old_json := pg_catalog.to_jsonb(OLD);` (cached once per row); got new=%d old=%d; ddl=\n%s",
 					c.mode, gotNew, gotOld, ddl)
 			}
 		} else {
@@ -487,7 +487,7 @@ func TestCaptureRowFunction_InsertSharedAcrossModes(t *testing.T) {
 			t.Errorf("mode %q: missing shared INSERT branch", m)
 		}
 		// The INSERT after-image is always the full new row.
-		if !strings.Contains(ddl, "v_after  := to_jsonb(NEW);\n        v_before := NULL;") {
+		if !strings.Contains(ddl, "v_after  := pg_catalog.to_jsonb(NEW);\n        v_before := NULL;") {
 			t.Errorf("mode %q: INSERT must write the full new-row image", m)
 		}
 		// Shared scaffold present in every mode. The extra_float_digits

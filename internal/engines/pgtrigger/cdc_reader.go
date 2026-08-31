@@ -179,6 +179,14 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// convention (TestOpenPathProbesDeriveBoundedContexts). Cost: one
 	// EXISTS + one single-row catalog read per stream open.
 	warnDDLDetectionAbsent(ctx, db, cfg.schema)
+	// WARN (never refuse) when the installed capture functions predate the
+	// SEC-1 fix — SECURITY DEFINER with no pinned search_path, which on the
+	// superuser-owned DDL capture function is a privilege-escalation any
+	// unprivileged user can trigger with one CREATE TABLE. Upgrading the
+	// binary does not replace an installed function; only a `trigger setup`
+	// re-run does. WARN rather than refuse so the upgrade does not strand
+	// running syncs — the reasoning is recorded on the door itself.
+	warnInsecureCaptureFunctions(ctx, db, cfg.schema)
 	return &CDCReader{
 		db:           db,
 		schema:       cfg.schema,
