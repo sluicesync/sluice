@@ -170,7 +170,7 @@ if ($LASTEXITCODE -ne 0) {
 # the whole local gate and failed only in CI. $shExe is Git-for-Windows'
 # bash (see the header), so the bash-only here-strings in
 # check-leg-nonvacuity-coverage run correctly.
-foreach ($g in @('check-skills-flags', 'check-schedule-consumers', 'check-leg-nonvacuity-coverage', 'check-dialect-translator-roster', 'check-local-gate-parity')) {
+foreach ($g in @('check-skills-flags', 'check-schedule-consumers', 'check-leg-nonvacuity-coverage', 'check-dialect-translator-roster', 'check-local-gate-parity', 'check-notes-claims-selftest')) {
     & $shExe "scripts/$g.sh"
     if ($LASTEXITCODE -ne 0) {
         Red "$g failed (a CI Lint-job guard)."

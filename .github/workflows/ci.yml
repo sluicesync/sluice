@@ -829,6 +829,18 @@ jobs:
       - name: check local-gate parity
         run: bash scripts/check-local-gate-parity.sh
 
+      # The notes-claims publish gate's own gate (audit 2026-08-31 T-1).
+      # check-notes-claims.sh shipped self-referential — it greped the whole
+      # tag tree including the release-notes file it was grading, so every
+      # claimed identifier satisfied itself and the gate structurally could
+      # not fail for its own class. This self-test builds throwaway tags
+      # whose notes+CHANGELOG are COMMITTED IN THE TAG (the shape the real
+      # release flow produces) and asserts both directions on every leg. It
+      # runs on every PR, not only on tags, because the gate's correctness
+      # is a property of the script, not of any particular release.
+      - name: check notes-claims gate self-test
+        run: bash scripts/check-notes-claims-selftest.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
@@ -861,6 +873,38 @@ jobs:
           # Fail the job on any issue. Combined with branch protection
           # this means you can't merge until lint is clean.
           args: --timeout=5m
+
+      # ----- the notes-claims gate itself, on TAG pushes only -----
+      # Publish sub-check 4b (CLAUDE.md) used to be a purely manual step: the
+      # audit found `grep -rn check-notes-claims` hit no workflow and no hook,
+      # so the only mechanical defense against "the notes claim code the tag
+      # does not carry" was a human remembering to run a script. It is real
+      # here because a tag push is the one event where both halves exist —
+      # the tag, and the notes archive committed in the release commit
+      # (present at 25/25 of the last 25 tags).
+      #
+      # A failure here fails the Lint job, which fails the `ci.yml`-on-the-tag
+      # run, which is publish check 2 — so a release whose notes outrun its
+      # tree cannot pass the publish gate. The step deliberately REQUIRES the
+      # archive: a release tag with no `docs/releases/release-notes-<tag>.md`
+      # fails loudly rather than skipping, because a silent skip here is the
+      # same vacuous green the gate exists to prevent. Non-release tags
+      # (anything that is not vMAJOR.MINOR.PATCH) skip with a notice.
+      - name: check release-notes claims against the tag tree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            *-*) echo "::notice::notes-claims: $TAG is a pre-release tag — skipping."; exit 0 ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::notice::notes-claims: $TAG is not a release tag — skipping."; exit 0 ;;
+          esac
+          # actions/checkout fetches the tagged commit; make sure the tag REF
+          # itself resolves, since the script grades `<tag>`'s tree by name.
+          if ! git rev-parse -q --verify "$TAG^{commit}" >/dev/null; then
+            git fetch --depth=1 --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          fi
+          sh scripts/check-notes-claims.sh "$TAG" "docs/releases/release-notes-$TAG.md"
 
   # ----- govulncheck -----
   # Reachability-based vulnerability scanning: unlike Dependabot alerts

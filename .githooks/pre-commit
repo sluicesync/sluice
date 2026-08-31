@@ -94,10 +94,15 @@ fi
 # gate and fail only in CI, breaking the "pre-commit runs everything CI
 # runs" contract. Two of them (schedule-consumers, leg-nonvacuity-coverage)
 # inspect workflow YAML that a Go-only gate would never see, which is
-# exactly why they sit ABOVE the Go-staged early return. Invoked via `bash`
+# exactly why they sit ABOVE the Go-staged early return — and so does
+# check-notes-claims-selftest, for the sharpest version of that reason: the
+# thing it guards is a SHELL script, so the commit that breaks it is by
+# definition one with no Go files staged (this guard was first placed below
+# the early return and was unreachable in exactly the case it exists for).
+# Invoked via `bash`
 # (not `sh`): leg-nonvacuity-coverage uses bash-only here-strings, and `sh`
 # is dash on Linux/macOS. All are sub-second grep/git-ls/awk.
-for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity; do
+for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity check-notes-claims-selftest; do
 	if ! bash "scripts/$g.sh"; then
 		red "pre-commit: $g failed (a CI Lint-job guard)."
 		exit 1
