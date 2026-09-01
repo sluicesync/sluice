@@ -1129,7 +1129,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// and is dropped by the scope gate exactly as its row-format
 		// siblings are. See cdc_statement_dml.go for the false-positive
 		// analysis and the stated residue.
-		if handled, err := r.dispatchStatementGuards(q, string(e.Schema)); handled || err != nil {
+		if handled, err := r.dispatchStatementGuards(q, string(e.Schema), ev.Header); handled || err != nil {
 			return err
 		}
 		// Everything below is DDL (TRUNCATE included). DDL IMPLICIT-COMMITS,

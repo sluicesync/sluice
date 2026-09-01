@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -81,14 +82,15 @@ func TestStatementDMLVerb(t *testing.T) {
 }
 
 // TestStatementDMLError pins the refusal's shape: the code, the verb,
-// the scope note, the correlation digest, and — audit 2026-08-27 A4 —
+// the scope note, the payload-free correlation coordinate that replaced
+// the statement digest (audit 2026-08-31 SEC-5), and — audit 2026-08-27 A4 —
 // that the statement's PAYLOAD never reaches the error: the binlog
 // text carries row values (PII) that would bypass --redact by riding
 // the refusal into logs and reports.
 func TestStatementDMLError(t *testing.T) {
 	t.Parallel()
 	long := "INSERT INTO t VALUES ('alice@example.com','555-0100')" + strings.Repeat(",(1)", 200)
-	err := statementDMLError("INSERT", "app", long)
+	err := statementDMLError("INSERT", "app", "ends at binlog mysql-bin.000004:9182", long)
 	ce, ok := sluicecode.FromError(err)
 	if !ok || ce.Code != sluicecode.CodeCDCStatementDML {
 		t.Fatalf("want %s; got %T: %v", sluicecode.CodeCDCStatementDML, err, err)
@@ -96,8 +98,8 @@ func TestStatementDMLError(t *testing.T) {
 	msg := err.Error()
 	for _, phrase := range []string{
 		"INSERT", `"app"`, "…", "binlog_format", "silently dropping",
-		"INSERT INTO t VALUES", // the sanitized lead: verb + table stay diagnostic
-		"sha256",               // the correlation digest is named
+		"INSERT INTO t VALUES",                 // the sanitized lead: verb + table stay diagnostic
+		"ends at binlog mysql-bin.000004:9182", // the payload-free correlation coordinate
 	} {
 		if !strings.Contains(msg, phrase) {
 			t.Errorf("message missing %q; got: %v", phrase, msg)
@@ -122,26 +124,80 @@ func TestStatementDMLError(t *testing.T) {
 		t.Errorf("hint = %q; want the performance_schema precondition + the MariaDB fallback (audit 2026-08-27 A6)", ce.Hint)
 	}
 
+	// The digest is GONE (audit 2026-08-31 SEC-5): a recomputable
+	// sha256 prefix over the statement text is an oracle for a
+	// low-entropy withheld value, and its only user already holds the
+	// plaintext. Pinned as an absence so a "restore the correlation
+	// aid" edit has to read the rationale first.
+	for _, gone := range []string{"sha256", "digest"} {
+		if strings.Contains(msg, gone) || strings.Contains(ce.Hint, gone) {
+			t.Errorf("refusal still carries %q: the statement-text digest is a brute-force oracle for the "+
+				"value it stands in for; the binlog coordinate replaced it (see statementDMLError)", gone)
+		}
+	}
+
 	// The WITH verb names its class: "a WITH statement" alone would leave
 	// the operator guessing what a read-only-looking keyword is doing in
 	// a refusal about DML.
-	withMsg := statementDMLError("WITH", "app", "WITH x AS (SELECT id FROM t) UPDATE t SET v = 1").Error()
+	withMsg := statementDMLError("WITH", "app", "gtid 6a3175a8-…:9", "WITH x AS (SELECT id FROM t) UPDATE t SET v = 1").Error()
 	if !strings.Contains(withMsg, "CTE-DML") {
 		t.Errorf("WITH refusal does not name CTE-DML; got: %v", withMsg)
 	}
 }
 
+// TestStatementDMLLocator pins the payload-free correlation coordinate
+// in its three reachable shapes — file/pos with the ROTATE seen, GTID
+// mode before any ROTATE, and a nil header — and, load-bearingly, that
+// none of them is a function of the statement's bytes.
+func TestStatementDMLLocator(t *testing.T) {
+	t.Parallel()
+
+	r := &CDCReader{currentFile: "mysql-bin.000007"}
+	got := r.statementDMLLocator(&replication.EventHeader{LogPos: 4210, Timestamp: 1767225600})
+	for _, want := range []string{"ends at binlog mysql-bin.000007:4210", "committed 2026-01-01T00:00:00Z"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("locator = %q; want it to contain %q", got, want)
+		}
+	}
+
+	// GTID mode: no ROTATE seen yet, so no file name — the position and
+	// the staged GTID still locate the event.
+	g := &CDCReader{pendingGTID: "6a3175a8-0000-0000-0000-000000000000:7"}
+	got = g.statementDMLLocator(&replication.EventHeader{LogPos: 812})
+	for _, want := range []string{"ends at binlog position 812", "gtid 6a3175a8-0000-0000-0000-000000000000:7"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gtid-mode locator = %q; want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "committed") {
+		t.Errorf("gtid-mode locator = %q; a zero header timestamp must not render as an epoch commit time", got)
+	}
+
+	if none := (&CDCReader{}).statementDMLLocator(nil); none != "no binlog coordinate available" {
+		t.Errorf("empty locator = %q; want the explicit unavailable string, never a misleading zero", none)
+	}
+}
+
 // TestStatementDMLLead pins the sanitizer's cut rule in both
-// directions: cut before the first string-literal quote or paren
-// (whichever comes first), keep the verb + table, cap the length.
+// directions: cut at the first token that is not identifier material,
+// keep the verb + table + leading column name, cap the length.
 func TestStatementDMLLead(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct{ in, want string }{
 		"paren_first":            {"INSERT INTO t VALUES (1,'x')", "INSERT INTO t VALUES…"},
 		"single_quote_first":     {"UPDATE t SET v = 'secret' WHERE id = 9", "UPDATE t SET v…"},
 		"double_quote_first":     {`DELETE FROM t WHERE v = "secret"`, "DELETE FROM t WHERE v…"},
-		"no_assignments":         {"DELETE FROM t WHERE id IS NULL", "DELETE FROM t WHERE id IS NULL"},
 		"numeric_literal_eq_cut": {"UPDATE t SET ssn=078051120", "UPDATE t SET ssn…"},
+		// The four shapes the blocklist cut missed (audit 2026-08-31
+		// SEC-5): none contains a quote, paren, or `=`.
+		"gt_unquoted_numeric":  {"DELETE FROM patients WHERE ssn > 078051120", "DELETE FROM patients WHERE ssn…"},
+		"between_range":        {"DELETE FROM patients WHERE mrn BETWEEN 4820113 AND 4820119", "DELETE FROM patients WHERE mrn BETWEEN…"},
+		"not_equal_angle":      {"DELETE FROM users WHERE ssn <> 078051120", "DELETE FROM users WHERE ssn…"},
+		"bare_keyword_literal": {"DELETE FROM t WHERE id IS NULL", "DELETE FROM t WHERE id IS…"},
+		// Names survive: a qualified, backticked table is the diagnostic
+		// half and is a NAME by MySQL's grammar, never a value.
+		"qualified_backticked": {"UPDATE `app`.`patients` SET ssn = 1", "UPDATE `app`.`patients` SET ssn…"},
+		"no_literals_at_all":   {"DELETE FROM t", "DELETE FROM t"},
 		"cap": {
 			"UPDATE " + strings.Repeat("very_long_table_name_", 10) + " SET a = b",
 			"UPDATE " + strings.Repeat("very_long_table_name_", 10)[:statementDMLEchoCap-len("UPDATE ")] + "…",
@@ -151,6 +207,116 @@ func TestStatementDMLLead(t *testing.T) {
 		if got := statementDMLLead(tc.in); got != tc.want {
 			t.Errorf("%s: statementDMLLead(%q) = %q; want %q", name, tc.in, got, tc.want)
 		}
+	}
+}
+
+// statementDMLPredicateOperators is the operator half of the redaction
+// family matrix. It is deliberately the whole comparison/range family
+// rather than a representative (the Bug 74 lesson applied to a
+// redactor): the shipped blocklist cut kept its promise for `=` — the
+// one member anyone pinned — and broke it for every other member, which
+// is exactly what a per-representative pin cannot see.
+//
+// The word operators are here for the same reason as the punctuation
+// ones: they do not cut themselves, so a cell only passes if the
+// OPERAND after them cuts.
+var statementDMLPredicateOperators = map[string]string{
+	"eq":      "ssn = %s",
+	"gt":      "ssn > %s",
+	"lt":      "ssn < %s",
+	"gte":     "ssn >= %s",
+	"lte":     "ssn <= %s",
+	"ne":      "ssn <> %s",
+	"bang_ne": "ssn != %s",
+	"between": "ssn BETWEEN %s AND %s",
+	"in":      "ssn IN (%s)",
+	"like":    "ssn LIKE %s",
+	"is":      "ssn IS %s",
+}
+
+// statementDMLLiteralKinds is the literal half: every lexical form a
+// MySQL value can take, each paired with the token that must NOT
+// survive into the refusal. `secret` is a substring of the rendered
+// literal, so a cell is only meaningful if the raw statement contains
+// it — asserted below as the anti-vacuity floor.
+var statementDMLLiteralKinds = map[string]struct{ literal, secret string }{
+	"quoted_string":    {"'078051120'", "078051120"},
+	"unquoted_numeric": {"078051120", "078051120"},
+	"hex":              {"0x4D7953514C", "4D7953514C"},
+	"bit":              {"b'01001101'", "01001101"},
+	"null":             {"NULL", "NULL"},
+	"boolean":          {"TRUE", "TRUE"},
+}
+
+// TestStatementDMLLeadFamilyMatrix is the class pin for the "values
+// withheld" promise: EVERY comparison/range operator family × EVERY
+// literal kind, asserting no literal token survives into the echoed
+// lead while the diagnostic prefix (verb, table, column) does.
+//
+// Some cells are not valid SQL (`ssn IS 0x4D…`). They are included
+// deliberately: the redactor is a lexer over whatever the server
+// logged, and a promise that holds only for grammatical input is not a
+// promise. The cut must be decided by the token shape, not by whether
+// the statement would parse.
+func TestStatementDMLLeadFamilyMatrix(t *testing.T) {
+	t.Parallel()
+
+	const wantPrefix = "DELETE FROM patients WHERE ssn"
+	cells := 0
+	for opName, opFmt := range statementDMLPredicateOperators {
+		for litName, lit := range statementDMLLiteralKinds {
+			name := opName + "/" + litName
+			args := []any{lit.literal}
+			if strings.Count(opFmt, "%s") == 2 { // BETWEEN takes two operands
+				args = append(args, lit.literal)
+			}
+			query := "DELETE FROM patients WHERE " + fmt.Sprintf(opFmt, args...)
+
+			// Anti-vacuity, per cell: the secret must actually be in the
+			// input, or "the lead does not contain it" proves nothing.
+			if !strings.Contains(query, lit.secret) {
+				t.Fatalf("%s: the cell's own statement %q does not contain the secret %q — the assertion "+
+					"below would pass vacuously", name, query, lit.secret)
+			}
+
+			lead := statementDMLLead(query)
+			if strings.Contains(lead, lit.secret) {
+				t.Errorf("%s: statementDMLLead(%q) = %q — the %s literal survived into the refusal, which "+
+					"the refusal's own text promises it will not (\"values withheld\"). Binlog statement "+
+					"text carries row values; a value that rides the refusal into logs and reports bypasses "+
+					"--redact entirely.", name, query, lead, litName)
+			}
+			// The other direction: a redactor that returned "" would pass
+			// every check above. The diagnostic prefix must survive.
+			if !strings.HasPrefix(lead, wantPrefix) {
+				t.Errorf("%s: statementDMLLead(%q) = %q; want it to keep the diagnostic prefix %q — verb, "+
+					"table and column are what make the refusal actionable", name, query, lead, wantPrefix)
+			}
+			cells++
+		}
+	}
+
+	// Anti-vacuity floor. A cell count compared against the product of
+	// the two tables is SELF-REFERENTIAL — both sides shrink together —
+	// so the floor names the families instead: dropping `>` from the
+	// operator table must fail here by name, because "the pin covered
+	// the one operator someone thought of" is the exact defect this
+	// matrix exists for. (Caught by the mutation run: an earlier
+	// `cells != len(ops)*len(lits) || cells < 60` form passed happily
+	// with `>` deleted.)
+	for _, op := range []string{"eq", "gt", "lt", "gte", "lte", "ne", "bang_ne", "between", "in", "like", "is"} {
+		if _, ok := statementDMLPredicateOperators[op]; !ok {
+			t.Errorf("the operator family %q is missing from statementDMLPredicateOperators — the matrix has "+
+				"narrowed back toward a representative", op)
+		}
+	}
+	for _, lit := range []string{"quoted_string", "unquoted_numeric", "hex", "bit", "null", "boolean"} {
+		if _, ok := statementDMLLiteralKinds[lit]; !ok {
+			t.Errorf("the literal kind %q is missing from statementDMLLiteralKinds", lit)
+		}
+	}
+	if cells < 66 {
+		t.Fatalf("exercised %d cells; want the full 11 operator families x 6 literal kinds", cells)
 	}
 }
 

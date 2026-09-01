@@ -4,10 +4,11 @@
 package mysql
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/go-mysql-org/go-mysql/replication"
 
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -157,7 +158,7 @@ func isKeywordByte(c byte) bool {
 // default database — schema, "" = none selected — is in the stream's
 // scope). (false, nil) falls through to the generic-DDL arm, whose own
 // cache clear is gated on the same scope condition.
-func (r *CDCReader) dispatchStatementGuards(q, schema string) (handled bool, err error) {
+func (r *CDCReader) dispatchStatementGuards(q, schema string, hdr *replication.EventHeader) (handled bool, err error) {
 	if handled, err := r.dispatchXAStatement(q); handled || err != nil {
 		return handled, err
 	}
@@ -168,32 +169,64 @@ func (r *CDCReader) dispatchStatementGuards(q, schema string) (handled bool, err
 	if schema != "" && !r.databaseInScope(schema) {
 		return false, nil
 	}
-	return false, statementDMLError(verb, schema, q)
+	return false, statementDMLError(verb, schema, r.statementDMLLocator(hdr), q)
+}
+
+// statementDMLLocator renders the payload-free coordinate the refusal
+// carries in place of the old sha256 prefix (see [statementDMLError]
+// for why): where the offending event sits in the binlog, when it was
+// committed, and — in GTID mode — the transaction it belongs to. Every
+// component is stream metadata, so none of it is a function of the
+// statement's bytes.
+//
+// Each component is best-effort and named only when known: currentFile
+// is empty until the dump's opening ROTATE arrives, and pendingGTID is
+// empty in file/pos mode and between transactions.
+func (r *CDCReader) statementDMLLocator(hdr *replication.EventHeader) string {
+	parts := make([]string, 0, 3)
+	if hdr != nil {
+		if r.currentFile != "" {
+			parts = append(parts, fmt.Sprintf("ends at binlog %s:%d", r.currentFile, hdr.LogPos))
+		} else {
+			parts = append(parts, fmt.Sprintf("ends at binlog position %d", hdr.LogPos))
+		}
+		if ts := binlogEventCommitTime(hdr); !ts.IsZero() {
+			parts = append(parts, "committed "+ts.UTC().Format(time.RFC3339))
+		}
+	}
+	if r.pendingGTID != "" {
+		parts = append(parts, "gtid "+r.pendingGTID)
+	}
+	if len(parts) == 0 {
+		return "no binlog coordinate available"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // statementDMLEchoCap bounds the sanitized leading text carried on the
 // refusal.
 const statementDMLEchoCap = 80
 
+// bareLiteralKeywords are the only MySQL literals that lex as plain
+// words, so they are the only ones [statementDMLCut]'s identifier
+// allowlist would otherwise carry through. Enumerated rather than
+// derived because MySQL's grammar has exactly these four.
+var bareLiteralKeywords = map[string]bool{
+	"NULL":    true,
+	"TRUE":    true,
+	"FALSE":   true,
+	"UNKNOWN": true,
+}
+
 // statementDMLLead returns the diagnostic prefix of a row-DML
-// statement, cut BEFORE the first string-literal quote, opening paren,
-// or `=` — whichever comes first — and capped at statementDMLEchoCap
-// bytes. The verb, table name, and leading column name (which precede
-// the first paren, literal, or assignment in every DML shape) are
-// diagnostic; the VALUES are not, and must never reach the error
-// (audit 2026-08-27 A4: the binlog text carries row values — PII that
-// would bypass --redact by riding the refusal into logs and reports).
-// The `=` cut is what keeps UNQUOTED numeric literals (`SET
-// ssn=078051120`) out too — a quote/paren-only cut let them survive
-// within the cap.
+// statement, cut at the first token that is not identifier material
+// (see [statementDMLCut]) and capped at statementDMLEchoCap bytes. The
+// verb, table name, and leading column name are diagnostic; the VALUES
+// are not, and must never reach the error (audit 2026-08-27 A4: the
+// binlog text carries row values — PII that would bypass --redact by
+// riding the refusal into logs and reports).
 func statementDMLLead(query string) string {
-	cut := len(query)
-	for i := 0; i < len(query); i++ {
-		if c := query[i]; c == '\'' || c == '"' || c == '(' || c == '=' {
-			cut = i
-			break
-		}
-	}
+	cut := statementDMLCut(query)
 	lead := strings.TrimRight(query[:cut], " \t\r\n")
 	if len(lead) > statementDMLEchoCap {
 		lead = lead[:statementDMLEchoCap]
@@ -204,20 +237,132 @@ func statementDMLLead(query string) string {
 	return lead
 }
 
+// statementDMLCut returns the byte offset at which the echoed lead must
+// stop: the start of the first token that is not an identifier, a
+// keyword, or a name separator.
+//
+// This is an ALLOWLIST over MySQL's lexical grammar, and that is the
+// load-bearing property (audit 2026-08-31 SEC-5 / A-4). The shipped
+// v0.132.2 form was a blocklist — cut at the first `'`, `"`, `(` or `=`
+// — which is a set of delimiters that HAPPEN to precede a value in the
+// shapes anyone thought to test. It kept its promise for `SET ssn=…`
+// and broke it for every other comparison: `WHERE ssn > 078051120`,
+// `WHERE mrn BETWEEN 4820113 AND 4820119`, `WHERE ssn <> …` contain
+// none of the four characters, so the row value rode the refusal into
+// operator logs intact. Enumerating `> < >= <= <> !=` would have closed
+// those and left the next unlisted operator open; inverting the test
+// closes the class.
+//
+// Allowed, and nothing else:
+//
+//   - whitespace, `.` and `,` — name qualification and list separators;
+//     no MySQL value is spelled with them alone;
+//   - a backtick-quoted identifier (with the “ “ “ escape) — MySQL's
+//     only identifier quote, so its contents are a NAME by the grammar,
+//     never a value;
+//   - a bare word `[A-Za-z_$][A-Za-z0-9_$]*` that is not one of
+//     [bareLiteralKeywords].
+//
+// Why that is complete for MySQL's grammar: every literal form either
+// begins with a character outside the allowed set — `'…'` / `"…"`
+// (string), a digit or `.`-digit (decimal, float, `0x…` hex, `0b…`
+// bit), the quote inside an introduced literal (`X'…'`, `b'…'`,
+// `_utf8'…'`, `N'…'`, `DATE '…'`, `{d '…'}`), the digit in an
+// `INTERVAL 3 DAY`, `?` for a placeholder, `@` for a user variable — or
+// it is one of the four bare keyword literals, which are enumerated.
+// And every OPERATOR built from punctuation (`= <=> > >= < <= <> != :=
+// + - * / % ^ | & ~ << >> ! && || -> ->>`) falls outside the allowed
+// set by construction, so the comparison family is spanned rather than
+// listed. The WORD operators (`AND OR NOT XOR LIKE RLIKE REGEXP IN
+// BETWEEN IS DIV MOD SOUNDS MEMBER OF`) deliberately do NOT cut: they
+// carry no value themselves, and the operand that follows one is what
+// cuts — `BETWEEN 4820113` cuts at the digit, `IN (…)` at the paren,
+// `LIKE 'a%'` at the quote, `IS NULL` at the keyword literal.
+//
+// The cost is small and stated: `WHERE id IS NULL` now renders as
+// `… WHERE id IS…`. A value is a value even when it is `NULL`, and the
+// column name — the diagnostic half — is upstream of the cut.
+func statementDMLCut(query string) int {
+	i := 0
+	for i < len(query) {
+		switch c := query[i]; {
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '.' || c == ',':
+			i++
+		case c == '`':
+			end := backtickIdentEnd(query, i)
+			if end < 0 {
+				return i // unterminated: nothing past it is provably a name
+			}
+			i = end
+		case isKeywordByte(c) || c == '$':
+			start := i
+			for i < len(query) && (isKeywordByte(query[i]) || query[i] == '$' || (query[i] >= '0' && query[i] <= '9')) {
+				i++
+			}
+			if bareLiteralKeywords[strings.ToUpper(query[start:i])] {
+				return start
+			}
+		default:
+			// A digit-initial token (every unquoted numeric, hex and bit
+			// literal), a quote, an operator character, a paren — cut.
+			return i
+		}
+	}
+	return len(query)
+}
+
+// backtickIdentEnd returns the offset just past the backtick-quoted
+// identifier starting at query[i], or -1 when it is unterminated. A
+// doubled backtick is an escaped backtick within the identifier.
+func backtickIdentEnd(query string, i int) int {
+	j := i + 1
+	for {
+		k := strings.IndexByte(query[j:], '`')
+		if k < 0 {
+			return -1
+		}
+		j += k + 1
+		if j < len(query) && query[j] == '`' {
+			j++ // escaped backtick; keep scanning
+			continue
+		}
+		return j
+	}
+}
+
 // statementDMLError builds the coded, stream-fatal refusal for a
 // row-DML statement arriving as query text. schema is the QueryEvent's
-// session default database ("" when none was selected). The statement
-// itself is identified by verb + byte length + a sha256 prefix of the
-// full text (enough for the operator to correlate with their own query
-// log) plus the sanitized lead from [statementDMLLead] — never the
-// payload.
-func statementDMLError(verb, schema, query string) error {
+// session default database ("" when none was selected); locator is the
+// payload-free binlog coordinate from
+// [CDCReader.statementDMLLocator]. The statement is identified by verb
+// + byte length + that coordinate plus the sanitized lead from
+// [statementDMLLead] — never the payload.
+//
+// The correlation aid is deliberately the COORDINATE and not a digest
+// of the statement text (audit 2026-08-31 SEC-5). The refusal carried
+// `sha256(query)[:4]` for the operator to recompute against their own
+// query log — but that recomputation IS a brute-force oracle: against a
+// known statement template with one low-entropy unknown (a 9-digit
+// national identifier is ~10^9 candidates over 2^32 buckets) the prefix
+// usually determines the withheld value uniquely for anyone holding the
+// log. Lengthening it makes that strictly worse; truncating it further
+// weakens the oracle and the correlation together; salting it
+// per-process removes the oracle by removing the use case, since the
+// operator can no longer recompute it and the refusal is stream-fatal
+// so there is exactly one per process to correlate internally. The
+// asymmetry that settles it: anyone who CAN recompute the digest
+// already holds the query log containing the plaintext, so it gave the
+// legitimate user nothing they did not have and gave a log-only reader
+// the value. The binlog file/position, event timestamp and GTID
+// identify the statement exactly, are directly usable against
+// mysqlbinlog, and are functions of the stream rather than of the
+// bytes — so they cannot be inverted at all.
+func statementDMLError(verb, schema, locator, query string) error {
 	if verb == "WITH" {
 		// Name the class, not just the token: the WITH entry exists for
 		// statement-format CTE-DML (file comment).
 		verb = "WITH-prefixed (CTE-DML)"
 	}
-	digest := sha256.Sum256([]byte(query))
 	where := "with no default database selected"
 	if schema != "" {
 		where = fmt.Sprintf("(session default database %q)", schema)
@@ -230,8 +375,9 @@ func statementDMLError(verb, schema, query string) error {
 			"SHOW PROCESSLIST and interrogate candidate sessions), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh "+
 			"(--restart-from-scratch) — the statement-logged writes are only recoverable by re-snapshot",
 		fmt.Errorf(
-			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s (%d bytes, sha256 %s, "+
-				"leading text %q; values withheld — correlate via the digest against your own query log) — "+
+			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s (%d bytes, %s, "+
+				"leading text %q; values withheld — locate the statement by that binlog coordinate, e.g. "+
+				"mysqlbinlog against your own server) — "+
 				"under ROW logging DML is written as row events, so statement text here is proof a writing "+
 				"session overrode binlog_format to STATEMENT/MIXED (or this resume is replaying a segment "+
 				"recorded before the global was set to ROW). sluice deliberately never executes replayed SQL "+
@@ -240,7 +386,7 @@ func statementDMLError(verb, schema, query string) error {
 				"it), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh: a resume would "+
 				"deterministically re-refuse at this same event, and only a fresh snapshot recopies the "+
 				"statement-logged writes",
-			verb, where, len(query), hex.EncodeToString(digest[:4]), statementDMLLead(query),
+			verb, where, len(query), locator, statementDMLLead(query),
 		),
 	)
 }
