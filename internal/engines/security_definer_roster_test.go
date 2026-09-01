@@ -47,7 +47,9 @@ import (
 // assembled from fragments too far apart for the literal scan (none today:
 // all three emitters spell the whole CREATE in one function), SQL read from
 // a config/manifest and executed verbatim (covered instead by the
-// single-statement door, SLUICE-E-DDL-EMIT-MULTI-STATEMENT), and functions
+// single-statement door, SLUICE-E-DDL-EMIT-MULTI-STATEMENT) — note "all
+// three emitters" became four when the D-1 sql_drop arm landed and each
+// still spells its whole CREATE in one function — and functions
 // already installed on a database by an OLDER sluice — a source file cannot
 // see those, which is exactly why pgtrigger carries the runtime
 // warnInsecureCaptureFunctions door as well. The floor below fails if the
@@ -107,10 +109,11 @@ func TestNoUnpinnedSecurityDefinerEmitters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walk %s: %v", repoRoot, err)
 	}
-	// Anti-vacuity floor: the three pgtrigger capture-function renderers.
-	// A walker that stops seeing them grades nothing while reporting green.
-	if len(found) < 3 {
-		t.Fatalf("derived only %d SECURITY DEFINER emitter(s) %v (floor 3: the pgtrigger row/truncate/DDL capture "+
+	// Anti-vacuity floor: the four pgtrigger capture-function renderers
+	// (row, truncate, ddl_command_end, and the D-1 sql_drop arm). A walker
+	// that stops seeing them grades nothing while reporting green.
+	if len(found) < 4 {
+		t.Fatalf("derived only %d SECURITY DEFINER emitter(s) %v (floor 4: the pgtrigger row/truncate/DDL/drop capture "+
 			"renderers) — the walker stopped seeing the emitters this gate exists to grade", len(found), sortedDefinerEmitters(found))
 	}
 }

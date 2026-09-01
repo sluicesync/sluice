@@ -83,12 +83,33 @@ type installedCaptureTrigger struct {
 	tgtype  int16
 }
 
-// eventTriggerState is the pg_event_trigger row for the DDL capture trigger
-// (zero value = absent).
+// eventTriggerState is the pg_event_trigger row for one capture event
+// trigger (zero value = absent).
 type eventTriggerState struct {
 	present bool
 	enabled string // pg_event_trigger.evtenabled: same domain as tgenabled
 	fn      string
+}
+
+// eventTier is one of the §7 DDL tier's two event-trigger arms. Each is
+// graded independently and each is EXEMPT when its own function is absent
+// — that is what keeps a polled-fingerprint install (no functions at all)
+// and a pre-v0.135 install (no sql_drop arm) from false-refusing. The
+// pairing is the door's independent evidence: setup creates a tier's
+// function and its event trigger in the same canEventTrigger branch, so
+// "function present, trigger absent" proves a manual DROP EVENT TRIGGER.
+type eventTier struct {
+	fn      string // proname setup installs
+	trigger string // evtname setup installs
+	watches string // what the arm records, for the message
+}
+
+// eventTierRoster is the two arms, in the order setup renders them. A
+// third arm added to renderSetupDDL and not added here is what the
+// capture-tier roster gate (capture_tier_roster_test.go) fails on.
+var eventTierRoster = []eventTier{
+	{fn: CaptureFunctionDDL, trigger: CaptureTriggerDDL, watches: "source-side ALTER/CREATE DDL"},
+	{fn: CaptureFunctionDrop, trigger: CaptureTriggerDrop, watches: "a DROP of a captured table"},
 }
 
 // verifyCaptureTriggerShape is the door's entry point: load the installed
@@ -105,11 +126,11 @@ func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, c
 	if err != nil {
 		return captureShapeProbeError(ctx, pctx, "installed capture triggers", err)
 	}
-	ddlFnPresent, evt, err := loadDDLCaptureState(pctx, db, schema)
+	ddl, err := loadDDLCaptureState(pctx, db, schema)
 	if err != nil {
 		return captureShapeProbeError(ctx, pctx, "DDL capture event-trigger state", err)
 	}
-	return gradeCaptureShape(schema, installed, ddlFnPresent, evt, captureReplicated)
+	return gradeCaptureShape(schema, installed, ddl, captureReplicated)
 }
 
 // captureShapeProbeError shapes the door's fail-closed refusal for a
@@ -157,11 +178,32 @@ SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, t.tgtype
 	return out, rows.Err()
 }
 
-// loadDDLCaptureState reads the two halves of the event-trigger tier's
-// evidence: whether the schema carries the DDL capture function (the
-// setup-time proof an event-trigger install was made), and the
-// pg_event_trigger row for the DDL trigger, if any.
-func loadDDLCaptureState(ctx context.Context, db *sql.DB, schema string) (ddlFnPresent bool, evt eventTriggerState, err error) {
+// ddlCaptureState is the event-trigger tier's installed evidence, per arm:
+// which capture FUNCTIONS the schema carries (the setup-time proof that
+// arm was installed) and the pg_event_trigger row for each arm's trigger.
+type ddlCaptureState struct {
+	fnPresent map[string]bool              // proname → present
+	triggers  map[string]eventTriggerState // evtname → row (absent = zero value)
+}
+
+// anyFnPresent reports whether ANY capture function of the event-trigger
+// tier exists — the "this is not a polled-fingerprint install" signal.
+func (s ddlCaptureState) anyFnPresent() bool {
+	for _, present := range s.fnPresent {
+		if present {
+			return true
+		}
+	}
+	return false
+}
+
+// loadDDLCaptureState reads both halves of the event-trigger tier's
+// evidence for every arm in [eventTierRoster].
+func loadDDLCaptureState(ctx context.Context, db *sql.DB, schema string) (ddlCaptureState, error) {
+	out := ddlCaptureState{
+		fnPresent: map[string]bool{},
+		triggers:  map[string]eventTriggerState{},
+	}
 	const fnQ = `
 SELECT EXISTS (
     SELECT 1
@@ -170,24 +212,30 @@ SELECT EXISTS (
      WHERE p.proname = $1
        AND n.nspname = $2
 )`
-	if err := db.QueryRowContext(ctx, fnQ, CaptureFunctionDDL, schema).Scan(&ddlFnPresent); err != nil {
-		return false, eventTriggerState{}, err
-	}
 	const evtQ = `
 SELECT e.evtenabled::text, p.proname
   FROM pg_event_trigger e
   JOIN pg_proc          p ON p.oid = e.evtfoid
  WHERE e.evtname = $1`
-	row := db.QueryRowContext(ctx, evtQ, CaptureTriggerDDL)
-	switch err := row.Scan(&evt.enabled, &evt.fn); err {
-	case nil:
-		evt.present = true
-	case sql.ErrNoRows:
-		// absent — the grader decides whether that is a defect
-	default:
-		return false, eventTriggerState{}, err
+	for _, tier := range eventTierRoster {
+		var present bool
+		if err := db.QueryRowContext(ctx, fnQ, tier.fn, schema).Scan(&present); err != nil {
+			return ddlCaptureState{}, err
+		}
+		out.fnPresent[tier.fn] = present
+
+		var evt eventTriggerState
+		switch err := db.QueryRowContext(ctx, evtQ, tier.trigger).Scan(&evt.enabled, &evt.fn); err {
+		case nil:
+			evt.present = true
+		case sql.ErrNoRows:
+			// absent — the grader decides whether that is a defect
+		default:
+			return ddlCaptureState{}, err
+		}
+		out.triggers[tier.trigger] = evt
 	}
-	return ddlFnPresent, evt, nil
+	return out, nil
 }
 
 // gradeCaptureShape is the pure grading half (unit-pinned without a
@@ -199,12 +247,12 @@ SELECT e.evtenabled::text, p.proname
 // and the consumer registry.
 //
 // captureReplicated is the RECORDED intent; the posture match it drives
-// covers the two per-table triggers only. The DDL event trigger is graded
+// covers the two per-table triggers only. The DDL event triggers are graded
 // as before (evtenabled 'O' or 'A' both accept): the opt-in never alters
-// its enablement — logical replication does not replicate DDL, so there is
+// their enablement — logical replication does not replicate DDL, so there is
 // no replicated-writes analogue for the event-trigger tier — and 'A' there
 // changes nothing the tag filter would see differently.
-func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddlFnPresent bool, evt eventTriggerState, captureReplicated bool) error {
+func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl ddlCaptureState, captureReplicated bool) error {
 	byTable := map[string]map[string]installedCaptureTrigger{}
 	for _, it := range installed {
 		m := byTable[it.table]
@@ -317,35 +365,43 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddlFn
 		}
 	}
 
-	// Event-trigger tier. Setup creates the DDL capture function and the
-	// event trigger in the same canEventTrigger branch, so the function is
-	// independent evidence the event trigger was installed — its absence
-	// with the function present proves a manual DROP EVENT TRIGGER. Without
-	// the function this is a polled-fingerprint install: no event trigger
-	// was ever expected, and requiring one would false-refuse every
-	// --allow-polled-fingerprint source (exempt, with this reason).
-	if ddlFnPresent {
+	// Event-trigger tier, arm by arm ([eventTierRoster]). Setup creates each
+	// arm's capture function and its event trigger in the same
+	// canEventTrigger branch, so the function is independent evidence that
+	// arm was installed — its absence with the function present proves a
+	// manual DROP EVENT TRIGGER. Without the function the arm is EXEMPT, and
+	// that exemption carries two populations, not one: a polled-fingerprint
+	// install (no functions at all — requiring an event trigger would
+	// false-refuse every --allow-polled-fingerprint source) and, for the
+	// sql_drop arm only, an install made before v0.135, which never had it.
+	// The second population is not silently tolerated: warnDropCaptureAbsent
+	// WARNs at every open, because "no drop detection" is the D-1 gap.
+	for _, tier := range eventTierRoster {
+		if !ddl.fnPresent[tier.fn] {
+			continue
+		}
+		evt := ddl.triggers[tier.trigger]
 		if !evt.present {
 			return fmt.Errorf(
-				"pgtrigger: the DDL capture function %s.%s exists but event trigger %q is MISSING (DROP EVENT TRIGGER?) — source-side DDL "+
+				"pgtrigger: the capture function %s.%s exists but event trigger %q is MISSING (DROP EVENT TRIGGER?) — %s "+
 					"would go undetected, so a post-DDL capture would silently mis-capture instead of refusing; re-run `sluice trigger setup` to reinstall it",
-				schema, CaptureFunctionDDL, CaptureTriggerDDL,
+				schema, tier.fn, tier.trigger, tier.watches,
 			)
 		}
 		switch evt.enabled {
 		case "O", "A":
-		default: // "D" or "R"
+		case "D", "R":
 			return fmt.Errorf(
-				"pgtrigger: event trigger %q is not enabled for origin sessions (evtenabled=%q) — source-side DDL would go undetected, "+
+				"pgtrigger: event trigger %q is not enabled for origin sessions (evtenabled=%q) — %s would go undetected, "+
 					"so a post-DDL capture would silently mis-capture instead of refusing; ALTER EVENT TRIGGER %s ENABLE, or re-run `sluice trigger setup`",
-				CaptureTriggerDDL, evt.enabled, CaptureTriggerDDL,
+				tier.trigger, evt.enabled, tier.watches, tier.trigger,
 			)
 		}
-		if evt.fn != CaptureFunctionDDL {
+		if evt.fn != tier.fn {
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is bound to function %q, not sluice's %q — it is not what this sluice installs; "+
 					"re-run `sluice trigger setup` to reinstall it",
-				CaptureTriggerDDL, evt.fn, CaptureFunctionDDL,
+				tier.trigger, evt.fn, tier.fn,
 			)
 		}
 	}

@@ -361,11 +361,11 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			r.setErr(classifyPollError(err))
 			return
 		}
-		if b.ddl != "" {
+		if b.ddl != nil {
 			// §7 — refuse-loudly on observed DDL. The polling loop
 			// terminates; the operator runs the drained-model
 			// recovery (ADR-0054 hint).
-			r.setErr(refuseObservedDDL(b.ddl))
+			r.setErr(refuseObservedDDL(*b.ddl))
 			return
 		}
 		for _, ev := range b.events {
@@ -501,10 +501,27 @@ func classifyPollError(err error) error {
 // PURPOSE-BUILT terminal — the opposite of an accidentally-unclassified park —
 // which is why the seterr gate accepts it as-is: routing it through the
 // transient classifier would be strictly wrong (this must never retry).
-func refuseObservedDDL(ddl string) error {
+//
+// A DROPPED captured table gets its own remedy (D-1). The generic hint sends
+// the operator to `sluice migrate`, which reads the SOURCE schema and creates
+// what it finds — it cannot land a drop, and re-running it against a source
+// that no longer has the table would leave the target's copy in place while
+// reporting success. Naming the dropped relation also matters because the
+// marker is the only remaining evidence: by the time this refusal is read the
+// table, and its capture triggers, are gone from the source catalogs.
+func refuseObservedDDL(m ddlMarker) error {
+	if m.droppedRelation != "" {
+		return fmt.Errorf(
+			"pgtrigger: source table %s was DROPPED (%s) — the trigger engine refuses to forward DDL, and a drop is not something `sluice migrate` can land: "+
+				"the target still holds that table's last-synced rows and will keep them forever. Drain the stream (`sluice sync stop --wait`), decide the target's fate for that table "+
+				"(drop it on the target to match the source, or keep it as a deliberate archive), re-run `sluice trigger setup --dsn=<source-dsn> --tables=<the tables that still exist>` on the source, "+
+				"drop the table from the sync's --tables, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+			m.droppedRelation, m.tag,
+		)
+	}
 	return fmt.Errorf(
 		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
-		ddl,
+		m.tag,
 	)
 }
 
@@ -547,11 +564,11 @@ func pollQuery(tableRef string) string {
 // waiting and skipping.
 type pollBatch struct {
 	events  []ir.Change
-	lastID  int64  // end of the contiguous run this poll consumed
-	holeAt  int64  // lowest id > lastID missing from the window (0 = the run reached the window's end)
-	holeEnd int64  // lowest VISIBLE id above holeAt — the row that proves holeAt was allocated
-	seenTo  int64  // highest id observed in this poll's window
-	ddl     string // non-empty → §7 refuse-loudly DDL marker
+	lastID  int64      // end of the contiguous run this poll consumed
+	holeAt  int64      // lowest id > lastID missing from the window (0 = the run reached the window's end)
+	holeEnd int64      // lowest VISIBLE id above holeAt — the row that proves holeAt was allocated
+	seenTo  int64      // highest id observed in this poll's window
+	ddl     *ddlMarker // non-nil → §7 refuse-loudly DDL marker
 }
 
 // poll runs one bounded fetch and consumes the contiguous committed run
@@ -611,7 +628,8 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		commitTime := pgTriggerCommitTime(committed)
 
 		if op == "X" {
-			b.ddl = decodeDDLTag(pkJSON.String)
+			m := decodeDDLMarker(pkJSON.String)
+			b.ddl = &m
 			return b, nil
 		}
 		// Truncate handling.
@@ -796,23 +814,41 @@ func normalizePayloadValue(v any) any {
 	return v
 }
 
-// decodeDDLTag pulls the command_tag from the §7 DDL-marker row's
-// pk_jsonb payload. Returns the empty string when the payload is
-// missing or malformed (defensive — the operator should still see
-// the refusal; we synthesise "DDL" if no tag is recoverable).
-func decodeDDLTag(s string) string {
+// ddlMarkerDroppedRelationKey is the pk_jsonb key the `sql_drop` capture
+// arm writes with the dropped table's identity (audit 2026-08-31 D-1).
+// Its presence is what distinguishes "a captured table is GONE" from
+// every other observed-DDL marker, and it is what selects the
+// drop-specific remedy in [refuseObservedDDL] — the generic remedy
+// ("run `sluice migrate` to land the schema change") cannot land a drop.
+// Both directions of vintage skew are benign: an older reader sees an
+// unknown key and falls back to the generic refusal, and this reader
+// sees the key absent on every pre-v0.135 X row.
+const ddlMarkerDroppedRelationKey = "dropped_relation"
+
+// ddlMarker is the decoded §7 X row: what the source did, and — for the
+// sql_drop arm — which captured relation it destroyed.
+type ddlMarker struct {
+	tag             string // command_tag, or "DDL" when unrecoverable
+	droppedRelation string // non-empty → a CAPTURED table was dropped
+}
+
+// decodeDDLMarker pulls the §7 DDL-marker row's pk_jsonb payload apart.
+// A missing or malformed payload still yields a refusal (defensive — the
+// operator must see it); we synthesise "DDL" if no tag is recoverable.
+func decodeDDLMarker(s string) ddlMarker {
 	if s == "" {
-		return "DDL"
+		return ddlMarker{tag: "DDL"}
 	}
 	dec := json.NewDecoder(bytes.NewBufferString(s))
 	var m map[string]string
 	if err := dec.Decode(&m); err != nil {
-		return "DDL"
+		return ddlMarker{tag: "DDL"}
 	}
-	if tag := m["command_tag"]; tag != "" {
-		return tag
+	out := ddlMarker{tag: m["command_tag"], droppedRelation: m[ddlMarkerDroppedRelationKey]}
+	if out.tag == "" {
+		out.tag = "DDL"
 	}
-	return "DDL"
+	return out
 }
 
 // changeLogTableExists probes for the §2 table on the source. A

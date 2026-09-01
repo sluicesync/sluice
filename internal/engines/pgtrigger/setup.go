@@ -29,6 +29,14 @@ const (
 	CapturePrefixRow   = "sluice_capture_" // for per-table CREATE TRIGGER names
 	CaptureTriggerRow  = "sluice_capture"  // per-table row-trigger name
 	CaptureTriggerDDL  = "sluice_capture_ddl_trg"
+	// CaptureFunctionDrop / CaptureTriggerDrop are the `sql_drop` arm of the
+	// §7 DDL tier (audit 2026-08-31 D-1). A DROP is reported to event
+	// triggers through pg_event_trigger_dropped_objects(), never through
+	// pg_event_trigger_ddl_commands() — see [renderCaptureDropFunction] for
+	// the measured ground truth and why this is a SECOND function rather
+	// than a branch in the ddl_command_end one.
+	CaptureFunctionDrop = "sluice_capture_drop"
+	CaptureTriggerDrop  = "sluice_capture_drop_trg"
 	// CaptureTriggerTruncate / CaptureFunctionTruncate are the per-table
 	// TRUNCATE companion trigger and its FOR EACH STATEMENT function.
 	// Named (rather than the literals renderSetupDDL used to repeat) so
@@ -801,7 +809,14 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// Safe on a fresh install too — plpgsql bodies are only
 		// syntax-checked at CREATE time, so the reference to the
 		// not-yet-created change-log table resolves at first execution.
-		out = append(out, renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef))
+		out = append(
+			out,
+			renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef),
+			// The sql_drop arm (D-1) rides the same ordering rule: it is
+			// created before any statement its own event trigger watches,
+			// and CREATE FUNCTION is not a watched tag either.
+			renderCaptureDropFunction(schema, tableRef(ChangeLogTable), metaRef),
+		)
 	}
 	out = append(
 		out,
@@ -931,16 +946,43 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 	}
 
 	if canEventTrigger {
-		// The DDL capture FUNCTION is the plan's first DDL statement (see
-		// the Bug 257 ordering note above); only the event trigger itself
-		// is (re)created here.
+		// The DDL capture FUNCTIONS are the plan's first DDL statements
+		// (see the Bug 257 ordering note above); only the event triggers
+		// themselves are (re)created here.
+		//
+		// TWO event triggers, because PostgreSQL reports CREATEs/ALTERs
+		// and DROPs through two mutually exclusive context functions
+		// (audit 2026-08-31 D-1; the measurement is on
+		// [renderCaptureDropFunction]):
+		//
+		//   - ddl_command_end + pg_event_trigger_ddl_commands() — the
+		//     recordable tags, which is why 'DROP TABLE' / 'DROP INDEX'
+		//     are NOT in this WHEN list any more. They were there from
+		//     v0.85.0 and could never produce a row, so the list read
+		//     broader than the truth; removing them changes no behaviour
+		//     (measured zero rows either way) and stops the next reader
+		//     believing drops were covered here.
+		//   - sql_drop + pg_event_trigger_dropped_objects() — UNFILTERED
+		//     by tag on purpose: a captured table can also die by
+		//     DROP SCHEMA … CASCADE or DROP OWNED BY, and the
+		//     dropped-object set, not the tag, is what proves a captured
+		//     relation went away. DROP INDEX stays uncaptured by that
+		//     same predicate (no table row), which is deliberate — sluice
+		//     never forwards index DDL, so refusing on it would halt a
+		//     stream for a change that cannot affect a row.
 		out = append(
 			out,
 			"DROP EVENT TRIGGER IF EXISTS "+quoteIdent(CaptureTriggerDDL),
 			fmt.Sprintf(
-				"CREATE EVENT TRIGGER %s ON ddl_command_end WHEN TAG IN ('ALTER TABLE','CREATE TABLE','DROP TABLE','CREATE INDEX','DROP INDEX') EXECUTE FUNCTION %s()",
+				"CREATE EVENT TRIGGER %s ON ddl_command_end WHEN TAG IN ('ALTER TABLE','CREATE TABLE','CREATE INDEX') EXECUTE FUNCTION %s()",
 				quoteIdent(CaptureTriggerDDL),
-				quoteIdent(schema)+"."+quoteIdent(CaptureFunctionDDL),
+				ddlFnRef(schema),
+			),
+			"DROP EVENT TRIGGER IF EXISTS "+quoteIdent(CaptureTriggerDrop),
+			fmt.Sprintf(
+				"CREATE EVENT TRIGGER %s ON sql_drop EXECUTE FUNCTION %s()",
+				quoteIdent(CaptureTriggerDrop),
+				dropFnRef(schema),
 			),
 		)
 	}
@@ -1024,6 +1066,10 @@ func truncateFnRef(schema string) string {
 
 func ddlFnRef(schema string) string {
 	return quoteIdent(schema) + "." + quoteIdent(CaptureFunctionDDL)
+}
+
+func dropFnRef(schema string) string {
+	return quoteIdent(schema) + "." + quoteIdent(CaptureFunctionDrop)
 }
 
 // renderCaptureRowFunction returns the CREATE OR REPLACE FUNCTION
@@ -1465,13 +1511,138 @@ END
 $sluice$;`
 }
 
+// renderCaptureDropFunction returns the CREATE OR REPLACE FUNCTION
+// statement for the `sql_drop` arm of the §7 DDL tier — the half that
+// records a DROPPED captured table (audit 2026-08-31, D-1).
+//
+// # The measured fact this whole arm exists for
+//
+// `ddl_command_end` FIRES on `DROP TABLE` (the tag matches), but
+// `pg_event_trigger_ddl_commands()` returns ZERO rows for it, so
+// [renderCaptureDDLFunction]'s loop body never executes and no op='X'
+// row is written. PostgreSQL reports dropped objects only to a
+// `sql_drop` event trigger, through pg_event_trigger_dropped_objects().
+// Measured on PG 16.14 (and re-measured by
+// TestCaptureDropTier_DDLCommandEndIsBlindToDrops on whatever server the
+// integration suite runs): CREATE TABLE → 2 ddl_commands rows, ALTER
+// TABLE → 1, DROP INDEX → 0, DROP TABLE → 0. From v0.85.0 to v0.134.x
+// the WHEN TAG list named `DROP TABLE` and `DROP INDEX` anyway, so the
+// tag list read as coverage the function could not deliver: a permanent
+// DROP of a synced table left the stream running at exit 0 with the
+// target holding the table's last-synced rows forever.
+//
+// # Why a SECOND function rather than a branch in the DDL one
+//
+// The two context functions are mutually exclusive by construction:
+// calling pg_event_trigger_dropped_objects() from a ddl_command_end
+// function raises `pg_event_trigger_dropped_objects() can only be called
+// in a sql_drop event trigger function` (observed on PG 16.14), and the
+// converse holds. One function bound to both events would therefore be
+// two disjoint bodies behind a TG_EVENT branch — strictly worse than two
+// functions, which also lets teardown, the capture-shape door and the
+// SEC-1 definer probe grade each tier independently. This mirrors the
+// row/truncate split (separate functions because the shapes differ), not
+// a new pattern.
+//
+// # Scope: the install's OWN captured tables, derived from its own artifacts
+//
+// The event trigger is deliberately NOT tag-filtered, because the tag is
+// not what decides whether a captured relation died: `DROP TABLE`,
+// `DROP SCHEMA … CASCADE` (observed: tag `DROP SCHEMA`, the member table
+// still reported), `DROP OWNED BY` and an extension drop all get there.
+// The FILTER is the dropped-object set itself: a table row whose drop
+// cascade also carried a trigger named [CaptureTriggerRow] on that same
+// table — i.e. a table THIS install was capturing. An unrelated DROP
+// anywhere else in the database records nothing, so the refusal cannot
+// be spammed by a neighbour's DDL. Consequences of that predicate, each
+// verified on PG 16.14:
+//
+//   - DROP INDEX on a captured table: no table row in the set → nothing
+//     recorded. Deliberate: sluice never forwards index DDL over CDC, so
+//     an index drop cannot change the row shape the applier writes, and
+//     refusing on it would be a spurious stream halt.
+//   - `DROP TRIGGER sluice_capture` alone: a trigger row with no table
+//     row → nothing recorded. That shape is the capture-shape door's job
+//     (cdc_capture_shape.go), and it is the door's stated residual.
+//   - A temp table carrying a same-named trigger is excluded by
+//     `NOT is_temporary` — sluice never installs on temp tables.
+//
+// Suppression, SECURITY DEFINER and the search_path pin are the same as
+// the sibling's, for the same reasons ([captureDDLSuppressionCheck],
+// SEC-1). Teardown drops the event triggers before its own DROP TABLEs,
+// so removing the engine never records its own drops.
+func renderCaptureDropFunction(schema, changeLogTableRef, metaTableRef string) string {
+	return `CREATE OR REPLACE FUNCTION ` + dropFnRef(schema) + `()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $sluice$
+DECLARE
+    r          RECORD;
+    v_marker   TEXT;
+    v_suppress BOOLEAN;
+BEGIN
+` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN
+        SELECT d.schema_name AS schema_name, d.object_identity AS object_identity
+          FROM pg_catalog.pg_event_trigger_dropped_objects() d
+         WHERE d.object_type = 'table'
+           AND NOT d.is_temporary
+           AND EXISTS (
+               SELECT 1
+                 FROM pg_catalog.pg_event_trigger_dropped_objects() g
+                WHERE g.object_type = 'trigger'
+                  AND g.address_names[1] = d.schema_name
+                  AND g.address_names[2] = d.object_name
+                  AND g.address_names[3] = ` + quoteSQLString(CaptureTriggerRow) + `)
+    LOOP
+        BEGIN
+            INSERT INTO ` + changeLogTableRef + `
+                (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
+            VALUES
+                (pg_catalog.pg_current_xact_id()::text::bigint,
+                 COALESCE(r.schema_name, 'public'),
+                 COALESCE(r.object_identity, 'unknown'),
+                 'X',
+                 pg_catalog.jsonb_build_object(
+                     'command_tag', TG_TAG,
+                     'object_type', 'table',
+                     '` + ddlMarkerDroppedRelationKey + `', COALESCE(r.object_identity, 'unknown')),
+                 NULL,
+                 NULL);
+        EXCEPTION
+            WHEN undefined_table THEN
+                -- Bug 101's shape, for this arm: the change-log table was
+                -- dropped without ` + "`sluice trigger teardown`" + `, leaving this
+                -- event trigger orphaned.
+                RAISE EXCEPTION USING
+                    ERRCODE = 'object_not_in_prerequisite_state',
+                    MESSAGE = 'sluice trigger engine is partially uninstalled (` + changeLogTableRef + ` missing); DDL blocked by orphaned event trigger',
+                    HINT    = 'To fully remove the sluice trigger engine, run: sluice trigger teardown --dsn=<source-dsn> --yes. To restore CDC capture, re-run: sluice trigger setup --dsn=<source-dsn> --tables=<...>.';
+        END;
+    END LOOP;
+END
+$sluice$;`
+}
+
 // renderTeardownDDL returns the ordered DROP statements that remove
 // the engine. Order matters: drop per-table triggers BEFORE the
 // shared capture function (else DROP FUNCTION CASCADE would have to
 // be used, which is louder than necessary). KeepData retains the
 // change-log table for post-mortem inspection.
 func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
-	out := []string{}
+	// Event triggers FIRST (D-1): from v0.135 the sql_drop arm records an
+	// op='X' row for a dropped captured table, and teardown's own
+	// statements — the per-table DROP TRIGGERs and, with keepData=false,
+	// the control-table DROP TABLEs — must never write into a change log
+	// the operator asked to remove. Neither shape satisfies the arm's
+	// predicate today (a bare DROP TRIGGER contributes no table row; the
+	// control tables carry no capture trigger), so this is a belt: it
+	// makes the ordering the reason instead of an accident.
+	out := []string{
+		"DROP EVENT TRIGGER IF EXISTS " + quoteIdent(CaptureTriggerDDL),
+		"DROP EVENT TRIGGER IF EXISTS " + quoteIdent(CaptureTriggerDrop),
+	}
 	for _, t := range tables {
 		fqTable := quoteIdent(schema) + "." + quoteIdent(t)
 		out = append(
@@ -1482,9 +1653,10 @@ func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
 	}
 	out = append(
 		out,
-		// Event trigger (idempotent — IF EXISTS handles the
-		// permissions-denied / polled-fingerprint-mode case).
-		"DROP EVENT TRIGGER IF EXISTS "+quoteIdent(CaptureTriggerDDL),
+		// The capture functions (idempotent — IF EXISTS handles the
+		// permissions-denied / polled-fingerprint-mode case, where neither
+		// event trigger nor DDL function was ever created).
+		"DROP FUNCTION IF EXISTS "+dropFnRef(schema)+"()",
 		"DROP FUNCTION IF EXISTS "+ddlFnRef(schema)+"()",
 		"DROP FUNCTION IF EXISTS "+truncateFnRef(schema)+"()",
 		"DROP FUNCTION IF EXISTS "+rowFunctionRef(schema)+"()",

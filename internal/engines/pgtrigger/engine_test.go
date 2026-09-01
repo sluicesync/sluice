@@ -213,26 +213,60 @@ func TestDecodeJSONBRow_EmptyAndNull(t *testing.T) {
 	}
 }
 
-// TestDecodeDDLTag pulls the command_tag from the §7 marker payload
-// and falls back to "DDL" on a malformed payload.
-func TestDecodeDDLTag(t *testing.T) {
+// TestDecodeDDLMarker pulls the command_tag — and, for the D-1 sql_drop
+// arm, the dropped relation — from the §7 marker payload, falling back to
+// "DDL" on a malformed payload. The vintage-skew cells are the load-bearing
+// ones: a pre-v0.135 X row carries no dropped_relation (generic refusal),
+// and a drop row missing its tag still names the relation.
+func TestDecodeDDLMarker(t *testing.T) {
 	cases := []struct {
 		payload string
-		want    string
+		want    ddlMarker
 	}{
-		{`{"command_tag":"ALTER TABLE","object_type":"table"}`, "ALTER TABLE"},
-		{`{"command_tag":"CREATE INDEX"}`, "CREATE INDEX"},
-		{`{}`, "DDL"},
-		{``, "DDL"},
-		{`not-json`, "DDL"},
+		{`{"command_tag":"ALTER TABLE","object_type":"table"}`, ddlMarker{tag: "ALTER TABLE"}},
+		{`{"command_tag":"CREATE INDEX"}`, ddlMarker{tag: "CREATE INDEX"}},
+		{
+			`{"command_tag":"DROP TABLE","object_type":"table","dropped_relation":"public.orders"}`,
+			ddlMarker{tag: "DROP TABLE", droppedRelation: "public.orders"},
+		},
+		{
+			`{"command_tag":"DROP SCHEMA","object_type":"table","dropped_relation":"sales.orders"}`,
+			ddlMarker{tag: "DROP SCHEMA", droppedRelation: "sales.orders"},
+		},
+		{`{"dropped_relation":"public.orders"}`, ddlMarker{tag: "DDL", droppedRelation: "public.orders"}},
+		{`{}`, ddlMarker{tag: "DDL"}},
+		{``, ddlMarker{tag: "DDL"}},
+		{`not-json`, ddlMarker{tag: "DDL"}},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.payload, func(t *testing.T) {
-			if got := decodeDDLTag(c.payload); got != c.want {
-				t.Errorf("decodeDDLTag(%q) = %q; want %q", c.payload, got, c.want)
+			if got := decodeDDLMarker(c.payload); got != c.want {
+				t.Errorf("decodeDDLMarker(%q) = %+v; want %+v", c.payload, got, c.want)
 			}
 		})
+	}
+}
+
+// TestRefuseObservedDDL_DroppedTableRemedy pins that the two refusal
+// shapes differ where it matters: a dropped captured table names the
+// relation and must NOT send the operator to `sluice migrate`, which
+// reads the source schema and so cannot land a drop.
+func TestRefuseObservedDDL_DroppedTableRemedy(t *testing.T) {
+	dropped := refuseObservedDDL(ddlMarker{tag: "DROP TABLE", droppedRelation: "public.orders"}).Error()
+	for _, want := range []string{"public.orders", "DROPPED", "--restart-from-scratch"} {
+		if !strings.Contains(dropped, want) {
+			t.Errorf("dropped-table refusal missing %q: %s", want, dropped)
+		}
+	}
+	if strings.Contains(dropped, "run `sluice migrate` on the target to land the schema change") {
+		t.Errorf("dropped-table refusal steers to `sluice migrate`, which cannot land a drop: %s", dropped)
+	}
+	generic := refuseObservedDDL(ddlMarker{tag: "ALTER TABLE"}).Error()
+	if !strings.Contains(generic, "sluice migrate") {
+		t.Errorf("generic DDL refusal lost its migrate remedy: %s", generic)
+	}
+	if strings.Contains(generic, "DROPPED") {
+		t.Errorf("generic DDL refusal claims a drop: %s", generic)
 	}
 }
 

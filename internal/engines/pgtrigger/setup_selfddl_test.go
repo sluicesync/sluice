@@ -121,11 +121,42 @@ func TestRenderSetupDDL_SelfDDLSuppression(t *testing.T) {
 				t.Errorf("DDL capture function body is missing the suppression check:\n%s", stmts[fnIdx])
 			}
 
+			dropFnIdx := -1
+			for i, s := range stmts {
+				if strings.HasPrefix(s, "CREATE OR REPLACE FUNCTION "+dropFnRef("public")) {
+					dropFnIdx = i
+					break
+				}
+			}
+			if dropFnIdx < 0 {
+				t.Fatal("render is missing the sql_drop capture function (D-1)")
+			}
+			if !strings.Contains(stmts[dropFnIdx], captureDDLSuppressionCheck(`"public"."`+ChangeLogMetaTable+`"`)) {
+				t.Errorf("sql_drop capture function body is missing the suppression check:\n%s", stmts[dropFnIdx])
+			}
+			// The sql_drop arm is UNFILTERED, so every DROP the plan issues
+			// reaches it — the same ordering rule as the tagged arm, for the
+			// same Bug 257 reason.
+			for i, s := range stmts {
+				if strings.HasPrefix(s, "DROP ") && i < dropFnIdx {
+					t.Errorf("statement %d (%q) is a DROP preceding the sql_drop capture function at %d", i, firstLine(s), dropFnIdx)
+				}
+			}
+
 			// Derive the watched tag set from the rendered event trigger so
 			// this pin tracks the TAG filter instead of a hand-copied list.
+			// The floor is 3, not the original 5: D-1 moved 'DROP TABLE' and
+			// 'DROP INDEX' off this arm, because pg_event_trigger_ddl_commands()
+			// returns zero rows for a DROP and the two tags could never record
+			// here. A regression that puts them back is caught below.
 			tags := watchedCommandTags(t, stmts)
-			if len(tags) < 5 {
+			if len(tags) < 3 {
 				t.Fatalf("parsed only %d watched tags %v from the CREATE EVENT TRIGGER (anti-vacuity: the parser has probably stopped matching)", len(tags), tags)
+			}
+			for _, tag := range tags {
+				if strings.HasPrefix(tag, "DROP ") {
+					t.Errorf("ddl_command_end watches %q, which pg_event_trigger_ddl_commands() can never report — the TAG list reads broader than the truth (D-1); drops belong to the sql_drop arm", tag)
+				}
 			}
 			recordable := 0
 			for i, s := range stmts {
@@ -147,10 +178,12 @@ func TestRenderSetupDDL_SelfDDLSuppression(t *testing.T) {
 				}
 			}
 			// Anti-vacuity floor: the two meta ADD COLUMNs + the change-log /
-			// meta / consumers CREATEs + the two index-diet DROPs are all
-			// watched, so a render where nothing matched means the prefix
-			// match broke, not that the plan went quiet.
-			if recordable < 7 {
+			// meta / consumers CREATEs are all watched, so a render where
+			// nothing matched means the prefix match broke, not that the plan
+			// went quiet. (Was 7 while the two index-diet DROP INDEXes counted;
+			// D-1 took the DROP tags off this arm — those statements are now
+			// covered by the sql_drop ordering check above.)
+			if recordable < 5 {
 				t.Errorf("only %d statements matched a watched tag; the ordering pin is not exercising the plan", recordable)
 			}
 		})

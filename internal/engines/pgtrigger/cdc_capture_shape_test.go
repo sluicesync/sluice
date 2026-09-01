@@ -37,37 +37,61 @@ func alwaysTriggers(table string) []installedCaptureTrigger {
 	}
 }
 
-// healthyEvt is the event-trigger state a full (event-trigger-tier) install
-// leaves behind.
-var healthyEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL}
+// healthyEvt / healthyDropEvt are the two event-trigger arms' states in a
+// full (event-trigger-tier) install.
+var (
+	healthyEvt     = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL}
+	healthyDropEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDrop}
+)
+
+// tiers builds the event-trigger-tier state with BOTH arms' functions
+// installed and the given trigger rows. The zero ddlCaptureState is the
+// polled-fingerprint shape (no functions, no triggers).
+func tiers(ddlEvt, dropEvt eventTriggerState) ddlCaptureState {
+	return ddlCaptureState{
+		fnPresent: map[string]bool{CaptureFunctionDDL: true, CaptureFunctionDrop: true},
+		triggers:  map[string]eventTriggerState{CaptureTriggerDDL: ddlEvt, CaptureTriggerDrop: dropEvt},
+	}
+}
+
+// healthyTiers is the full event-trigger install both arms healthy.
+func healthyTiers() ddlCaptureState { return tiers(healthyEvt, healthyDropEvt) }
+
+// preDropArmTiers is an install made before v0.135: the ddl_command_end arm
+// exists, the sql_drop one was never created. Graded as EXEMPT (the WARN
+// carries it — warnDropCaptureAbsent), never as a refusal, so upgrading the
+// binary cannot strand a running sync.
+func preDropArmTiers() ddlCaptureState {
+	return ddlCaptureState{
+		fnPresent: map[string]bool{CaptureFunctionDDL: true},
+		triggers:  map[string]eventTriggerState{CaptureTriggerDDL: healthyEvt},
+	}
+}
 
 func TestGradeCaptureShape(t *testing.T) {
 	cases := []struct {
 		name              string
 		installed         []installedCaptureTrigger
-		ddlFnPresent      bool
-		evt               eventTriggerState
+		ddl               ddlCaptureState
 		captureReplicated bool     // the recorded ADR-0185 posture
 		wantErr           []string // all must appear; empty = accept
 	}{
 		{
-			name:         "healthy full install accepts",
-			installed:    healthyTriggers("t"),
-			ddlFnPresent: true,
-			evt:          healthyEvt,
+			name:      "healthy full install accepts",
+			installed: healthyTriggers("t"),
+			ddl:       healthyTiers(),
 		},
 		{
 			name:      "polled-fingerprint install (no DDL function, no event trigger) accepts",
 			installed: healthyTriggers("t"),
-			// ddlFnPresent=false, evt absent: no event trigger was ever
-			// expected — requiring one would false-refuse every
-			// --allow-polled-fingerprint source.
+			// zero ddlCaptureState: no capture function, so no event
+			// trigger of either arm was ever expected — requiring one would
+			// false-refuse every --allow-polled-fingerprint source.
 		},
 		{
 			name:              "healthy ENABLE ALWAYS install accepts under the opt-in posture",
 			installed:         alwaysTriggers("t"),
-			ddlFnPresent:      true,
-			evt:               healthyEvt,
+			ddl:               healthyTiers(),
 			captureReplicated: true,
 		},
 		{
@@ -75,11 +99,10 @@ func TestGradeCaptureShape(t *testing.T) {
 			// capture"; the posture match narrows that — hand-flipped
 			// ENABLE ALWAYS captures replica-role writes without the
 			// echo-loop vetting.
-			name:         "ENABLE ALWAYS under a recorded origin-only posture refuses (hand-flipped drift)",
-			installed:    alwaysTriggers("t"),
-			ddlFnPresent: true,
-			evt:          healthyEvt,
-			wantErr:      []string{"ENABLE ALWAYS", "ORIGIN-ONLY", "--capture-replicated-writes"},
+			name:      "ENABLE ALWAYS under a recorded origin-only posture refuses (hand-flipped drift)",
+			installed: alwaysTriggers("t"),
+			ddl:       healthyTiers(),
+			wantErr:   []string{"ENABLE ALWAYS", "ORIGIN-ONLY", "--capture-replicated-writes"},
 		},
 		{
 			name: "plain row trigger under the opt-in posture refuses (replicated writes silently uncaptured)",
@@ -87,8 +110,7 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddlFnPresent:      true,
-			evt:               healthyEvt,
+			ddl:               healthyTiers(),
 			captureReplicated: true,
 			wantErr:           []string{CaptureTriggerRow, "--capture-replicated-writes", "NOT being captured"},
 		},
@@ -98,8 +120,7 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddlFnPresent:      true,
-			evt:               healthyEvt,
+			ddl:               healthyTiers(),
 			captureReplicated: true,
 			wantErr:           []string{CaptureTriggerTruncate, "--capture-replicated-writes", "TRUNCATE"},
 		},
@@ -109,8 +130,7 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddlFnPresent:      true,
-			evt:               healthyEvt,
+			ddl:               healthyTiers(),
 			captureReplicated: true,
 			wantErr:           []string{"DISABLED"},
 		},
@@ -118,10 +138,37 @@ func TestGradeCaptureShape(t *testing.T) {
 			// The opt-in never alters the event trigger's enablement, so
 			// evtenabled 'A' stays accepted under either posture (the
 			// door's evt scope note).
-			name:         "event trigger ENABLE ALWAYS accepts under the plain posture",
-			installed:    healthyTriggers("t"),
-			ddlFnPresent: true,
-			evt:          eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL},
+			name:      "event trigger ENABLE ALWAYS accepts under the plain posture",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL}, healthyDropEvt),
+		},
+		{
+			// The D-1 upgrade shape: the sql_drop arm was never installed.
+			// EXEMPT here by design — a refusal would strand every running
+			// sync at the moment the operator upgrades the binary, for a gap
+			// that is bounded and static. warnDropCaptureAbsent is what makes
+			// it loud (pinned in preflight_ddl_detection_integration_test.go).
+			name:      "install predating the sql_drop arm accepts (WARN carries it, not a refusal)",
+			installed: healthyTriggers("t"),
+			ddl:       preDropArmTiers(),
+		},
+		{
+			name:      "drop function present but its event trigger dropped refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(healthyEvt, eventTriggerState{}),
+			wantErr:   []string{CaptureTriggerDrop, "MISSING", "DROP of a captured table"},
+		},
+		{
+			name:      "disabled drop event trigger refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDrop}),
+			wantErr:   []string{CaptureTriggerDrop, "not enabled", "DROP of a captured table"},
+		},
+		{
+			name:      "drop event trigger bound to a foreign function refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_drop_hook"}),
+			wantErr:   []string{CaptureTriggerDrop, "somebody_elses_drop_hook"},
 		},
 		{
 			name:    "zero triggers anywhere refuses (the dropped-everything floor)",
@@ -175,29 +222,27 @@ func TestGradeCaptureShape(t *testing.T) {
 			wantErr: []string{"tgtype", "trigger setup"},
 		},
 		{
-			name:         "DDL function present but event trigger dropped refuses",
-			installed:    healthyTriggers("t"),
-			ddlFnPresent: true,
-			wantErr:      []string{CaptureTriggerDDL, "MISSING", "DROP EVENT TRIGGER"},
+			name:      "DDL function present but event trigger dropped refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(eventTriggerState{}, healthyDropEvt),
+			wantErr:   []string{CaptureTriggerDDL, "MISSING", "DROP EVENT TRIGGER"},
 		},
 		{
-			name:         "disabled event trigger refuses",
-			installed:    healthyTriggers("t"),
-			ddlFnPresent: true,
-			evt:          eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDDL},
-			wantErr:      []string{CaptureTriggerDDL, "not enabled"},
+			name:      "disabled event trigger refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDDL}, healthyDropEvt),
+			wantErr:   []string{CaptureTriggerDDL, "not enabled"},
 		},
 		{
-			name:         "event trigger bound to a foreign function refuses",
-			installed:    healthyTriggers("t"),
-			ddlFnPresent: true,
-			evt:          eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_ddl_hook"},
-			wantErr:      []string{CaptureTriggerDDL, "somebody_elses_ddl_hook"},
+			name:      "event trigger bound to a foreign function refuses",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_ddl_hook"}, healthyDropEvt),
+			wantErr:   []string{CaptureTriggerDDL, "somebody_elses_ddl_hook"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := gradeCaptureShape("public", tc.installed, tc.ddlFnPresent, tc.evt, tc.captureReplicated)
+			err := gradeCaptureShape("public", tc.installed, tc.ddl, tc.captureReplicated)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("want accept, got refusal: %v", err)

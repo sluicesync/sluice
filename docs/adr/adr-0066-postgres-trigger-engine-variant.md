@@ -468,7 +468,8 @@ engine refuses loudly with the drained-model recovery hint.**
 
 Postgres event triggers ARE available on every PG 9.3+ source, including
 restricted tiers (they're a built-in feature, not an extension). The
-engine creates one event trigger at setup:
+engine creates **two** event triggers at setup — see the DROP note below
+for why one is not enough:
 
 ```sql
 CREATE OR REPLACE FUNCTION sluice_capture_ddl()
@@ -500,9 +501,56 @@ $$;
 
 CREATE EVENT TRIGGER sluice_capture_ddl_trg
 ON ddl_command_end
-WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE', 'DROP TABLE', 'CREATE INDEX', 'DROP INDEX')
+WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE', 'CREATE INDEX')
 EXECUTE FUNCTION sluice_capture_ddl();
 ```
+
+**The DROP tags are NOT on that list, and this is the correction of a
+claim this ADR shipped wrong (audit 2026-08-31, D-1).** Through v0.134.x
+the `WHEN TAG` list above also named `DROP TABLE` and `DROP INDEX`, and
+the text below asserted "both code paths refuse" — but
+`pg_event_trigger_ddl_commands()` returns **zero rows for a DROP**, so
+the loop body never executed and no `op='X'` row was ever written. The
+event trigger fired; the function found nothing to record. Measured on
+PG 16.14 and 17.11 (and re-measured per-run by
+`TestCaptureDropTier_DDLCommandEndIsBlindToDrops`): `CREATE TABLE` → 2
+`ddl_commands` rows, `ALTER TABLE` → 1, `DROP INDEX` → 0, `DROP TABLE` →
+0. The consequence was a genuine silent gap: a permanently dropped synced
+table left the stream running at exit 0, with the target holding that
+table's last-synced rows forever and no refusal at any door.
+
+PostgreSQL reports dropped objects only to a `sql_drop` event trigger,
+through `pg_event_trigger_dropped_objects()` — and the two context
+functions are mutually exclusive (calling either from the other's event
+raises). So the fix is a second function on a second event:
+
+```sql
+CREATE EVENT TRIGGER sluice_capture_drop_trg
+ON sql_drop            -- deliberately NOT tag-filtered
+EXECUTE FUNCTION sluice_capture_drop();
+```
+
+Its body records `op='X'` for a dropped **table** whose drop cascade also
+carried that table's own `sluice_capture` trigger — i.e. a table THIS
+install was capturing, derived from the install's own artifacts rather
+than a roster. That predicate, not a tag list, is the filter: a captured
+table can also die by `DROP SCHEMA … CASCADE` (observed) or `DROP OWNED
+BY`, while an unrelated DROP anywhere else in the database records
+nothing. Two deliberate residuals, stated rather than implied:
+**`DROP INDEX` is not captured** (no table row in the dropped set) —
+sluice never forwards index DDL over CDC, so an index drop cannot change
+the row shape the applier writes and refusing on it would halt a stream
+for nothing; and a bare **`DROP TRIGGER sluice_capture`** is not captured
+here either — that shape belongs to the capture-shape door
+(`cdc_capture_shape.go`), which is where its residual is recorded. The
+reader gives a dropped table its own remedy, because `sluice migrate`
+reads the *source* schema and therefore cannot land a drop.
+
+The capture-tier roster (`TestCaptureTierRoster_EveryEmittedTrigger`) is
+what keeps this list from reading broader than the truth again: every
+trigger `renderSetupDDL` emits must be classified, and every tag on the
+`ddl_command_end` arm must be one `pg_event_trigger_ddl_commands()` can
+actually report.
 
 Event-trigger creation requires the SUPERUSER or `pg_create_event_trigger`
 role on PG 14+. On tiers that deny event-trigger creation (Heroku
@@ -514,11 +562,16 @@ loudly on any mismatch. This is more expensive than the event-trigger
 path (an extra catalog query per poll) but catches DDL within one
 poll interval and works on the most restricted tiers.
 
-**Refusal shape, not auto-apply.** Both code paths refuse, not auto-
-apply. The drained-model recovery hint (ADR-0054's established
+**Refusal shape, not auto-apply.** The event-trigger tier refuses, not
+auto-applies. (The polled-fingerprint tier refuses nothing today: its
+loop was never implemented, which is why every open on that tier logs
+`DDL-DETECTION-ABSENT` — capture-completeness G1. "Both code paths
+refuse" was the original claim here and it was never true of the second
+one.) The drained-model recovery hint (ADR-0054's established
 pattern) is the canonical recovery path: operator stops the stream,
 runs `sluice migrate` to land the schema change on target, restarts
-the stream from a fresh position. Auto-apply of source-side DDL via
+the stream from a fresh position — except for a DROPPED table, whose
+refusal carries its own remedy for the reason given above. Auto-apply of source-side DDL via
 the trigger plane is explicitly out of scope for v1; the complexity
 budget required to do it correctly (matching the schema-history /
 position-anchored decode model the pgoutput engine has via ADR-0049)

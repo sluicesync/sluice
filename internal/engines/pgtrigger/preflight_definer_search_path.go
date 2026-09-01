@@ -48,8 +48,9 @@ import (
 //
 // # What this door reaches (the gate-scope enumeration, per CLAUDE.md)
 //
-// All THREE sluice-owned capture functions in the schema — row, truncate
-// and DDL — not just the one that shipped vulnerable. The row and truncate
+// All FOUR sluice-owned capture functions in the schema — row, truncate,
+// DDL and (since v0.135, the D-1 sql_drop arm) drop — not just the one that
+// shipped vulnerable. The row and truncate
 // functions have carried the pin since the engine's first commit
 // (`git log -S` on setup.go returns exactly one commit), so no released
 // install should trip on them; checking them anyway means the door's name
@@ -132,9 +133,10 @@ func warnInsecureCaptureFunctions(ctx context.Context, db *sql.DB, schema string
 }
 
 // loadCaptureFunctionSecurity reads prosecdef + the search_path proconfig
-// entry for whichever of the three sluice-owned capture functions exist in
+// entry for whichever of the four sluice-owned capture functions exist in
 // the schema. Absent functions simply yield no row (a polled-fingerprint
-// install has no DDL function; teardown --keep-data leaves none at all).
+// install has no DDL or drop function; an install predating the D-1 sql_drop
+// arm has no drop function; teardown --keep-data leaves none at all).
 func loadCaptureFunctionSecurity(ctx context.Context, db *sql.DB, schema string) ([]definerFunctionState, error) {
 	const q = `
 SELECT p.proname,
@@ -147,9 +149,9 @@ SELECT p.proname,
   FROM pg_catalog.pg_proc      p
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname = $1
-   AND p.proname IN ($2, $3, $4)
+   AND p.proname IN ($2, $3, $4, $5)
  ORDER BY p.proname`
-	rows, err := db.QueryContext(ctx, q, schema, CaptureFunctionRow, CaptureFunctionTruncate, CaptureFunctionDDL)
+	rows, err := db.QueryContext(ctx, q, schema, CaptureFunctionRow, CaptureFunctionTruncate, CaptureFunctionDDL, CaptureFunctionDrop)
 	if err != nil {
 		return nil, err
 	}
