@@ -532,5 +532,10 @@ func captureBackupPosition(ctx context.Context, conn *sql.Conn, flavor Flavor) (
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("master status: %w", err)
 	}
-	return encodeBinlogPos(binlogPos{Mode: positionModeFilePos, File: file, Pos: pos})
+	return encodeBinlogPos(binlogPos{
+		Mode:       positionModeFilePos,
+		File:       file,
+		Pos:        pos,
+		ServerUUID: backupPositionServerUUID(ctx, conn, flavor),
+	})
 }

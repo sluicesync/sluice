@@ -93,6 +93,60 @@ func warnNoBinlogCursor(ctx context.Context) {
 	)
 }
 
+// backupPositionServerUUID reads the source instance identity to stamp
+// onto a file/pos backup cursor, mirroring what the three CDC-side
+// file/pos constructions already do (see [binlogPos.ServerUUID]).
+//
+// It exists because the two backup capturers did NOT stamp it, and that
+// was a silent-loss hole rather than a cosmetic gap: a manifest
+// EndPosition is resumed by `backup incremental` and by `sync start
+// --position-from-manifest`, both of which land in
+// [CDCReader.verifyPositionResumableInner]'s file/pos arm — whose
+// [verifySourceInstanceIdentity] call SKIPS when the persisted uuid is
+// empty. So the guard whose own rationale names the "restored from
+// backup" class reached three of its four doors, and the backup→CDC
+// handoff — the one door literally named in that rationale — was the
+// door it missed. Ground-truthed 2026-09-01 on two independent MySQL
+// 8.0.46 instances with gtid_mode=OFF (MySQL 8's default) whose binlogs
+// both carried mysql-bin.000001: sluice accepted the cross-instance
+// resume, streamed from a byte offset in the wrong lineage, and dropped
+// three source rows at exit 0 with no WARN.
+//
+// Degrade philosophy matches [CDCReader.StreamChanges]'s probe exactly:
+//
+//   - MariaDB has no @@server_uuid (the read errors 1193), so it is
+//     skipped rather than WARNed about on every capture. MariaDB also
+//     never reaches a file/pos arm at all — [gtidModeOnFor] reports GTID
+//     mode ON for that flavor unconditionally — so this is belt-and-
+//     braces, not the load-bearing case.
+//   - Any other read failure degrades to "" with a WARN rather than
+//     failing the backup. An unreadable @@server_uuid must not turn a
+//     working `backup full` into a refusal; the cost is that THAT
+//     cursor keeps the pre-fix (filename-only) protection, which is the
+//     same trade [verifySourceInstanceIdentity] already documents.
+//     This is also why the vtgate-routed flavors need no special case:
+//     planetscale/vitess reach the [SchemaReader.CaptureBackupPosition]
+//     door only on the degraded fallback, and the CDC reader already
+//     issues this identical query against vtgate on every stream open,
+//     so no new failure mode is introduced here.
+func backupPositionServerUUID(ctx context.Context, q rowQuerier, flavor Flavor) string {
+	if flavor == FlavorMariaDB {
+		return ""
+	}
+	uuid, err := sourceServerUUID(ctx, q)
+	if err != nil {
+		slog.WarnContext(
+			ctx, "mysql: backup: could not read @@server_uuid; this backup's file/pos end position "+
+				"carries no instance identity, so a resume from it degrades to the binlog-filename-only "+
+				"check (a replaced/restored source instance that reuses the same binlog filenames will "+
+				"not be caught)",
+			slog.String("err", err.Error()),
+		)
+		return ""
+	}
+	return uuid
+}
+
 // CaptureBackupPosition implements [irbackup.PositionCapturer]. Returns
 // the source's current binlog cursor — `@@global.gtid_executed` when
 // GTID mode is on, or `(file, position)` otherwise — encoded the same
@@ -172,7 +226,12 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: master status: %w", err)
 	}
-	pos, err := encodeBinlogPos(binlogPos{Mode: positionModeFilePos, File: file, Pos: p})
+	pos, err := encodeBinlogPos(binlogPos{
+		Mode:       positionModeFilePos,
+		File:       file,
+		Pos:        p,
+		ServerUUID: backupPositionServerUUID(ctx, r.db, r.flavor),
+	})
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
 	}

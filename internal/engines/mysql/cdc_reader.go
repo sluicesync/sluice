@@ -806,7 +806,18 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 	if err != nil {
 		return binlogPos{}, fmt.Errorf("mysql: SHOW MASTER STATUS: %w", err)
 	}
-	return binlogPos{Mode: positionModeFilePos, File: file, Pos: pos}, nil
+	// ServerUUID is inert on THIS value — a cold-start "from now"
+	// position is consumed by startStreamer (which reads only File/Pos)
+	// and never encoded; every position this stream later PERSISTS comes
+	// from positionFor, which stamps r.serverUUID itself. It is set
+	// anyway so that all four file/pos constructions in the package are
+	// uniform, which is what lets
+	// TestFilePosPositionsCarryServerUUID_ASTRoster require the field
+	// unconditionally instead of maintaining a persisted-vs-ephemeral
+	// exemption list that a future site would silently join the wrong
+	// side of. r.serverUUID is already populated here: StreamChanges
+	// reads it before calling resolveStartPosition.
+	return binlogPos{Mode: positionModeFilePos, File: file, Pos: pos, ServerUUID: r.serverUUID}, nil
 }
 
 // startStreamer hands the resolved position to the syncer. Initialises
@@ -2205,9 +2216,15 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 // instance / restored-from-backup node. Used to bind a file/pos
 // position to the instance that produced it (see
 // verifySourceInstanceIdentity).
-func sourceServerUUID(ctx context.Context, db *sql.DB) (string, error) {
+//
+// Takes a [rowQuerier] rather than a *sql.DB so the backup capturers can
+// share it: [captureBackupPosition] holds a single pinned *sql.Conn (its
+// position read must happen on the FTWRL-held connection), and reading
+// the identity on a different pool connection would be a different
+// question. See [backupPositionServerUUID].
+func sourceServerUUID(ctx context.Context, q rowQuerier) (string, error) {
 	var uuid string
-	if err := db.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&uuid); err != nil {
+	if err := q.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&uuid); err != nil {
 		return "", fmt.Errorf("mysql: read @@server_uuid: %w", err)
 	}
 	return uuid, nil
