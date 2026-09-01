@@ -38,6 +38,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -254,6 +255,46 @@ func TestCaptureReplicatedWrites_PostureAndEchoDoors(t *testing.T) {
 	})
 
 	applyPGSQL(t, dsn, `DROP TABLE public.sluice_cdc_state`)
+
+	t.Run("relay artifacts in ANOTHER schema of the same database still refuse (audit 2026-08-31 SEC-4)", func(t *testing.T) {
+		// The upstream applier pins sluice_cdc_state to its target DSN's
+		// schema at construction, and --target-schema (ADR-0031) moves the
+		// USER DATA without moving it — so the bookkeeping legitimately
+		// lives outside the schema this capture is set up against. Before
+		// SEC-4 probeRelayControlTable scoped its existence check to the
+		// capture schema, so this shape installed ENABLE ALWAYS triggers on
+		// exactly the topology the refusal exists to stop.
+		if err := setup(t, true); err != nil {
+			t.Fatalf("Setup(opt-in) with no relay artifacts: %v", err)
+		}
+		applyPGSQL(t, dsn, `
+			CREATE SCHEMA relay_ctl;
+			CREATE TABLE relay_ctl.sluice_cdc_state (
+				stream_id       VARCHAR(255) NOT NULL PRIMARY KEY,
+				source_position TEXT         NOT NULL
+			);
+			INSERT INTO relay_ctl.sluice_cdc_state (stream_id, source_position) VALUES ('upstream-a-to-b', 'pos');
+		`)
+		defer applyPGSQL(t, dsn, `DROP SCHEMA relay_ctl CASCADE`)
+
+		// The refusal must NAME where the evidence actually is, and report
+		// the count it actually read (A-5) — "0 registered stream(s)" from
+		// an unread detail query is the shape that sends an operator to the
+		// "decommissioned residue, drop it" remedy on no evidence.
+		err := openWantRefusal(t, "echo loop", "relay_ctl."+appliershared.ControlTableName, "1 registered stream(s)")
+		wantEchoRefusal(t, err, "openCDCReader (control table in another schema)")
+		wantEchoRefusal(t, setup(t, true), "Setup (control table in another schema)")
+
+		// The plain posture's WARN shares the same probe and therefore the
+		// same reach — the sibling SEC-4 names.
+		if err := setup(t, false); err != nil {
+			t.Fatalf("plain Setup on the cross-schema relay shape must not refuse: %v", err)
+		}
+		openLogs := captureWarnLogs(t, func() { openWantClean(t) })
+		if !strings.Contains(openLogs, captureGapRiskMarker) || !strings.Contains(openLogs, "relay_ctl."+appliershared.ControlTableName) {
+			t.Errorf("plain open on the cross-schema relay shape should WARN naming the control table's real schema:\n%s", openLogs)
+		}
+	})
 
 	t.Run("posture door: opt-in install hand-flipped to plain refuses at open", func(t *testing.T) {
 		if err := setup(t, true); err != nil {
