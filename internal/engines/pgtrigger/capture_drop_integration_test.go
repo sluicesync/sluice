@@ -111,6 +111,61 @@ func TestCaptureDropTier_DDLCommandEndIsBlindToDrops(t *testing.T) {
 	if want := "public.blind_b|DROP TABLE|public.blind_b"; got[1] != want {
 		t.Fatalf("drop marker = %q, want %q", got[1], want)
 	}
+
+	t.Run("PREMISE: the two context functions are NOT symmetrically exclusive", func(t *testing.T) {
+		// ADR-0066 said they were ("calling either from the other's event
+		// raises"), which was asserted rather than measured. Only ONE
+		// direction raises, and the other is the one that matters here:
+		// calling pg_event_trigger_ddl_commands() from a sql_drop function
+		// returns ZERO ROWS AND NO ERROR — the same silent nothing this
+		// whole arm exists to fix, one move further on. Someone relocating
+		// the capture arm to sql_drop and keeping the ddl_commands() call
+		// would reproduce the defect exactly, with nothing to say so.
+		//
+		// Corrected and pinned 2026-09-01 after a real PG 16.14/17.11
+		// measurement contradicted the ADR. Measured here per run rather
+		// than restated, per the premise-naming rule.
+		applyPGSQL(t, dsn, `
+CREATE FUNCTION premise_drop_probe() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM pg_catalog.pg_event_trigger_ddl_commands();
+    INSERT INTO premise_probe_log (what, n) VALUES ('ddl_commands_from_sql_drop', n);
+END $$;
+CREATE TABLE premise_probe_log (what TEXT, n INT);
+CREATE EVENT TRIGGER premise_drop_trg ON sql_drop EXECUTE FUNCTION premise_drop_probe();
+CREATE TABLE premise_victim (id BIGINT PRIMARY KEY);`)
+		applyPGSQL(t, dsn, `DROP TABLE public.premise_victim`)
+
+		var n sql.NullInt64
+		if err := db.QueryRowContext(ctx,
+			`SELECT n FROM premise_probe_log WHERE what = 'ddl_commands_from_sql_drop'`).Scan(&n); err != nil {
+			t.Fatalf("the sql_drop probe did not run, so the premise is unmeasured: %v", err)
+		}
+		if !n.Valid || n.Int64 != 0 {
+			t.Errorf("pg_event_trigger_ddl_commands() from a sql_drop function returned %v rows; want 0. "+
+				"If this now RAISES instead, the ADR's original symmetry claim has become true on this "+
+				"server version and the correction needs revisiting; if it returns rows, the sql_drop arm "+
+				"could have been written the other way after all", n)
+		}
+
+		// The direction that DOES raise, pinned so the asymmetry is a
+		// measured pair rather than one half plus an assumption.
+		_, err := db.ExecContext(ctx, `
+CREATE OR REPLACE FUNCTION premise_end_probe() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM pg_catalog.pg_event_trigger_dropped_objects();
+END $$;
+CREATE EVENT TRIGGER premise_end_trg ON ddl_command_end EXECUTE FUNCTION premise_end_probe();
+CREATE TABLE premise_raises (id BIGINT PRIMARY KEY);`)
+		if err == nil {
+			t.Error("pg_event_trigger_dropped_objects() from a ddl_command_end function did NOT raise; " +
+				"the asymmetry this test pins has changed and ADR-0066's correction needs re-deriving")
+		} else if !strings.Contains(err.Error(), "sql_drop") {
+			t.Errorf("it raised, but not with the expected sql_drop-context message: %v", err)
+		}
+	})
 }
 
 // TestCaptureDropTier_DroppedCapturedTableRefusesAtResume drives the whole

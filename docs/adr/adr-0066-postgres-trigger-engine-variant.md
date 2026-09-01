@@ -515,15 +515,36 @@ the loop body never executed and no `op='X'` row was ever written. The
 event trigger fired; the function found nothing to record. Measured on
 PG 16.14 and 17.11 (and re-measured per-run by
 `TestCaptureDropTier_DDLCommandEndIsBlindToDrops`): `CREATE TABLE` → 2
-`ddl_commands` rows, `ALTER TABLE` → 1, `DROP INDEX` → 0, `DROP TABLE` →
+`ddl_commands` rows **when the table carries a PRIMARY KEY** (the table
+plus its implicit index — a bare `CREATE TABLE t (a int, b text)` reports
+1, and the 2 above came from a PK-carrying fixture; corrected 2026-09-01,
+this ADR previously stated the 2 unqualified), `ALTER TABLE` → 1,
+`CREATE INDEX` → 1, `DROP INDEX` → 0, `DROP TABLE` →
 0. The consequence was a genuine silent gap: a permanently dropped synced
 table left the stream running at exit 0, with the target holding that
 table's last-synced rows forever and no refusal at any door.
 
 PostgreSQL reports dropped objects only to a `sql_drop` event trigger,
-through `pg_event_trigger_dropped_objects()` — and the two context
-functions are mutually exclusive (calling either from the other's event
-raises). So the fix is a second function on a second event:
+through `pg_event_trigger_dropped_objects()`. This ADR previously said
+the two context functions "are mutually exclusive (calling either from
+the other's event raises)". **Only one direction raises, and the other is
+the dangerous one** (measured on PG 16.14 and 17.11, 2026-09-01):
+
+- `pg_event_trigger_dropped_objects()` from a `ddl_command_end` function
+  → `ERROR: … can only be called in a sql_drop event trigger function`.
+  Loud.
+- `pg_event_trigger_ddl_commands()` from a `sql_drop` function → **no
+  error, zero rows.**
+
+The second is worth stating explicitly because it is the failure this
+whole section is about, one move further on: moving the capture arm to
+`sql_drop` while still calling `ddl_commands()` would produce an
+identically silent zero, and nothing would say so. The symmetry claim was
+asserted rather than checked — an UNVERIFIED PREMISE in the sense of the
+premise-naming rule, corrected here by measurement.
+
+So the fix is a second function on a second event, calling the context
+function that belongs to that event:
 
 ```sql
 CREATE EVENT TRIGGER sluice_capture_drop_trg
