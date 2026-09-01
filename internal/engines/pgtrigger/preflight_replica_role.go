@@ -101,6 +101,21 @@ type installMeta struct {
 	captureReplicated bool
 }
 
+// captureDigestMinSchemaVer is the schema version at which
+// capture_fn_digest was INTRODUCED, and the floor for believing one.
+//
+// It is deliberately a frozen literal rather than [ChangeLogSchemaVer].
+// Those are equal today and must not be written as one: the trust floor is
+// a fact about when the digest started being recorded, which never changes,
+// while ChangeLogSchemaVer moves on every future meta-table migration. Spelt
+// as `>= ChangeLogSchemaVer`, the next unrelated bump to 6 would make every
+// correctly-set-up v5 install's digest untrusted overnight — silently
+// dropping this door from REFUSE to WARN for the tamper case it exists to
+// catch, as a side effect of a change with nothing to do with it, and with
+// no failing test to say so. Pinned by
+// [TestCaptureDigestTrust_FloorIsFrozenNotTheCurrentSchemaVersion].
+const captureDigestMinSchemaVer = 5
+
 // captureDigestTrusted reports whether [installMeta.captureFnDigest] can be
 // believed. The COLUMN's presence is not the signal — the VERSION is: an
 // older binary's `trigger setup` run rewrites the capture functions without
@@ -110,7 +125,7 @@ type installMeta struct {
 // that never happened, so the version gate is what keeps this door's
 // refusal arm honest.
 func (m installMeta) captureDigestTrusted() bool {
-	return m.captureFnDigest != "" && m.schemaVersion >= ChangeLogSchemaVer
+	return m.captureFnDigest != "" && m.schemaVersion >= captureDigestMinSchemaVer
 }
 
 // readInstallMeta reads the install's recorded state from the meta table.

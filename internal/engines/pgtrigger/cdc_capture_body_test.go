@@ -15,6 +15,9 @@
 package pgtrigger
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 )
@@ -293,7 +296,7 @@ func TestGradeCaptureFunctionShapes_OldButUntamperedWarnsRatherThanRefuses(t *te
 	// ... and the SAME state with the version regressed by an older
 	// binary's setup run must fall back to "cannot tell", never to a
 	// refusal: that is the downgrade-then-upgrade path.
-	stale := installMeta{captureFnDigest: captureFunctionDigests(older), schemaVersion: ChangeLogSchemaVer - 1}
+	stale := installMeta{captureFnDigest: captureFunctionDigests(older), schemaVersion: captureDigestMinSchemaVer - 1}
 	if !stale.captureDigestTrusted() {
 		drift, err := gradeCaptureFunctionShapes(testSchema, installed, stale)
 		if err != nil {
@@ -304,6 +307,107 @@ func TestGradeCaptureFunctionShapes_OldButUntamperedWarnsRatherThanRefuses(t *te
 		}
 	} else {
 		t.Error("captureDigestTrusted believes a digest recorded under an older schema_version")
+	}
+}
+
+// TestCaptureDigestTrust_FloorIsFrozenNotTheCurrentSchemaVersion pins the one
+// property that makes the refusal arm survive a future meta-table migration:
+// the trust floor is the version the digest was INTRODUCED at, not whatever
+// ChangeLogSchemaVer happens to be.
+//
+// Written as `>= ChangeLogSchemaVer`, the next unrelated bump to 6 would make
+// every correctly-set-up v5 install's digest untrusted, silently dropping the
+// door from REFUSE to WARN for the tamper case — a security regression caused
+// by an unrelated change, which is exactly the kind nothing would have caught.
+// SHAPE, and why the behavioural cells alone are NOT the gate. The two
+// constants are equal today, so `>= ChangeLogSchemaVer` and
+// `>= captureDigestMinSchemaVer` are behaviourally identical in every input
+// this test can construct — the divergence only appears after a future bump,
+// which a test cannot fabricate for a compile-time constant. Mutation-run
+// confirmed exactly that: restoring the moving constant PASSED the
+// behavioural cells. So the load-bearing arm reads the SOURCE and requires
+// captureDigestTrusted to compare against the frozen floor, with the
+// behavioural cells kept below as the anti-vacuity half (they catch a floor
+// that is nonsense in the other directions).
+func TestCaptureDigestTrust_FloorIsFrozenNotTheCurrentSchemaVersion(t *testing.T) {
+	if captureDigestMinSchemaVer > ChangeLogSchemaVer {
+		t.Fatalf("the digest trust floor (%d) is above the current schema version (%d) — "+
+			"no install can ever satisfy it", captureDigestMinSchemaVer, ChangeLogSchemaVer)
+	}
+
+	assertCaptureDigestFloorIsFrozenInSource(t)
+
+	// An install recorded exactly AT the floor is trusted, and stays trusted
+	// however far ChangeLogSchemaVer later moves.
+	for _, ver := range []int{captureDigestMinSchemaVer, captureDigestMinSchemaVer + 1, ChangeLogSchemaVer + 3} {
+		m := installMeta{captureFnDigest: "some-digest", schemaVersion: ver}
+		if !m.captureDigestTrusted() {
+			t.Errorf("schema_version %d: digest not trusted; the floor is %d and a version at or "+
+				"above it must stay trusted no matter how far ChangeLogSchemaVer (%d) advances — "+
+				"otherwise an unrelated meta-table bump silently turns this door's tamper REFUSAL "+
+				"into a WARN", ver, captureDigestMinSchemaVer, ChangeLogSchemaVer)
+		}
+	}
+
+	// Below the floor is untrusted (the downgrade-then-upgrade path), and an
+	// absent digest is untrusted at any version. Without these the test would
+	// pass for a captureDigestTrusted that simply returned true.
+	if (installMeta{captureFnDigest: "some-digest", schemaVersion: captureDigestMinSchemaVer - 1}).captureDigestTrusted() {
+		t.Error("a digest recorded below the floor must not be trusted")
+	}
+	if (installMeta{captureFnDigest: "", schemaVersion: ChangeLogSchemaVer}).captureDigestTrusted() {
+		t.Error("an absent digest must not be trusted at any version")
+	}
+}
+
+// assertCaptureDigestFloorIsFrozenInSource walks captureDigestTrusted's body
+// and requires the version comparison to name the frozen floor rather than
+// the moving schema constant. It carries its own anti-vacuity floor: the
+// function must be found and must reference the floor, so a rename that made
+// the walk match nothing fails instead of passing silently.
+func assertCaptureDigestFloorIsFrozenInSource(t *testing.T) {
+	t.Helper()
+	const fn = "captureDigestTrusted"
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "preflight_replica_role.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse preflight_replica_role.go: %v", err)
+	}
+
+	var body *ast.BlockStmt
+	ast.Inspect(file, func(n ast.Node) bool {
+		if fd, ok := n.(*ast.FuncDecl); ok && fd.Name.Name == fn {
+			body = fd.Body
+		}
+		return body == nil
+	})
+	if body == nil {
+		t.Fatalf("%s not found in preflight_replica_role.go — if it moved or was renamed, move this "+
+			"gate with it rather than deleting it; it is the only thing pinning the frozen floor", fn)
+	}
+
+	var sawFloor, sawMovingConst bool
+	ast.Inspect(body, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok {
+			switch id.Name {
+			case "captureDigestMinSchemaVer":
+				sawFloor = true
+			case "ChangeLogSchemaVer":
+				sawMovingConst = true
+			}
+		}
+		return true
+	})
+	if !sawFloor {
+		t.Errorf("%s does not reference captureDigestMinSchemaVer", fn)
+	}
+	if sawMovingConst {
+		t.Errorf("%s compares against ChangeLogSchemaVer. The trust floor is the version the digest "+
+			"was INTRODUCED at and never moves; ChangeLogSchemaVer advances on every future "+
+			"meta-table migration, and the next bump would make every correctly-set-up install's "+
+			"digest untrusted — silently turning this door's tamper REFUSAL into a WARN. Compare "+
+			"against captureDigestMinSchemaVer.", fn)
 	}
 }
 
