@@ -61,6 +61,29 @@ import (
 // a /*!vvvvv … */ versioned comment lexes as a comment here. Both
 // remain the documented session-override residue, now narrowed to
 // those shapes (CTE-DML moved from residue to the verb set above).
+//
+// A THIRD residue, and the asymmetry in how it is handled is deliberate
+// (found on real MySQL 8.0.46 by the v0.137.1 pre-tag review). MySQL
+// lexes a `/*! … */` EXECUTABLE comment's contents as SQL, so a `*/`
+// inside a string literal does not terminate it — while this file's
+// comment scans are quote-blind, which matches MySQL for a PLAIN
+// comment and not for a versioned one. A versioned comment carrying
+// `*/` inside a quoted value therefore makes a scan stop mid-value.
+//
+//   - DETECTION ([leadingSQLKeyword], and so [statementDMLVerb]) is
+//     LEFT AS IS. The mis-lex can make a healthy ROW-logged DDL look
+//     like a DML verb and raise this refusal on a working
+//     configuration — loud, wrong, and recoverable. Teaching the lexer
+//     to distrust such a comment would instead make a genuine
+//     statement-format DML wrapped the same way lex as no keyword at
+//     all, so the belt would not fire and the write would be dropped
+//     SILENTLY. A false refusal outranks a silent miss here, per the
+//     project's own ordering, so the loud direction is kept on purpose.
+//   - REDACTION ([statementDMLCommentSkip]) IS guarded, because there
+//     the same mis-lex leaks a row-value fragment into a refusal that
+//     promises values are withheld, and the safe fallback costs only a
+//     diagnostic. See the guard's own comment.
+//
 // The belt is scope-gated like the generic arm's
 // cache clear (Bug 246: a statement-format writer on an UNRELATED
 // database must not kill the sync); the trade is that a statement
@@ -344,6 +367,31 @@ func statementDMLCommentSkip(query string) int {
 		case c == '/' && i+1 < len(query) && query[i+1] == '*':
 			end := strings.Index(query[i+2:], "*/")
 			if end < 0 {
+				return 0
+			}
+			// A `/*! … */` EXECUTABLE comment is lexed by MySQL as SQL,
+			// so a `*/` inside a string literal does NOT terminate it —
+			// unlike a plain `/* … */`, where MySQL is quote-blind exactly
+			// as this scan is. Ground-truthed on real MySQL 8.0.46 by the
+			// v0.137.1 pre-tag review: a versioned comment carrying `*/`
+			// inside a quoted value makes this scan stop early, mid-value,
+			// and the offset is then NOT past a comment — which is the
+			// unstated premise the allowlist's completeness argument rests
+			// on. Two consequences were observed, both real: a healthy
+			// ROW-logged DDL raised the stream-fatal STATEMENT-DML refusal
+			// with a remedy that cannot succeed, and a row-value fragment
+			// reached a refusal whose own text promises values are
+			// withheld.
+			//
+			// Rather than lex MySQL's version-gated SQL here, take the
+			// already-blessed safe direction: if a versioned comment's
+			// skipped span carries a quote, refuse to trust the skip and
+			// return 0, exactly as an unterminated comment does. The lead
+			// then collapses to "…" — a lost diagnostic, never a leak. The
+			// shapes this exists for (Vitess `/*vt+ …*/`, sqlcommenter,
+			// mysqldump) carry no quotes and are unaffected.
+			if span := query[i : i+end+4]; strings.HasPrefix(span, "/*!") &&
+				strings.ContainsAny(span, "'\"") {
 				return 0
 			}
 			i += end + 4

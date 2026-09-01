@@ -824,7 +824,7 @@ func normalizePayloadValue(v any) any {
 // ("run `sluice migrate` to land the schema change") cannot land a drop.
 // Both directions of vintage skew are benign: an older reader sees an
 // unknown key and falls back to the generic refusal, and this reader
-// sees the key absent on every pre-v0.135 X row.
+// sees the key absent on every pre-v0.136.0 X row.
 const ddlMarkerDroppedRelationKey = "dropped_relation"
 
 // ddlMarker is the decoded §7 X row: what the source did, and — for the

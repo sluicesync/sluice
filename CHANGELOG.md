@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.137.1] - 2026-09-01
+
+A one-line fix for a diagnostic regression v0.137.0 introduced, plus the correction of a compatibility claim that release over-stated. No data path changes; nothing silent was at risk in either.
+
+### Fixed
+
+**A comment-prefixed statement keeps its diagnostic in the `SLUICE-E-CDC-STATEMENT-DML` refusal.** v0.137.0 taught the refusal's redaction to skip a leading SQL comment, and moved the *end* of the quoted fragment without moving its *start* — so the comment text was still echoed, and a long one crowded out everything worth reading. An sqlcommenter or `traceparent` prefix runs to about 110 bytes against an 80-byte cap, which left refusals whose entire quoted fragment was comment and which named neither the verb nor the table: exactly the diagnostic loss v0.137.0 set out to fix, one step further along. Short comments still showed a verb, which is why v0.137.0's own tests passed. Values were never at risk in either version — the cut only ever moved earlier, never later.
+
+Anyone running MySQL sync behind Vitess or PlanetScale (`/*vt+ …*/`), ProxySQL, or a tracing-instrumented client was in the affected shape; nobody who hit it lost data, they lost the ability to tell which statement tripped the refusal.
+
+**A `/*!` versioned comment carrying a quote no longer leaks a value fragment into that refusal.** MySQL lexes a `/*! … */` *executable* comment's contents as SQL, so a `*/` inside a string literal does not terminate it — unlike a plain `/* … */`, where MySQL is quote-blind exactly as sluice's scan is. Such a comment therefore stopped the scan mid-value and the value's remainder was echoed. Ground-truthed on real MySQL 8.0.46; the comment is now not trusted at all, falling back to quoting nothing. Quote-free versioned comments (`mysqldump`, Vitess) are unaffected. The matching detection path is deliberately unchanged and the asymmetry is documented at the code: the same mis-lex can raise this refusal on a healthy ROW-logged DDL — loud and recoverable — whereas changing it would let a genuinely statement-logged write lex as nothing and be dropped silently.
+
+Also corrects five in-code comments that dated the `sql_drop` capture tier to v0.135; `git tag --contains` puts it in v0.136.0.
+
+### Changed
+
+**v0.137.0's compatibility note is corrected in place.** It said every pgtrigger install that has not re-run `sluice trigger setup` opens with a `STALE-CAPTURE-FUNCTION` warning. It does not: the warning fires only when an install's capture-function definitions **differ** from what the running binary renders, so an install already byte-identical — a v0.136.0 one, for instance — opens silent. Those installs capture correctly. The residual, now stated rather than implied, is that without a recorded provenance digest a later hand-edit of a capture function can only be warned about there, never refused. Re-running `trigger setup` once records the digest and closes it. A fresh install on v0.137.0 or later records it at setup and is unaffected.
+
+### Compatibility
+
+Drop-in from v0.137.0. No schema, format, flag or behaviour change beyond the refusal text above.
+
 ## [0.137.0] - 2026-09-01
 
 The tail of the 2026-08-31 blind audit. The `postgres-trigger` capture door stops trusting a trigger's *name* and starts grading what it actually executes; the echo-loop refusal stops looking in one schema for a database-wide hazard; and the statement-format-DML refusal stops printing operator data. **Every existing pgtrigger install will WARN until `sluice trigger setup` is re-run once — see Compatibility.**

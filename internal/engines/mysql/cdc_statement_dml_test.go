@@ -318,6 +318,18 @@ func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
 			t.Errorf("%s: statementDMLLead(%q) = %q — a literal survived; skipping the comment must "+
 				"move the START of the cut, never widen what it keeps", name, q, lead)
 		}
+		// start <= cut is a PANIC-FREEDOM precondition, not a nicety:
+		// statementDMLLead slices query[start:cut], so an inversion is a
+		// crash on a refusal path. It holds by construction only because
+		// statementDMLCut re-derives its start from the same pure
+		// statementDMLCommentSkip and never moves backwards — a coupling
+		// nothing else states. (Mutation-verified in the v0.137.1 review:
+		// forcing statementDMLCut's own start to 0 panics with
+		// "slice bounds out of range" on the first comment-prefixed input.)
+		if s, c := statementDMLCommentSkip(q), statementDMLCut(q); s > c {
+			t.Errorf("%s: statementDMLCommentSkip=%d > statementDMLCut=%d for %q — statementDMLLead "+
+				"slices query[start:cut] and would panic on a refusal path", name, s, c, q)
+		}
 		// The comment text itself must not be echoed. Asserting the verb
 		// survives is NOT sufficient on its own: with the comment kept and
 		// a short comment, both hold at once, which is how Bug 258 passed.
@@ -333,6 +345,44 @@ func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
 	// statement on malformed input.
 	if lead := statementDMLLead("/* unterminated UPDATE patients SET ssn = '078051120'"); strings.Contains(lead, "078051120") {
 		t.Errorf("an unterminated comment leaked: %q", lead)
+	}
+}
+
+// TestStatementDMLLead_VersionedCommentWithAQuoteIsNotTrusted pins the
+// v0.137.1 guard. MySQL lexes a `/*! … */` EXECUTABLE comment's contents as
+// SQL, so a `*/` inside a string literal does NOT terminate it — while the
+// skip is quote-blind, which is right for a plain comment and wrong for a
+// versioned one. A versioned comment carrying `*/` inside a quoted value
+// therefore stopped the skip MID-VALUE, and the remainder of the value was
+// echoed into a refusal that promises values are withheld.
+//
+// The statement below is not contrived: it is what real MySQL 8.0.46 wrote to
+// the binlog for a genuine statement-format UPDATE, observed by the v0.137.1
+// pre-tag review via SHOW BINLOG EVENTS.
+func TestStatementDMLLead_VersionedCommentWithAQuoteIsNotTrusted(t *testing.T) {
+	t.Parallel()
+
+	const secret = "078051120"
+	q := `/*!40000 UPDATE patients SET note='a */ UPDATE ssn` + secret + `' WHERE id=1 */`
+	if !strings.Contains(q, secret) {
+		t.Fatalf("the fixture lost its secret: %q", q)
+	}
+	if lead := statementDMLLead(q); strings.Contains(lead, secret) {
+		t.Errorf("statementDMLLead(%q) = %q — a row-value fragment reached the refusal. A `/*!` comment "+
+			"whose skipped span carries a quote must not be trusted as a comment; the safe fallback is "+
+			"to cut at 0 and lose the diagnostic", q, lead)
+	}
+
+	// The guard must be NARROW. A versioned comment without a quote is the
+	// common real shape (mysqldump, Vitess) and must still be skipped, or
+	// the guard would quietly disable the Bug 258 fix for those.
+	plain := "/*!40000 */ DELETE FROM patients WHERE ssn = '" + secret + "'"
+	lead := statementDMLLead(plain)
+	if !strings.HasPrefix(lead, "DELETE FROM patients WHERE ssn") {
+		t.Errorf("statementDMLLead(%q) = %q — a quote-free versioned comment must still be skipped", plain, lead)
+	}
+	if strings.Contains(lead, secret) {
+		t.Errorf("statementDMLLead(%q) = %q — literal survived", plain, lead)
 	}
 }
 
@@ -358,29 +408,50 @@ func TestStatementDMLLeadFamilyMatrix(t *testing.T) {
 			if strings.Count(opFmt, "%s") == 2 { // BETWEEN takes two operands
 				args = append(args, lit.literal)
 			}
-			query := "DELETE FROM patients WHERE " + fmt.Sprintf(opFmt, args...)
+			stmt := "DELETE FROM patients WHERE " + fmt.Sprintf(opFmt, args...)
 
-			// Anti-vacuity, per cell: the secret must actually be in the
-			// input, or "the lead does not contain it" proves nothing.
-			if !strings.Contains(query, lit.secret) {
-				t.Fatalf("%s: the cell's own statement %q does not contain the secret %q — the assertion "+
-					"below would pass vacuously", name, query, lit.secret)
-			}
+			// THIRD AXIS, added 2026-09-01. Bug 258 moved where the cut
+			// STARTS, and this matrix ran entirely at start == 0 while the
+			// comment test ran many comment forms against one literal
+			// shape — so the product of the two was untested precisely on
+			// the axis that had just changed. Every comment prefix here
+			// carries no quote, so none trips the `/*!` guard.
+			for _, prefix := range []string{
+				"",
+				"/* app */ ",
+				"/*vt+ QUERY_TIMEOUT_MS=30000 */ ",
+				"/*!40000 */ ",
+				"-- trace\n",
+				"# trace\n",
+				"  \t\n",
+			} {
+				query := prefix + stmt
 
-			lead := statementDMLLead(query)
-			if strings.Contains(lead, lit.secret) {
-				t.Errorf("%s: statementDMLLead(%q) = %q — the %s literal survived into the refusal, which "+
-					"the refusal's own text promises it will not (\"values withheld\"). Binlog statement "+
-					"text carries row values; a value that rides the refusal into logs and reports bypasses "+
-					"--redact entirely.", name, query, lead, litName)
+				// Anti-vacuity, per cell: the secret must actually be in
+				// the input, or "the lead does not contain it" proves
+				// nothing.
+				if !strings.Contains(query, lit.secret) {
+					t.Fatalf("%s: the cell's own statement %q does not contain the secret %q — the assertion "+
+						"below would pass vacuously", name, query, lit.secret)
+				}
+
+				lead := statementDMLLead(query)
+				if strings.Contains(lead, lit.secret) {
+					t.Errorf("%s [prefix %q]: statementDMLLead(%q) = %q — the %s literal survived into the "+
+						"refusal, which the refusal's own text promises it will not (\"values withheld\"). "+
+						"Binlog statement text carries row values; a value that rides the refusal into logs "+
+						"and reports bypasses --redact entirely.", name, prefix, query, lead, litName)
+				}
+				// The other direction: a redactor that returned "" would
+				// pass every check above. The diagnostic prefix must
+				// survive — including past a leading comment.
+				if !strings.HasPrefix(lead, wantPrefix) {
+					t.Errorf("%s [prefix %q]: statementDMLLead(%q) = %q; want it to keep the diagnostic "+
+						"prefix %q — verb, table and column are what make the refusal actionable",
+						name, prefix, query, lead, wantPrefix)
+				}
+				cells++
 			}
-			// The other direction: a redactor that returned "" would pass
-			// every check above. The diagnostic prefix must survive.
-			if !strings.HasPrefix(lead, wantPrefix) {
-				t.Errorf("%s: statementDMLLead(%q) = %q; want it to keep the diagnostic prefix %q — verb, "+
-					"table and column are what make the refusal actionable", name, query, lead, wantPrefix)
-			}
-			cells++
 		}
 	}
 
@@ -403,16 +474,17 @@ func TestStatementDMLLeadFamilyMatrix(t *testing.T) {
 			t.Errorf("the literal kind %q is missing from statementDMLLiteralKinds", lit)
 		}
 	}
-	if want := len(statementDMLPredicateOperators) * len(statementDMLLiteralKinds); cells != want {
-		t.Fatalf("exercised %d cells; want %d (%d operator families x %d literal kinds)",
-			cells, want, len(statementDMLPredicateOperators), len(statementDMLLiteralKinds))
+	const commentPrefixes = 7 // the third axis; keep in step with the loop above
+	if want := len(statementDMLPredicateOperators) * len(statementDMLLiteralKinds) * commentPrefixes; cells != want {
+		t.Fatalf("exercised %d cells; want %d (%d operator families x %d literal kinds x %d comment prefixes)",
+			cells, want, len(statementDMLPredicateOperators), len(statementDMLLiteralKinds), commentPrefixes)
 	}
 	// Absolute floor, separate from the product above: the product shrinks
 	// on BOTH sides when a table is trimmed, so it cannot notice a matrix
 	// that narrowed back toward a representative. Set at today's size.
-	if cells < 11*27 {
-		t.Fatalf("exercised %d cells; the matrix has shrunk below the 11 x 27 it covered when this "+
-			"floor was set — a literal kind or operator family was removed", cells)
+	if cells < 11*27*7 {
+		t.Fatalf("exercised %d cells; the matrix has shrunk below the 11 x 27 x 7 it covered when this "+
+			"floor was set — a literal kind, operator family or comment prefix was removed", cells)
 	}
 }
 

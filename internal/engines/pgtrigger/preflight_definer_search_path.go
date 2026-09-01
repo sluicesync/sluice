@@ -49,7 +49,7 @@ import (
 // # What this door reaches (the gate-scope enumeration, per CLAUDE.md)
 //
 // All FOUR sluice-owned capture functions in the schema — row, truncate,
-// DDL and (since v0.135, the D-1 sql_drop arm) drop — not just the one that
+// DDL and (since v0.136.0, the D-1 sql_drop arm) drop — not just the one that
 // shipped vulnerable. The row and truncate
 // functions have carried the pin since the engine's first commit
 // (`git log -S` on setup.go returns exactly one commit), so no released

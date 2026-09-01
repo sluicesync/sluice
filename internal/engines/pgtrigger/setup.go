@@ -1849,7 +1849,7 @@ $sluice$;`
 // be used, which is louder than necessary). KeepData retains the
 // change-log table for post-mortem inspection.
 func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
-	// Event triggers FIRST (D-1): from v0.135 the sql_drop arm records an
+	// Event triggers FIRST (D-1): from v0.136.0 the sql_drop arm records an
 	// op='X' row for a dropped captured table, and teardown's own
 	// statements — the per-table DROP TRIGGERs and, with keepData=false,
 	// the control-table DROP TABLEs — must never write into a change log

@@ -115,7 +115,7 @@ type eventTriggerState struct {
 // eventTier is one of the §7 DDL tier's two event-trigger arms. Each is
 // graded independently and each is EXEMPT when its own function is absent
 // — that is what keeps a polled-fingerprint install (no functions at all)
-// and a pre-v0.135 install (no sql_drop arm) from false-refusing. The
+// and a pre-v0.136.0 install (no sql_drop arm) from false-refusing. The
 // pairing is the door's independent evidence: setup creates a tier's
 // function and its event trigger in the same canEventTrigger branch, so
 // "function present, trigger absent" proves a manual DROP EVENT TRIGGER.
@@ -429,7 +429,7 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 	// that exemption carries two populations, not one: a polled-fingerprint
 	// install (no functions at all — requiring an event trigger would
 	// false-refuse every --allow-polled-fingerprint source) and, for the
-	// sql_drop arm only, an install made before v0.135, which never had it.
+	// sql_drop arm only, an install made before v0.136.0, which never had it.
 	// The second population is not silently tolerated: warnDropCaptureAbsent
 	// WARNs at every open, because "no drop detection" is the D-1 gap.
 	for _, tier := range eventTierRoster {
