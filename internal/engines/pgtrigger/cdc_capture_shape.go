@@ -26,6 +26,11 @@ import (
 //
 // # What this door reaches (the gate-scope enumeration, stated per CLAUDE.md)
 //
+//   - Every capture trigger the install creates — the per-table row and
+//     truncate pair AND both event triggers — graded against the recorded
+//     ADR-0185 posture (audit A-1). The mechanical statement of that scope
+//     is the capture-tier roster (capture_tier_roster_test.go), which
+//     derives its universe from what renderSetupDDL emits.
 //   - Every table where AT LEAST ONE sluice capture trigger still exists:
 //     a missing partner (DROP TRIGGER leaves the pair broken), a disabled or
 //     replica-only trigger, a wrong bound function, a wrong trigger shape
@@ -246,12 +251,16 @@ SELECT e.evtenabled::text, p.proname
 // function, the posture upsert), preserving the change-log, its watermark,
 // and the consumer registry.
 //
-// captureReplicated is the RECORDED intent; the posture match it drives
-// covers the two per-table triggers only. The DDL event triggers are graded
-// as before (evtenabled 'O' or 'A' both accept): the opt-in never alters
-// their enablement — logical replication does not replicate DDL, so there is
-// no replicated-writes analogue for the event-trigger tier — and 'A' there
-// changes nothing the tag filter would see differently.
+// captureReplicated is the RECORDED intent, and since audit 2026-08-31 A-1
+// the posture match it drives covers EVERY capture trigger the install
+// creates — the two per-table triggers and both event triggers. The ADR's
+// original scope ("the opt-in never alters the event trigger's enablement —
+// logical replication does not replicate DDL") was true of a native
+// subscription apply worker and false of the write class the opt-in
+// actually admits: `session_replication_role = replica` is an ordinary
+// operator/ETL idiom, and an 'O' event trigger does not fire for it
+// (observed). Grading three of four triggers would leave the door narrower
+// than its name.
 func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl ddlCaptureState, captureReplicated bool) error {
 	byTable := map[string]map[string]installedCaptureTrigger{}
 	for _, it := range installed {
@@ -388,13 +397,37 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 				schema, tier.fn, tier.trigger, tier.watches,
 			)
 		}
+		// The event triggers carry the SAME posture as the per-table pair
+		// (audit 2026-08-31 A-1): 'A' under the opt-in, 'O' without it.
+		// Before A-1 this arm accepted 'O' or 'A' blindly, on the ADR's
+		// premise that "logical replication does not replicate DDL" — true
+		// of a native apply worker, but the opt-in admits replica-role
+		// writes from ANY session, so the two capture tiers could disagree.
+		wantEvtEnabled := "O"
+		if captureReplicated {
+			wantEvtEnabled = "A"
+		}
 		switch evt.enabled {
-		case "O", "A":
+		case wantEvtEnabled:
 		case "D", "R":
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is not enabled for origin sessions (evtenabled=%q) — %s would go undetected, "+
 					"so a post-DDL capture would silently mis-capture instead of refusing; ALTER EVENT TRIGGER %s ENABLE, or re-run `sluice trigger setup`",
 				tier.trigger, evt.enabled, tier.watches, tier.trigger,
+			)
+		case "A": // reachable only when the recorded posture is origin-only
+			return fmt.Errorf(
+				"pgtrigger: event trigger %q is set ENABLE ALWAYS but this install recorded ORIGIN-ONLY capture — its enablement was flipped by hand, "+
+					"so %s is captured for replica-role sessions whose DML this install does NOT capture, and the two tiers disagree; "+
+					"re-run `sluice trigger setup` to restore origin-only capture, or re-run it with --capture-replicated-writes to make replicated capture the recorded, vetted intent",
+				tier.trigger, tier.watches,
+			)
+		default: // evt.enabled == "O" while the recorded posture is ENABLE ALWAYS
+			return fmt.Errorf(
+				"pgtrigger: event trigger %q is plain ENABLE (origin-only) but this install recorded --capture-replicated-writes — %s is NOT detected for "+
+					"replica-role (replicated/applied) sessions while their DML IS captured, so the applier would write post-DDL-shaped rows with no refusal "+
+					"(ADR-0185, audit A-1); re-run `sluice trigger setup --capture-replicated-writes` to set it ENABLE ALWAYS",
+				tier.trigger, tier.watches,
 			)
 		}
 		if evt.fn != tier.fn {

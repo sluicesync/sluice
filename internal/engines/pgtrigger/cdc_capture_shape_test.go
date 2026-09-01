@@ -42,6 +42,10 @@ func alwaysTriggers(table string) []installedCaptureTrigger {
 var (
 	healthyEvt     = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL}
 	healthyDropEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDrop}
+	// The ENABLE ALWAYS ('A') shapes the --capture-replicated-writes opt-in
+	// installs (ADR-0185 + audit A-1).
+	alwaysEvt     = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL}
+	alwaysDropEvt = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDrop}
 )
 
 // tiers builds the event-trigger-tier state with BOTH arms' functions
@@ -91,7 +95,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name:              "healthy ENABLE ALWAYS install accepts under the opt-in posture",
 			installed:         alwaysTriggers("t"),
-			ddl:               healthyTiers(),
+			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
 		},
 		{
@@ -110,7 +114,7 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddl:               healthyTiers(),
+			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
 			wantErr:           []string{CaptureTriggerRow, "--capture-replicated-writes", "NOT being captured"},
 		},
@@ -120,7 +124,7 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddl:               healthyTiers(),
+			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
 			wantErr:           []string{CaptureTriggerTruncate, "--capture-replicated-writes", "TRUNCATE"},
 		},
@@ -130,17 +134,39 @@ func TestGradeCaptureShape(t *testing.T) {
 				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
 			},
-			ddl:               healthyTiers(),
+			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
 			wantErr:           []string{"DISABLED"},
 		},
 		{
-			// The opt-in never alters the event trigger's enablement, so
-			// evtenabled 'A' stays accepted under either posture (the
-			// door's evt scope note).
-			name:      "event trigger ENABLE ALWAYS accepts under the plain posture",
+			// A-1: the event triggers now carry the posture too, in BOTH
+			// directions. 'A' under a recorded origin-only install is
+			// hand-flipped drift (and makes the two tiers disagree the other
+			// way round).
+			name:      "event trigger ENABLE ALWAYS under a recorded origin-only posture refuses",
 			installed: healthyTriggers("t"),
 			ddl:       tiers(eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL}, healthyDropEvt),
+			wantErr:   []string{CaptureTriggerDDL, "ENABLE ALWAYS", "ORIGIN-ONLY"},
+		},
+		{
+			name:              "plain DDL event trigger under the opt-in posture refuses (A-1's exact shape)",
+			installed:         alwaysTriggers("t"),
+			ddl:               tiers(healthyEvt, alwaysDropEvt),
+			captureReplicated: true,
+			wantErr:           []string{CaptureTriggerDDL, "--capture-replicated-writes", "NOT detected"},
+		},
+		{
+			name:              "plain sql_drop event trigger under the opt-in posture refuses too (both arms graded)",
+			installed:         alwaysTriggers("t"),
+			ddl:               tiers(alwaysEvt, healthyDropEvt),
+			captureReplicated: true,
+			wantErr:           []string{CaptureTriggerDrop, "--capture-replicated-writes", "DROP of a captured table"},
+		},
+		{
+			name:              "both event triggers ENABLE ALWAYS accept under the opt-in posture",
+			installed:         alwaysTriggers("t"),
+			ddl:               tiers(alwaysEvt, alwaysDropEvt),
+			captureReplicated: true,
 		},
 		{
 			// The D-1 upgrade shape: the sql_drop arm was never installed.

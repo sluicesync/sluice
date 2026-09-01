@@ -751,14 +751,19 @@ func pkColsJSON(cols []string) string {
 // The trigger DDL is not a member of the class: it emits
 // `DROP TRIGGER IF EXISTS` plus a plain `CREATE TRIGGER`, which is loud.
 //
-// captureReplicated (ADR-0185) adds, per table, an
-// `ALTER TABLE … ENABLE ALWAYS TRIGGER` for the row and truncate triggers
-// — PostgreSQL has no ENABLE ALWAYS clause on CREATE TRIGGER, so the
-// posture is a separate ALTER after each create — and records the posture
-// in the meta upsert so every CDC open can grade the installed enablement
-// against the recorded intent (the F2 door's posture match). A re-run
-// WITHOUT the flag converges an opt-in install back to plain: the
-// DROP + CREATE yields fresh 'O' triggers and the upsert records false.
+// captureReplicated (ADR-0185) adds an ENABLE ALWAYS ALTER for EVERY
+// capture trigger this plan creates — per table, the row and truncate
+// triggers; and, on the event-trigger tier, both event triggers (audit
+// 2026-08-31 A-1: PostgreSQL filters event triggers by evtenabled against
+// session_replication_role exactly as it filters row triggers, so leaving
+// them plain made the opt-in capture replica-role DML while staying blind
+// to replica-role DDL). PostgreSQL has no ENABLE ALWAYS clause on CREATE
+// TRIGGER, so the posture is a separate ALTER after each create. The
+// posture is recorded in the meta upsert so every CDC open can grade the
+// installed enablement against the recorded intent (the F2 door's posture
+// match, which grades all four triggers). A re-run WITHOUT the flag
+// converges an opt-in install back to plain: the DROP + CREATE yields
+// fresh 'O' triggers and the upsert records false.
 //
 // # The plan is ONE transaction (Bug 257 + audit SEC-2 / C-1)
 //
@@ -985,6 +990,23 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 				dropFnRef(schema),
 			),
 		)
+		if captureReplicated {
+			// ADR-0185 + audit 2026-08-31 A-1: PostgreSQL filters EVENT
+			// triggers by evtenabled against session_replication_role
+			// exactly as it filters row triggers (observed: an 'O' event
+			// trigger does not fire for a replica-role ALTER; ENABLE ALWAYS
+			// restores it). Without these two ALTERs the opt-in captured
+			// replica-role DML while leaving replica-role DDL invisible —
+			// the applier would then write post-DDL-shaped rows into a
+			// target the stream never refused for. One flag, one coherent
+			// capture posture: every trigger this install creates fires
+			// under replica role, or none does.
+			out = append(
+				out,
+				fmt.Sprintf("ALTER EVENT TRIGGER %s ENABLE ALWAYS", quoteIdent(CaptureTriggerDDL)),
+				fmt.Sprintf("ALTER EVENT TRIGGER %s ENABLE ALWAYS", quoteIdent(CaptureTriggerDrop)),
+			)
+		}
 	}
 
 	out = append(out, renderDisarmSetupEvidence(metaRef), "COMMIT")
