@@ -610,10 +610,15 @@ func TestLoadDataSegments_SegmentationCostsOnlyTheExtraStatements(t *testing.T) 
 			single.statements)
 	}
 	wantSegments := corpusBytes / smallBudget
-	if segmented.statements < 2 {
+	// Bounded on BOTH sides. Too few means the budget stopped taking effect;
+	// too many means the copy degenerated toward a round trip per row, which
+	// is one of the exact regressions this test exists to catch.
+	if segmented.statements < 2 || segmented.statements > 2*wantSegments {
 		t.Fatalf("the %d MiB-budgeted copy issued %d LOAD DATA statements; want the ~%d segments a "+
-			"%.1f MiB corpus implies. Nothing below is meaningful if segmentation did not happen",
-			smallBudget>>20, segmented.statements, wantSegments, float64(corpusBytes)/(1<<20))
+			"%.1f MiB corpus implies (bounded to [2, %d]). Below 2 the budget is not taking effect and "+
+			"nothing else here is meaningful; above the ceiling the copy is issuing statements far "+
+			"smaller than the budget — a round trip per row or per batch",
+			smallBudget>>20, segmented.statements, wantSegments, float64(corpusBytes)/(1<<20), 2*wantSegments)
 	}
 
 	// The model's two "nothing else changed" clauses.
@@ -622,15 +627,19 @@ func TestLoadDataSegments_SegmentationCostsOnlyTheExtraStatements(t *testing.T) 
 			"exactly the same rows — a difference means a row was lost, duplicated, or re-written",
 			segmented.rows, single.rows)
 	}
-	// Slack: one 16 KiB driver packet per segment. The real per-segment
-	// overhead is the repeated statement text plus a SHOW WARNINGS probe,
-	// a few hundred bytes; a re-transmitted corpus would be megabytes.
-	slack := segmented.statements * (16 << 10)
+	// Slack: one 16 KiB driver packet per EXPECTED segment. Deliberately
+	// keyed to wantSegments and not to segmented.statements — a tolerance
+	// funded by the observed value grows to cover whatever it observes, so
+	// a copy that issued a statement per row would buy itself gigabytes of
+	// slack and pass. The real per-segment overhead is the repeated
+	// statement text plus a SHOW WARNINGS probe, a few hundred bytes; a
+	// re-transmitted corpus would be megabytes.
+	slack := (wantSegments + 2) * (16 << 10)
 	if delta := segmented.bytes - single.bytes; delta > slack {
 		t.Errorf("Bytes_received: %d segmented against %d monolithic, %d bytes more over %d segments "+
-			"(slack is %d = one 16 KiB packet each). Segmentation is putting bytes on the wire that "+
-			"the monolithic form does not — a re-encode, a re-transmitted buffer, or a per-row round trip",
-			segmented.bytes, single.bytes, delta, segmented.statements, slack)
+			"(slack is %d = one 16 KiB packet per expected segment). Segmentation is putting bytes on "+
+			"the wire that the monolithic form does not — a re-encode, a re-transmitted buffer, or a "+
+			"per-row round trip", segmented.bytes, single.bytes, delta, segmented.statements, slack)
 	}
 }
 
