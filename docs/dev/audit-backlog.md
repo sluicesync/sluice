@@ -282,6 +282,18 @@ The psdb correction above came with a sweep for the same shape — an operator-f
 
 A gate built alongside these that was not on the G-list, recorded so it is findable: `TestBinlogTypeFamilyRoster` is a fail-by-default roster requiring every `data_type` `translateType` accepts to be either classified for the CDC-4 guard or listed as exempt with a reason, and `TestCDCSteadyState_EveryDataTypePassesTheGuard` ground-truths that classification against what a real mysqld writes into a TABLE_MAP (a single wrong entry produces a false refusal, which is how it was mutation-verified).
 
+## 2026-09-01 — OPEN, unexplained: a SEGFAULT on the `engines-mysql` shard, correlated with the server_uuid commit
+
+**Filed, not resolved, and deliberately not called a flake.** CI run `33549409943` on `947df8b0` failed the `Integration (engines-mysql)` shard with `signal: segmentation fault (core dumped)` — not an assertion, no Go panic, no stack, no DATA RACE report. It surfaced at `=== RUN TestCDCReader_TimestampNonUTCHost`, but a segfault kills the process, so the crashing goroutine may be anywhere.
+
+**Evidence both ways, stated honestly.** Against it being mine: the rerun of the same commit passed, and all three of the involved tests pass locally in isolation (Windows, `CGO_ENABLED=0` so no `-race`, ample RAM). For it being mine: the shard passed on the **previous five consecutive runs** (`c10f91a3`, `ddfffeef`, `0268f325`, `63abc1db`, `906e158e`) and failed on the first run of the commit that adds **three extra MySQL containers** to that shard — `TestBackupPositionStampsServerUUID` boots one and `TestBackupChainResumeRefusesAcrossInstances` boots two, all under `-race` on a ~7 GB runner, and all of them run *before* the crashing test in Go's source order.
+
+**Leading hypothesis (unproven):** resource pressure from the added containers, since the crash is neither reproducible in isolation nor deterministic. A bare segfault with no Go stack usually means the runtime or the race detector's C++ runtime, not application code — which is consistent with exhaustion rather than a nil-deref.
+
+**Proposed next step, cheapest first:** fold `TestBackupPositionStampsServerUUID` into `TestBackupChainResumeRefusesAcrossInstances`, which already boots instance A and takes a backup on it — the stamping assertion can ride that fixture. That takes the shard from three extra containers to two with no loss of coverage. Do this before adding any further multi-instance test to this shard.
+
+**Do NOT record this as a known flake and do NOT add a rerun allowance for it.** That is exactly the shape that hid the `TestLoadDataSegments_ThroughputCost` false premise for four releases (see the struck entry above). A second occurrence is a finding, not a retry.
+
 ## 2026-09-01 — DESIGN CALL for the operator: should a provenance-less pgtrigger install WARN?
 
 **DECIDED 2026-09-01 — option (a), by the operator.** Leave it; the residual stays documented at the code and nothing new warns. The reasoning, which is also the sharpest statement of why the residual is small: **a fresh `trigger setup` on v0.137.0+ records the digest at schema_version 5, so every NEW install is fully provenanced and gets the REFUSE arm automatically.** The gap can only ever affect an install created by a pre-v0.137.0 binary that nobody re-runs setup against — and while sluice is pre-user, that population is approximately empty. Options (b)–(d) below are kept for the revisit.

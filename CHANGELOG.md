@@ -4,6 +4,30 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.137.2] - 2026-09-01
+
+Closes a silent data-loss hole in the MySQL backup→CDC handoff. **If you resume MySQL sync from a backup manifest and your source has `gtid_mode=OFF` (MySQL 8's default), read the Fixed section — a fresh full backup is worth taking.**
+
+### Fixed
+
+**A backup-captured binlog position now records which server it came from.** MySQL binlog file names and offsets are *instance-local*: a replaced or rebuilt server starts a fresh, unrelated lineage that reuses the same names (`mysql-bin.000001`, and so on). sluice already knew this — `binlogPos.ServerUUID` exists precisely as the loud-failure floor for the "node replaced / restored from backup" class, and the resume path refuses when a position's recorded `server_uuid` does not match the source's.
+
+The two **backup** capturers never stamped it. The guard therefore skipped — its check is a no-op when the recorded identity is empty — so the one door named in its own rationale, *restored from backup*, was the door it did not reach. A `backup incremental` or a `sync start --position-from-manifest` pointed at a different instance was accepted, and streaming began at a byte offset in an unrelated binlog. Whether that surfaced as a parse error or as silence depended on byte alignment; when it aligned on an event boundary, changes were skipped and the run exited 0 looking healthy. Reproduced end to end on two MySQL 8.0.46 instances — three source rows never reached the target, while rows written after the resume applied normally.
+
+Both capturers now stamp the source's `@@server_uuid`, so a cross-instance resume refuses loudly and cold-starts instead. An unreadable `@@server_uuid` degrades to no stamp with a WARN rather than failing the backup — the cost being that that one cursor keeps the previous filename-only protection.
+
+**Who was exposed:** MySQL sources in file/pos mode — that is, `gtid_mode=OFF`, which is MySQL 8's default — resuming through the backup→CDC handoff, after the source instance was replaced, rebuilt, or swapped. **Not affected:** GTID mode (GTID UUIDs are already instance-bound and were always checked), MariaDB (always GTID mode), PlanetScale and Vitess (VStream positions, a different arm), and every Postgres source (a standby or replaced source is refused by its own preflight).
+
+**Backups taken before this release carry no identity**, and the resume path deliberately still accepts them rather than forcing a re-copy on positions that are almost certainly fine. Those chains keep the filename-only protection they have always had; taking one fresh full backup is what moves a chain onto the stronger guard.
+
+### Internal
+
+`TestFilePosPositionsCarryServerUUID_ASTRoster` derives its universe from the AST — every `binlogPos` literal in the package — rather than a hand-written list, so a future capture door cannot be added without either stamping the identity or failing the gate by `file:line`. Anti-vacuity floor at today's 5 sites across 4 files.
+
+### Compatibility
+
+Drop-in from v0.137.1. No schema, format or flag change. Positions captured by earlier versions continue to resume exactly as before.
+
 ## [0.137.1] - 2026-09-01
 
 A one-line fix for a diagnostic regression v0.137.0 introduced, plus the correction of a compatibility claim that release over-stated. No data path changes; nothing silent was at risk in either.
