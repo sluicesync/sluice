@@ -214,6 +214,10 @@ func verifyManifestSignaturePolicy(
 	mat verifyMaterial,
 	requireStrict bool,
 ) error {
+	// Heal provenance first — see [reportMaintenanceHeals]' door roster
+	// for why every verification entry point reports it, not just
+	// `backup verify`.
+	reportMaintenanceHeals(ctx, segStore, "restore")
 	sigPresent, err := manifestSigPresent(ctx, segStore, manifestPath)
 	if err != nil {
 		return err
@@ -257,6 +261,10 @@ func verifyChainSignatures(
 	mat verifyMaterial,
 	requireStrict bool,
 ) error {
+	// Heal provenance first — see [reportMaintenanceHeals]' door roster
+	// for why every verification entry point reports it, not just
+	// `backup verify`.
+	reportMaintenanceHeals(ctx, rootStore, "chain restore")
 	hasArtifacts, err := chainHasSignatureArtifacts(ctx, rootStore, links)
 	if err != nil {
 		return fmt.Errorf("chain restore: probe signature artifacts: %w", err)
@@ -303,7 +311,7 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 	// Heal provenance first (audit 2026-08-27 A3): a healed chain's
 	// signatures all verify, so without this line verify would report a
 	// laundered catalog as clean with no hint anything was regenerated.
-	reportMaintenanceHeals(ctx, store)
+	reportMaintenanceHeals(ctx, store, "backup verify")
 	// Signedness is decided by the PRESENCE of signature objects, never
 	// the tamperable FormatVersion field.
 	hasArtifacts, err := chainHasSignatureArtifacts(ctx, store, records)
@@ -532,24 +540,53 @@ func healStaleLineageSignatures(ctx context.Context, store irbackup.Store, cat *
 }
 
 // reportMaintenanceHeals surfaces the durable maintenance-heal records
-// (audit 2026-08-27 A3) on `backup verify` — informational, NEVER a
-// failure: a heal is the documented crash-stale recovery, and after one
-// every signature legitimately verifies, so the record's presence is the
-// only signal telling an operator "these signatures were regenerated on
-// <date> — decide whether that heal was yours". An unreadable log WARNs
-// (still not a failure — verify's signature checks stand on their own;
-// the log is evidence about provenance, not validity).
-func reportMaintenanceHeals(ctx context.Context, store irbackup.Store) {
+// (audit 2026-08-27 A3) — informational, NEVER a failure: a heal is the
+// documented crash-stale recovery, and after one every signature
+// legitimately verifies, so the record's presence is the only signal
+// telling an operator "these signatures were regenerated on <date> —
+// decide whether that heal was yours". An unreadable log WARNs (still not
+// a failure — the signature checks stand on their own; the log is evidence
+// about provenance, not validity). what names the reporting verb so the
+// line reads honestly on each path.
+//
+// DOOR ROSTER — every signature-verification entry point in this package,
+// and what each does (audit 2026-08-31 SEC-6). The A3 artifacts shipped
+// wired to `backup verify` ALONE, so an operator restoring a chain that
+// had been healed saw the reassuring "all manifest + lineage signatures
+// verified" line and nothing else — at the one moment the data actually
+// lands, which is precisely when the provenance matters most. There is no
+// single chokepoint the three share, so all three call it:
+//
+//   - [verifyBackupSignatures] — `backup verify` (restore.go). REACHED
+//     (the original A3 call site).
+//   - [verifyChainSignatures] — chain restore (chain_restore.go),
+//     `export-as-parquet` (export_parquet.go), and the broker freshness
+//     gate (broker_gate.go). REACHED, once per call, at the top.
+//   - [verifyManifestSignaturePolicy] — single-manifest restore
+//     (restore.go). REACHED, at the top. Not double-reported on chain
+//     re-entry: chain restore sets SkipChainDispatch, which skips this
+//     call entirely.
+//   - [healStaleLineageSignatures] — EXEMPT with reason: it is the WRITER
+//     of the record, not a reporter, and it already emits its own louder
+//     WARN naming the heal it is about to perform. Reporting prior heals
+//     there would announce provenance in the same breath as creating it.
+//
+// The roster is enforced, not promised: TestMaintenanceHealReportRoster_-
+// EveryVerifyEntryPointClassified derives the universe from the AST (every
+// function in this package that calls lineage.VerifyManifest or
+// lineage.VerifyLineage) and fails on a new entry point that neither
+// reports nor is classified exempt.
+func reportMaintenanceHeals(ctx context.Context, store irbackup.Store, what string) {
 	recs, err := lineage.ReadHealRecords(ctx, store)
 	if err != nil {
-		slog.WarnContext(ctx, "backup verify: cannot read the maintenance-heal log — heal provenance unknown",
+		slog.WarnContext(ctx, what+": cannot read the maintenance-heal log — heal provenance unknown",
 			slog.String("error", err.Error()))
 		return
 	}
 	for _, rec := range recs {
 		slog.InfoContext(
 			ctx,
-			"backup verify: chain signatures were regenerated by a no-op maintenance heal — if this heal was not an expected crash recovery, inspect the preserved pre-heal signature before trusting the current ones",
+			what+": chain signatures were regenerated by a no-op maintenance heal — if this heal was not an expected crash recovery, inspect the preserved pre-heal signature before trusting the current ones",
 			slog.String("healed_at", rec.HealedAt.Format(time.RFC3339)),
 			slog.String("operation", rec.Operation),
 			slog.String("signing_key_id", rec.KeyID),
