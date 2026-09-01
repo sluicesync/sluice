@@ -31,6 +31,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -47,6 +49,24 @@ import (
 // the new complete bytes, never a blend.
 type LocalStore struct {
 	root string
+
+	// sweptDirs records the directories whose crash-orphan sweep has
+	// already run for THIS store instance — the whole of
+	// [LocalStore.sweepStaleTemps]' cost control. Keys are native
+	// absolute directory paths; values are struct{}. Concurrency-safe
+	// without a lock of our own, which matters because the memo sits on
+	// the write path (see the sweep's doc).
+	sweptDirs sync.Map
+
+	// Sweep cost counters, observable so
+	// TestLocalStorePut_CostIsIndependentOfDirectorySize can assert the
+	// per-Put cost carries no directory read — counting the reads is
+	// what makes that gate deterministic instead of a wall-clock
+	// comparison. sweepDirScans counts completed os.ReadDir calls;
+	// sweepEntriesRead counts the directory entries those calls
+	// returned (the term that used to grow with the directory).
+	sweepDirScans    atomic.Uint64
+	sweepEntriesRead atomic.Uint64
 }
 
 // NewLocalStore creates a [LocalStore] rooted at root. The directory
@@ -104,20 +124,20 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
 	// A crash between CreateTemp and the rename orphans the unique temp
-	// file forever (nothing else ever names it). Sweep STALE same-key
-	// temps opportunistically on the next write of that key — bounded to
-	// this key's siblings, best-effort (a sweep failure never fails the
-	// write), and age-guarded so a live concurrent writer's fresh temp is
-	// never removed.
-	s.sweepStaleTemps(abs)
+	// file forever (nothing else ever names it). Sweep STALE temps in
+	// this key's directory on the FIRST write this store makes there —
+	// best-effort (a sweep failure never fails the write) and age-guarded
+	// so a live concurrent writer's fresh temp is never removed.
+	s.sweepStaleTemps(dir)
 	// os.CreateTemp opens O_EXCL with 0600 perms — unique per call (the
 	// concurrency requirement above) and never world-readable (chunk
 	// contents are row data; see the NewLocalStore doc comment).
-	f, err := os.CreateTemp(filepath.Dir(abs), filepath.Base(abs)+".tmp.*")
+	f, err := os.CreateTemp(dir, filepath.Base(abs)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("local store: create temp for %q: %w", path, err)
 	}
@@ -201,13 +221,14 @@ func (s *LocalStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) 
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
 	// Same crash-orphan sweep as Put: PutIfAbsent writes no temp file
-	// itself, but a crashed PUT of the same key may have left one, and
-	// this is the next write of that key.
-	s.sweepStaleTemps(abs)
+	// itself, but a crashed PUT into this directory may have left one,
+	// and this may be the store's first write there.
+	s.sweepStaleTemps(dir)
 	// 0600 like Put — see the NewLocalStore doc comment.
 	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -258,8 +279,8 @@ func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error
 // Put's own os.CreateTemp pattern — and before this filter a crash
 // mid-Put left a phantom entry in every subsequent listing forever
 // (surfacing in verify sweeps and consumer walks). The files
-// themselves are reclaimed by [LocalStore.sweepStaleTemps] on the next
-// same-key write.
+// themselves are reclaimed by [LocalStore.sweepStaleTemps] on the first
+// write a later store instance makes into their directory.
 //
 // Order is filesystem-dependent (filepath.Walk visits in lexical
 // order, which is good enough for "find every chunk under prefix"
@@ -344,7 +365,7 @@ func (s *LocalStore) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-// localStoreTempSweepAge is how old a same-key `.tmp.*` sibling must be
+// localStoreTempSweepAge is how old a `.tmp.<digits>` entry must be
 // before [LocalStore.sweepStaleTemps] reclaims it. Any live writer's temp
 // is seconds old (Put streams one object and renames); an hour-old temp is
 // a crash orphan. Generous on purpose — the cost of waiting is a little
@@ -375,28 +396,61 @@ func isPutTempName(name string) bool {
 	return true
 }
 
-// sweepStaleTemps best-effort removes crash-orphaned Put temp files for
-// ONE key: `<abs>.tmp.<digits>` siblings older than
-// [localStoreTempSweepAge]. Called by Put and PutIfAbsent before writing
-// that key — the only moment such orphans are cheaply discoverable without
-// a store-wide walk. Errors are deliberately swallowed: reclaiming an
-// orphan must never fail or slow the write that triggered it, and an
-// orphan that survives a failed sweep is retried on the key's next write.
-func (s *LocalStore) sweepStaleTemps(abs string) {
-	matches, err := filepath.Glob(abs + ".tmp.*")
+// sweepStaleTemps best-effort removes crash-orphaned Put temp files —
+// `<name>.tmp.<digits>` entries ([isPutTempName]) older than
+// [localStoreTempSweepAge] — from ONE directory, ONCE per store instance.
+// Called by Put and PutIfAbsent before writing into that directory.
+// Errors are deliberately swallowed: reclaiming an orphan must never fail
+// the write that triggered it.
+//
+// Once per directory is sufficient, and the once is load-bearing (audit
+// 2026-08-31 P-1). Orphans are crash residue from a PREVIOUS process —
+// nothing during a healthy run leaves one, since every Put either renames
+// its temp in or removes it on the error path — so everything there is to
+// reclaim is already on disk when this store makes its first write into
+// the directory. Sweeping on EVERY write instead made the backup chunk
+// writer quadratic: `filepath.Glob` with a metacharacter-free directory
+// component reads and sorts the WHOLE containing directory, chunks for one
+// table all land in one directory, so the Nth chunk paid an O(N) scan and
+// the table cost ~N²/2 comparisons plus N full directory enumerations
+// (measured: ~31 s of pure scanning for a 10,000-chunk table on Linux,
+// ~72 s on Windows, worse on network storage). Pinned by
+// TestLocalStorePut_CostIsIndependentOfDirectorySize.
+//
+// The scope is the DIRECTORY, not the one key being written. That is what
+// makes the memo safe — a per-key sweep run once per directory would only
+// ever reclaim one key's orphans — and it closes the A-6 half of the same
+// audit: chunk keys are written exactly once, so a per-key sweep could
+// never fire for the dominant object class at all. It also agrees with
+// [LocalStore.List], which hides these names store-wide by the same
+// predicate. Reading the directory with os.ReadDir rather than
+// filepath.Glob additionally removes the pattern hazard the audit flagged
+// alongside: an operator table named `order*` or `t[a-z]` used to be
+// interpolated straight into a glob pattern.
+func (s *LocalStore) sweepStaleTemps(dir string) {
+	// The whole synchronisation, and it stays OFF the write path's
+	// critical section: concurrent first-Puts into a directory race here,
+	// exactly one of them sweeps, and every other caller returns
+	// immediately rather than waiting on someone else's ReadDir.
+	if _, swept := s.sweptDirs.LoadOrStore(dir, struct{}{}); swept {
+		return
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	s.sweepDirScans.Add(1)
+	s.sweepEntriesRead.Add(uint64(len(entries)))
 	cutoff := time.Now().Add(-localStoreTempSweepAge)
-	for _, m := range matches {
-		if !isPutTempName(filepath.Base(m)) {
+	for _, e := range entries {
+		if e.IsDir() || !isPutTempName(e.Name()) {
 			continue
 		}
-		info, err := os.Stat(m)
-		if err != nil || info.IsDir() || info.ModTime().After(cutoff) {
-			continue // fresh (a live writer's), vanished, or not a file
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue // vanished, or fresh (a live writer's)
 		}
-		_ = os.Remove(m)
+		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
 }
 
