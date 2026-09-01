@@ -399,7 +399,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// copy — rather than at the post-copy StreamChanges chokepoint.
 	// Single-database scope is the DSN's database; multi-database scope
 	// is the selected set. See cdc_open_preflights.go.
-	if err := preflightBinlogCDCOpen(ctx, db, snapshotFilterScope(multiDatabase, cfg.DBName, databases, tables)); err != nil {
+	if err := preflightBinlogCDCOpen(ctx, db, snapshotFilterScope(multiDatabase, cfg.DBName, databases, tables), e.Flavor); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

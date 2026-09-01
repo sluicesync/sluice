@@ -658,7 +658,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// across a mysqld restart mid-sync. (The snapshot openers run the
 	// SAME set, so a cold start refuses before the bulk copy rather
 	// than after it.) See cdc_open_preflights.go.
-	if err := preflightBinlogCDCOpen(ctx, r.db, r.binlogFilterScope()); err != nil {
+	if err := preflightBinlogCDCOpen(ctx, r.db, r.binlogFilterScope(), r.flavor); err != nil {
 		return nil, err
 	}
 
@@ -2183,16 +2183,65 @@ func safePurgeHint(p binlogPos) string {
 // streamer's existing ADR-0022 fall-through to a clean cold-start
 // re-snapshot instead.
 //
-// persistedUUID is empty for positions written before the
-// ServerUUID field existed (transitional, zero-users) OR when the
-// reader couldn't read @@server_uuid at stream start; in either
-// degraded case we skip the identity check and let the filename
-// check stand — no false refusal, no regression, just no extra
-// protection for that one position. currentUUID empty (lookup
-// failed now) likewise degrades rather than refusing — a transient
-// information_schema hiccup shouldn't force a full re-snapshot.
+// The two empty cases were one `||` until 2026-09-01 and are now
+// SEPARATE branches, because they are different questions that happened
+// to share an answer:
+//
+//   - persistedUUID == "" — the position is UNVERIFIABLE, not wrong. It
+//     predates identity stamping (v0.137.2 and earlier backups; the
+//     transitional CDC case), or its capture degraded. Still accepted:
+//     that population cannot GROW, since every capture door now stamps,
+//     so it drains on its own — and refusing would force a full re-copy
+//     on positions that are almost certainly fine, a loud failure on a
+//     working configuration traded against a hazard already stopped at
+//     the source. It now WARNs, which it did not before: the residual
+//     here is silent DATA LOSS on an instance replacement, and an
+//     operator had no way to tell an unverifiable position from a
+//     verified one. The WARN is what makes "take a fresh full backup"
+//     actionable per chain instead of blanket advice.
+//   - currentUUID == "" — a PROBE FAILURE on a refusal-gating check,
+//     which is not the same thing at all. Fail-open here is the shape
+//     the F2 door's discipline rejects ("a refusal-gating probe must
+//     not degrade to a pass"). It is still permissive for now — a
+//     transient read must not force a re-snapshot, and MariaDB has no
+//     @@server_uuid by design (it never reaches this file/pos arm, but
+//     the function is generic) — so the posture is unchanged and the
+//     change is that it is no longer SILENT. Tightening it to a refusal
+//     is a live question deliberately left to the operator; see
+//     docs/dev/audit-backlog.md.
+//
+// Both stay permissive on purpose. The revisit trigger is the install
+// base, not the code: once there is one, the unverifiable population
+// stops draining on its own and the trade changes.
+// unverifiedInstanceIdentityMarker is the grep-stable prefix both
+// degraded arms of [verifySourceInstanceIdentity] carry, so an operator
+// can find every chain resuming without the identity check and the pins
+// can key on it.
+const unverifiedInstanceIdentityMarker = "UNVERIFIED-INSTANCE-IDENTITY"
+
 func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUID string) error {
-	if persistedUUID == "" || currentUUID == "" {
+	if persistedUUID == "" {
+		slog.WarnContext(
+			ctx, "mysql: cdc: "+unverifiedInstanceIdentityMarker+": this position carries no source "+
+				"instance identity, so it cannot be checked against the server being resumed from. It was "+
+				"captured before sluice stamped @@server_uuid onto binlog file/pos positions (v0.137.2 and "+
+				"earlier), or its capture could not read the value. The resume falls back to the binlog "+
+				"FILENAME check alone — and filenames are instance-local, so a replaced or rebuilt source "+
+				"reusing the same name would not be caught. Taking one fresh full backup moves this chain "+
+				"onto the identity check",
+			slog.String("current_server_uuid", currentUUID),
+		)
+		return nil
+	}
+	if currentUUID == "" {
+		slog.WarnContext(
+			ctx, "mysql: cdc: "+unverifiedInstanceIdentityMarker+": the position carries a source instance "+
+				"identity but the SOURCE's @@server_uuid could not be read, so the check could not run. "+
+				"This is a probe failure on a refusal-gating check, not an old position: it is being allowed "+
+				"through so a transient read does not force a full re-snapshot, but a replaced source would "+
+				"NOT be caught on this resume. If it persists, treat it as a real finding",
+			slog.String("persisted_server_uuid", persistedUUID),
+		)
 		return nil
 	}
 	if persistedUUID == currentUUID {

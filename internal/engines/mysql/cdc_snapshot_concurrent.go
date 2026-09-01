@@ -186,7 +186,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	if err := preflightBinlogCDCOpen(ctx, db, binlogFilterScope{
 		databases:    []string{cfg.DBName},
 		tableAllowed: tableAllowlist(tables),
-	}); err != nil {
+	}, e.Flavor); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
