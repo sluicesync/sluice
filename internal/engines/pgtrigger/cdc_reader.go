@@ -134,9 +134,11 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	}
 	// The recorded capture posture (ADR-0185): whether setup installed
 	// plain (origin-only) triggers or the --capture-replicated-writes
-	// ENABLE ALWAYS triggers. Fail-closed — the posture drives the two
-	// doors below, so streaming without it would grade against a guess.
-	captureReplicated, err := readCaptureReplicatedWritesPosture(ctx, db, cfg.schema)
+	// ENABLE ALWAYS triggers — and, since SL-5, the capture-function
+	// provenance the body arm distinguishes an old install from an edited
+	// one with. Fail-closed and read ONCE: the posture drives the two doors
+	// below, so streaming without it would grade against a guess.
+	meta, err := readInstallMeta(ctx, db, cfg.schema)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -148,7 +150,7 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// both drift tiers, and every subsequent DML would be silently
 	// uncaptured. Runs at every CDC open; both stream-open paths funnel
 	// through here.
-	if err := verifyCaptureTriggerShape(ctx, db, cfg.schema, captureReplicated); err != nil {
+	if err := verifyCaptureTriggerShape(ctx, db, cfg.schema, meta); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -160,7 +162,7 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// another sluice sync's applied rows is an echo loop. Fires here so
 	// BOTH stream-open paths get it: OpenCDCReader and OpenSnapshotStream
 	// construct the poller through this function.
-	if err := checkReplicaRoleCaptureShapes(ctx, db, cfg.schema, captureReplicated); err != nil {
+	if err := checkReplicaRoleCaptureShapes(ctx, db, cfg.schema, meta.captureReplicated); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

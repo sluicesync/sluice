@@ -50,16 +50,20 @@ const (
 	// auto-prune cuts against; v3 (ADR-0185) adds the meta table's
 	// capture_replicated_writes posture column; v4 (audit 2026-08-31 SEC-2)
 	// adds the three setup-evidence columns the DDL suppression is bound to
-	// ([metaSetupPIDCol] / [metaSetupNonceCol] / [metaSetupAtCol]). Setup is
-	// idempotent, so re-running it against an older install IS the
-	// migration: the CREATE TABLE IF NOT EXISTS adds the registry, the ADD
-	// COLUMN IF NOT EXISTS statements add the posture and evidence columns,
-	// and the meta upsert lifts the version. No reader gates on v3 or v4 —
-	// the posture read tolerates the column's absence
-	// (readCaptureReplicatedWritesPosture) and the capture function's
-	// evidence read tolerates it too (the bootstrap arm) — so the lift is
-	// bookkeeping that makes an install's vintage readable, not a door.
-	ChangeLogSchemaVer = 4
+	// ([metaSetupPIDCol] / [metaSetupNonceCol] / [metaSetupAtCol]); v5
+	// (audit 2026-08-31 SL-5) adds [metaCaptureDigestCol], the provenance
+	// the capture-shape door's body arm tells an old rendering from a
+	// post-setup replacement with. Setup is idempotent, so re-running it
+	// against an older install IS the migration: the CREATE TABLE IF NOT
+	// EXISTS adds the registry, the ADD COLUMN IF NOT EXISTS statements add
+	// the posture, evidence and digest columns, and the meta upsert lifts
+	// the version. No reader gates on v3 or v4 — the posture read tolerates
+	// the columns' absence ([readInstallMeta]) and the capture function's
+	// evidence read tolerates it too (the bootstrap arm). v5 is the first
+	// version any reader CONSULTS, and it consults it in the safe
+	// direction: below v5 the digest is not trusted and the body arm can
+	// only WARN, never refuse (see [installMeta.captureDigestTrusted]).
+	ChangeLogSchemaVer = 5
 
 	// metaCaptureReplicatedCol is the meta-table column recording whether
 	// this install's capture triggers are meant to be ENABLE ALWAYS
@@ -71,6 +75,19 @@ const (
 	// the migration, and the posture read defaults an absent column to
 	// false (origin-only), which is exactly what a pre-v3 install is.
 	metaCaptureReplicatedCol = "capture_replicated_writes"
+
+	// metaCaptureDigestCol is the v5 capture-function provenance column
+	// (audit 2026-08-31 SL-5): `name=<sha256>` per function the plan
+	// installs, of the definition it installs ([captureFunctionDigests]).
+	// It is what lets the capture-shape door's body arm distinguish "this
+	// install is older than the binary" (the definitions still match what
+	// setup recorded → WARN) from "something replaced a definition after
+	// setup" (they do not → refuse). Deliberately NOT in
+	// [internalTableColumnFloor], for the same reason the two column groups
+	// above are not: pre-v5 installs lack it, the ADD COLUMN IF NOT EXISTS
+	// in renderSetupDDL is the migration, and every reader tolerates its
+	// absence by falling back to the WARN-only arm.
+	metaCaptureDigestCol = "capture_fn_digest"
 
 	// setupSessionGUC is the transaction-scoped marker Setup's own plan sets
 	// and the DDL capture function returns early on (Bug 257). Without it,
@@ -939,6 +956,22 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
 	metaRef := tableRef(ChangeLogMetaTable)
+
+	// The capture functions this plan installs, rendered once and kept by
+	// name so the meta upsert can record their PROVENANCE digest (SL-5)
+	// while each statement still goes out in its load-bearing position.
+	// Keyed by name and not by position: the digest is per function, so a
+	// polled-fingerprint plan records provenance for the two it installs
+	// and leaves the event-tier pair's unknown rather than claiming it.
+	captureFns := map[string]string{
+		CaptureFunctionRow:      renderCaptureRowFunction(schema, tableRef(ChangeLogTable), payload),
+		CaptureFunctionTruncate: renderCaptureTruncateFunction(schema, tableRef(ChangeLogTable)),
+	}
+	if canEventTrigger {
+		captureFns[CaptureFunctionDDL] = renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef)
+		captureFns[CaptureFunctionDrop] = renderCaptureDropFunction(schema, tableRef(ChangeLogTable), metaRef)
+	}
+
 	out := []string{"BEGIN"}
 	if canEventTrigger {
 		// Re-created FIRST, before any TAG-watched statement (Bug 257): a
@@ -950,11 +983,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// not-yet-created change-log table resolves at first execution.
 		out = append(
 			out,
-			renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef),
+			captureFns[CaptureFunctionDDL],
 			// The sql_drop arm (D-1) rides the same ordering rule: it is
 			// created before any statement its own event trigger watches,
 			// and CREATE FUNCTION is not a watched tag either.
-			renderCaptureDropFunction(schema, tableRef(ChangeLogTable), metaRef),
+			captureFns[CaptureFunctionDrop],
 		)
 	}
 	out = append(
@@ -983,6 +1016,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 			"ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s INT, ADD COLUMN IF NOT EXISTS %s TEXT, ADD COLUMN IF NOT EXISTS %s TIMESTAMPTZ",
 			metaRef, metaSetupPIDCol, metaSetupNonceCol, metaSetupAtCol,
 		),
+		// The v5 capture-function provenance column (SL-5), by the same
+		// argument as the two groups above: one statement, tolerant readers,
+		// and an install that never re-runs setup simply has no provenance
+		// (which the door reads as "cannot tell old from edited" and WARNs).
+		"ALTER TABLE "+metaRef+" ADD COLUMN IF NOT EXISTS "+metaCaptureDigestCol+" TEXT",
 		// The source-side CONSUMER REGISTRY (roadmap item 115). Every
 		// trigger-CDC stream reading this database records its own
 		// durably-applied frontier here and the auto-prune cuts at the MIN
@@ -997,9 +1035,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 )`,
 
 		fmt.Sprintf(
-			"INSERT INTO %s (singleton_pk, schema_version, %s) VALUES (TRUE, %d, %t) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version, %s = EXCLUDED.%s",
-			metaRef, metaCaptureReplicatedCol, ChangeLogSchemaVer, captureReplicated,
+			"INSERT INTO %s (singleton_pk, schema_version, %s, %s) VALUES (TRUE, %d, %t, %s) ON CONFLICT (singleton_pk) DO UPDATE SET schema_version = EXCLUDED.schema_version, %s = EXCLUDED.%s, %s = EXCLUDED.%s",
+			metaRef, metaCaptureReplicatedCol, metaCaptureDigestCol,
+			ChangeLogSchemaVer, captureReplicated, quoteSQLString(captureFunctionDigests(captureFns)),
 			metaCaptureReplicatedCol, metaCaptureReplicatedCol,
+			metaCaptureDigestCol, metaCaptureDigestCol,
 		),
 
 		// The meta table, its evidence columns and its singleton row all
@@ -1038,11 +1078,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		// jsonb_object_agg projects pk_jsonb out of OLD/NEW. The
 		// capture-payload mode (ADR-0068) selects the per-op
 		// v_before / v_after assignment block.
-		renderCaptureRowFunction(schema, tableRef(ChangeLogTable), payload),
+		captureFns[CaptureFunctionRow],
 
 		// TRUNCATE companion — separate function because TRUNCATE
 		// triggers are FOR EACH STATEMENT, not FOR EACH ROW.
-		renderCaptureTruncateFunction(schema, tableRef(ChangeLogTable)),
+		captureFns[CaptureFunctionTruncate],
 	)
 
 	for _, t := range tables {

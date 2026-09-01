@@ -14,7 +14,12 @@ import (
 // The capture-shape door (audit 2026-08-26 F2) — pgtrigger's mirror of
 // sqlite-trigger's verifyCaptureTriggerShape (v0.131.2), the sibling that
 // sweep missed because it scoped to the CapturedValueExpr mechanism rather
-// than the door CLASS. The defect it closes: a `DROP TRIGGER sluice_capture`
+// than the door CLASS. It became a real mirror only on 2026-08-31 (SL-5):
+// the sqlite door compares the installed CREATE statement against the one
+// the binary renders, and this one graded names and shapes while calling
+// itself that door's mirror.
+//
+// The defect it closes: a `DROP TRIGGER sluice_capture`
 // (or DISABLE TRIGGER, or a rewire to a foreign function) is invisible to
 // both of the engine's drift tiers — the event-trigger tag filter only
 // watches ALTER/CREATE/DROP TABLE + INDEX, and the polled-fingerprint tier
@@ -52,6 +57,16 @@ import (
 //     canEventTrigger branch), so "function present, event trigger absent"
 //     proves a manual DROP EVENT TRIGGER. A polled-fingerprint install
 //     (no function) is exempt — no event trigger was ever expected.
+//   - What the triggers EXECUTE, not only what they are bound to (audit
+//     2026-08-31 SL-5): every capture function's body, `SET` pins and
+//     SECURITY DEFINER flag, graded against what this binary renders. That
+//     arm lives in cdc_capture_body.go, which carries its own decision
+//     table — the short version is that a function which records nothing
+//     refuses at any vintage, a definition that changed after setup
+//     recorded it refuses, and an install merely OLDER than the binary
+//     WARNs. Until it existed, a `CREATE OR REPLACE` of the capture
+//     function was invisible here: the trigger stayed present, enabled,
+//     correctly shaped and bound to a function of the right NAME.
 //
 // NOT reached: a single table whose row AND truncate triggers were BOTH
 // dropped while other tables keep theirs. pgtrigger records no setup-time
@@ -125,7 +140,7 @@ var eventTierRoster = []eventTier{
 // rationale on [openProbeTimeout]): a hung shape check must not silently
 // pass, so an expired probe deadline refuses with its own message rather
 // than degrading to a WARN the way the WARN-only probes do.
-func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, captureReplicated bool) error {
+func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, meta installMeta) error {
 	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
 	defer cancel()
 	installed, err := loadInstalledCaptureTriggers(pctx, db, schema)
@@ -136,7 +151,26 @@ func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, c
 	if err != nil {
 		return captureShapeProbeError(ctx, pctx, "DDL capture event-trigger state", err)
 	}
-	return gradeCaptureShape(schema, installed, ddl, captureReplicated)
+	// The BODY arm's evidence (audit 2026-08-31 SL-5). Read under the same
+	// bounded probe and fail-closed the same way: a door that cannot read
+	// what the triggers actually EXECUTE must not stream on the strength of
+	// their names.
+	bodies, err := loadInstalledCaptureFunctionShapes(pctx, db, schema)
+	if err != nil {
+		return captureShapeProbeError(ctx, pctx, "installed capture function definitions", err)
+	}
+	if err := gradeCaptureShape(schema, installed, ddl, meta.captureReplicated); err != nil {
+		return err
+	}
+	// Graded after the trigger shape so the operator sees the structural
+	// defect first when both are present — a missing trigger is the more
+	// urgent message, and re-running setup repairs either.
+	drift, err := gradeCaptureFunctionShapes(schema, bodies, meta)
+	if err != nil {
+		return err
+	}
+	warnStaleCaptureFunctions(ctx, schema, drift)
+	return nil
 }
 
 // captureShapeProbeError shapes the door's fail-closed refusal for a

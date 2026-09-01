@@ -92,31 +92,54 @@ func checkReplicaRoleCaptureShapes(ctx context.Context, db *sql.DB, schema strin
 	return nil
 }
 
-// readCaptureReplicatedWritesPosture reads the install's recorded capture
-// posture from the meta table (ADR-0185). The to_jsonb projection is the
-// load-bearing shape: a pre-v3 install's meta table has no
-// capture_replicated_writes column at all, and to_jsonb of the row simply
-// omits the key there — `->>` yields NULL and the COALESCE lands on
-// false, which is exactly what a pre-v3 (plain-trigger) install is. A
+// installMeta is what one bounded read of the meta table tells the open
+// path about the install: the ADR-0185 capture posture, the schema version
+// that recorded it, and the capture-function provenance digest (SL-5).
+type installMeta struct {
+	captureFnDigest   string
+	schemaVersion     int
+	captureReplicated bool
+}
+
+// captureDigestTrusted reports whether [installMeta.captureFnDigest] can be
+// believed. The COLUMN's presence is not the signal — the VERSION is: an
+// older binary's `trigger setup` run rewrites the capture functions without
+// touching (or knowing) the digest column, and its upsert regresses
+// schema_version to that binary's own value. Reading a stale digest as
+// truth there would refuse a downgrade-then-upgrade install for tampering
+// that never happened, so the version gate is what keeps this door's
+// refusal arm honest.
+func (m installMeta) captureDigestTrusted() bool {
+	return m.captureFnDigest != "" && m.schemaVersion >= ChangeLogSchemaVer
+}
+
+// readInstallMeta reads the install's recorded state from the meta table.
+// The to_jsonb projection is the load-bearing shape: an older install's
+// meta table has no capture_replicated_writes (pre-v3) or
+// capture_fn_digest (pre-v5) column at all, and to_jsonb of the row simply
+// omits the key there — `->>` yields NULL and the COALESCE lands on the
+// pre-migration default, which is exactly what such an install is. A
 // direct column reference would instead hard-error 42703 on every old
-// install. A missing meta ROW reads as false too (nothing ever recorded
-// an opt-in); any other failure — including a missing meta TABLE — fails
+// install. A missing meta ROW reads the same way (nothing ever recorded
+// anything); any other failure — including a missing meta TABLE — fails
 // CLOSED, because the posture selects both the F2 door's expected
 // enablement and whether the echo-loop refusal is armed.
-func readCaptureReplicatedWritesPosture(ctx context.Context, db *sql.DB, schema string) (bool, error) {
+func readInstallMeta(ctx context.Context, db *sql.DB, schema string) (installMeta, error) {
 	// Bounded per the open-path probe convention (audit 2026-08-27 A5).
 	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
 	defer cancel()
-	q := "SELECT COALESCE((to_jsonb(m) ->> '" + metaCaptureReplicatedCol + "')::boolean, FALSE) FROM " +
+	q := "SELECT COALESCE((to_jsonb(m) ->> '" + metaCaptureReplicatedCol + "')::boolean, FALSE), " +
+		"COALESCE((to_jsonb(m) ->> 'schema_version')::int, 0), " +
+		"COALESCE(to_jsonb(m) ->> '" + metaCaptureDigestCol + "', '') FROM " +
 		quoteIdent(schema) + "." + quoteIdent(ChangeLogMetaTable) + " m WHERE m.singleton_pk"
-	var v bool
-	switch err := db.QueryRowContext(pctx, q).Scan(&v); {
+	var m installMeta
+	switch err := db.QueryRowContext(pctx, q).Scan(&m.captureReplicated, &m.schemaVersion, &m.captureFnDigest); {
 	case err == nil:
-		return v, nil
+		return m, nil
 	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
+		return installMeta{}, nil
 	default:
-		return false, fmt.Errorf(
+		return installMeta{}, fmt.Errorf(
 			"pgtrigger: cannot read the recorded capture posture from %s.%s (%w) — refusing to stream without knowing "+
 				"whether this install captures replicated writes (the posture selects the capture-shape door's expected "+
 				"trigger enablement and arms the echo-loop refusal); repair the meta table by re-running `sluice trigger setup`",

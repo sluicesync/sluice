@@ -28,6 +28,7 @@ package pgtrigger
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -349,6 +350,18 @@ func TestInsecureCaptureFunctionWarn_AtCDCOpen(t *testing.T) {
 
 	t.Run("pre-fix install: WARN fires naming the function and the remedy", func(t *testing.T) {
 		applyPGSQL(t, dsn, preFixCaptureDDLFunction(t, "public", `"public"."`+ChangeLogTable+`"`))
+		// The fixture has to simulate the WHOLE old install, not just its
+		// function body (audit 2026-08-31 SL-5). Since v0.137 setup records
+		// what it installed (capture_fn_digest at schema_version 5) and the
+		// capture-shape door REFUSES a definition that no longer matches
+		// that record — which is exactly what hand-replacing the body on a
+		// current install is, and the refusal there is correct. A real
+		// pre-fix install carries no such record, so the fixture must not
+		// either: what an older sluice's setup would have left behind is a
+		// NULL digest at its own (lower) schema_version. Without this the
+		// pin would test a shape no upgrade can produce.
+		applyPGSQL(t, dsn, `UPDATE `+ChangeLogMetaTable+` SET `+metaCaptureDigestCol+` = NULL, schema_version = `+
+			fmt.Sprint(ChangeLogSchemaVer-1))
 
 		logs := openAndCaptureLogs(t)
 		if !strings.Contains(logs, insecureDefinerMarker) {
