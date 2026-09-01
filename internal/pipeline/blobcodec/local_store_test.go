@@ -284,7 +284,8 @@ func TestLocalStore_CrashOrphanedTemps(t *testing.T) {
 // of one table's backup chunks land in one directory, so chunk N paid an
 // O(N) scan and the table cost O(N²).
 //
-// METHOD, and why it is not the ThroughputCost flake class: the gate
+// METHOD, and why it is not the wall-clock-budget class the LOAD DATA
+// segmentation gate had to be rewritten out of (2026-08-31): the gate
 // counts directory READS (LocalStore.sweepDirScans / .sweepEntriesRead),
 // never wall-clock. The quantity that regressed is exactly "how many
 // directory entries did the write path read", so counting it is both the

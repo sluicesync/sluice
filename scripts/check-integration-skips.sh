@@ -46,8 +46,10 @@
 #   - The five sql_mode/local_infile probe tests skip when the container
 #     refuses the GLOBAL grant or the server doesn't exhibit the seeded
 #     clamp (data-dependent); ReplayRefuses... skips when @@max_error_count
-#     won't sit below the segment row count; ThroughputCost skips under
-#     -short. These are ANCHORED to the exact test names (audit T-4): the
+#     won't sit below the segment row count;
+#     SegmentationCostsOnlyTheExtraStatements skips under -short (it boots
+#     a container and copies a 7 MiB corpus twice). These are ANCHORED to
+#     the exact test names (audit T-4): the
 #     former `^TestLoadData` / `^TestWriteBatched` prefixes exempted all 21
 #     tests in the family — including the resume/replay silent-loss pins
 #     (RidesATransient, KeylessRefuses, TerminalError, ...) that have NO
@@ -79,7 +81,7 @@ ALLOWED_SKIPS='
 ^TestWriteBatched_RelaxedModeWarnsOnClamp$
 ^TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp$
 ^TestLoadDataSegments_ReplayRefusesWhenACoercionHidesAmongTheDuplicates$
-^TestLoadDataSegments_ThroughputCost$
+^TestLoadDataSegments_SegmentationCostsOnlyTheExtraStatements$
 ^TestCDCReader_TimestampNonUTCHost$
 ^TestPremise_PostgresRefusesSourceWritesToAGeneratedIdentity/.*publish_generated_columns
 '

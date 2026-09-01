@@ -897,19 +897,34 @@ func appendEscapedByte(dst []byte, c byte) []byte {
 // discarded entirely — anything from a few MiB up is a rounding error, so
 // this end of the trade is insensitive.
 //
-// THROUGHPUT. Measured, not assumed (TestLoadDataSegments_ThroughputCost):
-// an extra segment costs exactly one extra TRANSACTION COMMIT on the target
-// and nothing else. On the development box a one-row LOAD DATA and a
-// one-row INSERT both cost ~53 ms — identical, so the cost is the target's
-// commit, not anything LOAD DATA does — against a 0.6 ms round trip and a
-// 0.35 ms added SHOW WARNINGS probe. End-to-end over a 7.2 MiB corpus that
-// prices in linearly with the segment COUNT: 8 MiB budget 0.99x, 4 MiB
-// 1.09x, 2 MiB 1.19x, 1 MiB 1.46x, 256 KiB 2.59x. At 16 MiB the shipping
-// configuration is within measurement noise of the pre-item-114
-// single-statement copy. For scale, the batched-INSERT core this same
-// writer falls back to commits every ~1 MiB — a 16 MiB-segmented LOAD DATA
-// commits 16x LESS often than the alternative write path, so the throughput
-// advantage LOAD DATA is chosen for survives intact.
+// THROUGHPUT. What is PINNED is that segmenting adds LOAD DATA statements
+// and nothing else — same rows to the storage engine, same bytes on the
+// wire (TestLoadDataSegments_SegmentationCostsOnlyTheExtraStatements counts
+// Com_load / Innodb_rows_inserted / Bytes_received around both forms on real
+// MySQL). What is NOT pinned is the wall-clock price of those statements,
+// and the earlier account of it here was wrong.
+//
+// That account said an extra segment costs exactly one extra TRANSACTION
+// COMMIT and nothing else, citing a development box where a one-row LOAD
+// DATA and a one-row INSERT both took ~53 ms, and end-to-end ratios over a
+// 7.2 MiB corpus of 8 MiB 0.99x, 4 MiB 1.09x, 2 MiB 1.19x, 1 MiB 1.46x,
+// 256 KiB 2.59x. The per-commit model fitted because that box's fsync was
+// pathologically slow, so commit cost dominated everything else. On a
+// fast-committing target (a CI runner at 2.6 ms per commit) the 1 MiB budget
+// costs ~2.1x rather than 1.46x: the overhead did NOT shrink with the commit
+// cost, so it is not the commits. N separately autocommitted statements
+// forgo the InnoDB bulk-insert amortization that one large statement gets,
+// which is a per-BYTE effect. The 2026-08-31 correction is written up in
+// docs/dev/audit-backlog.md; re-deriving the real curve needs a controlled
+// box, not a shared runner, and is filed there.
+//
+// So the 16 MiB default is NOT defended here as "within noise" — that claim
+// rested on the withdrawn ratios and has been withdrawn with them. It is
+// defended by the resume-granularity argument above, by the direction of the
+// effect (fewer, larger segments cost strictly less than more, smaller ones),
+// and by the alternative: the batched-INSERT core this same writer falls
+// back to commits every ~1 MiB, so a 16 MiB-segmented LOAD DATA still
+// commits ~16x less often than the path it displaces.
 //
 // MEMORY, the binding constraint and a genuinely new cost: one segment's
 // bytes are held per CONCURRENT WRITER, where the streaming pre-item-114
