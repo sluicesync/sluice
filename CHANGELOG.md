@@ -104,6 +104,8 @@ Drop-in from v0.133.0 — no schema, format, or flag change. If you re-ran `trig
 
 ## [0.133.0] - 2026-08-27
 
+**Correction (2026-08-31):** the Compatibility line below — "Existing pgtrigger installs are untouched" — reads as a reassurance that re-running `trigger setup` (the moment the notes name as when the meta-table migration happens) is the safe moment. In this release it was not: on an already-**streamed** install that migration `ALTER` was recorded by the install's own DDL event trigger as an `op='X'` row, so the next warm resume refused "observed source-side DDL" and steered a needless full re-copy. That is **Bug 257**, which shipped in this release and was fixed in **v0.133.1**. Loud, never silent loss. The untouched half is right: an install you never re-run setup against opens unchanged as origin-only.
+
 Trigger-CDC can now capture replicated writes: `sluice trigger setup --capture-replicated-writes` (ADR-0185) makes the `postgres-trigger` engine capture DML applied under `session_replication_role = 'replica'`, turning the locked-down-primary → native-subscriber → sluice fan-out into a supported topology, with the echo-loop hazard refused loudly. Plus the honest lossless-shape refusal message, forensic hardening, and the notes-claims publish gate. Drop-in from v0.132.2.
 
 ### Added
