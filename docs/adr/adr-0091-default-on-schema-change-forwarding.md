@@ -471,7 +471,7 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
     rounds every element; the element resolves with typmod −1 by
     design), and **the session-TZ cast swaps — `time ↔ timetz` and
-    `timestamp ↔ timestamptz`, either direction**
+    `timestamp ↔ timestamptz`, either direction, scalar AND array**
     (`unforwardableSessionTZCast`). Both swaps MOVE their projected
     signatures (`time ↔ timetz` since the TIMETZ-PROJECTION fix,
     2026-08-28, which caught it as projection-identical before that;
@@ -492,12 +492,39 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     `SET TIME ZONE` anywhere in the engine) — a target-side pin would
     only narrow the hazard (making the target's cast deterministic),
     never close it, because the source setting stays unknowable.
-    Class siblings enumerated, filed not fixed (audit backlog
-    2026-08-28): the ARRAY variants (`time[] ↔ timetz[]`,
-    `timestamp[] ↔ timestamptz[]`) forward today with the same
-    per-element hazard, and MySQL's `timestamp ↔ datetime` MODIFY is
-    the other lane's analogue — both outside this decision's
-    scalar-PG scope.
+    *ARRAY variants — RESTORED, audit 2026-08-31 SL-3.* The 08-28
+    filing left `time[] ↔ timetz[]` and `timestamp[] ↔ timestamptz[]`
+    forwarding, and the first of those was a **regression opened
+    inside that same delta**: `time[] ↔ timetz[]` had refused since
+    the A2 gate (v0.132.1) because both element types resolved at
+    typmod −1 to a flag-less `ir.Time` and the pair was
+    projection-IDENTICAL; the TIMETZ-PROJECTION fix made the two
+    projections differ, the projection-equality gate stopped firing,
+    and the swap forwarded from v0.134.0 with its per-element hazard
+    intact. `sessionTZSwapPair` now unwraps BOTH sides through
+    `pgArrayElementOID` and runs the scalar arms on the element OIDs,
+    so the class is matched by PAIR rather than by projection accident
+    — stable under any future projection change, and automatically
+    covering a zone-aware element family added to that map later. A
+    scalar↔array dimension change (`time → timetz[]`) is deliberately
+    NOT a swap: PG needs an explicit `USING` to express it, so a
+    forwarded bare ALTER fails loudly rather than diverging.
+    *The other lane — FIXED, audit 2026-08-31 SL-2.* MySQL's
+    `TIMESTAMP ↔ DATETIME` `MODIFY` is the same class resolved by the
+    executing session's `time_zone` (observed on 8.0.46: the same
+    stored value becomes `21:00:00` when the ALTER runs at `+09:00`
+    and stays `12:00:00` at UTC), and the audit judged it the MORE
+    common member — sluice pins `time_zone='+00:00'` on its own
+    connections, so a non-UTC source host makes the divergence the
+    DEFAULT outcome rather than a coincidence. It refuses in the MySQL
+    engine's own boundary paths (`mysql.sessionTZSwapPair`, wired into
+    all three of that engine's `ir.SchemaSnapshot` emitters — binlog,
+    VStream standalone, VStream snapshot-stream). Cross-lane
+    enumeration is now mechanical:
+    `TestSessionGUCCastRoster_EveryCDCLane` (`internal/docsync`)
+    derives each lane's pairs from that lane's own declaration, fails
+    a lane that declares pairs without a refusal path, and fails a
+    newly-registered engine that classifies itself as neither.
     The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.
