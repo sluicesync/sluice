@@ -36,7 +36,7 @@ The MySQL CDC-open preflight roster and the probe-timeout roster now derive thei
 
 ### Compatibility
 
-**One `sluice trigger setup` re-run per pgtrigger install.** The install's meta table gains a `capture_fn_digest` column (schema version 4 → 5, added tolerantly; older readers are unaffected). Until setup is re-run, an existing install has no recorded provenance and opens with a `STALE-CAPTURE-FUNCTION` warning at every resume — a warning, never a refusal, and the same single re-run that v0.134.1's `INSECURE-CAPTURE-FUNCTION` warning already asks for. Streams keep running throughout.
+**One `sluice trigger setup` re-run per pgtrigger install.** The install's meta table gains a `capture_fn_digest` column (schema version 4 → 5, added tolerantly; older readers are unaffected). An install whose capture functions differ from what this binary renders opens with a `STALE-CAPTURE-FUNCTION` warning at every resume until setup is re-run — a warning, never a refusal, and the same single re-run that v0.134.1's `INSECURE-CAPTURE-FUNCTION` warning already asks for. An install whose definitions are already byte-identical to this binary's opens silent; it captures correctly, and the residual is only that a later hand-edit could be warned about rather than refused there. Streams keep running throughout either way. *(Corrected 2026-09-01: the released notes said every not-yet-re-set-up install warns, which over-claims — see the correction banner on `docs/releases/release-notes-v0.137.0.md`.)*
 
 **One behavior change that can newly refuse:** a `trigger setup` naming a subset of an opt-in install's tables now refuses rather than succeeding and wedging the stream. The refusal prints the full table list to pass back.
 

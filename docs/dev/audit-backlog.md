@@ -282,6 +282,16 @@ The psdb correction above came with a sweep for the same shape — an operator-f
 
 A gate built alongside these that was not on the G-list, recorded so it is findable: `TestBinlogTypeFamilyRoster` is a fail-by-default roster requiring every `data_type` `translateType` accepts to be either classified for the CDC-4 guard or listed as exempt with a reason, and `TestCDCSteadyState_EveryDataTypePassesTheGuard` ground-truths that classification against what a real mysqld writes into a TABLE_MAP (a single wrong entry produces a false refusal, which is how it was mutation-verified).
 
+## 2026-09-01 — DESIGN CALL for the operator: should a provenance-less pgtrigger install WARN?
+
+**Filed, deliberately not decided.** Found by the v0.137.0 regression cycle as Bug 259, whose filed shape was "the notes over-claim". The notes did over-claim and are corrected, but the finding underneath is a real design question and it should be answered by a person, not as a side effect of a doc fix.
+
+**The state.** `gradeCaptureFunctionShapes` returns early on `matchesAnyShape`, so an install whose capture function definitions are byte-identical to this binary's render is SILENT — including when setup never recorded a provenance digest for them (any pre-v5 install created by a sluice whose render happens to match, e.g. a v0.136.0 one; the regression cycle's `arm1b.out` census confirms the byte-identity). Those installs capture correctly. The cost is that they sit permanently on the door's WARN arm rather than its REFUSE arm: with no recorded digest, a later hand-edit of a capture function can only be warned about, never refused — and nothing prompts the operator to close that.
+
+**Why it was not simply changed.** `warnStaleCaptureFunctions`' text says the installed functions "are not what this sluice renders", which is FALSE for this case, so warning here means a NEW operator-facing warning surface — new marker, new text, docs, and it fires on every stream open for every existing install. That is an operator-visible posture change, off a LOW finding, in an already-published release. The counterweight: v0.134.1's `INSECURE-CAPTURE-FUNCTION` warning already steers most affected installs to the same single `sluice trigger setup` re-run that would close this.
+
+**The options.** (a) Leave it, residual documented at the code (what shipped). (b) A new distinct WARN with honest text ("current definition, no recorded provenance") — most protective, noisiest. (c) Have `trigger setup` record the digest opportunistically on any run, so the population drains without a new warning; does not help an install nobody ever re-runs setup against. (d) Report it once in `sluice doctor`-style output rather than per-open.
+
 ### Invariant sweep — the enumerated queue
 
 55 claims: 33 verified, 17 unverified, 5 suspect-false. **The queue is CLOSED as of 2026-08-08.** All 5 suspect-false closed 2026-08-07 (table below); all 14 *nameable* unverified claims closed across four batches, with the remaining 3 unrecoverable (they existed only in the un-preserved per-worker sweep output — see the completeness caveat). **11 of the 14 verdicts differed from their filing**, which is the number that argues for re-running the sweep; the breakdown and the recommendation are below.

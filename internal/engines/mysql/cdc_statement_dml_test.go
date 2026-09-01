@@ -292,12 +292,22 @@ var statementDMLLiteralKinds = map[string]struct{ literal, secret string }{
 // asserted here: the diagnostic survives, and the value still does not.
 func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
 	t.Parallel()
+	// The LONG cells are the ones that matter and the ones v0.137.0's first
+	// cut missed (Bug 258): the cut offset advanced past the comment, but
+	// the lead was still SLICED from 0, so the comment text was kept and a
+	// comment longer than the echo cap consumed all of it. Short comments
+	// passed, which is exactly why short-comment-only pins did not catch it.
+	// The sqlcommenter/`traceparent` prefix below is ~110 bytes and is the
+	// real-world shape, not a contrived one.
 	for name, q := range map[string]string{
 		"block":      "/* trace-id=abc */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
 		"vitess":     "/*vt+ QUERY_TIMEOUT_MS=30000 */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
 		"line":       "-- trace\nUPDATE patients SET note = 'x' WHERE ssn = '078051120'",
 		"hash":       "# trace\nUPDATE patients SET note = 'x' WHERE ssn = '078051120'",
 		"two_blocks": "/* a */ /* b */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"sqlcommenter": "/*traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'," +
+			"controller='checkout',action='pay'*/ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"long_line_comment": "-- " + strings.Repeat("annotation ", 20) + "\nUPDATE patients SET note = 'x' WHERE ssn = '078051120'",
 	} {
 		lead := statementDMLLead(q)
 		if !strings.Contains(lead, "UPDATE") || !strings.Contains(lead, "patients") {
@@ -307,6 +317,14 @@ func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
 		if strings.Contains(lead, "078051120") || strings.Contains(lead, "'x'") {
 			t.Errorf("%s: statementDMLLead(%q) = %q — a literal survived; skipping the comment must "+
 				"move the START of the cut, never widen what it keeps", name, q, lead)
+		}
+		// The comment text itself must not be echoed. Asserting the verb
+		// survives is NOT sufficient on its own: with the comment kept and
+		// a short comment, both hold at once, which is how Bug 258 passed.
+		if strings.Contains(lead, "trace") || strings.Contains(lead, "annotation") || strings.Contains(lead, "vt+") {
+			t.Errorf("%s: statementDMLLead(%q) = %q — the comment TEXT was echoed. It is the caller's "+
+				"annotation, not sluice's statement, and echoing it spends the cap on non-diagnostic bytes",
+				name, q, lead)
 		}
 	}
 

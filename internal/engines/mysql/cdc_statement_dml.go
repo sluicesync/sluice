@@ -226,8 +226,18 @@ var bareLiteralKeywords = map[string]bool{
 // binlog text carries row values — PII that would bypass --redact by
 // riding the refusal into logs and reports).
 func statementDMLLead(query string) string {
+	// Start where [statementDMLCut] starts — past any leading comment.
+	// Slicing from 0 keeps the comment TEXT, which is what shipped in
+	// v0.137.0 and is Bug 258: the cut offset advanced correctly, so
+	// short comments looked fixed, while a long one (an sqlcommenter /
+	// `traceparent` prefix runs ~110 bytes) spent the entire echo cap on
+	// comment text and left no verb and no table — the same diagnostic
+	// loss the comment skip was added to fix, one layer along. The
+	// comment is not diagnostic: it is the caller's annotation, not
+	// sluice's statement.
+	start := statementDMLCommentSkip(query)
 	cut := statementDMLCut(query)
-	lead := strings.TrimRight(query[:cut], " \t\r\n")
+	lead := strings.TrimRight(query[start:cut], " \t\r\n")
 	if len(lead) > statementDMLEchoCap {
 		lead = lead[:statementDMLEchoCap]
 	}

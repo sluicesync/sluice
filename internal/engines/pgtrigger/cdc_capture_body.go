@@ -420,6 +420,27 @@ func gradeCaptureFunctionShapes(schema string, installed map[string]captureFunct
 				schema, name, schema, ChangeLogTable,
 			)
 		}
+		// An install whose definitions are byte-identical to this binary's
+		// render is SILENT here even when setup never recorded provenance
+		// for them, and that is deliberate — but it is not free, so the
+		// residual is stated rather than implied (Bug 259, found by the
+		// v0.137.0 regression cycle; v0.137.0's own notes over-claimed a
+		// warning on every not-yet-re-set-up install and were corrected).
+		//
+		// The cost: exactly those installs are the ones whose tamper
+		// detection stays on the WARN arm below rather than the REFUSE arm,
+		// because there is no recorded digest for a later edit to fail
+		// against — and nothing here prompts the operator to fix that.
+		//
+		// Warning would be the more protective behaviour, and it is NOT
+		// taken here on purpose: [warnStaleCaptureFunctions]' text says the
+		// functions "are not what this sluice renders", which is false for
+		// this case, so it would mean a new operator-facing warning surface
+		// firing on every open for every existing install. That is a design
+		// call for the operator, not a side effect of a LOW finding; it is
+		// filed in docs/dev/audit-backlog.md. The existing SEC-1
+		// INSECURE-CAPTURE-FUNCTION warning already steers most affected
+		// installs to the same one `trigger setup` re-run.
 		if matchesAnyShape(got, expected[name]) {
 			continue
 		}
