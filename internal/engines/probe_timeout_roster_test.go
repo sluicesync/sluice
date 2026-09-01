@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The open-path probe-timeout roster (audit 2026-08-27 A5).
@@ -88,11 +90,30 @@ import (
 // F-T2 was about: a new uncapped pgtrigger probe taking the settleQuerier
 // interface and called from openCDCReader passed the pre-F-T2 gate and
 // reddens this one (2026-08-31).
+//
+// # The composed-latency half (audit 2026-08-31 C-6)
+//
+// Each cap bounds ONE probe; the probes run in sequence, so what an
+// operator actually waits for at a wedged CDC open is count x cap. On
+// pgtrigger that is seven 15s caps — 105s of worst-case added latency
+// per open. That number is documented at [openProbeTimeout] and held
+// here by capConst / worstCaseCeiling, so the NEXT serial probe (or a
+// raised cap) has to re-justify the bound instead of adding 15s
+// silently.
+//
+// Reach of that half, stated: pgtrigger only. mysql's preflights do not
+// share one cap constant (rowImagePreflightTimeout is 30s, siblings
+// differ) and postgres' chokepoint runs two, so neither composition is
+// derived here. That is a stated gap, not an implied cover — a roster
+// entry with no capConst is simply not latency-graded.
 var probeTimeoutRoster = []struct {
 	pkg         string   // directory under internal/engines/
 	chokepoints []string // functions whose probe callees form the universe
 	floor       int      // anti-vacuity: TODAY's exact derived count, so a drop reddens
 	exempt      map[string]string
+
+	capConst         string        // package const holding this path's per-probe cap ("" = not latency-graded)
+	worstCaseCeiling time.Duration // ceiling on derived-probes x cap
 }{
 	{
 		pkg:         "mysql",
@@ -116,6 +137,12 @@ var probeTimeoutRoster = []struct {
 		// capture-shape door, replica-role shape dispatch (WARN/echo-
 		// refusal), DDL-detection WARN, insecure-definer WARN (SEC-1).
 		floor: 7,
+
+		// The ceiling is TODAY'S bound, deliberately with no headroom:
+		// headroom is exactly what lets one more serial probe land
+		// unnoticed, which is the thing C-6 is about.
+		capConst:         "openProbeTimeout",
+		worstCaseCeiling: 105 * time.Second,
 	},
 }
 
@@ -189,6 +216,23 @@ func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 					"2026-08-27 A5). Derive the cap at the probe's top (the rowImagePreflightTimeout / "+
 					"openProbeTimeout pattern), or add an exemption here whose reason says why no cap is "+
 					"needed", entry.pkg, probe)
+			}
+		}
+
+		// The composed-latency ceiling (audit 2026-08-31 C-6). Only fires
+		// when the bound GROWS: a gate that also failed on a REDUCTION
+		// would defend the defect it exists to bound.
+		if entry.capConst != "" {
+			perProbe := parsePackageDurationConst(t, entry.pkg, entry.capConst)
+			worst := time.Duration(len(probes)) * perProbe
+			if worst > entry.worstCaseCeiling {
+				t.Errorf("%s: %d serial open-path probes x %s = %s worst-case added latency per CDC open, "+
+					"over the documented ceiling of %s.\n\n"+
+					"Each cap bounds one probe; they run in sequence, so this is what an operator waits for "+
+					"when the source is wedged — and part of it is spent by probes that can only WARN. Either "+
+					"the new probe belongs off the serial open path, or the bound is genuinely larger and "+
+					"both this ceiling and %s's doc owe the new number.",
+					entry.pkg, len(probes), perProbe, worst, entry.worstCaseCeiling, entry.capConst)
 			}
 		}
 
@@ -510,6 +554,72 @@ func bodyDerivesContextWithTimeout(fn *ast.FuncDecl) bool {
 		return true
 	})
 	return found
+}
+
+// parsePackageDurationConst reads a `const NAME = <n> * time.<Unit>`
+// declaration out of a sibling engine package. The cap is read from the
+// SOURCE rather than restated in the roster so that raising the constant
+// — the other way the composed bound grows — cannot slip past the
+// ceiling above.
+func parsePackageDurationConst(t *testing.T, pkg, name string) time.Duration {
+	t.Helper()
+	units := map[string]time.Duration{
+		"Nanosecond":  time.Nanosecond,
+		"Microsecond": time.Microsecond,
+		"Millisecond": time.Millisecond,
+		"Second":      time.Second,
+		"Minute":      time.Minute,
+	}
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(pkg)
+	if err != nil {
+		t.Fatalf("read %s: %v", pkg, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		f, perr := parser.ParseFile(fset, filepath.Join(pkg, e.Name()), nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s/%s: %v", pkg, e.Name(), perr)
+		}
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || len(vs.Names) != 1 || vs.Names[0].Name != name || len(vs.Values) != 1 {
+					continue
+				}
+				bin, ok := vs.Values[0].(*ast.BinaryExpr)
+				if !ok || bin.Op != token.MUL {
+					t.Fatalf("%s.%s is not an `<n> * time.<Unit>` expression; the latency ceiling cannot read it",
+						pkg, name)
+				}
+				lit, ok := bin.X.(*ast.BasicLit)
+				if !ok || lit.Kind != token.INT {
+					t.Fatalf("%s.%s: left operand is not an integer literal", pkg, name)
+				}
+				sel, ok := bin.Y.(*ast.SelectorExpr)
+				if !ok {
+					t.Fatalf("%s.%s: right operand is not a time.<Unit> selector", pkg, name)
+				}
+				unit, ok := units[sel.Sel.Name]
+				if !ok {
+					t.Fatalf("%s.%s: unrecognised duration unit %q", pkg, name, sel.Sel.Name)
+				}
+				n, cerr := strconv.Atoi(lit.Value)
+				if cerr != nil {
+					t.Fatalf("%s.%s: %v", pkg, name, cerr)
+				}
+				return time.Duration(n) * unit
+			}
+		}
+	}
+	t.Fatalf("%s: const %q not found — the roster names a cap this package does not declare", pkg, name)
+	return 0
 }
 
 func sortedProbeNames(m map[string]bool) []string {
