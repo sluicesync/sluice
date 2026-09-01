@@ -27,22 +27,54 @@ package lineage
 // crash-recovery, and the record exists precisely so an operator can
 // decide whether the heal was one of those.
 //
-// The append is read-modify-write. The optional [irbackup.Appender]
-// capability exists (LocalStore implements it; the progress sidecar uses
-// it) but is deliberately not taken here: heals are rare — a chain sees
-// 0–1 records ever — the log must behave identically on cloud stores
-// that lack the capability, and one code path is easier to keep
+// CONCURRENCY, and the two halves differ (audit 2026-08-31 C-3). This
+// file used to claim "maintenance runs are the only writer and hold the
+// chain maintenance flow single-threaded, so lost-update is not a live
+// concern". Nothing enforced that: the ADR-0160 concurrent-writer guard
+// arms inside WriteLineageCatalog, and the heal runs at compaction's and
+// prune's NO-OP doors, which return before any catalog write, so no chain
+// generation is ever claimed around a heal. A duplicated 03:00 cron
+// running `backup prune` twice is exactly the shape chain_guard.go's own
+// doc names. So:
+//
+//   - [PreserveLineageSigForHeal] — ENFORCED. The preserved copy is
+//     written with the create-only [irbackup.ConditionalPutter] claim, so
+//     the no-overwrite promise is the store's, not a probe's. Two heals
+//     that pick the same timestamp (the wall clock advances in ~505 µs
+//     ticks on Windows, so this is not the ns-resolution long shot it
+//     looks like) cannot both believe the path was free — the loser bumps.
+//     This is the half that matters: the preserved `.sig` is the
+//     BYTE-VERBATIM forensic evidence.
+//   - [AppendHealRecord] — read-modify-write, and still lost-update-prone
+//     under a genuine concurrent heal. PutIfAbsent cannot express an
+//     append: it claims a path exactly once, and the log is a single fixed
+//     path that must accumulate. The lost-update-free form is one object
+//     per record (`maintenance-heal/<ts>-<rand>.json`, read via List),
+//     which is a FORMAT change to a shipped artifact with its own reader
+//     and existing on-disk chains — deliberately not taken in this patch,
+//     and filed. The residual is bounded: two racing heals leave two
+//     preserved `.sig` copies (the evidence) and possibly one record (the
+//     description), so the count under-reports while the evidence does
+//     not.
+//
+// The optional [irbackup.Appender] capability exists (LocalStore
+// implements it; the progress sidecar uses it) but is deliberately not
+// taken here either: the log must behave identically on cloud stores that
+// lack the capability, and one code path is easier to keep
 // evidence-correct than two (A3-APPENDER-COMMENT, 2026-08-27; the prior
-// wording claimed no append primitive existed, which was stale).
-// Maintenance runs are the only writer and hold the chain maintenance
-// flow single-threaded, so lost-update is not a live concern; a torn
-// write is loud at read time (the JSONL parse refuses).
+// wording claimed no append primitive existed, which was stale). Note it
+// would not close the race anyway — concurrent O_APPEND writes interleave
+// whole lines, they do not serialise a read-modify-write.
+//
+// A torn write is loud at read time (the JSONL parse refuses the line and
+// [ReadHealRecords] counts it).
 
 import (
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -108,27 +140,50 @@ func PreserveLineageSigForHeal(ctx context.Context, store irbackup.Store, now ti
 		return "", fmt.Errorf("read %q for pre-heal preservation: %w", LineageSigFileName, err)
 	}
 	// Never overwrite prior evidence: the wall clock's granularity (coarse
-	// on Windows) can hand two heals the same UnixNano, and evidence
-	// preservation is exactly the place an overwrite must be impossible —
-	// probe and bump until the path is free (heals are rare; the loop is
-	// effectively 0–1 iterations).
+	// on Windows — measured at ~505 µs ticks, so "nanosecond" precision
+	// buys nothing) can hand two heals the same UnixNano, and evidence
+	// preservation is exactly the place an overwrite must be impossible.
+	//
+	// The no-overwrite promise is enforced by the STORE, not by a probe
+	// (audit 2026-08-31 C-3): the create-only [irbackup.ConditionalPutter]
+	// claim IS the arbitration, so ErrPathExists is the bump signal and
+	// two processes racing on the same timestamp cannot both think the
+	// path was free. The previous probe-then-Put was a TOCTOU across
+	// processes — and the doc that dismissed concurrent heals as
+	// impossible was itself unenforced (see the note at the top of this
+	// file). Heals are rare, so the loop is effectively 0–1 iterations.
 	ts := now.UnixNano()
 	path := fmt.Sprintf("%s%d", PreHealLineageSigPrefix, ts)
+	cp, conditional := store.(irbackup.ConditionalPutter)
 	for {
-		exists, err := store.Exists(ctx, path)
-		if err != nil {
-			return "", fmt.Errorf("probe pre-heal preservation path %q: %w", path, err)
-		}
-		if !exists {
-			break
+		if !conditional {
+			// Degradation path for a store without the optional
+			// capability. Both stores sluice ships (LocalStore, BlobStore)
+			// implement it, so this is reached only by a third-party or
+			// test store; it keeps the old probe-then-Put semantics rather
+			// than refusing a heal outright.
+			exists, err := store.Exists(ctx, path)
+			if err != nil {
+				return "", fmt.Errorf("probe pre-heal preservation path %q: %w", path, err)
+			}
+			if !exists {
+				if err := store.Put(ctx, path, bytes.NewReader(body)); err != nil {
+					return "", fmt.Errorf("preserve pre-heal signature at %q: %w", path, err)
+				}
+				return path, nil
+			}
+		} else {
+			err := cp.PutIfAbsent(ctx, path, bytes.NewReader(body))
+			if err == nil {
+				return path, nil
+			}
+			if !errors.Is(err, irbackup.ErrPathExists) {
+				return "", fmt.Errorf("preserve pre-heal signature at %q: %w", path, err)
+			}
 		}
 		ts++
 		path = fmt.Sprintf("%s%d", PreHealLineageSigPrefix, ts)
 	}
-	if err := store.Put(ctx, path, bytes.NewReader(body)); err != nil {
-		return "", fmt.Errorf("preserve pre-heal signature at %q: %w", path, err)
-	}
-	return path, nil
 }
 
 // AppendHealRecord appends rec to maintenance-heal.log (creating it on
