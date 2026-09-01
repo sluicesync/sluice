@@ -239,13 +239,83 @@ var statementDMLPredicateOperators = map[string]string{
 // survive into the refusal. `secret` is a substring of the rendered
 // literal, so a cell is only meaningful if the raw statement contains
 // it — asserted below as the anti-vacuity floor.
+// Widened 2026-09-01 after the pre-publish value-fidelity review pointed out
+// that six kinds do not exercise a grammar the comment above calls complete.
+// The allowlist cut is claimed to exclude EVERY MySQL literal form by
+// construction, so the matrix has to carry every form the grammar admits —
+// otherwise the claim rests on the six that happened to be listed.
 var statementDMLLiteralKinds = map[string]struct{ literal, secret string }{
-	"quoted_string":    {"'078051120'", "078051120"},
-	"unquoted_numeric": {"078051120", "078051120"},
-	"hex":              {"0x4D7953514C", "4D7953514C"},
-	"bit":              {"b'01001101'", "01001101"},
-	"null":             {"NULL", "NULL"},
-	"boolean":          {"TRUE", "TRUE"},
+	"quoted_string":       {"'078051120'", "078051120"},
+	"dquoted_string":      {`"078051120"`, "078051120"},
+	"unquoted_numeric":    {"078051120", "078051120"},
+	"signed_numeric":      {"-078051120", "078051120"},
+	"leading_dot_numeric": {".078051120", "078051120"},
+	"scientific_numeric":  {"7805112e0", "7805112"},
+	"hex":                 {"0x4D7953514C", "4D7953514C"},
+	"hex_xquote":          {"X'4D7953514C'", "4D7953514C"},
+	"hex_xquote_lower":    {"x'4D7953514C'", "4D7953514C"},
+	"bit":                 {"b'01001101'", "01001101"},
+	"bit_upper":           {"B'01001101'", "01001101"},
+	"bit_0b":              {"0b01001101", "01001101"},
+	"introducer_utf8":     {"_utf8'078051120'", "078051120"},
+	"introducer_binary":   {"_binary'078051120'", "078051120"},
+	"national_string":     {"N'078051120'", "078051120"},
+	"temporal_date":       {"DATE '2026-09-01'", "2026-09-01"},
+	"temporal_timestamp":  {"TIMESTAMP '2026-09-01 12:00:00'", "2026-09-01"},
+	"temporal_odbc":       {"{d '2026-09-01'}", "2026-09-01"},
+	"interval":            {"INTERVAL 078051120 DAY", "078051120"},
+	"placeholder":         {"?", "?"},
+	// A variable REFERENCE carries no value in the statement text, but it
+	// must still be cut: it is not identifier material, and in a longer
+	// predicate whatever follows it would be a value. The secret is
+	// deliberately unlike any column name the matrix uses — `@ssn` against
+	// a column named `ssn` reports the legitimately-KEPT column as a leak,
+	// which is a fixture bug that reads exactly like a real finding.
+	"user_variable":   {"@v078051120", "078051120"},
+	"system_variable": {"@@session.v078051120", "078051120"},
+	"null":            {"NULL", "NULL"},
+	"null_lower":      {"null", "null"},
+	"boolean":         {"TRUE", "TRUE"},
+	"boolean_false":   {"FALSE", "FALSE"},
+	"unknown":         {"UNKNOWN", "UNKNOWN"},
+}
+
+// TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic pins the fix for a
+// diagnostic loss the pre-publish review of v0.137.0 found: the cut did not
+// skip leading comments, and a comment's first byte is outside the identifier
+// allowlist, so the whole lead collapsed to "…".
+//
+// That is the SAFE direction — it over-cuts and cannot leak — but it erased
+// the verb, table and columns for an entire traffic class, since
+// comment-prefixed DML is the normal shape from Vitess and PlanetScale
+// (`/*vt+ …*/`), ProxySQL and tracing-annotated clients. Both halves are
+// asserted here: the diagnostic survives, and the value still does not.
+func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
+	t.Parallel()
+	for name, q := range map[string]string{
+		"block":      "/* trace-id=abc */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"vitess":     "/*vt+ QUERY_TIMEOUT_MS=30000 */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"line":       "-- trace\nUPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"hash":       "# trace\nUPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+		"two_blocks": "/* a */ /* b */ UPDATE patients SET note = 'x' WHERE ssn = '078051120'",
+	} {
+		lead := statementDMLLead(q)
+		if !strings.Contains(lead, "UPDATE") || !strings.Contains(lead, "patients") {
+			t.Errorf("%s: statementDMLLead(%q) = %q — the verb and table are the diagnostic half and "+
+				"must survive a leading comment", name, q, lead)
+		}
+		if strings.Contains(lead, "078051120") || strings.Contains(lead, "'x'") {
+			t.Errorf("%s: statementDMLLead(%q) = %q — a literal survived; skipping the comment must "+
+				"move the START of the cut, never widen what it keeps", name, q, lead)
+		}
+	}
+
+	// An unterminated block comment has no provable end, so it cuts at 0.
+	// Without this the skip could be written to run past the whole
+	// statement on malformed input.
+	if lead := statementDMLLead("/* unterminated UPDATE patients SET ssn = '078051120'"); strings.Contains(lead, "078051120") {
+		t.Errorf("an unterminated comment leaked: %q", lead)
+	}
 }
 
 // TestStatementDMLLeadFamilyMatrix is the class pin for the "values
@@ -315,8 +385,16 @@ func TestStatementDMLLeadFamilyMatrix(t *testing.T) {
 			t.Errorf("the literal kind %q is missing from statementDMLLiteralKinds", lit)
 		}
 	}
-	if cells < 66 {
-		t.Fatalf("exercised %d cells; want the full 11 operator families x 6 literal kinds", cells)
+	if want := len(statementDMLPredicateOperators) * len(statementDMLLiteralKinds); cells != want {
+		t.Fatalf("exercised %d cells; want %d (%d operator families x %d literal kinds)",
+			cells, want, len(statementDMLPredicateOperators), len(statementDMLLiteralKinds))
+	}
+	// Absolute floor, separate from the product above: the product shrinks
+	// on BOTH sides when a table is trimmed, so it cannot notice a matrix
+	// that narrowed back toward a representative. Set at today's size.
+	if cells < 11*27 {
+		t.Fatalf("exercised %d cells; the matrix has shrunk below the 11 x 27 it covered when this "+
+			"floor was set — a literal kind or operator family was removed", cells)
 	}
 }
 

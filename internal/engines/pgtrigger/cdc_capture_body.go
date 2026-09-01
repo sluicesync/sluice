@@ -266,28 +266,66 @@ func captureFunctionDigests(rendered map[string]string) string {
 }
 
 // parseCaptureFunctionDigests reads back what [captureFunctionDigests]
-// wrote. An unparseable entry is dropped, which reads as "no provenance for
-// that function" — the conservative direction (it can only downgrade a
-// refusal to a WARN, never invent one).
-func parseCaptureFunctionDigests(recorded string) map[string]string {
+// wrote, ALL OR NOTHING: a record with any unparseable entry yields no
+// provenance at all, and the second return reports that.
+//
+// Per-entry dropping was the first cut and it was the permissive direction
+// wearing conservative clothing. Trust is decided by
+// [installMeta.captureDigestTrusted], which only asks whether the recorded
+// string is non-empty — so garbling ONE entry left the record "trusted" while
+// that function's provenance quietly went missing, and the grading below took
+// the trusted-but-unrecorded arm: a WARN saying the function is "outside the
+// set the last setup run installed". That is both a misattribution and a
+// downgrade of the tamper REFUSAL to a WARN, available to exactly the
+// adversary this door exists to catch — anyone who can replace a function
+// body can also edit one byte of the digest column. A record that does not
+// parse is evidence of nothing, so it is treated as nothing.
+func parseCaptureFunctionDigests(recorded string) (map[string]string, bool) {
 	out := map[string]string{}
+	if strings.TrimSpace(recorded) == "" {
+		return out, true
+	}
 	for _, part := range strings.Split(recorded, ",") {
 		name, digest, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok || name == "" || digest == "" {
-			continue
+			return map[string]string{}, false
 		}
 		out[name] = digest
 	}
-	return out
+	return out, true
 }
 
-// loadInstalledCaptureFunctionShapes reads the three definition columns for
-// whichever sluice capture functions exist in the schema. proconfig is
-// joined server-side rather than scanned as an array: the entries are
-// `name=value` strings that cannot contain a newline, and this keeps the
-// read off any driver array-codec behaviour.
-func loadInstalledCaptureFunctionShapes(ctx context.Context, db *sql.DB, schema string) (map[string]captureFunctionShape, error) {
-	const q = `
+// captureFunctionArity is the argument count every sluice capture function
+// has, and it is a SCOPE on the read below, not a description.
+//
+// A trigger function takes no declared arguments — PostgreSQL rejects them on
+// `RETURNS trigger`/`RETURNS event_trigger` — so all four are 0-arg. But
+// `proname` alone does NOT identify a function: PostgreSQL permits
+// overloading, and with `check_function_bodies = off` any `RETURNS void`
+// plpgsql function stores `prosrc` verbatim. Selecting on the name alone let
+// an adversary gut the real 0-arg function and then plant a same-named
+// 1-arg decoy carrying a healthy body — the last row won the map collapse,
+// so the door read the decoy, saw a body that records into the change log,
+// and passed. Every source DML then went uncaptured at exit 0, on a fully
+// provenanced install where this file's header promises a refusal, and the
+// prescribed `trigger setup` repair did not clear it because it rewrites the
+// 0-arg function and leaves the decoy standing. Found by the pre-publish
+// value-fidelity review of v0.137.0 and ground-truthed on real PostgreSQL 16.
+//
+// Pinning the arity closes it completely rather than narrowly: a 0-arg decoy
+// cannot coexist with the real function — same signature means `CREATE OR
+// REPLACE` replaces it, and a differing return type is refused outright — so
+// exactly one row can match per name, and no legitimate capture function is
+// ever excluded. The duplicate arm below is belt-and-braces for the same
+// class: two rows sharing a name is a state no sluice install produces.
+const captureFunctionArity = 0
+
+// captureFunctionShapeQuery is package-level so
+// [TestLoadInstalledCaptureFunctionShapes_ScopesByArity] can grade the
+// predicate itself: the one thing that must never come back is a read scoped
+// by proname without an arity bound (see [captureFunctionArity] for why).
+func captureFunctionShapeQuery() string {
+	return `
 SELECT p.proname,
        p.prosrc,
        p.prosecdef,
@@ -296,8 +334,19 @@ SELECT p.proname,
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname = $1
    AND p.proname IN ($2, $3, $4, $5)
+   AND p.pronargs = $6
  ORDER BY p.proname`
-	rows, err := db.QueryContext(ctx, q, schema, CaptureFunctionRow, CaptureFunctionTruncate, CaptureFunctionDDL, CaptureFunctionDrop)
+}
+
+// loadInstalledCaptureFunctionShapes reads the three definition columns for
+// whichever sluice capture functions exist in the schema. proconfig is
+// joined server-side rather than scanned as an array: the entries are
+// `name=value` strings that cannot contain a newline, and this keeps the
+// read off any driver array-codec behaviour.
+func loadInstalledCaptureFunctionShapes(ctx context.Context, db *sql.DB, schema string) (map[string]captureFunctionShape, error) {
+	rows, err := db.QueryContext(ctx, captureFunctionShapeQuery(), schema,
+		CaptureFunctionRow, CaptureFunctionTruncate, CaptureFunctionDDL, CaptureFunctionDrop,
+		captureFunctionArity)
 	if err != nil {
 		return nil, err
 	}
@@ -310,6 +359,16 @@ SELECT p.proname,
 		)
 		if err := rows.Scan(&shape.name, &shape.body, &shape.definer, &config); err != nil {
 			return nil, err
+		}
+		// Refuse rather than collapse. The arity scope should make this
+		// unreachable; if it ever fires, the read is ambiguous and this
+		// door must not pick a winner — silently keeping one of two
+		// definitions is the exact defect the arity scope closes.
+		if _, dup := out[shape.name]; dup {
+			return nil, fmt.Errorf("pgtrigger: capture function %q resolves to more than one "+
+				"%d-argument definition in schema %q — the installed capture shape is ambiguous "+
+				"and cannot be graded; inspect pg_proc for duplicates before resuming",
+				shape.name, captureFunctionArity, schema)
 		}
 		shape.body = normalizeFunctionBody(shape.body)
 		for _, entry := range strings.Split(config, "\n") {
@@ -335,8 +394,11 @@ type captureFunctionDrift struct {
 // caller to WARN about. See the file header for the whole decision table.
 func gradeCaptureFunctionShapes(schema string, installed map[string]captureFunctionShape, meta installMeta) ([]captureFunctionDrift, error) {
 	expected := expectedCaptureFunctionShapes(schema)
-	recorded := parseCaptureFunctionDigests(meta.captureFnDigest)
-	trusted := meta.captureDigestTrusted()
+	recorded, wholeRecordParsed := parseCaptureFunctionDigests(meta.captureFnDigest)
+	// A record that does not parse is evidence of nothing — see
+	// [parseCaptureFunctionDigests] for why a partial read is the permissive
+	// direction here, not the conservative one.
+	trusted := meta.captureDigestTrusted() && wholeRecordParsed
 
 	names := make([]string, 0, len(installed))
 	for name := range installed {
@@ -390,7 +452,13 @@ func gradeCaptureFunctionShapes(schema string, installed map[string]captureFunct
 		default:
 			drift = append(drift, captureFunctionDrift{
 				name: name,
-				why:  "installed before sluice recorded capture-function provenance (schema_version < " + fmt.Sprint(ChangeLogSchemaVer) + "), so an older rendering and a hand edit CANNOT be told apart here",
+				// captureDigestMinSchemaVer, not ChangeLogSchemaVer: this
+				// sentence describes the TRUST FLOOR, which is frozen at the
+				// version that introduced the digest. Spelling it with the
+				// moving constant makes the message wrong at the next
+				// unrelated meta-table bump — the same defect the floor
+				// itself was extracted to fix, one layer out in the prose.
+				why: "installed before sluice recorded capture-function provenance (schema_version < " + fmt.Sprint(captureDigestMinSchemaVer) + "), so an older rendering and a hand edit CANNOT be told apart here",
 			})
 		}
 	}

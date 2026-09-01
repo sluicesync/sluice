@@ -283,7 +283,16 @@ func statementDMLLead(query string) string {
 // `… WHERE id IS…`. A value is a value even when it is `NULL`, and the
 // column name — the diagnostic half — is upstream of the cut.
 func statementDMLCut(query string) int {
-	i := 0
+	// Leading comments are skipped the same way [leadingSQLKeyword] skips
+	// them, and for a reason worth stating: a comment's first byte is `/`
+	// or `-` or `#`, none of which the allowlist below admits, so without
+	// this the cut landed at offset 0 and the whole diagnostic rendered as
+	// `…`. That is the SAFE direction — it over-cuts, it cannot leak — but
+	// it erased the verb, table and columns for an entire traffic class,
+	// since comment-prefixed DML is the normal shape from Vitess and
+	// PlanetScale (`/*vt+ …*/`), ProxySQL, and tracing-annotated clients.
+	// The comment text itself is NOT kept: only the offset advances.
+	i := statementDMLCommentSkip(query)
 	for i < len(query) {
 		switch c := query[i]; {
 		case c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '.' || c == ',':
@@ -309,6 +318,38 @@ func statementDMLCut(query string) int {
 		}
 	}
 	return len(query)
+}
+
+// statementDMLCommentSkip returns the offset of the first byte of query
+// that is not leading whitespace or a leading comment, using the same
+// comment forms [leadingSQLKeyword] recognises. On anything malformed
+// (an unterminated block comment) it returns 0, so the caller falls back
+// to cutting immediately — the safe direction.
+func statementDMLCommentSkip(query string) int {
+	i := 0
+	for i < len(query) {
+		switch c := query[i]; {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			i++
+		case c == '/' && i+1 < len(query) && query[i+1] == '*':
+			end := strings.Index(query[i+2:], "*/")
+			if end < 0 {
+				return 0
+			}
+			i += end + 4
+		case c == '-' && i+1 < len(query) && query[i+1] == '-':
+			if i+2 < len(query) && (query[i+2] == ' ' || query[i+2] == '\t') {
+				i = skipToEOL(query, i)
+				continue
+			}
+			return i
+		case c == '#':
+			i = skipToEOL(query, i)
+		default:
+			return i
+		}
+	}
+	return i
 }
 
 // backtickIdentEnd returns the offset just past the backtick-quoted

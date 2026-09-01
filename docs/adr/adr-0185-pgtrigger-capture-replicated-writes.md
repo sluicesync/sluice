@@ -1,6 +1,6 @@
 # ADR-0185: `trigger setup --capture-replicated-writes` — opt-in ENABLE ALWAYS capture for replica-role writes
 
-- **Status:** Accepted — implemented 2026-08-27 (audit 2026-08-26 F1 full fix; operator-greenlit same day). Unreleased at time of writing.
+- **Status:** Accepted — implemented 2026-08-27 (audit 2026-08-26 F1 full fix; operator-greenlit same day), shipped in **v0.133.0**. Extended since: v0.136.0 put the DDL event triggers under the same posture (A-1), and v0.137.0 made `trigger setup` write the posture install-wide and refuse to narrow it implicitly (A-2).
 - **Date:** 2026-08-27
 - **Related:** audit 2026-08-26 **F1** (the blindness this closes) and **F1-REFUSAL-OPTION** (the refusal design this supersedes — see Alternatives); `preflight_replica_role.go` (the shipped WARN half, now the default-posture arm); the **F2** capture-shape door (`cdc_capture_shape.go` — grows the posture match here); [ADR-0066](adr-0066-postgres-trigger-engine-variant.md) (the trigger engine); Bug 164 / `postgres/change_applier.go` `replicaRoleSQL` (why sluice's own applier writes under replica role); `docs/dev/capture-completeness-matrix.md` §pgtrigger (the F1 row this moves from WARNED to opt-in CAPTURED).
 

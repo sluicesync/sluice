@@ -411,6 +411,80 @@ func assertCaptureDigestFloorIsFrozenInSource(t *testing.T) {
 	}
 }
 
+// TestLoadInstalledCaptureFunctionShapes_ScopesByArity is the unit half of
+// the overload-decoy fix, keyed on the query text so the scope cannot be
+// dropped without a red — the same shape as
+// TestProbeRelayControlTable_ExistenceQueryIsDatabaseWide. The behavioural
+// half runs the real attack on real PostgreSQL in
+// TestCaptureFunctionBodyDoor.
+//
+// Selecting on proname alone is not a narrower read, it is an AMBIGUOUS one:
+// PostgreSQL permits overloading, so a same-named decoy carrying a healthy
+// body could be planted beside a gutted capture function and win the map
+// collapse, leaving the door reading a definition no trigger executes.
+func TestLoadInstalledCaptureFunctionShapes_ScopesByArity(t *testing.T) {
+	t.Parallel()
+	q := captureFunctionShapeQuery()
+	if !strings.Contains(q, "pronargs") {
+		t.Errorf("the installed-shape read no longer scopes by argument count, so a same-named "+
+			"overload can be graded in place of the function the trigger actually calls:\n%s", q)
+	}
+	// Anti-vacuity: the text the gate read must really be the shape query,
+	// not some other string that happens to mention pronargs.
+	if !strings.Contains(q, "pg_proc") || !strings.Contains(q, "prosrc") || !strings.Contains(q, "prosecdef") {
+		t.Errorf("the gate matched something that is not the capture-function shape query:\n%s", q)
+	}
+	if captureFunctionArity != 0 {
+		t.Errorf("captureFunctionArity = %d; a trigger function takes no declared arguments, and a "+
+			"non-zero scope would exclude every real capture function", captureFunctionArity)
+	}
+}
+
+// TestCaptureFunctionDigests_AGarbledRecordIsEvidenceOfNothing pins the
+// all-or-nothing read. Per-entry dropping was the first cut, and it handed
+// the adversary this door exists to catch a way to downgrade its own REFUSAL
+// to a WARN: garble ONE entry and that function's provenance goes missing
+// while the record still reads as "trusted", so a replaced body grades as
+// "outside the set the last setup run installed" instead of as tampering.
+func TestCaptureFunctionDigests_AGarbledRecordIsEvidenceOfNothing(t *testing.T) {
+	t.Parallel()
+	good := captureFunctionDigests(map[string]string{
+		CaptureFunctionRow:      renderCaptureRowFunction(testSchema, testChangeLogRef(), CapturePayloadFull),
+		CaptureFunctionTruncate: renderCaptureTruncateFunction(testSchema, testChangeLogRef()),
+	})
+	if _, ok := parseCaptureFunctionDigests(good); !ok {
+		t.Fatalf("the well-formed record %q must parse — the negatives below prove nothing otherwise", good)
+	}
+
+	firstEq := strings.Index(good, "=")
+	if firstEq < 0 {
+		t.Fatalf("the well-formed record %q carries no %q — the mutations below assume its shape", good, "=")
+	}
+
+	// Each mutation garbles exactly ONE entry and leaves the other intact:
+	// the whole point is that a partial record must not read as a usable one.
+	for _, tc := range []struct{ name, recorded string }{
+		{"separator removed from one entry", strings.Replace(good, "=", "", 1)},
+		{"one entry emptied", strings.Replace(good, good[:firstEq], "", 1)},
+		{"trailing separator leaves an empty entry", good + ","},
+		{"leading separator leaves an empty entry", "," + good},
+		{"entry with a name and no digest", good + ",sluice_capture_ddl="},
+	} {
+		if got, ok := parseCaptureFunctionDigests(tc.recorded); ok || len(got) != 0 {
+			t.Errorf("%s: parsed as usable (ok=%v, %d entries) from %q — any unparseable part must "+
+				"void the WHOLE record, or one edited byte turns a tamper refusal into a warning",
+				tc.name, ok, len(got), tc.recorded)
+		}
+	}
+
+	// An empty record is not garbled — it is a pre-v5 install, which the
+	// version floor already handles. Without this the test would pass for a
+	// parser that simply rejected everything.
+	if got, ok := parseCaptureFunctionDigests(""); !ok || len(got) != 0 {
+		t.Errorf("an empty record must read as parseable-and-empty (pre-v5), got ok=%v, %d entries", ok, len(got))
+	}
+}
+
 // The digest is per FUNCTION: a plan that installs fewer functions than the
 // schema carries must leave the others' provenance unknown rather than
 // making them all look replaced.
@@ -420,7 +494,10 @@ func TestCaptureFunctionDigests_ArePerFunction(t *testing.T) {
 		CaptureFunctionRow:      renderCaptureRowFunction(testSchema, testChangeLogRef(), CapturePayloadFull),
 		CaptureFunctionTruncate: renderCaptureTruncateFunction(testSchema, testChangeLogRef()),
 	}
-	recorded := parseCaptureFunctionDigests(captureFunctionDigests(polled))
+	recorded, ok := parseCaptureFunctionDigests(captureFunctionDigests(polled))
+	if !ok {
+		t.Fatal("a record this package just wrote must parse")
+	}
 	if len(recorded) != 2 {
 		t.Fatalf("recorded %d digests; want 2", len(recorded))
 	}

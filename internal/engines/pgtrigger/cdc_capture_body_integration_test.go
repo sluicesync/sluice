@@ -143,6 +143,98 @@ $evil$;`)
 		}
 	})
 
+	t.Run("THE ATTACK, class member 2: a gutted function hidden behind a same-named OVERLOAD still refuses", func(t *testing.T) {
+		// The subtest above executes the REPRESENTATIVE attack. This is the
+		// class member one CREATE FUNCTION away from it, and it defeated the
+		// door as originally shipped: PostgreSQL permits overloading, so
+		// after gutting the real 0-arg function an adversary plants a
+		// same-named 1-arg decoy carrying a healthy body. A read scoped by
+		// proname alone returned both rows and the map collapse kept the
+		// last one, so the door graded the DECOY, saw a body that records,
+		// and passed — while the trigger went on executing the gutted 0-arg
+		// function. Found by the pre-publish value-fidelity review of
+		// v0.137.0. The arity scope on the read is what closes it.
+		//
+		// check_function_bodies=off is what lets the decoy be stored: it is
+		// a RETURNS void function, so its body would not otherwise validate.
+		applyPGSQL(t, dsn, `
+CREATE OR REPLACE FUNCTION public.sluice_capture_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $evil$
+BEGIN
+    RETURN NULL;
+END
+$evil$;
+SET check_function_bodies = off;
+CREATE OR REPLACE FUNCTION public.sluice_capture_change(decoy text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET bytea_output = hex
+SET extra_float_digits = 3
+AS $decoy$
+BEGIN
+    INSERT INTO public.sluice_change_log
+        (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
+    VALUES
+        (pg_catalog.pg_current_xact_id()::text::bigint, TG_TABLE_SCHEMA, TG_TABLE_NAME, 'I', '{}'::jsonb, NULL, NULL);
+    RETURN;
+END
+$decoy$;
+RESET check_function_bodies;`)
+
+		// Anti-vacuity: the decoy must really be installed alongside the
+		// real function, or this is just the previous subtest again.
+		var overloads int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'public' AND p.proname = $1`, CaptureFunctionRow).Scan(&overloads); err != nil {
+			t.Fatalf("count overloads: %v", err)
+		}
+		if overloads != 2 {
+			t.Fatalf("pg_proc carries %d definitions of %s; want 2 (the gutted real one and the decoy) — "+
+				"the fixture is not reproducing the bypass", overloads, CaptureFunctionRow)
+		}
+
+		// The read must resolve to the ONE the trigger executes.
+		installed, err := loadInstalledCaptureFunctionShapes(ctx, db, "public")
+		if err != nil {
+			t.Fatalf("read installed shapes: %v", err)
+		}
+		if got := installed[CaptureFunctionRow]; got.recordsIntoChangeLog() {
+			t.Errorf("the door read a definition of %s that records into the change log; the 0-arg "+
+				"function the trigger actually calls was gutted, so it read the decoy", CaptureFunctionRow)
+		}
+		openWantRefusal(t, CaptureFunctionRow, "records NOTHING")
+
+		// And the same ground truth as the representative attack: the
+		// gutted function really does drop the write.
+		applyPGSQL(t, dsn, `INSERT INTO body_t VALUES (2, 'lost behind the decoy')`)
+		if ops := readCapturedOps(t, ctx, db, "body_t"); len(ops) != 0 {
+			t.Fatalf("captured %v; the gutted function should record nothing", ops)
+		}
+
+		// Clean up the decoy before the remedy: `trigger setup` rewrites the
+		// 0-arg function and CANNOT remove an overload, which is exactly why
+		// the bypass was permanent once planted. Asserted, not assumed.
+		setup(t)
+		installed, err = loadInstalledCaptureFunctionShapes(ctx, db, "public")
+		if err != nil {
+			t.Fatalf("read installed shapes after repair: %v", err)
+		}
+		if got := installed[CaptureFunctionRow]; !got.recordsIntoChangeLog() {
+			t.Error("the repair re-run did not restore a recording definition")
+		}
+		applyPGSQL(t, dsn, `DROP FUNCTION public.sluice_capture_change(text)`)
+		if logs := openWantClean(t); strings.Contains(logs, staleCaptureFunctionMarker) {
+			t.Errorf("after the repair and decoy removal the door still reports drift:\n%s", logs)
+		}
+	})
+
 	t.Run("a definition changed AFTER setup recorded it refuses (provenance armed)", func(t *testing.T) {
 		// Still records — so the capture-defeat arm does not fire — but it
 		// is not what setup installed. This is the subtle-tamper class the
