@@ -118,7 +118,20 @@ var probeTimeoutRoster = []struct {
 	{
 		pkg:         "mysql",
 		chokepoints: []string{"preflightBinlogCDCOpen"},
-		floor:       5, // row-image, format, replica-source, db-filter, FK-actions
+		// row-image, format, replica-source, db-filter, FK-actions, and —
+		// since 2026-09-01 — advisePositionMode, which is ADVISORY rather
+		// than a preflight but is still a bounded read on this chokepoint,
+		// so it belongs in this universe and its cap is graded here.
+		//
+		// Bumped 5→6 with that probe rather than left: a floor that counts
+		// fewer than the walker finds still passes, and would have stopped
+		// reddening if the sixth were dropped — the "counts what the walker
+		// FOUND, not what exists" hazard this file's header names. It is
+		// also, at 6, the only thing pinning that advisePositionMode is
+		// called from preflightBinlogCDCOpen at all, which
+		// cdc_open_preflights.go asserts in prose ("the three chokepoints
+		// cannot diverge on it") and nothing else checks.
+		floor: 6,
 	},
 	{
 		pkg:         "postgres",

@@ -37,18 +37,12 @@ import (
 // LAST, after every refusal, so a refused open never also warns.
 // Bulk-only runs (migrate, backup full) never read the binlog and are
 // deliberately not gated.
-// snapshotFilterScope names a snapshot opener's synced databases for
-// the G6 filter preflight — the DSN's database in single-database mode,
-// the selected set in multi-database mode — plus the opener's table
-// allowlist (nil = whole database) for the G9 census.
-func snapshotFilterScope(multiDatabase bool, dbName string, databases, tables []string) binlogFilterScope {
-	scope := binlogFilterScope{databases: databases, tableAllowed: tableAllowlist(tables)}
-	if !multiDatabase {
-		scope.databases = []string{dbName}
-	}
-	return scope
-}
-
+//
+// (Ordering note: this block sat ABOVE snapshotFilterScope until
+// 2026-09-01, which meant `go doc` attached the whole thing — the roster
+// claim included — to that helper, and preflightBinlogCDCOpen had no doc
+// at all. Pre-existing, found while fixing the same misattachment one
+// file over. The chokepoint now follows its own doc.)
 func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilterScope, flavor Flavor) error {
 	if err := preflightBinlogRowImage(ctx, db); err != nil {
 		return err
@@ -65,6 +59,18 @@ func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilte
 	preflightFKReferentialActions(ctx, db, scope)
 	advisePositionMode(ctx, db, flavor)
 	return nil
+}
+
+// snapshotFilterScope names a snapshot opener's synced databases for
+// the G6 filter preflight — the DSN's database in single-database mode,
+// the selected set in multi-database mode — plus the opener's table
+// allowlist (nil = whole database) for the G9 census.
+func snapshotFilterScope(multiDatabase bool, dbName string, databases, tables []string) binlogFilterScope {
+	scope := binlogFilterScope{databases: databases, tableAllowed: tableAllowlist(tables)}
+	if !multiDatabase {
+		scope.databases = []string{dbName}
+	}
+	return scope
 }
 
 // positionModeAdvisoryMarker is the grep-stable prefix [advisePositionMode]

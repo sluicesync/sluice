@@ -4,6 +4,26 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.137.3] - 2026-09-01
+
+Two diagnostics that follow v0.137.2. Nothing changes what resumes or what refuses — both changes make a situation that was already happening *visible*.
+
+### Changed
+
+**A resume that cannot verify the source's identity now says so.** v0.137.2 taught backups to stamp the source's `@@server_uuid` onto binlog file/pos positions, so a resume against a replaced or rebuilt server refuses instead of streaming from an unrelated binlog. That check quietly does nothing in two cases, and until now both were silent.
+
+A position captured *before* v0.137.2 carries no identity, so it cannot be checked. Those positions are still accepted — that population cannot grow, since every capture door now stamps, and refusing would force a full re-copy on chains that are almost certainly fine. But the resume now warns, naming that the binlog *filename* check is all that protects it. That is what makes "take one fresh full backup" actionable for a specific chain rather than blanket advice.
+
+The second case is different and is now treated as such: the position carries an identity but the *source's* `@@server_uuid` could not be read, so the check could not run. That is a probe failure on a check whose job is to refuse, not an old position. It is still allowed through, so a transient read cannot force a re-snapshot — but it warns, and a recurring one should be treated as a real finding rather than noise. Both carry `UNVERIFIED-INSTANCE-IDENTITY`, so every chain resuming without the check can be found in one grep.
+
+**A source with `gtid_mode=OFF` is told which resume mode it is on.** sluice has never required GTID either way and still doesn't — it detects the setting and picks an arm. That was reasonable while the two arms looked equivalent. It stopped being reasonable once file/pos turned out to be the arm carrying an instance-identity hazard: binlog filenames are instance-local, so a resume against a replaced source is only caught by the `@@server_uuid` stamp, whereas a GTID set is instance-bound by construction and needed no such stamp.
+
+Choosing the weaker arm silently, on MySQL 8's default, left operators with no way to know they were on it. There is now one INFO per CDC open saying so. It is an INFO and not a warning on purpose: file/pos is a supported, correct configuration, and a warning on a working setup is what teaches people to ignore warnings. MariaDB and the Vitess/PlanetScale flavors are excluded — neither has a choice to advise about.
+
+### Compatibility
+
+Drop-in from v0.137.2. No schema, format, or flag change, and no change to which positions resume or refuse — only new log output.
+
 ## [0.137.2] - 2026-09-01
 
 Closes a silent data-loss hole in the MySQL backup→CDC handoff. **If you resume MySQL sync from a backup manifest and your source has `gtid_mode=OFF` (MySQL 8's default), read the Fixed section — a fresh full backup is worth taking.**

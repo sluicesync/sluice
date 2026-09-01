@@ -2171,6 +2171,12 @@ func safePurgeHint(p binlogPos) string {
 	}
 }
 
+// unverifiedInstanceIdentityMarker is the grep-stable prefix both
+// degraded arms of [verifySourceInstanceIdentity] carry, so an operator
+// can find every chain resuming without the identity check and the pins
+// can key on it.
+const unverifiedInstanceIdentityMarker = "UNVERIFIED-INSTANCE-IDENTITY"
+
 // verifySourceInstanceIdentity refuses a file/pos resume whose
 // persisted @@server_uuid differs from the source instance the
 // resume is now connecting to. This is the loud-failure floor for
@@ -2213,12 +2219,6 @@ func safePurgeHint(p binlogPos) string {
 // Both stay permissive on purpose. The revisit trigger is the install
 // base, not the code: once there is one, the unverifiable population
 // stops draining on its own and the trade changes.
-// unverifiedInstanceIdentityMarker is the grep-stable prefix both
-// degraded arms of [verifySourceInstanceIdentity] carry, so an operator
-// can find every chain resuming without the identity check and the pins
-// can key on it.
-const unverifiedInstanceIdentityMarker = "UNVERIFIED-INSTANCE-IDENTITY"
-
 func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUID string) error {
 	if persistedUUID == "" {
 		slog.WarnContext(
