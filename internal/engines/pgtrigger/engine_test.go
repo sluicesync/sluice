@@ -276,8 +276,8 @@ func TestRefuseObservedDDL_DroppedTableRemedy(t *testing.T) {
 // polled-fingerprint loop's setup-time hook is the only DDL-detection
 // surface.
 func TestRenderSetupDDL_EventTriggerToggle(t *testing.T) {
-	withET := renderSetupDDL("public", []tableTriggerSpec{{Name: "orders", PKCols: []string{"id"}}}, true, CapturePayloadFull, false)
-	withoutET := renderSetupDDL("public", []tableTriggerSpec{{Name: "orders", PKCols: []string{"id"}}}, false, CapturePayloadFull, false)
+	withET := renderSetupDDL("public", []tableTriggerSpec{{Name: "orders", PKCols: []string{"id"}}}, true, CapturePayloadFull, false, nil)
+	withoutET := renderSetupDDL("public", []tableTriggerSpec{{Name: "orders", PKCols: []string{"id"}}}, false, CapturePayloadFull, false, nil)
 
 	if !anyContains(withET, "CREATE EVENT TRIGGER") {
 		t.Errorf("renderSetupDDL(canEventTrigger=true) missing CREATE EVENT TRIGGER")

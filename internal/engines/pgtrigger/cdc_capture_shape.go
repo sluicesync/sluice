@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // The capture-shape door (audit 2026-08-26 F2) — pgtrigger's mirror of
@@ -292,6 +293,15 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 		tables = append(tables, t)
 	}
 	sort.Strings(tables)
+	// The posture remedies name EVERY table that carries a capture trigger,
+	// not just the one that tripped the grade (audit 2026-08-31 A-2). The
+	// posture is install-wide, so a re-run that names fewer tables than the
+	// door grades cannot converge the install — and "re-run `sluice trigger
+	// setup`" without the list is exactly the advice that left an operator
+	// re-running their last command against a still-wedged stream. Setup
+	// now refuses to CREATE the divergence (refuseImplicitPostureNarrowing);
+	// this list is what repairs the installs that already have it.
+	allTables := "--tables=" + strings.Join(tables, ",")
 
 	expected := []struct {
 		name   string
@@ -344,17 +354,20 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 			case "A": // reachable only when the recorded posture is origin-only
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is set ENABLE ALWAYS but this install recorded ORIGIN-ONLY capture — the trigger's "+
-						"enablement was flipped by hand, so replica-role (replicated/applied) %s writes are being captured WITHOUT the echo-loop vetting "+
-						"the --capture-replicated-writes opt-in runs (ADR-0185); re-run `sluice trigger setup` to restore origin-only capture, or re-run it "+
-						"with --capture-replicated-writes to make replicated-write capture the recorded, vetted intent",
-					tbl, want.name, want.events,
+						"enablement was flipped by hand (or by a `trigger setup` run from before v0.137, which wrote the posture for the whole install "+
+						"but the trigger ALTERs only for the tables it named), so replica-role (replicated/applied) %s writes are being captured WITHOUT "+
+						"the echo-loop vetting the --capture-replicated-writes opt-in runs (ADR-0185); re-run `sluice trigger setup --dsn=... %s` — the "+
+						"list is every table this install captures, and a re-run naming fewer cannot converge the posture — to restore origin-only capture, "+
+						"or add --capture-replicated-writes to make replicated-write capture the recorded, vetted intent",
+					tbl, want.name, want.events, allTables,
 				)
 			default: // got.enabled == "O" while the recorded posture is ENABLE ALWAYS
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is plain ENABLE (origin-only) but this install recorded --capture-replicated-writes — "+
 						"replica-role (replicated/applied) %s writes are NOT being captured (silently absent from the stream — the exact loss the opt-in "+
-						"exists to close; ADR-0185); re-run `sluice trigger setup --capture-replicated-writes` to restore the ENABLE ALWAYS triggers",
-					tbl, want.name, want.events,
+						"exists to close; ADR-0185); re-run `sluice trigger setup --dsn=... %s --capture-replicated-writes` to restore the ENABLE ALWAYS "+
+						"triggers (the list is every table this install captures)",
+					tbl, want.name, want.events, allTables,
 				)
 			}
 			if got.fn != want.fn {

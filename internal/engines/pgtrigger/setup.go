@@ -424,6 +424,24 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, err
 	}
 
+	// The ADR-0185 posture is recorded per-INSTALL and enforced per-TABLE
+	// (audit 2026-08-31 A-2), so a run that names a subset of the install's
+	// captured tables owes the OTHERS a decision. Read them here — before
+	// the event-trigger probe, so a run this refuses touches nothing at all
+	// — and hand them to the render (widen) or to the refusal (narrow).
+	outside, err := installedCaptureTriggersOutside(ctx, db, opts.Schema, opts.Tables)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"pgtrigger: setup: cannot read the capture triggers already installed in schema %q (%w) — refusing to apply a "+
+				"plan that could leave the install's capture posture half-written (the posture is recorded once for the "+
+				"whole install but enforced per trigger)",
+			opts.Schema, err,
+		)
+	}
+	if err := refuseImplicitPostureNarrowing(outside, opts.Tables, opts.CaptureReplicatedWrites); err != nil {
+		return nil, err
+	}
+
 	// Event-trigger permissions probe (attempt-based, rolled back —
 	// zero residue; see canCreateEventTrigger).
 	canEventTrigger, err := canCreateEventTrigger(ctx, db, opts.Schema)
@@ -450,7 +468,7 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	for i, t := range opts.Tables {
 		specs[i] = tableTriggerSpec{Name: t, PKCols: pkColsByTable[t]}
 	}
-	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload, opts.CaptureReplicatedWrites)
+	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload, opts.CaptureReplicatedWrites, outside)
 
 	if len(refusals) > 0 {
 		// Refusals block the run even on dry-run — the operator
@@ -712,6 +730,118 @@ func missingFloorColumns(floor, have []string) []string {
 	return missing
 }
 
+// The install-wide posture's missing half (audit 2026-08-31 A-2).
+//
+// `--capture-replicated-writes` is recorded ONCE per install (the meta
+// table's capture_replicated_writes, which every CDC open reads) and
+// enforced per TRIGGER (the F2 door grades every sluice-named trigger it
+// finds in the schema). Setup wrote only the per-table half, and only for
+// `opts.Tables` — so:
+//
+//	sluice trigger setup --tables=orders --capture-replicated-writes
+//	  → orders' triggers 'A'; recorded posture true
+//	sluice trigger setup --tables=shipments          (flag omitted)
+//	  → shipments' triggers 'O'; recorded posture flipped to FALSE; NOT ONE
+//	    statement of the plan mentions orders, whose triggers stay 'A'
+//
+// The next open refused — loudly, which is right — but with "the trigger's
+// enablement was flipped by hand", blaming a human who flipped nothing, and
+// prescribing a `sluice trigger setup` re-run that is exactly the command
+// that produced the state, so the stream stayed wedged until the operator
+// independently reconstructed the full historical table list. Two shipped
+// docs stated that repair unconditionally.
+//
+// The fix is to make setup's WRITE set cover the door's GRADE set. The two
+// directions are deliberately NOT symmetric:
+//
+//   - WIDENING (the opt-in requested, an outside table plain): applied
+//     automatically. More capture is never a loss, and leaving it out is
+//     what created the half-converted install.
+//   - NARROWING (no opt-in requested, an outside table ENABLE ALWAYS):
+//     REFUSED ([refuseImplicitPostureNarrowing]). Taking a table off ENABLE
+//     ALWAYS is precisely the F1 silent-capture-gap this opt-in exists to
+//     close — rows another sync applies under replica role stop being
+//     captured, at exit 0 — and it must not happen as a side effect of
+//     naming a DIFFERENT table. The refusal hands the operator both
+//     runnable commands.
+//
+// 'D' (disabled) and 'R' (replica-only) outside triggers are left alone by
+// both directions: they are not a posture disagreement but a broken shape,
+// the capture-shape door refuses on them by name, and its remedy — naming
+// that table — re-creates the trigger outright.
+
+// installedCaptureTriggersOutside returns the sluice capture triggers
+// already installed in the schema on tables this run does NOT name. It is
+// the same reader the capture-shape door grades with
+// ([loadInstalledCaptureTriggers]), which is what makes "setup writes what
+// the door grades" a containment property rather than two hand-kept lists.
+// Bounded per the probe convention (audit 2026-08-27 A5) — a catalog read
+// behind a queued lock must not hang `trigger setup` either.
+func installedCaptureTriggersOutside(ctx context.Context, db *sql.DB, schema string, tables []string) ([]installedCaptureTrigger, error) {
+	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	installed, err := loadInstalledCaptureTriggers(pctx, db, schema)
+	if err != nil {
+		return nil, err
+	}
+	named := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		named[t] = true
+	}
+	var outside []installedCaptureTrigger
+	for _, it := range installed {
+		if !named[it.table] {
+			outside = append(outside, it)
+		}
+	}
+	return outside, nil
+}
+
+// refuseImplicitPostureNarrowing refuses a plain-posture setup run that
+// would leave ENABLE ALWAYS triggers behind on tables it does not name —
+// see the block comment above for why this direction refuses while the
+// widening one is applied. Pure (no DB) so the decision is unit-graded.
+func refuseImplicitPostureNarrowing(outside []installedCaptureTrigger, named []string, captureReplicated bool) error {
+	if captureReplicated {
+		return nil
+	}
+	always := map[string]bool{}
+	for _, it := range outside {
+		if it.enabled == "A" {
+			always[it.table] = true
+		}
+	}
+	if len(always) == 0 {
+		return nil
+	}
+	alwaysTables := make([]string, 0, len(always))
+	union := map[string]bool{}
+	for t := range always {
+		alwaysTables = append(alwaysTables, t)
+		union[t] = true
+	}
+	for _, t := range named {
+		union[t] = true
+	}
+	sort.Strings(alwaysTables)
+	allTables := make([]string, 0, len(union))
+	for t := range union {
+		allTables = append(allTables, t)
+	}
+	sort.Strings(allTables)
+	return fmt.Errorf(
+		"pgtrigger: setup: this install already captures replicated writes on table(s) %s (their capture triggers are "+
+			"ENABLE ALWAYS), but this run names only %s and did not pass --capture-replicated-writes. Applying it would "+
+			"leave the install half-converted — the recorded posture would say origin-only while those triggers keep "+
+			"firing for replica-role writes — and the next stream open would refuse. Setup will NOT silently take them "+
+			"off ENABLE ALWAYS either: that is the silent capture gap the opt-in exists to close (ADR-0185 — rows another "+
+			"sync applies under session_replication_role=replica stop being captured, at exit 0). Either keep the opt-in "+
+			"for the whole install by re-running with --capture-replicated-writes, or convert the install back to "+
+			"origin-only by naming every captured table: --tables=%s",
+		strings.Join(alwaysTables, ","), strings.Join(named, ","), strings.Join(allTables, ","),
+	)
+}
+
 // tableTriggerSpec pairs one replicated table with the PK column list
 // [renderSetupDDL] bakes into its capture trigger's TG_ARGV (ADR-0066
 // §3, N-16). PKCols is in PK-constraint (conkey) order; it is empty
@@ -762,8 +892,12 @@ func pkColsJSON(cols []string) string {
 // posture is recorded in the meta upsert so every CDC open can grade the
 // installed enablement against the recorded intent (the F2 door's posture
 // match, which grades all four triggers). A re-run WITHOUT the flag
-// converges an opt-in install back to plain: the DROP + CREATE yields
-// fresh 'O' triggers and the upsert records false.
+// converges the tables it NAMES back to plain: the DROP + CREATE yields
+// fresh 'O' triggers and the upsert records false. postureAlign carries the
+// capture triggers installed on the tables it does NOT name (audit
+// 2026-08-31 A-2) — widened here under the opt-in, refused by
+// [refuseImplicitPostureNarrowing] in the other direction, never left
+// behind.
 //
 // # The plan is ONE transaction (Bug 257 + audit SEC-2 / C-1)
 //
@@ -800,7 +934,7 @@ func pkColsJSON(cols []string) string {
 //     schema_version, so the version can never claim a registry that isn't
 //     there. (The transaction now makes that atomic as well, but the
 //     ordering is kept: a hand-applied plan can be stopped anywhere.)
-func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool) []string {
+func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool, postureAlign []installedCaptureTrigger) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
@@ -947,6 +1081,28 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerRow)),
 				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerTruncate)),
 			)
+		}
+	}
+
+	// The install-wide half of the posture (audit 2026-08-31 A-2): the
+	// capture triggers already installed on tables this run does NOT name.
+	// Only the WIDENING direction is rendered — the narrowing one refuses
+	// before we get here ([refuseImplicitPostureNarrowing]) — and only
+	// plain 'O' triggers are touched, so a hand-disabled ('D') or
+	// replica-only ('R') trigger stays the capture-shape door's business
+	// rather than being silently re-armed by a run about another table.
+	// These are ALTERs only: setup has no PK list for a table it was not
+	// asked about, and a DROP+CREATE with an empty TG_ARGV would install a
+	// trigger whose own body refuses every row.
+	if captureReplicated {
+		for _, it := range postureAlign {
+			if it.enabled != "O" {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"ALTER TABLE %s.%s ENABLE ALWAYS TRIGGER %s",
+				quoteIdent(schema), quoteIdent(it.table), quoteIdent(it.name),
+			))
 		}
 	}
 

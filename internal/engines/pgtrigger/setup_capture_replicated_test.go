@@ -23,8 +23,8 @@ func TestRenderSetupDDL_CaptureReplicatedWrites(t *testing.T) {
 		{Name: "orders", PKCols: []string{"id"}},
 		{Name: "line_items", PKCols: []string{"tenant_id", "order_id"}},
 	}
-	plain := strings.Join(renderSetupDDL("public", specs, true, CapturePayloadFull, false), "\n")
-	optIn := strings.Join(renderSetupDDL("public", specs, true, CapturePayloadFull, true), "\n")
+	plain := strings.Join(renderSetupDDL("public", specs, true, CapturePayloadFull, false, nil), "\n")
+	optIn := strings.Join(renderSetupDDL("public", specs, true, CapturePayloadFull, true, nil), "\n")
 
 	t.Run("opt-in emits ENABLE ALWAYS for both triggers of every table", func(t *testing.T) {
 		for _, want := range []string{

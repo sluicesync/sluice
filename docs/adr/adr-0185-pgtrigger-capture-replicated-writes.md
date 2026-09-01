@@ -21,7 +21,7 @@ The v0.131.5 remediation shipped **detection** (the `SILENT-CAPTURE-GAP RISK` WA
 
 ## Decision
 
-**The default posture is unchanged.** Plain triggers, origin-only capture, the existing WARN on both replica-role shapes — no upgrade changes any existing install's behaviour (a setup re-run without the flag converges an opt-in install back to plain).
+**The default posture is unchanged.** Plain triggers, origin-only capture, the existing WARN on both replica-role shapes — no upgrade changes any existing install's behaviour (a setup re-run without the flag converges an opt-in install back to plain **when it names every captured table**; a run that names fewer refuses rather than half-converting — see the A-2 implementation note).
 
 **New opt-in: `sluice trigger setup --capture-replicated-writes`** (postgres-trigger only; SQLite/D1 have no replication-role concept — their triggers fire for every write already).
 
@@ -88,6 +88,29 @@ So the opt-in produced the first configuration in which the two capture tiers co
 **Why a refusal here and a WARN for the D-1 arm's absence** (they look similar and are not): a posture MISMATCH is an install that claims a capture guarantee it is not delivering, and the operator explicitly asked for that guarantee. A missing `sql_drop` arm is an install that never claimed the guarantee at all — refusing it would strand every pre-v0.135 sync at the moment the binary is upgraded, for a gap that is bounded and static. Same reasoning as SEC-1's `INSECURE-CAPTURE-FUNCTION` WARN.
 
 **Gate.** `TestCaptureTierRoster_EveryEmittedTrigger` (`internal/engines/pgtrigger/capture_tier_roster_test.go`) derives the roster from the statements `renderSetupDDL` emits: every created trigger must be classified, every classified trigger must be `ENABLE ALWAYS` under the opt-in (or carry a written exemption), the plain render must set nothing, and each event trigger's tags must be recordable by its own arm. A new capture trigger that nobody classifies fails the build. Its scope is the rendered SQL only — the server-behaviour halves are `TestCaptureReplicatedWrites_ReplicaRoleDDLIsCaptured` (plain 'O' records nothing under replica role while origin DDL does; opt-in records the ALTER *before* the INSERT it reshapes; a replica-role DROP of a captured table records too; both posture-door directions with the setup-re-run repair) and `TestCaptureDropTier_DDLCommandEndIsBlindToDrops`.
+
+## Implementation note (audit 2026-08-31 A-2): the posture is recorded per INSTALL, so setup must write it for the whole install
+
+This ADR records the posture **once** (the meta table's singleton `capture_replicated_writes`, which every CDC open reads) and enforces it **per trigger** (the F2 door grades every sluice-named trigger it finds in the schema). `trigger setup` wrote only the per-table half, and only for the tables of that invocation — and `--tables` is `required`, with no setup-time discovery. So:
+
+```
+sluice trigger setup --tables=orders --capture-replicated-writes   → orders 'A', posture true
+sluice trigger setup --tables=shipments                            → shipments 'O', posture FALSE,
+                                                                     orders untouched at 'A'
+```
+
+The next open refused — correctly, the install *is* incoherent — but with *"the trigger's enablement was flipped by hand … re-run `sluice trigger setup`"*, which blames a human who flipped nothing and prescribes the command that produced the state. **The remedy provably does not clear it**: re-running `--tables=shipments` leaves `orders` at `'A'` forever, and the stream stays wedged until the operator independently reconstructs the full historical table list. Two shipped claims asserted that repair unconditionally — this ADR's Decision (*"a setup re-run without the flag converges an opt-in install back to plain"*) and `docs/operator/cdc-streaming.md`. Both are corrected. Note the shape: the F2 door's own scope note already named the missing artifact (*"pgtrigger records no setup-time table roster"*) against a different symptom, so one gap was described twice and closed zero times.
+
+**The fix makes setup's write set cover the door's grade set**, with the two directions deliberately asymmetric:
+
+- **Widening** (opt-in requested, an outside table plain): applied automatically — `ALTER TABLE … ENABLE ALWAYS TRIGGER` for each capture trigger on a table this run does not name. More capture is never a loss, and leaving it out is what created the half-converted install.
+- **Narrowing** (no opt-in requested, an outside table `ENABLE ALWAYS`): **refused**, naming those tables and printing both runnable commands — re-run with the flag, or re-run with `--tables=<every captured table>`. Taking a table off `ENABLE ALWAYS` is exactly the F1 silent-capture-gap this opt-in exists to close, and it must not happen as a side effect of naming a *different* table. The refusal fires before any DDL, dry-run included.
+
+`'D'` (disabled) and `'R'` (replica-only) outside triggers are left alone by both directions: they are not a posture disagreement but a broken shape, the capture-shape door refuses on them by name, and its remedy — naming that table — re-creates the trigger outright. Setup emits ALTERs only for outside tables, never a `DROP`+`CREATE`: it has no PK list for a table it was not asked about, and a re-create with an empty `TG_ARGV` would install a trigger whose own body refuses every row.
+
+For the installs that already carry the divergence, the door's posture messages now print `--tables=<every table carrying a capture trigger>` — the door reads that list to grade it, so it can hand it over — and name the pre-v0.137 setup as a possible cause alongside a hand-flip.
+
+**Gates.** `TestSetupPostureEndStateCoversTheDoorGradeSet` states the containment property over the END state rather than the statement list (after a run, every trigger the door will grade stands at the recorded posture — or the run refused), with a 4-trigger anti-vacuity floor; `TestSetupRefusesImplicitPostureNarrowing` and `TestSetupPostureAlignment` pin the two directions and the `'D'`/`'R'` carve-out; `TestSetupPostureIsInstallWide` walks the whole operator sequence on a real PG and requires **each prescribed remedy to actually clear the state it is prescribed for**. Mutation-run both ways: disabling the refusal makes the integration pin report `Setup accepted the half-converting run` (and its dry-run twin), disabling the widening leaves `shipments` at `'O'` and the CDC open refuses — the shipped defect, reproduced.
 
 ## Implementation note (audit 2026-08-31 SEC-4 + A-5): the echo-loop refusal probes the DATABASE, not one schema
 
