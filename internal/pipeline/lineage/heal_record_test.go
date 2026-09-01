@@ -1,12 +1,14 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Pins for the A3 heal-log LOW tails (audit backlog 2026-08-27): the
-// no-trailing-newline append belt and the ReadHealRecords line-cap
-// posture. The heal FLOW pins (evidence preservation, no-op boundaries,
+// Pins for the heal artifacts' own codec: the no-trailing-newline append
+// belt and the size posture (audit backlog 2026-08-27), the pre-heal
+// evidence copy's create-only claim (2026-08-31 C-3), and the per-line
+// read posture that stops one junk byte hiding every record (SEC-7). The
+// heal FLOW pins (evidence preservation end to end, no-op boundaries,
 // verify surfacing) live in internal/pipeline/backup's
-// chain_maintenance_heal_test.go; these two are properties of the
-// record codec itself, so they pin here beside it.
+// chain_maintenance_heal_test.go; these are properties of the record
+// codec itself, so they pin here beside it.
 
 package lineage
 
@@ -87,9 +89,12 @@ func TestAppendHealRecord_NonNewlineTerminatedPriorBody(t *testing.T) {
 	if err := AppendHealRecord(ctx, store, healRec("prune")); err != nil {
 		t.Fatalf("second append onto newline-less body: %v", err)
 	}
-	recs, err := ReadHealRecords(ctx, store)
+	recs, defects, err := ReadHealRecords(ctx, store)
 	if err != nil {
 		t.Fatalf("read after guarded append: %v", err)
+	}
+	if len(defects) != 0 {
+		t.Errorf("defects = %v; want none — the separator guard must keep both lines decodable", defects)
 	}
 	if len(recs) != 2 {
 		t.Fatalf("got %d record(s); want 2 — a missing separator glues the records into one unreadable line", len(recs))
@@ -169,11 +174,12 @@ func TestPreserveLineageSigForHeal_NeverOverwritesPriorEvidence(t *testing.T) {
 	})
 }
 
-// TestReadHealRecords_LongLines pins the A3-SCANNER-CAP posture, both
-// directions: a record whose VerifyFailure overflows bufio.Scanner's
-// 64 KiB DEFAULT line cap still reads (pre-fix the log was unreadable
-// forever), and a line past the raised 1 MiB ceiling refuses LOUDLY
-// rather than being skipped — the log is evidence.
+// TestReadHealRecords_LongLines pins the A3-SCANNER-CAP successor. The
+// old 1 MiB per-LINE ceiling was an artifact of bufio.Scanner; the whole-
+// body read has no per-line limit, so an arbitrarily long VerifyFailure
+// now reads back instead of stopping the scan. The loud boundary moved to
+// the whole-file cap, and reaching it is a DEFECT (the tail was not read),
+// never a silent truncation.
 func TestReadHealRecords_LongLines(t *testing.T) {
 	ctx := context.Background()
 
@@ -184,24 +190,117 @@ func TestReadHealRecords_LongLines(t *testing.T) {
 		if err := AppendHealRecord(ctx, store, rec); err != nil {
 			t.Fatalf("append: %v", err)
 		}
-		recs, err := ReadHealRecords(ctx, store)
+		recs, defects, err := ReadHealRecords(ctx, store)
 		if err != nil {
 			t.Fatalf("a >64KiB record must still read (the pre-fix unreadable-forever shape): %v", err)
 		}
 		if len(recs) != 1 || len(recs[0].VerifyFailure) != 100*1024 {
 			t.Fatalf("long record did not round-trip: got %d record(s)", len(recs))
 		}
+		if len(defects) != 0 {
+			t.Errorf("defects = %v; want none", defects)
+		}
 	})
 
-	t.Run("a line past 1 MiB refuses loudly", func(t *testing.T) {
+	t.Run("a 2 MiB line reads back too — the per-line ceiling is gone", func(t *testing.T) {
 		store := newMemStore()
 		rec := healRec("prune")
-		rec.VerifyFailure = strings.Repeat("y", healLogMaxLineBytes+1024)
+		rec.VerifyFailure = strings.Repeat("y", 2<<20)
 		if err := AppendHealRecord(ctx, store, rec); err != nil {
 			t.Fatalf("append: %v", err)
 		}
-		if _, err := ReadHealRecords(ctx, store); err == nil {
-			t.Fatal("a line past the 1 MiB ceiling must refuse loudly, never be silently skipped")
+		recs, defects, err := ReadHealRecords(ctx, store)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if len(recs) != 1 || len(recs[0].VerifyFailure) != 2<<20 {
+			t.Fatalf("a line past the old 1 MiB ceiling did not round-trip: got %d record(s)", len(recs))
+		}
+		if len(defects) != 0 {
+			t.Errorf("defects = %v; want none", defects)
 		}
 	})
+
+	t.Run("a body past the whole-file cap reports a defect, never a silent truncation", func(t *testing.T) {
+		store := newMemStore()
+		if err := AppendHealRecord(ctx, store, healRec("backup compact")); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		// Pad past the cap. The first record still parses; the read must
+		// SAY that everything past the cap went unread.
+		store.data[MaintenanceHealLogFileName] = append(
+			store.data[MaintenanceHealLogFileName],
+			bytes.Repeat([]byte("z"), healLogMaxBytes)...,
+		)
+		recs, defects, err := ReadHealRecords(ctx, store)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if len(recs) != 1 {
+			t.Errorf("records = %d; want the 1 that parsed before the cap", len(recs))
+		}
+		if len(defects) == 0 {
+			t.Fatal("a body past the read cap must be reported — a silent truncation is exactly the evidence loss this file exists to prevent")
+		}
+		if !strings.Contains(defects[0].Reason, "read cap") {
+			t.Errorf("first defect = %+v; want it to name the read cap", defects[0])
+		}
+	})
+}
+
+// TestReadHealRecords_OneJunkByteDoesNotHideTheOtherRecords is the audit
+// 2026-08-31 SEC-7 pin. Under the old refuse-the-whole-file posture an
+// adversary with store WRITE access but no signing key — strictly weaker
+// than one who can trigger a heal — appended a single non-JSON byte and
+// every prior heal record became invisible, behind a WARN, at exit 0.
+// Records now parse independently and the unreadable line is counted and
+// named.
+func TestReadHealRecords_OneJunkByteDoesNotHideTheOtherRecords(t *testing.T) {
+	ctx := context.Background()
+	store := newMemStore()
+	for _, op := range []string{"backup compact", "prune"} {
+		if err := AppendHealRecord(ctx, store, healRec(op)); err != nil {
+			t.Fatalf("append %s: %v", op, err)
+		}
+	}
+	// The one-byte lever: a junk line appended to a well-formed log.
+	store.data[MaintenanceHealLogFileName] = append(
+		store.data[MaintenanceHealLogFileName], []byte("\xff\n")...,
+	)
+
+	recs, defects, err := ReadHealRecords(ctx, store)
+	if err != nil {
+		t.Fatalf("malformed content must never be an error return (that is reserved for store failures): %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("records = %d; want 2 — one junk byte must not hide the heal records that DID parse", len(recs))
+	}
+	if recs[0].Operation != "backup compact" || recs[1].Operation != "prune" {
+		t.Errorf("records out of order or corrupted: %+v", recs)
+	}
+	// Loud, counted, and located — not a silent skip.
+	if len(defects) != 1 {
+		t.Fatalf("defects = %v; want exactly 1 (the junk line), reported not swallowed", defects)
+	}
+	if defects[0].Line != 3 {
+		t.Errorf("defect line = %d; want 3 — the defect must locate the bad line for an operator", defects[0].Line)
+	}
+	if defects[0].Reason == "" {
+		t.Error("defect carries no reason")
+	}
+
+	// A torn TAIL (no trailing newline) is the same class and must behave
+	// the same way: the completed records survive, the partial one is
+	// named.
+	store.data[MaintenanceHealLogFileName] = append(
+		bytes.TrimSuffix(store.data[MaintenanceHealLogFileName], []byte("\xff\n")),
+		[]byte(`{"healed_at":"2026-08-31T0`)...,
+	)
+	recs, defects, err = ReadHealRecords(ctx, store)
+	if err != nil {
+		t.Fatalf("torn tail: %v", err)
+	}
+	if len(recs) != 2 || len(defects) != 1 {
+		t.Fatalf("torn tail: records=%d defects=%v; want 2 records and 1 defect", len(recs), defects)
+	}
 }

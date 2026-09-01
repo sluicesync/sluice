@@ -577,12 +577,26 @@ func healStaleLineageSignatures(ctx context.Context, store irbackup.Store, cat *
 // lineage.VerifyLineage) and fails on a new entry point that neither
 // reports nor is classified exempt.
 func reportMaintenanceHeals(ctx context.Context, store irbackup.Store, what string) {
-	recs, err := lineage.ReadHealRecords(ctx, store)
+	recs, defects, err := lineage.ReadHealRecords(ctx, store)
 	if err != nil {
 		slog.WarnContext(ctx, what+": cannot read the maintenance-heal log — heal provenance unknown",
 			slog.String("error", err.Error()))
 		return
 	}
+	// Defects are reported AFTER the records that did parse: a corrupted
+	// line must not hide the rest (audit 2026-08-31 SEC-7). Loud, counted,
+	// and pointed at the remedy — still not a verify failure, because the
+	// signature checks stand on their own.
+	defer func() {
+		if len(defects) == 0 {
+			return
+		}
+		slog.WarnContext(ctx, what+": the maintenance-heal log has unreadable line(s) — the heal records reported above are the ones that PARSED, so some heal provenance may be missing. Inspect "+
+			lineage.MaintenanceHealLogFileName+" by hand, and compare against the preserved lineage.json.sig.pre-heal-* copies, which are separate objects and carry the byte-verbatim evidence",
+			slog.Int("unreadable_lines", len(defects)),
+			slog.Int("records_reported", len(recs)),
+			slog.String("first_defect", describeHealLogDefect(defects[0])))
+	}()
 	for _, rec := range recs {
 		slog.InfoContext(
 			ctx,
@@ -594,6 +608,14 @@ func reportMaintenanceHeals(ctx context.Context, store irbackup.Store, what stri
 			slog.String("preserved_sig", rec.PreservedSig),
 		)
 	}
+}
+
+// describeHealLogDefect renders one heal-log defect for the WARN.
+func describeHealLogDefect(d lineage.HealLogDefect) string {
+	if d.Line == 0 {
+		return d.Reason
+	}
+	return fmt.Sprintf("line %d: %s", d.Line, d.Reason)
 }
 
 // unverifiableSignedArtifact reports a signed artifact that cannot be

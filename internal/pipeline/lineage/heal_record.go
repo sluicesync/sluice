@@ -70,7 +70,6 @@ package lineage
 // [ReadHealRecords] counts it).
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -90,9 +89,19 @@ const MaintenanceHealLogFileName = "maintenance-heal.log"
 // lineage.json.sig. The suffix is the heal's UnixNano timestamp.
 const PreHealLineageSigPrefix = LineageSigFileName + ".pre-heal-"
 
-// healLogMaxLineBytes is [ReadHealRecords]' per-line ceiling (1 MiB —
-// see the posture note at the Scanner). A line past it refuses loudly.
-const healLogMaxLineBytes = 1 << 20
+// healLogMaxBytes caps how much of maintenance-heal.log [ReadHealRecords]
+// will read (16 MiB). A chain sees 0–1 heals ever and each record is a few
+// hundred bytes, so any log approaching this is already pathological; the
+// cap exists so a store object of arbitrary size cannot be read into
+// memory by a verify. Reaching it is reported as a defect (the tail was
+// NOT read), never silently.
+//
+// It replaces a 1 MiB per-LINE ceiling that came from bufio.Scanner's
+// ErrTooLong: with the whole-body read below there is no per-line limit to
+// hit, so a pathologically long VerifyFailure now reads back instead of
+// making the log unreadable forever (the A3-SCANNER-CAP concern, closed
+// rather than raised).
+const healLogMaxBytes = 16 << 20
 
 // HealRecord is one durable maintenance-heal entry. Append-only,
 // forward-compatible (readers ignore unknown fields).
@@ -225,47 +234,91 @@ func AppendHealRecord(ctx context.Context, store irbackup.Store, rec HealRecord)
 	return nil
 }
 
-// ReadHealRecords reads and decodes maintenance-heal.log. An absent log
-// is (nil, nil) — the common healthy-chain case. A malformed line is a
-// loud error, never a partial silent read: the log is evidence, and a
-// truncated/torn record is itself worth surfacing.
-func ReadHealRecords(ctx context.Context, store irbackup.Store) ([]HealRecord, error) {
+// HealLogDefect names one piece of maintenance-heal.log that could not be
+// decoded. Defects are REPORTED, never swallowed and never fatal — see
+// [ReadHealRecords] for why the posture is per-line rather than refuse-all.
+type HealLogDefect struct {
+	// Line is the 1-based line number, or 0 for a whole-file defect
+	// (e.g. the body exceeded [healLogMaxBytes]).
+	Line int
+
+	// Reason is the operator-facing description of what was unreadable.
+	Reason string
+}
+
+// ReadHealRecords reads and decodes maintenance-heal.log, returning the
+// records that parsed and one [HealLogDefect] per piece that did not. An
+// absent log is (nil, nil, nil) — the common healthy-chain case. The error
+// return is reserved for STORE failures (probe / open / read); malformed
+// CONTENT is never an error.
+//
+// POSTURE — per-line skip with a counted, loud defect, changed from
+// refuse-the-whole-file (audit 2026-08-31 SEC-7). The evidence-integrity
+// argument genuinely cuts both ways, so the reasoning is recorded here:
+//
+// Refuse-all treats the log as one indivisible artifact — a torn record
+// means "something is wrong with this evidence, stop". Attractive, but it
+// hands a strictly WEAKER adversary than the one who can cause a heal
+// (store write access, no signing key) a one-byte lever: append a single
+// non-JSON byte and EVERY prior heal record becomes invisible, behind a
+// warning that reads like a benign torn write, at exit 0. That converts
+// "evidence exists" into "a warning appeared", which is the outcome the A3
+// artifacts were built to prevent.
+//
+// Per-line skip keeps what refuse-all actually bought — an unreadable line
+// is still surfaced loudly, with its line number and a count — and removes
+// the lever, because hiding a record now costs corrupting THAT record
+// rather than one byte anywhere. It is not the "skip-branch without proof"
+// the new-surface checklist forbids: nothing is dropped quietly, the
+// skipped content is counted and named, and the caller
+// (backup.reportMaintenanceHeals) WARNs with the remedy. The format is
+// JSONL precisely because records are independent.
+//
+// Neither posture protects against a store-writer who rewrites the whole
+// log, and neither is meant to: the log is descriptive provenance. The
+// byte-verbatim forensic evidence is the preserved `lineage.json.sig.pre-
+// heal-*` copies, which are separate objects.
+func ReadHealRecords(ctx context.Context, store irbackup.Store) ([]HealRecord, []HealLogDefect, error) {
 	exists, err := store.Exists(ctx, MaintenanceHealLogFileName)
 	if err != nil {
-		return nil, fmt.Errorf("inspect %q: %w", MaintenanceHealLogFileName, err)
+		return nil, nil, fmt.Errorf("inspect %q: %w", MaintenanceHealLogFileName, err)
 	}
 	if !exists {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rc, err := store.Get(ctx, MaintenanceHealLogFileName)
 	if err != nil {
-		return nil, fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
+		return nil, nil, fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
 	}
 	defer func() { _ = rc.Close() }()
+	// Whole body, capped. Reading it in one piece (rather than through a
+	// bufio.Scanner) is what makes an overlong line a per-line defect
+	// instead of a hard stop that hides every record after it.
+	body, err := io.ReadAll(io.LimitReader(rc, healLogMaxBytes+1))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %q: %w", MaintenanceHealLogFileName, err)
+	}
+	var defects []HealLogDefect
+	if len(body) > healLogMaxBytes {
+		body = body[:healLogMaxBytes]
+		defects = append(defects, HealLogDefect{Reason: fmt.Sprintf(
+			"the log exceeds the %d-byte read cap; everything past it was NOT read", healLogMaxBytes,
+		)})
+	}
 	var recs []HealRecord
-	sc := bufio.NewScanner(rc)
-	// A VerifyFailure carries arbitrary error text, and bufio.Scanner's
-	// default 64 KiB line cap would make a log holding one long failure
-	// unreadable FOREVER — ErrTooLong on every read (A3-SCANNER-CAP).
-	// Raise the cap to 1 MiB. POSTURE: a line past 1 MiB still refuses
-	// loudly via sc.Err() below rather than being skipped — the log is
-	// evidence, and 1 MiB is orders of magnitude beyond any real verify
-	// failure, so hitting the cap means something is wrong enough to stop
-	// for. Pinned both ways by TestReadHealRecords_LongLines.
-	sc.Buffer(make([]byte, 0, 64*1024), healLogMaxLineBytes)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
+	for i, raw := range bytes.Split(body, []byte("\n")) {
+		line := bytes.TrimSpace(raw)
 		if len(line) == 0 {
+			// Provably empty — the separator after the final record, or a
+			// blank the newline guard inserted. Nothing to skip.
 			continue
 		}
 		var rec HealRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("decode %q record %d: %w", MaintenanceHealLogFileName, len(recs)+1, err)
+			defects = append(defects, HealLogDefect{Line: i + 1, Reason: err.Error()})
+			continue
 		}
 		recs = append(recs, rec)
 	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("scan %q: %w", MaintenanceHealLogFileName, err)
-	}
-	return recs, nil
+	return recs, defects, nil
 }
