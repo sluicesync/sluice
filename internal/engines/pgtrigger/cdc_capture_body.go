@@ -432,15 +432,24 @@ func gradeCaptureFunctionShapes(schema string, installed map[string]captureFunct
 		// because there is no recorded digest for a later edit to fail
 		// against — and nothing here prompts the operator to fix that.
 		//
-		// Warning would be the more protective behaviour, and it is NOT
-		// taken here on purpose: [warnStaleCaptureFunctions]' text says the
-		// functions "are not what this sluice renders", which is false for
-		// this case, so it would mean a new operator-facing warning surface
-		// firing on every open for every existing install. That is a design
-		// call for the operator, not a side effect of a LOW finding; it is
-		// filed in docs/dev/audit-backlog.md. The existing SEC-1
-		// INSECURE-CAPTURE-FUNCTION warning already steers most affected
-		// installs to the same one `trigger setup` re-run.
+		// Warning here would be the more protective behaviour and is NOT
+		// taken, DECIDED by the operator 2026-09-01 rather than defaulted
+		// into: [warnStaleCaptureFunctions]' text says the functions "are
+		// not what this sluice renders", which is false for this case, so
+		// warning would mean a new operator-facing surface firing on every
+		// open for every existing install.
+		//
+		// What makes the residual small is that it cannot GROW: a fresh
+		// `trigger setup` on this binary records the digest at
+		// schema_version 5, so every new install is fully provenanced and
+		// lands on the REFUSE arm. Only an install created by a pre-v5
+		// binary that nobody re-runs setup against sits here — and the
+		// SEC-1 INSECURE-CAPTURE-FUNCTION warning already steers most of
+		// those to the same single re-run.
+		//
+		// The decision is a function of the INSTALL BASE, not of this code,
+		// so it has a revisit trigger rather than being closed: see
+		// docs/dev/audit-backlog.md, which keeps the three alternatives.
 		if matchesAnyShape(got, expected[name]) {
 			continue
 		}

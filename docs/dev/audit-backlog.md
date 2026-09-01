@@ -284,7 +284,11 @@ A gate built alongside these that was not on the G-list, recorded so it is finda
 
 ## 2026-09-01 — DESIGN CALL for the operator: should a provenance-less pgtrigger install WARN?
 
-**Filed, deliberately not decided.** Found by the v0.137.0 regression cycle as Bug 259, whose filed shape was "the notes over-claim". The notes did over-claim and are corrected, but the finding underneath is a real design question and it should be answered by a person, not as a side effect of a doc fix.
+**DECIDED 2026-09-01 — option (a), by the operator.** Leave it; the residual stays documented at the code and nothing new warns. The reasoning, which is also the sharpest statement of why the residual is small: **a fresh `trigger setup` on v0.137.0+ records the digest at schema_version 5, so every NEW install is fully provenanced and gets the REFUSE arm automatically.** The gap can only ever affect an install created by a pre-v0.137.0 binary that nobody re-runs setup against — and while sluice is pre-user, that population is approximately empty. Options (b)–(d) below are kept for the revisit.
+
+**Revisit trigger, stated so it is not forgotten:** this decision is a function of the install base, not of the code. Once there IS one, the affected population stops being empty and stops draining on its own, and (c) — recording the digest opportunistically on any setup run — becomes cheap insurance worth taking before (b)'s permanent warning is ever needed. Same shape and same trigger as the pre-user security-advisory posture.
+
+**Filed, deliberately not decided (the original entry).** Found by the v0.137.0 regression cycle as Bug 259, whose filed shape was "the notes over-claim". The notes did over-claim and are corrected, but the finding underneath is a real design question and it should be answered by a person, not as a side effect of a doc fix.
 
 **The state.** `gradeCaptureFunctionShapes` returns early on `matchesAnyShape`, so an install whose capture function definitions are byte-identical to this binary's render is SILENT — including when setup never recorded a provenance digest for them (any pre-v5 install created by a sluice whose render happens to match, e.g. a v0.136.0 one; the regression cycle's `arm1b.out` census confirms the byte-identity). Those installs capture correctly. The cost is that they sit permanently on the door's WARN arm rather than its REFUSE arm: with no recorded digest, a later hand-edit of a capture function can only be warned about, never refused — and nothing prompts the operator to close that.
 
