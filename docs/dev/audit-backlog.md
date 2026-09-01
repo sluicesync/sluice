@@ -290,7 +290,9 @@ A gate built alongside these that was not on the G-list, recorded so it is finda
 
 **Why it was not simply changed.** `warnStaleCaptureFunctions`' text says the installed functions "are not what this sluice renders", which is FALSE for this case, so warning here means a NEW operator-facing warning surface — new marker, new text, docs, and it fires on every stream open for every existing install. That is an operator-visible posture change, off a LOW finding, in an already-published release. The counterweight: v0.134.1's `INSECURE-CAPTURE-FUNCTION` warning already steers most affected installs to the same single `sluice trigger setup` re-run that would close this.
 
-**The options.** (a) Leave it, residual documented at the code (what shipped). (b) A new distinct WARN with honest text ("current definition, no recorded provenance") — most protective, noisiest. (c) Have `trigger setup` record the digest opportunistically on any run, so the population drains without a new warning; does not help an install nobody ever re-runs setup against. (d) Report it once in `sluice doctor`-style output rather than per-open.
+**The options.** (a) Leave it, residual documented at the code (what shipped). (b) A new distinct WARN with honest text ("current definition, no recorded provenance") — most protective, noisiest. (c) Have `trigger setup` record the digest opportunistically on any run, so the population drains without a new warning; does not help an install nobody ever re-runs setup against. (d) Surface it in the `sluice diagnose` operator bundle (ADR-0056) rather than per-open — pull, not push.
+
+*(Corrected 2026-09-01: (d) originally named a `sluice doctor` command. There is no such command; the operator-bundle command is `sluice diagnose`. Verified against `cmd/sluice/cli.go:183` — the project's own rule about not citing a flag or command without checking it still exists applies to a backlog entry proposing one.)*
 
 ### Invariant sweep — the enumerated queue
 
