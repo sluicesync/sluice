@@ -34,14 +34,29 @@ import (
 //
 // Per engine package, the probes are the direct callees of that package's
 // CDC-open chokepoint function(s) that are package-level functions taking
-// a context.Context AND a database handle (the package's own db-ish param
-// types). Each derived probe must contain a context.WithTimeout call in
-// its own body OR in the body of a same-package function it directly
-// calls (ONE hop — preflightFKReferentialActions delegates its census,
-// and the cap, to the lane-shared warnFKReferentialActions; the same
-// one-hop lookthrough the pump-join gate uses). Anything deeper needs an
-// exemption whose reason names where the cap lives — or, better, the cap
-// moved to the probe's top, the siblings' proven placement.
+// a context.Context AND a database handle. Each derived probe must
+// contain a context.WithTimeout call in its own body OR in the body of a
+// same-package function it directly calls (ONE hop —
+// preflightFKReferentialActions delegates its census, and the cap, to the
+// lane-shared warnFKReferentialActions; the same one-hop lookthrough the
+// pump-join gate uses). Anything deeper needs an exemption whose reason
+// names where the cap lives — or, better, the cap moved to the probe's
+// top, the siblings' proven placement.
+//
+// "Database handle" is a STRUCTURAL predicate over the same AST, not a
+// per-package list of type names ([dbHandleTypes]): *sql.DB / *sql.Tx /
+// *sql.Conn, any package-level named type whose underlying type is one of
+// those, and any package-level interface whose method set — following
+// embedded in-package interfaces — declares QueryContext, QueryRowContext
+// or ExecContext. It replaces a hand-list (audit 2026-08-31 F-T2) that
+// was a transcription of today's code rather than a derivation: mysql
+// listed three type names, postgres and pgtrigger one each, so a probe
+// taking an IN-PACKAGE INTERFACE handle entered neither the graded
+// universe nor the alias watch set — and the floors could not see the
+// omission, because a floor counts what the walker FOUND, not what
+// exists. That shape was not hypothetical: pgtrigger already declares
+// settleQuerier for exactly this purpose ("Both *sql.DB … and a
+// snapshot-pinned *sql.Conn … satisfy it").
 //
 // WHAT THIS GATE REACHES, stated so the name cannot be read as broader
 // than the truth: probes invoked BY NAME from the configured chokepoints
@@ -56,32 +71,37 @@ import (
 // path owes this list its chokepoint), the sqlite/D1 engines
 // (request/response transports with per-call HTTP deadlines; no lock-queue
 // analogue), and general catalog helpers that are not probes at a
-// chokepoint. The anti-vacuity floors below fail the gate if a walker
-// change stops it seeing the probes it grades today.
+// chokepoint. Two residuals belong specifically to the handle predicate:
+// a handle reached through a STRUCT parameter (a probe taking *Engine, or
+// a config struct carrying a *sql.DB field — there is no field
+// transitivity here), and an interface declared in ANOTHER package or
+// spelling its read differently (an sqlx-style Get/Select). Both are
+// stated rather than closed; the predicate's own anti-vacuity floor is
+// TestProbeDBHandleDetection_SelfTest.
 //
-// Mutation-verified in both directions (2026-08-27): removing the
-// context.WithTimeout derivation from pgtrigger's replica-role capture
-// dispatch (checkReplicaRoleCaptureShapes, né warnReplicaRoleCaptureBlindness)
+// Mutation-verified in both directions: removing the context.WithTimeout
+// derivation from pgtrigger's replica-role capture dispatch
+// (checkReplicaRoleCaptureShapes, né warnReplicaRoleCaptureBlindness)
 // fails its roster line; pointing a chokepoint entry at a nonexistent
 // function fails the staleness guard; the floors fail if a package's
-// derived probe set shrinks.
+// derived probe set shrinks (2026-08-27). ADDITION-shaped, the direction
+// F-T2 was about: a new uncapped pgtrigger probe taking the settleQuerier
+// interface and called from openCDCReader passed the pre-F-T2 gate and
+// reddens this one (2026-08-31).
 var probeTimeoutRoster = []struct {
 	pkg         string   // directory under internal/engines/
 	chokepoints []string // functions whose probe callees form the universe
-	dbishTypes  []string // param types that mark a callee as a probe
-	floor       int      // anti-vacuity: minimum probes the walker must derive
+	floor       int      // anti-vacuity: TODAY's exact derived count, so a drop reddens
 	exempt      map[string]string
 }{
 	{
 		pkg:         "mysql",
 		chokepoints: []string{"preflightBinlogCDCOpen"},
-		dbishTypes:  []string{"dbQuerier", "rowQuerier", "sql.DB"},
 		floor:       5, // row-image, format, replica-source, db-filter, FK-actions
 	},
 	{
 		pkg:         "postgres",
 		chokepoints: []string{"createLogicalReplicationSlot"},
-		dbishTypes:  []string{"sql.DB"},
 		floor:       2, // serverVersionNum + warnPreparedTransactions
 		exempt: map[string]string{
 			"serverVersionNum": "reads one GUC (SHOW server_version_num) — no table access, so the " +
@@ -92,7 +112,6 @@ var probeTimeoutRoster = []struct {
 	{
 		pkg:         "pgtrigger",
 		chokepoints: []string{"openCDCReader"},
-		dbishTypes:  []string{"sql.DB"},
 		// change-log existence, sequence grade, capture-posture read,
 		// capture-shape door, replica-role shape dispatch (WARN/echo-
 		// refusal), DDL-detection WARN, insecure-definer WARN (SEC-1).
@@ -106,16 +125,17 @@ var probeTimeoutRoster = []struct {
 func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 	t.Parallel()
 	for _, entry := range probeTimeoutRoster {
-		fns := parsePackageFuncs(t, entry.pkg)
+		fns, decls := parsePackage(t, entry.pkg)
 		if len(fns) == 0 {
 			t.Fatalf("%s: parsed no functions — the walker cannot see the package it grades", entry.pkg)
 		}
+		dbish := dbHandleTypes(decls)
 
 		// Every probe-shaped package function (ctx+db params) — the set an
 		// alias in a chokepoint body could smuggle past the derivation.
 		probeShaped := map[string]bool{}
 		for name, fn := range fns {
-			if takesContextAndDB(fn, entry.dbishTypes) {
+			if takesContextAndDB(fn, dbish) {
 				probeShaped[name] = true
 			}
 		}
@@ -133,7 +153,7 @@ func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 				if !ok {
 					continue // method call on another package / builtin
 				}
-				if takesContextAndDB(target, entry.dbishTypes) {
+				if takesContextAndDB(target, dbish) {
 					probes[callee] = true
 				}
 			}
@@ -183,16 +203,20 @@ func TestOpenPathProbesDeriveBoundedContexts(t *testing.T) {
 	}
 }
 
-// parsePackageFuncs parses every non-test .go file in the sibling engine
-// package dir and returns its package-level (receiver-less) functions.
-func parsePackageFuncs(t *testing.T, pkg string) map[string]*ast.FuncDecl {
+// parsePackage parses every non-test .go file in the sibling engine
+// package dir and returns its package-level (receiver-less) functions plus
+// its package-level type declarations — the raw material [dbHandleTypes]
+// needs to decide, structurally, which parameter types are database
+// handles.
+func parsePackage(t *testing.T, pkg string) (funcs map[string]*ast.FuncDecl, types map[string]ast.Expr) {
 	t.Helper()
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		t.Fatalf("read %s: %v", pkg, err)
 	}
-	fns := map[string]*ast.FuncDecl{}
+	funcs = map[string]*ast.FuncDecl{}
+	types = map[string]ast.Expr{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -203,12 +227,143 @@ func parsePackageFuncs(t *testing.T, pkg string) map[string]*ast.FuncDecl {
 			t.Fatalf("parse %s/%s: %v", pkg, name, perr)
 		}
 		for _, d := range f.Decls {
-			if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Body != nil {
-				fns[fn.Name.Name] = fn
+			switch d := d.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Body != nil {
+					funcs[d.Name.Name] = d
+				}
+			case *ast.GenDecl:
+				if d.Tok != token.TYPE {
+					continue
+				}
+				for _, spec := range d.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						types[ts.Name.Name] = ts.Type
+					}
+				}
 			}
 		}
 	}
-	return fns
+	return funcs, types
+}
+
+// queryShapedMethods are the method names that make an interface a
+// database handle: everything a probe could wedge on is issued through
+// one of them. An interface spelling its read differently (an sqlx-style
+// Get/Select) is the stated residual — see the file comment.
+var queryShapedMethods = map[string]bool{
+	"QueryContext":    true,
+	"QueryRowContext": true,
+	"ExecContext":     true,
+}
+
+// dbHandleTypes derives the set of parameter-type renderings that count as
+// a database handle in this package, from the package's own type
+// declarations rather than from a hand-list (audit 2026-08-31 F-T2).
+// Three shapes qualify:
+//
+//   - the stdlib handles themselves — *sql.DB / *sql.Tx / *sql.Conn;
+//   - a package-level interface declaring a query-shaped method, directly
+//     or through an embedded in-package interface (mysql's dbQuerier
+//     embeds rowQuerier and would otherwise need the transitive step);
+//   - a package-level named type or alias whose underlying type is one of
+//     the above (`type handle = *sql.DB`).
+//
+// The last two are resolved to a fixpoint so declaration ORDER across the
+// package's files cannot change the answer.
+func dbHandleTypes(decls map[string]ast.Expr) map[string]bool {
+	dbish := map[string]bool{"sql.DB": true, "sql.Tx": true, "sql.Conn": true}
+	for changed := true; changed; {
+		changed = false
+		for name, typ := range decls {
+			if dbish[name] {
+				continue
+			}
+			var qualifies bool
+			switch typ := typ.(type) {
+			case *ast.InterfaceType:
+				for _, m := range typ.Methods.List {
+					// A named method (len(Names)==1) or an embedded
+					// interface (len(Names)==0, Type is the name).
+					if len(m.Names) == 1 {
+						qualifies = qualifies || queryShapedMethods[m.Names[0].Name]
+						continue
+					}
+					qualifies = qualifies || dbish[renderParamType(m.Type)]
+				}
+			default:
+				qualifies = dbish[renderParamType(typ)]
+			}
+			if qualifies {
+				dbish[name] = true
+				changed = true
+			}
+		}
+	}
+	return dbish
+}
+
+// TestProbeDBHandleDetection_SelfTest is the anti-vacuity floor for
+// [dbHandleTypes]: the F-T2 defect was a handle predicate that silently
+// covered less than its name implied, so the predicate owes a fixture
+// exercising each shape it claims — and one it must NOT claim, so a
+// predicate that went permissive (marking every parameter db-ish, which
+// would drag unrelated helpers into the graded universe and read as
+// broader coverage) fails too.
+func TestProbeDBHandleDetection_SelfTest(t *testing.T) {
+	t.Parallel()
+	const fixture = `package p
+
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+}
+
+type dbQuerier interface {
+	rowQuerier
+	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
+}
+
+type aliasHandle = *sql.DB
+
+type namedHandle *sql.Tx
+
+type reporter interface {
+	Report(msg string)
+}
+
+type settings struct{ Schema string }
+`
+	f, err := parser.ParseFile(token.NewFileSet(), "fixture.go", fixture, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	decls := map[string]ast.Expr{}
+	for _, d := range f.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			if ts, ok := spec.(*ast.TypeSpec); ok {
+				decls[ts.Name.Name] = ts.Type
+			}
+		}
+	}
+	dbish := dbHandleTypes(decls)
+	for _, want := range []string{"sql.DB", "sql.Tx", "sql.Conn", "rowQuerier", "dbQuerier", "aliasHandle", "namedHandle"} {
+		if !dbish[want] {
+			t.Errorf("%s is not recognised as a database handle — a probe taking it would enter neither the "+
+				"graded universe nor the alias watch set, which is exactly the F-T2 hole this predicate closed",
+				want)
+		}
+	}
+	for _, notWant := range []string{"reporter", "settings"} {
+		if dbish[notWant] {
+			t.Errorf("%s was recognised as a database handle — the predicate went permissive, so every "+
+				"ctx-taking helper becomes a 'probe' and the gate's universe stops meaning what its name says",
+				notWant)
+		}
+	}
 }
 
 // nonCallFuncRefs returns every occurrence of a watched name in fn's body
@@ -288,18 +443,17 @@ func directCallees(fn *ast.FuncDecl) map[string]bool {
 }
 
 // takesContextAndDB reports whether fn's parameters include a
-// context.Context and one of the package's db-ish types.
-func takesContextAndDB(fn *ast.FuncDecl, dbish []string) bool {
+// context.Context and a database handle, per the structural set
+// [dbHandleTypes] derived from the package's own declarations.
+func takesContextAndDB(fn *ast.FuncDecl, dbish map[string]bool) bool {
 	var hasCtx, hasDB bool
 	for _, field := range fn.Type.Params.List {
 		typ := renderParamType(field.Type)
 		if typ == "context.Context" {
 			hasCtx = true
 		}
-		for _, want := range dbish {
-			if typ == want {
-				hasDB = true
-			}
+		if dbish[typ] {
+			hasDB = true
 		}
 	}
 	return hasCtx && hasDB
