@@ -370,6 +370,16 @@ func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error)
 // starts with prefix, in unspecified order. Paths in the result are
 // relative to the BlobStore's configured prefix — matching
 // [LocalStore]'s contract.
+//
+// Deliberately WITHOUT [LocalStore]'s `.tmp.<digits>` exclusion (audit
+// 2026-08-31 A-6). That filter is a property of the tmp+rename write
+// strategy, and this store has no such strategy: s3/gs/azblob publish
+// an object only on a successful write, and gocloud's fileblob stages
+// its temp in os.TempDir() rather than in the bucket. There is nothing
+// of ours to hide here, so a filter could only swallow a legitimate
+// operator object named that way. The fileblob half is an environmental
+// premise about a third-party driver, so TestStoreListConformance
+// ground-truths it against the real driver instead of asserting it.
 func (s *BlobStore) List(ctx context.Context, prefix string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

@@ -282,6 +282,13 @@ func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error
 // themselves are reclaimed by [LocalStore.sweepStaleTemps] on the first
 // write a later store instance makes into their directory.
 //
+// This exclusion is part of the [irbackup.Store.List] contract, not a
+// local liberty, and it is deliberately NOT mirrored by [BlobStore]:
+// the filter belongs to the tmp+rename write strategy, and BlobStore's
+// writes become visible only on completion, so it has no such name to
+// hide and a filter there could only swallow a legitimate operator
+// object. Pinned together with the contract by TestStoreListConformance.
+//
 // Order is filesystem-dependent (filepath.Walk visits in lexical
 // order, which is good enough for "find every chunk under prefix"
 // queries; callers that need a stable order sort).

@@ -550,6 +550,28 @@ type Store interface {
 	// List returns every path within the store whose key starts with
 	// prefix. Paths are returned in unspecified order; callers sort if
 	// they care. Empty prefix returns every path.
+	//
+	// One exclusion, and it is part of the contract rather than an
+	// implementation liberty (audit 2026-08-31 A-6): a store never
+	// returns its OWN incomplete-write temporaries. Those are residue
+	// of the write strategy, never a caller's object, and before the
+	// exclusion a crash mid-write left a phantom entry in every
+	// subsequent listing forever. Concretely, an implementation that
+	// writes through a temporary name filters that name shape out;
+	// blobcodec.LocalStore writes `<key>.tmp.<digits>` (os.CreateTemp's
+	// own pattern) and hides exactly that.
+	//
+	// The exclusion is therefore ASYMMETRIC by construction, and that
+	// asymmetry is deliberate: a store whose write becomes visible only
+	// on successful completion has no such name to hide, and adding a
+	// filter there could only hide a legitimate operator object.
+	// blobcodec.BlobStore is that case for all four drivers it supports
+	// — s3/gs/azblob publish the object atomically, and gocloud's
+	// fileblob stages its temp in os.TempDir(), outside the bucket. That
+	// last one is an environmental premise about a third-party driver,
+	// so it is ground-truthed against the real driver rather than
+	// asserted: blobcodec's TestStoreListConformance pins the shared
+	// contract, the divergence, and the fileblob premise together.
 	List(ctx context.Context, prefix string) ([]string, error)
 
 	// Delete removes path from the store. Idempotent — deleting a
