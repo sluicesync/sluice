@@ -282,6 +282,21 @@ The psdb correction above came with a sweep for the same shape — an operator-f
 
 A gate built alongside these that was not on the G-list, recorded so it is findable: `TestBinlogTypeFamilyRoster` is a fail-by-default roster requiring every `data_type` `translateType` accepts to be either classified for the CDC-4 guard or listed as exempt with a reason, and `TestCDCSteadyState_EveryDataTypePassesTheGuard` ground-truths that classification against what a real mysqld writes into a TABLE_MAP (a single wrong entry produces a false refusal, which is how it was mutation-verified).
 
+## 2026-09-01 — SCHEDULED FOLLOW-UP (target: by ~2026-09-22): the backing-up-from-a-replica operator doc
+
+**Drafted, reviewed by the operator, deliberately HELD — not a dropped thread.** Operator asked to schedule it rather than land it now. Draft lives at `workspace/drafts/backing-up-from-a-replica.md` (gitignored, so it cannot be swept into a commit by `git add -A` and published early). **The draft is local-only; the verified facts are recorded below so the page is reconstructible if that file is lost.**
+
+**Everything below was ground-truthed, not reasoned — reuse it rather than re-deriving:**
+
+- **PostgreSQL refuses a backup from a standby**, coded `SLUICE-E-CDC-STANDBY-SOURCE`, via `checkNotStandby` (`pg_is_in_recovery()`) in `OpenBackupSnapshot` (`postgres/backup_snapshot.go:106`). Reason is real, not policy: the publication ensure is a WRITE, and standby slot creation blocks on the primary's next `running-xacts` record (Bug 197). **Sibling check done:** only MySQL implements `OpenBackupSnapshotForTables`, so every PG backup goes through the door — no bypass.
+- **Second, independent PG backstop:** `pg_current_wal_lsn()` errors during recovery. **Measured on a real streaming standby, PG 16:** `ERROR: recovery is in progress / HINT: WAL control functions cannot be executed during recovery.`
+- **The tempting workaround is a trap and the doc says so:** `pg_last_wal_replay_lsn()` DOES return a value on a standby (measured: `0/3000060`). sluice uses it nowhere, and that absence is load-bearing — swapping it in converts a loud failure into a silently wrong position.
+- **MySQL ALLOWS a replica source deliberately** (a replica with `log_replica_updates=ON` has its own binlog). `preflightReplicaSource` refuses only the `log_replica_updates=OFF` case, and only on the CDC path — not backup.
+- **The position note is the substance of the page:** GTID mode is portable across the topology, so a replica-captured position is coherent anywhere. file/pos mode records the REPLICA's own filename+offset, meaningless against any other server — now stamped with `@@server_uuid` (v0.137.2) so a cross-instance resume refuses loudly rather than silently mis-streaming. Pre-v0.137.2 chains warn `UNVERIFIED-INSTANCE-IDENTITY`.
+- **The cross-engine asymmetry, which is the page's closing point:** PostgreSQL makes the wrong answer UNAVAILABLE (the function errors); MySQL answers `SHOW MASTER STATUS` on a replica happily, returning a well-formed answer to a subtly different question.
+
+**Three open questions the operator has not yet ruled on** (raised at draft time, deliberately not decided): whether the PG refusal should read as "doing you a favour" or more neutrally; whether the `pg_last_wal_replay_lsn()` trap is more detail than an operator doc wants; and whether the closing cross-engine-asymmetry section belongs here or as a sluicesync.com field note instead.
+
 ## 2026-09-01 — OPEN, unexplained: a SEGFAULT on the `engines-mysql` shard, correlated with the server_uuid commit
 
 **Filed, not resolved, and deliberately not called a flake.** CI run `33549409943` on `947df8b0` failed the `Integration (engines-mysql)` shard with `signal: segmentation fault (core dumped)` — not an assertion, no Go panic, no stack, no DATA RACE report. It surfaced at `=== RUN TestCDCReader_TimestampNonUTCHost`, but a segfault kills the process, so the crashing goroutine may be anywhere.
