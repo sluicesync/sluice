@@ -44,7 +44,7 @@ Contract preservation (the load-bearing details):
 - **No goroutine leak.** The decode loop cancels a fetcher-scoped context on every
   return path, aborting the fetcher's in-flight HTTP request and its blocked handoff.
 - The LIMIT/OFFSET fallback (tables with no orderable key) prefetches through the
-  same loop — it needs no key extraction, only the offset.
+  same loop — it needs no key extraction, only the offset. **Amended 2026-09-02 (v0.138.0, audit 2026-09-01 LA-1):** that fallback no longer exists — see ADR-0132's amendment to its decision §6. The prefetch loop now serves keyset pages only (the PK, or the implicit rowid under whichever of `rowid`/`_rowid_`/`oid` no declared column shadows), and a table with neither is refused with `SLUICE-E-BULKCOPY-NO-PAGINATION-KEY` in `planPagination`, before the fetcher goroutine is started. The loop's no-silent-truncation and no-leak properties above are unchanged; the LA-3 `COUNT(*)` bracket sits outside the loop, around the whole table read.
 
 This is RTT-hiding only, **not** within-table chunking — D1 within-table chunking
 parallelism remains the deferred follow-up noted at `d1PageSize`.
