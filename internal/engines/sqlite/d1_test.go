@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +23,7 @@ import (
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // ---- mock D1 server -------------------------------------------------------
@@ -125,6 +125,54 @@ func drain(ch <-chan ir.Row) []ir.Row {
 	return out
 }
 
+// fixedRows is a handler serving rows for every query it is asked.
+func fixedRows(rows []map[string]any) d1Handler {
+	return func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) }
+}
+
+// isD1CountQuery reports whether sql is the LA-3 COUNT(*) bracket query the row
+// reader issues before its first page and after its last.
+func isD1CountQuery(sql string) bool { return strings.HasPrefix(sql, "SELECT CAST(COUNT(*) AS TEXT)") }
+
+// withCount answers the LA-3 COUNT(*) bracket with n and delegates every other
+// query to h. A canned-page mock has to declare the total it serves: the reader
+// refuses a read whose delivered total disagrees with a stable count, so a mock
+// that answered the count with a data page would fail every read.
+func withCount(n int, h d1Handler) d1Handler {
+	return func(sql string, params []string) (int, []byte) {
+		if isD1CountQuery(sql) {
+			return http.StatusOK, d1OK([]map[string]any{{"n": strconv.Itoa(n)}})
+		}
+		return h(sql, params)
+	}
+}
+
+// xinfoRows renders a PRAGMA table_xinfo result for the table's declared columns
+// (the LA-1 catalog read: which names a rowid alias would be shadowed by).
+func xinfoRows(table *ir.Table) []map[string]any {
+	rows := make([]map[string]any, 0, len(table.Columns))
+	for i, c := range table.Columns {
+		rows = append(rows, map[string]any{"cid": i, "name": c.Name, "type": "", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0})
+	}
+	return rows
+}
+
+// withRowidCatalog answers the rowid-keyset planning queries for a table that
+// shadows nothing — the catalog read (PRAGMA table_xinfo → its declared columns)
+// and the implicit-rowid probe (`SELECT "rowid" … LIMIT 1`, success) — and
+// delegates every other query to h.
+func withRowidCatalog(table *ir.Table, h d1Handler) d1Handler {
+	return func(sql string, params []string) (int, []byte) {
+		switch {
+		case strings.HasPrefix(sql, "PRAGMA table_xinfo("):
+			return http.StatusOK, d1OK(xinfoRows(table))
+		case strings.HasPrefix(sql, "SELECT \"rowid\" FROM") && strings.HasSuffix(sql, " LIMIT 1"):
+			return http.StatusOK, d1OK(nil)
+		}
+		return h(sql, params)
+	}
+}
+
 // ---- HEADLINE: integers > 2^53 round-trip EXACTLY -------------------------
 
 // TestD1RowReader_BigIntExact is the reason this engine exists: an INTEGER value
@@ -145,9 +193,7 @@ func TestD1RowReader_BigIntExact(t *testing.T) {
 		dataRow(table, map[string]cell{"id": ival("9007199254740993")}),
 		dataRow(table, map[string]cell{"id": ival("9223372036854775807")}),
 	}
-	client := startMockD1(t, func(_ string, _ []string) (int, []byte) {
-		return http.StatusOK, d1OK(rows)
-	})
+	client := startMockD1(t, withCount(len(rows), fixedRows(rows)))
 	r := &D1RowReader{client: client}
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -256,7 +302,7 @@ func TestD1RowReader_StorageClassFidelity(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "n"}}, Unique: true},
 	}
 	rows := []map[string]any{dataRow(table, map[string]cell{"n": rval("1.5")})}
-	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	client := startMockD1(t, withCount(len(rows), fixedRows(rows)))
 	r := &D1RowReader{client: client}
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -294,7 +340,7 @@ func TestD1RowReader_DateBool(t *testing.T) {
 		"day": tval("2024-01-02"),
 		"ok":  ival("1"),
 	})}
-	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(isoRows) })
+	client := startMockD1(t, withCount(len(isoRows), fixedRows(isoRows)))
 	r := &D1RowReader{client: client} // dateEnc inherit → iso default
 	ch, err := r.ReadRows(context.Background(), isoTable)
 	if err != nil {
@@ -332,7 +378,7 @@ func TestD1RowReader_DateBool(t *testing.T) {
 		"id": ival("1"),
 		"at": ival("1704164645"), // 2024-01-02 03:04:05 UTC
 	})}
-	client2 := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(uxRows) })
+	client2 := startMockD1(t, withCount(len(uxRows), fixedRows(uxRows)))
 	r2 := &D1RowReader{client: client2, dateEnc: dateEncodingUnixEpoch}
 	ch2, err := r2.ReadRows(context.Background(), uxTable)
 	if err != nil {
@@ -370,13 +416,13 @@ func TestD1RowReader_Pagination(t *testing.T) {
 		dataRow(table, map[string]cell{"id": ival("3"), "label": tval("c")}),
 	}
 	var sawBound []string
-	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+	client := startMockD1(t, withCount(len(page1)+len(page2), func(sql string, params []string) (int, []byte) {
 		if !strings.Contains(sql, "WHERE") {
 			return http.StatusOK, d1OK(page1) // first page, no bound
 		}
 		sawBound = params
 		return http.StatusOK, d1OK(page2)
-	})
+	}))
 	r := &D1RowReader{client: client, pageSize: 2} // page size 2 → page1 is full, triggers page2
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -428,7 +474,7 @@ func TestBuildD1PageQuery_Shape(t *testing.T) {
 	}
 
 	// Subsequent page: keyset predicate + ORDER BY, table-qualified.
-	query, params := buildD1PageQuery(table, plan, proj, []string{"42"}, 0, d1PageSize)
+	query, params := buildD1PageQuery(table, plan, proj, []string{"42"}, d1PageSize)
 	if !strings.Contains(query, `WHERE "t"."id" > ?`) {
 		t.Errorf("keyset predicate not table-qualified:\n%s", query)
 	}
@@ -442,7 +488,7 @@ func TestBuildD1PageQuery_Shape(t *testing.T) {
 	// Composite key → row-value comparison.
 	plan2 := newPagePlan(table.Columns)
 	plan2.orderCols = []string{"id", "v"}
-	sql2, _ := buildD1PageQuery(table, plan2, proj, []string{"1", "a"}, 0, d1PageSize)
+	sql2, _ := buildD1PageQuery(table, plan2, proj, []string{"1", "a"}, d1PageSize)
 	if !strings.Contains(sql2, `("t"."id", "t"."v") > (?, ?)`) {
 		t.Errorf("composite keyset not a row-value comparison:\n%s", sql2)
 	}
@@ -983,7 +1029,7 @@ func TestD1CaptureRender_RealDriver(t *testing.T) {
 	plan := newPagePlan(table.Columns)
 	plan.orderCols = []string{"id"}
 	proj := buildD1Projection(table, plan)
-	query, _ := buildD1PageQuery(table, plan, proj, nil, 0, d1PageSize)
+	query, _ := buildD1PageQuery(table, plan, proj, nil, d1PageSize)
 
 	rows, err := db.QueryContext(context.Background(), query) //nolint:rowserrcheck // single-row read below, err checked
 	if err != nil {
@@ -1079,17 +1125,12 @@ func TestD1RowReader_BlobPKUsesRowid(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
 	}
 	var dataSQL string
-	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
-		switch {
-		case strings.Contains(sql, "SELECT rowid FROM"):
-			return http.StatusOK, d1OK(nil) // rowid exists (probe succeeds)
-		default:
-			dataSQL = sql
-			return http.StatusOK, d1OK([]map[string]any{
-				withRowid(table, dataRow(table, map[string]cell{"k": bval("cafe"), "v": tval("x")}), "1"),
-			})
-		}
-	})
+	client := startMockD1(t, withCount(1, withRowidCatalog(table, func(sql string, _ []string) (int, []byte) {
+		dataSQL = sql
+		return http.StatusOK, d1OK([]map[string]any{
+			withRowid(table, dataRow(table, map[string]cell{"k": bval("cafe"), "v": tval("x")}), "1"),
+		})
+	})))
 	r := &D1RowReader{client: client, pageSize: 2}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {
@@ -1120,15 +1161,18 @@ func TestD1RowReader_BlobPKNoRowidRefused(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
 	}
 	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
-		if strings.Contains(sql, "SELECT rowid FROM") {
-			return http.StatusOK, d1Err(1, "no such column: rowid") // WITHOUT ROWID
+		if strings.HasPrefix(sql, "PRAGMA table_xinfo(") {
+			return http.StatusOK, d1OK(xinfoRows(table))
 		}
-		return http.StatusOK, d1OK(nil)
+		return http.StatusOK, d1Err(1, "no such column: rowid") // WITHOUT ROWID: the probe fails
 	})
 	r := &D1RowReader{client: client}
 	_, err := r.ReadRows(context.Background(), table)
-	if err == nil || !strings.Contains(err.Error(), "BLOB") || !strings.Contains(err.Error(), "t") {
+	if err == nil || !strings.Contains(err.Error(), "BLOB") || !strings.Contains(err.Error(), `"t"`) {
 		t.Errorf("want loud BLOB-key refusal naming the table; got %v", err)
+	}
+	if coded, ok := sluicecode.FromError(err); !ok || coded.Code != sluicecode.CodeBulkCopyNoPaginationKey {
+		t.Errorf("refusal must carry %s so a script can branch on it; got %v", sluicecode.CodeBulkCopyNoPaginationKey, err)
 	}
 }
 
@@ -1148,17 +1192,13 @@ func TestD1RowReader_RowidFallbackStitch(t *testing.T) {
 		withRowid(table, dataRow(table, map[string]cell{"v": tval("c")}), "3"),
 	}
 	var bound []string
-	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
-		switch {
-		case strings.Contains(sql, "SELECT rowid FROM"):
-			return http.StatusOK, d1OK(nil)
-		case strings.Contains(sql, "WHERE"):
+	client := startMockD1(t, withCount(len(page1)+len(page2), withRowidCatalog(table, func(sql string, params []string) (int, []byte) {
+		if strings.Contains(sql, "WHERE") {
 			bound = params
 			return http.StatusOK, d1OK(page2)
-		default:
-			return http.StatusOK, d1OK(page1)
 		}
-	})
+		return http.StatusOK, d1OK(page1)
+	})))
 	r := &D1RowReader{client: client, pageSize: 2}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {
@@ -1204,14 +1244,14 @@ func TestD1RowReader_CompositePKStitch(t *testing.T) {
 	}
 	var bound []string
 	var page2SQL string
-	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+	client := startMockD1(t, withCount(len(page1)+len(page2), func(sql string, params []string) (int, []byte) {
 		if strings.Contains(sql, "WHERE") {
 			bound = params
 			page2SQL = sql
 			return http.StatusOK, d1OK(page2)
 		}
 		return http.StatusOK, d1OK(page1)
-	})
+	}))
 	r := &D1RowReader{client: client, pageSize: 2}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {
@@ -1247,7 +1287,7 @@ func TestD1RowReader_NullKeysetRefused(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
 	}
 	rows := []map[string]any{dataRow(table, map[string]cell{"k": nullCell()})}
-	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	client := startMockD1(t, withCount(len(rows), fixedRows(rows)))
 	r := &D1RowReader{client: client}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {
@@ -1262,55 +1302,45 @@ func TestD1RowReader_NullKeysetRefused(t *testing.T) {
 // nullCell is a NULL cell (typeof null, JSON null value).
 func nullCell() cell { return cell{typeOf: "null", value: nil} }
 
-// TestD1RowReader_OffsetFallbackStitch pins the LIMIT/OFFSET fallback for a table
-// with neither a PK nor a rowid: pages stitch by OFFSET and the documented
-// not-safe-under-concurrent-writes caveat is logged.
-func TestD1RowReader_OffsetFallbackStitch(t *testing.T) {
-	// Capture the WARN the fallback emits.
-	var logBuf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	defer slog.SetDefault(prev)
-
+// TestD1RowReader_NoRowidRefused pins what replaced the LIMIT/OFFSET fallback
+// (audit 2026-09-01 LA-1): a PK-less table whose implicit-rowid probe fails is
+// REFUSED with SLUICE-E-BULKCOPY-NO-PAGINATION-KEY before any data page is
+// requested — no OFFSET read, no WARN-and-continue. The failed probe was the
+// one path into the old fallback, and the same probe is what a shadowing
+// `rowid` column silently satisfied.
+func TestD1RowReader_NoRowidRefused(t *testing.T) {
 	table := &ir.Table{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "v", Type: ir.Text{Size: ir.TextLong}}},
 	}
-	page1 := []map[string]any{
-		dataRow(table, map[string]cell{"v": tval("a")}),
-		dataRow(table, map[string]cell{"v": tval("b")}),
-	}
-	page2 := []map[string]any{dataRow(table, map[string]cell{"v": tval("c")})}
+	var dataQueries []string
 	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
 		switch {
-		case strings.Contains(sql, "SELECT rowid FROM"):
-			return http.StatusOK, d1Err(1, "no such column: rowid") // no rowid → OFFSET fallback
-		case strings.Contains(sql, "OFFSET 2"):
-			return http.StatusOK, d1OK(page2)
+		case strings.HasPrefix(sql, "PRAGMA table_xinfo("):
+			return http.StatusOK, d1OK(xinfoRows(table))
+		case strings.HasSuffix(sql, " LIMIT 1"):
+			return http.StatusOK, d1Err(1, "no such column: rowid") // the probe fails
 		default:
-			return http.StatusOK, d1OK(page1)
+			dataQueries = append(dataQueries, sql)
+			return http.StatusOK, d1OK(nil)
 		}
 	})
 	r := &D1RowReader{client: client, pageSize: 2}
-	ch, err := r.ReadRows(context.Background(), table)
-	if err != nil {
-		t.Fatalf("ReadRows: %v", err)
+	_, err := r.ReadRows(context.Background(), table)
+	if err == nil {
+		t.Fatal("a PK-less table with no reachable rowid must be refused, not read by LIMIT/OFFSET")
 	}
-	got := drain(ch)
-	if err := r.Err(); err != nil {
-		t.Fatalf("Err: %v", err)
+	coded, ok := sluicecode.FromError(err)
+	if !ok || coded.Code != sluicecode.CodeBulkCopyNoPaginationKey {
+		t.Errorf("refusal must carry %s; got %v", sluicecode.CodeBulkCopyNoPaginationKey, err)
 	}
-	want := []string{"a", "b", "c"}
-	if len(got) != 3 {
-		t.Fatalf("got %d rows; want 3 (OFFSET stitch)", len(got))
-	}
-	for i, w := range want {
-		if got[i]["v"] != w {
-			t.Errorf("row %d = %#v; want %q", i, got[i]["v"], w)
+	for _, want := range []string{`"t"`, "no primary key", "PRIMARY KEY"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must name %q (the table, why, and the remedy); got %v", want, err)
 		}
 	}
-	if !strings.Contains(logBuf.String(), "LIMIT/OFFSET") {
-		t.Errorf("expected the LIMIT/OFFSET not-safe caveat to be logged; got:\n%s", logBuf.String())
+	if len(dataQueries) != 0 {
+		t.Errorf("no data page may be requested after the refusal; got %q", dataQueries)
 	}
 }
 
@@ -1330,7 +1360,7 @@ func TestD1RowReader_NumericDecimal(t *testing.T) {
 		dataRow(table, map[string]cell{"id": ival("1"), "n": ival("42")}),
 		dataRow(table, map[string]cell{"id": ival("2"), "n": rval(fmt.Sprintf("%.17g", 1.5))}),
 	}
-	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	client := startMockD1(t, withCount(len(rows), fixedRows(rows)))
 	r := &D1RowReader{client: client}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {
@@ -1369,7 +1399,7 @@ func TestD1RowReader_TextVerbatim(t *testing.T) {
 		dataRow(table, map[string]cell{"id": ival("1"), "s": tval(withNUL)}),
 		dataRow(table, map[string]cell{"id": ival("2"), "s": tval(unicode)}),
 	}
-	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	client := startMockD1(t, withCount(len(rows), fixedRows(rows)))
 	r := &D1RowReader{client: client}
 	ch, err := r.ReadRows(context.Background(), table)
 	if err != nil {

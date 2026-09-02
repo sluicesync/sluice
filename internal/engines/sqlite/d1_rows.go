@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // D1RowReader streams rows from a live Cloudflare D1 table for the bulk-copy
@@ -78,7 +79,8 @@ func (r *D1RowReader) setErr(err error) {
 }
 
 // ReadRows streams the rows of table over the returned channel, paginating by
-// keyset (PK, else rowid, else a LIMIT/OFFSET fallback). The channel closes
+// keyset (PK, else the implicit rowid; a table with neither is refused — see
+// [planPagination]). The channel closes
 // when the table is fully read, when ctx is cancelled, or when a value fails the
 // storage-class fidelity check (in which case [Err] returns the cause).
 func (r *D1RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
@@ -106,17 +108,18 @@ func (r *D1RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.
 // pagePlan captures how a table is paginated. orderCols are the table-qualified
 // ORDER BY / keyset columns (qualified so the bound compares the TYPED column,
 // not the CAST-text alias — the lexical-sort trap the MySQL keyset hit). When
-// useRowid is set, the key is the implicit rowid (projected under rowidAlias)
-// rather than user columns. When useOffset is set, the table has no orderable
-// key and is read by LIMIT/OFFSET (a documented, rare, non-concurrent-safe
-// fallback).
+// useRowid is set, the key is the implicit rowid — referenced through rowidName,
+// the alias no declared column shadows (see [resolveRowidName]) and projected
+// under rowidAlias — rather than user columns. There is no third strategy: a
+// table with neither a safe PK keyset nor a reachable rowid is refused loudly
+// ([sluicecode.CodeBulkCopyNoPaginationKey]), never read by LIMIT/OFFSET.
 type pagePlan struct {
 	typeofPrefix  string   // collision-free prefix for the per-column typeof aliases
 	typeofAliases []string // per-column typeof alias, indexed by column position (hoisted: built once per table, not per cell)
-	rowidAlias    string   // projection alias carrying CAST(rowid AS TEXT), when useRowid
-	orderCols     []string // unqualified key column names (user PK cols, or {"rowid"})
+	rowidAlias    string   // projection alias carrying CAST(<rowidName> AS TEXT), when useRowid
+	rowidName     string   // the unshadowed implicit-rowid name (rowid / _rowid_ / oid), when useRowid
+	orderCols     []string // unqualified key column names (user PK cols, or {rowidName})
 	useRowid      bool
-	useOffset     bool
 }
 
 // newPagePlan seeds a pagePlan with the table's collision-free typeof prefix
@@ -135,51 +138,107 @@ func newPagePlan(cols []*ir.Column) pagePlan {
 }
 
 // planPagination chooses the pagination strategy for a table: keyset on the PK
-// if present and text-param-safe, else keyset on rowid (every SQLite/D1 base
-// table without a PK is a rowid table — WITHOUT ROWID requires a PK), else — only
-// if a rowid probe fails — a LIMIT/OFFSET fallback. A BLOB-affinity key column
-// cannot be keyset-bounded by a text param (see [pkKeysetSafe]) and routes to
-// rowid; a WITHOUT ROWID table keyed only by a BLOB column is refused loudly
-// rather than looped forever.
+// if present and text-param-safe, else keyset on the implicit rowid (every
+// SQLite/D1 base table without a PK is a rowid table — WITHOUT ROWID requires a
+// PK). A BLOB-affinity key column cannot be keyset-bounded by a text param (see
+// [pkKeysetSafe]) and routes to rowid. A table with neither — a WITHOUT ROWID
+// table keyed only by a BLOB column, or a rowid table whose declared columns
+// shadow every rowid alias — is refused loudly with
+// [sluicecode.CodeBulkCopyNoPaginationKey] rather than looped forever or read
+// by LIMIT/OFFSET. (The former OFFSET fallback was reachable only through a
+// failed rowid probe, which is exactly the path audit LA-1 found routing a
+// shadowed `rowid` column into the keyset; it is gone, not narrowed.)
 func (r *D1RowReader) planPagination(ctx context.Context, table *ir.Table) (pagePlan, error) {
 	p := newPagePlan(table.Columns)
 
-	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
-		if pkKeysetSafe(table) {
-			for _, ic := range table.PrimaryKey.Columns {
-				p.orderCols = append(p.orderCols, ic.Column)
-			}
-			return p, nil
+	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 && pkKeysetSafe(table) {
+		for _, ic := range table.PrimaryKey.Columns {
+			p.orderCols = append(p.orderCols, ic.Column)
 		}
-		// A BLOB-affinity (or no-declared-type) key column can't be bounded by a
-		// text param: SQLite ranks BLOB above every TEXT and applies no numeric
-		// coercion to the param, so `blobcol > ?(text)` is ALWAYS true and the
-		// page never advances (infinite loop + duplicate rows). The integer rowid
-		// compares exactly, so fall back to it when the table has one.
-		if r.tableHasRowid(ctx, table.Name) {
-			p.useRowid = true
-			p.orderCols = []string{"rowid"}
-			return p, nil
-		}
-		// WITHOUT ROWID table keyed only by a BLOB column: no safe keyset and no
-		// rowid to fall back to — refuse loudly rather than loop forever.
-		return pagePlan{}, fmt.Errorf(
-			"d1: table %q has a BLOB-affinity primary key and no rowid; cannot keyset-paginate "+
-				"safely (a text-param bound on a BLOB column never advances)", table.Name,
-		)
-	}
-	if r.tableHasRowid(ctx, table.Name) {
-		p.useRowid = true
-		p.orderCols = []string{"rowid"}
 		return p, nil
 	}
-	// No orderable key (a WITHOUT ROWID table missing a discoverable PK — rare).
-	// LIMIT/OFFSET is not safe under concurrent writes; D1 reads are typically of
-	// a quiescent database, so this is an accepted documented fallback.
-	p.useOffset = true
-	slog.WarnContext(ctx, "d1: table has no primary key or rowid; paginating by LIMIT/OFFSET (not safe under concurrent writes)",
-		slog.String("table", table.Name))
+	// No PK, or a BLOB-affinity (or no-declared-type) key column that can't be
+	// bounded by a text param: SQLite ranks BLOB above every TEXT and applies no
+	// numeric coercion to the param, so `blobcol > ?(text)` is ALWAYS true and
+	// the page never advances (infinite loop + duplicate rows). The integer
+	// rowid compares exactly, so key on it — through the alias the table does
+	// not shadow.
+	why := "no primary key"
+	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
+		why = "BLOB-affinity primary key, which a text-param bound never advances"
+	}
+	name, err := r.resolveRowidName(ctx, table, why)
+	if err != nil {
+		return pagePlan{}, err
+	}
+	p.useRowid = true
+	p.rowidName = name
+	p.orderCols = []string{name}
 	return p, nil
+}
+
+// rowidNames are the three names SQLite resolves to a rowid table's implicit
+// rowid — UNLESS the table declares a column of that name, in which case the
+// name binds the user column (SQLite's documented shadowing rule, matched
+// case-insensitively like every SQLite identifier). Preference order: `rowid`
+// first so the common (unshadowed) table's SQL is byte-identical to before.
+var rowidNames = [...]string{"rowid", "_rowid_", "oid"}
+
+// resolveRowidName returns the implicit-rowid name the keyset can safely use
+// for table: the first of [rowidNames] that no declared column shadows, proven
+// reachable by a `SELECT <name> … LIMIT 1` probe. It is the LA-1 fix — the
+// former probe was `SELECT rowid`, which SUCCEEDS on a PK-less table whose user
+// column is named `rowid` because the name binds that column, so the keyset
+// paginated on a non-unique user column and dropped every row sharing a page-
+// boundary value (2,500 → 2,000 rows at exit 0 on real D1). Declared columns
+// come from `PRAGMA table_xinfo` (the server's own catalog, generated columns
+// included — a generated column shadows too), not from the IR, so the check
+// holds however the caller built the table.
+//
+// Every failure is a loud [sluicecode.CodeBulkCopyNoPaginationKey] refusal
+// naming the table and the remedy — all three names shadowed, or the probe
+// failing (a WITHOUT ROWID table, which reaches here only with a BLOB-only PK,
+// or a transport error). Nothing falls through to a shadowed column or to
+// LIMIT/OFFSET.
+func (r *D1RowReader) resolveRowidName(ctx context.Context, table *ir.Table, why string) (string, error) {
+	declared, err := r.client.queryRows(ctx, "PRAGMA table_xinfo("+quotePragmaArg(table.Name)+")")
+	if err != nil {
+		return "", noPaginationKey(table.Name, why, fmt.Errorf("read declared columns: %w", err))
+	}
+	shadowed := map[string]bool{}
+	for _, row := range declared {
+		name, err := rowString(row, "name")
+		if err != nil {
+			return "", noPaginationKey(table.Name, why, fmt.Errorf("read declared columns: %w", err))
+		}
+		shadowed[strings.ToLower(name)] = true
+	}
+	for _, name := range rowidNames {
+		if shadowed[name] {
+			continue
+		}
+		// The name is unshadowed, so it can only mean the implicit rowid — which
+		// a WITHOUT ROWID table does not have (the probe errors there).
+		if _, err := r.client.queryRows(ctx, "SELECT "+quoteIdent(name)+" FROM "+quoteIdent(table.Name)+" LIMIT 1"); err != nil {
+			return "", noPaginationKey(table.Name, why, fmt.Errorf("probe of the implicit rowid as %s failed: %w", name, err))
+		}
+		return name, nil
+	}
+	return "", noPaginationKey(table.Name, why, errors.New(
+		"declared columns shadow every implicit-rowid name (rowid, _rowid_, oid), so no reference can reach it",
+	))
+}
+
+// noPaginationKeyHint is the remedy carried by [sluicecode.CodeBulkCopyNoPaginationKey].
+const noPaginationKeyHint = "declare a non-BLOB PRIMARY KEY on the table (or rename the columns shadowing rowid/_rowid_/oid) and re-run"
+
+// noPaginationKey is the coded refusal for a table sluice cannot paginate
+// without risking a silently short or looping read: why names what ruled out a
+// PK keyset, cause what ruled out the rowid.
+func noPaginationKey(table, why string, cause error) error {
+	return sluicecode.Wrap(sluicecode.CodeBulkCopyNoPaginationKey, noPaginationKeyHint,
+		fmt.Errorf("d1: table %q has no key sluice can keyset-paginate on: %s, and %w; %s",
+			table, why, cause, noPaginationKeyHint))
 }
 
 // pkKeysetSafe reports whether every primary-key column can be keyset-bounded by
@@ -211,12 +270,62 @@ func findColumn(table *ir.Table, name string) *ir.Column {
 	return nil
 }
 
-// tableHasRowid probes whether the table exposes a rowid (false for a WITHOUT
-// ROWID table). A network error also returns false, which routes to the OFFSET
-// fallback; the real error then surfaces on the first page read.
-func (r *D1RowReader) tableHasRowid(ctx context.Context, table string) bool {
-	_, err := r.client.queryRows(ctx, "SELECT rowid FROM "+quoteIdent(table)+" LIMIT 1")
-	return err == nil
+// countRows returns the server-side `COUNT(*)` of table — the independent
+// expected value the paginated read is checked against (audit LA-3). The count
+// is projected as TEXT and parsed exactly, the same discipline as every other
+// integer this transport reads (a JSON number would round past 2^53).
+func (r *D1RowReader) countRows(ctx context.Context, table string) (int64, error) {
+	rows, err := r.client.queryRows(ctx, "SELECT CAST(COUNT(*) AS TEXT) AS n FROM "+quoteIdent(table))
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) != 1 {
+		return 0, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
+	}
+	text, ok, err := jsonString(rows[0]["n"])
+	if err != nil || !ok {
+		return 0, fmt.Errorf("COUNT(*) result is not a text scalar (%v)", err)
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("COUNT(*) result %q: %w", text, err)
+	}
+	return n, nil
+}
+
+// rowCountMismatchHint is the remedy carried by [sluicecode.CodeBulkCopyRowCountMismatch].
+const rowCountMismatchHint = "do not trust this copy; migrate the table through `wrangler d1 export` + `sluice migrate --source-driver sqlite` and report the table's DDL as a sluice bug"
+
+// checkRowCount is the LA-3 bracket's verdict, taken after the final page:
+// before and after are the server-side COUNT(*) around the read, delivered is
+// what pagination produced.
+//
+//   - before == after (a quiescent source — the documented D1 assumption) and
+//     delivered differs: the READER lost or duplicated rows. That is the exact
+//     shape of LA-1, and it is refused with
+//     [sluicecode.CodeBulkCopyRowCountMismatch] so the run cannot exit 0 over
+//     a short copy.
+//   - before != after: writes landed during the read, so the delivered count is
+//     not comparable to either and the copy is not a point-in-time snapshot.
+//     That is WARNed, not refused — a live database would otherwise be
+//     unmigratable, and the keyset read is documented as non-snapshot under
+//     concurrent writes. The WARN names all three numbers.
+func checkRowCount(ctx context.Context, table string, before, after, delivered int64) error {
+	if before != after {
+		slog.WarnContext(ctx, "d1: table changed during the read; the copy is not a point-in-time snapshot and its row count cannot be verified",
+			slog.String("table", table),
+			slog.Int64("count_before", before),
+			slog.Int64("count_after", after),
+			slog.Int64("rows_delivered", delivered))
+		return nil
+	}
+	if delivered != before {
+		return sluicecode.Wrap(sluicecode.CodeBulkCopyRowCountMismatch, rowCountMismatchHint,
+			fmt.Errorf("pagination delivered %d rows but the source's COUNT(*) was %d before and after the read "+
+				"(the source was quiescent, so the reader lost or duplicated rows); %s",
+				delivered, before, rowCountMismatchHint))
+	}
+	return nil
 }
 
 // d1Page is one fetched page handed from the prefetching fetcher goroutine to
@@ -262,7 +371,7 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 	)
 	for page := range pages {
 		if page.err != nil {
-			r.setErr(fmt.Errorf("d1: table %q: read page: %w", table.Name, page.err))
+			r.setErr(fmt.Errorf("d1: table %q: %w", table.Name, page.err))
 			return
 		}
 		for _, raw := range page.rows {
@@ -308,36 +417,62 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 // per-row decodeRow deterministically reproduces the same loud refusal (with
 // full table/row context) when it reaches that row, so the error is never
 // duplicated and never lost.
+//
+// The read is bracketed by a server-side COUNT(*) (audit LA-3): one before the
+// first page, one after the final page, judged by [checkRowCount]. A verdict
+// against the read travels as the final page's err, so both consumers (the
+// stream loop and the staging materializer) surface it through the page-error
+// path they already have. The counts are the only evidence in this lane that
+// does not come from the reader under test.
 func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan pagePlan, pages chan<- d1Page) {
 	defer close(pages)
+
+	deliver := func(page d1Page) bool {
+		select {
+		case pages <- page:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	before, err := r.countRows(ctx, table.Name)
+	if err != nil {
+		deliver(d1Page{err: fmt.Errorf("count rows before the read: %w", err), final: true})
+		return
+	}
 
 	projection := buildD1Projection(table, plan)
 	pageSize := r.effectivePageSize()
 
 	var (
-		lastKey []string // exact-text bound from the previous page (keyset)
-		offset  int      // OFFSET cursor (fallback only)
-		ordinal int64    // rows fetched so far (error context for extractKey)
+		lastKey []string // exact-text bound from the previous page
+		ordinal int64    // rows fetched so far (error context for extractKey; the delivered total)
 	)
 	for {
-		sql, params := buildD1PageQuery(table, plan, projection, lastKey, offset, pageSize)
+		sql, params := buildD1PageQuery(table, plan, projection, lastKey, pageSize)
 		rows, err := r.client.queryRows(ctx, sql, params...)
-		// A short (or empty) page is the last page; a failed page ends the
-		// stream when the consumer reaches it.
-		final := err != nil || len(rows) < pageSize
-		select {
-		case pages <- d1Page{rows: rows, err: err, final: final}:
-		case <-ctx.Done():
+		if err != nil {
+			// A failed page ends the stream when the consumer reaches it.
+			deliver(d1Page{err: fmt.Errorf("read page: %w", err), final: true})
 			return
-		}
-		if final {
-			return
-		}
-		if plan.useOffset {
-			offset += len(rows)
-			continue
 		}
 		ordinal += int64(len(rows))
+		// A short (or empty) page is the last page: close the bracket and
+		// let its verdict ride the page.
+		if len(rows) < pageSize {
+			after, err := r.countRows(ctx, table.Name)
+			if err != nil {
+				err = fmt.Errorf("count rows after the read: %w", err)
+			} else {
+				err = checkRowCount(ctx, table.Name, before, after, ordinal)
+			}
+			deliver(d1Page{rows: rows, err: err, final: true})
+			return
+		}
+		if !deliver(d1Page{rows: rows}) {
+			return
+		}
 		key, err := r.extractKey(table, plan, rows[len(rows)-1], ordinal)
 		if err != nil {
 			return // consumer reproduces this refusal at the same row
@@ -384,12 +519,9 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 // extractKey reads the exact-text values of the keyset columns from a result
 // row, to bound the next page. For a PK keyset the key columns are user columns
 // (read from their value projection); for a rowid keyset it is the rowid alias.
-// Returns nil for the OFFSET fallback (no key). A NULL key value is refused
+// A NULL key value is refused
 // loudly — a NULL in a keyset column would make pagination skip/loop.
 func (r *D1RowReader) extractKey(table *ir.Table, plan pagePlan, raw d1Row, ordinal int64) ([]string, error) {
-	if plan.useOffset {
-		return nil, nil
-	}
 	if plan.useRowid {
 		text, ok, err := jsonString(raw[plan.rowidAlias])
 		if err != nil || !ok {
@@ -412,8 +544,9 @@ func (r *D1RowReader) extractKey(table *ir.Table, plan pagePlan, raw d1Row, ordi
 // buildD1Projection renders the SELECT list: for each user column, the
 // typeof-aliased storage class and the CAST/hex exact-text value (aliased to the
 // real column name so the decoded ir.Row is keyed correctly). For a rowid
-// keyset it also projects CAST(rowid AS TEXT) under the collision-free rowid
-// alias so the next page's bound is exact.
+// keyset it also projects CAST(<rowidName> AS TEXT) — the unshadowed implicit-
+// rowid name — under the collision-free rowid alias so the next page's bound
+// is exact.
 func buildD1Projection(table *ir.Table, plan pagePlan) string {
 	parts := make([]string, 0, len(table.Columns)*2+1)
 	for i, c := range table.Columns {
@@ -432,7 +565,7 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 		)
 	}
 	if plan.useRowid {
-		parts = append(parts, "CAST(rowid AS TEXT) AS "+quoteIdent(plan.rowidAlias))
+		parts = append(parts, "CAST("+quoteIdent(plan.rowidName)+" AS TEXT) AS "+quoteIdent(plan.rowidAlias))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -443,20 +576,12 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 // — the bug the MySQL keyset path hit). Bound values are passed as STRINGS so a
 // > 2^53 bound is not rounded through a JSON number; SQLite applies the bound
 // column's affinity to the text param, recovering the exact comparison.
-func buildD1PageQuery(table *ir.Table, plan pagePlan, projection string, lastKey []string, offset, pageSize int) (sql string, params []string) {
+func buildD1PageQuery(table *ir.Table, plan pagePlan, projection string, lastKey []string, pageSize int) (sql string, params []string) {
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	b.WriteString(projection)
 	b.WriteString(" FROM ")
 	b.WriteString(quoteIdent(table.Name))
-
-	if plan.useOffset {
-		b.WriteString(" LIMIT ")
-		b.WriteString(strconv.Itoa(pageSize))
-		b.WriteString(" OFFSET ")
-		b.WriteString(strconv.Itoa(offset))
-		return b.String(), nil
-	}
 
 	qualified := qualifiedKeyCols(table.Name, plan.orderCols)
 	if len(lastKey) > 0 {
@@ -486,8 +611,9 @@ func keysetPredicate(qualifiedCols []string) string {
 	return "(" + strings.Join(qualifiedCols, ", ") + ") > (" + strings.Join(placeholders, ", ") + ")"
 }
 
-// qualifiedKeyCols table-qualifies each key column (`"t"."c"`). rowid qualifies
-// the same way (`"t"."rowid"` is the rowid of t).
+// qualifiedKeyCols table-qualifies each key column (`"t"."c"`). The implicit
+// rowid qualifies the same way (`"t"."rowid"` / `"t"."_rowid_"` / `"t"."oid"`
+// is the rowid of t whenever t declares no column of that name).
 func qualifiedKeyCols(table string, cols []string) []string {
 	out := make([]string, len(cols))
 	qt := quoteIdent(table)

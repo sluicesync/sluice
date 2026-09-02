@@ -63,6 +63,19 @@ const (
 	CodeCDCXAUnsupported         Code = "SLUICE-E-CDC-XA-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
+	// Audit 2026-09-01 LA-1/LA-3: the D1 keyset paginator keyed a PK-less
+	// table on a user column named `rowid` (SQLite shadowing: the name binds
+	// the column, not the implicit rowid) and dropped 500 of 2,500 rows at
+	// exit 0 on real D1. NoPaginationKey is the loud door for a table with
+	// no unique orderable key sluice can reach (every rowid name shadowed, or
+	// a WITHOUT ROWID table keyed only by a BLOB column) — it replaces the
+	// LIMIT/OFFSET fallback the failed probe used to route into.
+	// RowCountMismatch is the independent-evidence bracket: a server-side
+	// COUNT(*) before and after the read that agrees with itself but not
+	// with the rows delivered means the READER lost or duplicated rows.
+	CodeBulkCopyNoPaginationKey  Code = "SLUICE-E-BULKCOPY-NO-PAGINATION-KEY"
+	CodeBulkCopyRowCountMismatch Code = "SLUICE-E-BULKCOPY-ROW-COUNT-MISMATCH"
+
 	// Audit 2026-08-11 C1-1: sluice's emitters only ever produce ONE SQL
 	// statement, and the restore path inlines RECORDED expression bodies
 	// from a backup manifest verbatim into that DDL before running it
@@ -567,6 +580,8 @@ var registry = map[Code]Info{
 	CodeConnectDatabaseMissing:   {ClassRuntime, "the DSN names a database that does not exist"},
 	CodeBulkCopyTargetMissing:    {ClassRuntime, "bulk-copy target table not found on the target"},
 	CodeBulkCopyTableFailed:      {ClassRuntime, "a table failed mid-bulk-copy; earlier tables lack secondary indexes"},
+	CodeBulkCopyNoPaginationKey:  {ClassRefusal, "the d1 reader refused a table with no unique orderable key it can keyset-paginate on (every implicit-rowid name shadowed by a declared column, or a WITHOUT ROWID table keyed only by a BLOB column) — refused rather than paginated on a non-unique column or by LIMIT/OFFSET"},
+	CodeBulkCopyRowCountMismatch: {ClassRefusal, "the d1 reader's server-side COUNT(*) before and after a table read agreed with each other but not with the rows pagination delivered — the reader lost or duplicated rows on a quiescent source"},
 	CodeSchemaPermissionDenied:   {ClassRuntime, "target role lacks CREATE on the schema"},
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},

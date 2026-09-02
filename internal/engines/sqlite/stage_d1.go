@@ -162,7 +162,7 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 	)
 	for page := range pages {
 		if page.err != nil {
-			return total, fmt.Errorf("d1 stage: table %q: read page: %w", t.Name, page.err)
+			return total, fmt.Errorf("d1 stage: table %q: %w", t.Name, page.err)
 		}
 		if len(page.rows) > 0 {
 			if err := stageInsertPage(ctx, db, t, plan, rr, insertSQL, stored, page.rows, &ordinal); err != nil {

@@ -133,7 +133,7 @@ DSN forms: `d1://<account_id>/<database_id>` or `d1://<database_id>` (account fr
 startup, before any request. The same `--sqlite-date-encoding` / `sqlite_date_encoding`
 date/bool policy applies to the text values, and the same loud storage-class fidelity holds
 (a value that can't be faithfully held in a column's resolved type is refused, naming the
-row — never silently coerced). Large tables are read in primary-key keyset pages.
+row — never silently coerced). Large tables are read in keyset pages: on the PRIMARY KEY when it is text-param-safe, else on the implicit rowid, reached through whichever of `rowid` / `_rowid_` / `oid` the table's own columns do not shadow (a declared column of that name binds the column, not the rowid — so a PK-less table with a user column named `rowid` used to paginate on that non-unique column and drop rows at exit 0; that is `SLUICE-E-BULKCOPY-NO-PAGINATION-KEY` territory now when every name is shadowed, and there is no LIMIT/OFFSET fallback). Every table read is bracketed by a server-side `COUNT(*)` before the first page and after the last: two equal counts that disagree with the rows delivered are refused with `SLUICE-E-BULKCOPY-ROW-COUNT-MISMATCH` (the reader lost rows), and two counts that disagree with each other are WARNed as a non-snapshot read of a moving source. The same count backs `sluice verify --depth count` against a `d1` source.
 
 **Which path for D1?** Use the export → `migrate` path (above) for a D1 database without
 integers > 2^53 and for offline imports — it is simple and exact for those. Use

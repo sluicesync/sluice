@@ -48,6 +48,10 @@ var (
 	// sources). Losing ir.Verifier turns `sluice verify --depth count` against
 	// a sqlite/flat-file endpoint into an "engine not supported" refusal.
 	_ ir.Verifier = (*SchemaReader)(nil)
+	// D1 SchemaReader: the same count depth over the HTTP query API (audit
+	// 2026-09-01 LA-3 — `verify --depth count` refused every `d1` source before
+	// it, so the lane had no independent row count an operator could ask for).
+	_ ir.Verifier = (*D1SchemaReader)(nil)
 
 	// File RowReader: the cursor/batched read family. Losing BatchedRowReader/
 	// BoundedBatchedRowReader silently demotes every large-table copy to the

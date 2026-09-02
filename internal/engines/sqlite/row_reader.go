@@ -233,6 +233,13 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, tableName string
 // `SELECT rowid ... LIMIT 1` errors on a WITHOUT ROWID table — lets the
 // reader include the rowid in fidelity-refusal messages when available
 // and fall back to an ordinal otherwise.
+//
+// Sibling of the D1 reader's LA-1 door ([D1RowReader.resolveRowidName]),
+// exempt with a reason: a user column named `rowid` shadows the implicit
+// rowid here too, but this reader streams a full scan and never keys on the
+// name — the probe only decorates error messages, so the worst case is a
+// refusal that quotes the user column's value (or the ordinal, when it is
+// not an integer) instead of the rowid. No row is skipped.
 func (r *RowReader) tableHasRowid(ctx context.Context, table string) bool {
 	var discard any
 	err := r.db.QueryRowContext(ctx, "SELECT rowid FROM "+quoteIdent(table)+" LIMIT 1").Scan(&discard)

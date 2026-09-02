@@ -64,13 +64,13 @@ func TestD1RowReader_PrefetchOverlapsStream(t *testing.T) {
 
 	page2Requested := make(chan struct{})
 	var once sync.Once
-	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+	client := startMockD1(t, withCount(len(page1)+len(page2), func(sql string, _ []string) (int, []byte) {
 		if !strings.Contains(sql, "WHERE") {
 			return http.StatusOK, d1OK(page1)
 		}
 		once.Do(func() { close(page2Requested) })
 		return http.StatusOK, d1OK(page2)
-	})
+	}))
 	r := &D1RowReader{client: client, pageSize: pageSize}
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -124,7 +124,7 @@ func TestD1RowReader_PrefetchRequestBoundsExact(t *testing.T) {
 		sqls []string
 		prms [][]string
 	)
-	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+	client := startMockD1(t, withCount(5, func(sql string, params []string) (int, []byte) {
 		mu.Lock()
 		n := len(sqls)
 		sqls = append(sqls, sql)
@@ -134,7 +134,7 @@ func TestD1RowReader_PrefetchRequestBoundsExact(t *testing.T) {
 			return http.StatusOK, d1OK(nil)
 		}
 		return http.StatusOK, d1OK(pages[n])
-	})
+	}))
 	r := &D1RowReader{client: client, pageSize: 2}
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -178,12 +178,12 @@ func TestD1RowReader_PrefetchRequestBoundsExact(t *testing.T) {
 func TestD1RowReader_PrefetchErrorSurfacesInSequence(t *testing.T) {
 	table := intPKTable("items")
 	page1 := idRows(table, 1, 2) // full page → page 2 requested
-	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+	client := startMockD1(t, withCount(len(page1), func(sql string, _ []string) (int, []byte) {
 		if !strings.Contains(sql, "WHERE") {
 			return http.StatusOK, d1OK(page1)
 		}
 		return http.StatusOK, d1Err(7500, "simulated D1 failure on page 2")
-	})
+	}))
 	r := &D1RowReader{client: client, pageSize: 2}
 
 	ch, err := r.ReadRows(context.Background(), table)
@@ -222,6 +222,10 @@ func TestD1RowReader_PrefetchCancelReapsFetcher(t *testing.T) {
 		var body d1RequestBody
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if isD1CountQuery(body.SQL) {
+			_, _ = w.Write(d1OK([]map[string]any{{"n": "3"}}))
 			return
 		}
 		if !strings.Contains(body.SQL, "WHERE") {

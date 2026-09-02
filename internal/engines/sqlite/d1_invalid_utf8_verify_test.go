@@ -265,8 +265,15 @@ func exportD1Dump(ctx context.Context, t *testing.T, account, dbID, token string
 // is reported loudly (it costs nothing but clutters the account).
 func createThrowawayD1Database(ctx context.Context, t *testing.T, account, token string) string {
 	t.Helper()
+	return createThrowawayD1DatabaseNamed(ctx, t, account, token, fmt.Sprintf("sluice-d1verify-%d", time.Now().UnixNano()))
+}
+
+// createThrowawayD1DatabaseNamed is [createThrowawayD1Database] with the
+// caller's database name — for a test whose leaked database should be
+// recognisable by name (e.g. the audit LA-1 replay's `la1-<nanos>`).
+func createThrowawayD1DatabaseNamed(ctx context.Context, t *testing.T, account, token, name string) string {
+	t.Helper()
 	base := "https://api.cloudflare.com/client/v4/accounts/" + account + "/d1/database"
-	name := fmt.Sprintf("sluice-d1verify-%d", time.Now().UnixNano())
 
 	body, err := d1AdminRequest(ctx, http.MethodPost, base, token, `{"name":"`+name+`"}`)
 	if err != nil {
