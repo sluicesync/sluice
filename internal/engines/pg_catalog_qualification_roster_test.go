@@ -67,9 +67,11 @@ import (
 // costs nothing and keeps the rule one sentence; (4) the MySQL/SQLite
 // engines, which have no schema-search resolution of this shape. The
 // connect-level `search_path = pg_catalog, pg_temp` pin that would make this
-// roster redundant is the scheduled follow-up — it needs every EXTENSION
-// type and function sluice emits (PostGIS, hstore, citext, uuid-ossp,
-// pgcrypto) namespace-qualified first, or it refuses working configurations.
+// roster redundant — the remedy pg_dump adopted for CVE-2018-1058, the same
+// search_path function-resolution class — is the scheduled follow-up: it
+// needs every EXTENSION type and function sluice emits (PostGIS, hstore,
+// citext, uuid-ossp, pgcrypto) namespace-qualified first, or it refuses
+// working configurations.
 //
 // # Exemptions
 //
