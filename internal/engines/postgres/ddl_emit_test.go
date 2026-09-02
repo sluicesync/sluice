@@ -686,7 +686,7 @@ func TestEmitDefault(t *testing.T) {
 		{
 			"expression mysql dialect: RAND() translates",
 			ir.DefaultExpression{Expr: "RAND()", Dialect: "mysql"},
-			"RANDOM()", true,
+			"pg_catalog.RANDOM()", true,
 		},
 		{
 			"expression mysql dialect: NOW() translates to keyword",

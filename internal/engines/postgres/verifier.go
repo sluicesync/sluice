@@ -40,7 +40,7 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 	// into the COUNT so verify compares matching-source rows against the
 	// filtered target subset. Empty when no filter is set for this table;
 	// always parenthesized so a disjunctive predicate is fully scoped.
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s`,
+	q := fmt.Sprintf(`SELECT pg_catalog.COUNT(*) FROM %s.%s`,
 		quoteIdent(r.schema), quoteIdent(table.Name))
 	q += rowFilterWhereSQL(r.rowFilters[table.Name])
 	var count int64
@@ -101,22 +101,22 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	if len(pkCols) == 1 {
 		pkExpr = fmt.Sprintf(`%s::text`, quoteIdent(pkCols[0]))
 	}
-	concatExpr := "CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
+	concatExpr := "pg_catalog.CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
 	var hashExpr string
 	switch algo {
 	case ir.HashSHA256:
 		// PG 11+: sha256() is built-in, returns bytea; encode to hex
 		// to match the MD5 shape.
-		hashExpr = "ENCODE(SHA256(" + concatExpr + "::bytea), 'hex')"
+		hashExpr = "pg_catalog.ENCODE(pg_catalog.SHA256(" + concatExpr + "::bytea), 'hex')"
 	default:
-		hashExpr = "MD5(" + concatExpr + ")"
+		hashExpr = "pg_catalog.MD5(" + concatExpr + ")"
 	}
 	// ADR-0173 Phase 1: AND the operator's `--where` filter into the
 	// FROM clause (before ORDER BY) so the sampled population is the
 	// matching-source subset; always parenthesized.
 	where := rowFilterWhereSQL(r.rowFilters[table.Name])
 	q := fmt.Sprintf(
-		`SELECT %s AS pk, %s AS hash FROM %s.%s%s ORDER BY MD5(%s || '%d') LIMIT %d`,
+		`SELECT %s AS pk, %s AS hash FROM %s.%s%s ORDER BY pg_catalog.MD5(%s || '%d') LIMIT %d`,
 		pkExpr, hashExpr,
 		quoteIdent(r.schema), quoteIdent(table.Name), where,
 		pkExpr, seed, n,

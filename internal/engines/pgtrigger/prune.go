@@ -266,7 +266,7 @@ func pgPruneBatch(db *sql.DB, tableRef string) triggercdc.BatchFunc {
 // batching loop's keyset floor. Indexed (id is the PK) and cheap.
 func pgChangeLogMinID(ctx context.Context, db *sql.DB, tableRef string) (int64, error) {
 	var minID int64
-	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MIN(id), 0) FROM "+tableRef).Scan(&minID); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(pg_catalog.MIN(id), 0) FROM "+tableRef).Scan(&minID); err != nil {
 		return 0, err
 	}
 	return minID, nil
@@ -275,7 +275,7 @@ func pgChangeLogMinID(ctx context.Context, db *sql.DB, tableRef string) (int64, 
 // pgChangeLogStats returns COALESCE(MIN(id), 0) and COUNT(*) of the change-log.
 // tableRef is the already-quoted schema.table reference.
 func pgChangeLogStats(ctx context.Context, db *sql.DB, tableRef string) (minID, count int64, err error) {
-	err = db.QueryRowContext(ctx, "SELECT COALESCE(MIN(id), 0), COUNT(*) FROM "+tableRef).Scan(&minID, &count)
+	err = db.QueryRowContext(ctx, "SELECT COALESCE(pg_catalog.MIN(id), 0), pg_catalog.COUNT(*) FROM "+tableRef).Scan(&minID, &count)
 	if err != nil {
 		return 0, 0, err
 	}

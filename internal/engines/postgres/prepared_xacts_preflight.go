@@ -58,7 +58,7 @@ const preparedXactWarnListCap = 5
 // database column is carried into the WARN).
 const preparedXactQuery = `
 	SELECT gid, database, owner,
-	       GREATEST(EXTRACT(EPOCH FROM (now() - prepared)), 0)::bigint
+	       GREATEST(EXTRACT(EPOCH FROM (pg_catalog.now() - prepared)), 0)::bigint
 	FROM   pg_prepared_xacts
 	ORDER  BY prepared`
 

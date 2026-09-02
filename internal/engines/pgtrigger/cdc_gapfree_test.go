@@ -36,18 +36,18 @@ func TestPollAndAnchorShareTheSettledCeiling(t *testing.T) {
 // first release) against pg_snapshot_xmin — never the row's system
 // `xmin`. Row xmin is a 32-bit epoch-LESS xid, so an xmin-based arm
 // stops matching once the cluster's lifetime txid count crosses 2^32,
-// COALESCE falls through to MAX(id), and the ceiling silently stops
+// COALESCE falls through to pg_catalog.MAX(id), and the ceiling silently stops
 // holding anything back (live-confirmed on a pg_resetwal-epoch-bumped
 // PG 16; the live pin is TestCDCReader_XIDEpochBump).
 func TestSettledCeilingSQL_ComparesInXID8Domain(t *testing.T) {
 	q := settledCeilingSQL("cl")
-	if !strings.Contains(q, "txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint") {
+	if !strings.Contains(q, "txid >= pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint") {
 		t.Errorf("settled ceiling lost the xid8-domain arm:\n%s", q)
 	}
 	if strings.Contains(q, "xmin::text") {
 		t.Errorf("settled ceiling compares the 32-bit row xmin against a 64-bit xid8 — the epoch-wrap silent-gap bug:\n%s", q)
 	}
-	if !strings.Contains(q, "MIN(id) - 1") || !strings.Contains(q, "COALESCE(MAX(id), 0)") {
+	if !strings.Contains(q, "pg_catalog.MIN(id) - 1") || !strings.Contains(q, "COALESCE(pg_catalog.MAX(id), 0)") {
 		t.Errorf("settled ceiling lost the (first-unsettled − 1, else MAX) shape:\n%s", q)
 	}
 }
@@ -69,7 +69,7 @@ func TestCeilingStallProbe_SharesTheCeilingPredicate(t *testing.T) {
 	if !strings.Contains(probe, "id > $1") {
 		t.Errorf("ceiling-stall probe lost its above-the-watermark bound:\n%s", probe)
 	}
-	if !strings.Contains(probe, "COUNT(*)") || !strings.Contains(probe, "COALESCE(MIN(id), 0)") {
+	if !strings.Contains(probe, "COUNT(*)") || !strings.Contains(probe, "COALESCE(pg_catalog.MIN(id), 0)") {
 		t.Errorf("ceiling-stall probe lost its held-count/first-held shape:\n%s", probe)
 	}
 }

@@ -173,7 +173,7 @@ func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Tabl
 func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableName, colName string) (ir.Type, bool, error) {
 	const q = `
 		SELECT
-			LOWER(c.data_type),
+			pg_catalog.LOWER(c.data_type),
 			c.udt_name,
 			c.character_maximum_length,
 			c.numeric_precision,
@@ -365,7 +365,7 @@ func (a *ChangeApplier) countColumnsPresent(ctx context.Context, schemaName, tab
 	if len(names) == 0 {
 		return 0, nil
 	}
-	const q = `SELECT COUNT(*) FROM information_schema.columns
+	const q = `SELECT pg_catalog.COUNT(*) FROM information_schema.columns
 		WHERE table_schema = $1 AND table_name = $2 AND column_name = ANY($3)`
 	var n int
 	if err := a.db.QueryRowContext(ctx, q, schemaName, tableName, pgTextArray(names)).Scan(&n); err != nil {
@@ -388,7 +388,7 @@ func (a *ChangeApplier) countIndexesPresent(ctx context.Context, schemaName, tab
 	if len(names) == 0 {
 		return 0, nil
 	}
-	const q = `SELECT COUNT(*) FROM pg_indexes
+	const q = `SELECT pg_catalog.COUNT(*) FROM pg_indexes
 		WHERE schemaname = $1 AND tablename = $2 AND indexname = ANY($3)`
 	var n int
 	if err := a.db.QueryRowContext(ctx, q, schemaName, tableName, pgTextArray(names)).Scan(&n); err != nil {

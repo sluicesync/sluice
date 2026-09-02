@@ -70,8 +70,8 @@ var strftimeNowDefaults = map[string]string{
 	// ISO-8601 with a literal Z. SQLite's 'now' is UTC, so the Z is
 	// accurate; PG's now() is tz-aware and the target column is
 	// timestamptz, which carries the zone itself.
-	"strftime('%y-%m-%dt%h:%m:%sz','now')": "date_trunc('second', now())",
-	"strftime('%y-%m-%d %h:%m:%s','now')":  "date_trunc('second', now())",
+	"strftime('%y-%m-%dt%h:%m:%sz','now')": "pg_catalog.date_trunc('second', pg_catalog.now())",
+	"strftime('%y-%m-%d %h:%m:%s','now')":  "pg_catalog.date_trunc('second', pg_catalog.now())",
 	// Date-only / time-only whole formats.
 	"strftime('%y-%m-%d','now')": "CURRENT_DATE",
 	"strftime('%h:%m:%s','now')": "CURRENT_TIME",

@@ -103,6 +103,9 @@ func TestPGClientSQLQualifiesEveryCatalogFunction(t *testing.T) {
 	if got := unqualifiedCatalogCalls("SELECT pg_catalog.to_jsonb(m), pg_catalog.count(*) FROM t m", procs); len(got) != 0 {
 		t.Fatalf("scanner self-check: the canned qualified literal must not flag, got %v", got)
 	}
+	if got := unqualifiedCatalogCalls("SELECT LOWER(c.data_type) FROM information_schema.columns c", procs); len(got) != 1 || got[0].name != "lower" {
+		t.Fatalf("scanner self-check: an UPPERCASE spelling must flag exactly like lowercase, got %v", got)
+	}
 
 	var violations []string
 	exemptUsed := map[string]bool{}
@@ -126,19 +129,20 @@ func TestPGClientSQLQualifiesEveryCatalogFunction(t *testing.T) {
 			if perr != nil {
 				return fmt.Errorf("parse %s: %w", path, perr)
 			}
+			// Every top-level declaration, not only function bodies: SQL
+			// held in package-level const/var blocks is sent to a server
+			// exactly like SQL spelled inline (the pre-tag VF review of
+			// v0.137.4 found 17 such sites the first cut never graded).
 			for _, decl := range f.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
-					continue
-				}
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
+				owner := topLevelDeclName(decl)
+				ast.Inspect(decl, func(n ast.Node) bool {
 					lit, ok := n.(*ast.BasicLit)
 					if !ok || lit.Kind != token.STRING {
 						return true
 					}
-					qualifiedSeen += strings.Count(lit.Value, "pg_catalog.")
+					qualifiedSeen += strings.Count(strings.ToLower(lit.Value), "pg_catalog.")
 					for _, hit := range unqualifiedCatalogCalls(lit.Value, procs) {
-						key := filepath.ToSlash(path) + ":" + fn.Name.Name + ":" + hit.name
+						key := filepath.ToSlash(path) + ":" + owner + ":" + hit.name
 						if _, ok := pgCatalogQualificationExempt[key]; ok {
 							exemptUsed[key] = true
 							continue
@@ -176,11 +180,9 @@ func TestPGClientSQLQualifiesEveryCatalogFunction(t *testing.T) {
 // the gate doc for the two admissible reasons. Keys are
 // `<package>/<file>:<GoFunc>:<name>`.
 var pgCatalogQualificationExempt = map[string]string{
-	// (a) SQL-standard syntactic forms: EXTRACT(field FROM source) is
-	// grammar, not a function call, and `pg_catalog.extract(epoch from x)`
-	// is a syntax error (the function-call spelling only exists from PG 14).
-	"postgres/ddl_default_sqlite.go:translateSQLiteStrftimeDefault:extract": "EXTRACT(field FROM source) is a syntactic form; qualifying it is a syntax error",
-	// Multi-argument unnest(a, b) is grammar too: the parser expands the
+	// (a) SQL-standard syntactic forms. EXTRACT is handled by name in the
+	// scanner (every spelling here is the FROM form); type modifiers by the
+	// typmod rule. Multi-argument unnest(a, b) is grammar too: the parser expands the
 	// BARE spelling into ROWS FROM(unnest(a), unnest(b)); the qualified
 	// spelling is looked up as a two-argument function and does not exist
 	// (`pg_catalog.unnest(smallint[], smallint[]) does not exist`, caught by
@@ -198,6 +200,7 @@ var pgCatalogQualificationExempt = map[string]string{
 	"postgres/ddl_default_sqlite.go:translateSQLiteDefaultExpr:date": "SQLite source default-expression pattern",
 	"postgres/ddl_default_sqlite.go:translateSQLiteDefaultExpr:time": "SQLite source default-expression pattern",
 	"postgres/expr_translate.go:rewriteCASTCharCharset:char":         "MySQL source CAST type-spec pattern",
+	"postgres/expr_translate.go:rewriteCASTCharCharset:varchar":      "PG target type spec assembled from a bare varchar( fragment plus a length; a type, not a call",
 	"postgres/schema_reader.go:isAutoIncrement:nextval":              "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
 	"postgres/sequence_reader.go:parseNextvalSequence:nextval":       "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
 }
@@ -214,7 +217,39 @@ type catalogCall struct {
 // other qualifier (an explicit `public.`) or none at all flags. The group
 // deliberately admits only identifier characters so a literal's opening
 // quote cannot be swallowed into it.
-var catalogCallRE = regexp.MustCompile(`([A-Za-z0-9_]+\.)?\b([a-z_][a-z0-9_]*)\(`)
+//
+// Case-insensitive on purpose: SQL folds unquoted identifiers, so
+// `LOWER(c.data_type)` resolves exactly like `lower(...)` — and the first
+// cut's lowercase-only pattern left ~100 UPPERCASE spellings ungraded, one
+// of them the schema reader's column-type read, hijacked live through a
+// planted `public.lower(character varying)` (pre-tag VF review, v0.137.4).
+var catalogCallRE = regexp.MustCompile(`([A-Za-z0-9_]+\.)?\b([A-Za-z_][A-Za-z0-9_]*)\(`)
+
+// typmodArgsRE matches the text after a `(` when it is a type modifier:
+// one or two integer literals or `%d` verbs, then the closing paren.
+var typmodArgsRE = regexp.MustCompile(`^\s*(\d+|%d)\s*(,\s*(\d+|%d)\s*)?\)`)
+
+// topLevelDeclName names the declaration a literal lives in, for the
+// exemption key: the function for a FuncDecl, the first declared name for a
+// const/var/type block.
+func topLevelDeclName(decl ast.Decl) string {
+	switch d := decl.(type) {
+	case *ast.FuncDecl:
+		return d.Name.Name
+	case *ast.GenDecl:
+		for _, spec := range d.Specs {
+			switch s := spec.(type) {
+			case *ast.ValueSpec:
+				if len(s.Names) > 0 {
+					return s.Names[0].Name
+				}
+			case *ast.TypeSpec:
+				return s.Name.Name
+			}
+		}
+	}
+	return "<decl>"
+}
 
 // unqualifiedCatalogCalls returns every call in the RAW literal text whose
 // name is a pg_catalog function and which is not spelled `pg_catalog.name(`.
@@ -224,13 +259,30 @@ var catalogCallRE = regexp.MustCompile(`([A-Za-z0-9_]+\.)?\b([a-z_][a-z0-9_]*)\(
 func unqualifiedCatalogCalls(raw string, procs map[string]bool) []catalogCall {
 	var out []catalogCall
 	for _, m := range catalogCallRE.FindAllStringSubmatchIndex(raw, -1) {
-		name := raw[m[4]:m[5]]
+		name := strings.ToLower(raw[m[4]:m[5]])
 		if !procs[name] {
+			continue
+		}
+		// A type modifier is not a call: `VARCHAR(255)`, `NUMERIC(%d,%d)`,
+		// `CHAR(1)`, `BIT(8)` name a TYPE in DDL, and a type name resolves
+		// through pg_type, where an unprivileged role's function cannot
+		// shadow anything. Derived from the argument text — digits, commas,
+		// spaces and `%d` verbs only — not from a list of type names, so a
+		// real call to one of the coercion functions of the same name
+		// (`varchar(x, 10, true)`) still grades.
+		if rest := raw[m[1]:]; typmodArgsRE.MatchString(rest) {
+			continue
+		}
+		// EXTRACT(field FROM source) is grammar, not a call, in every
+		// spelling this repo uses; `pg_catalog.extract(epoch from x)` is a
+		// syntax error. The function-call form only exists from PG 14 and
+		// is never spelled here.
+		if name == "extract" {
 			continue
 		}
 		if m[2] >= 0 {
 			qual := raw[m[2]:m[3]]
-			if qual == "pg_catalog." {
+			if strings.EqualFold(qual, "pg_catalog.") {
 				continue
 			}
 		}

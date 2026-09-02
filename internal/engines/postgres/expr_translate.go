@@ -1171,7 +1171,7 @@ func rewriteFROMUNIXTIME(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "TO_TIMESTAMP(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.TO_TIMESTAMP(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1189,7 +1189,7 @@ func rewriteCHARLENGTH(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "LENGTH(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.LENGTH(" + strings.TrimSpace(args[0]) + ")"
 	}
 	expr = rewriteFunctionCalls(expr, "CHAR_LENGTH", rename)
 	expr = rewriteFunctionCalls(expr, "CHARACTER_LENGTH", rename)
@@ -1217,7 +1217,7 @@ func rewriteROUNDDefaultScale(expr string) string {
 		if len(args) != 2 || strings.TrimSpace(args[1]) != "0" {
 			return ""
 		}
-		return "ROUND(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.ROUND(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1236,7 +1236,7 @@ func rewriteLOGNatural(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "LN(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.LN(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1247,7 +1247,7 @@ func rewriteLCASE(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "LOWER(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.LOWER(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1258,7 +1258,7 @@ func rewriteUCASE(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "UPPER(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.UPPER(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1329,7 +1329,7 @@ func rewriteSUBSTR(expr string) string {
 		for i, a := range args {
 			trimmed[i] = strings.TrimSpace(a)
 		}
-		return "SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
+		return "pg_catalog.SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
 	})
 }
 
@@ -1345,7 +1345,7 @@ func rewriteMID(expr string) string {
 		for i, a := range args {
 			trimmed[i] = strings.TrimSpace(a)
 		}
-		return "SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
+		return "pg_catalog.SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
 	})
 }
 
@@ -1360,7 +1360,7 @@ func rewriteRAND(expr string) string {
 		if len(args) != 0 {
 			return ""
 		}
-		return "RANDOM()"
+		return "pg_catalog.RANDOM()"
 	})
 }
 
@@ -1442,7 +1442,7 @@ func rewriteREGEXPREPLACE(expr string) string {
 		for i, a := range args {
 			trimmed[i] = strings.TrimSpace(a)
 		}
-		return "REGEXP_REPLACE(" + strings.Join(trimmed, ", ") + ", 'g')"
+		return "pg_catalog.REGEXP_REPLACE(" + strings.Join(trimmed, ", ") + ", 'g')"
 	})
 }
 
@@ -1455,7 +1455,7 @@ func rewriteINSTR(expr string) string {
 		if len(args) != 2 {
 			return ""
 		}
-		return "STRPOS(" + strings.TrimSpace(args[0]) + ", " + strings.TrimSpace(args[1]) + ")"
+		return "pg_catalog.STRPOS(" + strings.TrimSpace(args[0]) + ", " + strings.TrimSpace(args[1]) + ")"
 	})
 }
 
@@ -1476,7 +1476,7 @@ func rewriteLOCATE(expr string) string {
 		if len(args) != 2 {
 			return ""
 		}
-		return "STRPOS(" + strings.TrimSpace(args[1]) + ", " + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.STRPOS(" + strings.TrimSpace(args[1]) + ", " + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1645,7 +1645,7 @@ func rewriteDATEFORMAT(expr string) string {
 		if !ok {
 			return ""
 		}
-		return "TO_CHAR(" + x + ", '" + pgFmt + "')"
+		return "pg_catalog.TO_CHAR(" + x + ", '" + pgFmt + "')"
 	})
 }
 
@@ -1952,7 +1952,7 @@ func rewriteDAYNAME(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMDay')"
+		return "pg_catalog.TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMDay')"
 	})
 }
 
@@ -1965,7 +1965,7 @@ func rewriteMONTHNAME(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMMonth')"
+		return "pg_catalog.TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMMonth')"
 	})
 }
 
@@ -2107,11 +2107,11 @@ func rewriteTIMESTAMPDIFF(expr string) string {
 		case "WEEK":
 			return fmt.Sprintf("((%s::date - %s::date) / 7)", b, a)
 		case "MONTH":
-			return fmt.Sprintf("(EXTRACT(YEAR FROM AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM AGE(%s, %s)))::int", b, a, b, a)
+			return fmt.Sprintf("(EXTRACT(YEAR FROM pg_catalog.AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM pg_catalog.AGE(%s, %s)))::int", b, a, b, a)
 		case "QUARTER":
-			return fmt.Sprintf("((EXTRACT(YEAR FROM AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM AGE(%s, %s))) / 3)::int", b, a, b, a)
+			return fmt.Sprintf("((EXTRACT(YEAR FROM pg_catalog.AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM pg_catalog.AGE(%s, %s))) / 3)::int", b, a, b, a)
 		case "YEAR":
-			return fmt.Sprintf("EXTRACT(YEAR FROM AGE(%s, %s))::int", b, a)
+			return fmt.Sprintf("EXTRACT(YEAR FROM pg_catalog.AGE(%s, %s))::int", b, a)
 		}
 		return ""
 	})
@@ -2143,7 +2143,7 @@ func rewriteJSONOBJECT(expr string) string {
 		for i, a := range args {
 			trimmed[i] = strings.TrimSpace(a)
 		}
-		return "JSON_BUILD_OBJECT(" + strings.Join(trimmed, ", ") + ")"
+		return "pg_catalog.JSON_BUILD_OBJECT(" + strings.Join(trimmed, ", ") + ")"
 	})
 }
 
@@ -2160,7 +2160,7 @@ func rewriteJSONARRAY(expr string) string {
 		for i, a := range args {
 			trimmed[i] = strings.TrimSpace(a)
 		}
-		return "JSON_BUILD_ARRAY(" + strings.Join(trimmed, ", ") + ")"
+		return "pg_catalog.JSON_BUILD_ARRAY(" + strings.Join(trimmed, ", ") + ")"
 	})
 }
 
@@ -2185,7 +2185,7 @@ func rewriteLASTDAY(expr string) string {
 		if d == "" {
 			return ""
 		}
-		return fmt.Sprintf("(DATE_TRUNC('month', %s) + INTERVAL '1 month' - INTERVAL '1 day')::date", d)
+		return fmt.Sprintf("(pg_catalog.DATE_TRUNC('month', %s) + INTERVAL '1 month' - INTERVAL '1 day')::date", d)
 	})
 }
 

@@ -162,9 +162,9 @@ const holeProofPolls = 2
 // End-to-end: TestCDCReader_CeilingStall_WarnsWhileHeldAndResumes.
 func settledCeilingSQL(rel string) string {
 	return "COALESCE(\n" +
-		"    (SELECT MIN(id) - 1 FROM " + rel + "\n" +
+		"    (SELECT pg_catalog.MIN(id) - 1 FROM " + rel + "\n" +
 		"      WHERE " + notSettledPredicate + "),\n" +
-		"    (SELECT COALESCE(MAX(id), 0) FROM " + rel + ")\n" +
+		"    (SELECT COALESCE(pg_catalog.MAX(id), 0) FROM " + rel + ")\n" +
 		"  )"
 }
 
@@ -178,7 +178,7 @@ func settledCeilingSQL(rel string) string {
 // this predicate drifting apart is exactly the anchor-vs-poll drift this
 // file's header records; the probe reporting "idle" while the ceiling
 // holds rows would be the same shape one layer up.
-const notSettledPredicate = "txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
+const notSettledPredicate = "txid >= pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint"
 
 // ceilingStallProbeSQL renders the held-row probe the stall guard runs
 // when the stream has been unproductive for a full WARN cadence: how
@@ -188,7 +188,7 @@ const notSettledPredicate = "txid >= pg_snapshot_xmin(pg_current_snapshot())::te
 // idle; a non-zero count is a ceiling stall — committed changes exist
 // that no poll will return until the pinning transaction settles.
 func ceilingStallProbeSQL(tableRef string) string {
-	return "SELECT COUNT(*), COALESCE(MIN(id), 0), pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint\n" +
+	return "SELECT pg_catalog.COUNT(*), COALESCE(pg_catalog.MIN(id), 0), pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint\n" +
 		"  FROM " + tableRef + "\n" +
 		" WHERE id > $1 AND " + notSettledPredicate
 }
@@ -363,7 +363,7 @@ func (g *holeGuard) warnStuck(ctx context.Context, now time.Time) {
 // surfacing as sql.ErrNoRows from a query that found nothing.
 const changeLogSequenceQuery = `
 SELECT q.seq, s.seqcache, s.seqmin, s.seqincrement, s.seqcycle
-  FROM (SELECT pg_get_serial_sequence($1, 'id') AS seq) q
+  FROM (SELECT pg_catalog.pg_get_serial_sequence($1, 'id') AS seq) q
   LEFT JOIN pg_sequence s ON s.seqrelid = q.seq::regclass`
 
 // verifyChangeLogSequence preflights the ascending-monotone-allocation

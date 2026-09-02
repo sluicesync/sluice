@@ -116,7 +116,7 @@ func (a *ChangeApplier) countCheckConstraintsPresent(ctx context.Context, schema
 	if len(names) == 0 {
 		return 0, nil
 	}
-	const q = `SELECT COUNT(*) FROM pg_catalog.pg_constraint con
+	const q = `SELECT pg_catalog.COUNT(*) FROM pg_catalog.pg_constraint con
 		JOIN pg_catalog.pg_class     rel ON rel.oid     = con.conrelid
 		JOIN pg_catalog.pg_namespace nsp ON nsp.oid     = rel.relnamespace
 		WHERE nsp.nspname = $1 AND rel.relname = $2 AND con.contype = 'c' AND con.conname = ANY($3)`

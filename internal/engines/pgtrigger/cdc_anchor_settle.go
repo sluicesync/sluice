@@ -43,7 +43,7 @@ type settleQuerier interface {
 // (xmin:xmax:xip). Run on the PINNED snapshot connection it captures
 // the exact visibility horizon of the bulk copy, replayable later via
 // `$n::pg_snapshot` + pg_visible_in_snapshot on any connection.
-const snapshotTextQuery = `SELECT pg_current_snapshot()::text`
+const snapshotTextQuery = `SELECT pg_catalog.pg_current_snapshot()::text`
 
 // txidUpperBoundQuery assigns a REAL txid to its (implicit,
 // immediately-committed) transaction and returns it in the 64-bit
@@ -59,7 +59,7 @@ const snapshotTextQuery = `SELECT pg_current_snapshot()::text`
 // ASSIGNED xid bounds every earlier assignment; this is the same
 // own-xid bound logical-decoding slot creation waits on. Costs one xid
 // of wraparound budget per cold start; needs no privilege.
-const txidUpperBoundQuery = `SELECT pg_current_xact_id()::text::bigint`
+const txidUpperBoundQuery = `SELECT pg_catalog.pg_current_xact_id()::text::bigint`
 
 // settleWaitQuery lists the still-running txids assigned BEFORE the
 // captured upper bound ($1), from a FRESH snapshot: its xmin (PG keeps
@@ -70,9 +70,9 @@ const txidUpperBoundQuery = `SELECT pg_current_xact_id()::text::bigint`
 // observable in pg_stat_activity (tests key on it; operators see what
 // cold-start is blocked on).
 const settleWaitQuery = `SELECT /* sluice-anchor-settle-wait */ x FROM (
-  SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS x
+  SELECT pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint AS x
   UNION
-  SELECT xip::text::bigint FROM pg_snapshot_xip(pg_current_snapshot()) AS xip
+  SELECT xip::text::bigint FROM pg_catalog.pg_snapshot_xip(pg_catalog.pg_current_snapshot()) AS xip
 ) running WHERE x < $1 ORDER BY x`
 
 // captureSnapshotText exports the current snapshot's text form. For the
@@ -207,7 +207,7 @@ func minChangeLogIDForInvisibleTxns(ctx context.Context, q settleQuerier, schema
 	var got sql.NullInt64
 	if err := q.QueryRowContext(
 		ctx,
-		"SELECT MIN(id) FROM "+tableRef+
+		"SELECT pg_catalog.MIN(id) FROM "+tableRef+
 			" WHERE txid < $1 AND NOT pg_catalog.pg_visible_in_snapshot(txid::text::xid8, $2::pg_snapshot)",
 		upperBound, snapText,
 	).Scan(&got); err != nil {

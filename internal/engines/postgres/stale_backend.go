@@ -56,7 +56,7 @@ var _ ir.TargetStaleBackendReaper = Engine{}
 // once as a single greppable constant so the detect query and the reap
 // query can never drift apart. Any backend this clause does not select is
 // never reported and never terminated.
-const staleBackendScope = `application_name LIKE 'sluice/%' AND usename = current_user AND pid <> pg_backend_pid()`
+const staleBackendScope = `application_name LIKE 'sluice/%' AND usename = current_user AND pid <> pg_catalog.pg_backend_pid()`
 
 // idleInTxStates are the pg_stat_activity.state values that, on their own
 // (no held lock required), mark a sluice backend as orphaned: a run died
@@ -229,7 +229,7 @@ func scanStaleBackends(ctx context.Context, db *sql.DB, schemas []string) ([]ir.
 // Held as a package constant so the safety test can assert the scope is
 // embedded.
 const reapStaleBackendsQuery = `
-SELECT a.pid, pg_terminate_backend(a.pid) AS terminated
+SELECT a.pid, pg_catalog.pg_terminate_backend(a.pid) AS terminated
 FROM pg_stat_activity a
 WHERE a.pid = ANY ($1)
   AND ` + staleBackendScope + `

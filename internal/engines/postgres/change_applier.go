@@ -1984,7 +1984,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 	const q = `
 		SELECT
 			c.column_name,
-			LOWER(c.data_type),
+			pg_catalog.LOWER(c.data_type),
 			c.udt_name,
 			c.character_maximum_length,
 			c.numeric_precision,

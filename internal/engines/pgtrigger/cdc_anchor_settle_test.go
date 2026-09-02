@@ -23,7 +23,7 @@ func TestSettleQueries_StayInXID8Domain(t *testing.T) {
 			t.Errorf("%s lost the xid8 → bigint domain cast:\n%s", name, q)
 		}
 	}
-	if !strings.Contains(txidUpperBoundQuery, "pg_current_xact_id()") {
+	if !strings.Contains(txidUpperBoundQuery, "pg_catalog.pg_current_xact_id()") {
 		t.Errorf("txidUpperBoundQuery must ASSIGN a fresh xid (pg_current_xact_id) — a snapshot's xmax is latestCompletedXid+1 and does NOT bound running txns:\n%s", txidUpperBoundQuery)
 	}
 }
@@ -37,10 +37,10 @@ func TestSettleQueries_StayInXID8Domain(t *testing.T) {
 // still-RUNNING txid) with the xip members, bounded below the assigned
 // upper bound.
 func TestSettleWaitQuery_SeesRunnersAboveXmax(t *testing.T) {
-	if !strings.Contains(settleWaitQuery, "pg_snapshot_xmin(pg_current_snapshot())") {
+	if !strings.Contains(settleWaitQuery, "pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())") {
 		t.Errorf("settleWaitQuery lost the xmin arm — pg_snapshot_xip alone misses runners at/above xmax:\n%s", settleWaitQuery)
 	}
-	if !strings.Contains(settleWaitQuery, "pg_snapshot_xip(pg_current_snapshot())") {
+	if !strings.Contains(settleWaitQuery, "pg_catalog.pg_snapshot_xip(pg_catalog.pg_current_snapshot())") {
 		t.Errorf("settleWaitQuery lost the xip arm:\n%s", settleWaitQuery)
 	}
 	if !strings.Contains(settleWaitQuery, "x < $1") {

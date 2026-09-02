@@ -67,7 +67,7 @@ func TestQualifiesAsStale_OrphanSignalMatrix(t *testing.T) {
 // sluice's own, own-role, non-self backends. This pins the exact clause
 // so a future edit that loosens any of the three terms fails here.
 func TestStaleBackendScope_SafetyBound(t *testing.T) {
-	want := `application_name LIKE 'sluice/%' AND usename = current_user AND pid <> pg_backend_pid()`
+	want := `application_name LIKE 'sluice/%' AND usename = current_user AND pid <> pg_catalog.pg_backend_pid()`
 	if staleBackendScope != want {
 		t.Fatalf("staleBackendScope drifted from the safety bound.\n got: %s\nwant: %s", staleBackendScope, want)
 	}
@@ -78,7 +78,7 @@ func TestStaleBackendScope_SafetyBound(t *testing.T) {
 	for _, frag := range []string{
 		"application_name LIKE 'sluice/%'",
 		"usename = current_user",
-		"pid <> pg_backend_pid()",
+		"pid <> pg_catalog.pg_backend_pid()",
 	} {
 		if !strings.Contains(detect, frag) {
 			t.Errorf("detection query is missing safety-bound fragment %q", frag)
@@ -95,8 +95,8 @@ func TestReapStaleBackends_QueryReappliesScope(t *testing.T) {
 	for _, frag := range []string{
 		"application_name LIKE 'sluice/%'",
 		"usename = current_user",
-		"pid <> pg_backend_pid()",
-		"pg_terminate_backend(a.pid)",
+		"pid <> pg_catalog.pg_backend_pid()",
+		"pg_catalog.pg_terminate_backend(a.pid)",
 		"a.pid = ANY ($1)",
 	} {
 		if !strings.Contains(reapStaleBackendsQuery, frag) {
@@ -110,8 +110,8 @@ func TestReapStaleBackends_QueryReappliesScope(t *testing.T) {
 	// safety predicates. Assert the terminate appears before the WHERE and
 	// the scope lives inside the WHERE.
 	whereIdx := strings.Index(reapStaleBackendsQuery, "WHERE")
-	termIdx := strings.Index(reapStaleBackendsQuery, "pg_terminate_backend(a.pid)")
-	scopeIdx := strings.Index(reapStaleBackendsQuery, "pid <> pg_backend_pid()")
+	termIdx := strings.Index(reapStaleBackendsQuery, "pg_catalog.pg_terminate_backend(a.pid)")
+	scopeIdx := strings.Index(reapStaleBackendsQuery, "pid <> pg_catalog.pg_backend_pid()")
 	if termIdx < 0 || whereIdx < 0 || termIdx > whereIdx {
 		t.Errorf("pg_terminate_backend must be in the SELECT projection, before WHERE (term@%d, where@%d)", termIdx, whereIdx)
 	}

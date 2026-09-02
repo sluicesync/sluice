@@ -1123,7 +1123,7 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	qualified := quoteIdent(w.schema) + "." + quoteIdent(table.Name)
 
 	// Step 1: read MAX(<col>). NULL on empty table.
-	maxQuery := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(column), qualified)
+	maxQuery := fmt.Sprintf("SELECT pg_catalog.MAX(%s) FROM %s", quoteIdent(column), qualified)
 	var maxVal sql.NullInt64
 	if err := w.db.QueryRowContext(ctx, maxQuery).Scan(&maxVal); err != nil {
 		return fmt.Errorf("read max: %w", err)

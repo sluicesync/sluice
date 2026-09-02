@@ -72,7 +72,7 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			id        BIGSERIAL    PRIMARY KEY,
-			ts        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			ts        TIMESTAMPTZ  NOT NULL DEFAULT pg_catalog.NOW(),
 			stream_id TEXT         NOT NULL
 		)`
 	if _, err := r.db.ExecContext(ctx, ddl); err != nil {
@@ -146,7 +146,7 @@ func (r *SchemaReader) PruneHeartbeat(ctx context.Context, tableName string, old
 	// this path so there's no injection surface. Avoids pgx's bind-type
 	// inference resolving the parameter to `text` when concatenated with
 	// 'seconds' (the prior shape that tripped the v0.81 CI gate).
-	q := fmt.Sprintf("DELETE FROM %s WHERE ts < NOW() - INTERVAL '%d seconds'", tableRef, seconds)
+	q := fmt.Sprintf("DELETE FROM %s WHERE ts < pg_catalog.NOW() - INTERVAL '%d seconds'", tableRef, seconds)
 	res, err := r.db.ExecContext(ctx, q)
 	if err != nil {
 		if isPGPermissionDenied(err) {

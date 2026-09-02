@@ -139,8 +139,8 @@ func TestTranslateExprForPG_Bug20(t *testing.T) {
 		{"LOWER literal", "LOWER('ABC')", "LOWER('ABC'::text)"},
 		{"lower literal lowercase", "lower('abc')", "LOWER('abc'::text)"},
 		{"UPPER literal", "UPPER('xy')", "UPPER('xy'::text)"},
-		{"LCASE literal → LOWER+cast", "LCASE('AbC')", "LOWER('AbC'::text)"},
-		{"UCASE literal → UPPER+cast", "UCASE('AbC')", "UPPER('AbC'::text)"},
+		{"LCASE literal → LOWER+cast", "LCASE('AbC')", "pg_catalog.LOWER('AbC'::text)"},
+		{"UCASE literal → UPPER+cast", "UCASE('AbC')", "pg_catalog.UPPER('AbC'::text)"},
 		{"literal with embedded quote", "LOWER('O''Hara')", "LOWER('O''Hara'::text)"},
 		// Out of scope — must pass through verbatim (no spurious cast):
 		{"column ref untouched", "LOWER(name)", "LOWER(name)"},
@@ -705,7 +705,7 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		{
 			name: "FROM_UNIXTIME single-arg renames to TO_TIMESTAMP",
 			in:   "FROM_UNIXTIME(epoch_col)",
-			want: "TO_TIMESTAMP(epoch_col)",
+			want: "pg_catalog.TO_TIMESTAMP(epoch_col)",
 		},
 		{
 			name: "FROM_UNIXTIME with format arg falls through verbatim",
@@ -715,14 +715,14 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		{
 			name: "FROM_UNIXTIME composes with UNIX_TIMESTAMP",
 			in:   "FROM_UNIXTIME(UNIX_TIMESTAMP(now()))",
-			want: "TO_TIMESTAMP(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint)",
+			want: "pg_catalog.TO_TIMESTAMP(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint)",
 		},
 
 		// ---- ROUND default-scale strip (Bug 252) ----
 		{
 			name: "ROUND's materialized zero scale is stripped — MySQL's catalog adds it, PG's two-arg round is numeric-only",
 			in:   "round(price,0) >= 0",
-			want: "ROUND(price) >= 0",
+			want: "pg_catalog.ROUND(price) >= 0",
 		},
 		{
 			name: "a NON-zero ROUND scale is meaning and passes through",
@@ -737,14 +737,14 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		{
 			name: "ROUND zero-scale strip recurses through a nested call",
 			in:   "round(abs(delta), 0) <= 100",
-			want: "ROUND(abs(delta)) <= 100",
+			want: "pg_catalog.ROUND(abs(delta)) <= 100",
 		},
 
 		// ---- LOG natural-vs-base-10 (the measured SILENT cell) ----
 		{
 			name: "single-arg LOG (MySQL natural log) renames to LN — PG's log() is base-10",
 			in:   "log(c + 1) >= 0",
-			want: "LN(c + 1) >= 0",
+			want: "pg_catalog.LN(c + 1) >= 0",
 		},
 		{
 			name: "two-arg LOG passes through — identical semantics where PG's numeric overload accepts it",
@@ -766,17 +766,17 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		{
 			name: "CHAR_LENGTH renames to LENGTH",
 			in:   "CHAR_LENGTH(name)",
-			want: "LENGTH(name)",
+			want: "pg_catalog.LENGTH(name)",
 		},
 		{
 			name: "CHARACTER_LENGTH renames to LENGTH",
 			in:   "CHARACTER_LENGTH(name)",
-			want: "LENGTH(name)",
+			want: "pg_catalog.LENGTH(name)",
 		},
 		{
 			name: "CHAR_LENGTH inside a CHECK comparison",
 			in:   "CHAR_LENGTH(slug) >= 3",
-			want: "LENGTH(slug) >= 3",
+			want: "pg_catalog.LENGTH(slug) >= 3",
 		},
 		{
 			name: "MySQL LENGTH (byte length) is left alone — different semantics",
@@ -788,44 +788,44 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		{
 			name: "LCASE renames to LOWER",
 			in:   "LCASE(email)",
-			want: "LOWER(email)",
+			want: "pg_catalog.LOWER(email)",
 		},
 		{
 			name: "UCASE renames to UPPER",
 			in:   "UCASE(code)",
-			want: "UPPER(code)",
+			want: "pg_catalog.UPPER(code)",
 		},
 		{
 			name: "lowercase lcase",
 			in:   "lcase(email)",
-			want: "LOWER(email)",
+			want: "pg_catalog.LOWER(email)",
 		},
 		{
 			name: "case-folding in a CHECK constraint shape",
 			in:   "LCASE(name) = name",
-			want: "LOWER(name) = name",
+			want: "pg_catalog.LOWER(name) = name",
 		},
 
 		// ---- SUBSTR / MID ----
 		{
 			name: "SUBSTR three-arg renames to SUBSTRING",
 			in:   "SUBSTR(name, 1, 5)",
-			want: "SUBSTRING(name, 1, 5)",
+			want: "pg_catalog.SUBSTRING(name, 1, 5)",
 		},
 		{
 			name: "SUBSTR two-arg also rewrites",
 			in:   "SUBSTR(name, 2)",
-			want: "SUBSTRING(name, 2)",
+			want: "pg_catalog.SUBSTRING(name, 2)",
 		},
 		{
 			name: "MID three-arg renames to SUBSTRING",
 			in:   "MID(name, 1, 5)",
-			want: "SUBSTRING(name, 1, 5)",
+			want: "pg_catalog.SUBSTRING(name, 1, 5)",
 		},
 		{
 			name: "SUBSTR inside CONCAT composes with the CONCAT rewrite",
 			in:   "CONCAT(SUBSTR(first_name, 1, 1), '. ', last_name)",
-			want: "(SUBSTRING(first_name, 1, 1) || '. ' || last_name)",
+			want: "(pg_catalog.SUBSTRING(first_name, 1, 1) || '. ' || last_name)",
 		},
 		{
 			name: "SUBSTR with single arg falls through (PG SUBSTRING needs 2+)",
@@ -874,12 +874,12 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "RAND() argless to RANDOM()",
 			in:   "RAND()",
-			want: "RANDOM()",
+			want: "pg_catalog.RANDOM()",
 		},
 		{
 			name: "lowercase rand() also rewrites",
 			in:   "rand()",
-			want: "RANDOM()",
+			want: "pg_catalog.RANDOM()",
 		},
 		{
 			name: "RAND with seed arg falls through verbatim",
@@ -925,7 +925,7 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "REGEXP_REPLACE 3-arg adds 'g' flag",
 			in:   "REGEXP_REPLACE(name, '[0-9]+', '#')",
-			want: "REGEXP_REPLACE(name, '[0-9]+', '#', 'g')",
+			want: "pg_catalog.REGEXP_REPLACE(name, '[0-9]+', '#', 'g')",
 		},
 		{
 			name: "REGEXP_REPLACE 4-arg falls through (different MySQL semantic)",
@@ -937,7 +937,7 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "INSTR renames to STRPOS",
 			in:   "INSTR(name, 'foo')",
-			want: "STRPOS(name, 'foo')",
+			want: "pg_catalog.STRPOS(name, 'foo')",
 		},
 		{
 			name: "INSTR with 3 args falls through",
@@ -949,7 +949,7 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "LOCATE swaps args to STRPOS form",
 			in:   "LOCATE('foo', name)",
-			want: "STRPOS(name, 'foo')",
+			want: "pg_catalog.STRPOS(name, 'foo')",
 		},
 		{
 			name: "LOCATE 3-arg form (with start position) falls through",
@@ -959,7 +959,7 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "LOCATE used in a CHECK comparison",
 			in:   "LOCATE('@', email) > 0",
-			want: "STRPOS(email, '@') > 0",
+			want: "pg_catalog.STRPOS(email, '@') > 0",
 		},
 
 		// ---- Composition cases ----
@@ -971,7 +971,7 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "INSTR inside CHAR_LENGTH composes both rules",
 			in:   "CHAR_LENGTH(name) - INSTR(name, '_')",
-			want: "LENGTH(name) - STRPOS(name, '_')",
+			want: "pg_catalog.LENGTH(name) - pg_catalog.STRPOS(name, '_')",
 		},
 
 		// ---- Passthrough / negative cases ----
@@ -1151,59 +1151,59 @@ func TestTranslateExprForPG_DateFormat(t *testing.T) {
 		{
 			name: "ISO date %Y-%m-%d",
 			in:   "DATE_FORMAT(created_at, '%Y-%m-%d')",
-			want: "TO_CHAR(created_at, 'YYYY-MM-DD')",
+			want: "pg_catalog.TO_CHAR(created_at, 'YYYY-MM-DD')",
 		},
 		{
 			name: "ISO datetime %Y-%m-%d %H:%i:%s",
 			in:   "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')",
-			want: "TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS')",
+			want: "pg_catalog.TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS')",
 		},
 		{
 			name: "Time only %H:%i:%s",
 			in:   "DATE_FORMAT(t, '%H:%i:%s')",
-			want: "TO_CHAR(t, 'HH24:MI:SS')",
+			want: "pg_catalog.TO_CHAR(t, 'HH24:MI:SS')",
 		},
 		{
 			name: "12-hour with AM/PM %h:%i %p",
 			in:   "DATE_FORMAT(t, '%h:%i %p')",
-			want: "TO_CHAR(t, 'HH12:MI AM')",
+			want: "pg_catalog.TO_CHAR(t, 'HH12:MI AM')",
 		},
 		{
 			name: "Month name %M %d, %Y",
 			in:   "DATE_FORMAT(d, '%M %d, %Y')",
-			want: "TO_CHAR(d, 'Month DD, YYYY')",
+			want: "pg_catalog.TO_CHAR(d, 'Month DD, YYYY')",
 		},
 		{
 			name: "Day name %W, %M %d",
 			in:   "DATE_FORMAT(d, '%W, %M %d')",
-			want: "TO_CHAR(d, 'Day, Month DD')",
+			want: "pg_catalog.TO_CHAR(d, 'Day, Month DD')",
 		},
 		{
 			name: "Compound %T",
 			in:   "DATE_FORMAT(t, '%T')",
-			want: "TO_CHAR(t, 'HH24:MI:SS')",
+			want: "pg_catalog.TO_CHAR(t, 'HH24:MI:SS')",
 		},
 		{
 			name: "lowercase date_format",
 			in:   "date_format(d, '%Y-%m-%d')",
-			want: "TO_CHAR(d, 'YYYY-MM-DD')",
+			want: "pg_catalog.TO_CHAR(d, 'YYYY-MM-DD')",
 		},
 
 		// ---- Literal-text wrapping ----
 		{
 			name: "year suffix _year wraps in double quotes",
 			in:   "DATE_FORMAT(d, '%Y_year')",
-			want: "TO_CHAR(d, 'YYYY_\"year\"')",
+			want: "pg_catalog.TO_CHAR(d, 'YYYY_\"year\"')",
 		},
 		{
 			name: "literal Z timezone marker wraps",
 			in:   "DATE_FORMAT(d, '%Y-%m-%dT%H:%i:%sZ')",
-			want: "TO_CHAR(d, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+			want: "pg_catalog.TO_CHAR(d, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
 		},
 		{
 			name: "%% literal percent",
 			in:   "DATE_FORMAT(d, '%Y%%')",
-			want: "TO_CHAR(d, 'YYYY%')",
+			want: "pg_catalog.TO_CHAR(d, 'YYYY%')",
 		},
 
 		// ---- Fall-through cases ----
@@ -1242,12 +1242,12 @@ func TestTranslateExprForPG_DateFormat(t *testing.T) {
 		{
 			name: "DATE_FORMAT inside CONCAT composes",
 			in:   "CONCAT('day:', DATE_FORMAT(d, '%Y-%m-%d'))",
-			want: "('day:' || TO_CHAR(d, 'YYYY-MM-DD'))",
+			want: "('day:' || pg_catalog.TO_CHAR(d, 'YYYY-MM-DD'))",
 		},
 		{
 			name: "DATE_FORMAT of NOW() composes with NOW family rewrite",
 			in:   "DATE_FORMAT(NOW(), '%Y-%m-%d')",
-			want: "TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM-DD')",
+			want: "pg_catalog.TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM-DD')",
 		},
 
 		// ---- Passthrough / negative ----
@@ -1443,17 +1443,17 @@ func TestTranslateExprForPG_V35Catalog(t *testing.T) {
 		{
 			name: "DAYNAME to TO_CHAR FMDay",
 			in:   "DAYNAME(created_at)",
-			want: "TO_CHAR(created_at, 'FMDay')",
+			want: "pg_catalog.TO_CHAR(created_at, 'FMDay')",
 		},
 		{
 			name: "MONTHNAME to TO_CHAR FMMonth",
 			in:   "MONTHNAME(created_at)",
-			want: "TO_CHAR(created_at, 'FMMonth')",
+			want: "pg_catalog.TO_CHAR(created_at, 'FMMonth')",
 		},
 		{
 			name: "lowercase dayname also rewrites",
 			in:   "dayname(d)",
-			want: "TO_CHAR(d, 'FMDay')",
+			want: "pg_catalog.TO_CHAR(d, 'FMDay')",
 		},
 		{
 			name: "DAYNAME with no args falls through",
@@ -1611,17 +1611,17 @@ func TestTranslateExprForPG_V37Catalog(t *testing.T) {
 		{
 			name: "TIMESTAMPDIFF YEAR uses AGE",
 			in:   "TIMESTAMPDIFF(YEAR, a, b)",
-			want: "EXTRACT(YEAR FROM AGE(b, a))::int",
+			want: "EXTRACT(YEAR FROM pg_catalog.AGE(b, a))::int",
 		},
 		{
 			name: "TIMESTAMPDIFF MONTH uses AGE year*12 + month",
 			in:   "TIMESTAMPDIFF(MONTH, a, b)",
-			want: "(EXTRACT(YEAR FROM AGE(b, a)) * 12 + EXTRACT(MONTH FROM AGE(b, a)))::int",
+			want: "(EXTRACT(YEAR FROM pg_catalog.AGE(b, a)) * 12 + EXTRACT(MONTH FROM pg_catalog.AGE(b, a)))::int",
 		},
 		{
 			name: "TIMESTAMPDIFF QUARTER divides the MONTH formula by 3",
 			in:   "TIMESTAMPDIFF(QUARTER, a, b)",
-			want: "((EXTRACT(YEAR FROM AGE(b, a)) * 12 + EXTRACT(MONTH FROM AGE(b, a))) / 3)::int",
+			want: "((EXTRACT(YEAR FROM pg_catalog.AGE(b, a)) * 12 + EXTRACT(MONTH FROM pg_catalog.AGE(b, a))) / 3)::int",
 		},
 
 		// ---- TIMESTAMPDIFF — case + fall-through paths ----
@@ -1645,17 +1645,17 @@ func TestTranslateExprForPG_V37Catalog(t *testing.T) {
 		{
 			name: "JSON_OBJECT single pair",
 			in:   "JSON_OBJECT('k', v)",
-			want: "JSON_BUILD_OBJECT('k', v)",
+			want: "pg_catalog.JSON_BUILD_OBJECT('k', v)",
 		},
 		{
 			name: "JSON_OBJECT multiple pairs",
 			in:   "JSON_OBJECT('name', name, 'email', email)",
-			want: "JSON_BUILD_OBJECT('name', name, 'email', email)",
+			want: "pg_catalog.JSON_BUILD_OBJECT('name', name, 'email', email)",
 		},
 		{
 			name: "lowercase json_object rewrites",
 			in:   "json_object('k', v)",
-			want: "JSON_BUILD_OBJECT('k', v)",
+			want: "pg_catalog.JSON_BUILD_OBJECT('k', v)",
 		},
 		{
 			name: "JSON_OBJECT empty (no args) falls through",
@@ -1667,39 +1667,39 @@ func TestTranslateExprForPG_V37Catalog(t *testing.T) {
 		{
 			name: "JSON_ARRAY scalar list",
 			in:   "JSON_ARRAY(1, 2, 3)",
-			want: "JSON_BUILD_ARRAY(1, 2, 3)",
+			want: "pg_catalog.JSON_BUILD_ARRAY(1, 2, 3)",
 		},
 		{
 			name: "JSON_ARRAY with strings + idents",
 			in:   "JSON_ARRAY('a', col, 42)",
-			want: "JSON_BUILD_ARRAY('a', col, 42)",
+			want: "pg_catalog.JSON_BUILD_ARRAY('a', col, 42)",
 		},
 		{
 			name: "lowercase json_array rewrites",
 			in:   "json_array(1, 2)",
-			want: "JSON_BUILD_ARRAY(1, 2)",
+			want: "pg_catalog.JSON_BUILD_ARRAY(1, 2)",
 		},
 		{
 			name: "JSON_ARRAY empty (no args)",
 			in:   "JSON_ARRAY()",
-			want: "JSON_BUILD_ARRAY()",
+			want: "pg_catalog.JSON_BUILD_ARRAY()",
 		},
 
 		// ---- LAST_DAY ----
 		{
 			name: "LAST_DAY of bare column",
 			in:   "LAST_DAY(d)",
-			want: "(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+			want: "(pg_catalog.DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
 		},
 		{
 			name: "LAST_DAY of literal date",
 			in:   "LAST_DAY('2026-05-01')",
-			want: "(DATE_TRUNC('month', '2026-05-01') + INTERVAL '1 month' - INTERVAL '1 day')::date",
+			want: "(pg_catalog.DATE_TRUNC('month', '2026-05-01') + INTERVAL '1 month' - INTERVAL '1 day')::date",
 		},
 		{
 			name: "lowercase last_day rewrites",
 			in:   "last_day(d)",
-			want: "(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+			want: "(pg_catalog.DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
 		},
 		{
 			name: "LAST_DAY with no args falls through",
@@ -1718,20 +1718,20 @@ func TestTranslateExprForPG_V37Catalog(t *testing.T) {
 			// AGE-based MONTH formula doesn't trip the bool-idiom pass.
 			name: "TIMESTAMPDIFF inside CHECK >= comparison",
 			in:   "TIMESTAMPDIFF(YEAR, birth_date, NOW()) >= 18",
-			want: "EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, birth_date))::int >= 18",
+			want: "EXTRACT(YEAR FROM pg_catalog.AGE(CURRENT_TIMESTAMP, birth_date))::int >= 18",
 		},
 		{
 			// JSON_OBJECT inside a generated-column body composes with
 			// COALESCE → COALESCE.
 			name: "JSON_OBJECT inside COALESCE",
 			in:   "COALESCE(JSON_OBJECT('k', v), '{}')",
-			want: "COALESCE(JSON_BUILD_OBJECT('k', v), '{}')",
+			want: "COALESCE(pg_catalog.JSON_BUILD_OBJECT('k', v), '{}')",
 		},
 		{
 			// LAST_DAY inside a CHECK comparison.
 			name: "LAST_DAY inside CHECK = comparison",
 			in:   "due_date = LAST_DAY(created_at)",
-			want: "due_date = (DATE_TRUNC('month', created_at) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+			want: "due_date = (pg_catalog.DATE_TRUNC('month', created_at) + INTERVAL '1 month' - INTERVAL '1 day')::date",
 		},
 	}
 	for _, c := range cases {

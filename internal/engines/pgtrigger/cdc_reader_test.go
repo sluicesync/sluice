@@ -75,16 +75,16 @@ func TestPollQuery_BoundsTheWindowByTheSettledCeiling(t *testing.T) {
 // TestAnchorQuery_ComparesInXID8Domain is the anchor-side twin of
 // TestPollQuery_ComparesInXID8Domain: with row xmin on the left, the
 // `>=` arm never matches post-epoch-1, COALESCE falls through to
-// MAX(id), and the Bug-94 too-high-anchor cold-start gap resurfaces.
+// pg_catalog.MAX(id), and the Bug-94 too-high-anchor cold-start gap resurfaces.
 func TestAnchorQuery_ComparesInXID8Domain(t *testing.T) {
 	q := anchorQuery(`"public"."sluice_change_log"`)
-	if !strings.Contains(q, "txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint") {
+	if !strings.Contains(q, "txid >= pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint") {
 		t.Errorf("anchor query lost the xid8-domain in-flight arm:\n%s", q)
 	}
 	if strings.Contains(q, "xmin::text") {
 		t.Errorf("anchor query compares the 32-bit row xmin against a 64-bit xid8 — the epoch-wrap Bug-94 regression:\n%s", q)
 	}
-	if !strings.Contains(q, "MIN(id) - 1") || !strings.Contains(q, "COALESCE(MAX(id), 0)") {
+	if !strings.Contains(q, "pg_catalog.MIN(id) - 1") || !strings.Contains(q, "COALESCE(pg_catalog.MAX(id), 0)") {
 		t.Errorf("anchor query lost the (first-unsettled − 1, else MAX) shape:\n%s", q)
 	}
 }

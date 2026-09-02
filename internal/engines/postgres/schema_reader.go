@@ -1071,7 +1071,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			c.ordinal_position,
 			c.column_default,
 			c.is_nullable,
-			LOWER(c.data_type),
+			pg_catalog.LOWER(c.data_type),
 			c.udt_name,
 			c.character_maximum_length,
 			c.numeric_precision,

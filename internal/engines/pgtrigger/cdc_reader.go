@@ -293,7 +293,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// emits only changes captured AFTER this call.
 		startID, err = readChangeLogMaxID(ctx, r.db, r.schema)
 		if err != nil {
-			return nil, fmt.Errorf("pgtrigger: stream: read MAX(id) start anchor: %w", err)
+			return nil, fmt.Errorf("pgtrigger: stream: read pg_catalog.MAX(id) start anchor: %w", err)
 		}
 	}
 
@@ -884,7 +884,7 @@ SELECT EXISTS (
 func readChangeLogMaxID(ctx context.Context, db *sql.DB, schema string) (int64, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
 	var id sql.NullInt64
-	if err := db.QueryRowContext(ctx, "SELECT MAX(id) FROM "+tableRef).Scan(&id); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT pg_catalog.MAX(id) FROM "+tableRef).Scan(&id); err != nil {
 		return 0, err
 	}
 	if !id.Valid {

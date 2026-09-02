@@ -207,7 +207,7 @@ func (x *BackfillExecutor) CountRemaining(ctx context.Context, table *ir.Table, 
 	if table == nil {
 		return 0, errors.New("postgres: CountRemaining: table is nil")
 	}
-	query := "SELECT COUNT(*) FROM " + x.tableRef(table)
+	query := "SELECT pg_catalog.COUNT(*) FROM " + x.tableRef(table)
 	if where != "" {
 		query += " WHERE (" + where + ")"
 	}

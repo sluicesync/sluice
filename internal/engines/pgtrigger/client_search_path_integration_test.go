@@ -83,6 +83,15 @@ GRANT CREATE ON SCHEMA public TO lowpriv;
 		`CREATE FUNCTION public.format(text, name) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED format(text,name)'; END $$`,
 		`CREATE FUNCTION public.format(text, text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED format(text,text)'; END $$`,
 		`CREATE FUNCTION public.count(name) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED count(name)'; END $$`,
+		// The two the pre-tag VF review of v0.137.4 hijacked live through
+		// UPPERCASE spellings the first gate did not grade: the schema
+		// reader's `LOWER(c.data_type)` (information_schema's data_type is a
+		// domain over varchar, so an exact varchar overload beats
+		// pg_catalog.lower(text)) and the verifier's `CONCAT_WS(...)`.
+		`CREATE FUNCTION public.lower(character varying) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED lower(varchar)'; END $$`,
+		`CREATE FUNCTION public.lower(name) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED lower(name)'; END $$`,
+		`CREATE FUNCTION public.concat_ws(text, text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED concat_ws(text,text)'; END $$`,
+		`CREATE FUNCTION public.concat_ws(text, text, text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'HIJACKED concat_ws(text,text,text)'; END $$`,
 	}
 	for _, d := range decoys {
 		if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv", d); err != nil {

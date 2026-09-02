@@ -59,7 +59,7 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 		return nil, nil, err
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table.Name)
-	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
+	q := fmt.Sprintf("SELECT pg_catalog.MIN(%s), pg_catalog.MAX(%s) FROM %s",
 		quoteIdent(pkColumn), quoteIdent(pkColumn), tableRef)
 
 	rows, qerr := r.q.QueryContext(ctx, q) //nolint:rowserrcheck,sqlclosecheck // both handled below; linters don't follow this scope
@@ -444,8 +444,8 @@ func (r *RowReader) sampleKeysetOn(ctx context.Context, q querier, table *ir.Tab
 	stmt := fmt.Sprintf(`
 		SELECT %s FROM (
 			SELECT %s,
-			       ROW_NUMBER() OVER (ORDER BY %s) AS rn,
-			       COUNT(*)     OVER ()            AS total
+			       pg_catalog.ROW_NUMBER() OVER (ORDER BY %s) AS rn,
+			       pg_catalog.COUNT(*)     OVER ()            AS total
 			FROM %s
 		) s
 		WHERE rn IN (%s)
@@ -504,10 +504,10 @@ func (r *RowReader) exactCountOn(ctx context.Context, q querier, table *ir.Table
 	if err != nil {
 		return 0, err
 	}
-	stmt := `SELECT COUNT(*) FROM ` + quoteIdent(schema) + `.` + quoteIdent(table.Name)
+	stmt := `SELECT pg_catalog.COUNT(*) FROM ` + quoteIdent(schema) + `.` + quoteIdent(table.Name)
 	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
-		return 0, fmt.Errorf("postgres: CountRows exact COUNT(*): %w", err)
+		return 0, fmt.Errorf("postgres: CountRows exact pg_catalog.COUNT(*): %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
