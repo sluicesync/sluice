@@ -199,12 +199,57 @@ func checkExprsEquivalent(observed, recorded string) bool {
 // matched outer parens until neither side has further wrapping.
 // Used by checkExprsEquivalent.
 func normalizeCheckExprForCompare(s string) string {
-	out := strings.Join(strings.Fields(s), " ")
+	out := strings.Join(strings.Fields(stripPGCatalogQualifiers(s)), " ")
 	for len(out) >= 2 && out[0] == '(' && out[len(out)-1] == ')' &&
 		isMatchedOuterParens(out) {
 		out = strings.TrimSpace(out[1 : len(out)-1])
 	}
 	return out
+}
+
+// stripPGCatalogQualifiers drops every `pg_catalog.` schema qualifier
+// outside single-quoted literals. sluice's emitter writes
+// `pg_catalog.lower(x)` (v0.137.4, SEC-CRIT-1); PostgreSQL binds the OID at
+// CREATE and renders the constraint back bare, so a recorded expression
+// and its observed rendering differ only by the qualifier. The sibling of
+// the fold in internal/ir/diff's canonicalCheckExpr — the sweep for that
+// fix reached both comparers. Only `pg_catalog` is dropped: another
+// schema's function is a different function and must keep differing.
+func stripPGCatalogQualifiers(s string) string {
+	const q = "pg_catalog."
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '\'' {
+			end := i + 1
+			for end < len(s) {
+				if s[end] == '\'' {
+					if end+1 < len(s) && s[end+1] == '\'' {
+						end += 2
+						continue
+					}
+					end++
+					break
+				}
+				end++
+			}
+			sb.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		if len(s)-i >= len(q) && strings.EqualFold(s[i:i+len(q)], q) &&
+			(i == 0 || !(s[i-1] == '_' || s[i-1] == '.' || isIdentRune(rune(s[i-1])))) {
+			i += len(q)
+			continue
+		}
+		sb.WriteByte(s[i])
+		i++
+	}
+	return sb.String()
+}
+
+func isIdentRune(r rune) bool {
+	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
 // isMatchedOuterParens reports whether the first and last paren of

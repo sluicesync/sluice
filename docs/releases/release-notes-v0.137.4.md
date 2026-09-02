@@ -30,7 +30,7 @@ The connection-level `search_path = pg_catalog, pg_temp` pin that would make the
 
 ## Compatibility
 
-Drop-in from v0.137.3. No schema, format, flag, or database-side change. Translated MySQL defaults and CHECK expressions landing on a Postgres target now read `pg_catalog.md5(...)`, `pg_catalog.to_hex(...)`, `pg_catalog.array_position(...)`, `pg_catalog.encode(digest(...), 'hex')` and `pg_catalog.gen_random_uuid()`, which is semantically identical on PostgreSQL 13 and later (sluice's documented floor is 15).
+Drop-in from v0.137.3. No schema, format, flag, or database-side change. Translated MySQL defaults and CHECK expressions landing on a Postgres target now carry the qualifier — `pg_catalog.md5(...)`, `pg_catalog.LOWER(...)`, `pg_catalog.gen_random_uuid()` and so on — which is semantically identical on PostgreSQL 13 and later (sluice's documented floor is 15). PostgreSQL renders such a constraint or default back bare, so `schema diff` (CHECKs and defaults) and the shard-consolidation modify-check probe now treat `pg_catalog.f(...)` and `f(...)` as the same expression. The release's own CI caught the first cut reporting six phantom CHECK mismatches on a target a migrate had just created; all three comparers now carry the fold, pinned in both directions — a CHECK or default rebound to `public.lower(...)` still reports as drift.
 
 ## Install
 

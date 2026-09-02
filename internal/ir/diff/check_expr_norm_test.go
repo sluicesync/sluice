@@ -37,6 +37,21 @@ func TestCanonicalCheckExpr_MeasuredEmittedPairs(t *testing.T) {
 			`(flags <@ '{}'::text[])`,
 		},
 		{
+			// v0.137.4 (SEC-CRIT-1): the emitter qualifies every built-in
+			// as pg_catalog.<fn>; PG binds the OID at CREATE and renders
+			// the constraint back bare and lowercased. Measured on CI: the
+			// unfolded pair reported 6 phantom CHECK mismatches on a target
+			// migrate had just created.
+			"postgres pg_catalog-qualified built-in reads back bare",
+			`pg_catalog.LOWER("email") = "email"`,
+			`(lower(email) = email)`,
+		},
+		{
+			"postgres pg_catalog-qualified nested built-ins read back bare",
+			`pg_catalog.LENGTH(pg_catalog.LOWER("slug")) >= 3`,
+			`(length(lower(slug)) >= 3)`,
+		},
+		{
 			// PG rewrites IN (...) into = ANY (ARRAY[...]) on the way in
 			// and never renders it back. This is the one pair that needs
 			// a structural rewrite rather than token folding.
@@ -198,6 +213,11 @@ func TestCanonicalCheckExpr_TamperIsStillVisible(t *testing.T) {
 		{"a range bound widened", honestRange, "((pct >= 0) and (pct <= 200))"},
 		{"a range bound's operator loosened", honestRange, "((pct >= 0) and (pct < 100))"},
 		{"the conjunction turned into a disjunction", honestRange, "((pct >= 0) or (pct <= 100))"},
+		// The pg_catalog fold must not fold ANOTHER schema's function: a
+		// CHECK rebound to public.lower(...) is a different function (the
+		// SEC-CRIT-1 decoy shape) and stays visible as drift.
+		{"a built-in rebound to a public-schema function", "(lower(email) = email)", "(public.lower(email) = email)"},
+		{"a pg_catalog spelling inside a literal is a value, not a qualifier", "(note = 'x')", "(note = 'pg_catalog.x')"},
 		{"a bound dropped entirely", honestRange, "(pct >= 0)"},
 		{
 			"a regex anchor removed",

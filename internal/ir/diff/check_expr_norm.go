@@ -110,6 +110,34 @@ func canonicalCheckExpr(expr string) string {
 	return stripGrouping(folded)
 }
 
+// stripPGCatalogQualifier drops every `pg_catalog.` schema qualifier
+// outside single-quoted literals, any letter case. It is the fold
+// [foldServerRenderings] applies inline for CHECK expressions, exposed for
+// the DEFAULT comparer, which is a plain string-shape pass and cannot use
+// the token folds. Only `pg_catalog` is dropped: another schema's function
+// is a different function and must keep differing; a `pg_catalog.` inside
+// a literal is a value and is kept.
+func stripPGCatalogQualifier(s string) string {
+	const q = "pg_catalog."
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '\'' {
+			end := rawLiteralEnd(s, i)
+			sb.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		if len(s)-i >= len(q) && strings.EqualFold(s[i:i+len(q)], q) && (i == 0 || !isIdentByte(s[i-1])) {
+			i += len(q)
+			continue
+		}
+		sb.WriteByte(s[i])
+		i++
+	}
+	return sb.String()
+}
+
 // foldBetweenSimple rewrites `X BETWEEN A AND B` to `X >= A and X <= B`
 // — PostgreSQL's own DDL-time expansion of the form (DIFF-2, measured
 // 2026-08-14: `v BETWEEN 1 AND 10` reads back from PG as
@@ -386,6 +414,21 @@ func foldServerRenderings(expr string) string {
 		case isIdentByte(c) && (i == 0 || !isIdentByte(expr[i-1])):
 			j := skipIdent(expr, i)
 			switch {
+			case strings.EqualFold(expr[i:j], "pg_catalog") && j < len(expr) && expr[j] == '.':
+				// A `pg_catalog.` schema qualifier on a function is a
+				// resolution instruction, not part of the predicate:
+				// sluice's emitter writes `pg_catalog.lower(x)` (v0.137.4,
+				// SEC-CRIT-1 — an unqualified built-in resolves by best type
+				// match across the session's search_path, so an exact-typed
+				// overload planted in `public` wins), PostgreSQL binds the
+				// function OID at CREATE and renders it back BARE, because
+				// pg_catalog is always visible. Dropping the qualifier makes
+				// the two renderings of one predicate compare equal. Only
+				// `pg_catalog` folds: `public.lower(x)` names a DIFFERENT
+				// function and stays verbatim (spurious difference, never a
+				// spurious match).
+				i = j + 1
+				continue
 			case strings.EqualFold(expr[i:j], "cast"):
 				if inner, next, ok := splitCastCall(expr, j); ok {
 					sb.WriteString("(")

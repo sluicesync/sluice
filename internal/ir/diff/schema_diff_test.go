@@ -558,6 +558,11 @@ func TestSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 		{"CURRENT_TIMESTAMP vs now()", "CURRENT_TIMESTAMP", "now()"},
 		{"current_date vs CURRENT_DATE", "current_date", "CURRENT_DATE"},
 		{"whitespace tolerant", "current_timestamp ( 6 )", "CURRENT_TIMESTAMP(6)"},
+		// v0.137.4 (SEC-CRIT-1): the emitter qualifies built-ins as
+		// pg_catalog.<fn>; PostgreSQL renders the stored default back bare.
+		{"pg_catalog qualifier folds", "pg_catalog.now()", "now()"},
+		{"pg_catalog qualifier folds, any case", "PG_CATALOG.NOW()", "now()"},
+		{"pg_catalog qualifier folds before the equivalence lookup", "pg_catalog.now()", "CURRENT_TIMESTAMP(6)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -578,6 +583,39 @@ func TestSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 			d := Schemas(exp, act, Options{})
 			if d.HasChanges() {
 				t.Errorf("expected no drift for %s vs %s; got %+v", tc.exp, tc.act, d)
+			}
+		})
+	}
+}
+
+// TestSchemas_DefaultQualifierFoldIsPGCatalogOnly is the other direction
+// of the pg_catalog fold: a default rebound to ANOTHER schema's function
+// (the SEC-CRIT-1 decoy shape) and a `pg_catalog.` spelled inside a
+// literal must both still report as drift — the fold may only ever
+// collapse the one qualifier PostgreSQL itself renders away.
+func TestSchemas_DefaultQualifierFoldIsPGCatalogOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		exp  string
+		act  string
+	}{
+		{"another schema's function is a different function", "public.now()", "now()"},
+		{"a pg_catalog spelling inside a literal is a value", "'pg_catalog.x'", "'x'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mk := func(expr string) *ir.Schema {
+				return &ir.Schema{Tables: []*ir.Table{{
+					Name: "t",
+					Columns: []*ir.Column{{
+						Name: "c", Type: ir.Text{},
+						Default: ir.DefaultExpression{Expr: expr},
+					}},
+				}}}
+			}
+			d := Schemas(mk(tc.exp), mk(tc.act), Options{})
+			if !d.HasChanges() {
+				t.Errorf("expected drift for %s vs %s; the fold collapsed something that is not pg_catalog", tc.exp, tc.act)
 			}
 		})
 	}

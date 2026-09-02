@@ -1128,7 +1128,12 @@ func isLiteralOrNone(s string) bool {
 // equal. Keep this a pure string-shape pass; semantic normalization
 // (parsing argument lists, etc.) is deliberately out of scope.
 func normalizeDefaultExpr(s string) string {
-	s = strings.TrimSpace(strings.ToLower(s))
+	// A `pg_catalog.` qualifier is a resolution instruction, not part of
+	// the expression: sluice's emitter writes `pg_catalog.gen_random_uuid()`
+	// (v0.137.4, SEC-CRIT-1) and PostgreSQL renders the stored default back
+	// bare. Same fold as canonicalCheckExpr's, for the same pair; only
+	// pg_catalog folds, and only outside quoted literals.
+	s = stripPGCatalogQualifier(strings.TrimSpace(strings.ToLower(s)))
 	// Collapse internal whitespace runs to single spaces.
 	var sb strings.Builder
 	prevSpace := false

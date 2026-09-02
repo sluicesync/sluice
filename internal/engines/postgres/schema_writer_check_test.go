@@ -115,6 +115,14 @@ func TestCheckExprsEquivalent(t *testing.T) {
 		{"double-outer-parens", "((qty >= 0))", "qty >= 0", true},
 		{"different-expr", "qty > 0", "qty >= 0", false},
 		{"inner-parens-not-stripped", "(qty + 1) >= 0", "qty + 1 >= 0", false}, // (x+1)>=0 != x+1>=0
+		// v0.137.4 (SEC-CRIT-1): the recorded IR Expr carries the
+		// emitter's pg_catalog. qualifier; pg_get_constraintdef renders the
+		// bound built-in bare. The fold is the sibling of the one in
+		// internal/ir/diff's canonicalCheckExpr.
+		{"pg_catalog-qualifier-folds", "(lower(email) = email)", "pg_catalog.lower(email) = email", true},
+		{"pg_catalog-qualifier-folds-any-case", "(lower(email) = email)", "PG_CATALOG.lower(email) = email", true},
+		{"other-schema-stays-different", "(lower(email) = email)", "public.lower(email) = email", false},
+		{"qualifier-inside-literal-is-a-value", "note = 'x'", "note = 'pg_catalog.x'", false},
 	}
 	for _, c := range cases {
 		c := c
