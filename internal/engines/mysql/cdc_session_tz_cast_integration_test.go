@@ -94,12 +94,12 @@ func TestMySQLSessionTZCast_PremiseHoldsOnTheServer(t *testing.T) {
 // session-time_zone refusal rather than emitting the boundary a forward
 // path would act on.
 //
-// The prime-then-swap shape is deliberate and matches the production
-// window: the FIRST boundary for a table has no prior snapshot to compare
-// against (and is the one the pipeline treats as a cache prime / seed
-// no-op), so a harmless ADD COLUMN moves the reader onto a real
-// prev-state first — exactly as the ADR-0091 nullability integration test
-// does.
+// The prime-then-swap shape pins the SECOND boundary a table sees — the
+// reader's own last-emitted snapshot as prev. It used to be described
+// here as "the production window"; it is not (SLM-1, audit 2026-09-01):
+// the first boundary after a start is the one Shape A forwards, and
+// [TestCDCReader_SessionTZCastRefusesAtTheFirstBoundary] below pins that
+// one with no priming at all.
 func TestCDCReader_SessionTZCastRefusesOnALiveStream(t *testing.T) {
 	dsn, cleanup := startMySQLForCDC(t)
 	defer cleanup()
@@ -251,5 +251,103 @@ func TestCDCReader_PrecisionOnlyModifyStillForwards(t *testing.T) {
 	}
 	if !sawPostAlterRow {
 		t.Errorf("post-ALTER row id=3 never arrived (%d changes seen) — the precision-only MODIFY did not forward", len(got))
+	}
+}
+
+// TestCDCReader_SessionTZCastRefusesAtTheFirstBoundary is the SLM-1 pin
+// on the binlog lane: seeded exactly as the streamer seeds it (the
+// SchemaReader's raw IR, handed through SetSchemaSeed before
+// StreamChanges), the zone-sibling swap as the FIRST DDL the stream sees
+// — no priming ADD COLUMN — refuses. Both directions, because the seed
+// side and the boundary side come from two different projections
+// (information_schema through the SchemaReader vs. through the CDC
+// loader) and a mismatch in either would show up on one direction only.
+//
+// The server's default time_zone is +09:00 and the ALTER session sets
+// nothing — the operator shape the audit observed, not a SET.
+func TestCDCReader_SessionTZCastRefusesAtTheFirstBoundary(t *testing.T) {
+	dsn, cleanup := startMySQLM2Preflight(t, "--default-time-zone=+09:00")
+	defer cleanup()
+
+	for _, tc := range []struct{ name, from, to string }{
+		{"DATETIME→TIMESTAMP", "DATETIME", "TIMESTAMP"},
+		{"TIMESTAMP→DATETIME", "TIMESTAMP", "DATETIME"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table := "first_" + strings.ToLower(tc.from)
+			applyMySQL(t, dsn, `
+				DROP TABLE IF EXISTS `+table+`;
+				CREATE TABLE `+table+` (
+					id BIGINT NOT NULL AUTO_INCREMENT,
+					c  `+tc.from+` NOT NULL,
+					PRIMARY KEY (id)
+				) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+				INSERT INTO `+table+` (id, c) VALUES (1, '2020-01-01 21:00:00');
+			`)
+
+			eng := Engine{Flavor: FlavorVanilla}
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+
+			// The seed: the raw source IR, as the streamer captures it.
+			sr, err := eng.OpenSchemaReader(ctx, dsn)
+			if err != nil {
+				t.Fatalf("OpenSchemaReader: %v", err)
+			}
+			schema, err := sr.ReadSchema(ctx)
+			if closer, ok := sr.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+			if err != nil {
+				t.Fatalf("ReadSchema: %v", err)
+			}
+
+			rdr, err := eng.OpenCDCReader(ctx, dsn)
+			if err != nil {
+				t.Fatalf("OpenCDCReader: %v", err)
+			}
+			cdc, ok := rdr.(*CDCReader)
+			if !ok {
+				t.Fatalf("OpenCDCReader returned %T; want *CDCReader", rdr)
+			}
+			cdc.SetSchemaForward(true)
+			cdc.SetSchemaDeltaAppliesToTarget(true)
+			cdc.SetSchemaSeed(schema.Tables)
+			defer func() { _ = cdc.Close() }()
+
+			changes, err := cdc.StreamChanges(ctx, ir.Position{})
+			if err != nil {
+				t.Fatalf("StreamChanges: %v", err)
+			}
+			time.Sleep(200 * time.Millisecond)
+
+			// THE SWAP, first and only DDL, from a session inheriting the
+			// server's +09:00 default.
+			applyMySQL(t, dsn, `
+				ALTER TABLE `+table+` MODIFY c `+tc.to+` NOT NULL;
+				INSERT INTO `+table+` (id, c) VALUES (2, '2020-01-01 21:00:00');
+			`)
+
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				for range changes {
+				}
+			}()
+			select {
+			case <-drained:
+			case <-time.After(60 * time.Second):
+				t.Fatal("stream did not terminate within 60s — the first-boundary swap was forwarded instead of refused (SLM-1)")
+			}
+			streamErr := cdc.Err()
+			if streamErr == nil {
+				t.Fatal("stream ended with no error; the swap at the FIRST boundary must refuse loudly")
+			}
+			for _, want := range []string{"cannot be forwarded", `column "c"`, "TIMESTAMP and DATETIME", "time_zone", "drained model"} {
+				if !strings.Contains(streamErr.Error(), want) {
+					t.Errorf("stream error missing %q; got: %v", want, streamErr)
+				}
+			}
+		})
 	}
 }

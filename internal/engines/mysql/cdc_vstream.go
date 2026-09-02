@@ -241,6 +241,16 @@ type vstreamCDCReader struct {
 	// StreamChanges; read only on the pump goroutine.
 	schemaDeltaAppliesToTarget bool
 
+	// schemaSeedSig is the streamer-supplied prior shape per bare table
+	// name — the prev the session-`time_zone` cast refusal falls back to
+	// for a table this reader has not yet snapshotted (SLM-1; see
+	// [priorShapeFromSeed]). It is keyed by table rather than by
+	// fieldCacheKey's (shard, table) because the seed has no shard: every
+	// shard of a table shares it until that shard's first FIELD lands in
+	// snapshotSig. Set by [vstreamCDCReader.SetSchemaSeed] before
+	// StreamChanges; read only on the pump goroutine.
+	schemaSeedSig map[string]ir.SchemaSignature
+
 	// currentVgtid is the latest position the reader has observed.
 	// VStream emits a VGTID after each transaction; we update this
 	// then promote it to the candidate position emitted alongside
@@ -1732,9 +1742,14 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 	// refusal, VStream sibling of the binlog reader's. Same predicate, same
 	// place in the flow — before the boundary is emitted, so neither the
 	// ADR-0091 intercept nor Shape A's boundary router can act on it.
-	if r.schemaDeltaAppliesToTarget && hadPrev {
-		if col, pair, found := unforwardableSessionTZColumn(prev, tbl); found {
-			return sessionTZCastRefusal(keyspace, table, col, pair)
+	// SLM-1: a table this reader has not yet snapshotted borrows its prev
+	// from the streamer's seed (priorShapeFromSeed), so a DDL that lands
+	// before the table's first FIELD of this process is checked too.
+	if r.schemaDeltaAppliesToTarget {
+		if prior, hadPrior := priorShapeFromSeed(r.snapshotSig, cacheKey, r.schemaSeedSig, table); hadPrior {
+			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
+				return sessionTZCastRefusal(keyspace, table, col, pair)
+			}
 		}
 	}
 

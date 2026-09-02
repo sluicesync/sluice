@@ -361,6 +361,16 @@ func routeForwardBoundary(
 		)
 		return nil
 	}
+	// SLM-1: the session-zone cast door on the single-stream path, the
+	// sibling of the one in [BoundaryRouter.RouteBoundary]. The reader
+	// refuses this class first whenever it has a prior shape; this is the
+	// pipeline's own door for the boundary where it did not. Placed AFTER
+	// the seed guard on purpose: against a seed the shape is already
+	// skipped, and a seed-vs-CDC phantom (an operator's `--type-override`
+	// onto the zone sibling) must not be reported as a swap they never made.
+	if err := refuseSessionZoneSwap(tableName, shape, forwardRecoveryHint(tableName)); err != nil {
+		return err
+	}
 	switch shape.Kind {
 	case ShapeKindNone:
 		// No structural delta (incl. a pure column reorder — sluice

@@ -78,6 +78,94 @@ var (
 	_ schemaDeltaTargetApplySetter = (*vstreamSnapshotChanges)(nil)
 )
 
+// schemaSeedSetter mirrors the pipeline's optional seeding surface
+// (pipeline.schemaSeedSetter), pinned on the same three lanes for the same
+// reason as the arming surface above: the seed is what gives the refusal a
+// prev type at a table's FIRST boundary, and a lane that silently stopped
+// receiving it would be back to the SLM-1 window with nothing failing.
+type schemaSeedSetter interface {
+	SetSchemaSeed(tables []*ir.Table)
+}
+
+var (
+	_ schemaSeedSetter = (*CDCReader)(nil)
+	_ schemaSeedSetter = (*vstreamCDCReader)(nil)
+	_ schemaSeedSetter = (*vstreamSnapshotChanges)(nil)
+)
+
+// SetSchemaSeed hands the binlog reader the shape each in-scope table had
+// when the stream it is about to serve was last known to be consistent —
+// the cold-start source IR, or the retained schema-history version on a
+// warm resume — so the session-`time_zone` cast refusal has a prev type
+// at the table's FIRST DDL boundary of this process (SLM-1, audit
+// 2026-09-01). Before it, the refusal's prev was a memo the boundary
+// emitter alone wrote, so the first boundary per table was never checked
+// — the one Shape A's router forwards unguarded.
+//
+// Keyed exactly as the reader keys its own cache (qualifiedName over the
+// TABLE_MAP database + table); a seed table with no Schema takes the
+// reader's bound database. Column names and IR types are all the refusal
+// consults, so the seed's projection may come from the SchemaReader or
+// from a persisted history row — precision and the SRID sentinel do not
+// enter the zone-sibling predicate. Must be called before [StreamChanges];
+// replaces any earlier seed. Implements pipeline.schemaSeedSetter.
+func (r *CDCReader) SetSchemaSeed(tables []*ir.Table) {
+	r.priorSig = make(map[string]ir.SchemaSignature, len(tables))
+	for _, t := range tables {
+		if t == nil {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = r.schema
+		}
+		r.priorSig[qualifiedName(schema, t.Name)] = ir.SchemaSignatureOf(t)
+	}
+}
+
+// SetSchemaSeed is the VStream standalone lane's member of the seeding
+// surface; see [CDCReader.SetSchemaSeed] for the contract. Keyed by bare
+// table name (see [vstreamCDCReader.schemaSeedSig]). Implements
+// pipeline.schemaSeedSetter.
+func (r *vstreamCDCReader) SetSchemaSeed(tables []*ir.Table) {
+	r.schemaSeedSig = seedSignaturesByTable(tables)
+}
+
+// SetSchemaSeed is the cold-start snapshot stream's CDC-half member of
+// the seeding surface; see [CDCReader.SetSchemaSeed] for the contract.
+// Implements pipeline.schemaSeedSetter.
+func (c *vstreamSnapshotChanges) SetSchemaSeed(tables []*ir.Table) {
+	c.snap.schemaSeedSig = seedSignaturesByTable(tables)
+}
+
+// seedSignaturesByTable fingerprints a seed by bare table name — the key
+// both VStream lanes can resolve from a FIELD event, whose keyspace is the
+// DSN's and whose shard the seed does not know.
+func seedSignaturesByTable(tables []*ir.Table) map[string]ir.SchemaSignature {
+	out := make(map[string]ir.SchemaSignature, len(tables))
+	for _, t := range tables {
+		if t == nil {
+			continue
+		}
+		out[t.Name] = ir.SchemaSignatureOf(t)
+	}
+	return out
+}
+
+// priorShapeFromSeed resolves the refusal's prev for a VStream lane: the
+// lane's own last-emitted signature under its (shard, table) key when it
+// has one, else the streamer's seed under the bare table name. The
+// true-delta emission gate keeps using the lane's own memo alone — a seed
+// must never suppress the first FIELD's history version, only inform the
+// refusal that runs before it.
+func priorShapeFromSeed(emitted map[string]ir.SchemaSignature, cacheKey string, seed map[string]ir.SchemaSignature, table string) (ir.SchemaSignature, bool) {
+	if prev, ok := emitted[cacheKey]; ok {
+		return prev, true
+	}
+	prev, ok := seed[table]
+	return prev, ok
+}
+
 // sessionTZSwapPair reports a MySQL column type change between the
 // zone-aware temporal type and its zone-naive sibling, in either
 // direction, naming the pair for the refusal text. Precision is ignored on
@@ -126,12 +214,20 @@ func sessionTZSwapPair(prev, cur ir.Type) (string, bool) {
 // fires on exactly the boundaries a forward path would act on, and stays
 // silent on the ones it would not.
 //
-// A column absent from prev (ADD COLUMN, or a table the reader has never
-// snapshotted) is skipped — there is no prior type to have swapped away
-// from, and inventing one would be a guess. The reader having no memo for
-// a table is the honest "no prior knowledge" case, the same shape as PG's
-// missing relation-cache entry; it is also the boundary the intercept
-// treats as a cache prime or a seed-guarded no-op rather than an ALTER.
+// A column absent from prev (ADD COLUMN) is skipped — there is no prior
+// type to have swapped away from, and inventing one would be a guess.
+//
+// prev is NOT limited to what this reader has emitted. SLM-1 (audit
+// 2026-09-01) found that "no memo = no prior knowledge" was false in the
+// silent direction: the cold-start seed and the retained history version
+// both KNOW the prior type, and Shape A's router forwards the first
+// boundary it classifies against that very seed. So each lane resolves
+// prev from the seed it was handed (SetSchemaSeed) when its own memo is
+// empty, and the binlog lane additionally keeps the decode cache's last
+// shape across a DDL clear. A table with none of those — never seeded,
+// never decoded, never snapshotted — is the residual honest
+// "no prior knowledge" case, and the intercepts treat that boundary as a
+// cache prime rather than an ALTER.
 func unforwardableSessionTZColumn(prev ir.SchemaSignature, cur *ir.Table) (col, pair string, found bool) {
 	if cur == nil {
 		return "", "", false

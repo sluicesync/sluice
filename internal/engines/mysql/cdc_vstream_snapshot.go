@@ -817,6 +817,14 @@ type vstreamSnapshotStream struct {
 	// contract as snapshotSig above).
 	schemaDeltaAppliesToTarget bool
 
+	// schemaSeedSig is the streamer-supplied prior shape per bare table
+	// name, the refusal's fallback prev for a table this phase has not yet
+	// snapshotted (SLM-1; see [priorShapeFromSeed] and the standalone
+	// reader's field of the same name for the shard-blind caveat). Written
+	// by [vstreamSnapshotChanges.SetSchemaSeed] before the CDC pump starts;
+	// read only on that pump goroutine.
+	schemaSeedSig map[string]ir.SchemaSignature
+
 	// currentVgtid is the latest VGTID observed on the stream. When the
 	// COPY pump reaches the global COPY_COMPLETED, this is the snapshot-
 	// consistent position; during the CDC phase it advances with each
@@ -2617,10 +2625,13 @@ func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *
 	}
 	// SL-2 (audit 2026-08-31): the session-`time_zone` cast refusal, third
 	// and last of this engine's SchemaSnapshot emitters. Same predicate and
-	// same position in the flow as the standalone reader's.
-	if s.schemaDeltaAppliesToTarget && hadPrev {
-		if col, pair, found := unforwardableSessionTZColumn(prev, tbl); found {
-			return sessionTZCastRefusal(keyspace, table, col, pair)
+	// same position in the flow as the standalone reader's, including the
+	// SLM-1 seed fallback for a table not yet snapshotted on this phase.
+	if s.schemaDeltaAppliesToTarget {
+		if prior, hadPrior := priorShapeFromSeed(s.snapshotSig, cacheKey, s.schemaSeedSig, table); hadPrior {
+			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
+				return sessionTZCastRefusal(keyspace, table, col, pair)
+			}
 		}
 	}
 

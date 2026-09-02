@@ -153,6 +153,28 @@ type schemaDeltaTargetApplySetter interface {
 	SetSchemaDeltaAppliesToTarget(enabled bool)
 }
 
+// schemaSeedSetter is the optional CDC-reader-side surface that gives a
+// [schemaDeltaTargetApplySetter] reader a PRIOR shape per in-scope table
+// before its stream starts — the cold-start source IR, or the retained
+// schema-history version on a warm resume ([Streamer.readerSchemaSeed]).
+//
+// It exists because of SLM-1 (audit 2026-09-01): the MySQL lanes' refusal
+// compared a rebuilt table against a memo only their own boundary emitter
+// wrote, so every table's FIRST DDL after a start was never checked — and
+// that is exactly the boundary Shape A's router forwards (its cache is
+// seeded from the cold-start handoff, so the first CDC snapshot is a real
+// boundary to it, not a prime). Observed on a `--default-time-zone=+09:00`
+// source: the first `MODIFY c TIMESTAMP` forwarded and every pre-existing
+// target row read 9 h off at exit 0.
+//
+// Implemented by all three MySQL CDC lanes. Postgres does not implement it
+// and needs no seed: pgoutput sends a RelationMessage on first touch,
+// before any DDL, so its relation cache already holds the prior. Readers
+// that don't implement it silently ignore, which is the old behaviour.
+type schemaSeedSetter interface {
+	SetSchemaSeed(tables []*ir.Table)
+}
+
 // targetSchemaSetter is the optional applier-side surface for
 // engines that record the operator-supplied `--target-schema NAME`
 // on the per-target control table (Bug 46, ADR-0031). PG implements;
@@ -1470,6 +1492,17 @@ type Streamer struct {
 	// the applier's target schema is the same as when cold-start
 	// completed).
 	coldStartSeedSnapshots []ir.SchemaSnapshot
+
+	// readerSchemaSeed is the prior shape per in-scope table handed to a
+	// CDC reader that implements [schemaSeedSetter] (SLM-1). On cold start
+	// it is the RAW source IR captured in [coldStartPrepareSchema] before
+	// any mapping runs — a mapped type is a TARGET type, and a reader that
+	// compared its own source projection against one would see a phantom
+	// swap on every overridden column. On warm resume it is the latest
+	// retained schema-history version per table ([loadRetainedSchemaSeed]).
+	// Consumed and cleared where the reader is wired, so each attempt
+	// derives its own.
+	readerSchemaSeed []*ir.Table
 
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
 	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`

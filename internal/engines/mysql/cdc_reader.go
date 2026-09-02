@@ -252,6 +252,29 @@ type CDCReader struct {
 	// schemaCache clear is conservative, the snapshot is precise.
 	snapshotSig map[string]ir.SchemaSignature
 
+	// priorSig is the per-qualified-table shape this reader most recently
+	// KNEW the table by — the prev side of the session-`time_zone` cast
+	// refusal (cdc_session_tz_cast.go). It is deliberately a second memo
+	// beside snapshotSig, because the two answer different questions:
+	// snapshotSig is "the last version THIS reader EMITTED" (the ADR-0049
+	// true-delta contract, which must stay exactly that), while a refusal
+	// needs "the last shape anyone established", which has three sources
+	// in recency order —
+	//
+	//   - the streamer's seed ([CDCReader.SetSchemaSeed]: the cold-start
+	//     source IR, or the retained schema-history version on warm
+	//     resume), so the FIRST boundary after a start has a prev type;
+	//   - the decode cache, captured the moment the generic-DDL arm clears
+	//     it ([CDCReader.retainPriorShapes]), so a table decoded before a
+	//     DDL has a prev type even without a seed;
+	//   - every boundary maybeSnapshotSchemaB1 passes.
+	//
+	// SLM-1 (audit 2026-09-01): keying the refusal on snapshotSig alone
+	// left every table's FIRST DDL per process unchecked — a memo written
+	// only by the emitter cannot guard the emitter's first run. Written on
+	// the pump goroutine, except SetSchemaSeed (before StreamChanges).
+	priorSig map[string]ir.SchemaSignature
+
 	// schemaForward enables ADR-0091 F7a single-stream schema-change
 	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
 	// SchemaSnapshot on a per-column NULLABILITY-only change (GAP #2),
@@ -1230,6 +1253,11 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// using a stale column list.
 		stmtSchema := string(e.Schema)
 		if stmtSchema == "" || r.databaseInScope(stmtSchema) {
+			// SLM-1: the cache about to be cleared is the last shape each
+			// decoded table was known by — keep that as the refusal's prev
+			// before it is gone, so the rebuild after this DDL has something
+			// to be compared against even for a table no seed covered.
+			r.retainPriorShapes()
 			clear(r.schemaCache)
 			r.schemaCacheClears.Add(1) // ADR-0170 no-per-tx-churn pin
 
@@ -1755,18 +1783,12 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	if !r.pendingDDLActive || tbl == nil {
 		return nil
 	}
-	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: containSRIDSentinel(tbl.Columns)}
-	// Bug 89: surface the PK so downstream consumers (ADR-0058 backfill,
-	// other future per-PK paths) can resolve a cursor-paginated iteration
-	// against the table. The CDC reader's tableSchema already carries the
-	// PK column name list (Bug 88); project it into the IR Index shape.
-	if len(tbl.PrimaryKey) > 0 {
-		pkCols := make([]ir.IndexColumn, len(tbl.PrimaryKey))
-		for i, name := range tbl.PrimaryKey {
-			pkCols[i] = ir.IndexColumn{Column: name}
-		}
-		irTbl.PrimaryKey = &ir.Index{Columns: pkCols}
+	if r.priorSig == nil {
+		// Lazy-init: the production constructor seeds this map, but unit
+		// readers built as a struct literal may omit it.
+		r.priorSig = make(map[string]ir.SchemaSignature)
 	}
+	irTbl := projectTableIR(tbl)
 	sig := ir.SchemaSignatureOf(irTbl)
 	sigPrev, hadSig := r.snapshotSig[qn]
 	sigDelta := !hadSig || !sigPrev.Equal(sig)
@@ -1777,14 +1799,23 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	// BEFORE the boundary is emitted, so neither forward path sees it and
 	// no schema-history version is written for a schema sluice refuses to
 	// follow — the same posture as the PG reader's checkSchemaRace arm.
-	// Gated on hadSig: with no prior snapshot there is no prev type to have
-	// swapped away from, and that is also exactly the boundary the
-	// intercept treats as a cache prime / seed-guarded no-op.
-	if r.schemaDeltaAppliesToTarget && hadSig && sigDelta {
-		if col, pair, found := unforwardableSessionTZColumn(sigPrev, irTbl); found {
+	//
+	// The prev side is priorSig, NOT snapshotSig (SLM-1, audit 2026-09-01):
+	// snapshotSig is written only when THIS reader emits a boundary, so
+	// keying the refusal on it left every table's FIRST DDL after a start
+	// unchecked — exactly the boundary Shape A's router forwards. priorSig
+	// is seeded before the stream starts and refreshed from the decode
+	// cache at every DDL, so the first boundary has a prev type too. A
+	// table with no prior at all (never seeded, never decoded) is the
+	// honest "no prior knowledge" residual; see [CDCReader.priorSig].
+	if prior, hadPrior := r.priorSig[qn]; r.schemaDeltaAppliesToTarget && hadPrior && !prior.Equal(sig) {
+		if col, pair, found := unforwardableSessionTZColumn(prior, irTbl); found {
 			return sessionTZCastRefusal(tbl.Schema, tbl.Name, col, pair)
 		}
 	}
+	// Past the refusal, this is the shape the reader now knows the table
+	// by — whether or not it turns out to be a history boundary below.
+	r.priorSig[qn] = sig
 
 	// ADR-0091 F7a GAP #2: a per-column NULLABILITY change does NOT move
 	// ir.SchemaSignatureOf (name + ordered type — the ADR-0049 decode
@@ -1832,6 +1863,49 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	}
 	r.forwardNullSig[qn] = nullSig
 	return nil
+}
+
+// projectTableIR projects the reader's *tableSchema into the ir.Table the
+// boundary emitter publishes and the signature memos fingerprint. One
+// projection for both so a prev captured from the decode cache
+// (retainPriorShapes) compares against a boundary's shape on identical
+// terms — the SRID sentinel containment and the Bug 89 PK surface are
+// part of that shape, not of the caller.
+func projectTableIR(tbl *tableSchema) *ir.Table {
+	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: containSRIDSentinel(tbl.Columns)}
+	// Bug 89: surface the PK so downstream consumers (ADR-0058 backfill,
+	// other future per-PK paths) can resolve a cursor-paginated iteration
+	// against the table. The CDC reader's tableSchema already carries the
+	// PK column name list (Bug 88); project it into the IR Index shape.
+	if len(tbl.PrimaryKey) > 0 {
+		pkCols := make([]ir.IndexColumn, len(tbl.PrimaryKey))
+		for i, name := range tbl.PrimaryKey {
+			pkCols[i] = ir.IndexColumn{Column: name}
+		}
+		irTbl.PrimaryKey = &ir.Index{Columns: pkCols}
+	}
+	return irTbl
+}
+
+// retainPriorShapes copies the shape of every table in the decode cache
+// into priorSig, immediately before the generic-DDL arm clears the cache
+// (SLM-1). The cache holds the shape each table was decoded under up to
+// this DDL — the most recent prev available, fresher than any seed — and
+// the clear would otherwise discard it before the post-DDL rebuild can be
+// compared against it. Pump goroutine only.
+func (r *CDCReader) retainPriorShapes() {
+	if len(r.schemaCache) == 0 {
+		return
+	}
+	if r.priorSig == nil {
+		r.priorSig = make(map[string]ir.SchemaSignature, len(r.schemaCache))
+	}
+	for qn, tbl := range r.schemaCache {
+		if tbl == nil {
+			continue
+		}
+		r.priorSig[qn] = ir.SchemaSignatureOf(projectTableIR(tbl))
+	}
 }
 
 // nullabilitySignature renders a stable per-column NULLABLE vector for a

@@ -512,6 +512,13 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 // never runs this — by then the target schema is already shaped from
 // the cold-start run.
 func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error) {
+	// SLM-1: the CDC reader's prior-shape seed is the RAW source IR,
+	// captured before any mapping or the Shape A rewrite touches it. Every
+	// pass below rewrites types FOR THE TARGET (copy-on-write, so these
+	// pointers stay the untouched originals); the reader compares against
+	// its own SOURCE projection, and a target type in its prev would read
+	// as a phantom swap on every overridden column.
+	s.readerSchemaSeed = rawReaderSchemaSeed(schema)
 	// Apply per-column type overrides before the schema-write phase
 	// sees the schema. Warm resume skips this step — by then the
 	// target schema is already shaped from the cold-start run.
@@ -1357,6 +1364,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if setter, ok := stream.Changes.(schemaDeltaTargetApplySetter); ok {
 		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
 	}
+	// SLM-1: and the prior shape that refusal compares against at each
+	// table's FIRST boundary — the raw source IR coldStartPrepareSchema
+	// captured. Without it the arming above is inert until the reader has
+	// emitted a boundary of its own.
+	s.wireReaderSchemaSeed(stream.Changes)
 
 	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
 	// tables so the CDC-leg row-move eval can read every OLD column (refuses

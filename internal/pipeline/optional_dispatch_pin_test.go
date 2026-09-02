@@ -79,6 +79,12 @@ var (
 	// (mysql.schemaDeltaTargetApplySetter) because their types are
 	// unexported.
 	_ schemaDeltaTargetApplySetter = (*mysql.CDCReader)(nil)
+	// Its seeding half (audit 2026-09-01 SLM-1): the prior shape the
+	// refusal above compares against at a table's FIRST boundary. Same
+	// reasoning — an assertion that quietly stopped matching would leave
+	// the refusal armed and inert on every first DDL. The VStream lanes are
+	// pinned in-package (mysql.schemaSeedSetter) for the same reason.
+	_ schemaSeedSetter = (*mysql.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

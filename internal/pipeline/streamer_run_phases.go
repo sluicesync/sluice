@@ -786,6 +786,18 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		)
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, resumeCopyFrom, freshCopyNone)
 	case found:
+		// SLM-1: a warm resume's prior shape per table is the retained
+		// schema-history version in effect at the persisted position. Loaded
+		// here — the one place with the applier, the source and the
+		// position in hand — and handed to the reader inside warmResume.
+		// Only when a forward path is live: the seed feeds a refusal that
+		// is otherwise unarmed, and the read is not free.
+		if s.schemaDeltaAppliesToTarget() {
+			s.readerSchemaSeed, err = loadRetainedSchemaSeed(ctx, applier, s.Source, streamID, persisted)
+			if err != nil {
+				return nil, func() {}, false, migcore.WrapWithHint(migcore.PhaseCDC, err)
+			}
+		}
 		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		warmResumed = err == nil
 		// Slot-missing fall-through (ADR-0022) is suppressed when the

@@ -244,18 +244,118 @@ func TestB1_MaybeSnapshot_SessionTZCastRefuses(t *testing.T) {
 		}
 	})
 
-	t.Run("the FIRST boundary for a table cannot refuse (no prior type)", func(t *testing.T) {
-		// Honest scope note, pinned: with no prior snapshot there is no
-		// prev type to have swapped away from. That is also the boundary
-		// the pipeline intercept treats as a cache prime (warm resume) or
-		// a seed-guarded no-op (cold start), so nothing forwards from it.
+	// SLM-1 (audit 2026-09-01) — the FIRST boundary. The pre-SLM-1 cell
+	// here pinned "the first boundary cannot refuse (no prior type)" on the
+	// premise that nothing forwards from it; Shape A's router forwards
+	// exactly that boundary (its cache is seeded from the cold-start
+	// handoff), and it was observed forwarding a 9 h re-cast at exit 0.
+	// The expectation is FLIPPED: a table the streamer seeded, or one the
+	// reader decoded before the DDL, refuses at its first boundary.
+	first := func(t *testing.T, r *CDCReader, v *tableSchema) error {
+		t.Helper()
+		out := make(chan ir.Change, 8)
+		return r.maybeSnapshotSchemaB1(context.Background(), "app.events", v, out)
+	}
+	seedTable := func(cols ...*ir.Column) *ir.Table {
+		return &ir.Table{Name: "events", Columns: cols}
+	}
+
+	for _, tc := range []struct {
+		name string
+		seed []*ir.Column
+		v1   []*ir.Column
+	}{
+		{"TIMESTAMP seed → DATETIME first boundary", []*ir.Column{tsCol("created_at", 0)}, []*ir.Column{dtCol("created_at", 0)}},
+		{"DATETIME seed → TIMESTAMP first boundary", []*ir.Column{dtCol("created_at", 0)}, []*ir.Column{tsCol("created_at", 0)}},
+		{"TIMESTAMP(3) seed → DATETIME(6) first boundary", []*ir.Column{tsCol("created_at", 3)}, []*ir.Column{dtCol("created_at", 6)}},
+	} {
+		t.Run("the FIRST boundary for a SEEDED table refuses: "+tc.name, func(t *testing.T) {
+			r := newReader(true)
+			// The seed carries no Schema, as the MySQL SchemaReader's IR
+			// does; the reader keys it under its own bound database.
+			r.SetSchemaSeed([]*ir.Table{seedTable(tc.seed...)})
+			v := &tableSchema{Schema: "app", Name: "events", Columns: tc.v1}
+			requireSessionTZRefusal(t, first(t, r, v), "created_at")
+
+			// Un-armed: the seed informs a refusal that is not armed, so
+			// nothing changes for --schema-changes=refuse without Shape A.
+			r = newReader(false)
+			r.SetSchemaSeed([]*ir.Table{seedTable(tc.seed...)})
+			if err := first(t, r, v); err != nil {
+				t.Errorf("un-armed seeded reader must not refuse; got: %v", err)
+			}
+		})
+	}
+
+	t.Run("a table DECODED before the DDL refuses at its first boundary without a seed", func(t *testing.T) {
+		// The decode cache held the pre-DDL shape; the generic-DDL arm
+		// retains it (retainPriorShapes) before the blanket clear.
 		r := newReader(true)
+		r.schemaCache = map[string]*tableSchema{
+			"app.events": {Schema: "app", Name: "events", Columns: []*ir.Column{tsCol("created_at", 0)}},
+		}
+		r.retainPriorShapes()
+		clear(r.schemaCache)
 		v := &tableSchema{Schema: "app", Name: "events", Columns: []*ir.Column{dtCol("created_at", 0)}}
+		requireSessionTZRefusal(t, first(t, r, v), "created_at")
+	})
+
+	t.Run("the seed does not suppress the first history boundary", func(t *testing.T) {
+		// The seed is the refusal's prev, NOT the ADR-0049 true-delta memo:
+		// a first boundary whose shape equals the seed still emits, so the
+		// schema-history contract is byte-for-byte what it was.
+		r := newReader(true)
+		r.SetSchemaSeed([]*ir.Table{seedTable(tsCol("created_at", 0))})
+		v := &tableSchema{Schema: "app", Name: "events", Columns: []*ir.Column{tsCol("created_at", 0)}}
 		out := make(chan ir.Change, 8)
 		if err := r.maybeSnapshotSchemaB1(context.Background(), "app.events", v, out); err != nil {
-			t.Errorf("first boundary must not refuse; got: %v", err)
+			t.Fatalf("seed-equal first boundary refused: %v", err)
+		}
+		close(out)
+		n := 0
+		for c := range out {
+			if _, ok := c.(ir.SchemaSnapshot); ok {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("seed-equal first boundary emitted %d snapshots; want 1 — the seed must not be mistaken for an emitted version", n)
 		}
 	})
+
+	t.Run("a table with NO prior at all still cannot refuse — the stated residual", func(t *testing.T) {
+		// Never seeded (not in the cold-start scope, no retained version),
+		// never decoded before the DDL: there is no prev type to compare
+		// against, and inventing one would be a guess. This is the honest
+		// remaining window, and the pipeline intercepts treat such a
+		// boundary as a cache prime rather than an ALTER.
+		r := newReader(true)
+		v := &tableSchema{Schema: "app", Name: "events", Columns: []*ir.Column{dtCol("created_at", 0)}}
+		if err := first(t, r, v); err != nil {
+			t.Errorf("first boundary with no prior must not refuse; got: %v", err)
+		}
+	})
+}
+
+// TestSetSchemaSeed_KeysLikeTheReaderCache pins the key alignment the
+// seed depends on: a seed table without a Schema lands under the
+// reader's bound database, exactly where the TABLE_MAP-derived cache key
+// will look for it; a qualified one keeps its database.
+func TestSetSchemaSeed_KeysLikeTheReaderCache(t *testing.T) {
+	r := &CDCReader{schema: "app"}
+	r.SetSchemaSeed([]*ir.Table{
+		{Name: "bare", Columns: []*ir.Column{tsCol("c", 0)}},
+		{Schema: "other", Name: "qualified", Columns: []*ir.Column{dtCol("c", 0)}},
+		nil,
+	})
+	for _, want := range []string{"app.bare", "other.qualified"} {
+		if _, ok := r.priorSig[want]; !ok {
+			t.Errorf("seed key %q missing; keys = %v", want, r.priorSig)
+		}
+	}
+	if len(r.priorSig) != 2 {
+		t.Errorf("seeded %d keys; want 2 (nil entries skipped)", len(r.priorSig))
+	}
 }
 
 // tzFieldEvent builds a FIELD event for the shared "users" table with one
@@ -309,6 +409,45 @@ func TestVStreamSchemaHistory_SessionTZCastRefuses(t *testing.T) {
 			t.Errorf("datetime(3)→datetime(6) must forward on the VStream lane; got: %v", err)
 		}
 	})
+
+	// SLM-1: the FIRST FIELD of this process, with the prior coming from
+	// the streamer's seed rather than an earlier FIELD.
+	seeded := func(t *testing.T, seedType, first string) (error, int) {
+		t.Helper()
+		r := newVStreamTestReader()
+		r.schemaDeltaAppliesToTarget = true
+		r.SetSchemaSeed([]*ir.Table{{Name: "users", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "created_at", Type: ir.Timestamp{WithTimeZone: seedType == "timestamp"}},
+		}}})
+		out := make(chan ir.Change, 16)
+		ctx := context.Background()
+		if err := r.dispatch(ctx, vgtidEvent("gtid-1"), out); err != nil {
+			t.Fatalf("vgtid: %v", err)
+		}
+		err := r.dispatch(ctx, tzFieldEvent(first), out)
+		close(out)
+		n := 0
+		for c := range out {
+			if _, ok := c.(ir.SchemaSnapshot); ok {
+				n++
+			}
+		}
+		return err, n
+	}
+	t.Run("SEEDED: the first FIELD refuses a zone-sibling swap", func(t *testing.T) {
+		err, _ := seeded(t, "timestamp", "datetime")
+		requireSessionTZRefusal(t, err, "created_at")
+	})
+	t.Run("SEEDED: a seed-equal first FIELD still emits its history version", func(t *testing.T) {
+		err, n := seeded(t, "timestamp", "timestamp")
+		if err != nil {
+			t.Fatalf("seed-equal first FIELD refused: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("seed-equal first FIELD emitted %d snapshots; want 1 — the seed must not stand in for an emitted version", n)
+		}
+	})
 }
 
 // TestVStreamSnapshotCDC_SessionTZCastRefuses is the SIBLING pin on the
@@ -345,6 +484,45 @@ func TestVStreamSnapshotCDC_SessionTZCastRefuses(t *testing.T) {
 	t.Run("precision-only MODIFY still forwards", func(t *testing.T) {
 		if err := run(t, true, "datetime(3)", "datetime(6)"); err != nil {
 			t.Errorf("datetime(3)→datetime(6) must forward on the snapshot-stream lane; got: %v", err)
+		}
+	})
+
+	// SLM-1: the first post-COPY FIELD of this process, prior from the
+	// streamer's seed (handed through the snapshot stream's CDC half).
+	seeded := func(t *testing.T, seedType, first string) (error, int) {
+		t.Helper()
+		s := newVStreamSnapshotTestStream()
+		s.schemaDeltaAppliesToTarget = true
+		(&vstreamSnapshotChanges{snap: s}).SetSchemaSeed([]*ir.Table{{Name: "users", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "created_at", Type: ir.Timestamp{WithTimeZone: seedType == "timestamp"}},
+		}}})
+		out := make(chan ir.Change, 16)
+		ctx := context.Background()
+		if err := s.dispatchCDCEvent(ctx, vgtidEvent("gtid-pre"), out); err != nil {
+			t.Fatalf("vgtid: %v", err)
+		}
+		err := s.dispatchCDCEvent(ctx, tzFieldEvent(first), out)
+		close(out)
+		n := 0
+		for c := range out {
+			if _, ok := c.(ir.SchemaSnapshot); ok {
+				n++
+			}
+		}
+		return err, n
+	}
+	t.Run("SEEDED: the first FIELD refuses a zone-sibling swap", func(t *testing.T) {
+		err, _ := seeded(t, "timestamp", "datetime")
+		requireSessionTZRefusal(t, err, "created_at")
+	})
+	t.Run("SEEDED: a seed-equal first FIELD still emits its history version", func(t *testing.T) {
+		err, n := seeded(t, "timestamp", "timestamp")
+		if err != nil {
+			t.Fatalf("seed-equal first FIELD refused: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("seed-equal first FIELD emitted %d snapshots; want 1", n)
 		}
 	})
 }

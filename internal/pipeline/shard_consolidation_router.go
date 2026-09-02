@@ -130,6 +130,14 @@ func (r *BoundaryRouter) RouteBoundary(
 	if err != nil {
 		return fmt.Errorf("pipeline: route boundary: %w. %s", err, RecoveryHint(tableName))
 	}
+	// SLM-1: the session-zone cast door, BEFORE the lease is touched. Shape
+	// A forwards ALTER COLUMN TYPE regardless of --schema-changes, and the
+	// first boundary it classifies against the cold-start seed is one the
+	// reader may have had no prior for; this door is what stands between
+	// that boundary and applyShape on every path out of this function.
+	if err := refuseSessionZoneSwap(tableName, shape, RecoveryHint(tableName)); err != nil {
+		return fmt.Errorf("pipeline: route boundary: %w", err)
+	}
 	if shape.Kind == ShapeKindNone {
 		slog.DebugContext(
 			ctx, "shard consolidation boundary: no-op (no structural change)",

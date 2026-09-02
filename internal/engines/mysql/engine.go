@@ -390,6 +390,7 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, flavor Flavor, s
 		tableMap:       make(map[uint64]string),
 		schemaCache:    make(map[string]*tableSchema),
 		snapshotSig:    make(map[string]ir.SchemaSignature),
+		priorSig:       make(map[string]ir.SchemaSignature),
 		forwardNullSig: make(map[string]string),
 	}, nil
 }

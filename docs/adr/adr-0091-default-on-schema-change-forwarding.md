@@ -561,6 +561,36 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     derives each lane's pairs from that lane's own declaration, fails
     a lane that declares pairs without a refusal path, and fails a
     newly-registered engine that classifies itself as neither.
+    *The first-boundary window — FIXED, audit 2026-09-01 SLM-1.* The
+    SL-2 refusal compared each boundary against a memo only the
+    lane's own emitter wrote, so a table's FIRST DDL after any start
+    was never checked — and that is the boundary Shape A's router
+    forwards (its cache is seeded from the cold-start handoff, so the
+    first CDC snapshot is a real boundary to it). Observed on a
+    `--default-time-zone=+09:00` source: under `--inject-shard-column`
+    the first `MODIFY c TIMESTAMP` forwarded and every pre-existing
+    target row read 9 h off at exit 0; under the default
+    `--schema-changes=forward` it was §3 seed-skipped and later rows
+    landed in a zone-mismatched column. The reader now has a prior at
+    its first boundary: the streamer hands every MySQL lane a seed
+    through `schemaSeedSetter` (`SetSchemaSeed`) — the RAW source IR
+    on cold start (captured before mappings, which rewrite types for
+    the target), the retained schema-history version resolved at the
+    persisted position on warm resume (`loadRetainedSchemaSeed`) — and
+    the binlog lane additionally keeps the decode cache's last shape
+    across a DDL clear (`retainPriorShapes`). The pipeline carries its
+    own door as the belt behind the readers' braces:
+    `refuseSessionZoneSwap` runs in `BoundaryRouter.RouteBoundary`
+    before the lease and in `routeForwardBoundary` after the §3 seed
+    guard (deliberately after it, so an operator's `--type-override`
+    onto a zone sibling is not reported as a swap they never made);
+    `TestSessionZoneSwapDoorRoster_EveryShapeApplyCallSite` derives
+    every `applyShapeDelta` caller and its callers from the AST and
+    holds each behind a named door. The residual window, stated: a
+    table with no prior at all — outside the cold-start scope with no
+    retained version, and never decoded before the DDL — still cannot
+    refuse at its first boundary, and the intercepts treat that
+    boundary as a cache prime rather than an ALTER.
     The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.
