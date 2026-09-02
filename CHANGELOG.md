@@ -34,7 +34,7 @@ The remediation batch for the 2026-09-01 blind audit: eight silent-data-loss cla
 
 ### Compatibility
 
-Drop-in from v0.137.4. No schema, format, or flag change. One new refusal shape: a GTID resume whose set is not contained in the source's `gtid_executed` now refuses where it previously streamed, taking the existing cold-start fall-through (re-snapshot by default; hard stop under `--no-auto-resnapshot`).
+Drop-in from v0.137.4. No flag change. MariaDB positions gain three optional lineage-anchor fields; older binaries ignore them and older positions resume with a warning. The Postgres CDC commit position now records the post-commit LSN; a position persisted by an older binary replays one transaction once on its first resume, then converges. Two new error codes: `SLUICE-E-BULKCOPY-NO-PAGINATION-KEY` and `SLUICE-E-BULKCOPY-ROW-COUNT-MISMATCH`. New refusals on configurations that previously ran — every one of them a case that was silently losing or leaking data: a MySQL GTID, MariaDB or VStream resume against a source that never produced the position (taking the existing cold-start fall-through: re-snapshot by default, hard stop under `--no-auto-resnapshot`); a schema-qualified `--redact` rule on a flat-scope source; a multi-schema `sync start` over a partitioned or `INHERITS` parent; statement-format `LOAD DATA`, versioned-comment DML, `--`-newline DML and cross-database DML under a session STATEMENT override; a D1 table with no reachable pagination key; and a pgtrigger install whose trigger is bound to a function outside the sluice schema. `sluice verify --depth count` now accepts a `d1` source.
 
 ### Changed
 
