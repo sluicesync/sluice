@@ -514,6 +514,78 @@ func TestSessionZoneSwapDoorRoster_EveryShapeApplyCallSite(t *testing.T) {
 	}
 }
 
+// TestSchemaSeed_WiredWhereverTheRefusalIsArmed is the wiring-parity gate:
+// every function in the package that arms the refusal (type-asserts
+// schemaDeltaTargetApplySetter) must also hand the reader its seed
+// (wireReaderSchemaSeed) — arming without seeding is the SLM-1 state, a
+// refusal that is armed and inert at every first boundary — and the
+// warm-resume dispatcher must load the seed it hands over
+// (loadRetainedSchemaSeed). Derived from the AST so a new open path that
+// copies the arming line without the seeding line fails here.
+func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	arming := 0
+	loaders := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			arms, seeds, loads := false, false, false
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				switch v := n.(type) {
+				case *ast.TypeAssertExpr:
+					if id, ok := v.Type.(*ast.Ident); ok && id.Name == "schemaDeltaTargetApplySetter" {
+						arms = true
+					}
+				case *ast.CallExpr:
+					switch fun := v.Fun.(type) {
+					case *ast.SelectorExpr:
+						if fun.Sel.Name == "wireReaderSchemaSeed" {
+							seeds = true
+						}
+					case *ast.Ident:
+						if fun.Name == "loadRetainedSchemaSeed" {
+							loads = true
+						}
+					}
+				}
+				return true
+			})
+			fn := name + "::" + funcDeclName(fd)
+			if arms {
+				arming++
+				if !seeds {
+					t.Errorf("%s arms the session-zone refusal (schemaDeltaTargetApplySetter) but never calls wireReaderSchemaSeed — armed and inert at every first boundary (SLM-1)", fn)
+				}
+			}
+			if loads {
+				loaders[fn] = true
+			}
+		}
+	}
+	// Anti-vacuity: the cold-start and warm-resume open paths both arm.
+	if arming < 2 {
+		t.Fatalf("found %d arming sites; floor 2 (coldStartBeginCDC, warmResume) — the walk is vacuous", arming)
+	}
+	if !loaders["streamer_run_phases.go::(*Streamer).phaseOpenChangeStream"] {
+		t.Errorf("phaseOpenChangeStream no longer loads the retained schema seed before dispatching to warmResume; loaders found: %v", loaders)
+	}
+}
+
 // shortFuncName strips a "(*Recv)." prefix so a method's call sites (which
 // appear as selector calls on a receiver) match by method name.
 func shortFuncName(name string) string {
