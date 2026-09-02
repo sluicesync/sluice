@@ -1129,15 +1129,27 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 		var executed string
 		lerr := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed", bare).Scan(&contained, &executed)
 		if lerr == nil && contained == 0 {
-			_ = db.Close()
-			return fmt.Errorf("mysql/vstream: the resume position for shard %q is not contained in the source's "+
-				"@@global.gtid_executed (%s; resume %q, source executed %q) — the source is a different lineage "+
-				"(a fresh, reset, rebuilt or replaced keyspace/shard), or a shard that has not executed what the "+
-				"position consumed; cannot resume: %w",
-				sg.Shard, c.DBName, abbreviateGTIDSet(bare), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+			// Lag is not lineage. The probe routes through vtgate's
+			// keyspace:shard@<tablettype> target, which can land on a
+			// replica BEHIND the tablet the position was streamed from;
+			// every source UUID present with lower sequence numbers is
+			// that replica's lag, and Vitess's own tablet picker skips a
+			// mismatching tablet and tries another. Only a UUID the shard
+			// has never executed is lineage evidence — refuse on that
+			// alone, and let the picker handle the rest.
+			if gtidSetUUIDsSubset(bare, executed) {
+				slog.InfoContext(ctx, "mysql/vstream: lineage pre-flight: the probed tablet is BEHIND the resume position (every source UUID present, lower sequence numbers); treating as replica lag and leaving tablet selection to vtgate",
+					slog.String("target", c.DBName), slog.String("shard", sg.Shard))
+			} else {
+				_ = db.Close()
+				return fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
+					"executed (%s; resume %q, source executed %q) — the source is a different lineage (a fresh, reset, "+
+					"rebuilt or replaced keyspace/shard); cannot resume: %w",
+					sg.Shard, c.DBName, abbreviateGTIDSet(bare), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+			}
 		}
 		if lerr != nil {
-			slog.WarnContext(ctx, "mysql/vstream: lineage pre-flight: GTID_SUBSET(resume, gtid_executed) probe failed; proceeding to the retention check",
+			slog.WarnContext(ctx, "mysql/vstream: "+unverifiedInstanceIdentityMarker+": lineage pre-flight probe GTID_SUBSET(resume, gtid_executed) failed, so the resume position could not be checked against this shard's lineage; proceeding to the retention check (a replaced keyspace would NOT be caught on this resume; if it persists, treat it as a real finding)",
 				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", lerr.Error()))
 		}
 		var subset int

@@ -48,6 +48,20 @@ import (
 // closes the different-domain cell even for a position that carries no
 // anchor.
 //
+// # Residuals, stated
+//
+// A rebuilt instance whose binlog is byte-identical up to the anchor
+// reproduces the anchor and passes; with the anchor following rotations
+// that means reproducing A's live traffic byte for byte. And the purge
+// disambiguation accepts a wrong long-running host with the same
+// server_id and domain whose OLDEST retained file happens to start inside
+// [anchor seq, resume seq] — measured shape: anchor (mb.000003, 4, 0-1-12)
+// absent on B, B's mb.000004:4 = "0-1-22", resume "0-1-30" retained on B →
+// accepted, and B streams from after ITS OWN 0-1-30. Because the anchor
+// follows rotations the band is one binlog file of A's transactions and B
+// must have a file boundary inside it: coincidence-level, named here so it
+// is a known residual rather than an assumption.
+//
 // # Positions without an anchor
 //
 // A MariaDB position persisted before v0.138.0 carries no anchor. It is
