@@ -6,7 +6,7 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.138.0] - 2026-09-02
 
-Closes a silent data-loss hole in MySQL GTID-mode resume and corrects v0.137.2's claim that GTID mode was never exposed. **If you run MySQL sync or a backup chain with `gtid_mode=ON` and your source instance can be replaced, reset, or rebuilt, read the Fixed section.**
+The remediation batch for the 2026-09-01 blind audit: eight silent-data-loss classes closed, every one observed on a real server before it was fixed, plus one loud-but-wedging Postgres CDC recovery. **If you run MySQL or MariaDB sync or backup chains whose source can be replaced or rebuilt, a Vitess-backed source, a D1 source with primary-key-less tables, multi-schema Postgres sync, trigger-CDC, or `--redact` with schema-qualified rules, read the entry that names you.**
 
 ### Fixed
 
