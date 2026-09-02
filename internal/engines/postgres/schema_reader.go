@@ -2068,7 +2068,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		JOIN   pg_class pcl  ON pcl.oid = con.confrelid
 		JOIN   pg_namespace n  ON n.oid  = cl.relnamespace
 		JOIN   pg_namespace pn ON pn.oid = pcl.relnamespace
-		JOIN   LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS u(k_attnum, f_attnum, ord) ON TRUE
+		JOIN   LATERAL ROWS FROM (pg_catalog.unnest(con.conkey), pg_catalog.unnest(con.confkey)) WITH ORDINALITY AS u(k_attnum, f_attnum, ord) ON TRUE
 		LEFT JOIN pg_attribute fk_col  ON fk_col.attrelid  = con.conrelid  AND fk_col.attnum  = u.k_attnum
 		LEFT JOIN pg_attribute ref_col ON ref_col.attrelid = con.confrelid AND ref_col.attnum = u.f_attnum
 		WHERE  n.nspname = $1

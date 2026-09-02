@@ -189,14 +189,16 @@ func TestPGClientSQLQualifiesEveryCatalogFunction(t *testing.T) {
 var pgCatalogQualificationExempt = map[string]string{
 	// (a) SQL-standard syntactic forms. EXTRACT is handled by name in the
 	// scanner (every spelling here is the FROM form); type modifiers by the
-	// typmod rule. Multi-argument unnest(a, b) is grammar too: the parser expands the
-	// BARE spelling into ROWS FROM(unnest(a), unnest(b)); the qualified
-	// spelling is looked up as a two-argument function and does not exist
-	// (`pg_catalog.unnest(smallint[], smallint[]) does not exist`, caught by
-	// TestClientSQL_DecoyOverloadsInPublicNeverFire on a real PG 16 — the
-	// source-text gate alone was green). Single-argument unnest stays
-	// qualified everywhere else.
-	"postgres/schema_reader.go:populateForeignKeys:unnest": "multi-argument unnest(a, b) is a syntactic ROWS FROM expansion; the qualified two-argument function does not exist",
+	// typmod rule. Multi-argument unnest(a, b) WAS exempted here: it is
+	// grammar (the parser expands the bare spelling into ROWS FROM(...)) and
+	// `pg_catalog.unnest(smallint[], smallint[]) does not exist`. Measured
+	// 2026-09-02 on real PG 16 with a planted `public.unnest(smallint[])`
+	// RAISE decoy: the bare two-argument form binds its inner calls to
+	// pg_catalog directly (the decoy did NOT fire, while the bare
+	// single-argument form DID hit it), so the exemption was safe — and the
+	// foreign-key read now spells the expansion out explicitly,
+	// `ROWS FROM (pg_catalog.unnest(a), pg_catalog.unnest(b))`, which the
+	// same run proved equivalent, so no exemption is needed at all.
 	// (c) source-side PATTERNS, never sent to a server: these literals are
 	// compared against text the SOURCE produced (a SQLite default
 	// expression; a MySQL CAST type spec; pg_get_expr output, which renders
