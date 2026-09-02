@@ -87,8 +87,8 @@ func specsFor(names ...string) []tableTriggerSpec {
 // installedPair is the two capture triggers of one table at one enablement.
 func installedPair(table, enabled string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
-		{table: table, name: CaptureTriggerRow, enabled: enabled, fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-		{table: table, name: CaptureTriggerTruncate, enabled: enabled, fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+		{table: table, name: CaptureTriggerRow, enabled: enabled, fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerTruncate, enabled: enabled, fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 	}
 }
 

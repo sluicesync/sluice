@@ -29,6 +29,22 @@ import (
 	"time"
 )
 
+// loadBoundCaptureFunctionShapes reads the capture function definitions the
+// way the door does — for exactly the OIDs the installed triggers execute
+// ([boundCaptureFunctionOIDs]), never by name.
+func loadBoundCaptureFunctionShapes(t *testing.T, ctx context.Context, db *sql.DB, schema string) (map[string]captureFunctionShape, error) {
+	t.Helper()
+	installed, err := loadInstalledCaptureTriggers(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("read installed capture triggers: %v", err)
+	}
+	ddl, err := loadDDLCaptureState(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("read DDL capture state: %v", err)
+	}
+	return loadInstalledCaptureFunctionShapes(ctx, db, schema, boundCaptureFunctionOIDs(installed, ddl))
+}
+
 func TestCaptureFunctionBodyDoor(t *testing.T) {
 	dsn, cleanup := startPGForTrigger(t)
 	defer cleanup()
@@ -79,7 +95,7 @@ func TestCaptureFunctionBodyDoor(t *testing.T) {
 	setup(t)
 
 	t.Run("PREMISE: pg_proc gives back exactly what the renderer emitted, for every capture function", func(t *testing.T) {
-		installed, err := loadInstalledCaptureFunctionShapes(ctx, db, "public")
+		installed, err := loadBoundCaptureFunctionShapes(t, ctx, db, "public")
 		if err != nil {
 			t.Fatalf("read installed shapes: %v", err)
 		}
@@ -201,7 +217,7 @@ RESET check_function_bodies;`)
 		}
 
 		// The read must resolve to the ONE the trigger executes.
-		installed, err := loadInstalledCaptureFunctionShapes(ctx, db, "public")
+		installed, err := loadBoundCaptureFunctionShapes(t, ctx, db, "public")
 		if err != nil {
 			t.Fatalf("read installed shapes: %v", err)
 		}
@@ -222,7 +238,7 @@ RESET check_function_bodies;`)
 		// 0-arg function and CANNOT remove an overload, which is exactly why
 		// the bypass was permanent once planted. Asserted, not assumed.
 		setup(t)
-		installed, err = loadInstalledCaptureFunctionShapes(ctx, db, "public")
+		installed, err = loadBoundCaptureFunctionShapes(t, ctx, db, "public")
 		if err != nil {
 			t.Fatalf("read installed shapes after repair: %v", err)
 		}

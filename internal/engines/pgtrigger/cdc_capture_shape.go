@@ -67,6 +67,20 @@ import (
 //     WARNs. Until it existed, a `CREATE OR REPLACE` of the capture
 //     function was invisible here: the trigger stayed present, enabled,
 //     correctly shaped and bound to a function of the right NAME.
+//   - The IDENTITY of what each trigger executes, not its name (audit
+//     2026-09-01 SLP-1). `pg_trigger.tgfoid` / `pg_event_trigger.evtfoid`
+//     are OIDs, and a name resolves to one only within a schema. The door
+//     read `proname` alone and the body arm read definitions by name
+//     WITHIN the sluice schema, so a same-named function in ANY OTHER
+//     schema bound to a capture trigger passed every arm while the body
+//     arm graded the untouched original: 3 INSERTs + 1 UPDATE recorded 0
+//     change-log rows at a healthy stream, and a decoy-bound event trigger
+//     recorded no `X` row for an ALTER TABLE (observed on PG 16). Now every
+//     loader returns the bound function's namespace and OID, the grade
+//     refuses a namespace other than the sluice schema — per tier: the row
+//     trigger, the TRUNCATE trigger, the `ddl_command_end` arm and the
+//     `sql_drop` arm — and the body arm reads `WHERE p.oid = ANY(<bound>)`,
+//     so "grades the function the trigger EXECUTES" is literally the query.
 //
 // NOT reached: a single table whose row AND truncate triggers were BOTH
 // dropped while other tables keep theirs. pgtrigger records no setup-time
@@ -95,21 +109,28 @@ const (
 
 // installedCaptureTrigger is one sluice-named trigger row read from
 // pg_trigger, carrying everything the grader compares against the installed
-// shape.
+// shape. The bound function is carried as the three things that together
+// are its identity — name, namespace, OID — because `tgfoid` is an OID and
+// a name alone identifies nothing (SLP-1, the file header).
 type installedCaptureTrigger struct {
-	table   string
-	name    string
-	enabled string // pg_trigger.tgenabled: O(rigin), D(isabled), R(eplica), A(lways)
-	fn      string // bound function's proname
-	tgtype  int16
+	table    string
+	name     string
+	enabled  string // pg_trigger.tgenabled: O(rigin), D(isabled), R(eplica), A(lways)
+	fn       string // bound function's proname
+	fnSchema string // bound function's namespace (pg_namespace.nspname via pronamespace)
+	fnOID    uint32 // bound function's pg_proc.oid — what the trigger EXECUTES
+	tgtype   int16
 }
 
 // eventTriggerState is the pg_event_trigger row for one capture event
-// trigger (zero value = absent).
+// trigger (zero value = absent). The bound function is identified the same
+// three ways as on [installedCaptureTrigger].
 type eventTriggerState struct {
-	present bool
-	enabled string // pg_event_trigger.evtenabled: same domain as tgenabled
-	fn      string
+	present  bool
+	enabled  string // pg_event_trigger.evtenabled: same domain as tgenabled
+	fn       string
+	fnSchema string
+	fnOID    uint32
 }
 
 // eventTier is one of the §7 DDL tier's two event-trigger arms. Each is
@@ -151,20 +172,22 @@ func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, m
 	if err != nil {
 		return captureShapeProbeError(ctx, pctx, "DDL capture event-trigger state", err)
 	}
-	// The BODY arm's evidence (audit 2026-08-31 SL-5). Read under the same
-	// bounded probe and fail-closed the same way: a door that cannot read
-	// what the triggers actually EXECUTE must not stream on the strength of
-	// their names.
-	bodies, err := loadInstalledCaptureFunctionShapes(pctx, db, schema)
-	if err != nil {
-		return captureShapeProbeError(ctx, pctx, "installed capture function definitions", err)
-	}
 	if err := gradeCaptureShape(schema, installed, ddl, meta.captureReplicated); err != nil {
 		return err
 	}
-	// Graded after the trigger shape so the operator sees the structural
-	// defect first when both are present — a missing trigger is the more
-	// urgent message, and re-running setup repairs either.
+	// The BODY arm's evidence (audit 2026-08-31 SL-5), read for exactly the
+	// functions the triggers above are bound to — by OID, so a same-named
+	// function elsewhere is never what gets graded (SLP-1). Read under the
+	// same bounded probe and fail-closed the same way: a door that cannot
+	// read what the triggers actually EXECUTE must not stream on the
+	// strength of their names. Read AFTER the trigger grade so the operator
+	// sees the structural defect first when both are present — a missing
+	// trigger is the more urgent message, and re-running setup repairs
+	// either.
+	bodies, err := loadInstalledCaptureFunctionShapes(pctx, db, schema, boundCaptureFunctionOIDs(installed, ddl))
+	if err != nil {
+		return captureShapeProbeError(ctx, pctx, "installed capture function definitions", err)
+	}
 	drift, err := gradeCaptureFunctionShapes(schema, bodies, meta)
 	if err != nil {
 		return err
@@ -190,14 +213,17 @@ func captureShapeProbeError(ctx, pctx context.Context, what string, err error) e
 }
 
 // loadInstalledCaptureTriggers reads every sluice-named capture trigger in
-// the schema with its enabled state, bound function, and tgtype.
+// the schema with its enabled state, bound function (name, namespace and
+// OID — the namespace join is on the FUNCTION's pronamespace, distinct
+// from the table's), and tgtype.
 func loadInstalledCaptureTriggers(ctx context.Context, db *sql.DB, schema string) ([]installedCaptureTrigger, error) {
 	const q = `
-SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, t.tgtype
+SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.tgtype
   FROM pg_trigger   t
-  JOIN pg_class     c ON c.oid = t.tgrelid
-  JOIN pg_namespace n ON n.oid = c.relnamespace
-  JOIN pg_proc      p ON p.oid = t.tgfoid
+  JOIN pg_class     c  ON c.oid  = t.tgrelid
+  JOIN pg_namespace n  ON n.oid  = c.relnamespace
+  JOIN pg_proc      p  ON p.oid  = t.tgfoid
+  JOIN pg_namespace pn ON pn.oid = p.pronamespace
  WHERE n.nspname = $1
    AND t.tgname IN ($2, $3)
    AND NOT t.tgisinternal
@@ -210,12 +236,35 @@ SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, t.tgtype
 	var out []installedCaptureTrigger
 	for rows.Next() {
 		var it installedCaptureTrigger
-		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.tgtype); err != nil {
+		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.fnSchema, &it.fnOID, &it.tgtype); err != nil {
 			return nil, err
 		}
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// boundCaptureFunctionOIDs is the set of functions the installed capture
+// triggers — per-table pair and event-trigger arms alike — actually
+// EXECUTE, as pg_proc OIDs (sorted, deduplicated). It is the body arm's
+// read scope: what gets graded is exactly this set, whatever those
+// functions happen to be named.
+func boundCaptureFunctionOIDs(installed []installedCaptureTrigger, ddl ddlCaptureState) []uint32 {
+	seen := map[uint32]bool{}
+	for _, it := range installed {
+		seen[it.fnOID] = true
+	}
+	for _, evt := range ddl.triggers {
+		if evt.present {
+			seen[evt.fnOID] = true
+		}
+	}
+	out := make([]uint32, 0, len(seen))
+	for oid := range seen {
+		out = append(out, oid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // ddlCaptureState is the event-trigger tier's installed evidence, per arm:
@@ -253,9 +302,10 @@ SELECT EXISTS (
        AND n.nspname = $2
 )`
 	const evtQ = `
-SELECT e.evtenabled::text, p.proname
+SELECT e.evtenabled::text, p.proname, pn.nspname, p.oid
   FROM pg_event_trigger e
-  JOIN pg_proc          p ON p.oid = e.evtfoid
+  JOIN pg_proc          p  ON p.oid  = e.evtfoid
+  JOIN pg_namespace     pn ON pn.oid = p.pronamespace
  WHERE e.evtname = $1`
 	for _, tier := range eventTierRoster {
 		var present bool
@@ -265,7 +315,7 @@ SELECT e.evtenabled::text, p.proname
 		out.fnPresent[tier.fn] = present
 
 		var evt eventTriggerState
-		switch err := db.QueryRowContext(ctx, evtQ, tier.trigger).Scan(&evt.enabled, &evt.fn); err {
+		switch err := db.QueryRowContext(ctx, evtQ, tier.trigger).Scan(&evt.enabled, &evt.fn, &evt.fnSchema, &evt.fnOID); err {
 		case nil:
 			evt.present = true
 		case sql.ErrNoRows:
@@ -404,6 +454,20 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 					tbl, want.name, want.events, allTables,
 				)
 			}
+			// Namespace BEFORE name (SLP-1): the observed decoy has the right
+			// name in the wrong schema, and a name-only compare passes it.
+			// The body arm never reaches the decoy either — it grades by
+			// bound OID — so this is where the operator learns what
+			// happened.
+			if got.fnSchema != schema {
+				return fmt.Errorf(
+					"pgtrigger: table %q capture trigger %q is bound to function %q.%q — a function OUTSIDE the sluice schema %q, so it is "+
+						"not sluice's %q.%q whatever its name; its %s changes are captured by whatever that function does (a same-named "+
+						"decoy that records nothing makes them silently absent from the stream); re-run `sluice trigger setup` to rebind the "+
+						"trigger to the real function, and find out who rebound it",
+					tbl, want.name, got.fnSchema, got.fn, schema, schema, want.fn, want.events,
+				)
+			}
 			if got.fn != want.fn {
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is bound to function %q, not sluice's %q — it is not what this sluice installs "+
@@ -475,6 +539,18 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 					"replica-role (replicated/applied) sessions while their DML IS captured, so the applier would write post-DDL-shaped rows with no refusal "+
 					"(ADR-0185, audit A-1); re-run `sluice trigger setup --capture-replicated-writes` to set it ENABLE ALWAYS",
 				tier.trigger, tier.watches,
+			)
+		}
+		// Namespace before name, for the same reason as the per-table arm
+		// (SLP-1): a decoy-bound event trigger fires the decoy, and the
+		// observed one recorded no `X` row for an ALTER TABLE.
+		if evt.fnSchema != schema {
+			return fmt.Errorf(
+				"pgtrigger: event trigger %q is bound to function %q.%q — a function OUTSIDE the sluice schema %q, so it is not sluice's "+
+					"%q.%q whatever its name; %s is detected by whatever that function does (a same-named decoy that records nothing "+
+					"leaves a post-DDL capture silently mis-capturing instead of refusing); re-run `sluice trigger setup` to rebind it, "+
+					"and find out who rebound it",
+				tier.trigger, evt.fnSchema, evt.fn, schema, schema, tier.fn, tier.watches,
 			)
 		}
 		if evt.fn != tier.fn {

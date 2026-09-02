@@ -295,80 +295,95 @@ func parseCaptureFunctionDigests(recorded string) (map[string]string, bool) {
 	return out, true
 }
 
-// captureFunctionArity is the argument count every sluice capture function
-// has, and it is a SCOPE on the read below, not a description.
+// # Which functions the body arm reads: the ones the triggers EXECUTE
 //
-// A trigger function takes no declared arguments — PostgreSQL rejects them on
-// `RETURNS trigger`/`RETURNS event_trigger` — so all four are 0-arg. But
-// `proname` alone does NOT identify a function: PostgreSQL permits
-// overloading, and with `check_function_bodies = off` any `RETURNS void`
-// plpgsql function stores `prosrc` verbatim. Selecting on the name alone let
-// an adversary gut the real 0-arg function and then plant a same-named
-// 1-arg decoy carrying a healthy body — the last row won the map collapse,
-// so the door read the decoy, saw a body that records into the change log,
-// and passed. Every source DML then went uncaptured at exit 0, on a fully
-// provenanced install where this file's header promises a refusal, and the
-// prescribed `trigger setup` repair did not clear it because it rewrites the
-// 0-arg function and leaves the decoy standing. Found by the pre-publish
-// value-fidelity review of v0.137.0 and ground-truthed on real PostgreSQL 16.
+// The read below is scoped by pg_proc OID — the set of `tgfoid` /
+// `evtfoid` values the installed capture triggers carry
+// ([boundCaptureFunctionOIDs]) — and by the sluice schema. It is NOT scoped
+// by name, because `proname` does not identify a function, and two decoy
+// classes have ridden through a name-scoped read:
 //
-// Pinning the arity closes it completely rather than narrowly: a 0-arg decoy
-// cannot coexist with the real function — same signature means `CREATE OR
-// REPLACE` replaces it, and a differing return type is refused outright — so
-// exactly one row can match per name, and no legitimate capture function is
-// ever excluded. The duplicate arm below is belt-and-braces for the same
-// class: two rows sharing a name is a state no sluice install produces.
-const captureFunctionArity = 0
+//   - OVERLOAD (pre-publish value-fidelity review of v0.137.0). PostgreSQL
+//     permits overloading, and with `check_function_bodies = off` any
+//     `RETURNS void` plpgsql function stores `prosrc` verbatim. Gut the real
+//     0-arg function, plant a same-named 1-arg decoy carrying a healthy
+//     body: the last row won the map collapse, the door graded the decoy,
+//     and passed. The first fix scoped the read by `pronargs = 0`.
+//   - NAMESPACE (audit 2026-09-01 SLP-1). Plant `decoy.sluice_capture_change()`
+//     in another schema and rebind the trigger to it: the schema-scoped read
+//     graded the untouched `public.sluice_capture_change`, which is pristine
+//     and digest-matching, and passed — 3 INSERTs + 1 UPDATE recorded 0
+//     change-log rows at a healthy stream. The event-trigger arms and the
+//     `sql_drop` arm had the identical shape.
+//
+// Both are the same defect — grading something other than the function
+// the trigger points at — and the OID is what the trigger points at, so
+// keying on it closes the class rather than its members: a decoy of any
+// name, arity or schema either IS the bound function (and is graded) or is
+// not (and is irrelevant). The arity scope is subsumed: an OID names one
+// pg_proc row. The sluice-schema filter stays as belt-and-braces for the
+// trigger grade's own namespace refusal ([gradeCaptureShape]) — a bound OID
+// that does not come back is refused below, so this arm cannot silently
+// grade fewer functions than the triggers execute.
 
 // captureFunctionShapeQuery is package-level so
-// [TestLoadInstalledCaptureFunctionShapes_ScopesByArity] can grade the
-// predicate itself: the one thing that must never come back is a read scoped
-// by proname without an arity bound (see [captureFunctionArity] for why).
+// [TestLoadInstalledCaptureFunctionShapes_KeysOnBoundOIDs] can grade the
+// predicate itself: the one thing that must never come back is a read
+// scoped by proname (see the block above for why).
 func captureFunctionShapeQuery() string {
 	return `
-SELECT p.proname,
+SELECT p.oid,
+       p.proname,
        p.prosrc,
        p.prosecdef,
        pg_catalog.array_to_string(COALESCE(p.proconfig, '{}'::text[]), E'\n')
   FROM pg_catalog.pg_proc      p
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname = $1
-   AND p.proname IN ($2, $3, $4, $5)
-   AND p.pronargs = $6
+   AND p.oid = ANY($2::oid[])
  ORDER BY p.proname`
 }
 
 // loadInstalledCaptureFunctionShapes reads the three definition columns for
-// whichever sluice capture functions exist in the schema. proconfig is
-// joined server-side rather than scanned as an array: the entries are
-// `name=value` strings that cannot contain a newline, and this keeps the
-// read off any driver array-codec behaviour.
-func loadInstalledCaptureFunctionShapes(ctx context.Context, db *sql.DB, schema string) (map[string]captureFunctionShape, error) {
-	rows, err := db.QueryContext(ctx, captureFunctionShapeQuery(), schema,
-		CaptureFunctionRow, CaptureFunctionTruncate, CaptureFunctionDDL, CaptureFunctionDrop,
-		captureFunctionArity)
+// exactly the functions in bound — the OIDs the installed capture triggers
+// execute — within the sluice schema, and refuses if any of them does not
+// come back (it resolves outside the schema, or vanished between the
+// trigger read and this one). proconfig is joined server-side rather than
+// scanned as an array: the entries are `name=value` strings that cannot
+// contain a newline, and this keeps the read off any driver array-codec
+// behaviour.
+func loadInstalledCaptureFunctionShapes(ctx context.Context, db *sql.DB, schema string, bound []uint32) (map[string]captureFunctionShape, error) {
+	rows, err := db.QueryContext(ctx, captureFunctionShapeQuery(), schema, bound)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	out := map[string]captureFunctionShape{}
+	missing := make(map[uint32]bool, len(bound))
+	for _, oid := range bound {
+		missing[oid] = true
+	}
 	for rows.Next() {
 		var (
+			oid    uint32
 			shape  captureFunctionShape
 			config string
 		)
-		if err := rows.Scan(&shape.name, &shape.body, &shape.definer, &config); err != nil {
+		if err := rows.Scan(&oid, &shape.name, &shape.body, &shape.definer, &config); err != nil {
 			return nil, err
 		}
-		// Refuse rather than collapse. The arity scope should make this
-		// unreachable; if it ever fires, the read is ambiguous and this
-		// door must not pick a winner — silently keeping one of two
-		// definitions is the exact defect the arity scope closes.
+		delete(missing, oid)
+		// Refuse rather than collapse. Two bound OIDs sharing a name within
+		// one schema is a state PostgreSQL does not produce for trigger
+		// functions (0 declared arguments, so name + schema is the whole
+		// signature); if it ever fires, the read is ambiguous and this door
+		// must not pick a winner — silently keeping one of two definitions
+		// is the exact defect the OID scope closes.
 		if _, dup := out[shape.name]; dup {
 			return nil, fmt.Errorf("pgtrigger: capture function %q resolves to more than one "+
-				"%d-argument definition in schema %q — the installed capture shape is ambiguous "+
+				"bound definition in schema %q — the installed capture shape is ambiguous "+
 				"and cannot be graded; inspect pg_proc for duplicates before resuming",
-				shape.name, captureFunctionArity, schema)
+				shape.name, schema)
 		}
 		shape.body = normalizeFunctionBody(shape.body)
 		for _, entry := range strings.Split(config, "\n") {
@@ -379,7 +394,22 @@ func loadInstalledCaptureFunctionShapes(ctx context.Context, db *sql.DB, schema 
 		sort.Strings(shape.settings)
 		out[shape.name] = shape
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(missing) != 0 {
+		oids := make([]string, 0, len(missing))
+		for oid := range missing {
+			oids = append(oids, fmt.Sprint(oid))
+		}
+		sort.Strings(oids)
+		return nil, fmt.Errorf("pgtrigger: capture trigger(s) are bound to function OIDs %s that do not resolve to a function "+
+			"in schema %q — the trigger executes something this door cannot grade (a function in another schema, or one dropped "+
+			"between reads); refusing to stream. Re-run `sluice trigger setup --dsn=... --tables=...` to rebind the triggers to "+
+			"the real capture functions",
+			strings.Join(oids, ", "), schema)
+	}
+	return out, nil
 }
 
 // captureFunctionDrift is one function whose installed definition is not

@@ -23,8 +23,8 @@ import (
 // one table.
 func healthyTriggers(table string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
-		{table: table, name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-		{table: table, name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+		{table: table, name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 	}
 }
 
@@ -32,20 +32,20 @@ func healthyTriggers(table string) []installedCaptureTrigger {
 // (ENABLE ALWAYS) pair for one table.
 func alwaysTriggers(table string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
-		{table: table, name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-		{table: table, name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+		{table: table, name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 	}
 }
 
 // healthyEvt / healthyDropEvt are the two event-trigger arms' states in a
 // full (event-trigger-tier) install.
 var (
-	healthyEvt     = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL}
-	healthyDropEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDrop}
+	healthyEvt     = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL, fnSchema: "public"}
+	healthyDropEvt = eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDrop, fnSchema: "public"}
 	// The ENABLE ALWAYS ('A') shapes the --capture-replicated-writes opt-in
 	// installs (ADR-0185 + audit A-1).
-	alwaysEvt     = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL}
-	alwaysDropEvt = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDrop}
+	alwaysEvt     = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL, fnSchema: "public"}
+	alwaysDropEvt = eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDrop, fnSchema: "public"}
 )
 
 // tiers builds the event-trigger-tier state with BOTH arms' functions
@@ -111,8 +111,8 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "plain row trigger under the opt-in posture refuses (replicated writes silently uncaptured)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
@@ -121,8 +121,8 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "plain truncate trigger under the opt-in posture refuses too (both members graded)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
@@ -131,8 +131,8 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "disabled trigger still refuses under the opt-in posture",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
 			captureReplicated: true,
@@ -145,7 +145,7 @@ func TestGradeCaptureShape(t *testing.T) {
 			// way round).
 			name:      "event trigger ENABLE ALWAYS under a recorded origin-only posture refuses",
 			installed: healthyTriggers("t"),
-			ddl:       tiers(eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL}, healthyDropEvt),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "A", fn: CaptureFunctionDDL, fnSchema: "public"}, healthyDropEvt),
 			wantErr:   []string{CaptureTriggerDDL, "ENABLE ALWAYS", "ORIGIN-ONLY"},
 		},
 		{
@@ -187,13 +187,13 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name:      "disabled drop event trigger refuses",
 			installed: healthyTriggers("t"),
-			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDrop}),
+			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDrop, fnSchema: "public"}),
 			wantErr:   []string{CaptureTriggerDrop, "not enabled", "DROP of a captured table"},
 		},
 		{
 			name:      "drop event trigger bound to a foreign function refuses",
 			installed: healthyTriggers("t"),
-			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_drop_hook"}),
+			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_drop_hook", fnSchema: "public"}),
 			wantErr:   []string{CaptureTriggerDrop, "somebody_elses_drop_hook"},
 		},
 		{
@@ -203,38 +203,38 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "missing row trigger refuses naming it",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{`"t"`, CaptureTriggerRow, "MISSING", "trigger setup"},
 		},
 		{
 			name: "missing truncate trigger refuses naming it",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
 			},
 			wantErr: []string{CaptureTriggerTruncate, "MISSING", "TRUNCATE"},
 		},
 		{
 			name: "disabled trigger refuses",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"DISABLED", "DISABLE TRIGGER"},
 		},
 		{
 			name: "ENABLE REPLICA trigger refuses (fires for no origin write)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "R", fn: CaptureFunctionRow, tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "R", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"ENABLE REPLICA", "session_replication_role"},
 		},
 		{
 			name: "foreign bound function refuses",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: "audit_everything", tgtype: expectedRowTgType},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: "audit_everything", fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"audit_everything", CaptureFunctionRow, "not what this sluice installs"},
 		},
@@ -242,8 +242,8 @@ func TestGradeCaptureShape(t *testing.T) {
 			name: "wrong trigger shape (tgtype) refuses",
 			installed: []installedCaptureTrigger{
 				// BEFORE instead of AFTER: tgtype carries the BEFORE bit.
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, tgtype: expectedRowTgType | 1<<1},
-				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, tgtype: expectedTruncateTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType | 1<<1},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"tgtype", "trigger setup"},
 		},
@@ -256,14 +256,51 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name:      "disabled event trigger refuses",
 			installed: healthyTriggers("t"),
-			ddl:       tiers(eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDDL}, healthyDropEvt),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "D", fn: CaptureFunctionDDL, fnSchema: "public"}, healthyDropEvt),
 			wantErr:   []string{CaptureTriggerDDL, "not enabled"},
 		},
 		{
 			name:      "event trigger bound to a foreign function refuses",
 			installed: healthyTriggers("t"),
-			ddl:       tiers(eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_ddl_hook"}, healthyDropEvt),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "O", fn: "somebody_elses_ddl_hook", fnSchema: "public"}, healthyDropEvt),
 			wantErr:   []string{CaptureTriggerDDL, "somebody_elses_ddl_hook"},
+		},
+		// SLP-1 (audit 2026-09-01): a SAME-NAMED function in ANOTHER schema
+		// bound to a capture trigger. Every arm compared names, so all four
+		// tiers passed it while the body arm graded the untouched original;
+		// on real PG 16 the row tier recorded 0 change-log rows for 3
+		// INSERTs + 1 UPDATE and the DDL tier recorded no `X` for an ALTER
+		// TABLE. One cell per tier, because a refusal that reached one and
+		// not its siblings is the sibling-miss shape.
+		{
+			name: "row trigger bound to a same-named function in another schema refuses (SLP-1)",
+			installed: []installedCaptureTrigger{
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "decoy", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
+			},
+			ddl:     healthyTiers(),
+			wantErr: []string{CaptureTriggerRow, `"decoy"."` + CaptureFunctionRow + `"`, "OUTSIDE the sluice schema", "INSERT/UPDATE/DELETE"},
+		},
+		{
+			name: "truncate trigger bound to a same-named function in another schema refuses (SLP-1)",
+			installed: []installedCaptureTrigger{
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "decoy", tgtype: expectedTruncateTgType},
+			},
+			ddl:     healthyTiers(),
+			wantErr: []string{CaptureTriggerTruncate, `"decoy"."` + CaptureFunctionTruncate + `"`, "OUTSIDE the sluice schema", "TRUNCATE"},
+		},
+		{
+			name:      "ddl_command_end event trigger bound to a same-named function in another schema refuses (SLP-1)",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDDL, fnSchema: "decoy"}, healthyDropEvt),
+			wantErr:   []string{CaptureTriggerDDL, `"decoy"."` + CaptureFunctionDDL + `"`, "OUTSIDE the sluice schema", "ALTER/CREATE DDL"},
+		},
+		{
+			name:      "sql_drop event trigger bound to a same-named function in another schema refuses (SLP-1)",
+			installed: healthyTriggers("t"),
+			ddl:       tiers(healthyEvt, eventTriggerState{present: true, enabled: "O", fn: CaptureFunctionDrop, fnSchema: "decoy"}),
+			wantErr:   []string{CaptureTriggerDrop, `"decoy"."` + CaptureFunctionDrop + `"`, "OUTSIDE the sluice schema", "DROP of a captured table"},
 		},
 	}
 	for _, tc := range cases {

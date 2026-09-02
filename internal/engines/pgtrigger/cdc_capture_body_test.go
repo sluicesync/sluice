@@ -411,32 +411,68 @@ func assertCaptureDigestFloorIsFrozenInSource(t *testing.T) {
 	}
 }
 
-// TestLoadInstalledCaptureFunctionShapes_ScopesByArity is the unit half of
-// the overload-decoy fix, keyed on the query text so the scope cannot be
-// dropped without a red — the same shape as
+// TestLoadInstalledCaptureFunctionShapes_KeysOnBoundOIDs is the unit half
+// of the decoy-function fixes (the v0.137.0 overload and audit 2026-09-01
+// SLP-1's other-schema decoy — one class, see the block above
+// captureFunctionShapeQuery), keyed on the query text so the scope cannot
+// be dropped without a red — the same shape as
 // TestProbeRelayControlTable_ExistenceQueryIsDatabaseWide. The behavioural
-// half runs the real attack on real PostgreSQL in
-// TestCaptureFunctionBodyDoor.
+// half runs both attacks on real PostgreSQL: TestCaptureFunctionBodyDoor
+// (overload) and TestCDCOpen_CaptureShapeDoor_DecoySchema (namespace).
 //
-// Selecting on proname alone is not a narrower read, it is an AMBIGUOUS one:
-// PostgreSQL permits overloading, so a same-named decoy carrying a healthy
-// body could be planted beside a gutted capture function and win the map
-// collapse, leaving the door reading a definition no trigger executes.
-func TestLoadInstalledCaptureFunctionShapes_ScopesByArity(t *testing.T) {
+// Selecting on proname is not a narrower read, it is a read of SOMETHING
+// ELSE: a name resolves to one function only within one schema and one
+// argument list, and the trigger carries none of that — it carries an OID.
+// The read must be scoped by the bound OIDs and nothing name-shaped.
+func TestLoadInstalledCaptureFunctionShapes_KeysOnBoundOIDs(t *testing.T) {
 	t.Parallel()
 	q := captureFunctionShapeQuery()
-	if !strings.Contains(q, "pronargs") {
-		t.Errorf("the installed-shape read no longer scopes by argument count, so a same-named "+
-			"overload can be graded in place of the function the trigger actually calls:\n%s", q)
+	if !strings.Contains(q, "p.oid = ANY(") {
+		t.Errorf("the installed-shape read no longer scopes by the bound function OIDs, so a same-named "+
+			"decoy (another schema, or an overload) can be graded in place of the function the trigger actually calls:\n%s", q)
+	}
+	if strings.Contains(q, "proname IN") || strings.Contains(q, "proname =") {
+		t.Errorf("the installed-shape read scopes by proname again — a name is not the function's identity:\n%s", q)
+	}
+	if !strings.Contains(q, "nspname = $1") {
+		t.Errorf("the installed-shape read no longer confines the graded functions to the sluice schema; a bound OID "+
+			"outside it must fail to resolve here rather than be graded:\n%s", q)
 	}
 	// Anti-vacuity: the text the gate read must really be the shape query,
-	// not some other string that happens to mention pronargs.
+	// not some other string that happens to mention p.oid.
 	if !strings.Contains(q, "pg_proc") || !strings.Contains(q, "prosrc") || !strings.Contains(q, "prosecdef") {
 		t.Errorf("the gate matched something that is not the capture-function shape query:\n%s", q)
 	}
-	if captureFunctionArity != 0 {
-		t.Errorf("captureFunctionArity = %d; a trigger function takes no declared arguments, and a "+
-			"non-zero scope would exclude every real capture function", captureFunctionArity)
+}
+
+// TestBoundCaptureFunctionOIDs pins the body arm's read scope: the OID of
+// EVERY installed capture trigger's function — per-table pair and both
+// event-trigger arms — deduplicated, and nothing from an absent arm. A tier
+// left out here is a tier the body arm silently stops grading.
+func TestBoundCaptureFunctionOIDs(t *testing.T) {
+	t.Parallel()
+	installed := []installedCaptureTrigger{
+		{table: "a", name: CaptureTriggerRow, fn: CaptureFunctionRow, fnSchema: "public", fnOID: 11},
+		{table: "a", name: CaptureTriggerTruncate, fn: CaptureFunctionTruncate, fnSchema: "public", fnOID: 12},
+		{table: "b", name: CaptureTriggerRow, fn: CaptureFunctionRow, fnSchema: "public", fnOID: 11},
+		{table: "b", name: CaptureTriggerTruncate, fn: CaptureFunctionTruncate, fnSchema: "decoy", fnOID: 99},
+	}
+	ddl := ddlCaptureState{
+		fnPresent: map[string]bool{CaptureFunctionDDL: true, CaptureFunctionDrop: true},
+		triggers: map[string]eventTriggerState{
+			CaptureTriggerDDL:  {present: true, enabled: "O", fn: CaptureFunctionDDL, fnSchema: "public", fnOID: 13},
+			CaptureTriggerDrop: {}, // absent arm: no OID to grade
+		},
+	}
+	got := boundCaptureFunctionOIDs(installed, ddl)
+	want := []uint32{11, 12, 13, 99}
+	if len(got) != len(want) {
+		t.Fatalf("bound OIDs = %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("bound OIDs = %v; want %v", got, want)
+		}
 	}
 }
 
