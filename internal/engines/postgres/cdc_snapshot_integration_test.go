@@ -231,6 +231,39 @@ func countIdleInTxSessions(t *testing.T, ctx context.Context, dsn string) int {
 	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
 		t.Fatalf("count idle-in-tx: %v", err)
 	}
+	if n == 0 {
+		return n
+	}
+	// Phase A instrumentation (2026-09-02, first CI occurrence of `got 1`
+	// on the -race shard): a bare count cannot say WHICH connection was
+	// still inside a transaction — the released snapshot conn, the CDC
+	// reader's, or the importer pool's — so name each offender. This only
+	// changes the failure message; the assertion above is unchanged.
+	rows, err := db.QueryContext(ctx, `
+		SELECT COALESCE(application_name, ''), backend_type,
+		       COALESCE(EXTRACT(EPOCH FROM (pg_catalog.now() - xact_start)), -1)::float8,
+		       LEFT(COALESCE(query, ''), 80)
+		FROM pg_stat_activity
+		WHERE datname  = current_database()
+		  AND state    = 'idle in transaction'
+		  AND pid     <> pg_backend_pid()`)
+	if err != nil {
+		t.Logf("idle-in-tx detail query failed: %v", err)
+		return n
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var app, backend, query string
+		var age float64
+		if err := rows.Scan(&app, &backend, &age, &query); err != nil {
+			t.Logf("idle-in-tx detail scan: %v", err)
+			return n
+		}
+		t.Logf("idle-in-tx session: application_name=%q backend_type=%q xact_age=%.3fs last_query=%q", app, backend, age, query)
+	}
+	if err := rows.Err(); err != nil {
+		t.Logf("idle-in-tx detail rows: %v", err)
+	}
 	return n
 }
 
