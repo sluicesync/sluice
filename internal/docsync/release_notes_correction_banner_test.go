@@ -88,6 +88,14 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 137, 2},
+		fixedIn:     semver{0, 137, 5},
+		claimMarker: "GTID mode, where GTID UUIDs are themselves instance-bound and were always checked",
+		why: "the GTID resume arm checked only GTID_SUBSET(@@gtid_purged, resume), which a fresh instance's " +
+			"empty gtid_purged satisfies; a foreign GTID-mode position was accepted and backup incremental " +
+			"recorded the wrong instance's history as the chain delta at exit 0 (audit 2026-09-01 SLM-2)",
+	},
+	{
 		amended:     semver{0, 133, 0},
 		fixedIn:     semver{0, 133, 1},
 		claimMarker: "the meta-table migration happens only at the next `trigger setup` run",

@@ -2066,10 +2066,13 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 			}
 			return nil
 		}
-		// GTID UUIDs are themselves instance-bound, so a fresh
-		// instance's gtid_purged/gtid_executed carry a different
-		// source UUID and verifyGTIDSetReachable already catches the
-		// node-replace case without a separate identity check.
+		// GTID UUIDs are instance-bound, but that binds NOTHING by itself:
+		// the purged check (verifyGTIDSetReachable) asks only whether the
+		// source has thrown away something the position needs, which a
+		// fresh instance never has. Lineage is bound by the second arm it
+		// now runs, verifyGTIDLineageContinuity — the source must have
+		// EXECUTED everything the position consumed (audit 2026-09-01
+		// SLM-2; the previous comment here claimed the opposite).
 		return verifyGTIDSetReachable(ctx, r.db, p.GTIDSet)
 	default:
 		return fmt.Errorf("mysql: cannot verify position with mode %q", p.Mode)
@@ -2353,7 +2356,7 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 		return fmt.Errorf("mysql: GTID_SUBSET(@@gtid_purged, resume): %w", err)
 	}
 	if subset == 1 {
-		return nil
+		return verifyGTIDLineageContinuity(ctx, db, resumeSet)
 	}
 	// Item 132 interaction, checked rather than assumed: a resume set is now
 	// the PRE-transaction set of whatever the reader was in the middle of, so
@@ -2372,6 +2375,58 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 	// pre-toggle resume set fails this check.
 	return fmt.Errorf("mysql: source has purged GTIDs not present in resume set%s; cannot resume: %w",
 		cloudSQLPositionLossHint(ctx, db), ir.ErrPositionInvalid)
+}
+
+// verifyGTIDLineageContinuity is the OTHER direction of the GTID resume
+// check, and the one that binds the position to an instance lineage:
+// everything the position claims to have consumed must be in the source's
+// @@global.gtid_executed. The purged check alone asks only "has the source
+// thrown away anything I still need?", which a FRESH or RESET instance
+// answers with an empty gtid_purged — the empty set is a subset of every
+// set — so a position captured on instance A resumed against unrelated
+// instance B passed, and StartSyncGTID with A's set made B stream every
+// transaction B had ever executed. Observed 2026-09-01 (audit SLM-2):
+// `backup incremental` recorded the wrong instance's whole history as the
+// chain delta at exit 0, manifest end_position the union of two lineages.
+// The comment this function replaced claimed "GTID UUIDs are themselves
+// instance-bound, so verifyGTIDSetReachable already catches the
+// node-replace case"; it did not, and v0.137.2's notes repeated it.
+//
+// A promoted replica passes (its executed set is a superset of what it
+// replicated); a restore with `--set-gtid-purged=ON` passes (gtid_purged
+// seeds gtid_executed); a fresh instance, a RESET MASTER, and a replica
+// promoted WITHOUT some transactions the old primary had — which sluice
+// already applied to the target — all refuse with ir.ErrPositionInvalid
+// and route to the ADR-0022/ADR-0093 cold-start fall-through, exactly as
+// the file/pos arm's identity mismatch does.
+func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet string) error {
+	var contained int
+	var executed string
+	err := db.QueryRowContext(
+		ctx,
+		"SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed",
+		resumeSet,
+	).Scan(&contained, &executed)
+	if err != nil {
+		return fmt.Errorf("mysql: GTID_SUBSET(resume, @@gtid_executed): %w", err)
+	}
+	if contained == 1 {
+		return nil
+	}
+	return fmt.Errorf("mysql: the resume GTID set is not contained in the source's @@global.gtid_executed "+
+		"(resume %q; source executed %q) — the source is a different lineage (a fresh, reset, or rebuilt instance, "+
+		"or a replica promoted without transactions the old primary had); cannot resume: %w",
+		abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+}
+
+// abbreviateGTIDSet keeps an error message readable when a gtid_executed
+// carries many source UUIDs: the first 160 bytes plus an ellipsis.
+func abbreviateGTIDSet(s string) string {
+	const keep = 160
+	if len(s) <= keep {
+		return s
+	}
+	return s[:keep] + "…"
 }
 
 // goMySQLFlavor maps sluice's [Flavor] to the go-mysql flavor constant

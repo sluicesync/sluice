@@ -105,6 +105,15 @@ func classifyReaderError(err error) error {
 			"source mariadb cannot resume: the persisted domain-GTID position is older than the source's retained binlogs (required binlog files have been purged); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
 		)
 	}
+	// The sibling 1236: a domain-GTID the source has NEVER had — a fresh,
+	// reset or rebuilt instance, or a position captured on a different
+	// server (audit 2026-09-01 SLM-2's MariaDB arm, measured live). Same
+	// route: the position is not resumable here, so cold-start.
+	if isMariaDBForeignGTIDError(err) {
+		return fmt.Errorf(
+			"source mariadb cannot resume: the persisted domain-GTID position was never executed on this source (a fresh, reset, or replaced instance, or a position from a different server); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
+		)
+	}
 	// Oversized gRPC message. Checked BEFORE the retriable classifier for the
 	// same reason the purged-position branches are: the text carries
 	// `code = ResourceExhausted`, which vitessRetriableSubstrings matches as
@@ -409,6 +418,25 @@ func isVStreamMissingFieldEventError(err error) bool {
 // to a restart loop against an unreachable position.
 func isMariaDBPurgedGTIDError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "could not find gtid state requested")
+}
+
+// isMariaDBForeignGTIDError reports whether err is MariaDB's OTHER
+// GTID-resume 1236 — a position the server has never had at all, as
+// opposed to one it once had and purged (ground-truthed live against
+// mariadb:11.4, 2026-09-02, resuming instance A's position on unrelated
+// fresh instance B; audit SLM-2's MariaDB sibling):
+//
+//	"Error: connecting slave requested to start from GTID 0-1-3, which is
+//	 not in the master's binlog"
+//
+// Same consequence as the purged shape — the position is not resumable on
+// this source — so it takes the same ir.ErrPositionInvalid route to the
+// ADR-0022/ADR-0093 cold-start fall-through. Before this matcher the
+// refusal was LOUD but TERMINAL: the stream exited instead of taking the
+// fall-through the MariaDB arm's pre-check comment promises. The
+// discriminating phrase is unique to this server message.
+func isMariaDBForeignGTIDError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "which is not in the master's binlog")
 }
 
 // isVStreamPurgedGTIDError reports whether err is the source's

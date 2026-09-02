@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.137.5] - 2026-09-02
+
+Closes a silent data-loss hole in MySQL GTID-mode resume and corrects v0.137.2's claim that GTID mode was never exposed. **If you run MySQL sync or a backup chain with `gtid_mode=ON` and your source instance can be replaced, reset, or rebuilt, read the Fixed section.**
+
+### Fixed
+
+**A GTID-mode position is now bound to the source's lineage, not just to whatever the source has not purged.** v0.137.2 said GTID mode needed no identity stamp because "GTID UUIDs are themselves instance-bound and were always checked". The GTID resume arm ran one check, `GTID_SUBSET(@@global.gtid_purged, resume)` — has the source purged anything the position needs — and a fresh or reset instance has purged nothing, so its empty `gtid_purged` is a subset of every set. A position captured on instance A and resumed against unrelated instance B was accepted, and MySQL streamed B's entire history. Observed on two real MySQL 8.0 instances (audit 2026-09-01, SLM-2): `backup incremental` recorded the other instance's fourteen changes as the chain delta at exit 0, manifest `end_position` the union of two lineages. The fix is the other direction, `GTID_SUBSET(resume, @@global.gtid_executed)`: the source must have executed everything the position consumed. Promoted replicas and `--set-gtid-purged=ON` restores pass; fresh, reset, and rebuilt instances, and a replica promoted without transactions the old primary had, refuse with the position-invalid error and take the same cold-start fall-through as a file/pos identity mismatch. Pinned on real servers in all three directions (foreign instance refuses; same instance accepts; a third instance seeded with the set accepts despite a different `@@server_uuid`), mutation-run.
+
+**MariaDB measured, not assumed:** the server refuses a foreign domain-GTID with error 1236 "which is not in the master's binlog", but sluice classified only the purged-wording 1236, so that refusal was loud and terminal rather than routing to the cold-start fall-through. Now classified as position-invalid. No silent loss on MariaDB.
+
+**Who was exposed:** MySQL GTID-mode sources on every release that resumed a GTID position, when the instance was replaced, reset, or rebuilt without the old lineage — `sync` warm resume, `backup incremental`, chain replay, and the backup→CDC handoff share the one check. **Not exposed:** file/pos mode (v0.137.2), MariaDB (server-refused), Postgres (ADR-0051). PlanetScale/Vitess VStream positions ride a different arm and were **not measured** here.
+
+### Compatibility
+
+Drop-in from v0.137.4. No schema, format, or flag change. One new refusal shape: a GTID resume whose set is not contained in the source's `gtid_executed` now refuses where it previously streamed, taking the existing cold-start fall-through (re-snapshot by default; hard stop under `--no-auto-resnapshot`).
+
 ### Changed
 
 **The pg_catalog qualification gate's universe is now the union of PostgreSQL 16, 17, 18 and 19beta3.** v0.137.4 shipped it as a PostgreSQL 16.15 dump alone (2,694 names). The operator asked the right question at release time — what about 17, 18 and 19 — and the measurement is: 17 adds 37 catalog function names, 18 another 106, 19beta3 another 47, and sluice spells none of them unqualified today, so v0.137.4 has no exposure from the gap. But a future call to a function that only exists on a newer major would have been ungraded, so the fixture is now the union (2,847 names, `internal/engines/testdata/pg_catalog_procs.txt`), with a floor that fails if a major is lost and three version sentinels — one name first added in each of 17, 18 and 19 — that fail if the union was not actually taken. Test-only; no runtime change.
@@ -49,6 +65,8 @@ Choosing the weaker arm silently, on MySQL 8's default, left operators with no w
 Drop-in from v0.137.2. No schema, format, or flag change, and no change to which positions resume or refuse — only new log output.
 
 ## [0.137.2] - 2026-09-01
+
+> **Correction (2026-09-02):** the "Not affected: GTID mode, where GTID UUIDs are themselves instance-bound and were always checked" claim below was false — the GTID arm checked only that nothing had been purged, which a fresh instance's empty `gtid_purged` satisfies, so a foreign GTID-mode position was accepted and `backup incremental` recorded the wrong instance's history as the chain delta at exit 0 (audit 2026-09-01, SLM-2). Fixed in v0.137.5.
 
 Closes a silent data-loss hole in the MySQL backup→CDC handoff. **If you resume MySQL sync from a backup manifest and your source has `gtid_mode=OFF` (MySQL 8's default), read the Fixed section — a fresh full backup is worth taking.**
 

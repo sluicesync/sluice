@@ -1,5 +1,7 @@
 # sluice v0.137.2
 
+> **Correction (2026-09-02):** the "Not affected" line below — "GTID mode, where GTID UUIDs are themselves instance-bound and were always checked" — was false. The GTID resume arm checked only that nothing the position needs had been *purged*, and a fresh or reset instance has an empty `gtid_purged`, which is a subset of everything. A GTID-mode position captured on one instance and resumed against an unrelated one was accepted, and `backup incremental` recorded the wrong instance's entire history as the chain delta at exit 0 (audit 2026-09-01, SLM-2). Fixed in v0.137.5, which adds the lineage check the sentence assumed existed. MariaDB, PlanetScale/Vitess and Postgres remain as stated.
+
 **A silent data-loss hole in the MySQL backup→CDC handoff is closed.** If you resume MySQL sync from a backup manifest and your source runs `gtid_mode=OFF` — MySQL 8's default — a resume pointed at a *replaced or rebuilt* server could start streaming from a byte offset in an unrelated binlog and skip changes at exit 0. Upgrade, and take one fresh full backup to move existing chains onto the stronger guard. Drop-in from v0.137.1.
 
 ## Fixed

@@ -171,6 +171,19 @@ func TestClassifyReaderError_PurgedGTID(t *testing.T) {
 			true,
 		},
 		{
+			// MariaDB's OTHER 1236: a domain-GTID this server never had (a
+			// fresh/reset/replaced instance, or a position from another
+			// server). Measured verbatim on mariadb:11.4 resuming instance
+			// A's position on fresh instance B (audit 2026-09-01 SLM-2's
+			// MariaDB arm). Before isMariaDBForeignGTIDError existed this
+			// was loud but TERMINAL — the stream exited instead of taking
+			// the cold-start fall-through the arm's own comment promises.
+			"mariadb 1236 gtid not in the master's binlog",
+			errors.New("mysql: cdc: get event: ERROR 1236 (HY000): Error: connecting slave requested to start from GTID 0-1-3, " +
+				"which is not in the master's binlog"),
+			true,
+		},
+		{
 			// PlanetScale-flavored: the purged error arrives as a gRPC
 			// status carrying codes.Unknown (in the ADR-0038 retriable
 			// set). The purged check MUST win before isRetriableGRPCCode,

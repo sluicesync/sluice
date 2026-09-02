@@ -70,10 +70,14 @@ type binlogPos struct {
 	// source's current one turns that silent gap into a loud
 	// ir.ErrPositionInvalid → ADR-0022 cold-start re-snapshot.
 	//
-	// GTID mode does not need this: GTID UUIDs are themselves
-	// instance-bound, so verifyGTIDSetReachable already catches a
-	// fresh instance (its gtid_purged/gtid_executed carry a different
-	// source UUID). Empty on positions persisted before this field
+	// GTID mode does not carry this field, and until v0.137.5 that
+	// rested on a false premise ("GTID UUIDs are instance-bound, so
+	// verifyGTIDSetReachable already catches a fresh instance"): the
+	// purged check passes on a fresh instance because its gtid_purged is
+	// empty. GTID lineage is bound by verifyGTIDLineageContinuity — the
+	// resume set must be contained in the source's gtid_executed — which
+	// is the GTID arm's equivalent of this stamp (audit 2026-09-01
+	// SLM-2). Empty on positions persisted before this field
 	// existed (zero-users project, but a position could straddle an
 	// in-flight upgrade); the verify path treats an empty persisted
 	// uuid as "skip the identity check" so no false refusal — the
