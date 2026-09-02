@@ -238,7 +238,7 @@ func stripPGCatalogQualifiers(s string) string {
 			continue
 		}
 		if len(s)-i >= len(q) && strings.EqualFold(s[i:i+len(q)], q) &&
-			(i == 0 || !(s[i-1] == '_' || s[i-1] == '.' || isIdentRune(rune(s[i-1])))) {
+			(i == 0 || (s[i-1] != '.' && !isIdentRune(rune(s[i-1])))) {
 			i += len(q)
 			continue
 		}
