@@ -89,7 +89,7 @@ func sweepOrphanedBackupAnchors(ctx context.Context, db *sql.DB, now time.Time) 
 		 WHERE slot_name LIKE $1 ESCAPE '\'
 		   AND NOT active
 		   AND NOT temporary
-		   AND database = current_database()
+		   AND database = pg_catalog.current_database()
 		 ORDER BY slot_name`, pattern)
 	if err != nil {
 		return fmt.Errorf("postgres: sweep backup anchors: list slots: %w", err)
@@ -129,11 +129,11 @@ func sweepOrphanedBackupAnchors(ctx context.Context, db *sql.DB, now time.Time) 
 				slog.String("slot", name),
 				slog.Duration("age", age),
 				slog.Duration("min_age", backupAnchorOrphanMinAge),
-				slog.String("manual_drop", fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", name)),
+				slog.String("manual_drop", fmt.Sprintf("SELECT pg_catalog.pg_drop_replication_slot('%s')", name)),
 			)
 			continue
 		}
-		if _, err := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", name); err != nil {
+		if _, err := db.ExecContext(ctx, "SELECT pg_catalog.pg_drop_replication_slot($1)", name); err != nil {
 			if isSlotAlreadyGoneErr(err) {
 				continue // raced with manual cleanup — already gone is success
 			}

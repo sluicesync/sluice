@@ -155,7 +155,7 @@ func probeConnectionBudget(ctx context.Context, db *sql.DB) (connectionBudgetPro
 	// produced a FALSE "connection budget exhausted" that blocked cold
 	// start. backend_type is PG 10+; sluice's pgoutput CDC already
 	// requires PG 10+, so the column is always present.
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'`).Scan(&p.currentTotal); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT pg_catalog.count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'`).Scan(&p.currentTotal); err != nil {
 		return p, fmt.Errorf("probe pg_stat_activity count: %w", err)
 	}
 	// rolconnlimit for the connecting role. COALESCE guards the
@@ -163,25 +163,25 @@ func probeConnectionBudget(ctx context.Context, db *sql.DB) (connectionBudgetPro
 	// pg_roles entry) so a NULL scan never panics.
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT COALESCE(max(rolconnlimit), -1) FROM pg_roles WHERE rolname = current_user`,
+		`SELECT COALESCE(pg_catalog.max(rolconnlimit), -1) FROM pg_roles WHERE rolname = current_user`,
 	).Scan(&p.rolConnLimit); err != nil {
 		return p, fmt.Errorf("probe rolconnlimit: %w", err)
 	}
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_stat_activity WHERE usename = current_user`,
+		`SELECT pg_catalog.count(*) FROM pg_stat_activity WHERE usename = current_user`,
 	).Scan(&p.roleCurrent); err != nil {
 		return p, fmt.Errorf("probe role connection count: %w", err)
 	}
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT COALESCE(max(datconnlimit), -1) FROM pg_database WHERE datname = current_database()`,
+		`SELECT COALESCE(pg_catalog.max(datconnlimit), -1) FROM pg_database WHERE datname = pg_catalog.current_database()`,
 	).Scan(&p.datConnLimit); err != nil {
 		return p, fmt.Errorf("probe datconnlimit: %w", err)
 	}
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()`,
+		`SELECT pg_catalog.count(*) FROM pg_stat_activity WHERE datname = pg_catalog.current_database()`,
 	).Scan(&p.dbCurrent); err != nil {
 		return p, fmt.Errorf("probe database connection count: %w", err)
 	}

@@ -7,7 +7,7 @@ package postgres
 // changes (task #22). Per-shape DDL emit for PG.
 //
 // Each method is idempotent on the post-state via detect-then-emit
-// against pg_catalog.pg_constraint (contype = 'c'). PG supports
+// against pg_constraint (contype = 'c'). PG supports
 // `ADD CONSTRAINT IF NOT EXISTS` only via the trick of detecting
 // presence and skipping; sluice does that uniformly so the
 // takeover-stream's re-apply path on a `NotApplied` probe is safe.

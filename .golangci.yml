@@ -152,6 +152,10 @@ linters:
     # worktrees present.
     paths:
       - \.claude/
+      # workspace/ is gitignored scratch (audit reports, agent worktree
+      # residue, throwaway Go mains); CI never lints it, so the local hook
+      # must not fail on it either (audit 2026-09-01 AQP-5 / DDD-8).
+      - workspace/
     rules:
       # Length/complexity ceilings don't apply to tests: table-driven
       # test functions and integration scenarios are legitimately long,

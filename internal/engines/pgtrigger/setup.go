@@ -998,7 +998,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		"CREATE TABLE IF NOT EXISTS "+metaRef+` (
     singleton_pk   BOOLEAN PRIMARY KEY DEFAULT TRUE,
     schema_version INT NOT NULL,
-    installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    installed_at   TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
     CONSTRAINT sluice_change_log_meta_singleton CHECK (singleton_pk = TRUE)
 )`,
 		// The v3 capture-posture column (ADR-0185), added by ALTER rather
@@ -1031,7 +1031,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogConsumersTable)+` (
     consumer_id  TEXT PRIMARY KEY,
     applied_id   BIGINT NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now()
 )`,
 
 		fmt.Sprintf(
@@ -1050,7 +1050,7 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		"CREATE TABLE IF NOT EXISTS "+tableRef(ChangeLogTable)+` (
     id            BIGSERIAL PRIMARY KEY,
     txid          BIGINT NOT NULL,
-    committed_at  TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    committed_at  TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.statement_timestamp(),
     schema_name   TEXT NOT NULL,
     table_name    TEXT NOT NULL,
     op            CHAR(1) NOT NULL,
@@ -1360,7 +1360,7 @@ DECLARE
     v_before   JSONB;
     v_after    JSONB;
     v_op       CHAR(1);
-    -- v_new_json / v_old_json cache to_jsonb(NEW) / to_jsonb(OLD) so the
+    -- v_new_json / v_old_json cache pg_catalog.to_jsonb(NEW) / pg_catalog.to_jsonb(OLD) so the
     -- changed/minimal UPDATE branches compute each ONCE per row instead of
     -- 2x and 1+Nx respectively (N = column count). Unused (NULL) in the
     -- INSERT/DELETE branches and in the full mode. See ADR-0068 follow-ups.
@@ -2012,7 +2012,7 @@ func loadTableShape(ctx context.Context, db *sql.DB, schema, table string) (tabl
 	const q = `
 SELECT
     COALESCE((
-        SELECT to_jsonb(array_agg(att.attname::text ORDER BY array_position(con.conkey, att.attnum)))::text
+        SELECT pg_catalog.to_jsonb(pg_catalog.array_agg(att.attname::text ORDER BY pg_catalog.array_position(con.conkey, att.attnum)))::text
           FROM pg_constraint con
           JOIN pg_attribute  att
             ON att.attrelid = con.conrelid

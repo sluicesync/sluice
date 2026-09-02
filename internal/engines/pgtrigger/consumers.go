@@ -54,8 +54,8 @@ func (r *CDCReader) RegisterChangeLogConsumer(ctx context.Context, consumerID, d
 	// target and resumed the stream) must be able to lower the registry, or the
 	// next prune would cut above what that target has actually applied.
 	_, err = r.db.ExecContext(ctx,
-		"INSERT INTO "+r.consumersRef()+" (consumer_id, applied_id, updated_at) VALUES ($1, $2, now()) "+
-			"ON CONFLICT (consumer_id) DO UPDATE SET applied_id = EXCLUDED.applied_id, updated_at = now()",
+		"INSERT INTO "+r.consumersRef()+" (consumer_id, applied_id, updated_at) VALUES ($1, $2, pg_catalog.now()) "+
+			"ON CONFLICT (consumer_id) DO UPDATE SET applied_id = EXCLUDED.applied_id, updated_at = pg_catalog.now()",
 		consumerID, appliedLastID)
 	if err != nil {
 		return fmt.Errorf(
@@ -171,7 +171,7 @@ SELECT EXISTS (
 // already-quoted schema.table reference.
 func readConsumerRegistry(ctx context.Context, db *sql.DB, ref string) ([]triggercdc.Consumer, error) {
 	rows, err := db.QueryContext(ctx,
-		"SELECT consumer_id, applied_id, GREATEST(EXTRACT(EPOCH FROM (now() - updated_at)), 0)::BIGINT "+
+		"SELECT consumer_id, applied_id, GREATEST(EXTRACT(EPOCH FROM (pg_catalog.now() - updated_at)), 0)::BIGINT "+
 			"FROM "+ref)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: auto-prune: read consumer registry: %w", err)

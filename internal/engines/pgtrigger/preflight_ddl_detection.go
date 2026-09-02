@@ -114,8 +114,8 @@ func warnDropCaptureAbsent(ctx context.Context, state ddlCaptureState, schema st
 	}
 	slog.WarnContext(ctx,
 		"pgtrigger: "+dropCaptureAbsentMarker+": this install predates the sql_drop capture arm, so DROPPING a synced table is invisible to capture — "+
-			"PostgreSQL reports drops only through pg_event_trigger_dropped_objects() (a sql_drop event trigger), never through the "+
-			"pg_event_trigger_ddl_commands() the installed DDL tier reads, so the drop records NOTHING, the stream keeps exiting 0, and the target "+
+			"PostgreSQL reports drops only through pg_catalog.pg_event_trigger_dropped_objects() (a sql_drop event trigger), never through the "+
+			"pg_catalog.pg_event_trigger_ddl_commands() the installed DDL tier reads, so the drop records NOTHING, the stream keeps exiting 0, and the target "+
 			"keeps the dropped table's last-synced rows forever. Upgrading the sluice binary does not install the arm: re-run "+
 			"`sluice trigger setup --dsn=... --tables=...` (the change log, its resume watermark and the consumer registry are all preserved, "+
 			"and the stream resumes where it left off)",

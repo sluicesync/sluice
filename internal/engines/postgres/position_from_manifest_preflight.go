@@ -215,7 +215,7 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	var gucCount int
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_settings WHERE name ILIKE '%patroni%'`,
+		`SELECT pg_catalog.count(*) FROM pg_settings WHERE name ILIKE '%patroni%'`,
 	).Scan(&gucCount); err != nil {
 		return false, "", fmt.Errorf("query pg_settings for Patroni GUCs: %w", err)
 	}
@@ -228,7 +228,7 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	var appCount int
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_stat_replication WHERE application_name ILIKE 'patroni%'`,
+		`SELECT pg_catalog.count(*) FROM pg_stat_replication WHERE application_name ILIKE 'patroni%'`,
 	).Scan(&appCount); err != nil {
 		// pg_stat_replication is privileged in some PG versions;
 		// degrade gracefully on permission errors rather than failing
@@ -249,7 +249,7 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	var roleCount int
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_roles WHERE rolname IN ('patroni', 'replicator')`,
+		`SELECT pg_catalog.count(*) FROM pg_roles WHERE rolname IN ('patroni', 'replicator')`,
 	).Scan(&roleCount); err != nil {
 		return false, "", fmt.Errorf("query pg_roles: %w", err)
 	}
@@ -265,7 +265,7 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	var physSlotCount int
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`,
+		`SELECT pg_catalog.count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`,
 	).Scan(&physSlotCount); err != nil {
 		// pg_replication_slots can be restricted on some managed
 		// services (requires pg_read_all_stats or similar). Skip the

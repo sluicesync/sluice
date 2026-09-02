@@ -2283,7 +2283,7 @@ func primaryKeyColumnsFromCatalog(ctx context.Context, db *sql.DB, schema, table
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
-		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		JOIN   pg_attribute  a  ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		WHERE  ix.indisprimary
 		  AND  n.nspname  = $1

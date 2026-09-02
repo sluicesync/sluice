@@ -39,7 +39,7 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, slotName strin
 		slotName = defaultSlot
 	}
 	var lsn string
-	if err := r.db.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT pg_catalog.pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
 		return ir.Position{}, fmt.Errorf("postgres: CaptureBackupPosition: %w", err)
 	}
 	pos, err := encodePGPos(pgPos{Slot: slotName, LSN: lsn})

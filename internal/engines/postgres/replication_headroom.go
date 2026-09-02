@@ -54,10 +54,10 @@ func (r *SchemaReader) SourceReplicationHeadroom(ctx context.Context) (ir.Replic
 func probeReplicationHeadroom(ctx context.Context, db *sql.DB) (ir.ReplicationHeadroom, error) {
 	var h ir.ReplicationHeadroom
 	const ceilings = `
-SELECT current_setting('max_replication_slots')::int,
-       current_setting('max_wal_senders')::int,
-       (SELECT count(*) FROM pg_replication_slots),
-       (SELECT count(*) FROM pg_stat_replication)`
+SELECT pg_catalog.current_setting('max_replication_slots')::int,
+       pg_catalog.current_setting('max_wal_senders')::int,
+       (SELECT pg_catalog.count(*) FROM pg_replication_slots),
+       (SELECT pg_catalog.count(*) FROM pg_stat_replication)`
 	if err := db.QueryRowContext(ctx, ceilings).Scan(
 		&h.MaxReplicationSlots, &h.MaxWALSenders, &h.SlotsInUse, &h.ActiveWALSenders,
 	); err != nil {

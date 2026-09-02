@@ -891,12 +891,12 @@ func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
 		{
 			name: "UUID() to gen_random_uuid()",
 			in:   "UUID()",
-			want: "gen_random_uuid()",
+			want: "pg_catalog.gen_random_uuid()",
 		},
 		{
 			name: "lowercase uuid() also rewrites",
 			in:   "uuid()",
-			want: "gen_random_uuid()",
+			want: "pg_catalog.gen_random_uuid()",
 		},
 
 		// ---- ISNULL(x) → (x IS NULL) ----
@@ -1394,17 +1394,17 @@ func TestTranslateExprForPG_V35Catalog(t *testing.T) {
 		{
 			name: "HEX of bare ident",
 			in:   "HEX(id)",
-			want: "to_hex(id)",
+			want: "pg_catalog.to_hex(id)",
 		},
 		{
 			name: "HEX of int literal",
 			in:   "HEX(255)",
-			want: "to_hex(255)",
+			want: "pg_catalog.to_hex(255)",
 		},
 		{
 			name: "lowercase hex also rewrites",
 			in:   "hex(id)",
-			want: "to_hex(id)",
+			want: "pg_catalog.to_hex(id)",
 		},
 		{
 			name: "HEX with no args falls through verbatim",
@@ -1421,17 +1421,17 @@ func TestTranslateExprForPG_V35Catalog(t *testing.T) {
 		{
 			name: "FIELD of string in literal list",
 			in:   "FIELD(name, 'alpha', 'beta', 'gamma')",
-			want: "array_position(ARRAY['alpha', 'beta', 'gamma'], name)",
+			want: "pg_catalog.array_position(ARRAY['alpha', 'beta', 'gamma'], name)",
 		},
 		{
 			name: "FIELD of int in literal list",
 			in:   "FIELD(status, 1, 2, 3)",
-			want: "array_position(ARRAY[1, 2, 3], status)",
+			want: "pg_catalog.array_position(ARRAY[1, 2, 3], status)",
 		},
 		{
 			name: "lowercase field also rewrites",
 			in:   "field(x, 'a', 'b')",
-			want: "array_position(ARRAY['a', 'b'], x)",
+			want: "pg_catalog.array_position(ARRAY['a', 'b'], x)",
 		},
 		{
 			name: "FIELD with single arg (no haystack) falls through",
@@ -1535,7 +1535,7 @@ func TestTranslateExprForPG_V35Catalog(t *testing.T) {
 			// composes with the existing COALESCE pass.
 			name: "FIELD inside COALESCE composes",
 			in:   "COALESCE(FIELD(s, 'x', 'y'), 0)",
-			want: "COALESCE(array_position(ARRAY['x', 'y'], s), 0)",
+			want: "COALESCE(pg_catalog.array_position(ARRAY['x', 'y'], s), 0)",
 		},
 		{
 			// QUARTER + EXTRACT cast composes inside a CHECK shape.
@@ -1765,19 +1765,19 @@ func TestTranslateExprForPG_V38Catalog(t *testing.T) {
 			name: "MD5 of bare column",
 			in:   "MD5(payload)",
 			ctx:  ExprContext{},
-			want: "md5(payload)",
+			want: "pg_catalog.md5(payload)",
 		},
 		{
 			name: "MD5 of literal string",
 			in:   "MD5('hello')",
 			ctx:  ExprContext{},
-			want: "md5('hello')",
+			want: "pg_catalog.md5('hello')",
 		},
 		{
 			name: "lowercase md5 also rewrites",
 			in:   "md5(payload)",
 			ctx:  ExprContext{},
-			want: "md5(payload)",
+			want: "pg_catalog.md5(payload)",
 		},
 		{
 			name: "MD5 with two args falls through",
@@ -1797,13 +1797,13 @@ func TestTranslateExprForPG_V38Catalog(t *testing.T) {
 			name: "SHA1 with pgcrypto rewrites to encode+digest",
 			in:   "SHA1(payload)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha1'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha1'), 'hex')",
 		},
 		{
 			name: "lowercase sha1 with pgcrypto rewrites",
 			in:   "sha1(payload)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha1'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha1'), 'hex')",
 		},
 
 		// ---- SHA2: bit-width dispatch (256 / 224 / 384 / 512), gated on pgcrypto ----
@@ -1817,31 +1817,31 @@ func TestTranslateExprForPG_V38Catalog(t *testing.T) {
 			name: "SHA2 with bits=256 → sha256",
 			in:   "SHA2(payload, 256)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha256'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha256'), 'hex')",
 		},
 		{
 			name: "SHA2 with bits=0 → sha256 (MySQL default)",
 			in:   "SHA2(payload, 0)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha256'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha256'), 'hex')",
 		},
 		{
 			name: "SHA2 with bits=224 → sha224",
 			in:   "SHA2(payload, 224)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha224'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha224'), 'hex')",
 		},
 		{
 			name: "SHA2 with bits=384 → sha384",
 			in:   "SHA2(payload, 384)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha384'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha384'), 'hex')",
 		},
 		{
 			name: "SHA2 with bits=512 → sha512",
 			in:   "SHA2(payload, 512)",
 			ctx:  pgcryptoCtx,
-			want: "encode(digest(payload, 'sha512'), 'hex')",
+			want: "pg_catalog.encode(digest(payload, 'sha512'), 'hex')",
 		},
 		{
 			name: "SHA2 with unrecognised bits falls through",
@@ -1861,13 +1861,13 @@ func TestTranslateExprForPG_V38Catalog(t *testing.T) {
 			name: "MD5 inside COALESCE composes with the COALESCE pass",
 			in:   "COALESCE(MD5(payload), '')",
 			ctx:  ExprContext{},
-			want: "COALESCE(md5(payload), '')",
+			want: "COALESCE(pg_catalog.md5(payload), '')",
 		},
 		{
 			name: "SHA1 inside CONCAT composes (with pgcrypto enabled)",
 			in:   "CONCAT('h:', SHA1(payload))",
 			ctx:  pgcryptoCtx,
-			want: "('h:' || encode(digest(payload, 'sha1'), 'hex'))",
+			want: "('h:' || pg_catalog.encode(digest(payload, 'sha1'), 'hex'))",
 		},
 	}
 	for _, c := range cases {

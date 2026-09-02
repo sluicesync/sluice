@@ -732,7 +732,7 @@ func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.Do
 	const q = `
 		SELECT t.typname,
 		       COALESCE(con.conname, '')                     AS conname,
-		       COALESCE(pg_get_constraintdef(con.oid, true), '') AS condef
+		       COALESCE(pg_catalog.pg_get_constraintdef(con.oid, true), '') AS condef
 		FROM   pg_type t
 		JOIN   pg_namespace n ON n.oid = t.typnamespace
 		LEFT JOIN pg_constraint con
@@ -873,7 +873,7 @@ func (r *SchemaReader) addDomainGeometryColumnInfo(ctx context.Context, out map[
 	const q = `
 		SELECT c.relname,
 		       a.attname,
-		       coalesce(upper(postgis_typmod_type(t.typtypmod)), 'GEOMETRY'),
+		       coalesce(pg_catalog.upper(postgis_typmod_type(t.typtypmod)), 'GEOMETRY'),
 		       coalesce(postgis_typmod_srid(t.typtypmod), 0),
 		       coalesce(postgis_typmod_dims(t.typtypmod), 2)
 		FROM   pg_attribute  a
@@ -1524,7 +1524,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			COALESCE(opc.opcdefault, true) AS opclass_default,
 			CASE
 				WHEN a.attname IS NULL
-				THEN pg_get_indexdef(ix.indexrelid, u.ord::int, true)
+				THEN pg_catalog.pg_get_indexdef(ix.indexrelid, u.ord::int, true)
 				ELSE ''
 			END AS expr,
 			-- Number of *key* columns (Bug 19b). Columns at ordinal
@@ -1539,7 +1539,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- Partial-index WHERE predicate (Bug 19a), rendered in PG
 			-- dialect with table-qualified column refs resolved. Empty
 			-- string for a full (non-partial) index.
-			COALESCE(pg_get_expr(ix.indpred, ix.indrelid), '') AS predicate,
+			COALESCE(pg_catalog.pg_get_expr(ix.indpred, ix.indrelid), '') AS predicate,
 			-- TRIAGE #4: is this unique index owned by a table-level
 			-- UNIQUE CONSTRAINT (pg_constraint contype='u' whose
 			-- conindid is this index)? The constraint form is
@@ -1592,9 +1592,9 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
 		JOIN   pg_am         am ON am.oid = i.relam
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
-		JOIN   LATERAL unnest(ix.indkey)   WITH ORDINALITY AS u(attnum, ord) ON TRUE
-		LEFT JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON uc.ord = u.ord
-		LEFT JOIN LATERAL unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey)   WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		LEFT JOIN LATERAL pg_catalog.unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON uc.ord = u.ord
+		LEFT JOIN LATERAL pg_catalog.unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
 		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
 		-- contype IN ('u','p'): the attribute columns below must see a PRIMARY
@@ -2209,7 +2209,7 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		SELECT
 			cl.relname AS table_name,
 			con.conname,
-			pg_get_expr(con.conbin, con.conrelid)
+			pg_catalog.pg_get_expr(con.conbin, con.conrelid)
 		FROM   pg_constraint con
 		JOIN   pg_class      cl ON cl.oid = con.conrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
@@ -2393,7 +2393,7 @@ func (r *SchemaReader) populateRLSPolicies(ctx context.Context, tables map[strin
 			policyname,
 			cmd,
 			permissive,
-			array_to_json(roles)::text AS roles_json,
+			pg_catalog.array_to_json(roles)::text AS roles_json,
 			COALESCE(qual, '')         AS using_expr,
 			COALESCE(with_check, '')   AS check_expr
 		FROM   pg_policies
@@ -2464,12 +2464,12 @@ func decodeRoleArray(jsonText string) ([]string, error) {
 // the bound schema's ordinary tables.
 func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*ir.Table) error {
 	const tableQ = `
-		SELECT cl.relname, obj_description(cl.oid, 'pg_class')
+		SELECT cl.relname, pg_catalog.obj_description(cl.oid, 'pg_class')
 		FROM   pg_class     cl
 		JOIN   pg_namespace n ON n.oid = cl.relnamespace
 		WHERE  n.nspname  = $1
 		  AND  cl.relkind = 'r'
-		  AND  obj_description(cl.oid, 'pg_class') IS NOT NULL`
+		  AND  pg_catalog.obj_description(cl.oid, 'pg_class') IS NOT NULL`
 
 	rows, err := r.catalogQuery(ctx, tableQ, r.schema)
 	if err != nil {
@@ -2491,7 +2491,7 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 
 	const colQ = `
 		SELECT cl.relname, a.attname,
-		       col_description(cl.oid, a.attnum)
+		       pg_catalog.col_description(cl.oid, a.attnum)
 		FROM   pg_class      cl
 		JOIN   pg_namespace  n ON n.oid = cl.relnamespace
 		JOIN   pg_attribute  a ON a.attrelid = cl.oid
@@ -2499,7 +2499,7 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 		  AND  cl.relkind = 'r'
 		  AND  a.attnum   > 0
 		  AND  NOT a.attisdropped
-		  AND  col_description(cl.oid, a.attnum) IS NOT NULL`
+		  AND  pg_catalog.col_description(cl.oid, a.attnum) IS NOT NULL`
 
 	crows, err := r.catalogQuery(ctx, colQ, r.schema)
 	if err != nil {

@@ -26,7 +26,7 @@ func (r *SchemaReader) SourceCurrentPosition(ctx context.Context) (ir.Position, 
 		return ir.Position{}, errors.New("postgres: SourceCurrentPosition: reader not opened")
 	}
 	var lsn string
-	if err := r.db.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
+	if err := r.db.QueryRowContext(ctx, `SELECT pg_catalog.pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
 		return ir.Position{}, fmt.Errorf("postgres: SourceCurrentPosition: %w", err)
 	}
 	return ir.Position{Engine: dialectName, Token: lsn}, nil
@@ -65,7 +65,7 @@ func (r *SchemaReader) LagBytes(ctx context.Context, earlier, later ir.Position)
 		return 0, fmt.Errorf("postgres: LagBytes later-position: %w", err)
 	}
 	var diff int64
-	q := `SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint`
+	q := `SELECT pg_catalog.pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint`
 	if err := r.db.QueryRowContext(ctx, q, laterLSN, earlierLSN).Scan(&diff); err != nil {
 		return 0, fmt.Errorf("postgres: LagBytes (later=%q earlier=%q): %w", laterLSN, earlierLSN, err)
 	}

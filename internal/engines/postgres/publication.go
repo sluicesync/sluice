@@ -535,7 +535,7 @@ func publicationMemberDefsAt(ctx context.Context, q querier, name string, versio
 	if version >= pgVersionPublicationAttrs {
 		memberQuery = `
 		SELECT n.nspname, c.relname,
-		       COALESCE(pg_get_expr(pr.prqual, pr.prrelid), ''),
+		       COALESCE(pg_catalog.pg_get_expr(pr.prqual, pr.prrelid), ''),
 		       pr.prattrs IS NOT NULL
 		FROM   pg_publication p
 		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
@@ -655,7 +655,7 @@ func otherSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]st
 		if active {
 			slots = append(slots, s+" (active)")
 		} else {
-			slots = append(slots, s+" (inactive — holds a resumable position; drop it with SELECT pg_drop_replication_slot('"+s+"') if the stream is truly abandoned)")
+			slots = append(slots, s+" (inactive — holds a resumable position; drop it with SELECT pg_catalog.pg_drop_replication_slot('"+s+"') if the stream is truly abandoned)")
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -971,7 +971,7 @@ func isDuplicatePublication(err error) bool {
 // TABLES IN SCHEMA isn't a feature) so the query stays valid there
 // rather than failing to parse on a missing relation.
 func publicationIsEmpty(ctx context.Context, db *sql.DB, name string) (bool, error) {
-	const relCountQuery = `SELECT count(*) FROM pg_publication_rel pr
+	const relCountQuery = `SELECT pg_catalog.count(*) FROM pg_publication_rel pr
 		JOIN pg_publication p ON p.oid = pr.prpubid
 		WHERE p.pubname = $1`
 	var relCount int
@@ -985,7 +985,7 @@ func publicationIsEmpty(ctx context.Context, db *sql.DB, name string) (bool, err
 	var hasSchemaCatalog bool
 	if err := db.QueryRowContext(
 		ctx,
-		`SELECT to_regclass('pg_catalog.pg_publication_namespace') IS NOT NULL`,
+		`SELECT pg_catalog.to_regclass('pg_catalog.pg_publication_namespace') IS NOT NULL`,
 	).Scan(&hasSchemaCatalog); err != nil {
 		return false, fmt.Errorf("postgres: probe pg_publication_namespace: %w", err)
 	}
@@ -995,7 +995,7 @@ func publicationIsEmpty(ctx context.Context, db *sql.DB, name string) (bool, err
 		return true, nil
 	}
 
-	const nsCountQuery = `SELECT count(*) FROM pg_publication_namespace pn
+	const nsCountQuery = `SELECT pg_catalog.count(*) FROM pg_publication_namespace pn
 		JOIN pg_publication p ON p.oid = pn.pnpubid
 		WHERE p.pubname = $1`
 	var nsCount int

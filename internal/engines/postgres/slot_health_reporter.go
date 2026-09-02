@@ -59,7 +59,7 @@ func (r *SchemaReader) SlotHealth(ctx context.Context, slotName string) (ir.Slot
 		SELECT
 		    s.active,
 		    s.wal_status,
-		    pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint AS lag_bytes,
+		    pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), s.restart_lsn)::bigint AS lag_bytes,
 		    (SELECT setting::bigint FROM pg_settings WHERE name = 'max_slot_wal_keep_size') AS max_keep_mb
 		FROM pg_replication_slots s
 		WHERE s.slot_name = $1`

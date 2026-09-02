@@ -143,9 +143,9 @@ func readInstallMeta(ctx context.Context, db *sql.DB, schema string) (installMet
 	// Bounded per the open-path probe convention (audit 2026-08-27 A5).
 	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
 	defer cancel()
-	q := "SELECT COALESCE((to_jsonb(m) ->> '" + metaCaptureReplicatedCol + "')::boolean, FALSE), " +
-		"COALESCE((to_jsonb(m) ->> 'schema_version')::int, 0), " +
-		"COALESCE(to_jsonb(m) ->> '" + metaCaptureDigestCol + "', '') FROM " +
+	q := "SELECT COALESCE((pg_catalog.to_jsonb(m) ->> '" + metaCaptureReplicatedCol + "')::boolean, FALSE), " +
+		"COALESCE((pg_catalog.to_jsonb(m) ->> 'schema_version')::int, 0), " +
+		"COALESCE(pg_catalog.to_jsonb(m) ->> '" + metaCaptureDigestCol + "', '') FROM " +
 		quoteIdent(schema) + "." + quoteIdent(ChangeLogMetaTable) + " m WHERE m.singleton_pk"
 	var m installMeta
 	switch err := db.QueryRowContext(pctx, q).Scan(&m.captureReplicated, &m.schemaVersion, &m.captureFnDigest); {
@@ -278,7 +278,7 @@ func probeRelayControlTable(ctx context.Context, db *sql.DB) ([]relayControlTabl
 	for i := range found {
 		// Best-effort detail: how many streams apply into this database. A
 		// failure here degrades the message's detail, not the signal.
-		detailQ := "SELECT count(*) FROM " + quoteIdent(found[i].schema) + "." + quoteIdent(appliershared.ControlTableName)
+		detailQ := "SELECT pg_catalog.count(*) FROM " + quoteIdent(found[i].schema) + "." + quoteIdent(appliershared.ControlTableName)
 		if err := db.QueryRowContext(ctx, detailQ).Scan(&found[i].streams); err != nil {
 			found[i].streams = sql.NullInt64{}
 		}
@@ -321,7 +321,7 @@ func warnLogicalSubscriberShape(ctx context.Context, db *sql.DB) {
 SELECT s.subname, s.subenabled
   FROM pg_subscription s
   JOIN pg_database d ON d.oid = s.subdbid
- WHERE d.datname = current_database()
+ WHERE d.datname = pg_catalog.current_database()
  ORDER BY s.subname`
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {

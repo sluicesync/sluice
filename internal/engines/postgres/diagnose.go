@@ -95,7 +95,7 @@ func (r *SchemaReader) DiagnoseBundle(ctx context.Context, streamID string) (ir.
 	// Server version. Errors here surface as an empty EngineVersion;
 	// the rest of the probe can still produce useful state.
 	var v string
-	if err := r.db.QueryRowContext(ctx, "SELECT version()").Scan(&v); err == nil {
+	if err := r.db.QueryRowContext(ctx, "SELECT pg_catalog.version()").Scan(&v); err == nil {
 		snap.EngineVersion = v
 	}
 
@@ -113,7 +113,7 @@ func (r *SchemaReader) DiagnoseBundle(ctx context.Context, streamID string) (ir.
 	// Current LSN for cross-referencing with each slot's
 	// confirmed_flush_lsn. Skipped silently on error.
 	var lsn string
-	if err := r.db.QueryRowContext(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&lsn); err == nil {
+	if err := r.db.QueryRowContext(ctx, "SELECT pg_catalog.pg_current_wal_lsn()::text").Scan(&lsn); err == nil {
 		state["current_wal_lsn"] = lsn
 	}
 	state["stream_id_scope"] = streamID

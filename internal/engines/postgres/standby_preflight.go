@@ -46,14 +46,14 @@ const standbyRemedyHint = "point --source at the primary endpoint (a standby/rep
 // PG 16+ standbys — see snapshot_exporter.go).
 func checkNotStandby(ctx context.Context, db *sql.DB) error {
 	var inRecovery bool
-	if err := db.QueryRowContext(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT pg_catalog.pg_is_in_recovery()").Scan(&inRecovery); err != nil {
 		return fmt.Errorf("postgres: read pg_is_in_recovery: %w", err)
 	}
 	if !inRecovery {
 		return nil
 	}
 	return sluicecode.Wrap(sluicecode.CodeCDCStandbySource, standbyRemedyHint,
-		errors.New("postgres: cdc: the source is a read-only hot standby / read replica (pg_is_in_recovery() = true) — "+
+		errors.New("postgres: cdc: the source is a read-only hot standby / read replica (pg_catalog.pg_is_in_recovery() = true) — "+
 			"point --source at the PRIMARY endpoint (e.g. Supabase: db.<ref>.supabase.co, not the -rr- replica host). "+
 			"CDC manages a publication on the source and CREATE/ALTER PUBLICATION cannot run on a standby; PG 16+ "+
 			"standbys can technically host logical slots, but slot creation waits on the primary's next running-xacts "+

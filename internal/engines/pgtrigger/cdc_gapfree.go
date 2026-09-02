@@ -188,7 +188,7 @@ const notSettledPredicate = "txid >= pg_snapshot_xmin(pg_current_snapshot())::te
 // idle; a non-zero count is a ceiling stall — committed changes exist
 // that no poll will return until the pinning transaction settles.
 func ceilingStallProbeSQL(tableRef string) string {
-	return "SELECT COUNT(*), COALESCE(MIN(id), 0), pg_snapshot_xmin(pg_current_snapshot())::text::bigint\n" +
+	return "SELECT COUNT(*), COALESCE(MIN(id), 0), pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint\n" +
 		"  FROM " + tableRef + "\n" +
 		" WHERE id > $1 AND " + notSettledPredicate
 }

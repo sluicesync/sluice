@@ -299,7 +299,7 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			lease_holder_stream_id = EXCLUDED.lease_holder_stream_id,
 			lease_expires_at       = EXCLUDED.lease_expires_at
 		WHERE
-			` + tableRef + `.lease_expires_at <= timezone('utc', now())
+			` + tableRef + `.lease_expires_at <= pg_catalog.timezone('utc', pg_catalog.now())
 			AND ` + tableRef + `.applied_at IS NULL
 		RETURNING
 			target_table_full_name,

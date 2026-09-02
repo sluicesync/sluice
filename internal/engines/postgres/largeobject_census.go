@@ -31,7 +31,7 @@ import (
 // filtered table set is the pipeline's job.
 func (r *SchemaReader) LargeObjectCensus(ctx context.Context) (loCount int64, suspects map[string][]string, err error) {
 	if err := r.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM pg_largeobject_metadata`).Scan(&loCount); err != nil {
+		`SELECT pg_catalog.count(*) FROM pg_largeobject_metadata`).Scan(&loCount); err != nil {
 		return 0, nil, err
 	}
 

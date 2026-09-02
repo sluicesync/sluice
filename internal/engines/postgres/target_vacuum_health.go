@@ -81,9 +81,9 @@ func (a *ChangeApplier) TargetVacuumHealth(ctx context.Context) (ir.VacuumHealth
 	// Wraparound headroom for the connected database. Same query the
 	// source-side XID preflight uses (xid_wraparound_preflight.go) — this
 	// is its TARGET-side advisory sibling.
-	const xidQ = `SELECT age(datfrozenxid), datname FROM pg_database WHERE datname = current_database()`
+	const xidQ = `SELECT pg_catalog.age(datfrozenxid), datname FROM pg_database WHERE datname = pg_catalog.current_database()`
 	if err := a.db.QueryRowContext(ctx, xidQ).Scan(&h.XIDAge, &h.Datname); err != nil {
-		return ir.VacuumHealth{}, false, fmt.Errorf("postgres: vacuum-health probe (age(datfrozenxid)): %w", err)
+		return ir.VacuumHealth{}, false, fmt.Errorf("postgres: vacuum-health probe (pg_catalog.age(datfrozenxid)): %w", err)
 	}
 	return h, true, nil
 }

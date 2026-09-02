@@ -197,7 +197,7 @@ func (r *RowReader) EstimateTableBytes(ctx context.Context, table *ir.Table) (in
 	if err != nil {
 		return 0, err
 	}
-	q := `SELECT COALESCE((SELECT pg_table_size(c.oid)
+	q := `SELECT COALESCE((SELECT pg_catalog.pg_table_size(c.oid)
 	                       FROM pg_class c
 	                       JOIN pg_namespace n ON n.oid = c.relnamespace
 	                       WHERE n.nspname = $1 AND c.relname = $2), 0)`

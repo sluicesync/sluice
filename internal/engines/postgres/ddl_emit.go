@@ -1708,7 +1708,7 @@ func refuseUnrepresentablePrefix(cols []ir.IndexColumn, where string, enforcesUn
 				"source forbids two rows whose first %d characters of %q match, and a Postgres key over the "+
 				"whole column would ALLOW them — so the target would silently accept data the source "+
 				"rejects. Rewrite the key as a unique index over an expression that reproduces the prefix "+
-				"(for example `left(%s, %d)`), widen it to the full column on the source if the prefix was "+
+				"(for example `pg_catalog.left(%s, %d)`), widen it to the full column on the source if the prefix was "+
 				"only a size optimisation, or exclude the table",
 			where, c.Column, c.Length, c.Length, c.Column, c.Column, c.Length,
 		)

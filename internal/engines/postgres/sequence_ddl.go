@@ -158,7 +158,7 @@ type sqlExecer interface {
 // setvalSequence applies setval(seq, lastValue, isCalled) on execer.
 func (w *SchemaWriter) setvalSequence(ctx context.Context, execer sqlExecer, seq *ir.Sequence, lastValue int64, isCalled bool) error {
 	regclass := quoteSQLString(quoteIdent(w.schema) + "." + quoteIdent(seq.Name))
-	q := fmt.Sprintf("SELECT setval(%s, $1, $2)", regclass)
+	q := fmt.Sprintf("SELECT pg_catalog.setval(%s, $1, $2)", regclass)
 	if _, err := execer.ExecContext(ctx, q, lastValue, isCalled); err != nil {
 		return fmt.Errorf("postgres: prime sequence %q to %d (is_called=%t): %w",
 			seq.Name, lastValue, isCalled, err)

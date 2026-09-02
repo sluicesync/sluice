@@ -567,7 +567,7 @@ func (e Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string,
 	defer func() { _ = db.Close() }()
 
 	var lsn string
-	if err := db.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT pg_catalog.pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
 		return "", fmt.Errorf("postgres: read current WAL position: %w", err)
 	}
 	return lsn, nil

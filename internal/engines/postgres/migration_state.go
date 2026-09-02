@@ -97,19 +97,19 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				// stored value exactly what the read path assumes.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
 					"(migration_id, phase, table_progress, state_format, started_at, updated_at, last_error) " +
-					"VALUES ($1, $2, $3, $4, timezone('utc', now()), timezone('utc', now()), $5) " +
+					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), pg_catalog.timezone('utc', pg_catalog.now()), $5) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"phase = EXCLUDED.phase, " +
 					"table_progress = EXCLUDED.table_progress, " +
 					"state_format = EXCLUDED.state_format, " +
-					"updated_at = timezone('utc', now()), " +
+					"updated_at = pg_catalog.timezone('utc', pg_catalog.now()), " +
 					"last_error = EXCLUDED.last_error",
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress, updated_at) " +
-					"VALUES ($1, $2, $3, timezone('utc', now())) " +
+					"VALUES ($1, $2, $3, pg_catalog.timezone('utc', pg_catalog.now())) " +
 					"ON CONFLICT (migration_id, table_name) DO UPDATE SET " +
 					"progress = EXCLUDED.progress, " +
-					"updated_at = timezone('utc', now())",
+					"updated_at = pg_catalog.timezone('utc', pg_catalog.now())",
 				MarkUpgraded: "UPDATE " + hdr +
 					" SET table_progress = $1, state_format = $2 WHERE migration_id = $3",
 				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = $1",
@@ -150,8 +150,8 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			phase           VARCHAR(32)  NOT NULL,
 			table_progress  TEXT         NULL,
 			state_format    INT          NOT NULL DEFAULT 1,
-			started_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
-			updated_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
+			started_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
+			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			last_error      TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
@@ -168,7 +168,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			migration_id    VARCHAR(255) NOT NULL,
 			table_name      VARCHAR(255) NOT NULL,
 			progress        TEXT         NOT NULL,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
+			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			PRIMARY KEY (migration_id, table_name)
 		)`
 	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {

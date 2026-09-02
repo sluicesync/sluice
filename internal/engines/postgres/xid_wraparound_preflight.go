@@ -61,7 +61,7 @@ func (r *SchemaReader) SourceXIDWraparoundHorizon(ctx context.Context) (age int6
 // server; reading the row for `current_database()` needs no extra
 // privilege.
 func probeSourceXIDWraparoundHorizon(ctx context.Context, db *sql.DB) (age int64, datname string, err error) {
-	const q = `SELECT age(datfrozenxid), datname FROM pg_database WHERE datname = current_database()`
+	const q = `SELECT pg_catalog.age(datfrozenxid), datname FROM pg_database WHERE datname = pg_catalog.current_database()`
 	switch err := db.QueryRowContext(ctx, q).Scan(&age, &datname); {
 	case errors.Is(err, sql.ErrNoRows):
 		// `current_database()` is always present in pg_database by
@@ -69,7 +69,7 @@ func probeSourceXIDWraparoundHorizon(ctx context.Context, db *sql.DB) (age int64
 		// rather than silently treating as "no wraparound risk" (which
 		// would defer to the raw mid-migration write-block error the
 		// preflight exists to replace).
-		return 0, "", errors.New("postgres: probe XID wraparound horizon: pg_database row for current_database() not found")
+		return 0, "", errors.New("postgres: probe XID wraparound horizon: pg_database row for pg_catalog.current_database() not found")
 	case err != nil:
 		return 0, "", fmt.Errorf("postgres: probe XID wraparound horizon: %w", err)
 	}

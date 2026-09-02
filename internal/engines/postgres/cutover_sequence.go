@@ -119,7 +119,7 @@ func (r *SchemaReader) readOneSequenceState(ctx context.Context, schema, table, 
 	// We quote both schema and table so case-preserved names round-
 	// trip cleanly through the catalog (Bug 87 / task #42 regression
 	// pin — same shape SyncIdentitySequences uses).
-	const seqQuery = `SELECT pg_get_serial_sequence($1, $2)`
+	const seqQuery = `SELECT pg_catalog.pg_get_serial_sequence($1, $2)`
 	tableArg := quoteIdent(schema) + "." + quoteIdent(table)
 	var seqName sql.NullString
 	if err := r.db.QueryRowContext(ctx, seqQuery, tableArg, column).Scan(&seqName); err != nil {
@@ -471,7 +471,7 @@ func (w *SchemaWriter) primeOneSequence(
 	action.SourceValue = src.Value
 
 	// Resolve the target's owning sequence.
-	const seqQuery = `SELECT pg_get_serial_sequence($1, $2)`
+	const seqQuery = `SELECT pg_catalog.pg_get_serial_sequence($1, $2)`
 	tableArg := quoteIdent(w.schema) + "." + quoteIdent(table.Name)
 	var seqName sql.NullString
 	if err := w.db.QueryRowContext(ctx, seqQuery, tableArg, column).Scan(&seqName); err != nil {
@@ -540,9 +540,9 @@ func (w *SchemaWriter) primeOneSequence(
 
 	// Prime: setval to applyValue with is_called=true so next nextval
 	// returns applyValue+1.
-	const setvalQuery = `SELECT setval($1, $2, true)`
+	const setvalQuery = `SELECT pg_catalog.setval($1, $2, true)`
 	if _, err := w.db.ExecContext(ctx, setvalQuery, seqName.String, applyValue); err != nil {
-		return action, fmt.Errorf("setval(%q, %d, true): %w", seqName.String, applyValue, err)
+		return action, fmt.Errorf("pg_catalog.setval(%q, %d, true): %w", seqName.String, applyValue, err)
 	}
 	action.Outcome = "primed"
 	action.TargetAfter = applyValue

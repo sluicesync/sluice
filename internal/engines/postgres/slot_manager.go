@@ -142,7 +142,7 @@ func (m *SlotManager) Drop(ctx context.Context, name string, force bool) error {
 		)
 	}
 
-	const q = `SELECT pg_drop_replication_slot($1)`
+	const q = `SELECT pg_catalog.pg_drop_replication_slot($1)`
 	if _, err := m.db.ExecContext(ctx, q, name); err != nil {
 		// The pre-check above saw the slot, so reaching here with
 		// undefined_object means it was removed underneath us between

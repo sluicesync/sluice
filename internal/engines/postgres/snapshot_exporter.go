@@ -64,7 +64,7 @@ func (e Engine) ExportSnapshot(ctx context.Context, dsn string) (*ir.ExportedSna
 		return nil, fmt.Errorf("postgres: export snapshot: BEGIN: %w", err)
 	}
 	var name string
-	if err := conn.QueryRowContext(ctx, "SELECT pg_export_snapshot()").Scan(&name); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT pg_catalog.pg_export_snapshot()").Scan(&name); err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
 		_ = db.Close()

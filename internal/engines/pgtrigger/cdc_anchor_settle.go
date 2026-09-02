@@ -175,7 +175,7 @@ func waitForPreSnapshotTxnsToSettle(ctx context.Context, q settleQuerier, upperB
 		}
 		if time.Since(start) >= timeout {
 			return fmt.Errorf(
-				"cold-start CDC anchor: %d source transaction(s) still in flight after %s (txids: %v) — a transaction open since before the bulk-copy snapshot may hold an unsettled change-log id below the anchor, and proceeding could silently gap its changes; commit or roll back the stuck transaction(s) (find them: SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start; last resort: SELECT pg_terminate_backend(<pid>)), then re-run `sluice sync start`",
+				"cold-start CDC anchor: %d source transaction(s) still in flight after %s (txids: %v) — a transaction open since before the bulk-copy snapshot may hold an unsettled change-log id below the anchor, and proceeding could silently gap its changes; commit or roll back the stuck transaction(s) (find them: SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start; last resort: SELECT pg_catalog.pg_terminate_backend(<pid>)), then re-run `sluice sync start`",
 				len(remaining), timeout, remaining,
 			)
 		}
@@ -208,7 +208,7 @@ func minChangeLogIDForInvisibleTxns(ctx context.Context, q settleQuerier, schema
 	if err := q.QueryRowContext(
 		ctx,
 		"SELECT MIN(id) FROM "+tableRef+
-			" WHERE txid < $1 AND NOT pg_visible_in_snapshot(txid::text::xid8, $2::pg_snapshot)",
+			" WHERE txid < $1 AND NOT pg_catalog.pg_visible_in_snapshot(txid::text::xid8, $2::pg_snapshot)",
 		upperBound, snapText,
 	).Scan(&got); err != nil {
 		return 0, false, err

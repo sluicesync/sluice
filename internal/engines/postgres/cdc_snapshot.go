@@ -376,11 +376,11 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 // cancelled error paths.
 func abandonDropSourceObjects(db *sql.DB, slotName, publication string) error {
 	var firstErr error
-	if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", slotName); err != nil {
+	if _, err := db.ExecContext(context.Background(), "SELECT pg_catalog.pg_drop_replication_slot($1)", slotName); err != nil {
 		slog.WarnContext(
 			context.Background(), "postgres: snapshot abandon: dropping the just-created replication slot failed; drop it manually to release WAL",
 			slog.String("slot", slotName),
-			slog.String("manual_drop", fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)),
+			slog.String("manual_drop", fmt.Sprintf("SELECT pg_catalog.pg_drop_replication_slot('%s')", slotName)),
 			slog.String("error", err.Error()),
 		)
 		firstErr = fmt.Errorf("postgres: snapshot abandon: drop replication slot %q: %w", slotName, err)

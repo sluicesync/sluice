@@ -164,7 +164,7 @@ func identityGeneratedColumns(ctx context.Context, db *sql.DB, schema, table str
 		FROM   pg_class      cl
 		JOIN   pg_namespace  n  ON n.oid = cl.relnamespace
 		JOIN   pg_index      ix ON ix.indrelid = cl.oid
-		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		JOIN   pg_attribute  a  ON a.attrelid = cl.oid AND a.attnum = u.attnum
 		WHERE  n.nspname  = $1
 		  AND  cl.relname = $2

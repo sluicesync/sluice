@@ -97,7 +97,7 @@ func translateSQLiteStrftimeDefault(norm string) (string, bool) {
 	if norm == "strftime('%s','now')" {
 		// Integer seconds since the epoch. floor() matches SQLite's
 		// integer-second semantics; the surrounding column is numeric.
-		return "floor(extract(epoch from now()))", true
+		return "pg_catalog.floor(extract(epoch from pg_catalog.now()))", true
 	}
 	return "", false
 }

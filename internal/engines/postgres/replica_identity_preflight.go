@@ -439,7 +439,7 @@ func (r *SchemaReader) exemptPublishedGeneratedCols(ctx context.Context, rows []
 		return nil
 	}
 	const q = `
-		SELECT pt.tablename, COALESCE(array_to_json(pt.attnames)::text, 'null')
+		SELECT pt.tablename, COALESCE(pg_catalog.array_to_json(pt.attnames)::text, 'null')
 		FROM   pg_publication_tables pt
 		JOIN   pg_publication        p ON p.pubname = pt.pubname
 		WHERE  pt.schemaname = $1
@@ -509,7 +509,7 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		       COALESCE(ri.name, ''),
 		       COALESCE(ri.usable, false),
 		       COALESCE(cand.name, ''),
-		       COALESCE(array_to_json(gen.cols)::text, 'null')
+		       COALESCE(pg_catalog.array_to_json(gen.cols)::text, 'null')
 		FROM   pg_class     c
 		JOIN   pg_namespace n ON n.oid = c.relnamespace
 		LEFT   JOIN LATERAL (
@@ -529,7 +529,7 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		         LIMIT  1
 		       ) ri ON TRUE
 		LEFT   JOIN LATERAL (
-		         SELECT min(ci.relname) AS name
+		         SELECT pg_catalog.min(ci.relname) AS name
 		         FROM   pg_index i
 		         JOIN   pg_class ci ON ci.oid = i.indexrelid
 		         WHERE  i.indrelid  = c.oid
@@ -537,7 +537,7 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		           AND  i.indpred IS NULL AND i.indexprs IS NULL
 		           AND  NOT EXISTS (
 		                  SELECT 1
-		                  FROM   unnest(i.indkey) AS k(attnum)
+		                  FROM   pg_catalog.unnest(i.indkey) AS k(attnum)
 		                  JOIN   pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
 		                  -- Nullable OR GENERATED: a generated column is
 		                  -- not published, so an index containing one is
@@ -555,9 +555,9 @@ func (r *SchemaReader) replicaIdentityRows(ctx context.Context) ([]replicaIdenti
 		         -- every older server, so the "is it published after all"
 		         -- exemption is applied in Go behind a version gate
 		         -- (see exemptPublishedGeneratedCols).
-		         SELECT array_agg(a.attname ORDER BY u.ord) AS cols
+		         SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) AS cols
 		         FROM   pg_index i
-		         JOIN   LATERAL unnest(i.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		         JOIN   LATERAL pg_catalog.unnest(i.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		         JOIN   pg_attribute a ON a.attrelid = c.oid AND a.attnum = u.attnum
 		         WHERE  i.indrelid = c.oid
 		           AND  a.attgenerated <> ''

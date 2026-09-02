@@ -66,7 +66,7 @@ func (s *pgKeysetStore) EnsureKeysetTable(ctx context.Context) error {
 			name        TEXT        NOT NULL,
 			generation  INTEGER     NOT NULL,
 			bytes       BYTEA       NOT NULL,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
 			retired_at  TIMESTAMPTZ NULL,
 			active      BOOLEAN     NOT NULL DEFAULT false,
 			PRIMARY KEY (name, generation)

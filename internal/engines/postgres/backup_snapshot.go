@@ -128,7 +128,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		if anchorIsTemporary {
 			return
 		}
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		_, _ = db.ExecContext(ctx, "SELECT pg_catalog.pg_drop_replication_slot($1)", anchorSlot)
 	}
 
 	// A pre-existing slot at the anchor name is refused loudly. For
@@ -314,7 +314,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 				slog.String("consistent_point", consistentPoint),
 				slog.String("note", "the slot retains WAL until the next `backup incremental` consumes it; drop via `sluice slot drop` if you abandon the chain"),
 			)
-		} else if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", anchorSlot); err != nil {
+		} else if _, err := db.ExecContext(context.Background(), "SELECT pg_catalog.pg_drop_replication_slot($1)", anchorSlot); err != nil {
 			// Slot drop failure is logged but doesn't escalate — the
 			// backup itself is durable, and a leaked anchor slot is
 			// recoverable via `sluice slot drop` or manual SQL.

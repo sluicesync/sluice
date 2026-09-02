@@ -1385,7 +1385,7 @@ func rewriteUUID(expr string) string {
 		if len(args) != 0 {
 			return ""
 		}
-		return "gen_random_uuid()"
+		return "pg_catalog.gen_random_uuid()"
 	})
 }
 
@@ -1901,7 +1901,7 @@ func rewriteHEX(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "to_hex(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.to_hex(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -1931,7 +1931,7 @@ func rewriteFIELD(expr string) string {
 		}
 		needle := trimmed[0]
 		haystack := strings.Join(trimmed[1:], ", ")
-		return "array_position(ARRAY[" + haystack + "], " + needle + ")"
+		return "pg_catalog.array_position(ARRAY[" + haystack + "], " + needle + ")"
 	})
 }
 
@@ -2215,7 +2215,7 @@ func rewriteMD5(expr string) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "md5(" + strings.TrimSpace(args[0]) + ")"
+		return "pg_catalog.md5(" + strings.TrimSpace(args[0]) + ")"
 	})
 }
 
@@ -2237,7 +2237,7 @@ func rewriteSHA1(expr string, ctx ExprContext) string {
 		if len(args) != 1 {
 			return ""
 		}
-		return "encode(digest(" + strings.TrimSpace(args[0]) + ", 'sha1'), 'hex')"
+		return "pg_catalog.encode(digest(" + strings.TrimSpace(args[0]) + ", 'sha1'), 'hex')"
 	})
 }
 
@@ -2274,6 +2274,6 @@ func rewriteSHA2(expr string, ctx ExprContext) string {
 		default:
 			return ""
 		}
-		return "encode(digest(" + x + ", '" + algo + "'), 'hex')"
+		return "pg_catalog.encode(digest(" + x + ", '" + algo + "'), 'hex')"
 	})
 }

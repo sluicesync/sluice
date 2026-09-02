@@ -97,7 +97,7 @@ SELECT (
     rolsuper
     OR rolreplication
     OR CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_replication')
-            THEN pg_has_role(current_user, 'rds_replication', 'MEMBER')
+            THEN pg_catalog.pg_has_role(current_user, 'rds_replication', 'MEMBER')
             ELSE false
        END
 ), rolname

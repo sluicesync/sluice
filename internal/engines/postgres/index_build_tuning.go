@@ -332,17 +332,17 @@ func probeIndexBuildTuning(ctx context.Context, q rowQueryer) (indexBuildTuningP
 	var p indexBuildTuningProbe
 
 	if err := q.QueryRowContext(
-		ctx, `SELECT pg_size_bytes(current_setting('shared_buffers'))`,
+		ctx, `SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('shared_buffers'))`,
 	).Scan(&p.sharedBuffersBytes); err != nil {
 		return p, fmt.Errorf("probe shared_buffers: %w", err)
 	}
 	if err := q.QueryRowContext(
-		ctx, `SELECT pg_size_bytes(current_setting('effective_cache_size'))`,
+		ctx, `SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('effective_cache_size'))`,
 	).Scan(&p.effectiveCacheSizeBytes); err != nil {
 		return p, fmt.Errorf("probe effective_cache_size: %w", err)
 	}
 	if err := q.QueryRowContext(
-		ctx, `SELECT pg_size_bytes(current_setting('maintenance_work_mem'))`,
+		ctx, `SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('maintenance_work_mem'))`,
 	).Scan(&p.maintenanceWorkMemBytes); err != nil {
 		return p, fmt.Errorf("probe maintenance_work_mem: %w", err)
 	}

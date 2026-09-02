@@ -681,7 +681,7 @@ func TestEmitDefault(t *testing.T) {
 		{
 			"expression mysql dialect: UUID() translates",
 			ir.DefaultExpression{Expr: "UUID()", Dialect: "mysql"},
-			"gen_random_uuid()", true,
+			"pg_catalog.gen_random_uuid()", true,
 		},
 		{
 			"expression mysql dialect: RAND() translates",

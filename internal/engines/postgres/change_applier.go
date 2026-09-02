@@ -2147,7 +2147,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 // information_schema hides (PG-1). quote_ident builds a safe qualified name for
 // hostile identifiers. A NULL result means genuinely-absent.
 func targetTableInCatalog(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
-	const q = `SELECT to_regclass(quote_ident($1) || '.' || quote_ident($2)) IS NOT NULL`
+	const q = `SELECT pg_catalog.to_regclass(pg_catalog.quote_ident($1) || '.' || pg_catalog.quote_ident($2)) IS NOT NULL`
 	var exists bool
 	if err := db.QueryRowContext(ctx, q, schema, table).Scan(&exists); err != nil {
 		return false, err
@@ -2377,7 +2377,7 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) (prim
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      ic ON ic.oid = ix.indexrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
-		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		WHERE  n.nspname = $1
 		  AND  cl.relname = $2
@@ -2489,7 +2489,7 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 		JOIN   pg_class      tcl ON tcl.oid = ix.indrelid
 		JOIN   pg_class      cl  ON cl.oid  = ix.indexrelid
 		JOIN   pg_namespace  n   ON n.oid   = tcl.relnamespace
-		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		JOIN   pg_attribute  a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		WHERE  n.nspname = $1
 		  AND  tcl.relname = $2

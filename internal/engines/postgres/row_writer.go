@@ -457,7 +457,7 @@ func (w *RowWriter) CompositePKLeadsWith(ctx context.Context, table *ir.Table, c
 		return false, errors.New("postgres: CompositePKLeadsWith: table is nil")
 	}
 	const q = `
-		SELECT a.attname, array_length(i.indkey::int[], 1)
+		SELECT a.attname, pg_catalog.array_length(i.indkey::int[], 1)
 		FROM   pg_index    i
 		JOIN   pg_class    cl ON cl.oid = i.indrelid
 		JOIN   pg_namespace n ON n.oid  = cl.relnamespace

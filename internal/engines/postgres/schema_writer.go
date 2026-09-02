@@ -1138,8 +1138,8 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	// pg_get_serial_sequence returning NULL (defensive; should not
 	// fire for any standard IDENTITY column).
 	const setvalQuery = `
-		SELECT setval(pg_get_serial_sequence($1, $2), $3, true)
-		WHERE pg_get_serial_sequence($1, $2) IS NOT NULL`
+		SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence($1, $2), $3, true)
+		WHERE pg_catalog.pg_get_serial_sequence($1, $2) IS NOT NULL`
 	// pg_get_serial_sequence parses arg 1 as an identifier text → regclass;
 	// per SQL rules unquoted identifiers fold to lowercase. We must
 	// quote both schema and table so case-preserved names ("Widgets")

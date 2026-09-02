@@ -136,7 +136,7 @@ SELECT
 	a.pid,
 	a.application_name,
 	COALESCE(a.state, '')                                   AS state,
-	EXTRACT(EPOCH FROM (now() - a.state_change))            AS age_seconds,
+	EXTRACT(EPOCH FROM (pg_catalog.now() - a.state_change))            AS age_seconds,
 	COALESCE(l.relname, '')                                 AS lock_relation,
 	COALESCE(l.mode, '')                                    AS lock_mode
 FROM pg_stat_activity a
