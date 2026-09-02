@@ -55,41 +55,80 @@ import (
 //     QueryEvent is proof of statement-format CTE-DML. WITH RECURSIVE
 //     lexes the same first token and needs no second-token handling.
 //
-// Known residue, stated not implied: statement-format LOAD DATA
-// arrives as Begin/Execute_load_query events (a different event type
-// the dispatcher's default arm ignores), and a DML wrapped entirely in
-// a /*!vvvvv … */ versioned comment lexes as a comment here. Both
-// remain the documented session-override residue, now narrowed to
-// those shapes (CTE-DML moved from residue to the verb set above).
+// The four shapes that USED to be residue, closed by audit 2026-09-01
+// SLM-3 (every one observed on real MySQL 8.0.46 as rows missing from
+// the target with the stream alive, then confirmed live by a plain
+// INSERT that DID refuse in the same stream):
 //
-// A THIRD residue, and the asymmetry in how it is handled is deliberate
-// (found on real MySQL 8.0.46 by the v0.137.1 pre-tag review). MySQL
-// lexes a `/*! … */` EXECUTABLE comment's contents as SQL, so a `*/`
-// inside a string literal does not terminate it — while this file's
-// comment scans are quote-blind, which matches MySQL for a PLAIN
-// comment and not for a versioned one. A versioned comment carrying
-// `*/` inside a quoted value therefore makes a scan stop mid-value.
+//  1. Statement-format LOAD DATA arrives as Begin_load_query +
+//     Execute_load_query events, not a QueryEvent. The dispatcher now
+//     has an arm for the Execute (cdc_statement_load_data.go) that
+//     decodes the event's own schema + statement text and raises this
+//     same refusal with verb LOAD DATA, scope-gated identically.
+//  2. A DML wrapped ENTIRELY in a /*!vvvvv … */ versioned comment used
+//     to lex as a comment. MySQL EXECUTES a versioned comment's
+//     contents, so [skipLeadingSQLComments] now skips only the
+//     `/*!vvvvv` marker and keeps lexing inside it — the verb is found
+//     where the server found it.
+//  3. `--` followed by a NEWLINE. The old lexer treated `--` as a
+//     comment only before a space or tab ("MySQL's `--` comment
+//     requires trailing whitespace"). That premise is false: MySQL's
+//     rule is whitespace OR a control character, so `--\nINSERT …` —
+//     which a raw driver sends verbatim (the `mysql` CLI strips the
+//     bare line client-side, which is why hand testing missed it) —
+//     executes, is binlogged as-is, and lexed here as no keyword.
+//  4. Cross-database DML from an OUT-of-scope session database
+//     (`USE mysql; INSERT INTO src.t …`). The scope gate keyed only on
+//     the QueryEvent's session default database, so the write into the
+//     synced database slipped as "unrelated". The gate now also asks
+//     the statement itself ([statementNamesInScopeDatabase]): a
+//     `<db>.` qualifier naming a synced database is in scope.
 //
-//   - DETECTION ([leadingSQLKeyword], and so [statementDMLVerb]) is
-//     LEFT AS IS. The mis-lex can make a healthy ROW-logged DDL look
-//     like a DML verb and raise this refusal on a working
-//     configuration — loud, wrong, and recoverable. Teaching the lexer
-//     to distrust such a comment would instead make a genuine
-//     statement-format DML wrapped the same way lex as no keyword at
-//     all, so the belt would not fire and the write would be dropped
-//     SILENTLY. A false refusal outranks a silent miss here, per the
-//     project's own ordering, so the loud direction is kept on purpose.
-//   - REDACTION ([statementDMLCommentSkip]) IS guarded, because there
-//     the same mis-lex leaks a row-value fragment into a refusal that
-//     promises values are withheld, and the safe fallback costs only a
-//     diagnostic. See the guard's own comment.
+// And the class closure behind all four: a QueryEvent that carries
+// NON-comment text which lexes to NO keyword is, under ROW logging,
+// something this lexer does not understand — and the only thing it has
+// ever turned out to be is a statement-logged write. It now REFUSES
+// (verb "unrecognised") instead of falling to the generic-DDL arm. A
+// comment-ONLY event (whitespace + comments, nothing to execute) still
+// falls through: MySQL never binlogs an empty statement, and MariaDB
+// sends exactly that shape on purpose — the `# Dummy event replacing
+// event type 160 …` QueryEvent that pads out an ANNOTATE_ROWS event a
+// non-annotating replica did not ask for — so refusing it would kill
+// every MariaDB stream with binlog_annotate_row_events=ON.
 //
-// The belt is scope-gated like the generic arm's
-// cache clear (Bug 246: a statement-format writer on an UNRELATED
-// database must not kill the sync); the trade is that a statement
-// whose session default database is out of scope but which writes into
-// a synced database cross-database slips it — the narrower remainder
-// of the same residue.
+// The v0.137.1 "third residue" — a `/*!` comment whose contents carry
+// `*/` inside a string literal, which made the quote-blind span scan
+// stop mid-value — is DISSOLVED rather than guarded by (2): neither
+// scanner searches for the end of a versioned comment any more, because
+// its contents are SQL and the lex stops at the verb (detection) or the
+// first literal (redaction), both of which come before any `*/` a value
+// could hide. The posture that made the old asymmetry deliberate is
+// unchanged and worth restating: a false refusal outranks a silent
+// miss, so DETECTION is never made more conservative than the server.
+// One residue of that posture is stated here: a `/*!NNNNN` whose
+// version exceeds the SOURCE's is a comment to the server and SQL to
+// this lexer, so `/*!99999 INSERT … */ ALTER …` would refuse on a
+// working configuration — loud, wrong, recoverable, and not a shape any
+// known client emits (mysqldump versions are never above the dumping
+// server's).
+//
+// The belt is scope-gated like the generic arm's cache clear (Bug 246:
+// a statement-format writer on an UNRELATED database must not kill the
+// sync). Scope is now the union of the session default database and any
+// database the statement qualifies a name with; a statement that names
+// an in-scope database anywhere outside a string literal — even as a
+// SELECT source (`INSERT INTO other.t SELECT … FROM src.t`) — refuses,
+// which is the loud direction for the only population that can reach it
+// (an already-misconfigured session writing across databases).
+//
+// The VStream lane is the sibling here and it is REACHED, not exempt:
+// the vendored vstreamer forwards statement-format INSERT/UPDATE/DELETE/
+// REPLACE as VEvents of those TYPES (with the SQL in `Dml`), and both
+// hand-mirrored dispatchers dropped them at their default arm.
+// [vstreamStatementDMLError] is their refusal; statement LOAD DATA on a
+// tablet never reaches sluice at all (vstreamer's `IsQuery()` is
+// QUERY_EVENT-only, so Execute_load_query is dropped upstream) — that
+// one is exempt, and stated.
 
 // statementDMLVerbs are the row-DML leading keywords that cannot arrive
 // as query text under ROW logging. WITH is the CTE-DML entry (see the
@@ -120,37 +159,16 @@ func statementDMLVerb(query string) (string, bool) {
 	return first, true
 }
 
-// leadingSQLKeyword lexes the first bare keyword of s — skipping
-// whitespace, `/* … */` block comments (versioned included), `-- `
-// line comments, and `#` line comments — returning it uppercased along
-// with the remainder of s after the token. Empty when s holds no
-// keyword.
+// leadingSQLKeyword lexes the first bare keyword of s — past whatever
+// [skipLeadingSQLComments] recognises as whitespace or comment —
+// returning it uppercased along with the remainder of s after the
+// token. Empty when s holds no keyword: comment-only text, an
+// unterminated block comment, or non-comment text that does not begin
+// with a word ([statementIsCommentOnly] tells those apart).
 func leadingSQLKeyword(s string) (keyword, rest string) {
-	i := 0
-scan:
-	for i < len(s) {
-		switch c := s[i]; {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
-			i++
-		case c == '/' && i+1 < len(s) && s[i+1] == '*':
-			end := strings.Index(s[i+2:], "*/")
-			if end < 0 {
-				return "", ""
-			}
-			i += end + 4
-		case c == '-' && i+1 < len(s) && s[i+1] == '-':
-			// MySQL's `--` comment requires trailing whitespace; a bare
-			// `--x` is not a comment (and not a keyword either way).
-			if i+2 < len(s) && (s[i+2] == ' ' || s[i+2] == '\t') {
-				i = skipToEOL(s, i)
-				continue
-			}
-			return "", ""
-		case c == '#':
-			i = skipToEOL(s, i)
-		default:
-			break scan
-		}
+	i := skipLeadingSQLComments(s)
+	if i < 0 {
+		return "", ""
 	}
 	start := i
 	for i < len(s) && (isKeywordByte(s[i]) || (s[i] >= '0' && s[i] <= '9' && i > start)) {
@@ -160,6 +178,100 @@ scan:
 		return "", ""
 	}
 	return strings.ToUpper(s[start:i]), s[i:]
+}
+
+// skipLeadingSQLComments returns the offset of the first byte of s that
+// is neither whitespace nor part of a leading comment, following the
+// server's own comment grammar (audit 2026-09-01 AQP-2: this is the ONE
+// copy both the detection lexer and the redaction cut use, so the next
+// grammar correction cannot land in one scanner and not the other).
+// Returns -1 when a plain block comment is unterminated — the text has
+// no provable end, so no offset into it is trustworthy.
+//
+// The grammar, as MySQL lexes it:
+//
+//   - whitespace: space, tab, newline, carriage return, form feed and
+//     vertical tab;
+//   - `/* … */` — a plain block comment, quote-blind (a `*/` inside a
+//     quoted value terminates it on the server too);
+//   - `/*!vvvvv … */` and MariaDB's `/*M!vvvvvv … */` — EXECUTABLE
+//     comments: the server lexes their contents as SQL, so only the
+//     marker and its version digits are skipped and lexing continues
+//     INSIDE; the matching `*/` is consumed as a closer when it is met
+//     at comment depth (the `/*!40000 */ DELETE …` shape mysqldump and
+//     Vitess emit), and never searched for;
+//   - `/*+ … */` — an optimizer hint is a plain block comment to this
+//     scan (the server only interprets one directly after a verb);
+//   - `-- ` — a line comment when `--` is followed by whitespace OR a
+//     control character (0x00–0x20, 0x7F) or by the end of the text.
+//     That is the server's rule, ground-truthed on 8.0.46: `--\nINSERT`
+//     executes the INSERT, `--x` is a syntax error. The old scan
+//     accepted only space and tab (SLM-3 shape 3);
+//   - `#` — a line comment to end of line.
+//
+// A bare `--x` returns its own offset: it is not a comment, so nothing
+// past it is provably one either.
+func skipLeadingSQLComments(s string) int {
+	i, depth := 0, 0
+	for i < len(s) {
+		switch c := s[i]; {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+			i++
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			if marker := versionedCommentMarkerLen(s[i:]); marker > 0 {
+				i += marker
+				depth++
+				continue
+			}
+			end := strings.Index(s[i+2:], "*/")
+			if end < 0 {
+				return -1
+			}
+			i += end + 4
+		case c == '*' && depth > 0 && i+1 < len(s) && s[i+1] == '/':
+			depth--
+			i += 2
+		case c == '-' && i+1 < len(s) && s[i+1] == '-':
+			if i+2 >= len(s) || s[i+2] <= ' ' || s[i+2] == 0x7f {
+				i = skipToEOL(s, i)
+				continue
+			}
+			return i
+		case c == '#':
+			i = skipToEOL(s, i)
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// versionedCommentMarkerLen returns the byte length of the executable-
+// comment opener at the start of s — `/*!` or `/*M!` plus its optional
+// version digits — or 0 when s does not start with one.
+func versionedCommentMarkerLen(s string) int {
+	n := 0
+	switch {
+	case strings.HasPrefix(s, "/*!"):
+		n = 3
+	case strings.HasPrefix(s, "/*M!"):
+		n = 4
+	default:
+		return 0
+	}
+	for n < len(s) && s[n] >= '0' && s[n] <= '9' {
+		n++
+	}
+	return n
+}
+
+// statementIsCommentOnly reports whether s is nothing but whitespace and
+// comments — text the server would not execute and (on MySQL) would not
+// binlog at all. It is the one no-keyword shape the belt lets through:
+// MariaDB pads a suppressed ANNOTATE_ROWS event with a `# Dummy event …`
+// QueryEvent of exactly this shape (see the file comment).
+func statementIsCommentOnly(s string) bool {
+	return skipLeadingSQLComments(s) == len(s)
 }
 
 func skipToEOL(s string, i int) int {
@@ -173,26 +285,129 @@ func isKeywordByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
 
+// statementDMLUnrecognisedVerb is the verb the class-closure refusal
+// carries: the event held non-comment text this lexer found no keyword
+// in (SLM-3). Named so the refusal reads as what it is — "sluice could
+// not classify this statement" — rather than as a DML verb it never saw.
+const statementDMLUnrecognisedVerb = "unrecognised (no leading keyword)"
+
 // dispatchStatementGuards is the QueryEvent arm's statement-shaped
 // guard pair, run after the BEGIN/COMMIT arms and before the fold +
 // generic-DDL handling: the CDCPOS-1 XA verb dispatch (handled=true
 // consumes the event) and the M2 STATEMENT-DML tripwire (a coded,
-// stream-fatal refusal when query is a row-DML statement whose session
-// default database — schema, "" = none selected — is in the stream's
-// scope). (false, nil) falls through to the generic-DDL arm, whose own
-// cache clear is gated on the same scope condition.
+// stream-fatal refusal when query is a row-DML statement in the
+// stream's scope). (false, nil) falls through to the generic-DDL arm,
+// whose own cache clear is gated on the session-database scope.
+//
+// Two statements trip it: one whose leading keyword is a row-DML verb,
+// and one whose text lexes to NO keyword at all despite carrying
+// non-comment content (SLM-3's class closure — see the file comment for
+// why comment-only text is let through). Scope is
+// [CDCReader.statementInScope]: the session default database — schema,
+// "" = none selected — OR a `<db>.` qualifier in the statement naming a
+// synced database (SLM-3 shape 4).
 func (r *CDCReader) dispatchStatementGuards(q, schema string, hdr *replication.EventHeader) (handled bool, err error) {
 	if handled, err := r.dispatchXAStatement(q); handled || err != nil {
 		return handled, err
 	}
 	verb, isDML := statementDMLVerb(q)
 	if !isDML {
-		return false, nil
+		if first, _ := leadingSQLKeyword(q); first != "" || statementIsCommentOnly(q) {
+			return false, nil
+		}
+		verb = statementDMLUnrecognisedVerb
 	}
-	if schema != "" && !r.databaseInScope(schema) {
+	if !r.statementInScope(schema, q) {
 		return false, nil
 	}
 	return false, statementDMLError(verb, schema, r.statementDMLLocator(hdr), q)
+}
+
+// statementInScope is the belt's scope predicate: the statement's
+// session default database is in scope (or none was selected), or the
+// statement text itself qualifies a name with an in-scope database.
+func (r *CDCReader) statementInScope(schema, q string) bool {
+	if schema == "" || r.databaseInScope(schema) {
+		return true
+	}
+	return statementNamesInScopeDatabase(q, r.databaseInScope)
+}
+
+// statementNamesInScopeDatabase reports whether q carries a
+// `<name>.` qualifier — a bare or backtick-quoted identifier
+// immediately followed by a dot — for which inScope(name) holds,
+// anywhere outside a string literal or comment. It is the SLM-3 shape-4
+// door: a statement-format writer whose session database is unrelated
+// to the sync can still write INTO a synced database by qualifying the
+// table, and the session-database gate alone called that "unrelated".
+//
+// The scan is deliberately a whole-statement token walk rather than the
+// audit's "one token past the verb": the qualifier's position varies by
+// verb and modifier (`INSERT IGNORE INTO src.t`, `UPDATE LOW_PRIORITY
+// src.t`, `DELETE t FROM src.t`, `WITH c AS (…) UPDATE src.t`), and the
+// loud direction is the right one for the only population that reaches
+// it. The cost is stated in the file comment: a synced database named
+// only as a SELECT source refuses too. String literals are skipped with
+// MySQL's quoting rules (`\` escapes, doubled quotes) so a value that
+// happens to contain `src.` is never mistaken for a qualifier.
+func statementNamesInScopeDatabase(q string, inScope func(string) bool) bool {
+	i := 0
+	for i < len(q) {
+		switch c := q[i]; {
+		case c == '\'' || c == '"':
+			i = skipQuotedLiteral(q, i)
+		case c == '`':
+			end := backtickIdentEnd(q, i)
+			if end < 0 {
+				return false
+			}
+			if end < len(q) && q[end] == '.' && inScope(strings.ReplaceAll(q[i+1:end-1], "``", "`")) {
+				return true
+			}
+			i = end
+		case isKeywordByte(c) || c == '$':
+			start := i
+			for i < len(q) && (isKeywordByte(q[i]) || q[i] == '$' || (q[i] >= '0' && q[i] <= '9')) {
+				i++
+			}
+			if i < len(q) && q[i] == '.' && inScope(q[start:i]) {
+				return true
+			}
+		case c == '/' || c == '-' || c == '#':
+			// A comment mid-statement: skip it whole so a `src.` inside
+			// an annotation neither trips nor hides anything. A bare
+			// `/` or `-` operator advances one byte.
+			if n := skipLeadingSQLComments(q[i:]); n > 0 {
+				i += n
+			} else {
+				i++
+			}
+		default:
+			i++
+		}
+	}
+	return false
+}
+
+// skipQuotedLiteral returns the offset just past the string literal
+// opening at q[i] (a `'` or `"`), honouring MySQL's backslash escapes
+// and doubled-quote escapes. An unterminated literal consumes the rest
+// of q — nothing after it can be a qualifier the server saw.
+func skipQuotedLiteral(q string, i int) int {
+	quote := q[i]
+	for j := i + 1; j < len(q); j++ {
+		switch q[j] {
+		case '\\':
+			j++ // the escaped byte, whatever it is
+		case quote:
+			if j+1 < len(q) && q[j+1] == quote {
+				j++ // doubled quote: an escaped quote, keep scanning
+				continue
+			}
+			return j + 1
+		}
+	}
+	return len(q)
 }
 
 // statementDMLLocator renders the payload-free coordinate the refusal
@@ -354,60 +569,25 @@ func statementDMLCut(query string) int {
 }
 
 // statementDMLCommentSkip returns the offset of the first byte of query
-// that is not leading whitespace or a leading comment, using the same
-// comment forms [leadingSQLKeyword] recognises. On anything malformed
-// (an unterminated block comment) it returns 0, so the caller falls back
-// to cutting immediately — the safe direction.
+// that is not leading whitespace or a leading comment — the SAME
+// grammar the detection lexer uses, via [skipLeadingSQLComments]
+// (audit 2026-09-01 AQP-2: the two scanners were hand-copied and had
+// already diverged in effect). On an unterminated block comment it
+// returns 0, so the caller falls back to cutting immediately — the safe
+// direction.
+//
+// The v0.137.1 quote guard that used to live here (refuse to trust a
+// `/*!` span carrying a quote) is gone with the span search it guarded:
+// a versioned comment's contents are lexed as SQL, so the skip stops at
+// the marker and the allowlist cut handles whatever follows — a `*/`
+// hidden inside a quoted value is never reached, because the quote cuts
+// first. TestStatementDMLLead_VersionedCommentContentsAreSQL keeps the
+// original observed fixture pinned in both directions.
 func statementDMLCommentSkip(query string) int {
-	i := 0
-	for i < len(query) {
-		switch c := query[i]; {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
-			i++
-		case c == '/' && i+1 < len(query) && query[i+1] == '*':
-			end := strings.Index(query[i+2:], "*/")
-			if end < 0 {
-				return 0
-			}
-			// A `/*! … */` EXECUTABLE comment is lexed by MySQL as SQL,
-			// so a `*/` inside a string literal does NOT terminate it —
-			// unlike a plain `/* … */`, where MySQL is quote-blind exactly
-			// as this scan is. Ground-truthed on real MySQL 8.0.46 by the
-			// v0.137.1 pre-tag review: a versioned comment carrying `*/`
-			// inside a quoted value makes this scan stop early, mid-value,
-			// and the offset is then NOT past a comment — which is the
-			// unstated premise the allowlist's completeness argument rests
-			// on. Two consequences were observed, both real: a healthy
-			// ROW-logged DDL raised the stream-fatal STATEMENT-DML refusal
-			// with a remedy that cannot succeed, and a row-value fragment
-			// reached a refusal whose own text promises values are
-			// withheld.
-			//
-			// Rather than lex MySQL's version-gated SQL here, take the
-			// already-blessed safe direction: if a versioned comment's
-			// skipped span carries a quote, refuse to trust the skip and
-			// return 0, exactly as an unterminated comment does. The lead
-			// then collapses to "…" — a lost diagnostic, never a leak. The
-			// shapes this exists for (Vitess `/*vt+ …*/`, sqlcommenter,
-			// mysqldump) carry no quotes and are unaffected.
-			if span := query[i : i+end+4]; strings.HasPrefix(span, "/*!") &&
-				strings.ContainsAny(span, "'\"") {
-				return 0
-			}
-			i += end + 4
-		case c == '-' && i+1 < len(query) && query[i+1] == '-':
-			if i+2 < len(query) && (query[i+2] == ' ' || query[i+2] == '\t') {
-				i = skipToEOL(query, i)
-				continue
-			}
-			return i
-		case c == '#':
-			i = skipToEOL(query, i)
-		default:
-			return i
-		}
+	if i := skipLeadingSQLComments(query); i > 0 {
+		return i
 	}
-	return i
+	return 0
 }
 
 // backtickIdentEnd returns the offset just past the backtick-quoted
@@ -457,10 +637,17 @@ func backtickIdentEnd(query string, i int) int {
 // mysqlbinlog, and are functions of the stream rather than of the
 // bytes — so they cannot be inverted at all.
 func statementDMLError(verb, schema, locator, query string) error {
-	if verb == "WITH" {
+	carrier := "binlog QUERY-event text"
+	switch verb {
+	case "WITH":
 		// Name the class, not just the token: the WITH entry exists for
 		// statement-format CTE-DML (file comment).
 		verb = "WITH-prefixed (CTE-DML)"
+	case statementDMLLoadDataVerb:
+		// Statement-format LOAD DATA rides its own event class (SLM-3
+		// shape 1); name it so the coordinate resolves to the right
+		// event in mysqlbinlog.
+		carrier = "a binlog EXECUTE_LOAD_QUERY event's statement text"
 	}
 	where := "with no default database selected"
 	if schema != "" {
@@ -474,7 +661,7 @@ func statementDMLError(verb, schema, locator, query string) error {
 			"SHOW PROCESSLIST and interrogate candidate sessions), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh "+
 			"(--restart-from-scratch) — the statement-logged writes are only recoverable by re-snapshot",
 		fmt.Errorf(
-			"mysql: cdc: a %s statement arrived as binlog QUERY-event text %s (%d bytes, %s, "+
+			"mysql: cdc: a %s statement arrived as %s %s (%d bytes, %s, "+
 				"leading text %q; values withheld — locate the statement by that binlog coordinate, e.g. "+
 				"mysqlbinlog against your own server) — "+
 				"under ROW logging DML is written as row events, so statement text here is proof a writing "+
@@ -485,7 +672,7 @@ func statementDMLError(verb, schema, locator, query string) error {
 				"it), ensure @@GLOBAL.binlog_format=ROW, then start the sync fresh: a resume would "+
 				"deterministically re-refuse at this same event, and only a fresh snapshot recopies the "+
 				"statement-logged writes",
-			verb, where, len(query), locator, statementDMLLead(query),
+			verb, carrier, where, len(query), locator, statementDMLLead(query),
 		),
 	)
 }

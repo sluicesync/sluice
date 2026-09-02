@@ -2072,6 +2072,15 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 		// recovery is a future chunk.
 		return false, journalToShardLayoutErr(ev.GetJournal())
 
+	case binlogdata.VEventType_INSERT,
+		binlogdata.VEventType_REPLACE,
+		binlogdata.VEventType_UPDATE,
+		binlogdata.VEventType_DELETE:
+		// Statement-format DML during COPY is a write the catch-up
+		// phase would otherwise lose exactly as the CDC tail would
+		// (cdc_vstream_statement_dml.go).
+		return false, s.statementDMLRefusal(ev)
+
 	default:
 		// LASTPK, BEGIN, COMMIT, HEARTBEAT, GTID, OTHER, etc. — all
 		// fine to ignore during COPY.
@@ -2524,6 +2533,14 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		// so the caller can decide whether to reopen against the
 		// new shard set or fail loudly.
 		return journalToShardLayoutErr(ev.GetJournal())
+
+	case binlogdata.VEventType_INSERT,
+		binlogdata.VEventType_REPLACE,
+		binlogdata.VEventType_UPDATE,
+		binlogdata.VEventType_DELETE:
+		// Statement-format DML — the mirror of the standalone reader's
+		// arm (cdc_vstream_statement_dml.go).
+		return s.statementDMLRefusal(ev)
 
 	default:
 		// BEGIN, COMMIT, HEARTBEAT, GTID, OTHER, VERSION, LASTPK,
@@ -3534,4 +3551,13 @@ func toProtoShardGtids(in []shardGtid) ([]*binlogdata.ShardGtid, error) {
 		}
 	}
 	return out, nil
+}
+
+// statementDMLRefusal is the snapshot stream's STATEMENT-DML arm, reached
+// from both its COPY-phase and its post-COPY CDC dispatcher (audit
+// 2026-09-01 SLM-3; cdc_vstream_statement_dml.go). The mirror of
+// [vstreamCDCReader.statementDMLRefusal].
+func (s *vstreamSnapshotStream) statementDMLRefusal(ev *binlogdata.VEvent) error {
+	pos, _ := s.positionFor()
+	return vstreamStatementDMLError(ev, pos)
 }

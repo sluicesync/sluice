@@ -332,6 +332,15 @@ type CDCReader struct {
 	pendingGTID string
 	inSourceTx  bool
 
+	// binlogChecksumAlg is the checksum algorithm the current binlog
+	// file's FORMAT_DESCRIPTION declares; payloadDepth is > 0 while the
+	// dispatcher is inside a TRANSACTION_PAYLOAD's inner events. Together
+	// they say whether the event being dispatched carries a CRC32
+	// trailer — the one fact the EXECUTE_LOAD_QUERY decoder
+	// (cdc_statement_load_data.go) cannot read off the raw bytes.
+	binlogChecksumAlg replication.BinlogChecksum
+	payloadDepth      int
+
 	// scopeAllowed is the pipeline-supplied effective table scope
 	// (--include/--exclude-table merged with live-adds) — the optional
 	// [ir.CDCScopePredicateSetter] surface, consulted ONLY by reader-side
@@ -991,7 +1000,7 @@ func isRowRelevantEvent(ev *replication.BinlogEvent) bool {
 	}
 	switch ev.Event.(type) {
 	case *replication.RowsEvent, *replication.QueryEvent, *replication.GTIDEvent,
-		*replication.MariadbGTIDEvent, *replication.XIDEvent:
+		*replication.MariadbGTIDEvent, *replication.XIDEvent, *replication.ExecuteLoadQueryEvent:
 		return true
 	case *replication.TransactionPayloadEvent:
 		// A compressed transaction (binlog_transaction_compression=ON) wraps
@@ -1308,39 +1317,84 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// post-payload one — the compressed shape gets the identical guarantee as
 		// the uncompressed one, by construction, because it reuses the arms.
 		// (Pinned by TestGTIDStaging_CompressedTransactionPayload.)
-		payloadEnd := ev.Header.LogPos
-		payloadStart := payloadEnd - ev.Header.EventSize
-		lastIdx := -1
-		for i, inner := range e.Events {
-			if inner != nil && inner.Header != nil {
-				lastIdx = i
-			}
-		}
-		for i, inner := range e.Events {
-			if inner == nil || inner.Header == nil {
-				continue
-			}
-			if i == lastIdx {
-				// The commit (XID) — advance the resume point past the payload
-				// now that the whole transaction has been dispatched.
-				inner.Header.LogPos = payloadEnd
-			} else {
-				// Mid-payload — a partial apply must re-read the whole payload
-				// on resume, so anchor at the payload's start.
-				inner.Header.LogPos = payloadStart
-			}
-			if err := r.dispatch(ctx, inner, out); err != nil {
-				return err
-			}
-		}
+		return r.dispatchTransactionPayload(ctx, ev, e, out)
+
+	case *replication.FormatDescriptionEvent:
+		// Opens every binlog file; the checksum algorithm it declares is
+		// what says whether the events that follow carry a CRC32 trailer.
+		r.binlogChecksumAlg = e.ChecksumAlgorithm
 		return nil
 
+	case *replication.ExecuteLoadQueryEvent:
+		// Statement-format LOAD DATA (audit 2026-09-01 SLM-3 shape 1):
+		// the STATEMENT-DML belt's refusal, from this event class's own
+		// schema + statement text. See cdc_statement_load_data.go.
+		return r.dispatchExecuteLoadQuery(ev, e)
+
+	case *replication.BeginLoadQueryEvent:
+		// The file bytes of a statement-format LOAD DATA, one block per
+		// event, carrying no schema and no statement. The
+		// EXECUTE_LOAD_QUERY that follows in the same group is the
+		// refusal site; a BEGIN with no EXECUTE is a load the server
+		// rolled back, and there is nothing to apply. Classified in
+		// TestDispatchEventRoster_EveryWriteBearingType.
+		return nil
+
+	case *replication.GenericEvent:
+		// Undecoded types: bookkeeping, except the legacy LOAD DATA
+		// family, which is refused (cdc_statement_load_data.go).
+		return r.dispatchGenericEvent(ev)
+
 	default:
-		// FORMAT_DESCRIPTION_EVENT, ROWS_QUERY_EVENT, and other bookkeeping
-		// events fall through silently. (Compressed transactions are handled
-		// by the TransactionPayloadEvent case above.)
+		// ROWS_QUERY_EVENT, HEARTBEAT, PREVIOUS_GTIDS and the other
+		// decoded bookkeeping events fall through silently. Every type that
+		// can carry a write has an arm above, and the roster test fails
+		// on a new go-mysql event type that is not classified.
 		return nil
 	}
+}
+
+// dispatchTransactionPayload unpacks a compressed transaction and
+// re-dispatches its inner events with the position stamping the
+// TransactionPayloadEvent arm's comment explains: every inner event
+// carries the payload's START, the final (commit) one its END.
+func (r *CDCReader) dispatchTransactionPayload(
+	ctx context.Context,
+	ev *replication.BinlogEvent,
+	e *replication.TransactionPayloadEvent,
+	out chan<- ir.Change,
+) error {
+	payloadEnd := ev.Header.LogPos
+	payloadStart := payloadEnd - ev.Header.EventSize
+	lastIdx := -1
+	for i, inner := range e.Events {
+		if inner != nil && inner.Header != nil {
+			lastIdx = i
+		}
+	}
+	// Inner events carry no checksum trailer (go-mysql's nested parser
+	// runs with verification off for that reason); the EXECUTE_LOAD_QUERY
+	// decoder reads payloadDepth to leave the tail intact.
+	r.payloadDepth++
+	defer func() { r.payloadDepth-- }()
+	for i, inner := range e.Events {
+		if inner == nil || inner.Header == nil {
+			continue
+		}
+		if i == lastIdx {
+			// The commit (XID) — advance the resume point past the payload
+			// now that the whole transaction has been dispatched.
+			inner.Header.LogPos = payloadEnd
+		} else {
+			// Mid-payload — a partial apply must re-read the whole payload
+			// on resume, so anchor at the payload's start.
+			inner.Header.LogPos = payloadStart
+		}
+		if err := r.dispatch(ctx, inner, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dispatchRows fans a row event out into per-row [ir.Change] values.

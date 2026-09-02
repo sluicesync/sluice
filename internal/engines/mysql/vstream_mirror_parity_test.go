@@ -37,6 +37,9 @@ func TestVStreamDispatchTwinsShareTheirRecoveryHelpers(t *testing.T) {
 	// whenever a fix introduces a helper on one twin.
 	required := []string{
 		"invalidateFieldsForDDL",
+		// Audit 2026-09-01 SLM-3: the statement-DML refusal arm. Its
+		// absence on one twin is the binlog lane's silent drop, mirrored.
+		"statementDMLRefusal",
 	}
 	const (
 		readerType   = "vstreamCDCReader"

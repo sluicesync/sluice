@@ -41,6 +41,15 @@ func TestStatementDMLVerb(t *testing.T) {
 		"cte_delete_lowercase": "with x as (select id from t) delete from t where id in (select id from x)",
 		"cte_recursive":        "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT n+1 FROM x) DELETE FROM t WHERE id IN (SELECT n FROM x)",
 		"cte_comment":          "/* app */ WITH x AS (SELECT id FROM t) UPDATE t SET v = 2",
+		// SLM-3 shapes 2 and 3 (audit 2026-09-01), both observed on real
+		// 8.0.46 as silent drops: a versioned comment's contents are SQL
+		// to the server, and `--` before a newline IS a comment. Each was
+		// pinned as PASS here until the observation flipped it.
+		"versioned_wrapped":   "/*!50000 INSERT INTO t VALUES (10,'versioned') */",
+		"versioned_empty_pfx": "/*!40000 */ DELETE FROM t",
+		"mariadb_versioned":   "/*M!100300 REPLACE INTO t VALUES (1) */",
+		"dash_newline":        "--\nINSERT INTO t VALUES (13,'dashnl')",
+		"dash_crlf":           "--\r\nUPDATE t SET x = 1",
 	}
 	for name, q := range trips {
 		verb, ok := statementDMLVerb(q)
@@ -71,7 +80,8 @@ func TestStatementDMLVerb(t *testing.T) {
 		"comment_only":           "-- INSERT swallowed by a comment",
 		"hash_only":              "# UPDATE swallowed",
 		"unterminated":           "/* unterminated INSERT",
-		"versioned_residue":      "/*!40000 INSERT INTO t VALUES (1) */", // documented residue: versioned comments lex as comments
+		"plain_block_only":       "/* INSERT is a comment here, not SQL */",
+		"dash_bare":              "--x INSERT", // `--x` is a syntax error on the server, never a comment
 		"empty":                  "",
 	}
 	for name, q := range passes {
@@ -142,6 +152,22 @@ func TestStatementDMLError(t *testing.T) {
 	withMsg := statementDMLError("WITH", "app", "gtid 6a3175a8-…:9", "WITH x AS (SELECT id FROM t) UPDATE t SET v = 1").Error()
 	if !strings.Contains(withMsg, "CTE-DML") {
 		t.Errorf("WITH refusal does not name CTE-DML; got: %v", withMsg)
+	}
+	if !strings.Contains(withMsg, "binlog QUERY-event text") {
+		t.Errorf("a QueryEvent refusal must name its carrier; got: %v", withMsg)
+	}
+
+	// LOAD DATA rides a different event class (SLM-3 shape 1); the
+	// refusal names it so the coordinate resolves in mysqlbinlog.
+	loadMsg := statementDMLError(statementDMLLoadDataVerb, "app", "ends at binlog mysql-bin.000004:9182",
+		"LOAD DATA LOCAL INFILE '/tmp/t.tsv' INTO TABLE t").Error()
+	for _, want := range []string{"a LOAD DATA statement", "EXECUTE_LOAD_QUERY", "LOAD DATA LOCAL INFILE"} {
+		if !strings.Contains(loadMsg, want) {
+			t.Errorf("LOAD DATA refusal missing %q; got: %v", want, loadMsg)
+		}
+	}
+	if strings.Contains(loadMsg, "/tmp/t.tsv") {
+		t.Errorf("LOAD DATA refusal echoed the file-name literal: %v", loadMsg)
 	}
 }
 
@@ -348,18 +374,20 @@ func TestStatementDMLLead_CommentPrefixedKeepsItsDiagnostic(t *testing.T) {
 	}
 }
 
-// TestStatementDMLLead_VersionedCommentWithAQuoteIsNotTrusted pins the
-// v0.137.1 guard. MySQL lexes a `/*! … */` EXECUTABLE comment's contents as
-// SQL, so a `*/` inside a string literal does NOT terminate it — while the
-// skip is quote-blind, which is right for a plain comment and wrong for a
-// versioned one. A versioned comment carrying `*/` inside a quoted value
-// therefore stopped the skip MID-VALUE, and the remainder of the value was
-// echoed into a refusal that promises values are withheld.
+// TestStatementDMLLead_VersionedCommentContentsAreSQL pins the v0.137.1
+// fixture under the SLM-3 lexer. MySQL lexes a `/*! … */` EXECUTABLE
+// comment's contents as SQL, so a `*/` inside a string literal does NOT
+// terminate it. v0.137.1 guarded the redaction scan against that (refuse
+// to trust a `/*!` span carrying a quote, cut at 0) and deliberately left
+// detection alone; the lexer now does what the server does — skips only
+// the marker and lexes the contents — so the `*/` inside the value is
+// never reached by either scanner, the diagnostic survives, and the value
+// still does not.
 //
 // The statement below is not contrived: it is what real MySQL 8.0.46 wrote to
 // the binlog for a genuine statement-format UPDATE, observed by the v0.137.1
 // pre-tag review via SHOW BINLOG EVENTS.
-func TestStatementDMLLead_VersionedCommentWithAQuoteIsNotTrusted(t *testing.T) {
+func TestStatementDMLLead_VersionedCommentContentsAreSQL(t *testing.T) {
 	t.Parallel()
 
 	const secret = "078051120"
@@ -367,19 +395,24 @@ func TestStatementDMLLead_VersionedCommentWithAQuoteIsNotTrusted(t *testing.T) {
 	if !strings.Contains(q, secret) {
 		t.Fatalf("the fixture lost its secret: %q", q)
 	}
-	if lead := statementDMLLead(q); strings.Contains(lead, secret) {
-		t.Errorf("statementDMLLead(%q) = %q — a row-value fragment reached the refusal. A `/*!` comment "+
-			"whose skipped span carries a quote must not be trusted as a comment; the safe fallback is "+
-			"to cut at 0 and lose the diagnostic", q, lead)
+	lead := statementDMLLead(q)
+	if strings.Contains(lead, secret) {
+		t.Errorf("statementDMLLead(%q) = %q — a row-value fragment reached the refusal", q, lead)
+	}
+	if !strings.HasPrefix(lead, "UPDATE patients SET note") {
+		t.Errorf("statementDMLLead(%q) = %q — the contents of a versioned comment are SQL and their verb, "+
+			"table and column are the diagnostic half; v0.137.1 lost them to a guard this lexer no longer needs", q, lead)
+	}
+	if verb, ok := statementDMLVerb(q); !ok || verb != "UPDATE" {
+		t.Errorf("statementDMLVerb(%q) = %q, %v; want UPDATE (the contents are SQL to the server)", q, verb, ok)
 	}
 
-	// The guard must be NARROW. A versioned comment without a quote is the
-	// common real shape (mysqldump, Vitess) and must still be skipped, or
-	// the guard would quietly disable the Bug 258 fix for those.
+	// The empty-marker shape mysqldump and Vitess emit must still be
+	// skipped, or the Bug 258 fix would be quietly disabled for those.
 	plain := "/*!40000 */ DELETE FROM patients WHERE ssn = '" + secret + "'"
-	lead := statementDMLLead(plain)
+	lead = statementDMLLead(plain)
 	if !strings.HasPrefix(lead, "DELETE FROM patients WHERE ssn") {
-		t.Errorf("statementDMLLead(%q) = %q — a quote-free versioned comment must still be skipped", plain, lead)
+		t.Errorf("statementDMLLead(%q) = %q — an empty versioned comment must still be skipped", plain, lead)
 	}
 	if strings.Contains(lead, secret) {
 		t.Errorf("statementDMLLead(%q) = %q — literal survived", plain, lead)

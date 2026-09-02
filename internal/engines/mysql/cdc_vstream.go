@@ -1500,6 +1500,18 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		// inspect the new shard layout and call Reopen to resume.
 		return journalToShardLayoutErr(ev.GetJournal())
 
+	case binlogdata.VEventType_INSERT,
+		binlogdata.VEventType_REPLACE,
+		binlogdata.VEventType_UPDATE,
+		binlogdata.VEventType_DELETE:
+		// Statement-format DML, forwarded by the vendored vstreamer as
+		// these types with the SQL in Dml (audit 2026-09-01 SLM-3 sibling
+		// sweep; cdc_vstream_statement_dml.go). The old default arm's
+		// "which we don't get because Filter rules ask for row-format"
+		// was a false premise: the filter shapes ROW events, it does not
+		// suppress statement ones.
+		return r.statementDMLRefusal(ev)
+
 	case binlogdata.VEventType_BEGIN,
 		binlogdata.VEventType_COMMIT,
 		binlogdata.VEventType_HEARTBEAT,
@@ -1512,9 +1524,7 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		return nil
 
 	default:
-		// COPY_COMPLETED, statement-level INSERT/UPDATE/DELETE
-		// (which we don't get because Filter rules above ask for
-		// row-format), SET, and any future event types fall here
+		// COPY_COMPLETED, SET, and any future event types fall here
 		// silently. Logging is the caller's responsibility.
 		return nil
 	}
@@ -2732,4 +2742,12 @@ func vstreamMaxRecvBytesFromDSN(cfg *gomysql.Config) (int, error) {
 		)
 	}
 	return n, nil
+}
+
+// statementDMLRefusal is the standalone reader's STATEMENT-DML arm
+// (audit 2026-09-01 SLM-3; cdc_vstream_statement_dml.go). Mirrored on
+// [vstreamSnapshotStream] and held to it by the mirror-parity gate.
+func (r *vstreamCDCReader) statementDMLRefusal(ev *binlogdata.VEvent) error {
+	pos, _ := r.positionFor() // a position that fails to encode still refuses; the coordinate is diagnostic only
+	return vstreamStatementDMLError(ev, pos)
 }
