@@ -132,7 +132,9 @@ func fixedRows(rows []map[string]any) d1Handler {
 
 // isD1CountQuery reports whether sql is the LA-3 COUNT(*) bracket query the row
 // reader issues before its first page and after its last.
-func isD1CountQuery(sql string) bool { return strings.HasPrefix(sql, "SELECT CAST(COUNT(*) AS TEXT)") }
+func isD1CountQuery(sqlStr string) bool {
+	return strings.HasPrefix(sqlStr, "SELECT CAST(COUNT(*) AS TEXT)")
+}
 
 // withCount answers the LA-3 COUNT(*) bracket with n and delegates every other
 // query to h. A canned-page mock has to declare the total it serves: the reader

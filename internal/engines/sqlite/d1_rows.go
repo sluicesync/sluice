@@ -283,8 +283,11 @@ func (r *D1RowReader) countRows(ctx context.Context, table string) (int64, error
 		return 0, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
 	}
 	text, ok, err := jsonString(rows[0]["n"])
-	if err != nil || !ok {
-		return 0, fmt.Errorf("COUNT(*) result is not a text scalar (%v)", err)
+	if err != nil {
+		return 0, fmt.Errorf("COUNT(*) result is not a text scalar: %w", err)
+	}
+	if !ok {
+		return 0, errors.New("COUNT(*) result is NULL")
 	}
 	n, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {

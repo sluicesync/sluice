@@ -62,15 +62,37 @@ var rowidShadowMatrix = []rowidShadowCell{
 // possible on the implicit rowid.
 func rowidShadowSeed(t *testing.T, db *sql.DB, ddl string) {
 	t.Helper()
-	if _, err := db.Exec(ddl); err != nil {
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// Every declared TEXT column gets the same duplicate-valued series; the
 	// generated cell's `k` is its source column.
-	cols, err := db.Query(`SELECT name FROM pragma_table_info('t') WHERE type = 'TEXT'`)
+	textCols := declaredTextColumns(t, db)
+	if len(textCols) == 0 {
+		t.Fatal("test bug: the cell declares no TEXT column to shadow with")
+	}
+	for i, val := range []string{"a", "a", "a", "b", "b", "a", "b"} {
+		set := make([]string, len(textCols))
+		for j := range textCols {
+			set[j] = "'" + val + "'"
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO t (v, `+strings.Join(textCols, ", ")+`) VALUES (`+
+			strconv.Itoa(i+1)+`, `+strings.Join(set, ", ")+`)`); err != nil {
+			t.Fatalf("seed row %d: %v", i+1, err)
+		}
+	}
+}
+
+// declaredTextColumns lists the table's declared (non-generated) TEXT columns,
+// quoted for SQL.
+func declaredTextColumns(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	cols, err := db.QueryContext(context.Background(), `SELECT name FROM pragma_table_info('t') WHERE type = 'TEXT'`)
 	if err != nil {
 		t.Fatalf("pragma_table_info: %v", err)
 	}
+	defer func() { _ = cols.Close() }()
 	var textCols []string
 	for cols.Next() {
 		var name string
@@ -82,20 +104,7 @@ func rowidShadowSeed(t *testing.T, db *sql.DB, ddl string) {
 	if err := cols.Err(); err != nil {
 		t.Fatalf("pragma_table_info rows: %v", err)
 	}
-	_ = cols.Close()
-	if len(textCols) == 0 {
-		t.Fatal("test bug: the cell declares no TEXT column to shadow with")
-	}
-	for i, val := range []string{"a", "a", "a", "b", "b", "a", "b"} {
-		set := make([]string, len(textCols))
-		for j := range textCols {
-			set[j] = "'" + val + "'"
-		}
-		if _, err := db.Exec(`INSERT INTO t (v, ` + strings.Join(textCols, ", ") + `) VALUES (` +
-			strconv.Itoa(i+1) + `, ` + strings.Join(set, ", ") + `)`); err != nil {
-			t.Fatalf("seed row %d: %v", i+1, err)
-		}
-	}
+	return textCols
 }
 
 // recordingExec wraps the exec-backed mock so a test can assert which SQL the
