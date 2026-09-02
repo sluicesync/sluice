@@ -165,7 +165,7 @@ func resolveRetainedSeedTable(orderer ir.PositionOrderer, versions []ir.Retained
 	}
 	tbl, err := ir.ResolveSchemaVersion(orderer, versions, persisted)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errRetainedSeedUnresolvable, err)
+		return nil, fmt.Errorf("%w: %w", errRetainedSeedUnresolvable, err)
 	}
 	return tbl, nil
 }

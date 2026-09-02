@@ -48,10 +48,9 @@ func TestSessionZoneSiblingSwap_EveryFamilyAndShape(t *testing.T) {
 		{"date", ir.Date{}, "", false, false},
 		{"integer", ir.Integer{Width: 64}, "", false, false},
 	}
-	var universe []member
+	universe := make([]member, 0, 2*len(scalars))
 	for _, m := range scalars {
-		universe = append(universe, m)
-		universe = append(universe, member{"array:" + m.name, ir.Array{Element: m.typ}, "array:" + m.family, m.zoned, m.ok})
+		universe = append(universe, m, member{"array:" + m.name, ir.Array{Element: m.typ}, "array:" + m.family, m.zoned, m.ok})
 	}
 	if len(universe) < 14 {
 		t.Fatalf("universe holds %d members; floor 14 — the derivation went vacuous", len(universe))

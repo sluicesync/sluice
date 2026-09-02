@@ -412,7 +412,7 @@ func TestVStreamSchemaHistory_SessionTZCastRefuses(t *testing.T) {
 
 	// SLM-1: the FIRST FIELD of this process, with the prior coming from
 	// the streamer's seed rather than an earlier FIELD.
-	seeded := func(t *testing.T, seedType, first string) (error, int) {
+	seeded := func(t *testing.T, seedType, first string) (int, error) {
 		t.Helper()
 		r := newVStreamTestReader()
 		r.schemaDeltaAppliesToTarget = true
@@ -433,14 +433,14 @@ func TestVStreamSchemaHistory_SessionTZCastRefuses(t *testing.T) {
 				n++
 			}
 		}
-		return err, n
+		return n, err
 	}
 	t.Run("SEEDED: the first FIELD refuses a zone-sibling swap", func(t *testing.T) {
-		err, _ := seeded(t, "timestamp", "datetime")
+		_, err := seeded(t, "timestamp", "datetime")
 		requireSessionTZRefusal(t, err, "created_at")
 	})
 	t.Run("SEEDED: a seed-equal first FIELD still emits its history version", func(t *testing.T) {
-		err, n := seeded(t, "timestamp", "timestamp")
+		n, err := seeded(t, "timestamp", "timestamp")
 		if err != nil {
 			t.Fatalf("seed-equal first FIELD refused: %v", err)
 		}
@@ -489,7 +489,7 @@ func TestVStreamSnapshotCDC_SessionTZCastRefuses(t *testing.T) {
 
 	// SLM-1: the first post-COPY FIELD of this process, prior from the
 	// streamer's seed (handed through the snapshot stream's CDC half).
-	seeded := func(t *testing.T, seedType, first string) (error, int) {
+	seeded := func(t *testing.T, seedType, first string) (int, error) {
 		t.Helper()
 		s := newVStreamSnapshotTestStream()
 		s.schemaDeltaAppliesToTarget = true
@@ -510,14 +510,14 @@ func TestVStreamSnapshotCDC_SessionTZCastRefuses(t *testing.T) {
 				n++
 			}
 		}
-		return err, n
+		return n, err
 	}
 	t.Run("SEEDED: the first FIELD refuses a zone-sibling swap", func(t *testing.T) {
-		err, _ := seeded(t, "timestamp", "datetime")
+		_, err := seeded(t, "timestamp", "datetime")
 		requireSessionTZRefusal(t, err, "created_at")
 	})
 	t.Run("SEEDED: a seed-equal first FIELD still emits its history version", func(t *testing.T) {
-		err, n := seeded(t, "timestamp", "timestamp")
+		n, err := seeded(t, "timestamp", "timestamp")
 		if err != nil {
 			t.Fatalf("seed-equal first FIELD refused: %v", err)
 		}
