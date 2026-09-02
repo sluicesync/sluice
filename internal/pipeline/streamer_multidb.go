@@ -577,6 +577,80 @@ func (s *Streamer) warmResumeMultiDatabase(
 	return changes, stop, nil
 }
 
+// coldStartReadOneDatabaseSchema opens a per-database scoped SchemaReader,
+// reads + filters one selected database's schema, and runs the source-side
+// hierarchy preflights against the still-open reader — the multi-database
+// counterpart of [Streamer.coldStartReadSourceSchema]. A nil schema with a
+// nil error is the empty-database case (nothing to copy; already logged).
+//
+// The preflights are the Bug 100 partition and item-68b inheritance
+// refusals the single-namespace cold start (coldStartReadSourceSchema) and
+// migrate (phaseReadSourceSchema) both run; this fan-out was the one
+// cold-start entry point that ran neither, so `sync start --include-schema
+// s2` flattened a partitioned parent AND copied its leaves (duplicates),
+// then froze the parent at exit 0 — while `migrate --include-schema s2`
+// refused the same schema (audit 2026-09-01 A2-2). They run against the
+// POST-filter schema so `--exclude-table=<parent>` clears the door exactly
+// as it does on the other two paths, and against the scoped reader
+// (applyMultiDatabaseScope) so each prober answers for this namespace only.
+//
+// Same in-loop residual as the emit preflights in coldStartCopyOneDatabase
+// (audit C-6): a hierarchy in namespace N is discovered when the loop
+// reaches N, with N-1 namespaces already copied and the spanning snapshot
+// open — loud and resumable, not silent. The full roster of source-side
+// preflights this path runs versus its two siblings is pinned by
+// TestColdStartPreflightRoster_MultiDatabaseReachesEverySibling.
+func (s *Streamer) coldStartReadOneDatabaseSchema(
+	ctx context.Context,
+	streamID, database string,
+	inScope func(string) bool,
+) (*ir.Schema, error) {
+	// Per-database source DSN so the scoped SchemaReader reads the right
+	// database's information_schema. The bulk-copy ROW reads come from the
+	// shared spanning snapshot, not this reader.
+	deriver, ok := s.Source.(ir.DatabaseDSNDeriver)
+	if !ok {
+		return nil, fmt.Errorf(
+			"pipeline: source engine %q cannot derive a per-database DSN for multi-database sync (ADR-0074)",
+			s.Source.Name(),
+		)
+	}
+	srcDSN, err := deriver.WithDatabase(s.SourceDSN, database)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: derive source DSN for database %q: %w", database, err)
+	}
+
+	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
+	if err != nil {
+		return nil, connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
+	}
+	defer migcore.CloseIf(sr)
+	migcore.ApplyTableScope(sr, s.Filter)
+	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
+	}
+
+	if len(schema.Tables) == 0 {
+		slog.InfoContext(ctx, "multi-database: database has no tables; skipping copy",
+			slog.String("stream_id", streamID), slog.String("database", database))
+		return nil, nil
+	}
+
+	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
+	}
+
+	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
+	}
+	if err := preflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
+	}
+	return schema, nil
+}
+
 // coldStartCopyOneDatabase reads one selected database's schema (scoped so
 // Table.Schema is stamped + the FK carve-out lifted) and bulk-copies its
 // tables — read from the SHARED spanning snapshot RowReader — into its
@@ -604,43 +678,14 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	fresh freshCopyReason,
 	fanoutCeiling int,
 ) error {
-	// Per-database source DSN so the scoped SchemaReader reads the right
-	// database's information_schema. The bulk-copy ROW reads come from the
-	// shared spanning snapshot, not this reader.
-	deriver, ok := s.Source.(ir.DatabaseDSNDeriver)
-	if !ok {
-		return fmt.Errorf(
-			"pipeline: source engine %q cannot derive a per-database DSN for multi-database sync (ADR-0074)",
-			s.Source.Name(),
-		)
-	}
-	srcDSN, err := deriver.WithDatabase(s.SourceDSN, database)
+	schema, err := s.coldStartReadOneDatabaseSchema(ctx, streamID, database, inScope)
 	if err != nil {
-		return fmt.Errorf("pipeline: derive source DSN for database %q: %w", database, err)
+		return err
 	}
-
-	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
-	if err != nil {
-		return connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
-	}
-	migcore.ApplyTableScope(sr, s.Filter)
-	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
-	schema, err := sr.ReadSchema(ctx)
-	if err != nil {
-		migcore.CloseIf(sr)
-		return fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
-	}
-	migcore.CloseIf(sr)
-
-	if len(schema.Tables) == 0 {
-		slog.InfoContext(ctx, "multi-database: database has no tables; skipping copy",
-			slog.String("stream_id", streamID), slog.String("database", database))
+	if schema == nil {
 		return nil
 	}
 
-	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
-		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
-	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 	// ADR-0143: skip ORM/framework migration-bookkeeping tables in the
 	// per-database sync fan-out too. No-op unless SkipORMTables is set.
