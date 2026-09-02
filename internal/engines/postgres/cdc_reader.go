@@ -1207,7 +1207,39 @@ func (r *CDCReader) dispatchWAL(
 		// case (BEGIN immediately followed by COMMIT with no row
 		// events) is harmless — the applier's flush path skips when
 		// no rows have accumulated. See ADR-0027.
-		pos, err := r.positionAt(m.CommitLSN)
+		//
+		// The TxCommit carries the POST-commit point — TransactionEndLSN,
+		// the first byte after the commit record — not CommitLSN, the
+		// commit record's start (audit 2026-09-01 A2-1; the Postgres
+		// sibling of item 132). The two differ in exactly the way that
+		// matters for resume: logical decoding skips a transaction only
+		// when its commit record starts BEFORE the requested start LSN
+		// (SnapBuildXactNeedsSkip is `origptr < start_decoding_at`), so a
+		// resume from CommitLSN re-delivered the whole transaction it had
+		// just acknowledged — its RelationMessage rendered from the
+		// historic catalog AND its rows — while a resume from
+		// TransactionEndLSN begins at the next one. Every applier persists
+		// this position at a clean source-tx boundary (batched:
+		// CheckpointOnlyAtTxBoundary; per-change: persistSourceTxCommit;
+		// concurrent: the frontier's RecordTxBoundary), so every warm
+		// resume after a clean stop replayed the last applied transaction,
+		// and a mid-stream DDL refusal re-fired on that replay after the
+		// operator had applied the DDL on the target exactly as the hint
+		// said — the drained-model recovery could not run. Row events and
+		// TxBegin keep the PRE-transaction point (BeginMessage.FinalLSN ==
+		// CommitLSN): a position persisted mid-transaction still
+		// re-delivers the transaction whole, which ADR-0010 idempotency
+		// absorbs. TestPGCDC_TxCommitPositionIsPostCommit pins both
+		// directions on a real server.
+		if m.TransactionEndLSN <= m.CommitLSN {
+			// pgoutput stamps end_lsn on every commit, strictly past the
+			// commit record. A wire that does not is not one this position
+			// convention can resume from — refuse rather than persist a
+			// point that would re-deliver (or worse, skip) on resume.
+			return fmt.Errorf("postgres: cdc: commit message at %s carries transaction end LSN %s, which does not follow the commit record — cannot derive a post-commit resume position",
+				m.CommitLSN, m.TransactionEndLSN)
+		}
+		pos, err := r.positionAt(m.TransactionEndLSN)
 		if err != nil {
 			return err
 		}
@@ -1733,8 +1765,12 @@ func (r *CDCReader) emitTruncate(
 }
 
 // positionAt is a thin wrapper over [encodePGPos] specialised to the
-// reader's slot. Each emitted Change carries this so resume points
-// at the start of the change's transaction.
+// reader's slot. Each emitted Change carries this. Row events and
+// TxBegin carry the transaction's CommitLSN, so a resume from one of
+// them re-delivers the change's transaction whole (the pre-transaction
+// convention, absorbed by ADR-0010 idempotency); TxCommit carries the
+// TransactionEndLSN, so a resume from a clean boundary starts at the
+// NEXT transaction (see the CommitMessage arm of [CDCReader.dispatchWAL]).
 //
 // The reader's pinned (systemID, timeline) — captured from
 // IDENTIFY_SYSTEM at stream-start — is propagated onto every emitted

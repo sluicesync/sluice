@@ -1366,6 +1366,19 @@ func (b *IncrementalBackup) captureWindow(
 // rests completeness on the change-chunk tail rather than on this property
 // (see [irbackup.Manifest.SchemaHistoryAnchors]) — so the cost is a refused
 // backup whose message misattributes the cause, not unsound data.
+//
+// The Postgres sibling of that false positive (audit 2026-09-01 A2-1): the
+// PG TxCommit now carries TransactionEndLSN — the first LSN after the commit
+// record — and the next transaction's first WAL record can start exactly
+// there. A RelationMessage's anchor is that record's WALStart, so a window
+// that ends on the TxCommit (EndPosition = end LSN) and then exits between the
+// next transaction's schema snapshot and its first row — the same two
+// mid-transaction exits — records an anchor equal to its EndPosition. Same
+// verdict: loud, misattributed, never unsound. The anchor itself still
+// strictly precedes its OWN rows, so CDCPositionCommitsAfterRows stays false
+// for Postgres and this assertion keeps running there. Before the fix the
+// EndPosition was the commit record's start, an LSN no other record can
+// occupy, so the coincidence was impossible on Postgres.
 func assertDataWindowEndPositionInvariant(manifest *irbackup.Manifest) error {
 	if manifest.CDCPositionCommitsAfterRows || manifestChangeRecordCount(manifest) == 0 {
 		return nil

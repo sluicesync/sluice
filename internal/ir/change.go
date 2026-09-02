@@ -223,9 +223,17 @@ func (e TxBegin) SourceCommitTime() time.Time { return e.CommitTime }
 // with no row events between them does not produce an empty target
 // commit).
 //
-// Position carries the source-side commit position. For Postgres,
-// pgoutput's `CommitMessage.CommitLSN`. For MySQL, the position of
-// the XIDEvent (InnoDB transaction commit marker).
+// Position carries the source-side POST-commit point — the position a
+// resume starts AFTER this transaction from, never one that re-delivers
+// it. For Postgres, pgoutput's `CommitMessage.TransactionEndLSN` (the
+// first LSN after the commit record; `CommitLSN`, the record's start, is
+// what logical decoding re-delivers — audit 2026-09-01 A2-1). For MySQL,
+// the executed GTID set with this transaction's GTID folded in (item
+// 132) or the XIDEvent's file/pos. Row events and [TxBegin] carry the
+// PRE-transaction point instead, so a position persisted mid-transaction
+// replays the transaction whole. Every applier persists the TxCommit
+// position at a clean source-transaction boundary, which is what makes
+// a warm resume after a clean stop begin at the next transaction.
 type TxCommit struct {
 	Position Position
 	// CommitTime is the source-side commit timestamp of the transaction

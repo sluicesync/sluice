@@ -435,6 +435,42 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
   retryable after manual reconciliation.
 - **RENAME still needs the drained model** until F7b (PG) / forever
   (MySQL).
+- **The drained-model recovery must actually run on a warm resume
+  (impl note, audit 2026-09-01 A2-1).** Every refusal in this ADR
+  hands the operator "drain, apply the change on the target, restart
+  with the same stream-id". On a Postgres source that restart
+  re-refused, four runs out of four: the reader's `TxCommit` carried
+  `CommitLSN` — the commit record's START — and logical decoding skips
+  a transaction on resume only when its commit record starts strictly
+  before the requested LSN, so a resume from a cleanly-persisted
+  boundary replayed the whole last applied transaction. Its
+  `RelationMessage` is rendered from the historic catalog (the pre-DDL
+  shape), it re-seeded the relation cache, and the first post-DDL
+  transaction classified against it exactly as it had the first time.
+  The same replay routed a renamed table's rows to the old name into
+  `sluice_cdc_skipped_tables`, and its historic column names resolved
+  to `StableID` 0 against the live catalog, so the runbook's own PG
+  RENAME COLUMN path (a proven rename) reached this ADR's §3 refusal
+  as unprovable. Fixed at the convention, not at the doors: the
+  `TxCommit` now carries `TransactionEndLSN` — the post-commit point,
+  the Postgres sibling of item 132's MySQL fold — so a warm resume
+  after a clean boundary starts at the NEXT transaction (ADR-0027,
+  corrected). Rows and `TxBegin` keep the pre-transaction point, so a
+  position persisted mid-transaction still replays whole. Pinned on a
+  real server both directions (`TestPGCDC_TxCommitPositionIsPostCommit`)
+  and per shape through the reader (`TestPGCDC_DrainedModelRecoveryResumes`)
+  and the real applier + ledger (`TestStreamer_PGToPG_DrainedModelRecovery`).
+  *Stated consequence:* the replayed transaction was also the only
+  witness of the pre-DDL shape at resume, and only when it happened to
+  touch the altered table. Without it, a schema change applied on the
+  source while the stream was STOPPED is not classified at resume by
+  either mode — the first post-resume `RelationMessage` is the anchor,
+  which is what the runbook documents ("the post-restart CDC schema
+  cache rebuilds from the first event"). The drained model applies the
+  change on both sides before restarting and is unaffected; a
+  warm-resume source↔target shape reconciliation (target-derived seed,
+  same-engine exact) is the follow-up that would make a one-sided
+  change loud again, and the §3 seed-guard is the shape it would reuse.
 - **Table-rewrite VALUE changes are never streamed (impl note,
   capture-completeness G3, 2026-08-26).** PostgreSQL does not logically
   decode the contents of an `ALTER COLUMN TYPE` table rewrite — the
