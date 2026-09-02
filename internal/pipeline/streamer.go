@@ -1689,7 +1689,7 @@ func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, al
 // sites so the opt-out message is identical everywhere.
 func invalidPositionOptOutError(err error) error {
 	return fmt.Errorf(
-		"pipeline: the persisted source position is no longer valid (older than the source's retained binlogs / purged) and --no-auto-resnapshot is set, so sluice will not auto re-snapshot. Re-run with --restart-from-scratch for a fresh cold-start (idempotent sources absorb the overlap with no target drop; non-idempotent sources such as native MySQL binlog drop + recreate the in-scope target tables first so the plain-INSERT copy starts clean, preserving the cdc-state row), or --reset-target-data to also clear the cdc-state row and drop the tables: %w", err,
+		"pipeline: the persisted source position is no longer valid on this source (older than its retained binlogs / purged, or captured on a different source lineage — a replaced, reset or rebuilt instance; the underlying error says which) and --no-auto-resnapshot is set, so sluice will not auto re-snapshot. Re-run with --restart-from-scratch for a fresh cold-start (idempotent sources absorb the overlap with no target drop; non-idempotent sources such as native MySQL binlog drop + recreate the in-scope target tables first so the plain-INSERT copy starts clean, preserving the cdc-state row), or --reset-target-data to also clear the cdc-state row and drop the tables: %w", err,
 	)
 }
 

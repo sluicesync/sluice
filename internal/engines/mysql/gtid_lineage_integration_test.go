@@ -111,7 +111,7 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader(B): %v", err)
 	}
-	defer closeReader(readerB)
+	defer closeLineageReader(readerB)
 	_, err = readerB.StreamChanges(ctx, capturedOnA)
 	if err == nil {
 		t.Fatal("resuming instance A's GTID position against fresh instance B was ACCEPTED; " +
@@ -131,7 +131,7 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader(A): %v", err)
 	}
-	defer closeReader(readerA)
+	defer closeLineageReader(readerA)
 	if _, err := readerA.StreamChanges(ctx, capturedOnA); err != nil {
 		t.Fatalf("same-instance resume of a GTID position was REFUSED: %v "+
 			"(the lineage check must bind the lineage, not block every resume)", err)
@@ -156,7 +156,7 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader(C): %v", err)
 	}
-	defer closeReader(readerC)
+	defer closeLineageReader(readerC)
 	if _, err := readerC.StreamChanges(ctx, capturedOnA); err != nil {
 		t.Fatalf("resume on an instance whose gtid_executed CONTAINS the position's set was REFUSED: %v "+
 			"(a promoted replica or a --set-gtid-purged=ON restore must resume; the check binds lineage, "+
@@ -229,7 +229,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
 		}
-		defer closeReader(reader)
+		defer closeLineageReader(reader)
 		ch, err := reader.StreamChanges(ctx, pos)
 		if err != nil {
 			if !errors.Is(err, ir.ErrPositionInvalid) {
@@ -270,7 +270,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
 		}
-		defer closeReader(reader)
+		defer closeLineageReader(reader)
 		ch, err := reader.StreamChanges(ctx, pos)
 		if err != nil {
 			t.Fatalf("%s: a legitimate resume was REFUSED: %v", cell, err)
@@ -446,7 +446,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OpenCDCReader(A): %v", err)
 		}
-		defer closeReader(reader)
+		defer closeLineageReader(reader)
 		ch, err := reader.StreamChanges(ctx, fromNow)
 		if err != nil {
 			t.Fatalf("StreamChanges(A): %v", err)
@@ -504,7 +504,7 @@ func assertGTIDPositionUnder(t *testing.T, door string, p ir.Position, wantUUID 
 	return decoded.GTIDSet
 }
 
-func closeReader(r ir.CDCReader) {
+func closeLineageReader(r ir.CDCReader) {
 	if c, ok := r.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}

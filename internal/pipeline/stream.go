@@ -495,7 +495,7 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
 					if errors.Is(err, ir.ErrPositionInvalid) {
-						return fmt.Errorf("stream: after transient retry, source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+						return fmt.Errorf("stream: after transient retry, the source cannot serve the parent's terminal position (pruned past it, or a different source lineage — the underlying error says which); take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 					}
 					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: restart cdc stream after transient: %w", err))
 				}
@@ -852,7 +852,7 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err != nil {
 		migcore.CloseIf(cdc)
 		if errors.Is(err, ir.ErrPositionInvalid) {
-			return nil, fmt.Errorf("stream: source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+			return nil, fmt.Errorf("stream: the source cannot serve the parent's terminal position (pruned past it, or a different source lineage — the underlying error says which); take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 		}
 		return nil, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
 	}
