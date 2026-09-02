@@ -46,6 +46,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -214,7 +215,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 	t.Logf("A: set=%s anchor=%s:%d", decoded.GTIDSet, decoded.LineageFile, decoded.LineagePos)
 
 	// A legacy position: the same set with the anchor stripped, as a
-	// pre-v0.137.5 binary would have written it.
+	// pre-v0.138.0 binary would have written it.
 	legacy := decoded
 	legacy.LineageFile, legacy.LineagePos, legacy.LineageSet = "", 0, ""
 	legacyPos, err := encodeBinlogPos(legacy)
@@ -325,12 +326,166 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		mustRefuse(t, dsnB, "rebuilt-colliding", capturedOnA)
 		// The anchorless legacy position on this instance is the documented
 		// degraded posture: accepted, with the WARN — refusing would force a
-		// full re-copy on every pre-v0.137.5 chain.
+		// full re-copy on every pre-v0.138.0 chain.
 		mustAccept(t, dsnB, "rebuilt-colliding/legacy-position", legacyPos)
 	})
 
 	t.Run("same instance: accepted", func(t *testing.T) {
 		mustAccept(t, dsnA, "same-instance", capturedOnA)
+	})
+
+	t.Run("rebuilt colliding instance whose numbering never reached the anchor's file: refused", func(t *testing.T) {
+		// A different instance can be absent the anchor's file for the
+		// other reason — it never rotated that far. The instance must
+		// COLLIDE (same server_id, same domain, the same "0-1-3") so the
+		// server itself accepts the position and ONLY sluice's purge
+		// disambiguation stands between the resume and a whole-history
+		// replay: a cell the server catches first would pass with the
+		// disambiguation mutated to "always purged" (it did, in the first
+		// cut of this cell). Synthesise a high-numbered anchor file: the
+		// absence must be read as "different instance", not as a purge.
+		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupB()
+		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (10,'x'),(11,'y')`)
+		if state := globalVar(t, ctx, dsnB, "gtid_binlog_pos"); state != decoded.GTIDSet {
+			t.Fatalf("premise gone: the rebuilt instance's state is %q, A's position is %q", state, decoded.GTIDSet)
+		}
+		high := decoded
+		high.LineageFile = "mysqld-bin.000077"
+		highPos, err := encodeBinlogPos(high)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		mustRefuse(t, dsnB, "rebuilt-colliding/high-anchor", highPos)
+	})
+
+	t.Run("anchor purged by retention on the SAME lineage: accepted", func(t *testing.T) {
+		// The reviewer's scenario: a start-of-stream anchor carried
+		// forever would refuse here, once per retention window, forever.
+		// Small binlogs so 60 writes rotate many times; then purge past
+		// the anchor's file while the GTID resume point stays retained
+		// (the oldest retained file's start state covers it).
+		dsnP, cleanupP := newMariaDBDedicatedForCDC(t, "mariadb:11.4", "--server-id=3", "--max-binlog-size=4096")
+		defer cleanupP()
+		execSQL(t, ctx, dsnP, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v VARCHAR(200))`)
+		snapP, err := e.OpenBackupSnapshot(ctx, dsnP, irbackup.SnapshotOptions{})
+		if err != nil {
+			t.Fatalf("OpenBackupSnapshot(P): %v", err)
+		}
+		capturedOnP := snapP.Position
+		_ = snapP.Close()
+		var dp binlogPos
+		if err := json.Unmarshal([]byte(capturedOnP.Token), &dp); err != nil || dp.LineageFile == "" {
+			t.Fatalf("P's position has no anchor: %q %v", capturedOnP.Token, err)
+		}
+		// Rotate right after the capture, so the NEXT file starts at exactly
+		// the resume set — that file is what keeps the GTID resume point
+		// retained while the anchor's own file is purged (a stopped stream
+		// whose last persisted position sits at the end of a file that
+		// retention later removes). Then enough writes to rotate many times.
+		execSQL(t, ctx, dsnP, `FLUSH LOGS`)
+		for i := 100; i < 160; i++ {
+			execSQL(t, ctx, dsnP, fmt.Sprintf(`INSERT INTO cdc_src.t VALUES (%d, REPEAT('x', 150))`, i))
+		}
+		anchorNo, _ := binlogFileNumber(dp.LineageFile)
+		db, err := sql.Open("mysql", dsnP)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		names, err := binaryLogNames(ctx, db)
+		_ = db.Close()
+		if err != nil || len(names) < 3 {
+			t.Fatalf("list binary logs: %v (%v)", err, names)
+		}
+		// Purge exactly through the anchor's file: the file after it (which
+		// starts at the resume set) must survive.
+		keepFrom := ""
+		for _, n := range names {
+			if no, ok := binlogFileNumber(n); ok && no == anchorNo+1 {
+				keepFrom = n
+			}
+		}
+		if keepFrom == "" {
+			t.Fatalf("no binlog numbered %d+1 among %v", anchorNo, names)
+		}
+		execSQL(t, ctx, dsnP, `PURGE BINARY LOGS TO '`+keepFrom+`'`)
+		// Premise: the anchor's file really is gone now.
+		dbP, err := sql.Open("mysql", dsnP)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		names, err = binaryLogNames(ctx, dbP)
+		_ = dbP.Close()
+		if err != nil {
+			t.Fatalf("binary logs: %v", err)
+		}
+		for _, n := range names {
+			if n == dp.LineageFile {
+				t.Fatalf("premise gone: the anchor file %s survived the purge (retained: %v)", dp.LineageFile, names)
+			}
+		}
+		// The GTID resume point is retained through the newest file's
+		// start state, so this is a legitimate resume; MariaDB streams
+		// the 60 rows plus the continuation write. Drain and require
+		// the stream to be open and delivering.
+		mustAccept(t, dsnP, "same-lineage/anchor-purged", capturedOnP)
+	})
+
+	t.Run("rotation while streaming moves the anchor to the new file", func(t *testing.T) {
+		// A FRESH position at A's current tip, so the stream has no backlog
+		// from earlier cells and the first delivered change is the one
+		// written after the rotation below.
+		snapNow, err := e.OpenBackupSnapshot(ctx, dsnA, irbackup.SnapshotOptions{})
+		if err != nil {
+			t.Fatalf("OpenBackupSnapshot(A, now): %v", err)
+		}
+		fromNow := snapNow.Position
+		_ = snapNow.Close()
+		reader, err := e.OpenCDCReader(ctx, dsnA)
+		if err != nil {
+			t.Fatalf("OpenCDCReader(A): %v", err)
+		}
+		defer closeReader(reader)
+		ch, err := reader.StreamChanges(ctx, fromNow)
+		if err != nil {
+			t.Fatalf("StreamChanges(A): %v", err)
+		}
+		execSQL(t, ctx, dsnA, `FLUSH LOGS`)
+		execSQL(t, ctx, dsnA, `INSERT INTO cdc_src.t VALUES (7000,'after-rotate')`)
+		dbA, err := sql.Open("mysql", dsnA)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		names, err := binaryLogNames(ctx, dbA)
+		_ = dbA.Close()
+		if err != nil || len(names) == 0 {
+			t.Fatalf("binary logs: %v", err)
+		}
+		newest := names[len(names)-1]
+		deadline := time.After(45 * time.Second)
+		for {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					t.Fatalf("stream closed: %v", reader.(*CDCReader).Err())
+				}
+				var got binlogPos
+				if err := json.Unmarshal([]byte(ev.Pos().Token), &got); err != nil {
+					t.Fatalf("decode emitted position: %v", err)
+				}
+				if got.LineageFile != newest {
+					t.Fatalf("the position emitted after a rotation carries anchor %s:%d; want the new file %s (the anchor must follow the stream or retention purges it)", got.LineageFile, got.LineagePos, newest)
+				}
+				if got.LineagePos != 4 || got.LineageSet == "" {
+					t.Fatalf("re-anchored position is malformed: %+v", got)
+				}
+				t.Logf("re-anchored at %s:%d set=%s", got.LineageFile, got.LineagePos, got.LineageSet)
+				return
+			case <-deadline:
+				t.Fatal("no change delivered within 45s after the rotation")
+			}
+		}
 	})
 }
 

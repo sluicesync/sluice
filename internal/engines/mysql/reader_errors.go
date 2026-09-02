@@ -198,6 +198,21 @@ func classifyReaderError(err error) error {
 			"source vstream sent a row event before the table's FIELD event — the field cache was invalidated by a DDL on the keyspace and this table's shape has not been re-announced yet; reconnecting from the last position to re-learn it: %w", err,
 		)}
 	}
+	// vttablet's own lineage refusal (audit 2026-09-01 SLM-2, VStream arm,
+	// measured on the cluster rig 2026-09-02): uvstreamer checks the resume
+	// set ⊆ its gtid_executed and returns codes.InvalidArgument "GTIDSet
+	// Mismatch" for a position from a different cluster/shard lineage. The
+	// status switch below keeps InvalidArgument TERMINAL, so without this arm
+	// a foreign position exited the stream with no cold-start route — and
+	// when vtgate had fewer than three candidate tablets it did not surface
+	// at all (vtgate marked the refusing tablet ignorable and blocked). The
+	// pre-flight in verifyVStreamPositionReachable now refuses first; this is
+	// the reactive twin for the shapes that reach the stream.
+	if isVStreamGTIDSetMismatchError(err) {
+		return fmt.Errorf(
+			"source vstream refused the resume position: its GTID set is not contained in the shard's executed set (a fresh, reset, rebuilt or replaced keyspace/shard — a different lineage); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
+		)
+	}
 	// GRACEFUL HTTP/2 DRAIN (roadmap item 79, observed live 2026-07-24). The
 	// server sent a GOAWAY carrying ErrCode=NO_ERROR — "this connection is
 	// going away, reconnect" — which on PlanetScale accompanies routine
@@ -418,6 +433,15 @@ func isVStreamMissingFieldEventError(err error) bool {
 // to a restart loop against an unreachable position.
 func isMariaDBPurgedGTIDError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "could not find gtid state requested")
+}
+
+// isVStreamGTIDSetMismatchError reports whether err is vttablet's lineage
+// refusal of a resume position (uvstreamer setStreamStartPosition:
+// "GTIDSet Mismatch", carried as codes.InvalidArgument). Measured verbatim
+// on the real cluster rig 2026-09-02 resuming a position captured on a
+// different cluster. The phrase is unique to that check.
+func isVStreamGTIDSetMismatchError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "gtidset mismatch")
 }
 
 // isMariaDBForeignGTIDError reports whether err is MariaDB's OTHER

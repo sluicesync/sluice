@@ -29,6 +29,54 @@ func TestMariaDBGTIDDomains(t *testing.T) {
 	}
 }
 
+func TestBinlogFileNumber(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		want uint64
+		ok   bool
+	}{
+		{"mb.000009", 9, true},
+		{"mysqld-bin.000123", 123, true},
+		{"binlog.1", 1, true},
+		{"noext", 0, false},
+		{"mb.", 0, false},
+		{"mb.00x9", 0, false},
+	} {
+		got, ok := binlogFileNumber(tc.name)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("binlogFileNumber(%q) = (%d, %v), want (%d, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestMariaDBStateCovers(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		state, anchor string
+		want          bool
+	}{
+		// The measured purge case: the oldest retained file's start state
+		// is ahead of the anchor in the one domain.
+		{"0-1-62", "0-1-12", true},
+		{"0-1-12", "0-1-12", true},
+		{"0-1-11", "0-1-12", false},
+		// Domain order differs between BINLOG_GTID_POS and
+		// @@gtid_binlog_state; only per-domain sequence matters.
+		{"7-1-2,0-1-67", "0-1-12,7-1-1", true},
+		// A domain the anchor names that the state lacks: not covered.
+		{"0-1-99", "0-1-12,7-1-1", false},
+		// Several server_ids in one domain: the maximum counts.
+		{"0-2-5,0-1-40", "0-1-30", true},
+		// Empty anchor is covered by anything (nothing to reach).
+		{"0-1-1", "", true},
+	} {
+		if got := mariadbStateCovers(tc.state, tc.anchor); got != tc.want {
+			t.Errorf("mariadbStateCovers(%q, %q) = %v, want %v", tc.state, tc.anchor, got, tc.want)
+		}
+	}
+}
+
 func TestGTIDSetUUIDsSubset(t *testing.T) {
 	t.Parallel()
 	const a = "58e74464-8f3f-11f0-9d2c-0242ac110002"

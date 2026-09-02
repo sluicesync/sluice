@@ -14,7 +14,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// MariaDB lineage binding for resume positions (v0.137.5, audit
+// MariaDB lineage binding for resume positions (v0.138.0, audit
 // 2026-09-01 SLM-2's MariaDB arm).
 //
 // # Why a MariaDB position needs its own binding
@@ -50,7 +50,7 @@ import (
 //
 // # Positions without an anchor
 //
-// A MariaDB position persisted before v0.137.5 carries no anchor. It is
+// A MariaDB position persisted before v0.138.0 carries no anchor. It is
 // still accepted — with the UNVERIFIED-INSTANCE-IDENTITY WARN the file/pos
 // arm uses for the identical situation — because that population cannot
 // grow (every capture door now anchors) and refusing would force a full
@@ -125,7 +125,7 @@ func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 				"BINLOG_GTID_POS anchors on MariaDB positions (v0.137.4 and earlier). MariaDB GTIDs carry no "+
 				"instance identity, so a rebuilt source whose history reads the same GTIDs would NOT be caught on "+
 				"this resume. One fresh full backup or cold start moves this chain onto the lineage check",
-			slog.String("resume_position", p.GTIDSet+p.File),
+			slog.String("resume_gtid_set", p.GTIDSet), slog.String("resume_file", p.File),
 		)
 		return nil
 	}
@@ -134,9 +134,35 @@ func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("mariadb: the source has no binlog event at the position's lineage anchor (%s:%d) — "+
-			"the source is a different lineage (a fresh, reset, rebuilt or replaced instance) or has purged that "+
-			"binlog; cannot resume: %w", p.LineageFile, p.LineagePos, ir.ErrPositionInvalid)
+		// NULL is two different situations. The anchor's file is PRESENT
+		// but the offset is not an event boundary of it: a different
+		// instance that happens to reuse the filename — refuse. The file
+		// is ABSENT: either routine retention purged it on the SAME
+		// lineage (the stream re-anchors at every rotation it sees, but
+		// a stopped stream or an incremental-backup gap cannot), or this
+		// is a different instance whose numbering never reached it.
+		// Disambiguate with evidence only the same lineage can produce:
+		// a retained file numbered ABOVE the anchor whose own start
+		// state covers the anchor's set in every domain. A fresh
+		// instance has no such file; a rebuilt one would need to have
+		// rotated past the anchor's number AND to reproduce its GTIDs.
+		// Measured on 11.4: after PURGE BINARY LOGS TO 'mb.000009' the
+		// anchor at mb.000003:4 answers NULL while mb.000009:4 answers
+		// "0-1-62" ⊇ the anchor's "0-1-12". Retention of the GTID
+		// resume point itself is then the server's question (1236).
+		purged, why, perr := mariadbAnchorPurgedOnSameLineage(ctx, db, p)
+		if perr != nil {
+			return perr
+		}
+		if purged {
+			slog.InfoContext(ctx, "mariadb: cdc: the position's lineage anchor was purged by binlog retention on the "+
+				"same lineage; lineage confirmed from the oldest retained binlog's start state",
+				slog.String("anchor", fmt.Sprintf("%s:%d", p.LineageFile, p.LineagePos)), slog.String("evidence", why))
+			return nil
+		}
+		return fmt.Errorf("mariadb: the source has no binlog event at the position's lineage anchor (%s:%d) and %s — "+
+			"the source is a different lineage (a fresh, reset, rebuilt or replaced instance); cannot resume: %w",
+			p.LineageFile, p.LineagePos, why, ir.ErrPositionInvalid)
 	}
 	if set != p.LineageSet {
 		return fmt.Errorf("mariadb: the source's binlog at the position's lineage anchor (%s:%d) reads GTID state %q, "+
@@ -145,6 +171,165 @@ func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 			p.LineageFile, p.LineagePos, set, p.LineageSet, ir.ErrPositionInvalid)
 	}
 	return nil
+}
+
+// mariadbAnchorPurgedOnSameLineage decides the anchor-file-absent case
+// (see the caller): purged=true only when the anchor's file is not in SHOW
+// BINARY LOGS AND a retained file numbered above it has a start state
+// (BINLOG_GTID_POS(file, 4) — offset 4 is every binlog file's first event
+// boundary, measured) that covers the anchor's set in every domain. The
+// returned why is the evidence either way, for the log or the refusal.
+func mariadbAnchorPurgedOnSameLineage(ctx context.Context, db *sql.DB, p binlogPos) (purged bool, why string, err error) {
+	names, err := binaryLogNames(ctx, db)
+	if err != nil {
+		return false, "", err
+	}
+	anchorNo, ok := binlogFileNumber(p.LineageFile)
+	if !ok {
+		return false, fmt.Sprintf("the anchor file name %q has no numeric suffix", p.LineageFile), nil
+	}
+	newest := ""
+	newestNo := uint64(0)
+	for _, n := range names {
+		if n == p.LineageFile {
+			return false, "the anchor's binlog file is still present, so the offset is simply not an event boundary of it", nil
+		}
+		no, ok := binlogFileNumber(n)
+		if !ok || no <= anchorNo {
+			continue
+		}
+		if newest == "" || no < newestNo {
+			newest, newestNo = n, no
+		}
+	}
+	if newest == "" {
+		return false, "no retained binlog is numbered above the anchor's file (a same-lineage purge always leaves newer files)", nil
+	}
+	state, ok, err := mariadbLineageSetAt(ctx, db, newest, 4)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, fmt.Sprintf("the oldest retained binlog above the anchor (%s) has no readable start state", newest), nil
+	}
+	if !mariadbStateCovers(state, p.LineageSet) {
+		return false, fmt.Sprintf("the oldest retained binlog above the anchor (%s) starts at GTID state %q, which does not "+
+			"cover the anchor's %q", newest, state, p.LineageSet), nil
+	}
+	return true, fmt.Sprintf("%s starts at %q ⊇ anchor %q", newest, state, p.LineageSet), nil
+}
+
+// binaryLogNames lists the source's retained binlog files, in index order.
+func binaryLogNames(ctx context.Context, db *sql.DB) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return nil, fmt.Errorf("mariadb: SHOW BINARY LOGS: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("mariadb: SHOW BINARY LOGS columns: %w", err)
+	}
+	var names []string
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("mariadb: SHOW BINARY LOGS scan: %w", err)
+		}
+		switch v := vals[0].(type) {
+		case []byte:
+			names = append(names, string(v))
+		case string:
+			names = append(names, v)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mariadb: SHOW BINARY LOGS rows: %w", err)
+	}
+	return names, nil
+}
+
+// binlogFileNumber returns the numeric suffix of a binlog file name
+// ("mb.000009" → 9).
+func binlogFileNumber(name string) (uint64, bool) {
+	i := strings.LastIndexByte(name, '.')
+	if i < 0 || i+1 >= len(name) {
+		return 0, false
+	}
+	var n uint64
+	for _, c := range name[i+1:] {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	return n, true
+}
+
+// mariadbStateCovers reports whether state reaches at least anchor's
+// sequence in every domain anchor names. Both are MariaDB GTID lists; a
+// state may carry several server_ids per domain, so the maximum sequence
+// per domain is what counts.
+func mariadbStateCovers(state, anchor string) bool {
+	have := mariadbGTIDMaxSeqs(state)
+	for d, seq := range mariadbGTIDMaxSeqs(anchor) {
+		if have[d] < seq {
+			return false
+		}
+	}
+	return true
+}
+
+// mariadbGTIDMaxSeqs maps each domain in a MariaDB GTID list to the
+// highest sequence it names ("0-1-5,0-2-9,7-1-1" → {0: 9, 7: 1}).
+func mariadbGTIDMaxSeqs(set string) map[string]uint64 {
+	out := map[string]uint64{}
+	for _, g := range strings.Split(set, ",") {
+		parts := strings.Split(strings.TrimSpace(g), "-")
+		if len(parts) != 3 {
+			continue
+		}
+		var seq uint64
+		for _, c := range parts[2] {
+			if c < '0' || c > '9' {
+				seq = 0
+				break
+			}
+			seq = seq*10 + uint64(c-'0')
+		}
+		if seq > out[parts[0]] {
+			out[parts[0]] = seq
+		}
+	}
+	return out
+}
+
+// reanchorMariaDBLineage is called by the pump on every binlog rotation
+// it observes: the anchor moves to the new file's first event boundary
+// (offset 4) with the server's own start state for it, so the persisted
+// anchor is never older than the newest file the stream has seen and
+// routine retention cannot purge it out from under a running stream. The
+// set is always the SERVER's answer, never computed from the running
+// GTID set: BINLOG_GTID_POS orders domains differently from
+// @@gtid_binlog_state, so only function-versus-function comparison is
+// stable. A failed re-anchor keeps the previous anchor (still valid until
+// its file is purged) and logs once per rotation.
+func (r *CDCReader) reanchorMariaDBLineage(ctx context.Context, newFile string) {
+	if r.flavor != FlavorMariaDB || newFile == "" {
+		return
+	}
+	set, ok, err := mariadbLineageSetAt(ctx, r.db, newFile, 4)
+	if err != nil || !ok {
+		slog.WarnContext(ctx, "mariadb: cdc: could not re-anchor the lineage at the new binlog file; keeping the "+
+			"previous anchor, which stays valid until retention purges its file",
+			slog.String("file", newFile), slog.String("err", fmt.Sprint(err)))
+		return
+	}
+	r.lineageFile, r.lineagePos, r.lineageSet = newFile, 4, set
 }
 
 // verifyMariaDBDomainsPresent refuses a GTID-mode resume whose set names

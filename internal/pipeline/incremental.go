@@ -239,7 +239,10 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// on a chain whose restore was already broken.
 	warnIfParentChainUnrestorable(ctx, parent, parentPath)
 
-	startPos := parent.EndPosition
+	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
+	if err != nil {
+		return fmt.Errorf("incremental: %w", err)
+	}
 	if startPos.Engine == "" && startPos.Token == "" {
 		// v0.16.x fulls didn't record an EndPosition. Phase 3.1 still
 		// supports them by streaming "from now" — ie capturing

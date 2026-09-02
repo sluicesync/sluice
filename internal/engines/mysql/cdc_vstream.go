@@ -1112,6 +1112,34 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", err.Error()))
 			return nil
 		}
+		// Lineage FIRST (audit 2026-09-01 SLM-2, VStream arm, measured on
+		// the real cluster rig 2026-09-02): the purged check below asks only
+		// "has this shard thrown away anything the position needs", which a
+		// fresh or rebuilt cluster answers with an empty gtid_purged — a
+		// subset of everything. vttablet's own uvstreamer refuses a resume
+		// set that is not ⊆ its gtid_executed ("GTIDSet Mismatch"), but that
+		// refusal does not reliably reach sluice: vtgate marks the refusing
+		// tablet ignorable and BLOCKS waiting for another, so a `backup
+		// incremental` window deadline expired into a clean close and a
+		// chain link with an empty end_position, and the next link started
+		// from "current" on the unrelated cluster — silent loss at exit 0.
+		// Asking the shard the same question up front, the way the binlog
+		// arm does (verifyGTIDLineageContinuity), refuses at the door.
+		var contained int
+		var executed string
+		lerr := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed", bare).Scan(&contained, &executed)
+		if lerr == nil && contained == 0 {
+			_ = db.Close()
+			return fmt.Errorf("mysql/vstream: the resume position for shard %q is not contained in the source's "+
+				"@@global.gtid_executed (%s; resume %q, source executed %q) — the source is a different lineage "+
+				"(a fresh, reset, rebuilt or replaced keyspace/shard), or a shard that has not executed what the "+
+				"position consumed; cannot resume: %w",
+				sg.Shard, c.DBName, abbreviateGTIDSet(bare), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+		}
+		if lerr != nil {
+			slog.WarnContext(ctx, "mysql/vstream: lineage pre-flight: GTID_SUBSET(resume, gtid_executed) probe failed; proceeding to the retention check",
+				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", lerr.Error()))
+		}
 		var subset int
 		qerr := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(@@global.gtid_purged, ?)", bare).Scan(&subset)
 		_ = db.Close()

@@ -57,7 +57,7 @@ type binlogPos struct {
 	Pos  uint32 `json:"pos,omitempty"`
 
 	// LineageFile / LineagePos / LineageSet bind a MariaDB position to
-	// the binlog LINEAGE it was captured from (v0.137.5, audit SLM-2's
+	// the binlog LINEAGE it was captured from (v0.138.0, audit SLM-2's
 	// MariaDB arm). MariaDB GTIDs are (domain, server_id, seq) with no
 	// instance identity and there is no @@server_uuid, so neither the
 	// GTID set nor a filename says which server produced it — measured
@@ -92,7 +92,7 @@ type binlogPos struct {
 	// source's current one turns that silent gap into a loud
 	// ir.ErrPositionInvalid → ADR-0022 cold-start re-snapshot.
 	//
-	// GTID mode does not carry this field, and until v0.137.5 that
+	// GTID mode does not carry this field, and until v0.138.0 that
 	// rested on a false premise ("GTID UUIDs are instance-bound, so
 	// verifyGTIDSetReachable already catches a fresh instance"): the
 	// purged check passes on a fresh instance because its gtid_purged is

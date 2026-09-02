@@ -218,7 +218,7 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.
 		}
 		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
 		if r.flavor == FlavorMariaDB {
-			// Lineage anchor (v0.137.5): the binlog byte this set was
+			// Lineage anchor (v0.138.0): the binlog byte this set was
 			// read at, and the server's own GTID state there. See
 			// mariadb_lineage.go.
 			file, p, err := masterStatus(ctx, r.db)

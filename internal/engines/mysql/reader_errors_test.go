@@ -184,6 +184,17 @@ func TestClassifyReaderError_PurgedGTID(t *testing.T) {
 			true,
 		},
 		{
+			// vttablet's lineage refusal of a resume position from a different
+			// cluster/shard (uvstreamer setStreamStartPosition), measured on the
+			// real cluster rig 2026-09-02 as codes.InvalidArgument. The status
+			// switch keeps InvalidArgument TERMINAL, so without its own arm this
+			// exited the stream with no cold-start route.
+			"vstream GTIDSet Mismatch carried as gRPC InvalidArgument",
+			status.Error(codes.InvalidArgument, "vstream: rpc error: code = InvalidArgument desc = target: commerce.0.replica: "+
+				"vttablet: rpc error: code = InvalidArgument desc = GTIDSet Mismatch, requested: MySQL56/58e74464-8f3f-11f0-9d2c-0242ac110002:1-11, current: MySQL56/b8b646a3-8f3f-11f0-9d2c-0242ac110003:1-5"),
+			true,
+		},
+		{
 			// PlanetScale-flavored: the purged error arrives as a gRPC
 			// status carrying codes.Unknown (in the ADR-0038 retriable
 			// set). The purged check MUST win before isRetriableGRPCCode,

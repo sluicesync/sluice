@@ -89,7 +89,7 @@ type notesAmendment struct {
 var declaredNotesAmendments = []notesAmendment{
 	{
 		amended:     semver{0, 137, 2},
-		fixedIn:     semver{0, 137, 5},
+		fixedIn:     semver{0, 138, 0},
 		claimMarker: "GTID mode, where GTID UUIDs are themselves instance-bound and were always checked",
 		why: "the GTID resume arm checked only GTID_SUBSET(@@gtid_purged, resume), which a fresh instance's " +
 			"empty gtid_purged satisfies; a foreign GTID-mode position was accepted and backup incremental " +

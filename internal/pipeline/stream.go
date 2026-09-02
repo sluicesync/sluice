@@ -767,7 +767,10 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err != nil {
 		return nil, fmt.Errorf("stream: resolve parent: %w", err)
 	}
-	startPos := parent.EndPosition
+	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("stream: %w", err)
+	}
 	if startPos.Engine == "" && startPos.Token == "" {
 		slog.WarnContext(
 			ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",

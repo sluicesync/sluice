@@ -810,7 +810,7 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 		}
 		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
 		if r.flavor == FlavorMariaDB {
-			// Lineage anchor (v0.137.5, mariadb_lineage.go): a from-now
+			// Lineage anchor (v0.138.0, mariadb_lineage.go): a from-now
 			// start is a capture door too — every position this stream
 			// persists copies this anchor forward.
 			file, pos, err := masterStatus(ctx, r.db)
@@ -1010,6 +1010,10 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 	switch e := ev.Event.(type) {
 	case *replication.RotateEvent:
 		r.currentFile = string(e.NextLogName)
+		// MariaDB lineage anchor follows the stream (mariadb_lineage.go):
+		// one BINLOG_GTID_POS per rotation, so retention cannot purge the
+		// persisted anchor out from under a running stream.
+		r.reanchorMariaDBLineage(ctx, r.currentFile)
 		return nil
 
 	case *replication.GTIDEvent:
@@ -2063,7 +2067,7 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 			// MariaDB has no @@server_uuid, so the identity stamp below
 			// can never bind a MariaDB file/pos position (a sync cold
 			// start anchors MariaDB in file/pos mode). The lineage anchor
-			// is the binding for this flavor in both modes (v0.137.5).
+			// is the binding for this flavor in both modes (v0.138.0).
 			if err := verifyMariaDBLineage(ctx, r.db, p); err != nil {
 				return err
 			}
@@ -2092,7 +2096,7 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 			// GetEvent, which classifyReaderError wraps as
 			// ir.ErrPositionInvalid → the cold-start fall-through (ADR-0170).
 			//
-			// LINEAGE is a different question, and until v0.137.5 this
+			// LINEAGE is a different question, and until v0.138.0 this
 			// comment claimed the stream answered it too. Measured false
 			// (audit SLM-2's MariaDB arm): the server refuses a foreign
 			// position only when its domain is present with a different
@@ -2468,9 +2472,9 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 	// not a different lineage, and the operator should hear that.
 	if gtidSetUUIDsSubset(resumeSet, executed) {
 		return fmt.Errorf("mysql: the source is BEHIND the resume position: every source UUID in the resume set is "+
-			"present in the source's @@global.gtid_executed but some sequence numbers are ahead of it (resume %q; "+
-			"source executed %q) — a lagging replica behind a load-balanced or failover endpoint, or a primary "+
-			"rolled back past the position; cannot resume here: %w",
+			"present in the source's @@global.gtid_executed, but the resume set names transactions the source has "+
+			"not executed (resume %q; source executed %q) — a lagging replica behind a load-balanced or failover "+
+			"endpoint, a primary rolled back past the position, or a hole in the source's set; cannot resume here: %w",
 			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
 	}
 	return fmt.Errorf("mysql: the resume GTID set is not contained in the source's @@global.gtid_executed "+
