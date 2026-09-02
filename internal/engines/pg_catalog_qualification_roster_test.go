@@ -42,12 +42,17 @@ import (
 // # How the universe is derived (not hand-listed)
 //
 // The set of names that CAN be hijacked is the set of functions in
-// pg_catalog: `testdata/pg16_catalog_procs.txt` is
+// pg_catalog: `testdata/pg_catalog_procs.txt` is the UNION of
 //
 //	SELECT DISTINCT proname FROM pg_proc
 //	 WHERE pronamespace = 'pg_catalog'::regnamespace ORDER BY 1
 //
-// on PostgreSQL 16.15 (2,694 names). Every string literal in every
+// across the majors sluice supports — PostgreSQL 16.15, 17.11, 18.6 and
+// 19beta3 (2,847 names; 16 alone is 2,694, 17 adds 37, 18 adds 106 more,
+// 19beta3 another 47). A union, because a name that exists on ANY
+// supported major can be hijacked on that major and must be graded
+// everywhere; when a new major ships, regenerate the fixture from a real
+// container of it and re-union. Every string literal in every
 // non-test .go file under the two Postgres engine packages is scanned for
 // `<name>(` where <name> is in that set; each such call must be spelled
 // `pg_catalog.<name>(`. A qualified reference restricts resolution to that
@@ -310,7 +315,7 @@ func unqualifiedCatalogCalls(raw string, procs map[string]bool) []catalogCall {
 
 func loadPGCatalogProcs(t *testing.T) map[string]bool {
 	t.Helper()
-	f, err := os.Open(filepath.Join("testdata", "pg16_catalog_procs.txt"))
+	f, err := os.Open(filepath.Join("testdata", "pg_catalog_procs.txt"))
 	if err != nil {
 		t.Fatalf("open fixture: %v", err)
 	}
@@ -325,11 +330,21 @@ func loadPGCatalogProcs(t *testing.T) map[string]bool {
 	if err := sc.Err(); err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	// Fixture floor: PG 16 ships ~2,700 pg_catalog functions; a truncated
-	// fixture would silently shrink the universe. The three named entries
-	// are the ones the SEC-CRIT-1 reproduction hijacked.
-	if len(procs) < 2000 {
-		t.Fatalf("fixture carries only %d names (floor 2000) — regenerate it from a real PG 16", len(procs))
+	// Fixture floor: the 16–19 union is 2,847 names and no single major is
+	// below 2,690; a fixture under 2,800 has lost a major (or was
+	// regenerated from one), which silently shrinks the universe. The
+	// three named entries are the ones the SEC-CRIT-1 reproduction
+	// hijacked; the three version sentinels — `icu_unicode_version`
+	// (first in 17), `crc32` (first in 18), `error_on_null` (first in
+	// 19beta3), each measured absent from every earlier major — prove the
+	// union was actually taken rather than one major re-dumped.
+	if len(procs) < 2800 {
+		t.Fatalf("fixture carries only %d names (floor 2800: the PG 16–19 union) — regenerate from real containers of every supported major and re-union", len(procs))
+	}
+	for _, must := range []string{"icu_unicode_version", "crc32", "error_on_null"} {
+		if !procs[must] {
+			t.Fatalf("fixture is missing %q (a 17+/18+/19+ sentinel) — it is not the cross-major union this gate expects", must)
+		}
 	}
 	for _, must := range []string{"to_jsonb", "array_to_json", "quote_ident"} {
 		if !procs[must] {

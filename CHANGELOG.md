@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+**The pg_catalog qualification gate's universe is now the union of PostgreSQL 16, 17, 18 and 19beta3.** v0.137.4 shipped it as a PostgreSQL 16.15 dump alone (2,694 names). The operator asked the right question at release time — what about 17, 18 and 19 — and the measurement is: 17 adds 37 catalog function names, 18 another 106, 19beta3 another 47, and sluice spells none of them unqualified today, so v0.137.4 has no exposure from the gap. But a future call to a function that only exists on a newer major would have been ungraded, so the fixture is now the union (2,847 names, `internal/engines/testdata/pg_catalog_procs.txt`), with a floor that fails if a major is lost and three version sentinels — one name first added in each of 17, 18 and 19 — that fail if the union was not actually taken. Test-only; no runtime change.
+
 ## [0.137.4] - 2026-09-01
 
 A SECURITY release. **If you run sluice against PostgreSQL as a superuser or any privileged role, and an untrusted role can `CREATE` in a schema on that role's `search_path` (the default for `public` on PostgreSQL 14 and earlier, or any explicit grant), upgrade.** There is nothing to re-run on the database this time: the affected SQL is the SQL sluice itself sends, so the binary upgrade is the whole fix.
