@@ -239,12 +239,12 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// The ORIGINAL CDC anchor P. It is stamped onto stream.Position here and
 	// recorded on the reader; the ADR-0111 re-snapshot recovery NEVER advances
 	// it (the value-fidelity invariant). CopyCursors is empty at open.
-	anchor := binlogPos{
+	anchor := e.stampMariaDBLineageAnchor(ctx, conns[0], binlogPos{
 		Mode:       positionModeFilePos,
 		File:       file,
 		Pos:        pos,
 		ServerUUID: serverUUID,
-	}
+	}, file, pos)
 	position, err := encodeBinlogPos(anchor)
 	if err != nil {
 		_ = cdcReader.(closer).Close()

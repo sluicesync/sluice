@@ -163,20 +163,34 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	}
 }
 
-// TestGTIDResumeMariaDBForeignInstanceIsLoud is the MariaDB sibling as a
-// MEASUREMENT: the MariaDB arm has no pre-check and relies on the stream
-// refusing a position the server cannot serve. A foreign domain-server
-// GTID on a fresh instance must be refused loudly — at StreamChanges or on
-// the first event — never streamed from wherever the server feels like.
-func TestGTIDResumeMariaDBForeignInstanceIsLoud(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+// TestGTIDResumeMariaDBBindsLineage is the MariaDB family, every cell on
+// a real server, because the first cut of this test measured ONE cell
+// (different server_id — which the server itself refuses) and declared
+// MariaDB safe; the pre-tag review then measured the two cells the
+// server does NOT refuse. The matrix:
+//
+//   - different server_id, same domain — the server refuses (1236 "not
+//     in the master's binlog"); sluice must route it to cold-start.
+//   - different gtid_domain_id — the server ACCEPTS and streams its whole
+//     history; sluice's domain door and anchor must refuse.
+//   - rebuilt: same server_id, same domain, a history that reads the SAME
+//     GTIDs — the server accepts; only the BINLOG_GTID_POS anchor can
+//     tell them apart, and must.
+//   - the same instance — must ACCEPT (a check that refuses everything
+//     would pass the three above).
+//   - an anchorless legacy position on a rebuilt instance — must ACCEPT
+//     with the UNVERIFIED-INSTANCE-IDENTITY warning (the documented
+//     degraded posture), never refuse.
+//
+// Every cell asserts an independent expected value: the refusal wraps
+// ir.ErrPositionInvalid (so the streamer cold-starts), and an accepted
+// stream must deliver a write made on the resumed instance.
+func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	dsnA, cleanupA := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
 	defer cleanupA()
-	dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4", "--server-id=2")
-	defer cleanupB()
-
 	execSQL(t, ctx, dsnA, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
 	execSQL(t, ctx, dsnA, `INSERT INTO cdc_src.t VALUES (1,'a'),(2,'b'),(3,'c')`)
 
@@ -191,47 +205,133 @@ func TestGTIDResumeMariaDBForeignInstanceIsLoud(t *testing.T) {
 	if err := json.Unmarshal([]byte(capturedOnA.Token), &decoded); err != nil || decoded.Mode != positionModeGTID {
 		t.Fatalf("MariaDB backup position is not a GTID position: token=%q err=%v", capturedOnA.Token, err)
 	}
+	if decoded.LineageFile == "" || decoded.LineageSet == "" {
+		t.Fatalf("MariaDB backup position carries no lineage anchor (token %q); the capture door did not stamp it", capturedOnA.Token)
+	}
+	if decoded.LineageSet != decoded.GTIDSet {
+		t.Fatalf("anchor set %q != captured set %q — BINLOG_GTID_POS at the captured byte should equal the captured state", decoded.LineageSet, decoded.GTIDSet)
+	}
+	t.Logf("A: set=%s anchor=%s:%d", decoded.GTIDSet, decoded.LineageFile, decoded.LineagePos)
 
-	readerB, err := e.OpenCDCReader(ctx, dsnB)
+	// A legacy position: the same set with the anchor stripped, as a
+	// pre-v0.137.5 binary would have written it.
+	legacy := decoded
+	legacy.LineageFile, legacy.LineagePos, legacy.LineageSet = "", 0, ""
+	legacyPos, err := encodeBinlogPos(legacy)
 	if err != nil {
-		t.Fatalf("OpenCDCReader(B): %v", err)
+		t.Fatalf("encode legacy position: %v", err)
 	}
-	defer closeReader(readerB)
-	ch, err := readerB.StreamChanges(ctx, capturedOnA)
-	if err != nil {
-		if !errors.Is(err, ir.ErrPositionInvalid) {
-			t.Fatalf("MariaDB foreign-instance resume refused, but not with ir.ErrPositionInvalid: %v", err)
+
+	mustRefuse := func(t *testing.T, dsn, cell string, pos ir.Position) {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
 		}
-		t.Logf("MariaDB: refused at StreamChanges (pre-check or immediate stream error): %v", err)
-		return
-	}
-	// Accepted at open: the reactive refusal must arrive on the stream
-	// itself. Write on B so a silently-accepted stream would have
-	// something to deliver, then require an error (not a change) first.
-	execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
-	execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (500,'foreign')`)
-	// Errors surface as the channel closing with the reader's Err() set —
-	// the reader contract, not a per-change field.
-	deadline := time.After(45 * time.Second)
-	for {
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				serr := readerB.(*CDCReader).Err()
-				if serr == nil {
-					t.Fatal("MariaDB: stream closed with NO error after accepting a foreign GTID position — silent acceptance")
-				}
-				if !errors.Is(serr, ir.ErrPositionInvalid) {
-					t.Fatalf("MariaDB: stream refused, but not with ir.ErrPositionInvalid: %v", serr)
-				}
-				t.Logf("MariaDB: refused reactively on the stream: %v", serr)
-				return
+		defer closeReader(reader)
+		ch, err := reader.StreamChanges(ctx, pos)
+		if err != nil {
+			if !errors.Is(err, ir.ErrPositionInvalid) {
+				t.Fatalf("%s: refused, but not with ir.ErrPositionInvalid (no cold-start route): %v", cell, err)
 			}
-			t.Fatalf("MariaDB: a foreign-instance GTID position was ACCEPTED and B's write was DELIVERED as if it were A's delta (%+v) — silent lineage confusion, the SLM-2 shape on the MariaDB arm", ev)
-		case <-deadline:
-			t.Fatal("MariaDB: neither a refusal nor a change arrived within 45s after resuming a foreign GTID position; treat as unmeasured, not as safe")
+			t.Logf("%s: refused at open: %v", cell, err)
+			return
+		}
+		// Accepted at open: only a reactive server refusal may follow.
+		// Write on the resumed instance so silent acceptance has
+		// something to deliver, then require the channel to close with
+		// the reader's Err set (the reader contract).
+		execSQL(t, ctx, dsn, `INSERT INTO cdc_src.t VALUES (900,'foreign')`)
+		deadline := time.After(45 * time.Second)
+		for {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					serr := reader.(*CDCReader).Err()
+					if serr == nil {
+						t.Fatalf("%s: stream closed with NO error after accepting a foreign position — silent acceptance", cell)
+					}
+					if !errors.Is(serr, ir.ErrPositionInvalid) {
+						t.Fatalf("%s: stream refused, but not with ir.ErrPositionInvalid: %v", cell, serr)
+					}
+					t.Logf("%s: refused reactively on the stream: %v", cell, serr)
+					return
+				}
+				t.Fatalf("%s: a foreign position was ACCEPTED and the resumed instance's write was DELIVERED as the position's continuation (%+v) — the SLM-2 shape", cell, ev)
+			case <-deadline:
+				t.Fatalf("%s: neither a refusal nor a change arrived within 45s; unmeasured, not safe", cell)
+			}
 		}
 	}
+	mustAccept := func(t *testing.T, dsn, cell string, pos ir.Position) {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
+		}
+		defer closeReader(reader)
+		ch, err := reader.StreamChanges(ctx, pos)
+		if err != nil {
+			t.Fatalf("%s: a legitimate resume was REFUSED: %v", cell, err)
+		}
+		execSQL(t, ctx, dsn, `INSERT INTO cdc_src.t VALUES (901,'continuation')`)
+		deadline := time.After(45 * time.Second)
+		for {
+			select {
+			case _, ok := <-ch:
+				if !ok {
+					t.Fatalf("%s: stream closed: %v", cell, reader.(*CDCReader).Err())
+				}
+				// The only write after the resume is the one above, so any
+				// delivered change is the continuation.
+				t.Logf("%s: accepted and delivered the continuation write", cell)
+				return
+			case <-deadline:
+				t.Fatalf("%s: accepted but delivered nothing within 45s", cell)
+			}
+		}
+	}
+
+	t.Run("different server_id: server-refused, routed to cold-start", func(t *testing.T) {
+		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4", "--server-id=2")
+		defer cleanupB()
+		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		mustRefuse(t, dsnB, "different-server-id", capturedOnA)
+	})
+
+	t.Run("different gtid_domain_id: server accepts, sluice refuses", func(t *testing.T) {
+		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4", "--server-id=4", "--gtid-domain-id=7")
+		defer cleanupB()
+		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (10,'x'),(11,'y')`)
+		mustRefuse(t, dsnB, "different-domain", capturedOnA)
+		// The domain door alone must also catch the anchorless legacy
+		// shape here — the server would accept it.
+		mustRefuse(t, dsnB, "different-domain/legacy-position", legacyPos)
+	})
+
+	t.Run("rebuilt: same server_id, colliding GTIDs — only the anchor can tell", func(t *testing.T) {
+		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupB()
+		// Three transactions, like A (the container helper's own CREATE
+		// DATABASE is the first): the rebuilt instance's own history then
+		// reads the same "0-1-3" A's position names, with different data.
+		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (10,'x'),(11,'y')`)
+		state := globalVar(t, ctx, dsnB, "gtid_binlog_pos")
+		if state != decoded.GTIDSet {
+			t.Fatalf("premise gone: the rebuilt instance's state is %q, A's position is %q — the collision this cell reproduces did not happen", state, decoded.GTIDSet)
+		}
+		mustRefuse(t, dsnB, "rebuilt-colliding", capturedOnA)
+		// The anchorless legacy position on this instance is the documented
+		// degraded posture: accepted, with the WARN — refusing would force a
+		// full re-copy on every pre-v0.137.5 chain.
+		mustAccept(t, dsnB, "rebuilt-colliding/legacy-position", legacyPos)
+	})
+
+	t.Run("same instance: accepted", func(t *testing.T) {
+		mustAccept(t, dsnA, "same-instance", capturedOnA)
+	})
 }
 
 func assertGTIDPositionUnder(t *testing.T, door string, p ir.Position, wantUUID string) string {

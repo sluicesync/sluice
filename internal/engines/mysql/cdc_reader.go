@@ -304,6 +304,14 @@ type CDCReader struct {
 	gtidSet     mysql.GTIDSet
 	currentFile string
 
+	// lineageFile / lineagePos / lineageSet are the MariaDB lineage anchor
+	// of the position this stream started from, copied onto every
+	// position it persists (mariadb_lineage.go). Empty for other flavors
+	// and for anchorless legacy positions.
+	lineageFile string
+	lineagePos  uint32
+	lineageSet  string
+
 	// pendingGTID holds the in-flight transaction's own GTID between its
 	// opening group event and its COMMIT; foldPendingGTID moves it into
 	// gtidSet at the commit. Roadmap item 132: gtidSet used to be updated
@@ -800,7 +808,18 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 		if err != nil {
 			return binlogPos{}, err
 		}
-		return binlogPos{Mode: positionModeGTID, GTIDSet: set}, nil
+		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
+		if r.flavor == FlavorMariaDB {
+			// Lineage anchor (v0.137.5, mariadb_lineage.go): a from-now
+			// start is a capture door too — every position this stream
+			// persists copies this anchor forward.
+			file, pos, err := masterStatus(ctx, r.db)
+			if err != nil {
+				return binlogPos{}, fmt.Errorf("mysql: SHOW MASTER STATUS: %w", err)
+			}
+			bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, pos)
+		}
+		return bp, nil
 	}
 	file, pos, err := masterStatus(ctx, r.db)
 	if err != nil {
@@ -829,6 +848,11 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 	// (item 132). Reset before the mode switch so BOTH modes get it.
 	r.pendingGTID = ""
 	r.inSourceTx = false
+	// The MariaDB lineage anchor rides every position this stream
+	// persists, unchanged from the start position (mariadb_lineage.go):
+	// lineage identity is established at the anchor, continuity past it
+	// is this server's binlog.
+	r.lineageFile, r.lineagePos, r.lineageSet = p.LineageFile, p.LineagePos, p.LineageSet
 	switch p.Mode {
 	case positionModeGTID:
 		set, err := mysql.ParseGTIDSet(r.goMySQLFlavor(), p.GTIDSet)
@@ -1921,13 +1945,17 @@ func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, erro
 		if r.gtidSet != nil {
 			set = r.gtidSet.String()
 		}
-		return encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
+		return encodeBinlogPos(binlogPos{
+			Mode: positionModeGTID, GTIDSet: set,
+			LineageFile: r.lineageFile, LineagePos: r.lineagePos, LineageSet: r.lineageSet,
+		})
 	case positionModeFilePos:
 		return encodeBinlogPos(binlogPos{
-			Mode:       positionModeFilePos,
-			File:       r.currentFile,
-			Pos:        hdr.LogPos,
-			ServerUUID: r.serverUUID,
+			Mode:        positionModeFilePos,
+			File:        r.currentFile,
+			Pos:         hdr.LogPos,
+			ServerUUID:  r.serverUUID,
+			LineageFile: r.lineageFile, LineagePos: r.lineagePos, LineageSet: r.lineageSet,
 		})
 	default:
 		return ir.Position{}, fmt.Errorf("mysql: cdc: position mode %q unset", r.posMode)
@@ -2031,6 +2059,16 @@ func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) er
 func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPos) error {
 	switch p.Mode {
 	case positionModeFilePos:
+		if r.flavor == FlavorMariaDB {
+			// MariaDB has no @@server_uuid, so the identity stamp below
+			// can never bind a MariaDB file/pos position (a sync cold
+			// start anchors MariaDB in file/pos mode). The lineage anchor
+			// is the binding for this flavor in both modes (v0.137.5).
+			if err := verifyMariaDBLineage(ctx, r.db, p); err != nil {
+				return err
+			}
+			return verifyBinlogFilePresent(ctx, r.db, p.File)
+		}
 		// Track 1c node-replace floor: a file/pos position is only
 		// meaningful on the exact instance it was captured on, because
 		// binlog file NAMES are instance-local and a replaced /
@@ -2045,34 +2083,43 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 	case positionModeGTID:
 		if r.flavor == FlavorMariaDB {
 			// MariaDB has NO reliable SQL surface to pre-check GTID
-			// reachability: there is no GTID_SUBSET function and no
+			// RETENTION: there is no GTID_SUBSET function and no
 			// @@gtid_purged, and @@gtid_binlog_state reports the NEWEST
 			// GTID per domain, NOT a purged floor (ground-truthed: it is
-			// UNCHANGED across a PURGE BINARY LOGS, so a resume position
-			// below the purged floor is indistinguishable from a live one
-			// via SQL). The authoritative check is the stream itself:
-			// StartSyncGTID on a purged position surfaces MariaDB error
-			// 1236 ("Could not find GTID state requested by slave ...
-			// required binlog files have been purged") LOUDLY on the
-			// pump's first GetEvent, which classifyReaderError wraps as
-			// ir.ErrPositionInvalid (isMariaDBPurgedGTIDError) → the
-			// streamer's ADR-0022/ADR-0093 cold-start fall-through. So the
-			// pre-check is a minimal parse-validation and defers to that
-			// reactive refusal — never a silent start-from-wrong-position.
-			// See ADR-0170.
+			// UNCHANGED across a PURGE BINARY LOGS). For retention the
+			// authoritative check is the stream itself: StartSyncGTID on a
+			// purged position surfaces error 1236 on the pump's first
+			// GetEvent, which classifyReaderError wraps as
+			// ir.ErrPositionInvalid → the cold-start fall-through (ADR-0170).
+			//
+			// LINEAGE is a different question, and until v0.137.5 this
+			// comment claimed the stream answered it too. Measured false
+			// (audit SLM-2's MariaDB arm): the server refuses a foreign
+			// position only when its domain is present with a different
+			// server_id or a higher seq; a different domain, or a rebuilt
+			// instance with the same server_id and a colliding seq, is
+			// ACCEPTED and streams the source's whole history. The
+			// pre-check therefore binds lineage itself — the domain door
+			// and the BINLOG_GTID_POS anchor in mariadb_lineage.go — and
+			// only retention is left to the reactive 1236.
 			if _, err := mysql.ParseGTIDSet(mysql.MariaDBFlavor, p.GTIDSet); err != nil {
 				return fmt.Errorf("mariadb: resume gtid set %q is unparseable: %w (%w)",
 					p.GTIDSet, ir.ErrPositionInvalid, err)
 			}
-			return nil
+			return verifyMariaDBLineage(ctx, r.db, p)
 		}
 		// GTID UUIDs are instance-bound, but that binds NOTHING by itself:
 		// the purged check (verifyGTIDSetReachable) asks only whether the
 		// source has thrown away something the position needs, which a
-		// fresh instance never has. Lineage is bound by the second arm it
-		// now runs, verifyGTIDLineageContinuity — the source must have
-		// EXECUTED everything the position consumed (audit 2026-09-01
-		// SLM-2; the previous comment here claimed the opposite).
+		// fresh instance never has. Lineage is bound FIRST by
+		// verifyGTIDLineageContinuity — the source must have EXECUTED
+		// everything the position consumed (audit 2026-09-01 SLM-2; the
+		// previous comment here claimed the opposite) — so a source that is
+		// both foreign and has purged something is diagnosed as foreign,
+		// not as a retention loss with a PITR hint that does not apply.
+		if err := verifyGTIDLineageContinuity(ctx, r.db, p.GTIDSet); err != nil {
+			return err
+		}
 		return verifyGTIDSetReachable(ctx, r.db, p.GTIDSet)
 	default:
 		return fmt.Errorf("mysql: cannot verify position with mode %q", p.Mode)
@@ -2356,7 +2403,7 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 		return fmt.Errorf("mysql: GTID_SUBSET(@@gtid_purged, resume): %w", err)
 	}
 	if subset == 1 {
-		return verifyGTIDLineageContinuity(ctx, db, resumeSet)
+		return nil
 	}
 	// Item 132 interaction, checked rather than assumed: a resume set is now
 	// the PRE-transaction set of whatever the reader was in the middle of, so
@@ -2413,10 +2460,44 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 	if contained == 1 {
 		return nil
 	}
+	// Lag and lineage are different diagnoses with the same (safe)
+	// route. If every source UUID the position names is present in the
+	// source's executed set and only sequence numbers are ahead, the
+	// source is BEHIND the position — a lagging replica behind a
+	// load-balanced or DNS-failover endpoint, or a rolled-back primary —
+	// not a different lineage, and the operator should hear that.
+	if gtidSetUUIDsSubset(resumeSet, executed) {
+		return fmt.Errorf("mysql: the source is BEHIND the resume position: every source UUID in the resume set is "+
+			"present in the source's @@global.gtid_executed but some sequence numbers are ahead of it (resume %q; "+
+			"source executed %q) — a lagging replica behind a load-balanced or failover endpoint, or a primary "+
+			"rolled back past the position; cannot resume here: %w",
+			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+	}
 	return fmt.Errorf("mysql: the resume GTID set is not contained in the source's @@global.gtid_executed "+
 		"(resume %q; source executed %q) — the source is a different lineage (a fresh, reset, or rebuilt instance, "+
 		"or a replica promoted without transactions the old primary had); cannot resume: %w",
 		abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+}
+
+// gtidSetUUIDsSubset reports whether every source UUID named in resume
+// also appears in executed (MySQL GTID sets: "uuid:intervals[,uuid:…]").
+func gtidSetUUIDsSubset(resume, executed string) bool {
+	have := map[string]bool{}
+	for _, part := range strings.Split(executed, ",") {
+		if i := strings.IndexByte(part, ':'); i > 0 {
+			have[strings.ToLower(strings.TrimSpace(part[:i]))] = true
+		}
+	}
+	for _, part := range strings.Split(resume, ",") {
+		i := strings.IndexByte(part, ':')
+		if i <= 0 {
+			return false
+		}
+		if !have[strings.ToLower(strings.TrimSpace(part[:i]))] {
+			return false
+		}
+	}
+	return true
 }
 
 // abbreviateGTIDSet keeps an error message readable when a gtid_executed

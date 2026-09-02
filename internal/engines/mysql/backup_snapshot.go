@@ -526,7 +526,17 @@ func captureBackupPosition(ctx context.Context, conn *sql.Conn, flavor Flavor) (
 		if err != nil {
 			return ir.Position{}, err
 		}
-		return encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
+		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
+		if flavor == FlavorMariaDB {
+			// Lineage anchor (v0.137.5, mariadb_lineage.go), read on the
+			// same locked conn as the set.
+			file, pos, err := snapshotMasterStatus(ctx, conn)
+			if err != nil {
+				return ir.Position{}, fmt.Errorf("master status: %w", err)
+			}
+			bp = captureMariaDBLineageAnchor(ctx, conn, bp, file, pos)
+		}
+		return encodeBinlogPos(bp)
 	}
 	file, pos, err := snapshotMasterStatus(ctx, conn)
 	if err != nil {

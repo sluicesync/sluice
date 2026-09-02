@@ -216,7 +216,18 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.
 		if err != nil {
 			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
 		}
-		pos, err := encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
+		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
+		if r.flavor == FlavorMariaDB {
+			// Lineage anchor (v0.137.5): the binlog byte this set was
+			// read at, and the server's own GTID state there. See
+			// mariadb_lineage.go.
+			file, p, err := masterStatus(ctx, r.db)
+			if err != nil {
+				return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: master status: %w", err)
+			}
+			bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, p)
+		}
+		pos, err := encodeBinlogPos(bp)
 		if err != nil {
 			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
 		}

@@ -56,6 +56,28 @@ type binlogPos struct {
 	File string `json:"file,omitempty"`
 	Pos  uint32 `json:"pos,omitempty"`
 
+	// LineageFile / LineagePos / LineageSet bind a MariaDB position to
+	// the binlog LINEAGE it was captured from (v0.137.5, audit SLM-2's
+	// MariaDB arm). MariaDB GTIDs are (domain, server_id, seq) with no
+	// instance identity and there is no @@server_uuid, so neither the
+	// GTID set nor a filename says which server produced it — measured
+	// on 11.4: a foreign instance with a different gtid_domain_id, and a
+	// rebuilt instance with the same server_id whose history happens to
+	// read the same "0-1-3", both ACCEPT the position and stream their own
+	// history as its continuation. The anchor is the (file, offset) the
+	// capture door read under its lock together with
+	// BINLOG_GTID_POS(file, offset) — the GTID state at that byte of THIS
+	// server's binlog. On the same lineage the source answers the same
+	// set; a rebuilt or foreign instance answers NULL or a different set,
+	// and the resume refuses. Streamed positions carry the START anchor
+	// forward unchanged: lineage identity is established at the anchor
+	// and continuity past it is the same server's binlog. Empty on
+	// positions persisted before this field existed, which resume with
+	// the UNVERIFIED-INSTANCE-IDENTITY WARN the file/pos arm already uses.
+	LineageFile string `json:"lineage_file,omitempty"`
+	LineagePos  uint32 `json:"lineage_pos,omitempty"`
+	LineageSet  string `json:"lineage_set,omitempty"`
+
 	// ServerUUID binds a file/pos position to the source server
 	// instance it was captured on (@@server_uuid). It is the
 	// loud-failure floor for the PlanetScale "node replaced /

@@ -584,12 +584,12 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		cr.SetCDCDatabaseList(databases)
 	}
 
-	position, err := encodeBinlogPos(binlogPos{
+	position, err := encodeBinlogPos(e.stampMariaDBLineageAnchor(ctx, conn, binlogPos{
 		Mode:       positionModeFilePos,
 		File:       file,
 		Pos:        pos,
 		ServerUUID: serverUUID,
-	})
+	}, file, pos))
 	if err != nil {
 		_ = cdcReader.(closer).Close()
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
