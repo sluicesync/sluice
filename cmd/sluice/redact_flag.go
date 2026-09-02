@@ -23,9 +23,15 @@ import (
 //
 //	[schema.]table.column=strategy[:options]
 //
-// Schema is optional; empty schema applies to engines that resolve
-// schema implicitly (MySQL's "database" defaulting to the DSN's
-// configured database). Strategy is one of:
+// Schema is optional; the bare `table.column` form matches the table
+// in every namespace the run reads (on a single-database MySQL run,
+// the DSN's database; on Postgres, the reader's schema). A schema-
+// qualified rule matches ONLY a table stamped with that namespace —
+// and a single-database MySQL run stamps none, so a qualified rule
+// there is refused at preflight rather than silently skipping the
+// bulk-copy and backup lanes (audit 2026-08-27 NEW-1; the multi-
+// database flags are the way to address a MySQL database by name).
+// Strategy is one of:
 //
 //   - `null`                 — replace with NULL (column must be NULLABLE)
 //   - `static:<value>`       — replace with literal constant

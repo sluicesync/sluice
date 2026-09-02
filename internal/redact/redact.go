@@ -161,6 +161,25 @@ func (r *Registry) Set(schema, table, column string, strategy Strategy) {
 // vs `audit_svc.users.email`) still get the precise behaviour: the
 // schema-qualified Set takes precedence over the bare fallback when
 // both are registered.
+//
+// There is deliberately NO bridge in the other direction — a bare
+// lookup (schema == "") never falls forward to a schema-qualified
+// rule. The bulk-copy and backup lanes hand Get the table's stamped
+// [ir.Table.Schema], which a MySQL source in single-database mode
+// leaves EMPTY, so a qualified rule there is unreachable from those
+// lanes while the CDC lane (binlog rows carry the database name)
+// reaches it — the lane split that shipped a column unredacted at
+// exit 0 (audit 2026-08-27 NEW-1). A qualified→bare bridge cannot
+// close that honestly: with `customer_svc.users.email` and
+// `audit_svc.users.email` both registered, a bare lookup has no way
+// to pick, and picking either silently applies one schema's policy
+// to another's rows. The closure is upstream instead: the preflight
+// (migcore.PreflightRedactRules, on every lane that emits rows)
+// resolves a qualified rule against a table stamped with THAT
+// namespace and refuses it on a flat-scope source, so no qualified
+// rule survives into a run whose bulk rows carry "". Every lane then
+// agrees with this lookup: bare rules match everywhere via the Bug 58
+// fallback; qualified rules match only rows that carry the namespace.
 func (r *Registry) Get(schema, table, column string) Strategy {
 	if r == nil || len(r.rules) == 0 {
 		return nil

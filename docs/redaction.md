@@ -381,8 +381,29 @@ KMS/Vault adapters (layer them above sluice by populating
 
 ## Preflight refusals
 
-sluice runs three preflight checks before any data movement:
+sluice runs these preflight checks before any data movement, on every
+lane that redacts rows — `migrate` (single- and multi-database),
+`sync start` cold start (single- and multi-database), `sync add-table`,
+and `backup full`:
 
+0. **Selector resolution** (Bug 99 / v0.91.1; namespace half added for
+   audit finding NEW-1): every rule's `[schema.]table.column` must
+   resolve to a real column in the source schema, and a
+   schema-qualified rule must resolve to a table in **that**
+   namespace. A rule that resolves to nothing is refused as a typo
+   class — it would apply to nothing and ship the column in clear.
+   Two namespace shapes matter:
+   - **Single-database MySQL is flat scope.** Tables carry no namespace
+     there, so a qualified rule such as `source_db.users.email` can
+     never match a bulk-copied or backed-up row (only CDC rows carry
+     the binlog database name). Pre-fix that rule passed preflight and
+     the column shipped **unredacted** through bulk copy and backup at
+     exit 0 while CDC rows were redacted. It is now refused: use the
+     bare `users.email` form, or select the database explicitly
+     (`--include-database=source_db`) so tables are namespaced.
+   - **Multi-database / multi-schema runs** validate a qualified rule
+     in the pass for its own namespace; a qualified rule naming a
+     namespace outside the selected set is refused up front.
 1. **`mask:uuid` on a UUID-typed column** (Bug 60 / v0.58.1):
    refuses unless `--type-override=col=text` short-circuits the
    target column type.

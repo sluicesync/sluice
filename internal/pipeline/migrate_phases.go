@@ -208,7 +208,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 // All of it fires before DryRun and before any schema apply, so there
 // is never a partially-migrated target and the diagnostics match
 // `schema preview`.
-func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.SchemaReader, schema *ir.Schema) (*ir.Schema, bool, error) {
+func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.SchemaReader, schema *ir.Schema, scope *multiDBScope) (*ir.Schema, bool, error) {
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err := translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {
@@ -264,12 +264,16 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 			slog.String("reason", rawCopyReason))
 	}
 
-	// ---- 1.55. Redaction-type pre-flight refusal (Bug 60, v0.58.1) ----
+	// ---- 1.55. Redaction pre-flight refusal (Bug 60, v0.58.1) ----
 	// Catches mask:uuid on UUID-typed columns BEFORE schema apply so
 	// the operator sees an actionable error at run-start instead of
 	// a mid-bulk-copy pgx encode failure. Runs after ApplyMappings so
-	// `--type-override=col=text` short-circuits the refusal.
-	if err := preflightRedactTypes(m.Redactor, schema); err != nil {
+	// `--type-override=col=text` short-circuits the refusal. Also the
+	// selector check (Bug 99; audit 2026-08-27 NEW-1 for the namespace
+	// half): scope tells it which namespace this pass reads in the
+	// ADR-0074 / ADR-0075 fan-out, so a qualified rule for a sibling
+	// namespace is left to that namespace's pass instead of refused.
+	if err := preflightRedactTypesInScope(m.Redactor, schema, scope); err != nil {
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 

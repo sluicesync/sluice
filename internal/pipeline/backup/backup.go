@@ -431,6 +431,19 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
+	// 2.2. Redaction preflight (Bug 60 / Bug 99 / audit 2026-08-27 NEW-1).
+	// The chunk writer redacts through the same [migcore.RedactRow] the
+	// bulk-copy lanes use, keyed by the table's stamped namespace — but
+	// unlike migrate and sync cold-start, backup never ran the preflight,
+	// so a --redact rule that resolved to nothing (a typo, or a schema-
+	// qualified rule on a flat-scope MySQL source whose tables carry no
+	// namespace) reached the chunk write unchecked and the column landed
+	// in the archive UNREDACTED at exit 0. Refuse before the first chunk;
+	// backup is single-namespace, so there is no sibling pass to defer to.
+	if err := migcore.PreflightRedactRules(b.Redactor, schema, ""); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: %w", err))
+	}
+
 	// 2.4. Bug 248: refuse before ANY write when the destination store
 	// folds letter case and the (filtered) table set carries names whose
 	// chunk paths would fold to one host path — serial mode silently

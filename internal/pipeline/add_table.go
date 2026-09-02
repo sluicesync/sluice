@@ -340,14 +340,10 @@ func (a *AddTable) Run(ctx context.Context) error {
 	}
 
 	// Apply per-column type / expression overrides (CLI parity with
-	// migrate / sync-start).
-	scoped, err = translate.ApplyMappings(scoped, a.Mappings)
+	// migrate / sync-start), then the redaction preflight on the result.
+	scoped, err = a.translateScopedSchema(scoped)
 	if err != nil {
-		return fmt.Errorf("pipeline: add-table: apply mappings: %w", err)
-	}
-	scoped, err = translate.ApplyExpressionOverrides(scoped, a.ExpressionMappings)
-	if err != nil {
-		return fmt.Errorf("pipeline: add-table: apply expression overrides: %w", err)
+		return err
 	}
 
 	if a.DryRun {
@@ -579,6 +575,27 @@ func (a *AddTable) Run(ctx context.Context) error {
 
 	a.logAddComplete(ctx)
 	return nil
+}
+
+// translateScopedSchema applies the operator's per-column type /
+// expression overrides to the single-table schema and then runs the
+// redaction preflight on the result — the same order as migrate and
+// sync cold-start, so `--type-override=col=text` short-circuits the
+// mask:uuid refusal here too. Carved out of Run for the funlen ceiling
+// when the preflight joined it (audit 2026-08-27 NEW-1).
+func (a *AddTable) translateScopedSchema(scoped *ir.Schema) (*ir.Schema, error) {
+	scoped, err := translate.ApplyMappings(scoped, a.Mappings)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: add-table: apply mappings: %w", err)
+	}
+	scoped, err = translate.ApplyExpressionOverrides(scoped, a.ExpressionMappings)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: add-table: apply expression overrides: %w", err)
+	}
+	if err := a.preflightRedact(scoped); err != nil {
+		return nil, err
+	}
+	return scoped, nil
 }
 
 // extendPublicationScope extends the source publication to include the

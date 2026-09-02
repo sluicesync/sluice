@@ -135,6 +135,15 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 	if err := preflightNamespaceFoldCollisions(ctx, s.Target, s.TargetDSN, targets); err != nil {
 		return nil, nil, err
 	}
+	// Audit 2026-08-27 NEW-1: a schema-qualified --redact rule must name a
+	// SELECTED database — the per-database cold-copy pass hands a qualified
+	// rule for a sibling database off to that sibling's pass, so a rule
+	// naming an unselected database would be validated by none. Mirrors
+	// migrate_multidb.go; runs for warm resume too (CDC rows carry the
+	// database name, so the same registry keys are what they will match).
+	if err := migcore.PreflightRedactNamespaces(s.Redactor, selected); err != nil {
+		return nil, nil, connectHint(err)
+	}
 
 	selectedSet := make(map[string]struct{}, len(selected))
 	for _, db := range selected {
@@ -699,6 +708,17 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	schema, err = translate.ApplyExpressionOverrides(schema, s.ExpressionMappings)
 	if err != nil {
 		return fmt.Errorf("pipeline: apply expression overrides for %q: %w", database, err)
+	}
+
+	// Redaction preflight (Bug 60 / Bug 99 / audit 2026-08-27 NEW-1),
+	// per database and after the mappings — the single-database cold
+	// start has run this since v0.58.1; the multi-database pass did not,
+	// so a typo'd or mis-namespaced --redact rule reached the bulk copy
+	// unchecked. database is this pass's namespace: a qualified rule for
+	// a sibling database is that pass's business (resolveStreamDatabases
+	// already refused one naming an unselected database).
+	if err := migcore.PreflightRedactRules(s.Redactor, schema, database); err != nil {
+		return connectHint(fmt.Errorf("pipeline: redaction preflight for %q: %w", database, err))
 	}
 
 	// Cross-engine schema-narrowing advisory notices (Bug 157 Q2). Emitted

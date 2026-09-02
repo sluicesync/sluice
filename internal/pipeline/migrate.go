@@ -719,7 +719,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// raw-copy lane gate (rawCopyOK threads into the copy deps below),
 	// the redaction-type preflight, and the cross-engine refusals +
 	// loud-notice scans — all before DryRun and any schema apply.
-	schema, rawCopyOK, err := m.phaseTranslateAndGateSchema(ctx, sr, schema)
+	schema, rawCopyOK, err := m.phaseTranslateAndGateSchema(ctx, sr, schema, scope)
 	if err != nil {
 		return err
 	}

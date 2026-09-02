@@ -113,6 +113,16 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		return err
 	}
 
+	// Audit 2026-08-27 NEW-1: a schema-qualified --redact rule must name a
+	// SELECTED namespace. Each per-database pass below hands a qualified
+	// rule for a sibling namespace off to that sibling's pass, so a rule
+	// naming a namespace outside the selection would be handed off by
+	// every pass and validated by none — applying to nothing, silently.
+	// Refuse once, up front, before any database migrates.
+	if err := migcore.PreflightRedactNamespaces(m.Redactor, selected); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+
 	selectedSet := make(map[string]struct{}, len(selected))
 	for _, db := range selected {
 		selectedSet[db] = struct{}{}
