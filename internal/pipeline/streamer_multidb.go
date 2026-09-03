@@ -290,6 +290,15 @@ func (s *Streamer) coldStartMultiDatabase(
 		return nil, stop, err
 	}
 
+	// ---- 2.5. Source-side replica identity, BEFORE the spanning snapshot
+	// creates the publication that would expose the operator's application
+	// to Postgres's own UPDATE/DELETE refusal (audit 2026-09-01 A2-4). See
+	// [Streamer.preflightMultiNamespaceReplicaIdentity] for why it cannot
+	// live in the per-namespace copy loop with its sibling preflights. ----
+	if err := s.preflightMultiNamespaceReplicaIdentity(ctx, selected, inScope); err != nil {
+		return nil, stop, err
+	}
+
 	// ---- 3. Open the SINGLE spanning consistent snapshot. One tx, one
 	// binlog position spanning ALL selected databases. This is the crux:
 	// the position handed to CDC below is captured at one consistent cut. ----
@@ -658,6 +667,94 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
 	return schema, nil
+}
+
+// preflightMultiNamespaceReplicaIdentity is the fan-out's source-side
+// replica-identity preflight (audit 2026-09-01 A2-4). The single-namespace
+// cold start has run this since roadmap item 93; the fan-out ran the
+// partition and inheritance preflights and not this one, so a multi-schema
+// `sync start` over a table with no usable replica identity copied and
+// streamed it — and the SOURCE APPLICATION's own UPDATE/DELETE on that
+// table began failing, because a published table without a replica
+// identity is one Postgres refuses to update.
+//
+// It runs here, ahead of the spanning snapshot, and that placement is the
+// whole point rather than a detail. Scoping the publication is what makes
+// Postgres start refusing those writes, and on this path the publication
+// is created by the spanning snapshot open itself (FOR ALL TABLES — a
+// logical slot is database-wide), not by a later EnsurePublication. Run
+// per namespace inside the copy loop, as the sibling preflights are, the
+// refusal would arrive after the exposure it exists to prevent had already
+// begun. That is why this reads its own scoped schema per namespace
+// instead of reusing [Streamer.coldStartReadOneDatabaseSchema]'s reader.
+//
+// The cost is bounded by the capability gate: [preflightSourceReplicaIdentity]
+// no-ops unless the source declares CDCLogicalReplication, which is an
+// Engine-level answer, so a MySQL fan-out (every ADR-0074 source) opens no
+// readers here at all. Only the Postgres multi-schema path pays N schema
+// reads, and it pays them to avoid breaking the operator's application.
+//
+// Residual, stated: the publication this protects against is FOR ALL
+// TABLES, so sluice's own action exposes every table in the database —
+// including namespaces the operator did NOT select, which this does not
+// check. Widening it means either a database-wide engine query or a loop
+// over every namespace, and it changes what the refusal may demand (a sync
+// refused over an unrelated schema's table is a policy call, not a bug
+// fix). Filed as A2-4b.
+func (s *Streamer) preflightMultiNamespaceReplicaIdentity(ctx context.Context, selected []string, inScope func(string) bool) error {
+	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
+		return nil
+	}
+	deriver, ok := s.Source.(ir.DatabaseDSNDeriver)
+	if !ok {
+		// The fan-out cannot have got this far without one (the copy loop
+		// refuses on the same assertion), but this runs BEFORE that loop, so
+		// it states the requirement rather than assuming it.
+		return fmt.Errorf(
+			"pipeline: source engine %q cannot derive a per-namespace DSN for the replica-identity preflight (ADR-0075)",
+			s.Source.Name(),
+		)
+	}
+	for _, database := range selected {
+		srcDSN, err := deriver.WithDatabase(s.SourceDSN, database)
+		if err != nil {
+			return fmt.Errorf("pipeline: derive source DSN for namespace %q: %w", database, err)
+		}
+		if err := s.preflightOneNamespaceReplicaIdentity(ctx, srcDSN, database, inScope); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// preflightOneNamespaceReplicaIdentity is one namespace's pass, split out so
+// the scoped reader is closed on every path (the loop above would otherwise
+// hold N readers open until it returned).
+func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, srcDSN, database string, inScope func(string) bool) error {
+	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
+	if err != nil {
+		return connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
+	}
+	defer migcore.CloseIf(sr)
+	migcore.ApplyTableScope(sr, s.Filter)
+	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
+	}
+	if schema == nil || len(schema.Tables) == 0 {
+		return nil
+	}
+	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
+	}
+	// The post-filter names, bare, which is the same list the copy loop
+	// hands the publication — and the same question the engine's
+	// `WHERE n.nspname = $1` asks of this reader's bound namespace.
+	if err := preflightSourceReplicaIdentity(ctx, sr, s.Source.Capabilities(), migcore.TableNamesForPublication(schema)); err != nil {
+		return fmt.Errorf("pipeline: preflight namespace %q: %w", database, err)
+	}
+	return nil
 }
 
 // coldStartCopyOneDatabase reads one selected database's schema (scoped so

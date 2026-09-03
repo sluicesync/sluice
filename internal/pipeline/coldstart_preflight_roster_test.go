@@ -74,6 +74,14 @@ var coldStartPreflightReferenceFuncs = []string{
 // schema-read step, where the scoped reader is still open — or in
 // coldStartCopyOneDatabase for anything that needs the target writers).
 var coldStartPreflightMultiDatabaseFuncs = []string{
+	// A2-4: the replica-identity preflight cannot run inside the copy loop
+	// (the spanning snapshot has already created the FOR ALL TABLES
+	// publication by then), so it has its own pre-snapshot pass. Listed here
+	// because this roster only sees the functions it is told about — the
+	// first cut of the A2-4 fix added the call in a helper OUTSIDE this list
+	// and the gate went green while still carrying the exemption.
+	"(*Streamer).preflightMultiNamespaceReplicaIdentity",
+	"(*Streamer).preflightOneNamespaceReplicaIdentity",
 	"(*Streamer).coldStartMultiDatabase",
 	"(*Streamer).coldStartReadOneDatabaseSchema",
 	"(*Streamer).coldStartCopyOneDatabase",
@@ -84,9 +92,6 @@ var coldStartPreflightMultiDatabaseFuncs = []string{
 // here. Every entry today is a filed gap, not a design decision — the A2-2
 // roster sweep found them; each cites where it is tracked.
 var coldStartPreflightMultiDatabaseExempt = map[string]coldStartPreflightExemption{
-	"preflightSourceReplicaIdentity": {exemptFiledGap, "audit 2026-09-01 A2-4: the fan-out ensures the FOR ALL TABLES publication before " +
-		"any replica-identity check, so a keyless table breaks the SOURCE application's UPDATE/DELETE; " +
-		"must run per namespace BEFORE the spanning snapshot open (which creates the publication), not inside the copy loop."},
 	"preflightRLS": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep (source-side RLS): a BYPASSRLS-less role reads a " +
 		"silently-filtered snapshot; applies per namespace against the scoped reader, same shape as the partition preflight."},
 	"preflightSourceReplication": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep: the ADR-0075 spanning snapshot creates a " +
@@ -259,4 +264,88 @@ func sortedPreflightKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// TestMultiNamespaceReplicaIdentityRunsBeforeThePublicationExists binds the
+// A2-4 fix's load-bearing property, which the roster above cannot see.
+//
+// Two mutation runs taught this. Deleting the call site in
+// coldStartMultiDatabase left the roster green, because the roster asks
+// "does a listed fan-out function call preflightSourceReplicaIdentity?" and
+// the pre-pass helper still did. And before the helper was added to that
+// list, the roster was green while still carrying the exemption. A roster
+// over a hand-listed function set answers a narrower question than its name
+// suggests; this states the two facts that actually matter.
+//
+//  1. coldStartMultiDatabase CALLS the pre-pass. Nothing else does.
+//  2. It calls it BEFORE opening the spanning snapshot. That ordering IS
+//     the fix: the snapshot open creates the FOR ALL TABLES publication,
+//     and a published table with no replica identity is one Postgres
+//     refuses to UPDATE — so a refusal that arrives afterwards has already
+//     let sluice break the operator's application.
+func TestMultiNamespaceReplicaIdentityRunsBeforeThePublicationExists(t *testing.T) {
+	const (
+		file      = "streamer_multidb.go"
+		preflight = "preflightMultiNamespaceReplicaIdentity"
+		snapshot  = "openMultiDatabaseSnapshotStreamWithOptionalSlot"
+		entry     = "coldStartMultiDatabase"
+	)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if ok && fd.Name.Name == entry && fd.Body != nil {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatalf("%s declares no %s — this gate has lost its subject", file, entry)
+	}
+
+	preflightAt, snapshotAt := token.NoPos, token.NoPos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name := ""
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			name = fun.Name
+		case *ast.SelectorExpr:
+			name = fun.Sel.Name
+		}
+		switch name {
+		case preflight:
+			if !preflightAt.IsValid() {
+				preflightAt = call.Pos()
+			}
+		case snapshot:
+			if !snapshotAt.IsValid() {
+				snapshotAt = call.Pos()
+			}
+		}
+		return true
+	})
+
+	if !preflightAt.IsValid() {
+		t.Fatalf("%s does not call %s — a multi-namespace sync would publish a keyless table and break the source application's UPDATE/DELETE (audit 2026-09-01 A2-4)",
+			entry, preflight)
+	}
+	// Anti-vacuity: if the snapshot open moved or was renamed, the ordering
+	// claim below is unverifiable and must fail rather than pass silently.
+	if !snapshotAt.IsValid() {
+		t.Fatalf("%s no longer calls %s, so the ordering this gate asserts cannot be checked — re-anchor it on whatever now creates the publication",
+			entry, snapshot)
+	}
+	if preflightAt > snapshotAt {
+		t.Errorf("%s calls %s AFTER %s (%s vs %s); the spanning snapshot creates the FOR ALL TABLES publication, so the refusal must come first or it arrives after sluice has already exposed the source application (audit 2026-09-01 A2-4)",
+			entry, preflight, snapshot, fset.Position(preflightAt), fset.Position(snapshotAt))
+	}
 }
