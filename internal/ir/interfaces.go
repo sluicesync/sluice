@@ -2916,6 +2916,21 @@ type MultiDatabaseSnapshotOpener interface {
 	OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, databases []string) (*SnapshotStream, error)
 }
 
+// MultiDatabaseSnapshotOpenerWithSlot is the OPTIONAL slot-named form of
+// [MultiDatabaseSnapshotOpener], the exact sibling of
+// [SnapshotStreamWithSlotOpener] one fan-out level up (audit 2026-09-01
+// A2-3). An engine whose spanning snapshot creates a durable replication
+// slot must honour `--slot-name` there for the same reason the
+// single-namespace opener does: the slot name is how two streams against
+// one database stay out of each other's way, and the name is recorded in
+// the CDC state row that later `add-table` and slot-health reads resolve.
+// Postgres implements it (its spanning snapshot IS a slot-based one);
+// MySQL does not — a binlog has no slot to name — so the orchestrator's
+// helper falls back to the unnamed opener with a DEBUG line.
+type MultiDatabaseSnapshotOpenerWithSlot interface {
+	OpenMultiDatabaseSnapshotStreamWithSlot(ctx context.Context, dsn string, databases []string, slotName string) (*SnapshotStream, error)
+}
+
 // UnloggedCapturePreflighter is the OPTIONAL engine surface for the
 // spanning-sync UNLOGGED-table census (capture-completeness G2,
 // 2026-08-26). A Postgres FOR ALL TABLES publication — the shape a
@@ -2986,6 +3001,19 @@ type UnloggedCapturePreflighter interface {
 // error (keyspace-scoped CDC is the Phase 1c N-stream design).
 type ServerCDCReaderOpener interface {
 	OpenServerCDCReader(ctx context.Context, dsn string) (CDCReader, error)
+}
+
+// ServerCDCReaderWithSlotOpener is the OPTIONAL slot-named form of
+// [ServerCDCReaderOpener] (audit 2026-09-01 A2-3), and the warm-resume
+// half of [MultiDatabaseSnapshotOpenerWithSlot]. Both halves are needed
+// or neither works: a cold start that creates a named slot and a warm
+// resume that reads the default one would resume from the wrong slot —
+// which, on Postgres, means resuming from whatever LSN that other slot
+// happens to sit at. Postgres implements it (a logical slot is already
+// database-wide, so this is the ordinary named-slot reader); engines
+// without slots do not, and the orchestrator's helper falls back.
+type ServerCDCReaderWithSlotOpener interface {
+	OpenServerCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (CDCReader, error)
 }
 
 // NamespaceFolder is the OPTIONAL surface a TARGET engine implements to

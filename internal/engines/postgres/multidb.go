@@ -209,14 +209,31 @@ func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCRead
 	return e.OpenCDCReaderWithSlot(ctx, dsn, defaultSlot)
 }
 
+// OpenServerCDCReaderWithSlot implements
+// [ir.ServerCDCReaderWithSlotOpener] (audit 2026-09-01 A2-3): the
+// warm-resume half of the multi-schema `--slot-name` fix. Its cold-start
+// sibling is [Engine.OpenMultiDatabaseSnapshotStreamWithSlot], and both
+// halves are load-bearing — a cold start that creates `x` and a warm
+// resume that reads `sluice_slot` would resume from whatever LSN the
+// other slot sits at, which is a silent position substitution rather
+// than a missing flag.
+func (e Engine) OpenServerCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (ir.CDCReader, error) {
+	if slotName == "" {
+		slotName = defaultSlot
+	}
+	return e.OpenCDCReaderWithSlot(ctx, dsn, slotName)
+}
+
 // compile-time assertions that the engine satisfies the ADR-0075 fan-out
 // interfaces. Phase 2a: DatabaseLister + DatabaseDSNDeriver. Phase 2b:
 // MultiDatabaseSnapshotOpener + ServerCDCReaderOpener (the CDC reader's
 // CDCDatabaseScoper and the applier's MultiDatabaseRouter are asserted
 // near their own implementations).
 var (
-	_ ir.DatabaseLister              = Engine{}
-	_ ir.DatabaseDSNDeriver          = Engine{}
-	_ ir.MultiDatabaseSnapshotOpener = Engine{}
-	_ ir.ServerCDCReaderOpener       = Engine{}
+	_ ir.DatabaseLister                      = Engine{}
+	_ ir.DatabaseDSNDeriver                  = Engine{}
+	_ ir.MultiDatabaseSnapshotOpener         = Engine{}
+	_ ir.ServerCDCReaderOpener               = Engine{}
+	_ ir.MultiDatabaseSnapshotOpenerWithSlot = Engine{}
+	_ ir.ServerCDCReaderWithSlotOpener       = Engine{}
 )

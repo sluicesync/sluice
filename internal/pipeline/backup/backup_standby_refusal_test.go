@@ -42,7 +42,7 @@ func (e *standbySnapshotEngine) OpenBackupSnapshot(context.Context, string, irba
 }
 
 func (e *standbySnapshotEngine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
-	return &countingRowReader{inner: &fakeRowReader{rows: e.backupRecorderEngine.rows}, n: &e.rowsRead}, nil
+	return &countingRowReader{inner: &fakeRowReader{rows: e.rows}, n: &e.rowsRead}, nil
 }
 
 type countingRowReader struct {

@@ -70,13 +70,33 @@ func (e Engine) OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName st
 // construction, and the reader-side inScope filter (wired by the
 // orchestrator via [CDCReader.SetCDCDatabaseScope]) does the selection.
 func (e Engine) OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, schemas []string) (*ir.SnapshotStream, error) {
+	return e.OpenMultiDatabaseSnapshotStreamWithSlot(ctx, dsn, schemas, "")
+}
+
+// OpenMultiDatabaseSnapshotStreamWithSlot implements
+// [ir.MultiDatabaseSnapshotOpenerWithSlot] (audit 2026-09-01 A2-3): the
+// same spanning snapshot as [Engine.OpenMultiDatabaseSnapshotStream],
+// with the operator's `--slot-name` honoured. It had been hardcoded to
+// defaultSlot here while the single-schema opener took the name, so a
+// multi-schema `sync start --slot-name x` created and then resumed
+// `sluice_slot` — two multi-schema streams against one database could
+// not coexist, and the slot name recorded in the CDC state row (which
+// `sync add-table` and the slot-health reads resolve) was wrong.
+//
+// An empty slotName means "the engine default", exactly as it does on
+// every other slot-named surface here.
+func (e Engine) OpenMultiDatabaseSnapshotStreamWithSlot(ctx context.Context, dsn string, schemas []string, slotName string) (*ir.SnapshotStream, error) {
 	if len(schemas) == 0 {
 		return nil, errors.New("postgres: multi-schema snapshot: no schemas selected")
 	}
+	if slotName == "" {
+		slotName = defaultSlot
+	}
 	slog.InfoContext(ctx, "postgres: opening single spanning consistent snapshot across selected schemas",
 		slog.Int("schema_count", len(schemas)),
-		slog.Any("schemas", schemas))
-	return e.openSnapshotStreamShared(ctx, dsn, defaultSlot, schemas)
+		slog.Any("schemas", schemas),
+		slog.String("slot", slotName))
+	return e.openSnapshotStreamShared(ctx, dsn, slotName, schemas)
 }
 
 // openSnapshotStreamShared is the shared body of the single-schema and

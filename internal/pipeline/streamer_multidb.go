@@ -293,7 +293,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// ---- 3. Open the SINGLE spanning consistent snapshot. One tx, one
 	// binlog position spanning ALL selected databases. This is the crux:
 	// the position handed to CDC below is captured at one consistent cut. ----
-	stream, err := opener.OpenMultiDatabaseSnapshotStream(ctx, s.SourceDSN, selected)
+	stream, err := openMultiDatabaseSnapshotStreamWithOptionalSlot(ctx, s.Source, opener, s.SourceDSN, selected, s.SlotName)
 	if err != nil {
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open multi-database snapshot stream: %w", err))
 	}
@@ -514,7 +514,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 	}
 
 	// Open the bare server-wide CDC reader (no snapshot, no copy).
-	cdc, err := opener.OpenServerCDCReader(ctx, s.SourceDSN)
+	cdc, err := openServerCDCReaderWithOptionalSlot(ctx, s.Source, opener, s.SourceDSN, s.SlotName)
 	if err != nil {
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: open server-wide cdc reader: %w", err))
 	}
@@ -934,4 +934,62 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	migcore.CloseIf(rw)
 	migcore.CloseIf(sw)
 	return nil
+}
+
+// openMultiDatabaseSnapshotStreamWithOptionalSlot is the fan-out sibling of
+// [openSnapshotStreamScoped]'s slot arm (audit 2026-09-01 A2-3). The
+// multi-namespace cold start had called the unnamed opener unconditionally,
+// so `--slot-name` reached the single-namespace path and nothing else: a
+// Postgres multi-schema `sync start --slot-name x` created `sluice_slot`
+// instead, two such streams against one database could not coexist, and the
+// name recorded in the CDC state row — what `sync add-table` and the
+// slot-health reads resolve later — named a slot the operator had not asked
+// for.
+//
+// An engine with no slot to name (MySQL: the binlog is the stream) does not
+// implement the surface and keeps the unnamed opener, logged at DEBUG the
+// same way the single-namespace helper logs it.
+func openMultiDatabaseSnapshotStreamWithOptionalSlot(
+	ctx context.Context,
+	source ir.Engine,
+	opener ir.MultiDatabaseSnapshotOpener,
+	dsn string,
+	databases []string,
+	slotName string,
+) (*ir.SnapshotStream, error) {
+	if slotName == "" {
+		return opener.OpenMultiDatabaseSnapshotStream(ctx, dsn, databases)
+	}
+	if named, ok := source.(ir.MultiDatabaseSnapshotOpenerWithSlot); ok {
+		return named.OpenMultiDatabaseSnapshotStreamWithSlot(ctx, dsn, databases, slotName)
+	}
+	slog.DebugContext(
+		ctx, "engine does not implement MultiDatabaseSnapshotOpenerWithSlot; --slot-name silently ignored",
+		slog.String("engine", source.Name()),
+	)
+	return opener.OpenMultiDatabaseSnapshotStream(ctx, dsn, databases)
+}
+
+// openServerCDCReaderWithOptionalSlot is the warm-resume half of the A2-3
+// fix, and the two halves are load-bearing together: a cold start that
+// created a named slot paired with a warm resume that opened the default one
+// would resume from whatever position that other slot sits at — a silent
+// position substitution, not merely an ignored flag.
+func openServerCDCReaderWithOptionalSlot(
+	ctx context.Context,
+	source ir.Engine,
+	opener ir.ServerCDCReaderOpener,
+	dsn, slotName string,
+) (ir.CDCReader, error) {
+	if slotName == "" {
+		return opener.OpenServerCDCReader(ctx, dsn)
+	}
+	if named, ok := source.(ir.ServerCDCReaderWithSlotOpener); ok {
+		return named.OpenServerCDCReaderWithSlot(ctx, dsn, slotName)
+	}
+	slog.DebugContext(
+		ctx, "engine does not implement ServerCDCReaderWithSlotOpener; --slot-name silently ignored",
+		slog.String("engine", source.Name()),
+	)
+	return opener.OpenServerCDCReader(ctx, dsn)
 }
