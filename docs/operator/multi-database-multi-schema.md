@@ -137,6 +137,8 @@ on MySQL.)
 
 ## The documented edges
 
+- **`--slot-name` applies to a multi-schema Postgres run, on both its cold start and its warm resume (since v0.139.0).** A logical slot is database-wide, so a spanning multi-schema sync uses exactly one — and before v0.139.0 the fan-out ignored the flag and always used the default name, which meant two multi-schema streams against one database could not coexist and the slot recorded in the CDC state row was not the one you named. Name a slot per stream when you run more than one.
+- **A multi-schema `sync start` refuses a table with no usable replica identity, before it publishes anything (since v0.139.0).** Postgres will not `UPDATE` or `DELETE` a published table that lacks one, so publishing first and checking later would break your own application's writes. The refusal carries `SLUICE-E-SOURCE-REPLICA-IDENTITY` and names the offending tables; the remedy is a primary key, a `REPLICA IDENTITY FULL`, or `--exclude-table`.
 - **Cross-database / cross-schema foreign keys are refused loudly.** A
   fan-out collects FKs and validates referents are inside the selected
   set; an out-of-scope FK fails loudly at the deferred FK pass (after the

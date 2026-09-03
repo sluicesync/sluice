@@ -591,6 +591,34 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     retained version, and never decoded before the DDL — still cannot
     refuse at its first boundary, and the intercepts treat that
     boundary as a cache prime rather than an ALTER.
+
+    *The class was wider than the pair — FIXED at the pipeline door,
+    audit 2026-09-01 SLM-5, v0.139.0.* The predicate required BOTH
+    sides of the ALTER to be in a zone family, so only the sibling
+    swap matched. Measured 2026-09-03 on mysql:8.0.46 and postgres:16,
+    a value stored at 2026-06-15 20:00:00 UTC altered under +09:00 /
+    Asia/Tokyo against a UTC control: MySQL `TIMESTAMP` to VARCHAR gave
+    `2026-06-16 05:00:00`, to DATE `2026-06-16` (crossing midnight), to
+    TIME `05:00:00`, to BIGINT `20260616050000`; the reverse casts into
+    `TIMESTAMP` shifted the stored instant by the same nine hours; PG
+    `timestamptz` to text/varchar/date behaved identically. All of them
+    forwarded unrefused. `ir.SessionZoneCast` now keys on
+    SESSION-NORMALISED — stored UTC, so rendering must pick a zone
+    (`timestamptz`, MySQL `TIMESTAMP`) — rather than on carries-a-zone,
+    because the same measurement showed `timetz` is NOT affected
+    (`timetz` to text/time was byte-identical under both zones: the
+    offset travels with each value) while `time` to `timetz` IS (an
+    offset is invented from the session). The widened predicate
+    CONTAINS the sibling one by construction, pinned, so no shipped
+    refusal was dropped; the scalar-to-array dimension carve-out is
+    inherited deliberately, since PG needs an explicit USING and a bare
+    forwarded ALTER therefore fails loudly rather than diverging. Scope,
+    stated: this is the PIPELINE door, reached when a boundary is
+    FORWARDED — the mode that re-casts the target rows. The two
+    reader-side first-boundary arms still carry only the sibling pair
+    (filed SLM-5c), and `ZoneSiblingSwap` still refuses `timetz` to
+    `time`, which measured NOT session-dependent (filed SLM-5b:
+    narrowing a shipped refusal is its own reviewed change).
     The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.
