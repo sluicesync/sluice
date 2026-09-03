@@ -83,12 +83,17 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if setter, ok := cdc.(schemaDeltaTargetApplySetter); ok {
 		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
 	}
-	// SLM-1, warm-resume mirror: the prior shape per table is the retained
-	// schema-history version in effect at the persisted position, loaded
-	// by phaseOpenChangeStream before this call (this function has no
-	// applier in hand). Without it the arming above is inert until the
-	// reader has emitted a boundary of its own.
-	s.wireReaderSchemaSeed(cdc)
+	// SLM-1, warm-resume mirror: the prior shape per table is the target's
+	// zone witness with the retained schema-history version as fallback
+	// (SLM-1b), through the loader phaseOpenChangeStream installed before
+	// this call (this function has no applier in hand). The loader runs
+	// only for a reader that accepts a seed, and its error is loud: the
+	// arming above is inert without a prior, and a resume that silently
+	// lost its prior would reopen the first-boundary window.
+	if err := s.wireReaderSchemaSeed(ctx, cdc); err != nil {
+		migcore.CloseIf(cdc)
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)
+	}
 	// ADR-0173 Phase 2: request UN-narrowed before-images for the filtered
 	// tables (row-move eval needs every OLD column); refuses if unsupported.
 	if err := s.applyFullBeforeImageTables(cdc); err != nil {

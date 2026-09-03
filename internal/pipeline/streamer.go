@@ -263,9 +263,12 @@ type Streamer struct {
 	Applier ir.ChangeApplier
 
 	// Mappings is the per-column type-override list from sluice.yaml.
-	// Consumed only on the cold-start path, where the schema-apply
-	// phase needs the rewritten types. Warm resume reuses the target
-	// schema as-is, so the field is ignored on that branch.
+	// Applied on the cold-start path, where the schema-apply phase
+	// needs the rewritten types. Warm resume reuses the target schema
+	// as-is and does not re-apply them; it does READ them (SLM-1b) to
+	// know which tables the target cannot witness for the reader's
+	// prior-shape seed — an overridden temporal column's target type
+	// is the override's family, not the source's.
 	Mappings []config.Mapping
 
 	// ExpressionMappings is the per-column generated-expression
@@ -1493,16 +1496,18 @@ type Streamer struct {
 	// completed).
 	coldStartSeedSnapshots []ir.SchemaSnapshot
 
-	// readerSchemaSeed is the prior shape per in-scope table handed to a
-	// CDC reader that implements [schemaSeedSetter] (SLM-1). On cold start
-	// it is the RAW source IR captured in [coldStartPrepareSchema] before
-	// any mapping runs — a mapped type is a TARGET type, and a reader that
-	// compared its own source projection against one would see a phantom
-	// swap on every overridden column. On warm resume it is the latest
-	// retained schema-history version per table ([loadRetainedSchemaSeed]).
-	// Consumed and cleared where the reader is wired, so each attempt
-	// derives its own.
-	readerSchemaSeed []*ir.Table
+	// readerSchemaSeed loads the prior shape per in-scope table handed to
+	// a CDC reader that implements [schemaSeedSetter] (SLM-1). On cold
+	// start it is the RAW source IR captured in [coldStartPrepareSchema]
+	// before any mapping runs — a mapped type is a TARGET type, and a
+	// reader that compared its own source projection against one would
+	// see a phantom swap on every overridden column. On warm resume it is
+	// the target's zone witness per table with the retained schema-history
+	// version as fallback ([loadWarmResumeSchemaSeed], SLM-1b). A loader
+	// rather than a value so the warm-resume target read runs only for a
+	// reader that accepts a seed. Consumed and cleared where the reader
+	// is wired, so each attempt derives its own.
+	readerSchemaSeed schemaSeedLoader
 
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
 	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`

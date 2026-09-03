@@ -380,23 +380,48 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 }
 
 // TestWireReaderSchemaSeed_HandsOffOnceAndClears pins the lifecycle: the
-// seed reaches a reader that accepts it, and is cleared so the next
-// attempt cannot inherit it.
+// seed reaches a reader that accepts it, and the loader is cleared so
+// the next attempt cannot inherit it; a reader without the surface never
+// runs the loader (SLM-1b: the warm-resume loader reads the TARGET's
+// catalog, and a Postgres source — which has no seed surface — must not
+// pay for, or fail on, a read it consumes nothing from); a loader error
+// is the caller's to surface, never swallowed.
 func TestWireReaderSchemaSeed_HandsOffOnceAndClears(t *testing.T) {
+	ctx := context.Background()
 	rec := &seedRecordingReader{}
-	s := &Streamer{readerSchemaSeed: []*ir.Table{zoneSwapPre()}}
-	s.wireReaderSchemaSeed(rec)
+	s := &Streamer{readerSchemaSeed: staticSchemaSeed([]*ir.Table{zoneSwapPre()})}
+	if err := s.wireReaderSchemaSeed(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
 	if len(rec.seed) != 1 || rec.seed[0].Name != "events" {
 		t.Fatalf("reader received %v; want the pending seed", rec.seed)
 	}
 	if s.readerSchemaSeed != nil {
 		t.Fatal("seed not cleared after hand-off; a warm resume after a cold start in the same process would inherit the cold-start prior")
 	}
-	// A reader without the surface is a no-op, and still clears.
-	s.readerSchemaSeed = []*ir.Table{zoneSwapPre()}
-	s.wireReaderSchemaSeed(&stubCDCReader{})
+
+	// A reader without the surface never runs the loader, and still clears.
+	loads := 0
+	s.readerSchemaSeed = func(context.Context) ([]*ir.Table, error) {
+		loads++
+		return []*ir.Table{zoneSwapPre()}, nil
+	}
+	if err := s.wireReaderSchemaSeed(ctx, &stubCDCReader{}); err != nil {
+		t.Fatal(err)
+	}
+	if loads != 0 {
+		t.Fatalf("loader ran %d time(s) for a reader without the seed surface; want 0 — the target-catalog read must be lazy", loads)
+	}
 	if s.readerSchemaSeed != nil {
 		t.Fatal("seed not cleared for a reader without the surface")
+	}
+
+	// A loader error reaches the caller.
+	s.readerSchemaSeed = func(context.Context) ([]*ir.Table, error) {
+		return nil, errors.New("target catalog unreachable")
+	}
+	if err := s.wireReaderSchemaSeed(ctx, &seedRecordingReader{}); err == nil {
+		t.Fatal("loader error swallowed; the armed refusal would silently lose its prior")
 	}
 }
 
@@ -528,7 +553,7 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	arming := 0
-	loaders := map[string]bool{}
+	loaders := map[string]map[string]bool{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -543,7 +568,8 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 			if !ok || fd.Body == nil {
 				continue
 			}
-			arms, seeds, loads := false, false, false
+			arms, seeds := false, false
+			called := map[string]bool{}
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				switch v := n.(type) {
 				case *ast.TypeAssertExpr:
@@ -553,13 +579,12 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 				case *ast.CallExpr:
 					switch fun := v.Fun.(type) {
 					case *ast.SelectorExpr:
+						called[fun.Sel.Name] = true
 						if fun.Sel.Name == "wireReaderSchemaSeed" {
 							seeds = true
 						}
 					case *ast.Ident:
-						if fun.Name == "loadRetainedSchemaSeed" {
-							loads = true
-						}
+						called[fun.Name] = true
 					}
 				}
 				return true
@@ -571,17 +596,25 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 					t.Errorf("%s arms the session-zone refusal (schemaDeltaTargetApplySetter) but never calls wireReaderSchemaSeed — armed and inert at every first boundary (SLM-1)", fn)
 				}
 			}
-			if loads {
-				loaders[fn] = true
-			}
+			loaders[fn] = called
 		}
 	}
 	// Anti-vacuity: the cold-start and warm-resume open paths both arm.
 	if arming < 2 {
 		t.Fatalf("found %d arming sites; floor 2 (coldStartBeginCDC, warmResume) — the walk is vacuous", arming)
 	}
-	if !loaders["streamer_run_phases.go::(*Streamer).phaseOpenChangeStream"] {
-		t.Errorf("phaseOpenChangeStream no longer loads the retained schema seed before dispatching to warmResume; loaders found: %v", loaders)
+	// The warm-resume dispatcher installs the loader, and the loader reads
+	// BOTH priors — the target witness and the history fallback (SLM-1b):
+	// a loader that dropped either would resume on a narrower prior with
+	// nothing failing.
+	if !loaders["streamer_run_phases.go::(*Streamer).phaseOpenChangeStream"]["warmResumeSchemaSeedLoader"] {
+		t.Errorf("phaseOpenChangeStream no longer installs warmResumeSchemaSeedLoader before dispatching to warmResume")
+	}
+	loader := loaders["schema_seed.go::(*Streamer).loadWarmResumeSchemaSeed"]
+	for _, want := range []string{"loadRetainedSchemaSeed", "loadTargetZoneWitness", "mergeWarmResumeSeed"} {
+		if !loader[want] {
+			t.Errorf("loadWarmResumeSchemaSeed no longer calls %s; the warm-resume prior lost one of its two witnesses", want)
+		}
 	}
 }
 
