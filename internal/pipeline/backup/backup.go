@@ -1304,6 +1304,34 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 		if b.ChainSlot {
 			return nil, nil, nil, func() {}, fmt.Errorf("backup: --chain-slot requested but the snapshot-anchored path is unavailable: %w", err)
 		}
+		// Bug 260 (v0.137.3 regression cycle): a source that refused the
+		// snapshot BECAUSE IT IS A READ-ONLY STANDBY must not degrade.
+		// The fallback's own post-sweep position capture cannot run on a
+		// standby either — it dies raw at CaptureBackupPosition with
+		// SQLSTATE 55000 AFTER every row has been copied, leaving an
+		// uncommitted manifest that `restore` then refuses. Degrading
+		// here spends the whole copy to reach a guaranteed failure.
+		//
+		// The alternative — copy the rows and deliberately record NO
+		// EndPosition, the shape an engine without a PositionCapturer
+		// already produces — was rejected: a positionless FULL root is
+		// extended "from now" with a WARN (see the v0.16.x
+		// compatibility branch in incremental.go), so it would trade
+		// this loud failure for a silent chain gap, which the tenets
+		// rank strictly worse. Offering it needs an explicit opt-in AND
+		// a refusal on extending a positionless root; filed, not built.
+		//
+		// Keyed on the shared error CODE, not an engine type: any engine
+		// that codes a standby refusal gets this door, and the pipeline
+		// imports no engine package (IR-first).
+		if ce, coded := sluicecode.FromError(err); coded && ce.Code == sluicecode.CodeCDCStandbySource {
+			return nil, nil, nil, func() {}, fmt.Errorf(
+				"backup: the source is a read-only standby, so this backup cannot record the CDC end position every "+
+					"manifest needs — the non-snapshot fallback would copy every row and then fail at position "+
+					"capture. Point --source at the PRIMARY endpoint (a standby remains a fine source for bulk "+
+					"`sluice migrate`): %w", err,
+			)
+		}
 		// Snapshot open failed (e.g. PG without `wal_level=logical`
 		// can't create the temporary anchor slot). v0.17.x's
 		// non-snapshot path is still a legitimate one-shot full-backup
