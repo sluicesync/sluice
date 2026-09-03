@@ -82,8 +82,9 @@ func TestConcurrentReader_AnchorNeverMutatesUnderRecovery(t *testing.T) {
 	}
 	// binlogFileBefore needs a *sql.DB; with db==nil the file_pos purge branch
 	// would panic — so override the anchor to GTID mode for THIS pure-anchor
-	// assertion (GTID skips the file purge probe). The file_pos purge path is
-	// covered by the integration test against a real DB.
+	// assertion (the GTID purge probe is skipped on a nil pool, and only
+	// there). Both purge probes are covered by integration tests against a
+	// real DB.
 	r.anchor.Mode = positionModeGTID
 	r.anchor.GTIDSet = "uuid:1-50"
 	r.anchor.File = ""

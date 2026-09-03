@@ -190,13 +190,21 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		_ = db.Close()
 		return nil, err
 	}
+	// Which arm the anchor takes (GTID set on a gtid_mode=ON source,
+	// file/pos otherwise), by the resolver every capture door shares —
+	// cdc_snapshot_position.go, SLM-4. Read before the FTWRL window.
+	useGTID, err := snapshotPositionMode(ctx, db, e.Flavor)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Acquire the consistent N-snapshot (FTWRL → N pinned CONSISTENT SNAPSHOT
 	// conns → record ONE binlog position P → UNLOCK). Extracted so the
 	// ADR-0111 re-snapshot recovery re-runs the EXACT same sequence on a fresh
 	// pool. errFTWRLUnavailable is the no-RELOAD signal → fall back to the
 	// SERIAL single-snapshot path (LOUD WARN, ADR-0101 §4); any other error
 	// already cleaned up the pool inside the helper.
-	conns, file, pos, serverUUID, err := acquireConsistentSnapshot(ctx, db, n)
+	conns, cut, serverUUID, err := acquireConsistentSnapshot(ctx, db, n, e.Flavor, useGTID)
 	if err != nil {
 		if errors.Is(err, errFTWRLUnavailable) {
 			// "Grant RELOAD" is a dead end on AWS RDS (the master user
@@ -239,12 +247,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// The ORIGINAL CDC anchor P. It is stamped onto stream.Position here and
 	// recorded on the reader; the ADR-0111 re-snapshot recovery NEVER advances
 	// it (the value-fidelity invariant). CopyCursors is empty at open.
-	anchor := e.stampMariaDBLineageAnchor(ctx, conns[0], binlogPos{
-		Mode:       positionModeFilePos,
-		File:       file,
-		Pos:        pos,
-		ServerUUID: serverUUID,
-	}, file, pos)
+	anchor := e.snapshotHandoffPosition(ctx, conns[0], cut, useGTID, serverUUID)
 	position, err := encodeBinlogPos(anchor)
 	if err != nil {
 		_ = cdcReader.(closer).Close()
@@ -291,12 +294,15 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		if derr != nil {
 			return nil, nil, "", 0, derr
 		}
-		rconns, rfile, rpos, _, aerr := acquireConsistentSnapshot(rctx, rdb, n)
+		// The re-snapshot's own position P′ feeds only the file/pos
+		// purge probe; a GTID-mode anchor's probe asks the server about
+		// the anchor's SET (recoverViaResnapshot), so no set is read here.
+		rconns, rcut, _, aerr := acquireConsistentSnapshot(rctx, rdb, n, e.Flavor, false)
 		if aerr != nil {
 			_ = rdb.Close()
 			return nil, nil, "", 0, aerr
 		}
-		return rconns, rdb, rfile, rpos, nil
+		return rconns, rdb, rcut.File, rcut.Pos, nil
 	}
 
 	// Honest connection-budget surfacing (no false auto-clamp — ADR-0101 §5 /
@@ -354,7 +360,8 @@ var errFTWRLUnavailable = errors.New("mysql: snapshot(concurrent): FLUSH TABLES 
 
 // acquireConsistentSnapshot runs the consistency-lynchpin sequence on db:
 // FTWRL → N pinned REPEATABLE-READ CONSISTENT SNAPSHOT connections → record
-// ONE binlog position (file, pos) → UNLOCK → read @@server_uuid. All N
+// ONE binlog position (file, pos — and the executed GTID set when useGTID,
+// at the same frozen instant) → UNLOCK → read @@server_uuid. All N
 // snapshots pin the SAME cut because the FTWRL is held across every START
 // TRANSACTION and the position read (ADR-0101 §2). It is the ONE place this
 // sequence lives so the initial open AND the ADR-0111 re-snapshot recovery
@@ -365,31 +372,31 @@ var errFTWRLUnavailable = errors.New("mysql: snapshot(concurrent): FLUSH TABLES 
 // (NOT db — the caller owns the pool) and returns the wrapped error. On
 // success the N pinned connections are live (each in its consistent-snapshot
 // transaction) and the caller owns their lifecycle.
-func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int) (conns []*sql.Conn, file string, pos uint32, serverUUID string, err error) {
+func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int, flavor Flavor, useGTID bool) (conns []*sql.Conn, cut snapshotCut, serverUUID string, err error) {
 	conn0, err := db.Conn(ctx)
 	if err != nil {
-		return nil, "", 0, "", fmt.Errorf("mysql: snapshot(concurrent): pin conn 0: %w", err)
+		return nil, snapshotCut{}, "", fmt.Errorf("mysql: snapshot(concurrent): pin conn 0: %w", err)
 	}
 	if _, err := conn0.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
 		_ = conn0.Close()
-		return nil, "", 0, "", fmt.Errorf("mysql: snapshot(concurrent): set isolation: %w", err)
+		return nil, snapshotCut{}, "", fmt.Errorf("mysql: snapshot(concurrent): set isolation: %w", err)
 	}
 	// FTWRL is the consistency lynchpin — never proceed with N independent
 	// snapshots if it fails (silent-inconsistency class, ADR-0101 §4).
 	if _, err := conn0.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
 		_ = conn0.Close()
-		return nil, "", 0, "", fmt.Errorf("%w: %w", errFTWRLUnavailable, err)
+		return nil, snapshotCut{}, "", fmt.Errorf("%w: %w", errFTWRLUnavailable, err)
 	}
 
 	// From here the FTWRL is HELD. Every failure path before UNLOCK releases it
 	// and closes the pinned conns accumulated so far.
 	conns = []*sql.Conn{conn0}
-	failUnlock := func(wrap error) ([]*sql.Conn, string, uint32, string, error) {
+	failUnlock := func(wrap error) ([]*sql.Conn, snapshotCut, string, error) {
 		_, _ = conn0.ExecContext(context.Background(), "UNLOCK TABLES")
 		for _, c := range conns {
 			_ = c.Close()
 		}
-		return nil, "", 0, "", wrap
+		return nil, snapshotCut{}, "", wrap
 	}
 
 	if _, err := conn0.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
@@ -413,7 +420,7 @@ func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int) (conns []
 
 	// Record the ONE binlog position inside the lock — the single CDC-resume
 	// anchor every reader shares (ADR-0101 §2 step 3).
-	file, pos, err = snapshotMasterStatus(ctx, conn0)
+	cut, err = captureSnapshotCut(ctx, conn0, flavor, useGTID)
 	if err != nil {
 		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): capture position: %w", err))
 	}
@@ -425,7 +432,7 @@ func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int) (conns []
 	if uerr := conn0.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&serverUUID); uerr != nil {
 		serverUUID = ""
 	}
-	return conns, file, pos, serverUUID, nil
+	return conns, cut, serverUUID, nil
 }
 
 // concurrentBinlogRows is the multi-snapshot RowReader (ADR-0101 §6): it

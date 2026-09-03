@@ -20,22 +20,23 @@
 // binlog-purge case is already pinned by
 // streamer_mysql_purged_integration_test.go.
 //
-// PHASE-A GROUND-TRUTH (code-traced + empirically confirmed below):
-// the MySQL snapshot→CDC handoff ALWAYS anchors the persisted
-// position in file/pos mode (cdc_snapshot.go captures SHOW MASTER
-// STATUS → positionModeFilePos), EVEN when the source runs
-// gtid_mode=ON. So the streamer's resume-validation path is
-// verifyBinlogFilePresent in BOTH gtid_mode=OFF and gtid_mode=ON
-// deployments. The GTID-set branch (verifyGTIDSetReachable) is
-// exercised only by a caller-supplied GTID position — covered at the
-// reader level in cdc_reader_gtid_position_loss_integration_test.go.
+// PHASE-A GROUND-TRUTH, as it stood when this file was written: the
+// MySQL snapshot→CDC handoff anchored the persisted position in
+// file/pos mode EVEN when the source ran gtid_mode=ON, so the
+// streamer's resume validation was verifyBinlogFilePresent in both
+// deployments. That was audit 2026-09-01's SLM-4 finding, fixed in
+// cdc_snapshot_position.go: the handoff now anchors a GTID set on a
+// gtid_mode=ON source, so the gtid_mode=ON cell below exercises the
+// GTID-set branch (verifyGTIDSetReachable) through the streamer, and
+// streamer_mysql_gtid_handoff_integration_test.go pins the anchor's
+// mode itself.
 //
 // This file covers the two PS-realistic streamer-level cases the
 // existing purge test does NOT:
 //
 //   - gtid_mode=ON + binlog purged past resume: confirms the
-//     file/pos fall-through still fires when the source runs GTID
-//     mode (the PS topology — PS/Vitess sources are GTID-mode).
+//     position-invalid fall-through still fires when the source runs
+//     GTID mode (the PS topology — PS/Vitess sources are GTID-mode).
 //   - Fresh-instance / node-replace: resume against a DIFFERENT
 //     MySQL instance carrying the same data but NO binlog history
 //     covering the persisted position (the PS "node replaced /
@@ -75,10 +76,10 @@ import (
 // startMySQLGTID boots a single MySQL container with binlog AND GTID
 // mode enabled. Sibling of startMySQLBinlog (file/pos-mode); the only
 // difference is --gtid-mode=ON --enforce-gtid-consistency=ON so the
-// source matches the PS/Vitess topology (GTID-mode). Note: the
-// streamer's snapshot handoff still persists a file/pos position even
-// here (Phase-A finding) — the value of the GTID-mode boot is
-// proving the file/pos fall-through is unaffected by gtid_mode=ON.
+// source matches the PS/Vitess topology (GTID-mode). The streamer's
+// snapshot handoff persists a GTID-set position here (SLM-4; it used to
+// persist file/pos regardless), so a resume against this source runs
+// the GTID arm of the position check.
 func startMySQLGTID(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
 
@@ -140,11 +141,12 @@ func startMySQLGTID(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) 
 // TestStreamer_MySQLGTIDMode_BinlogPurgedFallsThroughToColdStart is
 // the gtid_mode=ON counterpart of
 // TestStreamer_MySQLToMySQL_BinlogPurgedFallsThroughToColdStart. It
-// confirms the PS-realistic property: even when the source runs in
-// GTID mode (the PS/Vitess topology), the streamer's persisted
-// position is file/pos, and a binlog-retention-exceeded resume is
-// detected loudly (verifyBinlogFilePresent) → ADR-0022 cold-start →
-// data correct after (no gap, no dup).
+// confirms the PS-realistic property: when the source runs in GTID
+// mode (the PS/Vitess topology), the streamer's persisted position is
+// a GTID set (SLM-4), and a binlog-retention-exceeded resume —
+// gtid_purged advanced past the set — is detected loudly
+// (verifyGTIDSetReachable) → ADR-0022 cold-start → data correct after
+// (no gap, no dup).
 //
 //  1. Cold-start MySQL→MySQL (source in gtid_mode=ON); drive a CDC
 //     change so the persisted position is concrete.
@@ -274,7 +276,7 @@ func TestStreamer_MySQLGTIDMode_BinlogPurgedFallsThroughToColdStart(t *testing.T
 		t.Fatalf("post-recovery src != dst (gap or dup): src=%v dst=%v", srcPayloads, dstPayloads)
 	}
 	t.Logf("PHASE-B (gtid_mode=ON purge): recovery verified — src == dst (%d rows), exactly-once held; "+
-		"file/pos fall-through unaffected by gtid_mode=ON", len(srcPayloads))
+		"position-invalid fall-through fires on the GTID arm", len(srcPayloads))
 
 	resumeCancel()
 	select {

@@ -120,24 +120,12 @@ func captureMariaDBLineageAnchor(ctx context.Context, q rowQuerier, p binlogPos,
 	return p
 }
 
-// stampMariaDBLineageAnchor is the flavor-aware form of
-// [captureMariaDBLineageAnchor] for the sync snapshot openers, which build
-// file/pos anchors for every binlog flavor: a no-op unless the engine is
-// MariaDB, whose file/pos positions have no @@server_uuid to bind and take
-// the anchor instead. BINLOG_GTID_POS is a function of the binlog
-// content, so it is valid on the snapshot conn after the lock.
-func (e Engine) stampMariaDBLineageAnchor(ctx context.Context, q rowQuerier, p binlogPos, file string, pos uint32) binlogPos {
-	if e.Flavor != FlavorMariaDB {
-		return p
-	}
-	return captureMariaDBLineageAnchor(ctx, q, p, file, pos)
-}
-
 // verifyMariaDBLineage is the MariaDB arm of the resume check, for BOTH
-// position modes (a MariaDB sync cold start anchors in file/pos mode;
-// backups and from-now starts anchor in GTID mode — one binding covers
-// both). It runs the domain door first for GTID-mode positions, then the
-// anchor door; a position with no anchor passes with the WARN.
+// position modes: every capture door anchors in GTID mode since SLM-4
+// (cdc_snapshot_position.go), and a `sync` cold start persisted by
+// v0.138.0 or earlier is file/pos plus the same anchor — one binding
+// covers both. It runs the domain door first for GTID-mode positions,
+// then the anchor door; a position with no anchor passes with the WARN.
 func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 	if p.Mode == positionModeGTID {
 		if err := verifyMariaDBDomainsPresent(ctx, db, p.GTIDSet); err != nil {

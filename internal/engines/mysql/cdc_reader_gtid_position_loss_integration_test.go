@@ -6,17 +6,15 @@
 // Track 1c — Phase B item 1 (reader level): GTID-mode position-loss
 // detection via verifyGTIDSetReachable.
 //
-// Phase-A ground-truth: the streamer's snapshot→CDC handoff always
-// persists a file/pos position even on a gtid_mode=ON source (the
-// snapshot path captures SHOW MASTER STATUS → positionModeFilePos).
-// So the GTID branch of verifyPositionResumable —
+// Phase-A ground-truth, as it stood when this file was written: the
+// streamer's snapshot→CDC handoff persisted a file/pos position even on
+// a gtid_mode=ON source, so the GTID branch of verifyPositionResumable —
 // verifyGTIDSetReachable, which runs GTID_SUBSET(@@global.gtid_purged,
-// resume) — is reached ONLY when a caller hands the reader a GTID
-// position directly (position-from-manifest, or a reader opened at a
-// GTID bookmark). The streamer-level chaos tests
-// (streamer_mysql_position_loss_chaos_integration_test.go) cover the
-// file/pos fall-through; THIS test pins the GTID branch at the unit
-// of code that actually owns it: the CDC reader.
+// resume) — was reached only by a caller-supplied GTID position. That
+// was audit 2026-09-01's SLM-4 finding; since cdc_snapshot_position.go
+// the sync handoff anchors a GTID set on such a source, and the
+// streamer-level chaos tests reach this branch too. THIS test still
+// pins the GTID branch at the unit of code that owns it: the CDC reader.
 //
 // Oracle (loud-failure tenet floor): a resume against a GTID position
 // whose GTIDs have been purged past (the PlanetScale "down past

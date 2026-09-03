@@ -420,6 +420,16 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: set isolation: %w", err)
 	}
+	// Which arm the handoff position takes — GTID set on a gtid_mode=ON
+	// source, file/pos otherwise — decided by the same resolver every other
+	// capture door uses, BEFORE the freeze so the lock window stays as
+	// short as it was (cdc_snapshot_position.go, SLM-4).
+	useGTID, err := snapshotPositionMode(ctx, conn, e.Flavor)
+	if err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, err
+	}
 	// Freeze writes across the snapshot+position capture. Without this,
 	// there is a window between START TRANSACTION WITH CONSISTENT SNAPSHOT
 	// (which fixes the row view) and SHOW BINARY LOG STATUS (which fixes
@@ -491,15 +501,15 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// [resolveLockFreeCapturePosition] for the probe that reports whether
 	// the window actually caught anything, and for the one case where the
 	// duplicate side is not free either.
-	var prePos *binlogTip
+	var pre *snapshotCut
 	if !locked {
-		f, p, err := snapshotMasterStatus(ctx, conn)
+		c, err := captureSnapshotCut(ctx, conn, e.Flavor, useGTID)
 		if err != nil {
 			_ = conn.Close()
 			_ = db.Close()
 			return nil, fmt.Errorf("mysql: snapshot: capture position (lock-free pre-snapshot): %w", err)
 		}
-		prePos = &binlogTip{File: f, Pos: p}
+		pre = &c
 	}
 
 	if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
@@ -514,8 +524,9 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// Capture the position INSIDE the same transaction so it is
 	// guaranteed to refer to the snapshot's logical clock. SHOW BINARY
 	// LOG STATUS is the 8.4+ spelling; SHOW MASTER STATUS is the
-	// pre-8.4 fallback. Same shape as the standalone CDC reader.
-	file, pos, err := snapshotMasterStatus(ctx, conn)
+	// pre-8.4 fallback; on a GTID-mode source the executed set is read
+	// at the same instant. Same shape as the standalone CDC reader.
+	cut, err := captureSnapshotCut(ctx, conn, e.Flavor, useGTID)
 	if err != nil {
 		if locked {
 			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
@@ -529,15 +540,11 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// position — it is the far edge of the window, and comparing the two
 	// edges is what turns "we warned you something might have happened" into
 	// a statement about whether anything did.
-	if prePos != nil {
-		file, pos = resolveLockFreeCapturePosition(ctx, *prePos, binlogTip{File: file, Pos: pos})
+	if pre != nil {
+		cut = resolveLockFreeCapture(ctx, *pre, cut)
 	}
-	slog.InfoContext(
-		ctx, "mysql: snapshot: captured consistent snapshot and CDC handoff position",
-		"freeze", snapshotFreezeMode(locked),
-		"binlog_file", file,
-		"binlog_pos", pos,
-	)
+	logSnapshotHandoff(ctx, "mysql: snapshot: captured consistent snapshot and CDC handoff position",
+		snapshotFreezeMode(locked), cut, useGTID)
 
 	// Release the write freeze now that both the snapshot view and the
 	// binlog position are captured. The open transaction keeps the
@@ -584,12 +591,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		cr.SetCDCDatabaseList(databases)
 	}
 
-	position, err := encodeBinlogPos(e.stampMariaDBLineageAnchor(ctx, conn, binlogPos{
-		Mode:       positionModeFilePos,
-		File:       file,
-		Pos:        pos,
-		ServerUUID: serverUUID,
-	}, file, pos))
+	position, err := encodeBinlogPos(e.snapshotHandoffPosition(ctx, conn, cut, useGTID, serverUUID))
 	if err != nil {
 		_ = cdcReader.(closer).Close()
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")

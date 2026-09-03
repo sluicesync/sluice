@@ -562,15 +562,32 @@ func (r *concurrentBinlogRows) recoverViaResnapshot(ctx context.Context) error {
 
 	// The original anchor P must still be present in the source's binlog for
 	// CDC to replay from it. In file_pos mode, if P′ rotated to a strictly
-	// later file and P's file is gone, P is purged. (GTID-mode purge is caught
-	// later by verifyGTIDSetReachable on the CDC start — the existing loud
-	// ErrPositionInvalid path.)
-	if anchor.Mode == positionModeFilePos {
+	// later file and P's file is gone, P is purged. In GTID mode (a
+	// gtid_mode=ON source, SLM-4 — this arm was unreachable while the
+	// opener stamped file/pos unconditionally) the same question is asked
+	// the way the resume check asks it: GTID_SUBSET(@@gtid_purged, P). Both
+	// arms are an EARLY exit; the CDC start's own verifyPositionResumable
+	// re-asks either loudly, so a probe error here keeps the anchor and
+	// lets the copy finish rather than misclassifying a transient as a
+	// purge.
+	switch anchor.Mode {
+	case positionModeFilePos:
 		purged, perr := binlogFileBefore(ctx, db, anchor.File, p2File)
 		if perr == nil && purged {
 			closeConns(conns)
 			_ = db.Close()
 			return errBinlogPurgedDuringResnapshot
+		}
+	case positionModeGTID:
+		// db is nil only under TestConcurrentReader_AnchorNeverMutatesUnderRecovery,
+		// which drives the recovery with no pool to isolate the anchor
+		// invariant; a real re-snapshot always returns one.
+		if db != nil {
+			if perr := verifyGTIDSetReachable(ctx, db, anchor.GTIDSet); errors.Is(perr, ir.ErrPositionInvalid) {
+				closeConns(conns)
+				_ = db.Close()
+				return errBinlogPurgedDuringResnapshot
+			}
 		}
 	}
 

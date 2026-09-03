@@ -17,38 +17,51 @@ import (
 // than anything sluice reports about itself.
 
 // TestLockFreeCaptureWindow_ReturnsTheEarlierTip is the crux: whichever way
-// the window went, the handoff position is the PRE-snapshot tip. Returning
+// the window went, the handoff position is the PRE-snapshot cut. Returning
 // `post` is the ordering that loses a commit; there is no input for which
-// this function may return it.
+// this function may return it. The GTID-mode cells (SLM-4) pin that the
+// cut comes back WHOLE — a resolver that copied the pre tip but the post
+// executed set would hand a GTID-mode source the losing ordering while
+// every file/pos cell stayed green.
 func TestLockFreeCaptureWindow_ReturnsTheEarlierTip(t *testing.T) {
 	cases := []struct {
 		name      string
-		pre, post binlogTip
+		pre, post snapshotCut
 	}{
 		{
 			name: "quiet window (tip did not move)",
-			pre:  binlogTip{File: "binlog.000007", Pos: 4096},
-			post: binlogTip{File: "binlog.000007", Pos: 4096},
+			pre:  snapshotCut{File: "binlog.000007", Pos: 4096},
+			post: snapshotCut{File: "binlog.000007", Pos: 4096},
 		},
 		{
 			name: "commits inside the window (position advanced)",
-			pre:  binlogTip{File: "binlog.000007", Pos: 4096},
-			post: binlogTip{File: "binlog.000007", Pos: 9001},
+			pre:  snapshotCut{File: "binlog.000007", Pos: 4096},
+			post: snapshotCut{File: "binlog.000007", Pos: 9001},
 		},
 		{
 			name: "commits inside the window (binlog rotated)",
-			pre:  binlogTip{File: "binlog.000007", Pos: 4096},
-			post: binlogTip{File: "binlog.000008", Pos: 157},
+			pre:  snapshotCut{File: "binlog.000007", Pos: 4096},
+			post: snapshotCut{File: "binlog.000008", Pos: 157},
+		},
+		{
+			name: "gtid mode, quiet window",
+			pre:  snapshotCut{File: "binlog.000007", Pos: 4096, GTIDSet: "uuid:1-40"},
+			post: snapshotCut{File: "binlog.000007", Pos: 4096, GTIDSet: "uuid:1-40"},
+		},
+		{
+			name: "gtid mode, commits inside the window (set advanced with the tip)",
+			pre:  snapshotCut{File: "binlog.000007", Pos: 4096, GTIDSet: "uuid:1-40"},
+			post: snapshotCut{File: "binlog.000007", Pos: 9001, GTIDSet: "uuid:1-42"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			file, pos := resolveLockFreeCapturePosition(context.Background(), tc.pre, tc.post)
-			if file != tc.pre.File || pos != tc.pre.Pos {
-				t.Errorf("handoff position = %s:%d; want the PRE tip %s:%d. "+
-					"Handing back the later tip is the ordering where a commit inside the window lands in "+
+			got := resolveLockFreeCapture(context.Background(), tc.pre, tc.post)
+			if got != tc.pre {
+				t.Errorf("handoff cut = %+v; want the PRE cut %+v. "+
+					"Handing back the later cut is the ordering where a commit inside the window lands in "+
 					"neither the snapshot nor the CDC tail — the B-4 silent-loss case",
-					file, pos, tc.pre.File, tc.pre.Pos)
+					got, tc.pre)
 			}
 		})
 	}

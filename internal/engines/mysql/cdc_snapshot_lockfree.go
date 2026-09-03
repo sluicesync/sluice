@@ -49,9 +49,13 @@ func snapshotFreezeMode(locked bool) string {
 	return "none (lock-free fallback)"
 }
 
-// resolveLockFreeCapturePosition picks the CDC handoff position for a
-// lock-free capture and reports what the capture window actually caught.
-// It returns the PRE-snapshot tip — the duplicate side — always.
+// resolveLockFreeCapture picks the CDC handoff cut for a lock-free
+// capture and reports what the capture window actually caught. It
+// returns the PRE-snapshot cut — the duplicate side — always, in
+// whichever mode it was read: on a GTID-mode source the handoff is the
+// pre-snapshot executed set, and the probe below still compares the two
+// binlog TIPS, which is the half that moves for every commit
+// (cdc_snapshot_position.go says why the tip is read before the set).
 //
 // # Why pre, unconditionally
 //
@@ -85,8 +89,8 @@ func snapshotFreezeMode(locked bool) string {
 // commits to tables outside the sync's scope, so a moved tip means "the
 // server was writing", not necessarily "your rows were duplicated".
 // That asymmetry is the right one for a warning.
-func resolveLockFreeCapturePosition(ctx context.Context, pre, post binlogTip) (file string, pos uint32) {
-	if pre == post {
+func resolveLockFreeCapture(ctx context.Context, pre, post snapshotCut) snapshotCut {
+	if pre.tip() == post.tip() {
 		slog.InfoContext(
 			ctx,
 			"mysql: snapshot: lock-free capture window was quiet — the binlog tip did not move between the "+
@@ -95,7 +99,7 @@ func resolveLockFreeCapturePosition(ctx context.Context, pre, post binlogTip) (f
 			"binlog_file", pre.File,
 			"binlog_pos", pre.Pos,
 		)
-		return pre.File, pre.Pos
+		return pre
 	}
 	slog.WarnContext(
 		ctx,
@@ -111,5 +115,5 @@ func resolveLockFreeCapturePosition(ctx context.Context, pre, post binlogTip) (f
 		"binlog_file_after", post.File,
 		"binlog_pos_after", post.Pos,
 	)
-	return pre.File, pre.Pos
+	return pre
 }
