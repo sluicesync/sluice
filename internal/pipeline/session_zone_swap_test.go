@@ -61,8 +61,24 @@ func TestSessionZoneSiblingSwap_EveryFamilyAndShape(t *testing.T) {
 			if a.name == b.name {
 				continue
 			}
-			want := a.ok && b.ok && a.family == b.family && a.zoned != b.zoned
-			if want {
+			// Same array depth is a precondition for the whole class: a
+			// scalar ⇄ array change needs an explicit USING on Postgres, so a
+			// forwarded bare ALTER fails loudly rather than diverging.
+			sameDepth := strings.HasPrefix(a.name, "array:") == strings.HasPrefix(b.name, "array:")
+			// The sibling half (SL-2 / SLM-1): same family, zone differs.
+			sibling := a.ok && b.ok && a.family == b.family && a.zoned != b.zoned
+			// The SLM-5 half, measured 2026-09-03 on mysql:8.0.46 and
+			// postgres:16: a cast is session-dependent when exactly one side
+			// is SESSION-NORMALISED (stored UTC, rendered through the session
+			// zone — timestamptz / MySQL TIMESTAMP), or when the target
+			// carries a zone the source did not (an offset is invented, e.g.
+			// time → timetz). timetz is NOT session-normalised: it stores its
+			// offset per value, so timetz → text/time measured byte-identical
+			// under Asia/Tokyo and UTC.
+			normalised := func(m member) bool { return m.ok && m.zoned && strings.HasSuffix(m.family, "timestamp") }
+			zoneInvented := b.ok && b.zoned && (!a.ok || !a.zoned)
+			want := sibling || (sameDepth && (normalised(a) != normalised(b) || zoneInvented))
+			if sibling {
 				wantSwaps++
 			}
 			if got := sessionZoneSiblingSwap(a.typ, b.typ); got != want {

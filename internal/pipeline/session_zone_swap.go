@@ -40,8 +40,29 @@ import (
 // dimension change is not a swap either (PG needs an explicit USING to
 // express it, so a forwarded bare ALTER fails loudly rather than
 // diverging — mirrors the PG lane's own predicate).
+//
+// Widened for audit 2026-09-01 SLM-5 (measured 2026-09-03): the predicate
+// is now [ir.SessionZoneCast], which also covers a change where only ONE
+// side is a session-normalised timestamp — `TIMESTAMP` → VARCHAR / DATE /
+// TIME / BIGINT and the reverse, `timestamptz` → text / date, and `time` →
+// `timetz`. Those were measured to shift by the ALTER session's offset on
+// mysql:8.0.46 and postgres:16 exactly as the sibling swap does, and they
+// forwarded unrefused. [ir.SessionZoneCast] contains [ir.ZoneSiblingSwap]
+// by construction (pinned by ir.TestSessionZoneCast_NeverNarrowsZoneSiblingSwap),
+// so nothing this door refused before is now allowed through.
+//
+// SCOPE, stated so the name cannot be read wider than the truth: this is
+// the PIPELINE door, reached when a boundary is FORWARDED — which is the
+// mode that re-casts the target's pre-existing rows, so it is where the
+// widened class does its work. The two READER-side arms that refuse at a
+// table's first boundary (mysql.sessionTZSwapPair on its IR types,
+// postgres.sessionTZSwapPair on wire OIDs, with the seeded arm bound to
+// it) still carry only the sibling pair. Widening those means reshaping
+// the Postgres wire declaration from a pair list into a predicate over
+// "is this OID timestamptz", along with the test that binds the seeded
+// arm to it — filed as SLM-5c rather than half-done here.
 func sessionZoneSiblingSwap(prev, cur ir.Type) bool {
-	return ir.ZoneSiblingSwap(prev, cur)
+	return ir.SessionZoneCast(prev, cur)
 }
 
 // zoneFamily classifies a type as (temporal family, carries-a-zone) —
