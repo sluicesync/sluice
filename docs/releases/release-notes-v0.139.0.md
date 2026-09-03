@@ -28,7 +28,7 @@ Drop-in from v0.138.0. No flag change, no format change. One new error code, `SL
 
 New refusals on configurations that previously ran, each one a case that was losing or corrupting data quietly: a forwarded `ALTER` casting to or from `TIMESTAMP`; a `timestamp` to `timestamptz` swap made while a Postgres stream was stopped; a multi-schema `sync start` over a table with no usable replica identity; and `backup full` against a Postgres standby (`SLUICE-E-CDC-STANDBY-SOURCE`). A MariaDB resume whose anchor was purged now warns `UNVERIFIED-INSTANCE-IDENTITY` where it used to log an informational line, and proceeds as before.
 
-On a `gtid_mode=ON` MySQL source, a `sync` cold start now records a GTID position where it previously recorded a file and offset. Existing positions keep resuming on their original arm, so an upgrade needs nothing; the change takes effect at the next cold start.
+On a `gtid_mode=ON` MySQL source, a `sync` cold start now records a GTID position where it previously recorded a file and offset. Existing positions keep resuming on their original arm, so an upgrade needs nothing; the change takes effect at the next cold start. One corner is worth naming because it is a routine operator action: a GTID-mode source that has executed nothing, either a fresh server or one that has just had `RESET MASTER` run against it with its data intact, is anchored in file-and-offset mode with a warning. An empty GTID set is not something sluice can read back, and the file-and-offset anchor is exactly what earlier releases recorded there. The source moves onto the GTID arm by itself at the first capture after its next transaction.
 
 ## Who needs this
 

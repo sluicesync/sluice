@@ -291,3 +291,57 @@ func TestSyncSnapshotOpenersMariaDBAnchorGTID(t *testing.T) {
 			"INSERT INTO cdc_src.t1 VALUES ("+strconv.Itoa(next)+",'legacy-continuation')", legacyPos)
 	}
 }
+
+// TestSyncSnapshotOpenersOnGTIDModeSourceWithNothingExecuted is the cell
+// the SLM-4 matrix did not have, and the v0.139.0 pre-tag review found
+// the defect through its absence.
+//
+// `@@global.gtid_executed` is empty on a `gtid_mode=ON` server that has
+// executed nothing — a fresh server, or one that has just had
+// `RESET MASTER` run against it with its data intact, which is a routine
+// operator action (this file's own failover cell does it two functions
+// up). SLM-4's first cut stamped `{"mode":"gtid"}` there, which
+// `encodeBinlogPos` accepted and `decodeBinlogPos` rejects, so the
+// handoff failed with `gtid mode requires gtid_set` — AFTER the whole
+// cold copy, from an anchor already persisted, with an error that is not
+// ir.ErrPositionInvalid and therefore never reached the auto-resnapshot
+// route. v0.138.0 recorded file/pos here and worked.
+//
+// The assertion is deliberately the round trip and the stream, not the
+// arm: what matters is that whatever a door records can be read back and
+// resumed from. It would pass equally if a future change made the GTID
+// arm work with an empty set.
+func TestSyncSnapshotOpenersOnGTIDModeSourceWithNothingExecuted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	dsn, cleanup := startMySQLFamilyContainer(
+		t, ctx, "mysql:8.0", "slm4e", mysqlFilePosEnvs("slm4e"), mysqlGTIDBootCmd,
+	)
+	defer cleanup()
+	assertServerVar(t, ctx, dsn, "@@global.gtid_mode", "ON")
+	execSQL(t, ctx, dsn, `CREATE TABLE slm4e.t1 (id INT PRIMARY KEY, v TEXT)`)
+	execSQL(t, ctx, dsn, `INSERT INTO slm4e.t1 VALUES (1,'a')`)
+	// The operator action: wipe the binlog and its GTID state, keep the data.
+	execSQL(t, ctx, dsn, "RESET MASTER")
+	if got := globalVar(t, ctx, dsn, "gtid_executed"); strings.TrimSpace(got) != "" {
+		t.Fatalf("premise gone: @@gtid_executed is %q after RESET MASTER; this cell needs it EMPTY", got)
+	}
+
+	e := Engine{Flavor: FlavorVanilla}
+	for _, o := range slm4Openers {
+		t.Run(o.name, func(t *testing.T) {
+			pos := openSyncSnapshotFor(t, ctx, e, dsn, o)
+			// (1) The recorded anchor must DECODE. That is the half that
+			// failed: an unreadable token is persisted before anything
+			// notices, and every later resume re-reads the same one.
+			if _, _, err := decodeBinlogPos(pos); err != nil {
+				t.Fatalf("the anchor the %s opener recorded cannot be decoded: %v (token %q) — "+
+					"a capture door persisted a position sluice cannot read back", o.name, err, pos.Token)
+			}
+			// (2) And the stream must actually open from it and deliver.
+			deliversAfterResume(t, ctx, e, dsn, "empty-gtid-set/"+o.name,
+				"INSERT INTO slm4e.t1 VALUES ("+strconv.Itoa(100+len(o.name))+",'after')", pos)
+		})
+	}
+}

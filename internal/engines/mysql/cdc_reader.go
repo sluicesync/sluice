@@ -840,18 +840,26 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 		if err != nil {
 			return binlogPos{}, err
 		}
-		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
-		if r.flavor == FlavorMariaDB {
-			// Lineage anchor (v0.138.0, mariadb_lineage.go): a from-now
-			// start is a capture door too — every position this stream
-			// persists copies this anchor forward.
-			file, pos, err := masterStatus(ctx, r.db)
-			if err != nil {
-				return binlogPos{}, fmt.Errorf("mysql: SHOW MASTER STATUS: %w", err)
+		if set == "" {
+			// Empty executed set: resolve the file/pos arm below instead,
+			// so the stream never runs in GTID mode with a set its own
+			// codec cannot encode (positionFor would then emit an
+			// unreadable token for every event).
+			warnEmptyGTIDSetFallsBackToFilePos(ctx, "cdc from-now start")
+		} else {
+			bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
+			if r.flavor == FlavorMariaDB {
+				// Lineage anchor (v0.138.0, mariadb_lineage.go): a from-now
+				// start is a capture door too — every position this stream
+				// persists copies this anchor forward.
+				file, pos, err := masterStatus(ctx, r.db)
+				if err != nil {
+					return binlogPos{}, fmt.Errorf("mysql: SHOW MASTER STATUS: %w", err)
+				}
+				bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, pos)
 			}
-			bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, pos)
+			return bp, nil
 		}
-		return bp, nil
 	}
 	file, pos, err := masterStatus(ctx, r.db)
 	if err != nil {
@@ -2193,9 +2201,13 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 	case positionModeFilePos:
 		if r.flavor == FlavorMariaDB {
 			// MariaDB has no @@server_uuid, so the identity stamp below
-			// can never bind a MariaDB file/pos position (a sync cold
-			// start anchors MariaDB in file/pos mode). The lineage anchor
-			// is the binding for this flavor in both modes (v0.138.0).
+			// can never bind a MariaDB file/pos position. The lineage
+			// anchor is the binding for this flavor in both modes
+			// (v0.138.0). Since v0.139.0 (audit SLM-4) every MariaDB
+			// capture door anchors in GTID mode — gtidModeOnFor is
+			// unconditionally true for this flavor — so a file/pos
+			// MariaDB position reaching here was persisted by v0.138.0
+			// or earlier, or by the empty-executed-set fallback.
 			if err := verifyMariaDBLineage(ctx, r.db, p); err != nil {
 				return err
 			}

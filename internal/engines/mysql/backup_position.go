@@ -195,6 +195,28 @@ func backupPositionServerUUID(ctx context.Context, q rowQuerier, flavor Flavor) 
 // "captured-during-backup" and "post-backup" event windows. In
 // file/pos mode the cursor is a byte offset into the named binlog
 // file; the incremental's CDC reader resumes from that offset.
+// captureGTIDBackupPosition is the GTID arm of [SchemaReader.CaptureBackupPosition],
+// lifted out so the empty-executed-set case can fall through to the
+// file/pos arm instead of encoding an anchor the codec cannot read back
+// (see warnEmptyGTIDSetFallsBackToFilePos). set is non-empty by contract.
+func (r *SchemaReader) captureGTIDBackupPosition(ctx context.Context, set string) (ir.Position, error) {
+	bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
+	if r.flavor == FlavorMariaDB {
+		// Lineage anchor (v0.138.0): the binlog byte this set was read
+		// at, and the server's own GTID state there. See mariadb_lineage.go.
+		file, p, err := masterStatus(ctx, r.db)
+		if err != nil {
+			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: master status: %w", err)
+		}
+		bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, p)
+	}
+	pos, err := encodeBinlogPos(bp)
+	if err != nil {
+		return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
+	}
+	return pos, nil
+}
+
 func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.Position, error) {
 	if r.db == nil {
 		return ir.Position{}, errors.New("mysql: CaptureBackupPosition: reader not opened")
@@ -216,22 +238,13 @@ func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, _ string) (ir.
 		if err != nil {
 			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
 		}
-		bp := binlogPos{Mode: positionModeGTID, GTIDSet: set}
-		if r.flavor == FlavorMariaDB {
-			// Lineage anchor (v0.138.0): the binlog byte this set was
-			// read at, and the server's own GTID state there. See
-			// mariadb_lineage.go.
-			file, p, err := masterStatus(ctx, r.db)
-			if err != nil {
-				return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: master status: %w", err)
-			}
-			bp = captureMariaDBLineageAnchor(ctx, r.db, bp, file, p)
+		if set == "" {
+			// Empty executed set: fall through to the file/pos arm below
+			// rather than encode an anchor the codec cannot read back.
+			warnEmptyGTIDSetFallsBackToFilePos(ctx, "CaptureBackupPosition")
+		} else {
+			return r.captureGTIDBackupPosition(ctx, set)
 		}
-		pos, err := encodeBinlogPos(bp)
-		if err != nil {
-			return ir.Position{}, fmt.Errorf("mysql: CaptureBackupPosition: %w", err)
-		}
-		return pos, nil
 	}
 	file, p, err := masterStatus(ctx, r.db)
 	if err != nil {

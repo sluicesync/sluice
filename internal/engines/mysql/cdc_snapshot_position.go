@@ -109,12 +109,15 @@ func captureSnapshotCut(ctx context.Context, conn *sql.Conn, flavor Flavor, useG
 // capturing connection, since BINLOG_GTID_POS is asked about the byte
 // the cut was read at.
 func (e Engine) snapshotHandoffPosition(ctx context.Context, q rowQuerier, cut snapshotCut, useGTID bool, serverUUID string) binlogPos {
-	if useGTID {
+	if useGTID && cut.GTIDSet != "" {
 		p := binlogPos{Mode: positionModeGTID, GTIDSet: cut.GTIDSet}
 		if e.Flavor == FlavorMariaDB {
 			p = captureMariaDBLineageAnchor(ctx, q, p, cut.File, cut.Pos)
 		}
 		return p
+	}
+	if useGTID {
+		warnEmptyGTIDSetFallsBackToFilePos(ctx, "sync snapshot opener")
 	}
 	return binlogPos{
 		Mode:       positionModeFilePos,
@@ -139,5 +142,39 @@ func logSnapshotHandoff(ctx context.Context, msg, freeze string, cut snapshotCut
 		"binlog_file", cut.File,
 		"binlog_pos", cut.Pos,
 		"gtid_set", cut.GTIDSet,
+	)
+}
+
+// warnEmptyGTIDSetFallsBackToFilePos is the one explanation every capture
+// door shares when the source is in GTID mode but has executed nothing.
+//
+// `@@global.gtid_executed` is empty on a `gtid_mode=ON` server that has
+// never committed a transaction, and — the case that actually reaches
+// operators — on one that has just had `RESET MASTER` run against it with
+// its data intact. "No transactions yet" is a real, resumable state, and
+// go-mysql's StartSyncGTID accepts an empty set as "from the beginning of
+// history". sluice's own position CODEC does not: [decodeBinlogPos]
+// requires a non-empty `gtid_set`, so a `{"mode":"gtid"}` token encodes
+// happily and can never be read back (audit VF review of v0.139.0,
+// reproduced on mysql:8.0.46).
+//
+// That asymmetry is fixed on both sides. [encodeBinlogPos] now refuses
+// what decode would reject, so no door can persist an unreadable anchor;
+// and every door that RESOLVES the arm takes the file/pos shape here
+// instead, which is exactly what v0.138.0 recorded for this source and is
+// correct: with nothing executed, a binlog file and offset is the
+// resumable anchor, and the @@server_uuid stamped alongside it carries
+// the instance identity the GTID arm would have carried.
+//
+// The stream moves onto the GTID arm by itself at the next cold start
+// after the first transaction.
+func warnEmptyGTIDSetFallsBackToFilePos(ctx context.Context, door string) {
+	slog.WarnContext(
+		ctx, "mysql: the source is in GTID mode but has executed no transactions "+
+			"(@@global.gtid_executed is empty — a fresh server, or RESET MASTER); recording a binlog "+
+			"file/offset position for this capture instead of an empty GTID set, which sluice cannot "+
+			"read back. This is the same anchor shape v0.138.0 recorded here, and the next capture "+
+			"after the source's first transaction takes the GTID arm",
+		slog.String("door", door),
 	)
 }

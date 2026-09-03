@@ -160,6 +160,24 @@ func encodeBinlogPos(p binlogPos) (ir.Position, error) {
 	if p.Mode != positionModeGTID && p.Mode != positionModeFilePos {
 		return ir.Position{}, fmt.Errorf("mysql: encode binlog position: invalid mode %q", p.Mode)
 	}
+	// Encode must refuse exactly what decode refuses. [decodeBinlogPos]
+	// requires a non-empty gtid_set, but `gtid_set` is omitempty, so a
+	// GTID position with an empty set marshalled happily to
+	// `{"mode":"gtid"}` and could never be read back — a codec asymmetry
+	// that let a capture door persist an anchor which then failed at the
+	// NEXT open, after a whole cold copy, with an error that is not
+	// ir.ErrPositionInvalid and so never reached the auto-resnapshot
+	// route (found by the v0.139.0 pre-tag review on mysql:8.0.46 after a
+	// RESET MASTER). Every door that resolves the arm now falls back to
+	// file/pos on an empty set (warnEmptyGTIDSetFallsBackToFilePos); this
+	// is the belt that keeps a future one from reintroducing it.
+	if p.Mode == positionModeGTID && p.GTIDSet == "" {
+		return ir.Position{}, errors.New(
+			"mysql: encode binlog position: gtid mode with an empty gtid_set — this token could not be decoded again " +
+				"(sluice requires a non-empty set in gtid mode). A source in GTID mode that has executed nothing " +
+				"(a fresh server, or RESET MASTER) must be anchored in file/pos mode instead",
+		)
+	}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("mysql: encode binlog position: %w", err)

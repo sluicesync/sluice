@@ -80,7 +80,18 @@ func TestSessionZoneCast_MeasuredFamilyMatrix(t *testing.T) {
 		{"time -> VARCHAR", timen, text, false, "20:00:00 under both zones"},
 
 		// --- shapes that must NOT refuse, or a working configuration breaks ---
-		{"precision-only TIMESTAMP -> TIMESTAMP", tsz, tsz, false, "same type, no cast"},
+		// Precision-only, with DIFFERENT precisions — the cell that
+		// matters. The first cut compared tsz to itself, which asserted
+		// nothing about precision at all (v0.139.0 pre-tag review).
+		{"precision-only TIMESTAMP(3) -> TIMESTAMP(6)", Timestamp{WithTimeZone: true, Precision: 3}, Timestamp{WithTimeZone: true, Precision: 6}, false, "real ALTER measured: value preserved under +09:00"},
+		{"precision-only DATETIME(3) -> DATETIME(6)", DateTime{Precision: 3}, DateTime{Precision: 6}, false, "no zoned side at all"},
+		{"same type, no cast", tsz, tsz, false, "identity"},
+		// Multi-dimensional arrays: the only interesting input to the
+		// family-prefix stripping in sessionNormalized.
+		{"timestamptz[][] -> text[][]", Array{Element: Array{Element: tsz}}, Array{Element: Array{Element: text}}, true, "same mechanism two levels down"},
+		{"timetz[][] -> text[][]", Array{Element: Array{Element: timez}}, Array{Element: Array{Element: text}}, false, "offset travels with each value"},
+		{"timetz -> timestamptz", timez, tsz, true, "a date is invented from the session"},
+		{"timestamptz -> timetz", tsz, timez, true, "rendered through the session zone"},
 		{"DATETIME -> DATETIME", dt, dt, false, "same type"},
 		{"DATETIME -> VARCHAR", dt, text, false, "no zone on either side"},
 		{"VARCHAR -> DATE", text, date, false, "no zone on either side"},
