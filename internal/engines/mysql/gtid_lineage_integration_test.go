@@ -42,11 +42,13 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -429,7 +431,28 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		// start state, so this is a legitimate resume; MariaDB streams
 		// the 60 rows plus the continuation write. Drain and require
 		// the stream to be open and delivering.
+		//
+		// And it must SAY the lineage was not verified (Bug 261): the
+		// evidence this branch has — the oldest retained file above the
+		// anchor starts at a state covering the anchor's set — is exactly
+		// what a rebuilt colliding instance reproduces at a file boundary,
+		// and MariaDB has no second witness. v0.138.0 logged INFO
+		// "lineage confirmed" here and the regression cycle recorded a
+		// foreign instance's rows as a chain delta at exit 0 under it.
+		// Capturing WARN+ and requiring the marker is the pin: a revert
+		// to the INFO wording, or to a silent accept, fails this cell.
+		var warnLog bytes.Buffer
+		prevLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&warnLog, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		mustAccept(t, dsnP, "same-lineage/anchor-purged", capturedOnP)
+		slog.SetDefault(prevLogger)
+		if !strings.Contains(warnLog.String(), unverifiedInstanceIdentityMarker) {
+			t.Fatalf("anchor-purged resume proceeded WITHOUT the %s WARN — the branch is claiming a lineage it cannot verify (Bug 261). WARN+ log:\n%s",
+				unverifiedInstanceIdentityMarker, warnLog.String())
+		}
+		if strings.Contains(warnLog.String(), "lineage confirmed") {
+			t.Fatalf("anchor-purged resume still claims 'lineage confirmed' (Bug 261). WARN+ log:\n%s", warnLog.String())
+		}
 	})
 
 	t.Run("rotation while streaming moves the anchor to the new file", func(t *testing.T) {

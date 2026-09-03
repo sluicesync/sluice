@@ -52,8 +52,20 @@ import (
 //
 // A rebuilt instance whose binlog is byte-identical up to the anchor
 // reproduces the anchor and passes; with the anchor following rotations
-// that means reproducing A's live traffic byte for byte. And the purge
-// disambiguation accepts a wrong long-running host with the same
+// that means reproducing A's live traffic byte for byte. And once the
+// anchor's FILE has been purged there is no independent witness at all
+// (the 2026-08-01 rule: say so). The purge disambiguation can only show
+// that the oldest retained file above the anchor starts at a state
+// covering the anchor's set — consistent with a same-lineage purge, and
+// equally produced by a rebuilt instance whose numbering rotated past the
+// anchor and whose GTIDs collide at exactly that state at a file boundary
+// (Bug 261, observed by the v0.138.0 regression cycle: `backup
+// incremental` recorded the foreign rows as the chain's delta at exit 0
+// while this branch logged INFO "lineage confirmed"). The branch therefore
+// proceeds under the UNVERIFIED-INSTANCE-IDENTITY WARN, never a
+// confirmation, and refusing instead was rejected because the same
+// evidence is what a legitimate stop longer than binlog retention
+// produces. It also accepts a wrong long-running host with the same
 // server_id and domain whose OLDEST retained file happens to start inside
 // [anchor seq, resume seq] — measured shape: anchor (mb.000003, 4, 0-1-12)
 // absent on B, B's mb.000004:4 = "0-1-22", resume "0-1-30" retained on B →
@@ -169,8 +181,22 @@ func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 			return perr
 		}
 		if purged {
-			slog.InfoContext(ctx, "mariadb: cdc: the position's lineage anchor was purged by binlog retention on the "+
-				"same lineage; lineage confirmed from the oldest retained binlog's start state",
+			// Consistent with a same-lineage purge — NOT proof of one. A
+			// rebuilt instance whose numbering rotated past the anchor's
+			// file and whose GTIDs collide at exactly the anchor's set at
+			// that file boundary reads identically, and MariaDB offers no
+			// second witness (Bug 261, v0.138.0 regression cycle: observed,
+			// `backup incremental` recorded the foreign instance's rows as
+			// the chain's delta at exit 0 under the INFO this used to be).
+			// So this is the same UNVERIFIED marker the anchorless case
+			// carries, and the evidence is logged for the operator to judge.
+			slog.WarnContext(ctx, "mariadb: cdc: "+unverifiedInstanceIdentityMarker+": the position's lineage anchor "+
+				"file has been purged by binlog retention, so the anchor cannot be checked. The oldest retained binlog "+
+				"above it starts at a state that covers the anchor's set, which is consistent with a purge on the same "+
+				"lineage but is not proof of it: a rebuilt instance whose numbering rotated past the anchor and whose "+
+				"GTIDs collide at exactly that state reads the same, and MariaDB carries no instance identity to tell "+
+				"them apart. Proceeding; if this source was rebuilt or replaced, stop and take a fresh full backup or "+
+				"cold start instead",
 				slog.String("anchor", fmt.Sprintf("%s:%d", p.LineageFile, p.LineagePos)), slog.String("evidence", why))
 			return nil
 		}

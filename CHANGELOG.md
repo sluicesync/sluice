@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A MariaDB resume whose lineage anchor file has been purged now says it could not verify the instance, instead of claiming it did (Bug 261, silent, narrow).** v0.138.0's MariaDB anchor door handled an absent anchor file by checking that the oldest retained binlog above it starts at a GTID state covering the anchor's set, and logged INFO "lineage confirmed" when it did. That evidence is consistent with a purge on the same lineage but is not proof of one: the v0.138.0 regression cycle built a rebuilt instance with the same `server_id` and domain whose numbering had rotated past the anchor and whose GTIDs collided at exactly the anchor's state at a file boundary, and `backup incremental` recorded that instance's rows as the chain's delta at exit 0 under the INFO. MariaDB carries no instance identity, so there is no second witness to ask; the branch now proceeds under the `UNVERIFIED-INSTANCE-IDENTITY` WARN (the same marker an anchorless pre-v0.138.0 position carries) with the evidence in the message, and the operator doc lists it as the fifth source of that marker. Refusing instead was rejected because the identical evidence is what a legitimate stop longer than binlog retention produces on the same lineage. Stated residual: this shape remains undetectable on MariaDB; the marker is what makes it auditable.
+
 ## [0.138.0] - 2026-09-02
 
 The remediation batch for the 2026-09-01 blind audit: eight silent-data-loss classes closed, every one observed on a real server before it was fixed, plus one loud-but-wedging Postgres CDC recovery. **If you run MySQL or MariaDB sync or backup chains whose source can be replaced or rebuilt, a Vitess-backed source, a D1 source with primary-key-less tables, multi-schema Postgres sync, trigger-CDC, or `--redact` with schema-qualified rules, read the entry that names you.**
