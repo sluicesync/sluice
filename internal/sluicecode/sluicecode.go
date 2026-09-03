@@ -76,6 +76,14 @@ const (
 	CodeBulkCopyNoPaginationKey  Code = "SLUICE-E-BULKCOPY-NO-PAGINATION-KEY"
 	CodeBulkCopyRowCountMismatch Code = "SLUICE-E-BULKCOPY-ROW-COUNT-MISMATCH"
 
+	// Audit 2026-09-01 LA-2: the D1 reader's fixed 1,000-row page met an
+	// 8 MiB response cap that D1 does nothing to keep a response under
+	// (the "~1 MiB D1 cap" premise was false), so every table of rows wider
+	// than ~8 KB failed as `unexpected end of JSON input`. Pages are now
+	// sized in bytes and shrink to one row; RowTooLarge is the loud door
+	// for the one row that overflows the cap on its own, named by key.
+	CodeBulkCopyRowTooLarge Code = "SLUICE-E-BULKCOPY-ROW-TOO-LARGE"
+
 	// Audit 2026-08-11 C1-1: sluice's emitters only ever produce ONE SQL
 	// statement, and the restore path inlines RECORDED expression bodies
 	// from a backup manifest verbatim into that DDL before running it
@@ -582,6 +590,7 @@ var registry = map[Code]Info{
 	CodeBulkCopyTableFailed:      {ClassRuntime, "a table failed mid-bulk-copy; earlier tables lack secondary indexes"},
 	CodeBulkCopyNoPaginationKey:  {ClassRefusal, "the d1 reader refused a table with no unique orderable key it can keyset-paginate on (every implicit-rowid name shadowed by a declared column, or a WITHOUT ROWID table keyed only by a BLOB column) — refused rather than paginated on a non-unique column or by LIMIT/OFFSET"},
 	CodeBulkCopyRowCountMismatch: {ClassRefusal, "the d1 reader's server-side COUNT(*) before and after a table read agreed with each other but not with the rows pagination delivered — the reader lost or duplicated rows on a quiescent source"},
+	CodeBulkCopyRowTooLarge:      {ClassRefusal, "the d1 reader met a single row wider than its response cap even as a page of one — pages are sized in bytes and shrink to one row; the one row that still overflows is refused by key rather than decoded from a truncated body"},
 	CodeSchemaPermissionDenied:   {ClassRuntime, "target role lacks CREATE on the schema"},
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},

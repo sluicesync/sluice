@@ -49,6 +49,25 @@ Contract preservation (the load-bearing details):
 This is RTT-hiding only, **not** within-table chunking — D1 within-table chunking
 parallelism remains the deferred follow-up noted at `d1PageSize`.
 
+**Amended 2026-09-02 (audit 2026-09-01 LA-2):** "one WAN RTT per 1000-row page" is
+now "per page", and a page is sized in BYTES, not rows — see ADR-0132's LA-2
+amendment to its decision §6 for the measurement and the controller. What changes in
+this loop: the fetcher probes the widest candidate row before the first page
+(`probeMaxRowWidth`), sizes each later page from the previous page's measured
+response bytes (`queryRowsSized` → `pageRowsFor`), and on an over-cap page
+(`d1ResponseTooLargeError`) halves and re-requests it at the SAME keyset bound before
+handing anything over — so the consumer never sees the retry, the "one page of
+read-ahead" memory bound now means at most `pageByteBudget` (4 MiB) plus one page in
+flight rather than 1,000 rows of unknown width, and the terminal-page test
+(`len(rows) < pageSize`) compares against the size REQUESTED for that page. `d1PageSize`
+= 1,000 is the ceiling, so ordinary tables still prefetch exactly as this ADR
+describes. Every contract above is unchanged: in-sequence error surfacing (the
+one-row `SLUICE-E-BULKCOPY-ROW-TOO-LARGE` refusal rides the final page's `err` like the
+LA-3 verdict), the explicit `final` marker, the fetcher reaped on every return path,
+and the stage-local leg (addendum below) inherits all of it by construction —
+`stageD1Table` drives the same `fetchPages`, pinned by the stage cells of
+`TestD1RowReader_RowTooLargeRefusedByName` and `TestD1Verify_WideRowsPageByBytes`.
+
 ## Coverage declaration (perf-parity matrix)
 
 Reached: the D1-source page-read path, which serves both **MIG** (D1 as a migrate

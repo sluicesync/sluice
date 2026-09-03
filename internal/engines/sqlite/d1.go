@@ -73,10 +73,17 @@ const (
 // client at an httptest.Server (ADR-0132: "make the endpoint base injectable").
 const defaultD1EndpointBase = "https://api.cloudflare.com/client/v4"
 
-// d1MaxResponseBytes bounds how much of a D1 response body is read.
-// Cloudflare caps D1 query responses at ~1 MiB, so 8 MiB is generous for
-// every legitimate response while an unbounded io.ReadAll against a
-// misdirected endpoint can't exhaust memory.
+// d1MaxResponseBytes bounds how much of a D1 response body is read. It is
+// SLUICE'S memory bound, not D1's: the earlier premise that "Cloudflare caps
+// a D1 response at ~1 MiB" was FALSE (audit 2026-09-01 LA-2 — a 12,000,669-byte
+// response was observed, and the Phase A measurement on real D1 on 2026-09-02
+// returned a 1,000-row page of 16 KiB BLOBs as 32,839,264 bytes at HTTP 200,
+// chunked, uncompressed). So nothing upstream keeps a response under this cap;
+// the row reader's page controller does, by sizing every page against
+// [d1PageByteBudget] and shrinking on overflow. A response that still exceeds
+// the cap is refused as a named [d1ResponseTooLargeError], never decoded from
+// a truncated body (which read as the misleading `unexpected end of JSON
+// input`).
 const d1MaxResponseBytes = 8 << 20
 
 // d1Engine is the Cloudflare D1 implementation of [ir.Engine]. Like the file
@@ -185,6 +192,35 @@ type d1Client struct {
 	// dateEnc is the per-source temporal encoding resolved from the DSN
 	// (ADR-0129); dateEncodingInherit is folded to the engine default at OpenRowReader (task 2.5), else ISO.
 	dateEnc dateEncoding
+
+	// maxResponseBytes overrides the response cap; 0 means [d1MaxResponseBytes].
+	// It exists so tests can drive the overflow path (and the page controller
+	// that guards it) with small bodies instead of 8 MiB ones.
+	maxResponseBytes int
+}
+
+// responseCap is the configured response cap, defaulting to [d1MaxResponseBytes].
+func (c *d1Client) responseCap() int {
+	if c.maxResponseBytes > 0 {
+		return c.maxResponseBytes
+	}
+	return d1MaxResponseBytes
+}
+
+// d1ResponseTooLargeError is the named refusal for a response body longer
+// than the client's cap. It is a distinct type so the row reader's page
+// controller can recognise an over-budget page and shrink it, while every
+// other caller (the catalog reads, the `d1-trigger` change-log poll) surfaces
+// it loudly with the cap named — before LA-2 the same event decoded a
+// truncated body and reported `unexpected end of JSON input`, which said
+// neither what happened nor what to do.
+type d1ResponseTooLargeError struct {
+	database string
+	limit    int
+}
+
+func (e *d1ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("d1: response from database %q exceeded sluice's %d-byte response cap", e.database, e.limit)
 }
 
 // openD1Client parses a d1:// DSN, resolves the env-only token and the account
@@ -330,14 +366,23 @@ type d1RequestBody struct {
 // error text — never a silent empty result (an empty result set is a valid,
 // distinct outcome and returns nil, nil).
 func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) ([]d1Row, error) {
+	rows, _, err := c.queryRowsSized(ctx, sql, params...)
+	return rows, err
+}
+
+// queryRowsSized is [queryRows] that also reports the response body's length
+// in bytes — the measurement the row reader's page controller sizes the next
+// page from (bytes per row of THIS page, not an estimate). A body longer than
+// [responseCap] is refused as a [d1ResponseTooLargeError] without decoding.
+func (c *d1Client) queryRowsSized(ctx context.Context, sql string, params ...string) (rows []d1Row, bodyBytes int, err error) {
 	reqBody, err := json.Marshal(d1RequestBody{SQL: sql, Params: params})
 	if err != nil {
-		return nil, fmt.Errorf("d1: marshal request: %w", err)
+		return nil, 0, fmt.Errorf("d1: marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.queryURL(), bytes.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("d1: build request: %w", err)
+		return nil, 0, fmt.Errorf("d1: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
@@ -350,22 +395,27 @@ func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) 
 		// terminating the stream (ground-truthed 2026-07-22 — see
 		// triggercdc.IsTransientTransportError). A non-transient shape is
 		// returned unchanged and stays terminal.
-		return nil, triggercdc.ClassifyTransient(
+		return nil, 0, triggercdc.ClassifyTransient(
 			fmt.Errorf("d1: query database %q: %w", c.databaseID, err),
 		)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Bound the read: Cloudflare caps a D1 response at ~1 MiB, so 8 MiB is
-	// generous headroom while a misdirected/hostile endpoint can't balloon
-	// memory (the same cap the PlanetScale telemetry client uses).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, d1MaxResponseBytes))
+	// Bound the read at the cap (D1 itself imposes none — see
+	// [d1MaxResponseBytes]) so a misdirected/hostile endpoint, or a page the
+	// controller mis-sized, can't balloon memory. One byte past the cap is
+	// read so an over-cap body is RECOGNISED rather than silently truncated.
+	limit := c.responseCap()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		// A truncated/reset response body mid-read is the same transient class
 		// as a failed dial — classify it so the CDC poll retries.
-		return nil, triggercdc.ClassifyTransient(
+		return nil, 0, triggercdc.ClassifyTransient(
 			fmt.Errorf("d1: read response from database %q: %w", c.databaseID, err),
 		)
+	}
+	if len(body) > limit {
+		return nil, 0, &d1ResponseTooLargeError{database: c.databaseID, limit: limit}
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -376,27 +426,27 @@ func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) 
 		// means the REQUEST is wrong (bad token, missing database, malformed
 		// statement) stays terminal so a real misconfiguration fails loudly.
 		if triggercdc.RetriableHTTPStatus(resp.StatusCode) {
-			return nil, triggercdc.AsTransient(statusErr)
+			return nil, 0, triggercdc.AsTransient(statusErr)
 		}
-		return nil, statusErr
+		return nil, 0, statusErr
 	}
 
 	var env d1Envelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("d1: decode response from database %q: %w (body: %s)",
+		return nil, 0, fmt.Errorf("d1: decode response from database %q: %w (body: %s)",
 			c.databaseID, err, truncateForError(body))
 	}
 	if !env.Success || len(env.Errors) > 0 {
-		return nil, fmt.Errorf("d1: query database %q refused: %s",
+		return nil, 0, fmt.Errorf("d1: query database %q refused: %s",
 			c.databaseID, formatD1Errors(env.Errors))
 	}
 	if len(env.Result) == 0 {
-		return nil, fmt.Errorf("d1: query database %q returned no result block", c.databaseID)
+		return nil, 0, fmt.Errorf("d1: query database %q returned no result block", c.databaseID)
 	}
 	if !env.Result[0].Success {
-		return nil, fmt.Errorf("d1: query database %q: statement reported failure", c.databaseID)
+		return nil, 0, fmt.Errorf("d1: query database %q: statement reported failure", c.databaseID)
 	}
-	return env.Result[0].Results, nil
+	return env.Result[0].Results, len(body), nil
 }
 
 // ping issues a trivial query to verify the endpoint, account, database, and

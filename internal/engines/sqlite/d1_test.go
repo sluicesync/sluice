@@ -136,14 +136,45 @@ func isD1CountQuery(sqlStr string) bool {
 	return strings.HasPrefix(sqlStr, "SELECT CAST(COUNT(*) AS TEXT)")
 }
 
-// withCount answers the LA-3 COUNT(*) bracket with n and delegates every other
-// query to h. A canned-page mock has to declare the total it serves: the reader
-// refuses a read whose delivered total disagrees with a stable count, so a mock
-// that answered the count with a data page would fail every read.
+// isD1WidthProbe reports whether sql is the LA-2 row-width probe the row
+// reader issues before its first page (the MAX of the estimated response
+// bytes over the first page's candidate rows).
+func isD1WidthProbe(sqlStr string) bool {
+	return strings.HasPrefix(sqlStr, "SELECT CAST(COALESCE(MAX(w), 0) AS TEXT)")
+}
+
+// d1WidthProbeAnswer renders the row-width probe's one-row result.
+func d1WidthProbeAnswer(width int64) []byte {
+	return d1OK([]map[string]any{{"w": strconv.FormatInt(width, 10)}})
+}
+
+// withCount answers the LA-3 COUNT(*) bracket with n, the LA-2 row-width
+// probe with 0 (unknown width → the full page, so a canned-page mock keeps
+// its page size), and delegates every other query to h. A canned-page mock
+// has to declare the total it serves: the reader refuses a read whose
+// delivered total disagrees with a stable count, so a mock that answered the
+// count with a data page would fail every read. A mock that wants the page
+// controller to SHRINK answers the probe itself, before delegating here (see
+// withWidth).
 func withCount(n int, h d1Handler) d1Handler {
 	return func(sql string, params []string) (int, []byte) {
 		if isD1CountQuery(sql) {
 			return http.StatusOK, d1OK([]map[string]any{{"n": strconv.Itoa(n)}})
+		}
+		if isD1WidthProbe(sql) {
+			return http.StatusOK, d1WidthProbeAnswer(0)
+		}
+		return h(sql, params)
+	}
+}
+
+// withWidth answers the LA-2 row-width probe with width (estimated response
+// bytes of the widest first-page row) and delegates every other query to h.
+// Wrap it OUTSIDE withCount so its answer wins over withCount's 0.
+func withWidth(width int64, h d1Handler) d1Handler {
+	return func(sql string, params []string) (int, []byte) {
+		if isD1WidthProbe(sql) {
+			return http.StatusOK, d1WidthProbeAnswer(width)
 		}
 		return h(sql, params)
 	}

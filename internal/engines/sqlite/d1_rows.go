@@ -33,15 +33,18 @@ type D1RowReader struct {
 	client  *d1Client
 	dateEnc dateEncoding
 
-	// pageSize overrides the keyset page size; 0 means [d1PageSize]. It exists
-	// so tests can force multi-page stitching without staging d1PageSize rows.
+	// pageSize overrides the maximum keyset page size; 0 means [d1PageSize].
+	// It exists so tests can force multi-page stitching without staging
+	// d1PageSize rows. The page controller still shrinks pages below it when
+	// the rows are wide (see [pageRowsFor]).
 	pageSize int
 
 	mu  sync.Mutex
 	err error
 }
 
-// effectivePageSize is the configured page size, defaulting to [d1PageSize].
+// effectivePageSize is the configured maximum page size, defaulting to
+// [d1PageSize].
 func (r *D1RowReader) effectivePageSize() int {
 	if r.pageSize > 0 {
 		return r.pageSize
@@ -49,11 +52,192 @@ func (r *D1RowReader) effectivePageSize() int {
 	return d1PageSize
 }
 
-// d1PageSize bounds each keyset page so a response stays under D1's
-// response-size limit (D1 caps a query response at ~1 MB / 100 MB depending on
-// plan; a modest page keeps well clear and bounds memory). It is deliberately
-// const — within-table chunking parallelism is a deferred follow-up.
+// d1PageSize is the MAXIMUM rows per keyset page — the page a table of
+// ordinary (sub-kilobyte) rows gets, exactly as before audit LA-2. It is not
+// what keeps a response under the transport's cap: pages are sized in BYTES by
+// [pageRowsFor] against [pageByteBudget], and this is only the ceiling that
+// bounds per-page memory and the prefetch's one-page read-ahead for narrow
+// rows. Within-table chunking parallelism remains a deferred follow-up.
 const d1PageSize = 1000
+
+// pageByteBudget is the response size a page is sized to stay under: half the
+// client's cap ([d1MaxResponseBytes]). The gap is the controller's headroom —
+// page N+1 is sized from page N's measured bytes per row, so rows may double
+// in width between two pages before a page overflows the cap and has to be
+// re-requested smaller. Half costs no throughput: measured on real D1
+// (2026-09-02, 16 KiB BLOB rows) the transport ran at its full ~13–15 MB/s
+// for every page of 3 MB or more, and a 4 MiB page hides the ~50 ms RTT as
+// well as a 32 MB one did.
+func pageByteBudget(responseCap int) int64 {
+	return int64(responseCap / 2)
+}
+
+// pageRowsFor is the page controller's one rule: how many rows of the given
+// response width (bytes per row — a server-side estimate for the first page,
+// the previous page's measured value after that) fit the byte budget. At most
+// maxRows, so rows narrower than budget/maxRows page exactly as before LA-2;
+// at least 1, so a row wider than the budget is still requested, as a page
+// of one — whether THAT fits is decided by the cap (twice the budget), and a
+// row the cap cannot hold is refused by name in [fetchPages]. A zero or
+// negative width means "unknown, or an empty table" and takes the full page.
+func pageRowsFor(width, budget int64, maxRows int) int {
+	if width <= 0 {
+		return maxRows
+	}
+	n := budget / width
+	switch {
+	case n < 1:
+		return 1
+	case n > int64(maxRows):
+		return maxRows
+	default:
+		return int(n)
+	}
+}
+
+// rowWidthExpr renders the SQL estimate of one row's size in a query-API
+// response: per column, the byte length of the value as [buildD1Projection]
+// renders it — `hex()` doubles a BLOB, a NULL costs its four-letter literal,
+// text and numbers cost their bytes (`CAST(… AS BLOB)` so an embedded NUL
+// does not stop the count short) — plus the fixed JSON framing of each cell
+// (column name, typeof alias and class, quotes and separators). It is an
+// ESTIMATE: JSON escaping can inflate a text (each `"`/`\` doubles, a control
+// character becomes `\u00XX`), and the controller's 2× headroom plus its
+// overflow retry absorb that. Measured on real D1 (2026-09-02): 32,772
+// estimated vs 32,839 actual bytes per 16 KiB-BLOB row.
+func rowWidthExpr(table *ir.Table, plan pagePlan) string {
+	overhead := len(`{},`)
+	parts := make([]string, 0, len(table.Columns))
+	for i, c := range table.Columns {
+		q := quoteIdent(c.Name)
+		parts = append(parts,
+			"COALESCE(CASE typeof("+q+") WHEN 'blob' THEN 2 * LENGTH("+q+") ELSE LENGTH(CAST("+q+" AS BLOB)) END, 4)")
+		// `"<name>":"…","<typeofAlias>":"integer",` around the value bytes.
+		overhead += len(c.Name) + len(plan.typeofAliases[i]) + len(`"":"","":"",`) + len("integer")
+	}
+	if plan.useRowid {
+		// `"<rowidAlias>":"<rowid digits>",` — a rowid is at most 20 digits.
+		overhead += len(plan.rowidAlias) + len(`"":"",`) + 20
+	}
+	return strconv.Itoa(overhead) + " + " + strings.Join(parts, " + ")
+}
+
+// probeMaxRowWidth returns the estimated response bytes of the WIDEST row
+// among the first page's candidates — the first maxRows rows in keyset order
+// — so the first page can be sized to fit whatever those rows hold. It is MAX
+// rather than an average because there is no measured page before the first;
+// from the second page on the previous page's measured bytes per row take
+// over ([fetchPages]). Cost: one LENGTH() pass over at most maxRows rows
+// through the keyset index — 57 ms for 1,000 rows of 16 KiB BLOBs on real D1
+// (2026-09-02). An empty table probes as 0 (the full page is requested and
+// comes back empty). Every failure is loud; there is no fall-through to a
+// blind full-size page.
+func (r *D1RowReader) probeMaxRowWidth(ctx context.Context, table *ir.Table, plan pagePlan, maxRows int) (int64, error) {
+	qualified := qualifiedKeyCols(table.Name, plan.orderCols)
+	sql := "SELECT CAST(COALESCE(MAX(w), 0) AS TEXT) AS w FROM (SELECT " + rowWidthExpr(table, plan) +
+		" AS w FROM " + quoteIdent(table.Name) + " ORDER BY " + strings.Join(qualified, ", ") +
+		" LIMIT " + strconv.Itoa(maxRows) + ")"
+	rows, err := r.client.queryRows(ctx, sql)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) != 1 {
+		return 0, fmt.Errorf("row-width probe returned %d rows; want 1", len(rows))
+	}
+	text, ok, err := jsonString(rows[0]["w"])
+	if err != nil {
+		return 0, fmt.Errorf("row-width probe result is not a text scalar: %w", err)
+	}
+	if !ok {
+		return 0, errors.New("row-width probe result is NULL")
+	}
+	w, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("row-width probe result %q: %w", text, err)
+	}
+	return w, nil
+}
+
+// rowTooLargeHint is the remedy carried by [sluicecode.CodeBulkCopyRowTooLarge].
+const rowTooLargeHint = "shrink or NULL the row's oversized values at the source, exclude the table (--exclude-table), or migrate it through `wrangler d1 export` + `sluice migrate --source-driver sqlite`, which streams the file and has no per-response cap"
+
+// rowTooLarge is the coded refusal for a single row the response cap cannot
+// hold — reached only after the page controller has shrunk the page to one
+// row and that one row still overflowed. The row is the next in keyset order
+// after lastKey (the first row when lastKey is empty); its key and estimated
+// response size are read back with a one-row probe so the operator can find
+// it. A failing probe still refuses, naming what is known — the refusal is
+// never downgraded to the raw overflow error.
+func (r *D1RowReader) rowTooLarge(ctx context.Context, table *ir.Table, plan pagePlan, lastKey []string, limit int) error {
+	position := "the first row"
+	if len(lastKey) > 0 {
+		position = "the row after " + keyText(plan, lastKey)
+	}
+	desc := position
+	if key, width, err := r.probeNextRow(ctx, table, plan, lastKey); err != nil {
+		desc += fmt.Sprintf(" (its key and size could not be probed: %v)", err)
+	} else {
+		// The width is the LENGTH() estimate, i.e. the values before JSON
+		// encoding — which can multiply a text of control characters
+		// sixfold (`\u00XX`), so it may read well under the cap it exceeded.
+		desc = fmt.Sprintf("the row with %s (about %d bytes of values before JSON encoding)", key, width)
+	}
+	return sluicecode.Wrap(sluicecode.CodeBulkCopyRowTooLarge, rowTooLargeHint,
+		fmt.Errorf("d1: table %q: %s exceeds sluice's %d-byte response cap even as a page of one row; %s",
+			table.Name, desc, limit, rowTooLargeHint))
+}
+
+// probeNextRow reads the key and estimated response width of the first row
+// after lastKey in keyset order (the first row of the table when lastKey is
+// empty) — the row [rowTooLarge] names. Only the key columns and a LENGTH()
+// sum are projected, so the probe itself cannot overflow the cap.
+func (r *D1RowReader) probeNextRow(ctx context.Context, table *ir.Table, plan pagePlan, lastKey []string) (key string, width int64, err error) {
+	qualified := qualifiedKeyCols(table.Name, plan.orderCols)
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	for i, col := range qualified {
+		b.WriteString("CAST(" + col + " AS TEXT) AS " + quoteIdent("k"+strconv.Itoa(i)) + ", ")
+	}
+	b.WriteString("CAST(" + rowWidthExpr(table, plan) + " AS TEXT) AS w FROM " + quoteIdent(table.Name))
+	var params []string
+	if len(lastKey) > 0 {
+		b.WriteString(" WHERE " + keysetPredicate(qualified))
+		params = lastKey
+	}
+	b.WriteString(" ORDER BY " + strings.Join(qualified, ", ") + " LIMIT 1")
+	rows, err := r.client.queryRows(ctx, b.String(), params...)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(rows) != 1 {
+		return "", 0, fmt.Errorf("probe returned %d rows; want 1", len(rows))
+	}
+	keyVals := make([]string, len(plan.orderCols))
+	for i := range plan.orderCols {
+		text, ok, err := jsonString(rows[0]["k"+strconv.Itoa(i)])
+		if err != nil || !ok {
+			return "", 0, fmt.Errorf("probe returned no key value for %s", plan.orderCols[i])
+		}
+		keyVals[i] = text
+	}
+	text, ok, err := jsonString(rows[0]["w"])
+	if err != nil || !ok {
+		return "", 0, errors.New("probe returned no width")
+	}
+	if width, err = strconv.ParseInt(text, 10, 64); err != nil {
+		return "", 0, fmt.Errorf("probe width %q: %w", text, err)
+	}
+	return keyText(plan, keyVals), width, nil
+}
+
+// keyText renders a keyset key for an error message: `id=7` for a single key
+// column (the implicit rowid included), `(a, b)=(1, x)` for a composite one.
+func keyText(plan pagePlan, key []string) string {
+	if len(plan.orderCols) == 1 {
+		return plan.orderCols[0] + "=" + key[0]
+	}
+	return "(" + strings.Join(plan.orderCols, ", ") + ")=(" + strings.Join(key, ", ") + ")"
+}
 
 // d1RowChanBuffer bounds the output channel so HTTP fetch + decode overlap the
 // downstream write while preserving back-pressure (mirrors the file reader's
@@ -427,6 +611,19 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 // stream loop and the staging materializer) surface it through the page-error
 // path they already have. The counts are the only evidence in this lane that
 // does not come from the reader under test.
+//
+// Page SIZE is adaptive (audit LA-2): the invariant it protects is the
+// client's response cap, which D1 does nothing to keep a response under (a
+// fixed 1,000-row page of 16 KiB BLOBs came back as 32.8 MB, and the 8 MiB cap
+// then truncated it into `unexpected end of JSON input` — every table of rows
+// wider than ~8 KB was unmigratable). The first page is sized from a
+// server-side probe of the widest candidate row ([probeMaxRowWidth]); each
+// later page from the previous page's MEASURED bytes per row ([pageRowsFor]
+// against [pageByteBudget]); and a page that overflows the cap anyway is
+// halved and re-requested at the same bound (idempotent under the keyset)
+// until it fits — or, at one row, is refused by name with
+// [sluicecode.CodeBulkCopyRowTooLarge] ([rowTooLarge]). Rows narrower than
+// the budget over [d1PageSize] still get the full 1,000-row page.
 func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan pagePlan, pages chan<- d1Page) {
 	defer close(pages)
 
@@ -446,7 +643,15 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 	}
 
 	projection := buildD1Projection(table, plan)
-	pageSize := r.effectivePageSize()
+	maxRows := r.effectivePageSize()
+	budget := pageByteBudget(r.client.responseCap())
+
+	width, err := r.probeMaxRowWidth(ctx, table, plan, maxRows)
+	if err != nil {
+		deliver(d1Page{err: fmt.Errorf("probe row width before the read: %w", err), final: true})
+		return
+	}
+	pageSize := pageRowsFor(width, budget, maxRows)
 
 	var (
 		lastKey []string // exact-text bound from the previous page
@@ -454,7 +659,26 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 	)
 	for {
 		sql, params := buildD1PageQuery(table, plan, projection, lastKey, pageSize)
-		rows, err := r.client.queryRows(ctx, sql, params...)
+		rows, bodyBytes, err := r.client.queryRowsSized(ctx, sql, params...)
+		var tooLarge *d1ResponseTooLargeError
+		if errors.As(err, &tooLarge) {
+			// The rows grew wider than the previous page predicted (or JSON
+			// escaping inflated them past the estimate): halve and re-request
+			// the SAME page — the keyset bound makes the retry idempotent. At
+			// one row the page IS the row, and a row the cap cannot hold is
+			// refused by name rather than retried forever.
+			if pageSize > 1 {
+				slog.InfoContext(ctx, "d1: page exceeded the response cap; re-requesting it smaller",
+					slog.String("table", table.Name),
+					slog.Int("rows_requested", pageSize),
+					slog.Int("rows_retrying", pageSize/2),
+					slog.Int("response_cap_bytes", tooLarge.limit))
+				pageSize /= 2
+				continue
+			}
+			deliver(d1Page{err: r.rowTooLarge(ctx, table, plan, lastKey, tooLarge.limit), final: true})
+			return
+		}
 		if err != nil {
 			// A failed page ends the stream when the consumer reaches it.
 			deliver(d1Page{err: fmt.Errorf("read page: %w", err), final: true})
@@ -481,6 +705,8 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 			return // consumer reproduces this refusal at the same row
 		}
 		lastKey = key
+		// Size the next page from THIS page's measured bytes per row.
+		pageSize = pageRowsFor(int64(bodyBytes)/int64(len(rows)), budget, maxRows)
 	}
 }
 

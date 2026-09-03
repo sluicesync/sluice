@@ -270,6 +270,10 @@ func TestStageD1Table_PrefetchCancelReapsFetcherLoud(t *testing.T) {
 			_, _ = w.Write(d1OK([]map[string]any{{"n": "3"}}))
 			return
 		}
+		if isD1WidthProbe(body.SQL) {
+			_, _ = w.Write(d1WidthProbeAnswer(0))
+			return
+		}
 		if !strings.Contains(body.SQL, "WHERE") {
 			_, _ = w.Write(d1OK(page1))
 			return

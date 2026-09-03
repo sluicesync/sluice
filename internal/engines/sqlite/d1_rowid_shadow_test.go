@@ -354,6 +354,9 @@ func TestD1RowReader_CountBracketWarnsOnConcurrentWrites(t *testing.T) {
 			calls++
 			return http.StatusOK, d1OK([]map[string]any{{"n": n}})
 		}
+		if isD1WidthProbe(sql) {
+			return http.StatusOK, d1WidthProbeAnswer(0)
+		}
 		return fixedRows(page)(sql, params)
 	}))
 	r := &D1RowReader{client: client, pageSize: 4}
