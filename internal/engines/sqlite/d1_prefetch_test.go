@@ -225,7 +225,7 @@ func TestD1RowReader_PrefetchCancelReapsFetcher(t *testing.T) {
 			return
 		}
 		if isD1CountQuery(body.SQL) {
-			_, _ = w.Write(d1OK([]map[string]any{{"n": "3"}}))
+			_, _ = w.Write(d1OK([]map[string]any{{"n": "3", "b": "-1"}}))
 			return
 		}
 		if isD1WidthProbe(body.SQL) {

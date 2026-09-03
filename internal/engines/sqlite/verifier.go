@@ -41,7 +41,7 @@ func (r *D1SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (in
 	if table == nil {
 		return 0, errors.New("d1: ExactRowCount: table is nil")
 	}
-	n, err := (&D1RowReader{client: r.client}).countRows(ctx, table.Name)
+	n, _, err := (&D1RowReader{client: r.client}).countRows(ctx, table)
 	if err != nil {
 		return 0, fmt.Errorf("d1: count rows in %q: %w", table.Name, err)
 	}

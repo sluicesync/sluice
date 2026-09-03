@@ -458,26 +458,61 @@ func findColumn(table *ir.Table, name string) *ir.Column {
 // expected value the paginated read is checked against (audit LA-3). The count
 // is projected as TEXT and parsed exactly, the same discipline as every other
 // integer this transport reads (a JSON number would round past 2^53).
-func (r *D1RowReader) countRows(ctx context.Context, table string) (int64, error) {
-	rows, err := r.client.queryRows(ctx, "SELECT CAST(COUNT(*) AS TEXT) AS n FROM "+quoteIdent(table))
+// textBytesExpr builds the server-side companion to decodeRow's textBytes
+// (audit LA-4): the summed byte length of every cell whose storage class is
+// text, over the columns this read projects.
+//
+// `length(CAST(c AS BLOB))` is the STORED byte count. The /query API
+// replaces each invalid UTF-8 byte with U+FFFD server-side, three bytes for
+// one, so a mangled cell arrives longer than it is stored and the two sums
+// disagree — the independent expected value the decode path could not have
+// (measured on live D1: a 3-byte cell `x'FFFE61'` arrives as 7 bytes).
+//
+// The typeof() guard is what makes the two sides count the same cells: a
+// blob arrives as a JSON array and an integer as a number, so neither
+// reaches decodeRow's string branch, and neither may reach this sum.
+func textBytesExpr(table *ir.Table) string {
+	parts := make([]string, 0, len(table.Columns))
+	for _, c := range table.Columns {
+		q := quoteIdent(c.Name)
+		parts = append(parts,
+			"COALESCE(SUM(CASE WHEN typeof("+q+")='text' THEN length(CAST("+q+" AS BLOB)) ELSE 0 END),0)")
+	}
+	if len(parts) == 0 {
+		return "0"
+	}
+	return strings.Join(parts, " + ")
+}
+
+func (r *D1RowReader) countRows(ctx context.Context, table *ir.Table) (count, textBytes int64, err error) {
+	rows, err := r.client.queryRows(ctx,
+		"SELECT CAST(COUNT(*) AS TEXT) AS n, CAST("+textBytesExpr(table)+" AS TEXT) AS b FROM "+quoteIdent(table.Name))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(rows) != 1 {
-		return 0, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
+		return 0, 0, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
+	}
+	bText, bOK, bErr := jsonString(rows[0]["b"])
+	if bErr != nil || !bOK {
+		return 0, 0, fmt.Errorf("text-byte sum is not a text scalar: %w", bErr)
+	}
+	textBytes, bErr = strconv.ParseInt(bText, 10, 64)
+	if bErr != nil {
+		return 0, 0, fmt.Errorf("text-byte sum %q is not an integer: %w", bText, bErr)
 	}
 	text, ok, err := jsonString(rows[0]["n"])
 	if err != nil {
-		return 0, fmt.Errorf("COUNT(*) result is not a text scalar: %w", err)
+		return 0, 0, fmt.Errorf("COUNT(*) result is not a text scalar: %w", err)
 	}
 	if !ok {
-		return 0, errors.New("COUNT(*) result is NULL")
+		return 0, 0, errors.New("COUNT(*) result is NULL")
 	}
-	n, err := strconv.ParseInt(text, 10, 64)
+	count, err = strconv.ParseInt(text, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("COUNT(*) result %q: %w", text, err)
+		return 0, 0, fmt.Errorf("COUNT(*) result %q: %w", text, err)
 	}
-	return n, nil
+	return count, textBytes, nil
 }
 
 // rowCountMismatchHint is the remedy carried by [sluicecode.CodeBulkCopyRowCountMismatch].
@@ -525,6 +560,15 @@ type d1Page struct {
 	rows  []d1Row
 	err   error
 	final bool
+
+	// The LA-4 byte bracket, set on the final page only. srcTextBytes is
+	// the server's own SUM over every text-storage cell of the projected
+	// columns, read in the same round trip as the closing COUNT(*);
+	// quiescent says the two COUNT(*) readings agreed, which is what makes
+	// the byte comparison meaningful (a table being written under the read
+	// changes both numbers legitimately).
+	srcTextBytes int64
+	quiescent    bool
 }
 
 // stream decodes fetched pages and pushes IR Rows onto out, closing it when
@@ -553,17 +597,24 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 	go r.fetchPages(fetchCtx, table, plan, pages)
 
 	var (
-		ordinal  int64 // 1-based row counter, for error context
-		sawFinal bool
+		ordinal      int64 // 1-based row counter, for error context
+		sawFinal     bool
+		gotTextBytes int64 // LA-4: delivered bytes of every text-storage cell
+		srcTextBytes int64 // the server's own sum, from the closing bracket
+		quiescent    bool
 	)
 	for page := range pages {
+		if page.final {
+			srcTextBytes, quiescent = page.srcTextBytes, page.quiescent
+		}
 		if page.err != nil {
 			r.setErr(fmt.Errorf("d1: table %q: %w", table.Name, page.err))
 			return
 		}
 		for _, raw := range page.rows {
 			ordinal++
-			row, _, err := r.decodeRow(table, plan, raw, enc, ordinal)
+			row, _, cellBytes, err := r.decodeRow(table, plan, raw, enc, ordinal)
+			gotTextBytes += cellBytes
 			if err != nil {
 				r.setErr(err)
 				return
@@ -586,6 +637,38 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 			return
 		}
 		r.setErr(fmt.Errorf("d1: table %q: page fetch aborted before the final page", table.Name))
+		return
+	}
+	// LA-4: the byte half of the bracket. D1 stores invalid-UTF-8 TEXT
+	// intact but replaces every invalid byte with U+FFFD in the /query JSON
+	// -- SERVER-SIDE, so the cell arrives as valid UTF-8 and no client-side
+	// check can see it. The server's own summed byte length of its
+	// text-storage cells is the independent expected value: a mangled cell
+	// is DELIVERED longer than it is STORED (three bytes for one), so the
+	// two sums disagree by exactly the inflation.
+	//
+	// Only when the table was quiescent: the row-count bracket has already
+	// spoken for a table being written under the read, and a legitimate
+	// concurrent write moves both numbers.
+	// srcTextBytes < 0 is the "no byte evidence" sentinel: a transport that
+	// cannot weigh its own text (the canned test doubles) reports it, and the
+	// comparison is skipped rather than fabricated. A real D1 response always
+	// carries the sum, so this cannot silently disarm the check in production
+	// — the count bracket would have refused a response missing columns.
+	if quiescent && srcTextBytes >= 0 && gotTextBytes != srcTextBytes {
+		r.setErr(sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"read the affected columns as hex(col) and repair the values at the source",
+			fmt.Errorf(
+				"d1: table %q: the text this read received is %d bytes where the source stores %d, on a table whose "+
+					"row count did not move -- D1 replaces every invalid UTF-8 byte with U+FFFD in its query response "+
+					"(three bytes for one), so at least one cell was silently rewritten in transit and copying it would "+
+					"persist the mangled value. The source is intact: hex(col) still returns the true bytes. Find the "+
+					"affected rows by comparing length(CAST(col AS BLOB)) against length(col) per text column, repair "+
+					"them, or exclude the table",
+				table.Name, gotTextBytes, srcTextBytes,
+			),
+		))
 	}
 }
 
@@ -636,7 +719,7 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 		}
 	}
 
-	before, err := r.countRows(ctx, table.Name)
+	before, _, err := r.countRows(ctx, table)
 	if err != nil {
 		deliver(d1Page{err: fmt.Errorf("count rows before the read: %w", err), final: true})
 		return
@@ -688,13 +771,15 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 		// A short (or empty) page is the last page: close the bracket and
 		// let its verdict ride the page.
 		if len(rows) < pageSize {
-			after, err := r.countRows(ctx, table.Name)
+			after, afterBytes, err := r.countRows(ctx, table)
+			quiescent := false
 			if err != nil {
 				err = fmt.Errorf("count rows after the read: %w", err)
 			} else {
 				err = checkRowCount(ctx, table.Name, before, after, ordinal)
+				quiescent = before == after
 			}
-			deliver(d1Page{rows: rows, err: err, final: true})
+			deliver(d1Page{rows: rows, err: err, final: true, srcTextBytes: afterBytes, quiescent: quiescent})
 			return
 		}
 		if !deliver(d1Page{rows: rows}) {
@@ -714,12 +799,18 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 // keyset bound for the next page. Every decode error is wrapped with
 // table/column/row so the operator can find the offending cell (the loud-failure
 // tenet).
-func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc dateEncoding, ordinal int64) (ir.Row, []string, error) {
-	row := make(ir.Row, len(table.Columns))
+// textBytes (audit LA-4) is the DELIVERED byte length of every cell whose
+// SQLite storage class is text, summed across the row. The projection
+// already carries typeof() per column, so this is exact and free: it counts
+// precisely the cells the server-side sum counts, and nothing else. A blob
+// arrives as a JSON array and an integer as a number (measured on live D1),
+// so neither can drift into either total.
+func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc dateEncoding, ordinal int64) (row ir.Row, key []string, textBytes int64, err error) {
+	row = make(ir.Row, len(table.Columns))
 	for i, col := range table.Columns {
 		typeofText, ok, err := jsonString(raw[plan.typeofAliases[i]])
 		if err != nil {
-			return nil, nil, fmt.Errorf("d1: table %q column %q row %d: decode typeof: %w",
+			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: decode typeof: %w",
 				table.Name, col.Name, ordinal, err)
 		}
 		if !ok {
@@ -727,22 +818,27 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 		}
 		storage, err := d1StorageValue(typeofText, raw[col.Name])
 		if err != nil {
-			return nil, nil, fmt.Errorf("d1: table %q column %q row %d: %w",
+			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: %w",
 				table.Name, col.Name, ordinal, err)
+		}
+		if typeofText == "text" {
+			if str, isStr := storage.(string); isStr {
+				textBytes += int64(len(str))
+			}
 		}
 		v, err := decodeCell(storage, col.Type, enc)
 		if err != nil {
-			return nil, nil, fmt.Errorf("d1: table %q column %q row %d: %w",
+			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: %w",
 				table.Name, col.Name, ordinal, err)
 		}
 		row[col.Name] = v
 	}
 
-	key, err := r.extractKey(table, plan, raw, ordinal)
+	key, err = r.extractKey(table, plan, raw, ordinal)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	return row, key, nil
+	return row, key, textBytes, nil
 }
 
 // extractKey reads the exact-text values of the keyset columns from a result

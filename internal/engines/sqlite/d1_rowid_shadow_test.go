@@ -352,7 +352,7 @@ func TestD1RowReader_CountBracketWarnsOnConcurrentWrites(t *testing.T) {
 		if isD1CountQuery(sql) {
 			n := counts[calls]
 			calls++
-			return http.StatusOK, d1OK([]map[string]any{{"n": n}})
+			return http.StatusOK, d1OK([]map[string]any{{"n": n, "b": "-1"}})
 		}
 		if isD1WidthProbe(sql) {
 			return http.StatusOK, d1WidthProbeAnswer(0)
