@@ -167,7 +167,7 @@ func TestBoundaryRouter_PG_MultiShardExactlyOnceApply(t *testing.T) {
 				results <- err
 				return
 			}
-			router, err := NewBoundaryRouter(mgr, shapeApplier, prober)
+			router, err := NewBoundaryRouter(mgr, shapeApplier, prober, "postgres", "postgres")
 			if err != nil {
 				results <- err
 				return
@@ -323,7 +323,7 @@ func TestBoundaryRouter_PG_TakeoverProbeAndRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLeaseManager B: %v", err)
 	}
-	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber))
+	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber), "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}

@@ -106,6 +106,9 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	if s.Target == nil {
 		return errors.New("pipeline: engage shard consolidation: nil target engine")
 	}
+	if s.Source == nil {
+		return errors.New("pipeline: engage shard consolidation: nil source engine")
+	}
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		return fmt.Errorf("pipeline: engage shard consolidation: open schema writer: %w", err)
@@ -123,7 +126,9 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	}
 	s.shapeWriter = sw
 
-	router, err := NewBoundaryRouter(mgr, shapeApplier, prober)
+	// The engine pair drives the router's per-boundary resolve to the
+	// target's shape (dialect + bound namespace) — Bug 262.
+	router, err := NewBoundaryRouter(mgr, shapeApplier, prober, s.Source.Name(), s.Target.Name())
 	if err != nil {
 		_ = closeIfErrIgnored(sw)
 		return fmt.Errorf("pipeline: engage shard consolidation: %w", err)

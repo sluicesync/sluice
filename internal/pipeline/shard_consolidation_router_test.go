@@ -86,7 +86,7 @@ func newTestRouter(t *testing.T, store *fakeLeaseStore, streamID string, prober 
 	t.Helper()
 	cfg := LeaseConfig{LeaseDuration: time.Minute, RenewDeadline: 30 * time.Second, RetryPeriod: 5 * time.Second}
 	mgr := newTestLeaseManager(t, store, streamID, cfg, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -361,13 +361,13 @@ func TestNewBoundaryRouter_NilGuards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLeaseManager: %v", err)
 	}
-	if _, err := NewBoundaryRouter(nil, &fakeShapeApplier{}, &fakeProber{}); err == nil {
+	if _, err := NewBoundaryRouter(nil, &fakeShapeApplier{}, &fakeProber{}, "postgres", "postgres"); err == nil {
 		t.Error("expected error on nil manager")
 	}
-	if _, err := NewBoundaryRouter(mgr, nil, &fakeProber{}); err == nil {
+	if _, err := NewBoundaryRouter(mgr, nil, &fakeProber{}, "postgres", "postgres"); err == nil {
 		t.Error("expected error on nil applier")
 	}
-	if _, err := NewBoundaryRouter(mgr, &fakeShapeApplier{}, nil); err == nil {
+	if _, err := NewBoundaryRouter(mgr, &fakeShapeApplier{}, nil, "postgres", "postgres"); err == nil {
 		t.Error("expected error on nil prober")
 	}
 }

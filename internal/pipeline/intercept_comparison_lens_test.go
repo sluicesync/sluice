@@ -71,7 +71,7 @@ func TestIntercept_ShapeA_LensAppliedToPostSide(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestIntercept_ShapeA_NoLens_PhantomAlterStillFires(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}

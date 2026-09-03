@@ -223,6 +223,7 @@ func TestEngage_ConstructsManagerWhenSupported(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		Source:            stubNamedEngine{name: "src-stub"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
@@ -249,6 +250,7 @@ func TestEngage_DefaultsZeroLeaseConfig(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		Source:            stubNamedEngine{name: "src-stub"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
@@ -397,6 +399,7 @@ func TestEngage_InheritsNoGCDefaultWhenSurfacesMissing(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		Source:            stubNamedEngine{name: "src-stub"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	applier := &leaseStoreOnlyApplier{

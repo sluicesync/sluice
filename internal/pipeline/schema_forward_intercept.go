@@ -686,20 +686,27 @@ func retargetShapeForTarget(post *ir.Table, shape Shape, sourceEngine, targetEng
 // scrubbed so the target SchemaWriter's qualifyTable falls back to its
 // own DSN-bound database. Mirrors the retarget+scrub in
 // [retargetAddedColumns]; factored so every shape's forward path shares
-// it (ADR-0091 §5).
+// it (ADR-0091 §5) — the single-stream forwarder and, since Bug 262,
+// the Shape A boundary router.
+//
+// The scrub is applied to a COPY: a same-engine pair is a retarget
+// pass-through that hands back the caller's own table, and post is the
+// intercept's cached pre-state for the next boundary and (on the Shape
+// A path) the very IR the downstream ADR-0049 schema-history row
+// serialises. Scrubbing that in place would persist a namespace-less
+// snapshot for the same-engine pairs only.
 func retargetTableScrub(post *ir.Table, sourceEngine, targetEngine string) *ir.Table {
 	retargeted := translate.RetargetForEngine(
 		&ir.Schema{Tables: []*ir.Table{post}},
 		sourceEngine, targetEngine,
 	)
-	if len(retargeted.Tables) == 0 {
-		scrubbed := *post
-		scrubbed.Schema = ""
-		return &scrubbed
+	rt := post
+	if len(retargeted.Tables) > 0 {
+		rt = retargeted.Tables[0]
 	}
-	rt := retargeted.Tables[0]
-	rt.Schema = ""
-	return rt
+	scrubbed := *rt
+	scrubbed.Schema = ""
+	return &scrubbed
 }
 
 // resolveColumnsByName maps each column in src to the same-named column

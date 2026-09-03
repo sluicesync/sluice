@@ -51,6 +51,22 @@ type BoundaryRouter struct {
 	applier ir.ShapeDeltaApplier
 	prober  ShardConsolidationProber
 
+	// sourceEngine / targetEngine name the engine pair the router
+	// forwards between. Every boundary's post IR is the SOURCE's CDC
+	// projection — the source's column dialect and the source's
+	// namespace (a MySQL database name, a PG schema) — and the target
+	// SchemaWriter / prober cannot consume that directly: qualifyTable
+	// honours Table.Schema over its own bound schema, so an unscrubbed
+	// post lands the DDL in a namespace named after the SOURCE (Bug 262:
+	// `schema "source_db" does not exist` on every forwarded DDL of a
+	// MySQL→PG Shape A stream). The router runs [retargetShapeForTarget]
+	// — the same resolver the single-stream forwarder and chain restore
+	// use — before the apply and before the takeover probe, so the DDL
+	// resolves through the writer's bound namespace exactly as the cold-
+	// start CREATE and the row applier's appliershared.Schema do.
+	sourceEngine string
+	targetEngine string
+
 	// observePollInterval controls how often the observer loop polls
 	// the lease row when a peer holds the lease. Default 2 seconds;
 	// tests can shrink it via NewBoundaryRouter's option-arg path
@@ -67,13 +83,17 @@ type BoundaryRouter struct {
 }
 
 // NewBoundaryRouter constructs a router around the supplied lease
-// manager + per-shape applier + prober. Returns an error if any
-// dependency is nil — these are non-optional for live coordination.
+// manager + per-shape applier + prober for the named engine pair
+// ([ir.Engine.Name] of the source and of the target — the same pair the
+// single-stream forwarder's schemaForwardDeps carries). Returns an
+// error if any dependency is nil — these are non-optional for live
+// coordination. A same-engine pair is a type pass-through; the
+// namespace scrub applies to every pair.
 //
 // observeTimeout defaults to 2 × LeaseDuration when zero — the same
 // observer-wait cap ADR-0054 §3 recommends. observePollInterval
 // defaults to 2 seconds.
-func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober ShardConsolidationProber) (*BoundaryRouter, error) {
+func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober ShardConsolidationProber, sourceEngine, targetEngine string) (*BoundaryRouter, error) {
 	if mgr == nil {
 		return nil, errors.New("pipeline: NewBoundaryRouter: lease manager is nil")
 	}
@@ -87,6 +107,8 @@ func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober S
 		mgr:                 mgr,
 		applier:             applier,
 		prober:              prober,
+		sourceEngine:        sourceEngine,
+		targetEngine:        targetEngine,
 		observePollInterval: 2 * time.Second,
 		observeTimeout:      2 * mgr.cfg.LeaseDuration,
 	}, nil
@@ -165,6 +187,12 @@ func (r *BoundaryRouter) RouteBoundary(
 // handleHeldLease runs when this stream successfully acquired the
 // lease (either ABSENT → HELD or EXPIRED takeover → HELD). It
 // dispatches the right apply/probe path based on the takeover flag.
+//
+// post is the boundary's comparison-form IR (source dialect, source
+// namespace). It is resolved to the target's shape ONCE here, and every
+// path out of this function — the held-lease apply, the takeover probe,
+// the takeover re-apply — consumes the resolved table, so the three
+// arms cannot diverge on which namespace they address (Bug 262).
 func (r *BoundaryRouter) handleHeldLease(
 	ctx context.Context,
 	lease *Lease,
@@ -183,17 +211,22 @@ func (r *BoundaryRouter) handleHeldLease(
 		}
 	}()
 
+	target, targetShape := retargetShapeForTarget(post, shape, r.sourceEngine, r.targetEngine)
+
 	if !lease.Takeover() {
 		// Normal lease-holder path: apply the shape, then finalize.
-		if err := r.applyShape(ctx, post, shape); err != nil {
+		if err := r.applyShape(ctx, target, targetShape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: apply shape %s: %w", shape.Kind, err)
 		}
 		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
 	}
 
 	// Takeover path: probe the target schema for the prior holder's
-	// recorded effect. Three outcomes per ADR-0054 §4.
-	outcome, err := DispatchProbe(ctx, r.prober, post, shape)
+	// recorded effect. Three outcomes per ADR-0054 §4. The probe reads
+	// the target catalog through the same resolved namespace the apply
+	// writes to — the engine probers mirror qualifyTable's Table.Schema
+	// precedence, so an unscrubbed post would probe the SOURCE's name.
+	outcome, err := DispatchProbe(ctx, r.prober, target, targetShape)
 	if err != nil {
 		return fmt.Errorf("pipeline: route boundary: probe %s: %w. %s",
 			shape.Kind, err, RecoveryHint(lease.tableName))
@@ -216,7 +249,7 @@ func (r *BoundaryRouter) handleHeldLease(
 			"stream_id", r.mgr.streamID,
 			"shape", shape.Kind.String(),
 		)
-		if err := r.applyShape(ctx, post, shape); err != nil {
+		if err := r.applyShape(ctx, target, targetShape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: takeover apply shape %s: %w", shape.Kind, err)
 		}
 		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
@@ -234,9 +267,10 @@ func (r *BoundaryRouter) handleHeldLease(
 // ir.ShapeDeltaApplier. Thin method wrapper over the shared
 // [applyShapeDelta] free function so the Shape A boundary router and
 // the single-stream ADR-0091 forwarding intercept use the identical
-// proven dispatch.
-func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape Shape) error {
-	return applyShapeDelta(ctx, r.applier, post, shape)
+// proven dispatch. target / shape are the [retargetShapeForTarget]
+// outputs — handleHeldLease resolves them once per boundary.
+func (r *BoundaryRouter) applyShape(ctx context.Context, target *ir.Table, shape Shape) error {
+	return applyShapeDelta(ctx, r.applier, target, shape)
 }
 
 // applyShapeDelta maps a classified [Shape] to the matching
@@ -247,11 +281,16 @@ func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape S
 // post-state (the applier methods use IF [NOT] EXISTS / detect-then-
 // emit), so a retry that replays the boundary is safe.
 //
-// post must already be retargeted to the target engine's dialect and
-// have its Schema scrubbed by the caller when the source IR carries a
-// different engine's types / database name (the single-stream CDC
-// caller does this via retargetShapeForTarget; the Shape A caller's
-// manifest-derived tables are already target-shaped).
+// post must already be resolved to the target engine's shape through
+// [retargetShapeForTarget] — dialect retargeted, Schema scrubbed so the
+// target SchemaWriter's qualifyTable falls back to its bound namespace.
+// Both live callers do this (the single-stream forwarder in
+// applyShapeForward; the Shape A router in handleHeldLease). This
+// precondition used to be documented as already holding for Shape A
+// because its tables were "manifest-derived" — they never were: the
+// router's post is the raw CDC projection, and that false premise was
+// Bug 262. TestRouteBoundary_Bug262_EveryShapeAndArmResolvesToTheTarget
+// is the gate on the router side.
 //
 // ShapeKindRenameColumn is dispatched here for the Shape A path (whose
 // lease + catalog make the rename unambiguous); the single-stream

@@ -237,7 +237,7 @@ func runMySQL3ShardContention(
 				results <- err
 				return
 			}
-			router, err := NewBoundaryRouter(mgr, shapeApplier, prober)
+			router, err := NewBoundaryRouter(mgr, shapeApplier, prober, "mysql", "mysql")
 			if err != nil {
 				results <- err
 				return
@@ -398,7 +398,7 @@ func TestPhase2e_MySQL_Takeover_ProbeAndRecord_Applied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLeaseManager B: %v", err)
 	}
-	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber))
+	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber), "mysql", "mysql")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}

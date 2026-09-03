@@ -197,7 +197,7 @@ func runPGNotAppliedTakeover(t *testing.T, targetTable, seedDDL string, addCol *
 	if err != nil {
 		t.Fatalf("NewLeaseManager B: %v", err)
 	}
-	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber))
+	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber), "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestPhase2e_PG_Takeover_ProbeAndRecord_Inconsistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLeaseManager B: %v", err)
 	}
-	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber))
+	router, err := NewBoundaryRouter(mgrB, swB.(ir.ShapeDeltaApplier), applierB.(ir.ShardConsolidationProber), "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}

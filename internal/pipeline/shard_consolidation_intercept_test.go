@@ -53,7 +53,7 @@ func TestIntercept_FirstSnapshotSeedsCache_NoRoute(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestIntercept_SecondSnapshotRoutesAddColumn(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestIntercept_UnrecognizedShape_ShortCircuitsAndStoresError(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestIntercept_SeededFromColdStart_FirstCDCSnapshotRoutes(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestIntercept_SeededFromColdStart_NoCDCSnapshot_NoRoute(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestIntercept_SeededFromColdStart_MultiTable(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestIntercept_SeededFromColdStart_BareNameKeyAlignment(t *testing.T) {
 	prober := &fakeProber{}
 	applier := &fakeShapeApplier{}
 	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-	router, err := NewBoundaryRouter(mgr, applier, prober)
+	router, err := NewBoundaryRouter(mgr, applier, prober, "postgres", "postgres")
 	if err != nil {
 		t.Fatalf("NewBoundaryRouter: %v", err)
 	}
