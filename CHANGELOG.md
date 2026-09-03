@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**Trigger-CDC no longer halts the stream over DDL on a table it does not capture (audit SLP-2).** The `postgres-trigger` engine records source DDL through a Postgres event trigger, and an event trigger is database-wide — it cannot be attached to a schema. This one filtered by command tag alone, so a `CREATE TABLE` in a schema sluice never touches recorded a DDL marker and stopped the stream with the restart-from-scratch remedy: somebody else’s unrelated table broke your sync. The tier now asks the question the drop arm has asked since v0.136.0, namely whether the command’s relation carries this install’s capture trigger. Measured on Postgres 16.15 rather than assumed, because the resolution differs by shape: an `ALTER` reports the table directly, including `ADD CONSTRAINT`, which was the one worth checking; a `CREATE INDEX` reports the index and resolves through its table; and a catalog-id guard keeps a non-relation object from being read as a relation. A brand-new table in a captured schema is exempt for the same reason it always was harmless: with no capture trigger it produces no change rows, so it cannot make the applier write a wrong one, and `sync add-table` is how it joins the stream. An install created by an earlier release warns that its capture functions are stale until `sluice trigger setup` is re-run, which is the existing posture for any function-body change.
+
 ## [0.139.0] - 2026-09-03
 
 The 2026-09-01 audit's remaining tail plus the three defects v0.138.0's own regression cycle found — every one measured on a real server before it was fixed, and two of them in code v0.138.0 had just shipped. **If you run multi-schema Postgres sync, MySQL sync against a source that can fail over, backups from a replica, Cloudflare D1 with wide rows, `--inject-shard-column`, or MariaDB backup chains, read the entry that names you.**

@@ -1686,6 +1686,48 @@ func captureDDLSuppressionCheck(metaTableRef string) string {
 // metaTableRef is the pre-quoted, schema-qualified meta table the
 // suppression check reads its evidence from (SEC-2) — see
 // [captureDDLSuppressionCheck].
+//
+// # Scope: only relations this install captures (audit 2026-09-01 SLP-2)
+//
+// A Postgres EVENT trigger is DATABASE-WIDE — it cannot be attached to a
+// schema — and this one filtered by command TAG alone. So a `CREATE TABLE`
+// in a schema sluice never touches recorded a DDL row and HALTED the
+// stream with the restart-from-scratch remedy: somebody else's unrelated
+// table stopped your sync. The `sql_drop` arm has asked the right question
+// since v0.136.0 ("was a captured relation involved?", via the
+// dropped-object set); this arm now asks the same question of the CURRENT
+// catalog, since nothing is being dropped: the command's relation must
+// carry this install's row-capture trigger.
+//
+// The resolution is measured, not assumed (postgres:16.15, 2026-09-03):
+//
+//	ALTER TABLE … ADD COLUMN / ALTER COLUMN TYPE / DROP COLUMN   object_type "table",        objid = the table
+//	ALTER TABLE … ADD CONSTRAINT (incl. UNIQUE)                  object_type "table",        objid = the table
+//	ALTER TABLE … RENAME COLUMN                                  object_type "table column", objid = the table
+//	ALTER TABLE … ATTACH PARTITION                               object_type "table",        objid = the PARENT
+//	CREATE INDEX, CREATE INDEX CONCURRENTLY                      object_type "index",        objid = the index
+//
+// So every shape but an index resolves through objid directly, and an
+// index resolves through pg_index.indrelid. ADD CONSTRAINT was the one
+// worth measuring — a constraint OID there would have been silently
+// skipped — and it reports the table.
+//
+// The classid guard is why a non-relation command cannot be misread: an
+// OID is only meaningful against its own catalog, and `CREATE TRIGGER`
+// (measured: object_type "trigger", classid pg_trigger) would otherwise
+// have its trigger OID compared against pg_class. Today's WHEN TAG list
+// cannot deliver one; the guard keeps that true if the list ever grows.
+//
+// Deliberate consequence: a `CREATE TABLE` in a SELECTED schema no longer
+// halts the stream either. An uncaptured table cannot make the applier
+// write a wrong row — no capture trigger, no change rows — and
+// `sluice sync add-table` is how it joins the stream. Halting for it
+// forced a restart-from-scratch over a table the stream was not carrying.
+//
+// Changing this body changes the capture-shape door's digest, so an
+// install created by an earlier sluice WARNs [staleCaptureFunctionMarker]
+// at every CDC open until `trigger setup` is re-run — the intended
+// vintage posture, not a refusal (see cdc_capture_body.go).
 func renderCaptureDDLFunction(schema, changeLogTableRef, metaTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + ddlFnRef(schema) + `()
 RETURNS event_trigger
@@ -1698,7 +1740,23 @@ DECLARE
     v_marker   TEXT;
     v_suppress BOOLEAN;
 BEGIN
-` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
+` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN
+        SELECT c.*
+          FROM pg_catalog.pg_event_trigger_ddl_commands() c
+         WHERE c.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+           AND EXISTS (
+                 SELECT 1
+                   FROM pg_catalog.pg_trigger tg
+                  WHERE tg.tgname = ` + quoteSQLString(CaptureTriggerRow) + `
+                    AND NOT tg.tgisinternal
+                    AND tg.tgrelid = CASE
+                          WHEN c.object_type = 'index'
+                            THEN (SELECT i.indrelid
+                                    FROM pg_catalog.pg_index i
+                                   WHERE i.indexrelid = c.objid)
+                          ELSE c.objid
+                        END)
+    LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;
         END IF;
