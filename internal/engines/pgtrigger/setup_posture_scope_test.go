@@ -132,7 +132,7 @@ func TestSetupPostureEndStateCoversTheDoorGradeSet(t *testing.T) {
 			if err != nil {
 				t.Fatalf("setup refused a convergent run: %v", err)
 			}
-			stmts := renderSetupDDL("public", specsFor(named...), true, CapturePayloadFull, tc.optIn, outside)
+			stmts := renderSetupDDL("public", specsFor(named...), true, false, CapturePayloadFull, tc.optIn, outside)
 			got := simulatePostureEndState(stmts, outside, named)
 			for trigger, enabled := range got {
 				if enabled != tc.wantPosture {
@@ -186,7 +186,7 @@ func TestSetupPostureAlignment(t *testing.T) {
 	t.Parallel()
 	t.Run("opt-in WIDENS the tables it did not name", func(t *testing.T) {
 		t.Parallel()
-		stmts := renderSetupDDL("public", specsFor("shipments"), true, CapturePayloadFull, true, installedPair("orders", "O"))
+		stmts := renderSetupDDL("public", specsFor("shipments"), true, false, CapturePayloadFull, true, installedPair("orders", "O"))
 		if got, want := enableAlwaysTargets(stmts), []string{"orders", "shipments"}; !equalStrings(got, want) {
 			t.Errorf("ENABLE ALWAYS targets = %v; want %v", got, want)
 		}
@@ -207,7 +207,7 @@ func TestSetupPostureAlignment(t *testing.T) {
 		// the plain plan must carry no posture statement at all: no
 		// silent widening, and no silent narrowing either.
 		for _, enabled := range []string{"O", "A", "D", "R"} {
-			stmts := renderSetupDDL("public", specsFor("shipments"), true, CapturePayloadFull, false, installedPair("orders", enabled))
+			stmts := renderSetupDDL("public", specsFor("shipments"), true, false, CapturePayloadFull, false, installedPair("orders", enabled))
 			if got := enableAlwaysTargets(stmts); len(got) != 0 {
 				t.Errorf("outside trigger at %q: plain render emitted ENABLE ALWAYS for %v", enabled, got)
 			}
@@ -223,7 +223,7 @@ func TestSetupPostureAlignment(t *testing.T) {
 		// shape the door refuses on by name; silently re-arming one from a
 		// run about a different table would erase that signal.
 		for _, enabled := range []string{"D", "R"} {
-			stmts := renderSetupDDL("public", specsFor("shipments"), true, CapturePayloadFull, true, installedPair("orders", enabled))
+			stmts := renderSetupDDL("public", specsFor("shipments"), true, false, CapturePayloadFull, true, installedPair("orders", enabled))
 			if got, want := enableAlwaysTargets(stmts), []string{"shipments"}; !equalStrings(got, want) {
 				t.Errorf("outside trigger at %q: ENABLE ALWAYS targets = %v; want %v", enabled, got, want)
 			}

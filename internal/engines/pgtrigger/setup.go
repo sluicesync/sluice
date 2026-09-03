@@ -485,7 +485,16 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	for i, t := range opts.Tables {
 		specs[i] = tableTriggerSpec{Name: t, PKCols: pkColsByTable[t]}
 	}
-	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload, opts.CaptureReplicatedWrites, outside)
+	// C-4: refresh the capture FUNCTION bodies whenever an event trigger is
+	// live, not only when this role could create one. Otherwise a
+	// --allow-polled-fingerprint re-run leaves an older body firing against
+	// the current suppression protocol and records sluice's own setup DDL.
+	// See [hasCaptureEventTriggers].
+	liveEventTriggers, err := hasCaptureEventTriggers(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("pgtrigger: setup: %w", err)
+	}
+	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, liveEventTriggers, opts.CapturePayload, opts.CaptureReplicatedWrites, outside)
 
 	if len(refusals) > 0 {
 		// Refusals block the run even on dry-run — the operator
@@ -951,7 +960,7 @@ func pkColsJSON(cols []string) string {
 //     schema_version, so the version can never claim a registry that isn't
 //     there. (The transaction now makes that atomic as well, but the
 //     ordering is kept: a hand-applied plan can be stopped anywhere.)
-func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload, captureReplicated bool, postureAlign []installedCaptureTrigger) []string {
+func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger, liveEventTriggers bool, payload CapturePayload, captureReplicated bool, postureAlign []installedCaptureTrigger) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
@@ -967,13 +976,20 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bo
 		CaptureFunctionRow:      renderCaptureRowFunction(schema, tableRef(ChangeLogTable), payload),
 		CaptureFunctionTruncate: renderCaptureTruncateFunction(schema, tableRef(ChangeLogTable)),
 	}
-	if canEventTrigger {
+	// C-4: rendered when this role can create the event triggers OR when one
+	// is already live from an earlier privileged install — a live trigger
+	// firing an older body is exactly the case that records sluice's own DDL.
+	if canEventTrigger || liveEventTriggers {
 		captureFns[CaptureFunctionDDL] = renderCaptureDDLFunction(schema, tableRef(ChangeLogTable), metaRef)
 		captureFns[CaptureFunctionDrop] = renderCaptureDropFunction(schema, tableRef(ChangeLogTable), metaRef)
 	}
 
 	out := []string{"BEGIN"}
-	if canEventTrigger {
+	// C-4: emitted on the same condition the bodies are rendered on. Gating
+	// the EMISSION on canEventTrigger alone was the defect: the bodies were
+	// prepared and then never sent, so a --allow-polled-fingerprint re-run
+	// left the live trigger firing its old body.
+	if canEventTrigger || liveEventTriggers {
 		// Re-created FIRST, before any TAG-watched statement (Bug 257): a
 		// re-setup over an install whose function body predates the
 		// suppression check must replace that body before the first
@@ -2276,4 +2292,34 @@ func quoteIdent(name string) string {
 // wrap in single quotes, doubling any embedded single-quote.
 func quoteSQLString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// hasCaptureEventTriggers reports whether this database already carries
+// either of the install's capture EVENT triggers.
+//
+// It exists for the C-4 case (audit 2026-08-31, sharpened 2026-09-01,
+// CONFIRMED on postgres:16.15): a `--allow-polled-fingerprint` re-run by a
+// role that cannot create event triggers rendered NO capture functions, so
+// an event trigger created by an EARLIER privileged install kept firing an
+// OLD function body. That body predates the SEC-2 evidence protocol and
+// suppresses on the bare marker value 'on', while setup now arms a random
+// nonce — so it did not recognise setup's own transaction and recorded six
+// op='X' markers for sluice's own DDL, including on the change log and the
+// meta table themselves. The next resume then refuses sluice's statements
+// as operator DDL: Bug 257's shape, returning by a different route.
+//
+// The remedy is to keep the bodies current whenever a trigger is live, so
+// this reports whether one is. No new failure mode comes with it: the plan
+// already CREATE OR REPLACEs the ROW capture function, so any role that can
+// complete a re-run at all must already own the capture functions (measured
+// — a non-owner fails on `sluice_capture_change` before reaching these).
+func hasCaptureEventTriggers(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pg_catalog.pg_event_trigger WHERE evtname IN ($1, $2)`,
+		CaptureTriggerDDL, CaptureTriggerDrop).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("probe existing capture event triggers: %w", err)
+	}
+	return n > 0, nil
 }

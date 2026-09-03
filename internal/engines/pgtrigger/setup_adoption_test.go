@@ -60,7 +60,7 @@ func TestMissingFloorColumns(t *testing.T) {
 func TestInternalTableColumnFloorMatchesTheRenderedDDL(t *testing.T) {
 	rendered := renderSetupDDL("public",
 		[]tableTriggerSpec{{Name: "t", PKCols: []string{"id"}}},
-		true, CapturePayloadFull, false, nil)
+		true, false, CapturePayloadFull, false, nil)
 
 	got := parseCreatedTableColumns(rendered)
 	if len(got) < 3 {

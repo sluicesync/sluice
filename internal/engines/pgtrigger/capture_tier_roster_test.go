@@ -175,8 +175,8 @@ func TestCaptureTierRoster_EveryEmittedTrigger(t *testing.T) {
 		{Name: "orders", PKCols: []string{"id"}},
 		{Name: "line_items", PKCols: []string{"tenant_id", "order_id"}},
 	}
-	plain := renderSetupDDL("public", specs, true, CapturePayloadFull, false, nil)
-	optIn := renderSetupDDL("public", specs, true, CapturePayloadFull, true, nil)
+	plain := renderSetupDDL("public", specs, true, false, CapturePayloadFull, false, nil)
+	optIn := renderSetupDDL("public", specs, true, false, CapturePayloadFull, true, nil)
 
 	plainCreated, plainAlways := renderedTriggers(plain)
 	optInCreated, optInAlways := renderedTriggers(optIn)

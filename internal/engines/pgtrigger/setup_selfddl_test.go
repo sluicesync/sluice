@@ -54,7 +54,7 @@ func TestRenderSetupDDL_SelfDDLSuppression(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			stmts := renderSetupDDL("public", specs, tc.canEventTrigger, CapturePayloadFull, tc.captureRepl, nil)
+			stmts := renderSetupDDL("public", specs, tc.canEventTrigger, false, CapturePayloadFull, tc.captureRepl, nil)
 
 			if got := stmts[0]; got != "BEGIN" {
 				t.Errorf("plan does not OPEN with BEGIN (got %q) — the marker's off-state would ride a trailing statement again (C-1)", got)

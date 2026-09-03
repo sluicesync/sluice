@@ -68,7 +68,7 @@ func TestRenderSetupDDL_NeverTriggersInternalTables(t *testing.T) {
 	for i, name := range kept {
 		specs[i] = tableTriggerSpec{Name: name, PKCols: []string{"id"}}
 	}
-	ddl := strings.Join(renderSetupDDL("public", specs, false, CapturePayloadFull, false, nil), "\n")
+	ddl := strings.Join(renderSetupDDL("public", specs, false, false, CapturePayloadFull, false, nil), "\n")
 
 	for _, internal := range []string{ChangeLogTable, ChangeLogMetaTable} {
 		// "CREATE TRIGGER ... ON "public"."<internal>"" must not appear. The
