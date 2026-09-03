@@ -167,10 +167,16 @@ type schemaDeltaTargetApplySetter interface {
 // source: the first `MODIFY c TIMESTAMP` forwarded and every pre-existing
 // target row read 9 h off at exit 0.
 //
-// Implemented by all three MySQL CDC lanes. Postgres does not implement it
-// and needs no seed: pgoutput sends a RelationMessage on first touch,
-// before any DDL, so its relation cache already holds the prior. Readers
-// that don't implement it silently ignore, which is the old behaviour.
+// Implemented by all three MySQL CDC lanes and, since SLM-1c, by the
+// Postgres pgoutput reader. The earlier claim that Postgres "needs no
+// seed: pgoutput sends a RelationMessage on first touch, so its relation
+// cache already holds the prior" was true only within one process — the
+// cache is OID-keyed and process-local, so a swap performed while the
+// stream was cleanly stopped arrived as the resumed process's FIRST
+// RelationMessage and primed silently (measured on postgres:16, PG→PG and
+// PG→MySQL, both directions; pipeline.TestStreamer_PGSource_StoppedStreamZoneSwap).
+// Readers that don't implement it (the trigger-CDC lanes, which emit no
+// schema boundary at all) silently ignore, which is the old behaviour.
 type schemaSeedSetter interface {
 	SetSchemaSeed(tables []*ir.Table)
 }

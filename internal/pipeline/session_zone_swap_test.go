@@ -383,9 +383,9 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 // seed reaches a reader that accepts it, and the loader is cleared so
 // the next attempt cannot inherit it; a reader without the surface never
 // runs the loader (SLM-1b: the warm-resume loader reads the TARGET's
-// catalog, and a Postgres source — which has no seed surface — must not
-// pay for, or fail on, a read it consumes nothing from); a loader error
-// is the caller's to surface, never swallowed.
+// catalog, and a reader without the seed surface — the trigger-CDC lanes
+// — must not pay for, or fail on, a read it consumes nothing from); a
+// loader error is the caller's to surface, never swallowed.
 func TestWireReaderSchemaSeed_HandsOffOnceAndClears(t *testing.T) {
 	ctx := context.Background()
 	rec := &seedRecordingReader{}

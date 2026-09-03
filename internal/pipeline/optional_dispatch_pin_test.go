@@ -85,6 +85,11 @@ var (
 	// the refusal armed and inert on every first DDL. The VStream lanes are
 	// pinned in-package (mysql.schemaSeedSetter) for the same reason.
 	_ schemaSeedSetter = (*mysql.CDCReader)(nil)
+	// The Postgres pgoutput lane joined the seeding surface with SLM-1c
+	// (audit 2026-09-01): its OID-keyed relation cache belongs to one
+	// process, so without the seed a stopped-stream timestamp⇄timestamptz
+	// swap primed silently on every warm resume. Same reasoning as above.
+	_ schemaSeedSetter = (*postgres.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

@@ -61,6 +61,19 @@ package pipeline
 // than refused. Stated here rather than hidden; the fallback is logged per
 // table so an operator can see which tables resume on which prior.
 //
+// Two more, from the Postgres source's side (SLM-1c). The witness family
+// is the TIMESTAMP pair only: a target `time`/`timetz` read-back is not
+// admitted, because a MySQL target holds a source `timetz` as plain
+// `TIME` (the zone is dropped by documented policy) and would witness
+// every zoned time column as its naive sibling — a phantom swap at the
+// next boundary — so a stopped-stream `time`⇄`timetz` swap on a
+// Postgres source resumes with no prior for that column and is primed.
+// And the loader is installed only when a path re-applies deltas to the
+// target ([Streamer.schemaDeltaAppliesToTarget]); under
+// `--schema-changes=refuse` no lane is seeded, so a stopped-stream swap
+// in that mode primes on the Postgres lane too (the MySQL lanes' refusal
+// is unarmed there by the same choice).
+//
 // # Why the witness is safe to hand the reader
 //
 // The witness is projected to the zone-family columns ONLY
@@ -100,8 +113,8 @@ const retainedSchemaSeedLimit = 10_000
 // schemaSeedLoader produces the prior-shape seed for the reader about to
 // be wired. It is a closure rather than a value so the warm-resume witness
 // read of the target ([loadTargetZoneWitness]) runs ONLY for a reader
-// that accepts a seed: a Postgres source never implements
-// [schemaSeedSetter], and reading its target's catalog on every resume
+// that accepts a seed: the trigger-CDC lanes never implement
+// [schemaSeedSetter], and reading their target's catalog on every resume
 // would be a new failure surface for a lane that consumes nothing from it.
 type schemaSeedLoader func(ctx context.Context) ([]*ir.Table, error)
 

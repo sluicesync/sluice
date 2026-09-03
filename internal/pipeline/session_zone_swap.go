@@ -41,31 +41,14 @@ import (
 // express it, so a forwarded bare ALTER fails loudly rather than
 // diverging — mirrors the PG lane's own predicate).
 func sessionZoneSiblingSwap(prev, cur ir.Type) bool {
-	prevFamily, prevZoned, prevOK := zoneFamily(prev)
-	curFamily, curZoned, curOK := zoneFamily(cur)
-	return prevOK && curOK && prevFamily == curFamily && prevZoned != curZoned
+	return ir.ZoneSiblingSwap(prev, cur)
 }
 
-// zoneFamily classifies a type as (temporal family, carries-a-zone). Only
-// the families with a zone-sibling are members; everything else reports
-// ok=false and can never pair. Array-ness is folded into the family so an
-// element swap inside arrays matches and a dimension change does not.
+// zoneFamily classifies a type as (temporal family, carries-a-zone) —
+// [ir.ZoneFamily], the one declaration this door shares with the Postgres
+// reader's seeded first-boundary check (SLM-1c) so the two cannot drift.
 func zoneFamily(t ir.Type) (family string, zoned, ok bool) {
-	switch v := t.(type) {
-	case ir.Array:
-		f, z, ok := zoneFamily(v.Element)
-		return "array:" + f, z, ok
-	case ir.Timestamp:
-		return "timestamp", v.WithTimeZone, true
-	case ir.DateTime:
-		// MySQL DATETIME is the zone-naive sibling of TIMESTAMP: stored and
-		// returned unconverted, which is exactly why the cast between them
-		// has to invent a zone.
-		return "timestamp", false, true
-	case ir.Time:
-		return "time", v.WithTimeZone, true
-	}
-	return "", false, false
+	return ir.ZoneFamily(t)
 }
 
 // refuseSessionZoneSwap is the door: nil for every shape that is not a

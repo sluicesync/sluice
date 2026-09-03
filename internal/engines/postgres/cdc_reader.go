@@ -245,6 +245,15 @@ type CDCReader struct {
 	// gate.
 	schemaForward bool
 
+	// schemaSeed is the streamer's prior shape per in-scope table, keyed
+	// by [seedKey] (schema.name), consulted by the session-TimeZone cast
+	// refusal at a relation's FIRST RelationMessage of this process —
+	// the one boundary the OID-keyed `relations` cache can never check
+	// (SLM-1c; see cdc_schema_seed.go). Set by [CDCReader.SetSchemaSeed]
+	// BEFORE StreamChanges, then read only on the pump goroutine. nil
+	// (non-streamer callers) means no prior and the pre-SLM-1c prime.
+	schemaSeed map[string]*ir.Table
+
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.
 	mu  sync.Mutex
@@ -1109,6 +1118,12 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		// SLM-1c: the seeded prior stands in for the OID cache at this
+		// relation's first RelationMessage of the process — a
+		// stopped-stream zone swap is refused here or nowhere.
+		if err := r.checkSeededSchemaRace(relations, m.RelationID, entry); err != nil {
+			return err
+		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err
 		}
@@ -1145,6 +1160,12 @@ func (r *CDCReader) dispatchWAL(
 		}
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		// SLM-1c: the seeded prior stands in for the OID cache at this
+		// relation's first RelationMessage of the process — a
+		// stopped-stream zone swap is refused here or nowhere.
+		if err := r.checkSeededSchemaRace(relations, m.RelationID, entry); err != nil {
+			return err
 		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err

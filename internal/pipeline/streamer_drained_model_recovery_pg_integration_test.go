@@ -164,6 +164,23 @@ func TestStreamer_PGToPG_DrainedModelRecovery(t *testing.T) {
 			col:        "v",
 			value:      "after",
 		},
+		// SLM-1c: the live session-TimeZone cast refusal, then the
+		// recovery. After the operator's target ALTER the resumed
+		// process's first RelationMessage is checked against the SEEDED
+		// prior (the target's post-ALTER family), which now equals the
+		// wire shape — a seed taken from the history instead would refuse
+		// again, forever (the SLM-1b loop, on this lane).
+		{
+			name:       "timestamp-zone-swap/forward",
+			mode:       "forward",
+			create:     `CREATE TABLE t (id INT PRIMARY KEY, v TEXT, c TIMESTAMP); ALTER TABLE t REPLICA IDENTITY FULL; INSERT INTO t VALUES (1, 'seed', '2020-01-01 12:00:00');`,
+			sourceDDL:  `ALTER TABLE t ALTER COLUMN c TYPE TIMESTAMPTZ; INSERT INTO t VALUES (3, 'after', '2020-01-01 12:00:00+00');`,
+			targetDDL:  `ALTER TABLE t ALTER COLUMN c TYPE TIMESTAMPTZ;`,
+			want:       []string{"cannot be forwarded", `column "c"`, "TimeZone", "Drained-model recovery"},
+			finalTable: "t",
+			col:        "v",
+			value:      "after",
+		},
 	} {
 		t.Run(sc.name, func(t *testing.T) {
 			sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
