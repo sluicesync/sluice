@@ -40,7 +40,7 @@ param(
     [string]$Run = '',
     [string]$Timeout = '30m',
     [int]$Count = 1,
-    [string]$Image = 'golang:1.26.5'  # must satisfy go.mod's go >= directive
+    [string]$Image = 'golang:1.26.6'  # must satisfy go.mod's go >= directive
 )
 
 $ErrorActionPreference = 'Stop'

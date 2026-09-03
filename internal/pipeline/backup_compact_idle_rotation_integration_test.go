@@ -54,7 +54,11 @@ type bug139Sums struct {
 // Do NOT pass `pg_current_wal_lsn()` sampled after the writes: it also
 // counts slot/snapshot bookkeeping records the stream will never commit
 // past on an idle source, so the wait cannot succeed. Tried, and it hung
-// 48 bytes short of an unreachable target.
+// 48 bytes short of an unreachable target. And do not pass
+// `pg_current_wal_lsn()` sampled INSIDE the write's transaction either:
+// that is the WRITE pointer, which in an uncommitted transaction still
+// sits at the previous commit's end — a target the chain can satisfy
+// without the final write (see the caller's comment).
 //
 // It exists because "sleep and hope the rollover fired" is the shape that
 // turns a healthy stream into a red publish gate under CI load. The
@@ -106,6 +110,54 @@ func bug139Read(t *testing.T, dsn string) bug139Sums {
 		n:          pgQueryOne[int64](t, dsn, "SELECT COUNT(*) FROM accounts"),
 		sumID:      pgQueryOne[int64](t, dsn, "SELECT COALESCE(SUM(id),0) FROM accounts"),
 		sumBalance: pgQueryOne[int64](t, dsn, "SELECT COALESCE(SUM(balance),0) FROM accounts"),
+	}
+}
+
+// bug139Diagnose turns an oracle mismatch into a diagnosable failure: which
+// ids differ (source vs restored balance), the LSN the wait was keyed on, and
+// the chain's positions link by link — before and after compaction — so a
+// one-off CI miss says WHERE the update went (never captured, dropped at a
+// window boundary, or lost in the merge) instead of just that it did.
+func bug139Diagnose(t *testing.T, sourceDSN, targetDSN string, store irbackup.Store, lastWriteAt string, cats ...*lineage.Catalog) {
+	t.Helper()
+	const perID = "SELECT COALESCE(string_agg(id || '=' || balance, ',' ORDER BY id), '') FROM accounts"
+	src := strings.Split(pgQueryOne[string](t, sourceDSN, perID), ",")
+	dst := strings.Split(pgQueryOne[string](t, targetDSN, perID), ",")
+	dstSet := make(map[string]bool, len(dst))
+	for _, kv := range dst {
+		dstSet[kv] = true
+	}
+	for _, kv := range src {
+		if !dstSet[kv] {
+			t.Logf("diag: source row %s is not what the restore holds", kv)
+		}
+	}
+	t.Logf("diag: last write's in-transaction LSN (the wait's target) = %s", lastWriteAt)
+	ctx := context.Background()
+	for ci, cat := range cats {
+		if cat == nil {
+			continue
+		}
+		for si := range cat.Segments {
+			seg := &cat.Segments[si]
+			t.Logf("diag: catalog[%d] segment %d dir=%q start=%s end=%s coverage_start=%s incrementals=%d",
+				ci, si, seg.Dir, seg.StartPosition.Token, seg.EndPosition.Token, seg.IncrementalCoverageStart.Token, len(seg.Incrementals))
+			for _, p := range seg.Incrementals {
+				m, err := lineage.ReadManifestAt(ctx, store, p)
+				if err != nil {
+					t.Logf("diag:   incremental %s: read error %v", p, err)
+					continue
+				}
+				rows := int64(0)
+				for _, c := range m.ChangeChunks {
+					if c != nil {
+						rows += c.RowCount
+					}
+				}
+				t.Logf("diag:   incremental %s start=%s end=%s chunks=%d records=%d",
+					p, m.StartPosition.Token, m.EndPosition.Token, len(m.ChangeChunks), rows)
+			}
+		}
 	}
 }
 
@@ -338,16 +390,30 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 		for i := 0; i < 16; i++ {
 			if i == 15 {
 				// The last write reports its own WAL position, read in the
-				// SAME transaction so the value sits BEFORE that
-				// transaction's commit record. That makes it a target the
-				// stream is guaranteed to pass once it decodes this
-				// transaction — unlike `pg_current_wal_lsn()` sampled
-				// afterwards, which also counts slot/snapshot bookkeeping
-				// the stream will never commit past on an idle source (a
-				// 48-byte gap, and an unreachable wait, when tried).
+				// SAME transaction so the value sits AFTER this
+				// transaction's UPDATE record and BEFORE its commit record.
+				// That makes it a target the stream cannot reach without
+				// decoding this transaction — unlike `pg_current_wal_lsn()`
+				// sampled afterwards, which also counts slot/snapshot
+				// bookkeeping the stream will never commit past on an idle
+				// source (a 48-byte gap, and an unreachable wait, when tried).
+				//
+				// It MUST be the INSERT pointer. `pg_current_wal_lsn()` is
+				// the WRITE pointer, and inside a small uncommitted
+				// transaction nothing has written this transaction's records
+				// out yet, so it still equals the PREVIOUS transaction's
+				// commit end (measured on postgres:16: write == prior end,
+				// insert 72 bytes past it, five of five). Since A2-1 (audit
+				// 2026-09-01) that prior commit end is exactly the previous
+				// window's recorded EndPosition, so a window boundary that
+				// happens to land after the 15th write satisfied the wait
+				// with the 16th write uncaptured, the stream was cancelled,
+				// and the restore came back one balance short — the CI miss
+				// on 21dd1fd6. The chain was honest (its EndPosition really
+				// did precede that write); the wait's target was not.
 				lastWriteAt = pgQueryOne[string](t, sourceDSN, fmt.Sprintf(
 					`WITH u AS (UPDATE accounts SET balance = balance + 1 WHERE id = %d RETURNING 1)
-					 SELECT pg_current_wal_lsn()::text FROM u LIMIT 1`, (i%4)+1,
+					 SELECT pg_current_wal_insert_lsn()::text FROM u LIMIT 1`, (i%4)+1,
 				))
 				continue
 			}
@@ -441,6 +507,7 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 	got := bug139Read(t, targetDSN)
 	if got != oracle {
 		t.Errorf("restored healed+compacted chain != source oracle: got %+v want %+v", got, oracle)
+		bug139Diagnose(t, sourceDSN, targetDSN, store, lastWriteAt, healed, post)
 	}
 	t.Logf("Bug-139 resume-heal pin PROVEN: stamp-less segment resumed from P_N + stamped; whole chain compacted %d→1; restore == source (%+v)",
 		len(cat.Segments), oracle)
