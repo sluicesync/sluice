@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,14 @@ func TestDDLCaptureFunctionSearchPath_ShadowedBuiltin(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
+	// The fixture SQL below spells the capture trigger name literally (it is
+	// a raw string). Bind it to the constant so a rename cannot silently
+	// leave these tables uncaptured — which would make every assertion in
+	// this file pass for the wrong reason.
+	if CaptureTriggerRow != "sluice_capture" {
+		t.Fatalf("CaptureTriggerRow is %q; the fixture SQL below hardcodes \"sluice_capture\" and must be updated together", CaptureTriggerRow)
+	}
+
 	// The attacker: an ordinary LOGIN role with a schema of its own. It is
 	// given no privilege beyond CREATE on that schema and write access to
 	// the observation table — deliberately NOT superuser, NOT the table
@@ -126,6 +135,21 @@ CREATE TABLE sec1_pwned (whoami TEXT, is_superuser TEXT, escalation TEXT);
 CREATE ROLE lowpriv LOGIN PASSWORD 'lowpriv';
 CREATE SCHEMA lowpriv AUTHORIZATION lowpriv;
 GRANT INSERT, SELECT, DELETE ON sec1_pwned TO lowpriv;
+-- Audit SLP-2: the DDL tier records only relations this install captures,
+-- so every table these sub-tests fire DDL against must carry the row-capture
+-- trigger BY NAME -- otherwise the capture body never runs and the exploit
+-- assertions below are vacuous. The trigger's FUNCTION is irrelevant to that
+-- predicate, so a no-op keeps the fixture honest about what it stands in for.
+CREATE FUNCTION public.slp2_noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TABLE lowpriv.pre_fix_tbl (id int);
+CREATE TABLE lowpriv.post_fix_tbl (id int);
+CREATE TABLE lowpriv.temp_shadow_tbl (id int);
+ALTER TABLE lowpriv.pre_fix_tbl OWNER TO lowpriv;
+ALTER TABLE lowpriv.post_fix_tbl OWNER TO lowpriv;
+ALTER TABLE lowpriv.temp_shadow_tbl OWNER TO lowpriv;
+CREATE TRIGGER sluice_capture AFTER INSERT ON lowpriv.pre_fix_tbl FOR EACH ROW EXECUTE FUNCTION public.slp2_noop();
+CREATE TRIGGER sluice_capture AFTER INSERT ON lowpriv.post_fix_tbl FOR EACH ROW EXECUTE FUNCTION public.slp2_noop();
+CREATE TRIGGER sluice_capture AFTER INSERT ON lowpriv.temp_shadow_tbl FOR EACH ROW EXECUTE FUNCTION public.slp2_noop();
 `)
 
 	// The shadow. Its body records the identity it executes under and
@@ -167,11 +191,23 @@ $shadow$;`
 			t.Fatalf("reset observations: %v", err)
 		}
 	}
-	// fireDDL runs one CREATE TABLE as lowpriv with the attacker's schema
-	// first on the search_path — the whole exploit input.
+	// fireDDL runs one ALTER as lowpriv with the attacker's schema first on
+	// the search_path — the whole exploit input.
+	//
+	// It must be an ALTER on a table lowpriv owns AND that carries the
+	// row-capture trigger. Since audit SLP-2 the DDL tier records only
+	// commands whose relation this install captures, so the bare
+	// `CREATE TABLE lowpriv.x` this used to fire leaves the capture body's
+	// loop empty — and every assertion below depends on that body actually
+	// RUNNING. A DDL that records nothing would make the whole test
+	// vacuously green, which is the failure mode this comment exists to
+	// stop the next reader from reintroducing.
+	fireSeq := 0
 	fireDDL := func(t *testing.T, table, pathSchema string) {
 		t.Helper()
-		script := "SET search_path = " + pathSchema + ", public;\nCREATE TABLE lowpriv." + table + " (id int);"
+		fireSeq++
+		script := "SET search_path = " + pathSchema + ", public;\n" +
+			"ALTER TABLE lowpriv." + table + " ADD COLUMN c" + strconv.Itoa(fireSeq) + " int;"
 		if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv", script); err != nil {
 			t.Fatalf("fire DDL as lowpriv: %v", err)
 		}
@@ -279,7 +315,7 @@ $shadow$;`
 		// Plant + fire in ONE session: a temp function lives only for the
 		// session that created it.
 		script := strings.ReplaceAll(shadowBody, "%SCHEMA%", "pg_temp") +
-			"\nCREATE TABLE lowpriv.temp_shadow_tbl (id int);"
+			"\nALTER TABLE lowpriv.temp_shadow_tbl ADD COLUMN c1 int;"
 		if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv", script); err != nil {
 			t.Fatalf("plant pg_temp overload + fire DDL as lowpriv: %v", err)
 		}

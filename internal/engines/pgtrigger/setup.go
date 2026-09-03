@@ -2316,7 +2316,7 @@ func quoteSQLString(s string) string {
 func hasCaptureEventTriggers(ctx context.Context, db *sql.DB) (bool, error) {
 	var n int
 	err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM pg_catalog.pg_event_trigger WHERE evtname IN ($1, $2)`,
+		`SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger WHERE evtname IN ($1, $2)`,
 		CaptureTriggerDDL, CaptureTriggerDrop).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("probe existing capture event triggers: %w", err)

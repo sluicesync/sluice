@@ -474,13 +474,21 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, errors.New("postgres: StreamChanges already in progress; construct a new reader for a second stream")
 	}
 
-	if err := checkWALLevel(ctx, r.db); err != nil {
+	// Bug 263 (v0.139.0 regression cycle): the standby check runs BEFORE
+	// checkWALLevel, because on a hot standby at wal_level=replica — the
+	// Postgres default, and what a plain streaming read replica actually
+	// runs — BOTH conditions hold, and whichever fires first is the error
+	// the caller sees. wal_level-first was actively misleading: it told the
+	// operator to set wal_level=logical on a server that inherits the
+	// setting from its primary and cannot change it, and on the backup path
+	// it also meant the coded standby refusal never reached the fallback
+	// door, so the run copied the whole database before dying at the
+	// position capture. A standby is never a valid CDC or backup-anchor
+	// source at any wal_level, so it is the more specific answer.
+	if err := checkNotStandby(ctx, r.db); err != nil {
 		return nil, err
 	}
-	// A hot standby / read replica cannot be a CDC source (Bug 197) —
-	// refuse with the coded primary-endpoint steer before any source
-	// write or replication command.
-	if err := checkNotStandby(ctx, r.db); err != nil {
+	if err := checkWALLevel(ctx, r.db); err != nil {
 		return nil, err
 	}
 

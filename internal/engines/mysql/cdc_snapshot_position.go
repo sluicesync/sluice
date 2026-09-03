@@ -131,8 +131,15 @@ func (e Engine) snapshotHandoffPosition(ctx context.Context, q rowQuerier, cut s
 // arm so a run's log says which resume mode the cold start is on
 // without the operator decoding the token.
 func logSnapshotHandoff(ctx context.Context, msg, freeze string, cut snapshotCut, useGTID bool) {
+	// Bug 264 (v0.139.0 regression cycle): report the arm actually TAKEN,
+	// not the one the mode probe asked for. A GTID-mode source that has
+	// executed nothing falls back to file/pos (see
+	// warnEmptyGTIDSetFallsBackToFilePos), and this line used to announce
+	// `position_mode=gtid gtid_set=""` four milliseconds before the token it
+	// describes was persisted as `{"mode":"file_pos",…}` — a diagnostic that
+	// contradicted the thing it was diagnosing.
 	mode := positionModeFilePos
-	if useGTID {
+	if useGTID && cut.GTIDSet != "" {
 		mode = positionModeGTID
 	}
 	slog.InfoContext(

@@ -134,15 +134,22 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		return nil, err
 	}
 
-	if err := checkWALLevel(ctx, db); err != nil {
+	// Bug 263 (v0.139.0 regression cycle): the standby check runs BEFORE
+	// checkWALLevel, because on a hot standby at wal_level=replica — the
+	// Postgres default, and what a plain streaming read replica actually
+	// runs — BOTH conditions hold, and whichever fires first is the error
+	// the caller sees. wal_level-first was actively misleading: it told the
+	// operator to set wal_level=logical on a server that inherits the
+	// setting from its primary and cannot change it, and on the backup path
+	// it also meant the coded standby refusal never reached the fallback
+	// door, so the run copied the whole database before dying at the
+	// position capture. A standby is never a valid CDC or backup-anchor
+	// source at any wal_level, so it is the more specific answer.
+	if err := checkNotStandby(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	// A hot standby / read replica cannot host the snapshot+CDC handoff
-	// (Bug 197): publication management always writes, and standby slot
-	// creation blocks on the primary. Refuse with the primary steer
-	// before the publication ensure below touches the source.
-	if err := checkNotStandby(ctx, db); err != nil {
+	if err := checkWALLevel(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
