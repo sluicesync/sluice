@@ -457,6 +457,15 @@ jobs:
       # generalized). pipefail keeps the tee from masking the test exit
       # code.
       - name: Integration tests (verbose, teed for the fail-on-skip guard)
+        # GOTRACEBACK=crash: roadmap item 85 / audit 2026-09-01 — the
+        # engines-mysql shard has died twice with a trace-less
+        # `signal: segmentation fault` (no Go panic, no TSan report), i.e.
+        # below Go's signal layer. With `crash`, a fatal signal dumps every
+        # goroutine (runtime frames included) before the process dies, so
+        # the next occurrence is diagnosable from the log instead of being
+        # a third data point. No effect on a passing run.
+        env:
+          GOTRACEBACK: crash
         run: |
           set -o pipefail
           go test -tags=integration -race -count=1 -timeout=${{ vars.CI_INTEGRATION_TIMEOUT || '35m' }} -v ${{ matrix.shard.goflags }} ${{ matrix.shard.packages }} 2>&1 | tee shard-test-output.txt
