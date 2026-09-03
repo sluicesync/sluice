@@ -46,8 +46,21 @@ for g in $ci_guards; do
 	# is not present — the base name is what actually appears in both styles.
 	base=${g%.sh}
 	in_sh=no; in_ps1=no
-	grep -qF "$base" "$HOOK_SH" && in_sh=yes
-	grep -qF "$base" "$HOOK_PS1" && in_ps1=yes
+	# Comments and messages do not run guards. A reference counts only on
+	# a non-comment line that either invokes the script by path
+	# (`scripts/<guard>`) or lists it in the guard loop's header (`for g in
+	# …` / `foreach ($g in @(…))`). Audit 2026-09-01 DDD-7: a hook that
+	# merely MENTIONED a guard in a comment satisfied this check, and the
+	# first fix (strip comments) was still satisfied by a Write-Host
+	# message naming the guard — both mutation-proven.
+	# Single-quoted pattern pieces: `$[` inside double quotes is bash
+	# arithmetic expansion and blew up under set -u on the first cut.
+	runs_guard() {
+		grep -vE '^[[:space:]]*#' "$1" | grep -qE \
+			'^[[:space:]]*(if +!? *)?(sh|bash|& +\$shExe) +"?scripts/'"$base"'(\.sh)?([^A-Za-z0-9_-]|$)|^[[:space:]]*for [A-Za-z_]+ in.*[^A-Za-z0-9_-]'"$base"'([^A-Za-z0-9_-]|$)|^[[:space:]]*foreach \(\$[A-Za-z_]+ in.*[^A-Za-z0-9_-]'"$base"'([^A-Za-z0-9_-]|$)'
+	}
+	runs_guard "$HOOK_SH" && in_sh=yes
+	runs_guard "$HOOK_PS1" && in_ps1=yes
 	if [ "$in_sh" = yes ] && [ "$in_ps1" = yes ]; then
 		echo "check-local-gate-parity: $g — in ci.yml + both local hooks. OK."
 	else

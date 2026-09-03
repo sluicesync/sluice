@@ -265,7 +265,7 @@ Configuration loading and CLI parsing details are discussed in [ADR-0003](adr/ad
 
 These are real questions that affect architecture but don't need answers before code starts. Captured here so they aren't lost.
 
-**Schema drift during continuous sync.** MySQL binlog carries DDL; PostgreSQL logical replication does not. Initial behaviour: pause sync on detected source-side DDL and require explicit operator action. Auto-application is a v2 feature.
+**Schema drift during continuous sync.** MySQL binlog carries DDL; PostgreSQL logical replication does not, so the Postgres lanes detect drift from relation messages (native) or record it through event triggers (`postgres-trigger`). What happens next is the `--schema-changes` mode: `forward` (the default) translates additive and type-changing DDL through the IR and applies it to the target at the boundary, `refuse` stops the stream with the drained-model remedy, and a small set of shapes always refuse because forwarding them would silently change stored values (the MySQL session-time-zone `TIMESTAMP`⇄`DATETIME` cast, drops of synced tables). ADR-0091 is the design and `docs/schema-change-runbook.md` the operator procedure; the "pause and require operator action" posture this paragraph originally described is what `refuse` mode still does.
 
 **Active-active replication.** Out of scope for v1. Sync is unidirectional.
 

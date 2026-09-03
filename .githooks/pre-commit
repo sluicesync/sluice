@@ -109,6 +109,24 @@ for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-covera
 	fi
 done
 
+# ---- CI coverage guards ----
+# These two run in CI's Lint job; without them here, adding
+# integration-tagged tests in an uncovered package (or a tagged test
+# whose name escapes its job's -run filter) passes the full local gate
+# and only fails in CI — contradicting "make pre-commit runs everything
+# CI runs". Both are pure git-ls-files/grep, sub-second — which is why
+# they sit ABOVE the Go-staged early return (audit 2026-09-01 DDD-5):
+# the shard list lives in ci.yml and a -run filter in a workflow file,
+# so the commit that breaks either can stage no Go file at all.
+if ! sh scripts/check-shard-coverage.sh; then
+	red "pre-commit: check-shard-coverage failed (integration tests outside every CI shard)."
+	exit 1
+fi
+if ! sh scripts/check-run-filter-coverage.sh; then
+	red "pre-commit: check-run-filter-coverage failed (a tagged test would never run in any workflow)."
+	exit 1
+fi
+
 # Only run Go checks if Go files are staged. Lets non-code commits
 # (docs, CI config, etc.) skip the slow steps. Everything ABOVE this line
 # is text-shaped and applies to every commit.
@@ -157,20 +175,6 @@ if ! sh scripts/vet-tags.sh; then
 	exit 1
 fi
 
-# ---- CI coverage guards ----
-# These two run in CI's Lint job; without them here, adding
-# integration-tagged tests in an uncovered package (or a tagged test
-# whose name escapes its job's -run filter) passes the full local gate
-# and only fails in CI — contradicting "make pre-commit runs everything
-# CI runs". Both are pure git-ls-files/grep, sub-second.
-if ! sh scripts/check-shard-coverage.sh; then
-	red "pre-commit: check-shard-coverage failed (integration tests outside every CI shard)."
-	exit 1
-fi
-if ! sh scripts/check-run-filter-coverage.sh; then
-	red "pre-commit: check-run-filter-coverage failed (a tagged test would never run in any workflow)."
-	exit 1
-fi
 
 # ---- go test (fast, no DB) ----
 # -race is preferred but requires cgo. On Windows / minimal-toolchain

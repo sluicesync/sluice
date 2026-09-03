@@ -61,7 +61,7 @@ func tiers(ddlEvt, dropEvt eventTriggerState) ddlCaptureState {
 // healthyTiers is the full event-trigger install both arms healthy.
 func healthyTiers() ddlCaptureState { return tiers(healthyEvt, healthyDropEvt) }
 
-// preDropArmTiers is an install made before v0.135: the ddl_command_end arm
+// preDropArmTiers is an install made before v0.136.0: the ddl_command_end arm
 // exists, the sql_drop one was never created. Graded as EXEMPT (the WARN
 // carries it — warnDropCaptureAbsent), never as a refusal, so upgrading the
 // binary cannot strand a running sync.

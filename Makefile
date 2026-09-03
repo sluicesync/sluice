@@ -75,10 +75,16 @@ fmt-check: ## Verify formatting without writing changes (exits non-zero if any f
 		exit 1; \
 	fi
 
-coverage-guards: ## Run CI Lint's tree/test guards (tree-hygiene + shard + -run-filter)
+coverage-guards: ## Run every CI Lint guard the pre-commit hooks run (tree-hygiene, shard, -run-filter, skills-flags, schedule-consumers, leg-nonvacuity, dialect-translator roster, local-gate parity, notes-claims selftest)
 	sh scripts/check-tree-hygiene.sh
 	sh scripts/check-shard-coverage.sh
 	sh scripts/check-run-filter-coverage.sh
+	sh scripts/check-skills-flags.sh
+	sh scripts/check-schedule-consumers.sh
+	sh scripts/check-leg-nonvacuity-coverage.sh
+	sh scripts/check-dialect-translator-roster.sh
+	sh scripts/check-local-gate-parity.sh
+	sh scripts/check-notes-claims-selftest.sh
 
 pre-commit: fmt-check vet vet-tags coverage-guards lint test ## Run the full local gate (mirrors CI: format, vet, tags-vet, coverage guards, lint, fast tests)
 	@echo "OK — ready to commit."

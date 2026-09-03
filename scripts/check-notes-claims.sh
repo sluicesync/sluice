@@ -142,7 +142,12 @@ fi
 #      camelCase out of the claim set. sluice's notes backtick their own
 #      symbols, so nothing real is lost.
 ids_codes=$(grep -oE 'SLUICE-E-[A-Z][A-Z-]*[A-Z]' "$NOTES" || true)
-ids_files=$(grep -oE '[A-Za-z0-9_.-]*[A-Za-z0-9_-]\.(go|md|log|sh)' "$NOTES" || true)
+# The extension must END the token: without the boundary, `pg_catalog.md5(`
+# yields the phantom claim `pg_catalog.md`, which the old substring content
+# leg then "resolved" against the very same `pg_catalog.md5` — a claim the
+# notes never made, satisfied by evidence of something else (found when
+# the word-boundary leg below started refusing it on v0.137.4's archive).
+ids_files=$(grep -oE '[A-Za-z0-9_.-]*[A-Za-z0-9_-]\.(go|md|log|sh)\b' "$NOTES" || true)
 ids_tests=$(grep -owE 'Test[A-Z][A-Za-z0-9_]+' "$NOTES" || true)
 ids_markers=$(grep -oE '[A-Z][A-Z0-9]+(-[A-Z0-9]+)+' "$NOTES" || true)
 ids_symbols=$(grep -oE '`[^`]*`' "$NOTES" | tr -d '`' | grep -owE '[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*' || true)
@@ -155,11 +160,19 @@ extracted=$(
 
 # The CODE-shaped subset, for floor part (b): everything except plain doc
 # file names and bare ADR references, which name artifacts rather than code.
+#
+# A marker counts as code-shaped only when it could be sluice's own: the
+# ALL-CAPS-HYPHENATED regex also matches standards and formats a release
+# might mention in passing (UTF-8, SHA-256, RFC-3339, ISO-8601, TLS-1.3,
+# PG-16), and audit 2026-09-01 TCI-2 found a notes file whose entire
+# code-shaped floor was `UTF-8` and `SHA-256`. An acronym followed only by
+# numbers/dots is that shape and is excluded from the FLOOR (it is still
+# checked as a claim like everything else).
 codeshaped=$(
 	{
 		printf '%s\n%s\n%s\n' "$ids_codes" "$ids_tests" "$ids_symbols"
 		printf '%s\n' "$ids_files" | grep -E '\.(go|sh)$' || true
-		printf '%s\n' "$ids_markers" | grep -vE '^ADR-[0-9]+$' || true
+		printf '%s\n' "$ids_markers" | grep -vE '^ADR-[0-9]+$' | grep -vE '^[A-Z]+(-[0-9.]+)+$' || true
 	} | grep -v '^$' | sort -u || true
 )
 
@@ -222,15 +235,19 @@ checked=0
 for ident in $extracted; do
 	checked=$((checked + 1))
 	# Content match first, scoped to the implementation allowlist
-	# (fixed-string: identifiers carry regex metacharacters like dots).
+	# (fixed-string: identifiers carry regex metacharacters like dots;
+	# whole-word: a PREFIX of a real symbol is not that symbol — audit
+	# 2026-09-01 TCI-2 showed `realSymbo` resolving against `realSymbol`).
 	# shellcheck disable=SC2086 # EVIDENCE_SCOPE is a deliberate pathspec list
-	if git grep -q -F -e "$ident" "$TAG" -- $EVIDENCE_SCOPE 2>/dev/null; then
+	if git grep -q -w -F -e "$ident" "$TAG" -- $EVIDENCE_SCOPE 2>/dev/null; then
 		echo "check-notes-claims:   content   $ident"
 		continue
 	fi
 	# Filename fallback: git grep matches CONTENT, not names, and a pure
 	# file-name claim (probe_timeout.go) can be real while un-mentioned.
-	if printf '%s\n' "$tree_names" | grep -qF "$ident"; then
+	# The claim must be a whole path component or path suffix, not a
+	# substring of one (same TCI-2 reason).
+	if printf '%s\n' "$tree_names" | grep -qE "(^|/)$(printf '%s' "$ident" | sed 's/[][\\.^$*+?(){}|]/\\&/g')\$"; then
 		echo "check-notes-claims:   filename  $ident"
 		continue
 	fi

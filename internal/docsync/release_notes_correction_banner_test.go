@@ -88,6 +88,15 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 137, 0},
+		fixedIn:     semver{0, 137, 1},
+		claimMarker: "Every existing pgtrigger install warns until `sluice trigger setup` is re-run once",
+		why: "the STALE-CAPTURE-FUNCTION warning fires only when an install's capture function definitions " +
+			"differ from what the binary renders; a byte-identical install (v0.136.0) opens silent, so the " +
+			"headline over-claimed. The archive was silently rewritten and the CHANGELOG never corrected " +
+			"(audit 2026-09-01 DDD-1); the original sentence is restored and both homes carry the banner",
+	},
+	{
 		amended:     semver{0, 137, 2},
 		fixedIn:     semver{0, 138, 0},
 		claimMarker: "GTID mode, where GTID UUIDs are themselves instance-bound and were always checked",

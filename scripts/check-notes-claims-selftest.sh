@@ -259,9 +259,42 @@ if run_case notes-name-self v9.9.7 1; then
 	expect notes-name-self "MISSING from v9.9.7: release-notes-v9.9.7.md"
 fi
 
+# ---- case 8: prefix / substring claims (audit 2026-09-01 TCI-2) ----
+# `realSelfTestSym` is a PREFIX of the real symbol and `iet_file.go` a
+# SUFFIX of the real file name. With the content leg a plain substring
+# grep and the filename leg a plain -F grep, both resolved; both must be
+# MISSING. The honest code keeps the floor satisfied so the failure is
+# per-claim.
+cat >"$bodies/case8.md" <<'EOF'
+# sluice v9.9.8
+
+Refines `realSelfTestSym` in `iet_file.go`; also `SLUICE-E-SELFTEST-REAL`. See CHANGELOG.md.
+EOF
+tag_notes v9.9.8 "$bodies/case8.md"
+if run_case prefix-claims v9.9.8 1; then
+	expect prefix-claims "MISSING from v9.9.8: realSelfTestSym"
+	expect prefix-claims "MISSING from v9.9.8: iet_file.go"
+	expect prefix-claims "content   SLUICE-E-SELFTEST-REAL"
+fi
+
+# ---- case 9: acronym-number markers are not code-shaped (TCI-2) ----
+# UTF-8 and SHA-256 match the ALL-CAPS-HYPHENATED marker regex and would
+# have carried the code-shaped floor on their own; with only them and a
+# doc file, the notes are non-vacuous (3 non-ubiquitous claims) but name
+# no code, and the gate must say so.
+cat >"$bodies/case9.md" <<'EOF'
+# sluice v9.9.9
+
+Documents the UTF-8 and SHA-256 handling in `adr-0999-selftest.md`. See CHANGELOG.md.
+EOF
+tag_notes v9.9.9 "$bodies/case9.md"
+if run_case acronym-markers v9.9.9 1; then
+	expect acronym-markers "none is code-shaped"
+fi
+
 if [ "$fail" -ne 0 ]; then
 	echo "check-notes-claims-selftest: FAILED — the notes-claims gate does not behave as documented." >&2
 	exit 1
 fi
 
-echo "check-notes-claims-selftest: all 7 cases behave as documented (self-reference on both legs, camelCase shape, filename fallback, both floor legs, exemption)."
+echo "check-notes-claims-selftest: all 9 cases behave as documented (self-reference on both legs, camelCase shape, filename fallback, both floor legs, exemption, prefix/suffix claims, acronym markers)."
