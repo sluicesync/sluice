@@ -14,13 +14,13 @@ A `d1-trigger` stream could silently skip changes, on every version since v0.99.
 
 **The publication-exposure warning printed a remedy that wedges the stream (Bug 267).** It suggested dropping the publication to restore the writes it had named as broken. On a running stream that pins the slot restart position behind the DROP record and the stream can never resume, failing with `publication "sluice_pub" does not exist` while it demonstrably exists; recovery costs a slot drop and a full re-copy, and the publication that recreates is database-wide again. Both warnings now say not to, and name `sluice sync decommission` instead.
 
-**Both exposure warnings described sets they do not report.** The `backup full --chain-slot` one said it named tables the run does not read; it names every at-risk table in the database. The multi-schema `sync start` one said "outside the schemas you selected", while its set also includes a table removed with `--exclude-table` from a selected schema — the case it exists for.
+**Both `UNSELECTED-NAMESPACE-EXPOSURE` warnings described sets they do not report.** The `backup full --chain-slot` one said it named tables the run does not read; it names every at-risk table in the database. The multi-schema `sync start` one said "outside the schemas you selected", while its set also includes a table removed with `--exclude-table` from a selected schema — the case it exists for.
 
 ### Compatibility
 
 Drop-in from v0.141.0. No flag change, no format change, no new error codes.
 
-If you have run a `d1-trigger` stream on any version from v0.99.175 onward whose change log has ever exceeded one page, changes may be missing on the target and sluice cannot tell you which — the position advanced past them, so they are indistinguishable from delivered ones. Re-snapshot the affected tables to be certain.
+To judge exposure, look at how large `sluice_change_log` grows between polls. If you have run a `d1-trigger` stream on any version from v0.99.175 onward whose change log has ever exceeded one page, changes may be missing on the target and sluice cannot tell you which — the position advanced past them, so they are indistinguishable from delivered ones. Re-snapshot the affected tables to be certain.
 
 ## [0.141.0] - 2026-09-04
 

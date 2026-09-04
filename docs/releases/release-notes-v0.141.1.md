@@ -12,13 +12,13 @@ Measured on a live database: a backlog drained with 50 of 53 rows on the target.
 
 **The publication-exposure warning told you to do something that leaves the stream unable to resume.** It suggested dropping the publication to restore writes it had named as broken. Doing that on a running stream pins the replication slot's restart position behind the drop, and the stream then fails to resume — reporting that the publication does not exist while it demonstrably does. Recovering costs dropping the slot and re-copying from scratch, and the publication that recreates is database-wide again. Both warnings now say not to, and point at `sluice sync decommission` instead, which retires the slot and the publication together.
 
-**Both exposure warnings described sets they do not report.** The one raised by `backup full --chain-slot` said it named tables the run does not read; it names every at-risk table in the database, including ones it does. The one raised by a multi-schema `sync start` said "outside the schemas you selected", while its set deliberately also includes a table you removed with `--exclude-table` from a schema you did select — which is the case it was built for. Both now say what they report.
+**Both `UNSELECTED-NAMESPACE-EXPOSURE` warnings described sets they do not report.** The one raised by `backup full --chain-slot` said it named tables the run does not read; it names every at-risk table in the database, including ones it does. The one raised by a multi-schema `sync start` said "outside the schemas you selected", while its set deliberately also includes a table you removed with `--exclude-table` from a schema you did select — which is the case it was built for. Both now say what they report.
 
 ## Compatibility
 
 Drop-in from v0.141.0. No flag change, no format change, no new error codes.
 
-If you have run a `d1-trigger` stream against Cloudflare D1 on any version from v0.99.175 onward, and its change log has ever exceeded one page, changes may be missing on the target. sluice cannot tell you which: the position advanced past them, so they are indistinguishable from changes that were delivered. Re-snapshotting the affected tables is the only way to be certain.
+If you have run a `d1-trigger` stream against Cloudflare D1 on any version from v0.99.175 onward, and its change log has ever exceeded one page, changes may be missing on the target. sluice cannot tell you which: the position advanced past them, so they are indistinguishable from changes that were delivered. Re-snapshotting the affected tables is the only way to be certain. To judge whether you were ever exposed, look at how large `sluice_change_log` has grown between polls — a stream restarted after any pause is the usual way it passes 1,000 rows.
 
 ## Who needs this
 
