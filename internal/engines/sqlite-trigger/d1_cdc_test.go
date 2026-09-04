@@ -630,10 +630,22 @@ func TestD1Capture_WatermarkBoundAsString(t *testing.T) {
 	if len(m.pollSQL) == 0 {
 		t.Fatal("no poll request recorded")
 	}
-	if !strings.Contains(m.pollSQL[0], `CAST(id AS TEXT) AS id`) ||
+	if !strings.Contains(m.pollSQL[0], `AS TEXT) AS id`) ||
 		!strings.Contains(m.pollSQL[0], `WHERE id > ?`) ||
 		!strings.Contains(m.pollSQL[0], "LIMIT ") {
 		t.Errorf("poll SQL not the expected CAST/keyset SELECT: %q", m.pollSQL[0])
+	}
+	// The ORDER BY must be QUALIFIED, and this assertion is here because its
+	// absence is what let Bug 266 ship. This test pinned the CAST, the keyset
+	// WHERE and the presence of a LIMIT — everything except the clause that
+	// decides what the LIMIT truncates. `CAST(id AS TEXT) AS id` shadows the
+	// integer column, SQLite resolves ORDER BY against output aliases first,
+	// and a bare `ORDER BY id` therefore sorted the TEXT: 1, 10, 11, 12, 2, 3,
+	// 9. With a truncating page that silently skips every lower id which
+	// sorted later.
+	if !strings.Contains(m.pollSQL[0], `ORDER BY "`+ChangeLogTable+`".id ASC`) {
+		t.Errorf("poll SQL does not qualify its ORDER BY — an unqualified term binds to the CAST alias and "+
+			"sorts lexicographically, which skips rows once the page truncates (Bug 266): %q", m.pollSQL[0])
 	}
 	if m.pollArgs[0] != "2" {
 		t.Errorf("first poll watermark param = %q; want \"2\" (string-bound)", m.pollArgs[0])
