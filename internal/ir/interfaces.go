@@ -2144,6 +2144,45 @@ type ReplicaIdentityPreflighter interface {
 	PreflightReplicaIdentity(ctx context.Context, tables []string) error
 }
 
+// UnselectedNamespaceExposureAuditor is the optional SOURCE-engine
+// surface (implemented on a [SchemaReader]) that a MULTI-NAMESPACE cold
+// start consults before it opens the spanning snapshot, to report the
+// tables its own action is about to break OUTSIDE the namespaces the
+// operator selected.
+//
+// [ReplicaIdentityPreflighter] is the same hazard scoped to what the
+// operator asked for. This is the half nobody asked for: a multi-schema
+// sync needs a database-wide logical slot, so the publication it opens is
+// FOR ALL TABLES, and that reaches every table in the database. A
+// permanent logged table in an unrelated schema with no usable replica
+// identity stops accepting UPDATE and DELETE the moment the publication
+// exists, in an application that has nothing to do with this sync.
+//
+// It WARNS rather than refusing, which is a policy decision recorded
+// here so it is not re-litigated: the tables are outside the operator's
+// declared scope, so refusing would block a sync over a schema they
+// deliberately excluded. They cannot discover the exposure any other
+// way, and a warning demands nothing of them.
+//
+// Measured on real PostgreSQL 16.15, 17.11, 18.6 and 19beta1, all
+// identical, and the at-risk set is narrower than "every table":
+// pg_publication_tables for a FOR ALL TABLES publication resolves to
+// exactly relkind='r' AND relpersistence='p'. An UNLOGGED table, a
+// partitioned PARENT, a view and a materialized view are all outside it
+// (leaf partitions are inside). Implementations must not report a
+// relation the publication would not actually cover, or the warning
+// names tables that were never at risk.
+//
+// excluded is the set of namespaces the operator DID select; those are
+// [ReplicaIdentityPreflighter]'s business and are skipped here so one
+// table cannot be reported twice. Implementations return the qualified
+// names, sorted, and nil when there is nothing to report. Engines
+// without the surface skip silently: only a publication-scoped source
+// can reach this at all.
+type UnselectedNamespaceExposureAuditor interface {
+	AuditUnselectedNamespaceExposure(ctx context.Context, excluded []string) ([]string, error)
+}
+
 // UpsertKeyPreflighter is the optional TARGET-engine surface (implemented
 // on a [ChangeApplier]) the streamer consults once the target schema
 // exists and before the first change is applied: it verifies that every

@@ -283,6 +283,89 @@ func sortedPreflightKeys[V any](m map[string]V) []string {
 //     and a published table with no replica identity is one Postgres
 //     refuses to UPDATE — so a refusal that arrives afterwards has already
 //     let sluice break the operator's application.
+//
+// TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists is A2-4b's
+// call-site gate, and it exists because its two immediate predecessors both
+// shipped a working helper that nothing reached.
+//
+// A2-3's first pin graded the two slot-aware helpers and stayed green when a
+// CALL SITE was reverted to the unnamed opener. A2-4's roster asked whether a
+// listed function calls the preflight and stayed green when the call site was
+// deleted, because an orphaned helper still called it. Both were found only by
+// mutating. A warning is even easier to lose than a refusal: nothing fails
+// when it stops being emitted, so there is no symptom at all.
+//
+// The ordering matters for the same reason it does for the refusing sibling.
+// The spanning snapshot open is what creates the FOR ALL TABLES publication,
+// which is what breaks the unselected schemas' writes. A warning emitted after
+// it describes damage already done.
+func TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists(t *testing.T) {
+	const (
+		file     = "streamer_multidb.go"
+		warn     = "warnUnselectedNamespaceExposure"
+		snapshot = "openMultiDatabaseSnapshotStreamWithOptionalSlot"
+		entry    = "coldStartMultiDatabase"
+	)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if ok && fd.Name.Name == entry && fd.Body != nil {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatalf("%s declares no %s — this gate has lost its subject", file, entry)
+	}
+
+	warnAt, snapshotAt := token.NoPos, token.NoPos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name := ""
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			name = fun.Name
+		case *ast.SelectorExpr:
+			name = fun.Sel.Name
+		}
+		switch name {
+		case warn:
+			if !warnAt.IsValid() {
+				warnAt = call.Pos()
+			}
+		case snapshot:
+			if !snapshotAt.IsValid() {
+				snapshotAt = call.Pos()
+			}
+		}
+		return true
+	})
+
+	if !warnAt.IsValid() {
+		t.Fatalf("%s does not call %s — a multi-schema sync would silently break UPDATE and DELETE on tables in schemas the operator never selected, with nothing said about it (audit 2026-09-01 A2-4b)",
+			entry, warn)
+	}
+	// Anti-vacuity: without the snapshot call the ordering claim below is
+	// unverifiable and must fail rather than pass by finding nothing.
+	if !snapshotAt.IsValid() {
+		t.Fatalf("%s no longer calls %s, so the ordering this gate asserts cannot be checked — re-anchor it on whatever now creates the publication",
+			entry, snapshot)
+	}
+	if warnAt > snapshotAt {
+		t.Errorf("%s calls %s AFTER %s (%s vs %s); the spanning snapshot creates the FOR ALL TABLES publication, so a warning after it describes exposure that has already happened (audit 2026-09-01 A2-4b)",
+			entry, warn, snapshot, fset.Position(warnAt), fset.Position(snapshotAt))
+	}
+}
+
 func TestMultiNamespaceReplicaIdentityRunsBeforeThePublicationExists(t *testing.T) {
 	const (
 		file      = "streamer_multidb.go"

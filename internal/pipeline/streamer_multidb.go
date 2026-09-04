@@ -295,6 +295,11 @@ func (s *Streamer) coldStartMultiDatabase(
 	// to Postgres's own UPDATE/DELETE refusal (audit 2026-09-01 A2-4). See
 	// [Streamer.preflightMultiNamespaceReplicaIdentity] for why it cannot
 	// live in the per-namespace copy loop with its sibling preflights. ----
+	// A2-4b: the same hazard OUTSIDE the selected set, which the refusing
+	// preflight below does not reach. Warns rather than refuses, and runs
+	// here for the same reason it does: after the spanning snapshot opens
+	// the FOR ALL TABLES publication, the exposure has already begun.
+	s.warnUnselectedNamespaceExposure(ctx, selected)
 	if err := s.preflightMultiNamespaceReplicaIdentity(ctx, selected, inScope); err != nil {
 		return nil, stop, err
 	}
@@ -669,6 +674,65 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	return schema, nil
 }
 
+// warnUnselectedNamespaceExposure reports the tables this cold start is
+// about to break OUTSIDE the namespaces the operator selected (audit
+// A2-4b, decided by the operator 2026-09-04).
+//
+// A multi-schema sync needs a database-wide logical slot, so the
+// publication the spanning snapshot opens is FOR ALL TABLES. That is
+// deliberate and correct — a scoped publication would drop the other
+// selected schemas' WAL — but it reaches every table in the database. A
+// permanent logged table with no usable replica identity stops accepting
+// UPDATE and DELETE the moment the publication exists. INSERT keeps
+// working, so the breakage is PARTIAL and surfaces as an error inside an
+// application that has nothing to do with this sync, with nothing
+// connecting it to the run that started ten minutes earlier.
+//
+// WARNS, never refuses, and that is the decision rather than an
+// oversight: these tables are outside the scope the operator declared, so
+// refusing would block a sync over a schema they deliberately excluded.
+// They cannot discover the exposure any other way, and a warning demands
+// nothing of them.
+//
+// Every failure here is swallowed to a DEBUG line. This is advisory: a
+// catalog read that cannot run must not fail a cold start that would
+// otherwise succeed, which would convert an advisory into exactly the
+// refusal the operator declined.
+func (s *Streamer) warnUnselectedNamespaceExposure(ctx context.Context, selected []string) {
+	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
+		return
+	}
+	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
+	if err != nil {
+		slog.DebugContext(ctx, "unselected-namespace exposure audit skipped (schema reader)", "error", err)
+		return
+	}
+	defer migcore.CloseIf(sr)
+	auditor, ok := sr.(ir.UnselectedNamespaceExposureAuditor)
+	if !ok {
+		return
+	}
+	exposed, err := auditor.AuditUnselectedNamespaceExposure(ctx, selected)
+	if err != nil {
+		slog.DebugContext(ctx, "unselected-namespace exposure audit skipped", "error", err)
+		return
+	}
+	if len(exposed) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx,
+		"UNSELECTED-NAMESPACE-EXPOSURE: this sync's publication will stop UPDATE and DELETE on tables outside the schemas you selected",
+		"tables", exposed,
+		"count", len(exposed),
+		"why", "a multi-schema sync needs a database-wide logical slot, so its publication is FOR ALL TABLES and reaches every "+
+			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica identity, "+
+			"while INSERT keeps working -- so the failure surfaces inside whatever application owns these tables",
+		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL before starting, or accept that writes to "+
+			"them will fail until you do; dropping this sync's publication also restores them",
+	)
+}
+
 // preflightMultiNamespaceReplicaIdentity is the fan-out's source-side
 // replica-identity preflight (audit 2026-09-01 A2-4). The single-namespace
 // cold start has run this since roadmap item 93; the fan-out ran the
@@ -694,13 +758,12 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 // readers here at all. Only the Postgres multi-schema path pays N schema
 // reads, and it pays them to avoid breaking the operator's application.
 //
-// Residual, stated: the publication this protects against is FOR ALL
-// TABLES, so sluice's own action exposes every table in the database —
-// including namespaces the operator did NOT select, which this does not
-// check. Widening it means either a database-wide engine query or a loop
-// over every namespace, and it changes what the refusal may demand (a sync
-// refused over an unrelated schema's table is a policy call, not a bug
-// fix). Filed as A2-4b.
+// Scope: this REFUSES over the namespaces the operator selected. The same
+// hazard outside that set is real — the publication is FOR ALL TABLES and
+// reaches the whole database — and is handled by
+// [Streamer.warnUnselectedNamespaceExposure], which WARNS instead. That
+// split is the operator's call (A2-4b, decided 2026-09-04): refusing over
+// a schema they deliberately excluded would block a working sync.
 func (s *Streamer) preflightMultiNamespaceReplicaIdentity(ctx context.Context, selected []string, inScope func(string) bool) error {
 	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
 		return nil
