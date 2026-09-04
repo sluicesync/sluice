@@ -136,6 +136,20 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 	if !exists {
 		var createQuery string
 		if len(tables) == 0 {
+			// THE THIRD DOOR (VF review of v0.141.0). ensureAllTablesPublication
+			// is not the only thing that creates a database-wide publication:
+			// this arm renders the same statement whenever a publication is
+			// missing and no scope was supplied, and its callers include EVERY
+			// StreamChanges, warm resume among them.
+			//
+			// The reachable loop is the unpleasant part, and this release wrote
+			// one end of it: the exposure warning tells the operator that
+			// dropping the publication restores the broken writes. Drop it on a
+			// SINGLE-schema stream, resume, and this line recreates it FOR ALL
+			// TABLES -- silently converting a scoped publication into a
+			// database-wide one and breaking every keyless table in the
+			// database, at exit 0. The release notes asserted the opposite.
+			warnPublicationExposure(ctx, db, nil)
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
 		} else {
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,

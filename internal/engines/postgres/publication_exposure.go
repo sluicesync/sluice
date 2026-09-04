@@ -19,7 +19,7 @@ import (
 // [SchemaReader.PreflightReplicaIdentity] covers the tables the operator
 // selected and REFUSES over them. This covers the ones they did not, and
 // WARNS. That split is the operator's decision (audit A2-4b), recorded on
-// [ir.UnselectedNamespaceExposureAuditor] with the reasoning.
+// [ir.PublicationExposureAuditor] with the reasoning.
 //
 // MEASURED, because the at-risk set is narrower than "every table" and
 // guessing it wider would name tables that were never in danger. On real

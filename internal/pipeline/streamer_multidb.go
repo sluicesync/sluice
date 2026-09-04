@@ -675,30 +675,6 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	return schema, nil
 }
 
-// warnUnselectedNamespaceExposure reports the tables this cold start is
-// about to break OUTSIDE the namespaces the operator selected (audit
-// A2-4b, decided by the operator 2026-09-04).
-//
-// A multi-schema sync needs a database-wide logical slot, so the
-// publication the spanning snapshot opens is FOR ALL TABLES. That is
-// deliberate and correct — a scoped publication would drop the other
-// selected schemas' WAL — but it reaches every table in the database. A
-// permanent logged table with no usable replica identity stops accepting
-// UPDATE and DELETE the moment the publication exists. INSERT keeps
-// working, so the breakage is PARTIAL and surfaces as an error inside an
-// application that has nothing to do with this sync, with nothing
-// connecting it to the run that started ten minutes earlier.
-//
-// WARNS, never refuses, and that is the decision rather than an
-// oversight: these tables are outside the scope the operator declared, so
-// refusing would block a sync over a schema they deliberately excluded.
-// They cannot discover the exposure any other way, and a warning demands
-// nothing of them.
-//
-// Every failure here is swallowed to a DEBUG line. This is advisory: a
-// catalog read that cannot run must not fail a cold start that would
-// otherwise succeed, which would convert an advisory into exactly the
-// refusal the operator declined.
 // publicationExposureCovered turns the set the refusing preflight recorded
 // into the per-table predicate the exposure audit consumes.
 //
@@ -720,6 +696,30 @@ func publicationExposureCovered(graded map[string]bool) func(namespace, table st
 	}
 }
 
+// warnPublicationExposure reports the tables this cold start is about to
+// break that NOTHING ELSE will refuse over (audit A2-4b, decided by the
+// operator 2026-09-04).
+//
+// A multi-schema sync needs a database-wide logical slot, so the
+// publication the spanning snapshot opens is FOR ALL TABLES. That is
+// deliberate and correct — a scoped publication would drop the other
+// selected schemas' WAL — but it reaches every table in the database. A
+// permanent logged table with no usable replica identity stops accepting
+// UPDATE and DELETE the moment the publication exists. INSERT keeps
+// working, so the breakage is PARTIAL and surfaces as an error inside an
+// application that has nothing to do with this sync, with nothing
+// connecting it to the run that started ten minutes earlier.
+//
+// WARNS, never refuses, and that is the decision rather than an
+// oversight: these tables are outside the scope the operator declared, so
+// refusing would block a sync over a schema they deliberately excluded.
+// They cannot discover the exposure any other way, and a warning demands
+// nothing of them.
+//
+// Every failure here is swallowed to a DEBUG line. This is advisory: a
+// catalog read that cannot run must not fail a cold start that would
+// otherwise succeed, which would convert an advisory into exactly the
+// refusal the operator declined.
 func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[string]bool) {
 	// graded is EXACTLY what the refusing preflight was handed, recorded by
 	// it rather than reconstructed here. Two earlier cuts got this wrong in
@@ -865,11 +865,19 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 	// the obvious candidate — is Filter.Allows-true yet never graded here,
 	// so it would be marked covered by nobody. The set is the answer; the
 	// predicate was the approximation.
-	for _, name := range names {
-		graded[database+"."+name] = true
-	}
+	// Recorded AFTER the refusal returns, not before. preflightSourceReplicaIdentity
+	// returns nil without grading anything if the handle does not satisfy
+	// ir.ReplicaIdentityPreflighter, and recording first would then mark every
+	// table in the namespace covered while nothing had refused over any of
+	// them — silently, because "covered" means "somebody else warns you".
+	// Unreachable today (only Postgres declares CDCLogicalReplication and its
+	// SchemaReader satisfies both surfaces), but the coupling is exactly what
+	// this set's doc claims, and nothing else holds it.
 	if err := preflightSourceReplicaIdentity(ctx, sr, s.Source.Capabilities(), names); err != nil {
 		return fmt.Errorf("pipeline: preflight namespace %q: %w", database, err)
+	}
+	for _, name := range names {
+		graded[database+"."+name] = true
 	}
 	return nil
 }

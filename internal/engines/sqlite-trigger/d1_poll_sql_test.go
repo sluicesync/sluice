@@ -127,7 +127,10 @@ func seedPollLog(t *testing.T, want ...int64) *sql.DB {
 		)`); err != nil {
 		t.Fatalf("create change log: %v", err)
 	}
-	// Insertion order is scrambled on purpose: 3, 1, 5, 2, 4 for 1..5.
+	// Insertion order is scrambled on purpose (5, 2, 4, 3, 1 for 1..5), so a
+	// query returning rows in PHYSICAL order is distinguishable from one that
+	// actually sorts. The exact permutation does not matter; that it is not
+	// already ascending does.
 	order := make([]int64, len(want))
 	copy(order, want)
 	for i, j := 0, len(order)-1; i < j; i, j = i+2, j-1 {

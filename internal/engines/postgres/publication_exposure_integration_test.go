@@ -153,9 +153,37 @@ func TestAuditPublicationExposure_MatchesRealPublicationCoverage(t *testing.T) {
 	covered := func(namespace, table string) bool {
 		return namespace == "selected" && table != "excluded_nokey"
 	}
-	got, err := openExposureAuditor(t, ctx, dsn).AuditPublicationExposure(ctx, covered)
+	auditor := openExposureAuditor(t, ctx, dsn)
+	got, err := auditor.AuditPublicationExposure(ctx, covered)
 	if err != nil {
-		t.Fatalf("AuditUnselectedNamespaceExposure: %v", err)
+		t.Fatalf("AuditPublicationExposure: %v", err)
+	}
+
+	// THE NIL ARM, which nothing exercised until 2026-09-04 and which the
+	// whole backup path rests on. `backup full --chain-slot` passes nil
+	// because it runs no replica-identity refusal at all, so nothing there
+	// is graded by anything else and everything at risk must be named.
+	//
+	// nil has to mean COVER NOTHING. Read as "no predicate supplied, so
+	// nothing to report" -- which is a perfectly plausible reading of
+	// `covered != nil &&` -- the backup warning silently names nothing,
+	// ever, while every other assertion in this file stays green because
+	// they all pass a real predicate.
+	unfiltered, err := auditor.AuditPublicationExposure(ctx, nil)
+	if err != nil {
+		t.Fatalf("AuditPublicationExposure(nil): %v", err)
+	}
+	if len(unfiltered) <= len(got) {
+		t.Fatalf("a nil predicate returned %d rows and a real one returned %d; nil must cover NOTHING, so it "+
+			"must report a strict superset -- the backup path passes nil and would otherwise warn about "+
+			"nothing at all", len(unfiltered), len(got))
+	}
+	unfilteredNames := auditedReasons(t, unfiltered)
+	for _, want := range []string{"selected.nokey", "other.nokey", "selected.excluded_nokey"} {
+		if _, ok := unfilteredNames[want]; !ok {
+			t.Errorf("a nil predicate did not name %s; with nothing covered, every at-risk table in the "+
+				"database must be reported:\n%s", want, strings.Join(unfiltered, "\n"))
+		}
 	}
 
 	// Names are compared EXACTLY, not with strings.Contains over the

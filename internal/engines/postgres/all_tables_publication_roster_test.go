@@ -51,6 +51,14 @@ var allTablesPublicationExempt = map[string]struct {
 	coveringTest string
 	coveringFile string
 }{
+	"ensureAllTablesPublication": {
+		reason: "a RENDERER, not a call site. It emits the statement, and BOTH of its callers appear in " +
+			"this same roster where each is separately required to warn or be exempt. Warning here as well " +
+			"would double-warn the backup path, and would add a blanket warning alongside the sync path's " +
+			"precise one, which reports the complement of what the refusal actually graded.",
+		coveringTest: "TestEveryAllTablesPublicationEmitterWarnsAboutExposure",
+		coveringFile: "all_tables_publication_roster_test.go",
+	},
 	"openSnapshotStreamShared": {
 		reason: "the multi-schema sync warns from the PIPELINE, not the engine: the warning reports the " +
 			"complement of what the refusing replica-identity preflight graded, and only the pipeline knows " +
@@ -61,8 +69,18 @@ var allTablesPublicationExempt = map[string]struct {
 	},
 }
 
-func TestEveryAllTablesPublicationCallerWarnsAboutExposure(t *testing.T) {
+func TestEveryAllTablesPublicationEmitterWarnsAboutExposure(t *testing.T) {
+	// Keyed on the SQL LITERAL, not on a helper's identifier. The first cut
+	// of this gate greped "ensureAllTablesPublication" and pinned the
+	// universe at its two callers -- and there is a THIRD emitter of the
+	// same statement, ensurePublication's no-scope arm, whose callers
+	// include every StreamChanges. A gate named for "every caller" that
+	// greps one function name is the coverage-narrower-than-its-name shape
+	// this repo keeps paying for, and it discouraged the next grep for a
+	// full day. The statement is the thing that causes the hazard, so the
+	// statement is what the universe is derived from.
 	const (
+		emitted     = "CREATE PUBLICATION %s FOR ALL TABLES"
 		publication = "ensureAllTablesPublication"
 		// The two shapes that reach the audit: the engine-local warner used
 		// by the backup path, and the pipeline-side warning, which reaches
@@ -114,9 +132,25 @@ func TestEveryAllTablesPublicationCallerWarnsAboutExposure(t *testing.T) {
 				}
 				return true
 			})
+			// A function EMITS a database-wide publication if it renders the
+			// statement itself, or delegates to the helper that does.
+			litAt := token.NoPos
+			ast.Inspect(fn.Body, func(nd ast.Node) bool {
+				lit, isLit := nd.(*ast.BasicLit)
+				if !isLit || lit.Kind != token.STRING || !strings.Contains(lit.Value, emitted) {
+					return true
+				}
+				if !litAt.IsValid() {
+					litAt = lit.Pos()
+				}
+				return true
+			})
 			pubAt, creates := calls[publication]
-			if !creates {
+			if !creates && !litAt.IsValid() {
 				continue
+			}
+			if !creates {
+				pubAt = litAt
 			}
 			_, warnsLocally := calls[localWarn]
 			_, warnsViaSurface := calls[surface]
@@ -135,16 +169,17 @@ func TestEveryAllTablesPublicationCallerWarnsAboutExposure(t *testing.T) {
 	// purpose: a THIRD caller is exactly what this exists to catch, and a
 	// caller REMOVED should be a deliberate edit here, not something a
 	// margin absorbs.
-	if len(sites) != 2 {
+	if len(sites) != 4 {
 		names := make([]string, 0, len(sites))
 		for _, s := range sites {
 			names = append(names, s.file+":"+s.fn)
 		}
 		sort.Strings(names)
-		t.Fatalf("found %d caller(s) of %s, expected exactly 2 (the multi-schema sync snapshot and "+
-			"backup --chain-slot): %v.\n\nIf you ADDED one, it must warn about the database-wide exposure "+
-			"before creating the publication, and this count goes up. If you REMOVED one, say so here.",
-			len(sites), publication, names)
+		t.Fatalf("found %d emitter(s) of a database-wide publication, expected exactly 4 (the two renderers "+
+			"in publication.go, plus backup --chain-slot and the multi-schema sync snapshot, which delegate "+
+			"to one of them): %v.\n\nIf you ADDED one, it must warn about the database-wide exposure before "+
+			"creating the publication, and this count goes up. If you REMOVED one, say so here.",
+			len(sites), names)
 	}
 
 	for _, s := range sites {
@@ -170,7 +205,8 @@ func TestEveryAllTablesPublicationCallerWarnsAboutExposure(t *testing.T) {
 			}
 			continue
 		}
-		t.Errorf("%s:%d: %s calls %s without auditing the exposure in the same function.\n"+
+		t.Errorf("%s:%d: %s emits a database-wide publication (renders the statement, or calls %s) "+
+			"without auditing the exposure in the same function.\n"+
 			"  A FOR ALL TABLES publication stops UPDATE and DELETE on every keyless permanent logged table in "+
 			"the DATABASE, including ones this run never reads, while INSERT keeps working — so the failure "+
 			"lands inside an unrelated application with nothing pointing back here.\n"+
