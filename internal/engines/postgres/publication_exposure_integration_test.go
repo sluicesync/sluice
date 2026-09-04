@@ -31,7 +31,7 @@ import (
 // Binding them here is what stops the two drifting — a future PG that
 // starts publishing unlogged tables would make the second half fail and
 // tell the next reader exactly which assumption moved.
-func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *testing.T) {
+func TestAuditPublicationExposure_MatchesRealPublicationCoverage(t *testing.T) {
 	ctx := context.Background()
 	dsn, cleanup := startPostgresForCDC(t)
 	defer cleanup()
@@ -40,9 +40,20 @@ func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *test
 		CREATE SCHEMA selected;
 		CREATE SCHEMA other;
 
-		-- In the SELECTED set: must never be reported here, whatever its
-		-- shape. That set belongs to the refusing preflight.
+		-- In the SELECTED set and ALLOWED by the filter: the refusing
+		-- preflight grades this one, so this audit must stay silent about
+		-- it or the operator is told the same thing twice.
 		CREATE TABLE selected.nokey (a int, b text);
+
+		-- THE THIRD CELL. In a SELECTED namespace but EXCLUDED by the
+		-- operator's table filter. The refusing preflight applies that
+		-- filter before it grades anything, so it never sees this table —
+		-- and the first cut of this audit skipped selected namespaces
+		-- wholesale, so it did not either. It is still in the FOR ALL
+		-- TABLES publication, so its writes break with nothing said. This
+		-- is the operator who followed the documented advice to take a
+		-- problem table out of the sync.
+		CREATE TABLE selected.excluded_nokey (a int, b text);
 
 		-- Outside, and genuinely at risk: permanent, logged, no usable
 		-- replica identity.
@@ -60,15 +71,27 @@ func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *test
 		CREATE MATERIALIZED VIEW other.mv AS SELECT 1 AS x;
 	`)
 
-	got, err := openExposureAuditor(t, ctx, dsn).AuditUnselectedNamespaceExposure(ctx, []string{"selected"})
+	// The predicate the streamer builds: selected namespace AND allowed by
+	// the operator's table filter. "selected.excluded_nokey" is in the
+	// namespace but not allowed, so nothing else grades it.
+	covered := func(namespace, table string) bool {
+		return namespace == "selected" && table != "excluded_nokey"
+	}
+	got, err := openExposureAuditor(t, ctx, dsn).AuditPublicationExposure(ctx, covered)
 	if err != nil {
 		t.Fatalf("AuditUnselectedNamespaceExposure: %v", err)
 	}
 
 	joined := strings.Join(got, "\n")
-	mustName := []string{"other.nokey", "other.nothing"}
+	mustName := []string{
+		"other.nokey",
+		"other.nothing",
+		// The third cell: covered by neither the refusal nor, before this,
+		// by the audit.
+		"selected.excluded_nokey",
+	}
 	mustNotName := []string{
-		"selected.nokey", // the selected set is the refusing preflight's
+		"selected.nokey", // graded by the refusing preflight, not here
 		"other.haspk",    // has a usable primary key
 		"other.hasfull",  // REPLICA IDENTITY FULL is always sufficient
 		"other.unlogged", // an unlogged table is not published
@@ -91,9 +114,10 @@ func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *test
 	// The second half: what the SERVER says the publication covers. The
 	// audit's exclusions are only correct while this holds.
 	applyPGSQL(t, dsn, `CREATE PUBLICATION a24b_probe FOR ALL TABLES;`)
-	covered := publicationCoverage(t, dsn, "a24b_probe", "other")
-	coveredJoined := strings.Join(covered, "\n")
-	for _, want := range []string{"other.nokey", "other.nothing", "other.haspk", "other.hasfull"} {
+	coveredByServer := append(publicationCoverage(t, dsn, "a24b_probe", "other"),
+		publicationCoverage(t, dsn, "a24b_probe", "selected")...)
+	coveredJoined := strings.Join(coveredByServer, "\n")
+	for _, want := range []string{"other.nokey", "other.nothing", "other.haspk", "other.hasfull", "selected.excluded_nokey"} {
 		if !strings.Contains(coveredJoined, want) {
 			t.Errorf("premise moved: the server does NOT publish %s, so this audit's relkind/relpersistence "+
 				"filter no longer describes coverage:\n%s", want, coveredJoined)
@@ -108,11 +132,12 @@ func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *test
 
 	// Anti-vacuity: a fixture that stopped creating tables would satisfy
 	// every "must not name" assertion above by having nothing to name.
-	if len(got) < 2 {
+	if len(got) < 3 {
 		t.Fatalf("audit returned %d rows; the fixture is not producing at-risk tables and this test proves nothing", len(got))
 	}
-	if len(covered) < 4 {
-		t.Fatalf("the publication covers %d tables in `other`; the fixture is not building the shapes this grades", len(covered))
+	if len(coveredByServer) < 5 {
+		t.Fatalf("the publication covers %d tables across the two schemas; the fixture is not building the shapes this grades",
+			len(coveredByServer))
 	}
 }
 
@@ -121,7 +146,7 @@ func TestAuditUnselectedNamespaceExposure_MatchesRealPublicationCoverage(t *test
 // implemented. An unimplemented optional surface is an INERT check, which is
 // the exact failure the compile-time pin in capabilities_assert.go and this
 // assertion both exist to refuse.
-func openExposureAuditor(t *testing.T, ctx context.Context, dsn string) ir.UnselectedNamespaceExposureAuditor {
+func openExposureAuditor(t *testing.T, ctx context.Context, dsn string) ir.PublicationExposureAuditor {
 	t.Helper()
 	sr, err := (Engine{}).OpenSchemaReader(ctx, dsn)
 	if err != nil {
@@ -132,9 +157,9 @@ func openExposureAuditor(t *testing.T, ctx context.Context, dsn string) ir.Unsel
 			_ = c.Close()
 		}
 	})
-	a, ok := sr.(ir.UnselectedNamespaceExposureAuditor)
+	a, ok := sr.(ir.PublicationExposureAuditor)
 	if !ok {
-		t.Fatal("the Postgres SchemaReader does not implement ir.UnselectedNamespaceExposureAuditor — the audit is inert")
+		t.Fatal("the Postgres SchemaReader does not implement ir.PublicationExposureAuditor — the audit is inert")
 	}
 	return a
 }

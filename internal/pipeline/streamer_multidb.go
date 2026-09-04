@@ -299,10 +299,11 @@ func (s *Streamer) coldStartMultiDatabase(
 	// preflight below does not reach. Warns rather than refuses, and runs
 	// here for the same reason it does: after the spanning snapshot opens
 	// the FOR ALL TABLES publication, the exposure has already begun.
-	s.warnUnselectedNamespaceExposure(ctx, selected)
-	if err := s.preflightMultiNamespaceReplicaIdentity(ctx, selected, inScope); err != nil {
+	graded, err := s.preflightMultiNamespaceReplicaIdentity(ctx, selected, inScope)
+	if err != nil {
 		return nil, stop, err
 	}
+	s.warnPublicationExposure(ctx, graded)
 
 	// ---- 3. Open the SINGLE spanning consistent snapshot. One tx, one
 	// binlog position spanning ALL selected databases. This is the crux:
@@ -698,7 +699,48 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 // catalog read that cannot run must not fail a cold start that would
 // otherwise succeed, which would convert an advisory into exactly the
 // refusal the operator declined.
-func (s *Streamer) warnUnselectedNamespaceExposure(ctx context.Context, selected []string) {
+// publicationExposureCovered turns the set the refusing preflight recorded
+// into the per-table predicate the exposure audit consumes.
+//
+// Extracted from its caller so it can be graded directly. It was a closure,
+// and a mutation that widened it back to "any table in a graded namespace" —
+// the original bug — left every test in the tree green, because the
+// integration pin hands the auditor a hand-written predicate and therefore
+// cannot see a wrong one built here. That is the same "the pin grades the
+// function, not the wiring" shape this repo keeps paying for, arriving for
+// the third time in one day.
+//
+// Exact membership, deliberately. Any prefix, namespace or pattern match
+// widens "covered", and widening covered is the silent direction: it means a
+// table nothing refuses over is also never warned about, which is the whole
+// defect this surface exists to prevent.
+func publicationExposureCovered(graded map[string]bool) func(namespace, table string) bool {
+	return func(namespace, table string) bool {
+		return graded[namespace+"."+table]
+	}
+}
+
+func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[string]bool) {
+	// graded is EXACTLY what the refusing preflight was handed, recorded by
+	// it rather than reconstructed here. Two earlier cuts got this wrong in
+	// the same direction, each marking more tables "covered" than really
+	// were, which is the silent direction:
+	//
+	//  1. Skipping the selected NAMESPACES wholesale. The preflight applies
+	//     the operator's table filter before grading, so a table excluded by
+	//     --exclude-table inside a selected schema was filtered out of the
+	//     refusal and skipped here — while staying in the FOR ALL TABLES
+	//     publication. That is the operator who followed the documented
+	//     advice to take a problem table out of the sync.
+	//  2. Reconstructing the predicate as "selected namespace AND
+	//     s.Filter.Allows(table)". Closer, still not equal: a relation the
+	//     source's ReadSchema does not surface as a Table — a leaf partition
+	//     being the obvious candidate — is Filter.Allows-true and never
+	//     graded, so it would again be covered by nobody.
+	//
+	// The set is the answer. Anything not in it is graded by nothing, which
+	// is precisely what this warning is for.
+	covered := publicationExposureCovered(graded)
 	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
 		return
 	}
@@ -708,11 +750,11 @@ func (s *Streamer) warnUnselectedNamespaceExposure(ctx context.Context, selected
 		return
 	}
 	defer migcore.CloseIf(sr)
-	auditor, ok := sr.(ir.UnselectedNamespaceExposureAuditor)
+	auditor, ok := sr.(ir.PublicationExposureAuditor)
 	if !ok {
 		return
 	}
-	exposed, err := auditor.AuditUnselectedNamespaceExposure(ctx, selected)
+	exposed, err := auditor.AuditPublicationExposure(ctx, covered)
 	if err != nil {
 		slog.DebugContext(ctx, "unselected-namespace exposure audit skipped", "error", err)
 		return
@@ -764,36 +806,37 @@ func (s *Streamer) warnUnselectedNamespaceExposure(ctx context.Context, selected
 // [Streamer.warnUnselectedNamespaceExposure], which WARNS instead. That
 // split is the operator's call (A2-4b, decided 2026-09-04): refusing over
 // a schema they deliberately excluded would block a working sync.
-func (s *Streamer) preflightMultiNamespaceReplicaIdentity(ctx context.Context, selected []string, inScope func(string) bool) error {
+func (s *Streamer) preflightMultiNamespaceReplicaIdentity(ctx context.Context, selected []string, inScope func(string) bool) (graded map[string]bool, err error) {
+	graded = map[string]bool{}
 	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
-		return nil
+		return graded, nil
 	}
 	deriver, ok := s.Source.(ir.DatabaseDSNDeriver)
 	if !ok {
 		// The fan-out cannot have got this far without one (the copy loop
 		// refuses on the same assertion), but this runs BEFORE that loop, so
 		// it states the requirement rather than assuming it.
-		return fmt.Errorf(
+		return graded, fmt.Errorf(
 			"pipeline: source engine %q cannot derive a per-namespace DSN for the replica-identity preflight (ADR-0075)",
 			s.Source.Name(),
 		)
 	}
 	for _, database := range selected {
-		srcDSN, err := deriver.WithDatabase(s.SourceDSN, database)
-		if err != nil {
-			return fmt.Errorf("pipeline: derive source DSN for namespace %q: %w", database, err)
+		srcDSN, derr := deriver.WithDatabase(s.SourceDSN, database)
+		if derr != nil {
+			return graded, fmt.Errorf("pipeline: derive source DSN for namespace %q: %w", database, derr)
 		}
-		if err := s.preflightOneNamespaceReplicaIdentity(ctx, srcDSN, database, inScope); err != nil {
-			return err
+		if perr := s.preflightOneNamespaceReplicaIdentity(ctx, srcDSN, database, inScope, graded); perr != nil {
+			return graded, perr
 		}
 	}
-	return nil
+	return graded, nil
 }
 
 // preflightOneNamespaceReplicaIdentity is one namespace's pass, split out so
 // the scoped reader is closed on every path (the loop above would otherwise
 // hold N readers open until it returned).
-func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, srcDSN, database string, inScope func(string) bool) error {
+func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, srcDSN, database string, inScope func(string) bool, graded map[string]bool) error {
 	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
 	if err != nil {
 		return connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
@@ -814,7 +857,18 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 	// The post-filter names, bare, which is the same list the copy loop
 	// hands the publication — and the same question the engine's
 	// `WHERE n.nspname = $1` asks of this reader's bound namespace.
-	if err := preflightSourceReplicaIdentity(ctx, sr, s.Source.Capabilities(), migcore.TableNamesForPublication(schema)); err != nil {
+	names := migcore.TableNamesForPublication(schema)
+	// Record EXACTLY what the refusal was handed, so the exposure warning
+	// can report the complement rather than guess at it. A predicate
+	// reconstructed from s.Filter would be close but not equal: a relation
+	// this ReadSchema does not surface as a Table — a leaf partition being
+	// the obvious candidate — is Filter.Allows-true yet never graded here,
+	// so it would be marked covered by nobody. The set is the answer; the
+	// predicate was the approximation.
+	for _, name := range names {
+		graded[database+"."+name] = true
+	}
+	if err := preflightSourceReplicaIdentity(ctx, sr, s.Source.Capabilities(), names); err != nil {
 		return fmt.Errorf("pipeline: preflight namespace %q: %w", database, err)
 	}
 	return nil

@@ -299,12 +299,13 @@ func sortedPreflightKeys[V any](m map[string]V) []string {
 // The spanning snapshot open is what creates the FOR ALL TABLES publication,
 // which is what breaks the unselected schemas' writes. A warning emitted after
 // it describes damage already done.
-func TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists(t *testing.T) {
+func TestPublicationExposureWarnsAfterThePreflightAndBeforeThePublication(t *testing.T) {
 	const (
-		file     = "streamer_multidb.go"
-		warn     = "warnUnselectedNamespaceExposure"
-		snapshot = "openMultiDatabaseSnapshotStreamWithOptionalSlot"
-		entry    = "coldStartMultiDatabase"
+		file      = "streamer_multidb.go"
+		warn      = "warnPublicationExposure"
+		preflight = "preflightMultiNamespaceReplicaIdentity"
+		snapshot  = "openMultiDatabaseSnapshotStreamWithOptionalSlot"
+		entry     = "coldStartMultiDatabase"
 	)
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, file, nil, 0)
@@ -324,7 +325,7 @@ func TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists(t *testing.T
 		t.Fatalf("%s declares no %s — this gate has lost its subject", file, entry)
 	}
 
-	warnAt, snapshotAt := token.NoPos, token.NoPos
+	warnAt, preflightAt, snapshotAt := token.NoPos, token.NoPos, token.NoPos
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -342,6 +343,10 @@ func TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists(t *testing.T
 			if !warnAt.IsValid() {
 				warnAt = call.Pos()
 			}
+		case preflight:
+			if !preflightAt.IsValid() {
+				preflightAt = call.Pos()
+			}
 		case snapshot:
 			if !snapshotAt.IsValid() {
 				snapshotAt = call.Pos()
@@ -354,15 +359,27 @@ func TestUnselectedNamespaceExposureWarnsBeforeThePublicationExists(t *testing.T
 		t.Fatalf("%s does not call %s — a multi-schema sync would silently break UPDATE and DELETE on tables in schemas the operator never selected, with nothing said about it (audit 2026-09-01 A2-4b)",
 			entry, warn)
 	}
-	// Anti-vacuity: without the snapshot call the ordering claim below is
+	// Anti-vacuity: without these two the ordering claims below are
 	// unverifiable and must fail rather than pass by finding nothing.
 	if !snapshotAt.IsValid() {
 		t.Fatalf("%s no longer calls %s, so the ordering this gate asserts cannot be checked — re-anchor it on whatever now creates the publication",
 			entry, snapshot)
 	}
+	if !preflightAt.IsValid() {
+		t.Fatalf("%s no longer calls %s, so the graded-set ordering cannot be checked", entry, preflight)
+	}
 	if warnAt > snapshotAt {
 		t.Errorf("%s calls %s AFTER %s (%s vs %s); the spanning snapshot creates the FOR ALL TABLES publication, so a warning after it describes exposure that has already happened (audit 2026-09-01 A2-4b)",
 			entry, warn, snapshot, fset.Position(warnAt), fset.Position(snapshotAt))
+	}
+	// And it must come AFTER the refusing preflight, which is what makes the
+	// warning's scope exact rather than approximate: the preflight records
+	// the names it actually graded, and the warning reports the complement.
+	// Run first, it would have to reconstruct that set from the filter — the
+	// approximation that marked leaf partitions covered by nobody.
+	if warnAt < preflightAt {
+		t.Errorf("%s calls %s BEFORE %s (%s vs %s); the warning reports what the preflight did NOT grade, so it cannot run until the preflight has said what that was",
+			entry, warn, preflight, fset.Position(warnAt), fset.Position(preflightAt))
 	}
 }
 

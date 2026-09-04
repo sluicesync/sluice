@@ -250,7 +250,15 @@ func (cr *catalogRows) Close() error {
 // the one query. SET LOCAL scopes the setting to this transaction, so
 // pooled connections return clean.
 func (r *SchemaReader) catalogQuery(ctx context.Context, q string, args ...any) (*catalogRows, error) {
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return catalogQueryOn(ctx, r.db, q, args...)
+}
+
+// catalogQueryOn is the db-bound form. Split out so a caller holding a
+// *sql.DB rather than a SchemaReader -- the backup path's publication
+// exposure audit -- runs the catalog read through the SAME chokepoint,
+// including the SET LOCAL above, instead of opening its own.
+func catalogQueryOn(ctx context.Context, db *sql.DB, q string, args ...any) (*catalogRows, error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: begin catalog read: %w", err)
 	}

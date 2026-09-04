@@ -2144,11 +2144,10 @@ type ReplicaIdentityPreflighter interface {
 	PreflightReplicaIdentity(ctx context.Context, tables []string) error
 }
 
-// UnselectedNamespaceExposureAuditor is the optional SOURCE-engine
-// surface (implemented on a [SchemaReader]) that a MULTI-NAMESPACE cold
-// start consults before it opens the spanning snapshot, to report the
-// tables its own action is about to break OUTSIDE the namespaces the
-// operator selected.
+// PublicationExposureAuditor is the optional SOURCE-engine surface
+// (implemented on a [SchemaReader]) that a MULTI-NAMESPACE cold start
+// consults before it opens the spanning snapshot, to report the tables
+// its own action is about to break that NOTHING ELSE will refuse over.
 //
 // [ReplicaIdentityPreflighter] is the same hazard scoped to what the
 // operator asked for. This is the half nobody asked for: a multi-schema
@@ -2173,14 +2172,25 @@ type ReplicaIdentityPreflighter interface {
 // relation the publication would not actually cover, or the warning
 // names tables that were never at risk.
 //
-// excluded is the set of namespaces the operator DID select; those are
-// [ReplicaIdentityPreflighter]'s business and are skipped here so one
-// table cannot be reported twice. Implementations return the qualified
-// names, sorted, and nil when there is nothing to report. Engines
-// without the surface skip silently: only a publication-scoped source
-// can reach this at all.
-type UnselectedNamespaceExposureAuditor interface {
-	AuditUnselectedNamespaceExposure(ctx context.Context, excluded []string) ([]string, error)
+// covered reports whether the REFUSING preflight already grades a table,
+// so it is skipped here and cannot be reported twice.
+//
+// It is a per-TABLE predicate, not a namespace list, and that distinction
+// is the whole correctness of this surface. The first cut took the
+// selected namespaces and skipped them wholesale, which left a third case
+// covered by neither side: the refusing preflight applies the operator's
+// table filter before it grades anything, so a table EXCLUDED by
+// --exclude-table inside a SELECTED namespace was filtered out of the
+// refusal AND skipped by this audit — while remaining in the FOR ALL
+// TABLES publication, so its writes broke with nothing said. That is
+// exactly the operator who followed the documented advice to take a
+// problem table out of the sync.
+//
+// Implementations return the qualified names, sorted, and nil when there
+// is nothing to report. Engines without the surface skip silently: only a
+// publication-scoped source can reach this at all.
+type PublicationExposureAuditor interface {
+	AuditPublicationExposure(ctx context.Context, covered func(namespace, table string) bool) ([]string, error)
 }
 
 // UpsertKeyPreflighter is the optional TARGET-engine surface (implemented

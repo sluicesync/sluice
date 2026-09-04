@@ -40,15 +40,30 @@ type exposureCandidate struct {
 	reason    string
 }
 
-// AuditUnselectedNamespaceExposure implements
-// [ir.UnselectedNamespaceExposureAuditor].
+// AuditPublicationExposure implements [ir.PublicationExposureAuditor].
 //
-// excluded is the namespace set the operator selected; those belong to
-// the refusing preflight and are skipped so one table cannot be reported
-// by both. The system catalogs are skipped too — they are not the
-// operator's to fix and pg_catalog's tables are not published.
-func (r *SchemaReader) AuditUnselectedNamespaceExposure(ctx context.Context, excluded []string) ([]string, error) {
-	rows, err := r.exposureRows(ctx, excluded)
+// covered is asked per TABLE rather than per namespace. Skipping whole
+// selected namespaces is what left the --exclude-table case reported by
+// nobody; see the interface doc. The system catalogs are skipped
+// unconditionally — they are not the operator's to fix and pg_catalog's
+// tables are not published.
+func (r *SchemaReader) AuditPublicationExposure(ctx context.Context, covered func(namespace, table string) bool) ([]string, error) {
+	return auditPublicationExposure(ctx, r.catalogQuery, covered)
+}
+
+// catalogQueryFunc is the read this audit needs, so the same body can serve
+// the SchemaReader-bound sync path and the db-bound backup path.
+type catalogQueryFunc func(ctx context.Context, q string, args ...any) (*catalogRows, error)
+
+// auditPublicationExposure is the shared core. It exists because
+// ensureAllTablesPublication has TWO callers and the first cut of this
+// surface reached one of them (audit VF review of v0.141.0, HIGH-1): the
+// multi-schema sync, and `backup full --chain-slot`. The backup case is the
+// worse of the two -- it deliberately PERSISTS the publication so the
+// chain's incrementals can decode through it, so the exposure outlives the
+// run -- and it had neither a refusal nor a warning.
+func auditPublicationExposure(ctx context.Context, query catalogQueryFunc, covered func(namespace, table string) bool) ([]string, error) {
+	rows, err := exposureRowsVia(ctx, query, covered)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +91,7 @@ func (r *SchemaReader) AuditUnselectedNamespaceExposure(ctx context.Context, exc
 // paid on every multi-schema cold start. Stated rather than left to be
 // discovered: this can name a table that PG 18's
 // `publish_generated_columns` would have rescued.
-func (r *SchemaReader) exposureRows(ctx context.Context, excluded []string) ([]exposureCandidate, error) {
+func exposureRowsVia(ctx context.Context, query catalogQueryFunc, covered func(namespace, table string) bool) ([]exposureCandidate, error) {
 	const q = `
 		SELECT n.nspname,
 		       c.relname,
@@ -99,15 +114,14 @@ func (r *SchemaReader) exposureRows(ctx context.Context, excluded []string) ([]e
 		       ) ri ON TRUE
 		WHERE  c.relkind = 'r'
 		  AND  c.relpersistence = 'p'
-		  AND  n.nspname <> ALL ($1::text[])
 		  AND  n.nspname NOT IN ('pg_catalog', 'information_schema')
 		  AND  n.nspname NOT LIKE 'pg_toast%'
 		  AND  n.nspname NOT LIKE 'pg_temp%'
 		ORDER  BY n.nspname, c.relname`
 
-	catRows, err := r.catalogQuery(ctx, q, pgTextArray(excluded))
+	catRows, err := query(ctx, q)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: audit unselected-namespace publication exposure: %w", err)
+		return nil, fmt.Errorf("postgres: audit publication exposure: %w", err)
 	}
 	defer func() { _ = catRows.Close() }()
 
@@ -120,7 +134,13 @@ func (r *SchemaReader) exposureRows(ctx context.Context, excluded []string) ([]e
 			riUsable  bool
 		)
 		if err := catRows.Scan(&ns, &table, &replIdent, &pkUsable, &riUsable); err != nil {
-			return nil, fmt.Errorf("postgres: scan unselected-namespace exposure row: %w", err)
+			return nil, fmt.Errorf("postgres: scan publication exposure row: %w", err)
+		}
+		// Asked per table, not per namespace. A nil predicate covers
+		// nothing, so every at-risk table is reported -- the safe default
+		// for a caller that did not say what its refusal already grades.
+		if covered != nil && covered(ns, table) {
+			continue
 		}
 		// The same four cases replicaIdentityUsable decides, restated
 		// here because this read has no index names to suggest and no
@@ -143,7 +163,7 @@ func (r *SchemaReader) exposureRows(ctx context.Context, excluded []string) ([]e
 		}
 	}
 	if err := catRows.Err(); err != nil {
-		return nil, fmt.Errorf("postgres: iterate unselected-namespace exposure rows: %w", err)
+		return nil, fmt.Errorf("postgres: iterate publication exposure rows: %w", err)
 	}
 	return out, nil
 }

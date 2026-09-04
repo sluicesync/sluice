@@ -25,10 +25,62 @@ func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, sche
 	if err := preflightChainSlotUnlogged(ctx, db, schema, inScopeTables); err != nil {
 		return err
 	}
+	// The SECOND caller of ensureAllTablesPublication, and the one the
+	// A2-4b warning missed on its first cut (VF review of v0.141.0, HIGH-1).
+	//
+	// A FOR ALL TABLES publication stops Postgres accepting UPDATE and
+	// DELETE on every permanent logged table in the database that has no
+	// replica identity -- not only the ones this backup reads. INSERT keeps
+	// working, so the breakage is partial and surfaces inside whatever
+	// application owns those tables.
+	//
+	// It is WORSE here than on the sync path, which is why it is not enough
+	// to say "pre-existing". --chain-slot deliberately PERSISTS this
+	// publication so the chain's incrementals can decode through it, so the
+	// exposure outlives the run that caused it.
+	//
+	// Nothing is passed as covered: unlike the sync cold start, this path
+	// runs no replica-identity REFUSAL at all, so no table here is graded by
+	// anything else. Adding that refusal is a behaviour change on a shipped
+	// path and is deliberately not made here; warning is purely additive.
+	warnPublicationExposure(ctx, db, nil)
 	if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
 		return classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
 	}
 	return nil
+}
+
+// warnPublicationExposure reports the tables a FOR ALL TABLES publication is
+// about to stop accepting UPDATE and DELETE on, and is engine-local because
+// this caller holds a *sql.DB rather than a Streamer.
+//
+// Advisory by construction: every failure is swallowed to DEBUG. A catalog
+// read that cannot run must not fail a backup that would otherwise succeed,
+// which would turn an advisory into the refusal this deliberately is not.
+func warnPublicationExposure(ctx context.Context, db *sql.DB, covered func(namespace, table string) bool) {
+	query := func(ctx context.Context, q string, args ...any) (*catalogRows, error) {
+		return catalogQueryOn(ctx, db, q, args...)
+	}
+	exposed, err := auditPublicationExposure(ctx, query, covered)
+	if err != nil {
+		slog.DebugContext(ctx, "publication exposure audit skipped", "error", err)
+		return
+	}
+	if len(exposed) == 0 {
+		return
+	}
+	slog.WarnContext(
+		ctx,
+		"UNSELECTED-NAMESPACE-EXPOSURE: this run's publication will stop UPDATE and DELETE on tables it does not read",
+		"tables", exposed,
+		"count", len(exposed),
+		"why", "a chain slot needs a database-wide publication, so it is created FOR ALL TABLES and reaches every "+
+			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica "+
+			"identity, while INSERT keeps working -- so the failure surfaces inside whatever application owns them, "+
+			"and --chain-slot keeps the publication after the run",
+		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL, or drop this backup's publication "+
+			"when the chain is finished with it",
+	)
 }
 
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary
