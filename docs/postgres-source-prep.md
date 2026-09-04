@@ -147,7 +147,7 @@ ALTER TABLE orders DROP CONSTRAINT orders_pkey;
 ALTER TABLE orders ADD  CONSTRAINT orders_pkey PRIMARY KEY (id);
 ```
 
-Or take the table out of the sync entirely with `--exclude-table` — an excluded table never joins the publication, so its writes are unaffected. The refusal names each offending table, why it failed, and (where one exists) the index you could nominate.
+Or take the table out of the sync entirely with `--exclude-table` — **on a single-schema sync**, where the publication is scoped `FOR TABLE`, an excluded table never joins it and its writes are unaffected. That escape does NOT exist on a multi-schema sync: a database-wide logical slot needs a `FOR ALL TABLES` publication, so an excluded table is published anyway and its writes break regardless. There the only remedies are a primary key or `REPLICA IDENTITY FULL` on the table itself, or not running the multi-schema sync; since v0.141.0 sluice warns (`UNSELECTED-NAMESPACE-EXPOSURE`) naming each table this will affect. The refusal names each offending table, why it failed, and (where one exists) the index you could nominate.
 
 ## Slot lifetime under failover
 
