@@ -4,6 +4,34 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.141.0] - 2026-09-04
+
+Three refusals that reached further than the thing they were guarding, and a warning for damage sluice was doing quietly. **If you migrate Cloudflare D1, run a `d1-trigger` stream, sync more than one Postgres schema at a time, or back up Postgres with `--chain-slot`, one of these is yours.**
+
+### Fixed
+
+**A Cloudflare D1 migration no longer refuses over a table you excluded (Bug 265).** v0.140.0 added a byte-sum bracket that catches D1 rewriting invalid UTF-8 in transit, and put it on the staging path as well as the bulk read. Staging replicates the WHOLE database by design — that faithfulness is what lets `--infer-types` treat the local file as indistinguishable from D1 — and it runs before the table filter is consulted at all. So one mangled table anywhere in the database failed the entire run, and neither `--include-table` nor `--exclude-table` could reach it, because by the time either is read the refusal has already happened. `--infer-types` engages staging automatically, so this sat on the path most operators take. The copy is still whole-database; the refusal now fires only for tables the run will actually read, resolved from the CLI flags and the YAML config alike, and a mangled table outside that set warns instead.
+
+**An oversized change row no longer wedges a `d1-trigger` stream permanently (audit LA-2b).** The change-log poll shared the transport's response cap with the bulk reader but not its adaptive page. A poll error kills the pump, the poll batch is not an operator flag, and the batch size was fixed — so a batch whose before-and-after row images exceeded the cap did not degrade the stream, it ended it, and every restart met the identical batch. There was no remedy at all. The poll now halves and re-requests against the same `id >` watermark, which returns a strict prefix of the same rows so nothing can be skipped, and refuses by name only when a single change row is itself too large. The shrink is sticky for the life of the stream and resets on restart.
+
+### Added
+
+**Postgres warns about the tables outside your scope that its publication is about to break (audit A2-4b).** A database-wide logical slot needs a `FOR ALL TABLES` publication, and that reaches every table in the database — not only the ones you selected. Postgres refuses UPDATE and DELETE on any published table without a replica identity, while INSERT keeps working, so the breakage is partial and surfaces as an error inside whatever application owns those tables, with nothing connecting it to the run that caused it. sluice now names each at-risk table before it opens the publication, with the mechanism and both remedies. It warns rather than refuses on purpose: these tables are outside the scope you declared, so refusing would block a run over a schema you deliberately excluded.
+
+Both paths that create such a publication now warn. The multi-schema `sync start` is the obvious one; the other is `backup full --chain-slot`, which is the worse case and had neither a refusal nor a warning, because it deliberately keeps the publication so the chain's incrementals can decode through it — so the exposure outlives the run.
+
+The warning's scope is exact rather than approximate: the replica-identity preflight that already refuses over your selected tables records precisely what it graded, and the warning reports the complement. A table excluded with `--exclude-table` inside a schema you did select — which the preflight never sees — is therefore no longer missed by both.
+
+Measured on PostgreSQL 16.15, 17.11, 18.6 and 19beta1, identical on all four. The at-risk set is exactly `relkind='r' AND relpersistence='p'`: an unlogged table, a partitioned parent, a view and a materialized view are all outside a `FOR ALL TABLES` publication and are never named; a leaf partition is inside. Both remedies verified rather than assumed — dropping the publication restores the writes, and so does `REPLICA IDENTITY FULL` with it in place — and a single-schema sync, which uses a scoped publication, never causes this at all.
+
+### Compatibility
+
+Drop-in from v0.140.0. No flag change, no format change, no new error codes.
+
+One behaviour change, and it is a relaxation: a Cloudflare D1 table holding invalid UTF-8 now refuses only when that table is in scope for the run. If v0.140.0 blocked you on a table you had already excluded, that run will now complete.
+
+The new Postgres warning is advisory. It never fails a run, and every failure inside the audit itself is swallowed to a debug line, so an absent warning is not proof of an absent hazard.
+
 ## [0.140.0] - 2026-09-03
 
 **Correction (2026-09-04).** The standby entry below justifies the reordering by saying the `wal_level` advice told the operator to change "a setting a standby inherits from its primary and cannot change". That is wrong: a standby's `wal_level` is its own GUC and IS settable — this release's own regression cycle restarted the same physical standby under `-c wal_level=replica` and `-c wal_level=logical` and sluice read each value back, so the repro that justified the fix also disproves the justification. What is true is that pointing at `wal_level` answers the wrong question: the blocking fact is that the source is a standby. The weaker claim that raising it on the standby accomplishes nothing is plausible and is NOT verified anywhere in this project, so it is not asserted. **The v0.140.0 code is correct and unchanged — no upgrade, nothing to re-run.** Found by the post-publish learnings sweep. A second, narrower correction to the same entry: it says v0.139.0's refusal "only fired on a standby someone had set to logical", which reads as a claim about every path. The v0.140.0 regression cycle measured that `sync start` already refused correctly at any `wal_level`, landing zero rows on both binaries; the ordering defect was specific to `backup full`. The fix is real and did less than that sentence implies.

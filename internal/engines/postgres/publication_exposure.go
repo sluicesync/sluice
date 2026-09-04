@@ -96,13 +96,16 @@ func exposureRowsVia(ctx context.Context, query catalogQueryFunc, covered func(n
 		SELECT n.nspname,
 		       c.relname,
 		       c.relreplident,
+		       COALESCE(pk.name, ''),
 		       COALESCE(pk.usable, false),
 		       COALESCE(ri.usable, false)
 		FROM   pg_class     c
 		JOIN   pg_namespace n ON n.oid = c.relnamespace
 		LEFT   JOIN LATERAL (
-		         SELECT (i.indisvalid AND i.indisunique AND i.indimmediate AND i.indpred IS NULL) AS usable
+		         SELECT ci.relname AS name,
+		                (i.indisvalid AND i.indisunique AND i.indimmediate AND i.indpred IS NULL) AS usable
 		         FROM   pg_index i
+		         JOIN   pg_class ci ON ci.oid = i.indexrelid
 		         WHERE  i.indrelid = c.oid AND i.indisprimary
 		         LIMIT  1
 		       ) pk ON TRUE
@@ -130,10 +133,11 @@ func exposureRowsVia(ctx context.Context, query catalogQueryFunc, covered func(n
 		var (
 			ns, table string
 			replIdent string
+			pkName    string
 			pkUsable  bool
 			riUsable  bool
 		)
-		if err := catRows.Scan(&ns, &table, &replIdent, &pkUsable, &riUsable); err != nil {
+		if err := catRows.Scan(&ns, &table, &replIdent, &pkName, &pkUsable, &riUsable); err != nil {
 			return nil, fmt.Errorf("postgres: scan publication exposure row: %w", err)
 		}
 		// Asked per table, not per namespace. A nil predicate covers
@@ -147,6 +151,30 @@ func exposureRowsVia(ctx context.Context, query catalogQueryFunc, covered func(n
 		// generated-column column to exempt: FULL is always fine, an
 		// explicit NOTHING never is, and 'd'/'i' turn on whether the
 		// index they name is usable.
+		//
+		// Two limits of the restatement, written down because both are
+		// invisible from the query and both are now pinned by
+		// TestAuditPublicationExposure_MatchesRealPublicationCoverage:
+		//
+		// The 'i' arm fires, in practice, only when the table nominates
+		// NOTHING -- the operator dropped the index it named, which
+		// leaves relreplident='i' and no indisreplident row at all.
+		// MEASURED on 16.15/17.11/18.6: PostgreSQL refuses at ALTER time
+		// every index shape the usability predicate would reject (partial,
+		// non-unique, non-immediate, invalid, nullable column) and refuses
+		// to drop the NOT NULL afterwards, so ri.usable=false over a
+		// PRESENT index is not reachable by any DDL the server accepts.
+		// The four predicates in the ri LATERAL are therefore defensive;
+		// COALESCE's false is what actually decides, and a mutation run
+		// that replaces only that LATERAL's predicate with TRUE survives.
+		//
+		// "no primary key" is IMPRECISE for a DEFERRABLE key: the key
+		// exists and publishes nothing (indimmediate=false). The
+		// classification is right and the sentence is not, because the
+		// query carries usability as a bare boolean and cannot tell the
+		// two apart. The refusing sibling replicaIdentityUsable does
+		// distinguish them ("its PRIMARY KEY index %q is DEFERRABLE");
+		// closing the gap here costs one more column in the pk LATERAL.
 		switch replIdent {
 		case "f":
 			continue
@@ -157,8 +185,23 @@ func exposureRowsVia(ctx context.Context, query catalogQueryFunc, covered func(n
 				out = append(out, exposureCandidate{ns, table, "REPLICA IDENTITY USING INDEX names an unusable index"})
 			}
 		default:
-			if !pkUsable {
+			switch {
+			case pkUsable:
+				// Nothing to report.
+			case pkName == "":
 				out = append(out, exposureCandidate{ns, table, "no primary key"})
+			default:
+				// A PRIMARY KEY that EXISTS and is not usable as a replica
+				// identity: DEFERRABLE (non-immediate) is the case operators
+				// actually create. Saying "no primary key" here contradicts
+				// the operator's own \d output, which is how a true warning
+				// gets dismissed as a bug in the tool. The refusing sibling
+				// in replica_identity_preflight.go has always drawn this
+				// distinction; this one did not until 2026-09-04.
+				out = append(out, exposureCandidate{
+					ns, table,
+					"PRIMARY KEY " + pkName + " is not usable as a replica identity (deferrable, invalid, partial or non-unique)",
+				})
 			}
 		}
 	}
