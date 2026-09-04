@@ -212,10 +212,22 @@ func canGCLease(lease ir.ShardConsolidationLeaseRow, streams []ir.StreamStatus, 
 	}
 	if !lease.HasAnchor {
 		// Defensive retention of legacy v0.75.0 rows: no anchor to
-		// compare against. The next time a stream observes a boundary
-		// on this table, the post-v0.76.0 path will rewrite the row
-		// with an anchor (via FinalizeLeaseApply) and a later sweep
-		// can act on it. Until then, retain.
+		// compare against, so condition 2 cannot be evaluated.
+		//
+		// This retention is PERMANENT, and this comment used to say
+		// otherwise -- that a later boundary on the table would rewrite
+		// the row with an anchor via FinalizeLeaseApply and let a later
+		// sweep act on it. It cannot. This arm is reached only when the
+		// row is already APPLIED, and tryAcquireShardLease guards its
+		// conflict path with applied_at IS NULL, so no stream can
+		// re-acquire the row and nothing can ever reach the finalize.
+		// Every later boundary on this table refuses instead (Bug 262b,
+		// audit backlog 2026-09-03) -- the same defect as the general
+		// second-DDL refusal, and a fix owes both homes.
+		//
+		// The operator escape today is to delete the row by hand once
+		// every stream is known past it; sluice does not do it for them
+		// because a legacy row carries no evidence that they are.
 		return false, "no anchor (legacy row)"
 	}
 	// Condition 2: every stream past the anchor under the engine's

@@ -6,6 +6,7 @@ package sqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -122,3 +123,30 @@ func D1ConnForTest(endpointBase, accountID, databaseID, token string) *D1Conn {
 // mirroring how `sqlite-trigger` composes [Engine] for the file path. The zero
 // value [d1Engine] holds no state.
 func NewD1Engine() ir.Engine { return d1Engine{} }
+
+// D1ResponseTooLarge reports whether err is the transport's named
+// over-cap refusal, and the cap it names.
+//
+// Exists so a caller in another package can do what the bulk row
+// reader's page controller does in this one: recognise an over-budget
+// response and re-request it smaller, rather than treating the cap as
+// terminal. The `d1-trigger` change-log poll is that caller — before
+// it had this, a change-log batch whose before/after images exceeded
+// the cap failed the poll, and the poll error kills the pump, and the
+// batch size was fixed, so the retry met the identical batch: the
+// stream was wedged with no operator remedy (the poll batch is not a
+// flag). See LA-2b, audit backlog 2026-09-03.
+//
+// Scope, stated because the enumeration matters more than the fix: the
+// D1 change-log executor makes seventeen queries and only the poll
+// carries user-row-width payload (change rows hold full before/after
+// row images). The other sixteen read catalog text — trigger SQL,
+// column lists, fingerprints, watermarks — bounded by schema size, not
+// by row width, and they stay terminal on the cap by design.
+func D1ResponseTooLarge(err error) (limit int, ok bool) {
+	var e *d1ResponseTooLargeError
+	if errors.As(err, &e) {
+		return e.limit, true
+	}
+	return 0, false
+}

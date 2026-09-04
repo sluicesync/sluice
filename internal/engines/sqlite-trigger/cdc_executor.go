@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // This file is the TRANSPORT SEAM (ADR-0136). The trigger engine's setup +
@@ -637,6 +638,13 @@ func (e *localExecutor) close() error {
 // AUTOINCREMENT id is bounded well under 2^53.
 type d1Executor struct {
 	conn *sqlite.D1Conn
+
+	// pollBatchCap is the sticky shrunk change-log poll batch: 0 until a
+	// response overflows the transport cap, then the batch that fit.
+	// Written and read only from the pump goroutine, which is the only
+	// caller of pollChangeLog (the reader documents its poll as
+	// pump-goroutine-only), so it needs no synchronisation.
+	pollBatchCap int
 }
 
 func (e *d1Executor) execDDL(ctx context.Context, stmt string) error {
@@ -644,11 +652,13 @@ func (e *d1Executor) execDDL(ctx context.Context, stmt string) error {
 }
 
 func (e *d1Executor) pollChangeLog(ctx context.Context, sinceID int64, batch int) ([]rawChangeRow, error) {
-	// LIMIT is a trusted in-process int (embedded, like the d1 row reader's
-	// pagination); only the watermark crosses as a bound param, sent as a string.
-	q := `SELECT CAST(id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
-		ChangeLogTable + `" WHERE id > ? ORDER BY id ASC LIMIT ` + strconv.Itoa(batch)
-	rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
+	// A previous poll that overflowed the response cap left its shrunk batch
+	// here; the reader keeps asking for its configured batch and this is what
+	// holds the smaller one (LA-2b).
+	if e.pollBatchCap > 0 && batch > e.pollBatchCap {
+		batch = e.pollBatchCap
+	}
+	rows, err := e.pollChangeLogRows(ctx, sinceID, batch)
 	if err != nil {
 		return nil, err
 	}
@@ -954,15 +964,79 @@ func (e *d1Executor) minChangeLogID(ctx context.Context) (int64, error) {
 func (e *d1Executor) pruneBatchSize() int64 { return d1PruneBatchSize }
 
 // d1PollBatchSize clamps the change-log poll batch on the D1 transport (P-3).
-// Cloudflare caps a /query response at ~1 MB — the same limit that sizes the
-// cold-copy row reader's page at 1000 (see sqlite.d1PageSize) — and change
-// rows are HEAVIER than data rows (each carries full before/after JSON
-// images), so the shared defaultBatchSize (10000) can overflow the cap on a
-// catch-up poll. 1000 matches d1PageSize's reasoning; the pump's full-batch
-// fast-repoll keeps catch-up throughput unthrottled.
+// This comment used to say Cloudflare caps a /query response at ~1 MB. It does
+// not: LA-4 measured a single 32.8 MB response come back whole. The limit that
+// actually binds is sluice's OWN client cap (8 MiB), which exists so an
+// oversized body is refused by name instead of decoded from a truncation.
+//
+// The ceiling is still right and its reasoning still holds against the real
+// number: change rows are HEAVIER than data rows (each carries full
+// before/after JSON images), so the shared defaultBatchSize (10000) can
+// overflow on a catch-up poll. 1000 matches sqlite.d1PageSize.
+//
+// A ceiling is not a guarantee -- 1000 rows of arbitrary width can still
+// exceed the cap -- which is why [d1Executor.pollChangeLogRows] shrinks and
+// re-requests rather than trusting this number (LA-2b). The pump's full-batch
+// fast-repoll keeps catch-up throughput unthrottled while at the ceiling.
 const d1PollBatchSize = 1000
 
 func (e *d1Executor) maxPollBatch() int { return d1PollBatchSize }
+
+// pollChangeLogRows runs the id-ordered change-log fetch, halving the batch
+// and re-requesting when the response exceeds the transport+s cap.
+//
+// The retry is idempotent for the same reason the bulk reader+s is: the query
+// is bounded by `id > sinceID ORDER BY id ASC`, so a smaller LIMIT returns a
+// strict PREFIX of the same rows. Nothing is skipped by asking for fewer.
+//
+// Why this is not merely a nicety (LA-2b): a poll error kills the pump, and the
+// poll batch is not an operator flag, so before this a change-log batch whose
+// before/after images exceeded the cap wedged the d1-trigger stream with no
+// remedy at all -- every restart met the identical batch.
+//
+// The shrink is STICKY for the life of the executor. A source that produced one
+// over-cap batch tends to produce more, and re-climbing from the ceiling every
+// poll would spend log2(batch) wasted round trips each time. It resets when the
+// stream restarts. The cost is that the pump+s full-batch fast-repoll no longer
+// fires while shrunk (a shrunk page is shorter than r.batchSize), so catch-up
+// runs at the poll cadence instead of back-to-back -- slower, never wrong.
+func (e *d1Executor) pollChangeLogRows(ctx context.Context, sinceID int64, batch int) ([]map[string]json.RawMessage, error) {
+	for {
+		// LIMIT is a trusted in-process int (embedded, like the d1 row reader+s
+		// pagination); only the watermark crosses as a bound param, sent as a string.
+		q := `SELECT CAST(id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
+			ChangeLogTable + `" WHERE id > ? ORDER BY id ASC LIMIT ` + strconv.Itoa(batch)
+		rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
+		if err == nil {
+			return rows, nil
+		}
+		limit, tooLarge := sqlite.D1ResponseTooLarge(err)
+		if !tooLarge {
+			return nil, err
+		}
+		if batch <= 1 {
+			// The batch IS one change row, and one change row the cap cannot
+			// hold cannot be streamed by this transport at all. Refuse by name
+			// rather than shrink forever or decode a truncated body.
+			return nil, sluicecode.Wrap(
+				sluicecode.CodeBulkCopyRowTooLarge,
+				"shrink or NULL the row+s oversized values at the source, or exclude the table from the sync",
+				fmt.Errorf(
+					"d1-trigger: a single change-log row after id=%d exceeds the %d-byte response cap even as a batch of one -- "+
+						"a change row carries the full before and after images of one source row, so it is roughly twice "+
+						"the width of the row itself. The stream cannot advance past it through the D1 query API",
+					sinceID, limit,
+				),
+			)
+		}
+		batch /= 2
+		e.pollBatchCap = batch
+		slog.WarnContext(ctx, "d1-trigger: change-log poll exceeded the response cap; re-requesting it smaller",
+			slog.Int64("since_id", sinceID),
+			slog.Int("rows_retrying", batch),
+			slog.Int("response_cap_bytes", limit))
+	}
+}
 
 // checkpointWAL is a no-op on the D1 transport: D1 polls over the `/query` HTTP
 // API against Cloudflare-managed storage — there is no local pager or WAL file
