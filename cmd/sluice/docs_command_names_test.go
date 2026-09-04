@@ -66,6 +66,18 @@ import (
 // the words after it.
 var docCommandRe = regexp.MustCompile("`sluice ([a-z][a-z0-9- ]*)`")
 
+// docBareCommandRe matches a backticked command path written WITHOUT the
+// binary name -- `sync start`, `schema add-table` -- which is how most of
+// this repo's prose refers to a subcommand once the page has established
+// which tool it is talking about. It is deliberately capped at three words
+// and only considered when the FIRST word is a real top-level command, so
+// an ordinary backticked phrase is not read as an invocation.
+//
+// This half exists because the bug that motivated the gate had both forms.
+// A gate that closed only the spelling it was shown would have left the
+// same error standing in the redaction guide and the redaction skill.
+var docBareCommandRe = regexp.MustCompile("`([a-z][a-z0-9-]*(?: [a-z][a-z0-9-]*){1,2})`")
+
 // docExemptRe reads the per-file exemption markers described above. The
 // reason text is required by the pattern: an exemption with no stated reason
 // does not parse, and therefore does not exempt.
@@ -75,7 +87,11 @@ var docExemptRe = regexp.MustCompile(`<!--\s*cli-command-exempt:\s*([a-z][a-z0-9
 // directory contributes the markdown directly inside it. Nothing recurses, so
 // a new docs subdirectory joins this gate by a deliberate edit rather than as
 // a side effect of being created.
-var docCommandRoots = []string{"docs", "docs/operator", "docs/cookbook", "skills", "README.md"}
+// A "/..." suffix means recurse. skills/ needs it because each skill is a
+// directory holding its own SKILL.md -- scanning skills/ non-recursively
+// found nothing at all, which is how the redaction skill kept the wrong
+// command name through the first cut of this gate.
+var docCommandRoots = []string{"docs", "docs/operator", "docs/cookbook", "skills/...", "README.md"}
 
 func TestDocsNameOnlyRealCommands(t *testing.T) {
 	repo := repoRootForDocs(t)
@@ -86,17 +102,27 @@ func TestDocsNameOnlyRealCommands(t *testing.T) {
 		t.Fatalf("kong.New: %v", err)
 	}
 	known := commandPaths(parser.Model.Node, nil, map[string]bool{})
+	// The bare-form check needs to know which words START a command, and it
+	// takes them from the same model rather than a list.
+	topLevel := map[string]bool{}
+	for _, c := range parser.Model.Node.Children {
+		if c.Name != "" {
+			topLevel[c.Name] = true
+		}
+	}
 	if len(known) < 20 {
 		t.Fatalf("kong yielded only %d command paths; the CLI struct moved and this gate is measuring nothing", len(known))
 	}
 
 	type hit struct{ file, path string }
 	var bad []hit
-	checked, files, exempted := 0, 0, 0
+	checked, bareChecked, files, exempted := 0, 0, 0, 0
 	seen := map[string]bool{}
 
 	for _, root := range docCommandRoots {
-		eachDocFile(t, filepath.Join(repo, root), func(path string, body []byte) {
+		recurse := strings.HasSuffix(root, "/...")
+		root = strings.TrimSuffix(root, "/...")
+		eachDocFile(t, filepath.Join(repo, root), recurse, func(path string, body []byte) {
 			if seen[path] {
 				return
 			}
@@ -142,6 +168,19 @@ func TestDocsNameOnlyRealCommands(t *testing.T) {
 				// the wrong subcommand was never looked at.
 				bad = append(bad, hit{rel, cmdPath})
 			}
+
+			for _, m := range docBareCommandRe.FindAllStringSubmatch(string(body), -1) {
+				words := strings.Fields(m[1])
+				if len(words) == 0 || !topLevel[words[0]] {
+					continue
+				}
+				cmdPath := strings.Join(words, " ")
+				bareChecked++
+				if known[cmdPath] || exempt[cmdPath] {
+					continue
+				}
+				bad = append(bad, hit{rel, cmdPath})
+			}
 		})
 	}
 
@@ -153,6 +192,9 @@ func TestDocsNameOnlyRealCommands(t *testing.T) {
 	if checked < 60 {
 		t.Fatalf("only %d command invocations extracted; the regex stopped matching and this gate is vacuous", checked)
 	}
+	if bareChecked < 40 {
+		t.Fatalf("only %d bare command paths extracted; docBareCommandRe stopped matching and half this gate is vacuous", bareChecked)
+	}
 	if exempted == 0 {
 		t.Fatal("no exemption marker matched; docExemptRe has stopped parsing them, so a deliberate mention would now pass for the wrong reason")
 	}
@@ -162,7 +204,7 @@ func TestDocsNameOnlyRealCommands(t *testing.T) {
 		var b strings.Builder
 		b.WriteString("operator-facing docs name commands that do not exist in the kong tree:\n")
 		for _, h := range bad {
-			b.WriteString("  " + h.file + ": `sluice " + h.path + "`\n")
+			b.WriteString("  " + h.file + ": `" + h.path + "`\n")
 		}
 		b.WriteString("\nEither the doc is wrong, or the command was renamed and its docs were not.\n")
 		b.WriteString("The command tree is the authority here; it is walked from kong, not listed by hand.\n")
@@ -188,7 +230,7 @@ func commandPaths(node *kong.Node, prefix []string, out map[string]bool) map[str
 
 // eachDocFile reads one markdown file, or the markdown directly inside one
 // directory. It does not recurse — see docCommandRoots.
-func eachDocFile(t *testing.T, root string, fn func(path string, body []byte)) {
+func eachDocFile(t *testing.T, root string, recurse bool, fn func(path string, body []byte)) {
 	t.Helper()
 	info, err := os.Stat(root)
 	if err != nil {
@@ -203,6 +245,18 @@ func eachDocFile(t *testing.T, root string, fn func(path string, body []byte)) {
 	}
 	if !info.IsDir() {
 		read(root)
+		return
+	}
+	if recurse {
+		if err := filepath.Walk(root, func(p string, fi os.FileInfo, werr error) error {
+			if werr != nil || fi.IsDir() || !strings.HasSuffix(p, ".md") {
+				return werr
+			}
+			read(p)
+			return nil
+		}); err != nil {
+			t.Fatalf("walk %s: %v", root, err)
+		}
 		return
 	}
 	entries, err := os.ReadDir(root)

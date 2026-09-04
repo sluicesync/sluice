@@ -386,7 +386,7 @@ KMS/Vault adapters (layer them above sluice by populating
 
 sluice runs these preflight checks before any data movement, on every
 lane that redacts rows — `migrate` (single- and multi-database),
-`sync start` cold start (single- and multi-database), `sync add-table`,
+`sync start` cold start (single- and multi-database), `schema add-table`,
 and `backup full`:
 
 0. **Selector resolution** (Bug 99 / v0.91.1; namespace half added for
