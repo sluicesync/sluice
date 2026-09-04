@@ -43,7 +43,12 @@ import (
 // back — verified by reading it, not assumed.
 //
 // WHAT THIS GATE REACHES, stated so the name cannot be read as broader than
-// the truth: SQL that sluice's own Go source SPELLS. Honest residuals — SQL
+// the truth: SQL that sluice's own Go source SPELLS. It grades package-level
+// CONSTS and VARS as well as function bodies, each declaration as its own
+// unit; until 2026-09-04 it visited functions only, which left the most
+// natural home for a long piece of static SQL as the one place this gate
+// could not see -- the same body-only shape that had to be fixed in
+// v0.137.4's capture-body door. Honest residuals — SQL
 // assembled from fragments too far apart for the literal scan (none today:
 // all three emitters spell the whole CREATE in one function), SQL read from
 // a config/manifest and executed verbatim (covered instead by the
@@ -85,23 +90,45 @@ func TestNoUnpinnedSecurityDefinerEmitters(t *testing.T) {
 			// the walker is mis-reading the tree — louder than skipping.
 			return fmt.Errorf("parse %s: %w", path, perr)
 		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			sql := literalsIn(fn.Body)
+		grade := func(unit, sql string) {
 			if !strings.Contains(sql, "SECURITY DEFINER") || !strings.Contains(sql, "FUNCTION ") ||
 				!strings.Contains(sql, "CREATE ") {
-				continue
+				return
 			}
-			name := filepath.ToSlash(path) + ":" + fn.Name.Name
+			name := filepath.ToSlash(path) + ":" + unit
 			found[name] = true
 			if !strings.Contains(sql, "SET search_path =") {
 				t.Errorf("%s emits SECURITY DEFINER SQL with NO `SET search_path =` clause — the function would "+
 					"resolve unqualified names against the FIRING session's search_path, letting any user who can "+
 					"create a function in a reachable schema shadow a built-in and execute as the function's OWNER "+
 					"(SEC-1). Add `SET search_path = pg_catalog, pg_temp` and pg_catalog-qualify the body", name)
+			}
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				grade(d.Name.Name, literalsIn(d.Body))
+			case *ast.GenDecl:
+				// Package-level const/var. A whole CREATE … SECURITY
+				// DEFINER held in a const was invisible to this gate until
+				// 2026-09-04 (audit 2026-09-01, testing-ci LOW tail): the
+				// walker visited *ast.FuncDecl only, so the most natural
+				// place to put a long piece of static SQL was the one place
+				// it was not graded. Each spec is graded as its own unit, so
+				// two unrelated consts cannot combine into a phantom match.
+				if d.Tok != token.CONST && d.Tok != token.VAR {
+					continue
+				}
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok || len(vs.Names) == 0 {
+						continue
+					}
+					grade(vs.Names[0].Name, literalsIn(vs))
+				}
 			}
 		}
 		return nil
