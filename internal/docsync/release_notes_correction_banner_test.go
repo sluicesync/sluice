@@ -88,6 +88,28 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 141, 1},
+		fixedIn:     semver{0, 141, 2},
+		claimMarker: "Both warnings now say not to, and point at `sluice sync decommission` instead",
+		why: "one did. The engine-local message has TWO callers -- backup full --chain-slot and any stream " +
+			"recreating a missing publication, warm resume included -- and one vocabulary, the backup one, " +
+			"so a plain sync start printed \"a chain slot needs a database-wide publication\" and " +
+			"\"--chain-slot keeps the publication after the run\" to an operator who passed no such flag, " +
+			"and named no stream remedy at all (Bug 269, found by this release's own regression cycle)",
+	},
+	{
+		amended:     semver{0, 141, 1},
+		fixedIn:     semver{0, 141, 2},
+		claimMarker: "pins the replication slot's restart position behind the drop, and the stream then fails to resume",
+		why: "that is the LOUD branch of a fork stated as the whole outcome. The v0.141.1 cycle isolated it " +
+			"on one variable -- whether anything was WRITTEN between the drop and the resume. With a row " +
+			"written the resume dies as described; with nothing written it SUCCEEDS, silently widening the " +
+			"publication to FOR ALL TABLES while reporting nothing wrong, and every keyless table in the " +
+			"database starts refusing UPDATE (Bug 270). The quiet branch is the worse one, and describing " +
+			"only the loud one hid it. Note the shape: v0.141.0 said \"at exit 0\", v0.141.1 replaced that " +
+			"with another absolute, and the behaviour needed a condition both times",
+	},
+	{
 		amended:     semver{0, 140, 0},
 		fixedIn:     semver{0, 140, 0},
 		claimMarker: "a setting a standby inherits from its primary and cannot change",

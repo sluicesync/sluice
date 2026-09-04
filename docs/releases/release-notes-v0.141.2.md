@@ -1,0 +1,32 @@
+# sluice v0.141.2
+
+**Two Postgres warnings were telling operators things that were not true — one of them in the direction that hides harm.** Both were found by v0.141.1's own regression cycle, and both were claims v0.141.1's release notes repeated. No code path that moves data changed; if you do not run Postgres CDC or `backup full --chain-slot`, there is nothing here for you.
+
+## Fixed
+
+**A plain `sync start` was warning you about a backup flag you never passed.** The publication-exposure warning has two doors — `backup full --chain-slot`, and *any* stream recreating a publication that has gone missing, warm resume included — and until now they shared one message, written for the first. So an operator whose stream was recreating its publication read that "a chain slot needs a database-wide publication" and that "`--chain-slot` keeps the publication after the run", with no backup anywhere in the picture. Worse, the shared message never named `sluice sync decommission`, which is the only thing that retires a stream's slot and publication together — so the one door whose operator could act on that remedy was the one door that was not told about it. Each door now has its own wording, and a new AST roster (`TestPublicationExposureSiteRoster`) fails the build if a call site does not name which door it is, with a companion gate grading the wording itself.
+
+**The advice about dropping a publication described the loud outcome as if it were the only one.** Both the warning and v0.141.1's notes said that dropping the publication out from under a live stream pins the slot's restart position behind the drop and the stream then fails to resume. That holds only when the stream has to decode something written after the drop. When it does not, the resume **succeeds**: the publication silently widens to `FOR ALL TABLES`, the stream replicates the next change and reports nothing wrong, and every keyless table in the database begins refusing `UPDATE` from that moment. The quiet branch is the dangerous one, and describing only the loud branch is what kept it out of sight. All three doors now state it as a fork, and the advice not to drop the publication stands — it is stronger for being accurate about what happens if you do.
+
+**The remedy those warnings pointed at did not do what they said.** They told you `sluice sync decommission` "drops the slot and the publication together". It drops the slot, and the publication only when the stream had one of its own: the shared default `sluice_pub` is deliberately never dropped, because other streams may read through it. That is the dominant configuration at these doors, so the common case was an operator running the suggested command, getting exit 0 and a removal report, and keeping the `FOR ALL TABLES` publication that was the entire subject of the warning. The messages now say what decommission actually retires, add that the stream has to be stopped first, and say plainly that a shared `sluice_pub` has to be dropped by hand once nothing reads it. This claim shipped in v0.141.0 and v0.141.1; it was found by the pre-tag review of *this* release, which caught it being copied onto a second door.
+
+## Compatibility
+
+Drop-in from v0.141.1. No flag change, no format change, no new error codes, and no change to which tables either warning reports — only the text and the remedy each door prints.
+
+There is nothing to re-run and no data to re-check. If you followed the old advice and dropped a publication, the outcome you got is one of the two described above: a stream that will not resume, or a stream that came back green with a database-wide publication. The second is worth checking for, because it looks like success — `SELECT pubname, puballtables FROM pg_publication` will show `t` on a publication you had scoped.
+
+The same query is the check if you ran `sluice sync decommission` expecting it to remove the publication: a surviving `sluice_pub` with `puballtables = t` is still refusing `UPDATE` on every keyless table in that database, whatever the decommission report said.
+
+## Who needs this
+
+Anyone running Postgres CDC who has seen `UNSELECTED-NAMESPACE-EXPOSURE`, and anyone who acted on what it or v0.141.1's notes said about dropping a publication. The v0.141.1 archive carries a correction banner naming both claims.
+
+## Install
+
+```
+brew install sluicesync/tap/sluice
+scoop bucket add sluicesync https://github.com/sluicesync/scoop-bucket && scoop install sluice
+go install sluicesync.dev/sluice/cmd/sluice@v0.141.2
+docker pull ghcr.io/sluicesync/sluice:0.141.2
+```
