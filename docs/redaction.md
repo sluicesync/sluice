@@ -372,6 +372,9 @@ credential-redacted in the line.
 
 ### Out of scope (v1)
 
+<!-- cli-command-exempt: keyset rotate - named here as deferred future work, not as an instruction -->
+<!-- cli-command-exempt: keyset list - named here as deferred future work, not as an instruction -->
+
 `sluice keyset rotate` / `sluice keyset list` CLI subcommands
 (populate `sluice_keysets` via SQL / edit the YAML by hand for now);
 KMS/Vault adapters (layer them above sluice by populating

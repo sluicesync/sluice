@@ -354,7 +354,7 @@ A Postgres event trigger is DATABASE-wide — it cannot be attached to a schema 
 Since v0.140.0 the tier records only commands whose RELATION carries this install’s capture trigger. In practice:
 
 - **Still halts** (these change a captured table’s shape): `ALTER TABLE` on a captured table, including `ADD COLUMN`, `ALTER COLUMN TYPE`, `DROP COLUMN`, `ADD CONSTRAINT` and `RENAME COLUMN`; and `CREATE INDEX` on one.
-- **No longer halts**: anything on a table this install does not capture — another schema entirely, an uncaptured neighbour in the same schema, or a brand-new table. A table with no capture trigger emits no change rows, so it cannot make the applier write a wrong one; `sluice sync add-table` is how it joins the stream.
+- **No longer halts**: anything on a table this install does not capture — another schema entirely, an uncaptured neighbour in the same schema, or a brand-new table. A table with no capture trigger emits no change rows, so it cannot make the applier write a wrong one; `sluice schema add-table` is how it joins the stream.
 
 Upgrading changes the capture function bodies, so an install created by an earlier release warns `STALE-CAPTURE-FUNCTION` until `sluice trigger setup` is re-run once.
 

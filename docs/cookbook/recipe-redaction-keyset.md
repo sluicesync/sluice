@@ -82,6 +82,7 @@ sluice migrate ... \
     --redact 'public.users.email=hash:hmac-sha256:email_v1'
 ```
 
+<!-- cli-command-exempt: keyset rotate - the sentence below says this command does NOT exist -->
 Operator-side management of the table (rotation, lookup, deletion) is
 manual SQL / YAML for now — there's no `sluice keyset rotate` CLI in
 v1.

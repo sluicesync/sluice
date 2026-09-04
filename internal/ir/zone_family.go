@@ -76,19 +76,15 @@ func ZoneSiblingSwap(prev, cur Type) bool {
 // `timestamptz → text` rendered `2026-06-16 05:00:00+09` under Asia/Tokyo
 // against `2026-06-15 20:00:00+00` under UTC, while `timetz → text` and
 // `timetz → time` returned byte-identical values under both.
-// arrayDepth counts the IR array dimensions wrapping t.
-func arrayDepth(t Type) int {
-	depth := 0
-	for {
-		arr, ok := t.(Array)
-		if !ok {
-			return depth
-		}
-		depth++
-		t = arr.Element
-	}
-}
-
+//
+// NOTE, and it is the open half of this measurement (audit SLM-5b): the pair
+// is ASYMMETRIC, and only one direction was measured non-session-dependent.
+// Dropping an offset (`timetz → time`) needs no zone. ADDING one
+// (`time → timetz`) has to get the offset from somewhere, and Postgres takes
+// it from the executing session. [ZoneSiblingSwap] refuses BOTH directions,
+// so the refusal is correct for one and over-broad for the other. Narrowing
+// it is a behaviour change on shipped code and is deliberately NOT done here;
+// it owes a measurement of the add direction under two session zones first.
 func sessionNormalized(t Type) bool {
 	family, zoned, ok := ZoneFamily(t)
 	if !ok || !zoned {
@@ -107,6 +103,19 @@ func sessionNormalized(t Type) bool {
 		family = family[i+1:]
 	}
 	return family == "timestamp"
+}
+
+// arrayDepth counts the IR array dimensions wrapping t.
+func arrayDepth(t Type) int {
+	depth := 0
+	for {
+		arr, ok := t.(Array)
+		if !ok {
+			return depth
+		}
+		depth++
+		t = arr.Element
+	}
 }
 
 // SessionZoneCast reports whether an ALTER COLUMN TYPE from prev to cur
