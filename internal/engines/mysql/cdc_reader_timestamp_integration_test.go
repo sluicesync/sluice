@@ -61,14 +61,34 @@ func TestCDCReader_TimestampNonUTCHost(t *testing.T) {
 	// later tests in the same process see the original value.
 	//
 	// The cleanup is registered FIRST so it runs LAST (t.Cleanup is
-	// LIFO and runs after all defers). This guarantees the CDC pump
-	// goroutine — which calls go-mysql's binlog decoder, which reads
-	// time.Local in time.Unix — has fully exited (signalled by the
-	// `changes` channel closing in the pump's deferred close(out))
-	// BEFORE the test goroutine writes to time.Local. Without this
-	// ordering, -race flagged a write-vs-read race between the
-	// cleanup's `time.Local = originalLocal` and a still-decoding
-	// pump call to time.Unix.
+	// LIFO and runs after all defers), so nothing writes time.Local
+	// until every reader of it has stopped. Without this ordering,
+	// -race flagged a write-vs-read race between the cleanup's
+	// `time.Local = originalLocal` and a still-decoding call to
+	// time.Unix.
+	//
+	// THERE ARE TWO READERS, and this comment used to prove an edge
+	// against only one of them while naming the other (checked
+	// 2026-09-03, while ruling this test out as the cause of the
+	// engines-mysql segfault; the ordering turned out to be sound,
+	// for a reason the comment did not give).
+	//
+	// (1) sluice's own pump goroutine. Covered by the `changes`
+	// channel closing in its deferred close(out), which the later
+	// cleanup drains to completion.
+	//
+	// (2) go-mysql's onStream goroutine, which is the one that
+	// actually runs the binlog decoder and therefore the one that
+	// actually calls time.Unix. A closed `changes` channel says
+	// nothing about it. What covers it is CDCReader.Close: it joins
+	// the pump, THEN calls syncer.Close, and go-mysql's close() ends
+	// in b.wg.Wait() (v1.16.0, replication/binlogsyncer.go) — so no
+	// decoder goroutine survives Close's return. The edge that makes
+	// this test safe is therefore go-mysql's waitgroup, reached
+	// through our Close, not the channel close on its own.
+	//
+	// If go-mysql ever stops joining there, this test races again and
+	// the channel-close argument will still look like it covers it.
 	loc, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
 		t.Skipf("LoadLocation America/Los_Angeles: %v (tzdata unavailable)", err)
