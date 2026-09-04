@@ -207,7 +207,7 @@ func TestStageD1Table_RowidShadowMatrix(t *testing.T) {
 			dst := openStageDest(t, cell.ddl)
 
 			rr := &D1RowReader{client: client, pageSize: 2}
-			total, err := stageD1Table(context.Background(), rr, dst, table, slog.Default())
+			total, err := stageD1Table(context.Background(), rr, dst, table, true, slog.Default())
 			if cell.wantKey == "" {
 				assertNoPaginationKeyRefusal(t, err, &sqls, &mu)
 				return
@@ -310,7 +310,7 @@ func TestD1RowReader_CountBracketRefusesQuiescentMismatch(t *testing.T) {
 	t.Run("stage", func(t *testing.T) {
 		dst := openStageDest(t, `CREATE TABLE t (v TEXT)`)
 		rr := &D1RowReader{client: newClient(), pageSize: 4}
-		_, err := stageD1Table(context.Background(), rr, dst, table, slog.Default())
+		_, err := stageD1Table(context.Background(), rr, dst, table, true, slog.Default())
 		assertRowCountMismatch(t, err)
 	})
 }

@@ -343,7 +343,7 @@ type MigrateCmd struct {
 // sidestepping D1's HTTP query CPU/pattern limits. Used by `migrate --stage-local`.
 // stageDir (--stage-dir / SLUICE_STAGE_DIR) overrides where the replica lives;
 // "" is the os.TempDir default.
-func stageD1Source(ctx context.Context, d1DSN, stageDir string) (path string, cleanup func(), err error) {
+func stageD1Source(ctx context.Context, d1DSN, stageDir string, inScope func(string) bool) (path string, cleanup func(), err error) {
 	dir, err := os.MkdirTemp(stageDir, "sluice-d1-stage-")
 	if err != nil {
 		if stageDir != "" {
@@ -355,7 +355,7 @@ func stageD1Source(ctx context.Context, d1DSN, stageDir string) (path string, cl
 	path = filepath.Join(dir, "d1-stage.db")
 	slog.InfoContext(ctx, "stage-local: replicating live D1 into a local SQLite file",
 		slog.String("dest", path))
-	if err := sqlite.StageD1ToLocalFile(ctx, d1DSN, path, slog.Default()); err != nil {
+	if err := sqlite.StageD1ToLocalFile(ctx, d1DSN, path, inScope, slog.Default()); err != nil {
 		cleanup()
 		return "", nil, fmt.Errorf("--stage-local: %w", err)
 	}
@@ -402,7 +402,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
-	source, target, cleanup, err := m.resolveEngines(kongContext(), g)
+	source, target, cleanup, err := m.resolveEngines(kongContext(), g, cfg)
 	if err != nil {
 		return err
 	}
@@ -627,7 +627,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 // can run for minutes, and a context.Background() here made it
 // Ctrl-C-deaf (the operator's interrupt neither stopped the HTTP
 // paging nor released the temp dir until process kill).
-func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, target ir.Engine, cleanup func(), err error) {
+func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals, cfg *config.Config) (source, target ir.Engine, cleanup func(), err error) {
 	cleanup = func() {}
 	source, err = resolveEngine(m.SourceDriver)
 	if err != nil {
@@ -681,7 +681,31 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
 				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
 		}
-		staged, stageCleanup, serr := stageD1Source(ctx, m.Source, g.StageDir)
+		// The LA-4 mangle refusal is scoped to the tables this run will
+		// actually read (Bug 265). Resolved from the CLI flags AND the YAML
+		// config, through the same helpers Run uses later, so a config-file
+		// filter scopes it exactly as --include-table does; a fix that read
+		// only the flags would have left the config form refusing.
+		//
+		// This is the run's filter EXACTLY, not an approximation of it, and
+		// that is worth stating because it is contingent. EffectiveTableFilter
+		// can narrow a filter further by merging an engine's default exclude
+		// patterns, but only MySQL declares any, and this path is D1 staged to
+		// sqlite. If sqlite ever gains defaults, this predicate becomes WIDER
+		// than the run's -- which is the safe direction (it refuses where a
+		// warning would have done) but no longer exact.
+		//
+		// A filter that cannot be built is not fatal HERE: Run resolves the
+		// same arguments a few lines later and reports it properly. Falling
+		// back to "everything is in scope" keeps this the conservative
+		// direction -- the refusal stays armed rather than silently off.
+		var stageScope func(string) bool
+		if inc, exc := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg); len(inc) > 0 || len(exc) > 0 {
+			if f, ferr := migcore.NewTableFilter(inc, exc); ferr == nil {
+				stageScope = f.Allows
+			}
+		}
+		staged, stageCleanup, serr := stageD1Source(ctx, m.Source, g.StageDir, stageScope)
 		if serr != nil {
 			return nil, nil, cleanup, serr
 		}

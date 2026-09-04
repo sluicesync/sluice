@@ -102,7 +102,7 @@ func TestStageD1_ByteFaithful(t *testing.T) {
 
 	mock := startMockD1(t, execD1Handler(srcDB))
 	dest := filepath.Join(t.TempDir(), "stage.db")
-	if err := stageD1ClientToLocalFile(context.Background(), mock, dest, nil); err != nil {
+	if err := stageD1ClientToLocalFile(context.Background(), mock, dest, nil, nil); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 

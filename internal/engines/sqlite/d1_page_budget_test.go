@@ -317,7 +317,7 @@ func TestD1RowReader_RowTooLargeRefusedByName(t *testing.T) {
 			)
 			rr := &D1RowReader{client: newClient(t, overflowAfter, &limits, &mu), pageSize: 2}
 			db := openStageDest(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)`)
-			total, err := stageD1Table(context.Background(), rr, db, table, slog.Default())
+			total, err := stageD1Table(context.Background(), rr, db, table, true, slog.Default())
 			if int(total) != overflowAfter || len(stagedIDs(t, db, "t")) != overflowAfter {
 				t.Errorf("staged %d rows (%d reported) before the refusal; want %d", len(stagedIDs(t, db, "t")), total, overflowAfter)
 			}

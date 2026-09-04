@@ -120,7 +120,7 @@ func TestD1InferTypes_Code7500_StageLocalAvoids(t *testing.T) {
 	ctx := context.Background()
 
 	dest := filepath.Join(t.TempDir(), "staged.db")
-	if err := stageD1ClientToLocalFile(ctx, client, dest, nil); err != nil {
+	if err := stageD1ClientToLocalFile(ctx, client, dest, nil, nil); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 	if n := rejected.Load(); n != 0 {

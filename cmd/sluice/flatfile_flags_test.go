@@ -51,7 +51,7 @@ func writeFixture(t *testing.T, name, content string) string {
 // resolveSource runs the PRODUCTION resolveEngines path on a parsed CLI.
 func resolveSource(t *testing.T, cli *CLI) (ir.Engine, error) {
 	t.Helper()
-	source, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), &cli.Globals)
+	source, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), &cli.Globals, nil)
 	t.Cleanup(cleanup)
 	return source, err
 }

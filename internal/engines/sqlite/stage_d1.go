@@ -39,7 +39,21 @@ import (
 // The result is a drop-in `--source-driver sqlite` source. Foreign keys are off
 // on the staging connection (writePragmas), so table-creation/insert order is
 // irrelevant and a cyclic-FK schema stages cleanly.
-func StageD1ToLocalFile(ctx context.Context, d1DSN, destPath string, log *slog.Logger) error {
+// inScope reports whether the migration will actually READ a table, and
+// it scopes the LA-4 mangle refusal -- not what gets staged.
+//
+// Everything is still staged. The staged file is a faithful whole-database
+// replica by design; that is what lets the sqlite reader and --infer-types
+// treat it as indistinguishable from D1 itself, and filtering it here would
+// change what a later phase sees.
+//
+// What is scoped is the REFUSAL. A mangled table the migration will never
+// read cannot reach the target, so refusing over it stops a run that was
+// going to be correct -- and neither --include-table nor --exclude-table
+// could get past it, because staging ran before the filter was consulted at
+// all. That was Bug 265, found by the v0.140.0 regression cycle against the
+// refusal this release added. A nil predicate means everything is in scope.
+func StageD1ToLocalFile(ctx context.Context, d1DSN, destPath string, inScope func(string) bool, log *slog.Logger) error {
 	client, err := openD1Client(d1DSN)
 	if err != nil {
 		return err
@@ -47,13 +61,13 @@ func StageD1ToLocalFile(ctx context.Context, d1DSN, destPath string, log *slog.L
 	if err := client.ping(ctx); err != nil {
 		return err
 	}
-	return stageD1ClientToLocalFile(ctx, client, destPath, log)
+	return stageD1ClientToLocalFile(ctx, client, destPath, inScope, log)
 }
 
 // stageD1ClientToLocalFile is the staging core, taking an already-opened
 // [d1Client] so tests can inject a mock-backed client (the httptest D1 server)
 // without env credentials.
-func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath string, log *slog.Logger) error {
+func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath string, inScope func(string) bool, log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -89,7 +103,7 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 	// 2. Copy each table's rows at exact storage class.
 	var totalRows int64
 	for _, t := range schema.Tables {
-		n, err := stageD1Table(ctx, &D1RowReader{client: client}, db, t, log)
+		n, err := stageD1Table(ctx, &D1RowReader{client: client}, db, t, inScope == nil || inScope(t.Name), log)
 		if err != nil {
 			return err
 		}
@@ -137,7 +151,7 @@ const stageInsertBatch = 1000
 // value, so the staged file holds the same integer/real/text/blob/null SQLite
 // would have read from D1. Generated columns are skipped (recomputed locally
 // from the DDL).
-func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table, log *slog.Logger) (int64, error) {
+func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table, inScope bool, log *slog.Logger) (int64, error) {
 	plan, err := rr.planPagination(ctx, t)
 	if err != nil {
 		return 0, fmt.Errorf("d1 stage: plan pagination for %q: %w", t.Name, err)
@@ -199,7 +213,26 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 	// LA-4: the same comparison the reader runs, on the same evidence. A
 	// staged file is the artifact the rest of the migrate reads, so a
 	// mangle that reaches it is undetectable from then on.
-	if quiescent && srcTextBytes >= 0 && gotTextBytes != srcTextBytes {
+	//
+	// Scoped to the tables the migration will actually read (Bug 265). The
+	// first cut refused for ANY table, and staging copies the whole database
+	// by design, so a mangled table in a schema the operator had excluded
+	// failed the entire run -- with no flag that could get past it, because
+	// staging happens before the filter is consulted. An out-of-scope mangle
+	// cannot reach the target, so it WARNS: the operator still learns their
+	// source holds bytes D1 will not return faithfully, and the run they
+	// asked for still completes.
+	mangled := quiescent && srcTextBytes >= 0 && gotTextBytes != srcTextBytes
+	if mangled && !inScope {
+		log.WarnContext(ctx, "d1 stage: table holds text D1 rewrote in transit, but it is OUT OF SCOPE for this run",
+			slog.String("table", t.Name),
+			slog.Int64("bytes_received", gotTextBytes),
+			slog.Int64("bytes_stored", srcTextBytes),
+			slog.String("note", "staged as delivered and NOT copied to the target, because your table filter excludes it; "+
+				"the source is intact and hex(col) still returns the true bytes. Including this table without repairing it "+
+				"would refuse the run"))
+	}
+	if mangled && inScope {
 		return total, sluicecode.Wrap(
 			sluicecode.CodeD1TextMangled,
 			"read the affected columns as hex(col) and repair the values at the source",

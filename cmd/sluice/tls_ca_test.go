@@ -80,7 +80,7 @@ func TestTLSCA_Migrate_Pin(t *testing.T) {
 			"--source-tls-ca="+caFile,
 		)
 		g := &cli.Globals
-		if _, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), g); err != nil {
+		if _, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), g, nil); err != nil {
 			cleanup()
 			t.Fatalf("resolveEngines: %v", err)
 		} else {
@@ -99,7 +99,7 @@ func TestTLSCA_Migrate_Pin(t *testing.T) {
 			"--target-driver=postgres", "--target=postgres://u@h/db",
 		)
 		g := &cli.Globals
-		_, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), g)
+		_, _, cleanup, err := cli.Migrate.resolveEngines(context.Background(), g, nil)
 		if err != nil {
 			cleanup()
 			t.Fatalf("resolveEngines: %v", err)

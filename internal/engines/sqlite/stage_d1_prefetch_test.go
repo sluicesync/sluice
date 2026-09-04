@@ -112,7 +112,7 @@ func TestStageD1Table_PrefetchOverlapsInsert(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		rr := &D1RowReader{client: client, pageSize: 2}
-		total, err := stageD1Table(ctx, rr, db, table, slog.Default())
+		total, err := stageD1Table(ctx, rr, db, table, true, slog.Default())
 		done <- result{total, err}
 	}()
 
@@ -176,7 +176,7 @@ func TestStageD1Table_PrefetchRequestBoundsExact(t *testing.T) {
 	db := openStageDest(t, `CREATE TABLE snowflakes (id INTEGER PRIMARY KEY, label TEXT)`)
 
 	rr := &D1RowReader{client: client, pageSize: 2}
-	total, err := stageD1Table(context.Background(), rr, db, table, slog.Default())
+	total, err := stageD1Table(context.Background(), rr, db, table, true, slog.Default())
 	if err != nil {
 		t.Fatalf("stageD1Table: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestStageD1Table_PrefetchErrorSurfacesInSequence(t *testing.T) {
 	db := openStageDest(t, `CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)`)
 
 	rr := &D1RowReader{client: client, pageSize: 2}
-	total, err := stageD1Table(context.Background(), rr, db, table, slog.Default())
+	total, err := stageD1Table(context.Background(), rr, db, table, true, slog.Default())
 	if err == nil {
 		t.Fatal("page-2 failure must surface as a loud staging error — a nil error here is a silently truncated staged file")
 	}
@@ -301,7 +301,7 @@ func TestStageD1Table_PrefetchCancelReapsFetcherLoud(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		rr := &D1RowReader{client: client, pageSize: 2}
-		total, err := stageD1Table(ctx, rr, db, table, slog.Default())
+		total, err := stageD1Table(ctx, rr, db, table, true, slog.Default())
 		done <- result{total, err}
 	}()
 

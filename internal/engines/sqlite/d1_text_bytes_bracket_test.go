@@ -156,15 +156,32 @@ func TestStageD1Table_TextByteBracket(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		srcBytes    int64
+		inScope     bool
 		wantRefusal bool
 	}{
-		{"agreeing sums stage cleanly", 5, false},
-		{"delivered longer than stored refuses before the file is trusted", 3, true},
+		{"agreeing sums stage cleanly", 5, true, false},
+		{"delivered longer than stored refuses before the file is trusted", 3, true, true},
+		{
+			// Bug 265, found by the v0.140.0 regression cycle against the
+			// refusal v0.140.0 itself added. Staging copies the WHOLE
+			// database by design, and it runs before the table filter is
+			// consulted — so refusing for any table meant one mangled table
+			// in a schema the operator had excluded failed the entire run,
+			// with no flag able to get past it. An out-of-scope mangle
+			// cannot reach the target, so it warns and the run proceeds.
+			"a mangled table OUT OF SCOPE warns instead of failing the run", 3, false, false,
+		},
+		{
+			// The other direction, which is the one that would quietly
+			// disarm the refusal: out-of-scope must not become a blanket
+			// skip of the comparison.
+			"an out-of-scope table with agreeing sums is still clean", 5, false, false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := bracketMock(t, rows, 1, 1, tc.srcBytes, tc.srcBytes)
 			db := openStageDest(t, `CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)`)
-			_, err := stageD1Table(context.Background(), rr, db, table, slog.Default())
+			_, err := stageD1Table(context.Background(), rr, db, table, tc.inScope, slog.Default())
 
 			var coded *sluicecode.CodedError
 			gotRefusal := errors.As(err, &coded) && coded.Code == sluicecode.CodeD1TextMangled
@@ -173,6 +190,18 @@ func TestStageD1Table_TextByteBracket(t *testing.T) {
 			}
 			if !tc.wantRefusal && err != nil {
 				t.Fatalf("clean staging failed: %v", err)
+			}
+			if !tc.wantRefusal {
+				// Scoping the REFUSAL must not have scoped the COPY: the
+				// staged file is a faithful whole-database replica, and a
+				// later phase reading it would find a silently empty table.
+				var staged int
+				if qerr := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM items").Scan(&staged); qerr != nil {
+					t.Fatalf("count staged rows: %v", qerr)
+				}
+				if staged != 1 {
+					t.Fatalf("staged %d rows, want 1 — the table was skipped, not just exempted from the refusal", staged)
+				}
 			}
 		})
 	}

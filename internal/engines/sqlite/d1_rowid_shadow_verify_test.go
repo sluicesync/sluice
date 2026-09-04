@@ -80,7 +80,7 @@ func TestD1Verify_RowidShadowedColumn(t *testing.T) {
 
 	t.Run("stage-local", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "stage.db")
-		if err := stageD1ClientToLocalFile(ctx, client, dest, nil); err != nil {
+		if err := stageD1ClientToLocalFile(ctx, client, dest, nil, nil); err != nil {
 			t.Fatalf("stage: %v", err)
 		}
 		db, err := sql.Open("sqlite", dest)

@@ -137,7 +137,7 @@ func TestD1Verify_WideRowsPageByBytes(t *testing.T) {
 	t.Run("wide/stage-local", func(t *testing.T) {
 		rec.reset()
 		dest := filepath.Join(t.TempDir(), "stage.db")
-		if err := stageD1ClientToLocalFile(ctx, client, dest, nil); err != nil {
+		if err := stageD1ClientToLocalFile(ctx, client, dest, nil, nil); err != nil {
 			t.Fatalf("stage: %v", err)
 		}
 		db, err := sql.Open("sqlite", dest)
@@ -230,7 +230,7 @@ func TestD1Verify_WideRowsPageByBytes(t *testing.T) {
 	t.Run("control/stage-local", func(t *testing.T) {
 		rec.reset()
 		dest := filepath.Join(t.TempDir(), "stage.db")
-		assertTooLarge(t, stageD1ClientToLocalFile(ctx, client, dest, nil))
+		assertTooLarge(t, stageD1ClientToLocalFile(ctx, client, dest, nil, nil))
 	})
 }
 
