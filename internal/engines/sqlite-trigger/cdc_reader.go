@@ -594,7 +594,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		// in ordering becomes a loud refusal instead of missing rows.
 		if rc.id <= newLast && newLast != lastSeen {
 			return nil, lastSeen, fmt.Errorf(
-				"sqlite-trigger: poll: change-log page is not in ascending id order (saw %d after %d) — "+
+				"sqlite-trigger: poll: CHANGE-LOG-PAGE-UNORDERED: page is not in ascending id order (saw %d after %d) — "+
 					"the resume watermark is this page's maximum id, so an out-of-order page would advance it "+
 					"past rows that were never delivered and they could never be read again. Refusing rather "+
 					"than advancing; this is a bug in the poll query or the transport, not in your data",
