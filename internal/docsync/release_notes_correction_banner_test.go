@@ -88,6 +88,17 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 140, 0},
+		fixedIn:     semver{0, 140, 0},
+		claimMarker: "a setting a standby inherits from its primary and cannot change",
+		why: "a standby's wal_level is its own GUC and IS settable -- Bug 263's own repro restarted the same " +
+			"physical standby under -c wal_level=replica and -c wal_level=logical and sluice read each value " +
+			"back, so the measurement that justified the fix also disproves the justification written for it. " +
+			"fixedIn is the amended version itself because this is a PROSE-only correction: the shipped code is " +
+			"correct and unchanged, so there is no later binary to upgrade to. Found by the post-publish " +
+			"learnings sweep on v0.140.0",
+	},
+	{
 		amended:     semver{0, 137, 0},
 		fixedIn:     semver{0, 137, 1},
 		claimMarker: "Every existing pgtrigger install warns until `sluice trigger setup` is re-run once",

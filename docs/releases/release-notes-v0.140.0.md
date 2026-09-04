@@ -1,5 +1,9 @@
 # sluice v0.140.0
 
+> **Correction (2026-09-04).** One sentence in the standby entry below is wrong. It says the `wal_level` advice told the operator "to change a setting a standby inherits from its primary and cannot change". A standby's `wal_level` is its own GUC and IS settable: this release's own regression cycle restarted the same physical standby under `-c wal_level=replica` and `-c wal_level=logical` and sluice read each value back, so the repro that justified the fix also disproves the justification. What is true, and is all the entry needed to say, is that pointing at `wal_level` answers the wrong question — the blocking fact is that the source is a standby. The weaker claim that raising it on the standby accomplishes nothing is plausible and is NOT verified anywhere in this project, so it is not asserted here.
+>
+> **No upgrade is needed and there is nothing to re-run.** The code v0.140.0 shipped is correct and unchanged; only this sentence was wrong. Found by the post-publish learnings sweep on v0.140.0.
+
 **Five defects that only a real server could show, three of them in code v0.139.0 had just shipped.** The trigger-CDC engine stops halting your stream over somebody else's table, a Cloudflare D1 read stops silently copying text the API rewrote in transit, and the Postgres standby refusal starts reaching the replicas people actually run. If you use `postgres-trigger`, back up from a Postgres replica, or migrate D1 tables holding text that is not valid UTF-8, one of the entries below names you.
 
 ## Fixed

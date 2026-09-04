@@ -6,6 +6,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.140.0] - 2026-09-03
 
+**Correction (2026-09-04).** The standby entry below justifies the reordering by saying the `wal_level` advice told the operator to change "a setting a standby inherits from its primary and cannot change". That is wrong: a standby's `wal_level` is its own GUC and IS settable — this release's own regression cycle restarted the same physical standby under `-c wal_level=replica` and `-c wal_level=logical` and sluice read each value back, so the repro that justified the fix also disproves the justification. What is true is that pointing at `wal_level` answers the wrong question: the blocking fact is that the source is a standby. The weaker claim that raising it on the standby accomplishes nothing is plausible and is NOT verified anywhere in this project, so it is not asserted. **The v0.140.0 code is correct and unchanged — no upgrade, nothing to re-run.** Found by the post-publish learnings sweep.
+
 Five defects that only a real server could show, three of them in code v0.139.0 had just shipped. **If you use `postgres-trigger`, back up from a Postgres replica, or migrate Cloudflare D1 tables holding text that is not valid UTF-8, read the entry that names you.**
 
 ### Compatibility
