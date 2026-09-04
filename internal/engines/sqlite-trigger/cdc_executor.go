@@ -1004,8 +1004,21 @@ func (e *d1Executor) pollChangeLogRows(ctx context.Context, sinceID int64, batch
 	for {
 		// LIMIT is a trusted in-process int (embedded, like the d1 row reader+s
 		// pagination); only the watermark crosses as a bound param, sent as a string.
-		q := `SELECT CAST(id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
-			ChangeLogTable + `" WHERE id > ? ORDER BY id ASC LIMIT ` + strconv.Itoa(batch)
+		// ORDER BY is QUALIFIED, and that is load-bearing rather than style.
+		// `CAST(id AS TEXT) AS id` puts a TEXT expression in scope under the
+		// column’s own name, and SQLite resolves an ORDER BY term against the
+		// output aliases first -- so a bare `ORDER BY id` sorts the TEXT, i.e.
+		// LEXICOGRAPHICALLY: 1, 10, 11, 12, 2, 3, 9.
+		//
+		// That is silent CDC loss the moment the LIMIT truncates, because the
+		// pump advances its watermark to the page’s NUMERIC max: everything
+		// below that max which sorted later is captured, never delivered, and
+		// never looked at again. Bug 266, found on live D1 by the v0.141.0
+		// regression cycle -- 50 of 53 rows reached the target with the stream
+		// alive and no error. WHERE is unaffected: SQLite does not resolve
+		// output aliases there, so `id > ?` compares the real column.
+		q := `SELECT CAST("` + ChangeLogTable + `".id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
+			ChangeLogTable + `" WHERE id > ? ORDER BY "` + ChangeLogTable + `".id ASC LIMIT ` + strconv.Itoa(batch)
 		rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
 		if err == nil {
 			return rows, nil

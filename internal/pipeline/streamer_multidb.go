@@ -778,7 +778,10 @@ func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[strin
 			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica identity, "+
 			"while INSERT keeps working -- so the failure surfaces inside whatever application owns these tables",
 		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL before starting, or accept that writes to "+
-			"them will fail until you do; dropping this sync's publication also restores them",
+			"them will fail until you do. Do NOT drop this sync's publication as a shortcut: the slot's "+
+			"restart_lsn pins behind the DROP record and the stream can then never resume, and a later open "+
+			"recreates the publication FOR ALL TABLES anyway. Retire a stream you are finished with using "+
+			"'sluice sync decommission --stream-id <id> --yes', which drops the slot and the publication together",
 	)
 }
 

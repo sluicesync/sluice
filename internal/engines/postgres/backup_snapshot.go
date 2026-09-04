@@ -85,8 +85,10 @@ func warnPublicationExposure(ctx context.Context, db *sql.DB, covered func(names
 			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica "+
 			"identity, while INSERT keeps working -- so the failure surfaces inside whatever application owns them, "+
 			"and --chain-slot keeps the publication after the run",
-		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL, or drop this backup's publication "+
-			"when the chain is finished with it",
+		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL. The publication can be dropped "+
+			"once the whole chain is finished with it and NO stream is using it -- dropping one out from under a "+
+			"live stream wedges that stream permanently, because its slot's restart_lsn pins behind the DROP "+
+			"record, and the next open recreates the publication FOR ALL TABLES regardless",
 	)
 }
 

@@ -148,7 +148,17 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 			// SINGLE-schema stream, resume, and this line recreates it FOR ALL
 			// TABLES -- silently converting a scoped publication into a
 			// database-wide one and breaking every keyless table in the
-			// database, at exit 0. The release notes asserted the opposite.
+			// database.
+			//
+			// This comment used to say "at exit 0". Measured otherwise by the
+			// v0.141.0 regression cycle (Bug 267): the widening itself is
+			// silent, but the stream does not survive to exploit it -- the
+			// slot's restart_lsn pins behind the DROP record and the resume
+			// fails NON-ZERO with `publication "sluice_pub" does not exist`,
+			// asserted while it demonstrably exists. Escaping that costs a slot
+			// drop and a full re-snapshot, and the publication the re-snapshot
+			// creates is FOR ALL TABLES again. So the loud failure and the
+			// silent widening are BOTH real, in that order.
 			warnPublicationExposure(ctx, db, nil)
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
 		} else {

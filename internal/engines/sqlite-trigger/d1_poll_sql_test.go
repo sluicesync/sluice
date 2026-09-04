@@ -45,40 +45,48 @@ import (
 // (pure-Go) SQLite database, so ordering, the bound watermark and the
 // embedded LIMIT are all evaluated by an engine rather than by a fake.
 func TestD1PollChangeLogSQL_IsAPrefixQuery(t *testing.T) {
-	db := seedPollLog(t, 1, 2, 3, 4, 5)
+	// Ids that DISTINGUISH numeric from lexicographic order. The first cut
+	// of this test used 1..5, which sort identically either way -- so it
+	// asserted the ordering claim while being structurally incapable of
+	// catching the defect that claim exists to prevent (Bug 266: the
+	// CAST-to-TEXT alias shadowed the integer column and the poll sorted
+	// lexicographically). A fixture chosen for tidiness rather than for
+	// discrimination is a green test that proves nothing.
+	db := seedPollLog(t, 1, 2, 3, 9, 10, 11, 12)
 	e := &d1Executor{conn: startRealSQLMockD1(t, db)}
 	ctx := context.Background()
 
-	full, err := e.pollChangeLog(ctx, 0, 5)
+	full, err := e.pollChangeLog(ctx, 0, 7)
 	if err != nil {
 		t.Fatalf("poll(since=0, batch=5): %v", err)
 	}
-	if len(full) != 5 {
-		t.Fatalf("full poll returned %d rows, want 5 — the fixture or the query is not what this grades", len(full))
+	if len(full) != 7 {
+		t.Fatalf("full poll returned %d rows, want 7 — the fixture or the query is not what this grades", len(full))
 	}
 
 	// ORDER: the pump takes its next watermark from the MAX id it saw, so a
 	// page that is not ascending hands it a watermark it has not actually
 	// consumed up to.
+	wantOrder := []int64{1, 2, 3, 9, 10, 11, 12}
 	for i, r := range full {
-		if r.id != int64(i+1) {
+		if r.id != wantOrder[i] {
 			t.Fatalf("row %d has id %d; the poll is not returning ids in ASCENDING order, so the pump's "+
 				"watermark would jump past changes it never read: %v", i, r.id, ids(full))
 		}
 	}
 
 	// PREFIX: the whole idempotency argument for halving the batch.
-	half, err := e.pollChangeLog(ctx, 0, 2)
+	half, err := e.pollChangeLog(ctx, 0, 3)
 	if err != nil {
 		t.Fatalf("poll(since=0, batch=2): %v", err)
 	}
-	if len(half) != 2 {
-		t.Fatalf("LIMIT is not being honoured: asked for 2, got %d (%v) — an unbounded page defeats the "+
+	if len(half) != 3 {
+		t.Fatalf("LIMIT is not being honoured: asked for 3, got %d (%v) — an unbounded page defeats the "+
 			"whole shrink-and-retry design", len(half), ids(half))
 	}
 	for i := range half {
 		if half[i].id != full[i].id {
-			t.Fatalf("the smaller page is not a PREFIX of the larger: batch=2 gave %v, batch=5 gave %v. "+
+			t.Fatalf("the smaller page is not a PREFIX of the larger: the shrunk page gave %v, the full page gave %v. "+
 				"Re-requesting a shrunk page would then skip rows the first attempt would have returned",
 				ids(half), ids(full))
 		}
@@ -86,12 +94,12 @@ func TestD1PollChangeLogSQL_IsAPrefixQuery(t *testing.T) {
 
 	// WATERMARK: `id >` is strict, so a resume from the last id consumed
 	// must not replay it.
-	after, err := e.pollChangeLog(ctx, 3, 5)
+	after, err := e.pollChangeLog(ctx, 3, 7)
 	if err != nil {
 		t.Fatalf("poll(since=3, batch=5): %v", err)
 	}
-	if len(after) != 2 || after[0].id != 4 || after[1].id != 5 {
-		t.Fatalf("poll(since=3) returned %v, want [4 5] — the watermark bound is not strict `id >`, so the "+
+	if len(after) != 4 || after[0].id != 9 || after[3].id != 12 {
+		t.Fatalf("poll(since=3) returned %v, want [9 10 11 12] — the watermark bound is not strict `id >`, so the "+
 			"stream would replay or skip at every resume", ids(after))
 	}
 }
