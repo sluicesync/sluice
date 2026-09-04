@@ -547,26 +547,115 @@ func probeDerivesBoundedContext(fn *ast.FuncDecl, fns map[string]*ast.FuncDecl) 
 	return false
 }
 
-// bodyDerivesContextWithTimeout reports whether fn's body contains a
-// context.WithTimeout call.
+// bodyDerivesContextWithTimeout reports whether fn's body derives a
+// context.WithTimeout AND actually USES the context it derived.
+//
+// The second half is the point, and it was missing until 2026-09-04
+// (audit 2026-09-01, testing-ci LOW tail: "grades presence not use").
+// Checking only that the call appears passes this:
+//
+//	timeoutCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+//	defer cancel()
+//	row := db.QueryRowContext(ctx, ...)   // the ORIGINAL ctx
+//
+// which has a cap that binds nothing. That is not a hypothetical typo so
+// much as the natural slip: the derived name is new, the old one is
+// already in every line below it, and the compiler is happy either way
+// because both are contexts. A gate that green-lights it is worse than
+// no gate, because it stops anyone looking.
+//
+// So the derived identifier must appear as a CALL ARGUMENT somewhere in
+// the same function. That deliberately accepts passing it onward to a
+// helper — the cap travels with the context, which is the whole design —
+// and rejects deriving it into "_" or leaving it unused.
+//
+// WHAT THIS STILL DOES NOT CATCH, measured rather than guessed. A probe
+// that derives the cap, uses it for one read, and passes the PARENT to
+// another read still passes:
+//
+//	pctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+//	installed, err := loadInstalledCaptureTriggers(ctx, db, schema)  // UNCAPPED
+//	ddl, err := loadDDLCaptureState(pctx, db, schema)                // capped
+//
+// That mutation was applied to the real verifyCaptureTriggerShape and
+// this gate stayed green, which is how the residual is known rather
+// than assumed.
+//
+// The obvious stronger rule — after a cap is derived, the parent must
+// not be passed to anything — was tried and is WRONG. It fails seven
+// real probes, and every one is a legitimate use: captureShapeProbeError
+// takes BOTH deliberately, so it can tell an expired probe deadline from
+// a cancelled caller, and the slog warn helpers take the parent because a
+// log line must still be emitted after the probe window closes. Shipping
+// that rule would have meant seven exemptions, and a gate that needs an
+// exemption per real call site is measuring the wrong thing.
+//
+// The right rule is narrower: after a cap is derived, no call that ALSO
+// passes a DATABASE HANDLE may pass the parent context. That separates
+// the two cases exactly — the uncapped read passes (ctx, db, …), while
+// the error and log helpers pass no handle at all. Implementing it means
+// threading the [dbHandleTypes] set and the enclosing file's type decls
+// down to this predicate, which the roster already computes for probe
+// derivation but does not currently pass here. Filed, with this note as
+// the specification (audit 2026-09-01 testing-ci LOW tail).
 func bodyDerivesContextWithTimeout(fn *ast.FuncDecl) bool {
-	found := false
+	derived := derivedTimeoutCtxNames(fn)
+	if len(derived) == 0 {
+		return false
+	}
+	used := false
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
+		// The WithTimeout call itself takes the PARENT context as its
+		// first argument; counting that would let a derived-but-unused
+		// context satisfy this check via its own derivation.
+		if isContextWithTimeoutCall(call) {
 			return true
 		}
-		if x, ok := sel.X.(*ast.Ident); ok && x.Name == "context" && sel.Sel.Name == "WithTimeout" {
-			found = true
-			return false
+		for _, arg := range call.Args {
+			if id, ok := arg.(*ast.Ident); ok && derived[id.Name] {
+				used = true
+				return false
+			}
 		}
 		return true
 	})
-	return found
+	return used
+}
+
+// derivedTimeoutCtxNames collects the identifiers a context.WithTimeout
+// result is assigned to in fn. "_" is deliberately not collected: a
+// context discarded at derivation can never be used.
+func derivedTimeoutCtxNames(fn *ast.FuncDecl) map[string]bool {
+	names := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !isContextWithTimeoutCall(call) {
+			return true
+		}
+		if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+			names[id.Name] = true
+		}
+		return true
+	})
+	return names
+}
+
+// isContextWithTimeoutCall reports whether call is context.WithTimeout(...).
+func isContextWithTimeoutCall(call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	x, ok := sel.X.(*ast.Ident)
+	return ok && x.Name == "context" && sel.Sel.Name == "WithTimeout"
 }
 
 // parsePackageDurationConst reads a `const NAME = <n> * time.<Unit>`

@@ -63,14 +63,32 @@ import (
 // quietly shrinking its coverage.
 const filePosUUIDExemptMarker = "//sluice:filepos-no-uuid"
 
-// filePosUUIDMinSites is the anti-vacuity floor. Six file/pos
-// constructions exist as of this gate's landing (two backup capturers,
-// the per-event emitter, the cold-start resolver, and the two snapshot
-// openers). The floor is set BELOW that so a deliberate consolidation
-// does not fail the build, but far enough above zero that a broken
+// filePosUUIDMinSites is the anti-vacuity floor. It exists so a broken
 // walker — wrong directory, changed type name, parse failure — fails
 // LOUDLY instead of passing with an empty roster, which is the failure
 // mode that makes a gate worse than no gate.
+//
+// FIVE, and that is now the WHOLE universe rather than a margin below
+// it. This comment used to say six existed (two backup capturers, the
+// per-event emitter, the cold-start resolver, and the two snapshot
+// openers) with the floor deliberately set one below, so a consolidation
+// would not fail the build. The consolidation then happened: SLM-4
+// merged the two snapshot openers into one shared
+// snapshotHandoffPosition, and the count became five. The margin did its
+// job and then quietly stopped being a margin, which is the state the
+// 2026-09-01 audit flagged as "floor 5 < universe 6" — accurate when
+// filed, and by the time it was checked the two numbers had met.
+//
+// Floor EQUAL to the universe is the strongest position available here,
+// so it is left there deliberately: any future consolidation now fails
+// this test and has to lower the number on purpose, which is the whole
+// point — a coverage reduction becomes a decision somebody records
+// instead of a margin absorbing it silently. If you are that person:
+// lower it, and say in this comment what merged into what.
+//
+// Verified rather than counted from the comment: the walker reports its
+// tally on every run ("checked N file/pos constructions across M
+// files"), which is how the drift above was found.
 const filePosUUIDMinSites = 5
 
 // filePosUUIDMinFiles guards the other vacuity shape: a walker that
