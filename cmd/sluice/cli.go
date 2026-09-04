@@ -337,6 +337,35 @@ type MigrateCmd struct {
 	CrashHookFlags
 }
 
+// stageScopeFor derives the table-scope predicate the D1 staging mangle
+// refusal is graded against: the run's own filter, from the CLI flags AND the
+// YAML config, through the same helpers Run uses later.
+//
+// Extracted from its caller so it can be graded at all. As a four-line inline
+// block nothing reached it — the D1 branch is entered by no test — and the
+// mutant that leaves open is one character: swapping the arguments, or
+// negating the result, makes every real table read as OUT of scope, so a
+// mangled table the operator DID select gets only a warning and its
+// U+FFFD-substituted values are staged and copied to the target at exit 0,
+// with the whole suite green. That is the "pin a value-gated fix THROUGH the
+// CLI layer" shape (Bug 180).
+//
+// nil means "everything is in scope", and that direction is deliberate. A
+// filter that cannot be built is not fatal here — Run resolves the same
+// arguments a few lines later and reports it properly — so falling back to
+// nil keeps the refusal ARMED rather than silently off.
+func stageScopeFor(m *MigrateCmd, cfg *config.Config) func(string) bool {
+	inc, exc := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg)
+	if len(inc) == 0 && len(exc) == 0 {
+		return nil
+	}
+	f, err := migcore.NewTableFilter(inc, exc)
+	if err != nil {
+		return nil
+	}
+	return f.Allows
+}
+
 // stageD1Source replicates the live Cloudflare D1 database named by d1DSN into a
 // temp-dir SQLite file (Strategy A) and returns the file path plus a cleanup
 // func that removes the temp dir. The migrate then runs against the local file,
@@ -699,13 +728,7 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals, cfg *config
 		// same arguments a few lines later and reports it properly. Falling
 		// back to "everything is in scope" keeps this the conservative
 		// direction -- the refusal stays armed rather than silently off.
-		var stageScope func(string) bool
-		if inc, exc := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg); len(inc) > 0 || len(exc) > 0 {
-			if f, ferr := migcore.NewTableFilter(inc, exc); ferr == nil {
-				stageScope = f.Allows
-			}
-		}
-		staged, stageCleanup, serr := stageD1Source(ctx, m.Source, g.StageDir, stageScope)
+		staged, stageCleanup, serr := stageD1Source(ctx, m.Source, g.StageDir, stageScopeFor(m, cfg))
 		if serr != nil {
 			return nil, nil, cleanup, serr
 		}
